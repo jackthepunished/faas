@@ -283,7 +283,7 @@ func (s *Shipper) uploadFile(ctx context.Context, f FileInfo) (int64, error) {
 }
 
 // bucketKey is the S3 object key for an (instance, day) tuple.
-// Mirrors the layout the read-back path (PR-B's gatewayd proxy)
+// Mirrors the layout the read-back path (PR-B's gatewayd-internal proxy)
 // expects: s3://{bucket}/faas-logs/{instanceID}/{YYYY}/{MM}/
 // {DD}.jsonl.gz. The prefix "faas-logs/" is fixed so an operator
 // sharing a bucket across multiple Gregale installs gets a

@@ -13,8 +13,8 @@
 //
 // Why a separate topAccountSet in this package:
 //
-//   pkg/gateway can't import pkg/wire (cmd/gatewayd → pkg/gateway → pkg/wire
-//   → cmd/gatewayd would cycle through the package import graph; pkg/gateway
+//   pkg/gateway can't import pkg/wire (cmd/gatewayd-internal → pkg/gateway → pkg/wire
+//   → cmd/gatewayd-internal would cycle through the package import graph; pkg/gateway
 //   predates pkg/wire and is intentionally narrow). The primitive here is a
 //   private mirror — same shape, same cap, same resetWindow cadence. If
 //   pkg/gateway ever grows a wire dependency, the two primitives should be
@@ -30,7 +30,7 @@
 //
 // Lifecycle:
 //
-//   Started by cmd/gatewayd/main.go after the gateway Handler is
+//   Started by cmd/gatewayd-internal/main.go after the gateway Handler is
 //   constructed; runs until ctx is cancelled. Stops cleanly because
 //   the only mutable state is the topAccountSet (the gauge rows
 //   persist across ticks — Prometheus gauges don't have rows to

@@ -1,15 +1,15 @@
-// scheddrouter.go — gatewayd's per-node schedd gRPC client cache
+// scheddrouter.go — gatewayd-internal's per-node schedd gRPC client cache
 // (Phase 2 / Gate A).
 //
-// One gatewayd process fronts every app on every node. With N schedd
-// peers (one per active compute_node), gatewayd needs to dial the
+// One gatewayd-internal process fronts every app on every node. With N schedd
+// peers (one per active compute_node), gatewayd-internal needs to dial the
 // schedd that owns the app being woken, not the legacy
 // default-local-only socket. This file replaces the single
 // scheddgrpc.DialContext(/run/faas/schedd.sock) with a per-node
 // cache keyed by compute_nodes.id.
 //
 // The cache is shape-equivalent to gateway's existing per-node vmmd
-// cache (cmd/gatewayd/nodecache.go / pkg/gateway.NodeClientCache):
+// cache (cmd/gatewayd-internal/nodecache.go / pkg/gateway.NodeClientCache):
 //
 //   - Lazy dial per (node_id) — first lookup opens a conn, subsequent
 //     lookups reuse it.
@@ -28,7 +28,7 @@
 // methods on the vmmd cache (widens the API surface in a package that
 // has nothing to do with schedd) or carry two parallel maps with
 // parallel eviction plumbing. The duplicate small cache wins on
-// readability — and the gatewayd process has two long-lived gRPC
+// readability — and the gatewayd-internal process has two long-lived gRPC
 // clients per node, not one, so the underlying dial cost is
 // additive regardless.
 
@@ -78,7 +78,7 @@ type ScheddNodeResolver interface {
 	InstanceByID(ctx context.Context, id string) (state.Instance, error)
 }
 
-// scheddRouter is gatewayd's per-node schedd client cache. Holds a
+// scheddRouter is gatewayd-internal's per-node schedd client cache. Holds a
 // map keyed by compute_nodes.id; values are ScheddClient interfaces
 // (production = *scheddgrpc.Client). On any failure to materialise
 // a client for a node, the router returns the error to the caller —
@@ -246,7 +246,7 @@ func (r *scheddRouter) Evict(nodeID string) {
 	}
 }
 
-// Close releases every cached client. Called once at gatewayd
+// Close releases every cached client. Called once at gatewayd-internal
 // shutdown; subsequent ScheddFor{App,Instance} calls return errors
 // so in-flight requests see the dial failure rather than a silent
 // nil deref.
@@ -266,7 +266,7 @@ func (r *scheddRouter) Close() error {
 
 // WatchNodeChanges subscribes to compute_node_changed pg_notify and
 // calls Evict on every payload. Mirrors
-// cmd/gatewayd/nodecache.go::WatchEvictions — same db.Subscribe
+// cmd/gatewayd-internal/nodecache.go::WatchEvictions — same db.Subscribe
 // wrapper, same malformed-payload drop, same single-goroutine
 // shape. The subscribeFunc test seam lives on the type so the
 // production wiring is the default and tests can inject a fake.

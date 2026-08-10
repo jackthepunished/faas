@@ -1,9 +1,9 @@
-// Issue #98 / ADR-028: gatewayd's per-node vmmd client cache + the
+// Issue #98 / ADR-028: gatewayd-internal's per-node vmmd client cache + the
 // pg_notify subscriber that evicts entries when a row mutates.
 //
-// Production wiring (one NodeClientCache per gatewayd process):
+// Production wiring (one NodeClientCache per gatewayd-internal process):
 //
-//	cache := gatewayd.NewNodeClientCache(pgStore, vmmdTLS, log)
+//	cache := gatewayd-internal.NewNodeClientCache(pgStore, vmmdTLS, log)
 //	defer cache.Close()
 //	go cache.WatchEvictions(ctx, pool)  // LISTEN compute_node_changed
 //	handler.WithForwarding(gateway.ForwardingReverseProxy(cache, log))
@@ -73,7 +73,7 @@ const subscriberHeartbeatInterval = 30 * time.Second
 type subscribeFunc func(ctx context.Context, pool *pgxpool.Pool, channels []string, log *slog.Logger) (<-chan db.Notification, error)
 
 // nodeCache bundles the gateway's per-node vmmd client cache with the
-// subscribe-and-evict goroutine. Splitting it from cmd/gatewayd/main.go
+// subscribe-and-evict goroutine. Splitting it from cmd/gatewayd-internal/main.go
 // keeps main.go focused on listener wiring; tests can construct the
 // cache without booting a full daemon.
 //
@@ -107,7 +107,7 @@ type nodeCache struct {
 // WithEvents (issue #517 / PR-C / ADR-064) installs the events
 // Platform that the forwarder will use to emit wake.proxy_first_byte.
 // Returns the receiver so the call reads as a fluent setter at the
-// wiring site in cmd/gatewayd/main.go:
+// wiring site in cmd/gatewayd-internal/main.go:
 //
 //	cache := newNodeCache(...).WithEvents(eventsPlatform)
 //
@@ -163,7 +163,7 @@ func newNodeCache(store *state.PgStore, vmmdTLS *tls.Config, log *slog.Logger, m
 	return &nodeCache{cache: cache, log: log, metrics: m, subscribe: db.SubscribeWithReconnect}
 }
 
-// Forwarding returns the per-node http.Handler factory. cmd/gatewayd
+// Forwarding returns the per-node http.Handler factory. cmd/gatewayd-internal
 // installs it on the gateway.Handler via WithForwarding so every
 // request dispatches through the cache.
 //
@@ -255,9 +255,9 @@ func (n *nodeCache) watchEvictionsWithInterval(ctx context.Context, pool *pgxpoo
 	if err != nil {
 		// First-subscribe failure: do NOT start the heartbeat. The
 		// gauge stays at 0; the alert rule fires. Production's
-		// ctx.Done probe in cmd/gatewayd/main.go's SIGHUP path
+		// ctx.Done probe in cmd/gatewayd-internal/main.go's SIGHUP path
 		// handles daemon shutdown — we don't need to block here.
-		n.log.Error("gatewayd: subscribe compute_node_changed", "err", err)
+		n.log.Error("gatewayd-internal: subscribe compute_node_changed", "err", err)
 		return
 	}
 
@@ -300,7 +300,7 @@ func (n *nodeCache) watchEvictionsWithInterval(ctx context.Context, pool *pgxpoo
 				Active bool   `json:"active"`
 			}
 			if err := json.Unmarshal([]byte(got.Payload), &p); err != nil || p.NodeID == "" {
-				n.log.Warn("gatewayd: bad compute_node_changed payload", "payload", got.Payload)
+				n.log.Warn("gatewayd-internal: bad compute_node_changed payload", "payload", got.Payload)
 				continue
 			}
 			// Evict on every mutation: the resolver re-reads the row
@@ -311,7 +311,7 @@ func (n *nodeCache) watchEvictionsWithInterval(ctx context.Context, pool *pgxpoo
 			// overlay is sub-100 ms and the simpler invariant is worth
 			// the occasional extra dial.
 			n.cache.Evict(p.NodeID)
-			n.log.Info("gatewayd: evicted node client cache",
+			n.log.Info("gatewayd-internal: evicted node client cache",
 				"node", p.NodeID, "active", p.Active)
 		}
 	}

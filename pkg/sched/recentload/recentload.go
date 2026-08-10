@@ -83,7 +83,7 @@ func New(scraper PromScraper, windowSize int, bucketSize time.Duration) *RecentL
 //
 // The deltas are computed against the cumulative value seen at the
 // previous Touch. A regression (cumulative lower than lastSeen)
-// means gatewayd restarted and reset its counter — treat it as a
+// means gatewayd-internal restarted and reset its counter — treat it as a
 // fresh start: clear the per-app ring so the new window's first
 // delta is measured from the new boot's perspective. This mirrors
 // the scaleup.RingBuffer's restart handling.

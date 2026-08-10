@@ -1,6 +1,6 @@
 // schedd — the scheduler and instance-lifecycle owner (spec §4.3, ADR-018).
 // schedd is the ONLY writer to the `instances` table and the sole owner of the
-// state machine (spec §6). This gRPC surface is how gatewayd asks schedd to
+// state machine (spec §6). This gRPC surface is how gatewayd-internal asks schedd to
 // wake an app and reports request activity back; schedd itself dials vmmd
 // (api/proto/onebox/faas/vmmd/v1) to drive the actual microVM lifecycle.
 //
@@ -264,7 +264,7 @@ type WakeResponse struct {
 	// the error path.
 	//
 	// Renamed from the legacy `addr` field (PR #116-era was host_ip:8080,
-	// an inner-netns placeholder unreachable from gatewayd on a remote
+	// an inner-netns placeholder unreachable from gatewayd-internal on a remote
 	// host). Dual semantics were deliberately not preserved — leaving
 	// both fields risks a caller picking the wrong one and regressing
 	// the hot path silently. The new shape is the only contract.
@@ -1049,7 +1049,7 @@ func (x *ListInstanceStatsResponse) GetRows() []*InstanceStatsRow {
 //
 // since_written_at (issue #517 / PR-B acceptance #3) is the
 // per-instance written_at lower bound on the replay page, mirrored
-// at the schedd hop so the bound survives the gatewayd → schedd →
+// at the schedd hop so the bound survives the gatewayd-internal → schedd →
 // vmmd transit. Empty = no bound. Wire is additive per ADR-016.
 //
 // Additive per ADR-016.
@@ -1355,7 +1355,7 @@ type StreamWarmHintsResponse struct {
 	// node_id is the compute_node.id the engine just admitted to.
 	NodeId string `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 	// written_at is the host-side time schedd stamped the entry (the
-	// WarmAffinity.lastSeen). Lets gatewayd detect clock skew in
+	// WarmAffinity.lastSeen). Lets gatewayd-internal detect clock skew in
 	// diagnostics; the gateway's hint cache treats this as advisory.
 	WrittenAt     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=written_at,json=writtenAt,proto3" json:"written_at,omitempty"`
 	unknownFields protoimpl.UnknownFields

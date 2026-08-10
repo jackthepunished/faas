@@ -4,7 +4,7 @@
 // list, app detail, usage, billing, account (keys + plan). All pages
 // are server-rendered (pkg/dashboard.Render) and live behind
 // sessionAuth so the single-public-listener invariant (spec §11)
-// survives — gatewayd reverse-proxies /dashboard/* to apid's loopback
+// survives — gatewayd-public reverse-proxies /dashboard/* to apid's loopback
 // listener.
 //
 // Each handler reads data via the v1 endpoints or directly via
@@ -225,7 +225,7 @@ func (s *server) renderAppsList(w http.ResponseWriter, r *http.Request, log *slo
 	// Finding 6 (issue #314): stamp the per-row quota-cell metadata.
 	// account.Plan is the plan every app in this account sees
 	// (RateLimitBurst / RateLimitRPS lives on api.LimitsFor(plan)).
-	// QuotaLabel stays "—" until the apid→gatewayd loopback dial
+	// QuotaLabel stays "—" until the apid→gatewayd-internal loopback dial
 	// lands — distinguishable from the live "N/M" reading on the
 	// next PR. The static cells don't currently render the plan in
 	// the visible text, so this is essentially dead-handed metadata

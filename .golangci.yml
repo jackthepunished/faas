@@ -65,7 +65,8 @@ linters:
         # through their owners.
         firecracker-jailer-vmmd-owned:
           files:
-            - "**/cmd/gatewayd/**"
+            - "**/cmd/gatewayd-internal/**"
+            - "**/cmd/gatewayd-public/**"
             - "**/cmd/meterd/**"
             - "**/cmd/faas/**"
             - "**/cmd/imaged/**"

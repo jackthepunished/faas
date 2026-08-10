@@ -66,7 +66,7 @@ const (
 	// return-point. Payload: {wake_id, app_id, instance_id,
 	// node_id, healthcheck_path, probe_count, elapsed_ms}.
 	WakeReadiness200 = "wake.readiness_200"
-	// WakeProxyFirstByte — gatewayd received the first response
+	// WakeProxyFirstByte — gatewayd-internal received the first response
 	// byte from the woken instance (httptrace.GotFirstResponseByte
 	// callback). Payload: {wake_id, app_id, request_id,
 	// instance_id, node_id, latency_ms}.
@@ -364,7 +364,7 @@ func (e Readiness200) Payload() map[string]any {
 	}
 }
 
-// ProxyFirstByte — gatewayd received the first response byte from
+// ProxyFirstByte — gatewayd-internal received the first response byte from
 // the woken instance. LatencyMs is the wall-clock from queue
 // acceptance to first byte so the customer timeline shows the
 // end-to-end latency, not just the proxy hop.

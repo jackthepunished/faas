@@ -19,7 +19,7 @@ import (
 // ScheddClient is the gateway-side interface a per-node schedd
 // router holds (Phase 2 / Gate A). Production wires it to *Client;
 // tests substitute a fake so the router doesn't need a real gRPC
-// dial. The surface is the union of every gRPC call gatewayd
+// dial. The surface is the union of every gRPC callgatewayd-internal
 // makes against schedd: admit, wake, activity flush, log stream,
 // warmhint stream, close. Each method maps 1:1 to a method on
 // *Client, so any fake only needs to forward the same shape.
@@ -43,7 +43,7 @@ type ScheddClient interface {
 	Close() error
 }
 
-// Client is gatewayd's handle to schedd's gRPC surface (ADR-018). It satisfies
+// Client is gatewayd-internal's handle to schedd's gRPC surface (ADR-018). It satisfies
 // the gateway.Scheduler shape (Wake) and carries the last_request_at flush
 // (ReportActivity) — schedd is the sole writer to `instances`, so the gateway
 // hands it activity batches rather than touching the table (CLAUDE.md ownership).

@@ -15,7 +15,7 @@
 //     overtakes it; this is safe because the gauge is a presentation
 //     view over an already-bounded counter, not the source of truth.
 //     The cap-reset is keyed on a sliding 24h window driven by the
-//     5s sampler (cmd/apid/topn.go / cmd/gatewayd/listener.go).
+//     5s sampler (cmd/apid/topn.go / cmd/gatewayd-internal/listener.go).
 //
 // Why a separate type, not extending accountLabelSet:
 //

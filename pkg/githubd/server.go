@@ -8,7 +8,7 @@
 //     slices 7-8 swap Unimplemented for real handlers.
 //
 //  2. Plain HTTP webhook listener on 127.0.0.1:8083. Only
-//     gatewayd's edge-verifying proxy forwards here — never
+//     gatewayd-internal's edge-verifying proxy forwards here — never
 //     reachable from the public internet (§11 single-public-
 //     listener invariant). The handler is the bridge between
 //     HTTP POSTs and Service.HandlePushRequest.
@@ -77,7 +77,7 @@ type Server struct {
 // githubd gRPC socket.
 const DefaultSocketPath = "/run/faas/githubd.sock"
 
-// DefaultHTTPAddr is the loopback listener gatewayd reverse-proxies
+// DefaultHTTPAddr is the loopback listener gatewayd-internal reverse-proxies
 // /webhooks/github to. Spec §11: githubd is loopback-only.
 const DefaultHTTPAddr = "127.0.0.1:8083"
 
@@ -191,12 +191,12 @@ func (s *Server) Start(ctx context.Context) (func(context.Context) error, <-chan
 }
 
 // WebhookLoopbackHandler returns the http.Handler the HTTP listener
-// serves. The proxy in cmd/gatewayd HMAC-verifies the request
+// serves. The proxy in cmd/gatewayd-internal/HMAC-verifies the request
 // before forwarding; this handler re-verifies (defense in depth)
 // and then dispatches via Service.HandlePushRequest.
 //
 // Loopback-only invariant (§11 single-public-listener): the listener
-// binds to 127.0.0.1:8083; gatewayd's edge-verifying proxy is the only
+// binds to 127.0.0.1:8083; gatewayd-internal's edge-verifying proxy is the only
 // reachable caller. Adding GET /metrics for ops scraping on the same
 // mux is safe — there's no path from the public internet to it.
 //
@@ -244,7 +244,7 @@ func (s *Server) handleWebhookPush(w http.ResponseWriter, r *http.Request) {
 		observe(err)
 		return
 	}
-	// Re-verify the HMAC. The gatewayd proxy already did this,
+	// Re-verify the HMAC. The gatewayd-internal proxy already did this,
 	// but a misconfigured proxy (no secret) must NOT bypass the
 	// daemon-side check.
 	sig := r.Header.Get("X-Hub-Signature-256")
@@ -357,7 +357,7 @@ func bufErrTooLarge(err error) bool {
 }
 
 // webhookSecretFromHeader is the slice-7 hook for an out-of-band
-// secret. Today we trust the gatewayd proxy; slice 8 adds the
+// secret. Today we trust the gatewayd-internal proxy; slice 8 adds the
 // per-tenant secret rotation that justifies this hook.
 func webhookSecretFromHeader(_ *http.Request) []byte {
 	// Placeholder — slice 8 reads from the per-account config table.
@@ -404,7 +404,7 @@ func (s *Server) grpcAdapter() githubdgrpc.Service {
 
 // CreateDeploymentFromPush is the gRPC entry that the apid webhook
 // bridge (slice 8) calls. For slice 7 githubd is the inbound caller
-// (gatewayd → githubd → apid), so this RPC stays Unimplemented in
+// (gatewayd-internal → githubd → apid), so this RPC stays Unimplemented in
 // the production daemon — the inbound path uses
 // Service.HandlePushRequest, not gRPC. Tests still exercise the
 // type satisfaction via the adapter.

@@ -1,7 +1,7 @@
 -- filename: 00080_apps_streaming_enabled.sql
 -- +goose Up
 -- Add per-app streaming flag (issue #471). Streams the response body
--- from the guest through gatewayd to the client with periodic flushes
+-- from the guest through gatewayd-internal to the client with periodic flushes
 -- (200 ms / 256 KiB) so ADR-046 tx_bytes stays accurate and LLM-style
 -- token streams / large JSON exports / SSE work.
 --
@@ -19,7 +19,7 @@
 -- no index bloat, and a second MigrateUp is a no-op.
 --
 -- Partial index on streaming_enabled=true is small (Hobby+/Pro/Scale
--- apps that opted in); gatewayd's lookup is a per-request cache hit
+-- apps that opted in); gatewayd-internal's lookup is a per-request cache hit
 -- on apps[host] so this index is for the operator "which apps stream?"
 -- query path (dashboard), not the hot request path.
 -- +goose StatementBegin

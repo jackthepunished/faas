@@ -62,8 +62,8 @@ const CapacityInterval = 1 * time.Second
 // 30+ successful reports and then hits one transient error
 // would otherwise stay at 30 s for the rest of its life —
 // the loop accumulates `backoff` across drains even when
-// each drain was clean. The gatewayd warmhints publisher
-// (cmd/gatewayd/warmhints.go:121) resets on a clean drain;
+// each drain was clean. The gatewayd-internal warmhints publisher
+// (cmd/gatewayd-internal/warmhints.go:121) resets on a clean drain;
 // we mirror that shape here. (Issue raised in PR-1 review.)
 const initialBackoff = 1 * time.Second
 
@@ -100,7 +100,7 @@ type countReader interface {
 // doubles on each drain failure (1s → 2s → 4s → 8s → 16s
 // → 30s capped), and resets to `initialBackoff` after a
 // clean drain return (nil error). This matches the
-// gatewayd warmhints cadence and prevents a long-lived
+// gatewayd-internal warmhints cadence and prevents a long-lived
 // vmmd from getting stuck at the cap after one transient
 // error.
 //

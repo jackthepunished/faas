@@ -1,8 +1,9 @@
-// gatewayd → githubd webhook proxy (spec §14 M7.5, ADR-012).
+// gatewayd-internal → githubd webhook proxy (spec §14 M7.5, ADR-012).
 //
-// gatewayd is the only public listener; /webhooks/github lands here,
+// gatewayd-public forwards /webhooks/github over the unix socket at
+// /run/faas/gatewayd-internal.sock; the request lands here behind the
 // we HMAC-verify the GitHub push header at the edge (the secret never
-// has to leave gatewayd's config), then reverse-proxy the request to
+// has to leave gatewayd-internal's config), then reverse-proxy the request to
 // githubd's loopback listener (127.0.0.1:8083 by default).
 //
 // githubd stays loopback-only so the §11 single-public-listener
@@ -53,7 +54,7 @@ type githubdProxy struct {
 
 // newGithubdProxy builds the proxy. If target is empty or secret
 // is missing, the wrapper is disabled (every /webhooks/github
-// request returns 503 — gatewayd refuses to forward unverified
+// request returns 503 — gatewayd-internal refuses to forward unverified
 // payloads, so missing secret = closed-by-default).
 //
 // auditor may be nil; in that case replay rejections are still

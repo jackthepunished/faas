@@ -28,7 +28,7 @@ type WarmHintFunc func(appID string) (nodeID string, found bool)
 
 // Router is the Postgres-backed routing seam PGBackend reads through. It is the
 // narrow slice of the state.Store the edge needs to resolve a hostname to its
-// app; cmd/gatewayd adapts state.Store to it. Keeping it gateway-local (rather
+// app; cmd/gatewayd-internal/adapts state.Store to it. Keeping it gateway-local (rather
 // than importing pkg/state here) keeps the hot request path unit-testable with
 // a fake and keeps this package's dependency surface to pkg/api only.
 type Router interface {
@@ -208,7 +208,7 @@ func (s *targetSet) pick(warmHint string) (Target, bool) {
 	return Target{}, false
 }
 
-// PGBackend is gatewayd's production Backend (spec §4.1, issue #168): a
+// PGBackend is gatewayd-internal's production Backend (spec §4.1, issue #168): a
 // host→app routing cache over Postgres plus schedd over gRPC for
 // per-instance admission. Replaces the M4-era unwiredBackend once schedd's
 // gRPC surface (ADR-018) is up.
@@ -316,7 +316,7 @@ type PGBackend struct {
 	// owner's app routed through it would return FailedPrecondition,
 	// surfacing as a 503 storm on transient cache misses. Multi-box
 	// startup sets this to false; single-box startup sets it to true.
-	// The setter (WithLegacySingleBox) is wired by cmd/gatewayd's
+	// The setter (WithLegacySingleBox) is wired by cmd/gatewayd-internal's
 	// startup phase after it has resolved fleet posture from the
 	// compute_nodes table.
 	legacySingleBox bool
@@ -364,7 +364,7 @@ func (b *PGBackend) WithClientForApp(fn ClientForAppFunc) *PGBackend {
 
 // WithWarmHint attaches the sticky-warm affinity source for the picker.
 // nil is tolerated (the picker degrades to per-node healthyCount).
-// cmd/gatewayd wires this from the WarmHint stream that schedd exposes
+// cmd/gatewayd-internal/wires this from the WarmHint stream that schedd exposes
 // via the gRPC surface; tests pass a closure that reads from a fake
 // or a fixed map.
 //
@@ -389,7 +389,7 @@ func (b *PGBackend) WithWarmHint(fn WarmHintFunc) *PGBackend {
 // through the legacy default-local dial, and that schedd returns
 // FailedPrecondition, surfacing as a 503 storm on transient cache
 // misses. The setter is documented at the field (see legacySingleBox
-// above). Returns b so the gatewayd startup wire-up can chain.
+// above). Returns b so the gatewayd-internal startup wire-up can chain.
 func (b *PGBackend) WithLegacySingleBox(v bool) *PGBackend {
 	b.legacySingleBox = v
 	return b
@@ -850,7 +850,7 @@ func (b *PGBackend) RefreshDeploymentWeights(ctx context.Context, appID string) 
 	}
 	rows, err := b.store.LiveDeployments(ctx, appID)
 	if err != nil {
-		return fmt.Errorf("gatewayd: refresh deployment weights app=%s: %w", appID, err)
+		return fmt.Errorf("gatewayd-internal: refresh deployment weights app=%s: %w", appID, err)
 	}
 	next := buildDeploymentWeights(rows)
 	b.tgtMu.Lock()
@@ -958,7 +958,7 @@ func (b *PGBackend) WithStore(s deploymentWeightsStore) *PGBackend {
 	return b
 }
 
-// FlushRoutes clears the host→app and app→plan caches. gatewayd calls this on
+// FlushRoutes clears the host→app and app→plan caches. gatewayd-internal calls this on
 // an app_changed / domain_changed notification so a renamed slug, plan change,
 // or deleted app is re-resolved (or 404'd) on the next request.
 func (b *PGBackend) FlushRoutes() {
@@ -970,7 +970,7 @@ func (b *PGBackend) FlushRoutes() {
 
 // InvalidatePublicAuth (issue #477 / ADR-079) drops every
 // entry in the per-app basic-auth unsealed-credential cache.
-// gatewayd calls this on a db.NotifyKeyChanged notification
+// gatewayd-internal calls this on a db.NotifyKeyChanged notification
 // (cmd/gatewayd-internal/backend.go) so a key rotation
 // re-unseals on the next request. nil-safe: an unwired
 // cache is a no-op.
@@ -1037,7 +1037,7 @@ func (b *PGBackend) resolveSched(ctx context.Context, appID string) (Scheduler, 
 			if b.legacySingleBox {
 				return b.sched, nil
 			}
-			return nil, fmt.Errorf("gatewayd: app %s: not found (transient resolver miss; multi-box posture forbids legacy fallback)", appID)
+			return nil, fmt.Errorf("gatewayd-internal: app %s: not found (transient resolver miss; multi-box posture forbids legacy fallback)", appID)
 		}
 		if app.NodeID == "" {
 			// Pre-migration row or test fixture: only valid
@@ -1046,7 +1046,7 @@ func (b *PGBackend) resolveSched(ctx context.Context, appID string) (Scheduler, 
 			if b.legacySingleBox {
 				return b.sched, nil
 			}
-			return nil, fmt.Errorf("gatewayd: app %s has empty NodeID (pre-migration row; multi-box posture forbids legacy fallback)", appID)
+			return nil, fmt.Errorf("gatewayd-internal: app %s has empty NodeID (pre-migration row; multi-box posture forbids legacy fallback)", appID)
 		}
 		cli, ok, err := b.clientForApp(ctx, app)
 		if err != nil {
@@ -1056,7 +1056,7 @@ func (b *PGBackend) resolveSched(ctx context.Context, appID string) (Scheduler, 
 			if b.legacySingleBox {
 				return b.sched, nil
 			}
-			return nil, fmt.Errorf("gatewayd: app %s (node %s): client resolver declined (transient miss; multi-box posture forbids legacy fallback)", appID, app.NodeID)
+			return nil, fmt.Errorf("gatewayd-internal: app %s (node %s): client resolver declined (transient miss; multi-box posture forbids legacy fallback)", appID, app.NodeID)
 		}
 		return cli, nil
 	}

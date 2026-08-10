@@ -105,7 +105,7 @@ type Unit struct {
 	ProtectKernelTunables   bool
 	ProtectKernelModules    bool
 	ProtectControlGroups    bool
-	SystemCallArchitectures string // "native" for the two gatewayd daemons
+	SystemCallArchitectures string // "native" for the two gatewayd-internal daemons
 	LockPersonality         bool
 	RestrictNamespaces      bool
 	RestrictRealtime        bool

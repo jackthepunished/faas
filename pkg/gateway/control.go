@@ -1,4 +1,4 @@
-// Control-plane listener for gatewayd (spec §11, §12). The /healthz, /readyz,
+// Control-plane listener for gatewayd-internal (spec §11, §12). The /healthz, /readyz,
 // and /metrics endpoints MUST NOT be on the public listener — they leak
 // operational data and CSRF-style probes have no business hitting them. This
 // file owns a SECOND *http.Server on a private listener (default :9090) that
@@ -7,7 +7,7 @@
 //	public   :80/:443   → Handler.ServeHTTP       (proxies customer apps)
 //	private  :9090      → ControlMux              (health + metrics)
 //
-// The private listener is wired into the cmd/gatewayd main alongside the
+// The private listener is wired into the cmd/gatewayd-internal/main alongside the
 // public server with its own graceful-shutdown context.
 package gateway
 
@@ -31,7 +31,7 @@ const ControlAddr = ":9090"
 // nil-ready behaviour is the SAFE default post-Tier-A7: a daemon that
 // forgets to wire a probe is marked not-ready rather than silently ready,
 // so the LB never routes traffic to a partial-boot instance. The pre-split
-// always-200 default was a latent bug (cmd/gatewayd/main.go:878 wired nil
+// always-200 default was a latent bug (cmd/gatewayd-internal/main.go:878 wired nil
 // and /readyz was useless); ADR-070 closes that.
 func ControlMux(m *Metrics, ready ReadyFunc) *http.ServeMux {
 	mux := http.NewServeMux()

@@ -1,4 +1,4 @@
-// Prometheus instrumentation for gatewayd (spec §4.1, §12). The metric names
+// Prometheus instrumentation for gatewayd-internal (spec §4.1, §12). The metric names
 // here are dashboard dependencies — DO NOT rename without coordinating with
 // the dashboards in deploy/grafana/. We register on a per-Handler registry
 // (not the global default) so concurrent tests don't collide.
@@ -18,7 +18,7 @@
 //     gateway_cold_wake_total in #273 / ADR-042; zero external consumers so
 //     it is a straight rename, not a dual-emit migration)
 //   - gateway_top_tenant_rps{account_id}             gauge (issue #300;
-//     label value is the resolved app_id — gatewayd's only
+//     label value is the resolved app_id — gatewayd-internal's only
 //     tenant-attributable key — see ObserveTopTenantRPS)
 //   - gateway_tls_cert_expiry_seconds                gauge (ADR-024 H3, closed
 //     in PR #345; refreshed every 5 min by StartCertExpiryRefresher; smallest
@@ -36,8 +36,8 @@
 //     usage_minutes.tx_bytes; this counter is the §12
 //     FaasTenantEgressSpike real-time operator view — "rate > 1GiB/min
 //     sustained 5m on a single (app, plan) pair". Lives on the
-//     gatewayd-local registry (the daemon's /metrics scrape); the
-//     cross-daemon contract is not duplicated here because gatewayd
+//     gatewayd-internal-local registry (the daemon's /metrics scrape); the
+//     cross-daemon contract is not duplicated here becausegatewayd-internal
 //     does not construct pkg/wire.OpsMetrics today. If a future
 //     daemon ever needs to surface this counter alongside its
 //     own, instantiate it via a fresh CounterVec — do NOT bring
@@ -49,7 +49,7 @@
 //     snapshot-store decision is a measurement, not a guess)
 //   - gateway_compute_node_changed_subscriber_alive  unlabelled gauge (PR
 //     scale-out readiness; bumped every 30s by the LISTEN
-//     compute_node_changed subscriber loop in cmd/gatewayd/nodecache.go.
+//     compute_node_changed subscriber loop in cmd/gatewayd-internal/nodecache.go.
 //     Stale gauge means the NodeClientCache is silently out of date and
 //     the next compute_nodes UPSERT is invisible to placement — page
 //     rule fires when the gauge freezes or drops to 0. The hook is the
@@ -84,7 +84,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 )
 
-// Metrics is the gatewayd Prometheus bundle. Construct once per Handler via
+// Metrics is the gatewayd-internal Prometheus bundle. Construct once per Handler via
 // NewMetrics and pass into NewHandlerWith.
 type Metrics struct {
 	registry *prometheus.Registry
@@ -153,7 +153,7 @@ type Metrics struct {
 	// Concurrency: single-writer by design. ONLY refreshCertExpiryOnce
 	// (and its callees ObserveHostCertExpiry / DeleteHostCertExpiry)
 	// touch this map, and it runs as a single-goroutine ticker
-	// (cmd/gatewayd/main.go). The /metrics scrape path doesn't read it
+	// (cmd/gatewayd-internal/main.go). The /metrics scrape path doesn't read it
 	// — Gather walks the *Vec by label, not by hostKinds. If a future
 	// change introduces a second writer, this map must grow its own
 	// mutex.
@@ -181,7 +181,7 @@ type Metrics struct {
 	// label name `account_id` with apid so a single Grafana
 	// panel can join both surfaces — but the label VALUE at
 	// the gateway is the resolved app_id, not an authenticated
-	// principal. Gatewayd is pre-auth (TLS + hostname routing
+	// principal. The public edge (gatewayd-public) is pre-auth (TLS + hostname routing
 	// only); the only tenant-attributable key on the request
 	// path is the app_id (the apps table's owner is in apid's
 	// domain). Operators reading the panel should treat
@@ -189,7 +189,7 @@ type Metrics struct {
 	// and apid_top_tenant_rps as "noisy customers on the API".
 	//
 	// The 5s sample cadence + 24h rolling reset are owned by
-	// the same sampler pattern as apid's (cmd/gatewayd/main.go
+	// the same sampler pattern as apid's (cmd/gatewayd-internal/main.go
 	// runs a parallel topNSampler); see pkg/wire/topn.go for
 	// the cardinality contract.
 	topTenantRPS *prometheus.GaugeVec
@@ -246,14 +246,14 @@ type Metrics struct {
 	wakeSnapshotTier *prometheus.CounterVec
 	// computeNodeChangedSubscriberAlive is the per-process liveness
 	// gauge for the LISTEN compute_node_changed subscriber loop
-	// (cmd/gatewayd/nodecache.go:102-141). PR scale-out readiness:
+	// (cmd/gatewayd-internal/nodecache.go:102-141). PR scale-out readiness:
 	// bumped every `subscriberHeartbeatInterval` (30s) while the
 	// subscriber is alive. On ctx cancel, channel close, or the
 	// initial subscribe failure, the heartbeat goroutine stops and
 	// the gauge freezes at its last value — operators see "I'm stale"
 	// without a separate series per channel. Unlabelled: cardinality
 	// is per-process, not per node / channel / daemon. Nil-safe via
-	// TouchComputeNodeChangedSubscriber so cmd/gatewayd's wiring can
+	// TouchComputeNodeChangedSubscriber so cmd/gatewayd-internal's wiring can
 	// pass nil *Metrics in tests without a guarded call site.
 	computeNodeChangedSubscriberAlive prometheus.Gauge
 }
@@ -315,7 +315,7 @@ func NewMetrics() *Metrics {
 			Help: "Requests rejected by the per-app rate limiter.",
 		}, []string{"app", "plan"}),
 		// ADR-046 PR-2 producer observability. Counter is
-		// registered on the gatewayd-local registry (this
+		// registered on the gatewayd-internal-local registry (this
 		// daemon scrapes /metrics via the control listener).
 		// The cross-daemon pkg/wire.OpsMetrics mirror was
 		// removed in the PR-2 review pass — there was no
@@ -384,7 +384,7 @@ func NewMetrics() *Metrics {
 		}, []string{"app"}),
 		topTenantRPS: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "gateway_top_tenant_rps",
-			Help: "Top-N 5s request rate per tenant observed at the edge (issue #300). Label key is account_id for parity with apid_top_tenant_rps; the label VALUE at the gateway is the resolved app_id (gatewayd is pre-auth and only sees hostname→app routing). Cardinality bounded at topAccountSetCap (1000) + 1 \"other\" overflow by pkg/wire/topn.go via the cmd/gatewayd/topn.go sampler. The overflow bucket literally named \"other\" matches apid's gauge.",
+			Help: "Top-N 5s request rate per tenant observed at the edge (issue #300). Label key is account_id for parity with apid_top_tenant_rps; the label VALUE at the gateway is the resolved app_id (gatewayd-internal is pre-auth and only sees hostname→app routing). Cardinality bounded at topAccountSetCap (1000) + 1 \"other\" overflow by pkg/wire/topn.go via the cmd/gatewayd-internal/topn.go sampler. The overflow bucket literally named \"other\" matches apid's gauge.",
 		}, []string{"account_id"}),
 		// ADR-024 H3 (closed in PR #345). Gauge starts unset (NaN at
 		// scrape time — Prometheus drops NaN series, so an idle daemon
@@ -459,7 +459,7 @@ func NewMetrics() *Metrics {
 		// PR scale-out readiness — liveness gauge for the LISTEN
 		// compute_node_changed subscriber. Bumped every
 		// `subscriberHeartbeatInterval` (30s) by the goroutine in
-		// cmd/gatewayd/nodecache.go.WatchEvictions; the gauge freezes
+		// cmd/gatewayd-internal/nodecache.go.WatchEvictions; the gauge freezes
 		// at its last value when the heartbeat goroutine ends
 		// (ctx cancel / channel close / initial subscribe failure)
 		// so a frozen gauge is the "subscriber died" signal. Series
@@ -468,7 +468,7 @@ func NewMetrics() *Metrics {
 		// gateway_tls_cert_expiry_seconds (H3, closed in PR #345).
 		computeNodeChangedSubscriberAlive: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gateway_compute_node_changed_subscriber_alive",
-			Help: "Liveness gauge for the LISTEN compute_node_changed subscriber loop in cmd/gatewayd/nodecache.go. Bumped every subscriberHeartbeatInterval (30s) while the subscriber is alive. A frozen or zero gauge means the NodeClientCache is silently out of date and the next compute_nodes UPSERT is invisible to placement. The hook is the observability point; the alert rule + window choice live in ops wiring, out of scope for this PR.",
+			Help: "Liveness gauge for the LISTEN compute_node_changed subscriber loop in cmd/gatewayd-internal/nodecache.go. Bumped every subscriberHeartbeatInterval (30s) while the subscriber is alive. A frozen or zero gauge means the NodeClientCache is silently out of date and the next compute_nodes UPSERT is invisible to placement. The hook is the observability point; the alert rule + window choice live in ops wiring, out of scope for this PR.",
 		}),
 	}
 	// Pre-instantiate the ("other",) row on gateway_top_tenant_rps so
@@ -488,7 +488,7 @@ func NewMetrics() *Metrics {
 	// appear after the first denial, hiding the "frozen zero =
 	// follow-up unmerged" signal we depend on for the §12 dashboard
 	// panel. NewMetrics is called exactly once per daemon
-	// (cmd/gatewayd/main.go:269), so each daemon gets exactly one set
+	// (cmd/gatewayd-internal/main.go:269), so each daemon gets exactly one set
 	// of pre-instantiated series; if you ever construct a second
 	// *Metrics, that's by design, not a bug. (ADR-024 H3, PR #345.)
 	for _, reason := range []string{"allowlist", "dns01", "token"} {
@@ -561,7 +561,7 @@ func (m *Metrics) ObserveRequest(appID, plan, code string) {
 // ObserveResponseBytes increments the per-(app, plan) egress byte
 // counter for ADR-046 PR-2. Nil-receiver safe (mirrors the rest of
 // the Observe* family). Called from Handler.recordEgress on the
-// 2xx/3xx path only. The counter lives on the gatewayd-local
+// 2xx/3xx path only. The counter lives on the gatewayd-internal-local
 // registry; the cross-daemon pkg/wire mirror was removed (review
 // pass: no production caller existed).
 func (m *Metrics) ObserveResponseBytes(appID, plan string, n int64) {
@@ -740,7 +740,7 @@ func (m *Metrics) ObserveWakeSnapshotTier(tier string) {
 
 // TouchComputeNodeChangedSubscriber bumps the subscriber-liveness gauge
 // by 1. Called every `subscriberHeartbeatInterval` (30s, see
-// cmd/gatewayd/nodecache.go) by the heartbeat goroutine that mirrors
+// cmd/gatewayd-internal/nodecache.go) by the heartbeat goroutine that mirrors
 // StartCertExpiryRefresher. The gauge value is monotonically
 // increasing until the heartbeat goroutine ends (ctx cancel / channel
 // close / initial subscribe failure) — the freeze is the "I'm stale"
@@ -754,7 +754,7 @@ func (m *Metrics) ObserveWakeSnapshotTier(tier string) {
 // wiring and out of scope for this PR. The hook is the
 // observability point.
 //
-// Nil-safe: cmd/gatewayd tests may pass a nil *Metrics. Production
+// Nil-safe: cmd/gatewayd-internal/tests may pass a nil *Metrics. Production
 // passes deps.metrics which is always non-nil after NewMetrics.
 func (m *Metrics) TouchComputeNodeChangedSubscriber() {
 	if m == nil || m.computeNodeChangedSubscriberAlive == nil {
@@ -768,7 +768,7 @@ func (m *Metrics) TouchComputeNodeChangedSubscriber() {
 // produced by the sampler; "other" is the overflow bucket rps.
 // Called once per 5s tick; nil-safe.
 //
-// The sampler in cmd/gatewayd/topn.go runs a local topAccountSet
+// The sampler in cmd/gatewayd-internal/topn.go runs a local topAccountSet
 // (mirroring pkg/wire/topn.go) and computes the top-N from its
 // own snapshot. It passes the resulting (id, rps) list here
 // rather than a closure because the gateway side has no

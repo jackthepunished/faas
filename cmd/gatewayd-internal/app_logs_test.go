@@ -1,6 +1,6 @@
-// Whitebox tests for cmd/gatewayd/app_logs.go — the AppLogsHandler
+// Whitebox tests for cmd/gatewayd-internal/app_logs.go — the AppLogsHandler
 // receive pump. The PR-2 wiring pushes the customer-facing log
-// stream from cmd/apid to cmd/gatewayd (issue #254 / Move 4), so
+// stream from cmd/apid to cmd/gatewayd-internal (issue #254 / Move 4), so
 // these tests are the corresponding whitebox surface, ported from
 // cmd/apid/schedd_client_test.go (which is now deleted).
 //

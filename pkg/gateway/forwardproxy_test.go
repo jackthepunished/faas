@@ -789,7 +789,7 @@ func stripHopByHopImpl(h http.Header) http.Header {
 // number — clock skew would flake).
 func TestForwardingReverseProxyWithEvents_EmitsProxyFirstByte(t *testing.T) {
 	store := state.NewMemStore()
-	platform := events.NewPlatform("gatewayd", store, slog.Default(), wire.NewOpsMetrics("gatewayd-test"), nil)
+	platform := events.NewPlatform("gatewayd-internal", store, slog.Default(), wire.NewOpsMetrics("gatewayd-test"), nil)
 
 	stream := &fakeBidiStream{
 		Responses: []*vmmdpb.ForwardHTTPStreamResponse{

@@ -20,7 +20,7 @@
 // host's compile-time defaults (mirrors cmd/vmmd/capacity_publisher.go's
 // "freshness, not authority" treaty).
 //
-// Drain-loop pattern mirrors cmd/gatewayd/nodecache.go::WatchEvictions
+// Drain-loop pattern mirrors cmd/gatewayd-internal/nodecache.go::WatchEvictions
 // and pkg/sched/nodekeys.go::(*NodeKeyRegistry).Run. Uses
 // db.SubscribeWithReconnect so a Postgres restart doesn't strand the
 // reload loop. The first-subscribe failure is logged-and-returned;

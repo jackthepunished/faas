@@ -112,7 +112,7 @@ func WaitForInstanceState(ctx context.Context, t T, pool *pgxpool.Pool, appID st
 }
 
 // WaitForHTTPReady polls a URL until it returns 2xx. Used to confirm
-// gatewayd's route cache has picked up an app_changed event before the test
+// gatewayd-internal's route cache has picked up an app_changed event before the test
 // fires its first request (CLAUDE.md gotcha: "the gateway holds requests
 // during wake" — but a route that's not yet cached 404s, which is different
 // from a wake-block, and the test should distinguish the two).
@@ -124,7 +124,7 @@ func WaitForHTTPReady(ctx context.Context, t T, client *http.Client, url string,
 		resp, err := client.Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
-			// 2xx OR a routing error code (4xx) both prove gatewayd is up.
+			// 2xx OR a routing error code (4xx) both prove gatewayd-internal is up.
 			// We just want to know the listener is alive.
 			if resp.StatusCode < 500 {
 				return nil

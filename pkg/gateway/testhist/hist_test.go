@@ -144,7 +144,7 @@ func TestQuantile_KnownDistribution(t *testing.T) {
 
 // TestSnapshotFromText parses a synthetic /metrics exposition and confirms
 // bucket cumulative counts land in the right cells. The exposition format
-// mirrors what gatewayd's /metrics serves for gateway_wake_latency_seconds.
+// mirrors what gatewayd-internal's /metrics serves for gateway_wake_latency_seconds.
 func TestSnapshotFromText(t *testing.T) {
 	text := strings.Join([]string{
 		`gateway_wake_latency_seconds_bucket{le="0.05"} 5`,

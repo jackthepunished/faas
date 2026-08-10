@@ -1,7 +1,7 @@
 // Package apislogs holds the SSE envelope helpers for the customer-
 // facing app-logs stream (issue #254 / Move 4 landing). Both the
 // cmd/apid tail (PR-A wiring, kept for the e2e harness direct-hit
-// path) and the cmd/gatewayd inline handler (PR-2 production
+// path) and the cmd/gatewayd-internal/inline handler (PR-2 production
 // wiring) render the same `text/event-stream` envelope shape, so
 // the helpers live here rather than being duplicated in each
 // daemon.
@@ -314,7 +314,7 @@ func ParseInt64Query(r *http.Request, name string, def int64) int64 {
 // IsTerminalFrame is the small predicate the SDK uses to decide
 // when a frames stream is done. Event-name lookup is the
 // cheapest check; the SDK reads the full line anyway. Exposed
-// here so the apid tail (PR-A) and the gatewayd handler (PR-2)
+// here so the apid tail (PR-A) and the gatewayd-internal handler (PR-2)
 // agree on which event names end the stream.
 //
 // Post-condition: every terminal frame in the wire shape is

@@ -2,13 +2,13 @@
 // required by spec §11 + DPA §TLS-on-the-dashboard. It is the only
 // place in the codebase that sets Strict-Transport-Security,
 // Content-Security-Policy, X-Frame-Options, X-Content-Type-Options,
-// Referrer-Policy, and Permissions-Policy. gatewayd and apid mount
+// Referrer-Policy, and Permissions-Policy. gatewayd-internal and apid mount
 // these middlewares at the outermost wrapper of their public
-// listeners (cmd/gatewayd/main.go publicHandler,
+// listeners (cmd/gatewayd-internal/main.go publicHandler,
 // cmd/apid/server.go observeWrap return).
 //
 // Static headers (Static) apply to every response. Content-Security-
-// Policy with per-request nonces (Nonce) is gated: gatewayd only
+// Policy with per-request nonces (Nonce) is gated: gatewayd-internal only
 // emits it on requests that resolve to apid (so customer-app responses
 // keep the customer's own CSP), apid emits it on every response (apid
 // serves only dashboard + API; the JSON API carries a harmless CSP).

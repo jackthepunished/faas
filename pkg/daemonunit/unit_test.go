@@ -193,7 +193,7 @@ func TestRender_RuntimeDirectoryPair(t *testing.T) {
 	}
 }
 
-// TestRender_RestrictAddressFamiliesAsList covers the gatewayd pair
+// TestRender_RestrictAddressFamiliesAsList covers the gatewayd-internal pair
 // (gatewayd-public uses AF_UNIX AF_INET; gatewayd-internal uses AF_UNIX
 // AF_INET AF_INET6 for the loopback control listener).
 func TestRender_RestrictAddressFamiliesAsList(t *testing.T) {

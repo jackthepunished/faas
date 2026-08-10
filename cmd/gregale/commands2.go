@@ -1956,7 +1956,7 @@ func cmdOpenDocs(args []string) int {
 }
 
 // dashboardBaseURL returns the dashboard's public base URL. Today
-// that's the API base minus /v1; the gatewayd reverse-proxy serves
+// that's the API base minus /v1; the gatewayd-public reverse-proxy serves
 // /dashboard/* from the same host. We use this so `gregale open` and
 // `gregale connect` build a clickable URL the customer's browser can
 // reach.

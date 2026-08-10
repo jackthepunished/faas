@@ -1,8 +1,8 @@
-// CertMagic wiring for gatewayd (spec §11, §4.1).
+// CertMagic wiring for gatewayd-internal (spec §11, §4.1).
 //
-// Production layout (cmd/gatewayd/main.go calls into this):
+// Production layout (cmd/gatewayd-public/main.go calls into this):
 //
-//	cfg, err := gateway.NewCertMagicConfig(ctx, gatewaydConfig.TLS, hetznerToken, log)
+//	cfg, err := gateway.NewCertMagicConfig(ctx, gatewayd-publicConfig.TLS, hetznerToken, log)
 //	// cfg.GetCertificate is the tls.Config.GetCertificate callback
 //	// cfg.HTTPChallengeHandler is the :80 handler for ACME challenges
 //	// cfg.OnDemandDecisionFunc mirrors what we set here for tests
@@ -16,11 +16,11 @@
 //
 // What this file does NOT own:
 //
-//   - the tls.Config.MinVersion / cipher suites (cmd/gatewayd/main.go)
-//   - the listener bind addresses (cmd/gatewayd/main.go)
+//   - the tls.Config.MinVersion / cipher suites (cmd/gatewayd-public/main.go)
+//   - the listener bind addresses (cmd/gatewayd-public/main.go)
 //   - the :80 ACME mux + redirect (pkg/gateway/acme.go)
 //
-// Why one Config and not per-host: spec §4.1 makes gatewayd the only public
+// Why one Config and not per-host: spec §4.1 makes gatewayd-internal the only public
 // listener on the box, and the wildcard + on-demand certs share storage and
 // the in-process lock — splitting them across Configs would force cross-cache
 // coordination for renewals. Single Config is the load-bearing invariant.
@@ -44,7 +44,7 @@ import (
 // sites.
 func zapNop() *zap.Logger { return zap.NewNop() }
 
-// TLSBundle is the wired CertMagic surface cmd/gatewayd hands to its
+// TLSBundle is the wired CertMagic surface cmd/gatewayd-internal/hands to its
 // listeners. Keep this struct tight: every field is consumed by main.go to
 // build the public tls.Config and the :80 handler. Adding fields here forces
 // every call site to be revisited, which is the right friction.
@@ -89,7 +89,7 @@ var silentZap = zapNop()
 // can be exercised without hitting the real Hetzner API.
 type DNSProviderFactory func(token, zone string) certmagic.DNSProvider
 
-// NewCertMagicConfig constructs the wired TLSBundle from the gatewayd
+// NewCertMagicConfig constructs the wired TLSBundle from thegatewayd-internal
 // TOML-shaped TLSConfig. It enforces Validate() invariants: callers should
 // already have called TLSConfig.Validate(), but this function re-checks the
 // surface it actually consumes (cert magic has no notion of "Disabled") so

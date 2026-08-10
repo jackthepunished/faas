@@ -262,7 +262,7 @@ func (s *server) deleteComputeNode(w http.ResponseWriter, r *http.Request, acct 
 	}
 	// Soft-delete path: resolve, then flip active=false. The
 	// compute_node_changed pg_notify trigger (migration 00026) fires
-	// on the UPDATE, gatewayd evicts its per-node client cache,
+	// on the UPDATE, gatewayd-internal evicts its per-node client cache,
 	// and schedd's watchdog treats the row as drained.
 	row, err := s.store.ComputeNodeByName(r.Context(), name)
 	if err != nil {

@@ -1,7 +1,7 @@
 // Whitebox + blackbox tests for pkg/authmw.Middleware.
 //
 // Blackbox cases live in this file (package auth_test) so they
-// exercise the exported surface as cmd/apid + future cmd/gatewayd
+// exercise the exported surface as cmd/apid + future cmd/gatewayd-internal/
 // callers will. Whitebox tests for ctx-stamping helpers live in
 // context_test.go (package auth) where they can call the
 // unexported stamp helpers.

@@ -244,7 +244,7 @@ type Event struct {
 	// forwards the event (pre-#294 behaviour).
 	//
 	// GitHub webhooks carry the same UUID via the X-GitHub-Delivery
-	// header, which gatewayd consults directly without round-tripping
+	// header, which gatewayd-internal consults directly without round-tripping
 	// through this struct.
 	EventID string
 

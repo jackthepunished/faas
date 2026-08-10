@@ -2,7 +2,7 @@
 // every daemon's public listener (spec §11 — Single public listener).
 //
 // Slice 2 ships three middlewares that close §11 gaps apid needs:
-// RequestID, Recovery, and AuthLimit. Gatewayd has had its own
+// RequestID, Recovery, and AuthLimit. The gatewayd-public edge has had its own
 // request-id primitive since M0 — the pkg/middleware copy is the same
 // algorithm so the wire header (x-faas-request-id) stays compatible.
 package middleware
@@ -60,7 +60,7 @@ func NewRequestID() string {
 // x-faas-request-id header (inbound override OR freshly generated),
 // stores it on the context via WithRequestID, and echoes it back on
 // the response. Wire-compatible with pkg/gateway/observability so the
-// same value flows from gatewayd through the reverse-proxy to apid.
+// same value flows from gatewayd-internal through the reverse-proxy to apid.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rid := r.Header.Get("x-faas-request-id")

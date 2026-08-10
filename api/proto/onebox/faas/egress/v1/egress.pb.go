@@ -1,5 +1,5 @@
-// gatewayd egress producer service (ADR-046 PR-2). One streaming
-// RPC: `StreamBytes` server-streaming from gatewayd to meterd.
+// gatewayd-internal egress producer service (ADR-046 PR-2). One streaming
+// RPC: `StreamBytes` server-streaming from gatewayd-internal to meterd.
 // Each chunk is one (instance_id, minute, bytes) drained from the
 // in-memory per-instance ring buffer
 // (pkg/gateway/egresssink.EgressSink). The meterd side reads,

@@ -420,7 +420,7 @@ type OpsMetrics struct {
 	ipLabels *ipLabelSet
 	// topTenantRPS: introduced in issue #300 — a per-tenant RPS
 	// gauge sampled every 5s by the daemon's topNSampler goroutine
-	// (cmd/apid/topn.go / cmd/gatewayd/listener.go). Bounded at
+	// (cmd/apid/topn.go / cmd/gatewayd-internal/listener.go). Bounded at
 	// topAccountSetCap (1000) real customer ids plus the "other"
 	// overflow bucket (see pkg/wire/topn.go). Layered above
 	// accountLabelSet: an id admitted at the 10k level can still
@@ -539,7 +539,7 @@ type OpsMetrics struct {
 	// (unlabelled) so the bucket set is sized to the actual hot path
 	// (sub-ms per row) — the general `dur` histogram tops out at 5 s
 	// and would lose all resolution here. nil on daemons that don't
-	// expose the path (apid, imaged, builderd, gatewayd, meterd,
+	// expose the path (apid, imaged, builderd, gatewayd-internal, meterd,
 	// githubd, faas CLI). Buckets: 100 µs → 100 ms.
 	cpuStatsCollectDur prometheus.Histogram
 	// residentGBPerCustomer: per-plan "resident GB-hours per paying
@@ -973,7 +973,7 @@ type OpsMetrics struct {
 	// on an idle daemon and the histogram has a series to bucket
 	// into the moment the first wake fires. Single-registry:
 	// registered on every daemon so the struct stays a single
-	// registry — only schedd / vmmd / gatewayd / builderd / apid
+	// registry — only schedd / vmmd / gatewayd-internal / builderd / apid
 	// increment via Platform.Emit in production; other daemons
 	// sit at zero. Closed set is the 13 phases from
 	// pkg/events/wake.go.
@@ -1319,7 +1319,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// auditOrgEvent (PR 6 / issue #190): closed 11-verb counter per
 	// outcome. The increment site lives in pkg/authz/authorize.go
 	// (deny paths) — apid emits one Counter per deny + one per allow;
-	// schedd / meterd / gatewayd do not call AuthorizeOrgAction
+	// schedd / meterd / gatewayd-internal do not call AuthorizeOrgAction
 	// today, so their registries have the counters registered but
 	// always-zero (matches the single-registry pattern in
 	// [wire-opsmetrics-single-registry]). result ∈ {allowed, denied}.
@@ -1446,7 +1446,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// CPU hot path is per-RPC, not per-tick, and we want bucket
 	// resolution at the cache.Lookup scale (sub-ms per row,
 	// ~µs at 100 instances). nil on daemons that don't expose the
-	// path (apid, imaged, builderd, gatewayd, meterd, githubd,
+	// path (apid, imaged, builderd, gatewayd-internal, meterd, githubd,
 	// faas CLI).
 	var cpuStatsCollectDurLocal prometheus.Histogram
 	switch prefix {
@@ -1728,7 +1728,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// proxy <5s; the 60s tail catches pathological stalls.
 	wakePhaseEmitted := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_phase_emitted_total",
-		Help: "Count of wake-timeline events emitted via pkg/events.Platform, labelled by phase (the substring after `wake.`, e.g. `boot_started`, `readiness_200`, `proxy_first_byte`) and result ∈ {ok, failed} (issue #517 / PR-C, ADR-064). Single-registry: registered on every daemon; only schedd / vmmd / gatewayd / builderd / apid increment via Platform.Emit. The closed 13-phase set is pre-instantiated at boot so the §12 wake-latency panel surfaces zero on an idle daemon.",
+		Help: "Count of wake-timeline events emitted via pkg/events.Platform, labelled by phase (the substring after `wake.`, e.g. `boot_started`, `readiness_200`, `proxy_first_byte`) and result ∈ {ok, failed} (issue #517 / PR-C, ADR-064). Single-registry: registered on every daemon; only schedd / vmmd / gatewayd-internal / builderd / apid increment via Platform.Emit. The closed 13-phase set is pre-instantiated at boot so the §12 wake-latency panel surfaces zero on an idle daemon.",
 	}, []string{"phase", "result"})
 	wakePhaseDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_wake_phase_duration_seconds",
@@ -2194,7 +2194,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// RPS gauge so the help/TYPE surfaces in /metrics from boot, before
 	// the first 5s sampler tick fires. Same precedent as the closed
 	// scale-up outcome / egress-deny catalog loops above. Real customer
-	// ids are added by TopTenantRPSFor (cmd/apid/topn.go / cmd/gatewayd/
+	// ids are added by TopTenantRPSFor (cmd/apid/topn.go / cmd/gatewayd-internal/
 	// listener.go), which routes through topAccountSet and demotes past
 	// top-1000 into this bucket.
 	topTenantRPS.WithLabelValues(topAccountOtherLabel)
@@ -3196,7 +3196,7 @@ func (m *OpsMetrics) CapacitySignatureRejected() prometheus.Counter {
 // (issue #279 / PR-B / ADR-039). The histogram is per-RPC (not
 // per-tick) and unlabelled; the underlying Histogram is a
 // singleton, not a vec. nil on daemons that don't expose the
-// path (apid, imaged, builderd, gatewayd, meterd, githubd,
+// path (apid, imaged, builderd, gatewayd-internal, meterd, githubd,
 // faas CLI) — the vmmdgrpc.Stats and scheddgrpc.ListInstanceStats
 // handlers guard the call with a nil check. Safe to cache.
 func (m *OpsMetrics) CPUStatsCollectDuration() prometheus.Histogram {

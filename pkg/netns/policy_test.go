@@ -68,7 +68,7 @@ func TestHostPolicyForwardDefaultDrop(t *testing.T) {
 //
 // Scoped to the forward chain: the rendered text also has a
 // `tcp dport { 22,80,443 } accept` line in the INPUT chain (sshd +
-// gatewayd), so a whole-ruleset substring scan would falsely match
+// gatewayd-internal), so a whole-ruleset substring scan would falsely match
 // that allowline first. The forward chain is where the SMTP drops
 // live (spec §11).
 func TestHostPolicyRenderDeniesAllSMTPPorts(t *testing.T) {

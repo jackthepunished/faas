@@ -257,7 +257,7 @@ func TestPGBackend_PickAfterEvictNodeEntry(t *testing.T) {
 }
 
 // TestPGBackend_PickFollowsWarmHintCache wires a real
-// *gateway.WarmHintCache (the same type cmd/gatewayd constructs)
+// *gateway.WarmHintCache (the same type cmd/gatewayd-internal/constructs)
 // as the picker's WarmHintFunc, then drives cache.Update the way
 // the warmHintConsumer would after a StreamWarmHints event. End-
 // to-end picker coverage for the WarmHintCache → HintFunc →

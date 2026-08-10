@@ -1,6 +1,6 @@
 // schedd — the scheduler and instance-lifecycle owner (spec §4.3, ADR-018).
 // schedd is the ONLY writer to the `instances` table and the sole owner of the
-// state machine (spec §6). This gRPC surface is how gatewayd asks schedd to
+// state machine (spec §6). This gRPC surface is how gatewayd-internal asks schedd to
 // wake an app and reports request activity back; schedd itself dials vmmd
 // (api/proto/onebox/faas/vmmd/v1) to drive the actual microVM lifecycle.
 //
@@ -44,7 +44,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // Schedd is the gRPC service schedd exposes on its unix socket. Two RPCs for
-// v1.0 — gatewayd is the only caller. Multi-host (Gate-A) replaces the socket
+// v1.0 — gatewayd-internal is the only caller. Multi-host (Gate-A) replaces the socket
 // with mTLS; this ADR-018 surface is per-host.
 type ScheddClient interface {
 	// Wake ensures an instance for the app is running and returns the address
@@ -142,15 +142,15 @@ type ScheddClient interface {
 	// StreamWarmHints (ADR-025 axis 4) is the sticky-warm affinity push.
 	// schedd is the only writer to pkg/sched.WarmAffinity; every successful
 	// admit stamps (app_id → node_id) and we forward the stamp as an event
-	// so gatewayd's picker (PGBackend.WarmHintFunc) can bias traffic to the
+	// so gatewayd-internal's picker (PGBackend.WarmHintFunc) can bias traffic to the
 	// warm node on multi-box fleets.
 	//
 	// Semantics:
-	//   - Server-streaming; gatewayd opens one stream at startup and keeps
+	//   - Server-streaming; gatewayd-internal opens one stream at startup and keeps
 	//     it open for the lifetime of the connection.
 	//   - "Tail from now": no replay cursor, no snapshot on connect. ADR-005
 	//     guarantees an empty hint falls through to least-loaded, so a
-	//     gatewayd that reconnects with no hint still routes correctly.
+	//     gatewayd-internal that reconnects with no hint still routes correctly.
 	//   - Events are emitted only on state change (RecordWake actually
 	//     changed app_id → node_id); a periodic RecordWake to the same node
 	//     is a no-op event-source-wise. The producer filters at emit time.
@@ -349,7 +349,7 @@ func (c *scheddClient) ReportLivenessFailed(ctx context.Context, in *LivenessFai
 // for forward compatibility.
 //
 // Schedd is the gRPC service schedd exposes on its unix socket. Two RPCs for
-// v1.0 — gatewayd is the only caller. Multi-host (Gate-A) replaces the socket
+// v1.0 — gatewayd-internal is the only caller. Multi-host (Gate-A) replaces the socket
 // with mTLS; this ADR-018 surface is per-host.
 type ScheddServer interface {
 	// Wake ensures an instance for the app is running and returns the address
@@ -447,15 +447,15 @@ type ScheddServer interface {
 	// StreamWarmHints (ADR-025 axis 4) is the sticky-warm affinity push.
 	// schedd is the only writer to pkg/sched.WarmAffinity; every successful
 	// admit stamps (app_id → node_id) and we forward the stamp as an event
-	// so gatewayd's picker (PGBackend.WarmHintFunc) can bias traffic to the
+	// so gatewayd-internal's picker (PGBackend.WarmHintFunc) can bias traffic to the
 	// warm node on multi-box fleets.
 	//
 	// Semantics:
-	//   - Server-streaming; gatewayd opens one stream at startup and keeps
+	//   - Server-streaming; gatewayd-internal opens one stream at startup and keeps
 	//     it open for the lifetime of the connection.
 	//   - "Tail from now": no replay cursor, no snapshot on connect. ADR-005
 	//     guarantees an empty hint falls through to least-loaded, so a
-	//     gatewayd that reconnects with no hint still routes correctly.
+	//     gatewayd-internal that reconnects with no hint still routes correctly.
 	//   - Events are emitted only on state change (RecordWake actually
 	//     changed app_id → node_id); a periodic RecordWake to the same node
 	//     is a no-op event-source-wise. The producer filters at emit time.

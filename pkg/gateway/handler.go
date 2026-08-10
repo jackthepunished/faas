@@ -167,7 +167,7 @@ type AppSidecar struct {
 // branch consumes — AuthenticateKey alone, returning
 // (account, key, error). Declaring it locally keeps pkg/gateway
 // free of any import dependency on pkg/auth or pkg/state
-// (cmd/gatewayd wires the *authmw.Middleware, which satisfies
+// (cmd/gatewayd-internal/wires the *authmw.Middleware, which satisfies
 // this interface through its exported Authn field; the
 // compile-time assertion at the call site pins the contract).
 type RequireAuthnAuthenticator interface {
@@ -191,7 +191,7 @@ type RequireAuthnKey struct {
 	ID string
 }
 
-// RequireAuthnAuditor is the narrow slice of cmd/gatewayd/audit.go's
+// RequireAuthnAuditor is the narrow slice of cmd/gatewayd-internal/audit.go's
 // gatewaydAuditor the per-deployment authz branch uses to emit
 // instances.authn_missing / instances.authn_invalid /
 // instances.authn_scope. Declared locally so pkg/gateway doesn't
@@ -327,7 +327,7 @@ type Backend interface {
 	Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
 }
 
-// Handler is gatewayd's HTTP entrypoint: route → rate-limit → (wake-block if
+// Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
 // parked) → proxy (spec §4.1, §2). It is the only public listener on the box.
 type Handler struct {
 	backend Backend
@@ -350,7 +350,7 @@ type Handler struct {
 	appsSuffix string
 	// egressSink records per-instance HTTP response body bytes for
 	// ADR-046 (per-instance egress metering, telemetry only).
-	// Set via WithEgressSink from cmd/gatewayd/main.go; nil in
+	// Set via WithEgressSink from cmd/gatewayd-internal/main.go; nil in
 	// unit tests that don't exercise the egress counter.
 	// Recording happens in observe() after the proxy returns —
 	// see the proxyByNode call site in ServeHTTP.
@@ -364,7 +364,7 @@ type Handler struct {
 	// Backend.Pick is interpreted as a node id and dereferenced via
 	// the per-node vmmd client cache. nil = legacy addr-based path
 	// (default for tests and the e2e harness; production wires
-	// ForwardingReverseProxy in cmd/gatewayd/main.go).
+	// ForwardingReverseProxy in cmd/gatewayd-internal/main.go).
 	//
 	// PR-C (issue #460 / ADR-053): the callback receives the full
 	// Target (not just the node id) so the forwarder can stamp
@@ -382,7 +382,7 @@ type Handler struct {
 	// into the guest's netns TCP socket. nil = the raw path is
 	// disabled (default for tests and the e2e harness without a
 	// vmmd overlay; production wires ForwardingRawReverseProxy in
-	// cmd/gatewayd/main.go alongside proxyByNode).
+	// cmd/gatewayd-internal/main.go alongside proxyByNode).
 	//
 	// Detection happens BEFORE proxyByNode is invoked: see the
 	// isUpgradeRequest branch at the proxyByNode call site in
@@ -391,8 +391,8 @@ type Handler struct {
 	// Plan.WebSocketEnabled / WebSocketResponseAllowed).
 	rawByNode func(t Target) http.Handler
 	// topNSample is the per-request bump for the gateway-side
-	// top-N sampler (cmd/gatewayd/topn.go, issue #300). Set via
-	// SetTopNSample from cmd/gatewayd/main.go. nil in unit
+	// top-N sampler (cmd/gatewayd-internal/topn.go, issue #300). Set via
+	// SetTopNSample from cmd/gatewayd-internal/main.go. nil in unit
 	// tests; observe() nil-checks before invoking. The function
 	// takes the resolved app_id and increments the sampler's
 	// rolling-window count — the gauge write itself happens in
@@ -410,7 +410,7 @@ type Handler struct {
 	// PR-B activates the Flusher path when this is true; PR-A only
 	// tests the buffered-fallback AC (#streaming_not_available on
 	// Free + a logged deprecation). Set via WithStreamingEnabled from
-	// cmd/gatewayd/main.go so production defaults to off and operators
+	// cmd/gatewayd-internal/main.go so production defaults to off and operators
 	// opt in per-cluster after PR-B ships.
 	streamingEnabled bool
 	// streamingWarned is the once-per-process log dedup for the
@@ -437,9 +437,9 @@ type Handler struct {
 	// requireAuthnAudit emits the instances.authn_missing /
 	// instances.authn_invalid / instances.authn_scope audit
 	// rows when a gated-app request is denied. nil =
-	// audit-disabled (tests). Production wires the gatewayd
+	// audit-disabled (tests). Production wires thegatewayd-internal
 	// audit emitter so the rows land in the same events table
-	// every other gatewayd-scope row uses (cmd/gatewayd/audit.go).
+	// every other gatewayd-scope row uses (cmd/gatewayd-internal/audit.go).
 	requireAuthnAudit RequireAuthnAuditor
 	// publicAuthCache is the unsealed basic-auth credential
 	// cache (issue #477 / ADR-079). Nil = no caching; the
@@ -569,7 +569,7 @@ func (h *Handler) WithForwarding(fn func(t Target) http.Handler) *Handler {
 // WithForwarding installs (the raw RPC runs on the same per-node
 // gRPC channel as the plain-HTTP RPC). nil = the raw path is
 // disabled (default for tests without the vmmd overlay; production
-// wires this in cmd/gatewayd/main.go alongside WithForwarding).
+// wires this in cmd/gatewayd-internal/main.go alongside WithForwarding).
 func (h *Handler) WithRawForwarding(fn func(t Target) http.Handler) *Handler {
 	h.rawByNode = fn
 	return h
@@ -591,7 +591,7 @@ func (h *Handler) WithStreamingEnabled(enabled bool) *Handler {
 
 // WithRequireAuthn (issue #560) arms the per-deployment token
 // gate. authn must satisfy RequireAuthnAuthenticator —
-// production passes the *pkg/auth.Middleware from cmd/gatewayd
+// production passes the *pkg/auth.Middleware from cmd/gatewayd-internal/
 // (which exposes its Authn field). audit may be nil (audit-
 // disabled mode); the authz branch still fires but the
 // instances.authn_* rows are dropped. nil authn = the authz
@@ -1113,7 +1113,7 @@ var (
 // errAuthnSentinel is a named-error type so errors.Is works
 // against the constant strings above without forcing pkg/gateway
 // to know about state.Err*. The string values are the same codes
-// pkg/state emits; the production adapter in cmd/gatewayd
+// pkg/state emits; the production adapter in cmd/gatewayd-internal/
 // translates via errors.Is on the incoming error.
 type errAuthnSentinel string
 
@@ -1308,8 +1308,8 @@ func (c *capWriter) Flush() {
 
 // WithEgressSink installs the per-instance HTTP response byte ring
 // buffer (pkg/gateway/egresssink). ADR-046 (per-instance egress
-// metering, telemetry only) wires this once at gatewayd boot from
-// cmd/gatewayd/main.go. nil-safe: passing nil clears the sink;
+// metering, telemetry only) wires this once at gatewayd-internal boot from
+// cmd/gatewayd-internal/main.go. nil-safe: passing nil clears the sink;
 // ServeHTTP short-circuits the record path the moment it sees
 // h.egressSink == nil, so unit tests don't have to install one.
 //
@@ -1342,7 +1342,7 @@ func (h *Handler) SetWakeGateHook() {
 //
 // The callback signature is func(appID string) so pkg/gateway
 // stays free of any dependency on pkg/wire or the local
-// cmd/gatewayd topAccountSet — same decoupling pattern as
+// cmd/gatewayd-internal/topAccountSet — same decoupling pattern as
 // SetWakeGateHook above.
 func (h *Handler) SetTopNSample(sample func(appID string)) {
 	h.topNSample = sample
@@ -1732,7 +1732,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//
 	// Gate order: isUpgradeRequest first (cheapest), then the
 	// per-app flag (cheap map lookup), then the rawByNode
-	// installation (the production cmd/gatewayd/main.go wires
+	// installation (the production cmd/gatewayd-internal/main.go wires
 	// it; tests that don't exercise the raw path leave it nil).
 	//
 	// Issue #707 (PR-3 review finding): an upgrade request on an
@@ -1908,7 +1908,7 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 		h.metrics.ObserveRequestDuration(appID, statusClassBucket(status), elapsed)
 	}
 	// Issue #300: feed the per-tenant rolling count for the
-	// 5s gateway_top_tenant_rps sampler (cmd/gatewayd/topn.go).
+	// 5s gateway_top_tenant_rps sampler (cmd/gatewayd-internal/topn.go).
 	// The sentinel "-" id keeps unknown-host traffic off the
 	// top-N gauge (it would otherwise flood the gauge with one
 	// series per scanner host). Cheap path — the sampler is
@@ -2053,8 +2053,8 @@ func (h *Handler) recordEgress(rec *statusRecorder, target Target, app App) {
 // parsing the problem+json body.
 //
 // Cross-process limitation (Finding 6 / ADR-040 follow-up): in a
-// multi-gatewayd fleet each gatewayd process keeps its own bucket;
-// the value reflects this gatewayd's view. ADR-040 already flagged
+// multi-gatewayd-internal fleet each gatewayd-internal process keeps its own bucket;
+// the value reflects this gatewayd-internal's view. ADR-040 already flagged
 // this; the X-RateLimit-* contract is documented to expose rather
 // than to remove the limitation. When a shared-bucket design ships
 // this method moves behind a shared-state seam with the same call
@@ -2468,13 +2468,13 @@ func writeWakeError(w http.ResponseWriter, err error) {
 	}
 }
 
-// sharedUpstreamTransport is the single *http.Transport gatewayd uses to
+// sharedUpstreamTransport is the single *http.Transport gatewayd-internal uses to
 // proxy to all upstream microVMs. It is wrapped in a firstByteRoundTripper
 // so the wake-timing trace can stamp the inbound request's recorder at
 // "first upstream response byte" (spec §6.3, §12). Sharing one transport
 // across requests matches Go's stdlib expectation (connection pooling
 // requires a single transport per upstream) and the spec's "single public
-// listener" invariant — gatewayd owns this transport exclusively.
+// listener" invariant — gatewayd-internal owns this transport exclusively.
 var sharedUpstreamTransport = newFirstByteRoundTripper(&http.Transport{
 	ResponseHeaderTimeout: 60 * time.Second, // spec §4.1
 	IdleConnTimeout:       90 * time.Second,

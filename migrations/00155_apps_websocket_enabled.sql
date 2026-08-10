@@ -22,7 +22,7 @@
 --
 -- The 100 MiB per-request cap (pkg/api.RawStreamMaxRequestBytes,
 -- exported from pkg/vmmdgrpc PR-1 review-fix #2) is enforced on
--- the vmmd side (init-frame clamp); the gatewayd forwarder just
+-- the vmmd side (init-frame clamp); gatewayd-internal's forwarder just
 -- stamps the constant on the init frame. Plan-level per-session
 -- byte cap (50 GiB/month) is a metering follow-up — see
 -- docs/adr/080.
@@ -32,7 +32,7 @@
 -- no rewrite, no index bloat, and a second MigrateUp is a no-op.
 --
 -- Partial index on websocket_enabled=true is small (Hobby+/Pro/
--- Scale apps that opted in); gatewayd's lookup is a per-request
+-- Scale apps that opted in); gatewayd-internal's lookup is a per-request
 -- cache hit on apps[host] so this index is for the operator
 -- "which apps open raw streams?" query path (dashboard), not the
 -- hot request path. Mirrors 00080_apps_streaming_enabled.sql.

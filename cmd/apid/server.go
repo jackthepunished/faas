@@ -463,7 +463,7 @@ func newServerWithDeps(
 	// (IP, endpoint) — a fresh limiter per route would let a brute-force
 	// attack hit 10 attempts × N endpoints × 1 min and never trip any
 	// single bucket. The Limiter is per-process; a restart resets it
-	// (acceptable — gatewayd is the primary edge counter).
+	// (acceptable — gatewayd-public is the primary edge counter).
 	apiAuthLimiter := middleware.NewLimiter(middleware.AuthLimitConfig{Log: log})
 	// Dashboard auth surface (/login, /auth/verify) gets its own shared
 	// bucket so the CountEveryAttempt sentinel on /login doesn't bleed
@@ -820,7 +820,7 @@ func (s *server) handler() http.Handler {
 	// (instances.id UUIDv7). Default limit 25, max 100 (strict 400
 	// on bad input via api.ParseLimit). Additive to the per-app
 	// endpoint — dashboards opt in. Per-account rate limit
-	// (ADR-040) fires at the gatewayd edge; this route charges 1
+	// (ADR-040) fires at the gatewayd-internal edge; this route charges 1
 	// token via authLimited just like every other /v1/* call.
 	mux.HandleFunc("GET /v1/instances", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listInstancesForAccount))))
 
@@ -1154,7 +1154,7 @@ func (s *server) handler() http.Handler {
 	// s.oauthConfig (loaded once at boot via (*server).WithOAuthConfig).
 	mux.Handle("GET /v1/auth/capabilities", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.renderAuthCapabilities))))
 
-	// Dashboard surface (M7.5, ADR-011). Lives behind gatewayd's
+	// Dashboard surface (M7.5, ADR-011). Lives behind gatewayd-public's
 	// /dashboard/* reverse-proxy (spec §11 single-public-listener).
 	//
 	// Slice 3 wires the magic-link auth flow:
@@ -1240,7 +1240,7 @@ func (s *server) handler() http.Handler {
 	// are cookie-session-authenticated (NOT API-key auth — the
 	// dashboard renders them, no Bearer token is in scope) and
 	// share the §11 middleware stack via dashboardChain. They live
-	// under /v1/* so cmd/gatewayd/proxy.go:isApidPath already
+	// under /v1/* so cmd/gatewayd-internal/proxy.go:isApidPath already
 	// forwards them; the §11 anti-takeover proof (session.github_login
 	// == install.account.login) is enforced in the handlers.
 	mux.Handle("POST /v1/install/repos/list", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listInstallableRepos))))
@@ -1328,7 +1328,7 @@ func (s *server) handler() http.Handler {
 	}, http.HandlerFunc(cli.renderCliAuthPage)))
 	mux.Handle("POST "+cliAuthPath, s.cliAuthSubmitChain(http.HandlerFunc(cli.postCliAuthPage)))
 
-	// Loopback infra probe (issue #85). gatewayd forwards /healthz to
+	// Loopback infra probe (issue #85). gatewayd-internal forwards /healthz to
 	// apid through the apidProxy chain, so this is what the
 	// deploy/digitalocean CD smoke test and deploy/digitalocean/
 	// bootstrap.sh health check actually hit on the public listener.

@@ -1,8 +1,8 @@
 // Package gateway — readiness.go owns the readiness probes the Tier
 // A7 edge daemons wire to /readyz.
 //
-// Background: the pre-split gatewayd wired /readyz with `nil`
-// (cmd/gatewayd/main.go:878 — `gateway.ControlMux(handler.Metrics(),
+// Background: the pre-split gatewayd-internal wired /readyz with `nil`
+// (cmd/gatewayd-internal/main.go:878 — `gateway.ControlMux(handler.Metrics(),
 // nil)`), which made /readyz return 200 unconditionally
 // (pkg/gateway/control.go:37 — `if ready == nil || ready()`). That
 // was acceptable for single-box (one daemon, no LB to drain) but

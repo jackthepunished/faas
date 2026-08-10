@@ -1219,7 +1219,7 @@ func TestExportAccount_RequestIdIdempotent_RetrySucceeds(t *testing.T) {
 
 	reqID := "test-request-id-retry-001"
 	// x-faas-request-id is the canonical header that
-	// pkg/middleware/requestid.go reads (matches gatewayd's wire
+	// pkg/middleware/requestid.go reads (matches gatewayd-internal's wire
 	// surface). X-Request-Id is the more generic name; the middleware
 	// ignores it.
 	hdrs := map[string]string{"X-Faas-Request-Id": reqID}

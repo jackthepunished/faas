@@ -106,7 +106,7 @@ func (f *fakeWakeVMM) AcknowledgeMigration(_ context.Context, _, _, _ string) er
 func (f *fakeWakeVMM) CancelLiveMigration(_ context.Context, _, _, _ string) error  { return nil }
 
 // recordingSynth captures every synthesize call. The cron loop's
-// "post a synthetic request through gatewayd so metering applies" path
+// "post a synthetic request through gatewayd-internal so metering applies" path
 // goes through this stub instead of dialing the unix socket.
 type recordingSynth struct {
 	calls atomic.Int64
@@ -122,7 +122,7 @@ func (r *recordingSynth) SynthesizeRequest(_ context.Context, appID, _, path str
 // Invoke is the Move 1 wake-with-envelope path. recordingSynth just
 // increments so cron tests can assert the call landed (and the row
 // arrived in invocations). The production gateway adapter (see
-// cmd/gatewayd/main.go) returns the live instance id from
+// cmd/gatewayd-internal/main.go) returns the live instance id from
 // sched.Wake; the test fake synthesises one so the cron loop's
 // StampInstanceInvocation can land without a real wake.
 func (r *recordingSynth) Invoke(_ context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
@@ -181,7 +181,7 @@ func newAppAndCron(t *testing.T, store state.Store, accountID string, enabled bo
 
 // TestCronDispatch_FiresOncePerBoundary is the headline gate for M7:
 // a fake clock advance of one minute produces exactly one synth call
-// through gatewayd. Re-running the tick immediately (no clock advance)
+// through gatewayd-internal. Re-running the tick immediately (no clock advance)
 // must NOT re-fire — the LastFiredAt boundary guards against double
 // dispatch. vmm.calls stays at 1 across the second/third ticks because
 // engine.Wake has an idempotent fast path for already-RUNNING apps
@@ -295,7 +295,7 @@ func TestCronDispatch_SuspendedAccountSkipped(t *testing.T) {
 
 // TestCronDispatch_NoGatewayNoCrash pins the "gateway synth is
 // optional" invariant. When schedd is wired without an internal RPC
-// client (e.g. before gatewayd starts up), the loop must still Wake
+// client (e.g. before gatewayd-internal starts up), the loop must still Wake
 // and mark the cron as fired — the synth call is best-effort.
 func TestCronDispatch_NoGatewayNoCrash(t *testing.T) {
 	t.Parallel()

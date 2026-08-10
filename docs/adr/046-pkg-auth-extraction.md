@@ -6,6 +6,14 @@ Accepted, 2026-07-29. PR-1 of the Move 4 follow-up. The companion
 implementation lands in this PR; PR-2 (gatewayd AppLogsHandler) follows
 once PR-1 merges.
 
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
+
 ## Context
 
 PR #412 (issue #254 / Move 4 partial) shipped the transport-neutral

@@ -24,7 +24,7 @@ func TestCorrelationRoundTrip(t *testing.T) {
 	// that round-trip without a real connection so a regression in the
 	// wire semantics fails fast and the test stays under -race.
 	incoming := metadata.New(map[string]string{
-		"x-faas-request-id": "req-from-gatewayd",
+		"x-faas-request-id": "req-from-gatewayd-internal",
 	})
 	serverCtx := metadata.NewIncomingContext(context.Background(), incoming)
 
@@ -32,8 +32,8 @@ func TestCorrelationRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("server-side read returned ok=false")
 	}
-	if lifted.RequestID != "req-from-gatewayd" {
-		t.Errorf("RequestID = %q, want req-from-gatewayd", lifted.RequestID)
+	if lifted.RequestID != "req-from-gatewayd-internal" {
+		t.Errorf("RequestID = %q, want req-from-gatewayd-internal", lifted.RequestID)
 	}
 
 	// Engine.Wake mints wake_id; the engine layer joins it onto the
@@ -51,7 +51,7 @@ func TestCorrelationRoundTrip(t *testing.T) {
 		t.Fatal("client-side read returned ok=false")
 	}
 	want := wire.CorrelationFields{
-		RequestID: "req-from-gatewayd",
+		RequestID: "req-from-gatewayd-internal",
 		WakeID:    "wake-minted",
 		AppID:     "app-1",
 	}

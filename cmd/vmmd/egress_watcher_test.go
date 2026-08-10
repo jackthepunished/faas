@@ -7,7 +7,7 @@
 //
 // White-box test (package main) so it can drive the unexported
 // egressWatcher.Reload directly. The pg_notify drain loop is
-// covered by cmd/gatewayd/nodecache_test.go's WatchEvictions tests;
+// covered by cmd/gatewayd-internal/nodecache_test.go's WatchEvictions tests;
 // the watcher here is a thinner wrapper that delegates to
 // db.SubscribeWithReconnect (`pkg/db/notify.go:291`).
 

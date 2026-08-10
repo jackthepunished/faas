@@ -38,7 +38,7 @@ import (
 // `appWebhookSecretSealLabel = "APP_WEBHOOK"` from
 // handlers_webhooks.go:44. The partner string lives in
 // cmd/gatewayd-internal/public_auth_unsealer.go; a future drift
-// surfaces as a fail-closed decryption at gatewayd boot (the
+// surfaces as a fail-closed decryption at gatewayd-internal boot (the
 // unsealer rejects any sealed blob whose namespace tag doesn't
 // match — see pkg/secretbox.SealBytes SetNamespaces contract).
 const publicAuthBasicSealNamespace = "APP_BASIC_AUTH"
@@ -956,7 +956,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// Plaintext username / password / sealed blob are NEVER
 	// recorded anywhere on the audit stream — neither this row
 	// nor any future contributor adding logging in the
-	// gatewayd-side path. has_basic_creds answers "did the
+	// gatewayd-internal-side path. has_basic_creds answers "did the
 	// customer rotate credentials on this PATCH?" without
 	// revealing the value.
 	if req.PublicAuth != nil && app.PublicAuthMode != updated.PublicAuthMode {
@@ -2113,7 +2113,7 @@ func (s *server) getUsage(w http.ResponseWriter, r *http.Request, acct state.Acc
 			// bytes — informational only, not billed.
 			// The two columns are sourced independently
 			// (TXBytes = gateway response bytes via
-			// cmd/gatewayd statusRecorder;
+			// pkg/gateway statusRecorder;
 			// NetTxBytes = root-side vethHost.rx_bytes
 			// delta via vmmd netstats.Cache). The
 			// gateway-side tx_bytes producer lands in
@@ -2584,7 +2584,7 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 	// 5-minute TTL is rejected with 200 + a webhook.replay_rejected
 	// audit row. Empty ev.EventID (older Paddle payloads) skips the
 	// check — pre-#294 behaviour. Fail-open on dedupe transport
-	// errors (mirrors gatewayd).
+	// errors (mirrors gatewayd-internal).
 	if ev.EventID != "" {
 		if err := webhookdedupe.CheckReplay(r.Context(), webhookdedupe.ProviderPaddle, ev.EventID); err != nil {
 			if webhookdedupe.IsReplay(err) {

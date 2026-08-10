@@ -54,7 +54,7 @@ type Limits struct {
 	IncludedGBHours int   // included GB-RAM-hours per calendar month
 	PriceMillicents int64 // monthly subscription price
 
-	// Edge (gatewayd, spec §4.1).
+	// Edge (gatewayd-internal, spec §4.1).
 	RateLimitRPS   int // token-bucket refill rate
 	RateLimitBurst int // token-bucket burst
 

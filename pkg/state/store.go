@@ -1646,7 +1646,7 @@ type Store interface {
 	ListEnabledCrons(ctx context.Context) ([]Cron, error)
 	// MarkCronFired stamps the last_fired_at column. The schedd cron
 	// dispatch loop calls this after a synthetic request has been
-	// dispatched through gatewayd (spec §4.4, M7). MemStore keeps a
+	// dispatched through gatewayd-internal (spec §4.4, M7). MemStore keeps a
 	// lastFiredAt map; PgStore uses a column added in migration 00003.
 	MarkCronFired(ctx context.Context, cronID string, at time.Time) error
 
@@ -2251,7 +2251,7 @@ type Store interface {
 	// 90s, and again active=true when a heartbeat succeeds for a
 	// previously-drained node. Emits compute_node_changed via the
 	// pg_notify listener (pkg/db/notify.NotifyComputeNodeChanged) so
-	// gatewayd can add or drop its per-node client without a
+	// gatewayd-internal can add or drop its per-node client without a
 	// restart. ErrNotFound when the id has no row.
 	SetComputeNodeActive(ctx context.Context, id string, active bool) error
 	// ListComputeNodes returns every compute_node in name order.
@@ -2563,7 +2563,7 @@ type Store interface {
 	RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error
 
 	// WebhookReplayDedup is the dedupe gate for the three webhook
-	// ingresses on the box (GitHub via gatewayd, Stripe + Paddle via
+	// ingresses on the box (GitHub via gatewayd-internal, Stripe + Paddle via
 	// apid). One table covers all three providers; the (provider,
 	// delivery_id) primary key makes a (re-POSTed) webhook within the
 	// TTL window a 200-on-replay no-op. cutoff is the lower bound on

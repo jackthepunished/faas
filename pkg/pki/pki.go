@@ -173,7 +173,7 @@ func Roles() []Role {
 	}
 
 	// Per-daemon outbound client leaves. vmmd dials schedd + apid;
-	// meterd dials schedd + gatewayd; gatewayd dials schedd + vmmd;
+	// meterd dials schedd + gatewayd-internal; gatewayd-internal dials schedd + vmmd;
 	// apid dials githubd. Builderd and schedd dials only vmmd (covered
 	// by the per-daemon TOML that points at vmmd's "server" leaf as
 	// the CA-trustable remote).

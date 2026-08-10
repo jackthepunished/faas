@@ -220,7 +220,7 @@ func TestErrWaitForWarm_BoundsAtOne(t *testing.T) {
 }
 
 // TestErrWaitForWarm_FlushedOnWire pins the WithHeader chain
-// end-to-end: gatewayd's writeWakeError surface WriteProblem
+// end-to-end: gatewayd-internal's writeWakeError surface WriteProblem
 // flushes the Retry-After header from extraHeaders. Gaps here
 // would silently drop the wire hint and the 503 would look
 // indistinguishable from a permanent failure.
@@ -556,7 +556,7 @@ func TestProblem_PaddleExtensionMarshalled(t *testing.T) {
 // fix on PR #322: the build-attestation transient-I/O branch on
 // pkg/sched.Engine.Wake/Prime wraps the storage error in a
 // *api.Problem with a Retry-After: 5 header via WithHeader, and
-// gatewayd's writeWakeError surfaces it via api.WriteProblem.
+// gatewayd-internal's writeWakeError surfaces it via api.WriteProblem.
 // The chain — WithHeader → extraHeaders → WriteProblem → wire
 // header — must be complete; gaps here would silently drop the
 // Retry-After and the 503 would look indistinguishable from a
@@ -587,7 +587,7 @@ func TestProblem_WithHeaderFlushedOnWire(t *testing.T) {
 }
 
 // TestProblem_WithHeaderAccumulates pins that multiple WithHeader
-// calls on the same key add rather than overwrite — gatewayd's
+// calls on the same key add rather than overwrite — gatewayd-internal's
 // downstream chain (header set, then header Add) would silently
 // drop the second value if this were a plain map assign.
 func TestProblem_WithHeaderAccumulates(t *testing.T) {

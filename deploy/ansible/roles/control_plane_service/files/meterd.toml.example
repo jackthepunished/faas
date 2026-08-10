@@ -32,7 +32,7 @@
 
 # gateway_egress_socket: dial target meterd uses to read tx_bytes
 # (ADR-046). Default /run/faas/gatewayd-egress.sock; multi-box
-# deployments override with tcp://<gatewayd-overlay-ip>:port and
+# deployments override with tcp://<gatewayd-internal-overlay-ip>:port and
 # populate the gateway_egress_tls_* cluster.
 # gateway_egress_socket = "/run/faas/gatewayd-egress.sock"
 # gateway_egress_tls_cert_path = "/etc/faas/tls/meterd/gatewayd-egress-client.crt"

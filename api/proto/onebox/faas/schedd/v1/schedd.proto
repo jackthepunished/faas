@@ -1,6 +1,6 @@
 // schedd — the scheduler and instance-lifecycle owner (spec §4.3, ADR-018).
 // schedd is the ONLY writer to the `instances` table and the sole owner of the
-// state machine (spec §6). This gRPC surface is how gatewayd asks schedd to
+// state machine (spec §6). This gRPC surface is how gatewayd-internal asks schedd to
 // wake an app and reports request activity back; schedd itself dials vmmd
 // (api/proto/onebox/faas/vmmd/v1) to drive the actual microVM lifecycle.
 //
@@ -19,7 +19,7 @@ import "google/protobuf/timestamp.proto";
 option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1;scheddpb";
 
 // Schedd is the gRPC service schedd exposes on its unix socket. Two RPCs for
-// v1.0 — gatewayd is the only caller. Multi-host (Gate-A) replaces the socket
+// v1.0 — gatewayd-internal is the only caller. Multi-host (Gate-A) replaces the socket
 // with mTLS; this ADR-018 surface is per-host.
 service Schedd {
   // Wake ensures an instance for the app is running and returns the address
@@ -123,15 +123,15 @@ service Schedd {
   // StreamWarmHints (ADR-025 axis 4) is the sticky-warm affinity push.
   // schedd is the only writer to pkg/sched.WarmAffinity; every successful
   // admit stamps (app_id → node_id) and we forward the stamp as an event
-  // so gatewayd's picker (PGBackend.WarmHintFunc) can bias traffic to the
+  // so gatewayd-internal's picker (PGBackend.WarmHintFunc) can bias traffic to the
   // warm node on multi-box fleets.
   //
   // Semantics:
-  //   - Server-streaming; gatewayd opens one stream at startup and keeps
+  //   - Server-streaming; gatewayd-internal opens one stream at startup and keeps
   //     it open for the lifetime of the connection.
   //   - "Tail from now": no replay cursor, no snapshot on connect. ADR-005
   //     guarantees an empty hint falls through to least-loaded, so a
-  //     gatewayd that reconnects with no hint still routes correctly.
+  //     gatewayd-internal that reconnects with no hint still routes correctly.
   //   - Events are emitted only on state change (RecordWake actually
   //     changed app_id → node_id); a periodic RecordWake to the same node
   //     is a no-op event-source-wise. The producer filters at emit time.
@@ -264,7 +264,7 @@ message WakeResponse {
   // the error path.
   //
   // Renamed from the legacy `addr` field (PR #116-era was host_ip:8080,
-  // an inner-netns placeholder unreachable from gatewayd on a remote
+  // an inner-netns placeholder unreachable from gatewayd-internal on a remote
   // host). Dual semantics were deliberately not preserved — leaving
   // both fields risks a caller picking the wrong one and regressing
   // the hot path silently. The new shape is the only contract.
@@ -457,7 +457,7 @@ message ListInstanceStatsResponse {
 //
 // since_written_at (issue #517 / PR-B acceptance #3) is the
 // per-instance written_at lower bound on the replay page, mirrored
-// at the schedd hop so the bound survives the gatewayd → schedd →
+// at the schedd hop so the bound survives the gatewayd-internal → schedd →
 // vmmd transit. Empty = no bound. Wire is additive per ADR-016.
 //
 // Additive per ADR-016.
@@ -565,7 +565,7 @@ message StreamWarmHintsResponse {
   // node_id is the compute_node.id the engine just admitted to.
   string node_id = 2;
   // written_at is the host-side time schedd stamped the entry (the
-  // WarmAffinity.lastSeen). Lets gatewayd detect clock skew in
+  // WarmAffinity.lastSeen). Lets gatewayd-internal detect clock skew in
   // diagnostics; the gateway's hint cache treats this as advisory.
   google.protobuf.Timestamp written_at = 3;
 }
