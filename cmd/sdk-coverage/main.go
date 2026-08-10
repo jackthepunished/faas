@@ -323,6 +323,13 @@ var methodRouteMap = map[string]string{
 	"POST /v1/admin/billing-paddle-catalog/sync": "SyncPaddleCatalog",
 	"POST /v1/admin/billing-reconcile/{id}":      "ReconcileAccount",
 
+	// ADR-089 PR-C — background re-seal progress. The auto-derivation
+	// would produce "GetAdminSecretsRekey-progress" (the dash survives
+	// titleCase), which is awkward in Go. Pin the name to match the
+	// Go SDK; the method lives in pkg/api/client.go next to the
+	// PR-P3 admin billing surface.
+	"GET /v1/admin/secrets/rekey-progress": "GetRekeyProgress",
+
 	// Issue #273 / ADR-042 — per-app metrics. The auto-derivation
 	// would produce GetAppsSlugMetrics (Swagger-style); the SDK
 	// names it GetAppMetrics to match the existing per-app methods

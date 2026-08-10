@@ -2277,3 +2277,21 @@ func (c *Client) ReconcileAccount(ctx context.Context, accountID string) (Billin
 	var out BillingReconcileResponse
 	return out, c.do(ctx, "POST", "/v1/admin/billing-reconcile/"+accountID, nil, &out)
 }
+
+// --- ADR-089 PR-C rekey progress -------------------------------------------
+//
+// GetRekeyProgress polls the background re-seal runner (ADR-089 PR-C).
+// The operator pings this after a host-age rotation to monitor when
+// the migration completes; the dashboard renders the cumulative
+// (rekeyed+skipped) vs (failed) so an operator can spot stuck or
+// errored rows.
+//
+// 503 + code=rekey_disabled when the runner is not enabled on the
+// host (FAAS_REKEY_ENABLED unset). The SDK does not special-case the
+// 503 — callers that care can branch on the *Problem's Code field.
+// Auth: admin-scoped API key + email in FAAS_ADMIN_EMAILS allowlist
+// (two-layer gate, same as every other /v1/admin/* route).
+func (c *Client) GetRekeyProgress(ctx context.Context) (RekeyProgress, error) {
+	var out RekeyProgress
+	return out, c.do(ctx, "GET", "/v1/admin/secrets/rekey-progress", nil, &out)
+}
