@@ -4,34 +4,21 @@
 -- 00172_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
--- This file is a deliberate no-op kept only to satisfy the
--- migrations/embed_test.go::TestMigrationsContiguous requirement
--- that the embedded migration set is exactly {1, 2, …, N} with
--- no gaps. It carries no schema change and does not appear in any
--- apply path (the replay-safety gate in ci.yml drops files whose
--- basename matches the reservation regex from its "added
--- migration versions" computation).
+-- Sibling of migrations/00166_reserve_slot.sql (PR #798, ADR-088)
+-- from PR #795 (issue #791 PR A). The original migration was
+-- 00166 but PRs #797 (compute_nodes_public_ip at 172), #799
+-- (edge_rules at 172), #798 (apps_overflow_node, ADR-088), and
+-- #800 (app_secrets_kid at 170) all claimed slots in this
+-- window in parallel; this PR renumbered twice (→171, then
+-- →173) as the race tightened. Slot 172 is held empty so the
+-- embedded FS stays contiguous while the four-way slot race
+-- resolves on its own. Whichever of #797/#799 merges first
+-- deletes its 00172 fence on the next rebase per ADR-041.
 --
--- Slot 00172 is reserved for PR #797 (Tier A9 standby write-redirect,
--- migrations/00172_compute_nodes_public_ip.sql). PR #799 (edge-rules)
--- renumbered its migration 6 times to clear the slot race: 00166 (initial)
--- → 00168 (after #798 took 00167) → 00169 (after #797 took 00168)
--- → 00170 (after #800 took 00169) → 00171 (after #795 took 00170)
--- → 00172 (after #795 raced again to 00171) → 00174 (after #797
--- shipped its real public_ip migration at 00172) → 00175 (after
--- #797 also placed a duplicate at 00174 — broken tree, slot gate
--- caught it). PR #795 settled on 00173 (real invocations.outcome
--- migration). Slot 00172 is held empty so the embedded FS stays
--- contiguous while the four-way slot race resolves. When #797 merges,
--- it deletes this 00172 fence on its next rebase per ADR-041.
---
--- See also migrations/00174_reserve_slot.sql — that slot is held
--- empty against #797's accidental duplicate 00174_compute_nodes_public_ip.sql;
--- #797 should drop the 00174 duplicate (and this comment block will be
--- deleted when the slot race resolves).
---
--- Body: `select 1;` — executes against the live DB at apply time
--- but produces no schema change.
+-- Body: `select 1;` — deliberate no-op. The replay-safety gate in
+-- ci.yml drops files matching the reservation regex from its
+-- "added migration versions" computation. See
+-- migrations/00056_reserve_slot.sql for the canonical template.
 --
 select 1;
 

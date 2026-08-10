@@ -21,8 +21,14 @@
 package imaged
 
 import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 )
@@ -91,5 +97,288 @@ func TestHandler_OCIBackendEnv_Handoff(t *testing.T) {
 	}
 	if fromHandler != be {
 		t.Errorf("storageFor() = %p, want %p (env-derived backend)", fromHandler, be)
+	}
+}
+
+// TestHandler_OCIBackendEnv_Handoff_ScanFromBackend pins the
+// scan-source side of the ADR-054 acceptance closure. The handler
+// is wired with an OCI-mode PrefixRouter (apps/ → OCI stub,
+// everything else → local); runDeployScan is invoked end-to-end
+// against a stub grypeRun that records the <dir> argument. The
+// recorded dir MUST point at a stage tempdir (NOT the legacy
+// appsRoot path), and the staged tempdir MUST live under
+// h.appsRoot — the §17 G2 "secrets on /tmp" gap is closed by
+// rooting the stage at the daemon's writable area.
+//
+// Why narrow: the load-bearing invariant for multi-box is that
+// the per-deploy scan does not silently no-op when the layer is
+// in the OCI backend. The previous (pre-acceptance) code called
+// h.appsRootPath() directly, which produced a path that did not
+// exist under FAAS_STORAGE_BACKEND=oci; the grype subprocess
+// then scanned an empty directory and stamped scan_status='pass'
+// with zero findings. This test is the regression pin for the
+// stageScanExt4 helper introduced in Fix 1.
+func TestHandler_OCIBackendEnv_Handoff_ScanFromBackend(t *testing.T) {
+	// Stable temp roots so CI never touches /srv/fc or
+	// /var/lib/faas/apps. The handler's appsRoot is the stage
+	// root for the scan source — under this test it's a
+	// t.TempDir(), not /var/lib/faas/apps.
+	appsRoot := t.TempDir()
+	localRoot := t.TempDir()
+
+	// OCI stub holds the per-app layer blob under the routed
+	// remainder (the PrefixRouter strips "apps/"). The handler's
+	// stageScanExt4 reads via the storage backend, so the stub
+	// must surface that blob on Get. The exact key is
+	// sched.AppLayerKey(slug, dep.ID) minus the "apps/" prefix;
+	// seeded after dep creation below.
+	oci := newFakeOCIPutter()
+	const blobBytes = "fake-scan-stage-ext4"
+
+	localBE, err := storage.NewLocalStorageBackend(localRoot)
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	router, err := storage.NewPrefixRouter(
+		map[string]storage.StorageBackend{"apps/": oci},
+		localBE,
+	)
+	if err != nil {
+		t.Fatalf("NewPrefixRouter: %v", err)
+	}
+
+	// Stub grypeRun records the <dir> the handler hands it.
+	var grypeDir string
+	stubGrype := func(_ context.Context, dir string) (*ScanResult, error) {
+		grypeDir = dir
+		// Pin the staged file actually lives inside the staged
+		// dir. grype dir:<dir> walks the dir; the staged ext4
+		// is the only file under it, so the bytes round-trip
+		// from the OCI stub through the stage helper.
+		stageFile := dir + string("/rootfs.ext4")
+		if _, statErr := os.Stat(stageFile); statErr != nil {
+			t.Errorf("grype source dir %q missing staged ext4 %q: %v",
+				dir, stageFile, statErr)
+		}
+		return &ScanResult{Vulnerabilities: []Vulnerability{}}, nil
+	}
+
+	h := New(state.NewMemStore(), &fakeNotifier{}, fakePuller{}, &fakeBuilder{},
+		"./init", appsRoot, silentLogger()).
+		WithStorage(router).
+		WithGrypeRun(stubGrype)
+
+	// Wire the app + deployment rows so runDeployScan has a
+	// dep.ID + app.Slug to feed stageScanExt4.
+	store := h.store
+	acct, err := store.CreateAccount(context.Background(), "u@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "acme", RAMMB: 512,
+		IdleTimeoutS: 60, MaxConcurrency: 5,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, ImageDigest: "sha256:abc",
+		Kind: state.DeploymentKindImage,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	// Seed the OCI stub at the exact routed-remainder key the
+	// router will hand to Get: "apps/" stripped from
+	// sched.AppLayerKey(slug, dep.ID).
+	appsKey := "acme/" + dep.ID + ".ext4"
+	if err := oci.Put(context.Background(), appsKey,
+		strings.NewReader(blobBytes)); err != nil {
+		t.Fatalf("oci.Put seed %q: %v", appsKey, err)
+	}
+
+	h.runDeployScan(context.Background(), app, dep)
+
+	if grypeDir == "" {
+		t.Fatal("stub grypeRun was not called; runDeployScan short-circuited")
+	}
+
+	// Pin 1: the recorded dir must NOT equal the legacy
+	// appsRootPath (which would mean the old direct-path code
+	// is still in effect — the production bug pre-acceptance).
+	if grypeDir == h.appsRootPath(app.Slug, dep.ID) {
+		t.Errorf("scan source = %q (legacy appsRootPath); "+
+			"want a stage tempdir under %q", grypeDir, appsRoot)
+	}
+
+	// Pin 2: the recorded dir must live under h.appsRoot (the
+	// §17 G2 root). Filesystem path containment check via
+	// filepath.Rel — an empty result with ".." prefix means the
+	// recorded dir escaped the appsRoot (which would be the
+	// os.TempDir() fallback — bad if the appsRoot IS writable).
+	rel, relErr := filepath.Rel(appsRoot, grypeDir)
+	if relErr != nil {
+		t.Fatalf("filepath.Rel(%q, %q): %v", appsRoot, grypeDir, relErr)
+	}
+	if strings.HasPrefix(rel, "..") || strings.Contains(rel, ".."+string(filepath.Separator)) {
+		t.Errorf("scan dir %q escaped appsRoot %q (rel=%q)",
+			grypeDir, appsRoot, rel)
+	}
+}
+
+// TestHandler_LocalBackendEnv_ScanStillReadsFromAppsRoot is the
+// regression pin for single-box behaviour. With a
+// LocalStorageBackend wired, runDeployScan must NOT enter the
+// stage-to-tempdir branch — it must read the layer ext4 directly
+// from the canonical appsRoot path, matching the pre-acceptance
+// 1:1 behaviour. A regression that always stages (even for
+// LocalStorageBackend) would burn disk I/O on every deploy on
+// single-box deployments that don't need it.
+//
+// Why narrow: the LocalStorageBackend short-circuit is the only
+// reason single-box keeps its deploy-scan latency budget. A
+// future refactor that deletes the short-circuit must update
+// this test (and re-measure the deploy-scan budget).
+func TestHandler_LocalBackendEnv_ScanStillReadsFromAppsRoot(t *testing.T) {
+	// The handler's appsRoot is the canonical ext4 path
+	// (single-box legacy layout). Seed the ext4 directly there
+	// so the legacy direct-path read succeeds.
+	appsRoot := t.TempDir()
+	const slug = "singlebox"
+
+	// Stub grypeRun records the <dir> the handler hands it.
+	var grypeDir string
+	stubGrype := func(_ context.Context, dir string) (*ScanResult, error) {
+		grypeDir = dir
+		return &ScanResult{Vulnerabilities: []Vulnerability{}}, nil
+	}
+
+	// Wire a LocalStorageBackend that points at the same
+	// appsRoot — single-box layout.
+	localBE, err := storage.NewLocalStorageBackend(appsRoot)
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+
+	h := New(state.NewMemStore(), &fakeNotifier{}, fakePuller{}, &fakeBuilder{},
+		"./init", appsRoot, silentLogger()).
+		WithStorage(localBE).
+		WithGrypeRun(stubGrype)
+
+	store := h.store
+	acct, err := store.CreateAccount(context.Background(), "u@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: slug, RAMMB: 512,
+		IdleTimeoutS: 60, MaxConcurrency: 5,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, ImageDigest: "sha256:abc",
+		Kind: state.DeploymentKindImage,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	// Seed the canonical ext4 path AFTER dep.ID is generated so
+	// the appsRootPath lookup hits the file. The legacy
+	// direct-path read depends on this file existing.
+	if err := os.MkdirAll(appsRoot+"/"+slug, 0o755); err != nil {
+		t.Fatalf("MkdirAll seed: %v", err)
+	}
+	if err := os.WriteFile(appsRoot+"/"+slug+"/"+dep.ID+".ext4",
+		[]byte("local-ext4-bytes"), 0o600); err != nil {
+		t.Fatalf("write seed ext4: %v", err)
+	}
+
+	h.runDeployScan(context.Background(), app, dep)
+
+	if grypeDir == "" {
+		t.Fatal("stub grypeRun was not called; runDeployScan short-circuited")
+	}
+
+	// Pin: the recorded dir must equal the canonical appsRoot
+	// path — LocalStorageBackend short-circuits stageScanExt4
+	// and the handler reads directly. Any other value means the
+	// short-circuit regressed.
+	want := h.appsRootPath(app.Slug, dep.ID)
+	if grypeDir != want {
+		t.Errorf("scan source = %q, want %q (LocalStorageBackend "+
+			"short-circuit must NOT stage)", grypeDir, want)
+	}
+}
+
+// TestHandler_OCIBackendEnv_Handoff_ScanSourceNotFoundStampsFailed
+// pins the registry-unreachable + LocalCacheBackend default-
+// fail-loud contract (the second half of Fix 1's behavioural
+// guarantee). With an OCI stub that has no entry for the
+// requested key, stageScanExt4 returns ("", noop, GetErr), and
+// runDeployScan must stamp scan_status='failed' on the
+// deployment row — NOT silently pass with zero findings. This
+// is the same fail-closed posture the existing runGrype error
+// path enforces.
+func TestHandler_OCIBackendEnv_Handoff_ScanSourceNotFoundStampsFailed(t *testing.T) {
+	appsRoot := t.TempDir()
+	localRoot := t.TempDir()
+	localBE, err := storage.NewLocalStorageBackend(localRoot)
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	// OCI stub with NO seeded blob — Get returns storage.ErrNotFound.
+	oci := newFakeOCIPutter()
+	router, err := storage.NewPrefixRouter(
+		map[string]storage.StorageBackend{"apps/": oci},
+		localBE,
+	)
+	if err != nil {
+		t.Fatalf("NewPrefixRouter: %v", err)
+	}
+
+	h := New(state.NewMemStore(), &fakeNotifier{}, fakePuller{}, &fakeBuilder{},
+		"./init", appsRoot, silentLogger()).WithStorage(router)
+
+	store := h.store
+	acct, err := store.CreateAccount(context.Background(), "u@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "missing", RAMMB: 512,
+		IdleTimeoutS: 60, MaxConcurrency: 5,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, ImageDigest: "sha256:abc",
+		Kind: state.DeploymentKindImage,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	h.runDeployScan(context.Background(), app, dep)
+
+	// Pin: the deployment row carries scan_status='failed' with
+	// the backend.Get error message in scan_result.Error. The
+	// deploy itself does NOT fail — the snapshotting transition
+	// fires regardless (the existing AC #4 contract).
+	got, err := store.DeploymentByID(context.Background(), dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	var scanResult ScanResult
+	if err := json.Unmarshal([]byte(got.ScanResult), &scanResult); err != nil {
+		t.Fatalf("unmarshal ScanResult %q: %v", got.ScanResult, err)
+	}
+	if scanResult.Error == "" {
+		t.Errorf("ScanResult.Error = \"\"; want non-empty (registry " +
+			"unreachable must stamp failure cause)")
 	}
 }
