@@ -15,7 +15,10 @@
 -- seeds.
 --
 -- Replay-safe (ADR-041 / PR #377): every DDL is guarded by IF NOT
--- EXISTS / IF EXISTS so a second MigrateUp is a no-op.
+-- EXISTS / IF EXISTS so a second MigrateUp is a no-op. Postgres 15
+-- (CI) does not support `ADD CONSTRAINT IF NOT EXISTS` — use the
+-- DROP+ADD pair (see migrations/00011_app_min_instances.sql for the
+-- canonical shape).
 --
 -- Design notes:
 --  * (account_id, app_id) parent FKs both CASCADE — apid's
@@ -50,11 +53,18 @@ CREATE TABLE IF NOT EXISTS edge_rules (
     updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
+-- Postgres 15 (CI) rejects `ADD CONSTRAINT IF NOT EXISTS`; the
+-- DROP+ADD pair is the canonical replay-safety pattern (see
+-- migrations/00011_app_min_instances.sql).
 ALTER TABLE edge_rules
-    ADD CONSTRAINT IF NOT EXISTS edge_rules_account_id_fkey
+    DROP CONSTRAINT IF EXISTS edge_rules_account_id_fkey;
+ALTER TABLE edge_rules
+    ADD CONSTRAINT edge_rules_account_id_fkey
         FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE;
 ALTER TABLE edge_rules
-    ADD CONSTRAINT IF NOT EXISTS edge_rules_app_id_fkey
+    DROP CONSTRAINT IF EXISTS edge_rules_app_id_fkey;
+ALTER TABLE edge_rules
+    ADD CONSTRAINT edge_rules_app_id_fkey
         FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE;
 
 CREATE INDEX IF NOT EXISTS edge_rules_enabled_match_host_idx
