@@ -2238,9 +2238,16 @@ func streamDeployLogs(c *Client, dep api.DeploymentResponse) int {
 	ctx := context.Background()
 	body, err := c.StreamDeploymentLogs(ctx, dep.ID, nil, 0, true)
 	if err != nil {
-		// Stream unreachable up front — try one GetDeployment poll in
-		// case the build already finished before we opened the stream
-		// (e.g., a fast tarball deploy on a slow link).
+		// Stream unreachable up front — first try the new
+		// /v1/builds/{id} poller (DEPLOY-PROV-6 / ADR-089); only if
+		// the build is still queued/running OR the new endpoint is
+		// unavailable do we fall through to the legacy
+		// pollDeploymentFinal. A fast tarball deploy on a slow link
+		// is the canonical case where the stream never opened and
+		// the build row is already terminal.
+		if b, ok := pollBuildStatus(c, dep, 5*time.Second); ok {
+			return terminalExitForBuild(b, dep.AppID)
+		}
 		if final, ok := pollDeploymentFinal(c, dep); ok {
 			return terminalExitForDeployment(final)
 		}
@@ -2310,9 +2317,15 @@ streamLoop:
 			return 3
 		}
 	}
-	// Stream ended without a terminal frame — try one GetDeployment
-	// poll so a fast build that raced the SSE open isn't reported as
-	// "follow manually" when we actually have the answer.
+	// Stream ended without a terminal frame — poll the new
+	// /v1/builds/{id} endpoint (DEPLOY-PROV-6 / ADR-089, issue
+	// #741) so a fast build that raced the SSE open isn't reported
+	// as "follow manually" when we actually have the answer. Only
+	// fall back to pollDeploymentFinal when the new poll reports
+	// the build is still queued or running.
+	if b, ok := pollBuildStatus(c, dep, 60*time.Second); ok {
+		return terminalExitForBuild(b, dep.AppID)
+	}
 	if final, ok := pollDeploymentFinal(c, dep); ok {
 		return terminalExitForDeployment(final)
 	}
@@ -2324,6 +2337,12 @@ streamLoop:
 // returns (final, true) when status is live or failed. Returns
 // (_, false) on any error or non-terminal status — the caller treats
 // both as "no answer, give up cleanly".
+//
+// Deprecated by DEPLOY-PROV-6 / ADR-089 (issue #741): pollBuildStatus
+// is the more-correct fallback now that /v1/builds/{id} exists.
+// pollDeploymentFinal stays as a last-ditch safety net so a server
+// where /v1/builds/{id} is unavailable still degrades gracefully;
+// streamDeployLogs prefers the new path.
 func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentResponse, bool) {
 	got, err := c.GetDeployment(context.Background(), dep.ID)
 	if err != nil {
@@ -2333,6 +2352,48 @@ func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentR
 		return got, true
 	}
 	return api.DeploymentResponse{}, false
+}
+
+// pollBuildStatus polls GET /v1/builds/{id} until the build reaches
+// a terminal status (succeeded|failed) or the deadline elapses.
+// Replaces the one-shot pollDeploymentFinal the SSE fallback in
+// streamDeployLogs used before DEPLOY-PROV-6 / ADR-089; with a real
+// status endpoint there's no reason to give up after a single GET.
+//
+// Backoff: 1s base, capped at 5s, jittered ±20% to avoid the
+// thundering-herd many CI jobs would trigger when they all exit SSE
+// at the same instant. Deadline defaults to 60s; CLI flow currently
+// uses the default — a future --wait flag could override.
+//
+// Returns (BuildResponse, true) on terminal status; (zero, false)
+// on deadline elapse or persistent transient error so the SSE caller
+// can fall back to the "follow manually" hint.
+func pollBuildStatus(c *Client, dep api.DeploymentResponse, deadline time.Duration) (api.BuildResponse, bool) {
+	if dep.BuildID == "" {
+		// No build_id on the deployment row — server pre-dates
+		// PROV-6, or the deployment was created via the fast-
+		// path that skips the builds table. Bail out so the
+		// caller falls through to pollDeploymentFinal.
+		return api.BuildResponse{}, false
+	}
+	end := time.Now().Add(deadline)
+	backoff := 1 * time.Second
+	for time.Now().Before(end) {
+		b, err := c.GetBuildsId(context.Background(), dep.BuildID)
+		if err == nil && (b.Status == "succeeded" || b.Status == "failed") {
+			return b, true
+		}
+		// Jitter ±20% of the current backoff so N concurrent CI
+		// jobs don't wake at the same wall-clock tick. Cheap
+		// pseudo-random via time.Now().UnixNano() avoids a
+		// math/rand import (and its seeding dance in Go 1.20+).
+		jitter := time.Duration(time.Now().UnixNano() % int64(backoff/5))
+		time.Sleep(backoff + jitter)
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+	return api.BuildResponse{}, false
 }
 
 // terminalExitForDeployment applies the same rendering rules as the
@@ -2345,6 +2406,27 @@ func terminalExitForDeployment(d api.DeploymentResponse) int {
 		return 0
 	}
 	return renderDeployFailure(d)
+}
+
+// terminalExitForBuild maps a polled terminal BuildResponse to a CLI
+// exit code. Mirrors terminalExitForDeployment but reads from the
+// build row (DEPLOY-PROV-6 / ADR-089, issue #741) — the polled
+// build row lacks the rich Error string from the deployment row,
+// so on failure we render a compact "BuildStatus=failed
+// failure_class=…" block and exit 2 (same exit-code convention as
+// terminalExitForDeployment's renderDeployFailure path).
+func terminalExitForBuild(b api.BuildResponse, appID string) int {
+	if b.Status == "succeeded" {
+		PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", appID)
+		printDeployColdWakeSentence()
+		return 0
+	}
+	// Failed build — surface the lifecycle info. End users hitting
+	// this path are CI scripts that lost their SSE; the canonical
+	// log path is `gregale logs --deployment <deployment_id>`.
+	PrintWarn(os.Stderr, "build %s failed (failure_class=%s); inspect logs with: gregale logs --deployment %s",
+		b.ID, b.FailureClass, b.DeploymentID)
+	return 2
 }
 
 // printDeployColdWakeSentence emits the UX §2.5 cold-wake honesty
