@@ -1,4 +1,4 @@
--- filename: 00170_app_secrets_kid.sql
+-- filename: 00174_app_secrets_kid.sql
 -- +goose Up
 -- ADR-089 PR-A: per-secret rotation surface needs a way to tell the
 -- operator "what host key sealed this row?" without parsing the age
@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS app_secrets_kid_idx
 -- migration would require a `pkg/secretbox` import which goose
 -- migrations don't have). The Go side rekey.Replayer.Run walks
 -- every row on startup when FAAS_REKEY_ENABLED=true; that's the
--- authoritative pass. Migration 00166 only adds the column shape.
+-- authoritative pass. Migration 00174 only adds the column shape.
 
 -- +goose Down
 DROP INDEX IF EXISTS app_secrets_kid_idx;
