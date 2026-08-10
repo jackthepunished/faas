@@ -99,15 +99,17 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// Resolve the wire name → UUID server-side before buildApp
 	// runs, so the resulting state.App carries the resolved
 	// UUID (the column-shape integrity contract — the column
-	// is uuid NULL, never text). The resolver returns:
+	// is uuid NULL, never text). strictEmpty=true at create
+	// time because the column starts NULL and there is no
+	// "clear" path on a fresh row — PATCH is the only place
+	// where "" means "clear", and the OpenAPI
+	// minLength: 1 + DTO docstring are the contract. The
+	// resolver returns:
 	//   - (uuid, nil) on a real, active compute_node
-	//   - ("", nil)   when OverflowNode == nil (no preference)
-	//   - ("", nil)   when OverflowNode == "" (create-time
-	//     "clear" is rejected per the DTO contract — see
-	//     validateCreateOverflowNode; buildApp receives a
-	//     state.App with OverflowNode == nil)
-	//   - ("", prob)  on ErrNotFound or active=false
-	overflowUUID, prob := s.resolveOverflowNode(r.Context(), req.OverflowNode, false /*create=true → reject ""*/)
+	//   - ("", nil)   when req.OverflowNode == nil (omit
+	//     → no preference, the A9 fallback)
+	//   - ("", prob)  on "", ErrNotFound, or active=false
+	overflowUUID, prob := s.resolveOverflowNode(r.Context(), req.OverflowNode, true /*strictEmpty: reject "" at create-time*/)
 	if prob != nil {
 		api.WriteProblem(w, prob)
 		return
