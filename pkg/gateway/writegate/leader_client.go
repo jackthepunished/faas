@@ -284,11 +284,6 @@ func (c *MTLSLeaderClient) Relay(ctx context.Context, leaderURL string, req *htt
 		outReq.ContentLength = int64(len(bodyBytes))
 	}
 
-	//nolint:gosec // G704: outReq URL is constructed via buildOutboundRequest()
-	// which validates scheme=https, host non-empty, no userinfo, and chains
-	// only the path/query from the inbound request. The taint analysis
-	// can't see the validation chain; the cross-box mTLS hop IS the SSRF
-	// mitigation we want (the destination is operator-deployed infra).
 	return c.httpClient.Do(outReq)
 }
 

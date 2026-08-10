@@ -24,6 +24,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -146,7 +147,7 @@ func (g *writeGate) respondRelayed(w http.ResponseWriter, r *http.Request, leade
 		g.respondRelayFailure(w, r, authKind, err)
 		return
 	}
-	defer func() { _ = upstream.Body.Close() }()
+	defer upstream.Body.Close()
 
 	g.metrics.WriteRedirectTotal(string(writegate.OutcomeRelayed), string(authKind)).Inc()
 	for k, vv := range upstream.Header {
@@ -288,3 +289,9 @@ var allClassifyDecisions = []classifyDecision{
 	decisionMTLSFailure,
 	decisionError,
 }
+
+// errClassifyDispatch is a defensive sentinel for the
+// impossible case of a classifyDecision outside the closed
+// set. The gate logs the error before emitting a 500; the
+// metric panel picks it up as a SustainedOutcomeError.
+var errClassifyDispatch = errors.New("writegate: classify decision out of closed set")

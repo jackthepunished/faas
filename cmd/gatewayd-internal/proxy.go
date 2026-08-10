@@ -1,9 +1,7 @@
-// gatewayd-internal → apid loopback proxy (spec §11 single-public-listener
+// gatewayd → apid loopback proxy (spec §11 single-public-listener
 // invariant, ADR-011).
 //
-// gatewayd-public terminates TLS at the edge and forwards every
-// request over /run/faas/gatewayd-internal.sock to this daemon. apid
-// binds loopback-only.
+// gatewayd is the only public listener. apid binds loopback-only.
 // For every public surface apid serves we add a thin path-prefix
 // switch in front of gateway.Handler: anything matching isApidPath
 // reverse-proxies to apid's loopback listener (default
@@ -26,7 +24,7 @@
 // apid binds loopback-only, so this proxy is the only way external
 // traffic reaches any of those routes — preserving the §11
 // invariant. Per-route auth (api.AuthLimit, dashboard session
-// middleware) is applied at apid; gatewayd-internal just forwards.
+// middleware) is applied at apid; gatewayd just forwards.
 //
 // Webhook paths (/webhooks/github, /v1/webhooks/stripe) live in
 // sibling wrappers (githubdProxy, stripeProxy) that run *before*
@@ -50,7 +48,7 @@ import (
 // apidProxy wraps next so requests matching isApidPath
 // reverse-proxy to apid's loopback listener. The proxy is
 // path-prefix only — it doesn't touch Host headers — because apid's
-// loopback mux doesn't key off Host (gatewayd-internal already does the
+// loopback mux doesn't key off Host (gatewayd already does the
 // host→app routing for traffic that reaches the proxy via the apps
 // domain).
 //
@@ -61,7 +59,7 @@ import (
 // of a stale Director closure.
 //
 // logsHandler is the issue #254 / Move 4 PR-2 carve-out handler
-// (cmd/gatewayd-internal/app_logs.go). When set, requests matching
+// (cmd/gatewayd/app_logs.go). When set, requests matching
 // isApidLogsPath route to logsHandler instead of the apid
 // loopback. nil-safe — tests omit it and the carve-out is silently
 // disabled.
@@ -131,9 +129,9 @@ func newApidProxyWithGate(target string, next, logsHandler, writeGate http.Handl
 // flow).
 //
 // Carve-out (issue #254 / Move 4 PR-2): requests to
-// `/v1/apps/{slug}/logs` are owned by cmd/gatewayd-internal's
+// `/v1/apps/{slug}/logs` are owned by cmd/gatewayd's
 // AppLogsHandler — the customer-facing log stream runs through
-// the gatewayd-internal → schedd dial so the route table stays out of
+// the gatewayd → schedd dial so the route table stays out of
 // apid. The match is run before isApidPath so the loopback
 // proxy never sees the path. The pattern is matched by
 // isApidLogsPath (hand-rolled, not regexp — per-request regex
@@ -184,7 +182,7 @@ func (a *apidProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //	/v1.zip                      ✗  (anchor regression, review finding #6)
 //
 // The matcher is also the predicate the AppLogsHandler tests
-// pin (cmd/gatewayd-internal/proxy_test.go::TestIsApidLogsPath) so any
+// pin (cmd/gatewayd/proxy_test.go::TestIsApidLogsPath) so any
 // future change to the route shape is loud.
 func isApidLogsPath(p string) bool {
 	const prefix = "/v1/apps/"
@@ -212,7 +210,19 @@ func isApidLogsPath(p string) bool {
 // prefix followed by "/", or prefix followed by "/" and then more
 // path. This prevents accidental shadowing like "/v1.zip" matching
 // "/v1" — review finding #6 from the dashboard era.
-// isApidPath returns true for the prefixes gatewayd-internal forwards to
+//
+// DEPRECATED: the live predicate is now `apid.IsApidPath` (see
+// `pkg/apid/router.go`); this wrapper is preserved only for any
+// future local matcher that wants to share the same anti-shadowing
+// discipline. New code MUST call `apid.IsApidPath` directly.
+func hasApidPrefix(p, prefix string) bool {
+	if p == prefix || p == prefix+"/" {
+		return true
+	}
+	return strings.HasPrefix(p, prefix+"/")
+}
+
+// isApidPath returns true for the prefixes gatewayd forwards to
 // apid. Keep the list exhaustive for the apid public surface
 // (issue #85) — anything outside falls through to the wake/proxy
 // path (which 404s for legitimate apid traffic, so missing entries
@@ -260,7 +270,7 @@ func isApidPath(p string) bool {
 //   - We strip X-Forwarded-Proto and X-Forwarded-Host (apid binds
 //     loopback; protocol headers would mislead scheme detection).
 //   - We pin X-Forwarded-For to the real client IP from
-//     pr.In.RemoteAddr's host (gatewayd-internal is the single public
+//     pr.In.RemoteAddr's host (gatewayd is the single public
 //     listener, so pr.In.RemoteAddr here is the originating
 //     customer). apid trusts X-Forwarded-For only when its own
 //     RemoteAddr is loopback, so a customer-injected X-Forwarded-For
@@ -311,11 +321,10 @@ func (a *apidProxy) proxyToApid(w http.ResponseWriter, r *http.Request) {
 				pr.Out.Header.Set("X-Forwarded-Proto", proto)
 			}
 			// Pin X-Forwarded-For to the real client IP from
-			// pr.In's RemoteAddr — gatewayd-public forwards the
-			// original customer's RemoteAddr over the unix
-			// socket, so this value is the customer's IP at the
-			// public edge. We overwrite (rather than append) so
-			// apid sees exactly one value, the contract its
+			// pr.In's RemoteAddr — the gatewayd edge sees the
+			// customer's IP before the loopback hop. We
+			// overwrite (rather than append) so apid sees
+			// exactly one value, the contract its
 			// defaultClientIP predicate relies on (issue #89).
 			if host, _, err := net.SplitHostPort(pr.In.RemoteAddr); err == nil && host != "" {
 				pr.Out.Header.Set("X-Forwarded-For", host)

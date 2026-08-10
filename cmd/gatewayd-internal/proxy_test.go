@@ -22,7 +22,7 @@ func TestApidProxy_ForwardsApidPaths(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits++
 		if r.Header.Get("x-faas-request-id") == "" {
-			t.Error("upstream request missing x-faas-request-id header (gatewayd-internal should generate one)")
+			t.Error("upstream request missing x-faas-request-id header (gatewayd should generate one)")
 		}
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
@@ -222,7 +222,7 @@ func TestIsApidPath_TableDriven(t *testing.T) {
 		{"/dashboard/apps/foo", true},
 		// /cli-auth is the device-code approval page (spec §2.2).
 		// Lives at the apid root, not under /dashboard/, so it
-		// needs its own gatewayd-internal allowlist entry — otherwise the
+		// needs its own gatewayd allowlist entry — otherwise the
 		// URL would 404 from the wake path on the public listener.
 		{"/cli-auth", true},
 		{"/cli-auth.zip", false}, // anchor regression (review finding #6)
@@ -389,11 +389,10 @@ func TestApidProxy_HealthzEndToEnd(t *testing.T) {
 }
 
 // TestApidProxy_PassesRealClientIPInXForwardedFor pins issue #89's
-// gatewayd-internal-side half: every /v1/* (and /login, /auth/verify, /dashboard,
+// gatewayd half: every /v1/* (and /login, /auth/verify, /dashboard,
 // etc.) request the apidProxy forwards must carry an X-Forwarded-For
 // header whose value is the real client IP — the host portion of
-// r.RemoteAddr forwarded by gatewayd-public over the unix socket.
-// apid's defaultClientIP trusts
+// r.RemoteAddr at the gatewayd edge. apid's defaultClientIP trusts
 // this header only when its own RemoteAddr is loopback (which it
 // always is on this hop), so the pin here is what restores per-IP
 // AuthLimit keying across the loopback hop.
@@ -421,8 +420,8 @@ func TestApidProxy_PassesRealClientIPInXForwardedFor(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/account", nil)
-	// Real client IP forwarded by gatewayd-public over the unix
-	// socket — what gatewayd-public saw at the public edge.
+	// Real client IP at the gatewayd edge — what gatewayd sees in
+	// r.RemoteAddr before the loopback hop.
 	req.RemoteAddr = "203.0.113.10:55555"
 	handler.ServeHTTP(rec, req)
 
@@ -438,20 +437,20 @@ func TestApidProxy_PassesRealClientIPInXForwardedFor(t *testing.T) {
 }
 
 // TestApidProxy_DoesNotSetXForwardedForWhenNoRemoteAddr pins the
-// defensive side of issue #89's gatewayd-internal-side half: when r.RemoteAddr is
+// defensive side of issue #89's gatewayd half: when r.RemoteAddr is
 // empty (the proxy is unreachable, or a test synthesises a bare
 // request) the proxy must NOT inject an X-Forwarded-For — that
 // would let a request without a real client IP trick apid's
 // defaultClientIP into trusting an empty header (the header would
 // be empty, the predicate falls back, but this test still confirms
-// the gatewayd-internal side doesn't write a bogus value).
+// the gatewayd side doesn't write a bogus value).
 //
 // Failure mode: if a future regression unconditionally writes a
 // header, a request with RemoteAddr="" would carry an empty
 // X-Forwarded-For and a downstream apid's predicate would fall
 // back to r.RemoteAddr (which is empty → "unknown"). The bucket
 // still works, but the loopback-only trust predicate never had a
-// chance to fire. This test pins that gatewayd-internal never synthesises
+// chance to fire. This test pins that gatewayd never synthesises
 // what apid might mistake for a trustable pin.
 func TestApidProxy_DoesNotSetXForwardedForWhenNoRemoteAddr(t *testing.T) {
 	var seenXFF string
@@ -472,7 +471,7 @@ func TestApidProxy_DoesNotSetXForwardedForWhenNoRemoteAddr(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/account", nil)
-	// Empty RemoteAddr — the degenerate case. gatewayd-internal must not
+	// Empty RemoteAddr — the degenerate case. gatewayd must not
 	// inject a header value, because there's no real IP to pin.
 	req.RemoteAddr = ""
 	handler.ServeHTTP(rec, req)
@@ -585,7 +584,7 @@ func TestApidProxy_LogsCarveOutToHandler(t *testing.T) {
 // expansion of TestApidProxy_LogsCarveOutToHandler that pins the
 // dispatch order for the negative cases the single-shot test
 // doesn't cover. apidProxy.ServeHTTP MUST check isApidLogsPath
-// BEFORE isApidPath (cmd/gatewayd-internal/proxy.go:110-120) — the table
+// BEFORE isApidPath (cmd/gatewayd/proxy.go:110-120) — the table
 // rows prove that:
 //   - paths that look like logs routes dispatch to logsHandler;
 //   - paths that match the apid prefix but NOT the logs matcher
@@ -741,7 +740,7 @@ func TestApidProxy_LogsCarveOutMethodFilter(t *testing.T) {
 // disabled case: when logsHandler is nil, the carve-out is
 // silently skipped and the path flows through to apid like
 // every other /v1/* path. This is the test-suite default — the
-// production gatewayd-internal wires the handler; tests don't.
+// production gatewayd wires the handler; tests don't.
 func TestApidProxy_LogsCarveOutDisabledWhenHandlerNil(t *testing.T) {
 	var upstreamHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -789,7 +788,7 @@ func TestApidProxy_LogsCarveOutDisabledWhenHandlerNil(t *testing.T) {
 // cover) is NOT pinned here — the spec might intentionally document
 // upcoming reservations, and the matcher is the live contract. The
 // one-way drift is what matters for "the customer-facing note in
-// the spec stays accurate to what gatewayd-internal actually reserves".
+// the spec stays accurate to what gatewayd actually reserves".
 func TestApidPathReservations_Documented(t *testing.T) {
 	specPath := "../../docs/faas_implementation_spec.md"
 	data, err := os.ReadFile(specPath)
@@ -815,7 +814,6 @@ func TestApidPathReservations_Documented(t *testing.T) {
 
 	// Pulled from pkg/apid/router.go's ApidRoot* const block
 	// (router.go:43-56). Keep in sync with that block — this test
-	// IS the guard that catches drift.
 	// IS the guard that catches drift.
 	wantConsts := []string{
 		"/v1",
