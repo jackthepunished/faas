@@ -2870,7 +2870,7 @@ type CreateAccountWithPersonalOrgResult struct {
 // EdgeRuleKind is the closed vocabulary for edge_rules.kind. The
 // gateway matcher's Kind switch is the compile-time guard against a
 // stray string landing in a default switch arm. Mirrors the schema
-// CHECK in migrations/00172_edge_rules.sql.
+// CHECK in migrations/00174_edge_rules.sql.
 type EdgeRuleKind string
 
 const (

@@ -1,4 +1,4 @@
--- filename: 00172_edge_rules.sql
+-- filename: 00174_edge_rules.sql
 -- +goose Up
 -- +goose StatementBegin
 -- Edge rules (issue #TBD / ADR-089, planned). Customer-configurable
@@ -11,7 +11,7 @@
 -- Slot 172 is the next free slot on origin/main (165 was taken by
 -- build_provenance.framework_version). If a sibling PR grabs 172
 -- first, renumber per migrations/README.md and update the companion
--- 00172_edge_rules_test.go filename + the literal UUIDs the test
+-- 00174_edge_rules_test.go filename + the literal UUIDs the test
 -- seeds.
 --
 -- Replay-safe (ADR-041 / PR #377): every DDL is guarded by IF NOT

@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00166_reserve_slot.sql — slot reservation placeholder
+-- 00172_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
@@ -12,14 +12,17 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- Issue #297 Tier A10 (PR #798, ADR-088) renumbered its apps.overflow_node
--- migration from 00165 (which collided with origin/main's
--- 00165_build_provenance_framework_version.sql landed by a parallel
--- PR) to slot 00167. Slot 00166 is also claimed by three other open
--- PRs (#795 invocations_outcome, #797 compute_nodes_public_ip,
--- #799 edge_rules). Whichever of those lands first deletes this
--- 00166 fence on its next rebase per ADR-041, exposing the
--- neighbour slot for the next sibling.
+-- Slot 00172 is reserved for PR #797 (Tier A9 standby write-redirect,
+-- migrations/00172_compute_nodes_public_ip.sql). PR #799 (edge-rules)
+-- renumbered its migration 5 times to clear this slot: 00166 (initial)
+-- → 00168 (after #798 took 00167) → 00169 (after #797 took 00168)
+-- → 00170 (after #800 took 00169) → 00171 (after #795 took 00170)
+-- → 00172 (after #795 raced again to 00171) → 00174 (after #797
+-- shipped its real public_ip migration at 00172). PR #795 settled on
+-- 00173 (real invocations.outcome migration). Slot 00172 is held
+-- empty so the embedded FS stays contiguous while the four-way slot
+-- race resolves. When #797 merges, it deletes this 00172 fence on
+-- its next rebase per ADR-041.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change.

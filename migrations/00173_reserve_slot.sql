@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00166_reserve_slot.sql — slot reservation placeholder
+-- 00173_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
@@ -12,14 +12,12 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- Issue #297 Tier A10 (PR #798, ADR-088) renumbered its apps.overflow_node
--- migration from 00165 (which collided with origin/main's
--- 00165_build_provenance_framework_version.sql landed by a parallel
--- PR) to slot 00167. Slot 00166 is also claimed by three other open
--- PRs (#795 invocations_outcome, #797 compute_nodes_public_ip,
--- #799 edge_rules). Whichever of those lands first deletes this
--- 00166 fence on its next rebase per ADR-041, exposing the
--- neighbour slot for the next sibling.
+-- Slot 00173 is reserved for PR #795 (issue #791 cron runs,
+-- migrations/00173_invocations_outcome.sql). PR #799 (edge-rules)
+-- renumbered to 00174 to leave this slot open for #795 to fill
+-- when it lands. When #795 merges, it deletes this 00173 fence on
+-- its next rebase per ADR-041 and ships its real invocations.outcome
+-- migration at the same slot.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change.
