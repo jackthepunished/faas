@@ -865,6 +865,23 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
 
+// FireCron manually triggers a cron fire-now (issue #791 PR-C /
+// ADR-090). The endpoint is asynchronous: apid inserts a pending row
+// into cron_fire_now_requests and emits db.NotifyCronRunNow; schedd
+// picks it up and stamps the terminal status. FireCron returns the
+// 202 response immediately with the request id — callers that need
+// the terminal status poll GET /v1/crons/{id}/runs (PR-A's surface)
+// for the matching `cron.fired.manually` audit row, or watch the
+// future GET /v1/cron-fire-now-requests/{id} endpoint.
+//
+// The idempotency-key auto-mint (TestDo_MutatingCallsCarryIdempotencyKey
+// in client_test.go) covers this call — replays with the same key
+// return the stored 202 without enqueuing a second fire.
+func (c *Client) FireCron(ctx context.Context, id string) (FireCronResponse, error) {
+	var out FireCronResponse
+	return out, c.do(ctx, "POST", "/v1/crons/"+id+"/run", nil, &out)
+}
+
 // ListCronRuns returns a page of the cron's execution history (issue
 // #791 / PR A): newest-first, server-computed duration_ms, outcome
 // classification (success/failed/timeout/dead_letter/running).

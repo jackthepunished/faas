@@ -20,6 +20,7 @@ import (
 	"github.com/onebox-faas/faas/cmd/gregale/templates"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
+	"github.com/onebox-faas/faas/pkg/gregalemanifest"
 )
 
 // Subcommand names — lifted to constants so goconst stops flagging the
@@ -607,6 +608,109 @@ func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *
 	return req
 }
 
+// manifestCronClient is the narrow surface deployManifestTriggers
+// reads from the SDK. Splitting it lets the unit test inject a
+// recording fake (cmd/gregale/manifest_test.go) without an httptest
+// server and without coupling the test to the SDK's full method
+// surface. *api.Client satisfies it by structural typing — no
+// adapter required at the call site.
+type manifestCronClient interface {
+	ListCrons(ctx context.Context, slug string) ([]api.CronResponse, error)
+	CreateCron(ctx context.Context, slug string, req api.CreateCronRequest) (api.CronResponse, error)
+	Whoami(ctx context.Context) (api.AccountResponse, error)
+}
+
+// deployManifestTriggers fans the manifest's `triggers:` block out to
+// apid via the existing CreateCron wire. Issue #791 PR-C / ADR-090.
+//
+// No manifest → no-op (returns nil). Bad manifest → wrapped error
+// from gregalemanifest.Validate, surfaced verbatim by printErr. The
+// fan-out itself is fail-fast: stop on the first CreateCron error,
+// report progress, exit non-zero. Identical (app, schedule, path)
+// triples are deduped by the server-side UNIQUE on crons, so a
+// re-running deploy is a no-op for the rows that already exist.
+//
+// Pre-count: the CLI tallies `existing` + `wanted` against the
+// account's plan limit and aborts with a clean 402 message before
+// any CreateCron. The authoritative check is server-side
+// (CreateCronIfUnderQuota takes FOR UPDATE on the apps row); the
+// pre-count is UX fast-fail only.
+func deployManifestTriggers(ctx context.Context, client manifestCronClient, slug, cwd string) error {
+	m, ok, err := gregalemanifest.Load(cwd)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // no manifest — nothing to do
+	}
+	if err := m.Validate(); err != nil {
+		return err
+	}
+
+	// Filter to triggers for THIS app's slug. Triggers targeting
+	// other slugs in a multi-app project are silently ignored on
+	// this deploy — `gregale deploy` is one-app-at-a-time, and the
+	// trigger for app-b should ship when the customer deploys app-b.
+	var matching []gregalemanifest.Trigger
+	for _, t := range m.Triggers {
+		if t.App == slug {
+			matching = append(matching, t)
+		}
+	}
+	if len(matching) == 0 {
+		return nil
+	}
+
+	// Pre-count against the server. ListCrons returns the existing
+	// rows; the per-plan CronLimitPerApp gate is the server's
+	// authority, so a clean pre-count is just a UX fast-fail. We
+	// look up the active account's plan via Whoami — silent on
+	// failure (an unknown plan falls through; the server gates with
+	// 402 ErrPlanCronsNotAllowed on the first CreateCron).
+	existing, err := client.ListCrons(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("list existing crons: %w", err)
+	}
+	var plan api.Limits
+	if acct, err := client.Whoami(ctx); err == nil {
+		if l, ok := api.LimitsFor(api.Plan(acct.Plan)); ok {
+			plan = l
+		}
+	}
+	wanted := len(matching)
+	headroom := plan.CronLimitPerApp - len(existing)
+	if headroom < wanted {
+		return fmt.Errorf("cron quota exceeded: %d triggers in manifest, plan allows %d (currently %d/%d); raise plan or drop triggers",
+			wanted, plan.CronLimitPerApp, len(existing), plan.CronLimitPerApp)
+	}
+
+	created := 0
+	for i, t := range matching {
+		enabled := t.IsEnabled()
+		req := api.CreateCronRequest{
+			AppID:    slug,
+			Schedule: t.Schedule,
+			Path:     t.Path,
+			Enabled:  &enabled,
+		}
+		if _, err := client.CreateCron(ctx, slug, req); err != nil {
+			// Staticcheck ST1005 — the format string must not end
+			// in a newline+period. The summary block reads as two
+			// sentences; the trailing newline from the original
+			// design flipped the staticcheck rule, so the second
+			// sentence now flows inline. Operators still see the
+			// "N triggers created, M not attempted" progress line.
+			return fmt.Errorf("trigger %d/%d (%s %q %s) rejected: %w — %d triggers created, %d not attempted (re-run deploy after fixing; creation is idempotent by (app, schedule, path))",
+				i+1, len(matching), t.App, t.Schedule, t.Path, err, created, len(matching)-i)
+		}
+		created++
+	}
+	if !jsonOutput && created > 0 {
+		_, _ = fmt.Fprintf(osStdout, "  ✓ %s: %d trigger(s) applied\n", slug, created)
+	}
+	return nil
+}
+
 // cmdDeployTarball implements `gregale deploy` (image / tarball / repo
 // / template / zero-config). Zero-config (issue #313) packs the cwd
 // and proceeds down the --tarball path. Issue #737 / ADR-083 added the
@@ -667,6 +771,11 @@ func cmdDeployTarball(args []string) int {
 	// validates [0, 100] (422) and the plan gate (403) on the
 	// request path; we just thread the pointer through.
 	trafficPercent := fs.Int("traffic-percent", -1, "split weight for this deployment (0-100, Pro/Scale only; -1 = server default 100)")
+	// Issue #791 PR-C / ADR-090: skip the `gregale.yaml` triggers fan-out.
+	// The flag is the explicit opt-out; without it, a present
+	// gregale.yaml with a `triggers:` block is applied AFTER CreateApp
+	// (and BEFORE the deploy body ships) — see deployManifestTriggers.
+	noTriggers := fs.Bool("no-triggers", false, "skip the `gregale.yaml` triggers fan-out (issue #791 PR-C)")
 	if err := fs.Parse(args); err != nil {
 		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME | --template NAME", "deploy")
 		return 1
@@ -853,10 +962,17 @@ func cmdDeployTarball(args []string) int {
 	} else if *app {
 		resolvedShape = shapeApp
 	}
+	cwd, cwdErr := os.Getwd()
+	if cwdErr != nil {
+		// Don't fail the deploy yet — only the no-(--image|--tarball)
+		// path actually reads cwd. We still need it for the
+		// gregale.yaml fan-out (issue #791 PR-C), so we surface
+		// the error there if needed.
+		cwd = ""
+	}
 	if *image == "" && *tarball == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return printErr("Could not read current directory", err)
+		if cwdErr != nil {
+			return printErr("Could not read current directory", cwdErr)
 		}
 		// Issue #737 / ADR-083: resolveDeployShape does detect +
 		// infer + print in one seam so the unit test can drive the
@@ -1011,6 +1127,19 @@ func cmdDeployTarball(args []string) int {
 			if _, err := client.UpdateApp(ctx, slug, api.UpdateAppRequest{RequireAuthn: requireAuthnPtr}); err != nil {
 				return printErr("Could not update existing app's require_authn", err)
 			}
+		}
+	}
+
+	// Issue #791 PR-C / ADR-090: gregale.yaml triggers fan-out. Runs
+	// after CreateApp so the slug exists for the FK, and before
+	// DeployTarball so a deploy-body error doesn't leave partial
+	// trigger rows in a confused state. Fail-fast on the first
+	// CreateCron error; the deploy is not rolled back (the tarball
+	// hasn't shipped yet, but CreateCronIfUnderQuota is the durable
+	// record). --no-triggers opts out of the entire fan-out.
+	if !*noTriggers {
+		if err := deployManifestTriggers(ctx, client, slug, cwd); err != nil {
+			return printErr("Manifest triggers fan-out failed", err)
 		}
 	}
 

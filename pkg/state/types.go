@@ -1062,6 +1062,40 @@ type Cron struct {
 	LastFiredAt time.Time // zero until first fire; updated by MarkCronFired
 }
 
+// FireNowStatus is the closed vocabulary for cron_fire_now_requests.status
+// (migrations/00193). Mirrors the audit-event `cron.fired.manually` status
+// field for the 4 success/fail outcomes; `cancelled` is reserved for a
+// future pause/cancel surface.
+type FireNowStatus string
+
+const (
+	FireNowStatusPending   FireNowStatus = "pending"
+	FireNowStatusRunning   FireNowStatus = "running"
+	FireNowStatusSucceeded FireNowStatus = "succeeded"
+	FireNowStatusFailed    FireNowStatus = "failed"
+	FireNowStatusCancelled FireNowStatus = "cancelled"
+)
+
+// FireNowRequest is one row of cron_fire_now_requests (migrations/00193).
+// ADR-090 PR-C: apid inserts on POST /v1/crons/{id}/run; schedd claims
+// (FOR UPDATE SKIP LOCKED) on each NotifyCronRunNow wakeup, calls
+// RunCronNow in-process, then transitions status to terminal.
+//
+// Invariant: a single row represents a single fire-now attempt. The
+// customer-side idempotency wrapper (cmd/apid/server.go::s.idempotent)
+// guards the INSERT so a retry with the same Idempotency-Key never
+// creates a second row.
+type FireNowRequest struct {
+	ID           string
+	CronID       string
+	AccountID    string
+	RequestedAt  time.Time
+	Status       FireNowStatus
+	InvocationID *string // nil while pending/running; set on terminal
+	Error        *string // nil until status=failed
+	FinishedAt   *time.Time
+}
+
 // AlertMetric is a closed vocabulary for the metric side of an AlertRule
 // condition (issue #396, ADR-045). Names mirror the AppMetricsResponse
 // payload verbatim so the evaluator and the customer-facing metrics

@@ -84,6 +84,7 @@ export type { EdgeRuleRedirectAction } from './EdgeRuleRedirectAction.js';
 export type { EdgeRuleResponse } from './EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
 export type { EdgeRuleRouteAction } from './EdgeRuleRouteAction.js';
+export type { FireCronResponse } from './FireCronResponse.js';
 export type { GdprAuditExportResponse } from './GdprAuditExportResponse.js';
 export type { GraceWindowResponse } from './GraceWindowResponse.js';
 export type { Id32 } from './Id32.js';

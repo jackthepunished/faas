@@ -180,6 +180,22 @@ func TestSweep_CreateCron(t *testing.T) {
 	}
 }
 
+func TestSweep_FireCron(t *testing.T) {
+	// ADR-090 PR-C: POST /v1/crons/{id}/run is a 202 with the
+	// FireCronResponse. Mirror the CreateCron round-trip shape; the
+	// idempotency-key auto-mint is exercised by TestDo_MutatingCallsCarryIdempotencyKey
+	// (client_test.go), which covers every mutating call including this one.
+	srv, _ := newSweepServer(t, 202, `{"request_id":"req_1","cron_id":"cron_1","status":"pending"}`)
+	c := NewClient(srv.URL, "fp_test")
+	resp, err := c.FireCron(context.Background(), "cron_1")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if resp.RequestID != "req_1" || resp.CronID != "cron_1" || resp.Status != "pending" {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+}
+
 func TestSweep_ListAlertRules(t *testing.T) {
 	srv, _ := newSweepServer(t, 200, `[]`)
 	c := NewClient(srv.URL, "fp_test")
