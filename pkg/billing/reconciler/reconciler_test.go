@@ -45,6 +45,15 @@ func (s *stubProvider) Refund(context.Context, string, int64) (*billing.RefundRe
 func (s *stubProvider) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Time) (int64, error) {
 	return s.pushed, s.err
 }
+func (s *stubProvider) RetryLatestCharge(_ context.Context, _ state.Account) (string, string, error) {
+	return "", "", nil
+}
+func (s *stubProvider) CancelAtPeriodEnd(_ context.Context, _ state.Account) (time.Time, error) {
+	return time.Time{}, nil
+}
+func (s *stubProvider) PaymentMethodSummary(_ context.Context, _ state.Account) (billing.PaymentMethod, error) {
+	return billing.PaymentMethod{}, nil
+}
 func (s *stubProvider) Capabilities() billing.CapabilitySet {
 	return s.caps
 }

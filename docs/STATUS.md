@@ -44,7 +44,7 @@ green in `pkg/fcvm/v6_resume_ext4_metal_test.go`.
 **Remaining:** §14 V2 latency loop driver (100 cycles, p50 ≤ 350 ms)
 — see [What's next](#whats-next).
 
-## M4 — gatewayd + schedd. ✅
+## M4 — gatewayd-public + gatewayd-internal + schedd. ✅
 
 Routing, wake gate, admission ledger (47,600 MB headroom / 160 vCPU),
 G7 flow-aware reaper (`pkg/sched/flowcount`), `PGBackend` PG routing,
@@ -194,7 +194,7 @@ decision; the operator runbook is
 `docs/ops/billing-provider-switch.md`.
 
 **Webhook signature replay protection (PR for issue #294, ADR-042)**
-— the three webhook ingresses (GitHub via gatewayd, Stripe + Paddle
+— the three webhook ingresses (GitHub via `gatewayd-public`, Stripe + Paddle
 via apid) verify HMAC but never checked the delivery UUID against a
 dedupe table; a replayed webhook within the signature-validity
 window succeeded twice. Closes the gap with a single shared
@@ -202,7 +202,7 @@ window succeeded twice. Closes the gap with a single shared
 `pkg/webhookdedupe` helper consumed by all three ingresses, one
 sweep goroutine in apid, and a `webhook.replay_rejected` audit row
 on each ingress. Replays return 200 (idempotent — provider
-interprets as success and stops retrying). New gatewayd audit seam
+interprets as success and stops retrying). New `gatewayd-public` audit seam
 mirrors the apid pattern.
 
 **§14 M7 acceptance test (24h GB-h shadow, integer-arithmetic exact)**
@@ -367,7 +367,7 @@ spinner) and PR #51 (the closeout batch):
   `fcvm_snapshot_fleet_p95_bytes`, `fcvm_resident_ram_pct`,
   `fcvm_lv_fc_used_pct` (schedd-owned), plus
   `vmmd_cold_boot_fallback_total` (vmmd-owned, ADR-016) and
-  `gateway_wake_queue_wait_seconds` (gatewayd-owned). Prometheus
+  `gateway_wake_queue_wait_seconds` (`gatewayd-internal`-owned; legacy Prometheus job label `gatewayd` retained). Prometheus
   + node_exporter are ansible roles with SHA-256-pinned binaries,
   scrape config template at
   `deploy/ansible/roles/prometheus/templates/prometheus.yml.j2`.
@@ -475,7 +475,7 @@ spinner) and PR #51 (the closeout batch):
 - **PR #152 — per-IP `AuthLimit` restored across loopback**
   (closes #89). `pkg/middleware/authlimit.go::defaultClientIP`
   trusts `X-Forwarded-For` only when `RemoteAddr` is loopback;
-  the gatewayd pin is at `cmd/gatewayd/proxy.go:215-222`.
+  the `gatewayd-internal` pin is at `cmd/gatewayd-internal/proxy.go:215-222`.
 - **PR #153 — §11 security-hardening e2e sweep**.
   `cmd/e2e/sec11_sweep_test.go` (4 tests:
   `TestSec11_AuthLimitPerIP_CrossProcess`,
@@ -731,10 +731,10 @@ explicitly open issues that the doc otherwise implies are closed.
 
 ### M8
 
-- **CertMagic TLS** for gatewayd (`*.apps.gregale.dev` via DNS-01;
+- **CertMagic TLS** for `gatewayd-public` (`*.apps.gregale.dev` via DNS-01;
   on-demand HTTP-01 gated by `custom_domains` allowlist). Plumbing
   landed across `pkg/gateway/tls*.go`, `dns01_hetzner.go`,
-  `allowlist.go`, `acme.go`, `cmd/gatewayd/{main,config,secrets}.go`,
+  `allowlist.go`, `acme.go`, `cmd/gatewayd-public/{main,config,secrets}.go`,
   the systemd unit, and the ansible role; `caddyserver/certmagic`
   v0.25.4 is pinned in `go.mod:14`. PR #87 closed the reference-node cut-over
   + the structured acceptance tests; ADR-024 declared H3 (TLS
@@ -742,8 +742,8 @@ explicitly open issues that the doc otherwise implies are closed.
   H4 (file-watch secret reload) as known follow-ups. H3 closes in
   this PR via `pkg/gateway/metrics.go::tlsCertExpiry` + `tlsOnDemandDenied`
   + `pkg/gateway/cert_expiry.go` refresher, wired into
-  `cmd/gatewayd/main.go`; three alert rules land in `faas.rules.yml`;
-  operator runbook at `docs/ops/gatewayd-tls-cutover.md`.
+  `cmd/gatewayd-public/main.go`; three alert rules land in `faas.rules.yml`;
+  operator runbook at `docs/ops/gatewayd-public-tls-cutover.md` (the legacy `docs/ops/gatewayd-tls-cutover.md` retains the pre-PR-A cut-over steps; current process lives in the public-edge runbook).
 - **§14 V2 latency driver** — 100 park→wake cycles per app class,
   p50 ≤ 350 ms / p95 ≤ 800 ms. The Hobby-class gate is wired via
   `TestDeployWakeMetal/wake-latency-p50p95-100cycles` (extends the

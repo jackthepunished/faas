@@ -45,7 +45,7 @@ import (
 // future provider is a one-line constant addition.
 const (
 	// ProviderGitHub is the source of the X-GitHub-Delivery UUID.
-	// gatewayd's GitHub proxy reads the header and passes it here.
+	// gatewayd-internal's GitHub proxy reads the header and passes it here.
 	ProviderGitHub = "github"
 	// ProviderStripe is the source of Stripe `event.id`. The Stripe
 	// webhook handler at cmd/apid/handlers_ext.go::stripeWebhook

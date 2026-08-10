@@ -361,6 +361,23 @@ func (f *fakeBillingProvider) ReconcileUsage(_ context.Context, _ state.Account,
 	return 0, billing.ErrNotImplemented
 }
 
+// RetryLatestCharge / CancelAtPeriodEnd / PaymentMethodSummary (issue #242):
+// the changePlan tests don't drive the retry/cancel/payment-method
+// handlers, so the fake returns zero values for all three. Add a
+// per-instance override slot if a future test needs to assert
+// Provider dispatch (handlers_billing_retry_test.go /
+// handlers_billing_cancel_test.go will introduce dedicated
+// recorder-shaped fakes — these are kept minimal here).
+func (f *fakeBillingProvider) RetryLatestCharge(_ context.Context, _ state.Account) (string, string, error) {
+	return "", "", nil
+}
+func (f *fakeBillingProvider) CancelAtPeriodEnd(_ context.Context, _ state.Account) (time.Time, error) {
+	return time.Time{}, nil
+}
+func (f *fakeBillingProvider) PaymentMethodSummary(_ context.Context, _ state.Account) (billing.PaymentMethod, error) {
+	return billing.PaymentMethod{}, nil
+}
+
 // Capabilities returns the Paddle-shaped set so the changePlan
 // handler dispatches via the new PR-P1 capability introspection
 // (CapHostedCheckout is set). Matches the production *paddle.Provider

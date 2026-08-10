@@ -114,7 +114,7 @@ effect. Cross-check the upstream cause via
 retry storm; if failures are high, it's an outage.
 
 **Drop (fleet or account)**: the most common cause is an upstream
-outage (Postgres, gatewayd, schedd). Cross-check
+outage (Postgres, gatewayd-public, gatewayd-internal, schedd). Cross-check
 `FaasApiAvailabilityLow` and `FaasResidentGbPerCustomerHigh` for
 fleet-wide pressure. For per-account drops that don't have a
 matching fleet-wide signal, the customer is likely in maintenance
@@ -147,6 +147,6 @@ a feature flag and triggered cascading re-fetches. Triage:
    it's a successful scan/burst.
 3. If it's a fleet-side post-deploy regression, identify the
    daemon via the route's `topk` panel (id 82) and roll back the
-   most recent apid / gatewayd deploy. If it's a customer-side
+   most recent apid / gatewayd-public / gatewayd-internal deploy. If it's a customer-side
    issue, coordinate a temporary per-account block via the §11
    egress catalog.

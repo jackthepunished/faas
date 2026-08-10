@@ -229,7 +229,7 @@ type runDeps struct {
 	// (issue #254 / Move 4 PR-2). It hosts the bearer / session / MFA
 	// / scope checks + the IDOR-safe LoadApp + the shared per-IP
 	// AuthLimit bucket. nil in tests → the AppLogsHandler is constructed
-	// in non-auth mode (the whitebox tests in cmd/gatewayd/app_logs_test.go
+	// in non-auth mode (the whitebox tests in cmd/gatewayd-internal/app_logs_test.go
 	// drive `serveAppLogs` directly with a stub stream and bypass the
 	// chain). ADR-046.
 	authMw *authmw.Middleware
@@ -354,7 +354,7 @@ func defaultServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// run is the production body, moved verbatim from cmd/gatewayd/main.go
+// run is the production body, moved verbatim from cmd/gatewayd-internal/main.go
 // during the Tier A7 split (PR-A moved the file, PR-B dropped the
 // placeholder that was previously serving TEMPLATE_OK from this
 // package; the `prod` prefix was the placeholder-era workaround so
@@ -418,7 +418,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// stream). On the single-box default-local fleet this dials the
 	// same client the router would resolve; on a multi-box install
 	// the stream comes from one schedd only and is documented as
-	// such in cmd/gatewayd/warmhints.go.
+	// such in cmd/gatewayd-internal/warmhints.go.
 	sched, err := scheddgrpc.DialContext(ctx, scheddSocket, nil)
 	if err != nil {
 		return fmt.Errorf("gatewayd: dial schedd: %w", err)
@@ -621,7 +621,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// PR scale-out readiness: thread *gateway.Metrics into the node
 	// cache so the WatchEvictions heartbeat goroutine has a sink for
 	// gateway_compute_node_changed_subscriber_alive. deps.metrics is
-	// always non-nil after NewMetrics (cmd/gatewayd/main.go:284).
+	// always non-nil after NewMetrics (cmd/gatewayd-internal/main.go:284).
 	//
 	// issue #517 / PR-C / ADR-064: thread the events Platform into
 	// the node cache so the forwarder emits wake.proxy_first_byte
@@ -651,13 +651,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 		deps.writeTimeout = cfg.ResponseWriteTimeout
 	}
 	// Issue #254 / Move 4 PR-2: pkg/auth.Middleware construction.
-	// AppLogsHandler (cmd/gatewayd/app_logs.go) shares the auth chain
+	// AppLogsHandler (cmd/gatewayd-internal/app_logs.go) shares the auth chain
 	// with cmd/apid via ADR-046 — same bearer / session / MFA / scope
 	// / IDOR-safe LoadApp, same per-IP AuthLimit bucket family. The
 	// session manager is loaded from FAAS_SESSION_KEY (see
 	// session_key.go); the auditor is the same pkg/audit.Auditor
 	// gatewayd already uses for githubd replay-dedupe audit rows
-	// (cmd/gatewayd/auditor.go). nil-safe when the env is unset so
+	// (cmd/gatewayd-internal/audit.go). nil-safe when the env is unset so
 	// the e2e harness + these dev-mode paths still boot.
 	sessions := loadSessionManager(osGetenv, log)
 	if sessions == nil {
@@ -874,7 +874,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// daemon's lifetime; stops cleanly on ctx cancel. Local
 	// topAccountSet mirrors pkg/wire/topn.go so pkg/gateway stays
 	// free of any dependency on pkg/wire (avoids an import cycle
-	// through cmd/gatewayd → pkg/gateway → pkg/wire → cmd/gatewayd).
+	// through cmd/gatewayd-internal → pkg/gateway → pkg/wire → cmd/gatewayd-internal).
 	gatewayTopNSampler := newTopNSampler(handler.Metrics(), log)
 	go gatewayTopNSampler.run(ctx)
 
@@ -967,7 +967,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// The handler is mounted on a tiny *http.ServeMux so the
 	// `{slug}` path parameter binds (the AppLogsHandler reads
 	// r.PathValue("slug")). The mux is wrapped by the apidProxy
-	// carve-out (cmd/gatewayd/proxy.go::isApidLogsPath) so the
+	// carve-out (cmd/gatewayd-internal/proxy.go::isApidLogsPath) so the
 	// public listener dispatches the path straight to the handler
 	// without consulting pkg/gateway.Handler's wake/proxy logic
 	// (the route is hostname-agnostic — it owns /v1/apps/{slug}/logs
@@ -1048,7 +1048,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// proxied through our wake/proxy path — those apps govern their
 	// own CSP, and injecting a nonce-locked policy here would break
 	// every customer HTML page (issue #249 risk callout).
-	// isApidPath lives in cmd/gatewayd/proxy.go (path-string
+	// isApidPath lives in cmd/gatewayd-internal/proxy.go (path-string
 	// predicate); the httpsec.Nonce gate takes a *http.Request, so
 	// the adapter below extracts r.URL.Path and forwards.
 	//

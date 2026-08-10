@@ -44,6 +44,6 @@
 // `Run(ctx) error` shape.
 //
 // PR-A ships the spool + shipper + s3client + CLI unseal. PR-B
-// extends gatewayd's SSE handler to proxy `?after=7d` reads
+// extends gatewayd-internal's SSE handler to proxy `?after=7d` reads
 // through the S3Client. PR-C closes the ansible + runbook gap.
 package logarchive

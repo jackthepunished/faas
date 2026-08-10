@@ -353,7 +353,7 @@ func TestListApps_RequiresAuth(t *testing.T) {
 
 // TestHealthz confirms the loopback liveness probe returns 200 with
 // the canonical {"status":"ok"} body. No auth, no DB — issue #85 said
-// the gatewayd forwards this path verbatim and a 5xx would cascade
+// the gatewayd-internal forwards this path verbatim and a 5xx would cascade
 // into the control plane.
 func TestHealthz(t *testing.T) {
 	e := setup(t, api.PlanFree)

@@ -1,7 +1,7 @@
 # Example schedd config — copy to /etc/faas/schedd.toml on the box.
 # Every field has a working default; an empty file yields a runnable daemon.
 
-# socket_path: unix socket schedd's gRPC server binds (ADR-018; gatewayd dials
+# socket_path: unix socket schedd's gRPC server binds (ADR-018; gatewayd-internal dials
 # it to wake apps). Mode 0660, group `faas`.
 # Default: /run/faas/schedd.sock
 # socket_path = "/run/faas/schedd.sock"
@@ -23,9 +23,9 @@
 # db_url = ""
 
 # --- Issue #95 / ADR-025: location-transparent gRPC transport ---
-# schedd is both a server (gatewayd + imaged dial it) and a client
+# schedd is both a server (gatewayd-internal + imaged dial it) and a client
 # (it dials vmmd). The two roles use distinct TLS clusters so a
-# remote vmmd cannot accidentally TLS-wrap the local gatewayd-facing
+# remote vmmd cannot accidentally TLS-wrap the local gatewayd-internal-facing
 # server, and each leaf cert carries a single EKU.
 
 # listen_addr: gRPC listen target. Empty (default) keeps the legacy
@@ -40,7 +40,7 @@
 # vmmd_target = "tcp://vmmd.internal:50051"
 
 # tls_cert_path / tls_key_path / tls_ca_path: server-mTLS cluster
-# (front of gatewayd). All three empty => no TLS. All three set =>
+# (front of gatewayd-internal). All three empty => no TLS. All three set =>
 # RequireAndVerifyClientCert. Partial cluster => startup error.
 # Defaults: ""
 # tls_cert_path = "/etc/faas/tls/schedd.crt"

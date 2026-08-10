@@ -1,8 +1,8 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00169_invocations_outcome.sql
+-- filename: 00173_invocations_outcome.sql
 --
--- 00169_invocations_outcome.sql — issue #791 (cron run history).
+-- 00173_invocations_outcome.sql — issue #791 (cron run history).
 --
 -- Adds a durable, normalized `outcome` to the invocations table so the
 -- per-cron run-history surface (GET /v1/crons/{id}/runs) can render

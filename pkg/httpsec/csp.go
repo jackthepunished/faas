@@ -1,5 +1,5 @@
 // csp.go — Content-Security-Policy with per-request nonce, gated by
-// a path predicate so gatewayd doesn't lock CSP onto customer-app
+// a path predicate so gatewayd-internal doesn't lock CSP onto customer-app
 // proxied responses (those apps govern their own CSP). apid emits
 // CSP on every response (apid serves only dashboard + API; JSON
 // responses carry a harmless policy).
@@ -110,10 +110,10 @@ func buildCSP(nonce string) string {
 // can stamp `nonce="…"` on every <script>/<style> tag), and emits
 // Content-Security-Policy only when gate(r) returns true.
 //
-// gate is the apid-vs-customer-app discriminator for gatewayd
-// (cmd/gatewayd/proxy.go::isApidPath); apid passes a func that
+// gate is the apid-vs-customer-app discriminator forgatewayd-internal
+// (cmd/gatewayd-internal/proxy.go::isApidPath); apid passes a func that
 // always returns true. Forgetting the gate is a compile error in
-// gatewayd's main.go (the parameter is required).
+// gatewayd-internal's main.go (the parameter is required).
 //
 // The middleware does not log the nonce; on the rare rand.Read
 // failure path it logs the 6-char fingerprint so the operator can

@@ -96,7 +96,7 @@ func (p *Problem) Error() string {
 }
 
 // WriteProblem renders p as an RFC 7807 problem+json response with its status
-// code. Every HTTP surface (gatewayd, apid) uses this so error shape is uniform.
+// code. Every HTTP surface (gatewayd-internal, apid) uses this so error shape is uniform.
 func WriteProblem(w http.ResponseWriter, p *Problem) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	for k, vs := range p.extraHeaders {
@@ -128,7 +128,7 @@ func (p *Problem) WithDocs(url string) *Problem {
 }
 
 // WithHeader attaches a single response header to the Problem so
-// gatewayd's writeWakeError can write it onto the wire without
+// gatewayd-internal's writeWakeError can write it onto the wire without
 // branches on each error code. Used today by the build-attestation
 // transient-I/O path (Retry-After: 5 — review finding #1a on
 // PR #322). Multiple WithHeader calls compose: each call appends a
@@ -275,7 +275,7 @@ const (
 	// CodeSigInvalid is returned by schedd when the layer's
 	// signature fails verification (or is missing) on cold-boot.
 	// The deployment transitions to DeployFailed with this code;
-	// the wake that triggered the verify returns 503 to gatewayd
+	// the wake that triggered the verify returns 503 to gatewayd-internal
 	// with the same code. ADR-038 §Consequences Compatibility.
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"
@@ -491,6 +491,14 @@ const (
 	// provenance row is the "populator INSERT failed + WARN logged"
 	// outcome, not a 404 of the build itself.
 	CodeBuildProvenanceNotFound = "build_provenance_not_found"
+	// CodeBuildNotFound is the DEPLOY-PROV-6 / ADR-089 (issue
+	// #741) 404 sentinel for GET /v1/builds/{id} when the build
+	// row does not exist OR belongs to another account. The 404
+	// surface is uniform (the server's IDOR chain collapses every
+	// negative path) so cross-account probes can't enumerate —
+	// distinct from CodeBuildProvenanceNotFound (which means
+	// "build exists, populator INSERT failed").
+	CodeBuildNotFound = "build_not_found"
 
 	// ADR-031 (tier-2 of the network roadmap) — per-app egress
 	// allowlist. Same gate shape as MinInstances: the feature is
@@ -604,6 +612,17 @@ const (
 	// "you've hit your reserved cap" vs "your plan doesn't unlock
 	// reserved" without conflating them.
 	CodePlanEvictionPriorityReservedQuota = "plan_eviction_priority_reserved_quota"
+
+	// Tier A10 / ADR-088 — per-app overflow_node preference. 422
+	// returned when (a) the wire name does not resolve via
+	// Store.ComputeNodeByName (404→422 mapping, mirrors the
+	// soft-404→404 surface at compute_nodes.go:267) or
+	// (b) the named compute_nodes row is active=false. Distinct
+	// code from the per-app column-set gates so the CLI can
+	// render "spill target not found" / "spill target offline"
+	// along the existing 422-family copy without conflating them
+	// in telemetry.
+	CodeInvalidOverflowNode = "invalid_overflow_node"
 
 	// Issue #471 PR-B (the meat) — emitted when an active stream
 	// exceeds the per-plan MaxResponseBodyBytes cap (Hobby+: 100 MB;
@@ -2277,6 +2296,19 @@ func ErrBuildProvenanceNotFound() *Problem {
 		WithDocs(docsBase + "/builds#provenance")
 }
 
+// ErrBuildNotFound is the DEPLOY-PROV-6 / ADR-089 (issue #741)
+// surface for GET /v1/builds/{id} when the build id is unknown
+// OR belongs to another account. The 404 surface is uniform so
+// cross-account probes can't enumerate — distinct from
+// CodeBuildProvenanceNotFound, which means "the build exists but
+// its provenance populator INSERT failed."
+func ErrBuildNotFound() *Problem {
+	return NewProblem(http.StatusNotFound, CodeBuildNotFound,
+		"No such build",
+		"the build id does not exist, or belongs to another account").
+		WithDocs(docsBase + "/builds#status")
+}
+
 // ErrBuildSBOMUnavailable is the issue #299 / ADR-038 Phase 3 surface
 // for `faas build sbom <id>` (and the SDK GetBuildsIdSbom) when no
 // SBOM artefact has been stored for this build yet — either the imaged
@@ -2520,4 +2552,16 @@ func ErrOrgAPIKeyRequiresOrg() *Problem {
 		"API key must be bound to an organization",
 		"this legacy API key has no organization binding; create a new key via /v1/orgs/{slug}/keys.").
 		WithDocs(docsBase + "/orgs#api-keys")
+}
+
+// ErrInvalidOverflowNode is the 422 returned when the
+// overflow_node PATCH or create-time value does not resolve
+// to a real, active compute_node (Tier A10 / ADR-088). Names
+// the offending value back to the customer so dashboards can
+// surface "spill target X not found" without grepping logs.
+func ErrInvalidOverflowNode(name string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidOverflowNode,
+		"Invalid overflow_node",
+		fmt.Sprintf("no active compute_node named %q; check the operator-supplied spill target name and try again.", name)).
+		WithDocs(docsBase + "/apps#overflow_node")
 }

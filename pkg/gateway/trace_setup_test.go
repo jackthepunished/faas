@@ -191,7 +191,7 @@ func TestTraceSetup_CounterIsSharedBetweenSamplerAndReturnValue(t *testing.T) {
 // InstallTracePipeline return bundle exposes DeploymentCounter
 // (the contract pkg/sched/deployment_counter_watcher.go relies
 // on). Pinning the field presence here is cheaper than spinning
-// up the full Platform + gatewayd in cmd/gatewayd-public.
+// up the full Platform + gatewayd-internal in cmd/gatewayd-public.
 func TestTraceSetup_DeploymentCounterOnTraceSetup(t *testing.T) {
 	// buildSampler returns a (sampler, counter) pair; the
 	// InstallTracePipeline wiring layer copies counter into the

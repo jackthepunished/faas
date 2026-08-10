@@ -1,3 +1,7 @@
+# Historical nftables fragment for the monolithic gatewayd;
+# the live ruleset is in
+# deploy/ansible/roles/nftables/files/policy_nftables.conf.j2.
+# PR-E (2026-08-09): retained for diff archaeology only.
 # nftables ruleset fragment for gatewayd — include from the platform nft
 # config (deploy/nftables/faas.nft) so all host firewall state stays in one
 # place. The public listener on the host IP needs :80 (ACME HTTP-01 + redirect

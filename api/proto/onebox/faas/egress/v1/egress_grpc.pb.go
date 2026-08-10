@@ -1,5 +1,5 @@
-// gatewayd egress producer service (ADR-046 PR-2). One streaming
-// RPC: `StreamBytes` server-streaming from gatewayd to meterd.
+// gatewayd-internal egress producer service (ADR-046 PR-2). One streaming
+// RPC: `StreamBytes` server-streaming from gatewayd-internal to meterd.
 // Each chunk is one (instance_id, minute, bytes) drained from the
 // in-memory per-instance ring buffer
 // (pkg/gateway/egresssink.EgressSink). The meterd side reads,
@@ -58,9 +58,9 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// EgressTxService is the gRPC service gatewayd exposes for the
+// EgressTxService is the gRPC service gatewayd-internal exposes for the
 // egress-producer channel (ADR-046 PR-2). Served on the same
-// unix socket as cmd/gatewayd/synth.go's SynthServer
+// unix socket as cmd/gatewayd-internal/egress_grpc.go
 // (FAAS_GATEWAY_SYNTH_SOCKET, default /run/faas/gatewayd-
 // internal.sock); the unix-socket DAC auth (ADR-015) is the
 // only authentication for v1 — only meterd is in the `faas`
@@ -75,7 +75,7 @@ type EgressTxServiceClient interface {
 	// EgressSink.DrainRecords produces them; the client (meterd)
 	// reads at its own cadence (one minute-by-minute accumulation
 	// per SampleAndRoll tick). Server-side backpressure is gRPC's
-	// natural flow control — the gateway never blocks; the meterd
+	// natural flow control — the egress server never blocks; the meterd
 	// dialer pulls at its own rate. Empty stream = nothing to
 	// drain this turn (the ring buffer has no observed bytes);
 	// the client MUST tolerate empty returns. End-of-stream is
@@ -119,9 +119,9 @@ type EgressTxService_StreamBytesClient = grpc.ServerStreamingClient[BytesFrame]
 // All implementations must embed UnimplementedEgressTxServiceServer
 // for forward compatibility.
 //
-// EgressTxService is the gRPC service gatewayd exposes for the
+// EgressTxService is the gRPC service gatewayd-internal exposes for the
 // egress-producer channel (ADR-046 PR-2). Served on the same
-// unix socket as cmd/gatewayd/synth.go's SynthServer
+// unix socket as cmd/gatewayd-internal/egress_grpc.go
 // (FAAS_GATEWAY_SYNTH_SOCKET, default /run/faas/gatewayd-
 // internal.sock); the unix-socket DAC auth (ADR-015) is the
 // only authentication for v1 — only meterd is in the `faas`
@@ -136,7 +136,7 @@ type EgressTxServiceServer interface {
 	// EgressSink.DrainRecords produces them; the client (meterd)
 	// reads at its own cadence (one minute-by-minute accumulation
 	// per SampleAndRoll tick). Server-side backpressure is gRPC's
-	// natural flow control — the gateway never blocks; the meterd
+	// natural flow control — the egress server never blocks; the meterd
 	// dialer pulls at its own rate. Empty stream = nothing to
 	// drain this turn (the ring buffer has no observed bytes);
 	// the client MUST tolerate empty returns. End-of-stream is

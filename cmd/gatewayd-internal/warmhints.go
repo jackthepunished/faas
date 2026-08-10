@@ -1,4 +1,4 @@
-// warmhints.go — gatewayd-side consumer for schedd's
+// warmhints.go — gatewayd-internal-side consumer for schedd's
 // StreamWarmHints gRPC stream (ADR-025 axis 4).
 //
 // PR #429 shipped the pull half (pkg/sched/warmaffinity.go on
@@ -7,7 +7,7 @@
 // schedd's StreamWarmHints stream and updates the picker's hint
 // cache on every event.
 //
-// Modeled on cmd/gatewayd/nodecache.go::WatchEvictions — same
+// Modeled on cmd/gatewayd-internal/nodecache.go::WatchEvictions — same
 // outer reconnect loop, same backoff cadence, same heartbeat
 // pattern (a slog.Debug line every 30s, no Prometheus surface;
 // the Phase 3 review chose slog.Debug only for dropped events).

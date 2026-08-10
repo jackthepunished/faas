@@ -2987,6 +2987,24 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.ClearAuthDefaultFlippedAt {
 		a.AuthDefaultFlippedAt = nil
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// Set bit controls the write — "don't touch" by default,
+	// "explicit NULL" (clear → A9 fallback) when Set is true
+	// with a nil pointer, and "set" when Set is true with a
+	// non-nil pointer. Apid has already validated the UUID
+	// against the empty-uuid CHECK + FK with ON DELETE SET
+	// NULL (migration 00167) before reaching this path; the
+	// store is a plain column write. Memstore mirrors the
+	// pgstore shape so every test that exercises UpdateApp
+	// sees the same behaviour regardless of backend.
+	if p.SetOverflowNode {
+		if p.OverflowNode == nil {
+			a.OverflowNode = nil
+		} else {
+			s := *p.OverflowNode
+			a.OverflowNode = &s
+		}
+	}
 	m.apps[id] = a
 	return a, nil
 }
@@ -4282,7 +4300,7 @@ func (m *MemStore) DeleteCron(_ context.Context, id, appID string) error {
 
 // MarkCronFired stamps the cron row's LastFiredAt field. Used by the
 // schedd dispatch loop after a synthetic cron request has been
-// dispatched through gatewayd (spec §4.4, M7).
+// dispatched through gatewayd-internal (spec §4.4, M7).
 func (m *MemStore) MarkCronFired(_ context.Context, id string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -6037,7 +6055,7 @@ func (m *MemStore) LookupNodeKey(_ context.Context, computeNodeID string, keyID 
 // goroutine reanimates a drained node to true on the next successful
 // dial. MemStore flips the flag in place; production also flips but
 // additionally fires the compute_node_changed pg_notify trigger so
-// gatewayd sees the change without polling.
+// gatewayd-internal sees the change without polling.
 func (m *MemStore) SetComputeNodeActive(_ context.Context, id string, active bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

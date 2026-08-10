@@ -369,7 +369,7 @@ func TestAccountRateLimit_TenOhOneReturns429(t *testing.T) {
 // unlimitedLimiterForTest is the per-app noop limiter used by the 1001-request
 // acceptance test so the per-app bucket can't 429 the test before the
 // per-account scope is exercised. Mirrors pkg/gateway/limiters_test.go's
-// unlimitedLimiter but lives here because cmd/gatewayd tests are
+// unlimitedLimiter but lives here because cmd/gatewayd-internal tests are
 // `package main` and can't import test-only helpers from pkg/gateway's
 // _test.go files.
 func unlimitedLimiterForTest() *gateway.Limiter {

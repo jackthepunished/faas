@@ -463,7 +463,7 @@ func newServerWithDeps(
 	// (IP, endpoint) — a fresh limiter per route would let a brute-force
 	// attack hit 10 attempts × N endpoints × 1 min and never trip any
 	// single bucket. The Limiter is per-process; a restart resets it
-	// (acceptable — gatewayd is the primary edge counter).
+	// (acceptable — gatewayd-public is the primary edge counter).
 	apiAuthLimiter := middleware.NewLimiter(middleware.AuthLimitConfig{Log: log})
 	// Dashboard auth surface (/login, /auth/verify) gets its own shared
 	// bucket so the CountEveryAttempt sentinel on /login doesn't bleed
@@ -797,6 +797,18 @@ func (s *server) handler() http.Handler {
 	// powerful as the min_instances PATCH (Σ rebalance affects
 	// sibling live rows in the same app).
 	mux.HandleFunc("PATCH /v1/deployments/{id}/traffic", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateDeploymentTraffic))))
+	// Builds (DEPLOY-PROV-6 / ADR-089, issue #741). Lifecycle
+	// surface — returns status, timestamps, failure_class,
+	// server-computed duration_seconds for a build id. Companion
+	// to the ADR-038 /v1/builds/{id}/provenance (post-mortem
+	// export) and /v1/builds/{id}/sbom (post-mortem blob) routes;
+	// this one is what CI scripts call to fail-fast on build
+	// error without scraping SSE. Same auth (api.ScopesReadSurface)
+	// + same IDOR-safe Build → Deployment → App → AccountID check
+	// as the sibling routes. The status field is the existing
+	// 4-state enum (queued|running|succeeded|failed); see ADR-089
+	// §1 for why 'cancelled' is out of scope.
+	mux.HandleFunc("GET /v1/builds/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuild)))
 	// Builds (ADR-038). The provenance route is the only /v1/builds
 	// surface today; deployments.id remains the parent resource.
 	// Build:read scope (api.ScopesReadSurface) gates the read.
@@ -820,7 +832,7 @@ func (s *server) handler() http.Handler {
 	// (instances.id UUIDv7). Default limit 25, max 100 (strict 400
 	// on bad input via api.ParseLimit). Additive to the per-app
 	// endpoint — dashboards opt in. Per-account rate limit
-	// (ADR-040) fires at the gatewayd edge; this route charges 1
+	// (ADR-040) fires at the gatewayd-internal edge; this route charges 1
 	// token via authLimited just like every other /v1/* call.
 	mux.HandleFunc("GET /v1/instances", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listInstancesForAccount))))
 
@@ -1061,6 +1073,23 @@ func (s *server) handler() http.Handler {
 	// to Stripe with 2FA on their side.
 	mux.HandleFunc("GET /v1/billing/portal", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.getBillingPortal)))
 
+	// Billing retry (issue #242). Closes the customer-trust lie in
+	// pkg/mail/account.go:107,150 (the dunning email promises
+	// `faas billing retry`; this is what it calls). Session-cookie
+	// auth + usage:read scope; the destructive nature of retry is
+	// bounded (a single charge attempt against the saved card).
+	// MFA-gated for parity with changePlan — retry touches money.
+	mux.HandleFunc("POST /v1/billing/retry", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.postBillingRetry))))
+
+	// Billing cancel (issue #242). Sets cancel_at_period_end on
+	// the account's subscription; account keeps running until
+	// period end then downgrades to Free (spec §4.7). Destructive
+	// but session-cookie-only — the CLI front-loads the typed-
+	// confirm gate from PR #782 ("cancel subscription"). Headless
+	// callers can wire their own confirm. MFA-gated for parity
+	// with changePlan.
+	mux.HandleFunc("POST /v1/billing/cancel", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.postBillingCancel))))
+
 	// Credit consumption reducer (issue #279 PR-C). Admin-only +
 	// MFA-gated — operator action that mutates money (spec §11). The
 	// `idempotent` middleware replays a prior 200 on duplicate
@@ -1157,7 +1186,7 @@ func (s *server) handler() http.Handler {
 	// s.oauthConfig (loaded once at boot via (*server).WithOAuthConfig).
 	mux.Handle("GET /v1/auth/capabilities", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.renderAuthCapabilities))))
 
-	// Dashboard surface (M7.5, ADR-011). Lives behind gatewayd's
+	// Dashboard surface (M7.5, ADR-011). Lives behind gatewayd-public's
 	// /dashboard/* reverse-proxy (spec §11 single-public-listener).
 	//
 	// Slice 3 wires the magic-link auth flow:
@@ -1243,7 +1272,7 @@ func (s *server) handler() http.Handler {
 	// are cookie-session-authenticated (NOT API-key auth — the
 	// dashboard renders them, no Bearer token is in scope) and
 	// share the §11 middleware stack via dashboardChain. They live
-	// under /v1/* so cmd/gatewayd/proxy.go:isApidPath already
+	// under /v1/* so cmd/gatewayd-internal/proxy.go:isApidPath already
 	// forwards them; the §11 anti-takeover proof (session.github_login
 	// == install.account.login) is enforced in the handlers.
 	mux.Handle("POST /v1/install/repos/list", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listInstallableRepos))))
@@ -1331,7 +1360,7 @@ func (s *server) handler() http.Handler {
 	}, http.HandlerFunc(cli.renderCliAuthPage)))
 	mux.Handle("POST "+cliAuthPath, s.cliAuthSubmitChain(http.HandlerFunc(cli.postCliAuthPage)))
 
-	// Loopback infra probe (issue #85). gatewayd forwards /healthz to
+	// Loopback infra probe (issue #85). gatewayd-internal forwards /healthz to
 	// apid through the apidProxy chain, so this is what the
 	// deploy/digitalocean CD smoke test and deploy/digitalocean/
 	// bootstrap.sh health check actually hit on the public listener.

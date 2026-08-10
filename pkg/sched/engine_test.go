@@ -1068,7 +1068,7 @@ func TestEngineWake_ColdBootPersistsObservedClass(t *testing.T) {
 
 // TestEngineWake_PropagatesWakeIDToVMM (PR-A, issue #517) asserts the
 // engine lifts wake_id / app_id / deployment_id from its inbound ctx
-// (set by gatewayd via the request middleware) and forwards them on
+// (set by gatewayd-internal via the request middleware) and forwards them on
 // the ctx passed to vmmd's CreateColdBoot. This is the half of the
 // AC1 contract the schedd package owns: correlation fields stamped on
 // the engine's bootCtx must reach the vmmd boundary.
@@ -1078,7 +1078,7 @@ func TestEngineWake_PropagatesWakeIDToVMM(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	// Simulate the inbound ctx gatewayd produces: request_id from
+	// Simulate the inbound ctx gatewayd-internal produces: request_id from
 	// x-faas-request-id, app_id / deployment_id from URL params, and
 	// (eventually, on cold wake) wake_id minted by the gateway path.
 	// PR-A is the envelope + propagation half; the engine here mints
@@ -2657,7 +2657,7 @@ func TestEngineWake_NilVerifierSkipsVerify(t *testing.T) {
 // #322): the verifier returns a non-Problem error (the storage
 // backend refused to read the sig blob, etc.). The engine must
 // (1) NOT surface sig_invalid, (2) wrap the error as a
-// *api.Problem with Retry-After so gatewayd's writeWakeError
+// *api.Problem with Retry-After so gatewayd-internal's writeWakeError
 // flushes the header, and (3) release the ledger slot rather
 // than holding it forever on a transient storage blip.
 func TestEngineWake_RejectsTransientVerifierIO(t *testing.T) {
@@ -2681,11 +2681,11 @@ func TestEngineWake_RejectsTransientVerifierIO(t *testing.T) {
 		t.Errorf("err = %v, must NOT carry code %q (this is the transient-I/O branch, not tamper)",
 			err, api.CodeSigInvalid)
 	}
-	// Must carry Retry-After so gatewayd flushes a 503 with the
+	// Must carry Retry-After so gatewayd-internal flushes a 503 with the
 	// header (writeWakeError falls back to ErrCapacity otherwise).
 	var p *api.Problem
 	if !errors.As(err, &p) {
-		t.Fatalf("err = %v, want *api.Problem so gatewayd can write Retry-After", err)
+		t.Fatalf("err = %v, want *api.Problem so gatewayd-internal can write Retry-After", err)
 	}
 	// Verify the engine tagged the underlying storage error in
 	// the Detail so log greps still find it (the customer-facing
@@ -2703,7 +2703,7 @@ func TestEngineWake_RejectsTransientVerifierIO(t *testing.T) {
 			got)
 	}
 	// Verify the Retry-After header is on the Problem (the
-	// engine-side pin; gatewayd's writeWakeError surfaces it on
+	// engine-side pin; gatewayd-internal's writeWakeError surfaces it on
 	// the wire via api.WriteProblem).
 	if got := p.HasHeader("Retry-After"); len(got) != 1 || got[0] != "5" {
 		t.Errorf("HasHeader(Retry-After) = %v, want [\"5\"]", got)

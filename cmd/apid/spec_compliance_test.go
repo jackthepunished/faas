@@ -343,7 +343,7 @@ func testRoutesParity(t *testing.T, root string, spec *specDoc) {
 	t.Helper()
 
 	// `serverSrcPath` is the canonical apid route table. After
-	// issue #254 / Move 4 PR-2 (gatewayd AppLogsHandler) the
+	// issue #254 / Move 4 PR-2 (gatewayd-internal AppLogsHandler) the
 	// `GET /v1/apps/{slug}/logs` route is owned by cmd/gatewayd-internal
 	// (ADR-043 + ADR-068 / Tier A7 split: gatewayd-internal is the
 	// routing + wake + proxy daemon and imports pkg/scheddgrpc). The

@@ -1,7 +1,7 @@
 // gRPC dial/listen helpers for the control-plane <-> compute-plane boundary.
 //
 // ADR-025 ("Decoupled Control Plane and Compute Nodes", docs/adr/025)
-// commits the platform to allowing the control plane (apid/gatewayd/schedd/
+// commits the platform to allowing the control plane (apid/gatewayd-internal/schedd/
 // meterd/githubd) to run on hosts where /dev/kvm isn't available — only
 // vmmd/builderd need KVM. This file is the location-transparent gRPC
 // seam that issue #95 lands as its first slice: strict target parsing,

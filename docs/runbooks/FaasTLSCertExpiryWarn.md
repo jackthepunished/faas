@@ -1,7 +1,7 @@
 # FaasTLSCertExpiryWarn
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`.
-Metric: `gateway_tls_cert_expiry_seconds` (gatewayd `/metrics`).
+Metric: `gateway_tls_cert_expiry_seconds` (gatewayd-public `/metrics`).
 Spec: §12 + ADR-024 H3 (closed in PR #345).
 Severity: warn.
 
@@ -13,6 +13,11 @@ Severity: warn.
 > `gatewayd-public`; the legacy daemon keeps them during the
 > migration window. PR-C sweeps the certmagic packages and
 > this runbook will be archived alongside them.
+>
+> The certmagic surface lives on `gatewayd-public` post-ADR-070;
+> the legacy `gatewayd.toml` config file is retained as the
+> historical reference, with the current config at
+> `/etc/faas/gatewayd-public.toml`.
 
 ## Symptom
 
@@ -27,7 +32,7 @@ new wildcard).
 
 ```bash
 curl -fsS http://127.0.0.1:9090/metrics | grep gateway_tls_cert_expiry_seconds
-journalctl -u faas-gatewayd --since '-7d' --no-pager | grep -iE 'renew|certmagic'
+journalctl -u faas-gatewayd-public --since '-7d' --no-pager | grep -iE 'renew|certmagic'
 # What's certmagic's view of the cert? The simplest check is the
 # on-disk NotAfter (the gauge's source of truth).
 for c in /var/lib/faas/certs/certificates/*/*/; do
@@ -47,14 +52,14 @@ Common causes:
 - **Hetzner token read-only**: the token has zone-write but the
   DNS-01 challenge TXTs are getting SERVFAIL because the Hetzner
   authoritative servers are slow. Look for `acme: error presenting
-  challenge` in the gatewayd log.
+  challenge` in the gatewayd-public log.
 
 ```bash
 # Cross-check: did the wildcard cert get re-minted in the last 24h?
 find /var/lib/faas/certs/certificates -name '*.crt' -mtime -1 -ls
 
 # Cross-check: is certmagic's renewal loop alive?
-journalctl -u faas-gatewayd --since '-1h' --no-pager | grep -c 'renew'
+journalctl -u faas-gatewayd-public --since '-1h' --no-pager | grep -c 'renew'
 ```
 
 ## Silence

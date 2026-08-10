@@ -1,7 +1,7 @@
 # FaasApiAvailabilityLow
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`.
-Metric: `gateway_requests_total{code=~"2.."}` vs total (gatewayd `/metrics`).
+Metric: `gateway_requests_total{code=~"2.."}` vs total (gatewayd-internal `/metrics`).
 Spec: §12 (API availability 99.5% monthly).
 Severity: page.
 
@@ -25,11 +25,11 @@ curl -fsS https://apps.gregale.dev/status/slo.json | jq .
 ## Check
 
 ```bash
-journalctl -u gatewayd --since '-15m' --no-pager | grep -iE '5xx|panic|overt'
+journalctl -u faas-gatewayd-public faas-gatewayd-internal --since '-15m' --no-pager | grep -iE '5xx|panic|overt'
 curl -fsS http://127.0.0.1:9090/api/v1/query?query='gateway_requests_total{code!~"2.."}' | head -100
 ```
 
-A spike in `503` from gatewayd is the canonical sign of wake-queue
+A spike in `503` from gatewayd-internal is the canonical sign of wake-queue
 saturation (cap 512/30s per the CLAUDE.md gotcha). A spike in `502`
 is upstream — apid, schedd, or vmmd refused the request.
 

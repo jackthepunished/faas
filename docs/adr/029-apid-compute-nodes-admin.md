@@ -1,6 +1,13 @@
 # ADR-029 · apid Compute-Nodes Admin Surface
 
 - **Status:** accepted v1.1 (2026-07-31). The CRUD surface is live; v1.1 adds the §6.4 audit-trail cross-reference — admin actions remain un-emitted into `events` (deferred to a v1.2 follow-up; see Consequences). The §6.4 failure-mode catalogue (spec §6.4) lists the per-error-mode contract for the admin surface (default-local hard-delete protection, typo'd `target_url`, admin-allowlist rotation, the 47600 MB literal backfill anti-goal).
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-22 (proposed); 2026-07-31 (accepted v1.1)
 - **Issue:** #98
 - **Decision:** Add operator-facing CRUD on `compute_nodes` to apid:

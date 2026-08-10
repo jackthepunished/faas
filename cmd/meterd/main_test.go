@@ -167,6 +167,15 @@ func (nopProvider) Refund(context.Context, string, int64) (*billing.RefundResult
 func (nopProvider) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
 	return 0, billing.ErrNotImplemented
 }
+func (nopProvider) RetryLatestCharge(context.Context, state.Account) (string, string, error) {
+	return "", "", nil
+}
+func (nopProvider) CancelAtPeriodEnd(context.Context, state.Account) (time.Time, error) {
+	return time.Time{}, nil
+}
+func (nopProvider) PaymentMethodSummary(context.Context, state.Account) (billing.PaymentMethod, error) {
+	return billing.PaymentMethod{}, nil
+}
 func (nopProvider) Capabilities() billing.CapabilitySet { return 0 }
 
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
@@ -542,6 +551,19 @@ func (r *meterRec) Refund(context.Context, string, int64) (*billing.RefundResult
 // (0, nil) — no drift signal.
 func (r *meterRec) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
 	return 0, nil
+}
+
+// RetryLatestCharge / CancelAtPeriodEnd / PaymentMethodSummary
+// (issue #242): meterd never drives these apid-only surfaces. Zero-
+// value stubs satisfy the interface.
+func (r *meterRec) RetryLatestCharge(context.Context, state.Account) (string, string, error) {
+	return "", "", nil
+}
+func (r *meterRec) CancelAtPeriodEnd(context.Context, state.Account) (time.Time, error) {
+	return time.Time{}, nil
+}
+func (r *meterRec) PaymentMethodSummary(context.Context, state.Account) (billing.PaymentMethod, error) {
+	return billing.PaymentMethod{}, nil
 }
 
 func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, int64) error {

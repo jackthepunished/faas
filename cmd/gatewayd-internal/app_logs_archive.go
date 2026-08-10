@@ -6,7 +6,7 @@
 //
 //   - ?archive=1 (PR-B, this file)  → serve historical lines from
 //     s3://{bucket}/faas-logs/{instance}/{YYYY}/{MM}/{DD}.jsonl.gz.
-//     Customer picks the (instance, day) tuple; gatewayd fetches
+//     Customer picks the (instance, day) tuple; gatewayd-internal fetches
 //     the gzipped object, decompresses, and emits the same
 //     `event: log` SSE envelope the live stream emits so the SDK
 //     decoder (pkg/api/sse.go) treats the two paths interchangeably.

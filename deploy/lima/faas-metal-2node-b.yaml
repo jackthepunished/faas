@@ -90,13 +90,13 @@ provision:
         build-essential e2fsprogs iproute2 iptables nftables git curl ca-certificates \
         busybox-static jq postgresql
 
-      for u in faas faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+      for u in faas faas-apid faas-schedd faas-vmmd faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-builderd faas-meterd faas-githubd; do
         if ! id -u "$u" >/dev/null 2>&1; then
           useradd -r -M -s /usr/sbin/nologin "$u"
         fi
       done
       groupadd -f faas || true
-      for u in faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+      for u in faas-apid faas-schedd faas-vmmd faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-builderd faas-meterd faas-githubd; do
         usermod -aG faas "$u" 2>/dev/null || true
       done
       install -d -m 0755 -o root -g root /etc/faas

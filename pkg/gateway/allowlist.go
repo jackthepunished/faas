@@ -5,7 +5,7 @@
 // Why this lives in pkg/gateway (not pkg/state): the allowlist is part of the
 // edge's TLS seam. pkg/state holds the rows; pkg/gateway decides what to do
 // with them. The query is identical to the one pgRouter.ResolveHost uses for
-// routing (cmd/gatewayd/backend.go), so we cannot serve one hostname from
+// routing (cmd/gatewayd-internal/backend.go), so we cannot serve one hostname from
 // routing and a different one from the allowlist — they share the Store.
 //
 // Caching: none today. The custom_domains table is small (one per customer
@@ -43,10 +43,10 @@ type verified interface {
 // ErrNotFound is the sentinel NewPGAllowlist recognizes as "this hostname is
 // not in the custom_domains table" so it can return false without logging at
 // Warn level (the steady-state denial path; logging here would flood the
-// gatewayd log on every scan of an unowned hostname). Callers MUST surface
+// gatewayd-internal log on every scan of an unowned hostname). Callers MUST surface
 // this sentinel from their lookup closure when the row is missing — wrapping
 // state.ErrNotFound (or any other concrete store sentinel) is the production
-// path in cmd/gatewayd.
+// path in cmd/gatewayd-internal/
 var ErrNotFound = errors.New("gateway: domain not found in allowlist")
 
 // NewPGAllowlist returns an OnDemandAllowlist backed by store. The store must

@@ -1,4 +1,4 @@
-// CertMagic wiring tests for gatewayd (spec §4.1, §11). These tests pin the
+// CertMagic wiring tests for gatewayd-internal (spec §4.1, §11). These tests pin the
 // DNS-01 / on-demand HTTP-01 wiring against a stubbed Hetzner DNS API so a
 // production build of pkg/gateway/tls_wire.go is exercised end-to-end
 // without hitting the live service. The cert-mint abuse-vector test
@@ -71,7 +71,7 @@ func TestNewCertMagicConfig_BuildsBundle(t *testing.T) {
 		t.Error("bundle.Config is nil")
 	}
 	if bundle.GetCertificate == nil {
-		t.Error("bundle.GetCertificate is nil (cmd/gatewayd/main.go needs this on tls.Config)")
+		t.Error("bundle.GetCertificate is nil (cmd/gatewayd-public/main.go needs this on tls.Config)")
 	}
 	if bundle.HTTPChallengeHandler == nil {
 		t.Error("bundle.HTTPChallengeHandler is nil (needed for :80 ACME mux)")

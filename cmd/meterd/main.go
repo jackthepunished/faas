@@ -222,7 +222,7 @@ func (a *scheddEgressAdapter) EgressBytes(instanceID string) (uint64, uint64, bo
 
 // gatewayEgressAdapter (ADR-046, step 8; PR-2 = stream consumer)
 // is the meterd-side source for usage_minutes.tx_bytes
-// (gateway HTTP response bytes). Production wires the gatewayd
+// (gateway HTTP response bytes). Production wires the gatewayd-internal
 // gRPC stream
 // (onebox.faas.egress.v1.EgressTxService.StreamBytes on
 // FAAS_GATEWAY_EGRESS_SOCKET) into a background goroutine that
@@ -256,7 +256,7 @@ func (a *scheddEgressAdapter) EgressBytes(instanceID string) (uint64, uint64, bo
 // Reconnect:
 //
 //	The stream goroutine reconnects with backoff on disconnect
-//	(gatewayd restart, transient sock churn). Worst-case
+//	(gatewayd-internal restart, transient sock churn). Worst-case
 //	behaviour during the gap is ok=false on every EgressBytes
 //	read → AppendUsage writes 0 to tx_bytes for that minute,
 //	which surfaces as a one-minute gap in the FaasTxBytesStall
@@ -268,7 +268,7 @@ type gatewayEgressAdapter struct {
 	now func() time.Time
 
 	// tlsCfg is the mTLS config the dialFn uses when the
-	// gatewayd egress listener lives on a remote compute node
+	// gatewayd-internal egress listener lives on a remote compute node
 	// (ADR-052). Nil on the single-box default-local path —
 	// the unix socket dial skips the TLS handshake by design
 	// (ADR-015: group-`faas` DAC is the auth posture).
@@ -282,7 +282,7 @@ type gatewayEgressAdapter struct {
 	// hand-rolled stream client; production wires the
 	// egresspb-grpc DailContext. tlsCfg is nil on the
 	// single-box default-local path; mTLS-wrapped remote
-	// gatewayd deployments pass the loaded *tls.Config here
+	// gatewayd-internal deployments pass the loaded *tls.Config here
 	// (ADR-052).
 	dialFn func(ctx context.Context, socketPath string, tlsCfg *tls.Config) (egresspb.EgressTxServiceClient, error)
 }
@@ -391,7 +391,7 @@ func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client egressp
 
 // recordFrame folds one BytesFrame into the snapshot. Called
 // exclusively from consumeStream under the assumption that the
-// producer (gatewayd) sends strictly minute-aligned timestamps
+// producer (gatewayd-internal) sends strictly minute-aligned timestamps
 // (it does — pkg/gateway/egresssink truncates on intake). A
 // non-truncated minute from a future gateway-side change would
 // be treated as its own bucket (different minuteUnix) and
@@ -423,7 +423,7 @@ func (a *gatewayEgressAdapter) Tracked() int {
 	return len(a.data)
 }
 
-// dialGatewayEgressStream dials the gatewayd egress listener and
+// dialGatewayEgressStream dials the gatewayd-internal egress listener and
 // returns a stub EgressTxServiceClient. Single-box deployments
 // pass a unix socket path + nil tlsCfg; the unix-socket DAC auth
 // (ADR-015, group `faas`, mode 0660) is the only authentication
@@ -440,7 +440,7 @@ func (a *gatewayEgressAdapter) Tracked() int {
 func dialGatewayEgressStream(ctx context.Context, target string, tlsCfg *tls.Config) (egresspb.EgressTxServiceClient, error) {
 	conn, err := wire.DialContext(ctx, target, tlsCfg)
 	if err != nil {
-		return nil, fmt.Errorf("meterd: dial gatewayd egress %s: %w", target, err)
+		return nil, fmt.Errorf("meterd: dial gatewayd-internal egress %s: %w", target, err)
 	}
 	return egresspb.NewEgressTxServiceClient(conn), nil
 }
@@ -759,7 +759,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// The five timers run in goroutines; the cancel-watcher below picks
 	// up the first error and returns. meterd has no inbound gRPC — the
-	// public listener is gatewayd's (spec §Component ownership).
+	// public listener is gatewayd-public's (spec §Component ownership).
 	//
 	// Issue #279 / PR-B: the cpu adapter lets the sampler read the
 	// per-instance CPU-µs snapshot the schedd's instancestats.Poller

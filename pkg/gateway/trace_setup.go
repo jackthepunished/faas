@@ -71,7 +71,7 @@ type TraceSetup struct {
 	// interceptors (PR-3).
 	TracerProvider *sdktrace.TracerProvider
 	// DeploymentCounter is the per-deployment 100% sampling
-	// window counter the gatewayd-side sampler consults (issue
+	// window counter the gatewayd-internal-side sampler consults (issue
 	// #555 / ADR-055). schedd's pkg/sched/deployment_counter_watcher
 	// watches the in-process Platform wake topic and calls
 	// counter.Reset(deploymentID) on the "last live instance

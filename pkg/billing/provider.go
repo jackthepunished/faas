@@ -156,6 +156,72 @@ type Provider interface {
 	// through VerifyWebhook → EventRefundProcessed, NOT through this
 	// method.
 	Refund(ctx context.Context, chargeID string, amountCents int64) (*RefundResult, error)
+
+	// RetryLatestCharge materializes a new charge attempt against
+	// the account's saved card (issue #242; closes the lie at
+	// pkg/mail/account.go:107,150 that promises `faas billing retry`
+	// which didn't exist). Returns the new attempt's id + the
+	// provider's reference id; the apid handler echoes them in
+	// BillingRetryResponse.
+	//
+	//   - Stripe: walks the customer's open invoices in reverse
+	//     chronological order and calls Invoices.Pay on the latest
+	//     one. Idempotency-Key is derived from
+	//     `acct.ID + "/retry/" + invoice.ID` so a flaky-network
+	//     redelivery collapses to one Stripe-side attempt.
+	//   - Paddle: posts a fresh CreateTransaction against the
+	//     existing customer (ctm_…) for the same plan's monthly
+	//     price plus month-to-date overage. Idempotency-Key is
+	//     pinned via paddle.ContextWithTransitID; CustomData
+	//     stamps kind=billing_retry so the merchant dashboard
+	//     distinguishes it from a fresh upgrade.
+	//
+	// Sentinel errors:
+	//   - ErrNoOpenCharge — no open invoice / transaction to retry
+	//     (account in good standing; apid maps to 404).
+	//   - ErrNoAPIKey — provider SDK not constructed (operator
+	//     mis-config; apid maps to 502 + clear hint).
+	RetryLatestCharge(ctx context.Context, acct state.Account) (attemptID, providerRefID string, err error)
+
+	// CancelAtPeriodEnd sets cancel_at_period_end on the account's
+	// subscription (issue #242). Account keeps running until period
+	// end, then downgrades to Free (spec §4.7).
+	//
+	//   - Stripe: Subscriptions.Update(cancel_at_period_end=true).
+	//     The flag lives on Stripe-side; no local mirror. Returns
+	//     sub.CurrentPeriodEnd as the effective timestamp.
+	//   - Paddle: Paddle has no separate "scheduled cancellation"
+	//     primitive; the cancel intent lives on the Paddle
+	//     Customer object's scheduled_change field. apid's Paddle
+	//     impl stamps that field via Customer.Update. Returns
+	//     the next month-rollover instant as the effective
+	//     timestamp.
+	//
+	// Sentinel errors:
+	//   - ErrAlreadyCancelled — no active subscription (Free / post-
+	//     cancel / never-checked-out); apid maps to 409 + clear
+	//     hint. Stripe returns this on no-subscription; Stripe's
+	//     re-cancel of an already-cancelled sub is idempotent and
+	//     returns 200 (so we don't return this on re-cancel).
+	CancelAtPeriodEnd(ctx context.Context, acct state.Account) (effectiveAt time.Time, err error)
+
+	// PaymentMethodSummary returns the card-on-file summary for the
+	// account (issue #242). The zero PaymentMethod is the "no card
+	// on file" sentinel — apid's handler omits the wire-DTO field
+	// in that case so the response stays clean.
+	//
+	//   - Stripe: PaymentMethods.List against the customer's
+	//     customer ID, reduced to (brand, last4, exp_month,
+	//     exp_year).
+	//   - Paddle: Customer.Get parses the customer's stored
+	//     PaymentMethod block. Paddle exposes the card-on-file on
+	//     the Customer object itself.
+	//
+	// Implementations MUST NOT fail when the customer has no card
+	// on file — they return the zero PaymentMethod, not an error.
+	// The only error path is the provider-SDK failure case
+	// (ErrNoAPIKey on Stripe when no SDK is constructed).
+	PaymentMethodSummary(ctx context.Context, acct state.Account) (PaymentMethod, error)
 }
 
 // EventType is the provider-neutral "what happened" classifier apid
@@ -244,7 +310,7 @@ type Event struct {
 	// forwards the event (pre-#294 behaviour).
 	//
 	// GitHub webhooks carry the same UUID via the X-GitHub-Delivery
-	// header, which gatewayd consults directly without round-tripping
+	// header, which gatewayd-internal consults directly without round-tripping
 	// through this struct.
 	EventID string
 
@@ -319,6 +385,50 @@ var ErrBadSignature = errors.New("billing: bad webhook signature")
 // docs_url pointing at the spec — the operator picks a backend that
 // supports the surface they need.
 var ErrNotImplemented = errors.New("billing: provider does not implement this method")
+
+// ErrNoAPIKey is the sentinel the Stripe Client's requireAPI() helper
+// returns when its SDK *client.API is nil — the operator set
+// FAAS_STRIPE_API_KEY to empty (or set only the legacy webhook secret).
+// apid's billing routes map this to a 502 Problem with a clear
+// "operator mis-configuration" hint; the CLI's `faas billing status`
+// prints it so operators can self-diagnose without paging support.
+// Distinct from ErrNotImplemented (which means the provider
+// intentionally lacks a surface) and from ErrBadSignature (which is
+// webhook-only). Stripe-side only today; Paddle has no equivalent
+// (its config loads a sandbox key or refuses to construct the Client).
+var ErrNoAPIKey = errors.New("billing: provider API key not configured")
+
+// ErrNoOpenCharge is returned by Provider.RetryLatestCharge when the
+// account has no open invoice / transaction to retry. apid's retry
+// handler maps this to 404 + a Problem whose detail explains the
+// customer is already in good standing (the dunning email is
+// stale). Distinct from a provider-side failure (502).
+var ErrNoOpenCharge = errors.New("billing: no open charge to retry")
+
+// ErrAlreadyCancelled is returned by Provider.CancelAtPeriodEnd when
+// the account has no active subscription (Free plan, post-cancel, or
+// never-checked-out). apid's cancel handler maps this to 409 +
+// `code: already_cancelled` so the CLI can render a friendly "your
+// subscription is already cancelled" hint instead of crashing. Stripe:
+// returned only when the account has no StripeSubscriptionItem
+// (Stripe's re-cancel of an already-cancelled sub is idempotent and
+// returns 200). Paddle: returned when the customer has no scheduled
+// recurring transaction; the SDK call itself distinguishes the
+// "cancelled" vs "never subscribed" cases from the response shape.
+var ErrAlreadyCancelled = errors.New("billing: subscription already cancelled or not active")
+
+// PaymentMethod is the provider-agnostic card-on-file summary
+// (issue #242). Lives in pkg/billing (NOT pkg/api) to avoid the
+// `pkg/api ↔ pkg/state` cycle flagged in memory
+// pkg-api-cannot-import-pkg-state.md — the apid handler converts to
+// the wire DTO (api.PaymentMethodSummary) at the handler boundary.
+// The zero value is the "no card on file" sentinel.
+type PaymentMethod struct {
+	Brand    string // lowercase network label: "visa", "mastercard", "amex"
+	Last4    string // last 4 digits of the PAN — never the full PAN
+	ExpMonth int    // 1-12
+	ExpYear  int    // 4-digit year
+}
 
 // Classifier is the optional seam a Provider can implement to declare
 // its push-error classification. meterd's pusher loop dispatches via

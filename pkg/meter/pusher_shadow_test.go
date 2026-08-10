@@ -115,6 +115,19 @@ func (r *recordingStripe) ReconcileUsage(_ context.Context, _ state.Account, _, 
 	return 0, nil
 }
 
+// RetryLatestCharge / CancelAtPeriodEnd / PaymentMethodSummary (issue #242):
+// meterd never drives these surfaces (only apid does). Zero-value
+// stubs are enough to satisfy the interface contract.
+func (r *recordingStripe) RetryLatestCharge(_ context.Context, _ state.Account) (string, string, error) {
+	return "", "", nil
+}
+func (r *recordingStripe) CancelAtPeriodEnd(_ context.Context, _ state.Account) (time.Time, error) {
+	return time.Time{}, nil
+}
+func (r *recordingStripe) PaymentMethodSummary(_ context.Context, _ state.Account) (billing.PaymentMethod, error) {
+	return billing.PaymentMethod{}, nil
+}
+
 func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

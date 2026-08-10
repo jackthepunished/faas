@@ -7,6 +7,14 @@ concern); ADR-039 (traffic anomaly detection, shares the
 `__other__` account-id overflow sentinel but reads from apid not
 gatewayd).
 
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
+
 ## Context
 
 The existing per-app gateway rate limit

@@ -4,6 +4,14 @@ Status: Accepted, 2026-07-25. Owner: @poyrazK. Closes: #169, #172.
 Related: #170 (PR #205, in flight, CPU signal source), #171 (preferential
 reaper, separate PR).
 
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
+
 ## Context
 
 The platform's autoscaling today is "warm pool + idle reaper": an instance

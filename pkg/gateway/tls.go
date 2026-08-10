@@ -1,16 +1,16 @@
-// TLS seam for gatewayd (spec §4.1, §11). The public listener terminates TLS
+// TLS seam for gatewayd-internal (spec §4.1, §11). The public listener terminates TLS
 // via CertMagic with:
 //
 //   - wildcard *.apps.gregale.dev via DNS-01 (Hetzner DNS API token from
 //     /etc/faas/secrets/hetzner-dns.token, sealed at rest per §11/G2)
 //   - on-demand HTTP-01 for customer custom_domains, gated by a Postgres
 //     lookup against the custom_domains allowlist so an attacker can't
-//     trick gatewayd into minting a cert for an unrelated hostname
+//     trick gatewayd-internal into minting a cert for an unrelated hostname
 //   - storage at /var/lib/faas/certs (root:root 0700)
 //
 // pkg/gateway/tls_wire.go wires the certmagic.Manager; pkg/gateway/dns01_hetzner.go
 // implements the DNS-01 solver; pkg/gateway/allowlist.go implements the
-// on-demand allowlist; pkg/gateway/acme.go builds the :80 listener mux. cmd/gatewayd
+// on-demand allowlist; pkg/gateway/acme.go builds the :80 listener mux. cmdgatewayd-internal
 // reads TLSConfig from TOML and decides whether to bind the TLS listeners or fall
 // back to plain :8080 (gated on TLSConfig.Disabled).
 package gateway
@@ -32,7 +32,7 @@ import (
 // to the decision func — there is no appID context at issuance time.
 type OnDemandAllowlist func(host string) bool
 
-// TLSConfig is the configuration bucket cmd/gatewayd reads from TOML. Empty
+// TLSConfig is the configuration bucket cmd/gatewayd-internal/reads from TOML. Empty
 // fields mean "TLS is off; serve plain HTTP" — the legacy dev/e2e path.
 //
 // Production:
@@ -55,7 +55,7 @@ type TLSConfig struct {
 
 	// HetznerDNSAPITokenPath is the path to the DNS-01 solver token.
 	// Must be readable by root only; the daemon reads it on startup via
-	// loadHetznerDNSToken (cmd/gatewayd/secrets.go), which enforces a 0400
+	// loadHetznerDNSToken (cmd/gatewayd-public/secrets.go), which enforces a 0400
 	// perm check mirroring pkg/secretbox.LoadRecipient.
 	HetznerDNSAPITokenPath string
 
@@ -96,7 +96,7 @@ var ErrTLSMisconfigured = errors.New("gateway: TLS config partial — set Disabl
 // reach :80 could mint certs for arbitrary hostnames.
 var ErrTLSAllowlistMissing = errors.New("gateway: TLS enabled without OnDemandHTTP01Allowlist — refusing to start (spec §11)")
 
-// Validate sanity-checks a TLSConfig. cmd/gatewayd calls this before
+// Validate sanity-checks a TLSConfig. cmd/gatewayd-internal/calls this before
 // attempting to bind :443.
 //
 // Check order matters: we report the more specific error first so an

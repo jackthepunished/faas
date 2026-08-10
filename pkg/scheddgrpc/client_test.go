@@ -22,7 +22,7 @@ import (
 )
 
 // newClient stands up an in-process schedd server backed by eng and returns a
-// scheddgrpc.Client dialed to it (the same wrapper gatewayd uses).
+// scheddgrpc.Client dialed to it (the same wrapper gatewayd-internal uses).
 func newClient(t *testing.T, eng scheddgrpc.SchedAPI) *scheddgrpc.Client {
 	t.Helper()
 	srv := grpc.NewServer()
@@ -93,7 +93,7 @@ func TestClientWake_CapacityLiftsToProblem(t *testing.T) {
 
 // TestClientWake_PropagatesPort pins issue #460 / ADR-053 (PR-C): the
 // per-deployment override port the engine computed must surface in
-// Client.Wake's return tuple so gatewayd callers can stamp it onto
+// Client.Wake's return tuple so gatewayd-internal callers can stamp it onto
 // ForwardHTTPRequestInit. The fake stub here mirrors the engine
 // contract: WakeResult.Port populated → Client.Wake's 5-tuple last
 // value matches.

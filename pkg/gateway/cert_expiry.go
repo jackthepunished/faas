@@ -326,7 +326,7 @@ func walkCerts(ctx context.Context, certsRoot, wildcardIssuerKey string, log *sl
 			// directory but a corrupted fs entry could still produce
 			// an attacker-influenced string. Sanitize so a CR/LF in
 			// the path can't break the one-line-per-event log
-			// invariant. Precedent: cmd/gatewayd/proxy.go:322
+			// invariant. Precedent: cmd/gatewayd-public/proxy.go:322
 			// (logsanitize.Field on r.URL.Path), metrics.go:751
 			// (logsanitize.Field on request_id).
 			//

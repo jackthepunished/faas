@@ -13,7 +13,7 @@
 // Redirect" that preserves the original method. Spec §4.1 says "redirect to
 // HTTPS"; 308 is the right status for that.
 //
-// Mount with http.Server.Addr = ":80" in cmd/gatewayd/main.go when TLS is
+// Mount with http.Server.Addr = ":80" in cmd/gatewayd-public/main.go when TLS is
 // enabled. When Disabled, :80 is unbound and the mux is never constructed.
 package gateway
 

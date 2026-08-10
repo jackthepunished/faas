@@ -1,6 +1,6 @@
-// Issue #98 / ADR-028: gatewayd's HTTP→gRPC forwarder.
+// Issue #98 / ADR-028: gatewayd-internal's HTTP→gRPC forwarder.
 //
-// Gatewayd's hot path looks up the compute_node.id an instance lives on
+// gatewayd-internal's hot path looks up the compute_node.id an instance lives on
 // (cached in PGBackend.targets after Wake) and forwards the inbound HTTP
 // request to vmmd's ForwardHTTP RPC. vmmd then nsenter's the per-instance
 // netns and dials netns.GuestIP:netns.AppPort on the inner side (see
@@ -48,7 +48,7 @@ import (
 // NodeClientLookup resolves a compute_node.id to a cached
 // *grpc.ClientConn dialed to that node's vmmd gRPC server. Implementations
 // must be safe for concurrent use. The gateway owns the cache
-// (cmd/gatewayd/nodecache.go); tests pass a fake.
+// (cmd/gatewayd-internal/nodecache.go); tests pass a fake.
 type NodeClientLookup interface {
 	// ClientFor returns a *grpc.ClientConn for the named compute node
 	// and a close function the caller MUST call when done with it.
@@ -91,7 +91,7 @@ func stripHopByHop(h http.Header) http.Header {
 // post-#98 / ADR-028 replacement for defaultProxy: defaultProxy
 // assumed `addr = host_ip:8080` and dialed the inner side directly;
 // the inner side is reachable only from inside the vmmd host's netns
-// (10.100.x.y/16 is bound on veth_peer per ADR-009) so gatewayd can't
+// (10.100.x.y/16 is bound on veth_peer per ADR-009) so gatewayd-internal can't
 // reach it from a remote box. This handler instead asks vmmd to
 // bridge the bytes via the bidi ForwardHTTPStream RPC.
 //
@@ -849,14 +849,14 @@ func (c *NodeClientCache) ClientFor(ctx context.Context, nodeID string) (vmmdpb.
 // map. Returning the empty string means "unknown node" and yields
 // ok=false from ClientFor.
 var resolveNodeTarget = func(ctx context.Context, nodeID string) (string, bool) {
-	// Production resolver installed by cmd/gatewayd at startup.
+	// Production resolver installed by cmd/gatewayd-internal/at startup.
 	return "", false
 }
 
 // SetNodeResolver replaces the package-level resolver. Production
 // calls this once during wiring; tests inject a fake. Splitting the
 // resolver out (rather than passing it through NodeClientCache's
-// constructor) lets the same cache type serve cmd/gatewayd's wiring
+// constructor) lets the same cache type serve cmd/gatewayd-internal's wiring
 // without dragging state.Store into the gateway package — pkg/gateway
 // stays pkg/api-only by design (CLAUDE.md ownership).
 func SetNodeResolver(fn func(ctx context.Context, nodeID string) (string, bool)) {
@@ -886,7 +886,7 @@ func (c *NodeClientCache) Evict(nodeID string) {
 	}
 }
 
-// Close shuts down every cached conn. Called by cmd/gatewayd on
+// Close shuts down every cached conn. Called by cmd/gatewayd-internal/on
 // SIGHUP / SIGTERM. In-flight requests see a closed conn (gRPC
 // surfaces Unavailable); the listener stops accepting new ones.
 func (c *NodeClientCache) Close() error {

@@ -98,7 +98,7 @@ def sync_detailed(
 
     Rate-limit tiering: one call now replaces N per-app calls,
     so per-page-load token spend drops from N to 1. The
-    per-account bucket (ADR-040) still applies at the gatewayd
+    per-account bucket (ADR-040) still applies at the gatewayd-internal
     edge; this route charges 1 token via the apid authLimited
     middleware, same as every other `/v1/*` route.
 
@@ -147,7 +147,7 @@ def sync(
 
     Rate-limit tiering: one call now replaces N per-app calls,
     so per-page-load token spend drops from N to 1. The
-    per-account bucket (ADR-040) still applies at the gatewayd
+    per-account bucket (ADR-040) still applies at the gatewayd-internal
     edge; this route charges 1 token via the apid authLimited
     middleware, same as every other `/v1/*` route.
 
@@ -191,7 +191,7 @@ async def asyncio_detailed(
 
     Rate-limit tiering: one call now replaces N per-app calls,
     so per-page-load token spend drops from N to 1. The
-    per-account bucket (ADR-040) still applies at the gatewayd
+    per-account bucket (ADR-040) still applies at the gatewayd-internal
     edge; this route charges 1 token via the apid authLimited
     middleware, same as every other `/v1/*` route.
 
@@ -238,7 +238,7 @@ async def asyncio(
 
     Rate-limit tiering: one call now replaces N per-app calls,
     so per-page-load token spend drops from N to 1. The
-    per-account bucket (ADR-040) still applies at the gatewayd
+    per-account bucket (ADR-040) still applies at the gatewayd-internal
     edge; this route charges 1 token via the apid authLimited
     middleware, same as every other `/v1/*` route.
 

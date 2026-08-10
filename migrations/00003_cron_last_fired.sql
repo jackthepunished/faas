@@ -2,7 +2,7 @@
 -- +goose StatementBegin
 
 -- M7: cron firing (spec §4.4). schedd's dispatch loop stamps this column
--- after a synthetic request has been routed through gatewayd so the
+-- after a synthetic request has been routed through gatewayd-internal so the
 -- metering + rate-limit pipeline applies to cron-triggered traffic
 -- identically to user traffic. The column is nullable so existing cron
 -- rows pre-deploy stay valid; the zero value means "never fired".

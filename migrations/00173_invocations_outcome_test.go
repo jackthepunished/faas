@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00169 (issue #791, cron run history).
+// Migration-apply test for 00173 (issue #791, cron run history).
 //
 // Asserts the new outcome column is present, the CHECK accepts every
 // value the Go layer can produce (success/failed/timeout/dead_letter
@@ -24,7 +24,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00169_Outcome_LandsColumnAndIndex(t *testing.T) {
+func TestMigrations_00173_Outcome_LandsColumnAndIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {

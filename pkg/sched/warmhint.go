@@ -6,7 +6,7 @@
 // to bias a wake toward the node that last warmed the same app.
 // This file is the push half: every RecordWake that actually
 // changed the cache entry fans out a WarmHintEvent to every
-// subscribed gRPC stream consumer (today: every gatewayd).
+// subscribed gRPC stream consumer (today: every gatewayd-internal).
 //
 // The broadcaster is intentionally narrow. It does not own a
 // snapshot of WarmAffinity — only "what changed since the last
@@ -16,7 +16,7 @@
 // rather than next to the cache it observes.
 //
 // Cold-boot path (ADR-005) is preserved by construction: a
-// gatewayd that reconnects sees no events for the warm entries it
+// gatewayd-internal that reconnects sees no events for the warm entries it
 // missed during the disconnect. An empty hint on the gateway side
 // degrades to least-loaded, identical to a fresh install. ADR-009
 // (snapshot reuse) is preserved because the hint is bias-only on
@@ -25,7 +25,7 @@
 //
 // Backpressure: emit is non-blocking. A subscriber whose channel
 // is full drops the event and bumps a counter exposed via
-// slog.Debug. The producer never blocks on a slow gatewayd; the
+// slog.Debug. The producer never blocks on a slow gatewayd-internal; the
 // per-subscriber buffer absorbs short-term slack and the picker
 // bias-on-stale property keeps the worst-case visible as "one
 // extra wake lands on the wrong node", which is the same
@@ -50,7 +50,7 @@ import (
 // bounded by the per-subscriber reader goroutine in
 // scheddgrpc.Server.StreamWarmHints, so 32 events of slack absorb
 // realistic admission bursts without ever forcing a drop on a
-// healthy gatewayd. A sustained slow consumer drops events
+// healthy gatewayd-internal. A sustained slow consumer drops events
 // regardless; the cap only smooths short-term jitter.
 const defaultWarmHintBufCap = 32
 
@@ -94,7 +94,7 @@ type WarmHintSink func(ev WarmHintEvent) error
 //   - emit takes the mutex once, iterates the subscriber map, and
 //     does a non-blocking send per subscriber (select with
 //     default). One producer (Engine.RecordWake); N consumers
-//     (one per open gatewayd gRPC stream).
+//     (one per open gatewayd-internal gRPC stream).
 //   - subscribe appends to the map under the mutex; unsubscribe
 //     removes + closes the channel.
 //   - dropped is an atomic counter the consumer of broadcaster
@@ -103,7 +103,7 @@ type WarmHintSink func(ev WarmHintEvent) error
 //
 // The buffer cap passed to subscribe defaults to 32 (matches
 // Engine.StreamAppLogs's per-instance channel cap in logs.go:93).
-// At bursty admission rates this gives the gatewayd time to drain
+// At bursty admission rates this gives the gatewayd-internal time to drain
 // without losing affinity state; on a sustained slow consumer we
 // drop, log, and continue.
 type warmHintBroadcaster struct {
@@ -124,7 +124,7 @@ func newWarmHintBroadcaster() *warmHintBroadcaster {
 // subscriber's full channel is a no-op for the producer (and a
 // dropped counter increment for diagnostics). The producer is the
 // engine under its per-app lock; we MUST NOT block here, or a
-// stuck gatewayd connection stalls the wake path.
+// stuck gatewayd-internal connection stalls the wake path.
 //
 // The caller (Engine.admitAndDispatch) is responsible for
 // stamping WrittenAt before invoking this method — the
@@ -150,7 +150,7 @@ func (b *warmHintBroadcaster) emit(ev WarmHintEvent) {
 		case ch <- ev:
 		default:
 			// Drop on full. The per-subscriber buffer cap is the
-			// only thing standing between a slow gatewayd and
+			// only thing standing between a slow gatewayd-internal and
 			// unbounded blocking; this branch is the natural
 			// trade-off the broadcaster makes (no fallback to a
 			// disk-backed queue — that's a future ADR if a real
@@ -167,7 +167,7 @@ func (b *warmHintBroadcaster) emit(ev WarmHintEvent) {
 // bufCap <= 0 falls back to defaultWarmHintBufCap (32 events,
 // matching Engine.StreamAppLogs's per-instance channel cap in
 // logs.go:93). The buffer is per-subscriber, so total memory is
-// O(N_gatewayds × bufCap).
+// O(N_gatewayd-internals × bufCap).
 func (b *warmHintBroadcaster) subscribe(bufCap int) (<-chan WarmHintEvent, func()) {
 	if bufCap <= 0 {
 		bufCap = defaultWarmHintBufCap

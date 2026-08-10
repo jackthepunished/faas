@@ -140,7 +140,7 @@ func (p *HetznerDNSProvider) DeleteRecords(ctx context.Context, _ string, recs [
 }
 
 // zoneID fetches the Hetzner Zone ID for the given zone name. The result is
-// not cached today (rarely more than 1 zone per gatewayd); add a TTL cache
+// not cached today (rarely more than 1 zone per gatewayd-internal); add a TTL cache
 // here if the operator ever fronts multiple zones from one daemon.
 func (p *HetznerDNSProvider) zoneID(ctx context.Context, zone string) (string, error) {
 	raw, err := p.do(ctx, http.MethodGet, "/zones?name="+zone, nil)

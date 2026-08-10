@@ -1,16 +1,20 @@
 # TLS cut-over drill — 2026-07-21 (M8 acceptance, ADR-024)
 
 > ⚠️ **PENDING — operator execution required.** This drill template
-> was scaffolded as part of the gatewayd Tier-1 PR
-> (`worktree-tier1-gatewayd-fix`, Finding 5) but the actual reference-node run
+> was scaffolded as part of the (now-archived) Tier-1 worktree
+> (Finding 5) but the actual reference-node run
 > has not happened yet. The §14 milestone gate is the reference-node execution,
 > not this document — issue #252 stays open until the row population
 > below is filled in by an operator against a live box. Do NOT mark
 > the issue closed from a code-only PR.
+>
+> **Note:** this drill was scaffolded against the legacy `cmd/gatewayd/`
+> daemon; the current process is `faas-gatewayd-public`
+> with config `/etc/faas/gatewayd-public.toml`.
 
 ## Acceptance bar
 
-> "gatewayd terminates TLS via CertMagic (DNS-01 wildcard +
+> "gatewayd-public terminates TLS via CertMagic (DNS-01 wildcard +
 > on-demand HTTP-01 gated by `custom_domains` allowlist); on-call has a
 > runbook; cert-mint abuse vector closes" — ADR-024, spec §11, spec §14 M8.
 
@@ -45,10 +49,10 @@ Paste the raw command output under "Result".)
 | 8 | Cert expiry | `notAfter=` ≥ 60 days out | |
 | 9 | TLS metric scrape (`gateway_tls_*` surfaces on :9090/metrics) | `gateway_tls_cert_expiry_seconds` ≥ 1d, `gateway_tls_cert_expiry_by_host_seconds{hostname,kind}` ≥ 1 row (per-host gauge from Finding 2), `gateway_tls_cert_expiry_refresher_walk_complete_total{result="complete"}` ≥ 1, `gateway_tls_on_demand_denied_total{reason=...}` present (any value, including 0) | |
 
-## journalctl excerpt (first 60 s after `systemctl restart faas-gatewayd`)
+## journalctl excerpt (first 60 s after `systemctl restart faas-gatewayd-public`)
 
 ```
-<paste the first ~60 lines of `journalctl -u faas-gatewayd --since '-60s'`
+<paste the first ~60 lines of `journalctl -u faas-gatewayd-public --since '-60s'`
 here; expect to see "public listening (TLS) addr=:443" and "ACME
 listening addr=:80" within the window, plus the wildcard mint INFO>
 ```
@@ -72,7 +76,7 @@ $ sudo bash deploy/scripts/hetzner-zone-setup.sh \
 
 | Check | Result |
 |---|---|
-| `sed -i 's/^disabled = false/disabled = true/' /etc/faas/gatewayd.toml && systemctl restart faas-gatewayd` brings plain `:8080` back | YES / NO |
+| `sed -i 's/^disabled = false/disabled = true/' /etc/faas/gatewayd.toml && systemctl restart faas-gatewayd-public` brings plain `:8080` back | YES / NO |
 | Certs left in `/var/lib/faas/certs/` are inert after rollback | YES / NO |
 | Re-flip (`disabled = false`) re-enables TLS without manual cert regen | YES / NO |
 

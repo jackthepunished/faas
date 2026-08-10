@@ -287,7 +287,7 @@ type APIKey struct {
 	// OrgID is the org the key was minted against (issue #190 / IAM-6,
 	// PR 6). Migration 00127 flips api_keys.org_id from NULL to
 	// NOT NULL after the deterministic personal-org backfill, so every
-	// row carries a non-empty string. The PR 7 (schedd/meterd/gatewayd
+	// row carries a non-empty string. The PR 7 (schedd/meterd/gatewayd-internal
 	// cutover) bump to AuthenticateKey's signature will thread this
 	// into admission decisions; PR 6 only adds the field so the
 	// Store/handler/auth triple don't need a coordinated rename.
@@ -391,7 +391,7 @@ type App struct {
 	// explicitly before CreateApp.
 	WorkloadClass WorkloadClass
 	// StreamingEnabled toggles the per-app streaming response path
-	// through gatewayd (issue #471 / ADR-047). When true, gatewayd
+	// through gatewayd-internal (issue #471 / ADR-047). When true, gatewayd-internal
 	// streams response body chunks instance → gateway → client with
 	// a periodic 200 ms / 256 KiB tx_bytes flush so ADR-046 metering
 	// stays accurate. Plan-gated upstream: Free defaults to false and
@@ -465,6 +465,21 @@ type App struct {
 	// backfill target for every pre-Phase-2 row, so single-box
 	// installs preserve bit-for-bit behaviour.
 	NodeID string
+	// OverflowNode is the customer's per-app preferred spill
+	// target (Tier A10, ADR-088, migration 00167). When set, the
+	// Tier A9 capacity-pressure rebalancer consults it BEFORE
+	// falling back to the first-peer-with-headroom selection.
+	// Nullable: a NULL app is the "no preference" default — the
+	// engine behaves exactly like A9 (random first peer with
+	// headroom, sorted by name ASC). UNSET-uuid is rejected by
+	// apps_overflow_node_chk (migration 00167) as a tripwire
+	// against buggy INSERT paths. The wire field is the
+	// human-readable compute_nodes.name; apid resolves the name
+	// to the UUID server-side via Store.ComputeNodeByName
+	// (cmd/apid/compute_nodes.go:250). FK cascades ON DELETE SET
+	// NULL — draining a node clears the preference, never
+	// orphans it.
+	OverflowNode *string
 	// ReassignedAt is the wall-clock time of the most recent
 	// successful cross-node reassignment (Tier A4, migration
 	// 00095). Stamped by Store.ReassignAppOwner in the same
@@ -532,7 +547,7 @@ type App struct {
 	// secretbox-sealed APP_BASIC_AUTH blob carrying the
 	// {username, password} pair the basic-auth path verifies
 	// against. Nil/empty for open/bearer modes; set ONLY when
-	// PublicAuthMode='basic'. Gatewayd-internal unseals it
+	// PublicAuthMode='basic'. gatewayd-internal unseals it
 	// at boot (and caches the unsealed form for 60s +
 	// db.NotifyKeyChanged invalidation) so the secretbox
 	// hot-path doesn't run on every request.
@@ -1025,7 +1040,7 @@ type BuildProvenance struct {
 }
 
 // CustomDomain is a customer's CNAME'd domain. apid owns this table;
-// gatewayd reads it to decide whether to mint a cert (spec §4.1, §7).
+// gatewayd-internal reads it to decide whether to mint a cert (spec §4.1, §7).
 type CustomDomain struct {
 	Domain         string
 	AppID          string
@@ -1036,7 +1051,7 @@ type CustomDomain struct {
 // Verified reports whether the TXT challenge has been satisfied.
 func (d CustomDomain) Verified() bool { return !d.VerifiedAt.IsZero() }
 
-// Cron is a scheduled synthetic POST through gatewayd (spec §4.3).
+// Cron is a scheduled synthetic POST through gatewayd-internal (spec §4.3).
 type Cron struct {
 	ID          string
 	AppID       string
@@ -1762,7 +1777,7 @@ type ComputeNode struct {
 	Zone *string
 	// ScheddTargetURL is the per-node schedd gRPC dial target
 	// (Phase 2 / Gate A, migration 00090). Distinct from
-	// TargetURL which is the vmmd dial target. gatewayd reads
+	// TargetURL which is the vmmd dial target. gatewayd-internal reads
 	// this to lazily dial the owner schedd for a customer
 	// request; the per-node dial cache is keyed by node_id and
 	// refreshed through the compute_node_changed pg_notify.
@@ -2167,7 +2182,7 @@ type UpdateAppParams struct {
 	// way SetRequireAuthn does. The apid PATCH validator
 	// enforces the plan gate (open=all, bearer=Hobby+,
 	// basic=Pro+) and the canonical mode enum; the secretbox
-	// seal happens at PATCH time so the gatewayd hot path
+	// seal happens at PATCH time so the gatewayd-internal hot path
 	// only reads ciphertext.
 	PublicAuth    *AppPublicAuthUpdate
 	SetPublicAuth bool
@@ -2214,6 +2229,17 @@ type UpdateAppParams struct {
 	// legacy readers don't see a stale floor).
 	ScalingPolicy    *ScalingPolicy
 	SetScalingPolicy bool
+	// OverflowNode (issue Tier A10 / ADR-088) is the customer's
+	// per-app preferred spill target (compute_node UUID). Apid
+	// has already resolved the wire name → UUID server-side
+	// (cmd/apid/handlers_ext.go::validateUpdateApp). Set bit
+	// distinguishes "unset" (don't touch the column) from
+	// "explicit NULL" (clear — back to A9 default fallback). The
+	// store is a plain column write; the empty-uuid CHECK +
+	// FK with ON DELETE SET NULL (migration 00167) cover the
+	// identity + ON-cascade contract.
+	OverflowNode    *string
+	SetOverflowNode bool
 }
 
 // AppPublicAuthUpdate (issue #477 / ADR-079) is the

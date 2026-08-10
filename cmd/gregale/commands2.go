@@ -72,6 +72,25 @@ const (
 	// terminalExitForDeployment branch.
 	statusLive = "live"
 
+	// Build status enum values from /v1/builds/{id} (DEPLOY-PROV-6
+	// / ADR-089, issue #741). 4-state enum per schema.sql CHECK
+	// constraint — matches BuildStatus constants in pkg/state.
+	// Lifted out so the SSE polling fallback in streamDeployLogs +
+	// terminalExitForBuild don't trip goconst when the same
+	// string appears 3+ times across the file.
+	buildStatusSucceeded = "succeeded"
+	buildStatusFailed    = "failed"
+
+	// Deployment status enum value (DEPLOY-PROV-6 sibling).
+	// Lifted out so the SSE decoder branch + pollDeploymentFinal
+	// + terminalExitForDeployment don't trip goconst once
+	// buildStatusFailed exists — goconst cross-file matching is
+	// by literal value, so we need two name-spaced constants even
+	// though they're the same string semantically. (The build
+	// status enum is a different 4-state set with `succeeded`/`failed`
+	// vs deployment's `live`/`failed`.)
+	deploymentStatusFailed = "failed"
+
 	// streamEventError is the SSE event name emitted by the build
 	// log stream when the upstream closes (5xx mid-stream, network
 	// reset, etc.). Mirrors the `event:` field of the build-log
@@ -197,6 +216,16 @@ func cmdApp(args []string) int {
 	publicAuth := fs.String("public-auth", "", "per-app public-URL auth: 'open' (default), 'bearer' (Hobby+), or 'basic' (Pro+; pair with --basic-user + --basic-pass)")
 	basicUser := fs.String("basic-user", "", "basic-auth username (RFC 7617 §2); required when --public-auth=basic")
 	basicPass := fs.String("basic-pass", "", "basic-auth password (RFC 7617 §2); required when --public-auth=basic")
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// The CLI takes the operator-supplied compute_nodes.name
+	// (the human-readable label) — apid resolves to UUID
+	// server-side. Empty string = clear the preference; non-
+	// empty = set. fs.Visit (below) distinguishes "flag not
+	// passed" (don't touch the column) from "flag passed with
+	// empty value" (explicit clear). The mirror on the wire is
+	// the `req.OverflowNode *string` pointer — same tri-state
+	// contract as EvictionPriority.
+	overflowNode := fs.String("overflow-node", "", "preferred overflow compute_node name (Tier A10; server resolves to UUID; '' clears)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -358,11 +387,25 @@ func cmdApp(args []string) int {
 		}
 		req.PublicAuth = block
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// The fs.Visit branch distinguishes "flag not passed" (nil
+	// pointer → don't touch the column) from "flag passed with
+	// empty value" (pointer to "" → explicit clear) from
+	// "flag passed with a value" (pointer to name → resolve
+	// server-side). The empty-string form is a deliberate
+	// CLI affordance — operators drain a node by deleting the
+	// preference rather than waiting for the FK ON DELETE
+	// SET NULL to land on the row.
+	if explicit["overflow-node"] {
+		v := *overflowNode
+		req.OverflowNode = &v
+	}
 
 	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
 		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
 		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil &&
-		req.EvictionPriority == nil && req.RequireAuthn == nil && req.PublicAuth == nil {
+		req.EvictionPriority == nil && req.RequireAuthn == nil && req.PublicAuth == nil &&
+		req.OverflowNode == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)
@@ -450,6 +493,18 @@ func cmdApp(args []string) int {
 			fmt.Printf("%-30s %s\n", "require authn:", "enabled")
 		} else {
 			fmt.Printf("%-30s %s\n", "require authn:", "disabled")
+		}
+		// Tier A10 / ADR-088: surface the resolved overflow_node
+		// preference (the UUID apid returns) so the customer can
+		// verify their PATCH round-tripped. nil on the wire means
+		// "no preference" — render the A9 fallback label so the
+		// CLI output stays self-documenting (the customer doesn't
+		// need to read ADR-088 to know what "no overflow_node"
+		// means in practice).
+		if a.OverflowNode == nil || *a.OverflowNode == "" {
+			fmt.Printf("%-30s %s\n", "overflow node:", "none (A9 fallback)")
+		} else {
+			fmt.Printf("%-30s %s\n", "overflow node:", *a.OverflowNode)
 		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
@@ -1956,7 +2011,7 @@ func cmdOpenDocs(args []string) int {
 }
 
 // dashboardBaseURL returns the dashboard's public base URL. Today
-// that's the API base minus /v1; the gatewayd reverse-proxy serves
+// that's the API base minus /v1; the gatewayd-public reverse-proxy serves
 // /dashboard/* from the same host. We use this so `gregale open` and
 // `gregale connect` build a clickable URL the customer's browser can
 // reach.
@@ -2238,9 +2293,16 @@ func streamDeployLogs(c *Client, dep api.DeploymentResponse) int {
 	ctx := context.Background()
 	body, err := c.StreamDeploymentLogs(ctx, dep.ID, nil, 0, true)
 	if err != nil {
-		// Stream unreachable up front — try one GetDeployment poll in
-		// case the build already finished before we opened the stream
-		// (e.g., a fast tarball deploy on a slow link).
+		// Stream unreachable up front — first try the new
+		// /v1/builds/{id} poller (DEPLOY-PROV-6 / ADR-089); only if
+		// the build is still queued/running OR the new endpoint is
+		// unavailable do we fall through to the legacy
+		// pollDeploymentFinal. A fast tarball deploy on a slow link
+		// is the canonical case where the stream never opened and
+		// the build row is already terminal.
+		if b, ok := pollBuildStatus(c, dep, 5*time.Second); ok {
+			return terminalExitForBuild(b, dep.AppID)
+		}
 		if final, ok := pollDeploymentFinal(c, dep); ok {
 			return terminalExitForDeployment(final)
 		}
@@ -2277,7 +2339,7 @@ streamLoop:
 					Status string `json:"status"`
 				}
 				if json.Unmarshal([]byte(e.Data), &status) == nil &&
-					(status.Status == statusLive || status.Status == "failed") {
+					(status.Status == statusLive || status.Status == deploymentStatusFailed) {
 					if status.Status == statusLive {
 						PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", dep.AppID)
 						printDeployColdWakeSentence()
@@ -2310,9 +2372,15 @@ streamLoop:
 			return 3
 		}
 	}
-	// Stream ended without a terminal frame — try one GetDeployment
-	// poll so a fast build that raced the SSE open isn't reported as
-	// "follow manually" when we actually have the answer.
+	// Stream ended without a terminal frame — poll the new
+	// /v1/builds/{id} endpoint (DEPLOY-PROV-6 / ADR-089, issue
+	// #741) so a fast build that raced the SSE open isn't reported
+	// as "follow manually" when we actually have the answer. Only
+	// fall back to pollDeploymentFinal when the new poll reports
+	// the build is still queued or running.
+	if b, ok := pollBuildStatus(c, dep, 60*time.Second); ok {
+		return terminalExitForBuild(b, dep.AppID)
+	}
 	if final, ok := pollDeploymentFinal(c, dep); ok {
 		return terminalExitForDeployment(final)
 	}
@@ -2324,15 +2392,94 @@ streamLoop:
 // returns (final, true) when status is live or failed. Returns
 // (_, false) on any error or non-terminal status — the caller treats
 // both as "no answer, give up cleanly".
+//
+// Deprecated by DEPLOY-PROV-6 / ADR-089 (issue #741): pollBuildStatus
+// is the more-correct fallback now that /v1/builds/{id} exists.
+// pollDeploymentFinal stays as a last-ditch safety net so a server
+// where /v1/builds/{id} is unavailable still degrades gracefully;
+// streamDeployLogs prefers the new path.
 func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentResponse, bool) {
 	got, err := c.GetDeployment(context.Background(), dep.ID)
 	if err != nil {
 		return api.DeploymentResponse{}, false
 	}
-	if got.Status == statusLive || got.Status == "failed" {
+	if got.Status == statusLive || got.Status == deploymentStatusFailed {
 		return got, true
 	}
 	return api.DeploymentResponse{}, false
+}
+
+// pollBuildStatus polls GET /v1/builds/{id} until the build reaches
+// a terminal status (succeeded|failed) or the deadline elapses.
+// Replaces the one-shot pollDeploymentFinal the SSE fallback in
+// streamDeployLogs used before DEPLOY-PROV-6 / ADR-089; with a real
+// status endpoint there's no reason to give up after a single GET.
+//
+// Backoff: 1s base, capped at 5s, jittered ±10% to avoid the
+// thundering-herd many CI jobs would trigger when they all exit SSE
+// at the same instant. Deadline defaults to 60s; CLI flow currently
+// uses the default — a future --wait flag could override.
+//
+// Context: each iteration derives a per-call context.WithTimeout
+// capped at the remaining budget, so a hung server connection
+// (e.g. server-side stall without an http.Client timeout firing)
+// can't block the loop past the deadline. The SDK's http.Client
+// also enforces a 30s per-call timeout as a second line of
+// defence; both work together so the worst-case wall-clock here
+// is `deadline` even on a pathological server.
+//
+// Returns (BuildResponse, true) on terminal status; (zero, false)
+// on deadline elapse or persistent transient error so the SSE caller
+// can fall back to the "follow manually" hint.
+func pollBuildStatus(c *Client, dep api.DeploymentResponse, deadline time.Duration) (api.BuildResponse, bool) {
+	if dep.BuildID == "" {
+		// No build_id on the deployment row — server pre-dates
+		// PROV-6, or the deployment was created via the fast-
+		// path that skips the builds table. Bail out so the
+		// caller falls through to pollDeploymentFinal.
+		return api.BuildResponse{}, false
+	}
+	// parent context is the wall-clock deadline; per-iteration
+	// children derive from this so the loop honors the budget.
+	parent, cancelParent := context.WithTimeout(context.Background(), deadline)
+	defer cancelParent()
+	end := time.Now().Add(deadline)
+	backoff := 1 * time.Second
+	for time.Now().Before(end) {
+		// Per-call timeout: remaining budget, capped at the SDK's
+		// 30s per-request timeout (lower of the two wins). Keeps
+		// a single hung request from blocking past deadline.
+		remaining := time.Until(end)
+		if remaining <= 0 {
+			return api.BuildResponse{}, false
+		}
+		callCtx, cancelCall := context.WithTimeout(parent, remaining)
+		b, err := c.GetBuildsId(callCtx, dep.BuildID)
+		cancelCall()
+		if err == nil && (b.Status == buildStatusSucceeded || b.Status == buildStatusFailed) {
+			return b, true
+		}
+		// Jitter ±10% of the current backoff so N concurrent CI
+		// jobs don't wake at the same wall-clock tick. Pseudo-
+		// random via time.Now().UnixNano() avoids a math/rand
+		// import (and its seeding dance in Go 1.20+). The mod
+		// picks magnitude in [0, span); subtracting span/2
+		// recentres it so the signed jitter is symmetric around
+		// zero. Review finding #3 pinned the previous version
+		// (which was always non-negative, producing [0, +20%]
+		// rather than the documented ±20%) — this formula gives
+		// the symmetric ±10% spread the docstring promises.
+		span := int64(backoff / 5)
+		if span < 1 {
+			span = 1
+		}
+		jitter := time.Duration(time.Now().UnixNano()%span) - time.Duration(span/2)
+		time.Sleep(backoff + jitter)
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+	return api.BuildResponse{}, false
 }
 
 // terminalExitForDeployment applies the same rendering rules as the
@@ -2345,6 +2492,27 @@ func terminalExitForDeployment(d api.DeploymentResponse) int {
 		return 0
 	}
 	return renderDeployFailure(d)
+}
+
+// terminalExitForBuild maps a polled terminal BuildResponse to a CLI
+// exit code. Mirrors terminalExitForDeployment but reads from the
+// build row (DEPLOY-PROV-6 / ADR-089, issue #741) — the polled
+// build row lacks the rich Error string from the deployment row,
+// so on failure we render a compact "BuildStatus=failed
+// failure_class=…" block and exit 2 (same exit-code convention as
+// terminalExitForDeployment's renderDeployFailure path).
+func terminalExitForBuild(b api.BuildResponse, appID string) int {
+	if b.Status == buildStatusSucceeded {
+		PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", appID)
+		printDeployColdWakeSentence()
+		return 0
+	}
+	// Failed build — surface the lifecycle info. End users hitting
+	// this path are CI scripts that lost their SSE; the canonical
+	// log path is `gregale logs --deployment <deployment_id>`.
+	PrintWarn(os.Stderr, "build %s failed (failure_class=%s); inspect logs with: gregale logs --deployment %s",
+		b.ID, b.FailureClass, b.DeploymentID)
+	return 2
 }
 
 // printDeployColdWakeSentence emits the UX §2.5 cold-wake honesty
