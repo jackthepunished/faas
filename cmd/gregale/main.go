@@ -48,6 +48,7 @@ Commands:
   deployment   Get one deployment (<id> | set-min-instances <id> --min N)
   deploy       Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)
   domains      Manage custom domains
+  edge-rules   Per-app edge rules (route|rewrite|redirect|headers|cors|jwt|ip; ADR-089)
   env          Pull/push .env <-> sealed secrets (--app <slug>)
   host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
@@ -221,6 +222,13 @@ func run(args []string) int {
 		return cmdTraffic(args[1:])
 	case "domains":
 		return cmdDomains(args[1:])
+	case "edge-rules":
+		// PR 2 of Edge Rules rollout: customer CLI wrapper around the
+		// /v1/apps/{slug}/edge-rules CRUD surface (PR 1 #799). Sub-
+		// commands live in commands_edge_rules.go; the dispatcher
+		// itself is cmdEdgeRules. --json round-trips through the
+		// pkg/api SDK methods (ListEdgeRules / CreateEdgeRule / etc.).
+		return cmdEdgeRules(args[1:])
 	case "crons":
 		return cmdCrons(args[1:])
 	case "delayed-task":
