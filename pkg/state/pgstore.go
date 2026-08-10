@@ -9914,19 +9914,23 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 // pod that holds the claim (state='pending') is allowed to flip; a
 // foreign caller (or one whose lease expired and the row was
 // reaped+re-claimed) sees 0 rows updated and gets ErrClaimLost so
-// the caller can decide how to react. mb_seconds is stamped for ops
-// debugging — the merchant dashboard line item already carries the
-// value in CustomData.
+// the caller can decide how to react. mb_seconds is stamped on the
+// row (column added in migration 00198) so ops reconciliation can
+// read the integer wire value directly without joining against
+// usage_minutes; the Paddle merchant dashboard's line item
+// Quantity + CustomData["mb_seconds"] carry the same value at the
+// merchant side.
 func (s *PgStore) CompletePaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
 	windowStart = windowStart.UTC()
 	tag, err := s.pool.Exec(ctx,
 		`update paddle_overage_dedupe
 		   set state = 'completed',
-		       pushed_at = now()
+		       pushed_at = now(),
+		       pushed_mb_seconds = $3
 		 where account_id = $1
 		   and window_start = $2
 		   and state = 'pending'`,
-		accountID, windowStart,
+		accountID, windowStart, mbSeconds,
 	)
 	if err != nil {
 		return fmt.Errorf("paddle dedupe complete acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
@@ -9938,22 +9942,24 @@ func (s *PgStore) CompletePaddleOverageWindow(ctx context.Context, accountID str
 		// skipped Claim). Either way, the terminal state is correct
 		// and we don't want to alert.
 		//
-		// We do still want to stamp the mb_seconds for ops — re-do
-		// the UPDATE without the state filter, gated on a NOT EXISTS
-		// precheck so we don't clobber a different pending claim.
+		// We do still want to stamp pushed_mb_seconds for ops — re-do
+		// the UPDATE without the state filter so the value is
+		// materialised even on a re-stamped row. Idempotent re-stamp
+		// is OK: the new value is the same integer the previous
+		// complete call carried.
 		if _, err := s.pool.Exec(ctx,
 			`update paddle_overage_dedupe
-			   set pushed_at = now()
+			   set pushed_at = now(),
+			       pushed_mb_seconds = $3
 			 where account_id = $1
 			   and window_start = $2
 			   and state = 'completed'`,
-			accountID, windowStart,
+			accountID, windowStart, mbSeconds,
 		); err != nil {
 			return fmt.Errorf("paddle dedupe complete refresh acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
 		}
 		return nil
 	}
-	_ = mbSeconds // currently not stamped on the row; CustomData carries the merchant-side value
 	return nil
 }
 
