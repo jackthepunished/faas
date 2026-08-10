@@ -216,6 +216,16 @@ func cmdApp(args []string) int {
 	publicAuth := fs.String("public-auth", "", "per-app public-URL auth: 'open' (default), 'bearer' (Hobby+), or 'basic' (Pro+; pair with --basic-user + --basic-pass)")
 	basicUser := fs.String("basic-user", "", "basic-auth username (RFC 7617 §2); required when --public-auth=basic")
 	basicPass := fs.String("basic-pass", "", "basic-auth password (RFC 7617 §2); required when --public-auth=basic")
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// The CLI takes the operator-supplied compute_nodes.name
+	// (the human-readable label) — apid resolves to UUID
+	// server-side. Empty string = clear the preference; non-
+	// empty = set. fs.Visit (below) distinguishes "flag not
+	// passed" (don't touch the column) from "flag passed with
+	// empty value" (explicit clear). The mirror on the wire is
+	// the `req.OverflowNode *string` pointer — same tri-state
+	// contract as EvictionPriority.
+	overflowNode := fs.String("overflow-node", "", "preferred overflow compute_node name (Tier A10; server resolves to UUID; '' clears)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -377,11 +387,25 @@ func cmdApp(args []string) int {
 		}
 		req.PublicAuth = block
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// The fs.Visit branch distinguishes "flag not passed" (nil
+	// pointer → don't touch the column) from "flag passed with
+	// empty value" (pointer to "" → explicit clear) from
+	// "flag passed with a value" (pointer to name → resolve
+	// server-side). The empty-string form is a deliberate
+	// CLI affordance — operators drain a node by deleting the
+	// preference rather than waiting for the FK ON DELETE
+	// SET NULL to land on the row.
+	if explicit["overflow-node"] {
+		v := *overflowNode
+		req.OverflowNode = &v
+	}
 
 	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
 		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
 		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil &&
-		req.EvictionPriority == nil && req.RequireAuthn == nil && req.PublicAuth == nil {
+		req.EvictionPriority == nil && req.RequireAuthn == nil && req.PublicAuth == nil &&
+		req.OverflowNode == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)
@@ -469,6 +493,18 @@ func cmdApp(args []string) int {
 			fmt.Printf("%-30s %s\n", "require authn:", "enabled")
 		} else {
 			fmt.Printf("%-30s %s\n", "require authn:", "disabled")
+		}
+		// Tier A10 / ADR-088: surface the resolved overflow_node
+		// preference (the UUID apid returns) so the customer can
+		// verify their PATCH round-tripped. nil on the wire means
+		// "no preference" — render the A9 fallback label so the
+		// CLI output stays self-documenting (the customer doesn't
+		// need to read ADR-088 to know what "no overflow_node"
+		// means in practice).
+		if a.OverflowNode == nil || *a.OverflowNode == "" {
+			fmt.Printf("%-30s %s\n", "overflow node:", "none (A9 fallback)")
+		} else {
+			fmt.Printf("%-30s %s\n", "overflow node:", *a.OverflowNode)
 		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0

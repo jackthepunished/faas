@@ -559,6 +559,20 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, prob)
 		return
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// Resolve the wire name → UUID server-side before the
+	// store call so the column carries the resolved UUID
+	// (the column-shape integrity contract — uuid NULL, not
+	// text). `strictEmpty=false` because PATCH allows `""` to
+	// mean "clear the preference" (an explicit transition,
+	// distinct from nil = "don't touch the column"). On any
+	// 4xx we bail; on success the local var carries the
+	// resolved UUID (or "" for clear).
+	overflowUUID, prob := s.resolveOverflowNode(r.Context(), req.OverflowNode, false /*strictEmpty*/)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
 	// SetMinInstances: nil pointer means "don't touch"; non-nil
 	// (even pointing at 0) means "explicit set" → scale to zero.
 	//
@@ -746,6 +760,16 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// re-rendering. New post-flip apps (column NULL on
 		// create) are unaffected by the SET.
 		ClearAuthDefaultFlippedAt: req.RequireAuthn != nil || req.PublicAuth != nil,
+		// Tier A10 / ADR-088: per-app overflow_node preference.
+		// `req.OverflowNode != nil` distinguishes "don't touch
+		// the column" (nil pointer) from "explicit clear or
+		// explicit set" (non-nil pointer; "" means clear,
+		// non-empty means the resolved UUID). Resolution to
+		// UUID ran above (resolveOverflowNode) so this
+		// carries the canonical column value, never the
+		// wire-format name.
+		OverflowNode:    nilStringPtr(overflowUUID),
+		SetOverflowNode: req.OverflowNode != nil,
 	}
 	if req.PublicAuth != nil {
 		// params.PublicAuth is unset when req.PublicAuth is
