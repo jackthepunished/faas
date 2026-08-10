@@ -82,6 +82,19 @@ func PrintWarn(w io.Writer, format string, a ...any) {
 	writeStatus(w, "!", format, a...)
 }
 
+// GlyphOK is the leading character for a "done" line. Lives here (not
+// at the call site) so the lint tripwire that rejects leading glyph
+// literals outside output.go has a single allow-listed file.
+const GlyphOK = "✓"
+
+// GlyphFail is the leading character for a "failed" line. Same rationale
+// as GlyphOK.
+const GlyphFail = "✗"
+
+// GlyphProgress is the leading character for an "in progress" line.
+// Same rationale as GlyphOK.
+const GlyphProgress = "→"
+
 // writeStatus centralises the "leading glyph + space + content + newline"
 // rule. The four Print* functions are one-liners above. The error from
 // Fprintf is intentionally discarded: writer failures (closed pipe,
