@@ -36,6 +36,13 @@ import (
 // test and returns a teardown that undoes the install. Each test gets its
 // own recipient (different from production key) so a unit-test bug never
 // collides with a leakage scenario.
+//
+// ADR-089 PR-A appended a nullable kid column to app_secrets; PR-C's
+// sealAndPersist path now stamps that kid alongside the ciphertext. The
+// kid is the X25519 identity fingerprint of the host identity, so a
+// test that installs only a recipient without a matching identity would
+// 503 "host age identities not loaded". We install both behind the
+// same closure so the receiver/identity pair is internally consistent.
 func withTestRecipient(t *testing.T) func() {
 	t.Helper()
 	// Generate a fresh identity in memory — we never persist it, so the
@@ -45,12 +52,19 @@ func withTestRecipient(t *testing.T) func() {
 	if err != nil {
 		t.Fatalf("age.GenerateX25519Identity: %v", err)
 	}
-	prev := setSecretRecipient
+	prevRcp := setSecretRecipient
+	prevIdent := mfaIdentities
 	setSecretRecipient = func() *age.X25519Recipient {
 		return ident.Recipient()
 	}
+	// Single-identity seam so tests that haven't migrated to the
+	// rotation-aware mfaIdentities accessor still stamp a kid. Production
+	// never uses this fallback (main.go sets BOTH for the rotation-aware
+	// path); the fallback exists only for unit-test harnesses.
+	mfaIdentities = func() []*age.X25519Identity { return []*age.X25519Identity{ident} }
 	return func() {
-		setSecretRecipient = prev
+		setSecretRecipient = prevRcp
+		mfaIdentities = prevIdent
 	}
 }
 

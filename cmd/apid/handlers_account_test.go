@@ -48,15 +48,26 @@ import (
 // the G6 export tests. Named to avoid clashing with the equivalent
 // helper in handlers_secrets_test.go (different filename, but same
 // package main).
+//
+// ADR-089 PR-A appended a nullable kid column to app_secrets; PR-C's
+// sealAndPersist path now stamps that kid alongside the ciphertext,
+// so the matching identity must also be installed via mfaIdentities —
+// otherwise the PUT 503s "host age identities not loaded". The
+// recipient + identity pair is internally consistent (same age key).
 func withAccountTestRecipient(t *testing.T) {
 	t.Helper()
-	prev := setSecretRecipient
-	t.Cleanup(func() { setSecretRecipient = prev })
+	prevRcp := setSecretRecipient
+	prevIdent := mfaIdentities
+	t.Cleanup(func() {
+		setSecretRecipient = prevRcp
+		mfaIdentities = prevIdent
+	})
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		t.Fatalf("GenerateX25519Identity: %v", err)
 	}
 	setSecretRecipient = func() *age.X25519Recipient { return id.Recipient() }
+	mfaIdentities = func() []*age.X25519Identity { return []*age.X25519Identity{id} }
 }
 
 // seedOneApp creates a single app the handler tests can hang

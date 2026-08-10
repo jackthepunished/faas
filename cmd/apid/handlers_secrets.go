@@ -166,7 +166,21 @@ func (s *server) sealAndPersist(c stdctx, acct state.Account, app state.App, key
 		// Apid started without a host.age.pub; refuse to accept plaintext.
 		return api.ErrCapacity("host age recipient not loaded — refusing to seal")
 	}
-	idents := mfaIdentities()
+	// mfaIdentities is nil in unit-test harnesses that only install
+	// the single-key package level (see withTestRecipient in
+	// handlers_secrets_test.go); the same nil-guard pattern lives in
+	// handlers_mfa.go:600-602. We fall back to mfaIdentity so tests
+	// that haven't migrated to the rotation-aware accessor stamp a
+	// kid without a separate setup helper.
+	var idents []*age.X25519Identity
+	if mfaIdentities != nil {
+		idents = mfaIdentities()
+	}
+	if len(idents) == 0 && mfaIdentity != nil {
+		if single := mfaIdentity(); single != nil {
+			idents = []*age.X25519Identity{single}
+		}
+	}
 	if len(idents) == 0 {
 		return api.ErrCapacity("host age identities not loaded — refusing to seal")
 	}
