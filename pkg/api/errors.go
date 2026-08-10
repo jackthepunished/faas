@@ -350,6 +350,16 @@ const (
 	// off" from "feature is on and idle".
 	CodeRekeyDisabled = "rekey_disabled"
 
+	// CodeRekeyNoIdentities — ADR-089 PR-C follow-up (PR #825).
+	// Returned with 503 when FAAS_REKEY_ENABLED=true BUT no host
+	// age identities are loaded. The operator has opted in but
+	// the runner is silently skipped because mfaIdentities() is
+	// empty (typically FAAS_HOST_AGE_IDENTITY_PATH unset). The
+	// distinct code lets a dashboard surface "you set the flag
+	// but the host-age identity isn't loaded" instead of the
+	// misleading "set FAAS_REKEY_ENABLED=true and restart".
+	CodeRekeyNoIdentities = "rekey_no_identities"
+
 	// Customer env vars (issue #395 / ADR-045). Distinct codes from
 	// CodeSecret* so the quota + audit shape is unambiguous to
 	// dashboards and SDK callers — a `plan_limit_env_vars` is a config

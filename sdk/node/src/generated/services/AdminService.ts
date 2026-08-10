@@ -266,6 +266,12 @@ export class AdminService {
    * When the runner is disabled (FAAS_REKEY_ENABLED unset), the
    * endpoint returns 503 with code `rekey_disabled` so an
    * operator can distinguish "no work yet" from "feature off".
+   * If FAAS_REKEY_ENABLED=true is set but no host age identities
+   * loaded (mfaIdentities() empty — typically FAAS_HOST_AGE_IDENTITY_PATH
+   * unset), the endpoint returns 503 with the distinct code
+   * `rekey_no_identities` (PR #825 follow-up); this avoids the
+   * misleading "set FAAS_REKEY_ENABLED and restart" detail when
+   * the operator already opted in.
    *
    * @returns RekeyProgress Current rekey progress snapshot.
    * @throws ApiError
@@ -281,7 +287,16 @@ export class AdminService {
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
-        503: `code: rekey_disabled — FAAS_REKEY_ENABLED is unset on this apid; the background re-seal runner is not running. Set the env flag and restart apid to opt in.`,
+        503: `Runner not running. The detail distinguishes two cases
+        via the \`code\` field:
+        - \`rekey_disabled\` — FAAS_REKEY_ENABLED is unset on
+        this apid; the background re-seal runner is not
+        running. Set the env flag and restart apid to opt in.
+        - \`rekey_no_identities\` — FAAS_REKEY_ENABLED=true but
+        no host age identities loaded (FAAS_HOST_AGE_IDENTITY_PATH
+        missing or empty). Set the identity path alongside
+        the flag, then restart apid.
+        `,
       },
     });
   }

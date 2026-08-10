@@ -175,13 +175,22 @@ type server struct {
 	// the cache is nil (the dev/test boot path).
 	graceWindowCache *graceWindowCache
 	// rekeyRunner is the background re-seal walker (ADR-089 PR-C).
-	// Wired only when FAAS_REKEY_ENABLED=true; nil on daemons
-	// where the operator hasn't enabled the feature. The HTTP
-	// handler reads Progress() through this field; a nil value
-	// produces a 503 with code="rekey_disabled" so the operator's
-	// dashboard distinguishes "feature is off" from "feature is
-	// on and the table is empty".
+	// Wired only when FAAS_REKEY_ENABLED=true AND mfaIdentities()
+	// is non-empty; nil on daemons where either condition fails.
+	// The HTTP handler reads Progress() through this field; a nil
+	// value produces a 503 — see rekeyRunnerOptedIn below for the
+	// distinction between "feature off" (rekey_disabled) and
+	// "flag set but no identities loaded" (rekey_no_identities).
 	rekeyRunner *Runner
+	// rekeyRunnerOptedIn tracks whether FAAS_REKEY_ENABLED=true was
+	// observed at boot, regardless of whether the runner was
+	// actually wired (it's skipped when identities are empty —
+	// cmd/apid/main.go:944). The handler pairs this with the
+	// rekeyRunner nil-check to return the right 503 code, so an
+	// operator who set the flag but forgot FAAS_HOST_AGE_IDENTITY_PATH
+	// sees rekey_no_identities instead of the misleading
+	// "set FAAS_REKEY_ENABLED and restart" detail.
+	rekeyRunnerOptedIn bool
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -350,6 +359,22 @@ func (s *server) WithBillingProvider(p billing.Provider) *server {
 // matching the WithOpsMetrics / WithBillingProvider style.
 func (s *server) WithRekeyRunner(r *Runner) *server {
 	s.rekeyRunner = r
+	return s
+}
+
+// MarkRekeyRunnerOptedIn records that FAAS_REKEY_ENABLED=true was
+// observed at boot, even if the runner itself was skipped (e.g.
+// because mfaIdentities() was empty). Paired with WithRekeyRunner,
+// the HTTP handler returns the right 503 code:
+//
+//   - runner nil + optedIn=false → rekey_disabled
+//   - runner nil + optedIn=true  → rekey_no_identities
+//   - runner set                 → 200 + progress
+//
+// Wired from cmd/apid/main.go at boot, BEFORE WithRekeyRunner so
+// the field is correct even if NewRunner fails.
+func (s *server) MarkRekeyRunnerOptedIn() *server {
+	s.rekeyRunnerOptedIn = true
 	return s
 }
 
