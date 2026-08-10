@@ -902,7 +902,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// end-to-end (handler.go:matchAndSubstituteRoute does the
 	// same-account check).
 	//
-	// Note: state.App does not carry Plan (the apps table
+	// Field copy (review fix R1): every auth/forwarder-relevant
+	// field on state.App MUST be copied onto the gateway.App —
+	// enforceRequireAuthn reads App.RequireAuthn,
+	// enforcePublicAuth reads App.PublicAuth.Mode, the streaming/
+	// WS detectors read StreamingEnabled/WebSocketEnabled, per-node
+	// schedd routing reads NodeID. A zero value on any of these
+	// would silently disable the per-app gate ("auth remains
+	// per-app on the target" promise would be broken — a target
+	// with require_authn=true would suddenly appear open to the
+	// inbound host's anonymous traffic after the route fires).
+	// Sidecars is intentionally NOT copied: state.App doesn't
+	// carry it (it lives on the deployment join), and a kind=route
+	// hit never references the inbound host's sidecar roster —
+	// the target's own routing resolves its own sidecars on the
+	// next request to its own hostname.
+	//
+	// Plan: state.App does not carry Plan (the apps table
 	// doesn't denormalize it; Plan lives on accounts). The
 	// routed App returned here has Plan="", which surfaces as
 	// an empty `plan` label on gateway_requests_total for
@@ -911,14 +927,38 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Plan properly is PR 8 (denormalize on apps row OR
 	// back-to-back AccountByID join — both deferred; the
 	// metrics label gap is acceptable for a v1 surface).
+	//
+	// Error classification (review fix R2): state.ErrNotFound
+	// is a clean miss (the target app row was deleted) — silent
+	// fall-through. Anything else is a real error (DB outage,
+	// pool exhaustion, ctx cancel) and gets logged at WARN +
+	// audited so a dashboard operator can distinguish a noisy
+	// transient from a sustained backend failure.
 	handler.WithEdgeRules(deps.edgeRulesMatcher, func(ctx context.Context, slug string) (gateway.App, bool) {
 		app, err := deps.pgStore.AppBySlug(ctx, slug)
 		if err != nil {
+			if !errors.Is(err, state.ErrNotFound) {
+				if log != nil {
+					log.Warn("edge rule target AppBySlug failed", "slug", slug, "err", err)
+				}
+				if deps.edgeRulesAudit != nil {
+					subject := slug
+					deps.edgeRulesAudit.Emit(ctx, "edge_rule.route_loader_error", &subject, map[string]any{
+						"slug": slug,
+						"err":  err.Error(),
+					})
+				}
+			}
 			return gateway.App{}, false
 		}
 		return gateway.App{
-			ID:        app.ID,
-			AccountID: app.AccountID,
+			ID:               app.ID,
+			AccountID:        app.AccountID,
+			RequireAuthn:     app.RequireAuthn,
+			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed},
+			StreamingEnabled: app.StreamingEnabled,
+			WebSocketEnabled: app.WebSocketEnabled,
+			NodeID:           app.NodeID,
 		}, true
 	}, deps.edgeRulesAudit)
 	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).

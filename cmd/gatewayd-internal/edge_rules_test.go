@@ -86,7 +86,10 @@ func TestCompileRouteRules_KeepsOnlyKindRoute(t *testing.T) {
 			},
 		},
 	}
-	got := compileRouteRules(in)
+	got, parseErrs := compileRouteRules(in)
+	if len(parseErrs) != 0 {
+		t.Errorf("parseErrs = %v, want empty", parseErrs)
+	}
 	if len(got) != 1 {
 		t.Fatalf("got %d rules, want 1 (kind filter)", len(got))
 	}
@@ -106,7 +109,10 @@ func TestCompileRouteRules_SkipsDisabled(t *testing.T) {
 			return r
 		}(),
 	}
-	got := compileRouteRules(in)
+	got, parseErrs := compileRouteRules(in)
+	if len(parseErrs) != 0 {
+		t.Errorf("parseErrs = %v, want empty", parseErrs)
+	}
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1 (disabled filtered)", len(got))
 	}
@@ -125,7 +131,10 @@ func TestCompileRouteRules_SortsPriorityAscending(t *testing.T) {
 		sampleRouteRule("high", 0, "a.example.com", "/", nil, "demo"),
 		sampleRouteRule("mid", 50, "a.example.com", "/", nil, "demo"),
 	}
-	got := compileRouteRules(in)
+	got, parseErrs := compileRouteRules(in)
+	if len(parseErrs) != 0 {
+		t.Errorf("parseErrs = %v, want empty", parseErrs)
+	}
 	if len(got) != 3 {
 		t.Fatalf("got %d, want 3", len(got))
 	}
@@ -141,7 +150,10 @@ func TestCompileRouteRules_CompilesMethodsLookupTable(t *testing.T) {
 	in := []state.EdgeRule{
 		sampleRouteRule("r", 0, "a.example.com", "/", []string{"get", "POST"}, "demo"),
 	}
-	got := compileRouteRules(in)
+	got, parseErrs := compileRouteRules(in)
+	if len(parseErrs) != 0 {
+		t.Errorf("parseErrs = %v, want empty", parseErrs)
+	}
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1", len(got))
 	}
@@ -160,11 +172,65 @@ func TestCompileRouteRules_EmptyInputProducesEmptyOutput(t *testing.T) {
 	// Edge case: store returns no rules → Put is a no-op (the
 	// gateway cache drops empty slices); the loader must not
 	// allocate a zero-length slice header that gets Put.
-	if got := compileRouteRules(nil); got != nil {
-		t.Errorf("compileRouteRules(nil) = %v, want nil", got)
+	if got, parseErrs := compileRouteRules(nil); got != nil || parseErrs != nil {
+		t.Errorf("compileRouteRules(nil) = %v, %v, want nil, nil", got, parseErrs)
 	}
-	if got := compileRouteRules([]state.EdgeRule{}); got != nil {
-		t.Errorf("compileRouteRules([]) = %v, want nil", got)
+	if got, parseErrs := compileRouteRules([]state.EdgeRule{}); got != nil || parseErrs != nil {
+		t.Errorf("compileRouteRules([]) = %v, %v, want nil, nil", got, parseErrs)
+	}
+}
+
+// TestCompileRouteRules_MalformedGlobDroppedAndReported (review fix R3)
+// pins the new behaviour: a rule whose MatchPath fails stdlib
+// path.Match validation (unmatched bracket, etc.) is dropped
+// from the compiled slice AND returned via the parseErrs slice
+// so the loader can log it. Prior behaviour was silent — the
+// rule made it into the cache and silently never matched any
+// request, with no operator-visible signal.
+func TestCompileRouteRules_MalformedGlobDroppedAndReported(t *testing.T) {
+	in := []state.EdgeRule{
+		sampleRouteRule("good", 100, "a.example.com", "/api/*", nil, "demo"),
+		func() state.EdgeRule {
+			r := sampleRouteRule("bad", 50, "a.example.com", "[unmatched", nil, "demo")
+			return r
+		}(),
+	}
+	got, parseErrs := compileRouteRules(in)
+	if len(parseErrs) != 1 {
+		t.Fatalf("parseErrs = %v, want 1 entry", parseErrs)
+	}
+	if parseErrs[0].RuleID != "bad" {
+		t.Errorf("parseErrs[0].RuleID = %q, want bad", parseErrs[0].RuleID)
+	}
+	if parseErrs[0].Glob != "[unmatched" {
+		t.Errorf("parseErrs[0].Glob = %q, want [unmatched", parseErrs[0].Glob)
+	}
+	if parseErrs[0].Err == nil {
+		t.Errorf("parseErrs[0].Err = nil, want non-nil")
+	}
+	if len(got) != 1 {
+		t.Fatalf("got len = %d, want 1 (malformed rule dropped)", len(got))
+	}
+	if got[0].ID != "good" {
+		t.Errorf("got[0].ID = %q, want good", got[0].ID)
+	}
+}
+
+// TestCompileRouteRules_EmptyAndStarGlobsAccepted (review fix R3)
+// pins the match-all sentinels: MatchPath="" and MatchPath="*"
+// must NOT trip the parser (stdlib path.Match rejects both as
+// errors on the empty-input probe).
+func TestCompileRouteRules_EmptyAndStarGlobsAccepted(t *testing.T) {
+	in := []state.EdgeRule{
+		sampleRouteRule("empty", 100, "a.example.com", "", nil, "demo"),
+		sampleRouteRule("star", 50, "a.example.com", "*", nil, "demo"),
+	}
+	got, parseErrs := compileRouteRules(in)
+	if len(parseErrs) != 0 {
+		t.Errorf("parseErrs = %v, want empty (match-all sentinels)", parseErrs)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got len = %d, want 2", len(got))
 	}
 }
 
