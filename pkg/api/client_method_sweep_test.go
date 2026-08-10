@@ -91,6 +91,21 @@ func TestSweep_Deploy(t *testing.T) {
 	}
 }
 
+func TestSweep_DeployFromSourceRef(t *testing.T) {
+	srv, captured := newSweepServer(t, 202, `{"id":"dep_2"}`)
+	c := NewClient(srv.URL, "fp_test")
+	if _, err := c.DeployFromSourceRef(context.Background(), "myapp", SourceRefDeployRequest{
+		Repo:   "onebox-faas/hello",
+		Ref:    "0123456789abcdef0123456789abcdef01234567",
+		Format: "tarball",
+	}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(*captured) == 0 {
+		t.Error("expected request body")
+	}
+}
+
 func TestSweep_GetDeploymentScan(t *testing.T) {
 	srv, _ := newSweepServer(t, 200, `{"status":"complete"}`)
 	c := NewClient(srv.URL, "fp_test")
