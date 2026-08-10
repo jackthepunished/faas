@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -258,6 +259,92 @@ func TestCmdSignup_DispatchesFromMain(t *testing.T) {
 	// integration path on the cli_login_test.go family.
 	if dispatchSignup != "signup" {
 		t.Errorf("dispatchSignup = %q, want %q", dispatchSignup, "signup")
+	}
+}
+
+// TestCmdSignup_Interactive_PipeReadsPlain: when stdin is a pipe
+// (testOnlyTTY=false, the CI default), signupInteractive routes the
+// password read through readPasswordLineFrom — the same path the
+// pre-fix code used. This locks in that the TTY-gated silent-echo
+// refactor (G10) does NOT regress the pipe/redirect branch: exit 0,
+// counter.signup == 1, token saved = signupPlaintext. The TTY branch
+// itself (term.ReadPassword) is unreachable from the Go test suite
+// because a pipe fd reports IsTerminal==false; we cover it in a
+// manual smoke step in the PR body.
+func TestCmdSignup_Interactive_PipeReadsPlain(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	// No withTTYForTest — pipeStdin sets osStdin to a non-*os.File
+	// reader, so readInteractivePassword lands in the line-read
+	// branch by virtue of the type assertion failing.
+	pipeStdin(t, "alice@example.com\ncorrect-horse-battery-staple\ncorrect-horse-battery-staple\n")
+
+	if got := cmdSignup(nil); got != 0 {
+		t.Fatalf("cmdSignup exit = %d, want 0 (pipe path regression)", got)
+	}
+	if c := atomic.LoadInt32(&counter.signup); c != 1 {
+		t.Errorf("/v1/auth/signup hit %d times, want 1", c)
+	}
+	if got := readSavedToken(t); got != signupPlaintext {
+		t.Errorf("saved token = %q, want %q", got, signupPlaintext)
+	}
+}
+
+// TestReadInteractivePassword_FallsBackOnNonFile: the helper's TTY
+// gate is `if f, ok := osStdin.(*os.File); ok && term.IsTerminal(int(f.Fd()))`.
+// When osStdin is a non-file reader (pipe, bytes.Buffer, …) the type
+// assertion fails and the helper returns the line it read. This test
+// is the unit-level regression guard for the silent-echo refactor: the
+// helper must NOT crash on a non-file reader, must return the same
+// trimmed line as readPasswordLineFrom, and must NOT print to stderr
+// twice (no trailing newline from the silent-echo branch).
+func TestReadInteractivePassword_FallsBackOnNonFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	prev := osStdin
+	t.Cleanup(func() { osStdin = prev })
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { r.Close() })
+	osStdin = r
+
+	go func() {
+		defer w.Close()
+		_, _ = w.WriteString("correct-horse-battery-staple\n")
+	}()
+
+	rd, restore := captureStderr(t)
+	defer restore()
+
+	br := bufio.NewReader(osStdin)
+	got, err := readInteractivePassword(br, "Password: ")
+	if err != nil {
+		t.Fatalf("readInteractivePassword: %v", err)
+	}
+	if got != "correct-horse-battery-staple" {
+		t.Errorf("got %q, want %q", got, "correct-horse-battery-staple")
+	}
+	// The line-read branch does NOT print a trailing newline — the
+	// user-typed \n is consumed by br.ReadString('\n') and then
+	// trimmed by strings.TrimRight. Stderr should contain ONLY the
+	// "Password: " prompt, no newline. The silent-echo branch is
+	// the one that prints an extra \n so the next prompt lands on a
+	// fresh line; if we accidentally wired that emit to the non-TTY
+	// path, this assertion would fail.
+	if got := rd.String(); got != "Password: " {
+		t.Errorf("stderr = %q, want %q", got, "Password: ")
 	}
 }
 
