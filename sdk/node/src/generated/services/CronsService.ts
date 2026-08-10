@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { CreateCronRequest } from '../models/CreateCronRequest.js';
 import type { CronResponse } from '../models/CronResponse.js';
+import type { FireCronResponse } from '../models/FireCronResponse.js';
 import type { ListCronRunsResponse } from '../models/ListCronRunsResponse.js';
 import type { UpdateCronRequest } from '../models/UpdateCronRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
@@ -180,6 +181,65 @@ export class CronsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Manually fire a cron now (bypasses the schedule boundary).
+   * Issue #791 PR-C / ADR-090. Inserts a pending row into
+   * `cron_fire_now_requests` and emits `db.NotifyCronRunNow`;
+   * schedd claims the row on the next LISTEN delivery and calls
+   * `RunCronNow` in its own process. The response is the
+   * immediate 202 with the request id; the customer's
+   * `GET /v1/crons/{id}/runs` will surface the matching
+   * `cron.fired.manually` audit row once schedd stamps the
+   * terminal state.
+   *
+   * Idempotent: a replay with the same Idempotency-Key returns
+   * the stored 202 without enqueuing a second fire.
+   *
+   * Scoped to `deploy:write` (or `admin`); no new `cron:write`
+   * scope is added (ADR-090 §Sub-decisions 1). The fire does
+   * NOT shift `last_fired_at` — the next scheduled boundary is
+   * unaffected.
+   *
+   * @returns FireCronResponse Fire-now enqueued. The request_id is the durable handle.
+   * @throws ApiError
+   */
+  public static fireCron({
+    id,
+    idempotencyKey,
+  }: {
+    /**
+     * The cron id (UUID hex, no dashes).
+     */
+    id: string,
+    /**
+     * Replay token. A duplicate (account, key) pair returns the
+     * stored 202 with the original request id.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<FireCronResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/crons/{id}/run',
+      path: {
+        'id': id,
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        402: `Plan tier does not include cron support (e.g. Free plan).`,
+        404: `code: not_found`,
+        410: `The cron is disabled.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

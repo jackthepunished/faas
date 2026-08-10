@@ -90,6 +90,7 @@ export type { EdgeRuleRedirectAction } from './models/EdgeRuleRedirectAction.js'
 export type { EdgeRuleResponse } from './models/EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './models/EdgeRuleRewriteAction.js';
 export type { EdgeRuleRouteAction } from './models/EdgeRuleRouteAction.js';
+export type { FireCronResponse } from './models/FireCronResponse.js';
 export type { GdprAuditExportResponse } from './models/GdprAuditExportResponse.js';
 export type { GraceWindowResponse } from './models/GraceWindowResponse.js';
 export type { Id32 } from './models/Id32.js';
