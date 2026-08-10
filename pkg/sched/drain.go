@@ -26,6 +26,33 @@ var ErrPermanentInvoke = errors.New("sched: permanent invoke error")
 // implementation; the drain short-circuits to state='failed'.
 var ErrPermanentWake = errors.New("sched: permanent wake error")
 
+// ErrDispatchTimeout is the sentinel a wake or invoke path wraps when
+// the failure was a blown deadline rather than a rejection — a gateway
+// 504, an expired claim lease, or a context deadline. It exists purely
+// so the durable outcome (issue #791, migrations/00166) can say
+// "timeout" instead of the undifferentiated "failed", which is what
+// makes the per-cron run history able to render a distinct timeout
+// row. It says nothing about retryability: a timeout may be transient
+// or permanent, and that decision stays with ErrPermanentWake /
+// ErrPermanentInvoke.
+var ErrDispatchTimeout = errors.New("sched: dispatch timeout")
+
+// failOutcome classifies a dispatch error for the durable outcome
+// column. Deliberately sentinel-based (errors.Is) rather than
+// string-matching the error text: last_error is operator-facing and
+// unversioned, and the two producers already vary their prefixes
+// ("wake: " / "invoke: ").
+//
+// context.DeadlineExceeded is folded in because both the engine's
+// Wake and the gateway's Invoke surface a blown context that way
+// without necessarily wrapping our own sentinel.
+func failOutcome(err error) state.FailOption {
+	if errors.Is(err, ErrDispatchTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return state.WithOutcome(state.OutcomeTimeout)
+	}
+	return state.WithOutcome(state.OutcomeFailed)
+}
+
 // Drain is the Move 1 event-shaped scheduler. It walks due rows from
 // the unified invocations table (async_invoke / queue / delayed_task /
 // cron) and dispatches them through the wake gate. Cron rows arrive
@@ -283,7 +310,7 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 		if errors.Is(err, ErrPermanentWake) {
 			retryAfter = 0
 		}
-		_ = d.store.FailInvocation(ctx, inv.ID, "wake: "+err.Error(), retryAfter, d.queueAttemptBudget(ctx, inv))
+		_ = d.store.FailInvocation(ctx, inv.ID, "wake: "+err.Error(), retryAfter, d.queueAttemptBudget(ctx, inv), failOutcome(err))
 		d.log.Warn("drain: wake", "inv", inv.ID, "err", err, "permanent", retryAfter == 0)
 		return
 	}
@@ -310,7 +337,7 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 		if errors.Is(err, ErrPermanentInvoke) {
 			retryAfter = 0
 		}
-		_ = d.store.FailInvocation(ctx, inv.ID, "invoke: "+err.Error(), retryAfter, d.queueAttemptBudget(ctx, inv))
+		_ = d.store.FailInvocation(ctx, inv.ID, "invoke: "+err.Error(), retryAfter, d.queueAttemptBudget(ctx, inv), failOutcome(err))
 		d.log.Warn("drain: invoke", "inv", inv.ID, "inst", wakeRes.InstanceID, "err", err, "permanent", retryAfter == 0)
 		return
 	}

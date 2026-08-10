@@ -2344,6 +2344,63 @@ type ListInvocationsResponse struct {
 	Invocations []Invocation `json:"invocations"`
 }
 
+// --- Issue #791 — cron run history ----------------------------------
+
+// CronRunOutcome is the normalized result of a single cron fire. It
+// mirrors state.InvocationOutcome plus the synthetic "running" value
+// the API substitutes for a NULL outcome, so a client never has to
+// handle an empty string.
+type CronRunOutcome string
+
+const (
+	// CronRunSuccess — the fire completed.
+	CronRunSuccess CronRunOutcome = "success"
+	// CronRunFailed — the fire failed permanently for a reason other
+	// than a deadline.
+	CronRunFailed CronRunOutcome = "failed"
+	// CronRunTimeout — the fire exceeded its deadline (gateway 504 or
+	// an expired dispatch lease).
+	CronRunTimeout CronRunOutcome = "timeout"
+	// CronRunDeadLetter — the per-plan retry budget was exhausted.
+	CronRunDeadLetter CronRunOutcome = "dead_letter"
+	// CronRunRunning — the fire is still in flight (the underlying
+	// invocation row is non-terminal and carries no outcome).
+	CronRunRunning CronRunOutcome = "running"
+)
+
+// CronRun is one row of a cron's execution history: GET
+// /v1/crons/{id}/runs.
+//
+// Deliberately NOT the full Invocation shape. A cron run is a narrow
+// question — did it work, when, and for how long — and the caller
+// should not have to know that runs are stored as invocations, nor
+// subtract two timestamps to get a duration. Keeping the projection
+// separate also means the invocations row can gain or lose fields
+// without churning the cron surface.
+type CronRun struct {
+	ID string `json:"id"`
+	// StartedAt is the underlying invocation's created_at — when the
+	// cron fired, not when the app began executing.
+	StartedAt   time.Time  `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// DurationMs is completed_at - started_at, computed server-side.
+	// nil while the run is still in flight.
+	DurationMs *int64         `json:"duration_ms,omitempty"`
+	Outcome    CronRunOutcome `json:"outcome"`
+	// Attempts is the dispatch count; > 1 means the row was retried.
+	Attempts   int    `json:"attempts"`
+	InstanceID string `json:"instance_id,omitempty"`
+	// Error is the operator-facing failure text. Unstructured and
+	// unversioned — branch on Outcome, never on this string.
+	Error string `json:"error,omitempty"`
+}
+
+// ListCronRunsResponse is the wire shape for GET /v1/crons/{id}/runs.
+// Ordered newest-first; page with ?before=<id of the last row>.
+type ListCronRunsResponse struct {
+	Runs []CronRun `json:"runs"`
+}
+
 // --- Issue #394 — queue introspection -------------------------------
 //
 // QueueStateResponse is the read-only depth/stats contract for

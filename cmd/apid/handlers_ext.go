@@ -1747,6 +1747,79 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// listCronRuns is the per-cron execution history (issue #791):
+// GET /v1/crons/{id}/runs.
+//
+// Answers "did my last N fires work, and how long did they take" —
+// the question /v1/invocations cannot express, because it has no
+// cron_id filter and no server-side duration.
+//
+// Ownership uses the same two-step as updateCron/deleteCron: resolve
+// the cron, then resolve its app and compare account ids. Both
+// failure branches emit the identical "no such cron" 404 so a probe
+// cannot distinguish "wrong id" from "someone else's cron".
+func (s *server) listCronRuns(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	c, err := s.store.CronByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such cron")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), c.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such cron")
+		return
+	}
+	limit, perr := parseCronRunsLimit(r)
+	if perr != nil {
+		api.WriteProblem(w, perr)
+		return
+	}
+	rows, err := s.store.ListCronRunsForCron(r.Context(), id, limit, r.URL.Query().Get("before"))
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list cron runs"))
+		return
+	}
+	runs := make([]api.CronRun, 0, len(rows))
+	for _, inv := range rows {
+		runs = append(runs, cronRunFromInvocation(inv))
+	}
+	writeJSON(w, http.StatusOK, api.ListCronRunsResponse{Runs: runs})
+}
+
+// cronRunFromInvocation projects an invocations row onto the narrow
+// CronRun wire shape. Two translations matter:
+//
+//   - duration is computed here rather than by the client, so every
+//     consumer agrees on the definition (completed_at - created_at,
+//     i.e. enqueue-to-terminal, which includes wake time).
+//   - a NULL outcome means the row is non-terminal, which the wire
+//     reports as "running" rather than an empty string.
+func cronRunFromInvocation(inv state.Invocation) api.CronRun {
+	run := api.CronRun{
+		ID:          inv.ID,
+		StartedAt:   inv.CreatedAt,
+		CompletedAt: inv.CompletedAt,
+		Attempts:    inv.Attempts,
+		InstanceID:  inv.InstanceID,
+		Error:       inv.LastError,
+		Outcome:     api.CronRunRunning,
+	}
+	if inv.Outcome != nil {
+		run.Outcome = api.CronRunOutcome(*inv.Outcome)
+	}
+	if inv.CompletedAt != nil {
+		ms := inv.CompletedAt.Sub(inv.CreatedAt).Milliseconds()
+		// Clamp: a clock step between the insert default and the
+		// terminal update can otherwise surface a negative duration.
+		if ms < 0 {
+			ms = 0
+		}
+		run.DurationMs = &ms
+	}
+	return run
+}
+
 // --- api keys --------------------------------------------------------------
 
 func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
@@ -3378,6 +3451,34 @@ func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time
 		}
 	}
 	return month, before, limit, nil
+}
+
+// parseCronRunsLimit validates the ?limit= query string for
+// GET /v1/crons/{id}/runs. Default 10; clamped 1..100. Bad input is
+// surfaced as a 400 Problem with limit + observed + docs URL so
+// clients see the misconfiguration instead of silently falling back
+// to the default (which masks their bug). Mirrors the invoice
+// helper above; kept as a separate function because cron's `before`
+// is an invocation id, not a timestamp — that parsing belongs with
+// the storage layer's cursor handling.
+func parseCronRunsLimit(r *http.Request) (int, *api.Problem) {
+	const limitMax = 100
+	limit := 10
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 1 || n > limitMax {
+			observed := int64(0)
+			if perr == nil {
+				observed = int64(n)
+			}
+			return 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad limit", "expected 1..100").
+				WithLimit(int64(limitMax), observed).
+				WithDocs("https://" + wire.DocsHost + "/crons#runs")
+		}
+		limit = n
+	}
+	return limit, nil
 }
 
 // invoiceResponse maps state.Invoice to the API DTO. Direct field

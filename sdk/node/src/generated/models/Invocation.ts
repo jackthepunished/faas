@@ -9,8 +9,8 @@ export type Invocation = {
   id: string;
   app_id: string;
   account_id: string;
-  source: 'async_invoke' | 'queue' | 'delayed_task' | 'cron';
-  state: 'pending' | 'dispatching' | 'completed' | 'failed' | 'cancelled';
+  source: 'async_invoke' | 'queue' | 'delayed_task' | 'cron' | 'replay';
+  state: 'pending' | 'dispatching' | 'completed' | 'failed' | 'cancelled' | 'dead_letter';
   method?: string;
   path?: string;
   payload?: Record<string, any>;

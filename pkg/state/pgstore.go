@@ -6070,7 +6070,7 @@ func (s *PgStore) CountFailedInvocationsSince(ctx context.Context, accountID, ap
 const invocationSelectCols = `id, app_id, account_id, source, state, method, path,
        payload, headers, due_at, scheduled_at, cron_id, ack_url,
        result, lease_expires_at, received_at, completed_at, attempts,
-       last_error, created_at, instance_id`
+       last_error, created_at, instance_id, outcome`
 
 func (s *PgStore) EnqueueInvocation(ctx context.Context, inv Invocation) (Invocation, error) {
 	payload, err := jsonOrEmpty(inv.Payload)
@@ -6203,9 +6203,12 @@ func (s *PgStore) ClaimInvocation(ctx context.Context, id, instanceID string, le
 }
 
 func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json.RawMessage) error {
+	// outcome (issue #791) is stamped alongside state so the cron
+	// run-history read never has to infer success from state.
 	tag, err := s.pool.Exec(ctx, `
 		update invocations
 		   set state = 'completed',
+		       outcome = 'success',
 		       completed_at = now(),
 		       received_at = coalesce(received_at, now()),
 		       result = coalesce($2, result)
@@ -6219,7 +6222,7 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 	return nil
 }
 
-func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int) error {
+func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int, opts ...FailOption) error {
 	// Issue #394 — dead-letter path. When retryAfter > 0 and budget > 0
 	// and attempts is already at the ceiling (ClaimInvocation already
 	// bumped attempts to the current attempt count — see pgstore.go
@@ -6244,6 +6247,13 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 	//                                          does not apply.
 	var query string
 	var args []any
+	// issue #791 — outcome. The permanent branch stamps the caller's
+	// classification (default 'failed', 'timeout' from the drain's
+	// deadline paths); the transient branch clears it because the row
+	// returns to a non-terminal state; the dead-letter arm of the
+	// budget CASE stamps 'dead_letter' regardless of what the caller
+	// asked for, mirroring how that branch already overrides state.
+	failOpts := ApplyFailOptions(opts)
 	switch {
 	case retryAfter > 0 && budget > 0:
 		// Same int→text concat workaround as ClaimInvocation: pass
@@ -6254,6 +6264,7 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 		retryText := strconv.FormatInt(retryAfter.Microseconds(), 10) + " microseconds"
 		query = `update invocations
 				    set state = case when attempts >= $4 then 'dead_letter' else 'pending' end,
+				        outcome = case when attempts >= $4 then 'dead_letter' else null end,
 				        due_at = case when attempts >= $4 then due_at else now() + $2::interval end,
 				        completed_at = case when attempts >= $4 then now() else completed_at end,
 				        lease_expires_at = null,
@@ -6269,6 +6280,7 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 		retryText := strconv.FormatInt(retryAfter.Microseconds(), 10) + " microseconds"
 		query = `update invocations
 				    set state = 'pending',
+				        outcome = null,
 				        due_at = now() + $2::interval,
 				        lease_expires_at = null,
 				        last_error = $3,
@@ -6278,10 +6290,11 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 	default:
 		query = `update invocations
 				    set state = 'failed',
+				        outcome = $3,
 				        completed_at = now(),
 				        last_error = $2
 				  where id = $1 and state in ('dispatching','pending')`
-		args = []any{id, lastError}
+		args = []any{id, lastError, string(failOpts.Outcome)}
 	}
 	tag, err := s.pool.Exec(ctx, query, args...)
 	if err != nil {
@@ -6419,6 +6432,46 @@ func (s *PgStore) ListInvocationsForApp(ctx context.Context, appID string, state
 		where app_id = $1
 		  and state = any($2::text[])
 		order by created_at desc, id desc`, appID, stateStrs)
+	if err != nil {
+		return nil, err
+	}
+	return scanInvocations(rows)
+}
+
+// ListCronRunsForCron is the per-cron run-history read (issue #791)
+// behind GET /v1/crons/{id}/runs. Index-backed by
+// invocations_cron_idx (migrations/00166), whose
+// `(cron_id, created_at DESC) WHERE cron_id IS NOT NULL` shape matches
+// this predicate and ORDER BY exactly.
+//
+// The cursor is the same opaque `before`-is-an-id convention as
+// ListInvocationsForAccount, including the correlated subselect that
+// resolves the cursor row's created_at. It intentionally does NOT
+// re-check ownership: the caller has already proven the cron belongs
+// to it (apid's listCronRuns runs the CronByID → AppByID → AccountID
+// check first), and the cron_id filter is total — a row can belong to
+// exactly one cron.
+func (s *PgStore) ListCronRunsForCron(ctx context.Context, cronID string, limit int, before string) ([]Invocation, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	var rows pgx.Rows
+	var err error
+	if before == "" {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where cron_id = $1
+			order by created_at desc, id desc
+			limit $2`, cronID, limit)
+	} else {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where cron_id = $1
+			  and created_at < (
+			      select created_at from invocations where id = $2 and cron_id = $1)
+			order by created_at desc, id desc
+			limit $3`, cronID, before, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -6661,11 +6714,12 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 	var scheduledAt, leaseExpires, receivedAt, completedAt *time.Time
 	var cronID, ackURL, lastErr, instanceID *string
 	var payload, headers, result []byte
+	var outcome *string
 	if err := scan(
 		&inv.ID, &inv.AppID, &inv.AccountID, &source, &state, &inv.Method, &inv.Path,
 		&payload, &headers, &inv.DueAt, &scheduledAt, &cronID, &ackURL,
 		&result, &leaseExpires, &receivedAt, &completedAt, &inv.Attempts,
-		&lastErr, &inv.CreatedAt, &instanceID,
+		&lastErr, &inv.CreatedAt, &instanceID, &outcome,
 	); err != nil {
 		return Invocation{}, err
 	}
@@ -6704,6 +6758,10 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 	}
 	if instanceID != nil {
 		inv.InstanceID = *instanceID
+	}
+	if outcome != nil {
+		o := InvocationOutcome(*outcome)
+		inv.Outcome = &o
 	}
 	return inv, nil
 }
