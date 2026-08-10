@@ -29,7 +29,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00168_AppSecretsKid(t *testing.T) {
+func TestMigrations_00169_AppSecretsKid(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
