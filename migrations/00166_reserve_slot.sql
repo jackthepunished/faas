@@ -12,10 +12,14 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- Tier A9 / ADR-089 (PR #797) lands at 00168; this fence holds
--- slot 166 for PR #799 (edge_rules) which dropped here mid-review.
--- Whichever PR lands first deletes its corresponding fence on
--- the next rebase per ADR-041.
+-- Issue #297 Tier A10 (PR #798, ADR-088) renumbered its apps.overflow_node
+-- migration from 00165 (which collided with origin/main's
+-- 00165_build_provenance_framework_version.sql landed by a parallel
+-- PR) to slot 00167. Slot 00166 is also claimed by three other open
+-- PRs (#795 invocations_outcome, #797 compute_nodes_public_ip,
+-- #799 edge_rules). Whichever of those lands first deletes this
+-- 00166 fence on its next rebase per ADR-041, exposing the
+-- neighbour slot for the next sibling.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change.

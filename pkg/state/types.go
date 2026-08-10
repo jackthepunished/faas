@@ -465,6 +465,21 @@ type App struct {
 	// backfill target for every pre-Phase-2 row, so single-box
 	// installs preserve bit-for-bit behaviour.
 	NodeID string
+	// OverflowNode is the customer's per-app preferred spill
+	// target (Tier A10, ADR-088, migration 00167). When set, the
+	// Tier A9 capacity-pressure rebalancer consults it BEFORE
+	// falling back to the first-peer-with-headroom selection.
+	// Nullable: a NULL app is the "no preference" default — the
+	// engine behaves exactly like A9 (random first peer with
+	// headroom, sorted by name ASC). UNSET-uuid is rejected by
+	// apps_overflow_node_chk (migration 00167) as a tripwire
+	// against buggy INSERT paths. The wire field is the
+	// human-readable compute_nodes.name; apid resolves the name
+	// to the UUID server-side via Store.ComputeNodeByName
+	// (cmd/apid/compute_nodes.go:250). FK cascades ON DELETE SET
+	// NULL — draining a node clears the preference, never
+	// orphans it.
+	OverflowNode *string
 	// ReassignedAt is the wall-clock time of the most recent
 	// successful cross-node reassignment (Tier A4, migration
 	// 00095). Stamped by Store.ReassignAppOwner in the same
@@ -2138,6 +2153,17 @@ type UpdateAppParams struct {
 	// legacy readers don't see a stale floor).
 	ScalingPolicy    *ScalingPolicy
 	SetScalingPolicy bool
+	// OverflowNode (issue Tier A10 / ADR-088) is the customer's
+	// per-app preferred spill target (compute_node UUID). Apid
+	// has already resolved the wire name → UUID server-side
+	// (cmd/apid/handlers_ext.go::validateUpdateApp). Set bit
+	// distinguishes "unset" (don't touch the column) from
+	// "explicit NULL" (clear — back to A9 default fallback). The
+	// store is a plain column write; the empty-uuid CHECK +
+	// FK with ON DELETE SET NULL (migration 00167) cover the
+	// identity + ON-cascade contract.
+	OverflowNode    *string
+	SetOverflowNode bool
 }
 
 // AppPublicAuthUpdate (issue #477 / ADR-079) is the

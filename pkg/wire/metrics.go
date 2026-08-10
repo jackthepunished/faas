@@ -938,6 +938,25 @@ type OpsMetrics struct {
 	// instantiated at boot so the rows surface in /metrics from
 	// the moment schedd starts.
 	pressureReassignmentsTotal *prometheus.CounterVec
+	// overflowTargetSpillHitsTotal: Tier A10 / ADR-088
+	// per-app overflow_node preference observability. Counter
+	// labelled by outcome ∈ {used, unavailable, fallback_used} —
+	// the closed set the pressure-rebalancer's overflow-peer
+	// resolution path can land in once per app per sweep.
+	// `used` = the customer's preferred overflow_node had
+	// headroom and the engine reassigned to it; `unavailable` =
+	// the preferred node was inactive / no headroom / no longer
+	// exists (the engine fell through to the A9 first-peer-with-
+	// headroom path); `fallback_used` = the fallback path
+	// actually landed an assignment after an `unavailable`
+	// observation. The first two are the tripwires for "is the
+	// preference honoured?"; the third answers "did the
+	// fallback save the sweep?" so a high
+	// `unavailable` + low `fallback_used` rate is the
+	// sustained-full-cluster-pressure tripwire. Single-registry:
+	// registered on every daemon; only schedd increments via
+	// OverflowTargetSpillHits.
+	overflowTargetSpillHitsTotal *prometheus.CounterVec
 	// migratingReconcileDecisions: Tier A6 / ADR-067
 	// migrating-instance watchdog observability. Counter labelled
 	// by outcome ∈ {reinvited, hard_deleted, conflict, error} —
@@ -1220,8 +1239,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_pressure_reassignments_total",
 		Help: "Cross-node capacity-pressure rebalance decisions (Tier A9 / ADR-087), labelled by outcome ∈ {migrated, peer_live_migrated, conflict, no_headroom, no_eligibility, no_peer}. `migrated` is the §12 dashboard panel (sum over 5m for the rate); `peer_live_migrated` is the tripwire for the policy gate opening the four-phase live handoff (ADR-066) on the pressure path; `no_headroom` is the tripwire for sustained full-cluster pressure (call the operator). Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via PressureReassignments.",
 	}, []string{"outcome"})
-	for _, outcome := range []string{"migrated", "peer_live_migrated", "conflict", "no_headroom", "no_eligibility", "no_peer"} {
+	for _, outcome := range []string{"migrated", "peer_live_migrated", "conflict", "no_headroom", "no_eligibility", "no_peer", "overflow_target_unavailable"} {
 		pressureReassignmentsTotal.WithLabelValues(outcome)
+	}
+	// ADR-088 / Tier A10: per-app overflow_node preference
+	// observability. New CounterVec (separate from
+	// pressureReassignmentsTotal) so a Grafana panel can branch
+	// "preference honoured?" vs "did the engine move the app at
+	// all?" without reading the same series with two queries.
+	// outcome ∈ {used, unavailable, fallback_used} — closed set
+	// pre-instantiated at boot so the rows surface in /metrics
+	// from the moment schedd starts (matching the
+	// pressureReassignmentsTotal pattern above).
+	overflowTargetSpillHitsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_overflow_target_spill_hits_total",
+		Help: "Per-app overflow_node preference resolution outcomes (Tier A10 / ADR-088), labelled by outcome ∈ {used, unavailable, fallback_used}. `used` = the customer's preferred overflow_node had headroom and the engine reassigned to it; `unavailable` = the preferred node was inactive / no headroom / no longer exists (the engine fell through to the A9 first-peer-with-headroom path); `fallback_used` = the fallback path actually landed an assignment after an `unavailable` observation. The first two are the tripwires for 'is the preference honoured?'; the third answers 'did the fallback save the sweep?' so a high `unavailable` + low `fallback_used` rate is the sustained-full-cluster-pressure tripwire. Single-registry: registered on every daemon; only schedd increments via OverflowTargetSpillHits.",
+	}, []string{"outcome"})
+	for _, outcome := range []string{"used", "unavailable", "fallback_used"} {
+		overflowTargetSpillHitsTotal.WithLabelValues(outcome)
 	}
 	eventsWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_events_write_failures_total",
@@ -1990,6 +2025,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// deadNodeReconcileDecisions); only schedd increments via
 	// PressureReassignments in production.
 	commonCollectors = append(commonCollectors, pressureReassignmentsTotal)
+	// ADR-088 / Tier A10: per-app overflow_node preference
+	// observability. Single-registry: registered on every
+	// daemon; only schedd increments via OverflowTargetSpillHits
+	// in production.
+	commonCollectors = append(commonCollectors, overflowTargetSpillHitsTotal)
 	// ADR-087 / Tier A9: per-(app, kind) AtCapacity trigger counter.
 	// Single-registry: registered on every daemon (mirrors
 	// deadNodeReconcileDecisions); only schedd increments via
@@ -2424,6 +2464,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		migratingReconcileDecisions:        migratingReconcileDecisions,
 		appAtCapacityTotal:                 appAtCapacityTotal,
 		pressureReassignmentsTotal:         pressureReassignmentsTotal,
+		overflowTargetSpillHitsTotal:       overflowTargetSpillHitsTotal,
 		activePassiveFailoversTotal:        activePassiveFailoversTotal,
 		standbyState:                       standbyState,
 		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
@@ -2676,6 +2717,26 @@ func (m *OpsMetrics) PressureReassignments(outcome string) prometheus.Counter {
 		return nil
 	}
 	return m.pressureReassignmentsTotal.WithLabelValues(outcome)
+}
+
+// OverflowTargetSpillHits returns the per-(outcome) counter the
+// Tier A10 / ADR-088 pressure-rebalancer increments once per app
+// per sweep when an overflow_node preference was consulted.
+// outcome ∈ {used, unavailable, fallback_used}. `used` is the
+// happy path (the preferred node had headroom and the engine
+// reassigned to it); `unavailable` is the spill-out tripwire
+// (the preferred node was inactive, full, or gone — the engine
+// fell through to the A9 first-peer-with-headroom path);
+// `fallback_used` answers "did the fallback save the sweep?"
+// after an `unavailable` observation. A high `unavailable` rate
+// with a low `fallback_used` rate is the sustained-full-cluster-
+// pressure tripwire. Same caching rules as PressureReassignments
+// — the returned Counter is safe to retain.
+func (m *OpsMetrics) OverflowTargetSpillHits(outcome string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.overflowTargetSpillHitsTotal.WithLabelValues(outcome)
 }
 
 // LiveMigrationDecisions returns the labelled counter for the
