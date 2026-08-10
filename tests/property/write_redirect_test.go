@@ -140,6 +140,33 @@ func (f *fakeLeaderClient) Relay(_ context.Context, _ string, _ *http.Request) (
 	}, nil
 }
 
+// fakeMetrics counts increments per (outcome, auth) cell.
+// Property test uses this to pin invariant #2 (exactly one
+// increment per gated request; bypass is silent).
+type fakeMetrics struct {
+	increments map[writegate.AuthKind]map[writegate.WriteOutcome]int
+}
+
+func (m *fakeMetrics) inc(auth writegate.AuthKind, outcome writegate.WriteOutcome) {
+	if m.increments == nil {
+		m.increments = map[writegate.AuthKind]map[writegate.WriteOutcome]int{}
+	}
+	if m.increments[auth] == nil {
+		m.increments[auth] = map[writegate.WriteOutcome]int{}
+	}
+	m.increments[auth][outcome]++
+}
+
+func (m *fakeMetrics) calls() int {
+	total := 0
+	for _, auth := range m.increments {
+		for _, c := range auth {
+			total += c
+		}
+	}
+	return total
+}
+
 // stubIsApidPath mirrors pkg/apid/router.go::IsApidPath.
 // Property test re-implements the predicate locally so the
 // import stays package-light (we don't want the property
@@ -400,9 +427,7 @@ func TestWriteRedirectStandbyRelays(t *testing.T) {
 	// Drive the relay directly. The property test exercises
 	// the dispatch decision; the actual mTLS hop is covered
 	// in pkg/gateway/writegate/leader_client_test.go.
-	if resp, rerr := client.Relay(req.Context(), "https://node-other/v1/apps", req); rerr == nil {
-		_ = resp.Body.Close()
-	}
+	_, _ = client.Relay(req.Context(), "https://node-other/v1/apps", req)
 
 	if got := client.calls.Load(); got != clientCallsBefore+1 {
 		t.Errorf("standby relay: client.calls=%d, want %d (exactly one invocation)",
