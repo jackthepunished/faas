@@ -1762,24 +1762,39 @@ func statusStr(ok bool) string {
 	return "err"
 }
 
+// CronDispatchTrigger labels the source of a cron fire for the audit
+// payload. ADR-090: fire-now adds a second trigger value while the
+// 60s tick keeps the canonical "schedule" path. The Trigger field
+// rides on the audit payload so dashboards can split tick fires from
+// operator fires without parsing a different event name.
+type CronDispatchTrigger string
+
+const (
+	// TriggerSchedule is the canonical 60s tick path. cron.fired
+	// audit rows + MarkCronFired side effects are emitted.
+	TriggerSchedule CronDispatchTrigger = "schedule"
+	// TriggerManual is the fire-now API path. cron.fired.manually
+	// audit rows are emitted; MarkCronFired is NOT called so the
+	// next scheduled fire still lands at the boundary.
+	TriggerManual CronDispatchTrigger = "manual"
+)
+
+// CronRun is the lightweight return shape from a fire-now dispatch.
+// apid renders this as a FireCronResponse; the schedd tick path
+// ignores it (the tick path's caller is runCronTick, which has no
+// audit-response surface).
+type CronRun struct {
+	InvocationID string
+	InstanceID   string
+	Success      bool
+}
+
 func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time) {
 	sched, err := ParseSchedule(c.Schedule)
 	if err != nil {
 		l.log.Warn("cron: bad schedule", "cron_id", c.ID, "err", err)
 		return
 	}
-	// issue #517: mint a fresh request_id at the cron dispatch
-	// boundary so the synthetic request that flows throughgatewayd-internal
-	// carries the same correlation id the rest of the wake
-	// timeline logs use. Stored on ctx so SynthesizeRequest can
-	// stamp it on the outbound x-faas-request-id header, and on
-	// the cron.fired notify payload so an operator query joins
-	// the synthetic request back to the cron that fired it.
-	requestID := middleware.NewRequestID()
-	ctx = wire.WithContext(ctx, wire.CorrelationFields{
-		RequestID: requestID,
-		AppID:     c.AppID,
-	})
 	// Boundary guard: fire iff we've crossed the next-fire boundary
 	// since LastFiredAt. robfig's NextFireAt(from) is exclusive — call
 	// it with LastFiredAt to get the upcoming boundary; if that boundary
@@ -1796,6 +1811,40 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		// Already fired in the current window.
 		return
 	}
+	res, ok := l.dispatchCronLocked(ctx, c, now, TriggerSchedule)
+	_ = res
+	if !ok {
+		return
+	}
+	if err := l.engine.Store().MarkCronFired(ctx, c.ID, now); err != nil {
+		l.log.Warn("cron: mark fired", "cron_id", c.ID, "err", err)
+	}
+}
+
+// dispatchCronLocked is the post-boundary part of the cron fire path.
+// Called by both the 60s tick (trigger=TriggerSchedule) and the
+// fire-now API (trigger=TriggerManual). The deferred audit emit is
+// the only writer of cron.fired* rows — do not duplicate it. The
+// caller decides whether to call MarkCronFired (tick path: yes; fire-now:
+// no, because manual fire must not shift next_fire_at).
+//
+// Returns (CronRun, true) on best-effort completion regardless of
+// success — the second value is true when the audit row was emitted.
+// Returns (CronRun{}, false) when the suspended-account guard rejects
+// the fire (no audit row, per spec §11 abuse guard).
+func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Time, trigger CronDispatchTrigger) (CronRun, bool) {
+	// issue #517: mint a fresh request_id at the cron dispatch
+	// boundary so the synthetic request that flows throughgatewayd-internal
+	// carries the same correlation id the rest of the wake
+	// timeline logs use. Stored on ctx so SynthesizeRequest can
+	// stamp it on the outbound x-faas-request-id header, and on
+	// the cron.fired notify payload so an operator query joins
+	// the synthetic request back to the cron that fired it.
+	requestID := middleware.NewRequestID()
+	ctx = wire.WithContext(ctx, wire.CorrelationFields{
+		RequestID: requestID,
+		AppID:     c.AppID,
+	})
 	// Capture the pre-fire state for the audit row (issue #291
 	// follow-up — schedd emits `cron.fired` after the dispatch path
 	// runs to completion). lastFiredAtBefore is what an operator
@@ -1811,12 +1860,12 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 	app, err := l.engine.Store().AppByID(ctx, c.AppID)
 	if err != nil {
 		l.log.Warn("cron: app", "cron_id", c.ID, "err", err)
-		return
+		return CronRun{}, false
 	}
 	acctRec, err := l.engine.Store().AccountByID(ctx, app.AccountID)
 	if err != nil {
 		l.log.Warn("cron: account", "cron_id", c.ID, "err", err)
-		return
+		return CronRun{}, false
 	}
 	if !acctRec.Active() {
 		// Suspended accounts don't get cron traffic (spec §11 abuse
@@ -1826,7 +1875,7 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		// don't want to surface suspended-account crons in the
 		// per-account audit list (and §5.1's 4xx-invariant covers
 		// the "we didn't fire" semantic too).
-		return
+		return CronRun{}, false
 	}
 	acct = acctRec
 	// Defer the cron.fired emit so ALL post-boundary failure modes
@@ -1837,6 +1886,12 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 	// expected vs actual fires. Best-effort semantics from
 	// pkg/audit.Auditor: never rolls back the underlying state
 	// changes (MarkCronFired, EnqueueInvocation, etc.).
+	//
+	// ADR-090: the trigger field rides on the payload so dashboards
+	// can split tick fires (cron.fired) from operator fires
+	// (cron.fired.manually) without parsing the event name. The
+	// event name itself is split per trigger so audit-event
+	// allowlists can gate on it without consulting the payload.
 	defer func() {
 		if l.audit == nil {
 			return
@@ -1856,15 +1911,20 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 			"status":        statusStr(fireSucceeded),
 			"invocation_id": invocationID,
 			"instance_id":   instanceID,
+			"trigger":       string(trigger),
 		}
 		if !lastFiredAtBefore.IsZero() {
 			payload["last_fired_at_before"] = lastFiredAtBefore.UTC().Format(time.RFC3339Nano)
 		}
-		l.audit.Emit(ctx, "cron.fired", &acct.ID, payload)
+		eventName := "cron.fired"
+		if trigger == TriggerManual {
+			eventName = "cron.fired.manually"
+		}
+		l.audit.Emit(ctx, eventName, &acct.ID, payload)
 	}()
 	if _, err := l.engine.Wake(ctx, c.AppID, ""); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
-		return
+		return CronRun{}, true
 	}
 	// Move 1: write the cron row to invocations so it shows up in
 	// /v1/invocations and the meter sees it. cron_id is stamped so
@@ -1932,7 +1992,7 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 			if err := l.gateway.SynthesizeRequest(ctx, c.AppID, "POST", c.Path); err != nil {
 				l.log.Warn("cron: synthesize (legacy)", "cron_id", c.ID, "err", err)
 				// status="err" via defer; fireSucceeded stays false.
-				return
+				return CronRun{InvocationID: enq.ID}, true
 			}
 		} else if enq.ID != "" {
 			// Stamp the live instance handle + complete the row
@@ -1958,9 +2018,6 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 			instanceID = invokeOut.InstanceID
 		}
 	}
-	if err := l.engine.Store().MarkCronFired(ctx, c.ID, now); err != nil {
-		l.log.Warn("cron: mark fired", "cron_id", c.ID, "err", err)
-	}
 	payload, _ := json.Marshal(map[string]any{
 		"cron_id": c.ID, "app_id": c.AppID, "at": now.UTC().Format(time.RFC3339Nano),
 		// issue #517: thread the synthetic request_id so a dashboard
@@ -1971,4 +2028,51 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 	if err := l.engine.Notifier().Notify(ctx, db.NotifyCronFired, string(payload)); err != nil {
 		l.log.Warn("cron: notify cron_fired", "err", err)
 	}
+	return CronRun{InvocationID: invocationID, InstanceID: instanceID, Success: fireSucceeded}, true
+}
+
+// ErrCronDisabled is the typed error returned by RunCronNow when
+// the cron row exists but Enabled=false. apid maps this to a 410
+// Gone with stable code `cron_disabled` (pkg/api/errors.go).
+var ErrCronDisabled = errors.New("sched: cron disabled")
+
+// ErrAccountSuspended is the typed error returned by RunCronNow
+// when the dispatchCronLocked path rejects the fire under the
+// suspended-account guard (spec §11 abuse guard). apid maps this
+// to a 403 with stable code `account_suspended`. The audit row is
+// NOT emitted in this branch (matches the tick path's behaviour).
+var ErrAccountSuspended = errors.New("sched: account suspended")
+
+// ErrNoCapacity is the typed error returned by RunCronNow when the
+// dispatch path cannot produce a wake (no RAM headroom, no
+// eligible runner, etc.). apid maps this to a 503 with the
+// existing capacity error shape.
+var ErrNoCapacity = errors.New("sched: no dispatch capacity")
+
+// RunCronNow fires a cron immediately, bypassing the due-time boundary
+// guard. The cron must be Enabled and the account must be Active; the
+// caller (apid's fireCronNow) is responsible for the IDOR-safe ownership
+// check. Returns a CronRun (invocation_id, instance_id, success) on
+// best-effort completion; errors bubble up only for the wire-shape
+// rejections (ErrNoCapacity for the dispatch path). MarkCronFired is
+// NOT called: a manual fire must not shift next_fire_at — that stays
+// owned by the 60s tick path. The audit event is cron.fired.manually
+// (vs. cron.fired for the tick path) and the payload carries the same
+// fields plus trigger="manual".
+func (l *Loop) RunCronNow(ctx context.Context, cronID, accountID string) (CronRun, error) {
+	c, err := l.engine.Store().CronByID(ctx, cronID)
+	if err != nil {
+		return CronRun{}, err
+	}
+	if !c.Enabled {
+		return CronRun{}, ErrCronDisabled
+	}
+	now := l.now()
+	if _, ok := l.dispatchCronLocked(ctx, c, now, TriggerManual); !ok {
+		// Suspended-account guard rejects the fire. The deferred
+		// audit emit does not run (no row written), so fail
+		// closed at the API surface.
+		return CronRun{}, ErrAccountSuspended
+	}
+	return CronRun{Success: true}, nil
 }
