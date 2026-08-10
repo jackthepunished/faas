@@ -797,6 +797,18 @@ func (s *server) handler() http.Handler {
 	// powerful as the min_instances PATCH (Σ rebalance affects
 	// sibling live rows in the same app).
 	mux.HandleFunc("PATCH /v1/deployments/{id}/traffic", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateDeploymentTraffic))))
+	// Builds (DEPLOY-PROV-6 / ADR-089, issue #741). Lifecycle
+	// surface — returns status, timestamps, failure_class,
+	// server-computed duration_seconds for a build id. Companion
+	// to the ADR-038 /v1/builds/{id}/provenance (post-mortem
+	// export) and /v1/builds/{id}/sbom (post-mortem blob) routes;
+	// this one is what CI scripts call to fail-fast on build
+	// error without scraping SSE. Same auth (api.ScopesReadSurface)
+	// + same IDOR-safe Build → Deployment → App → AccountID check
+	// as the sibling routes. The status field is the existing
+	// 4-state enum (queued|running|succeeded|failed); see ADR-089
+	// §1 for why 'cancelled' is out of scope.
+	mux.HandleFunc("GET /v1/builds/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuild)))
 	// Builds (ADR-038). The provenance route is the only /v1/builds
 	// surface today; deployments.id remains the parent resource.
 	// Build:read scope (api.ScopesReadSurface) gates the read.

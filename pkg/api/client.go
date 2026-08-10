@@ -525,6 +525,26 @@ func (c *Client) GetBuildsIdSbom(ctx context.Context, id string) ([]byte, error)
 	return out, c.doBytes(ctx, "GET", "/v1/builds/"+id+"/sbom", nil, &out)
 }
 
+// GetBuildsId returns the lifecycle row for a build id (DEPLOY-PROV-6
+// / ADR-089, issue #741). Backs `gregale build status <id>` and the
+// CLI's SSE fallback pollBuildStatus loop.
+//
+// The 404 surface is "no such build" — both for non-existent ids
+// and for cross-account probes (the server's IDOR chain collapses
+// every negative path to a uniform 404). The SDK propagates the
+// server's *APIError; callers can check apierr.Code() against
+// CodeBuildNotFound when the distinction matters (e.g. for
+// "follow manually" hints in the CLI).
+//
+// Method name: derived by cmd/sdk-coverage/main.go::deriveMethodName
+// from `GET /v1/builds/{id}` → GetBuildsId. Mirrors the existing
+// GetBuildsIdProvenance / GetBuildsIdSbom. No methodRouteMap entry
+// needed; sdk-check fails if the derived name doesn't match.
+func (c *Client) GetBuildsId(ctx context.Context, id string) (BuildResponse, error) {
+	var out BuildResponse
+	return out, c.do(ctx, "GET", "/v1/builds/"+id, nil, &out)
+}
+
 // DeployMultipart ships a source tarball (with optional runtime +
 // handler) to the multipart deploy endpoint. sourceName is the form
 // filename apid sees in the multipart "source" part; pass the

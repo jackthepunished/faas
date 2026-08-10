@@ -2464,6 +2464,51 @@ paths:
   # The provenance route is the only /v1/builds surface today.
   # deployments.id remains the parent resource; Build:read scope
   # (api.ScopesReadSurface) gates the read.
+  #
+  # DEPLOY-PROV-6 / ADR-089 (issue #741) added /v1/builds/{id} as
+  # the LIFECYCLE surface (status, timestamps, failure_class,
+  # duration). Companion to /provenance (post-mortem export) and
+  # /sbom (post-mortem blob). Same auth + same IDOR chain.
+
+  /v1/builds/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getBuild
+      summary: Get build status.
+      description: |
+        Returns the lifecycle row for a build id — current status,
+        enqueued/started/finished timestamps, failure_class (when
+        status='failed'), and a server-computed duration_seconds
+        (only set when both started_at and finished_at are
+        populated). Companion to /v1/builds/{id}/provenance (post-
+        mortem export) and /v1/builds/{id}/sbom (post-mortem
+        blob); this one is the LIFECYCLE surface CI scripts call
+        to fail-fast on build error without scraping SSE.
+
+        The status enum is `queued|running|succeeded|failed` (the
+        builds_status_check CHECK constraint; no 'cancelled' value).
+        failure_class, when present, is one of `oom|timeout|
+        user_error|infra` (the builds_failure_class_check CHECK
+        constraint). error_message is intentionally NOT in the
+        response — it lives on deployments; call GET
+        /v1/deployments/{id} for the per-failure string.
+      responses:
+        '200':
+          description: Build lifecycle row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BuildResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            `404 Not Found` — the build id does not exist OR
+            belongs to another account. Stable code
+            `build_not_found`. The 404 surface is uniform so
+            cross-account probes can't enumerate.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/builds/{id}/provenance:
     parameters:
@@ -6932,6 +6977,52 @@ components:
         finished_at: { type: string, format: date-time }
         sbom_storage_key: { type: [string, "null"], description: "Phase 3 populator fills this from `syft` output. Empty string when not yet populated." }
         framework_version: { type: [string, "null"], description: "Source-declared language version (nodes 22.11.0 / python 3.13 / go 1.24, etc.). Empty string when no version file is present or any parser fails — best-effort, never an error. Added in DEPLOY-PROV-5 / issue #740 / ADR-087." }
+
+    BuildResponse:
+      description: |
+        DEPLOY-PROV-6 / ADR-089 (issue #741): the LIFECYCLE row for
+        a single build — current status, enqueued/started/finished
+        timestamps, failure_class, server-computed duration_seconds.
+        Companion to BuildProvenanceResponse (post-mortem export,
+        ADR-038) and the /sbom route (post-mortem blob, ADR-038
+        Phase 3). The status field mirrors builds.status — a
+        4-state enum `queued|running|succeeded|failed` per the
+        `builds_status_check` CHECK constraint. 'cancelled' is
+        intentionally absent (ADR-089 §1).
+
+        failure_class is the low-cardinality enum
+        `oom|timeout|user_error|infra` per the
+        `builds_failure_class_check` CHECK; present only when
+        status='failed'.
+
+        duration_seconds is server-computed (FinishedAt − StartedAt)
+        only when BOTH timestamps are populated; absent otherwise
+        (so a queued/running build stays minimal). CI scripts can
+        rely on its presence as "the build reached a terminal state
+        and elapsed N wall-clock seconds." error_message is
+        intentionally NOT in this response — it lives on
+        deployments; clients that need the per-failure string call
+        GET /v1/deployments/{id}.
+      type: object
+      required:
+        - id
+        - deployment_id
+        - kind
+        - source_bytes
+        - status
+        - enqueued_at
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        deployment_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        kind: { type: string, enum: [railpack, dockerfile, tarball, github] }
+        source_bytes: { type: integer, format: int64 }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        failure_class: { type: string, enum: [oom, timeout, user_error, infra] }
+        log_path: { type: string }
+        enqueued_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        duration_seconds: { type: integer, description: "Server-computed FinishedAt − StartedAt in whole seconds. Absent until the build reaches a terminal state." }
 
     AccountCreditResponse:
       description: |

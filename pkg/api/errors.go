@@ -491,6 +491,14 @@ const (
 	// provenance row is the "populator INSERT failed + WARN logged"
 	// outcome, not a 404 of the build itself.
 	CodeBuildProvenanceNotFound = "build_provenance_not_found"
+	// CodeBuildNotFound is the DEPLOY-PROV-6 / ADR-089 (issue
+	// #741) 404 sentinel for GET /v1/builds/{id} when the build
+	// row does not exist OR belongs to another account. The 404
+	// surface is uniform (the server's IDOR chain collapses every
+	// negative path) so cross-account probes can't enumerate —
+	// distinct from CodeBuildProvenanceNotFound (which means
+	// "build exists, populator INSERT failed").
+	CodeBuildNotFound = "build_not_found"
 
 	// ADR-031 (tier-2 of the network roadmap) — per-app egress
 	// allowlist. Same gate shape as MinInstances: the feature is
@@ -2275,6 +2283,19 @@ func ErrBuildProvenanceNotFound() *Problem {
 		"Build provenance not found",
 		"the build succeeded but no provenance row exists; builderd logged a warning when the populator failed").
 		WithDocs(docsBase + "/builds#provenance")
+}
+
+// ErrBuildNotFound is the DEPLOY-PROV-6 / ADR-089 (issue #741)
+// surface for GET /v1/builds/{id} when the build id is unknown
+// OR belongs to another account. The 404 surface is uniform so
+// cross-account probes can't enumerate — distinct from
+// CodeBuildProvenanceNotFound, which means "the build exists but
+// its provenance populator INSERT failed."
+func ErrBuildNotFound() *Problem {
+	return NewProblem(http.StatusNotFound, CodeBuildNotFound,
+		"No such build",
+		"the build id does not exist, or belongs to another account").
+		WithDocs(docsBase + "/builds#status")
 }
 
 // ErrBuildSBOMUnavailable is the issue #299 / ADR-038 Phase 3 surface
