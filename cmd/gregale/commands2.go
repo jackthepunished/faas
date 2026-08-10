@@ -2379,10 +2379,18 @@ func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentR
 // streamDeployLogs used before DEPLOY-PROV-6 / ADR-089; with a real
 // status endpoint there's no reason to give up after a single GET.
 //
-// Backoff: 1s base, capped at 5s, jittered ±20% to avoid the
+// Backoff: 1s base, capped at 5s, jittered ±10% to avoid the
 // thundering-herd many CI jobs would trigger when they all exit SSE
 // at the same instant. Deadline defaults to 60s; CLI flow currently
 // uses the default — a future --wait flag could override.
+//
+// Context: each iteration derives a per-call context.WithTimeout
+// capped at the remaining budget, so a hung server connection
+// (e.g. server-side stall without an http.Client timeout firing)
+// can't block the loop past the deadline. The SDK's http.Client
+// also enforces a 30s per-call timeout as a second line of
+// defence; both work together so the worst-case wall-clock here
+// is `deadline` even on a pathological server.
 //
 // Returns (BuildResponse, true) on terminal status; (zero, false)
 // on deadline elapse or persistent transient error so the SSE caller
@@ -2395,18 +2403,41 @@ func pollBuildStatus(c *Client, dep api.DeploymentResponse, deadline time.Durati
 		// caller falls through to pollDeploymentFinal.
 		return api.BuildResponse{}, false
 	}
+	// parent context is the wall-clock deadline; per-iteration
+	// children derive from this so the loop honors the budget.
+	parent, cancelParent := context.WithTimeout(context.Background(), deadline)
+	defer cancelParent()
 	end := time.Now().Add(deadline)
 	backoff := 1 * time.Second
 	for time.Now().Before(end) {
-		b, err := c.GetBuildsId(context.Background(), dep.BuildID)
+		// Per-call timeout: remaining budget, capped at the SDK's
+		// 30s per-request timeout (lower of the two wins). Keeps
+		// a single hung request from blocking past deadline.
+		remaining := time.Until(end)
+		if remaining <= 0 {
+			return api.BuildResponse{}, false
+		}
+		callCtx, cancelCall := context.WithTimeout(parent, remaining)
+		b, err := c.GetBuildsId(callCtx, dep.BuildID)
+		cancelCall()
 		if err == nil && (b.Status == buildStatusSucceeded || b.Status == buildStatusFailed) {
 			return b, true
 		}
-		// Jitter ±20% of the current backoff so N concurrent CI
-		// jobs don't wake at the same wall-clock tick. Cheap
-		// pseudo-random via time.Now().UnixNano() avoids a
-		// math/rand import (and its seeding dance in Go 1.20+).
-		jitter := time.Duration(time.Now().UnixNano() % int64(backoff/5))
+		// Jitter ±10% of the current backoff so N concurrent CI
+		// jobs don't wake at the same wall-clock tick. Pseudo-
+		// random via time.Now().UnixNano() avoids a math/rand
+		// import (and its seeding dance in Go 1.20+). The mod
+		// picks magnitude in [0, span); subtracting span/2
+		// recentres it so the signed jitter is symmetric around
+		// zero. Review finding #3 pinned the previous version
+		// (which was always non-negative, producing [0, +20%]
+		// rather than the documented ±20%) — this formula gives
+		// the symmetric ±10% spread the docstring promises.
+		span := int64(backoff / 5)
+		if span < 1 {
+			span = 1
+		}
+		jitter := time.Duration(time.Now().UnixNano()%span) - time.Duration(span/2)
 		time.Sleep(backoff + jitter)
 		if backoff < 5*time.Second {
 			backoff *= 2

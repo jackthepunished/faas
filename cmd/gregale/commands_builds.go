@@ -225,6 +225,16 @@ func cmdBuildStatus(args []string) int {
 // the lifecycle bits customers parse off stdout (status,
 // failure_class, duration_seconds), then the source-marker
 // detail (source_bytes), then the three timestamps.
+//
+// Optional/lifecycle fields render as blank rows when empty
+// rather than the Go zero value — mirrors printProvenance's
+// "auditor wants consistency, not skipped rows" rule. The
+// BuildResponse DTO uses `omitempty` for duration_seconds +
+// started_at + finished_at, so a queued/running build arrives
+// with `0` for duration_seconds (Go int zero) and `""` for
+// the timestamps. Stringifying the int unconditionally would
+// render a misleading `duration_seconds: 0` for a build that's
+// been running for 30s.
 func printBuildStatus(w io.Writer, b api.BuildResponse) {
 	rows := []struct {
 		label, value string
@@ -238,7 +248,13 @@ func printBuildStatus(w io.Writer, b api.BuildResponse) {
 		{"enqueued_at", b.EnqueuedAt},
 		{"started_at", b.StartedAt},
 		{"finished_at", b.FinishedAt},
-		{"duration_seconds", strconv.Itoa(b.DurationSeconds)},
+		// duration_seconds is rendered only when the build reached
+		// a terminal status (server stamps 0 + omitempty otherwise).
+		// Showing a literal `0` here would suggest "this build took
+		// zero seconds" rather than "this build hasn't finished
+		// yet" — both are valid interpretations of the JSON shape,
+		// but only one is the auditor-friendly one.
+		{"duration_seconds", durationSecondsForDisplay(b)},
 	}
 	for _, r := range rows {
 		//nolint:errcheck // tabular printer writes to a typed writer; a failed Fprintf
@@ -246,4 +262,17 @@ func printBuildStatus(w io.Writer, b api.BuildResponse) {
 		// show up as a malformed output and the CLI will exit non-zero on the parse below.
 		fmt.Fprintf(w, "%-22s %s\n", r.label+":", r.value)
 	}
+}
+
+// durationSecondsForDisplay returns "" when the build is still
+// queued or running (server omits the field via omitempty, leaving
+// the Go int zero) and the integer string when terminal. Mirrors
+// the "blank row, not zero row" rule printProvenance follows for
+// the buildkit_version + framework_version columns (DEPLOY-PROV-5,
+// PR #736).
+func durationSecondsForDisplay(b api.BuildResponse) string {
+	if b.Status != buildStatusSucceeded && b.Status != buildStatusFailed {
+		return ""
+	}
+	return strconv.Itoa(b.DurationSeconds)
 }

@@ -146,3 +146,71 @@ func TestPrintBuildStatus_RowOrder(t *testing.T) {
 			idxEnq, idxStart, idxEnd, idxDur)
 	}
 }
+
+// TestPrintBuildStatus_BlankDurationForNonTerminal pins that a
+// queued or running build renders an empty duration_seconds
+// value, NOT a literal `0`. Review finding #1: the server's
+// omitempty JSON tag drops the field on a non-terminal build,
+// leaving the Go int zero. Stringifying that zero produced a
+// misleading `duration_seconds: 0` that CI scripts parsed as
+// "this build took zero seconds" rather than "this build
+// hasn't finished yet".
+func TestPrintBuildStatus_BlankDurationForNonTerminal(t *testing.T) {
+	for _, status := range []string{"queued", "running"} {
+		t.Run(status, func(t *testing.T) {
+			var buf bytes.Buffer
+			printBuildStatus(&buf, api.BuildResponse{
+				ID:         "id",
+				Status:     status,
+				EnqueuedAt: "2026-08-10T12:00:00Z",
+				StartedAt:  "", // omitempty drops; zero string
+				FinishedAt: "",
+				// DurationSeconds is 0 (server omits via omitempty).
+			})
+			out := buf.String()
+			// The row label must be present (auditor consistency,
+			// mirrors empty-buildkit_version convention) but the
+			// value column must be blank — not "0".
+			if !strings.Contains(out, "duration_seconds:") {
+				t.Errorf("missing duration_seconds row label; got:\n%s", out)
+			}
+			// Find the duration_seconds line and assert the
+			// value column (after the label + gutter) is empty.
+			idx := strings.Index(out, "duration_seconds:")
+			line := out[idx:]
+			if nl := strings.Index(line, "\n"); nl >= 0 {
+				line = line[:nl]
+			}
+			// The gutter is 22 chars then a literal space then
+			// the value. We expect just the gutter + label + ":"
+			// + spaces with NO trailing digit.
+			if strings.HasSuffix(strings.TrimSpace(line), "0") {
+				t.Errorf("duration_seconds row ends with 0 (status=%s): %q", status, line)
+			}
+		})
+	}
+}
+
+// TestPrintBuildStatus_NumericDurationForTerminal pins the
+// inverse: succeeded + failed builds DO render their integer
+// duration_seconds value. Without this test, the previous
+// regression fix could over-correct into "always blank".
+func TestPrintBuildStatus_NumericDurationForTerminal(t *testing.T) {
+	for _, status := range []string{"succeeded", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			var buf bytes.Buffer
+			printBuildStatus(&buf, api.BuildResponse{
+				ID:              "id",
+				Status:          status,
+				EnqueuedAt:      "2026-08-10T12:00:00Z",
+				StartedAt:       "2026-08-10T12:00:05Z",
+				FinishedAt:      "2026-08-10T12:00:10Z",
+				DurationSeconds: 82,
+			})
+			out := buf.String()
+			if !strings.Contains(out, "duration_seconds:      82") {
+				t.Errorf("expected duration_seconds: 82 in output (status=%s); got:\n%s", status, out)
+			}
+		})
+	}
+}

@@ -1729,3 +1729,53 @@ func TestTerminalExitForBuild_Failed(t *testing.T) {
 		t.Errorf("missing log-hint; got: %s", got)
 	}
 }
+
+// TestPollBuildStatus_HungServerHonoursDeadline pins the
+// context.WithTimeout fix (review finding #4): the loop must
+// return (_, false) within the deadline even when the server
+// accepts the connection and stalls indefinitely without
+// responding. Pre-fix, the loop called context.Background()
+// so the per-call context never cancelled; the SDK's 30s
+// http.Client timeout was the only safety net, which meant
+// the loop's worst-case wall-clock was unbounded if a hung
+// socket consumed that 30s budget.
+//
+// This test serves a request that sleeps far longer than the
+// deadline, returning 200 only after 5s — well past the test's
+// 500ms budget. Pre-fix, the client request would block until
+// the SDK's 30s http.Client.Timeout fired (or the server
+// returned); post-fix, the per-call context.WithTimeout
+// derived inside pollBuildStatus cancels the request when the
+// remaining deadline budget runs out.
+func TestPollBuildStatus_HungServerHonoursDeadline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Sleep longer than the deadline so the only thing
+		// protecting the wall-clock budget is the per-call
+		// context.WithTimeout. Returning 200 + JSON keeps the
+		// handler goroutine finite (no goroutine leak on
+		// httptest.Server.Close), unlike a `<-chan` block.
+		time.Sleep(5 * time.Second)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"b","deployment_id":"d","kind":"tarball","source_bytes":0,"status":"running","enqueued_at":"2026-08-10T12:00:00Z"}`)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	c := api.NewClient(srv.URL, "fp_live_x")
+	dep := api.DeploymentResponse{
+		ID: "dep-hung", AppID: "hello", BuildID: "build-hung",
+	}
+	start := time.Now()
+	_, ok := pollBuildStatus(c, dep, 500*time.Millisecond)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatalf("pollBuildStatus = (_, true); want (_, false) on stalled server")
+	}
+	// 500ms deadline + scheduling overhead. Pre-fix this took
+	// ≥30s because the SDK's http.Client.Timeout was the only
+	// cap and the per-call ctx never fired.
+	if elapsed > 2*time.Second {
+		t.Errorf("elapsed = %v, want <2s (deadline budget; pre-fix this took ~30s)", elapsed)
+	}
+}
