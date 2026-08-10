@@ -65,6 +65,72 @@ func seedBoth(t *testing.T, files []string) (fsys fs.FS, tarballPath string) {
 	return os.DirFS(dir), tarballPath
 }
 
+// seedBothWithDirs seeds a fixture containing BOTH regular files
+// (forward-slash names, empty content) and top-level directories
+// (forward-slash names, trailing-slash canonical form on the
+// tarball side). The FS view creates real directories via
+// os.MkdirAll; the tarball side emits tar.TypeDir headers with
+// a trailing slash. Used by the parity_dir_named_like_marker
+// fixture below — a project with a root-level directory whose
+// name matches a marker name (Dockerfile/, package.json/, …)
+// must NOT resolve to that framework on either side.
+func seedBothWithDirs(t *testing.T, files, dirs []string) (fsys fs.FS, tarballPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	for _, f := range files {
+		p := filepath.Join(dir, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	for _, d := range dirs {
+		p := filepath.Join(dir, filepath.FromSlash(d))
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+	}
+	tarDir := t.TempDir()
+	tarballPath = filepath.Join(tarDir, "src.tar.gz")
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, name := range files {
+		hdr := &tar.Header{
+			Name:     filepath.FromSlash(name),
+			Mode:     0o644,
+			Size:     0,
+			Typeflag: tar.TypeReg,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("tar header %s: %v", name, err)
+		}
+	}
+	for _, d := range dirs {
+		hdr := &tar.Header{
+			Name:     filepath.FromSlash(d) + "/",
+			Mode:     0o755,
+			Size:     0,
+			Typeflag: tar.TypeDir,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("tar dir header %s: %v", d, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	if err := os.WriteFile(tarballPath, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write tarball: %v", err)
+	}
+	return os.DirFS(dir), tarballPath
+}
+
 // seedBothWithFiles is the content-aware variant used by
 // TestVersionParity.
 func seedBothWithFiles(t *testing.T, files map[string]string) (fsys fs.FS, tarballPath string) {
@@ -207,6 +273,79 @@ func TestDetectCLIParity(t *testing.T) {
 				if srvErr != nil {
 					t.Errorf("DetectFromTarball(unknown) error = %v, want nil", srvErr)
 				}
+			}
+		})
+	}
+}
+
+// TestParityDirNamedLikeMarker pins the parity drift that
+// /code-review low found in pkg/markers/detect.go:39: a project
+// with a top-level DIRECTORY whose name matches a marker
+// (Dockerfile/, package.json/, go.mod/, …) must resolve to
+// FrameworkUnknown on BOTH the FS path (DetectFromFS skips
+// IsDir()) and the tarball path (DetectFromTarball must skip
+// tar.TypeDir entries). Before the fix, the tarball path
+// returned the matching framework while the FS path returned
+// unknown — silent parity drift.
+func TestParityDirNamedLikeMarker(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		dirs  []string
+		want  markers.Framework
+	}{
+		{
+			// Root-level Dockerfile/ directory next to an
+			// unrelated README must NOT resolve to docker.
+			name:  "dir_dockerfile_next_to_readme",
+			dirs:  []string{"Dockerfile"},
+			files: []string{"README.md"},
+			want:  markers.FrameworkUnknown,
+		},
+		{
+			// Root-level package.json/ directory next to a real
+			// marker (requirements.txt). The directory must be
+			// skipped; the real marker wins.
+			name:  "dir_package_json_next_to_requirements",
+			dirs:  []string{"package.json"},
+			files: []string{"requirements.txt"},
+			want:  markers.FrameworkPython,
+		},
+		{
+			// Root-level go.mod/ directory alone — must be
+			// unknown, NOT go.
+			name: "dir_go_mod_alone",
+			dirs: []string{"go.mod"},
+			want: markers.FrameworkUnknown,
+		},
+		{
+			// Three marker-named dirs at root, no real marker
+			// anywhere — must be unknown on both sides.
+			name: "dirs_only_dockerfile_pkg_go",
+			dirs: []string{"Dockerfile", "package.json", "go.mod"},
+			want: markers.FrameworkUnknown,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fsys, tarball := seedBothWithDirs(t, tc.files, tc.dirs)
+			cliFW, cliErr := markers.DetectFromFS(fsys)
+			if cliErr != nil {
+				t.Fatalf("DetectFromFS: %v", cliErr)
+			}
+			srvFW, srvErr := markers.DetectFromTarball(tarball)
+			if srvErr != nil {
+				t.Fatalf("DetectFromTarball: %v", srvErr)
+			}
+			if cliFW != srvFW {
+				t.Errorf("PARITY DRIFT (dirs): CLI=%q server=%q want=%q",
+					cliFW, srvFW, tc.want)
+			}
+			if cliFW != tc.want {
+				t.Errorf("DetectFromFS = %q, want %q", cliFW, tc.want)
+			}
+			if srvFW != tc.want {
+				t.Errorf("DetectFromTarball = %q, want %q", srvFW, tc.want)
 			}
 		})
 	}

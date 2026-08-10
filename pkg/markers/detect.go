@@ -39,12 +39,8 @@ func DetectFromFS(fsys fs.FS) (Framework, error) {
 		if e.IsDir() {
 			continue
 		}
-		// Top-level only — anything with a "/" is in a subdir.
-		// fs.DirEntry names are base names when read with ".",
-		// so this check is belt-and-braces.
-		if strings.Contains(e.Name(), "/") {
-			continue
-		}
+		// fs.DirEntry names from fs.ReadDir(fsys, ".") are base
+		// names by contract, so a "/" check is unnecessary here.
 		present[strings.ToLower(e.Name())] = true
 	}
 	for _, m := range appMarkers {
@@ -90,6 +86,14 @@ func DetectFromTarball(path string) (Framework, error) {
 		// not the project's package.json. Mirrors the original
 		// pkg/builderd/detect.go:67-72 rule.
 		if strings.Contains(hdr.Name, "/") {
+			continue
+		}
+		// Skip directory entries — parity with DetectFromFS which
+		// drops IsDir() entries. Without this, a project with a
+		// root-level directory named "Dockerfile" (or any other
+		// marker) would resolve to that framework on the tarball
+		// path but to FrameworkUnknown on the FS path.
+		if hdr.Typeflag == tar.TypeDir {
 			continue
 		}
 		present[strings.ToLower(hdr.Name)] = true
