@@ -42,6 +42,7 @@ export type { AuthProviders } from './AuthProviders.js';
 export type { BillingCancelResponse } from './BillingCancelResponse.js';
 export type { BillingCatalogEntry } from './BillingCatalogEntry.js';
 export type { BillingCatalogResponse } from './BillingCatalogResponse.js';
+export type { BillingPaddleOveragePreflightResponse } from './BillingPaddleOveragePreflightResponse.js';
 export type { BillingPortalResponse } from './BillingPortalResponse.js';
 export type { BillingReconcileResponse } from './BillingReconcileResponse.js';
 export type { BillingRetryResponse } from './BillingRetryResponse.js';
