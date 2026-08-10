@@ -110,7 +110,7 @@ func (s *server) obsAnomalies(w http.ResponseWriter, r *http.Request, acct state
 		sqlc.TrafficAnomalyAggregateParams{
 			Minute:   pgtype.Timestamptz{Time: since, Valid: true},
 			Minute_2: pgtype.Timestamptz{Time: baselineCutoff, Valid: true},
-			Limit:    int32(limit),
+			Column3:  int64(limit),
 		})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not query anomalies"))
@@ -168,8 +168,8 @@ func (s *server) obsRateLimits(w http.ResponseWriter, r *http.Request, acct stat
 	since := time.Now().UTC().Add(-window)
 	rows, err := s.store.PerAccountRateLimitAggregate(r.Context(),
 		sqlc.PerAccountRateLimitAggregateParams{
-			At:    pgtype.Timestamptz{Time: since, Valid: true},
-			Limit: int32(limit),
+			At:      pgtype.Timestamptz{Time: since, Valid: true},
+			Column2: int64(limit),
 		})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not query rate-limit aggregate"))

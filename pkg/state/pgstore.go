@@ -13674,8 +13674,8 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]Au
 // per pkg/api/limits.go::ObsAdminWindowMaxHours + ObsAdminAnomaly*
 // before calling this method.
 func (s *PgStore) TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error) {
-	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Limit <= 0 {
-		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Limit)
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
 	}
 	rows, err := s.pool.Query(ctx, `
 		with baseline as (
@@ -13741,7 +13741,7 @@ func (s *PgStore) TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficA
 		where z_score is not null
 		order by z_score desc
 		limit $3
-	`, arg.Minute.Time.UTC(), arg.Minute_2.Time.UTC(), arg.Limit)
+	`, arg.Minute.Time.UTC(), arg.Minute_2.Time.UTC(), arg.Column3)
 	if err != nil {
 		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: %w", err)
 	}
@@ -13775,8 +13775,8 @@ func (s *PgStore) TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficA
 // handler bounds since / limit per pkg/api/limits.go before
 // calling this method.
 func (s *PgStore) PerAccountRateLimitAggregate(ctx context.Context, arg sqlc.PerAccountRateLimitAggregateParams) ([]sqlc.PerAccountRateLimitAggregateRow, error) {
-	if !arg.At.Valid || arg.Limit <= 0 {
-		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: invalid params (since=%v limit=%d)", arg.At, arg.Limit)
+	if !arg.At.Valid || arg.Column2 <= 0 {
+		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: invalid params (since=%v limit=%d)", arg.At, arg.Column2)
 	}
 	rows, err := s.pool.Query(ctx, `
 		select coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid) as account_id,
@@ -13788,7 +13788,7 @@ func (s *PgStore) PerAccountRateLimitAggregate(ctx context.Context, arg sqlc.Per
 		group by coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid)
 		order by hits desc, last_event_at desc
 		limit $2
-	`, arg.At.Time.UTC(), arg.Limit)
+	`, arg.At.Time.UTC(), arg.Column2)
 	if err != nil {
 		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: %w", err)
 	}

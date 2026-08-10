@@ -10299,12 +10299,12 @@ func (m *MemStore) ExpireOrgInvitations(_ context.Context, now time.Time) (int64
 //
 // See ADR-091 §3.6 / PR #2 for the scoring model.
 func (m *MemStore) TrafficAnomalyAggregate(_ context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error) {
-	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Limit <= 0 {
-		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Limit)
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
 	}
 	since := arg.Minute.Time
 	baselineCutoff := arg.Minute_2.Time
-	limit := int(arg.Limit)
+	limit := int(arg.Column3)
 	type bucket struct {
 		sum, sumSq float64
 		n          int
@@ -10411,8 +10411,8 @@ func (m *MemStore) TrafficAnomalyAggregate(_ context.Context, arg sqlc.TrafficAn
 // subject (uuid) — anonymous events (subject empty) collapse under
 // the all-zeros UUID. See ADR-091 §3.5 / PR #2.
 func (m *MemStore) PerAccountRateLimitAggregate(_ context.Context, arg sqlc.PerAccountRateLimitAggregateParams) ([]sqlc.PerAccountRateLimitAggregateRow, error) {
-	if !arg.At.Valid || arg.Limit <= 0 {
-		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: invalid params (since=%v limit=%d)", arg.At, arg.Limit)
+	if !arg.At.Valid || arg.Column2 <= 0 {
+		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: invalid params (since=%v limit=%d)", arg.At, arg.Column2)
 	}
 	since := arg.At.Time
 	type bucket struct {
@@ -10447,7 +10447,7 @@ func (m *MemStore) PerAccountRateLimitAggregate(_ context.Context, arg sqlc.PerA
 		r sqlc.PerAccountRateLimitAggregateRow
 	}
 	var rows []rlrow
-	limit := int(arg.Limit)
+	limit := int(arg.Column2)
 	for k, bk := range bl {
 		rows = append(rows, rlrow{r: sqlc.PerAccountRateLimitAggregateRow{
 			AccountID:   uuidToPgtype(k),

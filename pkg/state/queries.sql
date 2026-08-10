@@ -610,7 +610,9 @@ where consumed_at is null
 --                      (handler default: now() - 24h, hard cap 168h)
 --   * $2 baseline    — RFC 3339 lower bound for the baseline pool
 --                      (handler default: now() - 7d, fixed by ADR)
---   * $3 limit       — top-N by deviation (handler default 50, cap 200)
+--   * $3 limit       — top-N by deviation (handler default 50, cap 200;
+--                      cast to int8 so sqlc emits int64 Params and the
+--                      handler's int→int64 widening is safe)
 -- Result columns:
 --   * account_id, app_id, minute, current_mb_seconds
 --   * baseline_mean, baseline_stddev, baseline_samples
@@ -683,7 +685,7 @@ select account_id,
 from scored
 where z_score is not null
 order by z_score desc
-limit $3;
+limit $3::int8;
 
 -- name: PerAccountRateLimitAggregate :many
 -- ADR-091 §3.5 — operator observability backend (PR #2) durable view.
@@ -691,7 +693,9 @@ limit $3;
 -- window, grouped by subject (account_id, NULL for anonymous actors).
 --   * $1 since  — RFC 3339 lower bound (handler default: now() - 24h,
 --                 hard cap 168h per pkg/api/limits.go::ObsAdminWindowMaxHours)
---   * $2 limit  — top-N by hits (handler default 100, cap 500)
+--   * $2 limit  — top-N by hits (handler default 100, cap 500;
+--                 cast to int8 so sqlc emits int64 Params and the
+--                 handler's int→int64 widening is safe)
 -- Anonymous (subject IS NULL) rows are bucketed under a single
 -- account_id = NULL row so the operator UI can render the "anon
 -- credential stuffing" signal distinctly from named-account bursts.
@@ -706,5 +710,5 @@ where kind = 'auth.rate_limited'
   and at >= $1
 group by coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid)
 order by hits desc, last_event_at desc
-limit $2;
+limit $2::int8;
 
