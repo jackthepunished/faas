@@ -32,6 +32,42 @@ contact_email = "ops@gregale.dev"
 use_staging_ca = true
 `
 
+// TestLoadConfig_NodeNameDefaultsEmpty pins the issue #678 / ADR-093
+// PR-0 surface: NodeName is the multi-box identity for the daemon.
+// Empty default = single-box dev back-compat (PR-B's verifier gate
+// stays closed; stdlib trust alone runs on every dial/listen). PR-B
+// reads this field at startup and constructs PGNodeVerifier when
+// non-empty.
+func TestLoadConfig_NodeNameDefaultsEmpty(t *testing.T) {
+	c, err := LoadConfig("/no/such/path")
+	if err != nil {
+		t.Fatalf("missing file: %v", err)
+	}
+	if c.NodeName != "" {
+		t.Errorf("NodeName = %q, want empty (single-box default)", c.NodeName)
+	}
+}
+
+// TestLoadConfig_NodeNameRoundTrip pins the toml round-trip: the
+// [node_name] field reads verbatim back from LoadConfig. A future
+// refactor that renames the field or drops the toml tag would
+// silently break PR-B's wiring.
+func TestLoadConfig_NodeNameRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gatewayd.toml")
+	body := `node_name = "fsn-2-gatewayd-internal"` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.NodeName != "fsn-2-gatewayd-internal" {
+		t.Errorf("NodeName = %q, want %q", c.NodeName, "fsn-2-gatewayd-internal")
+	}
+}
+
 func TestLoadConfig_DefaultsWhenMissing(t *testing.T) {
 	c, err := LoadConfig("/no/such/path")
 	if err != nil {

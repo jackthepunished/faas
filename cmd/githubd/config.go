@@ -47,6 +47,20 @@ type Config struct {
 	// RoleComputeOnly. RoleSingleBox is the default and lets
 	// single-box dev boot unmoved.
 	Role role.Role `toml:"role"`
+
+	// NodeName is the multi-box identity for the githubd process
+	// (issue #678 / ADR-093 PR-0). When non-empty, githubd is in
+	// multi-box mode: PR-B constructs PGNodeVerifier and threads
+	// it through every Load*WithVerifier helper. When empty,
+	// the verifier stays nil and stdlib trust alone runs (the
+	// single-box dev back-compat path). Operator seeds the
+	// matching row in compute_nodes via the existing
+	// POST /v1/compute-nodes flow (no new apid handler — reuses
+	// UpsertComputeNodeFromOperator). Defaults to "".
+	//
+	// Also reused for the githubd → apid bridge dialer (PR-C1
+	// wires the bridge tlsCfg alongside the server-side verifier).
+	NodeName string `toml:"node_name"`
 }
 
 // ResolveListenTarget returns the gRPC target the server should bind.
