@@ -14,20 +14,20 @@
 // Sensitive fields NEVER projected (ADR-091 §"Sensitive fields
 // (never exposed)"):
 //
-//   * accounts.mfa_secret_encrypted, mfa_recovery_codes_hash
-//   * account_passwords.hash
-//   * api_keys.key_sha256 (fingerprint only — see projectAPIKeys below)
-//   * sessions.binding_hash, sessions.issued_ip
-//   * login_tokens.token_hash, cli_auth_codes.token_hash,
+//   - accounts.mfa_secret_encrypted, mfa_recovery_codes_hash
+//   - account_passwords.hash
+//   - api_keys.key_sha256 (fingerprint only — see projectAPIKeys below)
+//   - sessions.binding_hash, sessions.issued_ip
+//   - login_tokens.token_hash, cli_auth_codes.token_hash,
 //     org_invitations.token_hash
-//   * app_secrets.ciphertext, app_envs.value
-//   * app_registry_credentials.password_encrypted
-//   * app_webhooks.webhook_secret_sealed,
+//   - app_secrets.ciphertext, app_envs.value
+//   - app_registry_credentials.password_encrypted
+//   - app_webhooks.webhook_secret_sealed,
 //     alert_rules.webhook_secret_sealed
-//   * instances.netns, guest_uid, host_ip, lease_token
-//   * invoices.raw (provider payload)
-//   * accounts.email (only via ?include_pii=1 with audit row)
-//   * orgs.provider_customer_id
+//   - instances.netns, guest_uid, host_ip, lease_token
+//   - invoices.raw (provider payload)
+//   - accounts.email (only via ?include_pii=1 with audit row)
+//   - orgs.provider_customer_id
 //
 // The helpers in this file only read fields outside that set.
 package main

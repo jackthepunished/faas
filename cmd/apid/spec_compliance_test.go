@@ -73,29 +73,29 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
-	"GET /v1/events":                          true, // SSE (cookie+Bearer, not s.auth)
-	"GET /login":                              true, // dashboard magic-link GET (HTML form, browser-only)
-	"POST /logout":                            true, // dashboard logout (HTML form, browser-only)
-	"GET /auth/verify":                        true, // magic-link consume (legacy; PR #1 closed; kept for compat)
-	"GET /oauth/callback":                     true, // GitHub App install callback
-	"GET /oauth/code-callback":                true, // GitHub App user-to-server OAuth callback (PR-C)
-	"POST /dashboard/install/connect":         true, // GitHub App "Connect GitHub" button (PR-C)
-	"GET /dashboard":                          true, // HTML dashboard
-	"GET /dashboard/":                         true, // HTML dashboard
-	"POST /dashboard/account/delete":          true, // HTML form
-	"POST /dashboard/account/restore":         true, // HTML form
-	"GET /dashboard/account/export":           true, // session-auth twin of /v1/account/export
-	"GET /dashboard/account/dpa":              true, // session-auth twin of DPA
-	"POST /dashboard/raise-overage-cap":       true, // HTML form (issue #561)
-	"POST /v1/cli-auth/code":                  true, // CLI device-code mint
-	"POST /v1/cli-auth/exchange":              true, // CLI device-code exchange
-	"GET /cli-auth":                           true, // dashboard claim form
-	"POST /cli-auth":                          true, // dashboard claim form submit
-	"GET /status":                             true, // public HTML status page
-	"GET /status/slo.json":                    true, // public status JSON
-	"GET /healthz":                            true, // loopback infra probe
-	"GET /v1/orgs/me":                         true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
-	"GET /v1/traces/{trace_id}":               true, // issue #555: gatewayd-public trace endpoint (mounted via bare /v1/traces/ prefix; the scanner doesn't match it)
+	"GET /v1/events":                            true, // SSE (cookie+Bearer, not s.auth)
+	"GET /login":                                true, // dashboard magic-link GET (HTML form, browser-only)
+	"POST /logout":                              true, // dashboard logout (HTML form, browser-only)
+	"GET /auth/verify":                          true, // magic-link consume (legacy; PR #1 closed; kept for compat)
+	"GET /oauth/callback":                       true, // GitHub App install callback
+	"GET /oauth/code-callback":                  true, // GitHub App user-to-server OAuth callback (PR-C)
+	"POST /dashboard/install/connect":           true, // GitHub App "Connect GitHub" button (PR-C)
+	"GET /dashboard":                            true, // HTML dashboard
+	"GET /dashboard/":                           true, // HTML dashboard
+	"POST /dashboard/account/delete":            true, // HTML form
+	"POST /dashboard/account/restore":           true, // HTML form
+	"GET /dashboard/account/export":             true, // session-auth twin of /v1/account/export
+	"GET /dashboard/account/dpa":                true, // session-auth twin of DPA
+	"POST /dashboard/raise-overage-cap":         true, // HTML form (issue #561)
+	"POST /v1/cli-auth/code":                    true, // CLI device-code mint
+	"POST /v1/cli-auth/exchange":                true, // CLI device-code exchange
+	"GET /cli-auth":                             true, // dashboard claim form
+	"POST /cli-auth":                            true, // dashboard claim form submit
+	"GET /status":                               true, // public HTML status page
+	"GET /status/slo.json":                      true, // public status JSON
+	"GET /healthz":                              true, // loopback infra probe
+	"GET /v1/orgs/me":                           true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
+	"GET /v1/traces/{trace_id}":                 true, // issue #555: gatewayd-public trace endpoint (mounted via bare /v1/traces/ prefix; the scanner doesn't match it)
 }
 
 // dtoExclude lists pkg/api exported DTOs that are intentionally not in the

@@ -9,10 +9,10 @@
 // rather than the SDK.
 //
 // Sensitive-field policy (ADR-091 §3, PII redaction by default):
-//   * Email never appears on the default list/detail path.
-//   * ?include_pii=1 is the only opt-in, and it emits a pii.accessed
+//   - Email never appears on the default list/detail path.
+//   - ?include_pii=1 is the only opt-in, and it emits a pii.accessed
 //     audit row in the handler.
-//   * No projection ever carries sealed-blob MFA fields, hashed
+//   - No projection ever carries sealed-blob MFA fields, hashed
 //     passwords, hashed tokens, sealed webhook secrets, sealed env
 //     secrets, or jail internals (netns, guest_uid, host_ip,
 //     lease_token). The handlers in cmd/apid/handlers_admin_obs.go
@@ -33,11 +33,11 @@ import "time"
 // server-side clock at handler entry; a frontend can display
 // "snapshot at HH:MM" without parsing log timestamps.
 type ObsOverviewResponse struct {
-	GeneratedAt               time.Time                    `json:"generated_at"`
-	Totals                    ObsOverviewTotals            `json:"totals"`
-	TopRateLimitedAccounts24h []ObsOverviewRateLimited     `json:"top_rate_limited_accounts_24h"`
-	NodeHealth                []ObsOverviewNodeHealth      `json:"node_health"`
-	RecentFailures1h          []ObsOverviewFailureKind     `json:"recent_failures_1h"`
+	GeneratedAt               time.Time                `json:"generated_at"`
+	Totals                    ObsOverviewTotals        `json:"totals"`
+	TopRateLimitedAccounts24h []ObsOverviewRateLimited `json:"top_rate_limited_accounts_24h"`
+	NodeHealth                []ObsOverviewNodeHealth  `json:"node_health"`
+	RecentFailures1h          []ObsOverviewFailureKind `json:"recent_failures_1h"`
 }
 
 // ObsOverviewTotals is the headline KPI block. The numbers are
@@ -135,11 +135,11 @@ type ObsTenantListResponse struct {
 // APIKeys, Sessions are per-tenant roll-ups so a single fetch
 // renders the per-tenant drawer.
 type ObsTenantDetailResponse struct {
-	Account  ObsTenantRow       `json:"account"`
-	Apps     []ObsTenantApp     `json:"apps"`
-	Orgs     []ObsTenantOrg     `json:"orgs"`
-	APIKeys  ObsTenantCounts    `json:"api_keys"`
-	Sessions ObsTenantCounts    `json:"sessions"`
+	Account  ObsTenantRow    `json:"account"`
+	Apps     []ObsTenantApp  `json:"apps"`
+	Orgs     []ObsTenantOrg  `json:"orgs"`
+	APIKeys  ObsTenantCounts `json:"api_keys"`
+	Sessions ObsTenantCounts `json:"sessions"`
 }
 
 // ObsTenantApp is a single app row in the tenant detail view.
@@ -206,12 +206,12 @@ type ObsNodeListResponse struct {
 // handler clamped it; the frontend can show "clamped to 24h"
 // so the operator knows they are not seeing the full history.
 type ObsHeartbeatListResponse struct {
-	NodeID       string             `json:"node_id"`
-	Name         string             `json:"name"`
-	Since        time.Time          `json:"since"`
-	SinceClamped bool               `json:"since_clamped"`
-	Heartbeats   []ObsHeartbeatRow  `json:"heartbeats"`
-	Limit        int                `json:"limit"`
+	NodeID       string            `json:"node_id"`
+	Name         string            `json:"name"`
+	Since        time.Time         `json:"since"`
+	SinceClamped bool              `json:"since_clamped"`
+	Heartbeats   []ObsHeartbeatRow `json:"heartbeats"`
+	Limit        int               `json:"limit"`
 }
 
 // ObsHeartbeatRow is one row of the heartbeat list. The fields
@@ -220,10 +220,10 @@ type ObsHeartbeatListResponse struct {
 // so the operator can spot dropped heartbeats without scanning
 // the raw timestamps.
 type ObsHeartbeatRow struct {
-	ReceivedAt       time.Time `json:"received_at"`
-	LastHeartbeatAt  time.Time `json:"last_heartbeat_at"`
-	Source           string    `json:"source"`
-	GapToPreviousMs  int64     `json:"gap_to_previous_ms"`
-	Missed           bool      `json:"missed"`
-	Stale            bool      `json:"stale"`
+	ReceivedAt      time.Time `json:"received_at"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+	Source          string    `json:"source"`
+	GapToPreviousMs int64     `json:"gap_to_previous_ms"`
+	Missed          bool      `json:"missed"`
+	Stale           bool      `json:"stale"`
 }

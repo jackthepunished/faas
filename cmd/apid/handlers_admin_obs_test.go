@@ -1,27 +1,27 @@
 // handlers_admin_obs_test.go — pins the contract of the operator
 // observability backend (issue #777 / ADR-091):
 //
-//   GET /v1/admin/obs/overview
-//   GET /v1/admin/obs/tenants
-//   GET /v1/admin/obs/tenants/{id}
-//   GET /v1/admin/obs/nodes
-//   GET /v1/admin/obs/nodes/{name}/heartbeats
+//	GET /v1/admin/obs/overview
+//	GET /v1/admin/obs/tenants
+//	GET /v1/admin/obs/tenants/{id}
+//	GET /v1/admin/obs/nodes
+//	GET /v1/admin/obs/nodes/{name}/heartbeats
 //
 // What this file pins:
 //
-//   1. Two-layer auth gate: admin scope + email allowlist
-//      (s.adminAllows). Non-admin scope → 403; admin scope but
-//      email not in the allowlist → 403 admin_required.
-//   2. PII redaction by default: the email field is absent on
-//      the default list/detail path. ?include_pii=1 is the only
-//      opt-in.
-//   3. Pagination: limit=1000 is silently capped to
-//      api.ObsAdminPaginationMax (500). The response carries
-//      a non-nil Items slice and the requested limit value.
-//   4. Org filter: ?plan= and ?status= narrow the result set
-//      without surfacing a 400 on a typo (matches the
-//      filterTenantRows contract).
-//   5. Per-tenant detail: unknown id → 404 with code CodeNotFound.
+//  1. Two-layer auth gate: admin scope + email allowlist
+//     (s.adminAllows). Non-admin scope → 403; admin scope but
+//     email not in the allowlist → 403 admin_required.
+//  2. PII redaction by default: the email field is absent on
+//     the default list/detail path. ?include_pii=1 is the only
+//     opt-in.
+//  3. Pagination: limit=1000 is silently capped to
+//     api.ObsAdminPaginationMax (500). The response carries
+//     a non-nil Items slice and the requested limit value.
+//  4. Org filter: ?plan= and ?status= narrow the result set
+//     without surfacing a 400 on a typo (matches the
+//     filterTenantRows contract).
+//  5. Per-tenant detail: unknown id → 404 with code CodeNotFound.
 //
 // The grep-style cross-tenant / PII-leak tests live in
 // handlers_admin_obs_security_test.go so the security posture

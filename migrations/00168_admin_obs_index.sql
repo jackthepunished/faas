@@ -1,4 +1,4 @@
--- filename: 00166_admin_obs_index.sql
+-- filename: 00168_admin_obs_index.sql
 -- +goose Up
 -- +goose StatementBegin
 -- Issue #777 / ADR-091: the operator observability backend at
@@ -11,9 +11,9 @@
 -- partial indexes now while the table is small; a future PR-A
 -- (multi-host) ships without a perf regression on the obs surface.
 --
--- Slot 166 is the next free slot on origin/main (165 was taken by
--- build_provenance_framework_version). No fence needed because no
--- sibling PR is racing for 166 — verify `git log -- migrations/embed.go`
+-- Slot 168 is the next free slot on origin/main (167 was taken by
+-- apps_overflow_node). No fence needed because no
+-- sibling PR is racing for 168 — verify `git log -- migrations/embed.go`
 -- before opening the PR per the slot-reservation pattern
 -- (migrations-gates-collision-and-replay.md).
 --
