@@ -9712,7 +9712,7 @@ func (s *PgStore) DeleteAppSecret(ctx context.Context, accountID, appID, key str
 // surfaced in PR review of issue #736.
 func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error) {
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+		`select account_id, app_id, key, ciphertext, coalesce(kid, '') as kid, created_at, updated_at
 		 from app_secrets
 		 where account_id = $1 and app_id = $2
 		 order by key asc`,
