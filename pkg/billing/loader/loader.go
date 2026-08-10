@@ -156,18 +156,17 @@ type ProviderMeta struct {
 // deterministic-order invariant is locked (the test
 // TestProviders_RegistersAllProviders pins the order).
 func Providers() []ProviderMeta {
-	stripeProv := stripe.NewClient(nil, nil, "", "", nil)
-	// Paddle's Capabilities() is static and invariant — the
-	// metadata-only lookup here never needs a *Provider. Reading the
-	// static capability set from the package-private helper avoids
-	// the now-error-returning NewProvider signature on this code
-	// path (NewProvider requires a non-nil log + correct options,
-	// and constructing it just to call .Capabilities() is wasted
-	// work — Providers() is invoked once at boot, not per-request).
+	// Both providers expose a static Capabilities() helper
+	// (stripe.StripeCapabilities, paddle.PaddleCapabilities) so the
+	// metadata-only lookup here does not have to construct a *Client
+	// / *Provider just to read the bits. Providers() is invoked once
+	// at boot, not per-request, but the asymmetry was a /code-review
+	// finding (PR #802 follow-up). Capabilities() never reads
+	// c.api / p.client — both functions return a constant.
 	out := []ProviderMeta{
 		{
 			Name:         providerStripe,
-			Capabilities: stripeProv.Capabilities(),
+			Capabilities: stripe.StripeCapabilities(),
 			EnvVars:      []string{"STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET"},
 			// BuildAPID nil → apid reads STRIPE_WEBHOOK_SECRET +
 			// FAAS_BILLING_PORTAL_URL inline (cmd/apid/main.go).
