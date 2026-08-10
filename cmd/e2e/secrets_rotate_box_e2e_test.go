@@ -71,6 +71,17 @@ func TestRekeyRunnerPg(t *testing.T) {
 		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientA,
 		"FAAS_HOST_AGE_IDENTITY_PATH=" + identityA,
 	})
+	// Capture A's key bytes so phase 2 can stage identity A as
+	// host.age.previous next to identity B's host.age — apid's
+	// LoadHostKeys(dir) picks up both and feeds the slice to
+	// OpenMulti, which is the only way the rekey runner can
+	// unseal envelopes sealed under the previous key. Without
+	// this, every unseal attempt fails with "no key matched"
+	// and the runner reports Failed=N rows.
+	identityABytes, err := os.ReadFile(identityA)
+	if err != nil {
+		t.Fatalf("read identity A: %v", err)
+	}
 	const (
 		numAccounts    = 3
 		secretsPerAcct = 2
@@ -99,6 +110,12 @@ func TestRekeyRunnerPg(t *testing.T) {
 	// returns. The second StartWithEnv runs the runner, which
 	// polls the on-disk progress file the test monitors.
 	recipientB, identityB := startHostedRecipient(t)
+	// Stage A as host.age.previous in identity B's dir so
+	// apid's LoadHostKeys picks it up — see phase-1 comment.
+	previousPath := filepath.Join(filepath.Dir(identityB), "host.age.previous")
+	if err := os.WriteFile(previousPath, identityABytes, 0o400); err != nil {
+		t.Fatalf("stage identity A as previous: %v", err)
+	}
 	progressFile := filepath.Join(t.TempDir(), "rekey-progress.json")
 	_ = e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
 		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientB,
