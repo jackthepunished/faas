@@ -192,6 +192,7 @@ export type { SeverityCounts } from './models/SeverityCounts.js';
 export type { Sidecar } from './models/Sidecar.js';
 export type { SLODuration } from './models/SLODuration.js';
 export type { Slug } from './models/Slug.js';
+export type { SourceRefDeployRequest } from './models/SourceRefDeployRequest.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
 export type { Trace } from './models/Trace.js';

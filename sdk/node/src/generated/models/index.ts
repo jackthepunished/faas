@@ -186,6 +186,7 @@ export type { SetPasswordRequest } from './SetPasswordRequest.js';
 export type { SeverityCounts } from './SeverityCounts.js';
 export type { Sidecar } from './Sidecar.js';
 export type { Slug } from './Slug.js';
+export type { SourceRefDeployRequest } from './SourceRefDeployRequest.js';
 export type { StorageUsageListResponse } from './StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './StorageUsageResponse.js';
 export type { Trace } from './Trace.js';
