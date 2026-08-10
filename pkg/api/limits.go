@@ -3237,4 +3237,20 @@ const (
 	// are a deliberate future concern (anomaly detection moves to
 	// PromQL when the control plane goes multi-node, ADR-091 §6).
 	ObsAdminWindowMaxHours = 168
+
+	// ObsAdminAnomalyLimitDefault / ObsAdminAnomalyLimitMax bound the
+	// top-N size of /v1/admin/obs/anomalies (ADR-091 §3.6 / PR #2).
+	// Default 50 keeps the dashboard tile to one screen; cap 200
+	// matches the upper bound the underlying CTE handles without
+	// spilling to disk.
+	ObsAdminAnomalyLimitDefault = 50
+	ObsAdminAnomalyLimitMax     = 200
+
+	// ObsAdminRateLimitLimitDefault / ObsAdminRateLimitLimitMax bound
+	// the top-N size of /v1/admin/obs/rate-limits (ADR-091 §3.5 /
+	// PR #2). Default 100 covers the "show me everyone over budget"
+	// tile; cap 500 = ObsAdminPaginationMax for parity with the rest
+	// of the operator surface.
+	ObsAdminRateLimitLimitDefault = 100
+	ObsAdminRateLimitLimitMax     = ObsAdminPaginationMax
 )

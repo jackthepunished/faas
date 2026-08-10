@@ -1021,6 +1021,13 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListNodes))))
 	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/heartbeats",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeHeartbeats))))
+	// PR #2 endpoints (ADR-091 §3.5 + §3.6). Same two-layer gate +
+	// MFA as PR #1. Anomalies reads usage_minutes only; rate-limits
+	// reads events + the in-process s.apiAuthLimiter snapshot.
+	mux.HandleFunc("GET /v1/admin/obs/anomalies",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsAnomalies))))
+	mux.HandleFunc("GET /v1/admin/obs/rate-limits",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsRateLimits))))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session

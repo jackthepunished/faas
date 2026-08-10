@@ -2377,6 +2377,62 @@ func (q *Queries) OrgMemberByAccount(ctx context.Context, db DBTX, arg OrgMember
 	return i, err
 }
 
+const perAccountRateLimitAggregate = `-- name: PerAccountRateLimitAggregate :many
+select coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid) as account_id,
+       count(*)::int as hits,
+       max(at) as last_event_at
+from events
+where kind = 'auth.rate_limited'
+  and at >= $1
+group by coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid)
+order by hits desc, last_event_at desc
+limit $2
+`
+
+type PerAccountRateLimitAggregateParams struct {
+	At    pgtype.Timestamptz
+	Limit int32
+}
+
+type PerAccountRateLimitAggregateRow struct {
+	AccountID   pgtype.UUID
+	Hits        int32
+	LastEventAt interface{}
+}
+
+// ADR-091 §3.5 — operator observability backend (PR #2) durable view.
+// Aggregates `events` rows of kind='auth.rate_limited' over a rolling
+// window, grouped by subject (account_id, NULL for anonymous actors).
+//   - $1 since  — RFC 3339 lower bound (handler default: now() - 24h,
+//     hard cap 168h per pkg/api/limits.go::ObsAdminWindowMaxHours)
+//   - $2 limit  — top-N by hits (handler default 100, cap 500)
+//
+// Anonymous (subject IS NULL) rows are bucketed under a single
+// account_id = NULL row so the operator UI can render the "anon
+// credential stuffing" signal distinctly from named-account bursts.
+// Index path: events_kind_at_idx (added in migration 00190) covers
+// the kind + at DESC predicate. The subject grouping is in-memory
+// after the index scan.
+func (q *Queries) PerAccountRateLimitAggregate(ctx context.Context, db DBTX, arg PerAccountRateLimitAggregateParams) ([]PerAccountRateLimitAggregateRow, error) {
+	rows, err := db.Query(ctx, perAccountRateLimitAggregate, arg.At, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PerAccountRateLimitAggregateRow{}
+	for rows.Next() {
+		var i PerAccountRateLimitAggregateRow
+		if err := rows.Scan(&i.AccountID, &i.Hits, &i.LastEventAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const revokeAllSessions = `-- name: RevokeAllSessions :many
 update sessions set revoked_at = now()
 where account_id = $1 and id <> $2 and revoked_at is null
@@ -2547,6 +2603,144 @@ update sessions set last_seen_at = now() where id = $1
 func (q *Queries) TouchSessionLastSeen(ctx context.Context, db DBTX, id pgtype.UUID) error {
 	_, err := db.Exec(ctx, touchSessionLastSeen, id)
 	return err
+}
+
+const trafficAnomalyAggregate = `-- name: TrafficAnomalyAggregate :many
+with baseline as (
+    select account_id,
+           app_id,
+           extract(hour from usage_minutes.minute) as hour_of_day,
+           avg(mb_seconds)::float8 as mean_mb_seconds,
+           coalesce(stddev_pop(mb_seconds), 0)::float8 as stddev_mb_seconds,
+           count(*)::int as sample_count
+    from usage_minutes
+    where usage_minutes.minute >= $2
+      and usage_minutes.minute <  $1
+      and mb_seconds > 0
+    group by account_id, app_id, extract(hour from usage_minutes.minute)
+),
+current_pool as (
+    select account_id,
+           app_id,
+           minute,
+           sum(mb_seconds)::float8 as current_mb_seconds
+    from usage_minutes
+    where minute >= $1
+      and mb_seconds > 0
+    group by account_id, app_id, minute
+),
+scored as (
+    select c.account_id,
+           c.app_id,
+           c.minute,
+           c.current_mb_seconds,
+           b.mean_mb_seconds,
+           b.stddev_mb_seconds,
+           b.sample_count,
+           case
+               when b.sample_count < 3 then null
+               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+               when b.stddev_mb_seconds >= 1.0
+                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+               else null
+           end as z_score,
+           case
+               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+               else 'hour_of_day'
+           end as reason
+    from current_pool c
+    join baseline b
+      on c.account_id = b.account_id
+     and c.app_id = b.app_id
+     and extract(hour from c.minute) = b.hour_of_day
+)
+select account_id,
+       app_id,
+       minute,
+       current_mb_seconds,
+       mean_mb_seconds,
+       stddev_mb_seconds,
+       sample_count,
+       z_score,
+       reason
+from scored
+where z_score is not null
+order by z_score desc
+limit $3
+`
+
+type TrafficAnomalyAggregateParams struct {
+	Minute   pgtype.Timestamptz
+	Minute_2 pgtype.Timestamptz
+	Limit    int32
+}
+
+type TrafficAnomalyAggregateRow struct {
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	Minute           pgtype.Timestamptz
+	CurrentMbSeconds float64
+	MeanMbSeconds    float64
+	StddevMbSeconds  float64
+	SampleCount      int32
+	ZScore           interface{}
+	Reason           string
+}
+
+// ADR-091 §3.6 — operator observability backend (PR #2).
+// Hour-of-day baseline over a rolling 7-day window:
+//   - baseline is per (account_id, app_id, EXTRACT(HOUR FROM minute))
+//   - an anomaly is a row whose current mb_seconds exceeds
+//     baseline_mean + 3.0*baseline_stddev (or baseline_mean * 5.0 when
+//     baseline_stddev < 1.0 — guards against noisy-low-traffic apps
+//     where a tiny stddev explodes the Z-score).
+//   - $1 since       — RFC 3339 lower bound for "current" rows
+//     (handler default: now() - 24h, hard cap 168h)
+//   - $2 baseline    — RFC 3339 lower bound for the baseline pool
+//     (handler default: now() - 7d, fixed by ADR)
+//   - $3 limit       — top-N by deviation (handler default 50, cap 200)
+//
+// Result columns:
+//   - account_id, app_id, minute, current_mb_seconds
+//   - baseline_mean, baseline_stddev, baseline_samples
+//   - z_score, reason ('hour_of_day' | 'raw_z')
+//
+// Index path: usage_minutes primary key (instance_id, minute) is
+// fine for current-minute scans in a 24h window. The 7-day baseline
+// pool scans the same primary key. For the fleet-wide aggregate a
+// future ADR adds (account_id, app_id, minute) as a covering index;
+// PR #2 does NOT add it (single-box posture; multi-host moves to
+// PromQL per ADR-091 §3.6).
+func (q *Queries) TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateParams) ([]TrafficAnomalyAggregateRow, error) {
+	rows, err := db.Query(ctx, trafficAnomalyAggregate, arg.Minute, arg.Minute_2, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TrafficAnomalyAggregateRow{}
+	for rows.Next() {
+		var i TrafficAnomalyAggregateRow
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.AppID,
+			&i.Minute,
+			&i.CurrentMbSeconds,
+			&i.MeanMbSeconds,
+			&i.StddevMbSeconds,
+			&i.SampleCount,
+			&i.ZScore,
+			&i.Reason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateAccountPlan = `-- name: UpdateAccountPlan :exec

@@ -227,3 +227,82 @@ type ObsHeartbeatRow struct {
 	Missed          bool      `json:"missed"`
 	Stale           bool      `json:"stale"`
 }
+
+// ObsAnomalyRow is one row of GET /v1/admin/obs/anomalies
+// (ADR-091 §3.6 / PR #2). AccountID and AppID are UUID strings;
+// the frontend can join to the tenant list for human rendering.
+// BaselineMean / BaselineStddev / BaselineSamples are the values
+// the SQL CTE used to score the row so the operator UI can show
+// "150 vs mean 41 ± 8" without re-querying. ZScore is a
+// float-pointer because very-low-traffic apps can have null
+// scores (sample_count < 3) — those rows are pruned server-side
+// and never reach the wire. Reason explains which detector fired:
+// "hour_of_day" for the primary Z-score, "raw_z" for the low-
+// traffic fallback (baseline_mean × 5 with stddev < 1.0).
+type ObsAnomalyRow struct {
+	AccountID       string   `json:"account_id"`
+	AppID           string   `json:"app_id"`
+	Minute          string   `json:"minute"`  // RFC 3339, parsed server-side
+	Current         float64  `json:"current"` // mb_seconds in the minute
+	BaselineMean    float64  `json:"baseline_mean"`
+	BaselineStddev  float64  `json:"baseline_stddev"`
+	BaselineSamples int      `json:"baseline_samples"`
+	ZScore          *float64 `json:"z_score"`
+	Reason          string   `json:"reason"`
+}
+
+// ObsAnomalyListResponse is the body of GET /v1/admin/obs/anomalies.
+// GeneratedAt + WindowHours + BaselineWindowDays surface the query
+// parameters the operator passed so the dashboard can render
+// "scanned 24h vs 7d baseline" inline. Items is always non-nil;
+// an empty window returns an empty slice, not null.
+type ObsAnomalyListResponse struct {
+	GeneratedAt        time.Time       `json:"generated_at"`
+	WindowHours        int             `json:"window_hours"`
+	BaselineWindowDays int             `json:"baseline_window_days"`
+	Items              []ObsAnomalyRow `json:"items"`
+}
+
+// ObsRateLimitDurableRow is one row of the durable (Postgres)
+// rate-limit aggregate (ADR-091 §3.5 / PR #2). AccountID is a
+// UUID string; the all-zeros UUID represents the anonymous bucket
+// (events.subject IS NULL → credential stuffing without a known
+// account). LastEventAt is the timestamp of the most recent
+// auth.rate_limited event for the bucket.
+type ObsRateLimitDurableRow struct {
+	AccountID   string    `json:"account_id"`
+	Hits        int       `json:"hits"`
+	LastEventAt time.Time `json:"last_event_at"`
+}
+
+// ObsRateLimitLiveRow is one row of the live (in-process limiter
+// snapshot) view. The limiter is keyed by client IP alone, so
+// the row carries IP — not account_id — and the operator UI
+// surfaces the IP as the actionable signal. CurrentlyRateLimited
+// is true when the IP's failure count is ≥ the bucket's
+// MaxFailures (i.e. the limiter would 429 the next request from
+// that IP). LiveHits30s is the failure count over the bucket
+// window (default 1m, but the field name surfaces the practical
+// "in the last 30s" semantics the operator cares about).
+type ObsRateLimitLiveRow struct {
+	IP                   string    `json:"ip"`
+	CurrentlyRateLimited bool      `json:"currently_rate_limited"`
+	LiveHits30s          int       `json:"live_hits_30s"`
+	LastEventAt          time.Time `json:"last_event_at"`
+}
+
+// ObsRateLimitResponse is the body of GET /v1/admin/obs/rate-limits
+// (ADR-091 §3.5 / PR #2). Sources is wire-stable: today always
+// ["durable", "live"]; future additions (gatewayd-public rate-limit
+// snapshot, etc.) appear here without breaking the contract.
+// LagSeconds is the documented lag of the durable view (= the
+// 30s aggregator flush + pg_notify round-trip). The operator UI
+// renders it in a tooltip on the durable table.
+type ObsRateLimitResponse struct {
+	GeneratedAt time.Time                `json:"generated_at"`
+	WindowHours int                      `json:"window_hours"`
+	Sources     []string                 `json:"sources"`
+	LagSeconds  int                      `json:"lag_seconds"`
+	Durable     []ObsRateLimitDurableRow `json:"durable"`
+	Live        []ObsRateLimitLiveRow    `json:"live"`
+}

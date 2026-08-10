@@ -173,6 +173,19 @@ type Querier interface {
 	OrgBySlug(ctx context.Context, db DBTX, lower string) (OrgBySlugRow, error)
 	OrgInvitationByTokenHash(ctx context.Context, db DBTX, tokenHash []byte) (OrgInvitationByTokenHashRow, error)
 	OrgMemberByAccount(ctx context.Context, db DBTX, arg OrgMemberByAccountParams) (OrgMemberByAccountRow, error)
+	// ADR-091 §3.5 — operator observability backend (PR #2) durable view.
+	// Aggregates `events` rows of kind='auth.rate_limited' over a rolling
+	// window, grouped by subject (account_id, NULL for anonymous actors).
+	//   * $1 since  — RFC 3339 lower bound (handler default: now() - 24h,
+	//                 hard cap 168h per pkg/api/limits.go::ObsAdminWindowMaxHours)
+	//   * $2 limit  — top-N by hits (handler default 100, cap 500)
+	// Anonymous (subject IS NULL) rows are bucketed under a single
+	// account_id = NULL row so the operator UI can render the "anon
+	// credential stuffing" signal distinctly from named-account bursts.
+	// Index path: events_kind_at_idx (added in migration 00190) covers
+	// the kind + at DESC predicate. The subject grouping is in-memory
+	// after the index scan.
+	PerAccountRateLimitAggregate(ctx context.Context, db DBTX, arg PerAccountRateLimitAggregateParams) ([]PerAccountRateLimitAggregateRow, error)
 	// Revokes every active row for accountID except the supplied sid
 	// (the calling session). Returns the revoked ids for audit.
 	RevokeAllSessions(ctx context.Context, db DBTX, arg RevokeAllSessionsParams) ([]pgtype.UUID, error)
@@ -202,6 +215,29 @@ type Querier interface {
 	// Best-effort, fire-and-forget. Allowed on revoked rows (observability
 	// signal only; not authorization). pgx interface returns nothing.
 	TouchSessionLastSeen(ctx context.Context, db DBTX, id pgtype.UUID) error
+	// ADR-091 §3.6 — operator observability backend (PR #2).
+	// Hour-of-day baseline over a rolling 7-day window:
+	//   * baseline is per (account_id, app_id, EXTRACT(HOUR FROM minute))
+	//   * an anomaly is a row whose current mb_seconds exceeds
+	//     baseline_mean + 3.0*baseline_stddev (or baseline_mean * 5.0 when
+	//     baseline_stddev < 1.0 — guards against noisy-low-traffic apps
+	//     where a tiny stddev explodes the Z-score).
+	//   * $1 since       — RFC 3339 lower bound for "current" rows
+	//                      (handler default: now() - 24h, hard cap 168h)
+	//   * $2 baseline    — RFC 3339 lower bound for the baseline pool
+	//                      (handler default: now() - 7d, fixed by ADR)
+	//   * $3 limit       — top-N by deviation (handler default 50, cap 200)
+	// Result columns:
+	//   * account_id, app_id, minute, current_mb_seconds
+	//   * baseline_mean, baseline_stddev, baseline_samples
+	//   * z_score, reason ('hour_of_day' | 'raw_z')
+	// Index path: usage_minutes primary key (instance_id, minute) is
+	// fine for current-minute scans in a 24h window. The 7-day baseline
+	// pool scans the same primary key. For the fleet-wide aggregate a
+	// future ADR adds (account_id, app_id, minute) as a covering index;
+	// PR #2 does NOT add it (single-box posture; multi-host moves to
+	// PromQL per ADR-091 §3.6).
+	TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateParams) ([]TrafficAnomalyAggregateRow, error)
 	UpdateAccountPlan(ctx context.Context, db DBTX, arg UpdateAccountPlanParams) error
 	UpdateAccountStatus(ctx context.Context, db DBTX, arg UpdateAccountStatusParams) error
 	UpdateApp(ctx context.Context, db DBTX, arg UpdateAppParams) (UpdateAppRow, error)

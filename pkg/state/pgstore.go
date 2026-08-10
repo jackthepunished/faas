@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/cursor"
+	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
 // PgStore implements Store against Postgres. It holds a connection pool and
@@ -13660,6 +13661,149 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]Au
 			a.Data = json.RawMessage(rawData)
 		}
 		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// TrafficAnomalyAggregate is the pgstore-side hand-rolled mirror of
+// the sqlc query TrafficAnomalyAggregate (queries.sql). The pgstore
+// adapter still hand-rolls SQL per ADR-017 / M5 (TODO(M5.1) is to
+// replace this with a call into the generated package — the sqlc
+// query is the canonical source). See ADR-091 §3.6 / PR #2 for
+// the anomaly model; the handler bounds since / baseline / limit
+// per pkg/api/limits.go::ObsAdminWindowMaxHours + ObsAdminAnomaly*
+// before calling this method.
+func (s *PgStore) TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error) {
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Limit <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Limit)
+	}
+	rows, err := s.pool.Query(ctx, `
+		with baseline as (
+		    select account_id,
+		           app_id,
+		           extract(hour from usage_minutes.minute) as hour_of_day,
+		           avg(mb_seconds)::float8 as mean_mb_seconds,
+		           coalesce(stddev_pop(mb_seconds), 0)::float8 as stddev_mb_seconds,
+		           count(*)::int as sample_count
+		    from usage_minutes
+		    where usage_minutes.minute >= $2
+		      and usage_minutes.minute <  $1
+		      and mb_seconds > 0
+		    group by account_id, app_id, extract(hour from usage_minutes.minute)
+		),
+		current_pool as (
+		    select account_id,
+		           app_id,
+		           minute,
+		           sum(mb_seconds)::float8 as current_mb_seconds
+		    from usage_minutes
+		    where minute >= $1
+		      and mb_seconds > 0
+		    group by account_id, app_id, minute
+		),
+		scored as (
+		    select c.account_id,
+		           c.app_id,
+		           c.minute,
+		           c.current_mb_seconds,
+		           b.mean_mb_seconds,
+		           b.stddev_mb_seconds,
+		           b.sample_count,
+		           case
+		               when b.sample_count < 3 then null
+		               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+		                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+		               when b.stddev_mb_seconds >= 1.0
+		                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+		                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+		               else null
+		           end as z_score,
+		           case
+		               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+		               else 'hour_of_day'
+		           end as reason
+		    from current_pool c
+		    join baseline b
+		      on c.account_id = b.account_id
+		     and c.app_id = b.app_id
+		     and extract(hour from c.minute) = b.hour_of_day
+		)
+		select account_id,
+		       app_id,
+		       minute,
+		       current_mb_seconds,
+		       mean_mb_seconds,
+		       stddev_mb_seconds,
+		       sample_count,
+		       z_score,
+		       reason
+		from scored
+		where z_score is not null
+		order by z_score desc
+		limit $3
+	`, arg.Minute.Time.UTC(), arg.Minute_2.Time.UTC(), arg.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: %w", err)
+	}
+	defer rows.Close()
+	out := []sqlc.TrafficAnomalyAggregateRow{}
+	for rows.Next() {
+		var r sqlc.TrafficAnomalyAggregateRow
+		var zScore *float64
+		if err := rows.Scan(
+			&r.AccountID,
+			&r.AppID,
+			&r.Minute,
+			&r.CurrentMbSeconds,
+			&r.MeanMbSeconds,
+			&r.StddevMbSeconds,
+			&r.SampleCount,
+			&zScore,
+			&r.Reason,
+		); err != nil {
+			return nil, fmt.Errorf("state: traffic_anomaly_aggregate scan: %w", err)
+		}
+		r.ZScore = zScore
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// PerAccountRateLimitAggregate is the pgstore-side hand-rolled
+// mirror of the sqlc query PerAccountRateLimitAggregate
+// (queries.sql). See ADR-091 §3.5 / PR #2 for the model. The
+// handler bounds since / limit per pkg/api/limits.go before
+// calling this method.
+func (s *PgStore) PerAccountRateLimitAggregate(ctx context.Context, arg sqlc.PerAccountRateLimitAggregateParams) ([]sqlc.PerAccountRateLimitAggregateRow, error) {
+	if !arg.At.Valid || arg.Limit <= 0 {
+		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: invalid params (since=%v limit=%d)", arg.At, arg.Limit)
+	}
+	rows, err := s.pool.Query(ctx, `
+		select coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid) as account_id,
+		       count(*)::int as hits,
+		       max(at) as last_event_at
+		from events
+		where kind = 'auth.rate_limited'
+		  and at >= $1
+		group by coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid)
+		order by hits desc, last_event_at desc
+		limit $2
+	`, arg.At.Time.UTC(), arg.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: %w", err)
+	}
+	defer rows.Close()
+	out := []sqlc.PerAccountRateLimitAggregateRow{}
+	for rows.Next() {
+		var r sqlc.PerAccountRateLimitAggregateRow
+		var lastAt time.Time
+		if err := rows.Scan(&r.AccountID, &r.Hits, &lastAt); err != nil {
+			return nil, fmt.Errorf("state: per_account_rate_limit_aggregate scan: %w", err)
+		}
+		if !lastAt.IsZero() {
+			r.LastEventAt = lastAt
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

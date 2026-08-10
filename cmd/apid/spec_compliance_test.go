@@ -73,6 +73,8 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/anomalies":               true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/rate-limits":             true, // ADR-091 — operator-only (PR #2)
 	"GET /v1/events":                            true, // SSE (cookie+Bearer, not s.auth)
 	"GET /login":                                true, // dashboard magic-link GET (HTML form, browser-only)
 	"POST /logout":                              true, // dashboard logout (HTML form, browser-only)
