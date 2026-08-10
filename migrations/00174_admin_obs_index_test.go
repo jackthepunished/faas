@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00168_admin_obs_index.sql
+// Migration-apply test for 00174_admin_obs_index.sql
 // (issue #777 / ADR-091). Pins the four indexes that the operator
 // observability backend at /v1/admin/obs/* needs to stay cheap as
 // the active base grows. Each index covers a fleet-wide scan path
@@ -8,7 +8,7 @@
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00168.
+//  1. Migration set applies cleanly through 00174.
 //  2. All four indexes exist on the right tables.
 //  3. Replay-safe: a second MigrateUp is a no-op (ADR-041).
 //
@@ -23,12 +23,12 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00168_AdminObsIndex pins the four indexes
-// declared in 00168_admin_obs_index.sql. One row per expected
+// TestMigrations_00174_AdminObsIndex pins the four indexes
+// declared in 00174_admin_obs_index.sql. One row per expected
 // (table, index) pair keeps the failure message specific — a
 // developer hitting a missing index sees exactly which one is
 // gone rather than scanning pg_indexes by hand.
-func TestMigrations_00168_AdminObsIndex(t *testing.T) {
+func TestMigrations_00174_AdminObsIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

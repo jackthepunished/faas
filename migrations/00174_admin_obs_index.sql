@@ -1,4 +1,4 @@
--- filename: 00168_admin_obs_index.sql
+-- filename: 00174_admin_obs_index.sql
 -- +goose Up
 -- +goose StatementBegin
 -- Issue #777 / ADR-091: the operator observability backend at
@@ -11,11 +11,11 @@
 -- partial indexes now while the table is small; a future PR-A
 -- (multi-host) ships without a perf regression on the obs surface.
 --
--- Slot 168 is the next free slot on origin/main (167 was taken by
--- apps_overflow_node). No fence needed because no
--- sibling PR is racing for 168 — verify `git log -- migrations/embed.go`
--- before opening the PR per the slot-reservation pattern
--- (migrations-gates-collision-and-replay.md).
+-- Slot 174 is the next free slot on origin/main. Slots 168 through
+-- 172 are reserved by sibling PRs we cannot disturb (per ADR-041 /
+-- migration-slot-renumber-at-pr-creation memory), and 173 is taken
+-- by invocations_outcome — confirm with `git fetch origin main;
+-- git ls-tree origin/main migrations | tail` before opening this PR.
 --
 -- Replay-safe (ADR-041): CREATE INDEX IF NOT EXISTS is idempotent
 -- in Postgres; rolling forward re-applies cleanly.
@@ -36,23 +36,23 @@
 --                               transitively when the audit-log search
 --                               (PR #3) joins on kind).
 CREATE INDEX IF NOT EXISTS orgs_created_at_idx
-    ON public.orgs USING btree (created_at DESC);
+    ON orgs USING btree (created_at DESC);
 
 CREATE INDEX IF NOT EXISTS orgs_status_idx
-    ON public.orgs USING btree (status)
+    ON orgs USING btree (status)
     WHERE status <> 'active';
 
 CREATE INDEX IF NOT EXISTS builds_account_created_idx
-    ON public.builds USING btree (account_id, created_at DESC);
+    ON builds USING btree (account_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS events_kind_at_idx
-    ON public.events USING btree (kind, at DESC);
+    ON events USING btree (kind, at DESC);
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-DROP INDEX IF EXISTS public.events_kind_at_idx;
-DROP INDEX IF EXISTS public.builds_account_created_idx;
-DROP INDEX IF EXISTS public.orgs_status_idx;
-DROP INDEX IF EXISTS public.orgs_created_at_idx;
+DROP INDEX IF EXISTS events_kind_at_idx;
+DROP INDEX IF EXISTS builds_account_created_idx;
+DROP INDEX IF EXISTS orgs_status_idx;
+DROP INDEX IF EXISTS orgs_created_at_idx;
 -- +goose StatementEnd
