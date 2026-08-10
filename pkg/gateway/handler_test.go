@@ -1399,3 +1399,141 @@ func TestStatusRecorder_FlushTriggers(t *testing.T) {
 type nopFlusher struct{}
 
 func (nopFlusher) Flush() {}
+
+// stubEdgeRuleMatcher is a hand-rolled EdgeRuleMatcher that returns
+// pre-seeded rules for a single host. Used by the PR 4 review-fix
+// regression tests to exercise matchAndApplyRewrite / ServeHTTP
+// without touching the store or the LRU cache. Embeds
+// noOpEdgeRuleMatcher (pkg/gateway/edge_rules.go) for the unused
+// methods so the interface stays satisfied.
+type stubEdgeRuleMatcher struct {
+	noOpEdgeRuleMatcher
+	rewrite  *EdgeRuleRewriteResolved
+	redirect *EdgeRuleRedirectResolved
+	headers  *EdgeRuleHeadersResolved
+}
+
+func (s stubEdgeRuleMatcher) MatchRewrite(_ context.Context, _, _, _ string) *EdgeRuleRewriteResolved {
+	return s.rewrite
+}
+
+func (s stubEdgeRuleMatcher) MatchRedirect(_ context.Context, _, _, _ string) *EdgeRuleRedirectResolved {
+	return s.redirect
+}
+
+func (s stubEdgeRuleMatcher) MatchHeaders(_ context.Context, _, _, _ string) *EdgeRuleHeadersResolved {
+	return s.headers
+}
+
+// TestMatchAndApplyRewrite_PrefixAddToSlash_NoDoubleSlash pins the
+// PR 4 review-fix F2: rule {From: "", To: "/"} (valid per apid
+// EdgeRuleRewriteAction.Validate — non-empty is the only check)
+// previously produced "//api/x" because singleSlash("/") returns "/"
+// and r.URL.Path already starts with "/". The fix drops To's leading
+// "/" before concatenating with r.URL.Path[1:], so the result is
+// just r.URL.Path (a degenerate rewrite that leaves the path alone).
+func TestMatchAndApplyRewrite_PrefixAddToSlash_NoDoubleSlash(t *testing.T) {
+	app := App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}
+	matcher := stubEdgeRuleMatcher{
+		rewrite: &EdgeRuleRewriteResolved{
+			ID: "rule-1", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			From: "", To: "/",
+		},
+	}
+	h := &Handler{edgeRules: matcher, metrics: NewMetrics()}
+	r := httptest.NewRequest("GET", "http://h.example.com/api/x", nil)
+	if !h.matchAndApplyRewrite(r, app) {
+		t.Fatalf("matchAndApplyRewrite returned false; want true (rule matched)")
+	}
+	if r.URL.Path == "//api/x" {
+		t.Errorf("r.URL.Path = %q; double-slash regression (review-fix F2)", r.URL.Path)
+	}
+	if r.URL.Path != "/api/x" {
+		t.Errorf("r.URL.Path = %q; want %q (degenerate rewrite leaves path alone)", r.URL.Path, "/api/x")
+	}
+}
+
+// TestMatchAndApplyRewrite_PrefixAddToNonSlash_PrefixesCorrectly
+// pins the positive case that review-fix F2 must NOT break: rule
+// {From: "", To: "/v1"} must still produce "/v1/api/x" for an
+// inbound /api/x. The fix uses r.URL.Path[1:] to drop the leading
+// "/" before concatenating with To's body after singleSlash.
+func TestMatchAndApplyRewrite_PrefixAddToNonSlash_PrefixesCorrectly(t *testing.T) {
+	app := App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}
+	matcher := stubEdgeRuleMatcher{
+		rewrite: &EdgeRuleRewriteResolved{
+			ID: "rule-1", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			From: "", To: "/v1",
+		},
+	}
+	h := &Handler{edgeRules: matcher, metrics: NewMetrics()}
+	r := httptest.NewRequest("GET", "http://h.example.com/api/x", nil)
+	if !h.matchAndApplyRewrite(r, app) {
+		t.Fatalf("matchAndApplyRewrite returned false; want true")
+	}
+	if r.URL.Path != "/v1/api/x" {
+		t.Errorf("r.URL.Path = %q; want /v1/api/x", r.URL.Path)
+	}
+}
+
+// TestServeHTTP_RedirectObservePassesPlanLabel pins PR 4 review-fix
+// F1: the redirect branch's h.observe call previously passed
+// app.AccountID as the plan parameter, breaking the §12 dashboard
+// cardinality contract (ObserveRequest{app_id, plan, code} would be
+// labelled with unbounded-cardinality account IDs). The fix uses
+// string(app.Plan) to match the other 14+ call sites in this file.
+// This end-to-end test wires a redirect-only stub matcher, fires a
+// request, and asserts the metric carries plan="pro" (NOT the
+// account ID "acct-1").
+func TestServeHTTP_RedirectObservePassesPlanLabel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("never reached — redirect short-circuits"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "r.example.com",
+		upstream: upstream.Listener.Addr().String(),
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	matcher := stubEdgeRuleMatcher{
+		redirect: &EdgeRuleRedirectResolved{
+			ID: "rule-r", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			StatusCode: 308, To: "https://target.example.com",
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("GET", "http://r.example.com/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// Assert the redirect fired (short-circuit, so the upstream was
+	// never contacted).
+	if rec.Code != http.StatusPermanentRedirect {
+		t.Fatalf("rec.Code = %d; want 308", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "https://target.example.com" {
+		t.Errorf("Location = %q; want https://target.example.com", loc)
+	}
+
+	// Assert the ObserveRequest metric carries plan="pro" — NOT the
+	// account ID. The metric is a CounterVec with labels
+	// (app, plan, code) per pkg/gateway/metrics.go:294; bodyForHistogram
+	// is the same scrape helper TestHandlerObserveRequestDuration uses.
+	body := bodyForHistogram(t, h.metrics)
+	if !strings.Contains(body, `app="app-1"`) ||
+		!strings.Contains(body, `plan="pro"`) {
+		t.Errorf("metric labels wrong: want app=app-1 plan=pro; body:\n%s", body)
+	}
+	if strings.Contains(body, `plan="acct-1"`) {
+		t.Errorf("metric plan label carries account ID (review-fix F1 regression); body:\n%s", body)
+	}
+}

@@ -887,6 +887,263 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 	return true
 }
 
+// matchAndApplyRewrite (ADR-089 / issue #561 PR 4) consults the
+// per-host edge-rule matcher for a `kind=rewrite` rule. On a hit,
+// the rule's `From` prefix is replaced with `To` on r.URL.Path in
+// place (the upstream app sees the rewritten path). The matcher's
+// same-account check (rule.AccountID != app.AccountID) emits the
+// `edge_rule.rewrite_blocked` audit + `outcome=blocked` metric
+// and silently falls through (same posture as
+// matchAndSubstituteRoute's cross-account branch).
+//
+// Returns true when a rule fired AND the path was actually mutated
+// — the caller proceeds normally (no short-circuit). nil-safe:
+// h.edgeRules == nil returns false.
+//
+// Extracted from ServeHTTP to keep the handler cap under 50 lines.
+func (h *Handler) matchAndApplyRewrite(r *http.Request, app App) bool {
+	if h.edgeRules == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchRewrite(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("rewrite", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.rewrite_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"from_path":       r.URL.Path,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("rewrite", "blocked")
+		}
+		return false
+	}
+	// Apply the prefix-strip + replacement. From="" means
+	// "match-any path" (the path-glob filter passed); we still
+	// need a non-empty To to actually mutate. A rule with From=""
+	// but To="/v1" effectively prefixes every request — the spec
+	// §13.4 documents this. From="*" is treated identically.
+	from := rule.From
+	if from == "*" {
+		from = ""
+	}
+	if from == "" {
+		// Pure prefix-add: prepend To to the existing path. Both
+		// singleSlash(To) and r.URL.Path start with "/" so we can't
+		// just concatenate — that produces "//api/x" (double slash)
+		// when To="/" (valid per apid EdgeRuleRewriteAction.Validate
+		// — non-empty is the only check). We special-case To="/"
+		// (degenerate rewrite, leave path alone) and otherwise
+		// concatenate the single-slashed To with r.URL.Path as-is.
+		// For To="/v1" + /api/x → "/v1/api/x".
+		to := singleSlash(rule.To)
+		if to == "/" {
+			// Degenerate rewrite (from="", To="/") — leave
+			// r.URL.Path unchanged.
+		} else {
+			r.URL.Path = to + r.URL.Path
+		}
+	} else if strings.HasPrefix(r.URL.Path, from) {
+		r.URL.Path = singleSlash(rule.To) + r.URL.Path[len(from):]
+	} else {
+		// The path-glob filter matched but the From prefix
+		// doesn't actually prefix the path (e.g. glob="/api/*"
+		// matched "/api/v1" but From="/v1/"). Treat as miss —
+		// the customer wrote inconsistent config; we don't fire.
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("rewrite", "miss")
+		}
+		return false
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.rewrite_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+			"from":      from,
+			"to":        rule.To,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("rewrite", "match")
+	}
+	return true
+}
+
+// matchAndApplyRedirect (ADR-089 / issue #561 PR 4) consults the
+// per-host edge-rule matcher for a `kind=redirect` rule. On a hit,
+// emits a 3xx via http.Redirect (stdlib) — additional headers from
+// the rule's EdgeRuleRedirectAction.Headers map are stamped on the
+// response via w.Header().Set BEFORE the redirect. Returns true
+// when a rule fired; the caller MUST `return` immediately (the
+// request short-circuits — no Lookup, no proxy).
+//
+// Same-account posture mirrors matchAndSubstituteRoute: cross-account
+// falls through silently with `edge_rule.redirect_blocked` audit +
+// `outcome=blocked` metric. nil-safe.
+//
+// Extracted from ServeHTTP to keep the handler cap under 50 lines.
+func (h *Handler) matchAndApplyRedirect(w http.ResponseWriter, r *http.Request, app App) bool {
+	if h.edgeRules == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchRedirect(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("redirect", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.redirect_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"to":              rule.To,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("redirect", "blocked")
+		}
+		return false
+	}
+	// Stamp additional response headers (the rule's Headers map).
+	for k, v := range rule.Headers {
+		w.Header().Set(k, v)
+	}
+	status := rule.StatusCode
+	if status != http.StatusMovedPermanently &&
+		status != http.StatusFound &&
+		status != http.StatusTemporaryRedirect &&
+		status != http.StatusPermanentRedirect {
+		status = http.StatusFound // 302 default per pkg/api/dto.go Validate
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.redirect_matched", nil, map[string]any{
+			"rule_id":     rule.ID,
+			"from_host":   r.Host,
+			"to":          rule.To,
+			"status_code": status,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("redirect", "match")
+	}
+	//nolint:gosec // rule.To is validated by apid Validate (pkg/api/dto.go:3337-3357) at create time: must be a non-empty URL/path. The customer's free-form redirect target IS the product surface — same posture as Cloudflare's "URL redirect" rules.
+	http.Redirect(w, r, rule.To, status)
+	return true
+}
+
+// applyEdgeRuleHeaders (ADR-089 / issue #561 PR 4) consults the
+// per-host edge-rule matcher for a `kind=headers` rule. On a hit,
+// applies RequestHeaders to r (mutates r.Header in place BEFORE
+// the proxy leg) and ResponseHeaders to w (wraps w with a
+// headerRecorder that applies ops on WriteHeader BEFORE the
+// downstream status code is committed).
+//
+// Same-account posture mirrors matchAndSubstituteRoute: cross-account
+// falls through silently with `edge_rule.headers_blocked` audit +
+// `outcome=blocked` metric. nil-safe.
+//
+// Returns true when a rule fired (caller proceeds normally).
+// Extracted from ServeHTTP to keep the handler cap under 50 lines.
+func (h *Handler) applyEdgeRuleHeaders(w http.ResponseWriter, r *http.Request, app App, rec *statusRecorder) bool {
+	if h.edgeRules == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchHeaders(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("headers", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.headers_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("headers", "blocked")
+		}
+		return false
+	}
+	// Request-side ops: apply directly to r.Header.
+	for _, op := range rule.RequestHeaders {
+		applyHeaderOp(r.Header, op)
+	}
+	// Response-side ops: wrap w with a headerRecorder that
+	// applies ops at WriteHeader commit time. Reuses the same
+	// statusRecorder pattern that PR-B streaming introduced.
+	if len(rule.ResponseHeaders) > 0 && rec != nil {
+		rec.installHeaderOps(rule.ResponseHeaders)
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.headers_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+			"req_ops":   len(rule.RequestHeaders),
+			"resp_ops":  len(rule.ResponseHeaders),
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("headers", "match")
+	}
+	return true
+}
+
+// singleSlash collapses a path to the canonical slash form (no
+// double slashes from `To: "/v1"` + `/api/...`). Helper for
+// matchAndApplyRewrite's prefix-add and replace branches.
+func singleSlash(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if len(p) > 1 && strings.HasSuffix(p, "/") {
+		p = p[:len(p)-1]
+	}
+	return p
+}
+
+// applyHeaderOp applies one EdgeRuleHeaderOp mutation to a header
+// map. Action ∈ {add, set, remove}; Value is empty for "remove".
+// Blacklist (Host, Content-Length, Transfer-Encoding, Connection,
+// x-faas-*) is enforced at apid-Validate-time (PR 1) so this
+// helper trusts the input.
+func applyHeaderOp(hdr http.Header, op EdgeRuleHeaderOp) {
+	switch op.Action {
+	case "remove":
+		hdr.Del(op.Name)
+	case "set":
+		if op.Value == "" {
+			hdr.Del(op.Name)
+			return
+		}
+		hdr.Set(op.Name, op.Value)
+	default: // "add" and any unknown verb
+		if op.Value != "" {
+			hdr.Add(op.Name, op.Value)
+		}
+	}
+}
+
 // bearerTokenFromHeader is the per-deployment authz branch's
 // local copy of pkg/auth.Middleware.bearerToken. Duplicated
 // here (rather than re-exported from pkg/auth) so pkg/gateway
@@ -1620,6 +1877,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	app = lookedApp
 haveApp:
 
+	// Issue #561 / ADR-089 PR 4 — apply the per-host
+	// kind=redirect / kind=rewrite / kind=headers edge rules
+	// against the (possibly substituted) App context. Runs AFTER
+	// route substitution + Lookup so the same-account check sees
+	// the right AccountID. nil-safe: all three helpers short-
+	// circuit when h.edgeRules is nil (PR 3 behaviour preserved
+	// for unit tests + the e2e harness).
+	//
+	// Order (spec §13.4): redirect first (short-circuits BEFORE
+	// rewrite/headers so a redirect doesn't leak a rewritten path
+	// or stamped header), then rewrite (mutates r.URL.Path so
+	// the proxy leg sees the new path), then headers (mutates
+	// r.Header + installs a response-side hook on `rec`). A
+	// redirect with `Content-Type` set by a same-host headers
+	// rule would leak the header; the order prevents this.
+	if h.matchAndApplyRedirect(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+	h.matchAndApplyRewrite(r, app)
+	h.applyEdgeRuleHeaders(w, r, app, rec)
+
 	// Issue #560 / per-deployment require_authn. Runs AFTER
 	// Host→app resolution (so we know which app's
 	// require_authn to consult) and BEFORE the per-account
@@ -2342,6 +2621,17 @@ type statusRecorder struct {
 	Bytes       int64
 	ContentType string
 
+	// headerOps (ADR-089 / issue #561 PR 4) is the per-request
+	// list of EdgeRuleHeaderOp mutations a kind=headers rule
+	// applied BEFORE the proxy leg. Applied at WriteHeader commit
+	// time so the response headers are stamped on the wire BEFORE
+	// the status code is sent. nil = no-op (default; tests + the
+	// e2e harness without edge rules). installHeaderOps is the
+	// setter the applyEdgeRuleHeaders helper calls; the ops run
+	// in declared order (Cloudflare "first wins" semantics for
+	// `set`).
+	headerOps []EdgeRuleHeaderOp
+
 	// Streaming fields (PR-B, nil → buffered path). Install via
 	// installFlushHook; the fields stay zero otherwise.
 	flusher          http.Flusher
@@ -2398,8 +2688,33 @@ func (s *statusRecorder) WriteHeader(code int) {
 		// reading it here is race-free relative to the underlying
 		// ResponseWriter.
 		s.ContentType = s.ResponseWriter.Header().Get("Content-Type")
+		// ADR-089 / issue #561 PR 4: apply any EdgeRuleHeaderOp
+		// mutations the applyEdgeRuleHeaders helper installed
+		// BEFORE the status code is committed. The ops run in
+		// declared order; `add` appends, `set` replaces,
+		// `remove` deletes (see applyHeaderOp in handler.go).
+		// Blacklist (Host, Content-Length, Transfer-Encoding,
+		// Connection, x-faas-*) is enforced at apid-Validate-time
+		// so we trust the slice here.
+		for _, op := range s.headerOps {
+			applyHeaderOp(s.Header(), op)
+		}
 	}
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// installHeaderOps (ADR-089 / issue #561 PR 4) arms the recorder
+// with the kind=headers rule's response-side mutations. Called by
+// applyEdgeRuleHeaders when a rule fires; nil-safe (a nil ops
+// slice or a nil receiver is a no-op). The ops apply on the next
+// WriteHeader call — the writer chain is unchanged (no wrapper
+// insertion; we just mutate the inner Header map at commit time,
+// matching the spec §13.4 "applied before status code" contract).
+func (s *statusRecorder) installHeaderOps(ops []EdgeRuleHeaderOp) {
+	if s == nil || len(ops) == 0 {
+		return
+	}
+	s.headerOps = ops
 }
 
 // lgtm[go/reflected-xss] false-positive: statusRecorder is a pass-through; every caller writes application/json, application/problem+json (api.WriteProblem at :326/:335/:366/:384/:906/:911/:914) or proxies to a Firecracker guest rendered via html/template. See statusRecorder doc-comment.

@@ -343,3 +343,231 @@ func TestGatewaydEdgeRulesAud_NilInnerIsNoOp(t *testing.T) {
 	aud := &gatewaydEdgeRulesAud{inner: nil}
 	aud.Emit(context.Background(), "edge_rule.route_matched", nil, map[string]any{}) // must not panic
 }
+
+// --- PR 4 surface: kind=rewrite / kind=redirect / kind=headers -----
+
+func sampleRewriteActionRule(id string, priority int, host, path string, methods []string, from, to string) state.EdgeRule {
+	return state.EdgeRule{
+		ID:           id,
+		AccountID:    "acc_test",
+		AppID:        "app_test",
+		MatchHost:    host,
+		MatchPath:    path,
+		MatchMethods: methods,
+		Priority:     priority,
+		Enabled:      true,
+		Kind:         state.EdgeRuleKindRewrite,
+		Action: state.EdgeRuleAction{
+			Kind:    state.EdgeRuleKindRewrite,
+			Rewrite: &state.EdgeRuleRewriteAction{From: from, To: to},
+		},
+	}
+}
+
+func sampleRedirectActionRule(id string, priority int, host, path string, methods []string, status int, to string, hdrs map[string]string) state.EdgeRule {
+	return state.EdgeRule{
+		ID:           id,
+		AccountID:    "acc_test",
+		AppID:        "app_test",
+		MatchHost:    host,
+		MatchPath:    path,
+		MatchMethods: methods,
+		Priority:     priority,
+		Enabled:      true,
+		Kind:         state.EdgeRuleKindRedirect,
+		Action: state.EdgeRuleAction{
+			Kind:     state.EdgeRuleKindRedirect,
+			Redirect: &state.EdgeRuleRedirectAction{StatusCode: status, To: to, Headers: hdrs},
+		},
+	}
+}
+
+func sampleHeadersActionRule(id string, priority int, host, path string, methods []string, reqHdrs, respHdrs []state.EdgeRuleHeaderOp) state.EdgeRule {
+	return state.EdgeRule{
+		ID:           id,
+		AccountID:    "acc_test",
+		AppID:        "app_test",
+		MatchHost:    host,
+		MatchPath:    path,
+		MatchMethods: methods,
+		Priority:     priority,
+		Enabled:      true,
+		Kind:         state.EdgeRuleKindHeaders,
+		Action: state.EdgeRuleAction{
+			Kind:    state.EdgeRuleKindHeaders,
+			Headers: &state.EdgeRuleHeadersAction{RequestHeaders: reqHdrs, ResponseHeaders: respHdrs},
+		},
+	}
+}
+
+func TestCompileRewriteRules_KeepsOnlyKindRewrite(t *testing.T) {
+	in := []state.EdgeRule{
+		sampleRewriteActionRule("rewrite-1", 0, "a.example.com", "/", nil, "/api", "/v1"),
+		{
+			ID: "route-1", AccountID: "acc_test", AppID: "app_test",
+			MatchHost: "a.example.com", Priority: 0, Enabled: true,
+			Kind: state.EdgeRuleKindRoute,
+			Action: state.EdgeRuleAction{
+				Kind:  state.EdgeRuleKindRoute,
+				Route: &state.EdgeRuleRouteAction{TargetAppSlug: "demo"},
+			},
+		},
+	}
+	got, parseErrs := compileRewriteRules(in)
+	if len(parseErrs) != 0 {
+		t.Errorf("parseErrs = %v, want empty", parseErrs)
+	}
+	if len(got) != 1 || got[0].ID != "rewrite-1" {
+		t.Errorf("got %d rules, want 1 (kind filter)", len(got))
+	}
+	if got[0].From != "/api" || got[0].To != "/v1" {
+		t.Errorf("From/To not copied: got %q/%q", got[0].From, got[0].To)
+	}
+}
+
+func TestCompileRedirectRules_DefaultsStatusCode(t *testing.T) {
+	in := []state.EdgeRule{
+		sampleRedirectActionRule("redirect-1", 0, "a.example.com", "/", nil, 0, "https://b", nil),
+	}
+	got, parseErrs := compileRedirectRules(in)
+	if len(parseErrs) != 0 {
+		t.Errorf("parseErrs = %v, want empty", parseErrs)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1", len(got))
+	}
+	if got[0].StatusCode != 302 {
+		t.Errorf("StatusCode = %d, want 302 (default)", got[0].StatusCode)
+	}
+}
+
+func TestCompileRedirectRules_CopiesHeaders(t *testing.T) {
+	hdrs := map[string]string{"X-Frame-Options": "DENY"}
+	in := []state.EdgeRule{
+		sampleRedirectActionRule("redirect-1", 0, "a.example.com", "/", nil, 308, "https://b", hdrs),
+	}
+	got, _ := compileRedirectRules(in)
+	if len(got) != 1 || got[0].Headers["X-Frame-Options"] != "DENY" {
+		t.Errorf("Headers not copied: got %v", got[0].Headers)
+	}
+}
+
+func TestCompileHeadersRules_CopiesOpsInOrder(t *testing.T) {
+	ops := []state.EdgeRuleHeaderOp{
+		{Name: "X-A", Value: "1", Action: "set"},
+		{Name: "X-A", Value: "2", Action: "set"},
+		{Name: "X-B", Value: "3", Action: "remove"},
+	}
+	in := []state.EdgeRule{
+		sampleHeadersActionRule("headers-1", 0, "a.example.com", "/", nil, ops, ops),
+	}
+	got, _ := compileHeadersRules(in)
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1", len(got))
+	}
+	if len(got[0].RequestHeaders) != 3 || got[0].RequestHeaders[1].Value != "2" {
+		t.Errorf("RequestHeaders order not preserved: %v", got[0].RequestHeaders)
+	}
+	if len(got[0].ResponseHeaders) != 3 || got[0].ResponseHeaders[2].Action != "remove" {
+		t.Errorf("ResponseHeaders order not preserved: %v", got[0].ResponseHeaders)
+	}
+}
+
+func TestCompileRewriteRules_EmptyInputProducesEmptyOutput(t *testing.T) {
+	if got, parseErrs := compileRewriteRules(nil); got != nil || parseErrs != nil {
+		t.Errorf("compileRewriteRules(nil) = %v, %v", got, parseErrs)
+	}
+}
+
+func TestCompileRedirectRules_EmptyInputProducesEmptyOutput(t *testing.T) {
+	if got, parseErrs := compileRedirectRules(nil); got != nil || parseErrs != nil {
+		t.Errorf("compileRedirectRules(nil) = %v, %v", got, parseErrs)
+	}
+}
+
+func TestCompileHeadersRules_EmptyInputProducesEmptyOutput(t *testing.T) {
+	if got, parseErrs := compileHeadersRules(nil); got != nil || parseErrs != nil {
+		t.Errorf("compileHeadersRules(nil) = %v, %v", got, parseErrs)
+	}
+}
+
+func TestGatewaydEdgeRules_MatchRewrite_CacheMissHitsStore(t *testing.T) {
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": {
+				sampleRewriteActionRule("rewrite-1", 0, "a.example.com", "/api/*", nil, "/api", "/v1"),
+			},
+		},
+	}
+	g := newGatewaydEdgeRules(store, newQuietLogger())
+	got := g.MatchRewrite(context.Background(), "a.example.com", "/api/x", "GET")
+	if got == nil {
+		t.Fatalf("MatchRewrite = nil, want rule")
+	}
+	if got.From != "/api" || got.To != "/v1" {
+		t.Errorf("got From/To %q/%q, want /api/v1", got.From, got.To)
+	}
+	if store.calls["a.example.com"] != 1 {
+		t.Errorf("store calls = %d, want 1", store.calls["a.example.com"])
+	}
+}
+
+func TestGatewaydEdgeRules_MatchRedirect_CacheMissHitsStore(t *testing.T) {
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": {
+				sampleRedirectActionRule("redirect-1", 0, "a.example.com", "/", nil, 308, "https://b", nil),
+			},
+		},
+	}
+	g := newGatewaydEdgeRules(store, newQuietLogger())
+	got := g.MatchRedirect(context.Background(), "a.example.com", "/", "GET")
+	if got == nil {
+		t.Fatalf("MatchRedirect = nil, want rule")
+	}
+	if got.StatusCode != 308 || got.To != "https://b" {
+		t.Errorf("got status %d to %q, want 308 https://b", got.StatusCode, got.To)
+	}
+}
+
+func TestGatewaydEdgeRules_MatchHeaders_CacheMissHitsStore(t *testing.T) {
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": {
+				sampleHeadersActionRule("headers-1", 0, "a.example.com", "/", nil,
+					[]state.EdgeRuleHeaderOp{{Name: "X-Test", Value: "1", Action: "set"}},
+					nil,
+				),
+			},
+		},
+	}
+	g := newGatewaydEdgeRules(store, newQuietLogger())
+	got := g.MatchHeaders(context.Background(), "a.example.com", "/", "GET")
+	if got == nil {
+		t.Fatalf("MatchHeaders = nil, want rule")
+	}
+	if len(got.RequestHeaders) != 1 || got.RequestHeaders[0].Name != "X-Test" {
+		t.Errorf("got RequestHeaders %v, want one X-Test op", got.RequestHeaders)
+	}
+}
+
+func TestGatewaydEdgeRules_SharedCacheAcrossKinds(t *testing.T) {
+	// PR 4 plan D5: a cache miss for any kind recompiles all four
+	// kinds together (the SQL roundtrip dominates). Verify by
+	// hitting Match* for two kinds on the same host and asserting
+	// the store is called exactly once across both hits.
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": {
+				sampleRouteRule("route-1", 100, "a.example.com", "/", nil, "demo"),
+				sampleRewriteActionRule("rewrite-1", 50, "a.example.com", "/", nil, "/api", "/v1"),
+			},
+		},
+	}
+	g := newGatewaydEdgeRules(store, newQuietLogger())
+	_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
+	_ = g.MatchRewrite(context.Background(), "a.example.com", "/", "GET")
+	if store.calls["a.example.com"] != 1 {
+		t.Errorf("store calls = %d, want 1 (shared cache recompiles all kinds)", store.calls["a.example.com"])
+	}
+}

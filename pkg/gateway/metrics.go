@@ -525,10 +525,13 @@ func NewMetrics() *Metrics {
 	// tlsOnDemandDenied / accountRateLimited pre-instantiation
 	// pattern above. To add a new outcome (e.g. remote_*):
 	// extend this slice; the metric name stays stable.
-	// ADR-089 PR 3 — pre-instantiate the closed (kind, outcome)
-	// cross product for every shipped kind. PR 4-7 add kinds to
-	// the outer loop; the outcome set is stable across kinds.
-	for _, kind := range []string{"route"} {
+	// ADR-089 PR 3 + PR 4 — pre-instantiate the closed (kind, outcome)
+	// cross product for every shipped kind. PR 5-7 add kinds to
+	// the outer loop (cors / jwt / ip); the outcome set is stable
+	// across kinds. The closed set guarantees the §12 dashboard
+	// panel "edge rule match rate" surfaces every (kind, outcome)
+	// tuple from first scrape.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers"} {
 		for _, outcome := range []string{"match", "miss", "blocked"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
