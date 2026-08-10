@@ -177,26 +177,45 @@ func readArchiveCreds(path string) (archiveCreds, error) {
 // where empty means "skip the listener entirely"). The test
 // seam + the explicit-empty-disable semantic are the reasons this
 // helper exists as a package-level function (vs a Config.Get
-// method). Defaults to "127.0.0.1:9101" so an operator typo (or a
+// metricsAddrDefault is the loopback bind address for the /metrics
+// listener. The default is loopback so an operator typo (or a
 // missing env var in prod) can't accidentally expose the internal
-// registry to the public network — series like
-// apid_ops_total{op,code} leak auth-rejection rates and per-route
-// traffic shape (review finding #1 on PR #132). Loopback bind is
-// safe because the local Prometheus scrapes from the box itself.
-// Mirrors cmd/builderd/main.go's MetricsAddr pattern (PR #124).
+// registry to the public network — series like apid_ops_total{op,code}
+// leak auth-rejection rates and per-route traffic shape (review
+// finding #1 on PR #132). Loopback bind is safe because the local
+// Prometheus scrapes from the box itself. Mirrors cmd/builderd/main.go's
+// MetricsAddr pattern (PR #124).
+//
+// PR-0 (issue #678): the literal was repeated 3+ times across the
+// pre-PR-0 inline env reads, the post-PR-0 resolveMetricsAddr helper,
+// and the package-level default. Extracted to a const for goconst
+// (golangci-lint v2.4.0 fires at 3 occurrences).
+const metricsAddrDefault = "127.0.0.1:9101"
+
+// resolveMetricsAddr reads FAAS_APID_METRICS_ADDR via the test
+// seam (deps.getenv). Empty string disables the listener (the
+// deliberately-distinct envOr path: envOr() collapses empty→unset→
+// fallback, which is right for FAAS_APID_LISTEN but wrong here,
+// where empty means "skip the listener entirely"). The test
+// seam + the explicit-empty-disable semantic are the reasons this
+// helper exists as a package-level function (vs a Config.Get
+// method). Defaults to metricsAddrDefault so an operator typo (or
+// a missing env var in prod) can't accidentally expose the
+// internal registry to the public network.
 //
 // The e2e harness stamps `FAAS_APID_METRICS_ADDR=` to avoid the
-// 127.0.0.1:9101 bind race against a sibling or zombie apid run.
+// metricsAddrDefault bind race against a sibling or zombie apid
+// run.
 //
 // PR-0 (issue #678): the tomlDefault argument pulls the default
 // from cfg.GetMetricsAddr so a TOML-configured metrics_addr is
 // respected (issue #678 PR-0 — apid's first ever TOML config).
 // When tomlDefault is non-empty, it wins over the package-level
-// default of 127.0.0.1:9101.
+// of metricsAddrDefault.
 func resolveMetricsAddr(getenv func(string) string, tomlDefault string) string {
 	v := getenv("FAAS_APID_METRICS_ADDR")
 	if v == "" && tomlDefault == "" {
-		return "127.0.0.1:9101"
+		return metricsAddrDefault
 	}
 	if v == "" {
 		return tomlDefault
@@ -244,16 +263,6 @@ func resolveGithubdBridgeSock(getenv func(string) string, cfg *Config) string {
 	}
 	return getenv("FAAS_APID_GITHUBD_BRIDGE_SOCK")
 }
-
-// listenAddr is the bind address for apid. Behind gatewayd-internal; not a public
-// listener. Overridable via FAAS_APID_LISTEN so the e2e harness can pick a
-// free port without colliding with a dev daemon on 8081.
-//
-// PR-0 (issue #678): the package-level var is no longer used directly;
-// run() reads listenBind = cfg.GetListenAddr(deps.getenv) at startup and
-// binds deps.listen("tcp", listenBind). The variable is kept only as
-// backwards-compatible ground for tests that import the symbol.
-var listenAddr = envOr("FAAS_APID_LISTEN", "127.0.0.1:8081")
 
 // resolveGithubdStagingRoot reads FAAS_GITHUBD_WORK_DIR via the
 // test seam (deps.getenv). The default matches the githubd-side
@@ -1070,7 +1079,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// PR-0 (issue #678): resolveMetricsAddr honours the explicit-
 	// empty-disable semantic by reading FAAS_APID_METRICS_ADDR via
 	// the test seam (deps.getenv), then falls back to cfg.GetMetricsAddr
-	// (TOML), then to the legacy package default of 127.0.0.1:9101.
+	// (TOML), then to metricsAddrDefault.
 	var metricsSrv *http.Server
 	if metricsAddr := resolveMetricsAddr(deps.getenv, cfg.GetMetricsAddr(deps.getenv)); metricsAddr != "" {
 		metricsSrv = &http.Server{
