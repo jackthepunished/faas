@@ -96,6 +96,20 @@ type pkiFlags struct {
 	rootDir string
 	force   bool
 	daemon  string
+	// boxRole selects the per-box PKI subset (Gate-B PR-3). Empty
+	// preserves the pre-Gate-B posture of issuing every leaf from
+	// pkg/pki.Roles() — that's the canonical single-box dev/lima
+	// shape, and the implicit default for any operator who hasn't
+	// added a host_vars/faas-fsn-{1,2}.yml yet. Allowed values:
+	// "", "single-box", "control-plane", "compute-only".
+	//
+	// When set, --daemon is ignored if it would have widened the
+	// subset (--box-role wins; it's the per-box shape, --daemon is
+	// the per-rotation scope). When set to a value pkg/pki.RolesForBox
+	// does not recognise, init/rotate exit 1 with a clear error
+	// rather than silently issuing the full Roles() set (the
+	// fail-closed posture — see pkg/pki/pki.go:RolesForBox).
+	boxRole string
 }
 
 func newPKIFlags(name string, defaultForce bool) (*flag.FlagSet, *pkiFlags) {
@@ -107,6 +121,8 @@ func newPKIFlags(name string, defaultForce bool) (*flag.FlagSet, *pkiFlags) {
 		"re-issue leaves whose NotAfter is still >= 30d away (rotate path)")
 	fs.StringVar(&f.daemon, "daemon", "",
 		"rotate only the leaves in this directory (rotate path; e.g. --daemon egress to reissue just the egress server + meterd client leaves)")
+	fs.StringVar(&f.boxRole, "box-role", "",
+		"per-box PKI subset (Gate-B PR-3): '', 'single-box' = full Roles(); 'control-plane' = fsn-1 leaves; 'compute-only' = fsn-2 leaves")
 	return fs, f
 }
 
@@ -127,7 +143,7 @@ func cmdPKIInit(args []string) int {
 	if err != nil {
 		return printErr("pki init: ensure CA", err)
 	}
-	written, skipped, errs := ensureAllLeaves(f.rootDir, caCert, caKey, f.force)
+	written, skipped, errs := ensureAllLeaves(f.rootDir, caCert, caKey, f.force, f.boxRole)
 	for _, e := range errs {
 		fmt.Fprintf(os.Stderr, "  ! %v\n", e)
 	}
@@ -154,7 +170,7 @@ func cmdPKIStatus(args []string) int {
 		return 1
 	}
 	reportCAStatus(os.Stdout, f.rootDir)
-	reportLeafStatusAll(os.Stdout, f.rootDir)
+	reportLeafStatusAll(os.Stdout, f.rootDir, f.boxRole)
 	// Cheap "any expiring within threshold" gate so operators can use
 	// this in CI / cron to surface the rotate countdown. Exit 1 here is
 	// non-fatal for the human reader but useful as a Nagios-style
@@ -198,7 +214,7 @@ func cmdPKIRotate(args []string) int {
 	if err != nil {
 		return printErr("pki rotate: ensure CA", err)
 	}
-	written, _, errs := ensureAllLeavesFiltered(f.rootDir, caCert, caKey, true, f.daemon)
+	written, _, errs := ensureAllLeavesFiltered(f.rootDir, caCert, caKey, true, f.daemon, f.boxRole)
 	for _, e := range errs {
 		fmt.Fprintf(os.Stderr, "  ! %v\n", e)
 	}
@@ -249,14 +265,21 @@ func rotateRestartHint(daemon string) string {
 	return "Reload: systemctl reload faas-{apid,gatewayd-internal,schedd,vmmd,builderd,meterd,githubd}"
 }
 
-// ensureAllLeaves iterates pkg/pki.Roles() and ensures each is present.
-// Returns the count of freshly-written leaves, the count of leaves
-// skipped (NotAfter > ReissueThreshold), and a slice of per-leaf errors
-// (the caller decides whether the aggregate counts as success).
-func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool) (int, int, []error) {
+// ensureAllLeaves iterates the role set returned by
+// pki.RolesForBox(boxRole) (or pki.Roles() when boxRole=="") and
+// ensures each leaf is present. Returns the count of freshly-written
+// leaves, the count of leaves skipped (NotAfter > ReissueThreshold),
+// and a slice of per-leaf errors (the caller decides whether the
+// aggregate counts as success).
+//
+// boxRole is the Gate-B PR-3 per-box PKI subset selector; passing ""
+// preserves the pre-Gate-B posture (every leaf for every daemon,
+// which is the canonical single-box dev/lima shape).
+func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, boxRole string) (int, int, []error) {
+	roles := pki.RolesForBox(boxRole)
 	var written, skipped int
 	var errs []error
-	for _, role := range pki.Roles() {
+	for _, role := range roles {
 		err := pki.EnsureLeaf(rootDir, role, caCert, caKey, force)
 		switch {
 		case err == nil:
@@ -279,13 +302,20 @@ func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.Priv
 // that client cert at mTLS handshake time — rotating only the server
 // leaf would leave meterd holding a stale client cert and every
 // subsequent egress dial would fail with a tls: bad certificate.
-func ensureAllLeavesFiltered(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, daemon string) (int, int, []error) {
+//
+// boxRole is the Gate-B per-box subset filter (--box-role on the CLI).
+// When boxRole is non-empty, only the leaves whose Directory survives
+// the per-box filter are eligible for the --daemon narrowing; this is
+// how `gregale pki rotate --box-role=compute-only --daemon=imaged`
+// would only rotate the imaged server leaf on fsn-2.
+func ensureAllLeavesFiltered(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, daemon string, boxRole string) (int, int, []error) {
 	if daemon == "" {
-		return ensureAllLeaves(rootDir, caCert, caKey, force)
+		return ensureAllLeaves(rootDir, caCert, caKey, force, boxRole)
 	}
+	roles := pki.RolesForBox(boxRole)
 	var written, skipped int
 	var errs []error
-	for _, role := range pki.Roles() {
+	for _, role := range roles {
 		if !roleMatchesDaemon(role, daemon) {
 			continue
 		}
@@ -324,9 +354,12 @@ func reportCAStatus(w io.Writer, rootDir string) {
 	reportOneStatus(w, "ca       ", certPath)
 }
 
-// reportLeafStatusAll prints one line per leaf in pkg/pki.Roles().
-func reportLeafStatusAll(w io.Writer, rootDir string) {
-	for _, role := range pki.Roles() {
+// reportLeafStatusAll prints one line per leaf in
+// pki.RolesForBox(boxRole) (or pki.Roles() when boxRole==""). Mirrors
+// ensureAllLeaves so `gregale pki status` on fsn-2 only walks the
+// leaves that box actually owns.
+func reportLeafStatusAll(w io.Writer, rootDir, boxRole string) {
+	for _, role := range pki.RolesForBox(boxRole) {
 		certPath, _ := pki.LeafPaths(rootDir, role)
 		label := fmt.Sprintf("%-9s %s", role.Directory, role.Filename)
 		reportOneStatus(w, label, certPath)

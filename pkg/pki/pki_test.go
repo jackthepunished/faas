@@ -306,6 +306,71 @@ func TestRolesIncludesEveryDaemon(t *testing.T) {
 	}
 }
 
+// TestRolesForBoxIsSubsetOfRoles pins the Gate-B invariant (issue
+// #297 / ADR-025 §Tier 2): every per-box filter returned by
+// RolesForBox must be a STRICT subset of Roles(). A future operator
+// who adds a daemon to Roles() but forgets to update one of the
+// per-role sets will not silently lose the leaf — this test surfaces
+// the drift by asserting the per-box set is a subset of the
+// canonical set (the canonical set is the source of truth).
+//
+// Also pins:
+//   - RoleSingleBox returns Roles() verbatim (single-box dev
+//     back-compat — every daemon runs on one host).
+//   - The two per-box sets are non-empty (a future operator who
+//     accidentally zeroes the filter would not silently leave a box
+//     with no PKI material).
+//   - The two per-box sets are disjoint — no daemon directory
+//     appears on both boxes (a future operator who double-listed
+//     a directory would issue the leaf twice; the stdlib verifier
+//     would still accept it but the on-disk write would race).
+func TestRolesForBoxIsSubsetOfRoles(t *testing.T) {
+	canonical := Roles()
+	canonicalDirs := map[string]bool{}
+	for _, r := range canonical {
+		canonicalDirs[r.Directory] = true
+	}
+
+	cp := RolesForBox("control-plane")
+	co := RolesForBox("compute-only")
+	sb := RolesForBox("single-box")
+	sbEmpty := RolesForBox("")
+
+	if len(cp) == 0 {
+		t.Errorf("RolesForBox(control-plane) returned empty slice; expected a non-empty subset")
+	}
+	if len(co) == 0 {
+		t.Errorf("RolesForBox(compute-only) returned empty slice; expected a non-empty subset")
+	}
+	if len(sb) != len(canonical) {
+		t.Errorf("RolesForBox(single-box) returned %d leaves, want %d (== Roles())", len(sb), len(canonical))
+	}
+	if len(sbEmpty) != len(canonical) {
+		t.Errorf("RolesForBox(\"\") returned %d leaves, want %d (== Roles())", len(sbEmpty), len(canonical))
+	}
+
+	for _, r := range cp {
+		if !canonicalDirs[r.Directory] {
+			t.Errorf("RolesForBox(control-plane) emitted %q which is not in Roles()", r.Directory)
+		}
+	}
+	for _, r := range co {
+		if !canonicalDirs[r.Directory] {
+			t.Errorf("RolesForBox(compute-only) emitted %q which is not in Roles()", r.Directory)
+		}
+	}
+
+	cpDirs := map[string]bool{}
+	for _, r := range cp {
+		cpDirs[r.Directory] = true
+	}
+	for _, r := range co {
+		if cpDirs[r.Directory] {
+			t.Errorf("RolesForBox(compute-only) emitted %q which RolesForBox(control-plane) also emitted; per-box sets must be disjoint", r.Directory)
+		}
+	}
+}
+
 // TestLeafPathsRoundTrip pins the path helper: every Role's
 // LeafPaths() must produce a stable suffix so per-daemon TOML
 // references like `tls_cert_path = "/etc/faas/tls/<dir>/<file>.crt"`
