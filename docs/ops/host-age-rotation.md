@@ -61,6 +61,13 @@ no operator-driven re-seal is required because every daemon
 unseals under either key, and any new envelope written during
 the overlap is sealed under the new key automatically.
 
+ADR-089 (PR-C, 2026-08-10) ships the v2 follow-up: per-secret
+on-demand rotation (`POST /v1/apps/{slug}/secrets/{key}/rotate`,
+PR-B) plus a background re-seal walker (`FAAS_REKEY_ENABLED`,
+PR-C) that drains the table without operator intervention. See
+"Per-secret rotation" and "Background re-seal" below for the
+operator-facing surfaces.
+
 ## Preconditions
 
 - `gregale` is on PATH (it's the same binary as `faas`; the
@@ -354,10 +361,209 @@ must `sudo rm /etc/faas/secrets/host.age` first to use this
 escape hatch. The default flow is `prune-previous` (just
 delete), which is irreversible.
 
+## Per-secret rotation (on demand)
+
+For customers who want a fresh envelope under the current
+identity without waiting for the natural overlap (e.g. after
+`prune-previous` deletes the previous key and a row's
+ciphertext is now unreadable), `POST
+/v1/apps/{slug}/secrets/{key}/rotate` re-seals one row in
+place. The endpoint is RBAC-equivalent to the existing secrets
+PUT (admin scope, MFA-gated, owner-or-admin); the audit kind
+distinguishes it from first-time sets (`secret.rotated` vs
+`secret.set`).
+
+CLI shape (issue / ADR-089 PR-B):
+
+```sh
+faas secrets rotate --app my-app STRIPE_KEY \
+  --value 'sk_live_...'
+# or pipe from stdin / vault
+faas secrets rotate --app my-app STRIPE_KEY < new-key.txt
+```
+
+Response:
+
+```json
+{
+  "key": "STRIPE_KEY",
+  "rotated_at": "2026-08-10T13:42:01.123456Z",
+  "kid": "age1qz3p..."
+}
+```
+
+The `kid` is the recipient fingerprint of the current host
+identity (matches what `gregale host-age status` prints as
+the current key). After rotate, GET against the row returns
+the new ciphertext (still opaque to the customer); the
+plaintext is held by vmmd's per-wake secret injection.
+
+Idempotency: rotating the same value twice is allowed; each
+call emits a fresh envelope under the current kid and a
+`secret.rotated` audit row. The OpenMulti unseal side keeps
+working through the 30-day overlap window regardless of how
+many times the row has been rotated.
+
+When to use:
+
+- A row was sealed under the previous identity AND the
+  operator has just run `prune-previous` (so OpenMulti no
+  longer covers it). Per-secret rotate is the only path that
+  recovers that row without rebuilding it from the customer's
+  source-of-truth credential store.
+- Compliance regimes that demand fresh envelopes on a
+  per-secret schedule (e.g. quarterly rotation of every
+  customer-managed secret).
+
+When NOT to use:
+
+- For the bulk "every row in the table is stale" case. Use the
+  background re-seal (next section) — running per-secret
+  rotate for every customer is a 1×N round-trip with no
+  observable benefit.
+
+## Background re-seal (after host identity rotation)
+
+For the operator who has just promoted a new host identity and
+wants every `app_secrets` row re-sealed without manual
+intervention, `FAAS_REKEY_ENABLED=true` starts a background
+walker in `apid`. The walker drains the table under the current
+identity only — no operator round-trip, no per-customer API
+call — and is crash-safe across daemon restarts.
+
+### Enable the walker
+
+1. Confirm the new identity is in production:
+
+   ```sh
+   sudo gregale host-age status
+   # confirm: host.age exists, host.age.previous either does
+   # not exist (clean state) OR is <30 days old (overlap
+   # still active).
+   ```
+
+2. Stamp the env var on the `apid` systemd unit:
+
+   ```sh
+   sudo systemctl edit faas-apid
+   # add:
+   # [Service]
+   # Environment="FAAS_REKEY_ENABLED=true"
+   # Environment="FAAS_REKEY_PROGRESS_FILE=/var/lib/faas/rekey-progress.json"
+   sudo systemctl restart faas-apid
+   ```
+
+3. Verify boot:
+
+   ```sh
+   sudo journalctl -u faas-apid -n 50 --no-pager | grep rekey
+   # expect: "background re-seal enabled" + "progress_path=/var/lib/faas/rekey-progress.json"
+   ```
+
+### Monitor progress
+
+The walker persists a JSON snapshot to
+`FAAS_REKEY_PROGRESS_FILE` after every batch (default
+`/var/lib/faas/rekey-progress.json`, mode `0o600 root:root`).
+The on-disk file is the operator's source of truth — it is
+crash-safe (atomic rename after every batch tick) and survives
+a `systemctl restart`.
+
+```sh
+sudo cat /var/lib/faas/rekey-progress.json | jq
+# {
+#   "total": 50000,
+#   "rekeyed": 42318,
+#   "skipped": 7682,
+#   "failed": 0,
+#   "last_id": "<account_id>|<app_id>|<key>"
+# }
+```
+
+`total` is cumulative rows visited; `rekeyed + skipped` is
+the success metric. `skipped` is a row whose kid already
+matched the current identity — natural PUTs during the
+overlap window sealed under the new key, so the walker has
+nothing to do for them. `failed > 0` is the tripwire; see the
+next subsection.
+
+The `GET /v1/admin/secrets/rekey-progress` endpoint returns
+the same shape via HTTP. The endpoint is admin-only (admin
+scope + the operator email allowlist from `FAAS_ADMIN_EMAILS`).
+When `FAAS_REKEY_ENABLED` is unset the endpoint returns
+`503 rekey_disabled` so a misconfigured box is observable on
+the wire rather than silently returning a zero-progress 200.
+
+```sh
+curl -H "Authorization: Bearer $ADMIN_KEY" \
+  https://apid.example.com/v1/admin/secrets/rekey-progress
+```
+
+### Failure recovery
+
+`failed > 0` means a row's ciphertext could not be unsealed
+(most often: the row was sealed under an identity that is no
+longer in `OpenMulti` reach — the operator ran
+`prune-previous` before the walker drained). The walker's
+crash-safe model retries these on the next daemon restart; the
+operator's recovery procedure is:
+
+1. Stop apid.
+2. Restore the missing identity: `gregale host-age rotate
+   --previous <path-to-backup>` re-installs the previous key
+   under `/etc/faas/secrets/host.age.previous`, restoring the
+   OpenMulti overlap window.
+3. Restart apid with `FAAS_REKEY_ENABLED=true`. The walker
+   resumes from the on-disk cursor (the pinned cursor model
+   in `pkg/rekey.Run` re-fetches failed rows via the `>=`
+   fence, so the failed count drops to zero on retry).
+4. Confirm:
+
+   ```sh
+   sudo cat /var/lib/faas/rekey-progress.json | jq .failed
+   # expect: 0
+   ```
+
+If the previous identity cannot be recovered (the file is
+truly lost), the only path is per-secret rotate for each
+failed row from the customer's source-of-truth credential
+store — the walker has nothing to unseal with.
+
+### What the walker does NOT do
+
+- It does not touch `audit-hmac.key`, `recovery-hmac.key`, or
+  any other derived secret. The audit-join key is
+  independently generated and stable across host.age rotation
+  (spec §11).
+- It does not change `host.age` or `host.age.previous`. The
+  operator rotates the key file via `gregale host-age rotate`;
+  the walker only re-seals `app_secrets` rows under the
+  already-promoted new identity.
+- It does not retry a row whose kid already matched the
+  current identity. `skipped` is a one-way decision: a row
+  sealed under the current kid does not need to be re-sealed.
+- It does not require SIGHUP or any signal handling. A new
+  identity requires a daemon restart (the walker reads
+  identities at boot via `secretbox.LoadHostKeys(dir)`).
+
+### Disable the walker
+
+Set `FAAS_REKEY_ENABLED=false` (or unset) and restart `apid`.
+The walker exits; the progress file remains on disk for
+audit / re-enable purposes. There is no "pause" — the walker
+is either running or not.
+
 ## References
 
 - `docs/adr/057-host-age-rotation.md` — ADR capturing the v1
   partial-deliverable and v2 follow-up scope.
+- `docs/adr/089-secret-rotation.md` — ADR capturing the v2
+  per-secret rotation surface (PR-B) + background re-seal
+  walker (PR-C). The "Per-secret rotation" and "Background
+  re-seal" sections above document the operator-facing surface
+  of PR-C.
+- `docs/adr/089-pr-cluster-outline.md` — PR-A/PR-B/PR-C split
+  + the cron-runs / box e2e coverage plan.
 - `docs/ops/secrets-rotation.md` — the surrounding secrets
   rotation doc; the host.age entry there references this
   runbook.
@@ -366,4 +572,6 @@ delete), which is irreversible.
   multi-host is enabled.
 - `pkg/secretbox/hostkey.go` — the underlying
   `LoadHostKeys(dir)` / `OpenMulti` plumbing.
+- `pkg/rekey/rekey.go` — the crash-safe walk primitive wrapped
+  by `cmd/apid/rekey_runner.go::Runner` (PR-C).
 - `cmd/gregale/commands_host_age.go` — the operator CLI.

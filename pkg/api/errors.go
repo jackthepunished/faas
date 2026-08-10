@@ -341,6 +341,15 @@ const (
 	CodeSecretValueTooLarge = "secret_value_too_large"
 	CodeSecretNotFound      = "secret_not_found"
 
+	// CodeRekeyDisabled — ADR-089 PR-C. Returned with 503 by
+	// GET /v1/admin/secrets/rekey-progress when FAAS_REKEY_ENABLED
+	// is unset. The runner is nil on those daemons, so the
+	// handler can't report progress; we surface the
+	// misconfiguration as a distinct code rather than a zero-
+	// progress 200, so a dashboard can distinguish "feature is
+	// off" from "feature is on and idle".
+	CodeRekeyDisabled = "rekey_disabled"
+
 	// Customer env vars (issue #395 / ADR-045). Distinct codes from
 	// CodeSecret* so the quota + audit shape is unambiguous to
 	// dashboards and SDK callers — a `plan_limit_env_vars` is a config
