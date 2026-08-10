@@ -3399,7 +3399,7 @@ type EdgeRuleHeaderOp struct {
 }
 
 // edgeRuleHeaderForbidden is the hard-coded blacklist of header
-// names a kind=headers rule cannot mutate (ADR-089 §Decision).
+// names a kind=headers rule cannot mutate (ADR-091 §Decision).
 // Per-app configurability is deferred to v2; the closed list ships
 // in v1 as a wire-bypass backstop.
 var edgeRuleHeaderForbidden = map[string]struct{}{
@@ -3479,16 +3479,30 @@ func (a *EdgeRuleCORSAction) Validate() *Problem {
 	if a.MaxAgeSeconds < 0 {
 		return ErrValidation("cors action max_age_seconds must be >= 0")
 	}
+	// CORS *+credentials footgun: browsers reject the combination
+	// Access-Control-Allow-Origin: * together with Access-Control-
+	// Allow-Credentials: true (RFC 6454 §7). Reject at create-time
+	// rather than shipping a rule that silently fails in production.
+	// (ADR-091 D12.)
+	if a.AllowCredentials {
+		for _, origin := range a.AllowOrigins {
+			if origin == "*" {
+				return ErrValidation("cors action cannot combine AllowCredentials: true with AllowOrigins: [\"*\"] (browsers reject this combination)")
+			}
+		}
+	}
 	return nil
 }
 
-// edgeRuleJWTAllowedAlgs is the closed algorithm vocabulary the
-// gateway's verifier accepts. HS* is included because some IdPs
-// still issue HMAC-signed JWTs for service-to-service auth.
+// edgeRuleJWTAllowedAlgs is the closed asymmetric-algorithm
+// vocabulary the gateway's verifier accepts. HS* is intentionally
+// excluded: HS* over JWKS would mean a symmetric key served from a
+// public endpoint, where anyone with the URL can forge tokens.
+// Customers needing HMAC-signed JWTs should use a separate secret
+// reference action shape (deferred to a future ADR — ADR-091 D11).
 var edgeRuleJWTAllowedAlgs = map[string]struct{}{
 	"RS256": {}, "RS384": {}, "RS512": {},
 	"ES256": {}, "ES384": {}, "ES512": {},
-	"HS256": {}, "HS384": {}, "HS512": {},
 }
 
 // EdgeRuleJWTAction validates an inbound Bearer JWT.
@@ -3498,6 +3512,26 @@ type EdgeRuleJWTAction struct {
 	JWKSURL        string            `json:"jwks_url"`
 	Algorithms     []string          `json:"algorithms"`
 	RequiredClaims map[string]string `json:"required_claims,omitempty"`
+}
+
+// edgeRuleJWTAllowedJWKSURLPrefixes is the closed list of prefixes
+// the validator rejects to prevent the gateway from being tricked
+// into fetching JWKS over a private/loopback/link-local address.
+// The firewall already denies egress to these ranges (CLAUDE.md
+// §11); this is the application-layer equivalent (ADR-091 D10).
+// Future enhancement: promote to net.ParseIP + IsPrivate/IsLoopback
+// /IsLinkLocalUnicast for IPv6-multicast edges.
+var edgeRuleJWTAllowedJWKSURLPrefixes = []string{
+	"https://localhost",
+	"https://localhost.",
+	"https://127.",
+	"https://10.",
+	"https://192.168.",
+	"https://169.254.",
+	"https://[::",
+	"https://[fc",
+	"https://[fd",
+	// IPv4 link-local: 169.254.0.0/16 (covered above).
 }
 
 func (a *EdgeRuleJWTAction) Validate() *Problem {
@@ -3510,12 +3544,22 @@ func (a *EdgeRuleJWTAction) Validate() *Problem {
 	if !strings.HasPrefix(a.JWKSURL, "https://") {
 		return ErrValidation("jwt action jwks_url must start with https://")
 	}
+	// Defense-in-depth: reject JWKS URLs that resolve to
+	// private/loopback/link-local addresses (ADR-091 D10). The
+	// string-prefix check is cheap; a future enhancement can upgrade
+	// to net.ParseIP + IsPrivate/IsLoopback/IsLinkLocalUnicast.
+	lower := strings.ToLower(a.JWKSURL)
+	for _, badPrefix := range edgeRuleJWTAllowedJWKSURLPrefixes {
+		if strings.HasPrefix(lower, badPrefix) {
+			return ErrValidation("jwt action jwks_url must not point to a private/loopback/link-local address (§11 egress posture)")
+		}
+	}
 	if len(a.Algorithms) == 0 {
 		return ErrValidation("jwt action requires at least one algorithm")
 	}
 	for _, alg := range a.Algorithms {
 		if _, ok := edgeRuleJWTAllowedAlgs[alg]; !ok {
-			return ErrValidation(fmt.Sprintf("jwt action algorithm %q is not in the closed vocabulary", alg))
+			return ErrValidation(fmt.Sprintf("jwt action algorithm %q is not in the closed vocabulary (RS256/RS384/RS512/ES256/ES384/ES512)", alg))
 		}
 	}
 	return nil

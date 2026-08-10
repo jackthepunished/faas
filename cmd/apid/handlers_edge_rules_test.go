@@ -1,6 +1,6 @@
 package main
 
-// PR 1 of the edge-rules rollout (ADR-089, planned). Round-trips
+// PR 1 of the edge-rules rollout (ADR-091). Round-trips
 // the apid surface against the in-process MemStore so a typo in
 // the validation, a missing IDOR check, or a plan-gate that
 // leaks the slug can be caught before merge. Mirrors the alert
@@ -156,6 +156,193 @@ func TestCreateEdgeRule_HobbyJWT_Returns201(t *testing.T) {
 	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// --- PR 5 (ADR-091 D11) — HS* dropped from JWT algorithm vocab ---
+
+// TestCreateEdgeRule_JWTRejectsHS256Alg pins that HS256 (and
+// symmetric-key algs generally) are no longer admitted. The vocab
+// shrank to RS256/RS384/RS512/ES256/ES384/ES512; HS* requires a
+// secret_ref action shape (deferred ADR — see ADR-091 D11).
+func TestCreateEdgeRule_JWTRejectsHS256Alg(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "hs-reject")
+	req := api.CreateEdgeRuleRequest{
+		MatchHost: "auth.example.com",
+		MatchPath: "/verify",
+		Kind:      string(state.EdgeRuleKindJWT),
+		Action:    json.RawMessage(`{"issuer":"https://idp.example.com/","jwks_url":"https://idp.example.com/.well-known/jwks.json","algorithms":["HS256"]}`),
+	}
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEdgeRule_JWTRejectsHS384Alg mirrors the HS256 pin for
+// HS384 — same vocabulary exclusion.
+func TestCreateEdgeRule_JWTRejectsHS384Alg(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "hs384-reject")
+	req := api.CreateEdgeRuleRequest{
+		MatchHost: "auth.example.com",
+		MatchPath: "/verify",
+		Kind:      string(state.EdgeRuleKindJWT),
+		Action:    json.RawMessage(`{"issuer":"https://idp.example.com/","jwks_url":"https://idp.example.com/.well-known/jwks.json","algorithms":["HS384"]}`),
+	}
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEdgeRule_JWTRejectsHS512Alg mirrors HS256/HS384 for
+// HS512 — same vocabulary exclusion.
+func TestCreateEdgeRule_JWTRejectsHS512Alg(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "hs512-reject")
+	req := api.CreateEdgeRuleRequest{
+		MatchHost: "auth.example.com",
+		MatchPath: "/verify",
+		Kind:      string(state.EdgeRuleKindJWT),
+		Action:    json.RawMessage(`{"issuer":"https://idp.example.com/","jwks_url":"https://idp.example.com/.well-known/jwks.json","algorithms":["HS512"]}`),
+	}
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEdgeRule_JWTAcceptsAllSixAsymAlgs confirms the RS256/
+// RS384/RS512/ES256/ES384/ES512 vocabulary all still pass. One
+// table-driven test, replacing 6 individual happy-path pins
+// (RS256 already covered by TestCreateEdgeRule_HobbyJWT_Returns201
+// so we add ES* + RS384/RS512 here).
+func TestCreateEdgeRule_JWTAcceptsAllSixAsymAlgs(t *testing.T) {
+	algs := []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+	for i, alg := range algs {
+		alg := alg
+		i := i
+		t.Run(alg, func(t *testing.T) {
+			e := setup(t, api.PlanHobby)
+			slug := mustSeedEdgeRuleApp(t, e, fmt.Sprintf("vocab-%d-%s", i, alg))
+			req := api.CreateEdgeRuleRequest{
+				MatchHost: "auth.example.com",
+				MatchPath: "/verify",
+				Kind:      string(state.EdgeRuleKindJWT),
+				Action:    json.RawMessage(fmt.Sprintf(`{"issuer":"https://idp.example.com/","jwks_url":"https://idp.example.com/.well-known/jwks.json","algorithms":[%q]}`, alg)),
+			}
+			rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+			if rec.Code != http.StatusCreated {
+				t.Errorf("alg=%s: status = %d, want 201; body = %s", alg, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// --- PR 5 (ADR-091 D10) — JWKS URL rejects RFC1918/loopback/link-local ---
+
+// TestCreateEdgeRule_JWTRejectsLocalhostJWKS pins the SSRF guard
+// at apid-Validate. The host firewall already denies these ranges;
+// this is the application-layer equivalent.
+func TestCreateEdgeRule_JWTRejectsLocalhostJWKS(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	slug := mustSeedEdgeRuleApp(t, e, "jwks-localhost")
+	req := api.CreateEdgeRuleRequest{
+		MatchHost: "auth.example.com",
+		MatchPath: "/verify",
+		Kind:      string(state.EdgeRuleKindJWT),
+		Action:    json.RawMessage(`{"issuer":"https://idp.example.com/","jwks_url":"https://localhost/.well-known/jwks.json","algorithms":["RS256"]}`),
+	}
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEdgeRule_JWTRejectsPrivateJWKS table-drives the four
+// RFC1918 + link-local ranges through the SSRF guard.
+func TestCreateEdgeRule_JWTRejectsPrivateJWKS(t *testing.T) {
+	badURLs := []string{
+		"https://10.0.0.1/jwks",
+		"https://192.168.1.1/jwks",
+		"https://169.254.169.254/jwks", // AWS metadata
+	}
+	for _, url := range badURLs {
+		url := url
+		t.Run(url, func(t *testing.T) {
+			e := setup(t, api.PlanHobby)
+			slug := mustSeedEdgeRuleApp(t, e, "private")
+			body := fmt.Sprintf(`{"issuer":"https://idp.example.com/","jwks_url":%q,"algorithms":["RS256"]}`, url)
+			req := api.CreateEdgeRuleRequest{
+				MatchHost: "auth.example.com",
+				MatchPath: "/verify",
+				Kind:      string(state.EdgeRuleKindJWT),
+				Action:    json.RawMessage(body),
+			}
+			rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("url=%s: status = %d, want 400; body = %s", url, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// --- PR 5 (ADR-091 D12) — CORS *+credentials footgun ---
+
+// TestCreateEdgeRule_CORSRejectsWildcardWithCredentials pins the
+// browser-rejection guard. AllowOrigins:["*"] + AllowCredentials:
+// true is the canonical RFC 6454 §7 footgun.
+func TestCreateEdgeRule_CORSRejectsWildcardWithCredentials(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	slug := mustSeedEdgeRuleApp(t, e, "cors-footgun")
+	req := api.CreateEdgeRuleRequest{
+		MatchHost: "cors.example.com",
+		MatchPath: "/",
+		Kind:      string(state.EdgeRuleKindCORSA),
+		Action:    json.RawMessage(`{"allow_origins":["*"],"allow_methods":["GET"],"allow_credentials":true}`),
+	}
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEdgeRule_CORSAcceptsWildcardWithoutCredentials pins
+// the inverse: AllowOrigins:["*"] without credentials is fine.
+// This is the common public-API posture; the validator must not
+// over-reject.
+func TestCreateEdgeRule_CORSAcceptsWildcardWithoutCredentials(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	slug := mustSeedEdgeRuleApp(t, e, "cors-public")
+	req := api.CreateEdgeRuleRequest{
+		MatchHost: "cors.example.com",
+		MatchPath: "/",
+		Kind:      string(state.EdgeRuleKindCORSA),
+		Action:    json.RawMessage(`{"allow_origins":["*"],"allow_methods":["GET","POST"],"allow_credentials":false}`),
+	}
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEdgeRule_CORSAcceptsCredentialsWithExplicitOrigin
+// pins the non-footgun credentials posture — credentials are
+// only safe with an explicit origin (not "*").
+func TestCreateEdgeRule_CORSAcceptsCredentialsWithExplicitOrigin(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	slug := mustSeedEdgeRuleApp(t, e, "cors-cred-origin")
+	req := api.CreateEdgeRuleRequest{
+		MatchHost: "cors.example.com",
+		MatchPath: "/",
+		Kind:      string(state.EdgeRuleKindCORSA),
+		Action:    json.RawMessage(`{"allow_origins":["https://app.example.com"],"allow_methods":["GET","POST"],"allow_credentials":true}`),
+	}
+	rec := e.do(t, "POST", "/v1/apps/"+slug+"/edge-rules", req, nil)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
 	}
 }
 
