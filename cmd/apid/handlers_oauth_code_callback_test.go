@@ -29,6 +29,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -83,6 +84,16 @@ func (f *oauthCodeCallbackFake) WriteCheck(context.Context, string, string, Chec
 }
 func (f *oauthCodeCallbackFake) VerifyInstallation(context.Context, int64, string) (bool, string, string, error) {
 	return false, "", "", errGithubdNotReady
+}
+// MintInstallationToken is unused by the OAuth code-callback test.
+// Returns the not-ready problem (DEPLOY-PROV-4 / ADR-092, issue #739).
+func (f *oauthCodeCallbackFake) MintInstallationToken(context.Context, string, int64) (string, time.Time, error) {
+	return "", time.Time{}, errGithubdNotReady
+}
+// StreamSourceRef is unused by the OAuth code-callback test.
+// Returns the not-ready problem (DEPLOY-PROV-4 / ADR-092, issue #739).
+func (f *oauthCodeCallbackFake) StreamSourceRef(context.Context, string, int64, string, string, int64) (*StreamSourceRefResult, error) {
+	return nil, errGithubdNotReady
 }
 func (f *oauthCodeCallbackFake) Close() error { return nil }
 

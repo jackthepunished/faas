@@ -1401,6 +1401,292 @@ func (x *EnqueueBuildResponse) GetAppId() string {
 	return ""
 }
 
+// MintInstallationTokenRequest carries the install lookup keys
+// (DEPLOY-PROV-4 / ADR-092, issue #739).
+type MintInstallationTokenRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// account_id is the accounts.id UUID that owns the install.
+	AccountId string `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	// installation_id is the GitHub App installation_id the call
+	// authenticates as. githubd verifies the install row's
+	// InstallationID matches; mismatch → NOT_FOUND.
+	InstallationId int64 `protobuf:"varint,2,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *MintInstallationTokenRequest) Reset() {
+	*x = MintInstallationTokenRequest{}
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MintInstallationTokenRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MintInstallationTokenRequest) ProtoMessage() {}
+
+func (x *MintInstallationTokenRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MintInstallationTokenRequest.ProtoReflect.Descriptor instead.
+func (*MintInstallationTokenRequest) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *MintInstallationTokenRequest) GetAccountId() string {
+	if x != nil {
+		return x.AccountId
+	}
+	return ""
+}
+
+func (x *MintInstallationTokenRequest) GetInstallationId() int64 {
+	if x != nil {
+		return x.InstallationId
+	}
+	return 0
+}
+
+type MintInstallationTokenResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// token is the plain installation token. Valid for 1 h per
+	// GitHub; callers MUST NOT log it. githubd already covers the
+	// cache + refresh lifecycle via pkg/githubd.TokenCache — the
+	// RPC forces a fresh mint so a CI runner that just received
+	// a 401 from codeload can retry without waiting for the
+	// proactive refresh window.
+	Token string `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	// expires_at is the GitHub-reported expiry timestamp (RFC 3339).
+	// apid stamps this on its internal install-token cache so the
+	// next call can short-circuit a cache miss.
+	ExpiresAt     string `protobuf:"bytes,2,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MintInstallationTokenResponse) Reset() {
+	*x = MintInstallationTokenResponse{}
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MintInstallationTokenResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MintInstallationTokenResponse) ProtoMessage() {}
+
+func (x *MintInstallationTokenResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MintInstallationTokenResponse.ProtoReflect.Descriptor instead.
+func (*MintInstallationTokenResponse) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *MintInstallationTokenResponse) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *MintInstallationTokenResponse) GetExpiresAt() string {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return ""
+}
+
+// StreamSourceRefRequest is the headless source-ref stream input
+// (DEPLOY-PROV-4 / ADR-092, issue #739).
+type StreamSourceRefRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// account_id is the accounts.id UUID that owns the install.
+	// githubd uses it to look up the durable install row.
+	AccountId string `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	// installation_id is the GitHub App installation_id. Matched
+	// against the install row's InstallationID; mismatch → NOT_FOUND.
+	InstallationId int64 `protobuf:"varint,2,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
+	// repo_full_name is "owner/name". Validated against the same
+	// shape pkg/gitfetch/http.go::isValidRepoPath enforces.
+	RepoFullName string `protobuf:"bytes,3,opt,name=repo_full_name,json=repoFullName,proto3" json:"repo_full_name,omitempty"`
+	// ref is the pinned commit SHA, branch, or tag. apid resolves
+	// branches/tags to a SHA via api.github.com/repos/<repo>/commits/<ref>
+	// BEFORE calling this RPC, so the streamer only sees 7–40 char
+	// lowercase hex SHAs (pkg/gitfetch/http.go::isValidCommitSHA).
+	Ref string `protobuf:"bytes,4,opt,name=ref,proto3" json:"ref,omitempty"`
+	// max_archive_bytes is the per-plan cap (Free 100 MB / Hobby 100 /
+	// Pro 250 / Scale 250 × 1024²). Applied as
+	// io.LimitReader(max_archive_bytes + 1, …) so the chunk
+	// carrying truncated=true surfaces when the cap is hit.
+	MaxArchiveBytes int64 `protobuf:"varint,5,opt,name=max_archive_bytes,json=maxArchiveBytes,proto3" json:"max_archive_bytes,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *StreamSourceRefRequest) Reset() {
+	*x = StreamSourceRefRequest{}
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamSourceRefRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamSourceRefRequest) ProtoMessage() {}
+
+func (x *StreamSourceRefRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamSourceRefRequest.ProtoReflect.Descriptor instead.
+func (*StreamSourceRefRequest) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *StreamSourceRefRequest) GetAccountId() string {
+	if x != nil {
+		return x.AccountId
+	}
+	return ""
+}
+
+func (x *StreamSourceRefRequest) GetInstallationId() int64 {
+	if x != nil {
+		return x.InstallationId
+	}
+	return 0
+}
+
+func (x *StreamSourceRefRequest) GetRepoFullName() string {
+	if x != nil {
+		return x.RepoFullName
+	}
+	return ""
+}
+
+func (x *StreamSourceRefRequest) GetRef() string {
+	if x != nil {
+		return x.Ref
+	}
+	return ""
+}
+
+func (x *StreamSourceRefRequest) GetMaxArchiveBytes() int64 {
+	if x != nil {
+		return x.MaxArchiveBytes
+	}
+	return 0
+}
+
+// StreamSourceRefChunk is one frame of the source-ref archive
+// stream. The wire is a stream-of-bytes; chunk boundaries are
+// an implementation detail of the gRPC transport, NOT of the
+// archive format (the receiver MUST treat the concatenation of
+// `data` fields as the tarball).
+type StreamSourceRefChunk struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// data is the next frame of the gzipped tarball. Concatenated
+	// frames form the complete archive.
+	Data []byte `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	// truncated is true when the streaming cap (max_archive_bytes)
+	// was hit. The apid handler rolls the spool file back and
+	// surfaces 413 + code=source_too_large per ADR-092 §3.8.
+	// Always false for non-final chunks.
+	Truncated bool `protobuf:"varint,2,opt,name=truncated,proto3" json:"truncated,omitempty"`
+	// bytes_streamed is the cumulative count of bytes the streamer
+	// has sent so far (post-cap). Echoed on the final chunk so
+	// the apid handler can record source_bytes on the deployment
+	// row without summing the data fields.
+	BytesStreamed int64 `protobuf:"varint,3,opt,name=bytes_streamed,json=bytesStreamed,proto3" json:"bytes_streamed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamSourceRefChunk) Reset() {
+	*x = StreamSourceRefChunk{}
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamSourceRefChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamSourceRefChunk) ProtoMessage() {}
+
+func (x *StreamSourceRefChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_onebox_faas_githubd_v1_githubd_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamSourceRefChunk.ProtoReflect.Descriptor instead.
+func (*StreamSourceRefChunk) Descriptor() ([]byte, []int) {
+	return file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *StreamSourceRefChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *StreamSourceRefChunk) GetTruncated() bool {
+	if x != nil {
+		return x.Truncated
+	}
+	return false
+}
+
+func (x *StreamSourceRefChunk) GetBytesStreamed() int64 {
+	if x != nil {
+		return x.BytesStreamed
+	}
+	return 0
+}
+
 var File_onebox_faas_githubd_v1_githubd_proto protoreflect.FileDescriptor
 
 const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
@@ -1495,7 +1781,26 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\x14EnqueueBuildResponse\x12\x19\n" +
 	"\bbuild_id\x18\x01 \x01(\tR\abuildId\x12#\n" +
 	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\x12\x15\n" +
-	"\x06app_id\x18\x03 \x01(\tR\x05appId*b\n" +
+	"\x06app_id\x18\x03 \x01(\tR\x05appId\"f\n" +
+	"\x1cMintInstallationTokenRequest\x12\x1d\n" +
+	"\n" +
+	"account_id\x18\x01 \x01(\tR\taccountId\x12'\n" +
+	"\x0finstallation_id\x18\x02 \x01(\x03R\x0einstallationId\"T\n" +
+	"\x1dMintInstallationTokenResponse\x12\x14\n" +
+	"\x05token\x18\x01 \x01(\tR\x05token\x12\x1d\n" +
+	"\n" +
+	"expires_at\x18\x02 \x01(\tR\texpiresAt\"\xc4\x01\n" +
+	"\x16StreamSourceRefRequest\x12\x1d\n" +
+	"\n" +
+	"account_id\x18\x01 \x01(\tR\taccountId\x12'\n" +
+	"\x0finstallation_id\x18\x02 \x01(\x03R\x0einstallationId\x12$\n" +
+	"\x0erepo_full_name\x18\x03 \x01(\tR\frepoFullName\x12\x10\n" +
+	"\x03ref\x18\x04 \x01(\tR\x03ref\x12*\n" +
+	"\x11max_archive_bytes\x18\x05 \x01(\x03R\x0fmaxArchiveBytes\"o\n" +
+	"\x14StreamSourceRefChunk\x12\x12\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\x12\x1c\n" +
+	"\ttruncated\x18\x02 \x01(\bR\ttruncated\x12%\n" +
+	"\x0ebytes_streamed\x18\x03 \x01(\x03R\rbytesStreamed*b\n" +
 	"\fInstallState\x12\x15\n" +
 	"\x11STATE_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rNOT_INSTALLED\x10\x01\x12\x0e\n" +
@@ -1511,7 +1816,7 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\bBUILDING\x10\x02\x12\b\n" +
 	"\x04LIVE\x10\x03\x12\n" +
 	"\n" +
-	"\x06FAILED\x10\x042\x9c\t\n" +
+	"\x06FAILED\x10\x042\x96\v\n" +
 	"\aGithubd\x12r\n" +
 	"\x0fGetInstallState\x12..onebox.faas.githubd.v1.GetInstallStateRequest\x1a/.onebox.faas.githubd.v1.GetInstallStateResponse\x12x\n" +
 	"\x11ExchangeOAuthCode\x120.onebox.faas.githubd.v1.ExchangeOAuthCodeRequest\x1a1.onebox.faas.githubd.v1.ExchangeOAuthCodeResponse\x12\x81\x01\n" +
@@ -1523,7 +1828,9 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\fEnqueueBuild\x12+.onebox.faas.githubd.v1.EnqueueBuildRequest\x1a,.onebox.faas.githubd.v1.EnqueueBuildResponse\x12c\n" +
 	"\n" +
 	"WriteCheck\x12).onebox.faas.githubd.v1.WriteCheckRequest\x1a*.onebox.faas.githubd.v1.WriteCheckResponse\x12{\n" +
-	"\x12VerifyInstallation\x121.onebox.faas.githubd.v1.VerifyInstallationRequest\x1a2.onebox.faas.githubd.v1.VerifyInstallationResponseBHZFgithub.com/onebox-faas/faas/api/proto/onebox/faas/githubd/v1;githubdpbb\x06proto3"
+	"\x12VerifyInstallation\x121.onebox.faas.githubd.v1.VerifyInstallationRequest\x1a2.onebox.faas.githubd.v1.VerifyInstallationResponse\x12\x84\x01\n" +
+	"\x15MintInstallationToken\x124.onebox.faas.githubd.v1.MintInstallationTokenRequest\x1a5.onebox.faas.githubd.v1.MintInstallationTokenResponse\x12q\n" +
+	"\x0fStreamSourceRef\x12..onebox.faas.githubd.v1.StreamSourceRefRequest\x1a,.onebox.faas.githubd.v1.StreamSourceRefChunk0\x01BHZFgithub.com/onebox-faas/faas/api/proto/onebox/faas/githubd/v1;githubdpbb\x06proto3"
 
 var (
 	file_onebox_faas_githubd_v1_githubd_proto_rawDescOnce sync.Once
@@ -1538,7 +1845,7 @@ func file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP() []byte {
 }
 
 var file_onebox_faas_githubd_v1_githubd_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_onebox_faas_githubd_v1_githubd_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_onebox_faas_githubd_v1_githubd_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_onebox_faas_githubd_v1_githubd_proto_goTypes = []any{
 	(InstallState)(0),                        // 0: onebox.faas.githubd.v1.InstallState
 	(CheckPhase)(0),                          // 1: onebox.faas.githubd.v1.CheckPhase
@@ -1563,6 +1870,10 @@ var file_onebox_faas_githubd_v1_githubd_proto_goTypes = []any{
 	(*WriteCheckResponse)(nil),               // 20: onebox.faas.githubd.v1.WriteCheckResponse
 	(*EnqueueBuildRequest)(nil),              // 21: onebox.faas.githubd.v1.EnqueueBuildRequest
 	(*EnqueueBuildResponse)(nil),             // 22: onebox.faas.githubd.v1.EnqueueBuildResponse
+	(*MintInstallationTokenRequest)(nil),     // 23: onebox.faas.githubd.v1.MintInstallationTokenRequest
+	(*MintInstallationTokenResponse)(nil),    // 24: onebox.faas.githubd.v1.MintInstallationTokenResponse
+	(*StreamSourceRefRequest)(nil),           // 25: onebox.faas.githubd.v1.StreamSourceRefRequest
+	(*StreamSourceRefChunk)(nil),             // 26: onebox.faas.githubd.v1.StreamSourceRefChunk
 }
 var file_onebox_faas_githubd_v1_githubd_proto_depIdxs = []int32{
 	0,  // 0: onebox.faas.githubd.v1.GetInstallStateResponse.state:type_name -> onebox.faas.githubd.v1.InstallState
@@ -1578,18 +1889,22 @@ var file_onebox_faas_githubd_v1_githubd_proto_depIdxs = []int32{
 	21, // 10: onebox.faas.githubd.v1.Githubd.EnqueueBuild:input_type -> onebox.faas.githubd.v1.EnqueueBuildRequest
 	19, // 11: onebox.faas.githubd.v1.Githubd.WriteCheck:input_type -> onebox.faas.githubd.v1.WriteCheckRequest
 	2,  // 12: onebox.faas.githubd.v1.Githubd.VerifyInstallation:input_type -> onebox.faas.githubd.v1.VerifyInstallationRequest
-	5,  // 13: onebox.faas.githubd.v1.Githubd.GetInstallState:output_type -> onebox.faas.githubd.v1.GetInstallStateResponse
-	7,  // 14: onebox.faas.githubd.v1.Githubd.ExchangeOAuthCode:output_type -> onebox.faas.githubd.v1.ExchangeOAuthCodeResponse
-	10, // 15: onebox.faas.githubd.v1.Githubd.ListInstallableRepos:output_type -> onebox.faas.githubd.v1.ListInstallableReposResponse
-	12, // 16: onebox.faas.githubd.v1.Githubd.BindAppRepo:output_type -> onebox.faas.githubd.v1.BindAppRepoResponse
-	14, // 17: onebox.faas.githubd.v1.Githubd.UnbindAppRepo:output_type -> onebox.faas.githubd.v1.UnbindAppRepoResponse
-	16, // 18: onebox.faas.githubd.v1.Githubd.GetAppBinding:output_type -> onebox.faas.githubd.v1.GetAppBindingResponse
-	18, // 19: onebox.faas.githubd.v1.Githubd.CreateDeploymentFromPush:output_type -> onebox.faas.githubd.v1.CreateDeploymentFromPushResponse
-	22, // 20: onebox.faas.githubd.v1.Githubd.EnqueueBuild:output_type -> onebox.faas.githubd.v1.EnqueueBuildResponse
-	20, // 21: onebox.faas.githubd.v1.Githubd.WriteCheck:output_type -> onebox.faas.githubd.v1.WriteCheckResponse
-	3,  // 22: onebox.faas.githubd.v1.Githubd.VerifyInstallation:output_type -> onebox.faas.githubd.v1.VerifyInstallationResponse
-	13, // [13:23] is the sub-list for method output_type
-	3,  // [3:13] is the sub-list for method input_type
+	23, // 13: onebox.faas.githubd.v1.Githubd.MintInstallationToken:input_type -> onebox.faas.githubd.v1.MintInstallationTokenRequest
+	25, // 14: onebox.faas.githubd.v1.Githubd.StreamSourceRef:input_type -> onebox.faas.githubd.v1.StreamSourceRefRequest
+	5,  // 15: onebox.faas.githubd.v1.Githubd.GetInstallState:output_type -> onebox.faas.githubd.v1.GetInstallStateResponse
+	7,  // 16: onebox.faas.githubd.v1.Githubd.ExchangeOAuthCode:output_type -> onebox.faas.githubd.v1.ExchangeOAuthCodeResponse
+	10, // 17: onebox.faas.githubd.v1.Githubd.ListInstallableRepos:output_type -> onebox.faas.githubd.v1.ListInstallableReposResponse
+	12, // 18: onebox.faas.githubd.v1.Githubd.BindAppRepo:output_type -> onebox.faas.githubd.v1.BindAppRepoResponse
+	14, // 19: onebox.faas.githubd.v1.Githubd.UnbindAppRepo:output_type -> onebox.faas.githubd.v1.UnbindAppRepoResponse
+	16, // 20: onebox.faas.githubd.v1.Githubd.GetAppBinding:output_type -> onebox.faas.githubd.v1.GetAppBindingResponse
+	18, // 21: onebox.faas.githubd.v1.Githubd.CreateDeploymentFromPush:output_type -> onebox.faas.githubd.v1.CreateDeploymentFromPushResponse
+	22, // 22: onebox.faas.githubd.v1.Githubd.EnqueueBuild:output_type -> onebox.faas.githubd.v1.EnqueueBuildResponse
+	20, // 23: onebox.faas.githubd.v1.Githubd.WriteCheck:output_type -> onebox.faas.githubd.v1.WriteCheckResponse
+	3,  // 24: onebox.faas.githubd.v1.Githubd.VerifyInstallation:output_type -> onebox.faas.githubd.v1.VerifyInstallationResponse
+	24, // 25: onebox.faas.githubd.v1.Githubd.MintInstallationToken:output_type -> onebox.faas.githubd.v1.MintInstallationTokenResponse
+	26, // 26: onebox.faas.githubd.v1.Githubd.StreamSourceRef:output_type -> onebox.faas.githubd.v1.StreamSourceRefChunk
+	15, // [15:27] is the sub-list for method output_type
+	3,  // [3:15] is the sub-list for method input_type
 	3,  // [3:3] is the sub-list for extension type_name
 	3,  // [3:3] is the sub-list for extension extendee
 	0,  // [0:3] is the sub-list for field type_name
@@ -1606,7 +1921,7 @@ func file_onebox_faas_githubd_v1_githubd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_onebox_faas_githubd_v1_githubd_proto_rawDesc), len(file_onebox_faas_githubd_v1_githubd_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   21,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

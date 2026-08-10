@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -88,6 +89,17 @@ func (f *bindPickerFake) CreateDeploymentFromPush(context.Context, string, strin
 }
 func (f *bindPickerFake) WriteCheck(context.Context, string, string, CheckPhase, string, string) error {
 	return errGithubdNotReady
+}
+// MintInstallationToken is unused by the bind picker test. Returns
+// the not-ready problem so any accidental call would surface as a
+// 503 (DEPLOY-PROV-4 / ADR-092, issue #739).
+func (f *bindPickerFake) MintInstallationToken(context.Context, string, int64) (string, time.Time, error) {
+	return "", time.Time{}, errGithubdNotReady
+}
+// StreamSourceRef is unused by the bind picker test. Returns the
+// not-ready problem (DEPLOY-PROV-4 / ADR-092, issue #739).
+func (f *bindPickerFake) StreamSourceRef(context.Context, string, int64, string, string, int64) (*StreamSourceRefResult, error) {
+	return nil, errGithubdNotReady
 }
 func (f *bindPickerFake) Close() error { return nil }
 

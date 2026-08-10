@@ -262,7 +262,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 					return fmt.Errorf("githubd: load host age recipient: %w", rerr)
 				}
 				auditFn := newGithubdAuditFn(log)
-				realSvc = githubd.NewRealService(auth, tokens, checks, storeAdapter, installsAdapter, recipient, identity, auditFn)
+				realSvc = githubd.NewRealService(auth, tokens, checks, storeAdapter, installsAdapter, recipient, identity, auditFn).
+					WithStreamer(newSourceRefStreamer(installsAdapter, &tokenCacheAdapter{cache: tokens}, nil, log))
 				if identities != nil {
 					realSvc.Identities = identities
 				}

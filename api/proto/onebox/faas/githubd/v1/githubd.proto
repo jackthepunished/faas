@@ -108,6 +108,50 @@ service Githubd {
   // install-belongs-to-the-app half; the install-belongs-to-the-user
   // half lands here).
   rpc VerifyInstallation(VerifyInstallationRequest) returns (VerifyInstallationResponse);
+
+  // MintInstallationToken returns a fresh installation token for
+  // the given (account, installation_id). The token is the canonical
+  // shape githubd's TokenCache hands out (pkg/githubd/tokencache.go)
+  // — sealed in transit over the apid↔githubd unix socket, scoped
+  // to the single RPC. apid's source-ref deploy handler calls this
+  // to authenticate the codeload fetch when no installation is
+  // available locally (DEPLOY-PROV-4 / ADR-092, issue #739).
+  //
+  // Errors:
+  //   - NOT_FOUND when the durable install row is missing for the
+  //     account (the dashboard `gregale connect` flow has not run).
+  //   - UNAVAILABLE when githubd's TokenCache is mid-refresh and the
+  //     api.github.com round-trip failed.
+  rpc MintInstallationToken(MintInstallationTokenRequest) returns (MintInstallationTokenResponse);
+
+  // StreamSourceRef streams the raw tar.gz archive for a
+  // (repo, ref) pair over the durable install's installation
+  // token (DEPLOY-PROV-4 / ADR-092, issue #739). apid's
+  // handleSourceRefDeploy calls this RPC, pipes the returned
+  // bytes into validateAndSpool, and os.Renames the staged
+  // file to FAAS_SPOOL_ROOT/<id>.tar.gz.
+  //
+  // The streaming wire shape is preferred over a unary
+  // (io.ReadCloser-shaped) return so a Free-plan tarball that
+  // exceeds SourceTarballMaxMB can be rejected mid-flight
+  // (server-initiated cancellation) rather than buffered
+  // entirely in memory. githubd applies
+  // io.LimitReader(max_archive_bytes + 1, …) on the server
+  // side; a cap overflow surfaces as a chunk carrying
+  // `truncated=true` and the apid handler rolls the spool
+  // file back.
+  //
+  // Errors:
+  //   - NOT_FOUND when the durable install row is missing.
+  //   - INVALID_ARGUMENT when the (repo, ref) fails
+  //     validation.
+  //   - UNAUTHENTICATED when the installation token is
+  //     rejected by codeload.github.com after one
+  //     cache-invalidate + retry (api maps to
+  //     503 source_ref_unavailable per ADR-092 §3.7).
+  //   - UNAVAILABLE when githubd is down or codeload
+  //     returns 5xx.
+  rpc StreamSourceRef(StreamSourceRefRequest) returns (stream StreamSourceRefChunk);
 }
 
 message VerifyInstallationRequest {
@@ -293,4 +337,73 @@ message EnqueueBuildResponse {
   // app_id is the app the build was (or was not) enqueued for.
   // Echoed so the caller can log without re-resolving the binding.
   string app_id        = 3;
+}
+
+// MintInstallationTokenRequest carries the install lookup keys
+// (DEPLOY-PROV-4 / ADR-092, issue #739).
+message MintInstallationTokenRequest {
+  // account_id is the accounts.id UUID that owns the install.
+  string account_id       = 1;
+  // installation_id is the GitHub App installation_id the call
+  // authenticates as. githubd verifies the install row's
+  // InstallationID matches; mismatch → NOT_FOUND.
+  int64  installation_id  = 2;
+}
+message MintInstallationTokenResponse {
+  // token is the plain installation token. Valid for 1 h per
+  // GitHub; callers MUST NOT log it. githubd already covers the
+  // cache + refresh lifecycle via pkg/githubd.TokenCache — the
+  // RPC forces a fresh mint so a CI runner that just received
+  // a 401 from codeload can retry without waiting for the
+  // proactive refresh window.
+  string token            = 1;
+  // expires_at is the GitHub-reported expiry timestamp (RFC 3339).
+  // apid stamps this on its internal install-token cache so the
+  // next call can short-circuit a cache miss.
+  string expires_at       = 2;
+}
+
+// StreamSourceRefRequest is the headless source-ref stream input
+// (DEPLOY-PROV-4 / ADR-092, issue #739).
+message StreamSourceRefRequest {
+  // account_id is the accounts.id UUID that owns the install.
+  // githubd uses it to look up the durable install row.
+  string account_id       = 1;
+  // installation_id is the GitHub App installation_id. Matched
+  // against the install row's InstallationID; mismatch → NOT_FOUND.
+  int64  installation_id  = 2;
+  // repo_full_name is "owner/name". Validated against the same
+  // shape pkg/gitfetch/http.go::isValidRepoPath enforces.
+  string repo_full_name   = 3;
+  // ref is the pinned commit SHA, branch, or tag. apid resolves
+  // branches/tags to a SHA via api.github.com/repos/<repo>/commits/<ref>
+  // BEFORE calling this RPC, so the streamer only sees 7–40 char
+  // lowercase hex SHAs (pkg/gitfetch/http.go::isValidCommitSHA).
+  string ref              = 4;
+  // max_archive_bytes is the per-plan cap (Free 100 MB / Hobby 100 /
+  // Pro 250 / Scale 250 × 1024²). Applied as
+  // io.LimitReader(max_archive_bytes + 1, …) so the chunk
+  // carrying truncated=true surfaces when the cap is hit.
+  int64  max_archive_bytes = 5;
+}
+
+// StreamSourceRefChunk is one frame of the source-ref archive
+// stream. The wire is a stream-of-bytes; chunk boundaries are
+// an implementation detail of the gRPC transport, NOT of the
+// archive format (the receiver MUST treat the concatenation of
+// `data` fields as the tarball).
+message StreamSourceRefChunk {
+  // data is the next frame of the gzipped tarball. Concatenated
+  // frames form the complete archive.
+  bytes  data             = 1;
+  // truncated is true when the streaming cap (max_archive_bytes)
+  // was hit. The apid handler rolls the spool file back and
+  // surfaces 413 + code=source_too_large per ADR-092 §3.8.
+  // Always false for non-final chunks.
+  bool   truncated        = 2;
+  // bytes_streamed is the cumulative count of bytes the streamer
+  // has sent so far (post-cap). Echoed on the final chunk so
+  // the apid handler can record source_bytes on the deployment
+  // row without summing the data fields.
+  int64  bytes_streamed   = 3;
 }
