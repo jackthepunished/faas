@@ -1884,6 +1884,53 @@ const (
 	// minute) while keeping the query load negligible.
 	DeadNodeReconcilerIntervalSeconds = 30
 
+	// Tier A9 (capacity-pressure-triggered cross-node app rebalance,
+	// ADR-087 — sibling to the dead-node rebalancer of ADR-064).
+	// Today apps are durably pinned to a single compute_node via
+	// apps.node_id (NOT NULL post-migration 00090). When the owner
+	// node is at capacity but still healthy (active=true), the wake
+	// path returns AtCapacity=true and the customer sees 503 even
+	// though a peer schedd has headroom. Tier A9 closes the gap
+	// with a sustained-pressure watcher that reassigns the app's
+	// apps.node_id to a peer with admission headroom.
+	//
+	// PressureAtCapacityThresholdPerMin is the per-app
+	// AtCapacity-event count over a 60s sliding window that marks
+	// the app as "pressured" and eligible for cross-node reassign.
+	// 5/min is high enough to ignore single-fail GC pauses or a
+	// cold-boot burst, low enough that a sustained customer spike
+	// reassigns within two reassessment sweeps (60s). Tunable via
+	// FAAS_PRESSURE_THRESHOLD_PER_MIN (env-overridable, see
+	// cmd/schedd/main.go::runWithDeps; propagated via
+	// Engine.WithPressureConfig).
+	//
+	// PressureReassessmentIntervalSeconds is the sweep cadence at
+	// which the watcher reconciles the aggregator. 30s matches the
+	// existing rebalancer / router_watcher / dead-node-reconciler
+	// family. A 1s tick would issue 60 identical no-op queries per
+	// app before the threshold could fire. Tunable via
+	// FAAS_PRESSURE_REASSESSMENT_SECONDS.
+	//
+	// PressureMigrationPolicy is the closed-set string that gates
+	// the four-phase live-instance migration (ADR-066) on the
+	// pressure path. Closed set ∈ {skip_live, migrate_after_1,
+	// migrate_after_2}. Default migrate_after_2: cheap parked-only
+	// reassign on the first sustained sweep, expensive live
+	// migration on the second sustained sweep within the same
+	// window. skip_live never migrates live instances (cheap path
+	// only — apps with live instances stay pinned and the customer
+	// sees 503 until the instances drain). migrate_after_1 fires
+	// the live handoff on the first sustained sweep (highest
+	// cost, lowest customer-facing latency). Closed-set validation
+	// lives in cmd/schedd/main.go; bad values panic at startup.
+	// Tunable via FAAS_PRESSURE_MIGRATION_POLICY.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	PressureAtCapacityThresholdPerMin   = 5
+	PressureReassessmentIntervalSeconds = 30
+	PressureMigrationPolicy             = "migrate_after_2"
+
 	// Tier A7 (edge split — gatewayd-public / gatewayd-internal,
 	// ADR-070): drain + replica registry + warm-hint-cache tunables.
 	//
