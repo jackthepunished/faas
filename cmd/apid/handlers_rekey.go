@@ -42,7 +42,6 @@ import (
 	"net/http"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/rekey"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -79,11 +78,17 @@ func (s *server) getRekeyProgress(w http.ResponseWriter, r *http.Request, acct s
 	// cumulative counters; mid-batch reads may see a stale total
 	// by cfg.BatchSize rows, which is acceptable for an operator
 	// dashboard that polls every 30s.
-	writeJSON(w, http.StatusOK, s.rekeyRunner.Progress())
+	//
+	// Convert to the wire-shape DTO (api.RekeyProgress) so the
+	// JSON tags + int64 widths match the OpenAPI spec exactly.
+	// pkg/rekey stays free of api imports to keep the walk
+	// primitive dependency-light.
+	src := s.rekeyRunner.Progress()
+	writeJSON(w, http.StatusOK, api.RekeyProgress{
+		Total:   int64(src.Total),
+		Rekeyed: int64(src.Rekeyed),
+		Skipped: int64(src.Skipped),
+		Failed:  int64(src.Failed),
+		LastID:  src.LastID,
+	})
 }
-
-// ensureRekeyProgressType keeps rekey.RekeyProgress referenced
-// from this package even when the field is nil at compile time.
-// The alias prevents an accidental import cycle if the runner
-// type is renamed in a future refactor.
-var _ rekey.RekeyProgress

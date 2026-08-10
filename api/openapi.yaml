@@ -5280,6 +5280,59 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  # ─── ADR-089 PR-C — background re-seal runner admin surface ──────
+  # Operator-only visibility into the rekey walk that re-seals every
+  # app_secret under the current host identity. The runner is opt-in
+  # (FAAS_REKEY_ENABLED=true); when it is disabled the endpoint
+  # returns 503 rekey_disabled so an operator script can distinguish
+  # "no work yet" from "feature off".
+  /v1/admin/secrets/rekey-progress:
+    get:
+      tags: [admin]
+      operationId: getRekeyProgress
+      summary: Read the cumulative rekey walk progress (admin-only).
+      description: |
+        Returns the latest RekeyProgress snapshot the apid rekey
+        runner has written — either to the in-process atomic pointer
+        (memory-only mode) or to FAAS_REKEY_PROGRESS_FILE on disk.
+        Operators poll this endpoint to monitor the walk after a
+        host identity rotation; the response shape mirrors
+        rekey.RekeyProgress exactly so a future operator tool
+        (e.g. `gregale rekey status`) can decode without a parallel
+        type.
+
+        `total` is the running count of rows observed so far; it can
+        grow as the walk paginates through (account_id, app_id, key)
+        order. `rekeyed` + `skipped` should approach `total` once
+        the walk drains. `failed` should stay at zero; a non-zero
+        value means the unseal step threw for at least one row —
+        the operationally safe recovery is `git rm
+        migrations/*reserve_slot.sql`-style idempotent re-trigger
+        (toggle FAAS_REKEY_ENABLED and restart apid; the seen-set
+        inside Replayer dedupes already-done rows).
+
+        When the runner is disabled (FAAS_REKEY_ENABLED unset), the
+        endpoint returns 503 with code `rekey_disabled` so an
+        operator can distinguish "no work yet" from "feature off".
+      responses:
+        '200':
+          description: Current rekey progress snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RekeyProgress' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — GET /v1/admin/secrets/rekey-progress requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503':
+          description: 'code: rekey_disabled — FAAS_REKEY_ENABLED is unset on this apid; the background re-seal runner is not running. Set the env flag and restart apid to opt in.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7) ──────────
   # Customer-visible org surface. Account-scoped (/v1/orgs list +
   # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
@@ -6442,6 +6495,49 @@ components:
           items: { $ref: '#/components/schemas/StorageUsageResponse' }
       x-since: "2026-08"
       x-issue: "436"
+
+    # ADR-089 PR-C — rekey walk progress snapshot. Returned by
+    # GET /v1/admin/secrets/rekey-progress (admin scope +
+    # FAAS_ADMIN_EMAILS allowlist). Mirrors pkg/rekey.RekeyProgress
+    # exactly so the on-disk FAAS_REKEY_PROGRESS_FILE and the
+    # admin response use one type.
+    RekeyProgress:
+      description: |
+        Cumulative rekey walk snapshot. Returned by
+        GET /v1/admin/secrets/rekey-progress and persisted to
+        FAAS_REKEY_PROGRESS_FILE (default
+        /var/lib/faas/rekey-progress.json) on every batch tick.
+        `last_id` is the (account_id, app_id, key) cursor the walk
+        will resume from on daemon restart.
+      type: object
+      required: [total, rekeyed, skipped, failed]
+      properties:
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Running count of rows observed so far. Grows as the walk paginates through (account_id, app_id, key) order.
+        rekeyed:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Rows successfully unsealed under the previous identity and re-sealed under the current one.
+        skipped:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Rows already sealed under the current identity (no-op). Seen-set dedupe — does NOT mean the row is unreadable.
+        failed:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Rows where the unseal step threw. A non-zero value warrants operator action (toggle FAAS_REKEY_ENABLED and restart apid to retry).
+        last_id:
+          type: string
+          description: Resume cursor in (account_id|app_id|key) form. Empty when the walk has just started or finished a clean sweep.
+      x-since: "2026-08"
+      x-adr: "089"
+      x-pr-cluster: "PR-C"
 
     APIKeyExportResponse:
       description: "One API key in export form: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, and request count. Scopes is the permission set attached to the key at the moment of export (audit trail; IAM-1, ADR-034 rev2)."
