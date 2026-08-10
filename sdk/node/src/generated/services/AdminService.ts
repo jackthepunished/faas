@@ -6,6 +6,7 @@ import type { AccountCreditResponse } from '../models/AccountCreditResponse.js';
 import type { BillingCatalogResponse } from '../models/BillingCatalogResponse.js';
 import type { BillingReconcileResponse } from '../models/BillingReconcileResponse.js';
 import type { ConsumeInvoiceResponse } from '../models/ConsumeInvoiceResponse.js';
+import type { RekeyProgress } from '../models/RekeyProgress.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -204,6 +205,49 @@ export class AdminService {
         `,
         501: `code: billing_reconcile_unsupported — provider does not implement ReconcileUsage.`,
         502: `code: billing_reconcile_failed — SDK round-trip failed.`,
+      },
+    });
+  }
+  /**
+   * Read the cumulative rekey walk progress (admin-only).
+   * Returns the latest RekeyProgress snapshot the apid rekey
+   * runner has written — either to the in-process atomic pointer
+   * (memory-only mode) or to FAAS_REKEY_PROGRESS_FILE on disk.
+   * Operators poll this endpoint to monitor the walk after a
+   * host identity rotation; the response shape mirrors
+   * rekey.RekeyProgress exactly so a future operator tool
+   * (e.g. `gregale rekey status`) can decode without a parallel
+   * type.
+   *
+   * `total` is the running count of rows observed so far; it can
+   * grow as the walk paginates through (account_id, app_id, key)
+   * order. `rekeyed` + `skipped` should approach `total` once
+   * the walk drains. `failed` should stay at zero; a non-zero
+   * value means the unseal step threw for at least one row —
+   * the operationally safe recovery is `git rm
+   * migrations*reserve_slot.sql`-style idempotent re-trigger
+   * (toggle FAAS_REKEY_ENABLED and restart apid; the seen-set
+   * inside Replayer dedupes already-done rows).
+   *
+   * When the runner is disabled (FAAS_REKEY_ENABLED unset), the
+   * endpoint returns 503 with code `rekey_disabled` so an
+   * operator can distinguish "no work yet" from "feature off".
+   *
+   * @returns RekeyProgress Current rekey progress snapshot.
+   * @throws ApiError
+   */
+  public static getRekeyProgress(): CancelablePromise<RekeyProgress> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/admin/secrets/rekey-progress',
+      errors: {
+        401: `code: unauthorized`,
+        403: `code: admin_required — GET /v1/admin/secrets/rekey-progress requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        503: `code: rekey_disabled — FAAS_REKEY_ENABLED is unset on this apid; the background re-seal runner is not running. Set the env flag and restart apid to opt in.`,
       },
     });
   }

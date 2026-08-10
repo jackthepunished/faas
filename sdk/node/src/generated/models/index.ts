@@ -162,6 +162,7 @@ export type { QueueStateResponse } from './QueueStateResponse.js';
 export type { QuotaBlock } from './QuotaBlock.js';
 export type { RaiseOverageCapRequest } from './RaiseOverageCapRequest.js';
 export type { RateLimitPlain } from './RateLimitPlain.js';
+export type { RekeyProgress } from './RekeyProgress.js';
 export type { RenameAppRequest } from './RenameAppRequest.js';
 export type { RepoResponse } from './RepoResponse.js';
 export type { RotateAlertRuleSecretResponse } from './RotateAlertRuleSecretResponse.js';
