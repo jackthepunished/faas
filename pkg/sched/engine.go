@@ -2418,8 +2418,12 @@ func (e *Engine) RebalanceOrphanedApps(ctx context.Context, deadNodeID string) e
 // single pressured app to a peer schedd's fleet when the
 // owner-of-record is at sustained capacity-refusal pressure.
 // The cheap path (this method) only handles the parked-only
-// case; the policy-gated live-instance migration rides
-// alongside via maybeMigrateLiveInstancesFor.
+// case; the policy-gated live-instance migration hook was
+// removed in the Tier A10 follow-up PR (see the comment at the
+// ReassignAppOwner call site below) — peer-to-peer live
+// migration on the pressure path is a Tier A10.1 follow-up
+// pending a real peer-to-peer migrator (ADR-066's four-phase
+// handoff only supports destination = local schedd).
 //
 // Triggered by the pressure-rebalancer (pkg/sched/pressure_rebalancer.go)
 // on every sweep where the app's sliding-window AtCapacity
@@ -2482,23 +2486,86 @@ func (e *Engine) RebalancePressuredApps(ctx context.Context, appID string) error
 		return nil
 	}
 	// Peer selection — name-ASC sort, deterministic.
-	peer, err := e.findPeerWithHeadroom(ctx, app)
-	if err != nil {
-		return fmt.Errorf("sched: pressure rebalance: find peer: %w", err)
+	// Tier A10 / ADR-088: per-app overflow_node preference. If
+	// the customer pinned a spill target, try it first; on
+	// miss (inactive / no headroom / gone) the engine observes
+	// `overflow_target_unavailable` on the A9 outcome axis
+	// AND `unavailable` on the A10 spill axis, then falls
+	// through to the existing first-peer-with-headroom path.
+	// A successful overflow-target assignment is counted as a
+	// regular `migrated` on the A9 axis (the outcome is the
+	// same — the app moved) and `used` on the A10 axis (the
+	// preference was honoured). The two metric surfaces stay
+	// independent so a Grafana panel can branch "did the
+	// preference matter?" without reading the same series.
+	var overflowTargetUsed bool
+	peer := ""
+	if app.OverflowNode != nil && *app.OverflowNode != "" {
+		var perr error
+		peer, perr = e.findOverflowPeerWithHeadroom(ctx, app, *app.OverflowNode)
+		if perr != nil {
+			e.log.Warn("sched: pressure rebalance: overflow peer lookup",
+				"app_id", app.ID, "overflow_node", *app.OverflowNode, "err", perr)
+		}
+		if peer != "" {
+			overflowTargetUsed = true
+		} else {
+			// Mirror the unavailable outcome on the A9 axis so
+			// the dashboard's existing "no_headroom" panel
+			// doesn't swallow a preference miss as a routine
+			// "fleet full" event. Operators branching on
+			// `overflow_target_unavailable` know the customer
+			// pinned a target and the engine couldn't honour
+			// it (vs `no_headroom` which is "no peer anywhere
+			// on the fleet has space").
+			e.observePressure("overflow_target_unavailable")
+			e.observeOverflowSpill("unavailable")
+		}
 	}
 	if peer == "" {
-		e.observePressure("no_headroom")
-		return nil
+		peer, err = e.findPeerWithHeadroom(ctx, app)
+		if err != nil {
+			return fmt.Errorf("sched: pressure rebalance: find peer: %w", err)
+		}
+		if peer == "" {
+			e.observePressure("no_headroom")
+			// Tier A10 / ADR-088: if the customer's
+			// overflow_node preference was missed earlier
+			// (overflowTargetUsed=false) and the fallback
+			// also produced no peer, no spill-axis label is
+			// warranted — the sweep simply had no place to
+			// land the app. A non-empty peer would have
+			// bumped `fallback_used` at the success site.
+			return nil
+		}
+		// Tier A10 / ADR-088: the overflow preference was
+		// missed earlier (overflowTargetUsed=false) and
+		// the A9 fallback actually landed a peer. Bump
+		// `fallback_used` so the spill-axis panel
+		// distinguishes "preference lost, fleet empty"
+		// (no fallback_used increment) from "preference
+		// lost, fleet absorbed the app" (this increment).
+		if !overflowTargetUsed {
+			e.observeOverflowSpill("fallback_used")
+		}
 	}
-	// Policy-gated live-instance migration. The cheap path
-	// (parked-only) runs unconditionally; the expensive path
-	// (live migration via ADR-066) only runs when the policy
-	// opens the live window AND the app has live instances on
-	// the owner. Skip is a no-op for the cheap path — the
-	// cheap path already returns migrated on success.
-	if migrated := e.maybeMigrateLiveInstancesFor(ctx, app, peer); migrated {
-		e.observePressure("peer_live_migrated")
-	}
+	// Live-instance migration hook (Tier A10 follow-up):
+	// previously called e.maybeMigrateLiveInstancesFor here and
+	// bumped observePressure("peer_live_migrated") on success.
+	// That helper always no-op'd because MigrateLiveInstances
+	// self-skips when deadNodeID == e.ownerNodeID (engine.go:2944
+	// in pkg/sched/engine.go), and ADR-066's four-phase handoff
+	// only supports destination = local schedd (active-passive HA,
+	// ADR-083) — peer-to-peer live migration on the pressure path
+	// is a Tier A10.1 follow-up. Until that ships, the pressure
+	// rebalancer's effective policy is `skip_live`: only parked
+	// apps are reassigned; apps with live instances on the owner
+	// stay pinned (the customer's wake fails until the instances
+	// drain). The migration policy knob keeps the closed set
+	// {skip_live, migrate_after_1, migrate_after_2} so a future
+	// PR can wire the policy to a real peer-to-peer migrator
+	// without churn on the API surface.
+	//
 	// Atomic reassign of apps.node_id. RowsAffected==0 (the
 	// peer-claim race) is the only conflict path; the engine
 	// sees ErrConflict and increments the conflict metric.
@@ -2520,6 +2587,14 @@ func (e *Engine) RebalancePressuredApps(ctx context.Context, appID string) error
 	}
 	e.ResetPressureSweepCounter(app.ID)
 	e.observePressure("migrated")
+	// Tier A10 / ADR-088: bump the spill-axis `used` counter
+	// alongside the A9 `migrated` outcome. The two metric
+	// surfaces stay independent so a Grafana panel can branch
+	// "did the preference matter?" (used vs no_used) without
+	// reading the same series with two queries.
+	if overflowTargetUsed {
+		e.observeOverflowSpill("used")
+	}
 	// Emit the per-app reassignment notify. The gateway's
 	// per-node schedd client cache subscribes to this channel
 	// and evicts the now-stale dial target for the old owner;
@@ -2546,6 +2621,16 @@ func (e *Engine) RebalancePressuredApps(ctx context.Context, appID string) error
 func (e *Engine) observePressure(outcome string) {
 	if e.ops != nil {
 		e.ops.PressureReassignments(outcome).Inc()
+	}
+}
+
+// observeOverflowSpill is the per-outcome Tier A10 / ADR-088
+// overflow_node preference metric helper. Mirrors
+// observePressure's nil-safe shape so the call sites stay
+// single-line and the metric surface stays "ops != nil → bump".
+func (e *Engine) observeOverflowSpill(outcome string) {
+	if e.ops != nil {
+		e.ops.OverflowTargetSpillHits(outcome).Inc()
 	}
 }
 
@@ -2584,53 +2669,66 @@ func (e *Engine) findPeerWithHeadroom(ctx context.Context, app state.App) (strin
 	return "", nil
 }
 
-// maybeMigrateLiveInstancesFor returns true iff the policy gate
-// opened the live-migration window AND a live instance was
-// routed through Engine.MigrateLiveInstances on the owner.
-// skip_live: never migrates live instances.
-// migrate_after_1: migrates on the first sustained sweep.
-// migrate_after_2 (default): migrates only on the second
-// sustained sweep within the window. The consecutive-sweep
-// counter is incremented by the watcher BEFORE the
-// RebalancePressuredApps call, so the policy gate reads the
-// current sweep count.
-func (e *Engine) maybeMigrateLiveInstancesFor(ctx context.Context, app state.App, peer string) bool {
-	policy := e.pressureMigrationPolicy
-	if policy == "" {
-		policy = api.PressureMigrationPolicy
+// findOverflowPeerWithHeadroom (Tier A10 / ADR-088) resolves a
+// per-app overflow_node preference to a single peer UUID,
+// applying the same headroom check findPeerWithHeadroom uses.
+// targetUUID is the resolved compute_nodes.id the customer
+// pinned at create / PATCH time (apid does the name → UUID
+// resolution server-side so this helper never sees a wire
+// shape). Returns "" if any of the following is true:
+//
+//   - targetUUID == e.ownerNodeID (no-op self-migration).
+//   - target node is missing (operator deleted it; the FK
+//     ON DELETE SET NULL would have cleared the column, but a
+//     racing sweep can still observe the prior value before
+//     the SET NULL lands).
+//   - target node is inactive (operator drained it; the
+//     customer didn't notice and never unset the preference).
+//   - target node has no headroom for this app
+//     (ceiling - used < neededMB).
+//
+// Errors from the underlying Store reads are wrapped with
+// %w+op; the engine caller decides whether to log+fall-through
+// (it does) or surface the error (it doesn't — the fallback
+// path is the canonical recovery).
+func (e *Engine) findOverflowPeerWithHeadroom(ctx context.Context, app state.App, targetUUID string) (string, error) {
+	if targetUUID == e.ownerNodeID {
+		return "", nil
 	}
-	if policy == "skip_live" {
-		return false
+	n, err := e.store.ComputeNodeByID(ctx, targetUUID)
+	if err != nil {
+		// ErrNotFound is the deleted-node path — the FK
+		// ON DELETE SET NULL would normally have cleared
+		// the column, so this is a racing-sweep observation
+		// only. ANY other error is also swallowed (logged at
+		// debug below) because the engine's fallback to
+		// first-peer-with-headroom is the canonical recovery
+		// for a preference miss — a transient store blip
+		// shouldn't escalate to a sweep-wide failure. Return
+		// "" + nil so the caller falls through without
+		// logging at warn.
+		if !errors.Is(err, state.ErrNotFound) {
+			e.log.Debug("sched: pressure rebalance: overflow peer lookup failed",
+				"app_id", app.ID, "overflow_node", targetUUID, "err", err)
+		}
+		return "", nil
 	}
-	sweepCount := e.pressureSweepCounterValue(app.ID)
-	threshold := 2
-	if policy == "migrate_after_1" {
-		threshold = 1
+	if !n.Active {
+		return "", nil
 	}
-	if sweepCount < threshold {
-		return false
+	used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
+	if err != nil {
+		return "", fmt.Errorf("sched: pressure rebalance: overflow peer used_mb read: %w", err)
 	}
-	// ComputeNodeByID(read-only) is the only pre-flight we
-	// need before delegating to the four-phase handoff. The
-	// handoff itself handles lease dance, snapshot upload,
-	// and the per-instance outcome metric.
-	if _, err := e.store.ComputeNodeByID(ctx, peer); err != nil {
-		e.log.Warn("sched: pressure rebalance: peer lookup failed (live migration skipped)",
-			"app_id", app.ID, "peer", peer, "err", err)
-		return false
+	ceiling := n.AdmissionCeilingMB
+	if ceiling <= 0 {
+		ceiling = api.RAMAdmissionCeilingMB
 	}
-	// The handoff is ownerNodeID-scoped: the dying node is the
-	// current owner. The new owner is the peer — the handoff
-	// reads/drops state correctly even when the destination is
-	// one of several live peers (the consumer's
-	// active-passive flip is the same path as the dead-node
-	// path).
-	if _, err := e.MigrateLiveInstances(ctx, e.ownerNodeID); err != nil {
-		e.log.Warn("sched: pressure rebalance: live migration failed",
-			"app_id", app.ID, "owner", e.ownerNodeID, "err", err)
-		return false
+	neededMB := int64(app.RAMMB) + int64(api.PerVMOverheadMB)
+	if int64(ceiling)-used < neededMB {
+		return "", nil
 	}
-	return true
+	return n.ID, nil
 }
 
 // pressureSweepCounterValue is the read-only accessor for the

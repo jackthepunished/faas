@@ -559,6 +559,20 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, prob)
 		return
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// Resolve the wire name → UUID server-side before the
+	// store call so the column carries the resolved UUID
+	// (the column-shape integrity contract — uuid NULL, not
+	// text). `strictEmpty=false` because PATCH allows `""` to
+	// mean "clear the preference" (an explicit transition,
+	// distinct from nil = "don't touch the column"). On any
+	// 4xx we bail; on success the local var carries the
+	// resolved UUID (or "" for clear).
+	overflowUUID, prob := s.resolveOverflowNode(r.Context(), req.OverflowNode, false /*strictEmpty*/)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
 	// SetMinInstances: nil pointer means "don't touch"; non-nil
 	// (even pointing at 0) means "explicit set" → scale to zero.
 	//
@@ -746,6 +760,16 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// re-rendering. New post-flip apps (column NULL on
 		// create) are unaffected by the SET.
 		ClearAuthDefaultFlippedAt: req.RequireAuthn != nil || req.PublicAuth != nil,
+		// Tier A10 / ADR-088: per-app overflow_node preference.
+		// `req.OverflowNode != nil` distinguishes "don't touch
+		// the column" (nil pointer) from "explicit clear or
+		// explicit set" (non-nil pointer; "" means clear,
+		// non-empty means the resolved UUID). Resolution to
+		// UUID ran above (resolveOverflowNode) so this
+		// carries the canonical column value, never the
+		// wire-format name.
+		OverflowNode:    nilStringPtr(overflowUUID),
+		SetOverflowNode: req.OverflowNode != nil,
 	}
 	if req.PublicAuth != nil {
 		// params.PublicAuth is unset when req.PublicAuth is
@@ -1721,6 +1745,79 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 		"app_id":  c.AppID,
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// listCronRuns is the per-cron execution history (issue #791):
+// GET /v1/crons/{id}/runs.
+//
+// Answers "did my last N fires work, and how long did they take" —
+// the question /v1/invocations cannot express, because it has no
+// cron_id filter and no server-side duration.
+//
+// Ownership uses the same two-step as updateCron/deleteCron: resolve
+// the cron, then resolve its app and compare account ids. Both
+// failure branches emit the identical "no such cron" 404 so a probe
+// cannot distinguish "wrong id" from "someone else's cron".
+func (s *server) listCronRuns(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	c, err := s.store.CronByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such cron")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), c.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such cron")
+		return
+	}
+	limit, perr := parseCronRunsLimit(r)
+	if perr != nil {
+		api.WriteProblem(w, perr)
+		return
+	}
+	rows, err := s.store.ListCronRunsForCron(r.Context(), id, limit, r.URL.Query().Get("before"))
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list cron runs"))
+		return
+	}
+	runs := make([]api.CronRun, 0, len(rows))
+	for _, inv := range rows {
+		runs = append(runs, cronRunFromInvocation(inv))
+	}
+	writeJSON(w, http.StatusOK, api.ListCronRunsResponse{Runs: runs})
+}
+
+// cronRunFromInvocation projects an invocations row onto the narrow
+// CronRun wire shape. Two translations matter:
+//
+//   - duration is computed here rather than by the client, so every
+//     consumer agrees on the definition (completed_at - created_at,
+//     i.e. enqueue-to-terminal, which includes wake time).
+//   - a NULL outcome means the row is non-terminal, which the wire
+//     reports as "running" rather than an empty string.
+func cronRunFromInvocation(inv state.Invocation) api.CronRun {
+	run := api.CronRun{
+		ID:          inv.ID,
+		StartedAt:   inv.CreatedAt,
+		CompletedAt: inv.CompletedAt,
+		Attempts:    inv.Attempts,
+		InstanceID:  inv.InstanceID,
+		Error:       inv.LastError,
+		Outcome:     api.CronRunRunning,
+	}
+	if inv.Outcome != nil {
+		run.Outcome = api.CronRunOutcome(*inv.Outcome)
+	}
+	if inv.CompletedAt != nil {
+		ms := inv.CompletedAt.Sub(inv.CreatedAt).Milliseconds()
+		// Clamp: a clock step between the insert default and the
+		// terminal update can otherwise surface a negative duration.
+		if ms < 0 {
+			ms = 0
+		}
+		run.DurationMs = &ms
+	}
+	return run
 }
 
 // --- api keys --------------------------------------------------------------
@@ -2968,6 +3065,46 @@ func (s *server) buildProvenanceResponse(p state.BuildProvenance) api.BuildProve
 	}
 }
 
+// buildResponse projects a state.Build into the wire BuildResponse
+// (DEPLOY-PROV-6 / ADR-089, issue #741). state.Build is the
+// in-memory shape (string IDs, plain time.Time) — the sqlc
+// pgtype.Timestamptz values are translated to time.Time by the
+// store layer. We treat the zero time as "unset" (queued builds
+// have no started_at; running builds have no finished_at) and
+// rely on the omitempty tags on BuildResponse so the JSON stays
+// minimal.
+//
+// duration_seconds is server-computed: only set when BOTH
+// StartedAt and FinishedAt are non-zero — a CI script can always
+// rely on its presence meaning "the build reached a terminal
+// state and elapsed N wall-clock seconds."
+func (s *server) buildResponse(b state.Build) api.BuildResponse {
+	out := api.BuildResponse{
+		ID:           b.ID,
+		DeploymentID: b.DeploymentID,
+		Kind:         string(b.Kind),
+		SourceBytes:  b.SourceBytes,
+		Status:       string(b.Status),
+	}
+	if b.FailureClass != "" {
+		out.FailureClass = string(b.FailureClass)
+	}
+	if b.LogPath != "" {
+		out.LogPath = b.LogPath
+	}
+	if !b.StartedAt.IsZero() {
+		out.StartedAt = b.StartedAt.UTC().Format(time.RFC3339)
+	}
+	if !b.FinishedAt.IsZero() {
+		out.FinishedAt = b.FinishedAt.UTC().Format(time.RFC3339)
+	}
+	if !b.StartedAt.IsZero() && !b.FinishedAt.IsZero() {
+		out.DurationSeconds = int(b.FinishedAt.Sub(b.StartedAt).Seconds())
+	}
+	out.EnqueuedAt = b.EnqueuedAt.UTC().Format(time.RFC3339)
+	return out
+}
+
 // instanceResponse projects a state.Instance into the wire
 // InstanceResponse. The minInstancesTarget parameter carries the
 // parent app's effective min_instances (issue #557 / ADR-071) so
@@ -3316,6 +3453,34 @@ func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time
 	return month, before, limit, nil
 }
 
+// parseCronRunsLimit validates the ?limit= query string for
+// GET /v1/crons/{id}/runs. Default 10; clamped 1..100. Bad input is
+// surfaced as a 400 Problem with limit + observed + docs URL so
+// clients see the misconfiguration instead of silently falling back
+// to the default (which masks their bug). Mirrors the invoice
+// helper above; kept as a separate function because cron's `before`
+// is an invocation id, not a timestamp — that parsing belongs with
+// the storage layer's cursor handling.
+func parseCronRunsLimit(r *http.Request) (int, *api.Problem) {
+	const limitMax = 100
+	limit := 10
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 1 || n > limitMax {
+			observed := int64(0)
+			if perr == nil {
+				observed = int64(n)
+			}
+			return 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad limit", "expected 1..100").
+				WithLimit(int64(limitMax), observed).
+				WithDocs("https://" + wire.DocsHost + "/crons#runs")
+		}
+		limit = n
+	}
+	return limit, nil
+}
+
 // invoiceResponse maps state.Invoice to the API DTO. Direct field
 // pass-through — the state row is already in the on-the-wire shape,
 // except HostedURL which is intentionally dropped (PR-B audit only).
@@ -3539,6 +3704,45 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 	}
 }
 
+// getBuild returns the lifecycle row for a build id (DEPLOY-PROV-6
+// / ADR-089, issue #741). Companion to the ADR-038
+// /v1/builds/{id}/provenance (post-mortem export) and
+// /v1/builds/{id}/sbom (post-mortem blob) routes — this one is
+// the LIFECYCLE surface (status, timestamps, failure_class,
+// duration). CI scripts call this to fail-fast on build error
+// without scraping SSE; the CLI's streamDeployLogs fallback
+// (pollBuildStatus in commands2.go) also loops on it.
+//
+// IDOR chain mirrors getBuildProvenance: BuildByID →
+// DeploymentByID → AppByID, comparing App.AccountID against the
+// requesting account. Every negative path renders 404 with
+// code=build_not_found so cross-account probes can't enumerate.
+// The "no such build" envelope is shared with the other
+// /v1/builds/{id}/* routes.
+//
+// Per ADR-034 rev2 the route is gated by api.ScopesReadSurface
+// (the same chain as getBuildProvenance / getBuildSbom; see
+// cmd/apid/server.go:803).
+func (s *server) getBuild(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	build, err := s.store.BuildByID(r.Context(), id)
+	if err != nil {
+		api.WriteProblem(w, api.ErrBuildNotFound())
+		return
+	}
+	dep, err := s.store.DeploymentByID(r.Context(), build.DeploymentID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrBuildNotFound())
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), dep.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		api.WriteProblem(w, api.ErrBuildNotFound())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.buildResponse(build))
+}
+
 // getBuildProvenance returns the ADR-038 provenance row for a build
 // (Tier 3 / issue #197 B3.10-read half). Two-step ownership check:
 // BuildByID → DeploymentByID → AppByID, comparing App.AccountID against
@@ -3551,7 +3755,6 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 // inside builderd.recordProvenance) renders 404 with code
 // build_provenance_not_found — distinct from "no such build"
 // so the customer can branch on the difference.
-//
 // Per ADR-034 rev2 the route is gated by the same `build:read`
 // scope the rest of the build surface uses.
 func (s *server) getBuildProvenance(w http.ResponseWriter, r *http.Request, acct state.Account) {

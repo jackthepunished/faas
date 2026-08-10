@@ -1776,7 +1776,15 @@ type Store interface {
 	// budget=0 because their retry semantics are not plan-scoped; the
 	// queue-source drain caller (drain.go:279/306) passes
 	// plan.LimitsForPlan(acct.Plan).MaxQueueAttempts.
-	FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int) error
+	//
+	// opts (issue #791) refines the durable Outcome stamped on the
+	// permanent branch. The default is OutcomeFailed; the drain's two
+	// deadline paths pass WithOutcome(OutcomeTimeout) so the cron
+	// run-history surface can distinguish a blown deadline from a
+	// generic failure without parsing lastError. Ignored on the
+	// transient branch (the row stays non-terminal, so it carries no
+	// outcome) and overridden by the dead-letter branch.
+	FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int, opts ...FailOption) error
 	// CountPendingInvocations is index-backed by invocations_app_pending_idx;
 	// used by the apid cap check on POST .../queues/invocations:send and
 	// POST /v1/apps/{slug}/delayed-tasks, and by the drain's cap re-check
@@ -1801,6 +1809,19 @@ type Store interface {
 	// combinations the planner falls back to a sequential scan, which is
 	// fine for the rare delete path.
 	ListInvocationsForApp(ctx context.Context, appID string, states ...InvocationState) ([]Invocation, error)
+	// ListCronRunsForCron is the per-cron run-history read (issue #791)
+	// backing GET /v1/crons/{id}/runs. Filters on cron_id — the FK
+	// schedd's dispatchOneCron stamps on every fire — and pages with the
+	// same opaque `before` cursor convention as ListInvocationsForAccount
+	// (an Invocation.ID; "" means "start from the newest"). Index-backed
+	// by invocations_cron_idx (migrations/00166).
+	//
+	// Deliberately NOT account-scoped in SQL: the caller must have
+	// already resolved the cron to an app it owns. apid's listCronRuns
+	// does this with the CronByID → AppByID → AccountID check that
+	// updateCron/deleteCron use, so a cross-tenant id 404s before it
+	// reaches the store.
+	ListCronRunsForCron(ctx context.Context, cronID string, limit int, before string) ([]Invocation, error)
 
 	// Queue introspection (issue #394, Move 1 dead-letter + read API).
 	// The three read-only methods back GET /v1/apps/{slug}/queues/{state,peek,dead_letter}

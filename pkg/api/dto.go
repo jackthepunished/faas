@@ -71,6 +71,16 @@ type CreateAppRequest struct {
 	// streaming pattern from issue #471 — same fail-closed
 	// contract, same Plan.WebSocketEnabled() accessor.
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
+	// preferred spill target for cross-node pressure rebalance.
+	// Wire type is the human-readable compute_nodes.name; apid
+	// resolves the name to the UUID server-side via
+	// Store.ComputeNodeByName. nil at create time = "no
+	// preference" (default A9 fallback). Empty-string "" at
+	// create time is rejected with 422 invalid_overflow_node —
+	// create-time has no "clear" path because the column starts
+	// NULL.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 }
 
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
@@ -215,6 +225,16 @@ type UpdateAppRequest struct {
 	// the reserved tier is unlocked) — the cap is over APPS, not
 	// instances, so flipping down always frees a slot.
 	EvictionPriority *string `json:"eviction_priority,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
+	// preferred spill target for cross-node pressure rebalance.
+	// Tri-state: nil = no change, "" = clear (back to A9 default
+	// fallback), non-empty = resolve server-side (404 on unknown
+	// name → 422 invalid_overflow_node; 422 on inactive node).
+	// Resolution is `Store.ComputeNodeByName(name)` → the FK on
+	// apps.overflow_node (migration 00167). Engine consults the
+	// resolved UUID on the next pressured sweep; falls through to
+	// A9 if the peer has no headroom or is inactive.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
@@ -573,6 +593,16 @@ type AppResponse struct {
 	// deployment-state only at the explicit ref — mirrors the
 	// per-deployment override pattern at DeploymentResponse.
 	ParkedDeployment *ParkedDeploymentRef `json:"parked_deployment,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) echoes the resolved UUID
+	// of the customer's per-app preferred spill target. NULL
+	// when no preference is set (the default A9 fallback).
+	// Dashboards branch on `null` to render the "no spill
+	// target" pill. The wire DTO is UUID-shaped (not name) so
+	// the value is unambiguous across operator-deployed fleets
+	// with non-unique names — apid always resolves the wire
+	// `name` to a `compute_nodes.id` server-side before
+	// persisting or returning.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 }
 
 // ParkedDeploymentRef is the reference shape returned in
@@ -1093,6 +1123,42 @@ type BuildProvenanceResponse struct {
 	FinishedAt     string `json:"finished_at"`
 	SBOMStorageKey string `json:"sbom_storage_key"`
 	FrameworkVer   string `json:"framework_version"`
+}
+
+// BuildResponse is the public surface of a builds row (DEPLOY-PROV-6 /
+// ADR-089, issue #741). Companion to BuildProvenanceResponse (post-
+// mortem export, ADR-038) and the /sbom route (post-mortem blob,
+// ADR-038 Phase 3): BuildResponse is the LIFECYCLE surface — status,
+// timestamps, failure_class, server-computed duration.
+//
+// Status mirrors builds.status, a 4-state enum (queued|running|
+// succeeded|failed) — schema.sql:662 CHECK constraint. 'cancelled'
+// from the original issue example is intentionally absent; the
+// schema doesn't support it and no transition code exists. Adding
+// it requires a separate migration + builderd path.
+//
+// failure_class is empty unless status='failed'; the failure_class
+// CHECK constraint is oom|timeout|user_error|infra (schema.sql:660).
+// error_message is NOT in this response — the detailed per-failure
+// string lives on deployments.error_message; clients that need it
+// should call GetDeployment(deployment_id). ADR-089 §4.
+//
+// duration_seconds is server-computed (FinishedAt-StartedAt) only
+// when both timestamps are set; the field is omitted otherwise so a
+// queued/running build stays minimal. CI scripts shouldn't have to
+// parse RFC3339 to compute elapsed time.
+type BuildResponse struct {
+	ID              string `json:"id"`
+	DeploymentID    string `json:"deployment_id"`
+	Kind            string `json:"kind"` // railpack|dockerfile|tarball|github
+	SourceBytes     int64  `json:"source_bytes"`
+	Status          string `json:"status"` // queued|running|succeeded|failed
+	FailureClass    string `json:"failure_class,omitempty"`
+	LogPath         string `json:"log_path,omitempty"`
+	EnqueuedAt      string `json:"enqueued_at"`
+	StartedAt       string `json:"started_at,omitempty"`
+	FinishedAt      string `json:"finished_at,omitempty"`
+	DurationSeconds int    `json:"duration_seconds,omitempty"`
 }
 
 // DeploymentResponse is a deployment as returned by the API.
@@ -2276,6 +2342,63 @@ type Invocation struct {
 // so pkg/api stays decoupled from pkg/state.
 type ListInvocationsResponse struct {
 	Invocations []Invocation `json:"invocations"`
+}
+
+// --- Issue #791 — cron run history ----------------------------------
+
+// CronRunOutcome is the normalized result of a single cron fire. It
+// mirrors state.InvocationOutcome plus the synthetic "running" value
+// the API substitutes for a NULL outcome, so a client never has to
+// handle an empty string.
+type CronRunOutcome string
+
+const (
+	// CronRunSuccess — the fire completed.
+	CronRunSuccess CronRunOutcome = "success"
+	// CronRunFailed — the fire failed permanently for a reason other
+	// than a deadline.
+	CronRunFailed CronRunOutcome = "failed"
+	// CronRunTimeout — the fire exceeded its deadline (gateway 504 or
+	// an expired dispatch lease).
+	CronRunTimeout CronRunOutcome = "timeout"
+	// CronRunDeadLetter — the per-plan retry budget was exhausted.
+	CronRunDeadLetter CronRunOutcome = "dead_letter"
+	// CronRunRunning — the fire is still in flight (the underlying
+	// invocation row is non-terminal and carries no outcome).
+	CronRunRunning CronRunOutcome = "running"
+)
+
+// CronRun is one row of a cron's execution history: GET
+// /v1/crons/{id}/runs.
+//
+// Deliberately NOT the full Invocation shape. A cron run is a narrow
+// question — did it work, when, and for how long — and the caller
+// should not have to know that runs are stored as invocations, nor
+// subtract two timestamps to get a duration. Keeping the projection
+// separate also means the invocations row can gain or lose fields
+// without churning the cron surface.
+type CronRun struct {
+	ID string `json:"id"`
+	// StartedAt is the underlying invocation's created_at — when the
+	// cron fired, not when the app began executing.
+	StartedAt   time.Time  `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// DurationMs is completed_at - started_at, computed server-side.
+	// nil while the run is still in flight.
+	DurationMs *int64         `json:"duration_ms,omitempty"`
+	Outcome    CronRunOutcome `json:"outcome"`
+	// Attempts is the dispatch count; > 1 means the row was retried.
+	Attempts   int    `json:"attempts"`
+	InstanceID string `json:"instance_id,omitempty"`
+	// Error is the operator-facing failure text. Unstructured and
+	// unversioned — branch on Outcome, never on this string.
+	Error string `json:"error,omitempty"`
+}
+
+// ListCronRunsResponse is the wire shape for GET /v1/crons/{id}/runs.
+// Ordered newest-first; page with ?before=<id of the last row>.
+type ListCronRunsResponse struct {
+	Runs []CronRun `json:"runs"`
 }
 
 // --- Issue #394 — queue introspection -------------------------------

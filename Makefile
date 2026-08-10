@@ -294,6 +294,59 @@ ha-failover-drill: ## Tier A8 / ADR-083: active-passive HA fail-over drill on th
 lint-incompatible-mods: ## CI: fail if any direct go.mod require is +incompatible
 	@bash scripts/ci/check_no_incompatible_deps.sh
 
+.PHONY: ha-write-redirect-drill
+ha-write-redirect-drill: ## Tier A9 / ADR-089: standby write-redirect drill on the two-node Lima fleet (§14 M9)
+	# Read-only drill (per ADR-089 §Open follow-ups): assumes the
+	# active-passive topology is already configured (make
+	# metal-lima-2node must be green; the prior tier-A8
+	# ha-failover-drill must have run at least once).
+	#
+	# Pre-flights both Limas (faas-metal + faas-metal-2b); fails
+	# closed if either is missing. The drill itself is the
+	# acceptance script + the manual operator steps in
+	# docs/runbooks/standby-write-redirect.md §Procedure; the
+	# validation matrix in §Acceptance is what a green run
+	# asserts. No UPDATE compute_nodes toggling — the drill
+	# exercises the relay/redirect paths under steady-state
+	# leader identity, not under failover.
+	@limactl list -q 2>/dev/null | grep -qx faas-metal || { echo "faas-metal not started — run 'make metal-lima-2node' first" >&2; exit 1; }
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || { echo "faas-metal-2b not started — run 'make metal-lima-2node' first" >&2; exit 1; }
+	@bash -c 'set -e; \
+	  echo "ha-write-redirect-drill: see docs/runbooks/standby-write-redirect.md for the 7-step procedure."; \
+	  echo "  Pre-flight: both Limas running; mTLS cert material at /etc/faas/tls/gatewayd/egress-client.{crt,key}"; \
+	  echo "              and CA at /etc/faas/tls/gatewayd/ca.crt on both boxes (ADR-052 keep set)."; \
+	  echo "              Both boxes must run with FAAS_LEADER_REDIRECT_TLS_CERT set so the writeGate is"; \
+	  echo "              constructed (the opt-in flag for the Tier A9 gate, ADR-089 §Decision #1)."; \
+	  echo "  Step 1: read the active-passive decision from each box. The leader identity is refreshed"; \
+	  echo "          on every compute_node_changed pg_notify event (Tier A8 / ADR-083):"; \
+	  echo "          limactl shell faas-metal    curl -s localhost:9100/metrics | grep gateway_standby_state"; \
+	  echo "          limactl shell faas-metal-2b curl -s localhost:9100/metrics | grep gateway_standby_state"; \
+	  echo "          lex-min(name) is the leader (StandbyState=2/warm); the other is the standby."; \
+	  echo "          limactl shell faas-metal    curl -s localhost:9100/metrics | grep gateway_standby_state"; \
+	  echo "          limactl shell faas-metal-2b curl -s localhost:9100/metrics | grep gateway_standby_state"; \
+	  echo "          lex-min(name) is the leader (StandbyState=2/warm); the other is the standby."; \
+	  echo "  Step 2: capture baseline counter on the standby:"; \
+	  echo "          limactl shell <standby> curl -s localhost:9100/metrics | grep gatewayd_internal_write_redirect_total"; \
+	  echo "  Step 3: bearer write to the standby — should relay via mTLS to the leader and increment"; \
+	  echo "          outcome=\"relayed\", auth_kind=\"bearer\" by exactly 1:"; \
+	  echo "          limactl shell <standby> curl -H \"Authorization: Bearer <drill-token>\" -X POST \\"; \
+	  echo "            -d \"{\\\"slug\\\":\\\"drill-<uuid>\\\",\\\"runtime\\\":\\\"node22\\\"}\" \\"; \
+	  echo "            https://127.0.0.1:8080/v1/apps"; \
+	  echo "  Step 4: cookie write to the standby — should 307-redirect to the leader and increment"; \
+	  echo "          outcome=\"redirect_307\", auth_kind=\"cookie\" by exactly 1:"; \
+	  echo "          limactl shell <standby> curl -i --cookie \"faas_sid=<drill-session>\" \\"; \
+	  echo "            -X POST -d \"{\\\"slug\\\":\\\"drill-<uuid>\\\"}\" \\"; \
+	  echo "            https://127.0.0.1:8080/v1/apps"; \
+	  echo "  Step 5: verify both counters advanced and the 307 carries Retry-After: 5 + Location: https://<leader>/..."; \
+	  echo "  Step 6: flip the leader via psql (operator-driven, NOT the drill) and re-run steps 3-4"; \
+	  echo "          to confirm the counter vocabulary still drives with the new leader identity."; \
+	  echo "  Step 7: limactl shell <standby> curl -s localhost:9100/metrics | grep gatewayd_internal_write_redirect_total \\"; \
+	  echo "          — confirm relayed and redirect_307 both >= 1; same_box and leader_unreachable are 0."; \
+	  echo "  The full read-only drill is automated by deploy/lima/run-ha-write-redirect.sh — exit codes 0/1/2/3/4"; \
+	  echo "  mirror the Tier A8 ha-failover-drill. Run the script directly when the operator wants a non-"; \
+	  echo "  interactive pass; the bash block above is the manual form."; \
+	  exit 0'
+
 .PHONY: lint
 lint: egress-check lint-incompatible-mods ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate
 	@$(GO) tool golangci-lint run

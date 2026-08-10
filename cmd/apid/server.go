@@ -797,6 +797,18 @@ func (s *server) handler() http.Handler {
 	// powerful as the min_instances PATCH (Σ rebalance affects
 	// sibling live rows in the same app).
 	mux.HandleFunc("PATCH /v1/deployments/{id}/traffic", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateDeploymentTraffic))))
+	// Builds (DEPLOY-PROV-6 / ADR-089, issue #741). Lifecycle
+	// surface — returns status, timestamps, failure_class,
+	// server-computed duration_seconds for a build id. Companion
+	// to the ADR-038 /v1/builds/{id}/provenance (post-mortem
+	// export) and /v1/builds/{id}/sbom (post-mortem blob) routes;
+	// this one is what CI scripts call to fail-fast on build
+	// error without scraping SSE. Same auth (api.ScopesReadSurface)
+	// + same IDOR-safe Build → Deployment → App → AccountID check
+	// as the sibling routes. The status field is the existing
+	// 4-state enum (queued|running|succeeded|failed); see ADR-089
+	// §1 for why 'cancelled' is out of scope.
+	mux.HandleFunc("GET /v1/builds/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuild)))
 	// Builds (ADR-038). The provenance route is the only /v1/builds
 	// surface today; deployments.id remains the parent resource.
 	// Build:read scope (api.ScopesReadSurface) gates the read.
@@ -834,6 +846,9 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/crons", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createCron)))))
 	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateCron))))
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron))))
+	// Per-cron execution history (issue #791). Read surface, so
+	// ScopesReadSurface and no idempotency wrapper.
+	mux.HandleFunc("GET /v1/crons/{id}/runs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCronRuns))))
 
 	// Projects (ADR-050, Phase 3). Two routes — /scan is dry-run
 	// (no writes), / is the transactional apply. Both are deploy-
@@ -966,6 +981,28 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.resetPaddleCatalog)))
 	mux.HandleFunc("POST /v1/admin/billing-reconcile/{id}",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.reconcileAccount)))
+
+	// Operator observability backend (issue #777 / ADR-091). The
+	// /v1/admin/obs/* surface gives the platform owner read-only
+	// visibility into fleet state (users, apps, nodes, heartbeats).
+	// Same two-layer gate as the rest of /v1/admin/* (admin scope
+	// + email allowlist, the second enforced inside each handler
+	// via s.adminAllows), plus MFA — the obs view exposes
+	// secret-adjacent metadata (MFA enrollment, account email) and
+	// the cost is a one-time TOTP per 24h session thanks to
+	// step-up elsewhere (ADR-091 §"Two-layer gate confirmed").
+	// All five routes are GETs; no s.idempotent wrapper needed
+	// (matches /v1/compute-nodes read precedent).
+	mux.HandleFunc("GET /v1/admin/obs/overview",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsOverview))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListTenants))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsGetTenant))))
+	mux.HandleFunc("GET /v1/admin/obs/nodes",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListNodes))))
+	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/heartbeats",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeHeartbeats))))
 
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session

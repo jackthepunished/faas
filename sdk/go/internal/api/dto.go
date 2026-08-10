@@ -18,6 +18,16 @@ type CreateAppRequest struct {
 	RAMMB          int    `json:"ram_mb,omitempty"`  // 0 => plan default
 	MaxConcurrency int    `json:"max_concurrency,omitempty"`
 	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
+	// preferred spill target. The wire form is a
+	// compute_nodes.name (the operator-supplied human-readable
+	// label), NOT a UUID — apid resolves the name to the
+	// underlying compute_nodes.id server-side. nil → no
+	// preference (the engine's A9 first-peer-with-headroom
+	// fallback). The string-shape rejects a silent "" at
+	// create-time (the column starts NULL), so callers that
+	// mean "no preference" should leave the field nil.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 }
 
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
@@ -56,6 +66,15 @@ type UpdateAppRequest struct {
 	// one-liner; this field is exposed for callers that bundle
 	// eviction_priority into a wider PATCH.
 	EvictionPriority *string `json:"eviction_priority,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
+	// preferred spill target. The wire form is a
+	// compute_nodes.name; apid resolves to a UUID server-side.
+	// Tri-state: nil → don't touch the column; "" → clear the
+	// preference; non-empty → resolve + set. Same surface
+	// contract as EvictionPriority (pointer-to-string with
+	// omitempty). Use Client.SetAppOverflowNode for the common
+	// one-liner.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 	// AutoscaleTargetRPS is the per-instance RPS target for the
 	// reactive scale-up trigger (issue #169 / #172 / pkg/sched/scaleup).
 	// When measured RPS / live_instance_count exceeds this value,
@@ -187,6 +206,16 @@ type AppResponse struct {
 	// 'reserved' (Hobby+ only, per-account cap enforced) protects
 	// the app from cross-account RAM-pressure eviction.
 	EvictionPriority string `json:"eviction_priority"`
+	// OverflowNode (Tier A10 / ADR-088) is the resolved UUID of
+	// the customer's per-app preferred spill target for the
+	// pressure-rebalance path (pkg/sched/engine.RebalancePressuredApps).
+	// nil when no preference is set — the engine falls back to
+	// the A9 first-peer-with-headroom path. The wire is a UUID
+	// string (the server resolved the customer-supplied
+	// compute_nodes.name at create / PATCH time, so the value
+	// on this surface is unambiguous across operator-deployed
+	// fleets).
+	OverflowNode *string `json:"overflow_node,omitempty"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart

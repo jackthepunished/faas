@@ -2464,6 +2464,51 @@ paths:
   # The provenance route is the only /v1/builds surface today.
   # deployments.id remains the parent resource; Build:read scope
   # (api.ScopesReadSurface) gates the read.
+  #
+  # DEPLOY-PROV-6 / ADR-089 (issue #741) added /v1/builds/{id} as
+  # the LIFECYCLE surface (status, timestamps, failure_class,
+  # duration). Companion to /provenance (post-mortem export) and
+  # /sbom (post-mortem blob). Same auth + same IDOR chain.
+
+  /v1/builds/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getBuild
+      summary: Get build status.
+      description: |
+        Returns the lifecycle row for a build id — current status,
+        enqueued/started/finished timestamps, failure_class (when
+        status='failed'), and a server-computed duration_seconds
+        (only set when both started_at and finished_at are
+        populated). Companion to /v1/builds/{id}/provenance (post-
+        mortem export) and /v1/builds/{id}/sbom (post-mortem
+        blob); this one is the LIFECYCLE surface CI scripts call
+        to fail-fast on build error without scraping SSE.
+
+        The status enum is `queued|running|succeeded|failed` (the
+        builds_status_check CHECK constraint; no 'cancelled' value).
+        failure_class, when present, is one of `oom|timeout|
+        user_error|infra` (the builds_failure_class_check CHECK
+        constraint). error_message is intentionally NOT in the
+        response — it lives on deployments; call GET
+        /v1/deployments/{id} for the per-failure string.
+      responses:
+        '200':
+          description: Build lifecycle row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BuildResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            `404 Not Found` — the build id does not exist OR
+            belongs to another account. Stable code
+            `build_not_found`. The 404 surface is uniform so
+            cross-account probes can't enumerate.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/builds/{id}/provenance:
     parameters:
@@ -2712,6 +2757,46 @@ paths:
       summary: Delete a cron.
       responses:
         '204': { description: No body. The cron trigger was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/crons/{id}/runs:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [crons]
+      operationId: listCronRuns
+      summary: List recent runs of a cron.
+      description: |
+        Execution history for one cron, newest first. Each row reports
+        when the fire started, how long it took (`duration_ms`,
+        computed server-side), and a normalized `outcome` — so a
+        timeout is distinguishable from a generic failure without
+        parsing `error`.
+
+        Paginated by `?before=<id>` (the LAST id of the returned
+        slice). Defaults to 10 per page; capped at 100. For a wider,
+        cross-source view use `GET /v1/invocations`.
+      parameters:
+        - name: before
+          in: query
+          required: false
+          schema: { type: string }
+          description: "Cursor — return runs older than this run id. Omit for the most recent page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+          description: "Page size; 1-100, default 10."
+      responses:
+        '200':
+          description: A page of runs for this cron, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListCronRunsResponse'
+                example: {"runs":[{"id":"0123456789abcdef0123456789abcdef","started_at":"2026-08-10T09:00:00Z","completed_at":"2026-08-10T09:00:01.2Z","duration_ms":1200,"outcome":"success","attempts":1},{"id":"fedcba9876543210fedcba9876543210","started_at":"2026-08-09T21:00:00Z","completed_at":"2026-08-09T21:00:30Z","duration_ms":30000,"outcome":"timeout","attempts":1,"error":"invoke: gateway timeout"}]}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -6404,6 +6489,19 @@ components:
             - type: 'null'
           description: "Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why is my app evicted_cold?' without grepping the audit log."
 
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Resolved UUID (not the wire name) — apid resolves the
+        # wire name to the UUID server-side before persisting,
+        # so the read-back is unambiguous across
+        # operator-deployed fleets with non-unique names. NULL
+        # when no preference is set (default A9 fallback;
+        # random first peer with headroom).
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps before the A9 fallback; falls through to A9 when the target is inactive or full."
+          type: [string, "null"]
+          format: uuid
+          example: "00000000-0000-0000-0000-000000000000"
+
         # Issue #477 / ADR-077: per-app public-URL auth
         # configuration. Mirrors the read-side
         # PublicAuthStatus shape — `has_basic_creds` is true
@@ -6478,6 +6576,17 @@ components:
           type: string
           enum: [best_effort, reserved]
           example: best_effort
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Wire form is the human-readable compute_nodes.name;
+        # apid resolves to the UUID server-side via
+        # Store.ComputeNodeByName before persisting. 404 on
+        # unknown name; 422 on inactive node. Omitted at
+        # create-time → default A9 fallback (no preference).
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is compute_nodes.name (resolved server-side). Omitted → no preference; empty string at create-time is rejected with 422 invalid_overflow_node because the column starts NULL and there is no 'clear' path at create-time."
+          type: string
+          minLength: 1
+          example: "box-eu-1"
         # Issue #560 + issue #695 / ADR-080: optional at
         # create-time. Omitted → apid applies the per-plan
         # default (Free=false, Hobby=true, Pro=true, Scale=true).
@@ -6653,6 +6762,17 @@ components:
           oneOf:
             - type: "null"
             - $ref: '#/components/schemas/PublicAuthBlock'
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Wire type is the human-readable compute_nodes.name;
+        # apid resolves to the UUID server-side. Tri-state:
+        # omitted → no change; "" → clear (back to A9
+        # fallback); non-empty → resolve via
+        # Store.ComputeNodeByName and store the UUID. 404 on
+        # unknown name; 422 on inactive node.
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist the UUID. 404 on unknown name; 422 on inactive node."
+          type: [string, "null"]
+          example: "box-eu-1"
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -7136,6 +7256,52 @@ components:
         sbom_storage_key: { type: [string, "null"], description: "Phase 3 populator fills this from `syft` output. Empty string when not yet populated." }
         framework_version: { type: [string, "null"], description: "Source-declared language version (nodes 22.11.0 / python 3.13 / go 1.24, etc.). Empty string when no version file is present or any parser fails — best-effort, never an error. Added in DEPLOY-PROV-5 / issue #740 / ADR-087." }
 
+    BuildResponse:
+      description: |
+        DEPLOY-PROV-6 / ADR-089 (issue #741): the LIFECYCLE row for
+        a single build — current status, enqueued/started/finished
+        timestamps, failure_class, server-computed duration_seconds.
+        Companion to BuildProvenanceResponse (post-mortem export,
+        ADR-038) and the /sbom route (post-mortem blob, ADR-038
+        Phase 3). The status field mirrors builds.status — a
+        4-state enum `queued|running|succeeded|failed` per the
+        `builds_status_check` CHECK constraint. 'cancelled' is
+        intentionally absent (ADR-089 §1).
+
+        failure_class is the low-cardinality enum
+        `oom|timeout|user_error|infra` per the
+        `builds_failure_class_check` CHECK; present only when
+        status='failed'.
+
+        duration_seconds is server-computed (FinishedAt − StartedAt)
+        only when BOTH timestamps are populated; absent otherwise
+        (so a queued/running build stays minimal). CI scripts can
+        rely on its presence as "the build reached a terminal state
+        and elapsed N wall-clock seconds." error_message is
+        intentionally NOT in this response — it lives on
+        deployments; clients that need the per-failure string call
+        GET /v1/deployments/{id}.
+      type: object
+      required:
+        - id
+        - deployment_id
+        - kind
+        - source_bytes
+        - status
+        - enqueued_at
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        deployment_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        kind: { type: string, enum: [railpack, dockerfile, tarball, github] }
+        source_bytes: { type: integer, format: int64 }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        failure_class: { type: string, enum: [oom, timeout, user_error, infra] }
+        log_path: { type: string }
+        enqueued_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        duration_seconds: { type: integer, description: "Server-computed FinishedAt − StartedAt in whole seconds. Absent until the build reaches a terminal state." }
+
     AccountCreditResponse:
       description: |
         One row in the account_credits table (issue #279). cents_remaining
@@ -7581,6 +7747,32 @@ components:
         enabled: { type: boolean }
         created_at: { type: string, format: date-time }
         last_fired_at: { type: [string, "null"], format: date-time }
+
+    CronRun:
+      description: "One execution of a cron: when it fired, how long it ran, and how it ended. Backed by the underlying invocations row, projected so callers need not compute a duration or interpret raw state."
+      type: object
+      required: [id, started_at, outcome, attempts]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        started_at: { type: string, format: date-time, description: "When the cron fired (the invocation's created_at), not when the app began executing." }
+        completed_at: { type: [string, "null"], format: date-time, description: "When the run reached a terminal state; null while still in flight." }
+        duration_ms: { type: [integer, "null"], description: "completed_at - started_at in milliseconds, computed server-side. Null while the run is still in flight." }
+        outcome:
+          type: string
+          enum: [success, failed, timeout, dead_letter, running]
+          description: "Normalized result. `timeout` means the dispatch exceeded its deadline; `dead_letter` means the retry budget was exhausted; `running` means the run has not reached a terminal state yet. Branch on this, never on `error`."
+        attempts: { type: integer, description: "Dispatch attempts for this run; greater than 1 means it was retried." }
+        instance_id: { type: [string, "null"], pattern: '^[a-f0-9]{32}$', description: "The instance that served the run; null if the fire never reached one." }
+        error: { type: [string, "null"], description: "Operator-facing failure text. Unstructured and unversioned — do not parse it." }
+
+    ListCronRunsResponse:
+      description: "Page of cron runs; ordered newest-first. Pass the LAST id of the returned slice as the next `?before=` to load older runs."
+      type: object
+      required: [runs]
+      properties:
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/CronRun' }
 
     CreateCronRequest:
       description: "Cron creation payload: schedule expression and target URL."
@@ -8908,8 +9100,8 @@ components:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
-        source: { type: string, enum: [async_invoke, queue, delayed_task, cron] }
-        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled] }
+        source: { type: string, enum: [async_invoke, queue, delayed_task, cron, replay] }
+        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled, dead_letter] }
         method: { type: string }
         path: { type: string }
         payload: { type: object, additionalProperties: true }

@@ -465,6 +465,21 @@ type App struct {
 	// backfill target for every pre-Phase-2 row, so single-box
 	// installs preserve bit-for-bit behaviour.
 	NodeID string
+	// OverflowNode is the customer's per-app preferred spill
+	// target (Tier A10, ADR-088, migration 00167). When set, the
+	// Tier A9 capacity-pressure rebalancer consults it BEFORE
+	// falling back to the first-peer-with-headroom selection.
+	// Nullable: a NULL app is the "no preference" default — the
+	// engine behaves exactly like A9 (random first peer with
+	// headroom, sorted by name ASC). UNSET-uuid is rejected by
+	// apps_overflow_node_chk (migration 00167) as a tripwire
+	// against buggy INSERT paths. The wire field is the
+	// human-readable compute_nodes.name; apid resolves the name
+	// to the UUID server-side via Store.ComputeNodeByName
+	// (cmd/apid/compute_nodes.go:250). FK cascades ON DELETE SET
+	// NULL — draining a node clears the preference, never
+	// orphans it.
+	OverflowNode *string
 	// ReassignedAt is the wall-clock time of the most recent
 	// successful cross-node reassignment (Tier A4, migration
 	// 00095). Stamped by Store.ReassignAppOwner in the same
@@ -1462,6 +1477,82 @@ type Invocation struct {
 	Attempts       int              `json:"attempts"`
 	LastError      string           `json:"last_error,omitempty"`
 	CreatedAt      time.Time        `json:"created_at"`
+	// Outcome is the normalized terminal classification (issue #791).
+	// nil while the row is non-terminal (pending / dispatching); the
+	// read surfaces render nil as "running". See InvocationOutcome.
+	Outcome *InvocationOutcome `json:"outcome,omitempty"`
+}
+
+// InvocationOutcome is the normalized, durable classification of a
+// terminal invocation (issue #791, migrations/00166). It exists
+// because InvocationState collapses every permanent failure into
+// InvocationFailed: a gateway 504 (the app blew its deadline) and a
+// malformed-payload reject are indistinguishable on `state` alone,
+// and recovering the difference by substring-matching LastError is
+// brittle — that text is operator-facing, unversioned, and varies by
+// call site. The classification is therefore recorded at write time,
+// where the caller already knows it.
+//
+// Written only by Store.CompleteInvocation (always OutcomeSuccess)
+// and Store.FailInvocation (via WithOutcome, defaulting to
+// OutcomeFailed / OutcomeDeadLetter). Non-terminal rows carry no
+// outcome at all.
+type InvocationOutcome string
+
+const (
+	// OutcomeSuccess is stamped by CompleteInvocation.
+	OutcomeSuccess InvocationOutcome = "success"
+	// OutcomeFailed is the default terminal classification for a
+	// permanent failure with no more specific cause.
+	OutcomeFailed InvocationOutcome = "failed"
+	// OutcomeTimeout marks a dispatch that exceeded its deadline —
+	// a gateway 504 or an expired claim lease. Callers opt in via
+	// FailInvocation(..., WithOutcome(OutcomeTimeout)); it is never
+	// inferred from LastError.
+	OutcomeTimeout InvocationOutcome = "timeout"
+	// OutcomeDeadLetter mirrors InvocationDeadLetter: the per-plan
+	// retry budget was exhausted. Set automatically by FailInvocation
+	// on the dead-letter branch, so callers need not pass it.
+	OutcomeDeadLetter InvocationOutcome = "dead_letter"
+)
+
+// FailOptions carries the optional, non-breaking extras for
+// Store.FailInvocation. It is threaded as a variadic option rather
+// than a positional parameter because FailInvocation has ~20 call
+// sites across pkg/sched and the test suites; only the two deadline
+// paths in the drain need to say anything beyond the default.
+type FailOptions struct {
+	// Outcome overrides the terminal classification on the permanent
+	// branch (retryAfter == 0). Ignored on the transient-requeue
+	// branch, which leaves the row non-terminal and therefore
+	// outcome-less. The dead-letter branch always wins over this.
+	Outcome InvocationOutcome
+}
+
+// FailOption mutates FailOptions. See WithOutcome.
+type FailOption func(*FailOptions)
+
+// WithOutcome classifies a permanent failure as something more
+// specific than OutcomeFailed — in practice OutcomeTimeout, passed by
+// the drain's deadline paths. A no-op when the row takes the
+// transient-retry or dead-letter branch.
+func WithOutcome(o InvocationOutcome) FailOption {
+	return func(f *FailOptions) { f.Outcome = o }
+}
+
+// ApplyFailOptions folds opts over the defaults. Exported so both
+// store backends derive the effective options identically.
+func ApplyFailOptions(opts []FailOption) FailOptions {
+	f := FailOptions{Outcome: OutcomeFailed}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&f)
+		}
+	}
+	if f.Outcome == "" {
+		f.Outcome = OutcomeFailed
+	}
+	return f
 }
 
 // QueueStats is the projection returned by Store.QueueState (issue
@@ -2138,6 +2229,17 @@ type UpdateAppParams struct {
 	// legacy readers don't see a stale floor).
 	ScalingPolicy    *ScalingPolicy
 	SetScalingPolicy bool
+	// OverflowNode (issue Tier A10 / ADR-088) is the customer's
+	// per-app preferred spill target (compute_node UUID). Apid
+	// has already resolved the wire name → UUID server-side
+	// (cmd/apid/handlers_ext.go::validateUpdateApp). Set bit
+	// distinguishes "unset" (don't touch the column) from
+	// "explicit NULL" (clear — back to A9 default fallback). The
+	// store is a plain column write; the empty-uuid CHECK +
+	// FK with ON DELETE SET NULL (migration 00167) cover the
+	// identity + ON-cascade contract.
+	OverflowNode    *string
+	SetOverflowNode bool
 }
 
 // AppPublicAuthUpdate (issue #477 / ADR-079) is the
