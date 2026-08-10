@@ -128,14 +128,17 @@
 | cache | `pkg/storage/cache.go` (new) | `LocalCacheBackend` LRU on disk; implements `StorageBackend` + `LocalArtifactLister` |
 | cache | `pkg/storage/cache_test.go` (new) | LRU eviction, registry-unreachable serves last-known-good |
 | fcvm | `pkg/fcvm/manager.go` | replace direct `/srv/fc/snap/...` reads with `backend.Get("snap/<dep>/{mem,vmstate}")` |
-| sched | `pkg/sched/disk_drift.go` | replace `os.ReadDir(<appsRootPath>)` with `backend.List("apps/")` |
-| imaged | `pkg/imaged/handler.go` | `SetDeploymentRootfs` writes via `backend.Put("apps/<slug>/<dep>.ext4", ext4)` |
-| imaged | `pkg/imaged/gc.go` | `GCUnreferencedApps` lists + deletes via `backend.List` + `backend.Delete` |
+| sched | `pkg/sched/disk_drift.go` | `Tick` enumerates `snap/<depID>/` via `backend.List("snap/")` when a `LocalArtifactLister`-capable backend is wired via `WithStorage`; falls back to `os.ReadDir(SnapDir())` when storage is nil or the backend List errors (intentional fail-soft, pinned by `TestDiskDrift_StorageBackend_ListErrorFallsBackToDisk`) |
+| imaged | `pkg/imaged/handler.go` | `SetDeploymentRootfs` writes via `backend.Put("apps/<slug>/<dep>.ext4", ext4)` (path stored in the diagnostic `rootfs_path` DB column); the per-deploy grype scan source routes through `stageScanExt4` (ADR-054 acceptance closure, Tier 1 Phase 3) so OCI-mode deploys don't silently lose the §17 G1 scan guarantee |
+| imaged | `pkg/imaged/loop.go` + `pkg/imaged/handler.go` (`cleanupDeployFiles` / `cleanupAppFiles`) | `deleteSnapshotsAndFiles` + `cleanupDeployFiles` + `cleanupAppFiles` route List + Delete through the wired `StorageBackend` (per-route keys for snap mem/vmstate; canonical `sched.AppLayerKey(slug, dep)` for the per-app ext4). Pure-function retention algorithm stays in `pkg/imaged/gc.go` |
 | vmmd | `cmd/vmmd/main.go` | load OCI creds + construct backend once at startup |
 | imaged | `cmd/imaged/main.go` | load OCI creds + construct backend once at startup |
-| tests | `pkg/storage/cache_test.go` | new — LRU eviction, last-known-good fallback |
+| schedd | `cmd/schedd/main.go` | load backend once at startup (disk-drift + cosign verifier + `cosign.NewLocalVerifier` all consume the same `BackendFromEnv` result); the cache observer (`StorageCacheStaleFallback`) is attached here too |
+| tests | `pkg/storage/cache_test.go` | new — LRU eviction, last-known-good fallback, opt-in stale fallback (`TestLocalCacheBackend_StaleFallbackEnabled` + `_StaleFallbackDisabled_DefaultContract`), fail-loud default (`TestLocalCacheBackend_ParentFailureSurfaces`) |
 | tests | `pkg/storage/router_test.go` | extend — `TestPrefixRouterLocalPlusOCI` with apps→OCI, snap→local |
-| tests | `pkg/imaged/handler_image_build_test.go` | extend — assert that with `FAAS_STORAGE_BACKEND=oci`, layer build writes go to the OCI backend |
+| tests | `pkg/imaged/handler_storage_env_test.go` + `pkg/imaged/handler_storage_routing_test.go` | `TestHandler_OCIBackendEnv_Handoff` pins env → Handler handoff (storage.BackendFromEnv returns *PrefixRouter, handler.storageFor() returns it unchanged); `TestHandler_StorageRouting_AppsToOCI` pins per-prefix dispatch to OCI vs local. Build-pipeline test delegation to these files (instead of `handler_image_build_test.go`) is intentional — the build pipeline cannot hermetically cover OCI mode without a live registry; see the existing doc comment at `handler_storage_env_test.go:48-55` |
+| tests | `pkg/imaged/handler_storage_env_test.go` | `TestHandler_OCIBackendEnv_Handoff_ScanFromBackend` (added by ADR-054 acceptance closure) — wires an OCI-mode router via `WithStorage`, runs `runDeployScan` end-to-end against a stub `grypeRun` that records `<dir>`, asserts the recorded dir points at a `t.TempDir()`-equivalent stage (NOT the appsRoot path) |
+| tests | `pkg/sched/disk_drift_test.go` | `TestDiskDrift_StorageBackend_*` (PresenceMatch, MissingFileIncrements, OrphanDepIncrements, ListErrorFallsBackToDisk) — pins the production `backend.List("snap/")` path |
 
 ## Out of scope
 
