@@ -2579,8 +2579,8 @@ type AccountAppSecret struct {
 //
 // Scope is the multi-scope identifier from ADR-090 (Phase 2 of the
 // 2026-08-10 secrets+envs roadmap). Mirrors the schema's
-// `app_envs.scope` column added by migration 00200; the default is
-// the literal string "default" for pre-00200 rows and for the
+// `app_envs.scope` column added by migration 00201; the default is
+// the literal string "default" for pre-00201 rows and for the
 // flat-shape writers (UpsertAppEnv / DeleteAppEnv / ListAppEnv /
 // CountAppEnv) which hardcode scope='default' at the SQL boundary.
 // Scope-aware writers (UpsertAppEnvInScope and its siblings) set
