@@ -1,0 +1,36 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00174_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Slot 00174 is reserved against PR #797 (Tier A9 standby write-redirect),
+-- which currently carries BOTH migrations/00172_compute_nodes_public_ip.sql
+-- AND a duplicate migrations/00174_compute_nodes_public_ip.sql in the
+-- same tree. That duplicate is almost certainly a rebase artefact —
+-- TestMigrationsUniquePrefixes will reject the duplicate the moment
+-- #797's tree merges into main, so #797 must drop the 00174 duplicate
+-- on its next rebase regardless of this fence. PR #799 (edge-rules)
+-- renumbered to 00175 on cycle 6 to clear this slot rather than
+-- collide with #797's accidental duplicate. When #797 merges, it
+-- deletes this 00174 fence on its next rebase per ADR-041.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
