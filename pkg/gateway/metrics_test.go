@@ -411,6 +411,73 @@ func TestMetricsTLSOnDemandDeniedNilSafe(t *testing.T) {
 	m.ObserveTLSOnDemandDenied("allowlist") // must not panic
 }
 
+// TestMetricsEdgeRuleApplyRegistersAndPreInstantiates — ADR-091
+// hardening PR-A: the apply-path counter must surface every (kind,
+// result) tuple at 0 from the moment the daemon binds (so the §12
+// dashboard chip "edge rule apply rate" never shows "no data" and
+// so the frozen-zero state for every kind is observable as the
+// "rule compile/apply never fired" tripwire). Increment one
+// (kind=jwt, result=success) and assert it surfaces at 1 while the
+// rest of the cross product stays at 0.
+func TestMetricsEdgeRuleApplyRegistersAndPreInstantiates(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveEdgeRuleApply("jwt", "success")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+		for _, result := range []string{"success", "error"} {
+			line := "gateway_edge_rule_apply_total{kind=\"" + kind + "\",result=\"" + result + "\"}"
+			if !strings.Contains(body, line) {
+				t.Errorf("missing exposition line for %q in body:\n%s", line, body)
+			}
+		}
+	}
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="success"} 1`) {
+		t.Errorf("jwt+success should surface at 1, body:\n%s", body)
+	}
+}
+
+// TestMetricsEdgeRuleApplyNilSafe — the counter must not panic when
+// called on a nil receiver (parallels TestMetricsTLSOnDemandDeniedNilSafe).
+func TestMetricsEdgeRuleApplyNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveEdgeRuleApply("cors", "error") // must not panic
+}
+
+// TestMetricsEdgeRuleCompileErrorRegistersAndPreInstantiates —
+// ADR-091 hardening PR-A: the compile-error counter must surface
+// every kind at 0 from boot. Non-zero values page the operator
+// (a rule shipped broken); the frozen-zero state for every kind
+// is observable as the "no compile errors fired" tripwire.
+func TestMetricsEdgeRuleCompileErrorRegistersAndPreInstantiates(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveEdgeRuleCompileError("ip")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+		line := "gateway_edge_rule_compile_error_total{kind=\"" + kind + "\"}"
+		if !strings.Contains(body, line) {
+			t.Errorf("missing exposition line for %q in body:\n%s", line, body)
+		}
+	}
+	if !strings.Contains(body, `gateway_edge_rule_compile_error_total{kind="ip"} 1`) {
+		t.Errorf("ip compile-error should surface at 1, body:\n%s", body)
+	}
+}
+
+// TestMetricsEdgeRuleCompileErrorNilSafe — the counter must not
+// panic when called on a nil receiver (parallels the apply test).
+func TestMetricsEdgeRuleCompileErrorNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveEdgeRuleCompileError("rewrite") // must not panic
+}
+
 // TestMetricsAccountRateLimitedRegistersAndPreInstantiates — ADR-040
 // / issue #292: the counter must surface the four (plan) rows under the
 // "__other__" placeholder at 0 from the moment the daemon binds, so the

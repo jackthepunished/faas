@@ -865,3 +865,50 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 		}
 	})
 }
+
+// BenchmarkEdgeRuleCache_Hit (ADR-091 hardening PR-A) pins the
+// hot-path cache-hit latency. With EdgeRuleCache.mu widened from
+// sync.Mutex to sync.RWMutex (PR-A), the read fast-path is two
+// atomic ops (RLock + RUnlock) plus a map lookup plus a container/
+// list MoveToFront under write-lock. The tripwire for future
+// regressions: p99 must stay < 200 ns on a 2024-class x86_64
+// (Apple M3+ ARM64 is comparable). A regression to the previous
+// shape would show up as p99 in the 1–2 µs range, so the gap is
+// measurable. Run with `go test -bench=BenchmarkEdgeRuleCache_Hit
+// -benchtime=2s ./pkg/gateway/...`.
+func BenchmarkEdgeRuleCache_Hit(b *testing.B) {
+	c := NewEdgeRuleCache(1024)
+	c.Put("hot.example.com", &HostEntry{
+		Host: "hot.example.com",
+		Route: []EdgeRuleResolved{{
+			ID:            "rule-hot",
+			AccountID:     "acct",
+			Priority:      100,
+			PathGlob:      "/",
+			TargetAppSlug: "hot",
+		}},
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := c.Get("hot.example.com"); !ok {
+			b.Fatalf("expected hit")
+		}
+	}
+}
+
+// BenchmarkEdgeRuleCache_Miss (ADR-091 hardening PR-A) is the
+// inverse tripwire: a miss must not pay the MoveToFront cost.
+// Used as a sanity check that the RWMutex widening didn't
+// accidentally regress the miss path. Both bench functions are
+// skipped on -short to keep the default `go test ./...` flow fast.
+func BenchmarkEdgeRuleCache_Miss(b *testing.B) {
+	c := NewEdgeRuleCache(1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := c.Get("nope.example.com"); ok {
+			b.Fatalf("expected miss")
+		}
+	}
+}

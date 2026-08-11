@@ -1599,6 +1599,18 @@ const (
 	// demand — the constant is the single source of truth.
 	SidecarCapMax = 2
 
+	// Edge-rule JWT verify deadline (ADR-091 hardening PR-A). Caps
+	// the wall-clock spent inside pkg/gateway.(*Handler).applyEdgeRuleJWT
+	// on a single request — signature verify + claim parse + any
+	// JWKS refresh that the verifier triggers mid-call. Sizing
+	// matches pkg/edgejwks.DefaultFetchTimeout (5 s for the network
+	// leg) so a hung IdP surfaces as a 401 inside the same window
+	// the rest of the gateway considers a stalled upstream. The
+	// deadline fires on top of r.Context(); if r.Context() already
+	// carries a tighter cap (e.g. an upstream HTTP/1.1 server
+	// ReadTimeout), the tighter deadline wins.
+	EdgeRuleJWTVerifyTimeoutDefault = 5 * time.Second
+
 	// Streaming response caps (issue #471 / ADR-047). Free stays on the
 	// 25 MB / 300 s envelope (spec §4.1 baseline) so the abuse-floor
 	// tier can't pin a long stream against the box. Hobby/Pro/Scale
