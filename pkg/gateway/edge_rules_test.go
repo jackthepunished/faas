@@ -554,3 +554,314 @@ func TestPickFirstRedirectMatch_PathGlob(t *testing.T) {
 		t.Errorf("/v1/api should not match /api/* glob, got %v", got)
 	}
 }
+
+// --- PR 5 surface: CORS / JWT / IP resolved types + per-kind pick helpers ----
+//
+// PR 6 widens putEntry to cover all 7 kinds and adds the wholesale-Reset
+// property test (ADR-091 D17).
+
+func sampleCORSRule(id string, prio int, host string) EdgeRuleCORSResolved {
+	return EdgeRuleCORSResolved{
+		ID:           id,
+		AccountID:    "acc_" + id,
+		AppID:        "app_" + id,
+		Priority:     prio,
+		PathGlob:     "",
+		Methods:      nil,
+		AllowOrigins: []string{"https://app.test"},
+		AllowMethods: []string{"GET", "POST"},
+	}
+}
+
+func sampleJWTRule(id string, prio int, host string) EdgeRuleJWTResolved {
+	return EdgeRuleJWTResolved{
+		ID:         id,
+		AccountID:  "acc_" + id,
+		AppID:      "app_" + id,
+		Priority:   prio,
+		PathGlob:   "",
+		Methods:    nil,
+		Issuer:     "https://idp.example.com/",
+		Audience:   []string{"https://api.example.com"},
+		JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+		Algorithms: []string{"RS256"},
+	}
+}
+
+func sampleIPRule(id string, prio int, host string) EdgeRuleIPResolved {
+	return EdgeRuleIPResolved{
+		ID:        id,
+		AccountID: "acc_" + id,
+		AppID:     "app_" + id,
+		Priority:  prio,
+		PathGlob:  "",
+		Methods:   nil,
+		// nil Allow + nil Deny is the "no rule" shape; apid-Validate
+		// requires non-empty lists in production but the gateway
+		// compiler is permissive (defence-in-depth).
+	}
+}
+
+// putEntryAll is the PR 6 widening of putEntry: covers all 7 kinds.
+// Mirrors cmd-side loadHost's single-pass compile pattern — the
+// production loader always populates every kind at once; this test
+// helper does the same.
+func putEntryAll(c *EdgeRuleCache, host string,
+	route []EdgeRuleResolved,
+	rewrite []EdgeRuleRewriteResolved,
+	redirect []EdgeRuleRedirectResolved,
+	headers []EdgeRuleHeadersResolved,
+	cors []EdgeRuleCORSResolved,
+	jwt []EdgeRuleJWTResolved,
+	ip []EdgeRuleIPResolved,
+) {
+	c.Put(host, &HostEntry{
+		Host:     host,
+		Route:    route,
+		Rewrite:  rewrite,
+		Redirect: redirect,
+		Headers:  headers,
+		CORS:     cors,
+		JWT:      jwt,
+		IP:       ip,
+	})
+}
+
+func TestPickFirstCORSMatch_PriorityOrdering(t *testing.T) {
+	rules := []EdgeRuleCORSResolved{
+		sampleCORSRule("high", 0, "a.example.com"),
+		sampleCORSRule("low", 100, "a.example.com"),
+	}
+	got := PickFirstCORSMatch(rules, "/", "OPTIONS")
+	if got == nil || got.ID != "high" {
+		t.Errorf("got %v, want high priority-0", got)
+	}
+}
+
+func TestPickFirstJWTMatch_PriorityOrdering(t *testing.T) {
+	rules := []EdgeRuleJWTResolved{
+		sampleJWTRule("high", 0, "a.example.com"),
+		sampleJWTRule("low", 100, "a.example.com"),
+	}
+	got := PickFirstJWTMatch(rules, "/", "GET")
+	if got == nil || got.ID != "high" {
+		t.Errorf("got %v, want high priority-0", got)
+	}
+}
+
+func TestPickFirstIPMatch_PriorityOrdering(t *testing.T) {
+	rules := []EdgeRuleIPResolved{
+		sampleIPRule("high", 0, "a.example.com"),
+		sampleIPRule("low", 100, "a.example.com"),
+	}
+	got := PickFirstIPMatch(rules, "/", "GET")
+	if got == nil || got.ID != "high" {
+		t.Errorf("got %v, want high priority-0", got)
+	}
+}
+
+// --- PR 6: wholesale-Reset() property test (ADR-091 D17) ----------
+//
+// The EdgeRuleCache is the LRU mirror for all 7 edge-rule kinds.
+// pg_notify-driven invalidation in cmd/gatewayd-internal/backend.go
+// fires Reset() wholesale — a regression against any single kind
+// fails this test, surfacing as a cache-consistency violation for
+// ALL 7 kinds simultaneously. The deterministic 7-row table is the
+// load-bearing assertion; the fuzz target is hardening on top.
+//
+// Why one row per kind: the cache stores a HostEntry whose slices
+// cover all 7 kinds together. Reset() drops the whole HostEntry
+// (and every kind's slice inside it). Pinning that pre-Reset each
+// kind's GetK returns a hit AND post-Reset each kind's GetK returns
+// (nil, false) is the invariant that catches "Reset forgot kind X"
+// regressions before they ship.
+
+// TestEdgeRuleReset_WholesaleAcrossAllSevenKinds is the deterministic
+// 7-row table that pins the wholesale-Reset invariant. See plan §D1.
+func TestEdgeRuleReset_WholesaleAcrossAllSevenKinds(t *testing.T) {
+	c := NewEdgeRuleCache(EdgeRuleCacheCap)
+	host := "a.example.com"
+	putEntryAll(c, host,
+		[]EdgeRuleResolved{sampleEdgeRule("r", 0, host, "alpha")},
+		[]EdgeRuleRewriteResolved{sampleRewriteRule("rw", 0, host, "/api", "/v2")},
+		[]EdgeRuleRedirectResolved{sampleRedirectRule("rd", 0, host, 308, "https://c")},
+		[]EdgeRuleHeadersResolved{sampleHeadersRule("hd", 0, host, nil, nil)},
+		[]EdgeRuleCORSResolved{sampleCORSRule("cors", 0, host)},
+		[]EdgeRuleJWTResolved{sampleJWTRule("jwt", 0, host)},
+		[]EdgeRuleIPResolved{sampleIPRule("ip", 0, host)},
+	)
+
+	// Sanity: every GetK returns a hit pre-Reset.
+	preChecks := []struct {
+		name string
+		f    func() bool
+	}{
+		{"Get", func() bool { _, ok := c.Get(host); return ok }},
+		{"GetRewrite", func() bool { _, ok := c.GetRewrite(host); return ok }},
+		{"GetRedirect", func() bool { _, ok := c.GetRedirect(host); return ok }},
+		{"GetHeaders", func() bool { _, ok := c.GetHeaders(host); return ok }},
+		{"GetCORS", func() bool { _, ok := c.GetCORS(host); return ok }},
+		{"GetJWT", func() bool { _, ok := c.GetJWT(host); return ok }},
+		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
+	}
+	for _, c0 := range preChecks {
+		if !c0.f() {
+			t.Fatalf("pre-Reset %s: expected hit, got miss", c0.name)
+		}
+	}
+
+	c.Reset()
+
+	postChecks := []struct {
+		name string
+		f    func() bool
+	}{
+		{"Get", func() bool { _, ok := c.Get(host); return ok }},
+		{"GetRewrite", func() bool { _, ok := c.GetRewrite(host); return ok }},
+		{"GetRedirect", func() bool { _, ok := c.GetRedirect(host); return ok }},
+		{"GetHeaders", func() bool { _, ok := c.GetHeaders(host); return ok }},
+		{"GetCORS", func() bool { _, ok := c.GetCORS(host); return ok }},
+		{"GetJWT", func() bool { _, ok := c.GetJWT(host); return ok }},
+		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
+	}
+	for _, c0 := range postChecks {
+		if c0.f() {
+			t.Errorf("post-Reset %s: returned hit, want miss", c0.name)
+		}
+	}
+	if c.Len() != 0 {
+		t.Errorf("Len = %d after Reset, want 0", c.Len())
+	}
+}
+
+// TestEdgeRuleReset_EmptyCacheNoPanic pins the edge case: calling
+// Reset() on a cache that has never been Put to must not panic and
+// must leave Len() at 0. Catches a "Reset on nil map" regression.
+func TestEdgeRuleReset_EmptyCacheNoPanic(t *testing.T) {
+	c := NewEdgeRuleCache(EdgeRuleCacheCap)
+	c.Reset()
+	if c.Len() != 0 {
+		t.Errorf("Len = %d, want 0", c.Len())
+	}
+	// Multiple resets must remain safe.
+	c.Reset()
+	c.Reset()
+	if c.Len() != 0 {
+		t.Errorf("Len = %d after triple Reset, want 0", c.Len())
+	}
+}
+
+// TestEdgeRuleReset_ConcurrentPutResetRaceSafe is the -race gate
+// for the wholesale-Reset invariant. 4 goroutines hammer the cache
+// with Put(hostA), Get(hostA), Reset(), Put(hostB). Asserts no
+// panic, no -race detector hit, post-settle Len() ∈ {0,1,2}.
+//
+// Mirrors TestEdgeRuleCache_ConcurrentGetPut at line 133 — extends
+// the existing concurrent test with Reset() interleaved.
+func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
+	c := NewEdgeRuleCache(100)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			hostA := "a.example.com"
+			hostB := "b.example.com"
+			for j := 0; j < 500; j++ {
+				switch j % 4 {
+				case 0:
+					putEntryAll(c, hostA,
+						[]EdgeRuleResolved{sampleEdgeRule("r", j, hostA, "alpha")},
+						[]EdgeRuleRewriteResolved{sampleRewriteRule("rw", j, hostA, "/x", "/y")},
+						[]EdgeRuleRedirectResolved{sampleRedirectRule("rd", j, hostA, 308, "https://c")},
+						[]EdgeRuleHeadersResolved{sampleHeadersRule("hd", j, hostA, nil, nil)},
+						[]EdgeRuleCORSResolved{sampleCORSRule("cors", j, hostA)},
+						[]EdgeRuleJWTResolved{sampleJWTRule("jwt", j, hostA)},
+						[]EdgeRuleIPResolved{sampleIPRule("ip", j, hostA)},
+					)
+				case 1:
+					_, _ = c.Get(hostA)
+					_, _ = c.GetCORS(hostA)
+					_, _ = c.GetJWT(hostA)
+					_, _ = c.GetIP(hostA)
+				case 2:
+					c.Reset()
+				case 3:
+					putEntryAll(c, hostB,
+						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
+						nil, nil, nil, nil, nil, nil,
+					)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	// After wg.Wait the last operation in each goroutine is the
+	// final j-loop iteration. Len() may legitimately be 0 (Reset
+	// won) or up to 2 (one entry per host that wasn't Reset out).
+	if c.Len() < 0 || c.Len() > 2 {
+		t.Errorf("Len = %d after concurrent Put+Reset, want 0..2", c.Len())
+	}
+}
+
+// FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds is the property
+// target for the wholesale-Reset invariant. The seed corpus covers
+// three shapes:
+//
+//   - 0x01 0x02 0x00 0x01 0xFE 0x00 0xFE — alternating Put/Get/Reset
+//     to exercise a hot Reset path under interleaved Puts.
+//   - 0x01 0xFE 0x00 0x01 0x02 0xFE — Put→Reset→Put→Get→Reset
+//   - 0xFE 0xFE 0xFE 0x00 0x01 0x02 — back-to-back Reset followed
+//     by Put+Get
+//
+// The fuzz applies each byte as an op (Put / GetK / Reset) on a
+// host keyed by `i % 4`, then asserts the wholesale invariant:
+// Len() stays within [0, cap]. PR 6 ships three seeds; CI's default
+// fuzz corpus is short, so the deterministic
+// TestEdgeRuleReset_WholesaleAcrossAllSevenKinds is the load-bearing
+// assertion (the fuzz is hardening on top).
+func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
+	// Three seeds that together exercise Put→Get→Reset,
+	// Put→Reset→Put→Get, and back-to-back Reset patterns.
+	f.Add([]byte{0x01, 0x02, 0x00, 0x01, 0xFE, 0x00, 0xFE})
+	f.Add([]byte{0x01, 0xFE, 0x00, 0x01, 0x02, 0xFE})
+	f.Add([]byte{0xFE, 0xFE, 0xFE, 0x00, 0x01, 0x02})
+
+	f.Fuzz(func(t *testing.T, ops []byte) {
+		c := NewEdgeRuleCache(EdgeRuleCacheCap)
+		for i, b := range ops {
+			host := []string{"a.example.com", "b.example.com", "c.example.com", "d.example.com"}[i%4]
+			switch b % 3 {
+			case 0: // Put
+				putEntryAll(c, host,
+					[]EdgeRuleResolved{sampleEdgeRule("r", i, host, "x")},
+					[]EdgeRuleRewriteResolved{sampleRewriteRule("rw", i, host, "/a", "/b")},
+					[]EdgeRuleRedirectResolved{sampleRedirectRule("rd", i, host, 308, "https://c")},
+					[]EdgeRuleHeadersResolved{sampleHeadersRule("hd", i, host, nil, nil)},
+					[]EdgeRuleCORSResolved{sampleCORSRule("cors", i, host)},
+					[]EdgeRuleJWTResolved{sampleJWTRule("jwt", i, host)},
+					[]EdgeRuleIPResolved{sampleIPRule("ip", i, host)},
+				)
+			case 1: // GetK (any kind)
+				_, _ = c.Get(host)
+				_, _ = c.GetRewrite(host)
+				_, _ = c.GetRedirect(host)
+				_, _ = c.GetHeaders(host)
+				_, _ = c.GetCORS(host)
+				_, _ = c.GetJWT(host)
+				_, _ = c.GetIP(host)
+			case 2: // Reset
+				c.Reset()
+			}
+			// Wholesale-invariant check: Len() must stay in bounds.
+			// A regression in Reset that left stale entries in
+			// byID/ll would surface as a -race hit during the GetK
+			// sequence above (the mutex is held by every GetK).
+			if c.Len() < 0 || c.Len() > c.cap {
+				t.Fatalf("Len = %d out of bounds [0, %d] after op %d", c.Len(), c.cap, i)
+			}
+		}
+	})
+}

@@ -98,7 +98,7 @@ type EdgeRuleResolved struct {
 
 // EdgeRuleRewriteResolved is the kind=rewrite subset. PR 4 mutates
 // r.URL.Path in place when a rule matches (From prefix → To
-// replacement; the spec §13.4 documents the "$1" capture shape
+// replacement; the spec §4.1.2 documents the "$1" capture shape
 // for trailing-`*` From patterns — applied via stdlib path.Match
 // + string replace at filter time).
 type EdgeRuleRewriteResolved struct {

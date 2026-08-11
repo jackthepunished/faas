@@ -93,6 +93,12 @@ def sync_detailed(
     When the runner is disabled (FAAS_REKEY_ENABLED unset), the
     endpoint returns 503 with code `rekey_disabled` so an
     operator can distinguish \"no work yet\" from \"feature off\".
+    If FAAS_REKEY_ENABLED=true is set but no host age identities
+    loaded (mfaIdentities() empty — typically FAAS_HOST_AGE_IDENTITY_PATH
+    unset), the endpoint returns 503 with the distinct code
+    `rekey_no_identities` (PR #825 follow-up); this avoids the
+    misleading \"set FAAS_REKEY_ENABLED and restart\" detail when
+    the operator already opted in.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -139,6 +145,12 @@ def sync(
     When the runner is disabled (FAAS_REKEY_ENABLED unset), the
     endpoint returns 503 with code `rekey_disabled` so an
     operator can distinguish \"no work yet\" from \"feature off\".
+    If FAAS_REKEY_ENABLED=true is set but no host age identities
+    loaded (mfaIdentities() empty — typically FAAS_HOST_AGE_IDENTITY_PATH
+    unset), the endpoint returns 503 with the distinct code
+    `rekey_no_identities` (PR #825 follow-up); this avoids the
+    misleading \"set FAAS_REKEY_ENABLED and restart\" detail when
+    the operator already opted in.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -181,6 +193,12 @@ async def asyncio_detailed(
     When the runner is disabled (FAAS_REKEY_ENABLED unset), the
     endpoint returns 503 with code `rekey_disabled` so an
     operator can distinguish \"no work yet\" from \"feature off\".
+    If FAAS_REKEY_ENABLED=true is set but no host age identities
+    loaded (mfaIdentities() empty — typically FAAS_HOST_AGE_IDENTITY_PATH
+    unset), the endpoint returns 503 with the distinct code
+    `rekey_no_identities` (PR #825 follow-up); this avoids the
+    misleading \"set FAAS_REKEY_ENABLED and restart\" detail when
+    the operator already opted in.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -225,6 +243,12 @@ async def asyncio(
     When the runner is disabled (FAAS_REKEY_ENABLED unset), the
     endpoint returns 503 with code `rekey_disabled` so an
     operator can distinguish \"no work yet\" from \"feature off\".
+    If FAAS_REKEY_ENABLED=true is set but no host age identities
+    loaded (mfaIdentities() empty — typically FAAS_HOST_AGE_IDENTITY_PATH
+    unset), the endpoint returns 503 with the distinct code
+    `rekey_no_identities` (PR #825 follow-up); this avoids the
+    misleading \"set FAAS_REKEY_ENABLED and restart\" detail when
+    the operator already opted in.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

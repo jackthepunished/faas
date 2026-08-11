@@ -92,6 +92,8 @@ export type { EdgeRuleRedirectAction } from './models/EdgeRuleRedirectAction.js'
 export type { EdgeRuleResponse } from './models/EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './models/EdgeRuleRewriteAction.js';
 export type { EdgeRuleRouteAction } from './models/EdgeRuleRouteAction.js';
+export type { EnvScope } from './models/EnvScope.js';
+export type { FireCronRequestResponse } from './models/FireCronRequestResponse.js';
 export type { FireCronResponse } from './models/FireCronResponse.js';
 export type { GdprAuditExportResponse } from './models/GdprAuditExportResponse.js';
 export type { GraceWindowResponse } from './models/GraceWindowResponse.js';
@@ -184,6 +186,7 @@ export type { RotateOrgAPIKeyResponse } from './models/RotateOrgAPIKeyResponse.j
 export type { ScalingPolicy } from './models/ScalingPolicy.js';
 export type { ScalingTarget } from './models/ScalingTarget.js';
 export type { ScanResult } from './models/ScanResult.js';
+export type { ScopedAppEnvResponse } from './models/ScopedAppEnvResponse.js';
 export type { SeatUsageResponse } from './models/SeatUsageResponse.js';
 export type { SecretKey } from './models/SecretKey.js';
 export type { SessionInfo } from './models/SessionInfo.js';
@@ -225,6 +228,7 @@ export { AuditService } from './services/AuditService.js';
 export { AuthService } from './services/AuthService.js';
 export { BillingService } from './services/BillingService.js';
 export { CronsService } from './services/CronsService.js';
+export { DefaultService } from './services/DefaultService.js';
 export { DelayedTasksService } from './services/DelayedTasksService.js';
 export { DeploymentsService } from './services/DeploymentsService.js';
 export { DomainsService } from './services/DomainsService.js';

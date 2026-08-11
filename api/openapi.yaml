@@ -2270,6 +2270,7 @@ paths:
   /v1/apps/{slug}/env:
     parameters:
       - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/EnvScope'
     get:
       tags: [env]
       operationId: listEnv
@@ -2278,6 +2279,15 @@ paths:
         Returns every env var key + timestamps on the app. The plaintext
         value NEVER appears in the response — guest-init reads the value
         at process start from `/etc/faas/env.json` inside the guest.
+
+        **ADR-090 PR-B scope filter.** The optional `?scope=`
+        query param selects which scope to read. Omitted = the
+        default scope (pre-PR-B behavior, byte-identical wire).
+        `?scope=__all__` returns the nested `env_by_scope` response
+        shape with every scope on the app; the flat `env` array
+        is empty in that arm (discriminated union). Any other
+        `?scope=<slug>` filters to that one scope. Invalid scope
+        values return 400 `env_scope_invalid`.
       responses:
         '200':
           description: Env var envelopes on the app (plaintext never returned).
@@ -2285,6 +2295,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppEnvListResponse'
+        '400': { $ref: '#/components/responses/EnvScopeInvalid' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -2293,6 +2304,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/Slug'
       - $ref: '#/components/parameters/SecretKey'
+      - $ref: '#/components/parameters/EnvScope'
     put:
       tags: [env]
       operationId: setEnv
@@ -2303,6 +2315,13 @@ paths:
         — credentials stay on `/v1/apps/{slug}/secrets/{key}`. Applies on
         next wake (cold-boot OR snapshot-restore); the running instance
         is unaffected.
+
+        **ADR-090 PR-B scope filter.** The optional `?scope=`
+        query param selects which scope to write. Omitted = the
+        default scope (pre-PR-B behavior). The reserved sentinel
+        `__all__` is rejected with 400 `env_scope_reserved` on
+        writes (it has no meaning on a single-row write). Invalid
+        scope shapes return 400 `env_scope_invalid`.
       requestBody:
         required: true
         description: "Env var payload — key name + plaintext."
@@ -2318,8 +2337,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppEnvResponse'
-                example: {"key":"LOG_LEVEL","created_at":"2026-07-28T11:25:00Z","updated_at":"2026-07-28T11:25:00Z"}
-        '400': { $ref: '#/components/responses/EnvVarInvalidKey' }
+                example: {"key":"LOG_LEVEL","scope":"default","created_at":"2026-07-28T11:25:00Z","updated_at":"2026-07-28T11:25:00Z"}
+        '400':
+          description: '400 on PUT /v1/apps/{slug}/env/{key}?scope=... — any of {env_var_invalid_key, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/PlanLimitEnvVars' }
         '413': { $ref: '#/components/responses/EnvValueTooLarge' }
@@ -2328,9 +2351,21 @@ paths:
       tags: [env]
       operationId: deleteEnv
       summary: Delete an env var.
+      description: |
+        Removes the (app_id, scope, key) row. `?scope=` selects
+        which scope; omitted = the default scope. `?scope=__all__`
+        is rejected (400 `env_scope_reserved`) — same reason as
+        on PUT: the sentinel has no meaning on a single-row
+        delete. Returns 400 `env_var_not_found` (not 404) when
+        no row matches — the URL resource is the env-var, not
+        the app.
       responses:
         '204': { description: No body. The env var was removed. }
-        '400': { $ref: '#/components/responses/EnvVarNotFound' }
+        '400':
+          description: '400 on DELETE /v1/apps/{slug}/env/{key}?scope=... — any of {env_var_not_found, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -3040,6 +3075,30 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/cron-fire-now-requests/{request_id}:
+    get:
+      operationId: getFireCronRequest
+      summary: Get fire-now request state
+      description: |
+        Polling surface for the row that `POST /v1/crons/{id}/run`
+        inserted (issue #791 PR-D / ADR-090 §Sub-decision 7).
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          description: Fire-now request identifier returned by `POST /v1/crons/{id}/run`.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Current state of the fire-now request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FireCronRequestResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ─── Projects (ADR-050 / Phase 3) ───────────────────────────────────
@@ -6297,6 +6356,29 @@ components:
       schema: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128 }
       description: Secret key. Must start with a letter; A-Z, 0-9, underscore.
 
+    # ADR-090 PR-B: optional `?scope=` query param on the three
+    # env routes (/v1/apps/{slug}/envs and .../{key}). The scope
+    # is a domain-valid slug (3..40 lowercase alnum + dash) or the
+    # reserved sentinel `__all__` on GET only. Omitted means
+    # scope=default — the wire shape is byte-identical to
+    # pre-PR-B. See EnvScopeInvalid / EnvScopeReserved in
+    # responses/ for the 400 codes.
+    EnvScope:
+      name: scope
+      in: query
+      required: false
+      schema:
+        type: string
+        pattern: '^([a-z0-9]([a-z0-9-]{1,38})[a-z0-9]|__all__)$'
+        maxLength: 40
+      description: |
+        Env-var scope (ADR-090). A domain-valid slug (3..40 chars,
+        lowercase alnum + dash, no leading/trailing dash) — e.g.
+        `default`, `staging`, `prod-eu`. Or the reserved sentinel
+        `__all__` on GET only, which returns the nested
+        `env_by_scope` response shape (every scope on the app).
+        Omitted = `scope=default` (pre-PR-B behavior).
+
     # Issue #190 / IAM-6 / ADR-061 (PR 5) — path-scoped org surface.
     # Slug matches the canonical regex in pkg/api/errors.go::OrgSlugPattern.
     # Max 32 chars (LoadOrg middleware caps at 64; oversize values
@@ -8386,6 +8468,24 @@ components:
           enum: [pending, running, succeeded, failed]
           example: "pending"
 
+    FireCronRequestResponse:
+      description: |
+        Issue #791 PR-D / ADR-090 §Sub-decision 7. Read shape for
+        `GET /v1/cron-fire-now-requests/{request_id}`.
+      type: object
+      required: [request_id, cron_id, status, requested_at, account_id]
+      properties:
+        request_id: { type: string, format: uuid }
+        cron_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, running, succeeded, failed, cancelled]
+        requested_at: { type: string, format: date-time }
+        finished_at: { type: [string, "null"], format: date-time }
+        invocation_id: { type: [string, "null"], format: uuid }
+        error: { type: [string, "null"] }
+        account_id: { type: string, format: uuid }
+
     CreateCronRequest:
       description: "Cron creation payload: schedule expression and target URL."
       type: object
@@ -9479,22 +9579,66 @@ components:
         value: { type: string, description: 'Plaintext env-var value. Stored as-is; do NOT use this surface for credentials.', example: "debug" }
 
     AppEnvResponse:
-      description: "An env var envelope: key name + timestamps. The plaintext value never appears here."
+      description: "An env var envelope: key name + scope + timestamps. The plaintext value never appears here."
       type: object
-      required: [key, created_at, updated_at]
+      required: [key, scope, created_at, updated_at]
       properties:
         key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128, example: "LOG_LEVEL" }
+        scope:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          maxLength: 40
+          description: "Env-var scope (ADR-090). Always 'default' for the pre-PR-B flat response; varies for the nested `env_by_scope` response."
+          example: "default"
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    # ADR-090 PR-B: per-row shape for the nested `env_by_scope`
+    # response. Identical to AppEnvResponse except the `scope`
+    # field is required (vs AppEnvResponse where the flat arm
+    # defaults to "default" for backwards-compat with pre-PR-B
+    # SDKs). The two shapes are wire-distinguishable: a SDK
+    # branch on `if 'env_by_scope' in response` decodes the
+    # nested map; otherwise it decodes the flat `env` array.
+    ScopedAppEnvResponse:
+      description: "An env var envelope scoped to one named environment (ADR-090). The plaintext value never appears here."
+      type: object
+      required: [scope, key, created_at, updated_at]
+      properties:
+        scope:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          maxLength: 40
+          example: "staging"
+        key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128, example: "DB_URL" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
     AppEnvListResponse:
-      description: "List of env var envelopes (no plaintext values)."
+      description: |
+        List of env var envelopes (no plaintext values). Discriminated
+        union (ADR-090 PR-B D3):
+
+          * `env` array populated, `env_by_scope` omitted: the
+            default-scope or per-scope read (omitted or `?scope=<slug>`).
+            `count` is the per-scope row count.
+          * `env` empty, `env_by_scope` populated: the `?scope=__all__`
+            read. `count` is the cross-scope row total.
+
+        Both arms are valid wire shapes for a GET; the `?scope=`
+        query discriminates.
       type: object
       required: [env, quota_max, count]
       properties:
         env:
           type: array
           items: { $ref: '#/components/schemas/AppEnvResponse' }
+        env_by_scope:
+          type: object
+          description: "Nested per-scope map (ADR-090 PR-B D3). Populated only when `?scope=__all__` is passed; keys are scope names, values are per-scope row lists ordered by key ASC."
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/ScopedAppEnvResponse' }
         quota_max: { type: integer }
         count: { type: integer }
 
@@ -11071,6 +11215,24 @@ components:
 
     EnvVarInvalidKey:
       description: 'code: env_var_invalid_key'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    # ADR-090 PR-B: standalone 400 ref for the GET route. The
+    # PUT/DELETE routes' 400s are documented inline (a single 400
+    # entry with an inline Problem schema + a description that
+    # names the closed set of codes) because OpenAPI 3.0 only
+    # allows one response per status code, and the PUT/DELETE
+    # routes' 400s carry three possible codes
+    # ({env_var_invalid_key, env_scope_invalid, env_scope_reserved}
+    # on PUT; {env_var_not_found, env_scope_invalid,
+    # env_scope_reserved} on DELETE). The GET route's 400 carries
+    # only env_scope_invalid (no key is part of the URL, so
+    # env_var_invalid_key doesn't apply; __all__ is allowed on
+    # read), so a single ref is fine.
+    EnvScopeInvalid:
+      description: 'code: env_scope_invalid — ?scope= failed the EnvScopePattern check (empty, too long, or out-of-shape slug).'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

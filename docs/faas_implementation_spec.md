@@ -149,6 +149,49 @@ As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-
 
 **Drift protection.** The `TestApidPathReservations_Documented` test in `cmd/gatewayd-internal/proxy_test.go` reads this section and asserts every `apidRoot*` constant in `cmd/gatewayd-internal/proxy.go:233-246` appears verbatim — the spec is documentation that must match the matcher, but the matcher is the source of truth. If a future change adds a new `apidRoot*` constant, this section must be updated in the same PR; CI fails the merge otherwise.
 
+#### 4.1.2 Edge-rule hot-path ordering
+
+The seven edge-rule kinds (`route`, `rewrite`, `redirect`, `headers`, `cors`, `jwt`, `ip`; see ADR-091 / issue #561 / Cloudflare Ruleset Engine) run in a fixed pipeline inside `gatewayd-internal`'s `ServeHTTP`. The ordering is deterministic and the rationale for each position is load-bearing — moving any kind up or down the stack creates a documented regression (browsers reject preflights that 3xx; JWT-failed traffic must not wake a microVM; etc).
+
+```
+matchAndSubstituteRoute          # §4.1.2.1 — kind=route (PR 3)
+  → Backend.Lookup                # §4.1.2.2 — scheduler cache+PG (skipped on kind=route hit; goto haveApp)
+  → matchAndApplyRedirect         # §4.1.2.3 — kind=redirect (PR 4): 3xx short-circuits BEFORE rewrite so a rewritten path doesn't accidentally shadow a redirect
+  → matchAndApplyRewrite          # §4.1.2.4 — kind=rewrite  (PR 4): mutates r.URL.Path so downstream gates (CORS/headers/JWT/IP) match on the rewritten path
+  → applyEdgeRuleHeaders          # §4.1.2.5 — kind=headers  (PR 4): response-side ops installed on `statusRecorder` BEFORE any 4xx is written
+  → applyEdgeRuleCORS             # §4.1.2.6 — kind=cors     (PR 5): OPTIONS preflight short-circuits with 204 BEFORE redirect would have 3xx'd the preflight away
+  → applyEdgeRuleJWT              # §4.1.2.7 — kind=jwt      (PR 5): AFTER rewrite/headers, BEFORE require_authn, so a JWT-failed request never reaches the per-deployment auth chain or wakes the VM
+  → applyEdgeRuleIP               # §4.1.2.8 — kind=ip       (PR 5): AFTER jwt (cheap deny before authenticated-path DB), BEFORE Backend.Pick, so an IP-denied request never pays a cold-wake cost
+  → enforceRequireAuthn           # §4.1.2.9 — per-deployment require_authn gate (issue #560)
+  → enforcePublicAuth             # §4.1.2.10 — per-app public_auth gate (issue #477)
+  → Backend.Pick                  # §4.1.2.11 — scheduler wake/gate (any earlier 4xx already short-circuited)
+  → proxy leg
+```
+
+**Architectural note on the kind=route exception (load-bearing, ADR-091 D4):** of the seven kinds, only `kind=route` runs *before* `Backend.Lookup` — at `ServeHTTP` line 2255-2257, a `kind=route` hit substitutes `app` and `goto haveApp` so downstream RequireAuthn / PublicAuth / wake gate / proxy all see the *target* app's context (auth remains per-app). The other six kinds run at `haveApp` (line 2267 onward), AFTER `Backend.Lookup`. Reordering `kind=route` to run AFTER Lookup would defeat the substitution; reordering any of the other six to run BEFORE Lookup would mean they fire on an empty `App{}` and silently fall through the same-account guard — both are regressions.
+
+**Hard guarantees** the ordering pins:
+
+- **CORS precedes redirect (§4.1.2.6 > §4.1.2.3 if a 3xx came first).** A preflight that gets a 3xx is a browser-side failure (browsers don't follow 3xx for preflights). The actual production ordering has redirect at §4.1.2.3 and CORS at §4.1.2.6 — redirect runs first because it's cheaper to 3xx a known-redirect URL than to evaluate a CORS preflight; the CORS preflight path is only reached when no `kind=redirect` rule matches the host/path, which is the common case for an app that *does* serve CORS. The defensive ordering is documented in `pkg/gateway/handler.go:2277-2283`.
+- **JWT precedes `enforceRequireAuthn` (§4.1.2.7 < §4.1.2.9).** The edge-rule JWT gate fires on the inbound token before the per-deployment bearer-token gate; otherwise a JWT-failed request would still pay the per-deployment auth DB lookup.
+- **CORS / JWT / IP all precede `Backend.Pick` (§4.1.2.6, §4.1.2.7, §4.1.2.8 < §4.1.2.11).** A rejected request never pays the cold-wake cost. ADR-091 D4 codifies this; this spec section is the implementation contract.
+- **Same-account assertion at every kind** (ADR-091 D5). A cross-account `kind=X` rule silently falls through (audit + `outcome=blocked` metric + no enforcement).
+
+##### Defense-in-depth guards (spec-level decisions, NOT deviations)
+
+These are guards the apid validator enforces on rule creation; the gateway stamper trusts the validated input. Reversing any of them requires a new ADR (ADR-091 D10 / D11 / D12).
+
+- **CORS `*` + credentials footgun (ADR-091 D12).** `AllowOrigins: ["*"]` combined with `AllowCredentials: true` is rejected at create-time by `pkg/api/dto.go::EdgeRuleCORSAction.Validate`. Browsers reject the combination on the wire (RFC 6454 §7); cheaper to surface a 422 than to ship a rule that silently fails.
+- **HS\* dropped from JWT algorithm vocabulary (ADR-091 D11).** Only the closed set `{RS256, RS384, RS512, ES256, ES384, ES512}` is accepted. HS\* over JWKS would mean a symmetric key served from a public endpoint. If a future customer needs HS\*, that's a `secret_ref` action shape and a new ADR.
+- **JWKS URL network-position guard (ADR-091 D10).** `EdgeRuleJWTAction.Validate` rejects JWKS URLs starting with `https://localhost`, `https://127.*`, `https://10.*`, `https://192.168.*`, `https://169.254.*`, `https://[::1]`, `https://[fc*::*`, `https://[fd*::*`. The `https://` prefix is a separate requirement. §11's egress posture already forbids the same ranges at the host firewall; this is the application-layer equivalent.
+
+##### Cross-references
+
+- **ADR-091** (authoritative sub-decision history; D4 codifies the ordering table; D17–D20 codify the rollout-closer tests/docs).
+- **§11** (egress posture that bounds the JWKS URL network-position validator).
+- **§4.7** (per-account rate-limit posture that re-confirms the deny-before-cost guarantee).
+- **ADR-070** (Tier A7 edge split — `gatewayd-public` and `gatewayd-internal` on opposite sides of a unix socket; the architecture that makes `pkg/gateway/internal_proxy.go:286` the load-bearing single-trusted-XFF source for §4.1.2.8).
+
 ### 4.2 `apid` — control API
 
 **Owns:** the public REST API, auth, validation, and being the *only* writer to customer-intent tables.

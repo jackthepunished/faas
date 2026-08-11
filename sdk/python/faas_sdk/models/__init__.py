@@ -26,6 +26,7 @@ from .api_key_response import APIKeyResponse
 from .api_key_response_scopes_item import APIKeyResponseScopesItem
 from .api_key_response_status import APIKeyResponseStatus
 from .app_env_list_response import AppEnvListResponse
+from .app_env_list_response_env_by_scope import AppEnvListResponseEnvByScope
 from .app_env_response import AppEnvResponse
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
@@ -73,10 +74,12 @@ from .billing_catalog_entry import BillingCatalogEntry
 from .billing_catalog_entry_kind import BillingCatalogEntryKind
 from .billing_catalog_entry_plan import BillingCatalogEntryPlan
 from .billing_catalog_response import BillingCatalogResponse
+from .billing_paddle_overage_preflight_response import BillingPaddleOveragePreflightResponse
 from .billing_portal_response import BillingPortalResponse
 from .billing_reconcile_response import BillingReconcileResponse
 from .billing_retry_response import BillingRetryResponse
 from .build_export_response import BuildExportResponse
+from .build_list_response import BuildListResponse
 from .build_provenance_response import BuildProvenanceResponse
 from .build_response import BuildResponse
 from .build_response_failure_class import BuildResponseFailureClass
@@ -150,6 +153,10 @@ from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
+from .fire_cron_request_response import FireCronRequestResponse
+from .fire_cron_request_response_status import FireCronRequestResponseStatus
+from .fire_cron_response import FireCronResponse
+from .fire_cron_response_status import FireCronResponseStatus
 from .gdpr_audit_export_response import GdprAuditExportResponse
 from .gdpr_audit_export_response_action import GdprAuditExportResponseAction
 from .gdpr_audit_export_response_data import GdprAuditExportResponseData
@@ -159,6 +166,7 @@ from .get_app_metrics_range import GetAppMetricsRange
 from .get_app_slo_window import GetAppSLOWindow
 from .get_apps_metrics_range import GetAppsMetricsRange
 from .get_build_sbom_response_200 import GetBuildSbomResponse200
+from .get_builds_status import GetBuildsStatus
 from .get_open_api_spec_json_response_200 import GetOpenAPISpecJSONResponse200
 from .grace_window_response import GraceWindowResponse
 from .install_bind_request import InstallBindRequest
@@ -286,6 +294,7 @@ from .scaling_target import ScalingTarget
 from .scaling_target_metric import ScalingTargetMetric
 from .scan_result import ScanResult
 from .scan_result_status import ScanResultStatus
+from .scoped_app_env_response import ScopedAppEnvResponse
 from .seat_usage_response import SeatUsageResponse
 from .seat_usage_response_plan import SeatUsageResponsePlan
 from .session_info import SessionInfo
@@ -299,6 +308,8 @@ from .sidecar import Sidecar
 from .sidecar_env import SidecarEnv
 from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
+from .source_ref_deploy_request import SourceRefDeployRequest
+from .source_ref_deploy_request_format import SourceRefDeployRequestFormat
 from .storage_usage_list_response import StorageUsageListResponse
 from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_archive import StreamAppLogsArchive
@@ -363,6 +374,7 @@ __all__ = (
     "APIKeyResponseScopesItem",
     "APIKeyResponseStatus",
     "AppEnvListResponse",
+    "AppEnvListResponseEnvByScope",
     "AppEnvResponse",
     "AppliedBuild",
     "ApplyResponse",
@@ -410,10 +422,12 @@ __all__ = (
     "BillingCatalogEntryKind",
     "BillingCatalogEntryPlan",
     "BillingCatalogResponse",
+    "BillingPaddleOveragePreflightResponse",
     "BillingPortalResponse",
     "BillingReconcileResponse",
     "BillingRetryResponse",
     "BuildExportResponse",
+    "BuildListResponse",
     "BuildProvenanceResponse",
     "BuildResponse",
     "BuildResponseFailureClass",
@@ -487,6 +501,10 @@ __all__ = (
     "EdgeRuleResponseKind",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
+    "FireCronRequestResponse",
+    "FireCronRequestResponseStatus",
+    "FireCronResponse",
+    "FireCronResponseStatus",
     "GdprAuditExportResponse",
     "GdprAuditExportResponseAction",
     "GdprAuditExportResponseData",
@@ -496,6 +514,7 @@ __all__ = (
     "GetAppSLOWindow",
     "GetAppsMetricsRange",
     "GetBuildSbomResponse200",
+    "GetBuildsStatus",
     "GetOpenAPISpecJSONResponse200",
     "GraceWindowResponse",
     "InstallBindRequest",
@@ -621,6 +640,7 @@ __all__ = (
     "ScalingTargetMetric",
     "ScanResult",
     "ScanResultStatus",
+    "ScopedAppEnvResponse",
     "SeatUsageResponse",
     "SeatUsageResponsePlan",
     "SessionInfo",
@@ -634,6 +654,8 @@ __all__ = (
     "SidecarEnv",
     "SidecarType",
     "SLODuration",
+    "SourceRefDeployRequest",
+    "SourceRefDeployRequestFormat",
     "StorageUsageListResponse",
     "StorageUsageResponse",
     "StreamAppLogsArchive",

@@ -3,7 +3,7 @@
 - **Status:** accepted (PR-cluster landing PR-1 through PR-5)
 - **Date:** 2026-08-10
 - **Issue:** #561 (customer-facing per-request routing/decisions: kind=route / rewrite / redirect / headers / cors / jwt / ip)
-- **Related:** spec §13.4 (gateway hot-path ordering), ADR-070 (Tier A7 edge split — the architecture that places `gatewayd-public` and `gatewayd-internal` on opposite sides of a unix socket), ADR-009 (the identical inner network world that lets PR 3's `kind=route` substitute freely), ADR-001–010 (inlined in spec §3), §11 (egress / host-age / cgroups posture that bounds the JWKS URL validator), ADR-041 (slot-reservation pattern used by the matching migration).
+- **Related:** spec §4.1.2 (gateway hot-path ordering), ADR-070 (Tier A7 edge split — the architecture that places `gatewayd-public` and `gatewayd-internal` on opposite sides of a unix socket), ADR-009 (the identical inner network world that lets PR 3's `kind=route` substitute freely), ADR-001–010 (inlined in spec §3), §11 (egress / host-age / cgroups posture that bounds the JWKS URL validator), ADR-041 (slot-reservation pattern used by the matching migration).
 - **Supersedes:** the per-deployment "routing rules" feature deferred from issue #561 / Q3'26.
 
 ## Context
@@ -61,27 +61,37 @@ PR-A/B/C — keep their cite numbers untouched.)
    update funnels through one notify; gatewayd-internal subscribes; PR 6 will
    add the property test that pins the wholesale invariant).
 
-4. **Hot-path ordering in `ServeHTTP`** (spec §13.4 + Cloudflare Ruleset
+4. **Hot-path ordering in `ServeHTTP`** (spec §4.1.2 + Cloudflare Ruleset
    Engine):
 
    ```
-   matchAndSubstituteRoute          # PR 3: kind=route
-     → applyEdgeRuleCORS            # PR 5: kind=cors (preflight 204 before redirect)
+   matchAndSubstituteRoute          # PR 3: kind=route (only kind before Backend.Lookup)
+     → Backend.Lookup               # host→app cache+PG (skipped on kind=route hit; goto haveApp)
      → matchAndApplyRedirect        # PR 4: kind=redirect (3xx short-circuit)
      → matchAndApplyRewrite         # PR 4: kind=rewrite (mutates r.URL.Path)
      → applyEdgeRuleHeaders         # PR 4: kind=headers (response header ops)
-     → applyEdgeRuleJWT             # PR 5: kind=jwt  (post-route, pre-wake-gate)
+     → applyEdgeRuleCORS            # PR 5: kind=cors (preflight 204 short-circuit)
+     → applyEdgeRuleJWT             # PR 5: kind=jwt  (post-headers, pre-wake-gate)
      → applyEdgeRuleIP              # PR 5: kind=ip   (cheap deny before auth)
      → enforceRequireAuthn
      → enforcePublicAuth
-     → Backend.Lookup
-     → ...
+     → Backend.Pick
+     → proxy leg
    ```
 
-   CORS precedes redirect so an OPTIONS preflight returns 204 (browsers reject
-   preflights that 3xx). JWT and IP precede per-deployment authority gates so a
-   JWT-failed request never reaches `require_authn=true`. CORS, JWT, and IP all
-   precede `Backend.Lookup` so a rejected request never pays a cold-wake cost.
+   JWT and IP precede per-deployment authority gates so a JWT-failed request
+   never reaches `require_authn=true`. CORS, JWT, and IP all precede
+   `Backend.Pick` so a rejected request never pays a cold-wake cost. The
+   `kind=route` exception (only kind that runs before `Backend.Lookup`) is
+   the substitution semantic — `matchAndSubstituteRoute` overwrites `app`
+   and `goto haveApp` so downstream auth/wake/proxy sees the *target* app.
+   Spec §4.1.2 documents this ordering authoritatively; this ADR and §4.1.2
+   must stay aligned. **Note on the original D4 wording (PR 6 review fix):**
+   the initial PR-cluster draft of this D4 said "CORS precedes redirect" but
+   the actual production ordering (handler.go:2284-2296) is redirect first,
+   CORS second — redirect is cheaper (3xx) than evaluating a preflight that
+   won't apply anyway when a 3xx rule matches the host/path. The D4 prose
+   above is the corrected version, aligned with handler.go:2284.
 
 5. **Same-account enforcement is the only security boundary at the gateway.**
    Cross-account rules fall through silently. Apid create-time rejects
@@ -182,8 +192,89 @@ PR-A/B/C — keep their cite numbers untouched.)
 
 16. **No new migrations.** PR 1 already added the `edge_rules` table
     (`migrations/00192_edge_rules.sql`) with all 7 kinds in the schema
-    CHECK constraint. PRs 2-5 are non-schema. PR 6 will add the LRU
-    property test that pins the wholesale `Reset()` invariant.
+    CHECK constraint. PRs 2-5 are non-schema. PR 6 ships D17 (LRU
+    property test), D18 (per-kind e2e), D19 (spec §4.1.2 backfill),
+    and D20 (deferred items).
+
+17. **Property-test invariant for wholesale `Reset()` (PR 6, ship-blocking).**
+    PR 6 ships a property-style test (`FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds`)
+    alongside a deterministic `TestEdgeRuleReset_WholesaleAcrossAllSevenKinds`
+    in `pkg/gateway/edge_rules_test.go`. Both pin the wholesale
+    `pg_notify`-driven `Reset()` invariant across all 7 kinds — a
+    regression against any single kind fails the test, surfacing as a
+    cache-consistency violation for ALL 7 kinds simultaneously. A
+    companion test in `cmd/gatewayd-internal/edge_rules_test.go`
+    (`TestGatewaydEdgeRules_ResetForwardsToCache`) pins the production
+    `gatewaydEdgeRules.Reset()` as a one-line `cache.Reset()` forward,
+    with `fakeEdgeRuleStore.calls` proving `Reset()` does NOT re-hit
+    the store. D3's promise that PR 6 would add the wholesale-RESET
+    property test is fulfilled here.
+
+18. **e2e cross-process coverage of all 7 kinds (PR 6, ship-blocking).**
+    PR 6 ships per-kind e2e tests under `cmd/e2e/edge_rules_<kind>_e2e_test.go`
+    covering the apid → gatewayd-internal path. Bitmask: `e2etest.APID
+    | e2etest.Gatewayd` (no schedd/vmmd/imaged — those wake microVMs
+    and PR 6's bitmask budget excludes them). The six non-route kinds
+    (rewrite / redirect / headers / cors / jwt / ip) all run at
+    `haveApp` (spec §4.1.2) AFTER `Backend.Lookup`, so each per-kind
+    test seeds a `kind=route` substitute (synthetic host → real test
+    app slug) as a precondition — mirroring the production pipeline
+    shape. Kind=jwt seeds the rule via direct `h.Pool.Exec` insert
+    (bypassing apid-Validate, which rejects `https://127.*` JWKS URLs
+    — D10's defence-in-depth stays in production); the gateway-side
+    wire is the surface under test. Per-kind minimum coverage: one
+    status-only happy path + one negative path. PR 6 is the
+    rollout-closer; kind=route e2e is the most thoroughly unit-tested
+    kind already (PR 3 + `cmd/gatewayd-internal/edge_rules_test.go`)
+    and is deferred to D20.
+
+19. **Spec §4.1.2 backfill (PR 6, ship-blocking).** Spec §4.1.2 is
+    backfilled with the canonical hot-path ordering table from D4.
+    ADR-091 D4 and spec §4.1.2 cross-reference each other
+    bi-directionally. The CORS `*`+credentials guard (D12), HS\* drop
+    (D11), and JWKS URL network-position guard (D10) are now
+    spec-level decisions, not just ADR-level — they live in
+    `docs/faas_implementation_spec.md` §4.1.2 "Defense-in-depth guards"
+    so a reader hitting the spec doesn't have to dig into ADR-091 to
+    learn that HS\* is dropped. Future contributions that try to add
+    an HS\* action shape MUST propose a new ADR (D11 footnote); the
+    spec guards make this clear. **Section-number correction (PR 6
+    review fix):** the original D4 and this ADR's forward-cite at the
+    top of the file pointed to "spec §13.4". That section number was
+    incorrect — §13 is RAM budget ledger. The correct home is §4.1.2
+    under `gatewayd-public` ⏵ `gatewayd-internal` — edge proxy (spec §4.1).
+    PR 6 corrects all six forward-cites in `pkg/gateway/handler.go`
+    (lines 954, 2277, 3126), `pkg/gateway/edge_rules.go:101`, and the
+    two ADR-091 cites (lines 6, 64).
+
+20. **Deferred items (follow-on PRs, non-blocking for PR 6).** The
+    following follow-on items surfaced during PR 6 review and are
+    explicitly deferred — they DO NOT block PR 6 merge:
+    - **D20.1 — kind=route e2e cross-process coverage.** Adds
+      `cmd/e2e/edge_rules_route_e2e_test.go` requiring
+      `e2etest.DeployWake` (schedd + vmmd + imaged) and creating two
+      stub apps on the same account, then asserting `kind=route`
+      substitutes across hosts with a real `Backend.Lookup`. Defer
+      until §14 M6 acceptance gets a stable stub-app fixture;
+      `deploy_wake_metal_test.go` is the right shape.
+    - **D20.2 — Account-level JWKS.** Per-rule JWKS URLs ship in PR 5
+      (D15); an account-level `jwks_endpoints` table is deferred
+      until a customer asks.
+    - **D20.3 — Audit retention SLO.** Audit rows from
+      `edge_rule.*_matched|blocked|failed|missing` are best-effort
+      today. A retention SLO (e.g., 30 days) needs an
+      operator-obs/audit-search ticket (#817 in flight).
+    - **D20.4 — Observability dashboard chip.** `gateway_edge_rule_match_total
+      {kind, outcome}` is exported as a Prometheus counter; no
+      Grafana chip ships. Owner: ADR-092 (observability catalog)
+      follow-on.
+    - **D20.5 — Per-rule rate limit.** Token-bucket per rule (e.g.,
+      "this JWKS-protected endpoint gets 100 RPS per IP"). Out of
+      ADR-091 — new ADR needed.
+    - **D20.6 — CORS non-preflight e2e path.** PR 6 covers CORS
+      preflight e2e; non-preflight stamp-the-Origin flow is
+      unit-tested at `pkg/gateway/handler.go:1175-1220` and the e2e
+      can add a `GET` happy-path assertion in a follow-up.
 
 ## Implementation surface
 
@@ -326,6 +417,17 @@ gh pr checks <PR-NUMBER> --watch
   AND `cmd/gregale/commands_edge_rules.go::edgeRuleJWTAlgVocab` (D11). Both
   vocabs must match exactly.
 - [ ] CORS `*`+credentials footgun guarded at apid-Validate (D12).
+- [ ] Wholesale-RESET property test pins all 7 kinds in
+  `pkg/gateway/edge_rules_test.go::TestEdgeRuleReset_WholesaleAcrossAllSevenKinds`
+  + the cmd-side forward test in `cmd/gatewayd-internal/edge_rules_test.go`
+  (D17).
+- [ ] Per-kind e2e files under `cmd/e2e/edge_rules_<kind>_e2e_test.go` cover
+  rewrite/redirect/headers/cors/jwt/ip with status-only happy + negative paths
+  on bitmask `e2etest.APID | e2etest.Gatewayd` (D18).
+- [ ] Spec §4.1.2 backfilled with the canonical hot-path ordering table; all
+  six forward-cites (pkg/gateway/handler.go:954,:2277,:3126,
+  pkg/gateway/edge_rules.go:101, ADR-091 lines 6 and 64) point to §4.1.2,
+  not §13.4 (D19).
 - [ ] `grep -nE 'ADR-089' --include='*.go' --include='*.md'` returns ≤18 hits
   post-cite-bug sweep (legitimate secret-rotation siblings stay).
 - [ ] PR 4 review-fix lessons applied — every `h.observe(...)` passes

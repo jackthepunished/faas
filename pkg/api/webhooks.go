@@ -47,6 +47,7 @@ var AllowedAppWebhookRetryPolicies = []string{"default", "aggressive", "none"}
 // so the dispatcher can route without a second lookup.
 var AllowedAppWebhookEvents = []string{
 	"cron.fired",
+	"cron.fired.manually", // issue #791 PR-D / ADR-090 §"Sub-decision 7" — manual cron run events.
 	"app.created",
 	"app.deleted",
 	"build.succeeded",

@@ -12,15 +12,20 @@ T = TypeVar("T", bound="AppEnvResponse")
 
 @_attrs_define
 class AppEnvResponse:
-    """An env var envelope: key name + timestamps. The plaintext value never appears here."""
+    """An env var envelope: key name + scope + timestamps. The plaintext value never appears here."""
 
     key: str
+    scope: str
+    """Env-var scope (ADR-090). Always 'default' for the pre-PR-B flat response; varies for the nested
+    `env_by_scope` response."""
     created_at: datetime.datetime
     updated_at: datetime.datetime
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         key = self.key
+
+        scope = self.scope
 
         created_at = self.created_at.isoformat()
 
@@ -31,6 +36,7 @@ class AppEnvResponse:
         field_dict.update(
             {
                 "key": key,
+                "scope": scope,
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
@@ -43,12 +49,15 @@ class AppEnvResponse:
         d = dict(src_dict)
         key = d.pop("key")
 
+        scope = d.pop("scope")
+
         created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
 
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
 
         app_env_response = cls(
             key=key,
+            scope=scope,
             created_at=created_at,
             updated_at=updated_at,
         )

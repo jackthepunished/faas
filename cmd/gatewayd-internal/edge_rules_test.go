@@ -324,6 +324,148 @@ func TestGatewaydEdgeRules_ResetDropsCache(t *testing.T) {
 	}
 }
 
+// --- PR 6: cmd-side Reset forward across all 7 kinds (ADR-091 D17) ----
+//
+// Mirrors TestGatewaydEdgeRules_ResetDropsCache at line 300 but
+// seeds all 7 edge-rule kinds on a single host. Pins the
+// production contract that g.Reset() is a one-line forward to
+// g.cache.Reset() (cmd/gatewayd-internal/edge_rules.go) —
+// store.calls must stay at 1 across the Reset (no re-hit) AND
+// every kind's Match* must miss until the next loadHost.
+
+// sampleAllSevenKindsRules builds a single-host state.EdgeRule
+// slice covering all 7 kinds (route / rewrite / redirect / headers
+// / cors / jwt / ip). Mirrors the cmd-side loadHost shape: one
+// SQL roundtrip returns every kind together; this helper exercises
+// that single-pass contract.
+func sampleAllSevenKindsRules(host string) []state.EdgeRule {
+	return []state.EdgeRule{
+		sampleRouteRule("route-1", 0, host, "", nil, "demo"),
+		sampleRewriteActionRule("rewrite-1", 0, host, "", nil, "/api", "/v2"),
+		sampleRedirectActionRule("redirect-1", 0, host, "", nil, 308, "https://b", nil),
+		sampleHeadersActionRule("headers-1", 0, host, "", nil, nil, nil),
+		{
+			ID: "cors-1", AccountID: "acc_test", AppID: "app_test",
+			MatchHost: host, MatchPath: "", Priority: 0, Enabled: true,
+			Kind: state.EdgeRuleKindCORSA,
+			Action: state.EdgeRuleAction{
+				Kind: state.EdgeRuleKindCORSA,
+				CORS: &state.EdgeRuleCORSAction{
+					AllowOrigins: []string{"https://app.test"},
+					AllowMethods: []string{"GET", "POST"},
+				},
+			},
+		},
+		{
+			ID: "jwt-1", AccountID: "acc_test", AppID: "app_test",
+			MatchHost: host, MatchPath: "", Priority: 0, Enabled: true,
+			Kind: state.EdgeRuleKindJWT,
+			Action: state.EdgeRuleAction{
+				Kind: state.EdgeRuleKindJWT,
+				JWT: &state.EdgeRuleJWTAction{
+					Issuer:     "https://idp.example.com/",
+					JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+					Algorithms: []string{"RS256"},
+				},
+			},
+		},
+		{
+			ID: "ip-1", AccountID: "acc_test", AppID: "app_test",
+			MatchHost: host, MatchPath: "", Priority: 0, Enabled: true,
+			Kind: state.EdgeRuleKindIP,
+			Action: state.EdgeRuleAction{
+				Kind: state.EdgeRuleKindIP,
+				IP: &state.EdgeRuleIPAction{
+					Allow: []string{"10.0.0.0/8"},
+				},
+			},
+		},
+	}
+}
+
+func TestGatewaydEdgeRules_ResetForwardsToCache_AcrossAllSevenKinds(t *testing.T) {
+	// PR 6 D17: production gatewaydEdgeRules.Reset() must forward
+	// to cache.Reset() without re-hitting the store. The test
+	// populates the cache with all 7 kinds on a single host (one
+	// Match* triggers one loadHost which compiles all 7 kinds at
+	// once), calls Reset(), and asserts:
+	//
+	//  1. cache.Len() == 0 (Reset dropped the entry)
+	//  2. store.calls[host] == 1 (Reset did NOT re-hit the store)
+	//  3. the cache stays at Len() == 0 immediately after Reset
+	//     (the wholesale invariant — the property test in
+	//     pkg/gateway/edge_rules_test.go pins the cache primitive)
+	//  4. the next Match* re-hits the store exactly once and the
+	//     single loadHost repopulates all 7 kinds at once — every
+	//     per-kind Match* after that is cache-served (store.calls
+	//     stays at 2).
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": sampleAllSevenKindsRules("a.example.com"),
+		},
+	}
+	g := newGatewaydEdgeRules(store, newQuietLogger())
+
+	// Prime the cache via MatchRoute (one loadHost compiles all 7
+	// kinds together into one HostEntry).
+	if got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET"); got == nil {
+		t.Fatalf("MatchRoute pre-Reset returned nil; want route-1")
+	}
+	if g.cache.Len() != 1 {
+		t.Fatalf("len before Reset = %d, want 1 (one HostEntry covering 7 kinds)", g.cache.Len())
+	}
+	if store.calls["a.example.com"] != 1 {
+		t.Fatalf("store calls pre-Reset = %d, want 1", store.calls["a.example.com"])
+	}
+
+	// The Reset contract under test.
+	g.Reset()
+	if g.cache.Len() != 0 {
+		t.Errorf("len after Reset = %d, want 0 (Reset must wipe the whole HostEntry)", g.cache.Len())
+	}
+	if store.calls["a.example.com"] != 1 {
+		t.Errorf("Reset re-hit store: calls = %d, want 1 (Reset is a pure forward)", store.calls["a.example.com"])
+	}
+
+	// The next Match* triggers a fresh loadHost (one SQL roundtrip
+	// + compile every kind). All 7 kinds' Match* must now return a
+	// hit because the single loadHost populated all of them.
+	if got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET"); got == nil {
+		t.Errorf("post-Reset MatchRoute returned nil; want route-1 (cache should repopulate)")
+	}
+	if store.calls["a.example.com"] != 2 {
+		t.Errorf("store calls post-Reset MatchRoute = %d, want 2 (re-populate should re-hit)", store.calls["a.example.com"])
+	}
+	if g.cache.Len() != 1 {
+		t.Errorf("len after post-Reset MatchRoute = %d, want 1 (cache repopulated)", g.cache.Len())
+	}
+	// Every kind's Match* must now hit because one loadHost
+	// populated all 7 kinds.
+	if got := g.MatchRewrite(context.Background(), "a.example.com", "/api", "GET"); got == nil {
+		t.Errorf("post-repopulate MatchRewrite = nil, want hit (single loadHost compiles all 7)")
+	}
+	if got := g.MatchRedirect(context.Background(), "a.example.com", "/", "GET"); got == nil {
+		t.Errorf("post-repopulate MatchRedirect = nil, want hit")
+	}
+	if got := g.MatchHeaders(context.Background(), "a.example.com", "/", "GET"); got == nil {
+		t.Errorf("post-repopulate MatchHeaders = nil, want hit")
+	}
+	if got := g.MatchCORS(context.Background(), "a.example.com", "/", "OPTIONS"); got == nil {
+		t.Errorf("post-repopulate MatchCORS = nil, want hit")
+	}
+	if got := g.MatchJWT(context.Background(), "a.example.com", "/", "GET"); got == nil {
+		t.Errorf("post-repopulate MatchJWT = nil, want hit")
+	}
+	if got := g.MatchIP(context.Background(), "a.example.com", "/", "GET"); got == nil {
+		t.Errorf("post-repopulate MatchIP = nil, want hit")
+	}
+	// store.calls should NOT have grown — the per-kind Match* hits
+	// are all served from the cache the prior MatchRoute populated.
+	if store.calls["a.example.com"] != 2 {
+		t.Errorf("per-kind Match* after repopulate triggered store re-hit: calls = %d, want 2", store.calls["a.example.com"])
+	}
+}
+
 // --- gatewaydEdgeRulesAud (audit thin wrapper) ---------------------------
 
 func TestGatewaydEdgeRulesAud_NilReceiverIsNoOp(t *testing.T) {

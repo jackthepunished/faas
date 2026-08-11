@@ -277,11 +277,15 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "deploy",
 		DocSlug: "deploy",
-		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)",
+		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME)",
 		Flags: []cliFlag{
 			{Name: "image", Short: "deploy from a container image reference"},
 			{Name: "tarball", Short: "deploy from a source tarball"},
 			{Name: "repo", Short: "deploy from a GitHub repo"},
+			// Issue #739 / ADR-092: --ref pairs with --repo to
+			// drive the headless source-ref deploy (CI-friendly,
+			// no install-token env). Required when --repo is set.
+			{Name: "ref", Short: "git ref for --repo (branch, tag, or 40-char SHA)"},
 			{Name: "template", Short: "scaffold from a built-in template", ClosedSet: []string{"node22-http", "python312-http"}},
 		},
 	},

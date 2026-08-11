@@ -9,7 +9,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.app_env_response import AppEnvResponse
 from ...models.problem import Problem
 from ...models.put_app_env_request import PutAppEnvRequest
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -17,8 +17,15 @@ def _get_kwargs(
     key: str,
     *,
     body: PutAppEnvRequest,
+    scope: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+
+    params: dict[str, Any] = {}
+
+    params["scope"] = scope
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "put",
@@ -26,6 +33,7 @@ def _get_kwargs(
             slug=quote(str(slug), safe=""),
             key=quote(str(key), safe=""),
         ),
+        "params": params,
     }
 
     _kwargs["json"] = body.to_dict()
@@ -92,6 +100,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: PutAppEnvRequest,
+    scope: str | Unset = UNSET,
 ) -> Response[AppEnvResponse | Problem]:
     """Set an env var.
 
@@ -101,9 +110,17 @@ def sync_detailed(
     next wake (cold-boot OR snapshot-restore); the running instance
     is unaffected.
 
+    **ADR-090 PR-B scope filter.** The optional `?scope=`
+    query param selects which scope to write. Omitted = the
+    default scope (pre-PR-B behavior). The reserved sentinel
+    `__all__` is rejected with 400 `env_scope_reserved` on
+    writes (it has no meaning on a single-row write). Invalid
+    scope shapes return 400 `env_scope_invalid`.
+
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
         body (PutAppEnvRequest): Set an env var: plaintext value (persisted verbatim in app_envs,
             non-sensitive by contract).
 
@@ -119,6 +136,7 @@ def sync_detailed(
         slug=slug,
         key=key,
         body=body,
+        scope=scope,
     )
 
     response = client.get_httpx_client().request(
@@ -134,6 +152,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: PutAppEnvRequest,
+    scope: str | Unset = UNSET,
 ) -> AppEnvResponse | Problem | None:
     """Set an env var.
 
@@ -143,9 +162,17 @@ def sync(
     next wake (cold-boot OR snapshot-restore); the running instance
     is unaffected.
 
+    **ADR-090 PR-B scope filter.** The optional `?scope=`
+    query param selects which scope to write. Omitted = the
+    default scope (pre-PR-B behavior). The reserved sentinel
+    `__all__` is rejected with 400 `env_scope_reserved` on
+    writes (it has no meaning on a single-row write). Invalid
+    scope shapes return 400 `env_scope_invalid`.
+
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
         body (PutAppEnvRequest): Set an env var: plaintext value (persisted verbatim in app_envs,
             non-sensitive by contract).
 
@@ -162,6 +189,7 @@ def sync(
         key=key,
         client=client,
         body=body,
+        scope=scope,
     ).parsed
 
 
@@ -171,6 +199,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: PutAppEnvRequest,
+    scope: str | Unset = UNSET,
 ) -> Response[AppEnvResponse | Problem]:
     """Set an env var.
 
@@ -180,9 +209,17 @@ async def asyncio_detailed(
     next wake (cold-boot OR snapshot-restore); the running instance
     is unaffected.
 
+    **ADR-090 PR-B scope filter.** The optional `?scope=`
+    query param selects which scope to write. Omitted = the
+    default scope (pre-PR-B behavior). The reserved sentinel
+    `__all__` is rejected with 400 `env_scope_reserved` on
+    writes (it has no meaning on a single-row write). Invalid
+    scope shapes return 400 `env_scope_invalid`.
+
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
         body (PutAppEnvRequest): Set an env var: plaintext value (persisted verbatim in app_envs,
             non-sensitive by contract).
 
@@ -198,6 +235,7 @@ async def asyncio_detailed(
         slug=slug,
         key=key,
         body=body,
+        scope=scope,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -211,6 +249,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: PutAppEnvRequest,
+    scope: str | Unset = UNSET,
 ) -> AppEnvResponse | Problem | None:
     """Set an env var.
 
@@ -220,9 +259,17 @@ async def asyncio(
     next wake (cold-boot OR snapshot-restore); the running instance
     is unaffected.
 
+    **ADR-090 PR-B scope filter.** The optional `?scope=`
+    query param selects which scope to write. Omitted = the
+    default scope (pre-PR-B behavior). The reserved sentinel
+    `__all__` is rejected with 400 `env_scope_reserved` on
+    writes (it has no meaning on a single-row write). Invalid
+    scope shapes return 400 `env_scope_invalid`.
+
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
         body (PutAppEnvRequest): Set an env var: plaintext value (persisted verbatim in app_envs,
             non-sensitive by contract).
 
@@ -240,5 +287,6 @@ async def asyncio(
             key=key,
             client=client,
             body=body,
+            scope=scope,
         )
     ).parsed

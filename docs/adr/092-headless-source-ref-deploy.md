@@ -1,6 +1,7 @@
 # ADR-092 · Headless source-ref deploy from CI (issue #739 / DEPLOY-PROV-4)
 
-- **Status:** proposed
+- **Status:** accepted (PR-A server foundation + Node SDK regen
+  merged; PR-B CLI surface + customer doc in flight)
 - **Date:** 2026-08-10
 - **Issue:** #739 / DEPLOY-PROV-4
 - **Supersedes:** the implicit "dashboard-only" `--repo` flow at

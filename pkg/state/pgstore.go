@@ -10572,6 +10572,37 @@ func (s *PgStore) CountAppEnvInScope(ctx context.Context, accountID, appID, scop
 	return n, err
 }
 
+// ListAllAppEnv returns every env row on the app across all scopes,
+// scoped to accountID. Order: by scope ASC, key ASC. Used by apid's
+// GET /v1/apps/{slug}/envs?scope=__all__ arm (ADR-090 PR-B) to
+// render the nested `env_by_scope` response shape (D3).
+//
+// The composite index `app_envs_account_app_scope_idx
+// (account_id, app_id, scope)` covers the (account_id, app_id)
+// prefix; the row count is bounded by Limits.EnvVarsMax so the scan
+// is cheap (8..2000 by plan).
+func (s *PgStore) ListAllAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, scope, key, value, created_at, updated_at
+		 from app_envs
+		 where account_id = $1 and app_id = $2
+		 order by scope asc, key asc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppEnv
+	for rows.Next() {
+		var e AppEnv
+		if err := rows.Scan(&e.AccountID, &e.AppID, &e.Scope, &e.Key, &e.Value, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // --- app trusted cosign signers (issue #472 / ADR-054) -----------------------
 //
 // Per-app allowlist of cosign public keys whose signatures on OCI images
