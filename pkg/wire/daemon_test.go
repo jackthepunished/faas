@@ -459,6 +459,18 @@ func TestDaemon_SIGHUPReloadsLevel(t *testing.T) {
 	// handler is installed and there is no delivery race.
 	waitFor(`"msg":"starting"`, 10*time.Second)
 
+	// Snapshot stderr strictly before the signal: everything in it was
+	// written while the leveler was still at INFO, so it is a
+	// race-free witness for the pre-flip assertion below. Slicing the
+	// post-flip output at the "log level changed" marker would NOT be:
+	// watchLogLevelReload calls logLevel.Set(next) before it emits that
+	// marker (daemon.go), so a probe tick landing in that window is
+	// legitimately written ahead of the marker.
+	preFlip, err := os.ReadFile(stderrPath)
+	if err != nil {
+		t.Fatalf("snapshot child stderr before SIGHUP: %v", err)
+	}
+
 	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
 		t.Fatalf("send SIGHUP: %v", err)
 	}
@@ -467,10 +479,9 @@ func TestDaemon_SIGHUPReloadsLevel(t *testing.T) {
 	if !strings.Contains(out, `"prev":"INFO"`) || !strings.Contains(out, `"next":"DEBUG"`) {
 		t.Errorf(`"log level changed" record lacks "prev":"INFO"/"next":"DEBUG"; child stderr:`+"\n%s", out)
 	}
-	// Before the flip, INFO suppressed the probes: no probe record may
-	// precede the change marker.
-	if pre := out[:strings.Index(out, `"msg":"log level changed"`)]; strings.Contains(pre, "debug probe") {
-		t.Errorf("debug probe leaked before the level change (leveler was not at INFO); child stderr:\n%s", out)
+	// Before the flip, INFO suppressed the probes.
+	if strings.Contains(string(preFlip), "debug probe") {
+		t.Errorf("debug probe leaked before SIGHUP (leveler was not at INFO); child stderr:\n%s", preFlip)
 	}
 	// After the flip, the mutated leveler must let a probe through.
 	waitFor(`"msg":"debug probe"`, 10*time.Second)
