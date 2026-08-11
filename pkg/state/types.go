@@ -2872,8 +2872,8 @@ type Session struct {
 // explicit scope parameter and are the canonical path. The flat
 // methods hardcode scope='default' as a thin delegation.
 type AppSecret struct {
-	AccountID  string
-	AppID      string
+	AccountID string
+	AppID     string
 	// Scope is the env-scope identifier attached at write time.
 	// Always 'default' for legacy rows backfilled via the
 	// column DEFAULT. Validated by `pkg/api.ValidateScope`

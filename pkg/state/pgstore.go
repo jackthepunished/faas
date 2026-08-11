@@ -11427,7 +11427,6 @@ func (s *PgStore) DeleteAppSecretInScope(ctx context.Context, accountID, appID, 
 	return nil
 }
 
-
 // ListAppSecretsInScope is the scope-aware sibling of
 // ListAppSecrets (ADR-092 PR-A). Returns every (key, ciphertext,
 // kid, timestamps) row on the app where scope matches the
