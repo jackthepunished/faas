@@ -301,6 +301,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// surfaces the trip in the §12 dashboard.
 				inner := githubd.NewHTTPChangedFiles(tokens, deps.httpClient())
 				webhookSvc.ChangedFiles = githubd.NewBreakerChangedFiles(inner, deps.now)
+				// PR-D / ADR-012 §6 closure: wire the Checks
+				// API writer to the post-enqueue hook at
+				// pkg/githubd/service.go::HandlePushRequest.
+				// The seam takes (ctx, repo, sha, phase); the
+				// underlying ChecksAPI takes (logsURL,
+				// summary) too — both are empty at the
+				// queued hook (the build fan-out fills them
+				// in when it lands via the gRPC path).
+				webhookSvc.WriteCheck = func(ctx context.Context, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase) error {
+					return githubd.WriteCheckCoalesced(ctx, checks, repoFullName, commitSHA, phase, "", "")
+				}
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}

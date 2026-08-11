@@ -214,24 +214,13 @@ func (l *liveClient) GetInstallState(ctx context.Context, accountID string) (Ins
 // ExchangeOAuthCode passes through to githubdgrpc.Client.ExchangeOAuthCode.
 // PR-C widens the apid-facing surface to (installID, defaultBranch, err)
 // so the renderOAuthCodeCallback handler can seed the dashboard redirect
-// without a second round-trip. The gRPC wire itself is unchanged (proto
-// regen isn't part of PR-C's scope); the githubd side surfaces
-// default_branch via the same repo that ExchangeOAuthCode calls
-// VerifyInstallation as part of its flow. Today we forward only the
-// installation_id through gRPC and the default_branch is read via the
-// existing /oauth/callback renderOAuthCallback handler's VerifyInstallation
-// call. Pre-PR-C callers that don't need default_branch pass an empty
-// string and ignore the second return.
-//
-// TODO(PR-D): once .pb.go regen lands in CI, move default_branch onto
-// ExchangeOAuthCodeResponse (the `default_branch = 2` reserved-but-unused
-// proto field at api/proto/.../githubd.proto:131) and surface it here.
+// without a second round-trip. PR-D / ADR-012 §6 closure: the
+// default_branch is now actually surfaced on the gRPC wire (the proto
+// field at `default_branch = 2` was reserved since slice 8; PR-D fills
+// it at the Server.ExchangeOAuthCode layer so this pass-through is
+// no longer a TODO).
 func (l *liveClient) ExchangeOAuthCode(ctx context.Context, accountID, code, state string) (string, string, error) {
-	installID, err := l.c.ExchangeOAuthCode(ctx, accountID, code, state)
-	if err != nil {
-		return "", "", err
-	}
-	return installID, "", nil
+	return l.c.ExchangeOAuthCode(ctx, accountID, code, state)
 }
 
 // ListInstallableRepos passes through to githubdgrpc.Client.ListInstallableRepos.

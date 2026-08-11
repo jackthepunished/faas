@@ -453,12 +453,18 @@ func (a *grpcSvcAdapter) CreateDeploymentFromPush(repoFullName, ref, commitSHA, 
 	return "", "", nil
 }
 
-// WriteCheck is the slice-8 seam — slice 7 leaves it as a log-
-// only stub so the smoke test can still observe the call ordering.
+// WriteCheck panics if reached — production wires
+// *githubd.RealService directly as the gRPC Service (see
+// cmd/githubd/main.go::gRPCImpl), bypassing this adapter. The
+// slice-7 smoke test path that called this stub was retired in
+// PR-D; panicking here makes a regression loud rather than
+// silently dropping the check-run write. The slice-7 test
+// pkg/githubdgrpc/bufconn_test.go uses RealService directly
+// (see TestService_WriteCheck_RoundTrip), so the panic is
+// unreachable from the production test surface.
 func (a *grpcSvcAdapter) WriteCheck(repoFullName, commitSHA string, phase githubdgrpc.CheckPhase, _, summary string) error {
-	a.svc.Log.Info("githubd grpc WriteCheck (slice-7 stub)",
-		"repo", repoFullName, "sha", commitSHA, "phase", phase, "summary", summary)
-	return nil
+	panic(fmt.Sprintf("githubd: grpcSvcAdapter.WriteCheck called (repo=%s sha=%s phase=%v summary=%s) — production wires *RealService directly; this stub is retired per PR-D",
+		repoFullName, commitSHA, phase, summary))
 }
 
 // VerifyInstallation forwards the install verification request to

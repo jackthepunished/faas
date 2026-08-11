@@ -83,17 +83,23 @@ func (c *Client) GetInstallState(ctx context.Context, accountID string) (Install
 }
 
 // ExchangeOAuthCode turns a GitHub OAuth code into an installation
-// record. Returns the new installation_id on success.
-func (c *Client) ExchangeOAuthCode(ctx context.Context, accountID, code, state string) (string, error) {
+// record. Returns (installation_id, default_branch, err) — the
+// default_branch is empty when the install handshake didn't
+// surface one (legacy installations, repository-less installs).
+// PR-D / ADR-012 §6 closure: the default_branch flows back to
+// apid's renderOAuthCallback handler so the bind picker can
+// pre-fill the production branch without a follow-up
+// VerifyInstallation RPC.
+func (c *Client) ExchangeOAuthCode(ctx context.Context, accountID, code, state string) (string, string, error) {
 	resp, err := c.cli.ExchangeOAuthCode(ctx, &githubdpb.ExchangeOAuthCodeRequest{
 		AccountId: accountID,
 		Code:      code,
 		State:     state,
 	})
 	if err != nil {
-		return "", liftErr(err)
+		return "", "", liftErr(err)
 	}
-	return resp.GetInstallationId(), nil
+	return resp.GetInstallationId(), resp.GetDefaultBranch(), nil
 }
 
 // ListInstallableRepos returns the catalog of repos the installation

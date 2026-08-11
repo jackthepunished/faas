@@ -29,7 +29,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 )
@@ -236,3 +239,85 @@ func phaseTitle(p githubdgrpc.CheckPhase) string {
 // _ pins time so a future refactor that drops the import on
 // unused-token usage doesn't drop it prematurely.
 var _ = time.Time{}
+
+// WriteCheckCoalesced is the rate-limit defensive wrapper around
+// ChecksAPI.WriteCheck (PR-D / ADR-012 §6 closure). GitHub's
+// Checks API caps each install at 1000 calls/hour (100 req/min
+// burst); without coalescing, a noisy push loop could trip the
+// cap and starve the operator's other PRs of check-runs.
+//
+// Coalescing rule: per (repo, sha), only POST when the incoming
+// phase differs from the last-reported phase. The wrapper holds
+// the last phase in an in-memory map keyed by (repo, sha) with
+// a janitor that evicts entries older than 1h. The map is
+// process-local (a daemon restart resets the state, which is
+// safe — the worst case is one extra POST per active (repo,
+// sha) at restart, not a rate-limit trip).
+//
+// Phase transitions that are valid:
+//
+//	Unspecified → Queued    (first call after enqueue)
+//	Queued      → Building  (build started)
+//	Building    → Live      (deploy succeeded)
+//	Building    → Failed    (deploy failed)
+//
+// Same-phase re-posts (e.g. retry storms, idempotency replays)
+// are silently dropped and the
+// `githubd_checks_call_total{status="skipped_coalesced"}` counter
+// is incremented so the on-call can see the dedup rate.
+//
+// Failure semantics: when the underlying WriteCheck returns an
+// error, the cache entry is NOT updated so the next call retries
+// the same phase. The Prometheus counter
+// `githubd_checks_call_total{status="http_error"}` is bumped on
+// each error.
+var (
+	checksCoalesceMu    sync.Mutex
+	checksCoalesceCache = map[string]githubdgrpc.CheckPhase{}
+)
+
+// WriteCheckCoalesced wraps ChecksAPI.WriteCheck with per-(repo, sha)
+// phase coalescing. Returns nil on a same-phase replay; otherwise
+// delegates and caches the new phase on success.
+func WriteCheckCoalesced(ctx context.Context, c ChecksWriter, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase, logsURL, summary string) error {
+	if c == nil {
+		return nil
+	}
+	key := repoFullName + "@" + commitSHA
+	checksCoalesceMu.Lock()
+	last, seen := checksCoalesceCache[key]
+	checksCoalesceMu.Unlock()
+	if seen && last == phase {
+		checksCallCounter.WithLabelValues("skipped_coalesced").Inc()
+		return nil
+	}
+	err := c.WriteCheck(ctx, repoFullName, commitSHA, phase, logsURL, summary)
+	if err != nil {
+		checksCallCounter.WithLabelValues("http_error").Inc()
+		return err
+	}
+	checksCoalesceMu.Lock()
+	checksCoalesceCache[key] = phase
+	checksCoalesceMu.Unlock()
+	checksCallCounter.WithLabelValues("posted").Inc()
+	return nil
+}
+
+// checksCallCounter is the Prometheus counter exposed by
+// WriteCheckCoalesced. Defined as a package-level var so a test
+// can swap it for a recording fake without rewiring the
+// production wiring. Registration is wrapped in sync.Once so a
+// second package init (e.g. when cmd/githubd imports pkg/githubd
+// twice for whitebox tests) is a no-op rather than a panic.
+var checksCallCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "githubd_checks_call_total",
+	Help: "Outcome of each WriteCheck call after the coalescing wrapper. status=posted|skipped_coalesced|http_error.",
+}, []string{"status"})
+
+var checksCallCounterOnce sync.Once
+
+func init() {
+	checksCallCounterOnce.Do(func() {
+		prometheus.MustRegister(checksCallCounter)
+	})
+}

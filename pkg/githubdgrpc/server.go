@@ -134,12 +134,20 @@ func (s *Server) GetInstallState(ctx context.Context, req *githubdpb.GetInstallS
 func (s *Server) ExchangeOAuthCode(ctx context.Context, req *githubdpb.ExchangeOAuthCodeRequest) (*githubdpb.ExchangeOAuthCodeResponse, error) {
 	const op = "ExchangeOAuthCode"
 	start := time.Now()
-	instID, _, err := s.svc.ExchangeOAuthCode(req.GetAccountId(), req.GetCode(), req.GetState())
+	instID, defaultBranch, err := s.svc.ExchangeOAuthCode(req.GetAccountId(), req.GetCode(), req.GetState())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, toStatusErr(err)
 	}
-	return &githubdpb.ExchangeOAuthCodeResponse{InstallationId: instID}, nil
+	// PR-D / ADR-012 §6 closure: surface default_branch on the
+	// wire. The proto field (`default_branch = 2`) has been
+	// reserved since the slice-8 proto commit; the consumer
+	// (apid's renderOAuthCallback) reads it to pre-fill the
+	// bind picker without a follow-up VerifyInstallation RPC.
+	return &githubdpb.ExchangeOAuthCodeResponse{
+		InstallationId: instID,
+		DefaultBranch:  defaultBranch,
+	}, nil
 }
 
 // ListInstallableRepos passes through to Service.ListInstallableRepos.
