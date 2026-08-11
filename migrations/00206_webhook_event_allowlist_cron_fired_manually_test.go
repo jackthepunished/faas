@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00204_webhook_event_allowlist_cron_fired_manually.sql
+// Migration-apply test for 00206_webhook_event_allowlist_cron_fired_manually.sql
 // (ADR-090 PR-D / issue #791 follow-up).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00204 against main's
+//  1. Migration set applies cleanly through 00206 against main's
 //     00194_cron_fire_now_requests.sql (no goose duplicate-version
 //     panic).
 //  2. `app_webhook_deliveries_event_chk` accepts the new audit event
@@ -29,7 +29,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00204_WebhookEventAllowlist_CronFiredManually(t *testing.T) {
+func TestMigrations_00206_WebhookEventAllowlist_CronFiredManually(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -56,7 +56,7 @@ func TestMigrations_00204_WebhookEventAllowlist_CronFiredManually(t *testing.T) 
 
 	// (2) The pre-existing `cron.fired` vocabulary still works.
 	// Pin: a forward-only widening that drops existing rows' coverage
-	// would be a regression. The DROP+ADD+VALIDATE triplet in 00204
+	// would be a regression. The DROP+ADD+VALIDATE triplet in 00206
 	// uses the wider set in step (2) and the existing rows are all
 	// within the new set by construction.
 	_, err = pool.Exec(ctx, `

@@ -1,4 +1,4 @@
--- filename: 00204_webhook_event_allowlist_cron_fired_manually.sql
+-- filename: 00206_webhook_event_allowlist_cron_fired_manually.sql
 -- +goose Up
 -- +goose StatementBegin
 
