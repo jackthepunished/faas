@@ -85,6 +85,7 @@ export type { EdgeRuleHeaderOp } from './EdgeRuleHeaderOp.js';
 export type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';
 export type { EdgeRuleIPAction } from './EdgeRuleIPAction.js';
 export type { EdgeRuleJWTAction } from './EdgeRuleJWTAction.js';
+export type { EdgeRuleLimitAction } from './EdgeRuleLimitAction.js';
 export type { EdgeRuleRedirectAction } from './EdgeRuleRedirectAction.js';
 export type { EdgeRuleResponse } from './EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
