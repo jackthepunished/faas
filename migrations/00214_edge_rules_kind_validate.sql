@@ -1,4 +1,4 @@
--- filename: 00207_edge_rules_kind_validate.sql
+-- filename: 00214_edge_rules_kind_validate.sql
 -- +goose Up
 -- +goose StatementBegin
 

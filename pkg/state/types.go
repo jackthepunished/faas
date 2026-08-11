@@ -3031,7 +3031,7 @@ const (
 	// 422 request_validation_failed without paying a cold-boot cost.
 	// Plan-gated Free-and-above (no IsPaidOnly change). Schema lives
 	// inline in action jsonb, capped at api.MaxEdgeRuleValidateSchemaBytes.
-	// See migrations/00207_edge_rules_kind_validate.sql for the
+	// See migrations/00214_edge_rules_kind_validate.sql for the
 	// schema CHECK widening.
 	EdgeRuleKindValidate EdgeRuleKind = "validate"
 )
