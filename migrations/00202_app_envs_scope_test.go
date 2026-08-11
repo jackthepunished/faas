@@ -1,21 +1,22 @@
 //go:build !no_pg
 
-// Migration-apply test for 00201_app_envs_scope.sql
+// Migration-apply test for 00202_app_envs_scope.sql
 // (ADR-090 PR-A / multi-scope app envs).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00201 (no goose
+//  1. Migration set applies cleanly through 00202 (no goose
 //     duplicate-version panic). PR-A carries reservation fences at
-//     00198, 00199, and 00200 (matching files in this directory)
-//     to satisfy TestMigrationsContiguous on the branch tip. The
-//     renumber chain was 00198 → 00199 → 00200 → 00201 as PR #819,
-//     PR #826, and PR #829 claimed the earlier slots (see
-//     migrations/00201_app_envs_scope.sql header for the full
+//     00198, 00199, 00200, and 00201 (matching files in this
+//     directory) to satisfy TestMigrationsContiguous on the
+//     branch tip. The renumber chain was
+//     00198 → 00199 → 00200 → 00201 → 00202 as PR #819, PR #826,
+//     and PR #829 claimed the earlier slots (see
+//     migrations/00202_app_envs_scope.sql header for the full
 //     chain).
 //  2. app_envs.scope column exists, is text NOT NULL, and has the
 //     DEFAULT 'default' literal (PG11+ fast-default). Every
-//     pre-00201 row gets scope='default' lazily on first read/write
+//     pre-00202 row gets scope='default' lazily on first read/write
 //     without an UPDATE rewrite, so the migration is metadata-only.
 //  3. PK is widened to (app_id, scope, key) — verified via
 //     pg_constraint (NOT pg_index.indkey which is unstable across
@@ -47,7 +48,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00201_AppEnvsScope(t *testing.T) {
+func TestMigrations_00202_AppEnvsScope(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
