@@ -1341,6 +1341,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- loop.Run(ctx) }()
 
+	// Issue #791 PR-D: fire-now is folded into loop.Run's existing
+	// LISTEN (db.NotifyCronRunNow is multiplexed onto the same
+	// long-term connection as NotifyAppChanged / NotifyDeploymentChanged
+	// / NotifySnapshotPrime — see pkg/sched/loop.go:348-352) plus a
+	// 60s safety ticker (fireNowT). Zero extra pool connections vs
+	// the pre-rebase PR-D posture; the standalone FireNowRun
+	// goroutine added a 7th long-term subscriber that tipped
+	// pool.MaxConns=8 over the edge and starved the async-invoke
+	// drain's BeginTx under e2e query bursts.
+
 	// Move 1 drain: a second goroutine inside schedd that drains the
 	// unified invocations table on a 1s safety tick + invocation_due
 	// pg_notify channel. Shares the engine + store with the cron

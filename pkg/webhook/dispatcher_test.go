@@ -260,6 +260,83 @@ func TestDispatcher_Delivered200OnFirstAttempt(t *testing.T) {
 	}
 }
 
+// TestDispatcher_CronFiredManuallyEventRoundTrip pins the
+// cron.fired.manually audit-event allowlist (issue #791 PR-D /
+// ADR-090 §"Sub-decision 7"). The webhook dispatcher doesn't filter
+// on event type — every subscribed delivery is dispatched — but the
+// row's `event` column must accept cron.fired.manually through the
+// SQL CHECK (migrations/00195) AND survive a round-trip via
+// AppWebhookDeliveryByID. This test exercises both: MemStore's
+// SQL-free path simulates the post-migration constraint by accepting
+// the value; the dispatcher fetches the row back and the field
+// round-trips byte-for-byte.
+func TestDispatcher_CronFiredManuallyEventRoundTrip(t *testing.T) {
+	m := state.NewMemStore()
+	loader, sealed := identityForSealedBlob(t)
+	appID := "app-firenow"
+	acctID := "acct-firenow"
+	if _, err := m.CreateApp(context.Background(), state.App{ID: appID, AccountID: acctID, Slug: "fire-now-app", Status: "ready"}); err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	w := newTestAppWebhook(t, m, appID, acctID, srv.URL, state.AppWebhookRetryDefault)
+	w.SecretSealed = sealed
+	if _, err := m.UpdateAppWebhook(context.Background(), w.ID, state.UpdateAppWebhookParams{WebhookSecretSealed: &sealed}); err != nil {
+		t.Fatalf("UpdateAppWebhook (reseal): %v", err)
+	}
+
+	del, err := m.RecordAppWebhookDelivery(context.Background(), state.AppWebhookDelivery{
+		WebhookID: w.ID,
+		AppID:     appID,
+		AccountID: acctID,
+		Event:     "cron.fired.manually",
+		Payload:   json.RawMessage(`{"request_id":"fedcba9876543210fedcba9876543210","cron_id":"0123456789abcdef0123456789abcdef"}`),
+	})
+	if err != nil {
+		t.Fatalf("RecordAppWebhookDelivery: %v", err)
+	}
+
+	disp := NewDispatcher(m, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	disp.IdentityLoader = loader
+	disp.Sleeper = (&recordingSleeper{}).Sleep
+	disp.HTTPClient = srv.Client()
+
+	disp.cycle(context.Background())
+
+	var gotDel state.AppWebhookDelivery
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var err error
+		gotDel, err = m.AppWebhookDeliveryByID(context.Background(), del.ID)
+		if err != nil {
+			t.Fatalf("AppWebhookDeliveryByID: %v", err)
+		}
+		if gotDel.Status == state.AppWebhookDeliverySucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts: got %d, want 1 (cron.fired.manually delivery must reach the receiver)", got)
+	}
+	if gotDel.Event != "cron.fired.manually" {
+		t.Errorf("event round-trip: got %q, want cron.fired.manually", gotDel.Event)
+	}
+	if gotDel.Status != state.AppWebhookDeliverySucceeded {
+		t.Errorf("status: got %s (last_error=%q), want succeeded", gotDel.Status, gotDel.LastError)
+	}
+}
+
 // TestDispatcher_500ThenRetry covers the retry path: 5xx →
 // MarkFailed with next_attempt_at set.
 func TestDispatcher_500ThenRetry(t *testing.T) {

@@ -877,6 +877,13 @@ func (s *server) handler() http.Handler {
 	// surface today; deployments.id remains the parent resource.
 	// Build:read scope (api.ScopesReadSurface) gates the read.
 	mux.HandleFunc("GET /v1/builds/{id}/provenance", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getBuildProvenance)))
+	// PR-D / issue #791: GET /v1/cron-fire-now-requests/{request_id} is
+	// the customer-visible read surface for the row that
+	// POST /v1/crons/{id}/run inserts. IDOR-safe byte-identical-404:
+	// bad UUID, no row, cross-account row all return the same
+	// not_found Problem body — no existence oracle. Same auth +
+	// scope as the cron-run write (ScopesReadSurface).
+	mux.HandleFunc("GET /v1/cron-fire-now-requests/{request_id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getFireCronRequest)))
 	// Builds (issue #299 / ADR-038 Phase 3). The /sbom route is the
 	// ADR-038 Phase-3 companion to /provenance — same auth, same
 	// scoping, same IDOR-safe Build → Deployment → App → AccountID

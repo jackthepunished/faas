@@ -979,6 +979,17 @@ func (c *Client) FireCron(ctx context.Context, id string) (FireCronResponse, err
 	return out, c.do(ctx, "POST", "/v1/crons/"+id+"/run", nil, &out)
 }
 
+// GetFireCronRequest is the polling surface for the cron fire-now
+// read shape (issue #791 PR-D / ADR-090 §Sub-decision 7). Pairs
+// with FireCron: clients POST to enqueue, then GET this endpoint
+// with the returned request_id until Status reaches a terminal
+// value. Read-side scope (ScopesReadSurface) — does NOT require
+// deploy:write.
+func (c *Client) GetFireCronRequest(ctx context.Context, requestID string) (FireCronRequestResponse, error) {
+	var out FireCronRequestResponse
+	return out, c.do(ctx, "GET", "/v1/cron-fire-now-requests/"+requestID, nil, &out)
+}
+
 // ListCronRuns returns a page of the cron's execution history (issue
 // #791 / PR A): newest-first, server-computed duration_ms, outcome
 // classification (success/failed/timeout/dead_letter/running).
