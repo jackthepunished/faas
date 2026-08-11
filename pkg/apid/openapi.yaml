@@ -5391,7 +5391,7 @@ paths:
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: 'code: admin_required — call requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          description: 'Code admin_required — admin-scoped Bearer + email in FAAS_ADMIN_EMAILS allowlist. PR-D widens the scope to cover per-tenant webhook secret rotation; the table-level pg_notify side-effect (installation_id) is intentional and consumed by githubd.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
