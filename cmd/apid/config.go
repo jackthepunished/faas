@@ -12,9 +12,10 @@
 // after LoadConfig in main.go and the env-overlay pattern is preserved.
 //
 // PR-0 only adds the type, LoadConfig, the Get helpers, and the Load*
-// TLS helpers (mirroring cmd/vmmd/config.go's shape). PR-A adds the
-// *WithVerifier variants; PR-B wires the verifier construction. None
-// of those land in this PR.
+// TLS helpers (mirroring cmd/vmmd/config.go's shape). PR-B adds the
+// *WithVerifier variants AND wires the verifier construction —
+// collapsed into one PR per the post-PR-823 sequencing decision
+// ("one big PR-B" instead of stacked PR-A + PR-B).
 package main
 
 import (
@@ -271,4 +272,46 @@ func (c *Config) LoadGithubdTLS() (*tls.Config, error) {
 		return nil, nil
 	}
 	return wire.LoadClientTLSConfigWithPrefix("githubd_", c.GithubdClientTLSCertPath, c.GithubdClientTLSKeyPath, c.GithubdClientTLSCAPath)
+}
+
+// LoadAdvisoryTLSWithVerifier is the PR-B (issue #678 / ADR-056) variant
+// of LoadAdvisoryTLS. When v is non-nil, installs a
+// tls.Config.VerifyPeerCertificate hook that consults v.LookupCN on the
+// verified leaf-CN after the stdlib chain/SAN/EKU check passes. When v
+// is nil (single-box dev / pre-PR-B wiring) the helper degrades to
+// LoadAdvisoryTLS — no hook installed.
+//
+// PR-B replaces the PR-A plan: instead of a small leading slice that
+// only adds *WithVerifier variants, the verifier-bearing helpers land
+// here AND the PGNodeVerifier construction + dial-site threading land
+// in cmd/apid/main.go as one combined PR. cmd/schedd already had
+// LoadServerTLSWithVerifier / LoadVMMTLSWithVerifier (issue #678 PR-A
+// in schedd's slice); apid's three Load*TLSWithVerifier siblings
+// mirror that shape.
+func (c *Config) LoadAdvisoryTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadServerTLSConfigWithPrefixAndVerifier("advisory_", c.AdvisoryTLSCertPath, c.AdvisoryTLSKeyPath, c.AdvisoryTLSCAPath, v)
+}
+
+// LoadGithubdBridgeTLSWithVerifier is the PR-B (issue #678 / ADR-056)
+// variant of LoadGithubdBridgeTLS. Same nil-verifier degradation
+// contract as LoadAdvisoryTLSWithVerifier.
+func (c *Config) LoadGithubdBridgeTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadServerTLSConfigWithPrefixAndVerifier("githubd_bridge_", c.GithubdBridgeTLSCertPath, c.GithubdBridgeTLSKeyPath, c.GithubdBridgeTLSCAPath, v)
+}
+
+// LoadGithubdTLSWithVerifier is the PR-B (issue #678 / ADR-056)
+// variant of LoadGithubdTLS — the client-side mirror used to dial
+// githubd's EnqueueBuild gRPC server. Same nil-verifier degradation
+// contract as LoadAdvisoryTLSWithVerifier.
+func (c *Config) LoadGithubdTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadClientTLSConfigWithPrefixAndVerifier("githubd_", c.GithubdClientTLSCertPath, c.GithubdClientTLSKeyPath, c.GithubdClientTLSCAPath, v)
 }
