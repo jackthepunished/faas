@@ -403,12 +403,14 @@ CREATE TABLE public.api_keys (
 CREATE TABLE public.app_envs (
     account_id uuid NOT NULL,
     app_id uuid NOT NULL,
+    scope text DEFAULT 'default' NOT NULL,
     key text NOT NULL,
     value text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     org_id uuid,
-    CONSTRAINT app_envs_key_shape CHECK (((key ~ '^[A-Z][A-Z0-9_]*$'::text) AND (length(key) <= 128)))
+    CONSTRAINT app_envs_key_shape CHECK (((key ~ '^[A-Z][A-Z0-9_]*$'::text) AND (length(key) <= 128))),
+    CONSTRAINT app_envs_scope_shape CHECK ((scope ~ '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'::text))
 );
 
 
@@ -1616,7 +1618,7 @@ ALTER TABLE ONLY public.api_keys
 --
 
 ALTER TABLE ONLY public.app_envs
-    ADD CONSTRAINT app_envs_pkey PRIMARY KEY (app_id, key);
+    ADD CONSTRAINT app_envs_pkey PRIMARY KEY (app_id, scope, key);
 
 
 --
@@ -2131,6 +2133,13 @@ CREATE INDEX api_keys_org_id_idx ON public.api_keys USING btree (org_id) WHERE (
 --
 
 CREATE INDEX api_keys_rotated_from_idx ON public.api_keys USING btree (rotated_from_id) WHERE (rotated_from_id IS NOT NULL);
+
+
+--
+-- Name: app_envs_account_app_scope_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_envs_account_app_scope_idx ON public.app_envs USING btree (account_id, app_id, scope);
 
 
 --

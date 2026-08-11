@@ -525,13 +525,23 @@ func NewMetrics() *Metrics {
 	// tlsOnDemandDenied / accountRateLimited pre-instantiation
 	// pattern above. To add a new outcome (e.g. remote_*):
 	// extend this slice; the metric name stays stable.
-	// ADR-089 PR 3 — pre-instantiate the closed (kind, outcome)
-	// cross product for every shipped kind. PR 4-7 add kinds to
-	// the outer loop; the outcome set is stable across kinds.
-	for _, kind := range []string{"route"} {
+	// ADR-089 PR 3 + PR 4 — pre-instantiate the closed (kind, outcome)
+	// cross product for every shipped kind. PR 5-7 add kinds to
+	// the outer loop (cors / jwt / ip). JWT additionally has
+	// "failed" + "missing" outcomes (the verifier path emits those
+	// — kind=jwt has more distinct failure modes than the other
+	// kinds because every sentinel error in pkg/edgejwks maps to
+	// a separate outcome for the dashboard). CORS + IP keep the
+	// closed {match, miss, blocked} triple. The closed set
+	// guarantees the §12 dashboard panel "edge rule match rate"
+	// surfaces every (kind, outcome) tuple from first scrape.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip"} {
 		for _, outcome := range []string{"match", "miss", "blocked"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
+	}
+	for _, outcome := range []string{"match", "miss", "blocked", "failed", "missing"} {
+		m.edgeRuleMatch.WithLabelValues("jwt", outcome)
 	}
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)

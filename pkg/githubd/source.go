@@ -1,5 +1,6 @@
 // Source-tree interface for githubd's push-dispatch path (PR-H,
-// repo decomposition Phase 5).
+// repo decomposition Phase 5), plus the headless source-ref stream
+// for DEPLOY-PROV-4 / ADR-092 (issue #739).
 //
 // githubd.Service.HandlePushRequest needs to read the on-disk tree
 // for the pushed commit so pkg/reconcile.Scan can run on it. The
@@ -8,6 +9,17 @@
 // adapter that closes the loop (resolve install row → unseal
 // token → call gitfetch.Fetcher → hand back a Tree) lives in
 // cmd/githubd/source_fetcher.go and implements SourceFetcher.
+//
+// The headless source-ref deploy path (POST /v1/apps/{slug}/
+// deployments/source-ref) needs the same install token + repo
+// resolution but, instead of an extracted fs.FS, wants the raw
+// tarball bytes written into a staging file. SourceRefStreamer is
+// that seam: it owns the install-row lookup, the install-token
+// unseal (via TokenCache), and the codeload GET; it returns an
+// io.ReadCloser of the response body wrapped in
+// io.LimitReader(maxArchiveBytes + 1, …). The caller (apid's
+// handleSourceRefDeploy) is responsible for piping the body into
+// validateAndSpool.
 //
 // Splitting the interface from the implementation keeps pkg/githubd
 // free of pgx/age/secretbox imports (the package has unit tests
@@ -20,6 +32,7 @@ package githubd
 
 import (
 	"context"
+	"io"
 	"io/fs"
 )
 
@@ -60,4 +73,41 @@ type SourceTree interface {
 //     leak the temp dir.
 type SourceFetcher interface {
 	Fetch(ctx context.Context, accountID string, installID int64, repoFullName, commitSHA string) (SourceTree, error)
+}
+
+// SourceRefStreamer streams the raw tar.gz bytes for a (repo, ref)
+// pair over the durable install's GitHub App installation token
+// (DEPLOY-PROV-4 / ADR-092, issue #739). It is the gRPC bridge
+// behind POST /v1/apps/{slug}/deployments/source-ref — apid dials
+// it via StreamSourceRef, pipes the returned io.ReadCloser into
+// validateAndSpool (cmd/apid/deploy_inputs.go:218), then os.Rename's
+// the staged file to FAAS_SPOOL_ROOT/<id>.tar.gz.
+//
+// Implementations must:
+//
+//   - Resolve the install row for accountID (the install token is
+//     sealed at rest in state.GitHubInstall.SealedToken). The
+//     install_id is NOT re-validated against inst.InstallationID
+//     here — the apid handler passes the durable install_id it
+//     pulled from state.GitHubInstallForAccount, so the row's
+//     own installation_id is authoritative. Mismatch is a config
+//     bug, not a security one (no cross-account take-over is
+//     possible because accountID gates the row lookup).
+//   - Mint (or refresh) the install token via TokenCache.Token —
+//     singleflight + 5-min proactive refresh keeps the cached
+//     token under 55 min of GitHub's 1 h TTL. On 401 from
+//     codeload: TokenCache.Invalidate + retry once. On retry
+//     401: surface ErrSourceRefUnavailable (mirrors
+//     source_fetcher.go's ErrUnauthorized / ErrNotFound
+//     surface).
+//   - Enforce maxArchiveBytes on the streaming body via
+//     io.LimitReader — capBytes=0 disables the cap (tests).
+//   - Honour ctx cancellation: a cancelled apid handler bails
+//     before the tarball is fully read; the body is drained +
+//     closed in the same defer.
+//   - Scope the bearer token to a single Stream call. The token
+//     must NEVER escape this function — not in logs, not in
+//     URLs, not in the response body, not in any error string.
+type SourceRefStreamer interface {
+	Stream(ctx context.Context, accountID string, installID int64, repoFullName, ref string, maxArchiveBytes int64) (io.ReadCloser, error)
 }

@@ -9,6 +9,7 @@ import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
 import type { ScanResult } from '../models/ScanResult.js';
+import type { SourceRefDeployRequest } from '../models/SourceRefDeployRequest.js';
 import type { UpdateDeploymentTrafficRequest } from '../models/UpdateDeploymentTrafficRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
@@ -64,6 +65,73 @@ export class DeploymentsService {
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Create a deployment from a Git source-ref (headless).
+   * Headless deploy path (issue #739 / DEPLOY-PROV-4 / ADR-092).
+   * Resolves the GitHub install bound to the caller's account,
+   * fetches the (repo, ref) tarball via the githubd bridge, spools
+   * it under the per-plan SourceTarballMaxMB cap, validates shape,
+   * and enqueues a build (Kind=DeploymentKindGitHub) pinned to
+   * the resolved 40-char commit SHA.
+   *
+   * Designed for CI runners: bearer token only, no GitHub env
+   * vars required. Idempotency-Key collapses concurrent / retried
+   * CI jobs into one build row.
+   *
+   * Distinct from the dashboard bind path (`POST
+   * /v1/apps/{slug}/deployments` with a `source` multipart
+   * upload) which goes through the browser + UI bind picker.
+   *
+   * @returns DeploymentResponse The source-ref deployment whose build has been accepted and queued.
+   * @throws ApiError
+   */
+  public static createDeploymentFromSourceRef({
+    slug,
+    requestBody,
+    idempotencyKey,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    requestBody: SourceRefDeployRequest,
+    /**
+     * Idempotency key for the POST. Stored for 24h. On replay the server
+     * returns the original response with `Idempotent-Replayed: true`.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<DeploymentResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/deployments/source-ref',
+      path: {
+        'slug': slug,
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: invalid_ref | validation_failed. ref must be a 40-char
+        SHA, branch, or tag.
+        `,
+        401: `code: unauthorized`,
+        404: `No durable GitHub install bound to the caller's account
+        (code: github_install_not_found).
+        `,
+        413: `code: source_too_large`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        503: `githubd unreachable or source-ref tarball fetch failed
+        (code: source_ref_unavailable). Retry in ~30s.
         `,
       },
     });

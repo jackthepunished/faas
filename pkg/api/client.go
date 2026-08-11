@@ -648,6 +648,25 @@ func (c *Client) DeployMultipart(ctx context.Context, slug string, source io.Rea
 	return out, c.doReq(c.uploadHTTP(), req, &out)
 }
 
+// DeployFromSourceRef is the headless CI deploy path (issue #739 /
+// DEPLOY-PROV-4 / ADR-092). Caller supplies a GitHub repo slug and
+// the ref they want to deploy — branch, tag, or 40-char SHA — and
+// apid resolves the durable install, mints an install-token via
+// githubd, fetches the codeload tarball, spools it under the
+// per-plan SourceTarballMaxMB cap, and enqueues a build pinned to
+// the resolved commit SHA. The full Idempotency-Key envelope is
+// auto-minted by c.do; CI retries with the same key fold into one
+// build row.
+//
+// Format: PR-A only supports "tarball". The field is required by
+// the wire shape but the server enforces it; passing an empty
+// string keeps callers forward-compat when a future format lands.
+func (c *Client) DeployFromSourceRef(ctx context.Context, slug string, req SourceRefDeployRequest) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "POST",
+		"/v1/apps/"+slug+"/deployments/source-ref", req, &out)
+}
+
 // GetApp returns the app metadata for a slug.
 func (c *Client) GetApp(ctx context.Context, slug string) (AppResponse, error) {
 	var out AppResponse

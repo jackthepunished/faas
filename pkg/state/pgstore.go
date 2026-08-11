@@ -10143,7 +10143,7 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	// walk — see pkg/rekey/rekey.go for the cursor semantics.
 	if cursor == "" {
 		rows, err := s.pool.Query(ctx,
-			`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+			`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 			 from app_secrets
 			 order by account_id asc, app_id asc, key asc
 			 limit $1`,
@@ -10168,7 +10168,7 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	}
 	curAcct, curApp, curKey := parts[0], parts[1], parts[2]
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+		`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 		 from app_secrets
 		 where (account_id, app_id, key) >= ($1::uuid, $2::uuid, $3)
 		 order by account_id asc, app_id asc, key asc
@@ -10447,29 +10447,84 @@ func (s *PgStore) MarkAppRegistryCredentialUsed(ctx context.Context, accountID, 
 // schedd reads via ListAppEnv at wake time and ships the rows on the
 // AppSpec wire.
 
-// UpsertAppEnv inserts or replaces the (app_id, key) env row. updated_at
-// is bumped on conflict so schedd's "freshest per app" staging path
-// observes a fresh mtime on every write — same posture as the secrets
-// table (rotation flows re-PUT without changing the value are still
-// treated as a write).
+// UpsertAppEnv inserts or replaces the (app_id, scope='default', key)
+// env row. updated_at is bumped on conflict so schedd's "freshest per
+// app" staging path observes a fresh mtime on every write — same
+// posture as the secrets table (rotation flows re-PUT without changing
+// the value are still treated as a write).
+//
+// ADR-090 PR-A: the underlying PK is (app_id, scope, key) post-00203,
+// so the flat writers hardcode scope='default' at the SQL boundary.
+// Use UpsertAppEnvInScope for any other scope.
 func (s *PgStore) UpsertAppEnv(ctx context.Context, accountID, appID, key, value string) error {
+	return s.UpsertAppEnvInScope(ctx, accountID, appID, "default", key, value)
+}
+
+// DeleteAppEnv removes the (app_id, scope='default', key) row scoped
+// to accountID. Returns ErrNotFound when no row matches — handler
+// renders 400 CodeEnvVarNotFound.
+//
+// ADR-090 PR-A: hardcodes scope='default' (see UpsertAppEnv).
+func (s *PgStore) DeleteAppEnv(ctx context.Context, accountID, appID, key string) error {
+	return s.DeleteAppEnvInScope(ctx, accountID, appID, "default", key)
+}
+
+// ListAppEnv returns every (key, value) row on the app where
+// scope='default', scoped to accountID. Order: by scope ASC, key ASC
+// for deterministic staging (the flat reader sees the same ordering
+// as pre-00203 because all its rows share scope='default'). Returns
+// nil slice when the app has no env rows.
+//
+// ADR-090 PR-A: the WHERE clause adds `scope='default'` so the flat
+// reader keeps seeing the pre-PR row set. The composite index
+// `app_envs_account_app_scope_idx (account_id, app_id, scope)` makes
+// the (account_id, app_id, scope) prefix a single index scan.
+func (s *PgStore) ListAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error) {
+	return s.ListAppEnvInScope(ctx, accountID, appID, "default")
+}
+
+// CountAppEnv is the quota helper used by apid's PUT handler to enforce
+// Limits.EnvVarsMax BEFORE UpsertAppEnv. Counts ALL scope values for
+// the app per ADR-090 D6 (EnvVarsMax is per-app, not per-scope).
+// Mirrors CountAppSecrets.
+//
+// ADR-090 PR-A: the WHERE clause drops the scope filter (per-D6
+// per-app semantics). PR-B's per-scope quota enforcement (if it
+// lands) uses CountAppEnvInScope instead.
+func (s *PgStore) CountAppEnv(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from app_envs where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
+// UpsertAppEnvInScope is the scope-aware sibling of UpsertAppEnv.
+// Inserts or replaces the (app_id, scope, key) row using the
+// caller-supplied scope. The 3-column PK upsert guarantees the on
+// conflict targets the right tuple regardless of the scope value.
+//
+// Reserved for PR-B's `?scope=` API handler and PR-C's
+// wake-time scope overlay. PR-A only verifies the surface compiles
+// and the flat wrappers delegate correctly.
+func (s *PgStore) UpsertAppEnvInScope(ctx context.Context, accountID, appID, scope, key, value string) error {
 	_, err := s.pool.Exec(ctx,
-		`insert into app_envs (account_id, app_id, key, value)
-		 values ($1, $2, $3, $4)
-		 on conflict (app_id, key) do update
+		`insert into app_envs (account_id, app_id, scope, key, value)
+		 values ($1, $2, $3, $4, $5)
+		 on conflict (app_id, scope, key) do update
 		   set value = excluded.value,
 		       updated_at = now()`,
-		accountID, appID, key, value)
+		accountID, appID, scope, key, value)
 	return err
 }
 
-// DeleteAppEnv removes the (app_id, key) row scoped to accountID.
-// Returns ErrNotFound when no row matches — handler renders 400
-// CodeEnvVarNotFound.
-func (s *PgStore) DeleteAppEnv(ctx context.Context, accountID, appID, key string) error {
+// DeleteAppEnvInScope is the scope-aware sibling of DeleteAppEnv.
+// Removes the (app_id, scope, key) row scoped to accountID. Returns
+// ErrNotFound when no row matches.
+func (s *PgStore) DeleteAppEnvInScope(ctx context.Context, accountID, appID, scope, key string) error {
 	tag, err := s.pool.Exec(ctx,
-		`delete from app_envs where account_id = $1 and app_id = $2 and key = $3`,
-		accountID, appID, key)
+		`delete from app_envs where account_id = $1 and app_id = $2 and scope = $3 and key = $4`,
+		accountID, appID, scope, key)
 	if err != nil {
 		return err
 	}
@@ -10479,16 +10534,17 @@ func (s *PgStore) DeleteAppEnv(ctx context.Context, accountID, appID, key string
 	return nil
 }
 
-// ListAppEnv returns every (key, value) row on the app, scoped to
-// accountID. Order: by key ASC for deterministic staging (mirrors
-// ListAppSecrets). Returns nil slice when the app has no env rows.
-func (s *PgStore) ListAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error) {
+// ListAppEnvInScope is the scope-aware sibling of ListAppEnv. Returns
+// every (key, value) row on the app where scope matches the
+// caller-supplied value, scoped to accountID. Order: by scope ASC,
+// key ASC for deterministic staging.
+func (s *PgStore) ListAppEnvInScope(ctx context.Context, accountID, appID, scope string) ([]AppEnv, error) {
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, key, value, created_at, updated_at
+		`select account_id, app_id, scope, key, value, created_at, updated_at
 		 from app_envs
-		 where account_id = $1 and app_id = $2
-		 order by key asc`,
-		accountID, appID)
+		 where account_id = $1 and app_id = $2 and scope = $3
+		 order by scope asc, key asc`,
+		accountID, appID, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -10496,7 +10552,7 @@ func (s *PgStore) ListAppEnv(ctx context.Context, accountID, appID string) ([]Ap
 	var out []AppEnv
 	for rows.Next() {
 		var e AppEnv
-		if err := rows.Scan(&e.AccountID, &e.AppID, &e.Key, &e.Value, &e.CreatedAt, &e.UpdatedAt); err != nil {
+		if err := rows.Scan(&e.AccountID, &e.AppID, &e.Scope, &e.Key, &e.Value, &e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -10504,13 +10560,15 @@ func (s *PgStore) ListAppEnv(ctx context.Context, accountID, appID string) ([]Ap
 	return out, rows.Err()
 }
 
-// CountAppEnv is the quota helper used by apid's PUT handler to enforce
-// Limits.EnvVarsMax BEFORE UpsertAppEnv. Mirrors CountAppSecrets.
-func (s *PgStore) CountAppEnv(ctx context.Context, accountID, appID string) (int, error) {
+// CountAppEnvInScope is the scope-aware sibling of CountAppEnv.
+// Counts only rows where scope matches the caller-supplied value.
+// Reserved for future per-scope caps (ADR-091 follow-up); PR-A does
+// not call it.
+func (s *PgStore) CountAppEnvInScope(ctx context.Context, accountID, appID, scope string) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,
-		`select count(*) from app_envs where account_id = $1 and app_id = $2`,
-		accountID, appID).Scan(&n)
+		`select count(*) from app_envs where account_id = $1 and app_id = $2 and scope = $3`,
+		accountID, appID, scope).Scan(&n)
 	return n, err
 }
 

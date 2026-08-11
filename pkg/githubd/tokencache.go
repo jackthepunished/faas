@@ -223,6 +223,27 @@ func (c *TokenCache) Invalidate(installationID int64) {
 	c.mu.Unlock()
 }
 
+// ExpiresAt returns the cached entry's expiry timestamp for the
+// given installation_id (zero time + ErrNotFound-equivalent
+// false if the cache is empty). Used by MintInstallationToken
+// (DEPLOY-PROV-4 / ADR-092, issue #739) so apid can stamp the
+// apid-side install-token cache with the GitHub-reported
+// expiry — the apid cache short-circuits the cache-miss
+// round-trip on the next call without depending on githubd's
+// internal refresh schedule.
+//
+// Returns (zero time, false) on a cache miss so the caller can
+// distinguish "we don't know" from "expires at T".
+func (c *TokenCache) ExpiresAt(installationID int64) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.items[installationID]
+	if !ok {
+		return time.Time{}, false
+	}
+	return entry.expiresAt, true
+}
+
 // Size returns the current number of cached entries (for
 // /metrics).
 func (c *TokenCache) Size() int {

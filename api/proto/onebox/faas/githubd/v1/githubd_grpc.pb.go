@@ -42,6 +42,8 @@ const (
 	Githubd_EnqueueBuild_FullMethodName             = "/onebox.faas.githubd.v1.Githubd/EnqueueBuild"
 	Githubd_WriteCheck_FullMethodName               = "/onebox.faas.githubd.v1.Githubd/WriteCheck"
 	Githubd_VerifyInstallation_FullMethodName       = "/onebox.faas.githubd.v1.Githubd/VerifyInstallation"
+	Githubd_MintInstallationToken_FullMethodName    = "/onebox.faas.githubd.v1.Githubd/MintInstallationToken"
+	Githubd_StreamSourceRef_FullMethodName          = "/onebox.faas.githubd.v1.Githubd/StreamSourceRef"
 )
 
 // GithubdClient is the client API for Githubd service.
@@ -128,6 +130,48 @@ type GithubdClient interface {
 	// install-belongs-to-the-app half; the install-belongs-to-the-user
 	// half lands here).
 	VerifyInstallation(ctx context.Context, in *VerifyInstallationRequest, opts ...grpc.CallOption) (*VerifyInstallationResponse, error)
+	// MintInstallationToken returns a fresh installation token for
+	// the given (account, installation_id). The token is the canonical
+	// shape githubd's TokenCache hands out (pkg/githubd/tokencache.go)
+	// — sealed in transit over the apid↔githubd unix socket, scoped
+	// to the single RPC. apid's source-ref deploy handler calls this
+	// to authenticate the codeload fetch when no installation is
+	// available locally (DEPLOY-PROV-4 / ADR-092, issue #739).
+	//
+	// Errors:
+	//   - NOT_FOUND when the durable install row is missing for the
+	//     account (the dashboard `gregale connect` flow has not run).
+	//   - UNAVAILABLE when githubd's TokenCache is mid-refresh and the
+	//     api.github.com round-trip failed.
+	MintInstallationToken(ctx context.Context, in *MintInstallationTokenRequest, opts ...grpc.CallOption) (*MintInstallationTokenResponse, error)
+	// StreamSourceRef streams the raw tar.gz archive for a
+	// (repo, ref) pair over the durable install's installation
+	// token (DEPLOY-PROV-4 / ADR-092, issue #739). apid's
+	// handleSourceRefDeploy calls this RPC, pipes the returned
+	// bytes into validateAndSpool, and os.Renames the staged
+	// file to FAAS_SPOOL_ROOT/<id>.tar.gz.
+	//
+	// The streaming wire shape is preferred over a unary
+	// (io.ReadCloser-shaped) return so a Free-plan tarball that
+	// exceeds SourceTarballMaxMB can be rejected mid-flight
+	// (server-initiated cancellation) rather than buffered
+	// entirely in memory. githubd applies
+	// io.LimitReader(max_archive_bytes + 1, …) on the server
+	// side; a cap overflow surfaces as a chunk carrying
+	// `truncated=true` and the apid handler rolls the spool
+	// file back.
+	//
+	// Errors:
+	//   - NOT_FOUND when the durable install row is missing.
+	//   - INVALID_ARGUMENT when the (repo, ref) fails
+	//     validation.
+	//   - UNAUTHENTICATED when the installation token is
+	//     rejected by codeload.github.com after one
+	//     cache-invalidate + retry (api maps to
+	//     503 source_ref_unavailable per ADR-092 §3.7).
+	//   - UNAVAILABLE when githubd is down or codeload
+	//     returns 5xx.
+	StreamSourceRef(ctx context.Context, in *StreamSourceRefRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamSourceRefChunk], error)
 }
 
 type githubdClient struct {
@@ -238,6 +282,35 @@ func (c *githubdClient) VerifyInstallation(ctx context.Context, in *VerifyInstal
 	return out, nil
 }
 
+func (c *githubdClient) MintInstallationToken(ctx context.Context, in *MintInstallationTokenRequest, opts ...grpc.CallOption) (*MintInstallationTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MintInstallationTokenResponse)
+	err := c.cc.Invoke(ctx, Githubd_MintInstallationToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *githubdClient) StreamSourceRef(ctx context.Context, in *StreamSourceRefRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamSourceRefChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Githubd_ServiceDesc.Streams[0], Githubd_StreamSourceRef_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamSourceRefRequest, StreamSourceRefChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Githubd_StreamSourceRefClient = grpc.ServerStreamingClient[StreamSourceRefChunk]
+
 // GithubdServer is the server API for Githubd service.
 // All implementations must embed UnimplementedGithubdServer
 // for forward compatibility.
@@ -322,6 +395,48 @@ type GithubdServer interface {
 	// install-belongs-to-the-app half; the install-belongs-to-the-user
 	// half lands here).
 	VerifyInstallation(context.Context, *VerifyInstallationRequest) (*VerifyInstallationResponse, error)
+	// MintInstallationToken returns a fresh installation token for
+	// the given (account, installation_id). The token is the canonical
+	// shape githubd's TokenCache hands out (pkg/githubd/tokencache.go)
+	// — sealed in transit over the apid↔githubd unix socket, scoped
+	// to the single RPC. apid's source-ref deploy handler calls this
+	// to authenticate the codeload fetch when no installation is
+	// available locally (DEPLOY-PROV-4 / ADR-092, issue #739).
+	//
+	// Errors:
+	//   - NOT_FOUND when the durable install row is missing for the
+	//     account (the dashboard `gregale connect` flow has not run).
+	//   - UNAVAILABLE when githubd's TokenCache is mid-refresh and the
+	//     api.github.com round-trip failed.
+	MintInstallationToken(context.Context, *MintInstallationTokenRequest) (*MintInstallationTokenResponse, error)
+	// StreamSourceRef streams the raw tar.gz archive for a
+	// (repo, ref) pair over the durable install's installation
+	// token (DEPLOY-PROV-4 / ADR-092, issue #739). apid's
+	// handleSourceRefDeploy calls this RPC, pipes the returned
+	// bytes into validateAndSpool, and os.Renames the staged
+	// file to FAAS_SPOOL_ROOT/<id>.tar.gz.
+	//
+	// The streaming wire shape is preferred over a unary
+	// (io.ReadCloser-shaped) return so a Free-plan tarball that
+	// exceeds SourceTarballMaxMB can be rejected mid-flight
+	// (server-initiated cancellation) rather than buffered
+	// entirely in memory. githubd applies
+	// io.LimitReader(max_archive_bytes + 1, …) on the server
+	// side; a cap overflow surfaces as a chunk carrying
+	// `truncated=true` and the apid handler rolls the spool
+	// file back.
+	//
+	// Errors:
+	//   - NOT_FOUND when the durable install row is missing.
+	//   - INVALID_ARGUMENT when the (repo, ref) fails
+	//     validation.
+	//   - UNAUTHENTICATED when the installation token is
+	//     rejected by codeload.github.com after one
+	//     cache-invalidate + retry (api maps to
+	//     503 source_ref_unavailable per ADR-092 §3.7).
+	//   - UNAVAILABLE when githubd is down or codeload
+	//     returns 5xx.
+	StreamSourceRef(*StreamSourceRefRequest, grpc.ServerStreamingServer[StreamSourceRefChunk]) error
 	mustEmbedUnimplementedGithubdServer()
 }
 
@@ -361,6 +476,12 @@ func (UnimplementedGithubdServer) WriteCheck(context.Context, *WriteCheckRequest
 }
 func (UnimplementedGithubdServer) VerifyInstallation(context.Context, *VerifyInstallationRequest) (*VerifyInstallationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyInstallation not implemented")
+}
+func (UnimplementedGithubdServer) MintInstallationToken(context.Context, *MintInstallationTokenRequest) (*MintInstallationTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MintInstallationToken not implemented")
+}
+func (UnimplementedGithubdServer) StreamSourceRef(*StreamSourceRefRequest, grpc.ServerStreamingServer[StreamSourceRefChunk]) error {
+	return status.Error(codes.Unimplemented, "method StreamSourceRef not implemented")
 }
 func (UnimplementedGithubdServer) mustEmbedUnimplementedGithubdServer() {}
 func (UnimplementedGithubdServer) testEmbeddedByValue()                 {}
@@ -563,6 +684,35 @@ func _Githubd_VerifyInstallation_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Githubd_MintInstallationToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MintInstallationTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GithubdServer).MintInstallationToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Githubd_MintInstallationToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GithubdServer).MintInstallationToken(ctx, req.(*MintInstallationTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Githubd_StreamSourceRef_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamSourceRefRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GithubdServer).StreamSourceRef(m, &grpc.GenericServerStream[StreamSourceRefRequest, StreamSourceRefChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Githubd_StreamSourceRefServer = grpc.ServerStreamingServer[StreamSourceRefChunk]
+
 // Githubd_ServiceDesc is the grpc.ServiceDesc for Githubd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -610,7 +760,17 @@ var Githubd_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "VerifyInstallation",
 			Handler:    _Githubd_VerifyInstallation_Handler,
 		},
+		{
+			MethodName: "MintInstallationToken",
+			Handler:    _Githubd_MintInstallationToken_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamSourceRef",
+			Handler:       _Githubd_StreamSourceRef_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "onebox/faas/githubd/v1/githubd.proto",
 }

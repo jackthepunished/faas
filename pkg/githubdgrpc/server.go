@@ -2,6 +2,7 @@ package githubdgrpc
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"time"
 
@@ -46,6 +47,30 @@ type Service interface {
 	// (verified=false, err=nil) accountLogin is empty so a forged
 	// caller cannot learn whether the install exists.
 	VerifyInstallation(installationID int64, expectedLogin string) (verified bool, accountLogin string, defaultBranch string, err error)
+
+	// MintInstallationToken returns a fresh installation token for
+	// (accountID, installationID) (DEPLOY-PROV-4 / ADR-092, issue #739).
+	// The token is the canonical shape githubd's TokenCache hands out
+	// — apid's source-ref deploy handler calls this RPC to
+	// authenticate the codeload fetch when no installation is
+	// available locally. The Service seam forces a fresh mint so a CI
+	// runner that just got a 401 from codeload can retry without
+	// waiting for the proactive refresh window. expiresAt is the
+	// GitHub-reported expiry timestamp; apid stamps it on its
+	// install-token cache so the next call can short-circuit a
+	// cache miss.
+	MintInstallationToken(accountID string, installationID int64) (token string, expiresAt time.Time, err error)
+
+	// StreamSourceRef streams the raw tar.gz archive for a
+	// (repo, ref) pair over the durable install's installation token
+	// (DEPLOY-PROV-4 / ADR-092, issue #739). The returned
+	// io.ReadCloser is the response body wrapped in
+	// io.LimitReader(maxArchiveBytes + 1, …); the caller (apid's
+	// handleSourceRefDeploy) is responsible for piping it into
+	// validateAndSpool. The truncated flag surfaces when the cap
+	// is hit; bytesStreamed is the post-cap cumulative count for
+	// the deployment row's source_bytes column.
+	StreamSourceRef(ctx context.Context, accountID string, installationID int64, repoFullName, ref string, maxArchiveBytes int64) (rc io.ReadCloser, truncated bool, bytesStreamed int64, err error)
 }
 
 // Server implements githubdpb.GithubdServer. It wraps a Service so
@@ -229,6 +254,90 @@ func (s *Server) VerifyInstallation(ctx context.Context, req *githubdpb.VerifyIn
 	}, nil
 }
 
+// MintInstallationToken passes through to Service.MintInstallationToken
+// (DEPLOY-PROV-4 / ADR-092, issue #739). Called by apid's
+// handleSourceRefDeploy so the install-token-bound codeload fetch
+// can authenticate without the token ever crossing the apid process
+// boundary (it stays scoped to the unary RPC response).
+//
+// Errors map:
+//   - githubd.ErrNoBinding → codes.NotFound (the apid handler turns
+//     this into 404 + code=github_install_not_found).
+//   - any other error → codes.Unavailable via toStatusErr.
+func (s *Server) MintInstallationToken(ctx context.Context, req *githubdpb.MintInstallationTokenRequest) (*githubdpb.MintInstallationTokenResponse, error) {
+	const op = "MintInstallationToken"
+	start := time.Now()
+	token, expiresAt, err := s.svc.MintInstallationToken(req.GetAccountId(), req.GetInstallationId())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		return nil, toStatusErr(err)
+	}
+	return &githubdpb.MintInstallationTokenResponse{
+		Token:     token,
+		ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+	}, nil
+}
+
+// StreamSourceRef passes through to Service.StreamSourceRef
+// (DEPLOY-PROV-4 / ADR-092, issue #739). Called by apid's
+// handleSourceRefDeploy; the server-streaming wire shape lets
+// a Free-plan tarball that exceeds SourceTarballMaxMB be rejected
+// mid-flight (chunk carrying truncated=true) rather than
+// buffered entirely in memory. bytes_streamed is echoed on the
+// final chunk so apid can record source_bytes on the deployment
+// row without summing data fields.
+//
+// Errors map:
+//   - githubd.ErrNoBinding → codes.NotFound.
+//   - gitfetch.ErrBadArchive (wrapped) → codes.InvalidArgument.
+//   - gitfetch.ErrUnauthorized (wrapped) → codes.Unauthenticated.
+//   - any other error → codes.Unavailable via toStatusErr.
+//
+// The streaming body is consumed server-side; once the stream
+// completes the inner io.ReadCloser is closed. The chunk loop
+// reads in 32 KiB frames (a conservative mid-point between
+// gRPC's default 16 KiB chunk and the codeload archive's
+// typical block size).
+func (s *Server) StreamSourceRef(req *githubdpb.StreamSourceRefRequest, stream grpc.ServerStreamingServer[githubdpb.StreamSourceRefChunk]) error {
+	const op = "StreamSourceRef"
+	start := time.Now()
+	rc, truncated, total, err := s.svc.StreamSourceRef(
+		stream.Context(),
+		req.GetAccountId(),
+		req.GetInstallationId(),
+		req.GetRepoFullName(),
+		req.GetRef(),
+		req.GetMaxArchiveBytes(),
+	)
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		return toStatusErr(err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	const chunkSize = 32 * 1024
+	buf := make([]byte, chunkSize)
+	for {
+		n, rerr := rc.Read(buf)
+		if n > 0 {
+			chunk := &githubdpb.StreamSourceRefChunk{
+				Data:          append([]byte(nil), buf[:n]...),
+				BytesStreamed: total,
+				Truncated:     truncated && rerr == io.EOF,
+			}
+			if serr := stream.Send(chunk); serr != nil {
+				return toStatusErr(serr)
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return toStatusErr(rerr)
+		}
+	}
+}
+
 // toStatusErr converts a Service error to a gRPC status error. It
 // preserves an existing *status.Status (so slice 1's codes.Unimplemented
 // survives the round-trip), wraps *api.Problem via grpcerr.ToStatus
@@ -301,4 +410,24 @@ func (UnimplementedService) WriteCheck(string, string, CheckPhase, string, strin
 // without committing to the verify-via-GitHub-API shape.
 func (UnimplementedService) VerifyInstallation(int64, string) (bool, string, string, error) {
 	return false, "", "", status.Error(codes.Unimplemented, "githubd: VerifyInstallation not yet wired (slice 8)")
+}
+
+// MintInstallationToken returns Unimplemented. Replaced by the real
+// githubd.RealService (cmd/githubd/realservice.go) for the DEPLOY-PROV-4
+// / ADR-092 (issue #739) source-ref deploy path. The slice-1 / test
+// build keeps returning Unimplemented so the round-trip exercises
+// the gRPC plumbing without committing to the TokenCache-backed
+// shape before PR-A lands.
+func (UnimplementedService) MintInstallationToken(string, int64) (string, time.Time, error) {
+	return "", time.Time{}, status.Error(codes.Unimplemented, "githubd: MintInstallationToken not yet wired (DEPLOY-PROV-4)")
+}
+
+// StreamSourceRef returns Unimplemented. Replaced by the real
+// githubd.RealService (cmd/githubd/realservice.go) for the
+// DEPLOY-PROV-4 / ADR-092 (issue #739) source-ref deploy path.
+// The slice-1 / test build keeps returning Unimplemented so the
+// round-trip exercises the gRPC plumbing without committing to
+// the codeload-streaming shape before PR-A lands.
+func (UnimplementedService) StreamSourceRef(context.Context, string, int64, string, string, int64) (io.ReadCloser, bool, int64, error) {
+	return nil, false, 0, status.Error(codes.Unimplemented, "githubd: StreamSourceRef not yet wired (DEPLOY-PROV-4)")
 }

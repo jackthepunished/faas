@@ -1,5 +1,7 @@
 //go:build !linux
 
+//nolint:unused
+
 // Non-linux stub (issue #463 / ADR-069 / ADR-071 / PR-C). The
 // linux proxy uses unix.AF_VSOCK + unix.SOCK_DGRAM, which
 // doesn't exist off the linux kernel. The test binary that
@@ -9,7 +11,8 @@
 // sidecar_events_proxy_linux.go build. The "no signal"
 // contract is preserved by returning nil from every method on
 // a nil receiver.
-
+//
+//nolint:unused
 package main
 
 import "log/slog"

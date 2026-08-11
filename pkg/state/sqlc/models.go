@@ -150,6 +150,7 @@ type App struct {
 type AppEnv struct {
 	AccountID pgtype.UUID
 	AppID     pgtype.UUID
+	Scope     string
 	Key       string
 	Value     string
 	CreatedAt pgtype.Timestamptz

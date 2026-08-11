@@ -2894,23 +2894,56 @@ type Store interface {
 	// four methods mirror the secrets surface 1:1 minus the ciphertext
 	// argument — values are stored as TEXT, not sealed bytea.
 	//
-	// UpsertAppEnv writes-or-replaces the (app_id, key) row. accountID
-	// is passed for ownership verification; the row also stores
+	// UpsertAppEnv writes-or-replaces the (app_id, scope, key) row,
+	// hardcoding scope='default'. Use UpsertAppEnvInScope for any
+	// scope other than 'default' (PR-B / PR-C wake). accountID is
+	// passed for ownership verification; the row also stores
 	// account_id for the account-scoped delete path and the G6 GDPR
 	// cascade.
 	UpsertAppEnv(ctx context.Context, accountID, appID, key, value string) error
-	// DeleteAppEnv removes the (app_id, key) row. Returns ErrNotFound
-	// if the row doesn't exist — handlers render 400 CodeEnvVarNotFound
-	// (intentional: URL resource IS the env-var name).
+	// DeleteAppEnv removes the (app_id, scope='default', key) row.
+	// Returns ErrNotFound if the row doesn't exist — handlers render
+	// 400 CodeEnvVarNotFound (intentional: URL resource IS the
+	// env-var name). Use DeleteAppEnvInScope for non-default scopes.
 	DeleteAppEnv(ctx context.Context, accountID, appID, key string) error
-	// ListAppEnv returns every env row on the app, scoped to
-	// accountID. Order: by key ASC for deterministic wake staging.
-	// Returns nil slice (not error) when the app has no env rows —
-	// schedd treats that as "no env.json to write".
+	// ListAppEnv returns every env row on the app where scope =
+	// 'default', scoped to accountID. Order: by scope ASC, key ASC
+	// for deterministic wake staging (the flat reader sees the same
+	// ordering as pre-00203 because all its rows share
+	// scope='default'). Returns nil slice (not error) when the app
+	// has no env rows — schedd treats that as "no env.json to
+	// write". Use ListAppEnvInScope for non-default scopes.
 	ListAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error)
 	// CountAppEnv is the quota check helper. apid calls it before
-	// UpsertAppEnv to enforce Limits.EnvVarsMax.
+	// UpsertAppEnv to enforce Limits.EnvVarsMax — counts ALL scope
+	// values for the app per ADR-090 D6 (EnvVarsMax is per-app, not
+	// per-scope). Use CountAppEnvInScope for future per-scope caps
+	// (ADR-091 follow-up).
 	CountAppEnv(ctx context.Context, accountID, appID string) (int, error)
+
+	// UpsertAppEnvInScope is the scope-aware sibling of UpsertAppEnv
+	// (ADR-090 PR-B / PR-C). Writes-or-replaces the (app_id, scope,
+	// key) row with the caller-supplied scope. The flat methods
+	// (UpsertAppEnv / DeleteAppEnv / ListAppEnv / CountAppEnv) are
+	// thin wrappers that hardcode scope='default' and are kept
+	// non-breaking so the wake-time reader in
+	// pkg/sched/engine.go:4153-4167 (loadAPIEnv) keeps working
+	// until PR-C's nested-decode path lands.
+	UpsertAppEnvInScope(ctx context.Context, accountID, appID, scope, key, value string) error
+	// DeleteAppEnvInScope is the scope-aware sibling of DeleteAppEnv.
+	// Returns ErrNotFound when no row matches the (app_id, scope,
+	// key) tuple.
+	DeleteAppEnvInScope(ctx context.Context, accountID, appID, scope, key string) error
+	// ListAppEnvInScope is the scope-aware sibling of ListAppEnv.
+	// Returns every (key, value) row on the app where scope matches
+	// the caller-supplied value, scoped to accountID. Order: by
+	// scope ASC, key ASC for deterministic staging.
+	ListAppEnvInScope(ctx context.Context, accountID, appID, scope string) ([]AppEnv, error)
+	// CountAppEnvInScope is the scope-aware sibling of CountAppEnv.
+	// Counts only rows where scope matches the caller-supplied
+	// value. Reserved for future per-scope caps (ADR-091 follow-up);
+	// PR-A does not call it.
+	CountAppEnvInScope(ctx context.Context, accountID, appID, scope string) (int, error)
 
 	// AppTrustedSigner is the per-app cosign trusted-publisher list
 	// (issue #472 / ADR-054). apid is the only writer; imaged reads
