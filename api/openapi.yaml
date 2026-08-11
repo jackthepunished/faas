@@ -1511,6 +1511,70 @@ paths:
         '422': { $ref: '#/components/responses/DeployFailed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/deployments/source-ref:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [deployments]
+      operationId: createDeploymentFromSourceRef
+      summary: Create a deployment from a Git source-ref (headless).
+      description: |
+        Headless deploy path (issue #739 / DEPLOY-PROV-4 / ADR-092).
+        Resolves the GitHub install bound to the caller's account,
+        fetches the (repo, ref) tarball via the githubd bridge, spools
+        it under the per-plan SourceTarballMaxMB cap, validates shape,
+        and enqueues a build (Kind=DeploymentKindGitHub) pinned to
+        the resolved 40-char commit SHA.
+
+        Designed for CI runners: bearer token only, no GitHub env
+        vars required. Idempotency-Key collapses concurrent / retried
+        CI jobs into one build row.
+
+        Distinct from the dashboard bind path (`POST
+        /v1/apps/{slug}/deployments` with a `source` multipart
+        upload) which goes through the browser + UI bind picker.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourceRefDeployRequest'
+            example: {"repo":"onebox-faas/hello","ref":"main","format":"tarball"}
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The source-ref deployment whose build has been accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentResponse'
+                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcdef","deployment_id":"0123456789abcdef0123456789abcdef","status":"running","commit_sha":"0123456789abcdef0123456789abcdef01234567","created_at":"2026-07-23T11:25:00Z","finished_at":null,"source_bytes":12345678}
+        '400':
+          description: |
+            code: invalid_ref | validation_failed. ref must be a 40-char
+            SHA, branch, or tag.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            No durable GitHub install bound to the caller's account
+            (code: github_install_not_found).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/SourceTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503':
+          description: |
+            githubd unreachable or source-ref tarball fetch failed
+            (code: source_ref_unavailable). Retry in ~30s.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   /v1/apps/{slug}/rollback:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -8370,6 +8434,39 @@ components:
         only:
           type: string
           description: "CSV of workload names to include (others skipped)"
+
+    SourceRefDeployRequest:
+      description: |
+        JSON body for POST /v1/apps/{slug}/deployments/source-ref
+        (DEPLOY-PROV-4 / ADR-092, issue #739). The headless CI deploy
+        path: `repo` resolves to an install-token-bound fetch, `ref` is
+        the customer's chosen input (branch / tag / SHA — server
+        resolves to a 40-char SHA before stamping the deployment row).
+      type: object
+      required: [repo, ref]
+      properties:
+        repo:
+          type: string
+          pattern: '^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$'
+          description: "GitHub owner/name slug, e.g. `onebox-faas/hello`."
+          example: onebox-faas/hello
+        ref:
+          type: string
+          minLength: 7
+          maxLength: 200
+          description: |
+            Commit ref — 40-char SHA, branch, or tag. api.github.com
+            /repos/<repo>/commits/<ref> resolves branch / tag inputs
+            to a pinned SHA before the tarball fetch starts. The wire
+            shape pins to the resolved 40-char SHA (server override;
+            caller's `ref` is preserved on the `deploy.source_ref`
+            audit row for traceability).
+          example: main
+        format:
+          type: string
+          enum: [tarball]
+          default: tarball
+          description: "Forward-compat field. PR-A only supports `tarball`."
 
     ProjectApplyRequest:
       description: |

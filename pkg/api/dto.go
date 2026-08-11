@@ -2891,6 +2891,27 @@ type ProjectApplyRequest struct {
 	Only             string `json:"only"`
 }
 
+// SourceRefDeployRequest is the JSON body for
+// POST /v1/apps/{slug}/deployments/source-ref (DEPLOY-PROV-4 /
+// ADR-092, issue #739). The CLI never sees the GitHub install
+// token; apid resolves it server-side from the durable
+// github_installations row (state.GitHubInstallForAccount),
+// then dials codeload.github.com via the githubd bridge
+// (MintInstallationToken + StreamSourceRef gRPCs).
+//
+// Ref accepts a 40-char commit SHA, a 7+ char short SHA, a
+// branch name, or a tag. Branches/tags are normalised to a SHA
+// server-side via api.github.com/repos/<repo>/commits/<ref>
+// before the fetch (the audit row's data.source_sha carries
+// the resolved SHA — not the customer's input). Format is
+// reserved for future wire shapes (zipball, git bundle); v1
+// only ships "tarball". Empty Format defaults to "tarball".
+type SourceRefDeployRequest struct {
+	Repo   string `json:"repo"`
+	Ref    string `json:"ref"`
+	Format string `json:"format,omitempty"`
+}
+
 // PlanWorkload mirrors reposcan.Workload (Phase 3 wire shape).
 // Field names match the OpenAPI schema verbatim — the spec-check
 // AST gate enforces the field-for-field mapping.

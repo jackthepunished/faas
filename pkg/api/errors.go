@@ -159,12 +159,36 @@ const (
 	CodePlanLimitConcur = "plan_limit_concurrency"
 	CodeSourceTooLarge  = "source_too_large"
 	CodeSourceInvalid   = "source_invalid"
-	CodeAppLayerTooBig  = "app_layer_too_large"
-	CodeBuildUndetected = "build_undetected"
-	CodeBuildOOM        = "build_oom"
-	CodeBuildTimeout    = "build_timeout"
-	CodeQuotaExhausted  = "quota_exhausted"
-	CodeBillingPastDue  = "billing_past_due"
+	// CodeInvalidRef is the DEPLOY-PROV-4 / ADR-092 (issue #739)
+	// 400 sentinel for POST /v1/apps/{slug}/deployments/source-ref
+	// when the supplied ref is not a valid commit SHA / branch /
+	// tag, OR the GitHub API failed to resolve it to a SHA. Distinct
+	// from CodeSourceInvalid (which fires after the tarball lands
+	// and the shape check rejects it): this is upstream of the
+	// fetch, on the wire itself.
+	CodeInvalidRef = "invalid_ref"
+	// CodeGitHubInstallNotFound is the DEPLOY-PROV-4 / ADR-092 (issue
+	// #739) 404 sentinel for POST /v1/apps/{slug}/deployments/source-ref
+	// when the account has no durable github_installations row. The
+	// customer must complete the dashboard `gregale connect` bind
+	// once to seed the install row before CI can drive source-ref
+	// deploys. Distinct from CodeNotFound so the dashboard can render
+	// a "bind first" CTA rather than a generic 404.
+	CodeGitHubInstallNotFound = "github_install_not_found"
+	// CodeSourceRefUnavailable is the DEPLOY-PROV-4 / ADR-092 (issue
+	// #739) 503 sentinel for POST /v1/apps/{slug}/deployments/source-ref
+	// when the githubd bridge is down (StreamSourceRef returns
+	// Unavailable) or when a 401 from codeload.github.com survives
+	// one cache-invalidate + retry. The 503 + Retry-After pair
+	// mirrors CodeCapacity / CodeBuildXXX — the failure is transient
+	// and the customer's CLI/CI will retry on the backoff.
+	CodeSourceRefUnavailable = "source_ref_unavailable"
+	CodeAppLayerTooBig       = "app_layer_too_large"
+	CodeBuildUndetected      = "build_undetected"
+	CodeBuildOOM             = "build_oom"
+	CodeBuildTimeout         = "build_timeout"
+	CodeQuotaExhausted       = "quota_exhausted"
+	CodeBillingPastDue       = "billing_past_due"
 	// CodeBillingNotImplemented is returned when the selected
 	// billing provider (FAAS_BILLING_PROVIDER) does not implement the
 	// requested method (issue #279: Paddle's Refund). Distinct from
@@ -2344,6 +2368,51 @@ func ErrBuildNotFound() *Problem {
 		"No such build",
 		"the build id does not exist, or belongs to another account").
 		WithDocs(docsBase + "/builds#status")
+}
+
+// ErrInvalidRef is the DEPLOY-PROV-4 / ADR-092 (issue #739)
+// 400 surface for POST /v1/apps/{slug}/deployments/source-ref
+// when the supplied ref fails gitfetch.IsValidCommitSHA, fails
+// the path-traversal guard, OR when GitHub's commits/{ref}
+// resolution returns 404. The ref is echoed verbatim so the
+// CI script's `--ref <value>` can be debugged without a second
+// call. Distinct from CodeSourceInvalid (post-fetch tarball
+// shape) and CodeSourceTooLarge (per-plan cap): this fires
+// upstream of the fetch.
+func ErrInvalidRef(ref string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeInvalidRef,
+		"Invalid ref",
+		fmt.Sprintf("ref %q is not a valid commit SHA, branch, or tag.", ref)).
+		WithDocs(docsBase + "/build/source-ref")
+}
+
+// ErrGitHubInstallNotFound is the DEPLOY-PROV-4 / ADR-092 (issue
+// #739) 404 surface for POST /v1/apps/{slug}/deployments/source-ref
+// when state.GitHubInstallForAccount returns ErrNotFound for the
+// caller's account. Distinct from the generic CodeNotFound so the
+// dashboard can render the "complete `gregale connect` first"
+// CTA — CI has no browser, so the bind row must already exist.
+func ErrGitHubInstallNotFound() *Problem {
+	return NewProblem(http.StatusNotFound, CodeGitHubInstallNotFound,
+		"No GitHub installation",
+		"this account has no GitHub App installation row; complete `gregale connect` once before retrying from CI").
+		WithDocs(docsBase + "/build/source-ref#prereq")
+}
+
+// ErrSourceRefUnavailable is the DEPLOY-PROV-4 / ADR-092 (issue
+// #739) 503 surface for POST /v1/apps/{slug}/deployments/source-ref
+// when the githubd bridge is down (StreamSourceRef returned
+// Unavailable) or when a 401 from codeload.github.com survived
+// one cache-invalidate + retry. The detail echoes the upstream
+// reason; Retry-After is left to the caller (typically 30s).
+// Distinct from CodeCapacity (the per-plan concurrency cap) and
+// CodeWaitForWarm (the per-app scale-out cooldown): both are
+// plan-shape gates, while this is "the GitHub bridge failed".
+func ErrSourceRefUnavailable(reason string) *Problem {
+	return NewProblem(http.StatusServiceUnavailable, CodeSourceRefUnavailable,
+		"Source-ref fetch unavailable",
+		reason).
+		WithDocs(docsBase + "/build/source-ref#errors")
 }
 
 // ErrBuildSBOMUnavailable is the issue #299 / ADR-038 Phase 3 surface

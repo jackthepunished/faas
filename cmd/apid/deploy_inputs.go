@@ -93,6 +93,10 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 		switch name {
 		case "source":
 			kind = state.DeploymentKindTarball
+			if vErr := assertMultipartFileName(part); vErr != nil {
+				api.WriteProblem(w, vErr)
+				return
+			}
 			path, n, vErr := validateAndSpool(part, limits)
 			if vErr != nil {
 				api.WriteProblem(w, vErr)
@@ -208,18 +212,29 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// validateAndSpool reads the multipart file part, validates the tarball
-// shape, and writes it to the spool dir. Returns (spool_path, bytes, problem).
+// validateAndSpool reads a tar.gz from r, validates its shape, and
+// writes it to the spool dir. Returns (spool_path, bytes, problem).
 //
 // Order is: write to a tmp path, validate, then atomically rename to the
 // canonical path. This avoids leaving a malformed or oversized tarball at the
 // canonical spool path where builderd could race to pick it up before the
 // validation result is known.
-func validateAndSpool(part *multipart.Part, limits api.Limits) (string, int64, *api.Problem) {
-	if part.FileName() == "" {
-		return "", 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-			"Bad source", "source field must be a file")
-	}
+//
+// The multipart and source-ref (DEPLOY-PROV-4 / ADR-092, issue #739)
+// deploy paths share this seam: the multipart caller wraps the
+// *multipart.Part in a thin assertFileName helper, the source-ref
+// caller passes the githubd-streamed io.ReadCloser straight through.
+// This is the canonical io.Reader seam — the multipart.Part already
+// implements Read so no adapter is needed.
+//
+// The caller MUST enforce SourceTarballMaxMB at the io.LimitReader
+// layer (PR-A invariant — handleSourceRefDeploy wraps the streaming
+// reader before this function sees it, so this seam receives a body
+// that's already cap-bound at the wire level). The redundant
+// post-Copy cap check below stays as a defence-in-depth: a future
+// caller that forgets the LimitReader wrapper should still trip a
+// CodeSourceTooLarge before spooling.
+func validateAndSpool(r io.Reader, limits api.Limits) (string, int64, *api.Problem) {
 	if err := os.MkdirAll(spoolRoot(), 0o755); err != nil {
 		return "", 0, api.ErrCapacity("could not create spool dir")
 	}
@@ -232,7 +247,7 @@ func validateAndSpool(part *multipart.Part, limits api.Limits) (string, int64, *
 	}
 	defer func() { _ = out.Close() }()
 
-	n, err := io.Copy(out, part)
+	n, err := io.Copy(out, r)
 	if err != nil {
 		_ = os.Remove(tmp)
 		return "", 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
@@ -253,6 +268,19 @@ func validateAndSpool(part *multipart.Part, limits api.Limits) (string, int64, *
 		return "", 0, api.ErrCapacity("could not finalize spool")
 	}
 	return dst, n, nil
+}
+
+// assertMultipartFileName is the multipart-specific guard the
+// validateAndSpool io.Reader seam absorbs. The source-ref path
+// streams from githubd, so FileName is meaningless there; the
+// guard exists only to keep the legacy multipart check
+// (cmd/apid/deploy_inputs.go had a 400 here pre-PR-A) untouched.
+func assertMultipartFileName(part *multipart.Part) *api.Problem {
+	if part.FileName() == "" {
+		return api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad source", "source field must be a file")
+	}
+	return nil
 }
 
 // validateTarballShape opens the spooled tarball and verifies the §9

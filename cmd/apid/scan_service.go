@@ -736,6 +736,9 @@ func parseScanMultipart(r *http.Request, acct state.Account, limits api.Limits) 
 		name := part.FormName()
 		switch name {
 		case "source":
+			if vErr := assertMultipartFileName(part); vErr != nil {
+				return nil, vErr
+			}
 			path, n, vErr := validateAndSpool(part, limits)
 			if vErr != nil {
 				return nil, vErr

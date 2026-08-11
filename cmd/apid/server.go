@@ -823,6 +823,14 @@ func (s *server) handler() http.Handler {
 
 	// Deployments.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))
+	// DEPLOY-PROV-4 / ADR-092 / issue #739 — headless source-ref
+	// deploy from CI. Same auth chain as the multipart sibling
+	// (authLimited → requireMFA → requireScope(ScopesDeployWriteSurface)
+	// → idempotent). Idempotency-Key on a CI retry collapses to the
+	// same build row; handler resolves the install token via the
+	// githubd gRPC bridge (cmd/apid/githubd_client.go) and streams
+	// the upstream tarball straight into validateAndSpool.
+	mux.HandleFunc("POST /v1/apps/{slug}/deployments/source-ref", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.handleSourceRefDeploy)))))
 	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeployment))))
 	// Per-deploy grype scan drill-down (issue #464 / ADR-055).
 	// Returns the typed api.ScanResult envelope (status,

@@ -13,6 +13,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"sync"
+	"time"
 
 	githubdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/githubd/v1"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
@@ -219,4 +222,178 @@ func liftErr(err error) error {
 		return p
 	}
 	return err
+}
+
+// MintInstallationToken wraps the unary gRPC of the same name
+// (DEPLOY-PROV-4 / ADR-092, issue #739). apid's handleSourceRefDeploy
+// handler calls it to obtain a fresh installation token for the
+// durable install the customer bound when connecting GitHub. The
+// token never crosses the githubd process boundary on a sticky
+// basis — every call mints fresh so a CI runner that got a 401
+// from codeload can retry without waiting for the proactive
+// refresh window. expiresAt is the GitHub-reported expiry as
+// time.Time (zero when githubd stamps a stub).
+//
+// Error mapping: the wrapped *api.Problem (codes.NotFound →
+// github_install_not_found; codes.Unavailable →
+// source_ref_unavailable) survives via liftErr so the apid
+// handler can branch on api.AsProblem(err) directly.
+func (c *Client) MintInstallationToken(ctx context.Context, accountID string, installationID int64) (string, time.Time, error) {
+	resp, err := c.cli.MintInstallationToken(ctx, &githubdpb.MintInstallationTokenRequest{
+		AccountId:      accountID,
+		InstallationId: installationID,
+	})
+	if err != nil {
+		return "", time.Time{}, liftErr(err)
+	}
+	if resp.GetToken() == "" {
+		return "", time.Time{}, fmt.Errorf("githubdgrpc: empty token in MintInstallationToken response")
+	}
+	exp, perr := time.Parse(time.RFC3339, resp.GetExpiresAt())
+	if perr != nil {
+		// Defensive — proto/regen puts a non-RFC3339 string here
+		// would be a wire-bug. Hand back a zero time so the apid
+		// caller can still use the token; the apid-side cache
+		// stamps the issuer-reported value, not the parsed one.
+		// Return perr so the apid-side log surfaces the wire
+		// mismatch (lint: nilerr — don't drop the parse error).
+		return resp.GetToken(), time.Time{}, fmt.Errorf("githubdgrpc: parse expires_at %q: %w", resp.GetExpiresAt(), perr)
+	}
+	return resp.GetToken(), exp, nil
+}
+
+// StreamSourceRefResult bundles the streaming body with the
+// terminal-frame signals githubd stamps on the last chunk
+// (truncated, bytes_streamed). apid's handleSourceRefDeploy reads
+// Total only after a successful Read to EOF — populating Total
+// happens lazily inside Close so a caller that bails out early
+// (size-cap trip, context cancel) still sees the partial byte
+// count without re-iterating the stream.
+type StreamSourceRefResult struct {
+	// Body is the streaming tar.gz bytes. The caller MUST Close
+	// it; defer Close immediately after StreamSourceRef returns.
+	Body io.ReadCloser
+	// Stats is populated on Close. Until Close returns, Stats
+	// holds zero values — readers MUST NOT peek at it before
+	// Body.Read returns io.EOF or Body.Close is called.
+	Stats StreamSourceRefStats
+}
+
+// StreamSourceRefStats captures the truncated/total fields the
+// proto wire carries on each chunk's final frame.
+type StreamSourceRefStats struct {
+	// Truncated is true when githubd hit the caller's
+	// max_archive_bytes cap mid-stream; the apid handler maps
+	// this to code=source_too_large (RFC 7807 413).
+	Truncated bool
+	// BytesStreamed is the post-cap cumulative bytes the githubd
+	// streamer forwarded to apid. Recorded on the deployment
+	// row's source_bytes column.
+	BytesStreamed int64
+	// Err is the terminal stream error if the body ended
+	// prematurely (liftErr-preserved *api.Problem). nil on a
+	// clean EOF.
+	Err error
+}
+
+// StreamSourceRef wraps the server-streaming gRPC of the same name
+// (DEPLOY-PROV-4 / ADR-092, issue #739). It drains every chunk into
+// a single io.ReadCloser the caller pipes straight into
+// validateAndSpool — no double buffering, no tee. Stats +
+// terminal error surface on Close.
+//
+// Error mapping mirrors MintInstallationToken: liftErr preserves
+// the *api.Problem Code so api.AsProblem(err) reaches the
+// handler untouched. A streaming error after the gRPC Invoke
+// succeeded surfaces as Stats.Err (Close returns it), so the
+// caller can render the stable Code without re-walking the
+// stream.
+func (c *Client) StreamSourceRef(ctx context.Context, accountID string, installationID int64, repoFullName, ref string, maxArchiveBytes int64) (*StreamSourceRefResult, error) {
+	stream, err := c.cli.StreamSourceRef(ctx, &githubdpb.StreamSourceRefRequest{
+		AccountId:       accountID,
+		InstallationId:  installationID,
+		RepoFullName:    repoFullName,
+		Ref:             ref,
+		MaxArchiveBytes: maxArchiveBytes,
+	})
+	if err != nil {
+		return nil, liftErr(err)
+	}
+	pr, pw := io.Pipe()
+	res := &streamSourceRefConn{
+		pr:         pr,
+		pw:         pw,
+		stream:     stream,
+		stats:      StreamSourceRefStats{},
+		pumpExited: make(chan struct{}),
+	}
+	// Single producer goroutine drains the gRPC stream into the
+	// pipe. Close-on-error surfaces to Read; Close-on-EOF cleanly
+	// terminates the reader.
+	go res.pump()
+	return &StreamSourceRefResult{Body: res}, nil
+}
+
+// streamSourceRefConn is the io.ReadCloser + terminal-stats bundle
+// StreamSourceRef returns. The fields are accessible only on the
+// single goroutine that owns the call: apid's handler reads in
+// the request goroutine, the pump writes from the gRPC recv
+// goroutine. State mutation happens inside Close (after pump
+// returns) so the handler observes a stable view.
+type streamSourceRefConn struct {
+	pr         *io.PipeReader
+	pw         *io.PipeWriter
+	stream     grpc.ServerStreamingClient[githubdpb.StreamSourceRefChunk]
+	stats      StreamSourceRefStats
+	pumpExited chan struct{}
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+// pump drains Recv into the pipe. It is the single writer of pw.
+func (s *streamSourceRefConn) pump() {
+	defer close(s.pumpExited)
+	defer func() { _ = s.pw.Close() }()
+	for {
+		chunk, rerr := s.stream.Recv()
+		if errors.Is(rerr, io.EOF) {
+			return
+		}
+		if rerr != nil {
+			s.stats.Err = liftErr(rerr)
+			_ = s.pw.CloseWithError(s.stats.Err)
+			return
+		}
+		if chunk.GetTruncated() {
+			s.stats.Truncated = true
+		}
+		if chunk.GetBytesStreamed() > 0 {
+			s.stats.BytesStreamed = chunk.GetBytesStreamed()
+		}
+		if n := len(chunk.GetData()); n > 0 {
+			if _, werr := s.pw.Write(chunk.GetData()); werr != nil {
+				// Reader went away (Close before EOF). The
+				// caller is fine; just exit quietly.
+				return
+			}
+		}
+	}
+}
+
+// Read satisfies io.Reader. Bytes flow from the streaming gRPC
+// goroutine through the pipe into apid's validateAndSpool.
+func (s *streamSourceRefConn) Read(p []byte) (int, error) {
+	return s.pr.Read(p)
+}
+
+// Close shuts down the read side and waits for the pump to
+// return, then hands the caller the terminal stats + error.
+// Idempotent and safe to defer; double-close is a no-op.
+func (s *streamSourceRefConn) Close() error {
+	s.closeOnce.Do(func() {
+		_ = s.pr.Close()
+		<-s.pumpExited
+		s.closeErr = s.stats.Err
+	})
+	return s.closeErr
 }

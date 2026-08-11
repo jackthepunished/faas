@@ -14,7 +14,9 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"log/slog"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
@@ -44,7 +46,38 @@ type GithubdClient interface {
 	// response includes the install's account_login so the apid
 	// handler can audit-log it.
 	VerifyInstallation(ctx context.Context, installationID int64, expectedLogin string) (verified bool, accountLogin string, defaultBranch string, err error)
+	// MintInstallationToken (DEPLOY-PROV-4 / ADR-092, issue #739)
+	// returns a fresh installation token for (accountID,
+	// installationID). apid's handleSourceRefDeploy uses it to
+	// authenticate a codeload archive fetch without scraping the
+	// token from the durable install row. The token stays scoped
+	// to one RPC response; expiresAt stamps the apid-side
+	// install-token cache so the next call short-circuits.
+	MintInstallationToken(ctx context.Context, accountID string, installationID int64) (token string, expiresAt time.Time, err error)
+	// StreamSourceRef (DEPLOY-PROV-4 / ADR-092, issue #739) drains
+	// the codeload tar.gz for (repo, ref) through githubd's
+	// install-token bound fetch. The returned Result.Body is an
+	// io.ReadCloser the apid handler pipes straight into
+	// validateAndSpool — no in-memory buffering. Stats.Truncated +
+	// Stats.BytesStreamed populate on Close.
+	StreamSourceRef(ctx context.Context, accountID string, installationID int64, repoFullName, ref string, maxArchiveBytes int64) (*StreamSourceRefResult, error)
 	Close() error
+}
+
+// StreamSourceRefResult mirrors pkg/githubdgrpc.StreamSourceRefResult
+// so handler tests can construct it without importing the gRPC
+// package. Stay field-for-field compatible with the wire
+// counterpart (PR-A invariant — see cmd/apid/handlers_source_ref.go).
+type StreamSourceRefResult struct {
+	Body  io.ReadCloser
+	Stats StreamSourceRefStats
+}
+
+// StreamSourceRefStats mirrors pkg/githubdgrpc.StreamSourceRefStats.
+type StreamSourceRefStats struct {
+	Truncated     bool
+	BytesStreamed int64
+	Err           error
 }
 
 // Aliases for the platform-friendly enum + struct mirrors — same shape
@@ -136,6 +169,23 @@ func (stubGithubdClient) VerifyInstallation(context.Context, int64, string) (boo
 	return false, "", "", errGithubdNotReady
 }
 
+// MintInstallationToken returns the not-ready problem (DEPLOY-PROV-4
+// / ADR-092, issue #739). With no githubd wired, the source-ref
+// deploy path renders the same "GitHub integration not configured"
+// page the OAuth callback does — this stays consistent until
+// slice 8 is live in production.
+func (stubGithubdClient) MintInstallationToken(context.Context, string, int64) (string, time.Time, error) {
+	return "", time.Time{}, errGithubdNotReady
+}
+
+// StreamSourceRef returns the not-ready problem (DEPLOY-PROV-4 /
+// ADR-092, issue #739). The handler that consumes this (apid's
+// handleSourceRefDeploy) maps the underlying problem Code to
+// 503 source_ref_unavailable.
+func (stubGithubdClient) StreamSourceRef(context.Context, string, int64, string, string, int64) (*StreamSourceRefResult, error) {
+	return nil, errGithubdNotReady
+}
+
 // Close is a no-op for the stub.
 func (stubGithubdClient) Close() error { return nil }
 
@@ -217,6 +267,38 @@ func (l *liveClient) WriteCheck(ctx context.Context, repoFullName, commitSHA str
 // VerifyInstallation passes through to githubdgrpc.Client.VerifyInstallation.
 func (l *liveClient) VerifyInstallation(ctx context.Context, installationID int64, expectedLogin string) (bool, string, string, error) {
 	return l.c.VerifyInstallation(ctx, installationID, expectedLogin)
+}
+
+// MintInstallationToken passes through to
+// githubdgrpc.Client.MintInstallationToken (DEPLOY-PROV-4 /
+// ADR-092, issue #739). The token never touches disk; it lives
+// only inside the RPC response frame and the apid-side
+// install-token cache populated by handleSourceRefDeploy.
+// Consumers strip it from the (token, expiry, err) tuple and
+// discard it before returning.
+func (l *liveClient) MintInstallationToken(ctx context.Context, accountID string, installationID int64) (string, time.Time, error) {
+	return l.c.MintInstallationToken(ctx, accountID, installationID)
+}
+
+// StreamSourceRef passes through to
+// githubdgrpc.Client.StreamSourceRef (DEPLOY-PROV-4 / ADR-092,
+// issue #739). The returned io.ReadCloser wraps a pipe the
+// underlying gRPC streaming receiver drains into; the apid
+// handler pipes it into validateAndSpool and calls Close exactly
+// once.
+func (l *liveClient) StreamSourceRef(ctx context.Context, accountID string, installationID int64, repoFullName, ref string, maxArchiveBytes int64) (*StreamSourceRefResult, error) {
+	res, err := l.c.StreamSourceRef(ctx, accountID, installationID, repoFullName, ref, maxArchiveBytes)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, nil
+	}
+	return &StreamSourceRefResult{Body: res.Body, Stats: StreamSourceRefStats{
+		Truncated:     res.Stats.Truncated,
+		BytesStreamed: res.Stats.BytesStreamed,
+		Err:           res.Stats.Err,
+	}}, nil
 }
 
 // newGithubdClient is the slice-1 constructor: returns the stub. Slice 7

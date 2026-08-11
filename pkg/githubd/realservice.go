@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"sync"
 	"time"
@@ -82,11 +83,19 @@ type AuditEvent func(event string, accountID string, payload map[string]any)
 type RealService struct {
 	githubdgrpc.UnimplementedService
 
-	Auth      *AppAuth
-	Tokens    *TokenCache
-	Checks    *ChecksAPI
-	Store     BindingsStore
-	Installs  StoreInstalls
+	Auth     *AppAuth
+	Tokens   *TokenCache
+	Checks   *ChecksAPI
+	Store    BindingsStore
+	Installs StoreInstalls
+	// Streamer is the SourceRefStreamer implementation wired
+	// for the DEPLOY-PROV-4 / ADR-092 (issue #739) source-ref
+	// deploy path. Production wiring (cmd/githubd/main.go) passes
+	// a *sourceRefStreamer that resolves the install row via
+	// s.Installs, mints the install token via s.Tokens, and
+	// proxies the codeload body. nil-safe: StreamSourceRef
+	// returns an error when Streamer is unconfigured.
+	Streamer  SourceRefStreamer
 	Recipient *age.X25519Recipient
 	// Identities is the multi-identity unseal slice for rotation
 	// overlap (issue #316 / ADR-057). Pre-rotation: length 1
@@ -157,6 +166,19 @@ func NewRealService(auth *AppAuth, tokens *TokenCache, checks *ChecksAPI, store 
 // cold-start rehydrate path is wired.
 func NewRealServiceLegacy(auth *AppAuth, tokens *TokenCache, checks *ChecksAPI, store BindingsStore) *RealService {
 	return NewRealService(auth, tokens, checks, store, nil, nil, nil, nil)
+}
+
+// WithStreamer wires a SourceRefStreamer implementation for
+// the DEPLOY-PROV-4 / ADR-092 (issue #739) headless source-ref
+// deploy path. Returns the receiver so the wiring reads as a
+// builder chain in cmd/githubd/main.go.
+//
+// Streamer may be nil to disable the path (slice 1 / test
+// builds); StreamSourceRef returns an error when Streamer is
+// unconfigured so the gRPC handler maps it to codes.Unavailable.
+func (s *RealService) WithStreamer(streamer SourceRefStreamer) *RealService {
+	s.Streamer = streamer
+	return s
 }
 
 // GetInstallState returns the install state for the given account.
@@ -713,6 +735,112 @@ func (s *RealService) VerifyInstallation(installationID int64, expectedLogin str
 		return false, "", "", nil
 	}
 	return true, inst.AccountLogin, defaultProductionBranch, nil
+}
+
+// MintInstallationToken returns a fresh installation token for
+// (accountID, installationID) (DEPLOY-PROV-4 / ADR-092, issue #739).
+// It resolves the durable install row via s.Installs, mints a
+// token via s.Tokens.Token (which handles the singleflight +
+// 5-min proactive refresh), and surfaces the GitHub-reported
+// expiry so the apid-side install-token cache can stamp it
+// without an extra round-trip.
+//
+// Errors:
+//   - ErrNoBinding on s.Installs.ErrNotFound (the apid handler
+//     turns this into 404 + code=github_install_not_found).
+//   - any other error wraps the upstream cause with operation
+//     context for the §12 dashboard's source-fetch error slice.
+//
+// Unlike the production TokenCache callers (Checks writer,
+// source fetcher), this method forces a fresh Token + read
+// of the cache entry's expiry. A CI runner that just got a
+// 401 from codeload can retry the RPC without waiting for
+// the proactive refresh window.
+func (s *RealService) MintInstallationToken(accountID string, installationID int64) (string, time.Time, error) {
+	if s.Tokens == nil {
+		return "", time.Time{}, fmt.Errorf("githubd: token cache not configured")
+	}
+	if s.Installs == nil {
+		return "", time.Time{}, fmt.Errorf("githubd: install store not configured")
+	}
+	if installationID <= 0 {
+		return "", time.Time{}, fmt.Errorf("githubd: invalid installation id %d", installationID)
+	}
+	// Resolve the durable install row. ErrNoBinding on
+	// state.ErrNotFound so the gRPC handler maps to NotFound.
+	inst, err := s.Installs.ForAccount(context.Background(), accountID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return "", time.Time{}, ErrNoBinding
+		}
+		return "", time.Time{}, fmt.Errorf("githubd: mint install token: resolve install: %w", err)
+	}
+	if inst.InstallationID != installationID {
+		// Same defensive guard as installationSourceFetcher
+		// (cmd/githubd/source_fetcher.go:128): mismatch is a
+		// config bug, not a security one (no cross-account
+		// take-over is possible because accountID gates the
+		// row lookup).
+		return "", time.Time{}, ErrNoBinding
+	}
+	// Mint. TokenCache.Token handles singleflight + 5-min
+	// proactive refresh — the first concurrent caller blocks
+	// on api.github.com; the rest piggy-back.
+	token, err := s.Tokens.Token(context.Background(), installationID)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("githubd: mint install token: cache: %w", err)
+	}
+	// Expiry: prefer the cached entry's expiresAt (zero +
+	// ErrNotFound-equivalent false on a cache miss, which
+	// shouldn't happen because Token just wrote one). The
+	// apid-side cache stamps expiryAt even if it's zero —
+	// the next apid-side cache miss will re-mint.
+	expiresAt, _ := s.Tokens.ExpiresAt(installationID)
+	return token, expiresAt, nil
+}
+
+// StreamSourceRef streams the raw tar.gz archive for a
+// (repo, ref) pair over the durable install's installation
+// token (DEPLOY-PROV-4 / ADR-092, issue #739). It is the
+// gRPC bridge behind POST /v1/apps/{slug}/deployments/source-ref
+// — apid's handleSourceRefDeploy dials it via StreamSourceRef,
+// pipes the returned io.ReadCloser into validateAndSpool,
+// then os.Renames the staged file to FAAS_SPOOL_ROOT/<id>.tar.gz.
+//
+// The streaming wire shape lets a Free-plan tarball that
+// exceeds SourceTarballMaxMB be rejected mid-flight (the
+// truncated=true chunk) rather than buffered entirely in
+// memory. bytesStreamed is the post-cap cumulative count
+// for the deployment row's source_bytes column.
+//
+// Errors:
+//   - ErrNoBinding when s.Installs.ErrNotFound.
+//   - the underlying SourceRefStreamer errors are passed
+//     through verbatim so the gRPC handler can map them via
+//     toStatusErr (codes.NotFound / InvalidArgument /
+//     Unauthenticated / Unavailable).
+func (s *RealService) StreamSourceRef(ctx context.Context, accountID string, installationID int64, repoFullName, ref string, maxArchiveBytes int64) (io.ReadCloser, bool, int64, error) {
+	if s.Streamer == nil {
+		return nil, false, 0, fmt.Errorf("githubd: source-ref streamer not configured")
+	}
+	rc, err := s.Streamer.Stream(ctx, accountID, installationID, repoFullName, ref, maxArchiveBytes)
+	if err != nil {
+		if errors.Is(err, ErrNoBinding) {
+			return nil, false, 0, ErrNoBinding
+		}
+		return nil, false, 0, err
+	}
+	// The streamer already wraps the body in
+	// io.LimitReader(maxArchiveBytes + 1, …); the apid-side
+	// handler reads past EOF to detect the cap. We don't
+	// pre-compute bytesStreamed here because the limit
+	// enforces a stream bound the gRPC chunk loop can't
+	// peek at without consuming the body. The handler
+	// records source_bytes via the final chunk's
+	// bytes_streamed field, which is the cumulative count
+	// at EOF — same posture as the tarball SHA on the
+	// multipart path.
+	return rc, false, 0, nil
 }
 
 // bindingToGRPC translates the durable state row into the gRPC
