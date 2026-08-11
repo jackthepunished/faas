@@ -3,10 +3,14 @@
 /* tslint:disable */
 /* eslint-disable */
 /**
- * An env var envelope: key name + timestamps. The plaintext value never appears here.
+ * An env var envelope: key name + scope + timestamps. The plaintext value never appears here.
  */
 export type AppEnvResponse = {
   key: string;
+  /**
+   * Env-var scope (ADR-090). Always 'default' for the pre-PR-B flat response; varies for the nested `env_by_scope` response.
+   */
+  scope: string;
   created_at: string;
   updated_at: string;
 };
