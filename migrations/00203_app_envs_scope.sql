@@ -1,11 +1,11 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00202_app_envs_scope.sql — ADR-090 PR-A.
+-- 00203_app_envs_scope.sql — ADR-090 PR-A.
 --
 -- Widen the app_envs PRIMARY KEY from (app_id, key) to (app_id, scope,
 -- key) by adding a new `scope` column. The default backfill is the
--- PG11+ fast-default — see ADR-090 D1. Every pre-00202 row gets
+-- PG11+ fast-default — see ADR-090 D1. Every pre-00203 row gets
 -- scope='default' lazily on first read/write without an UPDATE
 -- rewrite, so the migration is metadata-only on PG15.
 --
@@ -27,7 +27,7 @@
 -- 00053_deployments_source_url.sql:57-70.
 --
 -- Cross-PR slot gate: PR-A originally claimed 00198 but has
--- renumbered four times under ADR-041 seniority rules:
+-- renumbered five times under ADR-041 seniority rules:
 --   00198 → 00199 (after PR #819, open since 2026-08-10T16:52:56Z,
 --     claimed 00198 for webhook_event_allowlist_cron_fired_manually)
 --   00199 → 00200 (after PR #826, open since 2026-08-10T18:33:41Z,
@@ -39,15 +39,18 @@
 --   00201 → 00202 (after PR #819 and PR #826 both moved their real
 --     migrations to 00201 in response to the chase above, leaving
 --     00201 contested by three PRs at once: #819, #826, #827)
+--   00202 → 00203 (after PR #826 moved its real migration to
+--     00202 in response to the chase; cluster settled overnight,
+--     13 hours since PR #826's last push, so the chase is over)
 -- Fences 00193 / 00195 / 00196 are pre-existing on main and
 -- unrelated to ADR-090. This branch carries its own 00198, 00199,
--- 00200, and 00201 reservation fences (see those files) to
--- satisfy TestMigrationsContiguous on the branch tip before PR
--- #819, PR #826 and PR #829 land; once they merge, a follow-up
--- commit `fix(migrations): drop stale 00NNN_reserve_slot.sql
--- fence` drops them. PR-B and PR-C of the ADR-090 cluster will
--- land at 00203 and 00204 respectively (after this same fence
--- pattern).
+-- 00200, 00201 and 00202 reservation fences (see those files)
+-- to satisfy TestMigrationsContiguous on the branch tip before
+-- PR #819, PR #826 and PR #829 land; once they merge, a
+-- follow-up commit `fix(migrations): drop stale
+-- 00NNN_reserve_slot.sql fence` drops them. PR-B and PR-C of the
+-- ADR-090 cluster will land at 00204 and 00205 respectively
+-- (after this same fence pattern).
 --
 -- Index strategy: the new composite index
 -- `app_envs_account_app_scope_idx (account_id, app_id, scope)`
