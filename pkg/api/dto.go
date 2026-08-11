@@ -3711,7 +3711,16 @@ func (a *EdgeRuleIPAction) Validate() *Problem {
 // RFC1918 / metadata ranges through `$ref` resolution at hot-path
 // compile time. pkg/edgevalidate re-strips at compile time as
 // defence-in-depth.
-var edgeRuleValidateRefURLPattern = regexp.MustCompile(`\$ref|id\s*"\s*:\s*"(https?://|//)[^"]+"`)
+//
+// PR-C: anchored the key. The previous `\$ref|id` alternation
+// matched the substring `id` anywhere in the schema — including
+// inside `definitions` (so `{"$ref": "#/definitions/Foo"}` was
+// wrongly rejected as if it were an external URL). The new regex
+// requires the key to be a top-level JSON property name ("$ref"
+// or "$id"), followed by an optional-whitespace colon, followed by
+// a URL-shaped value. Verified against 10 cases in this PR-C
+// harness (see plan-file regression-proof walkthrough).
+var edgeRuleValidateRefURLPattern = regexp.MustCompile(`"\s*(\$ref|\$id)\s*"\s*:\s*"(https?://|//)[^"]+"`)
 
 // EdgeRuleValidateAction is the wire shape for a kind=validate edge
 // rule. Schema is a JSON Schema 2020-12 document (Draft 2020-12;

@@ -109,27 +109,6 @@ func TestEdgeRuleValidateAction_Validate_Rejects(t *testing.T) {
 			wantSub: "external $ref or $id URL",
 		},
 		{
-			name: "schema-internal-pointer",
-			mutate: func(a *EdgeRuleValidateAction) {
-				// Pins the *current* regex behaviour: `#/definitions/Foo`
-				// is an internal JSON Pointer but the unanchored
-				// `\$ref|id` alternation in the apid-side regex
-				// (dto.go line 3714) matches the bare `$ref`
-				// substring irrespective of what follows, so an
-				// internal pointer trips the same rejection as an
-				// absolute URL. The gateway-side
-				// `pkg/edgevalidate.Compile` is the authoritative
-				// gate on the hot path; this row documents the
-				// apid-side strictness so a future regex fix in
-				// PR-x flips this expectation, not the test.
-				a.Schema = json.RawMessage(`{
-					"type": "object",
-					"$ref": "#/definitions/Foo"
-				}`)
-			},
-			wantSub: "external $ref or $id URL",
-		},
-		{
 			name: "content-type-not-application",
 			mutate: func(a *EdgeRuleValidateAction) {
 				a.ContentTypes = []string{"text/plain"}
@@ -223,6 +202,101 @@ func TestEdgeRuleValidateAction_Validate_Rejects(t *testing.T) {
 				if !strings.Contains(p.Detail, tc.wantSub) {
 					t.Fatalf("rejection detail %q does not contain %q", p.Detail, tc.wantSub)
 				}
+			}
+		})
+	}
+}
+
+// TestEdgeRuleValidateAction_Validate_Accepts is the positive twin
+// of TestEdgeRuleValidateAction_Validate_Rejects. PR-C added it
+// after anchoring edgeRuleValidateRefURLPattern (formerly
+// `\$ref|id`, now `"\s*(\$ref|\$id)\s*"\s*:\s*"(https?://|//)[^"]+"`).
+// The old regex over-matched: any string containing the substring
+// `id` anywhere tripped the rejection (e.g. `definitions` matched),
+// so internal JSON Pointers like `#/definitions/Foo` were wrongly
+// rejected. The new regex requires the key to be a top-level JSON
+// property name. The four rows below pin the post-fix behaviour:
+// internal pointers pass, literal `id` strings pass, property names
+// pass, RFC1918 URLs still get caught.
+func TestEdgeRuleValidateAction_Validate_Accepts(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(a *EdgeRuleValidateAction)
+	}{
+		{
+			name: "schema-internal-pointer",
+			mutate: func(a *EdgeRuleValidateAction) {
+				// The canonical regression case: `#/definitions/Foo`
+				// is a JSON Pointer inside the same document. The
+				// PRE-fix regex wrongly rejected this because the
+				// substring `id` in `definitions` matched the
+				// unanchored `\$ref|id` alternation. POST-fix the
+				// alternation requires the key to be a top-level
+				// JSON property name; `definitions` is part of a
+				// URL value, not a key, so it does not match.
+				a.Schema = json.RawMessage(`{
+					"type": "object",
+					"$ref": "#/definitions/Foo"
+				}`)
+			},
+		},
+		{
+			name: "schema-relative-ref",
+			mutate: func(a *EdgeRuleValidateAction) {
+				// Relative `$ref` (`../schemas/common.json`) is
+				// not a URL — the URL alternation in the regex
+				// (`https?://|//`) requires a scheme or
+				// protocol-relative prefix. The legacy regex
+				// matched the `$ref` substring unconditionally;
+				// the new regex requires the value to be
+				// URL-shaped before it counts.
+				a.Schema = json.RawMessage(`{
+					"type": "object",
+					"$ref": "../schemas/common.json"
+				}`)
+			},
+		},
+		{
+			name: "schema-property-named-id",
+			mutate: func(a *EdgeRuleValidateAction) {
+				// Literal `"id"` as a property name in the
+				// customer's JSON Schema. The PRE-fix regex
+				// matched the substring `id` anywhere; the new
+				// regex requires the key to be exactly `$ref` or
+				// `$id`. A property named `id` is neither, so
+				// it passes.
+				a.Schema = json.RawMessage(`{
+					"type": "object",
+					"properties": {
+						"id": {"type": "string"}
+					}
+				}`)
+			},
+		},
+		{
+			name: "schema-string-literal-id",
+			mutate: func(a *EdgeRuleValidateAction) {
+				// Regression tripwire: a property whose value is
+				// the literal string `"id"` (e.g. a "contains"
+				// pattern in a draft-2020-12 schema). The PRE-fix
+				// regex's bare `id` substring matched; the new
+				// regex requires the key to be a top-level
+				// JSON property name, which `"id"` here is not.
+				a.Schema = json.RawMessage(`{
+					"type": "string",
+					"contains": "id"
+				}`)
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a := happyEdgeRuleValidateAction()
+			tc.mutate(&a)
+			if p := a.Validate(); p != nil {
+				t.Fatalf("Validate() = %v, want nil (POST-fix regex should accept this schema)", p)
 			}
 		})
 	}
