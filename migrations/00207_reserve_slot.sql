@@ -1,0 +1,40 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00207_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / cross-PR gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path beyond goose writing a row to goose_db_version. The
+-- replay-safety gate in ci.yml drops files whose basename matches
+-- the reservation regex from its "added migration versions"
+-- computation (see scripts/ci/check_migration_slots.sh ::
+-- reserved_from_paths), so this file is carved out of the
+-- cross-PR overlap check.
+--
+-- Context: PR #829 (paddle-overage dedupe pushed_mb_seconds) holds
+-- slot 00209 (real migration). Slots 00207 + 00208 are claimed by
+-- open PRs #826 (compute_node_heartbeats_stats at 00207) and #835
+-- + #836 + #838 (three real migrations at 00208). The branch tip
+-- carries this 00207 fence so TestMigrationsContiguous stays green
+-- while those PRs are still open. When PR #826 lands first, this
+-- fence becomes a duplicate-version collision against the real
+-- migration at 00207 and must be removed in a follow-up commit on
+-- PR #829. If PR #829 lands first (it must not — PR #826 is senior
+-- on 00207), the fence survives on main as a no-op until someone
+-- cleans it up.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
