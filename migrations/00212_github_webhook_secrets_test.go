@@ -1,15 +1,15 @@
 //go:build !no_pg
 
-// Migration-apply test for 00209_github_webhook_secrets.sql
+// Migration-apply test for 00212_github_webhook_secrets.sql
 // (PR-D / ADR-012 §7 amendment — per-tenant webhook secret).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00209 (no goose
-//     duplicate-version panic). PR-D carries no sibling fences on
-//     the branch tip — the fence 00208_reserve_slot.sql was
-//     squashed into this real migration via `git rm` + `git add`
-//     per `git-mv-migration-internals-untouched`.
+//  1. Migration set applies cleanly through 00212 (no goose
+//     duplicate-version panic). PR-D carries sibling fences
+//     00207/00208/00210/00211 on the branch tip — those become
+//     no-ops once the real migrations squash via `git rm` per
+//     `git-mv-migration-internals-untouched`.
 //  2. `github_webhook_secrets` table exists with four columns:
 //     installation_id (bigint, PK), secret_value (bytea),
 //     upgraded_at (timestamptz with default now()), upgraded_by
@@ -42,7 +42,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00209_GithubWebhookSecrets(t *testing.T) {
+func TestMigrations_00212_GithubWebhookSecrets(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

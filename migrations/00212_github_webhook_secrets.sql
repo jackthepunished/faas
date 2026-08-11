@@ -1,4 +1,4 @@
--- filename: 00209_github_webhook_secrets.sql
+-- filename: 00212_github_webhook_secrets.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -38,12 +38,16 @@
 --     FUNCTION are the load-bearing guards. The replay pass through
 --     apply_walk_test.go is a no-op.
 --
--- Cross-PR slot gate: PR-D landed at slot 209 (slot 207 was claimed
--- by PR #826's 00207_compute_node_heartbeats_stats; slot 008 holds
--- the 00208_reserve_slot.sql fence per the cross-pr-slot-fence-
--- pagination-gate pattern). The 00208_reserve_slot.sql fence
--- commits first so the renumber chain doesn't collide if both
--- PRs land in the same merge window.
+-- Cross-PR slot gate: PR-D landed at slot 212 after the
+-- 4-way collision cluster on slot 209 (PRs #829/#835/#836/#838
+-- all raced on 00209 simultaneously — see
+-- cross-pr-slot-fence-pagination-gate for the cluster pattern).
+-- Fences at 00207, 00208, 00210, and 00211 land before this
+-- migration so the renumber chain doesn't collide with
+-- PR #826 (00207_compute_node_heartbeats_stats), PR #835
+-- (00210_crons_unique_app_schedule_path), and PR #836
+-- (00211_deployments_scope) — each fence becomes a no-op via
+-- `git rm` once the real migration squash-merges.
 
 CREATE TABLE IF NOT EXISTS github_webhook_secrets (
     installation_id bigint PRIMARY KEY,

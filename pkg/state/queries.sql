@@ -720,9 +720,9 @@ limit $2::int8;
 -- (s *PgStore).GetGithubWebhookSecret. The body is hand-curated
 -- rather than sqlc-generated because the github_installations pair
 -- is also hand-curated (same precedent). The schema lives in
--- migrations/00209_github_webhook_secrets.sql (renumbered from
--- 00208 after PR #826 claimed 00207; see the migration's header
--- for the cross-pr-slot-fence chain).
+-- migrations/00212_github_webhook_secrets.sql (renumbered from
+-- 00208 → 00209 → 00212 in the slot-collision cluster; see the
+-- migration's header for the cross-pr-slot-fence chain).
 -- ---------------------------------------------------------------------------
 
 -- name: UpsertGithubWebhookSecret

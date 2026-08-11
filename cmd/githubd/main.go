@@ -181,7 +181,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// UpsertGithubWebhookSecret; we drop the cached entry so the
 	// next webhook rebuilds from the DB (without waiting for the
 	// 60s TTL). The trigger lives in
-	// migrations/00209_github_webhook_secrets.sql. The
+	// migrations/00212_github_webhook_secrets.sql. The
 	// SubscribeWithReconnect boundary handles transient LISTEN
 	// drops on its own; we just translate the payload into a
 	// Invalidate call. Plain-text payload (the install_id is not

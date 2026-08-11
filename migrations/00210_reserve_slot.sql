@@ -1,0 +1,14 @@
+-- filename: 00210_reserve_slot.sql
+-- +goose Up
+-- +goose StatementBegin
+-- Reserve slot 210 for PR #835 (crons_unique_app_schedule_path)
+-- and PR #836 (ADR-091 deployments.scope). PR-D landed at
+-- slot 212 after the slot-collision cluster (PRs #829/#835/
+-- #836/#838 all raced on 00209; see
+-- cross-pr-slot-fence-pagination-gate). The fence exists so
+-- the migrations/embed_test.go contiguity check passes on the
+-- local branch tip before force-pushing; it becomes a no-op
+-- once those PRs land and the real migrations squash it via
+-- `git rm migrations/00210_reserve_slot.sql`.
+SELECT 1;
+-- +goose StatementEnd
