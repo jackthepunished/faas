@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Apply-walk + column-shape test for migration 00200
+// Apply-walk + column-shape test for migration 00205
 // (paddle_overage_dedupe.pushed_mb_seconds). Insert a row directly
 // via the production schema, drop + recreate the schema via the
 // down/up pair, and assert the value round-trips — both pinned
@@ -31,7 +31,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-func TestMigrations_00200_PaddleOveragePushedMBSeconds(t *testing.T) {
+func TestMigrations_00205_PaddleOveragePushedMBSeconds(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -68,7 +68,7 @@ func TestMigrations_00200_PaddleOveragePushedMBSeconds(t *testing.T) {
 	// `_ = mbSeconds` line at pgstore.go:9956 returning) will
 	// flip this assertion red.
 	s := state.NewPgStore(pool)
-	acctID := "acct-mig-00200-" + time.Now().UTC().Format("150405.000000000")
+	acctID := "acct-mig-00205-" + time.Now().UTC().Format("150405.000000000")
 	if _, err := s.CreateAccount(ctx, acctID+"@mig.example.test", api.PlanFree); err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
