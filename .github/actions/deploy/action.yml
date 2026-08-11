@@ -54,7 +54,7 @@ outputs:
   status:
     description: "Final deployment status: ready | failed | cancelled | timeout"
   url:
-    description: "Live app URL once ready"
+    description: "URL of the new deployment record on the control-plane API (https://{api-base}/v1/apps/{slug}/deployments/{id})"
   cli-version:
     description: "Bundled gregale CLI version (verifies the vendored binary)"
 

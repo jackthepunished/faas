@@ -82,8 +82,11 @@ the same `LDFLAGS` (`pkg/wire.Version` stamping) that
 `poyrazK/faas`'s `Makefile:15-17` already uses, generates a
 `SHA256SUMS` file, copies the binary into `.github/actions/deploy/bin/gregale`,
 updates `src/version.txt`, commits everything to a `release/v<tag>`
-branch, and attaches the binary + SHA256SUMS to a GitHub Release
-via `softprops/action-gh-release@v2.6.2` (the same SHA pinned at
+branch, **force-updates the `vN` moving tag** so customers pinned at
+`@v1` always resolve to the latest vendored binary, and attaches the
+binary + SHA256SUMS to a GitHub Release via
+`softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2`
+(the same SHA pinned at
 `poyrazK/faas/.github/workflows/cd-controlplane.yml:99-110`).
 
 The companion `gregale deploy --github` flag in `poyrazK/faas`:

@@ -4,19 +4,23 @@
 # for linux-amd64 (and optional darwin-arm64 for maintainer local dev),
 # vendors the linux-amd64 binary into .github/actions/deploy/bin/gregale,
 # updates src/version.txt, generates SHA256SUMS, commits everything back
-# to a release branch, and attaches a GitHub Release via
-# softprops/action-gh-release@v2.6.2 (the same SHA pinned at
-# .github/workflows/cd-controlplane.yml:99-110).
+# to a release branch, force-updates the MAJOR moving tag so customers
+# pinned at @vN always resolve to the latest vendored binary, and
+# attaches a GitHub Release via softprops/action-gh-release (SHA-pinned
+# to match .github/workflows/cd-controlplane.yml:99-110).
 #
 # Cosign signing is OPTIONAL in v1 (per ADR-093 R5 mitigation). The
 # SHA256SUMS file is the deterministic verification surface for v1;
 # v2 will add cosign keypair signing.
 #
-# Branch strategy: the workflow commits to a `release/v<tag>` branch
-# rather than back to the tag ref itself. This avoids the classic
-# "git push to a tag ref doesn't move the tag" surprise. The
-# softprops/action-gh-release step then attaches to the actual tag
-# that triggered the run.
+# Tag strategy: every release commits to a `release/v<tag>` branch AND
+# force-updates the MAJOR moving tag (vN from vN.M.P) so that
+# `uses: poyrazK/faas/.github/actions/deploy@v1` (the canonical shape
+# pinned in the README + ADR + the rendered snippet) resolves to the
+# latest vendored binary. Without the moving-tag step, customers
+# pinned at @v1 would resolve to the pre-workflow commit that has no
+# bin/gregale, and `run.sh` would exit 1 with "vendored binary not
+# found" on day one.
 
 name: release
 
@@ -65,19 +69,26 @@ jobs:
             -o /tmp/gregale-build/gregale-darwin-arm64 ./cmd/gregale
           ls -la /tmp/gregale-build/gregale-darwin-arm64
 
+      # SHA256SUMS is generated in /tmp/gregale-build because that's
+      # the working directory where both binaries live. The vendoring
+      # step below copies both the binary and the SHA256SUMS into the
+      # repo so the `sha256sum -c` snippet in the release notes can
+      # resolve the file from the release branch (not just from the
+      # /tmp artifact on the runner).
       - name: Generate SHA256SUMS
         working-directory: /tmp/gregale-build
         run: |
           sha256sum gregale gregale-darwin-arm64 > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Vendor binary into action repo
+      - name: Vendor binary + SHA256SUMS into action repo
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cp /tmp/gregale-build/gregale .github/actions/deploy/bin/gregale
           chmod +x .github/actions/deploy/bin/gregale
+          cp /tmp/gregale-build/SHA256SUMS SHA256SUMS
           echo "$VERSION" > .github/actions/deploy/src/version.txt
           # Sanity-check: the vendored binary should report the right
           # version when invoked. Smoke asserts the LDFLAGS stamping
@@ -85,25 +96,49 @@ jobs:
           ./.github/actions/deploy/bin/gregale version
 
       - name: Commit vendored binary + version + SHA256SUMS
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           git config user.name "gregale-release-bot"
           git config user.email "release-bot@gregale.dev"
           BRANCH="release/${TAG}"
+          # Idempotent branch create: if a previous run left the
+          # branch around (network blip, partial push), reset it to
+          # origin/main instead of failing. The vendored-binary
+          # commit is the only thing the release branch adds, so
+          # this is safe to retry.
+          if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+            git branch -D "${BRANCH}"
+          fi
           git checkout -b "$BRANCH"
           git add .github/actions/deploy/bin/gregale .github/actions/deploy/src/version.txt SHA256SUMS
           git commit -m "release: bundle gregale ${TAG}"
           git push -u origin "$BRANCH"
+
+      - name: Force-update MAJOR moving tag (vN -> vN.M.P)
         env:
           TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Extract the MAJOR version (the "vN" from "vN.M.P") so
+          # customers pinned at @v1 always resolve to the latest
+          # vendored binary. Local-only: never push the moving tag
+          # to the release branch (it stays on the SHA we just
+          # committed). The `git push --force` updates the moving
+          # tag in refs/tags/vN to point at this commit, so
+          # `uses: .../deploy@v1` resolves to the vendored binary.
+          MAJOR="$(echo "$TAG" | cut -d. -f1)"
+          git tag -f "$MAJOR" "$TAG^{commit}"
+          git push origin "refs/tags/${MAJOR}" --force
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             .github/actions/deploy/bin/gregale
             /tmp/gregale-build/gregale-darwin-arm64
-            /tmp/gregale-build/SHA256SUMS
+            SHA256SUMS
           body: |
             ## Gregale ${{ github.ref_name }}
 
@@ -113,7 +148,7 @@ jobs:
             ### Checksums
 
             ```
-            $(cat /tmp/gregale-build/SHA256SUMS)
+            $(cat SHA256SUMS)
             ```
 
             ### Verify

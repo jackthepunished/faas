@@ -99,6 +99,14 @@ cmd_deploy() {
         die "could not extract deployment id from CLI output: $dep_json"
     fi
     echo "deployment-id=$dep_id" >> "$GITHUB_OUTPUT"
+    # Compose the deployment-record URL. We strip the trailing slash
+    # from FAAS_API (or fall back to the api-base input default) so
+    # the concatenation is robust to either form. The output is
+    # informational — customers use it to link back to the
+    # deployment row in the control-plane dashboard.
+    local api_base="${FAAS_API:-https://api.faas.example}"
+    api_base="${api_base%/}"
+    echo "url=${api_base}/v1/apps/${INPUT_APP}/deployments/${dep_id}" >> "$GITHUB_OUTPUT"
 
     # 4. Optionally wait. The vendored CLI tails the SSE build log
     #    when --wait is set; we use a separate mode here so the

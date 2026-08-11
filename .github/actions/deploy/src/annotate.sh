@@ -28,7 +28,12 @@ STDERR_FILE="${RUNNER_TEMP:-/tmp}/faas-deploy-action.stderr"
 # the Bearer pattern matches the full opaque token; the FAAS_TOKEN
 # pattern matches the env-var form (defence-in-depth).
 REDACT_PATTERNS=(
-    's/gh[ps]_[A-Za-z0-9_]\{20,\}/[REDACTED_TOKEN]/g'
+    # Matches every documented GitHub token prefix: gho_ (OAuth),
+    # ghp_ (PAT), ghu_ (user-to-server), ghs_ (server-to-server),
+    # ghr_ (refresh). The 20+ length floor matches GitHub's own
+    # token-length floor (classic PATs and fine-grained PATs are
+    # both >= 36 chars; OAuth tokens are >= 40).
+    's/gh[opsur]_[A-Za-z0-9_]\{20,\}/[REDACTED_TOKEN]/g'
     's/Bearer [A-Za-z0-9._-]\{8,\}/Bearer [REDACTED_TOKEN]/g'
     's/FAAS_TOKEN=[A-Za-z0-9._-]\{8,\}/FAAS_TOKEN=[REDACTED_TOKEN]/g'
 )

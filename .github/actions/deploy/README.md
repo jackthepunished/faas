@@ -54,12 +54,12 @@ The CLI emits a copy-paste workflow file. When run inside an Actions runner (`GI
 | `deployment-id` | The new deployment id (32-char hex). |
 | `app-slug` | Echo of the input `app` slug. |
 | `status` | Final deployment status: `ready` \| `failed` \| `cancelled` \| `timeout`. |
-| `url` | Live app URL once ready. |
+| `url` | URL of the deployment record on the control-plane API (`{api-base}/v1/apps/{slug}/deployments/{id}`). |
 | `cli-version` | Bundled `gregale` CLI version (verifies the vendored binary). |
 
 ## Pin reproducibility
 
-The action is pinned to `@v1` by default. For full immutability, pin a specific tag:
+The action is pinned to `@v1` by default. The `release.yml` workflow force-updates the `vN` moving tag on every `vN.M.P` release, so `@v1` always resolves to the latest vendored binary — minor and patch releases ship without any workflow edit on the customer side. For full immutability, pin a specific tag:
 
 ```yaml
 - uses: poyrazK/faas/.github/actions/deploy@v1.4.2
