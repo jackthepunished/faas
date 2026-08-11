@@ -92,6 +92,7 @@ export type { EdgeRuleRedirectAction } from './models/EdgeRuleRedirectAction.js'
 export type { EdgeRuleResponse } from './models/EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './models/EdgeRuleRewriteAction.js';
 export type { EdgeRuleRouteAction } from './models/EdgeRuleRouteAction.js';
+export type { FireCronRequestResponse } from './models/FireCronRequestResponse.js';
 export type { FireCronResponse } from './models/FireCronResponse.js';
 export type { GdprAuditExportResponse } from './models/GdprAuditExportResponse.js';
 export type { GraceWindowResponse } from './models/GraceWindowResponse.js';
@@ -225,6 +226,7 @@ export { AuditService } from './services/AuditService.js';
 export { AuthService } from './services/AuthService.js';
 export { BillingService } from './services/BillingService.js';
 export { CronsService } from './services/CronsService.js';
+export { DefaultService } from './services/DefaultService.js';
 export { DelayedTasksService } from './services/DelayedTasksService.js';
 export { DeploymentsService } from './services/DeploymentsService.js';
 export { DomainsService } from './services/DomainsService.js';

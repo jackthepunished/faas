@@ -3053,6 +3053,7 @@ paths:
         - name: request_id
           in: path
           required: true
+          description: Fire-now request identifier returned by `POST /v1/crons/{id}/run`.
           schema: { type: string, format: uuid }
       responses:
         '200':
@@ -8422,9 +8423,9 @@ components:
           type: string
           enum: [pending, running, succeeded, failed, cancelled]
         requested_at: { type: string, format: date-time }
-        finished_at: { type: string, format: date-time, nullable: true }
-        invocation_id: { type: string, format: uuid, nullable: true }
-        error: { type: string, nullable: true }
+        finished_at: { type: [string, "null"], format: date-time }
+        invocation_id: { type: [string, "null"], format: uuid }
+        error: { type: [string, "null"] }
         account_id: { type: string, format: uuid }
 
     CreateCronRequest:
