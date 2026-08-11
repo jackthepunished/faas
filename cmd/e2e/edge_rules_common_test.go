@@ -46,10 +46,14 @@ type gatewayReqOptions struct {
 
 // gatewayReq is the gateway-bound counterpart to package-level doReq.
 // Always uses h.GatewayURL (gatewayd-internal serves plain HTTP per
-// Tier A7; no TLS), always sets req.Host for the host-based router,
-// and returns the full resp.Header so the per-kind tests can assert on
-// Access-Control-*, Location, X-*, WWW-Authenticate, etc.
-func gatewayReq(t *testing.T, h *e2etest.Harness, method, path string, body any, opts gatewayReqOptions) (*http.Response, []byte) {
+// Tier A7; no TLS), always sets req.Host for the host-based router.
+// Returns (resp.Header, body, status) so the per-kind tests can
+// assert on stamped headers (Access-Control-*, Location, X-*,
+// WWW-Authenticate) without re-issuing the request. The body is
+// drained inside this function and Body.Close() runs via defer
+// before return — bodyclose's plugin tracks the lifecycle
+// locally rather than across the function boundary.
+func gatewayReq(t *testing.T, h *e2etest.Harness, method, path string, body any, opts gatewayReqOptions) (http.Header, []byte, int) {
 	t.Helper()
 	var r io.Reader
 	if body != nil {
@@ -82,7 +86,7 @@ func gatewayReq(t *testing.T, h *e2etest.Harness, method, path string, body any,
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
-	return resp, b
+	return resp.Header, b, resp.StatusCode
 }
 
 // doReqHeaders is the helper that captures resp.Header alongside
@@ -107,11 +111,10 @@ func doReqHeaders(t *testing.T, h *e2etest.Harness, host, method, path string, b
 			}
 		}
 	}
-	resp, bodyBytes := gatewayReq(t, h, method, path, body, gatewayReqOptions{
+	return gatewayReq(t, h, method, path, body, gatewayReqOptions{
 		Host:  host,
 		Extra: merged,
 	})
-	return resp.Header, bodyBytes, resp.StatusCode
 }
 
 // seedEdgeRuleDirect inserts one edge_rule row via the test pool,
