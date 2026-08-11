@@ -230,6 +230,18 @@ func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
 	if resp.StatusCode >= 300 {
 		var p Problem
 		if json.Unmarshal(data, &p) == nil && p.Code != "" {
+			// Copy RFC 7231 §7.1.3 wire headers the server attaches
+			// for transient / retryable errors (Retry-After on 503
+			// source_ref_unavailable, 429 plan_limit_concurrency,
+			// etc.) so callers can branch on Problem.HasHeader
+			// without re-reading resp.Header themselves. The SDK
+			// already discards the raw http.Response (see do), so
+			// this is the load-bearing surface for the backoff
+			// hint. Issue #739 / ADR-092: the headless source-ref
+			// CLI path relies on this for the 409 backoff message.
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				p = *p.WithHeader("Retry-After", ra)
+			}
 			return &APIError{Problem: p}
 		}
 		return fmt.Errorf("API error: %s", resp.Status)
@@ -287,6 +299,13 @@ func (c *Client) doBytes(ctx context.Context, method, path string, body, out any
 	if resp.StatusCode >= 300 {
 		var p Problem
 		if json.Unmarshal(data, &p) == nil && p.Code != "" {
+			// Mirror doReq: copy the Retry-After wire header into
+			// the Problem so the 409 / 429 / 503 backoff hint is
+			// reachable via Problem.HasHeader after the SDK
+			// discards the raw http.Response.
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				p = *p.WithHeader("Retry-After", ra)
+			}
 			return &APIError{Problem: p}
 		}
 		return fmt.Errorf("API error: %s", resp.Status)

@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -727,7 +726,13 @@ func cmdDeployTarball(args []string) int {
 	fs := flag.NewFlagSet("deploy", flag.ContinueOnError)
 	image := fs.String("image", "", "digest-pinned image reference")
 	tarball := fs.String("tarball", "", "path to source archive (tar.gz)")
-	repo := fs.String("repo", "", "GitHub repo to bind and deploy (owner/name)")
+	// Issue #739 / ADR-092: --repo pairs with --ref to drive the
+	// headless source-ref deploy (server-side foundation lives in
+	// cmd/apid/handlers_source_ref.go). The previous M7.5 dashboard
+	// browser flow is deleted in PR-B; --repo without --ref is an
+	// explicit 1-exit error.
+	repo := fs.String("repo", "", "GitHub repo to deploy from (owner/name)")
+	ref := fs.String("ref", "", "git ref for --repo (branch, tag, or 40-char SHA)")
 	templateName := fs.String("template", "", "start from an embedded template (run with a bad value to see available names)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine|node24|python313)")
@@ -777,7 +782,7 @@ func cmdDeployTarball(args []string) int {
 	// (and BEFORE the deploy body ships) — see deployManifestTriggers.
 	noTriggers := fs.Bool("no-triggers", false, "skip the `gregale.yaml` triggers fan-out (issue #791 PR-C)")
 	if err := fs.Parse(args); err != nil {
-		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME | --template NAME", "deploy")
+		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
 	}
 	// Issue #560: flag-pair mutex check (mirrors cmdApp /
@@ -842,22 +847,30 @@ func cmdDeployTarball(args []string) int {
 		slug = deriveName()
 	}
 
-	// --repo is the M7.5 git-deploy path. It opens the dashboard's
-	// repo-picker page where the customer finishes the bind (the
-	// picker needs the GitHub install token, which only the
-	// dashboard can use). Once bound, pushes auto-deploy.
+	// --repo is the headless source-ref deploy path (issue #739 /
+	// ADR-092). The previous M7.5 dashboard browser flow was deleted
+	// in PR-B; the server resolves the install token from
+	// github_installations, so CI runs need only FAAS_TOKEN + --ref.
 	if *repo != "" {
 		if err := validateRepoSlug(*repo); err != nil {
 			return printErr("Invalid --repo", err)
 		}
-		// Phase 3 guard: --repo is the dashboard browser flow; the
+		// --ref is required because the new endpoint needs a
+		// buildable commit. A bare --repo (no --ref) is almost
+		// always a CI mis-copy; reject before any side effects so
+		// the customer's first response is the explicit failure.
+		if *ref == "" {
+			PrintFail(os.Stderr, "missing --ref (required with --repo)")
+			return 1
+		}
+		// Phase 3 guard: --repo is the source-ref path; the
 		// one-key provision surface takes --tarball/--path, not
 		// --repo. Mixing them is almost always a mistake.
 		if *deployOnly != "" || *projectSlug != "" {
 			PrintFail(os.Stderr, "--repo cannot be combined with --only or --project-slug")
 			return 1
 		}
-		return cmdDeployRepo(slug, *repo)
+		return cmdDeployRepoSourceRef(slug, *repo, *ref)
 	}
 
 	// --template materializes an embedded starter project. For function
@@ -1161,29 +1174,6 @@ func cmdDeployTarball(args []string) int {
 		return jsonOut(writeJSON(dep))
 	}
 	return streamDeployLogs(client, dep)
-}
-
-// cmdDeployRepo binds (app, repo) via the dashboard and opens the
-// browser to the repo-picker page. The actual binding write goes
-// through the dashboard's /dashboard/account/connect-github flow
-// (slice 8) because that's where the OAuth install token lives.
-func cmdDeployRepo(slug, repoFullName string) int {
-	if _, err := authedClient(); err != nil {
-		return printErr("Not logged in", err)
-	}
-	target := dashboardRepoPickerURL(apiBase(), slug, repoFullName)
-	// Mid-string `→` here is semantic (binding repo X to app Y), not the
-	// §3.2 "in-progress" symbol. The leading glyph still routes through
-	// the gate so the prefix `→ ` strips under NO_COLOR / non-TTY.
-	PrintProgress(osStdout, "Opening %s to bind %s → %s", target, repoFullName, slug)
-	if err := browser.Open(target); err != nil {
-		// Fall back to a clickable copy if the opener is missing
-		// (sandboxed CI, no DISPLAY, etc.).
-		PrintFail(os.Stderr, "Could not open browser: %v", err)
-		fmt.Fprintf(os.Stderr, "  Open this URL manually:\n  %s\n", target)
-		return 0
-	}
-	return 0
 }
 
 // cmdRollback, cmdPark, cmdWake implement their eponymous routes.
@@ -2212,17 +2202,6 @@ func sanitizeSlugForURL(slug string) string {
 		return appSlugFallback
 	}
 	return string(out)
-}
-
-// dashboardRepoPickerURL is where the customer finishes the repo
-// bind (after `gregale deploy --repo` opens it). The dashboard reads
-// `app` and `repo` from the query string and pre-selects the form.
-func dashboardRepoPickerURL(api, slug, repoFullName string) string {
-	u := dashboardBaseURL(api) + "/dashboard/connect/repos"
-	q := url.Values{}
-	q.Set("app", slug)
-	q.Set("repo", repoFullName)
-	return u + "?" + q.Encode()
 }
 
 // validateRepoSlug checks the owner/name shape so a malformed

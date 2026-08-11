@@ -667,8 +667,10 @@ func cmdPlan(args []string) int {
 // --- dashboard -------------------------------------------------------------
 
 // cmdDashboard opens the account-level dashboard in the browser. Same
-// fallback-to-URL pattern as cmdDeployRepo (commands2.go:283-288). Tests
-// substitute browser.Default via withRecorder.
+// fallback-to-URL pattern as the (now-removed) M7.5 repo-picker
+// browser flow — the URL is always printed so a missing $DISPLAY
+// degrades gracefully. Tests substitute browser.Default via
+// withRecorder.
 //
 // --stateless (Move 1 PR-A) opens /dashboard/stateless instead — the
 // customer-facing landing page for the stateless contract (the
@@ -681,7 +683,8 @@ func cmdPlan(args []string) int {
 // Exit code on browser-open failure: 0, intentionally. The URL is
 // printed to stderr so the customer can paste it into a browser
 // themselves — the work the customer asked for (giving them the
-// dashboard URL) is done. Mirrors cmdDeployRepo and matches the §11
+// dashboard URL) is done. Mirrors the (now-removed) repo-picker
+// fallback pattern and matches the §11
 // "open the URL, fall back gracefully" UX convention. Exit 1 here
 // would make CI scripts and `&&`-chained shell commands treat a
 // missing $DISPLAY as a hard failure, which is the wrong signal.
