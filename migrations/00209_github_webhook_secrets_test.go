@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00208_github_webhook_secrets.sql
+// Migration-apply test for 00209_github_webhook_secrets.sql
 // (PR-D / ADR-012 §7 amendment — per-tenant webhook secret).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00208 (no goose
+//  1. Migration set applies cleanly through 00209 (no goose
 //     duplicate-version panic). PR-D carries no sibling fences on
 //     the branch tip — the fence 00208_reserve_slot.sql was
 //     squashed into this real migration via `git rm` + `git add`
@@ -26,6 +26,10 @@
 //     MigrateUp twice. The migration's IF NOT EXISTS guard
 //     makes the second pass a no-op; the harness fails loudly if
 //     the second pass errors.
+//  7. github_webhook_secret_changed pg_notify trigger is present
+//     on github_webhook_secrets and fires after INSERT/UPDATE.
+//     Inserted as the api/githubd cache-invalidation bridge
+//     (cmd/githubd/main.go listens).
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -38,7 +42,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00208_GithubWebhookSecrets(t *testing.T) {
+func TestMigrations_00209_GithubWebhookSecrets(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -201,4 +205,22 @@ func TestMigrations_00208_GithubWebhookSecrets(t *testing.T) {
 	}
 	// Cleanup so the test is idempotent within the same apply walk.
 	_, _ = pool.Exec(ctx, `DELETE FROM github_webhook_secrets WHERE installation_id = $1`, int64(42))
+
+	// (7) pg_notify trigger exists. The trigger is the
+	// api/githubd cache-invalidation bridge: cmd/githubd/main.go
+	// LISTENs on github_webhook_secret_changed and drops the
+	// cached entry on every row INSERT/UPDATE. If the trigger is
+	// missing, the daemon-side resolver's Invalidate() is dead
+	// code (the only thing that would call it is pg_notify).
+	var triggerName string
+	err = pool.QueryRow(ctx, `
+		SELECT trigger_name
+		FROM information_schema.triggers
+		WHERE event_object_schema = current_schema()
+		  AND event_object_table   = 'github_webhook_secrets'
+		  AND trigger_name         = 'github_webhook_secrets_notify_trg'
+	`).Scan(&triggerName)
+	if err != nil {
+		t.Errorf("github_webhook_secrets_notify_trg missing: %v", err)
+	}
 }

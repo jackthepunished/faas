@@ -37,6 +37,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -133,11 +134,7 @@ func githubWebhookSecretSet(args []string) int {
 	if jsonOutput {
 		return jsonOut(writeJSON(resp))
 	}
-	if resp.UpgradedAt != "" {
-		PrintOK(osStdout, "github-webhook-secret: installation_id=%d upgraded_at=%s upgraded_by=%s",
-			*installationID, resp.UpgradedAt, resp.UpgradedBy)
-	} else {
-		PrintOK(osStdout, "github-webhook-secret: installation_id=%d set", *installationID)
-	}
+	PrintOK(osStdout, "github-webhook-secret: installation_id=%d upgraded_at=%s upgraded_by=%s",
+		*installationID, resp.UpgradedAt.Format(time.RFC3339), resp.UpgradedBy)
 	return 0
 }

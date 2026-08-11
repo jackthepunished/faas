@@ -272,9 +272,22 @@ var _ = time.Time{}
 // `githubd_checks_call_total{status="http_error"}` is bumped on
 // each error.
 var (
-	checksCoalesceMu    sync.Mutex
-	checksCoalesceCache = map[string]githubdgrpc.CheckPhase{}
+	checksCoalesceMu      sync.Mutex
+	checksCoalesceCache   = map[string]checksCoalesceEntry{}
+	checksCoalesceMinAge  = 1 * time.Hour
+	checksCoalesceJanitor = 1 * time.Minute
 )
+
+// checksCoalesceEntry tracks the last-reported phase per (repo,
+// sha) plus the wall-clock instant of the last successful POST.
+// The cachedAt timestamp is what the janitor keys on to evict
+// stale entries — without it, the map grows unboundedly across
+// hot repos (a single GitHub App install can have thousands of
+// active (repo, sha) tuples over its lifetime).
+type checksCoalesceEntry struct {
+	phase    githubdgrpc.CheckPhase
+	cachedAt time.Time
+}
 
 // WriteCheckCoalesced wraps ChecksAPI.WriteCheck with per-(repo, sha)
 // phase coalescing. Returns nil on a same-phase replay; otherwise
@@ -287,7 +300,7 @@ func WriteCheckCoalesced(ctx context.Context, c ChecksWriter, repoFullName, comm
 	checksCoalesceMu.Lock()
 	last, seen := checksCoalesceCache[key]
 	checksCoalesceMu.Unlock()
-	if seen && last == phase {
+	if seen && last.phase == phase {
 		checksCallCounter.WithLabelValues("skipped_coalesced").Inc()
 		return nil
 	}
@@ -297,10 +310,30 @@ func WriteCheckCoalesced(ctx context.Context, c ChecksWriter, repoFullName, comm
 		return err
 	}
 	checksCoalesceMu.Lock()
-	checksCoalesceCache[key] = phase
+	checksCoalesceCache[key] = checksCoalesceEntry{phase: phase, cachedAt: time.Now()}
 	checksCoalesceMu.Unlock()
 	checksCallCounter.WithLabelValues("posted").Inc()
 	return nil
+}
+
+// checksCoalesceJanitorLoop evicts entries older than
+// checksCoalesceMinAge. Without a janitor the map grows
+// unboundedly across a daemon's lifetime (test finding #4).
+// The loop runs forever; the daemon is the only process that owns
+// the package, so the goroutine exits with the process.
+func checksCoalesceJanitorLoop() {
+	t := time.NewTicker(checksCoalesceJanitor)
+	defer t.Stop()
+	for range t.C {
+		cutoff := time.Now().Add(-checksCoalesceMinAge)
+		checksCoalesceMu.Lock()
+		for k, v := range checksCoalesceCache {
+			if v.cachedAt.Before(cutoff) {
+				delete(checksCoalesceCache, k)
+			}
+		}
+		checksCoalesceMu.Unlock()
+	}
 }
 
 // checksCallCounter is the Prometheus counter exposed by
@@ -320,4 +353,5 @@ func init() {
 	checksCallCounterOnce.Do(func() {
 		prometheus.MustRegister(checksCallCounter)
 	})
+	go checksCoalesceJanitorLoop()
 }

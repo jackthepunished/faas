@@ -275,6 +275,15 @@ const (
 	//   against notify loss. Consumed by cmd/gatewayd-internal/
 	//   backend.go (PR 8).
 	NotifyEdgeRuleChanged = "edge_rule_changed"
+	// NotifyGithubWebhookSecretChanged {"installation_id":bigint}
+	//   apid → githubd (PR-D / ADR-012 §7 amendment): a row in
+	//   github_webhook_secrets was rotated via the admin endpoint.
+	//   The githubd resolver listens and drops its cached entry so
+	//   the next webhook for that install rebuilds from the DB
+	//   (avoiding the 60s TTL fail-closed window). The payload is
+	//   informational — the consumer re-reads the row to defend
+	//   against notify loss. Consumed by cmd/githubd/main.go.
+	NotifyGithubWebhookSecretChanged = "github_webhook_secret_changed"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

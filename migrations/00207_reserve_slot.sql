@@ -1,5 +1,11 @@
 -- filename: 00207_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
+-- Reserve slot 207 for PR #826's 00207_compute_node_heartbeats_stats.
+-- PR-D (this branch) needs the contiguity gate to pass on its
+-- local tip before force-pushing. The fence file was committed
+-- per the cross-pr-slot-fence-pagination-gate pattern; it
+-- becomes a no-op once PR #826 lands and the real migration
+-- squashes this fence via `git rm migrations/00207_reserve_slot.sql`.
 SELECT 1;
 -- +goose StatementEnd

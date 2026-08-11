@@ -2066,9 +2066,9 @@ func (c *Client) UpdateAppSecurity(ctx context.Context, slug string, req AppSecu
 // the given installation_id (PR-D / ADR-012 §7 amendment). The
 // server hex-decodes SecretHex and writes the raw bytes to
 // github_webhook_secrets. ON CONFLICT DO UPDATE so a rotation
-// is a single idempotent call (re-running the same command
-// with the same secret returns the existing UpgradedAt — no
-// silent last-write-wins bump).
+// is a single idempotent call — every successful call bumps
+// upgraded_at (the audit trail; an operator re-running with
+// the same secret is itself a rotation event worth recording).
 //
 // Auth: admin-scoped API key (ScopesAdminOnly +
 // adminAllows email allowlist). The handler also emits

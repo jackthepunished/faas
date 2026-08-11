@@ -172,12 +172,13 @@ func (r *PGWebhookSecretResolver) Resolve(ctx context.Context, installationID in
 	r.mu.Unlock()
 
 	if err != nil {
-		// State.ErrNotFound is the expected miss — the platform
+		// state.ErrNotFound is the expected miss — the platform
 		// secret (FAAS_GITHUB_WEBHOOK_SECRET) is the fallback
 		// for installs that haven't been migrated yet. Other
 		// errors are DB outage; emit at Warn so the on-call
-		// sees them.
-		if errors.Is(err, errSecretNotFound) || isNotFound(err) {
+		// sees them. (isNotFound uses string matching — see the
+		// helper for the import-cycle rationale.)
+		if isNotFound(err) {
 			r.log.Info("githubd: webhook secret: per-tenant miss; falling back to platform secret",
 				"installation_id", installationID)
 			return nil, errSecretNotFound
@@ -194,6 +195,44 @@ func (r *PGWebhookSecretResolver) Resolve(ctx context.Context, installationID in
 func (r *PGWebhookSecretResolver) Invalidate(installationID int64) {
 	r.mu.Lock()
 	delete(r.items, installationID)
+	r.mu.Unlock()
+}
+
+// StartJanitor spawns a goroutine that evicts expired entries
+// every minute. Without it, r.items grows unboundedly across
+// the daemon's lifetime (test finding #4). Callers invoke the
+// returned stop func on ctx cancel. The pattern mirrors
+// pkg/githubd/tokencache.go::StartJanitor.
+func (r *PGWebhookSecretResolver) StartJanitor(ctx context.Context) (stop func()) {
+	stopCh := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopCh:
+				return
+			case <-t.C:
+				r.janitorSweep()
+			}
+		}
+	}()
+	return func() { close(stopCh) }
+}
+
+// janitorSweep evicts entries whose expiresAt is in the past.
+// Runs under r.mu. The sweep is O(n) over the map; even with
+// 10k active installs the loop completes in microseconds.
+func (r *PGWebhookSecretResolver) janitorSweep() {
+	now := r.clock()
+	r.mu.Lock()
+	for id, e := range r.items {
+		if !e.expiresAt.After(now) {
+			delete(r.items, id)
+		}
+	}
 	r.mu.Unlock()
 }
 

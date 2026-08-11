@@ -198,6 +198,7 @@ message ExchangeOAuthCodeRequest {
 }
 message ExchangeOAuthCodeResponse {
   string installation_id = 1;
+  string default_branch  = 2; // empty when unavailable; bind picker pre-fills from this
 }
 
 message Repo {

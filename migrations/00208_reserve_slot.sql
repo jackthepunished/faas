@@ -1,0 +1,17 @@
+-- filename: 00208_reserve_slot.sql
+-- +goose Up
+-- +goose StatementBegin
+-- Reserve slot 208 for PR-D (the GitHub deploy pipeline final
+-- slice / per-tenant webhook secret + Checks API writer +
+-- default_branch) on the local branch. PR-D's real migration
+-- landed at slot 208 but was renumbered to 209 after PR #826's
+-- 00207_compute_node_heartbeats_stats materialised on the
+-- contribution graph (slot 207 was missing on the local branch
+-- tip, breaking the migrations/embed_test.go contiguity check).
+-- The cross-pr-slot-fence-pagination-gate pattern requires this
+-- file to land before the real migration so the renumber chain
+-- doesn't collide if PR #826 and PR-D land in the same merge
+-- window. Replace with `git rm` once the real migration's slot
+-- is stable.
+SELECT 1;
+-- +goose StatementEnd

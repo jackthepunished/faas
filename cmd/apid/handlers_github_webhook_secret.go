@@ -26,9 +26,12 @@
 // leaked admin key from rotating a webhook secret for a
 // different tenant's GitHub App install.
 //
-// Idempotency: re-running with the same secret returns the
-// original `upgraded_at` (no last-write-wins bump). The
-// Prometheus counter
+// Idempotency: the SQL is `ON CONFLICT (installation_id) DO
+// UPDATE SET upgraded_at = now()`. Every successful call — even
+// a re-run with the same secret — bumps `upgraded_at` and
+// refreshes `upgraded_by`. The bump is the audit trail; an
+// operator re-running the same secret is itself a rotation
+// event worth recording. The Prometheus counter
 // `githubd_webhook_secret_total{status="set"}` is emitted on
 // every successful call so a dashboard alert can flag
 // unexpected rotation frequency.
