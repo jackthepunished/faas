@@ -1,0 +1,46 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00198_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / cross-PR gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path beyond goose writing a row to goose_db_version. The
+-- replay-safety gate in ci.yml drops files whose basename matches
+-- the reservation regex from its "added migration versions"
+-- computation (see scripts/ci/check_migration_slots.sh ::
+-- reserved_from_paths), so this file is carved out of the
+-- cross-PR overlap check.
+--
+-- Context: PR-A (ADR-090 / app_envs.scope PK widening) has
+-- renumbered twice under ADR-041 seniority rules:
+--   00198 → 00199 (after PR #819, open since 2026-08-10T16:52:56Z,
+--     claimed 00198 for webhook_event_allowlist_cron_fired_manually)
+--   00199 → 00200 (after PR #826, open since 2026-08-10T18:33:41Z,
+--     claimed 00199 for compute_node_heartbeats_stats with a fence
+--     at 00198)
+-- PR #819 is senior on slot 00198; PR #826 is senior on slot 00199.
+-- This branch carries this 00198 fence and a sibling 00199 fence
+-- (see migrations/00199_reserve_slot.sql) to satisfy
+-- TestMigrationsContiguous on the branch tip before either senior
+-- PR lands. Once PR #819 and PR #826 land first, both fences
+-- become duplicate-version collisions against the real migrations
+-- at the same slots and must be removed in a follow-up commit on
+-- this branch. If PR-A lands first (unlikely — both #819 and
+-- #826 are senior), the fences survive on main as no-ops until
+-- someone cleans them up.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
