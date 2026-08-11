@@ -26,7 +26,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 
 	"github.com/onebox-faas/faas/pkg/edgevalidate"
@@ -170,13 +169,13 @@ func translateValidateErr(err error) error {
 	}
 	switch {
 	case errors.Is(err, edgevalidate.ErrSchemaExternalRef):
-		return fmt.Errorf("%w: %v", gateway.ErrValidateSchemaExternalRef, err)
+		return errors.Join(gateway.ErrValidateSchemaExternalRef, err)
 	case errors.Is(err, edgevalidate.ErrSchemaInvalid):
-		return fmt.Errorf("%w: %v", gateway.ErrValidateSchemaInvalid, err)
+		return errors.Join(gateway.ErrValidateSchemaInvalid, err)
 	case errors.Is(err, edgevalidate.ErrSchemaEmpty):
-		return fmt.Errorf("%w: %v", gateway.ErrValidateSchemaEmpty, err)
+		return errors.Join(gateway.ErrValidateSchemaEmpty, err)
 	case errors.Is(err, edgevalidate.ErrSchemaTooLarge):
-		return fmt.Errorf("%w: %v", gateway.ErrValidateSchemaTooLarge, err)
+		return errors.Join(gateway.ErrValidateSchemaTooLarge, err)
 	}
 	return err
 }

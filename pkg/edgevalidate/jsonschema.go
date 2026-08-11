@@ -3,6 +3,7 @@ package edgevalidate
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -39,10 +40,12 @@ type CompiledSchema struct {
 // side.
 var schemaRefURLPattern = regexp.MustCompile(`(?i)"\$(?:ref|id)"\s*:\s*"[a-z][a-z0-9+.-]*://`)
 
-// jsonschemaDraft is the single Draft 2020-12 entrypoint. The
-// library uses Draft2020 (the spec alias for 2020-12); pinning
-// here so the dependency upgrade surface is one line.
-var jsonschemaDraft = jsonschema.Draft2020
+// jsonschemaDraft2020 is the singleton Draft 2020-12 value.
+// The library uses Draft2020 (the spec alias for 2020-12); pinning
+// here so the dependency upgrade surface is one line. The
+// schemaMempool factory below takes the address (`*Draft`) so the
+// pointer is stable across Compiler instances.
+var jsonschemaDraft2020 = *jsonschema.Draft2020
 
 // defaultPrinter mirrors jsonschema/v6's package-private
 // defaultPrinter. LocalizedString panics on nil printer (per
@@ -76,10 +79,6 @@ var schemaMempool = sync.Pool{
 		return c
 	},
 }
-
-// jsonschemaDraft2020 is the singleton Draft 2020-12 value.
-// Library upgrade surface is one line: bump this constant.
-var jsonschemaDraft2020 = *jsonschema.Draft2020
 
 // schemaIDCounter is an atomic counter paired with the pool. It
 // guarantees that every Compile call uses a unique URL even when
@@ -127,14 +126,14 @@ func Compile(schema []byte, rejectUnknownFields bool) (*CompiledSchema, error) {
 
 	var doc any
 	if err := json.Unmarshal(schema, &doc); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrSchemaInvalid, err)
+		return nil, errors.Join(ErrSchemaInvalid, err)
 	}
 	if err := compiler.AddResource(loc, doc); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrSchemaInvalid, err)
+		return nil, errors.Join(ErrSchemaInvalid, err)
 	}
 	compiled, err := compiler.Compile(loc)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrSchemaInvalid, err)
+		return nil, errors.Join(ErrSchemaInvalid, err)
 	}
 
 	_ = rejectUnknownFields // reserved for future audit-tag-only path.
@@ -155,20 +154,26 @@ func (c *CompiledSchema) Validate(body []byte) (*FieldError, error) {
 	var v any
 	if err := json.Unmarshal(body, &v); err != nil {
 		// Body is not JSON. Treat as a single-field failure
-		// with the path "" (root) and the expected "json".
-		return &FieldError{Field: "", Expected: "json", Got: "non-json"}, nil
+		// with the path "" (root) and the expected "json"
+		// rather than bubbling the unmarshal error — the
+		// customer-facing shape is a 422 with `errors[]`,
+		// not a 500. The audit log records the matching
+		// schema_digest + sample first-byte for forensics.
+		return &FieldError{Field: "", Expected: "json", Got: "non-json"}, nil //nolint:nilerr
 	}
 	if err := c.Schema.Validate(v); err != nil {
-		// jsonschema/v6 returns a *ValidationError. Cast and
-		// translate.
-		if ve, ok := err.(*jsonschema.ValidationError); ok {
+		// jsonschema/v6 returns a *ValidationError. errors.As
+		// walks the wrap chain (the library nests via
+		// Causes) so a wrapped ValidationError still resolves.
+		var ve *jsonschema.ValidationError
+		if errors.As(err, &ve) {
 			return translateValidationError(ve), nil
 		}
 		// Some other error: the schema is structurally
 		// broken (e.g. keyword violation at the schema
 		// itself). Treat as schema-invalid; caller maps to
 		// 500.
-		return nil, fmt.Errorf("%w: %v", ErrSchemaInvalid, err)
+		return nil, errors.Join(ErrSchemaInvalid, err)
 	}
 	return nil, nil
 }
@@ -277,11 +282,4 @@ func extractFirstExternalRef(schema []byte) string {
 		return raw
 	}
 	return raw
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
