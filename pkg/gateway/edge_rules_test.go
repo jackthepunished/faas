@@ -665,6 +665,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 	ip []EdgeRuleIPResolved,
 	validate []EdgeRuleValidateResolved,
 	limit []EdgeRuleLimitResolved,
+	geo []EdgeRuleGeoResolved,
 ) {
 	c.Put(host, &HostEntry{
 		Host:     host,
@@ -677,6 +678,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 		IP:       ip,
 		Validate: validate,
 		Limit:    limit,
+		Geo:      geo,
 	})
 }
 
@@ -952,6 +954,7 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 						[]EdgeRuleIPResolved{sampleIPRule("ip", j, hostA)},
 						[]EdgeRuleValidateResolved{sampleValidateRule("vd", j, hostA)},
 						[]EdgeRuleLimitResolved{sampleLimitRule("lm", j, hostA)},
+						[]EdgeRuleGeoResolved{sampleGeoRule("geo", j, nil, nil, "")},
 					)
 				case 1:
 					_, _ = c.Get(hostA)
@@ -965,7 +968,7 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 				case 3:
 					putEntryAll(c, hostB,
 						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
-						nil, nil, nil, nil, nil, nil, nil, nil,
+nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					)
 				}
 			}
@@ -1022,6 +1025,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 					[]EdgeRuleIPResolved{sampleIPRule("ip", i, host)},
 					[]EdgeRuleValidateResolved{sampleValidateRule("vd", i, host)},
 					[]EdgeRuleLimitResolved{sampleLimitRule("lm", i, host)},
+					[]EdgeRuleGeoResolved{sampleGeoRule("geo", i, nil, nil, "")},
 				)
 			case 1: // GetK (any kind)
 				_, _ = c.Get(host)
