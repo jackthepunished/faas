@@ -806,12 +806,9 @@ customers. Two extra series are emitted from `gatewayd-internal`
 behind the two-level opt-in (operator kill-switch + per-app
 `apps.route_metrics_enabled`):
 
-- `gateway_requests_total{app,plan,route,code}` (counter, paired
-  with the existing `{app,code}` series)
-- `gateway_request_duration_seconds{app,route,class}` (histogram,
-  paired with the existing `{app,class}` histogram)
-- `gateway_request_failures_total{app,plan,route,code}` (counter,
-  paired with the existing `{app,plan,code}` failures counter)
+- `gateway_requests_by_route_total{app,plan,route,code}` (counter)
+- `gateway_request_duration_by_route_seconds{app,route,class}` (histogram)
+- `gateway_request_failures_by_route_total{app,plan,route,code}` (counter)
 
 The `route` label is method + raw path (pre-edge-rule-rewrite),
 bounded per app to 50 distinct real routes + the reserved

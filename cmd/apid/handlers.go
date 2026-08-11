@@ -295,8 +295,8 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	return state.App{
 		AccountID: acct.ID, Slug: req.Slug, Type: typ, Runtime: req.Runtime,
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
-		StreamingEnabled:    streaming,
-		WebSocketEnabled:    ws,
+		StreamingEnabled: streaming,
+		WebSocketEnabled: ws,
 		// ADR-093: per-route observability opt-in (plan-level
 		// default applied via the block above). Mirrors the
 		// WebSocketEnabled shape — the per-plan default is

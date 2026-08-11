@@ -1,4 +1,4 @@
--- filename: 00212_apps_route_metrics_enabled.sql
+-- filename: 00216_apps_route_metrics_enabled.sql
 -- +goose Up
 -- Add per-app route-metrics opt-in flag (ADR-093). When true, the
 -- gatewayd-internal handler emits three additional Prometheus

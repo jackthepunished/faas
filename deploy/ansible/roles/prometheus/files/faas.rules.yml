@@ -315,7 +315,7 @@ groups:
       # ─────────────────────────────────────────────────────────────────
       - alert: FaasApiAvailabilityLow
         expr: |
-          (sum(rate(gateway_requests_total{code=~"2.."}[5m]))
+          (sum(rate(gateway_requests_by_route_total{code=~"2.."}[5m]))
             /
           sum(rate(gateway_requests_total[5m])))
             < 0.995
@@ -889,7 +889,7 @@ groups:
       # is path-fuzzing their app".
       - alert: GatewayWildcardRoute
         expr: |
-          sum by (app, route) (rate(gateway_requests_total{route="__route_other__"}[5m])) > 1
+          sum by (app, route) (rate(gateway_requests_by_route_total{route="__route_other__"}[5m])) > 1
         for: 10m
         labels:
           severity: info
@@ -897,7 +897,7 @@ groups:
           family: route_metrics
         annotations:
           summary: "App {{ $labels.app }} sustained in __route_other__ overflow for 10m"
-          description: "gateway_requests_total{route=__route_other__, app={{ $labels.app }}} has been above 1 reqps for 10m. The bounded admission set (50 routes + the __route_other__ bucket, ADR-093 D2) is collapsing distinct paths because the app is generating more than 50 distinct routes. Two interpretations: (1) the customer deployed a wildcard route pattern (/users/{uuid}) and the per-route breakdown is intentionally collapsing; (2) the app is being path-fuzzed. Runbook: docs/runbooks/GatewayWildcardRoute.md."
+          description: "gateway_requests_by_route_total{route=__route_other__, app={{ $labels.app }}} has been above 1 reqps for 10m. The bounded admission set (50 routes + the __route_other__ bucket, ADR-093 D2) is collapsing distinct paths because the app is generating more than 50 distinct routes. Two interpretations: (1) the customer deployed a wildcard route pattern (/users/{uuid}) and the per-route breakdown is intentionally collapsing; (2) the app is being path-fuzzed. Runbook: docs/runbooks/GatewayWildcardRoute.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/GatewayWildcardRoute.md"
 
       - alert: FaasGithubdPathFilterDegradedWarn

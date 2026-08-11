@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply test for 00212_apps_route_metrics_enabled.sql (ADR-093).
+// Migration-apply test for 00216_apps_route_metrics_enabled.sql (ADR-093).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00212 against main's
+//  1. Migration set applies cleanly through 00216 against main's
 //     00206_webhook_event_allowlist_cron_fired_manually.sql (no goose
 //     duplicate-version panic).
 //  2. The new `route_metrics_enabled` column is present on `apps`
@@ -26,13 +26,14 @@ package migrations_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00212_AppsRouteMetricsEnabled(t *testing.T) {
+func TestMigrations_00216_AppsRouteMetricsEnabled(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -54,7 +55,7 @@ func TestMigrations_00212_AppsRouteMetricsEnabled(t *testing.T) {
 	if isNullable != "NO" {
 		t.Errorf("apps.route_metrics_enabled should be NOT NULL, got is_nullable=%q", isNullable)
 	}
-	if !contains(columnDefault, "false") {
+	if !strings.Contains(columnDefault, "false") {
 		t.Errorf("apps.route_metrics_enabled default should mention 'false', got %q", columnDefault)
 	}
 
@@ -71,10 +72,10 @@ func TestMigrations_00212_AppsRouteMetricsEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected apps_route_metrics_enabled_idx partial index to exist, got: %v", err)
 	}
-	if !contains(indexDef, "WHERE") {
+	if !strings.Contains(indexDef, "WHERE") {
 		t.Errorf("expected apps_route_metrics_enabled_idx to be a partial index, got %q", indexDef)
 	}
-	if !contains(indexDef, "route_metrics_enabled") {
+	if !strings.Contains(indexDef, "route_metrics_enabled") {
 		t.Errorf("expected apps_route_metrics_enabled_idx to mention route_metrics_enabled, got %q", indexDef)
 	}
 
@@ -132,16 +133,3 @@ func TestMigrations_00212_AppsRouteMetricsEnabled(t *testing.T) {
 	}
 }
 
-// contains is a small substring helper to avoid pulling strings
-// into the package import list for a single use.
-func contains(s, sub string) bool {
-	if sub == "" {
-		return true
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}

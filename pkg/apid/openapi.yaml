@@ -1414,39 +1414,12 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [routes]
-                properties:
-                  routes:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/RouteRow'
+                $ref: '#/components/schemas/AppRoutesResponse'
               example:
-                routes:
-                  - route: "GET /users"
-                    count: 8210
-                    p50_ms: 12.4
-                    p95_ms: 41.0
-                    p99_ms: 167.5
-                    error_pct: 0.2
-                  - route: "POST /payments"
-                    count: 1820
-                    p50_ms: 58.0
-                    p95_ms: 182.0
-                    p99_ms: 410.0
-                    error_pct: 0.8
-                  - route: "GET /products"
-                    count: 4320
-                    p50_ms: 9.0
-                    p95_ms: 28.0
-                    p99_ms: 91.0
-                    error_pct: 0.1
-                  - route: "__route_other__"
-                    count: 103
-                    p50_ms: 22.0
-                    p95_ms: 84.0
-                    p99_ms: 220.0
-                    error_pct: 0.0
+                slug: my-api
+                app_id: 11111111-1111-1111-1111-111111111111
+                routes: ["GET /users", "POST /orders", "__route_other__"]
+                source: live
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -10118,6 +10091,30 @@ components:
           minimum: 0
           maximum: 100
           description: "Share of [45]xx requests with this route in the window."
+          x-since: "2026-08"
+          x-issue: "273"
+
+    AppRoutesResponse:
+      description: |
+        Per-route label snapshot (ADR-093). The bounded route label
+        set the gatewayd-internal control listener emits for the app.
+        Each item is `"<METHOD> <PATH>"` (pre-edge-rule-rewrite) for
+        an admitted route, or the reserved `"__route_other__"` overflow
+        bucket label. Bounded at 50 distinct real routes + the reserved
+        overflow per app (ADR-093 D2).
+      type: object
+      required: [slug, routes, source]
+      properties:
+        slug: {type: string, x-since: "2026-08", x-issue: "273"}
+        app_id: {type: string, x-since: "2026-08", x-issue: "273"}
+        routes:
+          type: array
+          items: {type: string}
+          x-since: "2026-08"
+          x-issue: "273"
+        source:
+          type: string
+          enum: ["live", "unavailable"]
           x-since: "2026-08"
           x-issue: "273"
 

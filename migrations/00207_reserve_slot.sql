@@ -1,5 +1,14 @@
 -- filename: 00207_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
+-- Reserve slot 207 for PR #845 (edge_rules_kind_geo.sql, ADR-091
+-- D21/D22/D23). Same fence rationale as 00210; see
+-- cross-pr-slot-fence-pagination-gate for the pattern. This
+-- fence is what keeps the local embed set contiguous while
+-- PR #845's real migration lands.
+--
+-- The fence will be removed when PR #845 lands. ADR-093's
+-- real migration sits at 00216, beyond PR #845's 00207, so
+-- the cross-PR slot gate stays clean.
 SELECT 1;
 -- +goose StatementEnd

@@ -1415,7 +1415,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// /v1/internal/apps/bar/routes both reach here.
 			// The handler itself trims the prefix and reads
 			// the slug from r.URL.Path.
-			resolve := gateway.ResolveSlugFn(func(slug string) (string, bool) {
+			resolve := gateway.ResolveSlugFn(func(slug string) (string, bool) { //nolint:contextcheck // ADR-093 ResolveSlugFn signature is fixed; ctx captured from per-request r.Context().
 				a, err := pgStore.AppBySlug(r.Context(), slug)
 				if err != nil || a.ID == "" {
 					return "", false
