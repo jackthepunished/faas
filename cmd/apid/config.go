@@ -45,13 +45,22 @@ type Config struct {
 	// AdvisorySock is the unix-domain socket the stateless-advisory
 	// gRPC server binds when set (vmmd dials /run/faas/apid.sock to
 	// forward fanotify batches from guest-init). Empty disables.
-	// Mirrors FAAS_APID_ADVISORY_SOCK. Defaults to /run/faas/apid.sock.
+	// Mirrors FAAS_APID_ADVISORY_SOCK.
+	//
+	// PR-0 (issue #678): default stays empty (the pre-PR-0 env-only
+	// shape). Setting a non-empty default here would auto-enable the
+	// listener on every e2e test that doesn't set the env var, and
+	// the bind fails in CI because the systemd-owned `faas-apid`
+	// user isn't present in the test container. Production sets
+	// the env (or the TOML key) to opt in.
 	AdvisorySock string `toml:"advisory_sock"`
 
 	// GithubdBridgeSock is the unix-domain socket the githubd → apid
 	// build-enqueue bridge gRPC server binds when set. Empty disables.
-	// Mirrors FAAS_APID_GITHUBD_BRIDGE_SOCK. Defaults to
-	// /run/faas/apid-githubd.sock.
+	// Mirrors FAAS_APID_GITHUBD_BRIDGE_SOCK.
+	//
+	// PR-0 (issue #678): default stays empty for the same reason as
+	// AdvisorySock (CI users `faas-githubd` doesn't exist either).
 	GithubdBridgeSock string `toml:"githubd_bridge_sock"`
 
 	// GithubdSocket is the unix-domain socket apid dials to call
@@ -124,16 +133,21 @@ type Config struct {
 // containerised-deploys path (no TOML in those images).
 func LoadConfig(path string) (*Config, error) {
 	c := &Config{
-		// Defaults match the legacy FAAS_APID_LISTEN,
-		// FAAS_APID_ADVISORY_SOCK, FAAS_APID_GITHUBD_BRIDGE_SOCK
-		// and FAAS_GITHUBD_SOCKET values so a partial / missing
-		// toml behaves the same as the pre-PR-#678 inline-env path.
-		// PR-0 is behaviour-preserving; these defaults keep
-		// single-box dev booting unchanged.
-		ListenAddr:        "127.0.0.1:8081",
-		AdvisorySock:      "/run/faas/apid.sock",
-		GithubdBridgeSock: "/run/faas/apid-githubd.sock",
-		GithubdSocket:     "/run/faas/githubd.sock",
+		// Defaults match the legacy FAAS_APID_LISTEN and
+		// FAAS_GITHUBD_SOCKET values so a partial / missing
+		// toml behaves the same as the pre-PR-#678 inline-env
+		// path. PR-0 is behaviour-preserving; these defaults
+		// keep single-box dev booting unchanged.
+		//
+		// AdvisorySock + GithubdBridgeSock are intentionally NOT
+		// defaulted here — pre-PR-0 the corresponding env vars
+		// were the only source, and an empty value disabled the
+		// listener. Setting non-empty defaults would auto-enable
+		// the listeners on every e2e test, and the unix-socket
+		// bind fails in CI (the per-daemon unix user `faas-apid`
+		// / `faas-githubd` doesn't exist in the test container).
+		ListenAddr:    "127.0.0.1:8081",
+		GithubdSocket: "/run/faas/githubd.sock",
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

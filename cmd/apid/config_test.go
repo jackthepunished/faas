@@ -19,11 +19,14 @@ func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
 	if cfg.ListenAddr != "127.0.0.1:8081" {
 		t.Errorf("ListenAddr = %q, want default", cfg.ListenAddr)
 	}
-	if cfg.AdvisorySock != "/run/faas/apid.sock" {
-		t.Errorf("AdvisorySock = %q, want default", cfg.AdvisorySock)
+	// AdvisorySock + GithubdBridgeSock default to empty (env-only
+	// enable, same as pre-PR-0). Non-empty defaults would auto-bind
+	// the unix socket in CI where the per-daemon user doesn't exist.
+	if cfg.AdvisorySock != "" {
+		t.Errorf("AdvisorySock = %q, want empty (env-only enable)", cfg.AdvisorySock)
 	}
-	if cfg.GithubdBridgeSock != "/run/faas/apid-githubd.sock" {
-		t.Errorf("GithubdBridgeSock = %q, want default", cfg.GithubdBridgeSock)
+	if cfg.GithubdBridgeSock != "" {
+		t.Errorf("GithubdBridgeSock = %q, want empty (env-only enable)", cfg.GithubdBridgeSock)
 	}
 	if cfg.GithubdSocket != "/run/faas/githubd.sock" {
 		t.Errorf("GithubdSocket = %q, want default", cfg.GithubdSocket)
@@ -123,8 +126,8 @@ func TestLoadConfig_PartialTOMLKeepsDefaults(t *testing.T) {
 	if cfg.ListenAddr != "127.0.0.1:8081" {
 		t.Errorf("ListenAddr = %q (default lost after partial unmarshal)", cfg.ListenAddr)
 	}
-	if cfg.AdvisorySock != "/run/faas/apid.sock" {
-		t.Errorf("AdvisorySock = %q (default lost)", cfg.AdvisorySock)
+	if cfg.AdvisorySock != "" {
+		t.Errorf("AdvisorySock = %q, want empty (env-only enable)", cfg.AdvisorySock)
 	}
 }
 
