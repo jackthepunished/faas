@@ -2931,6 +2931,14 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetWebSocketEnabled {
 		a.WebSocketEnabled = boolOrFalse(p.WebSocketEnabled)
 	}
+	// ADR-093: per-route observability opt-in. Same Set-bit
+	// convention as WebSocketEnabled above — the Set bit
+	// distinguishes "don't touch" from "explicit false" (opt out
+	// of per-route metrics). Apid already gated the plan; the
+	// store is a plain column write.
+	if p.SetRouteMetricsEnabled {
+		a.RouteMetricsEnabled = boolOrFalse(p.RouteMetricsEnabled)
+	}
 	// Issue #462 / ADR-058 / PR-A: per-app scaling policy. The
 	// Set bit is the canonical "unset vs explicit zero" signal;
 	// when Set is true the jsonb column is overwritten (deep-copied

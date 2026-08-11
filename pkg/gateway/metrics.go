@@ -213,6 +213,39 @@ type Metrics struct {
 	// SLO-clustered buckets (0.35/0.8s): this histogram must resolve
 	// sub-100ms warm responses AND multi-second slow ones.
 	requestDuration *prometheus.HistogramVec
+	// requestsByRoute backs the per-route observability counter
+	// (ADR-093 / issue #273 — opt-in follow-up to ADR-042 §1).
+	// Labels: app, plan, route, code. The `route` label admits
+	// through the bounded routeLabelSet per app (cap = 50 + the
+	// reserved __route_other__ overflow bucket); the cap is
+	// app.RouteMetricsEnabled AND the operator kill-switch
+	// (cmd/gatewayd-internal/config.go [route_metrics] enabled).
+	// When the cap is disabled, all admission collapses to the
+	// reserved empty-string "no appID" sentinel so the column
+	// never appears on /metrics — same shape as the existing
+	// `gateway_requests_total{app="-"}` series. The
+	// pre-instantiation loop in NewMetrics below must come AFTER
+	// the operator kill-switch is read — the daemon reads the
+	// config before NewMetrics returns, so the loop only emits
+	// the closed (plan) set under the empty-row placeholder when
+	// the operator has the feature disabled.
+	requestsByRoute *prometheus.CounterVec
+	// durationByRoute backs the per-route histogram
+	// (ADR-093 D4). Labels: app, route, class. Same bucket
+	// choice as the per-app requestDuration above (warm-friendly
+	// 0.005s..10s spread). The per-app per-route closed `class`
+	// set is pre-instantiated by PreInstantiateAppRoute after
+	// the route is admitted through routeLabelSet.
+	durationByRoute *prometheus.HistogramVec
+	// failuresByRoute backs the per-route failures counter
+	// (ADR-093 D4). Labels: app, plan, route, code. Mirrors
+	// the existing gateway_requests_total shape but adds
+	// `route`; the counter is incremented only when status
+	// ≥ 400 so the dashboard can compute error_rate_pct directly
+	// from the ratio without a separate error-rate histogram.
+	// Same operator kill-switch + customer-opt-in gate as
+	// requestsByRoute.
+	failuresByRoute *prometheus.CounterVec
 	// coldBoot backs the renamed gateway_cold_boot_total counter
 	// (issue #273 / ADR-042). Renamed outright from coldWake —
 	// gateway_cold_wake_total had zero external consumers (no
@@ -350,6 +383,39 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_compile_error_total",
 			Help: "Edge-rule compile-time errors caught by the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind"}),
+		// ADR-093 / issue #273 follow-up: per-route observability
+		// counters. The `route` label is admitted through the
+		// per-app routeLabelSet (cap = 50 + __route_other__
+		// overflow). The constructor does NOT pre-instantiate
+		// every (app, route, code) combo because the route label
+		// is unbounded — the routeLabelSet is the cap. The
+		// closed (plan, code) set is pre-instantiated below
+		// under the empty placeholder so the §12 dashboard panel
+		// for opt-in apps surfaces from the first scrape.
+		//
+		// The metric names carry the `_by_route` suffix to keep
+		// them disjoint from the pre-existing {app, plan, code}
+		// `gateway_requests_total` series — Prometheus rejects two
+		// CounterVecs with the same name but different label sets
+		// at registration time. Dashboards consuming
+		// `gateway_requests_by_route_total` etc. read the opt-in
+		// apps' per-route rows; the existing fleet-level
+		// `gateway_requests_total{app, plan, code}` is unchanged.
+		requestsByRoute: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_requests_by_route_total",
+			Help: "Per-route counter (ADR-093). Adds {route} as a 4th label when the app has apps.route_metrics_enabled=true; the per-app ADR-042 view is the same series with route omitted. route is method + raw path (pre-rewrite); admit() collapses wildcard-path overflow into the reserved __route_other__ bucket (cap = 50 per app).",
+		}, []string{"app", "plan", "route", "code"}),
+		durationByRoute: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_request_duration_by_route_seconds",
+			Help: "Per-route duration histogram (ADR-093). Adds {route} as a 3rd label when the app has apps.route_metrics_enabled=true; the per-app ADR-042 view is the same histogram with route omitted. The closed `class` set is pre-instantiated per app per admitted route via PreInstantiateAppRoute.",
+			Buckets: []float64{
+				0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10,
+			},
+		}, []string{"app", "route", "class"}),
+		failuresByRoute: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_request_failures_by_route_total",
+			Help: "Per-route failures counter (ADR-093). Increments on status ≥ 400; the dashboard computes error_rate_pct directly from the ratio to gateway_requests_total. Same route admission as gateway_requests_by_route_total above.",
+		}, []string{"app", "plan", "route", "code"}),
 		wakeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "gateway_wake_latency_seconds",
 			Help: "End-to-end latency from request received to first upstream byte after a cold wake.",
@@ -655,7 +721,7 @@ func NewMetrics() *Metrics {
 		}
 		m.edgeRuleCompileError.WithLabelValues(kind)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.requestsByRoute, m.durationByRoute, m.failuresByRoute)
 	return m
 }
 
@@ -764,6 +830,63 @@ func (m *Metrics) PreInstantiateApp(appID string) {
 	}
 	for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
 		m.requestDuration.WithLabelValues(appID, class)
+	}
+}
+
+// ObserveRequestRoute records one per-route counter increment for
+// opt-in apps (ADR-093 / issue #273 follow-up to ADR-042 §1). The
+// caller (Handler.observe) is responsible for routing the call
+// here only when the app's RouteMetricsEnabled flag is true AND
+// the operator kill-switch is enabled — the metrics graph
+// itself is shared and accepts every label. nil-receiver safe
+// (mirrors ObserveRequestDuration). The route argument is the
+// post-admit value (caller routed through routeLabelSet so the
+// caller has already paid the cap check); passing the pre-admit
+// string would create a way to bypass the cap.
+func (m *Metrics) ObserveRequestRoute(appID, plan, route, code string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.requestsByRoute.WithLabelValues(appID, plan, route, code).Inc()
+}
+
+// ObserveRequestDurationRoute records the per-route histogram
+// observation. Caller-routed through routeLabelSet on the
+// routeLabelSet side (same module-private pointer); nil-receiver
+// safe.
+func (m *Metrics) ObserveRequestDurationRoute(appID, route, class string, d time.Duration) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.durationByRoute.WithLabelValues(appID, route, class).Observe(d.Seconds())
+}
+
+// RequestFailureRoute records one per-route failure counter
+// increment for opt-in apps. Mirrors the existing per-app
+// gateway_requests_total{code} reader pattern; the dashboard
+// computes error_rate_pct as the ratio of this counter to
+// ObserveRequestRoute for the same (app, route). Caller-routed
+// through routeLabelSet. nil-receiver safe.
+func (m *Metrics) RequestFailureRoute(appID, plan, route, code string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.failuresByRoute.WithLabelValues(appID, plan, route, code).Inc()
+}
+
+// PreInstantiateAppRoute writes zero-valued series for the
+// closed (class) set under (appID, route) so dashboards surface
+// from the first request rather than after the first observation
+// (ADR-093 D4). The closed class set is the same as
+// PreInstantiateApp above (2xx/3xx/4xx/5xx). Caller-routed
+// through routeLabelSet — the route argument is post-admit, so
+// the cap is enforced before this is called. nil-receiver safe.
+func (m *Metrics) PreInstantiateAppRoute(appID, route string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
+		m.durationByRoute.WithLabelValues(appID, route, class)
 	}
 }
 

@@ -1588,6 +1588,14 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// (same Set-bit-aware shape) so the per-plan default doesn't get
 	// shadowed by the schema DEFAULT.
 	//
+	// ADR-093: route_metrics_enabled is written explicitly (same
+	// shape) so the per-plan default doesn't get shadowed by the
+	// schema DEFAULT. The CreateApp site is the only place the
+	// column is written at create time — there's no separate
+	// CreateAppIfUnderQuota path to keep in sync because the
+	// explicit per-plan default is applied by apid before
+	// reaching this path.
+	//
 	// Tier A10 / ADR-088: overflow_node preference is in the
 	// column list so the App struct's value is written verbatim
 	// at create time. apid resolved the wire name → UUID
@@ -1597,8 +1605,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1621,7 +1629,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
@@ -1754,6 +1762,10 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	//
 	// Issue #676 / PR-3: websocket_enabled follows the same shape.
 	//
+	// ADR-093: route_metrics_enabled follows the same shape; the
+	// per-plan default is applied by apid before reaching this
+	// path so the App struct's value is authoritative.
+	//
 	// Tier A10 / ADR-088: overflow_node preference is in the
 	// column list so the App struct's value is written verbatim
 	// at create time. apid resolved the wire name → UUID
@@ -1763,8 +1775,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1783,7 +1795,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
@@ -2624,6 +2636,15 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- Plan.WebSocketResponseAllowed() (Free → 403
 			   -- plan_websocket_not_allowed).
 			   websocket_enabled = case when $45 then $46 else websocket_enabled end,
+			   -- ADR-093: per-route observability opt-in.
+			   -- Same Set-bit convention as websocket_enabled
+			   -- above; apid gates PATCH-true through
+			   -- Plan.RouteMetricsResponseAllowed() (Free →
+			   -- 403 plan_route_metrics_not_allowed). The
+			   -- companion SetRouteMetricsEnabled flag
+			   -- distinguishes "don't touch" (default) from
+			   -- "explicit false" (opt out).
+			   route_metrics_enabled = case when $47 then $48 else route_metrics_enabled end,
 			   -- Tier A10 / ADR-088: per-app overflow_node
 			   -- preference. Same Set-bit convention as the
 			   -- surrounding fields — SetOverflowNode
@@ -2702,6 +2723,11 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// Issue #676 / PR-3: per-app raw-bytes Upgrade bridge.
 		// Same Set*/optional-pointer pattern as streaming_enabled.
 		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled),
+		// ADR-093: per-route observability opt-in. Same Set*/optional-
+		// pointer pattern as websocket_enabled above. The per-plan
+		// gate runs upstream in apid (Plan.RouteMetricsResponseAllowed)
+		// so by the time this UPDATE runs, the value is authoritative.
+		p.SetRouteMetricsEnabled, boolOrFalse(p.RouteMetricsEnabled),
 		// Tier A10 / ADR-088: overflow_node preference. The
 		// Set bit controls the CASE; the value slot is a
 		// nullable UUID — nullString coerces nil/empty to
@@ -11053,6 +11079,11 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// NOT NULL DEFAULT false (migration 00155); plain bool
 		// scan is safe.
 		&a.WebSocketEnabled,
+		// ADR-093: per-route observability opt-in. NOT NULL
+		// DEFAULT false (migration 00212); plain bool scan is
+		// safe. Order is positional and must match
+		// appsSelectColumns.
+		&a.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: per-app overflow_node preference.
 		// Scanned into a scratch string then conditionally
 		// promoted to *string so NULL round-trips as Go-nil —
@@ -11140,6 +11171,12 @@ const appsSelectColumns = `
 	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
 	-- writes through Plan.WebSocketResponseAllowed().
 	websocket_enabled,
+	-- ADR-093: per-route observability opt-in. Boolean NOT NULL
+	-- DEFAULT false (migration 00212); apid applies
+	-- Plan.RouteMetricsEnabled() at CreateApp time and gates PATCH
+	-- writes through Plan.RouteMetricsResponseAllowed() (Free →
+	-- 403 plan_route_metrics_not_allowed).
+	route_metrics_enabled,
 	-- Tier A10 / ADR-088: per-app overflow_node preference.
 	-- Nullable UUID; FK to compute_nodes(id) with ON DELETE SET
 	-- NULL cascades the preference to NULL on operator-side
