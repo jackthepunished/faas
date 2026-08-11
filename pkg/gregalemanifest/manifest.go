@@ -166,7 +166,7 @@ func (m *Manifest) Validate() error {
 // with the same app + schedule but different paths are different
 // resources — the (app, schedule, path) tuple is enforced by the
 // crons_app_schedule_path_unique constraint added in
-// migrations/00208 (issue #791 PR-E / ADR-090 closure).
+// migrations/00209 (issue #791 PR-E / ADR-090 closure).
 type triggerKey struct {
 	app      string
 	schedule string
