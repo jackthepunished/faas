@@ -113,13 +113,13 @@ func TestValidateScope_PatternFailures_Rejected(t *testing.T) {
 // 40-char boundaries.
 func TestValidateScope_Accepts(t *testing.T) {
 	cases := []string{
-		"default",                          // 7 chars
-		"staging",                          // 7 chars
-		"prod-eu",                          // 8 chars
-		"abc",                              // exact 3-char lower bound
-		strings.Repeat("a", 40),            // exact 40-char upper bound
-		"a-1",                              // mixed alnum + dash
-		"prod-us-west-2",                   // 15 chars
+		"default",               // 7 chars
+		"staging",               // 7 chars
+		"prod-eu",               // 8 chars
+		"abc",                   // exact 3-char lower bound
+		strings.Repeat("a", 40), // exact 40-char upper bound
+		"a-1",                   // mixed alnum + dash
+		"prod-us-west-2",        // 15 chars
 	}
 	for _, in := range cases {
 		in := in

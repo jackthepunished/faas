@@ -402,8 +402,8 @@ const (
 	// shape" (400 env_scope_invalid). Both render the same HTTP 400
 	// to the customer; the `code` discriminator is for the SDK's
 	// retry-guidance branch.
-	CodeEnvScopeInvalid   = "env_scope_invalid"
-	CodeEnvScopeReserved  = "env_scope_reserved"
+	CodeEnvScopeInvalid  = "env_scope_invalid"
+	CodeEnvScopeReserved = "env_scope_reserved"
 
 	// Trusted cosign signers (issue #472 / ADR-054). Same shape as
 	// the env-var quota — config cap, not a credential one — but a

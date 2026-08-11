@@ -91,10 +91,10 @@ type EnvByScope map[string][]ScopedAppEnvResponse
 // as the flat per-scope result. Both arms are valid wire shapes
 // for a GET /v1/apps/{slug}/envs; the `?scope=` query discriminates.
 type AppEnvListResponse struct {
-	Env        []AppEnvResponse     `json:"env"`
-	EnvByScope EnvByScope           `json:"env_by_scope,omitempty"`
-	Quota      int                  `json:"quota_max"`
-	Count      int                  `json:"count"`
+	Env        []AppEnvResponse `json:"env"`
+	EnvByScope EnvByScope       `json:"env_by_scope,omitempty"`
+	Quota      int              `json:"quota_max"`
+	Count      int              `json:"count"`
 }
 
 // ValidateEnvKey returns nil when key matches ^[A-Z][A-Z0-9_]*$ and is
