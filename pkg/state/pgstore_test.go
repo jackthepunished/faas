@@ -3029,10 +3029,16 @@ func TestPg_UpdateDeploymentTraffic_ProportionalRedistribution(t *testing.T) {
 	_, appID, depPrior := seedLiveDeploy(t, s, ctx, "prop-2way")
 
 	// Add a fresh live row alongside depPrior (which is at 100).
+	// ADR-091 / PR-D: deployments_app_scope_live_uniq enforces
+	// at-most-one-live per (app_id, scope). Each deployment in
+	// this fixture MUST carry its own scope so the canary +
+	// restore-prior sequence below doesn't trip 23505 on
+	// (app_id, 'default').
 	depCanary, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID: appID, Kind: state.DeploymentKindImage,
 		ImageDigest: "sha256:" + strings.Repeat("c", 64),
 		Status:      state.DeployPending,
+		Scope:       "canary",
 	})
 	if err != nil {
 		t.Fatalf("CreateDeployment (canary): %v", err)
@@ -3045,7 +3051,10 @@ func TestPg_UpdateDeploymentTraffic_ProportionalRedistribution(t *testing.T) {
 	// {prior:0, canary:100} both live, Σ=100, ready for the canary
 	// 25% stamp. Without this flip the test would be exercising the
 	// sole-row target=0 failure mode (legitimate Σ=0 error) instead
-	// of proportional redistribution.
+	// of proportional redistribution. depPrior is at scope='default'
+	// (seedLiveDeploy default), depCanary is at scope='canary' — so
+	// both rows can sit at status='live' simultaneously without
+	// tripping the partial unique index.
 	if err := s.MarkDeploymentLive(ctx, depPrior); err != nil {
 		t.Fatalf("MarkDeploymentLive (restore prior): %v", err)
 	}
@@ -3084,10 +3093,14 @@ func TestPg_UpdateDeploymentTraffic_ThreeWayResidual(t *testing.T) {
 	// the table to {A:50, B:30, C:20} via two consecutive
 	// UpdateDeploymentTraffic calls (each one stamps target +
 	// redistributes residual pro-rata across the other live rows).
+	// ADR-091 / PR-D: each row gets its own scope so the
+	// restore-A / restore-B re-flip sequence below doesn't trip
+	// deployments_app_scope_live_uniq.
 	depB, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID: appID, Kind: state.DeploymentKindImage,
 		ImageDigest: "sha256:" + strings.Repeat("d", 64),
 		Status:      state.DeployPending,
+		Scope:       "dep-b",
 	})
 	if err != nil {
 		t.Fatalf("CreateDeployment (B): %v", err)
@@ -3099,6 +3112,7 @@ func TestPg_UpdateDeploymentTraffic_ThreeWayResidual(t *testing.T) {
 		AppID: appID, Kind: state.DeploymentKindImage,
 		ImageDigest: "sha256:" + strings.Repeat("e", 64),
 		Status:      state.DeployPending,
+		Scope:       "dep-c",
 	})
 	if err != nil {
 		t.Fatalf("CreateDeployment (C): %v", err)
@@ -3208,10 +3222,14 @@ func TestPg_UpdateDeploymentTraffic_TieBreakStable(t *testing.T) {
 	_, appID, depA := seedLiveDeploy(t, s, ctx, "tie-break")
 
 	// Add depB live alongside depA; equalise to {A:50, B:50}.
+	// ADR-091 / PR-D: depB gets scope='dep-b' so the restore-A
+	// re-flip below doesn't trip deployments_app_scope_live_uniq
+	// on (app_id, scope='default') (depA is on default via seedLiveDeploy).
 	depB, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID: appID, Kind: state.DeploymentKindImage,
 		ImageDigest: "sha256:" + strings.Repeat("f", 64),
 		Status:      state.DeployPending,
+		Scope:       "dep-b",
 	})
 	if err != nil {
 		t.Fatalf("CreateDeployment (B): %v", err)
@@ -3269,6 +3287,7 @@ func TestPg_UpdateDeploymentTraffic_TwoWay_ResidualSpellsLegibly(t *testing.T) {
 		AppID: appID, Kind: state.DeploymentKindImage,
 		ImageDigest: "sha256:" + strings.Repeat("a", 64),
 		Status:      state.DeployPending,
+		Scope:       "canary",
 	})
 	if err != nil {
 		t.Fatalf("CreateDeployment (canary): %v", err)
@@ -3280,6 +3299,9 @@ func TestPg_UpdateDeploymentTraffic_TwoWay_ResidualSpellsLegibly(t *testing.T) {
 	// to live at 0 so we have {prior:0, canary:100}, Σ=100, both
 	// live. Without this flip, "equalise canary=0" would be a
 	// sole-row target=0 failure (legitimate Σ=0 error).
+	// ADR-091 / PR-D: depCanary uses scope='canary', depPrior is
+	// at scope='default' (seedLiveDeploy default) — both can sit
+	// at status='live' without tripping the partial unique index.
 	if err := s.MarkDeploymentLive(ctx, depPrior); err != nil {
 		t.Fatalf("MarkDeploymentLive (restore prior): %v", err)
 	}

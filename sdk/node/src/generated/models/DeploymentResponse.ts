@@ -74,5 +74,9 @@ export type DeploymentResponse = {
    * Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by construction.
    */
   traffic_percent?: number;
+  /**
+   * Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`.
+   */
+  scope?: string | null;
 };
 

@@ -366,6 +366,7 @@ type Deployment struct {
 	ScanResult          []byte
 	ScanStatus          pgtype.Text
 	ScannedAt           pgtype.Timestamptz
+	Scope               string
 }
 
 type DeploymentLog struct {

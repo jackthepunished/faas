@@ -405,6 +405,17 @@ const (
 	CodeEnvScopeInvalid  = "env_scope_invalid"
 	CodeEnvScopeReserved = "env_scope_reserved"
 
+	// ADR-091 / PR-D: per-deployment env scope collision. The
+	// partial unique index `deployments_app_scope_live_uniq`
+	// (migration 00213) makes two live rows on the same
+	// (app_id, scope) impossible — the second create returns
+	// state.ErrConflict wrapping the constraint name. The handler
+	// decodes the wrapped error to surface this code (409) so a
+	// customer can branch on "supersede the prior prod deployment
+	// first" rather than retry blindly. Renders 409 Conflict,
+	// matching the rest of state.ErrConflict's 4xx family.
+	CodeDeploymentScopeCollision = "deployment_scope_collision"
+
 	// Trusted cosign signers (issue #472 / ADR-054). Same shape as
 	// the env-var quota — config cap, not a credential one — but a
 	// distinct code so the dashboard can surface "trusted publishers"

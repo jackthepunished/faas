@@ -353,6 +353,20 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, p)
 		return
 	}
+	// ADR-091 / PR-D: per-deployment env scope validation. The
+	// schema CHECK (deployments_scope_shape) would reject on the
+	// INSERT — surfacing the violation here gives the customer a
+	// clean 400 with the right RFC 7807 code instead of letting
+	// the SQLSTATE 23514 bubble up to a generic 500. Empty
+	// request scope is fine (handled: defaulted to
+	// api.DefaultEnvScope in buildDeploymentForInsert), so we
+	// only validate when the field is present.
+	if req.Scope != "" {
+		if p := api.ValidateScope(req.Scope); p != nil {
+			api.WriteProblem(w, p)
+			return
+		}
+	}
 	// PR-B: prior-deployment supersede is in store.CreateDeployment's tx;
 	// we read prev BEFORE the call so the supersede-notify can carry
 	// its id (LatestDeployment returns the post-supersede row).
@@ -364,6 +378,20 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	}
 	d, err := s.store.CreateDeployment(r.Context(), dep)
 	if err != nil {
+		// ADR-091 / PR-D: per-deployment scope collision. mapErr
+		// wraps state.ErrConflict with the constraint name —
+		// detect deployments_app_scope_live_uniq here and surface a
+		// dedicated 409 deployment_scope_collision code instead of
+		// the generic 503/500 path. The substring match is
+		// defensive: mapErr's format is "ErrConflict: constraint"
+		// and ErrConflict may wrap a chain of similar errors on
+		// multi-statement tx failure paths.
+		if errors.Is(err, state.ErrConflict) && strings.Contains(err.Error(), "deployments_app_scope_live_uniq") {
+			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeDeploymentScopeCollision,
+				"Scope already live",
+				"a live deployment already targets this scope on this app; supersede it before creating another"))
+			return
+		}
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
 	}

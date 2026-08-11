@@ -3818,8 +3818,9 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		                          sidecars,
 		                          status,
 		                          min_instances,
-		                          traffic_percent)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19)
+		                          traffic_percent,
+		                          scope)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19, coalesce(nullif($20, ''), 'default'))
 		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -3830,7 +3831,13 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		nullJSONRaw(d.OverrideLivenessProbe),
 		notNullEmptyJSONRaw(d.Sidecars),
 		d.MinInstances,
-		d.TrafficPercent)
+		d.TrafficPercent,
+		// ADR-091 / PR-D: empty caller Scope collapses to the
+		// literal 'default' (matches the schema DEFAULT). A non-empty
+		// Scope is passed through verbatim. Mirrors the handler's
+		// scope-default collapse so pgstore never inserts a literal
+		// '' (which would fail the deployments_scope_shape CHECK).
+		d.Scope)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -3859,6 +3866,24 @@ func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment,
 	row := s.pool.QueryRow(ctx,
 		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where app_id = $1 and status = 'live' order by created_at desc limit 1`, appID)
+	return scanDeploymentWithRootfs(row)
+}
+
+// LiveDeploymentForScope (ADR-091 / PR-D) returns the unique live
+// deployment for the (app_id, scope) pair. Backed by the partial
+// UNIQUE index deployments_app_scope_live_uniq added in migration
+// 00213: at most one live row per (app_id, scope), so the LIMIT 1
+// is belt-and-suspenders and the result is deterministic. Returns
+// ErrNotFound when no live row exists for the scope — the wake
+// path converts that into a 404 via the ErrNoDeployment sentinel
+// already used by LiveDeployment. The query plan uses the partial
+// index (index-only on app_id, scope via INCLUDE-less btree; the
+// rootfs columns are heap-fetched, identical to LiveDeployment).
+func (s *PgStore) LiveDeploymentForScope(ctx context.Context, appID, scope string) (Deployment, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments where app_id = $1 and scope = $2 and status = 'live'
+		 order by created_at desc limit 1`, appID, scope)
 	return scanDeploymentWithRootfs(row)
 }
 
@@ -10961,7 +10986,8 @@ const deploymentSelectColumnsWithRootfs = `
 	min_instances,
 	scan_result, scan_status, scanned_at,
 	coalesce(parked_reason,''), parked_at,
-	traffic_percent`
+	traffic_percent,
+	scope`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -10990,7 +11016,8 @@ const deploymentSelectColumnsQualified = `
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
 	coalesce(d.parked_reason,''), d.parked_at,
-	d.traffic_percent`
+	d.traffic_percent,
+	d.scope`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -11050,7 +11077,8 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
-		&d.ParkedReason, &parkedAt, &d.TrafficPercent); err != nil {
+		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
+		&d.Scope); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {

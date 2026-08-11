@@ -744,6 +744,13 @@ type CreateDeploymentRequest struct {
 	// canary share. Plan-gated at Pro+ via
 	// acct.Plan.TrafficSplitAllowed().
 	TrafficPercent *int `json:"traffic_percent,omitempty"`
+	// Scope (ADR-091 / PR-D) declares which named env scope this
+	// deployment reads at wake time. Empty / omitted → handler
+	// defaults to api.DefaultEnvScope. Migration 00213's CHECK
+	// constraint enforces EnvScopePattern; the handler runs
+	// api.ValidateScope before storing. A duplicate live row on
+	// (app_id, scope) → 400 deployment_scope_collision.
+	Scope string `json:"scope,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -811,6 +818,15 @@ type CreateDeploymentOverrides struct {
 	// (Engine.ParkDeployment) regardless of per-deployment probe
 	// tuning.
 	LivenessProbe *DeploymentLivenessProbe `json:"liveness_probe,omitempty"`
+	// Scope (ADR-091 / PR-D) declares which named env scope this
+	// deployment reads at wake time. Empty / omitted defaults to
+	// api.DefaultEnvScope at the handler. Migration 00213's
+	// partial unique index `deployments_app_scope_live_uniq`
+	// prevents two live deployments from sharing (app_id, scope)
+	// — a duplicate returns 400 deployment_scope_collision. A
+	// scope change requires a NEW deployment; UpdateDeployment
+	// intentionally rejects field updates.
+	Scope string `json:"scope,omitempty"`
 }
 
 // DeploymentHealthcheck is the readiness-probe shape on the
@@ -1291,6 +1307,19 @@ type DeploymentResponse struct {
 	// pkg/state.UpdateDeploymentTraffic for the rebalance
 	// semantics.
 	TrafficPercent int `json:"traffic_percent"`
+	// Scope (ADR-091 / PR-D) echoes the deployment's
+	// env-targeting scope. Surfaces on GET /v1/deployments/{id}
+	// and the per-app live list (pkg/state.SerializeDeployment
+	// reads dep.Scope — already populated by the SELECT
+	// projection pgstore loads). omitempty keeps the wire clean
+	// for the (rare) pre-PR-D row where scope defaulted to
+	// "default" but the column itself was backfilled; the
+	// SerializeDeployment projector always writes the explicit
+	// value, so downstream consumers see "default" on pre-PR
+	// fixtures the moment PR-D ships. Migration 00213's CHECK
+	// ensures the value is a valid slug; the handler validates
+	// scopeFromBody before storing via api.ValidateScope.
+	Scope string `json:"scope,omitempty"`
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
