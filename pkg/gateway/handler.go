@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,24 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
+
+// ResolveSlugFn (ADR-093) is the (slug → appID) resolver the
+// control-listener /v1/internal/apps/{slug}/routes handler uses
+// to translate the path segment into the appID the in-process
+// route-set map keys on. Production wires a closure that consults
+// the same apps table apid used to register the app — the
+// control listener is loopback-only so it does NOT open its own
+// Postgres connection (ADR-070 single-purpose control mux). The
+// first request after a freshly-started gatewayd sees an empty
+// Routes array until the in-process cache hydrates; the dashboard
+// treats that as "no traffic yet" (matches the existing
+// /v1/internal/quota empty-state contract).
+//
+// ok=false is a clean "slug not registered"; the handler renders
+// an empty Routes array rather than 404 so the dashboard doesn't
+// distinguish "unknown slug" from "no traffic yet" (avoiding an
+// enumeration oracle on the loopback surface).
+type ResolveSlugFn func(slug string) (appID string, ok bool)
 
 // App is the routing target for a hostname.
 type App struct {
@@ -48,6 +67,19 @@ type App struct {
 	// in fakeBackend unit tests; tests that want to exercise the
 	// raw path set this to true alongside an app.Plan != PlanFree.
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) opts the app into the per-route
+	// observability surface. When true, Handler.observe emits three
+	// additional Prometheus series keyed by an enumerated `route`
+	// label (method + raw path, bounded per-app at 50 distinct
+	// entries with __route_other__ as the non-evicting overflow
+	// bucket) and the bounded in-memory reader at
+	// GET /v1/internal/apps/{slug}/routes returns the per-route
+	// detail. apid applies Plan.RouteMetricsEnabled() at CreateApp
+	// time and gates PATCH writes through Plan.RouteMetricsResponseAllowed().
+	// Default-false in fakeBackend unit tests; tests that want to
+	// exercise the per-route path set this to true alongside an
+	// app.Plan != PlanFree.
+	RouteMetricsEnabled bool
 	// NodeID is the durable shard key the owning schedd
 	// resolves at startup (Phase 2 / Gate A). Populated by
 	// pgRouter.toApp / the AppResolver closure from apps.node_id;
@@ -427,6 +459,33 @@ type Handler struct {
 	// initialise it explicitly. Value semantics avoid the
 	// data-race that lazy init would create under -race.
 	piApps preInstantiateApps
+	// routeSets (ADR-093) is the per-app routeLabelSet map keyed
+	// by appID. Lazily created on the first request for an opt-in
+	// app (App.RouteMetricsEnabled=true AND the operator kill-
+	// switch is enabled) so the cold path is allocation-free for
+	// apps that don't opt in. The map is never deleted — the
+	// underlying routeLabelSet is non-evicting (the daemon
+	// restart is the only path that resets it, same contract as
+	// accountLabelSet / hostnameLabelSet). sync.Map because the
+	// hot path is the "already created" lookup. nil until
+	// SetRouteMetricsEnabled is called from the App→routeSet
+	// resolution path.
+	routeSets sync.Map // appID(string) → *routeLabelSet
+	// routeSetsPi (ADR-093) deduplicates Metrics.PreInstantiateAppRoute
+	// calls keyed by (appID, routeLabel). The closed `class` set is
+	// written once per app per route; the dedupe map is never
+	// deleted (the underlying routeLabelSet is non-evicting). Same
+	// shape as preInstantiateApps, separate sync.Map so the per-app
+	// and per-route keys don't collide.
+	routeSetsPi sync.Map // appID+"\x00"+routeLabel(string) → struct{}
+	// routeMetricsEnabled (ADR-093) is the operator kill-switch
+	// mirroring the per-app opt-in. When false, every per-app
+	// routeSetFor lookup returns nil regardless of
+	// app.RouteMetricsEnabled — the customer's flag is inert.
+	// Wired from cmd/gatewayd-internal/config.go's `[route_metrics]
+	// enabled` field via WithRouteMetricsEnabled. Default false
+	// so existing deployments are unaffected.
+	routeMetricsEnabled bool
 	// requireAuthnAuthn is the bearer-key verifier the
 	// per-deployment authz branch uses (issue #560). nil =
 	// authz branch disabled (default; matches the pre-issue
@@ -636,6 +695,19 @@ func (h *Handler) WithRawForwarding(fn func(t Target) http.Handler) *Handler {
 // matching WithEgressSink / WithLimiter / etc).
 func (h *Handler) WithStreamingEnabled(enabled bool) *Handler {
 	h.streamingEnabled = enabled
+	return h
+}
+
+// WithRouteMetricsEnabled (ADR-093) arms the operator kill-switch
+// for the per-route observability surface. When false, every
+// per-app routeSetFor lookup returns nil regardless of
+// app.RouteMetricsEnabled — the customer's flag is inert. The
+// setter is fluent for chaining (same shape as the rest of the
+// Handler.With* family). Wired from
+// cmd/gatewayd-internal/config.go's `[route_metrics] enabled`
+// field via the runtime config init.
+func (h *Handler) WithRouteMetricsEnabled(enabled bool) *Handler {
+	h.routeMetricsEnabled = enabled
 	return h
 }
 
@@ -2627,6 +2699,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	app = lookedApp
 haveApp:
+	// ADR-093: derive the per-request route label and stash it
+	// on the request context so Handler.observe can read it on
+	// the single exit funnel. The label is method + raw path
+	// (pre-rewrite, ADR-093 D6) — the route identity is the
+	// customer-facing endpoint, so a kind=rewrite edge rule that
+	// rewrites /v1/foo → /v2/foo reports the inbound route, not
+	// the rewritten one. The routeLabelSet bounds the per-app
+	// distinct-route count to 50 + the __route_other__ overflow
+	// bucket. The label is empty when the app is not opted in
+	// (routeSetFor returns nil) — Handler.observe short-circuits
+	// the per-route emission on "".
+	routeLabel := ""
+	if set := h.routeSetFor(app.ID, app.RouteMetricsEnabled && h.routeMetricsEnabled); set != nil {
+		preLabel := r.Method + " " + r.URL.Path
+		routeLabel = set.admit(preLabel)
+		r = withRouteLabel(r, routeLabel)
+		// Pre-instantiate the closed `class` set under
+		// (app.ID, routeLabel) on the per-route histogram the
+		// first time the route is admitted. The admit() map is
+		// non-evicting, so we guard with a second sync.Map key
+		// (routeSetsPi) keyed by (app.ID, routeLabel) so the
+		// pre-instantiation runs exactly once per app per route.
+		// The dedupe keeps the hot path allocation-free after
+		// first sight.
+		h.preInstantiateAppRoute(app.ID, routeLabel)
+	}
 
 	// Issue #561 / ADR-089 PR 4 — apply the per-host
 	// kind=redirect / kind=rewrite / kind=headers edge rules
@@ -3120,9 +3218,22 @@ haveApp:
 // skew the §12 dashboard. On a 2xx response it also Touches the LastSeenSink
 // keyed by InstanceID (issue #168 — per-instance attribution survives the
 // multi-instance fan-out where multiple instances share a single node).
+//
+// ADR-093: routeLabel is the per-request route label computed
+// at the post-Lookup derivation site (handler.go's `haveApp:`
+// block) and stashed on the request context via withRouteLabel.
+// Empty when the app is not opted in. observe() reads the
+// context here so the call sites stay agnostic of the
+// routeLabelSet; the empty-string sentinels mirror the
+// `gateway_requests_total{app="-"}` pattern.
 func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold bool, target Target) {
 	code := statusClass(status)
 	requestID := requestIDFrom(r)
+	// Read the stashed route label BEFORE the sentinel-coercion
+	// below — the route label is independent of appID and stays
+	// empty when the app is not opted in OR the request didn't
+	// resolve to an app.
+	routeLabel := RouteLabelFrom(r)
 	// Measure elapsed against the same start stamp set at the top of
 	// ServeHTTP (issue #273 / ADR-042 fixed the WithStartTime dead-code
 	// bug so this is now request-received → handler-return, not
@@ -3141,6 +3252,20 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 		// to keep cardinality bounded — full status codes would explode
 		// per-app series count past 60× the class-based set.
 		h.metrics.ObserveRequestDuration(appID, statusClassBucket(status), elapsed)
+		// ADR-093: per-route emission. Gated on a non-empty
+		// routeLabel (the routeLabelSet always returns a non-empty
+		// label for an opted-in app — the empty string is the
+		// reserved "no appID" sentinel and would create a
+		// route="__empty__" series that nobody reads). The plan
+		// for non-opt-in apps is the per-app counters above
+		// (preserved per ADR-042 §1 deviation).
+		if routeLabel != "" {
+			h.metrics.ObserveRequestRoute(appID, plan, routeLabel, code)
+			h.metrics.ObserveRequestDurationRoute(appID, routeLabel, statusClassBucket(status), elapsed)
+			if status >= 400 {
+				h.metrics.RequestFailureRoute(appID, plan, routeLabel, code)
+			}
+		}
 	}
 	// Issue #300: feed the per-tenant rolling count for the
 	// 5s gateway_top_tenant_rps sampler (cmd/gatewayd-internal/topn.go).
@@ -3224,6 +3349,31 @@ type preInstantiateApps struct{ m sync.Map }
 func (p *preInstantiateApps) seen(appID string) bool {
 	_, loaded := p.m.LoadOrStore(appID, struct{}{})
 	return loaded
+}
+
+// routeSetFor returns the per-app *routeLabelSet for appID,
+// creating a fresh one on the first sight of an opt-in app. The
+// lookup is O(1) (sync.Map.Load). Returns nil when the app is not
+// opted in (enabled=false) — the caller short-circuits the
+// per-route emission on nil. The map is never deleted; the
+// underlying routeLabelSet is non-evicting (ADR-093 D2).
+//
+// Concurrency: sync.Map handles the parallel first-sight race
+// correctly. Two goroutines hitting the same opt-in app for the
+// first time may each create a fresh *routeLabelSet; only one
+// wins the LoadOrStore. The loser's *routeLabelSet is dereferenced
+// by the GC and the in-flight admit() calls it observers are
+// bounded by the cap, so the loser-drop is safe.
+func (h *Handler) routeSetFor(appID string, enabled bool) *routeLabelSet {
+	if !enabled || appID == "" {
+		return nil
+	}
+	if v, ok := h.routeSets.Load(appID); ok {
+		return v.(*routeLabelSet)
+	}
+	fresh := newRouteLabelSet()
+	actual, _ := h.routeSets.LoadOrStore(appID, fresh)
+	return actual.(*routeLabelSet)
 }
 
 // recordEgress attributes response body bytes to the (instanceID,
@@ -3368,6 +3518,58 @@ func (h *Handler) preInstantiateApp(appID string) {
 		return
 	}
 	h.metrics.PreInstantiateApp(appID)
+}
+
+// RoutesFor (ADR-093) returns a copy of the admitted route labels
+// for appID, in deterministic order (insertion order via sorted
+// keys). The caller is the /v1/internal/apps/{slug}/routes
+// control-listener handler; the snapshot is read-only and
+// allocation-bounded: at most routeLabelSetCap + reservedCount
+// entries per call. Returns nil when the app is not opted in
+// (Handler.routeSetFor returns nil for disabled apps) — the
+// control handler renders an empty Routes array on nil so the
+// dashboard can distinguish "feature off" from "no traffic yet".
+//
+// Concurrency: routeLabelSet.mu guards the snapshot read; the
+// returned slice is a copy so the caller can iterate without
+// holding the lock. Returning the underlying map directly would
+// race with admit() on the hot path.
+func (h *Handler) RoutesFor(appID string) []string {
+	if h == nil {
+		return nil
+	}
+	v, ok := h.routeSets.Load(appID)
+	if !ok {
+		return nil
+	}
+	s := v.(*routeLabelSet)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.admitted))
+	for k := range s.admitted {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// preInstantiateAppRoute (ADR-093) records (appID, route) once
+// and delegates to Metrics.PreInstantiateAppRoute. The dedupe is
+// keyed by (appID, routeLabel) so the closed `class` set under
+// the per-route histogram is written exactly once per app per
+// route. Mirrors the preInstantiateApp shape above; the per-
+// route dedupe uses a separate sync.Map so an app's per-app
+// pre-instantiation and its per-route pre-instantiations do not
+// race on the same key.
+func (h *Handler) preInstantiateAppRoute(appID, routeLabel string) {
+	if h == nil || h.metrics == nil || appID == "" || routeLabel == "" {
+		return
+	}
+	key := appID + "\x00" + routeLabel
+	if _, loaded := h.routeSetsPi.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	h.metrics.PreInstantiateAppRoute(appID, routeLabel)
 }
 
 // statusRecorder is a thin ResponseWriter wrapper that records the HTTP status

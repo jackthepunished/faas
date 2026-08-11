@@ -126,15 +126,11 @@ func newRouteLabelSetWithCap(capacity int) *routeLabelSet {
 // The Prometheus increment at the call site happens AFTER admit
 // returns, so it is outside the critical section.
 func (s *routeLabelSet) admit(route string) string {
-	// Reserved labels are folded into a single multi-value clause
-	// so the empty literal doesn't appear twice — Go's switch is
-	// not a constant-dedupe for "" aliases (reservedRouteLabelEmpty
-	// is the constant ""), and a literal `case "", reservedRouteLabelEmpty`
-	// would fail to compile with "duplicate case reservedRouteLabelEmpty".
-	// The two reserved labels pass through verbatim — an empty input
-	// IS reservedRouteLabelEmpty (the same constant), and __route_other__
-	// admits itself so the per-route metric can be incremented on
-	// the overflow bucket from the call site.
+	// Reserved values (empty + otherRouteLabel) are always admitted
+	// without consuming capacity. The empty case is folded into the
+	// multi-value branch because reservedRouteLabelEmpty == "" —
+	// distinct case clauses that label the same string trigger the
+	// compiler's duplicate-case check (we hit it once already).
 	switch route {
 	case reservedRouteLabelEmpty, otherRouteLabel:
 		return route

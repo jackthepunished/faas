@@ -2862,6 +2862,31 @@ type RouteRow struct {
 	ErrorPct float64 `json:"error_pct"`
 }
 
+// AppRoutesResponse is the per-route label snapshot returned by
+// GET /v1/apps/{slug}/routes (ADR-093). The shape is intentionally
+// narrower than AppMetricsResponse — only the bounded label set
+// the gatewayd-internal control listener emits (method + raw
+// path, capped at 50 + __route_other__). The Prometheus-derived
+// per-route rollup (count, percentiles, error_pct) lives on
+// AppMetricsResponse.Routes, computed lazily when the dashboard
+// needs it. Splitting the two surfaces keeps the lightweight
+// reader cheap (one in-memory map read on gatewayd-internal, one
+// HTTP round-trip from apid) and lets the dashboard render the
+// "what routes is this app serving?" panel without a Prometheus
+// query.
+//
+// Source is "live" when the gatewayd control listener responded
+// 200; "unavailable" when the dial failed (gatewayd not
+// reachable, X-Faas-Routes-State: unavailable header). Routes
+// is []string (not nil) on the unavailable path so the JSON
+// encoder emits `[]` rather than `null`.
+type AppRoutesResponse struct {
+	Slug   string   `json:"slug"`
+	AppID  string   `json:"app_id,omitempty"`
+	Routes []string `json:"routes"`
+	Source string   `json:"source"`
+}
+
 // --- Account-scoped metrics rollup (issue #393) --------------------------
 
 // AppsMetricsResponse is the rollup for GET /v1/apps/metrics?range=

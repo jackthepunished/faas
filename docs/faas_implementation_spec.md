@@ -765,11 +765,11 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | `lv_fc_used_pct` | — | > 80 % warn, > 90 % page |
 | build queue wait p95 | < 60 s | > 300 s warn |
 | `gateway_wake_latency_seconds` p95 | ≤ 0.8 s | > 1.5 s warn |
-| `gateway_request_duration_seconds{app,class}` p95 | n/a (per-app) | none (ADR-041: customer dashboard) |
+| `gateway_request_duration_seconds{app,class}` p95 | n/a (per-app) | none (ADR-042: customer dashboard) |
 | `gateway_stream_flushes_total{app,plan}` rate | n/a (per-app) | none (ADR-047: streaming telemetry — see §12.5) |
 | `gateway_response_bytes_total{app,plan}` rate | n/a (per-app) | none (ADR-047: per-flush + residual capture — see §12.5) |
 | `gateway_stream_active{app,plan}` gauge | n/a (per-app) | none (ADR-047: in-flight streams — see §12.5) |
-| `gateway_cold_boot_total{app}` share | < 2 % of wakes | none (ADR-041: customer dashboard; fleet wake latency is the SLO) |
+| `gateway_cold_boot_total{app}` share | < 2 % of wakes | none (ADR-042: customer dashboard; fleet wake latency is the SLO) |
 | cold-boot fallback rate | < 2 % of wakes | > 10 % warn (snapshot rot) |
 | `schedd_instance_cpu_pct{app,node}` | max over siblings | > 90 sustained page (hot loop) |
 | `schedd_instance_rss_mb{app,node}` | sum over siblings | > plan × max_concurrency page |
@@ -792,13 +792,41 @@ unbounded under the §6.2 fan-out invariant. Future scale policy
 work (#171 reaper, #169 scale-up trigger) reads from the Reader
 directly, not from Prometheus.
 
-`gateway_request_duration_seconds{app,class}` (ADR-041, issue #273)
+`gateway_request_duration_seconds{app,class}` (ADR-042, issue #273)
 is the per-app full-request-duration histogram exposed on the
 customer dashboard and the `GET /v1/apps/{slug}/metrics` endpoint.
-ADR-041 documents the deviation from the #273 acceptance criteria:
+ADR-042 documents the deviation from the #273 acceptance criteria:
 the `route` label is dropped (`gatewayd-internal` is an opaque reverse proxy)
 and the rename of `gateway_cold_wake_total` →
 `gateway_cold_boot_total` is straight (zero external consumers).
+
+**ADR-093 sidebar (issue #273 follow-up):** the per-route
+breakdown is reintroduced as an opt-in surface for API-hosting
+customers. Two extra series are emitted from `gatewayd-internal`
+behind the two-level opt-in (operator kill-switch + per-app
+`apps.route_metrics_enabled`):
+
+- `gateway_requests_total{app,plan,route,code}` (counter, paired
+  with the existing `{app,code}` series)
+- `gateway_request_duration_seconds{app,route,class}` (histogram,
+  paired with the existing `{app,class}` histogram)
+- `gateway_request_failures_total{app,plan,route,code}` (counter,
+  paired with the existing `{app,plan,code}` failures counter)
+
+The `route` label is method + raw path (pre-edge-rule-rewrite),
+bounded per app to 50 distinct real routes + the reserved
+`__route_other__` overflow bucket (ADR-093 D2). The bounded
+admission set is the only thing standing between us and
+`O(paths)` Prometheus cardinality under wildcard path patterns.
+The in-memory reader is also exposed via the control listener at
+`GET /v1/internal/apps/{slug}/routes` (loopback-only, mTLS-free
+within the same box) and reverse-proxied by apid as
+`GET /v1/apps/{slug}/routes` for the dashboard panel.
+
+ADR-042 §1 is **partially superseded** by ADR-093 — the route
+label is now opt-in for Hobby+ plans, not blanket-dropped. The
+rest of ADR-042 (cold-boot rename, per-app histogram shape)
+stands.
 
 ### 12.1 Autoscale decision telemetry (ADR-037, ADR-038)
 
