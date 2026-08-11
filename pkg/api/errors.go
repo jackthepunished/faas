@@ -127,6 +127,21 @@ func WriteProblem(w http.ResponseWriter, p *Problem) {
 	_ = json.NewEncoder(w).Encode(p)
 }
 
+// WriteProblemWithErrors is the kind=validate-shaped variant: the
+// same problem+json envelope but with a populated Errors []FieldError
+// so a customer's JSON-Schema rejection renders as a structured
+// per-field list (Cloudflare API Shield 422 + Stripe card_errors
+// shape). The Errors slice is assigned to p before the encode so the
+// wire body matches the in-memory struct; nil errs produces an
+// empty-array (no `errors` key, since FieldError.Errors is omitempty).
+//
+// Used by pkg/gateway/handler.go::applyEdgeRuleValidate only; all
+// other error sites keep the flat WriteProblem shape.
+func WriteProblemWithErrors(w http.ResponseWriter, p *Problem, errs []FieldError) {
+	p.Errors = errs
+	WriteProblem(w, p)
+}
+
 // NewProblem builds a Problem with the common fields set.
 func NewProblem(status int, code, title, detail string) *Problem {
 	return &Problem{Status: status, Code: code, Title: title, Detail: detail}
@@ -266,6 +281,31 @@ const (
 	// than "we deliberately refused". Use this for any 500 where the
 	// handler can't recover; pair with api.ErrInternal for a one-liner.
 	CodeInternal = "internal_error"
+	// CodeBadRequest is returned by handlers for a 400 on a
+	// malformed inbound body that isn't covered by a more specific
+	// code (e.g. the validate rule's body-read failure). Distinct
+	// from CodeValidation (422, schema-level rejection) so the
+	// dashboard pivots the message from "fix the format" to
+	// "the schema is wrong".
+	CodeBadRequest = "bad_request"
+	// CodeBadGateway is returned by the gateway when an upstream
+	// dependency (the validate-rule compile-time defense, a JWKS
+	// fetch, etc.) fails in a way that's clearly the gateway's
+	// fault rather than the customer's. 502 + this code = the
+	// operator's on-call should look at the daemon.
+	CodeBadGateway = "bad_gateway"
+	// CodeUnsupportedMediaType is returned when a kind=validate
+	// rule's ContentTypes gate rejects the inbound request.
+	// Distinct from CodeBadRequest so the dashboard pivots the
+	// message to "send a different Content-Type".
+	CodeUnsupportedMediaType = "unsupported_media_type"
+	// CodeRequestTooLarge is returned when the inbound body
+	// exceeds the per-rule cap (kind=validate MaxBodyBytes) or
+	// the plan's outer cap (api.MaxRequestBodyBytes). Distinct
+	// from CodeBadRequest so the dashboard pivots the message
+	// to "send a smaller body" — the customer's app's UI can
+	// chunk on receipt.
+	CodeRequestTooLarge = "request_too_large"
 	// CodeMFARequired is returned by requireMFA when a session-cookie
 	// principal is mfa_pending and the route is not on the MFA
 	// allowlist (IAM-2 / issue #186). Distinct from CodeForbidden so
@@ -1198,6 +1238,14 @@ func StatusForCode(code string) int {
 		return http.StatusGone
 	case CodeOrgRoleForbidden, CodeOrgMemberCapExceeded, CodeOrgInvitationCapExceeded:
 		return http.StatusForbidden
+	case CodeBadRequest:
+		return http.StatusBadRequest
+	case CodeBadGateway:
+		return http.StatusBadGateway
+	case CodeUnsupportedMediaType:
+		return http.StatusUnsupportedMediaType
+	case CodeRequestTooLarge:
+		return http.StatusRequestEntityTooLarge
 	default:
 		return http.StatusInternalServerError
 	}

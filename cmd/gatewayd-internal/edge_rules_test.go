@@ -248,7 +248,7 @@ func TestGatewaydEdgeRules_MatchRoute_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	if got == nil {
 		t.Fatalf("MatchRoute = nil, want rule")
@@ -276,7 +276,7 @@ func TestGatewaydEdgeRules_MatchRoute_CacheHitSkipsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	for i := 0; i < 5; i++ {
 		_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	}
@@ -291,7 +291,7 @@ func TestGatewaydEdgeRules_MatchRoute_StoreErrorIsMiss(t *testing.T) {
 	// the customer sees a 404, not a 500. (A future PR could
 	// add a last-error gauge; PR 3 stays silent.)
 	store := &fakeEdgeRuleStore{err: errors.New("pg unreachable")}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	if got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET"); got != nil {
 		t.Errorf("MatchRoute on store error = %v, want nil", got)
 	}
@@ -305,7 +305,7 @@ func TestGatewaydEdgeRules_ResetDropsCache(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	if g.cache.Len() != 1 {
 		t.Fatalf("len before Reset = %d, want 1", g.cache.Len())
@@ -404,7 +404,7 @@ func TestGatewaydEdgeRules_ResetForwardsToCache_AcrossAllSevenKinds(t *testing.T
 			"a.example.com": sampleAllSevenKindsRules("a.example.com"),
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 
 	// Prime the cache via MatchRoute (one loadHost compiles all 7
 	// kinds together into one HostEntry).
@@ -641,7 +641,7 @@ func TestGatewaydEdgeRules_MatchRewrite_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	got := g.MatchRewrite(context.Background(), "a.example.com", "/api/x", "GET")
 	if got == nil {
 		t.Fatalf("MatchRewrite = nil, want rule")
@@ -662,7 +662,7 @@ func TestGatewaydEdgeRules_MatchRedirect_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	got := g.MatchRedirect(context.Background(), "a.example.com", "/", "GET")
 	if got == nil {
 		t.Fatalf("MatchRedirect = nil, want rule")
@@ -683,7 +683,7 @@ func TestGatewaydEdgeRules_MatchHeaders_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	got := g.MatchHeaders(context.Background(), "a.example.com", "/", "GET")
 	if got == nil {
 		t.Fatalf("MatchHeaders = nil, want rule")
@@ -706,7 +706,7 @@ func TestGatewaydEdgeRules_SharedCacheAcrossKinds(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil)
 	_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	_ = g.MatchRewrite(context.Background(), "a.example.com", "/", "GET")
 	if store.calls["a.example.com"] != 1 {

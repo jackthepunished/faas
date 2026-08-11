@@ -1,11 +1,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -498,6 +500,16 @@ type Handler struct {
 	// pkg/edgejwks.Verifier constructed against the per-URL JWKS
 	// cache; nil = JWT kind disabled (unit tests + pre-PR-5 builds).
 	jwtVerifier JWTVerifier
+
+	// validator (PR-B) is the per-rule JSON-Schema validate
+	// handle consulted by applyEdgeRuleValidate. Wired via
+	// WithValidator from cmd/gatewayd-internal/edge_validate.go
+	// (which adapts the pkg/edgevalidate.Manager to the
+	// gateway.Validator interface). nil = validate kind
+	// disabled (unit tests + pre-PR-B builds). The applier
+	// short-circuits to fall-through when nil — same posture
+	// as jwtVerifier above.
+	validator Validator
 }
 
 // emptyAccountWarned is the process-wide trip flag for
@@ -677,6 +689,18 @@ func (h *Handler) WithEdgeRules(matcher EdgeRuleMatcher, resolve ResolveTargetAp
 // cmd/gatewayd-internal/edge_rules_jwks.go).
 func (h *Handler) WithJWTVerifier(v JWTVerifier) *Handler {
 	h.jwtVerifier = v
+	return h
+}
+
+// WithValidator (PR-B) arms the per-rule JSON-Schema validate
+// handle consulted by applyEdgeRuleValidate. v may be nil
+// (validate kind disabled; unit tests + pre-PR-B posture).
+// Production wires the cmd-side adapter
+// (cmd/gatewayd-internal/edge_validate.go) which adapts
+// pkg/edgevalidate.Manager to the narrow Validator interface
+// so pkg/gateway never imports pkg/edgevalidate.
+func (h *Handler) WithValidator(v Validator) *Handler {
+	h.validator = v
 	return h
 }
 
@@ -1488,6 +1512,234 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("ip", "match")
+	}
+	return false
+}
+
+// applyEdgeRuleValidate (PR-B) consults the per-host edge-rule
+// matcher for a `kind=validate` rule. On a hit, the inbound
+// request body is buffered (up to the per-rule cap or
+// api.MaxRequestBodyBytes, whichever is smaller), the compiled
+// JSON-Schema is consulted via h.validator, and r.Body is restored
+// to a fresh reader over the buffered bytes so the proxy leg
+// downstream still sees the body.
+//
+// Returns true (caller MUST return) on:
+//
+//   - 422 schema mismatch (request_validation_failed + FieldError).
+//   - 415 unsupported Content-Type (when rule.ContentTypes is set
+//     and the request's Content-Type doesn't match).
+//   - 413 body cap exceeded (request_too_large — applies the
+//     per-rule cap; if 0, falls back to api.MaxRequestBodyBytes).
+//   - 502/500 alarm-worthy compile/runtime errors.
+//
+// Returns false on a clean match (audit + metric "match"), a
+// rule miss ("miss"), a same-account mismatch ("blocked"), a
+// streaming skip (rule.ApplyWhileStreaming=false + upgrade request),
+// or when both h.edgeRules and h.validator are nil (dev mode).
+//
+// Body restore: the buffered body is re-installed as r.Body so
+// the downstream proxy leg reads the same bytes. This is the
+// first production hot-path body-restore in pkg/gateway (no
+// existing handler does this); the test-file idiom at
+// pkg/gateway/dns01_hetzner_test.go:48-49 informed the choice of
+// io.NopCloser(bytes.NewReader(buf)).
+func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, app App, rec *statusRecorder) bool {
+	if h.edgeRules == nil || h.validator == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchValidate(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("validate", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.validate_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+		}
+		return false
+	}
+	// Upgrade / streaming short-circuit: the body for an
+	// upgraded request is read by the proxy leg's hijacker,
+	// not buffered. Validate rules opt-in via
+	// rule.ApplyWhileStreaming; default false = skip.
+	if !rule.ApplyWhileStreaming && isUpgradeRequest(r) {
+		return false
+	}
+	// Content-Type gate: when the rule restricts Content-Types,
+	// anything outside the list returns 415. Empty
+	// ContentTypes = pass-through (back-compat with rules that
+	// pre-date the field).
+	ct := r.Header.Get("Content-Type")
+	if len(rule.ContentTypes) > 0 && !contentTypeAllowed(ct, rule.ContentTypes) {
+		api.WriteProblem(w, api.NewProblem(http.StatusUnsupportedMediaType,
+			api.CodeUnsupportedMediaType, "Unsupported media type",
+			fmt.Sprintf("rule %s requires one of %v; got %q", rule.ID, rule.ContentTypes, ct)))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.validate_unsupported_media_type", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"got":       ct,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+		}
+		return true
+	}
+	// Buffer the body (already bounded by the global
+	// MaxBytesReader installed in ServeHTTP above this slot).
+	// The per-rule cap is layered on top via an inner
+	// MaxBytesReader so a rule with MaxBodyBytes=2KiB
+	// short-circuits before the global cap fires.
+	cap := rule.MaxBodyBytes
+	if cap <= 0 || cap > api.MaxRequestBodyBytes {
+		cap = api.MaxRequestBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, int64(cap))
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge,
+				api.CodeRequestTooLarge, "Request body too large",
+				fmt.Sprintf("rule %s caps body at %d bytes", rule.ID, cap)))
+		} else {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest,
+				api.CodeBadRequest, "Could not read request body", err.Error()))
+		}
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.validate_failed", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"reason":    "body_read",
+				"err":       err.Error(),
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("validate", "failed")
+		}
+		return true
+	}
+	// Restore r.Body so the proxy leg reads the same bytes.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	res, err := h.validator.Validate(r.Context(), &EdgeValidateIn{
+		Body:        body,
+		ContentType: ct,
+	}, rule)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrValidateSchemaExternalRef):
+			// Compile-time defense fired at runtime —
+			// shouldn't happen if apid-Validate was
+			// correct. 502 signals "the gateway
+			// dependency is broken"; ops will see the
+			// alarm + slog.
+			api.WriteProblem(w, api.NewProblem(http.StatusBadGateway,
+				api.CodeBadGateway, "Edge rule compile error",
+				"validate rule contains an external $ref/$id; refusing to validate"))
+		case errors.Is(err, ErrValidateSchemaInvalid),
+			errors.Is(err, ErrValidateSchemaEmpty),
+			errors.Is(err, ErrValidateSchemaTooLarge):
+			// Broken stored schema — deploy bug. 500.
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeInternal, "Edge rule schema error",
+				"validate rule schema is broken"))
+		default:
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeInternal, "Edge rule validator error", err.Error()))
+		}
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.validate_failed", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"reason":    "validator_error",
+				"err":       err.Error(),
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("validate", "failed")
+		}
+		return true
+	}
+	if !res.OK {
+		// Translate to api.FieldError on the 422 problem+json.
+		// res.FirstError may be nil if the schema failed but
+		// the library returned no FieldError — treat as a
+		// generic 422 with an empty errors slice.
+		var errs []api.FieldError
+		if res.FirstError != nil {
+			errs = []api.FieldError{{
+				Field:    res.FirstError.Field,
+				Expected: res.FirstError.Expected,
+				Got:      res.FirstError.Got,
+			}}
+		}
+		api.WriteProblemWithErrors(w, api.NewProblem(http.StatusUnprocessableEntity,
+			api.CodeRequestValidationFailed, "Invalid request",
+			fmt.Sprintf("body does not match schema for rule %s", rule.ID)), errs)
+		if h.edgeRuleAudit != nil {
+			auditData := map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"reason":    "schema_mismatch",
+			}
+			if res.FirstError != nil {
+				auditData["field"] = res.FirstError.Field
+				auditData["expected"] = res.FirstError.Expected
+			}
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.validate_failed", nil, auditData)
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+		}
+		return true
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.validate_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("validate", "match")
+	}
+	return false
+}
+
+// isUpgradeRequest is defined in pkg/gateway/upgrade.go. The
+// validate applier reuses it.
+
+// contentTypeAllowed reports whether ct matches any entry in
+// allowed. Both sides are compared as-is (case-sensitive on
+// the media-type, case-insensitive on the parameters). The
+// apid-Validate path enforces "must start with application/" so
+// the rule's entries are always a closed set of media types.
+func contentTypeAllowed(ct string, allowed []string) bool {
+	if ct == "" {
+		return false
+	}
+	for _, a := range allowed {
+		if a == ct {
+			return true
+		}
+		// Match by media type only (ignore charset etc).
+		if i := strings.IndexByte(ct, ';'); i >= 0 {
+			if strings.TrimSpace(ct[:i]) == a {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -2338,6 +2590,25 @@ haveApp:
 		return
 	}
 
+	// PR-B / kind=validate body gate. Runs AFTER rewrite /
+	// headers / CORS / JWT / IP (so a rewritten path is matched
+	// against validate rules, and rejected-on-ip traffic never
+	// costs a body read) and BEFORE require_authn / public_auth
+	// (so a 4xx on bad body never reaches the auth chain). The
+	// applier buffers r.Body, restores it for the proxy leg, and
+	// returns 422 + RFC 7807 problem+json on schema mismatch.
+	//
+	// Body-cap placement: the global MaxBytesReader cap (spec
+	// §4.1) is installed HERE rather than further down so the
+	// validate read is bounded. Moved from the post-rate-limit
+	// block — same cap, same value, just earlier so this
+	// applier sees the bounded body.
+	r.Body = http.MaxBytesReader(w, r.Body, api.MaxRequestBodyBytes)
+	if h.applyEdgeRuleValidate(w, r, app, rec) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+
 	// Issue #560 / per-deployment require_authn. Runs AFTER
 	// Host→app resolution (so we know which app's
 	// require_authn to consult) and BEFORE the per-account
@@ -2459,9 +2730,6 @@ haveApp:
 	// Peek snapshot therefore reflects "tokens left after this
 	// request" which is the standard X-RateLimit-Remaining contract.
 	h.writeAppRateLimitHeaders(w, app.ID, app.Plan)
-
-	// Cap request body either direction (spec §4.1).
-	r.Body = http.MaxBytesReader(w, r.Body, api.MaxRequestBodyBytes)
 
 	// Per-app fan-out admission (issue #168). The WakeGate's
 	// shouldWake predicate runs HealthyCount against the plan's

@@ -323,6 +323,15 @@ type runDeps struct {
 	// allowance). Production wires a real adapter backed by
 	// pkg/edgejwks.NewCache + pkg/edgejwks.NewVerifier.
 	edgeJWKSAdapter *edgeJWKSAdapter
+	// edgeValidateAdapter (PR-B) is the validate handle consulted
+	// by applyEdgeRuleValidate. nil = validate kind disabled
+	// (pre-PR-B + dev posture; mirrors edgeJWKSAdapter's
+	// nil-allowance). Production wires a real adapter backed by
+	// pkg/edgevalidate.NewManager; the loader calls CompileSchema
+	// through this adapter on every kind=validate rule at
+	// loadHost time, and the applier calls Validate through it
+	// on every matched rule.
+	edgeValidateAdapter *edgeValidateAdapter
 	// edgeRulesAudit (ADR-089 PR 3) is the audit thin wrapper
 	// the handler's edge_rule.route_matched / edge_rule.route_blocked
 	// rows go through. nil = audit-disabled (matches the
@@ -775,7 +784,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// reads state.EdgeRule via the store; reset on
 	// db.NotifyEdgeRuleChanged is wired via PGBackend.WithEdgeRules
 	// below.
-	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log)
+	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter)
 	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
 	// Issue #561 / ADR-091 PR 5 — build the per-URL JWKS cache
 	// + JWT verifier that applyEdgeRuleJWT consults. Lazy
@@ -783,6 +792,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// with a 5s fetch timeout so an IdP outage can't block the
 	// gateway hot path.
 	deps.edgeJWKSAdapter = newEdgeJWKSAdapter(log)
+	// PR-B — build the kind=validate adapter backed by
+	// pkg/edgevalidate.NewManager (sha256-keyed LRU + Draft
+	// 2020-12 compile + JSON-Schema validate). The loader
+	// (loadHost) calls CompileSchema through this adapter for
+	// every kind=validate rule; the applier (handler.go) calls
+	// Validate through it on every matched rule.
+	deps.edgeValidateAdapter = newEdgeValidateAdapter(log)
 	// Issue #477 / ADR-079: build the unsealed basic-auth
 	// credential cache + the secretbox unsealer closure.
 	// The cache is shared between the Handler (read path)
@@ -980,6 +996,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// pkg/edgejwks.NewCache + pkg/edgejwks.NewVerifier.
 	if deps.edgeJWKSAdapter != nil {
 		handler.WithJWTVerifier(deps.edgeJWKSAdapter)
+	}
+	// PR-B — arm the per-rule JSON-Schema validator that
+	// applyEdgeRuleValidate consults. nil-safe:
+	// deps.edgeValidateAdapter nil falls through
+	// (applyEdgeRuleValidate short-circuits, matching pre-PR-B +
+	// dev posture). Production wires a real adapter backed by
+	// pkg/edgevalidate.NewManager.
+	if deps.edgeValidateAdapter != nil {
+		handler.WithValidator(deps.edgeValidateAdapter)
 	}
 	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
 	// The 60s cache lives on the Handler (production wires

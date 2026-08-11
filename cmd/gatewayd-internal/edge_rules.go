@@ -45,35 +45,63 @@ type edgeRuleStore interface {
 // wrapper. nil-safe (the gateway handler skips Match* when
 // h.edgeRules == nil; this type is never nil because cmd/gatewayd-internal/run.go
 // always wires one before the listener accepts).
+//
+// validate holds the pkg/edgevalidate adapter (set in PR-B).
+// compileValidateRules calls CompileSchema on every kind=validate
+// rule so the hot path never sees a cold cache. nil-safe: when
+// nil, kind=validate rules compile-then-drop (the rule is
+// silently skipped — same posture as a path-glob parse error).
+// The cmd-side run.go wires a non-nil adapter in production.
 type gatewaydEdgeRules struct {
-	store edgeRuleStore
-	cache *gateway.EdgeRuleCache
-	log   *slog.Logger
+	store    edgeRuleStore
+	cache    *gateway.EdgeRuleCache
+	log      *slog.Logger
+	validate validateCompiler
+}
+
+// validateCompiler is the surface compileValidateRules needs from
+// the cmd-side adapter (cmd/gatewayd-internal/edge_validate.go).
+// We narrow the seam so this file stays free of pkg/edgevalidate;
+// the adapter file provides the concrete impl.
+//
+// Note: this is deliberately a *small* projection of the
+// pkg/edgevalidate.Manager surface. CompileSchema is the only
+// method compileValidateRules needs at load time — Validate
+// itself is called from the handler-side applier via the
+// gateway.Validator interface (handler.go::WithValidator setter),
+// not through this matcher.
+type validateCompiler interface {
+	CompileSchema(schema []byte, rejectUnknownFields bool) (schemaDigest [32]byte, err error)
 }
 
 // newGatewaydEdgeRules builds the matcher with the standard
 // 10,000-entry LRU capacity (pkg/gateway/edgeRuleCacheCap). log
 // must be non-nil so loader failures have somewhere to land.
-func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger) *gatewaydEdgeRules {
+// validate may be nil (validate kind disabled; kind=validate rules
+// are silently dropped at compile time, same posture as a
+// path-glob parse error).
+func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate validateCompiler) *gatewaydEdgeRules {
 	return &gatewaydEdgeRules{
-		store: store,
-		cache: gateway.NewEdgeRuleCache(gateway.EdgeRuleCacheCap),
-		log:   log,
+		store:    store,
+		cache:    gateway.NewEdgeRuleCache(gateway.EdgeRuleCacheCap),
+		log:      log,
+		validate: validate,
 	}
 }
 
 // loadHost compiles every kind's slice for host into a fresh
-// hostEntry. Shared by all seven Match* methods so a cache miss for
-// ANY kind recompiles all seven kinds in one pass (the SQL roundtrip
-// dominates; the seven path.Match walks are irrelevant). Returns
+// hostEntry. Shared by all eight Match* methods so a cache miss for
+// ANY kind recompiles all eight kinds in one pass (the SQL roundtrip
+// dominates; the path.Match walks are irrelevant). Returns
 // nil + nil error on an empty store response.
 //
-// parseErrs is the aggregated parse-error list across all seven
+// parseErrs is the aggregated parse-error list across all eight
 // compile* calls — the caller logs each at WARN so an operator can
 // diagnose a malformed glob or CIDR. The malformed rules are
 // dropped from their respective compiled slices. PR 5 widens the
 // list to include malformed CIDR parse errors from compileIPRules
-// (reuses the same PathGlobError tuple shape).
+// (reuses the same PathGlobError tuple shape); PR-B widens it
+// again to include kind=validate compile errors.
 func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway.HostEntry, error) {
 	storeRules, err := g.store.MatchEdgeRulesForHost(ctx, host)
 	if err != nil {
@@ -86,6 +114,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	cors, corsErrs := compileCORSRules(storeRules)
 	jwt, jwtErrs := compileJWTRules(storeRules)
 	ip, ipErrs := compileIPRules(storeRules)
+	validate, validateErrs := g.compileValidateRules(storeRules)
 	entry := &gateway.HostEntry{
 		Route:    route,
 		Rewrite:  rewrite,
@@ -94,6 +123,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		CORS:     cors,
 		JWT:      jwt,
 		IP:       ip,
+		Validate: validate,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -101,6 +131,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, corsErrs...)
 	parseErrs = append(parseErrs, jwtErrs...)
 	parseErrs = append(parseErrs, ipErrs...)
+	parseErrs = append(parseErrs, validateErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
 	}
@@ -276,6 +307,33 @@ func (g *gatewaydEdgeRules) MatchIP(ctx context.Context, host, requestPath, meth
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstIPMatch(rules, requestPath, method)
+}
+
+// MatchValidate returns the highest-priority `kind=validate` rule
+// whose host, path, and method match, or nil (PR-B). Same cache
+// primitive as MatchIP — a cache miss recompiles all eight kinds
+// in one SQL pass. The applier (handler.go::applyEdgeRuleValidate)
+// buffers the request body, restores r.Body for the proxy leg,
+// and consults the cmd-side validator via gateway.Validator.
+// This method only finds the rule.
+func (g *gatewaydEdgeRules) MatchValidate(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleValidateResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetValidate(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Validate
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstValidateMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -677,6 +735,88 @@ func parseCIDRs(cidrs []string, ruleID string) ([]*net.IPNet, []gateway.PathGlob
 		return nil, parseErrs
 	}
 	return out, nil
+}
+
+// compileValidateRules mirrors compileIPRules for kind=validate.
+// The compiled slice carries the SchemaDigest + ContentTypes +
+// ApplyWhileStreaming + RejectUnknownFields + MaxBodyBytes fields
+// the handler's applyEdgeRuleValidate consults. apid-Validate
+// already enforced the schema is non-empty, ≤ 64 KiB, valid JSON,
+// and has no external $ref/$id (PR-A); this compile step is the
+// defence-in-depth pass — a hot-fix that bypassed apid still
+// fails here, and the rule is dropped from the slice (the customer
+// sees the existing pass-through path).
+//
+// The Compile call is keyed off the SHA-256 of the raw schema body,
+// stashed on the resolved struct so the handler-side applier can
+// look up the compiled *CompiledSchema in pkg/edgevalidate.Cache.
+// A nil validate adapter compiles-then-drops the rule (we don't
+// want a missing adapter to crash the load; the rule is simply
+// skipped, same as a malformed CIDR).
+func (g *gatewaydEdgeRules) compileValidateRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleValidateResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleValidateResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindValidate {
+			continue
+		}
+		if r.Action.Validate == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		action := r.Action.Validate
+		// Compute the digest from the raw schema bytes — this
+		// is what pkg/edgevalidate.Cache will key on. Doing
+		// it here lets the load path surface a parse error
+		// before the rule reaches the cache.
+		schemaBytes := []byte(action.Schema)
+		var digest [32]byte
+		if g.validate == nil {
+			// Adapter not wired — drop the rule. The
+			// loadHost caller's parseErrs slice stays
+			// empty (this is a deploy config error,
+			// not a malformed rule). slog it from
+			// the caller.
+			continue
+		}
+		d, err := g.validate.CompileSchema(schemaBytes, action.RejectOnUnknown)
+		if err != nil {
+			parseErrs = append(parseErrs, gateway.PathGlobError{
+				RuleID: r.ID, Glob: "validate", Err: err,
+			})
+			continue
+		}
+		digest = d
+		var contentTypes []string
+		if len(action.ContentTypes) > 0 {
+			contentTypes = append(contentTypes, action.ContentTypes...)
+		}
+		out = append(out, gateway.EdgeRuleValidateResolved{
+			ID:                  r.ID,
+			AccountID:           r.AccountID,
+			AppID:               r.AppID,
+			Priority:            r.Priority,
+			PathGlob:            r.MatchPath,
+			Methods:             buildMethodsMap(r.MatchMethods),
+			SchemaDigest:        digest,
+			ContentTypes:        contentTypes,
+			ApplyWhileStreaming: action.ApplyWhileStreaming,
+			RejectUnknownFields: action.RejectOnUnknown,
+			MaxBodyBytes:        action.MaxBodyBytes,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
 }
 
 // validatePathGlob runs stdlib path.Match(glob, "") to detect a

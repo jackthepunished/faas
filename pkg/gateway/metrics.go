@@ -560,16 +560,19 @@ func NewMetrics() *Metrics {
 	// extend this slice; the metric name stays stable.
 	// ADR-089 PR 3 + PR 4 — pre-instantiate the closed (kind, outcome)
 	// cross product for every shipped kind. PR 5-7 add kinds to
-	// the outer loop (cors / jwt / ip). JWT additionally has
-	// "failed" + "missing" outcomes (the verifier path emits those
-	// — kind=jwt has more distinct failure modes than the other
-	// kinds because every sentinel error in pkg/edgejwks maps to
-	// a separate outcome for the dashboard). CORS + IP keep the
-	// closed {match, miss, blocked} triple. The closed set
-	// guarantees the §12 dashboard panel "edge rule match rate"
-	// surfaces every (kind, outcome) tuple from first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip"} {
-		for _, outcome := range []string{"match", "miss", "blocked"} {
+	// the outer loop (cors / jwt / ip). PR-B (kind=validate)
+	// widens the outer loop with the "failed" outcome (broken
+	// schema compile + 415 + 413 audit rows all land here). JWT
+	// additionally has "failed" + "missing" outcomes (the
+	// verifier path emits those — kind=jwt has more distinct
+	// failure modes than the other kinds because every sentinel
+	// error in pkg/edgejwks maps to a separate outcome for the
+	// dashboard). CORS + IP keep the closed {match, miss, blocked}
+	// triple. The closed set guarantees the §12 dashboard panel
+	// "edge rule match rate" surfaces every (kind, outcome)
+	// tuple from first scrape.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate"} {
+		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
 	}
