@@ -63,9 +63,10 @@ const defaultEnvScope = "default"
 // (scope, isAll, problem) so listEnv can branch on isAll without
 // re-parsing the query string.
 //
-// PutEnvScopeQueryParam is a stable identifier; the gregale CLI
-// and the SDK generator hard-code it. If you rename it, also update
-// the `?scope=` references in api/openapi.yaml and the SDK.
+// scopeQueryParam is the wire-level query-string key for the env
+// scope. The gregale CLI and the SDK generator hard-code the
+// `scope` literal; if you rename it, also update the `?scope=`
+// references in api/openapi.yaml and the SDK.
 const scopeQueryParam = "scope"
 
 func scopeFromQuery(r *http.Request, allowAll bool) (scope string, isAll bool, prob *api.Problem) {
@@ -112,12 +113,10 @@ func (s *server) listEnv(w http.ResponseWriter, r *http.Request, acct state.Acco
 
 	if isAll {
 		// `?scope=__all__` returns the nested map shape. Read every
-		// row on the app via the scope-agnostic store path. We do
-		// NOT introduce a new State method for this — the
-		// all-scope read is rare (operator-only) and the in-memory
-		// sort is O(n log n) on the per-app env count (capped at
-		// Limits.EnvVarsMax).
-		rows, err := s.listAllEnvForApp(r.Context(), acct.ID, app.ID)
+		// row on the app via the scope-agnostic store path. The
+		// all-scope read is rare (operator-only) and the per-app
+		// row count is capped at Limits.EnvVarsMax.
+		rows, err := s.store.ListAllAppEnv(r.Context(), acct.ID, app.ID)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not list env vars"))
 			return
@@ -154,21 +153,6 @@ func (s *server) listEnv(w http.ResponseWriter, r *http.Request, acct state.Acco
 		Quota: limits.EnvVarsMax,
 		Count: totalCount,
 	})
-}
-
-// listAllEnvForApp returns every env row on the app across all
-// scopes, sorted by (scope ASC, key ASC). Used by listEnv's
-// `?scope=__all__` arm. Delegates to store.ListAllAppEnv so the
-// production pgstore + the test MemStore agree on the wire shape.
-// The per-app row count is bounded by Limits.EnvVarsMax (8..2000 by
-// plan) and the call is rare (operator-only), so the read is
-// cheap.
-func (s *server) listAllEnvForApp(c stdctxEnv, accountID, appID string) ([]state.AppEnv, error) {
-	rows, err := s.store.ListAllAppEnv(c, accountID, appID)
-	if err != nil {
-		return nil, err
-	}
-	return rows, nil
 }
 
 // writeEnvListAll renders the nested `env_by_scope` response shape

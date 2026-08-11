@@ -34,8 +34,8 @@ const MaxEnvScopeLen = 40
 // sentinel cannot collide with a real scope name. Rejecting it via
 // pattern alone would be brittle (a future relaxation that admits
 // underscores would accidentally start accepting "__all__"); instead
-// ValidateScope does a two-stage check: regex first, then a
-// dedicated sentinel rejection on the write path. See
+// ValidateScope does a two-stage check: dedicated sentinel branch
+// first (the load-bearing one), then the regex. See
 // ErrEnvScopeReserved for the 400 error code.
 const EnvScopeAllSentinel = "__all__"
 
