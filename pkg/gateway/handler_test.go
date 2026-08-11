@@ -1635,7 +1635,7 @@ func TestApplyEdgeRuleJWT_VerifierError_EmitsApplyError(t *testing.T) {
 			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
 			Priority: 0, PathGlob: "", Methods: nil,
 			Issuer: "https://idp.example.com", Audience: []string{"api"},
-			JWKSURL: "https://idp.example.com/.well-known/jwks.json",
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
 			Algorithms: []string{"RS256"},
 		},
 	}
@@ -1678,7 +1678,7 @@ func TestApplyEdgeRuleJWT_VerifierSuccess_EmitsApplySuccess(t *testing.T) {
 			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
 			Priority: 0, PathGlob: "", Methods: nil,
 			Issuer: "https://idp.example.com", Audience: []string{"api"},
-			JWKSURL: "https://idp.example.com/.well-known/jwks.json",
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
 			Algorithms: []string{"RS256"},
 		},
 	}
@@ -1718,7 +1718,7 @@ func TestApplyEdgeRuleJWT_MissingBearer_EmitsApplyError(t *testing.T) {
 			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
 			Priority: 0, PathGlob: "", Methods: nil,
 			Issuer: "https://idp.example.com", Audience: []string{"api"},
-			JWKSURL: "https://idp.example.com/.well-known/jwks.json",
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
 			Algorithms: []string{"RS256"},
 		},
 	}
