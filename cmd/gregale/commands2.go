@@ -733,6 +733,11 @@ func cmdDeployTarball(args []string) int {
 	// explicit 1-exit error.
 	repo := fs.String("repo", "", "GitHub repo to deploy from (owner/name)")
 	ref := fs.String("ref", "", "git ref for --repo (branch, tag, or 40-char SHA)")
+	// Issue #270: --github emits a copy-paste-ready GitHub Actions
+	// workflow snippet to stdout and exits 0. No auth, no side effects,
+	// mirrors `cmdBillingPortal --print` (commands_billing.go:104-157).
+	// See cmd_deploy_github.go for the snippet body.
+	githubSnippet := fs.Bool("github", false, "emit a GitHub Actions workflow snippet for the faas-deploy-action")
 	templateName := fs.String("template", "", "start from an embedded template (run with a bad value to see available names)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine|node24|python313)")
@@ -845,6 +850,19 @@ func cmdDeployTarball(args []string) int {
 	slug := *name
 	if slug == "" {
 		slug = deriveName()
+	}
+
+	// --github emits a copy-paste GitHub Actions workflow snippet to
+	// stdout and exits 0 (issue #270). No auth, no side effects — this
+	// is a documentation-generation path, not a deploy path. The snippet
+	// uses the resolved slug from --name / cwd (slug variable above)
+	// and emits ${{ github.* }} placeholders by default, or concrete
+	// values when running inside a Actions runner (GITHUB_REPOSITORY +
+	// GITHUB_SHA env vars). Slots above the --repo short-circuit so a
+	// customer can run `gregale deploy --github --name my-app` without
+	// a --ref. The slug is the only required input.
+	if *githubSnippet {
+		return cmdDeployGithubSnippet([]string{"--app", slug})
 	}
 
 	// --repo is the headless source-ref deploy path (issue #739 /
