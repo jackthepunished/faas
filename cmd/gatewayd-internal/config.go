@@ -121,6 +121,17 @@ type Config struct {
 	// start under RoleControlPlane. RoleSingleBox is the default
 	// and lets single-box dev boot unmoved.
 	Role role.Role `toml:"role"`
+
+	// NodeName is the multi-box identity for the gatewayd-internal
+	// process (issue #678 / ADR-093 PR-0). When non-empty,
+	// gatewayd-internal is in multi-box mode: PR-B constructs
+	// PGNodeVerifier and threads it through every Load*WithVerifier
+	// helper. When empty, the verifier stays nil and stdlib trust
+	// alone runs (the single-box dev back-compat path). Operator
+	// seeds the matching row in compute_nodes via the existing
+	// POST /v1/compute-nodes flow (no new apid handler — reuses
+	// UpsertComputeNodeFromOperator). Defaults to "".
+	NodeName string `toml:"node_name"`
 }
 
 // TOMLTLSConfig is the on-disk TLS subset. Function pointers and derived

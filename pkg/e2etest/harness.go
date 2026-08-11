@@ -874,6 +874,33 @@ func (h *Harness) stop() {
 	}
 }
 
+// Stop terminates every daemon subprocess owned by this Harness
+// immediately, without waiting for the test's t.Cleanup. Used by
+// e2e tests that need to release shared resources (Postgres
+// connections held by an apid pool, in-flight LISTEN goroutines,
+// etc.) between two boot phases — see
+// cmd/e2e/secrets_rotate_box_e2e_test.go::TestRekeyRunnerPg.
+//
+// Calls unexported stop() once. Idempotent: a second call after
+// the daemons are already reaped is a no-op (the inner loop
+// short-circuits on p.ProcessState != nil). The shared test pool
+// (h.Pool) is NOT closed here — that's owned by pgtest.Open's
+// t.Cleanup. Closing the pool mid-test would deadlock the next
+// StartWithEnv call.
+//
+// ADR-094: the L2 fix for PR-823's TestRekeyRunnerPg flake. The
+// listener-bind timeout (`127.0.0.1:<port> did not accept within
+// 10s`) was caused by phase 2's apid racing phase 1's
+// already-running bgBefore goroutines for the shared Postgres
+// max_connections=100 budget. Calling Stop between phases
+// removes phase 1 from contention so phase 2 boots cleanly.
+func (h *Harness) Stop() {
+	if h == nil {
+		return
+	}
+	h.stop()
+}
+
 // buildBinaries runs `go build` for each daemon listed in whichDaeamons into
 // the bin dir. The Go build cache means the second run in the same test
 // process is a no-op.

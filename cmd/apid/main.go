@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"filippo.io/age"
@@ -170,40 +171,58 @@ func readArchiveCreds(path string) (archiveCreds, error) {
 	return c, nil
 }
 
-// listenAddr is the bind address for apid. Behind gatewayd-internal; not a public
-// listener. Overridable via FAAS_APID_LISTEN so the e2e harness can pick a
-// free port without colliding with a dev daemon on 8081.
-var listenAddr = envOr("FAAS_APID_LISTEN", "127.0.0.1:8081")
-
-// metricsAddr is the bind address for the apid /metrics listener
-// (separate from the main listener so a port collision can't take the
-// daemon down). Defaults to 127.0.0.1:9101 so an operator typo (or
-// a missing env var in prod) can't accidentally expose the internal
+// resolveMetricsAddr reads FAAS_APID_METRICS_ADDR via the test seam
+// (deps.getenv). Empty string disables the listener (this is the
+// deliberately-distinct envOr path: envOr() collapses empty→unset→
+// fallback, which is right for FAAS_APID_LISTEN but wrong here,
+// where empty means "skip the listener entirely"). The test
+// seam + the explicit-empty-disable semantic are the reasons this
+// helper exists as a package-level function (vs a Config.Get
+// metricsAddrDefault is the loopback bind address for the /metrics
+// listener. The default is loopback so an operator typo (or a
+// missing env var in prod) can't accidentally expose the internal
 // registry to the public network — series like apid_ops_total{op,code}
 // leak auth-rejection rates and per-route traffic shape (review
 // finding #1 on PR #132). Loopback bind is safe because the local
-// Prometheus scrapes from the box itself.
-//
-// Empty FAAS_APID_METRICS_ADDR disables the listener. This is the
-// deliberately-distinct envOr path: envOr() collapses empty→unset→
-// fallback (line 63), which is right for FAAS_APID_LISTEN (where
-// empty means "no override, use the default port") but wrong here
-// (where empty means "skip the listener entirely"). os.LookupEnv
-// distinguishes "unset" (fall through to the default) from
-// "explicitly empty" (skip), so the e2e harness can stamp
-// `FAAS_APID_METRICS_ADDR=` and avoid the 127.0.0.1:9101 bind race
-// against a sibling or zombie apid run. Mirrors cmd/builderd/main.go's
+// Prometheus scrapes from the box itself. Mirrors cmd/builderd/main.go's
 // MetricsAddr pattern (PR #124).
-var metricsAddr = func() string {
-	v, ok := os.LookupEnv("FAAS_APID_METRICS_ADDR")
-	if ok && v == "" {
-		return "" // explicit-empty = disable
+//
+// PR-0 (issue #678): the literal was repeated 3+ times across the
+// pre-PR-0 inline env reads, the post-PR-0 resolveMetricsAddr helper,
+// and the package-level default. Extracted to a const for goconst
+// (golangci-lint v2.4.0 fires at 3 occurrences).
+const metricsAddrDefault = "127.0.0.1:9101"
+
+// resolveMetricsAddr reads FAAS_APID_METRICS_ADDR via the test
+// seam (deps.getenv). Empty string disables the listener (the
+// deliberately-distinct envOr path: envOr() collapses empty→unset→
+// fallback, which is right for FAAS_APID_LISTEN but wrong here,
+// where empty means "skip the listener entirely"). The test
+// seam + the explicit-empty-disable semantic are the reasons this
+// helper exists as a package-level function (vs a Config.Get
+// method). Defaults to metricsAddrDefault so an operator typo (or
+// a missing env var in prod) can't accidentally expose the
+// internal registry to the public network.
+//
+// The e2e harness stamps `FAAS_APID_METRICS_ADDR=` to avoid the
+// metricsAddrDefault bind race against a sibling or zombie apid
+// run.
+//
+// PR-0 (issue #678): the tomlDefault argument pulls the default
+// from cfg.GetMetricsAddr so a TOML-configured metrics_addr is
+// respected (issue #678 PR-0 — apid's first ever TOML config).
+// When tomlDefault is non-empty, it wins over the package-level
+// of metricsAddrDefault.
+func resolveMetricsAddr(getenv func(string) string, tomlDefault string) string {
+	v := getenv("FAAS_APID_METRICS_ADDR")
+	if v == "" && tomlDefault == "" {
+		return metricsAddrDefault
 	}
-	if !ok || v == "" {
-		return "127.0.0.1:9101"
+	if v == "" {
+		return tomlDefault
 	}
 	return v
-}()
+}
 
 // resolveAdvisorySock reads FAAS_APID_ADVISORY_SOCK via the test
 // seam (deps.getenv). Empty string disables the listener. Tests
@@ -214,7 +233,17 @@ var metricsAddr = func() string {
 // /run/faas/apid.sock explicitly so the default doesn't matter
 // in prod — the explicit assignment is what enables the
 // listener there.
-func resolveAdvisorySock(getenv func(string) string) string {
+//
+// PR-0 (issue #678): Config.GetAdvisorySock (cmd/apid/config.go)
+// is the TOML-aware version. main.go calls the helper directly
+// when a Config is in scope; this env-only helper stays for the
+// test seam that doesn't yet thread a Config (the existing
+// tests pass nil cfg → this branch). Tests that build a real
+// Config use Config.GetAdvisorySock directly.
+func resolveAdvisorySock(getenv func(string) string, cfg *Config) string {
+	if cfg != nil {
+		return cfg.GetAdvisorySock(getenv)
+	}
 	return getenv("FAAS_APID_ADVISORY_SOCK")
 }
 
@@ -227,7 +256,12 @@ func resolveAdvisorySock(getenv func(string) string) string {
 // the bridge socket has a separate path because the consumer
 // (githubd) dials it, not vmmd, and the 0660 DAC group is shared
 // between the githubd user and apid user.
-func resolveGithubdBridgeSock(getenv func(string) string) string {
+//
+// PR-0 (issue #678): same thin-wrapper pattern as resolveAdvisorySock.
+func resolveGithubdBridgeSock(getenv func(string) string, cfg *Config) string {
+	if cfg != nil {
+		return cfg.GetGithubdBridgeSock(getenv)
+	}
 	return getenv("FAAS_APID_GITHUBD_BRIDGE_SOCK")
 }
 
@@ -279,6 +313,36 @@ type runDeps struct {
 	// nil in production (defaultDeps wires billingloader.LoadBillingConfigFromPath);
 	// tests stub to return a hand-rolled *RootBillingConfig.
 	loadBillingConfig func(path string) (*billingloader.RootBillingConfig, error)
+	// PR-0 (issue #678): loadConfig reads the apid config (the
+	// non-billing surface: ListenAddr, MetricsAddr, AdvisorySock,
+	// GithubdBridgeSock, GithubdSocket, AppsDomain, the three TLS
+	// clusters, NodeName). nil in production (defaultDeps wires
+	// LoadConfig); tests stub to return a hand-rolled *Config.
+	// Same file as loadBillingConfig consumes — the two readers
+	// share /etc/faas/apid.toml.
+	loadConfig func(path string) (*Config, error)
+	// PR-0 (issue #678): preLoadedConfig, when non-nil, skips the
+	// LoadConfig call inside run() and uses this Config directly.
+	// Tests inject a hand-rolled *Config to assert behaviour
+	// without round-tripping a TOML file through LoadConfig. nil
+	// in production.
+	preLoadedConfig *Config
+	// PR-0 (issue #678): config carries the loaded *Config into
+	// runWithDeps so the listener / dial / TLS helpers can read
+	// cfg.Load* / cfg.Get* directly. Set by run() immediately after
+	// LoadConfig returns; nil in the test seam that constructs
+	// runDeps directly (those tests should set preLoadedConfig
+	// instead).
+	config *Config
+	// ADR-094: closePool is the pool-cleanup hook run() wires after
+	// db.Open succeeds. runWithDeps calls it on every early-return
+	// between db.Open and the post-bind defer-install (so an error
+	// anywhere in the bind path closes the pool out, not the
+	// in-flight bgBefore goroutines). Tests can inject a no-op
+	// (`func() {}`) so the existing TestRunWithDeps_ListenErrorReturns
+	// shape — which never sets up a real pool — keeps working.
+	// nil in production before run() sets it.
+	closePool func()
 }
 
 func defaultDeps() runDeps {
@@ -293,6 +357,7 @@ func defaultDeps() runDeps {
 		loginTTL:          15 * time.Minute,
 		configPath:        "/etc/faas/apid.toml",
 		loadBillingConfig: billingloader.LoadBillingConfigFromPath,
+		loadConfig:        LoadConfig,
 	}
 }
 
@@ -330,8 +395,45 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("apid: open db: %w", err)
 	}
-	defer pool.Close()
+	// ADR-094: the pool's lifetime is no longer bound to run()'s
+	// defer. The pre-bind goroutines in bgBefore (rekey walker,
+	// sseFanIn, audit subscriber, grace sweep, etc.) each call
+	// pool.Acquire(); an early-return anywhere between here and
+	// the listener bind used to close the pool out from under
+	// those goroutines — they returned "closed pool" and main
+	// never reached the listener-bind log line. The fix is the
+	// closePool helper + the explicit closePool() call before
+	// every early-return in this range, with a single
+	// defer closePool() at the post-bind site (below the metrics
+	// / advisory / bridge listener sections, just before
+	// srv.Serve).
+	//
+	// ADR-094 pins this shape via pkg/db/warmup_architecture_test.go
+	// so a future refactor that drops closePool() at an early-return
+	// site fails the test instead of silently reintroducing the
+	// race.
+	closePool := func() {
+		if pool != nil {
+			pool.Close()
+		}
+	}
+	// Warm-up barrier: acquire (and release) 4 connections before
+	// bgBefore launches its goroutines. This is the belt-and-braces
+	// defence — proves the pool can serve N parallel connections
+	// before any one of them races another for the same slot. The
+	// "N=4" default matches apid's expected boot fan-out (audit
+	// subscriber Subscribe + rekey first-walk + sseFanIn Subscribe +
+	// grace/login/eventretention first-pass DELETE each grab one
+	// connection at startup; 4 is the upper bound for any single
+	// tick). If a future daemon picks up a fifth concurrent
+	// goroutine at boot, bump the constant here + update the
+	// architecture test's expected ordering.
+	if err := db.WarmUp(ctx, pool, 4, 5*time.Second); err != nil {
+		closePool()
+		return fmt.Errorf("apid: pool warm-up: %w", err)
+	}
 	if err := db.MigrateUp(ctx, pool); err != nil {
+		closePool()
 		return fmt.Errorf("apid: migrate: %w", err)
 	}
 
@@ -344,7 +446,27 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 	deps := defaultDeps()
 	deps.store = func() state.Store { return state.NewPgStore(pool) }
+	// PR-0 (issue #678): load the apid Config from the same
+	// /etc/faas/apid.toml file the [billing] loader already reads.
+	// Behaviour-preserving: every legacy FAAS_APID_* / FAAS_GITHUBD_*
+	// env var continues to win over TOML because Get* helpers are
+	// called from main.go after this LoadConfig, and the env-overlay
+	// pattern (env first, TOML fallback) is preserved verbatim.
+	cfg := deps.preLoadedConfig
+	if cfg == nil {
+		cfg, err = deps.loadConfig(deps.configPath)
+		if err != nil {
+			closePool()
+			return fmt.Errorf("apid: load config: %w", err)
+		}
+	}
+	deps.config = cfg
 	deps.notif = func() Notifier { return pgNotifier{pool: pool} }
+	// ADR-094: hand runWithDeps the same closePool helper so the
+	// post-bind defer (installed just before srv.Serve) and every
+	// pre-bind early-return close the pool consistently. Tests that
+	// build runDeps directly without a pool pass a no-op closure.
+	deps.closePool = closePool
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
 		// ADR-089 PR-C — background re-seal runner. The runner is
 		// nil when FAAS_REKEY_ENABLED is unset (or when identities
@@ -616,6 +738,37 @@ func dpaPathFromEnv(getenv func(string) string) string {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// ADR-094: pool-close gate. closePool closes the pool; the
+	// Once guards against double-close when an early-return path
+	// closes the pool explicitly and the deferred fallback also
+	// runs. Production wires deps.closePool to the helper built
+	// in run() right after db.Open; tests that pass a no-op
+	// closure (defaultDeps.zeroClosePool) keep the existing
+	// behaviour. The Once-fallback ensures any pre-bind path
+	// that forgets to call closePoolOnce explicitly still closes
+	// the pool on return — defence-in-depth on top of the
+	// explicit calls below.
+	closePool := deps.closePool
+	closePoolOnce := sync.OnceFunc(func() {
+		if closePool != nil {
+			closePool()
+		}
+	})
+	defer closePoolOnce()
+
+	// PR-0 (issue #678): cfg carries the issue-#678 surface
+	// (Load*TLS, Get*) into every helper that used to read FAAS_APID_*
+	// inline. deps.config is set by run() after LoadConfig returns;
+	// the test seam can set it directly via runDeps.config. When
+	// nil (the pre-PR-#678 test path that calls runWithDeps
+	// directly without threading a Config), fall back to a
+	// defaults-only Config — the helpers tolerate nil-receiver,
+	// but the cfg.Get* calls don't, so an empty Config is the
+	// safe shape.
+	cfg := deps.config
+	if cfg == nil {
+		cfg = &Config{}
+	}
 	store := deps.store()
 
 	// Dev-only: seed a Free account bound to $FAAS_DEV_TOKEN so the CLI can be
@@ -646,20 +799,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// fine until githubd is actually deployed on this host.
 	//
 	// ADR-052: multi-box deployments dial githubd over tcp:// +
-	// mTLS. Load the client TLS config from env so the same
-	// per-daemon TOML surface (or env-var analogue) works whether
-	// the githubd lives on the same host (unix socket) or a
-	// remote box (tcp/dns + leaf cert). Empty TLS cluster returns
-	// (nil, nil) and the unix path keeps working.
-	githubdTLS, err := wire.LoadClientTLSConfig(
-		deps.getenv("FAAS_GITHUBD_TLS_CERT_PATH"),
-		deps.getenv("FAAS_GITHUBD_TLS_KEY_PATH"),
-		deps.getenv("FAAS_GITHUBD_TLS_CA_PATH"),
-	)
+	// mTLS. cfg.LoadGithubdTLS reads the githubd_tls_* cluster
+	// from apid.toml (issue #678 PR-0); the env-var analogue
+	// FAAS_GITHUBD_TLS_* was the pre-PR-#678 path. Empty TLS
+	// cluster returns (nil, nil) and the unix path keeps working.
+	// PR-0 is behaviour-preserving — see cmd/apid/config.go for
+	// the env-overlay contract.
+	githubdTLS, err := cfg.LoadGithubdTLS()
 	if err != nil {
 		return fmt.Errorf("apid: githubd TLS: %w", err)
 	}
-	githubd := newGithubdClient(ctx, deps.getenv("FAAS_GITHUBD_SOCKET"), githubdTLS, log)
+	githubd := newGithubdClient(ctx, cfg.GetGithubdSocket(deps.getenv), githubdTLS, log)
 	// M7.5: dashboard session manager. Loads the 32-byte key from
 	// FAAS_SESSION_KEY (hex-encoded); empty in dev = ephemeral key +
 	// warning so the daemon still boots for local testing. Production
@@ -692,7 +842,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"google_enabled", oauthCfg.Google.Enabled(),
 			"github_enabled", oauthCfg.GitHub.Enabled())
 	}
-	srv := newServerWithDeps(store, log, deps.getenv("FAAS_APPS_DOMAIN"), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
+	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
 	srv.WithOAuthConfig(oauthCfg)
 
 	// Issue #142: Stripe billing portal URL template for the changePlan
@@ -989,9 +1139,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		deps.bgBefore(ctx, log, srv)
 	}
 
-	httpSrv := deps.newSrv(listenAddr, srv.handler())
+	listenBind := cfg.GetListenAddr(deps.getenv)
+	httpSrv := deps.newSrv(listenBind, srv.handler())
 
-	l, err := deps.listen("tcp", listenAddr)
+	l, err := deps.listen("tcp", listenBind)
 	if err != nil {
 		return err
 	}
@@ -1001,8 +1152,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// FAAS_APID_METRICS_ADDR = no listener (the scrape observer is
 	// still wired into the main mux via observeWrap; only the
 	// listener is skipped). Mirrors cmd/builderd/main.go:146-157.
+	//
+	// PR-0 (issue #678): resolveMetricsAddr honours the explicit-
+	// empty-disable semantic by reading FAAS_APID_METRICS_ADDR via
+	// the test seam (deps.getenv), then falls back to cfg.GetMetricsAddr
+	// (TOML), then to metricsAddrDefault.
 	var metricsSrv *http.Server
-	if metricsAddr != "" {
+	if metricsAddr := resolveMetricsAddr(deps.getenv, cfg.GetMetricsAddr(deps.getenv)); metricsAddr != "" {
 		metricsSrv = &http.Server{
 			Addr:              metricsAddr,
 			Handler:           ops.Handler(),
@@ -1028,19 +1184,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// empty and avoid the bind race).
 	//
 	// ADR-052: when the target is tcp:// or dns:// (multi-box path),
-	// the operator must also set FAAS_APID_ADVISORY_TLS_{CERT,KEY,CA}_PATH
-	// to a per-daemon leaf. Single-box deployments leave the TLS
-	// cluster unset and continue to use the unix socket; the
-	// LoadServerTLSConfig helper returns (nil, nil) when all three
-	// paths are empty.
+	// the operator must also set advisory_tls_* in apid.toml to a
+	// per-daemon leaf. Single-box deployments leave the TLS cluster
+	// unset and continue to use the unix socket; cfg.LoadAdvisoryTLS
+	// returns (nil, nil) when all three paths are empty.
+	//
+	// PR-0 (issue #678): cfg.LoadAdvisoryTLS is the issue-#678 surface
+	// that replaces the inline env reads. The behaviour is identical
+	// (env-overlay path is preserved via the Get helpers).
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
-	if sock := resolveAdvisorySock(deps.getenv); sock != "" {
-		advisoryTLS, tlsErr := wire.LoadServerTLSConfig(
-			deps.getenv("FAAS_APID_ADVISORY_TLS_CERT_PATH"),
-			deps.getenv("FAAS_APID_ADVISORY_TLS_KEY_PATH"),
-			deps.getenv("FAAS_APID_ADVISORY_TLS_CA_PATH"),
-		)
+	if sock := resolveAdvisorySock(deps.getenv, cfg); sock != "" {
+		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLS()
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory TLS: %w", tlsErr)
@@ -1065,14 +1220,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// The bridge receiver implementation is in githubd_bridge.go;
 	// it implements the githubdpb.GithubdServer interface (only
 	// EnqueueBuild is wired; the rest is UnimplementedGithubdServer).
+	//
+	// PR-0 (issue #678): cfg.LoadGithubdBridgeTLS is the issue-#678
+	// surface that replaces the inline env reads.
 	var bridgeSrv *grpc.Server
 	var bridgeLis net.Listener
-	if sock := resolveGithubdBridgeSock(deps.getenv); sock != "" {
-		bridgeTLS, tlsErr := wire.LoadServerTLSConfig(
-			deps.getenv("FAAS_APID_GITHUBD_BRIDGE_TLS_CERT_PATH"),
-			deps.getenv("FAAS_APID_GITHUBD_BRIDGE_TLS_KEY_PATH"),
-			deps.getenv("FAAS_APID_GITHUBD_BRIDGE_TLS_CA_PATH"),
-		)
+	if sock := resolveGithubdBridgeSock(deps.getenv, cfg); sock != "" {
+		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLS()
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: githubd bridge TLS: %w", tlsErr)
@@ -1092,7 +1246,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("apid listening", "addr", listenAddr)
+		log.Info("apid listening", "addr", listenBind)
 		if err := httpSrv.Serve(l); err != nil && err != http.ErrServerClosed {
 			errc <- err
 		}

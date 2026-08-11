@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -72,9 +73,17 @@ type VMMClientIface interface {
 // the first MountParentExt4ReadOnly / UmountParentExt4 call
 // triggers grpc.DialContext; a transiently-down vmmd surfaces
 // as a dial error on that first call, not at construction time.
+//
+// PR-0 (issue #678): nodeName carries the multi-box identity
+// for the imaged process so PR-B can construct a verifier on
+// TCP/DNS targets (the cross-box path). Unix targets don't need
+// it — same-box DAC auth (ADR-015, group `faas`, mode 0660) is
+// the only authentication on that path. Empty nodeName = single-
+// box dev back-compat (no verifier; stdlib trust alone).
 type VMMClient struct {
-	target string
-	log    *slog.Logger
+	target   string
+	nodeName string
+	log      *slog.Logger
 
 	mu   sync.Mutex
 	conn *grpc.ClientConn
@@ -86,10 +95,25 @@ type VMMClient struct {
 // WithVMMClient.
 var _ VMMClientIface = (*VMMClient)(nil)
 
+// imagedNodeNameEnv is the env var imaged reads at construction
+// time to populate VMMClient.nodeName. Operator-driven (matches
+// the FAAS_APID_ROLE pattern Gate-B PR-1 established); production
+// systemd unit stamps it via host_vars on a multi-box fleet, and
+// single-box dev / Lima leave it unset.
+//
+// PR-0 (issue #678) adds this env-var surface; PR-B constructs
+// the verifier from it.
+const imagedNodeNameEnv = "FAAS_IMAGED_NODE_NAME"
+
 // NewVMMClient builds a client against the given unix-socket
 // target. Production wiring (cmd/imaged) passes
 // defaultVMMSock; tests pass a bufconn or a fake target so the
 // dial can be short-circuited. log may be nil.
+//
+// PR-0 (issue #678): nodeName carries the multi-box identity
+// from FAAS_IMAGED_NODE_NAME (read here so cmd/imaged doesn't
+// have to thread the env-read through its main wiring). Empty
+// = single-box dev back-compat.
 func NewVMMClient(target string, log *slog.Logger) *VMMClient {
 	if target == "" {
 		target = DefaultVMMSock
@@ -97,7 +121,11 @@ func NewVMMClient(target string, log *slog.Logger) *VMMClient {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &VMMClient{target: target, log: log}
+	return &VMMClient{
+		target:   target,
+		nodeName: os.Getenv(imagedNodeNameEnv),
+		log:      log,
+	}
 }
 
 // MountParentExt4ReadOnly asks vmmd to loopback-mount the

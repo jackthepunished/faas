@@ -429,7 +429,7 @@ func (a *gatewayEgressAdapter) Tracked() int {
 // pass a unix socket path + nil tlsCfg; the unix-socket DAC auth
 // (ADR-015, group `faas`, mode 0660) is the only authentication
 // on that path. Multi-box deployments pass a tcp/dns target +
-// a non-nil tlsCfg loaded via cfg.LoadGatewayEgressTLS(); the
+// a non-nil tlsCfg loaded via cfg.LoadEgressTLS(); the
 // stdlib verifier handles chain + SAN + EKU in a single pass
 // (ADR-052). The dialer is overridable via gwEgress.dialFn for
 // tests.
@@ -796,7 +796,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// deployments keep all three paths empty and LoadEgressTLS returns
 	// (nil, nil); multi-box deployments point egress_target at tcp://
 	// or dns:// + a TLS cluster.
-	gwEgressTLS, err := cfg.LoadGatewayEgressTLS()
+	gwEgressTLS, err := cfg.LoadEgressTLS()
 	if err != nil {
 		return fmt.Errorf("meterd: load egress TLS: %w", err)
 	}
