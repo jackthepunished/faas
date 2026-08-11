@@ -63,10 +63,22 @@ runs:
   steps:
     - name: Validate inputs
       shell: bash
-      run: ${{ github.action_path }}/src/run.sh validate
+      # ACTION_PATH is hoisted into env rather than interpolated
+      # directly into the run: string. CodeQL's js/injection rule
+      # flags any ${{ ... }} in run: even when the expression is
+      # GitHub-controlled (like github.action_path), because the
+      # expansion happens before shell evaluation. Routing through
+      # env: keeps the run string literal and resolves ACTION_PATH
+      # as a shell variable at run time. The src/run.sh script
+      # already honours ACTION_PATH via its own fallback at the
+      # top of the file (cmd/.../src/run.sh:25).
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: "$ACTION_PATH/src/run.sh validate"
     - name: Deploy
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         FAAS_API: ${{ inputs.api-base }}
         FAAS_TOKEN: ${{ inputs.api-key }}
         INPUT_APP: ${{ inputs.app }}
@@ -75,8 +87,10 @@ runs:
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_WAIT: ${{ inputs.wait }}
         INPUT_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
-      run: ${{ github.action_path }}/src/run.sh deploy
+      run: "$ACTION_PATH/src/run.sh deploy"
     - name: Annotate on failure
       if: failure()
       shell: bash
-      run: ${{ github.action_path }}/src/annotate.sh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: "$ACTION_PATH/src/annotate.sh"
