@@ -349,6 +349,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		db.NotifyAppChanged,
 		db.NotifyDeploymentChanged,
 		db.NotifySnapshotPrime,
+		db.NotifyCronRunNow, // PR-D / issue #791: multiplexed on the cron loop's existing LISTEN; zero extra pool connections.
 	}, l.log)
 	if err != nil {
 		return err
@@ -356,10 +357,26 @@ func (l *Loop) Run(ctx context.Context) error {
 	// SubscribeWithReconnect owns its own cancel via the deferred
 	// goroutine inside the wrapper; we close by ending ctx.
 
+	// PR-D / issue #791: drain any cron_fire_now_requests rows that
+	// survived a schedd bounce. Postgres re-fires the LISTEN channels
+	// immediately on connection establish, but fire-now rows are a
+	// TABLE source of truth — the LISTEN is just a wakeup — so we
+	// sweep once on startup to bound the post-restart latency at ~1
+	// round-trip rather than waiting for the 60s safety tick.
+	l.drainPendingFireNowRequests(ctx)
+
 	reaperT := time.NewTicker(10 * time.Second)
 	defer reaperT.Stop()
 	cronT := time.NewTicker(60 * time.Second)
 	defer cronT.Stop()
+	// Fire-now safety ticker (PR-D / issue #791). 60s cadence
+	// mirrors pkg/sched/fire_now.go::fireNowSafetyTick: when a
+	// NotifyCronRunNow delivery is dropped (Postgres bounce, network
+	// blip), the pending rows survive in the table and this ticker
+	// re-claims them. An operator-initiated action waiting up to
+	// 60s for recovery is acceptable.
+	fireNowT := time.NewTicker(fireNowSafetyTick)
+	defer fireNowT.Stop()
 	// Watchdog ticker (commit 3, spec §6.1). 1s cadence matches the
 	// spec's "per-second" granularity for catching stuck rows before
 	// they pin a ledger reservation for the full 30s cold-boot
@@ -576,6 +593,13 @@ func (l *Loop) Run(ctx context.Context) error {
 			retentionFirst = nil
 		case <-retentionTick(retentionT):
 			l.runRetention(ctx)
+		case <-fireNowT.C:
+			// PR-D / issue #791: safety sweep. Picks up rows that
+			// missed a NotifyCronRunNow delivery (Postgres bounce,
+			// network blip). Same dispatcher as the notify arm —
+			// drainPendingFireNowRequests is the single owner of the
+			// claim + dispatch loop.
+			l.drainPendingFireNowRequests(ctx)
 		}
 	}
 }
@@ -944,6 +968,14 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 		if err := l.engine.Prime(ctx, p.AppID, p.DeploymentID); err != nil {
 			l.log.Warn("sched: prime failed", "app", p.AppID, "deployment", p.DeploymentID, "err", err)
 		}
+	case db.NotifyCronRunNow:
+		// PR-D / issue #791: fire-now wake. The notify payload is
+		// informational (the row in cron_fire_now_requests is the
+		// source of truth) — drain handles claim + dispatch
+		// regardless of which request_id the notify carried. This
+		// matches the build_queued notify-loss defense pattern
+		// (cmd/imaged consumer: subscriber re-reads the row).
+		l.drainPendingFireNowRequests(ctx)
 	}
 }
 
@@ -2080,11 +2112,20 @@ func (l *Loop) RunCronNow(ctx context.Context, cronID, accountID string) (CronRu
 		return CronRun{}, ErrCronDisabled
 	}
 	now := l.now()
-	if _, ok := l.dispatchCronLocked(ctx, c, now, TriggerManual); !ok {
+	run, ok := l.dispatchCronLocked(ctx, c, now, TriggerManual)
+	if !ok {
 		// Suspended-account guard rejects the fire. The deferred
 		// audit emit does not run (no row written), so fail
 		// closed at the API surface.
 		return CronRun{}, ErrAccountSuspended
 	}
-	return CronRun{Success: true}, nil
+	// Issue #791 PR-D code-review: previously returned CronRun{
+	// Success: true} unconditionally, which discarded the
+	// fireSucceeded bool computed inside dispatchCronLocked.
+	// PR-D's processFireNowRequest maps this Success to the
+	// cron_fire_now_requests row's terminal status, so a fire
+	// that the audit row recorded as status="err" was being
+	// stamped succeeded on the row — a customer-visible
+	// disagreement. Propagate the real result.
+	return run, nil
 }

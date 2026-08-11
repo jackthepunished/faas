@@ -153,6 +153,8 @@ from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
+from .fire_cron_request_response import FireCronRequestResponse
+from .fire_cron_request_response_status import FireCronRequestResponseStatus
 from .fire_cron_response import FireCronResponse
 from .fire_cron_response_status import FireCronResponseStatus
 from .gdpr_audit_export_response import GdprAuditExportResponse
@@ -499,6 +501,8 @@ __all__ = (
     "EdgeRuleResponseKind",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
+    "FireCronRequestResponse",
+    "FireCronRequestResponseStatus",
     "FireCronResponse",
     "FireCronResponseStatus",
     "GdprAuditExportResponse",

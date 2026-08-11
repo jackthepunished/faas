@@ -225,6 +225,19 @@ type OpsMetrics struct {
 	// from the control-plane dur histogram whose sub-millisecond
 	// buckets are wrong for a Postgres call.
 	auditWriteDur *prometheus.HistogramVec
+	// cronFireNowDispatchDur: end-to-end latency of a manual cron
+	// fire-now (issue #791 PR-D / ADR-090 §"Sub-decision 7"). The
+	// start time is the customer's request row's `requested_at`
+	// (captured at the apid INSERT); the observation point is the
+	// schedd terminal stamp (MarkFireNowRequestSucceeded /
+	// MarkFireNowRequestFailed). Labelled by result ∈ {succeeded,
+	// failed} so an operator can split dispatcher-side latency
+	// (successful wakes) from woke-then-failed or notify-lost
+	// failures. The asymmetric buckets (0.1, 0.5, 1, 5, 30, 60)
+	// cover three failure modes: notify-wake stall (<5s),
+	// scheduler bypass / dispatcher capacity rejection (5-30s),
+	// and the full-build-VM path (30-60s).
+	cronFireNowDispatchDur *prometheus.HistogramVec
 	// accountOrgMismatch: PR 3 (issue #190, ADR-061) registers the
 	// counter on every daemon; PR 4 (handlers) and PR 6 (billing
 	// webhook) emit on it when the dual-write path detects that
@@ -1355,6 +1368,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, result := range []string{"ok", "failed"} {
 		auditWriteDur.WithLabelValues(result)
 	}
+	cronFireNowDispatchDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_cron_fire_now_dispatch_duration_seconds",
+		Help: "End-to-end fire-now dispatch latency (issue #791 PR-D / ADR-090 §Sub-decision 7): from the row insert at apid (requested_at) to the schedd terminal stamp. Labelled by result ∈ {succeeded, failed}. The 100ms bucket catches the fast-path notify; 5s catches the typical wake + wake-ticket; 30s/60s catch full build-VM cold-boot paths.",
+		// Sized for three distinct failure modes documented in the
+		// ADR: notify-wake stall (<5s), scheduler bypass / dispatcher
+		// capacity rejection (5-30s), and the full-build-VM path
+		// (30-60s). Buckets straddle stripePushDur's
+		// {0.5,1,2,5,10,20,30,45,60} — diverging here keeps the
+		// build-path noise out of the cron read shape, since
+		// cron fire-now can warm a brand-new snapshot on first
+		// dispatch.
+		Buckets: []float64{0.1, 0.5, 1, 5, 30, 60},
+	}, []string{"result"})
+	// Pre-instantiate the closed result label set (mirrors
+	// auditWriteDur + stripePushDur + buildDur).
+	for _, result := range []string{"succeeded", "failed"} {
+		cronFireNowDispatchDur.WithLabelValues(result)
+	}
 	requestFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_request_failures_total",
 		Help: "HTTP requests completed with status >= 400, labelled by account_id, the route template, and code ∈ {ok, err} (issue #278, PR #336, ADR-039). code is \"err\" for every increment today (the counter only fires on status >= 400); the label is added so the failure counter mirrors requestTotal and the per-account error-rate view derives from a single source. account_id=\"anonymous\" is the unauthenticated path; account_id=\"__other__\" is the bounded admission overflow bucket. route is r.Pattern (e.g. \"GET /v1/apps/{slug}\") or \"unmatched\" for paths the mux did not dispatch.",
@@ -1869,7 +1900,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	commonCollectors := []prometheus.Collector{
 		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		writeRedirectTotal, writeRedirectLatency,
-		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
+		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
 		paddleWebhookVerifyFailedTotal, paddleWebhookReplaySuppressedTotal,
@@ -2441,6 +2472,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		topApps:                            newTopAppSet(topAppSetCap),
 		throttleSecondsLastSeen:            newCPUThrottleLastSeen(),
 		cpuSecondsLast:                     newCPUSecondsLastSeen(),
+		cronFireNowDispatchDur:             cronFireNowDispatchDur,
 		stripePushDur:                      stripePushDur,
 		paddlePushDur:                      paddlePushDur,
 		buildDur:                           buildDur,
@@ -2930,6 +2962,21 @@ func (m *OpsMetrics) AuditWriteFailureDuration(result string) prometheus.Observe
 		return nil
 	}
 	return m.auditWriteDur.WithLabelValues(result)
+}
+
+// CronFireNowDispatchDuration returns the per-result observer for
+// the cron fire-now dispatch-latency histogram (issue #791 PR-D /
+// ADR-090 §Sub-decision 7). result ∈ {succeeded, failed}; the schedd
+// dispatch path emits one observation per terminal request row.
+// Safe to call from the cron-fire dispatch loop — the underlying
+// HistogramVec is shared and pre-instantiated at boot, so /metrics
+// surfaces the histogram's HELP/TYPE from the first scrape even
+// before any cron has fired.
+func (m *OpsMetrics) CronFireNowDispatchDuration(result string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.cronFireNowDispatchDur.WithLabelValues(result)
 }
 
 // FailedLoginTotal returns the per-IP counter for failed login

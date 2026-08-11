@@ -139,7 +139,7 @@ func cmdWebhooksAdd(args []string) int {
 	}
 	for _, ev := range events {
 		if !validAppWebhookEvent(ev) {
-			return printErr("Invalid --event", fmt.Errorf("unknown event %q (allowed: cron.fired, app.deployed, app.scaled, app.parked, app.woken)", ev))
+			return printErr("Invalid --event", fmt.Errorf("unknown event %q (allowed: cron.fired, cron.fired.manually, app.deployed, app.scaled, app.parked, app.woken)", ev))
 		}
 	}
 	client, err := authedClient()
@@ -398,11 +398,12 @@ var webhookIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 // `app_webhook_deliveries_event_chk` test in
 // 00141_app_webhook_deliveries_test.go:148-170.
 var validAppWebhookEvents = map[string]struct{}{
-	"cron.fired":   {},
-	"app.deployed": {},
-	"app.scaled":   {},
-	"app.parked":   {},
-	"app.woken":    {},
+	"cron.fired":          {},
+	"cron.fired.manually": {},
+	"app.deployed":        {},
+	"app.scaled":          {},
+	"app.parked":          {},
+	"app.woken":           {},
 }
 
 func validAppWebhookEvent(s string) bool {

@@ -1,38 +1,36 @@
-// pkg/sched/fire_now.go — schedd's fire-now consumer (ADR-090 PR-C).
+// pkg/sched/fire_now.go — schedd's fire-now dispatcher (ADR-090 PR-C/D).
 //
 // Producer: apid's POST /v1/crons/{id}/run handler inserts a row into
 // cron_fire_now_requests (migrations/00193, status='pending') and emits
 // db.NotifyCronRunNow on the wire.
 //
-// Consumer: this goroutine.
+// Consumer: loop.go's Run() multiplexes db.NotifyCronRunNow onto its
+// existing LISTEN (pkg/sched/loop.go:348-352) plus a 60s safety ticker
+// (pkg/sched/loop.go:fireNowT). Both wakeup sources call
+// drainPendingFireNowRequests, the row-level dispatcher. This avoids
+// a dedicated long-term pool connection (the original PR-C design
+// added one — it tipped schedd's pool.MaxConns=8 over the edge and
+// starved the async-invoke drain under the e2e harness query burst).
 //
-//   - LISTENs on db.NotifyCronRunNow via SubscribeWithReconnect.
-//   - On each delivery (and on every 60s safety tick), calls
-//     ClaimPendingFireNowRequest which atomically transitions one
-//     pending row to `running` via FOR UPDATE SKIP LOCKED LIMIT 1.
+// Per-row dispatch flow:
+//
+//   - drainPendingFireNowRequests calls ClaimPendingFireNowRequest
+//     which atomically transitions one pending row to `running` via
+//     FOR UPDATE SKIP LOCKED LIMIT 1.
 //   - Calls (*Loop).RunCronNow (the canonical "fire this cron" helper
 //     extracted from dispatchOneCron in PR-C step 1) to dispatch
 //     the request.
 //   - Stamps the row's terminal state via MarkFireNowRequestSucceeded
 //     / MarkFireNowRequestFailed.
-//
-// Why a dedicated goroutine instead of another ticker arm in loop.go:
-// loop.go is a 350-line switch with strict tick + watch responsibilities
-// (spec §6.1) and adding a 13th arm bloats every reader's mental model.
-// A dedicated goroutine + ctx-driven cancellation matches the existing
-// placement_claim.go / retention.go pattern (pkg/sched/<feature>.go).
 
 package sched
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
-	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -44,65 +42,14 @@ import (
 // for recovery. Acceptable for an operator-initiated action.
 const fireNowSafetyTick = 60 * time.Second
 
-// fireNowSubscriberPayload is the JSON shape apid emits on
-// NotifyCronRunNow. The request_id is informational — the row IS the
-// source of truth, and ClaimPendingFireNowRequest selects the oldest
-// pending row regardless of which id the notify carried. This matches
-// the build_queued pattern (pkg/db/notify.go:88-90 + cmd/imaged
-// consumer: subscriber re-reads the row to defend against notify loss).
-type fireNowSubscriberPayload struct {
-	RequestID string `json:"request_id"`
-}
-
-// FireNowRun starts the fire-now subscriber. Blocks until ctx is
-// cancelled. The function is the canonical wire-up site for the
-// cmd/schedd main goroutine; loop.go's Run() does not call this —
-// the binary wires it explicitly so tests can opt out.
-//
-// Returns ctx.Err() on cancellation (a clean exit) or a wrapped
-// error from the initial SubscribeWithReconnect failure (a fatal
-// boot error).
-func (l *Loop) FireNowRun(ctx context.Context) error {
-	notif, err := db.SubscribeWithReconnect(ctx, l.pool, []string{db.NotifyCronRunNow}, l.log)
-	if err != nil {
-		return fmt.Errorf("sched: fire_now: subscribe: %w", err)
-	}
-
-	safetyT := time.NewTicker(fireNowSafetyTick)
-	defer safetyT.Stop()
-
-	l.log.Info("sched: fire_now: subscriber online", "channel", db.NotifyCronRunNow)
-
-	// Drain pending rows on startup. A schedd bounce with rows in
-	// `pending` would otherwise wait up to fireNowSafetyTick for the
-	// first recovery tick — a 60s gap on a customer-visible API.
-	// One-shot drain keeps the post-restart latency bounded to the
-	// first claim round-trip.
-	l.drainPendingFireNowRequests(ctx)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-safetyT.C:
-			l.drainPendingFireNowRequests(ctx)
-		case n, ok := <-notif:
-			if !ok {
-				// SubscribeWithReconnect guarantees the outer channel
-				// only closes on ctx done; if it does close, treat as
-				// fatal and exit so the daemon restarts.
-				return errors.New("sched: fire_now: subscriber channel closed unexpectedly")
-			}
-			// Informational payload — the row is the truth. Drain
-			// handles everything; the notify is just a wakeup.
-			var p fireNowSubscriberPayload
-			if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
-				l.log.Warn("sched: fire_now: malformed notify payload", "err", err, "payload", n.Payload)
-			}
-			l.drainPendingFireNowRequests(ctx)
-		}
-	}
-}
+// Histogram label values for sched_cron_fire_now_dispatch_duration_seconds.
+// Pre-declared so goconst stops flagging the repeated literals across
+// the switch arms in processFireNowRequest (the file has 4 resultLabel
+// assignments to "failed" and one to "succeeded").
+const (
+	fireNowResultLabelSucceeded = "succeeded"
+	fireNowResultLabelFailed    = "failed"
+)
 
 // drainPendingFireNowRequests claims + dispatches every pending row,
 // one at a time. A single drain call claims all currently-pending
@@ -137,8 +84,18 @@ func (l *Loop) drainPendingFireNowRequests(ctx context.Context) {
 func (l *Loop) processFireNowRequest(ctx context.Context, req state.FireNowRequest) {
 	run, err := l.RunCronNow(ctx, req.CronID, req.AccountID)
 
+	// fireNowDispatchDuration: issue #791 PR-D / ADR-090 §"Sub-decision
+	// 7". One observation per terminal row, sized in seconds since
+	// the row was inserted at apid (req.RequestedAt). The observer is
+	// nil-safe — schedd's existing /metrics surface catches the
+	// nil-ops path silently. We compute elapsed BEFORE the mark*
+	// call so the histogram captures the wall-clock latency the
+	// customer actually waited, not the time to stamp the row.
+	elapsed := time.Since(req.RequestedAt).Seconds()
+	resultLabel := fireNowResultLabelSucceeded
+
 	switch {
-	case err == nil:
+	case err == nil && run.Success:
 		// Best-effort: RunCronNow returns CronRun{Success: true} with
 		// InvocationID="" when the dispatch path took the
 		// "enqueued" route (the cron tick + invoke are decoupled). We
@@ -151,17 +108,36 @@ func (l *Loop) processFireNowRequest(ctx context.Context, req state.FireNowReque
 		}
 		l.log.Info("sched: fire_now: succeeded", "request_id", req.ID, "cron_id", req.CronID)
 
+	case err == nil && !run.Success:
+		// Issue #791 PR-D code-review: previously collapsed into the
+		// `err == nil` branch which stamped the row succeeded even
+		// when the audit row recorded status="err" (e.g. Wake failed
+		// downstream). RunCronNow now propagates dispatchCronLocked's
+		// fireSucceeded, so a successful *admit* that ends in a
+		// failed *invoke* lands here. Stamp the row failed with a
+		// bounded message so the GET /v1/cron-fire-now-requests/{id}
+		// surface agrees with the audit row.
+		const dispatchFailedMsg = "dispatch: invocation did not complete"
+		if mErr := l.engine.Store().MarkFireNowRequestFailed(ctx, req.ID, dispatchFailedMsg); mErr != nil {
+			l.log.Warn("sched: fire_now: mark failed", "request_id", req.ID, "err", mErr)
+		}
+		l.log.Warn("sched: fire_now: dispatch admitted but invoke failed",
+			"request_id", req.ID, "cron_id", req.CronID)
+		resultLabel = fireNowResultLabelFailed
+
 	case errors.Is(err, ErrCronDisabled):
 		if mErr := l.engine.Store().MarkFireNowRequestFailed(ctx, req.ID, "cron disabled"); mErr != nil {
 			l.log.Warn("sched: fire_now: mark failed", "request_id", req.ID, "err", mErr)
 		}
 		l.log.Info("sched: fire_now: cron disabled", "request_id", req.ID)
+		resultLabel = fireNowResultLabelFailed
 
 	case errors.Is(err, ErrAccountSuspended):
 		if mErr := l.engine.Store().MarkFireNowRequestFailed(ctx, req.ID, "account suspended"); mErr != nil {
 			l.log.Warn("sched: fire_now: mark failed", "request_id", req.ID, "err", mErr)
 		}
 		l.log.Info("sched: fire_now: account suspended", "request_id", req.ID)
+		resultLabel = fireNowResultLabelFailed
 
 	default:
 		// Unknown error. Stamp as failed with the err string so the
@@ -173,6 +149,16 @@ func (l *Loop) processFireNowRequest(ctx context.Context, req state.FireNowReque
 		}
 		l.log.Warn("sched: fire_now: dispatch error",
 			"request_id", req.ID, "cron_id", req.CronID, "err", err)
+		resultLabel = fireNowResultLabelFailed
+	}
+
+	// Emit the histogram observation in a defer-safe location: the
+	// resultLabel is captured by the switch above; observing here
+	// means the histogram ALWAYS records one entry per row processed
+	// (matching the slog.Info / slog.Warn invariant above — observability
+	// pins that the lifecycle emits exactly one metric per row).
+	if obs := l.ops.CronFireNowDispatchDuration(resultLabel); obs != nil {
+		obs.Observe(elapsed)
 	}
 }
 

@@ -87,6 +87,7 @@ export type { EdgeRuleResponse } from './EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
 export type { EdgeRuleRouteAction } from './EdgeRuleRouteAction.js';
 export type { EnvScope } from './EnvScope.js';
+export type { FireCronRequestResponse } from './FireCronRequestResponse.js';
 export type { FireCronResponse } from './FireCronResponse.js';
 export type { GdprAuditExportResponse } from './GdprAuditExportResponse.js';
 export type { GraceWindowResponse } from './GraceWindowResponse.js';

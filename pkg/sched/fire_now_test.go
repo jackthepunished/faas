@@ -21,11 +21,15 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // ---------- RunCronNow ----------
@@ -288,5 +292,179 @@ func TestDrainPending_AllRowsDrained(t *testing.T) {
 	}
 	if n := h.synth.calls.Load(); n != int64(len(ids)) {
 		t.Errorf("synth calls = %d, want %d (one per drain)", n, len(ids))
+	}
+}
+
+// ---------- cronFireNowDispatchDur metric (issue #791 PR-D) ----------
+
+// findHistogram returns the *dto.Histogram metric matching the given
+// name + label set, or nil. The metric family slice mirrors the
+// /metrics output: gather the registry, scan by metric name, and
+// match all label name+value pairs against `want`. This is heavier
+// than testutil.ToFloat64 because the dispatch-latency observation is
+// a histogram — we need the bucket counts to confirm the histogram
+// observed the right bin.
+func findHistogram(t *testing.T, m *wire.OpsMetrics, name string, want map[string]string) *dto.Histogram {
+	t.Helper()
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("Registry.Gather: %v", err)
+	}
+	for _, fam := range families {
+		if !strings.Contains(fam.GetName(), name) {
+			continue
+		}
+		for _, mt := range fam.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range mt.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			ok := true
+			for k, v := range want {
+				if labels[k] != v {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+			return mt.GetHistogram()
+		}
+	}
+	return nil
+}
+
+func histogramSampleCount(h *dto.Histogram) uint64 {
+	if h == nil {
+		return 0
+	}
+	return h.GetSampleCount()
+}
+
+// TestDrainPending_EmitsDispatchLatencySucceeded pins that a successful
+// drain emits exactly one observation labelled result="succeeded" and
+// the sample count increases by one per row processed. Coverage for
+// ADR-090 §"Sub-decision 7".
+func TestDrainPending_EmitsDispatchLatencySucceeded(t *testing.T) {
+	t.Parallel()
+	ops := wire.NewOpsMetrics("schedd_test_succ")
+	h := newFireNowHarness(t)
+	h.loop.WithOpsMetrics(ops)
+	ctx := context.Background()
+	acct, _ := h.store.CreateAccount(ctx, "dbs@example.com", api.PlanPro)
+	_, c := newAppAndCron(t, h.store, acct.ID, true)
+	requestID, err := h.store.InsertFireNowRequest(ctx, c.ID, acct.ID)
+	if err != nil {
+		t.Fatalf("InsertFireNowRequest: %v", err)
+	}
+
+	want := map[string]string{"result": "succeeded"}
+
+	before := histogramSampleCount(findHistogram(t, ops, "cron_fire_now_dispatch_duration_seconds", want))
+
+	h.loop.drainPendingFireNowRequests(ctx)
+
+	after := histogramSampleCount(findHistogram(t, ops, "cron_fire_now_dispatch_duration_seconds", want))
+
+	if delta := after - before; delta != 1 {
+		t.Errorf("sample count delta = %d, want 1 (requestID=%s)", delta, requestID)
+	}
+}
+
+// TestDrainPending_EmitsDispatchLatencyFailed pins that a fire-now
+// against a disabled cron emits one observation labelled
+// result="failed".
+func TestDrainPending_EmitsDispatchLatencyFailed(t *testing.T) {
+	t.Parallel()
+	ops := wire.NewOpsMetrics("schedd_test_fail")
+	h := newFireNowHarness(t)
+	h.loop.WithOpsMetrics(ops)
+	ctx := context.Background()
+	acct, _ := h.store.CreateAccount(ctx, "dbf@example.com", api.PlanPro)
+	_, c := newAppAndCron(t, h.store, acct.ID, false) // disabled
+	_, err := h.store.InsertFireNowRequest(ctx, c.ID, acct.ID)
+	if err != nil {
+		t.Fatalf("InsertFireNowRequest: %v", err)
+	}
+
+	want := map[string]string{"result": "failed"}
+
+	before := histogramSampleCount(findHistogram(t, ops, "cron_fire_now_dispatch_duration_seconds", want))
+
+	h.loop.drainPendingFireNowRequests(ctx)
+
+	after := histogramSampleCount(findHistogram(t, ops, "cron_fire_now_dispatch_duration_seconds", want))
+
+	if delta := after - before; delta != 1 {
+		t.Errorf("failed-labeled sample count delta = %d, want 1", delta)
+	}
+}
+
+// TestDrainPending_NilOpsDoesNotPanic pins the nil-safety contract
+// from CronFireNowDispatchDuration: a schedd test or a wiring race
+// in production must not panic when ops is unset.
+func TestDrainPending_NilOpsDoesNotPanic(t *testing.T) {
+	t.Parallel()
+	h := newFireNowHarness(t)
+	// No WithOpsMetrics call — loop.ops is nil.
+	ctx := context.Background()
+	acct, _ := h.store.CreateAccount(ctx, "dbn@example.com", api.PlanPro)
+	_, c := newAppAndCron(t, h.store, acct.ID, true)
+	requestID, err := h.store.InsertFireNowRequest(ctx, c.ID, acct.ID)
+	if err != nil {
+		t.Fatalf("InsertFireNowRequest: %v", err)
+	}
+	// If the nil-safety contract breaks, this panics.
+	h.loop.drainPendingFireNowRequests(ctx)
+	got, err := h.store.GetFireNowRequest(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetFireNowRequest: %v", err)
+	}
+	if got.Status != state.FireNowStatusSucceeded {
+		t.Errorf("status = %q, want succeeded (nil-ops must not block drain)", got.Status)
+	}
+}
+
+// TestDrainPending_DispatchAdmittedButInvokeFailed pins the
+// code-review fix: when dispatchCronLocked admitted the fire but the
+// invocation did not complete (audit row status="err"), the fire-now
+// row must also stamp failed. Previously the row stamped succeeded
+// because RunCronNow discarded the fireSucceeded boolean. The test
+// exercises the err == nil && run.Success == false branch added by
+// PR-D, driven by the package's shared failingSynth (cron_loop_test.go)
+// whose Invoke + SynthesizeRequest both error.
+func TestDrainPending_DispatchAdmittedButInvokeFailed(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	vmm := &fakeWakeVMM{}
+	eng, _ := makeEngine(t, store, vmm)
+	synth := &failingSynth{}
+	loop := NewLoop(nil, eng, slog.Default()).WithGatewaySynth(synth)
+	ctx := context.Background()
+	acct, _ := store.CreateAccount(ctx, "ddf@example.com", api.PlanPro)
+	_, c := newAppAndCron(t, store, acct.ID, true)
+	requestID, err := store.InsertFireNowRequest(ctx, c.ID, acct.ID)
+	if err != nil {
+		t.Fatalf("InsertFireNowRequest: %v", err)
+	}
+
+	loop.drainPendingFireNowRequests(ctx)
+
+	got, err := store.GetFireNowRequest(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetFireNowRequest: %v", err)
+	}
+	// RunCronNow's new semantics propagate fireSucceeded through
+	// the CronRun return value. The failingSynth makes the dispatch
+	// path return Success=false; the fire-now row must agree.
+	if got.Status != state.FireNowStatusFailed {
+		t.Errorf("status = %q, want failed (admit-but-invoke-failed must not stamp succeeded)", got.Status)
+	}
+	if got.Error == nil {
+		t.Errorf("Error nil, want pointer to dispatch-failed message")
+	}
+	if synth.calls.Load() == 0 {
+		t.Errorf("failingSynth.calls = 0, want >= 1 (the dispatch path reached the synth step)")
 	}
 }
