@@ -1416,6 +1416,8 @@ func cmdCrons(args []string) int {
 		return 0
 	case subUpdate:
 		return cmdCronsUpdate(args[1:])
+	case subInfo:
+		return cmdCronsInfo(args[1:])
 	case subRuns:
 		return cmdCronsRuns(args[1:])
 	case subRm:

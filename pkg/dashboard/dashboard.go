@@ -168,13 +168,49 @@ type ScanSummary struct {
 	Unknown   int
 }
 
-// CronItem is one row on the app detail page's crons tab.
+// CronItem is one row on the app detail page's crons tab
+// (issue #791 PR-E / ADR-090 §"Sub-decision 7"). The inline runs
+// panel + fire-now form are projected into the same struct so the
+// template is a pure renderer — handler does the formatting.
 type CronItem struct {
 	ID          string
 	Schedule    string
 	Path        string
 	Enabled     bool
 	LastFiredAt string // empty until first fire
+
+	// Runs is the bounded last-N invocations for this cron
+	// (default 10). Rendered inside a server-rendered <details> on
+	// the app detail page so the customer can scan "Last 10 runs"
+	// without leaving the page. Empty slice → template renders an
+	// empty-state hint rather than zero rows.
+	Runs []CronRunRow
+	// RunsCount is len(Runs), exposed as a sibling field so the
+	// Go html/template parser can render "Last N runs" in the
+	// <details> summary without needing a FuncMap. The template
+	// can't call `len` on a slice directly (no FuncMap wired),
+	// so the handler computes it once and stores the integer.
+	RunsCount int
+	// FireNowConfirmToken is the per-request CSRF envelope for the
+	// "Fire now" POST form. Mandated by handlers_dashboard.go's
+	// CSRF middleware (delete-account uses the same shape, see
+	// handlers_dashboard.go:915). Always set when the cron is
+	// enabled; empty (zero) when disabled → template suppresses
+	// the form.
+	FireNowConfirmToken string
+}
+
+// CronRunRow is one projected row inside CronItem.Runs. Pre-formatted
+// at the handler edge so the template is a pure renderer (same
+// pattern as RecentInstanceItem and InstanceChipDurationMS). The
+// closed-vocabulary Outcome string matches api.CronRunOutcome — the
+// handler projects both fields so the template never invents its own
+// outcome label.
+type CronRunRow struct {
+	Glyph      string // "✓" | "✗" | "⟳" (running)
+	StartedAt  string // pre-formatted HH:MM (relative-day suppressed for density)
+	DurationMS string // "1.2s" | "980ms" | "timeout" | "—" — pre-formatted at handler
+	Outcome    string // closed vocab matching api.CronRunOutcome
 }
 
 // AppDetailData combines the bits the app detail page renders.
@@ -183,6 +219,14 @@ type AppDetailData struct {
 	Manifest    ManifestView
 	Deployments []DeploymentItem
 	Crons       []CronItem
+	// FiredFlash is the post-redirect banner surfaced after a
+	// dashboard cron fire-now POST. Values:
+	//   "ok"    — handler redirected with ?fired=1
+	//   "error" — handler redirected with ?fired=error
+	// Empty string → no banner. The template's empty-state branch
+	// suppresses the banner entirely so a fresh page load renders
+	// the section without any success/error chrome.
+	FiredFlash string
 	// RecentInstances is the most recent N wake rows for this app
 	// (parked → waking → running → …). Each carries its WakeID so
 	// operators can paste the ID from a gateway response header

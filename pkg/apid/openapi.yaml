@@ -2944,6 +2944,26 @@ paths:
   /v1/crons/{id}:
     parameters:
       - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [crons]
+      operationId: getCron
+      summary: Get one cron trigger.
+      description: |
+        Single-row read for one cron (issue #791 PR-E / ADR-090
+        closure). Backs `gregale crons info <id>` and any dashboard
+        drill-down. The wire shape matches `CronResponse` so SDK
+        clients decode it with the existing struct.
+      responses:
+        '200':
+          description: The cron trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CronResponse'
+                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcde0","schedule":"*/5 * * * *","path":"/cleanup","enabled":true,"last_fired_at":"2026-08-10T09:00:00Z","created_at":"2026-08-01T12:00:00Z"}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
     patch:
       tags: [crons]
       operationId: updateCron

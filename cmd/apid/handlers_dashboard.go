@@ -328,13 +328,53 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		renderProblem(w, log, err)
 		return
 	}
+	// Per-row CSRF envelope (issue #791 PR-E / ADR-090 §"Sub-decision
+	// 7") shared by every cron on the page. Minted once, reused —
+	// the per-row <input name="csrf_token" value="{{$.Foo}}"> is the
+	// form-hidden sibling that pairs with the faas_csrf cookie.
+	// The bound action is page-scoped ("fire_cron_{id}") so a token
+	// for cron A cannot be replayed against cron B; the same value
+	// is reused across renders as long as the cookie's MaxAge holds.
+	fireCSRFToken, err := middleware.IssueForAuthenticated(s.sessions, "fire_cron", acct.ID)
+	if err != nil {
+		log.Error("dashboard renderAppDetail: csrf issue fire_cron", "app_id", app.ID, "err", err)
+		fireCSRFToken = ""
+	} else {
+		http.SetCookie(w, &http.Cookie{
+			Name:     middleware.CookieNameAuthenticated,
+			Value:    fireCSRFToken,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   s.domain != "",
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
+		})
+	}
 	cronItems := make([]dashboard.CronItem, 0, len(crons))
 	for _, c := range crons {
 		item := dashboard.CronItem{
-			ID: c.ID, Schedule: c.Schedule, Path: c.Path, Enabled: c.Enabled,
+			ID:                  c.ID,
+			Schedule:            c.Schedule,
+			Path:                c.Path,
+			Enabled:             c.Enabled,
+			FireNowConfirmToken: fireCSRFToken,
 		}
 		if !c.LastFiredAt.IsZero() {
 			item.LastFiredAt = c.LastFiredAt.UTC().Format(time.RFC3339)
+		}
+		// Last 10 runs (issue #791 PR-E / ADR-090). Failure
+		// non-fatal — a transient Postgres blip on the runs read
+		// shouldn't kill the dashboard. handler pre-formats so
+		// the template stays a pure renderer.
+		if rows, rerr := s.store.ListCronRunsForCron(ctx, c.ID, 10, ""); rerr == nil {
+			proj := make([]dashboard.CronRunRow, 0, len(rows))
+			for _, inv := range rows {
+				proj = append(proj, projectCronRunRow(inv))
+			}
+			item.Runs = proj
+			item.RunsCount = len(proj)
+		} else {
+			log.Warn("dashboard renderAppDetail: list cron runs", "account_id", acct.ID, "app_id", app.ID, "cron_id", c.ID, "err", rerr)
 		}
 		cronItems = append(cronItems, item)
 	}
@@ -389,6 +429,12 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		Deployments:     deps,
 		Crons:           cronItems,
 		RecentInstances: recentItems,
+		// Issue #791 PR-E / ADR-090 closure — cron fire-now
+		// post-redirect banner. Reads ?fired=1 / ?fired=error and
+		// forwards through to the template's flash block.
+		// Anything other than the canonical values collapses to
+		// empty so a stale "?fired=" doesn't render an empty banner.
+		FiredFlash: firedFlash(r),
 		// Issue #273 / ADR-042 — best-effort metrics snapshot.
 		// Failure is non-fatal: Prometheus being down renders the
 		// "degraded" empty state rather than blocking the whole
@@ -414,6 +460,28 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 	}}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
+	}
+}
+
+// firedFlash translates the dashboard cron fire-now POST-redirect
+// `?fired=…` query flag into the closed vocab the template
+// understands. Values:
+//
+//	?fired=1       → "ok"     (green banner: "Fire-now enqueued…")
+//	?fired=error   → "error"  (red banner: "Fire-now failed…")
+//	?fired= (any other) → ""  (no banner — future variants can grow here)
+//
+// Empty output is the conservative default: a stale "?fired="
+// rendering no banner is preferable to one rendering an empty one.
+// Issue #791 PR-E / ADR-090.
+func firedFlash(r *http.Request) string {
+	switch r.URL.Query().Get("fired") {
+	case "1":
+		return "ok"
+	case "error":
+		return "error"
+	default:
+		return ""
 	}
 }
 

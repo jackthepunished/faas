@@ -70,6 +70,40 @@ export class CronsService {
     });
   }
   /**
+   * Get one cron trigger.
+   * Single-row read for one cron (issue #791 PR-E / ADR-090
+   * closure). Backs `gregale crons info <id>` and any dashboard
+   * drill-down. The wire shape matches `CronResponse` so SDK
+   * clients decode it with the existing struct.
+   *
+   * @returns CronResponse The cron trigger.
+   * @throws ApiError
+   */
+  public static getCron({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<CronResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/crons/{id}',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
    * Partial-update a cron.
    * @returns CronResponse The updated cron trigger.
    * @throws ApiError
