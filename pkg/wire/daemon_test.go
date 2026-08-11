@@ -420,13 +420,22 @@ func TestDaemon_SIGHUPReloadsLevel(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDaemon_SIGHUPReloadsLevel$")
 	// Strip FAAS_LOG_LEVEL so the child's package init boots the
 	// leveler at INFO regardless of the CI environment.
-	env := []string{"WIRE_SIGHUP_CHILD=1"}
+	var env []string
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, wire.EnvLogLevel+"=") {
 			env = append(env, kv)
 		}
 	}
+	// Sentinel last: exec.Cmd dedups by keeping the final occurrence of
+	// a key, so appending here beats any ambient WIRE_SIGHUP_CHILD in
+	// the developer's shell (a stale "=0" would send the child down the
+	// parent branch and fork-bomb the test).
+	env = append(env, "WIRE_SIGHUP_CHILD=1")
 	cmd.Env = env
+	// Both streams go to the same file: slog writes to stderr, but the
+	// child's go-test framework reports failures on stdout — without
+	// this a child framework failure surfaces as a bare "exit status 1".
+	cmd.Stdout = stderrFile
 	cmd.Stderr = stderrFile
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child: %v", err)
