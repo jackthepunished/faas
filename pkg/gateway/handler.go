@@ -951,7 +951,7 @@ func (h *Handler) matchAndApplyRewrite(r *http.Request, app App) bool {
 	// "match-any path" (the path-glob filter passed); we still
 	// need a non-empty To to actually mutate. A rule with From=""
 	// but To="/v1" effectively prefixes every request — the spec
-	// §13.4 documents this. From="*" is treated identically.
+	// §4.1.2 documents this. From="*" is treated identically.
 	from := rule.From
 	if from == "*" {
 		from = ""
@@ -2274,7 +2274,7 @@ haveApp:
 	// circuit when h.edgeRules is nil (PR 3 behaviour preserved
 	// for unit tests + the e2e harness).
 	//
-	// Order (spec §13.4): redirect first (short-circuits BEFORE
+	// Order (spec §4.1.2): redirect first (short-circuits BEFORE
 	// rewrite/headers so a redirect doesn't leak a rewritten path
 	// or stamped header), then rewrite (mutates r.URL.Path so
 	// the proxy leg sees the new path), then headers (mutates
@@ -3123,7 +3123,7 @@ func (s *statusRecorder) WriteHeader(code int) {
 // slice or a nil receiver is a no-op). The ops apply on the next
 // WriteHeader call — the writer chain is unchanged (no wrapper
 // insertion; we just mutate the inner Header map at commit time,
-// matching the spec §13.4 "applied before status code" contract).
+// matching the spec §4.1.2 "applied before status code" contract).
 func (s *statusRecorder) installHeaderOps(ops []EdgeRuleHeaderOp) {
 	if s == nil || len(ops) == 0 {
 		return
