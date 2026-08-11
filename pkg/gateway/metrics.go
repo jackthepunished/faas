@@ -89,22 +89,25 @@ import (
 type Metrics struct {
 	registry *prometheus.Registry
 
-	requests      *prometheus.CounterVec
-	wakeLatency   prometheus.Histogram
-	wakeQueueWait prometheus.Histogram
-	queueDepth    *prometheus.GaugeVec
-	rateLimited   *prometheus.CounterVec
-	// edgeRuleMatch: ADR-089 PR 3. Counter labelled by
-	// (kind, outcome) — `kind` is the EdgeRuleKind
-	// (route|rewrite|redirect|headers|cors|jwt|ip; closed set
-	// per migrations/00192_edge_rules.sql:49-51), `outcome` is
-	// one of {match, miss, blocked}. The handler increments
-	// from matchAndSubstituteRoute (handler.go:1449-1451) so the
-	// §12 dashboard panel "edge rule match rate" surfaces from
-	// first scrape — the closed label set is pre-instantiated
-	// at boot below. PR 4-7 extend kind; the outcome set is
-	// stable across all kinds.
-	edgeRuleMatch *prometheus.CounterVec
+	requests    *prometheus.CounterVec
+	wakeLatency prometheus.Histogram
+	// wakeLatencyByNode (PR #4 / ADR-092 §3.5) is the per-node
+	// labelled twin of wakeLatency. The unlabeled histogram stays
+	// untouched — it's the §12 SLA contract and is consumed by
+	// pkg/appmetrics/appmetrics.go:175 for the fleet p95. The new
+	// histogram is operator-side only; the obsNodeWakeLatency
+	// handler in cmd/apid PromQL-evals it for per-node quantiles.
+	// The label is the compute_node.id (UUID) rather than the
+	// human-readable name because gatewayd-internal has no
+	// node-id → node-name cache on the wake path; the obs handler
+	// resolves id → name via the existing ListComputeNodes call
+	// before returning. Label cardinality is bounded by
+	// compute_nodes count (today: 1, tomorrow: tens). ADR-091
+	// §3.6 documents the label cardinality constraint.
+	wakeLatencyByNode *prometheus.HistogramVec
+	wakeQueueWait     prometheus.Histogram
+	queueDepth        *prometheus.GaugeVec
+	rateLimited       *prometheus.CounterVec
 	// edgeRuleApply (ADR-091 hardening PR-A): counter of apply-path
 	// outcomes, distinct from edgeRuleMatch (which counts the
 	// matcher's pick). A rule can MATCH the matcher but FAIL at apply
@@ -124,6 +127,17 @@ type Metrics struct {
 	// kinds; the counter surfaces the signal even when the
 	// loader's WARN log is drowned by other gatewayd-internal noise.
 	edgeRuleCompileError *prometheus.CounterVec
+	// edgeRuleMatch: ADR-089 PR 3. Counter labelled by
+	// (kind, outcome) — `kind` is the EdgeRuleKind
+	// (route|rewrite|redirect|headers|cors|jwt|ip; closed set
+	// per migrations/00192_edge_rules.sql:49-51), `outcome` is
+	// one of {match, miss, blocked}. The handler increments
+	// from matchAndSubstituteRoute (handler.go:1449-1451) so the
+	// §12 dashboard panel "edge rule match rate" surfaces from
+	// first scrape — the closed label set is pre-instantiated
+	// at boot below. PR 4-7 extend kind; the outcome set is
+	// stable across all kinds.
+	edgeRuleMatch *prometheus.CounterVec
 	// responseBytes: ADR-046 PR-2 producer observability.
 	// Counter labelled by app (UUID, bounded by per-plan app
 	// quotas) and plan (Free|Hobby|Pro|Scale — closed set). The
@@ -318,19 +332,23 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_match_total",
 			Help: "Edge-rule matcher outcomes, labelled by kind and outcome (match|miss|blocked). ADR-089 PR 3.",
 		}, []string{"kind", "outcome"}),
-		// ADR-091 hardening PR-A — apply-path outcomes (distinct from
-		// the matcher pick). result is a closed {success, error} set.
+		// ADR-091 hardening PR-A — apply-path counter (distinct from
+		// match). A rule can match the matcher but fail at apply time
+		// (e.g. JWKS lookup returns ErrJWKSNotRegistered, or an IP
+		// rule's CIDR list is empty after redaction). The {kind, result}
+		// partition powers the §12 dashboard chip "edge rule apply rate".
 		edgeRuleApply: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_edge_rule_apply_total",
-			Help: "Edge-rule apply-path outcomes, labelled by kind and result (success|error). ADR-091 hardening PR-A.",
+			Help: "Edge-rule apply-path outcomes (success|error), labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind", "result"}),
-		// ADR-091 hardening PR-A — compile-time drops in the cmd-side
-		// loader (path-glob parse / CIDR parse failures). Non-zero means
-		// a rule shipped broken; the §12 dashboard chip "edge rule
-		// compile errors" pages on any increment.
+		// ADR-091 hardening PR-A — compile-time errors caught by
+		// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs. A
+		// non-zero value here means a rule shipped broken and was
+		// silently dropped by the loader; the dashboard chip surfaces
+		// it even when the loader's WARN log is drowned in noise.
 		edgeRuleCompileError: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_edge_rule_compile_error_total",
-			Help: "Edge-rule compile-time failures in the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
+			Help: "Edge-rule compile-time errors caught by the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind"}),
 		wakeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "gateway_wake_latency_seconds",
@@ -340,6 +358,19 @@ func NewMetrics() *Metrics {
 				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
 			},
 		}),
+		// PR #4 / ADR-092 §3.5. Same bucket layout as wakeLatency
+		// — same distribution, same SLO targets — just labelled
+		// by node_id so the per-node p95/p99 surfaces. Do NOT
+		// change the existing unlabeled histogram's buckets
+		// without re-running the §12 fleet p95 calibration; the
+		// new histogram is opt-in and not part of any SLO.
+		wakeLatencyByNode: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_wake_latency_seconds_by_node",
+			Help: "Per-node wake latency (operator-side only; the unlabeled gateway_wake_latency_seconds remains the §12 fleet p95 source). ADR-092 §3.5. node_id is the compute_nodes.id UUID; the obs handler resolves id to name via ListComputeNodes.",
+			Buckets: []float64{
+				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
+			},
+		}, []string{"node_id"}),
 		// Spec §12 row "wake queue wait p95". Observed by WakeGate.Wait
 		// on every caller that joins a single-flight coalescing wake. The
 		// leader (the request that actually triggers the wake) reads near
@@ -579,18 +610,6 @@ func NewMetrics() *Metrics {
 	for _, outcome := range []string{"match", "miss", "blocked", "failed", "missing"} {
 		m.edgeRuleMatch.WithLabelValues("jwt", outcome)
 	}
-	// ADR-091 hardening PR-A — pre-instantiate the apply-path
-	// (kind, result) and compile-error (kind) label sets so the §12
-	// dashboard chip "edge rule apply rate" + "edge rule compile
-	// errors" surface every tuple from first scrape. Adding a new
-	// kind (e.g. kind=rate_limit per ADR-091 D20.5) requires
-	// extending the outer slice below — the metric name is stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
-		for _, result := range []string{"success", "error"} {
-			m.edgeRuleApply.WithLabelValues(kind, result)
-		}
-		m.edgeRuleCompileError.WithLabelValues(kind)
-	}
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)
 	}
@@ -623,7 +642,20 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.streamActive.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError)
+	// PR #4 doesn't touch the edge-rule label set, but the
+	// ADR-091 hardening PR-A pre-instantiation must remain present
+	// so the §12 dashboard chip "edge rule apply rate" + "edge rule
+	// compile errors" surface every tuple from first scrape. Closed
+	// set: {route, rewrite, redirect, headers, cors, jwt, ip}. Adding
+	// a new kind requires extending this slice — the metric name is
+	// stable.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+		for _, result := range []string{"success", "error"} {
+			m.edgeRuleApply.WithLabelValues(kind, result)
+		}
+		m.edgeRuleCompileError.WithLabelValues(kind)
+	}
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError)
 	return m
 }
 
@@ -767,9 +799,27 @@ func (m *Metrics) ObserveAccountRateLimit(accountID, plan string) {
 // the wake latency (request-received to first upstream byte). Issue #273 /
 // ADR-042 renamed from ObserveColdWake; the gateway_cold_wake_total →
 // gateway_cold_boot_total rename is intentional and not dual-emitted.
-func (m *Metrics) ObserveColdBoot(appID string, latency time.Duration) {
+//
+// PR #4 (ADR-092 §3.5) also observes the labelled per-node histogram
+// `gateway_wake_latency_seconds_by_node`. The label value is the
+// compute_node.id (UUID) — gatewayd-internal has no name cache on
+// the wake path, and id is the durable shard key. nodeID=="" is
+// possible only on a wake that lost its target (parked mid-wake);
+// the labelled bucket "__unknown" preserves the observation
+// without polluting the per-node quantiles — the unknown bucket
+// is excluded from per-node PromQL by the obsNodeWakeLatency
+// handler's matcher.
+func (m *Metrics) ObserveColdBoot(appID string, latency time.Duration, nodeID string) {
 	m.coldBoot.WithLabelValues(appID).Inc()
 	m.wakeLatency.Observe(latency.Seconds())
+	if m.wakeLatencyByNode == nil {
+		return
+	}
+	label := nodeID
+	if label == "" {
+		label = "__unknown"
+	}
+	m.wakeLatencyByNode.WithLabelValues(label).Observe(latency.Seconds())
 }
 
 // ObserveWakeQueueWait records how long a request waited in the
@@ -821,13 +871,13 @@ func (m *Metrics) ObserveEdgeRuleMatch(kind, outcome string) {
 }
 
 // ObserveEdgeRuleApply (ADR-091 hardening PR-A) increments the
-// apply-path counter after an applyEdgeRule* helper returns.
-// kind is one of the seven shipped kinds; result is the closed
-// {success, error} set. Callers MUST invoke this on every apply
-// return so the §12 dashboard chip "edge rule apply rate" tracks
-// every gate, including the no-op ones (apply returned false but
-// "success" — e.g. JWT verify returned claims with no error).
-// Nil-receiver-safe: tests that don't thread metrics still pass.
+// apply-path counter. kind is the EdgeRuleKind; result is one of
+// {success, error}. Distinct from ObserveEdgeRuleMatch, which counts
+// the matcher's pick — a rule can match and still fail at apply time.
+// Nil-safe so the Handler hot path doesn't need a nil guard. PR #4
+// does not extend the result set; future error subclasses (e.g.
+// "jwks_expired", "ip_empty") require a new metric to keep cardinality
+// bounded (the §12 panel queries on {result=success}/{result=error}).
 func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
 	if m == nil {
 		return
@@ -835,12 +885,12 @@ func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
 	m.edgeRuleApply.WithLabelValues(kind, result).Inc()
 }
 
-// ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments
-// the compile-error counter from the cmd-side loader at every
-// path-glob / CIDR parse drop inside warnPathGlobErrs. The
-// pre-instantiated {kind} label set means any non-zero scrape
-// value pages the operator — a rule shipped broken is an
-// actionable correctness signal, not a headroom signal.
+// ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments the
+// compile-time error counter. Called from
+// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs when a rule's
+// glob/path/CIDR failed to parse at boot. kind is one of the seven
+// shipped kinds; the loader dropped the offending rule and is serving
+// traffic without it. Nil-safe so the loader doesn't need a nil guard.
 func (m *Metrics) ObserveEdgeRuleCompileError(kind string) {
 	if m == nil {
 		return

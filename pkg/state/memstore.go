@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"slices"
 	"sort"
@@ -2170,6 +2171,38 @@ func (m *MemStore) ListDeploymentsByNodeID(_ context.Context, nodeID string) ([]
 	return out, nil
 }
 
+// isInstanceStateLive reports whether the given instance state is
+// in the §6.2 invariant #1 set — {WAKING, COLD_BOOTING, RUNNING}.
+// The bash triple appears in:
+//   - pgstore.go (the predicate is a SQL IN clause)
+//   - memstore.go's ConcurrencyForDeployment (this file)
+//   - memstore.go's PerNodeLiveStats (PR #4)
+//
+// Extracted so the goconst lint rule (3+ literals) and the
+// state-machine spec (§6.1) share a single source of truth in the
+// in-memory twin. The Postgres CHECK constraint is the canonical
+// enforcement for the persistent table; this helper is the
+// in-memory twin's mirror.
+func isInstanceStateLive(state string) bool {
+	switch state {
+	case instanceStateRunning, instanceStateWaking, instanceStateColdBooting:
+		return true
+	}
+	return false
+}
+
+// instanceStateRunning / instanceStateWaking / instanceStateColdBooting
+// are the live-state literals from the spec §6.1 state machine.
+// Mirrored here only to feed isInstanceStateLive — the rest of
+// the codebase continues to use the bare string literals because
+// the SQL CHECK constraint is the load-bearing enforcement and
+// any wider refactor is out of scope.
+const (
+	instanceStateRunning     = "RUNNING"
+	instanceStateWaking      = "WAKING"
+	instanceStateColdBooting = "COLD_BOOTING"
+)
+
 // ConcurrencyForDeployment mirrors PgStore.ConcurrencyForDeployment.
 // Reads the in-memory instances slice with the same predicate the
 // SQL uses (state IN {'RUNNING','WAKING','COLD_BOOTING'}).
@@ -2181,8 +2214,7 @@ func (m *MemStore) ConcurrencyForDeployment(_ context.Context, appID, deployment
 		if inst.AppID != appID || inst.DeploymentID != deploymentID {
 			continue
 		}
-		switch inst.State {
-		case "RUNNING", "WAKING", "COLD_BOOTING":
+		if isInstanceStateLive(inst.State) {
 			n++
 		}
 	}
@@ -6343,6 +6375,139 @@ func (m *MemStore) ListComputeNodeHeartbeats(_ context.Context, nodeID string, s
 	return out, nil
 }
 
+// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+// amendment) is the v2 of AppendComputeNodeHeartbeat that also
+// carries the per-node CPU and disk pressure at heartbeat-mint
+// time. The PgStore impl is the load-bearing one — MemStore mirrors
+// it for handler tests that don't stand up Postgres. The duplicate
+// guard mirrors AppendComputeNodeHeartbeat's (node_id, received_at)
+// check so the test code path sees the same ErrConflict surface.
+// The CPUPct60s and DiskUsedBytes pointers are stored verbatim so
+// a handler can distinguish "absent" (nil → pre-PR #4 row) from
+// "explicit zero" (a fresh node with empty /srv/fc/snapshots).
+func (m *MemStore) AppendComputeNodeHeartbeatWithStats(_ context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.computeNodes[nodeID]; !ok {
+		return ErrNotFound
+	}
+	for _, prev := range m.computeNodeHeartbeats[nodeID] {
+		if prev.ReceivedAt.Equal(receivedAt) {
+			return fmt.Errorf("%w: compute_node_heartbeats (node_id, received_at) duplicate", ErrConflict)
+		}
+	}
+	cpu := cpuPct60s
+	disk := diskUsedBytes
+	row := ComputeNodeHeartbeat{
+		ID:              int64(len(m.computeNodeHeartbeats[nodeID]) + 1),
+		NodeID:          nodeID,
+		ReceivedAt:      receivedAt,
+		LastHeartbeatAt: lastHeartbeatAt,
+		Source:          source,
+		CPUPct60s:       &cpu,
+		DiskUsedBytes:   &disk,
+	}
+	m.computeNodeHeartbeats[nodeID] = append(m.computeNodeHeartbeats[nodeID], row)
+	return nil
+}
+
+// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+// per compute node, projected to the read shape (just NodeID +
+// ReceivedAt + the two stat pointers). Used by the obsListNodes
+// handler to fold CPU + disk pressure onto the per-node row. The
+// loop iterates the per-node slice in insertion order (last row
+// = newest, matching the SQL ORDER BY received_at DESC LIMIT 1
+// pattern). Missing or pre-PR #4 nodes return nil for the stat
+// pointers — the handler renders "—" for those.
+func (m *MemStore) LatestHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]ComputeNodeHeartbeatStats, 0, len(m.computeNodes))
+	for nodeID := range m.computeNodes {
+		rows := m.computeNodeHeartbeats[nodeID]
+		if len(rows) == 0 {
+			// No heartbeats yet. Still project the node so the
+			// handler can render "no data" rather than dropping
+			// it from the list entirely — the operator needs to
+			// see "node registered but silent" as a signal.
+			out = append(out, ComputeNodeHeartbeatStats{NodeID: nodeID})
+			continue
+		}
+		latest := rows[len(rows)-1]
+		out = append(out, ComputeNodeHeartbeatStats{
+			NodeID:        nodeID,
+			ReceivedAt:    latest.ReceivedAt,
+			CPUPct60s:     latest.CPUPct60s,
+			DiskUsedBytes: latest.DiskUsedBytes,
+		})
+	}
+	return out, nil
+}
+
+// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+// /v1/admin/obs/nodes handler. Walks instances in {WAKING,
+// COLD_BOOTING, RUNNING} state (the §6.2 invariant #1 set),
+// groups by instances.node_id, and projects to compute_nodes.name
+// for the human-friendly node label. The +8 on ram_mb mirrors
+// §6.2 invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so the
+// per-node RAMUsedMB sums to the fleet ceiling.
+//
+// Revision 2 (PR #4 prep): the original draft joined on a separate
+// instance_node_bindings table; after re-reading migration 00024
+// during implementation we discovered instances.node_id is already
+// a NOT NULL FK to compute_nodes(id), backfilled on pre-existing
+// rows. ADR-092 §8 amends §2.1 to drop the binding-table design.
+// This implementation mirrors the SQL GROUP BY directly: the
+// memstore's m.instances is the rows, the lookup onto
+// m.computeNodes is the JOIN, and only the live states count.
+func (m *MemStore) PerNodeLiveStats(_ context.Context) ([]PerNodeStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// node-id → *PerNodeStats. Walk every instance once; credit
+	// counts and RAM to the per-node bucket keyed by node_id.
+	// The handler LEFT JOINs onto compute_nodes by name; here we
+	// just project the raw uuid-aggregated buckets and let the
+	// handler map uuid → name via the existing
+	// ListComputeNodes call. Keeping the memstore uuid-shaped
+	// matches the SQL GROUP BY node_id.
+	agg := map[string]*PerNodeStats{}
+	for _, inst := range m.instances {
+		if !isInstanceStateLive(inst.State) {
+			continue
+		}
+		if inst.NodeID == "" {
+			// Defensive: migration 00024 enforces NOT NULL, but
+			// a hand-crafted memstore test fixture could trip
+			// the invariant. Skip rather than panic.
+			continue
+		}
+		row, ok := agg[inst.NodeID]
+		if !ok {
+			row = &PerNodeStats{NodeName: inst.NodeID}
+			agg[inst.NodeID] = row
+		}
+		row.InstancesLive++
+		switch inst.State {
+		case instanceStateRunning:
+			row.InstancesRunning++
+		case instanceStateWaking:
+			row.InstancesWaking++
+		case instanceStateColdBooting:
+			row.InstancesColdBooting++
+		}
+		// §6.2 invariant #2: ram_mb + 8 per live instance. Cast
+		// to int64 because PerNodeStats.RAMUsedMB is int64
+		// (matching the SQL SUM on bigint); Instance.RAMMB is
+		// plain int.
+		row.RAMUsedMB += int64(inst.RAMMB) + 8
+	}
+	out := make([]PerNodeStats, 0, len(agg))
+	for _, row := range agg {
+		out = append(out, *row)
+	}
+	return out, nil
+}
+
 // AppendEvent (commit 4) fixes two pre-existing bugs that the audit-log
 // PR surfaced. Before: the row's Subject pointer was dropped on the
 // floor (line 1226-1227 had a dead type-assertion placeholder and
@@ -6522,6 +6687,120 @@ func (m *MemStore) ListEventsByWakeID(_ context.Context, wakeID string, since ti
 		return out[i].At.Before(out[j].At)
 	})
 	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the in-memory twin
+// of PgStore.ListAllEventsPaged. Applies the same filter
+// semantics (actor / kind_prefix / subject / since) with the same
+// "empty string / zero time = no filter" sentinel used by the SQL
+// side. Order is (at DESC, id DESC) — same as the pgstore.
+// The cap to limit is applied AFTER the sort so the most-recent
+// rows are the ones that survive when the filter window is
+// larger than the limit.
+func (m *MemStore) ListAllEventsPaged(_ context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	var subjectFilter *uuid.UUID
+	if subject != "" {
+		parsed, err := uuid.Parse(subject)
+		if err != nil {
+			// Unparseable subject filter — no row would match it,
+			// so return empty rather than silently matching
+			// everything. Mirrors the pgstore contract: the SQL
+			// `$3 = '' OR subject = $3::uuid` clause fails the
+			// cast on a non-UUID string (Postgres returns 22P02
+			// invalid_text_representation); returning empty here
+			// keeps the two stores in lockstep on this edge.
+			return nil, nil
+		}
+		subjectFilter = &parsed
+	}
+	var out []Event
+	for _, e := range m.events {
+		if actor != "" && e.Actor != actor {
+			continue
+		}
+		if kindPrefix != "" && !strings.HasPrefix(e.Kind, kindPrefix) {
+			continue
+		}
+		if subjectFilter != nil {
+			if e.Subject == nil || *e.Subject != *subjectFilter {
+				continue
+			}
+		}
+		if !since.IsZero() && e.At.Before(since) {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].At.Equal(out[j].At) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].At.After(out[j].At)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+// per-account events drill-down. Same filter contract as the
+// pgstore version. Backed by the in-memory append order so the
+// partial-index shape (migrations/00099) is mirrored by the
+// iteration: every event matches the actor_account_id predicate
+// first, then the since floor, then the limit cap.
+func (m *MemStore) ListRecentEventsForAccount(_ context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	parsed, err := uuid.Parse(actorAccountID)
+	if err != nil {
+		// Unparseable actor_account_id — match the pgstore
+		// behaviour (empty result, no error).
+		return nil, nil
+	}
+	var out []Event
+	for _, e := range m.events {
+		// Memstore's Event struct does not have actor_account_id
+		// as a typed field (it lives in the jsonb data blob on
+		// the pgstore side; the in-memory type carries only the
+		// fields PR-3 surfaces). Decode the data payload lazily
+		// to find the actor_account_id, mirroring the wake-id
+		// pattern used by ListEventsByWakeID.
+		var payload struct {
+			ActorAccountID string `json:"actor_account_id"`
+		}
+		if len(e.Data) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		if payload.ActorAccountID != parsed.String() {
+			continue
+		}
+		if !since.IsZero() && e.At.Before(since) {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].At.Equal(out[j].At) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].At.After(out[j].At)
+	})
+	if len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil
@@ -10858,6 +11137,185 @@ func (m *MemStore) TrafficAnomalyAggregate(_ context.Context, arg sqlc.TrafficAn
 		out = append(out, s.r)
 	}
 	return out, nil
+}
+
+// PerAccountRateLimitAggregate is the in-memory mirror of
+// (PgStore).TrafficAnomalyAggregateByNode. Walks m.usage to build
+// per-(account, app, node, hour) buckets; the memstore's
+// usage entries don't carry node_id (they're per-instance), so
+// the resolution joins to m.instances[instance_id].node_id.
+// Computing a full per-node baseline is more expensive than the
+// per-app path (one extra GROUP BY column), so the memstore
+// shares the same baseline math via the existing bucket walker
+// with an additional key dimension.
+//
+// Why mirror the per-app impl rather than just return empty: the
+// obs handler tests for `?group_by=node` need to assert the wire
+// shape from a memstore-backed store. An empty result would
+// pass a "no rows" test but fail a "score threshold" test.
+func (m *MemStore) TrafficAnomalyAggregateByNode(_ context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error) {
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
+	}
+	since := arg.Minute.Time
+	baselineCutoff := arg.Minute_2.Time
+	limit := int(arg.Column3)
+	type bucket struct {
+		sum, sumSq float64
+		n          int
+	}
+	bl := map[string]*bucket{} // key = accountID|appID|nodeID|hour
+	keyOf := func(a, b, n string, h int) string {
+		return a + "|" + b + "|" + n + "|" + fmt.Sprint(h)
+	}
+	m.mu.Lock()
+	for _, u := range m.usage {
+		if u.Minute.Before(baselineCutoff) || !u.Minute.Before(since) {
+			continue
+		}
+		if u.MBSeconds <= 0 {
+			continue
+		}
+		nodeID := ""
+		if inst, ok := m.instances[u.InstanceID]; ok && inst.NodeID != "" {
+			nodeID = inst.NodeID
+		} else {
+			continue // no node resolution → skip (cannot credit a node)
+		}
+		k := keyOf(u.AccountID, u.AppID, nodeID, u.Minute.UTC().Hour())
+		bk := bl[k]
+		if bk == nil {
+			bk = &bucket{}
+			bl[k] = bk
+		}
+		bk.sum += float64(u.MBSeconds)
+		bk.sumSq += float64(u.MBSeconds) * float64(u.MBSeconds)
+		bk.n++
+	}
+	// current_pool: same shape, different time window.
+	cur := map[string]map[int]float64{} // (account|app|node) → hour → sum
+	curKey := func(a, b, n string) string {
+		return a + "|" + b + "|" + n
+	}
+	for _, u := range m.usage {
+		if u.Minute.Before(since) {
+			continue
+		}
+		if u.MBSeconds <= 0 {
+			continue
+		}
+		nodeID := ""
+		if inst, ok := m.instances[u.InstanceID]; ok && inst.NodeID != "" {
+			nodeID = inst.NodeID
+		} else {
+			continue
+		}
+		h := u.Minute.UTC().Hour()
+		ck := curKey(u.AccountID, u.AppID, nodeID)
+		cm := cur[ck]
+		if cm == nil {
+			cm = map[int]float64{}
+			cur[ck] = cm
+		}
+		cm[h] += float64(u.MBSeconds)
+	}
+	m.mu.Unlock()
+	type scored struct {
+		accountID, appID, nodeID string
+		minute                   time.Time
+		current                  float64
+		mean, stddev             float64
+		n                        int
+		z                        *float64
+		reason                   string
+	}
+	out := []scored{}
+	for ck, hours := range cur {
+		// ck = "account|app|node"
+		var accID, appID, nodeID string
+		for i, c := range []byte(ck) {
+			_ = i
+			_ = c
+		}
+		// Split ck — three segments separated by '|'.
+		// Avoid pulling strings.Split into hot path; use a tiny
+		// manual scan.
+		parts := [3]string{}
+		pi := 0
+		start := 0
+		for i := 0; i < len(ck); i++ {
+			if ck[i] == '|' && pi < 2 {
+				parts[pi] = ck[start:i]
+				pi++
+				start = i + 1
+			}
+		}
+		parts[pi] = ck[start:]
+		accID, appID, nodeID = parts[0], parts[1], parts[2]
+		for h, curSum := range hours {
+			bk := bl[keyOf(accID, appID, nodeID, h)]
+			if bk == nil {
+				continue
+			}
+			mean := bk.sum / float64(bk.n)
+			variance := (bk.sumSq / float64(bk.n)) - mean*mean
+			if variance < 0 {
+				variance = 0
+			}
+			stddev := math.Sqrt(variance)
+			var z *float64
+			var reason string
+			if bk.n < 3 {
+				continue
+			}
+			if stddev < 1.0 && curSum >= 5.0*mean && mean > 0 {
+				zv := (curSum - mean) / 5.0
+				z = &zv
+				reason = "raw_z"
+			} else if stddev >= 1.0 && curSum >= mean+3.0*stddev {
+				zv := (curSum - mean) / stddev
+				z = &zv
+				reason = "hour_of_day"
+			} else {
+				continue
+			}
+			out = append(out, scored{
+				accountID: accID, appID: appID, nodeID: nodeID,
+				minute:  time.Date(since.Year(), since.Month(), since.Day(), h, 0, 0, 0, time.UTC),
+				current: curSum, mean: mean, stddev: stddev, n: bk.n,
+				z: z, reason: reason,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].z == nil || out[j].z == nil {
+			return false
+		}
+		return *out[i].z > *out[j].z
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	rows := make([]sqlc.TrafficAnomalyAggregateByNodeRow, 0, len(out))
+	for _, s := range out {
+		var aid, bid, nid pgtype.UUID
+		_ = aid.Scan(s.accountID)
+		_ = bid.Scan(s.appID)
+		_ = nid.Scan(s.nodeID)
+		rows = append(rows, sqlc.TrafficAnomalyAggregateByNodeRow{
+			AccountID:        aid,
+			AppID:            bid,
+			NodeID:           nid,
+			Minute:           pgtypeTimestamptzFromTime(s.minute),
+			CurrentMbSeconds: s.current,
+			MeanMbSeconds:    s.mean,
+			StddevMbSeconds:  s.stddev,
+			SampleCount:      int32(s.n),
+			ZScore:           s.z,
+			Reason:           s.reason,
+		})
+	}
+	return rows, nil
 }
 
 // PerAccountRateLimitAggregate is the in-memory mirror of

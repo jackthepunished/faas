@@ -8125,6 +8125,144 @@ func (s *PgStore) ListComputeNodeHeartbeats(ctx context.Context, nodeID string, 
 	return out, nil
 }
 
+// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+// amendment) extends AppendComputeNodeHeartbeat with the cpu_pct_60s
+// and disk_used_bytes columns added by migration 00199. The two new
+// columns are nullable (pre-PR #4 rows keep NULL — see migration
+// 00199's comment) and default to NULL on INSERT so an un-upgraded
+// vmmd writer hitting a post-PR #4 schema still works. The
+// (node_id, received_at) unique constraint and parent-exists check
+// mirror AppendComputeNodeHeartbeat verbatim — the test code path
+// must see the same ErrConflict surface.
+func (s *PgStore) AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error {
+	// Parent existence check first (same rationale as
+	// AppendComputeNodeHeartbeat: avoid racing the FK insert).
+	var parentExists bool
+	if err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from compute_nodes where id = $1)`, nodeID,
+	).Scan(&parentExists); err != nil {
+		return fmt.Errorf("state: append compute_node_heartbeat_with_stats: parent check: %w", err)
+	}
+	if !parentExists {
+		return ErrNotFound
+	}
+	if _, err := s.pool.Exec(ctx, `
+		insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source, cpu_pct_60s, disk_used_bytes)
+		values ($1, $2, $3, $4, $5, $6)
+	`, nodeID, receivedAt, lastHeartbeatAt, source, cpuPct60s, diskUsedBytes); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return fmt.Errorf("%w: compute_node_heartbeats (node_id, received_at) duplicate", ErrConflict)
+		}
+		return fmt.Errorf("state: append compute_node_heartbeat_with_stats: %w", err)
+	}
+	return nil
+}
+
+// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+// per compute node. DISTINCT ON (node_id) collapses the per-node
+// rows to the latest received_at in one pass — Postgres-only
+// idiom, the MemStore mirrors it in Go. The obsListNodes handler
+// folds this onto the per-node projection; a node with no
+// heartbeats yet is NOT returned here (the LEFT JOIN in the
+// handler renders it as "no data" with the rest of the
+// compute_nodes row intact).
+func (s *PgStore) LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	rows, err := s.pool.Query(ctx, `
+		select distinct on (node_id)
+		       node_id, received_at, cpu_pct_60s, disk_used_bytes
+		from compute_node_heartbeats
+		order by node_id, received_at desc
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list latest heartbeat stats: %w", err)
+	}
+	defer rows.Close()
+	// Pre-size to a reasonable upper bound; the cluster won't have
+	// more than a few hundred nodes in the multi-host story, so
+	// 512 is generous headroom without bloating the slice.
+	out := make([]ComputeNodeHeartbeatStats, 0, 64)
+	for rows.Next() {
+		var h ComputeNodeHeartbeatStats
+		var nodeUUID string
+		var cpu *float64
+		var disk *int64
+		if err := rows.Scan(&nodeUUID, &h.ReceivedAt, &cpu, &disk); err != nil {
+			return nil, fmt.Errorf("state: scan latest heartbeat stats: %w", err)
+		}
+		h.NodeID = nodeUUID
+		h.CPUPct60s = cpu
+		h.DiskUsedBytes = disk
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate latest heartbeat stats: %w", err)
+	}
+	return out, nil
+}
+
+// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+// /v1/admin/obs/nodes handler. Groups live instances (state in
+// {RUNNING, WAKING, COLD_BOOTING}, the §6.2 invariant #1 set) by
+// instances.node_id and joins onto compute_nodes for the human-
+// friendly node name.
+//
+// Revision 2 (PR #4 prep): the original draft joined on a separate
+// instance_node_bindings table; after re-reading migration 00024
+// during implementation we discovered instances.node_id is already
+// a NOT NULL FK to compute_nodes(id), backfilled on pre-existing
+// rows. ADR-092 §8 amends §2.1 to drop the binding-table design.
+// This query mirrors the corrected design: the inner GROUP BY
+// walks the instances table directly. The +8 on ram_mb mirrors
+// §6.2 invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so per-node
+// RAMUsedMB sums to the fleet ceiling. COUNT(*) FILTER (WHERE
+// state = ...) projects each state bucket without four separate
+// scans. The JOIN onto compute_nodes is INNER today because the
+// obs handler only wants useful per-node aggregates; a node with
+// no instances simply doesn't appear in this result and the
+// handler surfaces "no live instances" via the dedicated empty
+// state in the response.
+func (s *PgStore) PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error) {
+	rows, err := s.pool.Query(ctx, `
+		select n.name                                           as node_name,
+		       count(*)                                         as instances_live,
+		       count(*) filter (where i.state = 'RUNNING')     as instances_running,
+		       count(*) filter (where i.state = 'WAKING')      as instances_waking,
+		       count(*) filter (where i.state = 'COLD_BOOTING') as instances_cold_booting,
+		       coalesce(sum(i.ram_mb + 8), 0)                    as ram_used_mb
+		from instances i
+		join compute_nodes n on n.id = i.node_id
+		where i.state in ('RUNNING', 'WAKING', 'COLD_BOOTING')
+		group by n.name
+		order by n.name
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: per-node live stats: %w", err)
+	}
+	defer rows.Close()
+	// Pre-size to a reasonable upper bound; the cluster won't have
+	// more than a few hundred nodes in the multi-host story.
+	out := make([]PerNodeStats, 0, 64)
+	for rows.Next() {
+		var s PerNodeStats
+		if err := rows.Scan(
+			&s.NodeName,
+			&s.InstancesLive,
+			&s.InstancesRunning,
+			&s.InstancesWaking,
+			&s.InstancesColdBooting,
+			&s.RAMUsedMB,
+		); err != nil {
+			return nil, fmt.Errorf("state: scan per-node live stats: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate per-node live stats: %w", err)
+	}
+	return out, nil
+}
+
 // MarkComputeNodeInactive flips active=false on the row (PR #114,
 // schedd heartbeat path). Idempotent: the UPDATE matches regardless
 // of current value, so re-flipping an inactive row is a no-op. We
@@ -8504,6 +8642,95 @@ func (s *PgStore) ListEventsByWakeID(ctx context.Context, wakeID string, since t
 		var rawData []byte
 		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
 			return nil, err
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator-obs
+// backend's read-side query for the live events table. Mirrors the
+// SQL in pkg/state/queries.sql::ListAllEventsPaged; the raw-SQL
+// fallback here keeps the param semantics identical to the sqlc
+// version (no string-built queries, all parameters bound).
+//
+// Bounded by the handler to api.ObsAdminEventsLimitMax (500). The
+// interface{} params for the discriminator columns (actor, kind_prefix,
+// subject, since) match the sqlc-emitted shape — the SQL uses the
+// ($1 = ” OR ...) predicate so the column type cannot be inferred.
+// Bound as string / time.Time at the call site.
+func (s *PgStore) ListAllEventsPaged(ctx context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if !since.IsZero() {
+		since = since.UTC()
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, at, actor, kind, subject, data from events
+		 where ($1 = '' or actor = $1)
+		   and ($2 = '' or kind like $2 || '%')
+		   and ($3 = '' or subject = $3::uuid)
+		   and ($4 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $4)
+		 order by at desc, id desc
+		 limit $5`,
+		actor, kindPrefix, subject, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list_all_events_paged: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, fmt.Errorf("state: list_all_events_paged: %w", err)
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+// per-account events drill-down. Backed by the partial
+// events_actor_account_idx on (actor_account_id) WHERE actor_account_id IS NOT NULL
+// (migrations/00099_orgs_memberships_invitations.sql). Same raw-SQL
+// shape as ListAllEventsPaged; the actor_account_id is the indexed
+// column so the planner picks the partial index on the per-account
+// filter regardless of the since filter.
+func (s *PgStore) ListRecentEventsForAccount(ctx context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if !since.IsZero() {
+		since = since.UTC()
+	}
+	parsedUUID, err := uuid.Parse(actorAccountID)
+	if err != nil {
+		// Unparseable actor_account_id — match the existing
+		// ListEvents behaviour where a malformed filter returns
+		// an empty slice rather than a SQL error.
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, at, actor, kind, subject, data from events
+		 where actor_account_id = $1
+		   and ($2 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $2)
+		 order by at desc, id desc
+		 limit $3`,
+		parsedUUID, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list_recent_events_for_account: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, fmt.Errorf("state: list_recent_events_for_account: %w", err)
 		}
 		e.Data = json.RawMessage(rawData)
 		out = append(out, e)
@@ -14162,6 +14389,121 @@ func (s *PgStore) TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficA
 			&r.Reason,
 		); err != nil {
 			return nil, fmt.Errorf("state: traffic_anomaly_aggregate scan: %w", err)
+		}
+		r.ZScore = zScore
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// TrafficAnomalyAggregateByNode is the pgstore wrapper around
+// the sqlc-generated TrafficAnomalyAggregateByNode query
+// (PR #4 / ADR-092 §3.4 amendment). The raw SQL mirrors the
+// sqlc-emitted string verbatim so the generated code can stay
+// the source of truth for the column shapes. Same scoring
+// formula as TrafficAnomalyAggregate; one extra GROUP BY key
+// (node_id) threads the result through instances →
+// compute_nodes. The handler resolves node_id → node_name via
+// ListComputeNodes before returning the wire shape.
+func (s *PgStore) TrafficAnomalyAggregateByNode(ctx context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error) {
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
+	}
+	rows, err := s.pool.Query(ctx, `
+		with baseline as (
+		    select um.account_id,
+		           um.app_id,
+		           n.id as node_id,
+		           extract(hour from um.minute) as hour_of_day,
+		           avg(um.mb_seconds)::float8 as mean_mb_seconds,
+		           coalesce(stddev_pop(um.mb_seconds), 0)::float8 as stddev_mb_seconds,
+		           count(*)::int as sample_count
+		    from usage_minutes um
+		    join instances i on i.id = um.instance_id
+		    join compute_nodes n on n.id = i.node_id
+		    where um.minute >= $2
+		      and um.minute <  $1
+		      and um.mb_seconds > 0
+		    group by um.account_id, um.app_id, n.id, extract(hour from um.minute)
+		),
+		current_pool as (
+		    select um.account_id,
+		           um.app_id,
+		           n.id as node_id,
+		           um.minute,
+		           sum(um.mb_seconds)::float8 as current_mb_seconds
+		    from usage_minutes um
+		    join instances i on i.id = um.instance_id
+		    join compute_nodes n on n.id = i.node_id
+		    where um.minute >= $1
+		      and um.mb_seconds > 0
+		    group by um.account_id, um.app_id, n.id, um.minute
+		),
+		scored as (
+		    select c.account_id,
+		           c.app_id,
+		           c.node_id,
+		           c.minute,
+		           c.current_mb_seconds,
+		           b.mean_mb_seconds,
+		           b.stddev_mb_seconds,
+		           b.sample_count,
+		           case
+		               when b.sample_count < 3 then null
+		               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+		                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+		               when b.stddev_mb_seconds >= 1.0
+		                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+		                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+		               else null
+		           end as z_score,
+		           case
+		               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+		               else 'hour_of_day'
+		           end as reason
+		    from current_pool c
+		    join baseline b
+		      on c.account_id = b.account_id
+		     and c.app_id    = b.app_id
+		     and c.node_id   = b.node_id
+		     and extract(hour from c.minute) = b.hour_of_day
+		)
+		select account_id,
+		       app_id,
+		       node_id,
+		       minute,
+		       current_mb_seconds,
+		       mean_mb_seconds,
+		       stddev_mb_seconds,
+		       sample_count,
+		       z_score,
+		       reason
+		from scored
+		where z_score is not null
+		order by z_score desc
+		limit $3::int8
+	`, arg.Minute.Time.UTC(), arg.Minute_2.Time.UTC(), arg.Column3)
+	if err != nil {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: %w", err)
+	}
+	defer rows.Close()
+	out := []sqlc.TrafficAnomalyAggregateByNodeRow{}
+	for rows.Next() {
+		var r sqlc.TrafficAnomalyAggregateByNodeRow
+		var zScore *float64
+		if err := rows.Scan(
+			&r.AccountID,
+			&r.AppID,
+			&r.NodeID,
+			&r.Minute,
+			&r.CurrentMbSeconds,
+			&r.MeanMbSeconds,
+			&r.StddevMbSeconds,
+			&r.SampleCount,
+			&zScore,
+			&r.Reason,
+		); err != nil {
+			return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node scan: %w", err)
 		}
 		r.ZScore = zScore
 		out = append(out, r)

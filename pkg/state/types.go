@@ -1857,6 +1857,40 @@ type ComputeNodeHeartbeat struct {
 	ReceivedAt      time.Time
 	LastHeartbeatAt time.Time
 	Source          string
+	// CPUPct60s is the 60-second sliding-window CPU utilization as
+	// a percentage of vpcpus × 100 (PR #4 / ADR-091 §3.6 amendment).
+	// Nil when the row predates migrations/00199 or vmmd hadn't
+	// sampled yet. Bounded [0.00, 100.00] for sane values.
+	CPUPct60s *float64
+	// DiskUsedBytes is the byte size of /srv/fc/snapshots + spool
+	// scratchpad at heartbeat-mint time (PR #4). Nil when the row
+	// predates the migration or vmmd hadn't sampled yet.
+	DiskUsedBytes *int64
+}
+
+// ComputeNodeHeartbeatStats is the read shape for LatestHeartbeatStats
+// (PR #4). One row per compute node; NodeID + the latest heartbeat's
+// stats fields. The handler folds this onto the ObsNodeRow projection.
+type ComputeNodeHeartbeatStats struct {
+	NodeID        string
+	ReceivedAt    time.Time
+	CPUPct60s     *float64
+	DiskUsedBytes *int64
+}
+
+// PerNodeStats is one row of the per-node live-stats aggregate (PR #4).
+// NodeName is the compute_nodes.name. The counts and RAM sums are over
+// instances whose binding row has released_at IS NULL (i.e. the VM is
+// currently hosted on that node). The +8 on ram_mb mirrors §6.2
+// invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so the per-node RAMUsedMB
+// is the operator-side number that adds up to the fleet ceiling.
+type PerNodeStats struct {
+	NodeName             string
+	InstancesLive        int64
+	InstancesRunning     int64
+	InstancesWaking      int64
+	InstancesColdBooting int64
+	RAMUsedMB            int64
 }
 
 // InstanceTouch is one entry in a last_request_at flush batch (spec §4.1). The

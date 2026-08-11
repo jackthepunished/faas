@@ -2459,6 +2459,43 @@ type Store interface {
 	// store's ComputeNodeByName, not this call.
 	ListComputeNodeHeartbeats(ctx context.Context, nodeID string, since time.Time, limit int) ([]ComputeNodeHeartbeat, error)
 
+	// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+	// amendment) extends AppendComputeNodeHeartbeat with the two new
+	// stats columns added in migrations/00199. vmmd is the only caller
+	// on the routine path; the existing AppendComputeNodeHeartbeat
+	// (without stats) stays so schedd's deactivation/reactivation
+	// stampers don't need to know about CPU/disk. cpuPct60s is the
+	// 60-second sliding-window CPU utilization as a percentage of
+	// vpcpus × 100 (range [0.00, 100.00] for sane values). The
+	// memstore mirrors the nullable semantics: existing callers
+	// without the stats columns pass 0 / 0 and the column defaults
+	// to NULL on the postgres side via the IF NOT EXISTS migration.
+	AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error
+
+	// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+	// row per node, with the CPU%/disk fields populated. Used by the
+	// obs surface to fold onto the /v1/admin/obs/nodes row projection.
+	// Returns one row per node — even nodes with no stats yet (the
+	// CPU/disk fields are nil). The LEFT JOIN onto compute_nodes is
+	// done in the handler; this query is just the latest-row-per-node.
+	LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
+
+	// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+	// new per-node utilization fields on /v1/admin/obs/nodes. One row
+	// per compute_node that has at least one live instance.
+	//
+	// The aggregate joins on instances.node_id (the existing NOT NULL
+	// FK from migration 00024, backfilled to the default-local node on
+	// pre-existing rows) — NOT a separate binding table. ADR-092 §2.1
+	// was rewritten during PR #4 prep after this discovery; see the
+	// §8 amendment in docs/adr/092-per-node-utilization-obs.md.
+	//
+	// The +8 on ram_mb mirrors §6.2 invariant #2 — Σ(ram_mb + 8) ≤
+	// 47,600 MB. The aggregate is per-node; the fleet Σ is computed
+	// by the caller if it wants the global number (the existing
+	// fleet Σ lives in the schedd engine, not on this wire).
+	PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error)
+
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
@@ -2507,6 +2544,33 @@ type Store interface {
 	// account's ID; the operator endpoint leaves AccountID nil and
 	// passes IncludeAnonymous=true when ?include_anonymous=true.
 	ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]AuditLog, error)
+
+	// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator
+	// observability backend's read-side query for the live events
+	// table. Distinct from ListAuditLog (audit_log table) — the
+	// two surfaces do NOT overlap per ADR-091 §3.7.4.
+	//
+	// Filter shape: actor ("" / exact match), kind_prefix ("" /
+	// LIKE 'prefix%'), subject ("" / UUID), since (zero time / since
+	// floor), limit (top-N; bounded by handler to
+	// ObsAdminEventsLimitMax). The "" / zero literals are the
+	// "no filter" sentinel — sqlc binds them as interface{} because
+	// the SQL uses the ($1 = '' OR ...) predicate shape.
+	//
+	// Order is (at DESC, id DESC) — the id tiebreaker keeps the
+	// over-read stable across (kind, at DESC) index hits and
+	// avoids an unstable sort.
+	ListAllEventsPaged(ctx context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error)
+
+	// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+	// per-account events drill-down. Backed by the events_actor_account_idx
+	// partial index on (actor_account_id) WHERE actor_account_id IS NOT NULL
+	// (migrations/00099_orgs_memberships_invitations.sql).
+	//
+	// since is the inclusive lower bound on at; limit is the top-N
+	// bounded by the caller's ObsAdminEventsLimitMax. Order is
+	// (at DESC, id DESC) — same rationale as ListAllEventsPaged.
+	ListRecentEventsForAccount(ctx context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error)
 	// DeploymentSidecarRAMs (issue #463 / ADR-070 / PR-C) returns
 	// the per-deployment sidecar RAM slice from the jsonb column.
 	// Empty/nil when the deployment has no sidecars — matching the
@@ -2567,6 +2631,15 @@ type Store interface {
 	// see the sqlc query in pkg/state/queries.sql for the scoring
 	// formula and reason taxonomy.
 	TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error)
+	// TrafficAnomalyAggregateByNode (PR #4 / ADR-092 §3.4
+	// amendment) is the per-(account, app, node, minute) variant
+	// of TrafficAnomalyAggregate. Same scoring formula and
+	// reason taxonomy; different GROUP BY keys (joins through
+	// instances.node_id → compute_nodes.id). Powers
+	// GET /v1/admin/obs/anomalies?group_by=node. The handler
+	// resolves node_id → node_name via ListComputeNodes before
+	// returning the wire shape.
+	TrafficAnomalyAggregateByNode(ctx context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error)
 	// PerAccountRateLimitAggregate is the durable view of
 	// auth.rate_limited events grouped by account_id (subject)
 	// over a rolling window. Powers GET /v1/admin/obs/rate-limits
