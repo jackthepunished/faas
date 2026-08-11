@@ -43,7 +43,7 @@ import (
 // CHECK widens to 10 values.
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
-	"validate", "limit",
+	"validate", "limit", "geo",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
@@ -229,6 +229,24 @@ func cmdEdgeRulesCreate(args []string) int {
 	// pkg/api.EdgeRuleLimitAction.Validate().
 	limitMaxBodyBytes := fs.Int("limit-max-body-bytes", 0, "kind=limit: required buffered body cap in bytes (>0, <=25MiB)")
 	limitMaxBodyBytesStreaming := fs.Int("limit-max-body-bytes-streaming", 0, "kind=limit: optional streaming body cap in bytes (0=inherit buffered; <=100MiB)")
+	// geo (ADR-091 D21). ISO 3166-1 alpha-2 country codes; the
+	// validator in pkg/api/dto.go enforces the closed vocab.
+	var geoAllow, geoDeny multiFlag
+	fs.Var(&geoAllow, "geo-allow", "kind=geo: allow country code (ISO 3166-1 alpha-2; repeat)")
+	fs.Var(&geoDeny, "geo-deny", "kind=geo: deny country code (ISO 3166-1 alpha-2; repeat)")
+
+	// validate (PR #841). The JSON Schema is read from a file path;
+	// inline JSON via a flag is unwieldy for any non-trivial schema
+	// and the 64 KiB cap (api.MaxEdgeRuleValidateSchemaBytes) is
+	// easier to police on the raw bytes the CLI reads. The validator
+	// runs against the same EdgeRuleValidateAction.Validate() so
+	// the apid wire shape stays the single source of truth.
+	validateSchemaFile := fs.String("validate-schema-file", "", "kind=validate: path to JSON Schema file (required)")
+	var validateContentTypes multiFlag
+	fs.Var(&validateContentTypes, "validate-content-type", "kind=validate: media-type allowlist (repeat for multiple)")
+	validateApplyStreaming := fs.Bool("validate-apply-while-streaming", false, "kind=validate: validate on streaming responses (ADR-047 opt-in)")
+	validateRejectUnknown := fs.Bool("validate-reject-unknown-fields", false, "kind=validate: reject requests with fields not in the schema")
+	validateMaxBody := fs.Int("validate-max-body-bytes", 0, "kind=validate: per-rule max body bytes (0 = inherit plan default)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -268,6 +286,13 @@ func cmdEdgeRulesCreate(args []string) int {
 		IPDeny:                     ipDeny,
 		LimitMaxBodyBytes:          *limitMaxBodyBytes,
 		LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
+		GeoAllow:                   geoAllow,
+		GeoDeny:                    geoDeny,
+		ValidateSchemaFile:         *validateSchemaFile,
+		ValidateContentTypes:       validateContentTypes,
+		ValidateApplyStream:        *validateApplyStreaming,
+		ValidateRejectUnknown:      *validateRejectUnknown,
+		ValidateMaxBodyBytes:       *validateMaxBody,
 	})
 	if err != nil {
 		return printErr("Invalid flags for --kind="+*kind, err)
@@ -383,6 +408,18 @@ func cmdEdgeRulesUpdate(args []string) int {
 	var ipAllow, ipDeny multiFlag
 	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR")
 	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR")
+	var geoAllow, geoDeny multiFlag
+	fs.Var(&geoAllow, "geo-allow", "kind=geo: allow country code (ISO 3166-1 alpha-2)")
+	fs.Var(&geoDeny, "geo-deny", "kind=geo: deny country code (ISO 3166-1 alpha-2)")
+	// validate (PR #841). Same shape as create; the file content is
+	// re-read on every update because the action is fully replaced
+	// on PATCH (no partial sub-keys).
+	validateSchemaFile := fs.String("validate-schema-file", "", "kind=validate: path to JSON Schema file")
+	var validateContentTypes multiFlag
+	fs.Var(&validateContentTypes, "validate-content-type", "kind=validate: media-type allowlist (repeat)")
+	validateApplyStreaming := fs.Bool("validate-apply-while-streaming", false, "kind=validate: validate on streaming responses")
+	validateRejectUnknown := fs.Bool("validate-reject-unknown-fields", false, "kind=validate: reject unknown fields")
+	validateMaxBody := fs.Int("validate-max-body-bytes", 0, "kind=validate: per-rule max body bytes")
 
 	// limit (ADR-091 D24). Same flags as Create; either flag
 	// present flips anyKindFlagVisited() true so the action jsonb
@@ -473,6 +510,13 @@ func cmdEdgeRulesUpdate(args []string) int {
 			IPDeny:                     ipDeny,
 			LimitMaxBodyBytes:          *limitMaxBodyBytes,
 			LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
+			GeoAllow:                   geoAllow,
+			GeoDeny:                    geoDeny,
+			ValidateSchemaFile:         *validateSchemaFile,
+			ValidateContentTypes:       validateContentTypes,
+			ValidateApplyStream:        *validateApplyStreaming,
+			ValidateRejectUnknown:      *validateRejectUnknown,
+			ValidateMaxBodyBytes:       *validateMaxBody,
 		})
 		if err != nil {
 			return printErr("Invalid flags for --kind="+*kind, err)
@@ -568,6 +612,19 @@ type edgeRuleActionInputs struct {
 	// server-side guard catches the omission cleanly.
 	LimitMaxBodyBytes          int
 	LimitMaxBodyBytesStreaming int
+	// geo (ADR-091 D21). ISO 3166-1 alpha-2 country codes;
+	// uppercased + space-stripped before the validator runs.
+	GeoAllow, GeoDeny []string
+	// validate (PR #841). SchemaFile is the path to a JSON Schema
+	// document the CLI reads and embeds into the action's Schema
+	// (json.RawMessage). ContentTypes repeats the flag into the
+	// action's optional allowlist. The rest map 1:1 to
+	// EdgeRuleValidateAction fields.
+	ValidateSchemaFile    string
+	ValidateContentTypes  []string
+	ValidateApplyStream   bool
+	ValidateRejectUnknown bool
+	ValidateMaxBodyBytes  int
 }
 
 // buildEdgeRuleAction marshals the per-kind inputs into the matching
@@ -674,6 +731,45 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 		a := api.EdgeRuleLimitAction{
 			MaxBodyBytes:          in.LimitMaxBodyBytes,
 			MaxBodyBytesStreaming: in.LimitMaxBodyBytesStreaming,
+		}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "geo":
+		// ISO 3166-1 alpha-2 country codes. The validator in
+		// pkg/api/dto.go enforces the closed vocab + the 50-entry
+		// cardinality cap + the no-dupes invariant; the CLI just
+		// uppercases here so the wire shape is consistent regardless
+		// of how the customer typed the flag.
+		allow := upperCountryCodes(in.GeoAllow)
+		deny := upperCountryCodes(in.GeoDeny)
+		a := api.EdgeRuleGeoAction{Allow: allow, Deny: deny}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "validate":
+		// PR #841 / EdgeRuleValidateAction. The CLI reads the
+		// JSON Schema from --validate-schema-file <path> and
+		// passes the raw bytes through as json.RawMessage so the
+		// apid-side Validate() owns the byte cap + well-formedness
+		// check + closed-keyword sanitisation (we don't want to
+		// re-parse here and risk drift). ContentTypes repeats
+		// cleanly into the action's optional allowlist.
+		if in.ValidateSchemaFile == "" {
+			return nil, fmt.Errorf("--validate-schema-file is required when --kind=validate")
+		}
+		schemaBytes, err := os.ReadFile(in.ValidateSchemaFile)
+		if err != nil {
+			return nil, fmt.Errorf("read --validate-schema-file %q: %w", in.ValidateSchemaFile, err)
+		}
+		a := api.EdgeRuleValidateAction{
+			Schema:                schemaBytes,
+			ContentTypes:          in.ValidateContentTypes,
+			ApplyWhileStreaming:   in.ValidateApplyStream,
+			RejectOnUnknownFields: in.ValidateRejectUnknown,
+			MaxBodyBytes:          in.ValidateMaxBodyBytes,
 		}
 		if err := a.Validate(); err != nil {
 			return nil, errToError(err)

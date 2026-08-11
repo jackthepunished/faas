@@ -9573,13 +9573,14 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 // Per-kind quota (ADR-091 D22). Same shape as the pgstore
 	// branch. The memstore holds the entire edgeRules slice under
 	// m.mu so the per-kind count is trivially race-free; we route
-	// through the public CountEdgeRulesByKindForApp helper (review
-	// finding #3 — single source of truth on both stores).
+	// through the unlocked private helper countEdgeRulesByKindForAppLocked
+	// because the public CountEdgeRulesByKindForApp re-acquires
+	// m.mu, and Go's sync.Mutex is not reentrant — calling the
+	// public helper here would deadlock the goroutine. Mirrors the
+	// pgstore's tx-side countEdgeRulesByKindForAppTx (review
+	// finding from the PR #845 medium pass).
 	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
-		kindCount, err := m.CountEdgeRulesByKindForApp(context.Background(), in.AppID, EdgeRuleKindGeo)
-		if err != nil {
-			return EdgeRule{}, err
-		}
+		kindCount := m.countEdgeRulesByKindForAppLocked(in.AppID, EdgeRuleKindGeo)
 		if kindCount >= limits.EdgeRulesGeoPerApp {
 			return EdgeRule{}, &EdgeRuleQuotaError{
 				Limit:      limits.EdgeRulesGeoPerApp,
@@ -9712,6 +9713,37 @@ func (m *MemStore) CountEdgeRulesForApp(_ context.Context, appID string) (int, e
 		}
 	}
 	return n, nil
+}
+
+// CountEdgeRulesByKindForApp mirrors pgstore. The memstore doesn't
+// enforce the per-kind cap in CreateEdgeRuleIfUnderQuota today
+// (the FOR UPDATE lock pattern is strictly a Postgres race-defence
+// — the test-only insert path on MemStore runs under the same
+// m.mu lock, so a per-kind check is also straightforward if
+// callers need it). The count is here so the Store interface
+// stays single-shape and the apid handler's surface is identical
+// across backends.
+func (m *MemStore) CountEdgeRulesByKindForApp(_ context.Context, appID string, kind EdgeRuleKind) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.countEdgeRulesByKindForAppLocked(appID, kind), nil
+}
+
+// countEdgeRulesByKindForAppLocked is the unlocked variant — the
+// caller MUST hold m.mu. Used by CreateEdgeRuleIfUnderQuota, which
+// already holds m.mu for the duration of the apps-row check and
+// the edge-rule write. Go's sync.Mutex is not reentrant, so calling
+// the public CountEdgeRulesByKindForApp from inside the locked
+// region deadlocks the goroutine. Mirrors the pgstore's tx-side
+// countEdgeRulesByKindForAppTx.
+func (m *MemStore) countEdgeRulesByKindForAppLocked(appID string, kind EdgeRuleKind) int {
+	n := 0
+	for _, r := range m.edgeRules {
+		if r.AppID == appID && r.Kind == kind {
+			n++
+		}
+	}
+	return n
 }
 
 // MatchEdgeRulesForHost is the gateway hot-path read (same shape
