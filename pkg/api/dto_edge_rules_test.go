@@ -1,13 +1,16 @@
-// Whitebox test for EdgeRuleValidateAction.Validate. The dto
-// validator is the first gate a kind=validate rule sees on the
-// create / update path (apid handler calls Validate() before any
-// SQL write); the gateway hot path re-strips external `$ref` and
-// re-compiles at gateway compile time as defence-in-depth, so this
-// test pins the apid-side contract only. Errors surface as a 400
-// `*Problem` (`CodeValidation`); the gateway runtime surface is a
-// distinct 422 `CodeRequestValidationFailed` (pkg/api/errors.go
-// line 1602) and lives in cmd/gatewayd-internal.
-
+// Whitebox tests for EdgeRule*Action.Validate. The dto validator
+// is the first gate every edge rule sees on the create / update
+// path (apid handler calls Validate() before any SQL write); the
+// gateway hot path re-compiles at gateway compile time as defence-
+// in-depth, so these tests pin the apid-side contract only. Errors
+// surface as a 400 `*Problem` (`CodeValidation`); the gateway
+// runtime surface is a distinct 422 `CodeRequestValidationFailed`
+// (pkg/api/errors.go line 1602) and lives in cmd/gatewayd-internal.
+//
+// ADR-091 D24 extends this file with TestEdgeRuleLimitAction_Validate_*
+// — the kind=limit validator. The shape is intentionally tiny (two
+// int fields) because the action is a per-route cap, not a schema
+// document; the apid-side predicate is the entire wire contract.
 package api
 
 import (
@@ -334,5 +337,210 @@ func TestEdgeRuleValidateAction_JSONRoundTrip(t *testing.T) {
 	}
 	if decoded.RejectOnUnknownFields {
 		t.Fatalf("RejectOnUnknownFields round-trip mismatch: got true, want false")
+	}
+}
+
+// --- ADR-091 D24: EdgeRuleLimitAction.Validate() ---------------------
+//
+// Whitebox test for the kind=limit validator. The DTO is a
+// per-route body cap with two integer fields (max_body_bytes,
+// max_body_bytes_streaming); every rejection arm is closed-form
+// against the platform caps in pkg/api/limits.go. The cmd-side
+// compileLimitRules (cmd/gatewayd-internal/edge_rules.go) is the
+// second gate — a direct-DB row that bypassed apid-Validate is
+// clamped there as defence-in-depth, but this test pins the
+// apid-side wire contract.
+//
+// Each row mutates one field of happyEdgeRuleLimitAction() and
+// asserts the returned *Problem.Detail contains wantSub. The
+// streaming-tighter-than-buffered case is the load-bearing shape —
+// a streaming cap that's tighter than the buffered cap would 413
+// every streaming request for a body the buffered path already
+// accepted.
+
+// happyEdgeRuleLimitAction returns a well-formed kind=limit action
+// that passes Validate() unmodified. 5 MiB buffered, no streaming
+// carve-out (the streaming field defaults to 0, which means "no
+// streaming carve-out — fall back to MaxBodyBytes" at the applier).
+func happyEdgeRuleLimitAction() EdgeRuleLimitAction {
+	return EdgeRuleLimitAction{
+		MaxBodyBytes:          5 * 1024 * 1024, // 5 MiB
+		MaxBodyBytesStreaming: 0,
+	}
+}
+
+// TestEdgeRuleLimitAction_Validate_HappyPath pins the canonical
+// in-range action. The exact cap (5 MiB) is below the 25 MiB
+// platform ceiling so this case never trips any of the rejection
+// arms.
+func TestEdgeRuleLimitAction_Validate_HappyPath(t *testing.T) {
+	a := happyEdgeRuleLimitAction()
+	if p := a.Validate(); p != nil {
+		t.Fatalf("happy path returned %v, want nil", p)
+	}
+}
+
+// TestEdgeRuleLimitAction_Validate_Rejects is the table-driven
+// negative arm. Each row mutates one field of the happy action
+// and asserts the returned *Problem.Detail contains wantSub.
+// The substring pin lets a re-wording of unrelated wording not
+// churn the table — the load-bearing substring is the load-bearing
+// predicate name (e.g. "max_body_bytes must be > 0").
+func TestEdgeRuleLimitAction_Validate_Rejects(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(a *EdgeRuleLimitAction)
+		wantSub string
+	}{
+		{
+			// A standalone limit rule with no cap is a silent no-op
+			// (every body passes), the worst shape for a security
+			// feature. apid-Validate rejects with 422.
+			name: "max-body-bytes-zero",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = 0
+			},
+			wantSub: "max_body_bytes must be > 0",
+		},
+		{
+			// Negative buffered cap is meaningless (negative bytes).
+			// Same predicate as the zero case.
+			name: "max-body-bytes-negative",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = -1
+			},
+			wantSub: "max_body_bytes must be > 0",
+		},
+		{
+			// The hard upper bound is MaxRequestBodyBytes (25 MiB).
+			// A limit rule can never widen past the global cap;
+			// if the customer wants to relax the cap on a specific
+			// path they're using the wrong primitive.
+			name: "max-body-bytes-over-platform-cap",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = MaxRequestBodyBytes + 1
+			},
+			wantSub: "exceeds the platform cap",
+		},
+		{
+			// Negative streaming cap is meaningless.
+			name: "max-body-bytes-streaming-negative",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytesStreaming = -1
+			},
+			wantSub: "max_body_bytes_streaming must be >= 0",
+		},
+		{
+			// The streaming cap is hard-clamped at
+			// MaxEdgeRuleLimitBodyBytesStreaming (100 MiB).
+			name: "max-body-bytes-streaming-over-platform-cap",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = 10 * 1024 * 1024 // 10 MiB buffered
+				a.MaxBodyBytesStreaming = int(MaxEdgeRuleLimitBodyBytesStreaming) + 1
+			},
+			wantSub: "exceeds the streaming platform cap",
+		},
+		{
+			// Load-bearing shape: a streaming cap tighter than the
+			// buffered cap would 413 every streaming request for a
+			// body the buffered path already accepted. The wire
+			// contract bans this.
+			name: "max-body-bytes-streaming-tighter-than-buffered",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = 10 * 1024 * 1024         // 10 MiB buffered
+				a.MaxBodyBytesStreaming = 5 * 1024 * 1024 // 5 MiB streaming
+			},
+			wantSub: "must be >= max_body_bytes",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := happyEdgeRuleLimitAction()
+			tc.mutate(&a)
+			p := a.Validate()
+			if p == nil {
+				t.Fatalf("Validate() = nil, want *Problem containing %q", tc.wantSub)
+			}
+			if !strings.Contains(p.Detail, tc.wantSub) {
+				t.Errorf("Detail = %q, want substring %q", p.Detail, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestEdgeRuleLimitAction_Validate_NilReceiver pins the
+// nil-receiver arm. Same posture as the validate action
+// (cmd/apid/handlers_edge_rules.go:117) — the dispatcher checks
+// `a == nil` first because Go's reflect-based dispatch would
+// panic on a nil pointer. Validate() must short-circuit with a
+// 422 problem, not crash.
+func TestEdgeRuleLimitAction_Validate_NilReceiver(t *testing.T) {
+	var a *EdgeRuleLimitAction
+	p := a.Validate()
+	if p == nil {
+		t.Fatal("nil receiver returned nil, want *Problem")
+	}
+	if !strings.Contains(p.Detail, "limit action is required") {
+		t.Errorf("Detail = %q, want substring %q", p.Detail, "limit action is required")
+	}
+}
+
+// TestEdgeRuleLimitAction_Validate_Accepts is the positive twin of
+// TestEdgeRuleLimitAction_Validate_Rejects. It pins the boundary
+// cases the rejects table leaves implicit — exactly-at-the-cap,
+// streaming-equal-to-buffered, streaming-loose. The boundary-equal
+// cases are the regression-trap: a future refactor that flips
+// `>=` to `>` for the streaming-vs-buffered check would let
+// streaming-equal pass through validate but the compiled rule
+// would emit a 413 on every same-cap streaming request.
+func TestEdgeRuleLimitAction_Validate_Accepts(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(a *EdgeRuleLimitAction)
+	}{
+		{
+			name: "exactly-at-buffered-platform-cap",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = MaxRequestBodyBytes // exactly 25 MiB
+			},
+		},
+		{
+			name: "exactly-at-streaming-platform-cap",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = 10 * 1024 * 1024                                 // 10 MiB buffered
+				a.MaxBodyBytesStreaming = int(MaxEdgeRuleLimitBodyBytesStreaming) // 100 MiB
+			},
+		},
+		{
+			// Streaming EQUAL to buffered (the boundary case the
+			// rejects table leaves implicit). The Validate() must
+			// pass — the rule means "no relaxation, no
+			// tightening", the streaming field is essentially a
+			// no-op in this shape.
+			name: "streaming-equal-to-buffered",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = 5 * 1024 * 1024
+				a.MaxBodyBytesStreaming = 5 * 1024 * 1024
+			},
+		},
+		{
+			// Streaming looser than buffered (the canonical happy
+			// shape for a customer who wants a bigger cap on
+			// streaming requests than on buffered ones).
+			name: "streaming-looser-than-buffered",
+			mutate: func(a *EdgeRuleLimitAction) {
+				a.MaxBodyBytes = 5 * 1024 * 1024
+				a.MaxBodyBytesStreaming = 50 * 1024 * 1024
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := happyEdgeRuleLimitAction()
+			tc.mutate(&a)
+			if p := a.Validate(); p != nil {
+				t.Errorf("Validate() = %v, want nil", p)
+			}
+		})
 	}
 }

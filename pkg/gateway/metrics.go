@@ -668,7 +668,7 @@ func NewMetrics() *Metrics {
 	// triple. The closed set guarantees the §12 dashboard panel
 	// "edge rule match rate" surfaces every (kind, outcome)
 	// tuple from first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit"} {
 		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
@@ -715,7 +715,7 @@ func NewMetrics() *Metrics {
 	// set: {route, rewrite, redirect, headers, cors, jwt, ip}. Adding
 	// a new kind requires extending this slice — the metric name is
 	// stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit"} {
 		for _, result := range []string{"success", "error"} {
 			m.edgeRuleApply.WithLabelValues(kind, result)
 		}

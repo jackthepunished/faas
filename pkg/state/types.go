@@ -3086,6 +3086,19 @@ const (
 	// See migrations/00214_edge_rules_kind_validate.sql for the
 	// schema CHECK widening.
 	EdgeRuleKindValidate EdgeRuleKind = "validate"
+	// EdgeRuleKindLimit caps the inbound request body at a per-rule
+	// byte threshold before the wake gate; an oversize request is
+	// rejected with 413 request_too_large without paying a cold-boot
+	// cost. The cap is the standalone primitive (vs the validate
+	// kind's body-cap side effect): a customer who only wants
+	// per-route body-size protection declares this kind without
+	// shipping a JSON Schema. Plan-gated Free-and-above (no
+	// IsPaidOnly change). MaxBodyBytes ≤ api.MaxRequestBodyBytes
+	// (buffered path) and an optional MaxBodyBytesStreaming ≤
+	// api.MaxBodyBytesStreaming (streaming opt-in); both clamped
+	// at apid-create time. See migrations/00219_edge_rules_kind_limit.sql
+	// for the schema CHECK widening.
+	EdgeRuleKindLimit EdgeRuleKind = "limit"
 )
 
 // IsValid reports whether k is a closed-set kind. New kinds land via
@@ -3095,7 +3108,7 @@ func (k EdgeRuleKind) IsValid() bool {
 	switch k {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
-		EdgeRuleKindIP, EdgeRuleKindValidate:
+		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit:
 		return true
 	}
 	return false
@@ -3218,6 +3231,25 @@ type EdgeRuleValidateAction struct {
 	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
 }
 
+// EdgeRuleLimitAction carries the per-rule body caps for kind=limit.
+// MaxBodyBytes is the buffered-path cap (≤ api.MaxRequestBodyBytes,
+// 25 MiB); MaxBodyBytesStreaming is the streaming opt-in cap (≤
+// api.MaxBodyBytesStreaming, 100 MiB). The streaming cap defaults to
+// 0 ("unspecified") and only takes effect on requests that opt into
+// the streaming response path (operator gate FAAS_GATEWAY_STREAMING +
+// app-level streaming_enabled + request Accept: application/json);
+// non-streaming requests still cap at MaxBodyBytes.
+//
+// Clamps and the negative-rejection check live in
+// pkg/api/dto.go::EdgeRuleLimitAction.Validate. The state mirror
+// carries the values verbatim so the gatewayd compile step can
+// defence-in-depth against any direct-DB write that bypassed
+// apid-Validate (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect).
+type EdgeRuleLimitAction struct {
+	MaxBodyBytes          int `json:"max_body_bytes"`
+	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
+}
+
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
 // as jsonb. The wire shape lives in pkg/api/dto.go (one struct per
 // kind); the state-side mirror is intentionally minimal — the
@@ -3240,6 +3272,13 @@ type EdgeRuleAction struct {
 	// enforced in pkg/api/dto.go::EdgeRuleValidateAction.Validate
 	// at apid-create time; the state mirror carries them verbatim.
 	Validate *EdgeRuleValidateAction `json:"validate,omitempty"`
+	// Limit carries the per-rule body caps for kind=limit.
+	// MaxBodyBytes is the buffered-path cap; MaxBodyBytesStreaming
+	// is the streaming opt-in cap (0 = unspecified, defer to
+	// MaxBodyBytes). The companion validate kind's MaxBodyBytes
+	// stays — it is the "cap the body I am about to schema-check"
+	// knob; kind=limit is the standalone gate.
+	Limit *EdgeRuleLimitAction `json:"limit,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.

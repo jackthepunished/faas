@@ -3924,6 +3924,76 @@ func (a *EdgeRuleValidateAction) Validate() *Problem {
 	return nil
 }
 
+// EdgeRuleLimitAction is the wire shape for a kind=limit edge rule
+// (ADR-091 D24). The standalone body-size primitive: a customer
+// who only wants per-route body-size protection ("POST /upload
+// ≤ 5 MB, POST /users ≤ 1 MB, POST /webhooks ≤ 2 MB") declares
+// this kind without shipping a JSON Schema. The hot-path applier
+// (pkg/gateway.(*Handler).applyEdgeRuleLimit, §4.1.2.8c) installs
+// http.MaxBytesReader on r.Body at the per-rule cap and short-
+// circuits oversize requests with 413 request_too_large — and,
+// more importantly, performs a Content-Length fast-path deny so
+// a 30 MB body on a 5 MB cap costs zero bytes of buffering.
+//
+// Field-by-field:
+//
+//   - MaxBodyBytes: required buffered-path cap. Must be > 0 and
+//     ≤ MaxRequestBodyBytes (25 MiB). 0 is rejected with 422 —
+//     a standalone limit rule with no cap is a silent no-op,
+//     worst shape for a security feature. The hard upper bound
+//     matches MaxRequestBodyBytes so a kind=limit rule can never
+//     widen past the global cap; if the customer wants to relax
+//     the cap on a specific path they're using the wrong
+//     primitive (this kind is strictly a tightening primitive).
+//   - MaxBodyBytesStreaming: optional streaming opt-in cap (≤
+//     MaxEdgeRuleLimitBodyBytesStreaming = 100 MiB, ADR-080
+//     raw-bridge parity). 0 = no streaming carve-out, the
+//     buffered MaxBodyBytes is the cap on both paths. Must be
+//     ≥ MaxBodyBytes when set — a streaming cap that is
+//     TIGHTER than the buffered cap would 413 every streaming
+//     request for a body that was already accepted as buffered,
+//     which is a wire-shape footgun. Runtime enforcement of
+//     this field is deferred to a follow-up PR (stated in
+//     ADR-091 D24 §6); the field is declared, clamped here, and
+//     clamped again at cmd-side compileLimitRules so a future
+//     runbook can wire enforcement without schema churn.
+type EdgeRuleLimitAction struct {
+	MaxBodyBytes          int `json:"max_body_bytes"`
+	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
+}
+
+func (a *EdgeRuleLimitAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("limit action is required")
+	}
+	if a.MaxBodyBytes <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes must be > 0 (got %d) — a standalone limit rule with no cap is a silent no-op; use kind=validate if you need a body cap alongside a JSON Schema",
+			a.MaxBodyBytes))
+	}
+	if a.MaxBodyBytes > MaxRequestBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes exceeds the platform cap (%d > %d)",
+			a.MaxBodyBytes, MaxRequestBodyBytes))
+	}
+	if a.MaxBodyBytesStreaming < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming must be >= 0 (got %d)",
+			a.MaxBodyBytesStreaming))
+	}
+	if int64(a.MaxBodyBytesStreaming) > MaxEdgeRuleLimitBodyBytesStreaming {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming exceeds the streaming platform cap (%d > %d)",
+			MaxEdgeRuleLimitBodyBytesStreaming, a.MaxBodyBytesStreaming))
+	}
+	if a.MaxBodyBytesStreaming > 0 && a.MaxBodyBytesStreaming < a.MaxBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming (%d) must be >= max_body_bytes (%d) when set — a streaming cap tighter than the buffered cap would 413 every streaming request for a body already accepted as buffered",
+			a.MaxBodyBytesStreaming, a.MaxBodyBytes))
+	}
+	return nil
+}
+
 // EdgeRuleResponse is the wire shape for an edge rule. Action is
 // kept as json.RawMessage so the generated Node/Python SDKs don't
 // need seven per-kind models today; a typed SDK unmarshals into

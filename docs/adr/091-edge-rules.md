@@ -476,6 +476,169 @@ broken citations; the next ADR to land in 092-099 should re-do the sweep.
 - **No resource-scope change:** edge rules remain **per-app**, not per-org.
   The org-scope resolution (ADR-190 PR-4) doesn't extend them.
 
+---
+
+## D24 — kind=limit (ADR-091 D24, 2026-08-11)
+
+### Decision
+
+Add a **ninth** edge-rule kind, **`limit`**, whose action is a single
+`max_body_bytes` integer (with an optional `max_body_bytes_streaming`
+companion). The primitive is the standalone body-size gate: a customer
+who only wants per-route body-size protection ("POST /upload ≤ 5 MB,
+POST /users ≤ 1 MB, POST /webhooks ≤ 2 MB") declares this kind without
+shipping a JSON Schema. Hot-path placement is §4.1.2.8c — after
+`applyEdgeRuleIP` (so rejected-on-IP traffic never costs a body read)
+and before the global `MaxBytesReader` at `handler.go:2789` (so the
+per-rule cap is the OUTER reader on the in-limit path; the global
+reader layers inside as the backstop for requests that don't match
+any limit rule).
+
+### Field-by-field
+
+| Field | Type | Required | Bounds | Behaviour |
+|---|---|---|---|---|
+| `max_body_bytes` | int | yes | `(0, MaxRequestBodyBytes]` (1…26214400) | Buffered-path cap. `0` rejected at create-time as 422 (a standalone limit rule with no cap is a silent no-op, worst shape for a security feature — use `kind=validate` if you need a cap alongside a JSON Schema). |
+| `max_body_bytes_streaming` | int | no | `[0, MaxEdgeRuleLimitBodyBytesStreaming]` (0…104857600); when >0 must be ≥ `max_body_bytes` | Streaming opt-in cap. `0` = no streaming carve-out (the buffered `max_body_bytes` is the cap on both paths). The wire contract bans streaming-tighter-than-buffered: it would 413 every streaming request for a body already accepted as buffered. |
+
+### Why §4.1.2.8c (between IP and the global reader)
+
+The placement is load-bearing for the **Content-Length fast path**.
+A `Content-Length: 30 MiB` header against a 5 MiB rule, at this
+slot, denies with 413 + RFC 7807 + `edge_rule.limit_rejected` audit
++ `match_total{kind="limit",outcome="blocked"}` metric, AND the
+fake backend's `Pick` is never called — the test
+`TestApplyEdgeRuleLimit_ContentLengthFastPath_DenyBeforeBackendPick`
+is the load-bearing regression pin (`pickCalls.Load() == 0`).
+
+If the applier ran AFTER the global `MaxBytesReader`, a bare
+`MaxBytesReader` would still trip on the proxy leg's first read,
+but at the cost of having the 30 MB body in memory first — a
+regression from "never buffer an oversize body" to "buffer and
+recover". The §4.1.2.8c placement guarantees the fast path fires
+BEFORE the global reader wraps `r.Body`.
+
+### Cross-account posture (ADR-091 D5)
+
+Mirrors `applyEdgeRuleValidate`'s posture at `handler.go:1688–1706`:
+a rule owned by a different account is a defense-in-depth no-op —
+the handler writes no response, returns `false`, emits
+`edge_rule.limit_blocked` audit, observes `match="blocked"` +
+`apply="success"` (so the §12 dashboard chip doesn't falsely flag
+the cross-account rule as a wire error). A regression that let
+cross-account rules enforce would let any customer 413 another
+customer's traffic; the test
+`TestApplyEdgeRuleLimit_CrossAccount_DefenceInDepthNoOp` pins
+this exactly (`pickCalls.Load() == 1` confirms the proxy leg
+was reached).
+
+### Relationship to kind=validate's `max_body_bytes`
+
+Kept, NOT deprecated. The semantic split is:
+
+- `kind=validate.max_body_bytes` = "cap the body I'm about to
+  schema-check". The applier at `handler.go:1746–1749` installs
+  the cap as an INNER reader around the buffered body, with the
+  global reader at `handler.go:2789` as the OUTER backstop. A
+  customer who wants both validation and a per-route cap uses
+  this knob.
+- `kind=limit.max_body_bytes` = standalone gate. The applier
+  installs the cap as an INNER reader around the body, with the
+  global reader at `handler.go:2789` as the OUTER backstop. A
+  customer who wants only the cap uses this kind.
+
+The two paths share the same underlying primitive (per-rule
+`MaxBytesReader`) but surface different control surfaces:
+validate couples the cap with schema checking, limit couples
+the cap with nothing else. A customer who declared a
+`kind=validate.max_body_bytes` rule today can migrate to
+`kind=limit` in a follow-up PR (no schema is required for the
+limit path, but they'd need to drop the schema from the validate
+path or keep both rules side-by-side).
+
+### Streaming carve-out — deferred
+
+The rule carries `max_body_bytes_streaming` (≤ 100 MiB per
+`pkg/api.RawStreamMaxRequestBytes`, ADR-080 raw-bridge parity).
+The DTO + apid-Validate + cmd-side compile clamps are all in
+place. **Runtime enforcement of the streaming field is deferred
+to a follow-up PR** — the load-bearing reason: detecting the
+streaming opt-in path at the §4.1.2.8c slot requires
+`isAcceptJSON(r.Header.Get("Accept"))` + `h.streamingEnabled` +
+`app.StreamingEnabled`, all of which live further down the
+chain at `handler.go:3019`. Pulling that detection above the
+§4.1.2.8c slot would tangle the rule-application order with the
+proxy configuration; the cleaner refactor is a follow-up PR
+that exposes a streaming-detected seam the rule appliers can
+consult. Until that ships, `max_body_bytes_streaming` is
+declared and persisted, but the applier falls back to
+`max_body_bytes` for both paths. Stated explicitly so a future
+operator doesn't confuse "the field exists in the API" with
+"the field is enforced at request time".
+
+### Test coverage
+
+| Test | Pins |
+|---|---|
+| `TestPickFirstLimitMatch_PriorityOrdering` | First-match-wins; priority ASC, methods filter, path-glob filter — same contract as every other kind. |
+| `TestPickFirstLimitMatch_PathGlob` | `/api/*` glob excludes `/healthz`; matches `/api/users`. |
+| `TestPickFirstLimitMatch_MethodsFilter` | POST-only rule excludes GET at priority 0. |
+| `TestEdgeRuleReset_WholesaleAcrossAllNineKinds` | Reset() drops all 9 kinds (route/rewrite/redirect/headers/cors/jwt/ip/validate/limit) — a regression that bound only 8 kinds trips this test. |
+| `TestEdgeRuleLimitAction_Validate_HappyPath` | In-range action passes. |
+| `TestEdgeRuleLimitAction_Validate_Rejects` | 0 / negative / over-cap / negative-streaming / over-streaming-cap / streaming-tighter-than-buffered → 422 with substring-pinned Detail. |
+| `TestEdgeRuleLimitAction_Validate_Accepts` | Boundary-at-cap, streaming-equal-to-buffered, streaming-looser-than-buffered all pass. |
+| `TestEdgeRuleLimitAction_Validate_NilReceiver` | Nil pointer → 422 (no panic on Go's reflect-dispatch). |
+| `TestApplyEdgeRuleLimit_ContentLengthFastPath_DenyBeforeBackendPick` | The load-bearing assertion: 30 MiB CL + 5 MiB rule → 413 + `pickCalls == 0`. |
+| `TestApplyEdgeRuleLimit_InLimit_InstallsMaxBytesReader` | In-limit body → `pickCalls == 1` + match/match + apply/success. |
+| `TestApplyEdgeRuleLimit_CrossAccount_DefenceInDepthNoOp` | Cross-tenant rule → `pickCalls == 1` + match/blocked + apply/success (defense-in-depth). |
+| `TestApplyEdgeRuleLimit_NilMatcher_PassThrough` | `h.edgeRules == nil` → no panic, falls through. |
+| `TestApplyEdgeRuleLimit_CapClamp_DefenceInDepth` | Direct-DB row with `MaxBodyBytes = 1 GiB` (bypassed apid-Validate) → 30 MiB CL still trips 413. |
+| `TestMigrations_00219_EdgeRulesKindLimit` | 00219 migration applies cleanly; CHECK constraint carries 9-value vocab; `kind='limit'` round-trips; `kind='limit_typo'` → 23514; replay safety. |
+
+### Rejected alternatives
+
+- **Reuse `kind=validate`'s `max_body_bytes` knob instead of
+  shipping a separate kind.** Rejected — a customer who wants
+  ONLY a cap shouldn't be forced to ship a JSON Schema
+  (`{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}`
+  to satisfy the validate kind's required `schema` field).
+  Coupling a security primitive to a schema declaration is
+  user-hostile.
+- **Per-deployment `max_body_bytes` column on `apps` /
+  `deployments`.** Rejected — CLAUDE.md pins apid as the only
+  writer to customer-intent tables; adding a column there
+  would touch customer-intent migrations and conflict with the
+  edge-rule feature surface (per-app, per-deployment scope is
+  already covered by edge rules).
+- **Plan-level matrix entry for body size.** Rejected — no
+  precedent in `pkg/api.Limits`; the four plan rows
+  (Free/Hobby/Pro/Scale) already share the same
+  `MaxRequestBodyBytes = 25 MiB` baseline.
+- **Replace the global 25 MiB reader with a per-rule lookup.**
+  Rejected — the global reader is the BACKSTOP for requests
+  that don't match any rule. Removing it would create a
+  security hole (no cap when no rule matches). The §4.1.2.8c
+  layering keeps the global reader as the inner backstop and
+  the per-rule reader as the outer tightening.
+
+### Migration slot 00219
+
+The 9-value vocab migration (DROP+ADD CHECK, replay-safe) lands
+at `migrations/00219_edge_rules_kind_limit.sql`. Two fences at
+`migrations/00217_reserve_slot.sql` (PR #849 ADR-092
+app_secrets_scope) and `migrations/00218_reserve_slot.sql`
+(preview-environments). The migration test
+`migrations/00219_edge_rules_kind_limit_test.go` pins all 9
+values present, all 8 pre-existing kinds still accept, and the
+`pg_get_constraintdef` substring shape per
+`pg-get-constraintdef-shapes.md`.
+
+When PR #845 (kind=geo) lands, its migration must widen the
+CHECK to 10 values including both `'geo'` and `'limit'`. The
+CHECK-rewrite race is documented in the migration's header
+comment; a regression that widens the CHECK without including
+both new values trips the migration test.
+
 ## Amendment (issue #561 / PR #838, 2026-08-11): observability cluster
 
 PR-A (#837, 2026-08-11) registered and pre-instantiated two Prometheus
