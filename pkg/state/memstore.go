@@ -7376,8 +7376,8 @@ func (m *MemStore) ClaimPaddleOverageWindow(_ context.Context, accountID string,
 // completed).
 //
 // Field-name note: `mbSecondsSum` here mirrors the production
-// column `pushed_mb_seconds` (migration 00200). The Sum suffix
-// predates the 00200 rename and is kept for backwards compatibility
+// column `pushed_mb_seconds` (migration 00204). The Sum suffix
+// predates the 00204 rename and is kept for backwards compatibility
 // with the existing memstore test fixtures; the value is the
 // last-completed window's integer stamp, not a cumulative sum.
 func (m *MemStore) CompletePaddleOverageWindow(_ context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {

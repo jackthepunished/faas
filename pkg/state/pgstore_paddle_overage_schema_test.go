@@ -45,7 +45,7 @@ import (
 )
 
 // TestPgStorePaddleOverageDedupeSchema_PostApply is the happy
-// path: after migrations 00034 + 00041 + 00200 apply, the probe
+// path: after migrations 00034 + 00041 + 00204 apply, the probe
 // reports the four 00041 columns + non-zero counts. The two
 // claims + one complete seed mirrors what meterd produces in
 // production over a two-window stretch.
@@ -96,7 +96,7 @@ func TestPgStorePaddleOverageDedupeSchema_PostApply(t *testing.T) {
 		t.Fatalf("PaddleOverageDedupeSchema: %v", err)
 	}
 	if !res.TableExists {
-		t.Errorf("TableExists = false post-apply, want true (migrations 00034 + 00041 + 00200 must have created paddle_overage_dedupe)")
+		t.Errorf("TableExists = false post-apply, want true (migrations 00034 + 00041 + 00204 must have created paddle_overage_dedupe)")
 	}
 	if !res.HasWindowStart || !res.HasState || !res.HasClaimedAt || !res.HasClaimedBy {
 		t.Errorf("all HasX must be true post-apply; got %+v (a future migration that drops one of the 00041 columns would flip this red)", res)
