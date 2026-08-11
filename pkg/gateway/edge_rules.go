@@ -233,7 +233,20 @@ type EdgeRuleIPResolved struct {
 // is the only invalidation — single-box scale assumption per
 // spec §4.3. Mirrors `RouteCache` at `pkg/gateway/routes.go:11-96`.
 type EdgeRuleCache struct {
-	mu   sync.Mutex
+	// mu (ADR-091 hardening PR-A) is a sync.RWMutex rather than the
+	// previous sync.Mutex. The hot path is read-dominant (every
+	// cache hit + every cache miss walks the map under at least an
+	// RLock), and Reset / Put are infrequent (Reset fires only on
+	// db.NotifyEdgeRuleChanged; Put fires only on a loader's
+	// compile-and-fill). Widening to RWMutex lets concurrent hits
+	// proceed without serialising on a write lock; misses that
+	// trigger a Put wait until the loader releases the write lock,
+	// which is the established semantic for the structural twin
+	// pkg/gateway/public_auth_cache.go:46-162. MoveToFront under
+	// write-lock is a container/list O(1) op that holds the
+	// critical section for nanoseconds; the value-copy before
+	// re-acquiring the write lock keeps the RLock phase short.
+	mu   sync.RWMutex
 	cap  int
 	ll   *list.List               // front = most recently used
 	byID map[string]*list.Element // host → element (element.Value is *HostEntry)
@@ -388,9 +401,32 @@ func (c *EdgeRuleCache) GetIP(host string) ([]EdgeRuleIPResolved, bool) {
 
 // getEntry promotes the entry on hit and returns it. Internal —
 // the Get* family wraps this so each returns a typed slice.
+//
+// Lock discipline (ADR-091 hardening PR-A): RLock for the entry
+// fetch + value-copy, Lock only for the MoveToFront (a
+// container/list O(1) mutation that must be exclusive). The pattern
+// mirrors pkg/gateway/public_auth_cache.go:130-147 (fast-path
+// RLock + slow-path Lock-on-evict with double-checked re-acquire).
+// A racing Put between the RUnlock and the Lock may have replaced
+// the entry (or evicted it); the post-re-acquire `el, ok := …`
+// re-check handles that case — if the host is gone, the caller
+// sees a clean miss and the loader re-hits PG on the next Get.
 func (c *EdgeRuleCache) getEntry(host string) (*HostEntry, bool) {
+	c.mu.RLock()
+	_, ok := c.byID[host]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Re-check under the write lock: a concurrent Reset / Put may
+	// have evicted or replaced the entry between RUnlock and Lock.
+	// container/list addresses are stable across Reset (we re-init
+	// ll but the old elements are unreachable), so it's enough to
+	// look the element up by the host key again and discard the
+	// pre-Lock value. The discard is intentional — staticcheck
+	// (SA4006) flags the pre-Lock `el` as unused otherwise.
 	el, ok := c.byID[host]
 	if !ok {
 		return nil, false

@@ -105,6 +105,25 @@ type Metrics struct {
 	// at boot below. PR 4-7 extend kind; the outcome set is
 	// stable across all kinds.
 	edgeRuleMatch *prometheus.CounterVec
+	// edgeRuleApply (ADR-091 hardening PR-A): counter of apply-path
+	// outcomes, distinct from edgeRuleMatch (which counts the
+	// matcher's pick). A rule can MATCH the matcher but FAIL at apply
+	// time (e.g. JWT verify returns ErrJWKSNotRegistered, or an IP
+	// rule's CIDR list is empty after redaction). The {kind, result}
+	// labels partition success / error so the §12 dashboard chip
+	// "edge rule apply rate" surfaces from first scrape. result is
+	// one of {success, error} — a 2-element closed set; expanding it
+	// requires a new metric (the apply-error mix is its own surface).
+	edgeRuleApply *prometheus.CounterVec
+	// edgeRuleCompileError (ADR-091 hardening PR-A): counter of
+	// compile-time failures inside the cmd-side loader
+	// (cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs). A
+	// non-zero value here means a rule shipped broken — the loader
+	// silently dropped the offending rule and is serving traffic
+	// without it. The {kind} label is one of the seven shipped
+	// kinds; the counter surfaces the signal even when the
+	// loader's WARN log is drowned by other gatewayd-internal noise.
+	edgeRuleCompileError *prometheus.CounterVec
 	// responseBytes: ADR-046 PR-2 producer observability.
 	// Counter labelled by app (UUID, bounded by per-plan app
 	// quotas) and plan (Free|Hobby|Pro|Scale — closed set). The
@@ -299,6 +318,20 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_match_total",
 			Help: "Edge-rule matcher outcomes, labelled by kind and outcome (match|miss|blocked). ADR-089 PR 3.",
 		}, []string{"kind", "outcome"}),
+		// ADR-091 hardening PR-A — apply-path outcomes (distinct from
+		// the matcher pick). result is a closed {success, error} set.
+		edgeRuleApply: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_edge_rule_apply_total",
+			Help: "Edge-rule apply-path outcomes, labelled by kind and result (success|error). ADR-091 hardening PR-A.",
+		}, []string{"kind", "result"}),
+		// ADR-091 hardening PR-A — compile-time drops in the cmd-side
+		// loader (path-glob parse / CIDR parse failures). Non-zero means
+		// a rule shipped broken; the §12 dashboard chip "edge rule
+		// compile errors" pages on any increment.
+		edgeRuleCompileError: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_edge_rule_compile_error_total",
+			Help: "Edge-rule compile-time failures in the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
+		}, []string{"kind"}),
 		wakeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "gateway_wake_latency_seconds",
 			Help: "End-to-end latency from request received to first upstream byte after a cold wake.",
@@ -543,6 +576,18 @@ func NewMetrics() *Metrics {
 	for _, outcome := range []string{"match", "miss", "blocked", "failed", "missing"} {
 		m.edgeRuleMatch.WithLabelValues("jwt", outcome)
 	}
+	// ADR-091 hardening PR-A — pre-instantiate the apply-path
+	// (kind, result) and compile-error (kind) label sets so the §12
+	// dashboard chip "edge rule apply rate" + "edge rule compile
+	// errors" surface every tuple from first scrape. Adding a new
+	// kind (e.g. kind=rate_limit per ADR-091 D20.5) requires
+	// extending the outer slice below — the metric name is stable.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+		for _, result := range []string{"success", "error"} {
+			m.edgeRuleApply.WithLabelValues(kind, result)
+		}
+		m.edgeRuleCompileError.WithLabelValues(kind)
+	}
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)
 	}
@@ -575,7 +620,7 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.streamActive.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError)
 	return m
 }
 
@@ -770,6 +815,34 @@ func (m *Metrics) ObserveEdgeRuleMatch(kind, outcome string) {
 		return
 	}
 	m.edgeRuleMatch.WithLabelValues(kind, outcome).Inc()
+}
+
+// ObserveEdgeRuleApply (ADR-091 hardening PR-A) increments the
+// apply-path counter after an applyEdgeRule* helper returns.
+// kind is one of the seven shipped kinds; result is the closed
+// {success, error} set. Callers MUST invoke this on every apply
+// return so the §12 dashboard chip "edge rule apply rate" tracks
+// every gate, including the no-op ones (apply returned false but
+// "success" — e.g. JWT verify returned claims with no error).
+// Nil-receiver-safe: tests that don't thread metrics still pass.
+func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
+	if m == nil {
+		return
+	}
+	m.edgeRuleApply.WithLabelValues(kind, result).Inc()
+}
+
+// ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments
+// the compile-error counter from the cmd-side loader at every
+// path-glob / CIDR parse drop inside warnPathGlobErrs. The
+// pre-instantiated {kind} label set means any non-zero scrape
+// value pages the operator — a rule shipped broken is an
+// actionable correctness signal, not a headroom signal.
+func (m *Metrics) ObserveEdgeRuleCompileError(kind string) {
+	if m == nil {
+		return
+	}
+	m.edgeRuleCompileError.WithLabelValues(kind).Inc()
 }
 
 // ObserveWakeSnapshotTier (issue #470 / PR #470-FU-B) increments

@@ -1411,6 +1411,7 @@ type stubEdgeRuleMatcher struct {
 	rewrite  *EdgeRuleRewriteResolved
 	redirect *EdgeRuleRedirectResolved
 	headers  *EdgeRuleHeadersResolved
+	jwt      *EdgeRuleJWTResolved
 }
 
 func (s stubEdgeRuleMatcher) MatchRewrite(_ context.Context, _, _, _ string) *EdgeRuleRewriteResolved {
@@ -1423,6 +1424,13 @@ func (s stubEdgeRuleMatcher) MatchRedirect(_ context.Context, _, _, _ string) *E
 
 func (s stubEdgeRuleMatcher) MatchHeaders(_ context.Context, _, _, _ string) *EdgeRuleHeadersResolved {
 	return s.headers
+}
+
+// MatchJWT (PR-A regression coverage) — returns s.jwt verbatim.
+// The handler's applyEdgeRuleJWT miss path must NOT dereference
+// rule.ID when rule == nil; see TestApplyEdgeRuleJWT_MissPath_*.
+func (s stubEdgeRuleMatcher) MatchJWT(_ context.Context, _, _, _ string) *EdgeRuleJWTResolved {
+	return s.jwt
 }
 
 // TestMatchAndApplyRewrite_PrefixAddToSlash_NoDoubleSlash pins the
@@ -1536,4 +1544,82 @@ func TestServeHTTP_RedirectObservePassesPlanLabel(t *testing.T) {
 	if strings.Contains(body, `plan="acct-1"`) {
 		t.Errorf("metric plan label carries account ID (review-fix F1 regression); body:\n%s", body)
 	}
+}
+
+// TestApplyEdgeRuleJWT_MissPath_NoNilDeref is the regression test
+// for the /code-review finding on PR-A: the jwtEmit consolidator
+// initially read rule.ID on the rule == nil miss path, which
+// nil-pointer-derefed on every JWT miss. The fix drops the audit
+// emit on a clean miss (mirrors the pre-PR-A behaviour: metric
+// increment only — an audit row for "no JWT rule for this host"
+// would be 100% noise) and the handler returns false (no-op for
+// the apply chain). This test pins that contract so future
+// refactors of jwtEmit cannot reintroduce the nil-deref.
+func TestApplyEdgeRuleJWT_MissPath_NoNilDeref(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "j.example.com",
+		upstream: "127.0.0.1:0", // unreachable; the test asserts we never reach it
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	// jwt verifier stub — MatchJWT returns nil (the clean-miss case).
+	// WithJWTVerifier is required so the nil-check in applyEdgeRuleJWT
+	// passes; the verifier's Verify is never called on this path.
+	called := int32(0)
+	stub := &countingJWTVerifier{onVerify: func(_ context.Context, _ string, _ *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		atomic.AddInt32(&called, 1)
+		return nil, nil
+	}}
+	h.WithEdgeRules(stubEdgeRuleMatcher{jwt: nil}, nil, nil)
+	h.WithJWTVerifier(stub)
+
+	req := httptest.NewRequest("GET", "http://j.example.com/", nil)
+	req.Header.Set("Authorization", "Bearer some-token")
+	rec := httptest.NewRecorder()
+
+	// Must not panic on the rule == nil miss path. The handler
+	// returns false from applyEdgeRuleJWT, which means the gate
+	// chain falls through to the regular request flow.
+	h.ServeHTTP(rec, req)
+
+	if got := atomic.LoadInt32(&called); got != 0 {
+		t.Errorf("verifier.Verify called %d times on miss path; want 0", got)
+	}
+	// Match counter should have fired exactly once.
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, " 1") {
+		t.Errorf("expected jwt+miss counter at 1, body:\n%s", body)
+	}
+}
+
+// bodyForCounter scrapes /metrics from m and returns the body as a
+// string. Counter-specific label filtering is left to the caller via
+// substring matching — Prometheus exposition doesn't index by
+// metric name in the handler_test context. Mirrors the existing
+// bodyForHistogram helper's shape.
+func bodyForCounter(t *testing.T, m *Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics returned %d", rec.Code)
+	}
+	return rec.Body.String()
+}
+
+// countingJWTVerifier is a stub JWTVerifier that counts Verify calls
+// without performing any signature/claim work — used by the miss-path
+// regression test to confirm Verify is never reached when MatchJWT
+// returns nil.
+type countingJWTVerifier struct {
+	onVerify func(ctx context.Context, raw string, rule *EdgeRuleJWTResolved) (*JWTClaims, error)
+}
+
+func (c *countingJWTVerifier) Verify(ctx context.Context, raw string, rule *EdgeRuleJWTResolved) (*JWTClaims, error) {
+	return c.onVerify(ctx, raw, rule)
 }

@@ -1285,23 +1285,23 @@ func (h *Handler) applyEdgeRuleJWT(w http.ResponseWriter, r *http.Request, app A
 	}
 	rule := h.edgeRules.MatchJWT(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
 	if rule == nil {
+		// Clean miss: no rule for this host. The match counter
+		// surfaces this on the §12 dashboard chip; an audit row
+		// here would be 100% noise (every request that doesn't
+		// hit a JWT rule for this host). Match the pre-PR-A
+		// behaviour: metric increment only, no audit emit. (The
+		// original code at lines 1287-1292 of PR-A's parent
+		// commit did the same.)
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("jwt", "miss")
 		}
 		return false
 	}
 	if rule.AccountID != app.AccountID {
-		if h.edgeRuleAudit != nil {
-			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.jwt_blocked", &rule.AccountID, map[string]any{
-				"rule_id":         rule.ID,
-				"from_host":       r.Host,
-				"rule_account_id": rule.AccountID,
-				"app_account_id":  app.AccountID,
-			})
-		}
-		if h.metrics != nil {
-			h.metrics.ObserveEdgeRuleMatch("jwt", "blocked")
-		}
+		h.jwtEmit(r.Context(), "jwt", "blocked", rule.ID, r.Host, &rule.AccountID, map[string]any{
+			"rule_account_id": rule.AccountID,
+			"app_account_id":  app.AccountID,
+		})
 		return false
 	}
 	raw := bearerTokenFromHeader(r.Header.Get("Authorization"))
@@ -1309,44 +1309,69 @@ func (h *Handler) applyEdgeRuleJWT(w http.ResponseWriter, r *http.Request, app A
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
 			api.CodeUnauthorized, "Missing bearer token",
 			"Authorization: Bearer <token> required for this edge rule"))
-		if h.edgeRuleAudit != nil {
-			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.jwt_missing", nil, map[string]any{
-				"rule_id":   rule.ID,
-				"from_host": r.Host,
-			})
-		}
-		if h.metrics != nil {
-			h.metrics.ObserveEdgeRuleMatch("jwt", "missing")
-		}
+		h.jwtEmit(r.Context(), "jwt", "missing", rule.ID, r.Host, nil, nil)
 		return true
 	}
-	claims, err := h.jwtVerifier.Verify(r.Context(), raw, rule)
+	claims, err := h.verifyJWTWithDeadline(r.Context(), raw, rule)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
 			api.CodeUnauthorized, "JWT verification failed", err.Error()))
-		if h.edgeRuleAudit != nil {
-			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.jwt_failed", nil, map[string]any{
-				"rule_id":   rule.ID,
-				"from_host": r.Host,
-				"err":       err.Error(),
-			})
-		}
-		if h.metrics != nil {
-			h.metrics.ObserveEdgeRuleMatch("jwt", "failed")
-		}
+		h.jwtEmit(r.Context(), "jwt", "failed", rule.ID, r.Host, nil, map[string]any{"err": err.Error()})
 		return true
 	}
+	h.jwtEmit(r.Context(), "jwt", "match", rule.ID, r.Host, nil, map[string]any{"sub": claims.Subject})
+	return false
+}
+
+// jwtEmit (ADR-091 hardening PR-A) consolidates the audit + metric
+// emission for an applyEdgeRuleJWT outcome into one helper so the
+// gate handler stays under the 50-line lint budget. fromHost is
+// the customer-visible Host header (the audit's load-bearing field
+// for operator triage). accountID may be nil (the unmatched /
+// missing-token / failed paths don't tie the row to a customer
+// account — only the blocked path does, to flag cross-account
+// rule attempts). extras is merged into the audit row data map;
+// nil is fine (audit.Emit tolerates nil maps). Both h.edgeRuleAudit
+// and h.metrics are nil-receiver-safe; the helper guards with simple
+// nil checks so the call sites stay one-liners.
+func (h *Handler) jwtEmit(ctx context.Context, kind, outcome, ruleID, fromHost string, accountID *string, extras map[string]any) {
 	if h.edgeRuleAudit != nil {
-		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.jwt_matched", nil, map[string]any{
-			"rule_id":   rule.ID,
-			"from_host": r.Host,
-			"sub":       claims.Subject,
-		})
+		data := map[string]any{
+			"rule_id":   ruleID,
+			"from_host": fromHost,
+		}
+		for k, v := range extras {
+			data[k] = v
+		}
+		h.edgeRuleAudit.Emit(ctx, "edge_rule."+kind+"_"+outcome, accountID, data)
 	}
 	if h.metrics != nil {
-		h.metrics.ObserveEdgeRuleMatch("jwt", "match")
+		h.metrics.ObserveEdgeRuleMatch(kind, outcome)
 	}
-	return false
+}
+
+// verifyJWTWithDeadline wraps h.jwtVerifier.Verify with the
+// platform's edge-rule JWT verify deadline (api.EdgeRuleJWTVerifyTimeoutDefault,
+// 5 s by default). The wall-clock cap defends against a slow IdP /
+// unreachable JWKS endpoint holding the request goroutine inside
+// applyEdgeRuleJWT indefinitely; r.Context() carries the upstream
+// deadline (server ReadTimeout / client cancellation) so the
+// tighter of the two wins.
+//
+// Returns the verifier's typed error verbatim — applyEdgeRuleJWT
+// maps it into a 401 + edge_rule.jwt_failed audit + match counter
+// increment. A deadline-exceeded error from context.WithTimeout
+// surfaces as a 401 with the verifier's error string (the audit's
+// `err` field gains a "context deadline exceeded" suffix; consumers
+// that grep for the JWKS-typed errors in pkg/edgejwks/verifier.go
+// continue to match them unchanged).
+func (h *Handler) verifyJWTWithDeadline(ctx context.Context, raw string, rule *EdgeRuleJWTResolved) (*JWTClaims, error) {
+	if h.jwtVerifier == nil {
+		return nil, errors.New("jwt verifier not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, api.EdgeRuleJWTVerifyTimeoutDefault)
+	defer cancel()
+	return h.jwtVerifier.Verify(ctx, raw, rule)
 }
 
 // applyEdgeRuleIP (ADR-091 / issue #561 PR 5) consults the
