@@ -16,6 +16,8 @@ export type { AccountLimits } from './models/AccountLimits.js';
 export type { AccountResponse } from './models/AccountResponse.js';
 export type { AccountSLOResponse } from './models/AccountSLOResponse.js';
 export type { AddTrustedSignerRequest } from './models/AddTrustedSignerRequest.js';
+export type { AdminSetGithubWebhookSecretRequest } from './models/AdminSetGithubWebhookSecretRequest.js';
+export type { AdminSetGithubWebhookSecretResponse } from './models/AdminSetGithubWebhookSecretResponse.js';
 export type { AlertRuleResponse } from './models/AlertRuleResponse.js';
 export type { APIKeyExportResponse } from './models/APIKeyExportResponse.js';
 export type { APIKeyResponse } from './models/APIKeyResponse.js';

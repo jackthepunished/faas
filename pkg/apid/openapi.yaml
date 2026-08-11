@@ -5381,12 +5381,7 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [installation_id, secret_hex]
-              properties:
-                installation_id: { type: integer, format: int64, minimum: 1, description: 'GitHub App installation_id (positive bigint).' }
-                secret_hex:      { type: string,  minLength: 32, maxLength: 128, description: 'Hex-encoded secret (16..64 bytes; 32..128 hex chars).' }
+            schema: { $ref: '#/components/schemas/AdminSetGithubWebhookSecretRequest' }
       responses:
         '201':
           description: Secret persisted. The new upgraded_at/upgraded_by are returned for the audit trail.

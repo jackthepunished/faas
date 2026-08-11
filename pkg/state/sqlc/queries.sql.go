@@ -1158,6 +1158,21 @@ func (q *Queries) ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt p
 	return result.RowsAffected(), nil
 }
 
+const getGithubWebhookSecret = `-- name: GetGithubWebhookSecret :one
+SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1
+`
+
+// Returns the bytea secret for the given installation_id. The
+// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
+// webhook is rejected rather than falling back to the platform-
+// wide FAAS_GITHUB_WEBHOOK_SECRET).
+func (q *Queries) GetGithubWebhookSecret(ctx context.Context, db DBTX, installationID int64) ([]byte, error) {
+	row := db.QueryRow(ctx, getGithubWebhookSecret, installationID)
+	var secret_value []byte
+	err := row.Scan(&secret_value)
+	return secret_value, err
+}
+
 const getInstanceTailCount = `-- name: GetInstanceTailCount :one
 select tail_count from instances where id = $1
 `
@@ -2962,6 +2977,46 @@ type UpdateOrgStatusParams struct {
 func (q *Queries) UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error {
 	_, err := db.Exec(ctx, updateOrgStatus, arg.ID, arg.Status)
 	return err
+}
+
+const upsertGithubWebhookSecret = `-- name: UpsertGithubWebhookSecret :execrows
+
+INSERT INTO github_webhook_secrets (installation_id, secret_value, upgraded_by)
+VALUES ($1, $2, $3)
+ON CONFLICT (installation_id) DO UPDATE
+SET secret_value = EXCLUDED.secret_value,
+    upgraded_at  = now(),
+    upgraded_by  = EXCLUDED.upgraded_by
+`
+
+type UpsertGithubWebhookSecretParams struct {
+	InstallationID int64
+	SecretValue    []byte
+	UpgradedBy     string
+}
+
+// ---------------------------------------------------------------------------
+// PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
+//
+// The two queries below are exposed by pkg/state/pgstore.go as
+// (s *PgStore).UpsertGithubWebhookSecret and
+// (s *PgStore).GetGithubWebhookSecret. The body is hand-curated
+// rather than sqlc-generated because the github_installations pair
+// is also hand-curated (same precedent). The schema lives in
+// migrations/00212_github_webhook_secrets.sql (renumbered from
+// 00208 → 00209 → 00212 in the slot-collision cluster; see the
+// migration's header for the cross-pr-slot-fence chain).
+// ---------------------------------------------------------------------------
+// Installs or rotates the per-tenant webhook secret for an
+// installation_id. ON CONFLICT (installation_id) DO UPDATE so a
+// rotation is one statement. upgradedAt + upgradedBy form a §11
+// audit trail.
+func (q *Queries) UpsertGithubWebhookSecret(ctx context.Context, db DBTX, arg UpsertGithubWebhookSecretParams) (int64, error) {
+	result, err := db.Exec(ctx, upsertGithubWebhookSecret, arg.InstallationID, arg.SecretValue, arg.UpgradedBy)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const usageByMonth = `-- name: UsageByMonth :many

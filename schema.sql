@@ -3547,6 +3547,26 @@ ALTER TABLE ONLY public.usage_minutes
 
 
 --
+-- Name: github_webhook_secrets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.github_webhook_secrets (
+    installation_id bigint NOT NULL,
+    secret_value bytea NOT NULL,
+    upgraded_at timestamp with time zone DEFAULT now() NOT NULL,
+    upgraded_by text DEFAULT 'platform'::text NOT NULL
+);
+
+
+--
+-- Name: github_webhook_secrets github_webhook_secrets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.github_webhook_secrets
+    ADD CONSTRAINT github_webhook_secrets_pkey PRIMARY KEY (installation_id);
+
+
+--
 --
 
 

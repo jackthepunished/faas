@@ -424,6 +424,13 @@ type GithubInstallation struct {
 	OrgID              pgtype.UUID
 }
 
+type GithubWebhookSecret struct {
+	InstallationID int64
+	SecretValue    []byte
+	UpgradedAt     pgtype.Timestamptz
+	UpgradedBy     string
+}
+
 type GooseDbVersion struct {
 	ID        int32
 	VersionID int64

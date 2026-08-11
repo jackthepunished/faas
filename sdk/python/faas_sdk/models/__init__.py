@@ -14,6 +14,8 @@ from .account_response_status import AccountResponseStatus
 from .account_slo_response import AccountSLOResponse
 from .account_slo_response_window import AccountSLOResponseWindow
 from .add_trusted_signer_request import AddTrustedSignerRequest
+from .admin_set_github_webhook_secret_request import AdminSetGithubWebhookSecretRequest
+from .admin_set_github_webhook_secret_response import AdminSetGithubWebhookSecretResponse
 from .alert_rule_response import AlertRuleResponse
 from .alert_rule_response_comparison import AlertRuleResponseComparison
 from .alert_rule_response_failure_source import AlertRuleResponseFailureSource
@@ -362,6 +364,8 @@ __all__ = (
     "AccountSLOResponse",
     "AccountSLOResponseWindow",
     "AddTrustedSignerRequest",
+    "AdminSetGithubWebhookSecretRequest",
+    "AdminSetGithubWebhookSecretResponse",
     "AlertRuleResponse",
     "AlertRuleResponseComparison",
     "AlertRuleResponseFailureSource",

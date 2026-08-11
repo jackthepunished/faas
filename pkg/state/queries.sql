@@ -725,7 +725,7 @@ limit $2::int8;
 -- migration's header for the cross-pr-slot-fence chain).
 -- ---------------------------------------------------------------------------
 
--- name: UpsertGithubWebhookSecret
+-- name: UpsertGithubWebhookSecret :execrows
 -- Installs or rotates the per-tenant webhook secret for an
 -- installation_id. ON CONFLICT (installation_id) DO UPDATE so a
 -- rotation is one statement. upgradedAt + upgradedBy form a §11
@@ -737,7 +737,7 @@ SET secret_value = EXCLUDED.secret_value,
     upgraded_at  = now(),
     upgraded_by  = EXCLUDED.upgraded_by;
 
--- name: GetGithubWebhookSecret
+-- name: GetGithubWebhookSecret :one
 -- Returns the bytea secret for the given installation_id. The
 -- daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
 -- webhook is rejected rather than falling back to the platform-
