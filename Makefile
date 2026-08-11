@@ -133,7 +133,7 @@ generate-diff: ## Print drift between generated and committed (no exit 1)
 	$(GO) run ./cmd/deployctl/ diff
 
 .PHONY: test
-test: ## Unit tests — must pass on any machine, no KVM needed.
+test: grafana-mirror-check ## Unit tests — must pass on any machine, no KVM needed.
 	# -timeout=18m: ./cmd/e2e under -race walks pkg/e2etest.buildApid
 	# per test (unique -o path → cache miss). PR #541 (apply-time build
 	# enqueue, ADR-068) added ~50 themed apply e2e tests, pushing the
@@ -168,6 +168,26 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 .PHONY: migrations-check
 migrations-check: ## Static migration-contiguity check (no Postgres needed) — PR #93 follow-up
 	$(GO) test -tags no_pg -race -count=1 -run 'TestMigrations' ./migrations/...
+
+.PHONY: grafana-jq-check
+grafana-jq-check: ## Validate every Grafana dashboard JSON parses cleanly (jq -e .). PR #837 (ADR-091 Amendment 1, issue #561) wired this into `test`.
+	@for f in deploy/grafana/*.json deploy/ansible/roles/grafana/files/*.json; do \
+	  if [ -f "$$f" ]; then \
+	    jq -e . "$$f" > /dev/null || (echo "grafana-jq-check: parse failed $$f"; exit 1); \
+	  fi; \
+	done
+
+.PHONY: grafana-mirror-check
+grafana-mirror-check: ## SHA-256 byte-identity check for deploy/grafana/ → deploy/ansible/roles/grafana/files/ mirror. PR #837 (ADR-091 Amendment 1, issue #561) wired this into `test`.
+	@for f in faas-fleet.json top-tenants.json top-throttled-apps.json edge-rules.json; do \
+	  if [ -f "deploy/grafana/$$f" ] && [ -f "deploy/ansible/roles/grafana/files/$$f" ]; then \
+	    a=$$(shasum -a 256 "deploy/grafana/$$f" | awk '{print $$1}'); \
+	    b=$$(shasum -a 256 "deploy/ansible/roles/grafana/files/$$f" | awk '{print $$1}'); \
+	    if [ "$$a" != "$$b" ]; then \
+	      echo "grafana-mirror-check: $$f mismatch (deploy/grafana/ vs deploy/ansible/roles/grafana/files/)"; exit 1; \
+	    fi; \
+	  fi; \
+	done
 
 .PHONY: verify-secrets
 verify-secrets: ## PR-P4: assert /etc/faas/sealed.env (or the file passed via SECRETS_FILE) is shaped correctly. CI runs this on every PR.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1411,7 +1412,9 @@ type stubEdgeRuleMatcher struct {
 	rewrite  *EdgeRuleRewriteResolved
 	redirect *EdgeRuleRedirectResolved
 	headers  *EdgeRuleHeadersResolved
+	cors     *EdgeRuleCORSResolved
 	jwt      *EdgeRuleJWTResolved
+	ip       *EdgeRuleIPResolved
 }
 
 func (s stubEdgeRuleMatcher) MatchRewrite(_ context.Context, _, _, _ string) *EdgeRuleRewriteResolved {
@@ -1426,11 +1429,23 @@ func (s stubEdgeRuleMatcher) MatchHeaders(_ context.Context, _, _, _ string) *Ed
 	return s.headers
 }
 
+// MatchCORS (PR-B) — returns s.cors verbatim so the CORS preflight
+// test can drive applyEdgeRuleCORS without a real matcher.
+func (s stubEdgeRuleMatcher) MatchCORS(_ context.Context, _, _, _ string) *EdgeRuleCORSResolved {
+	return s.cors
+}
+
 // MatchJWT (PR-A regression coverage) — returns s.jwt verbatim.
 // The handler's applyEdgeRuleJWT miss path must NOT dereference
 // rule.ID when rule == nil; see TestApplyEdgeRuleJWT_MissPath_*.
 func (s stubEdgeRuleMatcher) MatchJWT(_ context.Context, _, _, _ string) *EdgeRuleJWTResolved {
 	return s.jwt
+}
+
+// MatchIP (PR-B) — returns s.ip verbatim so the IP gate tests can
+// drive applyEdgeRuleIP without a real matcher.
+func (s stubEdgeRuleMatcher) MatchIP(_ context.Context, _, _, _ string) *EdgeRuleIPResolved {
+	return s.ip
 }
 
 // TestMatchAndApplyRewrite_PrefixAddToSlash_NoDoubleSlash pins the
@@ -1593,6 +1608,244 @@ func TestApplyEdgeRuleJWT_MissPath_NoNilDeref(t *testing.T) {
 	body := bodyForCounter(t, h.metrics)
 	if !strings.Contains(body, " 1") {
 		t.Errorf("expected jwt+miss counter at 1, body:\n%s", body)
+	}
+}
+
+// ADR-091 hardening PR-B tests — every TestApplyEdgeRule*_*_EmitsApply*
+// pins one (kind, result) tuple against the new
+// gateway_edge_rule_apply_total{kind,result} counter. Anchored on
+// TestApplyEdgeRuleJWT_MissPath_NoNilDeref's fixtures + bodyForCounter.
+// The apply counter is emitted from jwtEmit (JWT path) or directly in
+// the helper (other kinds); PR-B's wiring contract is the only thing
+// under test, not the helper behaviour itself.
+
+func TestApplyEdgeRuleJWT_VerifierError_EmitsApplyError(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "j.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		jwt: &EdgeRuleJWTResolved{
+			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Issuer: "https://idp.example.com", Audience: []string{"api"},
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+			Algorithms: []string{"RS256"},
+		},
+	}
+	stub := &countingJWTVerifier{onVerify: func(_ context.Context, _ string, _ *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		return nil, errors.New("signature mismatch")
+	}}
+	h.WithEdgeRules(matcher, nil, nil)
+	h.WithJWTVerifier(stub)
+
+	req := httptest.NewRequest("GET", "http://j.example.com/", nil)
+	req.Header.Set("Authorization", "Bearer bad")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("rec.Code = %d; want 401", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="error"} 1`) {
+		t.Errorf("apply_total{jwt,error} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="jwt",outcome="failed"} 1`) {
+		t.Errorf("match_total{jwt,failed} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleJWT_VerifierSuccess_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "j.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		jwt: &EdgeRuleJWTResolved{
+			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Issuer: "https://idp.example.com", Audience: []string{"api"},
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+			Algorithms: []string{"RS256"},
+		},
+	}
+	stub := &countingJWTVerifier{onVerify: func(_ context.Context, _ string, _ *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		return &JWTClaims{Subject: "user-1"}, nil
+	}}
+	h.WithEdgeRules(matcher, nil, nil)
+	h.WithJWTVerifier(stub)
+
+	req := httptest.NewRequest("GET", "http://j.example.com/", nil)
+	req.Header.Set("Authorization", "Bearer good")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="success"} 1`) {
+		t.Errorf("apply_total{jwt,success} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="jwt",outcome="match"} 1`) {
+		t.Errorf("match_total{jwt,match} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleJWT_MissingBearer_EmitsApplyError(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "j.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		jwt: &EdgeRuleJWTResolved{
+			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Issuer: "https://idp.example.com", Audience: []string{"api"},
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+			Algorithms: []string{"RS256"},
+		},
+	}
+	stub := &countingJWTVerifier{onVerify: func(_ context.Context, _ string, _ *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		return nil, errors.New("verifier must not be called when no Authorization header is present")
+	}}
+	h.WithEdgeRules(matcher, nil, nil)
+	h.WithJWTVerifier(stub)
+
+	req := httptest.NewRequest("GET", "http://j.example.com/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("rec.Code = %d; want 401", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="error"} 1`) {
+		t.Errorf("apply_total{jwt,error} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="jwt",outcome="missing"} 1`) {
+		t.Errorf("match_total{jwt,missing} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleIP_DenyCIDRMatch_EmitsApplyError(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "i.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	_, denyNet, _ := net.ParseCIDR("0.0.0.0/0") // deny everything; client IP will match
+	matcher := stubEdgeRuleMatcher{
+		ip: &EdgeRuleIPResolved{
+			ID: "rule-ip", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Deny: []*net.IPNet{denyNet},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("GET", "http://i.example.com/", nil)
+	// gatewayd-public writes exactly one trusted XFF entry; emulate it.
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("rec.Code = %d; want 403", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="ip",result="error"} 1`) {
+		t.Errorf("apply_total{ip,error} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleIP_AllowMatch_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "i.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	_, allowNet, _ := net.ParseCIDR("0.0.0.0/0") // allow everything
+	matcher := stubEdgeRuleMatcher{
+		ip: &EdgeRuleIPResolved{
+			ID: "rule-ip", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Allow: []*net.IPNet{allowNet},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("GET", "http://i.example.com/", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="ip",result="success"} 1`) {
+		t.Errorf("apply_total{ip,success} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="ip",outcome="match"} 1`) {
+		t.Errorf("match_total{ip,match} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleCORS_Preflight_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "c.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		cors: &EdgeRuleCORSResolved{
+			ID: "rule-cors", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			AllowOrigins: []string{"*"}, AllowMethods: []string{"GET"},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("OPTIONS", "http://c.example.com/api/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("rec.Code = %d; want 204", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="cors",result="success"} 1`) {
+		t.Errorf("apply_total{cors,success} != 1; body:\n%s", body)
 	}
 }
 

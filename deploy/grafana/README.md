@@ -13,6 +13,21 @@ snapshot-population-by-tier stat panel. UID `faas-warm-snapshot-pr-c`;
 land via `dashboards/warm-snapshot.json` import after the ansible role
 provisions the fleet dashboard (PR #141, ADR-031).
 
+## `edge-rules.json` (issue #561 / PR B / ADR-091)
+
+Four-panel dashboard for the edge-rules observability cluster: match
+rate by kind (`gateway_edge_rule_match_total{outcome="match"}`), apply
+rate by kind + result (`gateway_edge_rule_apply_total`, green=success,
+red=error), JWT failure rate (`gateway_edge_rule_match_total{kind="jwt",outcome="failed"}`),
+and compile-error stat panel (`gateway_edge_rule_compile_error_total{kind}`
+— any non-zero paints red, a page-tier signal because a rule shipped
+broken is an actionable correctness signal, not a headroom signal).
+UID `faas-edge-rules-pr-b`. Mirror at
+`deploy/ansible/roles/grafana/files/edge-rules.json` (byte-identical —
+`make grafana-mirror-check` enforces the contract). Runbooks in
+`docs/runbooks/`: `FaasEdgeRuleApplyHigh.md`, `FaasEdgeRuleCompileError.md`,
+`FaasEdgeRuleJWTFailures.md`.
+
 ## Provisioning (PR #141, ADR-031)
 
 The canonical install path is `deploy/ansible/roles/grafana/`, which
@@ -49,6 +64,8 @@ will move to a federated scrape per ADR-031).
 | Resident RAM % | `fcvm_resident_ram_pct` | resident_ram_pct_of_target |
 | lv-fc used % | `fcvm_lv_fc_used_pct` | lv-fc utilisation |
 | Wake rate | `gateway_requests_total` | — (operator sanity) |
+| Edge rule apply rate | `gateway_edge_rule_apply_total{kind,result}` | edge rule apply rate |
+| Edge rule compile errors | `gateway_edge_rule_compile_error_total{kind}` | edge rule compile errors |
 | Build success rate (non-user_error) | `builderd_ops_total{op="build"}` | build success |
 | Build queue wait p95 | `builderd_build_queue_wait_seconds` | build queue wait p95 |
 | Build duration p95 (by outcome) | `builderd_build_duration_seconds` | per-outcome wall-clock |

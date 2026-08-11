@@ -52,11 +52,17 @@ type edgeRuleStore interface {
 // nil, kind=validate rules compile-then-drop (the rule is
 // silently skipped — same posture as a path-glob parse error).
 // The cmd-side run.go wires a non-nil adapter in production.
+//
+// ADR-091 hardening PR-B: metrics carries the Prometheus counter
+// registry the compile* helpers increment when a rule is dropped at
+// parse time (gateway_edge_rule_compile_error_total{kind}). nil
+// is safe — the compile helpers guard before incrementing.
 type gatewaydEdgeRules struct {
 	store    edgeRuleStore
 	cache    *gateway.EdgeRuleCache
 	log      *slog.Logger
 	validate validateCompiler
+	metrics  *gateway.Metrics
 }
 
 // validateCompiler is the surface compileValidateRules needs from
@@ -80,12 +86,15 @@ type validateCompiler interface {
 // validate may be nil (validate kind disabled; kind=validate rules
 // are silently dropped at compile time, same posture as a
 // path-glob parse error).
-func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate validateCompiler) *gatewaydEdgeRules {
+// metrics may be nil (unit tests pass nil; production wires the
+// gatewayd-internal Prometheus registry via run.go).
+func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate validateCompiler, metrics *gateway.Metrics) *gatewaydEdgeRules {
 	return &gatewaydEdgeRules{
 		store:    store,
 		cache:    gateway.NewEdgeRuleCache(gateway.EdgeRuleCacheCap),
 		log:      log,
 		validate: validate,
+		metrics:  metrics,
 	}
 }
 
@@ -134,6 +143,39 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, validateErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
+	}
+	// PR-B: surface per-rule compile errors to Prometheus so the
+	// §12 dashboard chip "edge rule compile errors" reflects every
+	// dropped rule. Incrementing once per error here keeps the
+	// counter equal to the number of broken rules (not the number
+	// of hosts that had any broken rules). loadHost is the natural
+	// choke point — every Match* falls through it on a cache miss,
+	// so we get one tick per dropped rule across the whole fleet.
+	if g.metrics != nil {
+		for range routeErrs {
+			g.metrics.ObserveEdgeRuleCompileError("route")
+		}
+		for range rewriteErrs {
+			g.metrics.ObserveEdgeRuleCompileError("rewrite")
+		}
+		for range redirectErrs {
+			g.metrics.ObserveEdgeRuleCompileError("redirect")
+		}
+		for range headersErrs {
+			g.metrics.ObserveEdgeRuleCompileError("headers")
+		}
+		for range corsErrs {
+			g.metrics.ObserveEdgeRuleCompileError("cors")
+		}
+		for range jwtErrs {
+			g.metrics.ObserveEdgeRuleCompileError("jwt")
+		}
+		for range ipErrs {
+			g.metrics.ObserveEdgeRuleCompileError("ip")
+		}
+		for range validateErrs {
+			g.metrics.ObserveEdgeRuleCompileError("validate")
+		}
 	}
 	return entry, nil
 }

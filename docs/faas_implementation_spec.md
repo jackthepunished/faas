@@ -766,6 +766,9 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | `schedd_instance_stats_partial_errors_total{node}` | 0 | > 5 / min page (vmmd unreachable) |
 | `gatewayd_internal_write_redirect_total{outcome,auth_kind}` rate | n/a (per-outcome) | `outcome="leader_unreachable"` > 0.1 / min page (ADR-083 §Open #2 closure); `outcome="loop_prevented"` > 1 / min page (redirect-storm DoS); `outcome="mTLS_failure"` > 0 page (cert / clock-skew); `outcome="cookie_blocked"` rate tracked (deferred, ADR-025 Tier 2 unblocks) |
 | `gatewayd_internal_write_redirect_latency_seconds` p95 | ≤ 1.5 s | > 3 s warn (overlay degradation), > 5 s page (StandbyWriteRedirectTimeoutMS fires) |
+| `gateway_edge_rule_apply_total{kind,result}` rate | n/a (per-kind) | per-kind `result="error"` rate > 1 / min warn (runbook `FaasEdgeRuleApplyHigh.md`) |
+| `gateway_edge_rule_compile_error_total{kind}` rate | 0 | any non-zero page (runbook `FaasEdgeRuleCompileError.md`; ADR-091 Amendment 1: compile error = correctness signal, not headroom) |
+| `gateway_edge_rule_match_total{kind,outcome}` rate | n/a (per-kind) | per-kind `outcome="failed"` for kind=jwt > 5 / min warn (runbook `FaasEdgeRuleJWTFailures.md`; audit-grep `data.err` for `context deadline exceeded` separates timeout from verifier error; CORS preflight short-circuits IP+JWT gates — filter `method != "OPTIONS"` before counting) |
 
 The four `schedd_instance_*` gauges (ADR-036, issue #170) are the
 new per-`(app,node)` rolled-up surfaces — max CPU, sum RSS, sum
