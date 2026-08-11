@@ -76,7 +76,7 @@ export class AdminService {
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
-        403: `code: admin_required — call requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.`,
+        403: `Code admin_required — admin-scoped Bearer + email in FAAS_ADMIN_EMAILS allowlist. PR-D widens the scope to cover per-tenant webhook secret rotation; the table-level pg_notify side-effect (installation_id) is intentional and consumed by githubd.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
