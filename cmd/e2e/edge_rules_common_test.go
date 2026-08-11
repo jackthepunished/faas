@@ -10,22 +10,27 @@
 // deploy_wake_metal_test.go:doGetWithHost at lines 372-388).
 //
 // Bitmask for all six e2e files: e2etest.APID | e2etest.Gatewayd.
-// Edge-rule handlers all short-circuit or 404-fallthrough before
-// Backend.Lookup, so no schedd/vmmd/imaged is required (D20.1
-// defers kind=route e2e to a DeployWake-bitmask follow-on PR).
+// Edge-rule handlers all run at `haveApp` (spec §4.1.2) AFTER
+// Backend.Lookup; per-kind tests therefore seed a `kind=route`
+// substitute (synthetic host → real test app slug) as a precondition.
+// D20.1 defers `kind=route` itself to a DeployWake-bitmask follow-on.
 
 package e2e_test
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/onebox-faas/faas/pkg/e2etest"
+	"github.com/onebox-faas/faas/pkg/state"
 )
 
 // gatewayReqOptions captures the gateway-bound knobs that doReqHeaders
@@ -107,4 +112,98 @@ func doReqHeaders(t *testing.T, h *e2etest.Harness, host, method, path string, b
 		Extra: merged,
 	})
 	return resp.Header, bodyBytes, resp.StatusCode
+}
+
+// seedEdgeRuleDirect inserts one edge_rule row via the test pool,
+// bypassing apid-Validate. Used by every per-kind e2e test in this
+// directory to set up the production-shape pipeline without going
+// through the API surface. Returns the rule ID.
+//
+// match_path is hardcoded to '*' (the catch-all sentinel the
+// path-glob matcher honours per pkg/gateway/edge_rules.go:759-768).
+// match_methods is hardcoded to '{}' (no method filter).
+func seedEdgeRuleDirect(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	accountID, appID, host string,
+	kind state.EdgeRuleKind,
+	action any,
+) string {
+	t.Helper()
+	actionBytes, err := json.Marshal(action)
+	if err != nil {
+		t.Fatalf("marshal action: %v", err)
+	}
+	var ruleID string
+	err = pool.QueryRow(ctx, `
+		insert into edge_rules (
+			account_id, app_id, match_host, match_path,
+			match_methods, priority, enabled, kind, action
+		) values (
+			$1, $2, $3, '*',
+			'{}'::text[], 0, true, $4, $5::jsonb
+		)
+		returning id`,
+		accountID, appID, host, string(kind), actionBytes,
+	).Scan(&ruleID)
+	if err != nil {
+		t.Fatalf("insert edge_rule kind=%s host=%s: %v", kind, host, err)
+	}
+	return ruleID
+}
+
+// accountIDFromKey looks up the account_id for the seeded API key
+// by SHA-256-hashing the plaintext and joining via
+// api_keys.key_sha256 → accounts.id. The harness's SeedAccount
+// inserts the row with the same SHA-256 hash (pkg/api/apikey.go:30).
+func accountIDFromKey(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(key))
+	var accountID string
+	err := pool.QueryRow(ctx, `
+		select k.account_id from api_keys k
+		where k.key_sha256 = $1
+		limit 1`, sum[:]).Scan(&accountID)
+	if err != nil {
+		t.Fatalf("lookup account for key: %v", err)
+	}
+	return accountID
+}
+
+// resetEdgeRuleCache POSTs to gatewayd-internal's /admin/edge-rules/reset
+// control-plane endpoint so a freshly-inserted rule is observed on
+// the next request (gatewayd subscribes to edge_rule_changed pg_notify,
+// but the seed bypasses that path). If the endpoint isn't wired the
+// call is non-fatal — the test still observes whatever the cache
+// state was at boot.
+func resetEdgeRuleCache(t *testing.T, h *e2etest.Harness) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost,
+		h.GatewayControlURL+"/admin/edge-rules/reset", nil)
+	if err != nil {
+		t.Fatalf("new reset req: %v", err)
+	}
+	resp, err := h.HTTPClient().Do(req)
+	if err != nil {
+		t.Logf("edge-rule reset endpoint not reachable (non-fatal): %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// seedRouteSubstitute seeds the `kind=route` precondition rule that
+// every per-kind e2e test needs to get past Backend.Lookup on a
+// synthetic host. Without this, ServeHTTP returns 404 at handler.go
+// :2261 before any non-route edge rule fires.
+func seedRouteSubstitute(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
+	accountID, appID, host, appSlug string) string {
+	return seedEdgeRuleDirect(t, ctx, pool, accountID, appID, host,
+		state.EdgeRuleKindRoute,
+		map[string]any{
+			"kind":            "route",
+			"target_app_id":   appID,
+			"target_app_slug": appSlug,
+		},
+	)
 }
