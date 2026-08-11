@@ -233,36 +233,49 @@ func cmdPKIRotate(args []string) int {
 	return 0
 }
 
-// rotateRestartHint returns the systemctl reload/restart line an
-// operator should run after a rotation. The whole-fleet list is
-// post-ADR-070 (gatewayd-internal is the only gatewayd-named daemon;
-// gatewayd-public uses certmagic, not the control-plane PKI).
-// Scoping to a single daemon narrows the list so a partial rotation
-// (--daemon egress) only restarts the daemons that actually loaded
-// the rotated leaves.
+// rotateRestartHint returns the recommended reload command an
+// operator should run after a rotation. ADR-052 §5 / PR-E made
+// schedd, vmmd, apid pick up rotated material on a SIGHUP — the
+// canonical reload verb is `systemctl kill -s HUP faas-<d>` (the
+// PR-E slice wires WatchTLSReload to SIGHUP-driven reload; the
+// daemons that don't yet have rotation wiring fall through to
+// `systemctl reload` per the legacy behaviour). `kill -s HUP` does
+// not restart the daemon; it only fires the signal — schedd +
+// vmmd + apid pick up the new material on the next handshake,
+// no service interruption.
+//
+// The whole-fleet list is post-ADR-070 (gatewayd-internal is the
+// only gatewayd-named daemon; gatewayd-public uses certmagic, not
+// the control-plane PKI). Scoping to a single daemon narrows the
+// list so a partial rotation (--daemon egress) only restarts the
+// daemons that actually loaded the rotated leaves.
 func rotateRestartHint(daemon string) string {
 	if daemon != "" {
 		switch daemon {
 		case "egress":
 			// The egress server leaf is consumed by
 			// gatewayd-internal; the egress-client leaf is
-			// consumed by meterd.
-			return "Reload: systemctl reload faas-gatewayd-internal faas-meterd  (egress leaves: /etc/faas/tls/egress/egress.crt, /etc/faas/tls/meterd/egress-client.crt)"
+			// consumed by meterd. Neither daemon has
+			// SIGHUP-driven rotation yet (deferred to the
+			// Tier A10 cluster), so the hint keeps the
+			// legacy `systemctl reload` verb.
+			return "Reload: systemctl reload faas-gatewayd-internal faas-meterd  (egress leaves: /etc/faas/tls/egress/egress.crt, /etc/faas/tls/meterd/egress-client.crt)\n   Tip: prefer `systemctl kill -s HUP faas-<daemon>` once the Tier A10 cluster ships PR-E rotation to these daemons."
 		case "meterd":
-			return "Reload: systemctl reload faas-meterd"
+			return "Reload: systemctl reload faas-meterd (rotation PR-E deferred to Tier A10)"
 		case "schedd":
-			return "Reload: systemctl reload faas-schedd"
+			return "Reload (no restart): systemctl kill -s HUP faas-schedd   # picks up the new leaf on the next TLS handshake"
 		case "vmmd":
-			return "Reload: systemctl reload faas-vmmd"
+			return "Reload (no restart): systemctl kill -s HUP faas-vmmd   # picks up the new leaf on the next TLS handshake"
 		case "apid":
-			return "Reload: systemctl reload faas-apid"
+			return "Reload (no restart): systemctl kill -s HUP faas-apid   # picks up the new leaf on the next TLS handshake"
 		case "githubd":
-			return "Reload: systemctl reload faas-githubd"
+			return "Reload: systemctl reload faas-githubd (rotation PR-E deferred to Tier A10)"
 		case "builderd":
-			return "Reload: systemctl reload faas-builderd"
+			return "Reload: systemctl reload faas-builderd (rotation PR-E deferred to Tier A10)"
 		}
 	}
-	return "Reload: systemctl reload faas-{apid,gatewayd-internal,schedd,vmmd,builderd,meterd,githubd}"
+	return "Reload (no restart): systemctl kill -s HUP faas-{schedd,vmmd,apid}\n" +
+		"   Other daemons (gatewayd-internal, meterd, githubd, builderd): systemctl reload faas-<daemon>  # PR-E rotation deferred to Tier A10"
 }
 
 // ensureAllLeaves iterates the role set returned by

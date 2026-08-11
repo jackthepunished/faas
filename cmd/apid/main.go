@@ -23,9 +23,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -911,10 +913,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (single-box dev) leaves nodeVerifier nil; the wire helper's
 	// setVerifyHook no-ops on a nil verifier and the stdlib trust
 	// path runs unchanged.
-	githubdTLS, err := cfg.LoadGithubdTLSWithVerifier(nodeVerifier)
+	//
+	// ADR-052 §5 / PR-E: route the load through the WithReload
+	// factory so a SIGHUP-driven reload swaps the client leaf on
+	// the next outbound githubd handshake. githubdRotator holds
+	// the live *tls.Config; newGithubdClient captures the rotator's
+	// initial material at construction but stdlib's
+	// GetClientCertificate callback consults the rotator at every
+	// handshake.
+	githubdRotator := newTLSRotator(nil)
+	githubdTLS, err := cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, githubdRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("apid: githubd TLS: %w", err)
 	}
+	githubdRotator.Set(githubdTLS)
 	if deps.captureDialTLS != nil {
 		deps.captureDialTLS("githubd", githubdTLS)
 	}
@@ -1306,14 +1318,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the handshake-layer NodeVerifier hook on the server-side
 	// tls.Config. vmmd dials in here; the hook rejects any peer
 	// whose leaf-CN is not in compute_nodes.name.
+	//
+	// ADR-052 §5 / PR-E: route through the WithReload factory so a
+	// SIGHUP-driven reload swaps the server's leaf via stdlib's
+	// per-handshake GetConfigForClient callback.
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
+	advisoryRotator := newTLSRotator(nil)
 	if sock := resolveAdvisorySock(deps.getenv, cfg); sock != "" {
-		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLSWithVerifier(nodeVerifier)
+		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, advisoryRotator.Reload(nil))
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory TLS: %w", tlsErr)
 		}
+		advisoryRotator.Set(advisoryTLS)
 		if deps.captureDialTLS != nil {
 			deps.captureDialTLS("advisory", advisoryTLS)
 		}
@@ -1345,14 +1363,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the handshake-layer NodeVerifier hook on the server-side
 	// tls.Config. githubd dials in here; the hook rejects any peer
 	// whose leaf-CN is not in compute_nodes.name.
+	//
+	// ADR-052 §5 / PR-E: route through the WithReload factory for
+	// SIGHUP-driven leaf rotation.
 	var bridgeSrv *grpc.Server
 	var bridgeLis net.Listener
+	bridgeRotator := newTLSRotator(nil)
 	if sock := resolveGithubdBridgeSock(deps.getenv, cfg); sock != "" {
-		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLSWithVerifier(nodeVerifier)
+		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, bridgeRotator.Reload(nil))
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: githubd bridge TLS: %w", tlsErr)
 		}
+		bridgeRotator.Set(bridgeTLS)
 		if deps.captureDialTLS != nil {
 			deps.captureDialTLS("bridge", bridgeTLS)
 		}
@@ -1367,6 +1390,41 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				log.Error("apid githubd bridge serve", "err", err)
 			}
 		}()
+	}
+
+	// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. Apid
+	// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
+	// by watchLogLevelReload). Install three parallel ones — each
+	// gets every SIGHUP (signal.Notify fans the signal out to every
+	// registered channel). Best-effort failure posture (matches
+	// egress bundle): a failed reload keeps prior material live,
+	// never bricks. WatchTLSReload returns immediately on ctx cancel.
+	if cfg != nil && cfg.GithubdClientTLSCAPath != "" {
+		githubdHupCh := make(chan os.Signal, 1)
+		signal.Notify(githubdHupCh, syscall.SIGHUP)
+		defer signal.Stop(githubdHupCh)
+		githubdReload := func() (*tls.Config, error) {
+			return cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+		}
+		go wire.WatchTLSReload(ctx, log, githubdHupCh, githubdRotator, githubdReload)
+	}
+	if cfg != nil && cfg.AdvisoryTLSCAPath != "" {
+		advisoryHupCh := make(chan os.Signal, 1)
+		signal.Notify(advisoryHupCh, syscall.SIGHUP)
+		defer signal.Stop(advisoryHupCh)
+		advisoryReload := func() (*tls.Config, error) {
+			return cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+		}
+		go wire.WatchTLSReload(ctx, log, advisoryHupCh, advisoryRotator, advisoryReload)
+	}
+	if cfg != nil && cfg.GithubdBridgeTLSCAPath != "" {
+		bridgeHupCh := make(chan os.Signal, 1)
+		signal.Notify(bridgeHupCh, syscall.SIGHUP)
+		defer signal.Stop(bridgeHupCh)
+		bridgeReload := func() (*tls.Config, error) {
+			return cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+		}
+		go wire.WatchTLSReload(ctx, log, bridgeHupCh, bridgeRotator, bridgeReload)
 	}
 
 	errc := make(chan error, 1)
