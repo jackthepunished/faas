@@ -1068,6 +1068,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/accounts/{id}/credits",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.issueCredit))))
 
+	// PR-D / ADR-012 §7 amendment: per-tenant GitHub App webhook
+	// secret rotation. Same two-layer gate as issueCredit (scope +
+	// email allowlist inside the handler) so a leaked admin key
+	// from a non-operator account cannot rotate another tenant's
+	// webhook secret.
+	mux.HandleFunc("POST /v1/admin/github-webhook-secrets",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.handleSetGithubWebhookSecret)))
+
 	// PR-P3: operator-facing billing surface. Same two-layer gate as
 	// issueCredit above (scope + email allowlist inside the handler).
 	// The Paddle catalog handlers type-assert to paddle.OpProvider; on

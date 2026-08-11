@@ -12,6 +12,8 @@ export type { AccountLimits } from './AccountLimits.js';
 export type { AccountResponse } from './AccountResponse.js';
 export type { AccountSLOResponse } from './AccountSLOResponse.js';
 export type { AddTrustedSignerRequest } from './AddTrustedSignerRequest.js';
+export type { AdminSetGithubWebhookSecretRequest } from './AdminSetGithubWebhookSecretRequest.js';
+export type { AdminSetGithubWebhookSecretResponse } from './AdminSetGithubWebhookSecretResponse.js';
 export type { AlertRuleResponse } from './AlertRuleResponse.js';
 export type { AppEnvListResponse } from './AppEnvListResponse.js';
 export type { AppEnvResponse } from './AppEnvResponse.js';

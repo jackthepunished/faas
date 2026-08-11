@@ -30,3 +30,42 @@
 - **M8 hardening (§11 checklist):** the webhook is HMAC-verified at the gateway edge. If §11 fuzzing finds a verifier bypass, the fix is in `pkg/githubd/webhook.go` + the gatewayd path-routing segment — not a daemon split.
 - **Gate-A multi-host (spec §16):** githubd's outbound traffic to `api.github.com` may need to go through a different egress allowlist on the standby host. The transport (gRPC over `/run/faas/githubd.sock`) stays; the egress policy moves to `deploy/nftables/`.
 - **A second Git-like provider (GitLab, Gitea):** if the founder expands the ICP, the right shape is `git-deployd` (or rename `githubd` → `gitd`) with provider-specific webhook verifiers behind a shared `pkg/gitdeploy` core. Don't fork githubd per provider.
+## §7 Per-tenant webhook secret (PR-D amendment, 2026-08-11)
+
+- **Decision:** the platform-wide `FAAS_GITHUB_WEBHOOK_SECRET` (used by
+  `pkg/githubd/webhook.go::VerifyPushSignature`) is supplemented by a
+  row-per-installation lookup at `github_webhook_secrets` (migration
+  00208). The resolver at `pkg/githubd/webhook_secret.go` reads the
+  per-tenant row first; a missing row falls back to the platform
+  secret. Fail-closed posture: a DB error on resolve emits the
+  Prometheus counter `githubd_webhook_secret_total{status="db_error"}`
+  and the webhook is rejected (the gatewayd-internal proxy remains the
+  load-bearing edge verifier; the daemon-side re-verify is a defense in
+  depth check).
+- **Why:** a leaked tenant secret had to be rotated by every
+  GitHub App install simultaneously (the previous shape). The
+  per-tenant row lets a single tenant rotate without coordinating
+  other installs. The cache (60s TTL + singleflight) keeps the
+  hot-path latency within §13 budget; the Invalidate() call on the
+  admin `set` path keeps the rotation window short.
+- **Operational surface:** `gregale github-webhook-secret set
+  --installation-id <id> --secret <hex> [--from-stdin]` (admin-scoped
+  API key + email allowlist). See
+  `docs/runbooks/GithubWebhookSecretRotation.md` for the on-call
+  flow.
+- **Audit:** every set emits the `githubd.webhook_secret_set` event
+  with the operator's account id + the `installation_id`. The
+  Prometheus counter `githubd_webhook_secret_total{status="set"}` is
+  emitted server-side so a dashboard alert can flag unexpected
+  rotation frequency.
+- **Rejected alternatives:**
+  - **Per-tenant secret stored on `github_installations` directly.**
+    Rejected: that row already carries the OAuth handshake state and
+    the `account_id` FK; adding the secret there would couple the
+    webhook-secret lifecycle (permanent) to the install lifecycle
+    (revocable on uninstall). A separate table keeps the two
+    concerns decoupled.
+  - **Re-key on every webhook (rolling secret).** Rejected: GitHub
+    doesn't support per-webhook secrets — the secret is the App
+    setting, not the event. The rotation posture is operator-driven,
+    not rolling.

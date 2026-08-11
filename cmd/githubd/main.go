@@ -17,11 +17,13 @@ package main
 import (
 	"context"
 	"crypto/rsa"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"filippo.io/age"
@@ -161,6 +163,57 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	storeAdapter := newStateBindingsAdapter(pool)
 	source := newInstallationSourceFetcher(installsAdapter, gitFetcher, identity, log)
 
+	// PR-D / ADR-012 §7 — per-tenant webhook secret resolver. The
+	// pool is the same one state.Store wires through; the adapter
+	// exposes the bytea Get/Upsert query shape pkg/githubd
+	// expects. 60s TTL is the load-bearing default — short enough
+	// that a misconfigured box recovers on its own, long enough
+	// that the webhook hot path is dominated by cache hits.
+	//
+	// The janitor (1m tick) evicts expired entries so the map
+	// stays bounded across the daemon's lifetime. Mirrors
+	// TokenCache.StartJanitor.
+	secretResolver := githubd.NewPGWebhookSecretResolver(newStateSecretStoreAdapter(pool), log, 60*time.Second)
+	stopJanitor := secretResolver.StartJanitor(ctx)
+	defer stopJanitor()
+
+	// pg_notify bridge — apid emits on every
+	// UpsertGithubWebhookSecret; we drop the cached entry so the
+	// next webhook rebuilds from the DB (without waiting for the
+	// 60s TTL). The trigger lives in
+	// migrations/00212_github_webhook_secrets.sql. The
+	// SubscribeWithReconnect boundary handles transient LISTEN
+	// drops on its own; we just translate the payload into a
+	// Invalidate call. Plain-text payload (the install_id is not
+	// sensitive — it's the same id the wire decorator exposes).
+	notifCh, err := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyGithubWebhookSecretChanged}, log)
+	if err != nil {
+		return fmt.Errorf("githubd: subscribe to %s: %w", db.NotifyGithubWebhookSecretChanged, err)
+	}
+	go func() {
+		for n := range notifCh {
+			if n.Channel != db.NotifyGithubWebhookSecretChanged {
+				continue
+			}
+			// Payload is JSON {"installation_id":<bigint>}. Try a
+			// parse first; on malformed payload, fall back to a
+			// wholesale Invalidate-by-string so an upstream bug
+			// doesn't permanently desync the cache.
+			var p struct {
+				InstallationID int64 `json:"installation_id"`
+			}
+			id := parseInstallationIDFromPayload(n.Payload, &p)
+			if id == 0 {
+				log.Warn("githubd: webhook secret: malformed notify payload, skipping Invalidate",
+					"payload", n.Payload)
+				continue
+			}
+			log.Info("githubd: webhook secret: invalidating cache on notify",
+				"installation_id", id)
+			secretResolver.Invalidate(id)
+		}
+	}()
+
 	// Slice 7 Service skeleton (inbound webhook path).
 	webhookSvc := githubd.NewService(log)
 	// PR-GH.6 flip: wire Ops unconditionally so the
@@ -293,6 +346,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// surfaces the trip in the §12 dashboard.
 				inner := githubd.NewHTTPChangedFiles(tokens, deps.httpClient())
 				webhookSvc.ChangedFiles = githubd.NewBreakerChangedFiles(inner, deps.now)
+				// PR-D / ADR-012 §6 closure: wire the Checks
+				// API writer to the post-enqueue hook at
+				// pkg/githubd/service.go::HandlePushRequest.
+				// The seam takes (ctx, repo, sha, phase); the
+				// underlying ChecksAPI takes (logsURL,
+				// summary) too — both are empty at the
+				// queued hook (the build fan-out fills them
+				// in when it lands via the gRPC path).
+				webhookSvc.WriteCheck = func(ctx context.Context, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase) error {
+					return githubd.WriteCheckCoalesced(ctx, checks, repoFullName, commitSHA, phase, "", "")
+				}
 				log.Info("githubd: OAuth + Checks wired", "app_id", appID)
 			}
 		}
@@ -319,16 +383,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// construction so the per-daemon registry is shared by
 	// audit + reconcile + sync.Mutex-free observer paths).
 	srv := &githubd.Server{
-		Service:     webhookSvc,
-		Log:         log,
-		Ops:         ops,
-		GRPCServer:  githubdgrpc.New(gRPCImpl, ops, log),
-		HTTPAddr:    cfg.HTTPAddr,
-		SocketPath:  cfg.SocketPath,
-		ListenAddr:  cfg.ListenAddr,
-		TLSCertPath: cfg.TLSCertPath,
-		TLSKeyPath:  cfg.TLSKeyPath,
-		TLSCAPath:   cfg.TLSCAPath,
+		Service:        webhookSvc,
+		Log:            log,
+		Ops:            ops,
+		GRPCServer:     githubdgrpc.New(gRPCImpl, ops, log),
+		HTTPAddr:       cfg.HTTPAddr,
+		SocketPath:     cfg.SocketPath,
+		ListenAddr:     cfg.ListenAddr,
+		TLSCertPath:    cfg.TLSCertPath,
+		TLSKeyPath:     cfg.TLSKeyPath,
+		TLSCAPath:      cfg.TLSCAPath,
+		SecretResolver: secretResolver,
 	}
 	cleanup, errc, err := srv.Start(ctx)
 	if err != nil {
@@ -474,3 +539,30 @@ var (
 // depsAdapter is reserved for the test seam in pkg/githubd tests
 // that import cmd/githubd internals.
 type depsAdapter struct{}
+
+// parseInstallationIDFromPayload decodes the JSON
+// {"installation_id":<bigint>} payload from the
+// github_webhook_secret_changed pg_notify channel. Returns 0 on
+// malformed input — the caller logs and skips the Invalidate so
+// a corrupt payload never poisons the cache.
+//
+// The payload is treated as untrusted input (any daemon with
+// pg_notify write access can craft strings; per the
+// notify.go convention we treat the payload as adversarial).
+// We do NOT cross-validate the id against the row before
+// Invalidate — the resolver's Resolve() will re-read on the next
+// miss and the worst case is a spurious DB read.
+func parseInstallationIDFromPayload(payload string, p *struct {
+	InstallationID int64 `json:"installation_id"`
+}) int64 {
+	if err := json.Unmarshal([]byte(payload), p); err == nil && p.InstallationID > 0 {
+		return p.InstallationID
+	}
+	// Fallback: the payload MIGHT be a bare integer (e.g. a
+	// hand-rolled debug NOTIFY). Defensive parse so an upstream
+	// rewrite doesn't permanently desync.
+	if id, err := strconv.ParseInt(payload, 10, 64); err == nil && id > 0 {
+		return id
+	}
+	return 0
+}

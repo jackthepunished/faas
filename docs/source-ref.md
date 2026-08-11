@@ -88,7 +88,28 @@ underlying HTTP shape.
 - SDK binding: `pkg/api.Client.DeployFromSourceRef` (Go) /
   `DeploymentsService.createDeploymentFromSourceRef` (Node).
 
+## Webhook secrets (push-to-deploy)
+
+The push-to-deploy loop is wired end-to-end (issue #739
+PR-A + PR-B + PR-D). The webhook verifier at
+`pkg/githubd/webhook.go::VerifyPushSignature` reads the secret
+from `github_webhook_secrets` keyed by `installation_id` (PR-D
+/ ADR-012 §7), falling back to the platform-wide
+`FAAS_GITHUB_WEBHOOK_SECRET` for installs that haven't been
+migrated. Per-tenant rotation:
+
+```sh
+gregale github-webhook-secret set \
+    --installation-id <id> \
+    --secret <hex>   # or --from-stdin
+```
+
+Admin-scoped API key required. The Prometheus counter
+`githubd_webhook_secret_total{status="set"}` is emitted on every
+rotation so a dashboard alert can flag unexpected cadence.
+
 ## See also
 
 - `docs/adr/092-headless-source-ref-deploy.md` — design rationale.
+- `docs/runbooks/GithubWebhookSecretRotation.md` — operator rotation flow.
 - `docs/cli-setup.md` — shell completion + man page install.

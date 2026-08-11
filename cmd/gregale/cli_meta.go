@@ -547,6 +547,20 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		// PR-D / ADR-012 §7 amendment. Per-tenant GitHub App
+		// webhook secret rotation (admin-scoped). Distinct from
+		// `secrets` because the trust boundary is the GitHub
+		// App install, not the Faas app — the resolver in
+		// pkg/githubd/webhook_secret.go reads this row first
+		// before falling back to the platform secret.
+		Name:    "github-webhook-secret",
+		DocSlug: "github-webhook-secret",
+		Short:   "Manage per-tenant GitHub App webhook secrets (admin)",
+		Subcommands: []cliSub{
+			{Name: "set", Short: "Rotate the secret for one installation_id"},
+		},
+	},
+	{
 		Name:    dispatchSignKeys,
 		DocSlug: "sign-keys",
 		Short:   "Provision the cosign sign keypair (operator; --sign-key / --verify-key)",

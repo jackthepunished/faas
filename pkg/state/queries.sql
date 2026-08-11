@@ -712,3 +712,35 @@ group by coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid)
 order by hits desc, last_event_at desc
 limit $2::int8;
 
+-- ---------------------------------------------------------------------------
+-- PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
+--
+-- The two queries below are exposed by pkg/state/pgstore.go as
+-- (s *PgStore).UpsertGithubWebhookSecret and
+-- (s *PgStore).GetGithubWebhookSecret. The body is hand-curated
+-- rather than sqlc-generated because the github_installations pair
+-- is also hand-curated (same precedent). The schema lives in
+-- migrations/00212_github_webhook_secrets.sql (renumbered from
+-- 00208 → 00209 → 00212 in the slot-collision cluster; see the
+-- migration's header for the cross-pr-slot-fence chain).
+-- ---------------------------------------------------------------------------
+
+-- name: UpsertGithubWebhookSecret :execrows
+-- Installs or rotates the per-tenant webhook secret for an
+-- installation_id. ON CONFLICT (installation_id) DO UPDATE so a
+-- rotation is one statement. upgradedAt + upgradedBy form a §11
+-- audit trail.
+INSERT INTO github_webhook_secrets (installation_id, secret_value, upgraded_by)
+VALUES ($1, $2, $3)
+ON CONFLICT (installation_id) DO UPDATE
+SET secret_value = EXCLUDED.secret_value,
+    upgraded_at  = now(),
+    upgraded_by  = EXCLUDED.upgraded_by;
+
+-- name: GetGithubWebhookSecret :one
+-- Returns the bytea secret for the given installation_id. The
+-- daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
+-- webhook is rejected rather than falling back to the platform-
+-- wide FAAS_GITHUB_WEBHOOK_SECRET).
+SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1;
+

@@ -3,6 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AccountCreditResponse } from '../models/AccountCreditResponse.js';
+import type { AdminSetGithubWebhookSecretRequest } from '../models/AdminSetGithubWebhookSecretRequest.js';
+import type { AdminSetGithubWebhookSecretResponse } from '../models/AdminSetGithubWebhookSecretResponse.js';
 import type { BillingCatalogResponse } from '../models/BillingCatalogResponse.js';
 import type { BillingPaddleOveragePreflightResponse } from '../models/BillingPaddleOveragePreflightResponse.js';
 import type { BillingReconcileResponse } from '../models/BillingReconcileResponse.js';
@@ -49,6 +51,32 @@ export class AdminService {
         401: `code: unauthorized`,
         403: `code: admin_required — call requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.`,
         404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Set the per-tenant GitHub App webhook secret (admin-only).
+   * @returns AdminSetGithubWebhookSecretResponse Secret persisted. The new upgraded_at/upgraded_by are returned for the audit trail.
+   * @throws ApiError
+   */
+  public static setGithubWebhookSecret({
+    requestBody,
+  }: {
+    requestBody: AdminSetGithubWebhookSecretRequest,
+  }): CancelablePromise<AdminSetGithubWebhookSecretResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/admin/github-webhook-secrets',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        403: `Code admin_required — admin-scoped Bearer + email in FAAS_ADMIN_EMAILS allowlist. PR-D widens the scope to cover per-tenant webhook secret rotation; the table-level pg_notify side-effect (installation_id) is intentional and consumed by githubd.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

@@ -3093,6 +3093,41 @@ type AppSecurityResponse struct {
 	RequireSigned bool `json:"require_signed"`
 }
 
+// AdminSetGithubWebhookSecretRequest is the body shape for
+// POST /v1/admin/github-webhook-secrets (PR-D / ADR-012 §7
+// amendment). Per-tenant override of the platform-wide
+// FAAS_GITHUB_WEBHOOK_SECRET so a leaked tenant secret can
+// rotate without coordinating every GitHub App install.
+//
+// InstallationID is the GitHub Apps installation_id (signed
+// bigint). SecretHex is the secret in lowercase hex (16..128
+// hex chars; server-side bytea-stored). The CLI takes hex so
+// the plaintext never has to be a binary argv value or land in
+// shell history; the apid handler hex-decodes before the
+// INSERT.
+//
+// Auth: admin-scoped API key (ScopesAdminOnly) + email in
+// FAAS_ADMIN_EMAILS allowlist (matching the credit + sign-keys
+// routes). Mounted in apid under the existing
+// authLimited → requireMFA → requireScope chain
+// (cmd/apid/server.go).
+type AdminSetGithubWebhookSecretRequest struct {
+	InstallationID int64  `json:"installation_id"`
+	SecretHex      string `json:"secret_hex"`
+}
+
+// AdminSetGithubWebhookSecretResponse is the row shape echoed
+// back to the operator so a CI loop can confirm the rotation
+// landed (UpgradedBy stamps the admin id; UpgradedAt is the
+// RFC 3339 timestamp from now()). The Prometheus counter
+// githubd_webhook_secret_total{status="set"} is emitted
+// server-side at the apid handler.
+type AdminSetGithubWebhookSecretResponse struct {
+	InstallationID int64     `json:"installation_id"`
+	UpgradedAt     time.Time `json:"upgraded_at"`
+	UpgradedBy     string    `json:"upgraded_by"`
+}
+
 // SidecarType is the closed enum on Sidecar.Type (issue #463 /
 // ADR-068 §Decision 1). The 2-sidecar cap is enforced as 1 init +
 // 1 sidecar per deployment — `Sidecars.Validate` rejects any other

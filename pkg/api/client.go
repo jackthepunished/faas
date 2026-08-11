@@ -2062,6 +2062,23 @@ func (c *Client) UpdateAppSecurity(ctx context.Context, slug string, req AppSecu
 	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/security", req, &out)
 }
 
+// SetGithubWebhookSecret sets the per-tenant webhook secret for
+// the given installation_id (PR-D / ADR-012 §7 amendment). The
+// server hex-decodes SecretHex and writes the raw bytes to
+// github_webhook_secrets. ON CONFLICT DO UPDATE so a rotation
+// is a single idempotent call — every successful call bumps
+// upgraded_at (the audit trail; an operator re-running with
+// the same secret is itself a rotation event worth recording).
+//
+// Auth: admin-scoped API key (ScopesAdminOnly +
+// adminAllows email allowlist). The handler also emits
+// githubd_webhook_secret_total{status="set"} so a Prometheus
+// alert can fire if a tenant rotates unexpectedly often.
+func (c *Client) SetGithubWebhookSecret(ctx context.Context, req AdminSetGithubWebhookSecretRequest) (AdminSetGithubWebhookSecretResponse, error) {
+	var out AdminSetGithubWebhookSecretResponse
+	return out, c.do(ctx, "POST", "/v1/admin/github-webhook-secrets", req, &out)
+}
+
 // Org surface (issue #190 / IAM-6 / ADR-061, PR 5). The 11 methods
 // below mirror the spec routes documented under api/openapi.yaml
 // paths /v1/orgs*, /v1/invitations/{token}. Each maps 1:1 to a

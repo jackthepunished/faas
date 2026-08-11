@@ -435,6 +435,7 @@ func (x *ExchangeOAuthCodeRequest) GetState() string {
 type ExchangeOAuthCodeResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	InstallationId string                 `protobuf:"bytes,1,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
+	DefaultBranch  string                 `protobuf:"bytes,2,opt,name=default_branch,json=defaultBranch,proto3" json:"default_branch,omitempty"` // empty when unavailable; bind picker pre-fills from this
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -472,6 +473,13 @@ func (*ExchangeOAuthCodeResponse) Descriptor() ([]byte, []int) {
 func (x *ExchangeOAuthCodeResponse) GetInstallationId() string {
 	if x != nil {
 		return x.InstallationId
+	}
+	return ""
+}
+
+func (x *ExchangeOAuthCodeResponse) GetDefaultBranch() string {
+	if x != nil {
+		return x.DefaultBranch
 	}
 	return ""
 }
@@ -1710,9 +1718,10 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\tR\x05state\"D\n" +
+	"\x05state\x18\x03 \x01(\tR\x05state\"k\n" +
 	"\x19ExchangeOAuthCodeResponse\x12'\n" +
-	"\x0finstallation_id\x18\x01 \x01(\tR\x0einstallationId\"d\n" +
+	"\x0finstallation_id\x18\x01 \x01(\tR\x0einstallationId\x12%\n" +
+	"\x0edefault_branch\x18\x02 \x01(\tR\rdefaultBranch\"d\n" +
 	"\x04Repo\x12\x1b\n" +
 	"\tfull_name\x18\x01 \x01(\tR\bfullName\x12%\n" +
 	"\x0edefault_branch\x18\x02 \x01(\tR\rdefaultBranch\x12\x18\n" +

@@ -102,6 +102,11 @@ type Querier interface {
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
+	// Returns the bytea secret for the given installation_id. The
+	// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
+	// webhook is rejected rather than falling back to the platform-
+	// wide FAAS_GITHUB_WEBHOOK_SECRET).
+	GetGithubWebhookSecret(ctx context.Context, db DBTX, installationID int64) ([]byte, error)
 	// issue #667 / ADR-078 — read-only probe for the snapshotAndPark
 	// 5s watchdog's poll loop. Single SELECT … FROM instances WHERE
 	// id = $1; the column is on the hot path so the row is already in
@@ -251,6 +256,23 @@ type Querier interface {
 	UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateInstanceStateParams) error
 	UpdateOrgPlan(ctx context.Context, db DBTX, arg UpdateOrgPlanParams) error
 	UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error
+	// ---------------------------------------------------------------------------
+	// PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
+	//
+	// The two queries below are exposed by pkg/state/pgstore.go as
+	// (s *PgStore).UpsertGithubWebhookSecret and
+	// (s *PgStore).GetGithubWebhookSecret. The body is hand-curated
+	// rather than sqlc-generated because the github_installations pair
+	// is also hand-curated (same precedent). The schema lives in
+	// migrations/00212_github_webhook_secrets.sql (renumbered from
+	// 00208 → 00209 → 00212 in the slot-collision cluster; see the
+	// migration's header for the cross-pr-slot-fence chain).
+	// ---------------------------------------------------------------------------
+	// Installs or rotates the per-tenant webhook secret for an
+	// installation_id. ON CONFLICT (installation_id) DO UPDATE so a
+	// rotation is one statement. upgradedAt + upgradedBy form a §11
+	// audit trail.
+	UpsertGithubWebhookSecret(ctx context.Context, db DBTX, arg UpsertGithubWebhookSecretParams) (int64, error)
 	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error)
 }
 

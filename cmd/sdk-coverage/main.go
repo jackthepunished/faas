@@ -261,6 +261,12 @@ var methodRouteMap = map[string]string{
 	// artifact; the SDK verb is "issue" (the operator's mental
 	// model) so the explicit map takes precedence.
 	"POST /v1/admin/accounts/{id}/credits": "IssueAccountCredit",
+	// PR-D / ADR-012 §7 amendment — per-tenant webhook secret
+	// rotation. Auto-derivation produces
+	// "PostAdminGithub-webhook-secrets" (literal hyphen); the SDK
+	// verb is "set" (operator's mental model) so the explicit map
+	// takes precedence.
+	"POST /v1/admin/github-webhook-secrets": "SetGithubWebhookSecret",
 	// Issue #279 PR-C — credit consumption reducer. Auto-derivation
 	// produces "PostInvoicesIdConsume-credits" (literal hyphen); the
 	// SDK verb is "ConsumeInvoiceCredits" so the explicit map drops

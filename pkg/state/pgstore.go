@@ -14179,3 +14179,74 @@ func (s *PgStore) PerAccountRateLimitAggregate(ctx context.Context, arg sqlc.Per
 	}
 	return out, rows.Err()
 }
+
+// UpsertGithubWebhookSecret installs or rotates the per-tenant
+// GitHub App webhook secret for the given installation_id. PR-D /
+// ADR-012 §7 amendment: replaces the platform-wide
+// FAAS_GITHUB_WEBHOOK_SECRET with a row-per-install lookup so a
+// leaked tenant secret can rotate without coordinating every
+// GitHub install. upgradedAt + upgradedBy form a §11 audit trail
+// for the rotation.
+//
+// The secret is stored as raw bytes (bytea) — NOT hex-encoded
+// text — because the daemon-side verifier at
+// pkg/githubd/webhook.go::VerifyPushSignature reads the wire body
+// raw. A hex-decode on every webhook would be wasted CPU at the
+// gatewayd-internal proxy hot path.
+//
+// On conflict the existing row's secret_value + audit fields are
+// overwritten; the test at
+// migrations/00208_github_webhook_secrets_test.go pins the
+// round-trip.
+func (s *PgStore) UpsertGithubWebhookSecret(ctx context.Context, installationID int64, secret []byte, upgradedBy string) (time.Time, string, error) {
+	if installationID == 0 {
+		return time.Time{}, "", fmt.Errorf("state: UpsertGithubWebhookSecret: installation_id must be non-zero")
+	}
+	if len(secret) == 0 {
+		return time.Time{}, "", fmt.Errorf("state: UpsertGithubWebhookSecret: secret must be non-empty (use a 32-byte random value per GitHub's recommendation)")
+	}
+	if upgradedBy == "" {
+		upgradedBy = "platform"
+	}
+	var upgradedAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO github_webhook_secrets (installation_id, secret_value, upgraded_by)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (installation_id) DO UPDATE
+		SET secret_value = EXCLUDED.secret_value,
+		    upgraded_at  = now(),
+		    upgraded_by  = EXCLUDED.upgraded_by
+		RETURNING upgraded_at, upgraded_by
+	`, installationID, secret, upgradedBy).Scan(&upgradedAt, &upgradedBy)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("state: UpsertGithubWebhookSecret: %w", err)
+	}
+	return upgradedAt, upgradedBy, nil
+}
+
+// GetGithubWebhookSecret returns the per-tenant secret for the
+// given installation_id. Returns ErrNotFound when no row exists
+// (the daemon-side resolver treats this as fail-closed — the
+// webhook is rejected rather than falling back to the platform-
+// wide FAAS_GITHUB_WEBHOOK_SECRET, per PR-D's adoption posture).
+//
+// The bytea is returned as a raw byte slice; the caller
+// (pkg/githubd/webhook_secret.go::PGWebhookSecretResolver)
+// passes the bytes directly to VerifyPushSignature.
+func (s *PgStore) GetGithubWebhookSecret(ctx context.Context, installationID int64) ([]byte, error) {
+	if installationID == 0 {
+		return nil, ErrNotFound
+	}
+	var secret []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1`,
+		installationID,
+	).Scan(&secret)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("state: GetGithubWebhookSecret: %w", err)
+	}
+	return secret, nil
+}
