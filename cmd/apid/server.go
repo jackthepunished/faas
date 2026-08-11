@@ -917,6 +917,10 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/crons", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createCron)))))
 	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateCron))))
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron))))
+	// Single-cron read (issue #791 PR-E / ADR-090 closure). Backs
+	// `gregale crons info <id>` and any dashboard drill-down. Read
+	// surface, no MFA — same posture as listCronRuns.
+	mux.HandleFunc("GET /v1/crons/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getCron)))
 	// Per-cron execution history (issue #791). Read surface, so
 	// ScopesReadSurface and no idempotency wrapper.
 	mux.HandleFunc("GET /v1/crons/{id}/runs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCronRuns))))
@@ -1453,6 +1457,17 @@ func (s *server) handler() http.Handler {
 	// ADR-077) cannot silently disable the customer's cap. The 5-minute
 	// TTL is the standard sensitive-op window (review finding #10).
 	mux.Handle("POST /dashboard/raise-overage-cap", s.dashboardChain(s.sessionAuth(s.requireStepUpHandler(5*time.Minute)(http.HandlerFunc(s.dashboardRaiseOverageCap)))))
+	// Issue #791 PR-E / ADR-090 closure — fire-now from the
+	// dashboard's cron section. Same CSRF-envelope shape as the
+	// form POSTs above (the form-render path in renderAppDetail
+	// mints the token via IssueForAuthenticated; the handler
+	// verifies via VerifyAuthenticated). No requireStepUp — a
+	// fire-now is the same intent as a cron firing on schedule,
+	// so the MFA-then-fire posture is correct, not step-up.
+	// Parses the cron id out of the URL slug inside the handler
+	// (Go 1.22+ mux needs concrete segment counts; the
+	// /crons/{id}/fire-now suffix is the path tail).
+	mux.Handle("POST /dashboard/apps/{slug}/crons/{id}/fire-now", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardFireCron))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires

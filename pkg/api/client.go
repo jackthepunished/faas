@@ -931,6 +931,16 @@ func (c *Client) DeleteDomain(ctx context.Context, domain string) error {
 	return c.do(ctx, "DELETE", "/v1/domains/"+domain, nil, nil)
 }
 
+// GetCron returns one cron by id (issue #791 PR-E / ADR-090 closure).
+// Backs `gregale crons info <id>`. Wire shape matches CronResponse
+// (same projection as ListCrons' per-row). The server returns a
+// byte-identical 404 on missing or cross-account so the SDK does not
+// invent a local branch that could leak existence.
+func (c *Client) GetCron(ctx context.Context, id string) (CronResponse, error) {
+	var out CronResponse
+	return out, c.do(ctx, "GET", "/v1/crons/"+id, nil, &out)
+}
+
 // ListCrons returns every cron on the account when slug is empty,
 // or every cron for the given app when slug is non-empty. The slug
 // filter is added to the wire only when non-empty so the request

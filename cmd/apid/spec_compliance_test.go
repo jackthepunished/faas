@@ -89,6 +89,7 @@ var routeExclude = map[string]bool{
 	"GET /dashboard/account/export":             true, // session-auth twin of /v1/account/export
 	"GET /dashboard/account/dpa":                true, // session-auth twin of DPA
 	"POST /dashboard/raise-overage-cap":         true, // HTML form (issue #561)
+	"POST /dashboard/apps/{slug}/crons/{id}/fire-now": true, // HTML form, cron fire-now (issue #791 PR-E / ADR-090)
 	"POST /v1/cli-auth/code":                    true, // CLI device-code mint
 	"POST /v1/cli-auth/exchange":                true, // CLI device-code exchange
 	"GET /cli-auth":                             true, // dashboard claim form

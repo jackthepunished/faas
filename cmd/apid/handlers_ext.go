@@ -1747,6 +1747,34 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// getCron reads a single cron by id (issue #791 PR-E / ADR-090 closure).
+//
+// GET /v1/crons/{id}. Same IDOR-safe two-step as updateCron/deleteCron:
+// resolve the cron, then resolve its app and compare account ids. Both
+// failure branches emit the identical "no such cron" 404 so a probe
+// cannot distinguish missing from cross-account.
+//
+// Distinct from listCrons: listCrons returns every cron owned by the
+// account (or filtered by ?app_slug), while getCron answers the
+// `gregale crons info <id>` question — what is this specific rule —
+// with one row. The wire shape matches api.CronResponse (same
+// projection as listCrons' per-row), so SDK clients can decode it
+// with the existing CronResponse struct.
+func (s *server) getCron(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	c, err := s.store.CronByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such cron")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), c.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such cron")
+		return
+	}
+	writeJSON(w, http.StatusOK, cronResponse(c))
+}
+
 // listCronRuns is the per-cron execution history (issue #791):
 // GET /v1/crons/{id}/runs.
 //
