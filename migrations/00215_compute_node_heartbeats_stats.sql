@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00199_compute_node_heartbeats_stats.sql
+-- filename: 00215_compute_node_heartbeats_stats.sql
 --
 -- PR #4 (operator-obs §3.7 follow-up, ADR-091 §3.6 amendment) — extends
 -- the existing compute_node_heartbeats table with two columns that
