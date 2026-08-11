@@ -95,6 +95,16 @@ type MemStore struct {
 	// account (PR-C). Keyed by accountID so the cold-start rehydrate
 	// path in pkg/githubd/realservice.go can look up by account.
 	githubInstalls map[string]GitHubInstall
+	// githubWebhookSecrets is the per-tenant webhook secret
+	// store (PR-D / ADR-012 §7 amendment). Keyed by
+	// installation_id so the resolver cache at
+	// pkg/githubd/webhook_secret.go can match the prod
+	// ON CONFLICT (installation_id) DO UPDATE shape.
+	githubWebhookSecrets map[int64][]byte
+	// githubWebhookSecretMeta stamps (upgraded_at, upgraded_by)
+	// for each per-tenant row so the apid admin route can echo
+	// the row back without a second query.
+	githubWebhookSecretMeta map[int64]webhookSecretMeta
 	deployments    map[string]Deployment
 	builds         map[string]Build
 	// buildProvenance is the ADR-038 "what ran?" record keyed by
@@ -489,8 +499,12 @@ func NewMemStore() *MemStore {
 		apps:           map[string]App{},
 		githubBindings: map[string]GitHubBinding{},
 		githubInstalls: map[string]GitHubInstall{},
-		deployments:    map[string]Deployment{},
-		builds:         map[string]Build{},
+		// PR-D / ADR-012 §7 amendment: per-tenant webhook secret
+		// store (mirror of github_webhook_secrets).
+		githubWebhookSecrets:    map[int64][]byte{},
+		githubWebhookSecretMeta: map[int64]webhookSecretMeta{},
+		deployments:             map[string]Deployment{},
+		builds:                  map[string]Build{},
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
 		// build_id (mirrors the build_provenance.build_id UNIQUE).
 		// Starts empty; CreateBuildProvenance fills it.
@@ -3269,6 +3283,55 @@ func (m *MemStore) GitHubInstallForAccount(_ context.Context, accountID string) 
 		return GitHubInstall{}, ErrNotFound
 	}
 	return inst, nil
+}
+
+// UpsertGithubWebhookSecret mirrors PgStore (PR-D / ADR-012 §7
+// amendment). The MemStore is the unit-test stand-in for the
+// resolver; the bytea is held in an in-memory map keyed by
+// installation_id.
+func (m *MemStore) UpsertGithubWebhookSecret(_ context.Context, installationID int64, secret []byte, upgradedBy string) (time.Time, string, error) {
+	if installationID == 0 {
+		return time.Time{}, "", fmt.Errorf("memstore: UpsertGithubWebhookSecret: installation_id must be non-zero")
+	}
+	if len(secret) == 0 {
+		return time.Time{}, "", fmt.Errorf("memstore: UpsertGithubWebhookSecret: secret must be non-empty")
+	}
+	if upgradedBy == "" {
+		upgradedBy = "platform"
+	}
+	now := time.Now().UTC()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.githubWebhookSecrets == nil {
+		m.githubWebhookSecrets = map[int64][]byte{}
+	}
+	cp := make([]byte, len(secret))
+	copy(cp, secret)
+	m.githubWebhookSecrets[installationID] = cp
+	if m.githubWebhookSecretMeta == nil {
+		m.githubWebhookSecretMeta = map[int64]webhookSecretMeta{}
+	}
+	m.githubWebhookSecretMeta[installationID] = webhookSecretMeta{
+		UpgradedAt: now,
+		UpgradedBy: upgradedBy,
+	}
+	return now, upgradedBy, nil
+}
+
+// GetGithubWebhookSecret mirrors PgStore. ErrNotFound on miss.
+func (m *MemStore) GetGithubWebhookSecret(_ context.Context, installationID int64) ([]byte, error) {
+	if installationID == 0 {
+		return nil, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	secret, ok := m.githubWebhookSecrets[installationID]
+	if !ok || len(secret) == 0 {
+		return nil, ErrNotFound
+	}
+	cp := make([]byte, len(secret))
+	copy(cp, secret)
+	return cp, nil
 }
 
 // GetGithubInstallBindingForApp mirrors PgStore. accountID scopes
@@ -10002,6 +10065,16 @@ func (m *MemStore) TouchSessionLastSeen(_ context.Context, id string) error {
 
 // compile-time check that MemStore satisfies Store.
 var _ Store = (*MemStore)(nil)
+
+// webhookSecretMeta is the per-tenant meta stamped alongside
+// the secret (PR-D / ADR-012 §7 amendment). The shape mirrors
+// github_webhook_secrets.upgraded_at + upgraded_by so the apid
+// admin handler can echo the row back without a second
+// round-trip.
+type webhookSecretMeta struct {
+	UpgradedAt time.Time
+	UpgradedBy string
+}
 
 // BackdateForTest rewinds the row's started_at to the supplied
 // absolute timestamp. Used by the §6.1 watchdog tests in pkg/sched

@@ -1387,6 +1387,26 @@ type Store interface {
 	// whether to render the "Connect GitHub" button vs the bind list.
 	GitHubInstallForAccount(ctx context.Context, accountID string) (GitHubInstall, error)
 
+	// UpsertGithubWebhookSecret installs or rotates the per-tenant
+	// webhook secret for one GitHub App installation (PR-D / ADR-012
+	// §7 amendment). Idempotent on (installation_id): a fresh
+	// install INSERTs, a rotation ON CONFLICT DO UPDATE-set's
+	// secret_value + now() + upgraded_by. The PlatformSecret
+	// fallback at pkg/githubd/webhook_secret.go is unchanged — the
+	// row's absence means "use the platform secret" so this is the
+	// always-write path, never a delete.
+	//
+	// Returns the (upgraded_at, upgraded_by) stamp so the apid
+	// admin route can echo the row back without a follow-up
+	// SELECT.
+	UpsertGithubWebhookSecret(ctx context.Context, installationID int64, secret []byte, upgradedBy string) (time.Time, string, error)
+	// GetGithubWebhookSecret returns the raw bytes for the per-tenant
+	// row, or ErrNotFound if the install hasn't been migrated off the
+	// platform secret yet. Used by pkg/githubd's resolver cache;
+	// the resolver treats ErrNotFound as a fall-through to
+	// FAAS_GITHUB_WEBHOOK_SECRET rather than as an error.
+	GetGithubWebhookSecret(ctx context.Context, installationID int64) ([]byte, error)
+
 	// Deployments.
 	// CreateDeployment atomically inserts a new pending deployment row
 	// for the given app. When the app already has a pending or live

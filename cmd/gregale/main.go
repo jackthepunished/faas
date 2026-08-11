@@ -287,6 +287,11 @@ func run(args []string) int {
 		return cmdPKI(args[1:])
 	case "secrets":
 		return cmdSecrets(args[1:])
+	case "github-webhook-secret":
+		// PR-D / ADR-012 §7 amendment. Distinct top-level
+		// command; dispatches to a single verb (set) for the
+		// per-tenant webhook secret rotation.
+		return githubWebhookSecretSet(args[1:])
 	case "account":
 		return cmdAccount(args[1:])
 	case "alerts":

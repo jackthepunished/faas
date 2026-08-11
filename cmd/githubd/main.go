@@ -161,6 +161,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	storeAdapter := newStateBindingsAdapter(pool)
 	source := newInstallationSourceFetcher(installsAdapter, gitFetcher, identity, log)
 
+	// PR-D / ADR-012 §7 — per-tenant webhook secret resolver. The
+	// pool is the same one state.Store wires through; the adapter
+	// exposes the bytea Get/Upsert query shape pkg/githubd
+	// expects. 60s TTL is the load-bearing default — short enough
+	// that a misconfigured box recovers on its own, long enough
+	// that the webhook hot path is dominated by cache hits.
+	secretResolver := githubd.NewPGWebhookSecretResolver(newStateSecretStoreAdapter(pool), log, 60*time.Second)
+
 	// Slice 7 Service skeleton (inbound webhook path).
 	webhookSvc := githubd.NewService(log)
 	// PR-GH.6 flip: wire Ops unconditionally so the
@@ -319,16 +327,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// construction so the per-daemon registry is shared by
 	// audit + reconcile + sync.Mutex-free observer paths).
 	srv := &githubd.Server{
-		Service:     webhookSvc,
-		Log:         log,
-		Ops:         ops,
-		GRPCServer:  githubdgrpc.New(gRPCImpl, ops, log),
-		HTTPAddr:    cfg.HTTPAddr,
-		SocketPath:  cfg.SocketPath,
-		ListenAddr:  cfg.ListenAddr,
-		TLSCertPath: cfg.TLSCertPath,
-		TLSKeyPath:  cfg.TLSKeyPath,
-		TLSCAPath:   cfg.TLSCAPath,
+		Service:        webhookSvc,
+		Log:            log,
+		Ops:            ops,
+		GRPCServer:     githubdgrpc.New(gRPCImpl, ops, log),
+		HTTPAddr:       cfg.HTTPAddr,
+		SocketPath:     cfg.SocketPath,
+		ListenAddr:     cfg.ListenAddr,
+		TLSCertPath:    cfg.TLSCertPath,
+		TLSKeyPath:     cfg.TLSKeyPath,
+		TLSCAPath:      cfg.TLSCAPath,
+		SecretResolver: secretResolver,
 	}
 	cleanup, errc, err := srv.Start(ctx)
 	if err != nil {

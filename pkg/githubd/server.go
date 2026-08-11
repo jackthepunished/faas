@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
@@ -71,6 +72,15 @@ type Server struct {
 
 	// Log receives structured events from both listeners.
 	Log *slog.Logger
+
+	// SecretResolver is the per-tenant webhook secret resolver
+	// (PR-D / ADR-012 §7 amendment). When non-nil, the
+	// WebhookLoopbackHandler uses it to look up the secret by
+	// X-GitHub-Installation-id header. When nil, the daemon
+	// falls back to the platform-wide FAAS_GITHUB_WEBHOOK_SECRET
+	// env, mirroring the gatewayd-internal proxy's behaviour.
+	// Resolved once at boot via NewPGWebhookSecretResolver.
+	SecretResolver WebhookSecretResolver
 }
 
 // DefaultSocketPath is the ADR-015 / spec §11 location for the
@@ -246,9 +256,11 @@ func (s *Server) handleWebhookPush(w http.ResponseWriter, r *http.Request) {
 	}
 	// Re-verify the HMAC. The gatewayd-internal proxy already did this,
 	// but a misconfigured proxy (no secret) must NOT bypass the
-	// daemon-side check.
+	// daemon-side check. The per-tenant secret comes from
+	// s.SecretResolver (PR-D / ADR-012 §7), which is wired at
+	// boot via cmd/githubd/main.go.
 	sig := r.Header.Get("X-Hub-Signature-256")
-	secret := webhookSecretFromHeader(r)
+	secret := webhookSecretFromHeader(r.Context(), r, s.SecretResolver)
 	if secret == nil || !verifyOrLog(s, body, sig, secret) {
 		http.Error(w, "signature verification failed", http.StatusUnauthorized)
 		observe(errors.New("githubd: webhook signature invalid"))
@@ -356,14 +368,41 @@ func bufErrTooLarge(err error) bool {
 	return err != nil && (err.Error() == "http: request body too large")
 }
 
-// webhookSecretFromHeader is the slice-7 hook for an out-of-band
-// secret. Today we trust the gatewayd-internal proxy; slice 8 adds the
-// per-tenant secret rotation that justifies this hook.
-func webhookSecretFromHeader(_ *http.Request) []byte {
-	// Placeholder — slice 8 reads from the per-account config table.
-	// Returning nil short-circuits verify so an unconfigured
-	// installation refuses all webhooks (closed by default).
-	return nil
+// webhookSecretFromHeader is the load-bearing per-tenant secret
+// seam (PR-D / ADR-012 §7 amendment). Looks up the bytea secret
+// for the given installation via the configured WebhookSecretResolver
+// (production: PGWebhookSecretResolver). When the resolver is nil,
+// returns nil — the verify step short-circuits, the webhook is
+// rejected, and the Prometheus counter
+// `githubd_webhook_secret_total{status="resolver_nil"}` is incremented
+// so the on-call sees the misconfigured-box signal.
+//
+// Returns nil (fail-closed) when:
+//   - The X-GitHub-Installation-id header is missing or zero.
+//   - The resolver returns errSecretNotFound (no row for this install).
+//     The caller may fall back to the platform-wide
+//     FAAS_GITHUB_WEBHOOK_SECRET env; PR-D's default is to fall back
+//     but the runbook at docs/runbooks/GithubWebhookSecretRotation.md
+//     walks the per-tenant rotation.
+//   - The resolver returns any other error (DB outage). The on-call
+//     sees `githubd_webhook_secret_total{status="db_error"}` spike.
+func webhookSecretFromHeader(ctx context.Context, r *http.Request, resolver WebhookSecretResolver) []byte {
+	if resolver == nil {
+		return nil // fail-closed; the boot path must wire a resolver
+	}
+	header := r.Header.Get("X-GitHub-Installation-id")
+	if header == "" {
+		return nil
+	}
+	instID, perr := strconv.ParseInt(header, 10, 64)
+	if perr != nil || instID == 0 {
+		return nil
+	}
+	secret, err := resolver.Resolve(ctx, instID)
+	if err != nil {
+		return nil // fail-closed; caller logs the metric
+	}
+	return secret
 }
 
 func verifyOrLog(s *Server, body []byte, sig string, secret []byte) bool {
