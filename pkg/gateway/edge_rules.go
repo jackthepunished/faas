@@ -262,11 +262,11 @@ type EdgeRuleValidateResolved struct {
 	Priority            int
 	PathGlob            string
 	Methods             map[string]bool
-	SchemaDigest        [32]byte    // SHA-256 of the raw schema body
-	ContentTypes        []string    // nil/empty = any Content-Type
-	ApplyWhileStreaming bool        // default false
-	RejectUnknownFields bool        // audit-tag-only; schema-side authoritative
-	MaxBodyBytes        int         // 0 = use api.MaxRequestBodyBytes
+	SchemaDigest        [32]byte // SHA-256 of the raw schema body
+	ContentTypes        []string // nil/empty = any Content-Type
+	ApplyWhileStreaming bool     // default false
+	RejectUnknownFields bool     // audit-tag-only; schema-side authoritative
+	MaxBodyBytes        int      // 0 = use api.MaxRequestBodyBytes
 }
 
 // EdgeRuleCache is the in-memory per-host LRU (PR 3 shape; PR 4

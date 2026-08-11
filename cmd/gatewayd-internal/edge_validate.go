@@ -9,15 +9,15 @@
 //
 // Two distinct surfaces are wired through one struct:
 //
-//   1. validateCompiler (cmd-side loader) — pre-compiles every
-//      kind=validate rule at loadHost time so the hot path never
-//      sees a cold cache. Returns the SHA-256 digest for stashing
-//      on EdgeRuleValidateResolved.
+//  1. validateCompiler (cmd-side loader) — pre-compiles every
+//     kind=validate rule at loadHost time so the hot path never
+//     sees a cold cache. Returns the SHA-256 digest for stashing
+//     on EdgeRuleValidateResolved.
 //
-//   2. gateway.Validator (cmd-side applier) — buffers r.Body,
-//      consults the cached *CompiledSchema, returns FieldError on
-//      mismatch. The handler lifts this into api.FieldError on the
-//      422 problem+json.
+//  2. gateway.Validator (cmd-side applier) — buffers r.Body,
+//     consults the cached *CompiledSchema, returns FieldError on
+//     mismatch. The handler lifts this into api.FieldError on the
+//     422 problem+json.
 //
 // Both surfaces share the same Manager / Cache so a Reset() on
 // one wipes both.

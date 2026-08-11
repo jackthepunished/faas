@@ -3160,10 +3160,10 @@ type EdgeRuleIPAction struct {
 //     create-time 422 from pkg/api/dto.go.
 type EdgeRuleValidateAction struct {
 	Schema              json.RawMessage `json:"schema"`
-	ContentTypes        []string         `json:"content_types,omitempty"`
-	ApplyWhileStreaming bool             `json:"apply_while_streaming,omitempty"`
-	RejectOnUnknown     bool             `json:"reject_on_unknown_fields,omitempty"`
-	MaxBodyBytes        int              `json:"max_body_bytes,omitempty"`
+	ContentTypes        []string        `json:"content_types,omitempty"`
+	ApplyWhileStreaming bool            `json:"apply_while_streaming,omitempty"`
+	RejectOnUnknown     bool            `json:"reject_on_unknown_fields,omitempty"`
+	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
 }
 
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action

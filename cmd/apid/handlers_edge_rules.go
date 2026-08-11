@@ -376,11 +376,11 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 			// gateway hot path; this decoder is the structural
 			// decode pass only.
 			out.Validate = &state.EdgeRuleValidateAction{
-				Schema:                append([]byte(nil), a.Schema...),
-				ContentTypes:          a.ContentTypes,
-				ApplyWhileStreaming:   a.ApplyWhileStreaming,
-				RejectOnUnknown:       a.RejectOnUnknownFields,
-				MaxBodyBytes:          a.MaxBodyBytes,
+				Schema:              append([]byte(nil), a.Schema...),
+				ContentTypes:        a.ContentTypes,
+				ApplyWhileStreaming: a.ApplyWhileStreaming,
+				RejectOnUnknown:     a.RejectOnUnknownFields,
+				MaxBodyBytes:        a.MaxBodyBytes,
 			}
 		}
 	}

@@ -3741,11 +3741,11 @@ var edgeRuleValidateRefURLPattern = regexp.MustCompile(`\$ref|id\s*"\s*:\s*"(htt
 //     streaming). Must be > 0 and <= MaxRequestBodyBytes at
 //     create-time.
 type EdgeRuleValidateAction struct {
-	Schema              json.RawMessage `json:"schema"`
-	ContentTypes        []string        `json:"content_types,omitempty"`
-	ApplyWhileStreaming bool            `json:"apply_while_streaming,omitempty"`
-	RejectOnUnknownFields bool          `json:"reject_on_unknown_fields,omitempty"`
-	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
+	Schema                json.RawMessage `json:"schema"`
+	ContentTypes          []string        `json:"content_types,omitempty"`
+	ApplyWhileStreaming   bool            `json:"apply_while_streaming,omitempty"`
+	RejectOnUnknownFields bool            `json:"reject_on_unknown_fields,omitempty"`
+	MaxBodyBytes          int             `json:"max_body_bytes,omitempty"`
 }
 
 func (a *EdgeRuleValidateAction) Validate() *Problem {
