@@ -1442,6 +1442,16 @@ func cmdCrons(args []string) int {
 		}
 		PrintOK(osStdout, "Removed")
 		return 0
+	case "run":
+		// PR-C / issue #791: `gregale crons run <id>` enqueues a
+		// fire-now request. Implementation lives in
+		// commands_crons_fire_now.go (cmdCronsRun).
+		return cmdCronsRun(args[1:])
+	case "fire-now":
+		// PR-D / issue #791: poll a fire-now request row by
+		// request_id. Implementation in
+		// commands_crons_fire_now.go (cmdCronsFireNowGet).
+		return cmdCronsFireNowGet(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown crons subcommand %q\n", args[0])
 	sug, _ := suggestSubcommand(args[0], parent)

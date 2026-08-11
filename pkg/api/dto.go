@@ -2455,6 +2455,26 @@ type FireCronResponse struct {
 	Status    string `json:"status"`
 }
 
+// FireCronRequestResponse is the read shape for the row that backs
+// `GET /v1/cron-fire-now-requests/{request_id}` (issue #791 PR-D /
+// ADR-090 §Sub-decision 7). Nullable fields are *string so a pending
+// row does NOT serialise a zero timestamp as a literal
+// "0001-01-01T00:00:00Z".
+//
+// Polling contract: clients should poll until Status is one of the
+// terminal values {succeeded, failed, cancelled}. The schedd fire-now
+// consumer populates FinishedAt + Error + InvocationID at terminal stamp.
+type FireCronRequestResponse struct {
+	RequestID    string  `json:"request_id"`
+	CronID       string  `json:"cron_id"`
+	Status       string  `json:"status"`
+	RequestedAt  string  `json:"requested_at"`          // RFC3339Nano UTC
+	FinishedAt   *string `json:"finished_at,omitempty"` // RFC3339Nano UTC or null
+	InvocationID *string `json:"invocation_id,omitempty"`
+	Error        *string `json:"error,omitempty"`
+	AccountID    string  `json:"account_id"`
+}
+
 // --- Issue #394 — queue introspection -------------------------------
 //
 // QueueStateResponse is the read-only depth/stats contract for
