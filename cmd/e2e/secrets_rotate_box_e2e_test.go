@@ -105,10 +105,27 @@ func TestRekeyRunnerPg(t *testing.T) {
 	}
 
 	// Phase 2: identity B — the runner re-seals under the new
-	// identity. We do NOT call h1.stop() explicitly; the
-	// harness's t.Cleanup handles teardown when the test
-	// returns. The second StartWithEnv runs the runner, which
-	// polls the on-disk progress file the test monitors.
+	// identity.
+	//
+	// ADR-094 / L2 fix (PR-823): we DO stop h1 explicitly here,
+	// before phase 2 boots. Phase 1's apid holds a MaxConns=8 pool
+	// + 4+ background goroutines (rekey walker, sseFanIn, audit
+	// subscriber, grace sweep) each holding a connection on the
+	// shared Postgres service container. With phase 1 still alive
+	// when phase 2 boots, the two daemons compete for the
+	// service-container max_connections=100 budget; the first
+	// pgxpool.Acquire call inside phase 2's bgBefore goroutines
+	// can race with phase 1's rekey walker's connection
+	// churn and surface as "closed pool" / "context canceled"
+	// inside phase 2's listener bind path. Stopping phase 1
+	// before phase 2 boots removes that contention.
+	//
+	// Harness.Stop (pkg/e2etest/harness.go) signals the daemon
+	// subprocess (SIGTERM → 5s grace → SIGKILL) but does NOT
+	// close the test pool — the pgtest pool survives both
+	// phases and is closed only by the LIFO t.Cleanup at test
+	// exit. Safe to call h1.Stop() here.
+	h1.Stop()
 	recipientB, identityB := startHostedRecipient(t)
 	// Stage A as host.age.previous in identity B's dir so
 	// apid's LoadHostKeys picks it up — see phase-1 comment.
@@ -154,4 +171,56 @@ func TestRekeyRunnerPg(t *testing.T) {
 		t.Errorf("rekey failures: %d (expected 0; rows were sealed under identity A, runner unsealed under A and re-sealed under B)",
 			prog.Failed)
 	}
+}
+
+// TestRekeyRunnerPg_Phase2Isolated is the L2 sibling test that
+// pins the h1.stop() between phases. It runs the same phase-1 →
+// phase-2 lifecycle as TestRekeyRunnerPg but in a stripped-down
+// shape that only exercises the listener-bind path (no actual
+// secrets, no rekey progress assertions) — the original flake
+// was on phase 2's listener bind timing out at
+// `127.0.0.1:<port> did not accept within 10s`, which is the
+// pool-starvation race the L2 fix targets. This sibling is
+// deliberately fast (no progress-file polling) so it can run as
+// a CI smoke test multiple times without slowing the shard.
+//
+// The test's only assertion is that phase 2's StartWithEnv
+// succeeds deterministically — i.e. the listener bind returns
+// inside the harness's waitTCP deadline. If h1.stop() ever stops
+// being called between phases, this test will flake the same
+// way TestRekeyRunnerPg did pre-fix.
+func TestRekeyRunnerPg_Phase2Isolated(t *testing.T) {
+	pool := pgtest.Open(t)
+	if pool == nil {
+		return
+	}
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	// Phase 1: minimal boot — no secrets seeded, just confirm
+	// the daemon reaches the listener.
+	recipientA, identityA := startHostedRecipient(t)
+	h1 := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
+		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientA,
+		"FAAS_HOST_AGE_IDENTITY_PATH=" + identityA,
+	})
+
+	// Stop phase 1 before phase 2 boots (ADR-094 / L2 fix).
+	h1.Stop()
+
+	// Phase 2: boot a fresh apid with a different identity.
+	// StartWithEnv's waitTCP returns when the listener accepts
+	// TCP connections; if h1.stop() was missing, this is where
+	// the 10s deadline would fire (pre-fix flake signature).
+	recipientB, identityB := startHostedRecipient(t)
+	h2 := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
+		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientB,
+		"FAAS_HOST_AGE_IDENTITY_PATH=" + identityB,
+	})
+	// h2 is wired through the harness's t.Cleanup — no manual
+	// stop here. The test's only assertion is "phase 2 reached
+	// the listener-bind path"; if StartWithEnv returned without
+	// fail, the listener is up.
+	_ = h2
 }
