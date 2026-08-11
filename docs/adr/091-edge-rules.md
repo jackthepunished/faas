@@ -475,3 +475,78 @@ broken citations; the next ADR to land in 092-099 should re-do the sweep.
   posture mirrors the §17 G3 lesson.
 - **No resource-scope change:** edge rules remain **per-app**, not per-org.
   The org-scope resolution (ADR-190 PR-4) doesn't extend them.
+
+## Amendment (issue #561 / PR #838, 2026-08-11): observability cluster
+
+PR-A (#837, 2026-08-11) registered and pre-instantiated two Prometheus
+counters but intentionally deferred the production emit sites to this
+amendment. PR-B wires them and ships the dashboard + runbooks + spec §12
+rows that close the observability gap.
+
+1. **Adopted** — wired the production emit sites for the two counters
+   PR-A registered at boot:
+   - `gateway_edge_rule_apply_total{kind, result}` — sibling emit at
+     every existing `ObserveEdgeRuleMatch` site in
+     `pkg/gateway/handler.go` (the seven apply helpers: route, rewrite,
+     redirect, headers, cors, jwt, ip). `result="success"` on fall-through
+     and cross-account blocked (defense-in-depth no-op); `result="error"`
+     on a non-2xx wire write. Miss paths (no rule fired) emit nothing —
+     no apply path ran, and emitting would inflate the success denominator
+     with no-op traffic.
+   - `gateway_edge_rule_compile_error_total{kind}` — once per dropped
+     rule inside `cmd/gatewayd-internal/edge_rules.go::loadHost`,
+     ranging over the seven per-kind err slices. Counter equals the
+     number of broken rules (not the number of hosts that had any broken
+     rules). Pre-fix redox proof in the PR description.
+   - The `rule==nil` JWT miss path emits nothing (PR-A regression test
+     `TestApplyEdgeRuleJWT_MissPath_NoNilDeref` pins this). This is the
+     load-bearing exception to the "match path always emits" rule.
+2. **Dashboard** — `deploy/grafana/edge-rules.json` (UID
+   `faas-edge-rules-pr-b`) and a byte-identical mirror at
+   `deploy/ansible/roles/grafana/files/edge-rules.json`. Four panels:
+   match rate by kind, apply rate by kind + result (green=success,
+   red=error), JWT failure rate, compile-error stat (any non-zero
+   paints red). Byte-identity enforced by `make grafana-mirror-check`,
+   wired into `make test`.
+3. **Runbooks** — three new in `docs/runbooks/`:
+   - `FaasEdgeRuleApplyHigh.md` (warn) — per-kind `apply_total{result="error"}`
+     rate > 1/min sustained 5m; cites `api.EdgeRuleJWTVerifyTimeoutDefault = 5s`
+     and `pkg/edgejwks.DefaultFetchTimeout`.
+   - `FaasEdgeRuleCompileError.md` (page) — any non-zero compile error;
+     operator recovers by fixing the glob in apid or invalidating the
+     cache via `db.NotifyEdgeRuleChanged` pg_notify.
+   - `FaasEdgeRuleJWTFailures.md` (warn) — single failed-rate timeseries
+     plus an audit-grep step that distinguishes timeout (`context
+     deadline exceeded` substring in `data.err`) from verifier error
+     (other substrings). Calls out the CORS-preflight short-circuit:
+     a JWT-failure spike dominated by `OPTIONS` requests is a CORS
+     preflight storm, not a JWT problem — filter `method != "OPTIONS"`
+     before counting.
+4. **Spec §12** — three rows added to the metric table:
+   `gateway_edge_rule_apply_total{kind,result}`,
+   `gateway_edge_rule_compile_error_total{kind}`,
+   `gateway_edge_rule_match_total{kind,outcome}` (the match row was
+   previously only in ADR-091 D20.4; PR-B promotes it to §12).
+5. **Rejected alternative — JWT outcome label widening.** Considered
+   adding `{failed_timeout, failed_signature, failed_aud, failed_iss,
+   failed_expired, failed_missing_claim}` to the JWT outcome label set.
+   Rejected because: (a) the JWT verifier's internal error taxonomy
+   lives in `pkg/edgejwks` and is not a closed set — every verifier
+   change would bloat the §12 metric surface and the Prometheus label
+   cardinality; (b) the failure-reason breakdown is recoverable from
+   the existing `data.err` field in the `edge_rule.jwt_failed` audit
+   row, and the runbook documents the audit-grep. Deferred to a
+   follow-on ADR if/when the operator workload shows the grep is
+   insufficient.
+6. **CORS preflight short-circuits IP+JWT gates — pinned.** Per
+   `pkg/gateway/handler.go::applyEdgeRuleCORS` ordering comments:
+   preflight applies AFTER rewrite (so a rewritten path is matched
+   against CORS rules) and AFTER headers (so request-side header ops
+   don't shadow the preflight's `Allow-*` headers). CORS preflight
+   short-circuits with 204 + `Access-Control-Allow-*` headers; the
+   caller MUST return to skip the auth gates. The `FaasEdgeRuleJWTFailures`
+   runbook calls this out as the canonical reason to filter
+   `method != "OPTIONS"` before counting.
+7. **Pre-fix redox proof** — captured in the PR description (counter
+   call-site walkthrough for a JWT-failed request; compile-error
+   walkthrough for a malformed `match_path` rule).

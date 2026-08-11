@@ -784,7 +784,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// reads state.EdgeRule via the store; reset on
 	// db.NotifyEdgeRuleChanged is wired via PGBackend.WithEdgeRules
 	// below.
-	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter)
+deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter, deps.metrics)
 	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
 	// Issue #561 / ADR-091 PR 5 — build the per-URL JWKS cache
 	// + JWT verifier that applyEdgeRuleJWT consults. Lazy

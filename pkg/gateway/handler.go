@@ -912,6 +912,10 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("route", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op, not an
+			// apply failure. Surface as success so the §12 apply-rate
+			// panel counts it as a successful (no-op) apply.
+			h.metrics.ObserveEdgeRuleApply("route", "success")
 		}
 		return false
 	}
@@ -926,6 +930,9 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("route", "match")
+		// PR-B: route substitution is the apply-path outcome. Every
+		// successful match is a successful apply (substitute ran).
+		h.metrics.ObserveEdgeRuleApply("route", "success")
 	}
 	*app = target
 	return true
@@ -968,6 +975,8 @@ func (h *Handler) matchAndApplyRewrite(r *http.Request, app App) bool {
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("rewrite", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("rewrite", "success")
 		}
 		return false
 	}
@@ -1018,6 +1027,8 @@ func (h *Handler) matchAndApplyRewrite(r *http.Request, app App) bool {
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("rewrite", "match")
+		// PR-B: the rewrite was applied (path mutated in place).
+		h.metrics.ObserveEdgeRuleApply("rewrite", "success")
 	}
 	return true
 }
@@ -1058,6 +1069,8 @@ func (h *Handler) matchAndApplyRedirect(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("redirect", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("redirect", "success")
 		}
 		return false
 	}
@@ -1082,6 +1095,11 @@ func (h *Handler) matchAndApplyRedirect(w http.ResponseWriter, r *http.Request, 
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("redirect", "match")
+		// PR-B: redirect is an apply-path outcome (3xx written,
+		// request short-circuits). http.Redirect always writes a
+		// 3xx, so this counts as success even though the response
+		// isn't 2xx.
+		h.metrics.ObserveEdgeRuleApply("redirect", "success")
 	}
 	//nolint:gosec // rule.To is validated by apid Validate (pkg/api/dto.go:3337-3357) at create time: must be a non-empty URL/path. The customer's free-form redirect target IS the product surface — same posture as Cloudflare's "URL redirect" rules.
 	http.Redirect(w, r, rule.To, status)
@@ -1123,6 +1141,8 @@ func (h *Handler) applyEdgeRuleHeaders(w http.ResponseWriter, r *http.Request, a
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("headers", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("headers", "success")
 		}
 		return false
 	}
@@ -1146,6 +1166,8 @@ func (h *Handler) applyEdgeRuleHeaders(w http.ResponseWriter, r *http.Request, a
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("headers", "match")
+		// PR-B: headers were applied (request + response ops installed).
+		h.metrics.ObserveEdgeRuleApply("headers", "success")
 	}
 	return true
 }
@@ -1194,6 +1216,8 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("cors", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("cors", "success")
 		}
 		return false
 	}
@@ -1228,6 +1252,12 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("cors", "match")
+			// PR-B: preflight 204 short-circuit is a successful apply
+			// (the gate fired and wrote its response). CORS preflight
+			// intentionally short-circuits the JWT/IP gates that
+			// follow — see handler.go:2315-2320 doc-comment + ADR-091
+			// Amendment 1 + FaasEdgeRuleJWTFailures.md.
+			h.metrics.ObserveEdgeRuleApply("cors", "success")
 		}
 		return true
 	}
@@ -1240,6 +1270,10 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("cors", "match")
+		// PR-B: non-preflight CORS stamps response-side Allow-Origin
+		// via statusRecorder; the request falls through to the JWT /
+		// IP gates. Counts as a successful apply.
+		h.metrics.ObserveEdgeRuleApply("cors", "success")
 	}
 	return false
 }
@@ -1371,6 +1405,19 @@ func (h *Handler) jwtEmit(ctx context.Context, kind, outcome, ruleID, fromHost s
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch(kind, outcome)
+		// ADR-091 hardening PR-B: also fire the apply-path counter
+		// here so the §12 "edge rule apply rate" panel surfaces the
+		// JWT gate's outcome. Mapping per the plan: match → success,
+		// failed/missing → error (401 written), blocked → success
+		// (cross-account fall-through, not an apply failure).
+		switch outcome {
+		case "match":
+			h.metrics.ObserveEdgeRuleApply(kind, "success")
+		case "failed", "missing":
+			h.metrics.ObserveEdgeRuleApply(kind, "error")
+		case "blocked":
+			h.metrics.ObserveEdgeRuleApply(kind, "success")
+		}
 	}
 }
 
@@ -1436,6 +1483,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("ip", "success")
 		}
 		return false
 	}
@@ -1458,6 +1507,9 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+			// PR-B: caller_ip_forged writes a 403; surface as apply
+			// error so the §12 panel flags the forged-XFF attack.
+			h.metrics.ObserveEdgeRuleApply("ip", "error")
 		}
 		return true
 	}
@@ -1475,6 +1527,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 			}
 			if h.metrics != nil {
 				h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+				// PR-B: deny CIDR match wrote a 403.
+				h.metrics.ObserveEdgeRuleApply("ip", "error")
 			}
 			return true
 		}
@@ -1500,6 +1554,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 			}
 			if h.metrics != nil {
 				h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+				// PR-B: implicit deny wrote a 403.
+				h.metrics.ObserveEdgeRuleApply("ip", "error")
 			}
 			return true
 		}
@@ -1512,6 +1568,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("ip", "match")
+		// PR-B: IP allow match — request falls through (no 403).
+		h.metrics.ObserveEdgeRuleApply("ip", "success")
 	}
 	return false
 }
