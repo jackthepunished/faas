@@ -1566,6 +1566,17 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// MaxEdgeRuleValidateSchemaBytes bounds the JSON Schema body of a
+	// kind=validate edge rule at apid-create time (Cloudflare-style
+	// 64 KiB). Mirrors the §11 JWKS-URL defence-in-depth posture on
+	// pkg/api/dto.go::EdgeRuleValidateAction.Validate: a customer
+	// cannot ship a schema so large that compiling + caching pushes
+	// per-host memory through the roof, and the gateway never has
+	// to defend against a multi-MiB document. Independent of
+	// MaxRequestBodyBytes (which bounds inbound request bodies, not
+	// schema documents).
+	MaxEdgeRuleValidateSchemaBytes = 64 * 1024 // 64 KiB
+
 	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
 	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
 	// 365 days is the issue-189 spec: long enough to be

@@ -80,11 +80,30 @@ type Problem struct {
 	// Stripe: empty). The dashboard renders this as a confirmation id
 	// after the customer completes checkout. Empty on the Stripe path.
 	TxID string `json:"tx_id,omitempty"`
+	// Errors carries per-field validation detail (Cloudflare / Stripe
+	// shape). Populated by 422 sites that emit a list of field-level
+	// failures — used today by the kind=validate edge rule so a
+	// customer's JSON Schema rejection renders as a form-field list
+	// the dashboard can iterate without parsing prose. Optional +
+	// omitempty so every other problem+json site keeps its existing
+	// flat shape unchanged.
+	Errors []FieldError `json:"errors,omitempty"`
 	// extraHeaders are non-JSON response headers attached via WithHeader.
 	// Kept unexported so the wire body (RFC 7807 problem+json) is
 	// exactly the spec; WriteProblem flushes these onto the wire
 	// before WriteHeader. nil = no extras.
 	extraHeaders map[string][]string `json:"-"`
+}
+
+// FieldError is one per-field entry of Problem.Errors. The shape mirrors
+// Cloudflare's API Shield 422 + Stripe's card_errors family so an SDK can
+// iterate `errors[]` to drive form-field UI without parsing prose. Field
+// uses dotted-path JSON Pointer notation ("address.zip"), expected / got
+// are short stable strings; consumers should not depend on the prose.
+type FieldError struct {
+	Field    string `json:"field"`
+	Expected string `json:"expected"`
+	Got      string `json:"got,omitempty"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -1014,6 +1033,14 @@ func StatusForCode(code string) int {
 		// the GET /v1/deployments/{id} response and the CLI's
 		// `faas deployment <id>` render it identically.
 		return http.StatusUnprocessableEntity
+	case CodeRequestValidationFailed:
+		// 422 — kind=validate edge rule rejected the request body.
+		// Sits next to CodeStatelessOnlyViolation / CodeDeployFailed
+		// in the 422 family: well-formed request, content policy
+		// refuses. The detail body carries Problem.Errors; an SDK
+		// distinguishes this from CodeValidation by the `code`
+		// (gate lives on the gateway hot path, not the apid layer).
+		return http.StatusUnprocessableEntity
 	case CodePayment:
 		return http.StatusPaymentRequired
 	case CodePlanLimitSecrets:
@@ -1524,6 +1551,14 @@ const (
 	CodeJWTSignatureInvalid        = "jwt_signature_invalid"
 	CodeIPDenied                   = "ip_denied"
 	CodeHeaderMutationForbidden    = "header_mutation_forbidden"
+	// CodeRequestValidationFailed is the 422 a kind=validate edge
+	// rule emits when the inbound request body fails the customer's
+	// JSON Schema. Carries Problem.Errors (Cloudflare / Stripe shape)
+	// with one FieldError per mismatch (field + expected + got) so an
+	// SDK can drive form-field UI without parsing prose. Distinct
+	// from CodeValidation (the apid body-shape guard) because the
+	// gating policy and the actor are different.
+	CodeRequestValidationFailed = "request_validation_failed"
 )
 
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
@@ -2833,4 +2868,23 @@ func ErrHeaderMutationForbidden(name string) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeHeaderMutationForbidden,
 		"Header mutation forbidden",
 		fmt.Sprintf("the header %q is reserved and cannot be mutated by edge rules.", name))
+}
+
+// ErrRequestValidationFailed is the 422 returned by the gateway hot path
+// when a kind=validate edge rule rejects the inbound request body. errs
+// carries one FieldError per JSON Schema mismatch (Cloudflare / Stripe
+// shape: field + expected + got). Title + detail stay stable so SDKs
+// that don't yet iterate `errors[]` can render the prose.
+func ErrRequestValidationFailed(ruleID string, errs []FieldError) *Problem {
+	p := NewProblem(http.StatusUnprocessableEntity, CodeRequestValidationFailed,
+		"Invalid request",
+		"the request body does not match the validate-edge-rule schema")
+	if ruleID != "" {
+		// Surface the rule id on the wire so a customer support agent
+		// can locate which rule fired without re-reading the audit
+		// log. Detail stays unchanged for SDK prose paths.
+		p.Detail = fmt.Sprintf("the request body does not match the validate-edge-rule schema (rule %s)", ruleID)
+	}
+	p.Errors = errs
+	return p
 }
