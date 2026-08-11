@@ -60,6 +60,16 @@ const (
 	// The CHECK constraint on builds.kind is relaxed to allow
 	// this value by migration 00085.
 	DeploymentKindGitHub DeploymentKind = "github"
+	// DeploymentKindPreview tags builds enqueued by the githubd
+	// pull_request preview path (issue #272, ADR-094). Same wire
+	// shape as DeploymentKindGitHub (the codeload tarball is
+	// fetched server-side via the install-token mint), but the
+	// deployment row identifies it as a PR preview so per-customer
+	// dashboards and the preview-aware billing breakdown can
+	// distinguish ephemeral previews from prod pushes. The CHECK
+	// constraint on builds.kind is relaxed to allow this value
+	// by migration 00218.
+	DeploymentKindPreview DeploymentKind = "preview"
 )
 
 // DeploymentStatus tracks a deployment through the pipeline (spec §5, §9).
@@ -600,6 +610,43 @@ type App struct {
 	// api.Plan.EvictionPriorityReservedAllowed(); the column CHECK
 	// (apps_eviction_priority_chk) is the data-integrity backstop.
 	EvictionPriority string
+	// PreviewOfSlug names the parent (production) app this row is
+	// a PR preview of. Empty for production apps. Non-empty for
+	// preview rows provisioned by githubd's pull_request handler
+	// (issue #272 / ADR-094). The slug pair (preview_of_slug,
+	// preview_pr_number) is the natural lookup key for the
+	// dashboard's "preview environments" pane and for the teardown
+	// janitor's nightly scan. Nullable text in SQL; the empty-
+	// string-means-NULL convention matches Runtime / StartCommand.
+	PreviewOfSlug string
+	// PreviewPrNumber is the GitHub PR number this preview row
+	// tracks. Stable across synchronize/reopened events on the
+	// same PR; the slug is `pr-{N}-{parent_slug}`. Zero on
+	// production apps.
+	PreviewPrNumber int
+	// PreviewPrState is the closed-set lifecycle label on a
+	// preview row. NULL on production apps. The
+	// closed → stale → torn_down transitions are driven by the
+	// cmd/schedd/janitor_preview.go loop (PR-C). Values:
+	//
+	//   - "open"     : PR is open on GitHub; preview serves traffic.
+	//   - "closed"   : PR was closed within the last 24h; preview
+	//                  still serves traffic, allowing a quick
+	//                  reopen-replay to land without a fresh build.
+	//   - "stale"    : PR was closed more than 24h ago OR has
+	//                  expired (preview_expires_at < now()).
+	//                  Preview refuses new wakes (410 Gone).
+	//   - "torn_down": Teardown complete; the apps row is
+	//                  tombstoned (deleted_at set). The slug is
+	//                  free for reuse.
+	PreviewPrState string
+	// PreviewExpiresAt is the wall-clock time the teardown
+	// janitor should reap the preview, regardless of GitHub state.
+	// Computed at provision time as created_at + 7 days; the
+	// dashboard's preview panel surfaces the expiry to the
+	// customer so they can pin a preview they want to keep. NULL
+	// on production apps.
+	PreviewExpiresAt *time.Time
 	CreatedAt        time.Time
 }
 
@@ -626,6 +673,35 @@ func EvictionPriorityOrBestEffort(p string) string {
 		return string(api.EvictionPriorityBestEffort)
 	}
 	return p
+}
+
+// PreviewPrStateOpen / Closed / Stale / TornDown are the four
+// closed-set values for state.App.PreviewPrState. Mirrors the
+// apps_preview_pr_state_chk CHECK constraint introduced by
+// migration 00218 (issue #272 / ADR-094). Empty string means
+// "production app, no preview state" — the SQL CHECK allows
+// NULL or one of the four values; the Go side represents NULL
+// as "" (same convention as EvictionPriorityOrBestEffort).
+const (
+	PreviewPrStateOpen     = "open"
+	PreviewPrStateClosed   = "closed"
+	PreviewPrStateStale    = "stale"
+	PreviewPrStateTornDown = "torn_down"
+)
+
+// PreviewPrStateIsValid reports whether the value is one of
+// the four legal preview_pr_state values. Empty string is the
+// "production app" shape (preview_pr_state IS NULL) — the SQL
+// CHECK allows NULL; the Go side uses "" for that. Callers
+// building a new preview App MUST set a non-empty value from
+// the closed set above.
+func PreviewPrStateIsValid(s string) bool {
+	switch s {
+	case PreviewPrStateOpen, PreviewPrStateClosed, PreviewPrStateStale, PreviewPrStateTornDown:
+		return true
+	default:
+		return false
+	}
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
