@@ -5,12 +5,14 @@ package wire
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/onebox-faas/faas/pkg/logsanitize"
@@ -206,5 +208,168 @@ func watchLogLevelReload(ctx context.Context, log *slog.Logger, hupCh <-chan os.
 				"env", EnvLogLevel, "got", logsanitize.Field(raw), "fallback", "info")
 		}
 		log.Info("log level changed", "prev", prev.String(), "next", next.String())
+	}
+}
+
+// TLSReloader is the contract pkg/wire.WatchTLSReload drives: a small
+// setter that swaps the daemon's *tls.Config on a successful SIGHUP-driven
+// reload. Production implementations a a struct holding the config
+// behind an atomic.Pointer (or sync/atomic.Value) so gRPC's tlsCreds
+// reads a stable *tls.Config pointer at handshake time and the
+// WatchTLSReload goroutine swaps it without contending with the
+// handshake path.
+//
+// Set is called only on successful reload — a failed reload keeps the
+// prior config live. WatchTLSReload's contract is best-effort
+// (matches vmmd's watchEgressBundleReload at cmd/vmmd/egress_bundle.go
+// and pkg/wire.watchLogLevelReload): a malformed cert file does NOT
+// brick the daemon's mTLS leg.
+type TLSReloader interface {
+	// Set replaces the daemon's live *tls.Config with cfg. Called
+	// after WatchTLSReload's reload closure returns a fresh
+	// *tls.Config on a successful reload. WatchTLSReload never
+	// invokes Set on a nil cfg.
+	Set(cfg *tls.Config)
+}
+
+// TLSRotator is the production pkg/wire.TLSReloader implementation:
+// an atomic.Pointer[tls.Config] holding the live config, goroutine-
+// safe Set / Get / Reload. Used by every daemon (schedd, vmmd, apid)
+// that adopts the SIGHUP-driven cert rotation slice (ADR-052 §5 /
+// PR-E).
+//
+// The rotator serves two purposes:
+//
+//   - WatchTLSReload calls Set on every successful SIGHUP-driven
+//     reload. Handshake paths (gRPC's tlsCreds holds the original
+//     *tls.Config for the listener's lifetime) consult the rotator
+//     via the Reload closure installed at startup; stdlib invokes
+//     that closure on every handshake so a Set between two
+//     handshakes is observable to the second handshake. No listener
+//     rebuild required.
+//
+//   - Dialer closures that captured the boot-time *tls.Config read
+//     via Get() at dial time, so a SIGHUP-driven swap between dials
+//     surfaces the new material on the next dial without restart.
+//
+// Sync: atomic.Pointer is the load-bearing primitive. Set is called
+// only on successful reload (WatchTLSReload never swaps on error).
+// Get / Reload may be called from any goroutine.
+type TLSRotator struct {
+	ptr atomic.Pointer[tls.Config]
+}
+
+// NewTLSRotator builds a rotator holding initial. A nil initial is
+// tolerated and degrades to "no TLS configured" — Set becomes a
+// silent no-op (the rotator never acquired material). This keeps
+// the single-box / no-cluster paths from crashing on boot.
+func NewTLSRotator(initial *tls.Config) *TLSRotator {
+	r := &TLSRotator{}
+	if initial != nil {
+		r.ptr.Store(initial)
+	}
+	return r
+}
+
+// Set replaces the rotator's live *tls.Config. Called by
+// pkg/wire.WatchTLSReload after a successful reload. A nil cfg is
+// silently dropped so a buggy loader that returns (nil, nil) on
+// success doesn't silently null out an active rotator —
+// WatchTLSReload already warns on this case.
+func (r *TLSRotator) Set(cfg *tls.Config) {
+	if cfg == nil || r == nil {
+		return
+	}
+	r.ptr.Store(cfg)
+}
+
+// Get returns the rotator's live *tls.Config, or nil if no
+// material has ever been Set (the single-box / empty-cluster
+// posture). Callers that branch on a nil cfg should treat the
+// nil return the same as Load*TLSConfig's (nil, nil) contract:
+// the dial/listen site stays in the legacy shape.
+func (r *TLSRotator) Get() *tls.Config {
+	if r == nil {
+		return nil
+	}
+	return r.ptr.Load()
+}
+
+// Reload returns a wire.ReloadFunc the Load*TLSConfigWithReload
+// factory can hand to stdlib. On every handshake, stdlib consults
+// the closure, which reads the live *tls.Config from the rotator.
+// The closure is goroutine-safe: it holds only the rotator's
+// pointer (an atomic load) and never writes through it.
+//
+// The closure is the unit of freshness: stdlib re-runs it on
+// every handshake, so a SIGHUP-driven Set between two handshakes
+// is observable to the second handshake. gRPC's tlsCreds keeps the
+// outer *tls.Config for the listener's lifetime; the reload
+// handshake path is the per-handshake indirection that surfaces
+// the rotated material.
+//
+// initial is the daemon-supplied fallback (the startup value, in
+// case WatchTLSReload never fires): the closure returns initial
+// when the rotator is empty, so a single-box daemon that loses
+// its rotator still hands stdlib something usable.
+func (r *TLSRotator) Reload(initial *tls.Config) func() (*tls.Config, error) {
+	return func() (*tls.Config, error) {
+		if r == nil {
+			return initial, nil
+		}
+		if cur := r.ptr.Load(); cur != nil {
+			return cur, nil
+		}
+		return initial, nil
+	}
+}
+
+// WatchTLSReload is the SIGHUP-driven TLS cert rotation helper
+// (ADR-052 §5 / PR-E). On every hupCh receive, it calls reload(),
+// then Set()s the resulting *tls.Config on reloader. A failed
+// reload is Warn-logged with the path + error; the prior config
+// stays live (no Set call). The function never mutates hupCh
+// from the inside — production wraps it via signal.Notify and
+// tests inject their own channel.
+//
+// reload==nil returns immediately (no reload wired). The SIGHUP
+// path still installs at the call site (daemons install the
+// channel unconditionally); WatchTLSReload's early-return keeps
+// the production hot path silent when the daemon is single-box
+// with no TLS cluster configured.
+//
+// The reload closure is called OUTSIDE the watcher loop on every
+// hupCh receive; the caller is responsible for keeping reload
+// goroutine-safe (gRPC's tlsCreds invokes the per-handshake
+// callback concurrently with the SIGHUP-driven reload). See
+// tlsRotator in cmd/schedd/tls_rotator.go for the canonical
+// production pattern.
+func WatchTLSReload(ctx context.Context, log *slog.Logger, hupCh <-chan os.Signal, reloader TLSReloader, reload ReloadFunc) {
+	if reload == nil || reloader == nil {
+		// Either no reload wired (single-box with no TLS cluster)
+		// or no rotator installed. Stay quiet — the SIGHUP
+		// channel still drains (it's owned by the caller, who
+		// may have other reloaders), but we don't consume it.
+		log.Debug("wire: TLS reload disabled (nil reload or reloader)")
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hupCh:
+		}
+		next, err := reload()
+		if err != nil {
+			log.Warn("wire: TLS reload failed; keeping prior material",
+				"err", logsanitize.Field(err.Error()))
+			continue
+		}
+		if next == nil {
+			log.Warn("wire: TLS reload returned nil config; keeping prior material")
+			continue
+		}
+		reloader.Set(next)
+		log.Info("wire: TLS config reloaded")
 	}
 }

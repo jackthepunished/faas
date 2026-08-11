@@ -295,6 +295,17 @@ func (c *Config) LoadAdvisoryTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, 
 	return wire.LoadServerTLSConfigWithPrefixAndVerifier("advisory_", c.AdvisoryTLSCertPath, c.AdvisoryTLSKeyPath, c.AdvisoryTLSCAPath, v)
 }
 
+// LoadAdvisoryTLSWithPrefixAndVerifierAndReload is the ADR-052 §5
+// / PR-E variant of LoadAdvisoryTLSWithVerifier. Same nil-tolerance
+// contract: nil verifier / nil reload degrade to the no-hook /
+// no-callback shape (LoadAdvisoryTLS).
+func (c *Config) LoadAdvisoryTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadServerTLSConfigWithPrefixAndVerifierAndReload("advisory_", c.AdvisoryTLSCertPath, c.AdvisoryTLSKeyPath, c.AdvisoryTLSCAPath, v, reload)
+}
+
 // LoadGithubdBridgeTLSWithVerifier is the PR-B (issue #678 / ADR-056)
 // variant of LoadGithubdBridgeTLS. Same nil-verifier degradation
 // contract as LoadAdvisoryTLSWithVerifier.
@@ -303,6 +314,16 @@ func (c *Config) LoadGithubdBridgeTLSWithVerifier(v wire.NodeVerifier) (*tls.Con
 		return nil, nil
 	}
 	return wire.LoadServerTLSConfigWithPrefixAndVerifier("githubd_bridge_", c.GithubdBridgeTLSCertPath, c.GithubdBridgeTLSKeyPath, c.GithubdBridgeTLSCAPath, v)
+}
+
+// LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload is the
+// ADR-052 §5 / PR-E variant of LoadGithubdBridgeTLSWithVerifier.
+// Same nil-tolerance contract as LoadAdvisoryTLSWithPrefixAndVerifierAndReload.
+func (c *Config) LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadServerTLSConfigWithPrefixAndVerifierAndReload("githubd_bridge_", c.GithubdBridgeTLSCertPath, c.GithubdBridgeTLSKeyPath, c.GithubdBridgeTLSCAPath, v, reload)
 }
 
 // LoadGithubdTLSWithVerifier is the PR-B (issue #678 / ADR-056)
@@ -314,4 +335,16 @@ func (c *Config) LoadGithubdTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, e
 		return nil, nil
 	}
 	return wire.LoadClientTLSConfigWithPrefixAndVerifier("githubd_", c.GithubdClientTLSCertPath, c.GithubdClientTLSKeyPath, c.GithubdClientTLSCAPath, v)
+}
+
+// LoadGithubdTLSWithPrefixAndVerifierAndReload is the
+// ADR-052 §5 / PR-E variant of LoadGithubdTLSWithVerifier.
+// Client-side: trust root is fixed at config-build time per
+// ADR-052 §Risks "CA rotation pain"; only the leaf rotates
+// per-handshake via stdlib's GetClientCertificate callback.
+func (c *Config) LoadGithubdTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return wire.LoadClientTLSConfigWithPrefixAndVerifierAndReload("githubd_", c.GithubdClientTLSCertPath, c.GithubdClientTLSKeyPath, c.GithubdClientTLSCAPath, v, reload)
 }
