@@ -103,6 +103,22 @@ type Config struct {
 	// round-trip. Production default is false — operators opt in
 	// per-cluster after PR-B ships.
 	StreamingEnabled bool `toml:"streaming_enabled"`
+
+	// RouteMetricsEnabled (ADR-093) is the operator kill-switch
+	// for the per-route observability surface. When false (the
+	// default), every per-app routeSetFor lookup in Handler.ServeHTTP
+	// returns nil regardless of app.RouteMetricsEnabled — the
+	// customer's per-app flag is inert. The two flags are AND-gated
+	// in the Handler. The two-level shape mirrors the
+	// streaming_enabled / app.StreamingEnabled pair (issue #471
+	// / ADR-047) so an operator can disable the per-route surface
+	// wholesale on a hot day without a database round-trip.
+	//
+	// Overridable via FAAS_GATEWAY_ROUTE_METRICS so the e2e
+	// harness and metal tests can flip it without a TOML
+	// round-trip. Production default is false — operators opt in
+	// per-cluster after the envelope is comfortable.
+	RouteMetricsEnabled bool `toml:"route_metrics_enabled"`
 	// ResponseWriteTimeout is the http.Server.WriteTimeout override
 	// (spec §4.1: 300 s; issue #471 raises it to 900 s for paid
 	// plans). When 0, gatewayd uses api.ResponseWriteTimeout() which

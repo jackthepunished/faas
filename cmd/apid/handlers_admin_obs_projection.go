@@ -247,7 +247,7 @@ func buildTenantDetail(ctx context.Context, st state.Store, a state.Account, inc
 		deps, _ := st.ListDeploymentsForApp(ctx, app.ID, 1000, 0)
 		live := 0
 		for _, d := range deps {
-			if d.Status == "live" {
+			if d.Status == state.DeployLive {
 				live++
 			}
 		}

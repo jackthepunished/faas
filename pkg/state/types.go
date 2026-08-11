@@ -410,6 +410,14 @@ type App struct {
 	// PATCH it to true (apid returns 403
 	// plan_websocket_not_allowed); Hobby/Pro/Scale default to true.
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) opts the app into the per-route
+	// observability surface. Mirrors WebSocketEnabled's plan-gating
+	// contract: Free defaults to false and cannot PATCH it to true
+	// (apid returns 403 plan_route_metrics_not_allowed); Hobby/Pro/
+	// Scale default to true. The per-app route cap (50) +
+	// __route_other__ overflow bound the cardinality regardless of
+	// the customer's traffic shape.
+	RouteMetricsEnabled bool
 	// RequireSigned gates OCI image deploys (issue #472 / ADR-054) on
 	// a valid cosign signature from a trusted publisher. When true,
 	// imaged's buildImageLayer calls pkg/cosign.VerifyImageSignature
@@ -2187,6 +2195,16 @@ type UpdateAppParams struct {
 	// should never accept an Upgrade).
 	WebSocketEnabled    *bool
 	SetWebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) toggles the per-app per-route
+	// observability surface. SetRouteMetricsEnabled distinguishes
+	// "unset" (don't touch) from "explicit false" (opt out of the
+	// per-route breakdown). Plan-gated upstream: apid returns 403
+	// plan_route_metrics_not_allowed when the plan lacks the gate
+	// (Free). Hobby/Pro/Scale customers may PATCH true → false to
+	// disable per-route metrics for a specific app (e.g. an app
+	// that does not want the per-route cardinality on the box).
+	RouteMetricsEnabled    *bool
+	SetRouteMetricsEnabled bool
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys
 	// on a valid cosign signature from a trusted publisher. SetRequireSigned
 	// distinguishes "unset" (don't touch) from "explicit false"

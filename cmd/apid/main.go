@@ -1046,6 +1046,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	eventsPlatform := events.NewPlatform("apid", store, log, ops, nil)
 	srv.WithEventsPlatform(eventsPlatform)
 
+	// ADR-093: gatewayd-internal control-listener URL for the
+	// per-route observability reader. Default
+	// http://127.0.0.1:9090 matches gatewayd-internal's default
+	// control bind (pkg/gateway/control.go ControlAddr). Production
+	// overrides via FAAS_GATEWAYD_CONTROL_URL when the daemons
+	// are split across nodes; same-box is the only supported
+	// posture today (cross-box will need an mTLS-terminating
+	// reverse-proxy — out of scope for this PR). Empty disables
+	// the /v1/apps/{slug}/routes surface; getAppRoutes renders
+	// the unavailable state so the dashboard can distinguish
+	// "operator hasn't wired it" from "no traffic yet".
+	srv.WithGatewaydControlURL(deps.getenv("FAAS_GATEWAYD_CONTROL_URL"))
+
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
 	// prometheus (default :9090 on the bridge). The HTML path defaults

@@ -33,6 +33,10 @@ export type UpdateAppRequest = {
    */
   websocket_enabled?: boolean | null;
   /**
+   * Per-app per-route observability flag (ADR-093). Omitted → no change. Free PATCHing true is 403 plan_route_metrics_not_allowed.
+   */
+  route_metrics_enabled?: boolean | null;
+  /**
    * Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column.
    */
   scaling_policy?: (null | ScalingPolicy);

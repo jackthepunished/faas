@@ -46,6 +46,10 @@ export type AppResponse = {
    */
   websocket_enabled?: boolean;
   /**
+   * Per-app per-route observability flag (ADR-093). When true, gatewayd-internal emits gateway_request_duration_seconds{app,route,class} and serves the bounded reader at GET /v1/apps/{slug}/routes. Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed.
+   */
+  route_metrics_enabled?: boolean;
+  /**
    * Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column `apps.scaling_policy`.
    */
   scaling_policy?: (null | ScalingPolicy);

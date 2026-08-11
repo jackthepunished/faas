@@ -30,6 +30,7 @@ export type { AppMetricsResponse } from './models/AppMetricsResponse.js';
 export type { AppRegistryCredentialListResponse } from './models/AppRegistryCredentialListResponse.js';
 export type { AppRegistryCredentialResponse } from './models/AppRegistryCredentialResponse.js';
 export type { AppResponse } from './models/AppResponse.js';
+export type { AppRoutesResponse } from './models/AppRoutesResponse.js';
 export type { AppSecretExportResponse } from './models/AppSecretExportResponse.js';
 export type { AppSecretListResponse } from './models/AppSecretListResponse.js';
 export type { AppSecretResponse } from './models/AppSecretResponse.js';
@@ -187,6 +188,7 @@ export type { RotateAppWebhookSecretResponse } from './models/RotateAppWebhookSe
 export type { RotateKeyResponse } from './models/RotateKeyResponse.js';
 export type { RotateOrgAPIKeyRequest } from './models/RotateOrgAPIKeyRequest.js';
 export type { RotateOrgAPIKeyResponse } from './models/RotateOrgAPIKeyResponse.js';
+export type { RouteRow } from './models/RouteRow.js';
 export type { ScalingPolicy } from './models/ScalingPolicy.js';
 export type { ScalingTarget } from './models/ScalingTarget.js';
 export type { ScanResult } from './models/ScanResult.js';

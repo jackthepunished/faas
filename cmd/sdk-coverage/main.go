@@ -370,6 +370,13 @@ var methodRouteMap = map[string]string{
 	"GET /v1/apps/{slug}/slo": "GetAppSLO",
 	"GET /v1/account/slo":     "GetAccountSLO",
 
+	// ADR-093 — per-route observability inside an app. The
+	// auto-derivation would produce GetAppsSlugRoutes
+	// (Swagger-style); the SDK names it GetAppRoutes to match the
+	// sibling per-app family (GetAppMetrics, GetAppSLO, GetApp,
+	// ListApps) — drop the slug placeholder from the verb.
+	"GET /v1/apps/{slug}/routes": "GetAppRoutes",
+
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
 	// SDK named these methods deliberately after the user-facing action

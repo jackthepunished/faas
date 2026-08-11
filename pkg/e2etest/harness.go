@@ -500,7 +500,7 @@ const testDomain = "apps.test.example"
 // discipline (memory: cross-pr-slot-gate-fence-pattern) is that
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
-const e2eMigrationTarget = 215
+const e2eMigrationTarget = 216
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

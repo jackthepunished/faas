@@ -103,6 +103,50 @@ groups:
             0.001
           )
 
+      # ─────────────────────────────────────────────────────────────────
+      # ADR-093 — per-route observability (gatewayd-internal)
+      # ─────────────────────────────────────────────────────────────────
+      #
+      # Mirror of the apid per-route pattern above. The bounded
+      # admission set behind gateway_request_*{route,…} bounds the
+      # series fan-out to O(50 routes × N apps), not O(paths). The
+      # recording rules here ride the same machinery the apid-side
+      # rules use so the dashboard panels can join on (app, route)
+      # uniformly. Clamp_min(...) guards /0 on quiet routes.
+      #
+      # Why this is opt-in only at the metric level: the
+      # gateway_request_*_total{route=…} series are emitted
+      # unconditionally on every request that lands on an
+      # opted-in app. Off-apps still emit the pre-ADR-042
+      # {app, code} / {app, class} series; the recording
+      # rules below simply have zero data points to aggregate.
+      - record: faas_gateway_request_rate_3d_baseline:by_route
+        expr: |
+          avg_over_time(
+            sum by (app, route) (rate(gateway_requests_total[5m]))[3d:5m]
+          )
+      - record: faas_gateway_request_rate_5m:by_route
+        expr: sum by (app, route) (rate(gateway_requests_total[5m]))
+      - record: faas_gateway_request_rate_ratio:by_route
+        expr: |
+          faas_gateway_request_rate_5m:by_route
+          /
+          clamp_min(faas_gateway_request_rate_3d_baseline:by_route, 0.001)
+      - record: faas_gateway_error_rate_5m:by_route
+        expr: |
+          sum by (app, route) (rate(gateway_request_failures_total[5m]))
+          /
+          clamp_min(
+            sum by (app, route) (rate(gateway_requests_total[5m])),
+            0.001
+          )
+      - record: faas_gateway_p95_seconds:by_route
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (app, route, le) (rate(gateway_request_duration_seconds_bucket[5m]))
+          )
+
   - name: faas_slo
     interval: 30s
     rules:
@@ -271,7 +315,7 @@ groups:
       # ─────────────────────────────────────────────────────────────────
       - alert: FaasApiAvailabilityLow
         expr: |
-          (sum(rate(gateway_requests_total{code=~"2.."}[5m]))
+          (sum(rate(gateway_requests_by_route_total{code=~"2.."}[5m]))
             /
           sum(rate(gateway_requests_total[5m])))
             < 0.995
@@ -825,6 +869,36 @@ groups:
           summary: "githubd path-filter degraded — credentials missing or compare API unreachable"
           description: "githubd_path_filter_total{mode=error|breaker_open} has been ticking for 10m. mode=error fires when the GitHub App credentials are not provisioned (cmd/githubd wires NewUnavailableChangedFiles as the stub) or when the GitHub compare API returned a transport / non-2xx error. mode=breaker_open fires after 3 consecutive errors trip the breaker (pkg/githubd/changedfiles.go). Either way every push rebuilds every touched app — the conservative posture defeats the path-filter efficiency win. Verify: 1) FAAS_GITHUB_APP_ID + FAAS_GITHUB_APP_KEY_PATH point at a valid App + key; 2) outbound api.github.com is reachable; 3) the App installation hasn't been revoked. Runbook: docs/runbooks/FaasGithubdPathFilterDegraded.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasGithubdPathFilterDegraded.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # ADR-093 — wildcard-route detector
+      # ─────────────────────────────────────────────────────────────────
+      #
+      # The per-route observability surface bounds each app at 50
+      # distinct real routes; further routes collapse to the
+      # __route_other__ overflow bucket (ADR-093 D2). A sustained
+      # spike on __route_other__ for a single (app, route) tuple is
+      # the canonical "this app is now serving a wildcard path
+      # pattern (e.g. /users/{uuid}) — the per-route series is
+      # collapsing because distinct path count > 50" signal.
+      #
+      # Severity is info (not warn/page) — the customer app still
+      # serves correctly; we just stopped distinguishing routes
+      # for them. Operators should treat a sustained spike as
+      # "either the customer added a wildcard route OR something
+      # is path-fuzzing their app".
+      - alert: GatewayWildcardRoute
+        expr: |
+          sum by (app, route) (rate(gateway_requests_by_route_total{route="__route_other__"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: info
+          component: gatewayd-internal
+          family: route_metrics
+        annotations:
+          summary: "App {{ $labels.app }} sustained in __route_other__ overflow for 10m"
+          description: "gateway_requests_by_route_total{route=__route_other__, app={{ $labels.app }}} has been above 1 reqps for 10m. The bounded admission set (50 routes + the __route_other__ bucket, ADR-093 D2) is collapsing distinct paths because the app is generating more than 50 distinct routes. Two interpretations: (1) the customer deployed a wildcard route pattern (/users/{uuid}) and the per-route breakdown is intentionally collapsing; (2) the app is being path-fuzzed. Runbook: docs/runbooks/GatewayWildcardRoute.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/GatewayWildcardRoute.md"
 
       - alert: FaasGithubdPathFilterDegradedWarn
         expr: sum(rate(githubd_path_filter_total{mode=~"error|breaker_open"}[5m])) > 0
