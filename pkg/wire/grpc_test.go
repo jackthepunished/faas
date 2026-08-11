@@ -983,7 +983,7 @@ func TestTLSLoadersWithReload_ReloadErrorPropagates(t *testing.T) {
 	if err == nil || got != nil {
 		t.Errorf("server: got=%v err=%v; want nil cfg + boom err", got, err)
 	}
-	if err != boom {
+	if !errors.Is(err, boom) {
 		t.Errorf("server: err = %v, want %v", err, boom)
 	}
 
@@ -995,7 +995,7 @@ func TestTLSLoadersWithReload_ReloadErrorPropagates(t *testing.T) {
 	if err == nil || cert != nil {
 		t.Errorf("client: cert=%v err=%v; want nil cert + boom err", cert, err)
 	}
-	if err != boom {
+	if !errors.Is(err, boom) {
 		t.Errorf("client: err = %v, want %v", err, boom)
 	}
 }
