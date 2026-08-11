@@ -77,7 +77,7 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/audit-log/search":        true, // ADR-091 — operator-only (PR #3)
 	"GET /v1/admin/obs/events":                  true, // ADR-091 — operator-only (PR #3)
 	"GET /v1/admin/obs/nodes/events":            true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
-	"GET /v1/admin/obs/nodes/wake-latency":       true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
+	"GET /v1/admin/obs/nodes/wake-latency":      true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie

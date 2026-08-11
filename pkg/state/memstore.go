@@ -2198,8 +2198,8 @@ func isInstanceStateLive(state string) bool {
 // the SQL CHECK constraint is the load-bearing enforcement and
 // any wider refactor is out of scope.
 const (
-	instanceStateRunning    = "RUNNING"
-	instanceStateWaking     = "WAKING"
+	instanceStateRunning     = "RUNNING"
+	instanceStateWaking      = "WAKING"
 	instanceStateColdBooting = "COLD_BOOTING"
 )
 

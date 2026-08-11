@@ -89,8 +89,8 @@ import (
 type Metrics struct {
 	registry *prometheus.Registry
 
-	requests      *prometheus.CounterVec
-	wakeLatency   prometheus.Histogram
+	requests    *prometheus.CounterVec
+	wakeLatency prometheus.Histogram
 	// wakeLatencyByNode (PR #4 / ADR-092 §3.5) is the per-node
 	// labelled twin of wakeLatency. The unlabeled histogram stays
 	// untouched — it's the §12 SLA contract and is consumed by
@@ -106,8 +106,8 @@ type Metrics struct {
 	// §3.6 documents the label cardinality constraint.
 	wakeLatencyByNode *prometheus.HistogramVec
 	wakeQueueWait     prometheus.Histogram
-	queueDepth    *prometheus.GaugeVec
-	rateLimited   *prometheus.CounterVec
+	queueDepth        *prometheus.GaugeVec
+	rateLimited       *prometheus.CounterVec
 	// edgeRuleMatch: ADR-089 PR 3. Counter labelled by
 	// (kind, outcome) — `kind` is the EdgeRuleKind
 	// (route|rewrite|redirect|headers|cors|jwt|ip; closed set

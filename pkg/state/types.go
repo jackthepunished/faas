@@ -1885,12 +1885,12 @@ type ComputeNodeHeartbeatStats struct {
 // invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so the per-node RAMUsedMB
 // is the operator-side number that adds up to the fleet ceiling.
 type PerNodeStats struct {
-	NodeName              string
-	InstancesLive         int64
-	InstancesRunning      int64
-	InstancesWaking       int64
-	InstancesColdBooting  int64
-	RAMUsedMB             int64
+	NodeName             string
+	InstancesLive        int64
+	InstancesRunning     int64
+	InstancesWaking      int64
+	InstancesColdBooting int64
+	RAMUsedMB            int64
 }
 
 // InstanceTouch is one entry in a last_request_at flush batch (spec §4.1). The
