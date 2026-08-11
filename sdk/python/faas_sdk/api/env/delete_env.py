@@ -7,13 +7,21 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.problem import Problem
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     slug: str,
     key: str,
+    *,
+    scope: str | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["scope"] = scope
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "delete",
@@ -21,6 +29,7 @@ def _get_kwargs(
             slug=quote(str(slug), safe=""),
             key=quote(str(key), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -71,12 +80,22 @@ def sync_detailed(
     key: str,
     *,
     client: AuthenticatedClient | Client,
+    scope: str | Unset = UNSET,
 ) -> Response[Any | Problem]:
     """Delete an env var.
+
+     Removes the (app_id, scope, key) row. `?scope=` selects
+    which scope; omitted = the default scope. `?scope=__all__`
+    is rejected (400 `env_scope_reserved`) — same reason as
+    on PUT: the sentinel has no meaning on a single-row
+    delete. Returns 400 `env_var_not_found` (not 404) when
+    no row matches — the URL resource is the env-var, not
+    the app.
 
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -89,6 +108,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         slug=slug,
         key=key,
+        scope=scope,
     )
 
     response = client.get_httpx_client().request(
@@ -103,12 +123,22 @@ def sync(
     key: str,
     *,
     client: AuthenticatedClient | Client,
+    scope: str | Unset = UNSET,
 ) -> Any | Problem | None:
     """Delete an env var.
+
+     Removes the (app_id, scope, key) row. `?scope=` selects
+    which scope; omitted = the default scope. `?scope=__all__`
+    is rejected (400 `env_scope_reserved`) — same reason as
+    on PUT: the sentinel has no meaning on a single-row
+    delete. Returns 400 `env_var_not_found` (not 404) when
+    no row matches — the URL resource is the env-var, not
+    the app.
 
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -122,6 +152,7 @@ def sync(
         slug=slug,
         key=key,
         client=client,
+        scope=scope,
     ).parsed
 
 
@@ -130,12 +161,22 @@ async def asyncio_detailed(
     key: str,
     *,
     client: AuthenticatedClient | Client,
+    scope: str | Unset = UNSET,
 ) -> Response[Any | Problem]:
     """Delete an env var.
+
+     Removes the (app_id, scope, key) row. `?scope=` selects
+    which scope; omitted = the default scope. `?scope=__all__`
+    is rejected (400 `env_scope_reserved`) — same reason as
+    on PUT: the sentinel has no meaning on a single-row
+    delete. Returns 400 `env_var_not_found` (not 404) when
+    no row matches — the URL resource is the env-var, not
+    the app.
 
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -148,6 +189,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         slug=slug,
         key=key,
+        scope=scope,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -160,12 +202,22 @@ async def asyncio(
     key: str,
     *,
     client: AuthenticatedClient | Client,
+    scope: str | Unset = UNSET,
 ) -> Any | Problem | None:
     """Delete an env var.
+
+     Removes the (app_id, scope, key) row. `?scope=` selects
+    which scope; omitted = the default scope. `?scope=__all__`
+    is rejected (400 `env_scope_reserved`) — same reason as
+    on PUT: the sentinel has no meaning on a single-row
+    delete. Returns 400 `env_var_not_found` (not 404) when
+    no row matches — the URL resource is the env-var, not
+    the app.
 
     Args:
         slug (str):
         key (str):
+        scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -180,5 +232,6 @@ async def asyncio(
             slug=slug,
             key=key,
             client=client,
+            scope=scope,
         )
     ).parsed

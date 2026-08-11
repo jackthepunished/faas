@@ -7,25 +7,23 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="AppEnvResponse")
+T = TypeVar("T", bound="ScopedAppEnvResponse")
 
 
 @_attrs_define
-class AppEnvResponse:
-    """An env var envelope: key name + scope + timestamps. The plaintext value never appears here."""
+class ScopedAppEnvResponse:
+    """An env var envelope scoped to one named environment (ADR-090). The plaintext value never appears here."""
 
-    key: str
     scope: str
-    """Env-var scope (ADR-090). Always 'default' for the pre-PR-B flat response; varies for the nested
-    `env_by_scope` response."""
+    key: str
     created_at: datetime.datetime
     updated_at: datetime.datetime
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        key = self.key
-
         scope = self.scope
+
+        key = self.key
 
         created_at = self.created_at.isoformat()
 
@@ -35,8 +33,8 @@ class AppEnvResponse:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "key": key,
                 "scope": scope,
+                "key": key,
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
@@ -47,23 +45,23 @@ class AppEnvResponse:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        key = d.pop("key")
-
         scope = d.pop("scope")
+
+        key = d.pop("key")
 
         created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
 
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
 
-        app_env_response = cls(
-            key=key,
+        scoped_app_env_response = cls(
             scope=scope,
+            key=key,
             created_at=created_at,
             updated_at=updated_at,
         )
 
-        app_env_response.additional_properties = d
-        return app_env_response
+        scoped_app_env_response.additional_properties = d
+        return scoped_app_env_response
 
     @property
     def additional_keys(self) -> list[str]:

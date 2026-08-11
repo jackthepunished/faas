@@ -8428,6 +8428,31 @@ func (m *MemStore) CountAppEnvInScope(_ context.Context, accountID, appID, scope
 	return n, nil
 }
 
+// ListAllAppEnv returns every env row on the app across all scopes,
+// scoped to accountID. Order: by scope ASC, key ASC (mirrors the
+// pgstore ORDER BY so handler tests see the same wire shape).
+// Used by apid's GET /v1/apps/{slug}/envs?scope=__all__ arm
+// (ADR-090 PR-B / D3) to render the nested `env_by_scope` response
+// shape.
+func (m *MemStore) ListAllAppEnv(_ context.Context, accountID, appID string) ([]AppEnv, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AppEnv
+	for _, e := range m.envs {
+		if e.AppID != appID || e.AccountID != accountID {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out, nil
+}
+
 // --- app trusted cosign signers (issue #472 / ADR-054) -----------------------
 //
 // MemStore mirrors the PgStore trusted-signer CRUD so handler tests

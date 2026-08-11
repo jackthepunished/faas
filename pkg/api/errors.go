@@ -393,6 +393,18 @@ const (
 	CodeEnvVarValueTooLarge = "env_value_too_large"
 	CodeEnvVarNotFound      = "env_var_not_found"
 
+	// Customer env-var scopes (ADR-090). The scope query param on
+	// /v1/apps/{slug}/envs?scope= accepts a domain-valid slug (3..40
+	// lowercase alnum + dash) OR the reserved sentinel "__all__" on
+	// the read path. Two distinct codes so a CLI author can tell
+	// "you used the all-scopes sentinel on a write" (400
+	// env_scope_reserved) apart from "your scope name has the wrong
+	// shape" (400 env_scope_invalid). Both render the same HTTP 400
+	// to the customer; the `code` discriminator is for the SDK's
+	// retry-guidance branch.
+	CodeEnvScopeInvalid  = "env_scope_invalid"
+	CodeEnvScopeReserved = "env_scope_reserved"
+
 	// Trusted cosign signers (issue #472 / ADR-054). Same shape as
 	// the env-var quota — config cap, not a credential one — but a
 	// distinct code so the dashboard can surface "trusted publishers"
@@ -1873,6 +1885,36 @@ func ErrEnvVarNotFound(key string) *Problem {
 		"Env var not set",
 		fmt.Sprintf("no env var named %q on this app.", key)).
 		WithDocs(docsBase + "/env")
+}
+
+// ErrEnvScopeInvalid is returned when the scope query param or
+// --scope flag fails the EnvScopePattern check (empty, too long, or
+// out-of-shape). 400, code env_scope_invalid. Mirrors ErrEnvVarInvalidKey
+// on the 400 status + detail shape so the SDK's existing
+// `isInvalidKey()` switch arm decodes this without a new branch.
+//
+// Reserved-sentinel collisions (e.g. the literal "__all__") get the
+// dedicated ErrEnvScopeReserved code instead — see that helper's
+// comment for why a separate code is worth the one-line SDK switch.
+func ErrEnvScopeInvalid(detail string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeEnvScopeInvalid,
+		"Invalid env scope",
+		fmt.Sprintf("env scope must match %s; %s", EnvScopePattern, detail)).
+		WithDocs(docsBase + "/env#scopes")
+}
+
+// ErrEnvScopeReserved is returned when the scope query param is the
+// reserved sentinel "__all__" on a WRITE path (PUT/DELETE). The
+// sentinel is read-only — it triggers the nested `env_by_scope`
+// response shape on GET (ADR-090 D3) and MUST NOT be set as a scope
+// name. 400, code env_scope_reserved. Detail names the literal
+// sentinel so the CLI can render "you used the all-scopes sentinel
+// on a write — drop the ?scope= flag" without a separate API call.
+func ErrEnvScopeReserved(sentinel string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeEnvScopeReserved,
+		"Env scope reserved",
+		fmt.Sprintf("scope %q is reserved for the read path; omit ?scope= on writes.", sentinel)).
+		WithDocs(docsBase + "/env#scopes")
 }
 
 // ErrPlanRegistryCredentialsNotAllowed is returned when the customer's

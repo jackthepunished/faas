@@ -2943,6 +2943,16 @@ type Store interface {
 	// PR-A does not call it.
 	CountAppEnvInScope(ctx context.Context, accountID, appID, scope string) (int, error)
 
+	// ListAllAppEnv returns every env row on the app across ALL
+	// scopes, scoped to accountID. Order: by scope ASC, key ASC.
+	// Used by apid's GET /v1/apps/{slug}/envs?scope=__all__ arm
+	// (ADR-090 PR-B) to render the nested `env_by_scope` response
+	// shape (D3). The flat ListAppEnv + per-scope ListAppEnvInScope
+	// methods are still the read path for the per-scope arms; this
+	// one is reserved for the operator-only all-scopes read and
+	// is rare enough that no quota is enforced at the call site.
+	ListAllAppEnv(ctx context.Context, accountID, appID string) ([]AppEnv, error)
+
 	// AppTrustedSigner is the per-app cosign trusted-publisher list
 	// (issue #472 / ADR-054). apid is the only writer; imaged reads
 	// the matching set at deploy-time verify. The four methods mirror
