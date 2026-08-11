@@ -50,14 +50,51 @@ type AppEnvResponse struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+// ScopedAppEnvResponse is the per-row shape for the nested
+// `env_by_scope` response (ADR-090 D3). The flat AppEnvResponse
+// shape is unchanged — the only new field is `scope`, which carries
+// the scope name on the wire so a CLI / dashboard can render
+// "scope: staging" without a second lookup. Value is NEVER echoed
+// (same posture as AppEnvResponse).
+//
+// Reserved for the GET ?scope=__all__ path. The flat
+// AppEnvListResponse with a single `env` array is the default
+// (and is what every existing SDK caller decodes today). D3
+// justifies the discriminated-union shape over a single flattened
+// response because a customer on the default scope doesn't need
+// scope metadata in every row — a one-off nested response is
+// cheaper to render than a per-row scope string.
+type ScopedAppEnvResponse struct {
+	Scope     string `json:"scope"`
+	Key       string `json:"key"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// EnvByScope is the nested map shape returned under `env_by_scope`
+// when the GET carries `?scope=__all__`. Keys are scope names
+// (e.g. "default", "staging"); values are the rows for that scope,
+// ordered by key ASC to match the flat response. The map is nil
+// (omitted via omitempty) for the default-scope GET so SDK callers
+// that only care about the flat `env` array don't see a new field
+// they have to special-case.
+type EnvByScope map[string][]ScopedAppEnvResponse
+
 // AppEnvListResponse is the wrapped GET response: the env slice plus
 // quota metadata so the CLI can render "3/8 env vars" without a second
 // request. Shape mirrors AppSecretListResponse field-for-field —
 // SDK callers reuse the same parsing branch.
+//
+// EnvByScope is the discriminated-union arm for `?scope=__all__`
+// (ADR-090 D3). When present, the SDK decodes env_by_scope and
+// treats `env` as an empty array; when absent, the SDK decodes `env`
+// as the flat per-scope result. Both arms are valid wire shapes
+// for a GET /v1/apps/{slug}/envs; the `?scope=` query discriminates.
 type AppEnvListResponse struct {
-	Env   []AppEnvResponse `json:"env"`
-	Quota int              `json:"quota_max"`
-	Count int              `json:"count"`
+	Env        []AppEnvResponse     `json:"env"`
+	EnvByScope EnvByScope           `json:"env_by_scope,omitempty"`
+	Quota      int                  `json:"quota_max"`
+	Count      int                  `json:"count"`
 }
 
 // ValidateEnvKey returns nil when key matches ^[A-Z][A-Z0-9_]*$ and is
