@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00215_app_secrets_scope.sql — ADR-092 / Phase 4 of the
+-- 00216_app_secrets_scope.sql — ADR-092 / Phase 4 of the
 -- secrets+envs roadmap. Lifts the explicit ADR-090 D7 deferral
 -- ("No sealed secrets per scope in Phase 2 — per-scope sealed
 -- secrets ... deferred to a future ADR"). The goal: a `prod`
@@ -12,7 +12,7 @@
 -- (app_id, scope, key) by adding a new `scope` column. The
 -- default backfill is the PG11+ fast-default (same pattern as
 -- 00203_app_envs_scope.sql:65-66 and
--- 00213_deployments_scope.sql:69-70): every pre-00215 row gets
+-- 00213_deployments_scope.sql:69-70): every pre-00216 row gets
 -- scope='default' lazily on first read/write without an UPDATE
 -- rewrite, so the migration is metadata-only on PG15.
 --
@@ -20,7 +20,7 @@
 --   - migrations/00203_app_envs_scope.sql (env vars, shipped)
 --   - migrations/00213_deployments_scope.sql (deployment scope,
 --     shipped at slot 00213)
---   - this migration (sealed secrets, slot 00215)
+--   - this migration (sealed secrets, slot 00216)
 --
 -- Scope shape mirrors the existing `app_envs_scope_shape` CHECK
 -- (00203) and `deployments_scope_shape` CHECK (00213) and
@@ -36,11 +36,11 @@
 -- 3-column PK and skips the drop+recreate. Same convention as
 -- 00203 L85-97 and 00064_invocations_dead_letter.sql:56-71.
 --
--- Cross-PR slot gate: PR-A claims slot 00215 — the next free
+-- Cross-PR slot gate: PR-A claims slot 00216 — the next free
 -- slot on main after the ADR-091 PR-D (`00213_deployments_scope`)
 -- landed. No sibling PRs are currently contesting this slot.
 -- Pre-merge verify with
---   git ls-tree origin/main migrations/ | grep '^00215'
+--   git ls-tree origin/main migrations/ | grep '^00216'
 -- must return zero matches before push.
 --
 -- The kid column on app_secrets (added by
