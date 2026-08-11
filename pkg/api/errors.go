@@ -1632,8 +1632,8 @@ const (
 	// SDK can drive form-field UI without parsing prose. Distinct
 	// from CodeValidation (the apid body-shape guard) because the
 	// gating policy and the actor are different.
-	CodeRequestValidationFailed      = "request_validation_failed"
-	CodeHeaderMutationForbidden      = "header_mutation_forbidden"
+	CodeRequestValidationFailed = "request_validation_failed"
+	CodeHeaderMutationForbidden = "header_mutation_forbidden"
 )
 
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
