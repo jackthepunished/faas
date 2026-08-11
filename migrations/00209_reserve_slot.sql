@@ -1,12 +1,5 @@
 -- filename: 00209_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Reserve slot 209 for the slot-collision cluster (PRs #829/
--- #835/#836 raced on 00209 simultaneously; PR-D was renumbered
--- past the cluster to 00212). This fence is the cluster's
--- landing-zone — whichever PR merges first squashes this file
--- via `git rm migrations/00209_reserve_slot.sql` and replaces
--- it with their real migration at 00209_*. The remaining
--- cluster members must renumber past 00212.
 SELECT 1;
 -- +goose StatementEnd
