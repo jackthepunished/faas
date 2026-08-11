@@ -105,8 +105,8 @@ type MemStore struct {
 	// for each per-tenant row so the apid admin route can echo
 	// the row back without a second query.
 	githubWebhookSecretMeta map[int64]webhookSecretMeta
-	deployments    map[string]Deployment
-	builds         map[string]Build
+	deployments             map[string]Deployment
+	builds                  map[string]Build
 	// buildProvenance is the ADR-038 "what ran?" record keyed by
 	// build_id (mirrors build_provenance.build_id UNIQUE). MemStore
 	// holds the same idempotent-replace semantics as PgStore's

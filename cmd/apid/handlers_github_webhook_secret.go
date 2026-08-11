@@ -100,9 +100,9 @@ func (s *server) handleSetGithubWebhookSecret(w http.ResponseWriter, r *http.Req
 	}
 	s.audit.Emit(r.Context(), "githubd.webhook_secret_set", nil, map[string]any{
 		"installation_id": req.InstallationID,
-		"actor":          acct.ID,
-		"actor_email":    acct.Email,
-		"upgraded_at":    upgradedAt.Format(time.RFC3339),
+		"actor":           acct.ID,
+		"actor_email":     acct.Email,
+		"upgraded_at":     upgradedAt.Format(time.RFC3339),
 	})
 	writeJSON(w, http.StatusCreated, api.AdminSetGithubWebhookSecretResponse{
 		InstallationID: req.InstallationID,
