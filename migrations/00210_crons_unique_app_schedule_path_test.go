@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00209_crons_unique_app_schedule_path.sql
+// Migration-apply test for 00210_crons_unique_app_schedule_path.sql
 // (issue #791 PR-E / ADR-090 closure).
 //
 // Pins:
 //
 //  1. The crons_app_schedule_path_unique constraint exists after applying
-//     00209 — the ALTER TABLE applied cleanly (no goose panic, no
+//     00210 — the ALTER TABLE applied cleanly (no goose panic, no
 //     pre-existing duplicate rows that block ADD CONSTRAINT).
 //  2. Inserting a duplicate (app_id, schedule, path) row is rejected
 //     with pgx 23505 (unique_violation).
@@ -28,7 +28,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00209_CronsUniqueAppSchedulePath(t *testing.T) {
+func TestMigrations_00210_CronsUniqueAppSchedulePath(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -46,7 +46,7 @@ func TestMigrations_00209_CronsUniqueAppSchedulePath(t *testing.T) {
 	// constraint we are pinning cares only about crons.
 	_, err := pool.Exec(ctx, `
 		insert into accounts (id, email, created_at)
-		values ($1, '00209-crons-unique-test@example.com', now())
+		values ($1, '00210-crons-unique-test@example.com', now())
 		on conflict (id) do nothing
 	`, acctID)
 	if err != nil {
