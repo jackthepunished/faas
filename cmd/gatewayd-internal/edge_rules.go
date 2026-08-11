@@ -1,5 +1,5 @@
-// Edge-rule matcher wiring for gatewayd-internal (ADR-089 / issue #561,
-// PR 3 + PR 4). The cache primitive + interfaces live in pkg/gateway/edge_rules.go;
+// Edge-rule matcher wiring for gatewayd-internal (ADR-091 / issue #561,
+// PR 3 + PR 4 + PR 5). The cache primitive + interfaces live in pkg/gateway/edge_rules.go;
 // this file is the production seam where `state.EdgeRule → gateway.EdgeRule*Resolved`
 // happens, the pg_notify invalidation loop in cmd/gatewayd-internal/backend.go
 // calls Reset() on, and the handler calls Match* on.
@@ -13,13 +13,17 @@
 // irrelevant). The single pg_notify invalidation channel
 // (`db.NotifyEdgeRuleChanged`) covers all kinds wholesale.
 //
-// PR 5-7 widen with kind=cors / kind=jwt / kind=ip on the same shape.
+// PR 5 widens with kind=cors / kind=jwt / kind=ip on the same shape —
+// three more Match* methods, three more compile* helpers, and the
+// HostEntry widens to 7 slots (still one SQL pass on a cache miss).
 
 package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
 	"path"
 	"sort"
 	"strings"
@@ -59,15 +63,17 @@ func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger) *gatewaydEdgeRu
 }
 
 // loadHost compiles every kind's slice for host into a fresh
-// hostEntry. Shared by all four Match* methods so a cache miss for
-// ANY kind recompiles all four kinds in one pass (the SQL roundtrip
-// dominates; the four path.Match walks are irrelevant). Returns
+// hostEntry. Shared by all seven Match* methods so a cache miss for
+// ANY kind recompiles all seven kinds in one pass (the SQL roundtrip
+// dominates; the seven path.Match walks are irrelevant). Returns
 // nil + nil error on an empty store response.
 //
-// parseErrs is the aggregated path-glob parse-error list across all
-// four compile* calls — the caller logs each at WARN so an operator
-// can diagnose a malformed glob. The malformed rules are dropped
-// from their respective compiled slices.
+// parseErrs is the aggregated parse-error list across all seven
+// compile* calls — the caller logs each at WARN so an operator can
+// diagnose a malformed glob or CIDR. The malformed rules are
+// dropped from their respective compiled slices. PR 5 widens the
+// list to include malformed CIDR parse errors from compileIPRules
+// (reuses the same PathGlobError tuple shape).
 func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway.HostEntry, error) {
 	storeRules, err := g.store.MatchEdgeRulesForHost(ctx, host)
 	if err != nil {
@@ -77,15 +83,24 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	rewrite, rewriteErrs := compileRewriteRules(storeRules)
 	redirect, redirectErrs := compileRedirectRules(storeRules)
 	headers, headersErrs := compileHeadersRules(storeRules)
+	cors, corsErrs := compileCORSRules(storeRules)
+	jwt, jwtErrs := compileJWTRules(storeRules)
+	ip, ipErrs := compileIPRules(storeRules)
 	entry := &gateway.HostEntry{
 		Route:    route,
 		Rewrite:  rewrite,
 		Redirect: redirect,
 		Headers:  headers,
+		CORS:     cors,
+		JWT:      jwt,
+		IP:       ip,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
 	parseErrs = append(parseErrs, headersErrs...)
+	parseErrs = append(parseErrs, corsErrs...)
+	parseErrs = append(parseErrs, jwtErrs...)
+	parseErrs = append(parseErrs, ipErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
 	}
@@ -186,6 +201,81 @@ func (g *gatewaydEdgeRules) MatchHeaders(ctx context.Context, host, requestPath,
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstHeadersMatch(rules, requestPath, method)
+}
+
+// MatchCORS returns the highest-priority `kind=cors` rule whose
+// host, path, and method match, or nil (ADR-091 D4). Same cache
+// primitive as MatchHeaders — a cache miss recompiles all seven
+// kinds in one SQL pass.
+func (g *gatewaydEdgeRules) MatchCORS(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleCORSResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetCORS(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.CORS
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstCORSMatch(rules, requestPath, method)
+}
+
+// MatchJWT returns the highest-priority `kind=jwt` rule whose
+// host, path, and method match, or nil (ADR-091 D4). Same cache
+// primitive. The applier (handler.go::applyEdgeRuleJWT) is
+// responsible for the actual token verify via pkg/edgejwks —
+// this method only finds the rule; the verifier call lives
+// outside the cache primitive.
+func (g *gatewaydEdgeRules) MatchJWT(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleJWTResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetJWT(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.JWT
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstJWTMatch(rules, requestPath, method)
+}
+
+// MatchIP returns the highest-priority `kind=ip` rule whose host,
+// path, and method match, or nil (ADR-091 D4). Same cache
+// primitive. The applier (handler.go::applyEdgeRuleIP) reads the
+// single trusted XFF entry (gatewayd-public's RemoteAddr) and
+// evaluates against this rule's Allow/Deny CIDR lists.
+func (g *gatewaydEdgeRules) MatchIP(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleIPResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetIP(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.IP
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstIPMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -389,6 +479,204 @@ func compileHeadersRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleHeaders
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
 	return out, parseErrs
+}
+
+// compileCORSRules mirrors compileRouteRules for kind=cors. The
+// compiled slice carries the AllowOrigins / AllowMethods /
+// AllowHeaders / ExposeHeaders / AllowCredentials / MaxAgeSeconds
+// fields that the gateway's applyEdgeRuleCORS consults. apid-Validate
+// already rejected AllowOrigins:["*"] + AllowCredentials:true
+// (ADR-091 D12) so the gateway stamper can trust the input.
+func compileCORSRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleCORSResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleCORSResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindCORSA {
+			continue
+		}
+		if r.Action.CORS == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		action := r.Action.CORS
+		out = append(out, gateway.EdgeRuleCORSResolved{
+			ID:               r.ID,
+			AccountID:        r.AccountID,
+			AppID:            r.AppID,
+			Priority:         r.Priority,
+			PathGlob:         r.MatchPath,
+			Methods:          buildMethodsMap(r.MatchMethods),
+			AllowOrigins:     append([]string(nil), action.AllowOrigins...),
+			AllowMethods:     append([]string(nil), action.AllowMethods...),
+			AllowHeaders:     append([]string(nil), action.AllowHeaders...),
+			ExposeHeaders:    append([]string(nil), action.ExposeHeaders...),
+			AllowCredentials: action.AllowCredentials,
+			MaxAgeSeconds:    action.MaxAgeSeconds,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileJWTRules mirrors compileRouteRules for kind=jwt. The
+// compiled slice carries the Issuer / Audience / JWKSURL /
+// Algorithms / RequiredClaims fields. apid-Validate already
+// ensured JWKSURL is https:// + not private/loopback/link-local
+// (ADR-091 D10) and Algorithms is the closed {RS,ES}* vocabulary
+// (D11). The actual token verify happens at handler.go via
+// pkg/edgejwks.Verifier — this compile step only finds the rule.
+func compileJWTRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleJWTResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleJWTResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindJWT {
+			continue
+		}
+		if r.Action.JWT == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		action := r.Action.JWT
+		// Defense-in-depth: apid-Validate already enforced the
+		// HS* + RFC1918/loopback/link-local JWKS URL rules, but
+		// the SQL hotfix path means we can't trust it. Drop
+		// non-https URLs at compile so the gateway never even
+		// sees them (matches PR 3 R3 path-glob re-validation).
+		if !strings.HasPrefix(action.JWKSURL, "https://") {
+			parseErrs = append(parseErrs, gateway.PathGlobError{
+				RuleID: r.ID, Glob: action.JWKSURL,
+				Err: errors.New("jwks_url must start with https://"),
+			})
+			continue
+		}
+		var audCopy []string
+		if len(action.Audience) > 0 {
+			audCopy = append(audCopy, action.Audience...)
+		}
+		var algCopy []string
+		if len(action.Algorithms) > 0 {
+			algCopy = append(algCopy, action.Algorithms...)
+		}
+		var claimsCopy map[string]string
+		if len(action.RequiredClaims) > 0 {
+			claimsCopy = make(map[string]string, len(action.RequiredClaims))
+			for k, v := range action.RequiredClaims {
+				claimsCopy[k] = v
+			}
+		}
+		out = append(out, gateway.EdgeRuleJWTResolved{
+			ID:             r.ID,
+			AccountID:      r.AccountID,
+			AppID:          r.AppID,
+			Priority:       r.Priority,
+			PathGlob:       r.MatchPath,
+			Methods:        buildMethodsMap(r.MatchMethods),
+			Issuer:         action.Issuer,
+			Audience:       audCopy,
+			JWKSURL:        action.JWKSURL,
+			Algorithms:     algCopy,
+			RequiredClaims: claimsCopy,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileIPRules mirrors compileRouteRules for kind=ip. The
+// compiled slice carries pre-parsed *net.IPNet slices for both
+// Allow and Deny so the gateway hot path never has to call
+// net.ParseCIDR per-request. CIDR parse errors are surfaced via
+// the PathGlobError channel so an operator sees the malformed
+// row in slog (mirrors PR 3 R3 path-glob re-validation).
+func compileIPRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleIPResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleIPResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindIP {
+			continue
+		}
+		if r.Action.IP == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		action := r.Action.IP
+		allow, allowErrs := parseCIDRs(action.Allow, r.ID)
+		deny, denyErrs := parseCIDRs(action.Deny, r.ID)
+		if len(allowErrs) > 0 || len(denyErrs) > 0 {
+			parseErrs = append(parseErrs, allowErrs...)
+			parseErrs = append(parseErrs, denyErrs...)
+			continue
+		}
+		out = append(out, gateway.EdgeRuleIPResolved{
+			ID:        r.ID,
+			AccountID: r.AccountID,
+			AppID:     r.AppID,
+			Priority:  r.Priority,
+			PathGlob:  r.MatchPath,
+			Methods:   buildMethodsMap(r.MatchMethods),
+			Allow:     allow,
+			Deny:      deny,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// parseCIDRs turns a []string CIDR list into a []*net.IPNet slice.
+// Per-entry parse errors are returned as PathGlobError so the
+// caller can log them and drop the rule. nil entries in the input
+// are tolerated (an Allow: []CIDR is the canonical "no allowlist,
+// only deny applies" posture).
+func parseCIDRs(cidrs []string, ruleID string) ([]*net.IPNet, []gateway.PathGlobError) {
+	if len(cidrs) == 0 {
+		return nil, nil
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	var parseErrs []gateway.PathGlobError
+	for _, c := range cidrs {
+		_, ipNet, err := net.ParseCIDR(c)
+		if err != nil {
+			parseErrs = append(parseErrs, gateway.PathGlobError{
+				RuleID: ruleID, Glob: c, Err: err,
+			})
+			continue
+		}
+		out = append(out, ipNet)
+	}
+	if len(parseErrs) > 0 {
+		return nil, parseErrs
+	}
+	return out, nil
 }
 
 // validatePathGlob runs stdlib path.Match(glob, "") to detect a

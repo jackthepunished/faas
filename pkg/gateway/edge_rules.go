@@ -1,6 +1,6 @@
 package gateway
 
-// Edge Rules matcher surface (ADR-089 / issue #561, PR 3 + PR 4).
+// Edge Rules matcher surface (ADR-091 / issue #561, PR 3 + PR 4 + PR 5).
 //
 // PR 1 (#799) shipped the `edge_rules` table, state layer, apid CRUD,
 // SDK, and OpenAPI. PR 2 (#815) shipped the `gregale edge-rules` CLI.
@@ -18,8 +18,10 @@ package gateway
 // once on a miss for any kind (the SQL roundtrip dominates, so paying
 // the compile cost four times is irrelevant).
 //
-// PR 5-7 add MatchCORS, MatchJWT, MatchIP on top of the same surface;
-// the cache + invalidation plumbing stays unchanged.
+// PR 5 adds three security-gate kinds (cors / jwt / ip) on top of the
+// same surface — the cache widens to a 7-slot HostEntry and
+// EdgeRuleMatcher adds MatchCORS / MatchJWT / MatchIP. The cache +
+// invalidation plumbing stays unchanged.
 //
 // Why a subset type (not `state.EdgeRule`): pkg/gateway has no
 // `pkg/state` import today and adding one would be a reverse dep
@@ -31,8 +33,10 @@ package gateway
 import (
 	"container/list"
 	"context"
+	"net"
 	"path"
 	"sync"
+	"time"
 )
 
 // pathMatch is the stdlib path.Match wrapper — aliased here so the
@@ -150,6 +154,79 @@ type EdgeRuleHeadersResolved struct {
 	ResponseHeaders []EdgeRuleHeaderOp
 }
 
+// EdgeRuleCORSResolved is the kind=cors subset (ADR-091). PR 5
+// applies two branches in handler.go::applyEdgeRuleCORS:
+//
+//   - OPTIONS + this rule → 204 with Access-Control-Allow-* headers
+//     stamped, no Backend.Lookup (preflight short-circuit).
+//   - any method + this rule → stamps response-side headers via
+//     statusRecorder (Access-Control-Allow-Origin echoes the
+//     request Origin, ExposeHeaders, conditional AllowCredentials)
+//     and falls through to Backend.Lookup.
+//
+// The validator (pkg/api/dto.go::EdgeRuleCORSAction.Validate,
+// ADR-091 D12) rejects AllowOrigins:["*"] + AllowCredentials:true
+// at create-time so the gateway stamper can trust the input
+// shape.
+type EdgeRuleCORSResolved struct {
+	ID               string
+	AccountID        string
+	AppID            string
+	Priority         int
+	PathGlob         string
+	Methods          map[string]bool
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
+	AllowCredentials bool
+	MaxAgeSeconds    int
+}
+
+// EdgeRuleJWTResolved is the kind=jwt subset (ADR-091). PR 5 calls
+// pkg/edgejwks.Verifier.Verify with the raw token; the verifier
+// fetches the JWKS via the per-rule URL, validates iss/aud/alg/
+// required_claims with a 60s clock-skew tolerance, and returns
+// typed errors so the applier can pick the right audit kind.
+//
+// JWKSURL is already https:// AND not RFC1918/loopback/link-local
+// per the apid-Validate guard (ADR-091 D10). Algorithms is the
+// closed {RS,ES}{256,384,512} vocabulary (HS* dropped — D11).
+type EdgeRuleJWTResolved struct {
+	ID             string
+	AccountID      string
+	AppID          string
+	Priority       int
+	PathGlob       string
+	Methods        map[string]bool
+	Issuer         string
+	Audience       []string          // empty = skip aud check
+	JWKSURL        string            // already https:// + not private
+	Algorithms     []string          // closed vocab
+	RequiredClaims map[string]string // key=value
+}
+
+// EdgeRuleIPResolved is the kind=ip subset (ADR-091). PR 5 calls
+// applyEdgeRuleIP with the client IP extracted from the single
+// trusted XFF entry (gatewayd-public's XFF injection at
+// pkg/gateway/internal_proxy.go:286-288).
+//
+// Allow / Deny are parsed *net.IPNet slices. The compile side
+// re-parses each CIDR string at compile time (mirrors PR 3 R3
+// path-glob re-validation) and drops malformed ones with a
+// parse error — apid-Validate already calls net.ParseCIDR once,
+// but the SQL hotfix path means we can't trust the validator.
+type EdgeRuleIPResolved struct {
+	ID        string
+	AccountID string
+	AppID     string
+	Priority  int
+	PathGlob  string
+	Methods   map[string]bool
+	Allow     []*net.IPNet // nil = no allowlist
+	Deny      []*net.IPNet // nil = no denylist
+}
+
 // EdgeRuleCache is the in-memory per-host LRU (PR 3 shape; PR 4
 // widens the entry to a HostEntry carrying four compiled slices —
 // one per kind). Wholesale `Reset()` on `db.NotifyEdgeRuleChanged`
@@ -167,20 +244,24 @@ type EdgeRuleCache struct {
 // cmd/gatewayd-internal/edge_rules.go::loadHost, which runs every
 // compile* over the same []state.EdgeRule slice and stitches the
 // results into a single HostEntry. PathGlobErrs aggregates the
-// path-glob parse errors from all four compileXxx calls so the
+// path-glob parse errors from all seven compileXxx calls so the
 // loader can re-emit them at WARN on subsequent reads without
-// re-running path.Match.
+// re-running path.Match. (PR 5 widened the slice count from 4 to
+// 7; the audit tuple is reused verbatim — malformed CIDRs flow
+// through the same PathGlobErrs slice per compileIPRules.)
 //
 // Exported so the cmd-side loader can populate the cache via
 // `cache.Put(host, &gateway.HostEntry{...})` — see how the cmd-side
-// loadHost builds the entry. The PR 4 widening lives in this struct's
-// per-kind slice fields; PR 5-7 widen with CORS / JWT / IP slots.
+// loadHost builds the entry. PR 5 widens with CORS / JWT / IP slots.
 type HostEntry struct {
 	Host         string
 	Route        []EdgeRuleResolved
 	Rewrite      []EdgeRuleRewriteResolved
 	Redirect     []EdgeRuleRedirectResolved
 	Headers      []EdgeRuleHeadersResolved
+	CORS         []EdgeRuleCORSResolved
+	JWT          []EdgeRuleJWTResolved
+	IP           []EdgeRuleIPResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -259,6 +340,52 @@ func (c *EdgeRuleCache) GetHeaders(host string) ([]EdgeRuleHeadersResolved, bool
 	return out, true
 }
 
+// GetCORS / GetJWT / GetIP are the PR 5 per-kind accessors mirroring
+// GetRewrite / GetRedirect / GetHeaders. Same shape: a value-copy of
+// the underlying slice and a hit bool; nil slice with ok=true means
+// "entry exists but no rule of this kind for this host".
+func (c *EdgeRuleCache) GetCORS(host string) ([]EdgeRuleCORSResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.CORS == nil {
+		return nil, true
+	}
+	src := entry.CORS
+	out := make([]EdgeRuleCORSResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
+func (c *EdgeRuleCache) GetJWT(host string) ([]EdgeRuleJWTResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.JWT == nil {
+		return nil, true
+	}
+	src := entry.JWT
+	out := make([]EdgeRuleJWTResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
+func (c *EdgeRuleCache) GetIP(host string) ([]EdgeRuleIPResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.IP == nil {
+		return nil, true
+	}
+	src := entry.IP
+	out := make([]EdgeRuleIPResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
 // getEntry promotes the entry on hit and returns it. Internal —
 // the Get* family wraps this so each returns a typed slice.
 func (c *EdgeRuleCache) getEntry(host string) (*HostEntry, bool) {
@@ -280,19 +407,21 @@ func (c *EdgeRuleCache) getEntry(host string) (*HostEntry, bool) {
 // the cache is advisory and a missing entry costs one indexed
 // PG read (~0.5ms warm).
 //
-// All four slices are populated from the SAME PG read (a miss for
+// All seven slices are populated from the SAME PG read (a miss for
 // any kind re-runs the SQL query and recompiles every kind); this
 // is the loader's contract (cmd/gatewayd-internal/edge_rules.go).
 func (c *EdgeRuleCache) Put(host string, e *HostEntry) {
 	if e == nil {
 		return
 	}
-	// PR 4 contract: a Put whose HostEntry has empty/nil slices for
-	// every kind is a no-op (the loader re-hits PG on the next Get).
-	// Pinning this so a future test or refactor can't silently start
-	// caching "no rules" entries (which would mask a loader bug).
+	// PR 5 contract (widened from PR 4): a Put whose HostEntry has
+	// empty/nil slices for every kind is a no-op (the loader re-hits
+	// PG on the next Get). Pinning this so a future test or refactor
+	// can't silently start caching "no rules" entries (which would
+	// mask a loader bug).
 	if len(e.Route) == 0 && len(e.Rewrite) == 0 &&
-		len(e.Redirect) == 0 && len(e.Headers) == 0 {
+		len(e.Redirect) == 0 && len(e.Headers) == 0 &&
+		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 {
 		return
 	}
 	e.Host = host
@@ -339,10 +468,9 @@ func (c *EdgeRuleCache) removeElement(el *list.Element) {
 
 // EdgeRuleMatcher is the narrow contract the gateway handler uses
 // to consult per-request edge rules. Implementations MUST be safe
-// for concurrent use. PR 4 widens with MatchRewrite / MatchRedirect
-// / MatchHeaders; PR 5-7 add MatchCORS / MatchJWT / MatchIP on top
-// of the same shape. Future kind matchers embed a `noOpEdgeRuleMatcher`
-// to inherit the no-op default.
+// for concurrent use. PR 5 widens with MatchCORS / MatchJWT / MatchIP
+// on top of the same shape. Future kind matchers embed a
+// `noOpEdgeRuleMatcher` to inherit the no-op default.
 //
 // MatchRoute returns the highest-priority `kind=route` rule whose
 // host, path, and method match the inbound request, or nil if no
@@ -354,6 +482,11 @@ func (c *EdgeRuleCache) removeElement(el *list.Element) {
 // MatchRoute; each returns the highest-priority rule of its kind
 // that matches the inbound (host, path, method), or nil on miss.
 //
+// MatchCORS / MatchJWT / MatchIP are the PR 5 security-gate
+// matchers. Same priority-ASC + path/methods filter shape; the
+// appliers (handler.go) decide whether to short-circuit, stamp
+// headers, or write 401/403 on a hit.
+//
 // Reset drops every cached entry. Called by the gatewayd notify
 // loop on `db.NotifyEdgeRuleChanged`.
 type EdgeRuleMatcher interface {
@@ -361,6 +494,9 @@ type EdgeRuleMatcher interface {
 	MatchRewrite(ctx context.Context, host, path, method string) *EdgeRuleRewriteResolved
 	MatchRedirect(ctx context.Context, host, path, method string) *EdgeRuleRedirectResolved
 	MatchHeaders(ctx context.Context, host, path, method string) *EdgeRuleHeadersResolved
+	MatchCORS(ctx context.Context, host, path, method string) *EdgeRuleCORSResolved
+	MatchJWT(ctx context.Context, host, path, method string) *EdgeRuleJWTResolved
+	MatchIP(ctx context.Context, host, path, method string) *EdgeRuleIPResolved
 	Reset()
 }
 
@@ -374,13 +510,44 @@ type EdgeRuleAuditor interface {
 	Emit(ctx context.Context, kind string, subject *string, data map[string]any)
 }
 
-// noOpEdgeRuleMatcher is the default Embedding target PR 4-7 uses
-// to inherit default no-op behavior for the kinds they don't ship.
-// Today's production impl `cmd/gatewayd-internal.edgeRules` doesn't
-// embed it (PR 4 ships MatchRoute + MatchRewrite + MatchRedirect +
-// MatchHeaders); the type exists for the forward-compatible
-// interface shape so a future CORS / JWT / IP impl can embed it
-// and only override the kinds it ships.
+// JWTVerifier (ADR-091 / issue #561 PR 5) is the narrow surface
+// pkg/gateway uses for kind=jwt verification. The cmd-side wires the
+// pkg/edgejwks.Verifier via a thin adapter that conforms to this
+// interface; pkg/gateway itself never imports pkg/edgejwks, so
+// the dep direction stays one-way (gateway is a leaf, like
+// pkg/auth.Middleware being consumed by the daemons but not
+// importing cmd-side state types).
+//
+// rawToken is the stripped bearer suffix (no "Bearer " prefix) —
+// handler.go does strings.TrimPrefix before calling. The verifier
+// looks up the rule's JWKSURL in its per-URL cache, fetches the
+// keyset if needed, picks the right key by kid, verifies the
+// signature + exp + iss + aud + required_claims, and returns the
+// parsed claims. Errors are package sentinels (edgejwks.ErrJWT*)
+// so handler.go can map them to distinct audit + metric outcomes.
+type JWTVerifier interface {
+	Verify(ctx context.Context, rawToken string, rule *EdgeRuleJWTResolved) (claims *JWTClaims, err error)
+}
+
+// JWTClaims is the parsed subset pkg/gateway cares about. Mirrors
+// pkg/edgejwks.Claims (same field set; pkg/gateway doesn't import
+// pkg/edgejwks so the struct is duplicated here — drift would
+// surface as a mismatch when the cmd-side adapter copies the
+// fields over, which is intentional).
+type JWTClaims struct {
+	Subject string
+	Issuer  string
+	Aud     []string
+	Exp     time.Time
+}
+
+// noOpEdgeRuleMatcher is the default Embedding target the matcher
+// implementations use to inherit default no-op behavior for the
+// kinds they don't ship. Today's production impl
+// `cmd/gatewayd-internal.edgeRules` doesn't embed it (PR 5 ships
+// all seven Match* methods); the type exists for the
+// forward-compatible interface shape so a future kind's impl can
+// embed it and only override the kinds it ships.
 type noOpEdgeRuleMatcher struct{}
 
 func (noOpEdgeRuleMatcher) MatchRoute(context.Context, string, string, string) *EdgeRuleResolved {
@@ -393,6 +560,15 @@ func (noOpEdgeRuleMatcher) MatchRedirect(context.Context, string, string, string
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchHeaders(context.Context, string, string, string) *EdgeRuleHeadersResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchCORS(context.Context, string, string, string) *EdgeRuleCORSResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchJWT(context.Context, string, string, string) *EdgeRuleJWTResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchIP(context.Context, string, string, string) *EdgeRuleIPResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}
@@ -480,6 +656,64 @@ func PickFirstRedirectMatch(rules []EdgeRuleRedirectResolved, path, method strin
 }
 
 func PickFirstHeadersMatch(rules []EdgeRuleHeadersResolved, path, method string) *EdgeRuleHeadersResolved {
+	for i := range rules {
+		r := &rules[i]
+		if r.Methods != nil && !r.Methods[method] {
+			continue
+		}
+		if r.PathGlob != "" {
+			ok, _ := pathGlobMatch(r.PathGlob, path)
+			if !ok {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+// PickFirstCORSMatch / PickFirstJWTMatch / PickFirstIPMatch are the
+// PR 5 per-kind mirrors of PickFirstRouteMatch. Same shape:
+// priority-ASC walk, methods filter (O(1) via map lookup), path glob
+// via path.Match. Each is called from its own gatewaydEdgeRules
+// Match* method after the cache returns the priority-ordered slice.
+// Three small copies keep the per-kind return types precise without
+// paying for a runtime-type assertion on every request.
+func PickFirstCORSMatch(rules []EdgeRuleCORSResolved, path, method string) *EdgeRuleCORSResolved {
+	for i := range rules {
+		r := &rules[i]
+		if r.Methods != nil && !r.Methods[method] {
+			continue
+		}
+		if r.PathGlob != "" {
+			ok, _ := pathGlobMatch(r.PathGlob, path)
+			if !ok {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+func PickFirstJWTMatch(rules []EdgeRuleJWTResolved, path, method string) *EdgeRuleJWTResolved {
+	for i := range rules {
+		r := &rules[i]
+		if r.Methods != nil && !r.Methods[method] {
+			continue
+		}
+		if r.PathGlob != "" {
+			ok, _ := pathGlobMatch(r.PathGlob, path)
+			if !ok {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+func PickFirstIPMatch(rules []EdgeRuleIPResolved, path, method string) *EdgeRuleIPResolved {
 	for i := range rules {
 		r := &rules[i]
 		if r.Methods != nil && !r.Methods[method] {

@@ -39,11 +39,14 @@ var edgeRuleKindVocab = []string{
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
 // Mirrors pkg/api.EdgeRuleJWTAction.Validate() so the typo case
-// fails fast.
+// fails fast. HS* is intentionally excluded (ADR-091 D11); HS*
+// over JWKS would mean a symmetric key served from a public
+// endpoint, where anyone with the URL can forge tokens. If a future
+// ADR introduces a `secret_ref` action shape for HMAC-signed JWTs,
+// HS* would return here alongside a sibling secret.alg vocabulary.
 var edgeRuleJWTAlgVocab = []string{
 	"RS256", "RS384", "RS512",
 	"ES256", "ES384", "ES512",
-	"HS256", "HS384", "HS512",
 }
 
 // isEdgeRuleKind reports whether k is in the closed kind vocabulary.
@@ -198,7 +201,7 @@ func cmdEdgeRulesCreate(args []string) int {
 	jwtJWKS := fs.String("jwt-jwks-url", "", "kind=jwt: JWKS URL (required; must be https://)")
 	var jwtAudience, jwtAlgorithms multiFlag
 	fs.Var(&jwtAudience, "jwt-audience", "kind=jwt: required audience (repeat)")
-	fs.Var(&jwtAlgorithms, "jwt-algorithm", "kind=jwt: allowed algorithm (RS256|ES256|HS256|...; repeat)")
+	fs.Var(&jwtAlgorithms, "jwt-algorithm", "kind=jwt: allowed algorithm (RS256|RS384|RS512|ES256|ES384|ES512; repeat). HS* excluded (ADR-091 D11).")
 	var jwtClaims multiFlag
 	fs.Var(&jwtClaims, "jwt-required-claim", "kind=jwt: required claim (Name=Value; repeat)")
 
