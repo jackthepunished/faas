@@ -391,11 +391,16 @@ type installRepoKey struct {
 	RepoFullName string
 }
 
-// secretKey mirrors the app_secrets PRIMARY KEY (app_id, key). The
-// MemStore uses the same composite-key shape so tests don't drift from
-// production behavior.
+// secretKey mirrors the app_secrets PRIMARY KEY (app_id, scope, key)
+// post-ADR-092-PR-A (migration 00214). Pre-PR the PK was (app_id,
+// key); the Scope field is always 'default' for the flat methods
+// (UpsertAppSecret / DeleteAppSecret / ListAppSecrets /
+// CountAppSecrets) and is the caller-supplied value for the …InScope
+// variants. The scope literal is the same one the schema's
+// fast-default picks for pre-00214 rows.
 type secretKey struct {
 	AppID string
+	Scope string
 	Key   string
 }
 
@@ -8782,21 +8787,45 @@ func (m *MemStore) ListDeploymentLogs(_ context.Context, deploymentID string, be
 // ownership checks so unit tests can verify quota / list / delete logic
 // without touching Postgres.
 
-// UpsertAppSecret inserts or replaces the (account_id, app_id, key) row.
-// updated_at is bumped on every call so schedd's wake staging observes a
-// fresh mtime even when the ciphertext is identical (rotation flows
-// re-seal with the same plaintext).
+// UpsertAppSecret inserts or replaces the (account_id, app_id,
+// scope='default', key) row (ADR-092 PR-A).
+// updated_at is bumped on every call so schedd's wake staging
+// observes a fresh mtime even when the ciphertext is identical
+// (rotation flows re-seal with the same plaintext).
 //
 // ADR-089 PR-A: preserves the pre-PR-A wire shape (no kid stamp)
-// for backward compatibility. New callers use UpsertAppSecretWithKid.
-func (m *MemStore) UpsertAppSecret(_ context.Context, accountID, appID, key string, ciphertext []byte) error {
+// for backward compatibility. New callers use
+// UpsertAppSecretWithKid (or UpsertAppSecretWithKidInScope for
+// non-default scope).
+func (m *MemStore) UpsertAppSecret(ctx context.Context, accountID, appID, key string, ciphertext []byte) error {
+	return m.UpsertAppSecretInScope(ctx, accountID, appID, DefaultEnvScope, key, ciphertext)
+}
+
+// UpsertAppSecretWithKid is the kid-stamping sibling of
+// UpsertAppSecret (ADR-089 PR-A). Mirrors the pgstore impl — see
+// pkg/state/pgstore.go::UpsertAppSecretWithKid for the rationale.
+// Hardcodes scope='default' (PR-A); use
+// UpsertAppSecretWithKidInScope for any other scope.
+func (m *MemStore) UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+	return m.UpsertAppSecretWithKidInScope(ctx, accountID, appID, DefaultEnvScope, key, kid, ciphertext)
+}
+
+// UpsertAppSecretInScope is the scope-aware sibling of
+// UpsertAppSecret (ADR-092 PR-A). Mirrors the pgstore impl's
+// `ON CONFLICT (app_id, scope, key) DO UPDATE` semantics: an
+// existing row at the (app_id, scope, key) tuple is replaced and
+// updated_at bumped.
+func (m *MemStore) UpsertAppSecretInScope(_ context.Context, accountID, appID, scope, key string, ciphertext []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := secretKey{AppID: appID, Key: key}
+	k := secretKey{AppID: appID, Scope: scope, Key: key}
 	existing, ok := m.secrets[k]
 	now := time.Now()
 	if !ok {
-		m.secrets[k] = AppSecret{AccountID: accountID, AppID: appID, Key: key, Ciphertext: ciphertext, CreatedAt: now, UpdatedAt: now}
+		m.secrets[k] = AppSecret{
+			AccountID: accountID, AppID: appID, Scope: scope, Key: key,
+			Ciphertext: ciphertext, CreatedAt: now, UpdatedAt: now,
+		}
 		return nil
 	}
 	if existing.AccountID != accountID {
@@ -8808,17 +8837,21 @@ func (m *MemStore) UpsertAppSecret(_ context.Context, accountID, appID, key stri
 	return nil
 }
 
-// UpsertAppSecretWithKid is the kid-stamping sibling of
-// UpsertAppSecret (ADR-089 PR-A). Mirrors the pgstore impl — see
-// pkg/state/pgstore.go::UpsertAppSecretWithKid for the rationale.
-func (m *MemStore) UpsertAppSecretWithKid(_ context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+// UpsertAppSecretWithKidInScope is the kid-stamping scope-aware
+// sibling (ADR-092 PR-A). Mirrors UpsertAppSecretInScope but
+// stamps kid alongside ciphertext (see ADR-089 PR-A for the
+// kid semantics).
+func (m *MemStore) UpsertAppSecretWithKidInScope(_ context.Context, accountID, appID, scope, key, kid string, ciphertext []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := secretKey{AppID: appID, Key: key}
+	k := secretKey{AppID: appID, Scope: scope, Key: key}
 	existing, ok := m.secrets[k]
 	now := time.Now()
 	if !ok {
-		m.secrets[k] = AppSecret{AccountID: accountID, AppID: appID, Key: key, Ciphertext: ciphertext, Kid: kid, CreatedAt: now, UpdatedAt: now}
+		m.secrets[k] = AppSecret{
+			AccountID: accountID, AppID: appID, Scope: scope, Key: key,
+			Ciphertext: ciphertext, Kid: kid, CreatedAt: now, UpdatedAt: now,
+		}
 		return nil
 	}
 	if existing.AccountID != accountID {
@@ -8831,14 +8864,32 @@ func (m *MemStore) UpsertAppSecretWithKid(_ context.Context, accountID, appID, k
 	return nil
 }
 
-// GetAppSecret returns the (account_id, app_id, key) row.
+// GetAppSecret returns the (account_id, app_id,
+// scope='default', key) row.
 // Returns ErrNotFound when no row matches — same semantics as
 // PgStore so the rotate handler (PR-B) renders 400
-// CodeSecretNotFound for missing keys.
-func (m *MemStore) GetAppSecret(_ context.Context, accountID, appID, key string) (*AppSecret, error) {
+// CodeSecretNotFound for missing keys. Use GetAppSecretInScope for
+// non-default scopes.
+func (m *MemStore) GetAppSecret(ctx context.Context, accountID, appID, key string) (*AppSecret, error) {
+	return m.GetAppSecretInScope(ctx, accountID, appID, DefaultEnvScope, key)
+}
+
+// DeleteAppSecret removes the (account_id, app_id,
+// scope='default', key) row. Returns ErrNotFound when no row
+// matches — same semantics as PgStore so the handler renders 400
+// CodeSecretNotFound. Use DeleteAppSecretInScope for non-default
+// scopes.
+func (m *MemStore) DeleteAppSecret(ctx context.Context, accountID, appID, key string) error {
+	return m.DeleteAppSecretInScope(ctx, accountID, appID, DefaultEnvScope, key)
+}
+
+// GetAppSecretInScope is the scope-aware sibling of GetAppSecret
+// (ADR-092 PR-A). Returns the (app_id, scope, key) row scoped to
+// accountID. Returns ErrNotFound when no row matches.
+func (m *MemStore) GetAppSecretInScope(_ context.Context, accountID, appID, scope, key string) (*AppSecret, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := secretKey{AppID: appID, Key: key}
+	k := secretKey{AppID: appID, Scope: scope, Key: key}
 	row, ok := m.secrets[k]
 	if !ok || row.AccountID != accountID {
 		return nil, ErrNotFound
@@ -8847,13 +8898,12 @@ func (m *MemStore) GetAppSecret(_ context.Context, accountID, appID, key string)
 	return &cp, nil
 }
 
-// DeleteAppSecret removes the (account_id, app_id, key) row. Returns
-// ErrNotFound when no row matches — same semantics as PgStore so the
-// handler renders 400 CodeSecretNotFound.
-func (m *MemStore) DeleteAppSecret(_ context.Context, accountID, appID, key string) error {
+// DeleteAppSecretInScope is the scope-aware sibling of
+// DeleteAppSecret (ADR-092 PR-A).
+func (m *MemStore) DeleteAppSecretInScope(_ context.Context, accountID, appID, scope, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := secretKey{AppID: appID, Key: key}
+	k := secretKey{AppID: appID, Scope: scope, Key: key}
 	row, ok := m.secrets[k]
 	if !ok || row.AccountID != accountID {
 		return ErrNotFound
@@ -8863,21 +8913,38 @@ func (m *MemStore) DeleteAppSecret(_ context.Context, accountID, appID, key stri
 }
 
 // ListAppSecretsForRekey is the global paginated walk consumed by
-// pkg/rekey.Replayer.Run (ADR-089 PR-A). Order is
-// (account_id ASC, app_id ASC, key ASC) so the cursor walk is
-// monotonic — see pkg/state/pgstore.go::ListAppSecretsForRekey for
-// the SQL counterpart.
+// pkg/rekey.Replayer.Run (ADR-089 PR-A, widened to 4-tuple in
+// ADR-092 PR-A). Order is (account_id ASC, app_id ASC, scope ASC,
+// key ASC) so the cursor walk is monotonic across the
+// (account_id, app_id, scope, key) primary-key order — see
+// pkg/state/pgstore.go::ListAppSecretsForRekey for the SQL
+// counterpart.
+//
+// CURSOR FORMAT: "<account_id>|<app_id>|<scope>|<key>" — the
+// 4-tuple form. The 3-tuple "<account_id>|<app_id>|<key>" form
+// (pre-PR) is still accepted on decode: a 2-pipe cursor is
+// treated as scope="default" so an in-flight Replayer that
+// persisted a pre-PR LastID continues to work after the rollout
+// without operator intervention. Once the operator's first
+// post-PR Run completes, RekeyProgress.LastID is upgraded to the
+// 4-tuple form and the lazy fallback is no longer reached.
 func (m *MemStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor string) ([]AppSecret, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	var curAcct, curApp, curKey string
+	var curAcct, curApp, curScope, curKey string
 	if cursor != "" {
-		parts := strings.SplitN(cursor, "|", 3)
-		if len(parts) != 3 {
+		// Prefer 4-tuple; fall back to 3-tuple (pre-PR).
+		parts := strings.SplitN(cursor, "|", 4)
+		switch len(parts) {
+		case 4:
+			curAcct, curApp, curScope, curKey = parts[0], parts[1], parts[2], parts[3]
+		case 3:
+			curAcct, curApp, curKey = parts[0], parts[1], parts[2]
+			curScope = DefaultEnvScope
+		default:
 			return nil, fmt.Errorf("memstore: malformed rekey cursor %q", cursor)
 		}
-		curAcct, curApp, curKey = parts[0], parts[1], parts[2]
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -8885,7 +8952,10 @@ func (m *MemStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor s
 	for _, s := range m.secrets {
 		if curAcct != "" {
 			cmp := strings.Compare(s.AccountID, curAcct)
-			if cmp < 0 || (cmp == 0 && (s.AppID < curApp || (s.AppID == curApp && s.Key <= curKey))) {
+			if cmp < 0 ||
+				(cmp == 0 && (s.AppID < curApp ||
+					(s.AppID == curApp && (s.Scope < curScope ||
+						(s.Scope == curScope && s.Key <= curKey))))) {
 				continue
 			}
 		}
@@ -8898,6 +8968,9 @@ func (m *MemStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor s
 		if all[i].AppID != all[j].AppID {
 			return all[i].AppID < all[j].AppID
 		}
+		if all[i].Scope != all[j].Scope {
+			return all[i].Scope < all[j].Scope
+		}
 		return all[i].Key < all[j].Key
 	})
 	if len(all) > limit {
@@ -8906,9 +8979,43 @@ func (m *MemStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor s
 	return all, nil
 }
 
-// ListAppSecrets returns every secret on the app, scoped to accountID.
-// Order: by key ASC (matches PgStore ORDER BY).
-func (m *MemStore) ListAppSecrets(_ context.Context, accountID, appID string) ([]AppSecret, error) {
+// ListAppSecretsInScope is the scope-aware sibling of
+// ListAppSecrets (ADR-092 PR-A). Returns every (key, ciphertext,
+// kid, timestamps) row on the app where scope matches the
+// caller-supplied value, scoped to accountID. Order: by scope
+// ASC, key ASC for deterministic wake staging.
+func (m *MemStore) ListAppSecretsInScope(_ context.Context, accountID, appID, scope string) ([]AppSecret, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AppSecret
+	for _, s := range m.secrets {
+		if s.AppID != appID || s.AccountID != accountID || s.Scope != scope {
+			continue
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// ListAppSecrets returns every secret on the app where scope =
+// 'default', scoped to accountID. Order: by key ASC for
+// deterministic wake staging (matches PgStore ORDER BY).
+// Returns nil slice (not error) when the app has no secrets —
+// schedd treats that as "no env file to write". Use
+// ListAppSecretsInScope for non-default scopes, or
+// ListAllAppSecrets for the cross-scope enumeration the GET
+// ?scope=__all__ handler renders.
+func (m *MemStore) ListAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error) {
+	return m.ListAppSecretsInScope(ctx, accountID, appID, DefaultEnvScope)
+}
+
+// ListAllAppSecrets is the cross-scope mirror of ListAppSecrets
+// (ADR-092 PR-A). Returns every secret row on the app across all
+// scopes, scoped to accountID. Order: by scope ASC, key ASC.
+// Used by apid's GET /v1/apps/{slug}/secrets?scope=__all__ arm
+// (PR-B) to render the nested secrets_by_scope response shape.
+func (m *MemStore) ListAllAppSecrets(_ context.Context, accountID, appID string) ([]AppSecret, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []AppSecret
@@ -8918,7 +9025,12 @@ func (m *MemStore) ListAppSecrets(_ context.Context, accountID, appID string) ([
 		}
 		out = append(out, s)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+		return out[i].Key < out[j].Key
+	})
 	return out, nil
 }
 

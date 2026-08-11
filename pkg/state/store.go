@@ -3209,6 +3209,39 @@ type Store interface {
 	// handler renders KEYS only; ciphertext flows to vmmd. Returns nil slice
 	// (not error) when the app has no secrets.
 	ListAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error)
+	// UpsertAppSecretInScope is the scope-aware sibling of
+	// UpsertAppSecret (ADR-092 PR-A). Writes-or-replaces the
+	// (app_id, scope, key) row. Mirrors the env widening at
+	// store.go:2891+ for InScope variant. accountID is passed
+	// for ownership verification; the row also stores it for
+	// account-scoped delete paths.
+	UpsertAppSecretInScope(ctx context.Context, accountID, appID, scope, key string, ciphertext []byte) error
+	// UpsertAppSecretWithKidInScope is the scope-aware
+	// sibling of UpsertAppSecretWithKid (ADR-092 PR-A). Stamps
+	// kid alongside (scope, ciphertext). Used by the rotate
+	// handler (PR-B) and the rekey walk.
+	UpsertAppSecretWithKidInScope(ctx context.Context, accountID, appID, scope, key, kid string, ciphertext []byte) error
+	// GetAppSecretInScope is the scope-aware sibling of
+	// GetAppSecret (ADR-092 PR-A). Returns ErrNotFound when no
+	// row exists at (account_id, app_id, scope, key).
+	GetAppSecretInScope(ctx context.Context, accountID, appID, scope, key string) (*AppSecret, error)
+	// DeleteAppSecretInScope is the scope-aware sibling of
+	// DeleteAppSecret (ADR-092 PR-A). Returns ErrNotFound if
+	// the row doesn't exist — handlers render 400
+	// CodeSecretNotFound (not a 404) because the URL resource
+	// IS the secret name, by design.
+	DeleteAppSecretInScope(ctx context.Context, accountID, appID, scope, key string) error
+	// ListAppSecretsInScope is the scope-aware sibling of
+	// ListAppSecrets (ADR-092 PR-A). Used by schedd's
+	// pkg/sched/engine.go::loadSealedEnvFor wake-time reader
+	// to enumerate the scope's sealed rows.
+	ListAppSecretsInScope(ctx context.Context, accountID, appID, scope string) ([]AppSecret, error)
+	// ListAllAppSecrets is the cross-scope mirror of
+	// ListAppSecrets (ADR-092 PR-A). Used by apid's GET
+	// ?scope=__all__ arm (PR-B) to render the nested
+	// secrets_by_scope response shape. Order is
+	// (scope ASC, key ASC).
+	ListAllAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error)
 	// ListAppSecretsForAccount is the account-scoped sibling of
 	// ListAppSecrets (issue #393). The cursor is the (app_slug, key)
 	// pair — encoded as "<slug>|<key>" by the handler and split via

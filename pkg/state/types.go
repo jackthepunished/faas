@@ -2858,12 +2858,31 @@ type Session struct {
 // transiently in apid's PUT handler and vmmd's per-wake staging path.
 //
 // AccountID is the row's owning account. Both PgStore and MemStore filter
-// on (AccountID, AppID, Key) so cross-account access returns ErrNotFound
-// (handlers render 400 CodeSecretNotFound by design — the URL resource IS
-// the secret name).
+// on (AccountID, AppID, Scope, Key) so cross-account access returns
+// ErrNotFound (handlers render 400 CodeSecretNotFound by design — the URL
+// resource IS the secret name).
+//
+// ADR-092 PR-A: the PRIMARY KEY widened from (app_id, key) to
+// (app_id, scope, key) by migration 00214_app_secrets_scope.sql — mirrors
+// the same widening that 00203_app_envs_scope.sql did for app_envs. Pre-PR
+// rows backfill on first read with scope='default' via the PG11+
+// fast-default, so legacy callers (ListAppSecrets, UpsertAppSecret,
+// etc.) continue to work unchanged; the scope-aware variants
+// (ListAppSecretsInScope, UpsertAppSecretWithKidInScope, …) take an
+// explicit scope parameter and are the canonical path. The flat
+// methods hardcode scope='default' as a thin delegation.
 type AppSecret struct {
 	AccountID  string
 	AppID      string
+	// Scope is the env-scope identifier attached at write time.
+	// Always 'default' for legacy rows backfilled via the
+	// column DEFAULT. Validated by `pkg/api.ValidateScope`
+	// (regex ^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$) on every PUT /
+	// POST / DELETE that flows through apid's `?scope=` parse
+	// helper — the same shape as `app_envs.scope` (00203).
+	// Sealing (the secretbox step) is scope-agnostic; scope is
+	// purely a per-row address, not a seal-time identity.
+	Scope      string
 	Key        string
 	Ciphertext []byte
 	// Kid is the age-1... recipient string of the host identity
