@@ -1,27 +1,31 @@
 //go:build !no_pg
 
-// Migration-apply test for 00212_deployments_scope.sql
+// Migration-apply test for 00213_deployments_scope.sql
 // (ADR-091 / per-deployment env targeting).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00212 (no goose
-//     duplicate-version panic). PR-D was renumbered four
+//  1. Migration set applies cleanly through 00213 (no goose
+//     duplicate-version panic). PR-D was renumbered five
 //     times during the cross-PR slot gate dance: 00207 → 00208
 //     (after PRs #826 and #835 claimed 00207) → 00209 (after
 //     PR #838 claimed 00208) → 00211 (after PR #829 paddle
 //     claimed 00209) → 00212 (after PR #835's cron-uniqueness
-//     migration landed at slot 00210 and our 00210 fence
-//     became a real-migration collision; rebase dropped the
-//     00210 fence and renumbered our real migration). The
-//     00207, 00208, and 00209 slots are now held under ADR-041
-//     reservation fences (the 00209 fence is required because
-//     TestMigrationsContiguous uses position index — every
-//     position N in the embedded set must have a NNNNN-prefix
-//     file, even after renumbering away).
+//     migration landed at slot 00210 on main and our 00210
+//     fence became a real-migration collision; rebase dropped
+//     the 00210 fence and renumbered our real migration) →
+//     00213 (after PR #838 won slot 00212 with
+//     00212_github_webhook_secrets.sql on the same cluster
+//     chase, leaving our 00212 as a duplicate; the second
+//     rebase dropped our 00212 file and renumbered once more).
+//     The 00207, 00208, and 00209 slots are now held under
+//     ADR-041 reservation fences (the 00209 fence is required
+//     because TestMigrationsContiguous uses position index —
+//     every position N in the embedded set must have a
+//     NNNNN-prefix file, even after renumbering away).
 //  2. deployments.scope column exists, is text NOT NULL, and has
 //     the DEFAULT 'default' literal (PG11+ fast-default). Every
-//     pre-00212 deployment gets scope='default' lazily on first
+//     pre-00213 deployment gets scope='default' lazily on first
 //     read/write without an UPDATE rewrite, so the migration is
 //     metadata-only. Backwards-compat: existing wakes behave
 //     exactly as today.
@@ -68,7 +72,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00212_DeploymentsScope(t *testing.T) {
+func TestMigrations_00213_DeploymentsScope(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

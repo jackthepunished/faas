@@ -42,7 +42,7 @@ const EnvScopeAllSentinel = "__all__"
 // DefaultEnvScope is the scope name assigned to (1) every
 // pre-PR-B app_envs row via PG11+ fast-default at migration
 // 00203 (ADR-090 PR-A) and (2) every pre-PR-D deployments row via
-// migration 00212 (ADR-091 / PR-D). The wire shape `?scope=` on
+// migration 00213 (ADR-091 / PR-D). The wire shape `?scope=` on
 // env routes collapses an empty string to DefaultEnvScope at the
 // handler seam (see scopeFromQuery); the schedd loadAPIEnv thread
 // does the same defensive collapse so a caller that forgets to

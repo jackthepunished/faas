@@ -960,7 +960,7 @@ type Deployment struct {
 	// Scope (ADR-091 / PR-D) — per-deployment env targeting.
 	// The deployment declares which named scope (`default`/
 	// `staging`/`prod`/...) its wake should read env from.
-	// Backfilled to `'default'` by migration 00212's PG11+
+	// Backfilled to `'default'` by migration 00213's PG11+
 	// fast-default (metadata-only on pre-PR rows, no UPDATE
 	// rewrite). Enforced at the schema layer via the
 	// `deployments_scope_shape` CHECK and the partial unique

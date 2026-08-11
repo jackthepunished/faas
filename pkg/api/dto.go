@@ -746,7 +746,7 @@ type CreateDeploymentRequest struct {
 	TrafficPercent *int `json:"traffic_percent,omitempty"`
 	// Scope (ADR-091 / PR-D) declares which named env scope this
 	// deployment reads at wake time. Empty / omitted → handler
-	// defaults to api.DefaultEnvScope. Migration 00212's CHECK
+	// defaults to api.DefaultEnvScope. Migration 00213's CHECK
 	// constraint enforces EnvScopePattern; the handler runs
 	// api.ValidateScope before storing. A duplicate live row on
 	// (app_id, scope) → 400 deployment_scope_collision.
@@ -820,7 +820,7 @@ type CreateDeploymentOverrides struct {
 	LivenessProbe *DeploymentLivenessProbe `json:"liveness_probe,omitempty"`
 	// Scope (ADR-091 / PR-D) declares which named env scope this
 	// deployment reads at wake time. Empty / omitted defaults to
-	// api.DefaultEnvScope at the handler. Migration 00212's
+	// api.DefaultEnvScope at the handler. Migration 00213's
 	// partial unique index `deployments_app_scope_live_uniq`
 	// prevents two live deployments from sharing (app_id, scope)
 	// — a duplicate returns 400 deployment_scope_collision. A
@@ -1316,7 +1316,7 @@ type DeploymentResponse struct {
 	// "default" but the column itself was backfilled; the
 	// SerializeDeployment projector always writes the explicit
 	// value, so downstream consumers see "default" on pre-PR
-	// fixtures the moment PR-D ships. Migration 00212's CHECK
+	// fixtures the moment PR-D ships. Migration 00213's CHECK
 	// ensures the value is a valid slug; the handler validates
 	// scopeFromBody before storing via api.ValidateScope.
 	Scope string `json:"scope,omitempty"`

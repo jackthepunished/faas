@@ -1429,7 +1429,7 @@ type Store interface {
 	// LiveDeploymentForScope (ADR-091 / PR-D) returns the unique
 	// live deployment for (appID, scope). Backed by the partial
 	// UNIQUE index deployments_app_scope_live_uniq that PR-D
-	// adds in migration 00212 — at most one live row per
+	// adds in migration 00213 — at most one live row per
 	// (app_id, scope), so the read is deterministic. Returns
 	// ErrNotFound when no live deployment exists for the scope
 	// (the wake path should fall back to ErrNoDeployment, surfacing

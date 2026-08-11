@@ -3872,7 +3872,7 @@ func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment,
 // LiveDeploymentForScope (ADR-091 / PR-D) returns the unique live
 // deployment for the (app_id, scope) pair. Backed by the partial
 // UNIQUE index deployments_app_scope_live_uniq added in migration
-// 00212: at most one live row per (app_id, scope), so the LIMIT 1
+// 00213: at most one live row per (app_id, scope), so the LIMIT 1
 // is belt-and-suspenders and the result is deterministic. Returns
 // ErrNotFound when no live row exists for the scope — the wake
 // path converts that into a 404 via the ErrNoDeployment sentinel

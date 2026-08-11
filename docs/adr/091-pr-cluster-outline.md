@@ -30,7 +30,7 @@ NOT split the same way:
 
 In dependency order:
 
-1. **Schema:** `migrations/00212_deployments_scope.sql`
+1. **Schema:** `migrations/00213_deployments_scope.sql`
    - ALTER TABLE deployments ADD COLUMN scope (fast-default).
    - Shape CHECK constraint `deployments_scope_shape`.
    - Partial unique index `deployments_app_scope_live_uniq`.
@@ -53,8 +53,8 @@ In dependency order:
    through; `CreateDeployment` errors on a duplicate scope via
    `CodeDeploymentScopeCollision` 409.
 7. **Schema dump mirror:** `schema.sql` updated to reflect
-   post-00212 state.
-8. **Migration test:** `migrations/00212_deployments_scope_test.go`
+   post-00213 state.
+8. **Migration test:** `migrations/00213_deployments_scope_test.go`
    with six assertions (column shape, CHECK, partial unique index
    shape, uniqueness violation, backfill pin, replay-safety).
 9. **E2E:** new `cmd/e2e/deployment_scope_e2e_test.go` exercises
@@ -65,8 +65,8 @@ In dependency order:
 
 PR-D's commit sequence:
 
-1. Stage `migrations/00212_deployments_scope.sql` (real).
-2. Stage `migrations/00212_deployments_scope_test.go` (test).
+1. Stage `migrations/00213_deployments_scope.sql` (real).
+2. Stage `migrations/00213_deployments_scope_test.go` (test).
 3. Stage `migrations/00208_reserve_slot.sql` (fence).
 4. `git rm migrations/00208_reserve_slot.sql` (same commit).
 
@@ -82,11 +82,12 @@ PR that happens to land in the neighbourhood.
 After PR-D lands:
 `git ls-tree origin/main migrations/ | grep '00207_reserve_slot'` returns a real fence file (the contested slot 00207 is held
 under ADR-041 — see `cross-pr-slot-gate-reservation-fence-pattern`).
-The PR-D real migration at 00212 lands three slots past the 00207
-fence. Slot map is contiguous 00200..00212 with the 00207, 00208,
+The PR-D real migration at 00213 lands four slots past the 00207
+fence. Slot map is contiguous 00200..00213 with the 00207, 00208,
 and 00209 fences holding the contested slots for future use; slot
-00210 is owned by PR #835's real `00210_crons_unique_app_schedule_path.sql`
-that landed on main between PR-D's authoring and the rebase.
+00210 is owned by PR #835's real `00210_crons_unique_app_schedule_path.sql`,
+slot 00211 is a #838 cluster fence, slot 00212 is owned by PR #838's
+real `00212_github_webhook_secrets.sql`.
 
 ## What does NOT ship in PR-D (explicit deferrals)
 
@@ -104,9 +105,9 @@ that landed on main between PR-D's authoring and the rebase.
 
 If a customer is on main with TWO live deployments on one app
 with identical scope (the pre-PR-D wake-target ambiguity), the
-00212 migration's `CREATE UNIQUE INDEX IF NOT EXISTS` will NOT
+00213 migration's `CREATE UNIQUE INDEX IF NOT EXISTS` will NOT
 fail loudly on the conflict — it silently keeps the duplicate
-rows. The operator must run before applying 00212:
+rows. The operator must run before applying 00213:
 
 ```sql
 SELECT app_id, scope, count(*)

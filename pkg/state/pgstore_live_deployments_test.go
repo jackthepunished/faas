@@ -96,7 +96,7 @@ func TestPg_LiveDeployments_ReturnsOnlyLiveRows(t *testing.T) {
 // show Index Only Scan on deployments_live_traffic_idx — was
 // brittle to planner changes driven by the partial unique index
 // deployments_app_scope_live_uniq added in ADR-091 / PR-D
-// (migration 00212) plus the legacy deployments_app_idx. With
+// (migration 00213) plus the legacy deployments_app_idx. With
 // three viable indexes for the picker query and empty-table
 // statistics in pgtest, the planner is free to pick any of them;
 // the access path is no longer a strict invariant we can pin via

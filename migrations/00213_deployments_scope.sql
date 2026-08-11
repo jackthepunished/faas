@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00212_deployments_scope.sql — ADR-091 (Phase 3 of the
+-- 00213_deployments_scope.sql — ADR-091 (Phase 3 of the
 -- secrets+envs roadmap).
 --
 -- Wires per-deployment scope targeting onto the deployments
@@ -26,7 +26,7 @@
 -- a partial-apply where the goose row was lost) skips the
 -- shape CHECK. Same convention as 00203 and 00064.
 --
--- Cross-PR slot gate (revised four times): the original PR-D
+-- Cross-PR slot gate (revised five times): the original PR-D
 -- draft landed at slot 00207, but two other open PRs (#826
 -- obs-PR4 and #835 dashboard cron runs) also claimed 00207.
 -- The cross-PR slot fence convention (memory/cross-pr-slot-
@@ -37,24 +37,30 @@
 -- collision check via slots_from_paths). After the second
 -- renumber, a fourth PR (#829 paddle) claimed 00209 — so we
 -- renumber once more to 00211 and add a reservation fence at
--- 00210 (held under ADR-041; #835's real migration at 00210
--- was originally one slot past our 00211 fence, but the
--- rebase-after-PR-#835-merge rewrites this: PR #835's
--- cron-uniqueness migration landed at slot 00210 and our
--- 00210 fence became a collision, so we drop that fence on
--- rebase and renumber the real migration to 00212). Note:
--- the 00209 slot is ALSO held by an ADR-041 fence
+-- 00210 (held under ADR-041). After the third renumber, PR
+-- #835's cron-uniqueness migration landed at slot 00210 on
+-- main and our 00210 fence became a real-migration collision;
+-- the rebase dropped that fence and renumbered to 00212. After
+-- the fourth renumber, PR #838 (which had been on the same
+-- slot-collision cluster as PR-D and was also chased through
+-- the same renumber chain) won slot 00212 on its own merge
+-- with 00212_github_webhook_secrets.sql, leaving our 00212 as a
+-- duplicate. A second rebase dropped our 00212 file and
+-- renumbered once more to 00213 — the next free slot on main.
+-- Note: the 00209 slot is ALSO held by an ADR-041 fence
 -- (migrations/00209_reserve_slot.sql) because
 -- TestMigrationsContiguous uses position index, not just prefix —
 -- every position N in the embedded set must have a NNNNN-prefix
--- file. Our real migration moved off 00209 to 00212, but a gap
+-- file. Our real migration moved off 00209 to 00213, but a gap
 -- at position 209 in the embedded set would fail
 -- TestMigrationsContiguous ("migration slot 209 is missing").
 -- The 00209 fence fills the slot. Slot map after PR-D lands:
--- 00200..00212 contiguous with the 00207, 00208, and 00209
+-- 00200..00213 contiguous with the 00207, 00208, and 00209
 -- fences holding the contested slots; slot 00210 is real
--- (#835's crons_unique_app_schedule_path migration). The two
--- stale 00204 + 00205 PR-A fences STAY on this branch —
+-- (#835's crons_unique_app_schedule_path migration), slot
+-- 00211 is a fence (#838 cluster), slot 00212 is real (#838's
+-- github_webhook_secrets migration). The two stale 00204 +
+-- 00205 PR-A fences STAY on this branch —
 -- TestMigrationsContiguous is strict ("never skip a slot"),
 -- and PR-D does not consume those slots. A future PR that
 -- lands a real migration at 00204, 00205, 00207, 00208, OR

@@ -46,7 +46,7 @@ env on the wake wire) covers Phase 3 alone.
 ### D1. `deployments.scope` column with `NOT NULL DEFAULT 'default'`
 
 Add `scope text NOT NULL DEFAULT 'default'` on the deployments
-table (migration 00212). The default backfill is the PG11+ fast-
+table (migration 00213). The default backfill is the PG11+ fast-
 default — pre-PR-D rows get `scope='default'` lazily on first read
 without an UPDATE rewrite, so the migration is metadata-only on
 PG15. Enforced at the schema layer via the CHECK constraint
@@ -187,9 +187,9 @@ customer creates a new deployment to switch environment. See
 
 ### New
 
-- `migrations/00212_deployments_scope.sql` — schema + indexes +
+- `migrations/00213_deployments_scope.sql` — schema + indexes +
   DOWN mirror.
-- `migrations/00212_deployments_scope_test.go` — apply-test pins:
+- `migrations/00213_deployments_scope_test.go` — apply-test pins:
   column shape, CHECK constraint, partial unique index shape,
   uniqueness violation, backfill pin, replay-safety.
 - `migrations/00208_reserve_slot.sql` — fence (created and removed
@@ -202,7 +202,7 @@ customer creates a new deployment to switch environment. See
 ### Modified
 
 - `schema.sql` — checked-in sqlc input mirror reflecting
-  post-00212 schema (scope column + CHECK + two indexes).
+  post-00213 schema (scope column + CHECK + two indexes).
 - `pkg/state/sqlc/models.go` — regenerated: `Deployment` gains
   `Scope string`.
 - `pkg/state/types.go` — `Deployment` struct gains `Scope string`
@@ -218,7 +218,7 @@ customer creates a new deployment to switch environment. See
 - `pkg/sched/engine.go` — `loadAPIEnv` signature widens; three
   call sites pass `dep.Scope`.
 - `pkg/api/env_scope.go` — `DefaultEnvScope = "default"`
-  constant, the canonical wire-default for both 00212 and 00203
+  constant, the canonical wire-default for both 00213 and 00203
   fast-default shapes.
 - `pkg/api/dto.go` — `CreateDeploymentRequest.Scope`,
   `CreateDeploymentOverrides.Scope`, `DeploymentResponse.Scope`
@@ -309,16 +309,19 @@ customer creates a new deployment to switch environment. See
    check and the cross-PR collision check via
    `slots_from_paths` (see `scripts/ci/check_migration_slots.sh`),
    so it does not surface as a fresh collision. PR-D's real
-   migration lands at slot 00212, three slots past the 00207
+   migration lands at slot 00213, four slots past the 00207
    fence (over the 00208 and 00209 fences; slot 00210 is owned
    by #835's real `00210_crons_unique_app_schedule_path.sql`
-   migration that landed on main between PR-D's pre-rebase
-   authoring and its post-merge branch refresh). The stale
-   00204 + 00205 PR-A fences stay on this branch — they fill
-   positions 204 and 205 of the contiguous {1, …, N} requirement
-   that `TestMigrationsContiguous` enforces. After PR-D lands,
-   slot map is contiguous 00200..00212 with the 00207, 00208,
-   and 00209 fences holding the contested slots for future use.
+   migration, slot 00211 is a #838 cluster fence, and slot
+   00212 is #838's real `00212_github_webhook_secrets.sql`
+   migration — PR-D lost the 00212 race to PR #838 in the
+   same slot-collision chase and renumbered one more slot to
+   00213). The stale 00204 + 00205 PR-A fences stay on this
+   branch — they fill positions 204 and 205 of the contiguous
+   {1, …, N} requirement that `TestMigrationsContiguous`
+   enforces. After PR-D lands, slot map is contiguous
+   00200..00213 with the 00207, 00208, and 00209 fences
+   holding the contested slots for future use.
 
 ## Rejected alternatives
 
@@ -358,7 +361,7 @@ customer creates a new deployment to switch environment. See
 ## Acceptance
 
 1. `go build ./...` clean, `go vet ./...` clean.
-2. `make migrate-test` includes `TestMigrations_00212_DeploymentsScope`
+2. `make migrate-test` includes `TestMigrations_00213_DeploymentsScope`
    green on a fresh PG. The six assertions pin: column shape,
    CHECK, partial unique index shape, uniqueness violation
    (SQLSTATE 23505, constraint
@@ -384,7 +387,7 @@ customer creates a new deployment to switch environment. See
 7. Slot fence hygiene: `git ls-tree origin/main migrations/ |
    grep '00207_reserve_slot'` returns a real fence file (the
    contested slot 00207 is held under ADR-041). PR-D's real
-   migration at 00212 lands three slots past it. 00204 + 00205
+   migration at 00213 lands four slots past it. 00204 + 00205
    fences stay on main — they fill the contiguous slot positions
    that `TestMigrationsContiguous` requires.
 

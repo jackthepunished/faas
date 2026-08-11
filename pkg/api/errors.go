@@ -407,7 +407,7 @@ const (
 
 	// ADR-091 / PR-D: per-deployment env scope collision. The
 	// partial unique index `deployments_app_scope_live_uniq`
-	// (migration 00212) makes two live rows on the same
+	// (migration 00213) makes two live rows on the same
 	// (app_id, scope) impossible — the second create returns
 	// state.ErrConflict wrapping the constraint name. The handler
 	// decodes the wrapped error to surface this code (409) so a

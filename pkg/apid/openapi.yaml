@@ -7631,7 +7631,7 @@ components:
         # declares which named env scope its wake reads (default
         # / staging / prod / ...). Empty or omitted → handler
         # defaults to `default`. Pattern matches the schema-layer
-        # CHECK (deployments_scope_shape) at migration 00212. Two
+        # CHECK (deployments_scope_shape) at migration 00213. Two
         # live deployments on the same (app_id, scope) → 409
         # deployment_scope_collision.
         scope:
@@ -8110,7 +8110,7 @@ components:
         # ADR-091 / PR-D: per-deployment env scope. The deployment
         # declares which named env scope its wake reads. Empty
         # / omitted → `default` (handler seam). The schema-layer
-        # CHECK (deployments_scope_shape) at migration 00212
+        # CHECK (deployments_scope_shape) at migration 00213
         # enforces the slug regex; duplicate live rows on the
         # same (app_id, scope) → 409 deployment_scope_collision.
         scope:
