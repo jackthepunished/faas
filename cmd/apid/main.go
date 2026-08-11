@@ -343,6 +343,35 @@ type runDeps struct {
 	// shape — which never sets up a real pool — keeps working.
 	// nil in production before run() sets it.
 	closePool func()
+	// PR-B (issue #678 / ADR-056): pool is the *pgxpool.Pool run() opens
+	// via db.Open. runWithDeps needs it to construct the handshake-
+	// layer PGNodeVerifier (wire.NewPGNodeLoader(pool)) and to wire
+	// its notification drain (db.SubscribeWithReconnect(ctx, pool,
+	// [db.NotifyComputeNodeChanged], log)). Mirrors the existing
+	// deps.store / deps.notif pattern: production wires it from run();
+	// tests that build runDeps directly without a real pool leave it
+	// nil — the verifier block below short-circuits to nil when pool
+	// is nil (the cfg.NodeName == "" production path AND the
+	// pre-PR-B test paths). nil in production before run() sets it.
+	pool *pgxpool.Pool
+	// PR-B (issue #678 / ADR-056): preLoadedNodeVerifier lets tests
+	// inject a stub wire.NodeVerifier without booting Postgres or
+	// wiring a real PGNodeLoader. nil in production (the
+	// cfg.NodeName != "" block in runWithDeps owns the
+	// wire.NewPGNodeVerifier(wire.NewPGNodeLoader(pool), log) path);
+	// nil-tolerant — the cfg.NodeName gate still runs, so a test
+	// that sets only preLoadedConfig and preLoadedNodeVerifier == nil
+	// keeps the single-box wire behaviour.
+	preLoadedNodeVerifier wire.NodeVerifier
+	// PR-B (issue #678 / ADR-056): captureDialTLS is a test-side hook
+	// invoked at every Load*TLSWithVerifier dial site with (name,
+	// *tls.Config). name is "githubd", "advisory", or "bridge".
+	// nil in production; nil-tolerant (runWithDeps no-ops on nil).
+	// Lets the TestRunWithDeps_PassesNodeVerifierToDialSites pin test
+	// assert that a non-nil preLoadedNodeVerifier propagates into
+	// all three tls.Cfg.VerifyPeerCertificate hooks without booting
+	// a real Postgres pool.
+	captureDialTLS func(name string, cfg *tls.Config)
 }
 
 func defaultDeps() runDeps {
@@ -467,6 +496,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// pre-bind early-return close the pool consistently. Tests that
 	// build runDeps directly without a pool pass a no-op closure.
 	deps.closePool = closePool
+	// PR-B (issue #678 / ADR-056): hand runWithDeps the same
+	// *pgxpool.Pool so the handshake-layer PGNodeVerifier
+	// construction block can use wire.NewPGNodeLoader(pool) and
+	// db.SubscribeWithReconnect(ctx, pool, ...). nil in tests that
+	// build runDeps directly without a real pool — the verifier
+	// block short-circuits to nil when pool is nil.
+	deps.pool = pool
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
 		// ADR-089 PR-C — background re-seal runner. The runner is
 		// nil when FAAS_REKEY_ENABLED is unset (or when identities
@@ -769,6 +805,69 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if cfg == nil {
 		cfg = &Config{}
 	}
+
+	// PR-B (issue #678 / ADR-056): handshake-layer NodeVerifier. The
+	// verifier sits in front of every mTLS leg on this daemon
+	// (githubd client dial, advisory server listener, githubd-bridge
+	// server listener) so leaf-CNs from peers not in the registered
+	// compute_nodes set are rejected before stdlib trust returns
+	// success. Stdlib chain/SAN/EKU still runs first — the verifier
+	// augments (never replaces) the stdlib trust path.
+	//
+	// Single-box apid (cfg.NodeName == "") does NOT construct a
+	// verifier — stdlib trust alone runs. Multi-box apid constructs
+	// a PG-backed verifier, refreshes once at startup (so the first
+	// handshake after listen sees a populated snapshot), and pumps
+	// compute_node_changed notifications into a drain goroutine for
+	// the lifetime of the daemon.
+	//
+	// Last-known-good posture: PGNodeVerifier.Refresh keeps the
+	// previous snapshot on loader failure (per pkg/wire/pgverifier.go
+	// the snapshot is locked behind an RWMutex and Refresh only
+	// swaps on success). A de-sync to "allow nothing" would brick
+	// the cluster's mTLS legs (every handshake would fail), so the
+	// contract is "best effort refresh on every notify; never brick".
+	//
+	// The preLoadedNodeVerifier test seam lets tests inject a stub
+	// wire.NodeVerifier without booting Postgres. When both deps.pool
+	// is nil (test shape that builds runDeps directly) and
+	// preLoadedNodeVerifier is nil, the block short-circuits to nil —
+	// identical to the pre-PR-B single-box behaviour. The dial sites
+	// consume the wire.NodeVerifier interface, so production
+	// (*wire.PGNodeVerifier) and test stubs (a hand-rolled NodeVerifier)
+	// flow through the same Load*TLSWithVerifier(nodeVerifier) call
+	// sites.
+	var nodeVerifier wire.NodeVerifier
+	if deps.preLoadedNodeVerifier != nil {
+		// Test seam: use the stub verifier directly. Construction
+		// is intentionally lazy — Refresh is NOT called because the
+		// stub doesn't carry a snapshot; tests assert the verifier
+		// reaches the dial sites, not the Refresh contract.
+		nodeVerifier = deps.preLoadedNodeVerifier
+	} else if cfg.NodeName != "" && deps.pool != nil {
+		pgv := wire.NewPGNodeVerifier(wire.NewPGNodeLoader(deps.pool), log)
+		// Drive a synchronous startup Refresh so the first
+		// handshake after listen sees a populated snapshot. The
+		// existing defer closePoolOnce() at the top of runWithDeps
+		// closes the pool on this early-return — matches the
+		// schedd/vmmd pattern (cmd/schedd/main.go:295-297,
+		// cmd/vmmd/main.go:839-841).
+		if _, err := pgv.Refresh(ctx); err != nil {
+			return fmt.Errorf("apid: node verifier startup refresh: %w", err)
+		}
+		go func() {
+			ch, err := db.SubscribeWithReconnect(ctx, deps.pool, []string{db.NotifyComputeNodeChanged}, log)
+			if err != nil {
+				log.Error("apid: node verifier LISTEN failed", "err", err)
+				return
+			}
+			if rerr := pgv.Run(ctx, ch); rerr != nil && !errors.Is(rerr, context.Canceled) {
+				log.Error("apid: node verifier exited", "err", rerr)
+			}
+		}()
+		nodeVerifier = pgv
+	}
+
 	store := deps.store()
 
 	// Dev-only: seed a Free account bound to $FAAS_DEV_TOKEN so the CLI can be
@@ -805,9 +904,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cluster returns (nil, nil) and the unix path keeps working.
 	// PR-0 is behaviour-preserving — see cmd/apid/config.go for
 	// the env-overlay contract.
-	githubdTLS, err := cfg.LoadGithubdTLS()
+	//
+	// PR-B (issue #678 / ADR-056): the WithVerifier variant threads
+	// the handshake-layer NodeVerifier through LoadClientTLSConfig
+	// → SetVerifyPeerCertificate → crypto/tls. cfg.NodeName == ""
+	// (single-box dev) leaves nodeVerifier nil; the wire helper's
+	// setVerifyHook no-ops on a nil verifier and the stdlib trust
+	// path runs unchanged.
+	githubdTLS, err := cfg.LoadGithubdTLSWithVerifier(nodeVerifier)
 	if err != nil {
 		return fmt.Errorf("apid: githubd TLS: %w", err)
+	}
+	if deps.captureDialTLS != nil {
+		deps.captureDialTLS("githubd", githubdTLS)
 	}
 	githubd := newGithubdClient(ctx, cfg.GetGithubdSocket(deps.getenv), githubdTLS, log)
 	// M7.5: dashboard session manager. Loads the 32-byte key from
@@ -1192,13 +1301,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// PR-0 (issue #678): cfg.LoadAdvisoryTLS is the issue-#678 surface
 	// that replaces the inline env reads. The behaviour is identical
 	// (env-overlay path is preserved via the Get helpers).
+	//
+	// PR-B (issue #678 / ADR-056): the WithVerifier variant installs
+	// the handshake-layer NodeVerifier hook on the server-side
+	// tls.Config. vmmd dials in here; the hook rejects any peer
+	// whose leaf-CN is not in compute_nodes.name.
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
 	if sock := resolveAdvisorySock(deps.getenv, cfg); sock != "" {
-		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLS()
+		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLSWithVerifier(nodeVerifier)
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory TLS: %w", tlsErr)
+		}
+		if deps.captureDialTLS != nil {
+			deps.captureDialTLS("advisory", advisoryTLS)
 		}
 		advisorySrv, advisoryLis, err = runAdvisoryServer(ctx, sock, advisoryTLS, srv.store, srv.audit, srv.notif, log, srv.ops)
 		if err != nil {
@@ -1223,13 +1340,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	//
 	// PR-0 (issue #678): cfg.LoadGithubdBridgeTLS is the issue-#678
 	// surface that replaces the inline env reads.
+	//
+	// PR-B (issue #678 / ADR-056): the WithVerifier variant installs
+	// the handshake-layer NodeVerifier hook on the server-side
+	// tls.Config. githubd dials in here; the hook rejects any peer
+	// whose leaf-CN is not in compute_nodes.name.
 	var bridgeSrv *grpc.Server
 	var bridgeLis net.Listener
 	if sock := resolveGithubdBridgeSock(deps.getenv, cfg); sock != "" {
-		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLS()
+		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLSWithVerifier(nodeVerifier)
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: githubd bridge TLS: %w", tlsErr)
+		}
+		if deps.captureDialTLS != nil {
+			deps.captureDialTLS("bridge", bridgeTLS)
 		}
 		bridgeSrv, bridgeLis, err = runGithubdBridgeServer(ctx, sock, bridgeTLS, srv.store, srv.notif, log, srv.ops, spoolRoot(), resolveGithubdStagingRoot(deps.getenv))
 		if err != nil {
