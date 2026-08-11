@@ -65,5 +65,9 @@ export type CreateDeploymentOverrides = {
    *
    */
   liveness_probe?: (DeploymentLivenessProbe | null);
+  /**
+   * Override-object per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = inherit top-level scope or `default`.
+   */
+  scope?: string | null;
 };
 

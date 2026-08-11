@@ -899,10 +899,12 @@ CREATE TABLE public.deployments (
     scan_result jsonb,
     scan_status text,
     scanned_at timestamp with time zone,
+    scope text DEFAULT 'default'::text NOT NULL,
     CONSTRAINT deployments_commit_sha_shape_chk CHECK (((commit_sha IS NULL) OR (((char_length(commit_sha) >= 7) AND (char_length(commit_sha) <= 64)) AND (commit_sha ~ '^[0-9a-f]+$'::text)))),
     CONSTRAINT deployments_kind_check CHECK ((kind = ANY (ARRAY['image'::text, 'tarball'::text, 'dockerfile'::text, 'github'::text]))),
     CONSTRAINT deployments_min_instances_chk CHECK (((min_instances >= 0) AND (min_instances <= 100))),
     CONSTRAINT deployments_scan_status_chk CHECK (((scan_status IS NULL) OR (scan_status = ANY (ARRAY['pending'::text, 'complete'::text, 'failed'::text, 'skipped'::text])))),
+    CONSTRAINT deployments_scope_shape CHECK ((scope ~ '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'::text)),
     CONSTRAINT deployments_sidecars_cap_chk CHECK ((jsonb_array_length(sidecars) <= 2)),
     CONSTRAINT deployments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'building'::text, 'imaging'::text, 'snapshotting'::text, 'live'::text, 'failed'::text, 'superseded'::text])))
 );
@@ -2448,6 +2450,20 @@ CREATE INDEX deployments_app_scan_complete_idx ON public.deployments USING btree
 --
 
 CREATE INDEX deployments_failed_error_code_idx ON public.deployments USING btree (error_code) WHERE (status = 'failed'::text);
+
+
+--
+-- Name: deployments_app_scope_live_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX deployments_app_scope_live_uniq ON public.deployments USING btree (app_id, scope) WHERE (status = 'live'::text);
+
+
+--
+-- Name: deployments_app_scope_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX deployments_app_scope_idx ON public.deployments USING btree (app_id, scope, created_at DESC);
 
 
 --

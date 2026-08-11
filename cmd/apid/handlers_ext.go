@@ -2987,6 +2987,13 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 		// tx). For the single-live-deployment case (the most common
 		// shape today), Σ = 100 is trivially this one field.
 		TrafficPercent: d.TrafficPercent,
+		// ADR-091 / PR-D: per-deployment env scope echo. Always
+		// written — even when scope == "default" — so dashboards
+		// can branch on the literal value rather than treating
+		// absent == "default" (the migration backfills the
+		// column on every pre-PR-D deployment, so the field is
+		// never empty in practice).
+		Scope: d.Scope,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint

@@ -957,6 +957,17 @@ type Deployment struct {
 	// deployments_parked_reason_check constraint (migration 00157).
 	ParkedReason string     `json:"parked_reason,omitempty"`
 	ParkedAt     *time.Time `json:"parked_at,omitempty"`
+	// Scope (ADR-091 / PR-D) — per-deployment env targeting.
+	// The deployment declares which named scope (`default`/
+	// `staging`/`prod`/...) its wake should read env from.
+	// Backfilled to `'default'` by migration 00212's PG11+
+	// fast-default (metadata-only on pre-PR rows, no UPDATE
+	// rewrite). Enforced at the schema layer via the
+	// `deployments_scope_shape` CHECK and the partial unique
+	// index `deployments_app_scope_live_uniq` (at most one
+	// live row per (app_id, scope)). A scope change requires a
+	// NEW deployment — there is no update-time scope change.
+	Scope string `json:"scope,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem

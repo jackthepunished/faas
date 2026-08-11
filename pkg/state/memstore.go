@@ -3428,6 +3428,30 @@ func (m *MemStore) LiveDeployment(_ context.Context, appID string) (Deployment, 
 	return latest, nil
 }
 
+// LiveDeploymentForScope (ADR-091 / PR-D) mirrors PgStore — iterates
+// m.deployments filtering on (app_id, scope, status='live') and
+// keeps the most-recent row. The MemStore has no uniqueness
+// constraint that mirrors deployments_app_scope_live_uniq; if a
+// test setup inserts two live rows with the same (app, scope), the
+// most-recent one wins (same behaviour as LiveDeployment). The
+// partial unique index only enforces the invariant in production
+// Postgres.
+func (m *MemStore) LiveDeploymentForScope(_ context.Context, appID, scope string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var latest Deployment
+	found := false
+	for _, d := range m.deployments {
+		if d.AppID == appID && d.Scope == scope && d.Status == DeployLive && (!found || d.CreatedAt.After(latest.CreatedAt)) {
+			latest, found = d, true
+		}
+	}
+	if !found {
+		return Deployment{}, ErrNotFound
+	}
+	return latest, nil
+}
+
 // LiveDeployments (issue #556 / PR-B) mirrors the Postgres
 // plural query in pkg/state/pgstore.go — returns every row where
 // app_id=$1 AND status='live', ordered created_at DESC. Returns

@@ -1426,6 +1426,19 @@ type Store interface {
 	// deployments_live_traffic_idx (migration 00162); MemStore
 	// iterates m.deployments filtered by status='live'.
 	LiveDeployments(ctx context.Context, appID string) ([]Deployment, error)
+	// LiveDeploymentForScope (ADR-091 / PR-D) returns the unique
+	// live deployment for (appID, scope). Backed by the partial
+	// UNIQUE index deployments_app_scope_live_uniq that PR-D
+	// adds in migration 00212 — at most one live row per
+	// (app_id, scope), so the read is deterministic. Returns
+	// ErrNotFound when no live deployment exists for the scope
+	// (the wake path should fall back to ErrNoDeployment, surfacing
+	// 404 from the gateway). Used by schedd Phase 1 wake when the
+	// caller passed an explicit deploymentID: read `dep.Scope`
+	// from the resolved deployment, then re-resolve the live
+	// row for that scope so the env overlay only contains that
+	// scope's rows.
+	LiveDeploymentForScope(ctx context.Context, appID, scope string) (Deployment, error)
 	// CountLiveInstancesByDeployment returns the number of instances
 	// currently in {WAKING, COLD_BOOTING, RUNNING} for the given
 	// deployment_id (issue #555 PR-6). The DeploymentCounterWatcher

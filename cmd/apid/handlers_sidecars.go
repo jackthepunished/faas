@@ -319,6 +319,18 @@ func buildDeploymentForInsert(app state.App, req *api.CreateDeploymentRequest, o
 	if req.TrafficPercent != nil {
 		dep.TrafficPercent = *req.TrafficPercent
 	}
+	// ADR-091 / PR-D: per-deployment env scope. The handler ran
+	// api.ValidateScope above — non-empty here means well-formed
+	// (passes EnvScopePattern, is not __all__). Empty → default
+	// (the migration's NOT NULL DEFAULT 'default' would catch
+	// this, but we stamp it explicitly so the wire is consistent
+	// with the column and SerializeDeployment doesn't have to
+	// branch on "is the row pre-PR-D").
+	if req.Scope != "" {
+		dep.Scope = req.Scope
+	} else {
+		dep.Scope = api.DefaultEnvScope
+	}
 	if overrides != nil {
 		applyOverridesToDeployment(&dep, overrides)
 	}

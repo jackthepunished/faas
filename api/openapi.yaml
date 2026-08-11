@@ -7627,6 +7627,18 @@ components:
           maximum: 100
           description: "Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by construction."
           example: 100
+        # ADR-091 / PR-D: per-deployment env scope. The deployment
+        # declares which named env scope its wake reads (default
+        # / staging / prod / ...). Empty or omitted → handler
+        # defaults to `default`. Pattern matches the schema-layer
+        # CHECK (deployments_scope_shape) at migration 00212. Two
+        # live deployments on the same (app_id, scope) → 409
+        # deployment_scope_collision.
+        scope:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          description: "Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`."
+          example: "staging"
 
     UpdateDeploymentRequest:
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
@@ -8095,6 +8107,17 @@ components:
           maximum: 100
           description: "Per-deployment traffic-split weight (issue #556 PR-A). nil = server default 100; explicit 0..100 = opt into canary (Pro/Scale only)."
           example: 10
+        # ADR-091 / PR-D: per-deployment env scope. The deployment
+        # declares which named env scope its wake reads. Empty
+        # / omitted → `default` (handler seam). The schema-layer
+        # CHECK (deployments_scope_shape) at migration 00212
+        # enforces the slug regex; duplicate live rows on the
+        # same (app_id, scope) → 409 deployment_scope_collision.
+        scope:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          description: "Top-level per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`."
+          example: "prod"
 
     CreateDeploymentOverrides:
       description: |
@@ -8164,6 +8187,16 @@ components:
             `plan_liveness_probe_not_allowed` BEFORE the DB is touched); Hobby,
             Pro, Scale inherit the 5 s / 3 consecutive / 60 s cooldown / 3 in 300 s
             defaults. v1 is HTTP-only; gRPC health checks are deferred to v2.
+        # ADR-091 / PR-D: per-deployment env scope on the override
+        # object (alternative to the top-level `scope` field). Same
+        # regex + behaviour as the top-level CreateDeploymentRequest.
+        # nil/omitted → inherits the top-level scope or `default`
+        # if both are absent.
+        scope:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          description: "Override-object per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = inherit top-level scope or `default`."
+          example: "staging"
 
     DeploymentHealthcheck:
       description: |
