@@ -1201,9 +1201,9 @@ func TestCmdDashboard_OpensAccountURL(t *testing.T) {
 // TestCmdDashboard_BrowserOpenFailureExitsZero covers the no-$DISPLAY
 // path: browser.Open returns an error, the URL falls back to stderr,
 // and exit code is 0 (the customer's intent — get the dashboard URL —
-// is satisfied). Mirrors the cmdDeployRepo convention. If this test
-// ever flips to want exit 1, the command's doc comment and
-// cmdDeployRepo (commands2.go:288) need to be revisited together.
+// is satisfied). Mirrors the (now-removed) M7.5 repo-picker
+// fallback convention. If this test ever flips to want exit 1, the
+// command's doc comment needs to be revisited together.
 func TestCmdDashboard_BrowserOpenFailureExitsZero(t *testing.T) {
 	t.Setenv("FAAS_API", "https://api.example.com")
 	t.Setenv("FAAS_TOKEN", "fp_live_x")

@@ -776,24 +776,15 @@ func TestCmdOpen_NoArgsPrintsUsage(t *testing.T) {
 	}
 }
 
-func TestCmdDeployRepo_OpensRepoPicker(t *testing.T) {
-	rec := withRecorder(t)
-	t.Setenv("FAAS_TOKEN", "tok")
-	t.Setenv("FAAS_API", "https://api.example.test")
-	if code := cmdDeployTarball([]string{"--repo", "octo/api", "--name", "api-app"}); code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
-	}
-	if len(rec.urls) != 1 {
-		t.Fatalf("urls = %d, want 1", len(rec.urls))
-	}
-	want := "https://api.example.test/dashboard/connect/repos?app=api-app&repo=octo%2Fapi"
-	if rec.urls[0] != want {
-		t.Errorf("url = %q, want %q", rec.urls[0], want)
-	}
-}
-
+// TestCmdDeployRepo_RejectsBadRepoShape was the M7.5-era pin for the
+// dashboard browser flow's repo-slug validator. Issue #739 / ADR-092
+// repurposed --repo for the headless source-ref deploy path; the
+// validator is unchanged (validateRepoSlug, commands2.go:2100) but
+// the dispatch now requires --ref. The slug-rejection sub-cases are
+// kept here as a cheap regression guard on the validator itself;
+// the missing--ref guard is covered in
+// cmd_deploy_source_ref_test.go::TestCmdDeployTarball_RequiresRefWithRepo.
 func TestCmdDeployRepo_RejectsBadRepoShape(t *testing.T) {
-	_ = withRecorder(t)
 	t.Setenv("FAAS_TOKEN", "tok")
 	if code := cmdDeployTarball([]string{"--repo", "not-a-slug"}); code == 0 {
 		t.Fatal("bad repo shape should error")

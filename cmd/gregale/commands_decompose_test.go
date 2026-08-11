@@ -302,6 +302,12 @@ func TestCmdDeployTarball_RejectsOnlyWithRepo(t *testing.T) {
 	defer restoreErr()
 	code := cmdDeployTarball([]string{
 		"--repo", "owner/name",
+		// --ref is required for the headless source-ref path
+		// (issue #739 / ADR-092). Pass a valid 40-char SHA so the
+		// combo-rejection check below is exercised, not the
+		// missing-ref guard. The combo-rejection (--repo + --only)
+		// must short-circuit before any HTTP call.
+		"--ref", "0123456789abcdef0123456789abcdef01234567",
 		"--only", "api",
 	})
 	if code != 1 {

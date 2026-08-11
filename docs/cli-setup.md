@@ -145,3 +145,4 @@ in copy would drift the same way.
 
 - ADR-083 (this design decision)
 - `docs/faas_ux_spec.md` §3.2 (`--help is a real doc`)
+- `docs/source-ref.md` — headless `gregale deploy --repo --ref` for CI runners
