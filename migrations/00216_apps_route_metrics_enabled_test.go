@@ -132,4 +132,3 @@ func TestMigrations_00216_AppsRouteMetricsEnabled(t *testing.T) {
 		_ = pgErr
 	}
 }
-
