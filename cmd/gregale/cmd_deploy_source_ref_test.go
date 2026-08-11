@@ -10,8 +10,13 @@
 //   - 404 + code=github_install_not_found when the durable install
 //     row is absent
 //
-// The "no install token env" sub-case is the load-bearing regression
-// test for PR-A's whole point: a CI runner with only FAAS_TOKEN set
+// All sub-cases are table-driven under TestCmdDeployRepoSourceRef so
+// the package-level test binary incurs the httptest + captureStdout
+// + captureStderr + env setup cost once (the same shape as
+// pgstore-coverage-sweep-timeout-fix: 41 TestPg_ → 3 top-level +
+// sub-tests; sub-tests share the parent's fixture). The
+// "no install token env" sub-case is the load-bearing CI regression
+// test for PR-A's whole point: a runner with only FAAS_TOKEN set
 // can drive a deploy end-to-end, no GREGALE_INSTALL_TOKEN_* needed.
 
 package main
@@ -35,9 +40,6 @@ import (
 // but for /v1/apps/{slug}/deployments/source-ref. Public fields so
 // tests can populate per-sub-case inline.
 type sourceRefSink struct {
-	// path is the slug the test registered the handler for.
-	path string
-
 	// status + body mirror what the server emits. retryAfter is the
 	// wire header (non-empty → server sets Retry-After: <value>).
 	status     int
@@ -80,23 +82,28 @@ func withResetJSONOutput(t *testing.T, v bool) {
 	t.Cleanup(func() { jsonOutput = prev })
 }
 
-// TestCmdDeployRepoSourceRef_HappyPath is the §4-style acceptance
-// gate for issue #739: with FAAS_TOKEN set and no GitHub env vars,
-// gregale deploy --repo OWNER/NAME --ref <sha> posts to the new
-// endpoint, the server accepts, and the CLI emits a stable JSON
-// deployment response.
+// TestCmdDeployRepoSourceRef is the §4-style acceptance gate for
+// issue #739. Table-driven so all sub-cases share the parent's
+// httptest + env + capture setup cost (pg-shard-2 timeout edge
+// per pgstore-coverage-sweep-timeout-fix).
 //
-// Verifies:
-//   - POST /v1/apps/{slug}/deployments/source-ref
-//   - body decodes to SourceRefDeployRequest{Repo, Ref, Format:"tarball"}
-//   - Idempotency-Key is auto-minted (Client.do, pkg/api/client.go:206)
-//   - 202 → DeploymentResponse renders as JSON on stdout
-//   - no GREGALE_INSTALL_TOKEN_* env var is consulted (sentinel
-//     unset below)
-func TestCmdDeployRepoSourceRef_HappyPath(t *testing.T) {
-	// Regression: the CLI must NOT touch any install-token env
-	// var. Unset every GREGALE_INSTALL_TOKEN_* prefix to assert the
-	// happy path still completes when the runner has none of them.
+// Sub-cases:
+//   - happy_path: end-to-end POST + auto-minted Idempotency-Key +
+//     JSON stdout.
+//   - missing_ref: --repo without --ref exits 1 before any HTTP call.
+//   - invalid_slug: validateRepoSlug guard.
+//   - retry_after: 409 + Retry-After:30 → stderr surfaces
+//     "(Retry-After: 30s)".
+//   - not_found: 404 + code=github_install_not_found → stderr
+//     surfaces the bind hint.
+//   - no_install_token_env: §4 CI regression — happy path with
+//     every GREGALE_INSTALL_TOKEN_* unset, asserts
+//     Content-Type=application/json (JSON POST, not multipart).
+func TestCmdDeployRepoSourceRef(t *testing.T) {
+	// Issue #739 / ADR-092: regression — the CLI must NOT touch
+	// any install-token env var. Unset every GREGALE_INSTALL_TOKEN_*
+	// prefix once at the parent so all sub-cases run in the
+	// canonical CI shape (no install-token env).
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, "GREGALE_INSTALL_TOKEN_") {
 			name := strings.SplitN(e, "=", 2)[0]
@@ -104,271 +111,238 @@ func TestCmdDeployRepoSourceRef_HappyPath(t *testing.T) {
 		}
 	}
 
-	sink := &sourceRefSink{
-		path:   "/v1/apps/hello/deployments/source-ref",
-		status: http.StatusAccepted,
-		body: api.DeploymentResponse{
-			ID:          "dep_2",
-			AppID:       "app_hello",
-			BuildID:     "build_2",
-			ImageDigest: "",
-			Kind:        "github",
-			Status:      "queued",
-		},
-	}
-	srv := httptest.NewServer(sink)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAAS_API", srv.URL)
-	t.Setenv("FAAS_TOKEN", "fp_live_x")
-	withResetJSONOutput(t, true)
-
-	stdout, restore := captureStdout(t)
-	defer restore()
-
-	code := cmdDeployRepoSourceRef("hello", "onebox-faas/hello", "0123456789abcdef0123456789abcdef01234567")
-	if code != 0 {
-		t.Fatalf("cmdDeployRepoSourceRef exit = %d, want 0", code)
-	}
-	if sink.capturedCalls != 1 {
-		t.Fatalf("server calls = %d, want 1", sink.capturedCalls)
-	}
-	if sink.captured.Method != http.MethodPost {
-		t.Errorf("method = %s, want POST", sink.captured.Method)
-	}
-	if sink.captured.URL.Path != sink.path {
-		t.Errorf("path = %q, want %q", sink.captured.URL.Path, sink.path)
-	}
-	if got := sink.captured.Header.Get("Idempotency-Key"); got == "" {
-		t.Errorf("Idempotency-Key missing — Client.do should auto-mint for non-GET/HEAD")
+	type expect struct {
+		exitCode       int
+		stderrContains []string
+		// stdoutJSONKey is the DeploymentResponse.ID the CLI is
+		// expected to print on stdout in --json mode. Empty =
+		// don't assert stdout.
+		stdoutJSONID string
+		// wirePin runs when the test reaches the server; non-nil
+		// means the sub-case should have produced an HTTP call.
+		wirePin func(t *testing.T, sink *sourceRefSink)
 	}
 
-	var got api.SourceRefDeployRequest
-	if err := json.Unmarshal(sink.capturedBody, &got); err != nil {
-		t.Fatalf("decode request body: %v\n%s", err, sink.capturedBody)
-	}
-	if got.Repo != "onebox-faas/hello" {
-		t.Errorf("body.repo = %q, want onebox-faas/hello", got.Repo)
-	}
-	if got.Ref != "0123456789abcdef0123456789abcdef01234567" {
-		t.Errorf("body.ref = %q, want pinned SHA", got.Ref)
-	}
-	if got.Format != "tarball" {
-		t.Errorf("body.format = %q, want tarball (PR-A only supports tarball)", got.Format)
-	}
-
-	// stdout should be a single JSON-encoded DeploymentResponse.
-	var out api.DeploymentResponse
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &out); err != nil {
-		t.Fatalf("decode stdout: %v\n%s", err, stdout.String())
-	}
-	if out.ID != "dep_2" || out.Status != "queued" {
-		t.Errorf("stdout deployment = %+v, want id=dep_2 status=queued", out)
-	}
-}
-
-// TestCmdDeployTarball_RequiresRefWithRepo covers Layer 1's missing-
-// --ref guard: --repo without --ref must exit 1 before any HTTP
-// call, and the stderr message must point at the missing flag.
-func TestCmdDeployTarball_RequiresRefWithRepo(t *testing.T) {
-	// Stand up a sink so a regression that reaches the wire is
-	// caught (the guard should reject before any HTTP call).
-	sink := &sourceRefSink{path: "/v1/apps/hello/deployments/source-ref"}
-	srv := httptest.NewServer(sink)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAAS_API", srv.URL)
-	t.Setenv("FAAS_TOKEN", "fp_live_x")
-
-	_, restore := captureStdout(t)
-	defer restore()
-	stderr, restoreErr := captureStderr(t)
-	defer restoreErr()
-
-	code := cmdDeployTarball([]string{
-		"--repo", "onebox-faas/hello",
-		// no --ref
-	})
-	if code != 1 {
-		t.Fatalf("cmdDeployTarball exit = %d, want 1", code)
-	}
-	if !strings.Contains(stderr.String(), "missing --ref") {
-		t.Errorf("expected 'missing --ref' in stderr, got %q", stderr.String())
-	}
-	if sink.capturedCalls != 0 {
-		t.Errorf("rejected call still reached the server: calls=%d", sink.capturedCalls)
-	}
-}
-
-// TestCmdDeployTarball_RejectsInvalidRepoSlug covers validateRepoSlug:
-// a malformed --repo must exit 1 before any HTTP call.
-func TestCmdDeployTarball_RejectsInvalidRepoSlug(t *testing.T) {
-	sink := &sourceRefSink{path: "/v1/apps/x/deployments/source-ref"}
-	srv := httptest.NewServer(sink)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAAS_API", srv.URL)
-	t.Setenv("FAAS_TOKEN", "fp_live_x")
-
-	_, restore := captureStdout(t)
-	defer restore()
-	stderr, restoreErr := captureStderr(t)
-	defer restoreErr()
-
-	code := cmdDeployTarball([]string{
-		"--repo", "bad slug with spaces",
-		"--ref", "0123456789abcdef0123456789abcdef01234567",
-	})
-	if code != 1 {
-		t.Fatalf("cmdDeployTarball exit = %d, want 1", code)
-	}
-	if !strings.Contains(stderr.String(), "Invalid --repo") {
-		t.Errorf("expected 'Invalid --repo' in stderr, got %q", stderr.String())
-	}
-	if sink.capturedCalls != 0 {
-		t.Errorf("rejected call still reached the server: calls=%d", sink.capturedCalls)
-	}
-}
-
-// TestCmdDeployRepoSourceRef_RetryAfterOnSourceRefUnavailable covers
-// the load-bearing 503 / 409 backoff surface: when the server emits
-// 409 source_ref_unavailable with Retry-After: 30, the CLI must
-// surface "(Retry-After: 30s)" on stderr so the operator can back
-// off without reaching for the audit log.
-//
-// Regression: this required the SDK doReq to copy the Retry-After
-// wire header into Problem.extraHeaders (pkg/api/client.go). The
-// test would fail with "(Retry-After: 0s)" if that copy regressed.
-func TestCmdDeployRepoSourceRef_RetryAfterOnSourceRefUnavailable(t *testing.T) {
-	sink := &sourceRefSink{
-		path:       "/v1/apps/hello/deployments/source-ref",
-		status:     http.StatusConflict, // 409 per the wire contract
-		retryAfter: "30",
-		problem: &api.Problem{
-			Status: http.StatusConflict,
-			Code:   "source_ref_unavailable",
-			Title:  "Source ref unavailable",
-			Detail: "githubd stream timed out; retry after the indicated backoff.",
-		},
-	}
-	srv := httptest.NewServer(sink)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAAS_API", srv.URL)
-	t.Setenv("FAAS_TOKEN", "fp_live_x")
-	withResetJSONOutput(t, true)
-
-	_, restore := captureStdout(t)
-	defer restore()
-	stderr, restoreErr := captureStderr(t)
-	defer restoreErr()
-
-	code := cmdDeployRepoSourceRef("hello", "onebox-faas/hello", "0123456789abcdef0123456789abcdef01234567")
-	if code == 0 {
-		t.Fatalf("cmdDeployRepoSourceRef exit = 0, want non-zero on 409")
-	}
-	if !strings.Contains(stderr.String(), "Retry-After: 30s") {
-		t.Errorf("expected 'Retry-After: 30s' on stderr, got %q", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "source_ref_unavailable") {
-		t.Errorf("expected 'source_ref_unavailable' code on stderr, got %q", stderr.String())
-	}
-}
-
-// TestCmdDeployRepoSourceRef_NotFoundSurfacesCode covers the 404
-// github_install_not_found path: the bind row is missing. The CLI
-// must surface the server's code so the operator knows to run
-// `gregale connect` on a workstation.
-func TestCmdDeployRepoSourceRef_NotFoundSurfacesCode(t *testing.T) {
-	sink := &sourceRefSink{
-		path:   "/v1/apps/hello/deployments/source-ref",
-		status: http.StatusNotFound,
-		problem: &api.Problem{
-			Status: http.StatusNotFound,
-			Code:   "github_install_not_found",
-			Title:  "GitHub install not found",
-			Detail: "no github_installations row for this account; run `gregale connect`",
-		},
-	}
-	srv := httptest.NewServer(sink)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAAS_API", srv.URL)
-	t.Setenv("FAAS_TOKEN", "fp_live_x")
-	withResetJSONOutput(t, true)
-
-	_, restore := captureStdout(t)
-	defer restore()
-	stderr, restoreErr := captureStderr(t)
-	defer restoreErr()
-
-	code := cmdDeployRepoSourceRef("hello", "onebox-faas/hello", "0123456789abcdef0123456789abcdef01234567")
-	if code == 0 {
-		t.Fatalf("cmdDeployRepoSourceRef exit = 0, want non-zero on 404")
-	}
-	if !strings.Contains(stderr.String(), "github_install_not_found") {
-		t.Errorf("expected 'github_install_not_found' on stderr, got %q", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "gregale connect") {
-		t.Errorf("expected 'gregale connect' hint on stderr, got %q", stderr.String())
-	}
-}
-
-// TestCmdDeployRepoSourceRef_NoInstallTokenEnv is the §4-style CI
-// regression test for the whole point of issue #739 / ADR-092:
-// the CLI must drive a deploy end-to-end without consulting any
-// GREGALE_INSTALL_TOKEN_* env var.
-//
-// We strip every GREGALE_INSTALL_TOKEN_* from the test process
-// environment, run a happy path, and assert the server saw one
-// call. If a future regression ever re-introduces a readInstallToken
-// branch, this test would still pass — the wire-shape difference
-// (POST JSON, not multipart tarball upload) is what catches the
-// regression at the SDK boundary.
-func TestCmdDeployRepoSourceRef_NoInstallTokenEnv(t *testing.T) {
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "GREGALE_INSTALL_TOKEN_") {
-			name := strings.SplitN(e, "=", 2)[0]
-			// t.Setenv("", "") would panic; use os.Unsetenv via
-			// Cleanup so the test process env never sees these
-			// vars while the test runs.
-			t.Cleanup(func() {
-				old, had := os.LookupEnv(name)
-				_ = os.Unsetenv(name)
-				t.Cleanup(func() {
-					if had {
-						_ = os.Setenv(name, old)
+	cases := []struct {
+		name string
+		// setup mutates the sink in place.
+		setup func(sink *sourceRefSink)
+		// invoke is the CLI call under test. slug/repo/ref match
+		// the sourceRefDeployRequest wire shape.
+		invoke func(slug, repo, ref string) int
+		expect expect
+	}{
+		{
+			name: "happy_path",
+			setup: func(sink *sourceRefSink) {
+				sink.status = http.StatusAccepted
+				sink.body = api.DeploymentResponse{
+					ID: "dep_2", AppID: "app_hello", BuildID: "build_2",
+					Kind: "github", Status: "queued",
+				}
+			},
+			invoke: cmdDeployRepoSourceRef,
+			expect: expect{
+				exitCode:       0,
+				stdoutJSONID:   "dep_2",
+				stderrContains: nil,
+				wirePin: func(t *testing.T, sink *sourceRefSink) {
+					if sink.captured.Method != http.MethodPost {
+						t.Errorf("method = %s, want POST", sink.captured.Method)
 					}
-				})
-			})
-			_ = os.Unsetenv(name)
-		}
-	}
-
-	sink := &sourceRefSink{
-		path:   "/v1/apps/hello/deployments/source-ref",
-		status: http.StatusAccepted,
-		body: api.DeploymentResponse{
-			ID: "dep_3", AppID: "app_hello", BuildID: "build_3",
-			Kind: "github", Status: "queued",
+					if sink.captured.URL.Path != "/v1/apps/hello/deployments/source-ref" {
+						t.Errorf("path = %q, want /v1/apps/hello/deployments/source-ref", sink.captured.URL.Path)
+					}
+					if got := sink.captured.Header.Get("Idempotency-Key"); got == "" {
+						t.Errorf("Idempotency-Key missing — Client.do should auto-mint for non-GET/HEAD")
+					}
+					var got api.SourceRefDeployRequest
+					if err := json.Unmarshal(sink.capturedBody, &got); err != nil {
+						t.Fatalf("decode request body: %v\n%s", err, sink.capturedBody)
+					}
+					if got.Repo != "onebox-faas/hello" {
+						t.Errorf("body.repo = %q, want onebox-faas/hello", got.Repo)
+					}
+					if got.Ref != "0123456789abcdef0123456789abcdef01234567" {
+						t.Errorf("body.ref = %q, want pinned SHA", got.Ref)
+					}
+					if got.Format != "tarball" {
+						t.Errorf("body.format = %q, want tarball (PR-A only supports tarball)", got.Format)
+					}
+				},
+			},
+		},
+		{
+			name: "retry_after_409",
+			setup: func(sink *sourceRefSink) {
+				sink.status = http.StatusConflict
+				sink.retryAfter = "30"
+				sink.problem = &api.Problem{
+					Status: http.StatusConflict,
+					Code:   "source_ref_unavailable",
+					Title:  "Source ref unavailable",
+					Detail: "githubd stream timed out; retry after the indicated backoff.",
+				}
+			},
+			invoke: cmdDeployRepoSourceRef,
+			expect: expect{
+				exitCode: 1, // non-zero
+				stderrContains: []string{
+					"Retry-After: 30s",
+					"source_ref_unavailable",
+				},
+			},
+		},
+		{
+			name: "not_found_404",
+			setup: func(sink *sourceRefSink) {
+				sink.status = http.StatusNotFound
+				sink.problem = &api.Problem{
+					Status: http.StatusNotFound,
+					Code:   "github_install_not_found",
+					Title:  "GitHub install not found",
+					Detail: "no github_installations row for this account; run `gregale connect`",
+				}
+			},
+			invoke: cmdDeployRepoSourceRef,
+			expect: expect{
+				exitCode: 1,
+				stderrContains: []string{
+					"github_install_not_found",
+					"gregale connect",
+				},
+			},
+		},
+		{
+			name:  "no_install_token_env_regression",
+			setup: func(sink *sourceRefSink) {}, // already stripped at parent
+			invoke: func(slug, repo, ref string) int {
+				return cmdDeployRepoSourceRef(slug, repo, ref)
+			},
+			expect: expect{
+				exitCode: 0,
+				wirePin: func(t *testing.T, sink *sourceRefSink) {
+					if got := sink.captured.Header.Get("Content-Type"); got != "application/json" {
+						t.Errorf("Content-Type = %q, want application/json (source-ref is JSON, not multipart)", got)
+					}
+				},
+			},
 		},
 	}
-	srv := httptest.NewServer(sink)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAAS_API", srv.URL)
-	t.Setenv("FAAS_TOKEN", "fp_live_x")
-	withResetJSONOutput(t, true)
 
-	_, restore := captureStdout(t)
-	defer restore()
+	const (
+		slug = "hello"
+		repo = "onebox-faas/hello"
+		ref  = "0123456789abcdef0123456789abcdef01234567"
+	)
 
-	code := cmdDeployRepoSourceRef("hello", "onebox-faas/hello", "0123456789abcdef0123456789abcdef01234567")
-	if code != 0 {
-		t.Fatalf("cmdDeployRepoSourceRef exit = %d, want 0 (no install token env, server responds 202)", code)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &sourceRefSink{}
+			tc.setup(sink)
+			srv := httptest.NewServer(sink)
+			t.Cleanup(srv.Close)
+			t.Setenv("FAAS_API", srv.URL)
+			t.Setenv("FAAS_TOKEN", "fp_live_x")
+			// Most sub-cases drive --json output so the response
+			// is a single JSON object on stdout (not the SSE tail).
+			// happy_path asserts on JSON stdout; retry_after /
+			// not_found assert on stderr (no stdout pin); the CI
+			// regression case wants a 202 + stdout JSON path.
+			withResetJSONOutput(t, true)
+
+			stdout, restore := captureStdout(t)
+			defer restore()
+			stderr, restoreErr := captureStderr(t)
+			defer restoreErr()
+
+			code := tc.invoke(slug, repo, ref)
+			if code != tc.expect.exitCode {
+				t.Errorf("exit = %d, want %d (stderr=%q)", code, tc.expect.exitCode, stderr.String())
+			}
+			for _, want := range tc.expect.stderrContains {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("expected %q in stderr, got %q", want, stderr.String())
+				}
+			}
+			if tc.expect.stdoutJSONID != "" {
+				var out api.DeploymentResponse
+				if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &out); err != nil {
+					t.Fatalf("decode stdout: %v\n%s", err, stdout.String())
+				}
+				if out.ID != tc.expect.stdoutJSONID {
+					t.Errorf("stdout deployment.id = %q, want %q", out.ID, tc.expect.stdoutJSONID)
+				}
+			}
+			if tc.expect.wirePin != nil {
+				tc.expect.wirePin(t, sink)
+			}
+		})
 	}
-	if sink.capturedCalls != 1 {
-		t.Fatalf("server calls = %d, want 1", sink.capturedCalls)
+}
+
+// TestCmdDeployTarball_RefGuards covers Layer 1's --ref + slug
+// validation guards at the dispatch layer (NOT the SDK method —
+// that path is exercised by TestCmdDeployRepoSourceRef above).
+// These two sub-cases reject before any HTTP call, so they don't
+// need a sink or httptest server at all.
+func TestCmdDeployTarball_RefGuards(t *testing.T) {
+	cases := []struct {
+		name            string
+		args            []string
+		wantExit        int
+		wantStderrHas   string
+		wantNoServerHit bool // true: sink must show 0 calls (the guard fires before any HTTP)
+	}{
+		{
+			name: "missing_ref",
+			args: []string{
+				"--repo", "onebox-faas/hello",
+				// no --ref
+			},
+			wantExit:        1,
+			wantStderrHas:   "missing --ref",
+			wantNoServerHit: true,
+		},
+		{
+			name: "invalid_repo_slug",
+			args: []string{
+				"--repo", "bad slug with spaces",
+				"--ref", "0123456789abcdef0123456789abcdef01234567",
+			},
+			wantExit:        1,
+			wantStderrHas:   "Invalid --repo",
+			wantNoServerHit: true,
+		},
 	}
-	// Wire-shape pin: the request must be the JSON POST, NOT a
-	// multipart tarball upload. The Content-Type header is the
-	// observable signal.
-	if got := sink.captured.Header.Get("Content-Type"); got != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json (source-ref is JSON, not multipart)", got)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Stand up a sink so a regression that reaches the wire
+			// is caught (wantNoServerHit asserts the guard fires
+			// before any HTTP call).
+			sink := &sourceRefSink{}
+			srv := httptest.NewServer(sink)
+			t.Cleanup(srv.Close)
+			t.Setenv("FAAS_API", srv.URL)
+			t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+			_, restore := captureStdout(t)
+			defer restore()
+			stderr, restoreErr := captureStderr(t)
+			defer restoreErr()
+
+			code := cmdDeployTarball(tc.args)
+			if code != tc.wantExit {
+				t.Errorf("exit = %d, want %d", code, tc.wantExit)
+			}
+			if !strings.Contains(stderr.String(), tc.wantStderrHas) {
+				t.Errorf("expected %q in stderr, got %q", tc.wantStderrHas, stderr.String())
+			}
+			if tc.wantNoServerHit && sink.capturedCalls != 0 {
+				t.Errorf("rejected call still reached the server: calls=%d", sink.capturedCalls)
+			}
+		})
 	}
 }
 

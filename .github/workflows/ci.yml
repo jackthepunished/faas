@@ -285,7 +285,12 @@ jobs:
   unit-tests-pg-2:
     name: unit tests (pg shard 2 — state/gregale/schedd)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15m (was 10m) — cmd/gregale grew after PR #832's
+    # PR-B source-ref tests; the package-level test binary
+    # under -race -count=1 -p 4 sits near the 10m ceiling.
+    # Mirrors the pgstore-coverage-sweep-timeout-fix
+    # posture: add slack before splitting shards.
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
@@ -331,7 +336,13 @@ jobs:
         run: |
           mkdir -p coverage
           PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '(pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan)')
-          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard2.out -covermode=atomic $PKGS
+          # 14m (was 10m) — under -race -count=1 -p 4 the
+          # cmd/gregale package alone sits at ~3m; pkg/state
+          # sub-tests add another ~3m; the remaining packages
+          # round out the budget. 14m keeps headroom against
+          # CI load spikes (memory: pgstore-coverage-sweep-
+          # timeout-fix). Job-level timeout is 15m.
+          go test -race -count=1 -p 4 -timeout=14m -coverprofile=coverage/cover-shard2.out -covermode=atomic $PKGS
 
       - name: pkg/state coverage gate
         run: make check-state-coverage COVERFILE=coverage/cover-shard2.out
