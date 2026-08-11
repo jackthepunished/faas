@@ -3696,6 +3696,119 @@ func (a *EdgeRuleIPAction) Validate() *Problem {
 	return nil
 }
 
+// edgeRuleValidateRefURLPattern matches external `$ref` / `$id` values
+// that we refuse to compile against. The capture group is the URL
+// substring (so the 422 detail can name it); an external reference is
+// any non-empty URL that does NOT resolve to a JSON Pointer (the
+// `#/foo/bar` form). The JWKS-URL defence-in-depth at ADR-091 D10
+// uses the same posture but a different regex shape; this is the
+// JSON Schema analogue.
+//
+// Conservative on purpose: we strip / refuse anything that looks
+// URL-shaped on the right-hand side of `$ref` / `$id`. Internal
+// pointers (`#/definitions/Foo`) pass through. Same posture as the
+// §11 egress firewall — a customer cannot smuggle a request to
+// RFC1918 / metadata ranges through `$ref` resolution at hot-path
+// compile time. pkg/edgevalidate re-strips at compile time as
+// defence-in-depth.
+var edgeRuleValidateRefURLPattern = regexp.MustCompile(`\$ref|id\s*"\s*:\s*"(https?://|//)[^"]+"`)
+
+// EdgeRuleValidateAction is the wire shape for a kind=validate edge
+// rule. Schema is a JSON Schema 2020-12 document (Draft 2020-12;
+// sanity-bounded to a closed keyword set so a customer cannot ship
+// a vocabulary we don't compile). The apid-side Validate() runs
+// first; pkg/edgevalidate.Compile re-validates at compile time on
+// the gateway hot path as defence-in-depth.
+//
+// Field-by-field:
+//
+//   - Schema: required JSON Schema document. Capped at
+//     MaxEdgeRuleValidateSchemaBytes (64 KiB). External `$ref` /
+//     `$id` URLs are rejected — see edgeRuleValidateRefURLPattern.
+//   - ContentTypes: optional media-type allowlist (e.g.
+//     ["application/json"]). Closed set application/* (the
+//     spec runtime is JSON; non-JSON schemas are out of scope
+//     for v1). Empty = match any Content-Type.
+//   - ApplyWhileStreaming: per-rule opt-in for the streaming
+//     response path (ADR-047). Default false mirrors the §4.1
+//     Accept: application/json opt-out (an SSE-enabled app keeps
+//     validation off until the customer opts the rule in).
+//   - RejectOnUnknownFields: toggles additionalProperties=false
+//     on the compiled schema so a body with stray fields fails.
+//     Default false preserves byte-stable schemas.
+//   - MaxBodyBytes: per-rule inbound body cap. 0 = inherit
+//     api.MaxRequestBodyBytes (per-plan 25 MB buffered / 100 MB
+//     streaming). Must be > 0 and <= MaxRequestBodyBytes at
+//     create-time.
+type EdgeRuleValidateAction struct {
+	Schema                json.RawMessage `json:"schema"`
+	ContentTypes          []string        `json:"content_types,omitempty"`
+	ApplyWhileStreaming   bool            `json:"apply_while_streaming,omitempty"`
+	RejectOnUnknownFields bool            `json:"reject_on_unknown_fields,omitempty"`
+	MaxBodyBytes          int             `json:"max_body_bytes,omitempty"`
+}
+
+func (a *EdgeRuleValidateAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("validate action is required")
+	}
+	if len(a.Schema) == 0 {
+		return ErrValidation("validate action: schema is required")
+	}
+	if len(a.Schema) > MaxEdgeRuleValidateSchemaBytes {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: schema exceeds %d bytes (got %d)",
+			MaxEdgeRuleValidateSchemaBytes, len(a.Schema)))
+	}
+	// JSON well-formedness check. The json/v6 compile path runs
+	// this again at gateway compile time, but a fast-fail here keeps
+	// a malformed schema out of the apid create path and out of the
+	// 64 KiB-ish jsonb blob (Postgres jsonb rejects malformed JSON
+	// at insert with a 22P02 — same shape, but earlier).
+	var probe any
+	if err := json.Unmarshal(a.Schema, &probe); err != nil {
+		return ErrValidation(fmt.Sprintf("validate action: schema is not valid JSON: %v", err))
+	}
+	// External-$ref/$id strip. The JWKS-URL guard at ADR-091 D10
+	// uses the same posture: refuse any URL-shaped value rather
+	// than try to enumerate safe hosts (a regex strip is cheaper
+	// to audit). The gateway side re-strips at compile time as
+	// defence-in-depth.
+	if match := edgeRuleValidateRefURLPattern.FindStringIndex(string(a.Schema)); match != nil {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: schema contains an external $ref or $id URL (around byte %d); inline schemas only",
+			match[0]))
+	}
+	// ContentTypes: optional; closed set application/* (the spec
+	// runtime is JSON for v1). Empty == match any; non-empty must
+	// every entry start with the `application/` prefix and not be
+	// `application/*` (which is what json/* would mean in a future
+	// release; deferred to a new ADR).
+	for _, ct := range a.ContentTypes {
+		if !strings.HasPrefix(ct, "application/") {
+			return ErrValidation(fmt.Sprintf(
+				"validate action: content_types entries must start with 'application/' (got %q)",
+				ct))
+		}
+	}
+	// MaxBodyBytes: optional; clamped at create-time to the plan's
+	// MaxRequestBodyBytes. We don't read plan limits here (this
+	// runs in dto.go, plan-agnostic); the apid handler clamps after
+	// Validate returns so a customer can ship MaxBodyBytes=0 without
+	// the dto validator complaining. The hard upper bound is the
+	// platform cap.
+	if a.MaxBodyBytes < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: max_body_bytes must be >= 0 (got %d)", a.MaxBodyBytes))
+	}
+	if a.MaxBodyBytes > MaxRequestBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: max_body_bytes exceeds the platform cap (%d > %d)",
+			a.MaxBodyBytes, MaxRequestBodyBytes))
+	}
+	return nil
+}
+
 // EdgeRuleResponse is the wire shape for an edge rule. Action is
 // kept as json.RawMessage so the generated Node/Python SDKs don't
 // need seven per-kind models today; a typed SDK unmarshals into

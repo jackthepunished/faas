@@ -9049,7 +9049,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9060,6 +9060,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+            - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9077,7 +9078,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9088,6 +9089,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+            - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9110,6 +9112,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+            - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -9218,6 +9221,75 @@ components:
         deny:
           type: array
           items: { type: string, format: cidr }
+
+    EdgeRuleValidateAction:
+      description: |
+        Customer-supplied JSON Schema (Draft 2020-12) evaluated against
+        the inbound request body BEFORE the wake gate fires. The
+        kind=validate rule is the platform's API-native request-
+        validation surface: rejections return 422
+        `request_validation_failed` with `Problem.errors` carrying
+        per-field detail, never pay a cold-boot cost, never consume
+        the rate-limit / wake-quota budget on malformed traffic.
+
+        Free-and-above (no plan gate). Schema lives inline in the
+        `action` jsonb blob (single-table flow), capped at the
+        platform's `MaxEdgeRuleValidateSchemaBytes` (64 KiB). The
+        gateway re-validates at compile time as defence-in-depth so
+        the SQL hotfix path that bypasses apid-Validate still cannot
+        ship an external `$ref`.
+
+        Field-by-field:
+          * `schema` — required JSON Schema document (Draft 2020-12).
+            Capped at 64 KiB. External `$ref` / `$id` URLs are
+            rejected at create-time; internal pointers (`#/definitions/Foo`)
+            pass through.
+          * `content_types` — optional media-type allowlist.
+            Closed set `application/*`. Empty = match any.
+          * `apply_while_streaming` — per-rule opt-in for the
+            streaming response path (ADR-047). Default false mirrors
+            the §4.1 `Accept: application/json` opt-out.
+          * `reject_on_unknown_fields` — toggles
+            `additionalProperties: false` on the compiled schema.
+            Default false preserves byte-stable schemas.
+          * `max_body_bytes` — per-rule inbound body cap. 0 =
+            inherit `MaxRequestBodyBytes` (per-plan 25 MB buffered /
+            100 MB streaming). Must be > 0 and <= `MaxRequestBodyBytes`.
+      type: object
+      required: [schema]
+      properties:
+        schema:
+          type: object
+          description: |
+            Inline JSON Schema document (Draft 2020-12). The schema
+            is preserved byte-exact across apid↔gatewayd round-trips
+            so the SHA-256 cache key in `pkg/edgevalidate` is stable.
+          additionalProperties: true
+        content_types:
+          type: array
+          description: |
+            Optional media-type allowlist. Every entry must start
+            with `application/`. Empty array = match any Content-Type.
+          items: { type: string }
+        apply_while_streaming:
+          type: boolean
+          description: |
+            Whether validation fires on the streaming response path
+            (ADR-047). Default false; set true per-rule to opt the
+            SSE / chunked response path into body validation.
+        reject_on_unknown_fields:
+          type: boolean
+          description: |
+            Toggles `additionalProperties: false` on the compiled
+            schema. Default false so a body with stray fields does
+            not silently fail; opt in per-rule for strict schemas.
+        max_body_bytes:
+          type: integer
+          minimum: 0
+          description: |
+            Per-rule inbound body cap. 0 (default) inherits the
+            platform cap (`api.MaxRequestBodyBytes`). When set, must
+            be > 0 and <= the platform cap.
 
     # ─── API keys ─────────────────────────────────────────────────────────
 
@@ -10359,6 +10431,21 @@ components:
 
     # ─── Errors ───────────────────────────────────────────────────────────
 
+    FieldError:
+      type: object
+      description: |
+        Per-field entry of `Problem.errors`. The shape mirrors
+        Cloudflare's API Shield 422 / Stripe's `card_errors` family so
+        an SDK can iterate `errors[]` to drive form-field UI without
+        parsing prose. `field` uses JSON Pointer notation for nested
+        keys (`address.zip`). `expected` and `got` are short stable
+        strings; consumers should not depend on the prose.
+      required: [field, expected]
+      properties:
+        field: { type: string, example: "name" }
+        expected: { type: string, example: "string" }
+        got: { type: string, example: "integer" }
+
     Problem:
       type: object
       required: [title, status, code]
@@ -10376,6 +10463,13 @@ components:
         dashboard renders the transaction handle as a confirmation id.
         Exactly one of `billing_portal_url` or `paddle_checkout_url` is
         populated on a given 402 — never both.
+
+        `errors` carries per-field detail (Cloudflare / Stripe shape)
+        for 422 sites that emit a list of field-level failures — used
+        today by the kind=validate edge rule so a JSON Schema
+        rejection renders as a form-field list the dashboard can
+        iterate without parsing prose. Optional + omitempty so every
+        other problem+json site keeps its existing flat shape unchanged.
       example:
         type: "https://docs.gregale.dev/errors/validation_failed"
         title: Validation failed
@@ -10408,6 +10502,15 @@ components:
             Paddle transaction handle (`txn_…`) on a `payment_required`
             402. Empty on the Stripe path. The dashboard renders this as
             a confirmation id after the customer completes checkout.
+        errors:
+          type: array
+          description: |
+            Per-field validation detail. Populated by 422 sites that
+            emit a list of field-level failures. Each entry is a
+            `FieldError` (Cloudflare / Stripe shape: field + expected
+            + got) so an SDK can drive form-field UI without parsing
+            prose.
+          items: { $ref: '#/components/schemas/FieldError' }
 
     RateLimitPlain:
       type: string

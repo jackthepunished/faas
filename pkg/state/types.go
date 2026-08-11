@@ -3026,6 +3026,14 @@ const (
 	EdgeRuleKindCORSA    EdgeRuleKind = "cors"
 	EdgeRuleKindJWT      EdgeRuleKind = "jwt"
 	EdgeRuleKindIP       EdgeRuleKind = "ip"
+	// EdgeRuleKindValidate runs the inbound request body through the
+	// customer's JSON Schema before the wake gate; rejections return
+	// 422 request_validation_failed without paying a cold-boot cost.
+	// Plan-gated Free-and-above (no IsPaidOnly change). Schema lives
+	// inline in action jsonb, capped at api.MaxEdgeRuleValidateSchemaBytes.
+	// See migrations/00214_edge_rules_kind_validate.sql for the
+	// schema CHECK widening.
+	EdgeRuleKindValidate EdgeRuleKind = "validate"
 )
 
 // IsValid reports whether k is a closed-set kind. New kinds land via
@@ -3035,7 +3043,7 @@ func (k EdgeRuleKind) IsValid() bool {
 	switch k {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
-		EdgeRuleKindIP:
+		EdgeRuleKindIP, EdgeRuleKindValidate:
 		return true
 	}
 	return false
@@ -3129,6 +3137,35 @@ type EdgeRuleIPAction struct {
 	Deny  []string `json:"deny,omitempty"`
 }
 
+// EdgeRuleValidateAction carries the customer's JSON Schema + the
+// per-rule gating policy for kind=validate. Schema is the raw schema
+// body the customer posted (no re-serialise) so the SHA-256 cache key
+// in pkg/edgevalidate matches byte-for-byte across apid↔gatewayd.
+//
+// Per-request gating:
+//   - ContentTypes is the optional media-type allowlist; empty ==
+//     validate any Content-Type. Closed set application/* (the
+//     spec runtime is JSON; non-JSON schemas are out of scope).
+//   - ApplyWhileStreaming decides whether validation fires on the
+//     streaming response path (issue / ADR-047). Default false
+//     mirrors the §4.1 Accept: application/json opt-out: a customer
+//     who emits SSE with `streaming_enabled=true` keeps validation
+//     off until they opt in per-rule.
+//   - RejectOnUnknownFields sets additionalProperties=false (Draft
+//     2020-12) before the schema is compiled. Default false keeps
+//     the schema body byte-stable.
+//   - MaxBodyBytes is the per-rule inbound body cap. Default 0
+//     means "inherit api.MaxRequestBodyBytes". The plan cap is
+//     enforced as a sanity floor — MaxBodyBytes > plan cap is a
+//     create-time 422 from pkg/api/dto.go.
+type EdgeRuleValidateAction struct {
+	Schema              json.RawMessage `json:"schema"`
+	ContentTypes        []string        `json:"content_types,omitempty"`
+	ApplyWhileStreaming bool            `json:"apply_while_streaming,omitempty"`
+	RejectOnUnknown     bool            `json:"reject_on_unknown_fields,omitempty"`
+	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
+}
+
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
 // as jsonb. The wire shape lives in pkg/api/dto.go (one struct per
 // kind); the state-side mirror is intentionally minimal — the
@@ -3143,6 +3180,14 @@ type EdgeRuleAction struct {
 	CORS     *EdgeRuleCORSAction     `json:"cors,omitempty"`
 	JWT      *EdgeRuleJWTAction      `json:"jwt,omitempty"`
 	IP       *EdgeRuleIPAction       `json:"ip,omitempty"`
+	// Validate carries the JSON Schema body for kind=validate. The
+	// Schema blob is byte-exact what the customer POSTed (no
+	// re-serialise) so the SHA-256 cache key in pkg/edgevalidate is
+	// stable across apid↔gatewayd round-trips. The runtime caps
+	// (MaxEdgeRuleValidateSchemaBytes + per-rule MaxBodyBytes) are
+	// enforced in pkg/api/dto.go::EdgeRuleValidateAction.Validate
+	// at apid-create time; the state mirror carries them verbatim.
+	Validate *EdgeRuleValidateAction `json:"validate,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.

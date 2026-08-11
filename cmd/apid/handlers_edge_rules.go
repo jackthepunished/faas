@@ -114,6 +114,12 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage) *api.Problem {
 			return api.ErrValidation(fmt.Sprintf("ip action: %v", err))
 		}
 		return a.Validate()
+	case state.EdgeRuleKindValidate:
+		var a api.EdgeRuleValidateAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("validate action: %v", err))
+		}
+		return a.Validate()
 	}
 	return api.ErrValidation("edge rule action validation fell through — internal bug")
 }
@@ -361,6 +367,21 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 		var a api.EdgeRuleIPAction
 		if err := json.Unmarshal(raw, &a); err == nil {
 			out.IP = &state.EdgeRuleIPAction{Allow: a.Allow, Deny: a.Deny}
+		}
+	case state.EdgeRuleKindValidate:
+		var a api.EdgeRuleValidateAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Schema is preserved byte-exact (json.RawMessage round-trip).
+			// pkg/edgevalidate re-validates at compile time on the
+			// gateway hot path; this decoder is the structural
+			// decode pass only.
+			out.Validate = &state.EdgeRuleValidateAction{
+				Schema:              append([]byte(nil), a.Schema...),
+				ContentTypes:        a.ContentTypes,
+				ApplyWhileStreaming: a.ApplyWhileStreaming,
+				RejectOnUnknown:     a.RejectOnUnknownFields,
+				MaxBodyBytes:        a.MaxBodyBytes,
+			}
 		}
 	}
 	return out

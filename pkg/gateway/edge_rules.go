@@ -23,6 +23,14 @@ package gateway
 // EdgeRuleMatcher adds MatchCORS / MatchJWT / MatchIP. The cache +
 // invalidation plumbing stays unchanged.
 //
+// PR-B (issue #678, ADR follow-on) widens with an 8th kind, `validate`:
+// a JSON-Schema body gate that runs BEFORE the wake gate fires. The
+// 7-slot HostEntry widens to 8; the matcher widens with MatchValidate.
+// The compiled-schema cache lives in pkg/edgevalidate (separate
+// LRU keyed by SHA-256 of the raw schema bytes); this file only
+// carries the resolver subset (SchemaDigest) and delegates Validate
+// to pkg/edgevalidate.Validator via the cmd-side adapter.
+//
 // Why a subset type (not `state.EdgeRule`): pkg/gateway has no
 // `pkg/state` import today and adding one would be a reverse dep
 // (mirrors the existing `RequireAuthnAuthenticator` interface
@@ -33,6 +41,7 @@ package gateway
 import (
 	"container/list"
 	"context"
+	"errors"
 	"net"
 	"path"
 	"sync"
@@ -227,6 +236,39 @@ type EdgeRuleIPResolved struct {
 	Deny      []*net.IPNet // nil = no denylist
 }
 
+// EdgeRuleValidateResolved is the kind=validate subset (PR-B).
+// The applier (handler.go::applyEdgeRuleValidate) buffers the
+// inbound request body up to MaxBodyBytes (or api.MaxRequestBodyBytes
+// if MaxBodyBytes ≤ 0), restores r.Body so the proxy leg still
+// reads it, and consults pkg/edgevalidate.Validator with the
+// resolved SchemaDigest. The compiled *CompiledSchema lives in
+// pkg/edgevalidate.Cache keyed by SHA-256 — pkg/gateway doesn't
+// import pkg/edgevalidate, mirroring the JWT seam at line 528.
+//
+// ContentTypes gates the request's Content-Type against a closed
+// vocabulary (apid-Validate enforces "must start with application/"
+// upstream). When nil/empty, any Content-Type passes (back-compat
+// with rules that pre-date the field).
+//
+// ApplyWhileStreaming mirrors the per-rule apply_while_streaming
+// knob: when the inbound request is part of a streaming response
+// (the upgrade check at handler.go), the applier short-circuits
+// to pass-through unless this is true. Body validation needs the
+// full body, which streaming doesn't have.
+type EdgeRuleValidateResolved struct {
+	ID                  string
+	AccountID           string
+	AppID               string
+	Priority            int
+	PathGlob            string
+	Methods             map[string]bool
+	SchemaDigest        [32]byte // SHA-256 of the raw schema body
+	ContentTypes        []string // nil/empty = any Content-Type
+	ApplyWhileStreaming bool     // default false
+	RejectUnknownFields bool     // audit-tag-only; schema-side authoritative
+	MaxBodyBytes        int      // 0 = use api.MaxRequestBodyBytes
+}
+
 // EdgeRuleCache is the in-memory per-host LRU (PR 3 shape; PR 4
 // widens the entry to a HostEntry carrying four compiled slices —
 // one per kind). Wholesale `Reset()` on `db.NotifyEdgeRuleChanged`
@@ -275,6 +317,7 @@ type HostEntry struct {
 	CORS         []EdgeRuleCORSResolved
 	JWT          []EdgeRuleJWTResolved
 	IP           []EdgeRuleIPResolved
+	Validate     []EdgeRuleValidateResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -399,6 +442,24 @@ func (c *EdgeRuleCache) GetIP(host string) ([]EdgeRuleIPResolved, bool) {
 	return out, true
 }
 
+// GetValidate is the PR-B accessor for the kind=validate slice.
+// Same shape as GetIP: returns a value-copy of the underlying slice
+// and a hit bool; nil slice with ok=true means "entry exists but
+// no validate rule for this host".
+func (c *EdgeRuleCache) GetValidate(host string) ([]EdgeRuleValidateResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Validate == nil {
+		return nil, true
+	}
+	src := entry.Validate
+	out := make([]EdgeRuleValidateResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
 // getEntry promotes the entry on hit and returns it. Internal —
 // the Get* family wraps this so each returns a typed slice.
 //
@@ -450,14 +511,16 @@ func (c *EdgeRuleCache) Put(host string, e *HostEntry) {
 	if e == nil {
 		return
 	}
-	// PR 5 contract (widened from PR 4): a Put whose HostEntry has
-	// empty/nil slices for every kind is a no-op (the loader re-hits
-	// PG on the next Get). Pinning this so a future test or refactor
-	// can't silently start caching "no rules" entries (which would
-	// mask a loader bug).
+	// PR 5 contract (widened from PR 4, then again by PR-B for
+	// kind=validate): a Put whose HostEntry has empty/nil slices
+	// for every kind is a no-op (the loader re-hits PG on the next
+	// Get). Pinning this so a future test or refactor can't silently
+	// start caching "no rules" entries (which would mask a loader
+	// bug).
 	if len(e.Route) == 0 && len(e.Rewrite) == 0 &&
 		len(e.Redirect) == 0 && len(e.Headers) == 0 &&
-		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 {
+		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 &&
+		len(e.Validate) == 0 {
 		return
 	}
 	e.Host = host
@@ -523,6 +586,12 @@ func (c *EdgeRuleCache) removeElement(el *list.Element) {
 // appliers (handler.go) decide whether to short-circuit, stamp
 // headers, or write 401/403 on a hit.
 //
+// MatchValidate is the PR-B matcher for the kind=validate subset.
+// The applier buffers r.Body and consults pkg/edgevalidate.Validator
+// via the cmd-side adapter; the matcher itself only resolves the
+// highest-priority matching rule (no body read here — that lives
+// in handler.go to keep pkg/gateway free of io.Reader juggling).
+//
 // Reset drops every cached entry. Called by the gatewayd notify
 // loop on `db.NotifyEdgeRuleChanged`.
 type EdgeRuleMatcher interface {
@@ -533,6 +602,7 @@ type EdgeRuleMatcher interface {
 	MatchCORS(ctx context.Context, host, path, method string) *EdgeRuleCORSResolved
 	MatchJWT(ctx context.Context, host, path, method string) *EdgeRuleJWTResolved
 	MatchIP(ctx context.Context, host, path, method string) *EdgeRuleIPResolved
+	MatchValidate(ctx context.Context, host, path, method string) *EdgeRuleValidateResolved
 	Reset()
 }
 
@@ -577,6 +647,80 @@ type JWTClaims struct {
 	Exp     time.Time
 }
 
+// EdgeValidateIn is the per-call input the Validator consults. The
+// applier (handler.go) buffers r.Body into Body (preserving the
+// body for the proxy leg via r.Body = io.NopCloser(bytes.NewReader))
+// before calling. ContentType is r.Header.Get("Content-Type") at
+// the time of the call.
+//
+// The shape mirrors pkg/edgevalidate.In exactly. pkg/gateway keeps
+// its own copy because pkg/gateway has no dep on pkg/edgevalidate
+// (mirrors the JWTClaims discipline above); drift would surface
+// at the cmd-side adapter when it copies fields.
+type EdgeValidateIn struct {
+	Body        []byte
+	ContentType string
+}
+
+// EdgeValidateFieldError is one per-field entry of a validation
+// failure. Mirrors pkg/edgevalidate.FieldError exactly. The handler
+// lifts it into api.FieldError on the 422 problem+json; pkg/api
+// owns the wire-shape definition so customers see one shape across
+// rules.
+type EdgeValidateFieldError struct {
+	Field    string
+	Expected string
+	Got      string
+}
+
+// EdgeValidateResult is the per-call outcome of Validator.Validate.
+// OK is true on match; FirstError is non-nil only on mismatch.
+// SchemaDigest is always populated so the handler can tag
+// audit/metric events without re-hashing.
+type EdgeValidateResult struct {
+	OK           bool
+	SchemaDigest [32]byte
+	FirstError   *EdgeValidateFieldError
+}
+
+// Validator (PR-B) is the narrow surface pkg/gateway uses for
+// kind=validate validation. The cmd-side wires the
+// pkg/edgevalidate.Manager via a thin adapter that conforms to this
+// interface; pkg/gateway itself never imports pkg/edgevalidate, so
+// the dep direction stays one-way (gateway is a leaf, like with
+// pkg/edgejwks).
+//
+// The validator is consulted AFTER the body has been buffered
+// (handler.go is responsible for the read). Errors are package
+// sentinels (ErrSchemaInvalid / ErrSchemaExternalRef /
+// ErrSchemaEmpty / ErrSchemaTooLarge); the handler maps them to
+// distinct audit + metric outcomes.
+//
+// nil-safe: the Handler field is nil in dev mode and applyEdgeRuleValidate
+// short-circuits when nil.
+type Validator interface {
+	Validate(ctx context.Context, req *EdgeValidateIn, rule *EdgeRuleValidateResolved) (*EdgeValidateResult, error)
+}
+
+// Edge-validate sentinels, declared in pkg/gateway so the handler
+// can errors.Is them without importing pkg/edgevalidate. The
+// cmd-side adapter (cmd/gatewayd-internal/edge_validate.go)
+// wraps pkg/edgevalidate.Err* sentinels into these when
+// forwarding errors up through Validator.Validate.
+//
+// Why duplicate rather than re-export: pkg/edgevalidate is the
+// canonical source of truth for the underlying library; pkg/gateway
+// owns the applier-side error vocabulary. Drift would surface as
+// a missing sentinel when the adapter forgets to wrap, which is
+// intentional (the applier would see the literal error message
+// in the 500 audit row).
+var (
+	ErrValidateSchemaInvalid     = errors.New("edgevalidate: schema is invalid")
+	ErrValidateSchemaEmpty       = errors.New("edgevalidate: schema is empty")
+	ErrValidateSchemaTooLarge    = errors.New("edgevalidate: schema exceeds MaxSchemaBytes")
+	ErrValidateSchemaExternalRef = errors.New("edgevalidate: schema contains an external $ref or $id")
+)
+
 // noOpEdgeRuleMatcher is the default Embedding target the matcher
 // implementations use to inherit default no-op behavior for the
 // kinds they don't ship. Today's production impl
@@ -605,6 +749,9 @@ func (noOpEdgeRuleMatcher) MatchJWT(context.Context, string, string, string) *Ed
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchIP(context.Context, string, string, string) *EdgeRuleIPResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchValidate(context.Context, string, string, string) *EdgeRuleValidateResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}
@@ -750,6 +897,27 @@ func PickFirstJWTMatch(rules []EdgeRuleJWTResolved, path, method string) *EdgeRu
 }
 
 func PickFirstIPMatch(rules []EdgeRuleIPResolved, path, method string) *EdgeRuleIPResolved {
+	for i := range rules {
+		r := &rules[i]
+		if r.Methods != nil && !r.Methods[method] {
+			continue
+		}
+		if r.PathGlob != "" {
+			ok, _ := pathGlobMatch(r.PathGlob, path)
+			if !ok {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+// PickFirstValidateMatch is the PR-B mirror of PickFirstIPMatch.
+// Same priority-ASC + methods + path-glob filter shape; returns
+// the highest-priority matching validate rule, or nil on miss.
+// The body read + schema lookup happens in handler.go.
+func PickFirstValidateMatch(rules []EdgeRuleValidateResolved, path, method string) *EdgeRuleValidateResolved {
 	for i := range rules {
 		r := &rules[i]
 		if r.Methods != nil && !r.Methods[method] {
