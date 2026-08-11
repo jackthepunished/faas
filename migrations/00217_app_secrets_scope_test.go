@@ -1,18 +1,18 @@
 //go:build !no_pg
 
-// Migration-apply test for 00216_app_secrets_scope.sql
+// Migration-apply test for 00217_app_secrets_scope.sql
 // (ADR-092 PR-A / Phase 4 scope-aware sealed secrets).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00216 (no goose
-//     duplicate-version panic). Slot 00216 was the next free slot
-//     on main after 00213_deployments_scope.sql (ADR-091 PR-D,
-//     merged 2026-08-11). No sibling PRs contesting this slot at
-//     PR-A authoring time.
+//  1. Migration set applies cleanly through 00217 (no goose
+//     duplicate-version panic). Slot 00217 was the next free slot
+//     on main after PR-826 (00215_compute_node_heartbeats_stats)
+//     and PR-844 (00216_apps_route_metrics_enabled) both landed
+//     before PR-A's slot-chase re-run on 2026-08-11.
 //  2. app_secrets.scope column exists, is text NOT NULL, and has the
 //     DEFAULT 'default' literal (PG11+ fast-default). Every
-//     pre-00216 row gets scope='default' lazily on first read/write
+//     pre-00217 row gets scope='default' lazily on first read/write
 //     without an UPDATE rewrite, so the migration is metadata-only.
 //     The kid column (added by 00191, ADR-089 PR-A) is independent
 //     of scope and is not affected by this migration.
@@ -51,7 +51,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00216_AppSecretsScope(t *testing.T) {
+func TestMigrations_00217_AppSecretsScope(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -161,7 +161,7 @@ func TestMigrations_00216_AppSecretsScope(t *testing.T) {
 	// (6) backfill pin: insert with the pre-PR-A column list
 	// (account_id, app_id, key, ciphertext) — no `scope`, no
 	// `kid` — and assert scope = 'default'. The historical
-	// column list is the pre-00216 shape: PK was (app_id, key),
+	// column list is the pre-00217 shape: PK was (app_id, key),
 	// the kid column was added later (00191, nullable). The
 	// ONLY way the row gets a scope value is via the NOT NULL
 	// DEFAULT clause. A future regression that drops the
