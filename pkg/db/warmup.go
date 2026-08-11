@@ -105,8 +105,17 @@ func WarmUp(ctx context.Context, pool *pgxpool.Pool, want int, deadline time.Dur
 			// expires mid-Acquire; ctx.Err() on the bounded warmCtx
 			// is DeadlineExceeded, which is the canonical signal.
 			if errors.Is(warmCtx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("%w: acquired %d/%d connections in %s (pool starvation — increase MaxConns or reduce concurrent goroutines): %v",
-					ErrWarmUpTimeout, len(conns), want, deadline, err)
+				// errors.Join keeps both ErrWarmUpTimeout AND the
+				// underlying pgxpool acquire error in the chain
+				// so callers can errors.Is against either sentinel
+				// (the pool-starvation vs context-canceled surfaces
+				// are distinct). The leading message carries the
+				// "what to do next" hint that the operator needs.
+				return errors.Join(
+					fmt.Errorf("%w: acquired %d/%d connections in %s (pool starvation — increase MaxConns or reduce concurrent goroutines)",
+						ErrWarmUpTimeout, len(conns), want, deadline),
+					err,
+				)
 			}
 			if errors.Is(warmCtx.Err(), context.Canceled) {
 				return fmt.Errorf("db: WarmUp: canceled: %w", warmCtx.Err())
