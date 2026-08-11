@@ -2130,6 +2130,158 @@ func contentTypeAllowed(ct string, allowed []string) bool {
 	return false
 }
 
+// applyEdgeRuleGeo (ADR-091 D21 / §4.1.2.8b) consults the per-host
+// edge-rule matcher for a `kind=geo` rule. Same shape as
+// applyEdgeRuleIP: Deny walks first, then Allow is evaluated; an
+// empty Allow is "no allowlist, only Deny applies"; a non-empty
+// Allow with no match is an implicit deny. The country lookup is
+// against the trusted XFF client IP via the configured
+// pkg/geoip.Reader.
+//
+// Failure mode (§11 spirit): the lookup is fail-open. A missing
+// DB, a corrupt file, an IP outside the dataset, or a decode
+// error returns ("", false, err_or_nil) from the reader; the rule
+// does not fire (we increment "failed" and emit a Warn log, but
+// the request flows through). The operator sees the metric tick
+// + the audit + the log so a missing-DB incident is detectable
+// even though traffic is unaffected.
+//
+// nil-safe: h.edgeRules nil OR h.geoReader nil short-circuits to
+// fall-through. Same-account posture mirrors applyEdgeRuleIP.
+func (h *Handler) applyEdgeRuleGeo(w http.ResponseWriter, r *http.Request, app App) bool {
+	if h.edgeRules == nil || h.geoReader == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchGeo(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+		}
+		return false
+	}
+	clientIP, ok := clientIPFromTrustedXFF(r)
+	if !ok {
+		// Defense-in-depth: gatewayd-public is required to set
+		// exactly one XFF entry. Same fail-closed posture as
+		// applyEdgeRuleIP — the rule cannot be evaluated against
+		// an untrusted source.
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+			api.CodeForbidden, "Caller IP not in trusted set",
+			"X-Forwarded-For did not contain exactly one entry; refusing to evaluate geo allow/deny rules"))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.caller_ip_forged", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"xff_count": len(r.Header.Values("X-Forwarded-For")),
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+		}
+		return true
+	}
+	country, found, lerr := h.geoReader.Lookup(clientIP)
+	if lerr != nil {
+		if h.log != nil {
+			h.log.Warn("edge rule geo lookup failed", "ip", clientIP, "err", lerr)
+		}
+	} else if !found {
+		if h.log != nil {
+			h.log.Debug("edge rule geo lookup no country", "ip", clientIP)
+		}
+	}
+	if lerr != nil || !found {
+		// Fail-open: the rule does not fire. The metric + audit
+		// surface lets the operator see the failure rate and
+		// the customer is not affected.
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_failed", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"reason":    geoFailReason(lerr, found),
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "failed")
+		}
+		return false
+	}
+	// Deny walks first.
+	if _, denied := rule.Deny[country]; denied {
+		api.WriteProblem(w, api.ErrGeoDenied(country, "deny"))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_blocked", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"country":   country,
+				"decision":  "deny",
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+		}
+		return true
+	}
+	// If Allow is non-empty, only listed pass.
+	if len(rule.Allow) > 0 {
+		if _, allowed := rule.Allow[country]; !allowed {
+			api.WriteProblem(w, api.ErrGeoDenied(country, "implicit_deny"))
+			if h.edgeRuleAudit != nil {
+				h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_blocked", nil, map[string]any{
+					"rule_id":   rule.ID,
+					"from_host": r.Host,
+					"country":   country,
+					"implicit":  true,
+				})
+			}
+			if h.metrics != nil {
+				h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+			}
+			return true
+		}
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+			"country":   country,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("geo", "match")
+	}
+	return false
+}
+
+// geoFailReason returns a short audit-friendly string explaining
+// why the geo lookup was deemed "failed" (err vs not-found). The
+// audit pipeline copies this into the `"reason"` field of the
+// edge_rule.geo_failed event so an operator can distinguish a
+// corrupt DB from a missing record without re-reading the log.
+func geoFailReason(lerr error, found bool) string {
+	if lerr != nil {
+		return "lookup_error"
+	}
+	if !found {
+		return "no_country"
+	}
+	return "unknown"
+}
+
 // clientIPFromTrustedXFF extracts the single trusted X-Forwarded-For
 // entry that gatewayd-public writes before handing the request off
 // to gatewayd-internal. The cross-daemon handoff is via unix

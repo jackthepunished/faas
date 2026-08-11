@@ -5905,6 +5905,40 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 		}
 	}
 
+// Per-kind quota (ADR-091 D22). Geo is allowed on Free but with a
+	// tighter cap (EdgeRulesGeoPerApp = 1 on Free vs EdgeRulesPerApp
+	// = 5), so the per-kind count must be checked inside the same
+	// FOR UPDATE lock as the general count. The check fires AFTER
+	// the general cap so the pre-existing EdgeRuleQuotaError result
+	// is preserved for non-geo kinds (the per-kind error surfaces
+	// only when the kind-specific cap trips while the general cap
+	// would have allowed).
+	//
+	// Only `geo` has a per-kind cap today; future kinds that grow
+	// a per-kind cap reuse this branch by extending the table.
+	geoPerAppCap := limits.EdgeRulesGeoPerApp
+	if in.Kind == EdgeRuleKindGeo && geoPerAppCap > 0 {
+		// Per-kind quota (review finding #3) — uses the tx-side
+		// adapter so the count reads inside the apps-row FOR UPDATE
+		// lock above (a pool-side helper would re-open the snapshot
+		// and TOCTOU with a concurrent create). The SQL is the same
+		// string as the public CountEdgeRulesByKindForApp
+		// (countEdgeRulesByKindForAppSQL constant) so the two paths
+		// cannot drift on a future kind/column shape change.
+		kindCount, err := s.countEdgeRulesByKindForAppTx(ctx, tx, in.AppID, in.Kind)
+		if err != nil {
+			return EdgeRule{}, err
+		}
+		if kindCount >= geoPerAppCap {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      geoPerAppCap,
+				Observed:   kindCount,
+				Kind:       string(in.Kind),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 	actionBytes, err := json.Marshal(in.Action)
 	if err != nil {
 		return EdgeRule{}, fmt.Errorf("state: marshal edge_rule.action: %w", err)
@@ -6030,6 +6064,47 @@ func (s *PgStore) CountEdgeRulesForApp(ctx context.Context, appID string) (int, 
 		`select count(*) from edge_rules where app_id = $1`, appID,
 	).Scan(&n); err != nil {
 		return 0, err
+	}
+	return n, nil
+}
+
+// CountEdgeRulesByKindForApp is the per-kind quota check used by
+// CreateEdgeRuleIfUnderQuota (ADR-091 D22). The `kind` argument is
+// matched against the schema CHECK-validated kind column; passing
+// an unknown kind returns 0 (matches the schema's silent rejection
+// of unknown values — the calling handler validates kind BEFORE
+// this method via EdgeRuleKind.IsValid).
+//
+// PR #845 review finding #3 called out the dead-code pattern where
+// the count SQL was inlined inside CreateEdgeRuleIfUnderQuota AND
+// replicated in this helper. Both call sites now share
+// countEdgeRulesByKindForAppSQL + an unexported tx-side adapter
+// (countEdgeRulesByKindForAppTx) so there is one source of truth
+// for the SQL string and the parameter order.
+func (s *PgStore) CountEdgeRulesByKindForApp(ctx context.Context, appID string, kind EdgeRuleKind) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx, countEdgeRulesByKindForAppSQL, appID, string(kind)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count edge_rules by kind for app %s: %w", appID, err)
+	}
+	return n, nil
+}
+
+// countEdgeRulesByKindForAppSQL is the canonical SELECT shape for
+// the per-kind quota check; both pool-side and tx-side helpers
+// read from this constant. A future CHECK-shape change (e.g. adding
+// a kind or splitting out a deleted flag) updates here.
+const countEdgeRulesByKindForAppSQL = `select count(*) from edge_rules where app_id = $1 and kind = $2`
+
+// countEdgeRulesByKindForAppTx is the lock-preserving variant used
+// inside CreateEdgeRuleIfUnderQuota. Callers MUST hold the apps-row
+// FOR UPDATE lock before calling — this function does no locking
+// of its own. MemStore has no tx concept so the helper is private
+// to PgStore; the duplication the reviewer flagged was load-bearing
+// for the §6.2-2 TOCTOU invariant.
+func (s *PgStore) countEdgeRulesByKindForAppTx(ctx context.Context, tx pgx.Tx, appID string, kind EdgeRuleKind) (int, error) {
+	var n int
+	if err := tx.QueryRow(ctx, countEdgeRulesByKindForAppSQL, appID, string(kind)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count edge_rules by kind for app %s: %w", appID, err)
 	}
 	return n, nil
 }

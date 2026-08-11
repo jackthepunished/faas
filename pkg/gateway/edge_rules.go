@@ -446,7 +446,12 @@ func (c *EdgeRuleCache) GetIP(host string) ([]EdgeRuleIPResolved, bool) {
 	}
 	src := entry.IP
 	out := make([]EdgeRuleIPResolved, len(src))
-	copy(out, src)
+	for i := range src {
+		out[i] = src[i]
+		out[i].Methods = copyStringBoolMap(src[i].Methods)
+		out[i].Allow = copyIPNetSlice(src[i].Allow)
+		out[i].Deny = copyIPNetSlice(src[i].Deny)
+	}
 	return out, true
 }
 
@@ -477,13 +482,82 @@ func (c *EdgeRuleCache) GetLimit(host string) ([]EdgeRuleLimitResolved, bool) {
 	if !ok {
 		return nil, false
 	}
-	if entry.Limit == nil {
+if entry.Limit == nil {
 		return nil, true
 	}
 	src := entry.Limit
 	out := make([]EdgeRuleLimitResolved, len(src))
 	copy(out, src)
 	return out, true
+}
+
+// GetGeo mirrors GetIP for the kind=geo subset (ADR-091 D21).
+// The Geo slice is a deep-copy of the underlying cache entry —
+// outer struct fields AND the inner Methods / Allow / Deny maps
+// — so callers can mutate without poisoning the cache. Review
+// finding from PR #845: the pre-fix GetIP/GetGeo copied the outer
+// slice but shared the inner map pointers; any caller that mutated
+// rule.Allow via delete() would corrupt the cache. The mismatch
+// was particularly load-bearing for PickFirstGeoMatch's callers
+// even though the current PickFirst is read-only.
+func (c *EdgeRuleCache) GetGeo(host string) ([]EdgeRuleGeoResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Geo == nil {
+		return nil, true
+	}
+	src := entry.Geo
+	out := make([]EdgeRuleGeoResolved, len(src))
+	for i := range src {
+		out[i] = src[i]
+		out[i].Methods = copyStringBoolMap(src[i].Methods)
+		out[i].Allow = copyStringSet(src[i].Allow)
+		out[i].Deny = copyStringSet(src[i].Deny)
+	}
+	return out, true
+}
+
+// copyStringSet returns a fresh map[string]struct{} with the same
+// keys as src, or nil when src is nil (preserves nil-vs-empty at
+// call sites that distinguish "no allowlist" from "empty allowlist").
+func copyStringSet(src map[string]struct{}) map[string]struct{} {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, len(src))
+	for k := range src {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// copyStringBoolMap is the methods-map variant (map[string]bool;
+// values exist but are conventionally read-only here).
+func copyStringBoolMap(src map[string]bool) map[string]bool {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+// copyIPNetSlice deep-copies a []*net.IPNet. Each *net.IPNet is
+// immutable post-construction (the address + mask are read-only fields),
+// so we share the inner pointers and only clone the slice header.
+// If a caller needs to mutate the IPNet itself, they have to construct
+// a new one — and at that point they should construct a brand-new rule.
+func copyIPNetSlice(src []*net.IPNet) []*net.IPNet {
+	if src == nil {
+		return nil
+	}
+	out := make([]*net.IPNet, len(src))
+	copy(out, src)
+	return out
 }
 
 // getEntry promotes the entry on hit and returns it. Internal —

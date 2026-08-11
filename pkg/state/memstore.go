@@ -9570,6 +9570,26 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 			Observed: appCount,
 		}
 	}
+// Per-kind quota (ADR-091 D22). Same shape as the pgstore
+	// branch. The memstore holds the entire edgeRules slice under
+	// m.mu so the per-kind count is trivially race-free; we route
+	// through the public CountEdgeRulesByKindForApp helper (review
+	// finding #3 — single source of truth on both stores).
+	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
+		kindCount, err := m.CountEdgeRulesByKindForApp(context.Background(), in.AppID, EdgeRuleKindGeo)
+		if err != nil {
+			return EdgeRule{}, err
+		}
+		if kindCount >= limits.EdgeRulesGeoPerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesGeoPerApp,
+				Observed:   kindCount,
+				Kind:       string(EdgeRuleKindGeo),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 	if in.MatchMethods == nil {
 		in.MatchMethods = []string{}
 	}
