@@ -12,7 +12,7 @@
 //   - missing app → CLI exit 1 (cmdDeployGithubSnippet path)
 //
 // The test does NOT exercise the Action's vendored binary — that's
-// the e2e fixture in poyrazK/faas-deploy-action's test/e2e. This
+// the e2e fixture in poyrazK/faas/.github/actions/deploy/test/e2e. This
 // suite is the snippet-shape contract.
 
 package main
@@ -42,7 +42,7 @@ func TestRenderGithubSnippet(t *testing.T) {
 				"Repo: ${{ github.repository }}",
 				"Ref: ${{ github.sha }}",
 				"app: my-app",
-				"uses: poyrazK/faas-deploy-action@v1",
+				"uses: poyrazK/faas/.github/actions/deploy@v1",
 				"${{ secrets.GREGALE_API_KEY }}",
 				"https://api.faas.example",
 			},
@@ -77,8 +77,8 @@ func TestRenderGithubSnippet(t *testing.T) {
 			app:       "my-app",
 			pinnedSHA: "f1e2d3c4b5a6987654321098765432109abcdef0",
 			mustLines: []string{
-				"# pin this Action for reproducibility: poyrazK/faas-deploy-action@f1e2d3c4b5a6987654321098765432109abcdef0",
-				"uses: poyrazK/faas-deploy-action@v1",
+				"# pin this Action for reproducibility: poyrazK/faas/.github/actions/deploy@f1e2d3c4b5a6987654321098765432109abcdef0",
+				"uses: poyrazK/faas/.github/actions/deploy@v1",
 			},
 		},
 		{
@@ -92,9 +92,9 @@ func TestRenderGithubSnippet(t *testing.T) {
 			pinnedSHA: "f1e2d3c4b5a6987654321098765432109abcdef0",
 			mustLines: []string{
 				"Repo: onebox-faas/hello",
-				"# pin this Action for reproducibility: poyrazK/faas-deploy-action@f1e2d3c4b5a6987654321098765432109abcdef0",
+				"# pin this Action for reproducibility: poyrazK/faas/.github/actions/deploy@f1e2d3c4b5a6987654321098765432109abcdef0",
 				"app: hello",
-				"uses: poyrazK/faas-deploy-action@v1",
+				"uses: poyrazK/faas/.github/actions/deploy@v1",
 			},
 		},
 		{

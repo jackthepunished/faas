@@ -1812,7 +1812,7 @@ func TestCmdDeployTarball_GithubFlag(t *testing.T) {
 	if !strings.Contains(out, "app: my-app") {
 		t.Errorf("snippet missing the --app slug; got:\n%s", out)
 	}
-	if !strings.Contains(out, "uses: poyrazK/faas-deploy-action@v1") {
+	if !strings.Contains(out, "uses: poyrazK/faas/.github/actions/deploy@v1") {
 		t.Errorf("snippet missing the action reference; got:\n%s", out)
 	}
 	if !strings.Contains(out, "${{ secrets.GREGALE_API_KEY }}") {

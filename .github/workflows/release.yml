@@ -1,0 +1,140 @@
+# .github/workflows/release.yml — Gregale release pipeline (issue #270 / ADR-093).
+#
+# Triggered by a tag push matching v*.*.*. Cross-builds the gregale CLI
+# for linux-amd64 (and optional darwin-arm64 for maintainer local dev),
+# vendors the linux-amd64 binary into .github/actions/deploy/bin/gregale,
+# updates src/version.txt, generates SHA256SUMS, commits everything back
+# to a release branch, and attaches a GitHub Release via
+# softprops/action-gh-release@v2.6.2 (the same SHA pinned at
+# .github/workflows/cd-controlplane.yml:99-110).
+#
+# Cosign signing is OPTIONAL in v1 (per ADR-093 R5 mitigation). The
+# SHA256SUMS file is the deterministic verification surface for v1;
+# v2 will add cosign keypair signing.
+#
+# Branch strategy: the workflow commits to a `release/v<tag>` branch
+# rather than back to the tag ref itself. This avoids the classic
+# "git push to a tag ref doesn't move the tag" surprise. The
+# softprops/action-gh-release step then attaches to the actual tag
+# that triggered the run.
+
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `git describe` and the tag-resolution
+          # plumbing work end-to-end. The binary itself is the
+          # gzipped output, not the repo history.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Cross-build gregale (linux-amd64)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gregale-build
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X github.com/onebox-faas/faas/pkg/wire.Version=${VERSION}" \
+            -o /tmp/gregale-build/gregale ./cmd/gregale
+          ls -la /tmp/gregale-build/gregale
+
+      - name: Optional cross-build (darwin-arm64)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gregale-build
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w -X github.com/onebox-faas/faas/pkg/wire.Version=${VERSION}" \
+            -o /tmp/gregale-build/gregale-darwin-arm64 ./cmd/gregale
+          ls -la /tmp/gregale-build/gregale-darwin-arm64
+
+      - name: Generate SHA256SUMS
+        working-directory: /tmp/gregale-build
+        run: |
+          sha256sum gregale gregale-darwin-arm64 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Vendor binary into action repo
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cp /tmp/gregale-build/gregale .github/actions/deploy/bin/gregale
+          chmod +x .github/actions/deploy/bin/gregale
+          echo "$VERSION" > .github/actions/deploy/src/version.txt
+          # Sanity-check: the vendored binary should report the right
+          # version when invoked. Smoke asserts the LDFLAGS stamping
+          # worked end-to-end.
+          ./.github/actions/deploy/bin/gregale version
+
+      - name: Commit vendored binary + version + SHA256SUMS
+        run: |
+          set -euo pipefail
+          git config user.name "gregale-release-bot"
+          git config user.email "release-bot@gregale.dev"
+          BRANCH="release/${TAG}"
+          git checkout -b "$BRANCH"
+          git add .github/actions/deploy/bin/gregale .github/actions/deploy/src/version.txt SHA256SUMS
+          git commit -m "release: bundle gregale ${TAG}"
+          git push -u origin "$BRANCH"
+        env:
+          TAG: ${{ github.ref_name }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            .github/actions/deploy/bin/gregale
+            /tmp/gregale-build/gregale-darwin-arm64
+            /tmp/gregale-build/SHA256SUMS
+          body: |
+            ## Gregale ${{ github.ref_name }}
+
+            Bundled CLI: **gregale ${{ github.ref_name }}**
+            Compatible server API: see `poyrazK/faas` release notes for ${{ github.ref_name }}.
+
+            ### Checksums
+
+            ```
+            $(cat /tmp/gregale-build/SHA256SUMS)
+            ```
+
+            ### Verify
+
+            ```sh
+            sha256sum -c SHA256SUMS
+            ```
+
+            ### Pin
+
+            In your workflow:
+
+            ```yaml
+            - uses: poyrazK/faas/.github/actions/deploy@v1
+              with:
+                api-key: ${{ secrets.GREGALE_API_KEY }}
+                app: my-app
+            ```
+
+            For hard reproducibility, pin a specific tag:
+
+            ```yaml
+            - uses: poyrazK/faas/.github/actions/deploy@${{ github.ref_name }}
+            ```

@@ -91,10 +91,10 @@ underlying HTTP shape.
 ## GitHub Actions
 
 For teams that want explicit-CI deploys (workflow run, not push
-listener), the first-party `poyrazK/faas-deploy-action` wraps
-this same endpoint. The action is a composite that vendors the
-`gregale` CLI per release, so a workflow pin (`@v1`) is
-deterministic and a bundled `cli-version` output surfaces the
+listener), the first-party `poyrazK/faas/.github/actions/deploy`
+action wraps this same endpoint. The action is a composite that
+vendors the `gregale` CLI per release, so a workflow pin (`@v1`)
+is deterministic and a bundled `cli-version` output surfaces the
 exact version for drift detection.
 
 ### Generate a starter workflow

@@ -1,9 +1,10 @@
 // cmd_deploy_github.go — `gregale deploy --github` snippet generator
 // (issue #270, faas-deploy-action). Companion to the customer-facing
-// composite Action at poyrazK/faas-deploy-action. Emits a copy-paste
-// GitHub Actions workflow snippet to stdout and exits 0 with no auth
-// and no side effects. Mirrors the `cmdBillingPortal --print` shape
-// (cmd/gregale/commands_billing.go:104-157) — just print, no auth.
+// composite Action at poyrazK/faas/.github/actions/deploy (monorepo
+// shape, ADR-093). Emits a copy-paste GitHub Actions workflow snippet
+// to stdout and exits 0 with no auth and no side effects. Mirrors
+// the `cmdBillingPortal --print` shape (cmd/gregale/commands_billing.go:
+// 104-157) — just print, no auth.
 //
 // Detection: when GITHUB_REPOSITORY and GITHUB_SHA are set (i.e. the
 // process is itself running inside an Actions runner), the snippet
@@ -27,22 +28,23 @@ import (
 )
 
 // githubActionVersion is the Action tag the snippet pins to. Bump on
-// every release of poyrazK/faas-deploy-action. The snippet also emits a
-// `# pin:` comment line pointing at the immutable SHA so customers who
-// want hard reproducibility can copy-paste it; v1.0.0 is the first
-// tagged release. Per the plan §User-confirmed scope decisions: pinned-
-// major @v1 with the bundled CLI version surfaced as `cli-version` is
-// the recommended shape; the SHA pin is the optional reproducibility
+// every release of poyrazK/faas. The snippet also emits a `# pin:`
+// comment line pointing at the immutable SHA so customers who want
+// hard reproducibility can copy-paste it; v1.0.0 is the first tagged
+// release. Per the plan §User-confirmed scope decisions: pinned-major
+// @v1 with the bundled CLI version surfaced as `cli-version` is the
+// recommended shape; the SHA pin is the optional reproducibility
 // escape hatch.
 const githubActionVersion = "v1"
 
-// githubActionHeadRef is the canonical-when-pinned, ${{ github.* }}-
-// when-not comment the snippet surfaces. The single source of truth
-// (this file) drives the rendered YAML so a release can update both
-// with one commit.
-const (
-	githubActionRepo = "poyrazK/faas-deploy-action"
-)
+// githubActionPath is the monorepo path to the composite action. ADR-093
+// chose the monorepo shape over the separate-repo shape so PR-1 and
+// PR-2 collapse into one big PR. Customers reference this exact path
+// after `poyrazK/faas` in their `uses:` line.
+const githubActionPath = ".github/actions/deploy"
+
+// githubActionRepo is the parent repo reference for the pin comment.
+const githubActionRepo = "poyrazK/faas"
 
 // githubSnippetEnv captures the env vars the snippet generator reads.
 // Pulled into a struct so the test can drive both the "running inside
@@ -102,10 +104,12 @@ func renderGithubSnippet(env githubSnippetEnv, app, pinnedSHA string) string {
 	// Action reference + pin comment. The `uses:` line picks `@v1` by
 	// default (per the user-confirmed scope decision); the `# pin:`
 	// comment shows the immutable SHA for customers who want repro.
-	usesRef := "poyrazK/faas-deploy-action@v1"
+	// Monorepo shape: ADR-093 — the action lives at
+	// poyrazK/faas/.github/actions/deploy, no separate repo.
+	usesRef := fmt.Sprintf("%s/%s@%s", githubActionRepo, githubActionPath, githubActionVersion)
 	pinLine := ""
 	if pinnedSHA != "" {
-		pinLine = fmt.Sprintf("# pin this Action for reproducibility: %s@%s\n", githubActionRepo, pinnedSHA)
+		pinLine = fmt.Sprintf("# pin this Action for reproducibility: %s/%s@%s\n", githubActionRepo, githubActionPath, pinnedSHA)
 	} else {
 		// No SHA → drop the pin line; the README covers the
 		// "first release, no SHA yet" case explicitly.
