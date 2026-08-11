@@ -123,8 +123,12 @@ func (s *server) renderDashboardFireCron(w http.ResponseWriter, r *http.Request,
 		http.Redirect(w, r, "/dashboard/apps/"+slug+"?fired=error", http.StatusFound)
 		return
 	}
-	//nolint:gosec // G710: same gating as the error branch above.
-	http.Redirect(w, r, "/dashboard/apps/"+slug+"#cron-"+cronID+"?fired=1", http.StatusFound)
+	//nolint:gosec // G710: same gating as the error branch above. Query
+	// string must come BEFORE the #cron-{id} fragment — anything after
+	// the fragment is part of the fragment, not the query, so
+	// r.URL.Query().Get("fired") returns "" and the flash banner never
+	// renders. code-review finding A1.
+	http.Redirect(w, r, "/dashboard/apps/"+slug+"?fired=1#cron-"+cronID, http.StatusFound)
 }
 
 // dashboardFireCron is the mux.HandleFunc entrypoint (POST
@@ -228,6 +232,15 @@ var (
 // as RecentInstanceItem and InstanceChipDurationMS. A NULL outcome
 // surfaces as api.CronRunRunning (the server NEVER returns an empty
 // string), so this translator does no nil-vs-empty dance.
+//
+// The terminal-row projection guards on `Outcome != nil` BEFORE
+// matching a specific enum value. A terminal row with Outcome==nil
+// (transient DB-write anomaly, future enum value the dashboard
+// doesn't know about, etc.) is treated as "running" rather than
+// mis-projected as "failed" — the glyph stays as glyphRunning and
+// the outcome stays as api.CronRunRunning so the operator sees a
+// stale "in flight" row instead of a confusing red ✗ on a row that
+// may complete correctly seconds later. code-review finding A2.
 func projectCronRunRow(inv state.Invocation) dashboard.CronRunRow {
 	started := cronRunsEmDash
 	if !inv.CreatedAt.IsZero() {
@@ -235,32 +248,32 @@ func projectCronRunRow(inv state.Invocation) dashboard.CronRunRow {
 	}
 	outcome := api.CronRunRunning
 	glyph := glyphRunning
-	switch {
-	case inv.Outcome == nil && inv.CompletedAt == nil:
-		// Non-terminal — already defaulted to running.
-	default:
-		switch {
-		case inv.Outcome != nil && *inv.Outcome == state.OutcomeSuccess:
+	if inv.Outcome != nil {
+		switch *inv.Outcome {
+		case state.OutcomeSuccess:
 			outcome = api.CronRunSuccess
 			glyph = glyphOK
-		case inv.Outcome != nil && *inv.Outcome == state.OutcomeTimeout:
+		case state.OutcomeTimeout:
 			outcome = api.CronRunTimeout
 			glyph = glyphFail
-		case inv.Outcome != nil && *inv.Outcome == state.OutcomeDeadLetter:
+		case state.OutcomeDeadLetter:
 			outcome = api.CronRunDeadLetter
 			glyph = glyphFail
-		case inv.Outcome != nil && *inv.Outcome == state.OutcomeFailed:
+		case state.OutcomeFailed:
 			outcome = api.CronRunFailed
 			glyph = glyphFail
 		default:
-			outcome = api.CronRunFailed
-			glyph = glyphFail
+			// Unknown enum value — treat as in-flight rather than
+			// fabricating a failed classification. The SSE re-render
+			// on the next cron_fired event will pick up the corrected
+			// shape if the row re-syncs.
+			_ = inv // Outcome deref is on *inv.Outcome; the default arm leaves outcome/glyph at the running defaults above.
 		}
 	}
 	dur := cronRunsEmDash
 	if inv.CompletedAt != nil && !inv.CreatedAt.IsZero() {
 		ms := inv.CompletedAt.Sub(inv.CreatedAt).Milliseconds()
-		dur = formatCronRunDuration(ms)
+		dur = formatCronRunDuration(ms, *inv.Outcome == state.OutcomeTimeout)
 	}
 	return dashboard.CronRunRow{
 		Glyph:      glyph,
@@ -275,7 +288,14 @@ func projectCronRunRow(inv state.Invocation) dashboard.CronRunRow {
 // (commands_crons_runs.go) so a customer reading both surfaces
 // doesn't see one column say "980ms" and the other "1.0s" for the
 // same underlying run.
-func formatCronRunDuration(ms int64) string {
+//
+// The timeout-aware form surfaces the literal "timeout" string when
+// the row carries OutcomeTimeout so the dashboard's per-cron panel
+// doesn't make the customer scroll back to the outcome column to
+// discover a row was killed. Same density bands; the timeout variant
+// is only the >10s case (the build VM 10-min cap is the canonical
+// timeout ceiling per plan tier). code-review finding A3.
+func formatCronRunDuration(ms int64, isTimeout bool) string {
 	switch {
 	case ms <= 0:
 		return cronRunsEmDash
@@ -284,10 +304,9 @@ func formatCronRunDuration(ms int64) string {
 	case ms < 10_000:
 		return fmt.Sprintf("%.1fs", float64(ms)/1000)
 	default:
-		// Cron run timeout is 10 min (build VM), but exec-worker
-		// runs cap at 60s/300s/…; emit seconds for steady-state
-		// sanity and let the customer scroll to the row label
-		// to see "timeout".
+		if isTimeout {
+			return "timeout"
+		}
 		return fmt.Sprintf("%.1fs", float64(ms)/1000)
 	}
 }

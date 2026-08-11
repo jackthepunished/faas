@@ -919,8 +919,11 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron))))
 	// Single-cron read (issue #791 PR-E / ADR-090 closure). Backs
 	// `gregale crons info <id>` and any dashboard drill-down. Read
-	// surface, no MFA — same posture as listCronRuns.
-	mux.HandleFunc("GET /v1/crons/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getCron)))
+	// surface plus requireMFA — keeps the crons family consistent:
+	// listCrons, listCronRuns, fireCronNow, createCron, updateCron,
+	// deleteCron all use requireMFA, so getCron is the lone exception
+	// if we skip it. code-review finding A4.
+	mux.HandleFunc("GET /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getCron))))
 	// Per-cron execution history (issue #791). Read surface, so
 	// ScopesReadSurface and no idempotency wrapper.
 	mux.HandleFunc("GET /v1/crons/{id}/runs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCronRuns))))
