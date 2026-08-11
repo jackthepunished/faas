@@ -334,7 +334,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// live *tls.Config; vmmRouter / heartbeat / instance-stats
 	// dialers consult vmmRotator.Get() at dial time so a swap
 	// between rotations is observable to the next dial.
-	vmmRotator := newTLSRotator(nil)
+	vmmRotator := wire.NewTLSRotator(nil)
 	vmmTLS, err := cfg.LoadVMMTLSWithPrefixAndVerifierAndReload(nodeVerifier, vmmRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("schedd: load vmmd TLS: %w", err)
@@ -675,7 +675,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// rotator's Reload closure at startup so subsequent Set calls
 	// surface rotated material on the next handshake without
 	// rebuilding the gRPC server.
-	serverRotator := newTLSRotator(nil)
+	serverRotator := wire.NewTLSRotator(nil)
 	serverTLS, err := cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, serverRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("schedd: load server TLS: %w", err)

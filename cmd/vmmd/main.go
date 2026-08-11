@@ -869,8 +869,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the live *tls.Config; Listen's tls.Config + the per-handshake
 	// stdlib callback consult the rotator's Reload closure at
 	// handshake time.
-	serverRotator := newTLSRotator(serverTLS)
-	scheddClientRotator := newTLSRotator(scheddClientTLS)
+	serverRotator := wire.NewTLSRotator(serverTLS)
+	scheddClientRotator := wire.NewTLSRotator(scheddClientTLS)
 	// Replace the boot-time configs with reload-wrapped variants
 	// so Listen + ServerCreds + the schedd dial go through the
 	// rotator's Reload path. Listen and the publisher dial cache

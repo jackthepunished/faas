@@ -921,7 +921,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// initial material at construction but stdlib's
 	// GetClientCertificate callback consults the rotator at every
 	// handshake.
-	githubdRotator := newTLSRotator(nil)
+	githubdRotator := wire.NewTLSRotator(nil)
 	githubdTLS, err := cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, githubdRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("apid: githubd TLS: %w", err)
@@ -1324,7 +1324,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// per-handshake GetConfigForClient callback.
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
-	advisoryRotator := newTLSRotator(nil)
+	advisoryRotator := wire.NewTLSRotator(nil)
 	if sock := resolveAdvisorySock(deps.getenv, cfg); sock != "" {
 		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, advisoryRotator.Reload(nil))
 		if tlsErr != nil {
@@ -1368,7 +1368,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// SIGHUP-driven leaf rotation.
 	var bridgeSrv *grpc.Server
 	var bridgeLis net.Listener
-	bridgeRotator := newTLSRotator(nil)
+	bridgeRotator := wire.NewTLSRotator(nil)
 	if sock := resolveGithubdBridgeSock(deps.getenv, cfg); sock != "" {
 		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, bridgeRotator.Reload(nil))
 		if tlsErr != nil {
