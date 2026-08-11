@@ -151,7 +151,7 @@ As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-
 
 #### 4.1.2 Edge-rule hot-path ordering
 
-The seven edge-rule kinds (`route`, `rewrite`, `redirect`, `headers`, `cors`, `jwt`, `ip`; see ADR-091 / issue #561 / Cloudflare Ruleset Engine) run in a fixed pipeline inside `gatewayd-internal`'s `ServeHTTP`. The ordering is deterministic and the rationale for each position is load-bearing — moving any kind up or down the stack creates a documented regression (browsers reject preflights that 3xx; JWT-failed traffic must not wake a microVM; etc).
+The eight edge-rule kinds (`route`, `rewrite`, `redirect`, `headers`, `cors`, `jwt`, `ip`, `validate`; see ADR-091 / issue #561 / Cloudflare Ruleset Engine; `validate` added in PR-B / D20.6) run in a fixed pipeline inside `gatewayd-internal`'s `ServeHTTP`. The ordering is deterministic and the rationale for each position is load-bearing — moving any kind up or down the stack creates a documented regression (browsers reject preflights that 3xx; JWT-failed traffic must not wake a microVM; malformed-body traffic must not wake a microVM).
 
 ```
 matchAndSubstituteRoute          # §4.1.2.1 — kind=route (PR 3)
@@ -162,19 +162,21 @@ matchAndSubstituteRoute          # §4.1.2.1 — kind=route (PR 3)
   → applyEdgeRuleCORS             # §4.1.2.6 — kind=cors     (PR 5): OPTIONS preflight short-circuits with 204 BEFORE redirect would have 3xx'd the preflight away
   → applyEdgeRuleJWT              # §4.1.2.7 — kind=jwt      (PR 5): AFTER rewrite/headers, BEFORE require_authn, so a JWT-failed request never reaches the per-deployment auth chain or wakes the VM
   → applyEdgeRuleIP               # §4.1.2.8 — kind=ip       (PR 5): AFTER jwt (cheap deny before authenticated-path DB), BEFORE Backend.Pick, so an IP-denied request never pays a cold-wake cost
+  → applyEdgeRuleValidate         # §4.1.2.12 — kind=validate (PR-B / D20.6): AFTER IP (cheap body-shape deny on unverified source), BEFORE require_authn, so a malformed-body request is rejected with 422 without consuming auth, allocating quota, or waking a microVM
   → enforceRequireAuthn           # §4.1.2.9 — per-deployment require_authn gate (issue #560)
   → enforcePublicAuth             # §4.1.2.10 — per-app public_auth gate (issue #477)
   → Backend.Pick                  # §4.1.2.11 — scheduler wake/gate (any earlier 4xx already short-circuited)
   → proxy leg
 ```
 
-**Architectural note on the kind=route exception (load-bearing, ADR-091 D4):** of the seven kinds, only `kind=route` runs *before* `Backend.Lookup` — at `ServeHTTP` line 2255-2257, a `kind=route` hit substitutes `app` and `goto haveApp` so downstream RequireAuthn / PublicAuth / wake gate / proxy all see the *target* app's context (auth remains per-app). The other six kinds run at `haveApp` (line 2267 onward), AFTER `Backend.Lookup`. Reordering `kind=route` to run AFTER Lookup would defeat the substitution; reordering any of the other six to run BEFORE Lookup would mean they fire on an empty `App{}` and silently fall through the same-account guard — both are regressions.
+**Architectural note on the kind=route exception (load-bearing, ADR-091 D4):** of the eight kinds, only `kind=route` runs *before* `Backend.Lookup` — at `ServeHTTP` line 2255-2257, a `kind=route` hit substitutes `app` and `goto haveApp` so downstream RequireAuthn / PublicAuth / wake gate / proxy all see the *target* app's context (auth remains per-app). The other seven kinds run at `haveApp` (line 2267 onward), AFTER `Backend.Lookup`. Reordering `kind=route` to run AFTER Lookup would defeat the substitution; reordering any of the other seven to run BEFORE Lookup would mean they fire on an empty `App{}` and silently fall through the same-account guard — both are regressions.
 
 **Hard guarantees** the ordering pins:
 
 - **CORS precedes redirect (§4.1.2.6 > §4.1.2.3 if a 3xx came first).** A preflight that gets a 3xx is a browser-side failure (browsers don't follow 3xx for preflights). The actual production ordering has redirect at §4.1.2.3 and CORS at §4.1.2.6 — redirect runs first because it's cheaper to 3xx a known-redirect URL than to evaluate a CORS preflight; the CORS preflight path is only reached when no `kind=redirect` rule matches the host/path, which is the common case for an app that *does* serve CORS. The defensive ordering is documented in `pkg/gateway/handler.go:2277-2283`.
 - **JWT precedes `enforceRequireAuthn` (§4.1.2.7 < §4.1.2.9).** The edge-rule JWT gate fires on the inbound token before the per-deployment bearer-token gate; otherwise a JWT-failed request would still pay the per-deployment auth DB lookup.
 - **CORS / JWT / IP all precede `Backend.Pick` (§4.1.2.6, §4.1.2.7, §4.1.2.8 < §4.1.2.11).** A rejected request never pays the cold-wake cost. ADR-091 D4 codifies this; this spec section is the implementation contract.
+- **Validate precedes `enforceRequireAuthn` (§4.1.2.12 < §4.1.2.9) AND `Backend.Pick` (§4.1.2.12 < §4.1.2.11).** A malformed-body request is rejected with 422 (`request_validation_failed`, see §11 problem+json) and never wakes a microVM. This is the §4.7 deny-before-cost posture extended to body-shape: the wake quota cannot be exhausted by 4xx traffic. The plan calls out a follow-on in PR-D for the `DeployWake` bitmask so the post-wake path (snapshot restore) is exercised.
 - **Same-account assertion at every kind** (ADR-091 D5). A cross-account `kind=X` rule silently falls through (audit + `outcome=blocked` metric + no enforcement).
 
 ##### Defense-in-depth guards (spec-level decisions, NOT deviations)
@@ -191,6 +193,16 @@ These are guards the apid validator enforces on rule creation; the gateway stamp
 - **§11** (egress posture that bounds the JWKS URL network-position validator).
 - **§4.7** (per-account rate-limit posture that re-confirms the deny-before-cost guarantee).
 - **ADR-070** (Tier A7 edge split — `gatewayd-public` and `gatewayd-internal` on opposite sides of a unix socket; the architecture that makes `pkg/gateway/internal_proxy.go:286` the load-bearing single-trusted-XFF source for §4.1.2.8).
+
+##### §4.1.2.12 — kind=validate (PR-B / D20.6)
+
+The `kind=validate` shape is the only edge-rule kind that reads the request body. Customers ship a JSON Schema 2020-12 document inline in the rule's `action.jsonb` (`max_edge_rule_validate_schema_bytes = 64 KiB`); the gateway compiles the schema on first sight, keys it by SHA-256 of the body, and consults it on every match.
+
+- **422 surface.** Schema mismatch returns 422 with `code = "request_validation_failed"` and a `problem+json` `errors[]` of `FieldError{field, expected, got}` per `pkg/api/errors.go:1602`. The shape is RFC 7807-compatible. Body cap exceeded (per-rule `max_body_bytes` or the platform cap, whichever is lower) returns 413 `request_too_large`; Content-Type outside the rule's allowlist returns 415 `unsupported_media_type`. Audit events: `edge_rule.validate_matched`, `edge_rule.validate_failed`, `edge_rule.validate_blocked`, `edge_rule.validate_unsupported_media_type`. Metric: `gateway_edge_rule_match_total{kind="validate", outcome=…}` pre-instantiated at line 528-535 (PR-B extension).
+- **Cap chain.** Per-rule `max_body_bytes ∈ [0, api.MaxRequestBodyBytes]` is layered on top of the global `http.MaxBytesReader` installed in `ServeHTTP` (handler.go). A 0 `max_body_bytes` inherits the platform cap. The schema cap (`max_edge_rule_validate_schema_bytes = 64 KiB`) is enforced at apid-Validate time (dto.go:EdgeRuleValidateAction.Validate) AND re-checked at compile time (`pkg/edgevalidate.Compile`) — defence-in-depth per §11.
+- **Streaming posture.** Per-rule `apply_while_streaming: false` (default) means the rule is skipped when `isUpgradeRequest(r)` is true. SSE-style apps opt the rule in per rule. The opt-out mirrors §4.1's `Accept: application/json` opt-out so an SSE-enabled app keeps validation off until the customer opts the rule in. The CLI emits a warning when `streaming_enabled=true` is detected for the same app so the surprise is documented.
+- **External-`$ref` strip.** apid-Validate strips external `$ref` / `$id` URLs at create-time (the regex at `dto.go::edgeRuleValidateRefURLPattern`); `pkg/edgevalidate.Compile` re-strips at compile time on the gateway side. Internal JSON Pointers (`#/definitions/Foo`) currently trip the apid-side regex too (an unanchored `$ref|id` alternation; a future PR will tighten this), but the gateway-side regex is the authoritative gate on the hot path. A runtime `$ref` URL in a stored rule emits 502 `bad_gateway` from the gateway compile path (handler.go applyEdgeRuleValidate line ~1649) — a deploy-time bug-class alarm.
+- **Body-restore.** `applyEdgeRuleValidate` is the first production hot-path code to **buffer and re-install** `r.Body` for downstream consumption (`io.NopCloser(bytes.NewReader(buf))` at handler.go line ~1636). The proxy leg reads `r.Body` via `pkg/gateway/forwardproxy.go:319-339`. A regression in the restore shape surfaces as a 502 from the proxy leg (ctxReader EOF mid-body) and is covered by the PR-C e2e happy+reject path.
 
 ### 4.2 `apid` — control API
 

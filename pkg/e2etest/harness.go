@@ -487,7 +487,20 @@ const testDomain = "apps.test.example"
 //     main-landed migration and PR #697 picks 157 as the next free
 //     slot above main's head. The renumber chain is the standard
 //     PR-#697 follow-up to the PR-#653 145 chain.
-const e2eMigrationTarget = 157
+//
+// PR-C: bumped 157 → 215 after PR #841 (kind=validate PR-B)
+// landed 00214_edge_rules_kind_validate.sql on main. The
+// previous target (157) made `pgtest.WaitForMigration` return
+// early because the schema head was already past 157 — every
+// `cmd/e2e` test silently skipped for the entire edge-rules
+// hardening cluster (PR-A foundation, PR-B observability, PR-B
+// validate, PR-6 rollout-closer, PR #848 validate-C). 215 is
+// chosen as "next free integer above main's real head" so a
+// future migration merely bumps this constant again. The
+// discipline (memory: cross-pr-slot-gate-fence-pattern) is that
+// the only line a migration land touches in this file is this
+// constant + the doc-comment history above.
+const e2eMigrationTarget = 215
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

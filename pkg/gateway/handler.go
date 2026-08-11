@@ -1624,6 +1624,12 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+			// PR-C: cross-account blocked is a defense-in-depth
+			// no-op — emit apply success so the §12 dashboard
+			// chip doesn't falsely flag the cross-account rule
+			// as a wire error. Mirrors applyEdgeRuleIP
+			// (handler.go:1487).
+			h.metrics.ObserveEdgeRuleApply("validate", "success")
 		}
 		return false
 	}
@@ -1652,6 +1658,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+			// PR-C: 415 Unsupported Media Type is a non-2xx wire
+			// write — emit apply error so the §12 chip surfaces
+			// the rejected pre-flight on the customer side.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1687,6 +1697,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "failed")
+			// PR-C: body-read failure (413 / 400) is a non-2xx
+			// wire write — emit apply error so the §12 chip
+			// surfaces the rejected request.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1728,6 +1742,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "failed")
+			// PR-C: validator error (502 / 500) is a non-2xx
+			// wire write — emit apply error so the §12 chip
+			// surfaces the broken rule.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1761,6 +1779,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+			// PR-C: 422 schema mismatch is a non-2xx wire
+			// write — emit apply error so the §12 chip
+			// surfaces the customer's malformed payload.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1772,6 +1794,11 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("validate", "match")
+		// PR-C: validate happy path — request falls through
+		// to the proxy leg. Emit apply success so the §12
+		// chip tracks customer traffic that was body-validated.
+		// Mirrors applyEdgeRuleIP (handler.go:1572).
+		h.metrics.ObserveEdgeRuleApply("validate", "success")
 	}
 	return false
 }
