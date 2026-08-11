@@ -2654,7 +2654,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- with ON DELETE SET NULL (migration 00167)
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
-			   overflow_node = case when $47 then $48 else overflow_node end
+			   overflow_node = case when $49 then $50 else overflow_node end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
