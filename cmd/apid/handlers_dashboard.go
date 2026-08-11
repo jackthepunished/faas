@@ -353,10 +353,10 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 	cronItems := make([]dashboard.CronItem, 0, len(crons))
 	for _, c := range crons {
 		item := dashboard.CronItem{
-			ID:                c.ID,
-			Schedule:          c.Schedule,
-			Path:              c.Path,
-			Enabled:           c.Enabled,
+			ID:                  c.ID,
+			Schedule:            c.Schedule,
+			Path:                c.Path,
+			Enabled:             c.Enabled,
 			FireNowConfirmToken: fireCSRFToken,
 		}
 		if !c.LastFiredAt.IsZero() {

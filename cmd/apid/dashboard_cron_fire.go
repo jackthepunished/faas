@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/dashboard"
@@ -42,6 +43,12 @@ import (
 // the token verifies identity + intent, not which row; the lookup
 // inside the handler revalidates ownership against the URL path).
 const dashboardFireCronAction = "fire_cron"
+
+// dashboardFireCronIDRe mirrors the cronIDPattern shape used in the
+// CLI (cmd/gregale/commands2.go::cronIDPattern): 32 lowercase hex
+// chars. Validated before concatenating into the redirect target so
+// a malformed id can't compose into an open-redirect URL.
+var dashboardFireCronIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // Dashboard cron-run glyph vocabulary (issue #791 PR-E / ADR-090).
 // Mirrors the closed vocab the CLI's "crons runs" command prints
@@ -85,6 +92,19 @@ func (s *server) renderDashboardFireCron(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// Path params must match the canonical slug + cron-id shapes
+	// before we concatenate them into a redirect target. The mux
+	// only matches the route shape, not the values; validating
+	// here kills the G710 (open-redirect via taint) gosec warning
+	// the path-param-based redirect trips. The store lookups below
+	// already IDOR-safe the values against the account, but a
+	// malformed value that matched the mux (e.g. a //attacker.com
+	// slug) would compose into an open-redirect target if we
+	// skipped this regex gate.
+	if !validSlug(slug) || !dashboardFireCronIDRe.MatchString(cronID) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 	if err := middleware.VerifyAuthenticated(s.sessions, r, dashboardFireCronAction, acct.ID); err != nil {
 		// Same shape as dashboardDelete's CSRF-mismatch handling —
 		// the helper wraps ErrCSRFInvalid on every failure path, so
@@ -99,9 +119,11 @@ func (s *server) renderDashboardFireCron(w http.ResponseWriter, r *http.Request,
 		// the ?fired=…=error banner. Avoids leaving the operator
 		// on a handler-error page where the back button fights
 		// the form re-POST.
+		//nolint:gosec // G710: slug + cronID are regex-gated above (validSlug + dashboardFireCronIDRe) AND IDOR-validated inside fireCronFromDashboard, so the redirect target cannot escape the /dashboard/apps/{slug} prefix.
 		http.Redirect(w, r, "/dashboard/apps/"+slug+"?fired=error", http.StatusFound)
 		return
 	}
+	//nolint:gosec // G710: same gating as the error branch above.
 	http.Redirect(w, r, "/dashboard/apps/"+slug+"#cron-"+cronID+"?fired=1", http.StatusFound)
 }
 
