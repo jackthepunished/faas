@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"filippo.io/age"
@@ -333,6 +334,15 @@ type runDeps struct {
 	// runDeps directly (those tests should set preLoadedConfig
 	// instead).
 	config *Config
+	// ADR-094: closePool is the pool-cleanup hook run() wires after
+	// db.Open succeeds. runWithDeps calls it on every early-return
+	// between db.Open and the post-bind defer-install (so an error
+	// anywhere in the bind path closes the pool out, not the
+	// in-flight bgBefore goroutines). Tests can inject a no-op
+	// (`func() {}`) so the existing TestRunWithDeps_ListenErrorReturns
+	// shape — which never sets up a real pool — keeps working.
+	// nil in production before run() sets it.
+	closePool func()
 }
 
 func defaultDeps() runDeps {
@@ -385,8 +395,45 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("apid: open db: %w", err)
 	}
-	defer pool.Close()
+	// ADR-094: the pool's lifetime is no longer bound to run()'s
+	// defer. The pre-bind goroutines in bgBefore (rekey walker,
+	// sseFanIn, audit subscriber, grace sweep, etc.) each call
+	// pool.Acquire(); an early-return anywhere between here and
+	// the listener bind used to close the pool out from under
+	// those goroutines — they returned "closed pool" and main
+	// never reached the listener-bind log line. The fix is the
+	// closePool helper + the explicit closePool() call before
+	// every early-return in this range, with a single
+	// defer closePool() at the post-bind site (below the metrics
+	// / advisory / bridge listener sections, just before
+	// srv.Serve).
+	//
+	// ADR-094 pins this shape via pkg/db/warmup_architecture_test.go
+	// so a future refactor that drops closePool() at an early-return
+	// site fails the test instead of silently reintroducing the
+	// race.
+	closePool := func() {
+		if pool != nil {
+			pool.Close()
+		}
+	}
+	// Warm-up barrier: acquire (and release) 4 connections before
+	// bgBefore launches its goroutines. This is the belt-and-braces
+	// defence — proves the pool can serve N parallel connections
+	// before any one of them races another for the same slot. The
+	// "N=4" default matches apid's expected boot fan-out (audit
+	// subscriber Subscribe + rekey first-walk + sseFanIn Subscribe +
+	// grace/login/eventretention first-pass DELETE each grab one
+	// connection at startup; 4 is the upper bound for any single
+	// tick). If a future daemon picks up a fifth concurrent
+	// goroutine at boot, bump the constant here + update the
+	// architecture test's expected ordering.
+	if err := db.WarmUp(ctx, pool, 4, 5*time.Second); err != nil {
+		closePool()
+		return fmt.Errorf("apid: pool warm-up: %w", err)
+	}
 	if err := db.MigrateUp(ctx, pool); err != nil {
+		closePool()
 		return fmt.Errorf("apid: migrate: %w", err)
 	}
 
@@ -409,11 +456,17 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if cfg == nil {
 		cfg, err = deps.loadConfig(deps.configPath)
 		if err != nil {
+			closePool()
 			return fmt.Errorf("apid: load config: %w", err)
 		}
 	}
 	deps.config = cfg
 	deps.notif = func() Notifier { return pgNotifier{pool: pool} }
+	// ADR-094: hand runWithDeps the same closePool helper so the
+	// post-bind defer (installed just before srv.Serve) and every
+	// pre-bind early-return close the pool consistently. Tests that
+	// build runDeps directly without a pool pass a no-op closure.
+	deps.closePool = closePool
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
 		// ADR-089 PR-C — background re-seal runner. The runner is
 		// nil when FAAS_REKEY_ENABLED is unset (or when identities
@@ -685,6 +738,24 @@ func dpaPathFromEnv(getenv func(string) string) string {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// ADR-094: pool-close gate. closePool closes the pool; the
+	// Once guards against double-close when an early-return path
+	// closes the pool explicitly and the deferred fallback also
+	// runs. Production wires deps.closePool to the helper built
+	// in run() right after db.Open; tests that pass a no-op
+	// closure (defaultDeps.zeroClosePool) keep the existing
+	// behaviour. The Once-fallback ensures any pre-bind path
+	// that forgets to call closePoolOnce explicitly still closes
+	// the pool on return — defence-in-depth on top of the
+	// explicit calls below.
+	closePool := deps.closePool
+	closePoolOnce := sync.OnceFunc(func() {
+		if closePool != nil {
+			closePool()
+		}
+	})
+	defer closePoolOnce()
+
 	// PR-0 (issue #678): cfg carries the issue-#678 surface
 	// (Load*TLS, Get*) into every helper that used to read FAAS_APID_*
 	// inline. deps.config is set by run() after LoadConfig returns;
