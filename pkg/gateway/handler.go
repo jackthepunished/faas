@@ -3520,6 +3520,17 @@ func (h *Handler) preInstantiateApp(appID string) {
 	h.metrics.PreInstantiateApp(appID)
 }
 
+// RouteSetForTest is the test-only seam that exposes the
+// lazy-create behaviour of routeSetFor. Production must use
+// the gated-with-RouteMetricsEnabled call site at the
+// post-Lookup block (handler.go:2333). Exists so a unit test
+// can seed a known state without standing up the full Backend +
+// Edge-Rule matcher; tests should call RoutesFor on the
+// returned set and AdmitForTest on the underlying *routeLabelSet.
+func (h *Handler) RouteSetForTest(appID string) *routeLabelSet {
+	return h.routeSetFor(appID, true)
+}
+
 // RoutesFor (ADR-093) returns a copy of the admitted route labels
 // for appID, in deterministic order (insertion order via sorted
 // keys). The caller is the /v1/internal/apps/{slug}/routes

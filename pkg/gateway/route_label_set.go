@@ -155,3 +155,14 @@ func (s *routeLabelSet) admit(route string) string {
 	s.admitted[route] = struct{}{}
 	return route
 }
+
+// AdmitForTest is the test-only seam that inserts a route
+// without going through the cap admission check. Production
+// code MUST NOT call this — only tests via the build-tag-free
+// pkg/gateway test files. Exists so a unit test can seed a
+// known state without the cap-vs-overflow dance.
+func (s *routeLabelSet) AdmitForTest(route string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.admitted[route] = struct{}{}
+}
