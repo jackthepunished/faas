@@ -1770,3 +1770,61 @@ func TestPollBuildStatus_HungServerHonoursDeadline(t *testing.T) {
 		t.Errorf("elapsed = %v, want <2s (deadline budget; pre-fix this took ~30s)", elapsed)
 	}
 }
+
+// TestCmdDeployTarball_GithubFlag exercises the --github flag short-circuit
+// in cmdDeployTarball (issue #270). The flag emits a copy-paste Actions
+// workflow snippet to stdout and exits 0 — no auth, no side effects, no
+// API call. The test clears the runner env so the snippet uses
+// ${{ github.* }} placeholders, then asserts the load-bearing lines
+// (sentinel, app slug, action reference, secret reference).
+func TestCmdDeployTarball_GithubFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	oldOut := osStdout
+	oldErr := osStderr
+	osStdout = &stdout
+	osStderr = &stderr
+	defer func() {
+		osStdout = oldOut
+		osStderr = oldErr
+	}()
+
+	// Bare invocation: no runner env → portably-portable snippet.
+	t.Setenv("GITHUB_REPOSITORY", "")
+	t.Setenv("GITHUB_SHA", "")
+
+	// --name is the slug for the deploy family; --app is the
+	// bool flag for "deploy as an app shape" (orthogonal). The
+	// snippet generator picks the slug from --name / cwd at the
+	// top of cmdDeployTarball (slug := *name; if slug == "" { slug = deriveName() }).
+	if code := cmdDeployTarball([]string{"--github", "--name", "my-app"}); code != 0 {
+		t.Fatalf("cmdDeployTarball --github: exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.HasPrefix(out, "# Gregale deploy") {
+		t.Errorf("snippet missing leading sentinel; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Repo: ${{ github.repository }}") {
+		t.Errorf("snippet missing ${{ github.repository }} placeholder; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Ref: ${{ github.sha }}") {
+		t.Errorf("snippet missing ${{ github.sha }} placeholder; got:\n%s", out)
+	}
+	if !strings.Contains(out, "app: my-app") {
+		t.Errorf("snippet missing the --app slug; got:\n%s", out)
+	}
+	if !strings.Contains(out, "uses: poyrazK/faas-deploy-action@v1") {
+		t.Errorf("snippet missing the action reference; got:\n%s", out)
+	}
+	if !strings.Contains(out, "${{ secrets.GREGALE_API_KEY }}") {
+		t.Errorf("snippet missing the secret reference; got:\n%s", out)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("snippet path should not write to stderr; got %q", stderr.String())
+	}
+
+	// No HTTP server is set up — the flag must NOT have hit the network.
+	// The test would fail with a different error if it had tried to
+	// auth or call the API (authedClient would return an error and
+	// printErr would write to stderr). The empty stderr is the
+	// contract.
+}
