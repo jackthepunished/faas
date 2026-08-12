@@ -114,6 +114,54 @@ func TestRenderGithubSnippet(t *testing.T) {
 				"api-key: FAAS_TOKEN=",
 			},
 		},
+		{
+			// Per-field concrete override (--repo only). The
+			// customer said "use this repo" but didn't override
+			// the ref; the ref MUST stay a `${{ github.sha }}`
+			// placeholder rather than collapsing to the empty
+			// string from an unset GITHUB_SHA. We assert against
+			// the header line (# App: ... · Repo: ... · Ref: ...)
+			// specifically — the body contains a static comment
+			// with `${{ github.sha }}` regardless of the header.
+			name: "ConcreteRepository only flips Repo, leaves Ref as ${{ github.sha }}",
+			env: githubSnippetEnv{
+				ConcreteRepository: "acme/widget",
+			},
+			app: "widget",
+			mustLines: []string{
+				"# App: widget · Repo: acme/widget · Ref: ${{ github.sha }}",
+			},
+			mustNotLn: []string{
+				// The repo-only override must NOT trigger Runner
+				// mode (which would blank the Ref side).
+				"· Repo:  ·",
+				"· Repo:  ",
+			},
+		},
+		{
+			// Per-field concrete override (--ref only). Symmetric
+			// case to the repo-only override.
+			name: "ConcreteSHA only flips Ref, leaves Repo as ${{ github.repository }}",
+			env: githubSnippetEnv{
+				ConcreteSHA: "a1b2c3d4e5f6789012345678901234567890abcd",
+			},
+			app: "widget",
+			mustLines: []string{
+				"# App: widget · Repo: ${{ github.repository }} · Ref: a1b2c3d4e5f6789012345678901234567890abcd",
+			},
+		},
+		{
+			// Both per-field overrides. Independent of Runner mode.
+			name: "ConcreteRepository + ConcreteSHA both flip, Runner=false",
+			env: githubSnippetEnv{
+				ConcreteRepository: "acme/widget",
+				ConcreteSHA:        "a1b2c3d4e5f6789012345678901234567890abcd",
+			},
+			app: "widget",
+			mustLines: []string{
+				"# App: widget · Repo: acme/widget · Ref: a1b2c3d4e5f6789012345678901234567890abcd",
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -247,6 +295,60 @@ func TestCmdDeployGithubSnippet(t *testing.T) {
 		}
 		if strings.Contains(out, "repo: ${{ github.repository }}") {
 			t.Errorf("runner env: stdout still contains ${{ github.repository }} expression; got:\n%s", out)
+		}
+	})
+
+	t.Run("--repo only flips Repo, leaves Ref as ${{ github.sha }}", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		oldOut := osStdout
+		oldErr := osStderr
+		osStdout = &stdout
+		osStderr = &stderr
+		defer func() {
+			osStdout = oldOut
+			osStderr = oldErr
+		}()
+
+		// Bare env (no GITHUB_REPOSITORY / GITHUB_SHA). The CLI
+		// override must force Repo concrete without blanking Ref.
+		t.Setenv("GITHUB_REPOSITORY", "")
+		t.Setenv("GITHUB_SHA", "")
+
+		if code := cmdDeployGithubSnippet([]string{"--app", "widget", "--repo", "acme/widget"}); code != 0 {
+			t.Errorf("--repo only: exit code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		out := stdout.String()
+		if !strings.Contains(out, "Repo: acme/widget") {
+			t.Errorf("--repo only: stdout missing concrete repo; got:\n%s", out)
+		}
+		if !strings.Contains(out, "Ref: ${{ github.sha }}") {
+			t.Errorf("--repo only: stdout should keep Ref placeholder; got:\n%s", out)
+		}
+	})
+
+	t.Run("--ref only flips Ref, leaves Repo as ${{ github.repository }}", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		oldOut := osStdout
+		oldErr := osStderr
+		osStdout = &stdout
+		osStderr = &stderr
+		defer func() {
+			osStdout = oldOut
+			osStderr = oldErr
+		}()
+
+		t.Setenv("GITHUB_REPOSITORY", "")
+		t.Setenv("GITHUB_SHA", "")
+
+		if code := cmdDeployGithubSnippet([]string{"--app", "widget", "--ref", "feature-branch"}); code != 0 {
+			t.Errorf("--ref only: exit code = %d, want 0; stderr=%q", code, stderr.String())
+		}
+		out := stdout.String()
+		if !strings.Contains(out, "Ref: feature-branch") {
+			t.Errorf("--ref only: stdout missing concrete ref; got:\n%s", out)
+		}
+		if !strings.Contains(out, "Repo: ${{ github.repository }}") {
+			t.Errorf("--ref only: stdout should keep Repo placeholder; got:\n%s", out)
 		}
 	})
 }
