@@ -20,6 +20,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
 	"github.com/onebox-faas/faas/pkg/gregalemanifest"
+	"github.com/onebox-faas/faas/pkg/gregalesecretscan"
 )
 
 // Subcommand names — lifted to constants so goconst stops flagging the
@@ -781,6 +782,17 @@ func cmdDeployTarball(args []string) int {
 	// gregale.yaml with a `triggers:` block is applied AFTER CreateApp
 	// (and BEFORE the deploy body ships) — see deployManifestTriggers.
 	noTriggers := fs.Bool("no-triggers", false, "skip the `gregale.yaml` triggers fan-out (issue #791 PR-C)")
+	// --secret-scan toggles the pkg/gregalesecretscan pre-pack pass that
+	// drops credential-shaped lines (Stripe live keys, GitHub PATs, AWS
+	// access keys, OpenAI, Anthropic, Google API, PEM private keys, and
+	// Shannon-entropy-flagged unknowns) from .env* files before they are
+	// sealed into the upload tarball. Default ON because the failure mode
+	// (a Stripe key committed to .env.production by accident) ships a
+	// secret to the customer's running microVM where it's far harder to
+	// detect. Override with `--secret-scan=off` for local dev sandboxes
+	// that genuinely need to pass a Stripe test key at boot — the server
+	// still receives whatever the CLI ships.
+	secretScan := fs.String("secret-scan", "on", "scan .env* files for known credential patterns before packing (on|off; default on)")
 	if err := fs.Parse(args); err != nil {
 		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
@@ -797,6 +809,15 @@ func cmdDeployTarball(args []string) int {
 	// pick. Mirrors the --require-authn/--no-require-authn check above.
 	if *function && *app {
 		return printErr("Invalid flags", fmt.Errorf("--function and --app are mutually exclusive"))
+	}
+	// --secret-scan=off is the documented escape hatch for customers who
+	// genuinely need to ship a Stripe test key at boot (local dev
+	// sandboxes). Validate the value eagerly so a typo (--secret-scan=0,
+	// --secret-scan=false) fails fast with a clear message rather than
+	// silently being treated as "on".
+	secretScanOn, secretScanErr := parseSecretScanFlag(*secretScan)
+	if secretScanErr != nil {
+		return printErr("Invalid flags", secretScanErr)
 	}
 	// --app clears any --runtime/--handler the customer also set. The
 	// customer intended an app deploy; passing function fields is
@@ -1014,21 +1035,34 @@ func cmdDeployTarball(args []string) int {
 			}
 			// Pack the cwd so the multipart upload has a tarball —
 			// the function convention needs the file on the wire for
-			// imaged to stage it.
-			path, _, n, err := autoPackCwd(cwd)
+			// imaged to stage it. The secret-scan pass runs before the
+			// tarball is sealed so a Stripe key committed to
+			// .env.production by accident is dropped before it leaves
+			// the workstation; --secret-scan=off disables it.
+			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanOn)
+			if scanErr != nil {
+				return printErr("Secret scan failed", scanErr)
+			}
+			path, _, n, err := autoPackCwd(cwd, overrides)
 			if err != nil {
 				return printErr("Could not pack current directory", err)
 			}
 			defer func() { _ = os.Remove(path) }()
+			renderSecretScanWarnings(scanFindings, osStderr)
 			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
 			*tarball = path
 			resolvedShape = shapeFunction
 		case shapeApp:
-			path, fw, n, err := autoPackCwd(cwd)
+			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanOn)
+			if scanErr != nil {
+				return printErr("Secret scan failed", scanErr)
+			}
+			path, fw, n, err := autoPackCwd(cwd, overrides)
 			if err != nil {
 				return printErr("Could not pack current directory", err)
 			}
 			defer func() { _ = os.Remove(path) }()
+			renderSecretScanWarnings(scanFindings, osStderr)
 			if fw == fwDocker {
 				*dockerfile = true
 			}
@@ -2766,4 +2800,40 @@ func cmdUsageStorage(args []string) int {
 			(u.SnapshotBytes+u.LayerBytes)/(1024*1024))
 	}
 	return 0
+}
+
+// renderSecretScanWarnings prints one two-line stderr block per finding
+// emitted by pkg/gregalesecretscan, followed by a single summary line.
+// Lives here (not in the scan package) because the message format is
+// CLI-specific UX and the renderer needs access to the CLI's PrintWarn
+// + osStderr. Findings are written to stderr specifically so a customer
+// running `gregale deploy --json | jq .build_id` sees no warning noise
+// on stdout — the JSON contract is preserved.
+//
+// Two-line shape per finding:
+//
+//	! Secret detected in .env.production:12 (STRIPE_SECRET_KEY → stripe_live, high)
+//	  ↳ sk_liv…p7dc
+//
+// Then a single summary line if any findings fired:
+//
+//	! 1 secret line(s) skipped from the upload. Move to: gregale secrets set
+//
+// The summary is suppressed when no findings fired, so a clean deploy
+// prints nothing from this function.
+func renderSecretScanWarnings(findings []gregalesecretscan.Finding, w io.Writer) {
+	if len(findings) == 0 {
+		return
+	}
+	for _, f := range findings {
+		PrintWarn(w, "Secret detected in %s:%d (%s → %s, %s)",
+			f.File, f.Line, f.Key, f.Provider, f.Severity)
+		// The snippet line uses no glyph — it's a continuation of the
+		// warning above, not a new event. Indented two spaces to read as
+		// a sub-line in the terminal. Fprintf errors are intentionally
+		// discarded (same convention as writeStatus — see output.go).
+		_, _ = fmt.Fprintf(w, "  ↳ %s\n", f.Snippet)
+	}
+	PrintWarn(w, "%d secret line(s) skipped from the upload. Move to: gregale secrets set",
+		len(findings))
 }

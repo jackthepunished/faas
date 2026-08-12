@@ -67,6 +67,39 @@ func tarEntries(t *testing.T, path string) map[string]bool {
 	return out
 }
 
+// tarEntryBody returns the bytes of a single archive entry, matching by
+// suffix so callers can pass either the full "root/.env.production" or
+// the bare ".env.production" basename. Returns nil if no entry matches.
+func tarEntryBody(t *testing.T, path, suffix string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read tarball: %v", err)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		if hdr.Name == suffix || strings.HasSuffix(hdr.Name, "/"+suffix) {
+			body, rerr := io.ReadAll(tr)
+			if rerr != nil {
+				t.Fatalf("read body %s: %v", hdr.Name, rerr)
+			}
+			return body
+		}
+	}
+}
+
 func TestDetectFramework(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -293,7 +326,7 @@ func TestPackDirToTarGz_TopLevelDirAndCount(t *testing.T) {
 	writeFile(t, dir, "src/index.js", "console.log(1)")
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest)
+	n, err := packDirToTarGz(dir, dest, nil)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
 	}
@@ -324,7 +357,7 @@ func TestPackDirToTarGz_Excludes(t *testing.T) {
 	writeFile(t, dir, ".DS_Store", "junk")
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest)
+	n, err := packDirToTarGz(dir, dest, nil)
 	if err != nil {
 		t.Fatalf("pack: %v", err)
 	}
@@ -359,7 +392,7 @@ func TestPackDirToTarGz_RejectsSymlink(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest); err == nil {
+	if _, err := packDirToTarGz(dir, dest, nil); err == nil {
 		t.Fatal("packDirToTarGz should reject a symlink, got nil error")
 	}
 }
@@ -367,7 +400,7 @@ func TestPackDirToTarGz_RejectsSymlink(t *testing.T) {
 func TestPackDirToTarGz_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	n, err := packDirToTarGz(dir, dest)
+	n, err := packDirToTarGz(dir, dest, nil)
 	if err != nil {
 		t.Fatalf("pack empty: %v", err)
 	}
@@ -401,7 +434,7 @@ func TestPackDirToTarGz_TotalSizeCap(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	_, err := packDirToTarGz(dir, dest)
+	_, err := packDirToTarGz(dir, dest, nil)
 	if err == nil {
 		t.Fatal("packDirToTarGz should reject total size > cap, got nil error")
 	}
@@ -425,7 +458,7 @@ func TestPackDirToTarGz_PerFileCap(t *testing.T) {
 	writeFileBytes(t, filepath.Join(dir, "blob.bin"), huge)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	_, err := packDirToTarGz(dir, dest)
+	_, err := packDirToTarGz(dir, dest, nil)
 	if err == nil {
 		t.Fatal("packDirToTarGz should reject a single file >= per-file cap, got nil")
 	}
@@ -454,7 +487,7 @@ func TestPackDirToTarGz_JustUnderTotalCap(t *testing.T) {
 	writeFileBytes(t, filepath.Join(dir, "well_under.bin"), chunk)
 
 	dest := filepath.Join(t.TempDir(), "out.tar.gz")
-	if _, err := packDirToTarGz(dir, dest); err != nil {
+	if _, err := packDirToTarGz(dir, dest, nil); err != nil {
 		t.Fatalf("packDirToTarGz well under cap, want pass; got %v", err)
 	}
 }
@@ -464,7 +497,7 @@ func TestAutoPackCwd(t *testing.T) {
 	writeFile(t, dir, "package.json", "{}")
 	writeFile(t, dir, "index.js", "x")
 
-	path, fw, n, err := autoPackCwd(dir)
+	path, fw, n, err := autoPackCwd(dir, nil)
 	if err != nil {
 		t.Fatalf("autoPackCwd: %v", err)
 	}
@@ -491,7 +524,7 @@ func TestAutoPackCwd_CleansUpOnError(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "real.txt"), filepath.Join(dir, "link.txt")); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	path, _, _, err := autoPackCwd(dir)
+	path, _, _, err := autoPackCwd(dir, nil)
 	if err == nil {
 		t.Fatal("expected error from autoPackCwd on symlink dir")
 	}
@@ -743,4 +776,138 @@ func TestFuncErrorSuggestion(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeStripeLiveKey mirrors the var in pkg/gregalesecretscan/scan_test.go.
+// Declared locally because pack_test.go is `package main` — the scan
+// package's test var isn't reachable. The runtime behaviour is identical:
+// the regex matches, the Finding.Provider is "stripe_live".
+var fakeStripeLiveKey = "sk" + "_" + "live" + "_" + "XXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+// TestScanAndRedactEnvFiles_StripsStripeKey pins the most common case:
+// a Stripe live key committed to .env.production by accident. The
+// override map must contain the redacted bytes; the unredacted key must
+// NOT survive in the archive.
+//
+// The key literal is assembled via concatenation (see fakeStripeLiveKey)
+// so GitHub's secret-scanner doesn't flag the literal pattern on push.
+// The regex in pkg/gregalesecretscan still matches it at runtime.
+func TestScanAndRedactEnvFiles_StripsStripeKey(t *testing.T) {
+	dir := t.TempDir()
+	contents := "PORT=8080\nSTRIPE_SECRET_KEY=" + fakeStripeLiveKey + "\nDATABASE_URL=postgres://u:p@h:5432/d\n"
+	writeFile(t, dir, ".env.production", contents)
+
+	overrides, findings, err := scanAndRedactEnvFiles(dir, true)
+	if err != nil {
+		t.Fatalf("scanAndRedactEnvFiles: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("findings = %d, want 1: %+v", len(findings), findings)
+	}
+	if findings[0].Provider != "stripe_live" {
+		t.Errorf("Provider = %q, want stripe_live", findings[0].Provider)
+	}
+	if findings[0].Line != 2 {
+		t.Errorf("Line = %d, want 2", findings[0].Line)
+	}
+	got, ok := overrides[".env.production"]
+	if !ok {
+		t.Fatalf("override missing for .env.production; got keys = %v", keysOf(overrides))
+	}
+	if strings.Contains(string(got), fakeStripeLiveKey) {
+		t.Errorf("override still contains raw stripe key: %q", got)
+	}
+	if !strings.Contains(string(got), "<REDACTED # secret detected: stripe_live>") {
+		t.Errorf("override should contain redacted placeholder, got: %q", got)
+	}
+	if !strings.Contains(string(got), "PORT=8080") {
+		t.Errorf("clean line lost in override: %q", got)
+	}
+	if !strings.Contains(string(got), "DATABASE_URL=postgres://u:p@h:5432/d") {
+		t.Errorf("URL line lost in override (URL carve-out should preserve): %q", got)
+	}
+}
+
+// TestScanAndRedactEnvFiles_CleanDir_NoOp pins the no-findings fast path.
+func TestScanAndRedactEnvFiles_CleanDir_NoOp(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".env", "PORT=8080\nGREETING=hello\n")
+	writeFile(t, dir, "main.go", "package main\n")
+
+	overrides, findings, err := scanAndRedactEnvFiles(dir, true)
+	if err != nil {
+		t.Fatalf("scanAndRedactEnvFiles: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Errorf("findings = %d, want 0: %+v", len(findings), findings)
+	}
+	if len(overrides) != 0 {
+		t.Errorf("overrides = %v, want empty", overrides)
+	}
+}
+
+// TestScanAndRedactEnvFiles_Disabled pins the --secret-scan=off escape.
+// overrides/findings must both be nil even when the file is poisoned.
+func TestScanAndRedactEnvFiles_Disabled(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".env", "STRIPE_SECRET_KEY="+fakeStripeLiveKey+"\n")
+
+	overrides, findings, err := scanAndRedactEnvFiles(dir, false)
+	if err != nil {
+		t.Fatalf("scanAndRedactEnvFiles(disabled): %v", err)
+	}
+	if findings != nil {
+		t.Errorf("findings should be nil when disabled, got %+v", findings)
+	}
+	if overrides != nil {
+		t.Errorf("overrides should be nil when disabled, got %v", overrides)
+	}
+}
+
+// TestPackDirToTarGz_WithEnvOverride pins the integration: when the
+// override map contains a redacted .env.production, the archive must
+// contain the redacted bytes, NOT the original poisoned bytes.
+func TestPackDirToTarGz_WithEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	original := "PORT=8080\nSTRIPE_SECRET_KEY=" + fakeStripeLiveKey + "\n"
+	writeFile(t, dir, ".env.production", original)
+	writeFile(t, dir, "main.go", "package main\n")
+
+	overrides, _, err := scanAndRedactEnvFiles(dir, true)
+	if err != nil {
+		t.Fatalf("scanAndRedactEnvFiles: %v", err)
+	}
+	dest := filepath.Join(t.TempDir(), "out.tar.gz")
+	if _, err := packDirToTarGz(dir, dest, overrides); err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+
+	entries := tarEntries(t, dest)
+	foundEnv := false
+	for name := range entries {
+		if strings.HasSuffix(name, ".env.production") {
+			foundEnv = true
+			break
+		}
+	}
+	if !foundEnv {
+		t.Fatalf("archive missing .env.production; entries: %v", entries)
+	}
+	body := tarEntryBody(t, dest, ".env.production")
+	if strings.Contains(string(body), fakeStripeLiveKey) {
+		t.Errorf("archive still contains raw stripe key: %q", body)
+	}
+	if !strings.Contains(string(body), "<REDACTED") {
+		t.Errorf("archive should contain redacted placeholder, got: %q", body)
+	}
+}
+
+// keysOf is a small test helper: return map keys as a sorted slice for
+// stable error messages. Avoids pulling sort into every assertion.
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
