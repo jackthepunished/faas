@@ -626,6 +626,16 @@ Timers: WAKING ≤ 5 s then fallback to cold boot; COLD_BOOTING ≤ 30 s then FA
 
 Measured end-to-end as `gateway_wake_latency_seconds`. Regression gate in CI-on-metal (§14).
 
+The schedd-side wake path is decomposed into three `schedd_wake_rpc_duration_seconds{app, phase}` histograms (ADR-093, P1B) so operators can attribute a p95 regression to a specific phase without re-running the wake under a profiler:
+
+| schedd-side phase | Bucket range | What it covers |
+|---|---|---|
+| `admit_to_rpc` | 0.01–5 s | gRPC handler → `Engine.admitGate` → `NodeLedger.Admit` → placement → `vmmd` RPC start. Lock + admission + ledger + placement. |
+| `rpc_call` | 0.01–5 s | vmmd `CreateFromSnapshot` / `CreateColdBoot` round trip. Cross-process boundary, the only phase that crosses a node-local socket. |
+| `rpc_to_running` | 0.01–5 s | RPC return → `e.transition(ctx, ..., state.StateRunning)`. Boot-input re-read + `SetInstanceRuntime` + audit emit. |
+
+`wake_id` is attached as a `prometheus.Exemplar` on every observation so an operator can join the histogram to `gateway_wake_latency_seconds` on the gateway side and to the `events` table — no `wake_id` label is added to the histogram (cardinality blow-up). Bucket set is spec §6.3 verbatim plus a 0.01 s low-end bucket for `admit_to_rpc`. ADR-093.
+
 ### 6.4 Failure-mode catalogue (ADR-025 v1.1, ADR-028 v1.1, ADR-029 v1.1)
 
 This subsection is the cross-reference page for the three v1.1 ADRs. Steady-state behaviour is in §6.1–§6.3; this section maps the edge cases an operator will see in multi-node (ADR-025) routing. The intent is *one* page an on-call can scan when paged — not a redesign.
@@ -794,6 +804,7 @@ see "did the box scale, and why" without correlating instances:
 |---|---|---|---|
 | `schedd_scale_up_decisions_total` | `app`, `outcome` | `pkg/wire.OpsMetrics.ObserveScaleUp` (per tick, per app that ran the trigger) | `admit` (signal above target, admitted an instance), `reject_at_cap` (signal above target but at `max_concurrency`), `no_signal` (trigger had no RPS/CPU data for this app yet), `cooldown_held` (per-app scale-out cooldown consult in `Engine.admitGate` skipped the wake — issue #462), `min_floor_already` (per-app `ScalingPolicy.MinInstances` already met and no traffic signal — issue #462, PR-C), `overage_cap_reached` (account overage cap reached — issue #561, `pkg/sched/engine.go:4876-4888`) |
 | `schedd_scale_down_decisions_total` | `app`, `outcome` | `pkg/wire.OpsMetrics.ObserveScaleDown` (per tick, per app that ran the aggressive reaper) | `park` (≥ 1 instance parked above `max(min_instances, desired + 1)`), `keep` (signal said the running set is fine OR said "park to floor" and the floor matches the running count exactly), `min_floor_already` (per-app `ScalingPolicy.MinInstances` already met — issue #462, PR-C; semantic upgrade over `keep`), `cooldown_held` (per-app scale-in cooldown consult in `ReapAggressive` skipped the entire app — P1C) |
+| `schedd_wake_rpc_duration_seconds` | `app`, `phase` | `pkg/wire.OpsMetrics.WakeRPCDuration` (per successful wake, on the cold-boot / restore success path only — error branches emit `events.BootFailed` instead) | `admit_to_rpc` (gRPC handler → vmmd RPC start), `rpc_call` (vmmd `Create{FromSnapshot,ColdBoot}` round trip), `rpc_to_running` (RPC return → `state.StateRunning` transition). `wake_id` is attached as a `prometheus.Exemplar` on every observation so operators can join to `gateway_wake_latency_seconds` and to the `events` table. Bucket set is spec §6.3 verbatim plus a 0.01 s low-end bucket for `admit_to_rpc`. Empty-app sentinel rows are pre-instantiated for all three phases so the §12 wake-latency-decomposition panel surfaces zero rows from boot. ADR-093 (P1B). |
 
 Both counters are per-daemon (the `schedd_` prefix is supplied by
 `wire.NewOpsMetrics("schedd")`); the metric name is the operator-facing

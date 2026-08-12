@@ -1029,6 +1029,87 @@ func TestEngineWake_ColdBoot(t *testing.T) {
 	}
 }
 
+// TestEngineWake_PhaseHistograms_Recorded (ADR-093, P1B) — pinning the
+// schedd-side wake-phase decomposition. A cold-boot wake that takes
+// 50ms inside the fakeVMM RPC must produce a non-zero observation
+// count on every closed-set (app, phase) tuple:
+//
+//   - admit_to_rpc: the gap from bootInput.startedAt (engine.go:1589)
+//     to the vmm.CreateColdBoot call site (engine.go:1759). On the
+//     unit-test path this is sub-millisecond — the assertion is just
+//     that the count is 1, not the duration.
+//   - rpc_call: the fakeVMM sleepFor. The 50ms RPC latency must
+//     surface here. Assertion is 1 count + sum_bucket matches sleepFor
+//     with a generous tolerance (timer granularity + Go scheduler).
+//   - rpc_to_running: the gap from the RPC return to the
+//     e.transition(ctx, ..., state.StateRunning) call. Sub-millisecond
+//     on unit test; assertion is 1 count.
+//
+// The pre-instantiated empty-app sentinel rows stay at 0 — the
+// closed-set contract that bit PR #826 must hold.
+func TestEngineWake_PhaseHistograms_Recorded(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	ops := wire.NewOpsMetrics("schedd")
+	e := newEngine(t, store, &fakeVMM{sleepFor: 50 * time.Millisecond}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
+
+	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+
+	// Per-app rows must have count == 1 for every phase.
+	for _, phase := range []string{"admit_to_rpc", "rpc_call", "rpc_to_running"} {
+		got := readWakeRPC(t, ops, app.ID, phase, "count")
+		if got != 1 {
+			t.Errorf("phase %q: count = %v, want 1", phase, got)
+		}
+	}
+
+	// rpc_call sum must show the 50ms sleepFor with tolerance.
+	// The Engine opens the bucket at 0.05s, so a 50ms observation
+	// lands in le=0.35 (the next bucket up). Asserting sum instead
+	// of the bucket row keeps the test resilient to bucket reorders.
+	if got := readWakeRPC(t, ops, app.ID, "rpc_call", "sum"); got < 0.040 || got > 0.200 {
+		t.Errorf("rpc_call sum = %vs, want ~0.05s (fakeVMM sleepFor=50ms with tolerance)", got)
+	}
+
+	// Empty-app sentinel rows must stay at 0 — closed-set contract.
+	for _, phase := range []string{"admit_to_rpc", "rpc_call", "rpc_to_running"} {
+		got := readWakeRPC(t, ops, "", phase, "count")
+		if got != 0 {
+			t.Errorf("empty-app sentinel %q: count = %v, want 0", phase, got)
+		}
+	}
+}
+
+// readWakeRPC scrapes the schedd_wake_rpc_duration_seconds histogram
+// for a (app, phase) tuple and returns the integer count, the float
+// sum, or an empty bucket-row count (suffix ∈ {"count", "sum",
+// "bucket"}). Mirrors readScaleUp's shape — same httptest server +
+// strings.Split + strings.Fields parsing.
+func readWakeRPC(t *testing.T, ops *wire.OpsMetrics, app, phase, suffix string) float64 {
+	t.Helper()
+	if ops == nil {
+		return 0
+	}
+	body := getMetricsBody(t, ops)
+	prefix := `schedd_wake_rpc_duration_seconds_` + suffix + `{app="` + app + `",phase="` + phase + `"}`
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return 0
+			}
+			v, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+			if err != nil {
+				return 0
+			}
+			return v
+		}
+	}
+	return 0
+}
+
 // TestEngineWake_ColdBootPersistsObservedClass pins ADR-051 PR-D:
 // when the cold-boot's characterization report carries an
 // ObservedClass, the engine must persist it via

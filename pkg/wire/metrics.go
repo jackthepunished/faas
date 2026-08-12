@@ -139,6 +139,26 @@ type OpsMetrics struct {
 	// 0.3/0.35 pair is intentional (the 350 ms warm-wake budget needs
 	// tight resolution near 0.35).
 	guestInitDuration *prometheus.HistogramVec
+	// wakeRPCDuration (ADR-093, P1B) measures schedd-side wall-clock
+	// for each wake phase: admit_to_rpc (gRPC handler → vmmd RPC
+	// start), rpc_call (vmmd Create{FromSnapshot,ColdBoot} round
+	// trip), rpc_to_running (RPC return → WAKING/COLD_BOOTING → RUNNING
+	// transition). Labelled by {app, phase} — phase is closed-set
+	// {admit_to_rpc, rpc_call, rpc_to_running}. The empty-app
+	// sentinel is pre-instantiated for every phase value so the §12
+	// wake-latency decomposition dashboard panel surfaces a zero row
+	// from boot. Bucket set reuses the spec §6.3 wake-latency budget
+	// with one extra low-end bucket (0.01) for admit_to_rpc, which
+	// is dominated by in-process lock + ledger consult and rarely
+	// exceeds a few ms — without it the phase would collapse to the
+	// 0.05 bucket and lose observability on the lock/ledger path.
+	// wake_id is attached as a prometheus.Exemplar on each observation
+	// so operators can join to gateway_wake_latency_seconds on the
+	// gateway side and to the events table (BootStarted / BootCompleted
+	// rows in pkg/sched/events.go) — exemplar attachment does NOT
+	// add a wake_id label, so cardinality stays O(autoscale-enabled
+	// apps × 3 phase values).
+	wakeRPCDuration *prometheus.HistogramVec
 	// wakeSnapshotTier (issue #470 / PR C / ADR-074) — closed-set
 	// counter for the warm-vs-init-vs-cold-boot choice Engine.usableSnapshotForWake
 	// makes on every wake. Labels ∈ {warm, init, cold_boot_fallback}.
@@ -1175,6 +1195,31 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
 	}, []string{"app", "runner"})
 	guestInitDuration.WithLabelValues("", "")
+	// ADR-093 (P1B): schedd-side wake RPC duration histogram. Phase
+	// ∈ {admit_to_rpc, rpc_call, rpc_to_running}. Bucket set is spec
+	// §6.3 verbatim plus a 0.01 low-end bucket for admit_to_rpc.
+	// Empty-app sentinel rows are pre-instantiated for every phase
+	// value so the wake-latency decomposition dashboard surfaces a
+	// zero row from boot (the §12 panel-at-day-1 contract that bit
+	// PR #826). Engine.Wake attaches wake_id as a prometheus.Exemplar
+	// on each observation; the observer returns a prometheus.Observer
+	// that callers Observe(d) on — the wire.OpsMetrics.WakeRPCDuration
+	// accessor below mirrors GuestInitDuration's nil-safe shape.
+	//
+	// Note: name is *_wake_rpc_duration_seconds, not the existing
+	// *_wake_phase_duration_seconds (events platform, ADR-064 at
+	// metrics.go:1951 — {phase, result} labels, covers the full
+	// wake envelope). The two are correlated by wake_id exemplar
+	// but cover different windows; renaming the existing one would
+	// break the wake-latency panel that ships to day-1.
+	wakeRPCDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_wake_rpc_duration_seconds",
+		Help: "Wall-clock seconds for each schedd-side wake RPC phase (ADR-093). phase ∈ {admit_to_rpc, rpc_call, rpc_to_running}; app label is apps.id. admit_to_rpc covers the gRPC handler → vmmd RPC start window (lock + admitGate + ledger + placement). rpc_call covers the vmmd Create{FromSnapshot,ColdBoot} round trip. rpc_to_running covers the RPC return → WAKING/COLD_BOOTING → RUNNING transition. wake_id is attached as a prometheus.Exemplar on each observation so operators can join to gateway_wake_latency_seconds and to the events table. Bucket set reuses spec §6.3 verbatim with a 0.01 low-end bucket for admit_to_rpc.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.2, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
+	}, []string{"app", "phase"})
+	wakeRPCDuration.WithLabelValues("", "admit_to_rpc")
+	wakeRPCDuration.WithLabelValues("", "rpc_call")
+	wakeRPCDuration.WithLabelValues("", "rpc_to_running")
 	// Issue #470 / PR C / ADR-074: wake tier mix counter.
 	wakeSnapshotTier := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_snapshot_tier_total",
@@ -2131,6 +2176,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Count of LocalCacheBackend stale-cache fallback serves (ADR-054 acceptance). Fires once per Get that returned a last-known-good cached blob because the parent backend failed AND FAAS_STORAGE_CACHE_SERVE_STALE=true. No labels (deployment-level policy; per-key labels would explode cardinality). A non-zero rate means 'registry is down' — alertable via the §12 storage panel.",
 	})
 	commonCollectors = append(commonCollectors, storageCacheStaleFallback)
+	// ADR-093 (P1B): schedd-side wake RPC duration histogram. Same
+	// MustRegister pattern as the legacy wakePhaseDur at line 1998
+	// (events-platform ADR-064) but a distinct metric name and label
+	// set — see metrics.go:1208-1227 for the naming rationale.
+	commonCollectors = append(commonCollectors, wakeRPCDuration)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -2486,6 +2536,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		writeRedirectLatency:               writeRedirectLatency,
 		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
+		wakeRPCDuration:                    wakeRPCDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
 		guestTailSeconds:                   guestTailSeconds,
 		guestTailFailedTotal:               guestTailFailedTotal,
@@ -2692,6 +2743,33 @@ func (m *OpsMetrics) GuestInitDuration(app, runner string) prometheus.Observer {
 		return nil
 	}
 	return m.guestInitDuration.WithLabelValues(app, runner)
+}
+
+// WakeRPCDuration (ADR-093, P1B) returns the {(app, phase)}-labeled
+// histogram observer for schedd-side wake-phase duration. phase is
+// the closed set {admit_to_rpc, rpc_call, rpc_to_running}; callers
+// attach wake_id as a prometheus.Exemplar via ObserveWithExemplar
+// on the returned observer. The accessor is nil-safe — returns nil
+// on a nil receiver so Engine unit tests that construct the engine
+// without metrics keep working (mirrors GuestInitDuration above).
+//
+// Distinct from the legacy WakePhaseDuration(phase, result string)
+// at metrics.go:3783 (events platform, ADR-064, {phase, result}
+// labels, full wake envelope). The two metrics cover different
+// windows: wake_rpc_duration_seconds is the schedd-side RPC path
+// only; wake_phase_duration_seconds covers every wake phase from
+// queue→admit through proxy first byte. They are correlated by
+// wake_id exemplar on the schedd-side observations.
+//
+// Naming the new accessor WakeRPCDuration avoids the collision
+// with the legacy WakePhaseDuration accessor — both surface
+// prometheus.Observer, but the new one carries a wake_id exemplar
+// obligation that the legacy one does not.
+func (m *OpsMetrics) WakeRPCDuration(app, phase string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.wakeRPCDuration.WithLabelValues(app, phase)
 }
 
 // WakeSnapshotTier returns the per-tier counter the engine increments
