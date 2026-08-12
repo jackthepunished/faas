@@ -3984,7 +3984,7 @@ func (a *EdgeRuleLimitAction) Validate() *Problem {
 	if int64(a.MaxBodyBytesStreaming) > MaxEdgeRuleLimitBodyBytesStreaming {
 		return ErrValidation(fmt.Sprintf(
 			"limit action: max_body_bytes_streaming exceeds the streaming platform cap (%d > %d)",
-			MaxEdgeRuleLimitBodyBytesStreaming, a.MaxBodyBytesStreaming))
+			a.MaxBodyBytesStreaming, MaxEdgeRuleLimitBodyBytesStreaming))
 	}
 	if a.MaxBodyBytesStreaming > 0 && a.MaxBodyBytesStreaming < a.MaxBodyBytes {
 		return ErrValidation(fmt.Sprintf(

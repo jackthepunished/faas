@@ -15,6 +15,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -415,12 +416,17 @@ func TestEdgeRuleLimitAction_Validate_Rejects(t *testing.T) {
 			// The hard upper bound is MaxRequestBodyBytes (25 MiB).
 			// A limit rule can never widen past the global cap;
 			// if the customer wants to relax the cap on a specific
-			// path they're using the wrong primitive.
+			// path they're using the wrong primitive. The error
+			// message prints OBSERVED first, CAP second — same shape
+			// as the streaming-cap sibling below.
 			name: "max-body-bytes-over-platform-cap",
 			mutate: func(a *EdgeRuleLimitAction) {
 				a.MaxBodyBytes = MaxRequestBodyBytes + 1
 			},
-			wantSub: "exceeds the platform cap",
+			wantSub: fmt.Sprintf(
+				"(%d > %d)",
+				MaxRequestBodyBytes+1,
+				MaxRequestBodyBytes),
 		},
 		{
 			// Negative streaming cap is meaningless.
@@ -433,12 +439,21 @@ func TestEdgeRuleLimitAction_Validate_Rejects(t *testing.T) {
 		{
 			// The streaming cap is hard-clamped at
 			// MaxEdgeRuleLimitBodyBytesStreaming (100 MiB).
+			// The error message must print the OBSERVED value first
+			// and the CAP second — matching the buffered-cap sibling
+			// above and every other over-cap message in this package.
+			// Asserting the literal "(observed > cap)" substring pins
+			// the order; a future swap of the printf args would
+			// produce "(cap > observed)" and fail this case.
 			name: "max-body-bytes-streaming-over-platform-cap",
 			mutate: func(a *EdgeRuleLimitAction) {
 				a.MaxBodyBytes = 10 * 1024 * 1024 // 10 MiB buffered
 				a.MaxBodyBytesStreaming = int(MaxEdgeRuleLimitBodyBytesStreaming) + 1
 			},
-			wantSub: "exceeds the streaming platform cap",
+			wantSub: fmt.Sprintf(
+				"(%d > %d)",
+				int(MaxEdgeRuleLimitBodyBytesStreaming)+1,
+				MaxEdgeRuleLimitBodyBytesStreaming),
 		},
 		{
 			// Load-bearing shape: a streaming cap tighter than the
