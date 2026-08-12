@@ -420,20 +420,27 @@ func TestOpsMetrics_ObserveScaleDown(t *testing.T) {
 	m.ObserveScaleDown("a1", "park")
 	m.ObserveScaleDown("a1", "park")
 	m.ObserveScaleDown("a1", "keep")
+	m.ObserveScaleDown("a1", "cooldown_held")
 
 	body := render(t, m)
 	for _, want := range []string{
 		// Real observations.
 		`schedd_scale_down_decisions_total{app="a1",outcome="park"} 2`,
 		`schedd_scale_down_decisions_total{app="a1",outcome="keep"} 1`,
+		`schedd_scale_down_decisions_total{app="a1",outcome="cooldown_held"} 1`,
 		// Pre-instantiated empty-app placeholder: zero-valued, must
 		// surface in /metrics from boot so the panel exists at day 1.
 		// min_floor_already (PR-C, issue #462) is pre-instantiated
 		// alongside park / keep so the closed outcome label set
-		// is fully surfaced from boot.
+		// is fully surfaced from boot. cooldown_held (P1C) is the
+		// per-app scale-in cooldown consult in ReapAggressive
+		// (pkg/sched/reaper.go) — pre-instantiated so dashboards
+		// panel-query `outcome="cooldown_held"` returns 0 rather
+		// than a missing series on an idle box.
 		`schedd_scale_down_decisions_total{app="",outcome="park"} 0`,
 		`schedd_scale_down_decisions_total{app="",outcome="keep"} 0`,
 		`schedd_scale_down_decisions_total{app="",outcome="min_floor_already"} 0`,
+		`schedd_scale_down_decisions_total{app="",outcome="cooldown_held"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)

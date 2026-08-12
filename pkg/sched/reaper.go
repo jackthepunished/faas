@@ -6,6 +6,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // Idle reaper + eviction selection (spec §4.3). Both are pure functions over a
@@ -290,7 +291,14 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 //
 // Returns instance IDs in deterministic order (oldest-LastRequest
 // first; ties broken by instance ID, matching ReapIdle).
-func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[string]int) []string {
+//
+// The metrics parameter is the wire OpsMetrics for emitting
+// schedd_scale_down_decisions_total{outcome="cooldown_held"} when
+// the per-app scale-in cooldown consult skips an app. nil-safe —
+// nil and the test/fixture default of (*OpsMetrics)(nil) both
+// skip the emission, matching the nil-safety convention of the
+// rest of the wire package.
+func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[string]int, metrics *wire.OpsMetrics) []string {
 	type appGroup struct {
 		running         int
 		floor           int
@@ -298,6 +306,7 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		candidates      []InstanceInfo // RUNNING, !young, !busy
 		lastScaleInAt   *time.Time
 		scaleInCooldown time.Duration
+		cooldownEmitted bool // P1C: at most one cooldown_held observation per app
 	}
 	byApp := map[string]*appGroup{}
 	for _, in := range snapshot {
@@ -328,7 +337,15 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		}
 		// PR-C (issue #462): per-app scale-in cooldown consult (mirror
 		// ReapIdle). Skip the entire app when within the cooldown window.
+		// P1C: emit schedd_scale_down_decisions_total{outcome="cooldown_held"}
+		// exactly once per app — the per-instance loop body otherwise fires
+		// for every RUNNING instance in the app. Same precedent as
+		// Engine.admitGate's one-shot emission per call.
 		if g.lastScaleInAt != nil && g.scaleInCooldown > 0 && now.Sub(*g.lastScaleInAt) < g.scaleInCooldown {
+			if metrics != nil && !g.cooldownEmitted {
+				metrics.ObserveScaleDown(in.AppID, "cooldown_held")
+				g.cooldownEmitted = true
+			}
 			continue
 		}
 		g.running++

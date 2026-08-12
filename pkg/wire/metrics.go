@@ -1696,9 +1696,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// upgrade over "keep" emitted by the reaper when
 	// Concurrency(appID) >= ScalingPolicy.MinInstances AND the
 	// aggressive path would otherwise have parked an instance.
+	// cooldown_held (P1C) fires when the per-app scale-in cooldown
+	// consult in ReapAggressive (pkg/sched/reaper.go) skipped the
+	// entire app — the app is absent from the park slice and the
+	// caller never iterates over it. Idle branch (ReapIdle) emits
+	// no decision metrics today; adding a parallel emission there
+	// is a separate change.
 	scaleDownDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_down_decisions_total",
-		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already}; app label is the apps.id.",
+		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already, cooldown_held}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
 	// Issue #557 / ADR-071 §Decision 1: proactive min-instances
 	// floor reconciler observability. Closed outcome set
@@ -2385,13 +2391,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// ReplaceInstanceStats) which routes through topAppSet and
 	// demotes past top-100 into this bucket.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
-	// issue #171: pre-instantiate the {park, keep, min_floor_already}
-	// outcome rows for the empty-app label so the help/TYPE surfaces
-	// in /metrics from boot, mirroring the scale-up pattern above.
-	// min_floor_already (PR-C, issue #462) is the per-app "would
-	// have parked, but min_instances is reached" outcome the
-	// aggressive reaper emits.
-	for _, outcome := range []string{"park", "keep", "min_floor_already"} {
+	// issue #171: pre-instantiate the {park, keep, min_floor_already,
+	// cooldown_held} outcome rows for the empty-app label so the
+	// help/TYPE surfaces in /metrics from boot, mirroring the scale-up
+	// pattern above.
+	//   - min_floor_already (PR-C, issue #462): per-app "would have
+	//     parked, but min_instances is reached".
+	//   - cooldown_held (P1C): per-app scale-in cooldown consult in
+	//     ReapAggressive (pkg/sched/reaper.go) skipped the entire app;
+	//     the app is absent from the park slice. Idle branch
+	//     (ReapIdle) emits no decision metrics today — adding a
+	//     parallel emission there is a separate change.
+	for _, outcome := range []string{"park", "keep", "min_floor_already", "cooldown_held"} {
 		scaleDownDecisions.WithLabelValues("", outcome)
 	}
 	// Issue #557 / ADR-071 §Decision 1: pre-instantiate the eight

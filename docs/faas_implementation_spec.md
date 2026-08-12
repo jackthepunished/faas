@@ -793,7 +793,7 @@ see "did the box scale, and why" without correlating instances:
 | Metric name | Labels | Producer | Outcome semantics |
 |---|---|---|---|
 | `schedd_scale_up_decisions_total` | `app`, `outcome` | `pkg/wire.OpsMetrics.ObserveScaleUp` (per tick, per app that ran the trigger) | `admit` (signal above target, admitted an instance), `reject_at_cap` (signal above target but at `max_concurrency`), `no_signal` (trigger had no RPS/CPU data for this app yet) |
-| `schedd_scale_down_decisions_total` | `app`, `outcome` | `pkg/wire.OpsMetrics.ObserveScaleDown` (per tick, per app that ran the aggressive reaper) | `park` (≥ 1 instance parked above `max(min_instances, desired + 1)`), `keep` (signal said the running set is fine OR said "park to floor" and the floor matches the running count exactly) |
+| `schedd_scale_down_decisions_total` | `app`, `outcome` | `pkg/wire.OpsMetrics.ObserveScaleDown` (per tick, per app that ran the aggressive reaper) | `park` (≥ 1 instance parked above `max(min_instances, desired + 1)`), `keep` (signal said the running set is fine OR said "park to floor" and the floor matches the running count exactly), `min_floor_already` (per-app `ScalingPolicy.MinInstances` already met — issue #462, PR-C; semantic upgrade over `keep`), `cooldown_held` (per-app scale-in cooldown consult in `ReapAggressive` skipped the entire app — P1C) |
 
 Both counters are per-daemon (the `schedd_` prefix is supplied by
 `wire.NewOpsMetrics("schedd")`); the metric name is the operator-facing
