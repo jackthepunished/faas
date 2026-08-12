@@ -27,7 +27,7 @@
 -- from issue #676 / migration 00155) refuses Free customers from
 -- setting it to true; the default-by-plan is applied at create time
 -- in cmd/apid/handlers.go::buildApp using the new
--- Plan.RouteMetricsAllowed (Free=false, Hobby/Pro/Scale=true).
+-- Plan.RouteMetricsEnabled (Free=false, Hobby/Pro/Scale=true).
 --
 -- The operator-level kill-switch ([route_metrics] enabled in
 -- cmd/gatewayd-internal/config.go) is AND-gated with this flag —
