@@ -658,6 +658,41 @@ ADR-075 / issue #475 / migration 00138.
 
 ADR-076 / issue #476 / migrations 00140 + 00141.
 
+## M8 — Per-route observability (ADR-093). 🚧
+
+Opt-in per-app route breakdown on the gatewayd-internal hot path,
+surfaced as Prometheus `_by_route` series and a control-listener
+reader at `GET /v1/apps/{slug}/routes`. Bounded by a 50-route cap
+with a non-evicting `__route_other__` overflow bucket (ADR-093 D2).
+
+- **Schema / State** — `apps.route_metrics_enabled boolean` (migration
+  00216). Partial index `WHERE route_metrics_enabled = true` keeps
+  the col-store cheap on Free-tier (where the column is always false).
+- **Plan gate** — Hobby/Pro/Scale default-on; Free stays off. Two
+  accessors at `pkg/api/limits.go:2649` `RouteMetricsEnabled()`
+  (create-time default) and `:2662` `RouteMetricsResponseAllowed()`
+  (PATCH-time gate) so a Free PATCHing true surfaces
+  `plan_route_metrics_not_allowed` (403, `pkg/api/errors.go:720`).
+- **Metric primitives** — `pkg/gateway/metrics.go:404-417`
+  `requestsByRoute`, `durationByRoute`, `failuresByRoute`. The
+  `_by_route` suffix is required so the new `{route}` label set
+  doesn't collide with the pre-existing `{app, code}` CounterVec
+  (Prometheus rejects two CounterVecs with the same name but
+  different label sets at registration time).
+- **API** — `GET /v1/apps/{slug}/routes` (apid reverse-proxy to
+  gatewayd-internal `GET /v1/internal/apps/{slug}/routes`).
+  OperationId `getAppRoutes` (api/openapi.yaml:1394-1427, `x-issue: 273`).
+- **Operator kill-switch** — `route_metrics_enabled` toml + env
+  `FAAS_GATEWAY_ROUTE_METRICS` (`cmd/gatewayd-internal/config.go:107-121`).
+  Cluster default wired by commit 5 of this PR
+  (`deploy/ansible/roles/gatewayd_internal_service/templates/gatewayd.toml.j2`).
+- **Alert** — `GatewayWildcardRoute` — sustained
+  `__route_other__` overflow > 1 reqps for 10m. Runbook
+  `docs/runbooks/GatewayWildcardRoute.md`. Recording rules + the
+  alert land on the box via
+  `deploy/ansible/roles/prometheus/tasks/main.yml` (commit 1 of
+  this PR — G1+G2 closure).
+
 ## Auth default flip — issue #695 / ADR-080
 
 Closes spec §17 G15. Cloud Run's analogue is IAM-authenticated by
