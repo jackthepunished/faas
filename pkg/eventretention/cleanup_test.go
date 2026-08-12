@@ -434,7 +434,7 @@ func TestNew_NilOpsDisablesMetricPath(t *testing.T) {
 // nil.
 type typedNilOps struct{}
 
-func (*typedNilOps) AuditEventsDeleted() prometheus.Counter  { return nil }
+func (*typedNilOps) AuditEventsDeleted() prometheus.Counter    { return nil }
 func (*typedNilOps) AuditEventsRetentionLag() prometheus.Gauge { return nil }
 
 // TestSetOps_TypedNilDoesNotPin traps the typed-nil interface
