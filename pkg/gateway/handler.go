@@ -1875,6 +1875,161 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 	return false
 }
 
+// applyEdgeRuleLimit (ADR-091 D24 / new ADR-0NN-edge-rule-limit)
+// consults the per-host edge-rule matcher for a `kind=limit` rule.
+// On a hit, r.Body is wrapped in http.MaxBytesReader at the
+// per-rule cap so downstream reads (the proxy leg, the validate
+// applier at §4.1.2.8b) cannot exceed it — the per-rule cap is
+// always at most api.MaxRequestBodyBytes (cmd-side compileLimitRules
+// clamps higher values), so this is a strict tightening of the
+// global reader layered inside ServeHTTP.
+//
+// The load-bearing property is the **Content-Length fast path**:
+// when the inbound request advertises a body larger than the cap
+// via Content-Length, the applier writes 413 + RFC 7807
+// request_too_large immediately, without reading a single body
+// byte. A bare http.MaxBytesReader only trips when something
+// reads the body, and at this hot-path slot nothing reads the
+// body until the proxy leg — so without the fast path, a 30 MB
+// POST against a 5 MB rule would buffer 30 MB into memory before
+// tripping the cap. The fast path makes "never buffer an oversize
+// request" a guarantee, not a hope.
+//
+// Returns true (caller MUST return) on:
+//
+//   - 413 request_too_large from the Content-Length fast path.
+//   - 413 request_too_large from the MaxBytesReader trip on a
+//     chunked (no Content-Length) oversize body — this case is
+//     only reachable on a streaming opt-in path that didn't
+//     trigger the fast path; the reader still catches it.
+//
+// Returns false on:
+//
+//   - nil rule (audit "miss", no cap installed).
+//   - same-account mismatch (defense-in-depth — audit "blocked"
+//   - apply "success" so the §12 chip doesn't falsely flag the
+//     cross-account rule as a wire error; mirrors
+//     applyEdgeRuleValidate at handler.go:1688–1706).
+//   - clean match (audit "matched" + observe "match" + apply
+//     "success", MaxBytesReader installed at the per-rule cap).
+//
+// Streaming posture (ADR-091 D24 §4): the rule carries an
+// optional `max_body_bytes_streaming` field (≤ 100 MiB per
+// pkg/api/limits.go:1652 RawStreamMaxRequestBytes, enforced by
+// the apid-Validate path and by cmd-side compileLimitRules).
+// Detecting the streaming opt-in path at THIS slot requires
+// isAcceptJSON(r.Header.Get("Accept")) + h.streamingEnabled +
+// app.StreamingEnabled, which lives further down the chain at
+// handler.go:3019 — pulling that detection above the §4.1.2.8c
+// slot would tangle the rule application order with the proxy
+// configuration. The carve-out is therefore deferred to a
+// follow-up PR (issue filed as part of D24). Until that ships,
+// `max_body_bytes_streaming` is declared and persisted but the
+// applier falls back to `MaxBodyBytes` for both paths. State
+// in ADR-091 D24 — the DTO and the compile clamp are in place,
+// the runtime enforcement is the follow-up slice.
+func (h *Handler) applyEdgeRuleLimit(w http.ResponseWriter, r *http.Request, app App) bool {
+	if h.edgeRules == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchLimit(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("limit", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.limit_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("limit", "blocked")
+			// Cross-account blocked is a defense-in-depth no-op —
+			// emit apply success so the §12 dashboard chip doesn't
+			// falsely flag the cross-account rule as a wire error.
+			// Mirrors applyEdgeRuleValidate (handler.go:1704) and
+			// applyEdgeRuleIP (handler.go:1487).
+			h.metrics.ObserveEdgeRuleApply("limit", "success")
+		}
+		return false
+	}
+	// Defence-in-depth cap clamp: cmd-side compileLimitRules
+	// already clamped at api.MaxRequestBodyBytes, but a rule
+	// inserted by a direct DB write that bypassed apid-Validate
+	// (cmd/e2e/edge_rules_common_test.go:128 seedEdgeRuleDirect)
+	// could carry an out-of-range value. Mirror the validate
+	// applier's clamp at handler.go:1746-1748.
+	cap := rule.MaxBodyBytes
+	if cap <= 0 || cap > api.MaxRequestBodyBytes {
+		cap = api.MaxRequestBodyBytes
+	}
+	// Content-Length fast path: deny before reading a single
+	// body byte. r.ContentLength == 0 is treated as "unknown
+	// (chunked or no body)" — fall through to the MaxBytesReader,
+	// which will trip on the proxy leg's first read. r.ContentLength
+	// == -1 is the http.NoBody sentinel — same fall-through.
+	// A lying-low client (advertises small CL, sends large body)
+	// cannot bypass: the MaxBytesReader below still trips on
+	// the proxy leg's first read. The fast path can only ever
+	// produce a false-positive 413, never a bypass — see
+	// ADR-091 D24 §4 for the rationale.
+	if r.ContentLength > 0 && r.ContentLength > int64(cap) {
+		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge,
+			api.CodeRequestTooLarge, "Request body too large",
+			fmt.Sprintf("rule %s caps body at %d bytes", rule.ID, cap)))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.limit_rejected", nil, map[string]any{
+				"rule_id":        rule.ID,
+				"from_host":      r.Host,
+				"content_length": r.ContentLength,
+				"cap_bytes":      cap,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("limit", "blocked")
+			// 413 is a non-2xx wire write — emit apply error so
+			// the §12 chip surfaces the rejected pre-flight to
+			// the customer. Mirrors applyEdgeRuleValidate's 422
+			// path (handler.go:1736).
+			h.metrics.ObserveEdgeRuleApply("limit", "error")
+		}
+		return true
+	}
+	// In-limit body — install MaxBytesReader at the per-rule cap.
+	// This wraps r.Body so any subsequent read (the validate
+	// applier at handler.go:1750, the proxy leg further down)
+	// trips on the same cap if the body actually exceeds it.
+	// The global reader at handler.go:2789 layers outside this
+	// as the backstop for requests that don't match any limit
+	// rule; nesting two MaxBytesReaders is safe — both clamp
+	// to the smaller of their caps + the body, and the inner
+	// reader (this one) only ever tightens.
+	r.Body = http.MaxBytesReader(w, r.Body, int64(cap))
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.limit_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+			"cap_bytes": cap,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("limit", "match")
+		// Limit happy path — request falls through to the proxy
+		// leg (and to the validate applier if a validate rule
+		// also matches). Emit apply success so the §12 chip
+		// tracks customer traffic that was body-cap-matched.
+		// Mirrors applyEdgeRuleIP / applyEdgeRuleValidate.
+		h.metrics.ObserveEdgeRuleApply("limit", "success")
+	}
+	return false
+}
+
 // isUpgradeRequest is defined in pkg/gateway/upgrade.go. The
 // validate applier reuses it.
 
@@ -2769,6 +2924,25 @@ haveApp:
 		return
 	}
 	if h.applyEdgeRuleIP(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+
+	// ADR-091 D24 / kind=limit body cap gate. Runs AFTER JWT / IP
+	// (so rejected-on-ip / failed-jwt traffic never costs a body
+	// read) and BEFORE the global MaxBytesReader installed at
+	// handler.go:2944 (so the per-rule cap is the OUTER reader on
+	// the in-limit path; the global reader then layers INSIDE as
+	// the backstop for requests that don't match any limit rule).
+	// The Content-Length fast path inside applyEdgeRuleLimit
+	// delivers the "never buffer an oversize body" property —
+	// the global reader alone would buffer 30 MB into memory
+	// before tripping on a 5 MB rule. Placing the global reader
+	// AFTER applyEdgeRuleLimit keeps the fast path observable
+	// (the rule's 413 fires before the global reader wraps
+	// r.Body). Same posture as validate: short-circuit on deny,
+	// caller MUST `return`.
+	if h.applyEdgeRuleLimit(w, r, app) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}

@@ -1600,6 +1600,27 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// MaxEdgeRuleLimitBodyBytesStreaming (ADR-091 D24 / kind=limit
+	// streaming carve-out) is the upper bound on the optional
+	// `max_body_bytes_streaming` field of a kind=limit edge rule.
+	// The buffered-path field (`max_body_bytes`) is capped by
+	// MaxRequestBodyBytes (25 MiB) above; the streaming opt-in
+	// raises the cap to RawStreamMaxRequestBytes (100 MiB, ADR-080
+	// raw-bridge parity) so an LLM-style streaming POST against a
+	// /v1/chat/completions endpoint has the same headroom the
+	// raw-bridge ForwardStream has. The streaming detection
+	// (isAcceptJSON + h.streamingEnabled + app.StreamingEnabled)
+	// is NOT yet exposed at the §4.1.2.8c hot-path slot — D24
+	// ships the field declared and clamped here, but the runtime
+	// enforcement of `max_body_bytes_streaming` falls back to
+	// `max_body_bytes` until a follow-up PR lifts the streaming
+	// detection above the rule-application order. Stated
+	// explicitly in ADR-091 D24 §6. Matches RawStreamMaxRequestBytes
+	// byte-for-byte so a customer can set `max_body_bytes_streaming`
+	// = RawStreamMaxRequestBytes and the value survives the
+	// apid-Validate round-trip without surprise trimming.
+	MaxEdgeRuleLimitBodyBytesStreaming int64 = 100 * 1024 * 1024
+
 	// MaxEdgeRuleValidateSchemaBytes bounds the JSON Schema body of a
 	// kind=validate edge rule at apid-create time (Cloudflare-style
 	// 64 KiB). Mirrors the §11 JWKS-URL defence-in-depth posture on

@@ -14,9 +14,11 @@ if TYPE_CHECKING:
     from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
     from ..models.edge_rule_ip_action import EdgeRuleIPAction
     from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+    from ..models.edge_rule_limit_action import EdgeRuleLimitAction
     from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
     from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
     from ..models.edge_rule_route_action import EdgeRuleRouteAction
+    from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
 
 T = TypeVar("T", bound="EdgeRuleResponse")
@@ -45,9 +47,11 @@ class EdgeRuleResponse:
         | EdgeRuleHeadersAction
         | EdgeRuleIPAction
         | EdgeRuleJWTAction
+        | EdgeRuleLimitAction
         | EdgeRuleRedirectAction
         | EdgeRuleRewriteAction
         | EdgeRuleRouteAction
+        | EdgeRuleValidateAction
     )
     """Kind-tagged union — shape varies by `kind`."""
     created_at: datetime.datetime
@@ -59,10 +63,12 @@ class EdgeRuleResponse:
     def to_dict(self) -> dict[str, Any]:
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
+        from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
+        from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
         id = self.id
 
@@ -94,6 +100,10 @@ class EdgeRuleResponse:
         elif isinstance(self.action, EdgeRuleCORSAction):
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleJWTAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleIPAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleValidateAction):
             action = self.action.to_dict()
         else:
             action = self.action.to_dict()
@@ -129,9 +139,11 @@ class EdgeRuleResponse:
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
         from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+        from ..models.edge_rule_limit_action import EdgeRuleLimitAction
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
+        from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -159,9 +171,11 @@ class EdgeRuleResponse:
             | EdgeRuleHeadersAction
             | EdgeRuleIPAction
             | EdgeRuleJWTAction
+            | EdgeRuleLimitAction
             | EdgeRuleRedirectAction
             | EdgeRuleRewriteAction
             | EdgeRuleRouteAction
+            | EdgeRuleValidateAction
         ):
             try:
                 if not isinstance(data, dict):
@@ -211,11 +225,27 @@ class EdgeRuleResponse:
                 return action_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_6 = EdgeRuleIPAction.from_dict(data)
+
+                return action_type_6
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_7 = EdgeRuleValidateAction.from_dict(data)
+
+                return action_type_7
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            action_type_6 = EdgeRuleIPAction.from_dict(data)
+            action_type_8 = EdgeRuleLimitAction.from_dict(data)
 
-            return action_type_6
+            return action_type_8
 
         action = _parse_action(d.pop("action"))
 
