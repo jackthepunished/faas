@@ -105,6 +105,88 @@ func TestEdgeRulesCORS_E2E(t *testing.T) {
 	}
 }
 
+// TestEdgeRulesCORS_NonPreflight_HappyPath is the ADR-091 D20.6
+// twin of the preflight test above. The preflight path is covered
+// (it short-circuits at the CORS hook with a 204); the non-preflight
+// path was unit-level but had no e2e — operators couldn't tell
+// whether the GET-fall-through-with-ACAO path was wired correctly
+// in production. PR-B closes D20.6.
+//
+// Walks the same rule shape (kind=cors, allow_origins=[https://app.test],
+// allow_methods=[POST, GET]) but issues a GET instead of OPTIONS.
+// The CORS hook must fall through (NOT 204) and the proxied response
+// must carry Access-Control-Allow-Origin: https://app.test. The
+// test asserts both halves of the contract:
+//
+//   - Status: NOT 204 (no short-circuit on non-preflight).
+//   - ACAO header: stamped on the proxied response via the
+//     statusRecorder installHeaderOps path.
+//
+// Bitmask: APID | Gatewayd (same as the preflight test).
+func TestEdgeRulesCORS_NonPreflight_HappyPath(t *testing.T) {
+	pool := pgtest.Open(t)
+	if pool == nil {
+		return
+	}
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	h := e2etest.StartWithEnv(t, pool, e2etest.APID|e2etest.Gatewayd, nil)
+	key := h.SeedAccount(context.Background(), api.PlanHobby)
+	accountID := accountIDFromKey(t, context.Background(), pool, key)
+
+	slug := "cors-nonpreflight-test-app"
+	createRec := doReqBytes(t, h, key, http.MethodPost, "/v1/apps",
+		api.CreateAppRequest{Slug: slug})
+	if len(createRec) == 0 {
+		t.Fatalf("create app: empty response")
+	}
+	var app api.AppResponse
+	if err := json.Unmarshal(createRec, &app); err != nil {
+		t.Fatalf("decode app: %v body=%s", err, createRec)
+	}
+
+	synthHost := "edgectl-cors-np.apps.test.example"
+
+	seedRouteSubstitute(t, context.Background(), pool,
+		accountID, app.ID, synthHost, slug)
+
+	// Same kind=cors rule shape as the preflight test so this PR's
+	// non-preflight assertion is directly comparable: identical
+	// allow_origins / allow_methods / allow_credentials.
+	seedEdgeRuleDirect(t, context.Background(), pool,
+		accountID, app.ID, synthHost,
+		state.EdgeRuleKindCORSA,
+		map[string]any{
+			"kind": "cors",
+			"cors": map[string]any{
+				"allow_origins":     []string{"https://app.test"},
+				"allow_methods":     []string{"POST", "GET"},
+				"allow_credentials": true,
+			},
+		},
+	)
+
+	resetEdgeRuleCache(t, h)
+
+	// Happy-path non-preflight: GET / with Origin: https://app.test.
+	// The CORS hook MUST fall through (NOT 204) and MUST stamp the
+	// Access-Control-Allow-Origin header on the proxied response.
+	header, _, status := doReqHeaders(t, h, synthHost, http.MethodGet,
+		"/", nil, map[string]string{
+			"Origin": "https://app.test",
+		})
+	if status == http.StatusNoContent {
+		t.Errorf("kind=cors non-preflight: status=204 (preflight short-circuit on a GET); " +
+			"the CORS hook must fall through for non-OPTIONS")
+	}
+	if got := header.Get("Access-Control-Allow-Origin"); got != "https://app.test" {
+		t.Errorf("kind=cors non-preflight: ACAO=%q, want %q",
+			got, "https://app.test")
+	}
+}
+
 func stringContains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
