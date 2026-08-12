@@ -372,6 +372,15 @@ func diffCrons(out *Diff, base []api.CronResponse, pending []api.CreateCronReque
 // stable identity is (match_host, match_path, kind) — the gateway
 // rebuilds the compiled slice on every change so even identical
 // priority/methods count as a "modify".
+//
+// Duplicates: when the customer's manifest lists the same
+// (host, path, kind) tuple twice (e.g. two route rules for /v1
+// differing only by methods), the apid handler rejects the deploy
+// with a 409 against the CREATE UNIQUE constraint. Earlier versions
+// of this function silently overwrote the first occurrence in the
+// key map, masking the config error. We now emit one
+// `edge_rule_duplicate_key` break per duplicate tuple before the
+// regular diff walk so the customer sees the problem pre-deploy.
 func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateEdgeRuleRequest) {
 	if pending == nil {
 		return
@@ -382,8 +391,24 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 		baseByKey[erKey{r.MatchHost, r.MatchPath, r.Kind}] = r
 	}
 	pendByKey := map[erKey]api.CreateEdgeRuleRequest{}
+	seen := map[erKey]int{} // first-seen index for stable dup reporting
 	for i, r := range pending {
-		pendByKey[erKey{r.MatchHost, r.MatchPath, r.Kind}] = pending[i]
+		k := erKey{r.MatchHost, r.MatchPath, r.Kind}
+		if _, dup := pendByKey[k]; dup {
+			// Surface the dup with its first-occurrence index so
+			// the customer's eye lands on the right row.
+			label := k.kind + " " + k.host + k.path
+			out.Breaks = append(out.Breaks, Break{
+				Code:     "edge_rule_duplicate_key",
+				Severity: "error",
+				Reason:   "edge_rule[" + label + "] appears more than once in the pending list; apid's CREATE UNIQUE constraint will reject this deploy",
+				Field:    "edge_rule[" + label + "]",
+				Observed: AsAny(i),
+			})
+			continue
+		}
+		pendByKey[k] = pending[i]
+		seen[k] = i
 	}
 
 	allKeys := make([]erKey, 0, len(baseByKey)+len(pendByKey))
@@ -451,6 +476,12 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 // when any immutable field would change. Image, handler, and
 // AppManifest fields (entrypoint, port, healthz, working_dir, user)
 // are immutable per dto.go:1326.
+//
+// The compare is non-empty-agnostic: clearing a previously-set
+// healthz path is as much an immutable change as setting a new one.
+// The earlier `!= ""` short-circuit masked that case (a fresh
+// manifest with Healthz:"" against a deployment with healthz=/healthz
+// silently emitted no break). See code-review finding #3.
 func diffDeployment(out *Diff, base *api.DeploymentResponse, p Pending) {
 	if base == nil {
 		return
@@ -470,7 +501,11 @@ func diffDeployment(out *Diff, base *api.DeploymentResponse, p Pending) {
 		if base.OverrideHealthcheck != nil {
 			baseHCPath = base.OverrideHealthcheck.Path
 		}
-		if p.Manifest.Healthz != "" && p.Manifest.Healthz != baseHCPath {
+		// Compare unconditionally — clearing the healthz path is
+		// itself an immutable change. (Pre-review the guard
+		// `p.Manifest.Healthz != ""` dropped the break when the
+		// manifest cleared the field.)
+		if p.Manifest.Healthz != baseHCPath {
 			changes = append(changes, "healthz")
 		}
 		// WorkingDir / User live on AppManifest (the per-app
@@ -527,19 +562,21 @@ func detectSchemaBreak(out *Diff, base *api.DeploymentResponse, p Pending) {
 	// deployment row (sealed / non-secret by contract), only the
 	// OverrideEnvKeys []string set is wire-visible. A key add /
 	// remove is the customer-visible signal.
-	if len(p.Manifest.Env) > 0 {
-		pendKeys := make([]string, 0, len(p.Manifest.Env))
-		for k := range p.Manifest.Env {
-			pendKeys = append(pendKeys, k)
-		}
-		if !stringSliceEqualAsSet(pendKeys, base.OverrideEnvKeys) {
-			out.Breaks = append(out.Breaks, Break{
-				Code:     "schema_env_changed",
-				Severity: "warn",
-				Reason:   "environment key set change can alter process behaviour",
-				Field:    "manifest.env",
-			})
-		}
+	//
+	// We emit whenever the manifest is present — including when
+	// the customer removes every key from Env (a previous review
+	// found the `len(...) > 0` guard silently dropped that case).
+	pendKeys := make([]string, 0, len(p.Manifest.Env))
+	for k := range p.Manifest.Env {
+		pendKeys = append(pendKeys, k)
+	}
+	if !stringSliceEqualAsSet(pendKeys, base.OverrideEnvKeys) {
+		out.Breaks = append(out.Breaks, Break{
+			Code:     "schema_env_changed",
+			Severity: "warn",
+			Reason:   "environment key set change can alter process behaviour",
+			Field:    "manifest.env",
+		})
 	}
 	// EnvSecrets change → sealed-secret ref change. The wire form
 	// carries OverrideEnvSecretRefs (map[string]string) — refs are

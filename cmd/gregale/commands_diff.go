@@ -105,18 +105,34 @@ func runDiff(ctx context.Context, client *api.Client, opts diffCLIOptions) int {
 	// supplies QuotaConfig.
 	d := deploydiff.Compute(opts.Slug, baseline, pending)
 
-	// 4. Plan + limits for the gate.
-	plan, limits := inferPlanAndLimits(ctx, client, baseline)
-	if plan != "" {
+	// 4. Plan + limits for the gate. When the plan is unknown
+	// (PR-0 — the wire doesn't surface a full quota table today)
+	// we skip the gate and emit a warn. Running the gate against a
+	// zero-value Limits{} would false-fire on every Hobby/Pro/Scale
+	// customer's existing config (see code-review finding #1 / #6).
+	plan, limits, planKnown := inferPlanAndLimits(ctx, client, baseline)
+	if planKnown {
 		d.Plan = plan
+		breaks := deploydiff.Quota(plan, baseline, pending, deploydiff.QuotaConfig{
+			Limits:               limits,
+			AccountCronCount:     accountCronCount(ctx, client, opts.Slug),
+			AccountEdgeRuleCount: 0, // per-account edge-rule count not
+			// currently capped; pass 0.
+		})
+		d.Breaks = append(d.Breaks, breaks...)
+	} else {
+		// Plan tier not resolved — apid's `Whoami` only surfaces a
+		// partial AccountLimits table today (ram_mb, concurrency,
+		// deployed_apps, included_gb_hours, app_layer_max_mb — no
+		// crons / edge_rules / envs / etc.). Skip the gate and
+		// emit a single warn so the customer's eye lands on it.
+		d.Breaks = append(d.Breaks, deploydiff.Break{
+			Code:     "plan_unknown_quota_gate_skipped",
+			Severity: "warn",
+			Reason:   "could not resolve plan tier from Whoami; quota gate skipped (PR-0). PR-1 ships a server-side plan lookup.",
+			Field:    "plan",
+		})
 	}
-	breaks := deploydiff.Quota(plan, baseline, pending, deploydiff.QuotaConfig{
-		Limits:               limits,
-		AccountCronCount:     accountCronCount(ctx, client, opts.Slug),
-		AccountEdgeRuleCount: 0, // per-account edge-rule count not
-		// currently capped; pass 0.
-	})
-	d.Breaks = append(d.Breaks, breaks...)
 
 	// 5. Render.
 	if opts.JSON {
@@ -143,21 +159,37 @@ func buildBaseline(ctx context.Context, client *api.Client, slug string) (deploy
 	switch {
 	case err == nil:
 		out.App = &app
-		// Latest deployment: pull a one-element page to read the
-		// most-recent row. ListDeployments orders by created_at DESC
-		// (per memory pr-846-…) so the [0] element is the live row.
-		page, derr := client.ListDeployments(ctx, "", 1)
-		if derr == nil && len(page.Items) > 0 {
-			// The list is account-scoped, not app-scoped — filter
-			// by AppID. PR-0 is conservative: scan the page for a
-			// match; a future PR adds ListDeploymentsForApp.
-			for _, d := range page.Items {
-				if d.AppID == app.ID {
-					latest := d
+		// Latest deployment: ListDeployments is account-scoped
+		// (no ?app= filter today), so a single page can return
+		// another app's most-recent row. Bound-paginate until we
+		// find a row with AppID == app.ID, or until the cursor
+		// (NextBefore) goes empty. The bound (maxDeploymentPages)
+		// keeps the worst-case bounded so an account with hundreds
+		// of apps doesn't loop forever; missing the match leaves
+		// LatestDeployment nil — same shape as a never-deployed
+		// app, which is the safe default.
+		const pageSize = 20
+		const maxDeploymentPages = 10 // ≤ 200 rows scanned worst-case
+		cursor := ""
+		pagesScanned := 0
+		for pagesScanned < maxDeploymentPages {
+			page, derr := client.ListDeployments(ctx, cursor, pageSize)
+			if derr != nil {
+				break // surface no error — LatestDeployment
+				// staying nil is the safe default
+			}
+			for i := range page.Items {
+				if page.Items[i].AppID == app.ID {
+					latest := page.Items[i]
 					out.LatestDeployment = &latest
 					break
 				}
 			}
+			if out.LatestDeployment != nil || page.NextBefore == "" {
+				break
+			}
+			cursor = page.NextBefore
+			pagesScanned++
 		}
 	case isNotFound(err):
 		// Fresh deploy — leave baseline.App == nil.
@@ -225,19 +257,32 @@ func buildPending(ctx context.Context, client *api.Client, opts diffCLIOptions, 
 	return p
 }
 
-// inferPlanAndLimits reads the plan tier from the account's
-// limits. The wire shape isn't surfaced today (a Free customer's
-// AppResponse has no Plan field); PR-0 returns an empty plan and
-// the engine's gate fires only on the per-app-level caps that the
-// limits table can still validate.
+// inferPlanAndLimits resolves the account's plan tier + limits
+// table. We piggyback on Whoami (which carries AccountLimits.Plan
+// as a string) and lift that into the full [api.Limits] table via
+// [api.MustLimitsFor]. The returned `bool` reports whether the
+// lookup succeeded — when false, the caller must skip the gate
+// and emit a single warn so the customer doesn't see phantom
+// breaks (code-review finding #1 / #6).
 //
-// PR-1 will add a server-side `GET /v1/account/limits` endpoint
-// (or piggyback on Whoami) so the CLI can fetch the tier directly.
-func inferPlanAndLimits(ctx context.Context, client *api.Client, baseline deploydiff.Baseline) (api.Plan, api.Limits) {
-	// Best-effort: Whoami carries the plan tier in a future field;
-	// today we fall back to an empty plan and zero limits.
-	// PR-1 will wire this through the server endpoint.
-	return "", api.Limits{}
+// PR-1 will replace this with a server-side `GET /v1/account/limits`
+// endpoint that returns the full quota table directly. Until then,
+// Whoami is the canonical source for the plan tier.
+func inferPlanAndLimits(ctx context.Context, client *api.Client, baseline deploydiff.Baseline) (api.Plan, api.Limits, bool) {
+	acct, err := client.Whoami(ctx)
+	if err != nil {
+		return "", api.Limits{}, false
+	}
+	if acct.Plan == "" {
+		return "", api.Limits{}, false
+	}
+	plan := api.Plan(acct.Plan)
+	if !plan.Valid() {
+		return "", api.Limits{}, false
+	}
+	limits := api.MustLimitsFor(plan)
+	_ = baseline // reserved for PR-1's per-app upgrade
+	return plan, limits, true
 }
 
 // accountCronCount reads the per-account cron count for the quota

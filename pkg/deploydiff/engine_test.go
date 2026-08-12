@@ -261,6 +261,85 @@ func TestCompute_DeploymentImmutable(t *testing.T) {
 	}
 }
 
+// TestCompute_DeploymentImmutable_HealthzClear — code-review
+// finding #3: clearing the healthz path (Healthz:"" on the
+// manifest when the deployment has healthz=/healthz) must still
+// emit a would_create_deployment break. Earlier versions
+// short-circuited on `p.Manifest.Healthz != ""` and silently
+// dropped the break.
+func TestCompute_DeploymentImmutable_HealthzClear(t *testing.T) {
+	base := &api.DeploymentResponse{
+		OverrideHealthcheck: &api.DeploymentHealthcheck{Path: "/healthz"},
+	}
+	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
+	got := Compute("api", baseline, Pending{
+		Manifest: &api.AppManifest{Healthz: ""}, // explicitly clear
+	})
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "would_create_deployment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("clearing the healthz path must emit would_create_deployment; got %+v", got.Breaks)
+	}
+}
+
+// TestCompute_SchemaEnvChanged_KeyClear — code-review finding #4:
+// clearing every env key from the manifest (Env == empty map) must
+// still emit a schema_env_changed break when the baseline had
+// keys. Earlier versions short-circuited on `len(p.Manifest.Env)
+// > 0` and silently dropped the break.
+func TestCompute_SchemaEnvChanged_KeyClear(t *testing.T) {
+	base := &api.DeploymentResponse{
+		OverrideEnvKeys: []string{"FOO", "BAR"},
+	}
+	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
+	got := Compute("api", baseline, Pending{
+		Manifest: &api.AppManifest{Env: map[string]string{}}, // cleared
+	})
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "schema_env_changed" && b.Field == "manifest.env" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("clearing env keys must emit schema_env_changed; got %+v", got.Breaks)
+	}
+}
+
+// TestCompute_EdgeRules_DuplicateKey — code-review finding #5:
+// when the pending list carries the same (kind, host, path)
+// tuple twice, the diff must surface an
+// `edge_rule_duplicate_key` error-severity break (rather than
+// silently overwriting in the key map and emitting one row).
+// apid's CREATE UNIQUE constraint rejects the deploy at write
+// time; the diff is the pre-deploy warning.
+func TestCompute_EdgeRules_DuplicateKey(t *testing.T) {
+	pending := []api.CreateEdgeRuleRequest{
+		{
+			MatchHost: "api.example.com", MatchPath: "/v1",
+			Kind: "route", Action: mkAction("/v1"),
+		},
+		{
+			MatchHost: "api.example.com", MatchPath: "/v1",
+			Kind: "route", Action: mkAction("/v1/v2"), // same key, different action
+		},
+	}
+	got := Compute("api", Baseline{}, Pending{EdgeRules: pending})
+	dupCount := 0
+	for _, b := range got.Breaks {
+		if b.Code == "edge_rule_duplicate_key" {
+			dupCount++
+		}
+	}
+	if dupCount != 1 {
+		t.Fatalf("expected 1 edge_rule_duplicate_key break; got %d in %+v", dupCount, got.Breaks)
+	}
+}
+
 // TestCompute_HasBlockingBreaks — the gate's exit-1 input.
 func TestCompute_HasBlockingBreaks(t *testing.T) {
 	d := Diff{
