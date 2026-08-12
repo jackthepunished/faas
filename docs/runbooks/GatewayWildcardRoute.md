@@ -19,7 +19,7 @@ The customer app still serves correctly — the operator is losing per-route gra
 ## Triage
 
 1. Confirm the alert is firing on a single app tuple:
-   promtool query instant http://localhost:9090 'sum by (app, route) (rate(gateway_requests_total{route="__route_other__"}[5m]))'
+   promtool query instant http://localhost:9090 'sum by (app, route) (rate(gateway_requests_by_route_total{route="__route_other__"}[5m]))'
 2. Pull path distribution via control listener:
    curl http://127.0.0.1:9090/v1/internal/apps/<slug>/routes
 3. Verify apps.route_metrics_enabled=true on the affected app.
