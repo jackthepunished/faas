@@ -556,25 +556,55 @@ the cap with nothing else. A customer who declared a
 limit path, but they'd need to drop the schema from the validate
 path or keep both rules side-by-side).
 
-### Streaming carve-out — deferred
+### Streaming carve-out — runtime
 
 The rule carries `max_body_bytes_streaming` (≤ 100 MiB per
 `pkg/api.RawStreamMaxRequestBytes`, ADR-080 raw-bridge parity).
 The DTO + apid-Validate + cmd-side compile clamps are all in
-place. **Runtime enforcement of the streaming field is deferred
-to a follow-up PR** — the load-bearing reason: detecting the
-streaming opt-in path at the §4.1.2.8c slot requires
-`isAcceptJSON(r.Header.Get("Accept"))` + `h.streamingEnabled` +
-`app.StreamingEnabled`, all of which live further down the
-chain at `handler.go:3019`. Pulling that detection above the
-§4.1.2.8c slot would tangle the rule-application order with the
-proxy configuration; the cleaner refactor is a follow-up PR
-that exposes a streaming-detected seam the rule appliers can
-consult. Until that ships, `max_body_bytes_streaming` is
-declared and persisted, but the applier falls back to
-`max_body_bytes` for both paths. Stated explicitly so a future
-operator doesn't confuse "the field exists in the API" with
-"the field is enforced at request time".
+place. **Runtime enforcement ships via `streamingFor(h, r, app)`
+at `pkg/gateway/handler.go`**, a 4-conjunct helper lifted from
+the proxy-leg inline computation at `handler.go:3193–3195`:
+
+```go
+return h.streamingEnabled && app.StreamingEnabled &&
+    !isAcceptJSON(r.Header.Get("Accept")) &&
+    !isUpgradeRequest(r)
+```
+
+The §4.1.2.13 call site (`applyEdgeRuleLimit` at handler.go)
+computes the bool once and passes it as a parameter. The
+applier picks the cap:
+
+- streaming && `rule.MaxBodyBytesStreaming > 0` → streaming cap
+- else → buffered cap
+
+Per-cap-kind clamp: buffered cap clamps to
+`api.MaxRequestBodyBytes` (25 MiB); streaming cap clamps to
+`api.RawStreamMaxRequestBytes` (100 MiB). A single clamp to
+`api.MaxRequestBodyBytes` would silently regress streaming
+allowances, so the clamp is split. The DTO's
+`max_body_bytes_streaming ≥ max_body_bytes` invariant
+(`pkg/api/dto.go`) is trusted at runtime — a direct-DB row that
+violates it passes the compile and falls back to the buffered
+cap at runtime via the `MaxBodyBytesStreaming == 0` branch
+(safe degradation, never widens).
+
+The 413 detail message suffixes the cap kind — `"rule … caps
+body at … bytes (buffered cap)"` or `"… (streaming cap)"` — so
+a customer reading the problem+json body can bisect which cap
+fired without consulting logs. The audit payload (`edge_rule.
+limit_rejected` + `edge_rule.limit_matched`) carries an
+additive `cap_kind` field with the same value, threaded into
+the structured-log aggregator's existing sink. The cap kind is
+additive — consumers ignore unknown fields by default — and
+removing it is non-breaking.
+
+Why the DTO invariant is trusted: apid-Validate enforces it at
+rule-create time, and the apid-compile gate (the migration
+test) pins the rule of `s ≥ b` on every apply. Direct-DB
+writes are a known escape hatch (the e2e helper `seedEdgeRule
+Direct` exercises this) and the runtime's safe-degradation
+fallback is the documented contract for those paths.
 
 ### Test coverage
 
@@ -593,6 +623,13 @@ operator doesn't confuse "the field exists in the API" with
 | `TestApplyEdgeRuleLimit_CrossAccount_DefenceInDepthNoOp` | Cross-tenant rule → `pickCalls == 1` + match/blocked + apply/success (defense-in-depth). |
 | `TestApplyEdgeRuleLimit_NilMatcher_PassThrough` | `h.edgeRules == nil` → no panic, falls through. |
 | `TestApplyEdgeRuleLimit_CapClamp_DefenceInDepth` | Direct-DB row with `MaxBodyBytes = 1 GiB` (bypassed apid-Validate) → 30 MiB CL still trips 413. |
+| `TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_OverCap_413` | Streaming posture (Accept=event-stream, app + h streaming on) + 110 MiB CL on 5 MiB buffered / 100 MiB streaming cap → 413 via STREAMING cap, detail suffixes `(streaming cap)`, `pickCalls == 0`. |
+| `TestApplyEdgeRuleLimit_StreamingCap_StreamingCapZero_FallsBackToBuffered` | Streaming posture + streaming cap == 0 (customer didn't set it) → falls back to buffered 5 MiB, 30 MiB CL trips 413 with `(buffered cap)` suffix. |
+| `TestApplyEdgeRuleLimit_StreamingCap_BufferedRequest_StreamingFieldIgnored` | Buffered posture (Accept=application/json) with a rule carrying both caps → buffered cap fires; detail MUST NOT mention `streaming cap`. |
+| `TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_ContentLengthOverStreamingCap_413` | Streaming posture + 12 MiB CL on 1 MiB buffered / 10 MiB streaming → 413 via the streaming cap (the buffered cap is irrelevant — the streaming cap is the binding one). |
+| `TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind` | Two sub-cases (streaming + buffered) pin the audit payload's new `cap_kind` field: `edge_rule.limit_rejected` carries `cap_kind: "streaming"` or `"buffered"` per the request's path. |
+| `TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts` | Six-row truth table pinning the 4-conjunct detection formula (any future conjunct addition requires a new row). |
+| `TestApplyEdgeRuleLimit_StreamingCapClamp_DefenceInDepth` | Streaming posture + rule with `MaxBodyBytes = 1 GiB` / `MaxBodyBytesStreaming = 2 GiB` → streaming cap clamps to `api.RawStreamMaxRequestBytes` (100 MiB); 120 MiB CL trips 413. |
 | `TestMigrations_00219_EdgeRulesKindLimit` | 00219 migration applies cleanly; CHECK constraint carries 9-value vocab; `kind='limit'` round-trips; `kind='limit_typo'` → 23514; replay safety. |
 
 ### Rejected alternatives

@@ -2190,3 +2190,472 @@ func TestApplyEdgeRuleLimit_CapClamp_DefenceInDepth(t *testing.T) {
 		t.Errorf("fakeBackend.Pick = %d; want 0 (clamp must deny before wake)", b.pickCalls.Load())
 	}
 }
+
+// captureAuditor is a hand-rolled EdgeRuleAuditor that captures
+// every Emit call into a slice the test can inspect. Used by the
+// streaming-cap audit test (TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind)
+// to assert that the new `cap_kind` field is threaded through the
+// 413 audit emit. Mirrors the captureAuditor shape used by the
+// validate handler tests.
+type captureAuditor struct {
+	mu       sync.Mutex
+	captured []capturedAudit
+}
+
+type capturedAudit struct {
+	kind    string
+	subject *string
+	data    map[string]any
+}
+
+func (a *captureAuditor) Emit(_ context.Context, kind string, subject *string, data map[string]any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.captured = append(a.captured, capturedAudit{kind: kind, subject: subject, data: data})
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_OverCap_413
+// pins the §4.1.2.13 streaming-carve-out runtime: a streaming
+// request (Accept: text/event-stream, app.StreamingEnabled, h.streamingEnabled)
+// against a rule whose streaming cap is 100 MiB and whose buffered
+// cap is 5 MiB must 413 via the STREAMING cap (not the buffered
+// one) when the Content-Length is 110 MiB (over the streaming
+// cap; would be under the 100 MiB streaming cap if CL were 100
+// MiB and the buffered cap irrelevant). The 413 detail must
+// suffix "(streaming cap)" so a customer can bisect which cap
+// fired.
+func TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_OverCap_413(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-stream", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          5 * 1024 * 1024,   // 5 MiB buffered
+			MaxBodyBytesStreaming: 100 * 1024 * 1024, // 100 MiB streaming
+		},
+	}, nil, nil)
+
+	// 110 MiB — over the streaming cap (100 MiB), so the
+	// streaming fast path must fire. The buffered cap (5 MiB)
+	// would also deny at 110 MiB, but the test asserts the
+	// streaming cap is the one named in the detail.
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 110 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (streaming-cap Content-Length fast path)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	if code, _ := prob["code"].(string); code != "request_too_large" {
+		t.Errorf("code = %q; want request_too_large", code)
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "104857600") || !strings.Contains(detail, "streaming cap") {
+		t.Errorf("detail = %q; want substring 104857600 + streaming cap (the streaming cap fired, not buffered)", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0 (Content-Length fast path must deny before wake)", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_StreamingCapZero_FallsBackToBuffered
+// pins the s == 0 fallback: a streaming request with a rule whose
+// streaming cap is 0 (customer didn't set it) must use the
+// buffered cap. 30 MiB on a 5 MiB buffered cap → 413 with the
+// "(buffered cap)" suffix.
+func TestApplyEdgeRuleLimit_StreamingCap_StreamingCapZero_FallsBackToBuffered(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-buf", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          5 * 1024 * 1024,
+			MaxBodyBytesStreaming: 0, // customer didn't set streaming cap
+		},
+	}, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 30 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (buffered cap fallback must still 413)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "buffered cap") {
+		t.Errorf("detail = %q; want substring buffered cap (streaming cap == 0 must fall back to buffered)", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_BufferedRequest_StreamingFieldIgnored
+// pins the buffered-path posture: a request on the buffered
+// path (Accept: application/json) must use the buffered cap
+// even if the rule carries a streaming cap. 30 MiB on a 5 MiB
+// buffered cap → 413 with "(buffered cap)" suffix (NOT
+// "streaming cap").
+func TestApplyEdgeRuleLimit_StreamingCap_BufferedRequest_StreamingFieldIgnored(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: false},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	// Note: h.streamingEnabled left at zero (default buffered posture)
+	// and app.StreamingEnabled = false. Accept: application/json opts
+	// out of streaming even if the process is opted in.
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-bufonly", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          5 * 1024 * 1024,
+			MaxBodyBytesStreaming: 100 * 1024 * 1024, // set, but should be ignored
+		},
+	}, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 30 * 1024 * 1024
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (buffered cap fires regardless of streaming field)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "buffered cap") {
+		t.Errorf("detail = %q; want substring buffered cap (streaming field must be ignored on buffered path)", detail)
+	}
+	if strings.Contains(detail, "streaming cap") {
+		t.Errorf("detail = %q; buffered path must NOT mention streaming cap", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_ContentLengthOverStreamingCap_413
+// pins the streaming-cap fast path: a streaming request whose
+// Content-Length exceeds the streaming cap (12 MiB on a 10 MiB
+// streaming cap, with a 1 MiB buffered cap) must 413 from the
+// streaming cap, NOT the buffered cap. The buffered cap (1 MiB)
+// would also deny at 12 MiB, so this test specifically asserts
+// the streaming cap was the one consulted.
+func TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_ContentLengthOverStreamingCap_413(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-tight-buf", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          1 * 1024 * 1024,  // 1 MiB buffered
+			MaxBodyBytesStreaming: 10 * 1024 * 1024, // 10 MiB streaming
+		},
+	}, nil, nil)
+
+	// 12 MiB — over BOTH caps. The streaming cap (10 MiB) is the
+	// binding one on the streaming path; the 413 detail must name
+	// the streaming cap value (10 MiB), not the buffered cap (1 MiB).
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 12 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (streaming cap 10 MiB < 12 MiB Content-Length)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "streaming cap") {
+		t.Errorf("detail = %q; want substring streaming cap (12 MiB on streaming path must trip streaming cap)", detail)
+	}
+	if !strings.Contains(detail, "10485760") { // 10 MiB in bytes
+		t.Errorf("detail = %q; want substring 10485760 (10 MiB streaming cap is the binding cap)", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind pins
+// the audit payload's new cap_kind field: a 413 from the streaming
+// cap must emit edge_rule.limit_rejected with cap_kind=streaming;
+// a 413 from the buffered cap must emit cap_kind=buffered. The
+// field is the customer-debugging primitive for the streaming
+// carve-out (ADR-091 D24 §6). The 110 MiB Content-Length is over
+// BOTH the buffered cap (5 MiB) and the streaming cap (100 MiB);
+// the streaming sub-case names the streaming cap, the buffered
+// sub-case names the buffered cap.
+func TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind(t *testing.T) {
+	cases := []struct {
+		name        string
+		streamingOn bool
+		accept      string
+		wantCapKind string
+	}{
+		{
+			name:        "streaming-cap fires when streaming on + Accept=event-stream",
+			streamingOn: true,
+			accept:      "text/event-stream",
+			wantCapKind: "streaming",
+		},
+		{
+			name:        "buffered-cap fires when Accept=application/json",
+			streamingOn: true,
+			accept:      "application/json",
+			wantCapKind: "buffered",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &fakeBackend{
+				app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: tc.streamingOn},
+				host:     "l.example.com",
+				upstream: "127.0.0.1:0",
+				running:  true,
+			}
+			b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+			h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			h.SetWakeGateHook()
+			h.streamingEnabled = tc.streamingOn
+			auditor := &captureAuditor{}
+			h.WithEdgeRules(stubEdgeRuleMatcher{
+				limit: &EdgeRuleLimitResolved{
+					ID: "rule-l-audit", AccountID: "acct-1", AppID: "app-1",
+					Priority: 0, PathGlob: "", Methods: nil,
+					MaxBodyBytes:          5 * 1024 * 1024,
+					MaxBodyBytesStreaming: 100 * 1024 * 1024,
+				},
+			}, nil, auditor)
+
+			// 110 MiB Content-Length is over BOTH the buffered cap
+			// (5 MiB) AND the streaming cap (100 MiB). The streaming
+			// sub-case names the streaming cap (100 MiB); the buffered
+			// sub-case names the buffered cap (5 MiB). Under either cap
+			// the Content-Length fast path 413s before the streaming
+			// response-writer wrap (handler.go:2656), so we don't fall
+			// through and stack-overflow the test fixture.
+			req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+			req.ContentLength = 110 * 1024 * 1024
+			req.Header.Set("Accept", tc.accept)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("rec.Code = %d; want 413", rec.Code)
+			}
+			// Find the limit_rejected audit event.
+			var found *capturedAudit
+			auditor.mu.Lock()
+			defer auditor.mu.Unlock()
+			for i := range auditor.captured {
+				if auditor.captured[i].kind == "edge_rule.limit_rejected" {
+					found = &auditor.captured[i]
+					break
+				}
+			}
+			if found == nil {
+				t.Fatalf("no edge_rule.limit_rejected audit emitted; got %+v", auditor.captured)
+			}
+			if got, _ := found.data["cap_kind"].(string); got != tc.wantCapKind {
+				t.Errorf("cap_kind = %q; want %q (audit data = %+v)", got, tc.wantCapKind, found.data)
+			}
+		})
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts pins the
+// 4-conjunct detection formula at the §4.1.2.13 slot. The six
+// rows below are the formula's truth table; if any conjunct
+// ever grows (e.g., a future IsCachedRequest opt-out) the new
+// conjunct needs a row here. Mirrors the validate applier's
+// table-driven tests in this file.
+func TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts(t *testing.T) {
+	cases := []struct {
+		name          string
+		hStreaming    bool
+		appStreaming  bool
+		accept        string
+		upgradeHeader bool
+		want          bool
+	}{
+		{
+			name:       "h.streamingEnabled=false → not streaming",
+			hStreaming: false, appStreaming: true, accept: "text/event-stream",
+			want: false,
+		},
+		{
+			name:       "app.StreamingEnabled=false → not streaming",
+			hStreaming: true, appStreaming: false, accept: "text/event-stream",
+			want: false,
+		},
+		{
+			name:       "Accept=application/json → not streaming (isAcceptJSON opts out)",
+			hStreaming: true, appStreaming: true, accept: "application/json",
+			want: false,
+		},
+		{
+			name:       "Upgrade: websocket → not streaming (isUpgradeRequest opts out)",
+			hStreaming: true, appStreaming: true, accept: "text/event-stream", upgradeHeader: true,
+			want: false,
+		},
+		{
+			name:       "all four conjuncts true → streaming",
+			hStreaming: true, appStreaming: true, accept: "text/event-stream",
+			want: true,
+		},
+		{
+			name:       "Accept=json + Upgrade=ws (both opts out) → not streaming",
+			hStreaming: true, appStreaming: true, accept: "application/json", upgradeHeader: true,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: tc.appStreaming}
+			req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
+			if tc.upgradeHeader {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+			}
+			h := NewHandlerWith(&fakeBackend{}, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			h.streamingEnabled = tc.hStreaming
+
+			got := streamingFor(h, req, app)
+			if got != tc.want {
+				t.Errorf("streamingFor = %v; want %v (h.streamingEnabled=%v, app.StreamingEnabled=%v, Accept=%q, upgrade=%v)",
+					got, tc.want, tc.hStreaming, tc.appStreaming, tc.accept, tc.upgradeHeader)
+			}
+		})
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCapClamp_DefenceInDepth pins the
+// per-cap-kind runtime mirror of the cmd-side compile clamp. A
+// direct-DB row that bypassed apid-Validate with a streaming cap
+// > api.RawStreamMaxRequestBytes (2 GiB) must still produce a sane
+// CL fast-path 413 with the cap clamped to 100 MiB in the audit
+// payload. Without this clamp, the matcher would hand the handler
+// a 2 GiB cap that effectively means "no cap" — defeating the
+// streaming carve-out for that rule.
+func TestApplyEdgeRuleLimit_StreamingCapClamp_DefenceInDepth(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	auditor := &captureAuditor{}
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-bypass-stream", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			// Direct-DB row that bypassed apid-Validate: streaming
+			// cap > 100 MiB platform ceiling. cmd-side compileLimitRules
+			// would have clamped this to api.RawStreamMaxRequestBytes;
+			// the handler's mirror clamp at handler.go:2017 is the
+			// second gate.
+			MaxBodyBytes:          1 * 1024 * 1024,        // 1 MiB buffered (in bounds)
+			MaxBodyBytesStreaming: 2 * 1024 * 1024 * 1024, // 2 GiB streaming (out of bounds)
+		},
+	}, nil, auditor)
+
+	// 120 MiB CL — would be "in-limit" if the streaming clamp were
+	// absent (2 GiB cap). The clamp pins the streaming cap to
+	// RawStreamMaxRequestBytes (100 MiB), so 120 MiB is still
+	// over-cap and must 413.
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 120 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (streaming-cap clamp must fire before reaching proxy leg)", rec.Code)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0 (clamp must deny before wake)", b.pickCalls.Load())
+	}
+	// Find the limit_rejected audit event and assert the cap
+	// was clamped to 100 MiB in cap_bytes.
+	var found *capturedAudit
+	auditor.mu.Lock()
+	defer auditor.mu.Unlock()
+	for i := range auditor.captured {
+		if auditor.captured[i].kind == "edge_rule.limit_rejected" {
+			found = &auditor.captured[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no edge_rule.limit_rejected audit emitted; got %+v", auditor.captured)
+	}
+	capBytes, ok := found.data["cap_bytes"].(int)
+	if !ok {
+		t.Fatalf("cap_bytes = %T %+v; want int", found.data["cap_bytes"], found.data["cap_bytes"])
+	}
+	if int64(capBytes) != api.RawStreamMaxRequestBytes {
+		t.Errorf("cap_bytes = %d; want %d (RawStreamMaxRequestBytes = 100 MiB)", capBytes, api.RawStreamMaxRequestBytes)
+	}
+	if capKind, _ := found.data["cap_kind"].(string); capKind != "streaming" {
+		t.Errorf("cap_kind = %q; want streaming", capKind)
+	}
+}
