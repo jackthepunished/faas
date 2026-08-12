@@ -194,6 +194,11 @@ verify-secrets: ## PR-P4: assert /etc/faas/sealed.env (or the file passed via SE
 	@test -x deploy/scripts/verify-secrets.sh || (echo "deploy/scripts/verify-secrets.sh missing or not executable" ; exit 1)
 	@SECRETS_FILE=$${SECRETS_FILE:-/etc/faas/sealed.env} bash deploy/scripts/verify-secrets.sh
 
+.PHONY: hobby-route-audit
+hobby-route-audit: ## Tier A (ADR-093): Hobby-tier app audit. Read-only harness that lists Hobby tenants, pulls /v1/apps/{slug}/routes, counts __route_other__ vs real-route entries. Exit 1 if any app is saturated. Needs FAAS_API_BASE + FAAS_TOKEN.
+	@test -x deploy/scripts/adr093-hobby-audit.sh || (echo "deploy/scripts/adr093-hobby-audit.sh missing or not executable" ; exit 1)
+	@bash deploy/scripts/adr093-hobby-audit.sh
+
 .PHONY: test-load
 test-load: ## Hot-path load test (1k rps, //go:build load) — spec §14 M4 row 2. Needs ≥ 2 vCPU.
 	$(GO) test -tags=load -race -count=1 -v -timeout=10m ./pkg/gateway/...

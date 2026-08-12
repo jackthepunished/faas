@@ -693,6 +693,45 @@ with a non-evicting `__route_other__` overflow bucket (ADR-093 D2).
   `deploy/ansible/roles/prometheus/tasks/main.yml` (commit 1 of
   this PR — G1+G2 closure).
 
+### Tier A — observation period
+
+Operational follow-up (no code change). 2-week observation window
+after PR #856 lands. Empirical answer to "does the 50-cap actually
+bound cardinality or do apps collapse into `__route_other__`?" feeds
+either Tier B hardening (per-method cap, post-rewrite route label,
+`AppRoutesResponse` cap-visibility) or Tier C bigger ADRs (per-route
+SLI, per-plan budget).
+
+- **Alert surface** — `GatewayWildcardRoute` is `severity: info`
+  and routes to the EMPTY `faas-silent` receiver
+  (`alertmanager.yml.j2:53-56`). No page, no email, no Slack. Visible
+  in Prometheus `/alerts` and Grafana only. The status-page degraded
+  pill filters `severity=~"page|warn"` (line 519-541), so this alert
+  does **not** move the pill by design.
+- **Weekly review** — pull firing alerts directly:
+
+  ```sh
+  curl -s http://127.0.0.1:9090/api/v1/alerts \
+    | jq '.data.alerts[] | select(.labels.alertname=="GatewayWildcardRoute")'
+  ```
+
+- **Mid-sprint Hobby-tier audit** — run
+  `make hobby-route-audit` (uses `deploy/scripts/adr093-hobby-audit.sh`)
+  against the control plane. Counts `__route_other__` vs real-route
+  entries per Hobby-tier app. Read-only.
+- **Post-deploy smoke** — operator-side runbook at
+  `docs/runbooks/PostDeployAdr093.md`. Four artefact checks (rule
+  file, systemd unit, toml, Grafana panels 103/104) + a rule-load
+  check + an end-state snapshot. Read-only.
+- **Decision at end-of-sprint**:
+  - *Cap sufficient* (no Hobby-tier app saturated) → Tier B polish;
+    Tier C (per-route SLI + per-plan budget) becomes the next major ADR.
+  - *Cap partial* (some Hobby apps saturated, most didn't) → Tier B
+    per-method cap.
+  - *Cap insufficient* (most Hobby apps immediately saturated) →
+    ADR-093 needs re-scoping (lower default cap, revert Hobby's
+    default-on, or move to a customer-driven enable per plan).
+
 ## Auth default flip — issue #695 / ADR-080
 
 Closes spec §17 G15. Cloud Run's analogue is IAM-authenticated by
