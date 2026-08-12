@@ -594,6 +594,53 @@
         "graphMode": "area",
         "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "gatewayd top 10 routes by 5m rate + error rate (ADR-093)",
+      "id": 103,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 104},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "topk(10, faas_gateway_request_rate_5m:by_route)", "legendFormat": "reqps — {{route}}", "refId": "A"},
+        {"expr": "topk(10, faas_gateway_error_rate_5m:by_route)", "legendFormat": "err — {{route}}", "refId": "B"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byRegexp", "options": "^err — .*"},
+            "properties": [{"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}}]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "gatewayd top 10 routes by p95 latency (ADR-093)",
+      "id": 104,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 104},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "topk(10, faas_gateway_p95_seconds:by_route)", "legendFormat": "p95 — {{route}}", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ],
   "refresh": "30s",
