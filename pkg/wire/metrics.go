@@ -315,6 +315,33 @@ type OpsMetrics struct {
 	// baseline is enough to drive a "the flusher can talk to
 	// Postgres?" question.
 	failedLoginAuditWriteFailures prometheus.Counter
+	// auditEventsDeletedTotal: rows pruned by the daily event-
+	// retention cleanup loop (pkg/eventretention.Cleanup, ADR-075).
+	// Unlabelled — the loop has one outcome (rows deleted) and the
+	// per-kind breakdown lives on auditEventsVolumeTotal{kind_prefix}
+	// instead. Backs the "is the prune loop keeping up?" runbook
+	// question (docs/runbooks/FaasAuditRetentionExhaustion.md).
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsDeletedTotal prometheus.Counter
+	// auditEventsRetentionLagSeconds: gauge of (now − cutoff) at the
+	// moment each retention pass runs. A positive value means the
+	// loop is keeping up; a value pinned at 0 means the loop is
+	// running but never deleting anything (operator action needed
+	// if the events table is growing). Backs the same runbook as
+	// auditEventsDeletedTotal. The gauge is set (not Inc) so the
+	// value reflects the LATEST pass, not a cumulative sum.
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsRetentionLagSeconds prometheus.Gauge
+	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
+	// events table by kind prefix (auth.*, key.*, secret.*,
+	// account.*, stateless.*, webhook.*, edge_rule.*, cron.*,
+	// "" / unmatched). kind_prefix is the bounded-admission label
+	// — overflow collapses to "__other__" via the wire admission
+	// helper so Prometheus series stay bounded even if a future
+	// kind namespace blows up. Backs the "is the audit write rate
+	// healthy per kind?" dashboard panel. ADR-091 D20.3 / PR-B
+	// residual.
+	auditEventsVolumeTotal *prometheus.CounterVec
 	// alertEvalSkippedDegradedTotal — counts alert-rule evaluation
 	// ticks skipped because pkg/appmetrics returned a degraded source
 	// string ("degraded: <reason>"). Unlabelled. The dashboard's
@@ -1351,6 +1378,54 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_failed_login_audit_write_failures_total",
 		Help: "Failed-login audit rows whose AppendEvent could not be written (cmd/apid/audit.go::flushOne). Unlabelled — distinct from apid_audit_write_failures_total{account_id} because the failed-login row's subject is always nil, which would collapse to account_id=\"anonymous\" in the success-path counter and conflate the two surfaces (issue #286).",
 	})
+	// auditEventsDeletedTotal: rows pruned by the daily event-
+	// retention cleanup loop (pkg/eventretention.Cleanup, ADR-075).
+	// Unlabelled — the loop has one outcome (rows deleted) and the
+	// per-kind breakdown lives on auditEventsVolumeTotal{kind_prefix}
+	// instead. Backs the "is the prune loop keeping up?" runbook
+	// question (docs/runbooks/FaasAuditRetentionExhaustion.md).
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsDeletedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_audit_events_deleted_total",
+		Help: "Audit-event rows pruned by the daily cleanup loop (pkg/eventretention, ADR-075). Unlabelled — the loop has one outcome (rows deleted) and the per-kind breakdown lives on apid_audit_events_volume_total{kind_prefix}. ADR-091 D20.3 / PR-B residual.",
+	})
+	// auditEventsRetentionLagSeconds: gauge of (now − cutoff) at the
+	// moment each retention pass runs. A positive value means the
+	// loop is keeping up; a value pinned at 0 means the loop is
+	// running but never deleting anything (operator action needed
+	// if the events table is growing). Backs the same runbook as
+	// auditEventsDeletedTotal. The gauge is set (not Inc) so the
+	// value reflects the LATEST pass, not a cumulative sum.
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsRetentionLagSeconds := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_audit_events_retention_lag_seconds",
+		Help: "Seconds elapsed between the most recent retention pass and the cutoff it used (pkg/eventretention, ADR-075). Zero means the loop is running but no rows are being deleted. ADR-091 D20.3 / PR-B residual.",
+	})
+	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
+	// events table by kind prefix (auth.*, key.*, secret.*,
+	// account.*, stateless.*, webhook.*, edge_rule.*, cron.*,
+	// "" / unmatched). kind_prefix is the bounded-admission label
+	// — overflow collapses to "__other__" via the wire admission
+	// helper so Prometheus series stay bounded even if a future
+	// kind namespace blows up. Backs the "is the audit write rate
+	// healthy per kind?" dashboard panel. ADR-091 D20.3 / PR-B
+	// residual.
+	auditEventsVolumeTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_audit_events_volume_total",
+		Help: "Audit-event emit calls by kind prefix (auth.*, key.*, secret.*, account.*, stateless.*, webhook.*, edge_rule.*, cron.*, other). Overflow collapses to __other__ via the bounded admission helper so Prometheus series stay bounded. ADR-091 D20.3 / PR-B residual.",
+	}, []string{"kind_prefix"})
+	// Pre-instantiate the closed kind_prefix label set so the
+	// counter's HELP/TYPE and zero-valued series surface in /metrics
+	// from boot (same precedent as auditWriteDur's result label set).
+	// The empty string is the "unmatched prefix" bucket — kept so a
+	// future emit site that bypasses the prefix matcher still has a
+	// zero series rather than a missing one.
+	for _, kp := range []string{
+		"auth", "key", "secret", "account", "stateless",
+		"webhook", "edge_rule", "cron", "other",
+	} {
+		auditEventsVolumeTotal.WithLabelValues(kp)
+	}
 	auditWriteDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_audit_write_failures_duration_seconds",
 		Help: "Latency of state.Store.AppendEvent on the apid audit seam, labelled by terminal result {ok, failed}. Sized for the single-row INSERT round-trip (issue #278).",
@@ -1915,6 +1990,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		egressDeny,
 		failedLoginTotal, failedLoginDropped,
 		failedLoginAuditWriteFailures,
+		auditEventsDeletedTotal,
+		auditEventsRetentionLagSeconds,
+		auditEventsVolumeTotal,
 		topTenantRPS,
 		apidLogsEmittedTotal,
 		apidLogsDroppedTotal,
@@ -2457,6 +2535,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,
 		failedLoginAuditWriteFailures:      failedLoginAuditWriteFailures,
+		auditEventsDeletedTotal:            auditEventsDeletedTotal,
+		auditEventsRetentionLagSeconds:     auditEventsRetentionLagSeconds,
+		auditEventsVolumeTotal:             auditEventsVolumeTotal,
 		alertEvalSkippedDegradedTotal:      alertEvalSkippedDegradedTotal,
 		alertEvalFiredTotal:                alertEvalFiredTotal,
 		alertDeliveryAttemptsTotal:         alertDeliveryAttemptsTotal,
@@ -3023,6 +3104,53 @@ func (m *OpsMetrics) FailedLoginAuditWriteFailures() prometheus.Counter {
 		return nil
 	}
 	return m.failedLoginAuditWriteFailures
+}
+
+// AuditEventsDeleted returns the unlabelled counter for audit-
+// event rows pruned by the daily retention pass (pkg/eventretention,
+// ADR-075). Distinct from the per-kind volume counter so an operator
+// can see "is the prune loop running AND is it making progress"
+// without conflating emit rate with delete rate. Backs the
+// docs/runbooks/FaasAuditRetentionExhaustion.md runbook alongside
+// AuditEventsRetentionLag. ADR-091 D20.3 / PR-B residual.
+//
+// Also satisfies eventretention.Ops — the cleanup loop calls
+// .Add(float64(n)) on the returned counter (only when n > 0 so
+// idle passes don't tick up).
+func (m *OpsMetrics) AuditEventsDeleted() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.auditEventsDeletedTotal
+}
+
+// AuditEventsRetentionLag returns the gauge of seconds since
+// the most recent retention cutoff was computed. Set (not Inc) —
+// the value reflects the LATEST pass. A pinned-zero value is the
+// canary for "the loop is running but never deleting anything"
+// (events table growing). ADR-091 D20.3 / PR-B residual.
+//
+// Also satisfies eventretention.Ops — the cleanup loop calls
+// .Set(seconds) on the returned gauge on every successful pass
+// (so pinned-zero on an idle pass is a red flag).
+func (m *OpsMetrics) AuditEventsRetentionLag() prometheus.Gauge {
+	if m == nil {
+		return nil
+	}
+	return m.auditEventsRetentionLagSeconds
+}
+
+// AuditEventsVolumeTotal returns the per-kind-prefix counter for
+// audit-event emit calls. kind_prefix is the bounded-admission
+// label — overflow collapses to "__other__" via the wire admission
+// helper so Prometheus series stay bounded. Safe to call from the
+// emit hot path; the underlying CounterVec is shared and pre-
+// instantiated at boot. ADR-091 D20.3 / PR-B residual.
+func (m *OpsMetrics) AuditEventsVolumeTotal(kindPrefix string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.auditEventsVolumeTotal.WithLabelValues(kindPrefix)
 }
 
 // RequestFailure is the primitive counter accessor for

@@ -5,9 +5,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // fakeStore is the in-test stand-in for the narrow Store surface —
@@ -229,3 +233,195 @@ func (c *countingStore) DeleteOldEvents(_ context.Context, before time.Time) (in
 
 // Compile-time witness for the countingStore twin.
 var _ DeleteOldEventsStore = (*countingStore)(nil)
+
+// fakeOps is the in-test stand-in for the narrow Ops surface.
+// It implements the Ops interface using stub counters / gauges
+// that record every .Add / .Set call so the table-driven tests
+// below can assert the exact metric contract:
+//
+//   - AuditEventsDeleted().Add: only called when deleted > 0
+//     (an idle pass that prunes nothing does not bump the counter).
+//   - AuditEventsRetentionLag().Set: called on EVERY successful
+//     pass (so a pinned-zero lag is the canary for "loop running
+//     but never deleting").
+//
+// The mu guards the slices so -race is happy with parallel tests.
+type fakeOps struct {
+	mu              sync.Mutex
+	deletedCalls    []float64
+	lagCallsSeconds []float64
+}
+
+func (f *fakeOps) AuditEventsDeleted() prometheus.Counter {
+	return &fakeCounter{ops: f}
+}
+
+func (f *fakeOps) AuditEventsRetentionLag() prometheus.Gauge {
+	return &fakeGauge{ops: f}
+}
+
+// fakeCounter / fakeGauge are the smallest Prometheus objects
+// that satisfy the Counter / Gauge interfaces (both require
+// Desc + Collect + Write). We don't register them with a real
+// registry; the cleanup loop only calls .Add / .Set and the
+// tests assert on those alone.
+type fakeCounter struct {
+	ops *fakeOps
+}
+
+func (c *fakeCounter) Add(v float64) {
+	c.ops.mu.Lock()
+	defer c.ops.mu.Unlock()
+	c.ops.deletedCalls = append(c.ops.deletedCalls, v)
+}
+
+func (c *fakeCounter) Inc()                             { c.Add(1) }
+func (c *fakeCounter) Desc() *prometheus.Desc           { return nil }
+func (c *fakeCounter) Write(*dto.Metric) error          { return nil }
+func (c *fakeCounter) Describe(chan<- *prometheus.Desc) {}
+func (c *fakeCounter) Collect(chan<- prometheus.Metric) {}
+
+type fakeGauge struct {
+	ops *fakeOps
+}
+
+func (g *fakeGauge) Set(v float64) {
+	g.ops.mu.Lock()
+	defer g.ops.mu.Unlock()
+	g.ops.lagCallsSeconds = append(g.ops.lagCallsSeconds, v)
+}
+
+func (g *fakeGauge) Inc()                             {}
+func (g *fakeGauge) Dec()                             {}
+func (g *fakeGauge) Add(float64)                      {}
+func (g *fakeGauge) Sub(float64)                      {}
+func (g *fakeGauge) SetToCurrentTime()                {}
+func (g *fakeGauge) Desc() *prometheus.Desc           { return nil }
+func (g *fakeGauge) Write(*dto.Metric) error          { return nil }
+func (g *fakeGauge) Describe(chan<- *prometheus.Desc) {}
+func (g *fakeGauge) Collect(chan<- prometheus.Metric) {}
+
+// Compile-time witness: fakeOps satisfies Ops so the production
+// wiring can pass *wire.OpsMetrics and tests can pass *fakeOps
+// without an adapter.
+var _ Ops = (*fakeOps)(nil)
+
+// TestRunOnce_ObservesMetricsOnSuccess pins the happy-path metric
+// contract: a successful RunOnce that deletes 42 rows must fire
+// AuditEventsDeleted().Add(42) AND AuditEventsRetentionLag().Set
+// (with cutoffDays × 24h as the lag). ADR-091 D20.3 / PR-B residual.
+func TestRunOnce_ObservesMetricsOnSuccess(t *testing.T) {
+	f := &fakeStore{
+		deleteFunc: func(_ time.Time) (int64, error) { return 42, nil },
+	}
+	ops := &fakeOps{}
+	fixedNow := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	c := New(Params{
+		Store:      f,
+		CutoffDays: 30,
+		Now:        func() time.Time { return fixedNow },
+		Ops:        ops,
+	})
+
+	if _, err := c.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	ops.mu.Lock()
+	defer ops.mu.Unlock()
+	if got := len(ops.deletedCalls); got != 1 {
+		t.Fatalf("AuditEventsDeleted.Add calls = %d, want 1", got)
+	}
+	if ops.deletedCalls[0] != 42 {
+		t.Errorf("AuditEventsDeleted.Add[0] = %v, want 42", ops.deletedCalls[0])
+	}
+	if got := len(ops.lagCallsSeconds); got != 1 {
+		t.Fatalf("AuditEventsRetentionLag.Set calls = %d, want 1", got)
+	}
+	wantLag := 30 * 24 * time.Hour
+	if got := time.Duration(ops.lagCallsSeconds[0] * float64(time.Second)); got != wantLag {
+		t.Errorf("AuditEventsRetentionLag.Set[0] = %v, want %v", got, wantLag)
+	}
+}
+
+// TestRunOnce_ObservesLagButNotDeletedWhenZero pins the asymmetric
+// contract: a successful pass that prunes NOTHING still fires
+// AuditEventsRetentionLag (so the gauge reflects "the loop
+// is alive"), but does NOT fire AuditEventsDeleted (so the
+// counter doesn't tick up on idle days). The asymmetry is the
+// load-bearing behaviour for the runbook's "is the loop running
+// AND is it making progress" question — a pinned-zero gauge plus
+// a non-zero counter is healthy; a pinned-zero gauge plus a
+// pinned-zero counter is a red flag.
+func TestRunOnce_ObservesLagButNotDeletedWhenZero(t *testing.T) {
+	f := &fakeStore{
+		deleteFunc: func(_ time.Time) (int64, error) { return 0, nil },
+	}
+	ops := &fakeOps{}
+	c := New(Params{Store: f, Ops: ops})
+
+	if _, err := c.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	ops.mu.Lock()
+	defer ops.mu.Unlock()
+	if got := len(ops.deletedCalls); got != 0 {
+		t.Errorf("AuditEventsDeleted calls = %d, want 0 (idle pass must NOT bump the counter)", got)
+	}
+	if got := len(ops.lagCallsSeconds); got != 1 {
+		t.Fatalf("AuditEventsRetentionLag calls = %d, want 1", got)
+	}
+}
+
+// TestRunOnce_DoesNotObserveOnError pins that BOTH metric calls
+// are skipped when DeleteOldEvents returns an error. A failed
+// pass must not leave a stale lag value on the gauge (the next
+// successful pass overwrites it), and must not bump the delete
+// counter (the row count came back as 0 anyway).
+func TestRunOnce_DoesNotObserveOnError(t *testing.T) {
+	sentinel := errors.New("delete failed")
+	f := &fakeStore{
+		deleteFunc: func(_ time.Time) (int64, error) { return 0, sentinel },
+	}
+	ops := &fakeOps{}
+	c := New(Params{
+		Store: f,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Ops:   ops,
+	})
+
+	if _, err := c.RunOnce(context.Background()); !errors.Is(err, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", err, sentinel)
+	}
+
+	ops.mu.Lock()
+	defer ops.mu.Unlock()
+	if got := len(ops.deletedCalls); got != 0 {
+		t.Errorf("AuditEventsDeleted calls = %d, want 0 (failed pass must not bump)", got)
+	}
+	if got := len(ops.lagCallsSeconds); got != 0 {
+		t.Errorf("AuditEventsRetentionLag calls = %d, want 0 (failed pass must not bump)", got)
+	}
+}
+
+// TestNew_NilOpsDisablesMetricPath pins that an Ops-less Cleanup
+// runs without panicking. This is the unit-test default — the
+// existing 7 tests above use New(Params{Store: f}) with no Ops
+// and must continue to work. The test pins the behaviour so a
+// future change that adds a mandatory Ops check breaks the
+// existing test suite at the same time.
+func TestNew_NilOpsDisablesMetricPath(t *testing.T) {
+	f := &fakeStore{
+		deleteFunc: func(_ time.Time) (int64, error) { return 7, nil },
+	}
+	c := New(Params{Store: f}) // Ops nil on purpose
+
+	deleted, err := c.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if deleted != 7 {
+		t.Errorf("deleted = %d, want 7", deleted)
+	}
+}
