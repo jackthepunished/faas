@@ -58,6 +58,15 @@ type githubSnippetEnv struct {
 	// Runner is true when both env vars are present; controls whether
 	// the snippet emits concrete values or `${{ github.* }}` expressions.
 	Runner bool
+
+	// ConcreteRepository / ConcreteSHA are per-field overrides set
+	// by the CLI when the customer passes --repo or --ref. They take
+	// precedence over the Runner env state on a field-by-field basis
+	// so a customer can override one without blanking the other. The
+	// renderer uses them as `repoExpr = env.ConcreteRepository`
+	// (when non-empty) regardless of env.Runner.
+	ConcreteRepository string
+	ConcreteSHA        string
 }
 
 // detectGithubSnippetEnv reads the runner env. The two GITHUB_REPOSITORY
@@ -99,6 +108,16 @@ func renderGithubSnippet(env githubSnippetEnv, app, pinnedSHA string) string {
 	if env.Runner {
 		repoExpr = env.Repository
 		refExpr = env.SHA
+	}
+	// Per-field concrete overrides: when the customer passes --repo
+	// or --ref, that single field flips to its concrete value
+	// regardless of the Runner env state (the field-by-field CLI
+	// shape advertised in cmdDeployGithubSnippet's docstring).
+	if env.ConcreteRepository != "" {
+		repoExpr = env.ConcreteRepository
+	}
+	if env.ConcreteSHA != "" {
+		refExpr = env.ConcreteSHA
 	}
 
 	// Action reference + pin comment. The `uses:` line picks `@v1` by
@@ -182,18 +201,17 @@ func cmdDeployGithubSnippet(args []string) int {
 		return 1
 	}
 	env := detectGithubSnippetEnv()
-	if *repo != "" || *ref != "" {
-		// CLI overrides beat env detection. Mirror the field-by-field
-		// shape so a customer can override one without the other.
-		if *repo != "" {
-			env.Repository = *repo
-		}
-		if *ref != "" {
-			env.SHA = *ref
-		}
-		// Disable the `${{ github.* }}` fallback so the concrete
-		// values win. The customer said "use these"; honor it.
-		env.Runner = true
+	// CLI overrides beat env detection on a field-by-field basis so a
+	// customer can override one without blanking the other. Setting
+	// `Runner=true` here would force BOTH fields concrete, blanking
+	// whichever side wasn't passed; we instead record the per-field
+	// concrete value (env.ConcreteRepository / env.ConcreteSHA) and
+	// let the renderer apply each independently.
+	if *repo != "" {
+		env.ConcreteRepository = *repo
+	}
+	if *ref != "" {
+		env.ConcreteSHA = *ref
 	}
 	_, _ = fmt.Fprint(osStdout, renderGithubSnippet(env, *app, *pinnedSHA))
 	return 0

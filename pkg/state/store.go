@@ -936,6 +936,14 @@ type Store interface {
 	// call CountDeployedApps before this method (that's the bug).
 	CreateAppIfUnderQuota(ctx context.Context, app App, limits api.Limits) (App, error)
 	AppByID(ctx context.Context, id string) (App, error)
+	// PreviewAppsByParent (ADR-094 / issue #272) lists every
+	// preview app whose preview_of_slug matches the parent. Used
+	// by the dashboard's "preview environments" pane and the
+	// schedd's teardown janitor (cmd/schedd/janitor_preview.go,
+	// PR-C). Results are ordered by created_at DESC so the
+	// dashboard's newest-first display is free. Returns an empty
+	// slice (not an error) when the parent has no previews.
+	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and

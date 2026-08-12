@@ -2092,6 +2092,31 @@ func (m *MemStore) AppBySlug(_ context.Context, slug string) (App, error) {
 	return App{}, ErrNotFound
 }
 
+// PreviewAppsByParent (ADR-094 / issue #272) is the MemStore mirror
+// of PgStore.PreviewAppsByParent. Walks the in-memory map under the
+// same lock as CreateApp / AppByID / ListApps. Returns an empty slice
+// (not an error) when no previews exist for the parent — the
+// dashboard's preview pane projects the empty list as "no previews
+// yet", matching the MemStore zero-value convention everywhere else.
+func (m *MemStore) PreviewAppsByParent(_ context.Context, accountID, parentSlug string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.AccountID != accountID || a.PreviewOfSlug != parentSlug || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	// Stable sort: newest first. matches the pgstore ORDER BY
+	// created_at DESC. Tests that assert on row order should not
+	// depend on map iteration randomness.
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 func (m *MemStore) ListApps(_ context.Context, accountID string) ([]App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
