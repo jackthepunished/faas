@@ -123,10 +123,10 @@ groups:
       - record: faas_gateway_request_rate_3d_baseline:by_route
         expr: |
           avg_over_time(
-            sum by (app, route) (rate(gateway_requests_total[5m]))[3d:5m]
+            sum by (app, route) (rate(gateway_requests_by_route_total[5m]))[3d:5m]
           )
       - record: faas_gateway_request_rate_5m:by_route
-        expr: sum by (app, route) (rate(gateway_requests_total[5m]))
+        expr: sum by (app, route) (rate(gateway_requests_by_route_total[5m]))
       - record: faas_gateway_request_rate_ratio:by_route
         expr: |
           faas_gateway_request_rate_5m:by_route
@@ -134,17 +134,17 @@ groups:
           clamp_min(faas_gateway_request_rate_3d_baseline:by_route, 0.001)
       - record: faas_gateway_error_rate_5m:by_route
         expr: |
-          sum by (app, route) (rate(gateway_request_failures_total[5m]))
+          sum by (app, route) (rate(gateway_request_failures_by_route_total[5m]))
           /
           clamp_min(
-            sum by (app, route) (rate(gateway_requests_total[5m])),
+            sum by (app, route) (rate(gateway_requests_by_route_total[5m])),
             0.001
           )
       - record: faas_gateway_p95_seconds:by_route
         expr: |
           histogram_quantile(
             0.95,
-            sum by (app, route, le) (rate(gateway_request_duration_seconds_bucket[5m]))
+            sum by (app, route, le) (rate(gateway_request_duration_by_route_seconds_bucket[5m]))
           )
 
   - name: faas_slo
@@ -315,7 +315,7 @@ groups:
       # ─────────────────────────────────────────────────────────────────
       - alert: FaasApiAvailabilityLow
         expr: |
-          (sum(rate(gateway_requests_by_route_total{code=~"2.."}[5m]))
+          (sum(rate(gateway_requests_total{code=~"2.."}[5m]))
             /
           sum(rate(gateway_requests_total[5m])))
             < 0.995
