@@ -121,6 +121,49 @@ func TestInternalRoutesHandler_NilLookupReturns503(t *testing.T) {
 	}
 }
 
+// TestInternalRoutesHandler_MissingRoutesSuffix404 guards against
+// the prefix-match trap: ServeMux mounts the handler at the prefix
+// /v1/internal/apps/, so a request to /v1/internal/apps/foo (no
+// /routes suffix) reaches this handler. Before the trim-validator
+// it returned 200 with foo's routes; now it 404s so a typo can't
+// silently leak another app's labels through the loopback surface.
+func TestInternalRoutesHandler_MissingRoutesSuffix404(t *testing.T) {
+	h := &gateway.Handler{}
+	set := h.RouteSetForTest("app-1")
+	set.AdmitForTest("GET /users")
+	// Lookup returns the same app the prefix would have
+	// addressed — proves the test exercises the "wrong but
+	// would-have-answered" path, not the lookup miss path.
+	lookup := gateway.ResolveSlugFn(func(slug string) (string, bool) {
+		if slug == "foo" {
+			return "app-1", true
+		}
+		return "", false
+	})
+	srv := httptest.NewServer(internalRoutesHandler(h, lookup, nil))
+	defer srv.Close()
+
+	// No /routes suffix → must NOT serve foo's routes.
+	resp, err := http.Get(srv.URL + "/v1/internal/apps/foo")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (prefix without /routes must 404)", resp.StatusCode)
+	}
+
+	// Trailing junk after /routes → also 404.
+	resp2, err := http.Get(srv.URL + "/v1/internal/apps/foo/routes/extra")
+	if err != nil {
+		t.Fatalf("GET extra: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (extra path after /routes must 404)", resp2.StatusCode)
+	}
+}
+
 func contains(xs []string, want string) bool {
 	for _, x := range xs {
 		if x == want {

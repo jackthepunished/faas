@@ -568,7 +568,7 @@ func LoadServerTLSConfigWithReload(prefix, certPath, keyPath, caPath string, rel
 	if err != nil {
 		return nil, err
 	}
-	setReloadCallbacks(cfg, reload)
+	setServerReloadCallback(cfg, reload)
 	return cfg, nil
 }
 
@@ -591,7 +591,7 @@ func LoadServerTLSConfigWithPrefixAndVerifierAndReload(prefix, certPath, keyPath
 	if err := setVerifyHook(cfg, v); err != nil {
 		return nil, err
 	}
-	setReloadCallbacks(cfg, reload)
+	setServerReloadCallback(cfg, reload)
 	return cfg, nil
 }
 
@@ -613,7 +613,7 @@ func LoadClientTLSConfigWithReload(prefix, certPath, keyPath, caPath string, rel
 	if err != nil {
 		return nil, err
 	}
-	setReloadCallbacks(cfg, reload)
+	setClientReloadCallback(cfg, reload)
 	return cfg, nil
 }
 
@@ -630,32 +630,27 @@ func LoadClientTLSConfigWithPrefixAndVerifierAndReload(prefix, certPath, keyPath
 	if err := setVerifyHook(cfg, v); err != nil {
 		return nil, err
 	}
-	setReloadCallbacks(cfg, reload)
+	setClientReloadCallback(cfg, reload)
 	return cfg, nil
 }
 
-// setReloadCallbacks installs the per-handshake stdlib callbacks
-// that re-read cert material on every TLS handshake.
+// setServerReloadCallback installs ONLY the server-side per-handshake
+// reload hook: tls.Config.GetConfigForClient. The client-side hook
+// (GetClientCertificate) is intentionally left untouched — stdlib
+// never consults it for a server config, so leaving the field nil
+// pins the role and removes a dead-code path that the previous
+// single-helper version installed for both factories.
 //
-// The Go stdlib naming convention is confusing here:
-//   - GetConfigForClient is the SERVER callback (returns the
-//     config the server uses for an incoming client connection).
-//   - GetClientCertificate is the CLIENT callback (returns the
-//     leaf cert when the server requests client auth). Stdlib
-//     does NOT expose a "full per-handshake client config"
-//     callback — only the leaf can rotate per-handshake; the
-//     RootCAs pool is fixed at construction.
-//
-// A nil cfg or nil reload is a no-op: no callbacks installed,
-// the returned config behaves like the original factory output.
-// This matches the nil-tolerance pattern set by setVerifyHook.
+// A nil cfg or nil reload is a no-op: no callback installed, the
+// returned config behaves like the original factory output. Matches
+// the nil-tolerance pattern set by setVerifyHook.
 //
 // Helper-private so the only canonical installation point is the
-// Load*TLSConfigWithReload factory family — a side-channel
+// Load*ServerTLSConfigWithReload factory family — a side-channel
 // SetReload(cfg, reload) helper would let callers splice the
-// callback onto a *tls.Config built elsewhere and bypass the
-// factory verification (mode checks, prefix error naming).
-func setReloadCallbacks(cfg *tls.Config, reload ReloadFunc) {
+// callback onto a *tls.Config built elsewhere and bypass the factory
+// verification (mode checks, prefix error naming).
+func setServerReloadCallback(cfg *tls.Config, reload ReloadFunc) {
 	if cfg == nil || reload == nil {
 		return
 	}
@@ -665,6 +660,28 @@ func setReloadCallbacks(cfg *tls.Config, reload ReloadFunc) {
 	// rotated leaf + ClientCAs pool on every handshake.
 	cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		return reload()
+	}
+}
+
+// setClientReloadCallback installs ONLY the client-side per-handshake
+// reload hook: tls.Config.GetClientCertificate. The server-side hook
+// (GetConfigForClient) is intentionally left untouched — stdlib
+// never consults it for a client config, so leaving the field nil
+// pins the role and removes a dead-code path that the previous
+// single-helper version installed for both factories.
+//
+// A nil cfg or nil reload is a no-op: no callback installed, the
+// returned config behaves like the original factory output. Matches
+// the nil-tolerance pattern set by setVerifyHook.
+//
+// Helper-private so the only canonical installation point is the
+// Load*ClientTLSConfigWithReload factory family. Mirrors
+// setServerReloadCallback's role-distinguished split (PR review
+// finding on pkg/wire/grpc.go setReloadCallbacks — installing the
+// wrong-role callback is dead code on each branch).
+func setClientReloadCallback(cfg *tls.Config, reload ReloadFunc) {
+	if cfg == nil || reload == nil {
+		return
 	}
 	// Client callback: stdlib calls this on every client-side
 	// handshake where the server requests a certificate. Only

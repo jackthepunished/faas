@@ -848,6 +848,15 @@ func TestTLSLoadersWithReload_NilReloadDegradesToNoCallback(t *testing.T) {
 // to the handshake path. The verification chain (chain / SAN / EKU)
 // is stdlib's responsibility — we only pin that the callback fires
 // and the returned config carries the loader-built cert material.
+//
+// Regression guard (pkg/wire/grpc.go setReloadCallbacks refactor):
+// the previous single-helper version installed BOTH GetConfigForClient
+// AND GetClientCertificate on every config regardless of role. The
+// server-side field GetClientCertificate is dead code on a server
+// config (stdlib never consults it), so the corrected factory
+// (setServerReloadCallback) leaves it nil. If a future change
+// reinstalls the dual-install, this test fails the
+// "server GetClientCertificate = nil" assertion below.
 func TestTLSLoadersWithReload_ServerInstallsGetConfigForClient(t *testing.T) {
 	pki := newTestPKI(t)
 
@@ -867,8 +876,8 @@ func TestTLSLoadersWithReload_ServerInstallsGetConfigForClient(t *testing.T) {
 	if cfg.GetConfigForClient == nil {
 		t.Fatal("GetConfigForClient = nil, want non-nil")
 	}
-	if cfg.GetClientCertificate == nil {
-		t.Fatal("GetClientCertificate = nil, want non-nil (setReloadCallbacks installs both)")
+	if cfg.GetClientCertificate != nil {
+		t.Fatal("GetClientCertificate != nil on server config: setServerReloadCallback must leave it untouched (stdlib only consults it for client configs)")
 	}
 
 	// Fire the callback. With pki as the material, the returned
@@ -905,6 +914,11 @@ func TestTLSLoadersWithReload_ServerInstallsGetConfigForClient(t *testing.T) {
 // than panic — stdlib would convert a nil *tls.Certificate into a
 // confusing handshake failure, the explicit error makes the operator's
 // job easier.
+//
+// Mirrors the regression guard above: setClientReloadCallback leaves
+// GetConfigForClient untouched on a client config (stdlib never
+// consults it). Pinning the nil here catches a future re-introduction
+// of the dual-install pattern.
 func TestTLSLoadersWithReload_ClientInstallsGetClientCertificate(t *testing.T) {
 	pki := newTestPKI(t)
 
@@ -920,6 +934,9 @@ func TestTLSLoadersWithReload_ClientInstallsGetClientCertificate(t *testing.T) {
 	}
 	if cfg.GetClientCertificate == nil {
 		t.Fatal("GetClientCertificate = nil, want non-nil")
+	}
+	if cfg.GetConfigForClient != nil {
+		t.Fatal("GetConfigForClient != nil on client config: setClientReloadCallback must leave it untouched (stdlib only consults it for server configs)")
 	}
 
 	cert, err := cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
@@ -1002,9 +1019,26 @@ func TestTLSLoadersWithReload_ReloadErrorPropagates(t *testing.T) {
 
 // TestTLSLoadersWithReloadAndVerifier_BothHooksInstalled pins the
 // composed contract: a non-nil verifier AND a non-nil reload installs
-// BOTH the VerifyPeerCertificate hook AND the reload callbacks on the
-// same *tls.Config. This is the production cmd/<daemon> call-site
-// shape after PR-E.
+// BOTH the VerifyPeerCertificate hook AND the role-appropriate
+// reload callback on the same *tls.Config. This is the production
+// cmd/<daemon> call-site shape after PR-E.
+//
+// Regression guard (pkg/wire/grpc.go setReloadCallbacks refactor):
+// the previous single-helper version installed BOTH
+// GetConfigForClient (server callback) AND GetClientCertificate
+// (client callback) on every config regardless of role. The fixed
+// helpers (setServerReloadCallback / setClientReloadCallback) split
+// by role, so:
+//
+//   - server configs must have GetConfigForClient installed and
+//     GetClientCertificate MUST stay nil (stdlib never consults
+//     it for a server);
+//   - client configs must have GetClientCertificate installed and
+//     GetConfigForClient MUST stay nil (stdlib never consults it
+//     for a client).
+//
+// If a future change re-installs the dual-install on both roles,
+// the two negative assertions below fail.
 func TestTLSLoadersWithReloadAndVerifier_BothHooksInstalled(t *testing.T) {
 	pki := newTestPKI(t)
 
@@ -1023,10 +1057,10 @@ func TestTLSLoadersWithReloadAndVerifier_BothHooksInstalled(t *testing.T) {
 		t.Error("VerifyPeerCertificate = nil, want non-nil (verifier installed)")
 	}
 	if srv.GetConfigForClient == nil {
-		t.Error("GetConfigForClient = nil, want non-nil (reload installed)")
+		t.Error("GetConfigForClient = nil, want non-nil (server reload installed)")
 	}
-	if srv.GetClientCertificate == nil {
-		t.Error("GetClientCertificate = nil, want non-nil (reload installed)")
+	if srv.GetClientCertificate != nil {
+		t.Error("server GetClientCertificate != nil: server config must not carry the client-side callback (stdlib only consults it for client configs)")
 	}
 
 	cli, err := LoadClientTLSConfigWithPrefixAndVerifierAndReload(
@@ -1039,7 +1073,10 @@ func TestTLSLoadersWithReloadAndVerifier_BothHooksInstalled(t *testing.T) {
 		t.Error("VerifyPeerCertificate = nil, want non-nil (verifier installed)")
 	}
 	if cli.GetClientCertificate == nil {
-		t.Error("GetClientCertificate = nil, want non-nil (reload installed)")
+		t.Error("GetClientCertificate = nil, want non-nil (client reload installed)")
+	}
+	if cli.GetConfigForClient != nil {
+		t.Error("client GetConfigForClient != nil: client config must not carry the server-side callback (stdlib only consults it for server configs)")
 	}
 }
 

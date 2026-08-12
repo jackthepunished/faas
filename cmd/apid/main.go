@@ -226,6 +226,39 @@ func resolveMetricsAddr(getenv func(string) string, tomlDefault string) string {
 	return v
 }
 
+// gatewaydControlURLDefault is the loopback URL apid dials when
+// FAAS_GATEWAYD_CONTROL_URL is unset. Mirrors gatewayd-internal's
+// default ControlAddr (cmd/gatewayd-internal/config.go:181
+// 127.0.0.1:9090, scheme added). Same-box is the only supported
+// posture today; cross-box deployments override via the env
+// var. Extracted to a const so goconst pins it to one occurrence
+// (the helpers below + the server field comment at
+// cmd/apid/server.go:58 cite the same literal).
+const gatewaydControlURLDefault = "http://127.0.0.1:9090"
+
+// resolveGatewaydControlURL reads FAAS_GATEWAYD_CONTROL_URL via
+// the test seam (deps.getenv) and applies the loopback default
+// when the env value is empty. Same shape as resolveMetricsAddr
+// — the test seam keeps macOS-dev + CI from trying to dial a
+// real gatewayd unless the test opted in via WithGatewaydControlURL,
+// and the default keeps a same-box prod install from bricking
+// the per-route surface just because the operator never exported
+// the env var.
+//
+// Distinction from resolveMetricsAddr: there is no explicit-empty
+// "disable" semantic for FAAS_GATEWAYD_CONTROL_URL. The dial
+// surface either works (operator wired it OR default loopback
+// reachable) or the upstream dial fails and getAppRoutes renders
+// the unavailable state — there is no third "operator opted out
+// of the surface entirely" position.
+func resolveGatewaydControlURL(getenv func(string) string) string {
+	v := getenv("FAAS_GATEWAYD_CONTROL_URL")
+	if v == "" {
+		return gatewaydControlURLDefault
+	}
+	return v
+}
+
 // resolveAdvisorySock reads FAAS_APID_ADVISORY_SOCK via the test
 // seam (deps.getenv). Empty string disables the listener. Tests
 // disable by default (their getenv stub returns "" for unknown
@@ -1049,15 +1082,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// ADR-093: gatewayd-internal control-listener URL for the
 	// per-route observability reader. Default
 	// http://127.0.0.1:9090 matches gatewayd-internal's default
-	// control bind (pkg/gateway/control.go ControlAddr). Production
-	// overrides via FAAS_GATEWAYD_CONTROL_URL when the daemons
-	// are split across nodes; same-box is the only supported
-	// posture today (cross-box will need an mTLS-terminating
-	// reverse-proxy — out of scope for this PR). Empty disables
-	// the /v1/apps/{slug}/routes surface; getAppRoutes renders
-	// the unavailable state so the dashboard can distinguish
-	// "operator hasn't wired it" from "no traffic yet".
-	srv.WithGatewaydControlURL(deps.getenv("FAAS_GATEWAYD_CONTROL_URL"))
+	// control bind (cmd/gatewayd-internal/config.go ControlAddr,
+	// default 127.0.0.1:9090). Production overrides via
+	// FAAS_GATEWAYD_CONTROL_URL when the daemons are split across
+	// nodes; same-box is the only supported posture today
+	// (cross-box will need an mTLS-terminating reverse-proxy —
+	// out of scope for this PR). Empty string disables the
+	// /v1/apps/{slug}/routes surface; getAppRoutes renders the
+	// unavailable state so the dashboard can distinguish
+	// "operator hasn't wired it" from "no traffic yet". The
+	// unresolved env value is what the test seam surfaces
+	// (TestAppRoutes_MissingURLRendersUnavailable pins the empty
+	// contract); main() always applies the default at boot so a
+	// same-box install doesn't brick the per-route surface just
+	// because the operator never exported the env var.
+	srv.WithGatewaydControlURL(resolveGatewaydControlURL(deps.getenv))
 
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
