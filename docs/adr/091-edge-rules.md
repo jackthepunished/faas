@@ -810,3 +810,96 @@ rows that close the observability gap.
 7. **Pre-fix redox proof** — captured in the PR description (counter
    call-site walkthrough for a JWT-failed request; compile-error
    walkthrough for a malformed `match_path` rule).
+
+## CORS improvements (one-PR follow-up)
+
+A single follow-up PR lands six changes that build on the §D1–D19
+decisions above. None of them are spec deviations; each is an
+ergonomic widening of the surfaces introduced here. The cluster is
+intentionally scoped as one PR (per the implementation plan's
+`One big PR` decision) because every change references the same
+allowlist grammar; splitting risks landing inconsistent validators.
+
+### D20 — Subdomain / port wildcard grammar
+
+`EdgeRuleCORSAction.AllowOrigins` now accepts three wildcard shapes
+in addition to literal origins and the bare `*`:
+
+- `https://*.example.com` — subdomain wildcard (`*` is a single
+  left-most host label).
+- `https://localhost:*` and `https://api.example.com:*` — port
+  wildcard (`*` is the complete port).
+- A regex constant `api.CorsOriginPattern` enforces the grammar at
+  create-time; the gateway hot path runs the same predicates in
+  `pkg/gateway/handler.go::matchOrigin` so a rule that bypasses
+  apid-Validate still matches what the customer expects (defence in
+  depth).
+
+The bare `*`+credentials footgun guard (D12) is unchanged; only the
+bare `*` entry trips it. A subdomain-wildcard entry expands to a
+concrete origin at request time, so browsers permit credentials for
+it.
+
+### D21 — Per-app default CORS
+
+`apps` gains two columns:
+
+- `cors_default_enabled boolean NOT NULL DEFAULT false`
+- `cors_default_origins text[]` (nullable; coalesce to `'{}'` on read)
+
+When `cors_default_enabled` is true and no explicit `kind=cors`
+edge rule matches a request, the gateway stamps a soft CORS header
+set derived from `cors_default_origins`. The default is opt-in (no
+silent stamp on legacy rows), uses the same `matchOrigin` matcher
+the rule path uses (no parallel implementation), and **skips** the
+OPTIONS short-circuit (the customer's backend remains authoritative
+for the preflight answer; the gateway only stamps response headers).
+
+The validator on PATCH `/v1/apps/{slug}` requires a non-empty
+`cors_default_origins` when `cors_default_enabled` is true —
+silently accepting an empty allowlist would leave the customer with
+an opt-in flag that stamps nothing. Migration slot: 00215 (with
+00216 reserved as a fence per the cross-PR slot pattern).
+
+### D22 — Default-fallback placement in applyEdgeRuleCORS
+
+The fallback runs **inside** `applyEdgeRuleCORS`, immediately after
+the existing `MatchCORS` miss path. Pipeline order preserved:
+`kind=cors` rule → per-app default fallback → JWT → IP. No audit
+emit on the default path (it's a miss with a stamp, not a rule fire).
+
+### D23 — Typed SDK helper
+
+A new `pkg/api.CreateCORSEdgeRule(ctx, slug, opts)` packs the
+`EdgeRuleCORSAction` JSON, pins `kind="cors"`, and applies
+priority / max-age defaults the dashboard uses. Customers who want
+the full edge-rule power (priority, enable/disable, multi-host)
+still go through `CreateEdgeRule` directly; the helper is a thin
+ergonomic shim, not a parallel wire surface. Node + Python SDKs
+pick up the same shape via `make sdk-gen` (they read the kebab
+POST from OpenAPI directly).
+
+### D24 — CLI subcommand `gregale cors`
+
+`cmd/gregale/commands_cors.go` adds `cors allow|ls|rm|show` as a
+thin shim over the SDK helper. Same dispatch shape as
+`gregale edge-rules` (parent / subcommand / suggest-on-typo).
+Origins are validated against `api.CorsOriginPattern` locally so a
+common typo fails fast without a round-trip.
+
+### D25 — Hygiene bundle
+
+- `MaxAgeSeconds` cap at 86400 (24 h). Browsers ignore larger
+  values; the gateway was happily stamping
+  `Access-Control-Max-Age: 2147483647` before the cap.
+- Case-insensitive comparison on scheme + host in `matchOrigin`
+  (RFC 6454 §3). The request `Origin` is lowercased before
+  comparison; the echoed allowlist entry carries the lowercased
+  form.
+- `pkg/api/errors.go::ErrCORSOriginNotAllowed` gains a doc comment
+  noting it's exported for apid test fixtures and future per-app
+  audit emit; it's still not consumed on the gateway hot path
+  (origin rejection stays silent).
+- `cmd/e2e/edge_rules_cors_e2e_test.go` gains a `*+credentials`
+  reject case so the footgun guard is e2e-covered (it was
+  unit-tested in `cmd/apid/handlers_edge_rules_test.go` only).

@@ -1131,6 +1131,79 @@ func (c *Client) DeleteEdgeRule(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/edge-rules/"+id, nil, nil)
 }
 
+// CreateCORSEdgeRuleOpts is the typed CORS convenience shape used by
+// CreateCORSEdgeRule (CORS improvements D5). Every field maps 1:1 to
+// an EdgeRuleCORSAction field; the helper below packs them into a
+// CreateEdgeRuleRequest with Kind="cors" so the customer-side SDK
+// surface doesn't expose the kind/action union. Node + Python SDKs
+// get the same shape via `make sdk-gen` (they read the kebab-style
+// POST directly from OpenAPI — no parallel typed helper there).
+//
+// Priority defaults to 100 when zero (the gateway's middle bucket,
+// matching the validator-side default on CreateEdgeRuleRequest).
+// MaxAgeSeconds defaults to 600 (10 min — within the 24h cap
+// EdgeRuleCORSAction.Validate enforces server-side). AllowOrigins
+// must be non-empty; passing an empty slice returns an error before
+// the HTTP round-trip so the customer gets a synchronous signal
+// rather than a 422.
+type CreateCORSEdgeRuleOpts struct {
+	MatchHost        string
+	MatchPath        string
+	MatchMethods     []string
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
+	AllowCredentials bool
+	MaxAgeSeconds    int
+}
+
+// CreateCORSEdgeRule attaches a CORS-kind edge rule to the slug's
+// app (CORS improvements D5). It is a thin wrapper around
+// CreateEdgeRule that builds the EdgeRuleCORSAction JSON payload
+// and pins the kind to "cors" so callers don't have to assemble
+// the action blob themselves. Plan gate (402 plan_edge_rule_kind_not_allowed)
+// and per-app quota (402 plan_limit_edge_rules) still surface
+// from the underlying CreateEdgeRule — the helper adds zero
+// behaviour beyond action-blob construction.
+func (c *Client) CreateCORSEdgeRule(ctx context.Context, slug string, opts CreateCORSEdgeRuleOpts) (EdgeRuleResponse, error) {
+	if len(opts.AllowOrigins) == 0 {
+		var zero EdgeRuleResponse
+		return zero, errors.New("CreateCORSEdgeRule: AllowOrigins must be non-empty")
+	}
+	if opts.MatchHost == "" {
+		var zero EdgeRuleResponse
+		return zero, errors.New("CreateCORSEdgeRule: MatchHost is required (use the app's primary domain)")
+	}
+	priority := 100
+	action := EdgeRuleCORSAction{
+		AllowOrigins:     opts.AllowOrigins,
+		AllowMethods:     opts.AllowMethods,
+		AllowHeaders:     opts.AllowHeaders,
+		ExposeHeaders:    opts.ExposeHeaders,
+		AllowCredentials: opts.AllowCredentials,
+		MaxAgeSeconds:    opts.MaxAgeSeconds,
+	}
+	if action.MaxAgeSeconds == 0 {
+		action.MaxAgeSeconds = 600
+	}
+	raw, err := json.Marshal(action)
+	if err != nil {
+		var zero EdgeRuleResponse
+		return zero, fmt.Errorf("CreateCORSEdgeRule: marshal action: %w", err)
+	}
+	req := CreateEdgeRuleRequest{
+		MatchHost:    opts.MatchHost,
+		MatchPath:    opts.MatchPath,
+		MatchMethods: opts.MatchMethods,
+		Priority:     &priority,
+		Kind:         "cors",
+		Action:       raw,
+	}
+	var out EdgeRuleResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/edge-rules", req, &out)
+}
+
 // --- Event-driven surface (Move 2) -----------------------------------------
 //
 // The 10 routes exposed under /v1/apps/{slug}/invoke[/async],

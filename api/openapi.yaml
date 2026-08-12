@@ -7206,6 +7206,25 @@ components:
           format: uuid
           example: "00000000-0000-0000-0000-000000000000"
 
+        # CORS improvements D1: per-app default CORS opt-in.
+        # NULL on legacy rows (the customer's apps predated
+        # migration 00215). Non-null true means the gateway is
+        # stamping the default header set on miss; non-null
+        # false means the customer explicitly opted out (the
+        # column was flipped from the schema default).
+        cors_default_enabled:
+          type: [boolean, "null"]
+          example: true
+
+        # CORS improvements D1: per-app default CORS allowlist.
+        # NULL/empty on legacy rows. Wire shape is JSON `[]`
+        # (never null) when the column carries a value so
+        # dashboards can render the list directly.
+        cors_default_origins:
+          type: array
+          items: { type: string }
+          example: ["https://*.example.com"]
+
         # Issue #477 / ADR-077: per-app public-URL auth
         # configuration. Mirrors the read-side
         # PublicAuthStatus shape — `has_basic_creds` is true
@@ -7493,6 +7512,31 @@ components:
           description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist the UUID. 404 on unknown name; 422 on inactive node."
           type: [string, "null"]
           example: "box-eu-1"
+
+        # CORS improvements D1: per-app default CORS opt-in. When
+        # true, every response is stamped with a CORS header set
+        # derived from cors_default_origins whenever no explicit
+        # kind=cors edge rule matches. nil = no change (existing
+        # PATCH semantics); explicit true opts in; explicit false
+        # opts out. The Set-bit in UpdateAppParams distinguishes
+        # "unset" from "explicit flip" so partial-PATCH stays
+        # bit-for-bit additive on the wire.
+        cors_default_enabled:
+          type: [boolean, "null"]
+          example: true
+
+        # CORS improvements D1: per-app default CORS allowlist.
+        # Same grammar as EdgeRuleCORSAction.allow_origins
+        # (literal origin, https://*.host subdomain wildcard,
+        # https://host:* port wildcard, or '*'). When
+        # cors_default_enabled is true the validator requires a
+        # non-empty value (a 422 fires otherwise - silently
+        # accepting an empty allowlist would leave the customer
+        # with an opt-in flag that stamps nothing).
+        cors_default_origins:
+          type: array
+          items: { type: string }
+          example: ["https://*.example.com"]
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -9231,10 +9275,22 @@ components:
       type: object
       required: [allow_origins, allow_methods]
       properties:
+        # CORS improvements D2/D6: allow_origins accepts the
+        # wildcard grammar documented on CorsOriginPattern
+        # in pkg/api/dto.go. Bare '*', literal origin
+        # 'https://host[:port]', subdomain wildcard
+        # 'https://*.host[:port]', and port wildcard
+        # 'https://host:*'. The pattern is the create-time
+        # gate; the gateway hot path runs the same predicates
+        # in matchOrigin so a rule that bypasses apid-Validate
+        # still matches what the customer expects (defence in
+        # depth).
         allow_origins:
           type: array
           minItems: 1
-          items: { type: string }
+          items:
+            type: string
+            pattern: '^(\\*|https?://(?:\\*\\.[a-zA-Z0-9.\\-]+|[a-zA-Z0-9.\\-]+\\*|localhost|\\*)(?::\\*|\\:[0-9]+)?|https?://[a-zA-Z0-9.\\-]+(?::\\*|\\:[0-9]+)?)$'
         allow_methods:
           type: array
           minItems: 1
@@ -9246,7 +9302,11 @@ components:
           type: array
           items: { type: string }
         allow_credentials: { type: boolean, default: false }
-        max_age_seconds: { type: integer, minimum: 0 }
+        # CORS improvements D6: capped at 86400 (24h).
+        # Browsers ignore larger values; the gateway was
+        # happily stamping Access-Control-Max-Age: 2147483647
+        # before the cap. The lower bound is unchanged (>= 0).
+        max_age_seconds: { type: integer, minimum: 0, maximum: 86400 }
 
     EdgeRuleJWTAction:
       description: 'Validates an inbound Bearer JWT against a JWKS endpoint.'

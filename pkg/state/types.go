@@ -647,7 +647,46 @@ type App struct {
 	// customer so they can pin a preview they want to keep. NULL
 	// on production apps.
 	PreviewExpiresAt *time.Time
-	CreatedAt        time.Time
+	// CORSDefaultEnabled is the per-app default CORS opt-in
+	// (ADR-091 CORS improvements D1 / spec §4.1.2.6). When
+	// false (the default for every pre-PR app), the gateway
+	// applies no default CORS and the "no rule → no CORS"
+	// contract is preserved unchanged. When true, the gateway
+	// consults CORSDefaultOrigins for every request that
+	// misses a kind=cors edge rule and stamps
+	// Access-Control-Allow-Origin + Allow-Methods +
+	// Allow-Headers on the response. The OPTIONS
+	// short-circuit is intentionally SKIPPED on the default
+	// path so the customer's backend remains the authority
+	// on the preflight answer. Free on every plan; no
+	// plan gate (per-issue #561 framing — the fallback is
+	// the "just allow my origin" surface that customers
+	// expect from any FaaS).
+	//
+	// Pointer (not plain bool) because the wire
+	// DISTINGUISHES "schema default false" (legacy rows,
+	// pre-PR apps) from "explicit PATCH false"
+	// (customer opted out after enabling once). With a
+	// plain bool both project identically, and the
+	// customer-facing "did I ever turn this on?" question
+	// becomes unanswerable on the wire. nil = never set /
+	// schema default; *true = opt-in; *false = explicit
+	// opt-out. The pgstore layer hydrates legacy rows as
+	// *false so the wire shape collapses schema-default and
+	// opt-out to the same wire value (false) — the
+	// three-way distinction lives only on the write path.
+	CORSDefaultEnabled *bool
+	// CORSDefaultOrigins is the per-app default CORS
+	// allowlist. Same string shape as
+	// edge_rules_cors.allow_origins; the gateway reuses the
+	// matchOrigin matcher verbatim (which is widened in the
+	// same PR to accept subdomain/port wildcards). nil and
+	// an empty slice are both treated as "deny all" by
+	// the gateway. The column is text[] (not jsonb) so the
+	// matcher is reused bit-for-bit; see migration
+	// 00215_apps_cors_defaults.sql for the rationale.
+	CORSDefaultOrigins []string
+	CreatedAt          time.Time
 }
 
 // EvictionPriorityOrBestEffort (issue #475) snaps the empty Go zero
@@ -2413,6 +2452,27 @@ type UpdateAppParams struct {
 	// identity + ON-cascade contract.
 	OverflowNode    *string
 	SetOverflowNode bool
+	// CORSDefaultEnabled is the per-app default CORS opt-in
+	// (ADR-091 CORS improvements D1). SetCORSDefaultEnabled
+	// distinguishes "unset" (don't touch) from "explicit
+	// false" (turn the default off). PATCHing from true →
+	// false is non-destructive: the column is metadata only,
+	// no row is touched on the gateway hot path until the
+	// next request.
+	CORSDefaultEnabled    *bool
+	SetCORSDefaultEnabled bool
+	// CORSDefaultOrigins is the per-app default CORS
+	// allowlist. SetCORSDefaultOrigins distinguishes "unset"
+	// (don't touch) from "explicit empty slice" (clear the
+	// allowlist — back to deny all). The validator
+	// (apid's updateApp handler) rejects nil when
+	// SetCORSDefaultOrigins is true and CORSDefaultEnabled is
+	// nil pointer (we need a value to know whether the
+	// explicit-empty case is intentional or a wire-shape
+	// bug). The column is text[]; the gateway reuses the
+	// matchOrigin matcher verbatim against this list.
+	CORSDefaultOrigins    *[]string
+	SetCORSDefaultOrigins bool
 }
 
 // AppPublicAuthUpdate (issue #477 / ADR-079) is the

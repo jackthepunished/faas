@@ -380,6 +380,35 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			// here and pass it through to the audit-block.
 		}
 	}
+	// CORS improvements D1: per-app default CORS opt-in.
+	// Same grammar as EdgeRuleCORSAction.AllowOrigins
+	// (literal origin, https://*.example.com subdomain
+	// wildcard, https://host:* port wildcard, or '*' —
+	// the latter rejected when AllowCredentials would be
+	// true, which doesn't apply on the default path because
+	// credentials are never set there). The validator
+	// re-uses CorsOriginPattern so a PATCH can never land
+	// a value that the gateway hot path would silently
+	// reject on miss. Opting in with an empty / nil
+	// origins list is a 422 — the customer's stated
+	// intent (default-on) contradicts the empty allowlist
+	// and a 200 there would be a confusing silent no-op.
+	if req.CORSDefaultEnabled != nil && *req.CORSDefaultEnabled {
+		if req.CORSDefaultOrigins == nil || len(*req.CORSDefaultOrigins) == 0 {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeValidation,
+				"Invalid cors_default_origins",
+				"cors_default_origins must be a non-empty list when cors_default_enabled is true")
+		}
+		for _, o := range *req.CORSDefaultOrigins {
+			if !api.CorsOriginPattern.MatchString(o) {
+				return api.NewProblem(http.StatusUnprocessableEntity,
+					api.CodeValidation,
+					"Invalid cors_default_origins",
+					fmt.Sprintf("cors_default_origins entry %q does not match the origin grammar (scheme://host[:port], '*', or 'scheme://*.host[:port]' / 'scheme://host:*')", o))
+			}
+		}
+	}
 	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
 	// Plan-gated upstream: apid returns 402
 	// plan_public_auth_{bearer,basic}_not_allowed when the
@@ -795,6 +824,19 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// wire-format name.
 		OverflowNode:    nilStringPtr(overflowUUID),
 		SetOverflowNode: req.OverflowNode != nil,
+		// CORS improvements D1: per-app default CORS opt-in.
+		// `req.CORSDefaultEnabled != nil` distinguishes
+		// "don't touch" from "explicit flip" so a
+		// RAM-only PATCH never re-stamps the column.
+		// The validator (above) already enforced the
+		// non-empty origins rule when true; the pointer
+		// shape mirrors OverflowNode so a stale PATCH
+		// with nil origins + nil enabled is a clean
+		// no-op on the store.
+		CORSDefaultEnabled:    req.CORSDefaultEnabled,
+		SetCORSDefaultEnabled: req.CORSDefaultEnabled != nil,
+		CORSDefaultOrigins:    req.CORSDefaultOrigins,
+		SetCORSDefaultOrigins: req.CORSDefaultOrigins != nil,
 	}
 	if req.PublicAuth != nil {
 		// params.PublicAuth is unset when req.PublicAuth is

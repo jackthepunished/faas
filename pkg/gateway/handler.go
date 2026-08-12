@@ -129,6 +129,25 @@ type App struct {
 	// the pre-#477 customer behaviour in fakeBackend unit
 	// tests.
 	PublicAuth PublicAuthConfig
+	// CORS improvements D1: per-app default CORS
+	// opt-in. Plumbed from apps.cors_default_enabled
+	// through pgRouter.toApp so applyEdgeRuleCORS
+	// can stamp a soft CORS header set on the
+	// response when no kind=cors rule matches the
+	// host/path. Default-false in fakeBackend unit
+	// tests (the in-memory backend doesn't populate
+	// the column). See spec §4.1.2.6 CORS defaults.
+	CORSDefaultEnabled bool
+	// CORS improvements D1: per-app default CORS
+	// allowlist. Plumbed from apps.cors_default_origins
+	// (text[]) through pgRouter.toApp so the gateway
+	// reuses the same matchOrigin matcher against
+	// this list as against edge_rules_cors.allow_origins.
+	// nil and len==0 are both treated as "deny all"
+	// by the gateway; the apid handler validates that
+	// CORSDefaultEnabled=true ⇒ a non-nil value is
+	// provided.
+	CORSDefaultOrigins []string
 }
 
 // PublicAuthConfig (issue #477 / ADR-079) is the per-app
@@ -1275,6 +1294,23 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("cors", "miss")
 		}
+		// CORS improvements D1/D4: per-app default CORS
+		// fallback. Runs after the kind=cors miss and
+		// before the JWT/IP gates. The OPTIONS
+		// short-circuit is intentionally SKIPPED here —
+		// the customer's backend is the authority on
+		// the preflight answer; the gateway only
+		// stamps response headers. A preflight still
+		// reaches the customer code; the response gets
+		// Allow-Origin + Allow-Methods + Allow-Headers
+		// stamped on the way out.
+		if app.CORSDefaultEnabled && len(app.CORSDefaultOrigins) > 0 {
+			origin := r.Header.Get("Origin")
+			allowedOrigin := matchOrigin(app.CORSDefaultOrigins, origin)
+			if origin != "" && allowedOrigin != "" && rec != nil {
+				rec.installHeaderOps(corsDefaultOps(allowedOrigin))
+			}
+		}
 		return false
 	}
 	if rule.AccountID != app.AccountID {
@@ -1351,20 +1387,116 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 }
 
 // matchOrigin returns the value to stamp in
-// Access-Control-Allow-Origin — either "*" (echo back the wildcard)
-// or the literal origin from the request (if it matches an entry in
-// allowList). Empty string means "no match; do not stamp the
-// header".
+// Access-Control-Allow-Origin — either "*" (echo back the wildcard),
+// a literal origin from the request (if it matches an entry in
+// allowList), or the echoed origin when it matches a
+// subdomain/port-wildcard entry. Empty string means "no match; do
+// not stamp the header".
+//
+// CORS improvements D2/D6:
+//   - Subdomain wildcards: "https://*.example.com" matches
+//     "https://app.example.com" but not
+//     "https://app.sub.example.com" (only one label of wildcard,
+//     no chained "**").
+//   - Port wildcards: "https://localhost:*" matches
+//     "https://localhost:3000" and "https://localhost:8080".
+//   - Case-insensitive on scheme + host (RFC 6454 §3 says origins
+//     are case-insensitive on scheme + host, case-sensitive on
+//     path). Path matching is unchanged: a request Origin of
+//     "https://APP.example.com/Path" still does NOT match an
+//     allowList entry of "https://app.example.com" if the path
+//     component is also part of the comparison (today it isn't —
+//     Origin header has no path).
+//
+// The function is called once per request on the gateway hot path,
+// so it is O(n) over allowList. The corsOriginPattern regex in
+// pkg/api/dto.go validates the allowList entries at create-time;
+// this function is the runtime mirror.
 func matchOrigin(allowList []string, origin string) string {
 	if origin == "" {
 		return ""
 	}
-	for _, a := range allowList {
+	// RFC 6454 §3: scheme + host are case-insensitive.
+	// Lowercase the scheme and host of the request Origin so
+	// "HTTPS://App.Example.COM" matches the
+	// "https://app.example.com" allowlist entry.
+	origin = strings.ToLower(origin)
+	for _, raw := range allowList {
+		a := strings.ToLower(raw)
 		if a == "*" || a == origin {
 			return a
 		}
+		// Subdomain wildcard: "https://*.example.com" → match
+		// any "https://<single-label>.example.com". We split
+		// on "://" so the ".*" pattern only applies to the
+		// host segment, not the scheme.
+		sch, hostSuffix, ok := splitScheme(a)
+		if !ok {
+			continue
+		}
+		rSch, rHost, ok2 := splitScheme(origin)
+		if !ok2 {
+			continue
+		}
+		if sch != rSch {
+			continue
+		}
+		// Subdomain wildcard: "*.<rest>" — match any host
+		// with exactly one extra label prefixed to <rest>.
+		if strings.HasPrefix(hostSuffix, "*.") {
+			suffix := hostSuffix[2:] // strip "*."
+			suffixLabels := strings.Count(suffix, ".")
+			if strings.HasSuffix(rHost, "."+suffix) &&
+				strings.Count(rHost, ".") == suffixLabels+1 {
+				return a // echo the lower-cased allowlist entry
+			}
+		}
+		// Port wildcard: "<host>:*" — match any port.
+		if strings.HasSuffix(hostSuffix, ":*") {
+			prefix := strings.TrimSuffix(hostSuffix, ":*")
+			if strings.HasPrefix(rHost, prefix+":") {
+				return a
+			}
+		}
 	}
 	return ""
+}
+
+// splitScheme is a tiny helper that returns (scheme, "host[:port]")
+// for an origin of the form "scheme://host[:port]". Used by
+// matchOrigin to peel off the scheme before applying the
+// subdomain/port wildcard predicates. Returns false when the input
+// has no "://" separator (which the apid validator rejects at
+// create-time, so this is a runtime guard against a future schema
+// loosening that bypasses apid).
+func splitScheme(origin string) (scheme, rest string, ok bool) {
+	idx := strings.Index(origin, "://")
+	if idx < 0 {
+		return "", "", false
+	}
+	return origin[:idx], origin[idx+3:], true
+}
+
+// corsDefaultOps is the per-app default CORS header op set (CORS
+// improvements D1). Mirrors the shape of corsResponseOps above
+// but is opinionated: the gateway stamps a fixed
+// Allow-Methods (GET, POST, OPTIONS — the methods a CORS client
+// is most likely to need) and Allow-Headers: * (the per-app
+// default is permissive because the customer has opted in
+// to "just allow my origin" — the per-method / per-header
+// surface is what kind=cors edge rules are for). No
+// Allow-Credentials (the default is for uncredentialed
+// cross-origin GETs; a customer wanting credentials adds a
+// kind=cors rule, which takes precedence over the default).
+// The function takes the resolved allowedOrigin (already
+// lower-cased + matched by matchOrigin) so the response
+// always echoes the matched entry verbatim.
+func corsDefaultOps(allowedOrigin string) []EdgeRuleHeaderOp {
+	return []EdgeRuleHeaderOp{
+		{Action: "set", Name: "Access-Control-Allow-Origin", Value: allowedOrigin},
+		{Action: "set", Name: "Access-Control-Allow-Methods", Value: "GET, POST, OPTIONS"},
+		{Action: "set", Name: "Access-Control-Allow-Headers", Value: "*"},
+	}
 }
 
 // corsResponseOps turns a CORS rule + resolved allowedOrigin into the

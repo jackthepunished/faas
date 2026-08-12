@@ -223,6 +223,17 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:    "cors",
+		DocSlug: "cors",
+		Short:   "Configure CORS for an app (allow|ls|rm|show)",
+		Subcommands: []cliSub{
+			{Name: "allow", Short: "Attach a CORS rule to <slug>"},
+			{Name: "ls", Short: "List CORS rules bound to <slug>"},
+			{Name: "rm", Short: "Delete a CORS rule by id"},
+			{Name: "show", Short: "Show per-app default CORS + active rules"},
+		},
+	},
+	{
 		Name:    "crons",
 		DocSlug: "crons",
 		Short:   "Manage scheduled requests",
