@@ -3991,6 +3991,11 @@ func (a *EdgeRuleLimitAction) Validate() *Problem {
 			"limit action: max_body_bytes_streaming (%d) must be >= max_body_bytes (%d) when set — a streaming cap tighter than the buffered cap would 413 every streaming request for a body already accepted as buffered",
 			a.MaxBodyBytesStreaming, a.MaxBodyBytes))
 	}
+	// This `s ≥ b` invariant is consumed at runtime by
+	// pkg/gateway/handler.go::applyEdgeRuleLimit (cap selection).
+	// A direct-DB row that violates it passes the cmd-side compile
+	// and falls back to the buffered cap at runtime via the
+	// `MaxBodyBytesStreaming == 0` branch — see ADR-091 D24 §6.
 	return nil
 }
 

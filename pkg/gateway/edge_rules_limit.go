@@ -20,8 +20,8 @@ package gateway
 // api.MaxBodyBytesStreaming, 100 MiB). The streaming field is 0
 // when the customer didn't set it; the applier falls back to
 // MaxBodyBytes for streaming requests in that case. The streaming
-// detection lives in the applier (handler.go) — pkg/gateway
-// keeps the matcher free of io.Reader juggling.
+// detection lives in `streamingFor(h, r, app)` at handler.go —
+// pkg/gateway keeps the matcher free of io.Reader juggling.
 
 import "path"
 

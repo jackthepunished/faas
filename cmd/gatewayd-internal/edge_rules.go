@@ -862,6 +862,13 @@ func compileLimitRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleLimitReso
 		if maxBody <= 0 || maxBody > api.MaxRequestBodyBytes {
 			maxBody = api.MaxRequestBodyBytes
 		}
+		// This streaming clamp is the second gate (after
+		// apid-Validate in pkg/api/dto.go) and the runtime mirror
+		// in applyEdgeRuleLimit (pkg/gateway/handler.go) trusts
+		// the value it produces. A direct-DB row that violates the
+		// DTO's `s ≥ b` invariant passes this compile and falls
+		// back to the buffered cap at runtime via the
+		// `MaxBodyBytesStreaming == 0` branch — safe degradation.
 		// Streaming cap: only clamp on the upper bound; 0 means
 		// "no carve-out, fall back to MaxBodyBytes" (the applier
 		// handles that). The negative check is defence-in-depth

@@ -1608,17 +1608,18 @@ const (
 	// raises the cap to RawStreamMaxRequestBytes (100 MiB, ADR-080
 	// raw-bridge parity) so an LLM-style streaming POST against a
 	// /v1/chat/completions endpoint has the same headroom the
-	// raw-bridge ForwardStream has. The streaming detection
-	// (isAcceptJSON + h.streamingEnabled + app.StreamingEnabled)
-	// is NOT yet exposed at the §4.1.2.8c hot-path slot — D24
-	// ships the field declared and clamped here, but the runtime
-	// enforcement of `max_body_bytes_streaming` falls back to
-	// `max_body_bytes` until a follow-up PR lifts the streaming
-	// detection above the rule-application order. Stated
-	// explicitly in ADR-091 D24 §6. Matches RawStreamMaxRequestBytes
-	// byte-for-byte so a customer can set `max_body_bytes_streaming`
-	// = RawStreamMaxRequestBytes and the value survives the
-	// apid-Validate round-trip without surprise trimming.
+	// raw-bridge ForwardStream has. Runtime enforcement ships
+	// alongside the field (D24 §6 amendment). The cap-selection
+	// algorithm at pkg/gateway/handler.go::applyEdgeRuleLimit
+	// consults this field only when the request is on the
+	// streaming opt-in path (4-conjunct detection: h.streamingEnabled
+	// && app.StreamingEnabled && !isAcceptJSON(Accept) && !isUpgradeRequest).
+	// The DTO's `s ≥ b` invariant (pkg/api/dto.go) is the single
+	// source of truth — the runtime trusts it without re-check.
+	// Matches RawStreamMaxRequestBytes byte-for-byte so a
+	// customer can set `max_body_bytes_streaming` = RawStreamMaxRequestBytes
+	// and the value survives the apid-Validate round-trip without
+	// surprise trimming.
 	MaxEdgeRuleLimitBodyBytesStreaming int64 = 100 * 1024 * 1024
 
 	// MaxEdgeRuleValidateSchemaBytes bounds the JSON Schema body of a

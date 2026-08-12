@@ -1875,6 +1875,40 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 	return false
 }
 
+// streamingFor is the canonical 4-conjunct gate that decides
+// whether a request is on the streaming opt-in path. Used at
+// the §4.1.2.13 slot (applyEdgeRuleLimit call site) to pick
+// between a rule's buffered and streaming caps. The proxy leg
+// at handler.go:3193 has its own inline copy of the same formula
+// because the streaming response-writer wrap is a separate
+// concern from edge-rule application; a future refactor can lift
+// both to this helper. Keep them in lockstep if the conjuncts
+// ever grow — TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts
+// pins the §4.1.2.13 slot's view of the formula.
+//
+// The four conjuncts, in order:
+//
+//   - h.streamingEnabled: the process-wide opt-in flag, set via
+//     WithStreamingEnabled on the Handler (cmd/gatewayd-internal).
+//   - app.StreamingEnabled: the per-app opt-in flag, persisted in
+//     apps.streaming_enabled and surfaced through the per-host
+//     app cache. Without this, no per-app stream-bridge path is
+//     wired in the picker, so a "streaming" cap would never
+//     actually be reached.
+//   - !isAcceptJSON(Accept): the streaming bridge is reserved
+//     for long-lived event/stream responses. A request asking
+//     for a JSON response is buffered even if the app is opted
+//     in — the cap is the buffered cap in that case.
+//   - !isUpgradeRequest(r): WebSocket / HTTP/2 upgrade requests
+//     are long-lived but their body is read by the proxy leg's
+//     hijacker, not buffered. Treat them as buffered for the
+//     cap-selection purpose (the cap is the buffered cap).
+func streamingFor(h *Handler, r *http.Request, app App) bool {
+	return h.streamingEnabled && app.StreamingEnabled &&
+		!isAcceptJSON(r.Header.Get("Accept")) &&
+		!isUpgradeRequest(r)
+}
+
 // applyEdgeRuleLimit (ADR-091 D24 / new ADR-0NN-edge-rule-limit)
 // consults the per-host edge-rule matcher for a `kind=limit` rule.
 // On a hit, r.Body is wrapped in http.MaxBytesReader at the
@@ -1913,22 +1947,33 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 //   - clean match (audit "matched" + observe "match" + apply
 //     "success", MaxBytesReader installed at the per-rule cap).
 //
-// Streaming posture (ADR-091 D24 §4): the rule carries an
+// Streaming posture (ADR-091 D24 §6): the rule carries an
 // optional `max_body_bytes_streaming` field (≤ 100 MiB per
 // pkg/api/limits.go:1652 RawStreamMaxRequestBytes, enforced by
-// the apid-Validate path and by cmd-side compileLimitRules).
-// Detecting the streaming opt-in path at THIS slot requires
-// isAcceptJSON(r.Header.Get("Accept")) + h.streamingEnabled +
-// app.StreamingEnabled, which lives further down the chain at
-// handler.go:3019 — pulling that detection above the §4.1.2.8c
-// slot would tangle the rule application order with the proxy
-// configuration. The carve-out is therefore deferred to a
-// follow-up PR (issue filed as part of D24). Until that ships,
-// `max_body_bytes_streaming` is declared and persisted but the
-// applier falls back to `MaxBodyBytes` for both paths. State
-// in ADR-091 D24 — the DTO and the compile clamp are in place,
-// the runtime enforcement is the follow-up slice.
-func (h *Handler) applyEdgeRuleLimit(w http.ResponseWriter, r *http.Request, app App) bool {
+// the apid-Validate path and by cmd-side compileLimitRules). At
+// runtime, the call site computes `streamingFor(h, r, app)`
+// (above) once and passes the result in as the `streaming`
+// parameter; the cap-selection algorithm is:
+//
+//	cap = rule.MaxBodyBytes             // default "buffered"
+//	capKind = "buffered"
+//	if streaming && rule.MaxBodyBytesStreaming > 0 {
+//	    cap = rule.MaxBodyBytesStreaming // opt-in streaming cap
+//	    capKind = "streaming"
+//	}
+//
+// Both paths run the same Content-Length fast path and the same
+// MaxBytesReader install — only the cap value and the
+// (audit/413-visible) cap_kind label differ. The DTO's
+// `s ≥ b` invariant (pkg/api/dto.go::EdgeRuleLimitAction.Validate)
+// is trusted at runtime: apid-Validate enforces it on the
+// customer write path; a direct-DB row that violates it
+// (seedEdgeRuleDirect) passes cmd-side compile (which clamps
+// `s` to [0, 100 MiB] but not `s ≥ b`) and falls back to the
+// buffered cap at runtime via the `MaxBodyBytesStreaming == 0`
+// branch — safe degradation. See ADR-091 D24 §6 amendment and
+// spec §4.1.2.13 for the rationale.
+func (h *Handler) applyEdgeRuleLimit(w http.ResponseWriter, r *http.Request, streaming bool, app App) bool {
 	if h.edgeRules == nil {
 		return false
 	}
@@ -1959,15 +2004,39 @@ func (h *Handler) applyEdgeRuleLimit(w http.ResponseWriter, r *http.Request, app
 		}
 		return false
 	}
-	// Defence-in-depth cap clamp: cmd-side compileLimitRules
-	// already clamped at api.MaxRequestBodyBytes, but a rule
-	// inserted by a direct DB write that bypassed apid-Validate
+	// Cap selection (ADR-091 D24 §6):
+	//
+	//   - streaming && rule.MaxBodyBytesStreaming > 0 → streaming cap
+	//   - else → buffered cap (the existing path)
+	//
+	// Per-cap-kind defence-in-depth clamp: cmd-side compileLimitRules
+	// already clamps at the per-kind ceiling, but a rule inserted
+	// by a direct DB write that bypassed apid-Validate
 	// (cmd/e2e/edge_rules_common_test.go:128 seedEdgeRuleDirect)
-	// could carry an out-of-range value. Mirror the validate
-	// applier's clamp at handler.go:1746-1748.
+	// could carry an out-of-range value. The buffered clamp
+	// mirrors the validate applier's clamp at handler.go:1746-1748.
+	// The streaming clamp is per-kind (not the buffered ceiling)
+	// because the streaming field's ceiling
+	// (api.RawStreamMaxRequestBytes = 100 MiB) is strictly larger
+	// than the buffered one (api.MaxRequestBodyBytes = 25 MiB) —
+	// a single clamp to the buffered ceiling would silently
+	// regress streaming allowances. capKind is threaded into
+	// both the 413 detail suffix and the audit payload so a
+	// customer debugging a 413 can bisect which cap fired.
 	cap := rule.MaxBodyBytes
-	if cap <= 0 || cap > api.MaxRequestBodyBytes {
-		cap = api.MaxRequestBodyBytes
+	capKind := "buffered"
+	if streaming && rule.MaxBodyBytesStreaming > 0 {
+		cap = rule.MaxBodyBytesStreaming
+		capKind = "streaming"
+	}
+	if capKind == "buffered" {
+		if cap <= 0 || cap > api.MaxRequestBodyBytes {
+			cap = api.MaxRequestBodyBytes
+		}
+	} else {
+		if cap <= 0 || int64(cap) > api.RawStreamMaxRequestBytes {
+			cap = int(api.RawStreamMaxRequestBytes)
+		}
 	}
 	// Content-Length fast path: deny before reading a single
 	// body byte. r.ContentLength == 0 is treated as "unknown
@@ -1978,17 +2047,21 @@ func (h *Handler) applyEdgeRuleLimit(w http.ResponseWriter, r *http.Request, app
 	// cannot bypass: the MaxBytesReader below still trips on
 	// the proxy leg's first read. The fast path can only ever
 	// produce a false-positive 413, never a bypass — see
-	// ADR-091 D24 §4 for the rationale.
+	// ADR-091 D24 §4 for the rationale. The detail suffix
+	// "(buffered cap)" / "(streaming cap)" names the cap that
+	// fired so a customer can see whether they tripped the
+	// streaming opt-in or the buffered default.
 	if r.ContentLength > 0 && r.ContentLength > int64(cap) {
 		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge,
 			api.CodeRequestTooLarge, "Request body too large",
-			fmt.Sprintf("rule %s caps body at %d bytes", rule.ID, cap)))
+			fmt.Sprintf("rule %s caps body at %d bytes (%s cap)", rule.ID, cap, capKind)))
 		if h.edgeRuleAudit != nil {
 			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.limit_rejected", nil, map[string]any{
 				"rule_id":        rule.ID,
 				"from_host":      r.Host,
 				"content_length": r.ContentLength,
 				"cap_bytes":      cap,
+				"cap_kind":       capKind,
 			})
 		}
 		if h.metrics != nil {
@@ -2016,6 +2089,7 @@ func (h *Handler) applyEdgeRuleLimit(w http.ResponseWriter, r *http.Request, app
 			"rule_id":   rule.ID,
 			"from_host": r.Host,
 			"cap_bytes": cap,
+			"cap_kind":  capKind,
 		})
 	}
 	if h.metrics != nil {
@@ -2942,7 +3016,7 @@ haveApp:
 	// (the rule's 413 fires before the global reader wraps
 	// r.Body). Same posture as validate: short-circuit on deny,
 	// caller MUST `return`.
-	if h.applyEdgeRuleLimit(w, r, app) {
+	if h.applyEdgeRuleLimit(w, r, streamingFor(h, r, app), app) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
