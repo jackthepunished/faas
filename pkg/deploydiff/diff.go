@@ -184,12 +184,20 @@ type Diff struct {
 	Plan Plan `json:"plan"`
 }
 
+// Severity values for [Break.Severity]. Constants live here so
+// the engine, renderers, and CLI adapter all share one source of
+// truth (goconst keeps the literal in one place).
+const (
+	SeverityError = "error"
+	SeverityWarn  = "warn"
+)
+
 // HasBlockingBreaks reports whether any [Break] has Severity
 // "error" (vs "warn"). The gate reads this to decide between
 // exit 0 and exit 1.
 func (d Diff) HasBlockingBreaks() bool {
 	for _, b := range d.Breaks {
-		if b.Severity != "warn" {
+		if b.Severity != SeverityWarn {
 			return true
 		}
 	}

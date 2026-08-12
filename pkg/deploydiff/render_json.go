@@ -63,7 +63,7 @@ func sortedChanges(in []Change) []Change {
 func sortedBreaks(in []Break) []Break {
 	var errs, warns []Break
 	for _, b := range in {
-		if b.Severity == "error" {
+		if b.Severity == SeverityError {
 			errs = append(errs, b)
 		} else {
 			warns = append(warns, b)

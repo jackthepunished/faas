@@ -59,7 +59,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.RAMMB != nil && *pending.AppConfig.RAMMB > limits.RAMMB {
 		out = append(out, Break{
 			Code:     api.CodePlanLimitRAM,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "ram_mb exceeds plan cap",
 			Field:    "memory",
 			Observed: AsAny(*pending.AppConfig.RAMMB),
@@ -70,7 +70,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.MaxConcurrency != nil && *pending.AppConfig.MaxConcurrency > limits.MaxConcurrency {
 		out = append(out, Break{
 			Code:     api.CodePlanLimitConcur,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "max_concurrency exceeds plan cap",
 			Field:    "concurrency",
 			Observed: AsAny(*pending.AppConfig.MaxConcurrency),
@@ -82,7 +82,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.MinInstances != nil && *pending.AppConfig.MinInstances > limits.MaxMinInstances {
 		out = append(out, Break{
 			Code:     api.CodePlanMinInstancesNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "min_instances exceeds plan cap",
 			Field:    "min_instances",
 			Observed: AsAny(*pending.AppConfig.MinInstances),
@@ -94,7 +94,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.MinInstances != nil && *pending.AppConfig.MinInstances > 0 && !limits.MinInstancesAllowed {
 		out = append(out, Break{
 			Code:     api.CodePlanMinInstancesNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "min_instances is not enabled on this plan",
 			Field:    "min_instances",
 			Observed: AsAny(*pending.AppConfig.MinInstances),
@@ -105,7 +105,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.StreamingEnabled != nil && *pending.AppConfig.StreamingEnabled && !limits.StreamingEnabled {
 		out = append(out, Break{
 			Code:     api.CodePlanStreamingNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "streaming is not enabled on this plan",
 			Field:    "streaming_enabled",
 		})
@@ -114,7 +114,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.WebSocketEnabled != nil && *pending.AppConfig.WebSocketEnabled && !limits.WebSocketEnabled {
 		out = append(out, Break{
 			Code:     api.CodePlanWebSocketNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "websocket is not enabled on this plan",
 			Field:    "websocket_enabled",
 		})
@@ -123,7 +123,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.WarmSnapshotEnabled != nil && *pending.AppConfig.WarmSnapshotEnabled && !limits.WarmSnapshotEnabled {
 		out = append(out, Break{
 			Code:     api.CodePlanWarmSnapshotNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "warm_snapshot is not enabled on this plan",
 			Field:    "warm_snapshot_enabled",
 		})
@@ -132,7 +132,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.RequireAuthn != nil && *pending.AppConfig.RequireAuthn && !limits.RequireAuthn {
 		out = append(out, Break{
 			Code:     api.CodePlanRequireAuthnNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "require_authn is not enabled on this plan",
 			Field:    "require_authn",
 		})
@@ -142,7 +142,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 		if !limits.EgressAllowlistAllowed {
 			out = append(out, Break{
 				Code:     api.CodePlanEgressAllowlistNotAllowed,
-				Severity: "error",
+				Severity: SeverityError,
 				Reason:   "egress allowlist is not enabled on this plan",
 				Field:    "egress_allowlist",
 			})
@@ -150,7 +150,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 		if limits.EgressAllowlistMaxSize > 0 && len(*pending.AppConfig.EgressAllowlist) > limits.EgressAllowlistMaxSize {
 			out = append(out, Break{
 				Code:     "egress_allowlist_too_long",
-				Severity: "error",
+				Severity: SeverityError,
 				Reason:   "egress_allowlist exceeds plan size cap",
 				Field:    "egress_allowlist",
 				Observed: AsAny(len(*pending.AppConfig.EgressAllowlist)),
@@ -162,7 +162,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.AutoscaleTargetRPS != nil && *pending.AppConfig.AutoscaleTargetRPS > 0 && !limits.ScaleUpTargetRPSAllowed {
 		out = append(out, Break{
 			Code:     api.CodePlanScaleUpNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "autoscale_target_rps is not enabled on this plan",
 			Field:    "autoscale_target_rps",
 		})
@@ -171,7 +171,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 	if pending.AppConfig.AutoscaleTargetCP != nil && *pending.AppConfig.AutoscaleTargetCP > 0 && !limits.ScaleUpTargetCPUAllowed {
 		out = append(out, Break{
 			Code:     api.CodePlanScaleUpNotAllowed,
-			Severity: "error",
+			Severity: SeverityError,
 			Reason:   "autoscale_target_cpu_pct is not enabled on this plan",
 			Field:    "autoscale_target_cpu_pct",
 		})
@@ -189,7 +189,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 		if limits.CronLimitPerApp == 0 {
 			out = append(out, Break{
 				Code:     api.CodePlanCronsNotAllowed,
-				Severity: "error",
+				Severity: SeverityError,
 				Reason:   "crons are not enabled on this plan",
 				Field:    "crons",
 			})
@@ -197,7 +197,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 			if wanted > limits.CronLimitPerApp {
 				out = append(out, Break{
 					Code:     api.CodePlanCronQuota,
-					Severity: "error",
+					Severity: SeverityError,
 					Reason:   "cron count exceeds per-app cap",
 					Field:    "crons",
 					Observed: AsAny(wanted),
@@ -213,7 +213,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 		if postDeployAcct > limits.CronLimitPerAccount {
 			out = append(out, Break{
 				Code:     api.CodePlanCronQuota,
-				Severity: "error",
+				Severity: SeverityError,
 				Reason:   "cron count exceeds per-account cap",
 				Field:    "crons",
 				Observed: AsAny(postDeployAcct),
@@ -228,7 +228,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 		if wanted > limits.EdgeRulesPerApp {
 			out = append(out, Break{
 				Code:     api.CodePlanLimitEdgeRules,
-				Severity: "error",
+				Severity: SeverityError,
 				Reason:   "edge_rule count exceeds per-app cap",
 				Field:    "edge_rules",
 				Observed: AsAny(wanted),
@@ -242,7 +242,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 				if !limits.EdgeRulesJWTAllowed {
 					out = append(out, Break{
 						Code:     api.CodePlanEdgeRuleKindNotAllowed,
-						Severity: "error",
+						Severity: SeverityError,
 						Reason:   "kind=jwt is not enabled on this plan",
 						Field:    "edge_rule.kind",
 					})
@@ -251,7 +251,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 				if !limits.EdgeRulesIPAllowed {
 					out = append(out, Break{
 						Code:     api.CodePlanEdgeRuleKindNotAllowed,
-						Severity: "error",
+						Severity: SeverityError,
 						Reason:   "kind=ip is not enabled on this plan",
 						Field:    "edge_rule.kind",
 					})
@@ -271,7 +271,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 		if limits.EnvVarsMax > 0 && total > limits.EnvVarsMax {
 			out = append(out, Break{
 				Code:     api.CodePlanLimitEnvVars,
-				Severity: "error",
+				Severity: SeverityError,
 				Reason:   "env var count exceeds per-app cap",
 				Field:    "environment",
 				Observed: AsAny(total),
@@ -286,7 +286,7 @@ func Quota(p api.Plan, baseline Baseline, pending Pending, cfg QuotaConfig) []Br
 				if limits.EnvValueMaxBytes > 0 && len(r.Value) > limits.EnvValueMaxBytes {
 					out = append(out, Break{
 						Code:     api.CodeEnvVarValueTooLarge,
-						Severity: "error",
+						Severity: SeverityError,
 						Reason:   "env var value exceeds per-value byte cap",
 						Field:    "environment." + scope + "." + r.Key,
 						Observed: AsAny(len(r.Value)),

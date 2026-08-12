@@ -400,7 +400,7 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 			label := k.kind + " " + k.host + k.path
 			out.Breaks = append(out.Breaks, Break{
 				Code:     "edge_rule_duplicate_key",
-				Severity: "error",
+				Severity: SeverityError,
 				Reason:   "edge_rule[" + label + "] appears more than once in the pending list; apid's CREATE UNIQUE constraint will reject this deploy",
 				Field:    "edge_rule[" + label + "]",
 				Observed: AsAny(i),
@@ -519,7 +519,7 @@ func diffDeployment(out *Diff, base *api.DeploymentResponse, p Pending) {
 	if len(changes) > 0 {
 		out.Breaks = append(out.Breaks, Break{
 			Code:     "would_create_deployment",
-			Severity: "warn", // informational — not a quota break
+			Severity: SeverityWarn, // informational — not a quota break
 			Reason:   "this would create a new deployment row, not patch the existing one (deployment fields are immutable post-create except min_instances).",
 			Field:    "deployment",
 			Observed: AsAny(changes),
@@ -549,7 +549,7 @@ func detectSchemaBreak(out *Diff, base *api.DeploymentResponse, p Pending) {
 	if !stringSliceEqual(p.Manifest.Entrypoint, base.OverrideEntrypoint) {
 		out.Breaks = append(out.Breaks, Break{
 			Code:     "schema_response_changed",
-			Severity: "warn", // softer than handler — entrypoint
+			Severity: SeverityWarn, // softer than handler — entrypoint
 			// shifts don't always change response shape
 			Reason: "entrypoint change can alter process behaviour",
 			Field:  "entrypoint",
@@ -573,7 +573,7 @@ func detectSchemaBreak(out *Diff, base *api.DeploymentResponse, p Pending) {
 	if !stringSliceEqualAsSet(pendKeys, base.OverrideEnvKeys) {
 		out.Breaks = append(out.Breaks, Break{
 			Code:     "schema_env_changed",
-			Severity: "warn",
+			Severity: SeverityWarn,
 			Reason:   "environment key set change can alter process behaviour",
 			Field:    "manifest.env",
 		})
@@ -584,7 +584,7 @@ func detectSchemaBreak(out *Diff, base *api.DeploymentResponse, p Pending) {
 	if len(p.Manifest.EnvSecrets) > 0 && !stringMapsEqual(p.Manifest.EnvSecrets, base.OverrideEnvSecretRefs) {
 		out.Breaks = append(out.Breaks, Break{
 			Code:     "schema_env_changed",
-			Severity: "warn",
+			Severity: SeverityWarn,
 			Reason:   "sealed-secret ref change can alter process behaviour",
 			Field:    "manifest.env_secrets",
 		})

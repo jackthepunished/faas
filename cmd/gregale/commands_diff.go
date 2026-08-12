@@ -128,7 +128,7 @@ func runDiff(ctx context.Context, client *api.Client, opts diffCLIOptions) int {
 		// emit a single warn so the customer's eye lands on it.
 		d.Breaks = append(d.Breaks, deploydiff.Break{
 			Code:     "plan_unknown_quota_gate_skipped",
-			Severity: "warn",
+			Severity: deploydiff.SeverityWarn,
 			Reason:   "could not resolve plan tier from Whoami; quota gate skipped (PR-0). PR-1 ships a server-side plan lookup.",
 			Field:    "plan",
 		})
