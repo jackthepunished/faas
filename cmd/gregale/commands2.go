@@ -781,9 +781,30 @@ func cmdDeployTarball(args []string) int {
 	// gregale.yaml with a `triggers:` block is applied AFTER CreateApp
 	// (and BEFORE the deploy body ships) — see deployManifestTriggers.
 	noTriggers := fs.Bool("no-triggers", false, "skip the `gregale.yaml` triggers fan-out (issue #791 PR-C)")
+	// PR-0 of the deploy-diff cluster (see docs/adr/ draft):
+	// gregale deploy --diff renders what the deploy would change
+	// against the live state and exits per the gate. --json emits
+	// the stable wire shape; --strict (default) blocks on schema
+	// break / quota violation / missing required env; --lenient
+	// exits 0 even on breaks (still renders them). --server-diff
+	// routes the baseline + projection through apid's
+	// POST /v1/apps/{slug}/diff (PR-1), not the SDK client
+	// locally. The flag pair --strict / --lenient mirrors the
+	// existing --require-authn / --no-require-authn mutex shape
+	// at commands2.go:791-799.
+	diff := fs.Bool("diff", false, "preview what would change without deploying")
+	diffJSON := fs.Bool("json", false, "emit JSON output (only with --diff)")
+	diffStrict := fs.Bool("strict", false, "exit non-zero on schema/quota/env breaks (default with --diff)")
+	diffLenient := fs.Bool("lenient", false, "exit zero even on breaks; --diff still renders them")
+	serverDiff := fs.Bool("server-diff", false, "compute the diff on apid via POST /v1/apps/{slug}/diff (PR-1) instead of locally")
 	if err := fs.Parse(args); err != nil {
 		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
+	}
+	// --strict / --lenient mutex. Same rationale as
+	// --require-authn / --no-require-authn above.
+	if *diffStrict && *diffLenient {
+		return printErr("Invalid flags", fmt.Errorf("--strict and --lenient are mutually exclusive"))
 	}
 	// Issue #560: flag-pair mutex check (mirrors cmdApp /
 	// cmdAppScale --warm-snapshot/--no-warm-snapshot). Setting
@@ -1043,6 +1064,20 @@ func cmdDeployTarball(args []string) int {
 		return printErr("Not logged in", err)
 	}
 	ctx := context.Background()
+
+	// Deploy-diff short-circuit (PR-0 of the deploy-diff cluster).
+	// Runs AFTER authedClient so the SDK reads can resolve, and
+	// BEFORE the Phase 3 / CreateApp / Deploy body so no writes
+	// happen. --diff never ships a deploy.
+	if *diff {
+		opts := buildDiffOptions(slug, resolvedShape, *runtime, *handler, *image, cwd, requireAuthnPtr)
+		opts.JSON = *diffJSON
+		// --strict is the default; --lenient opts out.
+		opts.Strict = !*diffLenient
+		opts.Lenient = *diffLenient
+		opts.ServerDiff = *serverDiff
+		return runDiff(ctx, client, opts)
+	}
 
 	// Phase 3 (repo decomposition) one-key provision path. Triggered
 	// by --only or --project-slug on a --tarball / --template / zero-config
