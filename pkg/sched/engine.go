@@ -1082,6 +1082,25 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 // deployment is overridden. If the override deployment is no longer
 // live (a newer deploy happened mid-tick), the call returns
 // {AtCapacity: true} — the trigger's next sweep re-evaluates.
+//
+// P1A asymmetry note: this path (the floor trigger / fan-out /
+// per-deployment wake) bypasses Engine.admitGate by design. The
+// canonical per-app cap enforcement is NodeLedger.Admit
+// (pkg/sched/admission.go:225-228), which fires inside
+// ledger.Admit below. The PR-C invariant pinned at
+// pkg/sched/invariants_property_test.go:68
+// (TestProperty_EngineWake_RespectsMaxConcurrency) requires
+// "ledger caps, not lock caps" — both admitAndDispatch (wake path,
+// :1191) and admitAndDispatchForDeployment (this function) feed
+// into the same ledger write. As a consequence, the per-deployment
+// path cannot emit schedd_scale_up_decisions_total{outcome ∈
+// {cooldown_held, min_floor_already, overage_cap_reached}} from
+// the gate — only reject_at_cap surfaces, via the ledger's
+// *api.Problem{Code: CodePlanLimitConcur} return. Documenting this
+// here so a future reviewer doesn't try to "fix" it by routing the
+// deployment path through the gate (which would require either
+// collapsing the two cap-enforcement layers or duplicating the
+// ledger write).
 func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID string, liftCapacityToResult bool) (WakeResult, error) {
 	// ── Phase 2: admit window, under appMu ──────────────────
 	release := e.lockApp(appID)

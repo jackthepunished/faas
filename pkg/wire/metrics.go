@@ -1666,16 +1666,35 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"slice"})
 	// Issue #169 / #172: scale-up trigger observability. Outcome
 	// label set is closed ({admit, reject_at_cap, no_signal,
-	// cooldown_held}); pre-instantiated below so the rows surface
-	// in /metrics from boot. App label is per-app (bounded by apps
-	// with autoscale configured) — the closed outcome set means
-	// the total series cardinality is O(autoscale-enabled apps × 4).
-	// cooldown_held (PR-C, issue #462) lands on the wake-gate
-	// path when Concurrency(appID) > 0 AND
-	// time.Since(apps.last_scale_out_at) < ScaleOutCooldownS.
+	// cooldown_held, min_floor_already, overage_cap_reached});
+	// pre-instantiated below so the rows surface in /metrics from
+	// boot. App label is per-app (bounded by apps with autoscale
+	// configured) — the closed outcome set means the total series
+	// cardinality is O(autoscale-enabled apps × 6) (P1A: × 4 → × 6
+	// after adding min_floor_already and overage_cap_reached).
+	//   - admit (Engine.admitGate wakeAdmit, pkg/sched/engine.go:4890).
+	//   - reject_at_cap (admitGate wakeRejectAtCap, :4856-4860).
+	//   - no_signal (scaleup/trigger.go:decide short-circuit on no
+	//     RPS/CPU signal yet).
+	//   - cooldown_held (admitGate wakeCooldownHeld, :4862-4867;
+	//     PR-C issue #462 wake-gate path when Concurrency(appID) > 0
+	//     AND time.Since(apps.last_scale_out_at) < ScaleOutCooldownS).
+	//   - min_floor_already (admitGate wakeMinFloorAlready, :4868-4873;
+	//     ScalingPolicy.MinInstances already met, no traffic signal).
+	//   - overage_cap_reached (admitGate wakeOverageCapReached,
+	//     :4876-4888; issue #561 OverageChecker reports OverageReached).
+	//
+	// P1A: only the first four are emitted by the scaleup/trigger.go
+	// `decide` function; the last three (cooldown_held,
+	// min_floor_already, overage_cap_reached) are emitted by
+	// Engine.admitGate when called via the Wake / AdmitInstance path
+	// through admitAndDispatch (engine.go:1238). The
+	// `admitAndDispatchForDeployment` (engine.go:1085) path bypasses
+	// admitGate by design — see that function's doc comment for the
+	// asymmetry rationale (PR-C invariant: ledger caps, not lock caps).
 	scaleUpDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_up_decisions_total",
-		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, cooldown_held}; app label is the apps.id.",
+		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, cooldown_held, min_floor_already, overage_cap_reached}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
 	scaleUpAdmitRPS := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: prefix + "_scale_up_admit_rps",
@@ -2362,7 +2381,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// is a placeholder so the help/TYPE surfaces in /metrics before
 	// the first decision fires. Real per-app rows are added by
 	// ObserveScaleUp below.
-	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal", "cooldown_held"} {
+	//
+	// P1A: include `min_floor_already` and `overage_cap_reached` in
+	// the closed set. Both are written by Engine.admitGate at
+	// pkg/sched/engine.go:4868-4873 (min_floor_already, when
+	// ScalingPolicy.MinInstances is already met and no traffic
+	// signal) and pkg/sched/engine.go:4876-4888 (overage_cap_reached,
+	// issue #561, when OverageChecker reports OverageReached). The
+	// closed-set loop previously omitted these two — they were still
+	// emitted by admitGate, but only surfaced in /metrics after the
+	// first gate fire per app, breaking the §12 panel-at-day-1 contract
+	// (PR #826 precedent: pre-instantiation required).
+	for _, outcome := range []string{
+		"admit", "reject_at_cap", "no_signal",
+		"cooldown_held", "min_floor_already", "overage_cap_reached",
+	} {
 		scaleUpDecisions.WithLabelValues("", outcome)
 	}
 	// Issue #300: pre-instantiate the ("other",) row of the per-tenant

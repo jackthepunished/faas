@@ -467,17 +467,28 @@ func TestOpsMetrics_ObserveScaleUpClosedSet(t *testing.T) {
 	m := wire.NewOpsMetrics("schedd")
 	m.ObserveScaleUp("a1", "admit")
 	m.ObserveScaleUp("a1", "cooldown_held")
+	m.ObserveScaleUp("a1", "min_floor_already")
+	m.ObserveScaleUp("a1", "overage_cap_reached")
 
 	body := render(t, m)
 	for _, want := range []string{
 		// Real observations.
 		`schedd_scale_up_decisions_total{app="a1",outcome="admit"} 1`,
 		`schedd_scale_up_decisions_total{app="a1",outcome="cooldown_held"} 1`,
+		`schedd_scale_up_decisions_total{app="a1",outcome="min_floor_already"} 1`,
+		`schedd_scale_up_decisions_total{app="a1",outcome="overage_cap_reached"} 1`,
 		// Pre-instantiated empty-app placeholder for the closed set.
+		// P1A: the closed set is now 6 outcomes — min_floor_already
+		// (engine.go:4868-4873) and overage_cap_reached (issue #561,
+		// engine.go:4876-4888) joined the four pre-existing values.
+		// The closed-set loop must pre-instantiate all six so the
+		// §12 panel-at-day-1 contract holds (PR #826 precedent).
 		`schedd_scale_up_decisions_total{app="",outcome="admit"} 0`,
 		`schedd_scale_up_decisions_total{app="",outcome="reject_at_cap"} 0`,
 		`schedd_scale_up_decisions_total{app="",outcome="no_signal"} 0`,
 		`schedd_scale_up_decisions_total{app="",outcome="cooldown_held"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="min_floor_already"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="overage_cap_reached"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)
