@@ -3586,3 +3586,134 @@ ALTER TABLE ONLY public.github_webhook_secrets
 --
 
 
+
+--
+-- Name: app_errors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_errors (
+    id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    deployment_id uuid,
+    fingerprint character(64) NOT NULL,
+    route text NOT NULL,
+    http_status integer NOT NULL,
+    error_class text NOT NULL,
+    sample_message text NOT NULL,
+    count bigint DEFAULT 1 NOT NULL,
+    request_count bigint DEFAULT 1 NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT app_errors_http_status_check CHECK (((http_status >= 400) AND (http_status <= 599))),
+    CONSTRAINT app_errors_error_class_check CHECK (error_class = ANY (ARRAY['db_timeout'::text, 'stripe_timeout'::text, 'null_pointer'::text, 'invalid_json'::text, 'wake_failed'::text, 'upstream_5xx'::text, 'unhandled'::text, 'client_error'::text])),
+    CONSTRAINT app_errors_fingerprint_check CHECK (fingerprint ~ '^[0-9a-f]{64}$'::text),
+    CONSTRAINT app_errors_sample_message_check CHECK ((pg_column_size(sample_message) <= 512))
+);
+
+
+--
+-- Name: app_error_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_error_requests (
+    id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    fingerprint character(64) NOT NULL,
+    request_id uuid NOT NULL,
+    received_at timestamp with time zone NOT NULL,
+    route text NOT NULL,
+    http_status integer NOT NULL,
+    error_class text NOT NULL,
+    sample_message text NOT NULL,
+    deployment_id uuid,
+    headers_sample jsonb,
+    redactions text[] DEFAULT '{}'::text[] NOT NULL,
+    CONSTRAINT app_error_requests_http_status_check CHECK (((http_status >= 400) AND (http_status <= 599))),
+    CONSTRAINT app_error_requests_error_class_check CHECK (error_class = ANY (ARRAY['db_timeout'::text, 'stripe_timeout'::text, 'null_pointer'::text, 'invalid_json'::text, 'wake_failed'::text, 'upstream_5xx'::text, 'unhandled'::text, 'client_error'::text])),
+    CONSTRAINT app_error_requests_fingerprint_check CHECK (fingerprint ~ '^[0-9a-f]{64}$'::text),
+    CONSTRAINT app_error_requests_sample_message_check CHECK ((pg_column_size(sample_message) <= 512)),
+    CONSTRAINT app_error_requests_headers_sample_check CHECK (((headers_sample IS NULL) OR (pg_column_size((headers_sample)::text) <= 8192)))
+);
+
+
+--
+-- Name: app_errors_account_app_fp_last_seen_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_errors_account_app_fp_last_seen_idx ON public.app_errors USING btree (account_id, app_id, fingerprint, last_seen_at DESC);
+
+
+--
+-- Name: app_errors_account_app_last_seen_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_errors_account_app_last_seen_idx ON public.app_errors USING btree (account_id, app_id, last_seen_at DESC);
+
+
+--
+-- Name: app_errors_dedupe_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX app_errors_dedupe_uniq ON public.app_errors USING btree (account_id, app_id, fingerprint);
+
+
+--
+-- Name: app_error_requests_drill_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_error_requests_drill_idx ON public.app_error_requests USING btree (account_id, app_id, fingerprint, received_at DESC, request_id DESC);
+
+
+--
+-- Name: app_error_requests_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_error_requests_retention_idx ON public.app_error_requests USING btree (account_id, received_at) WHERE (received_at < (now() - '90 days'::interval));
+
+
+--
+-- Name: app_error_requests app_error_requests_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_error_requests ADD CONSTRAINT app_error_requests_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_error_requests app_error_requests_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_error_requests ADD CONSTRAINT app_error_requests_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_error_requests app_error_requests_deployment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_error_requests ADD CONSTRAINT app_error_requests_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES public.deployments(id) ON DELETE SET NULL;
+
+
+--
+-- Name: app_errors app_errors_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_errors ADD CONSTRAINT app_errors_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_errors app_errors_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_errors ADD CONSTRAINT app_errors_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_errors app_errors_deployment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_errors ADD CONSTRAINT app_errors_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES public.deployments(id) ON DELETE SET NULL;
+
+
+--

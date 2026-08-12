@@ -652,6 +652,31 @@ type Limits struct {
 	// per tier (Hobby's "last week", Pro's "this month", Scale's
 	// "this quarter"). 0 means "no archive on this plan" (Free).
 	LogArchiveRetentionDaysMax int
+
+	// AppErrorsRetentionDays (ADR-096 / customer-facing automatic
+	// error grouping) is the per-plan retention cap on
+	// app_errors / app_error_requests rows. The nightly purge
+	// cron in cmd/apid/app_errors_purge.go deletes rows older
+	// than this bound. MUST be <= LogArchiveRetentionDaysMax
+	// for the same plan — the errors view is a stricter subset
+	// of the log archive; if the archive retention widens in a
+	// future release, the errors retention widens with it but
+	// not faster. Free=1, Hobby=7, Pro=30, Scale=90.
+	AppErrorsRetentionDays int
+	// AppErrorsMaxFingerprintsPerApp (ADR-096) is the per-plan
+	// ceiling on the number of distinct fingerprints the
+	// gatewayd-internal recorder retains in its LRU for one
+	// (account_id, app_id). Past the cap the recorder silently
+	// drops + bumps faas_gateway_app_errors_recorded_total{
+	// outcome="rate_limited"}. Free=50, Hobby=200, Pro=1000,
+	// Scale=5000.
+	AppErrorsMaxFingerprintsPerApp int
+	// AppErrorsMaxRequestRowsPerFingerprint (ADR-096) is the
+	// per-plan ceiling on the number of app_error_requests rows
+	// retained per fingerprint for the drill-down view. Older
+	// rows beyond the cap are deleted first on the retention
+	// purge. Free=25, Hobby=100, Pro=500, Scale=1000.
+	AppErrorsMaxRequestRowsPerFingerprint int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -847,6 +872,14 @@ var planLimits = map[Plan]Limits{
 		// (returns immediately on ctx.Done()).
 		LogArchiveEnabled:          false,
 		LogArchiveRetentionDaysMax: 0,
+		// ADR-096 error grouping. Free = 1-day retention, 50
+		// fingerprints, 25 request rows per fingerprint — the
+		// abuse-floor tier. Retention MUST be <= the log-archive
+		// retention above (which is 0 for Free; "no archive, no
+		// grouped errors either" is the consistent posture).
+		AppErrorsRetentionDays:                1,
+		AppErrorsMaxFingerprintsPerApp:        50,
+		AppErrorsMaxRequestRowsPerFingerprint: 25,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -1062,6 +1095,12 @@ var planLimits = map[Plan]Limits{
 		// S3 within the spec §4.1 latency budget.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 7,
+		// ADR-096 — Hobby = "last week" retention, 200 fingerprints,
+		// 100 request rows per fingerprint. Retention equals the
+		// log-archive retention.
+		AppErrorsRetentionDays:                7,
+		AppErrorsMaxFingerprintsPerApp:        200,
+		AppErrorsMaxRequestRowsPerFingerprint: 100,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -1248,6 +1287,11 @@ var planLimits = map[Plan]Limits{
 		// rather than being a single shared cap.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 30,
+		// ADR-096 — Pro = "this month" retention, 1000 fingerprints,
+		// 500 request rows per fingerprint.
+		AppErrorsRetentionDays:                30,
+		AppErrorsMaxFingerprintsPerApp:        1000,
+		AppErrorsMaxRequestRowsPerFingerprint: 500,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1449,6 +1493,11 @@ var planLimits = map[Plan]Limits{
 		// generous at the top tier.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 90,
+		// ADR-096 — Scale = "this quarter" retention, 5000
+		// fingerprints, 1000 request rows per fingerprint.
+		AppErrorsRetentionDays:                90,
+		AppErrorsMaxFingerprintsPerApp:        5000,
+		AppErrorsMaxRequestRowsPerFingerprint: 1000,
 	},
 }
 
@@ -2467,6 +2516,46 @@ func (p Plan) LogArchiveRetentionDaysMax() int {
 	return l.LogArchiveRetentionDaysMax
 }
 
+// AppErrorsRetentionDays (ADR-096) returns the per-plan
+// retention cap on app_errors / app_error_requests rows. The
+// nightly purge cron in cmd/apid/app_errors_purge.go reads this
+// to decide which rows to DELETE. Returns 1 on unknown plans
+// (fail-closed minimum) so a missing plan row never silently
+// keeps errors forever.
+func (p Plan) AppErrorsRetentionDays() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 1
+	}
+	return l.AppErrorsRetentionDays
+}
+
+// AppErrorsMaxFingerprintsPerApp (ADR-096) returns the per-plan
+// ceiling on distinct fingerprints the gatewayd-internal recorder
+// retains in its LRU. The recorder uses this as the
+// CardinalityLimit backstop; past the cap, new fingerprints are
+// silently dropped (outcome="rate_limited"). Returns 50 on
+// unknown plans (Free-tier floor).
+func (p Plan) AppErrorsMaxFingerprintsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 50
+	}
+	return l.AppErrorsMaxFingerprintsPerApp
+}
+
+// AppErrorsMaxRequestRowsPerFingerprint (ADR-096) returns the
+// per-plan ceiling on app_error_requests rows retained per
+// fingerprint. The retention purge deletes oldest rows beyond
+// the cap first. Returns 25 on unknown plans (Free-tier floor).
+func (p Plan) AppErrorsMaxRequestRowsPerFingerprint() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 25
+	}
+	return l.AppErrorsMaxRequestRowsPerFingerprint
+}
+
 // LivenessPeriodSeconds returns the per-plan default poll cadence
 // for the liveness probe (issue #554). 0 for Free — coupled to
 // LivenessAllowed() above; if the customer is on a plan where
@@ -3276,4 +3365,50 @@ const (
 	// of the operator surface.
 	ObsAdminRateLimitLimitDefault = 100
 	ObsAdminRateLimitLimitMax     = ObsAdminPaginationMax
+
+	// AppErrorsWindowMaxHours (ADR-096) bounds the ?since= window
+	// on /v1/apps/{slug}/errors/summary. Mirrors ObsAdminWindowMaxHours
+	// (168h = 7d) — the customer view is narrower in the dashboard
+	// UI but the storage backend can serve the same window. The
+	// summary endpoint clamps ?since=/?until= to this bound; longer
+	// windows are silently clamped and the response sets
+	// window_clamped=true.
+	AppErrorsWindowMaxHours = 168
+
+	// AppErrorsSummaryDefaultLimit / AppErrorsSummaryMaxLimit bound
+	// ?limit= on GET /v1/apps/{slug}/errors/summary. 20 default =
+	// "show me the top 20 errors" (matches the Sentry-default
+	// grouping view the customer-facing dashboard renders); 100
+	// max caps the scan so a misconfigured caller cannot blow the
+	// row-budget. Past 100 the caller pages via ?cursor.
+	AppErrorsSummaryDefaultLimit = 20
+	AppErrorsSummaryMaxLimit     = 100
+
+	// AppErrorsDedupeWindowSeconds (ADR-096) is the platform-wide
+	// dedupe window for the IncrementAppError INSERT. NOT a
+	// per-plan constant — it is a system-wide setting
+	// (FAAS_APP_ERRORS_DEDUPE_WINDOW_SECONDS env var). 3600s = 1h
+	// default; raising it inflates the on-disk row count per
+	// fingerprint; lowering it increases the dedupe rate. Pinned
+	// here so the limits-lint gate accepts the constant.
+	AppErrorsDedupeWindowSeconds = 3600
+
+	// AppErrorsSampleMessageCapBytes (ADR-096) is the hard cap on
+	// the sample_message column at the writer. The
+	// redact.Redactor truncates at this bound BEFORE INSERT; the
+	// pg_column_size CHECK on the column is the backstop. 512 bytes
+	// matches the existing app_log archive precedent — half a KiB
+	// is enough to carry a 1-2 sentence error description with a
+	// stack-trace snippet, and small enough to keep the index
+	// narrow.
+	AppErrorsSampleMessageCapBytes = 512
+
+	// AppErrorsCardinalityBackstopMultiplier (ADR-096) is the
+	// multiplier applied to AppErrorsMaxFingerprintsPerApp() when
+	// computing the recorder's LRU cache cap. The recorder uses
+	// this so the cache can absorb a brief burst above the plan
+	// cap before the drop kicks in. 2x = the cache holds up to
+	// 2x the steady-state cap; the cache evicts oldest entries
+	// beyond that.
+	AppErrorsCardinalityBackstopMultiplier = 2
 )

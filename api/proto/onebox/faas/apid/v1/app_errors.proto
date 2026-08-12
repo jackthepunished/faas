@@ -1,0 +1,127 @@
+// app_errors — customer-facing automatic error grouping (ADR-096).
+// gatewayd-internal dials apid on /run/faas/apid.sock to forward
+// per-request error records the public edge observed. apid is the
+// sole writer to app_errors / app_error_requests (CLAUDE.md
+// ownership); gatewayd-internal never opens a direct Postgres
+// connection for this path.
+//
+// Wire discipline mirrors the sibling apid/v1/advisory.proto
+// service: checked-in *.pb.go generated with paths=source_relative,
+// errors enveloped through pkg/grpcerr, auth is the unix-socket DAC
+// model (mode 0660 group `faas`, ADR-015) on /run/faas/apid.sock.
+//
+// Streaming: IncrementAppError is a server-streaming RPC so a
+// bursty gateway can ship a batched window of events without
+// paying per-record RPC overhead. The server reads until the
+// client half-closes the stream; each event is committed inside
+// its own transaction (the dedupe-merge INSERT is the only
+// non-idempotent operation, so per-event tx is mandatory).
+
+syntax = "proto3";
+
+package onebox.faas.apid.v1;
+
+option go_package = "github.com/onebox-faas/faas/api/proto/onebox/faas/apid/v1;apidpb";
+
+// AppErrors is the gRPC service apid exposes on /run/faas/apid.sock
+// for the gatewayd-internal error recorder (ADR-096). The single
+// RPC accepts a stream of error records; the server returns
+// per-record outcomes so the gateway can update its in-process
+// counters (record ok / dedupe-merge / redaction-failed / etc.).
+service AppErrors {
+  // IncrementAppError streams error records from the gateway edge
+  // to apid's writer path. The server commits each record inside
+  // its own transaction (per-record commit; load-bearing for the
+  // dedupe-merge semantics).
+  //
+  // The response stream mirrors the request stream 1:1: every
+  // request gets exactly one response carrying its outcome. The
+  // server half-closes the response stream when the client
+  // half-closes the request stream (or on the first error). A
+  // transient DB failure on one record returns ResourceExhausted
+  // for that single response — the stream continues.
+  rpc IncrementAppError(stream IncrementAppErrorRequest) returns (stream IncrementAppErrorResponse);
+}
+
+// IncrementAppErrorRequest is one error record from the gateway edge.
+// All scalar fields are required (proto3 default-zero would be
+// ambiguous); empty values are rejected by the server with InvalidArgument.
+message IncrementAppErrorRequest {
+  // account_id (apps.account_id, UUID). Resolved at the gateway from
+  // the request session — the gateway's auth middleware has already
+  // proven the customer owns the app.
+  string account_id = 1;
+
+  // app_id (apps.app_id, UUID). Resolved from the matched route.
+  string app_id = 2;
+
+  // deployment_id (apps_deployments.deployment_id, UUID). May be
+  // empty if the wake did not yet resolve a deployment at the
+  // moment the error fired (cold-boot window).
+  string deployment_id = 3;
+
+  // route_template — the matched Go-mux pattern (e.g. "GET /v1/users/{id}").
+  // NEVER the expanded URL — load-bearing for fingerprint cardinality.
+  string route_template = 4;
+
+  // http_status — the response status code returned to the customer.
+  // Must be 400..599 (the migration CHECK rejects anything else).
+  int32 http_status = 5;
+
+  // error_class — closed-vocabulary enum enforced by the migration CHECK.
+  // One of: db_timeout | stripe_timeout | null_pointer | invalid_json |
+  //         wake_failed | upstream_5xx | unhandled | client_error.
+  string error_class = 6;
+
+  // fingerprint — hex-encoded sha256(canonical) computed at the
+  // gateway using the route_template (NOT the expanded URL). 64
+  // chars, lowercase hex.
+  string fingerprint = 7;
+
+  // sample_message — the error message excerpt (already PII-redacted
+  // at the gateway). Capped at AppErrorsSampleMessageCapBytes=512
+  // server-side.
+  string sample_message = 8;
+
+  // headers_sample — a JSON-encoded map of header name → redacted
+  // value. Capped at 8 KiB and ≤ 8 keys server-side. Empty string
+  // means "no headers captured" (the common case).
+  string headers_sample_json = 9;
+
+  // redactions_applied — sorted unique list of pattern names that
+  // fired at the gateway (mirrors pkg/redact.Apply's second
+  // return value). Echoed back to the customer in the response so
+  // the UI can render "we redacted email / card / cookie".
+  repeated string redactions_applied = 10;
+
+  // received_at_unix_ms — the gateway's wall-clock timestamp at the
+  // moment the response was returned to the customer (NOT the
+  // apid INSERT time — that would skew the customer-visible
+  // timestamps).
+  int64 received_at_unix_ms = 11;
+
+  // instance_id (optional) — vmmd-assigned instance id when the
+  // request reached a live microVM. Empty when the error fired
+  // before instance resolution (cold-boot, wake failure).
+  string instance_id = 12;
+}
+
+// IncrementAppErrorResponse is the per-record outcome the server
+// returns. outcome ∈ {inserted, merged, redaction_failed,
+// rate_limited, db_error}. `inserted` is a new row in
+// app_errors; `merged` is a dedupe-merge that bumped an existing
+// row's count + last_seen_at. The other three are observability
+// signals — the gateway should NOT retry on them (a retry would
+// double-count).
+message IncrementAppErrorResponse {
+  string outcome = 1;
+
+  // fingerprint — echoed back so the gateway can update its
+  // in-process LRU cache (count → last_seen_at).
+  string fingerprint = 2;
+
+  // dedupe_merged — true when outcome=="merged". Mirrors the
+  // outcome string but lets the gateway hot-path avoid a string
+  // compare on every record.
+  bool dedupe_merged = 3;
+}

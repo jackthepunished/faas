@@ -278,6 +278,50 @@ type OpsMetrics struct {
 	// faas_apid_error_rate_5m, _3d_baseline, _ratio) read from
 	// one counter.
 	requestTotal *prometheus.CounterVec
+	// appErrorsRecorded (ADR-096) — counter the gatewayd-internal
+	// recorder (cmd/gatewayd-internal/app_errors_recorder.go) and
+	// the apid gRPC handler (cmd/apid/grpc_server_apperrors.go)
+	// increment per outcome. outcome ∈ {ok, redaction_failed,
+	// rate_limited, db_error}. `ok` is the §12 customer-error-
+	// ingest panel (rate over 5m); `redaction_failed` is the
+	// tripwire for pkg/redact panicking (must stay at 0); the
+	// closed label set keeps cardinality bounded. Single-registry:
+	// registered on every daemon; only gatewayd-internal +
+	// apid increment via ObserveAppErrorsRecorded.
+	appErrorsRecorded *prometheus.CounterVec
+	// appErrorsFingerprintCacheHits (ADR-096) — counter for the
+	// gatewayd-internal recorder's in-process LRU fingerprint
+	// cache. Every hit is a record() that did NOT need to call
+	// the regex / dedupe logic; every miss did. The hit rate
+	// (over 5m, divided by requestFailures) is the §12
+	// fingerprint-cache-effectiveness panel; a sustained <80%
+	// rate means the LRU is too small for the customer's traffic
+	// shape. Unlabelled — no cardinality risk. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFingerprintCacheHit.
+	appErrorsFingerprintCacheHits prometheus.Counter
+	// appErrorsDedupeMerges (ADR-096) — counter for server-side
+	// dedupe-merge hits in the apid gRPC handler. Increments
+	// once per ON CONFLICT (account_id, app_id, fingerprint) DO
+	// UPDATE that bumps the existing row's count + last_seen_at
+	// (within AppErrorsDedupeWindowSeconds). The dedupe-merge
+	// rate vs the new-fingerprint insert rate is the §12
+	// dedupe-effectiveness panel; if 100% of inserts are merges,
+	// the LRU backstop in the recorder is effectively never
+	// firing. Unlabelled. Single-registry: registered on every
+	// daemon; only apid increments via ObserveAppErrorsDedupeMerge.
+	appErrorsDedupeMerges prometheus.Counter
+	// appErrorsFlushDuration (ADR-096) — histogram of the
+	// gatewayd-internal publisher's per-flush wall-clock
+	// duration (FlushInterval or FlushBatchSize, whichever
+	// first). Bucket set {0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
+	// 1, 5}: the 1ms bucket catches the empty-drain case
+	// (FlushInterval fires with nothing to do); the 5s bucket
+	// catches a stuck DB connection (alertable via
+	// FlushDurationP99Slo). Unlabelled. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFlushDuration.
+	appErrorsFlushDuration prometheus.Histogram
 	// accountLabels: the bounded admission set shared by the
 	// account_id-labelled metrics above. See accountLabelSet docs
 	// for the fixed-capacity, non-evicting contract — an evicting
@@ -2015,6 +2059,51 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Cross-node LIVE-instance migration decisions (Tier A5 / ADR-066), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, lease_expired, peer_failure}. `migrated` is the §12 dashboard panel. `lease_expired` is the tripwire for the four-phase handoff timing out; `peer_failure` is the tripwire for the new-owner vmmd failing the AdoptMigratedInstance RPC. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveLiveMigration.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, liveMigrationDecisions)
+	// ADR-096: customer-facing automatic error grouping ingest
+	// counter. Labelled by outcome ∈ {ok, redaction_failed,
+	// rate_limited, db_error}. `ok` is the §12 customer-error-
+	// ingest panel (rate over 5m); `redaction_failed` is the
+	// tripwire for pkg/redact panicking — must stay at 0.
+	// `rate_limited` is the LRU-cardinality backstop firing
+	// (CardinalityLimit hit). `db_error` is the publisher's
+	// 5th-consecutive-failure drop. Single-registry: registered
+	// on every daemon (mirrors liveMigrationDecisions); only
+	// gatewayd-internal + apid increment via
+	// ObserveAppErrorsRecorded.
+	appErrorsRecorded := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_recorded_total",
+		Help: "Customer-facing automatic error grouping ingest outcomes (ADR-096), labelled by outcome ∈ {ok, redaction_failed, rate_limited, db_error}. `ok` is the §12 customer-error-ingest panel (rate over 5m). `redaction_failed` is the tripwire for pkg/redact panicking — MUST stay at 0. `rate_limited` is the LRU-cardinality backstop firing when an app exceeds CardinalityLimit fingerprints. `db_error` is the publisher's 5th-consecutive-failure drop (better to lose a batch than block the request path). Single-registry: registered on every daemon; only gatewayd-internal + apid increment via ObserveAppErrorsRecorded.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, appErrorsRecorded)
+	// ADR-096: in-process LRU fingerprint cache hit counter.
+	// Unlabelled (no cardinality risk). Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFingerprintCacheHit.
+	appErrorsFingerprintCacheHits := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_fingerprint_cache_hits_total",
+		Help: "In-process LRU fingerprint cache hits in the gatewayd-internal error recorder (ADR-096). Hit rate over 5m divided by requestFailures is the §12 fingerprint-cache-effectiveness panel; sustained <80% means the LRU is too small for the customer's traffic shape. No labels; no cardinality risk. Single-registry: registered on every daemon; only gatewayd-internal increments via ObserveAppErrorsFingerprintCacheHit.",
+	})
+	commonCollectors = append(commonCollectors, appErrorsFingerprintCacheHits)
+	// ADR-096: server-side dedupe-merge counter. Fires once per
+	// ON CONFLICT DO UPDATE that bumps an existing row's count
+	// + last_seen_at within AppErrorsDedupeWindowSeconds.
+	// Unlabelled. Single-registry: registered on every daemon;
+	// only apid increments via ObserveAppErrorsDedupeMerge.
+	appErrorsDedupeMerges := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_dedupe_merges_total",
+		Help: "Server-side dedupe-merge hits in the apid gRPC handler (ADR-096). Increments once per ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE that bumps an existing row's count + last_seen_at within AppErrorsDedupeWindowSeconds. Merge rate vs new-fingerprint insert rate is the §12 dedupe-effectiveness panel. No labels. Single-registry: registered on every daemon; only apid increments via ObserveAppErrorsDedupeMerge.",
+	})
+	commonCollectors = append(commonCollectors, appErrorsDedupeMerges)
+	// ADR-096: per-flush wall-clock duration histogram for the
+	// gatewayd-internal publisher. Unlabelled. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFlushDuration.
+	appErrorsFlushDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    prefix + "_app_errors_flush_duration_seconds",
+		Help:    "Per-flush wall-clock duration in the gatewayd-internal app_errors publisher (ADR-096). One observation per drain of the ringbuffer (FlushInterval or FlushBatchSize, whichever first). Bucket set {0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5}: the 1ms bucket catches the empty-drain case (FlushInterval fires with nothing to do); the 5s bucket catches a stuck DB connection (alertable via FlushDurationP99Slo). No labels. Single-registry: registered on every daemon; only gatewayd-internal increments via ObserveAppErrorsFlushDuration.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
+	})
+	commonCollectors = append(commonCollectors, appErrorsFlushDuration)
 	// ADR-067 / Tier A6: migrating-instance watchdog reconcile counter.
 	// Labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}.
 	// The reinvited label is the §12 dashboard panel (sum over 5m for
@@ -2453,6 +2542,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		accountOrgMismatch:                 accountOrgMismatch,
 		requestFailures:                    requestFailures,
 		requestTotal:                       requestTotal,
+		appErrorsRecorded:                  appErrorsRecorded,
+		appErrorsFingerprintCacheHits:      appErrorsFingerprintCacheHits,
+		appErrorsDedupeMerges:              appErrorsDedupeMerges,
+		appErrorsFlushDuration:             appErrorsFlushDuration,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,
@@ -2635,6 +2728,50 @@ func (m *OpsMetrics) WriteRedirectLatency() prometheus.Observer {
 		return nil
 	}
 	return m.writeRedirectLatency
+}
+
+// ObserveAppErrorsRecorded increments the customer-facing
+// automatic error grouping ingest counter (ADR-096). outcome
+// MUST be one of {ok, redaction_failed, rate_limited, db_error};
+// the closed set is enforced by the canonical ADR-096 spec
+// (the apid gRPC handler + gatewayd-internal recorder share
+// this contract). nil-safe — no-op if m is nil.
+func (m *OpsMetrics) ObserveAppErrorsRecorded(outcome string) {
+	if m == nil || m.appErrorsRecorded == nil {
+		return
+	}
+	m.appErrorsRecorded.WithLabelValues(outcome).Inc()
+}
+
+// ObserveAppErrorsFingerprintCacheHit increments the in-process
+// LRU fingerprint cache hit counter (ADR-096). nil-safe.
+func (m *OpsMetrics) ObserveAppErrorsFingerprintCacheHit() {
+	if m == nil || m.appErrorsFingerprintCacheHits == nil {
+		return
+	}
+	m.appErrorsFingerprintCacheHits.Inc()
+}
+
+// ObserveAppErrorsDedupeMerge increments the server-side
+// dedupe-merge counter (ADR-096). Fires once per ON CONFLICT
+// DO UPDATE that bumps an existing row's count + last_seen_at.
+// nil-safe.
+func (m *OpsMetrics) ObserveAppErrorsDedupeMerge() {
+	if m == nil || m.appErrorsDedupeMerges == nil {
+		return
+	}
+	m.appErrorsDedupeMerges.Inc()
+}
+
+// ObserveAppErrorsFlushDuration records one sample of the
+// gatewayd-internal publisher's per-flush wall-clock duration
+// (ADR-096). Callers should pass seconds. nil-safe — no-op if
+// m is nil.
+func (m *OpsMetrics) ObserveAppErrorsFlushDuration(seconds float64) {
+	if m == nil || m.appErrorsFlushDuration == nil {
+		return
+	}
+	m.appErrorsFlushDuration.Observe(seconds)
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram

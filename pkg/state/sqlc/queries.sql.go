@@ -1052,6 +1052,44 @@ func (q *Queries) DeleteApp(ctx context.Context, db DBTX, id pgtype.UUID) error 
 	return err
 }
 
+const deleteAppErrorRequestsByIDs = `-- name: DeleteAppErrorRequestsByIDs :exec
+DELETE FROM app_error_requests WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) DeleteAppErrorRequestsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error {
+	_, err := db.Exec(ctx, deleteAppErrorRequestsByIDs, dollar_1)
+	return err
+}
+
+const deleteAppErrorRequestsOlderThan = `-- name: DeleteAppErrorRequestsOlderThan :exec
+DELETE FROM app_error_requests
+WHERE account_id = $1
+  AND received_at < $2
+`
+
+type DeleteAppErrorRequestsOlderThanParams struct {
+	AccountID  pgtype.UUID
+	ReceivedAt pgtype.Timestamptz
+}
+
+// The retention purge also runs on app_error_requests
+// independently — a customer's drill-down can age out without
+// the parent fingerprint row being removed (e.g. Hobby with
+// 100 rows/fingerprint cap evicts oldest request rows first).
+func (q *Queries) DeleteAppErrorRequestsOlderThan(ctx context.Context, db DBTX, arg DeleteAppErrorRequestsOlderThanParams) error {
+	_, err := db.Exec(ctx, deleteAppErrorRequestsOlderThan, arg.AccountID, arg.ReceivedAt)
+	return err
+}
+
+const deleteAppErrorsByIDs = `-- name: DeleteAppErrorsByIDs :exec
+DELETE FROM app_errors WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) DeleteAppErrorsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error {
+	_, err := db.Exec(ctx, deleteAppErrorsByIDs, dollar_1)
+	return err
+}
+
 const deleteCron = `-- name: DeleteCron :exec
 delete from crons where id = $1 and app_id = $2
 `
@@ -1158,6 +1196,60 @@ func (q *Queries) ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt p
 	return result.RowsAffected(), nil
 }
 
+const getAppErrorSample = `-- name: GetAppErrorSample :one
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id,
+    headers_sample, redactions
+FROM app_error_requests
+WHERE account_id  = $1
+  AND app_id      = $2
+  AND fingerprint = $3
+ORDER BY received_at ASC, request_id ASC
+LIMIT 1
+`
+
+type GetAppErrorSampleParams struct {
+	AccountID   pgtype.UUID
+	AppID       pgtype.UUID
+	Fingerprint string
+}
+
+type GetAppErrorSampleRow struct {
+	ID            pgtype.UUID
+	RequestID     pgtype.UUID
+	ReceivedAt    pgtype.Timestamptz
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  pgtype.UUID
+	HeadersSample []byte
+	Redactions    []string
+}
+
+// Single oldest request row for one fingerprint, used by the
+// UI's "what does this look like" preview. Returns
+// headers_sample + redactions for the wire-side "we redacted
+// X / Y / Z" badge.
+func (q *Queries) GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErrorSampleParams) (GetAppErrorSampleRow, error) {
+	row := db.QueryRow(ctx, getAppErrorSample, arg.AccountID, arg.AppID, arg.Fingerprint)
+	var i GetAppErrorSampleRow
+	err := row.Scan(
+		&i.ID,
+		&i.RequestID,
+		&i.ReceivedAt,
+		&i.Route,
+		&i.HttpStatus,
+		&i.ErrorClass,
+		&i.SampleMessage,
+		&i.DeploymentID,
+		&i.HeadersSample,
+		&i.Redactions,
+	)
+	return i, err
+}
+
 const getGithubWebhookSecret = `-- name: GetGithubWebhookSecret :one
 SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1
 `
@@ -1222,6 +1314,121 @@ func (q *Queries) GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetS
 		&i.RevokedAt,
 	)
 	return i, err
+}
+
+const incrementAppError = `-- name: IncrementAppError :exec
+
+INSERT INTO app_errors (
+    id, account_id, app_id, deployment_id, fingerprint,
+    route, http_status, error_class, sample_message,
+    count, request_count, first_seen_at, last_seen_at
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8, $9,
+    1, 1, $10, $10
+)
+ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE SET
+    count         = app_errors.count + 1,
+    request_count = app_errors.request_count + 1,
+    last_seen_at  = greatest(app_errors.last_seen_at, $10)
+`
+
+type IncrementAppErrorParams struct {
+	ID            pgtype.UUID
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	DeploymentID  pgtype.UUID
+	Fingerprint   string
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	FirstSeenAt   pgtype.Timestamptz
+}
+
+// ---------------------------------------------------------------------------
+// ADR-096 customer-facing automatic error grouping.
+// Tables live in migrations/00222_app_errors.sql. gatewayd-internal
+// writes via the apid gRPC IncrementAppError handler (pkg/apidgrpc/
+// apperrors.proto); apid is the only direct writer to the table
+// per the owner rules. The apid handlers in
+// cmd/apid/handlers_app_errors.go (PR-B) and the nightly purge
+// cron in cmd/apid/app_errors_purge.go (PR-A) read here.
+//
+// Index paths pinned in the migration file (NOT regenerated here
+// — sqlc doesn't manage indexes, only the typed query surface).
+// ---------------------------------------------------------------------------
+// ADR-096 §3.5 dedupe-merge INSERT. The grpc_server_apperrors.go
+// handler runs this inside a single pgx transaction per stream
+// batch. ON CONFLICT target is app_errors_dedupe_uniq (the
+// migration's UNIQUE on (account_id, app_id, fingerprint)).
+// The dedupe window is enforced by the writer's LRU; this
+// unique constraint is the last-resort tripwire.
+func (q *Queries) IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) error {
+	_, err := db.Exec(ctx, incrementAppError,
+		arg.ID,
+		arg.AccountID,
+		arg.AppID,
+		arg.DeploymentID,
+		arg.Fingerprint,
+		arg.Route,
+		arg.HttpStatus,
+		arg.ErrorClass,
+		arg.SampleMessage,
+		arg.FirstSeenAt,
+	)
+	return err
+}
+
+const insertAppErrorRequest = `-- name: InsertAppErrorRequest :exec
+INSERT INTO app_error_requests (
+    id, account_id, app_id, fingerprint, request_id, received_at,
+    route, http_status, error_class, sample_message,
+    deployment_id, headers_sample, redactions
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9, $10,
+    $11, $12, $13
+)
+`
+
+type InsertAppErrorRequestParams struct {
+	ID            pgtype.UUID
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	Fingerprint   string
+	RequestID     pgtype.UUID
+	ReceivedAt    pgtype.Timestamptz
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  pgtype.UUID
+	HeadersSample []byte
+	Redactions    []string
+}
+
+// One row per request that hit the grouped fingerprint. No
+// ON CONFLICT — every request gets its own row. request_count
+// on app_errors is bumped on the paired IncrementAppError
+// call; the read path derives the joined total at query time.
+func (q *Queries) InsertAppErrorRequest(ctx context.Context, db DBTX, arg InsertAppErrorRequestParams) error {
+	_, err := db.Exec(ctx, insertAppErrorRequest,
+		arg.ID,
+		arg.AccountID,
+		arg.AppID,
+		arg.Fingerprint,
+		arg.RequestID,
+		arg.ReceivedAt,
+		arg.Route,
+		arg.HttpStatus,
+		arg.ErrorClass,
+		arg.SampleMessage,
+		arg.DeploymentID,
+		arg.HeadersSample,
+		arg.Redactions,
+	)
+	return err
 }
 
 const insertComputeNodeHeartbeat = `-- name: InsertComputeNodeHeartbeat :exec
@@ -1417,6 +1624,204 @@ func (q *Queries) ListAPIKeys(ctx context.Context, db DBTX, accountID pgtype.UUI
 			&i.Scopes,
 			&i.CreatedAt,
 			&i.LastUsedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAppErrorFingerprintsForPurge = `-- name: ListAppErrorFingerprintsForPurge :many
+SELECT id FROM app_errors
+WHERE account_id = $1
+  AND last_seen_at < $2
+ORDER BY last_seen_at ASC
+LIMIT $3
+`
+
+type ListAppErrorFingerprintsForPurgeParams struct {
+	AccountID  pgtype.UUID
+	LastSeenAt pgtype.Timestamptz
+	Limit      int32
+}
+
+// Nightly retention purge read path (cmd/apid/app_errors_purge.go).
+// Returns IDs of app_errors rows for an account older than
+// `cutoff`. Capped at 10000 per call so the DELETE loop can
+// iterate without blocking. Sorted by last_seen_at ASC so the
+// oldest rows are deleted first (a future eviction policy
+// could swap to "least recent activity" without touching this
+// query).
+func (q *Queries) ListAppErrorFingerprintsForPurge(ctx context.Context, db DBTX, arg ListAppErrorFingerprintsForPurgeParams) ([]pgtype.UUID, error) {
+	rows, err := db.Query(ctx, listAppErrorFingerprintsForPurge, arg.AccountID, arg.LastSeenAt, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAppErrorGroups = `-- name: ListAppErrorGroups :many
+SELECT
+    id, fingerprint, error_class, route, http_status,
+    count, request_count, first_seen_at, last_seen_at,
+    sample_message
+FROM app_errors
+WHERE account_id = $1
+  AND app_id     = $2
+  AND last_seen_at >= $3
+  AND last_seen_at <= $4
+  AND ($5::timestamptz IS NULL OR (last_seen_at, fingerprint) < ($5, $6))
+ORDER BY count DESC, last_seen_at DESC, fingerprint ASC
+LIMIT $7
+`
+
+type ListAppErrorGroupsParams struct {
+	AccountID    pgtype.UUID
+	AppID        pgtype.UUID
+	LastSeenAt   pgtype.Timestamptz
+	LastSeenAt_2 pgtype.Timestamptz
+	Column5      pgtype.Timestamptz
+	LastSeenAt_3 pgtype.Timestamptz
+	Limit        int32
+}
+
+type ListAppErrorGroupsRow struct {
+	ID            pgtype.UUID
+	Fingerprint   string
+	ErrorClass    string
+	Route         string
+	HttpStatus    int32
+	Count         int64
+	RequestCount  int64
+	FirstSeenAt   pgtype.Timestamptz
+	LastSeenAt    pgtype.Timestamptz
+	SampleMessage string
+}
+
+// ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
+// one (account_id, app_id) over a (since, until) window.
+// Cursor pagination via the (last_seen_at, fingerprint) compound
+// tuple (distinct from the operator's (created_at, id) cursor).
+// Index path: app_errors_account_app_last_seen_idx covers the
+// primary scan; the (count DESC) sort happens post-filter on the
+// bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+func (q *Queries) ListAppErrorGroups(ctx context.Context, db DBTX, arg ListAppErrorGroupsParams) ([]ListAppErrorGroupsRow, error) {
+	rows, err := db.Query(ctx, listAppErrorGroups,
+		arg.AccountID,
+		arg.AppID,
+		arg.LastSeenAt,
+		arg.LastSeenAt_2,
+		arg.Column5,
+		arg.LastSeenAt_3,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAppErrorGroupsRow{}
+	for rows.Next() {
+		var i ListAppErrorGroupsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Fingerprint,
+			&i.ErrorClass,
+			&i.Route,
+			&i.HttpStatus,
+			&i.Count,
+			&i.RequestCount,
+			&i.FirstSeenAt,
+			&i.LastSeenAt,
+			&i.SampleMessage,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAppErrorRequests = `-- name: ListAppErrorRequests :many
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id
+FROM app_error_requests
+WHERE account_id  = $1
+  AND app_id      = $2
+  AND fingerprint = $3
+  AND ($4::timestamptz IS NULL OR (received_at, request_id) < ($4, $5))
+ORDER BY received_at DESC, request_id DESC
+LIMIT $6
+`
+
+type ListAppErrorRequestsParams struct {
+	AccountID   pgtype.UUID
+	AppID       pgtype.UUID
+	Fingerprint string
+	Column4     pgtype.Timestamptz
+	ReceivedAt  pgtype.Timestamptz
+	Limit       int32
+}
+
+type ListAppErrorRequestsRow struct {
+	ID            pgtype.UUID
+	RequestID     pgtype.UUID
+	ReceivedAt    pgtype.Timestamptz
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  pgtype.UUID
+}
+
+// Drill-down rows for one fingerprint. Cursor paginated via
+// (received_at, request_id). Index path:
+// app_error_requests_drill_idx. Does NOT include headers_sample
+// or redactions — those are returned only by GetAppErrorSample.
+func (q *Queries) ListAppErrorRequests(ctx context.Context, db DBTX, arg ListAppErrorRequestsParams) ([]ListAppErrorRequestsRow, error) {
+	rows, err := db.Query(ctx, listAppErrorRequests,
+		arg.AccountID,
+		arg.AppID,
+		arg.Fingerprint,
+		arg.Column4,
+		arg.ReceivedAt,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAppErrorRequestsRow{}
+	for rows.Next() {
+		var i ListAppErrorRequestsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RequestID,
+			&i.ReceivedAt,
+			&i.Route,
+			&i.HttpStatus,
+			&i.ErrorClass,
+			&i.SampleMessage,
+			&i.DeploymentID,
 		); err != nil {
 			return nil, err
 		}

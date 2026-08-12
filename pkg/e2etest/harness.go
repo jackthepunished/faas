@@ -487,7 +487,7 @@ const testDomain = "apps.test.example"
 //     main-landed migration and PR #697 picks 157 as the next free
 //     slot above main's head. The renumber chain is the standard
 //     PR-#697 follow-up to the PR-#653 145 chain.
-const e2eMigrationTarget = 157
+const e2eMigrationTarget = 222
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
