@@ -379,6 +379,13 @@ type HostEntry struct {
 	// is kind-agnostic and the cmd-side loader threads one slice
 	// per kind into the HostEntry.
 	Throttle     []EdgeRuleThrottleResolved
+	// Budget carries the kind=budget subset (ADR-093). The applier
+	// (handler.go::applyEdgeRuleBudget) stamps the per-rule
+	// BudgetMs onto r.Context() via reqbudget.WithRemaining. Stored
+	// as a plain slice to match the surrounding fields; the cache
+	// primitive is kind-agnostic and the cmd-side loader threads
+	// one slice per kind into the HostEntry.
+	Budget       []EdgeRuleBudgetResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -628,6 +635,25 @@ func (c *EdgeRuleCache) GetThrottle(host string) ([]EdgeRuleThrottleResolved, bo
 	return out, true
 }
 
+// GetBudget is the kind=budget accessor (ADR-093). Same shape as
+// GetLimit: returns a value-copy of the underlying slice and a hit
+// bool; nil slice with ok=true means "entry exists but no budget
+// rule for this host" — applyEdgeRuleBudget falls back to the
+// plan-level default budget on nil.
+func (c *EdgeRuleCache) GetBudget(host string) ([]EdgeRuleBudgetResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Budget == nil {
+		return nil, true
+	}
+	src := entry.Budget
+	out := make([]EdgeRuleBudgetResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
 // getEntry promotes the entry on hit and returns it. Internal —
 // the Get* family wraps this so each returns a typed slice.
 //
@@ -776,6 +802,14 @@ type EdgeRuleMatcher interface {
 	MatchMaintenance(ctx context.Context, host, path, method string) *EdgeRuleMaintenanceResolved
 	MatchGeo(ctx context.Context, host, path, method string) *EdgeRuleGeoResolved
 	MatchThrottle(ctx context.Context, host, path, method string) *EdgeRuleThrottleResolved
+	// MatchBudget is the ADR-093 matcher for the kind=budget
+	// subset. The applier stamps the per-rule BudgetMs onto the
+	// inbound ctx via reqbudget.WithRemaining; the matcher itself
+	// only resolves the highest-priority matching rule (no budget
+	// math here — that lives in handler.go's applyEdgeRuleBudget
+	// + reqbudget.WithRemaining so the per-hop remaining-time
+	// propagation logic stays in one place).
+	MatchBudget(ctx context.Context, host, path, method string) *EdgeRuleBudgetResolved
 	Reset()
 }
 
@@ -937,6 +971,9 @@ func (noOpEdgeRuleMatcher) MatchGeo(context.Context, string, string, string) *Ed
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchThrottle(context.Context, string, string, string) *EdgeRuleThrottleResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchBudget(context.Context, string, string, string) *EdgeRuleBudgetResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}

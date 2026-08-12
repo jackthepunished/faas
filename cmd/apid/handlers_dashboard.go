@@ -31,6 +31,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -525,11 +526,37 @@ func firedFlash(r *http.Request) string {
 // non-nil pointer so the template can render the "degraded" label
 // rather than disappear silently — that's the same shape the
 // public /status/slo.json uses.
+// budgetCtx is the ADR-093 / PR-D helper for the apid-side per-call
+// ceilings (PromQL 3s, billingOps 30s, sync-invoke 5s / 30s). When
+// the inbound ctx carries a Budget (the gatewayd-public → apid
+// round-trip), the per-call ceiling becomes a child of the budget:
+// childDeadline = min(parentRemaining, ceiling). The absolute
+// ceiling is unchanged — the budget can only tighten the cap. When
+// no Budget is attached (a direct apid call from the dashboard SPA
+// without going through gatewayd-public), the per-call
+// context.WithTimeout ceiling is preserved so the per-handler
+// safety cap cannot regress on the direct-call path.
+//
+// Returns the ctx + cancel. Callers must `defer cancel()` so the
+// context isn't leaked.
+func budgetCtx(parent context.Context, ceiling time.Duration) (context.Context, context.CancelFunc) {
+	if b, ok := reqbudget.FromContext(parent); ok {
+		newCtx, cancel, _ := b.WithCeiling(parent, ceiling)
+		return newCtx, cancel
+	}
+	return context.WithTimeout(parent, ceiling)
+}
+
 func (s *server) fetchDashboardMetrics(ctx context.Context, log *slog.Logger, appID string) *dashboard.AppMetricsView {
 	if s.promqlClient == nil {
 		return nil
 	}
-	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	// ADR-093 / PR-D: the 3s Prometheus ceiling becomes a child of
+	// the inbound budget when one is attached (gatewayd-public's
+	// BudgetMiddleware stamped it on r.Context()). childDeadline
+	// = min(parentRemaining, 3s). When no budget is on ctx the
+	// legacy 3s WithTimeout ceiling is preserved.
+	dctx, cancel := budgetCtx(ctx, 3*time.Second)
 	defer cancel()
 	resp, src := appmetrics.Fetch(dctx, s.promqlClient, log, appID, appmetrics.DefaultRange)
 	view := &dashboard.AppMetricsView{

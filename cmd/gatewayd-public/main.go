@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -59,6 +60,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -248,6 +250,33 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// outbound hop.
 	proxy.Transport = otelhttp.NewTransport(proxy.Transport)
 
+	// ADR-093 / PR-B: end-to-end request budgets. The BudgetMiddleware
+	// stamps a per-request deadline onto r.Context() before the proxy
+	// forwards to gatewayd-internal, and writes a 504 RFC 7807
+	// problem envelope if the budget fires. Budgets come from the
+	// edge-rule kind=budget match (resolved deeper in the chain) or
+	// fall back to api.RequestBudgetDefault. The metrics registry is
+	// a fresh one (gatewayd-public's ControlMux today exposes no
+	// default metrics — /metrics is empty unless we wire a
+	// registry), and is plumbed into the control mux below so
+	// /metrics scrapes both the budget histogram and the
+	// exceeded-counter families alongside any future series.
+	budgetReg := prometheus.NewRegistry()
+	budgetMetrics, err := reqbudget.NewMetrics(budgetReg, "gateway")
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: reqbudget metrics: %w", err)
+	}
+	budgetCfg, err := reqbudget.NewMiddlewareConfig(reqbudget.MiddlewareConfig{
+		Default: api.RequestBudgetDefault,
+		Max:     api.RequestBudgetMax,
+		Route:   "forward",
+		Metrics: budgetMetrics,
+		Log:     log,
+	})
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: reqbudget middleware config: %w", err)
+	}
+
 	// Trace pipeline (issue #555 PR-2). Builds the in-memory ring,
 	// wires the OTLP/HTTP exporter when OTEL_EXPORTER_OTLP_ENDPOINT
 	// is set, and installs the GET /v1/traces/{trace_id} handler.
@@ -266,7 +295,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 	traceMux.Handle("/v1/traces/", traceSetup.Handler)
 	traceMux.Handle("/", proxy)
 
-	// Public-facing handler: httpsec outer wrapper → trace mux → internal proxy.
+	// Public-facing handler: httpsec outer wrapper → budget middleware →
+	// trace mux → internal proxy.
 	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(hstsEnabledFromEnv))
 	// Issue #555 PR-3: otelhttp.NewHandler extracts W3C traceparent
 	// from inbound headers and starts a server span per request; the
@@ -274,10 +304,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// This wrap sits INSIDE httpsec.Security so the response headers
 	// (HSTS, CSP nonce, etc.) don't show up as span attributes (the
 	// OTel view is the request itself, not the security headers).
-	publicHandler := httpsec.Static(otelhttp.NewHandler(traceMux, "gatewayd-public.handler"))
+	//
+	// ADR-093 / PR-B: budget middleware wraps the otel handler so the
+	// budget deadline lands on the same ctx the OTel span reads. The
+	// budget middleware writes the 504 problem when the inner chain
+	// (proxy → gatewayd-internal) doesn't return in time, regardless
+	// of where the slowness lives.
+	publicHandler := budgetCfg.Middleware(otelhttp.NewHandler(traceMux, "gatewayd-public.handler"))
+	publicHandler = httpsec.Static(publicHandler)
 
-	// Control mux + listeners.
-	controlMux := gateway.ControlMux(gatewayMetrics, probe.ReadyFunc(), drainTracker)
+	// Control mux + listeners. Pass budgetReg as the extraGatherer so
+	// /metrics exposes the budget histogram + exceeded-counter
+	// alongside the default gateway series, and pass drainTracker so
+	// every control request is counted during graceful shutdown.
+	controlMux := gateway.ControlMuxWithExtra(gatewayMetrics, budgetReg, probe.ReadyFunc(), drainTracker)
 	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
 	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
 	publicSrv, controlSrv := buildServers(listenAddr, controlAddr, publicHandler, controlMux)

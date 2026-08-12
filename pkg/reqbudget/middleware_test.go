@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -215,6 +216,103 @@ func TestBudget_Observe_ClampsToTotal(t *testing.T) {
 	// Histogram series must exist.
 	if got := gatherSeriesCount(t, reg, "request_budget_seconds"); got != 1 {
 		t.Fatalf("observe: histogram series count = %d, want 1", got)
+	}
+}
+
+// TestMiddleware_DownstreamHopInheritsBudget exercises the
+// end-to-end propagation contract: a handler that reads the
+// inbound Budget via reqbudget.FromContext must see the
+// middleware-stamped values. ADR-093 / PR-F wiring test.
+func TestMiddleware_DownstreamHopInheritsBudget(t *testing.T) {
+	cfg, _, _ := newCfg(t, 3*time.Second, 30*time.Second)
+	var (
+		mu                sync.Mutex
+		observedBudget    Budget
+		observedHasBudget bool
+	)
+	downstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, ok := FromContext(r.Context())
+		mu.Lock()
+		observedBudget = b
+		observedHasBudget = ok
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	h := cfg.Middleware(downstream)
+	req := httptest.NewRequest(http.MethodPost, "/payment", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("downstream propagation: status = %d, want 200", rr.Code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !observedHasBudget {
+		t.Fatalf("downstream: no Budget on inner ctx (middleware failed to stamp)")
+	}
+	if observedBudget.Route != "forward" {
+		t.Errorf("downstream: Budget.Route = %q, want forward", observedBudget.Route)
+	}
+	if observedBudget.Endpoint != "POST:/payment" {
+		t.Errorf("downstream: Budget.Endpoint = %q, want POST:/payment", observedBudget.Endpoint)
+	}
+	if observedBudget.Total != 3*time.Second {
+		t.Errorf("downstream: Budget.Total = %v, want 3s", observedBudget.Total)
+	}
+}
+
+// TestMiddleware_EndToEndTimeoutEnforced is the ADR-093 §14
+// metal-acceptance smoke: a 100ms budget with a 1s slow
+// downstream fake must 504 in <200ms with a stable
+// `request_budget_exceeded` envelope. Companion to
+// TestMiddleware_Exceeded (which tests the same shape with a
+// synthetic handler sleep) — this test exercises the same
+// wiring from the outer middleware through a slow downstream
+// fake, matching the production gatewayd-public → gatewayd-internal
+// shape.
+func TestMiddleware_EndToEndTimeoutEnforced(t *testing.T) {
+	cfg, m, _ := newCfg(t, 100*time.Millisecond, 30*time.Second)
+	clk := newTestClock(time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC))
+	cfg.Now = clk.now
+
+	slowDownstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate a stuck downstream. The handler must exit
+		// on r.Context() cancellation — mirroring the cancel
+		// propagating through the dial-with-timeout /
+		// forwardproxy RoundTrip paths.
+		select {
+		case <-time.After(1 * time.Second):
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+			return
+		}
+	})
+	h := cfg.Middleware(slowDownstream)
+	req := httptest.NewRequest(http.MethodPost, "/payment", nil)
+	rr := httptest.NewRecorder()
+	start := time.Now()
+	h.ServeHTTP(rr, req)
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("end-to-end: ServeHTTP took %v, want < 200ms (ctx cancel must propagate)", elapsed)
+	}
+	if rr.Code != http.StatusGatewayTimeout {
+		t.Fatalf("end-to-end: status = %d, want 504", rr.Code)
+	}
+	if got := rr.Header().Get("Content-Type"); !strings.Contains(got, "application/problem+json") {
+		t.Fatalf("end-to-end: Content-Type = %q, want problem+json", got)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("end-to-end: body unmarshal: %v", err)
+	}
+	if env.Code != "request_budget_exceeded" {
+		t.Fatalf("end-to-end: code = %q, want request_budget_exceeded", env.Code)
+	}
+	if got := testutil.ToFloat64(m.RequestBudgetExceededTotal.WithLabelValues("forward", "POST:/payment", "gateway")); got != 1 {
+		t.Fatalf("end-to-end: counter = %v, want 1", got)
 	}
 }
 

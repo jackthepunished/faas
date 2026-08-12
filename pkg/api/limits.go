@@ -3783,6 +3783,17 @@ const (
 	// (EdgeRuleJWTVerifyTimeoutDefault, dashboard 3s, billing 30s,
 	// sync-invoke 5-30s).
 	RequestBudgetApidDefault = 5 * time.Second
+	// RequestBudgetDefaultOverrideHeader is the platform-wide
+	// default header name a kind=budget rule's AllowOverrideHeader
+	// resolves to when the rule leaves the field empty. Customers
+	// can override per-request by sending
+	// `x-faas-budget-ms: 3000` on the inbound request — the value
+	// is parsed as a positive integer milliseconds and replaces
+	// the static rule's BudgetMs for that single request, subject
+	// to the per-plan RequestBudgetMaxDuration ceiling. A
+	// per-rule AllowOverrideHeader takes precedence over this
+	// default when set.
+	RequestBudgetDefaultOverrideHeader = "x-faas-budget-ms"
 
 	// DefaultOverheadDB is the per-hop reservation for a local PG
 	// round-trip. Reservation, not measurement — it ensures a

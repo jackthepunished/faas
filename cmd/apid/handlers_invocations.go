@@ -245,8 +245,12 @@ func (s *server) queueReceive(w http.ResponseWriter, r *http.Request, acct state
 		api.WriteProblem(w, api.ErrPlanFeatureGated("queues", acct.Plan))
 		return
 	}
-	const timeout = 30 * time.Second
-	payload, err := s.notif.WaitFor(r.Context(), db.NotifyInvocationDone,
+	// ADR-093 / PR-D: 30s long-poll becomes child of inbound budget
+	// when one is attached. min(parentRemaining, 30s). No-budget
+	// path keeps the legacy 30s WaitFor ceiling.
+	waitCtx, cancel := budgetCtx(r.Context(), 30*time.Second)
+	defer cancel()
+	payload, err := s.notif.WaitFor(waitCtx, db.NotifyInvocationDone,
 		func(p string) bool {
 			// Canonical match on app_id — substring tests would let a
 			// 32-char id tail collide with an unrelated id (review
@@ -254,7 +258,7 @@ func (s *server) queueReceive(w http.ResponseWriter, r *http.Request, acct state
 			_, got := extractNotifyFields(p)
 			return got == app.ID
 		},
-		timeout)
+		30*time.Second)
 	if errors.Is(err, db.ErrWaitTimeout) {
 		w.WriteHeader(http.StatusNoContent)
 		return

@@ -51,6 +51,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
 // cookieOnlyPathRE matches API routes that are gated server-side to
@@ -220,6 +222,21 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 // recipe; methods that need a custom header set it on req before
 // calling doReq.
 func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
+	// ADR-093 / PR-E: outbound SDK call becomes a child of the
+	// inbound budget when one is attached. The CLI / SDK never
+	// receives a Budget from the user today — but apid's
+	// gatewayd-internal handlers do call into the SDK to issue
+	// outbound HTTP (issue #739 / ADR-092 source-ref refresh), so
+	// the SDK honours any budget that's on the inbound ctx.
+	// childDeadline = min(parentRemaining, cli.Timeout) — the
+	// client's Timeout stays as the absolute ceiling; the budget
+	// can only tighten it. When no Budget is on the inbound ctx,
+	// cli.Timeout alone bounds the request (the legacy contract).
+	if b, ok := reqbudget.FromContext(req.Context()); ok {
+		newCtx, cancel, _ := b.WithCeiling(req.Context(), cli.Timeout)
+		defer cancel()
+		req = req.Clone(newCtx)
+	}
 	resp, err := cli.Do(req)
 	if err != nil {
 		return fmt.Errorf("could not reach the API: %w", err)

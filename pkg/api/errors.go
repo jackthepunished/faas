@@ -1785,6 +1785,15 @@ const (
 	// gating policy and the actor are different.
 	CodeRequestValidationFailed = "request_validation_failed"
 	CodeHeaderMutationForbidden = "header_mutation_forbidden"
+	// CodeRequestBudgetExceeded is the 504 a kind=budget edge rule
+	// (or its plan-level default) emits when the per-request
+	// wall-clock budget fires before the handler can write a
+	// response. The platform-enforced budget — the load-bearing
+	// contract is "deadline fires from any hop, not just the
+	// handler body" — surfaces this single stable code on every
+	// outbound problem envelope so an SDK can branch on it
+	// without parsing prose. ADR-093 §Decision.
+	CodeRequestBudgetExceeded = "request_budget_exceeded"
 )
 
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler

@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ControlAddr is the bind address for the control-plane listener. Kept on
@@ -79,6 +81,68 @@ func ControlMux(m *Metrics, ready ReadyFunc, tracker *drain.Tracker) *http.Serve
 	}))
 	if m != nil {
 		mux.Handle("/metrics", wrap("control", m.Handler().ServeHTTP))
+	}
+	return mux
+}
+
+// ControlMuxWithExtra is the gatewayd-public / daemon-without-default-metrics
+// variant: builds the same /healthz, /readyz, /metrics mux as ControlMux
+// but plumbs an extra gatherer into the /metrics handler so callers can
+// expose their own metric families without re-implementing the control
+// listener. extra == nil mirrors ControlMux's behaviour (only m's
+// registry is exposed, if any). The two gatherers are combined into a
+// prometheus.Gatherers slice so a single scrape serves both — the
+// Prometheus text exposition format doesn't support per-gatherer
+// sections, but a single promhttp.HandlerFor over a Gatherers chain is
+// the documented way to expose multiple registries side-by-side.
+//
+//	ADR-093: reqbudget registers its histogram + counter against a
+//	fresh prometheus.NewRegistry() in cmd/gatewayd-public/main.go and
+//	passes that registry here, so /metrics scrapes the budget
+//	outcomes without the budget metrics having to live on a
+//	pre-existing daemon-default registry.
+func ControlMuxWithExtra(m *Metrics, extra prometheus.Gatherer, ready ReadyFunc, tracker *drain.Tracker) *http.ServeMux {
+	mux := http.NewServeMux()
+	wrap := func(label string, h http.HandlerFunc) http.HandlerFunc {
+		if tracker == nil {
+			return h
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			defer tracker.Begin(label)()
+			h(w, r)
+		}
+	}
+	mux.HandleFunc("/healthz", wrap("control", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	mux.HandleFunc("/readyz", wrap("control", func(w http.ResponseWriter, _ *http.Request) {
+		if ready == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not-ready: no probe registered"))
+			return
+		}
+		if ready() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("not-ready"))
+	}))
+	switch {
+	case m != nil && extra != nil:
+		// Combine both gatherers; prometheus.Gatherers is itself a
+		// Gatherer that fans out to its children. The returned
+		// handler renders the union on a single scrape.
+		mux.Handle("/metrics", wrap("control", promhttp.HandlerFor(
+			prometheus.Gatherers{m.Registry(), extra},
+			promhttp.HandlerOpts{Registry: prometheus.NewRegistry()},
+		).ServeHTTP))
+	case m != nil:
+		mux.Handle("/metrics", wrap("control", m.Handler().ServeHTTP))
+	case extra != nil:
+		mux.Handle("/metrics", wrap("control", promhttp.HandlerFor(extra, promhttp.HandlerOpts{Registry: prometheus.NewRegistry()}).ServeHTTP))
 	}
 	return mux
 }

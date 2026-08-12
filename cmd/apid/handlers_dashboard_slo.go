@@ -84,7 +84,7 @@ func (s *server) fetchDashboardSLO(ctx context.Context, log *slog.Logger, app st
 	if s.promqlClient == nil {
 		return nil
 	}
-	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	dctx, cancel := budgetCtx(ctx, 3*time.Second)
 	defer cancel()
 
 	// Scalar SLO panel (the existing fetchAppSLO). The
@@ -159,7 +159,7 @@ func (s *server) fetchDashboardAccountSLO(ctx context.Context, log *slog.Logger,
 	if s.promqlClient == nil {
 		return nil
 	}
-	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	dctx, cancel := budgetCtx(ctx, 3*time.Second)
 	defer cancel()
 
 	scalar, src := s.fetchAccountSLO(dctx, acct, window)
@@ -223,7 +223,7 @@ func (s *server) fetchDashboardSLOBadges(ctx context.Context, log *slog.Logger, 
 	if s.promqlClient == nil {
 		return nil
 	}
-	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	dctx, cancel := budgetCtx(ctx, 3*time.Second)
 	defer cancel()
 
 	// Edge case: cap the apps-list badge set so a 100-app
