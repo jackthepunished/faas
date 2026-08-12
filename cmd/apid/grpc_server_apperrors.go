@@ -52,7 +52,7 @@ const (
 // declared here so unit tests can substitute a fake without
 // spinning a real Postgres pool.
 type appErrorsStore interface {
-	IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) error
+	IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error)
 	InsertAppErrorRequest(ctx context.Context, arg sqlc.InsertAppErrorRequestParams) error
 }
 
@@ -166,7 +166,14 @@ func (a *appErrorsReceiver) handleOne(ctx context.Context, req *apidpb.Increment
 	// UPDATE; the params struct only carries the first_seen_at
 	// fallback (used when the INSERT fires). See pkg/state/queries.sql
 	// IncrementAppError for the full shape.
-	incErr := a.store.IncrementAppError(ctx, sqlc.IncrementAppErrorParams{
+	//
+	// inserted tells us whether the row was a fresh INSERT (true)
+	// or an ON CONFLICT DO UPDATE (false) — Postgres exposes this
+	// via the canonical (xmax = 0) trick on the RETURNING clause.
+	// The wire-side outcome distinguishes "inserted" from
+	// "merged" so the gateway can update its in-process LRU
+	// freshness on the merge path.
+	inserted, incErr := a.store.IncrementAppError(ctx, sqlc.IncrementAppErrorParams{
 		ID:            state.NewPgtypeUUID(newRowID()),
 		AccountID:     state.NewPgtypeUUID(accountID),
 		AppID:         state.NewPgtypeUUID(appID),
@@ -228,8 +235,19 @@ func (a *appErrorsReceiver) handleOne(ctx context.Context, req *apidpb.Increment
 	}
 
 	a.observe("ok")
-	out.Outcome = outcomeInserted
-	out.DedupeMerged = false
+	if inserted {
+		out.Outcome = outcomeInserted
+		out.DedupeMerged = false
+	} else {
+		out.Outcome = outcomeMerged
+		out.DedupeMerged = true
+		// Bump the unlabelled dedupe-merge counter so the §12
+		// "dedupe-effectiveness" panel sees the split between
+		// fresh inserts and ON CONFLICT hits.
+		if a.ops != nil {
+			a.ops.ObserveAppErrorsDedupeMerge()
+		}
+	}
 	return out
 }
 

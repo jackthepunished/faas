@@ -3355,7 +3355,7 @@ type Store interface {
 	// line 2611 — sqlc types leak through the Store interface
 	// for the queries that sqlc owns; readers convert to typed
 	// AppErrorGroup/Row/Row at the boundary).
-	IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) error
+	IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error)
 
 	// InsertAppErrorRequest writes one drill-down row per request
 	// that hit the fingerprint. No ON CONFLICT — every request

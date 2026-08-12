@@ -220,13 +220,18 @@ func (r *appErrorsRecorder) record(status int, req *http.Request) {
 	// Compute the fingerprint (sha256 hex of route|status|class).
 	fp := deriveFingerprint(route, status, errClass)
 
-	// LRU hit: bump cache; skip the redaction work (the
-	// publisher will skip it too because the cached row
-	// already has SampleMsg + HeadersJSON populated). We
-	// still increment the LRU counter + record the new
-	// received_at so the publisher can ship the dedupe-merge
-	// record.
-	if r.cacheHit(fp) {
+	// LRU hit: bump cache + observe the hit; the redaction work
+	// is skipped on the merge path because the apid-side
+	// ON CONFLICT DO UPDATE only touches count + request_count +
+	// last_seen_at (sample_message / headers / route / status /
+	// error_class are frozen at the first insert). Skipping the
+	// regex pass saves the per-request cost; the per-request row
+	// in app_error_requests still carries an empty
+	// headers_sample + no redactions on the merge path (which is
+	// the correct behaviour — the drill-down view shows the FIRST
+	// sample only).
+	cacheHit := r.cacheHit(fp)
+	if cacheHit {
 		if r.ops != nil {
 			r.ops.ObserveAppErrorsFingerprintCacheHit()
 		}
@@ -241,18 +246,27 @@ func (r *appErrorsRecorder) record(status int, req *http.Request) {
 		return
 	}
 
-	// Extract the sample message from the request body or
-	// from the matched route's handler metadata. Default
-	// to the request URL path when no body is available.
-	sample := extractSampleMessage(req)
-	headers := extractHeaders(req, r.cfg.HeadersSampleMaxKeys)
-
-	// Redact before enqueue. Apply() truncates + applies the
-	// canonical PII regex set; ApplyHeaders does the same per
-	// header value.
-	redactedSample, redactions := r.redact.Apply(sample)
-	redactedHeaders, headerRedactions := r.redact.ApplyHeaders(headers)
-	allRedactions := mergeRedactions(redactions, headerRedactions)
+	// Extract the sample message + headers, run redaction, and
+	// build the row — but ONLY on the cache-miss / first-insert
+	// path. On a cache hit, the apid-side handler's ON CONFLICT
+	// DO UPDATE keeps the FIRST sample_message + headers, so
+	// paying the regex cost on every hit would waste CPU for no
+	// observable benefit (the stored value never changes).
+	var (
+		redactedSample string
+		headersJSON    string
+		allRedactions  []string
+	)
+	if !cacheHit {
+		sample := extractSampleMessage(req)
+		headers := extractHeaders(req, r.cfg.HeadersSampleMaxKeys)
+		var redactions []string
+		var headerRedactions []string
+		redactedSample, redactions = r.redact.Apply(sample)
+		redactedHeaders, headerRedactions := r.redact.ApplyHeaders(headers)
+		allRedactions = mergeRedactions(redactions, headerRedactions)
+		headersJSON = mapToJSON(redactedHeaders)
+	}
 
 	// Build the row.
 	row := appErrorRow{
@@ -264,7 +278,7 @@ func (r *appErrorsRecorder) record(status int, req *http.Request) {
 		HTTPStatus:   status,
 		ErrorClass:   errClass,
 		SampleMsg:    redactedSample,
-		HeadersJSON:  mapToJSON(redactedHeaders),
+		HeadersJSON:  headersJSON,
 		Redactions:   allRedactions,
 		InstanceID:   req.Header.Get("X-Gregale-Instance-ID"), // propagated by vmmd
 		ReceivedAt:   r.cfg.Now().UTC(),

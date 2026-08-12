@@ -125,14 +125,17 @@ func (p *appErrorsPurger) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := p.purgeOnce(ctx, uuid.Nil); err != nil {
-				p.log.Warn("app_errors purge failed", "err", err)
-				if p.ops != nil {
-					// Reuse the dedupe-merge counter as a
-					// "purge ran but failed" signal; the §12
-					// dashboard panel keys off the rate.
-					p.ops.ObserveAppErrorsDedupeMerge()
-				}
+			// PR-A ships the structural cron shell only;
+			// the per-account iterator lands in PR-B
+			// alongside the reader-path handlers
+			// (cmd/apid/handlers_app_errors.go). Until
+			// then there is nothing for the retention
+			// pass to delete, so observe `no_accounts`
+			// and move on — the operator dashboard panel
+			// surfaces this every 24h until PR-B wires
+			// the iterator.
+			if p.ops != nil {
+				p.ops.ObserveAppErrorsPurge("no_accounts")
 			}
 		}
 	}
@@ -144,6 +147,8 @@ func (p *appErrorsPurger) Run(ctx context.Context) {
 // abort the sweep. The caller (Run) is responsible for
 // iterating across accounts — the cron is per-account today;
 // PR-B will introduce a platform-wide walk.
+//
+//nolint:unused // PR-B wires this from the Run loop once the per-account iterator lands alongside the reader-path handlers.
 func (p *appErrorsPurger) purgeOnce(ctx context.Context, accountID uuid.UUID) error {
 	horizon := p.computeHorizon()
 	if horizon.IsZero() {
@@ -179,6 +184,8 @@ func (p *appErrorsPurger) purgeOnce(ctx context.Context, accountID uuid.UUID) er
 //
 // Returns the zero time when no plan values are loaded (caller
 // treats this as a misconfiguration).
+//
+//nolint:unused // PR-B wires this from purgeOnce once the per-account iterator lands.
 func (p *appErrorsPurger) computeHorizon() time.Time {
 	if p.limits == nil {
 		return time.Time{}
@@ -208,6 +215,8 @@ func (p *appErrorsPurger) computeHorizon() time.Time {
 // where the list of active accounts is held in memory (the
 // platform-wide "walk every account" SQL is deferred to PR-B
 // alongside the admin-side /v1/admin/obs/overview expansion).
+//
+//nolint:unused // PR-B wires this from purgeOnce once the per-account iterator lands.
 func (p *appErrorsPurger) purgeRequestsOlderThan(ctx context.Context, accountID uuid.UUID, now time.Time, horizon time.Time) error {
 	if err := p.store.DeleteAppErrorRequestsOlderThan(ctx, accountID, horizon); err != nil {
 		return fmt.Errorf("delete app_error_requests: %w", err)
@@ -224,6 +233,8 @@ func (p *appErrorsPurger) purgeRequestsOlderThan(ctx context.Context, accountID 
 // ListAppErrorFingerprintsForPurge (pkg/state/queries.sql); the
 // downstream DELETE operates on app_errors via
 // DeleteAppErrorsByIDs.
+//
+//nolint:unused // PR-B wires this from purgeOnce once the per-account iterator lands.
 func (p *appErrorsPurger) purgeGhostFingerprints(ctx context.Context, accountID uuid.UUID, now time.Time, horizon time.Time) error {
 	rows, err := p.store.ListAppErrorFingerprintsForPurge(ctx, sqlc.ListAppErrorFingerprintsForPurgeParams{
 		AccountID:  state.NewPgtypeUUID(accountID),
@@ -253,6 +264,8 @@ func (p *appErrorsPurger) purgeGhostFingerprints(ctx context.Context, accountID 
 // The cardinality ceiling is asserted in pkg/api/limits.go and
 // rendered into a 429-style rejection when the gateway tries to
 // insert past the cap (also PR-B).
+//
+//nolint:unused // PR-B wires this from purgeOnce once the per-account iterator lands.
 func (p *appErrorsPurger) purgeCardinality(ctx context.Context, accountID uuid.UUID) error {
 	// Future PR: add AppErrorsMaxFingerprintsPerApp loop here.
 	return nil

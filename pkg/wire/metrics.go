@@ -288,6 +288,14 @@ type OpsMetrics struct {
 	// closed label set keeps cardinality bounded. Single-registry:
 	// registered on every daemon; only gatewayd-internal +
 	// apid increment via ObserveAppErrorsRecorded.
+	//
+	// NOTE (post-review): `db_error` increments per-row on EVERY
+	// failure — not just the 5th-consecutive. A batch is drained
+	// from the ringbuffer in tryFlush BEFORE flushBatch is called,
+	// so a failure means those rows are already lost; suppressing
+	// the per-row observe until the tripwire fires would let the
+	// first four failures of every outage disappear from the
+	// dashboard.
 	appErrorsRecorded *prometheus.CounterVec
 	// appErrorsFingerprintCacheHits (ADR-096) — counter for the
 	// gatewayd-internal recorder's in-process LRU fingerprint
@@ -322,6 +330,17 @@ type OpsMetrics struct {
 	// registered on every daemon; only gatewayd-internal
 	// increments via ObserveAppErrorsFlushDuration.
 	appErrorsFlushDuration prometheus.Histogram
+	// appErrorsPurges (ADR-096) — counter for the apid retention
+	// cron (cmd/apid/app_errors_purge.go). outcome ∈
+	// {ok, no_accounts, failed}. `ok` is the §12 retention-
+	// enforcement panel (rate over 24h, MUST be >0 once an
+	// account iterator lands); `no_accounts` is the signal that
+	// the cron ran but had no accounts to walk (PR-A ships with
+	// no iterator wired, so this fires every 24h until PR-B);
+	// `failed` is the tripwire for a SQL-level failure (alertable).
+	// Single-registry: registered on every daemon; only apid
+	// increments via ObserveAppErrorsPurge.
+	appErrorsPurges *prometheus.CounterVec
 	// accountLabels: the bounded admission set shared by the
 	// account_id-labelled metrics above. See accountLabelSet docs
 	// for the fixed-capacity, non-evicting contract — an evicting
@@ -2072,7 +2091,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// ObserveAppErrorsRecorded.
 	appErrorsRecorded := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_app_errors_recorded_total",
-		Help: "Customer-facing automatic error grouping ingest outcomes (ADR-096), labelled by outcome ∈ {ok, redaction_failed, rate_limited, db_error}. `ok` is the §12 customer-error-ingest panel (rate over 5m). `redaction_failed` is the tripwire for pkg/redact panicking — MUST stay at 0. `rate_limited` is the LRU-cardinality backstop firing when an app exceeds CardinalityLimit fingerprints. `db_error` is the publisher's 5th-consecutive-failure drop (better to lose a batch than block the request path). Single-registry: registered on every daemon; only gatewayd-internal + apid increment via ObserveAppErrorsRecorded.",
+		Help: "Customer-facing automatic error grouping ingest outcomes (ADR-096), labelled by outcome ∈ {ok, redaction_failed, rate_limited, db_error}. `ok` is the §12 customer-error-ingest panel (rate over 5m). `redaction_failed` is the tripwire for pkg/redact panicking — MUST stay at 0. `rate_limited` is the LRU-cardinality backstop firing when an app exceeds CardinalityLimit fingerprints. `db_error` is the publisher's per-row drop signal — incremented for EVERY row of a failed flush batch (the batch is drained before flushBatch is called, so failures always lose data; per-row observe gives the §12 panel an accurate outage timeline rather than only the 5th-consecutive-failure tripwire). Single-registry: registered on every daemon; only gatewayd-internal + apid increment via ObserveAppErrorsRecorded.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, appErrorsRecorded)
 	// ADR-096: in-process LRU fingerprint cache hit counter.
@@ -2104,6 +2123,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
 	})
 	commonCollectors = append(commonCollectors, appErrorsFlushDuration)
+	// ADR-096: retention cron outcome counter (apid-side).
+	// Labelled by outcome ∈ {ok, no_accounts, failed}. `ok` is
+	// the §12 retention-enforcement panel (rate over 24h, MUST
+	// be >0 once an account iterator lands); `no_accounts` is
+	// the signal that the cron ran but had no accounts to walk
+	// (PR-A ships with no iterator wired, so this fires every
+	// 24h until PR-B); `failed` is the tripwire for a SQL-level
+	// failure (alertable). Pre-instantiated at boot so the row
+	// surfaces in /metrics from the moment apid starts (single-
+	// registry rule).
+	appErrorsPurges := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_purges_total",
+		Help: "Retention cron outcomes for the customer-facing error grouping store (ADR-096), labelled by outcome ∈ {ok, no_accounts, failed}. `ok` is the §12 retention-enforcement panel (rate over 24h, MUST be >0 once an account iterator lands — Free 1d / Hobby 7d / Pro 30d / Scale 90d ceiling). `no_accounts` is the signal that the cron ran but had no accounts to walk (PR-A ships with no iterator wired, so this fires every 24h until PR-B lands the account iterator alongside the reader-path handlers). `failed` is the tripwire for a SQL-level failure (alertable). Single-registry: registered on every daemon; only apid increments via ObserveAppErrorsPurge.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, appErrorsPurges)
+	// Pre-instantiate the outcome set so /metrics surfaces the
+	// rows from a fresh process (Prometheus skips zero-valued
+	// CounterVec series by default). Extending the outcome
+	// vocabulary requires extending this loop in lock-step with
+	// the cmd/apid/app_errors_purge.go::Run dispatch.
+	for _, outcome := range []string{"ok", "no_accounts", "failed"} {
+		appErrorsPurges.WithLabelValues(outcome)
+	}
 	// ADR-067 / Tier A6: migrating-instance watchdog reconcile counter.
 	// Labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}.
 	// The reinvited label is the §12 dashboard panel (sum over 5m for
@@ -2546,6 +2588,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsFingerprintCacheHits:      appErrorsFingerprintCacheHits,
 		appErrorsDedupeMerges:              appErrorsDedupeMerges,
 		appErrorsFlushDuration:             appErrorsFlushDuration,
+		appErrorsPurges:                    appErrorsPurges,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,
@@ -2772,6 +2815,18 @@ func (m *OpsMetrics) ObserveAppErrorsFlushDuration(seconds float64) {
 		return
 	}
 	m.appErrorsFlushDuration.Observe(seconds)
+}
+
+// ObserveAppErrorsPurge records one observation of the apid
+// retention cron (ADR-096). outcome ∈ {ok, no_accounts,
+// failed}. nil-safe — no-op if m is nil or the metric was
+// pre-instantiated without labels. The closed outcome set keeps
+// cardinality bounded.
+func (m *OpsMetrics) ObserveAppErrorsPurge(outcome string) {
+	if m == nil || m.appErrorsPurges == nil {
+		return
+	}
+	m.appErrorsPurges.WithLabelValues(outcome).Inc()
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram

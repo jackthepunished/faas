@@ -28,8 +28,8 @@ import (
 var errMemStoreAppErrors = errors.New("state: MemStore does not implement ADR-096 app_errors — run the test against pgtest")
 
 // IncrementAppError (ADR-096) — MemStore stub. Postgres-only.
-func (m *MemStore) IncrementAppError(_ context.Context, _ sqlc.IncrementAppErrorParams) error {
-	return errMemStoreAppErrors
+func (m *MemStore) IncrementAppError(_ context.Context, _ sqlc.IncrementAppErrorParams) (bool, error) {
+	return false, errMemStoreAppErrors
 }
 
 // InsertAppErrorRequest (ADR-096) — MemStore stub. Postgres-only.

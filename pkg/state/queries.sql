@@ -758,13 +758,19 @@ SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1;
 -- — sqlc doesn't manage indexes, only the typed query surface).
 -- ---------------------------------------------------------------------------
 
--- name: IncrementAppError :exec
+-- name: IncrementAppError :one
 -- ADR-096 §3.5 dedupe-merge INSERT. The grpc_server_apperrors.go
 -- handler runs this inside a single pgx transaction per stream
 -- batch. ON CONFLICT target is app_errors_dedupe_uniq (the
 -- migration's UNIQUE on (account_id, app_id, fingerprint)).
 -- The dedupe window is enforced by the writer's LRU; this
 -- unique constraint is the last-resort tripwire.
+--
+-- Returns (inserted bool) via the canonical Postgres
+-- (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+-- on an UPDATE. This lets the handler distinguish
+-- outcomeInserted vs outcomeMerged on the wire — the gateway
+-- uses that signal to update its in-process LRU freshness.
 INSERT INTO app_errors (
     id, account_id, app_id, deployment_id, fingerprint,
     route, http_status, error_class, sample_message,
@@ -777,7 +783,8 @@ INSERT INTO app_errors (
 ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE SET
     count         = app_errors.count + 1,
     request_count = app_errors.request_count + 1,
-    last_seen_at  = greatest(app_errors.last_seen_at, $10);
+    last_seen_at  = greatest(app_errors.last_seen_at, $10)
+RETURNING (xmax = 0) AS inserted;
 
 -- name: InsertAppErrorRequest :exec
 -- One row per request that hit the grouped fingerprint. No

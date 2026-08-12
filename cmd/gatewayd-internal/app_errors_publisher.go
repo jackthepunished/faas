@@ -238,22 +238,38 @@ func (p *appErrorsPublisher) openStream(ctx context.Context) (apidgrpc.AppErrorS
 	return stream, nil
 }
 
-// recordFailure increments the consecutive-failure counter.
-// At AppErrorsFlushMaxConsecutiveFailures the publisher
-// drops the in-flight batch (counter increment for db_error).
+// recordFailure increments the consecutive-failure counter AND
+// observes `db_error` for every row in the dropped batch on
+// every failure — NOT just after the 5th consecutive one.
+//
+// Why: the batch was drained from the ringbuffer in tryFlush
+// BEFORE being passed to flushBatch, so a failure means those
+// rows are already gone. Suppressing the per-row db_error
+// observe until the 5th failure means the §12 dashboard misses
+// the first 4 failures of every outage, and an operator looking
+// at the rate panel sees a clean signal right up until the
+// tripwire fires — by which point 5×256 rows have been lost.
+//
+// At AppErrorsFlushMaxConsecutiveFailures the publisher also
+// drops the stream so the next flush opens a fresh RPC; the
+// counter is reset so a single successful flush clears the
+// tripwire.
 func (p *appErrorsPublisher) recordFailure(err error, batch []appErrorRow) {
 	p.streamMu.Lock()
 	defer p.streamMu.Unlock()
 	p.consecutiveFailures++
 	p.log.Warn("app_errors flush failed", "consecutive_failures", p.consecutiveFailures, "err", err)
-	if p.consecutiveFailures >= AppErrorsFlushMaxConsecutiveFailures {
-		// Drop the batch + drop the stream.
-		if p.ops != nil {
-			for range batch {
-				p.ops.ObserveAppErrorsRecorded("db_error")
-			}
+	if p.ops != nil {
+		for range batch {
+			p.ops.ObserveAppErrorsRecorded("db_error")
 		}
-		p.log.Warn("app_errors flush dropping batch after consecutive failures",
+	}
+	if p.consecutiveFailures >= AppErrorsFlushMaxConsecutiveFailures {
+		// Drop the stream — the next flush opens a fresh RPC.
+		// The batch is already gone (drained in tryFlush);
+		// the per-row db_error observes above are the data-
+		// loss signal.
+		p.log.Warn("app_errors flush dropped stream after consecutive failures",
 			"batch_size", len(batch),
 			"consecutive_failures", p.consecutiveFailures)
 		p.stream = nil

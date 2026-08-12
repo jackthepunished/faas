@@ -14336,7 +14336,7 @@ func pgtypeFromTime(t time.Time) pgtype.Timestamptz {
 // a single pgx transaction; this method runs ONE call at a
 // time — the caller is responsible for the tx (via
 // pgxpool.Pool's BeginTx in the grpc handler).
-func (s *PgStore) IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) error {
+func (s *PgStore) IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error) {
 	return s.appErrorsQueries().IncrementAppError(ctx, s.pool, arg)
 }
 

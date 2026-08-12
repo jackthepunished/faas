@@ -1316,7 +1316,7 @@ func (q *Queries) GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetS
 	return i, err
 }
 
-const incrementAppError = `-- name: IncrementAppError :exec
+const incrementAppError = `-- name: IncrementAppError :one
 
 INSERT INTO app_errors (
     id, account_id, app_id, deployment_id, fingerprint,
@@ -1331,6 +1331,7 @@ ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE SET
     count         = app_errors.count + 1,
     request_count = app_errors.request_count + 1,
     last_seen_at  = greatest(app_errors.last_seen_at, $10)
+RETURNING (xmax = 0) AS inserted
 `
 
 type IncrementAppErrorParams struct {
@@ -1364,8 +1365,14 @@ type IncrementAppErrorParams struct {
 // migration's UNIQUE on (account_id, app_id, fingerprint)).
 // The dedupe window is enforced by the writer's LRU; this
 // unique constraint is the last-resort tripwire.
-func (q *Queries) IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) error {
-	_, err := db.Exec(ctx, incrementAppError,
+//
+// Returns (inserted bool) via the canonical Postgres
+// (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+// on an UPDATE. This lets the handler distinguish
+// outcomeInserted vs outcomeMerged on the wire — the gateway
+// uses that signal to update its in-process LRU freshness.
+func (q *Queries) IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) (bool, error) {
+	row := db.QueryRow(ctx, incrementAppError,
 		arg.ID,
 		arg.AccountID,
 		arg.AppID,
@@ -1377,7 +1384,9 @@ func (q *Queries) IncrementAppError(ctx context.Context, db DBTX, arg IncrementA
 		arg.SampleMessage,
 		arg.FirstSeenAt,
 	)
-	return err
+	var inserted bool
+	err := row.Scan(&inserted)
+	return inserted, err
 }
 
 const insertAppErrorRequest = `-- name: InsertAppErrorRequest :exec

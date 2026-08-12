@@ -146,7 +146,13 @@ type Querier interface {
 	// migration's UNIQUE on (account_id, app_id, fingerprint)).
 	// The dedupe window is enforced by the writer's LRU; this
 	// unique constraint is the last-resort tripwire.
-	IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) error
+	//
+	// Returns (inserted bool) via the canonical Postgres
+	// (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+	// on an UPDATE. This lets the handler distinguish
+	// outcomeInserted vs outcomeMerged on the wire — the gateway
+	// uses that signal to update its in-process LRU freshness.
+	IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) (bool, error)
 	// One row per request that hit the grouped fingerprint. No
 	// ON CONFLICT — every request gets its own row. request_count
 	// on app_errors is bumped on the paired IncrementAppError
