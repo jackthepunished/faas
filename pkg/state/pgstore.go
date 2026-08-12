@@ -11143,13 +11143,16 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// column projection wraps preview_of_slug and
 		// preview_pr_state in coalesce(..., '') so the scan
 		// targets can be plain strings (NULL → '' round-trips
-		// through). preview_pr_number is a plain int — the
-		// SQL NULL → Go zero convention via pgx is fine
-		// because production rows always carry 0 (which is
-		// distinguishable from "preview with pr_number=0"
-		// via the preview_of_slug discriminator). preview_expires_at
-		// is nullable timestamptz scanned into *time.Time
-		// directly (pgx handles SQL NULL → Go nil).
+		// through). preview_pr_number is wrapped in
+		// coalesce(..., 0) so the scan can use a plain *int
+		// target — pgx rejects SQL NULL into *int with
+		// "cannot scan NULL into *int" (the strict default
+		// for the int4 → Go int mapping). The 0 sentinel is
+		// distinguishable from "preview with pr_number=0" via
+		// the preview_of_slug discriminator (prod apps have
+		// preview_of_slug=NULL → ''). preview_expires_at is
+		// nullable timestamptz scanned into *time.Time
+		// directly (pgx handles SQL NULL → Go nil natively).
 		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt); err != nil {
 		return mapErr(err)
 	}
@@ -11250,10 +11253,14 @@ const appsSelectColumns = `
 	-- still open). preview_pr_state is the closed-set label
 	-- enforced by apps_preview_pr_state_chk (migration 00218);
 	-- the coalesce() wraps NULL → '' so the pgx scan into a
-	-- plain string is safe. preview_expires_at is nullable
-	-- timestamptz scanned into *time.Time directly (pgx
-	-- handles SQL NULL → Go nil natively).
-	coalesce(preview_of_slug, ''), preview_pr_number,
+	-- plain string is safe. preview_pr_number is wrapped in
+	-- coalesce(..., 0) so the scan can target *int directly
+	-- (pgx rejects SQL NULL into *int with "cannot scan NULL
+	-- into *int"; the 0 sentinel is distinguishable from a real
+	-- PR-number-0 preview via the preview_of_slug discriminator).
+	-- preview_expires_at is nullable timestamptz scanned into
+	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
+	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
 	coalesce(preview_pr_state, ''), preview_expires_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
