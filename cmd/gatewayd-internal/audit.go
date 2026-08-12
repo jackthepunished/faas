@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"log/slog"
 
+	"github.com/onebox-faas/faas/pkg/auditutil"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -53,10 +54,33 @@ func newGatewaydAuditor(store auditStore, log *slog.Logger) *gatewaydAuditor {
 // swallowed — the proxy must not roll back a webhook forward
 // because the audit row failed to land. Matches the apid Emit
 // semantics at cmd/apid/audit.go:79.
+//
+// ADR-091 D20 PR-B: this method does NOT stamp a `result` field.
+// Call sites that want to record an outcome use EmitResult; legacy
+// sites without a meaningful outcome (e.g. webhook.forwarded) stay
+// on Emit. Mirrors pkg/audit.Auditor.Emit / EmitResult.
 func (a *gatewaydAuditor) Emit(ctx context.Context, kind string, subject *string, data map[string]any) {
+	a.emit(ctx, kind, subject, data, "")
+}
+
+// EmitResult is the result-bearing twin of [Emit]. result is the
+// literal value written to data["result"] — "success" / "error"
+// in the load-bearing case (edge_rule.* audit rows) or a finer
+// form for sites that encode context. The stamp goes through
+// [auditutil.WithResult] so a caller's explicit value on
+// data["result"] always wins.
+func (a *gatewaydAuditor) EmitResult(ctx context.Context, kind string, subject *string, data map[string]any, result string) {
+	a.emit(ctx, kind, subject, data, result)
+}
+
+// emit is the shared body. result == "" is the legacy Emit path;
+// result != "" is the EmitResult path. Single source of truth for
+// marshal + store call so the two entry points stay in lock-step.
+func (a *gatewaydAuditor) emit(ctx context.Context, kind string, subject *string, data map[string]any, result string) {
 	if a == nil {
 		return
 	}
+	data = auditutil.WithResult(data, result)
 	payload, err := json.Marshal(data)
 	if err != nil {
 		if a.log != nil {

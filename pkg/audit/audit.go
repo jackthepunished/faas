@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/onebox-faas/faas/pkg/auditutil"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -91,7 +92,34 @@ func (a *Auditor) SetOps(ops Ops) {
 // in-memory trace ring on the same key. The lift is best-effort: a
 // missing span context (legacy single-box without OTel) leaves the
 // data unchanged.
+//
+// ADR-091 D20 PR-B: emit sites that want to stamp the binary
+// `result` field call [EmitResult] (or wrap their data with
+// auditutil.WithResult before calling Emit). Emit itself does NOT
+// stamp a default result — keeps the cmd/gatewayd-internal mirror
+// in lock-step (it does NOT call this method) and avoids a second
+// silent wire-format change. Legacy emit sites without a meaningful
+// outcome stay on Emit unchanged.
 func (a *Auditor) Emit(ctx context.Context, kind string, accountID *string, data map[string]any) {
+	a.emit(ctx, kind, accountID, data, "")
+}
+
+// EmitResult is the result-bearing twin of [Emit]. result is the
+// literal value written to data["result"] — "success" / "error" in
+// the load-bearing case, or a finer-grained form (e.g.
+// "error:code=im403") for sites that want to encode context. The
+// stamp goes through [auditutil.WithResult] so a caller's explicit
+// value on data["result"] always wins over the supplied result.
+func (a *Auditor) EmitResult(ctx context.Context, kind string, accountID *string, data map[string]any, result string) {
+	a.emit(ctx, kind, accountID, data, result)
+}
+
+// emit is the shared body. result == "" is the legacy Emit path;
+// result != "" is the EmitResult path. Single source of truth for
+// the trace lift, marshal, store call, and metric observation —
+// keeping the two entry points in lock-step.
+func (a *Auditor) emit(ctx context.Context, kind string, accountID *string, data map[string]any, result string) {
+	data = auditutil.WithResult(data, result)
 	if data == nil {
 		data = map[string]any{}
 	}
