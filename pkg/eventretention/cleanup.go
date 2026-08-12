@@ -26,6 +26,7 @@ package eventretention
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -119,8 +120,38 @@ type Cleanup struct {
 // goroutine outlives the construction order). Pass nil to
 // disable the metric path. Safe to call from any goroutine before
 // the first RunOnce fires.
+//
+// Typed-nil guard: storing a non-nil interface wrapping a
+// typed-nil pointer (e.g. SetOps(srv.ops) when srv.ops is a nil
+// *wire.OpsMetrics) would panic at the next metric call — the
+// nil-receiver guard on the concrete Counter/Gauge returns nil
+// and .Add/.Set on nil panics. isTypedNil normalises both
+// flavours to the same nil c.ops value so RunOnce's `c.ops != nil`
+// check stays accurate. Production never hits this (apid always
+// passes a non-nil srv.ops) but unit tests can.
 func (c *Cleanup) SetOps(ops Ops) {
+	if isTypedNil(ops) {
+		c.ops = nil
+		return
+	}
 	c.ops = ops
+}
+
+// isTypedNil returns true when v is either an untyped nil interface
+// OR a non-nil interface wrapping a nil concrete pointer (or chan,
+// func, map, slice). Avoids the classic Go interface footgun where
+// `var p *T = nil; var i Interface = p` makes `i != nil` true but
+// the underlying method dispatch panics.
+func isTypedNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Chan, reflect.Func, reflect.Map, reflect.Slice, reflect.Interface:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // New returns a Cleanup wired to the given Store. Panics if Store

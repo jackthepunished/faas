@@ -425,3 +425,68 @@ func TestNew_NilOpsDisablesMetricPath(t *testing.T) {
 		t.Errorf("deleted = %d, want 7", deleted)
 	}
 }
+
+// typedNilOps is a typed-nil pointer-to-pointer concrete; passing it
+// to SetOps exercises the typed-nil footgun guard. The equivalent
+// real-world failure mode is cmd/apid passing `srv.ops` (a
+// *wire.OpsMetrics) into SetOps when WithOpsMetrics was never
+// called — the interface is non-nil but the underlying pointer is
+// nil.
+type typedNilOps struct{}
+
+func (*typedNilOps) AuditEventsDeleted() prometheus.Counter  { return nil }
+func (*typedNilOps) AuditEventsRetentionLag() prometheus.Gauge { return nil }
+
+// TestSetOps_TypedNilDoesNotPin traps the typed-nil interface
+// regression: SetOps(&nilPointer) must treat the input as nil so
+// RunOnce's `c.ops != nil` check stays accurate. Without the
+// guard, the per-call counter / gauge return nil from the typed-
+// nil receiver and .Add/.Set panics on nil. PR-B code review
+// surfaced this as a latent footgun.
+func TestSetOps_TypedNilDoesNotPin(t *testing.T) {
+	f := &fakeStore{
+		deleteFunc: func(_ time.Time) (int64, error) { return 1, nil },
+	}
+	c := New(Params{Store: f})
+
+	var pn *typedNilOps // typed nil
+	var ops Ops = pn    // non-nil interface wrapping typed-nil pointer
+
+	if ops == nil {
+		t.Fatal("pre-condition broken: typed-nil interface unexpectedly nil")
+	}
+	c.SetOps(ops)
+
+	// RunOnce must NOT panic — and it must NOT increment the
+	// underlying counter, since the typed-nil interface was
+	// normalised to nil by the guard.
+	if _, err := c.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+}
+
+// TestSetOps_RealOpsPinStillWorks is the positive twin: a non-nil
+// Ops must still be retained and observed.
+func TestSetOps_RealOpsPinStillWorks(t *testing.T) {
+	f := &fakeStore{
+		deleteFunc: func(_ time.Time) (int64, error) { return 3, nil },
+	}
+	c := New(Params{Store: f})
+
+	real := &fakeOps{}
+	c.SetOps(real)
+
+	if _, err := c.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	real.mu.Lock()
+	defer real.mu.Unlock()
+	if len(real.deletedCalls) != 1 {
+		t.Errorf("deletedCalls = %d, want 1", len(real.deletedCalls))
+	}
+}
+
+// Compile-time witness: *typedNilOps implements Ops (with nil-
+// returning methods) so the typed-nil test above exercises the
+// same call-shape production uses.
+var _ Ops = (*typedNilOps)(nil)
