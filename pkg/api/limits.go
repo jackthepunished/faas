@@ -87,6 +87,15 @@ type Limits struct {
 	VCPU         int // firecracker vcpu_count (spec §4.4)
 	IdleTimeoutS int // default idle-reaper timeout (spec §4.3)
 
+	// End-to-end request budget (ADR-093). Per-plan overrides for
+	// the platform's wall-clock deadline on every customer-facing
+	// request. 0 falls back to RequestBudgetDefault /
+	// RequestBudgetMax in the limits.go const block. Per-route
+	// overrides via edge-rule kind=budget take precedence at
+	// request time.
+	RequestBudgetMs    int // 0 → RequestBudgetDefault; non-zero clamped to [1, RequestBudgetMaxMs]
+	RequestBudgetMaxMs int // 0 → RequestBudgetMax; non-zero must be ≥ RequestBudgetMs
+
 	// CPU fairness (issue #301 / ADR-044). The 3-level cgroup hierarchy
 	// (faas-tenant.slice/tenant-<plan>.slice/<instance>) enforces these
 	// per-plan via two complementary channels:
@@ -3742,3 +3751,99 @@ const (
 	ObsAdminEventsLimitDefault = 200
 	ObsAdminEventsLimitMax     = ObsAdminPaginationMax
 )
+
+// End-to-end request budgets (ADR-093). The platform enforces a
+// wall-clock budget on every customer-facing request and propagates
+// the remaining time to every downstream call (DB, gRPC, outbound
+// HTTP). The values here are the *defaults* — per-route overrides
+// live on the edge-rule kind=budget JSON document, and per-plan
+// overrides live on Limits.RequestBudgetMs (added below).
+//
+// Source of truth: pkg/reqbudget re-exports these as reqbudget.*
+// so call-sites can use one import.
+const (
+	// RequestBudgetDefault is the per-request wall-clock budget the
+	// gatewayd-public BudgetMiddleware installs when no edge-rule
+	// kind=budget matches. 3 s matches the example in the user's
+	// feature ask ("POST /payment → 3 s"). A misconfigured
+	// deployment that wants a tighter or looser default can override
+	// per-route via kind=budget, or per-plan via the
+	// Limits.RequestBudgetMs accessor.
+	RequestBudgetDefault = 3 * time.Second
+	// RequestBudgetMax is the absolute upper bound on any per-request
+	// budget. Defends against a misconfiguration that would re-pin a
+	// 300 s stdlib WriteTimeout as the request budget. Per-plan max
+	// lives on Limits.RequestBudgetMaxMs; 0 falls back here.
+	RequestBudgetMax = 30 * time.Second
+	// RequestBudgetApidDefault is the apid-side default budget.
+	// apid serves dashboards + admin + sync-invoke long-polls that
+	// are already capped at 910 s upstream (fwdStream) so 5 s is
+	// the floor, not the ceiling; per-call context.WithTimeout calls
+	// in handlers continue to enforce their own sub-ceilings
+	// (EdgeRuleJWTVerifyTimeoutDefault, dashboard 3s, billing 30s,
+	// sync-invoke 5-30s).
+	RequestBudgetApidDefault = 5 * time.Second
+
+	// DefaultOverheadDB is the per-hop reservation for a local PG
+	// round-trip. Reservation, not measurement — it ensures a
+	// downstream call starts with at most (parentRemaining - 10 ms)
+	// even before its own work begins. Sized for local control
+	// plane; cross-region deployments may need larger reservations
+	// in a follow-up.
+	DefaultOverheadDB = 10 * time.Millisecond
+	// DefaultOverheadGRPC is the per-hop reservation for a local
+	// vmmd gRPC call. Same shape as DefaultOverheadDB — reservation,
+	// not measurement.
+	DefaultOverheadGRPC = 5 * time.Millisecond
+	// DefaultOverheadHTTP is the per-hop reservation for an outbound
+	// HTTP call (e.g. the public→internal RoundTrip).
+	DefaultOverheadHTTP = 20 * time.Millisecond
+	// DefaultOverheadStream is the per-hop reservation for a
+	// streaming first-byte ack. Larger than DB/gRPC because the
+	// first-byte acknowledgment involves one extra round-trip vs
+	// the unary case.
+	DefaultOverheadStream = 50 * time.Millisecond
+	// DefaultOverheadQueue is the per-hop reservation for a wake /
+	// enqueue / poll call. Small because these are local ops.
+	DefaultOverheadQueue = 5 * time.Millisecond
+)
+
+// RequestBudget returns the wall-clock deadline the platform
+// installs on customer-facing requests for this plan, falling back
+// to RequestBudgetDefault when the per-plan field is unset. The
+// returned duration is clamped to [1, RequestBudgetMax] so a
+// misconfigured Limits row cannot pin the budget to zero or to a
+// value larger than RequestBudgetMax. Per-route edge-rule
+// kind=budget overrides still take precedence at request time —
+// this accessor is the *baseline* the middleware starts from.
+//
+// ADR-093.
+func (l Limits) RequestBudget() time.Duration {
+	d := time.Duration(l.RequestBudgetMs) * time.Millisecond
+	if d <= 0 {
+		d = RequestBudgetDefault
+	}
+	if d > RequestBudgetMax {
+		d = RequestBudgetMax
+	}
+	return d
+}
+
+// RequestBudgetMaxDuration returns the absolute upper bound for any
+// per-request budget on this plan. 0 falls back to
+// RequestBudgetMax. Per-plan override clamps to [RequestBudget(),
+// 5 * RequestBudgetMax] so a customer with a 5 s plan default
+// cannot accidentally configure a 100 ms max (which would force the
+// default down to 100 ms).
+//
+// ADR-093.
+func (l Limits) RequestBudgetMaxDuration() time.Duration {
+	d := time.Duration(l.RequestBudgetMaxMs) * time.Millisecond
+	if d <= 0 {
+		d = RequestBudgetMax
+	}
+	if d < l.RequestBudget() {
+		d = l.RequestBudget()
+	}
+	return d
+}
