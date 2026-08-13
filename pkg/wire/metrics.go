@@ -383,13 +383,15 @@ type OpsMetrics struct {
 	// failure (alertable). Single-registry: registered on every
 	// daemon; only apid increments via ObservePreviewJanitor.
 	previewJanitorOutcomes *prometheus.CounterVec
-	// dataUpstreamRTT (ADR-098 PR-C) — most-recent observed
-	// RTT (ms) per (kind, host_redacted_hash, region). The
-	// label set is closed: kind ∈ closed-vocab; host_redacted_hash
-	// is the 8-hex prefix of sha256(salt||host); region is
-	// the meterd node's compute_nodes.region. §11: the
-	// plaintext host NEVER appears in any label.
-	dataUpstreamRTT *prometheus.GaugeVec
+	// dataUpstreamRTT (ADR-098 PR-C) — observed RTT bucketed
+	// per (kind, host_redacted_hash, region). The label set is
+	// closed: kind ∈ closed-vocab; host_redacted_hash is the
+	// 8-hex prefix of sha256(salt||host); region is the meterd
+	// node's compute_nodes.region. §11: the plaintext host NEVER
+	// appears in any label. Histogram (not Gauge) — the alert
+	// rules at faas.rules.yml:1062-1087 read p95 RTT via
+	// histogram_quantile() over the `_bucket` series.
+	dataUpstreamRTT *prometheus.HistogramVec
 	// dataUpstreamProbes (ADR-098 PR-C) — counter for the
 	// probe outcome class. outcome ∈ {ok, timeout, refused,
 	// tls_handshake, dns, unreachable}.
@@ -2335,9 +2337,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// "data placement" panel; schedd's chooser bias (PR-D)
 	// also reads from the same data_upstream_probes table
 	// rather than scraping these metrics.
-	dataUpstreamRTT := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	dataUpstreamRTT := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_data_upstream_rtt_ms",
-		Help: "Most-recent observed RTT (ms) for the (kind, host_redacted_hash, region) tuple. The label set is closed: kind ∈ {postgres, redis, mongo, ...}; host_redacted_hash is the 8-hex-char prefix of sha256(salt||host); region is the meterd node's compute_nodes.region. The plaintext host is NEVER in the labels (ADR-098 §11). §12 data-placement dashboard panel.",
+		Help: "Observed RTT (ms) bucketed per (kind, host_redacted_hash, region). Buckets cover 1ms..3s — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. The label set is closed: kind ∈ {postgres, redis, mongo, ...}; host_redacted_hash is the 8-hex-char prefix of sha256(salt||host); region is the meterd node's compute_nodes.region. The plaintext host is NEVER in the labels (ADR-098 §11). §12 data-placement dashboard panel.",
+		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 3000},
 	}, []string{"kind", "host_redacted_hash", "region"})
 	dataUpstreamProbes := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_data_upstream_probes_total",

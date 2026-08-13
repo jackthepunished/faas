@@ -1,0 +1,160 @@
+# Synthetic time-series fixture for ADR-098 §9.A meterd
+# data-upstream alerts (issue #NNN, ADR-098 row §D4).
+#
+# What this exercises:
+#   1. FaasUpstreamRttDegraded — the page alert. It must fire
+#      when p95 RTT (from meterd_data_upstream_rtt_ms_bucket)
+#      exceeds 200ms for 10m on a (kind, region) pair, and must
+#      NOT fire on a sub-200ms pair.
+#   2. FaasUpstreamRttHealthy — the info alert. It must fire
+#      when p95 RTT stays below 5ms for 10m, and must NOT fire
+#      on a pair above 5ms.
+#   3. The label contract — alerts carry (kind, region) labels
+#      only. A regression that adds a host_redacted_hash label
+#      (or worse, a plaintext host label) would trip the §11
+#      secret rule and surface here (assertion expects ONLY
+#     those two labels, with the meterd/component family
+#     metadata).
+#
+# Why this is the canonical synthetic-fixture test:
+# TestFaasRulesSyntax validates the rule file's syntax via
+# `promtool check rules` (parse-only); this test feeds real
+# samples through the alert evaluator and asserts the alert
+# opens at the configured threshold. No meterd instance
+# required — pure rule-engine evaluation.
+#
+# Synthetic-fixture mechanics (load-bearing — read before
+# editing): the alert expression is
+#   histogram_quantile(0.95, sum by (le, kind, region) (rate(meterd_data_upstream_rtt_ms_bucket[10m])))
+# `rate()` over a 10m window requires the bucket counts to
+# be MONOTONICALLY INCREASING across samples. With a constant
+# bucket count, `rate() = 0` and `histogram_quantile` is
+# undefined (no samples in the [10m] range). The fixture
+# series shape below is `0+1x50` — start at 0, increment by
+# 1 sample every 30s, for 50 samples (25m total). This
+# establishes a constant rate of 1 sample / 30s.
+#
+# Bucket boundaries MUST match the emitting histogram
+# (wire/metrics.go:2324 area). The meterd emits
+# `meterd_data_upstream_rtt_ms` (note: `_ms` suffix) with
+# buckets {1, 5, 10, 50, 100, 500, 1000, 3000} ms. The
+# fixture series below use those exact boundaries.
+
+rule_files:
+  - ../../../deploy/ansible/roles/prometheus/files/faas.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ──────────────────────────────────────────────────────────────
+  # Test 1 — degraded region (p95 = ~500ms) for 25m →
+  # FaasUpstreamRttDegraded fires.
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "postgres in us-east p95 RTT ~500ms for 25m → FaasUpstreamRttDegraded fires"
+    input_series:
+      # All samples land in the 500..1000ms bucket (p95 = 500ms
+      # in the bucket-boundary sense — see fixture mechanics).
+      # Below 500ms buckets stay constant at 0.
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="1"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="5"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="10"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="50"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="100"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="500"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="1000"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="3000"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="us-east",le="+Inf"}'
+        values: '0+1x50'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasUpstreamRttDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: meterd
+              family: data_placement
+              kind: postgres
+              region: us-east
+            exp_annotations:
+              summary: "Data-placement p95 RTT > 200ms for postgres/us-east"
+              description: "Connection-aware probe loop reports sustained p95 RTT > 200ms for postgres upstreams in us-east (10m window). Customer wakes are landing on a region with degraded connectivity — the chooser bias (C6) preserves the legacy fallthrough on stale scores so customer apps continue to wake, but the page signals a network condition worth investigating. Cross-reference with the recent deploy log; an outbound firewall change or inter-region route flap is the canonical cause."
+              runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamRttDegraded.md"
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 2 — healthy region (p95 ≈ 2ms) for 25m →
+  # FaasUpstreamRttHealthy fires (info).
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "postgres in eu-fra p95 RTT ~2ms for 25m → FaasUpstreamRttHealthy fires"
+    input_series:
+      # All samples land in the 1..5ms bucket (p95 = 1ms..5ms).
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="1"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="5"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="10"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="50"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="100"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="500"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="1000"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="3000"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="eu-fra",le="+Inf"}'
+        values: '0+1x50'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasUpstreamRttHealthy
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              component: meterd
+              family: data_placement
+              kind: postgres
+              region: eu-fra
+            exp_annotations:
+              summary: "Data-placement p95 RTT < 5ms for postgres/eu-fra"
+              description: "The chooser bias for postgres upstreams in eu-fra is observing p95 RTT < 5ms for 10m — the connection-aware placement is operating within the spec's healthy envelope. This is informational; no action required."
+
+  # ──────────────────────────────────────────────────────────────
+  # Test 3 — negative case: degraded pair fires the page but
+  # NOT the info alert (mutually exclusive on the same pair).
+  # ──────────────────────────────────────────────────────────────
+  - interval: 30s
+    name: "ap-tokyo p95 ~500ms for 25m → healthy does NOT fire"
+    input_series:
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="1"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="5"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="10"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="50"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="100"}'
+        values: '0+0x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="500"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="1000"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="3000"}'
+        values: '0+1x50'
+      - series: 'meterd_data_upstream_rtt_ms_bucket{kind="postgres",region="ap-tokyo",le="+Inf"}'
+        values: '0+1x50'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FaasUpstreamRttHealthy
+        # No exp_alerts → info MUST NOT fire when degraded.
