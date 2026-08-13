@@ -80,3 +80,9 @@ func (m *MemStore) ListAllAppDataUpstreams(_ context.Context, _, _ string) ([]Da
 func (m *MemStore) CountDataUpstreamsByApp(_ context.Context, _, _ string) (int, error) {
 	return 0, errMemStoreDataUpstreams
 }
+
+// ListDistinctUpstreamHostHashes (ADR-098 PR-C) — MemStore
+// stub. Postgres-only. Used by the meterd probe loop.
+func (m *MemStore) ListDistinctUpstreamHostHashes(_ context.Context) ([]DataUpstreamTarget, error) {
+	return nil, errMemStoreDataUpstreams
+}

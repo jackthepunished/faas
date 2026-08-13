@@ -3901,3 +3901,13 @@ type DataUpstreamProbe struct {
 	// queries.sql read paths).
 	ProbeNode string
 }
+
+// DataUpstreamTarget is the deduplicated (host_redacted_hash,
+// kind, port) tuple the meterd probe loop iterates on every
+// tick. The plaintext host is NEVER on this struct — the
+// probe knows the host only by hash (§11 secret rule).
+type DataUpstreamTarget struct {
+	HostRedactedHash string
+	Kind             DataUpstreamKind
+	Port             int
+}

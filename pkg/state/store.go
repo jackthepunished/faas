@@ -3695,6 +3695,14 @@ type Store interface {
 	// the window.
 	ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error)
 
+	// ListDistinctUpstreamHostHashes (PR-C / meterd probe
+	// loop) walks data_upstreams and returns the
+	// deduplicated set of (host_redacted_hash, kind, port)
+	// tuples — the probe iterates this set on every tick.
+	// The plaintext host is NEVER returned; the §11 secret
+	// rule is the reason.
+	ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error)
+
 	// PruneDataUpstreamProbesOlderThan is the hourly retention
 	// purge. cutoff is typically now() - 30 days (matches the
 	// §12 prom_retention_days:15 floor × 2 safety margin).

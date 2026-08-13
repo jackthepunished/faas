@@ -15577,3 +15577,30 @@ func (s *PgStore) CountDataUpstreamsByApp(ctx context.Context, accountID, appID 
 		accountID, appID).Scan(&n)
 	return n, err
 }
+
+// ListDistinctUpstreamHostHashes walks data_upstreams and
+// returns the deduplicated set of
+// (host_redacted_hash, kind, port) tuples. Used by the meterd
+// probe loop (PR-C). Plaintext host is NEVER returned — the
+// §11 secret rule is the reason.
+func (s *PgStore) ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error) {
+	rows, err := s.pool.Query(ctx,
+		`select host_redacted_hash, kind, port
+		 from data_upstreams
+		 group by host_redacted_hash, kind, port`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstreamTarget
+	for rows.Next() {
+		var t DataUpstreamTarget
+		var kind string
+		if err := rows.Scan(&t.HostRedactedHash, &kind, &t.Port); err != nil {
+			return nil, err
+		}
+		t.Kind = DataUpstreamKind(kind)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
