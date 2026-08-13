@@ -4064,7 +4064,7 @@ haveApp:
 		// budget. The plan's ResponseWriteTimeout is the absolute
 		// ceiling — the budget can only shorten it. When no
 		// Budget is on ctx the per-flush deadline is unchanged.
-		if b, ok := reqbudget.FromContext(r.Context()); ok {
+		if b, ok := reqbudget.FromContext(r.Context()); ok { //nolint:contextcheck // request ctx at handler boundary; budget lookup is a reader (ctx.Value equivalent).
 			if rem := b.Remaining(time.Time{}); rem > 0 && rem < writeTimeout {
 				writeTimeout = rem
 			}

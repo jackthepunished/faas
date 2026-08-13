@@ -9591,7 +9591,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9607,6 +9607,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9624,7 +9625,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9640,6 +9641,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9667,6 +9669,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -10045,6 +10048,57 @@ components:
             clamped at compile time.
           example: 200
 
+    EdgeRuleBudgetAction:
+      description: |
+        Per-route end-to-end request budget (ADR-093 / §4.1.2.16).
+        The primitive for "POST /payment → 3 s, POST /signup → 10 s"
+        without writing timeout-propagation code in the customer's
+        app. The hot-path applier (cmd/gatewayd-public/main.go:PR-B
+        + pkg/gateway/handler_apply_edge_rule_budget.go) installs a
+        per-request `Budget` onto `r.Context()` via
+        `reqbudget.WithRemaining`; every downstream hop (DB, gRPC,
+        HTTP) tightens itself against the budget via
+        `reqbudget.WithOverhead` / `WithCeiling`.
+
+        On expiry the platform returns 504 + RFC 7807 problem
+        envelope (`code: request_budget_exceeded`) BEFORE the
+        customer's handler runs — the goal is bounded resource
+        pin per request, not customer-visible timer logic. Customer
+        code can read `reqbudget.FromContext(r.Context()).Remaining`
+        if it wants to short-circuit its own work early.
+
+        Field-by-field:
+          * `budget_ms` — required wall-clock budget. Must be > 0
+            and ≤ the per-plan max (`Plan.RequestBudgetMaxMs`, default
+            `RequestBudgetMax = 30 s`). A 0 or negative value is
+            rejected at create-time with 422.
+          * `allow_override_header` — optional HTTP request header
+            that lets a customer set a per-request override
+            (default `x-faas-budget-ms`). Empty (default) =
+            no override accepted; the edge-rule value is the
+            authoritative budget. The header is parsed as a
+            decimal integer in `[1, math.MaxInt32]`; out-of-range
+            values are ignored and the edge-rule value wins
+            (silent clamp, no 400 — the budget is a quality
+            primitive, not a security gate).
+
+        Rejections never reach the wake gate, the auth chain, or
+        the rate limiter — same posture as the other kind=budget
+        edge-rule appliers. Free-and-above (no plan gate).
+      type: object
+      required: [budget_ms]
+      properties:
+        budget_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 30000
+          description: "Per-request wall-clock budget in milliseconds (1 ms – 30 s)."
+        allow_override_header:
+          type: string
+          maxLength: 128
+          pattern: '^[A-Za-z][A-Za-z0-9-]*$'
+          description: "Optional RFC 7230 token header name for per-request override (default `x-faas-budget-ms`). Empty = no override."
 
     # ─── API keys ─────────────────────────────────────────────────────────
 

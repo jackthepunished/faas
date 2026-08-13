@@ -22,13 +22,8 @@ type testClock struct{ v atomicInt64 }
 
 type atomicInt64 struct{ v int64 }
 
-func (a *atomicInt64) load() int64     { return a.v }
-func (a *atomicInt64) store(v int64)   { a.v = v }
-func (a *atomicInt64) add(delta int64) { a.v += delta }
-
-func newTestClock(t time.Time) *testClock    { return &testClock{v: atomicInt64{v: t.UnixNano()}} }
-func (c *testClock) now() time.Time          { return time.Unix(0, c.v.v) }
-func (c *testClock) advance(d time.Duration) { c.v.add(int64(d)) }
+func newTestClock(t time.Time) *testClock { return &testClock{v: atomicInt64{v: t.UnixNano()}} }
+func (c *testClock) now() time.Time       { return time.Unix(0, c.v.v) }
 
 // noopHandler is the canonical "happy path" handler used by tests
 // that don't care about the inner work — it returns 200 with an

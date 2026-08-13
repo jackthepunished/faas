@@ -19,6 +19,17 @@ import (
 	"time"
 )
 
+// endpointUnknown / routeUnknown are the per-handler fallbacks the
+// middleware stamps on Budget.Endpoint / Route when the caller left
+// them blank. NewMiddlewareConfig callers (gatewayd-public, apid) set
+// both at startup; the inline Middleware(...) fallback path uses these
+// so a direct MiddlewareConfig{} literal still produces stable
+// metric labels.
+const (
+	endpointUnknown = "unknown"
+	routeUnknown    = "unknown"
+)
+
 // MiddlewareConfig wires BudgetMiddleware. nil Metrics means
 // observations are no-ops (tests + path that doesn't have a Prometheus
 // registry yet — the gateway build wires metrics in via runDeps).
@@ -76,7 +87,7 @@ func NewMiddlewareConfig(cfg MiddlewareConfig) (MiddlewareConfig, error) {
 		cfg.Log = slog.Default()
 	}
 	if cfg.Endpoint == "" {
-		cfg.Endpoint = "unknown"
+		cfg.Endpoint = endpointUnknown
 	}
 	return cfg, nil
 }
@@ -111,10 +122,10 @@ func (cfg MiddlewareConfig) Middleware(next http.Handler) http.Handler {
 		cfg.Log = slog.Default()
 	}
 	if cfg.Endpoint == "" {
-		cfg.Endpoint = "unknown"
+		cfg.Endpoint = endpointUnknown
 	}
 	if cfg.Route == "" {
-		cfg.Route = "unknown"
+		cfg.Route = routeUnknown
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
