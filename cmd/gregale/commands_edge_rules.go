@@ -31,19 +31,16 @@ import (
 
 // edgeRuleKindVocab mirrors the closed `kind` set in
 // migrations/00192_edge_rules.sql's CHECK constraint (extended by
-// migrations/00207 for validate and 00219 for limit). Surfacing a
-// typo locally avoids a 400 round-trip on every `edge-rules create`
-// call (same posture as webhookClosedVocab in commands_webhooks.go).
-// The validate entry is a drive-by fix for PR-B's omission — the
-// gateway hot path has shipped kind=validate since #841 merged,
-// but the CLI rejected `--kind=validate` client-side; regen'd here
-// alongside kind=limit so the existing kinds table stays a single
+// migrations/00214 for validate, 00219 for limit, and 00220 for
+// geo). Surfacing a typo locally avoids a 400 round-trip on every
+// `edge-rules create` call (same posture as webhookClosedVocab in
+// commands_webhooks.go).
 // source of truth. The kind=geo entry is gated on PR #845's
 // migration landing; it will land in a follow-up commit when the
 // CHECK widens to 10 values.
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
-	"validate", "limit",
+	"validate", "limit", "geo",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
@@ -229,6 +226,11 @@ func cmdEdgeRulesCreate(args []string) int {
 	// pkg/api.EdgeRuleLimitAction.Validate().
 	limitMaxBodyBytes := fs.Int("limit-max-body-bytes", 0, "kind=limit: required buffered body cap in bytes (>0, <=25MiB)")
 	limitMaxBodyBytesStreaming := fs.Int("limit-max-body-bytes-streaming", 0, "kind=limit: optional streaming body cap in bytes (0=inherit buffered; <=100MiB)")
+	// geo (ADR-091 D21). ISO 3166-1 alpha-2 country codes; the
+	// validator in pkg/api/dto.go enforces the closed vocab.
+	var geoAllow, geoDeny multiFlag
+	fs.Var(&geoAllow, "geo-allow", "kind=geo: allow country code (ISO 3166-1 alpha-2; repeat)")
+	fs.Var(&geoDeny, "geo-deny", "kind=geo: deny country code (ISO 3166-1 alpha-2; repeat)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -268,6 +270,8 @@ func cmdEdgeRulesCreate(args []string) int {
 		IPDeny:                     ipDeny,
 		LimitMaxBodyBytes:          *limitMaxBodyBytes,
 		LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
+		GeoAllow:                   geoAllow,
+		GeoDeny:                    geoDeny,
 	})
 	if err != nil {
 		return printErr("Invalid flags for --kind="+*kind, err)
@@ -383,6 +387,9 @@ func cmdEdgeRulesUpdate(args []string) int {
 	var ipAllow, ipDeny multiFlag
 	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR")
 	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR")
+	var geoAllow, geoDeny multiFlag
+	fs.Var(&geoAllow, "geo-allow", "kind=geo: allow country code (ISO 3166-1 alpha-2)")
+	fs.Var(&geoDeny, "geo-deny", "kind=geo: deny country code (ISO 3166-1 alpha-2)")
 
 	// limit (ADR-091 D24). Same flags as Create; either flag
 	// present flips anyKindFlagVisited() true so the action jsonb
@@ -473,6 +480,8 @@ func cmdEdgeRulesUpdate(args []string) int {
 			IPDeny:                     ipDeny,
 			LimitMaxBodyBytes:          *limitMaxBodyBytes,
 			LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
+			GeoAllow:                   geoAllow,
+			GeoDeny:                    geoDeny,
 		})
 		if err != nil {
 			return printErr("Invalid flags for --kind="+*kind, err)
@@ -568,6 +577,9 @@ type edgeRuleActionInputs struct {
 	// server-side guard catches the omission cleanly.
 	LimitMaxBodyBytes          int
 	LimitMaxBodyBytesStreaming int
+	// geo (ADR-091 D21). ISO 3166-1 alpha-2 country codes;
+	// uppercased + space-stripped before the validator runs.
+	GeoAllow, GeoDeny []string
 }
 
 // buildEdgeRuleAction marshals the per-kind inputs into the matching
@@ -679,6 +691,19 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			return nil, errToError(err)
 		}
 		return marshalAction(a)
+	case "geo":
+		// ISO 3166-1 alpha-2 country codes. The validator in
+		// pkg/api/dto.go enforces the closed vocab + the 50-entry
+		// cardinality cap + the no-dupes invariant; the CLI just
+		// uppercases here so the wire shape is consistent regardless
+		// of how the customer typed the flag.
+		allow := upperCountryCodes(in.GeoAllow)
+		deny := upperCountryCodes(in.GeoDeny)
+		a := api.EdgeRuleGeoAction{Allow: allow, Deny: deny}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)
 }
@@ -704,6 +729,30 @@ func errToError(p *api.Problem) error {
 		return nil
 	}
 	return fmt.Errorf("%s", p.Detail)
+}
+
+// upperCountryCodes (ADR-091 D21) uppercases + trims each
+// ISO 3166-1 alpha-2 country code so the wire shape is consistent
+// regardless of how the customer typed the flag ("de" → "DE").
+// Empty / whitespace-only entries are dropped. The closed-vocab
+// check lives in pkg/api.EdgeRuleGeoAction.Validate (the
+// 2-letter rule + the reserved-code set).
+func upperCountryCodes(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, c := range in {
+		trimmed := strings.TrimSpace(c)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, strings.ToUpper(trimmed))
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // parseKVList splits each entry on the first `:` into Name/Value.

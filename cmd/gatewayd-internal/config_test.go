@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -118,7 +119,7 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 	if !c.TLS.UseStagingCA {
 		t.Error("UseStagingCA should be true from the fixture")
 	}
-	if got := c.resolveTLSConfig(func(string) bool { return true }); !got.UseStagingCA || got.ContactEmail != "ops@gregale.dev" {
+	if got := c.resolveTLSConfig(func(context.Context, string) (bool, error) { return true, nil }); !got.UseStagingCA || got.ContactEmail != "ops@gregale.dev" {
 		t.Errorf("resolveTLSConfig lost TLS fields: %+v", got)
 	}
 }
@@ -137,7 +138,7 @@ func TestConfig_ResolveTLSConfig(t *testing.T) {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	called := false
-	allowlist := func(string) bool { called = true; return true }
+	allowlist := func(_ context.Context, _ string) (bool, error) { called = true; return true, nil }
 	got := c.resolveTLSConfig(allowlist)
 	if got.Disabled {
 		t.Error("resolved TLS.Disabled = true, want false")
@@ -145,7 +146,11 @@ func TestConfig_ResolveTLSConfig(t *testing.T) {
 	if got.OnDemandHTTP01Allowlist == nil {
 		t.Fatal("resolved allowlist is nil")
 	}
-	if !got.OnDemandHTTP01Allowlist("any.gregale.dev") {
+	ok, err := got.OnDemandHTTP01Allowlist(context.Background(), "any.gregale.dev")
+	if err != nil {
+		t.Fatalf("allowlist err = %v, want nil", err)
+	}
+	if !ok {
 		t.Error("allowlist returned false on a permissive closure")
 	}
 	if !called {

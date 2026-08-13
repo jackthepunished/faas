@@ -79,7 +79,7 @@ type runDeps struct {
 	// existing app_changed consumer stays as the logging-only
 	// fallback. Tests inject a fake channel.
 	subscribeEgressDrift func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
-	// subscribeAppDelete (ADR-095) is the producer-side seam for
+	// subscribeAppDelete (ADR-098) is the producer-side seam for
 	// the app_delete consumer that evicts any in-flight wake for
 	// a deleted app via Engine.wakeCoord.Forget. nil = the
 	// subscriber is not started; tests inject a fake channel.
@@ -185,7 +185,7 @@ func defaultDeps() runDeps {
 		subscribePlacementClaim: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
 		},
-		// ADR-095: subscribe to app_delete so the wake coordinator
+		// ADR-098: subscribe to app_delete so the wake coordinator
 		// forgets in-flight wakes the moment apid deletes the app.
 		// Mirrors subscribeDeletion's shape (one channel, db.Subscribe
 		// is the production adapter, nil seam skips in tests).
@@ -779,7 +779,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		go subscribeWithReconnect(ctx, "deletion", log, deps.subscribeDeletion, pool, sub.Run)
 	}
 
-	// ADR-095: app-delete dispatch is folded into loop.Run's
+	// ADR-098: app-delete dispatch is folded into loop.Run's
 	// existing LISTEN (see loop.go's NotifyAppDelete case in
 	// handleNotification). No standalone goroutine, no extra pool
 	// connection — same zero-cost multiplexing pattern as
@@ -1188,7 +1188,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// floor trigger can share the same actor="schedd" instance
 	// and emit `floor.wake` audit rows on every proactive admit.
 	schedulerAuditor := audit.New(store, log, ops, "schedd")
-	// ADR-095: app-delete handler. Built here (not via the
+	// ADR-098: app-delete handler. Built here (not via the
 	// runDeps.subscribeAppDelete seam — that seam's now a stub
 	// retained only for the main_coverage_smoke_test defaultDeps
 	// assertion) and dispatched from loop.Run's existing LISTEN
@@ -1617,15 +1617,15 @@ type schedScaleUpEngine struct {
 // AdmitInstance implements scaleup.Engine: delegates to the wrapped
 // engine and lifts the relevant fields into the thinned
 // scaleup.AdmitResult.
-func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID string) (scaleup.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "")
+func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID, scope string) (scaleup.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
 	if err != nil {
 		return scaleup.AdmitResult{}, err
 	}
 	return scaleup.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }
 
-// EnsureWake (ADR-095) implements scaleup.Engine: delegates to the
+// EnsureWake (ADR-098) implements scaleup.Engine: delegates to the
 // wrapped engine's single-flight wake entry and lifts the relevant
 // fields into the thinned scaleup.WakeOutcome. AtCapacity is dropped
 // because the leader's ledger closes the at-cap loop; the trigger
@@ -1665,15 +1665,15 @@ type schedTargetsEngine struct {
 // the re-observe branch is dead code and the metric loses the
 // per-tick AtCapacity signal that the dashboard's "would have
 // scaled but cap reached" pane depends on.
-func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (targets.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "")
+func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID, scope string) (targets.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
 	if err != nil {
 		return targets.AdmitResult{}, err
 	}
 	return targets.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }
 
-// EnsureWake (ADR-095) implements targets.Engine: delegates to the
+// EnsureWake (ADR-098) implements targets.Engine: delegates to the
 // wrapped engine's single-flight wake entry and lifts the relevant
 // fields into the thinned targets.WakeOutcome. AtCapacity is dropped
 // because the leader's ledger closes the at-cap loop.
@@ -1704,8 +1704,8 @@ type schedFloorEngine struct {
 }
 
 // AdmitInstance implements floor.Engine.
-func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "")
+func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID, scope string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}
@@ -1714,15 +1714,15 @@ func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floo
 
 // AdmitInstanceForDeployment implements floor.Engine (issue #557
 // closure / ADR-074 — per-deployment floor wake).
-func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID)
+func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID, scope)
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}
 	return floor.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }
 
-// EnsureWake (ADR-095) implements floor.Engine: delegates to the
+// EnsureWake (ADR-098) implements floor.Engine: delegates to the
 // wrapped engine's single-flight wake entry and lifts the relevant
 // fields into the thinned floor.WakeOutcome. AtCapacity is dropped
 // because the leader's ledger closes the at-cap loop; the trigger

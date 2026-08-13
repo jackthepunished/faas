@@ -460,6 +460,35 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 // rawBridgeBodyLoop — callers can ask for less, never more.
 const ForwardRawStreamMaxRequestBytes = api.RawStreamMaxRequestBytes
 
+// ForwardRawStreamMaxResponseBytes is the per-session egress cap
+// on the raw-bytes bridge (issue #676 / ADR-080 follow-up, PR-C).
+// Mirrors the inbound cap shape: the gateway stamps the constant
+// unchanged onto the init frame (PR-1 / PR-2 placement), and
+// rawBridgePumpBody clamps DOWN to api.RawStreamMaxResponseBytes
+// so a misconfigured caller cannot grow the cap past the limit.
+//
+// Sizing rationale: WS workloads are long-lived by design
+// (rawStreamSessionDeadline is 24 h, see
+// pkg/gateway/forwardproxy.go:464). The 100 MiB per-request cap
+// (ForwardRawStreamMaxRequestBytes) bounds a single HTTP request
+// body, but a session that holds for hours and streams bytes
+// faster than the customer reads them can balloon the gateway's
+// bidi goroutine pair. The 1 GiB per-session egress cap is the
+// load-bearing memory bound on the bridge side; a guest that
+// exceeds it sees the response stream close cleanly with
+// ResourceExhausted (mirrors the inbound cap's customer-facing
+// signal at rawBridgeBodyLoop). Customer impact: a chat-
+// completion WS that streams 100 KB/s for 3 h hits 1 GiB
+// cleanly — well above any sane single-session workload; a
+// runaway guest app surfaces as a deterministic 502 at the
+// gateway rather than an OOM-kill on vmmd.
+//
+// The cap is NOT a billing surface — the (plan_ram + 8) per-
+// running-second cost (CLAUDE.md §"Hard limits") already pays
+// for WS residency. The cap is memory-safety + abuse-
+// prevention only.
+const ForwardRawStreamMaxResponseBytes = api.RawStreamMaxResponseBytes
+
 // vmmdRawBridgePath is the install path of the cmd/vmmd-raw-bridge
 // Go binary. Mirrors the deployment convention of vmmd itself
 // (/opt/faas/current/bin/vmmd-raw-bridge). MUST be an absolute
@@ -694,7 +723,7 @@ func (s *Server) ForwardRawStream(stream grpc.BidiStreamingServer[vmmdpb.Forward
 		return status.Errorf(codes.Internal, "raw bridge init send: %v", err)
 	}
 
-	if err := rawBridgePumpBody(stream, headReader, parsed.Body); err != nil {
+	if err := rawBridgePumpBody(stream, headReader, parsed.Body, reqInit.GetMaxRequestBytes()); err != nil {
 		_ = rawBridgeFinish(cmd, bodyErrCh, bodyWG, stream.Context(), stderr.String())
 		return err
 	}
@@ -854,9 +883,38 @@ func rawBridgeReadHead(r *bufio.Reader, stderr string) (*parsedBridgeResponse, e
 // On any send error the function drains the body goroutine and
 // surfaces Internal — the bidi stream is already half-closed by
 // the guest at that point.
-func rawBridgePumpBody(stream grpc.BidiStreamingServer[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], r *bufio.Reader, initialBody []byte) error {
+// rawBridgePumpBody pipes bytes from the bridge's stdout into the
+// gRPC response stream. The rx cap (issue #676 / ADR-080 follow-up,
+// PR-C) is clamped DOWN to ForwardRawStreamMaxResponseBytes — a
+// misconfigured gatewayd-internal cannot grow the cap past the
+// limit. The init frame's existing max_request_bytes field is
+// reused as the rx-cap source for now (a separate
+// max_response_bytes field is a wire change deferred to a follow-up
+// ADR; PR-C ships memory-safety without a wire bump). When the cap
+// fires the function returns ResourceExhausted, which surfaces as a
+// 502 + body="raw bridge response cap exceeded" at the gateway's
+// rawStreamOnceWithEvents (mirrors the inbound cap's behaviour at
+// rawBridgeBodyLoop).
+func rawBridgePumpBody(stream grpc.BidiStreamingServer[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], r *bufio.Reader, initialBody []byte, maxResponseBytes int64) error {
 	const respChunkSize = 8 * 1024
+	// Clamp DOWN: callers may ask for less, never more. The default
+	// (maxResponseBytes == 0) is the api.RawStreamMaxResponseBytes
+	// ceiling — a zero init field means "use the platform default",
+	// matching the inbound cap's behaviour at rawBridgeBodyLoop:781-784.
+	maxBody := ForwardRawStreamMaxResponseBytes
+	if maxResponseBytes > 0 && maxResponseBytes < maxBody {
+		maxBody = maxResponseBytes
+	}
 	if len(initialBody) > 0 {
+		// The initial body was already counted in parsed.Body by
+		// rawBridgeReadHead; if it alone exceeds the cap, surface
+		// the cap error immediately so the gateway's
+		// rawStreamOnceWithEvents emits a deterministic 502 rather
+		// than streaming a partial response.
+		if int64(len(initialBody)) > maxBody {
+			return status.Errorf(codes.ResourceExhausted,
+				"raw bridge response cap exceeded: %d > %d", len(initialBody), maxBody)
+		}
 		if err := stream.Send(&vmmdpb.ForwardRawResponse{
 			Frame: &vmmdpb.ForwardRawResponse_BodyChunk{
 				BodyChunk: append([]byte(nil), initialBody...),
@@ -866,9 +924,15 @@ func rawBridgePumpBody(stream grpc.BidiStreamingServer[vmmdpb.ForwardRawRequest,
 		}
 	}
 	buf := make([]byte, respChunkSize)
+	var totalRx int64
 	for {
 		n, rerr := r.Read(buf)
 		if n > 0 {
+			totalRx += int64(n)
+			if totalRx > maxBody {
+				return status.Errorf(codes.ResourceExhausted,
+					"raw bridge response cap exceeded: >%d bytes (initial + body)", maxBody)
+			}
 			if err := stream.Send(&vmmdpb.ForwardRawResponse{
 				Frame: &vmmdpb.ForwardRawResponse_BodyChunk{
 					BodyChunk: append([]byte(nil), buf[:n]...),

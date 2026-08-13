@@ -1,0 +1,87 @@
+// preview_parser.go — pure parser for preview-host hostnames
+// (issue #272 / ADR-095 PR-B). Extracted from
+// cmd/gatewayd-internal/backend.go::pgRouter.previewScopeFromHost so the
+// on-demand cert allowlist (pkg/gateway/allowlist.go) and the routing
+// layer share a single source of truth — a hostname that the router
+// accepts must be acceptable to the allowlist (and vice versa), and the
+// two paths cannot drift if they call into the same function.
+//
+// Pure: no I/O, no globals, no logger. Lives in pkg/gateway (not
+// cmd/gatewayd-internal) so pkg/gateway stays free of pkg/state and the
+// router code can stay close to the rest of the edge TLS plumbing.
+package gateway
+
+import (
+	"strconv"
+	"strings"
+)
+
+// PreviewScopeFromHost peels a preview-hostname shape
+// `pr-{N}.{parent-slug}.apps.<zone>` into (PR number, parent slug).
+// appsSuffix is the leading-dot form (".apps.gregale.dev"); empty
+// suffix refuses everything. The function returns ok=false for any
+// deviation from the locked shape — prod hosts, uppercase, leading
+// zeros, embedded dots in the parent slug, non-numeric PR numbers,
+// missing parent slug.
+//
+// Match is strict: case-sensitive `pr-` prefix; ASCII digits for the
+// PR number (no leading zero — GitHub PR numbers are never 0-padded,
+// and a scan that produced `pr-0...` is either malformed or hostile);
+// parent slug limited to the existing slug charset `[a-z0-9-]` with
+// no embedded dot. Any deviation returns ok=false; the caller falls
+// back to the prod-shape resolution (which itself fails closed at
+// the allowlist for non-prod shapes).
+//
+// Caller responsibility: this function does NOT consult the apps
+// table. The lookup half (resolving (n, slug) → preview app row →
+// state check) is the responsibility of OnDemandPreviewLookup in
+// pkg/gateway/allowlist.go.
+func PreviewScopeFromHost(appsSuffix, host string) (number int, slug string, ok bool) {
+	if appsSuffix == "" {
+		return 0, "", false
+	}
+	label, ok := strings.CutSuffix(host, appsSuffix)
+	if !ok || label == "" {
+		return 0, "", false
+	}
+	if !strings.HasPrefix(label, "pr-") {
+		return 0, "", false
+	}
+	tail := label[3:]
+	dash := strings.IndexByte(tail, '-')
+	if dash <= 0 || dash == len(tail)-1 {
+		return 0, "", false
+	}
+	digits := tail[:dash]
+	if digits[0] == '0' && len(digits) > 1 {
+		return 0, "", false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, "", false
+		}
+	}
+	rest := tail[dash+1:]
+	// No inner dots: the parent slug must not contain a separator (the
+	// platform slug charset already excludes dots; this guard rejects
+	// pathological scans like `pr-42.foo.bar.apps.gregale.dev` whose
+	// label is "pr-42.foo.bar" and would otherwise split as slug="foo").
+	if strings.Contains(rest, ".") {
+		return 0, "", false
+	}
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if c < 'a' || c > 'z' {
+			if c < '0' || c > '9' {
+				if c != '-' {
+					return 0, "", false
+				}
+			}
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n <= 0 {
+		return 0, "", false
+	}
+	return n, rest, true
+}

@@ -21,6 +21,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
+	"github.com/onebox-faas/faas/pkg/geoip"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -129,6 +130,23 @@ type App struct {
 	// the pre-#477 customer behaviour in fakeBackend unit
 	// tests.
 	PublicAuth PublicAuthConfig
+	// Scope (issue #272 / ADR-095 PR-B) is the per-lookup scope
+	// label that the gateway forwards to schedd on the wake /
+	// admit path. Empty = production (the legacy single-deployment
+	// behaviour every pre-PR-B caller exercises). Non-empty =
+	// preview scope, e.g. "pr-42" — the preview app row already
+	// carries its own apps.id, so the scheduler resolves the
+	// wake against the scope's live deployment (ADR-091 surfaced
+	// LiveDeploymentForScope for this).
+	//
+	// The field is populated by pgRouter.toApp from the resolved
+	// apps row's preview_pr_state + preview_pr_number
+	// (preview apps row) or stays empty (prod row). It is NOT
+	// plumbed via the apps table — it's a per-lookup token, not a
+	// row property — so cache invalidation is identical to the
+	// existing route cache (apps_update / domain_changed wipes
+	// the route cache, and the next Lookup re-derives).
+	Scope string
 	// CORS improvements D1: per-app default CORS
 	// opt-in. Plumbed from apps.cors_default_enabled
 	// through pgRouter.toApp so applyEdgeRuleCORS
@@ -345,6 +363,11 @@ type Target struct {
 //     failure (RAM headroom, chooser, store).
 type Backend interface {
 	// Lookup resolves a hostname to its app (cache-first, spec §4.1).
+	// The scope is plumbed on the returned App (issue #272 /
+	// ADR-095 PR-B) — empty for prod, non-empty for preview
+	// hosts (e.g. "pr-42"). This avoids widening the Lookup
+	// signature itself; the App handle is the only thing the
+	// handler caches, so the scope must ride on it.
 	Lookup(ctx context.Context, host string) (App, bool)
 	// Pick returns a PickResult (issue #556 / PR-C): the routable
 	// Target plus the signals the handler needs to drive
@@ -381,13 +404,23 @@ type Backend interface {
 	// that specific deployment so the retry Pick has a
 	// routable Target.
 	//
+	// scope (issue #272 / ADR-095 PR-B): the per-lookup scope
+	// label forwarding the preview-vs-prod routing decision
+	// to schedd. Empty = prod (legacy). Non-empty = preview
+	// (e.g. "pr-42"). schedd threads scope through Engine.Wake
+	// / Engine.AdmitInstance / LiveDeploymentForScope so the
+	// preview app's deployment row is the one resolved, not
+	// the parent prod app's. The picker is keyed by appID
+	// (the preview app already has its own apps.id), so
+	// scope is orthogonal to the per-app picker buckets.
+	//
 	// On the admitted path wakeID is non-empty, the new
 	// Target is cached, and method reflects what schedd
 	// actually did (restore or cold boot). On the at-capacity
 	// path wakeID is empty, method is WakeMethodUnspecified,
 	// and err is nil. On real failure err is a non-nil
 	// *api.Problem and method is WakeMethodUnspecified.
-	Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
+	Admit(ctx context.Context, appID, deploymentID, scope string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
 }
 
 // Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -563,6 +596,12 @@ type Handler struct {
 	// proxy all see the *target* app's context, not the
 	// inbound host's (auth remains per-app).
 	edgeRules EdgeRuleMatcher
+	// geoReader is the pkg/geoip.Reader used by applyEdgeRuleGeo
+	// (ADR-091 D21). A nil reader means the gate is disabled —
+	// applyEdgeRuleGeo short-circuits to fall-through so the
+	// daemon boots cleanly without a DB-IP file (§11 fail-open
+	// spirit). Set via WithGeoReader.
+	geoReader *geoip.Reader
 	// resolveTargetApp is the closure the matcher uses to
 	// swap the gateway.App when a `kind=route` rule fires.
 	// It returns (App{}, false) when the slug is not found
@@ -777,6 +816,18 @@ func (h *Handler) WithEdgeRules(matcher EdgeRuleMatcher, resolve ResolveTargetAp
 	h.edgeRules = matcher
 	h.resolveTargetApp = resolve
 	h.edgeRuleAudit = audit
+	return h
+}
+
+// WithGeoReader (ADR-091 D21 / §4.1.2.8b) arms the per-rule
+// geographic lookup consulted by applyEdgeRuleGeo. r may be nil
+// (geo kind disabled; pre-PR-7 + file-missing posture). The
+// nil-receiver-safe pattern in pkg/geoip.Reader.Lookup means a
+// nil reader keeps the gate fail-open — the matcher can still
+// surface a geo rule, but the lookup returns ("", false, nil)
+// and the rule does not fire.
+func (h *Handler) WithGeoReader(r *geoip.Reader) *Handler {
+	h.geoReader = r
 	return h
 }
 
@@ -2295,6 +2346,162 @@ func contentTypeAllowed(ct string, allowed []string) bool {
 	return false
 }
 
+// applyEdgeRuleGeo (ADR-091 D21 / §4.1.2.8b) consults the per-host
+// edge-rule matcher for a `kind=geo` rule. Same shape as
+// applyEdgeRuleIP: Deny walks first, then Allow is evaluated; an
+// empty Allow is "no allowlist, only Deny applies"; a non-empty
+// Allow with no match is an implicit deny. The country lookup is
+// against the trusted XFF client IP via the configured
+// pkg/geoip.Reader.
+//
+// Failure mode (§11 spirit): the lookup is fail-open. A missing
+// DB, a corrupt file, an IP outside the dataset, or a decode
+// error returns ("", false, err_or_nil) from the reader; the rule
+// does not fire (we increment "failed" and emit a Warn log, but
+// the request flows through). The operator sees the metric tick
+// + the audit + the log so a missing-DB incident is detectable
+// even though traffic is unaffected.
+//
+// nil-safe: h.edgeRules nil OR h.geoReader nil short-circuits to
+// fall-through. Same-account posture mirrors applyEdgeRuleIP.
+func (h *Handler) applyEdgeRuleGeo(w http.ResponseWriter, r *http.Request, app App) bool {
+	if h.edgeRules == nil || h.geoReader == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchGeo(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+		}
+		return false
+	}
+	clientIP, ok := clientIPFromTrustedXFF(r)
+	if !ok {
+		// Defense-in-depth: gatewayd-public is required to set
+		// exactly one XFF entry. Same fail-closed posture as
+		// applyEdgeRuleIP — the rule cannot be evaluated against
+		// an untrusted source.
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+			api.CodeForbidden, "Caller IP not in trusted set",
+			"X-Forwarded-For did not contain exactly one entry; refusing to evaluate geo allow/deny rules"))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.caller_ip_forged", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"xff_count": len(r.Header.Values("X-Forwarded-For")),
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+		}
+		return true
+	}
+	country, found, lerr := h.geoReader.Lookup(clientIP)
+	if lerr != nil {
+		if h.log != nil {
+			h.log.Warn("edge rule geo lookup failed", "ip", clientIP, "err", lerr)
+		}
+	} else if !found {
+		if h.log != nil {
+			h.log.Debug("edge rule geo lookup no country", "ip", clientIP)
+		}
+	}
+	if lerr != nil || !found {
+		// Fail-open: the rule does not fire. The metric + audit
+		// surface lets the operator see the failure rate and
+		// the customer is not affected.
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_failed", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"reason":    geoFailReason(lerr, found),
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "failed")
+		}
+		return false
+	}
+	// Deny walks first.
+	if _, denied := rule.Deny[country]; denied {
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+			api.CodeForbidden, "Country denied",
+			"client country matches a deny entry on this edge rule"))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_blocked", nil, map[string]any{
+				"rule_id":   rule.ID,
+				"from_host": r.Host,
+				"country":   country,
+				"decision":  "deny",
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+		}
+		return true
+	}
+	// If Allow is non-empty, only listed pass.
+	if len(rule.Allow) > 0 {
+		if _, allowed := rule.Allow[country]; !allowed {
+			api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+				api.CodeForbidden, "Country not allowed",
+				"client country does not match any allow entry on this edge rule"))
+			if h.edgeRuleAudit != nil {
+				h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_blocked", nil, map[string]any{
+					"rule_id":   rule.ID,
+					"from_host": r.Host,
+					"country":   country,
+					"implicit":  true,
+				})
+			}
+			if h.metrics != nil {
+				h.metrics.ObserveEdgeRuleMatch("geo", "blocked")
+			}
+			return true
+		}
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.geo_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+			"country":   country,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("geo", "match")
+	}
+	return false
+}
+
+// geoFailReason returns a short audit-friendly string explaining
+// why the geo lookup was deemed "failed" (err vs not-found). The
+// audit pipeline copies this into the `"reason"` field of the
+// edge_rule.geo_failed event so an operator can distinguish a
+// corrupt DB from a missing record without re-reading the log.
+func geoFailReason(lerr error, found bool) string {
+	if lerr != nil {
+		return "lookup_error"
+	}
+	if !found {
+		return "no_country"
+	}
+	return "unknown"
+}
+
 // clientIPFromTrustedXFF extracts the single trusted X-Forwarded-For
 // entry that gatewayd-public writes before handing the request off
 // to gatewayd-internal. The cross-daemon handoff is via unix
@@ -3166,6 +3373,18 @@ haveApp:
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
+	// ADR-091 D21 / §4.1.2.8b — kind=geo runs AFTER kind=ip (so a
+	// customer who uses IP as a poor-man's geo block today is
+	// nudged to migrate to geo without their IP rules changing
+	// behaviour) and BEFORE require_authn (so a denied-by-country
+	// request never wakes a Firecracker microVM — the cold-wake
+	// gate is gated on the country, not on auth). The gate is
+	// fail-open on lookup failure (see applyEdgeRuleGeo for the
+	// metric + audit + slog path).
+	if h.applyEdgeRuleGeo(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
 
 	// ADR-091 D24 / kind=limit body cap gate. Runs AFTER JWT / IP
 	// (so rejected-on-ip / failed-jwt traffic never costs a body
@@ -3333,7 +3552,7 @@ haveApp:
 	// N instances before short-circuiting.
 	limits, _ := api.LimitsFor(app.Plan)
 	//nolint:contextcheck // request ctx at handler boundary.
-	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, limits.MaxConcurrency)
+	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.Scope, limits.MaxConcurrency)
 	if err != nil {
 		writeWakeError(w, err)
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
@@ -3356,7 +3575,7 @@ haveApp:
 	// that re-seeds the cache.
 	if !pick.OK && pick.ColdBucket != "" {
 		//nolint:contextcheck // request ctx at handler boundary; this is the wake-fan-out retry branch.
-		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, limits.MaxConcurrency); err != nil {
+		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, app.Scope, limits.MaxConcurrency); err != nil {
 			// Log-and-continue: the existing "warmest bucket"
 			// fallback inside Pick already handled the
 			// fallback path. Failure here means the cold
@@ -3493,9 +3712,31 @@ haveApp:
 	// the WS handshake in an infinite loop. A deterministic 501
 	// names the cause and the WS client can back off cleanly.
 	if isUpgradeRequest(r) {
-		if !app.WebSocketEnabled || h.rawByNode == nil {
-			h.writeWebSocketNotAllowed(w, app.ID, h.rawByNode == nil)
+		// Issue #676 / ADR-080 follow-up, PR-B: stamp
+		// (plan, metrics) onto the request context so the
+		// raw forwarder can label its gateway_ws_*
+		// observations without a wider public signature
+		// (see pkg/gateway/upgrade.go::withWSContext).
+		// h.metrics is nil in the pre-metrics test corpus;
+		// withWSContext no-ops on nil so the legacy test
+		// path keeps compiling.
+		r = r.WithContext(withWSContext(r.Context(), app.Plan, h.metrics)) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
+		if !app.WebSocketEnabled {
+			if h.metrics != nil {
+				h.metrics.IncWSUpgrade(string(app.Plan), WSOutcomePlanDenied)
+			}
+			h.writeWebSocketNotAllowed(w, app.ID, false)
 			return
+		}
+		if h.rawByNode == nil {
+			if h.metrics != nil {
+				h.metrics.IncWSUpgrade(string(app.Plan), WSOutcomeBridgeDisabled)
+			}
+			h.writeWebSocketNotAllowed(w, app.ID, true)
+			return
+		}
+		if h.metrics != nil {
+			h.metrics.IncWSUpgrade(string(app.Plan), WSOutcomeAccepted)
 		}
 		// ADR-064 wake-timeline vocab: stamp the upgrade flag so
 		// downstream observability (slog fields, dashboards)
@@ -4301,7 +4542,14 @@ func (s *statusRecorder) finalFlush() {
 //   - err is non-nil only on real admission failures (RAM headroom, chooser,
 //     store). The benign app_concurrency_reached outcome is never lifted to
 //     an error by Backend.Admit.
-func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurrency int) (cold bool, wakeID string, method WakeMethod, err error) {
+//
+// scope (issue #272 / ADR-095 PR-B) is the per-lookup scope label
+// forwarded to Backend.Admit so schedd's wake path resolves the
+// preview app's deployment row (scope="pr-N") rather than the parent
+// prod app's. Empty = prod (legacy). When the cold-start path calls
+// coldStart and coldStart in turn calls Admit, scope is plumbed
+// through both paths.
+func (h *Handler) ensureCapacity(ctx context.Context, appID, scope string, maxConcurrency int) (cold bool, wakeID string, method WakeMethod, err error) {
 	// Loop bound: a single request can drive at most max_concurrency
 	// iterations (cold-start with follow-up fan-out). The cap is
 	// enforced atomically by Backend.Admit (HealthyCount + add as one
@@ -4310,7 +4558,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 	for attempt := 0; attempt < maxConcurrency; attempt++ {
 		healthy := h.backend.HealthyCount(appID)
 		if healthy == 0 {
-			c, w, m, e := h.coldStart(ctx, appID, maxConcurrency)
+			c, w, m, e := h.coldStart(ctx, appID, scope, maxConcurrency)
 			if e != nil {
 				return false, "", WakeMethodUnspecified, e
 			}
@@ -4330,7 +4578,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 		// atomically checks HealthyCount < maxConcurrency under its
 		// own lock, so concurrent callers cannot collectively
 		// exceed the cap.
-		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
+		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, maxConcurrency)
 		if e != nil {
 			return false, "", WakeMethodUnspecified, e
 		}
@@ -4346,7 +4594,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 // through the WakeGate's single-flight coalescing. shouldWake is held
 // under the gate lock and re-runs HealthyCount; if a peer's admit has
 // just landed, we skip the redundant cold boot.
-func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency int) (bool, string, WakeMethod, error) {
+func (h *Handler) coldStart(ctx context.Context, appID, scope string, maxConcurrency int) (bool, string, WakeMethod, error) {
 	var (
 		admittedWakeID string
 		cold           bool
@@ -4357,7 +4605,7 @@ func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency in
 			return h.backend.HealthyCount(appID) < maxConcurrency
 		},
 		func(ctx context.Context) error {
-			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
+			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, maxConcurrency)
 			if e != nil {
 				return e
 			}
@@ -4369,7 +4617,7 @@ func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency in
 			cold = true
 			return nil
 		},
-		// ADR-095 C7: bootstrap-cap predicate. The detached leader
+		// ADR-098 C7: bootstrap-cap predicate. The detached leader
 		// polls this on a 1s tick; if the queue drained (the gate
 		// itself tracks waiters) and there's still no live instance,
 		// the leader aborts with reason "queue_empty_no_instance"
@@ -4400,7 +4648,7 @@ func writeWakeError(w http.ResponseWriter, err error) {
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
 			"Briefly at capacity", "the wake queue is full; retry shortly"))
 	case errors.Is(err, ErrBootstrapAborted):
-		// ADR-095 C7: the leader aborted under the bootstrap cap
+		// ADR-098 C7: the leader aborted under the bootstrap cap
 		// (queue empty AND no live instance). The customer should
 		// retry — the next request finds the picker fast-path
 		// still empty, so a fresh wake fires immediately.

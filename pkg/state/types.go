@@ -419,6 +419,25 @@ type App struct {
 	// plan-gating contract: Free defaults to false and cannot
 	// PATCH it to true (apid returns 403
 	// plan_websocket_not_allowed); Hobby/Pro/Scale default to true.
+	//
+	// Per-session caps (issue #676 / ADR-080 PR-C):
+	//   - Inbound bytes capped at api.RawStreamMaxRequestBytes
+	//     (100 MiB) at pkg/vmmdgrpc/forward.go:rawBridgeBodyLoop.
+	//     Exceeding it returns ResourceExhausted → gateway 502.
+	//   - Outbound bytes capped at api.RawStreamMaxResponseBytes
+	//     (1 GiB, configured via the existing init-frame
+	//     max_request_bytes proto field — a dedicated
+	//     max_response_bytes wire field is a deferred ADR) at
+	//     pkg/vmmdgrpc/forward.go:rawBridgePumpBody. Exceeding
+	//     it returns ResourceExhausted → gateway 502.
+	//   - Outbound bytes the gateway forwards to the client
+	//     (body_chunks + init-error fallbacks) flow into the
+	//     per-instance egress ring via
+	//     pkg/gateway/forwardproxy.go's
+	//     rawStreamOnceWithEvents — see pkg/gateway/handler.go
+	//     WithEgressSink + pkg/gateway/egresssink. They
+	//     populate usage_minutes.tx_bytes alongside plain HTTP
+	//     chunk writes (ADR-046).
 	WebSocketEnabled bool
 	// RouteMetricsEnabled (ADR-093) opts the app into the per-route
 	// observability surface. Mirrors WebSocketEnabled's plan-gating
@@ -1894,7 +1913,7 @@ type Instance struct {
 	// pre-existing rows are backfilled to 0 on apply.
 	TailCount int
 	// RequestCount is the per-instance monotonically-increasing
-	// request counter (ADR-095 C8/C9/C10). Persisted in the
+	// request counter (ADR-098 C8/C9/C10). Persisted in the
 	// `request_count` column added by migrations/00221_instances_request_count.sql.
 	// The counter is the gate for warm-snapshot promotion (C10):
 	// when count >= WarmSnapshotMinRequests (per-app config), the
@@ -2033,7 +2052,7 @@ type PerNodeStats struct {
 type InstanceTouch struct {
 	InstanceID  string
 	LastRequest time.Time
-	// RequestDelta (ADR-095 C9) is the per-instance request count
+	// RequestDelta (ADR-098 C9) is the per-instance request count
 	// delta the gateway has observed since the last touch. The
 	// gateway's per-instance cache (Target.RequestCount) is the
 	// authoritative hot path; the engine batched-writer flushes
@@ -3260,6 +3279,12 @@ const (
 	// at apid-create time. See migrations/00219_edge_rules_kind_limit.sql
 	// for the schema CHECK widening.
 	EdgeRuleKindLimit EdgeRuleKind = "limit"
+	// EdgeRuleKindGeo is the country allow/deny primitive (ADR-091 D21).
+	// Migration 00229 widens the schema CHECK from 9 to 10 values
+	// (post-00219 'limit', post-00214 'validate'). Not in IsPaidOnly
+	// — Free customers get one rule under a tighter per-app quota
+	// (Limits.EdgeRulesGeoPerApp=1).
+	EdgeRuleKindGeo EdgeRuleKind = "geo"
 )
 
 // IsValid reports whether k is a closed-set kind. New kinds land via
@@ -3269,7 +3294,8 @@ func (k EdgeRuleKind) IsValid() bool {
 	switch k {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
-		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit:
+		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit,
+		EdgeRuleKindGeo:
 		return true
 	}
 	return false
@@ -3279,6 +3305,15 @@ func (k EdgeRuleKind) IsValid() bool {
 // The apid handler enforces this before insert; the gatewayd matcher
 // does NOT — a paid-only rule for a Free customer fails at create
 // time, never at request time.
+//
+// EdgeRuleKindGeo is NOT in this set — geo is available on Free
+// (ADR-091 D21 sub-decision hop). The tighter Free-tier guardrail is
+// enforced via Limits.EdgeRulesGeoPerApp (Free=1, Hobby=5, Pro=25,
+// Scale=100) inside the CreateEdgeRuleIfUnderQuota FOR UPDATE lock,
+// not via a Hobby+ plan gate. Rationale: the abuse-desk customer
+// persona needs ONE geo rule on Free ("block everything except DE")
+// before they'll convert; locking them out at the plan gate forces
+// them to upgrade for a feature they haven't sized yet.
 func (k EdgeRuleKind) IsPaidOnly() bool {
 	return k == EdgeRuleKindJWT || k == EdgeRuleKindIP
 }
@@ -3411,6 +3446,27 @@ type EdgeRuleLimitAction struct {
 	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
 }
 
+// EdgeRuleGeoAction is an ISO 3166-1 alpha-2 country allow/deny
+// evaluator. The wire shape mirrors EdgeRuleIPAction exactly — Allow
+// and Deny are both lists of country codes ("DE", "FR", "US"). The
+// gateway matcher evaluate order is identical to IP: Deny is evaluated
+// AFTER Allow so a single-country deny sticks even when the allow
+// list is broad. The plan wire-shape use case is
+// {action: "deny", countries: ["US"]} which decodes into
+// {Allow: [], Deny: ["US"]} — the "action" field name is a
+// Cloudflare idiom we deliberately do NOT adopt on the wire (the IP
+// action set the precedent, and the wire schema is closed for kind=ip).
+//
+// EdgeRuleGeoAction is the eighth kind-tagged union member, gated
+// by EdgeRuleKindGeo above. Membership validation (closed-set
+// country codes) lives in pkg/api/dto.go's EdgeRuleGeoAction.Validate
+// — the state-side mirror is intentionally minimal, same as the
+// other seven kinds.
+type EdgeRuleGeoAction struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
 // as jsonb. The wire shape lives in pkg/api/dto.go (one struct per
 // kind); the state-side mirror is intentionally minimal — the
@@ -3440,6 +3496,11 @@ type EdgeRuleAction struct {
 	// stays — it is the "cap the body I am about to schema-check"
 	// knob; kind=limit is the standalone gate.
 	Limit *EdgeRuleLimitAction `json:"limit,omitempty"`
+	// Geo carries the country allow/deny list for kind=geo. Plan
+	// gating (Free allowed with 1 rule, Hobby+ 5/25/100 by plan) is
+	// enforced at apid-create time via Limits.EdgeRulesGeoPerApp —
+	// see pkg/api/dto.go::EdgeRuleGeoAction.Validate.
+	Geo *EdgeRuleGeoAction `json:"geo,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.
@@ -3492,12 +3553,28 @@ type UpdateEdgeRuleParams struct {
 // the per-app cap is reached. Mirrors AlertRuleQuotaError's shape;
 // only the per-app scope exists today because edge rules are
 // per-app (an account-wide variant is not a v1 surface).
+//
+// The Kind, PerKind, and PerAppOnly fields are populated only by
+// the per-kind quota branch (ADR-091 D22). When set, the apid
+// handler renders a distinct RFC 7807 code
+// (`plan_edge_rule_kind_quota_reached`) so the customer sees the
+// specific kind that tripped the cap ("kind=geo: 1/1 rules used
+// on Free; upgrade to Hobby for 5"). The classic general-cap
+// path leaves these fields zero and the apid handler uses the
+// pre-existing `plan_edge_rules_quota_reached` code (or
+// whatever it ends up named — see apid/handlers_edge_rules.go).
 type EdgeRuleQuotaError struct {
-	Limit    int
-	Observed int
+	Limit      int
+	Observed   int
+	Kind       string // empty for the general cap; "geo" for the per-kind cap
+	PerKind    bool   // true → cap is per-kind (EdgeRulesGeoPerApp)
+	PerAppOnly bool   // true → cap is per-app (always true today; reserved for the per-account cap that doesn't exist yet)
 }
 
 func (e *EdgeRuleQuotaError) Error() string {
+	if e.PerKind {
+		return fmt.Sprintf("state: edge rule %s quota exceeded (limit=%d, observed=%d)", e.Kind, e.Limit, e.Observed)
+	}
 	return fmt.Sprintf("state: edge rule quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
 }
 

@@ -4,11 +4,30 @@
 -- Reserve slot 207 for PR #845 (edge_rules_kind_geo.sql, ADR-091
 -- D21/D22/D23). Same fence rationale as 00210; see
 -- cross-pr-slot-fence-pagination-gate for the pattern. This
--- fence is what keeps the local embed set contiguous while
--- PR #845's real migration lands.
+-- fence was what kept PR #845's local embed set contiguous while
+-- PR #845's real migration cycles through renumbers.
 --
--- The fence will be removed when PR #845 lands. ADR-093's
--- real migration sits at 00216, beyond PR #845's 00207, so
--- the cross-PR slot gate stays clean.
+-- PR #845's kind=geo finally settled at slot 00229 after 10
+-- renumbers across the PR's lifetime (00207 → 215 → 216 → 217
+-- → 218 → 220 → 221 → 222 → 223 → 226 → 229). The 00221 hop
+-- was caused by PR #854 (ADR-095 scale-to-zero T1 single-flight
+-- + phase telemetry) claiming 00221_instances_request_count.sql
+-- on main while PR #845 was rebasing — PR #845 had to step one
+-- slot further to 00222. The 00222 → 00223 hop was caused by
+-- PR #863 (ADR-096 customer-facing error grouping PR-A) landing
+-- 00222_app_errors.sql on main — PR #845 had to step one slot
+-- further to 00223. The 00223 → 00226 hop was caused by PR #866
+-- (ADR-091 D20-D25 cors_defaults) landing at 00224 with a
+-- coexistence fence at 00223 aimed at PR #845 — rather than
+-- step on PR #866's coordination, PR #845 renumbered to 00226.
+-- The 00226 → 00229 hop was caused by open-PR stampede:
+-- PR #864 (reqbudget PR1) also claimed 00226 with a real
+-- schema, PR #867 (maintenance PR-A) claimed 00227
+-- (kind=maintenance) + 00228 (apps.maintenance_mode), and
+-- PR #873 (cli-secret-scan) fenced 223-227 with reservation
+-- markers — PR #845 stepped to the next truly free slot 00229.
+-- This 00207 fence stays as a historical marker; it's no longer
+-- adjacent to PR #845's slot but it preserves the test fixture
+-- for any reference that relied on it before the renumber chain.
 SELECT 1;
 -- +goose StatementEnd

@@ -287,7 +287,7 @@ type Engine struct {
 
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
-	// wakeCoord is the per-app single-flight coordinator (ADR-095).
+	// wakeCoord is the per-app single-flight coordinator (ADR-098).
 	// Lazily initialised in NewEngine. Lock discipline is a LEAF:
 	// wakeCoord.mu is taken and released BEFORE e.lockApp(appID).
 	wakeCoord *wakeCoord
@@ -906,7 +906,7 @@ type WakeResult struct {
 	// (Target.DeploymentID empty, picker collapses to today's
 	// behaviour).
 	DeploymentID string
-	// RequestCount (ADR-095 C9) is the per-instance request counter
+	// RequestCount (ADR-098 C9) is the per-instance request counter
 	// schedd has observed via the batched ReportActivity path. The
 	// engine stamps it on the admitted path so the gateway's
 	// per-instance cache can show "warming up" vs "warmed" without
@@ -964,7 +964,14 @@ type WakeResult struct {
 // shared admitAndDispatch runs Phase 2-4. AdmitInstance (issue #168)
 // skips Phase 1 explicitly so a gateway can demand a new instance
 // even when others are already RUNNING.
-func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+func (e *Engine) Wake(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+	// PR-B (issue #272 / ADR-095): scope-aware Wake. Stamp the
+	// scope on the ctx so every downstream helper (resolveApp,
+	// loadAPIEnv, LiveDeployment lookup, ledger admit) threads the
+	// same value. Empty scope is a no-op for WithScope — the ctx
+	// is returned unchanged, so pre-PR-B callers (cron, meterd,
+	// e2e) keep byte-identical behaviour.
+	ctx = WithScope(ctx, scope)
 	// ── Phase 1: fast path under appMu ─────────────────────────────
 	release := e.lockApp(appID)
 	if ins, err := e.store.RunningInstanceForApp(ctx, appID); err == nil {
@@ -1013,15 +1020,29 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 		// need the lookup unless port defaults are acceptable. vmmd
 		// defaults to 8080 when port=0, so a transient lookup failure
 		// here is benign; we surface it via slog and carry on.
+		//
+		// PR-B (issue #272): the LiveDeployment read is scope-aware.
+		// A preview wake (scope="pr-{N}") MUST NOT route to the
+		// parent's live deployment; it must consult
+		// LiveDeploymentForScope so the preview gets the preview's
+		// own deployment row. Empty scope falls through to the
+		// legacy LiveDeployment (single-deployment app).
 		resolvedDeploymentID := deploymentID
-		if dep, depErr := e.store.LiveDeployment(ctx, appID); depErr == nil {
+		var depErr error
+		var dep state.Deployment
+		if scope == "" {
+			dep, depErr = e.store.LiveDeployment(ctx, appID)
+		} else {
+			dep, depErr = e.store.LiveDeploymentForScope(ctx, appID, scope)
+		}
+		if depErr == nil {
 			port = dep.OverridePort
 			if resolvedDeploymentID == "" {
 				resolvedDeploymentID = dep.ID
 			}
 		} else {
 			e.log.Warn("sched: wake: live deployment lookup for port/deployment_id failed; falling through with caller hint (or empty)",
-				"app", appID, "caller_deployment_id", deploymentID, "err", depErr)
+				"app", appID, "caller_deployment_id", deploymentID, "scope", scope, "err", depErr)
 		}
 		release()
 		// Surface the existing row's wake_id so a Phase-1 fast-path
@@ -1043,7 +1064,7 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 	return e.admitAndDispatch(ctx, appID, false)
 }
 
-// EnsureWake (ADR-095) is the single-flight-safe wake entry point.
+// EnsureWake (ADR-098) is the single-flight-safe wake entry point.
 // Every wake producer (gateway, cron, floor, scaleup, targets) routes
 // through this method so a concurrent burst coalesces into one virtual
 // boot per parked app.
@@ -1096,7 +1117,7 @@ func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, er
 	// caller's ctx via context.Background() + TTL — the wake must outlive
 	// the triggering request so other queued waiters get the same instance.
 	// This is the load-bearing single-flight coalescing invariant (spec
-	// §4.1, ADR-095 §Decision). Mirror of pkg/gateway/gate.go Wait
+	// §4.1, ADR-098 §Decision). Mirror of pkg/gateway/gate.go Wait
 	// goroutine detach.
 	leaderCtx, cancel := context.WithTimeout(context.Background(), e.wakeCoord.TTL())
 	defer cancel()
@@ -1109,9 +1130,9 @@ func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, er
 	// caller's ctx via context.Background() + TTL — the wake must outlive
 	// the triggering request so other queued waiters get the same instance.
 	// This is the load-bearing single-flight coalescing invariant (spec
-	// §4.1, ADR-095 §Decision). Mirror of pkg/gateway/gate.go Wait
+	// §4.1, ADR-098 §Decision). Mirror of pkg/gateway/gate.go Wait
 	// goroutine detach.
-	res, err := e.Wake(leaderCtx, appID, "")
+	res, err := e.Wake(leaderCtx, appID, "", "")
 	if err != nil {
 		out.Err = err
 		return out, err
@@ -1163,7 +1184,13 @@ func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, er
 // the newest live deployment — the legacy single-deployment
 // behaviour. Non-empty asks the engine to admit on that specific
 // live deployment. Additive per ADR-016.
-func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+//
+// scope (PR-B / issue #272): the preview scope ("pr-{N}") the
+// gateway derived from the inbound Host header. Empty = prod
+// (legacy single-deployment behaviour). Stamped on the ctx via
+// WithScope so resolveApp / loadAPIEnv read the same value.
+func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+	ctx = WithScope(ctx, scope)
 	if deploymentID == "" {
 		return e.admitAndDispatch(ctx, appID, true)
 	}
@@ -1185,9 +1212,15 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID string) 
 // deployment internally). Pass empty rather than resolving to
 // LatestDeployment — the trigger must NOT silently wake a
 // superseded deployment.
-func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+//
+// scope (PR-B / issue #272): threaded through the same way as
+// AdmitInstance; the floor trigger's scope is derived from the
+// app it's reconciling and must match the per-app scope ledger so
+// an over-cap prod app cannot drain a preview (or vice versa).
+func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+	ctx = WithScope(ctx, scope)
 	if deploymentID == "" {
-		return e.AdmitInstance(ctx, appID, "")
+		return e.AdmitInstance(ctx, appID, "", scope)
 	}
 	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
 }
@@ -3654,7 +3687,7 @@ func (e *Engine) lockedRunning(ctx context.Context, instanceID string) (*state.I
 // (spec §4.1, ADR-018). schedd is the sole writer to instances, so the gateway
 // hands it the batch instead of writing directly.
 //
-// ADR-095 C9: the gateway's per-instance cache (Target.RequestCount)
+// ADR-098 C9: the gateway's per-instance cache (Target.RequestCount)
 // ships the per-instance request_count delta on the same touch
 // batch. The engine flushes both last_request_at and the delta
 // atomically via TouchInstancesWithRequestDelta. The delta is
@@ -4070,7 +4103,7 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 //  4. now - FrameworkReadyAt >= app.WarmSnapshotMinMs (the
 //     time-since-first-ready floor; A.3 covers the time half of
 //     the gate)
-//  5. ins.RequestCount >= app.WarmSnapshotMinRequests (ADR-095
+//  5. ins.RequestCount >= app.WarmSnapshotMinRequests (ADR-098
 //     C10, supersedes ADR-071 PR-C). The per-instance request-
 //     count half of the gate. min == 0 is the "disabled" label
 //     case (Free/Hobby default) — the gate never opens. The
@@ -4127,7 +4160,7 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 		}
 	}
 
-	// Gate 5 (ADR-095 C10, supersedes ADR-071 PR-C): per-instance
+	// Gate 5 (ADR-098 C10, supersedes ADR-071 PR-C): per-instance
 	// request-count floor. The plan is the load-bearing knob: with
 	// min > 0 the promotion only fires once the instance has served
 	// at least `min` requests. min == 0 is the "disabled" label
@@ -4258,12 +4291,25 @@ func (e *Engine) warmKeysFor(nodeID, depID string) (memKey, vmstateKey string) {
 // resolveApp loads the app, account, plan limits, and current live deployment a
 // wake needs. A missing live deployment is a *api.Problem (an app should always
 // have one, invariant §6.2-3).
+//
+// PR-B (issue #272): the LiveDeployment lookup is scope-aware —
+// a non-empty scope reads the scope's live deployment row via
+// LiveDeploymentForScope. Empty scope falls through to the legacy
+// single-deployment LiveDeployment. The scope is read from the
+// ctx stamped by WithScope at Wake / AdmitInstance /
+// AdmitInstanceForDeployment entry points — see engine_scope.go.
 func (e *Engine) resolveApp(ctx context.Context, appID string) (state.App, state.Account, api.Limits, state.Deployment, error) {
 	app, acct, limits, err := e.resolveAppForDeploy(ctx, appID)
 	if err != nil {
 		return state.App{}, state.Account{}, api.Limits{}, state.Deployment{}, err
 	}
-	dep, err := e.store.LiveDeployment(ctx, appID)
+	scope := ScopeFrom(ctx)
+	var dep state.Deployment
+	if scope == "" {
+		dep, err = e.store.LiveDeployment(ctx, appID)
+	} else {
+		dep, err = e.store.LiveDeploymentForScope(ctx, appID, scope)
+	}
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return state.App{}, state.Account{}, api.Limits{}, state.Deployment{},

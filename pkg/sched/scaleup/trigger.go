@@ -24,7 +24,7 @@ type AdmitResult struct {
 	AtCapacity bool
 }
 
-// WakeOutcome (ADR-095): trigger-local projection of sched.CoordOutcome.
+// WakeOutcome (ADR-098): trigger-local projection of sched.CoordOutcome.
 // The leader's ledger enforces max_concurrency; the trigger observes the
 // at-capacity path via the bus, not the return value.
 type WakeOutcome struct {
@@ -78,8 +78,11 @@ type Ledger interface {
 // the cap rejection path. The signature intentionally avoids importing
 // sched (see AdmitResult's doc comment for the cycle rationale).
 type Engine interface {
-	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
-	// EnsureWake (ADR-095): the single-flight wake entry. Routes
+	// AdmitInstance (PR-B / issue #272): scope is the preview
+	// scope (`pr-{N}`) forwarded to the underlying sched.Engine.
+	// Empty = prod (legacy).
+	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
+	// EnsureWake (ADR-098): the single-flight wake entry. Routes
 	// through this so a scaleup tick racing the gateway, cron, floor,
 	// or targets triggers on the same parked app coalesces into one
 	// virtual boot.
@@ -395,7 +398,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
-		// ADR-095: route through EnsureWake so a scaleup tick racing the
+		// ADR-098: route through EnsureWake so a scaleup tick racing the
 		// gateway, cron, floor, or targets triggers on the same parked
 		// app coalesces into one virtual boot. The detached leader ctx
 		// means a cancelled triggering tick doesn't kill an in-flight

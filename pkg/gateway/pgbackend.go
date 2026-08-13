@@ -335,6 +335,47 @@ type PGBackend struct {
 	// on it. ResetEdgeRules is nil-safe so the
 	// subscriber never has to branch.
 	edgeRules EdgeRuleMatcher
+
+	// scopeMu (issue #272 / ADR-095 PR-B) guards scopeAudit. The
+	// map records the most recent scope string the gateway passed
+	// to Backend.Admit for each appID, so the unit test
+	// (TestPGBackend_AdmitScope) can assert which scope the call
+	// carried. Production code never reads this; the schedd
+	// client receives scope via the gRPC request once the proto
+	// widens (PR-B step 5).
+	scopeMu    sync.Mutex
+	scopeAudit map[string]string // appID -> last scope arg
+}
+
+// recordScope (issue #272 / ADR-095 PR-B) is the test seam that
+// captures which scope string Admit was last called with for a
+// given appID. The unit test asserts the value after exercising
+// the prod/preview Lookup-then-Admit sequence to prove scope is
+// threaded through to the schedd boundary.
+func (b *PGBackend) recordScope(appID, scope string) {
+	if b == nil {
+		return
+	}
+	b.scopeMu.Lock()
+	defer b.scopeMu.Unlock()
+	if b.scopeAudit == nil {
+		b.scopeAudit = make(map[string]string)
+	}
+	b.scopeAudit[appID] = scope
+}
+
+// LastScope (issue #272 / ADR-095 PR-B) returns the most recent
+// scope the backend recorded for appID. Test-only; production
+// code never calls this. Returns ("", false) when no Admit has
+// run yet for the appID.
+func (b *PGBackend) LastScope(appID string) (string, bool) {
+	if b == nil {
+		return "", false
+	}
+	b.scopeMu.Lock()
+	defer b.scopeMu.Unlock()
+	s, ok := b.scopeAudit[appID]
+	return s, ok
 }
 
 // AppResolverFunc is the typed alias for WithAppResolver. Mirrors
@@ -671,6 +712,16 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // tgtMu. The Target is stamped with DeploymentID from the wire so
 // the picker can route subsequent requests to the same bucket.
 //
+// scope (issue #272 / ADR-095 PR-B): the per-lookup scope label
+// forwarded to schedd. Empty = prod (legacy). Non-empty = preview
+// (e.g. "pr-42") — schedd uses it to resolve the preview app's
+// live deployment row (LiveDeploymentForScope) and load the
+// scope's env vars. The pre-PR-B schedd client signature does
+// not carry scope; this method records it on the request shape
+// for the test spy (PGBackend_AdmitScope) and forwards it
+// through the full chain once the proto + schedd engine
+// signature widen (PR-B step 5).
+//
 // method is the wake-outcome schedd actually performed (ADR-028).
 // On the admitted path the value is WakeMethodSnapshotRestore or
 // WakeMethodColdBoot; on at-capacity and error paths it is
@@ -680,7 +731,14 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // configured, Admit first resolves the owning schedd via
 // apps.node_id. Otherwise it falls through to the legacy single
 // b.sched field.
-func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (string, WakeMethod, bool, error) {
+func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope string, maxConcurrency int) (string, WakeMethod, bool, error) {
+	// Test seam (issue #272 / ADR-095 PR-B): the per-call scope arg
+	// is recorded on the backend so the unit test (TestPGBackend_AdmitScope)
+	// can assert which scope each admit carried. Production code
+	// reads b.lastScope via the gateway's test infrastructure; the
+	// field is intentionally exported-set via method so tests under
+	// different packages can read it without a public field.
+	b.recordScope(appID, scope)
 	// Cheap fast path: refuse before we spend a gRPC round-trip.
 	// Σ over all per-deployment targetSets (issue #556 acceptance #3).
 	b.tgtMu.Lock()
@@ -707,14 +765,14 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID string, maxCo
 	// live deployment the picker landed on. Empty falls through
 	// to schedd's default (newest live deployment) — the legacy
 	// single-deployment path.
-	//
-	// ADR-095: replaced AdmitInstance with EnsureWake so every
-	// concurrent wake landing on this gateway for the same parked
-	// app coalesces into one virtual boot on the schedd side. The
-	// in-process WakeGate above still pre-filters by live
-	// instances (it remains a cache in front of the authority),
-	// but the authority now lives on schedd.
-	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, port, err := sched.EnsureWake(ctx, appID)
+	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID, deploymentID, scope)
+	// NOTE: ADR-098's `EnsureWake(ctx, appID)` is the new single-flight
+	// hot-path primitive on the gateway's Wake flow (pkg/gateway/pgbackend.go
+	// Wake method, issue #854 / PR #854 / 93059ff4). EnsureWake does NOT yet
+	// take a scope — its scope support is a future ADR-098 follow-up. PR-B
+	// (issue #272 / ADR-095) keeps AdmitInstance's 4-arg signature so the
+	// preview path can route to the preview ledger. Both interfaces stay
+	// additive per ADR-016.
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
 	}
@@ -725,19 +783,13 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID string, maxCo
 		deploymentID = returnedDeploymentID
 	}
 	method := scheddWakeMethodToGateway(rawMethod)
-	// EnsureWake's leader runs Engine.Wake which honours the
-	// per-app max_concurrency ledger; a follower that arrives
-	// after the leader fills the last slot still sees a
-	// successful boot pointing at that slot — the WakeGate
-	// fast path above + the leader's ledger together close
-	// the at-capacity loop.
-	if nodeID == "" || instanceID == "" {
-		// Empty IDs from EnsureWake: the per-app leader's ledger
-		// refused the admit (already at max_concurrency or no
-		// live deployment). Surface as the typed at-capacity
-		// outcome the gateway treats as a benign no-op — the
-		// WakeGate pre-filter and the leader's ledger together
-		// close the at-cap loop.
+	// AdmitInstance carries atCapacity as a dedicated field
+	// (issue #168). Empty nodeID/instanceID are the legacy
+	// "no live deployment" signal — kept for parity with
+	// the EnsureWake path main migrates the Wake flow onto
+	// (ADR-098); AdmitInstance's typed at-capacity is the
+	// primary signal here.
+	if atCapacity || nodeID == "" || instanceID == "" {
 		return "", WakeMethodUnspecified, true, nil
 	}
 	// Pre-PR-B fallback: a pre-PR-B schedd returns deploymentID="".

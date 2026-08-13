@@ -52,6 +52,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/gateway/writegate"
+	"github.com/onebox-faas/faas/pkg/geoip"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -109,6 +110,20 @@ var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", defaultPublicListenAddr)
 // for non-standard deployments; production uses /etc/faas/gatewayd.toml.
 var configPath = envOrGateway("FAAS_GATEWAYD_CONFIG", "/etc/faas/gatewayd.toml")
 
+// geoipDBPath is the on-disk MaxMind-compatible .mmdb file consulted
+// by applyEdgeRuleGeo (ADR-091 D21). Override via FAAS_GEOIP_DB_PATH
+// for non-standard deployments; production uses /var/lib/faas/geoip/
+// dbip-country-lite.mmdb. Empty string = geo kind disabled (the
+// reader stays nil and the gate fail-opens).
+var geoipDBPath = envOrGateway("FAAS_GEOIP_DB_PATH", "/var/lib/faas/geoip/dbip-country-lite.mmdb")
+
+// geoipAutoRefresh, when "1", spawns the periodic DB-IP download
+// goroutine (cadence: 168h/weekly). Default "0" — the operator
+// owns the file (rsync'd from a control-plane mirror, mounted via
+// ConfigMap, etc.). The auto-refresh path is for environments
+// where the daemon is the canonical source of the DB.
+var geoipAutoRefresh = envOrGateway("FAAS_GEOIP_AUTO_REFRESH", "0")
+
 // controlAddr is the private control-plane listener — never reachable from
 // the internet; bound to the loopback interface by default so an
 // operator-prometheus scrape is the only thing that can reach it.
@@ -150,6 +165,35 @@ var streamingEnabledTruthy = []string{streamingFlagOne, streamingFlagTrue, strea
 
 func streamingEnabledFromEnv() bool {
 	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_STREAMING", streamingFlagFalse)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+// rawStreamEnabledFromEnv (issue #676 / ADR-080 follow-up) resolves the
+// FAAS_GATEWAY_RAW_STREAM_ENABLED operator kill switch. Default is true
+// — production already runs the raw-bytes Upgrade bridge; defaulting
+// to false would silently regress every deployment until operators
+// set the env. Accepted truthy values mirror FAAS_GATEWAY_STREAMING
+// (1/true/yes, case-insensitive); anything else falls through to
+// false (operator must opt out explicitly) and is logged via slog
+// at startup so a typo is visible.
+//
+// When the env resolves to false the handler.WithRawForwarding call
+// is skipped below (run.go: ~line 1090), leaving h.rawByNode nil. The
+// three-input gate at pkg/gateway/handler.go:2899
+// (isUpgradeRequest(r) && app.WebSocketEnabled && h.rawByNode != nil)
+// falls through to writeWebSocketNotAllowed with the
+// forwarderMissing=true detail — a deterministic 501 with
+// x-faas-error-reason: websocket_not_on_plan. The kill switch is
+// therefore load-bearing: it is the first operator control to reach
+// for when the raw forwarder itself is misbehaving (per-app PATCH
+// only helps if the bridge is healthy for OTHER apps on the box).
+func rawStreamEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_RAW_STREAM_ENABLED", streamingFlagTrue)))
 	for _, t := range streamingEnabledTruthy {
 		if v == t {
 			return true
@@ -373,6 +417,18 @@ type runDeps struct {
 	// rows go through. nil = audit-disabled (matches the
 	// WithRequireAuthn audit nil-allowance).
 	edgeRulesAudit *gatewaydEdgeRulesAud
+	// geoReader (ADR-091 D21) is the pkg/geoip.Reader consulted
+	// by applyEdgeRuleGeo. nil = geo kind disabled (pre-PR-7 +
+	// file-missing posture; matches the WithEdgeRules nil-allowance).
+	// Production wires a real reader backed by the DB-IP Lite
+	// .mmdb file at FAAS_GEOIP_DB_PATH; a missing file logs a
+	// WARN and the reader stays nil so the daemon boots cleanly.
+	geoReader *geoip.Reader
+	// geoWatcher (ADR-091 D21) is the periodic refresh goroutine.
+	// nil = no auto-refresh (the file is sourced from the operator,
+	// not auto-downloaded). Production wires a Watcher with a
+	// 168h (weekly) cadence if FAAS_GEOIP_AUTO_REFRESH=1.
+	geoWatcher *geoip.Watcher
 	// publicAuthCache (issue #477 / ADR-079) is the unsealed
 	// basic-auth credential cache shared between the Handler
 	// (enforcePublicAuthBasic reads through it) and the
@@ -666,7 +722,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "")
+			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "", "")
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -688,7 +744,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke resolve schedd %s: %w", appID, err)
 			}
-			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "")
+			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "", "")
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}
@@ -832,6 +888,49 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// below.
 	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter, deps.metrics)
 	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
+	// ADR-091 D21 — build the pkg/geoip.Reader backed by the
+	// DB-IP Lite .mmdb file at FAAS_GEOIP_DB_PATH. The Reader
+	// is nil-safe: a missing file logs a WARN and the reader
+	// stays nil so the daemon boots cleanly (the gate fail-opens
+	// at request time). The watcher is optional and only
+	// spawned when FAAS_GEOIP_AUTO_REFRESH=1 — the default is
+	// operator-owned file (rsync / ConfigMap / volume mount).
+	if geoipDBPath != "" {
+		reader, gerr := geoip.Open(geoipDBPath, geoip.SourceDBIP, geoip.DBIPAttribution, log)
+		if gerr != nil {
+			log.Warn("geoip: open failed; geo kind disabled (fail-open)",
+				"path", geoipDBPath,
+				"err", gerr)
+		} else {
+			deps.geoReader = reader
+			log.Info("geoip: loaded",
+				"path", geoipDBPath,
+				"source", string(geoip.SourceDBIP),
+				"attribution", geoip.DBIPAttribution,
+			)
+			if geoipAutoRefresh == "1" {
+				// 168h = 7 days. DB-IP publishes a monthly
+				// snapshot; the weekly cadence is a safety
+				// margin and tolerates a few days of drift.
+				watcher, werr := geoip.NewWatcher(reader, 168*time.Hour, log)
+				if werr != nil {
+					log.Warn("geoip: watcher init failed; continuing without auto-refresh",
+						"err", werr)
+				} else {
+					deps.geoWatcher = watcher
+					// Best-effort fetch on boot so the
+					// first request doesn't hit a stale
+					// DB. Cancellable via the daemon's
+					// shutdown context.
+					if berr := watcher.WatcherOnce(ctx); berr != nil {
+						log.Warn("geoip: boot refresh failed; continuing with the on-disk file",
+							"err", berr)
+					}
+					watcher.Start(ctx)
+				}
+			}
+		}
+	}
 	// Issue #561 / ADR-091 PR 5 — build the per-URL JWKS cache
 	// + JWT verifier that applyEdgeRuleJWT consults. Lazy
 	// registration on first match; the cache uses an HTTP client
@@ -1053,6 +1152,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if deps.edgeJWKSAdapter != nil {
 		handler.WithJWTVerifier(deps.edgeJWKSAdapter)
 	}
+	// ADR-091 D21 — arm the geoip reader that applyEdgeRuleGeo
+	// consults. nil-safe: deps.geoReader nil (file missing or
+	// FAAS_GEOIP_DB_PATH empty) keeps the gate disabled; the
+	// matcher still surfaces a geo rule, but the lookup is a
+	// no-op and the gate fail-opens.
+	if deps.geoReader != nil {
+		handler.WithGeoReader(deps.geoReader)
+	}
 	// PR-B — arm the per-rule JSON-Schema validator that
 	// applyEdgeRuleValidate consults. nil-safe:
 	// deps.edgeValidateAdapter nil falls through
@@ -1081,6 +1188,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unchanged.
 	egressSink := egresssink.NewEgressSink()
 	handler.WithEgressSink(egressSink)
+	// Issue #676 / ADR-080 PR-C: the raw-stream forwarder writes
+	// raw-bytes Upgrade chunks into the same per-instance egress
+	// ring as the plain HTTP forwarder. They share the *EgressSink
+	// pointer so both paths land in the same usage_minutes.tx_bytes
+	// bucket — see cmd/gatewayd-internal/nodecache.go:WithEgressSink.
+	if deps.nodeCache != nil {
+		deps.nodeCache.WithEgressSink(egressSink)
+	}
 	egressGRPCSocket := egressGRPCSocketPath()
 	// Reject the silent-no-TLS path: a non-unix target without TLS
 	// would build an insecure server (ADR-052). deps.egressTLS is
@@ -1141,7 +1256,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// three-input gate routes Connection: Upgrade requests
 		// here BEFORE falling through to WithForwarding's
 		// ForwardHTTPStream bridge.
-		handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		//
+		// Operator kill switch (issue #676 follow-up): when
+		// FAAS_GATEWAY_RAW_STREAM_ENABLED=false, the call is
+		// skipped — h.rawByNode stays nil, and the three-input
+		// gate at pkg/gateway/handler.go:2899 falls through to
+		// writeWebSocketNotAllowed(forwarderMissing=true),
+		// returning a deterministic 501 + x-faas-error-reason:
+		// websocket_not_on_plan. Default is true; see
+		// rawStreamEnabledFromEnv above.
+		if rawStreamEnabledFromEnv() {
+			handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		} else {
+			slog.Info("gatewayd-internal: raw-bytes Upgrade bridge disabled by FAAS_GATEWAY_RAW_STREAM_ENABLED=false",
+				"fallthrough", "writeWebSocketNotAllowed(forwarderMissing=true)")
+		}
 	}
 
 	// Per-instance last_request_at flush loop (spec §4.1). Present in production;
@@ -1654,7 +1783,7 @@ func (unwiredBackend) Lookup(context.Context, string) (gateway.App, bool) {
 }
 func (unwiredBackend) Pick(string) gateway.PickResult { return gateway.PickResult{} }
 func (unwiredBackend) HealthyCount(string) int        { return 0 }
-func (unwiredBackend) Admit(context.Context, string, string, int) (string, gateway.WakeMethod, bool, error) {
+func (unwiredBackend) Admit(context.Context, string, string, string, int) (string, gateway.WakeMethod, bool, error) {
 	return "", gateway.WakeMethodUnspecified, false, nil
 }
 

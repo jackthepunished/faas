@@ -27,10 +27,10 @@ import (
 // outweighs the value of de-duplicating 12 lines of stub code.
 type noopEngine struct{}
 
-func (noopEngine) Wake(context.Context, string, string) (sched.WakeResult, error) {
+func (noopEngine) Wake(context.Context, string, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
-func (noopEngine) AdmitInstance(context.Context, string, string) (sched.WakeResult, error) {
+func (noopEngine) AdmitInstance(context.Context, string, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
 func (noopEngine) EnsureWake(context.Context, string) (sched.CoordOutcome, error) {

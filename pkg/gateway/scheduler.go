@@ -193,11 +193,16 @@ type Scheduler interface {
 	// — the legacy single-deployment behaviour. Non-empty asks
 	// schedd to admit on that specific live deployment. Additive
 	// per ADR-016.
-	AdmitInstance(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
-	// EnsureWake (ADR-095) is the schedd-side single-flight wake
+	//
+	// scope (issue #272 / ADR-095 / PR-B): the preview scope
+	// (`pr-{N}`) the gateway parsed from the inbound Host header.
+	// Empty = prod (legacy single-deployment behaviour). Threaded
+	// through schedd's WakeRequest.scope wire field.
+	AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
+	// EnsureWake (ADR-098) is the schedd-side single-flight wake
 	// entry. Schedd coalesces every concurrent EnsureWake for the
 	// same app into one virtual boot; followers see the leader's
-	// outcome. Pre-ADR-095 callers continue to use Wake / AdmitInstance
+	// outcome. Pre-ADR-098 callers continue to use Wake / AdmitInstance
 	// on the legacy wire — this method is additive per ADR-016.
 	//
 	// On the at-cap path the leader's ledger returns an admitted
@@ -215,7 +220,7 @@ var ErrSchedulerUnconfigured = errors.New("gateway: scheduler not configured (M5
 // need the wake path.
 type NoopScheduler struct{}
 
-func (NoopScheduler) AdmitInstance(context.Context, string, string) (string, string, string, string, int32, bool, int, error) {
+func (NoopScheduler) AdmitInstance(context.Context, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	return "", "", "", "", 0, false, 0, ErrSchedulerUnconfigured
 }
 
@@ -357,7 +362,7 @@ func (f *FakeScheduler) AdmitsFor(appID string) int {
 	return f.admitsByApp[appID]
 }
 
-func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID, deploymentIDHint string) (string, string, string, string, int32, bool, int, error) {
+func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID, deploymentIDHint, scope string) (string, string, string, string, int32, bool, int, error) {
 	f.mu.Lock()
 	f.admitsByApp[appID]++
 	latency := time.Duration(f.latencyMs) * time.Millisecond
@@ -411,7 +416,7 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID, deploymentIDHi
 	return instanceID, nodeID, deploymentID, wakeID, rawMethod, false, port, err
 }
 
-// EnsureWake (ADR-095): the FakeScheduler isn't a real single-flight
+// EnsureWake (ADR-098): the FakeScheduler isn't a real single-flight
 // coalescer — every call returns a fresh identity, which is what
 // handler unit tests want (they're not exercising the schedd-side
 // leader/follower contract; the property-based test at C5 pins that

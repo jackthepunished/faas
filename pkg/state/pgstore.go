@@ -5949,6 +5949,29 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 			Observed: appCount,
 		}
 	}
+	// Per-kind quota (ADR-091 D22). The general EdgeRulesPerApp
+	// count above covers the cheap-tier guardrail; geo gets its own
+	// tighter cap (Free=1, Hobby=5, Pro=25, Scale=100) so the
+	// abuse-desk customer persona ("block everything except DE")
+	// has one rule before the upgrade path kicks in. Both branches
+	// share the same FOR UPDATE lock on apps for race-freedom.
+	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
+		var geoPerApp int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from edge_rules where app_id = $1 and kind = 'geo'`, in.AppID,
+		).Scan(&geoPerApp); err != nil {
+			return EdgeRule{}, fmt.Errorf("state: count edge_rules by kind=geo for app %s: %w", in.AppID, err)
+		}
+		if geoPerApp >= limits.EdgeRulesGeoPerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesGeoPerApp,
+				Observed:   geoPerApp,
+				Kind:       string(EdgeRuleKindGeo),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 
 	actionBytes, err := json.Marshal(in.Action)
 	if err != nil {
@@ -6073,6 +6096,24 @@ func (s *PgStore) CountEdgeRulesForApp(ctx context.Context, appID string) (int, 
 	var n int
 	if err := s.pool.QueryRow(ctx,
 		`select count(*) from edge_rules where app_id = $1`, appID,
+	).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountEdgeRulesByKindForApp is the per-kind quota reader
+// (ADR-091 D22). Same shape as CountEdgeRulesForApp but filtered
+// by kind. The Postgres runtime index edge_rules_app_kind_idx
+// (composite on (app_id, kind)) makes this O(log n) without
+// needing a sequence scan. The check that's load-bearing for race
+// freedom lives inside CreateEdgeRuleIfUnderQuoTa (FOR UPDATE on
+// the apps row) — this public method is the apid handler's
+// read-side probe to surface "X/Y used" in 200 responses.
+func (s *PgStore) CountEdgeRulesByKindForApp(ctx context.Context, appID string, kind EdgeRuleKind) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*) from edge_rules where app_id = $1 and kind = $2`, appID, string(kind),
 	).Scan(&n); err != nil {
 		return 0, err
 	}
@@ -7446,7 +7487,7 @@ func (s *PgStore) UpdateInstanceStateToTerminal(ctx context.Context, id, state s
 	return nil
 }
 
-// IncInstanceRequestCount (ADR-095 C8) bumps the per-instance
+// IncInstanceRequestCount (ADR-098 C8) bumps the per-instance
 // request_count column by the supplied delta. The writer is
 // additive ("request_count = request_count + delta") on purpose:
 // schedd batches 250ms of per-instance request events into a
@@ -7805,7 +7846,7 @@ func (s *PgStore) TouchInstancesLastSeen(ctx context.Context, touches []Instance
 	return int(tag.RowsAffected()), nil
 }
 
-// TouchInstancesWithRequestDelta (ADR-095 C9) is the batched
+// TouchInstancesWithRequestDelta (ADR-098 C9) is the batched
 // request_count writer. Same shape as TouchInstancesLastSeen
 // (unnest, single round-trip) but additionally bumps
 // request_count by the supplied delta on each row. The delta is

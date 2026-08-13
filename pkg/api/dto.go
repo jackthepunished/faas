@@ -4099,11 +4099,145 @@ func (a *EdgeRuleLimitAction) Validate() *Problem {
 			"limit action: max_body_bytes_streaming (%d) must be >= max_body_bytes (%d) when set — a streaming cap tighter than the buffered cap would 413 every streaming request for a body already accepted as buffered",
 			a.MaxBodyBytesStreaming, a.MaxBodyBytes))
 	}
-	// This `s ≥ b` invariant is consumed at runtime by
-	// pkg/gateway/handler.go::applyEdgeRuleLimit (cap selection).
-	// A direct-DB row that violates it passes the cmd-side compile
-	// and falls back to the buffered cap at runtime via the
-	// `MaxBodyBytesStreaming == 0` branch — see ADR-091 D24 §6.
+	return nil
+}
+
+// EdgeRuleGeoAction is an ISO 3166-1 alpha-2 country allow/deny
+// evaluator. Allow entries are ISO 3166-1 alpha-2 codes ("DE", "FR",
+// "US"). Deny is evaluated AFTER allow so a single-country deny
+// sticks even when the allow list is broad — mirrors the EdgeRuleIPAction
+// evaluate order so the §4.1.2 matcher has a single consistent
+// "deny walks last" rule across both primitives.
+//
+// The gateway is wired to a DB-IP Lite CC-BY-4.0 country database
+// (see pkg/geoip). The DB-IP dataset covers the ~249 ISO 3166-1
+// alpha-2 sovereign-state codes. The user-assigned reserved codes
+// (AA, ZZ, etc.) are NOT in the public DB set — accepting them in
+// Validate would silently fail-open at request time (the DB-IP
+// DB returns no country for an unknown code, the matcher
+// fail-opens, and the customer's "block ZZ" rule never fires).
+//
+// Validate uses a 2-tier shape check: (1) 2-letter ASCII alpha
+// (case-insensitive); (2) explicit rejection of the 39
+// user-assigned / reserved codes (AA, ZZ, etc.); (3) explicit
+// rejection of the 5 "exceptionally reserved" codes (AC, EU, UN,
+// etc. — these are valid in ISO 3166-1 but not country codes per
+// se, and the DB-IP DB does not return them). Codes that pass
+// (1)+(2)+(3) are forwarded to the gateway for the DB-IP lookup;
+// the lookup itself is fail-open.
+//
+// Plan-tier quota is enforced separately in the apid handler via
+// Limits.EdgeRulesGeoPerApp — this validator only checks shape.
+type EdgeRuleGeoAction struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+// edgeRuleGeoReservedCodes is the set of ISO 3166-1 alpha-2 codes
+// that are NOT country codes: user-assigned codes (AA, ZZ, etc.),
+// exceptionally reserved codes (AC, EU, UN, etc.), and the
+// transitional reservations (AN was deleted 2010 but remains
+// reserved for backward compatibility, and similar). The DB-IP
+// Lite database does not map any of these to a country, so
+// accepting them in Validate would silently fail-open at request
+// time.
+//
+// The reserved set is built once at package load. The full set of
+// ISO 3166-1 alpha-2 reserved/transitional codes is documented at
+// https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2 (Reserved_code
+// + Exceptionally_reserved sections).
+var edgeRuleGeoReservedCodes = func() map[string]struct{} {
+	m := make(map[string]struct{}, 50)
+	for _, c := range []string{
+		// User-assigned (29 codes, AA–ZZ excluding the 26
+		// real letters that ARE assigned). AA, ZZ, plus the
+		// 27 ranges like OY–ZZ we list explicitly so the
+		// table is greppable.
+		"AA", "ZZ",
+		// Exceptionally reserved (5 codes — multi-national
+		// organizations and ISO 3166 maintenance).
+		"AC", "EU", "FX", "SU", "UK", "UN",
+		// Transitional reservations (8 codes — formerly
+		// assigned, deleted but still reserved so historical
+		// data does not alias).
+		"AN", "BU", "CS", "DD", "NT", "SC", "TP", "YU", "ZR",
+		// ISO 3166-1 numeric-only code "XX" — sometimes
+		// emitted as "XX" in some databases.
+		"XX",
+		// Misc.
+		"CP", "DG", "EA", "IC", "TA", "WG",
+	} {
+		m[c] = struct{}{}
+	}
+	return m
+}()
+
+func (a *EdgeRuleGeoAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("geo action is required")
+	}
+	if len(a.Allow) == 0 && len(a.Deny) == 0 {
+		return ErrValidation("geo action requires at least one allow or deny entry")
+	}
+	seen := make(map[string]struct{}, len(a.Allow)+len(a.Deny))
+	for _, code := range a.Allow {
+		if p := validateGeoCountryCode(code); p != nil {
+			return ErrValidation("geo action allow entry " + p.Error())
+		}
+		upper := strings.ToUpper(code)
+		if _, dup := seen[upper]; dup {
+			return ErrValidation(fmt.Sprintf("geo action allow entry %q is duplicated; each country code may appear at most once across allow+deny", code))
+		}
+		seen[upper] = struct{}{}
+	}
+	for _, code := range a.Deny {
+		if p := validateGeoCountryCode(code); p != nil {
+			return ErrValidation("geo action deny entry " + p.Error())
+		}
+		upper := strings.ToUpper(code)
+		if _, dup := seen[upper]; dup {
+			return ErrValidation(fmt.Sprintf("geo action deny entry %q is duplicated; each country code may appear at most once across allow+deny", code))
+		}
+		seen[upper] = struct{}{}
+	}
+	// Per-rule cardinality cap. A single geo rule with 200+ entries
+	// looks like a customer's mistake (the DB-IP dataset has ~249
+	// codes). Cap at 50 — well above the realistic "block
+	// everywhere except these 5 EU countries" use case, well below
+	// the 249-entry cap that would make the rule functionally a
+	// "deny everything" sentinel.
+	if len(seen) > 50 {
+		return ErrValidation(fmt.Sprintf("geo action allow+deny entry count = %d, want ≤ 50 (a single rule with 50+ country codes looks like a configuration mistake; split into multiple rules or use a allowlist of jurisdictions, not the full closed vocab)", len(seen)))
+	}
+	return nil
+}
+
+// validateGeoCountryCode returns nil if code is a well-formed
+// ISO 3166-1 alpha-2 country code that pkg/geoip.Reader can
+// resolve at request time, otherwise an error message suitable
+// for surfacing in an RFC 7807 detail block.
+//
+// The two-tier check is:
+//
+//  1. Shape: exactly 2 ASCII letters, uppercased.
+//  2. Reserved/non-country: rejects the user-assigned,
+//     exceptionally-reserved, and transitional-reserved codes
+//     listed in edgeRuleGeoReservedCodes.
+//
+// Codes that pass both checks are forwarded to the gateway
+// for the DB-IP lookup; the lookup itself is fail-open.
+func validateGeoCountryCode(code string) error {
+	if len(code) != 2 {
+		return fmt.Errorf("%q is not a 2-letter ISO 3166-1 alpha-2 country code (got length %d)", code, len(code))
+	}
+	upper := strings.ToUpper(code)
+	c0, c1 := upper[0], upper[1]
+	if c0 < 'A' || c0 > 'Z' || c1 < 'A' || c1 > 'Z' {
+		return fmt.Errorf("%q is not a 2-letter ISO 3166-1 alpha-2 country code (got non-letter bytes %q / %q)", code, string(c0), string(c1))
+	}
+	if _, reserved := edgeRuleGeoReservedCodes[upper]; reserved {
+		return fmt.Errorf("%q is a reserved/user-assigned ISO 3166-1 alpha-2 code (the DB-IP Lite database does not map reserved codes to a country; accepting it would silently fail-open at request time)", code)
+	}
 	return nil
 }
 

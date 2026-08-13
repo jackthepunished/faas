@@ -11,6 +11,7 @@ from ..models.edge_rule_response_kind import EdgeRuleResponseKind, check_edge_ru
 
 if TYPE_CHECKING:
     from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+    from ..models.edge_rule_geo_action import EdgeRuleGeoAction
     from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
     from ..models.edge_rule_ip_action import EdgeRuleIPAction
     from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
@@ -44,6 +45,7 @@ class EdgeRuleResponse:
     kind: EdgeRuleResponseKind
     action: (
         EdgeRuleCORSAction
+        | EdgeRuleGeoAction
         | EdgeRuleHeadersAction
         | EdgeRuleIPAction
         | EdgeRuleJWTAction
@@ -65,6 +67,7 @@ class EdgeRuleResponse:
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
         from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+        from ..models.edge_rule_limit_action import EdgeRuleLimitAction
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
@@ -105,6 +108,8 @@ class EdgeRuleResponse:
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleValidateAction):
             action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleLimitAction):
+            action = self.action.to_dict()
         else:
             action = self.action.to_dict()
 
@@ -136,6 +141,7 @@ class EdgeRuleResponse:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+        from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
         from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
@@ -168,6 +174,7 @@ class EdgeRuleResponse:
             data: object,
         ) -> (
             EdgeRuleCORSAction
+            | EdgeRuleGeoAction
             | EdgeRuleHeadersAction
             | EdgeRuleIPAction
             | EdgeRuleJWTAction
@@ -241,11 +248,19 @@ class EdgeRuleResponse:
                 return action_type_7
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_8 = EdgeRuleLimitAction.from_dict(data)
+
+                return action_type_8
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            action_type_8 = EdgeRuleLimitAction.from_dict(data)
+            action_type_9 = EdgeRuleGeoAction.from_dict(data)
 
-            return action_type_8
+            return action_type_9
 
         action = _parse_action(d.pop("action"))
 

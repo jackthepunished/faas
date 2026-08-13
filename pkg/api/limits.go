@@ -419,6 +419,21 @@ type Limits struct {
 	// EdgeRulesIPAllowed gates kind='ip' rules on the plan. Same
 	// Hobby+ opt-in shape as EdgeRulesJWTAllowed.
 	EdgeRulesIPAllowed bool
+	// EdgeRulesGeoPerApp caps how many kind='geo' rules one app may
+	// hold. Stricter than EdgeRulesPerApp because geo is a high-touch
+	// abuse primitive — a customer with 10 geo rules on a Free app is
+	// doing something exotic. The Free-tier guardrail (1 rule) covers
+	// the abuse-desk customer persona ("block everything except DE")
+	// before they have to upgrade. Enforced inside the per-app FOR
+	// UPDATE lock in CreateEdgeRuleIfUnderQuota.
+	//
+	// Per-plan: Free 1, Hobby 5, Pro 25, Scale 100. Geo is available
+	// on ALL plans including Free (ADR-091 D21 sub-decision hop —
+	// the abuse-desk customer can't convert if they can't size geo
+	// first). Plan gate is enforced via the EdgeRulesQuotaError.Kind
+	// field; apid-Validate throws CodePlanEdgeRuleKindQuotaReached
+	// when this trips.
+	EdgeRulesGeoPerApp int
 
 	// WebhookPerApp caps how many outbound webhook subscriptions a
 	// single app may register (issue #476 / ADR-076). The plan gate
@@ -803,6 +818,11 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     5,
 		EdgeRulesJWTAllowed: false,
 		EdgeRulesIPAllowed:  false,
+		// Per-kind geo quota (ADR-091 D21/D22). Free gets exactly 1
+		// geo rule — the abuse-desk customer ("block everything
+		// except DE") is one rule. The upgrade path raises the cap
+		// to 5/25/100.
+		EdgeRulesGeoPerApp: 1,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
@@ -1023,6 +1043,7 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     25,
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
+		EdgeRulesGeoPerApp:  5,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
@@ -1232,6 +1253,7 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     100,
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
+		EdgeRulesGeoPerApp:  25,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
@@ -1434,6 +1456,7 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     500,
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
+		EdgeRulesGeoPerApp:  100,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
@@ -1755,6 +1778,22 @@ const (
 	// the same Hobby+ plans) so an LLM-style upgrade stream has
 	// the same headroom.
 	RawStreamMaxRequestBytes int64 = 100 * 1024 * 1024
+
+	// RawStreamMaxResponseBytes (issue #676 / ADR-080 follow-up,
+	// PR-C) bounds the per-session egress bytes on the raw-bytes
+	// Upgrade bridge. Mirrors RawStreamMaxRequestBytes in shape
+	// but is sized for a long-lived WS session — a 100 MiB cap on
+	// a 24-h session would be pathologically tight for any chat /
+	// agent workload. 1 GiB lets a 100 KB/s stream run for ~3 h
+	// cleanly; above that, rawBridgePumpBody surfaces
+	// ResourceExhausted so the gateway-side forwarder emits 502
+	// to the customer (mirrors the inbound cap's behaviour at
+	// rawBridgeBodyLoop). This is memory-safety, NOT billing —
+	// the (plan_ram + 8) per-running-second cost already pays for
+	// WS residency. The cap prevents a runaway guest from
+	// ballooning the gateway's bidi goroutine pair past the
+	// gateway process's RSS budget.
+	RawStreamMaxResponseBytes int64 = 1 * 1024 * 1024 * 1024
 
 	// Post-response tail (issue #667 / ADR-078).
 	//

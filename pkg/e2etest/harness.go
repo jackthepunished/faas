@@ -501,18 +501,71 @@ const testDomain = "apps.test.example"
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
 //
-// Re-bumped 222 → 226 by ADR-098 PR-A (data_upstreams +
-// data_upstream_probes schema at 00226). The intervening slots
-// 223..225 are sibling PR fences (223 ADR-091 CORS, 224
-// apps_cors_defaults, 225 reserve fence) that the apply-walk
-// test consumes as first-class entries per
-// TestMigrationsContiguous's position-index rule. Sibling PRs
-// #864/#867/#845 each carry their own 00226_reserve_slot.sql
-// fence per the cross-PR slot reservation convention
-// (cross-pr-slot-fence-reservation-fence-pattern memory); those
-// siblings drop their fences on rebase via `fix(migration):
-// drop 00226_reserve_slot.sql` after PR-A merges.
-const e2eMigrationTarget = 226
+// PR #882 ADR-098 §9.A connection-aware execution PR-A re-bumped
+// 226 → 229 — slot 226 is the data_upstreams + data_upstream_probes
+// schema (real DDL, landed via PR-A's `feat(migration): ADR-098
+// §9.A`); the run-up from 226 to 229 happened because main absorbed
+// PR #845's 00229_edge_rules_kind_geo.sql + sibling PRs #864/#867
+// in the interim (see the chain below). PR-A's own renumber story
+// was the reverse: PR-0 fenced 226 from PR-0 (issue # PR #858,
+// ADR-098 §renumber) and PR-A replaced the fence with the real DDL
+// on top of (still 00221 → 00226) renumbers.
+//
+// PR #845 (kind=geo, ADR-091 D21) + PR #863 (ADR-096 PR-A
+// app_errors) + PR #866 (ADR-091 D20-D25 cors_defaults) + PR #864
+// (reqbudget PR1, ADR-093) + PR #867 (maintenance PR-A, ADR-091
+// amendment): all five bumped 215/216 → 229 in flight. The renumber
+// chain tracks the gate's "next free slot past the live head AND
+// past open-PR claims" rule when sibling PRs race for the same N.
+//
+//   - 215 → 229 after PR #844 (ADR-093 per-route app metrics)
+//     landed 00216_apps_route_metrics_enabled.sql, after
+//     PR #855 (ADR-091 D24 kind=limit) landed
+//     00219_edge_rules_kind_limit.sql, after PR #851
+//     (issue-272 PR-preview environments) landed
+//     00220_preview_app_columns.sql, after PR #854
+//     (ADR-095 scale-to-zero T1 single-flight + phase
+//     telemetry) claimed 00221_instances_request_count.sql,
+//     after PR #863 (ADR-096 PR-A app_errors) landed
+//     00222_app_errors.sql, after PR #866 (ADR-091
+//     D20-D25 cors_defaults) landed 00224_apps_cors_defaults.sql,
+//     and after open-PR stampede with PR #864 (reqbudget PR1
+//     claiming 00226), PR #867 (maintenance PR-A claiming 00227
+//     kind=maintenance + 00228 apps.maintenance_mode), and PR
+//     #873 (cli-secret-scan fencing 223-227) — which pushed
+//     PR #845's kind=geo from 00220 → 00221 → 00222 → 00223 →
+//     00226 → 00229.
+//   - 215/216 → 229 by ADR-096 PR-A + ADR-091 D20-D25
+//   - open-PR stampede (app_errors schema at 00222, leaving
+//     00223 free for PR #845; PR #866's CORS team then placed a
+//     coexistence fence at 00223 alongside their own real
+//     migration at 00224, so PR #845 renumbered to 00226 — but
+//     PR #864 (reqbudget PR1) ALSO claimed 00226 with a real
+//     schema, so PR #845 stepped past PR #864 + PR #867's
+//     00227/00228 to the next free slot 00229). The in-flight
+//     cross-PR fences at 215..228 sit between main's 214
+//     (edge-rules-kind=validate) and 229 (kind=geo): 215
+//     compute_node_heartbeats_stats (PR #851), 216
+//     apps_route_metrics_enabled (PR #860), 217 ADR-092
+//     app_secrets_scope (PR #849), 218 preview-envs (PR
+//     preview-envs ADR-098 per PR #876), 219 edge_rules_kind_limit (PR
+//     kind=validate PR-C), 220 preview_app_columns (PR preview
+//     envs), 221 ADR-096 reserve fence for slot 222 itself, 222
+//     app_errors (PR #863), 223 PR #866 coexistence fence
+//     (passed-through by PR #845, now historical), 224
+//     apps_cors_defaults (PR #866), 225 PR #866 reserve fence,
+//     226 PR #864 real (reqbudget) + PR #858 fence, 227
+//     PR #867 real (kind=maintenance) + PR #873 fence, and
+//     228 PR #867 real (apps.maintenance_mode).
+//
+// The 00217 + 00218 slots carry `*_reserve_slot.sql` fences
+// for PR #849 (ADR-092 PR-A app_secrets.scope) and PR #845's
+// own fence respectively; the 00221 fence is PR #863's
+// ADR-096 reservation; the 00223 fence is PR #866's
+// coexistence marker (passed-through by PR #845's renumber,
+// kept as a no-op so the contiguity gate doesn't trip on the
+// renumber chain).
+const e2eMigrationTarget = 229
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

@@ -68,14 +68,14 @@ type capturingEngine struct {
 	seen map[string]bool
 }
 
-func (c *capturingEngine) Wake(_ context.Context, _, _ string) (sched.WakeResult, error) {
+func (c *capturingEngine) Wake(_ context.Context, _, _, _ string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
-func (c *capturingEngine) AdmitInstance(_ context.Context, _, _ string) (sched.WakeResult, error) {
+func (c *capturingEngine) AdmitInstance(_ context.Context, _, _, _ string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
 
-// EnsureWake (ADR-095): capacity tests don't exercise single-flight, so
+// EnsureWake (ADR-098): capacity tests don't exercise single-flight, so
 // this delegates straight through to Wake. Returning a zero CoordOutcome
 // with nil Instance triggers the defensive nil-instance branch in the
 // handler only on success; no capacity test relies on a non-nil
