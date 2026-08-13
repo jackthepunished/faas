@@ -1,4 +1,4 @@
--- filename: 00231_edge_rules_kind_maintenance.sql
+-- filename: 00234_edge_rules_kind_maintenance.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -27,10 +27,11 @@
 --
 -- Ordering hazard vs PR #845 (kind=geo, ADR-091 D21-D23): PR #845
 -- lands at 00229 (kind=geo widening), main absorbs it before this
--- branch re-merges. This migration is renumbered to 00231 (was
--- 00227 in earlier cycles) so the chain is:
+-- branch re-merges. This migration is renumbered to 00234 (was
+-- 00231 in the previous step, 00227 in earlier cycles) so the
+-- chain is:
 --
---   00219 kind=limit → 00229 kind=geo → 00231 kind=maintenance
+--   00219 kind=limit → 00229 kind=geo → 00234 kind=maintenance
 --
 -- The CHECK list below MUST include 'geo' (the kind=geo widening
 -- runs BEFORE this migration); otherwise the DROP+ADD pair would
@@ -39,8 +40,10 @@
 -- including kind=maintenance.
 --
 -- Pre-reserved at PR-A by migrations/00227_reserve_slot.sql
--- (since renumbered to migration 00231 by PR-B's 6-cycle renumber;
--- 00227 is now a fence on main owned by the kind=geo cluster).
+-- (since renumbered to migration 00234 by PR-B's 7-cycle renumber;
+-- 00227 is now a fence on main owned by the kind=geo cluster;
+-- 00233 is reserved by PR #873 secretscan v2; 00232 by PR #864
+-- ADR-093 request budgets).
 
 ALTER TABLE edge_rules DROP CONSTRAINT IF EXISTS edge_rules_kind_check;
 ALTER TABLE edge_rules ADD CONSTRAINT edge_rules_kind_check

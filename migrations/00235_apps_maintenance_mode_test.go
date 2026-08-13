@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00232_apps_maintenance_mode.sql
+// Migration-apply test for 00235_apps_maintenance_mode.sql
 // (ADR-091 amendment — D18 per-kind extension, PR-A fence + PR-B
 // runtime + PR-C rollout-closer).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00232 (no goose
+//  1. Migration set applies cleanly through 00235 (no goose
 //     duplicate-version panic).
 //  2. apps.maintenance_mode column exists, type boolean,
 //     NOT NULL, DEFAULT false. The runtime surface uses the
@@ -46,13 +46,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00232_AppsMaintenanceMode(t *testing.T) {
+func TestMigrations_00235_AppsMaintenanceMode(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00232 should land last.
+	// (1) Run the full migration set. 00235 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00231 kind=maintenance and 00232 apps.maintenance_mode)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00234 kind=maintenance and 00235 apps.maintenance_mode)", err)
 	}
 
 	// (2) Column shape.
@@ -69,7 +69,7 @@ func TestMigrations_00232_AppsMaintenanceMode(t *testing.T) {
 		   and column_name = 'maintenance_mode'
 	`).Scan(&dataType, &isNullable, &columnDefault)
 	if err != nil {
-		t.Fatalf("query apps.maintenance_mode column: %v (the 00232 ADD COLUMN IF NOT EXISTS must have landed)", err)
+		t.Fatalf("query apps.maintenance_mode column: %v (the 00235 ADD COLUMN IF NOT EXISTS must have landed)", err)
 	}
 	if dataType != "boolean" {
 		t.Errorf("apps.maintenance_mode data_type = %q, want 'boolean'", dataType)
@@ -91,7 +91,7 @@ func TestMigrations_00232_AppsMaintenanceMode(t *testing.T) {
 		   and indexname = 'apps_maintenance_mode_idx'
 	`).Scan(&indexDef)
 	if err != nil {
-		t.Fatalf("query apps_maintenance_mode_idx: %v (the 00232 CREATE INDEX IF NOT EXISTS must have landed)", err)
+		t.Fatalf("query apps_maintenance_mode_idx: %v (the 00235 CREATE INDEX IF NOT EXISTS must have landed)", err)
 	}
 	if !strings.Contains(indexDef, "WHERE") || !strings.Contains(indexDef, "maintenance_mode") || !strings.Contains(indexDef, "true") {
 		t.Errorf("apps_maintenance_mode_idx indexdef = %q, want partial predicate referencing maintenance_mode and true", indexDef)
@@ -108,7 +108,7 @@ func TestMigrations_00232_AppsMaintenanceMode(t *testing.T) {
 		   and trigger_name = 'apps_maintenance_mode_notify'
 	`).Scan(&triggerName, &triggerEvent)
 	if err != nil {
-		t.Fatalf("query apps_maintenance_mode_notify trigger: %v (the 00232 CREATE TRIGGER must have landed)", err)
+		t.Fatalf("query apps_maintenance_mode_notify trigger: %v (the 00235 CREATE TRIGGER must have landed)", err)
 	}
 	if triggerName != "apps_maintenance_mode_notify" {
 		t.Errorf("trigger_name = %q, want 'apps_maintenance_mode_notify'", triggerName)
@@ -142,8 +142,8 @@ func TestMigrations_00232_AppsMaintenanceMode(t *testing.T) {
 	}
 
 	// (5) Positive round-trip.
-	accountID := "00000000-0000-0000-0000-000000002232"
-	appID := "00000000-0000-0000-0000-000000012232"
+	accountID := "00000000-0000-0000-0000-000000002235"
+	appID := "00000000-0000-0000-0000-000000012235"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
 		values ($1, 'scale', 'maintenance-mode-test@example.com')
