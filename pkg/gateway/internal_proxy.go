@@ -45,6 +45,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 )
 
 // InternalDialer is the seam the public daemon wires to reach a
@@ -94,6 +96,22 @@ type InternalReverseProxy struct {
 	Transport   http.RoundTripper
 	Logger      *slog.Logger
 	DialTimeout time.Duration
+	// Drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker shared with Handler + TraceHandler + the
+	// control mux. nil = drain disabled. Wired via WithInFlightTracker
+	// from cmd/gatewayd-public/main.go so the same tracker the
+	// handler waits on covers the forwarder too — without this,
+	// a request that's already handed off to the proxy but is
+	// still piping bytes upstream would be invisible to the drain.
+	Drain *drain.Tracker
+}
+
+// WithInFlightTracker installs the per-request drain tracker (see
+// Handler.WithInFlightTracker for the full contract). Returns the
+// proxy for fluent chaining.
+func (p *InternalReverseProxy) WithInFlightTracker(tracker *drain.Tracker) *InternalReverseProxy {
+	p.Drain = tracker
+	return p
 }
 
 // NewInternalReverseProxy returns a wired InternalReverseProxy. The
@@ -253,6 +271,17 @@ func dialWithTimeout(ctx context.Context, dialer InternalDialer, dialTimeout tim
 // On dial failure: 502 Bad Gateway. On upstream error: propagated
 // unchanged.
 func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Drain tracker (issue #587 / PR-A): a request that's
+	// handed off to the proxy is "in flight" from the daemon's
+	// perspective until RoundTrip returns. The defer is nil-safe
+	// (no-op closure when p.Drain is nil) so production wires it
+	// once at construction and unit tests don't have to.
+	defer func() {
+		if p.Drain != nil {
+			p.Drain.Begin("http")()
+		}
+	}()
+
 	if p.Dialer == nil || p.Target == nil {
 		// Wiring bug — log at ERROR because the customer sees the
 		// failure on the public listener.

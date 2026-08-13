@@ -92,6 +92,12 @@ type Metrics struct {
 
 	requests    *prometheus.CounterVec
 	wakeLatency prometheus.Histogram
+	// drainWaitSeconds (issue #587 / PR-A) is the per-daemon
+	// graceful-shutdown drain histogram (see ObserveDrainWait).
+	drainWaitSeconds *prometheus.HistogramVec
+	// inflightRequests (issue #587 / PR-A) is the per-daemon
+	// drain.Tracker in-flight gauge (see SetInflightRequests).
+	inflightRequests *prometheus.GaugeVec
 	// wakeLatencyByNode (PR #4 / ADR-092 §3.5) is the per-node
 	// labelled twin of wakeLatency. The unlabeled histogram stays
 	// untouched — it's the §12 SLA contract and is consumed by
@@ -968,7 +974,57 @@ func NewMetrics() *Metrics {
 	// to omit the series entirely even with the WithLabelValues
 	// calls in place.
 	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds)
+	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
+	// observability. Same shape as the wire.OpsMetrics series,
+	// registered on the gateway.Metrics registry so it surfaces
+	// in the existing /metrics scrape (gatewayd-internal uses
+	// gateway.Metrics; gatewayd-public uses wire.OpsMetrics).
+	// Both daemons see the same metric NAME; only the registry
+	// differs. The {daemon, op} labels are pre-instantiated
+	// here so the dashboard surfaces rows from boot.
+	m.drainWaitSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gateway_drain_wait_seconds",
+		Help:    "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGraceSeconds=25s ceiling.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 25},
+	}, []string{"daemon", "outcome"})
+	m.drainWaitSeconds.WithLabelValues("gatewayd-internal", "clean")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-internal", "deadline_exceeded")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-internal", "ctx_cancelled")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-public", "clean")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-public", "deadline_exceeded")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-public", "ctx_cancelled")
+	m.inflightRequests = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gateway_inflight_requests",
+		Help: "Current in-flight request count tracked by the per-daemon drain.Tracker (issue #587 / PR-A / pkg/gateway/drain). Labelled by {daemon, op}; op ∈ {http, upgrade, control}. NO plan or app label — Prometheus cardinality discipline (per the cluster plan's 'Decisions baked in' §2).",
+	}, []string{"daemon", "op"})
+	m.inflightRequests.WithLabelValues("gatewayd-internal", "http")
+	m.inflightRequests.WithLabelValues("gatewayd-internal", "upgrade")
+	m.inflightRequests.WithLabelValues("gatewayd-internal", "control")
+	m.inflightRequests.WithLabelValues("gatewayd-public", "http")
+	m.inflightRequests.WithLabelValues("gatewayd-public", "upgrade")
+	m.inflightRequests.WithLabelValues("gatewayd-public", "control")
+	reg.MustRegister(m.drainWaitSeconds, m.inflightRequests)
 	return m
+}
+
+// ObserveDrainWait (issue #587 / PR-A) records the wall-clock
+// duration of a drain.Tracker.Drain call. outcome is one of
+// drain.Outcome{Clean,DeadlineExceeded,Cancelled}; daemon ∈
+// {gatewayd-public, gatewayd-internal}. Nil-safe.
+func (m *Metrics) ObserveDrainWait(daemon, outcome string, seconds float64) {
+	if m == nil || m.drainWaitSeconds == nil {
+		return
+	}
+	m.drainWaitSeconds.WithLabelValues(daemon, outcome).Observe(seconds)
+}
+
+// SetInflightRequests (issue #587 / PR-A) sets the per-daemon
+// per-op in-flight gauge. Nil-safe.
+func (m *Metrics) SetInflightRequests(daemon, op string, count float64) {
+	if m == nil || m.inflightRequests == nil {
+		return
+	}
+	m.inflightRequests.WithLabelValues(daemon, op).Set(count)
 }
 
 // Registry returns the underlying *prometheus.Registry — pass to promhttp.

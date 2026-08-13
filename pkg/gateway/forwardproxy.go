@@ -40,6 +40,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	evts "github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -847,11 +848,45 @@ func ForwardingRawReverseProxy(nodes NodeClientLookup, log *slog.Logger, sink *e
 // of ForwardingRawReverseProxy (issue #676 / ADR-080). nil events
 // opts out (pre-PR-C fixtures and the unit-test corpus).
 func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform, sink *egresssink.EgressSink) func(t Target) http.Handler {
+	return ForwardingRawReverseProxyWithEventsAndDrain(nodes, log, events, sink, nil)
+}
+
+// ForwardingRawReverseProxyWithEventsAndDrain (issue #587 / PR-A)
+// is the drain-aware variant. The drain tracker, when non-nil, is
+// held for the duration of the raw-stream pump so the gateway's
+// graceful-shutdown drain waits for hijacked Upgrade pumps (which
+// run outside any ServeHTTP envelope) instead of force-closing the
+// conn on TimeoutStopSec=30s.
+//
+// The tracker is held by the closure returned for each Target via
+// `tracker.Begin("upgrade")()` at the top of the inner handler.
+// Storing the Done closure on conn-scoped state isn't possible
+// here because the hijacker lives inside rawStreamOnceWithEvents;
+// the simplest correct invariant is "the closure fires when this
+// http.HandlerFunc returns, regardless of whether ServeHTTP has
+// returned to net/http". The closure is the canonical
+// defer-done pattern: it captures the per-request drain slot and
+// releases it when the inner function exits.
+//
+// nil tracker = pre-PR-A behaviour, preserved for unit tests
+// and the e2e harness.
+func ForwardingRawReverseProxyWithEventsAndDrain(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform, sink *egresssink.EgressSink, tracker *drain.Tracker) func(t Target) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return func(t Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Drain tracker: holds the per-raw-pump drain slot.
+			// The defer fires when this handler returns to
+			// net/http (typically after the gRPC bidi stream
+			// tears down). This is the only safe surface for
+			// the per-raw-pump Begin because the hijacked conn
+			// pump goroutine outlives ServeHTTP's envelope.
+			defer func() {
+				if tracker != nil {
+					tracker.Begin("upgrade")()
+				}
+			}()
 			ctx := contextWithProxyStart(r.Context(), time.Now())
 			cli, closer, ok := nodes.ClientFor(r.Context(), t.NodeID)
 			if !ok {

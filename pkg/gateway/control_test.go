@@ -12,7 +12,7 @@ import (
 )
 
 func TestControlMuxHealthz(t *testing.T) {
-	mux := ControlMux(NewMetrics(), nil)
+	mux := ControlMux(NewMetrics(), nil, nil)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -32,7 +32,7 @@ func TestControlMuxHealthz(t *testing.T) {
 
 func TestControlMuxReadyz(t *testing.T) {
 	t.Run("not-ready when callback false", func(t *testing.T) {
-		mux := ControlMux(NewMetrics(), func() bool { return false })
+		mux := ControlMux(NewMetrics(), func() bool { return false }, nil)
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
 		resp, err := http.Get(srv.URL + "/readyz")
@@ -45,7 +45,7 @@ func TestControlMuxReadyz(t *testing.T) {
 		}
 	})
 	t.Run("ready when callback true", func(t *testing.T) {
-		mux := ControlMux(NewMetrics(), func() bool { return true })
+		mux := ControlMux(NewMetrics(), func() bool { return true }, nil)
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
 		resp, err := http.Get(srv.URL + "/readyz")
@@ -63,7 +63,7 @@ func TestControlMuxReadyz(t *testing.T) {
 		// probe is a wiring bug; we surface it via /readyz so the
 		// operator sees the daemon draining, instead of forwarding
 		// traffic to a partial-boot instance.
-		mux := ControlMux(NewMetrics(), nil)
+		mux := ControlMux(NewMetrics(), nil, nil)
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
 		resp, err := http.Get(srv.URL + "/readyz")
@@ -84,7 +84,7 @@ func TestControlMuxReadyz(t *testing.T) {
 func TestControlMuxMetrics(t *testing.T) {
 	m := NewMetrics()
 	m.ObserveRequest("app-1", "pro", "200")
-	mux := ControlMux(m, nil)
+	mux := ControlMux(m, nil, nil)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/metrics")
@@ -103,7 +103,7 @@ func TestControlMuxMetrics(t *testing.T) {
 
 func TestRunControlServerShutsDownOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	mux := ControlMux(NewMetrics(), nil)
+	mux := ControlMux(NewMetrics(), nil, nil)
 	errc := make(chan error, 1)
 	go func() {
 		// Bind to a loopback ephemeral port to avoid ":9090 in use" in CI.

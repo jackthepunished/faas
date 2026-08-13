@@ -57,6 +57,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -223,6 +224,23 @@ func run(ctx context.Context, log *slog.Logger) error {
 		log,
 		h2cEnabled,
 	)
+	// Issue #587 / PR-A: per-request drain tracker shared between
+	// the InternalReverseProxy and the control mux so every
+	// ServeHTTP surface contributes to the same in-flight count.
+	// gatewayd-public has no Handler (the public listener is just
+	// a TLS-terminating reverse proxy) so the proxy is the
+	// load-bearing entry point here. runDrain below consumes the
+	// tracker to bound shutdown by known in-flight requests
+	// instead of a hard wall-clock.
+	drainTracker := drain.NewTracker()
+	proxy.WithInFlightTracker(drainTracker)
+	// gatewayMetrics is a gateway.Metrics bundle local to the
+	// public daemon; the public doesn't expose wire.OpsMetrics
+	// (the wire.Daemon harness owns those), so the drain
+	// histogram + inflight gauge live here and surface via
+	// /metrics on the control mux (ControlMux mounts
+	// metrics.Handler() automatically).
+	gatewayMetrics := gateway.NewMetrics()
 	// Issue #555 PR-3: mount otelhttp.NewTransport so the outbound
 	// request to gatewayd-internal carries the same trace context
 	// (gateway.route span). The wrapper sits UNDER the proxy's
@@ -259,7 +277,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	publicHandler := httpsec.Static(otelhttp.NewHandler(traceMux, "gatewayd-public.handler"))
 
 	// Control mux + listeners.
-	controlMux := gateway.ControlMux(nil, probe.ReadyFunc())
+	controlMux := gateway.ControlMux(gatewayMetrics, probe.ReadyFunc(), drainTracker)
 	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
 	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
 	publicSrv, controlSrv := buildServers(listenAddr, controlAddr, publicHandler, controlMux)
@@ -281,7 +299,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 
 	// Drain orchestration.
-	if err := runDrain(ctx, log, publicSrv, controlSrv, pgProbeSig, pgStop, traceSetup); err != nil {
+	if err := runDrain(ctx, log, publicSrv, controlSrv, pgProbeSig, pgStop, traceSetup, drainTracker, gatewayMetrics); err != nil {
 		return err
 	}
 	return nil
@@ -368,7 +386,7 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 //     1s ticker to make the sleep effectively cancellable).
 //  4. Shutdown both servers with a 5 s grace.
 //  5. pgStop() (already done above; kept here as a no-op safety net).
-func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http.Server, pgProbeSig *gateway.ReadySignal, pgStop func(), traceSetup *gateway.TraceSetup) error {
+func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http.Server, pgProbeSig *gateway.ReadySignal, pgStop func(), traceSetup *gateway.TraceSetup, drainTracker *drain.Tracker, gMetrics *gateway.Metrics) error {
 	drainCtx, cancelDrain := context.WithCancel(context.Background())
 	defer cancelDrain()
 	sigCh := make(chan os.Signal, 1)
@@ -423,6 +441,45 @@ func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http
 		log.Info("gatewayd-public: shutting down")
 	case err := <-errc:
 		return err
+	}
+	// Issue #587 / PR-A: wait for the per-request drain tracker
+	// to flush BEFORE Shutdown closes the listeners. Done first
+	// so we never race a Begin against srv.Shutdown's refusal to
+	// accept new connections. Shutdown itself has a 5s grace
+	// (next block) which is bounded by drain.DrainGraceSeconds
+	// below — the two together stay inside systemd's
+	// TimeoutStopSec=30s with 5s of headroom for the kernel.
+	//
+	// Exit-code discipline (systemd Restart=on-failure contract,
+	// pkg/deploycontroller/controller.go:43-115):
+	//   clean drain → return nil (no restart)
+	//   deadline_exceeded / ctx_cancelled → return ctx.Err()
+	//     so systemd restarts the daemon
+	// Pre-PR-A this path returned nil unconditionally, which hid
+	// second-SIGTERM force-exit bugs from operators.
+	if drainTracker != nil {
+		drainStart := time.Now()
+		drainCtxInner, cancelDrainInner := context.WithTimeout(context.WithoutCancel(ctx), drain.DrainGraceSeconds)
+		outcome, drainErr := drainTracker.Drain(drainCtxInner, drain.DrainGraceSeconds)
+		cancelDrainInner()
+		drainElapsed := time.Since(drainStart).Seconds()
+		// Issue #587 / PR-A: record the per-daemon drain
+		// histogram on every shutdown so the operator
+		// dashboard can spot a pattern of forced exits.
+		gMetrics.ObserveDrainWait("gatewayd-public", string(outcome), drainElapsed)
+		if drainErr != nil {
+			log.Warn("gatewayd-public: drain exited non-clean",
+				"outcome", string(outcome),
+				"max_inflight", drainTracker.MaxInflight(),
+				"err", drainErr)
+			return drainErr
+		}
+		if outcome != drain.OutcomeClean {
+			log.Warn("gatewayd-public: drain exited non-clean",
+				"outcome", string(outcome),
+				"max_inflight", drainTracker.MaxInflight())
+			return ctx.Err()
+		}
 	}
 	// Shutdown both servers gracefully. 5 s grace.
 	// context.WithoutCancel detaches from the parent's cancellation

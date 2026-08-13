@@ -49,6 +49,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/gateway/writegate"
@@ -257,6 +258,14 @@ type runDeps struct {
 	listen  func(network, addr string) (net.Listener, error)
 	newSrv  func(addr string, handler http.Handler) *http.Server
 	backend gateway.Backend
+	// drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker the graceful-shutdown path waits on. ONE
+	// tracker per daemon, shared by Handler + InternalReverseProxy +
+	// TraceHandler + control mux + raw-stream forwarder so every
+	// ServeHTTP surface contributes to the same in-flight count.
+	// Set in runWithDeps after construction; nil in unit tests
+	// that don't exercise the shutdown path.
+	drain *drain.Tracker
 	// streamingEnabled (issue #471 / ADR-047) is the per-process
 	// opt-in for the streaming response path. Production passes
 	// envOr(TOML) || env("FAAS_GATEWAY_STREAMING"); tests leave it
@@ -802,6 +811,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
+	// Issue #587 / PR-A: the raw-stream forwarder needs the drain
+	// tracker so the hijacked Upgrade pump is held in the in-flight
+	// count. Wired BEFORE the handler sets up WithRawForwarding
+	// below so the factory closure captures the tracker.
+	// nodeCache.WithDrainTracker is a no-op when deps.drain is
+	// nil; see cmd/gatewayd-internal/nodecache.go for the seam.
 	deps.pgStore = pgStore
 	// Tier A9 / ADR-084 (PR-B sub-task B7): expose the
 	// daemon-wide *wire.OpsMetrics to runWithDeps so the
@@ -1052,6 +1067,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// and proxies to the unix socket bound in cmd/gatewayd-internal/.
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
+	// Issue #587 / PR-A: construct the per-request drain tracker
+	// the graceful-shutdown path waits on. ONE tracker per daemon
+	// shared with the nodeCache raw forwarder + the control mux.
+	// See pkg/gateway/drain for the WaitGroup/atomic contract.
+	deps.drain = drain.NewTracker()
+	handler.WithInFlightTracker(deps.drain)
 	handler.SetWakeGateHook()
 	// Issue #471 / ADR-047: per-process streaming opt-in. The Handler
 	// buffers every response unless the flag is on; when off, a
@@ -1199,6 +1220,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// bucket — see cmd/gatewayd-internal/nodecache.go:WithEgressSink.
 	if deps.nodeCache != nil {
 		deps.nodeCache.WithEgressSink(egressSink)
+		// Issue #587 / PR-A: raw-stream Upgrade pump drain tracking.
+		// Captured by the ForwardingRawReverseProxyWithEventsAndDrain
+		// closure in nodeCache.RawForwarding() — every hijacked
+		// raw-stream conn holds a Begin("upgrade") slot for its
+		// pump's lifetime, so the graceful-shutdown drain sees it
+		// in-flight instead of force-closing on TimeoutStopSec=30s.
+		deps.nodeCache.WithDrainTracker(deps.drain)
 	}
 	egressGRPCSocket := egressGRPCSocketPath()
 	// Reject the silent-no-TLS path: a non-unix target without TLS
@@ -1569,7 +1597,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	legacyReady := gateway.ReadyFunc(func() bool {
 		return deps.pgStore != nil
 	})
-	controlMux := gateway.ControlMux(handler.Metrics(), legacyReady)
+	controlMux := gateway.ControlMux(handler.Metrics(), legacyReady, deps.drain)
 	// Finding 6 (issue #314): mount the dashboard quota endpoint on the
 	// control mux so an in-box caller (operator's curl today, future
 	// apid-side dial) can read per-app bucket state without going through
@@ -1748,7 +1776,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), drain.DrainGraceSeconds)
 		defer cancel()
 		//nolint:contextcheck // shutdown ctx must outlive the cancelled caller ctx (net/http contract).
 		// Best-effort shutdown of every listener we may have started.
@@ -1773,6 +1801,49 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// listener is already draining so no new requests
 			// land.
 			_ = deps.nodeCache.Close()
+		}
+		// Issue #587 / PR-A: wait for the per-request drain
+		// tracker to flush before exiting. shutdownCtx has
+		// already been wired to DrainGraceSeconds (25s) — that
+		// sits inside systemd's TimeoutStopSec=30s with 5s
+		// headroom. The drain sets its own internal `draining`
+		// flag so any post-Shutdown stragglers become no-op
+		// Begin closures (pkg/gateway/drain.Drain doc).
+		//
+		// Exit-code discipline (systemd Restart=on-failure
+		// contract, pkg/deploycontroller/controller.go:43-115):
+		//   clean drain → return nil (no restart)
+		//   deadline_exceeded / ctx_cancelled → return ctx.Err()
+		//     so systemd restarts the daemon
+		// Pre-PR-A this branch returned nil unconditionally,
+		// which hid ctx-cancellation bugs from operators. The
+		// PR-A fix surfaces them so a hung drain doesn't quietly
+		// recycle on the next deploy.
+		if deps.drain != nil {
+			drainStart := time.Now()
+			outcome, drainErr := deps.drain.Drain(shutdownCtx, drain.DrainGraceSeconds)
+			drainElapsed := time.Since(drainStart).Seconds()
+			// Issue #587 / PR-A: record the drain histogram on
+			// every shutdown so an operator can spot a
+			// pattern of forced exits from the dashboard
+			// without re-reading the daemon log. Recorded
+			// against deps.metrics (gateway.Metrics) so the
+			// existing /metrics scrape picks it up alongside
+			// the rest of the gateway_* series.
+			deps.metrics.ObserveDrainWait("gatewayd-internal", string(outcome), drainElapsed)
+			if drainErr != nil {
+				log.Warn("gatewayd-internal drain exited non-clean",
+					"outcome", string(outcome),
+					"max_inflight", deps.drain.MaxInflight(),
+					"err", drainErr)
+				return drainErr
+			}
+			if outcome != drain.OutcomeClean {
+				log.Warn("gatewayd-internal drain exited non-clean",
+					"outcome", string(outcome),
+					"max_inflight", deps.drain.MaxInflight())
+				return ctx.Err()
+			}
 		}
 		return nil
 	}
