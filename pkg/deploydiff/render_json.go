@@ -26,7 +26,6 @@ func RenderJSON(w io.Writer, d Diff) error {
 	d.Changes = sortedChanges(d.Changes)
 	// Sort breaks by code for stable wire shape; errors first.
 	d.Breaks = sortedBreaks(d.Breaks)
-
 	// Wrap so the gate's blocking bool is explicit on the wire.
 	// A CI consumer reading `.blocking` doesn't have to re-scan
 	// `.breaks[]` and pick the max severity.
@@ -60,24 +59,9 @@ func sortedChanges(in []Change) []Change {
 
 // sortedBreaks returns errors first, then warns, each sorted by
 // Code ASC. Stable across deploys so CI gating is reproducible.
+// Delegates to splitBreaksBySeverity (render_text.go) so the JSON
+// and text renderers share one severity-partition implementation.
 func sortedBreaks(in []Break) []Break {
-	var errs, warns []Break
-	for _, b := range in {
-		if b.Severity == SeverityError {
-			errs = append(errs, b)
-		} else {
-			warns = append(warns, b)
-		}
-	}
-	sortBreaksByCode(errs)
-	sortBreaksByCode(warns)
+	errs, warns := splitBreaksBySeverity(in)
 	return append(errs, warns...)
-}
-
-func sortBreaksByCode(in []Break) {
-	for i := 1; i < len(in); i++ {
-		for j := i; j > 0 && in[j-1].Code > in[j].Code; j-- {
-			in[j-1], in[j] = in[j], in[j-1]
-		}
-	}
 }

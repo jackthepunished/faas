@@ -387,12 +387,11 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 		baseByKey[erKey{r.MatchHost, r.MatchPath, r.Kind}] = r
 	}
 	pendByKey := map[erKey]api.CreateEdgeRuleRequest{}
-	seen := map[erKey]int{} // first-seen index for stable dup reporting
 	for i, r := range pending {
 		k := erKey{r.MatchHost, r.MatchPath, r.Kind}
 		if _, dup := pendByKey[k]; dup {
-			// Surface the dup with its first-occurrence index so
-			// the customer's eye lands on the right row.
+			// Surface the dup with its current-occurrence index
+			// so the customer's eye lands on the right row.
 			label := k.kind + " " + k.host + k.path
 			out.Breaks = append(out.Breaks, Break{
 				Code:     "edge_rule_duplicate_key",
@@ -404,7 +403,6 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 			continue
 		}
 		pendByKey[k] = pending[i]
-		seen[k] = i
 	}
 
 	allKeys := make([]erKey, 0, len(baseByKey)+len(pendByKey))
@@ -577,7 +575,13 @@ func detectSchemaBreak(out *Diff, base *api.DeploymentResponse, p Pending) {
 	// EnvSecrets change → sealed-secret ref change. The wire form
 	// carries OverrideEnvSecretRefs (map[string]string) — refs are
 	// non-secret by design, so we CAN compare values here.
-	if len(p.Manifest.EnvSecrets) > 0 && !stringMapsEqual(p.Manifest.EnvSecrets, base.OverrideEnvSecretRefs) {
+	//
+	// We emit whenever the manifest is present — including when
+	// the customer removes every sealed-secret ref (the previous
+	// `len(...) > 0` guard silently dropped that case, mirroring
+	// the Env-path bug noted above).
+	pendSecretRefs := p.Manifest.EnvSecrets
+	if !stringMapsEqual(pendSecretRefs, base.OverrideEnvSecretRefs) {
 		out.Breaks = append(out.Breaks, Break{
 			Code:     "schema_env_changed",
 			Severity: SeverityWarn,
