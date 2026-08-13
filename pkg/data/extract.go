@@ -29,6 +29,14 @@ import (
 // debug-level "skipped N env values" message).
 var ErrNotAConnectionString = errors.New("data: value is not a connection string with a host")
 
+// KindClosedVocab entries. Used as canonical string values in
+// env-key-to-kind mapping below; the wire-level DataUpstreamKind
+// pkg/state enum (PR-A) accepts these as input.
+const (
+	kindPostgres = "postgres"
+	kindRedis    = "redis"
+)
+
 // schemeKindMap is the env-key-prefix → DataUpstreamKind
 // mapping. Order matters in the sense that "postgres" /
 // "postgresql" both map to DataUpstreamKindPostgres (the second
@@ -85,9 +93,9 @@ func KindFromEnvKey(envKey string) (string, bool) {
 	switch envKey {
 	case "DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL", "PG_URL",
 		"PGHOST", "PGUSER", "PGDATABASE", "PGPORT":
-		return "postgres", true
+		return kindPostgres, true
 	case "REDIS_URL", "REDIS_URL_ALT":
-		return "redis", true
+		return kindRedis, true
 	case "MONGO_URL", "MONGODB_URL", "MONGODB_URI", "MONGO_URI":
 		return "mongo", true
 	case "CASSANDRA_URL", "CASSANDRA_CONTACT_POINTS":
@@ -196,7 +204,7 @@ func ExtractHostPort(raw string) (host string, port int, kind string, ok bool) {
 				port = pn
 			}
 		}
-		return host, port, "redis", true
+		return host, port, kindRedis, true
 	}
 	// Comma-separated bootstrap (kafka, cassandra) — take first.
 	if m := kafkaBootstrapPattern.FindStringSubmatch(raw); m != nil {

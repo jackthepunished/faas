@@ -35,6 +35,7 @@ package meter
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -371,7 +372,8 @@ func classifyDialError(err error) *UpstreamProbeOutcome {
 // for "refused" vs "unreachable" — both surface as
 // *net.OpError with a syscall.Errno, which we inspect.
 func isDNSError(err error) bool {
-	if dns, ok := err.(*net.DNSError); ok {
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
 		// dns.Err is the underlying error from the resolver
 		// (string-typed); dns.Name is the lookup name. A
 		// lookup failure has either Err set OR an empty
@@ -389,10 +391,10 @@ func isTimeoutErr(err error) bool {
 }
 
 func isRefusedErr(err error) bool {
-	if op, ok := err.(*net.OpError); ok {
-		if sys, ok := op.Err.(*net.OpError); ok {
-			_ = sys
-		}
+	var op *net.OpError
+	if errors.As(err, &op) {
+		var sys *net.OpError
+		_ = errors.As(op.Err, &sys)
 	}
 	return err != nil && containsErrno(err, "refused")
 }

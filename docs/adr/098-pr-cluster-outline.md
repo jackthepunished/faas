@@ -48,6 +48,22 @@ multi-node payoff lands at M9 (`docs/faas_implementation_spec.md` §14
 + ADR-066), gated on the M9 acceptance criteria from the §14
 delivery plan.
 
+## Shipped as mega PR (post-cluster retrospective)
+
+The original 5-PR cluster (PR-0 + PR-A + PR-B + PR-C + PR-D) was
+collapsed for the M8 ship into a single mega PR combining PR-B +
+PR-C + PR-D behind the per-PR feature flags (`FAAS_DATA_PLACEMENT`,
+`FAAS_UPSTREAM_PROBE`, `FAAS_UPSTREAM_AFFINITY` — all default OFF).
+PR-A (schema + `data_upstreams` typed boundary) shipped as
+`224c501e`; PR-0 (this outline) shipped as PR #858. The mega PR
+follows the 10-commit decomposition `C1..C10` that mirrors the
+cluster steps at the commit level — a regression can be rebased
+into the appropriate sub-PR (PR-B → C4, PR-C → C5, PR-D → C6) without
+changing the rollout gate. The order-of-flips is unchanged (PR-B
+→ PR-C → PR-D, one month apart). The cluster outline remains the
+source of truth for paths and behaviour; the mega PR is a shipping
+artefact, not a design change.
+
 ## Verification (end-to-end)
 
 `cmd/e2e/connection_aware_e2e_test.go` (deferred to the cluster

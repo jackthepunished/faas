@@ -45,19 +45,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
-
-// uuidParse wraps uuid.Parse so the call site at
-// UpstreamAffinity.Refresh is one line. Returns the parsed
-// uuid.UUID or the parse error.
-func uuidParse(s string) (uuid.UUID, error) {
-	return uuid.Parse(s)
-}
 
 // UpstreamAffinity is the connection-aware placement cache. Maps
 // appID → (preferredRegion, score, observedAt). Safe for concurrent
