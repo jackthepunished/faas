@@ -1,19 +1,19 @@
 //go:build !no_pg
 
-// Migration-apply test for 00223_apps_cors_defaults.sql
+// Migration-apply test for 00224_apps_cors_defaults.sql
 // (ADR-091 / per-app default CORS columns on `apps`).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00223 (no goose
+//  1. Migration set applies cleanly through 00224 (no goose
 //     duplicate-version panic). The slot is real; the
-//     companion 00224 file is a no-op fence (per
+//     companion 00225 file is a no-op fence (per
 //     cross-pr-slot-gate-reservation-fence-pattern), so
 //     the contiguity test allows a non-claiming
-//     reservation file at 00224.
+//     reservation file at 00225.
 //  2. cors_default_enabled column exists, is boolean
 //     NOT NULL, and has the DEFAULT false literal. Every
-//     pre-00223 app row gets cors_default_enabled=false
+//     pre-00224 app row gets cors_default_enabled=false
 //     lazily on first read/write without an UPDATE
 //     rewrite, so the migration is metadata-only.
 //     Backwards-compat: existing wakes behave exactly as
@@ -51,7 +51,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-func TestMigrations_00223_AppsCORSDefaults(t *testing.T) {
+func TestMigrations_00224_AppsCORSDefaults(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
