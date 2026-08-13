@@ -3859,6 +3859,27 @@ func (m *MemStore) UpsertDeploymentScanResult(_ context.Context, id string, scan
 	return nil
 }
 
+// UpsertDeploymentSecretFindings mirrors
+// PgStore.UpsertDeploymentSecretFindings (migrations/00221,
+// secret-scan v2). Stamps the per-deploy secret-scan audit row
+// (findings + status + scannedAt) on the in-memory deployments
+// row. The Deployment struct's SecretFindings + SecretScannedAt
+// fields were added in this PR — the in-memory mirror needed its
+// own counterpart.
+func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, findings []byte, status string, scannedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.SecretFindings = append([]byte(nil), findings...) // defensive copy
+	d.ScanStatus = status
+	d.SecretScannedAt = scannedAt
+	m.deployments[id] = d
+	return nil
+}
+
 // SetDeploymentSidecarLayer mirrors PgStore (issue #463 /
 // ADR-069 / PR-B). Upserts on the (deployment_id, sidecar_name)
 // pair — same idempotency contract as the schema CHECK + ON

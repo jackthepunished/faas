@@ -4805,6 +4805,37 @@ func (s *PgStore) UpsertDeploymentScanResult(ctx context.Context, deploymentID s
 	return nil
 }
 
+// UpsertDeploymentSecretFindings writes the secret-scan audit row
+// (migrations/00221, secret-scan v2). Mirrors UpsertDeploymentScanResult:
+// scopes to one deployment row, overwrites (not creates a second),
+// and returns ErrNotFound on a missing row so a misuse at the call
+// site fails closed. The scan_status on the deployment row is
+// updated to the closed-set value the caller passes
+// ('complete_with_redactions' on a non-empty findings list) so the
+// dashboard pill reflects what the customer actually uploaded.
+//
+// We update scan_status in the SAME statement (rather than two
+// round-trips) so the audit row + dashboard pill can never disagree:
+// a future reader either sees both updated or neither. The
+// `complete_with_redactions` value is enforced by the
+// migrations/00221 CHECK widening.
+func (s *PgStore) UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set secret_findings = $2,
+		        scan_status = $3,
+		        secret_scanned_at = $4
+		  where id = $1`,
+		deploymentID, findings, nullString(status), scannedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetDeploymentSidecarLayer is the per-workload filesystem handle
 // for sidecars (issue #463 / ADR-069 / PR-B). Upserts one row
 // keyed by (deployment_id, sidecar_name). The whole row is
@@ -11655,6 +11686,7 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at,
+	secret_findings, secret_scanned_at,
 	coalesce(parked_reason,''), parked_at,
 	traffic_percent,
 	scope`
@@ -11685,6 +11717,7 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.sidecars, '[]'::jsonb),
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
+	d.secret_findings, d.secret_scanned_at,
 	coalesce(d.parked_reason,''), d.parked_at,
 	d.traffic_percent,
 	d.scope`
@@ -11747,6 +11780,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
+		&d.SecretFindings, &d.SecretScannedAt,
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
 		&d.Scope); err != nil {
 		return mapErr(err)

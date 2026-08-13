@@ -1104,6 +1104,19 @@ type Deployment struct {
 	ScanResult []byte    `json:"scan_result,omitempty"`
 	ScanStatus string    `json:"scan_status,omitempty"`
 	ScannedAt  time.Time `json:"scanned_at,omitempty"`
+	// Secret-scan columns (migrations/00221, secret-scan v2). The
+	// server-side scanner in cmd/apid/secretscan.go writes the
+	// per-line findings + timestamp when the upload is rejected
+	// (422 secret_scan_strict). The audit row survives the tarball
+	// cleanup so post-mortem forensics can read what was found
+	// without re-walking bytes. Mirrors the Scan{Result,Status,At}
+	// shape above — kept distinct so the two pipelines (grype CVE +
+	// secret scan) don't clobber each other's columns. The apid
+	// decoder turns SecretFindings []byte into the typed
+	// *api.SecretScanResult at the handler boundary; the raw-bytes
+	// shape here matches the existing ScanResult convention.
+	SecretFindings  []byte    `json:"secret_findings,omitempty"`
+	SecretScannedAt time.Time `json:"secret_scanned_at,omitempty"`
 
 	// Parking reason + timestamp (issue #554 / ADR-079 follow-up).
 	// pkg/sched.Engine.ParkDeployment sets these before flipping

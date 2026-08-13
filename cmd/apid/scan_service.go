@@ -339,6 +339,30 @@ func (s *server) scanService(
 			"Scan failed", scanErr.Error())
 	}
 
+	// Server-side secret-scan (closes v1 gap A). Runs on BOTH
+	// apply=true and apply=false — the preview contract is "we ran
+	// the scan and found redactions needed", so a 422 is honest even
+	// when the customer wasn't going to apply. The scan is non-fatal
+	// to reposcan: a walk error is logged via the envelope's detail
+	// but findings drive the 422. The walk is bounded by
+	// serverSecretScanMaxBytes (1 MiB per file) +
+	// serverSecretScanExcludeDirs (.git, node_modules, vendor, …)
+	// so a 10k-file customer tree completes in p95 ≤ 250 ms (target
+	// envelope; not pinned by spec).
+	secretFindings, ssErr := scanExtractedTreeSecrets(req.ScanDir)
+	if ssErr != nil && len(secretFindings) == 0 {
+		// Walk-level failure with no partial findings: surface as a
+		// 500 so the customer can retry. If we DO have findings, the
+		// 422 takes precedence — refusing the upload is more useful
+		// than a generic "scan failed" 500.
+		return nil, state.Project{}, nil, nil, nil, nil, api.NewProblem(
+			http.StatusInternalServerError, api.CodeInternal,
+			"Secret scan failed", ssErr.Error())
+	}
+	if len(secretFindings) > 0 {
+		return nil, state.Project{}, nil, nil, nil, nil, newSecretScanRejectionProblem(secretFindings)
+	}
+
 	// Filter --only against workload name. Deterministic order
 	// preserved (reposcan already sorts).
 	var (

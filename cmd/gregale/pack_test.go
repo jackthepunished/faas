@@ -778,7 +778,7 @@ func TestFuncErrorSuggestion(t *testing.T) {
 	}
 }
 
-// fakeStripeLiveKey mirrors the var in pkg/gregalesecretscan/scan_test.go.
+// fakeStripeLiveKey mirrors the var in pkg/secretscan/scan_test.go.
 // Declared locally because pack_test.go is `package main` — the scan
 // package's test var isn't reachable. The runtime behaviour is identical:
 // the regex matches, the Finding.Provider is "stripe_live".
@@ -791,13 +791,13 @@ var fakeStripeLiveKey = "sk" + "_" + "live" + "_" + "XXXXXXXXXXXXXXXXXXXXXXXXXXX
 //
 // The key literal is assembled via concatenation (see fakeStripeLiveKey)
 // so GitHub's secret-scanner doesn't flag the literal pattern on push.
-// The regex in pkg/gregalesecretscan still matches it at runtime.
+// The regex in pkg/secretscan still matches it at runtime.
 func TestScanAndRedactEnvFiles_StripsStripeKey(t *testing.T) {
 	dir := t.TempDir()
 	contents := "PORT=8080\nSTRIPE_SECRET_KEY=" + fakeStripeLiveKey + "\nDATABASE_URL=postgres://u:p@h:5432/d\n"
 	writeFile(t, dir, ".env.production", contents)
 
-	overrides, findings, err := scanAndRedactEnvFiles(dir, true)
+	overrides, findings, err := scanAndRedactEnvFiles(dir, modeWarn)
 	if err != nil {
 		t.Fatalf("scanAndRedactEnvFiles: %v", err)
 	}
@@ -834,7 +834,7 @@ func TestScanAndRedactEnvFiles_CleanDir_NoOp(t *testing.T) {
 	writeFile(t, dir, ".env", "PORT=8080\nGREETING=hello\n")
 	writeFile(t, dir, "main.go", "package main\n")
 
-	overrides, findings, err := scanAndRedactEnvFiles(dir, true)
+	overrides, findings, err := scanAndRedactEnvFiles(dir, modeWarn)
 	if err != nil {
 		t.Fatalf("scanAndRedactEnvFiles: %v", err)
 	}
@@ -852,7 +852,7 @@ func TestScanAndRedactEnvFiles_Disabled(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, ".env", "STRIPE_SECRET_KEY="+fakeStripeLiveKey+"\n")
 
-	overrides, findings, err := scanAndRedactEnvFiles(dir, false)
+	overrides, findings, err := scanAndRedactEnvFiles(dir, modeOff)
 	if err != nil {
 		t.Fatalf("scanAndRedactEnvFiles(disabled): %v", err)
 	}
@@ -873,7 +873,7 @@ func TestPackDirToTarGz_WithEnvOverride(t *testing.T) {
 	writeFile(t, dir, ".env.production", original)
 	writeFile(t, dir, "main.go", "package main\n")
 
-	overrides, _, err := scanAndRedactEnvFiles(dir, true)
+	overrides, _, err := scanAndRedactEnvFiles(dir, modeWarn)
 	if err != nil {
 		t.Fatalf("scanAndRedactEnvFiles: %v", err)
 	}

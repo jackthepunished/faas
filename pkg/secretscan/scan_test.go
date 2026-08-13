@@ -1,11 +1,11 @@
-// Whitebox tests for pkg/gregalesecretscan. The package is small and
+// Whitebox tests for pkg/secretscan. The package is small and
 // stateless so the test surface is table-driven: each case names the input
 // file/bytes and the exact set of Findings expected. Per the whitebox-test-
 // file-pattern memory (../../CLAUDE.md), we keep `package
-// gregalesecretscan` rather than `gregalesecretscan_test` so we can assert
+// secretscan` rather than `secretscan_test` so we can assert
 // on the unexported `defaultPatterns` table size + the shannonEntropy
 // helper from this file.
-package gregalesecretscan
+package secretscan
 
 import (
 	"math"

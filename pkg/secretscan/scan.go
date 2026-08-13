@@ -27,7 +27,7 @@
 // NEVER emitted — neither in the Finding struct nor in the renderer. This
 // matters because the warning line is printed to stderr and may be captured
 // in CI logs that get uploaded to third-party dashboards.
-package gregalesecretscan
+package secretscan
 
 import (
 	"bytes"

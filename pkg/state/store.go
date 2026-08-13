@@ -1650,6 +1650,26 @@ type Store interface {
 	// error lets a misuse at the call site fail closed).
 	UpsertDeploymentScanResult(ctx context.Context, deploymentID string, scanResult []byte, status string) error
 
+	// UpsertDeploymentSecretFindings records the per-deploy secret-
+	// scan audit row (migrations/00221, secret-scan v2). Written by
+	// cmd/apid/secretscan.go when the server-side tree scan finds
+	// redactions needed (a 422 rejection). Mirror
+	// UpsertDeploymentScanResult's IDOR + idempotency contract:
+	// scoped to one deployment row, overwrites (not creates a second),
+	// and returns ErrNotFound when the row is missing so a misroute
+	// fails closed.
+	//
+	// findings is the marshalled JSON for the
+	// deployments.secret_findings jsonb column (the typed
+	// []api.SecretFinding list, including safe-snippet policy).
+	// scannedAt is set on every call so a future query "show me the
+	// deploys scanned in the last hour" has a typed timestamp. The
+	// scan_status on the deployment row is updated to
+	// 'complete_with_redactions' on a non-empty findings list — the
+	// apid-side caller passes that status so the pgstore stays
+	// schema-agnostic.
+	UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error
+
 	// Per-workload filesystem handles for sidecars (issue #463 /
 	// ADR-069 / PR-B). The PR-A surface (Deployment.Sidecars
 	// jsonb) stays the contract layer; this is the per-sidecar
