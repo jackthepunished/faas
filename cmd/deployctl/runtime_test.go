@@ -209,10 +209,10 @@ func TestHostRestartIteratesServiceOrderInOrder(t *testing.T) {
 		"apid",
 	}
 	r := hostRuntime{
-		unitDir:      "/tmp/nonexistent",
-		databaseURL:  "",
-		serviceOrder: scrambled,
-		readyTimeout: 100 * time.Millisecond,
+		unitDir:           "/tmp/nonexistent",
+		databaseURL:       "",
+		serviceOrder:      scrambled,
+		readyTimeout:      100 * time.Millisecond,
 		waitReadyOverride: func(_ context.Context, _ string) error { return nil },
 	}
 	if err := r.Restart(context.Background(), releasebundle.Manifest{}); err != nil {

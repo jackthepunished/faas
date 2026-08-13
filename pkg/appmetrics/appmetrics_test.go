@@ -60,7 +60,7 @@ func okStub(v float64) *stubPromQL {
 // the two fields are populated independently. Any other query
 // returns 0 + nil (the test does not assert on the other fields).
 type queryDiscriminatorStub struct {
-	scheddEgress float64
+	scheddEgress  float64
 	gatewayEgress float64
 }
 
@@ -475,7 +475,7 @@ var _ = func() bool { var x api.AppMetricsResponse; return x.AppID == "" }()
 // NOT silently shadow the schedd-side EgressBytes).
 func TestFetch_PR2_TxBytesPopulatedIndependently(t *testing.T) {
 	stub := &queryDiscriminatorStub{
-		scheddEgress: 1024, // 1 KiB
+		scheddEgress:  1024, // 1 KiB
 		gatewayEgress: 4096, // 4 KiB — divergence is the test condition
 	}
 	logger, _ := captureLog(t)

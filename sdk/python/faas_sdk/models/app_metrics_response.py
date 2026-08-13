@@ -57,6 +57,12 @@ class AppMetricsResponse:
     """Per-app egress byte delta over the window (informational; not billed). ADR-046. Source:
     schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until
     then this field stays 0)."""
+    tx_bytes: int | Unset = UNSET
+    """Per-app egress byte delta over the window, gateway-side mirror (informational; not billed). ADR-046 PR-2 /
+    issue #415 PR-2. Source: gateway_egress_tx_bytes_total{app} (Prom rollup; the gatewayd-internal-local per-
+    instance egress ring populates the counter on each raw-stream chunk). Distinct from `egress_bytes` (the schedd-
+    side mirror) so a divergence between the two surfaces immediately on the dashboard. Best-effort: query failure
+    does NOT flip the response to degraded — matches the `egress_bytes` semantics."""
     routes: list[RouteRow] | Unset = UNSET
     """Per-route breakdown for opt-in apps (ADR-093). Absent when
     `route_metrics_enabled` is false on the app — the dashboard
@@ -94,6 +100,8 @@ class AppMetricsResponse:
 
         egress_bytes = self.egress_bytes
 
+        tx_bytes = self.tx_bytes
+
         routes: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.routes, Unset):
             routes = []
@@ -120,6 +128,8 @@ class AppMetricsResponse:
         )
         if egress_bytes is not UNSET:
             field_dict["egress_bytes"] = egress_bytes
+        if tx_bytes is not UNSET:
+            field_dict["tx_bytes"] = tx_bytes
         if routes is not UNSET:
             field_dict["routes"] = routes
 
@@ -154,6 +164,8 @@ class AppMetricsResponse:
 
         egress_bytes = d.pop("egress_bytes", UNSET)
 
+        tx_bytes = d.pop("tx_bytes", UNSET)
+
         _routes = d.pop("routes", UNSET)
         routes: list[RouteRow] | Unset = UNSET
         if _routes is not UNSET:
@@ -176,6 +188,7 @@ class AppMetricsResponse:
             cold_start_pct=cold_start_pct,
             wake_p95_ms=wake_p95_ms,
             egress_bytes=egress_bytes,
+            tx_bytes=tx_bytes,
             routes=routes,
         )
 

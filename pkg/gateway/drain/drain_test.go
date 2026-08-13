@@ -197,6 +197,16 @@ func TestDrain_CtxCancelled(t *testing.T) {
 // 200 goroutines each holding a Begin for a randomised duration.
 // Drain (in a separate goroutine) must end with Inflight==0.
 // Stress surface for the atomic + WaitGroup combo under -race.
+//
+// The "max in-flight observed" assertion is a soft degeneracy
+// check, not a hard requirement: under -race on a single-CPU
+// CI runner, the goroutines may serialise and each observe
+// Inflight()==1, so we assert ≥ N/4 (=50) rather than > 0.
+// The actual load-bearing assertions are the clean Drain
+// outcome + Inflight()==0 after Drain (those would fail under
+// any Begin/Done asymmetry). The local HWM observation is
+// only there to catch a test that races past every Begin
+// without ever seeing contention — i.e. a no-op.
 func TestTracker_HighConcurrency(t *testing.T) {
 	tr := NewTracker()
 	const N = 200
@@ -235,8 +245,8 @@ func TestTracker_HighConcurrency(t *testing.T) {
 	if got := tr.Inflight(); got != 0 {
 		t.Errorf("after drain: Inflight = %d, want 0", got)
 	}
-	if maxObserved.Load() == 0 {
-		t.Errorf("local observer never saw in-flight > 0; test is degenerate")
+	if got := maxObserved.Load(); got < int64(N/4) {
+		t.Errorf("local observer never saw meaningful overlap: maxObserved=%d (want ≥ %d) — test is degenerate", got, N/4)
 	}
 }
 
