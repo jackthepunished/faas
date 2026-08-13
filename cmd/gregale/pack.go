@@ -2,8 +2,10 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/gregalesecretscan"
 )
 
 // framework is the source kind auto-detected from the current directory when
@@ -717,8 +721,17 @@ const zeroConfigSourceCapMB = 100
 // can change the byte count either way). Returns the count of regular files
 // archived.
 //
+// envOverride, when non-nil, is a rel-path → redacted-bytes map applied to
+// the matching entry before it's written to the tarball. Used by the
+// --secret-scan default path: pkg/gregalesecretscan.ScanEnvContent flags
+// every line in a .env* file whose value matches a known credential pattern
+// or exceeds the Shannon-entropy floor, and the caller passes the file's
+// redacted content here so the offending values never enter the archive.
+// Pass nil from callers that don't run the scan (e.g. the unit-test
+// harness, or `gregale deploy --secret-scan=off`).
+//
 // The gzip→tar→walk shape mirrors cmd/gregale/templates/embed.go:TarGz.
-func packDirToTarGz(srcDir, destPath string) (regularFileCount int, err error) {
+func packDirToTarGz(srcDir, destPath string, envOverride map[string][]byte) (regularFileCount int, err error) {
 	root := filepath.Base(srcDir)
 
 	f, err := os.Create(destPath)
@@ -794,11 +807,33 @@ func packDirToTarGz(srcDir, destPath string) (regularFileCount int, err error) {
 		hdr.ModTime = packEpoch
 		hdr.AccessTime = time.Time{}
 		hdr.ChangeTime = time.Time{}
+		if e.info.IsDir() {
+			if err := tw.WriteHeader(hdr); err != nil {
+				return 0, fmt.Errorf("write header %s: %w", hdr.Name, err)
+			}
+			continue
+		}
+		// envOverride path: the secret-scan pass may have rewritten this
+		// entry's bytes to redact credential-shaped lines (Stripe keys,
+		// GitHub PATs, AWS access keys, etc.). When the rel path is in the
+		// override map, write those bytes instead of reading from disk.
+		// The override is consumed in-place (delete the key) so a single
+		// caller can't accidentally re-pack the same override into two
+		// destinations — the secret-scan pass is per-archive.
+		if data, ok := envOverride[e.rel]; ok {
+			hdr.Size = int64(len(data))
+			if err := tw.WriteHeader(hdr); err != nil {
+				return 0, fmt.Errorf("write header %s: %w", hdr.Name, err)
+			}
+			if _, err := tw.Write(data); err != nil {
+				return 0, fmt.Errorf("write body %s: %w", hdr.Name, err)
+			}
+			delete(envOverride, e.rel)
+			regularFileCount++
+			continue
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return 0, fmt.Errorf("write header %s: %w", hdr.Name, err)
-		}
-		if e.info.IsDir() {
-			continue
 		}
 		if err := copyRegular(tw, e.abs); err != nil {
 			return 0, err
@@ -963,7 +998,12 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 // temp file (if created) is removed before returning. fileCount is the count
 // of regular files archived — NOT the server-side entry count, which includes
 // directory entries (see cmd/apid/deploy_inputs.go:maxSourceFiles).
-func autoPackCwd(srcDir string) (tarballPath string, fw framework, fileCount int, err error) {
+//
+// envOverride is the rel-path → redacted-bytes map produced by the
+// secret-scan pass (see scanAndRedactEnvFiles). Pass nil to skip the scan
+// entirely — used by `gregale deploy --secret-scan=off` and by callers
+// that already vetted the inputs (cmd/e2e harness, pack_test.go).
+func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath string, fw framework, fileCount int, err error) {
 	f, err := os.CreateTemp("", "gregale-cwd-*.tar.gz")
 	if err != nil {
 		return "", fwUnknown, 0, fmt.Errorf("create temp tarball: %w", err)
@@ -971,10 +1011,240 @@ func autoPackCwd(srcDir string) (tarballPath string, fw framework, fileCount int
 	path := f.Name()
 	_ = f.Close()
 
-	n, err := packDirToTarGz(srcDir, path)
+	n, err := packDirToTarGz(srcDir, path, envOverride)
 	if err != nil {
 		_ = os.Remove(path)
 		return "", fwUnknown, 0, err
 	}
 	return path, detectFramework(srcDir), n, nil
 }
+
+// envFileBaseNames is the set of file names that count as "env files" for
+// the purpose of the secret-scan pass. We scan exactly these patterns —
+// not arbitrary *.env* — because scanning every file in the source tree
+// for credential patterns would produce noise (compiled binaries, lock
+// files, generated code). The list mirrors the conventional dotenv
+// spelling (.env, .env.local, .env.production, etc.) plus the explicit
+// docker-compose env_file convention.
+var envFileBaseNames = map[string]bool{
+	".env":             true,
+	".env.local":       true,
+	".env.development": true,
+	".env.production":  true,
+	".env.test":        true,
+	".env.staging":     true,
+	".env.example":     true,
+	".env.sample":      true,
+	".env.template":    true,
+	".env.defaults":    true,
+	"env":              true, // bare 'env' file is uncommon but used by some frameworks
+}
+
+// isEnvFileBase reports whether a slash-separated rel path's basename is a
+// dotenv-style file the scanner should walk. Files inside excluded
+// directories (.git, node_modules, etc.) are skipped by the caller before
+// we ever see them, so this is purely a basename check.
+func isEnvFileBase(relSlash string) bool {
+	base := relSlash
+	if i := strings.LastIndex(relSlash, "/"); i >= 0 {
+		base = relSlash[i+1:]
+	}
+	if envFileBaseNames[base] {
+		return true
+	}
+	// Globs like ".env.<anything>" that aren't in the explicit list above
+	// (e.g. .env.production.us-east-1) still count — the dotenv convention
+	// is open-ended.
+	if strings.HasPrefix(base, ".env.") {
+		return true
+	}
+	return false
+}
+
+// parseSecretScanFlag normalises a --secret-scan value (string from the
+// flag parser) to the boolean used by both `gregale deploy` and
+// `gregale env push`. Accepts the common on/off spellings (on/off,
+// true/false, 1/0, yes/no) so a customer who paste-copies the flag
+// from a tutorial in any of those shapes still gets the expected
+// behaviour. Returns a non-nil error for any other value so a typo
+// (--secret-scan=0, --secret-scan=warn, --secret-scan=yes-please)
+// fails fast at flag parse time rather than silently defaulting.
+//
+// Shared between commands2.go (deploy) and commands5.go (env push) so a
+// future mode (e.g. --secret-scan=warn) can land in one place.
+//
+// The literal values are lifted to named consts so goconst
+// (golangci-lint v2.4.0) does not flag the four repeated string
+// literals here. They mirror the requireSignedTrue / requireSignedFalse
+// pattern in commands_app_security.go:50-59 and forceDefaultFalse in
+// commands_sign_keys_test.go:36, which exist for the same reason.
+const (
+	secretScanOn   = "on"
+	secretScanOff  = "off"
+	secretScanYes  = "yes"
+	secretScanNo   = "no"
+	secretScanOne  = "1"
+	secretScanZero = "0"
+)
+
+func parseSecretScanFlag(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case secretScanOn, requireSignedTrue, secretScanOne, secretScanYes:
+		return true, nil
+	case secretScanOff, requireSignedFalse, secretScanZero, secretScanNo:
+		return false, nil
+	default:
+		return false, fmt.Errorf("--secret-scan must be 'on' or 'off' (got %q)", raw)
+	}
+}
+
+// scanAndRedactEnvFiles walks srcDir once, finds every dotenv-style file,
+// runs pkg/gregalesecretscan against it, and returns:
+//   - overrides: rel-path → rewritten bytes, where offending lines are
+//     replaced by "<KEY>=<REDACTED # secret detected: stripe_live>".
+//     Empty for files where every line was a secret (the file is still
+//     included in the archive with that placeholder body so the customer's
+//     app doesn't see a missing .env at boot).
+//   - findings:  every gregalesecretscan.Finding produced, with the same
+//     File path as the override key so the caller can render one warning
+//     line per finding to stderr.
+//
+// The function is total: a srcDir with no env files returns (nil, nil).
+// An unredactable file (read error) is returned as a finding-with-error
+// rather than panicking; the caller decides whether that's a hard stop.
+//
+// secretScan=false is a fast-path escape hatch (--secret-scan=off): the
+// walk still happens but no files are scanned and no overrides are
+// produced, so the archive's bytes are identical to the pre-PR behaviour.
+func scanAndRedactEnvFiles(srcDir string, secretScan bool) (overrides map[string][]byte, findings []gregalesecretscan.Finding, err error) {
+	if !secretScan {
+		return nil, nil, nil
+	}
+	// errs accumulates per-file failures so a transient open/read error on
+	// the first .env file doesn't poison the whole walk (the previous
+	// single-err-variable shape had this bug). At the end we return
+	// errors.Join(errs...) so the caller sees every file that failed;
+	// partial success is still surfaced via overrides/findings.
+	var errs []error
+	walkErr := filepath.WalkDir(srcDir, func(p string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(srcDir, p)
+		if rerr != nil {
+			return rerr
+		}
+		relSlash := filepath.ToSlash(rel)
+		if !isEnvFileBase(relSlash) {
+			return nil
+		}
+		// openCustomerFile enforces the cmd/gregale os.Open tripwire and
+		// is symlink-safe (commands5.go). env files are customer-supplied
+		// so we route through the vetted boundary.
+		f, ferr := openCustomerFile(p)
+		if ferr != nil {
+			errs = append(errs, fmt.Errorf("open %s: %w", relSlash, ferr))
+			return nil
+		}
+		data, rerr := io.ReadAll(f)
+		_ = f.Close()
+		if rerr != nil {
+			errs = append(errs, fmt.Errorf("read %s: %w", relSlash, rerr))
+			return nil
+		}
+		fileFindings := gregalesecretscan.ScanEnvContent(relSlash, data)
+		if len(fileFindings) == 0 {
+			return nil
+		}
+		findings = append(findings, fileFindings...)
+		if overrides == nil {
+			overrides = make(map[string][]byte)
+		}
+		overrides[relSlash] = redactEnvContent(data, fileFindings)
+		return nil
+	})
+	if walkErr != nil {
+		errs = append(errs, fmt.Errorf("walk %s: %w", srcDir, walkErr))
+	}
+	return overrides, findings, errors.Join(errs...)
+}
+
+// redactEnvContent rewrites the env file so every line that produced a
+// Finding has its value replaced by a placeholder. Lines are matched by
+// their 1-indexed Line so a multi-finding file redacts only the offending
+// lines, leaving clean KEY=VALUE pairs intact (this matters for
+// stripe_test false-positives in mixed dev/prod env files).
+//
+// The placeholder preserves the original KEY so the customer's app can
+// still boot without crashing on a missing env var; the comment makes the
+// redaction self-documenting in the deployed tarball.
+func redactEnvContent(data []byte, findings []gregalesecretscan.Finding) []byte {
+	bad := make(map[int]string, len(findings))
+	for _, f := range findings {
+		bad[f.Line] = f.Provider
+	}
+	var out bytes.Buffer
+	lineNo := 1
+	// Trailing-newline policy: if the input ends with \n we preserve
+	// exactly that. If it does NOT end with \n, the output also lacks
+	// one. We only emit \n BETWEEN lines (after every consumed chunk).
+	// The previous shape appended \n unconditionally, which inflated
+	// files with no trailing newline (e.g. "A\nB" → "A\nB\n") and
+	// emitted "\n" for empty input — both of which changed shell `source
+	// .env` semantics in subtle ways.
+	hasTrailing := len(data) > 0 && data[len(data)-1] == '\n'
+	first := true
+	writeSep := func() {
+		if !first {
+			out.WriteByte('\n')
+		}
+		first = false
+	}
+	for {
+		i := bytes.IndexByte(data, '\n')
+		var line []byte
+		if i < 0 {
+			line = data
+			data = nil
+		} else {
+			line = data[:i]
+			data = data[i+1:]
+		}
+		if provider, hit := bad[lineNo]; hit {
+			eq := bytes.IndexByte(line, '=')
+			if eq >= 0 {
+				key := bytes.TrimSpace(line[:eq])
+				key = bytes.TrimPrefix(key, []byte("export "))
+				writeSep()
+				fmt.Fprintf(&out, "%s=<REDACTED # secret detected: %s>", key, provider)
+			} else {
+				// No '=' — keep the line as-is. Should be impossible given
+				// the scan matched it, but defensive: never crash the
+				// packer on a malformed line we can't safely rewrite.
+				writeSep()
+				out.Write(line)
+			}
+		} else {
+			writeSep()
+			out.Write(line)
+		}
+		lineNo++
+		if len(data) == 0 {
+			if hasTrailing {
+				out.WriteByte('\n')
+			}
+			return out.Bytes()
+		}
+	}
+}
+
+// formatSecretScanWarnings was an early string-slice renderer that lived
+// here while the CLI was being wired up. It was replaced by
+// renderSecretScanWarnings in commands2.go, which has direct access to
+// the CLI's PrintWarn + osStderr. Removed in favour of the single
+// renderer so a future contributor changing the message format only
+// touches one place. The two-line output shape is documented inline
+// at renderSecretScanWarnings.
