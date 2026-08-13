@@ -1969,19 +1969,23 @@ WHERE account_id = $1
   AND app_id     = $2
   AND last_seen_at >= $3
   AND last_seen_at <= $4
-  AND ($5::timestamptz IS NULL OR (last_seen_at, fingerprint) < ($5, $6))
+  AND ($5::bigint IS NULL
+       OR count < $5
+       OR (count = $5
+           AND (last_seen_at, fingerprint) < ($6, $7::text)))
 ORDER BY count DESC, last_seen_at DESC, fingerprint ASC
-LIMIT $7
+LIMIT $8
 `
 
 type ListAppErrorGroupsParams struct {
-	AccountID    pgtype.UUID
-	AppID        pgtype.UUID
-	LastSeenAt   pgtype.Timestamptz
-	LastSeenAt_2 pgtype.Timestamptz
-	Column5      pgtype.Timestamptz
-	LastSeenAt_3 pgtype.Timestamptz
-	Limit        int32
+	AccountID         pgtype.UUID
+	AppID             pgtype.UUID
+	Since             pgtype.Timestamptz
+	Until             pgtype.Timestamptz
+	CursorCount       int64
+	CursorLastSeen    pgtype.Timestamptz
+	CursorFingerprint string
+	Limit             int32
 }
 
 type ListAppErrorGroupsRow struct {
@@ -1999,19 +2003,31 @@ type ListAppErrorGroupsRow struct {
 
 // ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
 // one (account_id, app_id) over a (since, until) window.
-// Cursor pagination via the (last_seen_at, fingerprint) compound
-// tuple (distinct from the operator's (created_at, id) cursor).
+// Cursor pagination via the (count, last_seen_at, fingerprint)
+// compound tuple (distinct from the operator's (created_at, id)
+// cursor). All three columns are part of the ORDER BY so the
+// cursor predicate must include all three — dropping `count`
+// breaks pagination: rows with smaller count but newer
+// last_seen_at are silently dropped across pages (the cursor
+// predicate on (last_seen_at, fingerprint) only considers the
+// inner order, missing the leading count-DESC boundary).
 // Index path: app_errors_account_app_last_seen_idx covers the
 // primary scan; the (count DESC) sort happens post-filter on the
 // bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+//
+// sqlc.arg(name) annotations disambiguate the cursor predicate
+// types — without them sqlc infers the timestamps as timestamptz
+// from the leading (count, last_seen_at) references and breaks
+// pagination.
 func (q *Queries) ListAppErrorGroups(ctx context.Context, db DBTX, arg ListAppErrorGroupsParams) ([]ListAppErrorGroupsRow, error) {
 	rows, err := db.Query(ctx, listAppErrorGroups,
 		arg.AccountID,
 		arg.AppID,
-		arg.LastSeenAt,
-		arg.LastSeenAt_2,
-		arg.Column5,
-		arg.LastSeenAt_3,
+		arg.Since,
+		arg.Until,
+		arg.CursorCount,
+		arg.CursorLastSeen,
+		arg.CursorFingerprint,
 		arg.Limit,
 	)
 	if err != nil {
@@ -2051,18 +2067,19 @@ FROM app_error_requests
 WHERE account_id  = $1
   AND app_id      = $2
   AND fingerprint = $3
-  AND ($4::timestamptz IS NULL OR (received_at, request_id) < ($4, $5))
+  AND ($4::timestamptz IS NULL
+       OR (received_at, request_id) < ($4, $5::uuid))
 ORDER BY received_at DESC, request_id DESC
 LIMIT $6
 `
 
 type ListAppErrorRequestsParams struct {
-	AccountID   pgtype.UUID
-	AppID       pgtype.UUID
-	Fingerprint string
-	Column4     pgtype.Timestamptz
-	ReceivedAt  pgtype.Timestamptz
-	Limit       int32
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	Fingerprint      string
+	CursorReceivedAt pgtype.Timestamptz
+	CursorRequestID  pgtype.UUID
+	Limit            int32
 }
 
 type ListAppErrorRequestsRow struct {
@@ -2080,13 +2097,17 @@ type ListAppErrorRequestsRow struct {
 // (received_at, request_id). Index path:
 // app_error_requests_drill_idx. Does NOT include headers_sample
 // or redactions — those are returned only by GetAppErrorSample.
+//
+// sqlc.arg(name) annotations disambiguate the cursor predicate
+// types — without them sqlc infers $5 as timestamptz from the
+// leading (received_at) reference, breaking pagination.
 func (q *Queries) ListAppErrorRequests(ctx context.Context, db DBTX, arg ListAppErrorRequestsParams) ([]ListAppErrorRequestsRow, error) {
 	rows, err := db.Query(ctx, listAppErrorRequests,
 		arg.AccountID,
 		arg.AppID,
 		arg.Fingerprint,
-		arg.Column4,
-		arg.ReceivedAt,
+		arg.CursorReceivedAt,
+		arg.CursorRequestID,
 		arg.Limit,
 	)
 	if err != nil {

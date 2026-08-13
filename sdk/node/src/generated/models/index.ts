@@ -17,6 +17,11 @@ export type { AdminSetGithubWebhookSecretResponse } from './AdminSetGithubWebhoo
 export type { AlertRuleResponse } from './AlertRuleResponse.js';
 export type { AppEnvListResponse } from './AppEnvListResponse.js';
 export type { AppEnvResponse } from './AppEnvResponse.js';
+export type { AppErrorRequestItem } from './AppErrorRequestItem.js';
+export type { AppErrorRequestsResponse } from './AppErrorRequestsResponse.js';
+export type { AppErrorSampleResponse } from './AppErrorSampleResponse.js';
+export type { AppErrorSummaryItem } from './AppErrorSummaryItem.js';
+export type { AppErrorsSummaryResponse } from './AppErrorsSummaryResponse.js';
 export type { AppManifest } from './AppManifest.js';
 export type { AppMetricsResponse } from './AppMetricsResponse.js';
 export type { AppRegistryCredentialListResponse } from './AppRegistryCredentialListResponse.js';

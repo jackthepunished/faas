@@ -2,6 +2,9 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AppErrorRequestsResponse } from '../models/AppErrorRequestsResponse.js';
+import type { AppErrorSampleResponse } from '../models/AppErrorSampleResponse.js';
+import type { AppErrorsSummaryResponse } from '../models/AppErrorsSummaryResponse.js';
 import type { AppMetricsResponse } from '../models/AppMetricsResponse.js';
 import type { AppResponse } from '../models/AppResponse.js';
 import type { AppRoutesResponse } from '../models/AppRoutesResponse.js';
@@ -312,6 +315,183 @@ export class AppsService {
       },
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app customer-facing automatic error grouping summary (ADR-096 / PR-B).
+   * Sentry-style grouped error view scoped to a customer's
+   * app. One row per `(account_id, app_id, fingerprint)` over
+   * the requested `[since, until]` window, sorted by `count
+   * DESC, last_seen_at DESC, fingerprint ASC`. Distinct from
+   * `GET /v1/apps/{slug}/slo` (issue #696 / ADR-082) which is
+   * the closed-set SLO summary (`1h` / `24h` / `7d`) — the
+   * errors summary uses a continuous `[since, until]` window
+   * with an explicit RFC3339Nano stamp instead.
+   *
+   * The window is clamped to `AppErrorsWindowMaxHours` (168h).
+   * When the clamp fires, `window_clamped` is true so the
+   * dashboard can render a "you widened the window past the
+   * cap" tile. The endpoint returns 200 with `items: []`
+   * when no fingerprints are present in the window — never
+   * 404. Cross-account slug is a 404 (IDOR-safe; the error
+   * is byte-identical to a real "no such app" 404).
+   *
+   * Fingerprints are derived at write time as
+   * `sha256(route_template || "\x1f" || http_status ||
+   * "\x1f" || error_class)`. The route is the matched
+   * template (e.g. `/users/{id}`), NEVER the expanded URL —
+   * this is the load-bearing cardinality fix that keeps the
+   * top-N bounded.
+   *
+   * @returns AppErrorsSummaryResponse The grouped error summary.
+   * @throws ApiError
+   */
+  public static getAppErrorsSummary({
+    slug,
+    since,
+    until,
+    cursor,
+    limit = 20,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * RFC3339Nano UTC window start. Defaults to `until - 24h`.
+     */
+    since?: string | null,
+    /**
+     * RFC3339Nano UTC window end. Defaults to `now()`.
+     */
+    until?: string | null,
+    /**
+     * Opaque pagination cursor from the previous response's `next_cursor`. Empty for the first page.
+     */
+    cursor?: string | null,
+    /**
+     * Page size. Default `AppErrorsSummaryDefaultLimit=20`, capped at `AppErrorsSummaryMaxLimit=100`.
+     */
+    limit?: number,
+  }): CancelablePromise<AppErrorsSummaryResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/errors/summary',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'since': since,
+        'until': until,
+        'cursor': cursor,
+        'limit': limit,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-fingerprint drill-down rows (ADR-096 / PR-B).
+   * Cursor-paginated drill-down over the request rows that
+   * landed on this fingerprint. Returns 404 when the
+   * fingerprint has been purged by the retention cron or
+   * never existed; the cross-account slug case is also 404
+   * (IDOR-safe byte-identical to a real "no such app" 404).
+   *
+   * @returns AppErrorRequestsResponse The drill-down rows (newest-first).
+   * @throws ApiError
+   */
+  public static listAppErrorRequests({
+    slug,
+    fingerprint,
+    cursor,
+    limit = 20,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 64-hex-char SHA-256 fingerprint of the error group; sha256(route_template || 0x1f || status || 0x1f || error_class).
+     */
+    fingerprint: string,
+    /**
+     * Opaque pagination cursor (received_at, request_id compound). Empty for the first page.
+     */
+    cursor?: string | null,
+    /**
+     * Page size. Default `AppErrorsSummaryDefaultLimit=20`.
+     */
+    limit?: number,
+  }): CancelablePromise<AppErrorRequestsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/errors/{fingerprint}',
+      path: {
+        'slug': slug,
+        'fingerprint': fingerprint,
+      },
+      query: {
+        'cursor': cursor,
+        'limit': limit,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Single oldest sample row + redacted headers (ADR-096 / PR-B).
+   * Returns the OLDEST request row for the fingerprint plus
+   * the redacted `headers_sample` (jsonb-decoded) and the
+   * list of `redactions_applied` pattern names so the
+   * dashboard can render a "we redacted X / Y / Z" badge.
+   * Returns 404 when the fingerprint has been purged.
+   *
+   * @returns AppErrorSampleResponse The sample row.
+   * @throws ApiError
+   */
+  public static getAppErrorSample({
+    slug,
+    fingerprint,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 64-hex-char SHA-256 fingerprint to inspect; the oldest request row for this group is returned with its redacted headers.
+     */
+    fingerprint: string,
+  }): CancelablePromise<AppErrorSampleResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/errors/{fingerprint}/first',
+      path: {
+        'slug': slug,
+        'fingerprint': fingerprint,
+      },
+      errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
         429: `429. Two response shapes:
