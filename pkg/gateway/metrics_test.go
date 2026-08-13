@@ -1004,3 +1004,116 @@ func TestObserveStreamStartEndNilSafe(t *testing.T) {
 	m.ObserveStreamStart("app-A", "hobby") // must not panic
 	m.ObserveStreamEnd("app-A", "hobby")   // must not panic
 }
+
+// TestMetricsWSCountersRegistered (issue #676 / ADR-080
+// follow-up, PR-B) confirms all four gateway_ws_* Prometheus
+// series + their pre-instantiated closed label cells appear in
+// the /metrics output from boot. Catches a typo in the metric
+// names (which the §12 dashboards depend on) AND a regression
+// in the constructor's pre-instantiate loop (a missing label
+// cell would surface as "no data" on the panel until the first
+// production WS hit).
+func TestMetricsWSCountersRegistered(t *testing.T) {
+	m := NewMetrics()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+
+	// Series name contract — pin the exact names the
+	// deploy/grafana/ panels query (dashes between segments;
+	// "_total" suffix on counters; "_seconds" on the histogram
+	// + "_count" / "_sum" auto-emitted siblings).
+	wantSeries := []string{
+		"gateway_ws_upgrade_total",
+		"gateway_ws_active_sessions",
+		"gateway_ws_session_duration_seconds",
+		"gateway_ws_session_bytes_total",
+	}
+	for _, name := range wantSeries {
+		if !strings.Contains(body, name) {
+			t.Errorf("series %q not in registry output", name)
+		}
+	}
+
+	// Pre-instantiated label cells. The constructor loops over
+	// (api.Plans × wsOutcomes / wsSessionOutcomes / wsDirections)
+	// and stamps every cell. Asserting one cell per series
+	// catches a missing-loop regression; the package-level
+	// construction test below covers the full cross-product.
+	wantCells := []string{
+		`gateway_ws_upgrade_total{outcome="accepted",plan="hobby"}`,
+		`gateway_ws_upgrade_total{outcome="plan_denied",plan="free"}`,
+		`gateway_ws_upgrade_total{outcome="bridge_disabled",plan="pro"}`,
+		`gateway_ws_active_sessions{plan="scale"}`,
+		`gateway_ws_session_duration_seconds_count{outcome="client_disconnect",plan="hobby"}`,
+		`gateway_ws_session_bytes_total{direction="tx",plan="pro"}`,
+		`gateway_ws_session_bytes_total{direction="rx",plan="scale"}`,
+	}
+	for _, cell := range wantCells {
+		if !strings.Contains(body, cell) {
+			t.Errorf("pre-instantiated cell %q missing from output", cell)
+		}
+	}
+}
+
+// TestMetricsWSHelpersIncDecSymmetric (issue #676 / ADR-080
+// follow-up, PR-B) confirms the gauge Inc/Dec helpers balance
+// and the counter helpers track the byte volume. The symmetric
+// Inc/Dec pair is the load-bearing property: a forwarder that
+// Inc's without matching Dec (or vice versa) silently breaks
+// the ws_active_sessions{plan} panel rate. The counter Add
+// helper must accept n>0 (zero or negative is a no-op, not an
+// underflow).
+func TestMetricsWSHelpersIncDecSymmetric(t *testing.T) {
+	m := NewMetrics()
+
+	// Three sessions open, three close — gauge returns to zero.
+	for range []int{0, 1, 2} {
+		m.IncWSSessionStart("hobby")
+	}
+	m.DecWSSessionEnd("hobby")
+	m.DecWSSessionEnd("hobby")
+	m.DecWSSessionEnd("hobby")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	want := `gateway_ws_active_sessions{plan="hobby"} 0`
+	if !strings.Contains(body, want) {
+		t.Errorf("symmetric Inc/Dec didn't restore gauge to zero; want %q in body", want)
+	}
+
+	// Add bytes — counter increments by the exact delta.
+	m.AddWSSessionBytes("hobby", WSDirectionTx, 1024)
+	m.AddWSSessionBytes("hobby", WSDirectionTx, 4096)
+	m.AddWSSessionBytes("hobby", WSDirectionRx, 512)
+	m.AddWSSessionBytes("hobby", WSDirectionRx, 0)   // no-op
+	m.AddWSSessionBytes("hobby", WSDirectionRx, -10) // no-op (negative guard)
+
+	rec = httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body = rec.Body.String()
+	if !strings.Contains(body, `gateway_ws_session_bytes_total{direction="tx",plan="hobby"} 5120`) {
+		t.Errorf("tx counter mismatch; want 5120 in body")
+	}
+	if !strings.Contains(body, `gateway_ws_session_bytes_total{direction="rx",plan="hobby"} 512`) {
+		t.Errorf("rx counter mismatch; want 512 in body (negative/zero must be no-op)")
+	}
+}
+
+// TestMetricsWSNilSafe (issue #676 / ADR-080 follow-up, PR-B)
+// keeps the helper methods nil-safe so the pre-PR-B test corpus
+// (where Metrics may be nil) keeps building without per-test
+// boilerplate. Mirrors the existing TestObserveStreamStartEndNilSafe
+// precedent at the top of this file.
+func TestMetricsWSNilSafe(t *testing.T) {
+	var m *Metrics
+	m.IncWSUpgrade("hobby", WSOutcomeAccepted)
+	m.IncWSSessionStart("hobby")
+	m.DecWSSessionEnd("hobby")
+	m.ObserveWSSessionDuration("hobby", WSOutcomeAccepted, time.Second)
+	m.AddWSSessionBytes("hobby", WSDirectionTx, 1024)
+}

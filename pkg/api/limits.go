@@ -1756,6 +1756,22 @@ const (
 	// the same headroom.
 	RawStreamMaxRequestBytes int64 = 100 * 1024 * 1024
 
+	// RawStreamMaxResponseBytes (issue #676 / ADR-080 follow-up,
+	// PR-C) bounds the per-session egress bytes on the raw-bytes
+	// Upgrade bridge. Mirrors RawStreamMaxRequestBytes in shape
+	// but is sized for a long-lived WS session — a 100 MiB cap on
+	// a 24-h session would be pathologically tight for any chat /
+	// agent workload. 1 GiB lets a 100 KB/s stream run for ~3 h
+	// cleanly; above that, rawBridgePumpBody surfaces
+	// ResourceExhausted so the gateway-side forwarder emits 502
+	// to the customer (mirrors the inbound cap's behaviour at
+	// rawBridgeBodyLoop). This is memory-safety, NOT billing —
+	// the (plan_ram + 8) per-running-second cost already pays for
+	// WS residency. The cap prevents a runaway guest from
+	// ballooning the gateway's bidi goroutine pair past the
+	// gateway process's RSS budget.
+	RawStreamMaxResponseBytes int64 = 1 * 1024 * 1024 * 1024
+
 	// Post-response tail (issue #667 / ADR-078).
 	//
 	// TailCapMax is a structural constant applied uniformly across
