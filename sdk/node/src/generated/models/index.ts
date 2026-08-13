@@ -81,6 +81,7 @@ export type { DeploymentListResponse } from './DeploymentListResponse.js';
 export type { DeploymentLivenessProbe } from './DeploymentLivenessProbe.js';
 export type { DeploymentResponse } from './DeploymentResponse.js';
 export type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
+export type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 export type { EdgeRuleHeaderOp } from './EdgeRuleHeaderOp.js';
 export type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';
 export type { EdgeRuleIPAction } from './EdgeRuleIPAction.js';

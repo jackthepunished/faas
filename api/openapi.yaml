@@ -9121,6 +9121,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9151,6 +9152,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9175,6 +9177,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -9409,6 +9412,39 @@ components:
             the cap on both paths. Must be ≥ `max_body_bytes` when
             set. Runtime enforcement deferred to follow-up PR
             (ADR-091 D24 §6).
+
+    EdgeRuleGeoAction:
+      description: |
+        ISO 3166-1 alpha-2 country allow/deny evaluator (ADR-091
+        D21 / §4.1.2.8b). Mirrors `EdgeRuleIPAction` exactly: `allow`
+        and `deny` are parallel ISO 3166-1 alpha-2 country-code
+        lists; the matcher walks deny AFTER allow so a single-country
+        deny wins even when the allow list is broad.
+
+        The match port is `gatewayd-internal` which consults a
+        DB-IP Lite `.mmdb` file at request time to translate the
+        trusted XFF client IP into a country code. Plan-tier quota
+        is enforced at apid-create time via `Limits.EdgeRulesGeoPerApp`
+        (Free=1, Hobby=5, Pro=25, Scale=100) inside the same apps-row
+        FOR UPDATE lock as the general edge-rule cap. Geo is NOT in
+        IsPaidOnly — Free customers get one rule before they upgrade.
+
+        Failure posture is fail-open: missing `.mmdb`, IP not in
+        any country, RFC1918/bogon, or corrupt file → the rule does
+        not fire → the request flows through. The
+        `gateway_edge_rule_match_total{kind="geo",result="failed"}`
+        counter increments and an `edge_rule.geo_failed` audit event
+        emits.
+      type: object
+      properties:
+        allow:
+          type: array
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code." }
+          description: "ISO 3166-1 alpha-2 country allowlist. Empty + deny non-empty = deny-only. Empty + deny empty = no-op (create-time 422)."
+        deny:
+          type: array
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code." }
+          description: "ISO 3166-1 alpha-2 country denylist. Evaluated AFTER allow; single-country deny wins."
 
     # ─── API keys ─────────────────────────────────────────────────────────
 

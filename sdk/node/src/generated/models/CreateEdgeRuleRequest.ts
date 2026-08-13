@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
+import type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 import type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';
 import type { EdgeRuleIPAction } from './EdgeRuleIPAction.js';
 import type { EdgeRuleJWTAction } from './EdgeRuleJWTAction.js';
@@ -20,7 +21,7 @@ export type CreateEdgeRuleRequest = {
   match_methods?: Array<string>;
   priority?: number;
   enabled?: boolean;
-kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'geo';
+  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit';
   /**
    * Kind-tagged action body — shape depends on `kind`.
    */
