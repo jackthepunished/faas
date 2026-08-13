@@ -39,10 +39,10 @@
 -- row was lost) is idempotent. Same convention as 00213
 -- (deployments_scope) and 00203 (app_envs_scope_shape).
 --
--- Slot reservation: this migration replaces
--- migrations/00231_reserve_slot.sql, which held the slot before
--- PR-A landed. The fence file is removed in the same PR that
--- introduces this real migration.
+-- Slot reservation: 00231 was chosen as the next free real slot
+-- past PR #845 (00229_edge_rules_kind_geo) and PR #864
+-- (00232_edge_rules_kind_budget). No prior reservation existed at
+-- this slot; the migration lands fresh.
 
 ALTER TABLE deployments
     ADD COLUMN IF NOT EXISTS secret_findings  jsonb        NOT NULL DEFAULT '[]'::jsonb,
