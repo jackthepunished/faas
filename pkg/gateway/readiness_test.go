@@ -118,6 +118,69 @@ func TestReadyzProbe_ReadyFunc_StableUnderConcurrency(t *testing.T) {
 	<-done
 }
 
+// TestReadyzProbe_RegisterSignal_FoldsIntoAll exercises the
+// PR-B1 RegisterSignal path: a helper-constructed *ReadySignal
+// (e.g. one returned by NewPGPingSignal or NewStalenessSignal) is
+// added to the probe via RegisterSignal, and All() / ReadyFunc()
+// fold it into the fan-in alongside signals added via Register().
+//
+// The mixed use case is the load-bearing one: gatewayd-internal's
+// /readyz tighten (PR-B1) uses Register for manual signals
+// (schedd-router, nodeCache) and RegisterSignal for the helper
+// signals (PG ping, warm-hint staleness), because the helper
+// constructors already allocate a *ReadySignal and the caller
+// drives it via Stopper / Touch. Register() would build a
+// duplicate placeholder and the All() would permanently fail /readyz.
+func TestReadyzProbe_RegisterSignal_FoldsIntoAll(t *testing.T) {
+	var p ReadyzProbe
+
+	// Helper-constructed signal via NewStalenessSignal. The
+	// returned signal is the same one the helper goroutine drives
+	// (the goroutine flips true on touch, false on stale).
+	external, _, _ := NewStalenessSignal(50 * time.Millisecond)
+	p.RegisterSignal(external)
+
+	// Manual signal via Register. Set(true, "") immediately because
+	// in production this corresponds to a non-nil component.
+	manual := p.Register()
+	manual.Set(true, "")
+
+	// Before the staleness signal is touched, it is "not yet ready"
+	// (NewStalenessSignal's helper pre-arms true, but a race between
+	// the touch path and the first tick can land with false; we
+	// don't rely on the helper's pre-arm under -race).
+	// Drive the signal to a known state by calling Set directly.
+	external.Set(true, "")
+
+	ready, reason := p.All()
+	if !ready {
+		t.Errorf("All() = false (reason=%q) — RegisterSignal-folder signal did not contribute true", reason)
+	}
+
+	// Now flip the external signal false. All() must report false.
+	external.Set(false, "external failed")
+	ready, reason = p.All()
+	if ready {
+		t.Errorf("All() = true after RegisterSignal-folder signal flipped false (reason=%q)", reason)
+	}
+	if reason != "external failed" {
+		t.Errorf("All() reason = %q, want %q", reason, "external failed")
+	}
+}
+
+// TestReadyzProbe_RegisterSignal_NilIsNoop asserts the nil-guard:
+// callers do not need to check nil before RegisterSignal. A nil
+// signal is a no-op (the probe's All() does not panic on a nil entry
+// because RegisterSignal skips appending nil entries).
+func TestReadyzProbe_RegisterSignal_NilIsNoop(t *testing.T) {
+	var p ReadyzProbe
+	p.RegisterSignal(nil) // must not panic
+	ready, _ := p.All()
+	if !ready {
+		t.Errorf("All() after RegisterSignal(nil) = false (no signals registered; empty-probe contract is true)")
+	}
+}
+
 // stubPinger satisfies the pinger interface used by NewPGPingSignal.
 type stubPinger struct {
 	err   error

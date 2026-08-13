@@ -1,12 +1,20 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/daemonunitspec"
+	"github.com/onebox-faas/faas/pkg/releasebundle"
 )
 
 func TestCleanupBaseScratchRemovesOnlyControllerTempFiles(t *testing.T) {
@@ -117,5 +125,110 @@ func TestEnsureBaseStagingRootsOwnership(t *testing.T) {
 		if int(sys.Uid) != uid || int(sys.Gid) != gid {
 			t.Errorf("%s owned by %d:%d, want %d:%d", root, sys.Uid, sys.Gid, uid, gid)
 		}
+	}
+}
+
+// TestDefaultHostRuntimeUsesRestartOrder asserts the PR-B contract:
+// the hostRuntime that production gets from defaultHostRuntime() is
+// configured with serviceOrder from daemonunitspec.RestartOrder(),
+// not from the legacy slice-walking ActivationOrder().
+//
+// The Restart() loop itself stays a simple forward iterator — it
+// should NOT re-sort, because doing so would defeat the test seam
+// (waitReadyOverride) and silently re-order a serviceOrder that an
+// operator might have intentionally constructed for a partial restart.
+// PR-B's surface is at the *construction* layer (defaultHostRuntime),
+// not the iteration layer.
+//
+// This unit-level check replaces what would otherwise be an integration
+// test that needs real systemctl + a Linux box. The shape of the
+// contract is small enough that a unit test is enough: the
+// topological sort itself has its own exhaustive coverage in
+// pkg/daemonunitspec/restart_order_test.go.
+func TestDefaultHostRuntimeUsesRestartOrder(t *testing.T) {
+	want, err := daemonunitspec.RestartOrder()
+	if err != nil {
+		t.Fatalf("RestartOrder: %v", err)
+	}
+
+	r := defaultHostRuntime()
+	if !reflect.DeepEqual(r.serviceOrder, want) {
+		t.Errorf("defaultHostRuntime().serviceOrder =\n  got:  %v\n  want: %v\n(pr-B wires the host to the topological order; an operator-side override can still pass a scrambled slice to Restart, but the production default reads RestartOrder)",
+			r.serviceOrder, want)
+	}
+}
+
+// TestHostRestartIteratesServiceOrderInOrder asserts that Restart()
+// walks serviceOrder forward without re-sorting. This guards against
+// a future refactor that adds a hidden toposort inside Restart —
+// that would defeat the waitReadyOverride test seam (Restart would
+// re-skip an operator's hand-built slice) and surprise operators
+// reading the iteration order in journalctl.
+//
+// The scrambled slice is *not* a topological order on purpose. If
+// Restart secretly toposorted, the test would still pass on a
+// Registry sorted the same way as the scrambled slice; that's the
+// false positive we're guarding against. We assert the actual emission
+// order equals the input order — Restart is a forward iterator.
+//
+// Mutates package-level runCommand under a mutex; restores on test
+// exit via t.Cleanup so a future parallel test cannot be polluted.
+func TestHostRestartIteratesServiceOrderInOrder(t *testing.T) {
+	var mu sync.Mutex
+	orig := runCommand
+	t.Cleanup(func() { mu.Lock(); runCommand = orig; mu.Unlock() })
+
+	var (
+		recordingMu sync.Mutex
+		restarted   []string
+	)
+	rec := func(_ context.Context, name string, args ...string) error {
+		recordingMu.Lock()
+		defer recordingMu.Unlock()
+		// Capture "systemctl restart faas-X.service" only; skip the
+		// reset-failed + chown + chmod + is-active noise so the
+		// comparison slice is the exact restart sequence.
+		if name == "systemctl" && len(args) >= 2 && args[0] == "restart" {
+			restarted = append(restarted, args[1])
+		}
+		return nil
+	}
+
+	mu.Lock()
+	runCommand = rec
+	mu.Unlock()
+
+	scrambled := []string{
+		"gatewayd-public",
+		"meterd",
+		"gatewayd-internal",
+		"vmmd",
+		"imaged",
+		"githubd",
+		"schedd",
+		"apid",
+	}
+	r := hostRuntime{
+		unitDir:      "/tmp/nonexistent",
+		databaseURL:  "",
+		serviceOrder: scrambled,
+		readyTimeout: 100 * time.Millisecond,
+		waitReadyOverride: func(_ context.Context, _ string) error { return nil },
+	}
+	if err := r.Restart(context.Background(), releasebundle.Manifest{}); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+
+	recordingMu.Lock()
+	got := append([]string{}, restarted...)
+	recordingMu.Unlock()
+
+	// Map recorded service names → daemon names ("faas-X.service" → "X").
+	want := scrambled
+	for i, svc := range got {
+		got[i] = strings.TrimSuffix(strings.TrimPrefix(svc, "faas-"), ".service")
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Restart() iteration order = %v, want exactly %v (Restart must not re-sort)", got, want)
 	}
 }

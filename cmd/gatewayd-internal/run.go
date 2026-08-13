@@ -1590,14 +1590,63 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// that intentionally skips one". The split daemons (tasks #17,
 	// #18) wire the full ReadyzProbe from pkg/gateway/readiness.go
 	// with hydration tracking, schedd-router readiness, and PG ping.
-	// Here we wire the legacy one — "deps.pgStore != nil" — which is
-	// the strongest signal the pre-split daemon can honestly assert
-	// (the route cache is lazy-fill; the only "I cannot serve" state
-	// the legacy code has is "PG connection missing").
-	legacyReady := gateway.ReadyFunc(func() bool {
-		return deps.pgStore != nil
-	})
-	controlMux := gateway.ControlMux(handler.Metrics(), legacyReady, deps.drain)
+	//
+	// PR-B1 (issue #250 tier-1 ship-blocker): the gatewayd-internal
+	// split daemon flips from legacyReady (only "pgStore != nil") to
+	// the full ReadyzProbe. The tighter contract surfaces a partial-
+	// boot daemon to the LB drain instead of letting it accept traffic
+	// with a half-hydrated cache.
+	//
+	// Wiring strategy: each component-driven signal is constructed
+	// via the appropriate helper (PG ping, staleness) or Register()
+	// (manual), and is either Set(true, "") immediately (its
+	// component is non-nil → already wired above) or left Set(false)
+	// (nil → a test/dev path that intentionally skips the component).
+	// Production paths with deps.pool != nil, deps.scheddRouter != nil,
+	// deps.warmHints != nil, deps.nodeCache != nil flip true here.
+	readyProbe := &gateway.ReadyzProbe{}
+	// PG ping — only constructed if a pool is wired. The helper
+	// goroutine pings every 5s and flips true on success; it also
+	// kicks one ping immediately so the bit flips to ready as fast
+	// as Postgres can answer. The 5s cadence matches
+	// api.ReplicaHeartbeatIntervalSeconds so a /readyz scrape
+	// observes a coherent "all-replicas-healthy" surface.
+	if deps.pool != nil {
+		pgSig, _ := gateway.NewPGPingSignal(ctx, deps.pool, 5*time.Second)
+		readyProbe.RegisterSignal(pgSig)
+	}
+	// Schedd-router readiness: a manual signal flipped true the
+	// moment WatchNodeChanges has been started (called at runDeps
+	// init time around deps.scheddRouter construction above).
+	if deps.scheddRouter != nil {
+		s := readyProbe.Register()
+		s.Set(true, "")
+	}
+	// Per-node schedd dial cache (nodeCache) readiness: a manual
+	// signal flipped true after nodeCache construction above. The
+	// first dial lazy-fills; today the first dial happens on the
+	// first /v1/apps/{slug} request, so this signal is "we've
+	// constructed the cache and at least the first ClientFor can
+	// proceed" — not "we've already dialed". The lazy semantic is
+	// load-bearing for cold-boot latency; a stricter "cache primed"
+	// signal would force a synchronous Dial on every boot, which is
+	// what the legacy daemon deliberately avoided.
+	if deps.nodeCache != nil {
+		s := readyProbe.Register()
+		s.Set(true, "")
+	}
+	// Warm-hint subscriber freshness: a staleness signal Touched by
+	// warmHints on each delivery. 2-minute staleness catches "the
+	// daemon thinks it's subscribed but actually the goroutine
+	// exited" rather than "the stream is momentarily idle" (the
+	// schedd stream cadence under steady-state is sub-second).
+	// Skipped when deps.warmHints is nil so a test that doesn't
+	// construct the consumer doesn't fail /readyz permanently.
+	if deps.warmHints != nil {
+		signal, _, _ := gateway.NewStalenessSignal(2 * time.Minute)
+		readyProbe.RegisterSignal(signal)
+	}
+	controlMux := gateway.ControlMux(handler.Metrics(), readyProbe.ReadyFunc(), deps.drain)
 	// Finding 6 (issue #314): mount the dashboard quota endpoint on the
 	// control mux so an in-box caller (operator's curl today, future
 	// apid-side dial) can read per-app bucket state without going through

@@ -2880,6 +2880,22 @@ type AppMetricsResponse struct {
 	// future egress-billing PR picks the unit; this field
 	// reports the Prometheus counter verbatim.
 	EgressBytes int64 `json:"egress_bytes"`
+	// TxBytes (ADR-046 PR-2 / issue #415 PR-2) is the
+	// gateway-side mirror of EgressBytes. Source:
+	// gateway_egress_tx_bytes_total{app} (the byte
+	// counter drained from the per-instance ring by
+	// pkg/gateway/egressgrpc/server.go; the
+	// gateway-side stream consumer in
+	// cmd/gatewayd-internal/egress_grpc.go feeds the
+	// counter). Same window semantics as EgressBytes;
+	// the dashboard surfaces both columns so operators
+	// can see gateway-side vs schedd-side independently
+	// (a divergence indicates the EgressSink ring is
+	// dropping bytes or the gRPC stream is wedged).
+	// 0 when Prometheus is degraded or the gateway
+	// hasn't drained yet. Unit: interface bytes
+	// (includes framing).
+	TxBytes int64 `json:"tx_bytes"`
 	// Routes (ADR-093) is the per-route breakdown for opt-in apps
 	// (apps.route_metrics_enabled=true). nil when the app is not
 	// opt-in — the dashboard distinguishes "feature off" (Routes
