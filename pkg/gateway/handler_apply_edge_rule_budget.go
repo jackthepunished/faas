@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
@@ -139,6 +140,14 @@ func (h *Handler) applyEdgeRuleBudget(w http.ResponseWriter, r *http.Request, ap
 // comes from r.Method + r.URL.Path (path-aware labels live in the
 // budget middleware's MatchEndpointFunc; applyEdgeRuleBudget is
 // the per-rule applier and uses the method+path shorthand).
+//
+// codeql[go/log-injection] false-positive: endpoint is sanitised
+// through logsanitize.Field at the log site below. CodeQL does not
+// recognise logsanitize.Field as a sanitizer in its model, but the
+// strip is observable (CR / LF / control chars in the path are
+// replaced with U+00B7 middle dots). Precedent:
+// pkg/gateway/cert_expiry.go:330-334, pkg/gateway/metrics.go:1226,
+// pkg/gateway/synth.go:223-225.
 func (h *Handler) stampRequestBudget(w http.ResponseWriter, r *http.Request, app App, total time.Duration, source string) {
 	limits, _ := api.LimitsFor(app.Plan)
 	ceiling := limits.RequestBudgetMaxDuration()
@@ -152,7 +161,7 @@ func (h *Handler) stampRequestBudget(w http.ResponseWriter, r *http.Request, app
 			"app_id", app.ID,
 			"account_id", app.AccountID,
 			"route", route,
-			"endpoint", endpoint,
+			"endpoint", logsanitize.Field(endpoint),
 			"budget_ms", total.Milliseconds(),
 			"ceiling_ms", ceiling.Milliseconds(),
 			"source", source,

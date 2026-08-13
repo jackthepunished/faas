@@ -240,6 +240,28 @@ func (b *budgetWriter) WriteHeader(code int) {
 	b.ResponseWriter.WriteHeader(code)
 }
 
+// Write is a transparent passthrough to the wrapped ResponseWriter;
+// the only thing this method adds is the `wrote` flip so the
+// middleware knows the inner handler has committed a response body.
+// The body bytes themselves are NEVER inspected by reqbudget —
+// whatever the wrapped handler writes flows straight to the
+// ResponseWriter untouched.
+//
+// codeql[go/reflected-xss] false-positive: reqbudget is a deadline
+// accounting layer, not a renderer. The dataflow that CodeQL traces
+// here originates at cmd/vmmd-stream-bridge/main.go:285, which
+// writes an inbound HTTP request body (transparent guest proxy) to
+// the upstream connection, and the guest response flows back to the
+// customer via io.Copy. The customer-facing response is whatever the
+// guest chose to emit (typically JSON, JSONL, or binary protocol
+// bytes — never rendered HTML); the reqbudget layer never parses,
+// renders, or interpolates any part of the body. This is structurally
+// identical to the stdlib http.ResponseWriter passthrough pattern;
+// applying html.EscapeString would corrupt every non-text response
+// the platform proxies. The load-bearing transparency contract lives
+// at cmd/vmmd-stream-bridge/main.go:283-286 (chunked-body goroutine)
+// and pkg/gateway/forwardproxy.go:336 / 554 / 743 / 757-766 (ctxReader
+// streaming). Any change here MUST be coordinated with those sites.
 func (b *budgetWriter) Write(p []byte) (int, error) {
 	if !b.wrote {
 		b.wrote = true
