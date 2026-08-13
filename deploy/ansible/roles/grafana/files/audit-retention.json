@@ -1,0 +1,223 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Audit-event retention observability (ADR-091 D20.4, ADR-075). Three panels mirror the three-signal triage in docs/runbooks/FaasAuditRetentionExhaustion.md: (1) daily prune rate (apid_audit_events_deleted_total — counter, only ticks on passes where deleted > 0 per pkg/eventretention/cleanup.go:205-210; idle days stay flat at 0), (2) retention lag in days with green/yellow/red threshold bands at 89-91d healthy (the gauge reads ~90d on every healthy pass because pkg/eventretention/cleanup.go:198-199 sets cutoff = now - 90d and line 211-213 Sets the gauge to now - cutoff, so values outside the band mean clock skew or CutoffDays misconfiguration), (3) emit volume by kind_prefix (topk(8, ...) clamp survives the bounded-admission helper in pkg/wire/metrics.go that collapses overflow to __other__). Companion alerts live at deploy/ansible/roles/prometheus/files/faas.rules.yml under family: audit_retention — FaasAuditRetentionLoopStalled (page) on gauge staleness, FaasAuditRetentionLoopStretched (warn) at 50h, FaasAuditRetentionTableGrowingFasterThanPruned (warn) on volume-vs-deleted divergence.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Audit events pruned / 24h",
+      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(apid_audit_events_deleted_total[24h]))",
+          "legendFormat": "rows pruned",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Retention lag (days, healthy: 89-91)",
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "apid_audit_events_retention_lag_seconds / 86400",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 89
+              },
+              {
+                "color": "yellow",
+                "value": 91
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Audit-event volume by kind_prefix (top 8)",
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "topk(8, sum by (kind_prefix) (rate(apid_audit_events_volume_total[5m])))",
+          "legendFormat": "{{kind_prefix}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "faas",
+    "d20.4",
+    "audit-retention",
+    "adr-091",
+    "adr-075"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "faas audit retention (D20.4 / ADR-091)",
+  "uid": "faas-audit-retention-d20-4",
+  "version": 1,
+  "weekStart": ""
+}
