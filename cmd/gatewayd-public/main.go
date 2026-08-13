@@ -446,7 +446,7 @@ func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http
 	// to flush BEFORE Shutdown closes the listeners. Done first
 	// so we never race a Begin against srv.Shutdown's refusal to
 	// accept new connections. Shutdown itself has a 5s grace
-	// (next block) which is bounded by drain.DrainGraceSeconds
+	// (next block) which is bounded by drain.DrainGrace
 	// below — the two together stay inside systemd's
 	// TimeoutStopSec=30s with 5s of headroom for the kernel.
 	//
@@ -459,8 +459,8 @@ func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http
 	// second-SIGTERM force-exit bugs from operators.
 	if drainTracker != nil {
 		drainStart := time.Now()
-		drainCtxInner, cancelDrainInner := context.WithTimeout(context.WithoutCancel(ctx), drain.DrainGraceSeconds)
-		outcome, drainErr := drainTracker.Drain(drainCtxInner, drain.DrainGraceSeconds)
+		drainCtxInner, cancelDrainInner := context.WithTimeout(context.WithoutCancel(ctx), drain.DrainGrace)
+		outcome, drainErr := drainTracker.Drain(drainCtxInner, drain.DrainGrace)
 		cancelDrainInner()
 		drainElapsed := time.Since(drainStart).Seconds()
 		// Issue #587 / PR-A: record the per-daemon drain

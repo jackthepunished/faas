@@ -115,7 +115,7 @@ func TestHandlerDrainClearsUnderLoad(t *testing.T) {
 	const (
 		loadDur = 5 * time.Second
 		rps     = 1000
-		// 25s = drain.DrainGraceSeconds = the systemd
+		// 25s = drain.DrainGrace = the systemd
 		// TimeoutStopSec=30s budget minus 5s kernel-reap
 		// headroom. We assert the drain completes well
 		// inside this; a clean soak at 1k rps drains in

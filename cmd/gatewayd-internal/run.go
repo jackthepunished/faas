@@ -1835,7 +1835,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), drain.DrainGraceSeconds)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), drain.DrainGrace)
 		defer cancel()
 		//nolint:contextcheck // shutdown ctx must outlive the cancelled caller ctx (net/http contract).
 		// Best-effort shutdown of every listener we may have started.
@@ -1880,7 +1880,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// recycle on the next deploy.
 		if deps.drain != nil {
 			drainStart := time.Now()
-			outcome, drainErr := deps.drain.Drain(shutdownCtx, drain.DrainGraceSeconds)
+			//nolint:contextcheck // shutdownCtx is intentionally
+			// derived from context.Background() (line 1834)
+			// because it must outlive the cancelled caller
+			// ctx — the deadline budget for the drain comes
+			// from drain.DrainGrace, not from the caller's
+			// already-cancelled ctx. The Drain contract is to
+			// honour shutdownCtx's deadline + cancellation;
+			// the `deadline` param on Drain is the
+			// upper-bound knob.
+			outcome, drainErr := deps.drain.Drain(shutdownCtx, drain.DrainGrace)
 			drainElapsed := time.Since(drainStart).Seconds()
 			// Issue #587 / PR-A: record the drain histogram on
 			// every shutdown so an operator can spot a

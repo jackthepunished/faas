@@ -54,12 +54,12 @@ import (
 	"time"
 )
 
-// DrainGraceSeconds is the default shutdown grace budget. The daemon's
+// DrainGrace is the default shutdown grace budget. The daemon's
 // systemd unit declares TimeoutStopSec=30s; 25s leaves a 5s headroom
 // for the kernel to reap the process after a clean drain. Override at
 // the call site by passing a different deadline to Drain. Exposed as
-// `api.GatewayDrainGraceSeconds` so dashboards + tests can read it.
-const DrainGraceSeconds = 25 * time.Second
+// `api.GatewayDrainGrace` so dashboards + tests can read it.
+const DrainGrace = 25 * time.Second
 
 // DrainOutcome is the labelled result of a Drain call. Surfaced as
 // the `outcome` label of the gateway_drain_wait_seconds histogram so
@@ -211,9 +211,18 @@ func (t *Tracker) MaxInflight() int64 {
 // becomes a no-op. This is the late-Begin guard that makes the
 // drain safe against pipeline races between srv.Shutdown returning
 // and the last in-flight request goroutine firing Done.
+//
+// nolint:contextcheck // Drain's contract IS to receive the caller-
+// supplied ctx and respect its cancellation + deadline (the
+// shutdownCtx the daemon passes already has a 25s timeout derived
+// from `DrainGrace`). Wrapping ctx in context.WithTimeout here
+// would silently mask a forced-Shutdown by extending the drain
+// past the daemon's intended budget; lint's heuristic doesn't
+// apply because the `deadline` parameter is a separate knob
+// from ctx, not a redundant timeout-on-ctx.
 func (t *Tracker) Drain(ctx context.Context, deadline time.Duration) (DrainOutcome, error) {
 	if deadline <= 0 {
-		deadline = DrainGraceSeconds
+		deadline = DrainGrace
 	}
 	if ctx == nil {
 		ctx = context.Background()

@@ -10505,6 +10505,12 @@ components:
           description: "Per-app egress byte delta over the window (informational; not billed). ADR-046. Source: schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until then this field stays 0)."
           x-since: "2026-08"
           x-issue: "415"
+        tx_bytes:
+          type: integer
+          format: int64
+          description: "Per-app egress byte delta over the window, gateway-side mirror (informational; not billed). ADR-046 PR-2 / issue #415 PR-2. Source: gateway_egress_tx_bytes_total{app} (Prom rollup; the gatewayd-internal-local per-instance egress ring populates the counter on each raw-stream chunk). Distinct from `egress_bytes` (the schedd-side mirror) so a divergence between the two surfaces immediately on the dashboard. Best-effort: query failure does NOT flip the response to degraded — matches the `egress_bytes` semantics."
+          x-since: "2026-08"
+          x-issue: "415"
         routes:
           type: array
           description: |

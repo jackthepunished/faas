@@ -2414,7 +2414,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	//     so an operator can tell "drained fast" from "we
 	//     force-cut requests" without re-reading the daemon log.
 	//     Bucket set covers <100ms (idle) up to the full
-	//     DrainGraceSeconds=25s ceiling.
+	//     DrainGrace=25s ceiling.
 	//
 	//   * gatewayInflightRequests gauge {daemon, op} — current
 	//     in-flight Begin() count. op ∈ {http, upgrade, control}
@@ -2429,8 +2429,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// per-daemon collector (see e.g. writeRedirectTotal at
 	// metrics.go:1136-1142).
 	gatewayDrainWaitSeconds := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name: prefix + "_drain_wait_seconds",
-		Help: "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGraceSeconds=25s ceiling.",
+		Name:    prefix + "_drain_wait_seconds",
+		Help:    "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGrace=25s ceiling.",
 		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 25},
 	}, []string{"daemon", "outcome"})
 	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-internal", "clean")

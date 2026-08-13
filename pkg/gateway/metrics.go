@@ -960,19 +960,14 @@ func NewMetrics() *Metrics {
 	} {
 		m.wakePhaseDuration.WithLabelValues(phase)
 	}
-	// ADR-091 D21 (kind=geo): register geoipDBAgeSeconds alongside
-	// the rest of the wake/edge-rule metric family. Labelled by the
-	// DB source (closed set today: {"dbip"}); see NewMetrics() for
-	// the field declaration.
-	//
-	// Issue #676 / ADR-080 follow-up, PR-B: raw-bytes Upgrade /
-	// WebSocket observability surface. Registered alongside the rest
-	// of the gateway_* series so the §12 dashboard panels
-	// (ws_upgrade / ws_active / ws_duration / ws_bytes) surface
-	// from boot. The pre-instantiate loop above stamps every closed
-	// label cell — a missing registration here would cause /metrics
-	// to omit the series entirely even with the WithLabelValues
-	// calls in place.
+	// ADR-091 D21 (kind=geo) + issue #676 / ADR-080 follow-up,
+	// PR-B (raw-bytes Upgrade / WebSocket observability). Registered
+	// alongside the rest of the gateway_* series so the §12 dashboard
+	// panels (ws_upgrade / ws_active / ws_duration / ws_bytes /
+	// geoip_db_age_seconds) surface from boot. The pre-instantiate
+	// loops above stamp every closed label cell — a missing
+	// registration here would cause /metrics to omit the series
+	// entirely even with the WithLabelValues calls in place.
 	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
@@ -984,7 +979,7 @@ func NewMetrics() *Metrics {
 	// here so the dashboard surfaces rows from boot.
 	m.drainWaitSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gateway_drain_wait_seconds",
-		Help:    "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGraceSeconds=25s ceiling.",
+		Help:    "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGrace=25s ceiling.",
 		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 25},
 	}, []string{"daemon", "outcome"})
 	m.drainWaitSeconds.WithLabelValues("gatewayd-internal", "clean")

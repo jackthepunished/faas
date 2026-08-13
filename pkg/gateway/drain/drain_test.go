@@ -69,7 +69,7 @@ func TestTracker_DeferSymmetry(t *testing.T) {
 func TestDrain_FastPath_NoInFlight(t *testing.T) {
 	tr := NewTracker()
 	start := time.Now()
-	outcome, err := tr.Drain(context.Background(), DrainGraceSeconds)
+	outcome, err := tr.Drain(context.Background(), DrainGrace)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Errorf("err = %v, want nil", err)
@@ -120,7 +120,7 @@ func TestDrain_WaitsForCompletion(t *testing.T) {
 	}
 	resultCh := make(chan drainResult, 1)
 	go func() {
-		outcome, err := tr.Drain(context.Background(), DrainGraceSeconds)
+		outcome, err := tr.Drain(context.Background(), DrainGrace)
 		resultCh <- drainResult{outcome, err}
 	}()
 
@@ -138,7 +138,7 @@ func TestDrain_WaitsForCompletion(t *testing.T) {
 	var got drainResult
 	select {
 	case got = <-resultCh:
-	case <-time.After(DrainGraceSeconds):
+	case <-time.After(DrainGrace):
 		t.Fatalf("Drain did not return after release")
 	}
 	if got.outcome != OutcomeClean {
@@ -185,7 +185,7 @@ func TestDrain_CtxCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	outcome, err := tr.Drain(ctx, DrainGraceSeconds)
+	outcome, err := tr.Drain(ctx, DrainGrace)
 	if outcome != OutcomeCancelled {
 		t.Errorf("outcome = %s, want %s", outcome, OutcomeCancelled)
 	}
@@ -240,7 +240,7 @@ func TestTracker_HighConcurrency(t *testing.T) {
 	}
 }
 
-// Drain with deadline=0 must fall back to DrainGraceSeconds. This
+// Drain with deadline=0 must fall back to DrainGrace. This
 // catches a footgun where a caller passes a zero-value Duration.
 func TestDrain_ZeroDeadline_UsesDefault(t *testing.T) {
 	tr := NewTracker()
