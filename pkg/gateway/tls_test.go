@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -19,7 +20,7 @@ func TestTLSConfigPartialRejects(t *testing.T) {
 	// HetznerDNSAPITokenPath empty — that is the "partial" defect.
 	cfg := TLSConfig{
 		WildcardCertDomain:      "apps.gregale.dev",
-		OnDemandHTTP01Allowlist: func(string) bool { return false },
+		OnDemandHTTP01Allowlist: func(context.Context, string) (bool, error) { return false, nil },
 	}
 	err := cfg.Validate()
 	if !errors.Is(err, ErrTLSMisconfigured) {
@@ -50,7 +51,7 @@ func TestTLSConfigFullAccepts(t *testing.T) {
 		HetznerDNSAPITokenPath:  "/etc/faas/secrets/hetzner-dns.token",
 		HetznerZone:             "example.com",
 		StorageDir:              "/var/lib/faas/certs",
-		OnDemandHTTP01Allowlist: func(string) bool { return false },
+		OnDemandHTTP01Allowlist: func(context.Context, string) (bool, error) { return false, nil },
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("full config should validate, got %v", err)

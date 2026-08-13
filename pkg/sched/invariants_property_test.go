@@ -82,7 +82,7 @@ func TestProperty_EngineWake_RespectsMaxConcurrency(t *testing.T) {
 	results := make(chan error, goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func() {
-			_, err := e.Wake(context.Background(), app.ID, "")
+			_, err := e.Wake(context.Background(), app.ID, "", "")
 			results <- err
 		}()
 	}
@@ -180,7 +180,7 @@ func TestProperty_EngineAdmitInstance_RespectsMaxConcurrency(t *testing.T) {
 	}, goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func() {
-			res, err := e.AdmitInstance(context.Background(), app.ID, "")
+			res, err := e.AdmitInstance(context.Background(), app.ID, "", "")
 			results <- struct {
 				res WakeResult
 				err error
@@ -300,14 +300,14 @@ func TestProperty_EngineWake_DropsLockAroundBootRPC(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		_, appAErr = e.Wake(context.Background(), appA.ID, "")
+		_, appAErr = e.Wake(context.Background(), appA.ID, "", "")
 	}()
 	// Wait for app A's wake to enter Phase 3 (signal arrived on bootStarted).
 	<-bootStarted
 
 	go func() {
 		defer wg.Done()
-		_, appBErr = e.Wake(context.Background(), appB.ID, "")
+		_, appBErr = e.Wake(context.Background(), appB.ID, "", "")
 	}()
 
 	// Release app A's boot WITHOUT a fixed sleep on app B — close(bootRelease)
@@ -419,7 +419,7 @@ func TestProperty_EngineWake_RespectsCooldown(t *testing.T) {
 	results := make(chan error, goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func() {
-			_, err := e.Wake(context.Background(), app.ID, "")
+			_, err := e.Wake(context.Background(), app.ID, "", "")
 			results <- err
 		}()
 	}
@@ -525,7 +525,7 @@ func TestProperty_EngineWake_OverageCapReached(t *testing.T) {
 	results := make(chan error, goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func() {
-			_, err := e.Wake(context.Background(), app.ID, "")
+			_, err := e.Wake(context.Background(), app.ID, "", "")
 			results <- err
 		}()
 	}

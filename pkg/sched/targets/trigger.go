@@ -76,7 +76,10 @@ type Ledger interface {
 // performs the admission; the typed AdmitResult.AtCapacity=true signals
 // the cap rejection path.
 type Engine interface {
-	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
+	// AdmitInstance (PR-B / issue #272): scope is the preview scope
+	// (`pr-{N}`) forwarded to the underlying sched.Engine.
+	// Empty = prod (legacy single-deployment behaviour).
+	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
 	// EnsureWake (ADR-098): the single-flight wake entry. Routes
 	// through this so a targets tick racing the gateway, cron, floor,
 	// or scaleup triggers on the same parked app coalesces into one

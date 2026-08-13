@@ -119,8 +119,11 @@ type Ledger interface {
 // used by the per-deployment sweep (issue #557 closure / ADR-072);
 // its `deploymentID` is required, not optional.
 type Engine interface {
-	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
-	AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (AdmitResult, error)
+	// AdmitInstance / AdmitInstanceForDeployment (PR-B / issue #272):
+	// scope is the preview scope (`pr-{N}`) forwarded to the
+	// underlying sched.Engine. Empty = prod (legacy).
+	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
+	AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (AdmitResult, error)
 	// EnsureWake (ADR-098): the single-flight wake entry. The trigger
 	// routes through this so a floor tick racing the gateway, cron,
 	// scaleup, or targets triggers on the same parked app coalesces
@@ -519,7 +522,7 @@ func (t *Trigger) tickPerDeployment(ctx context.Context) error {
 		if !decision.AdmitNow {
 			continue
 		}
-		result, err := t.engine.AdmitInstanceForDeployment(ctx, d.AppID, d.ID)
+		result, err := t.engine.AdmitInstanceForDeployment(ctx, d.AppID, d.ID, "")
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err

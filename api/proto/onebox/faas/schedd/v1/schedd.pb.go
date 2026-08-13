@@ -204,7 +204,16 @@ type WakeRequest struct {
 	// the id against the live deployment set before admitting; an
 	// unknown or non-live id is rejected with NotFound so a stale
 	// gateway cache can't wake a ghost bucket.
-	DeploymentId  string `protobuf:"bytes,2,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
+	DeploymentId string `protobuf:"bytes,2,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
+	// scope (issue #272 / ADR-095, PR-B) is the preview scope
+	// (`pr-{N}`) the gateway derived from the inbound Host header
+	// (`pr-{N}.{slug}.apps.<zone>`). Empty = prod (legacy
+	// single-deployment behaviour). schedd reads the scope-keyed
+	// live deployment row via LiveDeploymentForScope so a preview
+	// wake lands on the preview's own deployment row, not the
+	// parent app's. Additive per ADR-016 — pre-PR-B callers omit
+	// the field and observe the same wire behaviour as before.
+	Scope         string `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -249,6 +258,13 @@ func (x *WakeRequest) GetAppId() string {
 func (x *WakeRequest) GetDeploymentId() string {
 	if x != nil {
 		return x.DeploymentId
+	}
+	return ""
+}
+
+func (x *WakeRequest) GetScope() string {
+	if x != nil {
+		return x.Scope
 	}
 	return ""
 }
@@ -400,7 +416,12 @@ type AdmitInstanceRequest struct {
 	// asks schedd to admit onto that specific live deployment so
 	// the picker has a routable Target on retry. Additive per
 	// ADR-016.
-	DeploymentId  string `protobuf:"bytes,2,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
+	DeploymentId string `protobuf:"bytes,2,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
+	// scope (issue #272 / ADR-095, PR-B) is the preview scope
+	// (`pr-{N}`) the gateway derived from the inbound Host
+	// header. Empty = prod (legacy single-deployment behaviour).
+	// See WakeRequest.scope for the full semantics.
+	Scope         string `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -445,6 +466,13 @@ func (x *AdmitInstanceRequest) GetAppId() string {
 func (x *AdmitInstanceRequest) GetDeploymentId() string {
 	if x != nil {
 		return x.DeploymentId
+	}
+	return ""
+}
+
+func (x *AdmitInstanceRequest) GetScope() string {
+	if x != nil {
+		return x.Scope
 	}
 	return ""
 }
@@ -1855,10 +1883,11 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"instanceId\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"#\n" +
 	"\x11LivenessFailedAck\x12\x0e\n" +
-	"\x02ok\x18\x01 \x01(\bR\x02ok\"I\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\"_\n" +
 	"\vWakeRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12#\n" +
-	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\"\x88\x02\n" +
+	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\x12\x14\n" +
+	"\x05scope\x18\x03 \x01(\tR\x05scope\"\x88\x02\n" +
 	"\fWakeResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
@@ -1867,10 +1896,11 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\aproblem\x18\x04 \x01(\v2\x17.google.protobuf.StructR\aproblem\x12\x17\n" +
 	"\awake_id\x18\x05 \x01(\tR\x06wakeId\x12\x12\n" +
 	"\x04port\x18\x06 \x01(\x05R\x04port\x12#\n" +
-	"\rdeployment_id\x18\a \x01(\tR\fdeploymentId\"R\n" +
+	"\rdeployment_id\x18\a \x01(\tR\fdeploymentId\"h\n" +
 	"\x14AdmitInstanceRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12#\n" +
-	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\"\xd7\x02\n" +
+	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\x12\x14\n" +
+	"\x05scope\x18\x03 \x01(\tR\x05scope\"\xd7\x02\n" +
 	"\x15AdmitInstanceResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
