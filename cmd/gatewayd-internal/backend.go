@@ -130,7 +130,7 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		// Handler.ServeHTTP's applyAppsMaintenanceMode can
 		// short-circuit WITHOUT re-reading the database. Default
 		// false on the App struct matches the apps.maintenance_mode
-		// column DEFAULT (migration 00235).
+		// column DEFAULT (migration 00237).
 		MaintenanceMode: app.MaintenanceMode,
 		RequireAuthn:    app.RequireAuthn,
 		// CORS improvements D1: per-app default CORS

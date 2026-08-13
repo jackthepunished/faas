@@ -13,11 +13,12 @@
 -- migration versions" computation).
 --
 -- PR #867 (kind=maintenance cluster, ADR-091 amendment) renumbered
--- from 00232 → 00235 after the cross-PR collision detector
--- rejected slot 00231 (claimed by open PR #873 secretscan v2)
--- alongside slots 00232 (PR #864 ADR-093 reqbudget) and 00233
--- (PR #873 secretscan v2). See the doc-comment block on
--- migrations/00231_reserve_slot.sql for the full chain.
+-- from 00232 → 00235 → 00237 across two steps after the cross-PR
+-- collision detector rejected slot 00232 (claimed by open PR #864
+-- ADR-093 reqbudget, pre-PR #872 reshuffle), and then slot 00234
+-- (PR #864 ADR-093 reqbudget post-PR #872 reshuffle). See the
+-- doc-comment block on migrations/00231_reserve_slot.sql for the
+-- full chain.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change. Future-proof against upstream

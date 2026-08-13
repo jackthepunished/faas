@@ -2829,7 +2829,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// maintenance flag. The Set bit distinguishes "don't
 		// touch" (default) from "explicit false" (opt out); the
 		// companion trigger fires pg_notify ONLY on the flip
-		// (migration 00235) so the cmd-side listener sees one
+		// (migration 00237) so the cmd-side listener sees one
 		// event per flip rather than one per app UPDATE.
 		p.SetMaintenanceMode, boolOrFalse(p.MaintenanceMode),
 		// ADR-091 CORS improvements D1: per-app default CORS
@@ -11391,7 +11391,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&corsDefaultEnabled, &a.CORSDefaultOrigins,
 		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 		// maintenance flag (apps.maintenance_mode). NOT NULL
-		// DEFAULT false (migration 00235); plain bool scan is
+		// DEFAULT false (migration 00237); plain bool scan is
 		// safe. Order is positional and must match
 		// appsSelectColumns above.
 		&a.MaintenanceMode); err != nil {
@@ -11520,7 +11520,7 @@ const appsSelectColumns = `
 	cors_default_enabled, coalesce(cors_default_origins, '{}'::text[]),
 	-- ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 	-- maintenance flag. Boolean NOT NULL DEFAULT false
-	-- (migration 00235); plain bool scan is safe. Order is
+	-- (migration 00237); plain bool scan is safe. Order is
 	-- positional and must match scanApp below.
 	maintenance_mode`
 

@@ -488,12 +488,12 @@ const testDomain = "apps.test.example"
 //     slot above main's head. The renumber chain is the standard
 //     PR-#697 follow-up to the PR-#653 145 chain.
 //
-// PR-C: bumped 216 → 235 for the maintenance cluster
-// (00234_edge_rules_kind_maintenance.sql +
-// 00235_apps_maintenance_mode.sql). The previous target (228)
+// PR-C: bumped 216 → 237 for the maintenance cluster
+// (00236_edge_rules_kind_maintenance.sql +
+// 00237_apps_maintenance_mode.sql). The previous target (228)
 // made `pgtest.WaitForMigration` return early because the
 // schema head was already past 228 — every `cmd/e2e` test would
-// silently skip for the entire maintenance cluster. 235 is
+// silently skip for the entire maintenance cluster. 237 is
 // chosen as "next free integer above main's real head" so a
 // future migration merely bumps this constant again. The
 // discipline (memory: cross-pr-slot-gate-fence-pattern) is that
@@ -547,7 +547,7 @@ const testDomain = "apps.test.example"
 //     PR #867 real (kind=maintenance) + PR #873 fence, and
 //     228 PR #867 real (apps.maintenance_mode).
 //
-// PR-C renumber history (7 cycles) on top of main's
+// PR-C renumber history (8 cycles) on top of main's
 // 00220_preview_app_columns + 00221_instances_request_count
 // (PR #851 + PR #854 wake single-flight) + 00222_app_errors
 // (PR #863 ADR-096 PR-A) + 00223..00226 fences (PR #866 CORS
@@ -556,14 +556,17 @@ const testDomain = "apps.test.example"
 // kind=geo/maintenance cross-PR stampede):
 //
 //	00220/00221 → 00222/00223 → 00224/00225 → 00227/00228 →
-//	00231/00232 → 00234/00235 (final; main absorbed
+//	00231/00232 → 00234/00235 → 00236/00237 (final; main absorbed
 //	00220..00226, then PR #845 added 00227/00228/00229/00230
 //	(00229 real kind=geo, rest fences), and after the renumber
 //	to 00231/00232 the cross-PR slot precheck on push caught a
 //	collision with open PR #864 (ADR-093 request budgets claims
-//	00232) and PR #873 (secretscan v2 fences 00231/00232/00233) —
-//	kind=maintenance cluster stepped to 00234/00235 to dodge the
-//	stampede).
+//	00232) and PR #873 (secretscan v2 fences 00231/00232/00233),
+//	stepping to 00234/00235; then after PR #872 landed (and
+//	PR #882 data_upstreams opened), PR #864 reshuffled to 00234
+//	re-claiming our slot — cross-PR slot precheck tripped again,
+//	kind=maintenance cluster stepped to 00236/00237 to dodge the
+//	reshuffle).
 //
 // The 00217 + 00218 slots carry `*_reserve_slot.sql` fences
 // for PR #849 (ADR-092 PR-A app_secrets.scope) and PR #845's
@@ -572,7 +575,7 @@ const testDomain = "apps.test.example"
 // coexistence marker (passed-through by PR #845's renumber,
 // kept as a no-op so the contiguity gate doesn't trip on the
 // renumber chain).
-const e2eMigrationTarget = 235
+const e2eMigrationTarget = 237
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

@@ -142,7 +142,21 @@ from .deployment_response_override_env_secret_refs import DeploymentResponseOver
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
+from .diff_app_config_patch import DiffAppConfigPatch
+from .diff_app_config_patch_eviction_priority import DiffAppConfigPatchEvictionPriority
+from .diff_break import DiffBreak
+from .diff_break_severity import DiffBreakSeverity
+from .diff_change import DiffChange
+from .diff_change_kind import DiffChangeKind
+from .diff_env_row import DiffEnvRow
+from .diff_payload import DiffPayload
+from .diff_payload_plan import DiffPayloadPlan
+from .diff_request import DiffRequest
+from .diff_request_env_by_scope import DiffRequestEnvByScope
+from .diff_response import DiffResponse
+from .diff_response_plan import DiffResponsePlan
 from .edge_rule_cors_action import EdgeRuleCORSAction
+from .edge_rule_geo_action import EdgeRuleGeoAction
 from .edge_rule_header_op import EdgeRuleHeaderOp
 from .edge_rule_header_op_action import EdgeRuleHeaderOpAction
 from .edge_rule_headers_action import EdgeRuleHeadersAction
@@ -500,7 +514,21 @@ __all__ = (
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
+    "DiffAppConfigPatch",
+    "DiffAppConfigPatchEvictionPriority",
+    "DiffBreak",
+    "DiffBreakSeverity",
+    "DiffChange",
+    "DiffChangeKind",
+    "DiffEnvRow",
+    "DiffPayload",
+    "DiffPayloadPlan",
+    "DiffRequest",
+    "DiffRequestEnvByScope",
+    "DiffResponse",
+    "DiffResponsePlan",
     "EdgeRuleCORSAction",
+    "EdgeRuleGeoAction",
     "EdgeRuleHeaderOp",
     "EdgeRuleHeaderOpAction",
     "EdgeRuleHeadersAction",

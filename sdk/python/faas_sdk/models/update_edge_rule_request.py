@@ -57,6 +57,7 @@ class UpdateEdgeRuleRequest:
         from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
         from ..models.edge_rule_limit_action import EdgeRuleLimitAction
+        from ..models.edge_rule_maintenance_action import EdgeRuleMaintenanceAction
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
@@ -94,6 +95,8 @@ class UpdateEdgeRuleRequest:
         elif isinstance(self.action, EdgeRuleValidateAction):
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleLimitAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleMaintenanceAction):
             action = self.action.to_dict()
         else:
             action = self.action.to_dict()
@@ -239,15 +242,11 @@ class UpdateEdgeRuleRequest:
                 return action_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                action_type_10 = EdgeRuleGeoAction.from_dict(data)
+            if not isinstance(data, dict):
+                raise TypeError()
+            action_type_10 = EdgeRuleGeoAction.from_dict(data)
 
-                return action_type_10
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return None
+            return action_type_10
 
         action = _parse_action(d.pop("action", UNSET))
 

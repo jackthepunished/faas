@@ -111,6 +111,8 @@ class AppResponse:
     """Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from
     the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps
     before the A9 fallback; falls through to A9 when the target is inactive or full."""
+    cors_default_enabled: bool | None | Unset = UNSET
+    cors_default_origins: list[str] | Unset = UNSET
     public_auth: PublicAuthStatus | Unset = UNSET
     """Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents
     without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision
@@ -223,6 +225,16 @@ class AppResponse:
         else:
             overflow_node = self.overflow_node
 
+        cors_default_enabled: bool | None | Unset
+        if isinstance(self.cors_default_enabled, Unset):
+            cors_default_enabled = UNSET
+        else:
+            cors_default_enabled = self.cors_default_enabled
+
+        cors_default_origins: list[str] | Unset = UNSET
+        if not isinstance(self.cors_default_origins, Unset):
+            cors_default_origins = self.cors_default_origins
+
         public_auth: dict[str, Any] | Unset = UNSET
         if not isinstance(self.public_auth, Unset):
             public_auth = self.public_auth.to_dict()
@@ -289,6 +301,10 @@ class AppResponse:
             field_dict["parked_deployment"] = parked_deployment
         if overflow_node is not UNSET:
             field_dict["overflow_node"] = overflow_node
+        if cors_default_enabled is not UNSET:
+            field_dict["cors_default_enabled"] = cors_default_enabled
+        if cors_default_origins is not UNSET:
+            field_dict["cors_default_origins"] = cors_default_origins
         if public_auth is not UNSET:
             field_dict["public_auth"] = public_auth
         if auth_default_flipped_at is not UNSET:
@@ -456,6 +472,17 @@ class AppResponse:
 
         overflow_node = _parse_overflow_node(d.pop("overflow_node", UNSET))
 
+        def _parse_cors_default_enabled(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        cors_default_enabled = _parse_cors_default_enabled(d.pop("cors_default_enabled", UNSET))
+
+        cors_default_origins = cast(list[str], d.pop("cors_default_origins", UNSET))
+
         _public_auth = d.pop("public_auth", UNSET)
         public_auth: PublicAuthStatus | Unset
         if isinstance(_public_auth, Unset):
@@ -511,6 +538,8 @@ class AppResponse:
             require_authn=require_authn,
             parked_deployment=parked_deployment,
             overflow_node=overflow_node,
+            cors_default_enabled=cors_default_enabled,
+            cors_default_origins=cors_default_origins,
             public_auth=public_auth,
             auth_default_flipped_at=auth_default_flipped_at,
         )

@@ -37,7 +37,7 @@ export type UpdateAppRequest = {
    */
   route_metrics_enabled?: boolean | null;
   /**
-   * Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → no change. PATCH true pins the app for maintenance (every request 503 + Retry-After); PATCH false restores normal handling. Free-tier allowed; no plan gate. The apps_maintenance_mode_notify trigger (migration 00235) fires pg_notify on flip.
+   * Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → no change. PATCH true pins the app for maintenance (every request 503 + Retry-After); PATCH false restores normal handling. Free-tier allowed; no plan gate. The apps_maintenance_mode_notify trigger (migration 00237) fires pg_notify on flip.
    */
   maintenance_mode?: boolean | null;
   /**

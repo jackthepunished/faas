@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00233_reserve_slot.sql — slot reservation placeholder
+-- 00234_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
@@ -13,13 +13,21 @@
 -- migration versions" computation).
 --
 -- PR #867 (kind=maintenance cluster, ADR-091 amendment) renumbered
--- from 00233 (a candidate intermediate slot) → 00234 → 00236
--- across two steps after the cross-PR collision detector rejected
--- slot 00233 (claimed by open PR #873 secretscan v2) alongside
--- slots 00231 (PR #873) and 00232 (PR #864 ADR-093 reqbudget), and
--- then slot 00234 (PR #864 ADR-093 reqbudget post-PR #872
--- reshuffle). See the doc-comment block on
--- migrations/00231_reserve_slot.sql for the full chain.
+-- from 00234 → 00236 after the cross-PR collision detector
+-- rejected slot 00234 (claimed by open PR #864 ADR-093 request
+-- budgets, which reshuffled to 00234 after PR #872 landed). The
+-- previous step (00231/00232 → 00234/00235) closed the gap to
+-- main's PR #845 kind=geo at 00229 + PR #873 secretscan fences at
+-- 00231/00232/00233; this renumber closes the new gap created when
+-- PR #864 reshuffled. The renumber chain is:
+--
+--   00220/00221 → 00222/00223 → 00224/00225 → 00227/00228 →
+--   00231/00232 → 00234/00235 → 00236/00237 (final; kind=maintenance
+--   cluster stepped to 00236/00237 to dodge the PR #864 reshuffle).
+--
+-- This file + 00231/00232/00233_reserve_slot.sql close the
+-- contiguity gap left by the renumber so TestMigrationsContiguous
+-- passes. PR #867 owns the fences.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change. Future-proof against upstream
