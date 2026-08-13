@@ -559,6 +559,38 @@ const (
 	CodeEnvScopeInvalid  = "env_scope_invalid"
 	CodeEnvScopeReserved = "env_scope_reserved"
 
+	// ADR-098 §D5: data-placement hints quota (Free customer + 0 cap
+	// gates the capture path; Hobby+ customers can hold up to their
+	// per-plan DataPlacementHintsPerApp). Distinct codes so a
+	// dashboard can render "your plan doesn't include data
+	// placement" (402 plan_limit_data_upstreams) apart from
+	// "delete one to add another" (403 plan_limit_data_upstreams —
+	// same code, different defaultStatus; the StateError wrapper
+	// lifts the right one).
+	//
+	// Wait — the two are distinct codes below:
+	//   * CodePlanDataUpstreamsNotAllowed = 402, plan doesn't
+	//     unlock the surface (Free today).
+	//   * CodePlanLimitDataUpstreams = 403, the per-plan cap is
+	//     reached.
+	// Mirrors the CodePlanWebhooksNotAllowed vs CodePlanWebhookQuota
+	// split at line 533/534.
+	CodePlanDataUpstreamsNotAllowed = "plan_data_upstreams_not_allowed" // 402, Free
+	CodePlanLimitDataUpstreams      = "plan_limit_data_upstreams"        // 403, per-app cap reached
+
+	// ADR-098 §D4 + §11: explicit-upstream write surface validation.
+	// Distinct codes from CodeEnvVarInvalidKey / CodeEnvVarValueTooLarge
+	// because the lifecycle and quota shape differ: a data upstream is
+	// keyed by (scope, kind, host, port) and the value is the host
+	// (not a connection string), and the §11 barrier requires the
+	// plaintext host never reaches the response body or the audit
+	// surface. Mirrors the CodePlanRegistryCredentialNotAllowed /
+	// CodeInvalidRegistryHost split at line 533/535.
+	CodeUpstreamInvalidKind = "upstream_invalid_kind"  // 400, closed-vocab check
+	CodeUpstreamInvalidHost = "upstream_invalid_host"  // 400, RFC-952/1123 hostname check
+	CodeUpstreamInvalidPort = "upstream_invalid_port"  // 400, 1..65535 range check
+	CodeUpstreamNotFound    = "upstream_not_found"     // 404, DELETE/GET absent
+
 	// ADR-091 / PR-D: per-deployment env scope collision. The
 	// partial unique index `deployments_app_scope_live_uniq`
 	// (migration 00213) makes two live rows on the same
@@ -1242,6 +1274,18 @@ func StatusForCode(code string) int {
 		return http.StatusRequestEntityTooLarge
 	case CodeInvalidRegistryHost, CodeRegistryCredentialNotFound:
 		return http.StatusBadRequest
+	// ADR-098: data-placement hints (issue #395 mirror + Free gate).
+	// CodePlanDataUpstreamsNotAllowed = 402 (plan doesn't unlock the
+	// surface, like CodePlanWebhooksNotAllowed). CodePlanLimitDataUpstreams
+	// = 403 (per-plan cap reached, like CodePlanWebhookQuota).
+	case CodePlanDataUpstreamsNotAllowed:
+		return http.StatusPaymentRequired
+	case CodePlanLimitDataUpstreams:
+		return http.StatusForbidden
+	case CodeUpstreamInvalidKind, CodeUpstreamInvalidHost, CodeUpstreamInvalidPort:
+		return http.StatusBadRequest
+	case CodeUpstreamNotFound:
+		return http.StatusNotFound
 	// Env vars (issue #395 / ADR-045): mirror the secrets status shape
 	// so SDK callers can reuse the same error-decoding pattern. Plan
 	// quota is 403, value size is 413, key regex + not-found are 400.
@@ -2044,6 +2088,77 @@ func ErrTenantSurfaceCertKindInvalid(kind string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeTenantSurfaceCertKindInvalid,
 		"Unsupported cert kind",
 		fmt.Sprintf("cert kind %q is not supported in v1; use per_host_san.", kind))
+}
+
+// ErrPlanDataUpstreamsNotAllowed (ADR-098 §D5) is the 402 returned
+// by apid's createUpstream handler when the customer's plan has
+// DataPlacementHintsPerApp == 0 (Free today). Mirrors
+// ErrPlanWebhooksNotAllowed at line 1883: fires BEFORE loadApp so a
+// Free customer posting to a non-existent slug gets a clean 402
+// instead of a 404. The 402 (PaymentRequired) shape signals
+// "upgrade-required" rather than "forbidden".
+func ErrPlanDataUpstreamsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanDataUpstreamsNotAllowed,
+		"Data-placement hints unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include data-placement hints; upgrade to Hobby or above to capture upstreams.", p)).
+		WithDocs(docsBase + "/plans#data-placement")
+}
+
+// ErrPlanLimitDataUpstreams (ADR-098 §D5) is the 403 returned when
+// CreateDataUpstreamIfUnderQuota surfaces a state-layer quota
+// error. Mirrors ErrPlanWebhookQuota at line 1900 — the plan DOES
+// unlock the surface, the right copy is "delete one to add another",
+// not "upgrade". The handler renders the (limit, observed) pair via
+// WithLimit so the dashboard can show "3/3 — at the cap".
+func ErrPlanLimitDataUpstreams(plan Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanLimitDataUpstreams,
+		"Data-upstream limit reached",
+		fmt.Sprintf("%s plan caps data upstreams at %d per app; you have %d. Delete one to add another.",
+			plan, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#data-placement")
+}
+
+// ErrUpstreamInvalidKind (ADR-098 §D4) is the 400 returned when
+// the customer's PUT body names a kind that's not in the 14-value
+// closed vocabulary (postgres, redis, mongo, ...). Distinct from
+// CodeEnvVarInvalidKey because the surface is a typed DTO, not a
+// free-form string. The handler reads DataUpstreamKindIsValid
+// (PR-B) to surface this code.
+func ErrUpstreamInvalidKind(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeUpstreamInvalidKind,
+		"Invalid data-upstream kind", reason)
+}
+
+// ErrUpstreamInvalidHost (ADR-098 §D4) is the 400 returned when
+// the host fails the RFC-952/1123 regex (with the IPv4 backstop
+// that PR-A added at migration 00226's
+// `data_upstreams_host_check` CHECK constraint). Mirrors
+// CodeInvalidRegistryHost at line 535.
+func ErrUpstreamInvalidHost(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeUpstreamInvalidHost,
+		"Invalid data-upstream host", reason)
+}
+
+// ErrUpstreamInvalidPort (ADR-098 §D4) is the 400 returned when
+// the port is outside [1, 65535] (matching the migration CHECK).
+// Distinct from CodeUpstreamInvalidHost so a customer with a
+// valid host + invalid port gets a precise error code rather than
+// a generic "invalid host".
+func ErrUpstreamInvalidPort(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeUpstreamInvalidPort,
+		"Invalid data-upstream port", reason)
+}
+
+// ErrUpstreamNotFound (ADR-098 §D4) is the 404 returned when a
+// DELETE or GET targets an upstream_id that doesn't exist on this
+// app. Mirrors CodeRegistryCredentialNotFound at line 568 — the
+// 404 vs 400 distinction is what lets the SDK distinguish "delete
+// a row that's already gone" (idempotent) from "fix the URL".
+func ErrUpstreamNotFound(upstreamID string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeUpstreamNotFound,
+		"Data upstream not found",
+		fmt.Sprintf("no data upstream with id %q on this app.", upstreamID))
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't
