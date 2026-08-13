@@ -705,13 +705,17 @@ func TestProcessOne_BuildMetricCodeByOutcome(t *testing.T) {
 
 	t.Run("user_error", func(t *testing.T) {
 		// Failing detector → markFailed(FailureUserError, ...). §12 excludes this from success.
-		// Point the deployment at a missing tarball so Detector.Detect errors out
-		// ("detect: open: …") and ProcessOne routes to markFailed(FailureUserError).
+		// A tarball without framework markers makes Detector.Detect error out
+		// ("detect: no package.json…") and ProcessOne routes to markFailed(FailureUserError).
+		// The file must exist on disk: the source-spool-lag wait (issue: split-box
+		// rsync) requeues missing sources instead of hard-failing them.
 		store := state.NewMemStore()
 		fvm := &fakeVM{out: BuildOutcome{OCIImage: outPath(t), ExitCode: 0, LogTailBytes: 9}}
 		ops := wire.NewOpsMetrics("builderd")
+		noMarkers := filepath.Join(t.TempDir(), "no-markers.tar.gz")
+		makeTarballWithName(t, noMarkers, []string{"README.md"})
 		b := New(store, &fakeNotifier{}, fvm, NewCache(t.TempDir()), failingDetector(), nil, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil))).WithOpsMetrics(ops)
-		_, _ = b.ProcessOne(context.Background(), mustSeed(t, store, filepath.Join(t.TempDir(), "does-not-exist.tar.gz")))
+		_, _ = b.ProcessOne(context.Background(), mustSeed(t, store, noMarkers))
 		assertCodes(t, ops, "user_error", "failed")
 	})
 
