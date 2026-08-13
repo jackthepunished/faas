@@ -1863,7 +1863,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		// Issue #587 / PR-A: wait for the per-request drain
 		// tracker to flush before exiting. shutdownCtx has
-		// already been wired to DrainGraceSeconds (25s) — that
+		// already been wired to drain.DrainGrace (25s) — that
 		// sits inside systemd's TimeoutStopSec=30s with 5s
 		// headroom. The drain sets its own internal `draining`
 		// flag so any post-Shutdown stragglers become no-op
