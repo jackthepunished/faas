@@ -470,6 +470,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		LogPath:      dep.LogPath,
 		RAMMB:        api.BuildVMRAMMB,
 		TimeoutSec:   b.cfg.BuildTimeoutSeconds,
+		Plan:         string(acct.Plan),
 	})
 	if err != nil {
 		// Translate a context-deadline to timeout-class; everything else is infra.

@@ -179,6 +179,11 @@ func (d *VMMDriver) Spawn(ctx context.Context, req VMRequest) (BuildHandle, erro
 			MemSizeMib: int32(api.BuildVMRAMMB),
 		},
 		Build: &vmmdpb.BuildSpec{ExportDir: buildExportDir},
+		// Issue #301 / ADR-043: vmmd validates Plan on every cold
+		// boot and routes the VM into the per-plan cgroup slice.
+		// The legacy empty value is rejected.
+		Plan:      req.Plan,
+		AccountId: req.TenantID,
 	})
 	if err != nil {
 		os.Remove(drive1Path)
