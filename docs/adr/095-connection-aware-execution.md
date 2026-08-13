@@ -299,8 +299,8 @@ before any scheduling behavior changes.
 
 ### New
 
-- `migrations/00223_reserve_slot.sql` (fence — this PR)
-- `migrations/00223_data_upstreams.sql` (PR-A — real DDL, drops the fence file)
+- `migrations/00221_reserve_slot.sql` (fence — this PR)
+- `migrations/00221_data_upstreams.sql` (PR-A — real DDL, drops the fence file)
 - `pkg/data/infer.go`, `pkg/data/extract.go` (PR-B)
 - `pkg/sched/upstream_affinity.go` (PR-D)
 - `pkg/meter/upstream_probe.go` (PR-C)
@@ -441,15 +441,14 @@ before any scheduling behavior changes.
 - `cmd/e2e/upstream_probe_e2e_test.go` (PR-C) — insert a
   `data_upstreams` row pointing to `127.0.0.1:NNNN`; meterd probes
   and writes `data_upstream_probes` within 1 min.
-- Slot fence discipline — migration 00223 lands as
-  `00223_data_upstreams.sql` at PR-A merge base, fence file
+- Slot fence discipline — migration 00221 lands as
+  `00221_data_upstreams.sql` at PR-A merge base, fence file
   `git rm`'d. Sibling-PR collisions handled per the four-step
   renumber playbook (`pr-849-adr-092-pr-a-slot-chase-cluster`).
-  PR-0 was renumbered twice: 00219→00221 after PR #855 landed
-  `00219_edge_rules_kind_limit.sql`, then 00221→00223 after PR
-  #863 (ADR-096 PR-A) added a `00221_reserve_slot.sql` fence of
-  its own. Slot 00222 stays reserved for #863's real
-  `app_errors.sql` (see `main-duplicate-slot-pattern-2026-08-10`).
+  PR-0 was renumbered 00219→00221 after CI flagged the duplicate
+  with `00219_edge_rules_kind_limit.sql` (landed via PR #855
+  between plan creation and PR-open — see the
+  `main-duplicate-slot-pattern-2026-08-10` memory).
 
 ## References
 
