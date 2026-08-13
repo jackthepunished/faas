@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -261,6 +262,41 @@ func TestAppErrorsSecurity_CursorRoundtrip_PureUnit(t *testing.T) {
 	}
 	if gotLS == nil || gotFP == nil {
 		t.Errorf("ls / fp should be non-nil")
+	}
+}
+
+// TestAppErrorsSecurity_ClampLimitToInt32_Bounds pins the
+// defensive int32-narrowing helper. CodeQL raised the
+// "Incorrect conversion between integer types" alert on the
+// naive int32(limit) at the two sqlc.Limit assignment sites in
+// handlers_app_errors_projection.go. Postgres rejects negative
+// LIMITs with "LIMIT must not be negative" so the silent wrap
+// would surface as a confusing query error rather than a
+// runtime crash; the guard is belt-and-braces against future
+// callers that pass a raw int without going through
+// parseAppErrorsLimit.
+func TestAppErrorsSecurity_ClampLimitToInt32_Bounds(t *testing.T) {
+	if got := clampLimitToInt32(0); got != 0 {
+		t.Errorf("0: got %d, want 0", got)
+	}
+	if got := clampLimitToInt32(20); got != 20 {
+		t.Errorf("20: got %d, want 20", got)
+	}
+	if got := clampLimitToInt32(api.AppErrorsSummaryMaxLimit); got != api.AppErrorsSummaryMaxLimit {
+		t.Errorf("max: got %d, want %d", got, api.AppErrorsSummaryMaxLimit)
+	}
+	if got := clampLimitToInt32(math.MaxInt32); got != math.MaxInt32 {
+		t.Errorf("MaxInt32: got %d, want %d", got, math.MaxInt32)
+	}
+	// Over MaxInt32: must NOT wrap to a negative int32 — that's
+	// the CodeQL-flagged silent truncation. Cap at MaxInt32.
+	if got := clampLimitToInt32(math.MaxInt32 + 1); got != math.MaxInt32 {
+		t.Errorf("MaxInt32+1: got %d, want %d (no wrap)", got, math.MaxInt32)
+	}
+	// Negative: must NOT wrap to a huge positive int32 either —
+	// that's the Postgres "LIMIT must not be negative" path.
+	if got := clampLimitToInt32(-1); got != 0 {
+		t.Errorf("-1: got %d, want 0", got)
 	}
 }
 

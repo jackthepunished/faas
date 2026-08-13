@@ -31,6 +31,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,6 +41,27 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
+
+// clampLimitToInt32 narrows a Go-int limit to int32 with an
+// explicit upper-bound guard. CodeQL flags naive int32(n) as
+// "Incorrect conversion between integer types" because Go's
+// `int` is arch-dependent (64-bit on amd64) and the wrap-around
+// to a negative int32 is silent. The handler-side
+// parseAppErrorsLimit caps at api.AppErrorsSummaryMaxLimit=100
+// so the guard is structurally redundant in production; the
+// projection helper keeps it anyway so a future caller passing
+// a raw int (e.g. a test, a CLI command) cannot crash the query
+// with a negative LIMIT (Postgres rejects negative LIMITs with
+// "LIMIT must not be negative" rather than wrapping).
+func clampLimitToInt32(n int) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if n < 0 {
+		return 0
+	}
+	return int32(n)
+}
 
 // buildAppErrorsSummaryParams assembles the sqlc list-params for
 // the summary endpoint. The cursor tuple is
@@ -94,7 +116,7 @@ func buildAppErrorsSummaryParams(
 		CursorCount:       curC,
 		CursorLastSeen:    curLS,
 		CursorFingerprint: curFP,
-		Limit:             int32(limit),
+		Limit:             clampLimitToInt32(limit),
 	}
 }
 
@@ -124,7 +146,7 @@ func buildAppErrorRequestsParams(
 		Fingerprint:      fingerprint,
 		CursorReceivedAt: curRA,
 		CursorRequestID:  curRI,
-		Limit:            int32(limit),
+		Limit:            clampLimitToInt32(limit),
 	}
 }
 
