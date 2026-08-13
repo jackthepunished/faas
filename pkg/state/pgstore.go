@@ -15501,3 +15501,79 @@ func (s *PgStore) ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sq
 func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error {
 	return s.dataUpstreamsQueries().PruneDataUpstreamProbesOlderThan(ctx, s.pool, pgtypeFromTime(cutoff))
 }
+
+// ListAllAppDataUpstreams returns every data_upstreams row on the
+// app across all scopes, scoped to accountID. Used by apid's
+// GET /v1/apps/{slug}/upstreams?scope=__all__ arm to render the
+// full list without a cursor. The row count is bounded by
+// DataPlacementHintsPerApp (0/3/10/50 by plan per ADR-098 §D5)
+// so the scan is cheap.
+func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, account_id, app_id, source, scope, kind, host, port,
+		        host_redacted_hash, coalesce(declared_region, ''),
+		        last_rtt_ms, last_probed_at, last_seen_at, created_at
+		 from data_upstreams
+		 where account_id = $1 and app_id = $2
+		 order by created_at desc, id desc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstream
+	for rows.Next() {
+		var (
+			id, accountIDpg, appIDpg pgtype.UUID
+			source, scope, kind, host, hostRedactedHash, declaredRegion string
+			port                                                                                    int32
+			lastRTT                                                                                  pgtype.Int4
+			lastProbedAt                                                                             pgtype.Timestamptz
+			lastSeenAt, createdAt                                                                    pgtype.Timestamptz
+		)
+		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
+			&hostRedactedHash, &declaredRegion,
+			&lastRTT, &lastProbedAt, &lastSeenAt, &createdAt); err != nil {
+			return nil, err
+		}
+		var rttPtr *int
+		if lastRTT.Valid {
+			v := int(lastRTT.Int32)
+			rttPtr = &v
+		}
+		var probedPtr *time.Time
+		if lastProbedAt.Valid {
+			t := timeFromPgtype(lastProbedAt)
+			probedPtr = &t
+		}
+		out = append(out, DataUpstream{
+			ID:               uuidFromPgtype(id),
+			AccountID:        uuidFromPgtype(accountIDpg),
+			AppID:            uuidFromPgtype(appIDpg),
+			Source:           DataUpstreamSource(source),
+			Scope:            scope,
+			Kind:             DataUpstreamKind(kind),
+			Host:             host,
+			Port:             int(port),
+			HostRedactedHash: hostRedactedHash,
+			DeclaredRegion:   declaredRegion,
+			LastRTTMs:        rttPtr,
+			LastProbedAt:     probedPtr,
+			LastSeenAt:       timeFromPgtype(lastSeenAt),
+			CreatedAt:        timeFromPgtype(createdAt),
+		})
+	}
+	return out, rows.Err()
+}
+
+// CountDataUpstreamsByApp is the per-plan quota helper. Counts
+// ALL scope values for the app per ADR-098 §D5
+// (DataPlacementHintsPerApp is per-app, not per-scope). Mirrors
+// CountAppEnv's posture.
+func (s *PgStore) CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from data_upstreams where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}

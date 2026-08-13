@@ -3661,6 +3661,19 @@ type Store interface {
 	// api.DataUpstreamsListMaxLimit by the handler.
 	ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error)
 
+	// ListAllAppDataUpstreams backs
+	// GET /v1/apps/{slug}/upstreams?scope=__all__ (PR-B).
+	// Returns every data_upstreams row on the app across all
+	// scopes — the count is bounded by
+	// DataPlacementHintsPerApp (per ADR-098 §D5) so the scan
+	// is cheap.
+	ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error)
+
+	// CountDataUpstreamsByApp backs the per-plan
+	// DataPlacementHintsPerApp quota in createUpstream
+	// (PR-B). Counts across ALL scopes per §D5.
+	CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error)
+
 	// GetDataUpstreamByID backs
 	// GET /v1/apps/{slug}/upstreams/{id} (PR-B).
 	GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUpstream, error)
