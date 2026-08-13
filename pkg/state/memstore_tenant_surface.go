@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -184,9 +185,12 @@ func (m *MemStore) UpdateTenantSurfaceCert(_ context.Context, in UpdateSurfaceCe
 }
 
 // DeleteTenantSurface — soft delete; the row stays for audit /
-// cert_history paths.
-func (m *MemStore) DeleteTenantSurface(_ context.Context, id string) error {
-	return m.UpdateTenantSurfaceStatus(context.Background(), id, SurfaceStatusDeleted)
+// cert_history paths. Context is forwarded to the underlying
+// UpdateSurfaceStatus so client cancellation / deadline-exceeded
+// is respected (PgStore sibling forwards ctx — the MemStore
+// previously discarded it, masking the cancellation in tests).
+func (m *MemStore) DeleteTenantSurface(ctx context.Context, id string) error {
+	return m.UpdateTenantSurfaceStatus(ctx, id, SurfaceStatusDeleted)
 }
 
 // TenantSurfaceByHostname — pgRouter.ResolveHost hot path; linear
@@ -219,8 +223,13 @@ func (m *MemStore) CreateTenantHostnameIfUnderQuota(_ context.Context, in Create
 		return TenantHostname{}, ErrNotFound
 	}
 	observed := 0
+	// Per-surface cap counts VERIFIED hostnames only. See
+	// pgstore_tenant_surface.go:CreateTenantHostnameIfUnderQuota
+	// for the rationale (verified-only floors the customer out of
+	// a lock-by-unverified-tail; the doc at limits.go:449-450 says
+	// "verified hostnames one surface may hold").
 	for _, h := range m.tenantHostnames {
-		if h.SurfaceID == in.SurfaceID {
+		if h.SurfaceID == in.SurfaceID && h.Verified() {
 			observed++
 		}
 	}
@@ -234,6 +243,14 @@ func (m *MemStore) CreateTenantHostnameIfUnderQuota(_ context.Context, in Create
 	if _, exists := m.tenantHostnames[in.Hostname]; exists {
 		return TenantHostname{}, ErrConflict
 	}
+	// Case-insensitive collision check mirrors the schema's
+	// tenant_hostnames.hostname citext column. PgStore rejects
+	// 'Customer.com' vs 'customer.com' via the unique index; the
+	// memstore must do the same so tests that exercise case
+	// variants converge on the same error.
+	if _, exists := m.tenantHostnames[strings.ToLower(in.Hostname)]; exists {
+		return TenantHostname{}, ErrConflict
+	}
 	now := time.Now().UTC()
 	h := TenantHostname{
 		ID:             uuid.NewString(),
@@ -243,6 +260,7 @@ func (m *MemStore) CreateTenantHostnameIfUnderQuota(_ context.Context, in Create
 		CreatedAt:      now,
 	}
 	m.tenantHostnames[h.Hostname] = h
+	m.tenantHostnames[strings.ToLower(h.Hostname)] = h
 	return h, nil
 }
 
@@ -366,7 +384,11 @@ func (m *MemStore) DeleteTenantHostname(_ context.Context, hostname string) erro
 	if _, ok := m.tenantHostnames[hostname]; !ok {
 		return ErrNotFound
 	}
+	// Mirror the case-insensitive indexing we wrote under
+	// CreateTenantHostnameIfUnderQuota. Mcase variants of the
+	// same row coexist in the map and both must be removed.
 	delete(m.tenantHostnames, hostname)
+	delete(m.tenantHostnames, strings.ToLower(hostname))
 	return nil
 }
 

@@ -218,6 +218,10 @@ func TestMemStoreTenantHostnameQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Per-surface cap counts VERIFIED hostnames only (see
+	// limits.go:449-450 doc, PR-A review finding K). The two
+	// hostnames below are both verified before the third
+	// insert attempts to land — that's how the cap trips.
 	for _, h := range []string{"a.example", "b.example"} {
 		if _, err := m.CreateTenantHostnameIfUnderQuota(ctx, CreateTenantHostnameParams{
 			SurfaceID: surf.ID, Hostname: h, ChallengeToken: "tok",
@@ -225,12 +229,66 @@ func TestMemStoreTenantHostnameQuota(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := m.MarkTenantHostnameVerified(ctx, "a.example"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MarkTenantHostnameVerified(ctx, "b.example"); err != nil {
+		t.Fatal(err)
+	}
 	_, err = m.CreateTenantHostnameIfUnderQuota(ctx, CreateTenantHostnameParams{
 		SurfaceID: surf.ID, Hostname: "c.example", ChallengeToken: "tok",
 	}, lim)
 	var qe *TenantHostnameQuotaError
 	if !errors.As(err, &qe) || qe.Limit != 2 || qe.SurfaceID != surf.ID {
 		t.Fatalf("hostname quota = %v (%T)", err, err)
+	}
+}
+
+// TestMemStoreTenantHostnameQuotaUnverifiedAllowed pins the
+// PR-A review finding K fix: the per-surface cap counts VERIFIED
+// hostnames only. A customer who adds 250 unverified hostnames
+// (typos, DNS never resolved) is below the cap and can keep
+// retrying verification — the previous implementation counted
+// unverified rows and locked the customer out.
+func TestMemStoreTenantHostnameQuotaUnverifiedAllowed(t *testing.T) {
+	m, ctx, acct, app, _ := tenantSurfaceFixture(t)
+	lim := api.Limits{
+		TenantSurfacesPerAccount:  5,
+		TenantHostnamesPerSurface: 2,
+		TenantSurfacesAllowed:     true,
+	}
+	surf, err := m.CreateTenantSurfaceIfUnderQuota(ctx, CreateTenantSurfaceParams{
+		AccountID: acct.ID, AppID: app.ID, Name: "unverified-cap",
+	}, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Add 5 unverified hostnames — well above the cap of 2.
+	// All inserts succeed because the cap counts verified only.
+	for _, h := range []string{"u1.example", "u2.example", "u3.example", "u4.example", "u5.example"} {
+		if _, err := m.CreateTenantHostnameIfUnderQuota(ctx, CreateTenantHostnameParams{
+			SurfaceID: surf.ID, Hostname: h, ChallengeToken: "tok",
+		}, lim); err != nil {
+			t.Fatalf("insert %s: %v", h, err)
+		}
+	}
+	// Verify two of them. The next insert attempt must now trip
+	// the quota (verified-count == 2 == limit).
+	if err := m.MarkTenantHostnameVerified(ctx, "u1.example"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MarkTenantHostnameVerified(ctx, "u2.example"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.CreateTenantHostnameIfUnderQuota(ctx, CreateTenantHostnameParams{
+		SurfaceID: surf.ID, Hostname: "u6.example", ChallengeToken: "tok",
+	}, lim)
+	var qe *TenantHostnameQuotaError
+	if !errors.As(err, &qe) || qe.Limit != 2 {
+		t.Fatalf("post-verify quota = %v (%T); want TenantHostnameQuotaError(Limit=2)", err, err)
+	}
+	if qe.Observed != 2 {
+		t.Errorf("observed = %d, want 2", qe.Observed)
 	}
 }
 

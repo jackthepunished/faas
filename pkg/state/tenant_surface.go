@@ -65,6 +65,44 @@ const (
 	CertStateFailed  CertState = "failed"
 )
 
+// ValidCertKind reports whether k is one of the closed-set values
+// enforced by the tenant_surfaces CHECK constraint. The pgstore
+// scan path uses this to fail-loud on a row that bypassed the
+// constraint (manual fix, replication drift) — a defensive read
+// rather than letting the issuer silently fall through with an
+// unknown kind.
+func (k CertKind) Valid() bool {
+	switch k {
+	case CertKindPerHostSAN, CertKindSharedWildcard:
+		return true
+	}
+	return false
+}
+
+// ValidSurfaceStatus reports whether s is one of the closed-set
+// values enforced by the tenant_surfaces CHECK constraint. Mirrors
+// ValidCertKind; the scan path uses it as a defense-in-depth read.
+func (s SurfaceStatus) Valid() bool {
+	switch s {
+	case SurfaceStatusPending, SurfaceStatusActive, SurfaceStatusSuspended, SurfaceStatusDeleted:
+		return true
+	}
+	return false
+}
+
+// ValidCertState reports whether s is one of the closed-set values
+// used by the cert engine. The tenant_surfaces table does not have
+// a CHECK for cert_state (the column is open to future values), but
+// the scan still asserts the v1 set so a stray value surfaces a
+// log+metric event rather than a silent downstream mismatch.
+func (s CertState) Valid() bool {
+	switch s {
+	case CertStateNone, CertStatePending, CertStateIssued, CertStateFailed:
+		return true
+	}
+	return false
+}
+
 // TenantSurface — one row in tenant_surfaces.
 type TenantSurface struct {
 	ID            string

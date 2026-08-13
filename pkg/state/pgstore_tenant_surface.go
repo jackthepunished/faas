@@ -36,6 +36,12 @@ const tenantHostnameCols = `id, surface_id, hostname, challenge_token,
 	coalesce(last_error, '')`
 
 // scanTenantSurface is the single row helper for tenant_surfaces.
+// Defense-in-depth: the closed CHECK constraint on cert_kind / status
+// is the SQL-side gate, but a row that bypassed the CHECK (manual fix,
+// replication drift) would otherwise silently produce a typed value
+// (`CertKind("unknown")`) the issuer would fail-closed at — masking
+// the drift. We fail-loud here so the validate-replica path is
+// observable.
 func scanTenantSurface(row pgx.Row) (TenantSurface, error) {
 	var s TenantSurface
 	var certKindRaw, statusRaw, certStateRaw string
@@ -50,6 +56,15 @@ func scanTenantSurface(row pgx.Row) (TenantSurface, error) {
 	s.CertKind = CertKind(certKindRaw)
 	s.Status = SurfaceStatus(statusRaw)
 	s.CertState = CertState(certStateRaw)
+	if !s.CertKind.Valid() {
+		return TenantSurface{}, fmt.Errorf("state: tenant_surfaces row %s has invalid cert_kind %q", s.ID, s.CertKind)
+	}
+	if !s.Status.Valid() {
+		return TenantSurface{}, fmt.Errorf("state: tenant_surfaces row %s has invalid status %q", s.ID, s.Status)
+	}
+	if !s.CertState.Valid() {
+		return TenantSurface{}, fmt.Errorf("state: tenant_surfaces row %s has invalid cert_state %q", s.ID, s.CertState)
+	}
 	return s, nil
 }
 
@@ -320,11 +335,19 @@ func (s *PgStore) CreateTenantHostnameIfUnderQuota(ctx context.Context, in Creat
 	}
 
 	var observed int
+	// Per-surface cap counts VERIFIED hostnames only. The
+	// limits.go:449-450 doc explicitly says "verified hostnames one
+	// surface may hold"; counting unverified would lock a customer
+	// out of retrying verification once they hit the cap with
+	// pending TXT records (the dns_poller can't flip them to
+	// verified so the customer is stuck — the capacity-aware
+	// behaviour is the inverse: more unverified = more headroom,
+	// not less).
 	if err := tx.QueryRow(ctx,
-		`select count(*) from tenant_hostnames where surface_id = $1`,
+		`select count(*) from tenant_hostnames where surface_id = $1 and verified_at is not null`,
 		in.SurfaceID,
 	).Scan(&observed); err != nil {
-		return TenantHostname{}, fmt.Errorf("state: count tenant_hostnames for surface %s: %w", in.SurfaceID, err)
+		return TenantHostname{}, fmt.Errorf("state: count verified tenant_hostnames for surface %s: %w", in.SurfaceID, err)
 	}
 	if observed >= limits.TenantHostnamesPerSurface {
 		return TenantHostname{}, &TenantHostnameQuotaError{
