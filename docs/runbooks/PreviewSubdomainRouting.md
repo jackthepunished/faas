@@ -13,7 +13,8 @@ Severity: warn.
 > webhook spine (preview app row, source-ref deploy, Check Run);
 > PR-B shipped the routing slice (subdomain parser +
 > cert-allowlist extension); PR-C ships the teardown janitor. This
-> runbook covers the PR-B surface. The prod URL
+> runbook covers the PR-B surface; the **Teardown recovery** section
+> below covers PR-C's janitor surface. The prod URL
 > (`{slug}.apps.<zone>`) keeps working — only preview-shaped
 > hostnames (`pr-{N}.{slug}.apps.<zone>`) are affected.
 
@@ -218,8 +219,165 @@ per ADR-094).
 The TTL deadline for a stale preview is `preview_expires_at`
 (default `now() + 7 days` per `pkg/githubd/service.go`). Once the
 janitor transitions the row to `torn_down`, the slug is reusable
-for a future PR — the row gets tombstoned (`apps.deleted_at`),
-not deleted.
+for a future PR — the row gets tombstoned via
+`apps.status='deleted'` (the platform's existing soft-delete
+column, not a `deleted_at` timestamp).
+
+## Teardown recovery (PR-C janitor)
+
+Source: `cmd/apid/preview_janitor.go`,
+`pkg/state/pgstore.go::ListPreviewsForTeardown + SetPreviewPrState +
+SoftDeleteAppCascade`, `pkg/wire/metrics.go::previewJanitorOutcomes`.
+Metric: `faas_preview_janitor_outcomes_total{outcome="ok|failed|torn_down"}`.
+
+### Symptoms
+
+- A preview app stays in `preview_pr_state='closed'` or
+  `'open'` longer than 24h after `preview_expires_at` (default
+  provisioning is `created_at + 7d`, so this is only a symptom
+  when the dispatcher or TTL is non-standard).
+- `closed` rows not transitioning to `stale` / `torn_down`.
+- A row stuck at `preview_pr_state='torn_down'` but
+  `apps.status='active'` (the janitor's two writes
+  interrupted by a crash; the recovery sweep on the next tick
+  must finish the tombstone — see ADR-095 §"PR-C corrections").
+- `faas_preview_janitor_outcomes_total{outcome="failed"}` is
+  increasing — a tick is failing every 5 minutes.
+
+### Triage by cause
+
+#### Sweep never fires
+
+The janitor has a 1-minute startup delay and a 5-minute tick
+interval. Both are constants; the e2e overrides them via env
+knobs. For production, neither knob is set. Verify the daemon
+is healthy:
+
+```bash
+journalctl -u faas-apid -n 200 | grep -E 'preview janitor|previewJanitor'
+```
+
+A clean apid logs `preview janitor: sweep scanned=N promoted=K
+tombstoned=M` every 5 minutes. Absence of that line for >10
+minutes means the goroutine has crashed — restart the daemon
+to recreate it.
+
+#### Sweep fires but no rows are picked up
+
+Inspect the SQL predicate via the store:
+
+```bash
+psql -U faas -d faas -c "
+  SELECT slug, preview_pr_state, preview_expires_at, status
+    FROM apps
+   WHERE preview_of_slug IS NOT NULL
+     AND (
+       preview_pr_state IN ('closed', 'stale')
+       OR (preview_pr_state = 'open' AND preview_expires_at < now())
+     )
+   ORDER BY preview_expires_at ASC NULLS LAST
+   LIMIT 20;"
+```
+
+The janitor's `ListPreviewsForTeardown` runs the same predicate
+(plus `coalesce(preview_pr_state,'') <> 'torn_down'` to avoid
+re-tombstoning). If the SQL returns rows but the janitor is
+silent, check the partial index `apps_preview_expires_at_idx`
+exists:
+
+```bash
+psql -U faas -d faas -c "\d apps" | grep preview
+```
+
+A missing index ⇒ migration 00220 didn't run (replay it via
+`make db-migrate-up`). Without the index, large fleets hit
+seq-scan latency and the janitor may appear "stuck".
+
+#### Sweep fires but tombed rows don't propagate
+
+The janitor emits `db.NotifyAppDelete` on the channel
+`app_delete` after `SetPreviewPrState('torn_down')` and
+`SoftDeleteAppCascade` both succeed. schedd's
+`pkg/sched/app_delete_subscriber.go` listens on that channel
+and reaps in-flight instances.
+
+If instances for the tombed app remain:
+
+```bash
+journalctl -u faas-schedd -n 500 | grep -E 'app_delete.*preview_teardown'
+```
+
+A `preview_teardown` payload kind means the janitor emitted.
+Absence of that line means either (a) the janitor hasn't
+reached the tombstone yet (see "Sweep never fires"), or (b)
+the channel listener is wedged (restart schedd).
+
+### Recover
+
+#### Premature teardown (extend a preview past grace)
+
+The 24h grace is a contract; the way to extend a preview is
+to bump `preview_expires_at` directly. The janitor re-evaluates
+on every tick — a 5-minute pause is the worst-case drift
+between the bump and the next sweep.
+
+```bash
+psql -U faas -d faas -c "
+  UPDATE apps
+     SET preview_expires_at = now() + interval '24 hours'
+   WHERE slug = 'pr-42-myapp'
+     AND preview_of_slug = 'myapp'
+     AND preview_pr_state IN ('open', 'closed');"
+```
+
+#### Stale row stuck in 'closed' for too long
+
+Either the TTL was set wrong, or a future-dated
+`preview_expires_at` was never refreshed. Inspect:
+
+```bash
+psql -U faas -d faas -c "
+  SELECT slug, preview_pr_state, preview_expires_at,
+         now() - preview_expires_at AS elapsed
+    FROM apps
+   WHERE preview_of_slug = 'myapp'
+     AND preview_pr_state = 'closed'
+   ORDER BY preview_expires_at ASC;"
+```
+
+If the TTL elapsed, the next janitor tick (within 5 minutes)
+will tombstone it. To force the sweep immediately, the apid
+process exposes no admin endpoint for this — the daemon
+auto-resumes on its tick cadence. For an emergency tombstone
+during a security incident, the support team can run
+`pkg/state.SoftDeleteAppCascade` directly.
+
+#### Instance leak after tombstone
+
+If `db.NotifyAppDelete` was emitted but schedd didn't reap:
+
+```bash
+# Manually reap: send the same notify payload via psql.
+psql -U faas -d faas -c "
+  SELECT pg_notify('app_delete',
+    json_build_object(
+      'app_id', id,
+      'slug', slug,
+      'kind', 'preview_teardown'
+    )::text)
+    FROM apps WHERE id = '<tombstoned-app-id>';"
+```
+
+This re-emits the delete notification; schedd's listener
+will reap the instance.
+
+### Silence
+
+Janitor failure is per-tick — a single failure logs a Warn
+and is observed via `faas_preview_janitor_outcomes_total
+{outcome="failed"}`. The cron continues to the next tick.
+There is no fleet alert yet; rely on the customer's support
+ticket for the signal.
 
 Cache invalidation between the routing layer and the allowlist is
 purely row-level: `apps_update` notifications (`pg_notify`) flush

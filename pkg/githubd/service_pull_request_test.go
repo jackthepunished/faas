@@ -197,6 +197,33 @@ func pullRequestClosedBody(prNumber int, headSHA string) []byte {
 	}`)
 }
 
+// pullRequestReopenedBody is the mirror of pullRequestClosedBody
+// for the reopened action. State field flips back to "open" so
+// any consumer of the raw JSON (not the decoded action) sees the
+// canonical open-shape; the decoder uses action, not state, to
+// route (see PullRequestAction enum in event.go). Added with
+// ADR-095 PR-C: the reopen event must clear a prior closed-state
+// label on the preview row, which the dispatcher now stamps via
+// SetPreviewPrState. Without a helper this case couldn't be
+// exercised — pullRequestOpenedBody's "action":"opened" routes
+// the same way but tests want to assert the closed-then-reopened
+// transition specifically.
+func pullRequestReopenedBody(prNumber int, headSHA string) []byte {
+	return []byte(`{
+		"action": "reopened",
+		"number": ` + itoa(prNumber) + `,
+		"pull_request": {
+			"state": "open",
+			"head_sha": "` + headSHA + `",
+			"head_ref": "feature/x",
+			"head": {"ref": "feature/x", "sha": "` + headSHA + `", "repo": {"full_name": "octo/api"}}
+		},
+		"repository": {"full_name": "octo/api", "name": "api"},
+		"installation": {"id": 42},
+		"sender": {"login": "alice"}
+	}`)
+}
+
 func pullRequestForkBody(prNumber int, headSHA string) []byte {
 	// head.repo.full_name differs from repository.full_name →
 	// IsFork returns true.
@@ -351,7 +378,10 @@ func TestHandlePullRequest_Synchronize_SamePR(t *testing.T) {
 
 // TestHandlePullRequest_Closed_StampsClosedState covers the
 // closed action: the handler stamps preview_pr_state='closed'
-// on the row (PR-C's janitor owns the actual teardown).
+// on the existing row (PR-C's janitor owns the actual teardown
+// sweep, but the dispatcher is responsible for advancing the
+// label so the janitor's closed → stale → torn_down clock can
+// start on time).
 func TestHandlePullRequest_Closed_StampsClosedState(t *testing.T) {
 	rig := newPreviewRig(t)
 	svc, _ := newPreviewService(t, rig)
@@ -362,31 +392,49 @@ func TestHandlePullRequest_Closed_StampsClosedState(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
-	// Then: close. The handler writes preview_pr_state='closed'
-	// on the same row via the CreateAppIfUnderQuota conflict
-	// path — the idempotent reuse — but DOES NOT mutate the
-	// existing row's preview_pr_state in this slice (the
-	// janitor in PR-C owns the closed → stale → torn_down
-	// transitions). What we DO assert is that the closed
-	// event returns success and doesn't surface as ErrIgnored.
+	// Then: close. The handler stamps preview_pr_state='closed'
+	// on the same row via SetPreviewPrState (ADR-095 PR-C.1).
+	// The janitor in cmd/apid/preview_janitor.go owns the
+	// closed → stale → torn_down transitions thereafter, but
+	// the dispatcher must advance the label so the janitor's
+	// grace clock starts on time. Before PR-C the conflict
+	// path swallowed the label write — a closed event left
+	// preview_pr_state='open' until the row hit its TTL.
 	_, err := svc.handlePullRequest(context.Background(),
 		pullRequestClosedBody(42, "deadbeef00000000000000000000000000000000"))
 	if err != nil {
 		t.Fatalf("closed: %v", err)
 	}
 
-	// After the closed event, the preview row still exists
-	// (janitor owns teardown). The preview's preview_pr_state
-	// stays 'open' until the janitor ticks — the dispatcher
-	// only stamps closed for a freshly-created row in this
-	// slice. (A future slice can UPDATE the existing row's
-	// state, but that's PR-C's concern.)
+	// After the closed event the preview row still exists
+	// (janitor owns teardown) AND its preview_pr_state is now
+	// 'closed' — the dispatcher's new contract.
 	previews, err := rig.mem.PreviewAppsByParent(context.Background(), rig.acct, "demo-app")
 	if err != nil {
 		t.Fatalf("PreviewAppsByParent: %v", err)
 	}
 	if len(previews) != 1 {
-		t.Errorf("preview rows after closed = %d, want 1 (janitor reaps later)", len(previews))
+		t.Fatalf("preview rows after closed = %d, want 1 (janitor reaps later)", len(previews))
+	}
+	if got := previews[0].PreviewPrState; got != state.PreviewPrStateClosed {
+		t.Errorf("PreviewPrState after closed = %q, want %q", got, state.PreviewPrStateClosed)
+	}
+
+	// A subsequent 'reopened' event must clear the closed
+	// label back to 'open' — the PR is live again. This is
+	// the corollary the dispatcher must enforce because
+	// SetPreviewPrState refuses the no-op.
+	svc.handlePullRequest(context.Background(),
+		pullRequestReopenedBody(42, "deadbeef00000000000000000000000000000000"))
+	if err != nil {
+		t.Fatalf("reopened: %v", err)
+	}
+	previews, err = rig.mem.PreviewAppsByParent(context.Background(), rig.acct, "demo-app")
+	if err != nil {
+		t.Fatalf("PreviewAppsByParent after reopened: %v", err)
+	}
+	if got := previews[0].PreviewPrState; got != state.PreviewPrStateOpen {
+		t.Errorf("PreviewPrState after reopened = %q, want %q", got, state.PreviewPrStateOpen)
 	}
 }
 

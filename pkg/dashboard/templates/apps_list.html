@@ -75,7 +75,15 @@
           <tbody>
             {{range $items}}
               <tr>
-                <td><code>{{.Slug}}</code></td>
+                <td>
+                  {{/* ADR-095 PR-C / issue #272: indent preview rows
+                       and tag them with a "preview" chip so the
+                       apps-list view makes the production/preview
+                       hierarchy obvious at a glance. The chip is
+                       informational only — it never gates any row
+                       action. */}}
+                  {{if .IsPreview}}<span style="color:#888">↳</span> {{end}}<code>{{.Slug}}</code>{{if .IsPreview}} <span class="badge dim" title="preview environment">preview</span>{{end}}
+                </td>
                 <!-- ux_spec §6.3: glyph + label render the live
                      instance state. Replaces the prior plain
                      .Status span (which only reflected the app's

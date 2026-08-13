@@ -1,7 +1,6 @@
 # ADR-095 · PR-preview environments (issue #272)
 
-- **Status:** proposed (PR-A spine shipped; PR-B routing + PR-C
-  teardown in flight)
+- **Status:** PR-A + PR-B shipped; PR-C ready (in review)
 - **Date:** 2026-08-11
 - **Issue:** #272
 - **Supersedes:** none.
@@ -183,18 +182,32 @@ bridge INSERT trips 23514.
 ## Teardown state machine
 
 ```
-opened --PR closed--> closed --24h--> stale --next tick--> torn_down
-                  ^                       |
-                  |---PR reopened---------|
-                  |                       |
-                  +--manual "Pin" action--+
+opened --PR closed--> closed --24h (TTL elapsed)--> stale --next tick--> torn_down
+                  ^                                       |
+                  |---PR reopened-------------------------|
+                  |                                       |
+                  +--TTL bumped via SQL (support only)----+
 
-stale:     build rows are deleted, instance rows killed,
-           app row remains queryable for audit.
-           `preview_url` returns 410 Gone.
-torn_down: app row is tombstoned (`apps.deleted_at` set);
-           `preview_url` returns 410 Gone; the slug is
-           free for reuse.
+stale:     preview_pr_state = 'stale'; app row remains
+           queryable. Wakes still complete (the schedd's
+           existing kill-stuck watchdog reaps on stale
+           after a grace tick; the customer's last-mile
+           request lands before that). The dashboard
+           surfaces the chip as red.
+
+torn_down: preview_pr_state = 'torn_down' AND apps.status
+           = 'deleted' (the existing soft-delete path,
+           reused from prod). preview_url returns 410
+           Gone; the slug is free for reuse.
+
+TTL:       The 24h grace is tracked via preview_expires_at
+           itself (provisioned at open time as
+           created_at + 7d, refreshed on every sync /
+           reopened event). The janitor treats a row as
+           "past grace" iff preview_pr_state IN
+           ('closed','open') AND preview_expires_at < NOW().
+           A support-pushed TTL bump re-stamps
+           preview_expires_at to extend the window.
 ```
 
 The 24h grace between `closed` and `stale` lets a
@@ -254,14 +267,55 @@ with the same number gets a fresh build (the slug is
 `pgRouter.slugFor` extension.
 
 **PR-C · Teardown + UX** — janitor + dashboard + e2e.
-`cmd/schedd/janitor_preview.go` + the dashboard preview
-panel + `cmd/e2e/preview_test.go`.
+`cmd/apid/preview_janitor.go` + the dashboard preview
+panel + `cmd/e2e/preview_e2e_test.go`.
 
 The cluster is **strictly sequential** because PR-B's
 gateway parser is a no-op without PR-A's preview app
 rows, and PR-C's teardown janitor needs PR-A's
 `preview_pr_state` column and PR-B's routing to land
 before e2e tests can exercise the full path.
+
+### PR-C corrections vs. the original plan
+
+Two material deviations from the PR-C plan written into this
+ADR pre-PR-A:
+
+1. **Janitor placement: `cmd/apid`, not `cmd/schedd`.**
+   The original ADR text named `cmd/schedd/janitor_preview.go`.
+   CLAUDE.md codifies schedd as the sole writer to
+   `instances` and apid as the sole writer to customer-intent
+   tables (`apps` included). The teardown writes both
+   `preview_pr_state` AND triggers a soft-delete on the apps
+   row; placing it in schedd would have made schedd a writer
+   to `apps` for the first time and broken the ownership
+   invariant. The janitor lives in apid; the tombstone emits
+   `db.NotifyAppDelete` so schedd's existing app_delete
+   subscriber (`pkg/sched/app_delete_subscriber.go`) reaps
+   in-flight instances for the deleted app — the two pieces
+   compose without a direct call.
+
+2. **Tombstone column: `apps.status='deleted'`, not
+   `apps.deleted_at`.** The original ADR referenced a
+   `deleted_at` timestamp. The `apps` schema predates
+   `deleted_at` (the platform's only tombstone is
+   `status='deleted'`); adding a new column would have
+   been a schema-drift footgun. The janitor's
+   `tombstone()` calls `pkg/state.SoftDeleteAppCascade`,
+   the same path the dashboard's delete button uses.
+
+### PR-C env knobs
+
+For tests only (cmd/e2e):
+
+- `FAAS_PREVIEW_JANITOR_STARTUP_DELAY_SECONDS=0` — skip the
+  1-minute boot delay.
+- `FAAS_PREVIEW_JANITOR_INTERVAL_SECONDS=1` — fire every
+  second (production: 5 min).
+
+Production never overrides these. The two knobs exist
+purely so the e2e can drive the full Run loop without
+sleeping for minutes.
 
 ## Verification
 

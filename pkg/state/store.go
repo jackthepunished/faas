@@ -28,6 +28,15 @@ var ErrNotFound = errors.New("state: not found")
 // HTTP response uses the canonical RFC 7807 code.
 var ErrInvalidTrafficPercent = errors.New("state: invalid traffic_percent")
 
+// ErrInvalidPreviewPrState is returned by SetPreviewPrState when the
+// requested state is outside the closed set
+// {open,closed,stale,torn_down}. The CHECK constraint
+// apps_preview_pr_state_chk (migration 00220) is the authoritative
+// gate, but the Go-side check lets the offending value ride in the
+// error message so an operator typo is diagnosable without a
+// Postgres round-trip. ADR-095 PR-C.
+var ErrInvalidPreviewPrState = errors.New("state: invalid preview_pr_state")
+
 // ErrTrafficPercentSumInvalid is the defensive backstop returned by
 // UpdateDeploymentTraffic when the post-write Σ invariant check
 // trips. Structurally unreachable with PR-A's "zero siblings"
@@ -976,14 +985,47 @@ type Store interface {
 	// call CountDeployedApps before this method (that's the bug).
 	CreateAppIfUnderQuota(ctx context.Context, app App, limits api.Limits) (App, error)
 	AppByID(ctx context.Context, id string) (App, error)
-	// PreviewAppsByParent (ADR-094 / issue #272) lists every
+	// PreviewAppsByParent (ADR-095 / issue #272) lists every
 	// preview app whose preview_of_slug matches the parent. Used
-	// by the dashboard's "preview environments" pane and the
-	// schedd's teardown janitor (cmd/schedd/janitor_preview.go,
-	// PR-C). Results are ordered by created_at DESC so the
-	// dashboard's newest-first display is free. Returns an empty
-	// slice (not an error) when the parent has no previews.
+	// by the dashboard's "preview environments" pane. Results are
+	// ordered by created_at DESC so the dashboard's newest-first
+	// display is free. Returns an empty slice (not an error) when
+	// the parent has no previews.
+	//
+	// Soft-deleted rows are filtered out — the teardown janitor's
+	// tombstone-aware sweep uses ListPreviewsForTeardown instead.
 	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
+	// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) returns
+	// preview rows the teardown janitor should consider this tick:
+	// every non-torn_down preview that is either in a terminal-ish
+	// PR state (closed / stale) or past its preview_expires_at TTL.
+	//
+	// Deliberately NOT filtered on status <> 'deleted': the janitor
+	// is the component that sets status='deleted', and it must be
+	// able to observe rows it has already tombstoned so a crash
+	// between the tombstone write and the preview_pr_state write
+	// is recoverable on the next tick. Callers that want the live
+	// customer-facing view want PreviewAppsByParent instead.
+	//
+	// `now` is passed rather than read from the DB clock so the
+	// janitor's test seam (and the e2e TTL case) can drive expiry
+	// without waiting 7 real days. maxPerTick bounds the sweep;
+	// <1 returns nil so a misconfigured caller is a no-op rather
+	// than a full-table scan. Ordered by preview_expires_at ASC
+	// (nulls last) so the most overdue rows are reaped first.
+	ListPreviewsForTeardown(ctx context.Context, now time.Time, maxPerTick int) ([]App, error)
+	// SetPreviewPrState (ADR-095 PR-C / issue #272) advances one
+	// preview row's lifecycle label. Returns the updated row, or
+	// ErrNotFound when no row matches the id.
+	//
+	// The value MUST satisfy PreviewPrStateIsValid — the SQL CHECK
+	// apps_preview_pr_state_chk is the authoritative gate, but
+	// implementations reject invalid values before touching the DB
+	// so a typo surfaces as a Go error rather than SQLSTATE 23514.
+	// Only preview rows (preview_of_slug <> '') are eligible; a
+	// production app id is ErrNotFound, so a bug in the janitor's
+	// query can never relabel a customer's live app.
+	SetPreviewPrState(ctx context.Context, appID, prState string) (App, error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and
