@@ -12,6 +12,7 @@ import type { EdgeRuleMaintenanceAction } from './EdgeRuleMaintenanceAction.js';
 import type { EdgeRuleRedirectAction } from './EdgeRuleRedirectAction.js';
 import type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
 import type { EdgeRuleRouteAction } from './EdgeRuleRouteAction.js';
+import type { EdgeRuleThrottleAction } from './EdgeRuleThrottleAction.js';
 import type { EdgeRuleValidateAction } from './EdgeRuleValidateAction.js';
 /**
  * Body shape for POST /v1/apps/{slug}/edge-rules.
@@ -22,10 +23,10 @@ export type CreateEdgeRuleRequest = {
   match_methods?: Array<string>;
   priority?: number;
   enabled?: boolean;
-  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo';
+  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle';
   /**
    * Kind-tagged action body — shape depends on `kind`.
    */
-  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction);
+  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction);
 };
 

@@ -173,6 +173,7 @@ from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
+from .edge_rule_throttle_action import EdgeRuleThrottleAction
 from .edge_rule_validate_action import EdgeRuleValidateAction
 from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
 from .field_error import FieldError
@@ -340,6 +341,8 @@ from .stream_app_logs_archive import StreamAppLogsArchive
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .throttle_suggestion_row import ThrottleSuggestionRow
+from .throttle_suggestions_response import ThrottleSuggestionsResponse
 from .trace import Trace
 from .trace_span import TraceSpan
 from .trace_span_attributes import TraceSpanAttributes
@@ -545,6 +548,7 @@ __all__ = (
     "EdgeRuleResponseKind",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
+    "EdgeRuleThrottleAction",
     "EdgeRuleValidateAction",
     "EdgeRuleValidateActionSchema",
     "FieldError",
@@ -710,6 +714,8 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "ThrottleSuggestionRow",
+    "ThrottleSuggestionsResponse",
     "Trace",
     "TraceSpan",
     "TraceSpanAttributes",

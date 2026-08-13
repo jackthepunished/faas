@@ -4484,11 +4484,11 @@ type RekeyProgress struct {
 // `Multiplier` field pins the formula version so a future change
 // to the recommendation strategy can be distinguished from drift.
 type ThrottleSuggestionRow struct {
-	Route         string  `json:"route"`
-	ObservedRPS   float64 `json:"observed_rps"`
-	SuggestedRPS  float64 `json:"suggested_rps"`
-	SuggestedBurst int    `json:"suggested_burst"`
-	Multiplier    float64 `json:"multiplier"`
+	Route          string  `json:"route"`
+	ObservedRPS    float64 `json:"observed_rps"`
+	SuggestedRPS   float64 `json:"suggested_rps"`
+	SuggestedBurst int     `json:"suggested_burst"`
+	Multiplier     float64 `json:"multiplier"`
 }
 
 // ThrottleSuggestionsResponse is the wire shape for
@@ -4505,14 +4505,14 @@ type ThrottleSuggestionRow struct {
 // tells the customer their throttle will be partial-coverage
 // regardless of what limit they set.
 type ThrottleSuggestionsResponse struct {
-	AppID                string                 `json:"app_id"`
-	Range                string                 `json:"range"`
-	Source               string                 `json:"source"`
-	AsOf                 string                 `json:"as_of"`
-	RouteMetricsDisabled bool                   `json:"route_metrics_disabled"`
-	RoutesCollapsed      int                    `json:"routes_collapsed"`
-	PlanCeilingRPS       int                    `json:"plan_ceiling_rps"`
-	PlanCeilingBurst     int                    `json:"plan_ceiling_burst"`
-	Multiplier           float64                `json:"multiplier"`
+	AppID                string                  `json:"app_id"`
+	Range                string                  `json:"range"`
+	Source               string                  `json:"source"`
+	AsOf                 string                  `json:"as_of"`
+	RouteMetricsDisabled bool                    `json:"route_metrics_disabled"`
+	RoutesCollapsed      int                     `json:"routes_collapsed"`
+	PlanCeilingRPS       int                     `json:"plan_ceiling_rps"`
+	PlanCeilingBurst     int                     `json:"plan_ceiling_burst"`
+	Multiplier           float64                 `json:"multiplier"`
 	Suggestions          []ThrottleSuggestionRow `json:"suggestions"`
 }

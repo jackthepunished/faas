@@ -105,6 +105,7 @@ export type { EdgeRuleRedirectAction } from './models/EdgeRuleRedirectAction.js'
 export type { EdgeRuleResponse } from './models/EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './models/EdgeRuleRewriteAction.js';
 export type { EdgeRuleRouteAction } from './models/EdgeRuleRouteAction.js';
+export type { EdgeRuleThrottleAction } from './models/EdgeRuleThrottleAction.js';
 export type { EdgeRuleValidateAction } from './models/EdgeRuleValidateAction.js';
 export type { EnvScope } from './models/EnvScope.js';
 export type { FieldError } from './models/FieldError.js';
@@ -218,6 +219,8 @@ export type { Slug } from './models/Slug.js';
 export type { SourceRefDeployRequest } from './models/SourceRefDeployRequest.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
+export type { ThrottleSuggestionRow } from './models/ThrottleSuggestionRow.js';
+export type { ThrottleSuggestionsResponse } from './models/ThrottleSuggestionsResponse.js';
 export type { Trace } from './models/Trace.js';
 export type { TraceSpan } from './models/TraceSpan.js';
 export type { TransferOwnershipRequest } from './models/TransferOwnershipRequest.js';

@@ -289,11 +289,11 @@ func Fetch(ctx context.Context, fetcher PromQL, log *slog.Logger, opts FetchOpti
 			burst = int64(planCeilingBurst)
 		}
 		out = append(out, api.ThrottleSuggestionRow{
-			Route:         route,
-			ObservedRPS:   observed,
-			SuggestedRPS:  float64(suggested),
+			Route:          route,
+			ObservedRPS:    observed,
+			SuggestedRPS:   float64(suggested),
 			SuggestedBurst: int(burst),
-			Multiplier:    Multiplier,
+			Multiplier:     Multiplier,
 		})
 	}
 
@@ -329,11 +329,11 @@ func degradedFromErr(resp api.ThrottleSuggestionsResponse, err error, log *slog.
 	// numbers — the dashboard's empty-state message depends on
 	// Suggestions being absent when degraded.
 	return api.ThrottleSuggestionsResponse{
-		AppID:          resp.AppID,
-		Range:          resp.Range,
-		Multiplier:     resp.Multiplier,
-		PlanCeilingRPS: resp.PlanCeilingRPS,
+		AppID:            resp.AppID,
+		Range:            resp.Range,
+		Multiplier:       resp.Multiplier,
+		PlanCeilingRPS:   resp.PlanCeilingRPS,
 		PlanCeilingBurst: resp.PlanCeilingBurst,
-		Suggestions:    []api.ThrottleSuggestionRow{},
+		Suggestions:      []api.ThrottleSuggestionRow{},
 	}, SourceDegradedPrefix + msg
 }

@@ -12,6 +12,7 @@ import type { EdgeRuleMaintenanceAction } from './EdgeRuleMaintenanceAction.js';
 import type { EdgeRuleRedirectAction } from './EdgeRuleRedirectAction.js';
 import type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
 import type { EdgeRuleRouteAction } from './EdgeRuleRouteAction.js';
+import type { EdgeRuleThrottleAction } from './EdgeRuleThrottleAction.js';
 import type { EdgeRuleValidateAction } from './EdgeRuleValidateAction.js';
 /**
  * Partial update — every field optional. Kind is not patchable.
@@ -25,6 +26,6 @@ export type UpdateEdgeRuleRequest = {
   /**
    * Replaces the jsonb column whole.
    */
-  action?: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction);
+  action?: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction);
 };
 

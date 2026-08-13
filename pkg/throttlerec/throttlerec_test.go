@@ -65,9 +65,9 @@ func TestThrottleRec_HappyPath(t *testing.T) {
 	log, _ := captureLog(t)
 	stub := &stubPromQL{fn: func(_, _, _ string) (map[string]map[string]float64, error) {
 		return appRow("app-1", map[string]float64{
-			"GET /users/4f8a":  1.0,
-			"POST /orders":     5.0,
-			"GET /health":      10.0,
+			"GET /users/4f8a": 1.0,
+			"POST /orders":    5.0,
+			"GET /health":     10.0,
 		}), nil
 	}}
 
@@ -225,8 +225,8 @@ func TestThrottleRec_RouteOtherExcluded(t *testing.T) {
 	log, _ := captureLog(t)
 	stub := &stubPromQL{fn: func(_, _, _ string) (map[string]map[string]float64, error) {
 		return appRow("app-1", map[string]float64{
-			"GET /users/4f8a":  1.0,
-			"POST /orders":     5.0,
+			"GET /users/4f8a": 1.0,
+			"POST /orders":    5.0,
 			"__route_other__": 12.0,
 		}), nil
 	}}

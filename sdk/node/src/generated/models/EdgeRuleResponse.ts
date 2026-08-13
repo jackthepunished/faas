@@ -12,6 +12,7 @@ import type { EdgeRuleMaintenanceAction } from './EdgeRuleMaintenanceAction.js';
 import type { EdgeRuleRedirectAction } from './EdgeRuleRedirectAction.js';
 import type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
 import type { EdgeRuleRouteAction } from './EdgeRuleRouteAction.js';
+import type { EdgeRuleThrottleAction } from './EdgeRuleThrottleAction.js';
 import type { EdgeRuleValidateAction } from './EdgeRuleValidateAction.js';
 /**
  * A customer-configurable edge rule. The `action` blob is a
@@ -37,11 +38,11 @@ export type EdgeRuleResponse = {
   match_methods: Array<string>;
   priority: number;
   enabled: boolean;
-  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo';
+  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle';
   /**
    * Kind-tagged union — shape varies by `kind`.
    */
-  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction);
+  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction);
   created_at: string;
   updated_at: string;
 };

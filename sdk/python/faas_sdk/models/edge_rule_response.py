@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
     from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
     from ..models.edge_rule_route_action import EdgeRuleRouteAction
+    from ..models.edge_rule_throttle_action import EdgeRuleThrottleAction
     from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
 
@@ -55,6 +56,7 @@ class EdgeRuleResponse:
         | EdgeRuleRedirectAction
         | EdgeRuleRewriteAction
         | EdgeRuleRouteAction
+        | EdgeRuleThrottleAction
         | EdgeRuleValidateAction
     )
     """Kind-tagged union — shape varies by `kind`."""
@@ -66,6 +68,7 @@ class EdgeRuleResponse:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+        from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
         from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
@@ -115,6 +118,8 @@ class EdgeRuleResponse:
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleMaintenanceAction):
             action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleGeoAction):
+            action = self.action.to_dict()
         else:
             action = self.action.to_dict()
 
@@ -155,6 +160,7 @@ class EdgeRuleResponse:
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
+        from ..models.edge_rule_throttle_action import EdgeRuleThrottleAction
         from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
         d = dict(src_dict)
@@ -189,6 +195,7 @@ class EdgeRuleResponse:
             | EdgeRuleRedirectAction
             | EdgeRuleRewriteAction
             | EdgeRuleRouteAction
+            | EdgeRuleThrottleAction
             | EdgeRuleValidateAction
         ):
             try:
@@ -271,11 +278,19 @@ class EdgeRuleResponse:
                 return action_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_10 = EdgeRuleGeoAction.from_dict(data)
+
+                return action_type_10
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            action_type_10 = EdgeRuleGeoAction.from_dict(data)
+            action_type_11 = EdgeRuleThrottleAction.from_dict(data)
 
-            return action_type_10
+            return action_type_11
 
         action = _parse_action(d.pop("action"))
 
