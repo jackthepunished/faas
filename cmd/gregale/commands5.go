@@ -344,15 +344,19 @@ func envPush(args []string) int {
 		}
 		findings := secretscan.ScanEnvPairs(scanPairs, origin)
 		// Strict mode: same shape as deploy's StrictSecretScanError so
-		// the printErr dispatcher renders the unified 422 envelope. The
-		// env-push path uses Pair, not Finding, so we synthesise
-		// per-pair Findings with the env-pair origin as the File.
+		// the printErr dispatcher renders the unified 422 envelope.
+		// ScanEnvPairs already stamps a 1-indexed Line on each
+		// Finding (the pair-index in the .env file), so we forward
+		// it as-is rather than rewriting Line=0 — the JSON envelope's
+		// `secret_findings[].line` and the text-mode `:N` renderer
+		// both depend on the contract documented in
+		// pkg/secretscan/scan.go.
 		if secretScanMode.isStrict() && len(findings) > 0 {
 			wireFindings := make([]secretscan.Finding, 0, len(findings))
 			for _, f := range findings {
 				wireFindings = append(wireFindings, secretscan.Finding{
 					File:     origin,
-					Line:     0,
+					Line:     f.Line,
 					Key:      f.Key,
 					Provider: f.Provider,
 					Severity: f.Severity,

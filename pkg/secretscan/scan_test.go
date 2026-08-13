@@ -208,6 +208,38 @@ func TestScanEnvContent_NoRawValueInSnippet(t *testing.T) {
 	}
 }
 
+// TestScanEnvContent_PEMNoCrash is the env-parser pin for review
+// finding #3. The .env-format parser splits each line on '=' and
+// does not have a "whole-line value" path (the only value path is
+// the right side of '='), so it cannot produce a private_key_block
+// finding at all — the pattern requires a whole-line value to
+// match. We assert that the env-parser survives an in-line PEM
+// block without producing spurious high_entropy findings on the
+// base64 body lines. The .env format has no line-continuation, so
+// the BEGIN/END lines are seen as ordinary env entries (no '=' →
+// skipped by matchLine) and the body lines are also no-equal →
+// skipped. The regression pin is therefore "no panic, no findings"
+// rather than "exactly 1 finding" — the source-tree path
+// (scan_file_test.go::TestScanFile_PEMDedup) carries the
+// load-bearing dedup assertion.
+func TestScanEnvContent_PEMNoCrash(t *testing.T) {
+	var body strings.Builder
+	body.WriteString("PORT=8080\n")
+	body.WriteString("-----BEGIN RSA PRIVATE KEY-----\n")
+	for i := 0; i < 30; i++ {
+		body.WriteString("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP012\n")
+	}
+	body.WriteString("-----END RSA PRIVATE KEY-----\n")
+	body.WriteString("DATABASE_URL=postgres://u:p@h/d\n")
+	got := ScanEnvContent(".env", []byte(body.String()))
+	// .env format has no line-continuation; the BEGIN/END/body
+	// lines are not valid env entries and the parser must skip
+	// them silently. The URL carve-out exempts DATABASE_URL.
+	if len(got) != 0 {
+		t.Errorf("env-parser produced %d findings on a PEM block (only valid env lines should be scanned); full set: %+v", len(got), got)
+	}
+}
+
 // TestScanEnvPairs_PassthroughOrigin pins the origin string field for the
 // envPush entry point. envPush passes the file path or "<stdin>" so the
 // stderr warning can say e.g. `File: .env.production` vs `File: <stdin>`.

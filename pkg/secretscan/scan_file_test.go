@@ -3,6 +3,7 @@
 package secretscan
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -89,6 +90,42 @@ func TestScanFile_LineNumbers(t *testing.T) {
 	}
 	if got[0].Line != 4 {
 		t.Errorf("Line = %d, want 4 (import at 1, blank at 2, comment at 3, secret at 4)", got[0].Line)
+	}
+}
+
+// TestScanFile_PEMDedup is the regression pin for review finding #3:
+// a 100-line committed PEM block must produce ONE finding (the
+// BEGIN-line private_key_block), NOT 100+ findings (one BEGIN + ~100
+// high_entropy on the base64 body). Without the dedup gate, --secret-
+// scan=strict floods the customer with one warning per base64 line
+// for what is logically a single secret.
+func TestScanFile_PEMDedup(t *testing.T) {
+	// Build a 50-line PEM block by repeating a long random-looking
+	// base64 string. Each body line is well over entropyMinLen (20
+	// bytes) and well over the 4.5 bits/char entropy floor, so the
+	// pre-dedup code would have produced ~50 high_entropy findings
+	// + 1 private_key_block = ~51 findings.
+	var body strings.Builder
+	body.WriteString("-----BEGIN RSA PRIVATE KEY-----\n")
+	for i := 0; i < 50; i++ {
+		// 80-char random-looking base64; uses a non-secret token
+		// (the alphabet 'A'..'z' mixes with digits to keep entropy
+		// high enough to trip the floor). Distinct on each line
+		// would be required for a real key, but the dedup gate
+		// doesn't care about uniqueness — it only cares that the
+		// line is INSIDE the BEGIN/END block.
+		body.WriteString("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP012\n")
+	}
+	body.WriteString("-----END RSA PRIVATE KEY-----\n")
+	got := ScanFile("keys/server.pem", []byte(body.String()))
+	if len(got) != 1 {
+		t.Fatalf("PEM block produced %d findings, want 1 (the BEGIN-line private_key_block); full set: %+v", len(got), got)
+	}
+	if got[0].Provider != "private_key_block" {
+		t.Errorf("Provider = %q, want private_key_block", got[0].Provider)
+	}
+	if got[0].Line != 1 {
+		t.Errorf("Line = %d, want 1 (the BEGIN line)", got[0].Line)
 	}
 }
 

@@ -29,8 +29,13 @@ import (
 // ScanFile scans a single file's bytes for secret-shaped lines. Returns
 // the findings in file-order. The path is recorded on each Finding so the
 // caller can render File:Line in the stderr / audit output.
+//
+// Same armoured-key dedup as ScanEnvContent (review finding #3):
+// a single PEM block produces one finding on the BEGIN line, not
+// one per base64 body line.
 func ScanFile(path string, data []byte) []Finding {
 	var out []Finding
+	inPEMBlock := false
 	for lineNo := 1; ; lineNo++ {
 		i := bytes.IndexByte(data, '\n')
 		var line []byte
@@ -44,7 +49,15 @@ func ScanFile(path string, data []byte) []Finding {
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
-		out = scanOneLine(path, lineNo, line, out)
+		// PEM-block state update before the match pass so the
+		// -----BEGIN line itself still scans.
+		if bytes.Contains(line, []byte("-----BEGIN ")) && bytes.Contains(line, []byte("PRIVATE KEY")) {
+			inPEMBlock = true
+		}
+		if bytes.Contains(line, []byte("-----END ")) && bytes.Contains(line, []byte("PRIVATE KEY")) {
+			inPEMBlock = false
+		}
+		out = scanOneLine(path, lineNo, line, out, inPEMBlock)
 		if len(data) == 0 {
 			return out
 		}
@@ -63,7 +76,10 @@ func ScanFile(path string, data []byte) []Finding {
 // so we don't trip on URL-shaped values like
 // `https://x.com?key=...`). `=` is preferred when both are present so an
 // `API_KEY=foo:bar` line lands on the key= side.
-func scanOneLine(path string, lineNo int, line []byte, out []Finding) []Finding {
+//
+// inPEMBlock suppresses the entropy fallback on body lines of an
+// armoured-key block (review finding #3).
+func scanOneLine(path string, lineNo int, line []byte, out []Finding, inPEMBlock bool) []Finding {
 	// Skip blanks and shell-style comments. Comments are not scanned
 	// even if they contain a real-looking token, because the token is by
 	// definition not a secret if it's commented out.
@@ -73,7 +89,7 @@ func scanOneLine(path string, lineNo int, line []byte, out []Finding) []Finding 
 	}
 	// Try the env-parser shape first: KEY=VALUE.
 	if key, value, ok := splitKeyValue(line, '='); ok {
-		if f := matchValue(path, lineNo, key, value); f != nil {
+		if f := matchValue(path, lineNo, key, value, inPEMBlock); f != nil {
 			out = append(out, *f)
 		}
 		return out
@@ -82,13 +98,13 @@ func scanOneLine(path string, lineNo int, line []byte, out []Finding) []Finding 
 	// if the KEY on the left is key-shaped — that filter keeps URL values
 	// from accidentally splitting on the host:port boundary.
 	if key, value, ok := splitKeyValueColon(trimmed); ok {
-		if f := matchValue(path, lineNo, key, value); f != nil {
+		if f := matchValue(path, lineNo, key, value, inPEMBlock); f != nil {
 			out = append(out, *f)
 		}
 		return out
 	}
 	// Whole-line value candidate (PEM armour, base64 blob, etc.).
-	if f := matchValue(path, lineNo, "", trimmed); f != nil {
+	if f := matchValue(path, lineNo, "", trimmed, inPEMBlock); f != nil {
 		out = append(out, *f)
 	}
 	return out

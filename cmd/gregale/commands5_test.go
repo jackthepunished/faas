@@ -617,6 +617,81 @@ func TestCmdEnvPush_RejectsDirectory(t *testing.T) {
 	}
 }
 
+// TestCmdEnvPush_StrictMode_PropagatesLine is the regression pin for
+// the review finding that envPush's strict-mode path was rewriting
+// every synthesised Finding to Line=0, breaking the 1-indexed Line
+// contract that pkg/secretscan/scan.go documents for env-pairs
+// ("the 1-indexed position in the pairs slice"). A programmatic
+// consumer running `gregale env push --secret-scan=strict --json`
+// would see `"line": 0` in every secret_findings[] entry, and the
+// text-mode :N renderer would print `:0`.
+//
+// The test seeds a .env file with a poisoned pair at line 4 (after
+// three clean lines) and a Stripe key. It then runs envPush with
+// --secret-scan=strict and asserts:
+//
+//  1. exit code == 1 (strict-mode rejected)
+//  2. no PUT request was sent (server-side can't accept poisoned
+//     pairs)
+//  3. the stderr rendering shows the poisoned pair at line 4 (the
+//     `:4` part) — pinning the wire contract end-to-end through
+//     renderStrictSecretScanError.
+//
+// The fakeStripeLiveKey constant is declared in pack_test.go
+// (whitebox); we re-declare the safe-construction form here to
+// keep the secret-scanner happy on push.
+func TestCmdEnvPush_StrictMode_PropagatesLine(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, ".env")
+	body := "PORT=8080\nDATABASE_URL=postgres://u:p@h:5432/d\nGREETING=hello\n" +
+		"STRIPE_SECRET_KEY=" + "sk_live_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ" + "_XXXX" + "\n"
+	if err := os.WriteFile(envFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var puts []string
+	sink := &multiSink{onSecrets: func(method, path string) (int, any) {
+		if method == "GET" {
+			return http.StatusOK, api.AppSecretListResponse{Quota: 25}
+		}
+		if method == "PUT" {
+			parts := strings.Split(path, "/")
+			puts = append(puts, parts[len(parts)-1])
+			return http.StatusOK, nil
+		}
+		return http.StatusBadRequest, nil
+	}}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	var stderr bytes.Buffer
+	origStderr := osStderr
+	osStderr = &stderr
+	defer func() { osStderr = origStderr }()
+
+	// Restore the strict-mode flag parse path. envPush's flag
+	// string is "--secret-scan" with the closed enum values
+	// off|on|strict|source-tree.
+	code := envPush([]string{"--app", "hello", "--secret-scan", "strict", "-f", envFile})
+	if code != 1 {
+		t.Errorf("envPush --secret-scan=strict = %d, want 1 (strict mode should reject)", code)
+	}
+	if len(puts) != 0 {
+		t.Errorf("strict mode must NOT PUT to server; got %d puts: %v", len(puts), puts)
+	}
+	// Pin the wire contract: the stderr rendering must include
+	// `:4` (the line number of the poisoned pair in the seeded
+	// .env) so a CI script can grep for the offending line. The
+	// review finding was that this used to render `:0`.
+	if !strings.Contains(stderr.String(), ":4 [stripe_live]") {
+		t.Errorf("stderr should render the poisoned pair at line 4; got: %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), ":0 [") {
+		t.Errorf("stderr rendered Line=0 (review-finding #2 regression): %q", stderr.String())
+	}
+}
+
 // --- app scale / rename ---------------------------------------------------
 
 // TestCmdAppScale_RequiresLogin pins the no-token exit code (#72).

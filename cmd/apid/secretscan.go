@@ -94,10 +94,17 @@ func scanExtractedTreeSecrets(scanDir string) ([]secretscan.Finding, error) {
 		if ferr != nil {
 			return nil
 		}
-		defer func() { _ = f.Close() }()
 		// Strict cap: read N+1 so we can detect overflow and skip
 		// without scanning a truncated copy.
 		data, rerr := io.ReadAll(io.LimitReader(f, serverSecretScanMaxBytes+1))
+		// Close inline — `defer f.Close()` inside a WalkDir callback
+		// only fires when the outer function returns, so every
+		// visited file would stay open until the walk completes and
+		// a 10k-file customer tree could pin 10k FDs simultaneously,
+		// exhausting `ulimit -n` on a busy control-plane box. The
+		// CLI twin (cmd/gregale/pack.go) closes inline for the same
+		// reason; mirror it here.
+		_ = f.Close()
 		if rerr != nil {
 			return nil
 		}
