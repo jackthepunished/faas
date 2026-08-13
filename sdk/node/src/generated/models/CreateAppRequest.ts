@@ -25,6 +25,10 @@ export type CreateAppRequest = {
    */
   route_metrics_enabled?: boolean;
   /**
+   * Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → apid applies the default (false). Free-tier allowed; no plan gate. Flipping this on at create time pins the app for maintenance from the first request.
+   */
+  maintenance_mode?: boolean;
+  /**
    * Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan default. Free/Hobby PATCH-true is rejected.
    */
   warm_snapshot_enabled?: boolean;

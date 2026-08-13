@@ -100,18 +100,19 @@ func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate valida
 }
 
 // loadHost compiles every kind's slice for host into a fresh
-// hostEntry. Shared by all eight Match* methods so a cache miss for
-// ANY kind recompiles all eight kinds in one pass (the SQL roundtrip
+// hostEntry. Shared by all Match* methods so a cache miss for
+// ANY kind recompiles all kinds in one pass (the SQL roundtrip
 // dominates; the path.Match walks are irrelevant). Returns
 // nil + nil error on an empty store response.
 //
-// parseErrs is the aggregated parse-error list across all eight
-// compile* calls — the caller logs each at WARN so an operator can
+// parseErrs is the aggregated parse-error list across all compile*
+// calls — the caller logs each at WARN so an operator can
 // diagnose a malformed glob or CIDR. The malformed rules are
 // dropped from their respective compiled slices. PR 5 widens the
 // list to include malformed CIDR parse errors from compileIPRules
 // (reuses the same PathGlobError tuple shape); PR-B widens it
-// again to include kind=validate compile errors.
+// to include kind=validate compile errors; the maintenance
+// amendment widens it again to include kind=maintenance.
 func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway.HostEntry, error) {
 	storeRules, err := g.store.MatchEdgeRulesForHost(ctx, host)
 	if err != nil {
@@ -126,18 +127,20 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	ip, ipErrs := compileIPRules(storeRules)
 	validate, validateErrs := g.compileValidateRules(storeRules)
 	limit, limitErrs := compileLimitRules(storeRules)
+	maintenance, maintenanceErrs := compileMaintenanceRules(storeRules)
 	geo, geoErrs := compileGeoRules(storeRules)
 	entry := &gateway.HostEntry{
-		Route:    route,
-		Rewrite:  rewrite,
-		Redirect: redirect,
-		Headers:  headers,
-		CORS:     cors,
-		JWT:      jwt,
-		IP:       ip,
-		Validate: validate,
-		Limit:    limit,
-		Geo:      geo,
+		Route:       route,
+		Rewrite:     rewrite,
+		Redirect:    redirect,
+		Headers:     headers,
+		CORS:        cors,
+		JWT:         jwt,
+		IP:          ip,
+		Validate:    validate,
+		Limit:       limit,
+		Maintenance: maintenance,
+		Geo:         geo,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -147,6 +150,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, ipErrs...)
 	parseErrs = append(parseErrs, validateErrs...)
 	parseErrs = append(parseErrs, limitErrs...)
+	parseErrs = append(parseErrs, maintenanceErrs...)
 	parseErrs = append(parseErrs, geoErrs...)
 
 	if len(parseErrs) > 0 {
@@ -186,6 +190,9 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		}
 		for range limitErrs {
 			g.metrics.ObserveEdgeRuleCompileError("limit")
+		}
+		for range maintenanceErrs {
+			g.metrics.ObserveEdgeRuleCompileError("maintenance")
 		}
 	}
 	return entry, nil
@@ -415,6 +422,35 @@ func (g *gatewaydEdgeRules) MatchLimit(ctx context.Context, host, requestPath, m
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstLimitMatch(rules, requestPath, method)
+}
+
+// MatchMaintenance returns the highest-priority `kind=maintenance`
+// rule whose host, path, and method match the inbound request, or
+// nil if no rule applies. Same primitive as MatchLimit — a miss for
+// maintenance triggers the same loadHost pass that also recompiles
+// route/rewrite/.../limit. The applier (handler.go::applyEdgeRuleMaintenance,
+// §4.1.2.13) short-circuits with 503 + Retry-After BEFORE auth,
+// BEFORE wake. Coarse-gate apps.maintenance_mode fires BEFORE this
+// method is consulted (handler.go::applyAppsMaintenanceMode), so the
+// fine-grained rule only sees requests that survived the coarse gate.
+func (g *gatewaydEdgeRules) MatchMaintenance(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleMaintenanceResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetMaintenance(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Maintenance
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstMaintenanceMatch(rules, requestPath, method)
 }
 
 // MatchGeo returns the highest-priority `kind=geo` rule whose
@@ -996,6 +1032,77 @@ func compileLimitRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleLimitReso
 			Methods:               buildMethodsMap(r.MatchMethods),
 			MaxBodyBytes:          maxBody,
 			MaxBodyBytesStreaming: maxBodyStream,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileMaintenanceRules mirrors compileLimitRules for kind=maintenance.
+// The compiled slice carries the per-rule Retry-After + optional
+// Message the handler's applyEdgeRuleMaintenance consults.
+// apid-Validate already enforced the
+// {0 ≤ retry_after_seconds ≤ api.MaxEdgeRuleMaintenanceRetryAfterSeconds}
+// + {len(message) ≤ 512} clamps (pkg/api/dto.go::EdgeRuleMaintenanceAction.Validate),
+// but the SQL hotfix path means we can't trust the validator. This
+// compile step is the defence-in-depth pass: a hot-fix that
+// bypassed apid still gets clamped here, and a row with a
+// non-positive RetryAfterSeconds degrades to the platform default
+// (no 503-storm on bad input). The Message field is NOT clamped
+// here — only the Retry-After is the load-bearing platform
+// invariant.
+//
+// Like compileLimitRules, the compile is a free function — it
+// doesn't need any adapter state (unlike compileValidateRules which
+// needs the schema cache). Out-of-bound values are clamped silently
+// and a slog.Warn from the caller notes the rule ID; the customer
+// never sees the warning (their rule still fires, just at the
+// platform default).
+func compileMaintenanceRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleMaintenanceResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleMaintenanceResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindMaintenance {
+			continue
+		}
+		if r.Action.Maintenance == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp Retry-After to the platform default + ceiling.
+		// Non-positive → api.EdgeRuleMaintenanceRetryAfterSeconds (a
+		// 0 cap would set Retry-After: 0 which RFC 7231 forbids — the
+		// apid-Validate cap already rejects > MaxEdgeRuleMaintenanceRetryAfterSeconds,
+		// so the upper clamp is defence-in-depth for direct-DB writes).
+		// Same defence-in-depth posture as compileLimitRules
+		// silently clamping out-of-bound body caps to the platform
+		// cap.
+		retry := r.Action.Maintenance.RetryAfterSeconds
+		if retry <= 0 {
+			retry = api.EdgeRuleMaintenanceRetryAfterSeconds
+		}
+		if retry > api.MaxEdgeRuleMaintenanceRetryAfterSeconds {
+			retry = api.MaxEdgeRuleMaintenanceRetryAfterSeconds
+		}
+		out = append(out, gateway.EdgeRuleMaintenanceResolved{
+			ID:                r.ID,
+			AccountID:         r.AccountID,
+			AppID:             r.AppID,
+			Priority:          r.Priority,
+			PathGlob:          r.MatchPath,
+			Methods:           buildMethodsMap(r.MatchMethods),
+			RetryAfterSeconds: retry,
+			Message:           r.Action.Maintenance.Message,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })

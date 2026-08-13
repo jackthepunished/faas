@@ -321,7 +321,7 @@ type EdgeRuleCache struct {
 // cmd/gatewayd-internal/edge_rules.go::loadHost, which runs every
 // compile* over the same []state.EdgeRule slice and stitches the
 // results into a single HostEntry. PathGlobErrs aggregates the
-// path-glob parse errors from all seven compileXxx calls so the
+// path-glob parse errors from all compileXxx calls so the
 // loader can re-emit them at WARN on subsequent reads without
 // re-running path.Match. (PR 5 widened the slice count from 4 to
 // 7; the audit tuple is reused verbatim — malformed CIDRs flow
@@ -347,7 +347,25 @@ type HostEntry struct {
 	// the surrounding fields — the cache primitive is
 	// kind-agnostic and the cmd-side loader threads one slice per
 	// kind into the HostEntry.
-	Limit        []EdgeRuleLimitResolved
+	Limit []EdgeRuleLimitResolved
+	// Maintenance carries the kind=maintenance subset (ADR-091
+	// amendment). Same shape as Limit / Validate above; the applier
+	// (handler.go::applyEdgeRuleMaintenance, §4.1.2.13) short-circuits
+	// a matched (host, path, method) request with 503 + Retry-After
+	// BEFORE auth, BEFORE wake. Stored as a plain slice to match the
+	// surrounding fields — the cache primitive is kind-agnostic and
+	// the cmd-side loader threads one slice per kind into the
+	// HostEntry. The struct itself lives in edge_rules_maintenance.go
+	// (file-level split mirroring edge_rules_limit.go).
+	Maintenance []EdgeRuleMaintenanceResolved
+	// Geo carries the kind=geo subset (ADR-091 D21). Same shape
+	// as IP / Limit above; the applier
+	// (handler.go::applyEdgeRuleGeo) reads the trusted XFF entry,
+	// consults the pkg/geoip.Reader for the country code, and
+	// evaluates against this rule's Allow/Deny sets. Stored as a
+	// plain slice to match the surrounding fields — the cache
+	// primitive is kind-agnostic and the cmd-side loader threads
+	// one slice per kind into the HostEntry.
 	Geo          []EdgeRuleGeoResolved
 	PathGlobErrs []PathGlobError
 }
@@ -509,6 +527,27 @@ func (c *EdgeRuleCache) GetLimit(host string) ([]EdgeRuleLimitResolved, bool) {
 	return out, true
 }
 
+// GetMaintenance is the kind=maintenance accessor. Same shape as
+// GetLimit: returns a value-copy of the underlying slice and a hit
+// bool; nil slice with ok=true means "entry exists but no
+// maintenance rule for this host". Coarse-gate apps.maintenance_mode
+// fires before this method is called (handler.go::applyAppsMaintenanceMode),
+// so a hit on the coarse gate short-circuits without consulting
+// this slice.
+func (c *EdgeRuleCache) GetMaintenance(host string) ([]EdgeRuleMaintenanceResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Maintenance == nil {
+		return nil, true
+	}
+	src := entry.Maintenance
+	out := make([]EdgeRuleMaintenanceResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
 // GetGeo mirrors GetIP for the kind=geo subset (ADR-091 D21).
 // The Geo slice is a value-copy of the underlying cache entry,
 // AND each per-entry map (Methods/Allow/Deny) is deep-copied —
@@ -601,7 +640,7 @@ func (c *EdgeRuleCache) getEntry(host string) (*HostEntry, bool) {
 // the cache is advisory and a missing entry costs one indexed
 // PG read (~0.5ms warm).
 //
-// All seven slices are populated from the SAME PG read (a miss for
+// All slices are populated from the SAME PG read (a miss for
 // any kind re-runs the SQL query and recompiles every kind); this
 // is the loader's contract (cmd/gatewayd-internal/edge_rules.go).
 func (c *EdgeRuleCache) Put(host string, e *HostEntry) {
@@ -618,7 +657,7 @@ func (c *EdgeRuleCache) Put(host string, e *HostEntry) {
 		len(e.Redirect) == 0 && len(e.Headers) == 0 &&
 		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 &&
 		len(e.Validate) == 0 && len(e.Limit) == 0 &&
-		len(e.Geo) == 0 {
+		len(e.Maintenance) == 0 && len(e.Geo) == 0 {
 		return
 	}
 	e.Host = host
@@ -702,6 +741,7 @@ type EdgeRuleMatcher interface {
 	MatchIP(ctx context.Context, host, path, method string) *EdgeRuleIPResolved
 	MatchValidate(ctx context.Context, host, path, method string) *EdgeRuleValidateResolved
 	MatchLimit(ctx context.Context, host, path, method string) *EdgeRuleLimitResolved
+	MatchMaintenance(ctx context.Context, host, path, method string) *EdgeRuleMaintenanceResolved
 	MatchGeo(ctx context.Context, host, path, method string) *EdgeRuleGeoResolved
 	Reset()
 }
@@ -825,7 +865,7 @@ var (
 // implementations use to inherit default no-op behavior for the
 // kinds they don't ship. Today's production impl
 // `cmd/gatewayd-internal.edgeRules` doesn't embed it (PR 5 ships
-// all seven Match* methods); the type exists for the
+// all Match* methods); the type exists for the
 // forward-compatible interface shape so a future kind's impl can
 // embed it and only override the kinds it ships.
 type noOpEdgeRuleMatcher struct{}
@@ -855,6 +895,9 @@ func (noOpEdgeRuleMatcher) MatchValidate(context.Context, string, string, string
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchLimit(context.Context, string, string, string) *EdgeRuleLimitResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchMaintenance(context.Context, string, string, string) *EdgeRuleMaintenanceResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchGeo(context.Context, string, string, string) *EdgeRuleGeoResolved {

@@ -304,6 +304,21 @@ const (
 	//   against notify loss. Consumed by cmd/gatewayd-internal/
 	//   backend.go (PR 8).
 	NotifyEdgeRuleChanged = "edge_rule_changed"
+	// ADR-091 amendment (PR-A #??? / apps.maintenance_mode):
+	// the existing NotifyAppChanged channel (declared in the const
+	// block above; payload contract at line 73) is reused for
+	// maintenance_mode flips. The maintenance trigger (migrations
+	// /00221_apps_maintenance_mode.sql) fires ONLY when
+	// maintenance_mode IS DISTINCT FROM OLD.maintenance_mode, so
+	// the channel stays low-volume (per-app flips, not every app
+	// UPDATE). The gatewayd-internal listener (cmd/gatewayd-
+	// internal/run.go) calls Backend.ResetApp(appID) which
+	// `delete`s the entry from the per-host apps LRU so the next
+	// Backend.Lookup repopulates the row from PG and picks up the
+	// new MaintenanceMode value. Without this notification the
+	// apps LRU (no TTL) keeps the stale MaintenanceMode for the
+	// lifetime of the cache entry — the first node to see the app
+	// returns 503 forever, every subsequent node returns 200.
 	// NotifyGithubWebhookSecretChanged {"installation_id":bigint}
 	//   apid → githubd (PR-D / ADR-012 §7 amendment): a row in
 	//   github_webhook_secrets was rotated via the admin endpoint.

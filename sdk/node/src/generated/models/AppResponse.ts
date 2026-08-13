@@ -50,6 +50,10 @@ export type AppResponse = {
    */
   route_metrics_enabled?: boolean;
   /**
+   * Coarse per-app maintenance toggle (ADR-091 amendment). When true the gatewayd-internal hot-path short-circuits every request to this app with 503 + Retry-After (default 60 s) BEFORE auth, BEFORE wake, BEFORE any kind=maintenance edge rule. Free-tier allowed. Surfaced in the GET /v1/apps/{slug} response so dashboards can show 'maintenance on / off' alongside the streaming/WS pills.
+   */
+  maintenance_mode?: boolean;
+  /**
    * Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column `apps.scaling_policy`.
    */
   scaling_policy?: (null | ScalingPolicy);

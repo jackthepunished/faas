@@ -67,6 +67,9 @@ class CreateDeploymentOverrides:
     Pro, Scale inherit the 5 s / 3 consecutive / 60 s cooldown / 3 in 300 s
     defaults. v1 is HTTP-only; gRPC health checks are deferred to v2.
     """
+    scope: None | str | Unset = UNSET
+    """Override-object per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no
+    leading/trailing dash. nil/omitted = inherit top-level scope or `default`."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -107,6 +110,12 @@ class CreateDeploymentOverrides:
         else:
             liveness_probe = self.liveness_probe
 
+        scope: None | str | Unset
+        if isinstance(self.scope, Unset):
+            scope = UNSET
+        else:
+            scope = self.scope
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -124,6 +133,8 @@ class CreateDeploymentOverrides:
             field_dict["healthcheck"] = healthcheck
         if liveness_probe is not UNSET:
             field_dict["liveness_probe"] = liveness_probe
+        if scope is not UNSET:
+            field_dict["scope"] = scope
 
         return field_dict
 
@@ -189,6 +200,15 @@ class CreateDeploymentOverrides:
 
         liveness_probe = _parse_liveness_probe(d.pop("liveness_probe", UNSET))
 
+        def _parse_scope(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        scope = _parse_scope(d.pop("scope", UNSET))
+
         create_deployment_overrides = cls(
             entrypoint=entrypoint,
             cmd=cmd,
@@ -197,6 +217,7 @@ class CreateDeploymentOverrides:
             port=port,
             healthcheck=healthcheck,
             liveness_probe=liveness_probe,
+            scope=scope,
         )
 
         create_deployment_overrides.additional_properties = d

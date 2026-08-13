@@ -1605,8 +1605,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
 		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1642,7 +1642,17 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		// apps never carry preview metadata. The bind site is
 		// the canonical "all four columns are NULL" producer.
 		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
-		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt))
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag (apps.maintenance_mode). Written
+		// explicitly so the App struct's value (default false)
+		// round-trips through CREATE — the schema DEFAULT also
+		// evaluates to false, but the explicit write is the
+		// established convention (websocket_enabled,
+		// route_metrics_enabled) and matches the column-list
+		// shape above. Mirrors the Set-bit-aware contract used
+		// in the PATCH path (handler_ext.go).
+		app.MaintenanceMode)
 	return scanApp(row)
 }
 
@@ -1783,8 +1793,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
 		returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1814,7 +1824,14 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		// (and quota-counted inserts that happen to land via
 		// this path) never carry preview metadata.
 		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
-		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt))
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. Same explicit-write posture as
+		// CreateApp above — the schema DEFAULT would yield
+		// false but the explicit write matches the
+		// websocket_enabled / route_metrics_enabled column-list
+		// discipline and the Set-bit-aware PATCH contract.
+		app.MaintenanceMode)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2693,6 +2710,19 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
 			   overflow_node = case when $49 then $50 else overflow_node end,
+				   -- ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+				   -- maintenance flag. Same Set-bit convention as the
+				   -- surrounding fields — SetMaintenanceMode
+				   -- distinguishes "don't touch" (default) from
+				   -- "explicit false" (opt out). No plan gate
+				   -- (Free+ may opt in). The companion
+				   -- apps_maintenance_mode_notify trigger fires
+				   -- pg_notify('app_changed', NEW.id::text) ONLY
+				   -- when maintenance_mode IS DISTINCT FROM old, so
+				   -- the cmd-side listener
+				   -- (cmd/gatewayd-internal/backend.go) sees one
+				   -- event per flip, not one per app UPDATE.
+				   maintenance_mode = case when $51 then $52 else maintenance_mode end,
 			   -- ADR-091 CORS improvements D1: per-app
 			   -- default CORS opt-in. SetCORSDefaultEnabled
 			   -- distinguishes "don't touch" from
@@ -2702,7 +2732,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- the fallback is the "just allow my
 			   -- origin" surface customers expect from
 			   -- any FaaS, so no plan gate.
-			   cors_default_enabled = case when $51 then $52 else cors_default_enabled end,
+				   cors_default_enabled = case when $53 then $54 else cors_default_enabled end,
 			   -- ADR-091 CORS improvements D1:
 			   -- per-app default CORS allowlist. Set bit
 			   -- gates the ARRAY write; nil + Set=true
@@ -2713,7 +2743,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- matches edge_rules_cors.allow_origins
 			   -- so the gateway reuses the matchOrigin
 			   -- matcher verbatim.
-			   cors_default_origins = case when $53 then $54::text[] else cors_default_origins end
+				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2795,6 +2825,13 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// touch" (don't run the SET clause) from "explicit
 		// NULL" (clear — back to A9 fallback).
 		p.SetOverflowNode, nullString(derefString(p.OverflowNode)),
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. The Set bit distinguishes "don't
+		// touch" (default) from "explicit false" (opt out); the
+		// companion trigger fires pg_notify ONLY on the flip
+		// (migration 00237) so the cmd-side listener sees one
+		// event per flip rather than one per app UPDATE.
+		p.SetMaintenanceMode, boolOrFalse(p.MaintenanceMode),
 		// ADR-091 CORS improvements D1: per-app default CORS
 		// opt-in + allowlist. Same Set*/optional-pointer
 		// pattern as overflow_node / streaming_enabled.
@@ -11351,7 +11388,13 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// EgressAllowlist handles the empty case). No helper
 		// normalisation needed.
 		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt,
-		&corsDefaultEnabled, &a.CORSDefaultOrigins); err != nil {
+		&corsDefaultEnabled, &a.CORSDefaultOrigins,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag (apps.maintenance_mode). NOT NULL
+		// DEFAULT false (migration 00237); plain bool scan is
+		// safe. Order is positional and must match
+		// appsSelectColumns above.
+		&a.MaintenanceMode); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
@@ -11470,11 +11513,16 @@ const appsSelectColumns = `
 	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
 	coalesce(preview_pr_state, ''), preview_expires_at,
 	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
-	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00223);
+	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00224);
 	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the
 	-- pgx scan sees a non-nil slice on legacy rows (the gateway treats
 	-- len==0 as "deny all" — same contract as EgressAllowlist).
-	cors_default_enabled, coalesce(cors_default_origins, '{}'::text[])`
+	cors_default_enabled, coalesce(cors_default_origins, '{}'::text[]),
+	-- ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+	-- maintenance flag. Boolean NOT NULL DEFAULT false
+	-- (migration 00237); plain bool scan is safe. Order is
+	-- positional and must match scanApp below.
+	maintenance_mode`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

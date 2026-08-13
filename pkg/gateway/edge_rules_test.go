@@ -648,10 +648,29 @@ func sampleLimitRule(id string, prio int, host string) EdgeRuleLimitResolved {
 	}
 }
 
-// putEntryAll is the PR 6 widening of putEntry: covers all 10
-// kinds after this PR's kind=geo extension. The validate
-// widening was PR-B; the limit widening was PR #855 (D24); the
-// geo widening is this PR (D21). Mirrors cmd-side loadHost's
+// sampleMaintenanceRule is the ADR-091 amendment / §4.1.2.13 sample
+// used by the cache + filter tests. Mirrors sampleLimitRule above;
+// kind=maintenance only carries RetryAfterSeconds + Message
+// (no body caps). The id is reused for AccountID + AppID to keep
+// the helper one-line.
+func sampleMaintenanceRule(id string, prio int, host string) EdgeRuleMaintenanceResolved {
+	return EdgeRuleMaintenanceResolved{
+		ID:                id,
+		AccountID:         "acc_" + id,
+		AppID:             "app_" + id,
+		Priority:          prio,
+		PathGlob:          "",
+		Methods:           nil,
+		RetryAfterSeconds: 60,
+		Message:           "Test maintenance: " + id,
+	}
+}
+
+// putEntryAll is the PR 6 widening of putEntry: covers all 11 kinds
+// after the kind=maintenance and kind=geo extensions (ADR-091 D21
+// amendment, §4.1.2.13). The validate widening was PR-B; the limit
+// widening was D24; the maintenance widening is PR-A; the geo
+// widening is PR-A's sibling cluster. Mirrors cmd-side loadHost's
 // single-pass compile pattern — the production loader always
 // populates every kind at once; this test helper does the same.
 //
@@ -669,20 +688,22 @@ func putEntryAll(c *EdgeRuleCache, host string,
 	ip []EdgeRuleIPResolved,
 	validate []EdgeRuleValidateResolved,
 	limit []EdgeRuleLimitResolved,
+	maintenance []EdgeRuleMaintenanceResolved,
 	geo []EdgeRuleGeoResolved,
 ) {
 	c.Put(host, &HostEntry{
-		Host:     host,
-		Route:    route,
-		Rewrite:  rewrite,
-		Redirect: redirect,
-		Headers:  headers,
-		CORS:     cors,
-		JWT:      jwt,
-		IP:       ip,
-		Validate: validate,
-		Limit:    limit,
-		Geo:      geo,
+		Host:        host,
+		Route:       route,
+		Rewrite:     rewrite,
+		Redirect:    redirect,
+		Headers:     headers,
+		CORS:        cors,
+		JWT:         jwt,
+		IP:          ip,
+		Validate:    validate,
+		Limit:       limit,
+		Maintenance: maintenance,
+		Geo:         geo,
 	})
 }
 
@@ -841,13 +862,13 @@ func TestPickFirstLimitMatch_MethodsFilter(t *testing.T) {
 // (nil, false) is the invariant that catches "Reset forgot kind X"
 // regressions before they ship.
 
-// TestEdgeRuleReset_WholesaleAcrossAllNineKinds is the deterministic
-// 10-row table that pins the wholesale-Reset invariant. The PR-C
+// TestEdgeRuleReset_WholesaleAcrossAllElevenKinds is the deterministic
+// 11-row table that pins the wholesale-Reset invariant. The PR-C
 // rename widened the original PR-6 SevenKinds test to cover the
-// kind=validate slice added by PR-B; this PR widens it once more
-// for kind=limit (ADR-091 D24) + kind=geo (ADR-091 D21). See plan
-// §D1 + D21 + D24.
-func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
+// kind=validate slice added by PR-B; PR #855 widened it again for
+// kind=limit (ADR-091 D24); PR-A widens it for kind=maintenance
+// (§4.1.2.13) and for kind=geo (D21). See plan §D1 + D21 + D24.
+func TestEdgeRuleReset_WholesaleAcrossAllElevenKinds(t *testing.T) {
 	c := NewEdgeRuleCache(EdgeRuleCacheCap)
 	host := "a.example.com"
 	putEntryAll(c, host,
@@ -860,6 +881,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
 		[]EdgeRuleIPResolved{sampleIPRule("ip", 0, host)},
 		[]EdgeRuleValidateResolved{sampleValidateRule("vd", 0, host)},
 		[]EdgeRuleLimitResolved{sampleLimitRule("lm", 0, host)},
+		[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", 0, host)},
 		[]EdgeRuleGeoResolved{sampleGeoRule("geo", 0, []string{"DE"}, nil, "")},
 	)
 
@@ -877,6 +899,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
 		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
 		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
+		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
 	}
 	for _, c0 := range preChecks {
@@ -900,6 +923,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
 		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
 		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
+		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
 	}
 	for _, c0 := range postChecks {
@@ -962,6 +986,7 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 						[]EdgeRuleIPResolved{sampleIPRule("ip", j, hostA)},
 						[]EdgeRuleValidateResolved{sampleValidateRule("vd", j, hostA)},
 						[]EdgeRuleLimitResolved{sampleLimitRule("lm", j, hostA)},
+						[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", j, hostA)},
 						[]EdgeRuleGeoResolved{sampleGeoRule("geo", j, []string{"DE"}, nil, "")},
 					)
 				case 1:
@@ -971,13 +996,14 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 					_, _ = c.GetIP(hostA)
 					_, _ = c.GetValidate(hostA)
 					_, _ = c.GetLimit(hostA)
+					_, _ = c.GetMaintenance(hostA)
 					_, _ = c.GetGeo(hostA)
 				case 2:
 					c.Reset()
 				case 3:
 					putEntryAll(c, hostB,
 						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
-						nil, nil, nil, nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					)
 				}
 			}
@@ -1035,6 +1061,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 					[]EdgeRuleIPResolved{sampleIPRule("ip", i, host)},
 					[]EdgeRuleValidateResolved{sampleValidateRule("vd", i, host)},
 					[]EdgeRuleLimitResolved{sampleLimitRule("lm", i, host)},
+					[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", i, host)},
 					[]EdgeRuleGeoResolved{sampleGeoRule("geo", i, []string{"DE"}, nil, "")},
 				)
 			case 1: // GetK (any kind)
@@ -1047,6 +1074,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 				_, _ = c.GetIP(host)
 				_, _ = c.GetValidate(host)
 				_, _ = c.GetLimit(host)
+				_, _ = c.GetMaintenance(host)
 				_, _ = c.GetGeo(host)
 			case 2: // Reset
 				c.Reset()
