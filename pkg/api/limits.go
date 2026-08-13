@@ -122,6 +122,27 @@ type Limits struct {
 	// the per-minute sum across all their apps.
 	RateLimitPerAccountRPM int
 
+	// Wake-side admission (schedd layer). Throttles the rate at which
+	// schedd will admit a *new* wake operation for an app or account.
+	// Distinct from RateLimitRPS/Burst which throttle inbound HTTP
+	// requests at the gateway edge — these cap the downstream
+	// consequence (one wake per cold-boot, one wake per warm fan-out,
+	// N wakes per cron tick). Consumed by
+	// pkg/sched.WakeRateLimiter (ADR-099 PR-0 / ADR-080 Risk #1).
+	//
+	// Units: per-minute refill, with `WakeBurstPerApp` as the bucket
+	// ceiling. The minute-scale (vs second-scale at the gateway) is
+	// deliberate: wake admissions are burstier than HTTP requests (a
+	// cron tick legitimately fires N wakes in the same second) and
+	// the per-minute budget still bounds a runaway dispatch fan-out.
+	//
+	// WakeBurstPerAccount caps the per-account sum so a customer
+	// fanning out across many apps in the same account cannot evade
+	// the per-app ceiling by keeping each app under its own cap. Same
+	// evasion shape as pkg/gateway.Limiter.AllowAccount.
+	WakeBurstPerApp      int
+	WakeBurstPerAccount  int
+
 	// Networking (spec §7).
 	EgressMbit int // per-instance egress bandwidth cap via tc
 
@@ -831,6 +852,13 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
+		// Wake-side admission throttle (ADR-099 PR-0). Free caps
+		// wake admissions at 1/min per app + 1/min per account — the
+		// abuse-floor tier should never burst-wake. The apid-side
+		// Free-plan gate is the primary block; this is the schedd
+		// backstop for the path that bypasses apid (cron, jobs).
+		WakeBurstPerApp:     1,
+		WakeBurstPerAccount: 1,
 		// Log deployment filter (issue #517 / PR-B): Free is the
 		// abuse-floor tier — the filter is a paid feature.
 		// Handler returns WritePlanDeploymentFilterNotAllowedError
@@ -1052,6 +1080,13 @@ var planLimits = map[Plan]Limits{
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
 		RateLimitPerAccountRPM: 200,
+		// Wake-side admission throttle (ADR-099 PR-0). Hobby
+		// permits a small wake burst — a cron tick on a Hobby
+		// customer's job can legitimately want 5 wakes/min across
+		// their apps. The per-account cap (10/min) is the ceiling
+		// for a fan-out across many apps in the same account.
+		WakeBurstPerApp:     5,
+		WakeBurstPerAccount: 10,
 		// Log deployment filter (issue #517 / PR-B): Hobby gets
 		// 1 — the typical Hobby customer runs one staging
 		// deployment alongside their prod slot, and the filter
@@ -1261,6 +1296,14 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
+		// Wake-side admission throttle (ADR-099 PR-0). Pro is the
+		// production tier — the per-app burst ceiling of 20/min is
+		// calibrated against a customer running a cron fleet
+		// (~1 cron tick per minute per app, plus a burst on
+		// deploy-driven cold starts). The per-account ceiling of
+		// 30/min bounds cross-app fan-out.
+		WakeBurstPerApp:     20,
+		WakeBurstPerAccount: 30,
 		// Log deployment filter (issue #517 / PR-B): Pro gets 10
 		// — covers the typical multi-staging fan-out (prod + 3-5
 		// staging branches + a few ephemeral preview slots) without
@@ -1467,6 +1510,14 @@ var planLimits = map[Plan]Limits{
 		// paid customer's bucket fills, which is the intended signal:
 		// coordinated abuse, not baseline load.
 		RateLimitPerAccountRPM: 5000,
+		// Wake-side admission throttle (ADR-099 PR-0). Scale is
+		// the upper tier — 100 wakes/min per app is enough to drain
+		// a 1000-task parallel job run in 10 min wall-clock, which
+		// matches ADR-099 §Acceptance. The per-account cap of
+		// 150/min allows a customer to fan out across several apps
+		// without exhausting the throttle.
+		WakeBurstPerApp:     100,
+		WakeBurstPerAccount: 150,
 		// Log deployment filter (issue #517 / PR-B): Scale gets 50
 		// — 5× Pro (10→50), tracks Scale's larger app budget
 		// (100 apps vs Pro's 25) and the multi-region staging fan-out

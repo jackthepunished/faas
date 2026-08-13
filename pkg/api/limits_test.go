@@ -59,6 +59,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
+			// ADR-099 PR-0: Free wake-admission throttle (1/1).
+			WakeBurstPerApp:     1,
+			WakeBurstPerAccount: 1,
 			// Issue #471 / ADR-047 (PR-A): Free is gated out of streaming
 			// entirely. The 25 MiB / 300 s caps are the legacy pre-#471
 			// defaults — kept here so a Free customer that PATCHes
@@ -166,6 +169,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
 			RateLimitPerAccountRPM: 200,
+			// ADR-099 PR-0: Hobby wake-admission throttle (5/10).
+			WakeBurstPerApp:     5,
+			WakeBurstPerAccount: 10,
 			// Issue #471 / ADR-047 (PR-A): Hobby unlocks streaming
 			// (100 MiB / 900 s) — the first paid tier. PR-A wires
 			// the flag + accessor; PR-B activates the Flusher path.
@@ -260,6 +266,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			WebhookPerApp: 10, WebhookPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
+			// ADR-099 PR-0: Pro wake-admission throttle (20/30).
+			WakeBurstPerApp:     20,
+			WakeBurstPerAccount: 30,
 			// Issue #471 / ADR-047 (PR-A): Pro keeps the same streaming
 			// envelope as Hobby. The cap is the same; the per-app
 			// streaming path is gatewayd-internal-edged, not per-tier.
@@ -362,6 +371,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
 			RateLimitPerAccountRPM: 5000,
+			// ADR-099 PR-0: Scale wake-admission throttle (100/150).
+			WakeBurstPerApp:     100,
+			WakeBurstPerAccount: 150,
 			// Issue #471 / ADR-047 (PR-A): Scale keeps the same envelope
 			// as Hobby/Pro. The streaming cap is uniform across paid
 			// tiers — the spec's paid-only unlock is the boolean, not

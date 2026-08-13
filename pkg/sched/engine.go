@@ -136,6 +136,15 @@ type Engine struct {
 	fcVer  string // running Firecracker version — snapshots load only on a match (ADR-005)
 	log    *slog.Logger
 	ops    *wire.OpsMetrics // nil is tolerated by KillStuck (skip the counter increment)
+
+	// wakeLimiter is the per-app + per-account admission-rate
+	// throttle (ADR-099 PR-0 / ADR-080 Risk #1). nil is a no-op —
+	// Allow* returns true — so unit tests that don't exercise the
+	// rate-limit branch can skip the wire-up. Production
+	// cmd/schedd wires NewWakeRateLimiter() so a runaway dispatch
+	// fan-out (cron storm, jobs burst) cannot OOM the control
+	// plane on cold-boot.
+	wakeLimiter *WakeRateLimiter
 	// verifier is the build-attestation verifier (ADR-038 / Tier 3
 	// phase 3). Wired via WithVerifier after NewEngine returns;
 	// nil means "skip verification" — kept for the unit tests
@@ -603,6 +612,24 @@ func (e *Engine) WithMigratingWatchdogIntervalSeconds(seconds int) *Engine {
 		panic(fmt.Sprintf("sched: WithMigratingWatchdogIntervalSeconds: seconds must be > 0, got %d", seconds))
 	}
 	e.migratingWatchdogIntervalSeconds = seconds
+	return e
+}
+
+// WithWakeRateLimiter wires the per-app + per-account wake-admission
+// rate-limit primitive (ADR-099 PR-0 / ADR-080 Risk #1). A nil value
+// is allowed — the rate-limit check then short-circuits to "allow",
+// preserving the pre-PR-0 behaviour for unit tests that don't exercise
+// the throttle. Production cmd/schedd wires NewWakeRateLimiter() so a
+// runaway dispatch fan-out (cron storm, jobs burst) cannot OOM the
+// control plane on cold-boot.
+//
+// Pass the same *WakeRateLimiter to WithRateLimiterForgetting on
+// account / app delete events so the buckets don't leak. (Not wired
+// in PR-0 — the apid-side Forget hook lands with the delete handlers
+// in PR-D; the in-memory bucket leak is bounded by the per-process
+// lifetime and surfaced via WakeRateLimiter.BucketCount() in /metrics.)
+func (e *Engine) WithWakeRateLimiter(l *WakeRateLimiter) *Engine {
+	e.wakeLimiter = l
 	return e
 }
 
@@ -1380,6 +1407,35 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		release()
 		e.IncAtCapacity(appID, "wake")
 		return WakeResult{AtCapacity: true}, nil
+	}
+
+	// PR-0 (ADR-099): wake-rate-limit consult. The throttle lives at
+	// the admission layer (here) rather than at the gateway edge
+	// (pkg/gateway.Limiter) because the wake path also fires from
+	// cron ticks and (post-PR-C) jobs dispatch — neither of which
+	// crosses gatewayd-internal. Without this gate, a Scale customer
+	// firing `--tasks 1000 --parallelism 100` on a parked app could
+	// trigger 100 cold-boots in a single 1 s tick and OOM the control
+	// plane (ADR-099 Risk #1; same primitive serves ADR-080 Risk #1).
+	//
+	// The check fires AFTER the worker-class short-circuit so a
+	// worker app's wake budget is not consumed by a request the
+	// engine would have rejected anyway, and BEFORE admitGate so a
+	// throttled wake neither burns the cooldown clock nor writes an
+	// unattached instance row. Branch shape: lifts to
+	// WakeResult{AtCapacity: true} so the gateway treats it as a
+	// no-op when it already has ≥1 cached target (the existing
+	// AdmitInstance typed-capacity path).
+	//
+	// Per-plan ceiling: api.Limits.WakeBurstPerApp / WakeBurstPerAccount
+	// (Free 1/1, Hobby 5/10, Pro 20/30, Scale 100/150 per minute).
+	// Fail-closed on unknown plan — mirrors pkg/gateway.Limiter.Allow.
+	if e.wakeLimiter != nil {
+		if !e.wakeLimiter.AllowWakeApp(appID, acct.Plan) || !e.wakeLimiter.AllowWakeAccount(string(acct.ID), acct.Plan) {
+			release()
+			e.IncAtCapacity(appID, "rate_limit")
+			return WakeResult{AtCapacity: true}, nil
+		}
 	}
 
 	// PR-C (issue #462): wake-gate consult. Three short-circuit
