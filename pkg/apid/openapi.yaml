@@ -7208,7 +7208,7 @@ components:
 
         # CORS improvements D1: per-app default CORS opt-in.
         # NULL on legacy rows (the customer's apps predated
-        # migration 00215). Non-null true means the gateway is
+        # migration 00221). Non-null true means the gateway is
         # stamping the default header set on miss; non-null
         # false means the customer explicitly opted out (the
         # column was flipped from the schema default).

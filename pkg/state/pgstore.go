@@ -11133,7 +11133,6 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var allowlistText string
 	var workloadClassStr string
 	var scalingPolicyBytes []byte
-	var corsDefaultEnabled bool // ADR-091 CORS defaults (D1) — hydrated into *bool below.
 	// Tier A10 / ADR-088: scratch sink for the overflow_node
 	// projection. coalesce(overflow_node::text, '') returns
 	// '' for the NULL-preference case, which we promote to
@@ -11340,7 +11339,7 @@ const appsSelectColumns = `
 	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
 	coalesce(preview_pr_state, ''), preview_expires_at,
 	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
-	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00215);
+	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00221);
 	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the
 	-- pgx scan sees a non-nil slice on legacy rows (the gateway treats
 	-- len==0 as "deny all" — same contract as EgressAllowlist).
