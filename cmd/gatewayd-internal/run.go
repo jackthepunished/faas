@@ -1054,6 +1054,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unchanged.
 	egressSink := egresssink.NewEgressSink()
 	handler.WithEgressSink(egressSink)
+	// Issue #676 / ADR-080 PR-C: the raw-stream forwarder writes
+	// raw-bytes Upgrade chunks into the same per-instance egress
+	// ring as the plain HTTP forwarder. They share the *EgressSink
+	// pointer so both paths land in the same usage_minutes.tx_bytes
+	// bucket — see cmd/gatewayd-internal/nodecache.go:WithEgressSink.
+	if deps.nodeCache != nil {
+		deps.nodeCache.WithEgressSink(egressSink)
+	}
 	egressGRPCSocket := egressGRPCSocketPath()
 	// Reject the silent-no-TLS path: a non-unix target without TLS
 	// would build an insecure server (ADR-052). deps.egressTLS is

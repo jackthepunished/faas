@@ -39,6 +39,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	evts "github.com/onebox-faas/faas/pkg/events"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -496,7 +497,7 @@ const rawStreamSessionDeadline = 24 * time.Hour
 //     records the disconnect.
 //
 // nil events opts out (legacy callers and the test corpus).
-func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform) {
+func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform, sink *egresssink.EgressSink) {
 	ctx, cancel := context.WithTimeout(r.Context(), rawStreamSessionDeadline)
 	defer cancel()
 
@@ -692,8 +693,17 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			// was already written above; the body is the
 			// last write before the receiver loop exits.
 			if init.Error != "" {
-				_, _ = w.Write([]byte(init.Error))
-				_, _ = io.WriteString(w, "\n")
+				errBody := []byte(init.Error + "\n")
+				if _, werr := w.Write(errBody); werr == nil && sink != nil {
+					// Init-error body is part of the
+					// per-instance egress ring too:
+					// the bridge wrote the synthetic
+					// 502 from inside the per-instance
+					// netns, so the bytes count toward
+					// the same usage_minutes.tx_bytes
+					// bucket the body_chunks do.
+					sink.RecordResponseBytes(t.InstanceID, int64(len(errBody)))
+				}
 				flushSafe(w)
 			}
 			continue
@@ -724,6 +734,17 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 					"node", t.NodeID, "err", werr.Error())
 				<-bodyErrCh
 				return
+			}
+			// Egress ring: every raw-stream byte the gateway
+			// forwards to the client counts toward this
+			// instance's usage_minutes.tx_bytes bucket.
+			// RecordResponseBytes is nil-safe on a nil
+			// receiver and on an empty InstanceID (skip),
+			// so the production path and the unit-test
+			// corpus both call it unconditionally and the
+			// guard lives at the sink boundary.
+			if sink != nil {
+				sink.RecordResponseBytes(t.InstanceID, int64(len(chunk)))
 			}
 			// Flush per Write so the H2C transport emits
 			// a DATA frame on every body_chunk. The
@@ -772,14 +793,22 @@ func flushSafe(w http.ResponseWriter) {
 // factory's output to invoke (per the isUpgradeRequest detector);
 // the factories share the same NodeClientLookup so the underlying
 // gRPC channel is reused regardless of which RPC is in flight.
-func ForwardingRawReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
-	return ForwardingRawReverseProxyWithEvents(nodes, log, nil)
+//
+// sink is the per-instance egress ring (see pkg/gateway/egresssink)
+// that the raw path's bytes flow into via
+// rawStreamOnceWithEvents's RecordResponseBytes hook — the legacy
+// setupStreamingWriter wrap at handler.go:2836-2838 is gated by
+// !isUpgradeRequest(r), so the raw path does not install that
+// onFlush hook itself. nil sink opts out (the test corpus and any
+// pre-egress-ring callers); RecordResponseBytes is nil-safe.
+func ForwardingRawReverseProxy(nodes NodeClientLookup, log *slog.Logger, sink *egresssink.EgressSink) func(t Target) http.Handler {
+	return ForwardingRawReverseProxyWithEvents(nodes, log, nil, sink)
 }
 
 // ForwardingRawReverseProxyWithEvents is the events-aware variant
 // of ForwardingRawReverseProxy (issue #676 / ADR-080). nil events
 // opts out (pre-PR-C fixtures and the unit-test corpus).
-func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform) func(t Target) http.Handler {
+func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform, sink *egresssink.EgressSink) func(t Target) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -792,7 +821,7 @@ func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logge
 				return
 			}
 			defer func() { _ = closer.Close() }()
-			rawStreamOnceWithEvents(w, r.WithContext(ctx), cli, log, t, events)
+			rawStreamOnceWithEvents(w, r.WithContext(ctx), cli, log, t, events, sink)
 		})
 	}
 }
