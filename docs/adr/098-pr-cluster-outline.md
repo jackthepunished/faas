@@ -7,8 +7,8 @@ slot chain ending in 214→218).
 
 | PR | Files touched | Behavior change | Review budget |
 |---|---|---|---|
-| **PR-0 docs** | `docs/adr/098-*.md`, `migrations/00221_reserve_slot.sql`, `docs/faas_implementation_spec.md` §9.A, `pkg/api/limits.go` + test | None. Spec + ADR + slot fence + quota table only. | ~10 min |
-| **PR-A schema** | `migrations/00221_data_upstreams.sql` (+ test, + probes partition), `pkg/state/{types,pgstore,memstore}.go`, `pkg/state/sqlc/queries/*`, `docs/storage.md` | None. Pure DDL; no code path reads the tables yet. | ~10 min |
+| **PR-0 docs** | `docs/adr/098-*.md`, `migrations/00226_reserve_slot.sql`, `docs/faas_implementation_spec.md` §9.A, `pkg/api/limits.go` + test | None. Spec + ADR + slot fence + quota table only. | ~10 min |
+| **PR-A schema** | `migrations/00226_data_upstreams.sql` (+ test, + probes partition), `pkg/state/{types,pgstore,memstore}.go`, `pkg/state/sqlc/queries/*`, `docs/storage.md` | None. Pure DDL; no code path reads the tables yet. | ~10 min |
 | **PR-B capture** | `pkg/data/{infer,extract}.go`, `cmd/apid/handlers_upstreams.go`, `cmd/apid/server.go`, `api/openapi.yaml`, `pkg/apid/openapi.yaml`, three SDKs | Captures hinted upstreams from env PUTs + explicit POST. Default OFF (`FAAS_DATA_PLACEMENT=0`). | ~15 min |
 | **PR-C probe** | `pkg/meter/upstream_probe.go`, `pkg/meter/loop.go`, `pkg/meter/health.go`, `pkg/wire/metrics.go`, `pkg/promqlrules/data_placement.yaml`, `cmd/meterd/{config,main}.go` | New 30s×5min sliding window probe. Default OFF (`FAAS_UPSTREAM_PROBE=0`). Metric surface added. | ~15 min |
 | **PR-D chooser** | `pkg/sched/upstream_affinity.go`, `pkg/sched/placement.go`, `pkg/sched/placement_test.go`, `pkg/sched/engine.go`, `cmd/schedd/main.go` | New `upstream_fit` tie-break in `betterCandidate`. Default OFF (`FAAS_UPSTREAM_AFFINITY=0`). Fails-open to legacy behaviour when no data. | ~20 min |
