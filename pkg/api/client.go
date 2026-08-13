@@ -2748,3 +2748,30 @@ func (c *Client) GetRekeyProgress(ctx context.Context) (RekeyProgress, error) {
 	var out RekeyProgress
 	return out, c.do(ctx, "GET", "/v1/admin/secrets/rekey-progress", nil, &out)
 }
+
+// Data upstreams (ADR-098 §9.A PR-B). The 4 endpoints back
+// `gregale upstreams list/get/create/delete`. The wire routes
+// are owned by cmd/apid/handlers_upstreams.go; the typed DTOs
+// live next to this method in pkg/api/upstreams.go (closed-vocab
+// DataUpstreamKind, RFC 952/1123 host regex, port range).
+//
+// §11 invariant: the DTO surface NEVER includes the plaintext
+// host — only host_redacted_hash (sha256(salt||host)) surfaces
+// to the caller. A custom POST that includes `host` is rejected
+// server-side; the SDK does not special-case that 400 — the
+// *Problem's Code field is `upstream_invalid_host`.
+func (c *Client) ListAppDataUpstreams(ctx context.Context, slug string) ([]DataUpstreamResponse, error) {
+	var out []DataUpstreamResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams", nil, &out)
+}
+func (c *Client) GetAppDataUpstream(ctx context.Context, slug, id string) (DataUpstreamResponse, error) {
+	var out DataUpstreamResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams/"+id, nil, &out)
+}
+func (c *Client) CreateAppDataUpstream(ctx context.Context, slug string, req PutDataUpstreamRequest) (DataUpstreamResponse, error) {
+	var out DataUpstreamResponse
+	return out, c.do(ctx, "PUT", "/v1/apps/"+slug+"/upstreams", req, &out)
+}
+func (c *Client) DeleteAppDataUpstream(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/upstreams/"+id, nil, nil)
+}

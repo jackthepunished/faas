@@ -2625,6 +2625,123 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Data upstreams (ADR-098 §9.A PR-B) ───────────────────────────────────
+
+  /v1/apps/{slug}/upstreams:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [upstreams]
+      operationId: listAppDataUpstreams
+      summary: List data upstreams on an app.
+      description: |
+        Returns every captured (host_redacted_hash, kind, port) tuple
+        on the app. The plaintext host NEVER appears in the response —
+        only the SHA-256 hash of (salt||host). See spec §11.
+
+        The list is bounded by the per-plan `api.DataPlacementHintsPerApp`
+        quota (Free=0, Hobby=3, Pro=10, Scale=50). When FAAS_DATA_PLACEMENT
+        is on the classifier derives entries on env mutation; when OFF
+        the table stays empty and the response is `[]`.
+      responses:
+        '200':
+          description: Captured upstreams on the app (plaintext never returned).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataUpstreamListResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [upstreams]
+      operationId: createAppDataUpstream
+      summary: Add a data upstream to an app.
+      description: |
+        Captures a (host, kind, port) tuple so the meterd probe loop
+        can dial it (PR-C) and schedd can bias wake placement by the
+        probed RTT (PR-D). Plaintext host is hashed via
+        `sha256(HostHashSalt||host)` before insert; the response
+        returns the hashed form only (§11 invariant).
+
+        **Plan limits.** Free plan returns 402
+        `plan_data_upstreams_not_allowed`. Hobby/Pro/Scale hit their
+        per-app cap (3/10/50) before the request body is parsed —
+        server returns 403 `plan_limit_data_upstreams` with the
+        observed count. Invalid inputs return 400
+        `upstream_invalid_{kind,host,port}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutDataUpstreamRequest'
+      responses:
+        '200':
+          description: The stored upstream envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataUpstreamResponse'
+        '400':
+          description: '400 — any of {upstream_invalid_kind, upstream_invalid_host, upstream_invalid_port}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: '402 — plan_data_upstreams_not_allowed (Free plan).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: '403 — plan_limit_data_upstreams (per-app cap exceeded).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/upstreams/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Upstream id (UUID).
+    get:
+      tags: [upstreams]
+      operationId: getAppDataUpstream
+      summary: Get one data upstream.
+      description: |
+        Returns the single upstream row by id. Plaintext host NEVER
+        appears in the response (§11 invariant).
+      responses:
+        '200':
+          description: The upstream envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataUpstreamResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [upstreams]
+      operationId: deleteAppDataUpstream
+      summary: Delete a data upstream.
+      description: |
+        Removes one row by id. Cascades into the probe set
+        (next probe tick no longer dials the host).
+      responses:
+        '204': { description: No body. The upstream was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '404 — upstream_not_found.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Deployments ──────────────────────────────────────────────────────────
 
   /v1/deployments:
@@ -10709,7 +10826,79 @@ components:
         quota_max: { type: integer }
         count: { type: integer }
 
-    # ─── Usage ────────────────────────────────────────────────────────────
+    # ─── Data upstreams (ADR-098 §9.A PR-B) ──────────────────────────────
+    # §11 invariant: the response shape NEVER carries the plaintext
+    # host. Only host_redacted_hash (sha256(salt||host)) is on the
+    # wire. Servers reject POST bodies that include `host` with
+    # 400 `upstream_invalid_host`.
+
+    PutDataUpstreamRequest:
+      type: object
+      required: [kind, host, port]
+      properties:
+        kind:
+          type: string
+          enum: [postgres, redis, mongo, cassandra, clickhouse, elasticsearch, opensearch, rabbitmq, kafka, nats, minio, memcached, etcd, s3, https_api]
+          description: "Closed vocabulary (ADR-098 §D1). Adding a new kind requires an ADR."
+        host:
+          type: string
+          description: "RFC 952/1123 hostname (no IPv4). Hashed server-side; the hashed form is what's persisted."
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        scope:
+          type: string
+          description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Omitted = default scope."
+
+    DataUpstreamResponse:
+      type: object
+      required: [id, source, kind, host_redacted_hash, port, created_at, last_seen_at]
+      properties:
+        id: { type: string, format: uuid }
+        source:
+          type: string
+          enum: [inferred, explicit]
+          description: "Whether the row was captured by the classifier (FAAS_DATA_PLACEMENT=1) or added via PUT (explicit)."
+        kind:
+          type: string
+          enum: [postgres, redis, mongo, cassandra, clickhouse, elasticsearch, opensearch, rabbitmq, kafka, nats, minio, memcached, etcd, s3, https_api]
+        host_redacted_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: "SHA-256 hex of (HostHashSalt||host). 64 lowercase hex chars, matching the schema CHECK constraint."
+        host_last4:
+          type: string
+          description: "First 8 hex chars of host_redacted_hash; safe for log/scrape correlation (8 chars = ~4B capacity)."
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        scope:
+          type: string
+          description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash)."
+        declared_region:
+          type: string
+          description: "Region hint (nullable). Empty on capture; populated by the operator or the classify-flow follow-up."
+        last_rtt_ms:
+          type: integer
+          description: "Most recent probe RTT (ms). Omitted when no probe yet."
+        last_probed_at:
+          type: string
+          format: date-time
+          description: "Timestamp of the most recent probe. Omitted when no probe yet."
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+
+    DataUpstreamListResponse:
+      type: object
+      required: [upstreams, quota_max, count]
+      properties:
+        upstreams:
+          type: array
+          items: { $ref: '#/components/schemas/DataUpstreamResponse' }
+        quota_max: { type: integer }
+        count: { type: integer }
     # Fields tagged with `x-since: "YYYY-MM"` (issue #NNN) were added after
     # the public launch. OpenAPI consumers (the Go SDK, the Node SDK) read
     # the extension and surface "this field was added in YYYY-MM" so
