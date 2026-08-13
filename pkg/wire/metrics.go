@@ -1764,8 +1764,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// consult in ReapAggressive (pkg/sched/reaper.go) skipped the
 	// entire app — the app is absent from the park slice and the
 	// caller never iterates over it. Idle branch (ReapIdle) emits
-	// no decision metrics today; adding a parallel emission there
-	// is a separate change.
+	// the same three of the four outcomes (cooldown_held, park,
+	// min_floor_already) since P1D; `keep` is intentionally omitted
+	// because ReapIdle has no traffic-signal consult (no
+	// desiredByApp).
 	scaleDownDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_down_decisions_total",
 		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already, cooldown_held}; app label is the apps.id.",
@@ -4279,11 +4281,12 @@ func (m *OpsMetrics) ObserveScaleUp(app, outcome string) {
 	m.scaleUpDecisions.WithLabelValues(app, outcome).Inc()
 }
 
-// ObserveScaleDown records one aggressive-reaper scale-down decision
-// (issue #171). One observation per app per 10 s reaper tick that ran
-// the new code path. outcome ∈ {park, keep}; "park" is emitted once
-// per app per tick even when multiple instances are parked. Safe on
-// a nil receiver so schedd unit tests without metrics keep working.
+// ObserveScaleDown records one reaper scale-down decision per app
+// per 10 s reaper tick that ran the new code path. outcome ∈
+// {park, keep, min_floor_already, cooldown_held}; emitted by both
+// ReapIdle (P1D) and ReapAggressive (P1C), one observation per
+// app per reaper branch per tick. Safe on a nil receiver so schedd
+// unit tests without metrics keep working.
 func (m *OpsMetrics) ObserveScaleDown(app, outcome string) {
 	if m == nil {
 		return

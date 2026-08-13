@@ -1207,8 +1207,15 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// enough to drive the cooldown consult on the next tick). The
 	// "stamp missed" direction is safe — the consult bypasses
 	// cooldown on a NIL stamp.
+	// cooldownHeldByApp (P1D): per-tick shared set for the
+	// cooldown_held metric emission. ReapIdle (run first) populates
+	// this with apps it skipped due to cooldown; ReapAggressive
+	// (run second) consults the set before its own emission so the
+	// same app in the same tick is counted once. See reaper.go for
+	// the load-bearing contract.
 	idleParkByApp := map[string]struct{}{}
-	for _, id := range ReapIdle(now, snapshot) {
+	cooldownHeldByApp := map[string]struct{}{}
+	for _, id := range ReapIdle(now, snapshot, l.ops, cooldownHeldByApp) {
 		if err := l.engine.Park(ctx, id); err != nil {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
 			continue
@@ -1276,7 +1283,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// tick from blocking the reaper for `cap × ~150 ms` during a
 	// sudden-scale-down storm.
 	if l.recentLoad != nil && l.reaperAggressive {
-		l.runReaperAggressive(ctx, apps, snapshot, instanceToApp, now)
+		l.runReaperAggressive(ctx, apps, snapshot, instanceToApp, cooldownHeldByApp, now)
 	}
 
 	for _, id := range SelectEvictions(resident, now, snapshot) {
@@ -1327,7 +1334,7 @@ func resolvePriority(snapshot []InstanceInfo, instanceID string) (string, bool) 
 // observation per app per tick. Carved out of runReaper so the
 // behaviour is unit-testable without a clock / DB round-trip on
 // the full reaper body.
-func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, instanceToApp map[string]string, now time.Time) {
+func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, instanceToApp map[string]string, cooldownHeldByApp map[string]struct{}, now time.Time) {
 	// PR-C review fix: instanceToApp is built once in runReaper
 	// (O(N)) and threaded through here. Previously this function
 	// built its own copy — cheap but a second O(N) walk on every
@@ -1372,7 +1379,7 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 	// app_id so the per-tick cap applies per-app, not globally.
 	parkByApp := map[string][]string{}
 	if len(desiredByApp) > 0 {
-		for _, id := range ReapAggressive(now, snapshot, desiredByApp, l.ops) {
+		for _, id := range ReapAggressive(now, snapshot, desiredByApp, l.ops, cooldownHeldByApp) {
 			appID := instanceToApp[id]
 			if appID == "" {
 				continue
