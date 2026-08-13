@@ -16,6 +16,8 @@ import (
 	"errors"
 	"net/http"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 )
 
 // ControlAddr is the bind address for the control-plane listener. Kept on
@@ -33,13 +35,31 @@ const ControlAddr = ":9090"
 // so the LB never routes traffic to a partial-boot instance. The pre-split
 // always-200 default was a latent bug (cmd/gatewayd-internal/main.go:878 wired nil
 // and /readyz was useless); ADR-070 closes that.
-func ControlMux(m *Metrics, ready ReadyFunc) *http.ServeMux {
+//
+// tracker (issue #587 / PR-A) is the per-request drain WaitGroup
+// the graceful-shutdown drain waits on. nil = drain disabled
+// (unit tests + pre-PR-A behaviour). When non-nil, every control
+// request (including /metrics scrapes during shutdown) is tracked
+// so a hung scraper can't block the drain. The control endpoints
+// are tiny but the same property holds: a curl during shutdown
+// that hangs the connection open past srv.Shutdown's grace must
+// not keep the daemon alive past TimeoutStopSec=30s.
+func ControlMux(m *Metrics, ready ReadyFunc, tracker *drain.Tracker) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	wrap := func(label string, h http.HandlerFunc) http.HandlerFunc {
+		if tracker == nil {
+			return h
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			defer tracker.Begin(label)()
+			h(w, r)
+		}
+	}
+	mux.HandleFunc("/healthz", wrap("control", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+	}))
+	mux.HandleFunc("/readyz", wrap("control", func(w http.ResponseWriter, _ *http.Request) {
 		if ready == nil {
 			// A nil probe is a wiring bug post-#568. Mark not-ready so
 			// the LB drain kicks in; the operator sees /readyz=503 and
@@ -56,9 +76,9 @@ func ControlMux(m *Metrics, ready ReadyFunc) *http.ServeMux {
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("not-ready"))
-	})
+	}))
 	if m != nil {
-		mux.Handle("/metrics", m.Handler())
+		mux.Handle("/metrics", wrap("control", m.Handler().ServeHTTP))
 	}
 	return mux
 }

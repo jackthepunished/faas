@@ -63,6 +63,10 @@ export type AppMetricsResponse = {
    */
   egress_bytes?: number;
   /**
+   * Per-app egress byte delta over the window, gateway-side mirror (informational; not billed). ADR-046 PR-2 / issue #415 PR-2. Source: gateway_egress_tx_bytes_total{app} (Prom rollup; the gatewayd-internal-local per-instance egress ring populates the counter on each raw-stream chunk). Distinct from `egress_bytes` (the schedd-side mirror) so a divergence between the two surfaces immediately on the dashboard. Best-effort: query failure does NOT flip the response to degraded — matches the `egress_bytes` semantics.
+   */
+  tx_bytes?: number;
+  /**
    * Per-route breakdown for opt-in apps (ADR-093). Absent when
    * `route_metrics_enabled` is false on the app — the dashboard
    * distinguishes "feature off" (field absent) from "feature

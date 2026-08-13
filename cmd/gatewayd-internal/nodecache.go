@@ -46,6 +46,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/overlay"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -116,6 +117,25 @@ type nodeCache struct {
 	// streaming wrap contribute to the same per-instance
 	// usage_minutes.tx_bytes bucket.
 	egressSink *egresssink.EgressSink
+	// drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker shared with the Handler / InternalReverseProxy /
+	// TraceHandler. The raw-stream pump holds a Begin slot for the
+	// lifetime of the hijacked conn so the graceful-shutdown drain
+	// waits for in-flight raw pumps instead of force-closing the
+	// conn on TimeoutStopSec=30s. nil = drain disabled (tests +
+	// pre-PR-A behaviour).
+	drain *drain.Tracker
+}
+
+// WithDrainTracker (issue #587 / PR-A) installs the per-request
+// drain tracker the raw-stream factory captures in its closure.
+// nil clears the tracker (returns the receiver for fluent
+// chaining). Wired from cmd/gatewayd-internal/main.go alongside
+// the Handler.WithInFlightTracker call so production has ONE
+// tracker per daemon shared by every ServeHTTP surface.
+func (n *nodeCache) WithDrainTracker(tracker *drain.Tracker) *nodeCache {
+	n.drain = tracker
+	return n
 }
 
 // WithEvents (issue #517 / PR-C / ADR-064) installs the events
@@ -212,7 +232,7 @@ func (n *nodeCache) Forwarding() func(gateway.Target) http.Handler {
 // handler's three-input gate routes Connection: Upgrade requests
 // here BEFORE falling through to Forwarding.
 func (n *nodeCache) RawForwarding() func(gateway.Target) http.Handler {
-	return gateway.ForwardingRawReverseProxyWithEvents(n.cache, n.log, n.events, n.egressSink)
+	return gateway.ForwardingRawReverseProxyWithEventsAndDrain(n.cache, n.log, n.events, n.egressSink, n.drain)
 }
 
 // Close shuts down every cached *grpc.ClientConn. Called once at

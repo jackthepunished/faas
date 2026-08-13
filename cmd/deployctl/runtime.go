@@ -26,6 +26,14 @@ type hostRuntime struct {
 	databaseURL  string
 	serviceOrder []string
 	readyTimeout time.Duration
+	// waitReady is the readiness probe used by Restart(); defaults
+	// to (r).waitReady. PR-B introduced the override seam so the
+	// restart-order unit test can stub the probe to nil-true instead
+	// of standing up fake sockets / open TCP ports for each daemon
+	// (8 services, ~3 probes each = 24 attempts on dev-box ports
+	// that are already in use by unrelated processes — flaky).
+	// Production sets it to nil (=> default) at construction.
+	waitReadyOverride func(ctx context.Context, service string) error
 }
 
 func (r hostRuntime) Preflight(_ context.Context, manifest releasebundle.Manifest, releaseRoot string) error {
@@ -277,6 +285,9 @@ func (r hostRuntime) Healthy(ctx context.Context, _ releasebundle.Manifest) erro
 }
 
 func (r hostRuntime) waitReady(ctx context.Context, service string) error {
+	if r.waitReadyOverride != nil {
+		return r.waitReadyOverride(ctx, service)
+	}
 	for _, entry := range daemonunitspec.Registry {
 		if entry.Name != service {
 			continue
@@ -367,7 +378,23 @@ func sleepReady(ctx context.Context) error {
 	}
 }
 
-func runCommand(ctx context.Context, name string, args ...string) error {
+// runCommand is a package-level variable so tests can stub out
+// systemctl invocations without booting a real systemd. Production
+// callers see the exec-based default; tests substitute a recorder
+// that captures the argv sequence Restart() iterates over so the
+// test can assert RestartOrder() actually drives the iteration in
+// the documented dependency order.
+//
+// PR-B made the override path necessary: previously ActivationOrder()
+// walked Registry slice order (a flat pass), and there was no
+// assertion that the loop emits daemons in the right sequence;
+// instead of trying to guess where restart_test.go would live, we
+// added the seam and the test together.
+//
+// Replacing via a package var (not a struct field) preserves the
+// call-site readability at runtime.go:Restart — the body still
+// reads `runCommand(ctx, ...)` with no `r.` prefix.
+var runCommand = func(ctx context.Context, name string, args ...string) error {
 	command := exec.CommandContext(ctx, name, args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -409,10 +436,32 @@ func installAtomic(source, destination string, mode fs.FileMode) error {
 }
 
 func defaultHostRuntime() hostRuntime {
+	// Issue #578 / PR-B: the restart loop walks `RestartOrder()` — the
+	// Registry sorted topologically by Lifecycle.After declarations —
+	// rather than Registry slice order. The slice order in registry.go
+	// is human-readable (vmmd first, imaged last) but operationally
+	// wrong: a daemon with an After declaration may sit at a higher
+	// index than a daemon it depends on, so a plain slice iteration
+	// would restart the dependent before its dependency is up.
+	//
+	// The two error paths here are typed (ErrUnknownDependency / ErrCycle)
+	// so callers can distinguish a registry-editor mistake from a
+	// transient sort failure. Today the Registry is hand-curated and
+	// can't produce either, so the err return surfaces as a fatal
+	// startup error rather than a silent skip.
+	order, err := daemonunitspec.RestartOrder()
+	if err != nil {
+		// This is a program-startup error: the binary was built against
+		// a Registry that is inconsistent. Fall back to ActivationOrder
+		// so the deployctl invocation still does something useful, but
+		// log the error so the operator sees it on stderr.
+		fmt.Fprintf(os.Stderr, "deployctl: RestartOrder failed (%v); falling back to ActivationOrder\n", err)
+		order = daemonunitspec.ActivationOrder()
+	}
 	return hostRuntime{
 		unitDir:      "/etc/systemd/system",
 		databaseURL:  "postgres:///faas?host=/run/postgresql&user=faas",
-		serviceOrder: daemonunitspec.ActivationOrder(),
+		serviceOrder: order,
 		readyTimeout: 60 * time.Second,
 	}
 }

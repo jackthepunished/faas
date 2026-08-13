@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 )
 
 // TraceHandlerConfig is the dependency bundle for the trace handler.
@@ -21,6 +23,10 @@ type TraceHandlerConfig struct {
 	// header. Empty string disables the endpoint (returns 404 —
 	// indistinguishable from the public surface).
 	ObserverToken string
+	// Drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker shared with Handler + InternalReverseProxy +
+	// the control mux. nil = drain disabled (unit tests).
+	Drain *drain.Tracker
 }
 
 // TraceHandler is the http.Handler for GET /v1/traces/{trace_id}.
@@ -48,6 +54,29 @@ func NewTraceHandler(cfg TraceHandlerConfig) *TraceHandler {
 // Response: 200 + JSON trace tree, 401 on auth failure, 404 on
 // missing trace, 405 on non-GET, 500 on internal errors.
 func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Drain tracker (issue #587 / PR-A): the trace handler is
+	// the smallest ServeHTTP surface in the gateway but it still
+	// counts as in-flight from the daemon's perspective.
+	//
+	// Correct shape is `defer tracker.Begin("http")()`:
+	// Begin runs IMMEDIATELY at the defer statement and the
+	// Done closure is what gets deferred.
+	//
+	// The WRONG shape `defer func(){ tracker.Begin(...)() }()`
+	// wraps both calls in a single closure body that fires at
+	// function return — so Begin+Done happen microseconds apart
+	// and the tracker never observes a held slot. Fixing that
+	// regression here as part of PR-A's drain wire.
+	//
+	// Begin is NOT nil-safe (it's a method on *Tracker); guard
+	// explicitly when the drain is absent so the e2e harness
+	// and unit tests still work.
+	done := func() {}
+	if h.cfg.Drain != nil {
+		done = h.cfg.Drain.Begin("http")
+	}
+	defer done()
+
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
 		writeProblem(w, http.StatusMethodNotAllowed, "method not allowed")

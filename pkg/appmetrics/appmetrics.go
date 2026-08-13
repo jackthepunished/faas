@@ -200,6 +200,35 @@ func Fetch(ctx context.Context, fetcher PromQL, log *slog.Logger, appID, rng str
 		log.Warn("appmetrics: egress_bytes query failed", "app_id", appID, "err", err)
 	}
 
+	// 8b. ADR-046 PR-2 / issue #415 PR-2: gateway-side
+	// tx_bytes mirror. Source:
+	//
+	//   gateway_egress_tx_bytes_total{app}
+	//
+	// The byte counter is emitted by pkg/gateway/egressgrpc
+	// /server.go per-drain on every Sink.Record call; the
+	// cmd/gatewayd-internal/egress_grpc.go consumer reads
+	// the stream and the per-instance
+	// pkg/gateway/egresssink.EgressSink populates the
+	// counter on each raw-stream chunk. Mirrors EgressBytes
+	// (the schedd-side mirror); the two are queried in
+	// parallel so a divergence surfaces to the dashboard
+	// immediately.
+	//
+	// Best-effort: same as the schedd-side query. A failure
+	// here does NOT flip the response to "degraded" — the
+	// rest of the panel is still useful, and the missing
+	// tx_bytes field is the correct UX (matches how the
+	// CPU/RSS/memory deltas degrade when their respective
+	// Prom sources are down).
+	txBytesQ := fmt.Sprintf(
+		`sum(increase(gateway_egress_tx_bytes_total{app=%q}[%s]))`, appID, rng)
+	if v, err := fetcher.QueryScalar(ctx, txBytesQ); err == nil {
+		resp.TxBytes = int64(SafeRoundNonNeg(v))
+	} else {
+		log.Warn("appmetrics: tx_bytes query failed", "app_id", appID, "err", err)
+	}
+
 	return resp, SourcePrometheus
 }
 

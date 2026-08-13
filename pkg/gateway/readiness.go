@@ -112,6 +112,29 @@ func (p *ReadyzProbe) Register() *ReadySignal {
 	return s
 }
 
+// RegisterSignal adds a pre-constructed *ReadySignal to the probe.
+// This is the helper-constructor counterpart to Register: helper
+// constructors (NewPGPingSignal, NewStalenessSignal) build a signal
+// internally and return it for the caller to drive via Stopper /
+// Touch. Register() would build a second placeholder signal;
+// RegisterSignal folds the existing one into the probe without
+// allocating a duplicate.
+//
+// Used by PR-B1 (gatewayd-internal /readyz tighten) where the
+// production wiring mixes Register (manual schedd-router / nodeCache
+// signals) with RegisterSignal (PG ping + warm-hint staleness, both
+// helper-constructed). The order in All() is the order of the
+// Register / RegisterSignal calls, which is preserved for the
+// /readyz reason concat.
+func (p *ReadyzProbe) RegisterSignal(s *ReadySignal) {
+	if s == nil {
+		return
+	}
+	p.mu.Lock()
+	p.signals = append(p.signals, s)
+	p.mu.Unlock()
+}
+
 // All returns true iff every registered signal is ready. The
 // ready reason returned is the OR of all "not ready" reasons —
 // the operator can see at a glance which component is not yet

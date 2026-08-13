@@ -49,6 +49,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/gateway/writegate"
@@ -257,6 +258,14 @@ type runDeps struct {
 	listen  func(network, addr string) (net.Listener, error)
 	newSrv  func(addr string, handler http.Handler) *http.Server
 	backend gateway.Backend
+	// drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker the graceful-shutdown path waits on. ONE
+	// tracker per daemon, shared by Handler + InternalReverseProxy +
+	// TraceHandler + control mux + raw-stream forwarder so every
+	// ServeHTTP surface contributes to the same in-flight count.
+	// Set in runWithDeps after construction; nil in unit tests
+	// that don't exercise the shutdown path.
+	drain *drain.Tracker
 	// streamingEnabled (issue #471 / ADR-047) is the per-process
 	// opt-in for the streaming response path. Production passes
 	// envOr(TOML) || env("FAAS_GATEWAY_STREAMING"); tests leave it
@@ -802,6 +811,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
+	// Issue #587 / PR-A: the raw-stream forwarder needs the drain
+	// tracker so the hijacked Upgrade pump is held in the in-flight
+	// count. Wired BEFORE the handler sets up WithRawForwarding
+	// below so the factory closure captures the tracker.
+	// nodeCache.WithDrainTracker is a no-op when deps.drain is
+	// nil; see cmd/gatewayd-internal/nodecache.go for the seam.
 	deps.pgStore = pgStore
 	// Tier A9 / ADR-084 (PR-B sub-task B7): expose the
 	// daemon-wide *wire.OpsMetrics to runWithDeps so the
@@ -1014,7 +1029,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// (Phase 3 review policy). nil in tests (the e2e harness
 	// doesn't drive the stream; the picker falls through to
 	// per-node healthyCount as it always did).
-	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log)
+	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log, nil)
 	go deps.warmHints.Run(ctx)
 	return runWithDeps(ctx, log, deps)
 }
@@ -1052,6 +1067,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// and proxies to the unix socket bound in cmd/gatewayd-internal/.
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
+	// Issue #587 / PR-A: construct the per-request drain tracker
+	// the graceful-shutdown path waits on. ONE tracker per daemon
+	// shared with the nodeCache raw forwarder + the control mux.
+	// See pkg/gateway/drain for the WaitGroup/atomic contract.
+	deps.drain = drain.NewTracker()
+	handler.WithInFlightTracker(deps.drain)
 	handler.SetWakeGateHook()
 	// Issue #471 / ADR-047: per-process streaming opt-in. The Handler
 	// buffers every response unless the flag is on; when off, a
@@ -1199,6 +1220,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// bucket — see cmd/gatewayd-internal/nodecache.go:WithEgressSink.
 	if deps.nodeCache != nil {
 		deps.nodeCache.WithEgressSink(egressSink)
+		// Issue #587 / PR-A: raw-stream Upgrade pump drain tracking.
+		// Captured by the ForwardingRawReverseProxyWithEventsAndDrain
+		// closure in nodeCache.RawForwarding() — every hijacked
+		// raw-stream conn holds a Begin("upgrade") slot for its
+		// pump's lifetime, so the graceful-shutdown drain sees it
+		// in-flight instead of force-closing on TimeoutStopSec=30s.
+		deps.nodeCache.WithDrainTracker(deps.drain)
 	}
 	egressGRPCSocket := egressGRPCSocketPath()
 	// Reject the silent-no-TLS path: a non-unix target without TLS
@@ -1562,14 +1590,73 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// that intentionally skips one". The split daemons (tasks #17,
 	// #18) wire the full ReadyzProbe from pkg/gateway/readiness.go
 	// with hydration tracking, schedd-router readiness, and PG ping.
-	// Here we wire the legacy one — "deps.pgStore != nil" — which is
-	// the strongest signal the pre-split daemon can honestly assert
-	// (the route cache is lazy-fill; the only "I cannot serve" state
-	// the legacy code has is "PG connection missing").
-	legacyReady := gateway.ReadyFunc(func() bool {
-		return deps.pgStore != nil
-	})
-	controlMux := gateway.ControlMux(handler.Metrics(), legacyReady)
+	//
+	// PR-B1 (issue #250 tier-1 ship-blocker): the gatewayd-internal
+	// split daemon flips from legacyReady (only "pgStore != nil") to
+	// the full ReadyzProbe. The tighter contract surfaces a partial-
+	// boot daemon to the LB drain instead of letting it accept traffic
+	// with a half-hydrated cache.
+	//
+	// Wiring strategy: each component-driven signal is constructed
+	// via the appropriate helper (PG ping, staleness) or Register()
+	// (manual), and is either Set(true, "") immediately (its
+	// component is non-nil → already wired above) or left Set(false)
+	// (nil → a test/dev path that intentionally skips the component).
+	// Production paths with deps.pool != nil, deps.scheddRouter != nil,
+	// deps.warmHints != nil, deps.nodeCache != nil flip true here.
+	readyProbe := &gateway.ReadyzProbe{}
+	// PG ping — only constructed if a pool is wired. The helper
+	// goroutine pings every 5s and flips true on success; it also
+	// kicks one ping immediately so the bit flips to ready as fast
+	// as Postgres can answer. The 5s cadence matches
+	// api.ReplicaHeartbeatIntervalSeconds so a /readyz scrape
+	// observes a coherent "all-replicas-healthy" surface.
+	if deps.pool != nil {
+		pgSig, _ := gateway.NewPGPingSignal(ctx, deps.pool, 5*time.Second)
+		readyProbe.RegisterSignal(pgSig)
+	}
+	// Schedd-router readiness: a manual signal flipped true the
+	// moment WatchNodeChanges has been started (called at runDeps
+	// init time around deps.scheddRouter construction above).
+	if deps.scheddRouter != nil {
+		s := readyProbe.Register()
+		s.Set(true, "")
+	}
+	// Per-node schedd dial cache (nodeCache) readiness: a manual
+	// signal flipped true after nodeCache construction above. The
+	// first dial lazy-fills; today the first dial happens on the
+	// first /v1/apps/{slug} request, so this signal is "we've
+	// constructed the cache and at least the first ClientFor can
+	// proceed" — not "we've already dialed". The lazy semantic is
+	// load-bearing for cold-boot latency; a stricter "cache primed"
+	// signal would force a synchronous Dial on every boot, which is
+	// what the legacy daemon deliberately avoided.
+	if deps.nodeCache != nil {
+		s := readyProbe.Register()
+		s.Set(true, "")
+	}
+	// Warm-hint subscriber freshness: a staleness signal Touched by
+	// warmHints on each delivery. 2-minute staleness catches "the
+	// daemon thinks it's subscribed but actually the goroutine
+	// exited" rather than "the stream is momentarily idle" (the
+	// schedd stream cadence under steady-state is sub-second).
+	// Skipped when deps.warmHints is nil so a test that doesn't
+	// construct the consumer doesn't fail /readyz permanently.
+	//
+	// FIX-4 (PR #880 code review): the touch callback returned
+	// by NewStalenessSignal MUST be wired back to the consumer,
+	// otherwise the helper goroutine observes lastTouch == 0 on
+	// every tick and flips the signal false with reason "no
+	// touch yet" — /readyz would be 503 forever and the LB
+	// would never route traffic to this daemon. SetOnTouch
+	// invokes touch() once immediately so the signal's first
+	// goroutine tick already sees touched > 0.
+	if deps.warmHints != nil {
+		signal, touch, _ := gateway.NewStalenessSignal(2 * time.Minute)
+		readyProbe.RegisterSignal(signal)
+		deps.warmHints.SetOnTouch(touch)
+	}
+	controlMux := gateway.ControlMux(handler.Metrics(), readyProbe.ReadyFunc(), deps.drain)
 	// Finding 6 (issue #314): mount the dashboard quota endpoint on the
 	// control mux so an in-box caller (operator's curl today, future
 	// apid-side dial) can read per-app bucket state without going through
@@ -1748,7 +1835,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), drain.DrainGrace)
 		defer cancel()
 		//nolint:contextcheck // shutdown ctx must outlive the cancelled caller ctx (net/http contract).
 		// Best-effort shutdown of every listener we may have started.
@@ -1773,6 +1860,58 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// listener is already draining so no new requests
 			// land.
 			_ = deps.nodeCache.Close()
+		}
+		// Issue #587 / PR-A: wait for the per-request drain
+		// tracker to flush before exiting. shutdownCtx has
+		// already been wired to drain.DrainGrace (25s) — that
+		// sits inside systemd's TimeoutStopSec=30s with 5s
+		// headroom. The drain sets its own internal `draining`
+		// flag so any post-Shutdown stragglers become no-op
+		// Begin closures (pkg/gateway/drain.Drain doc).
+		//
+		// Exit-code discipline (systemd Restart=on-failure
+		// contract, pkg/deploycontroller/controller.go:43-115):
+		//   clean drain → return nil (no restart)
+		//   deadline_exceeded / ctx_cancelled → return ctx.Err()
+		//     so systemd restarts the daemon
+		// Pre-PR-A this branch returned nil unconditionally,
+		// which hid ctx-cancellation bugs from operators. The
+		// PR-A fix surfaces them so a hung drain doesn't quietly
+		// recycle on the next deploy.
+		if deps.drain != nil {
+			drainStart := time.Now()
+			//nolint:contextcheck // shutdownCtx is intentionally
+			// derived from context.Background() (line 1834)
+			// because it must outlive the cancelled caller
+			// ctx — the deadline budget for the drain comes
+			// from drain.DrainGrace, not from the caller's
+			// already-cancelled ctx. The Drain contract is to
+			// honour shutdownCtx's deadline + cancellation;
+			// the `deadline` param on Drain is the
+			// upper-bound knob.
+			outcome, drainErr := deps.drain.Drain(shutdownCtx, drain.DrainGrace)
+			drainElapsed := time.Since(drainStart).Seconds()
+			// Issue #587 / PR-A: record the drain histogram on
+			// every shutdown so an operator can spot a
+			// pattern of forced exits from the dashboard
+			// without re-reading the daemon log. Recorded
+			// against deps.metrics (gateway.Metrics) so the
+			// existing /metrics scrape picks it up alongside
+			// the rest of the gateway_* series.
+			deps.metrics.ObserveDrainWait("gatewayd-internal", string(outcome), drainElapsed)
+			if drainErr != nil {
+				log.Warn("gatewayd-internal drain exited non-clean",
+					"outcome", string(outcome),
+					"max_inflight", deps.drain.MaxInflight(),
+					"err", drainErr)
+				return drainErr
+			}
+			if outcome != drain.OutcomeClean {
+				log.Warn("gatewayd-internal drain exited non-clean",
+					"outcome", string(outcome),
+					"max_inflight", deps.drain.MaxInflight())
+				return ctx.Err()
+			}
 		}
 		return nil
 	}

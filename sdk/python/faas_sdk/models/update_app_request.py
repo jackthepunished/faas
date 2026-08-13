@@ -56,7 +56,7 @@ class UpdateAppRequest:
     maintenance_mode: bool | None | Unset = UNSET
     """Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → no change. PATCH true pins the app for
     maintenance (every request 503 + Retry-After); PATCH false restores normal handling. Free-tier allowed; no plan
-    gate. The apps_maintenance_mode_notify trigger (migration 00235) fires pg_notify on flip."""
+    gate. The apps_maintenance_mode_notify trigger (migration 00237) fires pg_notify on flip."""
     scaling_policy: None | ScalingPolicy | Unset = UNSET
     """Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column."""
     require_signed: bool | None | Unset = UNSET
