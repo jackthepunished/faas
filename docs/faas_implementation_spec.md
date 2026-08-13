@@ -776,11 +776,11 @@ Concurrency and RAM interaction (the R1 discipline, mechanized): builder VMs are
 
 ---
 
-## 9.A. Connection-aware execution (ADR-095)
+## 9.A. Connection-aware execution (ADR-098)
 
 The platform is **stateless by contract** (§17 / ADR-046 / `docs/storage.md`). Customers bring their own datastore / cache / object store / APIs. §9.A makes the placement chooser aware of where those upstreams are so a wake lands as close as the control-plane fleet can get to where the data lives. Architecturally adjacent to §9 (deploy lifecycle) because both surface is the same `apid` write-path, but kept as a sibling section rather than a sub-subsection — the chooser changes (`pkg/sched/placement.go`) and a new probe loop (`pkg/meter/upstream_probe.go`) are not deploy-pipeline concerns.
 
-The implementation is split across a 5-PR cluster documented in `docs/adr/095-pr-cluster-outline.md`. The summary here is the contract every PR conforms to:
+The implementation is split across a 5-PR cluster documented in `docs/adr/098-pr-cluster-outline.md`. The summary here is the contract every PR conforms to:
 
 - **Capture:** `apid` infers upstreams from env values on `PUT /v1/apps/{slug}/env/*` and `POST /v1/apps/{slug}/secrets`, matching keys against a fixed regex set: `(DATABASE|REDIS|MONGO|CLICKHOUSE|CASSANDRA|ELASTIC|OPENSEARCH|RABBITMQ|KAFKA|NATS|MEMCACHED|ETCD)_(URL|ENDPOINT|URI|DSN)`, `S3_(BUCKET|ENDPOINT|REGION)`, and `*_API_URL`. Host extract via `net/url.Parse`. Region inferred from a static provider→region table in `pkg/data/infer.go`. The DSN value never leaves the handler (§11 secret rule); only the host + port + inferred region are written. Plan-gated: Free apps never get inferred rows (`Limits.DataPlacementHintsPerApp` = 0 for Free); Hobby 3, Pro 10, Scale 50.
 - **Probe:** `meterd` adds a seventh polling loop alongside its existing six timers (`pkg/meter/loop.go`). TCP-connect + TLS-handshake timing per `(host, region)` pair at 30 s × 5 min sliding window. Bounded worker pool (`Limits.UpstreamProbeMaxConcurrent = 64` global). Prom metric `data_upstream_rtt_ms{kind, host, region}` (median) + `data_upstream_probes_total{outcome}` (counter). Per-region SLO: p95 < 50 ms (info), alert at > 200 ms. Documented in §12 telemetry table.

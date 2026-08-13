@@ -1,7 +1,14 @@
-# ADR-095 — Connection-aware execution (data-aware placement)
+# ADR-098 — Connection-aware execution (data-aware placement)
 
 - **Status:** proposed
 - **Date:** 2026-08-12
+- **Renumbered:** originally drafted as ADR-095. Renumbered 095 → 098
+  on 2026-08-13 after PR #851 (PR-preview environments, MERGED
+  2026-08-11) claimed 095 on main and PR #854 (wake single-flight,
+  OPEN) also claimed 095. Mirrors the renumber dance ADR-097 used to
+  dodge ADR-093 + ADR-096. The internal ADR doc filename + spec
+  section anchor (`§9.A`) + PR-cluster-outline file all carry 098;
+  the original 095 references live only in this renumber note.
 - **Closes:** the §9 Connection-aware execution gap surfaced by the
   2026-08-12 customer-trust review. The platform is **stateless by
   contract** (CLAUDE.md, ADR-046, `docs/storage.md`); customers bring
@@ -153,7 +160,7 @@ alert at `>200`. Documented in `docs/faas_implementation_spec.md` §12.
 ```go
 type Request struct {
     // ... existing fields ...
-    PreferredRegion string // ADR-095: populated from upstream_affinity.Score()
+    PreferredRegion string // ADR-098: populated from upstream_affinity.Score()
 }
 ```
 
@@ -173,7 +180,7 @@ func upstreamFit(candidateRegion string, scores map[string]float64) float64 {
 (line 245) and the static region tie-break (line 250):
 
 ```go
-// ADR-095: tie-break #3 = upstream-region fit, weighted against
+// ADR-098: tie-break #3 = upstream-region fit, weighted against
 // api.UpstreamFitMinDeltaMs (default 5 ms). Behaviour:
 nFit := upstreamFit(n.Region, e.appScores[appID])
 bestFit := upstreamFit(best.Region, e.appScores[appID])
@@ -306,7 +313,7 @@ before any scheduling behavior changes.
 - `pkg/meter/upstream_probe.go` (PR-C)
 - `cmd/apid/handlers_upstreams.go` (PR-B)
 - `cmd/e2e/upstreams_e2e_test.go`, `cmd/e2e/upstream_probe_e2e_test.go`
-- `docs/adr/095-pr-cluster-outline.md`
+- `docs/adr/098-pr-cluster-outline.md`
 - `pkg/promqlrules/data_placement.yaml` (PR-C)
 
 ### Modified
