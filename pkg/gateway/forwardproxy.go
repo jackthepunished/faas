@@ -39,8 +39,8 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	evts "github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
