@@ -1,18 +1,17 @@
 //go:build !no_pg
 
-// Migration-apply test for 00231_deployments_secret_findings.sql
+// Migration-apply test for 00233_deployments_secret_findings.sql
 // (secret-scan v2 audit row).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00231 (no goose
-//     duplicate-version panic). The kind=maintenance slot landed at
-//     00220 in PR #867, the previous fence at 00231 was the
-//     secret-scan v2 reservation — see
-//     cross-pr-slot-fence-reservation-fence-pattern. Future
-//     renumbering must re-verify `git ls-tree origin/main
-//     migrations/` after every rebase, per
-//     migration-test-uuid-sed-residual and
+//  1. Migration set applies cleanly through 00233 (no goose
+//     duplicate-version panic). Slot 00233 is the next free real
+//     after PR #845 (00229_edge_rules_kind_geo), PR #867
+//     (00231_edge_rules_kind_maintenance, 00232_apps_maintenance_mode),
+//     and PR #864 (00232_edge_rules_kind_budget). Future renumbering
+//     must re-verify `git ls-tree origin/main migrations/` after every
+//     rebase, per migration-test-uuid-sed-residual and
 //     pr-867-maintenance-cluster-slot-chase.
 //
 //  2. Both new columns exist on the `deployments` table with the
@@ -53,13 +52,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00231_DeploymentsSecretFindings(t *testing.T) {
+func TestMigrations_00233_DeploymentsSecretFindings(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00231 should land last.
+	// (1) Run the full migration set. 00233 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00220 maintenance and 00231 secret-findings)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00220 maintenance and 00233 secret-findings)", err)
 	}
 
 	// (2) Column shape — both new columns exist with the right types.
@@ -102,20 +101,20 @@ func TestMigrations_00231_DeploymentsSecretFindings(t *testing.T) {
 	// secret_findings must be jsonb NOT NULL (the `'[]'::jsonb`
 	// default covers the pre-feature rows).
 	if c, ok := got["secret_findings"]; !ok {
-		t.Errorf("deployments.secret_findings missing (00231 must have ADD COLUMN)")
+		t.Errorf("deployments.secret_findings missing (00233 must have ADD COLUMN)")
 	} else if c.typ != "jsonb" {
 		t.Errorf("deployments.secret_findings type = %q, want jsonb", c.typ)
 	} else if !c.notNull {
 		t.Errorf("deployments.secret_findings must be NOT NULL (the '[]'::jsonb default covers pre-feature rows)")
 	}
 	// secret_scanned_at must be timestamptz NULL (nullable; NULL
-	// pre-00231, set when apid writes the audit row).
+	// pre-00233, set when apid writes the audit row).
 	if c, ok := got["secret_scanned_at"]; !ok {
-		t.Errorf("deployments.secret_scanned_at missing (00231 must have ADD COLUMN)")
+		t.Errorf("deployments.secret_scanned_at missing (00233 must have ADD COLUMN)")
 	} else if c.typ != "timestamptz" {
 		t.Errorf("deployments.secret_scanned_at type = %q, want timestamptz", c.typ)
 	} else if c.notNull {
-		t.Errorf("deployments.secret_scanned_at must be NULLABLE (NULL on pre-00231 rows; apid sets it on the audit path)")
+		t.Errorf("deployments.secret_scanned_at must be NULLABLE (NULL on pre-00233 rows; apid sets it on the audit path)")
 	}
 
 	// (3) deployments_scan_status_chk CHECK was widened to include
@@ -130,19 +129,19 @@ func TestMigrations_00231_DeploymentsSecretFindings(t *testing.T) {
 		 where c.conname = 'deployments_scan_status_chk'
 		   and n.nspname = current_schema()`).Scan(&def)
 	if err != nil {
-		t.Fatalf("query deployments_scan_status_chk constraint: %v (the 00231 widening must have landed)", err)
+		t.Fatalf("query deployments_scan_status_chk constraint: %v (the 00233 widening must have landed)", err)
 	}
 	// Substring pin: pg_get_constraintdef emits either `IN (...)` or
 	// `= ANY (ARRAY[...])` per pg-get-constraintdef-shapes.md. Assert
 	// the new value appears as a quoted literal so 'complete' does
 	// not match 'complete_with_redactions' accidentally.
 	if !strings.Contains(def, "'complete_with_redactions'") {
-		t.Errorf("deployments_scan_status_chk missing 'complete_with_redactions' in def %q (00231 must have widened the closed set)", def)
+		t.Errorf("deployments_scan_status_chk missing 'complete_with_redactions' in def %q (00233 must have widened the closed set)", def)
 	}
-	// Belt-and-braces: the four pre-00231 values must still be present.
+	// Belt-and-braces: the four pre-00233 values must still be present.
 	for _, v := range []string{"pending", "complete", "failed", "skipped"} {
 		if !strings.Contains(def, "'"+v+"'") {
-			t.Errorf("deployments_scan_status_chk lost %q during the 00231 widening (def %q)", v, def)
+			t.Errorf("deployments_scan_status_chk lost %q during the 00233 widening (def %q)", v, def)
 		}
 	}
 
@@ -150,11 +149,11 @@ func TestMigrations_00231_DeploymentsSecretFindings(t *testing.T) {
 	// the new scan_status + a findings jsonb array, read it back.
 	// We seed the parent account + app + deployment in the same
 	// pgtest schema (each run gets its own schema, so the UUIDs
-	// are unique enough at 00231-prefix).
+	// are unique enough at 00233-prefix).
 	const (
-		accountID    = "00000000-0000-0000-0000-000000002231"
-		appID        = "00000000-0000-0000-0000-000000012231"
-		deploymentID = "00000000-0000-0000-0000-000000022231"
+		accountID    = "00000000-0000-0000-0000-000000002233"
+		appID        = "00000000-0000-0000-0000-000000012233"
+		deploymentID = "00000000-0000-0000-0000-000000022233"
 	)
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
@@ -176,7 +175,7 @@ func TestMigrations_00231_DeploymentsSecretFindings(t *testing.T) {
 		values ($1, $2, 'local', 'tarball', 'complete_with_redactions', $3::jsonb, now(), now())
 		on conflict (id) do nothing
 	`, deploymentID, appID, findingsJSON); err != nil {
-		t.Fatalf("insert deployment: %v (00231 must accept scan_status='complete_with_redactions' + secret_findings jsonb)", err)
+		t.Fatalf("insert deployment: %v (00233 must accept scan_status='complete_with_redactions' + secret_findings jsonb)", err)
 	}
 	var gotStatus string
 	var gotFindings []byte
@@ -202,6 +201,6 @@ func TestMigrations_00231_DeploymentsSecretFindings(t *testing.T) {
 	// this at the directory level; this is the per-migration belt
 	// and braces.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp (replay): %v (00231 must be replay-safe; the IF EXISTS/IF NOT EXISTS guards cover every ALTER)", err)
+		t.Fatalf("db.MigrateUp (replay): %v (00233 must be replay-safe; the IF EXISTS/IF NOT EXISTS guards cover every ALTER)", err)
 	}
 }

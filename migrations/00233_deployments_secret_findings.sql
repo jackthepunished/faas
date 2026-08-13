@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00231_deployments_secret_findings.sql — secret-scan v2 audit row.
+-- 00233_deployments_secret_findings.sql — secret-scan v2 audit row.
 --
 -- Closes v1 gap B: when the server-side scan (cmd/apid/secretscan.go)
 -- finds secret-shaped bytes in a deployment, the findings list and
@@ -39,10 +39,11 @@
 -- row was lost) is idempotent. Same convention as 00213
 -- (deployments_scope) and 00203 (app_envs_scope_shape).
 --
--- Slot reservation: 00231 was chosen as the next free real slot
--- past PR #845 (00229_edge_rules_kind_geo) and PR #864
--- (00232_edge_rules_kind_budget). No prior reservation existed at
--- this slot; the migration lands fresh.
+-- Slot reservation: 00233 was chosen as the next free real slot
+-- past PR #845 (00229_edge_rules_kind_geo), PR #867
+-- (00231_edge_rules_kind_maintenance, 00232_apps_maintenance_mode),
+-- and PR #864 (00232_edge_rules_kind_budget). No prior reservation
+-- existed at this slot; the migration lands fresh.
 
 ALTER TABLE deployments
     ADD COLUMN IF NOT EXISTS secret_findings  jsonb        NOT NULL DEFAULT '[]'::jsonb,
