@@ -1,4 +1,4 @@
--- filename: 00246_instances_kind_job.sql
+-- filename: 00256_instances_kind_job.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -37,8 +37,8 @@
 --      lookup is hot (the run-detail page + the reaper
 --      exemption filter).
 --
--- Slot reservation: 00246 in the ADR-099 cluster range
--- (00245-00253). See 00245_jobs.sql header.
+-- Slot reservation: 00256 in the ADR-099 cluster range
+-- (00255-00263). See 00255_jobs.sql header.
 --
 -- Replay safety: ADD COLUMN IF NOT EXISTS (with constant
 -- default) and DROP CONSTRAINT IF EXISTS + ADD CONSTRAINT

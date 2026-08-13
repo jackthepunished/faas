@@ -1,4 +1,4 @@
--- filename: 00247_usage_minutes_app_nullable.sql
+-- filename: 00257_usage_minutes_app_nullable.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -9,7 +9,7 @@
 -- This migration:
 --
 --   1. WIDENS `usage_minutes.app_id` to nullable. Job-task
---      instance rows have app_id=NULL (per 00246); the
+--      instance rows have app_id=NULL (per 00256); the
 --      corresponding usage_minutes rows therefore must
 --      also allow app_id=NULL so meterd can write the
 --      billable-second rows. The job_id denormalised
@@ -29,8 +29,8 @@
 --      dashboard (PR-D) and the ADR-099 §Acceptance #5
 --      `jobs_minutes_metered_total` metric.
 --
--- Slot reservation: 00247 in the ADR-099 cluster range
--- (00245-00253). See 00245_jobs.sql header.
+-- Slot reservation: 00257 in the ADR-099 cluster range
+-- (00255-00263). See 00255_jobs.sql header.
 --
 -- Replay safety: ADD COLUMN IF NOT EXISTS (constant
 -- default — fast catalog-only backfill); ALTER ... DROP
@@ -84,7 +84,7 @@ ALTER TABLE usage_minutes
     );
 
 -- (4) Partial index for the per-job roll-up. Mirrors
--- the `instances_job_id_idx` shape from 00246.
+-- the `instances_job_id_idx` shape from 00256.
 CREATE INDEX IF NOT EXISTS usage_minutes_job_idx
     ON usage_minutes (account_id, minute DESC)
     WHERE meter_kind = 'job';
@@ -94,7 +94,7 @@ CREATE INDEX IF NOT EXISTS usage_minutes_job_idx
 -- +goose Down
 -- +goose StatementBegin
 
--- Forward-only by design (mirrors 00246's down
+-- Forward-only by design (mirrors 00256's down
 -- migration): reverting the widening would orphan any
 -- existing job-metered rows. The down migration
 -- preserves the widened state unconditionally — it

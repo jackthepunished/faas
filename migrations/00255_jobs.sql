@@ -1,4 +1,4 @@
--- filename: 00245_jobs.sql
+-- filename: 00255_jobs.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -29,11 +29,18 @@
 -- CRUD and PR-C (schedd) wires the dispatch tick. PR-A's
 -- only runtime effect is the table DDL.
 --
--- Slot reservation: this slot is in the range 00245-00253, fenced
+-- Slot reservation: this slot is in the range 00255-00263, fenced
 -- by the ADR-099 jobs PR-cluster (issue #879 / ADR-099). Sibling
--- fences at 00249-00253 hold PR-B/C/D/E/F headroom. Mirrors the
+-- fences at 00259-00263 hold PR-B/C/D/E/F headroom. Mirrors the
 -- cross-PR fence pattern from PR-0391 carve-out +
 -- PR #867 (cross-pr-slot-fence-pagination-gate).
+--
+-- The cluster initially targeted 00245-00253 but renumbered
+-- after PR #864 (edge-rules budget) bumped to 00245 first,
+-- making 00255 the next free slot. The fence at 00244
+-- co-occupies with #887's real 00244 edge-rules throttle
+-- (both no-op SELECT 1; the loser's renumber follows
+-- cross-pr-slot-gate-reservation-fence-pattern).
 --
 -- Replay safety: every CREATE uses IF NOT EXISTS, every index
 -- uses IF NOT EXISTS, and the down-migration uses DROP TABLE IF
