@@ -695,8 +695,8 @@ func NewHandler(backend Backend) *Handler {
 // registry) and a custom slog logger.
 func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 	h := &Handler{
-		backend:        backend,
-		limiter:        NewLimiter(),
+		backend: backend,
+		limiter: NewLimiter(),
 		// routeLimiter is built with NewLimiterWithLRU (#887) so
 		// the per-rule bucket map — keyed by appID+"\x00"+ruleID —
 		// cannot grow unboundedly; full-bucket-only eviction
@@ -2739,7 +2739,13 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("throttle", "blocked")
-			h.metrics.ObserveEdgeRuleApply("throttle", "blocked")
+			// 429 is a non-2xx wire write — emit apply success
+			// because the applier did its job. Mirrors
+			// applyEdgeRuleMaintenance (handler.go:2019) and the
+			// applyEdgeRuleGeo 403 paths (handler.go:2531). The
+			// match result is captured separately above for the
+			// §12 dashboard's "match outcome" panel.
+			h.metrics.ObserveEdgeRuleApply("throttle", "success")
 		}
 		return true
 	}
@@ -3694,13 +3700,16 @@ haveApp:
 	}
 
 	// ADR-091 D20.5 amendment / kind=throttle (issue #881). Runs
-	// AFTER applyEdgeRuleLimit (so 413 from a per-rule body cap
-	// still consumes a route token — denied requests count toward
-	// the throttle) and BEFORE applyEdgeRuleValidate (so the
-	// schema-gate 422 never costs a bucket decrement). The O(1)
-	// bucket lookup is the cheapest hot-path step short of the
-	// path-glob match itself. See applyEdgeRuleThrottle's doc for
-	// the rationale + the cross-account audit/metric posture.
+	// AFTER applyEdgeRuleLimit (which short-circuits with `return
+	// true` on a 413 at handler.go:2442, so a body-cap rejection
+	// does NOT consume a route token — this matches
+	// applyEdgeRuleThrottle's own doc at line 2661: requests denied
+	// by JWT/IP/Geo/Limit MUST NOT consume a route token) and BEFORE
+	// applyEdgeRuleValidate (so a schema-gate 422 never costs a
+	// bucket decrement). The O(1) bucket lookup is the cheapest
+	// hot-path step short of the path-glob match itself. See
+	// applyEdgeRuleThrottle's doc for the rationale + the
+	// cross-account audit/metric posture.
 	if h.applyEdgeRuleThrottle(w, r, app) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
