@@ -22,8 +22,15 @@ import (
 // Within each section, changes come before breaks so a customer
 // reading the table sees "what would change" before "what would
 // fail".
-func Compute(slug string, baseline Baseline, pending Pending) Diff {
-	plan := inferPlan(baseline.App)
+//
+// plan is the customer's subscription tier (Free / Hobby / Pro /
+// Scale). PR-0's stub `inferPlan` returned empty; PR-1 takes it
+// as a parameter so the apid handler can pass acct.Plan directly
+// without going through an SDK round-trip. Empty string is allowed
+// (the CLI's Whoami fallback) — when empty the quota gate's plan
+// feature branches fall through to the "not allowed" code paths
+// and the renderer still renders correctly.
+func Compute(slug string, plan Plan, baseline Baseline, pending Pending) Diff {
 	out := Diff{
 		Slug:    slug,
 		Changes: []Change{},
@@ -50,17 +57,6 @@ func Compute(slug string, baseline Baseline, pending Pending) Diff {
 	detectSchemaBreak(&out, baseline.LatestDeployment, pending)
 
 	return out
-}
-
-// inferPlan reads the plan from the baseline's App.Slug-free view
-// (the AppResponse has no Plan field; the apid handler passes it
-// separately in PR-1 via [Pending]). PR-0 leaves Plan empty until
-// the apid handler wires it through.
-func inferPlan(app *api.AppResponse) Plan {
-	if app == nil {
-		return ""
-	}
-	return ""
 }
 
 // diffAppConfig is the per-scalar pointer-aware comparison. Each
