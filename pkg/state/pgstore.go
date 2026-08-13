@@ -15110,3 +15110,173 @@ func (s *PgStore) DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID
 		ReceivedAt: pgtypeFromTime(cutoff),
 	})
 }
+
+// ----------------------------------------------------------------------------
+// ADR-098 connection-aware execution (§9.A). pgstore wrappers for the
+// sqlc-generated data_upstreams + data_upstream_probes query surface
+// (queries.sql ADR-098 block). Per-call helper mirrors
+// appErrorsQueries() at pgstore.go:14924. The typed DataUpstream /
+// DataUpstreamProbe structs (types.go ADR-098 block) are the handler
+// boundary; pgtype-flavored rows stay inside this adapter.
+//
+// PR-A: thin wrappers over sqlc. The call sites are PR-B (apid
+// env-classifier), PR-C (meterd probe loop), and PR-D (schedd wake-
+// side read). Until PR-B lands, no production code path calls these —
+// the surface compiles so the Store interface extension doesn't break
+// the rest of the package.
+// ----------------------------------------------------------------------------
+
+// dataUpstreamsQueries is the per-call helper for the ADR-098 §9.A
+// typed query surface. Mirrors appErrorsQueries() at pgstore.go:14924
+// — no state, no caching, allocated per call.
+func (s *PgStore) dataUpstreamsQueries() *sqlc.Queries { return sqlc.New() }
+
+// InsertDataUpstream writes one data_upstreams row via the dedupe-
+// merge ON CONFLICT tripwire on data_upstreams_dedupe_uniq. PR-B's
+// apid env-classifier (cmd/apid/extract.go) calls this on every
+// observed (app_id, scope, kind, host, port) tuple. The returned
+// uuid.UUID is the row's id (the same caller-supplied id on insert;
+// the existing row's id on conflict).
+func (s *PgStore) InsertDataUpstream(ctx context.Context, arg sqlc.InsertDataUpstreamParams) (uuid.UUID, error) {
+	id, err := s.dataUpstreamsQueries().InsertDataUpstream(ctx, s.pool, arg)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return uuidFromPgtype(id), nil
+}
+
+// ListDataUpstreamsByApp converts sqlc.ListDataUpstreamsByAppRow to
+// the typed DataUpstream at the boundary so handlers don't touch
+// pgtype. Cursor-paginated via (created_at, id); the handler MUST
+// pre-clamp limit to api.DataUpstreamsListMaxLimit (PR-B).
+func (s *PgStore) ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error) {
+	rows, err := s.dataUpstreamsQueries().ListDataUpstreamsByApp(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DataUpstream, 0, len(rows))
+	for _, r := range rows {
+		var rtt *int
+		if r.LastRttMs.Valid {
+			v := int(r.LastRttMs.Int32)
+			rtt = &v
+		}
+		var probedAt *time.Time
+		if r.LastProbedAt.Valid {
+			t := timeFromPgtype(r.LastProbedAt)
+			probedAt = &t
+		}
+		out = append(out, DataUpstream{
+			ID:               uuidFromPgtype(r.ID),
+			AccountID:        uuidFromPgtype(r.AccountID),
+			AppID:            uuidFromPgtype(r.AppID),
+			Source:           DataUpstreamSource(r.Source),
+			Scope:            r.Scope,
+			Kind:             DataUpstreamKind(r.Kind),
+			Host:             r.Host,
+			Port:             int(r.Port),
+			HostRedactedHash: r.HostRedactedHash,
+			DeclaredRegion:   r.DeclaredRegion,
+			LastRTTMs:        rtt,
+			LastProbedAt:     probedAt,
+			LastSeenAt:       timeFromPgtype(r.LastSeenAt),
+			CreatedAt:        timeFromPgtype(r.CreatedAt),
+		})
+	}
+	return out, nil
+}
+
+// GetDataUpstreamByID is the single-row read for the dashboard's
+// "edit upstream" pane (PR-B).
+func (s *PgStore) GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUpstream, error) {
+	row, err := s.dataUpstreamsQueries().GetDataUpstreamByID(ctx, s.pool, pgtypeFromUUID(id))
+	if err != nil {
+		return DataUpstream{}, err
+	}
+	var rtt *int
+	if row.LastRttMs.Valid {
+		v := int(row.LastRttMs.Int32)
+		rtt = &v
+	}
+	var probedAt *time.Time
+	if row.LastProbedAt.Valid {
+		t := timeFromPgtype(row.LastProbedAt)
+		probedAt = &t
+	}
+	return DataUpstream{
+		ID:               uuidFromPgtype(row.ID),
+		AccountID:        uuidFromPgtype(row.AccountID),
+		AppID:            uuidFromPgtype(row.AppID),
+		Source:           DataUpstreamSource(row.Source),
+		Scope:            row.Scope,
+		Kind:             DataUpstreamKind(row.Kind),
+		Host:             row.Host,
+		Port:             int(row.Port),
+		HostRedactedHash: row.HostRedactedHash,
+		DeclaredRegion:   row.DeclaredRegion,
+		LastRTTMs:        rtt,
+		LastProbedAt:     probedAt,
+		LastSeenAt:       timeFromPgtype(row.LastSeenAt),
+		CreatedAt:        timeFromPgtype(row.CreatedAt),
+	}, nil
+}
+
+// DeleteDataUpstreamByID removes one data_upstreams row by ID.
+// PR-B wires DELETE /v1/apps/{slug}/upstreams/{id} to this method.
+// FK CASCADE on account_id / app_id handles the GDPR path; the
+// handler is the only direct DELETE caller.
+func (s *PgStore) DeleteDataUpstreamByID(ctx context.Context, id uuid.UUID) error {
+	return s.dataUpstreamsQueries().DeleteDataUpstreamByID(ctx, s.pool, pgtypeFromUUID(id))
+}
+
+// InsertDataUpstreamProbe writes one probe sample. meterd's probe
+// loop calls this every 30s per (host_redacted_hash, region).
+// Partitioning on sampled_at gives the hot-write path; the partition
+// creator (PR-C) drops old partitions wholesale.
+func (s *PgStore) InsertDataUpstreamProbe(ctx context.Context, arg sqlc.InsertDataUpstreamProbeParams) error {
+	return s.dataUpstreamsQueries().InsertDataUpstreamProbe(ctx, s.pool, arg)
+}
+
+// ListDataUpstreamProbesByHostRegion is schedd's wake-side read path.
+// Returns the N most recent samples for one (host_redacted_hash,
+// region) pair within a time window. Partition pruning on sampled_at
+// drops everything outside the window.
+func (s *PgStore) ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error) {
+	rows, err := s.dataUpstreamsQueries().ListDataUpstreamProbesByHostRegion(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DataUpstreamProbe, 0, len(rows))
+	for _, r := range rows {
+		var rtt *int
+		if r.RttMs.Valid {
+			v := int(r.RttMs.Int32)
+			rtt = &v
+		}
+		var errClass *string
+		if r.ErrorClass.Valid {
+			s := r.ErrorClass.String
+			errClass = &s
+		}
+		out = append(out, DataUpstreamProbe{
+			ID:               uuidFromPgtype(r.ID),
+			HostRedactedHash: r.HostRedactedHash,
+			Region:           r.Region,
+			Kind:             DataUpstreamKind(r.Kind),
+			SampledAt:        timeFromPgtype(r.SampledAt),
+			RTTMs:            rtt,
+			OK:               r.Ok,
+			ErrorClass:       errClass,
+			ProbeNode:        r.ProbeNode,
+		})
+	}
+	return out, nil
+}
+
+// PruneDataUpstreamProbesOlderThan is the retention purge. meterd
+// calls this hourly with cutoff = now() - 30 days. The partition
+// pruning on sampled_at makes the partial-partition tail O(affected
+// partitions); PR-C's partition creator handles whole-partition drops.
+func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error {
+	return s.dataUpstreamsQueries().PruneDataUpstreamProbesOlderThan(ctx, s.pool, pgtypeFromTime(cutoff))
+}

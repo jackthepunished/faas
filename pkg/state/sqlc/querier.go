@@ -106,6 +106,14 @@ type Querier interface {
 	DeleteAppErrorsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error
 	DeleteCron(ctx context.Context, db DBTX, arg DeleteCronParams) error
 	DeleteCustomDomain(ctx context.Context, db DBTX, domain interface{}) error
+	// DELETE /v1/apps/{slug}/upstreams/{id} (PR-B). Soft-
+	// delete is rejected by ADR-098 (a soft-deleted row
+	// would still trigger pg_notify and confuse schedd);
+	// the handler is the only path and uses a hard
+	// DELETE. The CASCADE on account_id / app_id handles
+	// the GDPR path (delete-account cascades through
+	// apps → data_upstreams).
+	DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
@@ -114,6 +122,10 @@ type Querier interface {
 	// headers_sample + redactions for the wire-side "we redacted
 	// X / Y / Z" badge.
 	GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErrorSampleParams) (GetAppErrorSampleRow, error)
+	// Single-row read for the dashboard's "edit upstream"
+	// pane (PR-B). Cursor-safe: no pagination; the handler
+	// reads the row directly.
+	GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) (GetDataUpstreamByIDRow, error)
 	// Returns the bytea secret for the given installation_id. The
 	// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
 	// webhook is rejected rather than falling back to the platform-
@@ -169,6 +181,41 @@ type Querier interface {
 	// controls the wall-clock pair (the property test depends on
 	// caller-supplied timestamps for deterministic gap classification).
 	InsertComputeNodeHeartbeat(ctx context.Context, db DBTX, arg InsertComputeNodeHeartbeatParams) error
+	// ---------------------------------------------------------------------------
+	// ADR-098 connection-aware execution (§9.A). Tables live in
+	// migrations/00226_data_upstreams.sql. apid is the only writer to
+	// data_upstreams (env-classifier side, PR-B); meterd is the only writer
+	// to data_upstream_probes (probe loop, PR-C). schedd reads
+	// data_upstream_probes via ListDataUpstreamProbesByHostRegion on wake
+	// (PR-B wires pkg/sched/upstream_affinity.go). The Store interface is
+	// extended in pkg/state/store.go; pgstore + memstore stubs added in
+	// PR-A so the surface compiles — production reads/writes land in PR-B.
+	//
+	// Index paths pinned in the migration file (NOT regenerated here —
+	// sqlc doesn't manage indexes, only the typed query surface):
+	//   - data_upstreams_app_created_idx
+	//   - data_upstreams_host_redacted_idx
+	//   - data_upstreams_dedupe_uniq (UNIQUE)
+	//   - partitioned data_upstream_probes + default partition
+	// ---------------------------------------------------------------------------
+	// Dedupe-merge INSERT for data_upstreams. Mirrors the
+	// IncrementAppError ON CONFLICT pattern (queries.sql:906).
+	// The handler (PR-B's cmd/apid/extract.go) targets
+	// data_upstreams_dedupe_uniq on (app_id, scope, kind,
+	// host, port). On conflict: bump last_seen_at; refresh
+	// last_rtt_ms / last_probed_at / declared_region from
+	// EXCLUDED so the freshest classifier observation wins.
+	// id is caller-supplied (uuidv7) so the row identity is
+	// stable across the dedupe-merge.
+	InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDataUpstreamParams) (pgtype.UUID, error)
+	// meterd's probe loop writer (PR-C). One row per
+	// (host_redacted_hash, region) per 30s sample. The
+	// PK is (id, sampled_at) — id is a caller-supplied
+	// uuidv7 so dedupe on retry is trivial. Partitioning
+	// on sampled_at gives the meterd loop a hot-write
+	// path; the partition creator (PR-C) drops old
+	// partitions wholesale.
+	InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg InsertDataUpstreamProbeParams) error
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)
@@ -226,8 +273,24 @@ type Querier interface {
 	// The endpoint passes a hard-cap limit (default 200, max 2000). The
 	// composite index is enough for the routine 30s × 60 nodes × 24h
 	// steady-state workload; a 7-day retention sweep is a follow-on.
-	ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ComputeNodeHeartbeat, error)
+	ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ListComputeNodeHeartbeatsRow, error)
 	ListCronsForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListCronsForAppRow, error)
+	// schedd's wake-side read path (PR-B/C). Returns the
+	// N most recent probe samples for one (host, region)
+	// pair, time-windowed to the meterd sliding window
+	// (default: 30s × 5min). Index path: the
+	// partitioned table's PARTITION BY RANGE on
+	// sampled_at — partition pruning drops everything
+	// outside the window. The (kind) projection lets
+	// schedd key its upstream-affinity map on
+	// (kind, region) without joining data_upstreams.
+	ListDataUpstreamProbesByHostRegion(ctx context.Context, db DBTX, arg ListDataUpstreamProbesByHostRegionParams) ([]ListDataUpstreamProbesByHostRegionRow, error)
+	// GET /v1/apps/{slug}/upstreams (PR-B). Cursor pagination
+	// via (created_at, id) — distinct from app_errors'
+	// (last_seen_at, fingerprint) cursor because
+	// data_upstreams is a stable list, not a hot recency
+	// list. Index path: data_upstreams_app_created_idx.
+	ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error)
 	ListDeploymentsForApp(ctx context.Context, db DBTX, arg ListDeploymentsForAppParams) ([]ListDeploymentsForAppRow, error)
 	ListDomainsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListDomainsForAccountRow, error)
 	ListDomainsForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListDomainsForAppRow, error)
@@ -291,6 +354,17 @@ type Querier interface {
 	// the kind + at DESC predicate. The subject grouping is in-memory
 	// after the index scan.
 	PerAccountRateLimitAggregate(ctx context.Context, db DBTX, arg PerAccountRateLimitAggregateParams) ([]PerAccountRateLimitAggregateRow, error)
+	// Retention purge. The meterd cron calls this
+	// hourly with `cutoff = now() - interval '30 days'`
+	// (matches the §12 prom_retention_days:15 floor +
+	// a 2× safety margin). The partition pruning on
+	// sampled_at makes this O(affected partitions),
+	// not O(table size). The PR-C partition creator
+	// DROPs whole partitions for ranges entirely older
+	// than cutoff; this query handles the partial-
+	// partition tail (rows in the default partition or
+	// the current month that are older than cutoff).
+	PruneDataUpstreamProbesOlderThan(ctx context.Context, db DBTX, sampledAt pgtype.Timestamptz) error
 	// Revokes every active row for accountID except the supplied sid
 	// (the calling session). Returns the revoked ids for audit.
 	RevokeAllSessions(ctx context.Context, db DBTX, arg RevokeAllSessionsParams) ([]pgtype.UUID, error)

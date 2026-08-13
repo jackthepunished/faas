@@ -3498,4 +3498,69 @@ type Store interface {
 	// cutoff timestamp. Used by the nightly retention purge to
 	// age out orphaned request rows.
 	DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error
+
+	// --- ADR-098 connection-aware execution (§9.A) ---
+	//
+	// Writer methods (InsertDataUpstream / DeleteDataUpstreamByID
+	// / InsertDataUpstreamProbe / PruneDataUpstreamProbesOlderThan)
+	// are wired by PR-B/C:
+	//   - apid's env-classifier (cmd/apid/extract.go) calls
+	//     InsertDataUpstream / DeleteDataUpstreamByID
+	//   - meterd's probe loop (cmd/meterd/probe_loop.go) calls
+	//     InsertDataUpstreamProbe every 30s per
+	//     (host_redacted_hash, region)
+	//   - meterd's hourly retention cron calls
+	//     PruneDataUpstreamProbesOlderThan
+	//
+	// Reader methods (ListDataUpstreamsByApp /
+	// GetDataUpstreamByID / ListDataUpstreamProbesByHostRegion)
+	// back:
+	//   - GET /v1/apps/{slug}/upstreams (PR-B;
+	//     ListDataUpstreamsByApp)
+	//   - GET /v1/apps/{slug}/upstreams/{id} (PR-B;
+	//     GetDataUpstreamByID)
+	//   - schedd's wake-side affinity read (PR-B/C;
+	//     ListDataUpstreamProbesByHostRegion)
+	//
+	// PR-A ships these on the interface with Postgres + MemStore
+	// stubs so the package compiles and unit tests don't regress.
+	// PR-B replaces the apid / meterd / schedd call sites with
+	// the production wiring.
+
+	// InsertDataUpstream writes one data_upstreams row via the
+	// dedupe-merge ON CONFLICT tripwire on
+	// data_upstreams_dedupe_uniq (PR-B env-classifier).
+	InsertDataUpstream(ctx context.Context, arg sqlc.InsertDataUpstreamParams) (uuid.UUID, error)
+
+	// ListDataUpstreamsByApp backs
+	// GET /v1/apps/{slug}/upstreams (PR-B). Cursor-paginated via
+	// (created_at, id); limit MUST be pre-clamped to
+	// api.DataUpstreamsListMaxLimit by the handler.
+	ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error)
+
+	// GetDataUpstreamByID backs
+	// GET /v1/apps/{slug}/upstreams/{id} (PR-B).
+	GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUpstream, error)
+
+	// DeleteDataUpstreamByID backs
+	// DELETE /v1/apps/{slug}/upstreams/{id} (PR-B).
+	DeleteDataUpstreamByID(ctx context.Context, id uuid.UUID) error
+
+	// InsertDataUpstreamProbe is meterd's probe-loop writer. One
+	// row per (host_redacted_hash, region) per 30s sample.
+	// Partitioning on sampled_at gives the hot-write path; the
+	// partition creator (PR-C) drops old partitions wholesale.
+	InsertDataUpstreamProbe(ctx context.Context, arg sqlc.InsertDataUpstreamProbeParams) error
+
+	// ListDataUpstreamProbesByHostRegion is schedd's wake-side
+	// read path (PR-B/C). Returns the N most recent samples for
+	// one (host_redacted_hash, region) pair within a time window.
+	// Partition pruning on sampled_at drops everything outside
+	// the window.
+	ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error)
+
+	// PruneDataUpstreamProbesOlderThan is the hourly retention
+	// purge. cutoff is typically now() - 30 days (matches the
+	// §12 prom_retention_days:15 floor × 2 safety margin).
+	PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error
 }

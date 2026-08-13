@@ -501,16 +501,18 @@ const testDomain = "apps.test.example"
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
 //
-// Re-bumped 215/216 → 222 by ADR-096 PR-A (app_errors schema
-// at 00222). The in-flight cross-PR fences at 215..221 sit
-// between main's 214 (edge-rules-kind=validate) and 222
-// (app_errors): 215 compute_node_heartbeats_stats (PR #851),
-// 216 apps_route_metrics_enabled (PR #860), 217 ADR-092
-// app_secrets_scope (PR #849), 218 preview-envs (PR
-// preview-envs ADR-095), 219 edge_rules_kind_limit (PR
-// kind=validate PR-C), 220 preview_app_columns (PR preview
-// envs), and 221 ADR-096 reserve fence for slot 222 itself.
-const e2eMigrationTarget = 222
+// Re-bumped 222 → 226 by ADR-098 PR-A (data_upstreams +
+// data_upstream_probes schema at 00226). The intervening slots
+// 223..225 are sibling PR fences (223 ADR-091 CORS, 224
+// apps_cors_defaults, 225 reserve fence) that the apply-walk
+// test consumes as first-class entries per
+// TestMigrationsContiguous's position-index rule. Sibling PRs
+// #864/#867/#845 each carry their own 00226_reserve_slot.sql
+// fence per the cross-PR slot reservation convention
+// (cross-pr-slot-fence-reservation-fence-pattern memory); those
+// siblings drop their fences on rebase via `fix(migration):
+// drop 00226_reserve_slot.sql` after PR-A merges.
+const e2eMigrationTarget = 226
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

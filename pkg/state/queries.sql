@@ -1027,3 +1027,136 @@ DELETE FROM app_error_requests WHERE id = ANY($1::uuid[]);
 DELETE FROM app_error_requests
 WHERE account_id = $1
   AND received_at < $2;
+
+-- ---------------------------------------------------------------------------
+-- ADR-098 connection-aware execution (§9.A). Tables live in
+-- migrations/00226_data_upstreams.sql. apid is the only writer to
+-- data_upstreams (env-classifier side, PR-B); meterd is the only writer
+-- to data_upstream_probes (probe loop, PR-C). schedd reads
+-- data_upstream_probes via ListDataUpstreamProbesByHostRegion on wake
+-- (PR-B wires pkg/sched/upstream_affinity.go). The Store interface is
+-- extended in pkg/state/store.go; pgstore + memstore stubs added in
+-- PR-A so the surface compiles — production reads/writes land in PR-B.
+--
+-- Index paths pinned in the migration file (NOT regenerated here —
+-- sqlc doesn't manage indexes, only the typed query surface):
+--   - data_upstreams_app_created_idx
+--   - data_upstreams_host_redacted_idx
+--   - data_upstreams_dedupe_uniq (UNIQUE)
+--   - partitioned data_upstream_probes + default partition
+-- ---------------------------------------------------------------------------
+
+-- name: InsertDataUpstream :one
+-- Dedupe-merge INSERT for data_upstreams. Mirrors the
+-- IncrementAppError ON CONFLICT pattern (queries.sql:906).
+-- The handler (PR-B's cmd/apid/extract.go) targets
+-- data_upstreams_dedupe_uniq on (app_id, scope, kind,
+-- host, port). On conflict: bump last_seen_at; refresh
+-- last_rtt_ms / last_probed_at / declared_region from
+-- EXCLUDED so the freshest classifier observation wins.
+-- id is caller-supplied (uuidv7) so the row identity is
+-- stable across the dedupe-merge.
+INSERT INTO data_upstreams (
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, declared_region,
+    last_rtt_ms, last_probed_at,
+    last_seen_at, created_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8,
+    $9, $10,
+    $11, $12,
+    now(), now()
+)
+ON CONFLICT (app_id, scope, kind, host, port) DO UPDATE SET
+    source          = EXCLUDED.source,
+    declared_region = EXCLUDED.declared_region,
+    last_rtt_ms     = EXCLUDED.last_rtt_ms,
+    last_probed_at  = EXCLUDED.last_probed_at,
+    last_seen_at    = now()
+RETURNING id;
+
+-- name: ListDataUpstreamsByApp :many
+-- GET /v1/apps/{slug}/upstreams (PR-B). Cursor pagination
+-- via (created_at, id) — distinct from app_errors'
+-- (last_seen_at, fingerprint) cursor because
+-- data_upstreams is a stable list, not a hot recency
+-- list. Index path: data_upstreams_app_created_idx.
+SELECT
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, coalesce(declared_region, ''),
+    last_rtt_ms, last_probed_at, last_seen_at, created_at
+FROM data_upstreams
+WHERE app_id = $1
+  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+ORDER BY created_at DESC, id DESC
+LIMIT $4;
+
+-- name: GetDataUpstreamByID :one
+-- Single-row read for the dashboard's "edit upstream"
+-- pane (PR-B). Cursor-safe: no pagination; the handler
+-- reads the row directly.
+SELECT
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, coalesce(declared_region, ''),
+    last_rtt_ms, last_probed_at, last_seen_at, created_at
+FROM data_upstreams
+WHERE id = $1;
+
+-- name: DeleteDataUpstreamByID :exec
+-- DELETE /v1/apps/{slug}/upstreams/{id} (PR-B). Soft-
+-- delete is rejected by ADR-098 (a soft-deleted row
+-- would still trigger pg_notify and confuse schedd);
+-- the handler is the only path and uses a hard
+-- DELETE. The CASCADE on account_id / app_id handles
+-- the GDPR path (delete-account cascades through
+-- apps → data_upstreams).
+DELETE FROM data_upstreams WHERE id = $1;
+
+-- name: InsertDataUpstreamProbe :exec
+-- meterd's probe loop writer (PR-C). One row per
+-- (host_redacted_hash, region) per 30s sample. The
+-- PK is (id, sampled_at) — id is a caller-supplied
+-- uuidv7 so dedupe on retry is trivial. Partitioning
+-- on sampled_at gives the meterd loop a hot-write
+-- path; the partition creator (PR-C) drops old
+-- partitions wholesale.
+INSERT INTO data_upstream_probes (
+    id, host_redacted_hash, region, kind, sampled_at, rtt_ms,
+    ok, error_class, probe_node
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9
+);
+
+-- name: ListDataUpstreamProbesByHostRegion :many
+-- schedd's wake-side read path (PR-B/C). Returns the
+-- N most recent probe samples for one (host, region)
+-- pair, time-windowed to the meterd sliding window
+-- (default: 30s × 5min). Index path: the
+-- partitioned table's PARTITION BY RANGE on
+-- sampled_at — partition pruning drops everything
+-- outside the window. The (kind) projection lets
+-- schedd key its upstream-affinity map on
+-- (kind, region) without joining data_upstreams.
+SELECT
+    id, host_redacted_hash, region, kind, sampled_at, rtt_ms,
+    ok, error_class, coalesce(probe_node, '')
+FROM data_upstream_probes
+WHERE host_redacted_hash = $1
+  AND region = $2
+  AND sampled_at >= $3
+ORDER BY sampled_at DESC
+LIMIT $4;
+
+-- name: PruneDataUpstreamProbesOlderThan :exec
+-- Retention purge. The meterd cron calls this
+-- hourly with `cutoff = now() - interval '30 days'`
+-- (matches the §12 prom_retention_days:15 floor +
+-- a 2× safety margin). The partition pruning on
+-- sampled_at makes this O(affected partitions),
+-- not O(table size). The PR-C partition creator
+-- DROPs whole partitions for ranges entirely older
+-- than cutoff; this query handles the partial-
+-- partition tail (rows in the default partition or
+-- the current month that are older than cutoff).
+DELETE FROM data_upstream_probes WHERE sampled_at < $1;

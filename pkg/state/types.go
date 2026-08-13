@@ -3508,3 +3508,141 @@ func (e *EdgeRuleQuotaError) Is(target error) bool {
 	_, ok := target.(*EdgeRuleQuotaError)
 	return ok
 }
+
+// ----------------------------------------------------------------------------
+// ADR-098 connection-aware execution (§9.A). In-memory mirror of the
+// data_upstreams + data_upstream_probes tables (migrations/
+// 00226_data_upstreams.sql). The Store interface exposes typed
+// DataUpstream / DataUpstreamProbe at the boundary so handlers don't
+// touch pgtype. Field ordering matches the sqlc-generated DataUpstream /
+// DataUpstreamProbe (pkg/state/sqlc/models.go) — pointer discipline for
+// the nullable pair (LastRTTMs/LastProbedAt, RTTMs/ErrorClass) maps to
+// the SQL CHECK pair constraints. The coalesce-empty-string convention
+// for `text NULL` columns (DeclaredRegion, ProbeNode) matches the
+// app_errors handler-side boundary (queries.sql:949-960).
+// ----------------------------------------------------------------------------
+
+// DataUpstreamSource is the closed vocabulary for data_upstreams.source.
+// 'inferred' = apid env-classifier captured the host from a
+// customer env value (ADR-098 D1.a). 'explicit' = the customer
+// POSTed /v1/apps/{slug}/upstreams with the row (ADR-098 D4).
+type DataUpstreamSource string
+
+const (
+	DataUpstreamSourceInferred DataUpstreamSource = "inferred"
+	DataUpstreamSourceExplicit DataUpstreamSource = "explicit"
+)
+
+// DataUpstreamKind is the closed vocabulary for data_upstreams.kind +
+// data_upstream_probes.kind. Fourteen values from ADR-098 D1. The
+// SQL CHECK mirrors this set (migrations/00226_data_upstreams.sql);
+// the Go side exposes the constants + IsValid() so callers fail fast
+// on a typo at the API boundary instead of surfacing a 23514 at
+// runtime.
+type DataUpstreamKind string
+
+const (
+	DataUpstreamKindPostgres      DataUpstreamKind = "postgres"
+	DataUpstreamKindRedis         DataUpstreamKind = "redis"
+	DataUpstreamKindMongo         DataUpstreamKind = "mongo"
+	DataUpstreamKindCassandra     DataUpstreamKind = "cassandra"
+	DataUpstreamKindClickhouse    DataUpstreamKind = "clickhouse"
+	DataUpstreamKindElasticsearch DataUpstreamKind = "elasticsearch"
+	DataUpstreamKindOpensearch    DataUpstreamKind = "opensearch"
+	DataUpstreamKindRabbitmq      DataUpstreamKind = "rabbitmq"
+	DataUpstreamKindKafka         DataUpstreamKind = "kafka"
+	DataUpstreamKindNats          DataUpstreamKind = "nats"
+	DataUpstreamKindMinio         DataUpstreamKind = "minio"
+	DataUpstreamKindMemcached     DataUpstreamKind = "memcached"
+	DataUpstreamKindEtcd          DataUpstreamKind = "etcd"
+	DataUpstreamKindS3            DataUpstreamKind = "s3"
+	DataUpstreamKindHTTPSAPI      DataUpstreamKind = "https_api"
+)
+
+// IsValid reports whether k is one of the closed-set DataUpstreamKind
+// constants. Cheap — used by the env-classifier (cmd/apid/extract.go,
+// PR-B) to fail fast on an unknown kind before the SQL INSERT surfaces
+// a 23514. Mirrors (EdgeRuleKind).IsValid() at types.go:3268.
+func (k DataUpstreamKind) IsValid() bool {
+	switch k {
+	case DataUpstreamKindPostgres, DataUpstreamKindRedis, DataUpstreamKindMongo,
+		DataUpstreamKindCassandra, DataUpstreamKindClickhouse,
+		DataUpstreamKindElasticsearch, DataUpstreamKindOpensearch,
+		DataUpstreamKindRabbitmq, DataUpstreamKindKafka, DataUpstreamKindNats,
+		DataUpstreamKindMinio, DataUpstreamKindMemcached, DataUpstreamKindEtcd,
+		DataUpstreamKindS3, DataUpstreamKindHTTPSAPI:
+		return true
+	}
+	return false
+}
+
+// DataUpstream is one row of data_upstreams. apid is the only writer
+// (ADR-098 D1.a / D4); schedd reads via the dashboard's
+// GET /v1/apps/{slug}/upstreams (PR-B). Source / Kind are typed enums
+// (DataUpstreamSource / DataUpstreamKind) so the wire shape matches
+// the schema CHECKs. LastRTTMs / LastProbedAt are nullable pointers so
+// the "never probed" shape (last_rtt_ms IS NULL on the wire; the
+// sqlc read path projects pgtype.Int4.Valid) is distinguishable from
+// "measured at 0ms".
+type DataUpstream struct {
+	ID               uuid.UUID
+	AccountID        uuid.UUID
+	AppID            uuid.UUID
+	Source           DataUpstreamSource
+	Scope            string
+	Kind             DataUpstreamKind
+	Host             string
+	Port             int
+	HostRedactedHash string
+	// DeclaredRegion is the operator / customer-supplied region
+	// hint (NULL until the classifier derives it or the customer
+	// sets it via POST). Empty string projects to NULL on the
+	// wire (coalesce('') in the queries.sql read paths).
+	DeclaredRegion string
+	// LastRTTMs is the most recent probe RTT (nil = never
+	// probed). Pointer so "never probed" projects to nil rather
+	// than the SQL NULL sentinel.
+	LastRTTMs *int
+	// LastProbedAt pairs with LastRTTMs (nil until first probe).
+	// Pointer so the pair-violation check on the SQL side stays
+	// consistent with the typed boundary.
+	LastProbedAt *time.Time
+	LastSeenAt   time.Time
+	CreatedAt    time.Time
+}
+
+// DataUpstreamProbe is one row of data_upstream_probes. meterd is
+// the only writer; schedd reads via
+// ListDataUpstreamProbesByHostRegion (PR-B). The PK is
+// (id, sampled_at) — id is a caller-supplied uuidv7 so retry dedupe
+// is trivial. RTTMs is nullable on ok=false rows (the SQL CHECK
+// data_upstream_probes_ok_pair_chk enforces the pair). ErrorClass
+// is the NULL on ok=true / NOT NULL on ok=false closed-set
+// ('timeout' | 'refused' | 'tls_handshake' | 'dns' |
+// 'unreachable').
+type DataUpstreamProbe struct {
+	ID               uuid.UUID
+	HostRedactedHash string
+	Region           string
+	Kind             DataUpstreamKind
+	SampledAt        time.Time
+	// RTTMs is nil on ok=false rows. Pointer so the typed
+	// boundary distinguishes "not measured" from "measured at
+	// 0ms".
+	RTTMs *int
+	// OK is the TCP+TLS handshake outcome (true = handshake
+	// completed within ProbeTimeoutMs).
+	OK bool
+	// ErrorClass is nil on ok=true rows. Closed-set on the SQL
+	// side; the Go side mirrors with a string pointer so callers
+	// can compare against the constants in
+	// pkg/meter/upstream_probe.go (PR-C). Untyped here so the
+	// PR-A addition doesn't force a pkg/meter import in
+	// pkg/state.
+	ErrorClass *string
+	// ProbeNode is the meterd node's compute_nodes.name that
+	// ran the probe. NULL on single-box installs. Empty string
+	// projects to NULL on the wire (coalesce('') in the
+	// queries.sql read paths).
+	ProbeNode string
+}
