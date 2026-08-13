@@ -3176,7 +3176,7 @@ const (
 	// for the schema CHECK widening.
 	EdgeRuleKindLimit EdgeRuleKind = "limit"
 	// EdgeRuleKindGeo is the country allow/deny primitive (ADR-091 D21).
-	// Migration 00223 widens the schema CHECK from 9 to 10 values
+	// Migration 00226 widens the schema CHECK from 9 to 10 values
 	// (post-00219 'limit', post-00214 'validate'). Not in IsPaidOnly
 	// — Free customers get one rule under a tighter per-app quota
 	// (Limits.EdgeRulesGeoPerApp=1).

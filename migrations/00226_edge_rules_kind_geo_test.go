@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00223_edge_rules_kind_geo.sql
+// Migration-apply test for 00226_edge_rules_kind_geo.sql
 // (ADR-091 D21/D22 — kind=geo widener).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00223 (no goose
+//  1. Migration set applies cleanly through 00226 (no goose
 //     duplicate-version panic, no constraint-name collision).
 //  2. The CHECK accepts the new value `kind='geo'` (positive
 //     round-trip — the abuse-desk customer can land a geo rule).
@@ -17,10 +17,10 @@
 //     over-tolerant.
 //  5. The CHECK is named `edge_rules_kind_check` — the auto-name
 //     Postgres picks for an inline column CHECK. The companion
-//     migration 00223 rewrites this exact name; if a future
+//     migration 00226 rewrites this exact name; if a future
 //     migration renames the inline CHECK in 00192, this pin +
-//     the DROP+ADD in 00223 must update together (silent breakage
-//     here means 00223 becomes a no-op).
+//     the DROP+ADD in 00226 must update together (silent breakage
+//     here means 00226 becomes a no-op).
 //
 // Seed UUIDs carry the slot number in the last group (`...000192`,
 // `...000292`, `...000392`) — mirrors migrations/00192_edge_rules_test.go
@@ -40,14 +40,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00223_EdgeRulesKindGeo(t *testing.T) {
+func TestMigrations_00226_EdgeRulesKindGeo(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00223. The apply_walk_test.go pin auto-picks
+	// (1) Apply through 00226. The apply_walk_test.go pin auto-picks
 	// up the new slot the next time `make embed-migrations` runs.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00192 and 00223)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00192 and 00226)", err)
 	}
 
 	// Seed the parent account + app so the FK constraints on
@@ -124,10 +124,10 @@ func TestMigrations_00223_EdgeRulesKindGeo(t *testing.T) {
 	// (5) The CHECK is named `edge_rules_kind_check`. This is the
 	// auto-name Postgres assigns to an inline column CHECK on
 	// `edge_rules.kind` (Postgres names inline CHECKs as
-	// `<table>_<column>_check`). The 00223 migration rewrites
+	// `<table>_<column>_check`). The 00226 migration rewrites
 	// this exact name; if a future migration renames the inline
-	// CHECK in 00192, this pin + the DROP+ADD in 00223 must update
-	// together. Silent breakage here means 00223's DROP IF EXISTS
+	// CHECK in 00192, this pin + the DROP+ADD in 00226 must update
+	// together. Silent breakage here means 00226's DROP IF EXISTS
 	// falls through to a no-op and the OLD CHECK (without 'geo')
 	// survives — which is exactly the regression this test
 	// surfaces.
@@ -143,7 +143,7 @@ func TestMigrations_00223_EdgeRulesKindGeo(t *testing.T) {
 		t.Fatalf("read edge_rules kind CHECK constraint: %v", err)
 	}
 	if constraintName != "edge_rules_kind_check" {
-		t.Errorf("edge_rules kind CHECK named %q, want %q (regression: 00223's DROP+ADD targets this name; if 00192 renames the inline CHECK, both must update together)",
+		t.Errorf("edge_rules kind CHECK named %q, want %q (regression: 00226's DROP+ADD targets this name; if 00192 renames the inline CHECK, both must update together)",
 			constraintName, "edge_rules_kind_check")
 	}
 }

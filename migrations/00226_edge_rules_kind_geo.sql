@@ -1,4 +1,4 @@
--- filename: 00223_edge_rules_kind_geo.sql
+-- filename: 00226_edge_rules_kind_geo.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -19,14 +19,19 @@
 -- A plain ADD CONSTRAINT is correct: validity check is free because
 -- the new set is a strict superset of the old set.
 --
--- This migration lands after 00222 (PR #863 / ADR-096 PR-A
--- app_errors). PR #845 (this PR) renumbered kind=geo through
+-- This migration lands after 00225 (PR #866 / ADR-091 D20-D25
+-- cors_defaults). PR #845 (this PR) renumbered kind=geo through
 -- 00207 → 00215 → 00216 → 00217 → 00218 → 00220 → 00221 → 00222
--- → 00223 as main picked up sibling migrations that claimed the
--- earlier slots (PR #844 ADR-093, PR #849 ADR-092, PR #855
+-- → 00223 → 00226 as main picked up sibling migrations that claimed
+-- the earlier slots (PR #844 ADR-093, PR #849 ADR-092, PR #855
 -- ADR-091 D24, PR #851 issue-272, PR #854 ADR-095, PR #863
--- ADR-096 PR-A). The fenced slots at 00217 + 00218 + 00221
--- carry cross-PR coordination fences.
+-- ADR-096 PR-A, PR #866 ADR-091 D20-D25 cors_defaults). The final
+-- 00223 → 00226 hop was caused by PR #866 landing at 00224 with a
+-- 00223_reserve_slot.sql coexistence fence aimed at PR #845 —
+-- rather than overwrite that coordination, we stepped kind=geo to
+-- the next free slot 00226 and drop the coexistence fence at
+-- merge. The fenced slots at 00217 + 00218 + 00221 + 00223 (PR
+-- #866's) carry cross-PR coordination fences.
 --
 -- Sub-decision hop (D21) deviates from the team's ADR-091 D14 default
 -- of "Hobby+ only" for non-trivial edge-rule kinds: geo is allowed on
