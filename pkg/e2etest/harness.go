@@ -538,7 +538,7 @@ const testDomain = "apps.test.example"
 //     compute_node_heartbeats_stats (PR #851), 216
 //     apps_route_metrics_enabled (PR #860), 217 ADR-092
 //     app_secrets_scope (PR #849), 218 preview-envs (PR
-//     preview-envs ADR-095), 219 edge_rules_kind_limit (PR
+//     preview-envs ADR-098 per PR #876), 219 edge_rules_kind_limit (PR
 //     kind=validate PR-C), 220 preview_app_columns (PR preview
 //     envs), 221 ADR-096 reserve fence for slot 222 itself, 222
 //     app_errors (PR #863), 223 PR #866 coexistence fence
