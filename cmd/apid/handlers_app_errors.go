@@ -37,6 +37,7 @@ import (
 // fingerprint for the summary; received_at, request_id for the
 // drill-down).
 type errorsCursorShape struct {
+	Count       int64  `json:"c,omitempty"`
 	LastSeenAt  string `json:"l,omitempty"`
 	Fingerprint string `json:"f,omitempty"`
 	ReceivedAt  string `json:"r,omitempty"`
@@ -45,7 +46,9 @@ type errorsCursorShape struct {
 
 // encodeErrorsCursor base64-url-encodes a cursor shape. Returns
 // "" for the zero-value (matches the "no further page" sentinel
-// contract used elsewhere in apid).
+// contract used elsewhere in apid). The summary cursor is keyed
+// on (count, last_seen_at, fingerprint); the drill-down cursor
+// is keyed on (received_at, request_id) and ignores Count.
 func encodeErrorsCursor(c errorsCursorShape) string {
 	if c.LastSeenAt == "" && c.Fingerprint == "" &&
 		c.ReceivedAt == "" && c.RequestID == "" {
@@ -79,7 +82,7 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 		return
 	}
 	q := r.URL.Query()
-	until, since, err := parseAppErrorsSummaryWindow(q.Get("since"), q.Get("until"))
+	until, since, windowClamped, err := parseAppErrorsSummaryWindow(q.Get("since"), q.Get("until"))
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "validation_failed", "invalid window", err.Error()))
 		return
@@ -89,13 +92,13 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "validation_failed", "invalid limit", err.Error()))
 		return
 	}
-	curLS, curFP, err := decodeSummaryCursor(q.Get("cursor"))
+	curC, curLS, curFP, err := decodeSummaryCursor(q.Get("cursor"))
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "validation_failed", "invalid cursor", err.Error()))
 		return
 	}
 	rows, err := s.store.ListAppErrorGroups(r.Context(), buildAppErrorsSummaryParams(
-		acct.ID, app.ID, since, until, curLS, curFP, limit,
+		acct.ID, app.ID, since, until, curC, curLS, curFP, limit,
 	))
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "internal_error", "list failed", "see request_id"))
@@ -106,6 +109,7 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 	if len(items) == limit {
 		last := rows[len(rows)-1]
 		next = encodeErrorsCursor(errorsCursorShape{
+			Count:       last.Count,
 			LastSeenAt:  last.LastSeenAt.UTC().Format(time.RFC3339Nano),
 			Fingerprint: last.Fingerprint,
 		})
@@ -116,7 +120,7 @@ func (s *server) getAppErrorsSummary(w http.ResponseWriter, r *http.Request, acc
 		AppSlug:       app.Slug,
 		WindowStart:   since.UTC().Format(time.RFC3339Nano),
 		WindowEnd:     until.UTC().Format(time.RFC3339Nano),
-		WindowClamped: until.Sub(since) > time.Duration(api.AppErrorsWindowMaxHours)*time.Hour,
+		WindowClamped: windowClamped,
 		Items:         items,
 		NextCursor:    next,
 		Limit:         limit,
@@ -275,15 +279,18 @@ func appErrorRequestsHeader(row state.AppErrorRequestRow, fingerprint string) st
 // parseAppErrorsSummaryWindow parses ?since= and ?until= as
 // RFC3339Nano UTC strings. Missing ?until defaults to now().
 // Missing ?since defaults to until - 24h. The returned span is
-// clamped to AppErrorsWindowMaxHours (168h) — the handler
-// reports WindowClamped=true when the clamp fires.
-func parseAppErrorsSummaryWindow(sinceStr, untilStr string) (until, since time.Time, err error) {
+// clamped to AppErrorsWindowMaxHours (168h) — the returned bool
+// is true when the clamp fires. The bool is computed against the
+// PRE-CLAMP span: comparing post-clamp `until.Sub(since)` would
+// always be ≤ max and the dashboard "you widened past the cap"
+// tile would never render.
+func parseAppErrorsSummaryWindow(sinceStr, untilStr string) (until, since time.Time, clamped bool, err error) {
 	if untilStr == "" {
 		until = time.Now().UTC()
 	} else {
 		until, err = time.Parse(time.RFC3339Nano, untilStr)
 		if err != nil {
-			return time.Time{}, time.Time{}, err
+			return time.Time{}, time.Time{}, false, err
 		}
 		until = until.UTC()
 	}
@@ -292,23 +299,27 @@ func parseAppErrorsSummaryWindow(sinceStr, untilStr string) (until, since time.T
 	} else {
 		since, err = time.Parse(time.RFC3339Nano, sinceStr)
 		if err != nil {
-			return time.Time{}, time.Time{}, err
+			return time.Time{}, time.Time{}, false, err
 		}
 		since = since.UTC()
 	}
 	max := time.Duration(api.AppErrorsWindowMaxHours) * time.Hour
 	if until.Sub(since) > max {
+		clamped = true
 		since = until.Add(-max)
 	}
 	if !since.Before(until) {
-		return time.Time{}, time.Time{}, errAppErrorsWindowInvalid
+		return time.Time{}, time.Time{}, false, errAppErrorsWindowInvalid
 	}
-	return until, since, nil
+	return until, since, clamped, nil
 }
 
 // parseAppErrorsLimit parses ?limit= with the defaults and
-// caps from pkg/api/limits.go. Empty / 0 → default; over max
-// → clamped to max; negative → 400.
+// caps from pkg/api/limits.go. Empty → default; 0 / negative
+// → 400 (the handler uses len(items)==limit as the
+// "page was filled" signal and the cursor-encode branch then
+// reads rows[len(rows)-1]; limit=0 with an empty page would
+// panic). Over max → clamped to max.
 func parseAppErrorsLimit(s string) (int, error) {
 	if s == "" {
 		return api.AppErrorsSummaryDefaultLimit, nil
@@ -317,7 +328,7 @@ func parseAppErrorsLimit(s string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if n < 0 {
+	if n <= 0 {
 		return 0, errAppErrorsLimitInvalid
 	}
 	if n > api.AppErrorsSummaryMaxLimit {
@@ -327,29 +338,34 @@ func parseAppErrorsLimit(s string) (int, error) {
 }
 
 // decodeSummaryCursor parses the opaque cursor on the summary
-// endpoint. Returns (nil, nil, nil) for the empty cursor — the
-// SQL predicate uses IS NULL on the time column as the fast-path.
-func decodeSummaryCursor(s string) (*time.Time, *string, error) {
+// endpoint. Returns (nil, nil, nil, nil) for the empty cursor —
+// the SQL predicate uses IS NULL on the count column as the
+// fast-path. Count is part of the (count, last_seen_at,
+// fingerprint) seek tuple; without it the cursor would silently
+// drop or duplicate rows at count-group boundaries (page-2 rows
+// with same last_seen_at but smaller fingerprint get returned
+// again).
+func decodeSummaryCursor(s string) (*int64, *time.Time, *string, error) {
 	if s == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	raw, err := base64.URLEncoding.DecodeString(s)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var c errorsCursorShape
 	if err := json.Unmarshal(raw, &c); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if c.LastSeenAt == "" || c.Fingerprint == "" {
-		return nil, nil, errAppErrorsCursorShape
+		return nil, nil, nil, errAppErrorsCursorShape
 	}
 	t, err := time.Parse(time.RFC3339Nano, c.LastSeenAt)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	fp := c.Fingerprint
-	return &t, &fp, nil
+	return &c.Count, &t, &fp, nil
 }
 
 // decodeDrilldownCursor parses the opaque cursor on the

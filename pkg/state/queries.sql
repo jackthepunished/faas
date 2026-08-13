@@ -949,15 +949,22 @@ INSERT INTO app_error_requests (
 -- name: ListAppErrorGroups :many
 -- ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
 -- one (account_id, app_id) over a (since, until) window.
--- Cursor pagination via the (last_seen_at, fingerprint) compound
--- tuple (distinct from the operator's (created_at, id) cursor).
+-- Cursor pagination via the (count, last_seen_at, fingerprint)
+-- compound tuple (distinct from the operator's (created_at, id)
+-- cursor). All three columns are part of the ORDER BY so the
+-- cursor predicate must include all three — dropping `count`
+-- breaks pagination: rows with smaller count but newer
+-- last_seen_at are silently dropped across pages (the cursor
+-- predicate on (last_seen_at, fingerprint) only considers the
+-- inner order, missing the leading count-DESC boundary).
 -- Index path: app_errors_account_app_last_seen_idx covers the
 -- primary scan; the (count DESC) sort happens post-filter on the
 -- bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
 --
 -- sqlc.arg(name) annotations disambiguate the cursor predicate
--- types — without them sqlc infers both $5 and $6 as timestamptz
--- from the leading (last_seen_at) reference, breaking pagination.
+-- types — without them sqlc infers the timestamps as timestamptz
+-- from the leading (count, last_seen_at) references and breaks
+-- pagination.
 SELECT
     id, fingerprint, error_class, route, http_status,
     count, request_count, first_seen_at, last_seen_at,
@@ -967,8 +974,10 @@ WHERE account_id = sqlc.arg('account_id')
   AND app_id     = sqlc.arg('app_id')
   AND last_seen_at >= sqlc.arg('since')
   AND last_seen_at <= sqlc.arg('until')
-  AND (sqlc.arg('cursor_last_seen')::timestamptz IS NULL
-       OR (last_seen_at, fingerprint) < (sqlc.arg('cursor_last_seen'), sqlc.arg('cursor_fingerprint')::text))
+  AND (sqlc.arg('cursor_count')::bigint IS NULL
+       OR count < sqlc.arg('cursor_count')
+       OR (count = sqlc.arg('cursor_count')
+           AND (last_seen_at, fingerprint) < (sqlc.arg('cursor_last_seen'), sqlc.arg('cursor_fingerprint')::text)))
 ORDER BY count DESC, last_seen_at DESC, fingerprint ASC
 LIMIT sqlc.arg('limit');
 

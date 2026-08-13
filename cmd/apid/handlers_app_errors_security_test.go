@@ -149,21 +149,32 @@ func TestAppErrorsSecurity_NoSealedBlobsOnSummary(t *testing.T) {
 // mishandle. The test is the unit-level companion to the
 // integration security test above.
 func TestAppErrorsSecurity_ParseAppErrorsSummaryWindow_PureUnit(t *testing.T) {
-	until, since, err := parseAppErrorsSummaryWindow("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
+	until, since, _, err := parseAppErrorsSummaryWindow("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
 	if err != nil {
 		t.Fatalf("parse window: %v", err)
 	}
 	if !since.Before(until) {
 		t.Errorf("since %v should be before until %v", since, until)
 	}
-	// Default window (missing since/until) should clamp to
-	// until - 24h and pass the since.Before(until) check.
-	until, since, err = parseAppErrorsSummaryWindow("", "")
+	// A span larger than AppErrorsWindowMaxHours must report
+	// windowClamped=true so the dashboard tile renders.
+	_, _, clamped, err := parseAppErrorsSummaryWindow(
+		"2026-08-01T00:00:00Z", "2026-08-12T00:00:00Z", // 264h
+	)
+	if err != nil {
+		t.Fatalf("parse over-cap window: %v", err)
+	}
+	if !clamped {
+		t.Errorf("over-cap span should clamp; want clamped=true")
+	}
+	// Default window (missing since/until) should NOT clamp
+	// (24h is well under the 168h cap).
+	_, _, clamped, err = parseAppErrorsSummaryWindow("", "")
 	if err != nil {
 		t.Fatalf("parse default window: %v", err)
 	}
-	if !since.Before(until) {
-		t.Errorf("default since %v should be before until %v", since, until)
+	if clamped {
+		t.Errorf("24h default window should not clamp; want clamped=false")
 	}
 }
 
@@ -175,6 +186,13 @@ func TestAppErrorsSecurity_ParseAppErrorsSummaryWindow_PureUnit(t *testing.T) {
 func TestAppErrorsSecurity_ParseLimit_ClampsAndDefaults(t *testing.T) {
 	if n, err := parseAppErrorsLimit(""); err != nil || n != api.AppErrorsSummaryDefaultLimit {
 		t.Errorf("empty limit: got (%d, %v), want (%d, nil)", n, err, api.AppErrorsSummaryDefaultLimit)
+	}
+	// limit=0 would crash the cursor-emit branch with
+	// rows[len(rows)-1] on an empty slice. The parser must
+	// reject it; the handler treats that as a 400 to the
+	// client.
+	if _, err := parseAppErrorsLimit("0"); err == nil {
+		t.Errorf("limit=0 should fail (would panic cursor encode)")
 	}
 	if _, err := parseAppErrorsLimit("-1"); err == nil {
 		t.Errorf("negative limit should 400")
@@ -210,7 +228,10 @@ func TestAppErrorsSecurity_FingerprintRegex_PureUnit(t *testing.T) {
 // silently truncate the pagination (the next page would
 // start at the wrong boundary).
 func TestAppErrorsSecurity_CursorRoundtrip_PureUnit(t *testing.T) {
+	// Cursor carries (count, last_seen_at, fingerprint) so the
+	// compound-key seek survives count-group boundaries.
 	c := errorsCursorShape{
+		Count:       42,
 		LastSeenAt:  "2026-08-01T00:00:00.000000000Z",
 		Fingerprint: strings.Repeat("a", 64),
 	}
@@ -226,8 +247,20 @@ func TestAppErrorsSecurity_CursorRoundtrip_PureUnit(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.LastSeenAt != c.LastSeenAt || got.Fingerprint != c.Fingerprint {
+	if got.LastSeenAt != c.LastSeenAt || got.Fingerprint != c.Fingerprint || got.Count != c.Count {
 		t.Errorf("cursor round-trip drift: got %+v, want %+v", got, c)
+	}
+	// Decode the cursor and confirm count propagates into the
+	// SQL params boundary (sqlc.ListAppErrorGroupsParams.CursorCount).
+	gotCount, gotLS, gotFP, err := decodeSummaryCursor(enc)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+	if gotCount == nil || *gotCount != 42 {
+		t.Errorf("count: got %v, want 42", gotCount)
+	}
+	if gotLS == nil || gotFP == nil {
+		t.Errorf("ls / fp should be non-nil")
 	}
 }
 
@@ -236,15 +269,15 @@ func TestAppErrorsSecurity_CursorRoundtrip_PureUnit(t *testing.T) {
 // missing fields all return errors so the handler can 400
 // rather than silently truncating.
 func TestAppErrorsSecurity_CursorDecode_RejectsBadInput(t *testing.T) {
-	if _, _, err := decodeSummaryCursor("not-base64!@#"); err == nil {
+	if _, _, _, err := decodeSummaryCursor("not-base64!@#"); err == nil {
 		t.Errorf("non-base64 cursor should fail")
 	}
-	if _, _, err := decodeSummaryCursor(base64.URLEncoding.EncodeToString([]byte("not json"))); err == nil {
+	if _, _, _, err := decodeSummaryCursor(base64.URLEncoding.EncodeToString([]byte("not json"))); err == nil {
 		t.Errorf("non-JSON cursor should fail")
 	}
 	// missing LastSeenAt
 	bad := errorsCursorShape{Fingerprint: "abcd"}
-	if _, _, err := decodeSummaryCursor(encodeErrorsCursor(bad)); err == nil {
+	if _, _, _, err := decodeSummaryCursor(encodeErrorsCursor(bad)); err == nil {
 		t.Errorf("missing last_seen should fail")
 	}
 }

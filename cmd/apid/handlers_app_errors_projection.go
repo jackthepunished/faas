@@ -69,10 +69,15 @@ import (
 func buildAppErrorsSummaryParams(
 	accountID, appID string,
 	since, until time.Time,
+	cursorCount *int64,
 	cursorLastSeenAt *time.Time,
 	cursorFingerprint *string,
 	limit int,
 ) sqlc.ListAppErrorGroupsParams {
+	curC := int64(0)
+	if cursorCount != nil {
+		curC = *cursorCount
+	}
 	curLS := pgtype.Timestamptz{}
 	if cursorLastSeenAt != nil {
 		curLS = pgtype.Timestamptz{Time: *cursorLastSeenAt, Valid: true}
@@ -86,6 +91,7 @@ func buildAppErrorsSummaryParams(
 		AppID:             pgtypeFromUUIDString(appID),
 		Since:             pgtype.Timestamptz{Time: since, Valid: true},
 		Until:             pgtype.Timestamptz{Time: until, Valid: true},
+		CursorCount:       curC,
 		CursorLastSeen:    curLS,
 		CursorFingerprint: curFP,
 		Limit:             int32(limit),
@@ -199,17 +205,6 @@ func projectAppErrorRequestRows(rows []state.AppErrorRequestRow) []api.AppErrorR
 		out = append(out, item)
 	}
 	return out
-}
-
-// projectAppErrorSampleHeader copies the drill-down header
-// fields (fingerprint, error_class, route, http_status) from the
-// parent summary row onto the /first response so the dashboard
-// can render the "what does this look like" preview without a
-// second round-trip to /errors/summary. The /first row's own
-// fields override nothing — this is a header denormalisation
-// from a known-good parent.
-func projectAppErrorSampleHeader(parent state.AppErrorGroup) (string, string, string, int32) {
-	return parent.Fingerprint, parent.ErrorClass, parent.Route, parent.HTTPStatus
 }
 
 // parseHeadersSample parses the jsonb blob stored on
