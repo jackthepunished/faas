@@ -235,6 +235,16 @@ func (c *Config) LoadServerTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, er
 	return wire.LoadServerTLSConfigWithVerifier(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath, v)
 }
 
+// LoadServerTLSWithPrefixAndVerifierAndReload is the ADR-052 §5
+// / PR-E variant: per-handshake verifier + SIGHUP-driven cert
+// rotation. nil v and nil reload are tolerated and degrade to
+// LoadServerTLS (no hook, no callback) — same back-compat shape
+// as LoadServerTLSWithVerifier. The reload closure is consulted
+// by stdlib's per-handshake GetConfigForClient callback.
+func (c *Config) LoadServerTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	return wire.LoadServerTLSConfigWithPrefixAndVerifierAndReload("", c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath, v, reload)
+}
+
 // LoadScheddClientTLS returns the client mTLS config vmmd uses to
 // dial schedd for the capacity publisher (ADR-052). Empty cluster
 // returns (nil, nil); partial cluster is rejected.
@@ -247,6 +257,17 @@ func (c *Config) LoadScheddClientTLS() (*tls.Config, error) {
 // installed; prefix ("schedd_client_") names missing fields.
 func (c *Config) LoadScheddClientTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefixAndVerifier("schedd_client_", c.ScheddClientCertPath, c.ScheddClientKeyPath, c.ScheddClientCAPath, v)
+}
+
+// LoadScheddClientTLSWithPrefixAndVerifierAndReload is the
+// ADR-052 §5 / PR-E variant. Same nil-tolerance contract as the
+// server variant: nil v / nil reload degrade to the no-hook /
+// no-callback shape (LoadScheddClientTLS). The reload closure
+// re-issues the client leaf on every handshake via stdlib's
+// GetClientCertificate; trust root is fixed at construction per
+// ADR-052 §Risks "CA rotation pain".
+func (c *Config) LoadScheddClientTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefixAndVerifierAndReload("schedd_client_", c.ScheddClientCertPath, c.ScheddClientKeyPath, c.ScheddClientCAPath, v, reload)
 }
 
 // LoadAdvisoryClientTLS returns the client mTLS config vmmd uses to

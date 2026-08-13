@@ -17,11 +17,15 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -724,6 +728,626 @@ func TestTLSLoadersWithPrefix(t *testing.T) {
 		}
 	})
 }
+
+// --- Load*TLSConfigWithReload factories (PR-E / ADR-052 §5) --------------
+//
+// Coverage targets:
+//   - All-empty inputs preserve the (nil, nil) contract.
+//   - Partial cluster inputs keep the Load*TLSConfig error shape (prefixed
+//     field names).
+//   - reload==nil degrades to the no-callback contract — the returned
+//     config behaves exactly like the non-reload factory.
+//   - reload!=nil installs GetConfigForClient on server factories and
+//     GetClientCertificate on client factories.
+//   - The composed *WithVerifierAndReload factory installs BOTH the
+//     verifier hook AND the reload callback on the same *tls.Config.
+//   - Calling the installed callback exercises the closure end-to-end
+//     and returns a fresh *tls.Config (or *tls.Certificate, for the
+//     client callback) that stdlib would hand to the handshake path.
+//   - Reload returning an error propagates through both callbacks so
+//     stdlib surfaces it as a handshake failure.
+//   - Reload returning a *tls.Config with no Certificates surfaces
+//     only via GetClientCertificate (server callback doesn't peek).
+
+func TestTLSLoadersWithReload_AllEmptyReturnsNilNil(t *testing.T) {
+	cases := []struct {
+		name string
+		load func() (*tls.Config, error)
+	}{
+		{"server", func() (*tls.Config, error) { return LoadServerTLSConfigWithReload("", "", "", "", nil) }},
+		{"server+prefix+verifier", func() (*tls.Config, error) {
+			return LoadServerTLSConfigWithPrefixAndVerifierAndReload("vmmd_", "", "", "", nil, nil)
+		}},
+		{"client", func() (*tls.Config, error) { return LoadClientTLSConfigWithReload("", "", "", "", nil) }},
+		{"client+prefix+verifier", func() (*tls.Config, error) {
+			return LoadClientTLSConfigWithPrefixAndVerifierAndReload("vmmd_", "", "", "", nil, nil)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := tc.load()
+			if err != nil || cfg != nil {
+				t.Fatalf("all-empty: cfg=%v err=%v, want nil/nil", cfg, err)
+			}
+		})
+	}
+}
+
+func TestTLSLoadersWithReload_PartialClusterStillRejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		cert, key string
+		prefix    string
+		load      func(prefix, cert, key string) (*tls.Config, error)
+		wantSubs  []string
+	}{
+		{"server+prefix cert-only", "a", "", "vmmd_",
+			func(p, c, k string) (*tls.Config, error) { return LoadServerTLSConfigWithReload(p, c, k, "", nil) },
+			[]string{"vmmd_tls_key_path", "vmmd_tls_ca_path"}},
+		{"server+verifier+reload cert+key no ca", "a", "b", "vmmd_",
+			func(p, c, k string) (*tls.Config, error) {
+				return LoadServerTLSConfigWithPrefixAndVerifierAndReload(p, c, k, "", nil, nil)
+			},
+			[]string{"vmmd_tls_ca_path"}},
+		{"client+prefix cert+ca no key", "a", "", "vmmd_",
+			func(p, c, k string) (*tls.Config, error) {
+				return LoadClientTLSConfigWithPrefixAndVerifierAndReload(p, c, k, "", nil, nil)
+			},
+			[]string{"vmmd_tls_key_path"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.load(tc.prefix, tc.cert, tc.key)
+			if err == nil {
+				t.Fatalf("expected error naming missing fields")
+			}
+			for _, want := range tc.wantSubs {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %q; want substring %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestTLSLoadersWithReload_NilReloadDegradesToNoCallback pins the
+// single-box / pre-PR-E back-compat path: a nil reload closure means
+// the returned config is the same as the non-reload factory's — no
+// GetConfigForClient, no GetClientCertificate. This is what lets a
+// caller pass reload=nil for "no cluster configured" without changing
+// behaviour.
+func TestTLSLoadersWithReload_NilReloadDegradesToNoCallback(t *testing.T) {
+	pki := newTestPKI(t)
+
+	server, err := LoadServerTLSConfigWithReload("", pki.serverCert, pki.serverKey, pki.caCert, nil)
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if server.GetConfigForClient != nil {
+		t.Errorf("server reload=nil: GetConfigForClient = %p, want nil", server.GetConfigForClient)
+	}
+	if server.GetClientCertificate != nil {
+		t.Errorf("server reload=nil: GetClientCertificate = %p, want nil", server.GetClientCertificate)
+	}
+
+	client, err := LoadClientTLSConfigWithReload("", pki.clientCert, pki.clientKey, pki.caCert, nil)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	if client.GetConfigForClient != nil {
+		t.Errorf("client reload=nil: GetConfigForClient = %p, want nil", client.GetConfigForClient)
+	}
+	if client.GetClientCertificate != nil {
+		t.Errorf("client reload=nil: GetClientCertificate = %p, want nil", client.GetClientCertificate)
+	}
+}
+
+// TestTLSLoadersWithReload_ServerInstallsGetConfigForClient pins the
+// "reload installs server callback" contract. The callback, when
+// invoked, MUST return the closure's *tls.Config so stdlib hands it
+// to the handshake path. The verification chain (chain / SAN / EKU)
+// is stdlib's responsibility — we only pin that the callback fires
+// and the returned config carries the loader-built cert material.
+//
+// Regression guard (pkg/wire/grpc.go setReloadCallbacks refactor):
+// the previous single-helper version installed BOTH GetConfigForClient
+// AND GetClientCertificate on every config regardless of role. The
+// server-side field GetClientCertificate is dead code on a server
+// config (stdlib never consults it), so the corrected factory
+// (setServerReloadCallback) leaves it nil. If a future change
+// reinstalls the dual-install, this test fails the
+// "server GetClientCertificate = nil" assertion below.
+func TestTLSLoadersWithReload_ServerInstallsGetConfigForClient(t *testing.T) {
+	pki := newTestPKI(t)
+
+	calls := 0
+	reload := func() (*tls.Config, error) {
+		calls++
+		// Return a real config built via the existing non-reload
+		// factory — exercises the same load path WatchTLSReload
+		// will hit in production.
+		return LoadServerTLSConfig(pki.serverCert, pki.serverKey, pki.caCert)
+	}
+
+	cfg, err := LoadServerTLSConfigWithReload("", pki.serverCert, pki.serverKey, pki.caCert, reload)
+	if err != nil {
+		t.Fatalf("LoadServerTLSConfigWithReload: %v", err)
+	}
+	if cfg.GetConfigForClient == nil {
+		t.Fatal("GetConfigForClient = nil, want non-nil")
+	}
+	if cfg.GetClientCertificate != nil {
+		t.Fatal("GetClientCertificate != nil on server config: setServerReloadCallback must leave it untouched (stdlib only consults it for client configs)")
+	}
+
+	// Fire the callback. With pki as the material, the returned
+	// config must carry the loaded leaf (one Certificates entry).
+	got, err := cfg.GetConfigForClient(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("callback: %v", err)
+	}
+	if got == nil {
+		t.Fatal("callback returned nil *tls.Config")
+	}
+	if len(got.Certificates) != 1 {
+		t.Errorf("returned config: %d Certificates entries, want 1", len(got.Certificates))
+	}
+	if calls != 1 {
+		t.Errorf("reload called %d times, want 1", calls)
+	}
+
+	// A second invocation must consult the closure again (the
+	// contract is "fresh per handshake"). This pins stdlib's
+	// per-handshake behaviour that gRPC's tlsCreds relies on.
+	if _, err := cfg.GetConfigForClient(&tls.ClientHelloInfo{}); err != nil {
+		t.Fatalf("callback (2nd): %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("reload called %d times after second invoke, want 2", calls)
+	}
+}
+
+// TestTLSLoadersWithReload_ClientInstallsGetClientCertificate pins
+// the client-side contract: the callback returns a *tls.Certificate
+// derived from the closure's freshly-built config's Certificates[0].
+// An empty Certificates slice MUST surface an explicit error rather
+// than panic — stdlib would convert a nil *tls.Certificate into a
+// confusing handshake failure, the explicit error makes the operator's
+// job easier.
+//
+// Mirrors the regression guard above: setClientReloadCallback leaves
+// GetConfigForClient untouched on a client config (stdlib never
+// consults it). Pinning the nil here catches a future re-introduction
+// of the dual-install pattern.
+func TestTLSLoadersWithReload_ClientInstallsGetClientCertificate(t *testing.T) {
+	pki := newTestPKI(t)
+
+	calls := 0
+	reload := func() (*tls.Config, error) {
+		calls++
+		return LoadClientTLSConfig(pki.clientCert, pki.clientKey, pki.caCert)
+	}
+
+	cfg, err := LoadClientTLSConfigWithReload("", pki.clientCert, pki.clientKey, pki.caCert, reload)
+	if err != nil {
+		t.Fatalf("LoadClientTLSConfigWithReload: %v", err)
+	}
+	if cfg.GetClientCertificate == nil {
+		t.Fatal("GetClientCertificate = nil, want non-nil")
+	}
+	if cfg.GetConfigForClient != nil {
+		t.Fatal("GetConfigForClient != nil on client config: setClientReloadCallback must leave it untouched (stdlib only consults it for server configs)")
+	}
+
+	cert, err := cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("callback: %v", err)
+	}
+	if cert == nil {
+		t.Fatal("callback returned nil *tls.Certificate")
+	}
+	if len(cert.Certificate) == 0 {
+		t.Error("returned cert has 0 raw DER bytes")
+	}
+	if calls != 1 {
+		t.Errorf("reload called %d times, want 1", calls)
+	}
+}
+
+// TestTLSLoadersWithReload_ClientEmptyCertsSurfacesError pins the
+// "no Certificates" guard in setReloadCallbacks' client callback. A
+// closure that returns a *tls.Config with no Certificates (the
+// production edge case: a fresh LoadX509KeyPair succeeded but the
+// returned Certificate slice is empty — extremely unusual, but the
+// guard prevents a confusing nil-pointer panic inside stdlib).
+func TestTLSLoadersWithReload_ClientEmptyCertsSurfacesError(t *testing.T) {
+	pki := newTestPKI(t)
+
+	reload := func() (*tls.Config, error) {
+		return &tls.Config{}, nil // no Certificates
+	}
+
+	cfg, err := LoadClientTLSConfigWithReload("", pki.clientCert, pki.clientKey, pki.caCert, reload)
+	if err != nil {
+		t.Fatalf("LoadClientTLSConfigWithReload: %v", err)
+	}
+	cert, err := cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err == nil {
+		t.Fatalf("expected error for empty Certificates, got nil (cert=%v)", cert)
+	}
+	if !strings.Contains(err.Error(), "no Certificates") {
+		t.Errorf("err = %q; want substring %q", err.Error(), "no Certificates")
+	}
+}
+
+// TestTLSLoadersWithReload_ReloadErrorPropagates pins the contract
+// that a closure error flows through both stdlib callbacks. Stdlib
+// surfaces a callback-returned error as a TLS handshake failure —
+// failing closed is the right behaviour for a temporarily-missing
+// cert file (WatchTLSReload keeps the prior material live on its
+// end, but the per-handshake callback is allowed to fail closed).
+func TestTLSLoadersWithReload_ReloadErrorPropagates(t *testing.T) {
+	pki := newTestPKI(t)
+
+	boom := errors.New("reload: file vanished")
+	reload := func() (*tls.Config, error) { return nil, boom }
+
+	srv, err := LoadServerTLSConfigWithReload("", pki.serverCert, pki.serverKey, pki.caCert, reload)
+	if err != nil {
+		t.Fatalf("LoadServerTLSConfigWithReload: %v", err)
+	}
+	got, err := srv.GetConfigForClient(&tls.ClientHelloInfo{})
+	if err == nil || got != nil {
+		t.Errorf("server: got=%v err=%v; want nil cfg + boom err", got, err)
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("server: err = %v, want %v", err, boom)
+	}
+
+	cli, err := LoadClientTLSConfigWithReload("", pki.clientCert, pki.clientKey, pki.caCert, reload)
+	if err != nil {
+		t.Fatalf("LoadClientTLSConfigWithReload: %v", err)
+	}
+	cert, err := cli.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err == nil || cert != nil {
+		t.Errorf("client: cert=%v err=%v; want nil cert + boom err", cert, err)
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("client: err = %v, want %v", err, boom)
+	}
+}
+
+// TestTLSLoadersWithReloadAndVerifier_BothHooksInstalled pins the
+// composed contract: a non-nil verifier AND a non-nil reload installs
+// BOTH the VerifyPeerCertificate hook AND the role-appropriate
+// reload callback on the same *tls.Config. This is the production
+// cmd/<daemon> call-site shape after PR-E.
+//
+// Regression guard (pkg/wire/grpc.go setReloadCallbacks refactor):
+// the previous single-helper version installed BOTH
+// GetConfigForClient (server callback) AND GetClientCertificate
+// (client callback) on every config regardless of role. The fixed
+// helpers (setServerReloadCallback / setClientReloadCallback) split
+// by role, so:
+//
+//   - server configs must have GetConfigForClient installed and
+//     GetClientCertificate MUST stay nil (stdlib never consults
+//     it for a server);
+//   - client configs must have GetClientCertificate installed and
+//     GetConfigForClient MUST stay nil (stdlib never consults it
+//     for a client).
+//
+// If a future change re-installs the dual-install on both roles,
+// the two negative assertions below fail.
+func TestTLSLoadersWithReloadAndVerifier_BothHooksInstalled(t *testing.T) {
+	pki := newTestPKI(t)
+
+	verifier := NewInmemNodeVerifier()
+	reload := func() (*tls.Config, error) {
+		return LoadServerTLSConfig(pki.serverCert, pki.serverKey, pki.caCert)
+	}
+
+	srv, err := LoadServerTLSConfigWithPrefixAndVerifierAndReload(
+		"vmmd_", pki.serverCert, pki.serverKey, pki.caCert, verifier, reload,
+	)
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if srv.VerifyPeerCertificate == nil {
+		t.Error("VerifyPeerCertificate = nil, want non-nil (verifier installed)")
+	}
+	if srv.GetConfigForClient == nil {
+		t.Error("GetConfigForClient = nil, want non-nil (server reload installed)")
+	}
+	if srv.GetClientCertificate != nil {
+		t.Error("server GetClientCertificate != nil: server config must not carry the client-side callback (stdlib only consults it for client configs)")
+	}
+
+	cli, err := LoadClientTLSConfigWithPrefixAndVerifierAndReload(
+		"vmmd_", pki.clientCert, pki.clientKey, pki.caCert, verifier, reload,
+	)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	if cli.VerifyPeerCertificate == nil {
+		t.Error("VerifyPeerCertificate = nil, want non-nil (verifier installed)")
+	}
+	if cli.GetClientCertificate == nil {
+		t.Error("GetClientCertificate = nil, want non-nil (client reload installed)")
+	}
+	if cli.GetConfigForClient != nil {
+		t.Error("client GetConfigForClient != nil: client config must not carry the server-side callback (stdlib only consults it for server configs)")
+	}
+}
+
+// TestTLSLoadersWithReloadAndVerifier_NilBothOrNilOne pins the
+// per-axis nil degradation: nil verifier → no hook; nil reload →
+// no callback; both nil → identical to the non-reload factory's
+// output (and by extension identical to
+// Load*TLSConfigWithPrefixAndVerifier when only reload is nil, or
+// Load*TLSConfigWithPrefix when both are nil).
+func TestTLSLoadersWithReloadAndVerifier_NilBothOrNilOne(t *testing.T) {
+	pki := newTestPKI(t)
+
+	cases := []struct {
+		name             string
+		verifier         NodeVerifier
+		reload           ReloadFunc
+		wantVerifyHook   bool
+		wantServerReload bool
+	}{
+		{"both nil: no hooks", nil, nil, false, false},
+		{"verifier only: hook yes reload no", NewInmemNodeVerifier(), nil, true, false},
+		{"reload only: hook no reload yes", nil, func() (*tls.Config, error) { return nil, nil }, false, true},
+		{"both: hook yes reload yes", NewInmemNodeVerifier(), func() (*tls.Config, error) { return nil, nil }, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := LoadServerTLSConfigWithPrefixAndVerifierAndReload(
+				"vmmd_", pki.serverCert, pki.serverKey, pki.caCert, tc.verifier, tc.reload,
+			)
+			if err != nil {
+				t.Fatalf("server: %v", err)
+			}
+			if (srv.VerifyPeerCertificate != nil) != tc.wantVerifyHook {
+				t.Errorf("server VerifyPeerCertificate: nil=%v, want hookInstalled=%v", srv.VerifyPeerCertificate == nil, tc.wantVerifyHook)
+			}
+			if (srv.GetConfigForClient != nil) != tc.wantServerReload {
+				t.Errorf("server GetConfigForClient: nil=%v, want installed=%v", srv.GetConfigForClient == nil, tc.wantServerReload)
+			}
+		})
+	}
+}
+
+// --- WatchTLSReload (PR-E / ADR-052 §5) ----------------------------------
+//
+// Coverage targets:
+//   - nil reload or nil reloader → silent early return.
+//   - Context cancel returns immediately without consuming hupCh.
+//   - Successful SIGHUP consults the closure + calls Set.
+//   - Multiple SIGHUPs in series each consult the closure + call Set.
+//   - Reload error keeps the prior material live (Set NOT called).
+//   - Reload returns nil *tls.Config keeps the prior material live.
+//
+// The test seam shape mirrors cmd/vmmd/egress_bundle_reload_test.go:
+// synthetic hupCh + stub setter + silent logger + polling waitForCalls.
+
+func TestWatchTLSReload_NilReloadOrReloaderNoOps(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hupCh := make(chan os.Signal, 1)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// nil reload → early return. The function exits before the
+	// for-loop, so even a closed ctx isn't required. Pin the
+	// "no panic / no hang" contract.
+	WatchTLSReload(ctx, log, hupCh, &recordingReloader{}, nil)
+
+	cancelledCtx, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	// nil reloader → early return too.
+	WatchTLSReload(cancelledCtx, log, hupCh, nil, func() (*tls.Config, error) { return nil, nil })
+}
+
+func TestWatchTLSReload_ContextCancelExits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	hupCh := make(chan os.Signal, 1)
+	close(hupCh) // doesn't matter — ctx is gone first
+
+	stub := &recordingReloader{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	WatchTLSReload(ctx, log, hupCh, stub, func() (*tls.Config, error) { return nil, nil })
+
+	// WatchTLSReload returns from ctx-done branch without calling
+	// the closure or Set.
+	stub.assertNoCalls(t)
+}
+
+func TestWatchTLSReload_SuccessfulHUPReplacesConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hupCh := make(chan os.Signal, 1)
+	stub := &recordingReloader{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	reloadCalled := 0
+	reload := func() (*tls.Config, error) {
+		reloadCalled++
+		return &tls.Config{MinVersion: tls.VersionTLS13}, nil
+	}
+
+	go WatchTLSReload(ctx, log, hupCh, stub, reload)
+
+	hupCh <- syscall.SIGHUP
+	waitForReloadCalls(t, stub, 1, 2*time.Second)
+	if reloadCalled != 1 {
+		t.Errorf("reload called %d times, want 1", reloadCalled)
+	}
+}
+
+func TestWatchTLSReload_MultipleHUPs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hupCh := make(chan os.Signal, 1)
+	stub := &recordingReloader{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	reloadCalled := 0
+	reload := func() (*tls.Config, error) {
+		reloadCalled++
+		return &tls.Config{MinVersion: tls.VersionTLS13}, nil
+	}
+
+	go WatchTLSReload(ctx, log, hupCh, stub, reload)
+
+	for i := 0; i < 3; i++ {
+		hupCh <- syscall.SIGHUP
+	}
+	waitForReloadCalls(t, stub, 3, 2*time.Second)
+	if reloadCalled != 3 {
+		t.Errorf("reload called %d times, want 3", reloadCalled)
+	}
+}
+
+func TestWatchTLSReload_KeepPriorOnError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hupCh := make(chan os.Signal, 1)
+	stub := &recordingReloader{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var (
+		counter reloadCallCounter
+	)
+	boom := errors.New("malformed PEM")
+	reload := func() (*tls.Config, error) {
+		counter.inc()
+		return nil, boom
+	}
+
+	go WatchTLSReload(ctx, log, hupCh, stub, reload)
+
+	hupCh <- syscall.SIGHUP
+	// Synchronise on the watcher having consulted the closure at
+	// least once — on error the watcher continues to the next
+	// select iteration without calling Set, so the only observable
+	// signal is the counter inside the closure.
+	waitForCounter(t, &counter, 1, 2*time.Second)
+	cancel()
+
+	stub.assertNoCalls(t)
+	if got := counter.get(); got != 1 {
+		t.Errorf("reload called %d times, want 1 (closure consulted even on error)", got)
+	}
+}
+
+func TestWatchTLSReload_KeepPriorOnNilConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hupCh := make(chan os.Signal, 1)
+	stub := &recordingReloader{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var counter reloadCallCounter
+	reload := func() (*tls.Config, error) {
+		counter.inc()
+		return nil, nil // explicit nil config
+	}
+
+	go WatchTLSReload(ctx, log, hupCh, stub, reload)
+
+	hupCh <- syscall.SIGHUP
+	waitForCounter(t, &counter, 1, 2*time.Second)
+	cancel()
+
+	stub.assertNoCalls(t)
+	if got := counter.get(); got != 1 {
+		t.Errorf("reload called %d times, want 1 (closure consulted even on nil cfg)", got)
+	}
+}
+
+// recordingReloader is the test-side stub for TLSReloader.Set.
+// Distinct from the recordingVerifier in config_verifier_test.go so
+// each test file's helper surface is self-contained. The stub
+// records every Set call with a mutex — the polling helpers race
+// against the watcher's goroutine.
+type recordingReloader struct {
+	mu   sync.Mutex
+	cfgs []*tls.Config
+}
+
+func (r *recordingReloader) Set(cfg *tls.Config) {
+	r.mu.Lock()
+	r.cfgs = append(r.cfgs, cfg)
+	r.mu.Unlock()
+}
+
+func (r *recordingReloader) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.cfgs)
+}
+
+func (r *recordingReloader) assertNoCalls(t *testing.T) {
+	t.Helper()
+	if n := r.calls(); n != 0 {
+		t.Errorf("Reloader.Set called %d times, want 0 (best-effort: prior material stays live)", n)
+	}
+}
+
+// waitForReloadCalls polls for up to within for the stub to record
+// want Set calls. Mirrors vmmd's waitForCalls shape.
+func waitForReloadCalls(t *testing.T, stub *recordingReloader, want int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if stub.calls() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("waitForReloadCalls: got %d Set calls, want %d within %s", stub.calls(), want, within)
+}
+
+// reloadCallCounter is a tiny mutex-guarded int the test injects
+// into its ReloadFunc closures. The closure increments the counter;
+// the test polls waitForCounter for synchronisation. Distinct from
+// the waitForReloadCalls path: that one observes Set calls on the
+// stub (the success path); this one observes closure invocations
+// directly (the failure / nil-cfg paths where Set never fires).
+type reloadCallCounter struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (r *reloadCallCounter) inc() {
+	r.mu.Lock()
+	r.count++
+	r.mu.Unlock()
+}
+
+func (r *reloadCallCounter) get() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.count
+}
+
+// waitForCounter polls for up to within for counter to reach want.
+func waitForCounter(t *testing.T, counter *reloadCallCounter, want int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if counter.get() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("waitForCounter: got %d, want %d within %s", counter.get(), want, within)
+}
+
+// --- Pre-PR-E tests continue below... ------------------------------------
 
 // TestTargetStringRoundTrip: pin the asymmetries of Target.String() so
 // nobody silently changes it. unix reconstructs the canonical form;

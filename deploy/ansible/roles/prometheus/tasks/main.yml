@@ -136,6 +136,23 @@
     mode: "0644"
   notify: reload prometheus
 
+# ADR-093 §12 dashboard — per-route observability recording rules
+# + the GatewayWildcardRoute alert. The rules file ships in this
+# role's `files/` dir (the only one that drops Prometheus rule
+# files — single source of truth per CLAUDE.md Component ownership)
+# and is already referenced from prometheus.yml.j2's `rule_files:`
+# block at line 18. This task is the missing staging step: without
+# it, the alert never evaluates on the box even though the scrape
+# config references the path.
+- name: prometheus — drop faas.rules.yml (ADR-093 §12 dashboard)
+  ansible.builtin.copy:
+    src: faas.rules.yml
+    dest: /etc/prometheus/faas.rules.yml
+    owner: prometheus
+    group: prometheus
+    mode: "0644"
+  notify: reload prometheus
+
 - name: prometheus — install systemd unit
   ansible.builtin.copy:
     src: prometheus.service

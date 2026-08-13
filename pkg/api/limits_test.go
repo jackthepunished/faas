@@ -73,6 +73,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// plan_websocket_not_allowed (mirrors Free's
 			// StreamingEnabled=false envelope above).
 			WebSocketEnabled: false,
+			// ADR-093: per-route metrics surface is a paid-tier
+			// feature — Free gated off (the abuse-floor tier's
+			// blast radius is small enough that route-level
+			// breakdown doesn't justify the per-app cap plumbing).
+			RouteMetricsEnabled: false,
 			// Issue #461 / ADR-062: Free has no private-registry
 			// credential surface (handler returns 403
 			// plan_registry_credentials_not_allowed).
@@ -170,6 +175,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// thin HTTP boundary, and Hobby is the tier where those
 			// workloads land first.
 			WebSocketEnabled: true,
+			// ADR-093: Hobby unlocks per-route observability as
+			// the first paid tier. The bounded cap (50 distinct
+			// real routes + __route_other__ overflow per app)
+			// is what makes this safe to enable across the
+			// paid tiers without per-tenant cardinality risk.
+			RouteMetricsEnabled: true,
 			// Issue #517 / PR-B: Hobby unlocks the `?deployment=`
 			// filter for the typical one-staging-deployment workload.
 			LogDeploymentFilterMax: 1,
@@ -257,6 +268,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Upgrade bridge for the same reason as Hobby — production
 			// workloads at this tier run agent / WS-backed services.
 			WebSocketEnabled: true,
+			// ADR-093: Pro mirrors Hobby — per-route observability
+			// on by default; same bounded cap (50 + overflow).
+			RouteMetricsEnabled: true,
 			// Issue #517 / PR-B: Pro gets 10 — covers the typical
 			// multi-staging fan-out (prod + 3-5 staging + a few
 			// preview slots) without monopolising the schedd's
@@ -357,6 +371,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Upgrade bridge — production WS-backed services sit at
 			// this tier.
 			WebSocketEnabled: true,
+			// ADR-093: Scale mirrors Hobby/Pro — per-route
+			// observability on by default. The 50-cap is per-app;
+			// Scale customers can run more apps, not more routes
+			// per app, so the cap stays the same across plans.
+			RouteMetricsEnabled: true,
 			// Issue #517 / PR-B: Scale gets 50 — 5× Pro, tracks the
 			// larger app budget (100 vs 25) and multi-region staging
 			// fan-out SaaS-scale customers typically run.

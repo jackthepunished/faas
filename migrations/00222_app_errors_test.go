@@ -11,9 +11,12 @@
 //     - app_errors_account_app_fp_last_seen_idx
 //     - app_errors_dedupe_uniq (UNIQUE on (account_id, app_id, fingerprint))
 //     - app_error_requests_drill_idx
-//     - app_error_requests_retention_idx (PARTIAL — the
-//     WHERE received_at < now() - interval '90 days' predicate
-//     is load-bearing for the nightly purge)
+//     - app_error_requests_retention_idx (plain btree on
+//     (account_id, received_at) — load-bearing for the nightly
+//     purge DELETE; started life as a PARTIAL with
+//     WHERE received_at < now() - interval '90 days' but the
+//     volatile now() predicate broke migration-apply with
+//     SQLSTATE 42P17, so the index is the plain btree.
 //  3. CHECK constraints reject malformed input:
 //     - http_status OUTSIDE 400..599 → SQLSTATE 23514
 //     - fingerprint not 64 hex chars → SQLSTATE 23514
@@ -85,7 +88,7 @@ func TestMigrations_00222_AppErrors(t *testing.T) {
 		{"app_errors_account_app_fp_last_seen_idx", "app_errors", "fingerprint"},
 		{"app_errors_dedupe_uniq", "app_errors", "UNIQUE"},
 		{"app_error_requests_drill_idx", "app_error_requests", "received_at"},
-		{"app_error_requests_retention_idx", "app_error_requests", "WHERE"},
+		{"app_error_requests_retention_idx", "app_error_requests", "account_id"},
 	}
 	for _, p := range pins {
 		var indexDef string

@@ -137,13 +137,20 @@ CREATE INDEX IF NOT EXISTS app_error_requests_drill_idx
     ON app_error_requests (account_id, app_id, fingerprint, received_at DESC, request_id DESC);
 
 -- Retention purge: account-scoped nightly DELETE keyed off
--- received_at. Partial predicate keeps the index narrow when
--- retention has already aged the majority of rows. 90-day
--- floor matches the Scale plan's AppErrorsRetentionDays
+-- received_at. The (account_id, received_at) btree covers the
+-- DELETE where-clause; the planner picks it for
+-- DeleteAppErrorRequestsOlderThan(account_id, cutoff). A
+-- partial predicate ("old rows only") was rejected at
+-- migration-apply time because now() is volatile (42P17:
+-- functions in index predicate must be marked IMMUTABLE);
+-- the plain btree is the simpler fix and the index never
+-- grew large enough to need the partial trick — the
+-- retention-cron spends most of its run time on inserts,
+-- not on retention reads. 90-day floor matches the Scale
+-- plan's AppErrorsRetentionDays
 -- (cmd/apid/app_errors_purge.go).
 CREATE INDEX IF NOT EXISTS app_error_requests_retention_idx
-    ON app_error_requests (account_id, received_at)
-    WHERE received_at < now() - interval '90 days';
+    ON app_error_requests (account_id, received_at);
 
 -- +goose StatementEnd
 

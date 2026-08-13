@@ -175,6 +175,24 @@ type Querier interface {
 	// scopes is the auth permission set surfaced to the dashboard and the
 	// /v1/keys listing. See ADR-034 rev2.
 	ListAPIKeys(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAPIKeysRow, error)
+	// ADR-091 §3.7 / PR #3 — operator-obs backend audit-reading surface.
+	// Reads the live events table (NOT audit_log — distinct source of
+	// truth per ADR-091 §3.7.4). Optional filters:
+	//   * $1 actor    — exact match (handler passes "" to skip)
+	//   * $2 kind_prefix — LIKE 'prefix%' (handler passes "" to skip)
+	//   * $3 subject  — exact match (handler passes "" to skip)
+	//   * $4 since    — RFC 3339 timestamptz (handler passes zero time to skip)
+	//   * $5 limit    — top-N rows (handler default 200, cap 500;
+	//                   cast to int8 so sqlc emits int64 Params and the
+	//                   handler's int→int64 widening is safe)
+	// Order: at DESC, id DESC — the id tiebreaker keeps the planner on
+	// the (kind, at DESC) index added by 00190_admin_obs_index.sql for
+	// kind-prefix queries and avoids an unstable sort on the
+	// over-read window.
+	// Subject is uuid (nullable in the schema); the cast is left to
+	// the handler so the handler can pass an empty string for "no
+	// subject filter" without a NULL literal.
+	ListAllEventsPaged(ctx context.Context, db DBTX, arg ListAllEventsPagedParams) ([]ListAllEventsPagedRow, error)
 	// Nightly retention purge read path (cmd/apid/app_errors_purge.go).
 	// Returns IDs of app_errors rows for an account older than
 	// `cutoff`. Capped at 10000 per call so the DELETE loop can
@@ -231,6 +249,23 @@ type Querier interface {
 	ListOrgInvitationsForOrg(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgInvitationsForOrgRow, error)
 	ListOrgMembers(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgMembersRow, error)
 	ListOrgsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOrgsForAccountRow, error)
+	// ADR-091 §3.7 / PR #3 — per-account events drill-down. Backed by
+	// the partial index events_actor_account_idx on
+	// (actor_account_id) WHERE actor_account_id IS NOT NULL
+	// (migrations/00099_orgs_memberships_invitations.sql). Filters:
+	//   * $1 actor_account_id — uuid (the account the actor belonged to)
+	//   * $2 since             — RFC 3339 timestamptz (handler passes
+	//                            zero time to skip; the predicate is
+	//                            uniform with ListAllEventsPaged)
+	//   * $3 limit             — top-N rows (handler default 200, cap 500;
+	//                            cast to int8 so sqlc emits int64 Params
+	//                            and the handler's int→int64 widening is
+	//                            safe)
+	// Order: at DESC, id DESC — same rationale as ListAllEventsPaged.
+	// PR #3 wires the per-account filter on the SSE mirror's
+	// per-account projections; the broader ?actor + ?subject filter
+	// shape lives on ListAllEventsPaged.
+	ListRecentEventsForAccount(ctx context.Context, db DBTX, arg ListRecentEventsForAccountParams) ([]ListRecentEventsForAccountRow, error)
 	// Active rows only, newest first. Partial index keeps the scan tight.
 	ListSessions(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListSessionsRow, error)
 	MarkDeploymentLive(ctx context.Context, db DBTX, id pgtype.UUID) error
@@ -310,6 +345,27 @@ type Querier interface {
 	// PR #2 does NOT add it (single-box posture; multi-host moves to
 	// PromQL per ADR-091 §3.6).
 	TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateParams) ([]TrafficAnomalyAggregateRow, error)
+	// PR #4 (ADR-092 §3.4 amendment) — per-node variant of
+	// TrafficAnomalyAggregate. Joins usage_minutes to instances to
+	// recover the hosting node_id, then groups by
+	// (account_id, app_id, node_id, EXTRACT(HOUR FROM minute)) for
+	// the baseline. The current_pool also groups by node_id so the
+	// "today" anomaly is per-node, not per-app-wide.
+	//
+	// Why a separate query and not a sqlc parameter on the existing
+	// one: the baseline math is identical, but the GROUP BY keys
+	// differ by one column, and trying to thread that through a
+	// nullable WHERE filter would either lose the per-node grain
+	// (NULL filter collapses the group) or return the wrong rollup
+	// (a per-node "current" against an app-wide baseline reports
+	// spurious anomalies when the fleet is unevenly loaded). A
+	// separate query keeps each path simple and self-contained.
+	//
+	// Index path: same as TrafficAnomalyAggregate — usage_minutes
+	// primary key (instance_id, minute) is fine for the 24h current
+	// window in single-box posture. The instances.node_id lookup
+	// is by PK; the join is O(matches) on the PK.
+	TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error)
 	UpdateAccountPlan(ctx context.Context, db DBTX, arg UpdateAccountPlanParams) error
 	UpdateAccountStatus(ctx context.Context, db DBTX, arg UpdateAccountStatusParams) error
 	UpdateApp(ctx context.Context, db DBTX, arg UpdateAppParams) (UpdateAppRow, error)

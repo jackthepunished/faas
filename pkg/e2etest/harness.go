@@ -487,6 +487,29 @@ const testDomain = "apps.test.example"
 //     main-landed migration and PR #697 picks 157 as the next free
 //     slot above main's head. The renumber chain is the standard
 //     PR-#697 follow-up to the PR-#653 145 chain.
+//
+// PR-C: bumped 157 → 215 after PR #841 (kind=validate PR-B)
+// landed 00214_edge_rules_kind_validate.sql on main. The
+// previous target (157) made `pgtest.WaitForMigration` return
+// early because the schema head was already past 157 — every
+// `cmd/e2e` test silently skipped for the entire edge-rules
+// hardening cluster (PR-A foundation, PR-B observability, PR-B
+// validate, PR-6 rollout-closer, PR #848 validate-C). 215 is
+// chosen as "next free integer above main's real head" so a
+// future migration merely bumps this constant again. The
+// discipline (memory: cross-pr-slot-gate-fence-pattern) is that
+// the only line a migration land touches in this file is this
+// constant + the doc-comment history above.
+//
+// Re-bumped 215/216 → 222 by ADR-096 PR-A (app_errors schema
+// at 00222). The in-flight cross-PR fences at 215..221 sit
+// between main's 214 (edge-rules-kind=validate) and 222
+// (app_errors): 215 compute_node_heartbeats_stats (PR #851),
+// 216 apps_route_metrics_enabled (PR #860), 217 ADR-092
+// app_secrets_scope (PR #849), 218 preview-envs (PR
+// preview-envs ADR-095), 219 edge_rules_kind_limit (PR
+// kind=validate PR-C), 220 preview_app_columns (PR preview
+// envs), and 221 ADR-096 reserve fence for slot 222 itself.
 const e2eMigrationTarget = 222
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:

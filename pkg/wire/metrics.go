@@ -2283,12 +2283,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		apidStatelessAdvisoryEventsTotal.WithLabelValues(sev)
 	}
 	// issue #432 phase 5: pre-instantiate the githubd bridge
-	// `kind` label set ({github} — the only kind the bridge
-	// produces today; the loop is forward-compat for future
-	// daemon-to-daemon build sources). Same pattern as the
-	// pre-instantiations above so the row surfaces in /metrics
-	// from boot.
-	for _, kind := range []string{"github"} {
+	// `kind` label set ({github, preview} — push → github,
+	// pull_request → preview, issue #272 / ADR-094). Same pattern
+	// as the pre-instantiations above so the row surfaces in
+	// /metrics from boot. Mirrors the constants in this file
+	// (GithubdBridgeKind* below).
+	for _, kind := range []string{"github", "preview"} {
 		apidGithubdBridgeEnqueuedTotal.WithLabelValues(kind)
 	}
 	// issue #432 phase 5 / ADR-050 §109: pre-instantiate the
@@ -4514,15 +4514,21 @@ const (
 	AdvisorySeverityInfo = "info"
 )
 
-// GithubdBridgeKindGitHub is the only value the `kind` label
-// takes on the githubd → apid build enqueue counter (issue #432
-// phase 5). Mirrored as the constant the apid-side bridge
-// increments via IncGithubdBridgeEnqueued. The loop in
-// NewOpsMetrics pre-instantiates this value so the row surfaces
-// in /metrics from boot — same precedent as the advisorySeverity
-// closed-set above.
+// GithubdBridgeKind* are the closed-set values for the `kind`
+// label on githubd_bridge_enqueued_total (issue #432 phase 5;
+// extended for issue #272 / ADR-094 PR-preview environments).
+// The bridge stamps DeploymentKindGitHub for push events and
+// DeploymentKindPreview for pull_request events — the metric
+// label mirrors the resolved deployment kind so dashboards
+// can split preview traffic from production-push traffic.
+//
+// The closed-set switch in IncGithubdBridgeEnqueued drops
+// unknown values silently (CardinalityGuard). The pre-
+// instantiation loop in NewOpsMetrics pre-fills both values
+// so the rows surface in /metrics from boot.
 const (
-	GithubdBridgeKindGitHub = "github"
+	GithubdBridgeKindGitHub  = "github"
+	GithubdBridgeKindPreview = "preview"
 )
 
 // PathFilterMode* are the closed-set values for the `mode`
@@ -4610,14 +4616,15 @@ func (m *OpsMetrics) ObserveStatelessAdvisory(severity string) {
 }
 
 // IncGithubdBridgeEnqueued increments
-// githubd_bridge_enqueued_total{kind} (issue #432 phase 5). Called
-// from cmd/apid/githubd_bridge.go's EnqueueBuild handler on each
-// landed build row. kind is GithubdBridgeKindGitHub — the only
-// value the githubd bridge produces today; the switch is
-// forward-compat for future daemon-to-daemon build sources. Unknown
-// values produce no increment (closed-set guard). Nil receiver is
-// allowed for parity with the other Observe* accessors — apid
-// unit tests that don't wire metrics keep working.
+// githubd_bridge_enqueued_total{kind} (issue #432 phase 5;
+// extended for issue #272 / ADR-094 PR-preview environments).
+// Called from cmd/apid/githubd_bridge.go's EnqueueBuild handler
+// on each landed build row. kind is one of GithubdBridgeKindGitHub
+// (production push) or GithubdBridgeKindPreview (pull_request
+// preview). Unknown values produce no increment (closed-set
+// guard). Nil receiver is allowed for parity with the other
+// Observe* accessors — apid unit tests that don't wire metrics
+// keep working.
 //
 // The function name uses the Inc* prefix (not Observe*) because
 // it accepts a state.DeploymentKind-shaped enum value, not a
@@ -4630,7 +4637,7 @@ func (m *OpsMetrics) IncGithubdBridgeEnqueued(kind string) {
 		return
 	}
 	switch kind {
-	case GithubdBridgeKindGitHub:
+	case GithubdBridgeKindGitHub, GithubdBridgeKindPreview:
 		m.apidGithubdBridgeEnqueuedTotal.WithLabelValues(kind).Inc()
 	}
 }

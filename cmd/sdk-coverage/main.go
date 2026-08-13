@@ -74,6 +74,10 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/anomalies":               true, // ADR-091 — operator-only (PR #2)
 	"GET /v1/admin/obs/rate-limits":             true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/audit-log/search":        true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/events":                  true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/nodes/events":            true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
+	"GET /v1/admin/obs/nodes/wake-latency":      true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie
@@ -365,6 +369,13 @@ var methodRouteMap = map[string]string{
 	// mirrors GetAccountUsage (the usage account-scoped family).
 	"GET /v1/apps/{slug}/slo": "GetAppSLO",
 	"GET /v1/account/slo":     "GetAccountSLO",
+
+	// ADR-093 — per-route observability inside an app. The
+	// auto-derivation would produce GetAppsSlugRoutes
+	// (Swagger-style); the SDK names it GetAppRoutes to match the
+	// sibling per-app family (GetAppMetrics, GetAppSLO, GetApp,
+	// ListApps) — drop the slug placeholder from the verb.
+	"GET /v1/apps/{slug}/routes": "GetAppRoutes",
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the

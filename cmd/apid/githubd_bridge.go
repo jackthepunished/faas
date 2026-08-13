@@ -273,9 +273,19 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 	// intentionally NOT in pkg/state.Deployment yet — they're
 	// carried in the proto for forward-compat and stashed in
 	// SourceURL if/when a future migration adds columns.
+	// Kind dispatch (issue #272 / ADR-094): the proto3 EnqueueBuild
+	// carries an event_kind enum (push vs pull_request). Push events
+	// keep stamping DeploymentKindGitHub (ADR-048 metering keys on
+	// this); pull_request events stamp DeploymentKindPreview so the
+	// preview-app builds are separable from production pushes in
+	// metered reports + audit logs. EVENT_KIND_UNSPECIFIED falls
+	// through to DeploymentKindGitHub so the pre-issue-#272 wire
+	// shape stays binary-compatible (older githubd builds + the
+	// slice-7 test fixtures don't set the field).
+	kind := eventKindToDeploymentKind(req.EventKind)
 	res, err := apidsource.Enqueue(ctx, g.store, g.notif, apidsource.EnqueueParams{
 		AppID:       app.ID,
-		Kind:        state.DeploymentKindGitHub,
+		Kind:        kind,
 		SourcePath:  req.SourcePath,
 		SourceBytes: req.SourceBytes,
 		SourceURL:   req.SourceUrl,
@@ -289,8 +299,11 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 
 	// §12 metric: apid_githubd_bridge_enqueued_total. The
 	// accessor is nil-receiver safe; when ops is nil (test path)
-	// the metric stays zero.
-	g.ops.IncGithubdBridgeEnqueued(wire.GithubdBridgeKindGitHub)
+	// the metric stays zero. Issue #272 / ADR-094: the label
+	// reflects the resolved deployment kind (push → github,
+	// pull_request → preview), so the dashboard can split
+	// preview traffic from production-push traffic.
+	g.ops.IncGithubdBridgeEnqueued(deploymentKindToWireLabel(kind))
 
 	g.log.Info("githubd bridge: build enqueued",
 		"build", res.BuildID, "deployment", res.DeploymentID, notifyAppField, app.ID,
@@ -341,6 +354,47 @@ func grpcIsNotFound(err error) bool {
 		return false
 	}
 	return errors.Is(err, state.ErrNotFound)
+}
+
+// eventKindToDeploymentKind maps the proto3 EnqueueBuildEventKind
+// enum (api/proto/onebox/faas/githubd/v1/githubd.proto) to the
+// corresponding state.DeploymentKind stamp on the deployment row.
+//
+// Mapping:
+//
+//   - EVENT_KIND_UNSPECIFIED → DeploymentKindGitHub (legacy; the
+//     pre-PR-A wire shape didn't carry this field at all, so
+//     "unset" is treated as "push" for back-compat)
+//   - EVENT_KIND_PUSH        → DeploymentKindGitHub
+//   - EVENT_KIND_PULL_REQUEST→ DeploymentKindPreview (issue #272 / ADR-094)
+//
+// Unknown enum values fall through to DeploymentKindGitHub;
+// the closed-set switch in IncGithubdBridgeEnqueued drops the
+// metric increment in that case so a future enum value won't
+// silently inflate the production-push counter.
+func eventKindToDeploymentKind(k githubdpb.EnqueueBuildEventKind) state.DeploymentKind {
+	switch k {
+	case githubdpb.EnqueueBuildEventKind_EVENT_KIND_PULL_REQUEST:
+		return state.DeploymentKindPreview
+	default:
+		// Unspecified + Push + unknown all → GitHub. The
+		// distinction between "legacy unset" and "explicit push"
+		// doesn't matter for the kind stamp; both produce the
+		// same downstream row.
+		return state.DeploymentKindGitHub
+	}
+}
+
+// deploymentKindToWireLabel maps the resolved deployment kind
+// to the wire/metric label set used by IncGithubdBridgeEnqueued.
+// Mirrors the constants in pkg/wire/metrics.go (GithubdBridgeKind*).
+func deploymentKindToWireLabel(k state.DeploymentKind) string {
+	switch k {
+	case state.DeploymentKindPreview:
+		return wire.GithubdBridgeKindPreview
+	default:
+		return wire.GithubdBridgeKindGitHub
+	}
 }
 
 // registerGithubdBridge binds the GithubdServer (only EnqueueBuild

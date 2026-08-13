@@ -72,6 +72,19 @@ type CreateAppRequest struct {
 	// streaming pattern from issue #471 — same fail-closed
 	// contract, same Plan.WebSocketEnabled() accessor.
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// RouteMetricsEnabled (ADR-093) opts the brand-new app into the
+	// per-route observability surface (gatewayd-internal emits
+	// `gateway_request_duration_seconds{app,route,class}` etc. plus
+	// the bounded in-memory reader at
+	// GET /v1/internal/apps/{slug}/routes). nil → plan default
+	// (Free off; Hobby/Pro/Scale on). Explicit true on Free =
+	// rejected by apid with 403 plan_route_metrics_not_allowed.
+	// Explicit false on Hobby/Pro/Scale = opt out (a synchronous
+	// JSON API that does not want per-route cardinality on the
+	// box). The default-on shape mirrors the WebSocketEnabled
+	// pattern from issue #676 — same fail-closed contract, same
+	// Plan.RouteMetricsEnabled() accessor.
+	RouteMetricsEnabled *bool `json:"route_metrics_enabled,omitempty"`
 	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
 	// preferred spill target for cross-node pressure rebalance.
 	// Wire type is the human-readable compute_nodes.name; apid
@@ -150,6 +163,18 @@ type UpdateAppRequest struct {
 	// does not want long-poll pinning). Pointer distinguishes
 	// "don't touch" (nil) from "explicit false" (*bool=false).
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// RouteMetricsEnabled (ADR-093) toggles the per-app per-route
+	// observability surface. When true (or unset on a plan where
+	// the default is true), gatewayd-internal emits the per-route
+	// Prometheus series and serves the per-app reader at
+	// GET /v1/internal/apps/{slug}/routes. When false, the
+	// routeLabelSet is empty for this app and the per-route series
+	// do not appear on the /metrics scrape. Plan-gated upstream:
+	// Free returns 403 plan_route_metrics_not_allowed when a
+	// customer attempts PATCH true. Hobby/Pro/Scale may PATCH
+	// true → false to opt out. Pointer distinguishes "don't
+	// touch" (nil) from "explicit false" (*bool=false).
+	RouteMetricsEnabled *bool `json:"route_metrics_enabled,omitempty"`
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys on
 	// a valid cosign signature from a trusted publisher (mirrors AWS
 	// Lambda's Code Signing for Lambda). When true, imaged verifies
@@ -477,6 +502,15 @@ type AppResponse struct {
 	// explicitly opted out via PATCH. Surfaced so dashboards can
 	// show "websocket on / off" alongside the streaming pill.
 	WebSocketEnabled bool `json:"websocket_enabled"`
+	// RouteMetricsEnabled (ADR-093) reflects the per-app
+	// route_metrics_enabled flag stored on the apps row. False
+	// on Free (the plan default and the only legal state — apid
+	// rejects PATCH true with 403 plan_route_metrics_not_allowed).
+	// True on Hobby/Pro/Scale by default unless the customer
+	// explicitly opted out via PATCH. Surfaced so dashboards can
+	// show "route metrics on / off" alongside the streaming/WS
+	// pills.
+	RouteMetricsEnabled bool `json:"route_metrics_enabled"`
 	// EvictionPriority (issue #475) is the per-app eviction tier
 	// classification. 'best_effort' (default for every pre-#475
 	// row, applied by the column DEFAULT at migration time) keeps
@@ -2779,6 +2813,78 @@ type AppMetricsResponse struct {
 	// future egress-billing PR picks the unit; this field
 	// reports the Prometheus counter verbatim.
 	EgressBytes int64 `json:"egress_bytes"`
+	// Routes (ADR-093) is the per-route breakdown for opt-in apps
+	// (apps.route_metrics_enabled=true). nil when the app is not
+	// opt-in — the dashboard distinguishes "feature off" (Routes
+	// absent) from "feature on, no traffic" (Routes = []). Each
+	// row is the bounded detail from the gatewayd-internal
+	// in-memory reader: max 50 distinct routes + the
+	// __route_other__ overflow bucket. The route label is
+	// method + raw path (pre-rewrite, ADR-093 D6). The shape
+	// matches the existing field-level `x-since: "2026-08"`
+	// header convention so the SDK generator picks it up
+	// automatically.
+	Routes []RouteRow `json:"routes,omitempty"`
+}
+
+// RouteRow is the per-route detail row returned by the
+// gatewayd-internal control-listener reader at
+// GET /v1/internal/apps/{slug}/routes (ADR-093). The same
+// structure is wrapped in AppMetricsResponse.Routes by the apid
+// handler. `Route` is the label exactly as emitted on the
+// Prometheus side (method + raw path, or __route_other__ for the
+// overflow bucket). All latency fields are milliseconds ≥ 0;
+// NaN/Inf are coerced to 0 by the reader — same contract as the
+// AppMetricsResponse histograms.
+type RouteRow struct {
+	// Route is the bounded label: "GET /users/4f8a" for an
+	// admitted route, or "__route_other__" for the overflow
+	// bucket. The two reserved labels ("" and "__route_other__")
+	// are surfaced verbatim so dashboards can render the
+	// wildcard-route signal honestly.
+	Route string `json:"route"`
+	// Count is the number of requests observed in the window.
+	Count uint64 `json:"count"`
+	// P50MS / P95MS / P99MS are histogram_quantile over the
+	// full request duration (status-agnostic — failures are
+	// included, not excluded, so the percentile is the
+	// latency-percentile the customer actually experiences).
+	// The histogram is gateway_request_duration_seconds{app,
+	// route, class} (ADR-093 D4), summed across all classes
+	// for the row.
+	P50MS float64 `json:"p50_ms"`
+	P95MS float64 `json:"p95_ms"`
+	P99MS float64 `json:"p99_ms"`
+	// ErrorPct is the share of requests with status ≥ 400 in
+	// the window. Computed from
+	// gateway_request_failures_total{app, route, code} /
+	// gateway_requests_total{app, route}, code ≥ 400 summed.
+	ErrorPct float64 `json:"error_pct"`
+}
+
+// AppRoutesResponse is the per-route label snapshot returned by
+// GET /v1/apps/{slug}/routes (ADR-093). The shape is intentionally
+// narrower than AppMetricsResponse — only the bounded label set
+// the gatewayd-internal control listener emits (method + raw
+// path, capped at 50 + __route_other__). The Prometheus-derived
+// per-route rollup (count, percentiles, error_pct) lives on
+// AppMetricsResponse.Routes, computed lazily when the dashboard
+// needs it. Splitting the two surfaces keeps the lightweight
+// reader cheap (one in-memory map read on gatewayd-internal, one
+// HTTP round-trip from apid) and lets the dashboard render the
+// "what routes is this app serving?" panel without a Prometheus
+// query.
+//
+// Source is "live" when the gatewayd control listener responded
+// 200; "unavailable" when the dial failed (gatewayd not
+// reachable, X-Faas-Routes-State: unavailable header). Routes
+// is []string (not nil) on the unavailable path so the JSON
+// encoder emits `[]` rather than `null`.
+type AppRoutesResponse struct {
+	Slug   string   `json:"slug"`
+	AppID  string   `json:"app_id,omitempty"`
+	Routes []string `json:"routes"`
+	Source string   `json:"source"`
 }
 
 // --- Account-scoped metrics rollup (issue #393) --------------------------
@@ -3711,7 +3817,16 @@ func (a *EdgeRuleIPAction) Validate() *Problem {
 // RFC1918 / metadata ranges through `$ref` resolution at hot-path
 // compile time. pkg/edgevalidate re-strips at compile time as
 // defence-in-depth.
-var edgeRuleValidateRefURLPattern = regexp.MustCompile(`\$ref|id\s*"\s*:\s*"(https?://|//)[^"]+"`)
+//
+// PR-C: anchored the key. The previous `\$ref|id` alternation
+// matched the substring `id` anywhere in the schema — including
+// inside `definitions` (so `{"$ref": "#/definitions/Foo"}` was
+// wrongly rejected as if it were an external URL). The new regex
+// requires the key to be a top-level JSON property name ("$ref"
+// or "$id"), followed by an optional-whitespace colon, followed by
+// a URL-shaped value. Verified against 10 cases in this PR-C
+// harness (see plan-file regression-proof walkthrough).
+var edgeRuleValidateRefURLPattern = regexp.MustCompile(`"\s*(\$ref|\$id)\s*"\s*:\s*"(https?://|//)[^"]+"`)
 
 // EdgeRuleValidateAction is the wire shape for a kind=validate edge
 // rule. Schema is a JSON Schema 2020-12 document (Draft 2020-12;
@@ -3806,6 +3921,81 @@ func (a *EdgeRuleValidateAction) Validate() *Problem {
 			"validate action: max_body_bytes exceeds the platform cap (%d > %d)",
 			a.MaxBodyBytes, MaxRequestBodyBytes))
 	}
+	return nil
+}
+
+// EdgeRuleLimitAction is the wire shape for a kind=limit edge rule
+// (ADR-091 D24). The standalone body-size primitive: a customer
+// who only wants per-route body-size protection ("POST /upload
+// ≤ 5 MB, POST /users ≤ 1 MB, POST /webhooks ≤ 2 MB") declares
+// this kind without shipping a JSON Schema. The hot-path applier
+// (pkg/gateway.(*Handler).applyEdgeRuleLimit, §4.1.2.8c) installs
+// http.MaxBytesReader on r.Body at the per-rule cap and short-
+// circuits oversize requests with 413 request_too_large — and,
+// more importantly, performs a Content-Length fast-path deny so
+// a 30 MB body on a 5 MB cap costs zero bytes of buffering.
+//
+// Field-by-field:
+//
+//   - MaxBodyBytes: required buffered-path cap. Must be > 0 and
+//     ≤ MaxRequestBodyBytes (25 MiB). 0 is rejected with 422 —
+//     a standalone limit rule with no cap is a silent no-op,
+//     worst shape for a security feature. The hard upper bound
+//     matches MaxRequestBodyBytes so a kind=limit rule can never
+//     widen past the global cap; if the customer wants to relax
+//     the cap on a specific path they're using the wrong
+//     primitive (this kind is strictly a tightening primitive).
+//   - MaxBodyBytesStreaming: optional streaming opt-in cap (≤
+//     MaxEdgeRuleLimitBodyBytesStreaming = 100 MiB, ADR-080
+//     raw-bridge parity). 0 = no streaming carve-out, the
+//     buffered MaxBodyBytes is the cap on both paths. Must be
+//     ≥ MaxBodyBytes when set — a streaming cap that is
+//     TIGHTER than the buffered cap would 413 every streaming
+//     request for a body that was already accepted as buffered,
+//     which is a wire-shape footgun. Runtime enforcement of
+//     this field is deferred to a follow-up PR (stated in
+//     ADR-091 D24 §6); the field is declared, clamped here, and
+//     clamped again at cmd-side compileLimitRules so a future
+//     runbook can wire enforcement without schema churn.
+type EdgeRuleLimitAction struct {
+	MaxBodyBytes          int `json:"max_body_bytes"`
+	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
+}
+
+func (a *EdgeRuleLimitAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("limit action is required")
+	}
+	if a.MaxBodyBytes <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes must be > 0 (got %d) — a standalone limit rule with no cap is a silent no-op; use kind=validate if you need a body cap alongside a JSON Schema",
+			a.MaxBodyBytes))
+	}
+	if a.MaxBodyBytes > MaxRequestBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes exceeds the platform cap (%d > %d)",
+			a.MaxBodyBytes, MaxRequestBodyBytes))
+	}
+	if a.MaxBodyBytesStreaming < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming must be >= 0 (got %d)",
+			a.MaxBodyBytesStreaming))
+	}
+	if int64(a.MaxBodyBytesStreaming) > MaxEdgeRuleLimitBodyBytesStreaming {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming exceeds the streaming platform cap (%d > %d)",
+			a.MaxBodyBytesStreaming, MaxEdgeRuleLimitBodyBytesStreaming))
+	}
+	if a.MaxBodyBytesStreaming > 0 && a.MaxBodyBytesStreaming < a.MaxBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming (%d) must be >= max_body_bytes (%d) when set — a streaming cap tighter than the buffered cap would 413 every streaming request for a body already accepted as buffered",
+			a.MaxBodyBytesStreaming, a.MaxBodyBytes))
+	}
+	// This `s ≥ b` invariant is consumed at runtime by
+	// pkg/gateway/handler.go::applyEdgeRuleLimit (cap selection).
+	// A direct-DB row that violates it passes the cmd-side compile
+	// and falls back to the buffered cap at runtime via the
+	// `MaxBodyBytesStreaming == 0` branch — see ADR-091 D24 §6.
 	return nil
 }
 

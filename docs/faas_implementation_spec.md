@@ -151,7 +151,7 @@ As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-
 
 #### 4.1.2 Edge-rule hot-path ordering
 
-The seven edge-rule kinds (`route`, `rewrite`, `redirect`, `headers`, `cors`, `jwt`, `ip`; see ADR-091 / issue #561 / Cloudflare Ruleset Engine) run in a fixed pipeline inside `gatewayd-internal`'s `ServeHTTP`. The ordering is deterministic and the rationale for each position is load-bearing — moving any kind up or down the stack creates a documented regression (browsers reject preflights that 3xx; JWT-failed traffic must not wake a microVM; etc).
+The nine edge-rule kinds (`route`, `rewrite`, `redirect`, `headers`, `cors`, `jwt`, `ip`, `validate`, `limit`; see ADR-091 / issue #561 / Cloudflare Ruleset Engine; `validate` added in PR-B / D20.6; `limit` added in this PR / D24) run in a fixed pipeline inside `gatewayd-internal`'s `ServeHTTP`. The ordering is deterministic and the rationale for each position is load-bearing — moving any kind up or down the stack creates a documented regression (browsers reject preflights that 3xx; JWT-failed traffic must not wake a microVM; malformed-body traffic must not wake a microVM; oversize-body traffic must not wake a microVM).
 
 ```
 matchAndSubstituteRoute          # §4.1.2.1 — kind=route (PR 3)
@@ -162,19 +162,23 @@ matchAndSubstituteRoute          # §4.1.2.1 — kind=route (PR 3)
   → applyEdgeRuleCORS             # §4.1.2.6 — kind=cors     (PR 5): OPTIONS preflight short-circuits with 204 BEFORE redirect would have 3xx'd the preflight away
   → applyEdgeRuleJWT              # §4.1.2.7 — kind=jwt      (PR 5): AFTER rewrite/headers, BEFORE require_authn, so a JWT-failed request never reaches the per-deployment auth chain or wakes the VM
   → applyEdgeRuleIP               # §4.1.2.8 — kind=ip       (PR 5): AFTER jwt (cheap deny before authenticated-path DB), BEFORE Backend.Pick, so an IP-denied request never pays a cold-wake cost
+  → applyEdgeRuleLimit            # §4.1.2.13 — kind=limit (D24): AFTER IP, BEFORE the global 25 MiB reader and BEFORE require_authn, so an oversize request is rejected with 413 + Content-Length fast-path deny BEFORE any body bytes are buffered or any auth/wake work runs
+  → applyEdgeRuleValidate         # §4.1.2.12 — kind=validate (PR-B / D20.6): AFTER IP + limit (cheap body-shape deny on unverified source), BEFORE require_authn, so a malformed-body request is rejected with 422 without consuming auth, allocating quota, or waking a microVM
   → enforceRequireAuthn           # §4.1.2.9 — per-deployment require_authn gate (issue #560)
   → enforcePublicAuth             # §4.1.2.10 — per-app public_auth gate (issue #477)
   → Backend.Pick                  # §4.1.2.11 — scheduler wake/gate (any earlier 4xx already short-circuited)
   → proxy leg
 ```
 
-**Architectural note on the kind=route exception (load-bearing, ADR-091 D4):** of the seven kinds, only `kind=route` runs *before* `Backend.Lookup` — at `ServeHTTP` line 2255-2257, a `kind=route` hit substitutes `app` and `goto haveApp` so downstream RequireAuthn / PublicAuth / wake gate / proxy all see the *target* app's context (auth remains per-app). The other six kinds run at `haveApp` (line 2267 onward), AFTER `Backend.Lookup`. Reordering `kind=route` to run AFTER Lookup would defeat the substitution; reordering any of the other six to run BEFORE Lookup would mean they fire on an empty `App{}` and silently fall through the same-account guard — both are regressions.
+**Architectural note on the kind=route exception (load-bearing, ADR-091 D4):** of the nine kinds, only `kind=route` runs *before* `Backend.Lookup` — at `ServeHTTP` line 2255-2257, a `kind=route` hit substitutes `app` and `goto haveApp` so downstream RequireAuthn / PublicAuth / wake gate / proxy all see the *target* app's context (auth remains per-app). The other eight kinds run at `haveApp` (line 2267 onward), AFTER `Backend.Lookup`. Reordering `kind=route` to run AFTER Lookup would defeat the substitution; reordering any of the other eight to run BEFORE Lookup would mean they fire on an empty `App{}` and silently fall through the same-account guard — both are regressions.
 
 **Hard guarantees** the ordering pins:
 
 - **CORS precedes redirect (§4.1.2.6 > §4.1.2.3 if a 3xx came first).** A preflight that gets a 3xx is a browser-side failure (browsers don't follow 3xx for preflights). The actual production ordering has redirect at §4.1.2.3 and CORS at §4.1.2.6 — redirect runs first because it's cheaper to 3xx a known-redirect URL than to evaluate a CORS preflight; the CORS preflight path is only reached when no `kind=redirect` rule matches the host/path, which is the common case for an app that *does* serve CORS. The defensive ordering is documented in `pkg/gateway/handler.go:2277-2283`.
 - **JWT precedes `enforceRequireAuthn` (§4.1.2.7 < §4.1.2.9).** The edge-rule JWT gate fires on the inbound token before the per-deployment bearer-token gate; otherwise a JWT-failed request would still pay the per-deployment auth DB lookup.
 - **CORS / JWT / IP all precede `Backend.Pick` (§4.1.2.6, §4.1.2.7, §4.1.2.8 < §4.1.2.11).** A rejected request never pays the cold-wake cost. ADR-091 D4 codifies this; this spec section is the implementation contract.
+- **Validate precedes `enforceRequireAuthn` (§4.1.2.12 < §4.1.2.9) AND `Backend.Pick` (§4.1.2.12 < §4.1.2.11).** A malformed-body request is rejected with 422 (`request_validation_failed`, see §11 problem+json) and never wakes a microVM. This is the §4.7 deny-before-cost posture extended to body-shape: the wake quota cannot be exhausted by 4xx traffic. The plan calls out a follow-on in PR-D for the `DeployWake` bitmask so the post-wake path (snapshot restore) is exercised.
+- **Limit precedes Backend.Pick (§4.1.2.13 < §4.1.2.11) AND `enforceRequireAuthn` (§4.1.2.13 < §4.1.2.9).** An oversize request is rejected with 413 (`request_too_large`, see §11 problem+json) before any auth/wake work runs, AND the Content-Length fast path denies before the global 25 MiB reader wraps `r.Body` — the "never buffer an oversize body" property is a guarantee, not a hope. The placement is load-bearing: `TestApplyEdgeRuleLimit_ContentLengthFastPath_DenyBeforeBackendPick` is the regression pin (`fakeBackend.Pick` is never called for an oversize request).
 - **Same-account assertion at every kind** (ADR-091 D5). A cross-account `kind=X` rule silently falls through (audit + `outcome=blocked` metric + no enforcement).
 
 ##### Defense-in-depth guards (spec-level decisions, NOT deviations)
@@ -191,6 +195,27 @@ These are guards the apid validator enforces on rule creation; the gateway stamp
 - **§11** (egress posture that bounds the JWKS URL network-position validator).
 - **§4.7** (per-account rate-limit posture that re-confirms the deny-before-cost guarantee).
 - **ADR-070** (Tier A7 edge split — `gatewayd-public` and `gatewayd-internal` on opposite sides of a unix socket; the architecture that makes `pkg/gateway/internal_proxy.go:286` the load-bearing single-trusted-XFF source for §4.1.2.8).
+
+##### §4.1.2.12 — kind=validate (PR-B / D20.6)
+
+The `kind=validate` shape is the only edge-rule kind that reads the request body. Customers ship a JSON Schema 2020-12 document inline in the rule's `action.jsonb` (`max_edge_rule_validate_schema_bytes = 64 KiB`); the gateway compiles the schema on first sight, keys it by SHA-256 of the body, and consults it on every match.
+
+- **422 surface.** Schema mismatch returns 422 with `code = "request_validation_failed"` and a `problem+json` `errors[]` of `FieldError{field, expected, got}` per `pkg/api/errors.go:1602`. The shape is RFC 7807-compatible. Body cap exceeded (per-rule `max_body_bytes` or the platform cap, whichever is lower) returns 413 `request_too_large`; Content-Type outside the rule's allowlist returns 415 `unsupported_media_type`. Audit events: `edge_rule.validate_matched`, `edge_rule.validate_failed`, `edge_rule.validate_blocked`, `edge_rule.validate_unsupported_media_type`. Metric: `gateway_edge_rule_match_total{kind="validate", outcome=…}` pre-instantiated at line 528-535 (PR-B extension).
+- **Cap chain.** Per-rule `max_body_bytes ∈ [0, api.MaxRequestBodyBytes]` is layered on top of the global `http.MaxBytesReader` installed in `ServeHTTP` (handler.go). A 0 `max_body_bytes` inherits the platform cap. The schema cap (`max_edge_rule_validate_schema_bytes = 64 KiB`) is enforced at apid-Validate time (dto.go:EdgeRuleValidateAction.Validate) AND re-checked at compile time (`pkg/edgevalidate.Compile`) — defence-in-depth per §11.
+- **Streaming posture.** Per-rule `apply_while_streaming: false` (default) means the rule is skipped when `isUpgradeRequest(r)` is true. SSE-style apps opt the rule in per rule. The opt-out mirrors §4.1's `Accept: application/json` opt-out so an SSE-enabled app keeps validation off until the customer opts the rule in. The CLI emits a warning when `streaming_enabled=true` is detected for the same app so the surprise is documented.
+- **External-`$ref` strip.** apid-Validate strips external `$ref` / `$id` URLs at create-time (the regex at `dto.go::edgeRuleValidateRefURLPattern`); `pkg/edgevalidate.Compile` re-strips at compile time on the gateway side. Internal JSON Pointers (`#/definitions/Foo`) currently trip the apid-side regex too (an unanchored `$ref|id` alternation; a future PR will tighten this), but the gateway-side regex is the authoritative gate on the hot path. A runtime `$ref` URL in a stored rule emits 502 `bad_gateway` from the gateway compile path (handler.go applyEdgeRuleValidate line ~1649) — a deploy-time bug-class alarm.
+- **Body-restore.** `applyEdgeRuleValidate` is the first production hot-path code to **buffer and re-install** `r.Body` for downstream consumption (`io.NopCloser(bytes.NewReader(buf))` at handler.go line ~1636). The proxy leg reads `r.Body` via `pkg/gateway/forwardproxy.go:319-339`. A regression in the restore shape surfaces as a 502 from the proxy leg (ctxReader EOF mid-body) and is covered by the PR-C e2e happy+reject path.
+
+##### §4.1.2.13 — kind=limit (ADR-091 D24)
+
+The `kind=limit` shape is the standalone per-route body-size primitive — the load-bearing primitive for the "POST /upload ≤ 5 MB, POST /users ≤ 1 MB, POST /webhooks ≤ 2 MB" case where the customer does not want to ship a JSON Schema. The applier is the only kind (besides validate's inner-reader wrapper) that wraps `r.Body`, but unlike validate it does not buffer-and-restore — the per-rule cap is installed as an `http.MaxBytesReader` around the existing `r.Body`, and the cap is enforced on the next read (the proxy leg, the validate applier further down).
+
+- **413 surface.** Cap exceeded returns 413 with `code = "request_too_large"` and a `problem+json` body carrying the rule ID + cap. The shape is RFC 7807-compatible. Audit events: `edge_rule.limit_matched`, `edge_rule.limit_rejected`, `edge_rule.limit_blocked`. Metric: `gateway_edge_rule_match_total{kind="limit", outcome=…}` + `gateway_edge_rule_apply_total{kind="limit", result=…}` (the apply axis carries the "blocked" cross-account case as `success` so the §12 dashboard chip doesn't falsely flag a defense-in-depth no-op as a wire error — same posture as validate's cross-account path).
+- **Cap chain.** Per-rule `max_body_bytes ∈ (0, api.MaxRequestBodyBytes]` is layered on top of the global `http.MaxBytesReader` installed in `ServeHTTP` (handler.go). The §4.1.2.13 placement (between `applyEdgeRuleIP` and the global reader) means the per-rule cap is the OUTER reader on the in-limit path; the global reader layers inside as the backstop for requests that don't match any limit rule. Nesting two `MaxBytesReader`s is safe — the inner reader only ever tightens.
+- **Content-Length fast path (load-bearing).** When the inbound request advertises a body larger than the cap via `Content-Length`, the applier writes 413 immediately, without reading a single body byte. A bare `http.MaxBytesReader` only trips when something reads the body, and at this hot-path slot nothing reads it until the proxy leg — so without the fast path, a 30 MB POST against a 5 MB rule would buffer 30 MB into memory before tripping. The fast path can only ever produce a **false-positive** 413 (a client that lied high); a lying-low client cannot bypass because the inner `MaxBytesReader` still trips on the proxy leg's first read. Stated explicitly in ADR-091 D24 §4.
+- **First-match-wins (not smallest-cap-wins).** Consistent with every other kind; priority is the customer's declared tiebreak. A future "tightest cap wins" optimization would couple two rules semantically — the customer could end up with one rule accidentally swallowing another's intent. Rejected in D24 §rejected-alternatives.
+- **Streaming posture.** The rule carries an optional `max_body_bytes_streaming ≤ 100 MiB` (matching `pkg/api.RawStreamMaxRequestBytes` for ADR-080 raw-bridge parity). **Runtime enforcement ships alongside the field.** The applier at the §4.1.2.13 slot consults `streamingFor(h, r, app)` — the 4-conjunct detection formula (`h.streamingEnabled && app.StreamingEnabled && !isAcceptJSON(Accept) && !isUpgradeRequest(r)`) — and picks the cap per request: streaming requests use `max_body_bytes_streaming` (clamped to `api.RawStreamMaxRequestBytes`); buffered requests use `max_body_bytes` (clamped to `api.MaxRequestBodyBytes`); streaming cap == 0 falls back to the buffered cap (safe degradation, never widens). The 413 detail message suffixes the cap kind — `(buffered cap)` or `(streaming cap)` — so a customer can bisect which cap fired without consulting logs. The audit payload (`edge_rule.limit_rejected` + `edge_rule.limit_matched`) carries an additive `cap_kind` field for the same purpose on the operator side. See ADR-091 D24 §6 for the rationale (per-cap-kind clamp, DTO `s ≥ b` invariant trust, deferred-to-runtime risks rejected).
+- **Relationship to `kind=validate.max_body_bytes`.** Kept, NOT deprecated. The semantic split is: validate's `max_body_bytes` is the "cap the body I'm about to schema-check" knob; limit's `max_body_bytes` is the standalone gate. The two paths share the same underlying primitive (per-rule `MaxBytesReader`) but surface different control surfaces — validate couples the cap with schema checking, limit couples the cap with nothing else. A customer who declared a `kind=validate.max_body_bytes` rule today can migrate to `kind=limit` in a follow-up (no schema is required for the limit path).
 
 ### 4.2 `apid` — control API
 
@@ -753,11 +778,11 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | `lv_fc_used_pct` | — | > 80 % warn, > 90 % page |
 | build queue wait p95 | < 60 s | > 300 s warn |
 | `gateway_wake_latency_seconds` p95 | ≤ 0.8 s | > 1.5 s warn |
-| `gateway_request_duration_seconds{app,class}` p95 | n/a (per-app) | none (ADR-041: customer dashboard) |
+| `gateway_request_duration_seconds{app,class}` p95 | n/a (per-app) | none (ADR-042: customer dashboard) |
 | `gateway_stream_flushes_total{app,plan}` rate | n/a (per-app) | none (ADR-047: streaming telemetry — see §12.5) |
 | `gateway_response_bytes_total{app,plan}` rate | n/a (per-app) | none (ADR-047: per-flush + residual capture — see §12.5) |
 | `gateway_stream_active{app,plan}` gauge | n/a (per-app) | none (ADR-047: in-flight streams — see §12.5) |
-| `gateway_cold_boot_total{app}` share | < 2 % of wakes | none (ADR-041: customer dashboard; fleet wake latency is the SLO) |
+| `gateway_cold_boot_total{app}` share | < 2 % of wakes | none (ADR-042: customer dashboard; fleet wake latency is the SLO) |
 | cold-boot fallback rate | < 2 % of wakes | > 10 % warn (snapshot rot) |
 | `schedd_instance_cpu_pct{app,node}` | max over siblings | > 90 sustained page (hot loop) |
 | `schedd_instance_rss_mb{app,node}` | sum over siblings | > plan × max_concurrency page |
@@ -766,6 +791,9 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | `schedd_instance_stats_partial_errors_total{node}` | 0 | > 5 / min page (vmmd unreachable) |
 | `gatewayd_internal_write_redirect_total{outcome,auth_kind}` rate | n/a (per-outcome) | `outcome="leader_unreachable"` > 0.1 / min page (ADR-083 §Open #2 closure); `outcome="loop_prevented"` > 1 / min page (redirect-storm DoS); `outcome="mTLS_failure"` > 0 page (cert / clock-skew); `outcome="cookie_blocked"` rate tracked (deferred, ADR-025 Tier 2 unblocks) |
 | `gatewayd_internal_write_redirect_latency_seconds` p95 | ≤ 1.5 s | > 3 s warn (overlay degradation), > 5 s page (StandbyWriteRedirectTimeoutMS fires) |
+| `gateway_edge_rule_apply_total{kind,result}` rate | n/a (per-kind) | per-kind `result="error"` rate > 1 / min warn (runbook `FaasEdgeRuleApplyHigh.md`) |
+| `gateway_edge_rule_compile_error_total{kind}` rate | 0 | any non-zero page (runbook `FaasEdgeRuleCompileError.md`; ADR-091 Amendment 1: compile error = correctness signal, not headroom) |
+| `gateway_edge_rule_match_total{kind,outcome}` rate | n/a (per-kind) | per-kind `outcome="failed"` for kind=jwt > 5 / min warn (runbook `FaasEdgeRuleJWTFailures.md`; audit-grep `data.err` for `context deadline exceeded` separates timeout from verifier error; CORS preflight short-circuits IP+JWT gates — filter `method != "OPTIONS"` before counting) |
 
 The four `schedd_instance_*` gauges (ADR-036, issue #170) are the
 new per-`(app,node)` rolled-up surfaces — max CPU, sum RSS, sum
@@ -777,13 +805,38 @@ unbounded under the §6.2 fan-out invariant. Future scale policy
 work (#171 reaper, #169 scale-up trigger) reads from the Reader
 directly, not from Prometheus.
 
-`gateway_request_duration_seconds{app,class}` (ADR-041, issue #273)
+`gateway_request_duration_seconds{app,class}` (ADR-042, issue #273)
 is the per-app full-request-duration histogram exposed on the
 customer dashboard and the `GET /v1/apps/{slug}/metrics` endpoint.
-ADR-041 documents the deviation from the #273 acceptance criteria:
+ADR-042 documents the deviation from the #273 acceptance criteria:
 the `route` label is dropped (`gatewayd-internal` is an opaque reverse proxy)
 and the rename of `gateway_cold_wake_total` →
 `gateway_cold_boot_total` is straight (zero external consumers).
+
+**ADR-093 sidebar (issue #273 follow-up):** the per-route
+breakdown is reintroduced as an opt-in surface for API-hosting
+customers. Two extra series are emitted from `gatewayd-internal`
+behind the two-level opt-in (operator kill-switch + per-app
+`apps.route_metrics_enabled`):
+
+- `gateway_requests_by_route_total{app,plan,route,code}` (counter)
+- `gateway_request_duration_by_route_seconds{app,route,class}` (histogram)
+- `gateway_request_failures_by_route_total{app,plan,route,code}` (counter)
+
+The `route` label is method + raw path (pre-edge-rule-rewrite),
+bounded per app to 50 distinct real routes + the reserved
+`__route_other__` overflow bucket (ADR-093 D2). The bounded
+admission set is the only thing standing between us and
+`O(paths)` Prometheus cardinality under wildcard path patterns.
+The in-memory reader is also exposed via the control listener at
+`GET /v1/internal/apps/{slug}/routes` (loopback-only, mTLS-free
+within the same box) and reverse-proxied by apid as
+`GET /v1/apps/{slug}/routes` for the dashboard panel.
+
+ADR-042 §1 is **partially superseded** by ADR-093 — the route
+label is now opt-in for Hobby+ plans, not blanket-dropped. The
+rest of ADR-042 (cold-boot rename, per-app histogram shape)
+stands.
 
 ### 12.1 Autoscale decision telemetry (ADR-037, ADR-038)
 

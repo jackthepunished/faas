@@ -1588,6 +1588,14 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// (same Set-bit-aware shape) so the per-plan default doesn't get
 	// shadowed by the schema DEFAULT.
 	//
+	// ADR-093: route_metrics_enabled is written explicitly (same
+	// shape) so the per-plan default doesn't get shadowed by the
+	// schema DEFAULT. The CreateApp site is the only place the
+	// column is written at create time — there's no separate
+	// CreateAppIfUnderQuota path to keep in sync because the
+	// explicit per-plan default is applied by apid before
+	// reaching this path.
+	//
 	// Tier A10 / ADR-088: overflow_node preference is in the
 	// column list so the App struct's value is written verbatim
 	// at create time. apid resolved the wire name → UUID
@@ -1597,9 +1605,9 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
-		 returning ` + appsSelectColumns
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
 	// create path keeps the schema DEFAULT behaviour. The column is NOT
@@ -1621,12 +1629,20 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
 		// from the column, same as NodeID above.
-		nullString(derefString(app.OverflowNode)))
+		nullString(derefString(app.OverflowNode)),
+		// Issue #272 / ADR-094: per-app preview metadata. Empty
+		// strings + zero ints + nil time all land as SQL NULL
+		// via the existing nullString / nullable helpers — the
+		// create path is the production path, and production
+		// apps never carry preview metadata. The bind site is
+		// the canonical "all four columns are NULL" producer.
+		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt))
 	return scanApp(row)
 }
 
@@ -1754,6 +1770,10 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	//
 	// Issue #676 / PR-3: websocket_enabled follows the same shape.
 	//
+	// ADR-093: route_metrics_enabled follows the same shape; the
+	// per-plan default is applied by apid before reaching this
+	// path so the App struct's value is authoritative.
+	//
 	// Tier A10 / ADR-088: overflow_node preference is in the
 	// column list so the App struct's value is written verbatim
 	// at create time. apid resolved the wire name → UUID
@@ -1763,9 +1783,9 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-		 returning ` + appsSelectColumns
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+		returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
 	// column DEFAULT is documented as 'active' but the explicit INSERT
@@ -1783,12 +1803,18 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
 		// from the column, same as NodeID above.
-		nullString(derefString(app.OverflowNode)))
+		nullString(derefString(app.OverflowNode)),
+		// Issue #272 / ADR-094: per-app preview metadata. Same
+		// NULL-all shape as CreateApp above — production apps
+		// (and quota-counted inserts that happen to land via
+		// this path) never carry preview metadata.
+		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt))
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -1809,6 +1835,30 @@ func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 	sel := `select ` + appsSelectColumns + ` from apps where slug = $1 and status <> 'deleted'`
 	row := s.pool.QueryRow(ctx, sel, slug)
 	return scanApp(row)
+}
+
+// PreviewAppsByParent (ADR-094 / issue #272) returns every preview
+// app whose preview_of_slug = parentSlug, scoped to accountID. The
+// query plan uses the partial index apps_preview_of_slug_idx
+// (migration 00218), which carries the same WHERE preview_of_slug IS
+// NOT NULL predicate. Soft-deleted previews (apps.status = 'deleted')
+// are filtered out so the dashboard doesn't render "torn down" rows
+// in the live pane — they remain queryable via the janitor's
+// tombstone-aware sweep in PR-C.
+//
+// The account_id predicate is non-negotiable: a customer should
+// never see another customer's preview rows even if the
+// preview_of_slug happened to collide (it can't today — slugs are
+// globally unique — but defence-in-depth matches the pattern every
+// other apps query uses).
+func (s *PgStore) PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+appsSelectColumns+` from apps where account_id = $1 and preview_of_slug = $2 and status <> 'deleted' order by created_at desc`,
+		accountID, parentSlug)
+	if err != nil {
+		return nil, fmt.Errorf("state: preview apps by parent %q/%q: %w", accountID, parentSlug, err)
+	}
+	return scanApps(rows)
 }
 
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
@@ -2624,6 +2674,15 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- Plan.WebSocketResponseAllowed() (Free → 403
 			   -- plan_websocket_not_allowed).
 			   websocket_enabled = case when $45 then $46 else websocket_enabled end,
+			   -- ADR-093: per-route observability opt-in.
+			   -- Same Set-bit convention as websocket_enabled
+			   -- above; apid gates PATCH-true through
+			   -- Plan.RouteMetricsResponseAllowed() (Free →
+			   -- 403 plan_route_metrics_not_allowed). The
+			   -- companion SetRouteMetricsEnabled flag
+			   -- distinguishes "don't touch" (default) from
+			   -- "explicit false" (opt out).
+			   route_metrics_enabled = case when $47 then $48 else route_metrics_enabled end,
 			   -- Tier A10 / ADR-088: per-app overflow_node
 			   -- preference. Same Set-bit convention as the
 			   -- surrounding fields — SetOverflowNode
@@ -2633,7 +2692,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- with ON DELETE SET NULL (migration 00167)
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
-			   overflow_node = case when $47 then $48 else overflow_node end
+			   overflow_node = case when $49 then $50 else overflow_node end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2702,6 +2761,11 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// Issue #676 / PR-3: per-app raw-bytes Upgrade bridge.
 		// Same Set*/optional-pointer pattern as streaming_enabled.
 		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled),
+		// ADR-093: per-route observability opt-in. Same Set*/optional-
+		// pointer pattern as websocket_enabled above. The per-plan
+		// gate runs upstream in apid (Plan.RouteMetricsResponseAllowed)
+		// so by the time this UPDATE runs, the value is authoritative.
+		p.SetRouteMetricsEnabled, boolOrFalse(p.RouteMetricsEnabled),
 		// Tier A10 / ADR-088: overflow_node preference. The
 		// Set bit controls the CASE; the value slot is a
 		// nullable UUID — nullString coerces nil/empty to
@@ -3246,15 +3310,23 @@ func (s *PgStore) ApplyProjectPlan(
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
-		     project_id, root_dir, workload_name, workload_class, start_command)
+		     project_id, root_dir, workload_name, workload_class, start_command,
+			     preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
 		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
-		        $11, $12, $13, $14, $15)
+		        $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
 			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
+			// Issue #272 / ADR-094: preview columns default to
+			// NULL on ApplyProjectPlan — repo-decomposed
+			// projects never carry preview metadata at create
+			// time. The preview path provisions rows via
+			// CreateApp / CreateAppIfUnderQuota directly.
+			nullString(a.PreviewOfSlug), a.PreviewPrNumber,
+			nullString(a.PreviewPrState), nullableTimestamptzPtr(a.PreviewExpiresAt),
 		)
 		app, err := scanApp(row)
 		if err != nil {
@@ -8125,6 +8197,144 @@ func (s *PgStore) ListComputeNodeHeartbeats(ctx context.Context, nodeID string, 
 	return out, nil
 }
 
+// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+// amendment) extends AppendComputeNodeHeartbeat with the cpu_pct_60s
+// and disk_used_bytes columns added by migration 00199. The two new
+// columns are nullable (pre-PR #4 rows keep NULL — see migration
+// 00199's comment) and default to NULL on INSERT so an un-upgraded
+// vmmd writer hitting a post-PR #4 schema still works. The
+// (node_id, received_at) unique constraint and parent-exists check
+// mirror AppendComputeNodeHeartbeat verbatim — the test code path
+// must see the same ErrConflict surface.
+func (s *PgStore) AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error {
+	// Parent existence check first (same rationale as
+	// AppendComputeNodeHeartbeat: avoid racing the FK insert).
+	var parentExists bool
+	if err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from compute_nodes where id = $1)`, nodeID,
+	).Scan(&parentExists); err != nil {
+		return fmt.Errorf("state: append compute_node_heartbeat_with_stats: parent check: %w", err)
+	}
+	if !parentExists {
+		return ErrNotFound
+	}
+	if _, err := s.pool.Exec(ctx, `
+		insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source, cpu_pct_60s, disk_used_bytes)
+		values ($1, $2, $3, $4, $5, $6)
+	`, nodeID, receivedAt, lastHeartbeatAt, source, cpuPct60s, diskUsedBytes); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return fmt.Errorf("%w: compute_node_heartbeats (node_id, received_at) duplicate", ErrConflict)
+		}
+		return fmt.Errorf("state: append compute_node_heartbeat_with_stats: %w", err)
+	}
+	return nil
+}
+
+// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+// per compute node. DISTINCT ON (node_id) collapses the per-node
+// rows to the latest received_at in one pass — Postgres-only
+// idiom, the MemStore mirrors it in Go. The obsListNodes handler
+// folds this onto the per-node projection; a node with no
+// heartbeats yet is NOT returned here (the LEFT JOIN in the
+// handler renders it as "no data" with the rest of the
+// compute_nodes row intact).
+func (s *PgStore) LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	rows, err := s.pool.Query(ctx, `
+		select distinct on (node_id)
+		       node_id, received_at, cpu_pct_60s, disk_used_bytes
+		from compute_node_heartbeats
+		order by node_id, received_at desc
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list latest heartbeat stats: %w", err)
+	}
+	defer rows.Close()
+	// Pre-size to a reasonable upper bound; the cluster won't have
+	// more than a few hundred nodes in the multi-host story, so
+	// 512 is generous headroom without bloating the slice.
+	out := make([]ComputeNodeHeartbeatStats, 0, 64)
+	for rows.Next() {
+		var h ComputeNodeHeartbeatStats
+		var nodeUUID string
+		var cpu *float64
+		var disk *int64
+		if err := rows.Scan(&nodeUUID, &h.ReceivedAt, &cpu, &disk); err != nil {
+			return nil, fmt.Errorf("state: scan latest heartbeat stats: %w", err)
+		}
+		h.NodeID = nodeUUID
+		h.CPUPct60s = cpu
+		h.DiskUsedBytes = disk
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate latest heartbeat stats: %w", err)
+	}
+	return out, nil
+}
+
+// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+// /v1/admin/obs/nodes handler. Groups live instances (state in
+// {RUNNING, WAKING, COLD_BOOTING}, the §6.2 invariant #1 set) by
+// instances.node_id and joins onto compute_nodes for the human-
+// friendly node name.
+//
+// Revision 2 (PR #4 prep): the original draft joined on a separate
+// instance_node_bindings table; after re-reading migration 00024
+// during implementation we discovered instances.node_id is already
+// a NOT NULL FK to compute_nodes(id), backfilled on pre-existing
+// rows. ADR-092 §8 amends §2.1 to drop the binding-table design.
+// This query mirrors the corrected design: the inner GROUP BY
+// walks the instances table directly. The +8 on ram_mb mirrors
+// §6.2 invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so per-node
+// RAMUsedMB sums to the fleet ceiling. COUNT(*) FILTER (WHERE
+// state = ...) projects each state bucket without four separate
+// scans. The JOIN onto compute_nodes is INNER today because the
+// obs handler only wants useful per-node aggregates; a node with
+// no instances simply doesn't appear in this result and the
+// handler surfaces "no live instances" via the dedicated empty
+// state in the response.
+func (s *PgStore) PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error) {
+	rows, err := s.pool.Query(ctx, `
+		select n.name                                           as node_name,
+		       count(*)                                         as instances_live,
+		       count(*) filter (where i.state = 'RUNNING')     as instances_running,
+		       count(*) filter (where i.state = 'WAKING')      as instances_waking,
+		       count(*) filter (where i.state = 'COLD_BOOTING') as instances_cold_booting,
+		       coalesce(sum(i.ram_mb + 8), 0)                    as ram_used_mb
+		from instances i
+		join compute_nodes n on n.id = i.node_id
+		where i.state in ('RUNNING', 'WAKING', 'COLD_BOOTING')
+		group by n.name
+		order by n.name
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: per-node live stats: %w", err)
+	}
+	defer rows.Close()
+	// Pre-size to a reasonable upper bound; the cluster won't have
+	// more than a few hundred nodes in the multi-host story.
+	out := make([]PerNodeStats, 0, 64)
+	for rows.Next() {
+		var s PerNodeStats
+		if err := rows.Scan(
+			&s.NodeName,
+			&s.InstancesLive,
+			&s.InstancesRunning,
+			&s.InstancesWaking,
+			&s.InstancesColdBooting,
+			&s.RAMUsedMB,
+		); err != nil {
+			return nil, fmt.Errorf("state: scan per-node live stats: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate per-node live stats: %w", err)
+	}
+	return out, nil
+}
+
 // MarkComputeNodeInactive flips active=false on the row (PR #114,
 // schedd heartbeat path). Idempotent: the UPDATE matches regardless
 // of current value, so re-flipping an inactive row is a no-op. We
@@ -8504,6 +8714,95 @@ func (s *PgStore) ListEventsByWakeID(ctx context.Context, wakeID string, since t
 		var rawData []byte
 		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
 			return nil, err
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator-obs
+// backend's read-side query for the live events table. Mirrors the
+// SQL in pkg/state/queries.sql::ListAllEventsPaged; the raw-SQL
+// fallback here keeps the param semantics identical to the sqlc
+// version (no string-built queries, all parameters bound).
+//
+// Bounded by the handler to api.ObsAdminEventsLimitMax (500). The
+// interface{} params for the discriminator columns (actor, kind_prefix,
+// subject, since) match the sqlc-emitted shape — the SQL uses the
+// ($1 = ” OR ...) predicate so the column type cannot be inferred.
+// Bound as string / time.Time at the call site.
+func (s *PgStore) ListAllEventsPaged(ctx context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if !since.IsZero() {
+		since = since.UTC()
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, at, actor, kind, subject, data from events
+		 where ($1 = '' or actor = $1)
+		   and ($2 = '' or kind like $2 || '%')
+		   and ($3 = '' or subject = $3::uuid)
+		   and ($4 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $4)
+		 order by at desc, id desc
+		 limit $5`,
+		actor, kindPrefix, subject, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list_all_events_paged: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, fmt.Errorf("state: list_all_events_paged: %w", err)
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+// per-account events drill-down. Backed by the partial
+// events_actor_account_idx on (actor_account_id) WHERE actor_account_id IS NOT NULL
+// (migrations/00099_orgs_memberships_invitations.sql). Same raw-SQL
+// shape as ListAllEventsPaged; the actor_account_id is the indexed
+// column so the planner picks the partial index on the per-account
+// filter regardless of the since filter.
+func (s *PgStore) ListRecentEventsForAccount(ctx context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if !since.IsZero() {
+		since = since.UTC()
+	}
+	parsedUUID, err := uuid.Parse(actorAccountID)
+	if err != nil {
+		// Unparseable actor_account_id — match the existing
+		// ListEvents behaviour where a malformed filter returns
+		// an empty slice rather than a SQL error.
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, at, actor, kind, subject, data from events
+		 where actor_account_id = $1
+		   and ($2 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $2)
+		 order by at desc, id desc
+		 limit $3`,
+		parsedUUID, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list_recent_events_for_account: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, fmt.Errorf("state: list_recent_events_for_account: %w", err)
 		}
 		e.Data = json.RawMessage(rawData)
 		out = append(out, e)
@@ -10826,6 +11125,11 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// NOT NULL DEFAULT false (migration 00155); plain bool
 		// scan is safe.
 		&a.WebSocketEnabled,
+		// ADR-093: per-route observability opt-in. NOT NULL
+		// DEFAULT false (migration 00212); plain bool scan is
+		// safe. Order is positional and must match
+		// appsSelectColumns.
+		&a.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: per-app overflow_node preference.
 		// Scanned into a scratch string then conditionally
 		// promoted to *string so NULL round-trips as Go-nil —
@@ -10834,7 +11138,22 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// column-list normalisation handles other nullable
 		// string-shaped values like RootDir / WorkloadName
 		// (see below).
-		&overflowNodeStr); err != nil {
+		&overflowNodeStr,
+		// Issue #272 / ADR-094: per-app preview metadata. The
+		// column projection wraps preview_of_slug and
+		// preview_pr_state in coalesce(..., '') so the scan
+		// targets can be plain strings (NULL → '' round-trips
+		// through). preview_pr_number is wrapped in
+		// coalesce(..., 0) so the scan can use a plain *int
+		// target — pgx rejects SQL NULL into *int with
+		// "cannot scan NULL into *int" (the strict default
+		// for the int4 → Go int mapping). The 0 sentinel is
+		// distinguishable from "preview with pr_number=0" via
+		// the preview_of_slug discriminator (prod apps have
+		// preview_of_slug=NULL → ''). preview_expires_at is
+		// nullable timestamptz scanned into *time.Time
+		// directly (pgx handles SQL NULL → Go nil natively).
+		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
@@ -10913,6 +11232,12 @@ const appsSelectColumns = `
 	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
 	-- writes through Plan.WebSocketResponseAllowed().
 	websocket_enabled,
+	-- ADR-093: per-route observability opt-in. Boolean NOT NULL
+	-- DEFAULT false (migration 00212); apid applies
+	-- Plan.RouteMetricsEnabled() at CreateApp time and gates PATCH
+	-- writes through Plan.RouteMetricsResponseAllowed() (Free →
+	-- 403 plan_route_metrics_not_allowed).
+	route_metrics_enabled,
 	-- Tier A10 / ADR-088: per-app overflow_node preference.
 	-- Nullable UUID; FK to compute_nodes(id) with ON DELETE SET
 	-- NULL cascades the preference to NULL on operator-side
@@ -10921,7 +11246,22 @@ const appsSelectColumns = `
 	-- coerces to the empty string via coalesce so the pgx
 	-- scan sees a string target — the App.OverflowNode field
 	-- is *string (nil = no preference = default A9 fallback).
-	coalesce(overflow_node::text, '')`
+	coalesce(overflow_node::text, ''),
+	-- Issue #272 / ADR-094: per-app preview metadata. NULL on
+	-- production apps. preview_of_slug carries the parent app's
+	-- slug (no FK — parent may be deleted while previews are
+	-- still open). preview_pr_state is the closed-set label
+	-- enforced by apps_preview_pr_state_chk (migration 00218);
+	-- the coalesce() wraps NULL → '' so the pgx scan into a
+	-- plain string is safe. preview_pr_number is wrapped in
+	-- coalesce(..., 0) so the scan can target *int directly
+	-- (pgx rejects SQL NULL into *int with "cannot scan NULL
+	-- into *int"; the 0 sentinel is distinguishable from a real
+	-- PR-number-0 preview via the preview_of_slug discriminator).
+	-- preview_expires_at is nullable timestamptz scanned into
+	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
+	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
+	coalesce(preview_pr_state, ''), preview_expires_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
@@ -14162,6 +14502,121 @@ func (s *PgStore) TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficA
 			&r.Reason,
 		); err != nil {
 			return nil, fmt.Errorf("state: traffic_anomaly_aggregate scan: %w", err)
+		}
+		r.ZScore = zScore
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// TrafficAnomalyAggregateByNode is the pgstore wrapper around
+// the sqlc-generated TrafficAnomalyAggregateByNode query
+// (PR #4 / ADR-092 §3.4 amendment). The raw SQL mirrors the
+// sqlc-emitted string verbatim so the generated code can stay
+// the source of truth for the column shapes. Same scoring
+// formula as TrafficAnomalyAggregate; one extra GROUP BY key
+// (node_id) threads the result through instances →
+// compute_nodes. The handler resolves node_id → node_name via
+// ListComputeNodes before returning the wire shape.
+func (s *PgStore) TrafficAnomalyAggregateByNode(ctx context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error) {
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
+	}
+	rows, err := s.pool.Query(ctx, `
+		with baseline as (
+		    select um.account_id,
+		           um.app_id,
+		           n.id as node_id,
+		           extract(hour from um.minute) as hour_of_day,
+		           avg(um.mb_seconds)::float8 as mean_mb_seconds,
+		           coalesce(stddev_pop(um.mb_seconds), 0)::float8 as stddev_mb_seconds,
+		           count(*)::int as sample_count
+		    from usage_minutes um
+		    join instances i on i.id = um.instance_id
+		    join compute_nodes n on n.id = i.node_id
+		    where um.minute >= $2
+		      and um.minute <  $1
+		      and um.mb_seconds > 0
+		    group by um.account_id, um.app_id, n.id, extract(hour from um.minute)
+		),
+		current_pool as (
+		    select um.account_id,
+		           um.app_id,
+		           n.id as node_id,
+		           um.minute,
+		           sum(um.mb_seconds)::float8 as current_mb_seconds
+		    from usage_minutes um
+		    join instances i on i.id = um.instance_id
+		    join compute_nodes n on n.id = i.node_id
+		    where um.minute >= $1
+		      and um.mb_seconds > 0
+		    group by um.account_id, um.app_id, n.id, um.minute
+		),
+		scored as (
+		    select c.account_id,
+		           c.app_id,
+		           c.node_id,
+		           c.minute,
+		           c.current_mb_seconds,
+		           b.mean_mb_seconds,
+		           b.stddev_mb_seconds,
+		           b.sample_count,
+		           case
+		               when b.sample_count < 3 then null
+		               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+		                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+		               when b.stddev_mb_seconds >= 1.0
+		                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+		                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+		               else null
+		           end as z_score,
+		           case
+		               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+		               else 'hour_of_day'
+		           end as reason
+		    from current_pool c
+		    join baseline b
+		      on c.account_id = b.account_id
+		     and c.app_id    = b.app_id
+		     and c.node_id   = b.node_id
+		     and extract(hour from c.minute) = b.hour_of_day
+		)
+		select account_id,
+		       app_id,
+		       node_id,
+		       minute,
+		       current_mb_seconds,
+		       mean_mb_seconds,
+		       stddev_mb_seconds,
+		       sample_count,
+		       z_score,
+		       reason
+		from scored
+		where z_score is not null
+		order by z_score desc
+		limit $3::int8
+	`, arg.Minute.Time.UTC(), arg.Minute_2.Time.UTC(), arg.Column3)
+	if err != nil {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: %w", err)
+	}
+	defer rows.Close()
+	out := []sqlc.TrafficAnomalyAggregateByNodeRow{}
+	for rows.Next() {
+		var r sqlc.TrafficAnomalyAggregateByNodeRow
+		var zScore *float64
+		if err := rows.Scan(
+			&r.AccountID,
+			&r.AppID,
+			&r.NodeID,
+			&r.Minute,
+			&r.CurrentMbSeconds,
+			&r.MeanMbSeconds,
+			&r.StddevMbSeconds,
+			&r.SampleCount,
+			&zScore,
+			&r.Reason,
+		); err != nil {
+			return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node scan: %w", err)
 		}
 		r.ZScore = zScore
 		out = append(out, r)

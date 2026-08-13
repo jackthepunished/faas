@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -52,11 +53,17 @@ type edgeRuleStore interface {
 // nil, kind=validate rules compile-then-drop (the rule is
 // silently skipped — same posture as a path-glob parse error).
 // The cmd-side run.go wires a non-nil adapter in production.
+//
+// ADR-091 hardening PR-B: metrics carries the Prometheus counter
+// registry the compile* helpers increment when a rule is dropped at
+// parse time (gateway_edge_rule_compile_error_total{kind}). nil
+// is safe — the compile helpers guard before incrementing.
 type gatewaydEdgeRules struct {
 	store    edgeRuleStore
 	cache    *gateway.EdgeRuleCache
 	log      *slog.Logger
 	validate validateCompiler
+	metrics  *gateway.Metrics
 }
 
 // validateCompiler is the surface compileValidateRules needs from
@@ -80,12 +87,15 @@ type validateCompiler interface {
 // validate may be nil (validate kind disabled; kind=validate rules
 // are silently dropped at compile time, same posture as a
 // path-glob parse error).
-func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate validateCompiler) *gatewaydEdgeRules {
+// metrics may be nil (unit tests pass nil; production wires the
+// gatewayd-internal Prometheus registry via run.go).
+func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate validateCompiler, metrics *gateway.Metrics) *gatewaydEdgeRules {
 	return &gatewaydEdgeRules{
 		store:    store,
 		cache:    gateway.NewEdgeRuleCache(gateway.EdgeRuleCacheCap),
 		log:      log,
 		validate: validate,
+		metrics:  metrics,
 	}
 }
 
@@ -115,6 +125,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	jwt, jwtErrs := compileJWTRules(storeRules)
 	ip, ipErrs := compileIPRules(storeRules)
 	validate, validateErrs := g.compileValidateRules(storeRules)
+	limit, limitErrs := compileLimitRules(storeRules)
 	entry := &gateway.HostEntry{
 		Route:    route,
 		Rewrite:  rewrite,
@@ -124,6 +135,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		JWT:      jwt,
 		IP:       ip,
 		Validate: validate,
+		Limit:    limit,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -132,8 +144,45 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, jwtErrs...)
 	parseErrs = append(parseErrs, ipErrs...)
 	parseErrs = append(parseErrs, validateErrs...)
+	parseErrs = append(parseErrs, limitErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
+	}
+	// PR-B: surface per-rule compile errors to Prometheus so the
+	// §12 dashboard chip "edge rule compile errors" reflects every
+	// dropped rule. Incrementing once per error here keeps the
+	// counter equal to the number of broken rules (not the number
+	// of hosts that had any broken rules). loadHost is the natural
+	// choke point — every Match* falls through it on a cache miss,
+	// so we get one tick per dropped rule across the whole fleet.
+	if g.metrics != nil {
+		for range routeErrs {
+			g.metrics.ObserveEdgeRuleCompileError("route")
+		}
+		for range rewriteErrs {
+			g.metrics.ObserveEdgeRuleCompileError("rewrite")
+		}
+		for range redirectErrs {
+			g.metrics.ObserveEdgeRuleCompileError("redirect")
+		}
+		for range headersErrs {
+			g.metrics.ObserveEdgeRuleCompileError("headers")
+		}
+		for range corsErrs {
+			g.metrics.ObserveEdgeRuleCompileError("cors")
+		}
+		for range jwtErrs {
+			g.metrics.ObserveEdgeRuleCompileError("jwt")
+		}
+		for range ipErrs {
+			g.metrics.ObserveEdgeRuleCompileError("ip")
+		}
+		for range validateErrs {
+			g.metrics.ObserveEdgeRuleCompileError("validate")
+		}
+		for range limitErrs {
+			g.metrics.ObserveEdgeRuleCompileError("limit")
+		}
 	}
 	return entry, nil
 }
@@ -334,6 +383,34 @@ func (g *gatewaydEdgeRules) MatchValidate(ctx context.Context, host, requestPath
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstValidateMatch(rules, requestPath, method)
+}
+
+// MatchLimit returns the highest-priority `kind=limit` rule whose
+// host, path, and method match, or nil (ADR-091 D24). Same cache
+// primitive as MatchValidate — a miss for limit triggers the same
+// loadHost pass that also recompiles route/rewrite/.../validate.
+// The applier (handler.go::applyEdgeRuleLimit, §4.1.2.8c) installs
+// http.MaxBytesReader on r.Body at the per-rule cap and emits 413
+// request_too_large on the Content-Length fast path before any
+// bytes are buffered. This method only finds the rule.
+func (g *gatewaydEdgeRules) MatchLimit(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleLimitResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetLimit(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Limit
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstLimitMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -735,6 +812,93 @@ func parseCIDRs(cidrs []string, ruleID string) ([]*net.IPNet, []gateway.PathGlob
 		return nil, parseErrs
 	}
 	return out, nil
+}
+
+// compileLimitRules mirrors compileIPRules for kind=limit. The
+// compiled slice carries the two body caps the handler's
+// applyEdgeRuleLimit consults. apid-Validate already enforced the
+// non-zero + ≤-platform-cap clamps (pkg/api/dto.go::EdgeRuleLimitAction.Validate),
+// but the SQL hotfix path means we can't trust the validator. This
+// compile step is the defence-in-depth pass: a hot-fix that
+// bypassed apid still gets clamped here, and a row with a
+// non-positive MaxBodyBytes or a value > api.MaxRequestBodyBytes
+// degrades to the platform cap (no 413-storm on bad input). The
+// streaming cap is NOT clamped here — only the buffered cap is the
+// load-bearing platform invariant.
+//
+// Like compileIPRules, the compile is a free function — it doesn't
+// need any adapter state (unlike compileValidateRules which needs
+// the schema cache). Out-of-bound values are clamped silently and
+// a slog.Warn from the caller notes the rule ID; the customer
+// never sees the warning (their rule still fires, just at the
+// platform cap).
+func compileLimitRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleLimitResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleLimitResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindLimit {
+			continue
+		}
+		if r.Action.Limit == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp the buffered cap to the platform ceiling.
+		// Non-positive → api.MaxRequestBodyBytes (a 0 cap would
+		// 413 every request, which is worse than the platform
+		// default; the same defence-in-depth posture as
+		// compileIPRules silently dropping malformed CIDRs).
+		maxBody := r.Action.Limit.MaxBodyBytes
+		if maxBody <= 0 || maxBody > api.MaxRequestBodyBytes {
+			maxBody = api.MaxRequestBodyBytes
+		}
+		// This streaming clamp is the second gate (after
+		// apid-Validate in pkg/api/dto.go) and the runtime mirror
+		// in applyEdgeRuleLimit (pkg/gateway/handler.go) trusts
+		// the value it produces. A direct-DB row that violates the
+		// DTO's `s ≥ b` invariant passes this compile and falls
+		// back to the buffered cap at runtime via the
+		// `MaxBodyBytesStreaming == 0` branch — safe degradation.
+		// Streaming cap: only clamp on the upper bound; 0 means
+		// "no carve-out, fall back to MaxBodyBytes" (the applier
+		// handles that). The negative check is defence-in-depth
+		// against a malformed direct-DB write. The hard ceiling
+		// matches api.RawStreamMaxRequestBytes (100 MiB) per
+		// pkg/api/limits.go:1652 — the constant lands in #12.
+		maxBodyStream := r.Action.Limit.MaxBodyBytesStreaming
+		if maxBodyStream < 0 {
+			maxBodyStream = 0
+		}
+		// RawStreamMaxRequestBytes is int64 (legacy raw-bridge
+		// byte-count type); struct field is int — platform-int
+		// width is fine, every box we ship is 64-bit and 100 MiB
+		// fits comfortably.
+		if int64(maxBodyStream) > api.RawStreamMaxRequestBytes {
+			maxBodyStream = int(api.RawStreamMaxRequestBytes)
+		}
+		out = append(out, gateway.EdgeRuleLimitResolved{
+			ID:                    r.ID,
+			AccountID:             r.AccountID,
+			AppID:                 r.AppID,
+			Priority:              r.Priority,
+			PathGlob:              r.MatchPath,
+			Methods:               buildMethodsMap(r.MatchMethods),
+			MaxBodyBytes:          maxBody,
+			MaxBodyBytesStreaming: maxBodyStream,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
 }
 
 // compileValidateRules mirrors compileIPRules for kind=validate.

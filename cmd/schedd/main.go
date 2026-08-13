@@ -17,8 +17,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -324,10 +326,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Issue #95 / ADR-025: dial vmmd through the location-transparent
 	// helper. tcp/dns targets require the vmmd_tls_* cluster; nil TLS on
 	// a unix target keeps single-box behaviour unchanged.
-	vmmTLS, err := cfg.LoadVMMTLSWithVerifier(nodeVerifier)
+	//
+	// ADR-052 §5 / PR-E: route the load through the WithReload factory
+	// so a SIGHUP-driven reload (operator workflow: `gregale pki
+	// rotate` → `kill -HUP $(pidof faas-schedd)`) swaps the leaf on
+	// the next outbound TLS handshake. The vmmRotator holds the
+	// live *tls.Config; vmmRouter / heartbeat / instance-stats
+	// dialers consult vmmRotator.Get() at dial time so a swap
+	// between rotations is observable to the next dial.
+	vmmRotator := wire.NewTLSRotator(nil)
+	vmmTLS, err := cfg.LoadVMMTLSWithPrefixAndVerifierAndReload(nodeVerifier, vmmRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("schedd: load vmmd TLS: %w", err)
 	}
+	vmmRotator.Set(vmmTLS)
 	store := state.NewPgStore(pool)
 
 	// Phase 2 / Gate A: resolve this schedd's owner node id at
@@ -655,10 +667,47 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// gRPC surface for gatewayd-internal (ADR-018): unix socket by default;
 	// tcp requires the tls_* cluster and is issue #95.
-	serverTLS, err := cfg.LoadServerTLSWithVerifier(nodeVerifier)
+	//
+	// ADR-052 §5 / PR-E: route the load through the WithReload factory
+	// so a SIGHUP-driven reload swaps the inbound server's leaf via
+	// stdlib's per-handshake GetConfigForClient callback. serverRotator
+	// holds the live config; Listen's outer tls.Config installs the
+	// rotator's Reload closure at startup so subsequent Set calls
+	// surface rotated material on the next handshake without
+	// rebuilding the gRPC server.
+	serverRotator := wire.NewTLSRotator(nil)
+	serverTLS, err := cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, serverRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("schedd: load server TLS: %w", err)
 	}
+	serverRotator.Set(serverTLS)
+	// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. schedd
+	// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
+	// by watchLogLevelReload). Install two parallel ones — each
+	// gets every SIGHUP (signal.Notify fans the signal out to every
+	// registered channel). Same pattern as cmd/vmmd/main.go:1115-1118's
+	// egress-bundle reload. Best-effort failure posture (matches
+	// egress bundle): a failed reload keeps prior material live,
+	// never bricks.
+	serverHupCh := make(chan os.Signal, 1)
+	signal.Notify(serverHupCh, syscall.SIGHUP)
+	defer signal.Stop(serverHupCh)
+	vmmHupCh := make(chan os.Signal, 1)
+	signal.Notify(vmmHupCh, syscall.SIGHUP)
+	defer signal.Stop(vmmHupCh)
+	// serverReload re-runs the loader on every SIGHUP and surfaces
+	// the freshly-loaded *tls.Config via rotator.Set on success.
+	// The closure is goroutine-safe (the loader is stateless
+	// beyond cfg).
+	serverReload := func() (*tls.Config, error) {
+		return cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	vmmReload := func() (*tls.Config, error) {
+		return cfg.LoadVMMTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	go wire.WatchTLSReload(ctx, log, serverHupCh, serverRotator, serverReload)
+	go wire.WatchTLSReload(ctx, log, vmmHupCh, vmmRotator, vmmReload)
+
 	lis, err := deps.listen(ctx, listenTarget, serverTLS, cfg.OwnerUser)
 	if err != nil {
 		return fmt.Errorf("schedd: listen %s: %w", listenTarget, err)
