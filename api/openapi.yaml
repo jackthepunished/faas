@@ -3658,6 +3658,48 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/throttle-suggestions:
+    get:
+      tags: [edge_rules]
+      operationId: getAppThrottleSuggestions
+      summary: |
+        Per-route throttle recommender (ADR-091 D20.5 amendment,
+        issue #881). Read-only: returns a suggested rps/burst per
+        route over the window, clamped to the customer's plan
+        ceiling so the suggestion is always settable.
+
+        The recommender is ADVICE-ONLY — it never auto-applies.
+        Customers confirm via POST /v1/apps/{slug}/edge-rules.
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string, maxLength: 40 }
+          description: "App slug (lowercase, kebab-case; per-account unique). The recommender walks the per-route rate() for this app's gatewayd-internal reader."
+        - name: range
+          in: query
+          description: |
+            Prometheus window. Closed vocabulary (see
+            `pkg/appmetrics.Ranges`). Defaults to 5m.
+          schema: { type: string, default: "5m" }
+      security:
+        - bearerAuth: [admin]
+        - bearerAuth: [apps:read]
+      responses:
+        '200':
+          description: |
+            Suggestion payload. Source is `prometheus` on success
+            or `degraded: <reason>` on Prometheus failure
+            (response is still 200 with empty Suggestions — the
+            dashboard's empty-state branch handles it).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ThrottleSuggestionsResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Outbound webhooks (issue #476 / ADR-076) ──────────────────────────────
   # Customer-facing CRUD + deliveries surface for outbound webhook
   # subscriptions. The dispatcher lives in cmd/schedd (issue #476
@@ -9415,7 +9457,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9430,6 +9472,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
+            - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9447,7 +9490,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9462,6 +9505,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
+            - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9488,6 +9532,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
+            - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -9825,6 +9870,46 @@ components:
           type: array
           items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the denylist." }
           description: "ISO 3166-1 alpha-2 country denylist. Evaluated AFTER allow; single-country deny wins."
+    EdgeRuleThrottleAction:
+      description: |
+        Per-route token-bucket cap (ADR-091 D20.5 amendment,
+        issue #881). Customers tighten the per-route rps/burst
+        below their plan's `plan.RateLimitRPS` — the apid
+        validator enforces the sub-plan ceiling; the gateway
+        compiler enforces it again at load time.
+
+        Sub-plan ceiling — the load-bearing constraint. A
+        throttle rule is STRICTLY a tightening primitive. A
+        rule that exceeds the ceiling is rejected with 422
+        BEFORE any DB write — a customer cannot raise their
+        plan limit by registering a throttle rule.
+
+        Per-IP sub-keying is deliberately absent in v1 — see
+        the package doc on `pkg/state.EdgeRuleThrottleAction`
+        for the design rationale (memory-bounded limiter +
+        attacker-controlled IP cardinality = unbounded bucket
+        growth).
+      type: object
+      required: [requests_per_second, burst]
+      properties:
+        requests_per_second:
+          type: number
+          format: double
+          minimum: 0.01
+          description: |
+            Token-bucket refill rate per route. The apid
+            validator rejects rps > plan.RateLimitRPS with a
+            422. The gateway compiler clamps + warns on the
+            same bound at load time.
+          example: 50
+        burst:
+          type: integer
+          minimum: 1
+          description: |
+            Token-bucket burst per route. Mirrors rps: rejected
+            above `plan.RateLimitBurst` at create time and
+            clamped at compile time.
+          example: 200
 
 
     # ─── API keys ─────────────────────────────────────────────────────────
@@ -10618,6 +10703,149 @@ components:
             `__route_other__`. Omitted on `source: unavailable` paths
             (cap state is unknown when the gatewayd-internal dial
             fails).
+
+    ThrottleSuggestionRow:
+      description: |
+        One (route → suggested rate) row in the payload returned by
+        `GET /v1/apps/{slug}/throttle-suggestions` (ADR-091 D20.5
+        amendment, issue #881). The recommender is read-only — it
+        never auto-applies — and the suggestion is always ≤ the
+        customer's plan ceiling so a customer can act on it
+        without a 422 from apid's sub-plan validator.
+      type: object
+      required: [route, observed_rps, suggested_rps, suggested_burst, multiplier]
+      properties:
+        route:
+          type: string
+          description: |
+            The bounded label exactly as emitted on the Prometheus
+            side: `<METHOD> <PATH>` (pre-edge-rule-rewrite), or
+            the reserved `__route_other__` overflow bucket label.
+          example: "GET /users/4f8a"
+          x-since: "2026-08"
+          x-issue: "881"
+        observed_rps:
+          type: number
+          format: double
+          minimum: 0
+          description: |
+            The `rate()` value over the window (already per-second).
+          example: 1.5
+          x-since: "2026-08"
+          x-issue: "881"
+        suggested_rps:
+          type: number
+          format: double
+          minimum: 1
+          description: |
+            `ceil(observed_rps * multiplier)` clamped into
+            `[1, plan.RateLimitRPS]`. The 2× headroom is echoed
+            on the wire so the value is auditable rather than
+            magic.
+          example: 3
+          x-since: "2026-08"
+          x-issue: "881"
+        suggested_burst:
+          type: integer
+          minimum: 1
+          description: |
+            `ceil(suggested_rps * 1.5)` clamped into
+            `[1, plan.RateLimitBurst]`. The 1.5× factor is a
+            softer version of the rate headroom — burst oversize
+            is the most common cause of customer-flapping 429s.
+          example: 5
+          x-since: "2026-08"
+          x-issue: "881"
+        multiplier:
+          type: number
+          format: double
+          description: |
+            The headroom factor the recommender applied to
+            `observed_rps`. Pinned on the wire so a future
+            strategy change is distinguishable from drift.
+          example: 2.0
+          x-since: "2026-08"
+          x-issue: "881"
+
+    ThrottleSuggestionsResponse:
+      description: |
+        Per-route throttle recommendation payload (ADR-091 D20.5
+        amendment, issue #881). Source is `prometheus` on success
+        or `degraded: <reason>` on Prometheus failure (response is
+        still 200 with empty Suggestions — the dashboard's
+        empty-state branch handles it).
+      type: object
+      required: [app_id, range, source, route_metrics_disabled, routes_collapsed, plan_ceiling_rps, plan_ceiling_burst, multiplier, suggestions]
+      properties:
+        app_id: { type: string, x-since: "2026-08", x-issue: "881" }
+        range: { type: string, x-since: "2026-08", x-issue: "881" }
+        source:
+          type: string
+          description: |
+            `prometheus` on success, `degraded: <reason>` on
+            PromQL failure.
+          x-since: "2026-08"
+          x-issue: "881"
+        as_of:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp the response was assembled.
+          x-since: "2026-08"
+          x-issue: "881"
+        route_metrics_disabled:
+          type: boolean
+          default: false
+          description: |
+            True when `apps.route_metrics_enabled=false` (Free
+            plan). The response carries empty Suggestions plus
+            this flag so the dashboard can render the upsell
+            rather than a misleading zero.
+          x-since: "2026-08"
+          x-issue: "881"
+        routes_collapsed:
+          type: integer
+          minimum: 0
+          description: |
+            Count of routes that collapsed into the reserved
+            `__route_other__` overflow bucket during the window
+            (ADR-093 cap = 50). A non-zero value indicates the
+            throttle is partial-coverage regardless of the
+            configured limit.
+          x-since: "2026-08"
+          x-issue: "881"
+        plan_ceiling_rps:
+          type: integer
+          minimum: 0
+          description: |
+            `plan.RateLimitRPS` — the sub-plan ceiling the
+            suggestion is clamped to. 0 on unknown plans (fail
+            OPEN — the apid sub-plan validator is the
+            authoritative gate).
+          x-since: "2026-08"
+          x-issue: "881"
+        plan_ceiling_burst:
+          type: integer
+          minimum: 0
+          description: |
+            `plan.RateLimitBurst` — the sub-plan ceiling for
+            burst. 0 on unknown plans.
+          x-since: "2026-08"
+          x-issue: "881"
+        multiplier:
+          type: number
+          format: double
+          description: |
+            The headroom factor the recommender applied to every
+            route (`Multiplier` constant). Echoed on the wire
+            so the strategy is auditable.
+          example: 2.0
+          x-since: "2026-08"
+          x-issue: "881"
+        suggestions:
+          type: array
+          items: { $ref: '#/components/schemas/ThrottleSuggestionRow' }
+          x-since: "2026-08"
+          x-issue: "881"
 
     ListInstancesResponse:
       description: |

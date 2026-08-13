@@ -227,6 +227,12 @@ var methodRouteMap = map[string]string{
 	"GET /v1/edge-rules/{id}":         "GetEdgeRule",
 	"PATCH /v1/edge-rules/{id}":       "UpdateEdgeRule",
 	"DELETE /v1/edge-rules/{id}":      "DeleteEdgeRule",
+	// ADR-091 D20.5 amendment / issue #881 — per-route throttle
+	// recommender. Auto-derivation would produce
+	// "GetAppsSlugThrottle-suggestions" (literal hyphen) due to the
+	// path's webhook-model naming; the SDK verb is the noun
+	// "ThrottleSuggestions" so the explicit map drops the hyphen.
+	"GET /v1/apps/{slug}/throttle-suggestions": "GetAppThrottleSuggestions",
 
 	// Issue #476 / ADR-076 — outbound webhook subscriptions. Same
 	// pattern as alerts: the SDK names the methods after the resource

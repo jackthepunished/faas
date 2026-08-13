@@ -29,6 +29,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/throttlerec"
 )
 
 // getAppMetrics serves GET /v1/apps/{slug}/metrics?range=.
@@ -53,6 +54,49 @@ func (s *server) getAppMetrics(w http.ResponseWriter, r *http.Request, acct stat
 	}
 
 	resp, src := appmetrics.Fetch(r.Context(), s.promqlClient, s.log, app.ID, rng)
+	resp.AppID = app.ID
+	resp.Range = rng
+	resp.Source = src
+	resp.AsOf = time.Now().UTC().Format(time.RFC3339Nano)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// getAppThrottleSuggestions serves
+// GET /v1/apps/{slug}/throttle-suggestions?range= (ADR-091 D20.5
+// amendment, issue #881). Same auth chain as getAppMetrics
+// (read-only, ScopesReadSurface, no MFA). IDOR-safe via loadApp.
+//
+// The handler is a thin wrapper around pkg/throttlerec.Fetch: it
+// pulls the customer's plan ceiling from the app's account row,
+// passes the route_metrics_enabled flag, validates the range,
+// and assembles the response envelope. The actual PromQL query
+// and recommendation math live in pkg/throttlerec — the extracted
+// seam matches the per-app metrics pattern
+// (pkg/appmetrics.Fetch) so the dashboard's two cards share the
+// same PromQL transport and the same degraded-fallback shape.
+func (s *server) getAppThrottleSuggestions(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug")) //nolint:contextcheck // loadApp takes r and uses r.Context() for its own DB calls; the helper is shared across every per-app handler.
+	if !ok {
+		return
+	}
+
+	rng := r.URL.Query().Get("range")
+	if rng == "" {
+		rng = throttlerec.DefaultRange
+	}
+	if !appmetrics.IsValidRange(rng) {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"invalid range",
+			fmt.Sprintf("range must be one of: %s", strings.Join(appmetrics.Ranges(), ", "))))
+		return
+	}
+
+	resp, src := throttlerec.Fetch(r.Context(), s.promqlClient, s.log, throttlerec.FetchOptions{
+		AppID:               app.ID,
+		Range:               rng,
+		Plan:                acct.Plan,
+		RouteMetricsEnabled: app.RouteMetricsEnabled,
+	})
 	resp.AppID = app.ID
 	resp.Range = rng
 	resp.Source = src

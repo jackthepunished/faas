@@ -138,6 +138,15 @@ var dtoExclude = map[string]bool{
 	"AppWebhookDeliveryRow":           true,
 	"ListAppWebhookDeliveriesOptions": true,
 	"RotateAppWebhookSecretRequest":   true,
+	// ADR-091 D20.5 amendment / issue #881 — per-route throttle
+	// validator context. The EdgeRuleThrottleAction.Validate() takes
+	// a per-plan ceiling argument bag (RateLimitRPS / RateLimitBurst)
+	// rather than reading limits globally; the context is the
+	// boundary that makes the validator unit-testable without a
+	// plan row. It is a server-side concern that never crosses
+	// the wire — apid inlines the per-plan values from the
+	// acct.Plan row at validateEdgeRuleAction time.
+	"ThrottleValidationContext": true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the

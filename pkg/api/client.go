@@ -1857,6 +1857,27 @@ func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetric
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// GetAppThrottleSuggestions returns the per-route throttle
+// recommendation payload for slug over the named range window
+// (ADR-091 D20.5 amendment, issue #881). The recommender is
+// read-only — it never auto-applies — and the suggestion is
+// always ≤ the customer's plan ceiling so the customer can act
+// on it without a 422 from apid's sub-plan validator.
+//
+// rng is the same closed vocabulary as GetAppMetrics; empty
+// falls back to the server's default (5m). The response is
+// HTTP 200 with empty Suggestions on Prometheus failure (the
+// dashboard's empty-state branch handles it). RouteMetricsDisabled
+// is true when apps.route_metrics_enabled=false (Free plan).
+func (c *Client) GetAppThrottleSuggestions(ctx context.Context, slug, rng string) (ThrottleSuggestionsResponse, error) {
+	var out ThrottleSuggestionsResponse
+	path := "/v1/apps/" + slug + "/throttle-suggestions"
+	if rng != "" {
+		path += "?range=" + rng
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // GetAppRoutes returns the per-route label snapshot for the named
 // app (ADR-093). The bounded label set is served by the
 // gatewayd-internal control listener and reverse-proxied by apid;

@@ -819,6 +819,14 @@ func (s *server) handler() http.Handler {
 	// (a customer who shouldn't see a route set on app X
 	// cannot enumerate it through this endpoint).
 	mux.HandleFunc("GET /v1/apps/{slug}/routes", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppRoutes)))
+	// ADR-091 D20.5 amendment / issue #881 — per-route throttle
+	// recommender (Phase 1). Read-only, no MFA, primary caller is
+	// an API key with ScopesReadSurface. IDOR-safe via loadApp —
+	// cross-account slug is a 404, not a 200 with another tenant's
+	// per-route observations. The recommender is ADVICE-ONLY — it
+	// never auto-applies; customers confirm via POST
+	// /v1/apps/{slug}/edge-rules.
+	mux.HandleFunc("GET /v1/apps/{slug}/throttle-suggestions", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppThrottleSuggestions)))
 	// Account-scoped metrics rollup (issue #393). One call replaces
 	// N per-app /v1/apps/{slug}/metrics calls. Same auth chain as
 	// the per-app endpoint (read-only, no MFA). Cross-account
