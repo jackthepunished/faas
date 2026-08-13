@@ -876,17 +876,33 @@ func ForwardingRawReverseProxyWithEventsAndDrain(nodes NodeClientLookup, log *sl
 	}
 	return func(t Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Drain tracker: holds the per-raw-pump drain slot.
-			// The defer fires when this handler returns to
-			// net/http (typically after the gRPC bidi stream
-			// tears down). This is the only safe surface for
-			// the per-raw-pump Begin because the hijacked conn
-			// pump goroutine outlives ServeHTTP's envelope.
-			defer func() {
-				if tracker != nil {
-					tracker.Begin("upgrade")()
-				}
-			}()
+			// Drain tracker: holds the per-raw-pump drain slot
+			// for the FULL lifetime of the hijacked Upgrade pump
+			// (which outlives ServeHTTP's envelope — the bidi
+			// gRPC stream keeps the conn open past this
+			// function return).
+			//
+			// Correct shape is `defer tracker.Begin("upgrade")()`:
+			//   - Begin("upgrade") runs IMMEDIATELY at the defer
+			//     statement (increments the WaitGroup).
+			//   - The Done closure is what gets deferred.
+			//
+			// The WRONG shape `defer func(){ tracker.Begin(...)() }()`
+			// evaluates the entire closure body at function return
+			// — Begin+Done both fire then, so the tracker never
+			// sees a slot held during the pump.
+			//
+			// Begin is NOT nil-safe (it's a method on *Tracker), so
+			// guard explicitly when the tracker is absent (e2e
+			// harness, unit tests). When tracker == nil, returning
+			// the no-op closure let the same `defer ...()` shape
+			// be used at the call site without an if-defender
+			// outside the defer statement itself.
+			done := func() {}
+			if tracker != nil {
+				done = tracker.Begin("upgrade")
+			}
+			defer done()
 			ctx := contextWithProxyStart(r.Context(), time.Now())
 			cli, closer, ok := nodes.ClientFor(r.Context(), t.NodeID)
 			if !ok {

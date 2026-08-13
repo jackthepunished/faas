@@ -1029,7 +1029,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// (Phase 3 review policy). nil in tests (the e2e harness
 	// doesn't drive the stream; the picker falls through to
 	// per-node healthyCount as it always did).
-	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log)
+	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log, nil)
 	go deps.warmHints.Run(ctx)
 	return runWithDeps(ctx, log, deps)
 }
@@ -1642,9 +1642,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// schedd stream cadence under steady-state is sub-second).
 	// Skipped when deps.warmHints is nil so a test that doesn't
 	// construct the consumer doesn't fail /readyz permanently.
+	//
+	// FIX-4 (PR #880 code review): the touch callback returned
+	// by NewStalenessSignal MUST be wired back to the consumer,
+	// otherwise the helper goroutine observes lastTouch == 0 on
+	// every tick and flips the signal false with reason "no
+	// touch yet" — /readyz would be 503 forever and the LB
+	// would never route traffic to this daemon. SetOnTouch
+	// invokes touch() once immediately so the signal's first
+	// goroutine tick already sees touched > 0.
 	if deps.warmHints != nil {
-		signal, _, _ := gateway.NewStalenessSignal(2 * time.Minute)
+		signal, touch, _ := gateway.NewStalenessSignal(2 * time.Minute)
 		readyProbe.RegisterSignal(signal)
+		deps.warmHints.SetOnTouch(touch)
 	}
 	controlMux := gateway.ControlMux(handler.Metrics(), readyProbe.ReadyFunc(), deps.drain)
 	// Finding 6 (issue #314): mount the dashboard quota endpoint on the

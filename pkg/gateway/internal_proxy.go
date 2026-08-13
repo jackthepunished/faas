@@ -273,14 +273,29 @@ func dialWithTimeout(ctx context.Context, dialer InternalDialer, dialTimeout tim
 func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Drain tracker (issue #587 / PR-A): a request that's
 	// handed off to the proxy is "in flight" from the daemon's
-	// perspective until RoundTrip returns. The defer is nil-safe
-	// (no-op closure when p.Drain is nil) so production wires it
-	// once at construction and unit tests don't have to.
-	defer func() {
-		if p.Drain != nil {
-			p.Drain.Begin("http")()
-		}
-	}()
+	// perspective until this ServeHTTP returns.
+	//
+	// Correct shape is `defer tracker.Begin("http")()`:
+	// Begin runs IMMEDIATELY at the defer statement
+	// (increments the WaitGroup); the Done closure is what
+	// gets deferred.
+	//
+	// The WRONG shape `defer func(){ tracker.Begin(...)() }()`
+	// evaluates the entire closure body at function return —
+	// Begin and Done both fire then, so the tracker never sees
+	// a slot held during the proxy's RoundTrip. Under load,
+	// the gateway's drain then `OutcomeClean`s immediately and
+	// force-cuts in-flight requests — the exact regression
+	// PR-A's WaitGroup was meant to fix.
+	//
+	// Begin is NOT nil-safe (it's a method on *Tracker); guard
+	// explicitly when the drain is absent so the e2e harness
+	// and unit tests still compile.
+	done := func() {}
+	if p.Drain != nil {
+		done = p.Drain.Begin("http")
+	}
+	defer done()
 
 	if p.Dialer == nil || p.Target == nil {
 		// Wiring bug — log at ERROR because the customer sees the
