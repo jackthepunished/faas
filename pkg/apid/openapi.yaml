@@ -9439,11 +9439,11 @@ components:
       properties:
         allow:
           type: array
-          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code." }
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the allowlist." }
           description: "ISO 3166-1 alpha-2 country allowlist. Empty + deny non-empty = deny-only. Empty + deny empty = no-op (create-time 422)."
         deny:
           type: array
-          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code." }
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the denylist." }
           description: "ISO 3166-1 alpha-2 country denylist. Evaluated AFTER allow; single-country deny wins."
 
     # ─── API keys ─────────────────────────────────────────────────────────
