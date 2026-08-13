@@ -1,7 +1,7 @@
 package gateway
 
 // Edge rule kind=budget subset (ADR-093 §Decision, see
-// migrations/00245_edge_rules_kind_budget.sql).
+// migrations/00254_edge_rules_kind_budget.sql).
 //
 // kind=budget is the per-request wall-clock budget primitive: a
 // customer pins a hard wall-clock deadline on a matched

@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00245_edge_rules_kind_budget.sql
+// Migration-apply test for 00254_edge_rules_kind_budget.sql
 // (ADR-093 §Decision / new ADR-0NN-kind-budget). The kind=budget
-// slot lands at 00245 — fence-free after main's 00237
+// slot lands at 00254 — fence-free after main's 00237
 // (apps_maintenance_mode, PR-B post-272-preview) and PR #884's
 // 00238-00243 (tenant_surfaces PR-0, ADR-099 cluster, issue #879).
-// 00245 is unclaimed by any open PR at the time of PR #864
-// force-push. Slots 00245+ are open. Future renumbering must
+// 00254 is unclaimed by any open PR at the time of PR #864
+// force-push. Slots 00254+ are open. Future renumbering must
 // re-verify `git ls-tree origin/main migrations/` AND enumerate
 // open-PR fence claims
 // (cross-pr-slot-gate-reservation-fence-pattern) after every
@@ -15,7 +15,7 @@
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00245 (no goose
+//  1. Migration set applies cleanly through 00254 (no goose
 //     duplicate-version panic).
 //  2. edge_rules_kind_check CHECK exists, with the closed
 //     vocabulary of 12 values: route, rewrite, redirect, headers,
@@ -36,7 +36,7 @@
 //     the new shape (pgstore's edgeRuleSelectCols is
 //     kind-agnostic and stores action verbatim).
 //  5. All 11 pre-existing kinds still accept. Walk the
-//     pre-00245 vocabulary and assert each inserts successfully.
+//     pre-00254 vocabulary and assert each inserts successfully.
 //     This is the load-bearing regression pin for the
 //     CHECK-rewrite race — a future regression that narrows the
 //     CHECK to just 'budget' (e.g. by silently overwriting the
@@ -73,7 +73,7 @@ import (
 // widening the migration's IN list is a load-bearing failure mode.
 // Includes 'geo' from migration 00229 (PR #845, kind=geo) and
 // 'maintenance' from migration 00236 (PR-B post-272-preview,
-// kind=maintenance) because PR #864's migration 00245 must rewrite
+// kind=maintenance) because PR #864's migration 00254 must rewrite
 // the CHECK with the union of all post-00219 vocab — losing either
 // would re-trigger the CHECK-rewrite race (PR #864 CI run
 // 31705973056, PG shard 2 fail).
@@ -83,13 +83,13 @@ var budgetMigrationVocab = []string{
 	"geo", "maintenance", "budget",
 }
 
-func TestMigrations_00245_EdgeRulesKindBudget(t *testing.T) {
+func TestMigrations_00254_EdgeRulesKindBudget(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00245 should land last.
+	// (1) Run the full migration set. 00254 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00237 maintenance_mode and 00245 budget — also ensure no other open PR has claimed 00245+)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00237 maintenance_mode and 00254 budget — also ensure no other open PR has claimed 00254+)", err)
 	}
 
 	// (2) CHECK constraint shape + (3) constraint name pin. One
@@ -122,7 +122,7 @@ func TestMigrations_00245_EdgeRulesKindBudget(t *testing.T) {
 			t.Errorf("edge_rules_kind_check: missing %s in def %q (closed vocabulary must include all 12 values; a regression here means the CHECK was narrowed)", needle, def)
 		}
 	}
-	// Belt-and-braces: assert the narrower pre-00245 vocabulary
+	// Belt-and-braces: assert the narrower pre-00254 vocabulary
 	// (without 'budget') is NOT the active def. Catches a
 	// regression where the migration was authored but the
 	// ALTER TABLE ADD CONSTRAINT silently failed (e.g. a
@@ -136,10 +136,10 @@ func TestMigrations_00245_EdgeRulesKindBudget(t *testing.T) {
 	// reads back. Seeds an account + app + edge_rule with the
 	// kind=budget action jsonb shape (budget_ms +
 	// allow_override_header). pgstore.MigrateUp has already
-	// applied 00245 — the row goes through the active CHECK.
-	accountID := "00000000-0000-0000-0000-000000002245"
-	appID := "00000000-0000-0000-0000-000000012245"
-	ruleID := "00000000-0000-0000-0000-000000022245"
+	// applied 00254 — the row goes through the active CHECK.
+	accountID := "00000000-0000-0000-0000-000000002254"
+	appID := "00000000-0000-0000-0000-000000012254"
+	ruleID := "00000000-0000-0000-0000-000000022254"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
 		values ($1, 'scale', 'budget-kind-test@example.com')
@@ -192,7 +192,7 @@ func TestMigrations_00245_EdgeRulesKindBudget(t *testing.T) {
 	})
 
 	// (5) All 11 pre-existing kinds still accept. Walk the
-	// pre-00245 vocabulary (route..maintenance) and assert each
+	// pre-00254 vocabulary (route..maintenance) and assert each
 	// inserts successfully. This is the load-bearing regression
 	// pin for the CHECK-rewrite race between this migration and
 	// every prior widening PR — a future regression that
@@ -242,7 +242,7 @@ func TestMigrations_00245_EdgeRulesKindBudget(t *testing.T) {
 				                        priority, enabled, kind, action)
 				values ($1, $2, $3, 'api.example.com', $4, 100, true, $5, $6)
 			`, probeID, accountID, appID, "/probe/"+k, k, aJSON); err != nil {
-				t.Fatalf("insert kind=%s: %v (CHECK regression — pre-existing kind rejected after 00245 widening)", k, err)
+				t.Fatalf("insert kind=%s: %v (CHECK regression — pre-existing kind rejected after 00254 widening)", k, err)
 			}
 			t.Cleanup(func() {
 				_, _ = pool.Exec(ctx, `delete from edge_rules where id = $1`, probeID)

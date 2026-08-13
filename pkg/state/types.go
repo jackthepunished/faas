@@ -3355,7 +3355,7 @@ const (
 	// Open to Free and every other plan (no IsPaidOnly change — a
 	// 3 s default budget is a baseline safety floor that all
 	// customers benefit from). See
-	// migrations/00245_edge_rules_kind_budget.sql for the schema
+	// migrations/00254_edge_rules_kind_budget.sql for the schema
 	// CHECK widening.
 	EdgeRuleKindBudget EdgeRuleKind = "budget"
 )
