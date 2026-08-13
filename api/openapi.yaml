@@ -1566,7 +1566,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-f0-9]{64}$' }
-        description: "64-hex-char SHA-256 fingerprint (ADR-096 §3.5)."
+        description: "64-hex-char SHA-256 fingerprint of the error group; sha256(route_template || 0x1f || status || 0x1f || error_class)."
     get:
       tags: [apps]
       operationId: listAppErrorRequests
@@ -1607,7 +1607,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-f0-9]{64}$' }
-        description: "64-hex-char SHA-256 fingerprint (ADR-096 §3.5)."
+        description: "64-hex-char SHA-256 fingerprint to inspect; the oldest request row for this group is returned with its redacted headers."
     get:
       tags: [apps]
       operationId: getAppErrorSample
@@ -10972,7 +10972,7 @@ components:
       type: object
       required: [fingerprint, error_class, route, http_status, count, request_count, first_seen_at, last_seen_at, sample_message]
       properties:
-        fingerprint: { type: string, pattern: '^[a-f0-9]{64}$', description: "64-hex-char SHA-256 fingerprint (ADR-096 §3.5)." }
+        fingerprint: { type: string, pattern: '^[a-f0-9]{64}$', description: "64-hex-char SHA-256 fingerprint identifying this error group; stable across requests with the same (route, status, error_class)." }
         error_class:
           type: string
           enum: [db_timeout, stripe_timeout, null_pointer, invalid_json, wake_failed, upstream_5xx, unhandled, client_error]
