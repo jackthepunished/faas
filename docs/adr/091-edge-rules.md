@@ -275,10 +275,26 @@ PR-A/B/C — keep their cite numbers untouched.)
       runbook (`docs/runbooks/FaasAuditRetentionExhaustion.md`).
       ADR-075 + this PR close the runtime gap; the operator-obs
       ticket (#817 in flight) closes the dashboard chip in D20.4.
-    - **D20.4 — Observability dashboard chip.** `gateway_edge_rule_match_total
-      {kind, outcome}` is exported as a Prometheus counter; no
-      Grafana chip ships. Owner: ADR-092 (observability catalog)
-      follow-on.
+    - **D20.4 — Grafana observability chip.** PR-B (PR #857) shipped
+      the three prerequisite metrics in `pkg/wire/metrics.go:1389-1425`:
+      `apid_audit_events_deleted_total`,
+      `apid_audit_events_retention_lag_seconds`,
+      `apid_audit_events_volume_total{kind_prefix}`. PR-D20.4 closes
+      the operator surface with three Prometheus alert rules
+      (`FaasAuditRetentionLoopStalled` page, staleness-based — the
+      gauge itself reads ~90d on every healthy pass and does NOT grow
+      between passes, so the alert uses `time() - timestamp(gauge) >
+      93600`; `FaasAuditRetentionLoopStretched` warn at 50h;
+      `FaasAuditRetentionTableGrowingFasterThanPruned` warn with a
+      `volume_rate > 0` precondition to avoid firing on idle days when
+      the deleted counter is flat) and the Grafana dashboard
+      `faas-audit-retention-d20-4` (3 panels: prune rate, retention
+      lag with green/yellow/red thresholds at 89-91d healthy, and
+      `topk(8, ...)` volume by kind_prefix). All alerts/panels
+      reference `docs/runbooks/FaasAuditRetentionExhaustion.md`.
+      Alertmanager routing keys on `severity` (page / warn / info),
+      so the new `family: audit_retention` label requires no routing
+      change. **Shipped.**
     - **D20.5 — Per-rule rate limit.** Token-bucket per rule (e.g.,
       "this JWKS-protected endpoint gets 100 RPS per IP"). Out of
       ADR-091 — new ADR needed.

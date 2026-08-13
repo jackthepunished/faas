@@ -20,10 +20,17 @@ ADR-075) is failing to keep up. The three signals stack:
 - **`apid_audit_events_retention_lag_seconds` (gauge)**: the gauge
   reflects `(now − cutoff)` at the latest successful pass. A
   pinned-zero value means the loop is running but finds nothing to
-  prune. A growing value tracks the cadence of the loop; an alert
-  fires when the gauge exceeds 26h (loop is running but the cadence
-  is stretched). A missing/NaN value means the loop never completed
-  a pass successfully — escalate.
+  prune. The gauge itself reads `~7,776,000 seconds (≈90 days)` on
+  every healthy pass — it does NOT grow between passes (the gauge
+  is `Set` to `now − cutoff` per `pkg/eventretention/cleanup.go:211-213`,
+  and cutoff is fixed at `now − 90d`). Prometheus alerts on
+  **staleness** instead: `time() − timestamp(gauge) > 93600` (page,
+  `FaasAuditRetentionLoopStalled`) fires when the loop hasn't
+  completed a pass in >26h (24h cadence + 2h slack for the first-pass
+  grace window). A second alert at `> 180000` (warn,
+  `FaasAuditRetentionLoopStretched`) trips when the cadence is past
+  2x the interval (50h). A missing/NaN value means the loop never
+  completed a pass successfully — escalate.
 - **`apid_audit_events_volume_total{kind_prefix}` (counter, labelled)**:
   a divergence between this counter's rate and the table's actual
   growth points to either (a) the loop silently failing (counter
@@ -105,9 +112,20 @@ their network identifiers. This is required for incident response
 
 ## Verify
 
+The Grafana dashboard `faas-audit-retention-d20-4` (uid
+`faas-audit-retention-d20-4`) renders all three signals on one
+panel set — open it first; the curl commands below are for ad-hoc
+verification when the dashboard isn't available.
+
 ```bash
-# Is the loop alive? — gauge present + non-NaN
+# Is the loop alive? — gauge present + non-NaN AND recent (staleness)
 curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=apid_audit_events_retention_lag_seconds'
+
+# Is the loop running on schedule? — gauge staleness (PR-D20.4 primary signal)
+# Healthy: time() - timestamp(gauge) < 86400s (one cadence).
+# Page:    > 93600s (26h, one cadence + 2h slack).
+# Warn:    > 180000s (50h, 2x cadence + 2h slack).
+curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=time%28%29+-+timestamp%28apid_audit_events_retention_lag_seconds%29'
 
 # Is it pruning? — counter rate over 24h
 curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=rate%28apid_audit_events_deleted_total%5B24h%5D%29'
