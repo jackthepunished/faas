@@ -1,27 +1,31 @@
 //go:build !no_pg
 
-// Migration-apply test for 00220_edge_rules_kind_budget.sql
+// Migration-apply test for 00244_edge_rules_kind_budget.sql
 // (ADR-093 §Decision / new ADR-0NN-kind-budget). The kind=budget
-// slot lands at 00220 — fence-free after 00217 + 00218 (reserve
-// slot fences, PR #845 + #849 chains) and 00219 (kind=limit,
-// PR #855). Future renumbering must re-verify `git ls-tree
-// origin/main migrations/` after every rebase, per
-// migration-test-uuid-sed-residual and pr-845-edge-rules-geo-
-// slot-chase-2026-08-11.
+// slot lands at 00244 — fence-free after main's 00237
+// (apps_maintenance_mode, PR-B post-272-preview) and PR #884's
+// 00238-00243 (tenant_surfaces PR-0, ADR-099 cluster, issue #879).
+// 00244 is unclaimed by any open PR at the time of PR #864
+// force-push. Slots 00245+ are open. Future renumbering must
+// re-verify `git ls-tree origin/main migrations/` AND enumerate
+// open-PR fence claims
+// (cross-pr-slot-gate-reservation-fence-pattern) after every
+// rebase, per migration-test-uuid-sed-residual and
+// pr-845-edge-rules-geo-slot-chase-2026-08-11.
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00220 (no goose
+//  1. Migration set applies cleanly through 00244 (no goose
 //     duplicate-version panic).
 //  2. edge_rules_kind_check CHECK exists, with the closed
-//     vocabulary of 10 values: route, rewrite, redirect, headers,
-//     cors, jwt, ip, validate, limit, budget. pg_get_constraintdef
-//     emits the IN-list form per pg-get-constraintdef-shapes.md;
-//     assert every value appears as a substring. The regression
-//     pin for the CHECK-rewrite race: a future migration that
-//     widens or narrows this CHECK must not silently drop any of
-//     these 10 values — this assertion catches it here, before
-//     production.
+//     vocabulary of 12 values: route, rewrite, redirect, headers,
+//     cors, jwt, ip, validate, limit, geo, maintenance, budget.
+//     pg_get_constraintdef emits the IN-list form per
+//     pg-get-constraintdef-shapes.md; assert every value appears
+//     as a substring. The regression pin for the CHECK-rewrite
+//     race: a future migration that widens or narrows this CHECK
+//     must not silently drop any of these 12 values — this
+//     assertion catches it here, before production.
 //  3. The constraint name is exactly `edge_rules_kind_check`
 //     (Postgres-assigned default for an inline CHECK on `kind`).
 //  4. Positive round-trip: insert a row with kind='budget' +
@@ -31,13 +35,14 @@
 //     fields verbatim. Pins that the jsonb action column accepts
 //     the new shape (pgstore's edgeRuleSelectCols is
 //     kind-agnostic and stores action verbatim).
-//  5. All 9 pre-existing kinds still accept. Walk the
-//     pre-00220 vocabulary and assert each inserts successfully.
+//  5. All 11 pre-existing kinds still accept. Walk the
+//     pre-00244 vocabulary and assert each inserts successfully.
 //     This is the load-bearing regression pin for the
 //     CHECK-rewrite race — a future regression that narrows the
 //     CHECK to just 'budget' (e.g. by silently overwriting the
 //     ADD CONSTRAINT with a one-value list) would 23514 every
-//     kind=validate / kind=limit create on this code path.
+//     kind=validate / kind=limit / kind=geo / kind=maintenance
+//     create on this code path.
 //  6. A typo kind='budget_typo' is rejected with 23514 (check
 //     violation). Pins the closed vocabulary contract end-to-end.
 //  7. Replay safety: re-running db.MigrateUp is a no-op (the
@@ -66,19 +71,25 @@ import (
 // must carry after this migration. The slice doubles as the pin
 // set the test walks — adding a new value here without also
 // widening the migration's IN list is a load-bearing failure mode.
+// Includes 'geo' from migration 00229 (PR #845, kind=geo) and
+// 'maintenance' from migration 00236 (PR-B post-272-preview,
+// kind=maintenance) because PR #864's migration 00244 must rewrite
+// the CHECK with the union of all post-00219 vocab — losing either
+// would re-trigger the CHECK-rewrite race (PR #864 CI run
+// 31705973056, PG shard 2 fail).
 var budgetMigrationVocab = []string{
 	"route", "rewrite", "redirect", "headers",
 	"cors", "jwt", "ip", "validate", "limit",
-	"budget",
+	"geo", "maintenance", "budget",
 }
 
-func TestMigrations_00220_EdgeRulesKindBudget(t *testing.T) {
+func TestMigrations_00244_EdgeRulesKindBudget(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00220 should land last.
+	// (1) Run the full migration set. 00244 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00219 limit and 00220 budget)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00237 maintenance_mode and 00244 budget — also ensure no other open PR has claimed 00244+)", err)
 	}
 
 	// (2) CHECK constraint shape + (3) constraint name pin. One
@@ -108,10 +119,10 @@ func TestMigrations_00220_EdgeRulesKindBudget(t *testing.T) {
 	for _, v := range budgetMigrationVocab {
 		needle := "'" + v + "'"
 		if !strings.Contains(def, needle) {
-			t.Errorf("edge_rules_kind_check: missing %s in def %q (closed vocabulary must include all 10 values; a regression here means the CHECK was narrowed)", needle, def)
+			t.Errorf("edge_rules_kind_check: missing %s in def %q (closed vocabulary must include all 12 values; a regression here means the CHECK was narrowed)", needle, def)
 		}
 	}
-	// Belt-and-braces: assert the narrower pre-00220 vocabulary
+	// Belt-and-braces: assert the narrower pre-00244 vocabulary
 	// (without 'budget') is NOT the active def. Catches a
 	// regression where the migration was authored but the
 	// ALTER TABLE ADD CONSTRAINT silently failed (e.g. a
@@ -125,10 +136,10 @@ func TestMigrations_00220_EdgeRulesKindBudget(t *testing.T) {
 	// reads back. Seeds an account + app + edge_rule with the
 	// kind=budget action jsonb shape (budget_ms +
 	// allow_override_header). pgstore.MigrateUp has already
-	// applied 00220 — the row goes through the active CHECK.
-	accountID := "00000000-0000-0000-0000-000000002220"
-	appID := "00000000-0000-0000-0000-000000012220"
-	ruleID := "00000000-0000-0000-0000-000000022220"
+	// applied 00244 — the row goes through the active CHECK.
+	accountID := "00000000-0000-0000-0000-000000002244"
+	appID := "00000000-0000-0000-0000-000000012244"
+	ruleID := "00000000-0000-0000-0000-000000022244"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
 		values ($1, 'scale', 'budget-kind-test@example.com')
@@ -177,26 +188,26 @@ func TestMigrations_00220_EdgeRulesKindBudget(t *testing.T) {
 		t.Errorf("action jsonb round-trip: got %s, want action.budget.allow_override_header=\"x-faas-budget-ms\"", string(gotAction))
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `delete from edge_rules where id = $1`, ruleID)
+		_, _ = pool.Exec(ctx, `delete from edge_rules where id = $1`, ruleID)
 	})
 
-	// (5) All 9 pre-existing kinds still accept. Walk the
-	// pre-00220 vocabulary (route..limit) and assert each
+	// (5) All 11 pre-existing kinds still accept. Walk the
+	// pre-00244 vocabulary (route..maintenance) and assert each
 	// inserts successfully. This is the load-bearing regression
 	// pin for the CHECK-rewrite race between this migration and
 	// every prior widening PR — a future regression that
 	// narrows the CHECK to just 'budget' (e.g. by silently
 	// overwriting the ADD CONSTRAINT with a one-value list)
-	// would 23514 every kind=validate / kind=limit create on
-	// this code path. Each iteration seeds its own row so the
-	// inserts don't collide on the (account_id, app_id,
-	// match_host, match_path) uniqueness.
-	for _, k := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit"} {
+	// would 23514 every kind=validate / kind=limit / kind=geo /
+	// kind=maintenance create on this code path. Each iteration
+	// seeds its own row so the inserts don't collide on the
+	// (account_id, app_id, match_host, match_path) uniqueness.
+	for _, k := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "geo", "maintenance"} {
 		k := k
 		t.Run("vocab_still_accepts_"+k, func(t *testing.T) {
 			// Reuse the same account + app; vary match_path so
 			// each kind row is distinct.
-			probeID := "00000000-0000-0000-0000-00000003" + strings.Repeat("0", 0) + pad2(k)
+			probeID := "00000000-0000-0000-0000-00000003" + pad2(k)
 			probeAction := map[string]any{}
 			switch k {
 			case "route":
@@ -217,6 +228,10 @@ func TestMigrations_00220_EdgeRulesKindBudget(t *testing.T) {
 				probeAction["validate"] = map[string]any{"schema": map[string]any{"type": "object"}}
 			case "limit":
 				probeAction["limit"] = map[string]any{"max_body_bytes": 1024}
+			case "geo":
+				probeAction["geo"] = map[string]any{"allow": []string{"DE"}}
+			case "maintenance":
+				probeAction["maintenance"] = map[string]any{"retry_after_seconds": 60}
 			}
 			aJSON, mErr := json.Marshal(probeAction)
 			if mErr != nil {
@@ -227,10 +242,10 @@ func TestMigrations_00220_EdgeRulesKindBudget(t *testing.T) {
 				                        priority, enabled, kind, action)
 				values ($1, $2, $3, 'api.example.com', $4, 100, true, $5, $6)
 			`, probeID, accountID, appID, "/probe/"+k, k, aJSON); err != nil {
-				t.Fatalf("insert kind=%s: %v (CHECK regression — pre-existing kind rejected after 00220 widening)", k, err)
+				t.Fatalf("insert kind=%s: %v (CHECK regression — pre-existing kind rejected after 00244 widening)", k, err)
 			}
 			t.Cleanup(func() {
-				_, _ = pool.Exec(context.Background(), `delete from edge_rules where id = $1`, probeID)
+				_, _ = pool.Exec(ctx, `delete from edge_rules where id = $1`, probeID)
 			})
 		})
 	}
@@ -268,7 +283,7 @@ func TestMigrations_00220_EdgeRulesKindBudget(t *testing.T) {
 	})
 }
 
-// pad2 left-pads a 1- or 2-char kind name to exactly 2 chars so
+// pad2 truncates a 1- or 2-char kind name to exactly 2 chars so
 // the probe row IDs stay within the 00000000-0000-0000-0000-
 // 00000003XXXX pattern. Mirrors the uuid-sed-residual pattern.
 func pad2(s string) string {

@@ -3325,7 +3325,7 @@ const (
 	// (24 h) is enforced at apid-create time. Optional Message
 	// goes into Problem.detail (≤ 512 B; same payload-size budget
 	// as EdgeRuleValidateAction.Schema). Plan-gated Free-and-above
-	// (no IsPaidOnly change). See migrations/00220_edge_rules_kind_maintenance.sql
+	// (no IsPaidOnly change). See migrations/00236_edge_rules_kind_maintenance.sql
 	// for the schema CHECK widening.
 	EdgeRuleKindMaintenance EdgeRuleKind = "maintenance"
 	// EdgeRuleKindGeo is the country allow/deny primitive (ADR-091 D21).
@@ -3355,7 +3355,7 @@ const (
 	// Open to Free and every other plan (no IsPaidOnly change — a
 	// 3 s default budget is a baseline safety floor that all
 	// customers benefit from). See
-	// migrations/00220_edge_rules_kind_budget.sql for the schema
+	// migrations/00244_edge_rules_kind_budget.sql for the schema
 	// CHECK widening.
 	EdgeRuleKindBudget EdgeRuleKind = "budget"
 )

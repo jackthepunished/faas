@@ -31,13 +31,16 @@ import (
 
 // edgeRuleKindVocab mirrors the closed `kind` set in
 // migrations/00192_edge_rules.sql's CHECK constraint (extended by
-// migrations/00214 for validate, 00219 for limit, 00220 for geo,
-// and 00244 for throttle). Surfacing a typo locally avoids a
-// 400 round-trip on every `edge-rules create` call (same posture
-// as webhookClosedVocab in commands_webhooks.go).
+// migrations/00214 for validate, 00219 for limit, 00229 for geo,
+// 00236 for maintenance, 00244 for throttle, and 00244 for budget
+// (post-merge the budget migration renumbered to the same slot as
+// the throttle migration — see ADR-091 D20.5 amendment, issue #881
+// + ADR-093). Surfacing a typo locally avoids a 400 round-trip on
+// every `edge-rules create` call (same posture as webhookClosedVocab
+// in commands_webhooks.go).
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
-	"validate", "limit", "geo", "throttle",
+	"validate", "limit", "geo", "maintenance", "throttle", "budget",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
