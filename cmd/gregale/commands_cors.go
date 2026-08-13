@@ -58,6 +58,15 @@ import (
 // failing fast avoids a round-trip).
 var corsDefaultMethods = []string{"GET", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"}
 
+// corsRuleKind is the edge-rule kind string the CLI filters for in
+// ListEdgeRulesForApp responses. Mirrors state.EdgeRuleKindCORSA but
+// stays in this file so the CLI doesn't import pkg/state (the
+// CLI is HTTP-only — see cli-is-http-only-not-direct-db). The
+// goconst lint wants a named const so a wire-shape regression
+// (renaming "cors" to "cors_v2") shows up at compile time on
+// the kind comparisons below.
+const corsRuleKind = "cors"
+
 // corsAllowedMethods is the closed set of HTTP methods the --method
 // flag accepts. Anything else fails fast (local 422-equivalent).
 // Mirrors the apid-side gate (EdgeRuleCORSAction.Validate at
@@ -214,7 +223,7 @@ func cmdCorsLs(args []string) int {
 	}
 	cors := make([]api.EdgeRuleResponse, 0, len(rules))
 	for _, r := range rules {
-		if r.Kind == "cors" {
+		if r.Kind == corsRuleKind {
 			cors = append(cors, r)
 		}
 	}
@@ -284,7 +293,7 @@ func cmdCorsShow(args []string) int {
 	}
 	cors := make([]api.EdgeRuleResponse, 0, len(rules))
 	for _, r := range rules {
-		if r.Kind == "cors" {
+		if r.Kind == corsRuleKind {
 			cors = append(cors, r)
 		}
 	}
