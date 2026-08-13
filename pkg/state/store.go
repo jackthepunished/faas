@@ -1915,6 +1915,14 @@ type Store interface {
 	// handler before the insert; the insert itself runs the same
 	// count inside the FOR UPDATE on the apps row).
 	CountEdgeRulesForApp(ctx context.Context, appID string) (int, error)
+	// CountEdgeRulesByKindForApp is the per-kind quota check
+	// (ADR-091 D22 — kind=geo has a tighter per-app cap than the
+	// general EdgeRulesPerApp; Free=1 vs 5). Called by the apid
+	// handler to surface the specific kind + cap to the customer
+	// (e.g. "kind=geo: 1/1 rules used on Free"). The store
+	// implementations run the count inside the same apps-row FOR
+	// UPDATE lock for race-freedom against parallel inserts.
+	CountEdgeRulesByKindForApp(ctx context.Context, appID string, kind EdgeRuleKind) (int, error)
 	// MatchEdgeRulesForHost is the gateway hot-path read. Returns
 	// every enabled rule whose match_host matches `host` (or "*"),
 	// ordered by priority ASC. The gatewayd matcher iterates in

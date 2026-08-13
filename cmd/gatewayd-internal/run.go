@@ -52,6 +52,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/gateway/writegate"
+	"github.com/onebox-faas/faas/pkg/geoip"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -108,6 +109,20 @@ var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", defaultPublicListenAddr)
 // configPath is the on-disk TOML config. Overridable via FAAS_GATEWAYD_CONFIG
 // for non-standard deployments; production uses /etc/faas/gatewayd.toml.
 var configPath = envOrGateway("FAAS_GATEWAYD_CONFIG", "/etc/faas/gatewayd.toml")
+
+// geoipDBPath is the on-disk MaxMind-compatible .mmdb file consulted
+// by applyEdgeRuleGeo (ADR-091 D21). Override via FAAS_GEOIP_DB_PATH
+// for non-standard deployments; production uses /var/lib/faas/geoip/
+// dbip-country-lite.mmdb. Empty string = geo kind disabled (the
+// reader stays nil and the gate fail-opens).
+var geoipDBPath = envOrGateway("FAAS_GEOIP_DB_PATH", "/var/lib/faas/geoip/dbip-country-lite.mmdb")
+
+// geoipAutoRefresh, when "1", spawns the periodic DB-IP download
+// goroutine (cadence: 168h/weekly). Default "0" — the operator
+// owns the file (rsync'd from a control-plane mirror, mounted via
+// ConfigMap, etc.). The auto-refresh path is for environments
+// where the daemon is the canonical source of the DB.
+var geoipAutoRefresh = envOrGateway("FAAS_GEOIP_AUTO_REFRESH", "0")
 
 // controlAddr is the private control-plane listener — never reachable from
 // the internet; bound to the loopback interface by default so an
@@ -402,6 +417,18 @@ type runDeps struct {
 	// rows go through. nil = audit-disabled (matches the
 	// WithRequireAuthn audit nil-allowance).
 	edgeRulesAudit *gatewaydEdgeRulesAud
+	// geoReader (ADR-091 D21) is the pkg/geoip.Reader consulted
+	// by applyEdgeRuleGeo. nil = geo kind disabled (pre-PR-7 +
+	// file-missing posture; matches the WithEdgeRules nil-allowance).
+	// Production wires a real reader backed by the DB-IP Lite
+	// .mmdb file at FAAS_GEOIP_DB_PATH; a missing file logs a
+	// WARN and the reader stays nil so the daemon boots cleanly.
+	geoReader *geoip.Reader
+	// geoWatcher (ADR-091 D21) is the periodic refresh goroutine.
+	// nil = no auto-refresh (the file is sourced from the operator,
+	// not auto-downloaded). Production wires a Watcher with a
+	// 168h (weekly) cadence if FAAS_GEOIP_AUTO_REFRESH=1.
+	geoWatcher *geoip.Watcher
 	// publicAuthCache (issue #477 / ADR-079) is the unsealed
 	// basic-auth credential cache shared between the Handler
 	// (enforcePublicAuthBasic reads through it) and the
@@ -861,6 +888,49 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// below.
 	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter, deps.metrics)
 	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
+	// ADR-091 D21 — build the pkg/geoip.Reader backed by the
+	// DB-IP Lite .mmdb file at FAAS_GEOIP_DB_PATH. The Reader
+	// is nil-safe: a missing file logs a WARN and the reader
+	// stays nil so the daemon boots cleanly (the gate fail-opens
+	// at request time). The watcher is optional and only
+	// spawned when FAAS_GEOIP_AUTO_REFRESH=1 — the default is
+	// operator-owned file (rsync / ConfigMap / volume mount).
+	if geoipDBPath != "" {
+		reader, gerr := geoip.Open(geoipDBPath, geoip.SourceDBIP, geoip.DBIPAttribution, log)
+		if gerr != nil {
+			log.Warn("geoip: open failed; geo kind disabled (fail-open)",
+				"path", geoipDBPath,
+				"err", gerr)
+		} else {
+			deps.geoReader = reader
+			log.Info("geoip: loaded",
+				"path", geoipDBPath,
+				"source", string(geoip.SourceDBIP),
+				"attribution", geoip.DBIPAttribution,
+			)
+			if geoipAutoRefresh == "1" {
+				// 168h = 7 days. DB-IP publishes a monthly
+				// snapshot; the weekly cadence is a safety
+				// margin and tolerates a few days of drift.
+				watcher, werr := geoip.NewWatcher(reader, 168*time.Hour, log)
+				if werr != nil {
+					log.Warn("geoip: watcher init failed; continuing without auto-refresh",
+						"err", werr)
+				} else {
+					deps.geoWatcher = watcher
+					// Best-effort fetch on boot so the
+					// first request doesn't hit a stale
+					// DB. Cancellable via the daemon's
+					// shutdown context.
+					if berr := watcher.WatcherOnce(ctx); berr != nil {
+						log.Warn("geoip: boot refresh failed; continuing with the on-disk file",
+							"err", berr)
+					}
+					watcher.Start(ctx)
+				}
+			}
+		}
+	}
 	// Issue #561 / ADR-091 PR 5 — build the per-URL JWKS cache
 	// + JWT verifier that applyEdgeRuleJWT consults. Lazy
 	// registration on first match; the cache uses an HTTP client
@@ -1081,6 +1151,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// pkg/edgejwks.NewCache + pkg/edgejwks.NewVerifier.
 	if deps.edgeJWKSAdapter != nil {
 		handler.WithJWTVerifier(deps.edgeJWKSAdapter)
+	}
+	// ADR-091 D21 — arm the geoip reader that applyEdgeRuleGeo
+	// consults. nil-safe: deps.geoReader nil (file missing or
+	// FAAS_GEOIP_DB_PATH empty) keeps the gate disabled; the
+	// matcher still surfaces a geo rule, but the lookup is a
+	// no-op and the gate fail-opens.
+	if deps.geoReader != nil {
+		handler.WithGeoReader(deps.geoReader)
 	}
 	// PR-B — arm the per-rule JSON-Schema validator that
 	// applyEdgeRuleValidate consults. nil-safe:

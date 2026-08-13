@@ -172,6 +172,14 @@ type Metrics struct {
 	// "no data" for a quiet daemon). See ObserveStreamStart /
 	// ObserveStreamEnd below.
 	streamActive *prometheus.GaugeVec
+	// geoipDBAgeSeconds: ADR-091 D21. Gauge labelled by the
+	// geoip.Source (dbip | maxmind). The reader's pkg/geoip
+	// BootAt() is read at scrape time; the gauge is the
+	// operator's "is the DB stale?" tripwire. A scrape value
+	// > 30 days = the auto-refresh is failing AND the operator
+	// hasn't replaced the file manually; the dashboard panel
+	// flags red.
+	geoipDBAgeSeconds *prometheus.GaugeVec
 	// accountRateLimited backs the per-account throttling introduced by
 	// ADR-040 (issue #292). Labels: account_id, plan. Pre-instantiates
 	// the four plan rows under the `__other__` placeholder so the §12
@@ -478,6 +486,10 @@ func NewMetrics() *Metrics {
 			Name: "gateway_request_failures_by_route_total",
 			Help: "Per-route failures counter (ADR-093). Increments on status ≥ 400; the dashboard computes error_rate_pct directly from the ratio to gateway_requests_total. Same route admission as gateway_requests_by_route_total above.",
 		}, []string{"app", "plan", "route", "code"}),
+		geoipDBAgeSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "geoip_db_age_seconds",
+			Help: "Seconds since the geoip DB was last (re)loaded. ADR-091 D21; the operator's 'is the DB stale?' tripwire.",
+		}, []string{"source"}),
 		wakeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "gateway_wake_latency_seconds",
 			Help: "End-to-end latency from request received to first upstream byte after a cold wake.",
@@ -837,7 +849,7 @@ func NewMetrics() *Metrics {
 	// triple. The closed set guarantees the §12 dashboard panel
 	// "edge rule match rate" surfaces every (kind, outcome)
 	// tuple from first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "geo"} {
 		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
@@ -888,10 +900,10 @@ func NewMetrics() *Metrics {
 	// ADR-091 hardening PR-A pre-instantiation must remain present
 	// so the §12 dashboard chip "edge rule apply rate" + "edge rule
 	// compile errors" surface every tuple from first scrape. Closed
-	// set: {route, rewrite, redirect, headers, cors, jwt, ip}. Adding
-	// a new kind requires extending this slice — the metric name is
-	// stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit"} {
+	// set: {route, rewrite, redirect, headers, cors, jwt, ip, validate,
+	// limit, geo}. Adding a new kind requires extending this slice —
+	// the metric name is stable.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "geo"} {
 		for _, result := range []string{"success", "error"} {
 			m.edgeRuleApply.WithLabelValues(kind, result)
 		}
@@ -914,18 +926,20 @@ func NewMetrics() *Metrics {
 	} {
 		m.wakePhaseDuration.WithLabelValues(phase)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts,
-		// Issue #676 / ADR-080 follow-up, PR-B: raw-bytes Upgrade
-		// / WebSocket observability surface. Registered alongside
-		// the rest of the gateway_* series so the §12 dashboard
-		// panels (ws_upgrade / ws_active / ws_duration /
-		// ws_bytes) surface from boot. The pre-instantiate loop
-		// above stamps every closed label cell — a missing
-		// registration here would cause /metrics to omit the
-		// series entirely even with the WithLabelValues calls in
-		// place.
-		m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes,
-	)
+	// ADR-091 D21 (kind=geo): register geoipDBAgeSeconds alongside
+	// the rest of the wake/edge-rule metric family. Labelled by the
+	// DB source (closed set today: {"dbip"}); see NewMetrics() for
+	// the field declaration.
+	//
+	// Issue #676 / ADR-080 follow-up, PR-B: raw-bytes Upgrade /
+	// WebSocket observability surface. Registered alongside the rest
+	// of the gateway_* series so the §12 dashboard panels
+	// (ws_upgrade / ws_active / ws_duration / ws_bytes) surface
+	// from boot. The pre-instantiate loop above stamps every closed
+	// label cell — a missing registration here would cause /metrics
+	// to omit the series entirely even with the WithLabelValues
+	// calls in place.
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds)
 	return m
 }
 

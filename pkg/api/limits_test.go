@@ -52,7 +52,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (route|rewrite|redirect|headers|cors) but jwt/ip stay
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
-			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false,
+			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1,
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
 			WebhookPerApp: 0, WebhookPerAccount: 0,
@@ -152,7 +152,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND the jwt|ip kinds. The plan-kind gate surface
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
-			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
+			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
 			// (10) one-to-one. Pending invitations = members/2
 			// because the default 7d TTL keeps the live set small.
@@ -249,7 +249,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-089 (planned): edge rules — Pro unlocks 100 rules
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
-			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
+			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
 			// (50) one-to-one — every team member can hold a key
 			// for their own deploy target. Financial model is
@@ -349,7 +349,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (5× Pro) AND jwt|ip. The 500 cap is the practical upper
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
-			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
+			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
 			// (200) one-to-one — SaaS-scale multi-team + rotating-CI.
 			// Financial model is authoritative — derived value,
@@ -1849,6 +1849,62 @@ func TestHAConstantsStable(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v (ADR-083/084 design value)",
 				c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestEdgeRulesGeoPerApp_PerPlanMatrix pins the per-plan matrix for the
+// new EdgeRulesGeoPerApp quota (ADR-091 D22). Free customers get 1
+// geo rule (the "block everything except DE" abuse-block use case),
+// Hobby=5, Pro=25, Scale=100. This is the FAIL-CLOSED shape that the
+// apid handler dispatches on ErrPlanEdgeRuleKindQuotaReached.
+//
+// Distinct from EdgeRulesPerApp (the general per-app cap), which is
+// 5/25/100/500 — geo is a high-touch abuse primitive so the per-kind
+// cap is intentionally tighter than the general cap on Free.
+func TestEdgeRulesGeoPerApp_PerPlanMatrix(t *testing.T) {
+	want := map[Plan]int{
+		PlanFree:  1,
+		PlanHobby: 5,
+		PlanPro:   25,
+		PlanScale: 100,
+	}
+	for plan, expected := range want {
+		l, ok := LimitsFor(plan)
+		if !ok {
+			t.Fatalf("LimitsFor(%s) returned !ok", plan)
+		}
+		if l.EdgeRulesGeoPerApp != expected {
+			t.Errorf("%s: EdgeRulesGeoPerApp = %d, want %d", plan, l.EdgeRulesGeoPerApp, expected)
+		}
+	}
+	// Sanity: at every plan tier, EdgeRulesGeoPerApp ≤ EdgeRulesPerApp
+	// (the per-kind cap must never exceed the general cap). A
+	// regression that swaps the two values breaks the fail-closed
+	// quota gate — Free customers could create more geo rules than
+	// total rules, which is impossible to enforce.
+	for _, plan := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale} {
+		l, _ := LimitsFor(plan)
+		if l.EdgeRulesGeoPerApp > l.EdgeRulesPerApp {
+			t.Errorf("%s: per-kind cap %d > general cap %d (per-kind must ≤ general)",
+				plan, l.EdgeRulesGeoPerApp, l.EdgeRulesPerApp)
+		}
+	}
+}
+
+// TestEdgeRulesGeoPerApp_MonotonicLadder pins that the per-plan
+// geo-cap ladder is non-decreasing. A regression where Pro < Hobby
+// or Scale < Pro breaks the upgrade story (a Pro customer
+// downgrading-from-Scale would gain geo capacity, which is an
+// invariant the billing model depends on).
+func TestEdgeRulesGeoPerApp_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.EdgeRulesGeoPerApp < prevL.EdgeRulesGeoPerApp {
+			t.Errorf("%s.EdgeRulesGeoPerApp (%d) < %s.EdgeRulesGeoPerApp (%d)",
+				ladder[i], currL.EdgeRulesGeoPerApp, ladder[i-1], prevL.EdgeRulesGeoPerApp)
 		}
 	}
 }

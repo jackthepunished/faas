@@ -1,19 +1,17 @@
 -- filename: 00223_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Reserve slot 223 as a cross-PR fence. PR #845
--- (ADR-091 D21-D23 / kind=geo) claims slot 00223 with a
--- real migration (00223_edge_rules_kind_geo.sql); this
--- fence is reservation-only per ADR-041 and
--- cross-pr-slot-gate-reservation-fence-pattern, so it does
--- NOT collide with PR #845's slot claim — the slot-check
--- excludes reservation files from the overlap scan. The
--- fence exists on THIS branch so the migrations-contiguous
--- gate passes locally; the actual slot claim lives on PR
--- #845. Once #845 merges into main, the fence here is
--- deleted via `git rm migrations/00223_reserve_slot.sql`
--- (per cross-pr-rebase-fence-deletion-hazard — restore with
--- `git checkout origin/main -- migrations/00223_reserve_slot.sql`
--- if main loses the file).
+-- Reserve slot 223 as a cross-PR fence (PR #866 ADR-091 D20-D25
+-- cors_defaults). PR #845 (ADR-091 D21 kind=geo) passed through
+-- this slot during its 9-hop renumber chain (00207 → 215 → 216 →
+-- 217 → 218 → 220 → 221 → 222 → 223 → 226) before stepping further
+-- to 00226 to avoid stepping on PR #866's coordination. The fence
+-- stays as a historical marker — its original intent (a coexistence
+-- reservation for PR #845 at slot 00223) is satisfied in spirit by
+-- PR #845's renumber to the next free slot past PR #866's own
+-- 00224 + 00225 reservation markers. The fence body is unchanged
+-- (SELECT 1; no-op per ADR-041) so the migrations-contiguous gate
+-- passes locally; the slot is just passed-through real estate, not
+-- a claim.
 SELECT 1;
 -- +goose StatementEnd

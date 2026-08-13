@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
+import type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 import type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';
 import type { EdgeRuleIPAction } from './EdgeRuleIPAction.js';
 import type { EdgeRuleJWTAction } from './EdgeRuleJWTAction.js';
@@ -24,6 +25,6 @@ export type CreateEdgeRuleRequest = {
   /**
    * Kind-tagged action body — shape depends on `kind`.
    */
-  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction);
+  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleGeoAction);
 };
 
