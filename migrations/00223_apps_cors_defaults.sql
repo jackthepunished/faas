@@ -42,9 +42,15 @@
 -- allow my origin, no application code") without breaking
 -- apps whose preflight handlers depend on running.
 
+-- Replay-safe (PR #377 / ADR-041): ADD COLUMN IF NOT EXISTS. The two
+-- columns are NOT NULL DEFAULT false (boolean, no rewrite) and
+-- nullable text[] (no rewrite) — both metadata-only — so a second
+-- MigrateUp is a no-op and the replay_safety_test harness stays
+-- green. The original DROP COLUMN IF EXISTS pair (below) keeps the
+-- down-migration idempotent for the same reason.
 ALTER TABLE apps
-  ADD COLUMN cors_default_enabled boolean NOT NULL DEFAULT false,
-  ADD COLUMN cors_default_origins  text[];
+  ADD COLUMN IF NOT EXISTS cors_default_enabled boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS cors_default_origins  text[];
 
 -- +goose StatementEnd
 
