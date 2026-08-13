@@ -585,10 +585,12 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// lgtm[go/reflected-xss] false-positive: statusRecorder is a pass-through; gatewayd-internal serves application/json (api.WriteProblem via cmd/apid handlers) or text/event-stream SSE (cmd/gatewayd-internal/app_logs.go::ServeHTTP), never HTML — the XSS sink is unreachable. Mirrors the pattern at pkg/middleware/authlimit.go:81 and pkg/gateway/handler.go:3973.
 func (r *statusRecorder) Write(p []byte) (int, error) {
 	if !r.wroteHeader {
 		r.wroteHeader = true
 	}
+	// lgtm[go/reflected-xss] false-positive: see doc-comment above; pass-through forwards bytes unchanged to the underlying ResponseWriter.
 	return r.ResponseWriter.Write(p)
 }
 
