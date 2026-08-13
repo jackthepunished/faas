@@ -7,8 +7,8 @@
 // Pins:
 //
 //  1. Both tables exist:
-//       - data_upstreams
-//       - data_upstream_probes
+//     - data_upstreams
+//     - data_upstream_probes
 //     Plus the default partition
 //     `data_upstream_probes_default`.
 //  2. data_upstream_probes is PARTITIONED BY RANGE on
@@ -21,20 +21,20 @@
 //     PARTITION BY clause, this assertion fails before the
 //     breakage reaches production.
 //  3. CHECK constraints reject malformed input:
-//       - source outside ('inferred','explicit') → 23514
-//       - scope not matching app_envs_scope_shape → 23514
-//       - kind outside the 14-value vocabulary → 23514
-//       - host outside the RFC 1123 regex → 23514
-//         (×3 flavors: wildcard + underscores + IPv4
-//         literal — the classifier must normalise
-//         BEFORE INSERT)
-//       - port outside 1..65535 → 23514
-//       - host_redacted_hash not 64 hex / not the
-//         __unsalted__ sentinel → 23514
-//       - last_rtt_ms out of [0, 600000] → 23514
-//       - last_probed_at / last_rtt_ms pair violated → 23514
-//       - data_upstream_probes ok/rtt/error_class pair
-//         violated → 23514
+//     - source outside ('inferred','explicit') → 23514
+//     - scope not matching app_envs_scope_shape → 23514
+//     - kind outside the 14-value vocabulary → 23514
+//     - host outside the RFC 1123 regex → 23514
+//     (×3 flavors: wildcard + underscores + IPv4
+//     literal — the classifier must normalise
+//     BEFORE INSERT)
+//     - port outside 1..65535 → 23514
+//     - host_redacted_hash not 64 hex / not the
+//     __unsalted__ sentinel → 23514
+//     - last_rtt_ms out of [0, 600000] → 23514
+//     - last_probed_at / last_rtt_ms pair violated → 23514
+//     - data_upstream_probes ok/rtt/error_class pair
+//     violated → 23514
 //  4. FK cascade: deleting an account cascades to both
 //     data_upstreams and the apps that the upstreams row
 //     points to. data_upstream_probes has no FK (intentional
