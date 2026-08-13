@@ -28,6 +28,38 @@ UID `faas-edge-rules-pr-b`. Mirror at
 `docs/runbooks/`: `FaasEdgeRuleApplyHigh.md`, `FaasEdgeRuleCompileError.md`,
 `FaasEdgeRuleJWTFailures.md`.
 
+## `audit-retention.json` (ADR-091 D20.4 / PR-D20.4, ADR-075)
+
+Three-panel dashboard for the audit-event retention observability
+chip. Closes the operator surface for the three prerequisite
+metrics shipped by PR-B (PR #857) in `pkg/wire/metrics.go:1389-1425`:
+`apid_audit_events_deleted_total` (counter, only ticks on passes
+where `deleted > 0` per `pkg/eventretention/cleanup.go:205-210`),
+`apid_audit_events_retention_lag_seconds` (gauge, reads ~90d on every
+healthy pass because `cleanup.go:198-199` sets cutoff = now − 90d and
+line 211-213 Sets the gauge to now − cutoff), and
+`apid_audit_events_volume_total{kind_prefix}` (counter, labelled).
+
+Panels mirror `docs/runbooks/FaasAuditRetentionExhaustion.md`'s
+three-signal triage:
+
+1. **Audit events pruned / 24h** — `sum(increase(apid_audit_events_deleted_total[24h]))`. Idle days (loop running, nothing past the cutoff) read 0; the counter is `Add`-ed only when `deleted > 0`.
+2. **Retention lag (days, healthy: 89-91)** — `apid_audit_events_retention_lag_seconds / 86400`. Stat panel with green band 89-91d, yellow 91-95d, red <89 or >95d. The healthy value is exactly 90d on every pass; values outside the band mean clock skew or `CutoffDays` misconfiguration.
+3. **Audit-event volume by kind_prefix (top 8)** — `topk(8, sum by (kind_prefix) (rate(apid_audit_events_volume_total[5m])))`. The `topk(8, ...)` clamp survives the bounded-admission helper at `pkg/wire/metrics.go` (overflow collapses to `__other__`).
+
+UID `faas-audit-retention-d20-4`. Mirror at
+`deploy/ansible/roles/grafana/files/audit-retention.json`
+(byte-identical — `make grafana-mirror-check` enforces the contract).
+Companion Prometheus alerts live at
+`deploy/ansible/roles/prometheus/files/faas.rules.yml` under
+`family: audit_retention`:
+
+- `FaasAuditRetentionLoopStalled` (page) — `time() − timestamp(gauge) > 93600` (26h, one cadence + 2h slack) for 30m. SOC 2 CC6.2 retention obligation at risk.
+- `FaasAuditRetentionLoopStretched` (warn) — `> 180000` (50h, 2x cadence + 2h slack) for 30m. Loop is alive but cadence is broken.
+- `FaasAuditRetentionTableGrowingFasterThanPruned` (warn) — volume rate > 0 AND `(volume_rate − deleted_rate) > 100` rows/day for 6h. The `> 0` precondition prevents firing on idle days when the deleted counter is flat.
+
+Runbook: `docs/runbooks/FaasAuditRetentionExhaustion.md`.
+
 ## Provisioning (PR #141, ADR-031)
 
 The canonical install path is `deploy/ansible/roles/grafana/`, which
