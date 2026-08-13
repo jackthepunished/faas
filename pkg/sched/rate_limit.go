@@ -62,18 +62,18 @@ import (
 // events.Platform) so unit tests that don't exercise the limiter can
 // skip the wire-up.
 type WakeRateLimiter struct {
-	mu      sync.Mutex
-	appBuckets    map[string]*wakeBucket // appID -> bucket
-	acctBuckets   map[string]*wakeBucket // accountID -> bucket
-	now           func() time.Time
-	noop          bool // test seam: WithNoop returns a copy that always allows
+	mu          sync.Mutex
+	appBuckets  map[string]*wakeBucket // appID -> bucket
+	acctBuckets map[string]*wakeBucket // accountID -> bucket
+	now         func() time.Time
+	noop        bool // test seam: WithNoop returns a copy that always allows
 }
 
 type wakeBucket struct {
-	tokens  float64
-	rpm     float64 // refill rate (tokens per minute)
-	burst   float64 // bucket ceiling
-	last    time.Time
+	tokens float64
+	rpm    float64 // refill rate (tokens per minute)
+	burst  float64 // bucket ceiling
+	last   time.Time
 }
 
 // NewWakeRateLimiter returns a limiter using the wall clock.

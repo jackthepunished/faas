@@ -140,8 +140,8 @@ type Limits struct {
 	// fanning out across many apps in the same account cannot evade
 	// the per-app ceiling by keeping each app under its own cap. Same
 	// evasion shape as pkg/gateway.Limiter.AllowAccount.
-	WakeBurstPerApp      int
-	WakeBurstPerAccount  int
+	WakeBurstPerApp     int
+	WakeBurstPerAccount int
 
 	// Networking (spec §7).
 	EgressMbit int // per-instance egress bandwidth cap via tc
