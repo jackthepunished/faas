@@ -1,4 +1,4 @@
--- filename: 00228_apps_maintenance_mode.sql
+-- filename: 00232_apps_maintenance_mode.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -44,9 +44,10 @@
 -- invalidation is the load-bearing reason this trigger exists.
 --
 -- Pre-reserved at PR-A by migrations/00227_reserve_slot.sql
--- (since renumbered to migration 00228 by PR-B's 5-cycle renumber;
--- 00227 is no longer the apps.maintenance_mode slot — see
--- harness.go::e2eMigrationTarget for the chain).
+-- (since renumbered to migration 00232 by PR-B's 6-cycle renumber;
+-- 00227 is now a fence on main owned by the kind=geo cluster
+-- (PR #845) — the 00226/00227/00228 stampede is settled by
+-- stepping this migration to 00232).
 
 ALTER TABLE apps
     ADD COLUMN IF NOT EXISTS maintenance_mode boolean NOT NULL DEFAULT false;

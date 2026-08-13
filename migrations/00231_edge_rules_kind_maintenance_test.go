@@ -1,25 +1,26 @@
 //go:build !no_pg
 
-// Migration-apply test for 00227_edge_rules_kind_maintenance.sql
+// Migration-apply test for 00231_edge_rules_kind_maintenance.sql
 // (ADR-091 amendment — D18 per-kind extension, PR-A fence + PR-B
 // runtime + PR-C rollout-closer).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00227 (no goose
+//  1. Migration set applies cleanly through 00231 (no goose
 //     duplicate-version panic). The kind=maintenance slot landed
-//     at 00227 after the kind=limit widening at 00219; see
+//     at 00231 after the kind=geo widening at 00229 (PR #845) and
+//     the 00227/00228 cross-PR fence stampede; see
 //     cross-pr-slot-fence-reservation-fence-pattern. Future
 //     renumbering must re-verify `git ls-tree origin/main
 //     migrations/` after every rebase.
 //  2. edge_rules_kind_check CHECK exists, with the closed
-//     vocabulary of 10 values: route, rewrite, redirect, headers,
-//     cors, jwt, ip, validate, limit, maintenance.
+//     vocabulary of 11 values: route, rewrite, redirect, headers,
+//     cors, jwt, ip, validate, limit, geo, maintenance.
 //     pg_get_constraintdef emits the IN-list form per
 //     pg-get-constraintdef-shapes.md; assert every value appears
 //     as a substring. The regression pin for the CHECK-rewrite
 //     race: a future migration that widens or narrows this
-//     CHECK must not silently drop any of these 10 values.
+//     CHECK must not silently drop any of these 11 values.
 //  3. The constraint name is exactly `edge_rules_kind_check`
 //     (Postgres-assigned default for an inline CHECK on `kind`).
 //     Same posture as 00219 / 00214.
@@ -30,7 +31,7 @@
 //  5. All 9 pre-existing kinds still accept (load-bearing
 //     regression pin for the CHECK-rewrite race between this
 //     migration and the kind=limit widening at 00219 — the
-//     00227/00228 vocabulary must still round-trip after this
+//     00231/00232 vocabulary must still round-trip after this
 //     migration).
 //  6. A typo kind='maintenance_typo' is rejected with 23514
 //     (check_violation). Pins the closed vocabulary contract.
@@ -56,18 +57,18 @@ import (
 // failure mode.
 var maintenanceMigrationVocab = []string{
 	"route", "rewrite", "redirect", "headers",
-	"cors", "jwt", "ip", "validate", "limit", "maintenance",
+	"cors", "jwt", "ip", "validate", "limit", "geo", "maintenance",
 }
 
-func TestMigrations_00227_EdgeRulesKindMaintenance(t *testing.T) {
+func TestMigrations_00231_EdgeRulesKindMaintenance(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00227 should land last (alongside 00228)
+	// (1) Run the full migration set. 00231 should land last (alongside 00232)
 	// (which is the apps maintenance_mode
 	// column + trigger).
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00219 limit and 00227 maintenance)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00229 geo and 00231 maintenance)", err)
 	}
 
 	// (2) CHECK constraint shape + (3) constraint name pin.
@@ -84,7 +85,7 @@ func TestMigrations_00227_EdgeRulesKindMaintenance(t *testing.T) {
 	for _, v := range maintenanceMigrationVocab {
 		needle := "'" + v + "'"
 		if !strings.Contains(def, needle) {
-			t.Errorf("edge_rules_kind_check: missing %s in def %q (closed vocabulary must include all 10 values; a regression here means the CHECK was narrowed)", needle, def)
+			t.Errorf("edge_rules_kind_check: missing %s in def %q (closed vocabulary must include all 11 values; a regression here means the CHECK was narrowed)", needle, def)
 		}
 	}
 	// Belt-and-braces: 'maintenance' must be present.
@@ -96,7 +97,7 @@ func TestMigrations_00227_EdgeRulesKindMaintenance(t *testing.T) {
 	// and reads back. Seeds an account + app + edge_rule with
 	// the kind=maintenance action jsonb shape (retry_after_seconds
 	// integer + message string). pgstore.MigrateUp has already
-	// applied 00227 — the row goes through the active CHECK.
+	// applied 00231 — the row goes through the active CHECK.
 	accountID := "00000000-0000-0000-0000-000000002292"
 	appID := "00000000-0000-0000-0000-000000012224"
 	ruleID := "00000000-0000-0000-0000-000000022922"
@@ -150,13 +151,13 @@ func TestMigrations_00227_EdgeRulesKindMaintenance(t *testing.T) {
 		t.Errorf("action jsonb round-trip: got %s, want action.maintenance.message substring", string(gotAction))
 	}
 
-	// (5) All 9 pre-existing kinds still accept. Walk the
-	// 00227/00228 vocabulary (route..limit) and assert each
-	// inserts successfully. The 00227 widening must not have
+	// (5) All 10 pre-existing kinds still accept. Walk the
+	// 00231/00232 vocabulary (route..geo) and assert each
+	// inserts successfully. The 00231 widening must not have
 	// narrowed the CHECK.
 	preExistingKinds := []string{
 		"route", "rewrite", "redirect", "headers",
-		"cors", "jwt", "ip", "validate", "limit",
+		"cors", "jwt", "ip", "validate", "limit", "geo",
 	}
 	for _, k := range preExistingKinds {
 		var actionShape string

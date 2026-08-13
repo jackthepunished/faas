@@ -488,29 +488,32 @@ const testDomain = "apps.test.example"
 //     slot above main's head. The renumber chain is the standard
 //     PR-#697 follow-up to the PR-#653 145 chain.
 //
-// PR-C: bumped 216 → 228 for the maintenance cluster
-// (00227_edge_rules_kind_maintenance.sql +
-// 00228_apps_maintenance_mode.sql). The previous target (216)
+// PR-C: bumped 216 → 232 for the maintenance cluster
+// (00231_edge_rules_kind_maintenance.sql +
+// 00232_apps_maintenance_mode.sql). The previous target (228)
 // made `pgtest.WaitForMigration` return early because the
-// schema head was already past 216 — every `cmd/e2e` test would
-// silently skip for the entire maintenance cluster. 228 is
+// schema head was already past 228 — every `cmd/e2e` test would
+// silently skip for the entire maintenance cluster. 232 is
 // chosen as "next free integer above main's real head" so a
 // future migration merely bumps this constant again. The
 // discipline (memory: cross-pr-slot-gate-fence-pattern) is that
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
 //
-// PR-C renumber history (5 cycles) on top of main's
+// PR-C renumber history (6 cycles) on top of main's
 // 00220_preview_app_columns + 00221_instances_request_count
 // (PR #851 + PR #854 wake single-flight) + 00222_app_errors
 // (PR #863 ADR-096 PR-A) + 00223..00226 fences (PR #866 CORS
-// cluster + ADR-098 PR-0):
+// cluster + ADR-098 PR-0) + 00227..00228/00229..00230 fences
+// (PR #845 kind=geo added 00229 + 00230 fence during the
+// kind=geo/maintenance cross-PR stampede):
 //
 //	00220/00221 → 00222/00223 → 00224/00225 → 00227/00228 →
-//	00227/00228 (final; main absorbed 00220..00226 during the
-//	rebase — slot 00221 is now instances_request_count, 00226
-//	is a fence for ADR-098 PR-A).
-const e2eMigrationTarget = 228
+//	00227/00228 → 00231/00232 (final; main absorbed
+//	00220..00226, then PR #845 added 00227/00228/00229/00230
+//	(00229 real kind=geo, rest fences) — kind=maintenance cluster
+//	stepped to 00231/00232 to dodge the stampede).
+const e2eMigrationTarget = 232
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
