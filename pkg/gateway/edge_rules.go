@@ -510,8 +510,16 @@ func (c *EdgeRuleCache) GetLimit(host string) ([]EdgeRuleLimitResolved, bool) {
 }
 
 // GetGeo mirrors GetIP for the kind=geo subset (ADR-091 D21).
-// The Geo slice is a value-copy of the underlying cache entry
-// so callers can mutate without poisoning the cache.
+// The Geo slice is a value-copy of the underlying cache entry,
+// AND each per-entry map (Methods/Allow/Deny) is deep-copied —
+// the unique inner-map-mutation test (edge_rules_geo_test.go
+// TestCache_GetGeo_DeepCopiesInnerMaps) pins the contract that
+// a caller mutating the returned Allow/Deny/Methods for any
+// reason (e.g. a "consume" pattern that removes a matched
+// country to short-circuit subsequent walks) MUST NOT poison
+// the cache. The other Get* family members only copy the
+// outer slice — their maps are not mutated by callers — so
+// this is the only accessor that pays the inner-map copy cost.
 func (c *EdgeRuleCache) GetGeo(host string) ([]EdgeRuleGeoResolved, bool) {
 	entry, ok := c.getEntry(host)
 	if !ok {
@@ -522,7 +530,30 @@ func (c *EdgeRuleCache) GetGeo(host string) ([]EdgeRuleGeoResolved, bool) {
 	}
 	src := entry.Geo
 	out := make([]EdgeRuleGeoResolved, len(src))
-	copy(out, src)
+	for i, r := range src {
+		out[i] = r
+		if r.Methods != nil {
+			m := make(map[string]bool, len(r.Methods))
+			for k, v := range r.Methods {
+				m[k] = v
+			}
+			out[i].Methods = m
+		}
+		if r.Allow != nil {
+			a := make(map[string]struct{}, len(r.Allow))
+			for k := range r.Allow {
+				a[k] = struct{}{}
+			}
+			out[i].Allow = a
+		}
+		if r.Deny != nil {
+			d := make(map[string]struct{}, len(r.Deny))
+			for k := range r.Deny {
+				d[k] = struct{}{}
+			}
+			out[i].Deny = d
+		}
+	}
 	return out, true
 }
 
