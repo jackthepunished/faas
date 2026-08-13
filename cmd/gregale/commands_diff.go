@@ -28,6 +28,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -90,6 +91,13 @@ func buildDiffOptions(slug string, sh shape, runtime, handler, image, cwd string
 // cmdDeployTarball after the auth client is acquired but before
 // any CreateApp / Deploy call. Returns the exit code.
 func runDiff(ctx context.Context, client *api.Client, opts diffCLIOptions) int {
+	// --server-diff routes through apid's POST /v1/apps/{slug}/diff
+	// (PR-1). The local SDK path (PR-0) is the default; --server-diff
+	// is for CI / headless environments that don't ship the CLI.
+	if opts.ServerDiff {
+		return runServerDiff(ctx, client, opts)
+	}
+
 	// 1. Baseline snapshot.
 	baseline, err := buildBaseline(ctx, client, opts.Slug)
 	if err != nil {
@@ -100,19 +108,20 @@ func runDiff(ctx context.Context, client *api.Client, opts diffCLIOptions) int {
 	// populates Pending.Crons (mirrors deployManifestTriggers).
 	pending := buildPending(ctx, client, opts, baseline)
 
-	// 3. Run the engine. The quota gate is a separate pass — the
+	// 3. Plan + limits. When the plan is unknown (the wire doesn't
+	// surface a full quota table today) we skip the gate and emit a
+	// warn. Running the gate against a zero-value Limits{} would
+	// false-fire on every Hobby/Pro/Scale customer's existing config
+	// (see code-review finding #1 / #6). The plan value is passed
+	// into Compute so d.Plan is set in one place.
+	plan, limits, planKnown := inferPlanAndLimits(ctx, client, baseline)
+
+	// 4. Run the engine. The quota gate is a separate pass — the
 	// engine itself doesn't read pkg/api/limits.go; the caller
 	// supplies QuotaConfig.
-	d := deploydiff.Compute(opts.Slug, baseline, pending)
+	d := deploydiff.Compute(opts.Slug, plan, baseline, pending)
 
-	// 4. Plan + limits for the gate. When the plan is unknown
-	// (PR-0 — the wire doesn't surface a full quota table today)
-	// we skip the gate and emit a warn. Running the gate against a
-	// zero-value Limits{} would false-fire on every Hobby/Pro/Scale
-	// customer's existing config (see code-review finding #1 / #6).
-	plan, limits, planKnown := inferPlanAndLimits(ctx, client, baseline)
 	if planKnown {
-		d.Plan = plan
 		breaks := deploydiff.Quota(plan, baseline, pending, deploydiff.QuotaConfig{
 			Limits:               limits,
 			AccountCronCount:     accountCronCount(ctx, client, opts.Slug),
@@ -310,4 +319,119 @@ func isNotFound(err error) bool {
 		return ae.Problem.Status == 404
 	}
 	return false
+}
+
+// runServerDiff routes through apid's POST /v1/apps/{slug}/diff
+// (PR-1). Output is byte-equivalent to the local --json path:
+// same DiffResponse shape, same Blocking bool, same renderers.
+//
+// Two notable behavioural differences vs the local path:
+//
+//  1. The server already has plan + per-account cron count, so
+//     the server response includes quota gate rows in .diff.breaks
+//     that the local path emits from inferPlanAndLimits +
+//     Quota(...). The CLI doesn't re-run the gate client-side —
+//     the server is the source of truth (per CLAUDE.md
+//     "apid is the only writer to customer-intent tables"; the
+//     gate's authoritative path is the same Postgres row).
+//
+//  2. The server can return 200 for a fresh-app diff (Baseline.App
+//     == nil); the local path achieves the same via the SDK
+//     GetApp 404 → isNotFound branch. The wire is the source of
+//     truth here too.
+func runServerDiff(ctx context.Context, client *api.Client, opts diffCLIOptions) int {
+	req := diffRequestFromCLI(opts)
+	resp, err := client.Diff(ctx, opts.Slug, req)
+	if err != nil {
+		return printErr("Could not run server-side diff", err)
+	}
+	// Render. The server returns DiffResponse; the local --json
+	// path renders Diff (the engine type). Wrap the inner Diff
+	// through a synthetic Diff so the same renderers work.
+	synthetic := syntheticDiffFromResponse(resp)
+	if opts.JSON {
+		if err := deploydiff.RenderJSON(osStdout, synthetic); err != nil {
+			return printErr("Could not encode diff", err)
+		}
+	} else {
+		deploydiff.RenderText(osStdout, synthetic)
+	}
+	if resp.Blocking && !opts.Lenient {
+		return 1
+	}
+	return 0
+}
+
+// diffRequestFromCLI projects the CLI flag set onto the wire
+// DiffRequest. Mirrors the apid handler's diffPendingFromRequest
+// (cmd/apid/handlers_diff.go) but with CLI-side signal sources
+// (gregale.yaml triggers fan-out populates Crons; --require-authn
+// populates AppConfig.RequireAuthn).
+//
+// PR-1 keeps the CLI's existing AppConfig surface narrow — only
+// the fields the CLI flags today (RequireAuthn, etc.). Future PRs
+// can extend with --memory, --concurrency, etc.
+func diffRequestFromCLI(opts diffCLIOptions) api.DiffRequest {
+	req := api.DiffRequest{ImageRef: opts.Image}
+	if opts.AppConfig.RequireAuthn != nil {
+		v := *opts.AppConfig.RequireAuthn
+		req.AppConfig = &api.DiffAppConfigPatch{RequireAuthn: &v}
+	}
+	if opts.Manifest != nil {
+		req.Manifest = opts.Manifest
+	}
+	// Cron fan-out — same source as the local buildPending.
+	req.Crons = append(req.Crons, opts.Crons...)
+	return req
+}
+
+// syntheticDiffFromResponse re-projects a wire DiffResponse back
+// onto the engine's Diff type so the same renderers work. The
+// engine's renderer reads Change{Field,Kind,Before,After} as
+// anyJSON values; we re-wrap the wire's json.RawMessage into
+// anyJSON's Value via json.Unmarshal.
+func syntheticDiffFromResponse(resp api.DiffResponse) deploydiff.Diff {
+	out := deploydiff.Diff{
+		Slug:    resp.Diff.Slug,
+		Plan:    deploydiff.Plan(resp.Plan),
+		Changes: make([]deploydiff.Change, 0, len(resp.Diff.Changes)),
+		Breaks:  make([]deploydiff.Break, 0, len(resp.Diff.Breaks)),
+	}
+	for _, c := range resp.Diff.Changes {
+		before := decodeRaw(c.Before)
+		after := decodeRaw(c.After)
+		out.Changes = append(out.Changes, deploydiff.Change{
+			Field:  c.Field,
+			Kind:   deploydiff.ChangeKind(c.Kind),
+			Before: deploydiff.AsAny(before),
+			After:  deploydiff.AsAny(after),
+		})
+	}
+	for _, b := range resp.Diff.Breaks {
+		out.Breaks = append(out.Breaks, deploydiff.Break{
+			Code:     b.Code,
+			Severity: b.Severity,
+			Reason:   b.Reason,
+			Field:    b.Field,
+			Observed: deploydiff.AsAny(decodeRaw(b.Observed)),
+			Limit:    deploydiff.AsAny(decodeRaw(b.Limit)),
+		})
+	}
+	return out
+}
+
+// decodeRaw turns a json.RawMessage back into a Go value the
+// renderer's %v can format. nil → nil; otherwise json.Unmarshal
+// into the closest typed value (the engine's anyJSON round-trip
+// via AsAny will re-marshal for the --json path; the text
+// renderer just %v's the value).
+func decodeRaw(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return string(raw)
+	}
+	return v
 }

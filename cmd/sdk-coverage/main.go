@@ -156,6 +156,7 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/rollback":               "Rollback",
 	"POST /v1/apps/{slug}/deployments":            "Deploy",
 	"POST /v1/apps/{slug}/deployments/source-ref": "DeployFromSourceRef", // issue #739 / DEPLOY-PROV-4 / ADR-092; headless CI deploy
+	"POST /v1/apps/{slug}/diff":                   "Diff", // PR-1 of deploy-diff cluster; CI gate input
 	"GET /v1/account/export":                      "ExportAccount",
 	"DELETE /v1/account":                          "DeleteAccount",
 	"PATCH /v1/account/plan":                      "ChangePlan",
