@@ -187,23 +187,46 @@
   - **Rollout gate:** the feature ships enabled at the merge point.
     Per-app gating via `PATCH /v1/apps/{id} websocket_enabled=false`
     is the operator escape hatch — see Migration / rollback below.
-    (An `FAAS_GATEWAY_RAW_STREAM_ENABLED` feature flag is a
-    follow-up; the merged PR-3 wiring does not include one yet —
-    filed as a follow-up to this ADR.)
+    `FAAS_GATEWAY_RAW_STREAM_ENABLED` (default `true`,
+    `envBoolOr` shape mirroring `FAAS_INTERNAL_H2C` at
+    `cmd/gatewayd-public/main.go:213-224`) is the daemon-level
+    kill switch installed in PR-A; setting it to `0`/`false`
+    reverts `handler.WithRawForwarding` to a no-op so every
+    upgrade request falls through to `writeWebSocketNotAllowed`
+    with `forwarder_missing=true`. The Free plan's per-plan
+    `WebSocketResponseAllowed() == false` makes the per-app
+    PATCH path fail-closed for free customers even if an admin
+    backfills the column (the `403 plan_websocket_not_allowed`
+    response gates the PATCH before the column write lands —
+    PR-A covers this with `TestUpdateAppWebSocket_FreeGate`).
 
   - **Observability:** `x-faas-upgrade: true` observability header
     stamped on the inbound request (matches the ADR-064 wake-timeline
     vocabulary). `evts.Platform` events emitted on the first
     downstream byte via `evts.ProxyFirstByte` — same seam the
-    streaming forwarder uses (ADR-064 precedent). (Four
-    `gateway_ws_*` Prometheus series — `gateway_ws_upgrade_total`,
-    `gateway_ws_active_sessions`,
-    `gateway_ws_session_duration_seconds`,
-    `gateway_ws_session_bytes_total{direction}` — are documented
-    as the metering seam for the per-session byte cap follow-up
-    PR; they are NOT defined in `pkg/gateway/metrics.go` at this
-    point and the merged raw forwarder emits only the events seam
-    above. Filed as a follow-up to this ADR.)
+    streaming forwarder uses (ADR-064 precedent). Four
+    `gateway_ws_*` Prometheus series (PR-B) live in
+    `pkg/gateway/metrics.go`:
+    - `gateway_ws_upgrade_total{plan,outcome}` — outcome ∈
+      `{accepted, plan_denied, bridge_disabled}`. Incremented
+      at the three-input detector gate
+      (`pkg/gateway/handler.go:2899`) so an operator can
+      distinguish "Free-plan customer trying to opt in"
+      (outcome=`plan_denied`) from "kill switch tripped"
+      (outcome=`bridge_disabled`).
+    - `gateway_ws_active_sessions{plan}` — Inc/Dec symmetric
+      gauge; the `defer` at `rawStreamOnceWithEvents`
+      guarantees Dec across every return branch.
+    - `gateway_ws_session_duration_seconds{plan,outcome}` —
+      histogram; buckets 0.05..86400 to fit hours-long WS
+      sessions (the existing `op_duration_seconds` 0.5ms..5s
+      bucket set is too tight).
+    - `gateway_ws_session_bytes_total{plan,direction}` —
+      counter; direction ∈ `{tx, rx}`. The tx byte counter
+      mirrors the gateway-side egress ring population in
+      PR-C (`RecordResponseBytes` from
+      `rawStreamOnceWithEvents`'s body-chunk write path +
+      init-error fallback write path).
 
   - **Cross-references:** ADR-016 (additive wire change), ADR-028
     (default-local wake; the new RPC inherits local-or-remote
@@ -243,14 +266,27 @@
     ADR-080's wire accommodates this — `RawStreamSessionDeadline`
     and `MaxRequestBytes` are per-stream, not per-connection.
 
-  - **Per-session byte cap at the platform layer** — the metering
-    seam is the `evts.Platform` events surface (ADR-064) plus a
-    follow-up `gateway_ws_session_bytes_total{direction}`
-    Prometheus counter (not yet defined). The actual
-    cap-and-throttle enforcement is a follow-up metering PR
-    (cite ADR-048 meterd-gbh-floor as the model). v1.0 has no
-    customer-visible cap; the vmmd-side 100 MiB per-request cap
-    is the load-bearing ceiling.
+  - **Per-session byte cap at the platform layer** — PR-C ships
+    the rx cap (`api.RawStreamMaxResponseBytes`, default 1 GiB,
+    declared in `pkg/api/limits.go` next to the inbound
+    `RawStreamMaxRequestBytes` — CLAUDE.md: every limit lives in
+    the table). Enforced at
+    `pkg/vmmdgrpc/forward.go:rawBridgePumpBody` via clamp-DOWN
+    to the platform ceiling (mirrors the inbound clamp at
+    `rawBridgeBodyLoop`); exceeding it returns `ResourceExhausted`
+    which surfaces as a 502 at the gateway. The init-frame's
+    existing `max_request_bytes` proto field is reused as the
+    rx-cap source — a dedicated `max_response_bytes` wire field
+    is a deferred ADR (avoids SDK + regen churn for this single
+    memory-safety invariant). The tx byte counter is also fed by
+    `egresssink.RecordResponseBytes` from
+    `pkg/gateway/forwardproxy.go:rawStreamOnceWithEvents` so
+    raw-stream bytes flow into the same `usage_minutes.tx_bytes`
+    bucket as plain HTTP chunks (ADR-046). The
+    cap-and-throttle enforcement at the platform layer (a future
+    PR closes ADR-048-style metering over this surface) is still
+    out of scope here; v1.0 has no customer-visible cap beyond
+    the rx ceiling above.
 
   - **HTTP/3 / QUIC** — issue #680.
 
@@ -315,12 +351,16 @@
 - **Migration / rollback:**
 
   - **Default:** the feature ships enabled at the merge point.
-    There is no daemon-level kill switch in PR-3 (the
-    `FAAS_GATEWAY_RAW_STREAM_ENABLED` env var is filed as a
-    follow-up to this ADR — the merged PR-3 wiring installs
-    `WithRawForwarding` unconditionally when `deps.nodeCache != nil`,
-    so the only post-merge operator control is per-app PATCH
-    below).
+    PR-A installs the `FAAS_GATEWAY_RAW_STREAM_ENABLED` env
+    var (default `true`) as the daemon-level kill switch —
+    `envBoolOr` shape mirroring `FAAS_INTERNAL_H2C`. Setting
+    it to `0`/`false`/`no`/`off` (case-insensitive) reverts
+    `handler.WithRawForwarding` to a no-op so every upgrade
+    request falls through to `writeWebSocketNotAllowed` with
+    `forwarder_missing=true` (a deterministic 501 + the
+    `x-faas-error-reason: websocket_not_on_plan` header —
+    the load-bearing upgrade of the original "no daemon
+    control" gap).
 
   - **Per-app rollback:** `PATCH /v1/apps/{id}` with
     `websocket_enabled=false` flips an individual app off at the
@@ -328,13 +368,34 @@
     app.WebSocketEnabled && h.rawByNode != nil`) — the request
     falls through to `proxyByNode` and the plain-HTTP strip
     removes Connection + Upgrade as hop-by-hop, returning 502
-    from the upstream (the standard "no-WS-handshake-here"
-    failure path; not a deterministic 501 — a deterministic 501
-    path is the follow-up env var above). The Free plan's
-    per-plan `WebSocketResponseAllowed() == false` makes the
-    PATCH path fail-closed for free customers even if an admin
-    backfills the column (the `403 plan_websocket_not_allowed`
-    response gates the PATCH before the column write lands).
+    from the upstream. The Free plan's per-plan
+    `WebSocketResponseAllowed() == false` makes the PATCH path
+    fail-closed for free customers even if an admin backfills
+    the column: PR-A's
+    `TestUpdateAppWebSocket_FreeGate` pins the
+    `403 plan_websocket_not_allowed` response on opt-in; the
+    asymmetric opt-out path (`websocket_enabled: false`) is
+    covered by `TestUpdateAppWebSocket_FreeOptOut`.
+
+  - **PR-cluster summary** — PR-A (ops safety) + PR-B
+    (observability) + PR-C (rx cap + parser coverage + race
+    audit) closed the §8 follow-ups this ADR originally filed.
+    The cluster maps one-to-one onto the follow-up list:
+
+    | Follow-up | PR   | Surface                                              |
+    |-----------|------|------------------------------------------------------|
+    | kill switch (env var)                | PR-A | `cmd/gatewayd-internal/run.go`         |
+    | PATCH-time 403 test coverage (Free)  | PR-A | `cmd/apid/handlers_ext_test.go`        |
+    | `gateway_ws_*` Prometheus series     | PR-B | `pkg/gateway/metrics.go` + `forwardproxy.go` |
+    | rx byte cap                          | PR-C | `pkg/vmmdgrpc/forward.go` + `pkg/api/limits.go` |
+    | parser coverage (race audit)         | PR-C | `pkg/gateway/upgrade_test.go` + `forward_raw_review_fixes_test.go` |
+
+    After the cluster merges, issue #676 is closable — every
+    ADR §8 follow-up is landed; the original "files" trail
+    (`pkg/gateway/forwardproxy.go:74`,
+    `pkg/vmmdgrpc/forward.go:454-511`,
+    `pkg/sched/flowcount/conntrack.go`) maps onto the shipped
+    work.
 
   - **Schema rollback:** `ALTER TABLE apps DROP COLUMN
     websocket_enabled;` is non-blocking (no FK, no NOT NULL
