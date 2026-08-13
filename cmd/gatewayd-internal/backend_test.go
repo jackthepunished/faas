@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -141,6 +142,12 @@ type fakeInvalidator struct {
 	refreshed     []string // app_ids that received RefreshDeploymentWeights
 	resetCnt      int      // ResetEdgeRules call count (ADR-089 PR 3)
 	resetApps     []string // app_ids that received ResetApp (ADR-091 amendment)
+	// remintSurfaces records the surface_ids that received
+	// RequestCertForSurface (ADR-100 / issue #879). remintErr
+	// makes the call return that error so the test can assert
+	// the log-and-swallow path.
+	remintSurfaces []string
+	remintErr      error
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -176,6 +183,13 @@ func (f *fakeInvalidator) RefreshDeploymentWeights(_ context.Context, appID stri
 	f.refreshed = append(f.refreshed, appID)
 	f.mu.Unlock()
 	return nil
+}
+func (f *fakeInvalidator) RequestCertForSurface(_ context.Context, surfaceID string) error {
+	f.mu.Lock()
+	f.remintSurfaces = append(f.remintSurfaces, surfaceID)
+	err := f.remintErr
+	f.mu.Unlock()
+	return err
 }
 
 func TestHandleInvalidation(t *testing.T) {
@@ -296,6 +310,41 @@ func TestHandleInvalidation_LifecycleStatesDoNotEvict(t *testing.T) {
 			t.Errorf("state=%q: evicted %d entries, want 0 (cache-self-destruct guard)", state, evicted)
 		}
 	}
+}
+
+// TestHandleInvalidation_TenantSurfaceChanged (ADR-100 / issue
+// #879) pins the cert-remint dispatch: a db.NotifyTenantSurfaceChanged
+// event must trigger RequestCertForSurface with the bare surface
+// uuid as the argument. Errors are logged-and-swallowed so a
+// transient CA failure can't block the notify loop. The test
+// exercises both the success path and a remintErr return.
+func TestHandleInvalidation_TenantSurfaceChanged(t *testing.T) {
+	log := testLogger()
+
+	// Success: the bare surface uuid is forwarded verbatim.
+	f := &fakeInvalidator{}
+	handleInvalidation(context.Background(), f, db.Notification{
+		Channel: db.NotifyTenantSurfaceChanged,
+		Payload: "srf-abc-123",
+	}, log)
+	f.mu.Lock()
+	if len(f.remintSurfaces) != 1 || f.remintSurfaces[0] != "srf-abc-123" {
+		t.Errorf("remintSurfaces = %v, want [srf-abc-123]", f.remintSurfaces)
+	}
+	f.mu.Unlock()
+
+	// remintErr is non-nil → handler logs and swallows; the next
+	// event in the queue still dispatches.
+	f = &fakeInvalidator{remintErr: errors.New("ca outage")}
+	handleInvalidation(context.Background(), f, db.Notification{
+		Channel: db.NotifyTenantSurfaceChanged,
+		Payload: "srf-second",
+	}, log)
+	f.mu.Lock()
+	if len(f.remintSurfaces) != 1 || f.remintSurfaces[0] != "srf-second" {
+		t.Errorf("remintSurfaces (err path) = %v, want [srf-second]", f.remintSurfaces)
+	}
+	f.mu.Unlock()
 }
 
 // TestHandleInvalidation_TerminalStatesEvict (issue #168 + Tier A5 /

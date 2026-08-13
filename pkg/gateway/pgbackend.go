@@ -289,6 +289,14 @@ type PGBackend struct {
 	// without restarting the edge. Tests inject a fake Store.
 	store deploymentWeightsStore
 
+	// certIssuer (ADR-100 / issue #879) is the per-surface
+	// cert-remint seam. nil = feature dark; the notify subscriber
+	// no-ops so a misconfigured rollout can't crash the edge.
+	// Production wires this from cmd/gatewayd-internal so a
+	// tenant_surface_changed notification triggers a fresh SAN
+	// mint; tests inject a fake that records the call.
+	certIssuer CertIssuer
+
 	// appResolver (Phase 2 / Gate A) maps appID → state.App so the
 	// per-node client cache can find apps.node_id without a second
 	// store hop. Optional: nil falls through to the legacy single-sched
@@ -1078,6 +1086,18 @@ func (b *PGBackend) WithEdgeRules(matcher EdgeRuleMatcher) *PGBackend {
 	return b
 }
 
+// WithCertIssuer (ADR-100 / issue #879) arms the cert-remint
+// seam. nil = feature dark; the notify subscriber no-ops so a
+// misconfigured rollout can't crash the edge. Production wires
+// this from cmd/gatewayd-internal so a tenant_surface_changed
+// notification triggers a fresh SAN mint; tests inject a fake
+// that records the call. The setter returns *PGBackend for
+// fluent chaining (same shape as every other PGBackend.With*).
+func (b *PGBackend) WithCertIssuer(issuer CertIssuer) *PGBackend {
+	b.certIssuer = issuer
+	return b
+}
+
 // ResetEdgeRules (ADR-089 / issue #561 PR 3) drops the
 // edge-rule matcher's per-host LRU. cmd/gatewayd-internal
 // calls this on db.NotifyEdgeRuleChanged (cmd/gatewayd-internal/backend.go
@@ -1126,6 +1146,22 @@ func (b *PGBackend) ResetApp(appID string) {
 	b.appsMu.Lock()
 	delete(b.apps, appID)
 	b.appsMu.Unlock()
+}
+
+// RequestCertForSurface (ADR-100 / issue #879) delegates to the
+// configured CertIssuer so a tenant_surface_changed pg_notify
+// re-mints the SAN-aggregated cert for the affected surface. nil-
+// safe: an unwired backend (PR-A's default until the issuer is
+// set on the production wiring) no-ops so a notify burst before
+// the cert engine lands doesn't crash the edge. Errors flow
+// through unchanged; the caller (cmd/gatewayd-internal handleInvalidation)
+// logs-and-swallows so a transient CA failure can't block the
+// notify loop.
+func (b *PGBackend) RequestCertForSurface(ctx context.Context, surfaceID string) error {
+	if b == nil || b.certIssuer == nil {
+		return nil
+	}
+	return b.certIssuer.RequestCertForSurface(ctx, surfaceID)
 }
 
 // resolveSched picks the schedd client that should service appID

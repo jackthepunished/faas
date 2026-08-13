@@ -227,6 +227,17 @@ type invalidator interface {
 	// flips are usually isolated to one app; wholesale FlushRoutes
 	// would also evict every other app's entry on every flip.
 	ResetApp(appID string)
+	// RequestCertForSurface (ADR-100 / issue #879) is the
+	// cert-remint goroutine's entry point. A
+	// tenant_surface_changed notification (any insert / update /
+	// delete on tenant_surfaces OR tenant_hostnames) re-assembles
+	// the SAN set and asks the issuer for a fresh cert. The
+	// payload is the bare surface uuid; the consumer re-reads
+	// the surface + hostnames (defence against notify loss).
+	// Errors are logged-and-swallowed: a failed mint re-tries on
+	// the next mutation; we never block the notify path on a
+	// transient CA failure.
+	RequestCertForSurface(ctx context.Context, surfaceID string) error
 }
 
 // watchInvalidations subscribes to the pg_notify channels that affect routing
@@ -257,6 +268,7 @@ func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator
 		db.NotifyKeyChanged,
 		db.NotifyDeploymentChanged,
 		db.NotifyEdgeRuleChanged,
+		db.NotifyTenantSurfaceChanged,
 	}
 	notif, err := db.SubscribeWithReconnect(ctx, pool, channels, log)
 	if err != nil {
@@ -420,5 +432,25 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		// surgical-evict. Wholesale flush is cheaper and
 		// correct.
 		inv.ResetEdgeRules()
+	case db.NotifyTenantSurfaceChanged:
+		// ADR-100 / issue #879: any mutation on
+		// tenant_surfaces or tenant_hostnames (insert /
+		// update / delete) emits this notification with the
+		// bare surface uuid as payload. The cert-remint
+		// goroutine re-reads the surface + verified hostnames
+		// (defence against notify loss — the trigger at
+		// migrations/00243 fires on every relevant row
+		// change, including the verified_at flip), then asks
+		// the issuer for a fresh cert. The SAN set is
+		// deterministic (sort-by-hostname) so re-mints
+		// against the same verified set produce identical
+		// (primary, sans) tuples.
+		//
+		// Errors are logged-and-swallowed: a failed mint
+		// re-tries on the next mutation; we never block the
+		// notify path on a transient CA failure.
+		if err := inv.RequestCertForSurface(ctx, n.Payload); err != nil {
+			log.Warn("gatewayd: cert remint failed", "surface", n.Payload, "err", err)
+		}
 	}
 }
