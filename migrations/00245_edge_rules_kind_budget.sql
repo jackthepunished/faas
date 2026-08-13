@@ -1,4 +1,4 @@
--- filename: 00244_edge_rules_kind_budget.sql
+-- filename: 00245_edge_rules_kind_budget.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -50,12 +50,12 @@
 -- convention to include 'budget'. The IN list is the union of all
 -- post-00219 vocab values to date. A future widening that adds
 -- another kind MUST update the IN list together with the
--- pre-existing-vocab walk loop in 00244's test, or the test will
+-- pre-existing-vocab walk loop in 00245's test, or the test will
 -- catch the regression via 23514 on a known kind (CHECK-rewrite
 -- race, see PR #864 CI run 31705973056 + memory
 -- migration-gates-collision-and-replay.md).
 --
--- Slot choice: 00244 is the lowest unclaimed slot after main's
+-- Slot choice: 00245 is the lowest unclaimed slot after main's
 -- 00237 (apps_maintenance_mode) and PR #884's fences 00238-00243
 -- (tenant_surfaces PR-0, ADR-099 cluster, issue #879). Future
 -- renumbering must re-verify `git ls-tree origin/main migrations/`
