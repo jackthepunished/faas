@@ -341,6 +341,16 @@ type Metrics struct {
 	// "no certs" (the rule's `result="partial"` filter excludes them).
 	tlsCertExpiryRefresherWalkComplete *prometheus.CounterVec
 	tlsOnDemandDenied                  *prometheus.CounterVec
+	// tenantSurfaceCert (ADR-100 / issue #879) counts every cert
+	// remint driven by a tenant_surface_changed pg_notify.
+	// Labels: result ∈ {issued, failed, skipped} and kind ∈
+	// {per_host_san, shared_wildcard}. Pre-instantiated at boot
+	// so the §12 panel surfaces from first scrape; an idle
+	// daemon shows zeros, a quiet one shows counts climbing
+	// only on real customer mutations. Bounded label sets
+	// (no per-surface cardinality) keep the time-series
+	// footprint flat.
+	tenantSurfaceCert *prometheus.CounterVec
 	// wakeLocality is the increment-only wake-outcome classifier that
 	// backs the multiplex scale-out decision (PR scale-out readiness,
 	// ADRs 025/028). Outcome ∈ {local_snapshot, local_coldboot} today;
@@ -719,6 +729,18 @@ func NewMetrics() *Metrics {
 			Name: "gateway_tls_on_demand_denied_total",
 			Help: "On-demand cert mint denials, labelled by reason. ADR-024 H3 (closed in PR #345); H3.b is the still-open follow-up. reason=allowlist is incremented from pkg/gateway/tls_wire.go's allowlistToDecisionFunc today. reason=dns01 and reason=token are reserved for the H3.b follow-up that bridges the certmagic ACME-issuer logger through this counter; the series are pre-instantiated at 0 so the dashboard panel surfaces from boot and a missing wire-incrementation is visible as a frozen zero.",
 		}, []string{"reason"}),
+		// ADR-100 / issue #879 — per-surface cert-remint
+		// counter. result ∈ {issued, failed, skipped} (skipped
+		// is the "no verified hostnames" / "soft-deleted
+		// surface" / "unsupported cert_kind" path that never
+		// reaches the CA). kind ∈ {per_host_san,
+		// shared_wildcard} (per_host_san is the only kind the
+		// v1 issuer mints; shared_wildcard counts surface so
+		// the dashboard surfaces the deferred-ADR backlog).
+		tenantSurfaceCert: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_tenant_surface_cert_total",
+			Help: "Tenant surface cert remint outcomes, labelled by result and kind. ADR-100 / issue #879. result ∈ {issued, failed, skipped}; kind ∈ {per_host_san, shared_wildcard}.",
+		}, []string{"result", "kind"}),
 		// PR scale-out readiness — wake-locality counter. The closed
 		// (outcome) set is pre-instantiated below so the panel surfaces
 		// from boot. New outcomes (remote_*) join by widening the
@@ -912,6 +934,17 @@ func NewMetrics() *Metrics {
 	for _, result := range []string{"complete", "partial", "empty"} {
 		m.tlsCertExpiryRefresherWalkComplete.WithLabelValues(result)
 	}
+	// ADR-100 / issue #879 — pre-instantiate the closed
+	// (result, kind) cartesian product so the §12 panel
+	// surfaces from boot. Bounded (3 results × 2 kinds = 6
+	// series) so the time-series footprint is flat. An idle
+	// daemon shows all six counters at zero; a quiet one
+	// climbs only on real customer mutations.
+	for _, result := range []string{"issued", "failed", "skipped"} {
+		for _, kind := range []string{"per_host_san", "shared_wildcard"} {
+			m.tenantSurfaceCert.WithLabelValues(result, kind)
+		}
+	}
 	// ADR-047 PR-D: pre-instantiate the closed (plan) set on
 	// gateway_stream_active under the "__other__" placeholder so the
 	// §12 dashboard panel surfaces zero-valued series from the moment
@@ -968,7 +1001,14 @@ func NewMetrics() *Metrics {
 	// loops above stamp every closed label cell — a missing
 	// registration here would cause /metrics to omit the series
 	// entirely even with the WithLabelValues calls in place.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds)
+	//
+	// ADR-100 / issue #879 PR-A: also register m.tenantSurfaceCert
+	// (the per-surface cert-remint outcome counter) so the
+	// gateway_tenant_surface_cert_total{result,kind} series
+	// surfaces from boot. The pre-instantiate loop above (where
+	// tenantSurfaceCert is stamped across the closed (result, kind)
+	// cartesian) is the same pattern as the rest of the family.
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces
@@ -1465,6 +1505,21 @@ func (m *Metrics) ObserveTLSOnDemandDenied(reason string) {
 		return
 	}
 	m.tlsOnDemandDenied.WithLabelValues(reason).Inc()
+}
+
+// ObserveTenantSurfaceCert (ADR-100 / issue #879) increments the
+// per-surface cert-remint counter. result ∈ {issued, failed,
+// skipped} (skipped = no verified hostnames / soft-deleted
+// surface / unsupported cert_kind — paths that never reach the
+// CA). kind ∈ {per_host_san, shared_wildcard}. nil-safe so the
+// pkg/gateway cert-issuer path can be exercised by tests that
+// don't wire a full Metrics — same pattern as
+// ObserveTLSOnDemandDenied above.
+func (m *Metrics) ObserveTenantSurfaceCert(result, kind string) {
+	if m == nil {
+		return
+	}
+	m.tenantSurfaceCert.WithLabelValues(result, kind).Inc()
 }
 
 // SetTLSCertExpiry writes the smallest remaining lifetime across cached

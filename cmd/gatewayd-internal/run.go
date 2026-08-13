@@ -225,6 +225,27 @@ func routeMetricsEnabledFromEnv() bool {
 	return false
 }
 
+// certIssuerFor (ADR-100 / issue #879) constructs the per-surface
+// cert-remint engine wired to PGBackend. Returns nil when the
+// feature flag is off so the pg_notify subscriber no-ops (a
+// tenant_surface_changed event still arrives but
+// PGBackend.RequestCertForSurface short-circuits on a nil issuer).
+// The flag is the same dark-launch switch as the apid HTTP
+// surface (PR-C) so a single env var controls the entire
+// surface stack — operator sets it on the apid + gatewayd box
+// pair when PR-C is ready, unsets it to roll back without
+// bouncing any daemon.
+//
+// The metrics pointer is nil at the call site today
+// (NewMetrics is wired in cmd/gregale/serve_gatewayd_internal);
+// passing nil is safe — ObserveTenantSurfaceCert guards.
+func certIssuerFor(store state.Store, enabled bool) gateway.CertIssuer {
+	if !enabled {
+		return nil
+	}
+	return gateway.NewTenantSurfaceCertIssuer(store, nil)
+}
+
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
 // gRPC client + the in-process gateway handler. Move 1 widens the
 // surface from Wake-only to two methods so the synthetic HTTP envelope
@@ -652,7 +673,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// picker's weight table. The adapter translates
 		// state.Deployment to gateway.DeploymentWeightsRow
 		// (the gateway package does not import pkg/state).
-		WithStore(weightsStoreAdapter{store: pgStore})
+		WithStore(weightsStoreAdapter{store: pgStore}).
+		// ADR-100 / issue #879: arm the per-surface cert-remint
+		// engine so a tenant_surface_changed notification
+		// re-mints the SAN-aggregated cert for the affected
+		// surface. The engine is gated on
+		// FAAS_TENANT_SURFACES_ENABLED (same dark-launch
+		// switch as the apid HTTP surface, PR-C) so a
+		// misconfigured rollout can be reverted by unsetting
+		// the env var without bouncing the daemon.
+		WithCertIssuer(certIssuerFor(pgStore, api.TenantSurfacesEnabled()))
 
 	// Phase 2 / Gate A: gate the resolveSched legacy fallback on the
 	// active fleet. Single-box posture (only default-local active)
