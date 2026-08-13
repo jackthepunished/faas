@@ -290,6 +290,15 @@ type Querier interface {
 	// (last_seen_at, fingerprint) cursor because
 	// data_upstreams is a stable list, not a hot recency
 	// list. Index path: data_upstreams_app_created_idx.
+	//
+	// sqlc.arg(...)::type casts disambiguate the two cursor
+	// params — without them sqlc named both fields
+	// `CreatedAt` (taken from the SELECT list) and the
+	// generated Go wrapper bound a timestamptz to the $3
+	// uuid slot, tripping a type error on every cursor page
+	// past the first. See the cross-PR slot-fence
+	// sqlc.arg-disambiguates-cursor memory; the same
+	// pattern pins ListAppErrorGroups.
 	ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error)
 	ListDeploymentsForApp(ctx context.Context, db DBTX, arg ListDeploymentsForAppParams) ([]ListDeploymentsForAppRow, error)
 	ListDomainsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListDomainsForAccountRow, error)

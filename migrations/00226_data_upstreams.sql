@@ -166,15 +166,23 @@ CREATE TABLE IF NOT EXISTS data_upstreams (
     CONSTRAINT data_upstreams_host_check
         -- RFC 1123 hostname: labels of [a-z0-9-]{1,63}
         -- joined by dots, total <= 253 chars. Wildcard
-        -- hosts (e.g. *.s3.amazonaws.com) and IPv4
-        -- literals are explicitly rejected here — the
-        -- classifier normalises those shapes BEFORE
-        -- INSERT, so anything that lands in the DB
-        -- matches the strict regex. A bug in the
-        -- classifier that lets a wildcard through
-        -- trips this CHECK (23514) before the row
-        -- poisons the probe loop.
+        -- hosts (e.g. *.s3.amazonaws.com), hosts with
+        -- underscores or other non-RFC characters, AND
+        -- IPv4 literals (e.g. 192.168.1.1, 127.0.0.1)
+        -- are explicitly rejected here — the classifier
+        -- normalises those shapes BEFORE INSERT, so
+        -- anything that lands in the DB matches the
+        -- strict regex. The IPv4 backstop is the second
+        -- conjunct: `^[0-9]+(\.[0-9]+)+$` matches a
+        -- host whose every label is all digits separated
+        -- by dots (i.e. an IPv4 dotted-quad literal);
+        -- the NOT gates it off, so an IPv4 that snuck
+        -- through the first regex (e.g. via Postgres's
+        -- ARE allowing `192.168.1.1` as four [a-z0-9]
+        -- labels) still trips this CHECK (23514)
+        -- before the row poisons the probe loop.
         CHECK (host ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+               AND host !~ '^[0-9]+(\.[0-9]+)+$'
                AND length(host) BETWEEN 1 AND 253),
     CONSTRAINT data_upstreams_port_check
         CHECK (port BETWEEN 1 AND 65535),

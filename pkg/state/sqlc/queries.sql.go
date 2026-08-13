@@ -2350,17 +2350,19 @@ SELECT
     host_redacted_hash, coalesce(declared_region, ''),
     last_rtt_ms, last_probed_at, last_seen_at, created_at
 FROM data_upstreams
-WHERE app_id = $1
-  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+WHERE app_id = $1::uuid
+  AND ($2::timestamptz IS NULL
+       OR (created_at, id) < ($2::timestamptz,
+                              $3::uuid))
 ORDER BY created_at DESC, id DESC
-LIMIT $4
+LIMIT $4::int
 `
 
 type ListDataUpstreamsByAppParams struct {
-	AppID     pgtype.UUID
-	Column2   pgtype.Timestamptz
-	CreatedAt pgtype.Timestamptz
-	Limit     int32
+	AppID           pgtype.UUID
+	CursorCreatedAt pgtype.Timestamptz
+	CursorID        pgtype.UUID
+	PageLimit       int32
 }
 
 type ListDataUpstreamsByAppRow struct {
@@ -2385,12 +2387,21 @@ type ListDataUpstreamsByAppRow struct {
 // (last_seen_at, fingerprint) cursor because
 // data_upstreams is a stable list, not a hot recency
 // list. Index path: data_upstreams_app_created_idx.
+//
+// sqlc.arg(...)::type casts disambiguate the two cursor
+// params — without them sqlc named both fields
+// `CreatedAt` (taken from the SELECT list) and the
+// generated Go wrapper bound a timestamptz to the $3
+// uuid slot, tripping a type error on every cursor page
+// past the first. See the cross-PR slot-fence
+// sqlc.arg-disambiguates-cursor memory; the same
+// pattern pins ListAppErrorGroups.
 func (q *Queries) ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error) {
 	rows, err := db.Query(ctx, listDataUpstreamsByApp,
 		arg.AppID,
-		arg.Column2,
-		arg.CreatedAt,
-		arg.Limit,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.PageLimit,
 	)
 	if err != nil {
 		return nil, err

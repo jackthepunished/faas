@@ -25,8 +25,9 @@
 //       - scope not matching app_envs_scope_shape → 23514
 //       - kind outside the 14-value vocabulary → 23514
 //       - host outside the RFC 1123 regex → 23514
-//         (×2 flavors: wildcard + IPv4 literal — the
-//         classifier must normalise BEFORE INSERT)
+//         (×3 flavors: wildcard + underscores + IPv4
+//         literal — the classifier must normalise
+//         BEFORE INSERT)
 //       - port outside 1..65535 → 23514
 //       - host_redacted_hash not 64 hex / not the
 //         __unsalted__ sentinel → 23514
@@ -208,11 +209,16 @@ func TestMigrations_00226_DataUpstreams(t *testing.T) {
 	`, accountID, appID, dataUpstreamsHostRedactedSentinel)
 	assertCheckViolation(t, err, "data_upstreams_kind_check")
 
-	// (3d) host outside the RFC 1123 regex → 23514. Two
+	// (3d) host outside the RFC 1123 regex → 23514. Three
 	// flavors: wildcard S3 (the classifier must normalise
-	// BEFORE INSERT) and a host with an underscore
-	// (forbidden by RFC 1123; the classifier rejects it).
-	for _, badHost := range []string{"*.s3.amazonaws.com", "db_with_underscore.example.com"} {
+	// BEFORE INSERT), a host with an underscore (forbidden
+	// by RFC 1123; the classifier rejects it), and an IPv4
+	// literal (PostgreSQL's ARE accepts 192.168.1.1 as four
+	// [a-z0-9] labels — a regression would let the IPv4
+	// slip past the regex; the second conjunct
+	// `host !~ '^[0-9]+(\.[0-9]+)+$'` rejects it before
+	// the row poisons the probe loop).
+	for _, badHost := range []string{"*.s3.amazonaws.com", "db_with_underscore.example.com", "192.168.1.1"} {
 		_, err = pool.Exec(ctx, `
 			INSERT INTO data_upstreams (
 				id, account_id, app_id, source, scope, kind, host, port,
