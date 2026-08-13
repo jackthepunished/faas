@@ -500,6 +500,16 @@ const testDomain = "apps.test.example"
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
 //
+// PR #882 ADR-098 §9.A connection-aware execution PR-A re-bumped
+// 226 → 229 — slot 226 is the data_upstreams + data_upstream_probes
+// schema (real DDL, landed via PR-A's `feat(migration): ADR-098
+// §9.A`); the run-up from 226 to 229 happened because main absorbed
+// PR #845's 00229_edge_rules_kind_geo.sql + sibling PRs #864/#867
+// in the interim (see the chain below). PR-A's own renumber story
+// was the reverse: PR-0 fenced 226 from PR-0 (issue # PR #858,
+// ADR-098 §renumber) and PR-A replaced the fence with the real DDL
+// on top of (still 00221 → 00226) renumbers.
+//
 // PR #845 (kind=geo, ADR-091 D21) + PR #863 (ADR-096 PR-A
 // app_errors) + PR #866 (ADR-091 D20-D25 cors_defaults) + PR #864
 // (reqbudget PR1, ADR-093) + PR #867 (maintenance PR-A, ADR-091

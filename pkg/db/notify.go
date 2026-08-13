@@ -278,6 +278,21 @@ const (
 	//   is informational — consumers can re-read the row to defend
 	//   against notify loss.
 	NotifyWarmHintPublished = "warm_hint_published"
+	// NotifyDataUpstreamChanged {app_id, scope, kind, host, port, op}
+	//   apid env-classifier + customer-facing
+	//   POST/DELETE /v1/apps/{slug}/upstreams (PR-B) →
+	//   schedd's pkg/sched/upstream_affinity.go subscriber
+	//   (PR-B/C): a row in data_upstreams was written, updated,
+	//   or deleted. The payload is pipe-delimited (rather than
+	//   JSONB like github_webhook_secrets_changed) to keep the
+	//   string under the 8000-byte pg_notify limit even on a
+	//   worst-case 253-char host. Trigger definition:
+	//   migrations/00226_data_upstreams.sql's
+	//   data_upstreams_notify_trg. Reserved for PR-B; PR-A ships
+	//   the trigger but no LISTEN subscriber — pg_notify drops
+	//   unlistened payloads, so no backlog accumulates. ADR-098
+	//   §D2.
+	NotifyDataUpstreamChanged = "data_upstreams_changed"
 	// NotifyEdgeRuleChanged {"app_id":uuid, "rule_id":uuid,
 	//                        "op":"created|updated|deleted"}
 	//   apid → gatewayd-internal: the per-host LRU mirroring the
