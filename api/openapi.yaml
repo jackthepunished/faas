@@ -7173,6 +7173,19 @@ components:
           description: "Per-app per-route observability flag (ADR-093). When true, gatewayd-internal emits gateway_request_duration_seconds{app,route,class} and serves the bounded reader at GET /v1/apps/{slug}/routes. Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
           type: boolean
           example: false
+        # ADR-091 amendment: apps.maintenance_mode is the
+        # coarse-grained "whole app in maintenance" toggle. When
+        # true the gatewayd-internal hot-path short-circuits
+        # every request to this app with 503 + Retry-After BEFORE
+        # auth, BEFORE wake (the coarse gate beats per-route
+        # kind=maintenance rules). Free-tier allowed (no
+        # IsPaidOnly change). The apps_maintenance_mode_notify
+        # trigger (migration 00237) fires pg_notify on flip so
+        # the gatewayd apps LRU cache stays fresh.
+        maintenance_mode:
+          description: "Coarse per-app maintenance toggle (ADR-091 amendment). When true the gatewayd-internal hot-path short-circuits every request to this app with 503 + Retry-After (default 60 s) BEFORE auth, BEFORE wake, BEFORE any kind=maintenance edge rule. Free-tier allowed. Surfaced in the GET /v1/apps/{slug} response so dashboards can show 'maintenance on / off' alongside the streaming/WS pills."
+          type: boolean
+          example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
         # Nullable: legacy rows project as `null` (the empty
         # policy falls back to the legacy min_instances /
@@ -7368,6 +7381,14 @@ components:
           description: "Per-app per-route observability flag (ADR-093). Omitted → apid applies the plan default (Free = false; Hobby/Pro/Scale = true). PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
           type: boolean
           example: false
+        # ADR-091 amendment: optional at create-time. Omitted →
+        # apid applies the default (false). Free-tier allowed; no
+        # plan gate. Flipping this on a Hobby/Pro/Scale app flips
+        # every request to 503 + Retry-After (60 s).
+        maintenance_mode:
+          description: "Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → apid applies the default (false). Free-tier allowed; no plan gate. Flipping this on at create time pins the app for maintenance from the first request."
+          type: boolean
+          example: false
         # Issue #470 / ADR-055: optional at create-time. Omitted
         # → apid applies the plan default (Pro/Scale = true;
         # Free/Hobby = false — the only legal state on those
@@ -7490,6 +7511,16 @@ components:
         # surfaces the gate.
         route_metrics_enabled:
           description: "Per-app per-route observability flag (ADR-093). Omitted → no change. Free PATCHing true is 403 plan_route_metrics_not_allowed."
+          type: [boolean, "null"]
+          example: false
+        # ADR-091 amendment: partial-update nullable boolean.
+        # Omitted → no change. Free-tier allowed; no plan gate.
+        # PATCH true → every request to this app 503 + Retry-After.
+        # PATCH false → app returns to normal request handling.
+        # The apps_maintenance_mode_notify trigger fires pg_notify
+        # on flip so the gatewayd apps LRU cache stays fresh.
+        maintenance_mode:
+          description: "Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → no change. PATCH true pins the app for maintenance (every request 503 + Retry-After); PATCH false restores normal handling. Free-tier allowed; no plan gate. The apps_maintenance_mode_notify trigger (migration 00237) fires pg_notify on flip."
           type: [boolean, "null"]
           example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
@@ -9384,7 +9415,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9397,6 +9428,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -9415,7 +9447,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9428,6 +9460,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
 
     UpdateEdgeRuleRequest:
@@ -9453,6 +9486,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
 
     EdgeRuleRouteAction:
@@ -9705,6 +9739,60 @@ components:
             set. Runtime enforcement deferred to follow-up PR
             (ADR-091 D24 §6).
 
+    EdgeRuleMaintenanceAction:
+      description: |
+        Per-route maintenance toggle (ADR-091 amendment, §4.1.2.13).
+        The fine-grained primitive for "this endpoint is in
+        maintenance mode" — the hot-path applier
+        (pkg/gateway.(*Handler).applyEdgeRuleMaintenance) short-
+        circuits a matched (host, path, http_method) request with
+        503 + Retry-After BEFORE auth, BEFORE wake. The coarse
+        sibling (`apps.maintenance_mode`, PATCH /v1/apps/{slug})
+        covers the "whole app in maintenance" case; use this kind
+        when only specific routes need to be pinned.
+
+        Field-by-field:
+          * `retry_after_seconds` — optional per-rule override for
+            the `Retry-After` header. 0 (default) = use the
+            platform default
+            `api.EdgeRuleMaintenanceRetryAfterSeconds` (60 s).
+            Must be in `[0, 86400]` (24 h, enforced by
+            `api.MaxEdgeRuleMaintenanceRetryAfterSeconds`); a
+            customer cannot ship a rule that asks a client to
+            back off for a week.
+          * `message` — optional operator-friendly string that
+            goes into `Problem.detail`. ≤ 512 B (same payload-
+            size budget as `EdgeRuleValidateAction.schema`).
+            Surface this on the customer's status page or in a
+            dashboard alert so operators see why the endpoint is
+            dark without scraping the rule row.
+
+        Free-and-above (no plan gate). Mirror the validate /
+        limit posture: rejection never reaches the wake gate, the
+        auth chain, or the rate limiter.
+      type: object
+      properties:
+        retry_after_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400  # 24h = MaxEdgeRuleMaintenanceRetryAfterSeconds
+          description: |
+            Optional per-rule Retry-After override in seconds.
+            0 (default) = use the platform default
+            `api.EdgeRuleMaintenanceRetryAfterSeconds` (60 s).
+            Must be in `[0, 86400]` (24 h); values above 86400 are
+            rejected at create-time with 422.
+          example: 0
+        message:
+          type: string
+          maxLength: 512
+          description: |
+            Optional operator-friendly detail string that goes into
+            `Problem.detail`. ≤ 512 B. Surface this on the
+            customer's status page so monitoring / curl users see
+            why the endpoint is dark.
+          example: "Rolling out v2; back at 14:00 UTC."
+
     EdgeRuleGeoAction:
       description: |
         ISO 3166-1 alpha-2 country allow/deny evaluator (ADR-091
@@ -9737,6 +9825,7 @@ components:
           type: array
           items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the denylist." }
           description: "ISO 3166-1 alpha-2 country denylist. Evaluated AFTER allow; single-country deny wins."
+
 
     # ─── API keys ─────────────────────────────────────────────────────────
 

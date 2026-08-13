@@ -1,0 +1,43 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00231_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- PR #867 (kind=maintenance cluster, ADR-091 amendment) renumbered
+-- from 00231 → 00234 → 00236 across two steps after the cross-PR
+-- collision detector rejected slot 00231 (claimed by open PR #873
+-- secretscan v2) alongside slots 00232 (PR #864 ADR-093 reqbudget,
+-- pre-PR #872 reshuffle) and 00233 (PR #873 secretscan v2), and
+-- then slot 00234 (PR #864 ADR-093 reqbudget post-PR #872 reshuffle
+-- + PR #882 data upstreams). The renumber chain is:
+--
+--   00220/00221 → 00222/00223 → 00224/00225 → 00227/00228 →
+--   00231/00232 → 00234/00235 → 00236/00237 (final; kind=maintenance
+--   cluster stepped to 00236/00237 to dodge the PR #864 reshuffle).
+--
+-- This file + 00232_reserve_slot.sql + 00233_reserve_slot.sql +
+-- 00234_reserve_slot.sql close the contiguity gaps left by the
+-- renumber so TestMigrationsContiguous passes. PR #867 owns the
+-- fences.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

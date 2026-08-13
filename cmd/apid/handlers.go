@@ -303,6 +303,14 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 		// applied here at create time so the row round-trips
 		// the same value a future PATCH would land on.
 		RouteMetricsEnabled: rm,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. Default false (mirrors the
+		// apps.maintenance_mode column DEFAULT). Customers may
+		// PATCH true to put the whole app into 503 maintenance;
+		// there's no plan gate (Free and above may opt in) —
+		// coarse maintenance is a customer-experience feature,
+		// not an abuse vector.
+		MaintenanceMode:     req.MaintenanceMode != nil && *req.MaintenanceMode,
 		WarmSnapshotEnabled: warmEnabled,
 		// Issue #560 + issue #695 / ADR-080: see the
 		// plan-default block above. Default is per-plan

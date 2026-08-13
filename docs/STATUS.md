@@ -658,6 +658,29 @@ ADR-075 / issue #475 / migration 00138.
 
 ADR-076 / issue #476 / migrations 00140 + 00141.
 
+## M8 — API maintenance mode (ADR-091 amendment). 🚧
+
+Two complementary customer-facing primitives that ship together as one feature cluster:
+
+1. **`apps.maintenance_mode` bool** — coarse per-app gate; one PATCH flips the whole app into maintenance, every request returns 503 + `Retry-After: 60` + `Problem.code = "app_maintenance_mode"`.
+2. **`kind=maintenance` edge rule** — fine-grained per-route gate; a `(match_host, match_path, match_methods)` tuple returns 503 + `Retry-After` (per-rule, default 60 s, hard cap 24 h) + `Problem.code = "edge_rule_maintenance"`. Optional `message` (≤512 B) goes into `Problem.detail`.
+
+The coarse gate runs BEFORE the fine-grained rule, so when both fire on the same request the customer sees `app_maintenance_mode`, not `edge_rule_maintenance` — the load-bearing customer-facing guarantee is "an app I put into maintenance is in maintenance; the per-rule contract is a no-op in that case". Both primitives fire BEFORE auth, BEFORE wake, so a maintenance 503 never pays a cold-boot cost.
+
+- **Schema** — migrations `00222_edge_rules_kind_maintenance.sql` (DROP+ADD on `edge_rules_kind_check`, widening to `{route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance}`) and `00223_apps_maintenance_mode.sql` (`ADD COLUMN IF NOT EXISTS maintenance_mode boolean NOT NULL DEFAULT false` + partial index `WHERE maintenance_mode = true` + `apps_maintenance_mode_notify` AFTER UPDATE trigger that emits `pg_notify('app_changed', NEW.id::text)` ONLY when `maintenance_mode IS DISTINCT FROM old.maintenance_mode`).
+- **Cluster shape** — three-PR cluster (PR-A control-plane widening + fence, PR-B runtime surface + gateway hot-path, PR-C rollout-closer + e2e + spec backfill). Mirrors the kind=validate cluster (PR #840 / #841 / #848). PR-A consumed slots 220 + 221 via fences; PR-B consumed both slots and removed the fences.
+- **Hot-path slot** — `pkg/gateway/handler.go:2943` inserts `applyAppsMaintenanceMode` (coarse gate on the substituted app) + `applyEdgeRuleMaintenance` (fine-grained rule) at the TOP of the `haveApp` chain (§4.1.2.0 + §4.1.2.14), BEFORE redirect/rewrite/headers/CORS/JWT/IP/limit/validate/auth/wake. Same deny-before-cost posture as ADR-091 D4 codifies for every other cost-control kind.
+- **Cache invalidation** — new `db.NotifyAppChanged = "app_changed"` pg_notify channel; gatewayd listener drops only that app's entry from the apps LRU (`Backend.ResetApp(appID)` at `pkg/gateway/pgbackend.go:1025`), not wholesale `FlushRoutes`. A maintenance flip on one app doesn't evict every other app's cache entry — `TestHandleInvalidation` pins the differential.
+- **Per-rule quota** — counts against the existing `EdgeRulesPerApp` quota (5/25/100/500 by plan). No new per-rule counter for v1 (D20.10 if customers ask).
+- **Defaults** — `api.EdgeRuleMaintenanceRetryAfterSeconds = 60` (env-overridable via `FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS`). Cap: `api.MaxEdgeRuleMaintenanceRetryAfterSeconds = 86400` (24 h, hard, enforced at apid Validate).
+- **Free-tier-allowed.** No `IsPaidOnly()` on either primitive.
+- **Metrics** — new `gateway_app_maintenance_total{plan}` (pre-instantiated at the closed `{free, hobby, pro, scale}` set, plan=string(app.Plan)) + new `gateway_edge_rule_match_total{kind="maintenance", outcome=match|miss|blocked}` pre-instantiation loop (mirrors the 9 prior kinds). No existing metric names changed.
+- **Audit** — `app.maintenance_mode_match`, `edge_rule.maintenance_matched`, `edge_rule.maintenance_blocked`. Cross-account rules silently fall through (`outcome=blocked` + audit `maintenance_blocked`, same posture as every other kind, ADR-091 D5).
+- **E2E** — `cmd/e2e/edge_rules_maintenance_e2e_test.go` (3 tests: match-returns-503, default-retry-after, cross-account-falls-through) + `cmd/e2e/apps_maintenance_mode_e2e_test.go` (2 tests: patch-true-returns-503, coarse-gate-beats-edge-rule).
+- **TTL / auto-disable** — out of scope for v1; deferred to D20.7.
+
+ADR-091 amendment. No new ADR slot.
+
 ## M8 — Per-route observability (ADR-093). 🚧
 
 Opt-in per-app route breakdown on the gatewayd-internal hot path,

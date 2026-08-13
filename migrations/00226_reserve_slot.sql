@@ -14,3 +14,8 @@
 -- next free contiguous slot is 00226.
 SELECT 1;
 -- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

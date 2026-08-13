@@ -43,6 +43,9 @@ class CreateDeploymentRequest:
     traffic_percent: int | None | Unset = UNSET
     """Per-deployment traffic-split weight (issue #556 PR-A). nil = server default 100; explicit 0..100 = opt into
     canary (Pro/Scale only)."""
+    scope: None | str | Unset = UNSET
+    """Top-level per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no
+    leading/trailing dash. nil/omitted = `default`."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +80,12 @@ class CreateDeploymentRequest:
         else:
             traffic_percent = self.traffic_percent
 
+        scope: None | str | Unset
+        if isinstance(self.scope, Unset):
+            scope = UNSET
+        else:
+            scope = self.scope
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -90,6 +99,8 @@ class CreateDeploymentRequest:
             field_dict["sidecars"] = sidecars
         if traffic_percent is not UNSET:
             field_dict["traffic_percent"] = traffic_percent
+        if scope is not UNSET:
+            field_dict["scope"] = scope
 
         return field_dict
 
@@ -145,12 +156,22 @@ class CreateDeploymentRequest:
 
         traffic_percent = _parse_traffic_percent(d.pop("traffic_percent", UNSET))
 
+        def _parse_scope(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        scope = _parse_scope(d.pop("scope", UNSET))
+
         create_deployment_request = cls(
             image=image,
             overrides=overrides,
             require_signed=require_signed,
             sidecars=sidecars,
             traffic_percent=traffic_percent,
+            scope=scope,
         )
 
         create_deployment_request.additional_properties = d

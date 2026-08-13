@@ -447,6 +447,21 @@ type App struct {
 	// __route_other__ overflow bound the cardinality regardless of
 	// the customer's traffic shape.
 	RouteMetricsEnabled bool
+	// MaintenanceMode (ADR-091 amendment, PR-A #???) opts the
+	// whole app into 503 + Retry-After mode — the coarse primitive
+	// for "every route is in maintenance". When true, the gatewayd
+	// applier (pkg/gateway.(*Handler).applyAppsMaintenanceMode,
+	// §4.1.2.0) short-circuits every request to this app with
+	// 503 + Retry-After: api.EdgeRuleMaintenanceRetryAfterSeconds
+	// (60 s) BEFORE auth, BEFORE wake, BEFORE any kind=maintenance
+	// rule fires (coarse gate beats fine-grained). The boolean is
+	// Free-tier allowed (no IsPaidOnly change); a Free customer
+	// may pin their own app for maintenance. The apps_maintenance_
+	// mode_notify trigger (migrations/00221_apps_maintenance_mode.
+	// sql) fires pg_notify('app_changed', NEW.id) only on a flip so
+	// the gatewayd-internal apps LRU cache can be flushed without
+	// waking up on every unrelated app update.
+	MaintenanceMode bool
 	// RequireSigned gates OCI image deploys (issue #472 / ADR-054) on
 	// a valid cosign signature from a trusted publisher. When true,
 	// imaged's buildImageLayer calls pkg/cosign.VerifyImageSignature
@@ -2364,6 +2379,15 @@ type UpdateAppParams struct {
 	// that does not want the per-route cardinality on the box).
 	RouteMetricsEnabled    *bool
 	SetRouteMetricsEnabled bool
+	// MaintenanceMode (ADR-091 amendment) opts the whole app
+	// into 503 + Retry-After mode. SetMaintenanceMode
+	// distinguishes "unset" (don't touch) from "explicit false"
+	// (opt out of maintenance mode). Free-tier allowed (no plan
+	// gate); the gatewayd applier short-circuits every request
+	// before wake, so this primitive is the cheapest way to pin
+	// an app during a deploy rollback or a billing investigation.
+	MaintenanceMode    *bool
+	SetMaintenanceMode bool
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys
 	// on a valid cosign signature from a trusted publisher. SetRequireSigned
 	// distinguishes "unset" (don't touch) from "explicit false"
@@ -3279,6 +3303,18 @@ const (
 	// at apid-create time. See migrations/00219_edge_rules_kind_limit.sql
 	// for the schema CHECK widening.
 	EdgeRuleKindLimit EdgeRuleKind = "limit"
+	// EdgeRuleKindMaintenance short-circuits a matched
+	// (host, path, http_method) request with 503 + Retry-After
+	// before the wake gate. ADR-091 amendment (PR-A #??? / PR-B /
+	// PR-C). Per-rule RetryAfterSeconds overrides the platform
+	// default api.EdgeRuleMaintenanceRetryAfterSeconds (60 s); the
+	// hard upper bound api.MaxEdgeRuleMaintenanceRetryAfterSeconds
+	// (24 h) is enforced at apid-create time. Optional Message
+	// goes into Problem.detail (≤ 512 B; same payload-size budget
+	// as EdgeRuleValidateAction.Schema). Plan-gated Free-and-above
+	// (no IsPaidOnly change). See migrations/00220_edge_rules_kind_maintenance.sql
+	// for the schema CHECK widening.
+	EdgeRuleKindMaintenance EdgeRuleKind = "maintenance"
 	// EdgeRuleKindGeo is the country allow/deny primitive (ADR-091 D21).
 	// Migration 00229 widens the schema CHECK from 9 to 10 values
 	// (post-00219 'limit', post-00214 'validate'). Not in IsPaidOnly
@@ -3295,7 +3331,7 @@ func (k EdgeRuleKind) IsValid() bool {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
 		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit,
-		EdgeRuleKindGeo:
+		EdgeRuleKindMaintenance, EdgeRuleKindGeo:
 		return true
 	}
 	return false
@@ -3446,6 +3482,24 @@ type EdgeRuleLimitAction struct {
 	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
 }
 
+// EdgeRuleMaintenanceAction carries the per-rule 503 + Retry-After
+// payload for kind=maintenance. RetryAfterSeconds overrides the
+// platform default api.EdgeRuleMaintenanceRetryAfterSeconds (60 s)
+// when > 0; 0 means "use the platform default". The hard upper
+// bound (api.MaxEdgeRuleMaintenanceRetryAfterSeconds, 24 h) is
+// enforced in pkg/api/dto.go::EdgeRuleMaintenanceAction.Validate so
+// a customer cannot ship a rule that asks a client to back off for
+// a week. Message is an optional operator-friendly string that goes
+// into Problem.detail (≤ 512 B; same payload-size budget as
+// EdgeRuleValidateAction.Schema). The state mirror carries the
+// values verbatim so the gatewayd compile step can defence-in-depth
+// against any direct-DB write that bypassed apid-Validate
+// (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect).
+type EdgeRuleMaintenanceAction struct {
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+	Message           string `json:"message,omitempty"`
+}
+
 // EdgeRuleGeoAction is an ISO 3166-1 alpha-2 country allow/deny
 // evaluator. The wire shape mirrors EdgeRuleIPAction exactly — Allow
 // and Deny are both lists of country codes ("DE", "FR", "US"). The
@@ -3496,6 +3550,15 @@ type EdgeRuleAction struct {
 	// stays — it is the "cap the body I am about to schema-check"
 	// knob; kind=limit is the standalone gate.
 	Limit *EdgeRuleLimitAction `json:"limit,omitempty"`
+	// Maintenance carries the per-rule 503 + Retry-After payload
+	// for kind=maintenance. RetryAfterSeconds > 0 overrides the
+	// platform default (api.EdgeRuleMaintenanceRetryAfterSeconds);
+	// 0 means "use the default". Message is an optional human-
+	// readable string that goes into Problem.detail. The applier
+	// (pkg/gateway.(*Handler).applyEdgeRuleMaintenance, §4.1.2.13)
+	// sets Retry-After via api.WriteProblem + WithHeader and emits
+	// a `gateway_edge_rule_match_total{kind="maintenance"}` metric.
+	Maintenance *EdgeRuleMaintenanceAction `json:"maintenance,omitempty"`
 	// Geo carries the country allow/deny list for kind=geo. Plan
 	// gating (Free allowed with 1 rule, Hobby+ 5/25/100 by plan) is
 	// enforced at apid-create time via Limits.EdgeRulesGeoPerApp —

@@ -35,6 +35,12 @@ class CreateAppRequest:
     websocket_enabled: bool | Unset = UNSET
     """Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → apid applies the plan default;
     PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."""
+    route_metrics_enabled: bool | Unset = UNSET
+    """Per-app per-route observability flag (ADR-093). Omitted → apid applies the plan default (Free = false;
+    Hobby/Pro/Scale = true). PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."""
+    maintenance_mode: bool | Unset = UNSET
+    """Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → apid applies the default (false). Free-tier
+    allowed; no plan gate. Flipping this on at create time pins the app for maintenance from the first request."""
     warm_snapshot_enabled: bool | Unset = UNSET
     """Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan
     default. Free/Hobby PATCH-true is rejected."""
@@ -78,6 +84,10 @@ class CreateAppRequest:
 
         websocket_enabled = self.websocket_enabled
 
+        route_metrics_enabled = self.route_metrics_enabled
+
+        maintenance_mode = self.maintenance_mode
+
         warm_snapshot_enabled = self.warm_snapshot_enabled
 
         warm_snapshot_min_requests = self.warm_snapshot_min_requests
@@ -113,6 +123,10 @@ class CreateAppRequest:
             field_dict["streaming_enabled"] = streaming_enabled
         if websocket_enabled is not UNSET:
             field_dict["websocket_enabled"] = websocket_enabled
+        if route_metrics_enabled is not UNSET:
+            field_dict["route_metrics_enabled"] = route_metrics_enabled
+        if maintenance_mode is not UNSET:
+            field_dict["maintenance_mode"] = maintenance_mode
         if warm_snapshot_enabled is not UNSET:
             field_dict["warm_snapshot_enabled"] = warm_snapshot_enabled
         if warm_snapshot_min_requests is not UNSET:
@@ -157,6 +171,10 @@ class CreateAppRequest:
 
         websocket_enabled = d.pop("websocket_enabled", UNSET)
 
+        route_metrics_enabled = d.pop("route_metrics_enabled", UNSET)
+
+        maintenance_mode = d.pop("maintenance_mode", UNSET)
+
         warm_snapshot_enabled = d.pop("warm_snapshot_enabled", UNSET)
 
         warm_snapshot_min_requests = d.pop("warm_snapshot_min_requests", UNSET)
@@ -183,6 +201,8 @@ class CreateAppRequest:
             idle_timeout_s=idle_timeout_s,
             streaming_enabled=streaming_enabled,
             websocket_enabled=websocket_enabled,
+            route_metrics_enabled=route_metrics_enabled,
+            maintenance_mode=maintenance_mode,
             warm_snapshot_enabled=warm_snapshot_enabled,
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,

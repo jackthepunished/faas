@@ -1,0 +1,35 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00235_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- PR #867 (kind=maintenance cluster, ADR-091 amendment) renumbered
+-- from 00235 → 00237 across two steps after the cross-PR collision
+-- detector rejected slot 00234 (claimed by open PR #864 ADR-093
+-- request budgets post-PR #872 reshuffle). The previous step
+-- (00231/00232 → 00234/00235) closed the gap to main's PR #845
+-- kind=geo at 00229 + PR #873 secretscan fences at 00231/00232/00233;
+-- this renumber closes the new gap created when PR #864 reshuffled.
+-- See migrations/00231_reserve_slot.sql for the full chain.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

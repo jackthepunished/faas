@@ -48,6 +48,23 @@ type App struct {
 	ID        string
 	AccountID string // joined in pgRouter.toApp; empty only in fakeBackend unit tests (ADR-040)
 	Plan      api.Plan
+	// Slug is the customer-facing app slug (lowercased at apid
+	// write time). Surfaced on the 503 Problem.detail for
+	// apps.maintenance_mode so monitoring / curl users can
+	// identify which app is in maintenance. Default-empty in
+	// fakeBackend unit tests; production path always populates.
+	Slug string
+	// MaintenanceMode (ADR-091 amendment / §4.1.2.0) is the
+	// coarse-grained per-app maintenance flag mirrored from
+	// apps.maintenance_mode. When true, every inbound request is
+	// short-circuited with 503 + Retry-After BEFORE auth, BEFORE
+	// wake, BEFORE any kind=maintenance rule (coarse gate beats
+	// fine-grained per D4 ordering). Plumbed through pgRouter.toApp
+	// from the apps row so ServeHTTP can short-circuit WITHOUT
+	// re-reading the database. Default-false in fakeBackend unit
+	// tests; production path always populates from
+	// apps.maintenance_mode.
+	MaintenanceMode bool
 	// StreamingEnabled is the per-app streaming flag (issue #471 /
 	// ADR-047). Plumbed through pgRouter.toApp from the apps row so
 	// ServeHTTP can decide between the buffered and streamed
@@ -1862,6 +1879,133 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 	return false
 }
 
+// applyAppsMaintenanceMode (ADR-091 amendment / §4.1.2.0) is the
+// coarse-grained per-app maintenance gate. When the matched app's
+// apps.maintenance_mode column is true, every inbound request is
+// short-circuited with 503 + Retry-After (default 60 s, env-overridable
+// via FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS, hard cap 24 h
+// per pkg/api/limits.go) BEFORE auth, BEFORE wake, BEFORE any
+// kind=maintenance rule (coarse gate beats fine-grained per D4
+// ordering). Audit row carries the app slug for operator triage;
+// ObserveAppMaintenance(plan) is the per-plan counter so the §12
+// dashboard can break down "in maintenance" by plan tier.
+//
+// Returns true (caller MUST return) on apps.maintenance_mode=true.
+// Returns false on apps.maintenance_mode=false (pass-through) or
+// when the gate is nil (dev mode / pre-wiring path).
+//
+// Why coarse beats fine-grained: the customer's mental model is "I
+// flipped maintenance_mode=true on the whole app". A 503 from the
+// fine-grained rule with a different Problem.code would leak the
+// existence of a per-route rule and confuse the operator. The two
+// primitives compose because the coarse gate covers everything the
+// fine-grained rules could ever cover; the fine-grained rules only
+// matter when the app is NOT in coarse maintenance.
+func (h *Handler) applyAppsMaintenanceMode(w http.ResponseWriter, r *http.Request, app App) bool {
+	if !app.MaintenanceMode {
+		return false
+	}
+	api.WriteProblem(w, api.ErrAppMaintenanceMode(api.EdgeRuleMaintenanceRetryAfterSeconds, app.Slug))
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "app.maintenance_mode_match", nil, map[string]any{
+			"app_id":      app.ID,
+			"app_slug":    app.Slug,
+			"from_host":   r.Host,
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"retry_after": api.EdgeRuleMaintenanceRetryAfterSeconds,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveAppMaintenance(string(app.Plan))
+	}
+	return true
+}
+
+// applyEdgeRuleMaintenance (ADR-091 amendment / §4.1.2.13) consults
+// the per-host edge-rule matcher for a `kind=maintenance` rule. On a
+// hit, the inbound request is short-circuited with 503 + Retry-After
+// at the per-rule cap (default EdgeRuleMaintenanceRetryAfterSeconds,
+// 60 s; hard cap MaxEdgeRuleMaintenanceRetryAfterSeconds, 24 h)
+// BEFORE auth, BEFORE wake, BEFORE the proxy leg. The fine-grained
+// sibling of applyAppsMaintenanceMode — distinct Problem.code so a
+// customer can tell which gate fired.
+//
+// Returns true (caller MUST return) on:
+//
+//   - 503 maintenance (edge_rule_maintenance + Retry-After +
+//     optional Problem.detail when the rule carried a Message).
+//
+// Returns false on a rule miss (audit "miss"), same-account
+// mismatch (defense-in-depth — audit "blocked"), or when h.edgeRules
+// is nil (dev mode). Cross-account rules silently fall through
+// (mirrors applyEdgeRuleIP's defense-in-depth posture at line 1547).
+//
+// Streaming posture: short-circuits unconditionally — no
+// ApplyWhileStreaming knob (mirroring the maintenance 503 always
+// fires, even on a streaming response, because the customer-facing
+// intent is "this endpoint is in maintenance, do not pay the wake
+// cost"). The "Maintenance" detail in Problem.detail is the
+// customer's `Message` field (≤ 512 B; surfaced via api.WriteProblem
+// as Problem.detail so monitoring / curl users see why the endpoint
+// is dark without scraping the rule row).
+func (h *Handler) applyEdgeRuleMaintenance(w http.ResponseWriter, r *http.Request, app App) bool {
+	if h.edgeRules == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchMaintenance(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("maintenance", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.maintenance_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("maintenance", "blocked")
+			// Cross-account blocked is a defense-in-depth no-op —
+			// emit apply success so the §12 dashboard chip doesn't
+			// falsely flag the cross-account rule as a wire error.
+			// Mirrors applyEdgeRuleLimit (handler.go:1958) and
+			// applyEdgeRuleIP (handler.go:1559).
+			h.metrics.ObserveEdgeRuleApply("maintenance", "success")
+		}
+		return false
+	}
+	api.WriteProblem(w, api.ErrEdgeRuleMaintenance(rule.RetryAfterSeconds, rule.Message))
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.maintenance_matched", nil, map[string]any{
+			"rule_id":     rule.ID,
+			"from_host":   r.Host,
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"retry_after": rule.RetryAfterSeconds,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("maintenance", "match")
+		// 503 is a non-2xx wire write — emit apply success because
+		// the applier did its job (audit + metric + Problem wire);
+		// the §12 "wire errors" chip only surfaces internal
+		// unexpected failures, not customer-facing 503s. Mirrors
+		// the kind=limit 413 outcome at handler.go:2000 which uses
+		// "error" for the 413 path; the difference is that 413 is
+		// "client error / contract violation" while 503 is "service
+		// answer / contract met". Apply success is correct for
+		// maintenance.
+		h.metrics.ObserveEdgeRuleApply("maintenance", "success")
+	}
+	return true
+}
+
 // applyEdgeRuleValidate (PR-B) consults the per-host edge-rule
 // matcher for a `kind=validate` rule. On a hit, the inbound
 // request body is buffered (up to the per-rule cap or
@@ -3342,6 +3486,23 @@ haveApp:
 	// r.Header + installs a response-side hook on `rec`). A
 	// redirect with `Content-Type` set by a same-host headers
 	// rule would leak the header; the order prevents this.
+	//
+	// ADR-091 amendment — the two maintenance gates fire BEFORE
+	// the rewrite/redirect/headers triple and BEFORE the auth chain
+	// (the same coarse-then-fine-grained posture documented at
+	// §4.1.2.0 + §4.1.2.13). Coarse gate (apps.maintenance_mode)
+	// beats fine-grained (kind=maintenance) per the D4 ordering
+	// table — a customer who flipped the whole app should never see
+	// a per-route 503 from a different Problem.code, because that
+	// would leak the existence of the fine-grained rule.
+	if h.applyAppsMaintenanceMode(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+	if h.applyEdgeRuleMaintenance(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
 	if h.matchAndApplyRedirect(w, r, app) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return

@@ -740,6 +740,20 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// plain column write.
 		RouteMetricsEnabled:    req.RouteMetricsEnabled,
 		SetRouteMetricsEnabled: req.RouteMetricsEnabled != nil,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag (apps.maintenance_mode). Same Set-bit
+		// convention as RouteMetricsEnabled above — nil pointer
+		// means "don't touch the column"; non-nil pointer writes
+		// the boolean verbatim. No plan gate (Free and above
+		// may opt in). The pg_notify trigger
+		// apps_maintenance_mode_notify (migrations/00225) fires
+		// pg_notify('app_changed', NEW.id::text) ONLY when this
+		// column IS DISTINCT FROM old; the cmd-side listener
+		// (cmd/gatewayd-internal/backend.go) calls
+		// PGBackend.ResetApp(appID) so the apps LRU drops the
+		// stale MaintenanceMode before the next request lands.
+		MaintenanceMode:    req.MaintenanceMode,
+		SetMaintenanceMode: req.MaintenanceMode != nil,
 		// Issue #462 / ADR-058: per-app scaling policy. The
 		// setter bit on UpdateAppParams distinguishes "don't
 		// touch" (nil pointer) from "explicit zero policy"
