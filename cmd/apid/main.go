@@ -605,6 +605,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 			Store: srv.store,
 			Log:   log,
 		})
+		// ADR-091 D20.3 / PR-B residual: thread the Ops into the
+		// audit-event retention cleanup loop. srv.ops is populated
+		// by srv.WithOpsMetrics(ctx, ops) on line ~1027 BEFORE
+		// deps.bgBefore is invoked (line 1248), so reading srv.ops
+		// here is safe; the closure's goroutine launch proceeds
+		// regardless of whether ops is nil (the loop runs and
+		// logs but does not increment — same trade-off the apid
+		// audit auditor makes with pkg/audit.Auditor.SetOps).
+		eventRetentionCleanup.SetOps(srv.ops)
 		go func() { _ = eventRetentionCleanup.Run(ctx) }()
 		// Issue #562 / PR-A: log archive shipper. Walks the local
 		// spool dir every cfg.FlushInterval (5 min default) and

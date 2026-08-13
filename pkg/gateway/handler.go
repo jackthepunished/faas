@@ -1595,6 +1595,15 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 					"rule_id":   rule.ID,
 					"from_host": r.Host,
 					"cidr":      denyNet.String(),
+					// ADR-091 D20 widening / PR-B: the offending client
+					// IP so operators can grep the audit-events table
+					// by IP without re-parsing XFF. clientIP is in
+					// scope here — clientIPFromTrustedXFF has already
+					// gated it through the defense-in-depth guard
+					// (line 1491). PII: see the runbook's "audit-event
+					// access control" section — masking is a separate
+					// ADR and is out of scope for this PR.
+					"client_ip": clientIP.String(),
 				})
 			}
 			if h.metrics != nil {
@@ -1622,6 +1631,11 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 					"rule_id":   rule.ID,
 					"from_host": r.Host,
 					"implicit":  true,
+					// ADR-091 D20 widening / PR-B: see the deny-CIDR
+					// site above for the rationale — operators can now
+					// see WHICH IP was implicitly denied, which is the
+					// most common kind of false positive.
+					"client_ip": clientIP.String(),
 				})
 			}
 			if h.metrics != nil {
@@ -1636,6 +1650,10 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.ip_matched", nil, map[string]any{
 			"rule_id":   rule.ID,
 			"from_host": r.Host,
+			// ADR-091 D20 widening / PR-B: the matched IP for the
+			// audit "this rule let through a request from IP X"
+			// row. Same PII rationale as the deny sites above.
+			"client_ip": clientIP.String(),
 		})
 	}
 	if h.metrics != nil {

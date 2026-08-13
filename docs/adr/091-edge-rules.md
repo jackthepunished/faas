@@ -264,6 +264,17 @@ PR-A/B/C — keep their cite numbers untouched.)
       `edge_rule.*_matched|blocked|failed|missing` are best-effort
       today. A retention SLO (e.g., 30 days) needs an
       operator-obs/audit-search ticket (#817 in flight).
+      **Amendment 2 (PR-B residual, 2026-08-12):** retention is
+      NOT shipped by this PR — ADR-075 already ships the 90-day
+      SOC 2 CC6.2 floor (`pkg/eventretention.Cleanup`). D20.3 is
+      re-scoped to **SLO + observability** on top of the prune
+      loop: three new wire metrics
+      (`apid_audit_events_deleted_total`,
+      `apid_audit_events_retention_lag_seconds`,
+      `apid_audit_events_volume_total{kind_prefix}`) plus a new
+      runbook (`docs/runbooks/FaasAuditRetentionExhaustion.md`).
+      ADR-075 + this PR close the runtime gap; the operator-obs
+      ticket (#817 in flight) closes the dashboard chip in D20.4.
     - **D20.4 — Observability dashboard chip.** `gateway_edge_rule_match_total
       {kind, outcome}` is exported as a Prometheus counter; no
       Grafana chip ships. Owner: ADR-092 (observability catalog)
@@ -275,6 +286,39 @@ PR-A/B/C — keep their cite numbers untouched.)
       preflight e2e; non-preflight stamp-the-Origin flow is
       unit-tested at `pkg/gateway/handler.go:1175-1220` and the e2e
       can add a `GET` happy-path assertion in a follow-up.
+      **Amendment 2 (PR-B residual, 2026-08-12):** the e2e ship
+      lands in this PR — `TestEdgeRulesCORS_NonPreflight_HappyPath`
+      in `cmd/e2e/edge_rules_cors_e2e_test.go` with bitmask
+      `APID|Gatewayd`, plus a new unit test
+      `TestApplyEdgeRuleCORS_NonPreflight_EmitsApplySuccess` that
+      pins the apply/match counter contract. D20.6 closed.
+
+    - **D20.7 — Audit payload widening (PR-B residual, 2026-08-12).**
+      Three round-trips folded into this PR:
+      1. **`result` field** — every emit site that knows an outcome
+         can stamp `result: "success"|"error[:code=...]"` via
+         `pkg/auditutil.WithResult` (new package, single 5-line
+         helper). `pkg/audit.Auditor.Emit` stays unchanged; the
+         twin method `EmitResult` is the entry point that takes
+         the result. `cmd/gatewayd-internal/audit.go::gatewaydAuditor`
+         mirrors the contract. The 25 inline emit sites stay
+         unchanged today — follow-on PRs migrate them call-site by
+         call-site.
+      2. **`client_ip` field (XFF audit widening)** —
+         `applyEdgeRuleIP` audit rows at sites 1522 (deny CIDR),
+         1549 (implicit deny), and 1564 (allow match) now include
+         `client_ip`. Sites 1477 (cross-account, before the XFF
+         read) and 1502 (forged-XFF, returns nil) keep their
+         current payload. The IP flows through
+         `clientIPFromTrustedXFF`'s defense-in-depth guard, so the
+         audit row carries a trustworthy IP only.
+      3. **`client_ip` PII note** — IP is RFC 7239 §6.1 PII;
+         operators are responsible for access control on the
+         audit-events table. Masking (last-octet truncation for
+         v4, prefix truncation for v6) is a separate ADR and is
+         out of scope for this PR. Runbook
+         `docs/runbooks/FaasAuditRetentionExhaustion.md`
+         documents the access-control expectation.
 
 ## Implementation surface
 
