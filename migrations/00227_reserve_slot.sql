@@ -1,17 +1,19 @@
 -- filename: 00227_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Reserve slot 227 for the next PR-cluster PR after PR #845
--- (ADR-091 D21-D23 kind=geo at 00226). Same fence rationale as
--- 00211; see cross-pr-slot-fence-reservation-fence-pattern for
--- the pattern.
---
--- DO NOT bump the slot. If you are claiming this slot for a
--- different feature, fork off the latest main and write your own
--- reserve_slot at the next free number. The slot is currently
--- fenced because main has 00225_reserve_slot.sql (PR #866) and
--- PR #845 has 00226_edge_rules_kind_geo.sql + 00227 (this fence)
--- — three contiguous reservation markers from sibling PRs.
+-- Reserve slot 227 as a cross-PR coexistence fence for PR #867
+-- (maintenance PR-A, ADR-091 amendment) which claims 00227 with
+-- 00227_edge_rules_kind_maintenance.sql. PR #845 (ADR-091 D21
+-- kind=geo) renumbered AWAY from 00226 to 00229, passing through
+-- 00227 on the way; this fence exists so the migrations-contiguous
+-- gate passes locally without colliding with PR #867's real
+-- schema. The fence is reservation-only per ADR-041 and
+-- cross-pr-slot-gate-reservation-fence-pattern, so it does NOT
+-- collide with PR #867's real migration — the slot-check excludes
+-- reservation files from the overlap scan. Once #867 merges into
+-- main, this fence is deleted via
+-- `git rm migrations/00227_reserve_slot.sql` (per
+-- cross-pr-rebase-fence-deletion-hazard).
 SELECT 1;
 -- +goose StatementEnd
 
