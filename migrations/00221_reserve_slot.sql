@@ -1,0 +1,17 @@
+-- filename: 00221_reserve_slot.sql
+-- +goose Up
+-- +goose StatementBegin
+-- Reserve slot 221 for PR #854 (ADR-095 scale-to-zero T1 single-flight
+-- + phase-decomposed telemetry, migrations/00221_instances_request_count.sql).
+-- This branch (PR #845, ADR-091 D21 kind=geo) is at slot 00222; the
+-- fence here preserves contiguity (00220 → 00221 → 00222) so the
+-- TestMigrationsContiguous gate in migrations/embed_test.go does not
+-- trip on PR #845's rebase.
+--
+-- Cross-PR coordination reminder for whoever lands PR #854: when
+-- you replace this fence with the real 00221_instances_request_count.sql,
+-- DO NOT bump the slot — keep it at 00221. PR #845 is locked to 00222
+-- (this 00221 fence is the PR #854 reservation; the 00217 + 00218
+-- fences are PR #849 / PR #845-sibling gates).
+SELECT 1;
+-- +goose StatementEnd
