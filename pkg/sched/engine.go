@@ -309,6 +309,16 @@ type Engine struct {
 	// missed wiring is a silent no-op rather than a nil-deref panic.
 	warmAffinity *WarmAffinity
 
+	// upstreamAffinity (ADR-098 PR-D) is the connection-aware
+	// placement bias. Defaults to nil (FAAS_UPSTREAM_AFFINITY=0
+	// branch) so pre-PR test fixtures keep their existing
+	// behaviour. Production wires a real cache via
+	// WithUpstreamAffinity. nil is tolerated by Score (returns
+	// ok=false → chooser falls back to legacy tie-break) so a
+	// missed wiring is a silent no-op rather than a nil-deref
+	// panic — parallel to warmAffinity's contract above.
+	upstreamAffinity *UpstreamAffinity
+
 	// overage is the spend-cap pause-workload seam (issue #561).
 	// Nil tolerates the gate branch as a no-op (pre-#561 fixtures
 	// keep their existing behaviour); production cmd/schedd wires
@@ -478,6 +488,18 @@ func (e *Engine) WithOpsMetrics(ops *wire.OpsMetrics) *Engine {
 // their existing single-box behaviour.
 func (e *Engine) WithWarmAffinity(w *WarmAffinity) *Engine {
 	e.warmAffinity = w
+	return e
+}
+
+// WithUpstreamAffinity attaches the connection-aware placement
+// bias (ADR-098 PR-D). The engine reads Score(appID) before
+// calling ChoosePlacement and stamps Request.PreferredRegion;
+// the chooser honors it via the upstream_fit tie-break in
+// betterCandidate. nil is tolerated (Score returns ok=false →
+// legacy tie-break) so legacy test fixtures that don't wire
+// this keep their existing single-box behaviour.
+func (e *Engine) WithUpstreamAffinity(u *UpstreamAffinity) *Engine {
+	e.upstreamAffinity = u
 	return e
 }
 
@@ -1578,10 +1600,28 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// (cold boot must always work) is preserved: an empty hint
 	// behaves identically to a fresh install.
 	warmHint, _ := e.warmAffinity.LastWarmNode(appID)
+	// ADR-098 PR-D: connection-aware placement bias. Score is
+	// the synchronous read (per ADR §D2 — schedd does NOT
+	// LISTEN on data_upstreams_changed). On cache miss, Refresh
+	// fires synchronously to populate the entry; on hit, the
+	// cached preferredRegion flows through. ok=false → empty
+	// PreferredRegion → legacy tie-break. The refresh error is
+	// logged + swallowed so a transient DB hiccup doesn't break
+	// the legacy chooser.
+	preferredRegion, _, _ := e.upstreamAffinity.Score(appID)
+	if preferredRegion == "" && e.upstreamAffinity != nil {
+		if rerr := e.upstreamAffinity.Refresh(ctx, acct.ID, appID); rerr == nil {
+			preferredRegion, _, _ = e.upstreamAffinity.Score(appID)
+		} else {
+			// best-effort: log at debug, fall through to legacy
+			e.log.Debug("upstream affinity refresh failed; using legacy chooser", "app", appID, "err", rerr)
+		}
+	}
 	placement, err := e.choosePlacementLocked(ctx, Request{
 		AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-		PreferredNodeID: warmHint,
+		PreferredNodeID:   warmHint,
+		PreferredRegion:   preferredRegion,
 	})
 	if err != nil {
 		release()

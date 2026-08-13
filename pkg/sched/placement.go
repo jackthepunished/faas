@@ -204,7 +204,7 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 	// node is well under its RAM ceiling).
 	best := candidates[0]
 	for _, n := range candidates[1:] {
-		if betterCandidate(n, usedMB[n.ID], usedVCPU[n.ID], best, usedMB[best.ID], usedVCPU[best.ID]) {
+		if betterCandidate(n, usedMB[n.ID], usedVCPU[n.ID], best, usedMB[best.ID], usedVCPU[best.ID], r.PreferredRegion) {
 			best = n
 		}
 	}
@@ -232,7 +232,7 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 // against the node's VCPUBudget; a node with vcpu_budget=0 has
 // zero headroom and is excluded upstream (the candidate filter
 // in ChoosePlacement), so betterCandidate never sees it.
-func betterCandidate(n state.ComputeNode, nUsed int64, nVCPUUsed int64, best state.ComputeNode, bestUsed int64, bestVCPUUsed int64) bool {
+func betterCandidate(n state.ComputeNode, nUsed int64, nVCPUUsed int64, best state.ComputeNode, bestUsed int64, bestVCPUUsed int64, preferred string) bool {
 	nHead := int64(n.AdmissionCeilingMB) - nUsed
 	bestHead := int64(best.AdmissionCeilingMB) - bestUsed
 	if nHead != bestHead {
@@ -247,14 +247,31 @@ func betterCandidate(n state.ComputeNode, nUsed int64, nVCPUUsed int64, best sta
 	if nVHead != bestVHead {
 		return nVHead > bestVHead
 	}
+	// ADR-098 PR-D: connection-aware upstream fit. When the
+	// caller passed a PreferredRegion (the upstream-affinity
+	// cache hit on the wake path), prefer the candidate whose
+	// compute_node.region matches. An empty PreferredRegion
+	// (cache cold / FAAS_UPSTREAM_AFFINITY=0) skips this branch
+	// and falls through to the legacy region-string ASC
+	// tie-break — the bias is opt-in by design. Region
+	// comparison uses the same nil → "" collapse as the
+	// legacy comparator below; the upstream_fit INSERT is
+	// load-bearing (placement_test.go pins the ordering).
+	nRegion := derefRegion(n.Region)
+	bestRegion := derefRegion(best.Region)
+	if preferred != "" {
+		nMatch := nRegion == preferred
+		bestMatch := bestRegion == preferred
+		if nMatch != bestMatch {
+			return nMatch
+		}
+	}
 	// Region/Zone are nullable strings; collapse nil → "" so the
 	// comparator sees a single shape. Tied on headroom → prefer
 	// lower region, then lower zone, then lower name. The seeded
 	// default-local row is backfilled to ('local','local') in
 	// migration 00069, so single-box deploys see a deterministic
 	// ordering with no operator-added rows competing.
-	nRegion := derefRegion(n.Region)
-	bestRegion := derefRegion(best.Region)
 	if nRegion != bestRegion {
 		return nRegion < bestRegion
 	}

@@ -821,6 +821,17 @@ const UpstreamProbeMaxConcurrent = 64
 // top-level constant (not on the Limits struct) per ADR-098 §263.
 const UpstreamFitMinDeltaMs = 5
 
+// UpstreamAffinityTTL (ADR-098 §D2) is the staleness budget on
+// schedd's in-process upstream-affinity cache. Matches the
+// meterd probe cadence (pkg/meter/upstream_probe.go
+// DefaultUpstreamProbeInterval = 30 s) so the cached preferred
+// region is never more than one probe-cycle stale. Overridable
+// via FAAS_UPSTREAM_AFFINITY_TTL on schedd startup; the engine
+// constructor takes a duration so callers can stub it in tests.
+// Lives as a top-level constant (not on the Limits struct) per
+// ADR-098 §263.
+const UpstreamAffinityTTL = 30 * time.Second
+
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
 // limits, §4.3 idle timeouts, §4.6 app-layer caps, §7 egress, §10 prices.
 //
