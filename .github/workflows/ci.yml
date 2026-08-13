@@ -252,7 +252,6 @@ jobs:
           fi
           PROTOC_TARBALL="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
           PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_TARBALL}"
-          mkdir -p "$HOME/.local/protoc/bin"
           ZIP="$RUNNER_TEMP/${PROTOC_TARBALL}"
           echo "→ downloading $PROTOC_URL"
           # Authenticated release-asset fetch: 5000/hr per-token
@@ -267,15 +266,20 @@ jobs:
           echo "→ verifying SHA-256"
           echo "${PROTOC_SHA256_LINUX_AMD64}  $ZIP" | sha256sum --check --strict
           echo "→ extracting"
-          # The zip lays out bin/protoc + include/google/protobuf/*. The
-          # tarball has no top-level directory prefix, so we extract
-          # into a scratch dir and copy the binary to the stable install
-          # path. `unzip` is on every ubuntu-latest runner by default.
+          # The zip lays out bin/protoc + include/google/protobuf/*.proto
+          # (e.g. timestamp.proto, any.proto — every well-known type the
+          # repo's .proto files import). We install BOTH into
+          # /usr/local: the binary lands on PATH automatically, and the
+          # include dir lands at protoc's default search path
+          # (/usr/local/include/google/protobuf/...). No Makefile change
+          # needed — the local-dev recipe (brew install protobuf)
+          # produces the same /usr/local/include layout.
           (cd "$RUNNER_TEMP" && unzip -q "$ZIP")
-          cp "$RUNNER_TEMP/bin/protoc" "$HOME/.local/protoc/bin/protoc"
-          chmod +x "$HOME/.local/protoc/bin/protoc"
-          echo "→ installed: $("$HOME/.local/protoc/bin/protoc" --version)"
-          echo "$HOME/.local/protoc/bin" >> "$GITHUB_PATH"
+          sudo install -m 0755 "$RUNNER_TEMP/bin/protoc" /usr/local/bin/protoc
+          sudo cp -r "$RUNNER_TEMP/include/google" /usr/local/include/
+          echo "→ installed: $(protoc --version)"
+          echo "→ includes:"
+          ls /usr/local/include/google/protobuf/ | head -5
       - name: install protoc plugins
         run: |
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
