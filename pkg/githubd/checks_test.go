@@ -40,6 +40,29 @@ func TestChecksAPI_PhaseMapping(t *testing.T) {
 	}
 }
 
+// TestChecksAPI_PreviewPhaseTitle pins the preview-specific
+// title copy (issue #272 / ADR-094). The PR UI uses the
+// Check Run title to render the row — keeping "Preview X"
+// distinct from the production "Build X" copy lets operators
+// distinguish the two pipelines on a busy PR.
+func TestChecksAPI_PreviewPhaseTitle(t *testing.T) {
+	cases := []struct {
+		phase githubdgrpc.CheckPhase
+		want  string
+	}{
+		{githubdgrpc.CheckPhaseQueued, "Preview queued"},
+		{githubdgrpc.CheckPhaseBuilding, "Preview building"},
+		{githubdgrpc.CheckPhaseLive, "Preview live"},
+		{githubdgrpc.CheckPhaseFailed, "Preview failed"},
+		{githubdgrpc.CheckPhaseUnspecified, "Preview"},
+	}
+	for _, c := range cases {
+		if got := previewPhaseTitle(c.phase); got != c.want {
+			t.Errorf("phase %v: title = %q, want %q", c.phase, got, c.want)
+		}
+	}
+}
+
 func TestChecksAPI_WriteCheck_HTTP(t *testing.T) {
 	var hits atomic.Int32
 	var gotBody map[string]any
@@ -169,5 +192,154 @@ func TestWriteCheck_NoBindingFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no app bound") {
 		t.Errorf("err = %v, want 'no app bound' message", err)
+	}
+}
+
+// newPreviewChecksAPI builds a ChecksAPI wired to a fake HTTP
+// server + a fake binding + a fake token fetcher. Returns the
+// ChecksAPI, the fake server URL, and a record of the body the
+// server saw. Used by the WritePreviewCheck + WritePreviewCheckForkRefused
+// tests below.
+func newPreviewChecksAPI(t *testing.T) (*ChecksAPI, *atomic.Pointer[map[string]any]) {
+	t.Helper()
+	var gotBody atomic.Pointer[map[string]any]
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		m := map[string]any{}
+		_ = json.Unmarshal(body, &m)
+		gotBody.Store(&m)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":7777}`))
+	}))
+	t.Cleanup(fake.Close)
+
+	tokens := NewTokenCache(fakeFetcher(func(_ context.Context, _ int64) (string, time.Time, error) {
+		return "ghs_preview_token", time.Now().Add(time.Hour), nil
+	}), time.Minute)
+	c, err := NewChecksAPI(tokens, &singleHostClient{base: fake.Client(), api: fake.URL}, &fakeBindings{id: 99})
+	if err != nil {
+		t.Fatalf("NewChecksAPI: %v", err)
+	}
+	return c, &gotBody
+}
+
+// TestWritePreviewCheck_HappyPath_IncludesURL covers the
+// production path: a PR-preview event with a known preview URL
+// posts a Check Run named "gregale-preview" with a Markdown
+// link to the preview in the summary, status=in_progress for
+// the Building phase.
+func TestWritePreviewCheck_HappyPath_IncludesURL(t *testing.T) {
+	c, gotBody := newPreviewChecksAPI(t)
+	previewURL := "https://pr-42-hello.apps.gregale.dev"
+	err := c.WritePreviewCheck(context.Background(),
+		"octo/api", "deadbeef", githubdgrpc.CheckPhaseBuilding,
+		previewURL, "Building preview app for PR #42")
+	if err != nil {
+		t.Fatalf("WritePreviewCheck: %v", err)
+	}
+	body := *gotBody.Load()
+	if body == nil {
+		t.Fatal("no body captured")
+	}
+	if body["name"] != previewCheckName {
+		t.Errorf("name = %v, want %q", body["name"], previewCheckName)
+	}
+	if body["status"] != statusInProgress {
+		t.Errorf("status = %v, want %q", body["status"], statusInProgress)
+	}
+	if body["conclusion"] != nil {
+		t.Errorf("conclusion = %v, want absent for in_progress", body["conclusion"])
+	}
+	summary, _ := body["output"].(map[string]any)["summary"].(string)
+	if !strings.Contains(summary, previewURL) {
+		t.Errorf("summary = %q, want it to contain %q", summary, previewURL)
+	}
+	if !strings.Contains(summary, "Building preview") {
+		t.Errorf("summary = %q, want it to contain 'Building preview'", summary)
+	}
+}
+
+// TestWritePreviewCheck_NoURL covers the URL-less path (D3 fork
+// refusal in the dispatcher would NOT use this function —
+// WritePreviewCheckForkRefused handles that — but the
+// dispatcher's quota-exhausted path may not have a URL when
+// CreateApp failed before the app row was written).
+func TestWritePreviewCheck_NoURL(t *testing.T) {
+	c, gotBody := newPreviewChecksAPI(t)
+	if err := c.WritePreviewCheck(context.Background(),
+		"octo/api", "deadbeef", githubdgrpc.CheckPhaseQueued,
+		"", "Preview queued"); err != nil {
+		t.Fatalf("WritePreviewCheck: %v", err)
+	}
+	body := *gotBody.Load()
+	summary, _ := body["output"].(map[string]any)["summary"].(string)
+	if strings.Contains(summary, "Preview URL:") {
+		t.Errorf("summary = %q, want no Preview URL line when previewURL is empty", summary)
+	}
+	if !strings.Contains(summary, "Preview queued") {
+		t.Errorf("summary = %q, want it to retain caller summary", summary)
+	}
+}
+
+// TestWritePreviewCheck_RejectsMissingArgs mirrors the production
+// WriteCheck guard: empty repo / sha returns a clear error rather
+// than a downstream 4xx.
+func TestWritePreviewCheck_RejectsMissingArgs(t *testing.T) {
+	c, _ := newPreviewChecksAPI(t)
+	if err := c.WritePreviewCheck(context.Background(), "", "sha", githubdgrpc.CheckPhaseQueued, "", ""); err == nil {
+		t.Error("empty repo should error")
+	}
+	if err := c.WritePreviewCheck(context.Background(), "owner/repo", "", githubdgrpc.CheckPhaseQueued, "", ""); err == nil {
+		t.Error("empty sha should error")
+	}
+}
+
+// TestWritePreviewCheckForkRefused_HappyPath covers the D3
+// neutral-check shape: status=completed, conclusion=neutral,
+// title="Preview skipped (security policy)".
+func TestWritePreviewCheckForkRefused_HappyPath(t *testing.T) {
+	c, gotBody := newPreviewChecksAPI(t)
+	err := c.WritePreviewCheckForkRefused(context.Background(),
+		"octo/api", "deadbeef",
+		"Fork PR refused — head repo differs from base repo")
+	if err != nil {
+		t.Fatalf("WritePreviewCheckForkRefused: %v", err)
+	}
+	body := *gotBody.Load()
+	if body == nil {
+		t.Fatal("no body captured")
+	}
+	if body["name"] != previewCheckName {
+		t.Errorf("name = %v, want %q", body["name"], previewCheckName)
+	}
+	if body["status"] != statusCompleted {
+		t.Errorf("status = %v, want %q", body["status"], statusCompleted)
+	}
+	if body["conclusion"] != previewCheckConclusionNeutral {
+		t.Errorf("conclusion = %v, want %q", body["conclusion"], previewCheckConclusionNeutral)
+	}
+	if body["head_sha"] != "deadbeef" {
+		t.Errorf("head_sha = %v, want deadbeef", body["head_sha"])
+	}
+	output, _ := body["output"].(map[string]any)
+	if title, _ := output["title"].(string); title != "Preview skipped (security policy)" {
+		t.Errorf("title = %q, want %q", title, "Preview skipped (security policy)")
+	}
+	summary, _ := output["summary"].(string)
+	if !strings.Contains(summary, "Fork PR refused") {
+		t.Errorf("summary = %q, want it to retain caller summary", summary)
+	}
+}
+
+// TestWritePreviewCheckForkRefused_RejectsMissingArgs mirrors
+// the production guard.
+func TestWritePreviewCheckForkRefused_RejectsMissingArgs(t *testing.T) {
+	c, _ := newPreviewChecksAPI(t)
+	if err := c.WritePreviewCheckForkRefused(context.Background(), "", "sha", "x"); err == nil {
+		t.Error("empty repo should error")
+	}
+	if err := c.WritePreviewCheckForkRefused(context.Background(), "owner/repo", "", "x"); err == nil {
+		t.Error("empty sha should error")
 	}
 }

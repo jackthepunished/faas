@@ -60,6 +60,16 @@ const (
 	// The CHECK constraint on builds.kind is relaxed to allow
 	// this value by migration 00085.
 	DeploymentKindGitHub DeploymentKind = "github"
+	// DeploymentKindPreview tags builds enqueued by the githubd
+	// pull_request preview path (issue #272, ADR-094). Same wire
+	// shape as DeploymentKindGitHub (the codeload tarball is
+	// fetched server-side via the install-token mint), but the
+	// deployment row identifies it as a PR preview so per-customer
+	// dashboards and the preview-aware billing breakdown can
+	// distinguish ephemeral previews from prod pushes. The CHECK
+	// constraint on builds.kind is relaxed to allow this value
+	// by migration 00218.
+	DeploymentKindPreview DeploymentKind = "preview"
 )
 
 // DeploymentStatus tracks a deployment through the pipeline (spec §5, §9).
@@ -410,6 +420,14 @@ type App struct {
 	// PATCH it to true (apid returns 403
 	// plan_websocket_not_allowed); Hobby/Pro/Scale default to true.
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) opts the app into the per-route
+	// observability surface. Mirrors WebSocketEnabled's plan-gating
+	// contract: Free defaults to false and cannot PATCH it to true
+	// (apid returns 403 plan_route_metrics_not_allowed); Hobby/Pro/
+	// Scale default to true. The per-app route cap (50) +
+	// __route_other__ overflow bound the cardinality regardless of
+	// the customer's traffic shape.
+	RouteMetricsEnabled bool
 	// RequireSigned gates OCI image deploys (issue #472 / ADR-054) on
 	// a valid cosign signature from a trusted publisher. When true,
 	// imaged's buildImageLayer calls pkg/cosign.VerifyImageSignature
@@ -592,6 +610,43 @@ type App struct {
 	// api.Plan.EvictionPriorityReservedAllowed(); the column CHECK
 	// (apps_eviction_priority_chk) is the data-integrity backstop.
 	EvictionPriority string
+	// PreviewOfSlug names the parent (production) app this row is
+	// a PR preview of. Empty for production apps. Non-empty for
+	// preview rows provisioned by githubd's pull_request handler
+	// (issue #272 / ADR-094). The slug pair (preview_of_slug,
+	// preview_pr_number) is the natural lookup key for the
+	// dashboard's "preview environments" pane and for the teardown
+	// janitor's nightly scan. Nullable text in SQL; the empty-
+	// string-means-NULL convention matches Runtime / StartCommand.
+	PreviewOfSlug string
+	// PreviewPrNumber is the GitHub PR number this preview row
+	// tracks. Stable across synchronize/reopened events on the
+	// same PR; the slug is `pr-{N}-{parent_slug}`. Zero on
+	// production apps.
+	PreviewPrNumber int
+	// PreviewPrState is the closed-set lifecycle label on a
+	// preview row. NULL on production apps. The
+	// closed → stale → torn_down transitions are driven by the
+	// cmd/schedd/janitor_preview.go loop (PR-C). Values:
+	//
+	//   - "open"     : PR is open on GitHub; preview serves traffic.
+	//   - "closed"   : PR was closed within the last 24h; preview
+	//                  still serves traffic, allowing a quick
+	//                  reopen-replay to land without a fresh build.
+	//   - "stale"    : PR was closed more than 24h ago OR has
+	//                  expired (preview_expires_at < now()).
+	//                  Preview refuses new wakes (410 Gone).
+	//   - "torn_down": Teardown complete; the apps row is
+	//                  tombstoned (deleted_at set). The slug is
+	//                  free for reuse.
+	PreviewPrState string
+	// PreviewExpiresAt is the wall-clock time the teardown
+	// janitor should reap the preview, regardless of GitHub state.
+	// Computed at provision time as created_at + 7 days; the
+	// dashboard's preview panel surfaces the expiry to the
+	// customer so they can pin a preview they want to keep. NULL
+	// on production apps.
+	PreviewExpiresAt *time.Time
 	CreatedAt        time.Time
 }
 
@@ -618,6 +673,35 @@ func EvictionPriorityOrBestEffort(p string) string {
 		return string(api.EvictionPriorityBestEffort)
 	}
 	return p
+}
+
+// PreviewPrStateOpen / Closed / Stale / TornDown are the four
+// closed-set values for state.App.PreviewPrState. Mirrors the
+// apps_preview_pr_state_chk CHECK constraint introduced by
+// migration 00218 (issue #272 / ADR-094). Empty string means
+// "production app, no preview state" — the SQL CHECK allows
+// NULL or one of the four values; the Go side represents NULL
+// as "" (same convention as EvictionPriorityOrBestEffort).
+const (
+	PreviewPrStateOpen     = "open"
+	PreviewPrStateClosed   = "closed"
+	PreviewPrStateStale    = "stale"
+	PreviewPrStateTornDown = "torn_down"
+)
+
+// PreviewPrStateIsValid reports whether the value is one of
+// the four legal preview_pr_state values. Empty string is the
+// "production app" shape (preview_pr_state IS NULL) — the SQL
+// CHECK allows NULL; the Go side uses "" for that. Callers
+// building a new preview App MUST set a non-empty value from
+// the closed set above.
+func PreviewPrStateIsValid(s string) bool {
+	switch s {
+	case PreviewPrStateOpen, PreviewPrStateClosed, PreviewPrStateStale, PreviewPrStateTornDown:
+		return true
+	default:
+		return false
+	}
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -1857,6 +1941,40 @@ type ComputeNodeHeartbeat struct {
 	ReceivedAt      time.Time
 	LastHeartbeatAt time.Time
 	Source          string
+	// CPUPct60s is the 60-second sliding-window CPU utilization as
+	// a percentage of vpcpus × 100 (PR #4 / ADR-091 §3.6 amendment).
+	// Nil when the row predates migrations/00199 or vmmd hadn't
+	// sampled yet. Bounded [0.00, 100.00] for sane values.
+	CPUPct60s *float64
+	// DiskUsedBytes is the byte size of /srv/fc/snapshots + spool
+	// scratchpad at heartbeat-mint time (PR #4). Nil when the row
+	// predates the migration or vmmd hadn't sampled yet.
+	DiskUsedBytes *int64
+}
+
+// ComputeNodeHeartbeatStats is the read shape for LatestHeartbeatStats
+// (PR #4). One row per compute node; NodeID + the latest heartbeat's
+// stats fields. The handler folds this onto the ObsNodeRow projection.
+type ComputeNodeHeartbeatStats struct {
+	NodeID        string
+	ReceivedAt    time.Time
+	CPUPct60s     *float64
+	DiskUsedBytes *int64
+}
+
+// PerNodeStats is one row of the per-node live-stats aggregate (PR #4).
+// NodeName is the compute_nodes.name. The counts and RAM sums are over
+// instances whose binding row has released_at IS NULL (i.e. the VM is
+// currently hosted on that node). The +8 on ram_mb mirrors §6.2
+// invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so the per-node RAMUsedMB
+// is the operator-side number that adds up to the fleet ceiling.
+type PerNodeStats struct {
+	NodeName             string
+	InstancesLive        int64
+	InstancesRunning     int64
+	InstancesWaking      int64
+	InstancesColdBooting int64
+	RAMUsedMB            int64
 }
 
 // InstanceTouch is one entry in a last_request_at flush batch (spec §4.1). The
@@ -2153,6 +2271,16 @@ type UpdateAppParams struct {
 	// should never accept an Upgrade).
 	WebSocketEnabled    *bool
 	SetWebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) toggles the per-app per-route
+	// observability surface. SetRouteMetricsEnabled distinguishes
+	// "unset" (don't touch) from "explicit false" (opt out of the
+	// per-route breakdown). Plan-gated upstream: apid returns 403
+	// plan_route_metrics_not_allowed when the plan lacks the gate
+	// (Free). Hobby/Pro/Scale customers may PATCH true → false to
+	// disable per-route metrics for a specific app (e.g. an app
+	// that does not want the per-route cardinality on the box).
+	RouteMetricsEnabled    *bool
+	SetRouteMetricsEnabled bool
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys
 	// on a valid cosign signature from a trusted publisher. SetRequireSigned
 	// distinguishes "unset" (don't touch) from "explicit false"
@@ -3034,6 +3162,19 @@ const (
 	// See migrations/00214_edge_rules_kind_validate.sql for the
 	// schema CHECK widening.
 	EdgeRuleKindValidate EdgeRuleKind = "validate"
+	// EdgeRuleKindLimit caps the inbound request body at a per-rule
+	// byte threshold before the wake gate; an oversize request is
+	// rejected with 413 request_too_large without paying a cold-boot
+	// cost. The cap is the standalone primitive (vs the validate
+	// kind's body-cap side effect): a customer who only wants
+	// per-route body-size protection declares this kind without
+	// shipping a JSON Schema. Plan-gated Free-and-above (no
+	// IsPaidOnly change). MaxBodyBytes ≤ api.MaxRequestBodyBytes
+	// (buffered path) and an optional MaxBodyBytesStreaming ≤
+	// api.MaxBodyBytesStreaming (streaming opt-in); both clamped
+	// at apid-create time. See migrations/00219_edge_rules_kind_limit.sql
+	// for the schema CHECK widening.
+	EdgeRuleKindLimit EdgeRuleKind = "limit"
 )
 
 // IsValid reports whether k is a closed-set kind. New kinds land via
@@ -3043,7 +3184,7 @@ func (k EdgeRuleKind) IsValid() bool {
 	switch k {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
-		EdgeRuleKindIP, EdgeRuleKindValidate:
+		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit:
 		return true
 	}
 	return false
@@ -3166,6 +3307,25 @@ type EdgeRuleValidateAction struct {
 	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
 }
 
+// EdgeRuleLimitAction carries the per-rule body caps for kind=limit.
+// MaxBodyBytes is the buffered-path cap (≤ api.MaxRequestBodyBytes,
+// 25 MiB); MaxBodyBytesStreaming is the streaming opt-in cap (≤
+// api.MaxBodyBytesStreaming, 100 MiB). The streaming cap defaults to
+// 0 ("unspecified") and only takes effect on requests that opt into
+// the streaming response path (operator gate FAAS_GATEWAY_STREAMING +
+// app-level streaming_enabled + request Accept: application/json);
+// non-streaming requests still cap at MaxBodyBytes.
+//
+// Clamps and the negative-rejection check live in
+// pkg/api/dto.go::EdgeRuleLimitAction.Validate. The state mirror
+// carries the values verbatim so the gatewayd compile step can
+// defence-in-depth against any direct-DB write that bypassed
+// apid-Validate (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect).
+type EdgeRuleLimitAction struct {
+	MaxBodyBytes          int `json:"max_body_bytes"`
+	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
+}
+
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
 // as jsonb. The wire shape lives in pkg/api/dto.go (one struct per
 // kind); the state-side mirror is intentionally minimal — the
@@ -3188,6 +3348,13 @@ type EdgeRuleAction struct {
 	// enforced in pkg/api/dto.go::EdgeRuleValidateAction.Validate
 	// at apid-create time; the state mirror carries them verbatim.
 	Validate *EdgeRuleValidateAction `json:"validate,omitempty"`
+	// Limit carries the per-rule body caps for kind=limit.
+	// MaxBodyBytes is the buffered-path cap; MaxBodyBytesStreaming
+	// is the streaming opt-in cap (0 = unspecified, defer to
+	// MaxBodyBytes). The companion validate kind's MaxBodyBytes
+	// stays — it is the "cap the body I am about to schema-check"
+	// knob; kind=limit is the standalone gate.
+	Limit *EdgeRuleLimitAction `json:"limit,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.

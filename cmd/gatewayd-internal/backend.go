@@ -116,7 +116,15 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		// raw forwarder. Default false on the App struct
 		// matches the apps.websocket_enabled column DEFAULT.
 		WebSocketEnabled: app.WebSocketEnabled,
-		RequireAuthn:     app.RequireAuthn,
+		// ADR-093: per-route observability opt-in. Plumbed
+		// from apps.route_metrics_enabled through pgRouter.toApp
+		// so Handler.ServeHTTP's routeSetFor (gated on
+		// app.RouteMetricsEnabled && h.routeMetricsEnabled) can
+		// lazily create the per-app routeLabelSet. Default false
+		// on the App struct matches the apps.route_metrics_enabled
+		// column DEFAULT (migration 00212).
+		RouteMetricsEnabled: app.RouteMetricsEnabled,
+		RequireAuthn:        app.RequireAuthn,
 		PublicAuth: gateway.PublicAuthConfig{
 			Mode:        app.PublicAuthMode,
 			BasicSealed: app.PublicAuthBasicSealed,

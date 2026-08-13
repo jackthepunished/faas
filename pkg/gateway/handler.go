@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,24 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
+
+// ResolveSlugFn (ADR-093) is the (slug → appID) resolver the
+// control-listener /v1/internal/apps/{slug}/routes handler uses
+// to translate the path segment into the appID the in-process
+// route-set map keys on. Production wires a closure that consults
+// the same apps table apid used to register the app — the
+// control listener is loopback-only so it does NOT open its own
+// Postgres connection (ADR-070 single-purpose control mux). The
+// first request after a freshly-started gatewayd sees an empty
+// Routes array until the in-process cache hydrates; the dashboard
+// treats that as "no traffic yet" (matches the existing
+// /v1/internal/quota empty-state contract).
+//
+// ok=false is a clean "slug not registered"; the handler renders
+// an empty Routes array rather than 404 so the dashboard doesn't
+// distinguish "unknown slug" from "no traffic yet" (avoiding an
+// enumeration oracle on the loopback surface).
+type ResolveSlugFn func(slug string) (appID string, ok bool)
 
 // App is the routing target for a hostname.
 type App struct {
@@ -48,6 +67,19 @@ type App struct {
 	// in fakeBackend unit tests; tests that want to exercise the
 	// raw path set this to true alongside an app.Plan != PlanFree.
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) opts the app into the per-route
+	// observability surface. When true, Handler.observe emits three
+	// additional Prometheus series keyed by an enumerated `route`
+	// label (method + raw path, bounded per-app at 50 distinct
+	// entries with __route_other__ as the non-evicting overflow
+	// bucket) and the bounded in-memory reader at
+	// GET /v1/internal/apps/{slug}/routes returns the per-route
+	// detail. apid applies Plan.RouteMetricsEnabled() at CreateApp
+	// time and gates PATCH writes through Plan.RouteMetricsResponseAllowed().
+	// Default-false in fakeBackend unit tests; tests that want to
+	// exercise the per-route path set this to true alongside an
+	// app.Plan != PlanFree.
+	RouteMetricsEnabled bool
 	// NodeID is the durable shard key the owning schedd
 	// resolves at startup (Phase 2 / Gate A). Populated by
 	// pgRouter.toApp / the AppResolver closure from apps.node_id;
@@ -427,6 +459,33 @@ type Handler struct {
 	// initialise it explicitly. Value semantics avoid the
 	// data-race that lazy init would create under -race.
 	piApps preInstantiateApps
+	// routeSets (ADR-093) is the per-app routeLabelSet map keyed
+	// by appID. Lazily created on the first request for an opt-in
+	// app (App.RouteMetricsEnabled=true AND the operator kill-
+	// switch is enabled) so the cold path is allocation-free for
+	// apps that don't opt in. The map is never deleted — the
+	// underlying routeLabelSet is non-evicting (the daemon
+	// restart is the only path that resets it, same contract as
+	// accountLabelSet / hostnameLabelSet). sync.Map because the
+	// hot path is the "already created" lookup. nil until
+	// SetRouteMetricsEnabled is called from the App→routeSet
+	// resolution path.
+	routeSets sync.Map // appID(string) → *routeLabelSet
+	// routeSetsPi (ADR-093) deduplicates Metrics.PreInstantiateAppRoute
+	// calls keyed by (appID, routeLabel). The closed `class` set is
+	// written once per app per route; the dedupe map is never
+	// deleted (the underlying routeLabelSet is non-evicting). Same
+	// shape as preInstantiateApps, separate sync.Map so the per-app
+	// and per-route keys don't collide.
+	routeSetsPi sync.Map // appID+"\x00"+routeLabel(string) → struct{}
+	// routeMetricsEnabled (ADR-093) is the operator kill-switch
+	// mirroring the per-app opt-in. When false, every per-app
+	// routeSetFor lookup returns nil regardless of
+	// app.RouteMetricsEnabled — the customer's flag is inert.
+	// Wired from cmd/gatewayd-internal/config.go's `[route_metrics]
+	// enabled` field via WithRouteMetricsEnabled. Default false
+	// so existing deployments are unaffected.
+	routeMetricsEnabled bool
 	// requireAuthnAuthn is the bearer-key verifier the
 	// per-deployment authz branch uses (issue #560). nil =
 	// authz branch disabled (default; matches the pre-issue
@@ -636,6 +695,19 @@ func (h *Handler) WithRawForwarding(fn func(t Target) http.Handler) *Handler {
 // matching WithEgressSink / WithLimiter / etc).
 func (h *Handler) WithStreamingEnabled(enabled bool) *Handler {
 	h.streamingEnabled = enabled
+	return h
+}
+
+// WithRouteMetricsEnabled (ADR-093) arms the operator kill-switch
+// for the per-route observability surface. When false, every
+// per-app routeSetFor lookup returns nil regardless of
+// app.RouteMetricsEnabled — the customer's flag is inert. The
+// setter is fluent for chaining (same shape as the rest of the
+// Handler.With* family). Wired from
+// cmd/gatewayd-internal/config.go's `[route_metrics] enabled`
+// field via the runtime config init.
+func (h *Handler) WithRouteMetricsEnabled(enabled bool) *Handler {
+	h.routeMetricsEnabled = enabled
 	return h
 }
 
@@ -912,6 +984,10 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("route", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op, not an
+			// apply failure. Surface as success so the §12 apply-rate
+			// panel counts it as a successful (no-op) apply.
+			h.metrics.ObserveEdgeRuleApply("route", "success")
 		}
 		return false
 	}
@@ -926,6 +1002,9 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("route", "match")
+		// PR-B: route substitution is the apply-path outcome. Every
+		// successful match is a successful apply (substitute ran).
+		h.metrics.ObserveEdgeRuleApply("route", "success")
 	}
 	*app = target
 	return true
@@ -968,6 +1047,8 @@ func (h *Handler) matchAndApplyRewrite(r *http.Request, app App) bool {
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("rewrite", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("rewrite", "success")
 		}
 		return false
 	}
@@ -1018,6 +1099,8 @@ func (h *Handler) matchAndApplyRewrite(r *http.Request, app App) bool {
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("rewrite", "match")
+		// PR-B: the rewrite was applied (path mutated in place).
+		h.metrics.ObserveEdgeRuleApply("rewrite", "success")
 	}
 	return true
 }
@@ -1058,6 +1141,8 @@ func (h *Handler) matchAndApplyRedirect(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("redirect", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("redirect", "success")
 		}
 		return false
 	}
@@ -1082,6 +1167,11 @@ func (h *Handler) matchAndApplyRedirect(w http.ResponseWriter, r *http.Request, 
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("redirect", "match")
+		// PR-B: redirect is an apply-path outcome (3xx written,
+		// request short-circuits). http.Redirect always writes a
+		// 3xx, so this counts as success even though the response
+		// isn't 2xx.
+		h.metrics.ObserveEdgeRuleApply("redirect", "success")
 	}
 	//nolint:gosec // rule.To is validated by apid Validate (pkg/api/dto.go:3337-3357) at create time: must be a non-empty URL/path. The customer's free-form redirect target IS the product surface — same posture as Cloudflare's "URL redirect" rules.
 	http.Redirect(w, r, rule.To, status)
@@ -1123,6 +1213,8 @@ func (h *Handler) applyEdgeRuleHeaders(w http.ResponseWriter, r *http.Request, a
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("headers", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("headers", "success")
 		}
 		return false
 	}
@@ -1146,6 +1238,8 @@ func (h *Handler) applyEdgeRuleHeaders(w http.ResponseWriter, r *http.Request, a
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("headers", "match")
+		// PR-B: headers were applied (request + response ops installed).
+		h.metrics.ObserveEdgeRuleApply("headers", "success")
 	}
 	return true
 }
@@ -1194,6 +1288,8 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("cors", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("cors", "success")
 		}
 		return false
 	}
@@ -1228,6 +1324,12 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("cors", "match")
+			// PR-B: preflight 204 short-circuit is a successful apply
+			// (the gate fired and wrote its response). CORS preflight
+			// intentionally short-circuits the JWT/IP gates that
+			// follow — see handler.go:2315-2320 doc-comment + ADR-091
+			// Amendment 1 + FaasEdgeRuleJWTFailures.md.
+			h.metrics.ObserveEdgeRuleApply("cors", "success")
 		}
 		return true
 	}
@@ -1240,6 +1342,10 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("cors", "match")
+		// PR-B: non-preflight CORS stamps response-side Allow-Origin
+		// via statusRecorder; the request falls through to the JWT /
+		// IP gates. Counts as a successful apply.
+		h.metrics.ObserveEdgeRuleApply("cors", "success")
 	}
 	return false
 }
@@ -1371,6 +1477,19 @@ func (h *Handler) jwtEmit(ctx context.Context, kind, outcome, ruleID, fromHost s
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch(kind, outcome)
+		// ADR-091 hardening PR-B: also fire the apply-path counter
+		// here so the §12 "edge rule apply rate" panel surfaces the
+		// JWT gate's outcome. Mapping per the plan: match → success,
+		// failed/missing → error (401 written), blocked → success
+		// (cross-account fall-through, not an apply failure).
+		switch outcome {
+		case "match":
+			h.metrics.ObserveEdgeRuleApply(kind, "success")
+		case "failed", "missing":
+			h.metrics.ObserveEdgeRuleApply(kind, "error")
+		case "blocked":
+			h.metrics.ObserveEdgeRuleApply(kind, "success")
+		}
 	}
 }
 
@@ -1436,6 +1555,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+			// PR-B: cross-account is a defense-in-depth no-op.
+			h.metrics.ObserveEdgeRuleApply("ip", "success")
 		}
 		return false
 	}
@@ -1458,6 +1579,9 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+			// PR-B: caller_ip_forged writes a 403; surface as apply
+			// error so the §12 panel flags the forged-XFF attack.
+			h.metrics.ObserveEdgeRuleApply("ip", "error")
 		}
 		return true
 	}
@@ -1475,6 +1599,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 			}
 			if h.metrics != nil {
 				h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+				// PR-B: deny CIDR match wrote a 403.
+				h.metrics.ObserveEdgeRuleApply("ip", "error")
 			}
 			return true
 		}
@@ -1500,6 +1626,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 			}
 			if h.metrics != nil {
 				h.metrics.ObserveEdgeRuleMatch("ip", "blocked")
+				// PR-B: implicit deny wrote a 403.
+				h.metrics.ObserveEdgeRuleApply("ip", "error")
 			}
 			return true
 		}
@@ -1512,6 +1640,8 @@ func (h *Handler) applyEdgeRuleIP(w http.ResponseWriter, r *http.Request, app Ap
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("ip", "match")
+		// PR-B: IP allow match — request falls through (no 403).
+		h.metrics.ObserveEdgeRuleApply("ip", "success")
 	}
 	return false
 }
@@ -1566,6 +1696,12 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+			// PR-C: cross-account blocked is a defense-in-depth
+			// no-op — emit apply success so the §12 dashboard
+			// chip doesn't falsely flag the cross-account rule
+			// as a wire error. Mirrors applyEdgeRuleIP
+			// (handler.go:1487).
+			h.metrics.ObserveEdgeRuleApply("validate", "success")
 		}
 		return false
 	}
@@ -1594,6 +1730,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+			// PR-C: 415 Unsupported Media Type is a non-2xx wire
+			// write — emit apply error so the §12 chip surfaces
+			// the rejected pre-flight on the customer side.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1629,6 +1769,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "failed")
+			// PR-C: body-read failure (413 / 400) is a non-2xx
+			// wire write — emit apply error so the §12 chip
+			// surfaces the rejected request.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1670,6 +1814,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "failed")
+			// PR-C: validator error (502 / 500) is a non-2xx
+			// wire write — emit apply error so the §12 chip
+			// surfaces the broken rule.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1703,6 +1851,10 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 		}
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("validate", "blocked")
+			// PR-C: 422 schema mismatch is a non-2xx wire
+			// write — emit apply error so the §12 chip
+			// surfaces the customer's malformed payload.
+			h.metrics.ObserveEdgeRuleApply("validate", "error")
 		}
 		return true
 	}
@@ -1714,6 +1866,240 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 	}
 	if h.metrics != nil {
 		h.metrics.ObserveEdgeRuleMatch("validate", "match")
+		// PR-C: validate happy path — request falls through
+		// to the proxy leg. Emit apply success so the §12
+		// chip tracks customer traffic that was body-validated.
+		// Mirrors applyEdgeRuleIP (handler.go:1572).
+		h.metrics.ObserveEdgeRuleApply("validate", "success")
+	}
+	return false
+}
+
+// streamingFor is the canonical 4-conjunct gate that decides
+// whether a request is on the streaming opt-in path. Used at
+// the §4.1.2.13 slot (applyEdgeRuleLimit call site) to pick
+// between a rule's buffered and streaming caps. The proxy leg
+// at handler.go:3193 has its own inline copy of the same formula
+// because the streaming response-writer wrap is a separate
+// concern from edge-rule application; a future refactor can lift
+// both to this helper. Keep them in lockstep if the conjuncts
+// ever grow — TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts
+// pins the §4.1.2.13 slot's view of the formula.
+//
+// The four conjuncts, in order:
+//
+//   - h.streamingEnabled: the process-wide opt-in flag, set via
+//     WithStreamingEnabled on the Handler (cmd/gatewayd-internal).
+//   - app.StreamingEnabled: the per-app opt-in flag, persisted in
+//     apps.streaming_enabled and surfaced through the per-host
+//     app cache. Without this, no per-app stream-bridge path is
+//     wired in the picker, so a "streaming" cap would never
+//     actually be reached.
+//   - !isAcceptJSON(Accept): the streaming bridge is reserved
+//     for long-lived event/stream responses. A request asking
+//     for a JSON response is buffered even if the app is opted
+//     in — the cap is the buffered cap in that case.
+//   - !isUpgradeRequest(r): WebSocket / HTTP/2 upgrade requests
+//     are long-lived but their body is read by the proxy leg's
+//     hijacker, not buffered. Treat them as buffered for the
+//     cap-selection purpose (the cap is the buffered cap).
+func streamingFor(h *Handler, r *http.Request, app App) bool {
+	return h.streamingEnabled && app.StreamingEnabled &&
+		!isAcceptJSON(r.Header.Get("Accept")) &&
+		!isUpgradeRequest(r)
+}
+
+// applyEdgeRuleLimit (ADR-091 D24 / new ADR-0NN-edge-rule-limit)
+// consults the per-host edge-rule matcher for a `kind=limit` rule.
+// On a hit, r.Body is wrapped in http.MaxBytesReader at the
+// per-rule cap so downstream reads (the proxy leg, the validate
+// applier at §4.1.2.8b) cannot exceed it — the per-rule cap is
+// always at most api.MaxRequestBodyBytes (cmd-side compileLimitRules
+// clamps higher values), so this is a strict tightening of the
+// global reader layered inside ServeHTTP.
+//
+// The load-bearing property is the **Content-Length fast path**:
+// when the inbound request advertises a body larger than the cap
+// via Content-Length, the applier writes 413 + RFC 7807
+// request_too_large immediately, without reading a single body
+// byte. A bare http.MaxBytesReader only trips when something
+// reads the body, and at this hot-path slot nothing reads the
+// body until the proxy leg — so without the fast path, a 30 MB
+// POST against a 5 MB rule would buffer 30 MB into memory before
+// tripping the cap. The fast path makes "never buffer an oversize
+// request" a guarantee, not a hope.
+//
+// Returns true (caller MUST return) on:
+//
+//   - 413 request_too_large from the Content-Length fast path.
+//   - 413 request_too_large from the MaxBytesReader trip on a
+//     chunked (no Content-Length) oversize body — this case is
+//     only reachable on a streaming opt-in path that didn't
+//     trigger the fast path; the reader still catches it.
+//
+// Returns false on:
+//
+//   - nil rule (audit "miss", no cap installed).
+//   - same-account mismatch (defense-in-depth — audit "blocked"
+//   - apply "success" so the §12 chip doesn't falsely flag the
+//     cross-account rule as a wire error; mirrors
+//     applyEdgeRuleValidate at handler.go:1688–1706).
+//   - clean match (audit "matched" + observe "match" + apply
+//     "success", MaxBytesReader installed at the per-rule cap).
+//
+// Streaming posture (ADR-091 D24 §6): the rule carries an
+// optional `max_body_bytes_streaming` field (≤ 100 MiB per
+// pkg/api/limits.go:1652 RawStreamMaxRequestBytes, enforced by
+// the apid-Validate path and by cmd-side compileLimitRules). At
+// runtime, the call site computes `streamingFor(h, r, app)`
+// (above) once and passes the result in as the `streaming`
+// parameter; the cap-selection algorithm is:
+//
+//	cap = rule.MaxBodyBytes             // default "buffered"
+//	capKind = "buffered"
+//	if streaming && rule.MaxBodyBytesStreaming > 0 {
+//	    cap = rule.MaxBodyBytesStreaming // opt-in streaming cap
+//	    capKind = "streaming"
+//	}
+//
+// Both paths run the same Content-Length fast path and the same
+// MaxBytesReader install — only the cap value and the
+// (audit/413-visible) cap_kind label differ. The DTO's
+// `s ≥ b` invariant (pkg/api/dto.go::EdgeRuleLimitAction.Validate)
+// is trusted at runtime: apid-Validate enforces it on the
+// customer write path; a direct-DB row that violates it
+// (seedEdgeRuleDirect) passes cmd-side compile (which clamps
+// `s` to [0, 100 MiB] but not `s ≥ b`) and falls back to the
+// buffered cap at runtime via the `MaxBodyBytesStreaming == 0`
+// branch — safe degradation. See ADR-091 D24 §6 amendment and
+// spec §4.1.2.13 for the rationale.
+func (h *Handler) applyEdgeRuleLimit(w http.ResponseWriter, r *http.Request, streaming bool, app App) bool {
+	if h.edgeRules == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchLimit(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("limit", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.limit_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("limit", "blocked")
+			// Cross-account blocked is a defense-in-depth no-op —
+			// emit apply success so the §12 dashboard chip doesn't
+			// falsely flag the cross-account rule as a wire error.
+			// Mirrors applyEdgeRuleValidate (handler.go:1704) and
+			// applyEdgeRuleIP (handler.go:1487).
+			h.metrics.ObserveEdgeRuleApply("limit", "success")
+		}
+		return false
+	}
+	// Cap selection (ADR-091 D24 §6):
+	//
+	//   - streaming && rule.MaxBodyBytesStreaming > 0 → streaming cap
+	//   - else → buffered cap (the existing path)
+	//
+	// Per-cap-kind defence-in-depth clamp: cmd-side compileLimitRules
+	// already clamps at the per-kind ceiling, but a rule inserted
+	// by a direct DB write that bypassed apid-Validate
+	// (cmd/e2e/edge_rules_common_test.go:128 seedEdgeRuleDirect)
+	// could carry an out-of-range value. The buffered clamp
+	// mirrors the validate applier's clamp at handler.go:1746-1748.
+	// The streaming clamp is per-kind (not the buffered ceiling)
+	// because the streaming field's ceiling
+	// (api.RawStreamMaxRequestBytes = 100 MiB) is strictly larger
+	// than the buffered one (api.MaxRequestBodyBytes = 25 MiB) —
+	// a single clamp to the buffered ceiling would silently
+	// regress streaming allowances. capKind is threaded into
+	// both the 413 detail suffix and the audit payload so a
+	// customer debugging a 413 can bisect which cap fired.
+	cap := rule.MaxBodyBytes
+	capKind := "buffered"
+	if streaming && rule.MaxBodyBytesStreaming > 0 {
+		cap = rule.MaxBodyBytesStreaming
+		capKind = "streaming"
+	}
+	if capKind == "buffered" {
+		if cap <= 0 || cap > api.MaxRequestBodyBytes {
+			cap = api.MaxRequestBodyBytes
+		}
+	} else {
+		if cap <= 0 || int64(cap) > api.RawStreamMaxRequestBytes {
+			cap = int(api.RawStreamMaxRequestBytes)
+		}
+	}
+	// Content-Length fast path: deny before reading a single
+	// body byte. r.ContentLength == 0 is treated as "unknown
+	// (chunked or no body)" — fall through to the MaxBytesReader,
+	// which will trip on the proxy leg's first read. r.ContentLength
+	// == -1 is the http.NoBody sentinel — same fall-through.
+	// A lying-low client (advertises small CL, sends large body)
+	// cannot bypass: the MaxBytesReader below still trips on
+	// the proxy leg's first read. The fast path can only ever
+	// produce a false-positive 413, never a bypass — see
+	// ADR-091 D24 §4 for the rationale. The detail suffix
+	// "(buffered cap)" / "(streaming cap)" names the cap that
+	// fired so a customer can see whether they tripped the
+	// streaming opt-in or the buffered default.
+	if r.ContentLength > 0 && r.ContentLength > int64(cap) {
+		api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge,
+			api.CodeRequestTooLarge, "Request body too large",
+			fmt.Sprintf("rule %s caps body at %d bytes (%s cap)", rule.ID, cap, capKind)))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.limit_rejected", nil, map[string]any{
+				"rule_id":        rule.ID,
+				"from_host":      r.Host,
+				"content_length": r.ContentLength,
+				"cap_bytes":      cap,
+				"cap_kind":       capKind,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("limit", "blocked")
+			// 413 is a non-2xx wire write — emit apply error so
+			// the §12 chip surfaces the rejected pre-flight to
+			// the customer. Mirrors applyEdgeRuleValidate's 422
+			// path (handler.go:1736).
+			h.metrics.ObserveEdgeRuleApply("limit", "error")
+		}
+		return true
+	}
+	// In-limit body — install MaxBytesReader at the per-rule cap.
+	// This wraps r.Body so any subsequent read (the validate
+	// applier at handler.go:1750, the proxy leg further down)
+	// trips on the same cap if the body actually exceeds it.
+	// The global reader at handler.go:2789 layers outside this
+	// as the backstop for requests that don't match any limit
+	// rule; nesting two MaxBytesReaders is safe — both clamp
+	// to the smaller of their caps + the body, and the inner
+	// reader (this one) only ever tightens.
+	r.Body = http.MaxBytesReader(w, r.Body, int64(cap))
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.limit_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+			"cap_bytes": cap,
+			"cap_kind":  capKind,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("limit", "match")
+		// Limit happy path — request falls through to the proxy
+		// leg (and to the validate applier if a validate rule
+		// also matches). Emit apply success so the §12 chip
+		// tracks customer traffic that was body-cap-matched.
+		// Mirrors applyEdgeRuleIP / applyEdgeRuleValidate.
+		h.metrics.ObserveEdgeRuleApply("limit", "success")
 	}
 	return false
 }
@@ -2542,6 +2928,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	app = lookedApp
 haveApp:
+	// ADR-093: derive the per-request route label and stash it
+	// on the request context so Handler.observe can read it on
+	// the single exit funnel. The label is method + raw path
+	// (pre-rewrite, ADR-093 D6) — the route identity is the
+	// customer-facing endpoint, so a kind=rewrite edge rule that
+	// rewrites /v1/foo → /v2/foo reports the inbound route, not
+	// the rewritten one. The routeLabelSet bounds the per-app
+	// distinct-route count to 50 + the __route_other__ overflow
+	// bucket. The label is empty when the app is not opted in
+	// (routeSetFor returns nil) — Handler.observe short-circuits
+	// the per-route emission on "".
+	routeLabel := ""
+	if set := h.routeSetFor(app.ID, app.RouteMetricsEnabled && h.routeMetricsEnabled); set != nil {
+		preLabel := r.Method + " " + r.URL.Path
+		routeLabel = set.admit(preLabel)
+		r = withRouteLabel(r, routeLabel)
+		// Pre-instantiate the closed `class` set under
+		// (app.ID, routeLabel) on the per-route histogram the
+		// first time the route is admitted. The admit() map is
+		// non-evicting, so we guard with a second sync.Map key
+		// (routeSetsPi) keyed by (app.ID, routeLabel) so the
+		// pre-instantiation runs exactly once per app per route.
+		// The dedupe keeps the hot path allocation-free after
+		// first sight.
+		h.preInstantiateAppRoute(app.ID, routeLabel)
+	}
 
 	// Issue #561 / ADR-089 PR 4 — apply the per-host
 	// kind=redirect / kind=rewrite / kind=headers edge rules
@@ -2586,6 +2998,25 @@ haveApp:
 		return
 	}
 	if h.applyEdgeRuleIP(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+
+	// ADR-091 D24 / kind=limit body cap gate. Runs AFTER JWT / IP
+	// (so rejected-on-ip / failed-jwt traffic never costs a body
+	// read) and BEFORE the global MaxBytesReader installed at
+	// handler.go:2944 (so the per-rule cap is the OUTER reader on
+	// the in-limit path; the global reader then layers INSIDE as
+	// the backstop for requests that don't match any limit rule).
+	// The Content-Length fast path inside applyEdgeRuleLimit
+	// delivers the "never buffer an oversize body" property —
+	// the global reader alone would buffer 30 MB into memory
+	// before tripping on a 5 MB rule. Placing the global reader
+	// AFTER applyEdgeRuleLimit keeps the fast path observable
+	// (the rule's 413 fires before the global reader wraps
+	// r.Body). Same posture as validate: short-circuit on deny,
+	// caller MUST `return`.
+	if h.applyEdgeRuleLimit(w, r, streamingFor(h, r, app), app) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
@@ -3007,7 +3438,7 @@ haveApp:
 				"app", app.ID, "node", target.NodeID, "instance", target.InstanceID)
 			firstByteAt = time.Now()
 		}
-		h.metrics.ObserveColdBoot(app.ID, firstByteAt.Sub(wakeStart))
+		h.metrics.ObserveColdBoot(app.ID, firstByteAt.Sub(wakeStart), target.NodeID)
 		// Wake-locality classifier (PR scale-out readiness). Increment
 		// AFTER the existing first-byte observation so the 350 ms
 		// measurement path is unchanged. Only fires on a real admit
@@ -3035,9 +3466,22 @@ haveApp:
 // skew the §12 dashboard. On a 2xx response it also Touches the LastSeenSink
 // keyed by InstanceID (issue #168 — per-instance attribution survives the
 // multi-instance fan-out where multiple instances share a single node).
+//
+// ADR-093: routeLabel is the per-request route label computed
+// at the post-Lookup derivation site (handler.go's `haveApp:`
+// block) and stashed on the request context via withRouteLabel.
+// Empty when the app is not opted in. observe() reads the
+// context here so the call sites stay agnostic of the
+// routeLabelSet; the empty-string sentinels mirror the
+// `gateway_requests_total{app="-"}` pattern.
 func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold bool, target Target) {
 	code := statusClass(status)
 	requestID := requestIDFrom(r)
+	// Read the stashed route label BEFORE the sentinel-coercion
+	// below — the route label is independent of appID and stays
+	// empty when the app is not opted in OR the request didn't
+	// resolve to an app.
+	routeLabel := RouteLabelFrom(r)
 	// Measure elapsed against the same start stamp set at the top of
 	// ServeHTTP (issue #273 / ADR-042 fixed the WithStartTime dead-code
 	// bug so this is now request-received → handler-return, not
@@ -3056,6 +3500,20 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 		// to keep cardinality bounded — full status codes would explode
 		// per-app series count past 60× the class-based set.
 		h.metrics.ObserveRequestDuration(appID, statusClassBucket(status), elapsed)
+		// ADR-093: per-route emission. Gated on a non-empty
+		// routeLabel (the routeLabelSet always returns a non-empty
+		// label for an opted-in app — the empty string is the
+		// reserved "no appID" sentinel and would create a
+		// route="__empty__" series that nobody reads). The plan
+		// for non-opt-in apps is the per-app counters above
+		// (preserved per ADR-042 §1 deviation).
+		if routeLabel != "" {
+			h.metrics.ObserveRequestRoute(appID, plan, routeLabel, code)
+			h.metrics.ObserveRequestDurationRoute(appID, routeLabel, statusClassBucket(status), elapsed)
+			if status >= 400 {
+				h.metrics.RequestFailureRoute(appID, plan, routeLabel, code)
+			}
+		}
 	}
 	// Issue #300: feed the per-tenant rolling count for the
 	// 5s gateway_top_tenant_rps sampler (cmd/gatewayd-internal/topn.go).
@@ -3139,6 +3597,31 @@ type preInstantiateApps struct{ m sync.Map }
 func (p *preInstantiateApps) seen(appID string) bool {
 	_, loaded := p.m.LoadOrStore(appID, struct{}{})
 	return loaded
+}
+
+// routeSetFor returns the per-app *routeLabelSet for appID,
+// creating a fresh one on the first sight of an opt-in app. The
+// lookup is O(1) (sync.Map.Load). Returns nil when the app is not
+// opted in (enabled=false) — the caller short-circuits the
+// per-route emission on nil. The map is never deleted; the
+// underlying routeLabelSet is non-evicting (ADR-093 D2).
+//
+// Concurrency: sync.Map handles the parallel first-sight race
+// correctly. Two goroutines hitting the same opt-in app for the
+// first time may each create a fresh *routeLabelSet; only one
+// wins the LoadOrStore. The loser's *routeLabelSet is dereferenced
+// by the GC and the in-flight admit() calls it observers are
+// bounded by the cap, so the loser-drop is safe.
+func (h *Handler) routeSetFor(appID string, enabled bool) *routeLabelSet {
+	if !enabled || appID == "" {
+		return nil
+	}
+	if v, ok := h.routeSets.Load(appID); ok {
+		return v.(*routeLabelSet)
+	}
+	fresh := newRouteLabelSet()
+	actual, _ := h.routeSets.LoadOrStore(appID, fresh)
+	return actual.(*routeLabelSet)
 }
 
 // recordEgress attributes response body bytes to the (instanceID,
@@ -3283,6 +3766,69 @@ func (h *Handler) preInstantiateApp(appID string) {
 		return
 	}
 	h.metrics.PreInstantiateApp(appID)
+}
+
+// RouteSetForTest is the test-only seam that exposes the
+// lazy-create behaviour of routeSetFor. Production must use
+// the gated-with-RouteMetricsEnabled call site at the
+// post-Lookup block (handler.go:2333). Exists so a unit test
+// can seed a known state without standing up the full Backend +
+// Edge-Rule matcher; tests should call RoutesFor on the
+// returned set and AdmitForTest on the underlying *routeLabelSet.
+func (h *Handler) RouteSetForTest(appID string) *routeLabelSet {
+	return h.routeSetFor(appID, true)
+}
+
+// RoutesFor (ADR-093) returns a copy of the admitted route labels
+// for appID, in deterministic order (insertion order via sorted
+// keys). The caller is the /v1/internal/apps/{slug}/routes
+// control-listener handler; the snapshot is read-only and
+// allocation-bounded: at most routeLabelSetCap + reservedCount
+// entries per call. Returns nil when the app is not opted in
+// (Handler.routeSetFor returns nil for disabled apps) — the
+// control handler renders an empty Routes array on nil so the
+// dashboard can distinguish "feature off" from "no traffic yet".
+//
+// Concurrency: routeLabelSet.mu guards the snapshot read; the
+// returned slice is a copy so the caller can iterate without
+// holding the lock. Returning the underlying map directly would
+// race with admit() on the hot path.
+func (h *Handler) RoutesFor(appID string) []string {
+	if h == nil {
+		return nil
+	}
+	v, ok := h.routeSets.Load(appID)
+	if !ok {
+		return nil
+	}
+	s := v.(*routeLabelSet)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.admitted))
+	for k := range s.admitted {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// preInstantiateAppRoute (ADR-093) records (appID, route) once
+// and delegates to Metrics.PreInstantiateAppRoute. The dedupe is
+// keyed by (appID, routeLabel) so the closed `class` set under
+// the per-route histogram is written exactly once per app per
+// route. Mirrors the preInstantiateApp shape above; the per-
+// route dedupe uses a separate sync.Map so an app's per-app
+// pre-instantiation and its per-route pre-instantiations do not
+// race on the same key.
+func (h *Handler) preInstantiateAppRoute(appID, routeLabel string) {
+	if h == nil || h.metrics == nil || appID == "" || routeLabel == "" {
+		return
+	}
+	key := appID + "\x00" + routeLabel
+	if _, loaded := h.routeSetsPi.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	h.metrics.PreInstantiateAppRoute(appID, routeLabel)
 }
 
 // statusRecorder is a thin ResponseWriter wrapper that records the HTTP status

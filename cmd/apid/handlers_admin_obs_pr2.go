@@ -73,6 +73,13 @@ const obsRateLimitLiveLagSeconds = 30
 const (
 	obsRateLimitSourceDurable = "durable"
 	obsRateLimitSourceLive    = "live"
+
+	// PR #4 (ADR-092 §3.4 amendment) — obsAnomalies ?group_by=
+	// closed set. Promoted to consts so goconst stays green and
+	// the operator UI can match against the canonical strings
+	// without risking a typo drift.
+	obsAnomalyGroupByApp  = "app"
+	obsAnomalyGroupByNode = "node"
 )
 
 // obsAnomalies handles GET /v1/admin/obs/anomalies (ADR-091 §3.6).
@@ -82,11 +89,17 @@ const (
 //	?window_hours=<n>   default 24, cap 168 (ObsAdminWindowMaxHours)
 //	?limit=<n>          default 50 (ObsAdminAnomalyLimitDefault),
 //	                    cap 200 (ObsAdminAnomalyLimitMax)
+//	?group_by=app|node  default "app" (PR #2 behavior); "node" enables
+//	                    the per-node grain (PR #4 / ADR-092 §3.4).
+//	                    Unknown values 400 — closed set per the
+//	                    §14 acceptance test contract.
 //
 // Response is a single ObsAnomalyListResponse object — items are
 // pre-sorted server-side by z_score DESC so the operator UI can
 // render the table without re-sorting. Items is always non-nil so
-// the JSON shape is stable on empty windows.
+// the JSON shape is stable on empty windows. GroupBy echoes the
+// caller's choice (default "app") so the operator UI can confirm
+// the grain it asked for.
 func (s *server) obsAnomalies(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if allowed, prob := s.adminAllows(acct); !allowed {
 		api.WriteProblem(w, prob)
@@ -104,26 +117,66 @@ func (s *server) obsAnomalies(w http.ResponseWriter, r *http.Request, acct state
 		api.WriteProblem(w, prob)
 		return
 	}
-	since := time.Now().UTC().Add(-window)
-	baselineCutoff := since.AddDate(0, 0, -obsAnomalyBaselineDays)
-	rows, err := s.store.TrafficAnomalyAggregate(r.Context(),
-		sqlc.TrafficAnomalyAggregateParams{
-			Minute:   pgtype.Timestamptz{Time: since, Valid: true},
-			Minute_2: pgtype.Timestamptz{Time: baselineCutoff, Valid: true},
-			Column3:  int64(limit),
-		})
-	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("could not query anomalies"))
+	groupBy := r.URL.Query().Get("group_by")
+	if groupBy == "" {
+		groupBy = obsAnomalyGroupByApp
+	}
+	if groupBy != obsAnomalyGroupByApp && groupBy != obsAnomalyGroupByNode {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid group_by", "group_by must be 'app' or 'node'"))
 		return
 	}
-	items := make([]api.ObsAnomalyRow, 0, len(rows))
-	for _, row := range rows {
-		items = append(items, toObsAnomalyRow(row))
+	since := time.Now().UTC().Add(-window)
+	baselineCutoff := since.AddDate(0, 0, -obsAnomalyBaselineDays)
+	items := make([]api.ObsAnomalyRow, 0)
+	switch groupBy {
+	case obsAnomalyGroupByApp:
+		rows, err := s.store.TrafficAnomalyAggregate(r.Context(),
+			sqlc.TrafficAnomalyAggregateParams{
+				Minute:   pgtype.Timestamptz{Time: since, Valid: true},
+				Minute_2: pgtype.Timestamptz{Time: baselineCutoff, Valid: true},
+				Column3:  int64(limit),
+			})
+		if err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not query anomalies"))
+			return
+		}
+		for _, row := range rows {
+			items = append(items, toObsAnomalyRow(row))
+		}
+	case obsAnomalyGroupByNode:
+		rows, err := s.store.TrafficAnomalyAggregateByNode(r.Context(),
+			sqlc.TrafficAnomalyAggregateByNodeParams{
+				Minute:   pgtype.Timestamptz{Time: since, Valid: true},
+				Minute_2: pgtype.Timestamptz{Time: baselineCutoff, Valid: true},
+				Column3:  int64(limit),
+			})
+		if err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not query per-node anomalies"))
+			return
+		}
+		// Resolve node_id → node_name. The list is bounded (tens
+		// of nodes in the multi-host story); include_inactive
+		// so an operator can still see historical rows on a
+		// drained node.
+		allNodes, err := s.store.ListComputeNodes(r.Context(), true)
+		if err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not list compute nodes for node-name resolution"))
+			return
+		}
+		idToName := make(map[string]string, len(allNodes))
+		for _, n := range allNodes {
+			idToName[n.ID] = n.Name
+		}
+		for _, row := range rows {
+			items = append(items, toObsAnomalyRowByNode(row, idToName))
+		}
 	}
 	writeJSON(w, http.StatusOK, api.ObsAnomalyListResponse{
 		GeneratedAt:        time.Now().UTC(),
 		WindowHours:        int(window / time.Hour),
 		BaselineWindowDays: obsAnomalyBaselineDays,
+		GroupBy:            groupBy,
 		Items:              items,
 	})
 }
@@ -229,6 +282,35 @@ func toObsAnomalyRow(row sqlc.TrafficAnomalyAggregateRow) api.ObsAnomalyRow {
 	return api.ObsAnomalyRow{
 		AccountID:       uuidString(row.AccountID),
 		AppID:           uuidString(row.AppID),
+		Minute:          row.Minute.Time.UTC().Format(time.RFC3339),
+		Current:         row.CurrentMbSeconds,
+		BaselineMean:    row.MeanMbSeconds,
+		BaselineStddev:  row.StddevMbSeconds,
+		BaselineSamples: int(row.SampleCount),
+		ZScore:          z,
+		Reason:          row.Reason,
+	}
+}
+
+// toObsAnomalyRowByNode is the per-node variant of
+// toObsAnomalyRow (PR #4 / ADR-092 §3.4 amendment). Populates
+// NodeID/NodeName on the wire shape so the operator UI can group
+// by hosting node instead of just by app. The handler resolves
+// node_id → node_name via the idToName map it builds from
+// ListComputeNodes before calling this projection.
+func toObsAnomalyRowByNode(row sqlc.TrafficAnomalyAggregateByNodeRow, idToName map[string]string) api.ObsAnomalyRow {
+	var z *float64
+	if row.ZScore != nil {
+		if f, ok := row.ZScore.(*float64); ok && f != nil {
+			z = f
+		}
+	}
+	nodeID := uuidString(row.NodeID)
+	return api.ObsAnomalyRow{
+		AccountID:       uuidString(row.AccountID),
+		AppID:           uuidString(row.AppID),
+		NodeID:          nodeID,
+		NodeName:        idToName[nodeID],
 		Minute:          row.Minute.Time.UTC().Format(time.RFC3339),
 		Current:         row.CurrentMbSeconds,
 		BaselineMean:    row.MeanMbSeconds,

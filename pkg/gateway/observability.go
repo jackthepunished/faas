@@ -116,3 +116,53 @@ func startTime(r *http.Request) time.Time {
 	}
 	return time.Now()
 }
+
+// routeLabelKey (ADR-093) is the context key used to thread the
+// per-request route label from the post-Lookup derivation site
+// (handler.go's `haveApp:` label) to Handler.observe's single exit
+// funnel. The label is the result of routeLabelSet.admit() —
+// i.e. method + raw path bounded by the per-app cap, with
+// __route_other__ as the overflow bucket. Empty string = the
+// reserved "no appID" sentinel (the same value the
+// gateway_requests_total{app="-"} series uses).
+//
+// The stash is module-private-but-package-internal: only the
+// Handler observes the request lifecycle, so the key is not
+// exported. The lookup is O(1) (Go's context.Value walks a small
+// slice of typed keys, no map allocation) so the hot path stays
+// allocation-free.
+type routeLabelKey struct{}
+
+// WithRouteLabel stores label on ctx. label="" is a no-op so
+// callers can short-circuit the "feature off" case without a
+// string allocation.
+func WithRouteLabel(ctx context.Context, label string) context.Context {
+	if label == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, routeLabelKey{}, label)
+}
+
+// withRouteLabel is the *http.Request convenience wrapper. Mirrors
+// the withSidecarPort pattern above.
+func withRouteLabel(r *http.Request, label string) *http.Request {
+	if r == nil || label == "" {
+		return r
+	}
+	return r.WithContext(WithRouteLabel(r.Context(), label))
+}
+
+// RouteLabelFrom returns the per-request route label from r's
+// context, or "" if none. Handler.observe reads this on every
+// HTTP exit path; the lookup is O(1) and the empty-string
+// fallback is the same sentinel the gateway_requests_total{app="-"}
+// reader uses.
+func RouteLabelFrom(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if v, ok := r.Context().Value(routeLabelKey{}).(string); ok {
+		return v
+	}
+	return ""
+}

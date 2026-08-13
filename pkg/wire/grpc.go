@@ -29,6 +29,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -519,6 +520,185 @@ func LoadClientTLSConfigWithVerifier(certPath, keyPath, caPath string, v NodeVer
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// ReloadFunc is the closure-shaped "rebuild me" contract for the
+// SIGHUP-driven TLS rotation slice (ADR-052 §5 / PR-E). A daemon
+// hands WatchTLSReload a ReloadFunc that re-reads its cert material
+// from disk and returns a freshly-built *tls.Config on each call.
+//
+// The contract:
+//   - The closure MUST be safe for concurrent invocation (gRPC's
+//     tlsCreds may invoke the stdlib callback that ends up calling
+//     this concurrently with a SIGHUP-driven reload).
+//   - The closure MUST return a fresh *tls.Config every call. Do
+//     not return the cached one — stdlib reads the certificate
+//     material off the returned config at handshake time, so a
+//     cached config carries the cert that was current when the
+//     closure was first built.
+//   - On error (file missing, malformed, mode drift), the closure
+//     returns (nil, err). WatchTLSReload keeps the prior config
+//     live; the daemon does NOT refuse to keep running.
+//
+// A nil ReloadFunc degrades to the no-callback contract: the
+// returned *tls.Config is built once and never re-read.
+type ReloadFunc func() (*tls.Config, error)
+
+// LoadServerTLSConfigWithReload is the SIGHUP-reload-aware variant
+// of LoadServerTLSConfig (ADR-052 §5). It installs
+// tls.Config.GetConfigForClient so gRPC's tlsCreds hands the
+// caller a fresh *tls.Config on every server-side handshake. The
+// reload closure is consulted per-handshake by stdlib (and therefore
+// by gRPC's tlsCreds which wraps stdlib).
+//
+// (The stdlib field is named GetConfigForClient — confusingly,
+// that's the callback a SERVER registers to return its
+// per-handshake config. There is no GetConfigForServer.)
+//
+// reload==nil degrades to LoadServerTLSConfig (no callback
+// installed) — single-box dev paths and pre-PR-E wiring keep
+// working unchanged. All-paths-empty input still returns the
+// (nil, nil) contract so callers can branch on "no TLS configured".
+//
+// Use this when the daemon reads its leaf + CA from disk on a
+// known path and an operator-driven `kill -HUP $(pidof ...)`
+// should pick up rotated material without a restart.
+func LoadServerTLSConfigWithReload(prefix, certPath, keyPath, caPath string, reload ReloadFunc) (*tls.Config, error) {
+	cfg, err := loadServerTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	setServerReloadCallback(cfg, reload)
+	return cfg, nil
+}
+
+// LoadServerTLSConfigWithPrefixAndVerifierAndReload combines the
+// role-distinguished error naming of LoadServerTLSConfigWithPrefix,
+// the handshake-layer NodeVerifier hook of LoadServerTLSConfigWithVerifier
+// (ADR-056), and the SIGHUP-driven reload callback of
+// LoadServerTLSConfigWithReload (ADR-052 §5 / PR-E). All three are
+// composed on the single returned config: stdlib chain/SAN/EKU runs
+// first, then the verifier hook, then the per-handshake reload callback.
+//
+// Both v and reload may be nil — the contract matches the existing
+// factories (nil verifier → no hook; nil reload → no callback). The
+// (nil, nil) return for all-paths-empty input is preserved.
+func LoadServerTLSConfigWithPrefixAndVerifierAndReload(prefix, certPath, keyPath, caPath string, v NodeVerifier, reload ReloadFunc) (*tls.Config, error) {
+	cfg, err := loadServerTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
+	}
+	setServerReloadCallback(cfg, reload)
+	return cfg, nil
+}
+
+// LoadClientTLSConfigWithReload is the client-side mirror of
+// LoadServerTLSConfigWithReload. It installs
+// tls.Config.GetClientCertificate so stdlib returns a fresh leaf
+// on every TLS handshake where the server requests client auth.
+// The trust root (RootCAs pool) is set at config-build time and
+// NOT re-read on every handshake — stdlib does not expose a
+// "full per-handshake client config" callback (the closest,
+// tls.Config.GetConfigForClient, is the SERVER callback). A CA
+// rotation therefore requires a daemon restart; this matches the
+// ADR-052 §Risks "CA rotation pain" contract.
+//
+// reload==nil degrades to LoadClientTLSConfig (no callback).
+// All-paths-empty input still returns (nil, nil).
+func LoadClientTLSConfigWithReload(prefix, certPath, keyPath, caPath string, reload ReloadFunc) (*tls.Config, error) {
+	cfg, err := loadClientTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	setClientReloadCallback(cfg, reload)
+	return cfg, nil
+}
+
+// LoadClientTLSConfigWithPrefixAndVerifierAndReload is the
+// client-side mirror of
+// LoadServerTLSConfigWithPrefixAndVerifierAndReload. Composes
+// prefix-distinguished error naming + ADR-056 verifier hook +
+// ADR-052 §5 reload callback. Both v and reload may be nil.
+func LoadClientTLSConfigWithPrefixAndVerifierAndReload(prefix, certPath, keyPath, caPath string, v NodeVerifier, reload ReloadFunc) (*tls.Config, error) {
+	cfg, err := loadClientTLSConfig(certPath, keyPath, caPath, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if err := setVerifyHook(cfg, v); err != nil {
+		return nil, err
+	}
+	setClientReloadCallback(cfg, reload)
+	return cfg, nil
+}
+
+// setServerReloadCallback installs ONLY the server-side per-handshake
+// reload hook: tls.Config.GetConfigForClient. The client-side hook
+// (GetClientCertificate) is intentionally left untouched — stdlib
+// never consults it for a server config, so leaving the field nil
+// pins the role and removes a dead-code path that the previous
+// single-helper version installed for both factories.
+//
+// A nil cfg or nil reload is a no-op: no callback installed, the
+// returned config behaves like the original factory output. Matches
+// the nil-tolerance pattern set by setVerifyHook.
+//
+// Helper-private so the only canonical installation point is the
+// Load*ServerTLSConfigWithReload factory family — a side-channel
+// SetReload(cfg, reload) helper would let callers splice the
+// callback onto a *tls.Config built elsewhere and bypass the factory
+// verification (mode checks, prefix error naming).
+func setServerReloadCallback(cfg *tls.Config, reload ReloadFunc) {
+	if cfg == nil || reload == nil {
+		return
+	}
+	// Server callback: stdlib calls this on every server-side
+	// handshake after parsing the ClientHello. Returning the
+	// closure's freshly-loaded *tls.Config hands the caller the
+	// rotated leaf + ClientCAs pool on every handshake.
+	cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		return reload()
+	}
+}
+
+// setClientReloadCallback installs ONLY the client-side per-handshake
+// reload hook: tls.Config.GetClientCertificate. The server-side hook
+// (GetConfigForClient) is intentionally left untouched — stdlib
+// never consults it for a client config, so leaving the field nil
+// pins the role and removes a dead-code path that the previous
+// single-helper version installed for both factories.
+//
+// A nil cfg or nil reload is a no-op: no callback installed, the
+// returned config behaves like the original factory output. Matches
+// the nil-tolerance pattern set by setVerifyHook.
+//
+// Helper-private so the only canonical installation point is the
+// Load*ClientTLSConfigWithReload factory family. Mirrors
+// setServerReloadCallback's role-distinguished split (PR review
+// finding on pkg/wire/grpc.go setReloadCallbacks — installing the
+// wrong-role callback is dead code on each branch).
+func setClientReloadCallback(cfg *tls.Config, reload ReloadFunc) {
+	if cfg == nil || reload == nil {
+		return
+	}
+	// Client callback: stdlib calls this on every client-side
+	// handshake where the server requests a certificate. Only
+	// the leaf rotates per-handshake; RootCAs stays fixed.
+	// The returned *tls.Config is rebuilt on every call so a
+	// future stdlib change that exposes the full client config
+	// picks up the rotation automatically.
+	cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		reloaded, err := reload()
+		if err != nil {
+			return nil, err
+		}
+		if len(reloaded.Certificates) == 0 {
+			return nil, errors.New("wire: reload returned *tls.Config with no Certificates")
+		}
+		return &reloaded.Certificates[0], nil
+	}
 }
 
 // setVerifyHook installs the hook returned by VerifyCNClosure on cfg

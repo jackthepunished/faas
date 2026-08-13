@@ -707,6 +707,18 @@ const (
 	// AND at PATCH time (no override path).
 	CodePlanWebSocketNotAllowed = "plan_websocket_not_allowed"
 
+	// ADR-093: customer attempted PATCH-true on Free for
+	// apps.route_metrics_enabled. Same gate shape as
+	// CodePlanWebSocketNotAllowed above; distinct code so the
+	// CLI can render "per-route metrics is a paid feature"
+	// alongside the streaming + warm-snapshot copy without
+	// conflating them in telemetry. The Free plan is the
+	// abuse-floor tier where per-route cardinality would not
+	// have a budget alongside the per-app rollups, so the gate
+	// is fail-closed at create time AND at PATCH time (no
+	// override path).
+	CodePlanRouteMetricsNotAllowed = "plan_route_metrics_not_allowed"
+
 	// Issue #470 / ADR-055: out-of-range warm-snapshot threshold
 	// values from a PATCH (warm_snapshot_min_requests outside [1,
 	// 100] or warm_snapshot_min_ms outside [100, 60000]). 422 with

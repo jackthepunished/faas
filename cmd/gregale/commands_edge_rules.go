@@ -30,11 +30,20 @@ import (
 )
 
 // edgeRuleKindVocab mirrors the closed `kind` set in
-// migrations/00192_edge_rules.sql's CHECK constraint. Surfacing a
+// migrations/00192_edge_rules.sql's CHECK constraint (extended by
+// migrations/00207 for validate and 00219 for limit). Surfacing a
 // typo locally avoids a 400 round-trip on every `edge-rules create`
 // call (same posture as webhookClosedVocab in commands_webhooks.go).
+// The validate entry is a drive-by fix for PR-B's omission — the
+// gateway hot path has shipped kind=validate since #841 merged,
+// but the CLI rejected `--kind=validate` client-side; regen'd here
+// alongside kind=limit so the existing kinds table stays a single
+// source of truth. The kind=geo entry is gated on PR #845's
+// migration landing; it will land in a follow-up commit when the
+// CHECK widens to 10 values.
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
+	"validate", "limit",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
@@ -96,7 +105,7 @@ func cmdEdgeRules(args []string) int {
 func cmdEdgeRulesList(args []string) int {
 	fs := flag.NewFlagSet("edge-rules list", flag.ContinueOnError)
 	slug := fs.String("app", "", "filter to a single app slug")
-	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip)")
+	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip|validate|limit)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -154,7 +163,7 @@ func cmdEdgeRulesList(args []string) int {
 func cmdEdgeRulesCreate(args []string) int {
 	fs := flag.NewFlagSet("edge-rules create", flag.ContinueOnError)
 	slug := fs.String("app", "", "app slug (required)")
-	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip (required)")
+	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip|validate|limit (required)")
 	matchHost := fs.String("match-host", "", "host to match (required)")
 	matchPath := fs.String("match-path", "/", "path to match")
 	var matchMethods multiFlag
@@ -210,6 +219,17 @@ func cmdEdgeRulesCreate(args []string) int {
 	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR (repeat)")
 	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR (repeat)")
 
+	// limit (ADR-091 D24). Standalone per-route body cap — the
+	// primitive for "POST /upload ≤ 5 MB" without a JSON Schema.
+	// Both flags are required-as-a-pair at the action-struct
+	// level: --limit-max-body-bytes must be > 0 (otherwise
+	// apid-Validate returns 422). --limit-max-body-bytes-streaming
+	// is optional (0 = no streaming carve-out, falls back to the
+	// buffered cap). Clamps are enforced server-side by
+	// pkg/api.EdgeRuleLimitAction.Validate().
+	limitMaxBodyBytes := fs.Int("limit-max-body-bytes", 0, "kind=limit: required buffered body cap in bytes (>0, <=25MiB)")
+	limitMaxBodyBytesStreaming := fs.Int("limit-max-body-bytes-streaming", 0, "kind=limit: optional streaming body cap in bytes (0=inherit buffered; <=100MiB)")
+
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -221,31 +241,33 @@ func cmdEdgeRulesCreate(args []string) int {
 		return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
 	}
 	actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
-		RouteTarget:     *routeTarget,
-		RewriteFrom:     *rewriteFrom,
-		RewriteTo:       *rewriteTo,
-		RedirectStatus:  *redirectStatus,
-		RedirectTo:      *redirectTo,
-		RedirectHeaders: redirectHeaders,
-		HeadersReqAdd:   headersReqAdd,
-		HeadersReqSet:   headersReqSet,
-		HeadersReqRm:    headersReqRm,
-		HeadersResAdd:   headersResAdd,
-		HeadersResSet:   headersResSet,
-		HeadersResRm:    headersResRm,
-		CORSOrigins:     corsOrigins,
-		CORSMethods:     corsMethods,
-		CORSHeaders:     corsHeaders,
-		CORSExpose:      corsExpose,
-		CORSCreds:       *corsCreds,
-		CORSMaxAge:      *corsMaxAge,
-		JWTIssuer:       *jwtIssuer,
-		JWTJWKS:         *jwtJWKS,
-		JWTAudience:     jwtAudience,
-		JWTAlgorithms:   jwtAlgorithms,
-		JWTClaims:       jwtClaims,
-		IPAllow:         ipAllow,
-		IPDeny:          ipDeny,
+		RouteTarget:                *routeTarget,
+		RewriteFrom:                *rewriteFrom,
+		RewriteTo:                  *rewriteTo,
+		RedirectStatus:             *redirectStatus,
+		RedirectTo:                 *redirectTo,
+		RedirectHeaders:            redirectHeaders,
+		HeadersReqAdd:              headersReqAdd,
+		HeadersReqSet:              headersReqSet,
+		HeadersReqRm:               headersReqRm,
+		HeadersResAdd:              headersResAdd,
+		HeadersResSet:              headersResSet,
+		HeadersResRm:               headersResRm,
+		CORSOrigins:                corsOrigins,
+		CORSMethods:                corsMethods,
+		CORSHeaders:                corsHeaders,
+		CORSExpose:                 corsExpose,
+		CORSCreds:                  *corsCreds,
+		CORSMaxAge:                 *corsMaxAge,
+		JWTIssuer:                  *jwtIssuer,
+		JWTJWKS:                    *jwtJWKS,
+		JWTAudience:                jwtAudience,
+		JWTAlgorithms:              jwtAlgorithms,
+		JWTClaims:                  jwtClaims,
+		IPAllow:                    ipAllow,
+		IPDeny:                     ipDeny,
+		LimitMaxBodyBytes:          *limitMaxBodyBytes,
+		LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
 	})
 	if err != nil {
 		return printErr("Invalid flags for --kind="+*kind, err)
@@ -362,6 +384,12 @@ func cmdEdgeRulesUpdate(args []string) int {
 	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR")
 	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR")
 
+	// limit (ADR-091 D24). Same flags as Create; either flag
+	// present flips anyKindFlagVisited() true so the action jsonb
+	// gets re-marshaled and shipped in the PATCH body.
+	limitMaxBodyBytes := fs.Int("limit-max-body-bytes", 0, "kind=limit: buffered body cap in bytes")
+	limitMaxBodyBytesStreaming := fs.Int("limit-max-body-bytes-streaming", 0, "kind=limit: streaming body cap in bytes (0=inherit buffered)")
+
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -418,31 +446,33 @@ func cmdEdgeRulesUpdate(args []string) int {
 			return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
 		}
 		actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
-			RouteTarget:     *routeTarget,
-			RewriteFrom:     *rewriteFrom,
-			RewriteTo:       *rewriteTo,
-			RedirectStatus:  *redirectStatus,
-			RedirectTo:      *redirectTo,
-			RedirectHeaders: redirectHeaders,
-			HeadersReqAdd:   headersReqAdd,
-			HeadersReqSet:   headersReqSet,
-			HeadersReqRm:    headersReqRm,
-			HeadersResAdd:   headersResAdd,
-			HeadersResSet:   headersResSet,
-			HeadersResRm:    headersResRm,
-			CORSOrigins:     corsOrigins,
-			CORSMethods:     corsMethods,
-			CORSHeaders:     corsHeaders,
-			CORSExpose:      corsExpose,
-			CORSCreds:       *corsCreds,
-			CORSMaxAge:      *corsMaxAge,
-			JWTIssuer:       *jwtIssuer,
-			JWTJWKS:         *jwtJWKS,
-			JWTAudience:     jwtAudience,
-			JWTAlgorithms:   jwtAlgorithms,
-			JWTClaims:       jwtClaims,
-			IPAllow:         ipAllow,
-			IPDeny:          ipDeny,
+			RouteTarget:                *routeTarget,
+			RewriteFrom:                *rewriteFrom,
+			RewriteTo:                  *rewriteTo,
+			RedirectStatus:             *redirectStatus,
+			RedirectTo:                 *redirectTo,
+			RedirectHeaders:            redirectHeaders,
+			HeadersReqAdd:              headersReqAdd,
+			HeadersReqSet:              headersReqSet,
+			HeadersReqRm:               headersReqRm,
+			HeadersResAdd:              headersResAdd,
+			HeadersResSet:              headersResSet,
+			HeadersResRm:               headersResRm,
+			CORSOrigins:                corsOrigins,
+			CORSMethods:                corsMethods,
+			CORSHeaders:                corsHeaders,
+			CORSExpose:                 corsExpose,
+			CORSCreds:                  *corsCreds,
+			CORSMaxAge:                 *corsMaxAge,
+			JWTIssuer:                  *jwtIssuer,
+			JWTJWKS:                    *jwtJWKS,
+			JWTAudience:                jwtAudience,
+			JWTAlgorithms:              jwtAlgorithms,
+			JWTClaims:                  jwtClaims,
+			IPAllow:                    ipAllow,
+			IPDeny:                     ipDeny,
+			LimitMaxBodyBytes:          *limitMaxBodyBytes,
+			LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
 		})
 		if err != nil {
 			return printErr("Invalid flags for --kind="+*kind, err)
@@ -530,6 +560,14 @@ type edgeRuleActionInputs struct {
 	JWTClaims                  []string
 	// ip
 	IPAllow, IPDeny []string
+	// limit (ADR-091 D24). Both fields are int — pointer types
+	// would force a "was-it-passed" triple-state distinction
+	// that's already handled by anyKindFlagVisited(). A literal
+	// 0 from a missed flag is harmless because kind=limit without
+	// a buffered cap is rejected by apid-Validate (422), so the
+	// server-side guard catches the omission cleanly.
+	LimitMaxBodyBytes          int
+	LimitMaxBodyBytesStreaming int
 }
 
 // buildEdgeRuleAction marshals the per-kind inputs into the matching
@@ -622,6 +660,21 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			}
 		}
 		a := api.EdgeRuleIPAction{Allow: in.IPAllow, Deny: in.IPDeny}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "limit":
+		// Standalone per-route body cap. The Validate() call runs
+		// the same closed-set predicates as the apid-side action
+		// (0 → 422, negative streaming → 422, streaming-tighter-
+		// than-buffered → 422, over-cap → 422) so a CLI user gets
+		// the same error message they'd get over the wire. No
+		// regex/CIDR parse here; the only check is the cap range.
+		a := api.EdgeRuleLimitAction{
+			MaxBodyBytes:          in.LimitMaxBodyBytes,
+			MaxBodyBytesStreaming: in.LimitMaxBodyBytesStreaming,
+		}
 		if err := a.Validate(); err != nil {
 			return nil, errToError(err)
 		}
@@ -750,6 +803,7 @@ func anyKindFlagVisited(visited map[string]bool) bool {
 		"cors-allow-credentials", "cors-max-age-seconds",
 		"jwt-issuer", "jwt-jwks-url", "jwt-audience", "jwt-algorithm", "jwt-required-claim",
 		"ip-allow", "ip-deny",
+		"limit-max-body-bytes", "limit-max-body-bytes-streaming",
 	}
 	for _, name := range kindFlagNames {
 		if visited[name] {

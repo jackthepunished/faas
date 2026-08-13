@@ -1391,6 +1391,40 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/routes:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppRoutes
+      summary: Per-route breakdown for opt-in apps (ADR-093).
+      description: |
+        Returns the `routes` array of the per-app metrics surface
+        directly. Reverse-proxies the gatewayd-internal loopback
+        control listener at `GET /v1/internal/apps/{slug}/routes`.
+        The array is empty when `route_metrics_enabled` is false
+        on the app (the gatewayd handler returns 200 + empty
+        rows rather than 404 — the customer-facing "feature off"
+        state is not a 404). The route label is method + raw
+        path (pre-rewrite, ADR-093 D6); the `__route_other__`
+        bucket surfaces the wildcard-path signal.
+      responses:
+        '200':
+          description: The per-route rows for the app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppRoutesResponse'
+              example:
+                slug: my-api
+                app_id: 11111111-1111-1111-1111-111111111111
+                routes: ["GET /users", "POST /orders", "__route_other__"]
+                source: live
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/slo:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -7043,6 +7077,14 @@ components:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."
           type: boolean
           example: false
+        # ADR-093: per-route observability opt-in. Default-on for
+        # Hobby/Pro/Scale; Free customers always see this as false.
+        # PATCH-true on Free is rejected with 403
+        # plan_route_metrics_not_allowed.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). When true, gatewayd-internal emits gateway_request_duration_seconds{app,route,class} and serves the bounded reader at GET /v1/apps/{slug}/routes. Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
+          type: boolean
+          example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
         # Nullable: legacy rows project as `null` (the empty
         # policy falls back to the legacy min_instances /
@@ -7211,6 +7253,14 @@ components:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → apid applies the plan default; PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."
           type: boolean
           example: false
+        # ADR-093: optional at create-time. Omitted → apid applies
+        # the plan default (Free = false; Hobby/Pro/Scale = true).
+        # PATCH-true on Free is rejected with 403
+        # plan_route_metrics_not_allowed.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). Omitted → apid applies the plan default (Free = false; Hobby/Pro/Scale = true). PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
+          type: boolean
+          example: false
         # Issue #470 / ADR-055: optional at create-time. Omitted
         # → apid applies the plan default (Pro/Scale = true;
         # Free/Hobby = false — the only legal state on those
@@ -7325,6 +7375,14 @@ components:
         # pattern mirrors streaming_enabled above.
         websocket_enabled:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → no change. Free PATCHing true is 403 plan_websocket_not_allowed."
+          type: [boolean, "null"]
+          example: false
+        # ADR-093: partial-update nullable boolean. Omitted → no
+        # change. Plan gate runs first (403
+        # plan_route_metrics_not_allowed) so a Free PATCHing true
+        # surfaces the gate.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). Omitted → no change. Free PATCHing true is 403 plan_route_metrics_not_allowed."
           type: [boolean, "null"]
           example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
@@ -9049,7 +9107,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9061,6 +9119,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9078,7 +9137,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9090,6 +9149,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9113,6 +9173,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -9290,6 +9351,63 @@ components:
             Per-rule inbound body cap. 0 (default) inherits the
             platform cap (`api.MaxRequestBodyBytes`). When set, must
             be > 0 and <= the platform cap.
+
+    EdgeRuleLimitAction:
+      description: |
+        Standalone per-route body-size cap (ADR-091 D24 / §4.1.2.13).
+        The primitive for "POST /upload ≤ 5 MB, POST /users ≤ 1 MB,
+        POST /webhooks ≤ 2 MB" without shipping a JSON Schema. The
+        hot-path applier (§4.1.2.8c) installs `http.MaxBytesReader`
+        on the inbound body and short-circuits oversize requests
+        with 413 `request_too_large` — and, more importantly,
+        performs a Content-Length fast-path deny so a 30 MB body on
+        a 5 MB cap costs zero bytes of buffering (a `MaxBytesReader`
+        alone only trips when something reads the body, and on this
+        hot path nothing reads it until the proxy leg).
+
+        Rejections never reach the wake gate, the auth chain, or the
+        rate limiter — same posture as kind=validate. Free-and-above
+        (no plan gate).
+
+        Field-by-field:
+          * `max_body_bytes` — required buffered-path cap. Must be
+            > 0 and ≤ `MaxRequestBodyBytes` (25 MiB). A standalone
+            limit rule with no cap is a silent no-op and is
+            rejected at create-time with 422 — use `kind=validate`
+            if you need a body cap alongside a JSON Schema.
+          * `max_body_bytes_streaming` — optional streaming opt-in
+            cap (≤ `MaxEdgeRuleLimitBodyBytesStreaming` = 100 MiB).
+            0 (default) = no streaming carve-out; the buffered
+            `max_body_bytes` is the cap on both paths. When set,
+            must be ≥ `max_body_bytes` — a streaming cap tighter
+            than the buffered cap would 413 every streaming request
+            for a body already accepted as buffered. Runtime
+            enforcement of this field is declared + clamped at
+            create-time but deferred at the §4.1.2.8c slot to a
+            follow-up PR (stated in ADR-091 D24 §6).
+      type: object
+      required: [max_body_bytes]
+      properties:
+        max_body_bytes:
+          type: integer
+          minimum: 1
+          maximum: 26214400  # 25 MiB = MaxRequestBodyBytes
+          description: |
+            Required per-rule buffered-path body cap. Must be > 0
+            and ≤ `api.MaxRequestBodyBytes` (25 MiB). A standalone
+            limit rule with no cap is rejected at create-time with
+            422 — use `kind=validate` if you need a body cap
+            alongside a JSON Schema.
+        max_body_bytes_streaming:
+          type: integer
+          minimum: 1
+          maximum: 104857600  # 100 MiB = RawStreamMaxRequestBytes
+          description: |
+            Optional streaming opt-in cap. 0 (default) = no
+            streaming carve-out; the buffered `max_body_bytes` is
+            the cap on both paths. Must be ≥ `max_body_bytes` when
+            set. Runtime enforcement deferred to follow-up PR
+            (ADR-091 D24 §6).
 
     # ─── API keys ─────────────────────────────────────────────────────────
 
@@ -9969,6 +10087,96 @@ components:
           description: "Per-app egress byte delta over the window (informational; not billed). ADR-046. Source: schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until then this field stays 0)."
           x-since: "2026-08"
           x-issue: "415"
+        routes:
+          type: array
+          description: |
+            Per-route breakdown for opt-in apps (ADR-093). Absent when
+            `route_metrics_enabled` is false on the app — the dashboard
+            distinguishes "feature off" (field absent) from "feature
+            on, no traffic" (empty array). Each row is the bounded
+            detail from the gatewayd-internal in-memory reader: max
+            50 distinct routes + the `__route_other__` wildcard-path
+            overflow bucket. The route label is method + raw path
+            (pre-rewrite, ADR-093 D6).
+          items:
+            $ref: '#/components/schemas/RouteRow'
+          x-since: "2026-08"
+          x-issue: "273"
+
+    RouteRow:
+      description: |
+        Per-route detail row (ADR-093). The `route` field is the
+        bounded label: `"GET /users/4f8a"` for an admitted route, or
+        `"__route_other__"` for the overflow bucket. Latency fields
+        are milliseconds over the full request duration (status-
+        agnostic — failures included). Same zero-on-degraded
+        contract as `AppMetricsResponse`.
+      type: object
+      required:
+        - route
+        - count
+        - p50_ms
+        - p95_ms
+        - p99_ms
+        - error_pct
+      properties:
+        route:
+          type: string
+          description: "Bounded route label (method + raw path, or `__route_other__`)."
+          x-since: "2026-08"
+          x-issue: "273"
+        count:
+          type: integer
+          format: int64
+          description: "Number of requests with this route in the window."
+          x-since: "2026-08"
+          x-issue: "273"
+        p50_ms:
+          type: number
+          description: "p50 of `gateway_request_duration_seconds_bucket{app, route, class}` over the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        p95_ms:
+          type: number
+          description: "p95 over all classes in the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        p99_ms:
+          type: number
+          description: "p99 over all classes in the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        error_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: "Share of [45]xx requests with this route in the window."
+          x-since: "2026-08"
+          x-issue: "273"
+
+    AppRoutesResponse:
+      description: |
+        Per-route label snapshot (ADR-093). The bounded route label
+        set the gatewayd-internal control listener emits for the app.
+        Each item is `"<METHOD> <PATH>"` (pre-edge-rule-rewrite) for
+        an admitted route, or the reserved `"__route_other__"` overflow
+        bucket label. Bounded at 50 distinct real routes + the reserved
+        overflow per app (ADR-093 D2).
+      type: object
+      required: [slug, routes, source]
+      properties:
+        slug: {type: string, x-since: "2026-08", x-issue: "273"}
+        app_id: {type: string, x-since: "2026-08", x-issue: "273"}
+        routes:
+          type: array
+          items: {type: string}
+          x-since: "2026-08"
+          x-issue: "273"
+        source:
+          type: string
+          enum: ["live", "unavailable"]
+          x-since: "2026-08"
+          x-issue: "273"
 
     ListInstancesResponse:
       description: |

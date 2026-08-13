@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { AppMetricsResponse } from '../models/AppMetricsResponse.js';
 import type { AppResponse } from '../models/AppResponse.js';
+import type { AppRoutesResponse } from '../models/AppRoutesResponse.js';
 import type { AppSLOResponse } from '../models/AppSLOResponse.js';
 import type { AppsMetricsResponse } from '../models/AppsMetricsResponse.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
@@ -207,6 +208,46 @@ export class AppsService {
       },
       query: {
         'range': range,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-route breakdown for opt-in apps (ADR-093).
+   * Returns the `routes` array of the per-app metrics surface
+   * directly. Reverse-proxies the gatewayd-internal loopback
+   * control listener at `GET /v1/internal/apps/{slug}/routes`.
+   * The array is empty when `route_metrics_enabled` is false
+   * on the app (the gatewayd handler returns 200 + empty
+   * rows rather than 404 — the customer-facing "feature off"
+   * state is not a 404). The route label is method + raw
+   * path (pre-rewrite, ADR-093 D6); the `__route_other__`
+   * bucket surfaces the wildcard-path signal.
+   *
+   * @returns AppRoutesResponse The per-route rows for the app.
+   * @throws ApiError
+   */
+  public static getAppRoutes({
+    slug,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+  }): CancelablePromise<AppRoutesResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/routes',
+      path: {
+        'slug': slug,
       },
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,

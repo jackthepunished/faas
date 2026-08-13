@@ -120,6 +120,12 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage) *api.Problem {
 			return api.ErrValidation(fmt.Sprintf("validate action: %v", err))
 		}
 		return a.Validate()
+	case state.EdgeRuleKindLimit:
+		var a api.EdgeRuleLimitAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("limit action: %v", err))
+		}
+		return a.Validate()
 	}
 	return api.ErrValidation("edge rule action validation fell through — internal bug")
 }
@@ -381,6 +387,20 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 				ApplyWhileStreaming: a.ApplyWhileStreaming,
 				RejectOnUnknown:     a.RejectOnUnknownFields,
 				MaxBodyBytes:        a.MaxBodyBytes,
+			}
+		}
+	case state.EdgeRuleKindLimit:
+		var a api.EdgeRuleLimitAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Mirror the validate path's pattern: structural decode
+			// only, no schema here. The gateway re-compiles the
+			// cap (cmd-side compileLimitRules, cmd/gatewayd-internal/
+			// edge_rules.go) and clamps out-of-range values as
+			// defence-in-depth against a direct-DB row that
+			// bypassed apid-Validate.
+			out.Limit = &state.EdgeRuleLimitAction{
+				MaxBodyBytes:          a.MaxBodyBytes,
+				MaxBodyBytesStreaming: a.MaxBodyBytesStreaming,
 			}
 		}
 	}

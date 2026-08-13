@@ -1,0 +1,96 @@
+name: "faas deploy"
+description: "Deploy a faas/Gregale app from a GitHub Actions workflow using a pinned gregale CLI"
+author: "Gregale"
+
+# Composite Action, monorepo shape (ADR-093). The vendored binary
+# lives at bin/gregale and is replaced by the release.yml workflow
+# on every v*.*.* tag. The action runs against the existing
+# POST /v1/apps/{slug}/deployments/source-ref endpoint — no new
+# server surface.
+#
+# Pinned-major @v1 is the recommended shape; the bundled CLI
+# version is exposed as the `cli-version` output so customers can
+# lint for drift. Optional `--pinned-sha` input on the snippet
+# generator emits a `# pin: <sha>` comment line for customers who
+# want hard reproducibility.
+
+inputs:
+  api-key:
+    description: "faas API bearer token (use ${{ secrets.GREGALE_API_KEY }} for the deploy scope)"
+    required: true
+  api-base:
+    description: "faas API base URL (override per environment; default is the public example host)"
+    required: false
+    default: "https://api.faas.example"
+  app:
+    description: "App slug to deploy"
+    required: true
+  repo:
+    description: "OWNER/NAME of the source GitHub repo (default: ${{ github.repository }})"
+    required: false
+    default: "${{ github.repository }}"
+  ref:
+    description: "git ref — branch, tag, or 40-char SHA (default: ${{ github.sha }})"
+    required: false
+    default: "${{ github.sha }}"
+  format:
+    description: "Source format passed to the source-ref endpoint"
+    required: false
+    default: "tarball"
+  wait:
+    description: "If true, block until the deployment is ready (or fails)"
+    required: false
+    default: "true"
+  wait-timeout:
+    description: "Maximum seconds to wait for the deployment to settle (only used when wait=true)"
+    required: false
+    default: "600"
+
+outputs:
+  deployment-id:
+    description: "The new deployment id (32-char hex)"
+  app-slug:
+    description: "Echo of the input app slug"
+  status:
+    description: "Final deployment status: ready | failed | cancelled | timeout"
+  url:
+    description: "URL of the new deployment record on the control-plane API (https://{api-base}/v1/apps/{slug}/deployments/{id})"
+  cli-version:
+    description: "Bundled gregale CLI version (verifies the vendored binary)"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs
+      shell: bash
+      # ACTION_PATH is hoisted into env rather than interpolated
+      # directly into the run: string. CodeQL's js/injection rule
+      # flags any ${{ ... }} in run: even when the expression is
+      # GitHub-controlled (like github.action_path), because the
+      # expansion happens before shell evaluation. Routing through
+      # env: keeps the run string literal and resolves ACTION_PATH
+      # as a shell variable at run time. The src/run.sh script
+      # already honours ACTION_PATH via its own fallback at the
+      # top of the file (cmd/.../src/run.sh:25).
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: "$ACTION_PATH/src/run.sh validate"
+    - name: Deploy
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        FAAS_API: ${{ inputs.api-base }}
+        FAAS_TOKEN: ${{ inputs.api-key }}
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_REF: ${{ inputs.ref }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_WAIT: ${{ inputs.wait }}
+        INPUT_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+      run: "$ACTION_PATH/src/run.sh deploy"
+    - name: Annotate on failure
+      if: failure()
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: "$ACTION_PATH/src/annotate.sh"

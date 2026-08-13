@@ -303,6 +303,18 @@ func (c *Config) LoadServerTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, er
 	return wire.LoadServerTLSConfigWithVerifier(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath, v)
 }
 
+// LoadServerTLSWithPrefixAndVerifierAndReload is the ADR-052 §5
+// / PR-E variant: per-handshake verifier + SIGHUP-driven cert
+// rotation. nil v and nil reload are tolerated and degrade to
+// LoadServerTLS (no hook, no callback) — same shape as the
+// LoadServerTLSWithVerifier back-compat path. The reload closure
+// is consulted by stdlib on every server-side handshake via
+// tls.Config.GetConfigForClient (the canonical stdlib server
+// callback — confusingly named; see pkg/wire/grpc.go:639-647).
+func (c *Config) LoadServerTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	return wire.LoadServerTLSConfigWithPrefixAndVerifierAndReload("", c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath, v, reload)
+}
+
 // LoadVMMTLS returns the client mTLS config schedd uses to dial vmmd.
 // Empty cluster returns (nil, nil) — single-box default. Partial
 // cluster is rejected with the vmmd_tls_* field names (not the
@@ -316,6 +328,18 @@ func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 // Mirrors the prefix semantics (vmmd_ for error naming).
 func (c *Config) LoadVMMTLSWithVerifier(v wire.NodeVerifier) (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefixAndVerifier("vmmd_", c.VMMTLSCertPath, c.VMMTLSKeyPath, c.VMMTLSCAPath, v)
+}
+
+// LoadVMMTLSWithPrefixAndVerifierAndReload is the ADR-052 §5
+// / PR-E variant of LoadVMMTLSWithVerifier. Same back-compat
+// contract as LoadServerTLSWithPrefixAndVerifierAndReload:
+// nil v / nil reload tolerate the single-box / pre-rotation
+// paths. The reload closure re-issues the client leaf on every
+// handshake via tls.Config.GetClientCertificate; the trust root
+// is fixed at config-build time per ADR-052 §Risks "CA rotation
+// pain" (stdlib has no per-handshake client RootCAs callback).
+func (c *Config) LoadVMMTLSWithPrefixAndVerifierAndReload(v wire.NodeVerifier, reload wire.ReloadFunc) (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefixAndVerifierAndReload("vmmd_", c.VMMTLSCertPath, c.VMMTLSKeyPath, c.VMMTLSCAPath, v, reload)
 }
 
 // LoadConfig reads a TOML file at path with defaults filled in. A missing file
