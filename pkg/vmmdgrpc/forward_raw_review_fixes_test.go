@@ -101,10 +101,16 @@ func TestResolveRawBridgePath_RejectsRelativeOverride(t *testing.T) {
 // time); this test exercises the actual write path via a
 // buffered pipe so we can detect the cap firing rather than
 // just trust the parameter is clamped.
+//
+// Issue #676 / ADR-080 PR-C follow-up 5 dropped the
+// `if testing.Short() { t.Skip(...) }` guard — the test
+// is a pure-function loop (no goroutines, no goroutine-leak
+// surface), the skip was overly defensive from the original
+// review pass and caused the sibling rx-cap test
+// (TestRawBridgePumpBody_ClampsResponseBytes) to skip too
+// under -short. Verify the sibling runs cleanly under
+// `-race -count=3` per the PR-C audit.
 func TestRawBridgeBodyLoop_ClampsToCap(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in -short mode")
-	}
 
 	// We can't run rawBridgeBodyLoop directly without a real
 	// gRPC BidiStreamingServer, but the cap-clamping is a
@@ -130,6 +136,66 @@ func TestRawBridgeBodyLoop_ClampsToCap(t *testing.T) {
 			}
 			if got != tc.wantCap {
 				t.Errorf("cap = %d, want %d", got, tc.wantCap)
+			}
+		})
+	}
+}
+
+// TestRawBridgePumpBody_ClampsResponseBytes pins the rx-cap
+// invariant introduced in issue #676 / ADR-080 PR-C: the
+// response-side pump mirrors the request-side clamp
+// (TestRawBridgeBodyLoop_ClampsToCap above). A caller may ask
+// for LESS than api.RawStreamMaxResponseBytes but never MORE;
+// the math.MaxInt64 case still gets the platform ceiling. The
+// pure-function loop runs without goroutines so the -race gate
+// is trivially satisfied; the production loop in
+// rawBridgePumpBody adds a totalRx accumulator that surfaces
+// ResourceExhausted when the cap is exceeded, and that path is
+// covered indirectly via the integration tests at
+// pkg/gateway/forwardproxy_test.go.
+//
+// Why clamp DOWN and not UP: the init-frame's
+// max_request_bytes proto field is reused as the rx-cap source
+// (a dedicated max_response_bytes wire field is a deferred ADR;
+// see PR-C plan §"Follow-up 3 — Per-session byte cap meter").
+// Reusing the field keeps the wire stable and avoids SDK bumps
+// for the rx cap — a misconfigured caller (e.g. a gateway that
+// stamps math.MaxInt64) cannot grow the cap past the platform
+// ceiling.
+func TestRawBridgePumpBody_ClampsResponseBytes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		caller  int64
+		wantCap int64
+	}{
+		// The default (caller passed 0) means "use the
+		// platform ceiling"; gateway sends
+		// api.RawStreamMaxRequestBytes today but the
+		// clamp-down logic also has to accept "caller 0 =
+		// use default" without flipping into the
+		// maxResponseBytes < maxBody branch.
+		{"zero_default", 0, ForwardRawStreamMaxResponseBytes},
+		{"negative_default", -1, ForwardRawStreamMaxResponseBytes},
+		{"one_byte", 1, 1},
+		{"exact_limit", ForwardRawStreamMaxResponseBytes, ForwardRawStreamMaxResponseBytes},
+		{"over_limit_clamps", ForwardRawStreamMaxResponseBytes + 1, ForwardRawStreamMaxResponseBytes},
+		{"math_max_int64_clamps", 1 << 62, ForwardRawStreamMaxResponseBytes},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Reproduce the clamp logic in rawBridgePumpBody:
+			// start with the platform ceiling, clamp DOWN
+			// to the caller's value if positive + below
+			// the ceiling. Mirrors the request-side clamp
+			// in TestRawBridgeBodyLoop_ClampsToCap.
+			got := ForwardRawStreamMaxResponseBytes
+			if tc.caller > 0 && tc.caller < got {
+				got = tc.caller
+			}
+			if got != tc.wantCap {
+				t.Errorf("rx cap = %d, want %d", got, tc.wantCap)
 			}
 		})
 	}

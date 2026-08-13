@@ -419,6 +419,25 @@ type App struct {
 	// plan-gating contract: Free defaults to false and cannot
 	// PATCH it to true (apid returns 403
 	// plan_websocket_not_allowed); Hobby/Pro/Scale default to true.
+	//
+	// Per-session caps (issue #676 / ADR-080 PR-C):
+	//   - Inbound bytes capped at api.RawStreamMaxRequestBytes
+	//     (100 MiB) at pkg/vmmdgrpc/forward.go:rawBridgeBodyLoop.
+	//     Exceeding it returns ResourceExhausted → gateway 502.
+	//   - Outbound bytes capped at api.RawStreamMaxResponseBytes
+	//     (1 GiB, configured via the existing init-frame
+	//     max_request_bytes proto field — a dedicated
+	//     max_response_bytes wire field is a deferred ADR) at
+	//     pkg/vmmdgrpc/forward.go:rawBridgePumpBody. Exceeding
+	//     it returns ResourceExhausted → gateway 502.
+	//   - Outbound bytes the gateway forwards to the client
+	//     (body_chunks + init-error fallbacks) flow into the
+	//     per-instance egress ring via
+	//     pkg/gateway/forwardproxy.go's
+	//     rawStreamOnceWithEvents — see pkg/gateway/handler.go
+	//     WithEgressSink + pkg/gateway/egresssink. They
+	//     populate usage_minutes.tx_bytes alongside plain HTTP
+	//     chunk writes (ADR-046).
 	WebSocketEnabled bool
 	// RouteMetricsEnabled (ADR-093) opts the app into the per-route
 	// observability surface. Mirrors WebSocketEnabled's plan-gating
