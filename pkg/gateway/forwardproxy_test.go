@@ -909,7 +909,7 @@ func TestRawStreamReverseProxy_RoundTrip(t *testing.T) {
 	}
 	cli := &fakeVmmdClient{RawStream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
-	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil, nil)
 
 	body := "GET /socket HTTP/1.1\r\nHost: app.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
 	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(body))
@@ -967,7 +967,7 @@ func TestRawStreamReverseProxy_RemoteWakeNode(t *testing.T) {
 	}
 	cli := &fakeVmmdClient{RawStream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
-	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(""))
 	req.Header.Set("Connection", "Upgrade")
@@ -1009,7 +1009,7 @@ func TestRawStreamReverseProxy_InitError_Populated(t *testing.T) {
 	}
 	cli := &fakeVmmdClient{RawStream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
-	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(""))
 	req.Header.Set("Connection", "Upgrade")
@@ -1063,7 +1063,7 @@ func TestRawStreamReverseProxy_ClientCancel_TearsDownStream(t *testing.T) {
 	stream := &blockingRawBidiStream{ctx: ctx}
 	cli := &fakeVmmdClient{RawStream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
-	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/socket", body)
 	req = req.WithContext(ctx)

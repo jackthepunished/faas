@@ -173,6 +173,35 @@ func streamingEnabledFromEnv() bool {
 	return false
 }
 
+// rawStreamEnabledFromEnv (issue #676 / ADR-080 follow-up) resolves the
+// FAAS_GATEWAY_RAW_STREAM_ENABLED operator kill switch. Default is true
+// — production already runs the raw-bytes Upgrade bridge; defaulting
+// to false would silently regress every deployment until operators
+// set the env. Accepted truthy values mirror FAAS_GATEWAY_STREAMING
+// (1/true/yes, case-insensitive); anything else falls through to
+// false (operator must opt out explicitly) and is logged via slog
+// at startup so a typo is visible.
+//
+// When the env resolves to false the handler.WithRawForwarding call
+// is skipped below (run.go: ~line 1090), leaving h.rawByNode nil. The
+// three-input gate at pkg/gateway/handler.go:2899
+// (isUpgradeRequest(r) && app.WebSocketEnabled && h.rawByNode != nil)
+// falls through to writeWebSocketNotAllowed with the
+// forwarderMissing=true detail — a deterministic 501 with
+// x-faas-error-reason: websocket_not_on_plan. The kill switch is
+// therefore load-bearing: it is the first operator control to reach
+// for when the raw forwarder itself is misbehaving (per-app PATCH
+// only helps if the bridge is healthy for OTHER apps on the box).
+func rawStreamEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_RAW_STREAM_ENABLED", streamingFlagTrue)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
 // routeMetricsEnabledFromEnv (ADR-093) is the per-process
 // opt-in for the per-route observability surface. Mirrors
 // streamingEnabledFromEnv above: env (FAAS_GATEWAY_ROUTE_METRICS)
@@ -1159,6 +1188,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unchanged.
 	egressSink := egresssink.NewEgressSink()
 	handler.WithEgressSink(egressSink)
+	// Issue #676 / ADR-080 PR-C: the raw-stream forwarder writes
+	// raw-bytes Upgrade chunks into the same per-instance egress
+	// ring as the plain HTTP forwarder. They share the *EgressSink
+	// pointer so both paths land in the same usage_minutes.tx_bytes
+	// bucket — see cmd/gatewayd-internal/nodecache.go:WithEgressSink.
+	if deps.nodeCache != nil {
+		deps.nodeCache.WithEgressSink(egressSink)
+	}
 	egressGRPCSocket := egressGRPCSocketPath()
 	// Reject the silent-no-TLS path: a non-unix target without TLS
 	// would build an insecure server (ADR-052). deps.egressTLS is
@@ -1219,7 +1256,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// three-input gate routes Connection: Upgrade requests
 		// here BEFORE falling through to WithForwarding's
 		// ForwardHTTPStream bridge.
-		handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		//
+		// Operator kill switch (issue #676 follow-up): when
+		// FAAS_GATEWAY_RAW_STREAM_ENABLED=false, the call is
+		// skipped — h.rawByNode stays nil, and the three-input
+		// gate at pkg/gateway/handler.go:2899 falls through to
+		// writeWebSocketNotAllowed(forwarderMissing=true),
+		// returning a deterministic 501 + x-faas-error-reason:
+		// websocket_not_on_plan. Default is true; see
+		// rawStreamEnabledFromEnv above.
+		if rawStreamEnabledFromEnv() {
+			handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		} else {
+			slog.Info("gatewayd-internal: raw-bytes Upgrade bridge disabled by FAAS_GATEWAY_RAW_STREAM_ENABLED=false",
+				"fallthrough", "writeWebSocketNotAllowed(forwarderMissing=true)")
+		}
 	}
 
 	// Per-instance last_request_at flush loop (spec §4.1). Present in production;

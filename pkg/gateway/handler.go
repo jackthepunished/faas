@@ -3680,9 +3680,31 @@ haveApp:
 	// the WS handshake in an infinite loop. A deterministic 501
 	// names the cause and the WS client can back off cleanly.
 	if isUpgradeRequest(r) {
-		if !app.WebSocketEnabled || h.rawByNode == nil {
-			h.writeWebSocketNotAllowed(w, app.ID, h.rawByNode == nil)
+		// Issue #676 / ADR-080 follow-up, PR-B: stamp
+		// (plan, metrics) onto the request context so the
+		// raw forwarder can label its gateway_ws_*
+		// observations without a wider public signature
+		// (see pkg/gateway/upgrade.go::withWSContext).
+		// h.metrics is nil in the pre-metrics test corpus;
+		// withWSContext no-ops on nil so the legacy test
+		// path keeps compiling.
+		r = r.WithContext(withWSContext(r.Context(), app.Plan, h.metrics)) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
+		if !app.WebSocketEnabled {
+			if h.metrics != nil {
+				h.metrics.IncWSUpgrade(string(app.Plan), WSOutcomePlanDenied)
+			}
+			h.writeWebSocketNotAllowed(w, app.ID, false)
 			return
+		}
+		if h.rawByNode == nil {
+			if h.metrics != nil {
+				h.metrics.IncWSUpgrade(string(app.Plan), WSOutcomeBridgeDisabled)
+			}
+			h.writeWebSocketNotAllowed(w, app.ID, true)
+			return
+		}
+		if h.metrics != nil {
+			h.metrics.IncWSUpgrade(string(app.Plan), WSOutcomeAccepted)
 		}
 		// ADR-064 wake-timeline vocab: stamp the upgrade flag so
 		// downstream observability (slog fields, dashboards)

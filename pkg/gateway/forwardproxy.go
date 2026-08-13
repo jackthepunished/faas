@@ -40,6 +40,7 @@ import (
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	evts "github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -496,12 +497,47 @@ const rawStreamSessionDeadline = 24 * time.Hour
 //     records the disconnect.
 //
 // nil events opts out (legacy callers and the test corpus).
-func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform) {
+func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform, sink *egresssink.EgressSink) {
 	ctx, cancel := context.WithTimeout(r.Context(), rawStreamSessionDeadline)
 	defer cancel()
 
+	// Issue #676 / ADR-080 follow-up, PR-B: instrument the WS
+	// observability surface (gateway_ws_* Prometheus series).
+	// The (plan, metrics) pair is stamped onto the request
+	// context at the cmd/gatewayd-internal three-input gate
+	// (pkg/gateway/handler.go:2899) via withWSContext so the
+	// forwarder doesn't need a wider public signature. The
+	// outcome variable is captured by reference in the four
+	// `return` branches below — each sets it before returning,
+	// and the deferred ObserveWSSessionDuration fires on the
+	// way out with the resolved label.
+	plan, metrics := wsContextFrom(r.Context())
+	sessionStart := time.Now()
+	if metrics != nil {
+		metrics.IncWSSessionStart(string(plan))
+	}
+	var wsOutcome WSOutcome
+	defer func() {
+		if metrics == nil {
+			return
+		}
+		// Default to client_disconnect if no branch set the
+		// outcome — covers the common case where the function
+		// exits via the normal bidi close (no explicit
+		// `return` path sets wsOutcome). The receiver loop's
+		// EOF branch is the only path that relies on this
+		// default; everything else sets wsOutcome before
+		// returning.
+		if wsOutcome == "" {
+			wsOutcome = WSOutcomeClientDisconnect
+		}
+		metrics.DecWSSessionEnd(string(plan))
+		metrics.ObserveWSSessionDuration(string(plan), wsOutcome, time.Since(sessionStart))
+	}()
+
 	stream, err := cli.ForwardRawStream(ctx)
 	if err != nil {
+		wsOutcome = WSOutcomeInitFailed
 		log.Error("gateway: raw forwarder stream open failed",
 			"node", t.NodeID, "err", err.Error())
 		http.Error(w, "raw forwarder stream open failed", http.StatusBadGateway)
@@ -534,6 +570,7 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	if err := stream.Send(&vmmdpb.ForwardRawRequest{
 		Frame: &vmmdpb.ForwardRawRequest_Init{Init: init},
 	}); err != nil {
+		wsOutcome = WSOutcomeInitFailed
 		log.Error("gateway: raw forwarder stream init send failed",
 			"node", t.NodeID, "err", err.Error())
 		http.Error(w, "raw forwarder stream init failed", http.StatusBadGateway)
@@ -548,6 +585,15 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// disconnect, gateway-side deadline), the goroutine exits
 	// promptly via the inner ctxReader.Read returning
 	// ctx.Err(). Same F3 fix as fwdStreamOnceWithEvents.
+	//
+	// Issue #676 / ADR-080 follow-up, PR-B: the tx byte counter
+	// increments per `stream.Send` (the bytes flowing
+	// customer→guest). The counter is increment-after-send so a
+	// half-send that the receiver catches surfaces as the
+	// upstream_unavailable outcome rather than a missing-byte
+	// observation. Prometheus counters are atomic, so the
+	// concurrent tx/rx increment from the body goroutine +
+	// receiver loop is race-free without a mutex.
 	bodyErrCh := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 8*1024)
@@ -560,8 +606,35 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 						BodyChunk: append([]byte(nil), buf[:n]...),
 					},
 				}); serr != nil {
+					// A Send failure on the request
+					// side is an upstream-availability
+					// issue (the bridge closed the
+					// bidi stream because the guest
+					// went away, the per-instance
+					// netns was torn down, or the
+					// vmmd process crashed). Without
+					// this label, the defer's default
+					// of WSOutcomeClientDisconnect
+					// would race-mislabel the
+					// histogram (PR-B code review
+					// finding #2: the body goroutine
+					// can record wsOutcome before the
+					// receiver loop sees the
+					// corresponding Recv error, and
+					// the latter would otherwise
+					// overwrite it with the same
+					// WSOutcomeUpstreamUnavailable).
+					// Both goroutines writing the
+					// same constant is benign — the
+					// race is only on the *value*,
+					// not on the observability
+					// contract.
+					wsOutcome = WSOutcomeUpstreamUnavailable
 					bodyErrCh <- serr
 					return
+				}
+				if metrics != nil {
+					metrics.AddWSSessionBytes(string(plan), WSDirectionTx, int64(n))
 				}
 			}
 			if errors.Is(err, io.EOF) {
@@ -597,15 +670,18 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			default:
 			}
 			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+				wsOutcome = WSOutcomeUpstreamUnavailable
 				log.Warn("gateway: raw forwarder stream Unavailable; surfacing 503",
 					"node", t.NodeID)
 				http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
 				return
 			}
 			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				wsOutcome = WSOutcomeUpstreamUnavailable
 				http.Error(w, "instance gone", http.StatusServiceUnavailable)
 				return
 			}
+			wsOutcome = WSOutcomeUpstreamUnavailable
 			log.Error("gateway: raw forwarder stream Recv failed",
 				"node", t.NodeID, "err", err.Error())
 			http.Error(w, "raw forwarder stream failed", http.StatusBadGateway)
@@ -641,13 +717,47 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			// was already written above; the body is the
 			// last write before the receiver loop exits.
 			if init.Error != "" {
-				_, _ = w.Write([]byte(init.Error))
-				_, _ = io.WriteString(w, "\n")
+				// Bridge dial failure is an upstream-
+				// availability issue — the bridge wrote
+				// the synthetic 502 from inside the
+				// per-instance netns because the guest
+				// refused the connect. Without this
+				// label, the defer's default of
+				// WSOutcomeClientDisconnect would tag
+				// the histogram as customer-side churn
+				// (PR-B code review finding #1:
+				// polluting the
+				// rate(gateway_ws_session_duration_seconds{outcome="client_disconnect"})
+				// panel when the bridge is the source of
+				// the failure).
+				wsOutcome = WSOutcomeUpstreamUnavailable
+				errBody := []byte(init.Error + "\n")
+				if _, werr := w.Write(errBody); werr == nil && sink != nil {
+					// Init-error body is part of the
+					// per-instance egress ring too:
+					// the bridge wrote the synthetic
+					// 502 from inside the per-instance
+					// netns, so the bytes count toward
+					// the same usage_minutes.tx_bytes
+					// bucket the body_chunks do.
+					sink.RecordResponseBytes(t.InstanceID, int64(len(errBody)))
+				}
 				flushSafe(w)
 			}
 			continue
 		}
 		if chunk := frame.GetBodyChunk(); len(chunk) > 0 {
+			// Issue #676 / ADR-080 follow-up, PR-B: rx byte
+			// counter increments per chunk received
+			// (guest→customer). Counter is increment-before-
+			// write so the gauge / counter pair stays
+			// self-consistent even if w.Write fails — the
+			// bytes DID arrive from the guest, the
+			// client_disconnect outcome label is for the
+			// fact that they didn't reach the customer.
+			if metrics != nil {
+				metrics.AddWSSessionBytes(string(plan), WSDirectionRx, int64(len(chunk)))
+			}
 			if _, werr := w.Write(chunk); werr != nil {
 				// Client disconnect mid-stream. The
 				// receiver stops reading frames. The
@@ -657,10 +767,22 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 				// drain bodyErrCh so the handler
 				// doesn't return while the goroutine
 				// is still unwinding.
+				wsOutcome = WSOutcomeClientDisconnect
 				log.Debug("gateway: raw forwarder stream client write failed",
 					"node", t.NodeID, "err", werr.Error())
 				<-bodyErrCh
 				return
+			}
+			// Egress ring: every raw-stream byte the gateway
+			// forwards to the client counts toward this
+			// instance's usage_minutes.tx_bytes bucket.
+			// RecordResponseBytes is nil-safe on a nil
+			// receiver and on an empty InstanceID (skip),
+			// so the production path and the unit-test
+			// corpus both call it unconditionally and the
+			// guard lives at the sink boundary.
+			if sink != nil {
+				sink.RecordResponseBytes(t.InstanceID, int64(len(chunk)))
 			}
 			// Flush per Write so the H2C transport emits
 			// a DATA frame on every body_chunk. The
@@ -677,6 +799,11 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// distinguish a clean bidi close from a client-disconnect
 	// (which surfaces as a Send error).
 	<-bodyErrCh
+	// wsOutcome stays at WSOutcomeClientDisconnect (the defer's
+	// default) for the clean bidi close. A future enhancement
+	// could inspect bodyErrCh's final value to distinguish
+	// client-initiated FIN from server-initiated close; for
+	// PR-B the customer-side churn signal is sufficient.
 }
 
 // flushSafe is a recover-guarded wrapper around http.Flusher.Flush
@@ -704,14 +831,22 @@ func flushSafe(w http.ResponseWriter) {
 // factory's output to invoke (per the isUpgradeRequest detector);
 // the factories share the same NodeClientLookup so the underlying
 // gRPC channel is reused regardless of which RPC is in flight.
-func ForwardingRawReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
-	return ForwardingRawReverseProxyWithEvents(nodes, log, nil)
+//
+// sink is the per-instance egress ring (see pkg/gateway/egresssink)
+// that the raw path's bytes flow into via
+// rawStreamOnceWithEvents's RecordResponseBytes hook — the legacy
+// setupStreamingWriter wrap at handler.go:2836-2838 is gated by
+// !isUpgradeRequest(r), so the raw path does not install that
+// onFlush hook itself. nil sink opts out (the test corpus and any
+// pre-egress-ring callers); RecordResponseBytes is nil-safe.
+func ForwardingRawReverseProxy(nodes NodeClientLookup, log *slog.Logger, sink *egresssink.EgressSink) func(t Target) http.Handler {
+	return ForwardingRawReverseProxyWithEvents(nodes, log, nil, sink)
 }
 
 // ForwardingRawReverseProxyWithEvents is the events-aware variant
 // of ForwardingRawReverseProxy (issue #676 / ADR-080). nil events
 // opts out (pre-PR-C fixtures and the unit-test corpus).
-func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform) func(t Target) http.Handler {
+func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform, sink *egresssink.EgressSink) func(t Target) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -724,7 +859,7 @@ func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logge
 				return
 			}
 			defer func() { _ = closer.Close() }()
-			rawStreamOnceWithEvents(w, r.WithContext(ctx), cli, log, t, events)
+			rawStreamOnceWithEvents(w, r.WithContext(ctx), cli, log, t, events, sink)
 		})
 	}
 }
