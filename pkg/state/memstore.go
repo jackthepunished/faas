@@ -3083,6 +3083,32 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 			a.OverflowNode = &s
 		}
 	}
+	// CORS improvements D1: per-app default CORS opt-in +
+	// allowlist. Same Set-bit convention as the other partial
+	// PATCH fields. SetCORSDefaultEnabled distinguishes "don't
+	// touch" from "explicit false" (opt out of an enabled
+	// fallback). SetCORSDefaultOrigins distinguishes "don't
+	// touch" from "explicit empty list" (clear an enabled
+	// fallback). The validator runs above the store layer so
+	// we never see (enabled=true, origins=nil) here.
+	if p.SetCORSDefaultEnabled {
+		// Lifts nullable wire shape into the
+		// store-layer pointer field. nil → nil
+		// (legacy row, opt-out triple collapse),
+		// *v → *v (no copy needed; the apid
+		// caller already handed off ownership).
+		a.CORSDefaultEnabled = p.CORSDefaultEnabled
+	}
+	if p.SetCORSDefaultOrigins {
+		if p.CORSDefaultOrigins == nil {
+			a.CORSDefaultOrigins = nil
+		} else {
+			src := *p.CORSDefaultOrigins
+			dst := make([]string, len(src))
+			copy(dst, src)
+			a.CORSDefaultOrigins = dst
+		}
+	}
 	m.apps[id] = a
 	return a, nil
 }

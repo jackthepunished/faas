@@ -217,6 +217,47 @@ The `kind=limit` shape is the standalone per-route body-size primitive — the l
 - **Streaming posture.** The rule carries an optional `max_body_bytes_streaming ≤ 100 MiB` (matching `pkg/api.RawStreamMaxRequestBytes` for ADR-080 raw-bridge parity). **Runtime enforcement ships alongside the field.** The applier at the §4.1.2.13 slot consults `streamingFor(h, r, app)` — the 4-conjunct detection formula (`h.streamingEnabled && app.StreamingEnabled && !isAcceptJSON(Accept) && !isUpgradeRequest(r)`) — and picks the cap per request: streaming requests use `max_body_bytes_streaming` (clamped to `api.RawStreamMaxRequestBytes`); buffered requests use `max_body_bytes` (clamped to `api.MaxRequestBodyBytes`); streaming cap == 0 falls back to the buffered cap (safe degradation, never widens). The 413 detail message suffixes the cap kind — `(buffered cap)` or `(streaming cap)` — so a customer can bisect which cap fired without consulting logs. The audit payload (`edge_rule.limit_rejected` + `edge_rule.limit_matched`) carries an additive `cap_kind` field for the same purpose on the operator side. See ADR-091 D24 §6 for the rationale (per-cap-kind clamp, DTO `s ≥ b` invariant trust, deferred-to-runtime risks rejected).
 - **Relationship to `kind=validate.max_body_bytes`.** Kept, NOT deprecated. The semantic split is: validate's `max_body_bytes` is the "cap the body I'm about to schema-check" knob; limit's `max_body_bytes` is the standalone gate. The two paths share the same underlying primitive (per-rule `MaxBytesReader`) but surface different control surfaces — validate couples the cap with schema checking, limit couples the cap with nothing else. A customer who declared a `kind=validate.max_body_bytes` rule today can migrate to `kind=limit` in a follow-up (no schema is required for the limit path).
 
+#### 4.1.2.6a CORS ergonomics (ADR-091 D20–D25)
+
+Three ergonomic layers extend the §4.1.2.6 `kind=cors` surface; none
+of them are spec deviations, only widenerings of the allowlist
+grammar and customer-facing ergonomics. The matcher (`matchOrigin`
+in `pkg/gateway/handler.go`) is the only origin-algebra seam;
+everything else routes through it.
+
+1. **Subdomain / port wildcard grammar (D20).** `AllowOrigins`
+   accepts `https://*.example.com`, `https://localhost:*`, and
+   `https://api.example.com:*` in addition to literal origins and
+   the bare `*`. The grammar is enforced by `api.CorsOriginPattern`
+   at create-time; the gateway hot path runs the same predicates
+   in `matchOrigin` (defence in depth).
+2. **Per-app default CORS (D21, D22).** `apps.cors_default_enabled`
+   and `apps.cors_default_origins` (migration 00223) give a single
+   opt-in a soft CORS stamp without the customer configuring an
+   edge rule. The default runs INSIDE `applyEdgeRuleCORS`,
+   immediately after the existing `MatchCORS` miss path, so
+   pipeline order stays `kind=cors` rule → per-app default → JWT →
+   IP. The OPTIONS short-circuit is SKIPPED on the default path —
+   the customer's backend remains authoritative for the preflight
+   answer; the gateway only stamps response headers.
+3. **Typed SDK helper + CLI subcommand (D23, D24).**
+   `pkg/api.CreateCORSEdgeRule` packs the `EdgeRuleCORSAction`
+   JSON and pins `kind="cors"` so callers don't have to assemble
+   the action blob themselves. `gregale cors allow|ls|rm|show` is
+   a thin shim over the helper for the common
+   "configure-cors-and-stop-thinking-about-it" crowd that
+   motivated the original ticket. Node + Python SDKs pick up the
+   same shape via `make sdk-gen` (the kebab POST is the source of
+   truth; no hand-written kebab method on the SDK side).
+
+Precedence rule (load-bearing, codifies the contract customers see):
+an explicit `kind=cors` rule wins on its match_host + match_path
++ match_methods. The per-app default applies only on a `MatchCORS`
+miss — never stacked with an explicit rule, never overrides one.
+The `*`+credentials footgun guard (D12) is unchanged; only the bare
+`*` entry trips it. A subdomain-wildcard entry expands to a concrete
+origin at request time, so browsers permit credentials for it.
+
 ### 4.2 `apid` — control API
 
 **Owns:** the public REST API, auth, validation, and being the *only* writer to customer-intent tables.

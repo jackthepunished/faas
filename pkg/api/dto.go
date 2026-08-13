@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -261,6 +262,32 @@ type UpdateAppRequest struct {
 	// resolved UUID on the next pressured sweep; falls through to
 	// A9 if the peer has no headroom or is inactive.
 	OverflowNode *string `json:"overflow_node,omitempty"`
+	// CORSDefaultEnabled (CORS improvements D1 / ADR-091
+	// appendix) opts the app into the soft default-CORS
+	// fallback. When true, every incoming response is
+	// stamped with a CORS header set derived from
+	// CORSDefaultOrigins whenever no explicit kind=cors
+	// edge rule matches. nil → keep current value
+	// (existing PATCH semantics); explicit false opts out;
+	// explicit true opts in. The Set-bit in the
+	// pgstore-level UpdateApp distinguishes "unset" from
+	// "explicit flip" so partial-PATCH stays bit-for-bit
+	// additive on the wire.
+	CORSDefaultEnabled *bool `json:"cors_default_enabled,omitempty"`
+	// CORSDefaultOrigins (CORS improvements D1) is the
+	// per-app default allowlist. Same grammar as
+	// EdgeRuleCORSAction.AllowOrigins — concrete origins,
+	// '*.example.com' subdomain wildcards, 'localhost:*'
+	// port wildcards, or '*' (denied when credentials
+	// are enabled, same footgun guard as the explicit
+	// rule). nil slice or len==0 means "no default
+	// fallback"; when CORSDefaultEnabled is true the
+	// validator requires a non-empty value (otherwise
+	// the fallback is a silent no-op and the customer
+	// wonders why nothing changed). Stamped on the
+	// gateway hot path by reusing pkg/gateway's
+	// matchOrigin predicate against this list.
+	CORSDefaultOrigins *[]string `json:"cors_default_origins,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
@@ -638,6 +665,22 @@ type AppResponse struct {
 	// `name` to a `compute_nodes.id` server-side before
 	// persisting or returning.
 	OverflowNode *string `json:"overflow_node,omitempty"`
+	// CORSDefaultEnabled (CORS improvements D1) reflects the
+	// per-app soft default-CORS opt-in. NULL on legacy rows
+	// so dashboards render an "off" pill; non-null true
+	// means the gateway is stamping the default header set
+	// on miss; non-null false means the customer explicitly
+	// opted out (the column was flipped from the schema
+	// default).
+	CORSDefaultEnabled *bool `json:"cors_default_enabled"`
+	// CORSDefaultOrigins (CORS improvements D1) reflects the
+	// resolved default allowlist. nil/len==0 means the
+	// column is NULL (no origins configured); the gateway
+	// short-circuits to a deny-all stamp on the default
+	// path. The wire shape is JSON [] (never null) when
+	// the column carries a value, so dashboards can render
+	// the list directly.
+	CORSDefaultOrigins []string `json:"cors_default_origins"`
 }
 
 // ParkedDeploymentRef is the reference shape returned in
@@ -3694,6 +3737,32 @@ type EdgeRuleCORSAction struct {
 	MaxAgeSeconds    int      `json:"max_age_seconds"`
 }
 
+// CorsOriginPattern is the grammar for an allow_origins entry
+// after the CORS improvements PR. Three forms are accepted:
+//
+//	"*"                                  bare full-wildcard
+//	"https://app.example.com"            literal origin
+//	"https://*.example.com"              subdomain wildcard (* as a
+//	                                     complete left-most host label)
+//	"https://localhost:*"                port wildcard (* as a complete
+//	                                     port — useful for local dev)
+//	"https://api.example.com:*"          host + port wildcard
+//
+// The grammar is deliberately tiny (no regex metacharacters, no
+// path matching, no scheme matching) so the gateway hot-path
+// matcher can stay an O(n) string-prefix scan without backtracking.
+// The regex below enforces the grammar at create-time; the gateway
+// applies the same predicates in handler.go::matchOrigin (so a
+// rule that bypasses the apid validator still matches what the
+// customer expects — defence in depth).
+//
+// Footgun guard (ADR-091 D12) only fires for the bare "*" entry
+// combined with AllowCredentials: true. A pattern like
+// "https://*.example.com" expands to a concrete origin at
+// request time, so browsers permit credentials for it; the
+// guard is intentionally narrow.
+var CorsOriginPattern = regexp.MustCompile(`^(?:\*|https?://(?:\*\.[a-zA-Z0-9.\-]+|localhost)(?::\*|\:[0-9]+)?|https?://[a-zA-Z0-9.\-]+(?::\*|\:[0-9]+)?)$`)
+
 func (a *EdgeRuleCORSAction) Validate() *Problem {
 	if a == nil {
 		return ErrValidation("cors action is required")
@@ -3704,14 +3773,36 @@ func (a *EdgeRuleCORSAction) Validate() *Problem {
 	if len(a.AllowMethods) == 0 {
 		return ErrValidation("cors action requires at least one allow_method")
 	}
+	// CORS improvements D6: cap MaxAgeSeconds at 24h. Browsers
+	// ignore larger values; the gateway was happily stamping
+	// "Access-Control-Max-Age: 2147483647" before the cap.
+	// The lower bound is unchanged (>= 0).
 	if a.MaxAgeSeconds < 0 {
 		return ErrValidation("cors action max_age_seconds must be >= 0")
+	}
+	if a.MaxAgeSeconds > 86400 {
+		return ErrValidation("cors action max_age_seconds must be <= 86400 (24h; browsers ignore larger values)")
+	}
+	// CORS improvements D2: validate every allow_origins entry
+	// against the CorsOriginPattern grammar. The gateway's
+	// matchOrigin (handler.go) applies the same predicates, so
+	// a rule that bypasses the apid validator still matches
+	// what the customer expects.
+	for _, origin := range a.AllowOrigins {
+		if !CorsOriginPattern.MatchString(origin) {
+			return ErrValidation(
+				"cors action allow_origin " + strconv.Quote(origin) +
+					" does not match the supported grammar: bare \"*\", literal \"https://host[:port]\"," +
+					" subdomain wildcard \"https://*.host\", or port wildcard \"https://host:*\"")
+		}
 	}
 	// CORS *+credentials footgun: browsers reject the combination
 	// Access-Control-Allow-Origin: * together with Access-Control-
 	// Allow-Credentials: true (RFC 6454 §7). Reject at create-time
 	// rather than shipping a rule that silently fails in production.
-	// (ADR-091 D12.)
+	// (ADR-091 D12.) Only the bare "*" entry trips the guard — a
+	// subdomain/port wildcard expands to a concrete origin at
+	// request time and is credentials-safe.
 	if a.AllowCredentials {
 		for _, origin := range a.AllowOrigins {
 			if origin == "*" {

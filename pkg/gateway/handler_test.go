@@ -2726,3 +2726,137 @@ func TestApplyEdgeRuleLimit_StreamingCapClamp_DefenceInDepth(t *testing.T) {
 		t.Errorf("cap_kind = %q; want streaming", capKind)
 	}
 }
+
+// --- CORS improvements (ADR-091 appendix): matchOrigin coverage -----------
+
+// Step 9 test surface for the wildcard grammar added in Step 3 (subdomain
+// + port wildcards, case-insensitive scheme+host per RFC 6454 §3). Each
+// case covers one branch of matchOrigin predicate tree so a regression
+// in the matcher is localisable from the test name alone.
+
+func TestMatchOrigin_LiteralExactMatch(t *testing.T) {
+	allow := []string{"https://app.example.com"}
+	if got := matchOrigin(allow, "https://app.example.com"); got != "https://app.example.com" {
+		t.Errorf("exact match: got %q want %q", got, "https://app.example.com")
+	}
+}
+
+func TestMatchOrigin_LiteralNoMatch(t *testing.T) {
+	allow := []string{"https://app.example.com"}
+	if got := matchOrigin(allow, "https://other.example.com"); got != "" {
+		t.Errorf("expected empty for non-matching origin, got %q", got)
+	}
+}
+
+func TestMatchOrigin_EmptyOriginNeverMatches(t *testing.T) {
+	allow := []string{"https://app.example.com", "*"}
+	if got := matchOrigin(allow, ""); got != "" {
+		t.Errorf("empty origin must never match, got %q", got)
+	}
+}
+
+func TestMatchOrigin_BareWildcardMatchesAny(t *testing.T) {
+	allow := []string{"*"}
+	for _, origin := range []string{
+		"https://app.example.com",
+		"http://localhost:3000",
+		"https://totally-different.example.org",
+	} {
+		if got := matchOrigin(allow, origin); got != "*" {
+			t.Errorf("bare wildcard for %q: got %q want %q", origin, got, "*")
+		}
+	}
+}
+
+func TestMatchOrigin_CaseInsensitiveSchemeAndHost(t *testing.T) {
+	// RFC 6454 §3: scheme + host are case-insensitive. Origin is
+	// always lowercased before compare; the echoed allowlist entry
+	// carries the lowercased form.
+	allow := []string{"https://app.example.com"}
+	cases := []string{
+		"HTTPS://APP.example.com",
+		"https://App.Example.Com",
+		"https://app.EXAMPLE.com",
+	}
+	for _, origin := range cases {
+		if got := matchOrigin(allow, origin); got != "https://app.example.com" {
+			t.Errorf("case-fold %q: got %q want %q", origin, got, "https://app.example.com")
+		}
+	}
+}
+
+func TestMatchOrigin_SubdomainWildcardSingleLabel(t *testing.T) {
+	allow := []string{"https://*.example.com"}
+	// single-label subdomain matches.
+	if got := matchOrigin(allow, "https://app.example.com"); got != "https://*.example.com" {
+		t.Errorf("subdomain match: got %q want %q", got, "https://*.example.com")
+	}
+	// two-label subdomain (chained) does NOT match - only one
+	// label of wildcard, no "**".
+	if got := matchOrigin(allow, "https://app.sub.example.com"); got != "" {
+		t.Errorf("two-label subdomain must not match, got %q", got)
+	}
+	// exact apex also does not match the wildcard entry - that is
+	// what allowlist authors want (apex goes in its own literal).
+	if got := matchOrigin(allow, "https://example.com"); got != "" {
+		t.Errorf("apex must not match wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_SubdomainWildcardSchemeMustMatch(t *testing.T) {
+	allow := []string{"https://*.example.com"}
+	if got := matchOrigin(allow, "http://app.example.com"); got != "" {
+		t.Errorf("scheme mismatch must not match wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_PortWildcardMatchesAnyPort(t *testing.T) {
+	allow := []string{"https://localhost:*"}
+	for _, origin := range []string{
+		"https://localhost:3000",
+		"https://localhost:8080",
+		"https://localhost:65535",
+	} {
+		if got := matchOrigin(allow, origin); got != "https://localhost:*" {
+			t.Errorf("port wildcard for %q: got %q want %q", origin, got, "https://localhost:*")
+		}
+	}
+	// No port on the request: does not match the port-wildcard
+	// entry (which carries an explicit port slot).
+	if got := matchOrigin(allow, "https://localhost"); got != "" {
+		t.Errorf("port-less request must not match port wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_HostPlusPortWildcard(t *testing.T) {
+	allow := []string{"https://api.example.com:*"}
+	if got := matchOrigin(allow, "https://api.example.com:443"); got != "https://api.example.com:*" {
+		t.Errorf("host+port wildcard: got %q want %q", got, "https://api.example.com:*")
+	}
+	// Different host does not match even with port wildcard.
+	if got := matchOrigin(allow, "https://other.example.com:443"); got != "" {
+		t.Errorf("host mismatch with port wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_MultipleEntriesFirstLiteralWins(t *testing.T) {
+	// When the allowlist contains both a wildcard and a literal,
+	// the first matching entry is what matchOrigin returns. In
+	// production the apid validator rejects ambiguous pairs, but
+	// the gateway matcher is permissive on input.
+	allow := []string{"https://app.example.com", "https://*.example.com"}
+	if got := matchOrigin(allow, "https://app.example.com"); got != "https://app.example.com" {
+		t.Errorf("expected literal entry to win, got %q", got)
+	}
+}
+
+func TestMatchOrigin_DefaultFallbackHonoursAllowlist(t *testing.T) {
+	// The default-CORS fallback in applyEdgeRuleCORS reuses
+	// matchOrigin against app.CORSDefaultOrigins. Mirror the
+	// path here so a regression in the wiring does not slip
+	// through a gateway-hot-path test.
+	allow := []string{"https://*.staging.example.com"}
+	if got := matchOrigin(allow, "https://app.staging.example.com"); got == "" {
+		t.Errorf("default-fallback wildcard must match")
+	}
+}

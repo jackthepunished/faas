@@ -2692,7 +2692,28 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- with ON DELETE SET NULL (migration 00167)
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
-			   overflow_node = case when $49 then $50 else overflow_node end
+			   overflow_node = case when $49 then $50 else overflow_node end,
+			   -- ADR-091 CORS improvements D1: per-app
+			   -- default CORS opt-in. SetCORSDefaultEnabled
+			   -- distinguishes "don't touch" from
+			   -- "explicit false" (opt out); apid gates
+			   -- the request shape so the SQL never sees
+			   -- an illegal value. Plan-tier agnostic -
+			   -- the fallback is the "just allow my
+			   -- origin" surface customers expect from
+			   -- any FaaS, so no plan gate.
+			   cors_default_enabled = case when $51 then $52 else cors_default_enabled end,
+			   -- ADR-091 CORS improvements D1:
+			   -- per-app default CORS allowlist. Set bit
+			   -- gates the ARRAY write; nil + Set=true
+			   -- is rejected upstream by apid (the
+			   -- validator requires a value when the
+			   -- Set bit is true, same convention as
+			   -- EgressAllowlist). The array shape
+			   -- matches edge_rules_cors.allow_origins
+			   -- so the gateway reuses the matchOrigin
+			   -- matcher verbatim.
+			   cors_default_origins = case when $53 then $54::text[] else cors_default_origins end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2773,7 +2794,17 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// the column. The Set bit distinguishes "don't
 		// touch" (don't run the SET clause) from "explicit
 		// NULL" (clear — back to A9 fallback).
-		p.SetOverflowNode, nullString(derefString(p.OverflowNode)))
+		p.SetOverflowNode, nullString(derefString(p.OverflowNode)),
+		// ADR-091 CORS improvements D1: per-app default CORS
+		// opt-in + allowlist. Same Set*/optional-pointer
+		// pattern as overflow_node / streaming_enabled.
+		// The validator on the apid side rejects
+		// CORSDefaultEnabled = true with an empty
+		// CORSDefaultOrigins (applies the same
+		// explicit-empty-must-mean-something rule as
+		// EgressAllowlist).
+		p.SetCORSDefaultEnabled, boolOrFalse(p.CORSDefaultEnabled),
+		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins))
 	return scanApp(row)
 }
 
@@ -2808,6 +2839,20 @@ func ptrOrEmpty(p *AppPublicAuthUpdate) *string {
 func derefString(s *string) string {
 	if s == nil {
 		return ""
+	}
+	return *s
+}
+
+// derefStrings returns the dereferenced value of a *[]string, or nil if
+// the pointer is nil. Mirrors derefString above for the string case.
+// Used by the UpdateApp SQL wrapper for the CORS_DEFAULT_ORIGINS arg;
+// the CASE in the SQL guards the nil so a missing pointer never
+// touches the wire (Set bit is false in that case). When the Set bit
+// is true, the apid validator guarantees a non-nil pointer, so the
+// dereference is safe.
+func derefStrings(s *[]string) []string {
+	if s == nil {
+		return nil
 	}
 	return *s
 }
@@ -11093,6 +11138,12 @@ func scanAppInto(a *App, row pgx.Row) error {
 	// '' for the NULL-preference case, which we promote to
 	// App.OverflowNode == nil below.
 	var overflowNodeStr string
+	// ADR-091 CORS improvements D1: scratch sink for the
+	// cors_default_enabled scan target. The schema's NOT
+	// NULL DEFAULT false makes the bool value always present
+	// at scan time; the *bool field is built by lifting
+	// this local below.
+	var corsDefaultEnabled bool
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
@@ -11153,13 +11204,38 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// preview_of_slug=NULL → ''). preview_expires_at is
 		// nullable timestamptz scanned into *time.Time
 		// directly (pgx handles SQL NULL → Go nil natively).
-		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt); err != nil {
+		//
+		// ADR-091 CORS improvements D1: per-app default CORS
+		// opt-in + allowlist. cors_default_enabled is NOT
+		// NULL DEFAULT false in the schema so the scan lands
+		// a plain bool; we lift it into *bool below so the
+		// wire projection surfaces the legacy-row nil vs.
+		// explicit opt-out *false distinction. The three-state
+		// collapse (nil = never touched, *false = PATCHed-to-
+		// false, *true = opted in) lives on the write path;
+		// the read path always returns a non-nil pointer.
+		// cors_default_origins is text[] — pgx maps a NULL
+		// array to a nil Go slice, which is exactly the
+		// "deny all" sentinel the gateway uses (mirrors how
+		// EgressAllowlist handles the empty case). No helper
+		// normalisation needed.
+		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt,
+		&corsDefaultEnabled, &a.CORSDefaultOrigins); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
 		s := overflowNodeStr
 		a.OverflowNode = &s
 	}
+	// Lift hydrated cors_default_enabled into the
+	// store-layer pointer field. The schema's NOT
+	// NULL DEFAULT false makes the bool value always
+	// present at scan time; the *bool shape exists
+	// because the wire projection needs the nil vs
+	// *false distinction (legacy rows vs explicit
+	// opt-out hydrates identically to *false — the
+	// three-state lives on the write path only).
+	a.CORSDefaultEnabled = &corsDefaultEnabled
 	a.Type = AppType(typeStr)
 	a.Status = AppStatus(statusStr)
 	a.WorkloadClass = WorkloadClass(workloadClassStr)
@@ -11261,7 +11337,13 @@ const appsSelectColumns = `
 	-- preview_expires_at is nullable timestamptz scanned into
 	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
 	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
-	coalesce(preview_pr_state, ''), preview_expires_at`
+	coalesce(preview_pr_state, ''), preview_expires_at,
+	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
+	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00223);
+	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the
+	-- pgx scan sees a non-nil slice on legacy rows (the gateway treats
+	-- len==0 as "deny all" — same contract as EgressAllowlist).
+	cors_default_enabled, coalesce(cors_default_origins, '{}'::text[])`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
