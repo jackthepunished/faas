@@ -1,25 +1,18 @@
 -- filename: 00226_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Reserve slot 226 — required by TestMigrationsContiguous so the
--- embedded migration set stays contiguous. The maintenance cluster
--- renumbered its real migrations from 00220/00221 → 00222/00223 →
--- 00224/00225 → 00227/00228 to dodge the cross-PR collisions with
--- PR #858 + #863 (both fence at 00221; #863 also has a real migration
--- at 00222) and PR #864 (reqbudget, has a real migration at 00226).
--- This fence fills the slot vacated by the renumber so the embedded
--- set remains contiguous \{1, 2, …, 228\}.
+-- Reserve slot 226 for the ADR-098 (connection-aware execution)
+-- PR-cluster. The real migration lands as 00226_data_upstreams.sql
+-- at PR-A merge base; this fence exists solely to claim the slot
+-- ahead of sibling PRs per the cross-pr-slot-fence pagination
+-- pattern. Body is a no-op SELECT 1.
 --
--- Same shape as 00056_reserve_slot.sql / 00221_reserve_slot.sql /
--- 00222_reserve_slot.sql / 00223_reserve_slot.sql: `select 1;` no-op,
--- no schema change. The replay-safety gate in ci.yml drops files
--- matching the reservation regex from the "added migration versions"
--- computation so this fence never appears as a real apply path.
---
--- DO NOT bump the slot. If you are claiming this slot for a
--- different feature, fork off the latest main and write your own
--- reserve_slot at the next free number.
-select 1;
+-- Slot 221 was the original fence; 226 is the post-rebase next-free
+-- slot after PR #863 (ADR-096 PR-A, MERGED 2026-08-13) landed
+-- 00221_reserve_slot.sql + 00222_app_errors.sql on main, and PR #866
+-- (CORS) added 00223 + 00224 + 00225 fences. Main is at 00225; the
+-- next free contiguous slot is 00226.
+SELECT 1;
 -- +goose StatementEnd
 
 -- +goose Down

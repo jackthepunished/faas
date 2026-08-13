@@ -801,6 +801,23 @@ Concurrency and RAM interaction (the R1 discipline, mechanized): builder VMs are
 
 ---
 
+## 9.A. Connection-aware execution (ADR-098)
+
+The platform is **stateless by contract** (§17 / ADR-046 / `docs/storage.md`). Customers bring their own datastore / cache / object store / APIs. §9.A makes the placement chooser aware of where those upstreams are so a wake lands as close as the control-plane fleet can get to where the data lives. Architecturally adjacent to §9 (deploy lifecycle) because both surface is the same `apid` write-path, but kept as a sibling section rather than a sub-subsection — the chooser changes (`pkg/sched/placement.go`) and a new probe loop (`pkg/meter/upstream_probe.go`) are not deploy-pipeline concerns.
+
+The implementation is split across a 5-PR cluster documented in `docs/adr/098-pr-cluster-outline.md`. The summary here is the contract every PR conforms to:
+
+- **Capture:** `apid` infers upstreams from env values on `PUT /v1/apps/{slug}/env/*` and `POST /v1/apps/{slug}/secrets`, matching keys against a fixed regex set: `(DATABASE|REDIS|MONGO|CLICKHOUSE|CASSANDRA|ELASTIC|OPENSEARCH|RABBITMQ|KAFKA|NATS|MEMCACHED|ETCD)_(URL|ENDPOINT|URI|DSN)`, `S3_(BUCKET|ENDPOINT|REGION)`, and `*_API_URL`. Host extract via `net/url.Parse`. Region inferred from a static provider→region table in `pkg/data/infer.go`. The DSN value never leaves the handler (§11 secret rule); only the host + port + inferred region are written. Plan-gated: Free apps never get inferred rows (`Limits.DataPlacementHintsPerApp` = 0 for Free); Hobby 3, Pro 10, Scale 50.
+- **Probe:** `meterd` adds a seventh polling loop alongside its existing six timers (`pkg/meter/loop.go`). TCP-connect + TLS-handshake timing per `(host, region)` pair at 30 s × 5 min sliding window. Bounded worker pool (`Limits.UpstreamProbeMaxConcurrent = 64` global). Prom metric `data_upstream_rtt_ms{kind, host, region}` (median) + `data_upstream_probes_total{outcome}` (counter). Per-region SLO: p95 < 50 ms (info), alert at > 200 ms. Documented in §12 telemetry table.
+- **Placement bias:** `pkg/sched/placement.go::Request` gains `PreferredRegion` (parallel to `PreferredNodeID`). `UpstreamAffinity` (`pkg/sched/upstream_affinity.go`) mirrors `WarmAffinity` — a TTL'd in-process `appID → regionScore` map fed by `pg_notify` from the probe's insert path. `betterCandidate` adds one tie-break **between vCPU-headroom and static-region** (`pkg/sched/placement.go:235`), gated on `Limits.UpstreamFitMinDeltaMs` (default 5 ms) so warm-affinity keeps snapshot reuse when the RTT delta is small. The chooser is fail-open — no data means legacy behaviour.
+- **Customer surface:** `GET / POST / DELETE /v1/apps/{slug}/upstreams` — three new routes in `cmd/apid/handlers_upstreams.go` (sibling to `handlers_env.go`). GET returns the inferred + explicit rows joined to the latest RTT sample (last 5 min). Auth: `env:read` for GET, `env:write` for POST/DELETE (mirrors env-route auth per ADR-090).
+- **Quota:** every new limit lives in `pkg/api/limits.go`. `DataPlacementHintsPerApp` is per-plan. `UpstreamProbeMaxConcurrent` and `UpstreamFitMinDeltaMs` are global. Error codes `data_upstream_quota_exceeded` (402) and `data_upstream_invalid` (400) join the package's RFC 7807 problem shape.
+- **Rollout:** three feature flags — `FAAS_DATA_PLACEMENT=0` (apid), `FAAS_UPSTREAM_PROBE=0` (meterd), `FAAS_UPSTREAM_AFFINITY=0` (schedd). All default OFF for v1.10. Manual flip per node for v1.11 once CI is clean for one full month on `main`. The single-node install is byte-identical until ops flip the flags.
+
+The §9.A payoff multiplies with each compute box added at M9. On a single-node install the feature is observable (metrics + GET endpoint reflect hints) but functionally invisible to the chooser (no multi-candidate scoring possible). On a multi-node fleet with distinct regions, the chooser biases wakes toward the node whose measured RTT to the customer's upstreams is lowest.
+
+---
+
 ## 10. Metering and billing detail
 
 - Unit: GB-RAM-hour, billed on provisioned `ram_mb + 8` per running second (§4.7). Definition published verbatim in docs — no surprise-RSS billing.

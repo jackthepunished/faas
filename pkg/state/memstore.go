@@ -5445,6 +5445,24 @@ func (m *MemStore) UpdateInstanceState(_ context.Context, id, state string) erro
 	return nil
 }
 
+// IncInstanceRequestCount (ADR-098 C8) bumps the per-instance
+// request_count column by delta. Mirrors PgStore's behaviour:
+// idempotent on Phase-4-loser re-applies (the writer is additive),
+// returns -1 when the row is gone. The memstore mirrors the column
+// on the Instance struct so the gate can read the value without
+// a SQL hop; C10 wires the gate-side reader.
+func (m *MemStore) IncInstanceRequestCount(_ context.Context, id string, delta int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return -1, nil
+	}
+	ins.RequestCount += delta
+	m.instances[id] = ins
+	return ins.RequestCount, nil
+}
+
 // UpdateInstanceStateWithTimestamp mirrors PgStore's variant. Mirrors
 // the §6.1 watchdog's need to know "time of entry into current
 // state" for SNAPSHOTTING rows; parked_at is the column the watchdog
@@ -5698,6 +5716,29 @@ func (m *MemStore) TouchInstancesLastSeen(_ context.Context, touches []InstanceT
 			continue
 		}
 		ins.LastRequestAt = t.LastRequest
+		m.instances[t.InstanceID] = ins
+		applied++
+	}
+	return applied, nil
+}
+
+// TouchInstancesWithRequestDelta (ADR-098 C9) applies both
+// last_request_at and the per-instance request_count delta. The
+// memstore mirrors the writer contract: additive
+// (`request_count = request_count + delta`), idempotent on
+// Phase-4-loser re-applies, and rows that no longer exist are
+// silently dropped (the touch is a no-op).
+func (m *MemStore) TouchInstancesWithRequestDelta(_ context.Context, touches []InstanceTouch) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	applied := 0
+	for _, t := range touches {
+		ins, ok := m.instances[t.InstanceID]
+		if !ok {
+			continue
+		}
+		ins.LastRequestAt = t.LastRequest
+		ins.RequestCount += t.RequestDelta
 		m.instances[t.InstanceID] = ins
 		applied++
 	}

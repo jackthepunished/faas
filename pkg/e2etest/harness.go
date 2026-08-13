@@ -500,11 +500,16 @@ const testDomain = "apps.test.example"
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
 //
-// PR-C renumber history (5 cycles):
+// PR-C renumber history (5 cycles) on top of main's
+// 00220_preview_app_columns + 00221_instances_request_count
+// (PR #851 + PR #854 wake single-flight) + 00222_app_errors
+// (PR #863 ADR-096 PR-A) + 00223..00226 fences (PR #866 CORS
+// cluster + ADR-098 PR-0):
 //
 //	00220/00221 → 00222/00223 → 00224/00225 → 00227/00228 →
-//	00227/00228 (final, no fences needed past 00226 because
-//	PR #866 owns 00221..00225 + PR #864 owns 00226 real).
+//	00227/00228 (final; main absorbed 00220..00226 during the
+//	rebase — slot 00221 is now instances_request_count, 00226
+//	is a fence for ADR-098 PR-A).
 const e2eMigrationTarget = 228
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:

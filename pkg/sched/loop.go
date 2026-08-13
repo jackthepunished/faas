@@ -56,6 +56,7 @@ type Loop struct {
 	floor              *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
 	recentLoad         *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
 	livenessWindow     *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
+	appDelete          *AppDeleteSubscriber   // ADR-098 app_delete handler; nil = no-op dispatch (tests / opt-out)
 	reaperAggressive   bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
 	reaperParkCap      int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 	// lastFloorByApp (issue #557 closure / ADR-072): per-app
@@ -106,6 +107,23 @@ func (l *Loop) WithWatchdog(w *Watchdog) *Loop {
 // window + interval live in pkg/api/limits.
 func (l *Loop) WithRetention(r *Retention) *Loop {
 	l.retention = r
+	return l
+}
+
+// WithAppDeleteSubscriber attaches the ADR-098 app_delete handler
+// that evicts any in-flight wake for a deleted app via the wake
+// coordinator (Engine.wakeCoord.Forget). The notification is
+// consumed off the loop's existing LISTEN (db.NotifyAppDelete is
+// added to the channel list below), so this option costs zero
+// additional pgxpool connections — the same zero-cost pattern used
+// for NotifyCronRunNow above (PR-D / issue #791).
+//
+// nil = no dispatch (tests / opt-out). nil is safe because the
+// notify channel is still LISTENed (Postgres accepts unknown
+// channels silently); handleNotification just no-ops on
+// NotifyAppDelete when the field is nil.
+func (l *Loop) WithAppDeleteSubscriber(d *AppDeleteSubscriber) *Loop {
+	l.appDelete = d
 	return l
 }
 
@@ -350,6 +368,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		db.NotifyDeploymentChanged,
 		db.NotifySnapshotPrime,
 		db.NotifyCronRunNow, // PR-D / issue #791: multiplexed on the cron loop's existing LISTEN; zero extra pool connections.
+		db.NotifyAppDelete,  // ADR-098: multiplexed on the cron loop's existing LISTEN; same zero-cost pattern as NotifyCronRunNow. Saves a 7th long-term pool subscriber (the standalone one tipped pool.MaxConns=8 over the edge and starved the async-invoke drain's BeginTx under e2e query bursts).
 	}, l.log)
 	if err != nil {
 		return err
@@ -976,6 +995,28 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 		// matches the build_queued notify-loss defense pattern
 		// (cmd/imaged consumer: subscriber re-reads the row).
 		l.drainPendingFireNowRequests(ctx)
+	case db.NotifyAppDelete:
+		// ADR-098: app was deleted. Evict any in-flight wake for
+		// the deleted app via the wake coordinator's Forget so
+		// followers unwind with ErrAppDeleted instead of waiting
+		// for the wake-coord TTL. Multiplexed onto this loop's
+		// existing LISTEN (see the SubscribeWithReconnect call
+		// above); nil appDelete is a no-op for tests / opt-out.
+		if l.appDelete == nil {
+			return
+		}
+		var p struct {
+			AppID string `json:"app_id"`
+		}
+		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
+			l.log.Warn("sched: bad app_delete payload", "err", err)
+			return
+		}
+		if p.AppID == "" {
+			l.log.Warn("sched: app_delete missing app_id", "payload", n.Payload)
+			return
+		}
+		l.appDelete.evictApp(ctx, p.AppID)
 	}
 }
 
@@ -1973,7 +2014,12 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 		}
 		l.audit.Emit(ctx, eventName, &acct.ID, payload)
 	}()
-	if _, err := l.engine.Wake(ctx, c.AppID, ""); err != nil {
+	// ADR-098: cron now goes through EnsureWake so a cron tick racing
+	// a gateway burst (or a floor / scaleup / targets trigger on the
+	// same parked app) coalesces into one virtual boot. The detached
+	// leader ctx means a cancelled triggering cron doesn't kill the
+	// boot the next follow-on caller still needs.
+	if _, err := l.engine.EnsureWake(ctx, c.AppID); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return CronRun{}, true
 	}

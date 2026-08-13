@@ -1908,6 +1908,18 @@ type Instance struct {
 	// untouched. NOT NULL DEFAULT 0 enforced by migration 00151;
 	// pre-existing rows are backfilled to 0 on apply.
 	TailCount int
+	// RequestCount is the per-instance monotonically-increasing
+	// request counter (ADR-098 C8/C9/C10). Persisted in the
+	// `request_count` column added by migrations/00221_instances_request_count.sql.
+	// The counter is the gate for warm-snapshot promotion (C10):
+	// when count >= WarmSnapshotMinRequests (per-app config), the
+	// captured snapshot is promoted to a permanent warm key. Bigint
+	// even at 100 RPS sustained — a 73-day-running instance
+	// accumulates ~6.3e8 rows; int4's 2.1e9 ceiling would be the
+	// next upgrade cycle's blocker. Mirrored here so the warm-gate
+	// reads request_count alongside TailCount without a second SQL
+	// hop. NOT NULL DEFAULT 0 enforced by migration 00221.
+	RequestCount int64
 }
 
 // ComputeNode is one vmmd host in the fleet (issue #97 / ADR-025 axis
@@ -2036,6 +2048,19 @@ type PerNodeStats struct {
 type InstanceTouch struct {
 	InstanceID  string
 	LastRequest time.Time
+	// RequestDelta (ADR-098 C9) is the per-instance request count
+	// delta the gateway has observed since the last touch. The
+	// gateway's per-instance cache (Target.RequestCount) is the
+	// authoritative hot path; the engine batched-writer flushes
+	// per-instance deltas into the instances.request_count column
+	// in the same transaction as last_request_at. 0 = no delta
+	// (the gateway observed a request but the per-instance counter
+	// already moved — the explicit zero avoids a no-op UPDATE).
+	// The increment is additive ("request_count = request_count +
+	// delta") so a re-delivered batch is idempotent on
+	// Phase-4-loser re-applies, mirroring the writer in
+	// pkg/state/pgstore.go::IncInstanceRequestCount.
+	RequestDelta int64
 }
 
 // Event is one row in the append-only audit log (spec §6.1).
