@@ -41,6 +41,8 @@ from .app_response import AppResponse
 from .app_response_eviction_priority import AppResponseEvictionPriority
 from .app_response_runtime import AppResponseRuntime
 from .app_response_type import AppResponseType
+from .app_routes_response import AppRoutesResponse
+from .app_routes_response_source import AppRoutesResponseSource
 from .app_secret_export_response import AppSecretExportResponse
 from .app_secret_list_response import AppSecretListResponse
 from .app_secret_response import AppSecretResponse
@@ -148,6 +150,8 @@ from .edge_rule_ip_action import EdgeRuleIPAction
 from .edge_rule_jwt_action import EdgeRuleJWTAction
 from .edge_rule_jwt_action_algorithms_item import EdgeRuleJWTActionAlgorithmsItem
 from .edge_rule_jwt_action_required_claims import EdgeRuleJWTActionRequiredClaims
+from .edge_rule_limit_action import EdgeRuleLimitAction
+from .edge_rule_maintenance_action import EdgeRuleMaintenanceAction
 from .edge_rule_redirect_action import EdgeRuleRedirectAction
 from .edge_rule_redirect_action_headers import EdgeRuleRedirectActionHeaders
 from .edge_rule_redirect_action_status_code import EdgeRuleRedirectActionStatusCode
@@ -155,6 +159,9 @@ from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
+from .edge_rule_validate_action import EdgeRuleValidateAction
+from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
+from .field_error import FieldError
 from .fire_cron_request_response import FireCronRequestResponse
 from .fire_cron_request_response_status import FireCronRequestResponseStatus
 from .fire_cron_response import FireCronResponse
@@ -291,6 +298,7 @@ from .rotate_app_webhook_secret_response_webhook_secret_sealed_masked import (
 from .rotate_key_response import RotateKeyResponse
 from .rotate_org_api_key_request import RotateOrgAPIKeyRequest
 from .rotate_org_api_key_response import RotateOrgAPIKeyResponse
+from .route_row import RouteRow
 from .scaling_policy import ScalingPolicy
 from .scaling_target import ScalingTarget
 from .scaling_target_metric import ScalingTargetMetric
@@ -394,6 +402,8 @@ __all__ = (
     "AppResponseEvictionPriority",
     "AppResponseRuntime",
     "AppResponseType",
+    "AppRoutesResponse",
+    "AppRoutesResponseSource",
     "AppSecretExportResponse",
     "AppSecretListResponse",
     "AppSecretResponse",
@@ -498,6 +508,8 @@ __all__ = (
     "EdgeRuleJWTAction",
     "EdgeRuleJWTActionAlgorithmsItem",
     "EdgeRuleJWTActionRequiredClaims",
+    "EdgeRuleLimitAction",
+    "EdgeRuleMaintenanceAction",
     "EdgeRuleRedirectAction",
     "EdgeRuleRedirectActionHeaders",
     "EdgeRuleRedirectActionStatusCode",
@@ -505,6 +517,9 @@ __all__ = (
     "EdgeRuleResponseKind",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
+    "EdgeRuleValidateAction",
+    "EdgeRuleValidateActionSchema",
+    "FieldError",
     "FireCronRequestResponse",
     "FireCronRequestResponseStatus",
     "FireCronResponse",
@@ -639,6 +654,7 @@ __all__ = (
     "RotateKeyResponse",
     "RotateOrgAPIKeyRequest",
     "RotateOrgAPIKeyResponse",
+    "RouteRow",
     "ScalingPolicy",
     "ScalingTarget",
     "ScalingTargetMetric",

@@ -1682,6 +1682,28 @@ const (
 	// schema documents).
 	MaxEdgeRuleValidateSchemaBytes = 64 * 1024 // 64 KiB
 
+	// EdgeRuleMaintenanceRetryAfterSeconds (ADR-091 amendment,
+	// PR-A #??? / kind=maintenance) is the platform default
+	// Retry-After for both the kind=maintenance edge rule and the
+	// apps.maintenance_mode coarse gate. Override via
+	// FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS env var (parsed
+	// at boot — see pkg/api/env.go for the env-loading helpers;
+	// the constant here is the default when the env var is unset).
+	// Applied in pkg/gateway.(*Handler).applyEdgeRuleMaintenance and
+	// pkg/gateway.(*Handler).applyAppsMaintenanceMode via
+	// api.WriteProblem + WithHeader, mirroring the existing
+	// StandbyWriteRetryAfterSeconds pattern at line 2171.
+	EdgeRuleMaintenanceRetryAfterSeconds = 60
+
+	// MaxEdgeRuleMaintenanceRetryAfterSeconds caps the per-rule
+	// RetryAfterSeconds field on a kind=maintenance edge rule at
+	// 24 h. EdgeRuleMaintenanceAction.Validate rejects larger
+	// values with 422 so a customer cannot ship a rule that asks
+	// a client to back off for a week. Independent of
+	// EdgeRuleMaintenanceRetryAfterSeconds (which is the default,
+	// not the cap).
+	MaxEdgeRuleMaintenanceRetryAfterSeconds = 24 * 60 * 60 // 86400 (24h)
+
 	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
 	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
 	// 365 days is the issue-189 spec: long enough to be

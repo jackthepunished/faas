@@ -126,6 +126,12 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage) *api.Problem {
 			return api.ErrValidation(fmt.Sprintf("limit action: %v", err))
 		}
 		return a.Validate()
+	case state.EdgeRuleKindMaintenance:
+		var a api.EdgeRuleMaintenanceAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("maintenance action: %v", err))
+		}
+		return a.Validate()
 	}
 	return api.ErrValidation("edge rule action validation fell through — internal bug")
 }
@@ -401,6 +407,21 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 			out.Limit = &state.EdgeRuleLimitAction{
 				MaxBodyBytes:          a.MaxBodyBytes,
 				MaxBodyBytesStreaming: a.MaxBodyBytesStreaming,
+			}
+		}
+	case state.EdgeRuleKindMaintenance:
+		var a api.EdgeRuleMaintenanceAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Same mirror pattern as kind=limit: structural decode,
+			// no payload validation here (validateEdgeRuleAction
+			// already ran). The gateway re-compiles the action body
+			// (cmd-side compileMaintenanceRules, PR-B) and clamps
+			// out-of-range values as defence-in-depth against a
+			// direct-DB row that bypassed apid-Validate
+			// (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect).
+			out.Maintenance = &state.EdgeRuleMaintenanceAction{
+				RetryAfterSeconds: a.RetryAfterSeconds,
+				Message:           a.Message,
 			}
 		}
 	}

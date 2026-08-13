@@ -138,6 +138,18 @@ type Metrics struct {
 	// at boot below. PR 4-7 extend kind; the outcome set is
 	// stable across all kinds.
 	edgeRuleMatch *prometheus.CounterVec
+	// appMaintenance (ADR-091 amendment / §4.1.2.0): counter of
+	// apps.maintenance_mode coarse-gate matches. Distinct from the
+	// edgeRule* family because the coarse gate is not an edge
+	// rule — there's no matcher, no audit row beyond the
+	// app.maintenance_mode_match emit, no per-rule cap, no
+	// cross-account defense. The {plan} label is the closed
+	// {Free, Hobby, Pro, Scale} set so the §12 dashboard panel
+	// "apps in maintenance by plan" surfaces from first scrape.
+	// Pre-instantiated at boot in NewMetrics via the closed plan
+	// loop below (mirrors streamActive / accountRateLimited
+	// pre-instantiation pattern).
+	appMaintenance *prometheus.CounterVec
 	// responseBytes: ADR-046 PR-2 producer observability.
 	// Counter labelled by app (UUID, bounded by per-plan app
 	// quotas) and plan (Free|Hobby|Pro|Scale — closed set). The
@@ -383,6 +395,15 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_compile_error_total",
 			Help: "Edge-rule compile-time errors caught by the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind"}),
+		// ADR-091 amendment — coarse-gate apps.maintenance_mode
+		// short-circuit counter. Distinct from edgeRule* family
+		// because the coarse gate is per-app, not per-rule. Plan
+		// label is the closed Free|Hobby|Pro|Scale set, pre-
+		// instantiated at boot below.
+		appMaintenance: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_app_maintenance_total",
+			Help: "Apps.maintenance_mode coarse-gate short-circuits, labelled by plan. ADR-091 amendment / §4.1.2.0.",
+		}, []string{"plan"}),
 		// ADR-093 / issue #273 follow-up: per-route observability
 		// counters. The `route` label is admitted through the
 		// per-app routeLabelSet (cap = 50 + __route_other__
@@ -668,7 +689,7 @@ func NewMetrics() *Metrics {
 	// triple. The closed set guarantees the §12 dashboard panel
 	// "edge rule match rate" surfaces every (kind, outcome)
 	// tuple from first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance"} {
 		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
@@ -715,13 +736,20 @@ func NewMetrics() *Metrics {
 	// set: {route, rewrite, redirect, headers, cors, jwt, ip}. Adding
 	// a new kind requires extending this slice — the metric name is
 	// stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance"} {
 		for _, result := range []string{"success", "error"} {
 			m.edgeRuleApply.WithLabelValues(kind, result)
 		}
 		m.edgeRuleCompileError.WithLabelValues(kind)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.requestsByRoute, m.durationByRoute, m.failuresByRoute)
+	// ADR-091 amendment — pre-instantiate the closed (plan) set on
+	// the coarse-gate counter so the §12 dashboard panel "apps in
+	// maintenance by plan" surfaces from boot. Closed set mirrors
+	// streamActive / accountRateLimited pre-instantiation above.
+	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
+		m.appMaintenance.WithLabelValues(plan)
+	}
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute)
 	return m
 }
 
@@ -1019,6 +1047,21 @@ func (m *Metrics) ObserveEdgeRuleCompileError(kind string) {
 		return
 	}
 	m.edgeRuleCompileError.WithLabelValues(kind).Inc()
+}
+
+// ObserveAppMaintenance (ADR-091 amendment / §4.1.2.0) increments
+// the coarse-gate apps.maintenance_mode short-circuit counter.
+// plan is the matched app's plan (Free|Hobby|Pro|Scale). The
+// counter is closed-set bounded by the pre-instantiation loop
+// above; an unknown plan still emits (the metric accepts any label
+// value) but only the four canonical plans surface in the §12
+// dashboard panel. Nil-safe so the Handler hot path doesn't need
+// a nil guard.
+func (m *Metrics) ObserveAppMaintenance(plan string) {
+	if m == nil {
+		return
+	}
+	m.appMaintenance.WithLabelValues(plan).Inc()
 }
 
 // ObserveWakeSnapshotTier (issue #470 / PR #470-FU-B) increments

@@ -563,7 +563,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
 		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)
@@ -1033,6 +1033,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return gateway.App{
 			ID:               app.ID,
 			AccountID:        app.AccountID,
+			Slug:             app.Slug,
 			RequireAuthn:     app.RequireAuthn,
 			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed},
 			StreamingEnabled: app.StreamingEnabled,
@@ -1042,7 +1043,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// routeSetFor gate in Handler.ServeHTTP reads this
 			// alongside the operator kill-switch.
 			RouteMetricsEnabled: app.RouteMetricsEnabled,
-			NodeID:              app.NodeID,
+			// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+			// maintenance flag (apps.maintenance_mode).
+			MaintenanceMode: app.MaintenanceMode,
+			NodeID:          app.NodeID,
 		}, true
 	}, deps.edgeRulesAudit)
 	// Issue #561 / ADR-091 PR 5 — arm the per-rule JWT verifier.

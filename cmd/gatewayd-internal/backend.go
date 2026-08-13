@@ -106,6 +106,7 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		ID:               app.ID,
 		AccountID:        acct.ID,
 		Plan:             acct.Plan,
+		Slug:             app.Slug,
 		StreamingEnabled: app.StreamingEnabled,
 		// Issue #676 / ADR-080: per-app raw-bytes Upgrade
 		// bridge flag. Plumbed from apps.websocket_enabled
@@ -124,7 +125,14 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		// on the App struct matches the apps.route_metrics_enabled
 		// column DEFAULT (migration 00212).
 		RouteMetricsEnabled: app.RouteMetricsEnabled,
-		RequireAuthn:        app.RequireAuthn,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. Plumbed from apps.maintenance_mode so
+		// Handler.ServeHTTP's applyAppsMaintenanceMode can
+		// short-circuit WITHOUT re-reading the database. Default
+		// false on the App struct matches the apps.maintenance_mode
+		// column DEFAULT (migration 00228).
+		MaintenanceMode: app.MaintenanceMode,
+		RequireAuthn:    app.RequireAuthn,
 		// CORS improvements D1: per-app default CORS
 		// plumbed through pgRouter.toApp from the apps
 		// row. CORSDefaultEnabled is *bool (tri-state:
@@ -198,6 +206,17 @@ type invalidator interface {
 	// key, which it doesn't. The cache is advisory so a
 	// brief staleness window is fine.
 	ResetEdgeRules()
+	// ResetApp (ADR-091 amendment / §4.1.2.0) drops a single app
+	// from the apps LRU when its apps.maintenance_mode (or any
+	// other customer-visible column) flips. The companion trigger
+	// apps_maintenance_mode_notify (migrations/00225) fires
+	// pg_notify('app_changed', NEW.id::text) ONLY when
+	// maintenance_mode IS DISTINCT FROM old, so this method is
+	// low-volume — it's not on the hot request path. Per-app
+	// drop (not wholesale FlushRoutes) because maintenance_mode
+	// flips are usually isolated to one app; wholesale FlushRoutes
+	// would also evict every other app's entry on every flip.
+	ResetApp(appID string)
 }
 
 // watchInvalidations subscribes to the pg_notify channels that affect routing
@@ -307,7 +326,31 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		case "stopped", "failed", "parked", "snapshotting", "migrating":
 			inv.EvictInstance(p.AppID, p.InstanceID)
 		}
-	case db.NotifyAppChanged, db.NotifyDomainChanged:
+	case db.NotifyAppChanged:
+		// ADR-091 amendment / §4.1.2.0: a per-app column flip
+		// (e.g. apps.maintenance_mode) fires apps_maintenance_mode_notify
+		// which emits 'app_changed' with NEW.id as the payload.
+		// Drop ONLY that app from the apps LRU — not the route
+		// cache — because the next Backend.Lookup will re-read
+		// the apps row and pick up the new column value. This
+		// arm is also the load-bearing destination of any future
+		// per-app column triggers (e.g. apps.streaming_enabled
+		// flips, apps.public_auth_mode rotations). Until those
+		// land, the only fired trigger is apps_maintenance_mode_notify.
+		// Wholesale FlushRoutes() used to be the only behaviour;
+		// we keep that for NotifyDomainChanged because a custom
+		// domain's host→app mapping change affects the route
+		// resolver wholesale, not per-app.
+		if n.Payload != "" {
+			inv.ResetApp(n.Payload)
+		} else {
+			// Defensive: a missing payload on the existing
+			// channel (e.g. a row delete or a future trigger
+			// without a NEW.id payload) falls back to wholesale
+			// FlushRoutes — same posture as the legacy arm.
+			inv.FlushRoutes()
+		}
+	case db.NotifyDomainChanged:
 		inv.FlushRoutes()
 	case db.NotifyKeyChanged:
 		// Issue #477 / ADR-079. A key rotation across the

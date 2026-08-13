@@ -243,6 +243,28 @@ const (
 	// bounds it at 1 second so the wire always emits a non-zero
 	// hint.
 	CodeWaitForWarm = "wait_for_warm"
+	// CodeEdgeRuleMaintenance marks a kind=maintenance edge-rule
+	// hit on the gatewayd hot path (ADR-091 amendment, PR-A
+	// #???). The customer configured an (host, path, http_method)
+	// tuple to return 503 + Retry-After; the gate fires BEFORE
+	// auth and BEFORE wake so a maintenance 503 never pays a
+	// cold-boot cost. Distinct from CodeCapacity / CodeWaitForWarm
+	// (transient platform-state 503s) — this is a deliberate,
+	// long-lived customer off-switch. 503 status via StatusForCode.
+	// The Retry-After header is the canonical UX; the builder
+	// below bounds it at 1 second so the wire always emits a
+	// non-zero hint. Distinct from CodeAppMaintenance (the
+	// per-app coarse sibling on apps.maintenance_mode) so the two
+	// primitives are differentiable on dashboards.
+	CodeEdgeRuleMaintenance = "edge_rule_maintenance"
+	// CodeAppMaintenance marks an apps.maintenance_mode coarse-gate
+	// hit on the gatewayd hot path (ADR-091 amendment). The
+	// customer pinned the whole app via PATCH /v1/apps/{slug};
+	// the gatewayd applier (applyAppsMaintenanceMode, §4.1.2.0)
+	// short-circuits every request to this app with 503 +
+	// Retry-After BEFORE auth, BEFORE wake. Distinct from
+	// CodeEdgeRuleMaintenance (the per-route fine-grained kind).
+	CodeAppMaintenance = "app_maintenance_mode"
 	// CodeAdmissionRefused marks a wake that schedd refused because
 	// the account's current-month overage cents met/exceeded
 	// accounts.overage_cap_cents (issue #561 / PR-XXX). Distinct
@@ -1015,7 +1037,8 @@ func StatusForCode(code string) int {
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
 		CodeAlertRuleInvalid, CodeAppWebhookInvalid, CodeHandlerMissing, CodeImageRequired:
 		return http.StatusBadRequest
-	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm:
+	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm,
+		CodeEdgeRuleMaintenance, CodeAppMaintenance:
 		return http.StatusServiceUnavailable
 	case CodeScanCritical:
 		// 503 — the base ext4 has a CRITICAL Grype finding
@@ -1353,6 +1376,52 @@ func ErrWaitForWarm(cooldownS int, l Limits, observed int) *Problem {
 		WithLimit(int64(cooldownS), int64(observed)).
 		WithDocs(docsBase+"/scaling-policy#cooldown").
 		WithHeader("Retry-After", strconv.Itoa(cooldownS))
+}
+
+// ErrEdgeRuleMaintenance is returned by the gatewayd hot-path
+// applier (pkg/gateway.(*Handler).applyEdgeRuleMaintenance,
+// §4.1.2.13) when a kind=maintenance edge-rule matches the inbound
+// (host, path, http_method). The Retry-After header is always a
+// positive integer; per-rule retryAfterSeconds (from the rule's
+// EdgeRuleMaintenanceAction) overrides the platform default
+// (EdgeRuleMaintenanceRetryAfterSeconds, 60 s) when > 0. msg is
+// the customer-facing detail string from the rule's action body
+// (≤ 512 B; same payload-size budget as
+// EdgeRuleValidateAction.Schema), surfaced as Problem.detail so
+// monitoring / curl users see why the endpoint is dark without
+// scraping the rule row. The builder clamps retryAfterS at 1 s on
+// the floor so the wire always emits a non-zero hint, matching
+// the ErrWaitForWarm convention.
+func ErrEdgeRuleMaintenance(retryAfterS int, msg string) *Problem {
+	if retryAfterS <= 0 {
+		retryAfterS = EdgeRuleMaintenanceRetryAfterSeconds
+	}
+	detail := "This endpoint is in maintenance mode"
+	if msg != "" {
+		detail = "Maintenance: " + msg
+	}
+	return NewProblem(http.StatusServiceUnavailable, CodeEdgeRuleMaintenance,
+		"Endpoint in maintenance", detail).
+		WithHeader("Retry-After", strconv.Itoa(retryAfterS))
+}
+
+// ErrAppMaintenanceMode is the coarse-gate sibling of
+// ErrEdgeRuleMaintenance — returned by the gatewayd hot-path
+// applier (pkg/gateway.(*Handler).applyAppsMaintenanceMode,
+// §4.1.2.0) when the matched app's apps.maintenance_mode boolean
+// is true. retryAfterS is the platform default
+// (EdgeRuleMaintenanceRetryAfterSeconds, 60 s) today; a future
+// per-app retry_after_seconds column is D20.X. appSlug is surfaced
+// in the Problem.detail so monitoring / curl users see which app
+// is in maintenance. The builder clamps retryAfterS at 1 s on the
+// floor so the wire always emits a non-zero hint.
+func ErrAppMaintenanceMode(retryAfterS int, appSlug string) *Problem {
+	if retryAfterS <= 0 {
+		retryAfterS = EdgeRuleMaintenanceRetryAfterSeconds
+	}
+	return NewProblem(http.StatusServiceUnavailable, CodeAppMaintenance,
+		"App in maintenance", fmt.Sprintf("App %q is in maintenance mode", appSlug)).
+		WithHeader("Retry-After", strconv.Itoa(retryAfterS))
 }
 
 // ErrAdmissionRefused is the typed Problem builder for the issue #561

@@ -100,6 +100,9 @@ class DeploymentResponse:
     traffic_percent: int | Unset = UNSET
     """Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by
     construction."""
+    scope: None | str | Unset = UNSET
+    """Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash.
+    nil/omitted = `default`."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -209,6 +212,12 @@ class DeploymentResponse:
 
         traffic_percent = self.traffic_percent
 
+        scope: None | str | Unset
+        if isinstance(self.scope, Unset):
+            scope = UNSET
+        else:
+            scope = self.scope
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -255,6 +264,8 @@ class DeploymentResponse:
             field_dict["parked_at"] = parked_at
         if traffic_percent is not UNSET:
             field_dict["traffic_percent"] = traffic_percent
+        if scope is not UNSET:
+            field_dict["scope"] = scope
 
         return field_dict
 
@@ -444,6 +455,15 @@ class DeploymentResponse:
 
         traffic_percent = d.pop("traffic_percent", UNSET)
 
+        def _parse_scope(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        scope = _parse_scope(d.pop("scope", UNSET))
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -468,6 +488,7 @@ class DeploymentResponse:
             parked_reason=parked_reason,
             parked_at=parked_at,
             traffic_percent=traffic_percent,
+            scope=scope,
         )
 
         deployment_response.additional_properties = d

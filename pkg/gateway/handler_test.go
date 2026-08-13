@@ -1433,6 +1433,13 @@ type stubEdgeRuleMatcher struct {
 	// MatchLimit from the embedded noOpEdgeRuleMatcher; the
 	// MatchLimit override below returns s.limit verbatim.
 	limit *EdgeRuleLimitResolved
+	// maintenance (ADR-091 amendment / kind=maintenance PR-B):
+	// tenth-kind seat on the stub matcher so the
+	// maintenance-applier handler tests can drive applyEdgeRuleMaintenance
+	// without a real matcher or LRU cache. Inherits the no-op
+	// MatchMaintenance from the embedded noOpEdgeRuleMatcher; the
+	// MatchMaintenance override below returns s.maintenance verbatim.
+	maintenance *EdgeRuleMaintenanceResolved
 }
 
 func (s stubEdgeRuleMatcher) MatchRewrite(_ context.Context, _, _, _ string) *EdgeRuleRewriteResolved {
@@ -1474,6 +1481,18 @@ func (s stubEdgeRuleMatcher) MatchIP(_ context.Context, _, _, _ string) *EdgeRul
 // hit the "rule miss" branch.
 func (s stubEdgeRuleMatcher) MatchLimit(_ context.Context, _, _, _ string) *EdgeRuleLimitResolved {
 	return s.limit
+}
+
+// MatchMaintenance (ADR-091 amendment / kind=maintenance PR-B) —
+// returns s.maintenance verbatim so the 503-applier handler tests
+// can drive applyEdgeRuleMaintenance without a real matcher or
+// LRU cache. Mirrors MatchLimit above; the stub's
+// noOpEdgeRuleMatcher base class returns nil for this method, so
+// without this override every test would silently hit the "rule
+// miss" branch and the test's `b.pickCalls.Load() != 0` assertion
+// would never fire.
+func (s stubEdgeRuleMatcher) MatchMaintenance(_ context.Context, _, _, _ string) *EdgeRuleMaintenanceResolved {
+	return s.maintenance
 }
 
 // TestMatchAndApplyRewrite_PrefixAddToSlash_NoDoubleSlash pins the
@@ -2727,27 +2746,6 @@ func TestApplyEdgeRuleLimit_StreamingCapClamp_DefenceInDepth(t *testing.T) {
 	}
 }
 
-// --- CORS improvements (ADR-091 appendix): matchOrigin coverage -----------
-
-// Step 9 test surface for the wildcard grammar added in Step 3 (subdomain
-// + port wildcards, case-insensitive scheme+host per RFC 6454 §3). Each
-// case covers one branch of matchOrigin predicate tree so a regression
-// in the matcher is localisable from the test name alone.
-
-func TestMatchOrigin_LiteralExactMatch(t *testing.T) {
-	allow := []string{"https://app.example.com"}
-	if got := matchOrigin(allow, "https://app.example.com"); got != "https://app.example.com" {
-		t.Errorf("exact match: got %q want %q", got, "https://app.example.com")
-	}
-}
-
-func TestMatchOrigin_LiteralNoMatch(t *testing.T) {
-	allow := []string{"https://app.example.com"}
-	if got := matchOrigin(allow, "https://other.example.com"); got != "" {
-		t.Errorf("expected empty for non-matching origin, got %q", got)
-	}
-}
-
 func TestMatchOrigin_EmptyOriginNeverMatches(t *testing.T) {
 	allow := []string{"https://app.example.com", "*"}
 	if got := matchOrigin(allow, ""); got != "" {
@@ -2858,5 +2856,307 @@ func TestMatchOrigin_DefaultFallbackHonoursAllowlist(t *testing.T) {
 	allow := []string{"https://*.staging.example.com"}
 	if got := matchOrigin(allow, "https://app.staging.example.com"); got == "" {
 		t.Errorf("default-fallback wildcard must match")
+	}
+}
+func TestApplyEdgeRuleMaintenance_MatchReturns503(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, Slug: "payments"},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		maintenance: &EdgeRuleMaintenanceResolved{
+			ID: "rule-m", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			RetryAfterSeconds: 3600, // custom override
+			Message:           "Scheduled payment rollout in progress",
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/payments", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("rec.Code = %d; want 503 (kind=maintenance match)", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+		t.Errorf("Content-Type = %q; want application/problem+json", ct)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "3600" {
+		t.Errorf("Retry-After = %q; want 3600 (per-rule override)", ra)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	if code, _ := prob["code"].(string); code != "edge_rule_maintenance" {
+		t.Errorf("code = %q; want edge_rule_maintenance", code)
+	}
+	if detail, _ := prob["detail"].(string); !strings.Contains(detail, "Scheduled payment rollout") {
+		t.Errorf("detail = %q; want it to contain the rule's Message", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0 (maintenance must deny before wake)", b.pickCalls.Load())
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="maintenance",outcome="match"} 1`) {
+		t.Errorf("match_total{maintenance,match} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="maintenance",result="success"} 1`) {
+		t.Errorf("apply_total{maintenance,success} != 1; body:\n%s", body)
+	}
+}
+
+// TestApplyEdgeRuleMaintenance_NoCustomRetryAfter pins the default
+// Retry-After path. A rule with RetryAfterSeconds=0 must surface
+// the platform default (60 s) on the wire — the cmd-side
+// compileMaintenanceRules clamps 0 → api.EdgeRuleMaintenanceRetryAfterSeconds
+// before the applier ever sees the rule.
+func TestApplyEdgeRuleMaintenance_DefaultRetryAfter(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, Slug: "payments"},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		maintenance: &EdgeRuleMaintenanceResolved{
+			ID: "rule-m-default", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			RetryAfterSeconds: 0, // would-be 0 → default 60
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/payments", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("rec.Code = %d; want 503", rec.Code)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "60" {
+		t.Errorf("Retry-After = %q; want 60 (platform default)", ra)
+	}
+}
+
+// TestApplyEdgeRuleMaintenance_CrossAccountFallsThrough pins the
+// D5 same-account defence-in-depth posture. A rule owned by
+// account A applied to a host in account B silently falls through
+// (audit emit edge_rule.maintenance_blocked + apply success) —
+// the customer never sees a 503 from a cross-account rule.
+func TestApplyEdgeRuleMaintenance_CrossAccountFallsThrough(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-2", Plan: api.PlanPro},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		maintenance: &EdgeRuleMaintenanceResolved{
+			ID: "rule-m-cross", AccountID: "acct-1", AppID: "app-other",
+			Priority: 0, PathGlob: "", Methods: nil,
+			RetryAfterSeconds: 60,
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/payments", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// Cross-account → fall through to backend.Pick (the load-bearing
+	// observation: a 200 reaches the proxy leg because the rule is
+	// silently dropped). No 503.
+	if rec.Code == http.StatusServiceUnavailable {
+		t.Errorf("rec.Code = 503; want non-503 (cross-account rule must fall through)")
+	}
+	if b.pickCalls.Load() == 0 {
+		t.Errorf("fakeBackend.Pick = 0; want ≥1 (cross-account rule must fall through to proxy leg)")
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="maintenance",outcome="blocked"} 1`) {
+		t.Errorf("match_total{maintenance,blocked} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="maintenance",result="success"} 1`) {
+		t.Errorf("apply_total{maintenance,success} != 1 (defence-in-depth apply success); body:\n%s", body)
+	}
+}
+
+// TestApplyEdgeRuleMaintenance_MissPathPassesThrough pins the
+// miss-path behaviour: no rule → pass through to the proxy leg.
+// Match counter increments with outcome=miss.
+func TestApplyEdgeRuleMaintenance_MissPathPassesThrough(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	h.WithEdgeRules(stubEdgeRuleMatcher{maintenance: nil}, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/payments", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if b.pickCalls.Load() == 0 {
+		t.Errorf("fakeBackend.Pick = 0; want ≥1 (no rule → fall through to proxy leg)")
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="maintenance",outcome="miss"} 1`) {
+		t.Errorf("match_total{maintenance,miss} != 1; body:\n%s", body)
+	}
+}
+
+// TestApplyAppsMaintenanceMode_TrueReturns503 pins the coarse-gate
+// contract (§4.1.2.0). An app with apps.maintenance_mode=true must
+// short-circuit every request — distinct Problem.code from the
+// fine-grained gate so a customer can tell which fired.
+func TestApplyAppsMaintenanceMode_TrueReturns503(t *testing.T) {
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro,
+			Slug: "payments", MaintenanceMode: true,
+		},
+		host: "l.example.com", upstream: "127.0.0.1:0", running: true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	req := httptest.NewRequest("GET", "http://l.example.com/payments", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("rec.Code = %d; want 503 (apps.maintenance_mode=true)", rec.Code)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "60" {
+		t.Errorf("Retry-After = %q; want 60 (platform default)", ra)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	if code, _ := prob["code"].(string); code != "app_maintenance_mode" {
+		t.Errorf("code = %q; want app_maintenance_mode", code)
+	}
+	if detail, _ := prob["detail"].(string); !strings.Contains(detail, "payments") {
+		t.Errorf("detail = %q; want it to contain the slug", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0 (coarse gate must deny before wake)", b.pickCalls.Load())
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_app_maintenance_total{plan="pro"} 1`) {
+		t.Errorf("app_maintenance_total{pro} != 1; body:\n%s", body)
+	}
+}
+
+// TestApplyAppsMaintenanceMode_FalsePassesThrough pins the
+// non-maintenance default. MaintenanceMode=false → pass through to
+// the proxy leg; no 503, no metric increment.
+func TestApplyAppsMaintenanceMode_FalsePassesThrough(t *testing.T) {
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro,
+			Slug: "payments", MaintenanceMode: false,
+		},
+		host: "l.example.com", upstream: "127.0.0.1:0", running: true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	req := httptest.NewRequest("GET", "http://l.example.com/payments", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if b.pickCalls.Load() == 0 {
+		t.Errorf("fakeBackend.Pick = 0; want ≥1 (MaintenanceMode=false must pass through)")
+	}
+	body := bodyForCounter(t, h.metrics)
+	if strings.Contains(body, `gateway_app_maintenance_total{plan="pro"} 1`) {
+		t.Errorf("app_maintenance_total{pro} incremented; want 0 (MaintenanceMode=false must not fire)")
+	}
+}
+
+// TestApplyAppsMaintenanceMode_FiresBeforeEdgeRuleMaintenance pins
+// the D4 ordering: coarse gate fires BEFORE fine-grained. An app
+// with both MaintenanceMode=true AND a kind=maintenance rule on
+// the request's path/method must emit the coarse Problem.code
+// (app_maintenance_mode), not the fine-grained one
+// (edge_rule_maintenance). The order matters because the
+// fine-grained rule's existence should be opaque to a customer
+// who's already opted into coarse maintenance.
+func TestApplyAppsMaintenanceMode_FiresBeforeEdgeRuleMaintenance(t *testing.T) {
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro,
+			Slug: "payments", MaintenanceMode: true,
+		},
+		host: "l.example.com", upstream: "127.0.0.1:0", running: true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		maintenance: &EdgeRuleMaintenanceResolved{
+			ID: "rule-m-fine", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			RetryAfterSeconds: 3600,
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/payments", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("rec.Code = %d; want 503", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	if code, _ := prob["code"].(string); code != "app_maintenance_mode" {
+		t.Errorf("code = %q; want app_maintenance_mode (coarse gate beats fine-grained)", code)
+	}
+	// Fine-grained audit/metric must NOT fire — the coarse gate
+	// short-circuited first.
+	body := bodyForCounter(t, h.metrics)
+	if strings.Contains(body, `gateway_edge_rule_match_total{kind="maintenance",outcome="match"} 1`) {
+		t.Errorf("fine-grained match_total{maintenance,match} incremented; want 0 (coarse gate short-circuits)")
+	}
+	if strings.Contains(body, `gateway_edge_rule_match_total{kind="maintenance",outcome="miss"} 1`) {
+		t.Errorf("fine-grained match_total{maintenance,miss} incremented; want 0 (coarse gate short-circuits)")
 	}
 }

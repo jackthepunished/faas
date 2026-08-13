@@ -644,12 +644,30 @@ func sampleLimitRule(id string, prio int, host string) EdgeRuleLimitResolved {
 	}
 }
 
-// putEntryAll is the PR 6 widening of putEntry: covers all 9 kinds
-// after the kind=limit extension (ADR-091 D24). The validate
-// widening was PR-B; the limit widening is this PR. Mirrors
-// cmd-side loadHost's single-pass compile pattern — the production
-// loader always populates every kind at once; this test helper
-// does the same.
+// sampleMaintenanceRule is the ADR-091 amendment / §4.1.2.13 sample
+// used by the cache + filter tests. Mirrors sampleLimitRule above;
+// kind=maintenance only carries RetryAfterSeconds + Message
+// (no body caps). The id is reused for AccountID + AppID to keep
+// the helper one-line.
+func sampleMaintenanceRule(id string, prio int, host string) EdgeRuleMaintenanceResolved {
+	return EdgeRuleMaintenanceResolved{
+		ID:                id,
+		AccountID:         "acc_" + id,
+		AppID:             "app_" + id,
+		Priority:          prio,
+		PathGlob:          "",
+		Methods:           nil,
+		RetryAfterSeconds: 60,
+		Message:           "Test maintenance: " + id,
+	}
+}
+
+// putEntryAll is the PR 6 widening of putEntry: covers all 10 kinds
+// after the kind=maintenance extension (ADR-091 amendment, §4.1.2.13).
+// The validate widening was PR-B; the limit widening was D24; the
+// maintenance widening is this PR. Mirrors cmd-side loadHost's
+// single-pass compile pattern — the production loader always
+// populates every kind at once; this test helper does the same.
 //
 // Adding a new edge-rule kind requires extending this signature.
 // The compiler enforces it across every callsite — that's the
@@ -665,18 +683,20 @@ func putEntryAll(c *EdgeRuleCache, host string,
 	ip []EdgeRuleIPResolved,
 	validate []EdgeRuleValidateResolved,
 	limit []EdgeRuleLimitResolved,
+	maintenance []EdgeRuleMaintenanceResolved,
 ) {
 	c.Put(host, &HostEntry{
-		Host:     host,
-		Route:    route,
-		Rewrite:  rewrite,
-		Redirect: redirect,
-		Headers:  headers,
-		CORS:     cors,
-		JWT:      jwt,
-		IP:       ip,
-		Validate: validate,
-		Limit:    limit,
+		Host:        host,
+		Route:       route,
+		Rewrite:     rewrite,
+		Redirect:    redirect,
+		Headers:     headers,
+		CORS:        cors,
+		JWT:         jwt,
+		IP:          ip,
+		Validate:    validate,
+		Limit:       limit,
+		Maintenance: maintenance,
 	})
 }
 
@@ -835,12 +855,13 @@ func TestPickFirstLimitMatch_MethodsFilter(t *testing.T) {
 // (nil, false) is the invariant that catches "Reset forgot kind X"
 // regressions before they ship.
 
-// TestEdgeRuleReset_WholesaleAcrossAllNineKinds is the deterministic
-// 9-row table that pins the wholesale-Reset invariant. The PR-C
+// TestEdgeRuleReset_WholesaleAcrossAllTenKinds is the deterministic
+// 10-row table that pins the wholesale-Reset invariant. The PR-C
 // rename widened the original PR-6 SevenKinds test to cover the
-// kind=validate slice added by PR-B; this PR widens it once more
-// for kind=limit (ADR-091 D24). See plan §D1 + D24.
-func TestEdgeRuleReset_WholesaleAcrossAllNineKinds(t *testing.T) {
+// kind=validate slice added by PR-B; PR #855 widened it again for
+// kind=limit (ADR-091 D24); the ADR-091 amendment widens it once
+// more for kind=maintenance (§4.1.2.13). See plan §D1 + D24.
+func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
 	c := NewEdgeRuleCache(EdgeRuleCacheCap)
 	host := "a.example.com"
 	putEntryAll(c, host,
@@ -853,6 +874,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllNineKinds(t *testing.T) {
 		[]EdgeRuleIPResolved{sampleIPRule("ip", 0, host)},
 		[]EdgeRuleValidateResolved{sampleValidateRule("vd", 0, host)},
 		[]EdgeRuleLimitResolved{sampleLimitRule("lm", 0, host)},
+		[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", 0, host)},
 	)
 
 	// Sanity: every GetK returns a hit pre-Reset.
@@ -869,6 +891,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllNineKinds(t *testing.T) {
 		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
 		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
+		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 	}
 	for _, c0 := range preChecks {
 		if !c0.f() {
@@ -891,6 +914,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllNineKinds(t *testing.T) {
 		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
 		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
+		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 	}
 	for _, c0 := range postChecks {
 		if c0.f() {
@@ -952,6 +976,7 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 						[]EdgeRuleIPResolved{sampleIPRule("ip", j, hostA)},
 						[]EdgeRuleValidateResolved{sampleValidateRule("vd", j, hostA)},
 						[]EdgeRuleLimitResolved{sampleLimitRule("lm", j, hostA)},
+						[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", j, hostA)},
 					)
 				case 1:
 					_, _ = c.Get(hostA)
@@ -960,12 +985,13 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 					_, _ = c.GetIP(hostA)
 					_, _ = c.GetValidate(hostA)
 					_, _ = c.GetLimit(hostA)
+					_, _ = c.GetMaintenance(hostA)
 				case 2:
 					c.Reset()
 				case 3:
 					putEntryAll(c, hostB,
 						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
-						nil, nil, nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					)
 				}
 			}
@@ -1022,6 +1048,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 					[]EdgeRuleIPResolved{sampleIPRule("ip", i, host)},
 					[]EdgeRuleValidateResolved{sampleValidateRule("vd", i, host)},
 					[]EdgeRuleLimitResolved{sampleLimitRule("lm", i, host)},
+					[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", i, host)},
 				)
 			case 1: // GetK (any kind)
 				_, _ = c.Get(host)
@@ -1033,6 +1060,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 				_, _ = c.GetIP(host)
 				_, _ = c.GetValidate(host)
 				_, _ = c.GetLimit(host)
+				_, _ = c.GetMaintenance(host)
 			case 2: // Reset
 				c.Reset()
 			}

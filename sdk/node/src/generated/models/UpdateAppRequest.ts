@@ -37,6 +37,10 @@ export type UpdateAppRequest = {
    */
   route_metrics_enabled?: boolean | null;
   /**
+   * Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → no change. PATCH true pins the app for maintenance (every request 503 + Retry-After); PATCH false restores normal handling. Free-tier allowed; no plan gate. The apps_maintenance_mode_notify trigger (migration 00228) fires pg_notify on flip.
+   */
+  maintenance_mode?: boolean | null;
+  /**
    * Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column.
    */
   scaling_policy?: (null | ScalingPolicy);

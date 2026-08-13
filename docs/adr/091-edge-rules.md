@@ -303,14 +303,35 @@ PR-A/B/C — keep their cite numbers untouched.)
       unit-tested at `pkg/gateway/handler.go:1175-1220` and the e2e
       can add a `GET` happy-path assertion in a follow-up.
       **Amendment 2 (PR-B residual, 2026-08-12):** the e2e ship
-      lands in this PR — `TestEdgeRulesCORS_NonPreflight_HappyPath`
+      lands in the CORS-residual PR — `TestEdgeRulesCORS_NonPreflight_HappyPath`
       in `cmd/e2e/edge_rules_cors_e2e_test.go` with bitmask
       `APID|Gatewayd`, plus a new unit test
       `TestApplyEdgeRuleCORS_NonPreflight_EmitsApplySuccess` that
       pins the apply/match counter contract. D20.6 closed.
-
-    - **D20.7 — Audit payload widening (PR-B residual, 2026-08-12).**
-      Three round-trips folded into this PR:
+    - **D20.7 — kind=maintenance + apps.maintenance_mode.** The
+      maintenance primitives (PR-A #??? / PR-B / PR-C cluster).
+      Adds a 10th edge-rule kind (`kind=maintenance`) that emits
+      503 + Retry-After before the wake gate, plus a coarse per-app
+      boolean (`apps.maintenance_mode`) that 503s the whole app.
+      Plan-gated Free-and-above (no IsPaidOnly change). The hot-
+      path placement is the cost-control slot (D4): runs BEFORE
+      auth, BEFORE wake, AFTER `Backend.Lookup`. Cache invalidation
+      uses a new `app_changed` pg_notify channel so the gatewayd
+      apps LRU (no TTL) flushes on flip. TTL on maintenance rules
+      is deferred (D20.8); dashboard chip deferred (D20.9, ADR-092).
+    - **D20.8 — Maintenance TTL.** Auto-disable maintenance rules
+      at a customer-set timestamp (`edge_rules.expires_at
+      timestamptz` + a pg_cron sweeper + a new audit event). Out
+      of scope for v1; customers who want timed maintenance today
+      can flip the rule on/off via cron + an apid PATCH. New ADR
+      needed.
+    - **D20.9 — Dashboard chip for maintenance_mode.** Counter
+      `gateway_app_maintenance_total{plan}` lands in PR-B; no
+      Grafana chip ships. Owner: ADR-092 (observability catalog)
+      follow-on, mirroring D20.4.
+    - **D21 — Audit payload widening (PR-B residual, 2026-08-12).**
+      Three round-trips folded into the CORS-residual PR (PR-B
+      pre-maintenance):
       1. **`result` field** — every emit site that knows an outcome
          can stamp `result: "success"|"error[:code=...]"` via
          `pkg/auditutil.WithResult` (new package, single 5-line

@@ -64,6 +64,16 @@ class AppResponse:
     websocket_enabled: bool | Unset = UNSET
     """Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Default-on for Hobby/Pro/Scale; Free customers
     always see this as false. PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."""
+    route_metrics_enabled: bool | Unset = UNSET
+    """Per-app per-route observability flag (ADR-093). When true, gatewayd-internal emits
+    gateway_request_duration_seconds{app,route,class} and serves the bounded reader at GET /v1/apps/{slug}/routes.
+    Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid
+    with 403 plan_route_metrics_not_allowed."""
+    maintenance_mode: bool | Unset = UNSET
+    """Coarse per-app maintenance toggle (ADR-091 amendment). When true the gatewayd-internal hot-path short-
+    circuits every request to this app with 503 + Retry-After (default 60 s) BEFORE auth, BEFORE wake, BEFORE any
+    kind=maintenance edge rule. Free-tier allowed. Surfaced in the GET /v1/apps/{slug} response so dashboards can
+    show 'maintenance on / off' alongside the streaming/WS pills."""
     scaling_policy: None | ScalingPolicy | Unset = UNSET
     """Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from
     min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column
@@ -154,6 +164,10 @@ class AppResponse:
         streaming_enabled = self.streaming_enabled
 
         websocket_enabled = self.websocket_enabled
+
+        route_metrics_enabled = self.route_metrics_enabled
+
+        maintenance_mode = self.maintenance_mode
 
         scaling_policy: dict[str, Any] | None | Unset
         if isinstance(self.scaling_policy, Unset):
@@ -249,6 +263,10 @@ class AppResponse:
             field_dict["streaming_enabled"] = streaming_enabled
         if websocket_enabled is not UNSET:
             field_dict["websocket_enabled"] = websocket_enabled
+        if route_metrics_enabled is not UNSET:
+            field_dict["route_metrics_enabled"] = route_metrics_enabled
+        if maintenance_mode is not UNSET:
+            field_dict["maintenance_mode"] = maintenance_mode
         if scaling_policy is not UNSET:
             field_dict["scaling_policy"] = scaling_policy
         if last_scale_out_at is not UNSET:
@@ -331,6 +349,10 @@ class AppResponse:
         streaming_enabled = d.pop("streaming_enabled", UNSET)
 
         websocket_enabled = d.pop("websocket_enabled", UNSET)
+
+        route_metrics_enabled = d.pop("route_metrics_enabled", UNSET)
+
+        maintenance_mode = d.pop("maintenance_mode", UNSET)
 
         def _parse_scaling_policy(data: object) -> None | ScalingPolicy | Unset:
             if data is None:
@@ -476,6 +498,8 @@ class AppResponse:
             egress_allowlist=egress_allowlist,
             streaming_enabled=streaming_enabled,
             websocket_enabled=websocket_enabled,
+            route_metrics_enabled=route_metrics_enabled,
+            maintenance_mode=maintenance_mode,
             scaling_policy=scaling_policy,
             last_scale_out_at=last_scale_out_at,
             last_scale_in_at=last_scale_in_at,

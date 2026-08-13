@@ -86,6 +86,15 @@ type CreateAppRequest struct {
 	// pattern from issue #676 — same fail-closed contract, same
 	// Plan.RouteMetricsEnabled() accessor.
 	RouteMetricsEnabled *bool `json:"route_metrics_enabled,omitempty"`
+	// MaintenanceMode (ADR-091 amendment) opts the new app into
+	// 503 + Retry-After mode at create time. The coarse sibling of
+	// the kind=maintenance edge rule — the customer wants "this
+	// whole app is in maintenance" without per-rule ceremony.
+	// Free-tier allowed (no IsPaidOnly change); the per-app
+	// apps_maintenance_mode_notify trigger (migration 00221)
+	// fires pg_notify('app_changed', NEW.id) on a flip so the
+	// gatewayd-internal apps LRU cache can be flushed.
+	MaintenanceMode *bool `json:"maintenance_mode,omitempty"`
 	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
 	// preferred spill target for cross-node pressure rebalance.
 	// Wire type is the human-readable compute_nodes.name; apid
@@ -176,6 +185,13 @@ type UpdateAppRequest struct {
 	// true → false to opt out. Pointer distinguishes "don't
 	// touch" (nil) from "explicit false" (*bool=false).
 	RouteMetricsEnabled *bool `json:"route_metrics_enabled,omitempty"`
+	// MaintenanceMode (ADR-091 amendment) opts the app into
+	// 503 + Retry-After mode via PATCH. Pointer distinguishes
+	// "don't touch" (nil) from "explicit false" (*bool=false).
+	// Free-tier allowed (no IsPaidOnly change); the
+	// apps_maintenance_mode_notify trigger fires pg_notify on
+	// flip so the gatewayd-internal apps LRU cache stays fresh.
+	MaintenanceMode *bool `json:"maintenance_mode,omitempty"`
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys on
 	// a valid cosign signature from a trusted publisher (mirrors AWS
 	// Lambda's Code Signing for Lambda). When true, imaged verifies
@@ -538,6 +554,14 @@ type AppResponse struct {
 	// show "route metrics on / off" alongside the streaming/WS
 	// pills.
 	RouteMetricsEnabled bool `json:"route_metrics_enabled"`
+	// MaintenanceMode (ADR-091 amendment) is the coarse-grained
+	// maintenance toggle for the whole app. When true the
+	// gatewayd applier (applyAppsMaintenanceMode, §4.1.2.0)
+	// short-circuits every request with 503 + Retry-After
+	// BEFORE auth, BEFORE wake, BEFORE any kind=maintenance rule
+	// (coarse gate beats fine-grained). Surfaced in the GET app
+	// response so dashboards can show "maintenance on / off".
+	MaintenanceMode bool `json:"maintenance_mode"`
 	// EvictionPriority (issue #475) is the per-app eviction tier
 	// classification. 'best_effort' (default for every pre-#475
 	// row, applied by the column DEFAULT at migration time) keeps
@@ -4104,6 +4128,59 @@ func (a *EdgeRuleLimitAction) Validate() *Problem {
 	// A direct-DB row that violates it passes the cmd-side compile
 	// and falls back to the buffered cap at runtime via the
 	// `MaxBodyBytesStreaming == 0` branch — see ADR-091 D24 §6.
+	return nil
+}
+
+// EdgeRuleMaintenanceAction is the wire shape for a kind=maintenance
+// edge rule (ADR-091 amendment, PR-A #???). The customer-facing
+// primitive for "this route is in maintenance mode" — the hot-path
+// applier (pkg/gateway.(*Handler).applyEdgeRuleMaintenance,
+// §4.1.2.13) short-circuits a matched (host, path, http_method)
+// request with 503 + Retry-After before the wake gate. The coarse
+// sibling (apps.maintenance_mode) is the per-app version and lives
+// on the apps row directly (MaintenanceMode *bool on CreateAppRequest
+// / UpdateAppRequest), so this DTO is only for the fine-grained
+// per-route case.
+//
+// Field-by-field:
+//
+//   - RetryAfterSeconds: optional override for the per-rule
+//     Retry-After header. 0 means "use the platform default
+//     EdgeRuleMaintenanceRetryAfterSeconds (60 s)". Must be in
+//     [0, MaxEdgeRuleMaintenanceRetryAfterSeconds] (24 h) — a
+//     customer cannot ship a rule that asks a client to back off
+//     for a week. Negative values rejected with 422; values above
+//     the cap rejected with 422.
+//   - Message: optional operator-friendly string that goes into
+//     Problem.detail. ≤ 512 B; same payload-size budget as
+//     EdgeRuleValidateAction.Schema. Newlines / control bytes are
+//     not sanitised at this layer (slog JSON re-encodes the wire
+//     Problem at log time) — the limit is bytes-on-the-wire, not
+//     a sanitiser.
+type EdgeRuleMaintenanceAction struct {
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+	Message           string `json:"message,omitempty"`
+}
+
+func (a *EdgeRuleMaintenanceAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("maintenance action is required")
+	}
+	if a.RetryAfterSeconds < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"maintenance action: retry_after_seconds must be >= 0 (got %d)",
+			a.RetryAfterSeconds))
+	}
+	if a.RetryAfterSeconds > MaxEdgeRuleMaintenanceRetryAfterSeconds {
+		return ErrValidation(fmt.Sprintf(
+			"maintenance action: retry_after_seconds exceeds the platform cap (%d > %d)",
+			a.RetryAfterSeconds, MaxEdgeRuleMaintenanceRetryAfterSeconds))
+	}
+	if len(a.Message) > 512 {
+		return ErrValidation(fmt.Sprintf(
+			"maintenance action: message exceeds 512 bytes (got %d)",
+			len(a.Message)))
+	}
 	return nil
 }
 

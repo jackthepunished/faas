@@ -99,6 +99,7 @@ export type { EdgeRuleHeadersAction } from './models/EdgeRuleHeadersAction.js';
 export type { EdgeRuleIPAction } from './models/EdgeRuleIPAction.js';
 export type { EdgeRuleJWTAction } from './models/EdgeRuleJWTAction.js';
 export type { EdgeRuleLimitAction } from './models/EdgeRuleLimitAction.js';
+export type { EdgeRuleMaintenanceAction } from './models/EdgeRuleMaintenanceAction.js';
 export type { EdgeRuleRedirectAction } from './models/EdgeRuleRedirectAction.js';
 export type { EdgeRuleResponse } from './models/EdgeRuleResponse.js';
 export type { EdgeRuleRewriteAction } from './models/EdgeRuleRewriteAction.js';

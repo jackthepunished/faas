@@ -1041,6 +1041,30 @@ func (b *PGBackend) putApp(app App) {
 	b.appsMu.Unlock()
 }
 
+// ResetApp (ADR-091 amendment / §4.1.2.0) drops a single app from
+// the apps LRU so the next Backend.Lookup repopulates from PG with
+// the up-to-date column values (most importantly
+// apps.maintenance_mode). Called from the cmd-side pg_notify
+// listener on db.NotifyAppChanged when the trigger fires only when
+// maintenance_mode IS DISTINCT FROM old — see
+// migrations/00221_apps_maintenance_mode.sql. The apps LRU has no
+// TTL — without this listener the gateway keeps stale
+// MaintenanceMode for the lifetime of the cache entry, and the
+// first node to see the flip returns 503 forever.
+//
+// nil-safe: an unwired backend (no apps map) short-circuits so
+// the notify subscriber doesn't need a wiring branch. Lock
+// discipline mirrors ResetEdgeRules at line 1024: write-lock for
+// the delete, RLock for reads elsewhere.
+func (b *PGBackend) ResetApp(appID string) {
+	if b == nil {
+		return
+	}
+	b.appsMu.Lock()
+	delete(b.apps, appID)
+	b.appsMu.Unlock()
+}
+
 // resolveSched picks the schedd client that should service appID
 // (Phase 2 / Gate A). Returns the per-node client when both hooks
 // are configured AND the app has a non-empty NodeID; otherwise
