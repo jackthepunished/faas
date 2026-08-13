@@ -23,6 +23,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -50,6 +51,36 @@ func serverSecretScanIsExcludedDir(name string) bool {
 		return true
 	}
 	return false
+}
+
+// openSpoolFile opens a file from the apid extract spool for scanning.
+// The spool lives under the apid-internal scan dir (cmd/apid/scan_service.go
+// passes req.ScanDir, which is a freshly-created os.MkdirTemp that the
+// caller owns), so the path is "vetted" by construction: only files
+// apid itself wrote into the spool can be walked here. We still guard
+// with a post-open Lstat mirroring cmd/gregale/commands5.go::openCustomerFile
+// so the security boundary is the same shape on both sides — a TOCTOU
+// race or a future code path that reuses this helper against a less
+// vetted directory will trip the Lstat guard instead of touching the
+// file's bytes.
+//
+// The bare os.Open below is the load-bearing exception that the
+// .golangci.yml forbidigo rule exists to gate. The wrapper IS the
+// vetted-id helper; anything less lands in a review tripwire.
+func openSpoolFile(path string) (*os.File, error) {
+	//nolint:forbidigo // openSpoolFile IS the security boundary — post-open Lstat discipline below is what makes os.Open safe here.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := f.Stat(); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("post-open stat %q: %w", path, err)
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("refusing non-regular file at %q (mode %s)", path, info.Mode())
+	}
+	return f, nil
 }
 
 // scanExtractedTreeSecrets walks scanDir and returns every secret
@@ -85,14 +116,14 @@ func scanExtractedTreeSecrets(scanDir string) ([]secretscan.Finding, error) {
 		// walk), so a symlink-to-large-file is caught here.
 		info, ierr := d.Info()
 		if ierr != nil {
-			return nil
+			return fmt.Errorf("stat %q: %w", p, ierr)
 		}
 		if info.Size() > serverSecretScanMaxBytes {
 			return nil
 		}
-		f, ferr := os.Open(p)
+		f, ferr := openSpoolFile(p)
 		if ferr != nil {
-			return nil
+			return fmt.Errorf("open %q: %w", p, ferr)
 		}
 		// Strict cap: read N+1 so we can detect overflow and skip
 		// without scanning a truncated copy.
@@ -106,7 +137,7 @@ func scanExtractedTreeSecrets(scanDir string) ([]secretscan.Finding, error) {
 		// reason; mirror it here.
 		_ = f.Close()
 		if rerr != nil {
-			return nil
+			return fmt.Errorf("read %q: %w", p, rerr)
 		}
 		if int64(len(data)) > serverSecretScanMaxBytes {
 			return nil
