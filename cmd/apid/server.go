@@ -831,6 +831,15 @@ func (s *server) handler() http.Handler {
 	// githubd gRPC bridge (cmd/apid/githubd_client.go) and streams
 	// the upstream tarball straight into validateAndSpool.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments/source-ref", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.handleSourceRefDeploy)))))
+	// PR-1 of the deploy-diff cluster — server-side pre-deploy
+	// preview. Read-only (no DB writes, no audit row, no deployment
+	// row), so the auth chain matches GET /v1/apps/{slug}/metrics
+	// (server.go:785): authLimited → requireScope(ScopesReadSurface)
+	// with NO requireMFA. A CI key with `apps:read` is sufficient;
+	// typical deploy-write keys also pass (ScopeAdmin covers the
+	// read surface). Cross-account isolation is via loadApp at
+	// handlers_diff.go:diffApp.
+	mux.HandleFunc("POST /v1/apps/{slug}/diff", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.diffApp)))
 	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeployment))))
 	// Per-deploy grype scan drill-down (issue #464 / ADR-055).
 	// Returns the typed api.ScanResult envelope (status,
