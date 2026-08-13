@@ -500,8 +500,43 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	ctx, cancel := context.WithTimeout(r.Context(), rawStreamSessionDeadline)
 	defer cancel()
 
+	// Issue #676 / ADR-080 follow-up, PR-B: instrument the WS
+	// observability surface (gateway_ws_* Prometheus series).
+	// The (plan, metrics) pair is stamped onto the request
+	// context at the cmd/gatewayd-internal three-input gate
+	// (pkg/gateway/handler.go:2899) via withWSContext so the
+	// forwarder doesn't need a wider public signature. The
+	// outcome variable is captured by reference in the four
+	// `return` branches below — each sets it before returning,
+	// and the deferred ObserveWSSessionDuration fires on the
+	// way out with the resolved label.
+	plan, metrics := wsContextFrom(r.Context())
+	sessionStart := time.Now()
+	if metrics != nil {
+		metrics.IncWSSessionStart(string(plan))
+	}
+	var wsOutcome WSOutcome
+	defer func() {
+		if metrics == nil {
+			return
+		}
+		// Default to client_disconnect if no branch set the
+		// outcome — covers the common case where the function
+		// exits via the normal bidi close (no explicit
+		// `return` path sets wsOutcome). The receiver loop's
+		// EOF branch is the only path that relies on this
+		// default; everything else sets wsOutcome before
+		// returning.
+		if wsOutcome == "" {
+			wsOutcome = WSOutcomeClientDisconnect
+		}
+		metrics.DecWSSessionEnd(string(plan))
+		metrics.ObserveWSSessionDuration(string(plan), wsOutcome, time.Since(sessionStart))
+	}()
+
 	stream, err := cli.ForwardRawStream(ctx)
 	if err != nil {
+		wsOutcome = WSOutcomeInitFailed
 		log.Error("gateway: raw forwarder stream open failed",
 			"node", t.NodeID, "err", err.Error())
 		http.Error(w, "raw forwarder stream open failed", http.StatusBadGateway)
@@ -534,6 +569,7 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	if err := stream.Send(&vmmdpb.ForwardRawRequest{
 		Frame: &vmmdpb.ForwardRawRequest_Init{Init: init},
 	}); err != nil {
+		wsOutcome = WSOutcomeInitFailed
 		log.Error("gateway: raw forwarder stream init send failed",
 			"node", t.NodeID, "err", err.Error())
 		http.Error(w, "raw forwarder stream init failed", http.StatusBadGateway)
@@ -548,6 +584,15 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// disconnect, gateway-side deadline), the goroutine exits
 	// promptly via the inner ctxReader.Read returning
 	// ctx.Err(). Same F3 fix as fwdStreamOnceWithEvents.
+	//
+	// Issue #676 / ADR-080 follow-up, PR-B: the tx byte counter
+	// increments per `stream.Send` (the bytes flowing
+	// customer→guest). The counter is increment-after-send so a
+	// half-send that the receiver catches surfaces as the
+	// upstream_unavailable outcome rather than a missing-byte
+	// observation. Prometheus counters are atomic, so the
+	// concurrent tx/rx increment from the body goroutine +
+	// receiver loop is race-free without a mutex.
 	bodyErrCh := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 8*1024)
@@ -562,6 +607,9 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 				}); serr != nil {
 					bodyErrCh <- serr
 					return
+				}
+				if metrics != nil {
+					metrics.AddWSSessionBytes(string(plan), WSDirectionTx, int64(n))
 				}
 			}
 			if errors.Is(err, io.EOF) {
@@ -597,15 +645,18 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			default:
 			}
 			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+				wsOutcome = WSOutcomeUpstreamUnavailable
 				log.Warn("gateway: raw forwarder stream Unavailable; surfacing 503",
 					"node", t.NodeID)
 				http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
 				return
 			}
 			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				wsOutcome = WSOutcomeUpstreamUnavailable
 				http.Error(w, "instance gone", http.StatusServiceUnavailable)
 				return
 			}
+			wsOutcome = WSOutcomeUpstreamUnavailable
 			log.Error("gateway: raw forwarder stream Recv failed",
 				"node", t.NodeID, "err", err.Error())
 			http.Error(w, "raw forwarder stream failed", http.StatusBadGateway)
@@ -648,6 +699,17 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			continue
 		}
 		if chunk := frame.GetBodyChunk(); len(chunk) > 0 {
+			// Issue #676 / ADR-080 follow-up, PR-B: rx byte
+			// counter increments per chunk received
+			// (guest→customer). Counter is increment-before-
+			// write so the gauge / counter pair stays
+			// self-consistent even if w.Write fails — the
+			// bytes DID arrive from the guest, the
+			// client_disconnect outcome label is for the
+			// fact that they didn't reach the customer.
+			if metrics != nil {
+				metrics.AddWSSessionBytes(string(plan), WSDirectionRx, int64(len(chunk)))
+			}
 			if _, werr := w.Write(chunk); werr != nil {
 				// Client disconnect mid-stream. The
 				// receiver stops reading frames. The
@@ -657,6 +719,7 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 				// drain bodyErrCh so the handler
 				// doesn't return while the goroutine
 				// is still unwinding.
+				wsOutcome = WSOutcomeClientDisconnect
 				log.Debug("gateway: raw forwarder stream client write failed",
 					"node", t.NodeID, "err", werr.Error())
 				<-bodyErrCh
@@ -677,6 +740,11 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// distinguish a clean bidi close from a client-disconnect
 	// (which surfaces as a Send error).
 	<-bodyErrCh
+	// wsOutcome stays at WSOutcomeClientDisconnect (the defer's
+	// default) for the clean bidi close. A future enhancement
+	// could inspect bodyErrCh's final value to distinguish
+	// client-initiated FIN from server-initiated close; for
+	// PR-B the customer-side churn signal is sufficient.
 }
 
 // flushSafe is a recover-guarded wrapper around http.Flusher.Flush

@@ -81,6 +81,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 )
 
@@ -274,6 +275,58 @@ type Metrics struct {
 	// histogram (the histogram stays unlabeled by tier to keep
 	// cardinality bounded; the counter is the join key).
 	wakeSnapshotTier *prometheus.CounterVec
+	// wsUpgradeTotal (issue #676 / ADR-080 follow-up, PR-B) counts
+	// every Connection: Upgrade + Upgrade: <token> request that
+	// crosses the cmd/gatewayd-internal three-input gate
+	// (pkg/gateway/handler.go:2899). Labels {plan, outcome}:
+	//   plan     ∈ api.Plans (Free/Hobby/Pro/Scale)
+	//   outcome  ∈ {accepted, plan_denied, bridge_disabled}
+	// "plan_denied" surfaces from both the request-time 501
+	// (writeWebSocketNotAllowed) and the PATCH-time 403
+	// (cmd/apid/handlers_ext.go:261-268). "bridge_disabled" is
+	// the FAAS_GATEWAY_RAW_STREAM_ENABLED=false / h.rawByNode==nil
+	// branch (PR-A follow-up). The closed label cross-product is
+	// pre-instantiated at boot so dashboards render with zero
+	// rows from idle fleet, non-zero as soon as production WS
+	// traffic arrives.
+	wsUpgradeTotal *prometheus.CounterVec
+	// wsActiveSessions (issue #676 / ADR-080 follow-up, PR-B) is
+	// the in-flight raw-bytes Upgrade session gauge, labelled by
+	// plan. Inc/Dec happens via IncWSSessionStart /
+	// DecWSSessionEnd inside rawStreamOnceWithEvents; the defer
+	// pair keeps Inc/Dec symmetric across every return branch
+	// (init_failed / upstream_unavailable / client_disconnect /
+	// accepted).
+	wsActiveSessions *prometheus.GaugeVec
+	// wsSessionDuration (issue #676 / ADR-080 follow-up, PR-B) is
+	// the histogram of wall-clock seconds per session. Buckets
+	// span 50 ms (one TCP round-trip) to 24 h (the
+	// rawStreamSessionDeadline ceiling at
+	// pkg/gateway/forwardproxy.go:464); intermediate buckets
+	// align with the plan wake_idle_timeout matrix so a panel
+	// can read "how long past the per-plan idle timeout did
+	// this session hold" without a custom
+	// histogram_quantile interpolation. Labels {plan, outcome}:
+	//   outcome ∈ {accepted, init_failed, upstream_unavailable,
+	//              client_disconnect} (no plan_denied /
+	//              bridge_disabled — those never open a
+	//              session)
+	wsSessionDuration *prometheus.HistogramVec
+	// wsSessionBytes (issue #676 / ADR-080 follow-up, PR-B) is
+	// the counter of bytes that traverse the raw-bytes bridge,
+	// labelled by {plan, direction}. direction ∈ {tx, rx}:
+	//   tx — bytes flowing customer → guest (request body + raw
+	//        HTTP request line + headers that the bridge carries
+	//        verbatim); incremented in the body-copy goroutine
+	//        at pkg/gateway/forwardproxy.go:~558
+	//   rx — bytes flowing guest → customer (response body + raw
+	//        HTTP status line + headers); incremented in the
+	//        receiver loop at pkg/gateway/forwardproxy.go:~651
+	// Raw-stream egress bytes ALSO flow through the
+	// per-instance egress ring via egressSink.RecordResponseBytes
+	// (PR-C follow-up) so usage_minutes.tx_bytes reflects WS
+	// workloads without a separate meterd surface.
+	wsSessionBytes *prometheus.CounterVec
 	// computeNodeChangedSubscriberAlive is the per-process liveness
 	// gauge for the LISTEN compute_node_changed subscriber loop
 	// (cmd/gatewayd-internal/nodecache.go:102-141). PR scale-out readiness:
@@ -521,6 +574,81 @@ func NewMetrics() *Metrics {
 			Name: "gateway_compute_node_changed_subscriber_alive",
 			Help: "Liveness gauge for the LISTEN compute_node_changed subscriber loop in cmd/gatewayd-internal/nodecache.go. Bumped every subscriberHeartbeatInterval (30s) while the subscriber is alive. A frozen or zero gauge means the NodeClientCache is silently out of date and the next compute_nodes UPSERT is invisible to placement. The hook is the observability point; the alert rule + window choice live in ops wiring, out of scope for this PR.",
 		}),
+		// Issue #676 / ADR-080 follow-up, PR-B: raw-bytes
+		// Upgrade / WebSocket observability surface. Four series
+		// registered against the per-Handler registry (matching
+		// the rest of pkg/gateway/metrics.go — gateway_wake_*
+		// / gateway_cold_boot_* / gateway_request_*, all
+		// per-Handler). The dashboard panels "ws: upgrades by
+		// plan (5m)", "ws: active sessions by plan",
+		// "ws: session duration p50/p95/p99 by plan", and
+		// "ws: session bytes (rx/tx) by plan" depend on these
+		// existing from boot.
+		//
+		// Plan / outcome / direction closed sets are declared
+		// alongside the helper methods below
+		// (WSOutcome / WSDirection constants) so the constructor
+		// pre-instantiate loop and the runtime helpers share one
+		// source of truth.
+		wsUpgradeTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "gateway_ws_upgrade_total",
+				Help: "Count of Connection: Upgrade + Upgrade: <token> requests crossing the cmd/gatewayd-internal three-input gate (issue #676 / ADR-080). Labelled by {plan, outcome}: plan ∈ api.Plans (Free/Hobby/Pro/Scale), outcome ∈ {accepted, plan_denied, bridge_disabled}. 'plan_denied' is the WebSocketResponseAllowed()=false branch; 'bridge_disabled' is FAAS_GATEWAY_RAW_STREAM_ENABLED=false / h.rawByNode==nil. 12 series total.",
+			},
+			[]string{"plan", "outcome"},
+		),
+		wsActiveSessions: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "gateway_ws_active_sessions",
+				Help: "In-flight raw-bytes Upgrade sessions (issue #676 / ADR-080), labelled by plan. Inc/Dec via IncWSSessionStart / DecWSSessionEnd inside pkg/gateway/forwardproxy.go's rawStreamOnceWithEvents (the defer pair keeps symmetry across every return branch). 4 series total.",
+			},
+			[]string{"plan"},
+		),
+		// Buckets span 50 ms (one TCP round-trip) to 24 h (the
+		// rawStreamSessionDeadline ceiling at
+		// pkg/gateway/forwardproxy.go:464). Intermediate buckets
+		// align with the plan wake_idle_timeout matrix (Hobby
+		// 60 s, Pro 300 s, Scale 600 s).
+		wsSessionDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name: "gateway_ws_session_duration_seconds",
+				Help: "Wall-clock seconds per raw-bytes Upgrade session (issue #676 / ADR-080). Labelled by {plan, outcome}: plan ∈ api.Plans, outcome ∈ {accepted, init_failed, upstream_unavailable, client_disconnect}. Buckets span 50 ms (one TCP round-trip) to 24 h (the rawStreamSessionDeadline); intermediate buckets align with the plan wake_idle_timeout matrix.",
+				Buckets: []float64{
+					0.05, 0.25, 1, 5, 30, 60, 300, 600, 1800, 7200, 21600, 86400,
+				},
+			},
+			[]string{"plan", "outcome"},
+		),
+		wsSessionBytes: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "gateway_ws_session_bytes_total",
+				Help: "Bytes that traverse the raw-bytes bridge (issue #676 / ADR-080), labelled by {plan, direction}: plan ∈ api.Plans, direction ∈ {tx, rx}. tx = customer→guest request body+headers; rx = guest→customer response body+headers. 8 series total.",
+			},
+			[]string{"plan", "direction"},
+		),
+	}
+	// Pre-instantiate the WS closed label cross-product (issue
+	// #676 / ADR-080 follow-up, PR-B). Same precedent as
+	// tlsOnDemandDenied / accountRateLimited above. The
+	// ws_session_duration_seconds histogram excludes plan_denied
+	// / bridge_disided because those never open a session — the
+	// counter is sufficient for the rejected-at-gate outcomes.
+	wsOutcomes := []WSOutcome{WSOutcomeAccepted, WSOutcomePlanDenied, WSOutcomeBridgeDisabled}
+	wsSessionOutcomes := []WSOutcome{WSOutcomeAccepted, WSOutcomeInitFailed, WSOutcomeUpstreamUnavailable, WSOutcomeClientDisconnect}
+	wsDirections := []WSDirection{WSDirectionTx, WSDirectionRx}
+	wsPlans := []api.Plan{api.PlanFree, api.PlanHobby, api.PlanPro, api.PlanScale}
+	for _, plan := range wsPlans {
+		planStr := string(plan)
+		m.wsActiveSessions.WithLabelValues(planStr)
+		for _, outcome := range wsOutcomes {
+			m.wsUpgradeTotal.WithLabelValues(planStr, string(outcome))
+		}
+		for _, outcome := range wsSessionOutcomes {
+			m.wsSessionDuration.WithLabelValues(planStr, string(outcome))
+		}
+		for _, direction := range wsDirections {
+			m.wsSessionBytes.WithLabelValues(planStr, string(direction))
+		}
 	}
 	// Pre-instantiate the ("other",) row on gateway_top_tenant_rps so
 	// the gauge surfaces from boot, mirroring the apid precedent
@@ -623,7 +751,18 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.streamActive.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError,
+		// Issue #676 / ADR-080 follow-up, PR-B: raw-bytes Upgrade
+		// / WebSocket observability surface. Registered alongside
+		// the rest of the gateway_* series so the §12 dashboard
+		// panels (ws_upgrade / ws_active / ws_duration /
+		// ws_bytes) surface from boot. The pre-instantiate loop
+		// above stamps every closed label cell — a missing
+		// registration here would cause /metrics to omit the
+		// series entirely even with the WithLabelValues calls in
+		// place.
+		m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes,
+	)
 	return m
 }
 
@@ -1060,4 +1199,162 @@ func (l *requestLogger) Log(appID, code string, latency time.Duration, cold bool
 		"cold", cold,
 		"request_id", logsanitize.Field(requestID),
 	)
+}
+
+// Issue #676 / ADR-080 follow-up, PR-B: closed-set label constants
+// for the gateway_ws_* Prometheus surface. Defining the sets here
+// — alongside the per-Handler Metrics type — means the constructor
+// pre-instantiate loop and the runtime helper methods share the
+// same source of truth. Adding a fourth outcome or a third
+// direction requires a deliberate constant edit; the alternative
+// (string literals scattered across pkg/gateway + handler.go) is
+// how §12 dashboard naming conventions get silently out of sync
+// with the metric names.
+type WSOutcome string
+
+const (
+	// WSOutcomeAccepted — request cleared the three-input gate
+	// (isUpgradeRequest + plan allowed + h.rawByNode wired) and
+	// the raw forwarder accepted the stream. The session
+	// duration histogram and the byte counters both fire on
+	// this outcome.
+	WSOutcomeAccepted WSOutcome = "accepted"
+	// WSOutcomePlanDenied — Plan.WebSocketResponseAllowed()
+	// returned false (Free plan). Surfaced by both the request-
+	// time 501 (pkg/gateway/handler.go writeWebSocketNotAllowed)
+	// and the PATCH-time 403
+	// (cmd/apid/handlers_ext.go:261-268).
+	WSOutcomePlanDenied WSOutcome = "plan_denied"
+	// WSOutcomeBridgeDisabled — either the
+	// FAAS_GATEWAY_RAW_STREAM_ENABLED=false kill switch
+	// (cmd/gatewayd-internal/run.go: PR-A) or h.rawByNode==nil
+	// in tests. Surfaced as the forwarderMissing=true branch of
+	// writeWebSocketNotAllowed with the same 501 +
+	// x-faas-error-reason: websocket_not_on_plan response shape.
+	WSOutcomeBridgeDisabled WSOutcome = "bridge_disabled"
+	// WSOutcomeInitFailed — rawStreamOnceWithEvents failed to
+	// open the bidi ForwardRawStream or send the init frame
+	// (the gRPC dial refused, the box lost its mTLS cert, or
+	// the bridge binary is missing). Distinct from
+	// client_disconnect because the failure happens BEFORE
+	// any bytes flow; the byte counters stay at zero.
+	WSOutcomeInitFailed WSOutcome = "init_failed"
+	// WSOutcomeUpstreamUnavailable — vmmd returned
+	// codes.Unavailable mid-session (the box crashed, the
+	// bridge binary lost its netns handle, etc.). Surfaced
+	// as 503 + body="upstream unavailable" from the
+	// receiver loop.
+	WSOutcomeUpstreamUnavailable WSOutcome = "upstream_unavailable"
+	// WSOutcomeClientDisconnect — the customer closed the
+	// connection mid-stream (TCP FIN before EOF on the
+	// body-copy goroutine). This is the normal-session-end
+	// case for WS clients; the panel
+	// rate(gateway_ws_session_duration_seconds{outcome=
+	// "client_disconnect"}) is the customer-side churn signal.
+	WSOutcomeClientDisconnect WSOutcome = "client_disconnect"
+)
+
+type WSDirection string
+
+const (
+	// WSDirectionTx — bytes flowing customer → guest
+	// (request body + the raw HTTP request line + headers
+	// that the raw bridge carries verbatim). Incremented in
+	// the body-copy goroutine at
+	// pkg/gateway/forwardproxy.go:~558.
+	WSDirectionTx WSDirection = "tx"
+	// WSDirectionRx — bytes flowing guest → customer
+	// (response body + the raw HTTP status line + headers
+	// that the bridge pipes back). Incremented in the
+	// receiver loop at pkg/gateway/forwardproxy.go:~651.
+	// Raw-stream egress bytes ALSO flow through the
+	// per-instance egress ring via
+	// egressSink.RecordResponseBytes (PR-C follow-up) so
+	// usage_minutes.tx_bytes reflects WS workloads without a
+	// separate meterd surface.
+	WSDirectionRx WSDirection = "rx"
+)
+
+// IncWSUpgrade (issue #676 / ADR-080 follow-up, PR-B) bumps the
+// {plan, outcome}-labeled gateway_ws_upgrade_total counter at the
+// cmd/gatewayd-internal three-input gate
+// (pkg/gateway/handler.go:2899). Caller passes the resolved plan
+// (Free/Hobby/Pro/Scale from api.Plans) and one of the WSOutcome
+// constants. The closed label set is pre-instantiated at boot
+// (see NewMetrics) so this call always returns a real counter;
+// nil only if m itself is nil (callers in the pre-metrics test
+// corpus use nil-safe wrap patterns).
+func (m *Metrics) IncWSUpgrade(plan string, outcome WSOutcome) {
+	if m == nil {
+		return
+	}
+	m.wsUpgradeTotal.WithLabelValues(plan, string(outcome)).Inc()
+}
+
+// IncWSSessionStart (issue #676 / ADR-080 follow-up, PR-B)
+// increments the {plan}-labeled gateway_ws_active_sessions
+// gauge when a raw-bytes Upgrade session opens. MUST be paired
+// with DecWSSessionEnd on every return path;
+// pkg/gateway/forwardproxy.go's rawStreamOnceWithEvents uses a
+// `IncWSSessionStart + defer DecWSSessionEnd` pair at the top of
+// the function so symmetry is automatic across init_failed /
+// upstream_unavailable / client_disconnect / accepted.
+func (m *Metrics) IncWSSessionStart(plan string) {
+	if m == nil {
+		return
+	}
+	m.wsActiveSessions.WithLabelValues(plan).Inc()
+}
+
+// DecWSSessionEnd (issue #676 / ADR-080 follow-up, PR-B)
+// decrements the {plan}-labeled gateway_ws_active_sessions
+// gauge when a raw-bytes Upgrade session closes. MUST be paired
+// with IncWSSessionStart; the defer-pair at
+// rawStreamOnceWithEvents guarantees symmetry. Calling
+// DecWSSessionEnd without a matching Inc is a programmer error
+// and will produce negative gauge values.
+func (m *Metrics) DecWSSessionEnd(plan string) {
+	if m == nil {
+		return
+	}
+	m.wsActiveSessions.WithLabelValues(plan).Dec()
+}
+
+// ObserveWSSessionDuration (issue #676 / ADR-080 follow-up, PR-B)
+// records one wall-clock seconds sample in the
+// {plan, outcome}-labeled gateway_ws_session_duration_seconds
+// histogram. Buckets span 50 ms to 24 h; a session hitting the
+// rawStreamSessionDeadline ceiling
+// (pkg/gateway/forwardproxy.go:464) emits the top bucket
+// cleanly. Outcome distinguishes the closed-session paths
+// (accepted / client_disconnect) from the failure paths
+// (init_failed / upstream_unavailable) so a Grafana panel can
+// split "WS churn" (client_disconnect rate) from "WS
+// availability" (accepted / (accepted + init_failed +
+// upstream_unavailable) ratio).
+func (m *Metrics) ObserveWSSessionDuration(plan string, outcome WSOutcome, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.wsSessionDuration.WithLabelValues(plan, string(outcome)).Observe(d.Seconds())
+}
+
+// AddWSSessionBytes (issue #676 / ADR-080 follow-up, PR-B) adds
+// n bytes to the {plan, direction}-labeled
+// gateway_ws_session_bytes_total counter. Use Add (not Inc)
+// because a single Write or Read can carry more than 1 byte —
+// e.g. a 16 KiB gorilla/websocket frame in the round-trip e2e
+// (pkg/gateway/forwardproxy_handler_test.go). Counter math is
+// identical to a per-byte Inc but the API surface documents the
+// byte-volume intent. n<=0 is a no-op (handles short-reads where
+// the body goroutine returned 0 bytes before EOF without
+// double-counting).
+func (m *Metrics) AddWSSessionBytes(plan string, direction WSDirection, n int64) {
+	if m == nil {
+		return
+	}
+	if n <= 0 {
+		return
+	}
+	m.wsSessionBytes.WithLabelValues(plan, string(direction)).Add(float64(n))
 }

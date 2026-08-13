@@ -37,9 +37,57 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"strings"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
+
+// wsContextKey is the unexported context key that the
+// cmd/gatewayd-internal three-input gate (handler.go:2899) uses to
+// stamp the resolved app.Plan + the per-Handler Metrics pointer
+// onto the inbound request context. The raw forwarder
+// (pkg/gateway/forwardproxy.go's rawStreamOnceWithEvents) reads
+// the pair from the context to label its gateway_ws_*
+// observations without having to thread (plan, metrics) through
+// the public Handler/ForwardingRawReverseProxy signature.
+//
+// The metrics pointer is stored as *Metrics (not *wire.OpsMetrics)
+// because gatewayd-internal's local Prometheus registry is the
+// per-Handler one (pkg/gateway/metrics.go), which already
+// registers the rest of the gateway_* series. A separate
+// daemon-wide registry would split the WS surface from the wake
+// / cold-boot / request-* surface on /metrics, complicating the
+// §12 dashboard wiring.
+type wsContextKey struct{}
+
+// withWSContext stamps plan + metrics onto a copy of ctx. nil
+// metrics is allowed — the raw forwarder checks for nil before
+// calling helpers (the helpers themselves are nil-safe). Used by
+// the three-input gate in pkg/gateway/handler.go's ServeHTTP.
+func withWSContext(ctx context.Context, plan api.Plan, m *Metrics) context.Context {
+	if plan == "" && m == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, wsContextKey{}, wsContext{plan: plan, metrics: m})
+}
+
+// wsContextFrom returns the (plan, metrics) pair stashed by
+// withWSContext, or zero values if absent (the pre-PR-B test
+// corpus + the public→internal hop before the handler stamps it).
+func wsContextFrom(ctx context.Context) (api.Plan, *Metrics) {
+	v, ok := ctx.Value(wsContextKey{}).(wsContext)
+	if !ok {
+		return "", nil
+	}
+	return v.plan, v.metrics
+}
+
+type wsContext struct {
+	plan    api.Plan
+	metrics *Metrics
+}
 
 // isUpgradeRequest reports whether the inbound request carries the
 // RFC 7230 §6.1 hop-by-hop Upgrade token. The detector accepts ANY
