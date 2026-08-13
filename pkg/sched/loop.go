@@ -1372,7 +1372,7 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 	// app_id so the per-tick cap applies per-app, not globally.
 	parkByApp := map[string][]string{}
 	if len(desiredByApp) > 0 {
-		for _, id := range ReapAggressive(now, snapshot, desiredByApp) {
+		for _, id := range ReapAggressive(now, snapshot, desiredByApp, l.ops) {
 			appID := instanceToApp[id]
 			if appID == "" {
 				continue

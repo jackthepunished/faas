@@ -125,6 +125,21 @@ type Decision struct {
 //   - Per-instance inflight > target (strict >) → admit when
 //     headroom > 0, else reject_at_cap.
 //   - Otherwise → no_signal.
+//
+// P1A asymmetry note: the cooldown consult above is a fast-bail
+// predicate, NOT an emission of schedd_scale_up_decisions_total{
+// outcome="cooldown_held"}. The trigger's job is to fire
+// Engine.AdmitInstance when over target; if Engine.admitGate
+// subsequently rejects via the same cooldown consult, it emits
+// `cooldown_held` once at engine.go:4862-4867. Routing the
+// emission through the trigger too would double-count and would
+// also break the scale-up metric semantics (`cooldown_held` is
+// the wake-gate path; the scale-up trigger's cooldown is its own
+// gate, not the metric source). The trigger returns
+// Decision{Outcome: OutcomeCooldownHeld} but the OutcomeCooldownHeld
+// is mapped to a no-op in the trigger-side caller
+// (Tick at trigger.go:279) rather than to ObserveScaleUp, so the
+// closed-set metric never sees it.
 func decide(s Stats) Decision {
 	if s.TargetValue == 0 {
 		return Decision{Outcome: OutcomeNoSignal}

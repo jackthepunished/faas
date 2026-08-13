@@ -29,6 +29,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
@@ -1082,6 +1083,25 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 // deployment is overridden. If the override deployment is no longer
 // live (a newer deploy happened mid-tick), the call returns
 // {AtCapacity: true} — the trigger's next sweep re-evaluates.
+//
+// P1A asymmetry note: this path (the floor trigger / fan-out /
+// per-deployment wake) bypasses Engine.admitGate by design. The
+// canonical per-app cap enforcement is NodeLedger.Admit
+// (pkg/sched/admission.go:225-228), which fires inside
+// ledger.Admit below. The PR-C invariant pinned at
+// pkg/sched/invariants_property_test.go:68
+// (TestProperty_EngineWake_RespectsMaxConcurrency) requires
+// "ledger caps, not lock caps" — both admitAndDispatch (wake path,
+// :1191) and admitAndDispatchForDeployment (this function) feed
+// into the same ledger write. As a consequence, the per-deployment
+// path cannot emit schedd_scale_up_decisions_total{outcome ∈
+// {cooldown_held, min_floor_already, overage_cap_reached}} from
+// the gate — only reject_at_cap surfaces, via the ledger's
+// *api.Problem{Code: CodePlanLimitConcur} return. Documenting this
+// here so a future reviewer doesn't try to "fix" it by routing the
+// deployment path through the gate (which would require either
+// collapsing the two cap-enforcement layers or duplicating the
+// ledger write).
 func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID string, liftCapacityToResult bool) (WakeResult, error) {
 	// ── Phase 2: admit window, under appMu ──────────────────
 	release := e.lockApp(appID)
@@ -1707,6 +1727,20 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			RequestedAt: bootInput.startedAt, // best-effort stamp
 		})
 	}
+	// ADR-097 (P1B): capture the schedd-side wake-phase boundaries.
+	//   - rpcStartedAt: the moment just before the vmmd
+	//     CreateFromSnapshot / CreateColdBoot RPC fires. Used to
+	//     observe admit_to_rpc (gap from bootInput.startedAt) and
+	//     rpc_call (gap from rpcStartedAt to RPC return).
+	//   - rpcEndedAt: the moment the vmmd RPC returns nil on the
+	//     success path. Used to observe rpc_to_running (gap from
+	//     rpcEndedAt to the WAKING/COLD_BOOTING → RUNNING
+	//     transition below at engine.go:1892).
+	// Both captures are wall-clock time.Now() — negligible overhead,
+	// <1µs each. The error path at :1781-1790 does not capture
+	// rpcEndedAt; the error duration is already surfaced via the
+	// events.BootFailed - events.BootStarted math.
+	rpcStartedAt := time.Now().UTC()
 	if bootInput.haveSnap && bootInput.snapKey != "" {
 		// #96 / ADR-025 axis 2: read the storage key the snap row
 		// carries (imaged stamps it from the snapshot_written
@@ -1805,6 +1839,13 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	release2 := e.lockApp(bootInput.appID)
 	defer release2()
 
+	// ADR-097 (P1B): success-path RPC end capture. The error branch
+	// above does NOT capture rpcEndedAt — error duration is already
+	// surfaced via the events.BootFailed - events.BootStarted math
+	// (see engine.go:1810-1817). We only need the success-path
+	// capture to scope rpc_to_running.
+	rpcEndedAt := time.Now().UTC()
+
 	// Re-read the row. If a watchdog (commit 3) or a Park or another
 	// Wake moved it out of initState during Phase 3, abort: this Wake
 	// is no longer the canonical owner. Free the reservation and
@@ -1890,6 +1931,57 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	}
 
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
+
+	// ADR-097 (P1B): observe the three schedd-side wake phases.
+	//   - admit_to_rpc = rpcStartedAt - bootInput.startedAt.
+	//     Covers the gRPC handler → admitGate → ledger → placement
+	//     → bootInput construction window. bootInput.startedAt is
+	//     the existing bootInput capture at :1589 — the bootInput
+	//     stamp and the events.Platform BootStarted.RequestedAt are
+	//     the same moment, so the histogram joins cleanly to the
+	//     events table on wake_id.
+	//   - rpc_call = rpcEndedAt - rpcStartedAt.
+	//     Wall-clock time inside the vmmd Create{FromSnapshot,ColdBoot}
+	//     RPC. Cross-process boundary; the only phase that crosses
+	//     a node-local socket.
+	//   - rpc_to_running = time.Since(rpcEndedAt).
+	//     Covers the bootInput re-read + SetInstanceRuntime +
+	//     audit emit + e.transition work.
+	//
+	// All three are observed on the success path only — the error
+	// branches above (engine.go:1795-1838) do not produce a
+	// successful RUNNING transition and would skew the histogram
+	// with failure latencies that the events.BootFailed row already
+	// captures. The wake_id is attached as a prometheus.Exemplar on
+	// each observation (the third ObserveWithExemplar arg below)
+	// so operators can join to gateway_wake_latency_seconds on the
+	// gateway side and to the events table.
+	if e.ops != nil {
+		// wake_id is the per-wake-attempt correlation handle emitted
+		// on the events table and on the boot_started / boot_completed
+		// SSE channel. Attach it as a prometheus.Exemplar on each
+		// phase observation so operators can join metrics to events
+		// on the wake_id key without paying the label cardinality cost.
+		exemplar := prometheus.Labels{"wake_id": bootInput.wakeID}
+		if obs, ok := e.ops.WakeRPCDuration(bootInput.appID, "admit_to_rpc").(prometheus.ExemplarObserver); ok {
+			obs.ObserveWithExemplar(
+				rpcStartedAt.Sub(bootInput.startedAt).Seconds(),
+				exemplar,
+			)
+		}
+		if obs, ok := e.ops.WakeRPCDuration(bootInput.appID, "rpc_call").(prometheus.ExemplarObserver); ok {
+			obs.ObserveWithExemplar(
+				rpcEndedAt.Sub(rpcStartedAt).Seconds(),
+				exemplar,
+			)
+		}
+		if obs, ok := e.ops.WakeRPCDuration(bootInput.appID, "rpc_to_running").(prometheus.ExemplarObserver); ok {
+			obs.ObserveWithExemplar(
+				time.Since(rpcEndedAt).Seconds(),
+				exemplar,
+			)
+		}
+	}
 
 	// issue #517 / PR-C / ADR-064 — emit wake.boot_completed. The
 	// three sibling emits (wake.boot_started, wake.boot_completed,
