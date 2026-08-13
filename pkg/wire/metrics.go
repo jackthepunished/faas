@@ -361,6 +361,17 @@ type OpsMetrics struct {
 	// Single-registry: registered on every daemon; only apid
 	// increments via ObserveAppErrorsPurge.
 	appErrorsPurges *prometheus.CounterVec
+	// previewJanitorOutcomes (ADR-095 PR-C) — counter for the
+	// preview teardown cron (cmd/apid/preview_janitor.go).
+	// outcome ∈ {ok, failed, torn_down}. `ok` fires every tick
+	// the sweep ran cleanly (whether or not it tombstoned a
+	// row); `torn_down` fires per-row when a preview app
+	// reaches the torn_down state and is soft-deleted (the
+	// §12 teardown-rate panel sums this over 1h to chart PR-
+	// close cadence); `failed` is the tripwire for a SQL-level
+	// failure (alertable). Single-registry: registered on every
+	// daemon; only apid increments via ObservePreviewJanitor.
+	previewJanitorOutcomes *prometheus.CounterVec
 	// accountLabels: the bounded admission set shared by the
 	// account_id-labelled metrics above. See accountLabelSet docs
 	// for the fixed-capacity, non-evicting contract — an evicting
@@ -2297,6 +2308,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"ok", "no_accounts", "failed"} {
 		appErrorsPurges.WithLabelValues(outcome)
 	}
+	// ADR-095 PR-C: preview teardown janitor outcomes. Mirror of
+	// appErrorsPurges for the preview-row sweep. The closed-set
+	// outcome vocabulary keeps cardinality bounded per
+	// ObserveAppErrorsPurge convention.
+	previewJanitorOutcomes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_preview_janitor_outcomes_total",
+		Help: "Preview teardown cron outcomes (ADR-095 PR-C, issue #272), labelled by outcome ∈ {ok, failed, torn_down}. `ok` fires every tick the sweep ran cleanly (whether or not it tombstoned a row); `torn_down` fires per-row when a preview app reaches torn_down and is soft-deleted (the §12 teardown-rate panel sums this over 1h to chart PR-close cadence); `failed` is the tripwire for a SQL-level failure (alertable). Single-registry: registered on every daemon; only apid increments via ObservePreviewJanitor.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, previewJanitorOutcomes)
+	for _, outcome := range []string{"ok", "failed", "torn_down"} {
+		previewJanitorOutcomes.WithLabelValues(outcome)
+	}
 	// ADR-067 / Tier A6: migrating-instance watchdog reconcile counter.
 	// Labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}.
 	// The reinvited label is the §12 dashboard panel (sum over 5m for
@@ -2775,6 +2798,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsDedupeMerges:              appErrorsDedupeMerges,
 		appErrorsFlushDuration:             appErrorsFlushDuration,
 		appErrorsPurges:                    appErrorsPurges,
+		previewJanitorOutcomes:             previewJanitorOutcomes,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,
@@ -3016,6 +3040,19 @@ func (m *OpsMetrics) ObserveAppErrorsPurge(outcome string) {
 		return
 	}
 	m.appErrorsPurges.WithLabelValues(outcome).Inc()
+}
+
+// ObservePreviewJanitor records one observation of the apid
+// preview teardown cron (ADR-095 PR-C / issue #272). outcome ∈
+// {ok, failed, torn_down}. nil-safe — no-op if m is nil or the
+// metric was pre-instantiated without labels. The closed outcome
+// set keeps cardinality bounded per the ObserveAppErrorsPurge
+// convention (ADR-096 retention cron shares the same pattern).
+func (m *OpsMetrics) ObservePreviewJanitor(outcome string) {
+	if m == nil || m.previewJanitorOutcomes == nil {
+		return
+	}
+	m.previewJanitorOutcomes.WithLabelValues(outcome).Inc()
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram

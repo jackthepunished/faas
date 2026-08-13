@@ -1474,6 +1474,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}()
 		go newAppErrorsPurger(srv.store, nil, srv.ops, log, true).Run(ctx)
 
+		// ADR-095 PR-C: preview teardown janitor. Lives in apid
+		// (the sole writer to customer-intent tables per CLAUDE.md
+		// line 71) and drives preview rows through the
+		// closed → stale → torn_down state machine. Emits
+		// db.NotifyAppDelete so schedd reaps in-flight instances
+		// for tombstoned apps via its existing app_delete
+		// subscriber (pkg/sched/app_delete_subscriber.go).
+		go newPreviewJanitor(srv.store, srv.notif, srv.ops, log, true).Run(ctx)
+
 		// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. Apid
 		// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
 		// by watchLogLevelReload). Install three parallel ones — each
