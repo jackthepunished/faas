@@ -2897,6 +2897,15 @@ func ErrPlanEdgeRuleKindQuotaReached(plan Plan, kind string, observed, limit int
 
 // ErrCORSOriginNotAllowed is the 403 returned when a CORS rule's
 // allow_origins list rejects the request's Origin header.
+//
+// Exported for apid test fixtures and future per-app audit emit
+// (CORS improvements D1); not consumed on the gateway hot path
+// today, where origin rejection is silent — the gateway stamps
+// no Access-Control-Allow-Origin and the browser drops the
+// response client-side. A future ADR can switch the gateway to
+// emit this Problem on a per-deployment "fail-closed" opt-in;
+// today the failure mode matches the pre-PR-#841 contract
+// documented in spec §4.1.2.6.
 func ErrCORSOriginNotAllowed(origin string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeCORSOriginNotAllowed,
 		"CORS origin not allowed",

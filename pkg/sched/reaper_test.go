@@ -1,11 +1,13 @@
 package sched
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 func TestEffectiveIdleTimeout(t *testing.T) {
@@ -40,7 +42,7 @@ func TestReapIdle(t *testing.T) {
 		// Free 30s; idle 45s → reap.
 		{Instance: "free-idle", Plan: api.PlanFree, State: state.StateRunning, LastRequest: now.Add(-45 * time.Second)},
 	}
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if !equalSet(got, []string{"idle", "free-idle"}) {
 		t.Errorf("ReapIdle = %v, want [idle free-idle]", got)
 	}
@@ -76,7 +78,7 @@ func TestReapIdleSkipsInstanceWithOpenConns(t *testing.T) {
 		{Instance: "fresh", Plan: api.PlanPro, State: state.StateRunning,
 			LastRequest: now.Add(-time.Second)},
 	}
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if !equalSet(got, []string{"idle"}) {
 		t.Errorf("ReapIdle = %v, want [idle] only", got)
 	}
@@ -110,7 +112,7 @@ func TestReapIdleSkipsInstanceWithTailCount(t *testing.T) {
 		{Instance: "fresh", Plan: api.PlanPro, State: state.StateRunning,
 			LastRequest: now.Add(-time.Second)},
 	}
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if !equalSet(got, []string{"idle"}) {
 		t.Errorf("ReapIdle = %v, want [idle] only", got)
 	}
@@ -150,7 +152,7 @@ func TestReapAggressiveSkipsInstanceWithTailCount(t *testing.T) {
 	// the two tail-bearing instances.
 	const testAppID = "app1"
 	desiredByApp := map[string]int{testAppID: 0}
-	got := ReapAggressive(now, instances, desiredByApp, nil)
+	got := ReapAggressive(now, instances, desiredByApp, nil, nil)
 	if containsString(got, "tail-stale") {
 		t.Errorf("ReapAggressive picked tail-stale (TailCount=3, stale); the tail-count gate is not honored; got %v", got)
 	}
@@ -273,7 +275,7 @@ func TestReapIdleRespectsMinInstancesFloor(t *testing.T) {
 		in.MinInstances = 0 // start with no floor
 	}
 	// floor 0 → reap all 4.
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if !equalSet(got, []string{"oldest", "older", "newer", "newest"}) {
 		t.Fatalf("floor 0: got %v, want all 4", got)
 	}
@@ -281,7 +283,7 @@ func TestReapIdleRespectsMinInstancesFloor(t *testing.T) {
 	for i := range instances {
 		instances[i].MinInstances = 2
 	}
-	got = ReapIdle(now, instances)
+	got = ReapIdle(now, instances, nil, nil)
 	if !equalSet(got, []string{"oldest", "older"}) {
 		t.Fatalf("floor 2: got %v, want [oldest older] (drop freshest)", got)
 	}
@@ -289,7 +291,7 @@ func TestReapIdleRespectsMinInstancesFloor(t *testing.T) {
 	for i := range instances {
 		instances[i].MinInstances = 4
 	}
-	got = ReapIdle(now, instances)
+	got = ReapIdle(now, instances, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("floor 4 (== running): got %v, want empty", got)
 	}
@@ -297,7 +299,7 @@ func TestReapIdleRespectsMinInstancesFloor(t *testing.T) {
 	for i := range instances {
 		instances[i].MinInstances = 99
 	}
-	got = ReapIdle(now, instances)
+	got = ReapIdle(now, instances, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("floor 99 (>running): got %v, want empty (allowed clamps to 0)", got)
 	}
@@ -326,7 +328,7 @@ func TestReapIdleFloorDoesNotCrossApps(t *testing.T) {
 	for i := range instances {
 		instances[i].MinInstances = 1
 	}
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if !equalSet(got, []string{"a1-old", "a2-old", "a2-mid"}) {
 		t.Fatalf("got %v, want [a1-old a2-old a2-mid] (1 fresh per app kept)", got)
 	}
@@ -392,7 +394,7 @@ func TestReapAggressive_ParkToBuffer(t *testing.T) {
 		mkAggressive("app1", "newer", 30*time.Minute, 0, 1),
 		mkAggressive("app1", "newest", 15*time.Minute, 0, 1),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	// limit = max(1, 0+1) = 1; extra = 4-1 = 3. Wait — 4 candidates, 3
 	// extra → park 3, keep the freshest.
 	if !equalSet(got, []string{"oldest", "older", "newer"}) {
@@ -409,7 +411,7 @@ func TestReapAggressive_WithinBuffer(t *testing.T) {
 		mkAggressive("app1", "b", 45*time.Minute, 0, 0),
 		mkAggressive("app1", "c", 30*time.Minute, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 2}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 2}, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("3-inst / desired=2 / within buffer: got %v, want empty", got)
 	}
@@ -424,7 +426,7 @@ func TestReapAggressive_JustAboveBuffer(t *testing.T) {
 		mkAggressive("app1", "mid", 45*time.Minute, 0, 0),
 		mkAggressive("app1", "newest", 30*time.Minute, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 1}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 1}, nil, nil)
 	if len(got) != 1 || got[0] != "oldest" {
 		t.Fatalf("got %v, want [oldest]", got)
 	}
@@ -445,7 +447,7 @@ func TestReapAggressive_OpenConnsProtect(t *testing.T) {
 		mkAggressive("app1", "open", 45*time.Minute, 3, 0),
 		mkAggressive("app1", "newest", 30*time.Minute, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	if !equalSet(got, []string{"oldest", "newest"}) {
 		t.Fatalf("got %v, want [oldest newest] (open-conns instance is the only survivor)", got)
 	}
@@ -468,7 +470,7 @@ func TestReapAggressive_MinInstanceAgeProtects(t *testing.T) {
 		fresh,
 		mkAggressive("app1", "old", time.Hour, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	// fresh: not in candidates (too young). old: in candidates.
 	// limit=max(0, 0+1)=1; extra=2-1=1; park 1 = "old".
 	if !equalSet(got, []string{"old"}) {
@@ -481,7 +483,7 @@ func TestReapAggressive_MinInstanceAgeProtects(t *testing.T) {
 func TestReapAggressive_SingleInstanceApp(t *testing.T) {
 	now := time.Now()
 	instances := []InstanceInfo{mkAggressive("app1", "only", time.Hour, 0, 0)}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("single instance must not be reaped, got %v", got)
 	}
@@ -497,7 +499,7 @@ func TestReapAggressive_NilDesired_DefersToReapIdle(t *testing.T) {
 		mkAggressive("hobby-app", "b", 45*time.Minute, 0, 0),
 	}
 	// desiredByApp has no entry for hobby-app.
-	got := ReapAggressive(now, instances, nil, nil)
+	got := ReapAggressive(now, instances, nil, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("apps absent from desiredByApp must not be reaped, got %v", got)
 	}
@@ -515,7 +517,7 @@ func TestReapAggressive_ZeroTarget_ClampsToFloor(t *testing.T) {
 		mkAggressive("app1", "newer", 15*time.Minute, 0, 2),
 		mkAggressive("app1", "newest", 5*time.Minute, 0, 2),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	if !equalSet(got, []string{"oldest", "older", "mid"}) {
 		t.Fatalf("got %v, want [oldest older mid] (floor 2 + 3 extra)", got)
 	}
@@ -543,7 +545,7 @@ func TestReapAggressive_TwoApps(t *testing.T) {
 	got := ReapAggressive(now, instances, map[string]int{
 		"appA": 0,
 		"appB": 1,
-	}, nil)
+	}, nil, nil)
 	want := []string{"appA_oldest", "appA_older", "appB_oldest", "appB_older"}
 	if !equalSet(got, want) {
 		t.Fatalf("two apps: got %v, want %v", got, want)
@@ -561,7 +563,7 @@ func TestReapAggressive_FloorExceedsRunning(t *testing.T) {
 		mkAggressive("app1", "b", 45*time.Minute, 0, 10),
 		mkAggressive("app1", "c", 30*time.Minute, 0, 10),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("floor (10) > running (3): got %v, want empty", got)
 	}
@@ -580,7 +582,7 @@ func TestReapAggressive_EmptyCandidates(t *testing.T) {
 	}
 	// Override Started so the second instance is MinInstanceAge-young.
 	instances[1].Started = now.Add(-10 * time.Second)
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("all candidates protected: got %v, want empty", got)
 	}
@@ -613,7 +615,7 @@ func TestReapIdle_WorkerClassCarveOut(t *testing.T) {
 			WorkloadClass: state.WorkloadClassHTTP,
 		},
 	}
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if len(got) != 1 || got[0] != "http-1" {
 		t.Fatalf("ReapIdle worker carve-out: got %v, want [http-1] (worker must be exempt)", got)
 	}
@@ -647,7 +649,7 @@ func TestReapAggressive_WorkerClassCarveOut(t *testing.T) {
 	// http-1 as a candidate. workers must not run, not enter the
 	// candidate set, and not park.
 	desired := map[string]int{"app1": 0}
-	got := ReapAggressive(now, instances, desired, nil)
+	got := ReapAggressive(now, instances, desired, nil, nil)
 	// Running=1 (only http-1), limit=max(0, 0+1)=1, extra=0 → no park.
 	for _, id := range got {
 		if id == "worker-1" || id == "worker-2" {
@@ -656,7 +658,7 @@ func TestReapAggressive_WorkerClassCarveOut(t *testing.T) {
 	}
 	// also with desired=10 — must NOT park workers under "running is 3".
 	desired10 := map[string]int{"app1": 10}
-	got = ReapAggressive(now, instances, desired10, nil)
+	got = ReapAggressive(now, instances, desired10, nil, nil)
 	for _, id := range got {
 		if id == "worker-1" || id == "worker-2" {
 			t.Errorf("ReapAggressive carved-out worker under desired=10; got %v", id)
@@ -691,7 +693,7 @@ func TestReapIdleRespectsScaleInCooldownUnder(t *testing.T) {
 		{Instance: "idle-b", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
 			LastRequest: now.Add(-45 * time.Minute), LastScaleInAt: &last, ScaleInCooldownS: 60},
 	}
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if len(got) != 0 {
 		t.Errorf("ReapIdle (cooldown 59s remaining) = %v, want [] (cooldown_held)", got)
 	}
@@ -710,9 +712,131 @@ func TestReapIdleRespectsScaleInCooldownOver(t *testing.T) {
 		{Instance: "idle-b", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
 			LastRequest: now.Add(-45 * time.Minute), LastScaleInAt: &last, ScaleInCooldownS: 60},
 	}
-	got := ReapIdle(now, instances)
+	got := ReapIdle(now, instances, nil, nil)
 	if !equalSet(got, []string{"idle-a", "idle-b"}) {
 		t.Errorf("ReapIdle (cooldown elapsed) = %v, want [idle-a idle-b]", got)
+	}
+}
+
+// TestReapIdleEmitsCooldownHeld (P1D) pins that when the per-app
+// scale-in cooldown consult fires, ReapIdle emits
+// schedd_scale_down_decisions_total{outcome="cooldown_held"} exactly
+// once per app per tick (the per-row loop body would otherwise fire
+// for every RUNNING instance in the app). Mirrors
+// TestReapAggressiveEmitsCooldownHeld in loop_test.go but at the
+// selector boundary so the metric contract is pinned independently
+// of the loop wrapper.
+func TestReapIdleEmitsCooldownHeld(t *testing.T) {
+	now := time.Now()
+	last := now.Add(-1 * time.Second)
+	instances := []InstanceInfo{
+		{Instance: "idle-a", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour), LastScaleInAt: &last, ScaleInCooldownS: 60},
+		{Instance: "idle-b", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-45 * time.Minute), LastScaleInAt: &last, ScaleInCooldownS: 60},
+		{Instance: "idle-c", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-30 * time.Minute), LastScaleInAt: &last, ScaleInCooldownS: 60},
+	}
+	ops := wire.NewOpsMetrics("schedd")
+	got := ReapIdle(now, instances, ops, nil)
+	if len(got) != 0 {
+		t.Errorf("ReapIdle (cooldown held) = %v, want []", got)
+	}
+	// Cooldown held → 1 observation (NOT 3, despite 3 RUNNING
+	// instances — the cooldownEmitted flag is the load-bearing
+	// contract here). `park` must NOT fire because the app was
+	// skipped entirely.
+	body := wireRenderMetrics(t, ops)
+	if !bytes.Contains(body, []byte(`schedd_scale_down_decisions_total{app="app1",outcome="cooldown_held"} 1`)) {
+		t.Errorf("missing cooldown_held=1 line in:\n%s", body)
+	}
+	if bytes.Contains(body, []byte(`schedd_scale_down_decisions_total{app="app1",outcome="park"}`)) {
+		t.Errorf("unexpected park line for cooldown-held app in:\n%s", body)
+	}
+}
+
+// TestReapIdleEmitsPark (P1D) pins that ReapIdle emits
+// schedd_scale_down_decisions_total{outcome="park"} exactly once
+// per app per tick when at least one instance is parked, even
+// when multiple instances are parked for the same app in the
+// same tick. Layout: 3 stale Pro instances, floor=0, no cooldown.
+// All 3 are parked; one observation fires.
+func TestReapIdleEmitsPark(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "a", time.Hour, 0, 0),
+		mkAggressive("app1", "b", 45*time.Minute, 0, 0),
+		mkAggressive("app1", "c", 30*time.Minute, 0, 0),
+	}
+	ops := wire.NewOpsMetrics("schedd")
+	got := ReapIdle(now, instances, ops, nil)
+	if !equalSet(got, []string{"a", "b", "c"}) {
+		t.Errorf("ReapIdle = %v, want [a b c]", got)
+	}
+	body := wireRenderMetrics(t, ops)
+	if !bytes.Contains(body, []byte(`schedd_scale_down_decisions_total{app="app1",outcome="park"} 1`)) {
+		t.Errorf("missing park=1 line in:\n%s", body)
+	}
+	// And no `min_floor_already` for the same app — the floor was
+	// zero, so the floor branch never fires.
+	if bytes.Contains(body, []byte(`schedd_scale_down_decisions_total{app="app1",outcome="min_floor_already"}`)) {
+		t.Errorf("unexpected min_floor_already line in:\n%s", body)
+	}
+}
+
+// TestReapIdleEmitsMinFloorAlready (P1D) pins the floor-kept
+// branch: when candidates exist but the floor blocks every one
+// (allowed == 0 with floor > 0), ReapIdle emits
+// schedd_scale_down_decisions_total{outcome="min_floor_already"}
+// once per app per tick. Layout: 2 stale Pro instances, floor=2,
+// no cooldown. Both candidates exist but neither can be parked
+// because the floor says keep both alive. No `park` observation.
+func TestReapIdleEmitsMinFloorAlready(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		mkAggressive("app1", "a", time.Hour, 0, 2), // floor=2
+		mkAggressive("app1", "b", 45*time.Minute, 0, 2),
+	}
+	ops := wire.NewOpsMetrics("schedd")
+	got := ReapIdle(now, instances, ops, nil)
+	if len(got) != 0 {
+		t.Errorf("ReapIdle = %v, want [] (floor kept all candidates)", got)
+	}
+	body := wireRenderMetrics(t, ops)
+	if !bytes.Contains(body, []byte(`schedd_scale_down_decisions_total{app="app1",outcome="min_floor_already"} 1`)) {
+		t.Errorf("missing min_floor_already=1 line in:\n%s", body)
+	}
+	if bytes.Contains(body, []byte(`schedd_scale_down_decisions_total{app="app1",outcome="park"}`)) {
+		t.Errorf("unexpected park line in:\n%s", body)
+	}
+}
+
+// TestReapIdle_NilMetrics_NoPanic (P1D) pins the nil-safety
+// contract on the new metrics parameter. The selector must
+// return the same park slice it would have returned with a
+// non-nil metrics (or with the no-metrics fixture default) and
+// must NOT panic on the nil receiver dereferences that
+// ObserveScaleDown would normally guard via its own nil-receiver
+// check (reaper.go never calls ObserveScaleDown when metrics==nil,
+// so this is the load-bearing test for that contract).
+//
+// Layout: two apps. app1 is in cooldown (cooldown_held would fire
+// with non-nil metrics). app2 has no cooldown and one stale
+// instance (park would fire with non-nil metrics). With nil
+// metrics, neither emission runs but the pure return value is
+// unchanged: app2's stale instance is parked, app1 contributes
+// nothing.
+func TestReapIdle_NilMetrics_NoPanic(t *testing.T) {
+	now := time.Now()
+	last := now.Add(-1 * time.Second)
+	instances := []InstanceInfo{
+		{Instance: "idle-a", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour), LastScaleInAt: &last, ScaleInCooldownS: 60},
+		mkAggressive("app2", "b", time.Hour, 0, 0),
+	}
+	got := ReapIdle(now, instances, nil, nil)
+	if !equalSet(got, []string{"b"}) {
+		t.Errorf("ReapIdle = %v, want [b]", got)
 	}
 }
 
@@ -729,7 +853,7 @@ func TestReapAggressiveRespectsScaleInCooldownUnder(t *testing.T) {
 		mkAggressiveWithStamp("app1", "b", 45*time.Minute, 0, 0, &last, 60),
 		mkAggressiveWithStamp("app1", "c", 30*time.Minute, 0, 0, &last, 60),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	if len(got) != 0 {
 		t.Errorf("ReapAggressive (cooldown 59s remaining) = %v, want [] (cooldown_held)", got)
 	}
@@ -748,7 +872,7 @@ func TestReapAggressiveRespectsScaleInCooldownOver(t *testing.T) {
 		mkAggressiveWithStamp("app1", "b", 45*time.Minute, 0, 0, &last, 60),
 		mkAggressiveWithStamp("app1", "c", 30*time.Minute, 0, 0, &last, 60),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil, nil)
 	if !equalSet(got, []string{"a", "b"}) {
 		t.Errorf("ReapAggressive (cooldown elapsed) = %v, want [a b] (park 2 oldest)", got)
 	}
@@ -882,5 +1006,57 @@ func TestResolvePriority(t *testing.T) {
 	}
 	if got, ok := resolvePriority(snapshot, "missing"); ok || got != "" {
 		t.Errorf("missing id = (%q, %v), want (\"\", false)", got, ok)
+	}
+}
+
+// TestReapIdleNilMetrics_DoesNotPoisonSharedSet (P1D / code-review
+// finding 2 regression pin) — pins the load-bearing invariant that
+// ReapIdle, when called with nil metrics, must NOT record the
+// cooldown-skipped app into the shared cooldownHeldByApp set.
+// Otherwise, when ReapAggressive is called next with non-nil metrics
+// in the same tick, its `alreadySeen` check would falsely suppress
+// the emission and the observation is silently dropped.
+//
+// Layout: one app, three stale Pro instances in cooldown. Call
+// ReapIdle with nil metrics (record should NOT happen); then call
+// ReapAggressive with non-nil metrics on the same shared set. The
+// aggressive emission must fire and the final metric value must be
+// exactly 1.
+func TestReapIdleNilMetrics_DoesNotPoisonSharedSet(t *testing.T) {
+	now := time.Now()
+	last := now.Add(-1 * time.Second)
+	instances := []InstanceInfo{
+		{Instance: "a", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour), LastScaleInAt: &last, ScaleInCooldownS: 60},
+		{Instance: "b", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-45 * time.Minute), LastScaleInAt: &last, ScaleInCooldownS: 60},
+	}
+	// Step 1: ReapIdle with nil metrics. No emission; set must
+	// remain empty (the load-bearing assertion).
+	shared := map[string]struct{}{}
+	if got := ReapIdle(now, instances, nil, shared); len(got) != 0 {
+		t.Fatalf("ReapIdle = %v, want [] (cooldown held)", got)
+	}
+	if len(shared) != 0 {
+		t.Errorf("ReapIdle(nil metrics) poisoned shared set: %v (want empty)", shared)
+	}
+	// Step 2: ReapAggressive with non-nil metrics on the SAME shared
+	// set. Must NOT see the app as "already seen" because idle didn't
+	// emit — must emit the observation itself.
+	ops := wire.NewOpsMetrics("schedd")
+	desiredByApp := map[string]int{"app1": 0}
+	if got := ReapAggressive(now, instances, desiredByApp, ops, shared); len(got) != 0 {
+		t.Errorf("ReapAggressive = %v, want [] (cooldown held)", got)
+	}
+	body := wireRenderMetrics(t, ops)
+	want := `schedd_scale_down_decisions_total{app="app1",outcome="cooldown_held"} 1`
+	if !bytes.Contains(body, []byte(want)) {
+		t.Errorf("missing line %q in:\n%s", want, body)
+	}
+	// And the shared set must contain the app — the aggressive
+	// emission now records it (so a third observer downstream would
+	// see it).
+	if _, ok := shared["app1"]; !ok {
+		t.Errorf("ReapAggressive did not record into shared set: %v", shared)
 	}
 }

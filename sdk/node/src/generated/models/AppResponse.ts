@@ -93,6 +93,8 @@ export type AppResponse = {
    * Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps before the A9 fallback; falls through to A9 when the target is inactive or full.
    */
   overflow_node?: string | null;
+  cors_default_enabled?: boolean | null;
+  cors_default_origins?: Array<string>;
   public_auth?: PublicAuthStatus;
   auth_default_flipped_at?: string | null;
 };

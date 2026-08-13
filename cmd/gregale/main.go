@@ -249,6 +249,14 @@ func run(args []string) int {
 		// itself is cmdEdgeRules. --json round-trips through the
 		// pkg/api SDK methods (ListEdgeRules / CreateEdgeRule / etc.).
 		return cmdEdgeRules(args[1:])
+	case "cors":
+		// CORS improvements D5: thin shim over the typed SDK
+		// helper CreateCORSEdgeRule. Sub-commands live in
+		// commands_cors.go; the dispatcher is cmdCors. Not a
+		// parallel wire surface - customers who need the full
+		// edge-rule power (priority, enable/disable, multi-host)
+		// still go through `gregale edge-rules create --kind cors`.
+		return cmdCors(args[1:])
 	case "crons":
 		return cmdCrons(args[1:])
 	case "delayed-task":
