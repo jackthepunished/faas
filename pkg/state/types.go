@@ -1115,8 +1115,8 @@ type Deployment struct {
 	// decoder turns SecretFindings []byte into the typed
 	// *api.SecretScanResult at the handler boundary; the raw-bytes
 	// shape here matches the existing ScanResult convention.
-	SecretFindings  []byte    `json:"secret_findings,omitempty"`
-	SecretScannedAt time.Time `json:"secret_scanned_at,omitempty"`
+	SecretFindings  []byte     `json:"secret_findings,omitempty"`
+	SecretScannedAt *time.Time `json:"secret_scanned_at,omitempty"`
 
 	// Parking reason + timestamp (issue #554 / ADR-079 follow-up).
 	// pkg/sched.Engine.ParkDeployment sets these before flipping

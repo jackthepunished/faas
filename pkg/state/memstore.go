@@ -3875,7 +3875,7 @@ func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, 
 	}
 	d.SecretFindings = append([]byte(nil), findings...) // defensive copy
 	d.ScanStatus = status
-	d.SecretScannedAt = scannedAt
+	d.SecretScannedAt = &scannedAt
 	m.deployments[id] = d
 	return nil
 }
