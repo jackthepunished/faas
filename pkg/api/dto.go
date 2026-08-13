@@ -4461,3 +4461,58 @@ type RekeyProgress struct {
 	Failed  int64  `json:"failed"`
 	LastID  string `json:"last_id,omitempty"`
 }
+
+// ThrottleSuggestionRow is one (route → suggested rate) row in the
+// payload returned by GET /v1/apps/{slug}/throttle-suggestions
+// (ADR-091 D20.5 amendment, issue #881 / PR-E). The recommender is
+// read-only — it never auto-applies — and the suggestion is always
+// ≤ the customer's plan ceiling (pkg/api.Limits.RateLimitRPS) so a
+// customer can act on it without a 422 from apid's sub-plan
+// validator.
+//
+// `Route` is the bounded label exactly as emitted on the Prometheus
+// side: method + raw path (the same shape RouteRow.Route uses, ADR-093
+// D6). The recommender never sees the reserved __route_other__
+// overflow bucket — it is dropped from the suggestions slice and
+// the count surfaces as RoutesCollapsed so the customer can tell
+// "wildcard-shape pattern" from "low traffic on a real route".
+//
+// `ObservedRPS` is the rate() value over the window (already
+// per-second). `SuggestedRPS` is `ceil(observed_rps * 2)` clamped
+// into [1, plan.RateLimitRPS] — the 2× headroom is documented on
+// the wire so the number is auditable rather than magic. The
+// `Multiplier` field pins the formula version so a future change
+// to the recommendation strategy can be distinguished from drift.
+type ThrottleSuggestionRow struct {
+	Route         string  `json:"route"`
+	ObservedRPS   float64 `json:"observed_rps"`
+	SuggestedRPS  float64 `json:"suggested_rps"`
+	SuggestedBurst int    `json:"suggested_burst"`
+	Multiplier    float64 `json:"multiplier"`
+}
+
+// ThrottleSuggestionsResponse is the wire shape for
+// GET /v1/apps/{slug}/throttle-suggestions. Source degrades the
+// same way AppMetricsResponse does: "prometheus" on success,
+// "degraded: <reason>" otherwise. RouteMetricsDisabled is true
+// when apps.route_metrics_enabled=false (Free plan) — the response
+// carries empty Suggestions plus that flag so the dashboard can
+// render the upsell rather than a misleading zero.
+//
+// RoutesCollapsed reports the count of routes that collapsed into
+// __route_other__ during the window (ADR-093 cap = 50). It's a
+// coverage signal, not a recommendation signal — a non-zero value
+// tells the customer their throttle will be partial-coverage
+// regardless of what limit they set.
+type ThrottleSuggestionsResponse struct {
+	AppID                string                 `json:"app_id"`
+	Range                string                 `json:"range"`
+	Source               string                 `json:"source"`
+	AsOf                 string                 `json:"as_of"`
+	RouteMetricsDisabled bool                   `json:"route_metrics_disabled"`
+	RoutesCollapsed      int                    `json:"routes_collapsed"`
+	PlanCeilingRPS       int                    `json:"plan_ceiling_rps"`
+	PlanCeilingBurst     int                    `json:"plan_ceiling_burst"`
+	Multiplier           float64                `json:"multiplier"`
+	Suggestions          []ThrottleSuggestionRow `json:"suggestions"`
+}
