@@ -230,8 +230,14 @@ func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
 	// the SDK honours any budget that's on the inbound ctx.
 	// childDeadline = min(parentRemaining, cli.Timeout) — the
 	// client's Timeout stays as the absolute ceiling; the budget
-	// can only tighten it. When no Budget is on the inbound ctx,
-	// cli.Timeout alone bounds the request (the legacy contract).
+	// can only tighten it. cli.Timeout == 0 is treated as "no
+	// ceiling configured" by WithCeiling (it inherits the
+	// parent's remaining time) so a default-constructed
+	// http.Client{} doesn't immediately expire; cli.Do then
+	// applies no Timeout of its own — the SDK no longer enforces
+	// a wall-clock cap on those calls, same as pre-PR-E. When
+	// no Budget is on the inbound ctx, cli.Timeout alone bounds
+	// the request (the legacy contract).
 	if b, ok := reqbudget.FromContext(req.Context()); ok {
 		newCtx, cancel, _ := b.WithCeiling(req.Context(), cli.Timeout)
 		defer cancel()

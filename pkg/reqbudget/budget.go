@@ -112,10 +112,19 @@ func (b Budget) Remaining(_ time.Time) time.Duration {
 // has the new total (the capped value), preserves Started and the
 // audit trail from parent.
 //
+// now is the wall-clock anchor passed in by the caller — read
+// ONCE at the caller's entry so the math (remaining, childTotal,
+// childStarted) is consistent within a single hop transition.
+// Reading now twice (once inside b.Remaining and once via
+// parentBudget.now() inside derivedChild) produces a
+// time-of-check / time-of-use gap that lets the child overshoot
+// parent's remaining by the read-1/read-2 delta — small with a
+// wall clock, large with a fake clock advancing between calls.
+//
 // If parentBudget is the zero value (no Budget on ctx), derivedChild
 // returns the parent ctx unchanged with a no-op cancel — an identity
 // no-op so callers without a budget are unaffected.
-func derivedChild(parentBudget Budget, parent context.Context, childTotal, ceiling time.Duration, hopName string, hopCost time.Duration) (context.Context, context.CancelFunc, Budget) {
+func derivedChild(parentBudget Budget, parent context.Context, now time.Time, childTotal, ceiling time.Duration, hopName string, hopCost time.Duration) (context.Context, context.CancelFunc, Budget) {
 	if parentBudget.Total == 0 {
 		// No budget on ctx — be the parent, no cancellation churn.
 		return parent, func() {}, Budget{}
@@ -128,18 +137,33 @@ func derivedChild(parentBudget Budget, parent context.Context, childTotal, ceili
 	childBudget.Total = childTotal
 	childBudget.Ceiling = ceiling
 	// Per-hop Started: the child's clock anchor is the moment of
-	// attach. Remaining math on the child reads
-	// childBudget.Remaining = childTotal - (now - childStarted). The
-	// parent budget's already-consumed elapsed time is captured in
-	// childTotal itself; this keeps child Remaining() honest
-	// regardless of how much wall time passed between parent and
-	// child attach.
-	childBudget.Started = parentBudget.now()
+	// attach. The caller passed `now` already read once at
+	// entry, so childBudget.Remaining = childTotal - (now' -
+	// childStarted) where now' >= now, and childTotal was
+	// computed against this same `now` — the child's Remaining
+	// math is internally consistent.
+	childBudget.Started = now
 	// Per-Budget clock handle: a child inherits its parent's clock so
 	// tests can fake the wall clock end-to-end without touching
 	// global state. Production leaves parentBudget.Now nil and the
 	// clock handle resolves to DefaultClock at every call.
 	childBudget.Now = parentBudget.Now
+	// Defensive copy of Overheads: parentBudget.Overheads is a
+	// slice header shared between parent and child after
+	// `childBudget := parentBudget`. Without the copy, a
+	// subsequent append() on the child can mutate the parent's
+	// underlying array (if the parent's slice has spare
+	// capacity), leaking the child's hop names back into the
+	// parent's audit trail — every later hop on the parent
+	// would then see the wrong history. The copy is cheap
+	// (Overheads is bounded by hop count, typically ≤ 5) and
+	// preserves the invariant that parent and child Overheads
+	// are disjoint after a WithOverhead / WithCeiling call.
+	if len(parentBudget.Overheads) > 0 {
+		childBudget.Overheads = append(make([]HopMargin, 0, len(parentBudget.Overheads)+1), parentBudget.Overheads...)
+	} else {
+		childBudget.Overheads = nil
+	}
 	if hopName != "" && hopCost > 0 {
 		childBudget.Overheads = append(childBudget.Overheads, HopMargin{Name: hopName, Cost: hopCost})
 	}
@@ -154,6 +178,17 @@ func derivedChild(parentBudget Budget, parent context.Context, childTotal, ceili
 // cancel that MUST be defer'd by the caller, and the new child
 // Budget.
 //
+// ceiling <= 0 is treated as "no ceiling configured" — the helper
+// falls through to a child that inherits the parent's remaining
+// time unchanged, with no fresh deadline installed. This matters
+// for callers that pass a configured ceiling (e.g.
+// http.Client.Timeout) which may be zero for a default-constructed
+// client; treating zero as "tighten to zero" would produce a
+// context.WithTimeout(parent, 0) ctx — already expired before the
+// inner call runs. The caller can still install its own
+// WithTimeout via the cli.Timeout path when the budget isn't
+// attached.
+//
 // When no Budget is on parent, WithCeiling returns the parent ctx
 // unchanged with a no-op cancel — call-sites without a budget don't
 // change behavior.
@@ -161,9 +196,24 @@ func (b Budget) WithCeiling(parent context.Context, ceiling time.Duration) (cont
 	if b.Total == 0 {
 		return parent, func() {}, Budget{}
 	}
-	remaining := b.Remaining(time.Time{})
-	if ceiling < 0 {
-		ceiling = 0
+	// Read now ONCE at entry so the math is consistent within
+	// this hop transition (Finding 4 from low-effort code
+	// review: time-of-check / time-of-use gap otherwise lets
+	// the child overshoot parent's remaining by the read-1/
+	// read-2 delta).
+	now := b.now()
+	remaining := b.Total - now.Sub(b.Started)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if ceiling <= 0 {
+		// No ceiling configured. The child inherits the
+		// parent's remaining time unchanged (childTotal =
+		// childCeiling = remaining) — same shape as if the
+		// caller hadn't wrapped at all, but the child Budget
+		// is still stamped so a later WithOverhead records the
+		// hop in the audit trail.
+		return derivedChild(b, parent, now, remaining, remaining, "", 0)
 	}
 	childTotal := remaining
 	if ceiling < childTotal {
@@ -172,7 +222,7 @@ func (b Budget) WithCeiling(parent context.Context, ceiling time.Duration) (cont
 	if childTotal < 0 {
 		childTotal = 0
 	}
-	return derivedChild(b, parent, childTotal, ceiling, "", 0)
+	return derivedChild(b, parent, now, childTotal, ceiling, "", 0)
 }
 
 // WithOverhead is the per-hop workhorse: child deadline =
@@ -191,7 +241,13 @@ func (b Budget) WithOverhead(parent context.Context, hopName string, cost time.D
 	if b.Total == 0 {
 		return parent, func() {}, Budget{}
 	}
-	remaining := b.Remaining(time.Time{})
+	// Read now ONCE at entry — see WithCeiling for the TOCTOU
+	// rationale.
+	now := b.now()
+	remaining := b.Total - now.Sub(b.Started)
+	if remaining < 0 {
+		remaining = 0
+	}
 	if cost < 0 {
 		cost = 0
 	}
@@ -202,7 +258,7 @@ func (b Budget) WithOverhead(parent context.Context, hopName string, cost time.D
 	// Cap by the parent's ceiling so a child hop never exceeds the
 	// ceiling even if parent remaining was generous. childCeiling is
 	// carried on the new Budget for further descendants.
-	return derivedChild(b, parent, childTotal, b.Ceiling, hopName, cost)
+	return derivedChild(b, parent, now, childTotal, b.Ceiling, hopName, cost)
 }
 
 // WithRemaining is the edge setter: install a child ctx whose

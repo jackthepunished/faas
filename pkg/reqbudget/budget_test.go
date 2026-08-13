@@ -317,3 +317,122 @@ func TestBudget_ClockHandle_InheritedByChildren(t *testing.T) {
 		t.Fatal("bc1.Now must be inherited from parent's clock")
 	}
 }
+
+// TestBudget_WithCeiling_ZeroMeansNoCeiling pins the contract fix
+// from low-effort code review Finding 2: ceiling <= 0 must be
+// treated as "no ceiling configured", not as "tighten to zero
+// deadline". Pre-fix, WithCeiling(parent, 0) on a budgeted ctx
+// produced a context.WithTimeout(parent, 0) ctx — already expired
+// before the inner call ran, every call returning
+// DeadlineExceeded immediately. Post-fix, ceiling <= 0 inherits
+// the parent's remaining time as the child's ceiling.
+func TestBudget_WithCeiling_ZeroMeansNoCeiling(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	_, _, b, clk := installBudget(t, start, 3*time.Second, 30*time.Second)
+
+	clk.advance(50 * time.Millisecond)
+	// ceiling=0 must NOT produce a 0-deadline ctx.
+	ctx, cancel, bc := b.WithCeiling(context.Background(), 0)
+	defer cancel()
+
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		t.Fatalf("ceiling=0 with budget: expected ctx to have a deadline (parent's remaining), got none")
+	}
+	// Child ceiling = parent remaining at attach (3s - 50ms =
+	// 2950ms) — the no-ceiling fallback inherits parent's
+	// remaining unchanged.
+	if bc.Ceiling != 2950*time.Millisecond {
+		t.Errorf("ceiling=0: bc.Ceiling = %v, want 2950ms (parent remaining at attach)", bc.Ceiling)
+	}
+	if bc.Total != 2950*time.Millisecond {
+		t.Errorf("ceiling=0: bc.Total = %v, want 2950ms", bc.Total)
+	}
+}
+
+// TestBudget_DerivedChild_DoesNotMutateParentOverheads pins the
+// slice-aliasing fix from low-effort code review Finding 3:
+// WithOverhead on a parent budget must NOT leak the child's hop
+// name back into the parent's Overheads audit trail. Pre-fix, a
+// parent whose Overheads slice had spare capacity was corrupted
+// by the child's append — the parent's audit trail then reported
+// the child's hop names as if they were parent's.
+func TestBudget_DerivedChild_DoesNotMutateParentOverheads(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	_, _, b, _ := installBudget(t, start, 3*time.Second, 30*time.Second)
+	// Pre-warm the parent's Overheads slice by attaching one
+	// overhead entry directly on the local b. This gives it
+	// spare capacity (len=1, cap > 1) so the pre-fix code would
+	// have aliased into the same backing array.
+	b.Overheads = append(b.Overheads, HopMargin{Name: "warm", Cost: 5 * time.Millisecond})
+
+	// Snapshot parent's Overheads BEFORE the child's append —
+	// including its current length, so we can detect any
+	// growth from the child's append leaking back.
+	wantLen := len(b.Overheads)
+	wantLast := b.Overheads[wantLen-1]
+
+	// Take a child via WithOverhead; this triggers the
+	// append(childBudget.Overheads, ...) inside derivedChild.
+	// Pre-fix, this would have grown b.Overheads by one and
+	// leaked the "child-hop" entry back. Post-fix, derivedChild
+	// does a defensive copy before appending.
+	_, childCancel, bc := b.WithOverhead(context.Background(), "child-hop", 10*time.Millisecond)
+	defer childCancel()
+
+	// The CHILD's audit trail must include both entries —
+	// proving derivedChild preserved the parent's history AND
+	// appended the child's hop name correctly.
+	if len(bc.Overheads) != wantLen+1 {
+		t.Fatalf("child Overheads: len=%d, want %d (parent's %d entries + child's 1)",
+			len(bc.Overheads), wantLen+1, wantLen)
+	}
+	if bc.Overheads[wantLen].Name != "child-hop" {
+		t.Fatalf("child Overheads[%d].Name = %q, want %q",
+			wantLen, bc.Overheads[wantLen].Name, "child-hop")
+	}
+
+	// Parent's Overheads must be unchanged: same length, no
+	// "child-hop" entry leaked.
+	if len(b.Overheads) != wantLen {
+		t.Fatalf("parent Overheads length changed: before=%d after=%d (slice aliasing bug)",
+			wantLen, len(b.Overheads))
+	}
+	if b.Overheads[wantLen-1] != wantLast {
+		t.Fatalf("parent Overheads tail mutated: before=%+v after=%+v",
+			wantLast, b.Overheads[wantLen-1])
+	}
+}
+
+// TestBudget_DerivedChild_ClockAnchorConsistent pins the
+// time-of-check/time-of-use fix from low-effort code review
+// Finding 4: a child budget's Total + Started must be computed
+// against the SAME wall-clock read so child.Remaining() can't
+// overshoot parent's remaining by the read-1/read-2 delta. Pre-fix,
+// now() was read once in b.Remaining and again inside derivedChild
+// — a fake clock advancing between calls would let the child
+// inherit a Total computed against read-1 but a Started = read-2,
+// producing Remaining = Total - (read-3 - read-2) which can be
+// > parent remaining.
+func TestBudget_DerivedChild_ClockAnchorConsistent(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	_, _, b, clk := installBudget(t, start, 3*time.Second, 30*time.Second)
+
+	clk.advance(100 * time.Millisecond)
+	_, cancel, bc := b.WithOverhead(context.Background(), "db", 10*time.Millisecond)
+	defer cancel()
+
+	// Don't advance the clock between reads — the child
+	// should observe exactly parent remaining at attach minus
+	// the overhead cost: parent.Total(3s) - elapsed(100ms) -
+	// overhead.Cost(10ms) = 2890ms.
+	want := 3*time.Second - 100*time.Millisecond - 10*time.Millisecond // 2890ms
+	if got := bc.Remaining(time.Time{}); got != want {
+		t.Fatalf("bc.Remaining at attach = %v, want %v (Total + Started must be consistent)", got, want)
+	}
+	// Sanity: child Remaining can NEVER exceed parent Remaining
+	// at the moment of attach (3s - 100ms = 2900ms).
+	parentRem := b.Total - 100*time.Millisecond
+	if got := bc.Remaining(time.Time{}); got > parentRem {
+		t.Fatalf("bc.Remaining = %v > parent remaining at attach = %v (child overshot parent's ceiling)", got, parentRem)
+	}
+}
