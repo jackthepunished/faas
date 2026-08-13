@@ -66,10 +66,17 @@ type wsContextKey struct{}
 // metrics is allowed — the raw forwarder checks for nil before
 // calling helpers (the helpers themselves are nil-safe). Used by
 // the three-input gate in pkg/gateway/handler.go's ServeHTTP.
+//
+// PR-B code review finding #3: the previous short-circuit
+// (`if plan == "" && m == nil { return ctx }`) was asymmetric.
+// When the caller passed plan != "" with m == nil (the public
+// → internal hop before the handler stamps its own metrics),
+// the receiver later read a context carrying only the plan
+// with no metrics — defensible but the asymmetry was a
+// footgun for future stamp sites. The helper now always
+// stamps; the metric helpers + wsContextFrom zero-value
+// handling cover the "no real metrics" case uniformly.
 func withWSContext(ctx context.Context, plan api.Plan, m *Metrics) context.Context {
-	if plan == "" && m == nil {
-		return ctx
-	}
 	return context.WithValue(ctx, wsContextKey{}, wsContext{plan: plan, metrics: m})
 }
 

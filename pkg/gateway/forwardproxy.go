@@ -606,6 +606,30 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 						BodyChunk: append([]byte(nil), buf[:n]...),
 					},
 				}); serr != nil {
+					// A Send failure on the request
+					// side is an upstream-availability
+					// issue (the bridge closed the
+					// bidi stream because the guest
+					// went away, the per-instance
+					// netns was torn down, or the
+					// vmmd process crashed). Without
+					// this label, the defer's default
+					// of WSOutcomeClientDisconnect
+					// would race-mislabel the
+					// histogram (PR-B code review
+					// finding #2: the body goroutine
+					// can record wsOutcome before the
+					// receiver loop sees the
+					// corresponding Recv error, and
+					// the latter would otherwise
+					// overwrite it with the same
+					// WSOutcomeUpstreamUnavailable).
+					// Both goroutines writing the
+					// same constant is benign — the
+					// race is only on the *value*,
+					// not on the observability
+					// contract.
+					wsOutcome = WSOutcomeUpstreamUnavailable
 					bodyErrCh <- serr
 					return
 				}
@@ -693,6 +717,20 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			// was already written above; the body is the
 			// last write before the receiver loop exits.
 			if init.Error != "" {
+				// Bridge dial failure is an upstream-
+				// availability issue — the bridge wrote
+				// the synthetic 502 from inside the
+				// per-instance netns because the guest
+				// refused the connect. Without this
+				// label, the defer's default of
+				// WSOutcomeClientDisconnect would tag
+				// the histogram as customer-side churn
+				// (PR-B code review finding #1:
+				// polluting the
+				// rate(gateway_ws_session_duration_seconds{outcome="client_disconnect"})
+				// panel when the bridge is the source of
+				// the failure).
+				wsOutcome = WSOutcomeUpstreamUnavailable
 				errBody := []byte(init.Error + "\n")
 				if _, werr := w.Write(errBody); werr == nil && sink != nil {
 					// Init-error body is part of the
