@@ -28,6 +28,11 @@ type VMRequest struct {
 	LogPath      string // build log appended by the VM
 	RAMMB        int    // from the plan's BuildVMRAMMB (spec §1, §4.5)
 	TimeoutSec   int    // wall-clock build budget (0 ⇒ pkg/api/limits.go default)
+	// Plan is the owning account's plan tier. vmmd validates it on
+	// CreateColdBoot (issue #301 / ADR-043) and routes the builder VM
+	// into the per-plan cgroup sub-slice. Empty = legacy path that
+	// vmmd now rejects; the orchestrator always populates it.
+	Plan string
 }
 
 // VMResult is the legacy single-step result — kept for backwards compat
