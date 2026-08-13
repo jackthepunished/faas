@@ -26,8 +26,8 @@ import (
 )
 
 type fakeEngine struct {
-	wakeFn          func(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error)
-	admitInstanceFn func(ctx context.Context, appID string) (sched.WakeResult, error)
+	wakeFn          func(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error)
+	admitInstanceFn func(ctx context.Context, appID, scope string) (sched.WakeResult, error)
 	reportFn        func(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	parkFn          func(ctx context.Context, instanceID, reason string) error
 	// streamLogFn (issue #254 / Move 4) drives the per-frame fan-out
@@ -51,19 +51,19 @@ type fakeEngine struct {
 	destroyFn func(ctx context.Context, instanceID, reason string) error
 }
 
-func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error) {
-	return f.wakeFn(ctx, appID, deploymentID)
+func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error) {
+	return f.wakeFn(ctx, appID, deploymentID, scope)
 }
 
-func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error) {
+func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error) {
 	if f.admitInstanceFn != nil {
-		return f.admitInstanceFn(ctx, appID)
+		return f.admitInstanceFn(ctx, appID, scope)
 	}
 	// Default: behave like Wake so existing tests that don't set
 	// admitInstanceFn continue to compile and pass unchanged.
 	// (PR-C widening: deployment_id is forwarded to Wake via "")
 	if f.wakeFn != nil {
-		return f.wakeFn(ctx, appID, "")
+		return f.wakeFn(ctx, appID, "", scope)
 	}
 	return sched.WakeResult{}, nil
 }
@@ -235,7 +235,7 @@ func readCounter(t *testing.T, m *wire.OpsMetrics, metricName string, reason str
 
 func TestWake_Success(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{InstanceID: "i-1", NodeID: "node-test-1", Method: vmmdpb.WakeMethod_WAKE_RESTORE}, nil
 		},
 	})
@@ -253,7 +253,7 @@ func TestWake_Success(t *testing.T) {
 
 func TestWake_CapacityDenialSurfacesProblem(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{}, api.ErrCapacity("no RAM headroom")
 		},
 	})
@@ -269,7 +269,7 @@ func TestWake_CapacityDenialSurfacesProblem(t *testing.T) {
 
 func TestWake_PlainErrorIsInternal(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{}, errors.New("db exploded")
 		},
 	})
@@ -316,7 +316,7 @@ func TestReportActivity(t *testing.T) {
 func TestWake_PropagatesWakeID(t *testing.T) {
 	const wantWakeID = "0193f7c0-1234-7abc-9def-0123456789ab"
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{
 				InstanceID: "i-1",
 				NodeID:     "node-test-1",
@@ -340,7 +340,7 @@ func TestWake_PropagatesWakeID(t *testing.T) {
 func TestAdmitInstance_AdmitsNewInstance(t *testing.T) {
 	const wantWakeID = "0193f7c0-aaaa-7abc-9def-0123456789ab"
 	cli := newServer(t, &fakeEngine{
-		admitInstanceFn: func(context.Context, string) (sched.WakeResult, error) {
+		admitInstanceFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{
 				InstanceID: "i-1",
 				NodeID:     "node-test-1",
@@ -376,7 +376,7 @@ func TestAdmitInstance_AdmitsNewInstance(t *testing.T) {
 // no-op when it already has ≥1 cached target.
 func TestAdmitInstance_AtCapacityIsTypedResult(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		admitInstanceFn: func(context.Context, string) (sched.WakeResult, error) {
+		admitInstanceFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{AtCapacity: true}, nil
 		},
 	})
@@ -403,7 +403,7 @@ func TestAdmitInstance_AtCapacityIsTypedResult(t *testing.T) {
 // gRPC errors with the RFC 7807 problem. At-capacity must not.
 func TestAdmitInstance_RealFailureSurfacesProblem(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		admitInstanceFn: func(context.Context, string) (sched.WakeResult, error) {
+		admitInstanceFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{}, api.ErrCapacity("RAM headroom exhausted")
 		},
 	})
@@ -481,7 +481,7 @@ func TestServerParkInstance_InternalError(t *testing.T) {
 // to dial :8080 against a guest that bound :9090 → 503.
 func TestWake_PropagatesPort(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{
 				InstanceID: "i-1",
 				NodeID:     "node-test-1",
@@ -506,7 +506,7 @@ func TestWake_PropagatesPort(t *testing.T) {
 // path is on AdmitInstance + Target.Port in pkg/gateway.
 func TestAdmitInstance_PropagatesPort(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		admitInstanceFn: func(context.Context, string) (sched.WakeResult, error) {
+		admitInstanceFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{
 				InstanceID: "i-1",
 				NodeID:     "node-test-1",
@@ -535,7 +535,7 @@ func TestAdmitInstance_PropagatesPort(t *testing.T) {
 func TestWake_DeploymentIDForwarded(t *testing.T) {
 	var gotDeploymentID string
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(_ context.Context, appID, deploymentID string) (sched.WakeResult, error) {
+		wakeFn: func(_ context.Context, appID, deploymentID, scope string) (sched.WakeResult, error) {
 			gotDeploymentID = deploymentID
 			return sched.WakeResult{
 				InstanceID:   "i-1",
@@ -569,7 +569,7 @@ func TestWake_DeploymentIDForwarded(t *testing.T) {
 func TestWake_DeploymentIDEmptyPreserved(t *testing.T) {
 	var gotDeploymentID string = "sentinel"
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(_ context.Context, appID, deploymentID string) (sched.WakeResult, error) {
+		wakeFn: func(_ context.Context, appID, deploymentID, scope string) (sched.WakeResult, error) {
 			gotDeploymentID = deploymentID
 			return sched.WakeResult{
 				InstanceID: "i-1",

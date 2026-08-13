@@ -24,13 +24,19 @@ import (
 // warmhint stream, close. Each method maps 1:1 to a method on
 // *Client, so any fake only needs to forward the same shape.
 type ScheddClient interface {
-	AdmitInstance(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
+	// AdmitInstance (issue #272 / ADR-095 / PR-B): scope is the
+	// preview scope (`pr-{N}`) forwarded from the gateway's
+	// Host-header parse. Empty = prod (legacy single-deployment
+	// behaviour). Threaded through schedd's AdmitInstanceRequest.
+	AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
 	// Wake (issue #556 / PR-C): deploymentID is the optional
 	// per-deployment wake hint forwarded to schedd. Empty falls
 	// through to the newest live deployment. Return tuple gains
 	// deploymentIDOut (the deployment schedd actually woke onto;
 	// "" on error).
-	Wake(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, port int, err error)
+	//
+	// scope (PR-B): preview scope forwarded to schedd.
+	Wake(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, port int, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	ParkInstance(ctx context.Context, instanceID, reason string) error
 	// StreamAppLogs (issue #309 / tier-2 DX): level + grep are
@@ -117,8 +123,8 @@ func (c *Client) Close() error {
 // Admission denials arrive as an *api.Problem so gateway.writeWakeError
 // maps them straight to the right RFC 7807 status. Satisfies
 // gateway.Scheduler.
-func (c *Client) Wake(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, port int, err error) {
-	resp, err := c.cli.Wake(ctx, &scheddpb.WakeRequest{AppId: appID, DeploymentId: deploymentID})
+func (c *Client) Wake(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, port int, err error) {
+	resp, err := c.cli.Wake(ctx, &scheddpb.WakeRequest{AppId: appID, DeploymentId: deploymentID, Scope: scope})
 	if err != nil {
 		return "", "", "", "", 0, liftErr(err)
 	}
@@ -158,8 +164,8 @@ func (c *Client) Wake(ctx context.Context, appID, deploymentID string) (instance
 // (wake-fan-out path); empty falls through to the newest live
 // deployment (legacy single-deployment path). Additive per
 // ADR-016.
-func (c *Client) AdmitInstance(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error) {
-	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID, DeploymentId: deploymentID})
+func (c *Client) AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error) {
+	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID, DeploymentId: deploymentID, Scope: scope})
 	if err != nil {
 		return "", "", "", "", 0, false, 0, liftErr(err)
 	}

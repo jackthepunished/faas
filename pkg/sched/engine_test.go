@@ -764,7 +764,7 @@ func TestAdmitAndDispatch_WorkerClassExempt(t *testing.T) {
 		}
 		ops := wire.NewOpsMetrics("schedd")
 		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
-		r, err := e.AdmitInstance(context.Background(), app.ID, "")
+		r, err := e.AdmitInstance(context.Background(), app.ID, "", "")
 		if err != nil {
 			t.Fatalf("AdmitInstance: %v", err)
 		}
@@ -804,7 +804,7 @@ func TestAdmitAndDispatch_WorkerClassExempt(t *testing.T) {
 		// failure. The first-check MUST NOT fire (WorkloadClass is
 		// zero-value = stateless). Symmetric pin to the worker-class
 		// branch: AtCapacity must be false on the warm-up path.
-		r, err := e.AdmitInstance(context.Background(), app.ID, "")
+		r, err := e.AdmitInstance(context.Background(), app.ID, "", "")
 		if err != nil {
 			var p *api.Problem
 			if errors.As(err, &p) {
@@ -840,7 +840,7 @@ func TestAdmitAndDispatch_CooldownSwitchedToWaitForWarm(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("prime ledger: %v", err)
 	}
-	_, err := e.AdmitInstance(context.Background(), app.ID, "")
+	_, err := e.AdmitInstance(context.Background(), app.ID, "", "")
 	if err == nil {
 		t.Fatal("AdmitInstance = nil, want *api.Problem{CodeWaitForWarm}")
 	}
@@ -896,7 +896,7 @@ func TestAdmitAndDispatch_MinFloorAlready_StaysPlanLimitConcur(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("prime ledger 2: %v", err)
 	}
-	_, err := e.AdmitInstance(context.Background(), app.ID, "")
+	_, err := e.AdmitInstance(context.Background(), app.ID, "", "")
 	if err == nil {
 		t.Fatal("AdmitInstance = nil, want *api.Problem{CodePlanLimitConcur}")
 	}
@@ -1006,7 +1006,7 @@ func TestEngineWake_ColdBoot(t *testing.T) {
 	notif := &fakeNotifier{}
 	e := newEngine(t, store, vmm, notif, "1.10.0")
 
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -1053,7 +1053,7 @@ func TestEngineWake_PhaseHistograms_Recorded(t *testing.T) {
 	ops := wire.NewOpsMetrics("schedd")
 	e := newEngine(t, store, &fakeVMM{sleepFor: 50 * time.Millisecond}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
 
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 
@@ -1135,7 +1135,7 @@ func TestEngineWake_ColdBootPersistsObservedClass(t *testing.T) {
 		},
 	}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 	got, err := store.AppByID(context.Background(), app.ID)
@@ -1171,7 +1171,7 @@ func TestEngineWake_PropagatesWakeIDToVMM(t *testing.T) {
 		DeploymentID: dep.ID,
 	})
 
-	res, err := e.Wake(inboundCtx, app.ID, "")
+	res, err := e.Wake(inboundCtx, app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -1220,11 +1220,11 @@ func TestEngineWake_Idempotent(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	first, err := e.Wake(context.Background(), app.ID, "")
+	first, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake #1: %v", err)
 	}
-	second, err := e.Wake(context.Background(), app.ID, "")
+	second, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake #2: %v", err)
 	}
@@ -1243,7 +1243,7 @@ func TestEngineWake_Idempotent(t *testing.T) {
 // regression that re-introduces `var deploymentID string` inside the
 // fast-path block shadows the function parameter and silently drops
 // the caller's value. The legacy test corpus only exercises the
-// empty-string path (every `e.Wake(ctx, app.ID, "")` in this file),
+// empty-string path (every `e.Wake(ctx, app.ID, "", "")` in this file),
 // so the shadowing compiled clean — the bug was invisible until a
 // reviewer audit surfaced it on the `pkg/sched/engine.go::Wake` shape.
 //
@@ -1265,7 +1265,7 @@ func TestEngineWake_HonorsCallerDeploymentID(t *testing.T) {
 	// Cold-wake to materialise a RUNNING instance attached to depA.
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
-	if _, err := e.Wake(ctx, app.ID, ""); err != nil {
+	if _, err := e.Wake(ctx, app.ID, "", ""); err != nil {
 		t.Fatalf("seed Wake: %v", err)
 	}
 
@@ -1297,7 +1297,7 @@ func TestEngineWake_HonorsCallerDeploymentID(t *testing.T) {
 	// Wake with the caller-supplied depA.ID — the gateway's cached
 	// target deployment. Phase 1 should hit and the result must
 	// carry depA.ID, NOT the freshly-promoted depB.ID.
-	res, err := e.Wake(ctx, app.ID, depA.ID)
+	res, err := e.Wake(ctx, app.ID, depA.ID, "")
 	if err != nil {
 		t.Fatalf("Wake with caller deploymentID: %v", err)
 	}
@@ -1327,13 +1327,13 @@ func TestEngineWake_EmptyCallerDeploymentID_FallsBackToLiveDeployment(t *testing
 
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
-	if _, err := e.Wake(ctx, app.ID, ""); err != nil {
+	if _, err := e.Wake(ctx, app.ID, "", ""); err != nil {
 		t.Fatalf("seed Wake: %v", err)
 	}
 
 	// Second Wake with empty deploymentID. Phase 1 must resolve
 	// via LiveDeployment — which returns depA.ID (the only live row).
-	res, err := e.Wake(ctx, app.ID, "")
+	res, err := e.Wake(ctx, app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake with empty deploymentID: %v", err)
 	}
@@ -1357,7 +1357,7 @@ func TestEngineWake_RestoreFromSnapshot(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -1391,7 +1391,7 @@ func TestEngineWake_StorageKey_ForwardedFromRow(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 	if vmm.lastSnapRef.StorageKey != customKey {
@@ -1427,7 +1427,7 @@ func TestEngineWake_RequiresStorageKey(t *testing.T) {
 
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 	// Empty StorageKey → engine takes the cold-boot branch
@@ -1464,7 +1464,7 @@ func TestEngineWake_ForwardsSealedEnv(t *testing.T) {
 
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 
@@ -1493,7 +1493,7 @@ func TestEngineWake_NoSecrets_EmptySealedEnv(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 	if len(vmm.lastColdBootSpec.SealedEnv) != 0 {
@@ -1532,7 +1532,7 @@ func TestEngineWake_ForwardsOverridePort(t *testing.T) {
 		vmm := &fakeVMM{}
 		e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-		res, err := e.Wake(context.Background(), app.ID, "")
+		res, err := e.Wake(context.Background(), app.ID, "", "")
 		if err != nil {
 			t.Fatalf("Wake: %v", err)
 		}
@@ -1576,7 +1576,7 @@ func TestEngineWake_ForwardsOverridePort(t *testing.T) {
 		vmm := &fakeVMM{}
 		e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-		res, err := e.Wake(context.Background(), app.ID, "")
+		res, err := e.Wake(context.Background(), app.ID, "", "")
 		if err != nil {
 			t.Fatalf("Wake: %v", err)
 		}
@@ -1615,11 +1615,11 @@ func TestEngineWake_ForwardsOverridePort(t *testing.T) {
 		vmm := &fakeVMM{}
 		e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 		// Cold-wake first to materialise a RUNNING row.
-		if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+		if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 			t.Fatalf("first Wake: %v", err)
 		}
 		// Second Wake hits the Phase-1 fast path.
-		res, err := e.Wake(context.Background(), app.ID, "")
+		res, err := e.Wake(context.Background(), app.ID, "", "")
 		if err != nil {
 			t.Fatalf("second Wake (fast path): %v", err)
 		}
@@ -1642,7 +1642,7 @@ func TestEngineWake_OverridePortZeroIsZero(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -1667,7 +1667,7 @@ func TestEngineWake_StaleFcVersionColdBoots(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 	if vmm.coldBoots != 1 || vmm.restores != 0 {
@@ -1685,7 +1685,7 @@ func TestEngineWake_RestoreFallbackMarksSnapshotStale(t *testing.T) {
 	vmm := &fakeVMM{forceColdFallback: true}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -1738,7 +1738,7 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 		_ = billable
 	}
 
-	_, err := e.Wake(context.Background(), app.ID, "")
+	_, err := e.Wake(context.Background(), app.ID, "", "")
 	if err == nil {
 		t.Fatal("expected capacity denial")
 	}
@@ -1800,7 +1800,7 @@ func TestEngineWake_AdmissionDeniedOnVCPU(t *testing.T) {
 	// stops the filler loop at the first admit capacity failure
 	// and uses the wake as the assertion path.
 
-	_, err := e.Wake(context.Background(), app.ID, "")
+	_, err := e.Wake(context.Background(), app.ID, "", "")
 	if err == nil {
 		t.Fatal("expected vCPU capacity denial")
 	}
@@ -1839,7 +1839,7 @@ func TestEngineWake_BootErrorFails(t *testing.T) {
 	vmm := &fakeVMM{wakeErr: errors.New("firecracker boom")}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	if _, err := e.Wake(context.Background(), app.ID, ""); err == nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err == nil {
 		t.Fatal("expected boot error")
 	}
 	// Ledger must be released (no leak) and the instance marked failed.
@@ -1885,7 +1885,7 @@ func TestEnginePark_SnapshotFailureStops(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -1908,7 +1908,7 @@ func TestEngineEvict_Destroys(t *testing.T) {
 	vmm := &fakeVMM{}
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -1931,7 +1931,7 @@ func TestEngineReportActivity(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
 	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
-	res, _ := e.Wake(context.Background(), app.ID, "")
+	res, _ := e.Wake(context.Background(), app.ID, "", "")
 
 	now := time.Now()
 	applied, err := e.ReportActivity(context.Background(), []state.InstanceTouch{
@@ -1987,7 +1987,7 @@ func TestEngineWake_VMMDColdBootDeadlineEnforced(t *testing.T) {
 	e := withTestBootBudget(t, newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0"))
 
 	start := time.Now()
-	_, err := e.Wake(context.Background(), app.ID, "")
+	_, err := e.Wake(context.Background(), app.ID, "", "")
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -2143,7 +2143,7 @@ func TestEngineWake_LockReleasedDuringBoot(t *testing.T) {
 	aDone := make(chan struct{})
 	go func() {
 		defer close(aDone)
-		_, err := e.Wake(context.Background(), app.ID, "")
+		_, err := e.Wake(context.Background(), app.ID, "", "")
 		aResult <- err
 	}()
 
@@ -2161,7 +2161,7 @@ func TestEngineWake_LockReleasedDuringBoot(t *testing.T) {
 	bDone := make(chan struct{})
 	go func() {
 		defer close(bDone)
-		_, err := e.Wake(context.Background(), app.ID, "")
+		_, err := e.Wake(context.Background(), app.ID, "", "")
 		bResult <- err
 	}()
 
@@ -2236,7 +2236,7 @@ func TestEngineWake_PostVMMDAbortOnStolenState(t *testing.T) {
 	}
 	aRes := make(chan result, 1)
 	go func() {
-		r, err := e.Wake(context.Background(), app.ID, "")
+		r, err := e.Wake(context.Background(), app.ID, "", "")
 		aRes <- result{r.InstanceID, err}
 	}()
 
@@ -2374,7 +2374,7 @@ func TestEngineWake_MintsFreshWakeIDPerWake(t *testing.T) {
 	e := newEngine(t, store, vmm, notif, "1.10.0")
 
 	// First wake — must produce a non-empty UUIDv7-shaped wake_id.
-	res1, err := e.Wake(context.Background(), app.ID, "")
+	res1, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("first Wake: %v", err)
 	}
@@ -2395,7 +2395,7 @@ func TestEngineWake_MintsFreshWakeIDPerWake(t *testing.T) {
 
 	// Second wake — distinct wake_id even though the app (and likely the
 	// instance row) is the same.
-	res2, err := e.Wake(context.Background(), app.ID, "")
+	res2, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("second Wake: %v", err)
 	}
@@ -2432,7 +2432,7 @@ func TestEngineWake_Phase1FastPathReturnsExistingWakeID(t *testing.T) {
 	e := newEngine(t, store, vmm, notif, "1.10.0")
 
 	// First wake → cold boot → row carries a fresh wake_id.
-	res1, err := e.Wake(context.Background(), app.ID, "")
+	res1, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("first Wake: %v", err)
 	}
@@ -2442,7 +2442,7 @@ func TestEngineWake_Phase1FastPathReturnsExistingWakeID(t *testing.T) {
 
 	// Second Wake on the already-RUNNING app → Phase 1 fast path.
 	// WakeID must equal the row's existing value, NOT be empty.
-	res2, err := e.Wake(context.Background(), app.ID, "")
+	res2, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("second Wake (fast path): %v", err)
 	}
@@ -2511,7 +2511,7 @@ func TestTransitionWithKind_EmitsRowWakeID(t *testing.T) {
 	// is what emitInstanceChanged's audit path ultimately calls. The
 	// cleanest seam is to park a freshly-woken app and assert the
 	// snapshotting→parked transition carries the row's wake_id.
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -2653,7 +2653,7 @@ func TestEngineWake_RejectsBadSig(t *testing.T) {
 	verifier := &staleVerifier{reject: tampered}
 	e.WithVerifier(verifier)
 
-	_, err := e.Wake(context.Background(), app.ID, "")
+	_, err := e.Wake(context.Background(), app.ID, "", "")
 	if err == nil {
 		t.Fatal("Wake accepted tampered sig; want error")
 	}
@@ -2697,7 +2697,7 @@ func TestEngineWake_AcceptsGoodSig(t *testing.T) {
 	verifier := &staleVerifier{} // reject == nil → accept
 	e.WithVerifier(verifier)
 
-	res, err := e.Wake(context.Background(), app.ID, "")
+	res, err := e.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake with good sig: %v", err)
 	}
@@ -2725,7 +2725,7 @@ func TestEngineWake_NilVerifierSkipsVerify(t *testing.T) {
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 	// No WithVerifier call — verifier field is nil.
 
-	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, "", ""); err != nil {
 		t.Fatalf("Wake with nil verifier: %v", err)
 	}
 	if vmm.coldBoots != 1 {
@@ -2751,7 +2751,7 @@ func TestEngineWake_RejectsTransientVerifierIO(t *testing.T) {
 	verifier := &staleVerifier{reject: transient}
 	e.WithVerifier(verifier)
 
-	_, err := e.Wake(context.Background(), app.ID, "")
+	_, err := e.Wake(context.Background(), app.ID, "", "")
 	if err == nil {
 		t.Fatal("Wake accepted transient verifier I/O; want error")
 	}

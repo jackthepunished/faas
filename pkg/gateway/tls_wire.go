@@ -271,8 +271,8 @@ func ensureStorageDir(dir string) error {
 	return nil
 }
 
-// allowlistToDecisionFunc adapts our OnDemandAllowlist (func(host) bool) to
-// certmagic's DecisionFunc (func(ctx, name) error). Returning a non-nil
+// allowlistToDecisionFunc adapts our OnDemandAllowlist (func(ctx, host) (bool, error))
+// to certmagic's DecisionFunc (func(ctx, name) error). Returning a non-nil
 // error tells certmagic to deny the request — that's how we close the
 // cert-mint abuse vector from spec §11.
 //
@@ -288,13 +288,26 @@ func ensureStorageDir(dir string) error {
 // Validate() (ErrTLSAllowlistMissing); the increment here is a
 // defense-in-depth for the test-only path that builds a DecisionFunc
 // directly.
+//
+// PR-B (issue #272 / ADR-095): ctx flows through to the allowlist so
+// the preview branch gets the same 2-second DB budget the custom-domain
+// branch uses.
 func allowlistToDecisionFunc(allow OnDemandAllowlist, log *slog.Logger, m *Metrics) func(context.Context, string) error {
-	return func(_ context.Context, name string) error {
+	return func(ctx context.Context, name string) error {
 		if allow == nil {
 			m.ObserveTLSOnDemandDenied("allowlist")
 			return errors.New("gateway: on-demand denied (allowlist not configured)")
 		}
-		if !allow(name) {
+		ok, err := allow(ctx, name)
+		if err != nil {
+			// DB-level failure inside the allowlist — surface as a
+			// denial so the cert-mint abuse vector stays closed even
+			// during an outage. Certmagic's own retry loop will
+			// re-invoke us once Postgres recovers.
+			m.ObserveTLSOnDemandDenied("allowlist")
+			return fmt.Errorf("gateway: on-demand denied for %q: %w", name, err)
+		}
+		if !ok {
 			if log != nil {
 				log.Info("gateway: on-demand cert denied by allowlist", "host", name)
 			}

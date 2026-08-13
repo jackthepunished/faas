@@ -67,7 +67,10 @@ type Ledger interface {
 // performs the admission; the typed AdmitResult.AtCapacity=true signals
 // the cap rejection path.
 type Engine interface {
-	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
+	// AdmitInstance (PR-B / issue #272): scope is the preview scope
+	// (`pr-{N}`) forwarded to the underlying sched.Engine.
+	// Empty = prod (legacy single-deployment behaviour).
+	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
 }
 
 // InstatsReader is the per-instance in-flight signal source (PR-C,
@@ -305,7 +308,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
-		result, err := t.engine.AdmitInstance(ctx, app.ID)
+		result, err := t.engine.AdmitInstance(ctx, app.ID, "")
 		if err != nil {
 			t.log.Warn("targets: admit failed", "app_id", app.ID, "err", err)
 			continue

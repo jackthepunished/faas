@@ -129,6 +129,23 @@ type App struct {
 	// the pre-#477 customer behaviour in fakeBackend unit
 	// tests.
 	PublicAuth PublicAuthConfig
+	// Scope (issue #272 / ADR-095 PR-B) is the per-lookup scope
+	// label that the gateway forwards to schedd on the wake /
+	// admit path. Empty = production (the legacy single-deployment
+	// behaviour every pre-PR-B caller exercises). Non-empty =
+	// preview scope, e.g. "pr-42" — the preview app row already
+	// carries its own apps.id, so the scheduler resolves the
+	// wake against the scope's live deployment (ADR-091 surfaced
+	// LiveDeploymentForScope for this).
+	//
+	// The field is populated by pgRouter.toApp from the resolved
+	// apps row's preview_pr_state + preview_pr_number
+	// (preview apps row) or stays empty (prod row). It is NOT
+	// plumbed via the apps table — it's a per-lookup token, not a
+	// row property — so cache invalidation is identical to the
+	// existing route cache (apps_update / domain_changed wipes
+	// the route cache, and the next Lookup re-derives).
+	Scope string
 }
 
 // PublicAuthConfig (issue #477 / ADR-079) is the per-app
@@ -317,6 +334,11 @@ type Target struct {
 //     failure (RAM headroom, chooser, store).
 type Backend interface {
 	// Lookup resolves a hostname to its app (cache-first, spec §4.1).
+	// The scope is plumbed on the returned App (issue #272 /
+	// ADR-095 PR-B) — empty for prod, non-empty for preview
+	// hosts (e.g. "pr-42"). This avoids widening the Lookup
+	// signature itself; the App handle is the only thing the
+	// handler caches, so the scope must ride on it.
 	Lookup(ctx context.Context, host string) (App, bool)
 	// Pick returns a PickResult (issue #556 / PR-C): the routable
 	// Target plus the signals the handler needs to drive
@@ -353,13 +375,23 @@ type Backend interface {
 	// that specific deployment so the retry Pick has a
 	// routable Target.
 	//
+	// scope (issue #272 / ADR-095 PR-B): the per-lookup scope
+	// label forwarding the preview-vs-prod routing decision
+	// to schedd. Empty = prod (legacy). Non-empty = preview
+	// (e.g. "pr-42"). schedd threads scope through Engine.Wake
+	// / Engine.AdmitInstance / LiveDeploymentForScope so the
+	// preview app's deployment row is the one resolved, not
+	// the parent prod app's. The picker is keyed by appID
+	// (the preview app already has its own apps.id), so
+	// scope is orthogonal to the per-app picker buckets.
+	//
 	// On the admitted path wakeID is non-empty, the new
 	// Target is cached, and method reflects what schedd
 	// actually did (restore or cold boot). On the at-capacity
 	// path wakeID is empty, method is WakeMethodUnspecified,
 	// and err is nil. On real failure err is a non-nil
 	// *api.Problem and method is WakeMethodUnspecified.
-	Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
+	Admit(ctx context.Context, appID, deploymentID, scope string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
 }
 
 // Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -3186,7 +3218,7 @@ haveApp:
 	// N instances before short-circuiting.
 	limits, _ := api.LimitsFor(app.Plan)
 	//nolint:contextcheck // request ctx at handler boundary.
-	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, limits.MaxConcurrency)
+	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.Scope, limits.MaxConcurrency)
 	if err != nil {
 		writeWakeError(w, err)
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
@@ -3209,7 +3241,7 @@ haveApp:
 	// that re-seeds the cache.
 	if !pick.OK && pick.ColdBucket != "" {
 		//nolint:contextcheck // request ctx at handler boundary; this is the wake-fan-out retry branch.
-		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, limits.MaxConcurrency); err != nil {
+		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, app.Scope, limits.MaxConcurrency); err != nil {
 			// Log-and-continue: the existing "warmest bucket"
 			// fallback inside Pick already handled the
 			// fallback path. Failure here means the cold
@@ -4127,7 +4159,14 @@ func (s *statusRecorder) finalFlush() {
 //   - err is non-nil only on real admission failures (RAM headroom, chooser,
 //     store). The benign app_concurrency_reached outcome is never lifted to
 //     an error by Backend.Admit.
-func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurrency int) (cold bool, wakeID string, method WakeMethod, err error) {
+//
+// scope (issue #272 / ADR-095 PR-B) is the per-lookup scope label
+// forwarded to Backend.Admit so schedd's wake path resolves the
+// preview app's deployment row (scope="pr-N") rather than the parent
+// prod app's. Empty = prod (legacy). When the cold-start path calls
+// coldStart and coldStart in turn calls Admit, scope is plumbed
+// through both paths.
+func (h *Handler) ensureCapacity(ctx context.Context, appID, scope string, maxConcurrency int) (cold bool, wakeID string, method WakeMethod, err error) {
 	// Loop bound: a single request can drive at most max_concurrency
 	// iterations (cold-start with follow-up fan-out). The cap is
 	// enforced atomically by Backend.Admit (HealthyCount + add as one
@@ -4136,7 +4175,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 	for attempt := 0; attempt < maxConcurrency; attempt++ {
 		healthy := h.backend.HealthyCount(appID)
 		if healthy == 0 {
-			c, w, m, e := h.coldStart(ctx, appID, maxConcurrency)
+			c, w, m, e := h.coldStart(ctx, appID, scope, maxConcurrency)
 			if e != nil {
 				return false, "", WakeMethodUnspecified, e
 			}
@@ -4156,7 +4195,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 		// atomically checks HealthyCount < maxConcurrency under its
 		// own lock, so concurrent callers cannot collectively
 		// exceed the cap.
-		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
+		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, maxConcurrency)
 		if e != nil {
 			return false, "", WakeMethodUnspecified, e
 		}
@@ -4172,7 +4211,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 // through the WakeGate's single-flight coalescing. shouldWake is held
 // under the gate lock and re-runs HealthyCount; if a peer's admit has
 // just landed, we skip the redundant cold boot.
-func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency int) (bool, string, WakeMethod, error) {
+func (h *Handler) coldStart(ctx context.Context, appID, scope string, maxConcurrency int) (bool, string, WakeMethod, error) {
 	var (
 		admittedWakeID string
 		cold           bool
@@ -4183,7 +4222,7 @@ func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency in
 			return h.backend.HealthyCount(appID) < maxConcurrency
 		},
 		func(ctx context.Context) error {
-			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
+			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, maxConcurrency)
 			if e != nil {
 				return e
 			}

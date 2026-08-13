@@ -69,14 +69,14 @@ type rotatingDeployScheduler struct {
 	idx         int
 }
 
-func (r *rotatingDeployScheduler) AdmitInstance(ctx context.Context, appID, _ string) (string, string, string, string, int32, bool, int, error) {
+func (r *rotatingDeployScheduler) AdmitInstance(ctx context.Context, appID, _, _ string) (string, string, string, string, int32, bool, int, error) {
 	// Snapshot the deploymentID BEFORE the parent's AdmitInstance
 	// runs, since the parent mints ids and we want to drive our
 	// own counter.
 	dep := r.deployments[r.idx%len(r.deployments)]
 	r.idx++
 	r.FakeScheduler.WithDeploymentID(dep)
-	return r.FakeScheduler.AdmitInstance(ctx, appID, "")
+	return r.FakeScheduler.AdmitInstance(ctx, appID, dep, "")
 }
 
 // TestPGBackend_PickWeighted_AcrossTwoDeployments (PR-B / issue #556):
@@ -102,7 +102,7 @@ func TestPGBackend_PickWeighted_AcrossTwoDeployments(t *testing.T) {
 	// Seed 5 admits: 2 on dep-25, 3 on dep-75 (both buckets non-empty
 	// so the cold-deployment fallback never fires).
 	for i := 0; i < 5; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 10); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -152,7 +152,7 @@ func TestPGBackend_PickRoundRobin_WithinDeployment(t *testing.T) {
 		t.Fatalf("RefreshDeploymentWeights: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -194,7 +194,7 @@ func TestPGBackend_RefreshDeploymentWeights_OnNotifyDeploymentChanged(t *testing
 		t.Fatalf("initial refresh: %v", err)
 	}
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -240,7 +240,7 @@ func TestPGBackend_RefreshDeploymentWeights_OnNotifyDeploymentChanged(t *testing
 	// restore the 25/75 ratio.
 	sched.WithDeploymentID("dep-B")
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 10); err != nil {
 			t.Fatalf("dep-B Admit #%d: %v", i+1, err)
 		}
 	}
@@ -299,7 +299,7 @@ func TestPGBackend_PickSingleDeployment_ByteIdenticalToLegacy(t *testing.T) {
 		t.Fatalf("refresh: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -348,7 +348,7 @@ func TestPGBackend_Pick_ColdBucketSignalsHandler(t *testing.T) {
 	// Seed ONLY dep-A with 2 instances. dep-B is the cold bucket
 	// that the weighted stride will land on ~75% of the time.
 	for i := 0; i < 2; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 10); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -420,7 +420,7 @@ func TestPGBackend_Pick_Implicit100_OnlyOnEmptyWeights(t *testing.T) {
 		t.Fatalf("RefreshDeploymentWeights: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -430,7 +430,7 @@ func TestPGBackend_Pick_Implicit100_OnlyOnEmptyWeights(t *testing.T) {
 	// the real weight table. PR-C narrows the synthesis so the
 	// real table survives.
 	sched.WithDeploymentID("dep-B")
-	if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 		t.Fatalf("Admit on dep-B: %v", err)
 	}
 
@@ -467,7 +467,7 @@ func TestPGBackend_RefreshDeploymentWeights_PrunesStaleSets(t *testing.T) {
 		t.Fatalf("initial refresh: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 10); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}

@@ -1966,7 +1966,7 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 		}
 		l.audit.Emit(ctx, eventName, &acct.ID, payload)
 	}()
-	if _, err := l.engine.Wake(ctx, c.AppID, ""); err != nil {
+	if _, err := l.engine.Wake(ctx, c.AppID, "", ""); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return CronRun{}, true
 	}

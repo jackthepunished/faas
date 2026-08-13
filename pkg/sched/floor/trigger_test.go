@@ -80,7 +80,7 @@ type fakeEngine struct {
 	errs    map[string]error
 }
 
-func (e *fakeEngine) AdmitInstance(_ context.Context, appID string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID)
@@ -98,7 +98,7 @@ func (e *fakeEngine) AdmitInstance(_ context.Context, appID string) (AdmitResult
 // trigger's per-deployment walk calls this; the per-app walk still
 // calls AdmitInstance. The fake records both with the same
 // `appID|deploymentID` shape so the tests can assert either path.
-func (e *fakeEngine) AdmitInstanceForDeployment(_ context.Context, appID, deploymentID string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstanceForDeployment(_ context.Context, appID, deploymentID, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID+"|"+deploymentID)
