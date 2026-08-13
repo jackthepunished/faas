@@ -40,6 +40,8 @@ tags:
     description: Account & billing (self-service, GDPR, plan).
   - name: apps
     description: App lifecycle (create, update, delete, wake, park).
+  - name: deploydiff
+    description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules
     description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip) per app.
   - name: deployments
@@ -1571,6 +1573,90 @@ paths:
           description: |
             githubd unreachable or source-ref tarball fetch failed
             (code: source_ref_unavailable). Retry in ~30s.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/apps/{slug}/diff:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [deploydiff]
+      operationId: diffApp
+      summary: Read-only preview of what a deploy would change.
+      description: |
+        PR-1 of the deploy-diff cluster. Server-side equivalent of
+        `gregale deploy --diff` — runs the same engine (pkg/deploydiff)
+        and returns the same wire shape (DiffResponse).
+
+        Read-only: no DB writes, no audit row, no deployment row. The
+        app-not-found case is 200 with `diff.changes[]` containing a
+        `would_create_app` row + the quota gate firing against the
+        customer's plan — a CI consumer can preview a fresh deploy the
+        same way the CLI does.
+
+        Auth: bearer-key with `apps:read` (or admin). NO MFA on this
+        endpoint, mirroring GET /v1/apps/{slug}/metrics.
+
+        Schema-break detection is text-only in PR-1 (handler / entrypoint
+        / env-key changes → warn-severity Breaks). Structural OpenAPI
+        response-schema diff lands in PR-2.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiffRequest'
+            example:
+              image: ghcr.io/me/api@sha256:abc
+              app_config:
+                ram_mb: 512
+                max_concurrency: 30
+      responses:
+        '200':
+          description: |
+            DiffResponse with `blocking: true` if any break has
+            `severity: "error"`. CI gate input — `jq '.blocking'`
+            collapses to a single bool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiffResponse'
+              example:
+                diff:
+                  slug: api
+                  plan: hobby
+                  changes:
+                    - { field: memory, kind: modify, before: 256, after: 512 }
+                  breaks:
+                    - code: plan_limit_concurrency
+                      severity: error
+                      reason: max_concurrency exceeds plan cap
+                      field: concurrency
+                      observed: 30
+                      limit: 20
+                blocking: true
+                slug: api
+                plan: hobby
+        '400':
+          description: |
+            code: validation_failed. Body is malformed JSON, fails
+            strict-decode, or has a plan lookup error.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            code: forbidden. Caller's bearer key lacks both
+            `apps:read` and admin scope.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: |
+            code: capacity. pkg/state read failed for the baseline
+            builder (deployment / env / crons / edge rules).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -8680,6 +8766,151 @@ components:
           enum: [tarball]
           default: tarball
           description: "Forward-compat field. PR-A only supports `tarball`."
+
+    DiffRequest:
+      description: |
+        JSON body for POST /v1/apps/{slug}/diff (PR-1). Slim
+        purpose-built DTO — every field maps 1:1 to a
+        [deploydiff.Pending] entry via the apid handler's adapter.
+        Empty / absent fields mean "no change proposed" (matches
+        the engine's pointer semantics: every nested field is
+        optional; null = "don't touch").
+      type: object
+      properties:
+        app_config:
+          $ref: '#/components/schemas/DiffAppConfigPatch'
+        image:
+          type: string
+          description: |
+            Would-write image reference. Empty = no image deploy
+            proposed. Compared against the baseline's
+            DeploymentResponse.ImageDigest for the immutable-diff
+            check.
+          example: ghcr.io/me/api@sha256:abc
+        manifest:
+          $ref: '#/components/schemas/AppManifest'
+        env_by_scope:
+          type: object
+          description: |
+            Per-scope env write. Full-replacement semantics per
+            scope (ADR-090 D3). Keys are scope names ("default",
+            "staging", ...); values are DiffEnvRow arrays.
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/DiffEnvRow' }
+        crons:
+          type: array
+          items: { $ref: '#/components/schemas/CreateCronRequest' }
+        edge_rules:
+          type: array
+          items: { $ref: '#/components/schemas/CreateEdgeRuleRequest' }
+
+    DiffAppConfigPatch:
+      description: |
+        Per-app scalar patch. Pointer-aware: nil = "don't touch";
+        explicit zero / explicit value = "set to this". Matches
+        [UpdateAppRequest] semantics but exposes only the fields
+        the engine computes against (no ScalingPolicy /
+        PublicAuth / OverflowNode).
+      type: object
+      properties:
+        ram_mb: { type: integer, minimum: 128, maximum: 10240 }
+        idle_timeout_s: { type: integer, minimum: 30, maximum: 600 }
+        max_concurrency: { type: integer, minimum: 1, maximum: 200 }
+        min_instances: { type: integer, minimum: 0, maximum: 10 }
+        egress_allowlist:
+          type: array
+          items: { type: string }
+        autoscale_target_rps: { type: integer, minimum: 1, maximum: 10000 }
+        autoscale_target_cpu_pct: { type: integer, minimum: 1, maximum: 100 }
+        streaming_enabled: { type: boolean }
+        websocket_enabled: { type: boolean }
+        require_signed: { type: boolean }
+        warm_snapshot_enabled: { type: boolean }
+        require_authn: { type: boolean }
+        eviction_priority: { type: string, enum: [normal, batch, latency] }
+
+    DiffEnvRow:
+      description: |
+        One would-write env var. Value carries plaintext so the
+        quota gate's per-value byte cap can fire (the wire's list
+        path never echoes values per ADR-053 §Decision 4).
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 64 }
+        value: { type: string, maxLength: 8192 }
+
+    DiffChange:
+      description: |
+        One diff row. Polymorphic values (Before / After) re-emitted
+        as JSON objects — the engine emits primitives, slices, or
+        structs depending on the field.
+      type: object
+      required: [field, kind]
+      properties:
+        field: { type: string, description: "Human path: 'memory', 'concurrency', 'environment.<scope>.<key>', 'cron[<schedule> <path>]', 'edge_rule[<kind> <host><path>]'" }
+        kind: { type: string, enum: [add, remove, modify] }
+        before: { description: "Primitive value (int / string / bool / []string) — JSON-encoded. Omitted on Add." }
+        after:  { description: "Primitive value — JSON-encoded. Omitted on Remove." }
+
+    DiffBreak:
+      description: |
+        One would-ship-a-problem row. Stable RFC 7807 code
+        (matches [api.Code*] constants) so the CLI error renders
+        identically to what a real deploy would say.
+      type: object
+      required: [code, severity, reason]
+      properties:
+        code: { type: string, description: "Stable RFC 7807 code; matches api.Code* constants" }
+        severity: { type: string, enum: [error, warn] }
+        reason: { type: string }
+        field: { type: string, description: "Optional scope-wide ('memory') or per-row ('environment.<scope>.<key>')." }
+        observed: { description: "JSON-encoded observed value (int / string / []string / …)." }
+        limit:    { description: "JSON-encoded limit value." }
+
+    DiffPayload:
+      description: |
+        Inner diff object the engine produces. Slug + Plan +
+        Changes + Breaks. Wrapped by [DiffResponse] so a CI
+        consumer reading `.diff.changes` and a CLI consumer
+        reading the top-level keys agree.
+      type: object
+      required: [slug, changes, breaks]
+      properties:
+        slug: { type: string }
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
+          description: "Customer's subscription tier (echoed from acct.Plan)."
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/DiffChange' }
+        breaks:
+          type: array
+          items: { $ref: '#/components/schemas/DiffBreak' }
+
+    DiffResponse:
+      description: |
+        Wire envelope for POST /v1/apps/{slug}/diff and
+        `gregale deploy --diff --json`. Wraps the [DiffPayload]
+        plus the Blocking bit so a CI consumer doesn't have to
+        re-scan Breaks and pick the max severity.
+      type: object
+      required: [diff, blocking, slug]
+      properties:
+        diff: { $ref: '#/components/schemas/DiffPayload' }
+        blocking:
+          type: boolean
+          description: |
+            True if any break has severity "error". Mirrors
+            [pkg/deploydiff.Diff.HasBlockingBreaks]. The exit-1
+            input for CI gates.
+        slug: { type: string }
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
+          description: "Echoed at top level too — kept in sync with diff.plan."
 
     ProjectApplyRequest:
       description: |
