@@ -1,4 +1,4 @@
--- filename: 00221_apps_cors_defaults.sql
+-- filename: 00223_apps_cors_defaults.sql
 -- +goose Up
 -- +goose StatementBegin
 

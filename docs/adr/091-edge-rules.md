@@ -858,8 +858,8 @@ for the preflight answer; the gateway only stamps response headers).
 The validator on PATCH `/v1/apps/{slug}` requires a non-empty
 `cors_default_origins` when `cors_default_enabled` is true —
 silently accepting an empty allowlist would leave the customer with
-an opt-in flag that stamps nothing. Migration slot: 00221 (with
-00222 reserved as a fence per the cross-PR slot pattern).
+an opt-in flag that stamps nothing. Migration slot: 00223 (with
+00224 reserved as a fence per the cross-PR slot pattern).
 
 ### D22 — Default-fallback placement in applyEdgeRuleCORS
 

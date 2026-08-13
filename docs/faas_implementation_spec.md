@@ -232,7 +232,7 @@ everything else routes through it.
    at create-time; the gateway hot path runs the same predicates
    in `matchOrigin` (defence in depth).
 2. **Per-app default CORS (D21, D22).** `apps.cors_default_enabled`
-   and `apps.cors_default_origins` (migration 00221) give a single
+   and `apps.cors_default_origins` (migration 00223) give a single
    opt-in a soft CORS stamp without the customer configuring an
    edge rule. The default runs INSIDE `applyEdgeRuleCORS`,
    immediately after the existing `MatchCORS` miss path, so

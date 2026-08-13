@@ -11339,7 +11339,7 @@ const appsSelectColumns = `
 	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
 	coalesce(preview_pr_state, ''), preview_expires_at,
 	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
-	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00221);
+	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00223);
 	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the
 	-- pgx scan sees a non-nil slice on legacy rows (the gateway treats
 	-- len==0 as "deny all" — same contract as EgressAllowlist).
