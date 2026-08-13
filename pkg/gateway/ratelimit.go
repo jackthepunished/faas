@@ -140,6 +140,36 @@ func (l *Limiter) Allow(appID string, plan api.Plan) bool {
 // the per-minute refill kicks in. Distinct from Allow (per-app) so a botnet
 // rotating across many apps within an account cannot evade this limiter by
 // keeping per-app rps low.
+// AllowWithParams is the rule-scoped variant for kind=throttle
+// (ADR-091 D20.5 amendment, issue #881). Caller (cmd-side
+// applyEdgeRuleThrottle) supplies the rule's bucket key (the
+// convention `appID + "\x00" + ruleID` so the bucket is bounded by
+// configured rules, not traffic — see plan §"Bucket key") together
+// with the rule's per-rule rps and burst. Returns true on a
+// consumed token, false when the bucket is empty (caller responds
+// 429 with `x-faas-rate-limit-scope: route` +
+// `X-RouteRateLimit-{Limit,Remaining,Reset}` headers — see
+// applyEdgeRuleThrottle). Distinct from Allow (per-app) and
+// AllowAccount (per-account) so customer-configured throttles
+// don't fight the platform-shared limits for map slots.
+//
+// rps must be > 0; the cmd-side compile clamps to 1 as
+// defence-in-depth against a direct-DB row that bypassed
+// apid-Validate, so call sites can rely on rps/burst > 0 here.
+// When the limiter was built with NewLimiterWithLRU, each call
+// also marks the bucket most-recently-used and, on inserting
+// into a full map, tries to evict (PR #887 invariant: only full
+// buckets are evictable, so an attacker cannot force eviction to
+// bypass a partially-drained rule bucket).
+func (l *Limiter) AllowWithParams(id string, rps, burst float64) bool {
+	if l.noop {
+		return true
+	}
+	if rps < 0 || burst < 0 {
+		return false
+	}
+	return l.allowToken(id, rps, burst)
+}
 func (l *Limiter) AllowAccount(accountID string, plan api.Plan) bool {
 	if l.noop {
 		return true
@@ -391,6 +421,61 @@ func (l *Limiter) PeekAccount(accountID string, plan api.Plan) (limit, remaining
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b := l.buckets[accountID]
+	if b == nil {
+		return limit, 0, 0, false
+	}
+	tokens := b.tokens
+	last := b.last
+	now := l.now()
+	dt := now.Sub(last).Seconds()
+	if dt > 0 {
+		tokens += dt * rps
+		if tokens > burst {
+			tokens = burst
+		}
+	}
+	if tokens < 0 {
+		tokens = 0
+	}
+	remaining = int(tokens)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if tokens < 1 {
+		resetSeconds = int((1-tokens)/rps + 1)
+		if resetSeconds < 1 {
+			resetSeconds = 1
+		}
+	}
+	return limit, remaining, resetSeconds, true
+}
+
+// PeekWithParams is the rule-scoped variant of Peek for
+// kind=throttle (ADR-091 D20.5 amendment, issue #881). Returns the
+// post-consume snapshot of the bucket at id (the same id used in
+// AllowWithParams — the convention is `appID + "\x00" + ruleID`)
+// using the supplied rps/burst as the bucket parameters. Caller
+// (applyEdgeRuleThrottle → writeRouteRateLimitHeaders) renders
+// the values into X-RouteRateLimit-{Limit,Remaining,Reset}. The
+// limit field is the burst (i.e. the bucket ceiling), matching
+// the X-RateLimit-Limit convention for the per-app + per-account
+// paths so a customer dashboard that auto-parses limit-style
+// headers sees one shape across all three scopes. Returns
+// ok=false on noop or a missing bucket (the "never seen" contract
+// shared with Peek / PeekAccount — the absence of the headers is
+// the loader-side signal that the value is "not yet established").
+func (l *Limiter) PeekWithParams(id string, rps, burst float64) (limit, remaining, resetSeconds int, ok bool) {
+	if l == nil || l.noop {
+		return 0, 0, 0, false
+	}
+	if rps <= 0 || burst <= 0 {
+		return 0, 0, 0, false
+	}
+	limit = int(burst)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.buckets[id]
 	if b == nil {
 		return limit, 0, 0, false
 	}

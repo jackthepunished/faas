@@ -375,6 +375,72 @@ func TestRateLimitReturns429(t *testing.T) {
 	}
 }
 
+// TestEdgeRuleThrottleReturns429 — ADR-091 D20.5 amendment
+// (issue #881): when a kind=throttle rule's bucket is exhausted
+// the handler must 429 with x-faas-rate-limit-scope: route (new
+// scope value alongside `account` + `app`) +
+// X-RouteRateLimit-{Limit,Remaining,Reset} headers + a problem+json
+// body. Per-rule rps=1, burst=1 means two requests in quick
+// succession: the first consumes the token, the second trips the
+// 429. The test bypasses the per-app + per-account limiters so the
+// rule is the only 429 source — without the bypass the per-account
+// bucket would trip first (burst 1000 vs rule burst 1) and the
+// assertion on `x-faas-rate-limit-scope: route` would never fire.
+func TestEdgeRuleThrottleReturns429(t *testing.T) {
+	h, b, _ := newTestHandler(t)
+	b.setLegacyHot()
+	b.app.Plan = api.PlanPro
+	b.app.AccountID = "acct-1"
+	// Bypass per-app + per-account limiters so the rule is the
+	// only 429 source.
+	h.WithLimiter(NewLimiter().WithNoop())
+	h.WithAccountLimiter(NewLimiter().WithNoop())
+	// Install a stub matcher that surfaces the rule on every
+	// request. Bucket ceiling = 1 (burst=1) so the second request
+	// trips the 429.
+	h.edgeRules = stubEdgeRuleMatcher{
+		throttle: &EdgeRuleThrottleResolved{
+			ID: "rule-1", AccountID: "acct-1", AppID: b.app.ID,
+			Priority: 0, PathGlob: "", Methods: nil,
+			RequestsPerSecond: 1, Burst: 1,
+		},
+	}
+
+	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req)
+	if rec1.Code == http.StatusTooManyRequests {
+		t.Fatalf("first request should NOT trip the throttle (burst=1 means the first consume succeeds); got 429 body=%s",
+			rec1.Body.String())
+	}
+
+	// Second request: bucket now empty → 429.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request should trip the throttle 429; got code=%d body=%s",
+			rec2.Code, rec2.Body.String())
+	}
+	if got := rec2.Header().Get("Retry-After"); got == "" {
+		t.Error("route-scope 429 should include Retry-After")
+	}
+	if got := rec2.Header().Get("x-faas-rate-limit-scope"); got != "route" {
+		t.Errorf("route-scope 429 should carry x-faas-rate-limit-scope: route; got %q", got)
+	}
+	// X-RouteRateLimit-* family is distinct from X-RateLimit-* and
+	// X-AccountRateLimit-* (handler.go:writeRouteRateLimitHeaders).
+	if got := rec2.Header().Get("X-RouteRateLimit-Limit"); got != "1" {
+		t.Errorf("route-scope 429 should carry X-RouteRateLimit-Limit=1 (rule burst=1); got %q", got)
+	}
+	// remaining=0 because the bucket was just exhausted.
+	if got := rec2.Header().Get("X-RouteRateLimit-Remaining"); got != "0" {
+		t.Errorf("route-scope 429 should carry X-RouteRateLimit-Remaining=0 (bucket exhausted); got %q", got)
+	}
+	if got := rec2.Header().Get("X-RouteRateLimit-Reset"); got == "" {
+		t.Error("route-scope 429 should carry X-RouteRateLimit-Reset (time-until-next-token in s)")
+	}
+}
+
 // TestAccountRateLimitReturns429 — ADR-040 / issue #292: when the
 // per-account bucket is exhausted the handler must 429 with
 // x-faas-rate-limit-scope: account. Per-app burst is bypassed with
@@ -1440,6 +1506,13 @@ type stubEdgeRuleMatcher struct {
 	// MatchMaintenance from the embedded noOpEdgeRuleMatcher; the
 	// MatchMaintenance override below returns s.maintenance verbatim.
 	maintenance *EdgeRuleMaintenanceResolved
+	// throttle (ADR-091 D20.5 amendment / kind=throttle): eleventh-kind
+	// seat on the stub matcher so the throttle-applier handler tests
+	// can drive applyEdgeRuleThrottle without a real matcher or LRU
+	// cache. Inherits the no-op MatchThrottle from the embedded
+	// noOpEdgeRuleMatcher; the MatchThrottle override below returns
+	// s.throttle verbatim.
+	throttle *EdgeRuleThrottleResolved
 }
 
 func (s stubEdgeRuleMatcher) MatchRewrite(_ context.Context, _, _, _ string) *EdgeRuleRewriteResolved {
@@ -1493,6 +1566,17 @@ func (s stubEdgeRuleMatcher) MatchLimit(_ context.Context, _, _, _ string) *Edge
 // would never fire.
 func (s stubEdgeRuleMatcher) MatchMaintenance(_ context.Context, _, _, _ string) *EdgeRuleMaintenanceResolved {
 	return s.maintenance
+}
+
+// MatchThrottle (ADR-091 D20.5 amendment / kind=throttle) —
+// returns s.throttle verbatim so the 429-applier handler tests
+// can drive applyEdgeRuleThrottle without a real matcher or
+// limiter. Mirrors MatchMaintenance above; the stub's
+// noOpEdgeRuleMatcher base class returns nil for this method, so
+// without this override every test would silently hit the "rule
+// miss" branch and the bucket-key assertion would never fire.
+func (s stubEdgeRuleMatcher) MatchThrottle(_ context.Context, _, _, _ string) *EdgeRuleThrottleResolved {
+	return s.throttle
 }
 
 // TestMatchAndApplyRewrite_PrefixAddToSlash_NoDoubleSlash pins the

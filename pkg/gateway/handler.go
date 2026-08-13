@@ -445,6 +445,15 @@ type Backend interface {
 type Handler struct {
 	backend Backend
 	limiter *Limiter
+	// routeLimiter is the per-rule token-bucket throttle (ADR-091
+	// D20.5 amendment, issue #881). Same underlying *Limiter type as
+	// limiter + accountLimiter but constructed with NewLimiterWithLRU
+	// (PR #887) so the per-rule bucket map — keyed by
+	// `appID + "\x00" + ruleID` — cannot grow unboundedly. Distinct
+	// from limiter (per-app) and accountLimiter (per-account) so the
+	// customer-configured rule scope shares no bucket slots with
+	// platform-shared throttles.
+	routeLimiter *Limiter
 	// accountLimiter is the per-account token-bucket throttle (ADR-040 /
 	// issue #292). Runs BEFORE limiter (per-app) in ServeHTTP so a botnet
 	// rotating across many apps is rejected before any per-app bucket
@@ -688,6 +697,12 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 	h := &Handler{
 		backend:        backend,
 		limiter:        NewLimiter(),
+		// routeLimiter is built with NewLimiterWithLRU (#887) so
+		// the per-rule bucket map — keyed by appID+"\x00"+ruleID —
+		// cannot grow unboundedly; full-bucket-only eviction
+		// invariant means an attacker cannot weaponise eviction to
+		// bypass a partially-drained rule.
+		routeLimiter:   NewLimiterWithLRU(EdgeRuleCacheCap),
 		accountLimiter: NewLimiter(),
 		gate:           NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
 		metrics:        m,
@@ -2631,6 +2646,118 @@ func (h *Handler) applyEdgeRuleGeo(w http.ResponseWriter, r *http.Request, app A
 	return false
 }
 
+// applyEdgeRuleThrottle (ADR-091 D20.5 amendment / issue #881 /
+// §4.1.2.x) consults the per-host edge-rule matcher for a
+// `kind=throttle` rule. On match, decrements the rule's bucket via
+// the LRU-backed routeLimiter (constructed with NewLimiterWithLRU
+// in NewHandlerWith, PR #887) keyed by `appID + "\x00" + ruleID`.
+// The bucket's rps/burst come from the rule itself (cmd-side
+// compileThrottleRules clamps non-positive values to {1, 1} as
+// defence-in-depth). On deny, returns true after writing the
+// problem+json 429 + x-faas-rate-limit-scope: route +
+// X-RouteRateLimit-{Limit,Remaining,Reset}. On allow, returns
+// false so the caller continues down the chain.
+//
+// Hot-path placement: runs AFTER applyEdgeRuleLimit
+// (pkg/gateway/handler.go:2336 — kind=limit body-size cap) and
+// BEFORE applyEdgeRuleValidate
+// (pkg/gateway/handler.go:2037 — kind=validate schema gate).
+// Rationale:
+//
+//   - requests denied by JWT/IP/Geo/Limit MUST NOT consume a route
+//     token (already enforced by running AFTER them);
+//   - the O(1) bucket lookup MUST run BEFORE validate allocates
+//     and parses r.Body, so a throttled request never costs a
+//     schema-validate pass;
+//   - the bucket decrement is bounded by the rule's burst so a
+//     sudden spike cannot starve legitimate traffic.
+//
+// Cross-account defence-in-depth: same posture as every other
+// applier (ApplyLimit / ApplyGeo / ApplyMaintenance) — a rule
+// that fires for a different account than the inbound App is
+// silently passed over (audit `edge_rule.throttle_blocked` +
+// metric `outcome=blocked`), so a direct-DB write that ignores
+// same-account governance doesn't get to gate traffic.
+//
+// Returns true iff the caller MUST return (short-circuit on 429).
+func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, app App) bool {
+	if h.edgeRules == nil || h.routeLimiter == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchThrottle(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("throttle", "miss")
+		}
+		return false
+	}
+	if rule.AccountID != app.AccountID {
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.throttle_blocked", &rule.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"rule_account_id": rule.AccountID,
+				"app_account_id":  app.AccountID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("throttle", "blocked")
+			// Cross-account blocked is a defense-in-depth no-op —
+			// emit apply success so the §12 dashboard chip doesn't
+			// falsely flag the cross-account rule as a wire error.
+			// Mirrors applyEdgeRuleLimit (handler.go:2357) and
+			// applyEdgeRuleGeo (handler.go:2531).
+			h.metrics.ObserveEdgeRuleApply("throttle", "success")
+		}
+		return false
+	}
+	// Bucket key is `appID + "\x00" + ruleID` so the per-rule
+	// bucket is bounded by *configured rules*, not by traffic.
+	// Per-IP sub-keying is deliberately excluded from v1 — that
+	// would multiply cardinality by unique-IP count, which is
+	// unbounded and attacker-controlled, against a limiter that
+	// has never had eviction. PR-B (#887) added LRU eviction with
+	// the full-bucket-only invariant so the bucket map cannot
+	// grow unboundedly even with many configured rules.
+	bucketKey := app.ID + "\x00" + rule.ID
+	if !h.routeLimiter.AllowWithParams(bucketKey, rule.RequestsPerSecond, float64(rule.Burst)) {
+		w.Header().Set("Retry-After", "1")
+		// `route` is a new scope value alongside `account` + `app`
+		// (established by per-account / per-app 429 paths
+		// respectively) — see writeRouteRateLimitHeaders comment.
+		w.Header().Set("x-faas-rate-limit-scope", "route")
+		h.writeRouteRateLimitHeaders(w, bucketKey, rule.RequestsPerSecond, rule.Burst)
+		api.WriteProblem(w, api.NewProblem(http.StatusTooManyRequests, "rate_limited",
+			"Rate limit exceeded", "slow down and retry"))
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.throttle_rejected", nil, map[string]any{
+				"rule_id": rule.ID,
+				"app_id":  app.ID,
+				"rps":     rule.RequestsPerSecond,
+				"burst":   rule.Burst,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("throttle", "blocked")
+			h.metrics.ObserveEdgeRuleApply("throttle", "blocked")
+		}
+		return true
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.throttle_matched", nil, map[string]any{
+			"rule_id": rule.ID,
+			"app_id":  app.ID,
+			"rps":     rule.RequestsPerSecond,
+			"burst":   rule.Burst,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("throttle", "match")
+		h.metrics.ObserveEdgeRuleApply("throttle", "success")
+	}
+	return false
+}
+
 // geoFailReason returns a short audit-friendly string explaining
 // why the geo lookup was deemed "failed" (err vs not-found). The
 // audit pipeline copies this into the `"reason"` field of the
@@ -3566,6 +3693,19 @@ haveApp:
 		return
 	}
 
+	// ADR-091 D20.5 amendment / kind=throttle (issue #881). Runs
+	// AFTER applyEdgeRuleLimit (so 413 from a per-rule body cap
+	// still consumes a route token — denied requests count toward
+	// the throttle) and BEFORE applyEdgeRuleValidate (so the
+	// schema-gate 422 never costs a bucket decrement). The O(1)
+	// bucket lookup is the cheapest hot-path step short of the
+	// path-glob match itself. See applyEdgeRuleThrottle's doc for
+	// the rationale + the cross-account audit/metric posture.
+	if h.applyEdgeRuleThrottle(w, r, app) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
+
 	// PR-B / kind=validate body gate. Runs AFTER rewrite /
 	// headers / CORS / JWT / IP (so a rewritten path is matched
 	// against validate rules, and rejected-on-ip traffic never
@@ -4290,6 +4430,35 @@ func (h *Handler) writeAccountRateLimitHeaders(w http.ResponseWriter, accountID 
 	w.Header().Set("X-AccountRateLimit-Limit", intToString(limit))
 	w.Header().Set("X-AccountRateLimit-Remaining", intToString(remaining))
 	w.Header().Set("X-AccountRateLimit-Reset", intToString(reset))
+}
+
+// writeRouteRateLimitHeaders writes the X-RouteRateLimit-* header
+// trio for the per-rule bucket (ADR-091 D20.5 amendment,
+// issue #881). Distinct header family from X-RateLimit-* and
+// X-AccountRateLimit-* so generic X-RateLimit-* consumers (e.g.
+// browser DevTools) don't conflate the three scopes. Set on both
+// the per-rule 429 path (so a customer debugging a 429 storm can
+// see which throttle tripped) and the 2xx success path (so a
+// customer's standard X-RateLimit-*-style dashboard surfaces the
+// per-rule values without bespoke parsing).
+//
+// rps is the rule's requests_per_second (post-clamp at apid +
+// post-clamp at compile); burst is the rule's burst ceiling
+// (same dual-clamp story). The limiter's PeekWithParams takes
+// the same rps/burst so the visible reset time uses the same
+// denominator the rule actually refills at — mirroring the
+// per-app + per-account paths.
+func (h *Handler) writeRouteRateLimitHeaders(w http.ResponseWriter, bucketKey string, rps float64, burst int) {
+	if h == nil || h.routeLimiter == nil || bucketKey == "" {
+		return
+	}
+	limit, remaining, reset, ok := h.routeLimiter.PeekWithParams(bucketKey, rps, float64(burst))
+	if !ok {
+		return
+	}
+	w.Header().Set("X-RouteRateLimit-Limit", intToString(limit))
+	w.Header().Set("X-RouteRateLimit-Remaining", intToString(remaining))
+	w.Header().Set("X-RouteRateLimit-Reset", intToString(reset))
 }
 
 // intToString is a tiny strconv.Itoa shim so handler.go doesn't grow
