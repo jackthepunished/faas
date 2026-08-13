@@ -47,7 +47,6 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
-	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
 // UpstreamAffinity is the connection-aware placement cache. Maps
@@ -85,15 +84,13 @@ type upstreamAffinityEntry struct {
 // needs at refresh time. *state.PgStore satisfies it; tests
 // inject a stub.
 //
-//   - ListAllAppDataUpstreams returns every captured upstream
-//     for the app (no cursor/limit — schedd wants the full set
-//     for the bias score; bounded by api.DataPlacementHintsPerApp).
-//   - ListDataUpstreamProbesByHostRegion returns the most-recent
-//     probe row per (host_redacted_hash, region) — the
-//     chooser bias only cares about the freshest observation.
+//   - ListAppUpstreamProbeScores returns one row per
+//     (data_upstreams.id, region) for the app, with the
+//     freshest probe's RTT. Single round-trip on the wake
+//     path (replaces the legacy N+1 design — see
+//     pkg/state/pgstore.go::ListAppUpstreamProbeScores).
 type UpstreamAffinityStore interface {
-	ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]state.DataUpstream, error)
-	ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]state.DataUpstreamProbe, error)
+	ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]state.AppUpstreamProbeScore, error)
 }
 
 // NewUpstreamAffinity returns a cache with the given TTL. A zero
@@ -145,13 +142,15 @@ func (u *UpstreamAffinity) Score(appID string) (region string, scoreMs int, ok b
 // cache. Returns ok=false when the app has no captured upstreams
 // or no probe rows; the cache is left unchanged (no churn).
 //
-// The query is O(U × P) where U = upstreams-per-app (≤ plan
-// quota) and P = probes-per-host-region (1 by construction —
-// the probe loop keeps the freshest row). Total cost per
-// refresh is bounded by api.UpstreamProbeMaxConcurrent = 64,
-// well under the per-wake < 1 ms budget.
+// The read is a single PG round-trip via the JOIN-collapsed
+// ListAppUpstreamProbeScores query (replaces the legacy N+1
+// design that ran 1 ListAllAppDataUpstreams + N
+// ListDataUpstreamProbesByHostRegion queries per wake — for a
+// Scale plan app with DataPlacementHintsPerApp=50, that's 51
+// round-trips on the wake goroutine under appMu, far past
+// the < 1 ms wake-budget claim).
 //
-// accountID is required because pgstore.ListAllAppDataUpstreams
+// accountID is required because pgstore.ListAppUpstreamProbeScores
 // is keyed on (account_id, app_id). appID is the string form
 // passed at the wake call site (engine.app.id is already a
 // string at that point).
@@ -159,30 +158,28 @@ func (u *UpstreamAffinity) Refresh(ctx context.Context, accountID, appID string)
 	if u == nil || u.store == nil {
 		return nil
 	}
-	upstreams, err := u.store.ListAllAppDataUpstreams(ctx, accountID, appID)
+	scores, err := u.store.ListAppUpstreamProbeScores(ctx, accountID, appID)
 	if err != nil {
 		return err
 	}
-	if len(upstreams) == 0 {
+	if len(scores) == 0 {
 		return nil
 	}
-	// Collect the per-host probe set; the score is the mean
-	// RTT across the app's captured upstreams. The chooser
-	// cares about the region with the lowest mean.
-	rows := []state.DataUpstreamProbe{}
-	for _, up := range upstreams {
-		region := up.DeclaredRegion
-		if region == "" {
-			continue
+	// Adapter: the JOIN-collapsed rows are shaped like the
+	// legacy DataUpstreamProbe struct so the pure-function
+	// scoreForUpstreams (placement-go's comparator) doesn't
+	// need to change. The OK + RTTMs pair is the
+	// scoreForUpstreams filter — same contract as before.
+	rows := make([]state.DataUpstreamProbe, 0, len(scores))
+	for _, s := range scores {
+		row := state.DataUpstreamProbe{
+			HostRedactedHash: s.HostRedactedHash,
+			Region:           s.Region,
+			Kind:             s.Kind,
+			OK:               s.OK,
+			RTTMs:            s.RTTMs,
 		}
-		fresh, err := u.store.ListDataUpstreamProbesByHostRegion(ctx, sqlc.ListDataUpstreamProbesByHostRegionParams{
-			HostRedactedHash: up.HostRedactedHash,
-			Region:           region,
-		})
-		if err != nil {
-			return err
-		}
-		rows = append(rows, fresh...)
+		rows = append(rows, row)
 	}
 	bestRegion, bestMean := scoreForUpstreams(rows)
 	if bestRegion == "" {

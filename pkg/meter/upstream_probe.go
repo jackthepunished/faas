@@ -293,7 +293,15 @@ func (p *Probe) ProbeOnce(ctx context.Context, tgt state.DataUpstreamTarget) Pro
 	dialCtx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
 
-	addr := net.JoinHostPort(tgt.HostRedactedHash[:8], strconv.Itoa(tgt.Port))
+	// The probe dials the PLAINTEXT host (carried in
+	// tgt.Host). The §11 secret rule is preserved by the
+	// surrounding code: the plaintext host NEVER appears
+	// in metric labels, audit emit, pg_notify payload, or
+	// log lines. The probe is the one place where the
+	// plaintext is needed (to resolve the dial), and
+	// `tgt.Host` is dropped on the floor as soon as
+	// ProbeOnce returns.
+	addr := net.JoinHostPort(tgt.Host, strconv.Itoa(tgt.Port))
 	dialer := p.dialerOrDefault()
 	rawConn, err := dialer(dialCtx, "tcp", addr)
 	if err != nil {

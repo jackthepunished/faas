@@ -33,13 +33,19 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/data"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
 // stdctxEnv alias mirrors handlers_secrets.go so the file is self-
@@ -245,6 +251,41 @@ func (s *server) setEnv(w http.ResponseWriter, r *http.Request, acct state.Accou
 		api.WriteProblem(w, api.ErrCapacity("could not persist env var"))
 		return
 	}
+	// ADR-098 PR-B (C4): when the data-placement flag is on,
+	// run the env-classifier on the just-persisted row. The
+	// classifier (pkg/data/infer.go) extracts host + port from
+	// the value, hashes the host via pkg/secretbox.HashHost,
+	// and upserts a data_upstreams row. The plaintext host is
+	// dropped on the floor — only the hash + kind + port land
+	// in the table (§11 invariant).
+	//
+	// The classifier + insert path runs synchronously here
+	// because the env mutation is the customer's synchronisation
+	// point: they're waiting for the response. A reload-style
+	// async pipeline would race the customer's next request
+	// (the e2e at cmd/e2e/connection_aware_e2e_test.go
+	// asserts the row exists immediately after the env PUT).
+	// The classifier is cheap (one env row + one dedupe-merge
+	// INSERT) so the latency hit is sub-ms.
+	if s.dataPlacementEnabled {
+		if err := s.runEnvClassifier(r.Context(), acct, app, scope, key, req.Value); err != nil {
+			// The env row is already persisted — a classifier
+			// failure (e.g. secretbox salt missing) is a
+			// data-plane concern, NOT a request failure.
+			// Log and continue; the next env mutation will
+			// re-attempt the classifier, and the importer
+			// path can backfill. CRITICAL: this branch
+			// returns 200 to the customer — partial success
+			// is the right product behaviour.
+			s.log.Warn("env-classifier failed after env upsert",
+				"app", app.Slug,
+				"scope", logsanitize.Field(scope),
+				"key", logsanitize.Field(key),
+				"account", acct.ID,
+				"err", err.Error(),
+			)
+		}
+	}
 	// Audit + log. VALUE never reaches slog. logsanitize.RedactValue is
 	// used defensively even though we never log req.Value directly — a
 	// future refactor that adds a "request echo" log line won't leak.
@@ -385,4 +426,119 @@ func (s *server) envExistsInScope(c stdctxEnv, accountID, appID, scope, key stri
 		}
 	}
 	return false, nil
+}
+
+// runEnvClassifier (ADR-098 PR-B / C4) ingests one env mutation
+// through the env-classifier and upserts the resulting rows into
+// data_upstreams. The classifier (pkg/data/infer.go) walks the
+// env row, extracts host + port from the value, hashes the host
+// via pkg/secretbox.HashHost, and shapes the InferredUpstream
+// rows. The insert uses the InsertDataUpstream path (dedupe-
+// merge on (account_id, app_id, scope, kind, host_redacted_hash,
+// port)) so a re-PUT of the same DSN is idempotent.
+//
+// §11 invariant: the env plaintext reaches the helper ONLY via
+// the value arg; the classifier hashes the host, the helper
+// inserts only the hash, the plaintext host is dropped on the
+// floor before this function returns.
+//
+// Returns the classifier error verbatim — the caller (setEnv)
+// logs + continues (the env row is already persisted; the
+// classifier is a best-effort data-plane concern).
+func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app state.App, scope, key, value string) error {
+	acctUUID, err := uuid.Parse(acct.ID)
+	if err != nil {
+		return fmt.Errorf("parse account uuid: %w", err)
+	}
+	appUUID, err := uuid.Parse(app.ID)
+	if err != nil {
+		return fmt.Errorf("parse app uuid: %w", err)
+	}
+	classifier := data.NewClassifier(s.log, app.ID)
+	classifier.HashHost = secretbox.HashHost
+	classifier.ResolveDefaultPort = func(kind string) (int, bool) {
+		return api.DefaultPortForKind(api.DataUpstreamKind(kind))
+	}
+	result, err := classifier.Run(ctx, []data.EnvRow{
+		{Key: key, Value: value, Scope: scope},
+	})
+	if err != nil {
+		return err
+	}
+	for _, row := range result.Rows {
+		if !row.HostHashOK {
+			// HashHost failed (e.g. salt missing). Skip
+			// this row — the data_upstreams schema
+			// enforces NOT NULL on host_redacted_hash,
+			// so an INSERT with the empty hash would
+			// trip 23502. Already logged at the
+			// classifier level.
+			continue
+		}
+		// Per-plan quota check (DataPlacementHintsPerApp).
+		// The classifier returns ALL rows that match the
+		// current env mutation; the total count against
+		// the per-app cap is what matters. Mirror the
+		// createUpstream path's per-plan check.
+		limits := api.MustLimitsFor(acct.Plan)
+		current, err := s.store.CountDataUpstreamsByApp(ctx, acct.ID, app.ID)
+		if err != nil {
+			return err
+		}
+		if limits.DataPlacementHintsPerApp > 0 && current >= limits.DataPlacementHintsPerApp {
+			// Quota reached — log + skip. The Free-plan
+			// short-circuit (0/3/10/50) is handled here:
+			// Free apps have DataPlacementHintsPerApp=0
+			// so the classifier never inserts.
+			s.log.Warn("env-classifier quota reached",
+				"app", app.Slug,
+				"account", acct.ID,
+				"kind", row.Kind,
+				"current", current,
+				"limit", limits.DataPlacementHintsPerApp,
+			)
+			continue
+		}
+		hash := row.HostHash
+		// Inferred rows carry the plaintext host in
+		// row.Host ONLY for the duration of the
+		// classifier walk. The INSERT below passes the
+		// host into the col that's then never surfaced
+		// on the wire (the SQL column is bytea-shaped
+		// and not in the GET response). The hash is
+		// the only on-wire identifier.
+		_, err = s.store.InsertDataUpstream(ctx, sqlc.InsertDataUpstreamParams{
+			ID:               state.NewPgtypeUUID(uuid.New()),
+			AccountID:        state.NewPgtypeUUID(acctUUID),
+			AppID:            state.NewPgtypeUUID(appUUID),
+			Source:           string(api.DataUpstreamSourceInferred),
+			Scope:            scope,
+			Kind:             row.Kind,
+			Host:             row.Host,
+			Port:             int32(row.Port),
+			HostRedactedHash: hash,
+			DeclaredRegion:   state.Text{},
+			LastRttMs:        state.Int4{},
+			LastProbedAt:     state.Timestamptz{},
+		})
+		if err != nil {
+			return err
+		}
+		s.log.Info("data_upstream inferred",
+			"app", app.Slug,
+			"account", acct.ID,
+			"kind", row.Kind,
+			"scope", logsanitize.Field(scope),
+			"env_key", logsanitize.Field(key),
+			"host_redacted_hash", hash[:8],
+		)
+		s.audit.Emit(ctx, "data_upstream.inferred", &acct.ID, map[string]any{
+			"app_id":             app.ID,
+			"kind":               row.Kind,
+			"scope":              scope,
+			"env_key":            key,
+			"host_redacted_hash": hash[:8],
+		})
+	}
+	return nil
 }

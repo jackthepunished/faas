@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
-	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
 // TestScore_FailsOpenOnEmpty asserts that Score returns ok=false
@@ -106,16 +105,12 @@ func TestScoreForUpstreams_EmptyReturnsEmpty(t *testing.T) {
 }
 
 // fakeUpstreamAffinityStore satisfies the UpstreamAffinityStore
-// interface. We only need the stubs to compile; the upstream-
-// list / probe-list paths are exercised only when Refresh runs
-// end-to-end (not covered here — Refresh is an integration
-// concern, pinned by the C9 e2e).
+// interface. We only need the stubs to compile; the
+// ListAppUpstreamProbeScores path is exercised only when
+// Refresh runs end-to-end (not covered here — Refresh is an
+// integration concern, pinned by the C9 e2e).
 type fakeUpstreamAffinityStore struct{}
 
-func (s *fakeUpstreamAffinityStore) ListAllAppDataUpstreams(_ context.Context, _, _ string) ([]state.DataUpstream, error) {
-	return nil, nil
-}
-
-func (s *fakeUpstreamAffinityStore) ListDataUpstreamProbesByHostRegion(_ context.Context, _ sqlc.ListDataUpstreamProbesByHostRegionParams) ([]state.DataUpstreamProbe, error) {
+func (s *fakeUpstreamAffinityStore) ListAppUpstreamProbeScores(_ context.Context, _, _ string) ([]state.AppUpstreamProbeScore, error) {
 	return nil, nil
 }

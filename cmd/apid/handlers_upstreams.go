@@ -319,7 +319,11 @@ func (s *server) deleteUpstream(w http.ResponseWriter, r *http.Request, acct sta
 		"kind":               string(row.Kind),
 		"host_redacted_hash": row.HostRedactedHash[:8],
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
+	// 204 No Content — the canonical REST shape for a successful
+	// DELETE. The e2e at cmd/e2e/connection_aware_e2e_test.go
+	// asserts this explicitly. Body would be redundant: the
+	// caller already knows the upstream ID from the path.
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // dataUpstreamResponseFromState converts the typed state row to
