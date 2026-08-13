@@ -1,0 +1,13 @@
+---
+# gatewayd-internal — handlers.
+
+# ADR-093: triggered when the gatewayd.toml drop-in changes the
+# route_metrics_enabled kill-switch. Restart is required because
+# cmd/gatewayd-internal/config.go:178-216 reads the toml only at
+# start-up (the FAAS_GATEWAY_ROUTE_METRICS env override is the
+# live-reload path; the toml key is the cluster-default path).
+- name: restart faas-gatewayd-internal
+  ansible.builtin.systemd:
+    name: faas-gatewayd-internal
+    state: restarted
+  listen: restart faas-gatewayd-internal

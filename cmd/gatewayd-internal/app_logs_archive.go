@@ -85,6 +85,18 @@ import (
 // of truth and goconst stops nagging on the literal.
 const archiveQueryDateLayout = "2006-01-02"
 
+// Archive-end-reason vocabulary. Stable wire contract (issue #562
+// AC3 / Wire shape comment above) — the SDK branches on these
+// strings, so renaming is a breaking change. Pinning them here is
+// also the goconst enforcement: the three-terminal frame names
+// appear in renderArchiveTerminal's call sites + the test corpus
+// + the doc-comment block above.
+const (
+	archiveReasonComplete = "archive_complete"
+	archiveReasonMissing  = "archive_missing"
+	archiveReasonDegraded = "archive_degraded"
+)
+
 // archiveDateRegex pins the ?date= format to YYYY-MM-DD. Defends
 // against path-traversal-shaped strings ("..", "2025-01-01/",
 // "2025/01/01") before they reach the S3 key — the bucket proxy
@@ -380,7 +392,7 @@ func (h *ArchiveLogsHandler) serveArchive(ctx_ context.Context, w http.ResponseW
 	// archive exists, just isn't readable.
 	gz, gzErr := gzip.NewReader(&body)
 	if gzErr != nil {
-		renderArchiveTerminal(w, flusher, "archive_degraded")
+		renderArchiveTerminal(w, flusher, archiveReasonDegraded)
 		return
 	}
 	defer func() { _ = gz.Close() }()
@@ -402,7 +414,7 @@ func (h *ArchiveLogsHandler) serveArchive(ctx_ context.Context, w http.ResponseW
 		case <-ctx_.Done():
 			return
 		case <-backstopTimer.C:
-			renderArchiveTerminal(w, flusher, "archive_degraded")
+			renderArchiveTerminal(w, flusher, archiveReasonDegraded)
 			return
 		case <-heartbeatCh:
 			_, _ = fmt.Fprint(w, ":\n\n")
@@ -421,7 +433,7 @@ func (h *ArchiveLogsHandler) serveArchive(ctx_ context.Context, w http.ResponseW
 			// shouldn't generate these, but a third-party
 			// tool writing into the bucket could. Render
 			// a degraded terminal + return.
-			renderArchiveTerminal(w, flusher, "archive_degraded")
+			renderArchiveTerminal(w, flusher, archiveReasonDegraded)
 			return
 		}
 	}
@@ -434,11 +446,11 @@ func (h *ArchiveLogsHandler) serveArchive(ctx_ context.Context, w http.ResponseW
 				h.Log.Warn("logarchive.readback.scan_error",
 					"app", appID, "instance", instance, "day", day, "err", err)
 			}
-			renderArchiveTerminal(w, flusher, "archive_degraded")
+			renderArchiveTerminal(w, flusher, archiveReasonDegraded)
 			return
 		}
 	}
-	renderArchiveTerminal(w, flusher, "archive_complete")
+	renderArchiveTerminal(w, flusher, archiveReasonComplete)
 }
 
 // archiveObjectKey mirrors pkg/logarchive.Shipper.bucketKey's
@@ -527,10 +539,10 @@ func renderArchiveTerminal(w http.ResponseWriter, flusher http.Flusher, reason s
 // set.
 func archiveTerminalForError(err error) string {
 	if err == nil {
-		return "archive_complete"
+		return archiveReasonComplete
 	}
 	if logarchive.IsPermanent(err) {
-		return "archive_missing"
+		return archiveReasonMissing
 	}
-	return "archive_degraded"
+	return archiveReasonDegraded
 }

@@ -60,6 +60,16 @@ const (
 	// The CHECK constraint on builds.kind is relaxed to allow
 	// this value by migration 00085.
 	DeploymentKindGitHub DeploymentKind = "github"
+	// DeploymentKindPreview tags builds enqueued by the githubd
+	// pull_request preview path (issue #272, ADR-094). Same wire
+	// shape as DeploymentKindGitHub (the codeload tarball is
+	// fetched server-side via the install-token mint), but the
+	// deployment row identifies it as a PR preview so per-customer
+	// dashboards and the preview-aware billing breakdown can
+	// distinguish ephemeral previews from prod pushes. The CHECK
+	// constraint on builds.kind is relaxed to allow this value
+	// by migration 00218.
+	DeploymentKindPreview DeploymentKind = "preview"
 )
 
 // DeploymentStatus tracks a deployment through the pipeline (spec §5, §9).
@@ -429,6 +439,14 @@ type App struct {
 	//     populate usage_minutes.tx_bytes alongside plain HTTP
 	//     chunk writes (ADR-046).
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) opts the app into the per-route
+	// observability surface. Mirrors WebSocketEnabled's plan-gating
+	// contract: Free defaults to false and cannot PATCH it to true
+	// (apid returns 403 plan_route_metrics_not_allowed); Hobby/Pro/
+	// Scale default to true. The per-app route cap (50) +
+	// __route_other__ overflow bound the cardinality regardless of
+	// the customer's traffic shape.
+	RouteMetricsEnabled bool
 	// RequireSigned gates OCI image deploys (issue #472 / ADR-054) on
 	// a valid cosign signature from a trusted publisher. When true,
 	// imaged's buildImageLayer calls pkg/cosign.VerifyImageSignature
@@ -611,7 +629,83 @@ type App struct {
 	// api.Plan.EvictionPriorityReservedAllowed(); the column CHECK
 	// (apps_eviction_priority_chk) is the data-integrity backstop.
 	EvictionPriority string
-	CreatedAt        time.Time
+	// PreviewOfSlug names the parent (production) app this row is
+	// a PR preview of. Empty for production apps. Non-empty for
+	// preview rows provisioned by githubd's pull_request handler
+	// (issue #272 / ADR-094). The slug pair (preview_of_slug,
+	// preview_pr_number) is the natural lookup key for the
+	// dashboard's "preview environments" pane and for the teardown
+	// janitor's nightly scan. Nullable text in SQL; the empty-
+	// string-means-NULL convention matches Runtime / StartCommand.
+	PreviewOfSlug string
+	// PreviewPrNumber is the GitHub PR number this preview row
+	// tracks. Stable across synchronize/reopened events on the
+	// same PR; the slug is `pr-{N}-{parent_slug}`. Zero on
+	// production apps.
+	PreviewPrNumber int
+	// PreviewPrState is the closed-set lifecycle label on a
+	// preview row. NULL on production apps. The
+	// closed → stale → torn_down transitions are driven by the
+	// cmd/schedd/janitor_preview.go loop (PR-C). Values:
+	//
+	//   - "open"     : PR is open on GitHub; preview serves traffic.
+	//   - "closed"   : PR was closed within the last 24h; preview
+	//                  still serves traffic, allowing a quick
+	//                  reopen-replay to land without a fresh build.
+	//   - "stale"    : PR was closed more than 24h ago OR has
+	//                  expired (preview_expires_at < now()).
+	//                  Preview refuses new wakes (410 Gone).
+	//   - "torn_down": Teardown complete; the apps row is
+	//                  tombstoned (deleted_at set). The slug is
+	//                  free for reuse.
+	PreviewPrState string
+	// PreviewExpiresAt is the wall-clock time the teardown
+	// janitor should reap the preview, regardless of GitHub state.
+	// Computed at provision time as created_at + 7 days; the
+	// dashboard's preview panel surfaces the expiry to the
+	// customer so they can pin a preview they want to keep. NULL
+	// on production apps.
+	PreviewExpiresAt *time.Time
+	// CORSDefaultEnabled is the per-app default CORS opt-in
+	// (ADR-091 CORS improvements D1 / spec §4.1.2.6). When
+	// false (the default for every pre-PR app), the gateway
+	// applies no default CORS and the "no rule → no CORS"
+	// contract is preserved unchanged. When true, the gateway
+	// consults CORSDefaultOrigins for every request that
+	// misses a kind=cors edge rule and stamps
+	// Access-Control-Allow-Origin + Allow-Methods +
+	// Allow-Headers on the response. The OPTIONS
+	// short-circuit is intentionally SKIPPED on the default
+	// path so the customer's backend remains the authority
+	// on the preflight answer. Free on every plan; no
+	// plan gate (per-issue #561 framing — the fallback is
+	// the "just allow my origin" surface that customers
+	// expect from any FaaS).
+	//
+	// Pointer (not plain bool) because the wire
+	// DISTINGUISHES "schema default false" (legacy rows,
+	// pre-PR apps) from "explicit PATCH false"
+	// (customer opted out after enabling once). With a
+	// plain bool both project identically, and the
+	// customer-facing "did I ever turn this on?" question
+	// becomes unanswerable on the wire. nil = never set /
+	// schema default; *true = opt-in; *false = explicit
+	// opt-out. The pgstore layer hydrates legacy rows as
+	// *false so the wire shape collapses schema-default and
+	// opt-out to the same wire value (false) — the
+	// three-way distinction lives only on the write path.
+	CORSDefaultEnabled *bool
+	// CORSDefaultOrigins is the per-app default CORS
+	// allowlist. Same string shape as
+	// edge_rules_cors.allow_origins; the gateway reuses the
+	// matchOrigin matcher verbatim (which is widened in the
+	// same PR to accept subdomain/port wildcards). nil and
+	// an empty slice are both treated as "deny all" by
+	// the gateway. The column is text[] (not jsonb) so the
+	// matcher is reused bit-for-bit; see migration
+	// 00215_apps_cors_defaults.sql for the rationale.
+	CORSDefaultOrigins []string
+	CreatedAt          time.Time
 }
 
 // EvictionPriorityOrBestEffort (issue #475) snaps the empty Go zero
@@ -637,6 +731,35 @@ func EvictionPriorityOrBestEffort(p string) string {
 		return string(api.EvictionPriorityBestEffort)
 	}
 	return p
+}
+
+// PreviewPrStateOpen / Closed / Stale / TornDown are the four
+// closed-set values for state.App.PreviewPrState. Mirrors the
+// apps_preview_pr_state_chk CHECK constraint introduced by
+// migration 00218 (issue #272 / ADR-094). Empty string means
+// "production app, no preview state" — the SQL CHECK allows
+// NULL or one of the four values; the Go side represents NULL
+// as "" (same convention as EvictionPriorityOrBestEffort).
+const (
+	PreviewPrStateOpen     = "open"
+	PreviewPrStateClosed   = "closed"
+	PreviewPrStateStale    = "stale"
+	PreviewPrStateTornDown = "torn_down"
+)
+
+// PreviewPrStateIsValid reports whether the value is one of
+// the four legal preview_pr_state values. Empty string is the
+// "production app" shape (preview_pr_state IS NULL) — the SQL
+// CHECK allows NULL; the Go side uses "" for that. Callers
+// building a new preview App MUST set a non-empty value from
+// the closed set above.
+func PreviewPrStateIsValid(s string) bool {
+	switch s {
+	case PreviewPrStateOpen, PreviewPrStateClosed, PreviewPrStateStale, PreviewPrStateTornDown:
+		return true
+	default:
+		return false
+	}
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -1789,6 +1912,18 @@ type Instance struct {
 	// untouched. NOT NULL DEFAULT 0 enforced by migration 00151;
 	// pre-existing rows are backfilled to 0 on apply.
 	TailCount int
+	// RequestCount is the per-instance monotonically-increasing
+	// request counter (ADR-098 C8/C9/C10). Persisted in the
+	// `request_count` column added by migrations/00221_instances_request_count.sql.
+	// The counter is the gate for warm-snapshot promotion (C10):
+	// when count >= WarmSnapshotMinRequests (per-app config), the
+	// captured snapshot is promoted to a permanent warm key. Bigint
+	// even at 100 RPS sustained — a 73-day-running instance
+	// accumulates ~6.3e8 rows; int4's 2.1e9 ceiling would be the
+	// next upgrade cycle's blocker. Mirrored here so the warm-gate
+	// reads request_count alongside TailCount without a second SQL
+	// hop. NOT NULL DEFAULT 0 enforced by migration 00221.
+	RequestCount int64
 }
 
 // ComputeNode is one vmmd host in the fleet (issue #97 / ADR-025 axis
@@ -1876,6 +2011,40 @@ type ComputeNodeHeartbeat struct {
 	ReceivedAt      time.Time
 	LastHeartbeatAt time.Time
 	Source          string
+	// CPUPct60s is the 60-second sliding-window CPU utilization as
+	// a percentage of vpcpus × 100 (PR #4 / ADR-091 §3.6 amendment).
+	// Nil when the row predates migrations/00199 or vmmd hadn't
+	// sampled yet. Bounded [0.00, 100.00] for sane values.
+	CPUPct60s *float64
+	// DiskUsedBytes is the byte size of /srv/fc/snapshots + spool
+	// scratchpad at heartbeat-mint time (PR #4). Nil when the row
+	// predates the migration or vmmd hadn't sampled yet.
+	DiskUsedBytes *int64
+}
+
+// ComputeNodeHeartbeatStats is the read shape for LatestHeartbeatStats
+// (PR #4). One row per compute node; NodeID + the latest heartbeat's
+// stats fields. The handler folds this onto the ObsNodeRow projection.
+type ComputeNodeHeartbeatStats struct {
+	NodeID        string
+	ReceivedAt    time.Time
+	CPUPct60s     *float64
+	DiskUsedBytes *int64
+}
+
+// PerNodeStats is one row of the per-node live-stats aggregate (PR #4).
+// NodeName is the compute_nodes.name. The counts and RAM sums are over
+// instances whose binding row has released_at IS NULL (i.e. the VM is
+// currently hosted on that node). The +8 on ram_mb mirrors §6.2
+// invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so the per-node RAMUsedMB
+// is the operator-side number that adds up to the fleet ceiling.
+type PerNodeStats struct {
+	NodeName             string
+	InstancesLive        int64
+	InstancesRunning     int64
+	InstancesWaking      int64
+	InstancesColdBooting int64
+	RAMUsedMB            int64
 }
 
 // InstanceTouch is one entry in a last_request_at flush batch (spec §4.1). The
@@ -1883,6 +2052,19 @@ type ComputeNodeHeartbeat struct {
 type InstanceTouch struct {
 	InstanceID  string
 	LastRequest time.Time
+	// RequestDelta (ADR-098 C9) is the per-instance request count
+	// delta the gateway has observed since the last touch. The
+	// gateway's per-instance cache (Target.RequestCount) is the
+	// authoritative hot path; the engine batched-writer flushes
+	// per-instance deltas into the instances.request_count column
+	// in the same transaction as last_request_at. 0 = no delta
+	// (the gateway observed a request but the per-instance counter
+	// already moved — the explicit zero avoids a no-op UPDATE).
+	// The increment is additive ("request_count = request_count +
+	// delta") so a re-delivered batch is idempotent on
+	// Phase-4-loser re-applies, mirroring the writer in
+	// pkg/state/pgstore.go::IncInstanceRequestCount.
+	RequestDelta int64
 }
 
 // Event is one row in the append-only audit log (spec §6.1).
@@ -2172,6 +2354,16 @@ type UpdateAppParams struct {
 	// should never accept an Upgrade).
 	WebSocketEnabled    *bool
 	SetWebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) toggles the per-app per-route
+	// observability surface. SetRouteMetricsEnabled distinguishes
+	// "unset" (don't touch) from "explicit false" (opt out of the
+	// per-route breakdown). Plan-gated upstream: apid returns 403
+	// plan_route_metrics_not_allowed when the plan lacks the gate
+	// (Free). Hobby/Pro/Scale customers may PATCH true → false to
+	// disable per-route metrics for a specific app (e.g. an app
+	// that does not want the per-route cardinality on the box).
+	RouteMetricsEnabled    *bool
+	SetRouteMetricsEnabled bool
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys
 	// on a valid cosign signature from a trusted publisher. SetRequireSigned
 	// distinguishes "unset" (don't touch) from "explicit false"
@@ -2304,6 +2496,27 @@ type UpdateAppParams struct {
 	// identity + ON-cascade contract.
 	OverflowNode    *string
 	SetOverflowNode bool
+	// CORSDefaultEnabled is the per-app default CORS opt-in
+	// (ADR-091 CORS improvements D1). SetCORSDefaultEnabled
+	// distinguishes "unset" (don't touch) from "explicit
+	// false" (turn the default off). PATCHing from true →
+	// false is non-destructive: the column is metadata only,
+	// no row is touched on the gateway hot path until the
+	// next request.
+	CORSDefaultEnabled    *bool
+	SetCORSDefaultEnabled bool
+	// CORSDefaultOrigins is the per-app default CORS
+	// allowlist. SetCORSDefaultOrigins distinguishes "unset"
+	// (don't touch) from "explicit empty slice" (clear the
+	// allowlist — back to deny all). The validator
+	// (apid's updateApp handler) rejects nil when
+	// SetCORSDefaultOrigins is true and CORSDefaultEnabled is
+	// nil pointer (we need a value to know whether the
+	// explicit-empty case is intentional or a wire-shape
+	// bug). The column is text[]; the gateway reuses the
+	// matchOrigin matcher verbatim against this list.
+	CORSDefaultOrigins    *[]string
+	SetCORSDefaultOrigins bool
 }
 
 // AppPublicAuthUpdate (issue #477 / ADR-079) is the
@@ -3053,6 +3266,19 @@ const (
 	// See migrations/00214_edge_rules_kind_validate.sql for the
 	// schema CHECK widening.
 	EdgeRuleKindValidate EdgeRuleKind = "validate"
+	// EdgeRuleKindLimit caps the inbound request body at a per-rule
+	// byte threshold before the wake gate; an oversize request is
+	// rejected with 413 request_too_large without paying a cold-boot
+	// cost. The cap is the standalone primitive (vs the validate
+	// kind's body-cap side effect): a customer who only wants
+	// per-route body-size protection declares this kind without
+	// shipping a JSON Schema. Plan-gated Free-and-above (no
+	// IsPaidOnly change). MaxBodyBytes ≤ api.MaxRequestBodyBytes
+	// (buffered path) and an optional MaxBodyBytesStreaming ≤
+	// api.MaxBodyBytesStreaming (streaming opt-in); both clamped
+	// at apid-create time. See migrations/00219_edge_rules_kind_limit.sql
+	// for the schema CHECK widening.
+	EdgeRuleKindLimit EdgeRuleKind = "limit"
 )
 
 // IsValid reports whether k is a closed-set kind. New kinds land via
@@ -3062,7 +3288,7 @@ func (k EdgeRuleKind) IsValid() bool {
 	switch k {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
-		EdgeRuleKindIP, EdgeRuleKindValidate:
+		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit:
 		return true
 	}
 	return false
@@ -3185,6 +3411,25 @@ type EdgeRuleValidateAction struct {
 	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
 }
 
+// EdgeRuleLimitAction carries the per-rule body caps for kind=limit.
+// MaxBodyBytes is the buffered-path cap (≤ api.MaxRequestBodyBytes,
+// 25 MiB); MaxBodyBytesStreaming is the streaming opt-in cap (≤
+// api.MaxBodyBytesStreaming, 100 MiB). The streaming cap defaults to
+// 0 ("unspecified") and only takes effect on requests that opt into
+// the streaming response path (operator gate FAAS_GATEWAY_STREAMING +
+// app-level streaming_enabled + request Accept: application/json);
+// non-streaming requests still cap at MaxBodyBytes.
+//
+// Clamps and the negative-rejection check live in
+// pkg/api/dto.go::EdgeRuleLimitAction.Validate. The state mirror
+// carries the values verbatim so the gatewayd compile step can
+// defence-in-depth against any direct-DB write that bypassed
+// apid-Validate (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect).
+type EdgeRuleLimitAction struct {
+	MaxBodyBytes          int `json:"max_body_bytes"`
+	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
+}
+
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
 // as jsonb. The wire shape lives in pkg/api/dto.go (one struct per
 // kind); the state-side mirror is intentionally minimal — the
@@ -3207,6 +3452,13 @@ type EdgeRuleAction struct {
 	// enforced in pkg/api/dto.go::EdgeRuleValidateAction.Validate
 	// at apid-create time; the state mirror carries them verbatim.
 	Validate *EdgeRuleValidateAction `json:"validate,omitempty"`
+	// Limit carries the per-rule body caps for kind=limit.
+	// MaxBodyBytes is the buffered-path cap; MaxBodyBytesStreaming
+	// is the streaming opt-in cap (0 = unspecified, defer to
+	// MaxBodyBytes). The companion validate kind's MaxBodyBytes
+	// stays — it is the "cap the body I am about to schema-check"
+	// knob; kind=limit is the standalone gate.
+	Limit *EdgeRuleLimitAction `json:"limit,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.

@@ -168,6 +168,7 @@ var cliCommands = []cliCommand{
 		Short:   "List your apps",
 		Subcommands: []cliSub{
 			{Name: "ls", Short: "Alias for the default list action"},
+			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
 			{Name: "-q", Short: "Delete one app (positional: <slug>)"},
 			{Name: "--quiet", Short: "Delete one app (positional: <slug>)"},
 		},
@@ -181,6 +182,7 @@ var cliCommands = []cliCommand{
 			{Name: "scale", Short: "Set max_concurrency / ram_mb"},
 			{Name: "rename", Short: "Rename an app"},
 			{Name: "security", Short: "Toggle require_signed on deploys"},
+			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
 		},
 		Positionals: []string{"<slug>"},
 		Flags: []cliFlag{
@@ -220,6 +222,17 @@ var cliCommands = []cliCommand{
 		Short:   "Connect a third-party service (github)",
 		Subcommands: []cliSub{
 			{Name: "github", Short: "Connect a GitHub account for repo deploys"},
+		},
+	},
+	{
+		Name:    "cors",
+		DocSlug: "cors",
+		Short:   "Configure CORS for an app (allow|ls|rm|show)",
+		Subcommands: []cliSub{
+			{Name: "allow", Short: "Attach a CORS rule to <slug>"},
+			{Name: "ls", Short: "List CORS rules bound to <slug>"},
+			{Name: "rm", Short: "Delete a CORS rule by id"},
+			{Name: "show", Short: "Show per-app default CORS + active rules"},
 		},
 	},
 	{
@@ -277,7 +290,7 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "deploy",
 		DocSlug: "deploy",
-		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME)",
+		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | --template NAME)",
 		Flags: []cliFlag{
 			{Name: "image", Short: "deploy from a container image reference"},
 			{Name: "tarball", Short: "deploy from a source tarball"},
@@ -286,6 +299,11 @@ var cliCommands = []cliCommand{
 			// drive the headless source-ref deploy (CI-friendly,
 			// no install-token env). Required when --repo is set.
 			{Name: "ref", Short: "git ref for --repo (branch, tag, or 40-char SHA)"},
+			// Issue #270: --github emits a copy-paste Actions workflow
+			// snippet for the faas-deploy-action (companion repo
+			// poyrazK/faas-deploy-action). No auth, no side effects.
+			// The snippet uses --name / cwd as the app slug.
+			{Name: "github", Short: "emit a GitHub Actions workflow snippet for faas-deploy-action"},
 			{Name: "template", Short: "scaffold from a built-in template", ClosedSet: []string{"node22-http", "python312-http"}},
 		},
 	},

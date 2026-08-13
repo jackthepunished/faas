@@ -570,6 +570,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Manager side, so a producer binary that doesn't wire
 	// metrics still runs.
 	frm := fcvm.NewFrameworkReadyMetrics()
+	// ADR-098 C11: wake-phase histogram (vmmd_wake_phase_duration_seconds).
+	// Mirrors frm / cbm — dedicated per-vmmd registry, mounted
+	// alongside on the cmd-side mux below.
+	wpm := fcvm.NewWakePhaseMetrics()
 	// #96 / ADR-025 axis 2: vmmd publishes the mem blob via the configured
 	// StorageBackend after a successful Snapshot, and resolves it back
 	// from the key on Restore. The env-driven fork (FAAS_STORAGE_BACKEND)
@@ -643,6 +647,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log,
 		cbm,
 	).WithFrameworkReady(frm).
+		SetWakePhaseMetrics(wpm).
 		// Issue #470 / PR #470-FU-B: attach the SQL persistence
 		// seam so the framework_ready DGRAM receipt path can
 		// stamp the `instances.framework_ready_at` column. A
@@ -860,6 +865,33 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("vmmd: load schedd client TLS: %w", err)
 	}
 	deps.scheddClientTLS = scheddClientTLS
+
+	// ADR-052 §5 / PR-E: route the server + schedd-client loads
+	// through the WithReload factories so a SIGHUP-driven reload
+	// (`gregale pki rotate` → `kill -HUP $(pidof faas-vmmd)`)
+	// swaps material on the next inbound / outbound handshake
+	// without restart. serverRotator / scheddClientRotator hold
+	// the live *tls.Config; Listen's tls.Config + the per-handshake
+	// stdlib callback consult the rotator's Reload closure at
+	// handshake time.
+	serverRotator := wire.NewTLSRotator(serverTLS)
+	scheddClientRotator := wire.NewTLSRotator(scheddClientTLS)
+	// Replace the boot-time configs with reload-wrapped variants
+	// so Listen + ServerCreds + the schedd dial go through the
+	// rotator's Reload path. Listen and the publisher dial cache
+	// *tls.Config pointers — the rotator's Get() is observed on
+	// subsequent operations after Set.
+	serverTLS, err = cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, serverRotator.Reload(serverTLS))
+	if err != nil {
+		return fmt.Errorf("vmmd: load server TLS (reload): %w", err)
+	}
+	serverRotator.Set(serverTLS)
+	scheddClientTLS, err = cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(nodeVerifier, scheddClientRotator.Reload(scheddClientTLS))
+	if err != nil {
+		return fmt.Errorf("vmmd: load schedd client TLS (reload): %w", err)
+	}
+	scheddClientRotator.Set(scheddClientTLS)
+	deps.scheddClientTLS = scheddClientTLS
 	lis, err := deps.listen(ctx, listenTarget, serverTLS, cfg.OwnerUser)
 	if err != nil {
 		return fmt.Errorf("vmmd: listen %s: %w", listenTarget, err)
@@ -915,6 +947,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// = Prometheus). Mount at /metrics/framework-warmup so the
 		// dashboard panel picks it up without polluting /metrics.
 		mux.Handle(metricsPath+"/framework-warmup", frm.Handler())
+		// ADR-098 C11: wake-phase histogram on its own
+		// dedicated registry, mirroring the framework-warmup
+		// pattern. Single writer (Manager.Wake), single reader
+		// (Prometheus). Mounted at /metrics/wake-phase so the
+		// §12 wake-phase-breakdown panel can scrape it
+		// directly without polluting the main /metrics scrape
+		// (which is the wire-side OpsMetrics registry).
+		mux.Handle(metricsPath+"/wake-phase", wpm.Handler())
 		httpSrv = &http.Server{
 			Addr:              cfg.MetricsAddr,
 			Handler:           mux,
@@ -1116,6 +1156,31 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	signal.Notify(hupCh, syscall.SIGHUP)
 	defer signal.Stop(hupCh)
 	go watchEgressBundleReload(ctx, mgr, cfg.EgressOperatorAllowlist, log, hupCh)
+	// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation on the
+	// same hupCh the egress-bundle reload watches. Reuses the
+	// channel — each signal is consumed by both watchers — and
+	// uses the best-effort failure posture WatchTLSReload pins
+	// (matches watchEgressBundleReload's contract: a malformed
+	// cert file does NOT brick the daemon's mTLS leg).
+	serverReload := func() (*tls.Config, error) {
+		return cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	scheddClientReload := func() (*tls.Config, error) {
+		return cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	// serverHupCh + scheddHupCh get every SIGHUP (signal.Notify
+	// fans the signal out to every registered channel). The
+	// single hupCh above is owned by watchEgressBundleReload and
+	// is consumed there; the new channels keep the tls reloads
+	// independent of that path.
+	serverHupCh := make(chan os.Signal, 1)
+	signal.Notify(serverHupCh, syscall.SIGHUP)
+	defer signal.Stop(serverHupCh)
+	scheddClientHupCh := make(chan os.Signal, 1)
+	signal.Notify(scheddClientHupCh, syscall.SIGHUP)
+	defer signal.Stop(scheddClientHupCh)
+	go wire.WatchTLSReload(ctx, log, serverHupCh, serverRotator, serverReload)
+	go wire.WatchTLSReload(ctx, log, scheddClientHupCh, scheddClientRotator, scheddClientReload)
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)

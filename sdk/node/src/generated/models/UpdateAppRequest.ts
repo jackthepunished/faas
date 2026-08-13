@@ -33,6 +33,10 @@ export type UpdateAppRequest = {
    */
   websocket_enabled?: boolean | null;
   /**
+   * Per-app per-route observability flag (ADR-093). Omitted → no change. Free PATCHing true is 403 plan_route_metrics_not_allowed.
+   */
+  route_metrics_enabled?: boolean | null;
+  /**
    * Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column.
    */
   scaling_policy?: (null | ScalingPolicy);
@@ -68,5 +72,7 @@ export type UpdateAppRequest = {
    * Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist the UUID. 404 on unknown name; 422 on inactive node.
    */
   overflow_node?: string | null;
+  cors_default_enabled?: boolean | null;
+  cors_default_origins?: Array<string>;
 };
 

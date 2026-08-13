@@ -47,6 +47,14 @@ import (
 // and the verb name live one Edit apart for reviewers.
 const subSecurity = "security"
 
+// subRoutes is the verb name for `gregale apps routes ...` /
+// `gregale app <slug> routes ...` (ADR-093 Tier B item #2). Lives
+// in commands_app_routes.go alongside the cmdAppsRoutes leaf, mirroring
+// the subSecurity co-location pattern; the dispatcher arms import
+// this const rather than re-declaring it so goconst stays quiet and
+// the verb name has a single source of truth.
+const subRoutes = "routes"
+
 // requireSignedTrue / requireSignedFalse are the strict literal
 // values the --require-signed flag accepts. The handler enforces the
 // same closed enum (handlers_ext.go:1074-1093), so we mirror it

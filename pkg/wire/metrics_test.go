@@ -420,20 +420,27 @@ func TestOpsMetrics_ObserveScaleDown(t *testing.T) {
 	m.ObserveScaleDown("a1", "park")
 	m.ObserveScaleDown("a1", "park")
 	m.ObserveScaleDown("a1", "keep")
+	m.ObserveScaleDown("a1", "cooldown_held")
 
 	body := render(t, m)
 	for _, want := range []string{
 		// Real observations.
 		`schedd_scale_down_decisions_total{app="a1",outcome="park"} 2`,
 		`schedd_scale_down_decisions_total{app="a1",outcome="keep"} 1`,
+		`schedd_scale_down_decisions_total{app="a1",outcome="cooldown_held"} 1`,
 		// Pre-instantiated empty-app placeholder: zero-valued, must
 		// surface in /metrics from boot so the panel exists at day 1.
 		// min_floor_already (PR-C, issue #462) is pre-instantiated
 		// alongside park / keep so the closed outcome label set
-		// is fully surfaced from boot.
+		// is fully surfaced from boot. cooldown_held (P1C) is the
+		// per-app scale-in cooldown consult in ReapAggressive
+		// (pkg/sched/reaper.go) — pre-instantiated so dashboards
+		// panel-query `outcome="cooldown_held"` returns 0 rather
+		// than a missing series on an idle box.
 		`schedd_scale_down_decisions_total{app="",outcome="park"} 0`,
 		`schedd_scale_down_decisions_total{app="",outcome="keep"} 0`,
 		`schedd_scale_down_decisions_total{app="",outcome="min_floor_already"} 0`,
+		`schedd_scale_down_decisions_total{app="",outcome="cooldown_held"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)
@@ -460,21 +467,89 @@ func TestOpsMetrics_ObserveScaleUpClosedSet(t *testing.T) {
 	m := wire.NewOpsMetrics("schedd")
 	m.ObserveScaleUp("a1", "admit")
 	m.ObserveScaleUp("a1", "cooldown_held")
+	m.ObserveScaleUp("a1", "min_floor_already")
+	m.ObserveScaleUp("a1", "overage_cap_reached")
 
 	body := render(t, m)
 	for _, want := range []string{
 		// Real observations.
 		`schedd_scale_up_decisions_total{app="a1",outcome="admit"} 1`,
 		`schedd_scale_up_decisions_total{app="a1",outcome="cooldown_held"} 1`,
+		`schedd_scale_up_decisions_total{app="a1",outcome="min_floor_already"} 1`,
+		`schedd_scale_up_decisions_total{app="a1",outcome="overage_cap_reached"} 1`,
 		// Pre-instantiated empty-app placeholder for the closed set.
+		// P1A: the closed set is now 6 outcomes — min_floor_already
+		// (engine.go:4868-4873) and overage_cap_reached (issue #561,
+		// engine.go:4876-4888) joined the four pre-existing values.
+		// The closed-set loop must pre-instantiate all six so the
+		// §12 panel-at-day-1 contract holds (PR #826 precedent).
 		`schedd_scale_up_decisions_total{app="",outcome="admit"} 0`,
 		`schedd_scale_up_decisions_total{app="",outcome="reject_at_cap"} 0`,
 		`schedd_scale_up_decisions_total{app="",outcome="no_signal"} 0`,
 		`schedd_scale_up_decisions_total{app="",outcome="cooldown_held"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="min_floor_already"} 0`,
+		`schedd_scale_up_decisions_total{app="",outcome="overage_cap_reached"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing line %q in:\n%s", want, body)
 		}
+	}
+}
+
+// TestOpsMetrics_ObserveWakePhase (ADR-097, P1B) — the schedd-side
+// wake-phase histogram vector is pre-instantiated at boot with the
+// closed 3-phase label set under the empty-app sentinel so the §12
+// wake-latency-decomposition panel surfaces zero rows from an idle
+// daemon (the PR #826 closed-set contract). WakeRPCDuration accessor
+// returns a real prometheus.Observer for each (app, phase) pair so
+// Engine.Wake can attach wake_id as a prometheus.Exemplar on every
+// observation without paying the label-cardinality cost.
+//
+// Mirrors TestOpsMetrics_ObserveGuestInit's shape (pkg/wire/metrics.go
+// field 11xx) but with the new {app, phase} label set.
+func TestOpsMetrics_ObserveWakePhase(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+
+	// Observe on three phase values for one app. The empty-app
+	// sentinel rows remain at 0.
+	m.WakeRPCDuration("app-1", "admit_to_rpc").Observe(0.045)
+	m.WakeRPCDuration("app-1", "rpc_call").Observe(0.250)
+	m.WakeRPCDuration("app-1", "rpc_to_running").Observe(0.012)
+
+	body := render(t, m)
+	for _, want := range []string{
+		// Real observations.
+		`schedd_wake_rpc_duration_seconds_count{app="app-1",phase="admit_to_rpc"} 1`,
+		`schedd_wake_rpc_duration_seconds_count{app="app-1",phase="rpc_call"} 1`,
+		`schedd_wake_rpc_duration_seconds_count{app="app-1",phase="rpc_to_running"} 1`,
+		// Pre-instantiated empty-app sentinel rows for the closed set.
+		// P1B / ADR-097: the closed set is {admit_to_rpc, rpc_call,
+		// rpc_to_running}; every value must surface from boot so the
+		// dashboard panel has zero rows at idle (PR #826 precedent).
+		// Metric name is *_wake_rpc_duration_seconds (not the
+		// existing *_wake_phase_duration_seconds owned by the
+		// events platform at ADR-064) — see metrics.go:1208-1227.
+		`schedd_wake_rpc_duration_seconds_count{app="",phase="admit_to_rpc"} 0`,
+		`schedd_wake_rpc_duration_seconds_count{app="",phase="rpc_call"} 0`,
+		`schedd_wake_rpc_duration_seconds_count{app="",phase="rpc_to_running"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_ObserveWakePhaseNilSafe (ADR-097, P1B) — a nil
+// *OpsMetrics receiver must not panic on WakeRPCDuration access.
+// The convention (mirroring GuestInitDuration at metrics.go:2729
+// and the existing TestOpsMetrics_GuestInitDurationNilSafe) is to
+// return nil from the accessor; callers must check before
+// observing. Engine unit tests build schedd without a metrics
+// registry; the accessor must keep that path panic-free.
+func TestOpsMetrics_ObserveWakePhaseNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.WakeRPCDuration("app-1", "admit_to_rpc"); got != nil {
+		t.Errorf("nil.WakeRPCDuration = %v, want nil", got)
 	}
 }
 

@@ -17,8 +17,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -77,6 +79,11 @@ type runDeps struct {
 	// existing app_changed consumer stays as the logging-only
 	// fallback. Tests inject a fake channel.
 	subscribeEgressDrift func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
+	// subscribeAppDelete (ADR-098) is the producer-side seam for
+	// the app_delete consumer that evicts any in-flight wake for
+	// a deleted app via Engine.wakeCoord.Forget. nil = the
+	// subscriber is not started; tests inject a fake channel.
+	subscribeAppDelete func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
 	// subscribePlacementClaim (Phase 2 / Gate A, migration 00084)
 	// is the producer-side seam for the app_changed consumer that
 	// atomically stamps apps.node_id via Engine.ClaimUnplaced.
@@ -177,6 +184,13 @@ func defaultDeps() runDeps {
 		// subscribeEgressDrift comment).
 		subscribePlacementClaim: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
+		},
+		// ADR-098: subscribe to app_delete so the wake coordinator
+		// forgets in-flight wakes the moment apid deletes the app.
+		// Mirrors subscribeDeletion's shape (one channel, db.Subscribe
+		// is the production adapter, nil seam skips in tests).
+		subscribeAppDelete: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
+			return db.Subscribe(ctx, p, []string{db.NotifyAppDelete})
 		},
 		// Tier A4 / ADR-064: subscribe to compute_node_changed
 		// and let Rebalancer filter to active=false. The router
@@ -324,10 +338,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Issue #95 / ADR-025: dial vmmd through the location-transparent
 	// helper. tcp/dns targets require the vmmd_tls_* cluster; nil TLS on
 	// a unix target keeps single-box behaviour unchanged.
-	vmmTLS, err := cfg.LoadVMMTLSWithVerifier(nodeVerifier)
+	//
+	// ADR-052 §5 / PR-E: route the load through the WithReload factory
+	// so a SIGHUP-driven reload (operator workflow: `gregale pki
+	// rotate` → `kill -HUP $(pidof faas-schedd)`) swaps the leaf on
+	// the next outbound TLS handshake. The vmmRotator holds the
+	// live *tls.Config; vmmRouter / heartbeat / instance-stats
+	// dialers consult vmmRotator.Get() at dial time so a swap
+	// between rotations is observable to the next dial.
+	vmmRotator := wire.NewTLSRotator(nil)
+	vmmTLS, err := cfg.LoadVMMTLSWithPrefixAndVerifierAndReload(nodeVerifier, vmmRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("schedd: load vmmd TLS: %w", err)
 	}
+	vmmRotator.Set(vmmTLS)
 	store := state.NewPgStore(pool)
 
 	// Phase 2 / Gate A: resolve this schedd's owner node id at
@@ -655,10 +679,47 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// gRPC surface for gatewayd-internal (ADR-018): unix socket by default;
 	// tcp requires the tls_* cluster and is issue #95.
-	serverTLS, err := cfg.LoadServerTLSWithVerifier(nodeVerifier)
+	//
+	// ADR-052 §5 / PR-E: route the load through the WithReload factory
+	// so a SIGHUP-driven reload swaps the inbound server's leaf via
+	// stdlib's per-handshake GetConfigForClient callback. serverRotator
+	// holds the live config; Listen's outer tls.Config installs the
+	// rotator's Reload closure at startup so subsequent Set calls
+	// surface rotated material on the next handshake without
+	// rebuilding the gRPC server.
+	serverRotator := wire.NewTLSRotator(nil)
+	serverTLS, err := cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, serverRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("schedd: load server TLS: %w", err)
 	}
+	serverRotator.Set(serverTLS)
+	// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. schedd
+	// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
+	// by watchLogLevelReload). Install two parallel ones — each
+	// gets every SIGHUP (signal.Notify fans the signal out to every
+	// registered channel). Same pattern as cmd/vmmd/main.go:1115-1118's
+	// egress-bundle reload. Best-effort failure posture (matches
+	// egress bundle): a failed reload keeps prior material live,
+	// never bricks.
+	serverHupCh := make(chan os.Signal, 1)
+	signal.Notify(serverHupCh, syscall.SIGHUP)
+	defer signal.Stop(serverHupCh)
+	vmmHupCh := make(chan os.Signal, 1)
+	signal.Notify(vmmHupCh, syscall.SIGHUP)
+	defer signal.Stop(vmmHupCh)
+	// serverReload re-runs the loader on every SIGHUP and surfaces
+	// the freshly-loaded *tls.Config via rotator.Set on success.
+	// The closure is goroutine-safe (the loader is stateless
+	// beyond cfg).
+	serverReload := func() (*tls.Config, error) {
+		return cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	vmmReload := func() (*tls.Config, error) {
+		return cfg.LoadVMMTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	go wire.WatchTLSReload(ctx, log, serverHupCh, serverRotator, serverReload)
+	go wire.WatchTLSReload(ctx, log, vmmHupCh, vmmRotator, vmmReload)
+
 	lis, err := deps.listen(ctx, listenTarget, serverTLS, cfg.OwnerUser)
 	if err != nil {
 		return fmt.Errorf("schedd: listen %s: %w", listenTarget, err)
@@ -717,6 +778,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		sub := sched.NewDeletionSubscriber(engine, log)
 		go subscribeWithReconnect(ctx, "deletion", log, deps.subscribeDeletion, pool, sub.Run)
 	}
+
+	// ADR-098: app-delete dispatch is folded into loop.Run's
+	// existing LISTEN (see loop.go's NotifyAppDelete case in
+	// handleNotification). No standalone goroutine, no extra pool
+	// connection — same zero-cost multiplexing pattern as
+	// NotifyCronRunNow (PR-D / issue #791). The AppDeleteSubscriber
+	// is constructed and passed to the loop via
+	// WithAppDeleteSubscriber below so loop.handleNotification can
+	// call evictApp on every NotifyAppDelete delivery.
 
 	// tier-2 PR-B (ADR-031 + ADR-033): egress drift subscriber.
 	// Same dial-loop shape as the deletion subscriber above
@@ -1118,7 +1188,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// floor trigger can share the same actor="schedd" instance
 	// and emit `floor.wake` audit rows on every proactive admit.
 	schedulerAuditor := audit.New(store, log, ops, "schedd")
+	// ADR-098: app-delete handler. Built here (not via the
+	// runDeps.subscribeAppDelete seam — that seam's now a stub
+	// retained only for the main_coverage_smoke_test defaultDeps
+	// assertion) and dispatched from loop.Run's existing LISTEN
+	// so we don't add a 7th long-term pool subscriber on top of
+	// pool.MaxConns=8 (which tips the async-invoke drain's
+	// BeginTx into starvation under e2e query bursts).
+	appDeleteSub := sched.NewAppDeleteSubscriber(engine, log)
 	loop := sched.NewLoop(pool, engine, log).
+		WithAppDeleteSubscriber(appDeleteSub).
 		WithFlowCounter(flowcount.NewReader(wire.ExecRunner{})).
 		WithWatchdog(sched.NewWatchdog(store, engine, log)).
 		// PR #74: §17 retention sweep — DELETEs STOPPED/FAILED rows older
@@ -1546,6 +1625,26 @@ func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID string) (sc
 	return scaleup.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }
 
+// EnsureWake (ADR-098) implements scaleup.Engine: delegates to the
+// wrapped engine's single-flight wake entry and lifts the relevant
+// fields into the thinned scaleup.WakeOutcome. AtCapacity is dropped
+// because the leader's ledger closes the at-cap loop; the trigger
+// observes the path via the bus, not the return value.
+func (s schedScaleUpEngine) EnsureWake(ctx context.Context, appID string) (scaleup.WakeOutcome, error) {
+	r, err := s.engine.EnsureWake(ctx, appID)
+	if err != nil {
+		return scaleup.WakeOutcome{}, err
+	}
+	if r.Instance == nil {
+		return scaleup.WakeOutcome{}, nil
+	}
+	return scaleup.WakeOutcome{
+		InstanceID: r.Instance.InstanceID,
+		WakeID:     r.Instance.WakeID,
+		ColdBoot:   r.Instance.ColdBoot,
+	}, nil
+}
+
 // schedTargetsEngine (PR-C, issue #462) adapts *sched.Engine to
 // the targets.Engine interface. Mirrors schedScaleUpEngine above
 // but lifts into the thinned targets.AdmitResult shape (which only
@@ -1572,6 +1671,25 @@ func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (ta
 		return targets.AdmitResult{}, err
 	}
 	return targets.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// EnsureWake (ADR-098) implements targets.Engine: delegates to the
+// wrapped engine's single-flight wake entry and lifts the relevant
+// fields into the thinned targets.WakeOutcome. AtCapacity is dropped
+// because the leader's ledger closes the at-cap loop.
+func (s schedTargetsEngine) EnsureWake(ctx context.Context, appID string) (targets.WakeOutcome, error) {
+	r, err := s.engine.EnsureWake(ctx, appID)
+	if err != nil {
+		return targets.WakeOutcome{}, err
+	}
+	if r.Instance == nil {
+		return targets.WakeOutcome{}, nil
+	}
+	return targets.WakeOutcome{
+		InstanceID: r.Instance.InstanceID,
+		WakeID:     r.Instance.WakeID,
+		ColdBoot:   r.Instance.ColdBoot,
+	}, nil
 }
 
 // schedFloorEngine (issue #557 / ADR-071) adapts *sched.Engine to
@@ -1602,6 +1720,26 @@ func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID,
 		return floor.AdmitResult{}, err
 	}
 	return floor.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// EnsureWake (ADR-098) implements floor.Engine: delegates to the
+// wrapped engine's single-flight wake entry and lifts the relevant
+// fields into the thinned floor.WakeOutcome. AtCapacity is dropped
+// because the leader's ledger closes the at-cap loop; the trigger
+// observes the path via the bus, not the return value.
+func (s schedFloorEngine) EnsureWake(ctx context.Context, appID string) (floor.WakeOutcome, error) {
+	r, err := s.engine.EnsureWake(ctx, appID)
+	if err != nil {
+		return floor.WakeOutcome{}, err
+	}
+	if r.Instance == nil {
+		return floor.WakeOutcome{}, nil
+	}
+	return floor.WakeOutcome{
+		InstanceID: r.Instance.InstanceID,
+		WakeID:     r.Instance.WakeID,
+		ColdBoot:   r.Instance.ColdBoot,
+	}, nil
 }
 
 // schedFloorPlanResolver (issue #557 / ADR-071) adapts

@@ -40,6 +40,8 @@ tags:
     description: Account & billing (self-service, GDPR, plan).
   - name: apps
     description: App lifecycle (create, update, delete, wake, park).
+  - name: deploydiff
+    description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules
     description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip) per app.
   - name: deployments
@@ -1391,6 +1393,41 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/routes:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppRoutes
+      summary: Per-route breakdown for opt-in apps (ADR-093).
+      description: |
+        Returns the `routes` array of the per-app metrics surface
+        directly. Reverse-proxies the gatewayd-internal loopback
+        control listener at `GET /v1/internal/apps/{slug}/routes`.
+        The array is empty when `route_metrics_enabled` is false
+        on the app (the gatewayd handler returns 200 + empty
+        rows rather than 404 — the customer-facing "feature off"
+        state is not a 404). The route label is method + raw
+        path (pre-rewrite, ADR-093 D6); the `__route_other__`
+        bucket surfaces the wildcard-path signal.
+      responses:
+        '200':
+          description: The per-route rows for the app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppRoutesResponse'
+              example:
+                slug: my-api
+                app_id: 11111111-1111-1111-1111-111111111111
+                routes: ["GET /users", "POST /orders", "__route_other__"]
+                source: live
+                cap_hit: true
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/slo:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -1571,6 +1608,90 @@ paths:
           description: |
             githubd unreachable or source-ref tarball fetch failed
             (code: source_ref_unavailable). Retry in ~30s.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/apps/{slug}/diff:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [deploydiff]
+      operationId: diffApp
+      summary: Read-only preview of what a deploy would change.
+      description: |
+        PR-1 of the deploy-diff cluster. Server-side equivalent of
+        `gregale deploy --diff` — runs the same engine (pkg/deploydiff)
+        and returns the same wire shape (DiffResponse).
+
+        Read-only: no DB writes, no audit row, no deployment row. The
+        app-not-found case is 200 with `diff.changes[]` containing a
+        `would_create_app` row + the quota gate firing against the
+        customer's plan — a CI consumer can preview a fresh deploy the
+        same way the CLI does.
+
+        Auth: bearer-key with `apps:read` (or admin). NO MFA on this
+        endpoint, mirroring GET /v1/apps/{slug}/metrics.
+
+        Schema-break detection is text-only in PR-1 (handler / entrypoint
+        / env-key changes → warn-severity Breaks). Structural OpenAPI
+        response-schema diff lands in PR-2.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiffRequest'
+            example:
+              image: ghcr.io/me/api@sha256:abc
+              app_config:
+                ram_mb: 512
+                max_concurrency: 30
+      responses:
+        '200':
+          description: |
+            DiffResponse with `blocking: true` if any break has
+            `severity: "error"`. CI gate input — `jq '.blocking'`
+            collapses to a single bool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiffResponse'
+              example:
+                diff:
+                  slug: api
+                  plan: hobby
+                  changes:
+                    - { field: memory, kind: modify, before: 256, after: 512 }
+                  breaks:
+                    - code: plan_limit_concurrency
+                      severity: error
+                      reason: max_concurrency exceeds plan cap
+                      field: concurrency
+                      observed: 30
+                      limit: 20
+                blocking: true
+                slug: api
+                plan: hobby
+        '400':
+          description: |
+            code: validation_failed. Body is malformed JSON, fails
+            strict-decode, or has a plan lookup error.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            code: forbidden. Caller's bearer key lacks both
+            `apps:read` and admin scope.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: |
+            code: capacity. pkg/state read failed for the baseline
+            builder (deployment / env / crons / edge rules).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -7043,6 +7164,14 @@ components:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."
           type: boolean
           example: false
+        # ADR-093: per-route observability opt-in. Default-on for
+        # Hobby/Pro/Scale; Free customers always see this as false.
+        # PATCH-true on Free is rejected with 403
+        # plan_route_metrics_not_allowed.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). When true, gatewayd-internal emits gateway_request_duration_seconds{app,route,class} and serves the bounded reader at GET /v1/apps/{slug}/routes. Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
+          type: boolean
+          example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
         # Nullable: legacy rows project as `null` (the empty
         # policy falls back to the legacy min_instances /
@@ -7164,6 +7293,25 @@ components:
           format: uuid
           example: "00000000-0000-0000-0000-000000000000"
 
+        # CORS improvements D1: per-app default CORS opt-in.
+        # NULL on legacy rows (the customer's apps predated
+        # migration 00223). Non-null true means the gateway is
+        # stamping the default header set on miss; non-null
+        # false means the customer explicitly opted out (the
+        # column was flipped from the schema default).
+        cors_default_enabled:
+          type: [boolean, "null"]
+          example: true
+
+        # CORS improvements D1: per-app default CORS allowlist.
+        # NULL/empty on legacy rows. Wire shape is JSON `[]`
+        # (never null) when the column carries a value so
+        # dashboards can render the list directly.
+        cors_default_origins:
+          type: array
+          items: { type: string }
+          example: ["https://*.example.com"]
+
         # Issue #477 / ADR-077: per-app public-URL auth
         # configuration. Mirrors the read-side
         # PublicAuthStatus shape — `has_basic_creds` is true
@@ -7209,6 +7357,14 @@ components:
         # rejected with 403 plan_websocket_not_allowed.
         websocket_enabled:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → apid applies the plan default; PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."
+          type: boolean
+          example: false
+        # ADR-093: optional at create-time. Omitted → apid applies
+        # the plan default (Free = false; Hobby/Pro/Scale = true).
+        # PATCH-true on Free is rejected with 403
+        # plan_route_metrics_not_allowed.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). Omitted → apid applies the plan default (Free = false; Hobby/Pro/Scale = true). PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
           type: boolean
           example: false
         # Issue #470 / ADR-055: optional at create-time. Omitted
@@ -7327,6 +7483,14 @@ components:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → no change. Free PATCHing true is 403 plan_websocket_not_allowed."
           type: [boolean, "null"]
           example: false
+        # ADR-093: partial-update nullable boolean. Omitted → no
+        # change. Plan gate runs first (403
+        # plan_route_metrics_not_allowed) so a Free PATCHing true
+        # surfaces the gate.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). Omitted → no change. Free PATCHing true is 403 plan_route_metrics_not_allowed."
+          type: [boolean, "null"]
+          example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
         # Omitted → no change. Non-null → atomic full-overwrite
         # of the jsonb column `apps.scaling_policy` (the
@@ -7435,6 +7599,31 @@ components:
           description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist the UUID. 404 on unknown name; 422 on inactive node."
           type: [string, "null"]
           example: "box-eu-1"
+
+        # CORS improvements D1: per-app default CORS opt-in. When
+        # true, every response is stamped with a CORS header set
+        # derived from cors_default_origins whenever no explicit
+        # kind=cors edge rule matches. nil = no change (existing
+        # PATCH semantics); explicit true opts in; explicit false
+        # opts out. The Set-bit in UpdateAppParams distinguishes
+        # "unset" from "explicit flip" so partial-PATCH stays
+        # bit-for-bit additive on the wire.
+        cors_default_enabled:
+          type: [boolean, "null"]
+          example: true
+
+        # CORS improvements D1: per-app default CORS allowlist.
+        # Same grammar as EdgeRuleCORSAction.allow_origins
+        # (literal origin, https://*.host subdomain wildcard,
+        # https://host:* port wildcard, or '*'). When
+        # cors_default_enabled is true the validator requires a
+        # non-empty value (a 422 fires otherwise - silently
+        # accepting an empty allowlist would leave the customer
+        # with an opt-in flag that stamps nothing).
+        cors_default_origins:
+          type: array
+          items: { type: string }
+          example: ["https://*.example.com"]
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -8681,6 +8870,151 @@ components:
           default: tarball
           description: "Forward-compat field. PR-A only supports `tarball`."
 
+    DiffRequest:
+      description: |
+        JSON body for POST /v1/apps/{slug}/diff (PR-1). Slim
+        purpose-built DTO — every field maps 1:1 to a
+        [deploydiff.Pending] entry via the apid handler's adapter.
+        Empty / absent fields mean "no change proposed" (matches
+        the engine's pointer semantics: every nested field is
+        optional; null = "don't touch").
+      type: object
+      properties:
+        app_config:
+          $ref: '#/components/schemas/DiffAppConfigPatch'
+        image:
+          type: string
+          description: |
+            Would-write image reference. Empty = no image deploy
+            proposed. Compared against the baseline's
+            DeploymentResponse.ImageDigest for the immutable-diff
+            check.
+          example: ghcr.io/me/api@sha256:abc
+        manifest:
+          $ref: '#/components/schemas/AppManifest'
+        env_by_scope:
+          type: object
+          description: |
+            Per-scope env write. Full-replacement semantics per
+            scope (ADR-090 D3). Keys are scope names ("default",
+            "staging", ...); values are DiffEnvRow arrays.
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/DiffEnvRow' }
+        crons:
+          type: array
+          items: { $ref: '#/components/schemas/CreateCronRequest' }
+        edge_rules:
+          type: array
+          items: { $ref: '#/components/schemas/CreateEdgeRuleRequest' }
+
+    DiffAppConfigPatch:
+      description: |
+        Per-app scalar patch. Pointer-aware: nil = "don't touch";
+        explicit zero / explicit value = "set to this". Matches
+        [UpdateAppRequest] semantics but exposes only the fields
+        the engine computes against (no ScalingPolicy /
+        PublicAuth / OverflowNode).
+      type: object
+      properties:
+        ram_mb: { type: integer, minimum: 128, maximum: 10240 }
+        idle_timeout_s: { type: integer, minimum: 30, maximum: 600 }
+        max_concurrency: { type: integer, minimum: 1, maximum: 200 }
+        min_instances: { type: integer, minimum: 0, maximum: 10 }
+        egress_allowlist:
+          type: array
+          items: { type: string }
+        autoscale_target_rps: { type: integer, minimum: 1, maximum: 10000 }
+        autoscale_target_cpu_pct: { type: integer, minimum: 1, maximum: 100 }
+        streaming_enabled: { type: boolean }
+        websocket_enabled: { type: boolean }
+        require_signed: { type: boolean }
+        warm_snapshot_enabled: { type: boolean }
+        require_authn: { type: boolean }
+        eviction_priority: { type: string, enum: [normal, batch, latency] }
+
+    DiffEnvRow:
+      description: |
+        One would-write env var. Value carries plaintext so the
+        quota gate's per-value byte cap can fire (the wire's list
+        path never echoes values per ADR-053 §Decision 4).
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 64 }
+        value: { type: string, maxLength: 8192 }
+
+    DiffChange:
+      description: |
+        One diff row. Polymorphic values (Before / After) re-emitted
+        as JSON objects — the engine emits primitives, slices, or
+        structs depending on the field.
+      type: object
+      required: [field, kind]
+      properties:
+        field: { type: string, description: "Human path: 'memory', 'concurrency', 'environment.<scope>.<key>', 'cron[<schedule> <path>]', 'edge_rule[<kind> <host><path>]'" }
+        kind: { type: string, enum: [add, remove, modify] }
+        before: { description: "Primitive value (int / string / bool / []string) — JSON-encoded. Omitted on Add." }
+        after:  { description: "Primitive value — JSON-encoded. Omitted on Remove." }
+
+    DiffBreak:
+      description: |
+        One would-ship-a-problem row. Stable RFC 7807 code
+        (matches [api.Code*] constants) so the CLI error renders
+        identically to what a real deploy would say.
+      type: object
+      required: [code, severity, reason]
+      properties:
+        code: { type: string, description: "Stable RFC 7807 code; matches api.Code* constants" }
+        severity: { type: string, enum: [error, warn] }
+        reason: { type: string }
+        field: { type: string, description: "Optional scope-wide ('memory') or per-row ('environment.<scope>.<key>')." }
+        observed: { description: "JSON-encoded observed value (int / string / []string / …)." }
+        limit:    { description: "JSON-encoded limit value." }
+
+    DiffPayload:
+      description: |
+        Inner diff object the engine produces. Slug + Plan +
+        Changes + Breaks. Wrapped by [DiffResponse] so a CI
+        consumer reading `.diff.changes` and a CLI consumer
+        reading the top-level keys agree.
+      type: object
+      required: [slug, changes, breaks]
+      properties:
+        slug: { type: string }
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
+          description: "Customer's subscription tier (echoed from acct.Plan)."
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/DiffChange' }
+        breaks:
+          type: array
+          items: { $ref: '#/components/schemas/DiffBreak' }
+
+    DiffResponse:
+      description: |
+        Wire envelope for POST /v1/apps/{slug}/diff and
+        `gregale deploy --diff --json`. Wraps the [DiffPayload]
+        plus the Blocking bit so a CI consumer doesn't have to
+        re-scan Breaks and pick the max severity.
+      type: object
+      required: [diff, blocking, slug]
+      properties:
+        diff: { $ref: '#/components/schemas/DiffPayload' }
+        blocking:
+          type: boolean
+          description: |
+            True if any break has severity "error". Mirrors
+            [pkg/deploydiff.Diff.HasBlockingBreaks]. The exit-1
+            input for CI gates.
+        slug: { type: string }
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
+          description: "Echoed at top level too — kept in sync with diff.plan."
+
     ProjectApplyRequest:
       description: |
         Multipart body for POST /v1/projects (apply). Same shape as
@@ -9049,7 +9383,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9061,6 +9395,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9078,7 +9413,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9090,6 +9425,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9113,6 +9449,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -9170,10 +9507,22 @@ components:
       type: object
       required: [allow_origins, allow_methods]
       properties:
+        # CORS improvements D2/D6: allow_origins accepts the
+        # wildcard grammar documented on CorsOriginPattern
+        # in pkg/api/dto.go. Bare '*', literal origin
+        # 'https://host[:port]', subdomain wildcard
+        # 'https://*.host[:port]', and port wildcard
+        # 'https://host:*'. The pattern is the create-time
+        # gate; the gateway hot path runs the same predicates
+        # in matchOrigin so a rule that bypasses apid-Validate
+        # still matches what the customer expects (defence in
+        # depth).
         allow_origins:
           type: array
           minItems: 1
-          items: { type: string }
+          items:
+            type: string
+            pattern: '^(\\*|https?://(?:\\*\\.[a-zA-Z0-9.\\-]+|localhost)(?::\\*|\\:[0-9]+)?|https?://[a-zA-Z0-9.\\-]+(?::\\*|\\:[0-9]+)?)$'
         allow_methods:
           type: array
           minItems: 1
@@ -9185,7 +9534,11 @@ components:
           type: array
           items: { type: string }
         allow_credentials: { type: boolean, default: false }
-        max_age_seconds: { type: integer, minimum: 0 }
+        # CORS improvements D6: capped at 86400 (24h).
+        # Browsers ignore larger values; the gateway was
+        # happily stamping Access-Control-Max-Age: 2147483647
+        # before the cap. The lower bound is unchanged (>= 0).
+        max_age_seconds: { type: integer, minimum: 0, maximum: 86400 }
 
     EdgeRuleJWTAction:
       description: 'Validates an inbound Bearer JWT against a JWKS endpoint.'
@@ -9290,6 +9643,63 @@ components:
             Per-rule inbound body cap. 0 (default) inherits the
             platform cap (`api.MaxRequestBodyBytes`). When set, must
             be > 0 and <= the platform cap.
+
+    EdgeRuleLimitAction:
+      description: |
+        Standalone per-route body-size cap (ADR-091 D24 / §4.1.2.13).
+        The primitive for "POST /upload ≤ 5 MB, POST /users ≤ 1 MB,
+        POST /webhooks ≤ 2 MB" without shipping a JSON Schema. The
+        hot-path applier (§4.1.2.8c) installs `http.MaxBytesReader`
+        on the inbound body and short-circuits oversize requests
+        with 413 `request_too_large` — and, more importantly,
+        performs a Content-Length fast-path deny so a 30 MB body on
+        a 5 MB cap costs zero bytes of buffering (a `MaxBytesReader`
+        alone only trips when something reads the body, and on this
+        hot path nothing reads it until the proxy leg).
+
+        Rejections never reach the wake gate, the auth chain, or the
+        rate limiter — same posture as kind=validate. Free-and-above
+        (no plan gate).
+
+        Field-by-field:
+          * `max_body_bytes` — required buffered-path cap. Must be
+            > 0 and ≤ `MaxRequestBodyBytes` (25 MiB). A standalone
+            limit rule with no cap is a silent no-op and is
+            rejected at create-time with 422 — use `kind=validate`
+            if you need a body cap alongside a JSON Schema.
+          * `max_body_bytes_streaming` — optional streaming opt-in
+            cap (≤ `MaxEdgeRuleLimitBodyBytesStreaming` = 100 MiB).
+            0 (default) = no streaming carve-out; the buffered
+            `max_body_bytes` is the cap on both paths. When set,
+            must be ≥ `max_body_bytes` — a streaming cap tighter
+            than the buffered cap would 413 every streaming request
+            for a body already accepted as buffered. Runtime
+            enforcement of this field is declared + clamped at
+            create-time but deferred at the §4.1.2.8c slot to a
+            follow-up PR (stated in ADR-091 D24 §6).
+      type: object
+      required: [max_body_bytes]
+      properties:
+        max_body_bytes:
+          type: integer
+          minimum: 1
+          maximum: 26214400  # 25 MiB = MaxRequestBodyBytes
+          description: |
+            Required per-rule buffered-path body cap. Must be > 0
+            and ≤ `api.MaxRequestBodyBytes` (25 MiB). A standalone
+            limit rule with no cap is rejected at create-time with
+            422 — use `kind=validate` if you need a body cap
+            alongside a JSON Schema.
+        max_body_bytes_streaming:
+          type: integer
+          minimum: 1
+          maximum: 104857600  # 100 MiB = RawStreamMaxRequestBytes
+          description: |
+            Optional streaming opt-in cap. 0 (default) = no
+            streaming carve-out; the buffered `max_body_bytes` is
+            the cap on both paths. Must be ≥ `max_body_bytes` when
+            set. Runtime enforcement deferred to follow-up PR
+            (ADR-091 D24 §6).
 
     # ─── API keys ─────────────────────────────────────────────────────────
 
@@ -9969,6 +10379,119 @@ components:
           description: "Per-app egress byte delta over the window (informational; not billed). ADR-046. Source: schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until then this field stays 0)."
           x-since: "2026-08"
           x-issue: "415"
+        routes:
+          type: array
+          description: |
+            Per-route breakdown for opt-in apps (ADR-093). Absent when
+            `route_metrics_enabled` is false on the app — the dashboard
+            distinguishes "feature off" (field absent) from "feature
+            on, no traffic" (empty array). Each row is the bounded
+            detail from the gatewayd-internal in-memory reader: max
+            50 distinct routes + the `__route_other__` wildcard-path
+            overflow bucket. The route label is method + raw path
+            (pre-rewrite, ADR-093 D6).
+          items:
+            $ref: '#/components/schemas/RouteRow'
+          x-since: "2026-08"
+          x-issue: "273"
+
+    RouteRow:
+      description: |
+        Per-route detail row (ADR-093). The `route` field is the
+        bounded label: `"GET /users/4f8a"` for an admitted route, or
+        `"__route_other__"` for the overflow bucket. Latency fields
+        are milliseconds over the full request duration (status-
+        agnostic — failures included). Same zero-on-degraded
+        contract as `AppMetricsResponse`.
+      type: object
+      required:
+        - route
+        - count
+        - p50_ms
+        - p95_ms
+        - p99_ms
+        - error_pct
+      properties:
+        route:
+          type: string
+          description: "Bounded route label (method + raw path, or `__route_other__`)."
+          x-since: "2026-08"
+          x-issue: "273"
+        count:
+          type: integer
+          format: int64
+          description: "Number of requests with this route in the window."
+          x-since: "2026-08"
+          x-issue: "273"
+        p50_ms:
+          type: number
+          description: "p50 of `gateway_request_duration_seconds_bucket{app, route, class}` over the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        p95_ms:
+          type: number
+          description: "p95 over all classes in the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        p99_ms:
+          type: number
+          description: "p99 over all classes in the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        error_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: "Share of [45]xx requests with this route in the window."
+          x-since: "2026-08"
+          x-issue: "273"
+
+    AppRoutesResponse:
+      description: |
+        Per-route label snapshot (ADR-093). The bounded route label
+        set the gatewayd-internal control listener emits for the app.
+        Each item is `"<METHOD> <PATH>"` (pre-edge-rule-rewrite) for
+        an admitted route, or the reserved `"__route_other__"` overflow
+        bucket label. Bounded at 50 distinct real routes + the reserved
+        overflow per app (ADR-093 D2).
+
+        `cap_hit` (ADR-093 Tier B item #1) is true iff the app's
+        route label set has reached `RouteMetricsPerAppCap` (50) and
+        additional routes are collapsing into the reserved
+        `__route_other__` overflow bucket. When `cap_hit` is true,
+        `len(routes) == RouteMetricsPerAppCap + 2` (50 real + the
+        reserved empty label + `__route_other__`). When false, the
+        dashboard can render "you have N admitted routes" without
+        having to count the array (which is ambiguous: 5 real routes
+        + `__route_other__` is indistinguishable from 50 real routes
+        + overflow). Omitted on the `source: unavailable` path —
+        the gatewayd-internal dial failed, the cap state is unknown.
+      type: object
+      required: [slug, routes, source]
+      properties:
+        slug: {type: string, x-since: "2026-08", x-issue: "273"}
+        app_id: {type: string, x-since: "2026-08", x-issue: "273"}
+        routes:
+          type: array
+          items: {type: string}
+          x-since: "2026-08"
+          x-issue: "273"
+        source:
+          type: string
+          enum: ["live", "unavailable"]
+          x-since: "2026-08"
+          x-issue: "273"
+        cap_hit:
+          type: boolean
+          default: false
+          x-since: "2026-08"
+          x-issue: "273"
+          description: |
+            True iff the route label set has hit `RouteMetricsPerAppCap`
+            (50) and additional routes are collapsing into
+            `__route_other__`. Omitted on `source: unavailable` paths
+            (cap state is unknown when the gatewayd-internal dial
+            fails).
 
     ListInstancesResponse:
       description: |

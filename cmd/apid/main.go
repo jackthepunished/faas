@@ -23,9 +23,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -220,6 +222,39 @@ func resolveMetricsAddr(getenv func(string) string, tomlDefault string) string {
 	}
 	if v == "" {
 		return tomlDefault
+	}
+	return v
+}
+
+// gatewaydControlURLDefault is the loopback URL apid dials when
+// FAAS_GATEWAYD_CONTROL_URL is unset. Mirrors gatewayd-internal's
+// default ControlAddr (cmd/gatewayd-internal/config.go:181
+// 127.0.0.1:9090, scheme added). Same-box is the only supported
+// posture today; cross-box deployments override via the env
+// var. Extracted to a const so goconst pins it to one occurrence
+// (the helpers below + the server field comment at
+// cmd/apid/server.go:58 cite the same literal).
+const gatewaydControlURLDefault = "http://127.0.0.1:9090"
+
+// resolveGatewaydControlURL reads FAAS_GATEWAYD_CONTROL_URL via
+// the test seam (deps.getenv) and applies the loopback default
+// when the env value is empty. Same shape as resolveMetricsAddr
+// — the test seam keeps macOS-dev + CI from trying to dial a
+// real gatewayd unless the test opted in via WithGatewaydControlURL,
+// and the default keeps a same-box prod install from bricking
+// the per-route surface just because the operator never exported
+// the env var.
+//
+// Distinction from resolveMetricsAddr: there is no explicit-empty
+// "disable" semantic for FAAS_GATEWAYD_CONTROL_URL. The dial
+// surface either works (operator wired it OR default loopback
+// reachable) or the upstream dial fails and getAppRoutes renders
+// the unavailable state — there is no third "operator opted out
+// of the surface entirely" position.
+func resolveGatewaydControlURL(getenv func(string) string) string {
+	v := getenv("FAAS_GATEWAYD_CONTROL_URL")
+	if v == "" {
+		return gatewaydControlURLDefault
 	}
 	return v
 }
@@ -570,6 +605,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 			Store: srv.store,
 			Log:   log,
 		})
+		// ADR-091 D20.3 / PR-B residual: thread the Ops into the
+		// audit-event retention cleanup loop. srv.ops is populated
+		// by srv.WithOpsMetrics(ctx, ops) on line ~1027 BEFORE
+		// deps.bgBefore is invoked (line 1248), so reading srv.ops
+		// here is safe; the closure's goroutine launch proceeds
+		// regardless of whether ops is nil (the loop runs and
+		// logs but does not increment — same trade-off the apid
+		// audit auditor makes with pkg/audit.Auditor.SetOps).
+		eventRetentionCleanup.SetOps(srv.ops)
 		go func() { _ = eventRetentionCleanup.Run(ctx) }()
 		// Issue #562 / PR-A: log archive shipper. Walks the local
 		// spool dir every cfg.FlushInterval (5 min default) and
@@ -911,10 +955,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (single-box dev) leaves nodeVerifier nil; the wire helper's
 	// setVerifyHook no-ops on a nil verifier and the stdlib trust
 	// path runs unchanged.
-	githubdTLS, err := cfg.LoadGithubdTLSWithVerifier(nodeVerifier)
+	//
+	// ADR-052 §5 / PR-E: route the load through the WithReload
+	// factory so a SIGHUP-driven reload swaps the client leaf on
+	// the next outbound githubd handshake. githubdRotator holds
+	// the live *tls.Config; newGithubdClient captures the rotator's
+	// initial material at construction but stdlib's
+	// GetClientCertificate callback consults the rotator at every
+	// handshake.
+	githubdRotator := wire.NewTLSRotator(nil)
+	githubdTLS, err := cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, githubdRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("apid: githubd TLS: %w", err)
 	}
+	githubdRotator.Set(githubdTLS)
 	if deps.captureDialTLS != nil {
 		deps.captureDialTLS("githubd", githubdTLS)
 	}
@@ -1033,6 +1087,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// events row + bumps wake_phase_emitted_total.
 	eventsPlatform := events.NewPlatform("apid", store, log, ops, nil)
 	srv.WithEventsPlatform(eventsPlatform)
+
+	// ADR-093: gatewayd-internal control-listener URL for the
+	// per-route observability reader. Default
+	// http://127.0.0.1:9090 matches gatewayd-internal's default
+	// control bind (cmd/gatewayd-internal/config.go ControlAddr,
+	// default 127.0.0.1:9090). Production overrides via
+	// FAAS_GATEWAYD_CONTROL_URL when the daemons are split across
+	// nodes; same-box is the only supported posture today
+	// (cross-box will need an mTLS-terminating reverse-proxy —
+	// out of scope for this PR). Empty string disables the
+	// /v1/apps/{slug}/routes surface; getAppRoutes renders the
+	// unavailable state so the dashboard can distinguish
+	// "operator hasn't wired it" from "no traffic yet". The
+	// unresolved env value is what the test seam surfaces
+	// (TestAppRoutes_MissingURLRendersUnavailable pins the empty
+	// contract); main() always applies the default at boot so a
+	// same-box install doesn't brick the per-route surface just
+	// because the operator never exported the env var.
+	srv.WithGatewaydControlURL(resolveGatewaydControlURL(deps.getenv))
 
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
@@ -1306,14 +1379,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the handshake-layer NodeVerifier hook on the server-side
 	// tls.Config. vmmd dials in here; the hook rejects any peer
 	// whose leaf-CN is not in compute_nodes.name.
+	//
+	// ADR-052 §5 / PR-E: route through the WithReload factory so a
+	// SIGHUP-driven reload swaps the server's leaf via stdlib's
+	// per-handshake GetConfigForClient callback.
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
+	advisoryRotator := wire.NewTLSRotator(nil)
 	if sock := resolveAdvisorySock(deps.getenv, cfg); sock != "" {
-		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLSWithVerifier(nodeVerifier)
+		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, advisoryRotator.Reload(nil))
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory TLS: %w", tlsErr)
 		}
+		advisoryRotator.Set(advisoryTLS)
 		if deps.captureDialTLS != nil {
 			deps.captureDialTLS("advisory", advisoryTLS)
 		}
@@ -1345,14 +1424,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the handshake-layer NodeVerifier hook on the server-side
 	// tls.Config. githubd dials in here; the hook rejects any peer
 	// whose leaf-CN is not in compute_nodes.name.
+	//
+	// ADR-052 §5 / PR-E: route through the WithReload factory for
+	// SIGHUP-driven leaf rotation.
 	var bridgeSrv *grpc.Server
 	var bridgeLis net.Listener
+	bridgeRotator := wire.NewTLSRotator(nil)
 	if sock := resolveGithubdBridgeSock(deps.getenv, cfg); sock != "" {
-		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLSWithVerifier(nodeVerifier)
+		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, bridgeRotator.Reload(nil))
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: githubd bridge TLS: %w", tlsErr)
 		}
+		bridgeRotator.Set(bridgeTLS)
 		if deps.captureDialTLS != nil {
 			deps.captureDialTLS("bridge", bridgeTLS)
 		}
@@ -1367,6 +1451,63 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				log.Error("apid githubd bridge serve", "err", err)
 			}
 		}()
+	}
+
+	// ADR-096 PR-A: customer-facing automatic error grouping.
+	// The IncrementAppError gRPC server lives behind
+	// FAAS_APP_ERRORS_ENABLED (PR-A ships the kill-switch OFF so the
+	// schema is populated only by hand); the retention purge goroutine
+	// is started alongside it so PR-B can flip the flag without
+	// touching this main(). The reader-path handlers + DTOs + OpenAPI
+	// are PR-B work.
+	if deps.getenv("FAAS_APP_ERRORS_ENABLED") == "true" { //nolint:goconst // kill-switch sentinel; the canonical "true" env literal.
+		appErrSrv, appErrLis, err := runAppErrorsServer(ctx, srv.store, srv.ops, log)
+		if err != nil {
+			_ = l.Close()
+			return fmt.Errorf("apid: app errors server: %w", err)
+		}
+		go func() {
+			log.Info("apid app errors server listening")
+			if err := appErrSrv.Serve(appErrLis); err != nil {
+				log.Error("apid app errors serve", "err", err)
+			}
+		}()
+		go newAppErrorsPurger(srv.store, nil, srv.ops, log, true).Run(ctx)
+
+		// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. Apid
+		// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
+		// by watchLogLevelReload). Install three parallel ones — each
+		// gets every SIGHUP (signal.Notify fans the signal out to every
+		// registered channel). Best-effort failure posture (matches
+		// egress bundle): a failed reload keeps prior material live,
+		// never bricks. WatchTLSReload returns immediately on ctx cancel.
+		if cfg != nil && cfg.GithubdClientTLSCAPath != "" {
+			githubdHupCh := make(chan os.Signal, 1)
+			signal.Notify(githubdHupCh, syscall.SIGHUP)
+			defer signal.Stop(githubdHupCh)
+			githubdReload := func() (*tls.Config, error) {
+				return cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, githubdHupCh, githubdRotator, githubdReload)
+		}
+		if cfg != nil && cfg.AdvisoryTLSCAPath != "" {
+			advisoryHupCh := make(chan os.Signal, 1)
+			signal.Notify(advisoryHupCh, syscall.SIGHUP)
+			defer signal.Stop(advisoryHupCh)
+			advisoryReload := func() (*tls.Config, error) {
+				return cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, advisoryHupCh, advisoryRotator, advisoryReload)
+		}
+		if cfg != nil && cfg.GithubdBridgeTLSCAPath != "" {
+			bridgeHupCh := make(chan os.Signal, 1)
+			signal.Notify(bridgeHupCh, syscall.SIGHUP)
+			defer signal.Stop(bridgeHupCh)
+			bridgeReload := func() (*tls.Config, error) {
+				return cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, bridgeHupCh, bridgeRotator, bridgeReload)
+		}
 	}
 
 	errc := make(chan error, 1)
@@ -1751,4 +1892,28 @@ func isUnixSocketPath(target string) bool {
 		return true
 	}
 	return false
+}
+
+// runAppErrorsServer brings up the AppErrors gRPC server
+// (ADR-096 §3.5: gatewayd-internal → apid IncrementAppError
+// streaming RPC). Listens on a unix socket under /run/faas so
+// the gateway-side dial is loopback-only and TLS-free (single-box
+// mode). The socket path is hard-coded to /run/faas/app_errors.sock
+// — gatewayd-internal dials it via FAAS_APID_APP_ERRORS_SOCK env
+// (defaulting to the same path). PR-A wires this server behind
+// FAAS_APP_ERRORS_ENABLED so the surface exists but is dormant
+// until PR-B flips the flag.
+//
+// Returns the server (caller calls Serve) and the listener. Errors
+// here are non-fatal: the caller logs and continues without the
+// app_errors gRPC server (the apid HTTP listener still serves).
+func runAppErrorsServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/app_errors.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("app errors listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerAppErrorsReceiver(srv, store, ops, true)
+	return srv, lis, nil
 }

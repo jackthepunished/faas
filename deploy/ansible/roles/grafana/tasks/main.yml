@@ -200,6 +200,31 @@
     - restart grafana-server
     - reload grafana provisioning
 
+# ADR-091 D20.4 / PR-D20.4 — audit-event retention observability
+# chip. Closes the operator surface for the three prerequisite
+# metrics shipped by PR-B (PR #857) in pkg/wire/metrics.go:1389-1425
+# (apid_audit_events_deleted_total, apid_audit_events_retention_lag_seconds,
+# apid_audit_events_volume_total{kind_prefix}). Three panels mirror
+# docs/runbooks/FaasAuditRetentionExhaustion.md's three-signal triage
+# (prune rate, retention lag with green/yellow/red thresholds at
+# 89-91d healthy, volume by kind_prefix top 8). Companion alerts live
+# in faas.rules.yml under family: audit_retention
+# (FaasAuditRetentionLoopStalled page, FaasAuditRetentionLoopStretched
+# warn, FaasAuditRetentionTableGrowingFasterThanPruned warn). Byte-
+# identical copy of deploy/grafana/audit-retention.json — the
+# deploy/grafana/ tree is the operator-visible source of truth
+# (Makefile:172-185 grafana-mirror-check enforces identity).
+- name: grafana — drop audit-retention dashboard JSON (ADR-091 D20.4)
+  ansible.builtin.copy:
+    src: audit-retention.json
+    dest: "{{ gv_dashboards_dir }}/audit-retention.json"
+    owner: grafana
+    group: grafana
+    mode: "0640"
+  notify:
+    - restart grafana-server
+    - reload grafana provisioning
+
 - name: grafana — install systemd unit
   ansible.builtin.copy:
     src: grafana-server.service

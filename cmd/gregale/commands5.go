@@ -31,11 +31,15 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
+	"github.com/onebox-faas/faas/pkg/gregalesecretscan"
 )
 
 // `gregale app` subcommand names — lifted to constants so goconst stops
 // flagging the repeated "scale"/"rename" string literals across the
-// dispatch table (cmdAppDispatch) and the usage hints.
+// dispatch table (cmdAppDispatch) and the usage hints. subSecurity
+// lives in commands_app_security.go (its verb constant is colocated
+// with the leaf it dispatches to); subRoutes follows the same
+// colocated pattern in commands_app_routes.go.
 const (
 	subScale  = "scale"
 	subRename = "rename"
@@ -241,7 +245,19 @@ func envPush(args []string) int {
 	app := fs.String("app", "", "app slug")
 	in := fs.String("f", ".env", "input file (default .env)")
 	fromStdin := fs.Bool("from-stdin", false, "read KEY=VALUE pairs from stdin (one per line)")
+	// --secret-scan mirrors the deploy-side flag. Default ON because the
+	// failure mode (a Stripe key pasted into a `gregale env push`
+	// heredoc) is the same as the deploy-side case — the value lands in
+	// the platform's sealed secret store where the customer expects
+	// "SECRET_KEY", not "my live Stripe key". Override with
+	// --secret-scan=off for local-dev sandbox keys (e.g. sk_test_…).
+	secretScan := fs.String("secret-scan", "on", "scan pairs for known credential patterns before pushing (on|off; default on)")
 	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	secretScanOn, secretScanErr := parseSecretScanFlag(*secretScan)
+	if secretScanErr != nil {
+		PrintFail(os.Stderr, "%s", secretScanErr)
 		return 1
 	}
 	if *app == "" {
@@ -311,6 +327,47 @@ func envPush(args []string) int {
 		PrintFail(os.Stderr, "no KEY=VALUE pairs in input")
 		return 1
 	}
+	// Secret-scan pass: scan the parsed pairs (in-memory; no file I/O
+	// because the values are already in hand) for known credential
+	// patterns. Findings cause the pair to be dropped from the upload
+	// and a stderr warning to be rendered. The origin string is the
+	// input path or "<stdin>" so the warning says `File: <stdin>` for
+	// pipe input (matches how envPush surfaces other parse errors).
+	if secretScanOn {
+		origin := *in
+		if *fromStdin {
+			origin = "<stdin>"
+		}
+		scanPairs := make([]gregalesecretscan.Pair, len(pairs))
+		for i, p := range pairs {
+			scanPairs[i] = gregalesecretscan.Pair{Key: p.k, Value: p.v}
+		}
+		findings := gregalesecretscan.ScanEnvPairs(scanPairs, origin)
+		if len(findings) > 0 {
+			renderEnvPushScanWarnings(findings, osStderr)
+			// Build a drop set keyed by (key, value) so a duplicate
+			// KEY with a different VALUE pair is treated distinctly —
+			// the pair table is small (handful of entries per .env
+			// file) so a linear scan is fine.
+			drop := make(map[int]bool, len(findings))
+			for _, f := range findings {
+				if f.Line >= 1 && f.Line <= len(pairs) {
+					drop[f.Line-1] = true
+				}
+			}
+			kept := pairs[:0]
+			for i, p := range pairs {
+				if !drop[i] {
+					kept = append(kept, p)
+				}
+			}
+			pairs = kept
+		}
+	}
+	if len(pairs) == 0 {
+		PrintFail(os.Stderr, "all KEY=VALUE pairs contained detected secrets; none were pushed. Use --secret-scan=off to override")
+		return 1
+	}
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -342,6 +399,35 @@ func envPush(args []string) int {
 		PrintOK(osStdout, "%s set", p.k)
 	}
 	return 0
+}
+
+// renderEnvPushScanWarnings is the envPush-side twin of
+// renderSecretScanWarnings in commands2.go. Same two-line shape per
+// finding, but the summary line ends with "pushed." rather than
+// "upload." because envPush ships to the platform secret store, not a
+// tarball. Stderr-only so `gregale env push --json | jq` keeps a clean
+// stdout JSON envelope.
+//
+// Each line:
+//
+//	! Secret detected in .env:12 (STRIPE_SECRET_KEY → stripe_live, high)
+//	  ↳ sk_liv…p7dc
+//
+// Summary line (only if any findings fired):
+//
+//	! 1 secret(s) skipped from the push. Move to: skip
+func renderEnvPushScanWarnings(findings []gregalesecretscan.Finding, w io.Writer) {
+	if len(findings) == 0 {
+		return
+	}
+	for _, f := range findings {
+		PrintWarn(w, "Secret detected in %s:%d (%s → %s, %s)",
+			f.File, f.Line, f.Key, f.Provider, f.Severity)
+		// Same convention as renderSecretScanWarnings in commands2.go:
+		// the snippet is a continuation line, Fprintf errors discarded.
+		_, _ = fmt.Fprintf(w, "  ↳ %s\n", f.Snippet)
+	}
+	PrintWarn(w, "%d secret(s) skipped from the push.", len(findings))
 }
 
 // openCustomerFile opens any customer-supplied file path with defense
@@ -584,12 +670,12 @@ func cmdAppRename(slug, newSlug string) int {
 }
 
 // cmdAppDispatch routes `gregale app <slug> ...` to either the new
-// subcommand form (scale / rename) or the legacy flag-form (`gregale app
-// <slug> --ram N`, `gregale app <slug>`). Pulled out of main.go so the
-// switch stays small.
+// subcommand form (scale / rename / security / routes) or the legacy
+// flag-form (`gregale app <slug> --ram N`, `gregale app <slug>`).
+// Pulled out of main.go so the switch stays small.
 func cmdAppDispatch(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> [scale|rename <new>|security [--require-signed=true|false]|--ram N|--max-concurrency N|--idle SEC|--min N]", "apps")
+		PrintUsage(os.Stderr, "usage: gregale app <slug> [scale|rename <new>|security [--require-signed=true|false]|routes|--ram N|--max-concurrency N|--idle SEC|--min N]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -605,6 +691,8 @@ func cmdAppDispatch(args []string) int {
 			return cmdAppRename(slug, args[2])
 		case subSecurity:
 			return cmdAppSecurity(slug, args[2:])
+		case subRoutes:
+			return cmdAppsRoutes(slug, args[2:])
 		}
 	}
 	// Backwards-compat: legacy flag-form dispatch is the existing cmdApp.

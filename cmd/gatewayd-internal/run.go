@@ -42,6 +42,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid"
+	"github.com/onebox-faas/faas/pkg/apidgrpc"
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
@@ -186,6 +187,28 @@ func rawStreamEnabledFromEnv() bool {
 	return false
 }
 
+// routeMetricsEnabledFromEnv (ADR-093) is the per-process
+// opt-in for the per-route observability surface. Mirrors
+// streamingEnabledFromEnv above: env (FAAS_GATEWAY_ROUTE_METRICS)
+// OR TOML ([route_metrics].enabled) flips the bit, either is
+// sufficient. The closed truthy set reuses the streamingFlag*
+// constants — same convention, same linter-friendly shape —
+// because the four-way {1, true, yes, false} mapping is platform
+// convention rather than per-feature. The runtime default is
+// false; operators opt in per-cluster after the envelope is
+// comfortable. cmd/e2e/per_route_metrics_e2e_test.go flips this
+// on via the harness's extraEnv parameter; the metal build tag
+// keeps the per-route test off the default unit/e2e lane.
+func routeMetricsEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_ROUTE_METRICS", streamingFlagFalse)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
 // gRPC client + the in-process gateway handler. Move 1 widens the
 // surface from Wake-only to two methods so the synthetic HTTP envelope
@@ -225,6 +248,19 @@ type runDeps struct {
 	// false. The flag also drives the buffered-fallback deprecation
 	// log when an SSE-emitting app lands on the legacy buffered path.
 	streamingEnabled bool
+	// routeMetricsEnabled (ADR-093) is the per-process operator
+	// kill-switch for the per-route observability surface. When
+	// false (the production default), every Handler.routeSetFor
+	// lookup returns nil regardless of the per-app
+	// app.RouteMetricsEnabled flag — the customer's per-app flag
+	// is inert. The two flags are AND-gated in Handler.ServeHTTP.
+	// Production passes env(TOML) || env("FAAS_GATEWAY_ROUTE_METRICS");
+	// tests leave it false. Together with the per-app flag this
+	// is the two-level opt-in the ADR promises: an operator can
+	// disable wholesale on a hot day without a Postgres round-trip,
+	// and a customer has to opt in per-app to use any of the
+	// surface.
+	routeMetricsEnabled bool
 	// synth is the internal unix-socket RPC server schedd dials for cron
 	// dispatch (spec §4.4, M7). nil in tests; production wires it after
 	// the schedd client is dialed.
@@ -556,7 +592,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled}, true, nil
 		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)
@@ -754,6 +790,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// default is false (no streaming — the legacy buffered path).
 	// Tests override by setting one of the two knobs.
 	deps.streamingEnabled = cfg.StreamingEnabled || streamingEnabledFromEnv()
+	// ADR-093: operator kill-switch for the per-route observability
+	// surface. Mirrors the streamingEnabled merge above — TOML or
+	// FAAS_GATEWAY_ROUTE_METRICS flips the bit, either is sufficient.
+	// The per-app flag (apps.route_metrics_enabled) is AND-gated against
+	// this in Handler.routeSetFor, so flipping the kill-switch at process
+	// level (via env or systemd drop-in) takes the surface offline
+	// without a Postgres round-trip or a pg_notify fan-out — the
+	// "operator can disable wholesale on a hot day" property the
+	// two-level design promises.
+	deps.routeMetricsEnabled = cfg.RouteMetricsEnabled || routeMetricsEnabledFromEnv()
 	// Issue #471 / ADR-047 (PR-A): resolve the http.Server.WriteTimeout.
 	// Spec §4.1 baseline is 300 s; the TOML [response_write_timeout]
 	// key overrides per-cluster. PR-B lifts the per-plan cap on
@@ -813,7 +859,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// reads state.EdgeRule via the store; reset on
 	// db.NotifyEdgeRuleChanged is wired via PGBackend.WithEdgeRules
 	// below.
-	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter)
+	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter, deps.metrics)
 	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
 	// Issue #561 / ADR-091 PR 5 — build the per-URL JWKS cache
 	// + JWT verifier that applyEdgeRuleJWT consults. Lazy
@@ -945,6 +991,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// — run()
 	// populates deps.streamingEnabled; tests inject the bit directly.
 	handler.WithStreamingEnabled(deps.streamingEnabled)
+	// ADR-093: arm the per-process routeMetricsEnabled kill-switch on
+	// the Handler so routeSetFor can AND the operator flag against the
+	// per-app flag (apps.route_metrics_enabled). Same merge point as
+	// WithStreamingEnabled above; both flags ride the same plumbing.
+	handler.WithRouteMetricsEnabled(deps.routeMetricsEnabled)
 	// Issue #560: per-deployment require_authn. The adapter
 	// + auditor are nil-safe; the pre-issue public-by-default
 	// behaviour is preserved for unit tests + dev boxes that
@@ -1015,7 +1066,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed},
 			StreamingEnabled: app.StreamingEnabled,
 			WebSocketEnabled: app.WebSocketEnabled,
-			NodeID:           app.NodeID,
+			// ADR-093: per-route observability opt-in. Mirrors
+			// the WebSocketEnabled plumbing above — the same
+			// routeSetFor gate in Handler.ServeHTTP reads this
+			// alongside the operator kill-switch.
+			RouteMetricsEnabled: app.RouteMetricsEnabled,
+			NodeID:              app.NodeID,
 		}, true
 	}, deps.edgeRulesAudit)
 	// Issue #561 / ADR-091 PR 5 — arm the per-rule JWT verifier.
@@ -1329,6 +1385,54 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// pre-#294 behaviour.
 	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log, newGatewaydAuditor(deps.pgStore, log))
 
+	// ADR-096: customer-facing automatic error grouping writer
+	// path. gatewayd-internal records every 4xx/5xx response on
+	// the public edge and ships batches to apid via the
+	// unix-socket gRPC IncrementAppError streaming RPC. apid is
+	// the sole writer to app_errors / app_error_requests
+	// (CLAUDE.md ownership); the gateway never opens a direct
+	// Postgres connection for this store.
+	//
+	// Kill-switch: FAAS_APP_ERRORS_ENABLED defaults to false
+	// (PR-A's stable point). PR-B flips it to true. When false,
+	// the recorder middleware is a pass-through (no per-request
+	// cost beyond a single int compare) and the publisher
+	// goroutine is NOT started.
+	//
+	// apid socket: defaults to /run/faas/apid.sock (the
+	// ADR-015 unix-socket DAC convention shared with schedd +
+	// vmmd). Operators override via FAAS_APID_SOCKET when the
+	// socket path diverges (containerised deployments, etc).
+	appErrorsEnabled := osGetenv("FAAS_APP_ERRORS_ENABLED") == "true"
+	apidAppErrorsSock := osGetenv("FAAS_APID_APP_ERRORS_SOCKET")
+	if apidAppErrorsSock == "" {
+		apidAppErrorsSock = "/run/faas/app_errors.sock"
+	}
+	if appErrorsEnabled && deps.opsMetrics != nil {
+		// Build the recorder + publisher; wire the publisher
+		// goroutine; wrap the public handler with the
+		// recorder's middleware.
+		cli, dialErr := apidgrpc.DialContext(ctx, apidAppErrorsSock, nil)
+		if dialErr != nil {
+			log.Warn("app_errors: apid socket dial failed; recorder disabled", "err", dialErr)
+		} else {
+			recorder := newAppErrorsRecorder(appErrorsRecorderConfig{
+				Enabled:               true,
+				DedupeWindowSeconds:   3600,
+				CardinalityLimit:      10000,
+				SampleMessageCapBytes: 512,
+				HeadersSampleMaxKeys:  8,
+			}, nil, deps.opsMetrics, log)
+			publisher := newAppErrorsPublisher(recorder, cli, deps.opsMetrics, log)
+			recorder.pub = publisher
+			go publisher.Run(ctx)
+			publicHandler = recorder.Middleware(publicHandler)
+			log.Info("app_errors recorder enabled", "apid_socket", apidAppErrorsSock)
+		}
+	} else {
+		log.Info("app_errors recorder disabled (FAAS_APP_ERRORS_ENABLED != \"true\")")
+	}
+
 	// Issue #249 / spec §11: mount security response headers at the
 	// outermost wrapper of the public listener.
 	//
@@ -1391,6 +1495,36 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// reads from the same *Limiter the public edge uses (handler.Limiter()
 	// is the seam) so the snapshot agrees with what Allow consumed.
 	controlMux.HandleFunc("/v1/internal/quota", internalQuotaHandler(handler, log))
+	// ADR-093: mount the per-route observability reader on the
+	// control mux so apid can reverse-proxy
+	// /v1/apps/{slug}/routes → /v1/internal/apps/{slug}/routes
+	// without going through the public :443 listener (which would
+	// self-rate-limit and expose the internal route-label state
+	// to a customer-scoped probe). The handler resolves slug via
+	// pgStore.AppBySlug — the control listener does NOT open its
+	// own Postgres connection (ADR-070 single-purpose control
+	// mux), so the closure shares the daemon's existing pool.
+	// nil pgStore (tests / single-box dev without a DB) renders
+	// the lookup_unavailable problem so the dashboard can
+	// distinguish "DB missing" from "unknown slug".
+	if deps.pgStore != nil {
+		pgStore := deps.pgStore
+		controlMux.HandleFunc("/v1/internal/apps/", func(w http.ResponseWriter, r *http.Request) {
+			// Path-keyed: ServeMux's HandleFunc uses prefix
+			// match, so /v1/internal/apps/foo/routes and
+			// /v1/internal/apps/bar/routes both reach here.
+			// The handler itself trims the prefix and reads
+			// the slug from r.URL.Path.
+			resolve := gateway.ResolveSlugFn(func(slug string) (string, bool) { //nolint:contextcheck // ADR-093 ResolveSlugFn signature is fixed; ctx captured from per-request r.Context().
+				a, err := pgStore.AppBySlug(r.Context(), slug)
+				if err != nil || a.ID == "" {
+					return "", false
+				}
+				return string(a.ID), true
+			})
+			internalRoutesHandler(handler, resolve, log).ServeHTTP(w, r)
+		})
+	}
 
 	// Track every *http.Server we spin up so the shutdown path can drain
 	// them in parallel. sslib guidance is "call Shutdown on each" rather

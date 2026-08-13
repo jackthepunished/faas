@@ -707,6 +707,18 @@ const (
 	// AND at PATCH time (no override path).
 	CodePlanWebSocketNotAllowed = "plan_websocket_not_allowed"
 
+	// ADR-093: customer attempted PATCH-true on Free for
+	// apps.route_metrics_enabled. Same gate shape as
+	// CodePlanWebSocketNotAllowed above; distinct code so the
+	// CLI can render "per-route metrics is a paid feature"
+	// alongside the streaming + warm-snapshot copy without
+	// conflating them in telemetry. The Free plan is the
+	// abuse-floor tier where per-route cardinality would not
+	// have a budget alongside the per-app rollups, so the gate
+	// is fail-closed at create time AND at PATCH time (no
+	// override path).
+	CodePlanRouteMetricsNotAllowed = "plan_route_metrics_not_allowed"
+
 	// Issue #470 / ADR-055: out-of-range warm-snapshot threshold
 	// values from a PATCH (warm_snapshot_min_requests outside [1,
 	// 100] or warm_snapshot_min_ms outside [100, 60000]). 422 with
@@ -2855,6 +2867,15 @@ func ErrPlanEdgeRuleKindNotAllowed(plan Plan, kind string) *Problem {
 
 // ErrCORSOriginNotAllowed is the 403 returned when a CORS rule's
 // allow_origins list rejects the request's Origin header.
+//
+// Exported for apid test fixtures and future per-app audit emit
+// (CORS improvements D1); not consumed on the gateway hot path
+// today, where origin rejection is silent — the gateway stamps
+// no Access-Control-Allow-Origin and the browser drops the
+// response client-side. A future ADR can switch the gateway to
+// emit this Problem on a per-deployment "fail-closed" opt-in;
+// today the failure mode matches the pre-PR-#841 contract
+// documented in spec §4.1.2.6.
 func ErrCORSOriginNotAllowed(origin string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeCORSOriginNotAllowed,
 		"CORS origin not allowed",

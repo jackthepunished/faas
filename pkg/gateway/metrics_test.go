@@ -44,7 +44,7 @@ func TestMetricsWakeQueueWaitNilSafe(t *testing.T) {
 func TestMetricsIssue273Exposition(t *testing.T) {
 	m := NewMetrics()
 	m.PreInstantiateApp("app-1")
-	m.ObserveColdBoot("app-1", 250*time.Millisecond)
+	m.ObserveColdBoot("app-1", 250*time.Millisecond, "node-1")
 	m.ObserveRequestDuration("app-1", "2xx", 12*time.Millisecond)
 	m.ObserveRequestDuration("app-1", "5xx", 500*time.Millisecond)
 
@@ -148,7 +148,7 @@ func TestWakeGateObservesWaitDuration(t *testing.T) {
 			func(ctx context.Context) error {
 				<-release
 				return nil
-			})
+			}, nil, nil)
 	}()
 	// Yield so the leader is committed before the follower joins.
 	time.Sleep(20 * time.Millisecond)
@@ -156,7 +156,7 @@ func TestWakeGateObservesWaitDuration(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(context.Background(), "appA",
 			func() bool { return false }, // would-wake check is leader-only; follower ignores it
-			func(ctx context.Context) error { return nil })
+			func(ctx context.Context) error { return nil }, nil, nil)
 	}()
 
 	// Hold the leader parked so the follower accumulates wait.
@@ -201,14 +201,14 @@ func TestWakeGateSkipsObservationOnErrQueueFull(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(context.Background(), "appB",
 			func() bool { return true },
-			func(ctx context.Context) error { <-release; return nil })
+			func(ctx context.Context) error { <-release; return nil }, nil, nil)
 	}()
 	time.Sleep(20 * time.Millisecond) // leader commits first
 
 	// Synchronous next caller — gate rejects with ErrQueueFull.
 	err := g.Wait(context.Background(), "appB",
 		func() bool { return false },
-		func(ctx context.Context) error { return nil })
+		func(ctx context.Context) error { return nil }, nil, nil)
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("err = %v, want ErrQueueFull", err)
 	}
@@ -252,7 +252,7 @@ func TestWakeGateSkipsObservationOnCtxCancel(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(context.Background(), "appC",
 			func() bool { return true },
-			func(ctx context.Context) error { <-release; return nil })
+			func(ctx context.Context) error { <-release; return nil }, nil, nil)
 	}()
 
 	// Follower with a cancelled context — must be queued behind the
@@ -265,7 +265,7 @@ func TestWakeGateSkipsObservationOnCtxCancel(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(cancelledCtx, "appC",
 			func() bool { return false },
-			func(ctx context.Context) error { return nil })
+			func(ctx context.Context) error { return nil }, nil, nil)
 		// Tell the test driver we've entered Wait (even if it returned
 		// immediately — the gate has serialized us).
 		close(followerCommitted)
@@ -640,6 +640,59 @@ func TestMetricsWakeSnapshotTierPreinstantiated(t *testing.T) {
 		want := fmt.Sprintf(`gateway_wake_snapshot_tier_total{tier=%q} 0`, tier)
 		if !strings.Contains(body, want) {
 			t.Errorf("pre-instantiated %s missing from /metrics body:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsWakePhaseDurationPreinstantiated (ADR-098 C11) pins the
+// closed phase set on the new phase-decomposed wake histogram at
+// zero from the moment the daemon binds, so the §12 panel surfaces
+// from boot. Catches a future change that drops the pre-instantiation
+// loop or renames a phase value. The aggregate
+// gateway_wake_latency_seconds histogram is NOT changed here — that
+// series stays byte-identical (tested in pkg/gateway/testhist/...).
+func TestMetricsWakePhaseDurationPreinstantiated(t *testing.T) {
+	m := NewMetrics()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, phase := range []string{
+		"queue_wait", "coordinator_wait", "schedd_admit",
+		"vmmd_wake", "guest_ready", "cold_fallback_reason",
+	} {
+		want := fmt.Sprintf(`gateway_wake_phase_duration_seconds_count{phase=%q} 0`, phase)
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated %s missing from /metrics body:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsObserveWakePhaseRoundTrip (ADR-098 C11) asserts that
+// ObserveWakePhase increments the labelled histogram and that the
+// scalar (legacy) ObserveWakeQueueWait dual-writes into the
+// phase="queue_wait" series. Pinning both halves of the dual-write
+// here keeps the §12 panel honest through a future refactor that
+// drops either the scalar or the vector.
+func TestMetricsObserveWakePhaseRoundTrip(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveWakePhase("vmmd_wake", 250*time.Millisecond)
+	m.ObserveWakeQueueWait(120 * time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`gateway_wake_phase_duration_seconds_count{phase="vmmd_wake"} 1`,
+		`gateway_wake_phase_duration_seconds_count{phase="queue_wait"} 1`,
+		// Legacy scalar stays byte-identical for one release.
+		// ObserveWakeQueueWait dual-writes into the vector AND
+		// into the scalar; only the queue_wait call counts here.
+		`gateway_wake_queue_wait_seconds_count 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing exposition line %q in body:\n%s", want, body)
 		}
 	}
 }

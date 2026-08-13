@@ -3735,3 +3735,89 @@ func TestUpdateAppWebSocket_FreeOptOut(t *testing.T) {
 		t.Fatalf("status %d, want 200 (asymmetric gate; opt-out always allowed): %s", rec.Code, rec.Body)
 	}
 }
+
+// --- CORS improvements D1: per-app default CORS PATCH tests ----
+
+// The validator (validateUpdateApp) requires a non-empty origins
+// list whenever CORSDefaultEnabled is true (otherwise the customer
+// turns the fallback on with no allowlist and the gateway stamps
+// nothing). A round-trip test pins the persistence shape: a valid
+// PATCH survives the validator, lands on the apps row, and reads
+// back through the AppResponse projection. Validator-only tests
+// (no round-trip) pin the negative path.
+
+func TestUpdateApp_CORSDefaultEnabledRoundTrip(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "cors-rt")
+	enabled := true
+	origins := []string{"https://*.example.com"}
+	rec := e.do(t, "PATCH", "/v1/apps/cors-rt", api.UpdateAppRequest{
+		CORSDefaultEnabled: &enabled,
+		CORSDefaultOrigins: &origins,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.CORSDefaultEnabled == nil || !*out.CORSDefaultEnabled {
+		t.Errorf("CORSDefaultEnabled: got %v want *true", out.CORSDefaultEnabled)
+	}
+	if len(out.CORSDefaultOrigins) != 1 || out.CORSDefaultOrigins[0] != "https://*.example.com" {
+		t.Errorf("CORSDefaultOrigins: got %v", out.CORSDefaultOrigins)
+	}
+}
+
+func TestUpdateApp_CORSDefaultEnabled_EmptyOriginsRejected(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "cors-empty")
+	enabled := true
+	empty := []string{}
+	rec := e.do(t, "PATCH", "/v1/apps/cors-empty", api.UpdateAppRequest{
+		CORSDefaultEnabled: &enabled,
+		CORSDefaultOrigins: &empty,
+	}, nil)
+	assertProblem(t, rec, 422, api.CodeValidation)
+}
+
+func TestUpdateApp_CORSDefaultEnabled_NilOriginsRejected(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "cors-nil")
+	enabled := true
+	rec := e.do(t, "PATCH", "/v1/apps/cors-nil", api.UpdateAppRequest{
+		CORSDefaultEnabled: &enabled,
+		// CORSDefaultOrigins left nil
+	}, nil)
+	assertProblem(t, rec, 422, api.CodeValidation)
+}
+
+func TestUpdateApp_CORSDefaultEnabled_BadGrammarRejected(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "cors-bad")
+	enabled := true
+	origins := []string{"example.com"} // missing scheme
+	rec := e.do(t, "PATCH", "/v1/apps/cors-bad", api.UpdateAppRequest{
+		CORSDefaultEnabled: &enabled,
+		CORSDefaultOrigins: &origins,
+	}, nil)
+	assertProblem(t, rec, 422, api.CodeValidation)
+}
+
+func TestUpdateApp_CORSDefaultEnabled_OptOutPath(t *testing.T) {
+	// Setting CORSDefaultEnabled to false without an origins list
+	// must NOT 422 — the customer is opting out of an enabled
+	// fallback (or never enabled it). The validator only requires
+	// origins when the customer enables the feature.
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "cors-off")
+	disabled := false
+	rec := e.do(t, "PATCH", "/v1/apps/cors-off", api.UpdateAppRequest{
+		CORSDefaultEnabled: &disabled,
+		// origins intentionally omitted
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}

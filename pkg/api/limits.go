@@ -534,6 +534,19 @@ type Limits struct {
 	// flag via PATCH (gated by Plan.WebSocketResponseAllowed so
 	// Free stays off even when an admin backfills the column).
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) gates the per-app per-route
+	// observability surface: when true, gatewayd-internal emits three
+	// additional Prometheus series keyed by an enumerated `route`
+	// label (method + raw path, bounded per-app at 50 distinct entries
+	// with __route_other__ as the non-evicting overflow bucket) and
+	// serves the per-app reader at GET /v1/internal/apps/{slug}/routes.
+	// Hobby/Pro/Scale default on; Free stays off (the abuse-floor tier
+	// where per-route cardinality would not have a budget). The
+	// plan-level default is applied at CreateApp time via buildApp
+	// using Plan.RouteMetricsEnabled(); an existing app may still flip
+	// the flag via PATCH (gated by Plan.RouteMetricsResponseAllowed
+	// so Free stays off even when an admin backfills the column).
+	RouteMetricsEnabled bool
 	// MaxResponseBodyBytes is the per-response body cap (spec §4.1
 	// for the legacy 25 MB bound; issue #471 raises the cap for
 	// Hobby+ to 100 MB so LLM-style streams have headroom). 0 means
@@ -652,6 +665,31 @@ type Limits struct {
 	// per tier (Hobby's "last week", Pro's "this month", Scale's
 	// "this quarter"). 0 means "no archive on this plan" (Free).
 	LogArchiveRetentionDaysMax int
+
+	// AppErrorsRetentionDays (ADR-096 / customer-facing automatic
+	// error grouping) is the per-plan retention cap on
+	// app_errors / app_error_requests rows. The nightly purge
+	// cron in cmd/apid/app_errors_purge.go deletes rows older
+	// than this bound. MUST be <= LogArchiveRetentionDaysMax
+	// for the same plan — the errors view is a stricter subset
+	// of the log archive; if the archive retention widens in a
+	// future release, the errors retention widens with it but
+	// not faster. Free=1, Hobby=7, Pro=30, Scale=90.
+	AppErrorsRetentionDays int
+	// AppErrorsMaxFingerprintsPerApp (ADR-096) is the per-plan
+	// ceiling on the number of distinct fingerprints the
+	// gatewayd-internal recorder retains in its LRU for one
+	// (account_id, app_id). Past the cap the recorder silently
+	// drops + bumps faas_gateway_app_errors_recorded_total{
+	// outcome="rate_limited"}. Free=50, Hobby=200, Pro=1000,
+	// Scale=5000.
+	AppErrorsMaxFingerprintsPerApp int
+	// AppErrorsMaxRequestRowsPerFingerprint (ADR-096) is the
+	// per-plan ceiling on the number of app_error_requests rows
+	// retained per fingerprint for the drill-down view. Older
+	// rows beyond the cap are deleted first on the retention
+	// purge. Free=25, Hobby=100, Pro=500, Scale=1000.
+	AppErrorsMaxRequestRowsPerFingerprint int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -799,6 +837,12 @@ var planLimits = map[Plan]Limits{
 		// Default off; apid PATCH rejects with 403
 		// plan_websocket_not_allowed.
 		WebSocketEnabled: false,
+		// Per-route metrics (ADR-093): Free is the abuse-floor tier
+		// — per-route cardinality would not have a budget (Free
+		// apps share the §12 dashboard series set with paid apps).
+		// Default off; apid PATCH rejects with 403
+		// plan_route_metrics_not_allowed. Hobby+ customers opt in.
+		RouteMetricsEnabled: false,
 		// Warm-snapshot (issue #470 / ADR-055): Free is off by
 		// plan. Warm-tier apps keep warm.snap + init.snap on the
 		// parked disk budget; doubling the per-app snapshot
@@ -847,6 +891,14 @@ var planLimits = map[Plan]Limits{
 		// (returns immediately on ctx.Done()).
 		LogArchiveEnabled:          false,
 		LogArchiveRetentionDaysMax: 0,
+		// ADR-096 error grouping. Free = 1-day retention, 50
+		// fingerprints, 25 request rows per fingerprint — the
+		// abuse-floor tier. Retention MUST be <= the log-archive
+		// retention above (which is 0 for Free; "no archive, no
+		// grouped errors either" is the consistent posture).
+		AppErrorsRetentionDays:                1,
+		AppErrorsMaxFingerprintsPerApp:        50,
+		AppErrorsMaxRequestRowsPerFingerprint: 25,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -1005,6 +1057,12 @@ var planLimits = map[Plan]Limits{
 		// 100 MB / 900 s caps above cover a long-poll or chat WS
 		// session comfortably.
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Hobby is the first paid tier
+		// — opt-in by default (Hobby customers hosting APIs are the
+		// core "which endpoint is slow?" use case). The per-app
+		// route cap (50) + __route_other__ overflow bound the
+		// cardinality regardless of the customer's traffic shape.
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Hobby is gated off
 		// for the same cost-shape reason as Free — doubling the
 		// parked per-app snapshot footprint doesn't fit the
@@ -1062,6 +1120,12 @@ var planLimits = map[Plan]Limits{
 		// S3 within the spec §4.1 latency budget.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 7,
+		// ADR-096 — Hobby = "last week" retention, 200 fingerprints,
+		// 100 request rows per fingerprint. Retention equals the
+		// log-archive retention.
+		AppErrorsRetentionDays:                7,
+		AppErrorsMaxFingerprintsPerApp:        200,
+		AppErrorsMaxRequestRowsPerFingerprint: 100,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -1200,6 +1264,11 @@ var planLimits = map[Plan]Limits{
 		// the first tier where production workloads sit — opt-in by
 		// default for the same reason as Hobby (LLM / agent SDKs).
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Pro is the first tier where
+		// production workloads sit — opt-in by default for the same
+		// reason as Hobby (production APIs want the per-route
+		// breakdown by default).
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Pro is the first
 		// tier where warm-snapshot is on by default. Per the issue
 		// body's acceptance: "for a Pro+ app that has served ≥5
@@ -1248,6 +1317,11 @@ var planLimits = map[Plan]Limits{
 		// rather than being a single shared cap.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 30,
+		// ADR-096 — Pro = "this month" retention, 1000 fingerprints,
+		// 500 request rows per fingerprint.
+		AppErrorsRetentionDays:                30,
+		AppErrorsMaxFingerprintsPerApp:        1000,
+		AppErrorsMaxRequestRowsPerFingerprint: 500,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1398,6 +1472,10 @@ var planLimits = map[Plan]Limits{
 		// stays on by default — production workloads at this tier
 		// are expected to run agent / WS-backed services.
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Scale stays on by default
+		// for the same reason as Pro — production workloads want
+		// the per-route breakdown without a PATCH round-trip.
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Scale stays on
 		// by default — the per-app parked footprint cost fits
 		// inside the 452 GB budget, and the customer's wake-p50
@@ -1449,6 +1527,11 @@ var planLimits = map[Plan]Limits{
 		// generous at the top tier.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 90,
+		// ADR-096 — Scale = "this quarter" retention, 5000
+		// fingerprints, 1000 request rows per fingerprint.
+		AppErrorsRetentionDays:                90,
+		AppErrorsMaxFingerprintsPerApp:        5000,
+		AppErrorsMaxRequestRowsPerFingerprint: 1000,
 	},
 }
 
@@ -1565,6 +1648,28 @@ const (
 	MaxRequestBodyBytes = 25 * 1024 * 1024 // 25 MB either direction
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
+
+	// MaxEdgeRuleLimitBodyBytesStreaming (ADR-091 D24 / kind=limit
+	// streaming carve-out) is the upper bound on the optional
+	// `max_body_bytes_streaming` field of a kind=limit edge rule.
+	// The buffered-path field (`max_body_bytes`) is capped by
+	// MaxRequestBodyBytes (25 MiB) above; the streaming opt-in
+	// raises the cap to RawStreamMaxRequestBytes (100 MiB, ADR-080
+	// raw-bridge parity) so an LLM-style streaming POST against a
+	// /v1/chat/completions endpoint has the same headroom the
+	// raw-bridge ForwardStream has. Runtime enforcement ships
+	// alongside the field (D24 §6 amendment). The cap-selection
+	// algorithm at pkg/gateway/handler.go::applyEdgeRuleLimit
+	// consults this field only when the request is on the
+	// streaming opt-in path (4-conjunct detection: h.streamingEnabled
+	// && app.StreamingEnabled && !isAcceptJSON(Accept) && !isUpgradeRequest).
+	// The DTO's `s ≥ b` invariant (pkg/api/dto.go) is the single
+	// source of truth — the runtime trusts it without re-check.
+	// Matches RawStreamMaxRequestBytes byte-for-byte so a
+	// customer can set `max_body_bytes_streaming` = RawStreamMaxRequestBytes
+	// and the value survives the apid-Validate round-trip without
+	// surprise trimming.
+	MaxEdgeRuleLimitBodyBytesStreaming int64 = 100 * 1024 * 1024
 
 	// MaxEdgeRuleValidateSchemaBytes bounds the JSON Schema body of a
 	// kind=validate edge rule at apid-create time (Cloudflare-style
@@ -2483,6 +2588,46 @@ func (p Plan) LogArchiveRetentionDaysMax() int {
 	return l.LogArchiveRetentionDaysMax
 }
 
+// AppErrorsRetentionDays (ADR-096) returns the per-plan
+// retention cap on app_errors / app_error_requests rows. The
+// nightly purge cron in cmd/apid/app_errors_purge.go reads this
+// to decide which rows to DELETE. Returns 1 on unknown plans
+// (fail-closed minimum) so a missing plan row never silently
+// keeps errors forever.
+func (p Plan) AppErrorsRetentionDays() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 1
+	}
+	return l.AppErrorsRetentionDays
+}
+
+// AppErrorsMaxFingerprintsPerApp (ADR-096) returns the per-plan
+// ceiling on distinct fingerprints the gatewayd-internal recorder
+// retains in its LRU. The recorder uses this as the
+// CardinalityLimit backstop; past the cap, new fingerprints are
+// silently dropped (outcome="rate_limited"). Returns 50 on
+// unknown plans (Free-tier floor).
+func (p Plan) AppErrorsMaxFingerprintsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 50
+	}
+	return l.AppErrorsMaxFingerprintsPerApp
+}
+
+// AppErrorsMaxRequestRowsPerFingerprint (ADR-096) returns the
+// per-plan ceiling on app_error_requests rows retained per
+// fingerprint. The retention purge deletes oldest rows beyond
+// the cap first. Returns 25 on unknown plans (Free-tier floor).
+func (p Plan) AppErrorsMaxRequestRowsPerFingerprint() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 25
+	}
+	return l.AppErrorsMaxRequestRowsPerFingerprint
+}
+
 // LivenessPeriodSeconds returns the per-plan default poll cadence
 // for the liveness probe (issue #554). 0 for Free — coupled to
 // LivenessAllowed() above; if the customer is on a plan where
@@ -2620,6 +2765,45 @@ func (p Plan) WebSocketResponseAllowed() bool {
 	}
 	return l.WebSocketEnabled
 }
+
+// RouteMetricsEnabled reports whether the plan defaults the per-app
+// apps.route_metrics_enabled column to true (ADR-093). Hobby/Pro/Scale
+// opt in; Free stays off (the abuse-floor tier where per-route
+// cardinality would not have a budget). The plan-level default is
+// applied at CreateApp time in cmd/apid/handlers.go::buildApp using
+// the RouteMetricsEnabled() accessor. Unknown plans fail closed
+// (return false) — same contract as WebSocketEnabled / StreamingEnabled.
+func (p Plan) RouteMetricsEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.RouteMetricsEnabled
+}
+
+// RouteMetricsResponseAllowed reports whether the plan permits a customer
+// to set apps.route_metrics_enabled=true via PATCH. Hobby+ opt in; Free
+// returns false so apid's updateApp handler can surface 403
+// plan_route_metrics_not_allowed (ADR-093 AC #2). Same fail-closed
+// contract as RouteMetricsEnabled above.
+func (p Plan) RouteMetricsResponseAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.RouteMetricsEnabled
+}
+
+// RouteMetricsPerAppCap is the per-app hard cap on the number of
+// distinct routes admitted into the routeLabelSet (ADR-093 D2). When
+// exceeded, all new routes collapse into the reserved __route_other__
+// bucket. The cap is a constant — not per-plan — because the
+// cardinality bound is the same regardless of plan: any single app
+// exceeding 50 distinct routes is a wildcard-shape pattern that the
+// __route_other__ signal was designed to surface. Halo constant: do
+// not make this per-plan without a separate ADR (the §12 budget math
+// is global, not per-tenant).
+const RouteMetricsPerAppCap = 50
 
 // WarmSnapshotEnabled reports whether the plan's default for the
 // per-app two-tier snapshot flag is on. Pro/Scale return true; Free /
@@ -3292,4 +3476,69 @@ const (
 	// of the operator surface.
 	ObsAdminRateLimitLimitDefault = 100
 	ObsAdminRateLimitLimitMax     = ObsAdminPaginationMax
+
+	// AppErrorsWindowMaxHours (ADR-096) bounds the ?since= window
+	// on /v1/apps/{slug}/errors/summary. Mirrors ObsAdminWindowMaxHours
+	// (168h = 7d) — the customer view is narrower in the dashboard
+	// UI but the storage backend can serve the same window. The
+	// summary endpoint clamps ?since=/?until= to this bound; longer
+	// windows are silently clamped and the response sets
+	// window_clamped=true.
+	AppErrorsWindowMaxHours = 168
+
+	// AppErrorsSummaryDefaultLimit / AppErrorsSummaryMaxLimit bound
+	// ?limit= on GET /v1/apps/{slug}/errors/summary. 20 default =
+	// "show me the top 20 errors" (matches the Sentry-default
+	// grouping view the customer-facing dashboard renders); 100
+	// max caps the scan so a misconfigured caller cannot blow the
+	// row-budget. Past 100 the caller pages via ?cursor.
+	AppErrorsSummaryDefaultLimit = 20
+	AppErrorsSummaryMaxLimit     = 100
+
+	// AppErrorsDedupeWindowSeconds (ADR-096) is the platform-wide
+	// dedupe window for the IncrementAppError INSERT. NOT a
+	// per-plan constant — it is a system-wide setting
+	// (FAAS_APP_ERRORS_DEDUPE_WINDOW_SECONDS env var). 3600s = 1h
+	// default; raising it inflates the on-disk row count per
+	// fingerprint; lowering it increases the dedupe rate. Pinned
+	// here so the limits-lint gate accepts the constant.
+	AppErrorsDedupeWindowSeconds = 3600
+
+	// AppErrorsSampleMessageCapBytes (ADR-096) is the hard cap on
+	// the sample_message column at the writer. The
+	// redact.Redactor truncates at this bound BEFORE INSERT; the
+	// pg_column_size CHECK on the column is the backstop. 512 bytes
+	// matches the existing app_log archive precedent — half a KiB
+	// is enough to carry a 1-2 sentence error description with a
+	// stack-trace snippet, and small enough to keep the index
+	// narrow.
+	AppErrorsSampleMessageCapBytes = 512
+
+	// AppErrorsCardinalityBackstopMultiplier (ADR-096) is the
+	// multiplier applied to AppErrorsMaxFingerprintsPerApp() when
+	// computing the recorder's LRU cache cap. The recorder uses
+	// this so the cache can absorb a brief burst above the plan
+	// cap before the drop kicks in. 2x = the cache holds up to
+	// 2x the steady-state cap; the cache evicts oldest entries
+	// beyond that.
+	AppErrorsCardinalityBackstopMultiplier = 2
+
+	// ObsAdminAuditLogLimitDefault / ObsAdminAuditLogLimitMax bound
+	// the top-N size of /v1/admin/obs/audit-log/search (ADR-091 §3.7 /
+	// PR #3). Default 200 covers the operator's "what happened in
+	// the last hour" drill-down; cap 500 = ObsAdminPaginationMax
+	// for parity with the rest of the operator surface. The underlying
+	// store is bounded by an over-read on the same idiom as
+	// listAuditLogOverRead (cmd/apid/handlers_audit_log.go:67).
+	ObsAdminAuditLogLimitDefault = 200
+	ObsAdminAuditLogLimitMax     = ObsAdminPaginationMax
+
+	// ObsAdminEventsLimitDefault / ObsAdminEventsLimitMax bound the
+	// top-N size of /v1/admin/obs/events (ADR-091 §3.7 / PR #3).
+	// Same shape as the audit-log search: default 200, cap 500. The
+	// events table is append-only with no retention pruning today
+	// so the over-read budget is also bounded by the
+	// (kind, at DESC) index added by 00190_admin_obs_index.sql.
+	ObsAdminEventsLimitDefault = 200
+	ObsAdminEventsLimitMax     = ObsAdminPaginationMax
 )

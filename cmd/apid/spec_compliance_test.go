@@ -43,6 +43,7 @@ const (
 	scanFile      = "dto_scan.go"      // issue #464 / ADR-055 — per-deploy grype CVE scan DTOs
 	webhooksFile  = "webhooks.go"      // issue #476 / ADR-076
 	billingFile   = "billing.go"       // PR-P3 — admin reconcile + future billing DTOs
+	diffFile      = "diff.go"          // PR-1 of the deploy-diff cluster — DiffRequest / DiffResponse wire DTOs
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -73,7 +74,11 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/tenants/{id}":                  true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes":                         true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes/{name}/heartbeats":       true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/events":                  true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
+	"GET /v1/admin/obs/nodes/wake-latency":            true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
 	"GET /v1/admin/obs/anomalies":                     true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/audit-log/search":              true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/events":                        true, // ADR-091 — operator-only (PR #3)
 	"GET /v1/admin/obs/rate-limits":                   true, // ADR-091 — operator-only (PR #2)
 	"GET /v1/events":                                  true, // SSE (cookie+Bearer, not s.auth)
 	"GET /login":                                      true, // dashboard magic-link GET (HTML form, browser-only)
@@ -560,6 +565,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", scanFile),
 		filepath.Join(root, "pkg", "api", webhooksFile),
 		filepath.Join(root, "pkg", "api", billingFile),
+		filepath.Join(root, "pkg", "api", diffFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

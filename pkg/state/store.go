@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
@@ -258,6 +259,45 @@ type PaddleOverageDedupeSchemaResult struct {
 	// `select count(*) filter (where state = …)` query.
 	PendingRows   int64
 	CompletedRows int64
+}
+
+// AppErrorGroup is the typed row produced by the
+// /v1/apps/{slug}/errors/summary endpoint (ADR-096). It mirrors
+// sqlc.ListAppErrorGroupsRow but uses stdlib uuid.UUID + time.Time
+// so handlers don't have to thread pgtype values through the
+// wire layer. PgStore converts at the boundary.
+type AppErrorGroup struct {
+	ID            uuid.UUID
+	Fingerprint   string
+	ErrorClass    string
+	Route         string
+	HTTPStatus    int32
+	Count         int64
+	RequestCount  int64
+	FirstSeenAt   time.Time
+	LastSeenAt    time.Time
+	SampleMessage string
+}
+
+// AppErrorRequestRow is the typed drill-down row for
+// /v1/apps/{slug}/errors/{fingerprint}.
+type AppErrorRequestRow struct {
+	ID            uuid.UUID
+	RequestID     uuid.UUID
+	ReceivedAt    time.Time
+	Route         string
+	HTTPStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  *uuid.UUID
+}
+
+// AppErrorSampleRow is the typed single-sample row for
+// /v1/apps/{slug}/errors/{fingerprint}/first.
+type AppErrorSampleRow struct {
+	AppErrorRequestRow
+	HeadersSample []byte // jsonb raw; handler parses to map[string]string
+	Redactions    []string
 }
 
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
@@ -936,6 +976,14 @@ type Store interface {
 	// call CountDeployedApps before this method (that's the bug).
 	CreateAppIfUnderQuota(ctx context.Context, app App, limits api.Limits) (App, error)
 	AppByID(ctx context.Context, id string) (App, error)
+	// PreviewAppsByParent (ADR-094 / issue #272) lists every
+	// preview app whose preview_of_slug matches the parent. Used
+	// by the dashboard's "preview environments" pane and the
+	// schedd's teardown janitor (cmd/schedd/janitor_preview.go,
+	// PR-C). Results are ordered by created_at DESC so the
+	// dashboard's newest-first display is free. Returns an empty
+	// slice (not an error) when the parent has no previews.
+	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and
@@ -2102,6 +2150,23 @@ type Store interface {
 	// entered current state"), so the engine must stamp it on entry.
 	// Non-SNAPSHOTTING transitions should still use UpdateInstanceState.
 	UpdateInstanceStateWithTimestamp(ctx context.Context, id, state string, parkedAt time.Time) error
+	// IncInstanceRequestCount bumps the per-instance request_count
+	// column by delta (ADR-098 C8). The writer is additive
+	// ("request_count = request_count + delta") so a Phase-4-loser
+	// re-apply is idempotent. Returns the post-increment total, or
+	// -1 when the row is gone (Phase-4 loser landed after the
+	// instance was evicted). The batched flush path (C9) is the only
+	// caller; the writer is deliberately not used at single-request
+	// granularity.
+	IncInstanceRequestCount(ctx context.Context, id string, delta int64) (int64, error)
+	// TouchInstancesWithRequestDelta (ADR-098 C9) is the batched
+	// version of IncInstanceRequestCount: same per-instance delta
+	// increment, but applied across a whole touch batch in one
+	// round-trip via unnest. Mirrors TouchInstancesLastSeen — the
+	// gateway's ReportActivity batch carries both last_request_at
+	// AND the per-instance request_count delta, and the engine
+	// stamps both atomically. Returns the number of rows updated.
+	TouchInstancesWithRequestDelta(ctx context.Context, touches []InstanceTouch) (int, error)
 	// UpdateInstanceStateToTerminal writes state AND stamps terminal_at
 	// on the same UPDATE (PR #74, spec §17 follow-up). terminal_at is
 	// the dedicated retention anchor the daily sweep (pkg/sched.Retention)
@@ -2459,6 +2524,43 @@ type Store interface {
 	// store's ComputeNodeByName, not this call.
 	ListComputeNodeHeartbeats(ctx context.Context, nodeID string, since time.Time, limit int) ([]ComputeNodeHeartbeat, error)
 
+	// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+	// amendment) extends AppendComputeNodeHeartbeat with the two new
+	// stats columns added in migrations/00199. vmmd is the only caller
+	// on the routine path; the existing AppendComputeNodeHeartbeat
+	// (without stats) stays so schedd's deactivation/reactivation
+	// stampers don't need to know about CPU/disk. cpuPct60s is the
+	// 60-second sliding-window CPU utilization as a percentage of
+	// vpcpus × 100 (range [0.00, 100.00] for sane values). The
+	// memstore mirrors the nullable semantics: existing callers
+	// without the stats columns pass 0 / 0 and the column defaults
+	// to NULL on the postgres side via the IF NOT EXISTS migration.
+	AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error
+
+	// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+	// row per node, with the CPU%/disk fields populated. Used by the
+	// obs surface to fold onto the /v1/admin/obs/nodes row projection.
+	// Returns one row per node — even nodes with no stats yet (the
+	// CPU/disk fields are nil). The LEFT JOIN onto compute_nodes is
+	// done in the handler; this query is just the latest-row-per-node.
+	LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
+
+	// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+	// new per-node utilization fields on /v1/admin/obs/nodes. One row
+	// per compute_node that has at least one live instance.
+	//
+	// The aggregate joins on instances.node_id (the existing NOT NULL
+	// FK from migration 00024, backfilled to the default-local node on
+	// pre-existing rows) — NOT a separate binding table. ADR-092 §2.1
+	// was rewritten during PR #4 prep after this discovery; see the
+	// §8 amendment in docs/adr/092-per-node-utilization-obs.md.
+	//
+	// The +8 on ram_mb mirrors §6.2 invariant #2 — Σ(ram_mb + 8) ≤
+	// 47,600 MB. The aggregate is per-node; the fleet Σ is computed
+	// by the caller if it wants the global number (the existing
+	// fleet Σ lives in the schedd engine, not on this wire).
+	PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error)
+
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
@@ -2507,6 +2609,33 @@ type Store interface {
 	// account's ID; the operator endpoint leaves AccountID nil and
 	// passes IncludeAnonymous=true when ?include_anonymous=true.
 	ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]AuditLog, error)
+
+	// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator
+	// observability backend's read-side query for the live events
+	// table. Distinct from ListAuditLog (audit_log table) — the
+	// two surfaces do NOT overlap per ADR-091 §3.7.4.
+	//
+	// Filter shape: actor ("" / exact match), kind_prefix ("" /
+	// LIKE 'prefix%'), subject ("" / UUID), since (zero time / since
+	// floor), limit (top-N; bounded by handler to
+	// ObsAdminEventsLimitMax). The "" / zero literals are the
+	// "no filter" sentinel — sqlc binds them as interface{} because
+	// the SQL uses the ($1 = '' OR ...) predicate shape.
+	//
+	// Order is (at DESC, id DESC) — the id tiebreaker keeps the
+	// over-read stable across (kind, at DESC) index hits and
+	// avoids an unstable sort.
+	ListAllEventsPaged(ctx context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error)
+
+	// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+	// per-account events drill-down. Backed by the events_actor_account_idx
+	// partial index on (actor_account_id) WHERE actor_account_id IS NOT NULL
+	// (migrations/00099_orgs_memberships_invitations.sql).
+	//
+	// since is the inclusive lower bound on at; limit is the top-N
+	// bounded by the caller's ObsAdminEventsLimitMax. Order is
+	// (at DESC, id DESC) — same rationale as ListAllEventsPaged.
+	ListRecentEventsForAccount(ctx context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error)
 	// DeploymentSidecarRAMs (issue #463 / ADR-070 / PR-C) returns
 	// the per-deployment sidecar RAM slice from the jsonb column.
 	// Empty/nil when the deployment has no sidecars — matching the
@@ -2567,6 +2696,15 @@ type Store interface {
 	// see the sqlc query in pkg/state/queries.sql for the scoring
 	// formula and reason taxonomy.
 	TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error)
+	// TrafficAnomalyAggregateByNode (PR #4 / ADR-092 §3.4
+	// amendment) is the per-(account, app, node, minute) variant
+	// of TrafficAnomalyAggregate. Same scoring formula and
+	// reason taxonomy; different GROUP BY keys (joins through
+	// instances.node_id → compute_nodes.id). Powers
+	// GET /v1/admin/obs/anomalies?group_by=node. The handler
+	// resolves node_id → node_name via ListComputeNodes before
+	// returning the wire shape.
+	TrafficAnomalyAggregateByNode(ctx context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error)
 	// PerAccountRateLimitAggregate is the durable view of
 	// auth.rate_limited events grouped by account_id (subject)
 	// over a rolling window. Powers GET /v1/admin/obs/rate-limits
@@ -3294,4 +3432,70 @@ type Store interface {
 	// /deliveries/{id}/retry) and the dispatcher-side audit
 	// emission that needs to read the row's account_id + app_id.
 	AppWebhookDeliveryByID(ctx context.Context, id string) (AppWebhookDelivery, error)
+
+	// --- ADR-096 customer-facing automatic error grouping ---
+	//
+	// The writer methods (IncrementAppError / InsertAppErrorRequest)
+	// are called by the apid gRPC server-side handler in
+	// cmd/apid/grpc_server_apperrors.go; gatewayd-internal dials
+	// apid over a unix socket and never touches the Store
+	// directly. The reader methods back the
+	// /v1/apps/{slug}/errors/* handlers in PR-B.
+
+	// IncrementAppError is the dedupe-merge INSERT called by
+	// grpc_server_apperrors.go. Runs ON CONFLICT (account_id,
+	// app_id, fingerprint) DO UPDATE so a fresh row with an
+	// existing fingerprint bumps count + request_count + bumps
+	// last_seen_at. The handler wraps N calls in a single pgx
+	// transaction (one per gRPC stream batch). params use sqlc
+	// types to match the generated query method (ADR-006 +
+	// TrafficAnomalyAggregate precedent at pkg/state/store.go
+	// line 2611 — sqlc types leak through the Store interface
+	// for the queries that sqlc owns; readers convert to typed
+	// AppErrorGroup/Row/Row at the boundary).
+	IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error)
+
+	// InsertAppErrorRequest writes one drill-down row per request
+	// that hit the fingerprint. No ON CONFLICT — every request
+	// gets its own row. Paired with IncrementAppError on the same
+	// gRPC stream batch.
+	InsertAppErrorRequest(ctx context.Context, arg sqlc.InsertAppErrorRequestParams) error
+
+	// ListAppErrorGroups backs GET /v1/apps/{slug}/errors/summary
+	// (PR-B). Cursor-paginated via (last_seen_at, fingerprint)
+	// when cursor != ""; otherwise first page. limit MUST be
+	// pre-clamped to api.AppErrorsSummaryMaxLimit by the handler.
+	ListAppErrorGroups(ctx context.Context, arg sqlc.ListAppErrorGroupsParams) ([]AppErrorGroup, error)
+
+	// ListAppErrorRequests backs GET /v1/apps/{slug}/errors/{fp}
+	// (PR-B). Cursor-paginated via (received_at, request_id).
+	// limit MUST be pre-clamped by the handler.
+	ListAppErrorRequests(ctx context.Context, arg sqlc.ListAppErrorRequestsParams) ([]AppErrorRequestRow, error)
+
+	// GetAppErrorSample backs GET /v1/apps/{slug}/errors/{fp}/first
+	// (PR-B). Returns the OLDEST request row for one fingerprint.
+	// headers_sample + redactions are populated for the
+	// wire-side "we redacted X / Y / Z" badge.
+	GetAppErrorSample(ctx context.Context, arg sqlc.GetAppErrorSampleParams) (AppErrorSampleRow, error)
+
+	// ListAppErrorFingerprintsForPurge is the read-side of the
+	// nightly retention purge (cmd/apid/app_errors_purge.go).
+	// Returns IDs of app_errors rows for an account older than
+	// cutoff, capped at 10000 per call. DeleteAppErrorsByIDs +
+	// DeleteAppErrorRequestsByIDs follow.
+	ListAppErrorFingerprintsForPurge(ctx context.Context, arg sqlc.ListAppErrorFingerprintsForPurgeParams) ([]uuid.UUID, error)
+
+	// DeleteAppErrorsByIDs removes app_errors rows by ID array.
+	// Used by the nightly retention purge.
+	DeleteAppErrorsByIDs(ctx context.Context, ids []uuid.UUID) error
+
+	// DeleteAppErrorRequestsByIDs removes app_error_requests rows
+	// by ID array. Used by the nightly retention purge.
+	DeleteAppErrorRequestsByIDs(ctx context.Context, ids []uuid.UUID) error
+
+	// DeleteAppErrorRequestsOlderThan removes ALL
+	// app_error_requests rows for one account older than the
+	// cutoff timestamp. Used by the nightly retention purge to
+	// age out orphaned request rows.
+	DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error
 }

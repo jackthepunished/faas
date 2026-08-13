@@ -894,3 +894,117 @@ func TestClient_AllowsNonCookieOnlyAuthRoutes(t *testing.T) {
 		t.Error("server never hit — regex over-matched to /v1/auth/logout")
 	}
 }
+
+// --- CORS improvements D5: CreateCORSEdgeRule typed helper tests ----
+
+// The helper is a thin shim over CreateEdgeRule that pins kind=cors
+// and packs the EdgeRuleCORSAction JSON. The tests below pin each
+// wire-shape invariant so a regression in the helper (e.g. wrong
+// priority default, wrong MaxAgeSeconds default, missing kind)
+// breaks locally before reaching the e2e suite.
+
+func TestCreateCORSEdgeRule_EmptyOriginsRejected(t *testing.T) {
+	c := NewClient("http://example.invalid", "fp_test")
+	_, err := c.CreateCORSEdgeRule(context.Background(), "demo", CreateCORSEdgeRuleOpts{
+		MatchHost:    "demo.apps.example",
+		MatchPath:    "/*",
+		AllowOrigins: nil,
+		AllowMethods: []string{"GET"},
+	})
+	if err == nil {
+		t.Fatal("expected error for empty AllowOrigins, got nil")
+	}
+}
+
+func TestCreateCORSEdgeRule_EmptyHostRejected(t *testing.T) {
+	c := NewClient("http://example.invalid", "fp_test")
+	_, err := c.CreateCORSEdgeRule(context.Background(), "demo", CreateCORSEdgeRuleOpts{
+		MatchHost:    "",
+		AllowOrigins: []string{"https://app.example.com"},
+		AllowMethods: []string{"GET"},
+	})
+	if err == nil {
+		t.Fatal("expected error for empty MatchHost, got nil")
+	}
+}
+
+func TestCreateCORSEdgeRule_PinsKindCORSAndActionShape(t *testing.T) {
+	var gotPath string
+	var gotKind string
+	var gotAction EdgeRuleCORSAction
+	var gotPriority int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		var body CreateEdgeRuleRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		gotKind = body.Kind
+		if body.Priority != nil {
+			gotPriority = *body.Priority
+		}
+		if err := json.Unmarshal(body.Action, &gotAction); err != nil {
+			t.Errorf("unmarshal action: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"r1","kind":"cors","match_host":"demo.apps.example","match_path":"/*","enabled":true}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "fp_test")
+	_, err := c.CreateCORSEdgeRule(context.Background(), "demo", CreateCORSEdgeRuleOpts{
+		MatchHost:        "demo.apps.example",
+		MatchPath:        "/*",
+		MatchMethods:     []string{"GET", "POST", "OPTIONS"},
+		AllowOrigins:     []string{"https://app.example.com"},
+		AllowMethods:     []string{"GET", "POST"},
+		AllowHeaders:     []string{"*"},
+		AllowCredentials: false,
+		MaxAgeSeconds:    0, // 0 -> SDK default 600
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPath != "/v1/apps/demo/edge-rules" {
+		t.Errorf("path: got %q want %q", gotPath, "/v1/apps/demo/edge-rules")
+	}
+	if gotKind != "cors" {
+		t.Errorf("kind: got %q want %q", gotKind, "cors")
+	}
+	if gotPriority != 100 {
+		t.Errorf("priority: got %d want %d", gotPriority, 100)
+	}
+	if gotAction.MaxAgeSeconds != 600 {
+		t.Errorf("MaxAgeSeconds default: got %d want %d", gotAction.MaxAgeSeconds, 600)
+	}
+	if gotAction.AllowOrigins[0] != "https://app.example.com" {
+		t.Errorf("AllowOrigins round-trip: got %v", gotAction.AllowOrigins)
+	}
+	if gotAction.AllowCredentials {
+		t.Errorf("AllowCredentials should be false")
+	}
+}
+
+func TestCreateCORSEdgeRule_HonoursExplicitMaxAge(t *testing.T) {
+	var gotAction EdgeRuleCORSAction
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body CreateEdgeRuleRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.Unmarshal(body.Action, &gotAction)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"r1","kind":"cors"}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "fp_test")
+	_, err := c.CreateCORSEdgeRule(context.Background(), "demo", CreateCORSEdgeRuleOpts{
+		MatchHost:     "demo.apps.example",
+		AllowOrigins:  []string{"https://app.example.com"},
+		AllowMethods:  []string{"GET"},
+		MaxAgeSeconds: 1200,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAction.MaxAgeSeconds != 1200 {
+		t.Errorf("explicit MaxAgeSeconds: got %d want %d", gotAction.MaxAgeSeconds, 1200)
+	}
+}

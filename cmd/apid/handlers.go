@@ -212,6 +212,21 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if req.WebSocketEnabled != nil {
 		ws = *req.WebSocketEnabled
 	}
+	// ADR-093: per-route observability opt-in. Mirrors the
+	// WebSocketEnabled shape above — plan-level default applied
+	// when the request didn't carry one, request override
+	// otherwise. Free stays off (per-route cardinality would not
+	// have a budget alongside the per-app rollups); Hobby/Pro/
+	// Scale default on. The Plan.RouteMetricsEnabled() accessor
+	// is fail-closed — Free's accessor returns false. The PATCH
+	// upstream gate (CodePlanRouteMetricsNotAllowed) has already
+	// rejected a Free customer trying to override the default to
+	// true on a PATCH round-trip; create-time goes through the
+	// same gate in handlers_ext.go.
+	rm := acct.Plan.RouteMetricsEnabled()
+	if req.RouteMetricsEnabled != nil {
+		rm = *req.RouteMetricsEnabled
+	}
 	// Issue #470 / ADR-055: per-app two-tier snapshot flag. Apply
 	// the plan-level default when the request didn't carry one —
 	// a Pro customer's brand-new app gets warm.snap capture
@@ -280,8 +295,14 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	return state.App{
 		AccountID: acct.ID, Slug: req.Slug, Type: typ, Runtime: req.Runtime,
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
-		StreamingEnabled:    streaming,
-		WebSocketEnabled:    ws,
+		StreamingEnabled: streaming,
+		WebSocketEnabled: ws,
+		// ADR-093: per-route observability opt-in (plan-level
+		// default applied via the block above). Mirrors the
+		// WebSocketEnabled shape — the per-plan default is
+		// applied here at create time so the row round-trips
+		// the same value a future PATCH would land on.
+		RouteMetricsEnabled: rm,
 		WarmSnapshotEnabled: warmEnabled,
 		// Issue #560 + issue #695 / ADR-080: see the
 		// plan-default block above. Default is per-plan
@@ -472,6 +493,12 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// flag. Surfaced so dashboards can show "websocket on / off"
 		// alongside the streaming pill.
 		WebSocketEnabled: a.WebSocketEnabled,
+		// ADR-093: per-route observability opt-in (DB round-trip).
+		// Surfaced so dashboards can show "per-route metrics on /
+		// off" alongside the streaming + websocket pills and so a
+		// customer can verify their PATCH landed without a second
+		// round-trip.
+		RouteMetricsEnabled: a.RouteMetricsEnabled,
 		// Issue #560: per-app require_authn flag. Surfaced so
 		// dashboards can show "auth required on / off" alongside
 		// the streaming + require_signed pills, and so a customer
@@ -528,7 +555,30 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// handlers_ext.go, so the value is always UUID-shaped
 		// (never the operator-readable name).
 		OverflowNode: a.OverflowNode,
+		// CORS improvements D1: per-app default CORS opt-in +
+		// allowlist. Projected from the apps row so a customer
+		// can verify their PATCH landed without a second
+		// round-trip. The store-layer field is already *bool
+		// so the three-state shape (nil = schema default,
+		// *false = explicit opt-out, *true = opt-in)
+		// flows through unchanged. CORSDefaultOrigins is
+		// materialised as a non-nil slice so the JSON shape
+		// is `[]` (never `null`) for the same ergonomic
+		// reasons as EgressAllowlist above.
+		CORSDefaultEnabled: a.CORSDefaultEnabled,
+		CORSDefaultOrigins: cORSOriginsList(a.CORSDefaultOrigins),
 	}
+}
+
+// cORSOriginsList materialises the text[] column as a non-nil slice.
+// A nil column (legacy row, never configured) projects as an empty
+// slice on the wire so dashboards can render an empty origin list
+// without a special-case for null.
+func cORSOriginsList(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
 }
 
 // withParkedDeploymentRef (issue #554 / ADR-079 follow-up, AC #3

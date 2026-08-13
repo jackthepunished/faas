@@ -90,11 +90,34 @@ import (
 type Metrics struct {
 	registry *prometheus.Registry
 
-	requests      *prometheus.CounterVec
-	wakeLatency   prometheus.Histogram
-	wakeQueueWait prometheus.Histogram
-	queueDepth    *prometheus.GaugeVec
-	rateLimited   *prometheus.CounterVec
+	requests    *prometheus.CounterVec
+	wakeLatency prometheus.Histogram
+	// wakeLatencyByNode (PR #4 / ADR-092 §3.5) is the per-node
+	// labelled twin of wakeLatency. The unlabeled histogram stays
+	// untouched — it's the §12 SLA contract and is consumed by
+	// pkg/appmetrics/appmetrics.go:175 for the fleet p95. The new
+	// histogram is operator-side only; the obsNodeWakeLatency
+	// handler in cmd/apid PromQL-evals it for per-node quantiles.
+	// The label is the compute_node.id (UUID) rather than the
+	// human-readable name because gatewayd-internal has no
+	// node-id → node-name cache on the wake path; the obs handler
+	// resolves id → name via the existing ListComputeNodes call
+	// before returning. Label cardinality is bounded by
+	// compute_nodes count (today: 1, tomorrow: tens). ADR-091
+	// §3.6 documents the label cardinality constraint.
+	wakeLatencyByNode *prometheus.HistogramVec
+	wakeQueueWait     prometheus.Histogram
+	// wakePhaseDuration (ADR-098 C11): phase-decomposed wake
+	// latency vector. Closed phase set pre-instantiated below so
+	// the §12 panel surfaces zero on an idle gateway.
+	wakePhaseDuration *prometheus.HistogramVec
+	queueDepth        *prometheus.GaugeVec
+	rateLimited       *prometheus.CounterVec
+	// leaderBootstrapAborts (ADR-098 C7): counter labelled by
+	// reason — closed set {queue_empty_no_instance, ttl_expired,
+	// app_deleted}. Pre-instantiated in NewMetrics so the §12
+	// dashboard chip surfaces from first scrape.
+	leaderBootstrapAborts *prometheus.CounterVec
 	// edgeRuleMatch: ADR-089 PR 3. Counter labelled by
 	// (kind, outcome) — `kind` is the EdgeRuleKind
 	// (route|rewrite|redirect|headers|cors|jwt|ip; closed set
@@ -200,6 +223,39 @@ type Metrics struct {
 	// SLO-clustered buckets (0.35/0.8s): this histogram must resolve
 	// sub-100ms warm responses AND multi-second slow ones.
 	requestDuration *prometheus.HistogramVec
+	// requestsByRoute backs the per-route observability counter
+	// (ADR-093 / issue #273 — opt-in follow-up to ADR-042 §1).
+	// Labels: app, plan, route, code. The `route` label admits
+	// through the bounded routeLabelSet per app (cap = 50 + the
+	// reserved __route_other__ overflow bucket); the cap is
+	// app.RouteMetricsEnabled AND the operator kill-switch
+	// (cmd/gatewayd-internal/config.go [route_metrics] enabled).
+	// When the cap is disabled, all admission collapses to the
+	// reserved empty-string "no appID" sentinel so the column
+	// never appears on /metrics — same shape as the existing
+	// `gateway_requests_total{app="-"}` series. The
+	// pre-instantiation loop in NewMetrics below must come AFTER
+	// the operator kill-switch is read — the daemon reads the
+	// config before NewMetrics returns, so the loop only emits
+	// the closed (plan) set under the empty-row placeholder when
+	// the operator has the feature disabled.
+	requestsByRoute *prometheus.CounterVec
+	// durationByRoute backs the per-route histogram
+	// (ADR-093 D4). Labels: app, route, class. Same bucket
+	// choice as the per-app requestDuration above (warm-friendly
+	// 0.005s..10s spread). The per-app per-route closed `class`
+	// set is pre-instantiated by PreInstantiateAppRoute after
+	// the route is admitted through routeLabelSet.
+	durationByRoute *prometheus.HistogramVec
+	// failuresByRoute backs the per-route failures counter
+	// (ADR-093 D4). Labels: app, plan, route, code. Mirrors
+	// the existing gateway_requests_total shape but adds
+	// `route`; the counter is incremented only when status
+	// ≥ 400 so the dashboard can compute error_rate_pct directly
+	// from the ratio without a separate error-rate histogram.
+	// Same operator kill-switch + customer-opt-in gate as
+	// requestsByRoute.
+	failuresByRoute *prometheus.CounterVec
 	// coldBoot backs the renamed gateway_cold_boot_total counter
 	// (issue #273 / ADR-042). Renamed outright from coldWake —
 	// gateway_cold_wake_total had zero external consumers (no
@@ -371,20 +427,57 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_match_total",
 			Help: "Edge-rule matcher outcomes, labelled by kind and outcome (match|miss|blocked). ADR-089 PR 3.",
 		}, []string{"kind", "outcome"}),
-		// ADR-091 hardening PR-A — apply-path outcomes (distinct from
-		// the matcher pick). result is a closed {success, error} set.
+		// ADR-091 hardening PR-A — apply-path counter (distinct from
+		// match). A rule can match the matcher but fail at apply time
+		// (e.g. JWKS lookup returns ErrJWKSNotRegistered, or an IP
+		// rule's CIDR list is empty after redaction). The {kind, result}
+		// partition powers the §12 dashboard chip "edge rule apply rate".
 		edgeRuleApply: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_edge_rule_apply_total",
-			Help: "Edge-rule apply-path outcomes, labelled by kind and result (success|error). ADR-091 hardening PR-A.",
+			Help: "Edge-rule apply-path outcomes (success|error), labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind", "result"}),
-		// ADR-091 hardening PR-A — compile-time drops in the cmd-side
-		// loader (path-glob parse / CIDR parse failures). Non-zero means
-		// a rule shipped broken; the §12 dashboard chip "edge rule
-		// compile errors" pages on any increment.
+		// ADR-091 hardening PR-A — compile-time errors caught by
+		// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs. A
+		// non-zero value here means a rule shipped broken and was
+		// silently dropped by the loader; the dashboard chip surfaces
+		// it even when the loader's WARN log is drowned in noise.
 		edgeRuleCompileError: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_edge_rule_compile_error_total",
-			Help: "Edge-rule compile-time failures in the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
+			Help: "Edge-rule compile-time errors caught by the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind"}),
+		// ADR-093 / issue #273 follow-up: per-route observability
+		// counters. The `route` label is admitted through the
+		// per-app routeLabelSet (cap = 50 + __route_other__
+		// overflow). The constructor does NOT pre-instantiate
+		// every (app, route, code) combo because the route label
+		// is unbounded — the routeLabelSet is the cap. The
+		// closed (plan, code) set is pre-instantiated below
+		// under the empty placeholder so the §12 dashboard panel
+		// for opt-in apps surfaces from the first scrape.
+		//
+		// The metric names carry the `_by_route` suffix to keep
+		// them disjoint from the pre-existing {app, plan, code}
+		// `gateway_requests_total` series — Prometheus rejects two
+		// CounterVecs with the same name but different label sets
+		// at registration time. Dashboards consuming
+		// `gateway_requests_by_route_total` etc. read the opt-in
+		// apps' per-route rows; the existing fleet-level
+		// `gateway_requests_total{app, plan, code}` is unchanged.
+		requestsByRoute: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_requests_by_route_total",
+			Help: "Per-route counter (ADR-093). Adds {route} as a 4th label when the app has apps.route_metrics_enabled=true; the per-app ADR-042 view is the same series with route omitted. route is method + raw path (pre-rewrite); admit() collapses wildcard-path overflow into the reserved __route_other__ bucket (cap = 50 per app).",
+		}, []string{"app", "plan", "route", "code"}),
+		durationByRoute: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_request_duration_by_route_seconds",
+			Help: "Per-route duration histogram (ADR-093). Adds {route} as a 3rd label when the app has apps.route_metrics_enabled=true; the per-app ADR-042 view is the same histogram with route omitted. The closed `class` set is pre-instantiated per app per admitted route via PreInstantiateAppRoute.",
+			Buckets: []float64{
+				0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10,
+			},
+		}, []string{"app", "route", "class"}),
+		failuresByRoute: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_request_failures_by_route_total",
+			Help: "Per-route failures counter (ADR-093). Increments on status ≥ 400; the dashboard computes error_rate_pct directly from the ratio to gateway_requests_total. Same route admission as gateway_requests_by_route_total above.",
+		}, []string{"app", "plan", "route", "code"}),
 		wakeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "gateway_wake_latency_seconds",
 			Help: "End-to-end latency from request received to first upstream byte after a cold wake.",
@@ -393,6 +486,19 @@ func NewMetrics() *Metrics {
 				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
 			},
 		}),
+		// PR #4 / ADR-092 §3.5. Same bucket layout as wakeLatency
+		// — same distribution, same SLO targets — just labelled
+		// by node_id so the per-node p95/p99 surfaces. Do NOT
+		// change the existing unlabeled histogram's buckets
+		// without re-running the §12 fleet p95 calibration; the
+		// new histogram is opt-in and not part of any SLO.
+		wakeLatencyByNode: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_wake_latency_seconds_by_node",
+			Help: "Per-node wake latency (operator-side only; the unlabeled gateway_wake_latency_seconds remains the §12 fleet p95 source). ADR-092 §3.5. node_id is the compute_nodes.id UUID; the obs handler resolves id to name via ListComputeNodes.",
+			Buckets: []float64{
+				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
+			},
+		}, []string{"node_id"}),
 		// Spec §12 row "wake queue wait p95". Observed by WakeGate.Wait
 		// on every caller that joins a single-flight coalescing wake. The
 		// leader (the request that actually triggers the wake) reads near
@@ -410,10 +516,42 @@ func NewMetrics() *Metrics {
 				0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
 			},
 		}),
+		// ADR-098 C11: phase-decomposed wake telemetry. Sibling of
+		// wakeLatency (gateway_wake_latency_seconds). The aggregate
+		// histogram stays byte-identical to pre-C11 buckets — that
+		// series is the §12 SLO source-of-truth (p50 ≤ 0.35 s,
+		// p95 ≤ 0.8 s). This vector adds the recovery dimension
+		// when a regression fires: phase ∈ {"queue_wait",
+		// "coordinator_wait", "schedd_admit", "vmmd_wake",
+		// "guest_ready", "cold_fallback_reason"}. Phases are
+		// labelled by the emit site, not the boundary, so a stalled
+		// coordinator shows up as coordinator_wait tail, not as a
+		// generic wake latency regression.
+		//
+		// Pre-instantiated below with the closed phase set so the
+		// §12 panel surfaces zero on an idle gateway.
+		wakePhaseDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_wake_phase_duration_seconds",
+			Help: "Phase-decomposed wake latency (ADR-098 C11). Each phase is observed once per request at the boundary it measures. The aggregate gateway_wake_latency_seconds is unchanged.",
+			// Same bucket envelope as wakeLatency so the dashboards
+			// can compare phase histograms to the aggregate without
+			// re-bucketing.
+			Buckets: []float64{
+				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
+			},
+		}, []string{"phase"}),
 		queueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "gateway_queue_depth",
 			Help: "Current number of waiters per app's wake queue (sampled).",
 		}, []string{"app"}),
+		// ADR-098 C7: closed-set reasons pre-instantiated so the
+		// §12 dashboard chip "leader bootstrap aborts" surfaces
+		// zero rows from boot. Adding a new reason is a code +
+		// dashboard change.
+		leaderBootstrapAborts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_leader_bootstrap_aborts_total",
+			Help: "Detached leader goroutine aborts on the bootstrap cap, labelled by reason (queue_empty_no_instance|ttl_expired|app_deleted). ADR-098 C7.",
+		}, []string{"reason"}),
 		rateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_rate_limited_total",
 			Help: "Requests rejected by the per-app rate limiter.",
@@ -699,25 +837,13 @@ func NewMetrics() *Metrics {
 	// triple. The closed set guarantees the §12 dashboard panel
 	// "edge rule match rate" surfaces every (kind, outcome)
 	// tuple from first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate"} {
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit"} {
 		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
 	}
 	for _, outcome := range []string{"match", "miss", "blocked", "failed", "missing"} {
 		m.edgeRuleMatch.WithLabelValues("jwt", outcome)
-	}
-	// ADR-091 hardening PR-A — pre-instantiate the apply-path
-	// (kind, result) and compile-error (kind) label sets so the §12
-	// dashboard chip "edge rule apply rate" + "edge rule compile
-	// errors" surface every tuple from first scrape. Adding a new
-	// kind (e.g. kind=rate_limit per ADR-091 D20.5) requires
-	// extending the outer slice below — the metric name is stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
-		for _, result := range []string{"success", "error"} {
-			m.edgeRuleApply.WithLabelValues(kind, result)
-		}
-		m.edgeRuleCompileError.WithLabelValues(kind)
 	}
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)
@@ -731,6 +857,13 @@ func NewMetrics() *Metrics {
 	// stays stable.
 	for _, tier := range []string{tierWarm, tierInit, tierCold} {
 		m.wakeSnapshotTier.WithLabelValues(tier)
+	}
+	// ADR-098 C7: pre-instantiate the closed (reason) set on the
+	// leader-bootstrap-aborts counter so the §12 dashboard chip
+	// "leader bootstrap aborts" surfaces every reason from boot.
+	// Adding a new reason is a code + dashboard change.
+	for _, reason := range []string{"queue_empty_no_instance", "ttl_expired", "app_deleted"} {
+		m.leaderBootstrapAborts.WithLabelValues(reason)
 	}
 	// ADR-024 H3 follow-up (Finding 2): pre-instantiate the closed
 	// (result) set on the walk-completeness counter so the §12
@@ -751,7 +884,37 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.streamActive.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError,
+	// PR #4 doesn't touch the edge-rule label set, but the
+	// ADR-091 hardening PR-A pre-instantiation must remain present
+	// so the §12 dashboard chip "edge rule apply rate" + "edge rule
+	// compile errors" surface every tuple from first scrape. Closed
+	// set: {route, rewrite, redirect, headers, cors, jwt, ip}. Adding
+	// a new kind requires extending this slice — the metric name is
+	// stable.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit"} {
+		for _, result := range []string{"success", "error"} {
+			m.edgeRuleApply.WithLabelValues(kind, result)
+		}
+		m.edgeRuleCompileError.WithLabelValues(kind)
+	}
+	// ADR-098 C11: pre-instantiate the closed phase set so the §12
+	// panel reads zero on an idle gateway. queue_wait is the
+	// legacy scalar (gateway_wake_queue_wait_seconds) folded into
+	// a labelled histogram here; the scalar stays for one release
+	// per the dual-write plan. coordinator_wait is the per-app
+	// wake-coordinator spin-up at schedd. schedd_admit is the
+	// schedd.EnsureWake RPC. vmmd_wake is the vmmd.Wake RPC
+	// latency. guest_ready is the framework-ready handshake
+	// stamp propagation. cold_fallback_reason is the wake that
+	// fell through to cold boot — labelled to match the vmmd
+	// result enum (closed set).
+	for _, phase := range []string{
+		"queue_wait", "coordinator_wait", "schedd_admit",
+		"vmmd_wake", "guest_ready", "cold_fallback_reason",
+	} {
+		m.wakePhaseDuration.WithLabelValues(phase)
+	}
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts,
 		// Issue #676 / ADR-080 follow-up, PR-B: raw-bytes Upgrade
 		// / WebSocket observability surface. Registered alongside
 		// the rest of the gateway_* series so the §12 dashboard
@@ -874,6 +1037,63 @@ func (m *Metrics) PreInstantiateApp(appID string) {
 	}
 }
 
+// ObserveRequestRoute records one per-route counter increment for
+// opt-in apps (ADR-093 / issue #273 follow-up to ADR-042 §1). The
+// caller (Handler.observe) is responsible for routing the call
+// here only when the app's RouteMetricsEnabled flag is true AND
+// the operator kill-switch is enabled — the metrics graph
+// itself is shared and accepts every label. nil-receiver safe
+// (mirrors ObserveRequestDuration). The route argument is the
+// post-admit value (caller routed through routeLabelSet so the
+// caller has already paid the cap check); passing the pre-admit
+// string would create a way to bypass the cap.
+func (m *Metrics) ObserveRequestRoute(appID, plan, route, code string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.requestsByRoute.WithLabelValues(appID, plan, route, code).Inc()
+}
+
+// ObserveRequestDurationRoute records the per-route histogram
+// observation. Caller-routed through routeLabelSet on the
+// routeLabelSet side (same module-private pointer); nil-receiver
+// safe.
+func (m *Metrics) ObserveRequestDurationRoute(appID, route, class string, d time.Duration) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.durationByRoute.WithLabelValues(appID, route, class).Observe(d.Seconds())
+}
+
+// RequestFailureRoute records one per-route failure counter
+// increment for opt-in apps. Mirrors the existing per-app
+// gateway_requests_total{code} reader pattern; the dashboard
+// computes error_rate_pct as the ratio of this counter to
+// ObserveRequestRoute for the same (app, route). Caller-routed
+// through routeLabelSet. nil-receiver safe.
+func (m *Metrics) RequestFailureRoute(appID, plan, route, code string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.failuresByRoute.WithLabelValues(appID, plan, route, code).Inc()
+}
+
+// PreInstantiateAppRoute writes zero-valued series for the
+// closed (class) set under (appID, route) so dashboards surface
+// from the first request rather than after the first observation
+// (ADR-093 D4). The closed class set is the same as
+// PreInstantiateApp above (2xx/3xx/4xx/5xx). Caller-routed
+// through routeLabelSet — the route argument is post-admit, so
+// the cap is enforced before this is called. nil-receiver safe.
+func (m *Metrics) PreInstantiateAppRoute(appID, route string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
+		m.durationByRoute.WithLabelValues(appID, route, class)
+	}
+}
+
 // ObserveRateLimit records a 429 outcome.
 func (m *Metrics) ObserveRateLimit(appID, plan string) {
 	m.rateLimited.WithLabelValues(appID, plan).Inc()
@@ -906,19 +1126,67 @@ func (m *Metrics) ObserveAccountRateLimit(accountID, plan string) {
 // the wake latency (request-received to first upstream byte). Issue #273 /
 // ADR-042 renamed from ObserveColdWake; the gateway_cold_wake_total →
 // gateway_cold_boot_total rename is intentional and not dual-emitted.
-func (m *Metrics) ObserveColdBoot(appID string, latency time.Duration) {
+//
+// PR #4 (ADR-092 §3.5) also observes the labelled per-node histogram
+// `gateway_wake_latency_seconds_by_node`. The label value is the
+// compute_node.id (UUID) — gatewayd-internal has no name cache on
+// the wake path, and id is the durable shard key. nodeID=="" is
+// possible only on a wake that lost its target (parked mid-wake);
+// the labelled bucket "__unknown" preserves the observation
+// without polluting the per-node quantiles — the unknown bucket
+// is excluded from per-node PromQL by the obsNodeWakeLatency
+// handler's matcher.
+
+// ObserveLeaderBootstrapAbort (ADR-098 C7) records a detached-leader
+// goroutine abort under the bootstrap cap. Closed (reason) set
+// pre-instantiated in NewMetrics; nil-safe on the receiver.
+func (m *Metrics) ObserveLeaderBootstrapAbort(reason string) {
+	if m == nil {
+		return
+	}
+	m.leaderBootstrapAborts.WithLabelValues(reason).Inc()
+}
+
+func (m *Metrics) ObserveColdBoot(appID string, latency time.Duration, nodeID string) {
 	m.coldBoot.WithLabelValues(appID).Inc()
 	m.wakeLatency.Observe(latency.Seconds())
+	if m.wakeLatencyByNode == nil {
+		return
+	}
+	label := nodeID
+	if label == "" {
+		label = "__unknown"
+	}
+	m.wakeLatencyByNode.WithLabelValues(label).Observe(latency.Seconds())
 }
 
 // ObserveWakeQueueWait records how long a request waited in the
 // per-app wake queue before the gate released it (single-flight
 // coalescing). Nil-safe so WakeGate can call it without branching.
+//
+// Deprecated: also observed via gateway_wake_phase_duration_seconds{phase="queue_wait"}.
+// The scalar here stays for one release — dashboards migrate in
+// the follow-up. ADR-098 C11.
 func (m *Metrics) ObserveWakeQueueWait(d time.Duration) {
 	if m == nil {
 		return
 	}
 	m.wakeQueueWait.Observe(d.Seconds())
+	// ADR-098 C11: dual-write into the labelled phase histogram so
+	// dashboards querying the new name see the same series shape.
+	m.wakePhaseDuration.WithLabelValues("queue_wait").Observe(d.Seconds())
+}
+
+// ObserveWakePhase records a single phase-decomposed wake boundary
+// measurement (ADR-098 C11). phase ∈ {"queue_wait", "coordinator_wait",
+// "schedd_admit", "vmmd_wake", "guest_ready", "cold_fallback_reason"}.
+// Closed set is pre-instantiated in NewMetrics. Nil-safe so the
+// gateway hot path doesn't branch.
+func (m *Metrics) ObserveWakePhase(phase string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.wakePhaseDuration.WithLabelValues(phase).Observe(d.Seconds())
 }
 
 // ObserveWakeLocality increments the wake-locality counter for the
@@ -960,13 +1228,13 @@ func (m *Metrics) ObserveEdgeRuleMatch(kind, outcome string) {
 }
 
 // ObserveEdgeRuleApply (ADR-091 hardening PR-A) increments the
-// apply-path counter after an applyEdgeRule* helper returns.
-// kind is one of the seven shipped kinds; result is the closed
-// {success, error} set. Callers MUST invoke this on every apply
-// return so the §12 dashboard chip "edge rule apply rate" tracks
-// every gate, including the no-op ones (apply returned false but
-// "success" — e.g. JWT verify returned claims with no error).
-// Nil-receiver-safe: tests that don't thread metrics still pass.
+// apply-path counter. kind is the EdgeRuleKind; result is one of
+// {success, error}. Distinct from ObserveEdgeRuleMatch, which counts
+// the matcher's pick — a rule can match and still fail at apply time.
+// Nil-safe so the Handler hot path doesn't need a nil guard. PR #4
+// does not extend the result set; future error subclasses (e.g.
+// "jwks_expired", "ip_empty") require a new metric to keep cardinality
+// bounded (the §12 panel queries on {result=success}/{result=error}).
 func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
 	if m == nil {
 		return
@@ -974,12 +1242,12 @@ func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
 	m.edgeRuleApply.WithLabelValues(kind, result).Inc()
 }
 
-// ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments
-// the compile-error counter from the cmd-side loader at every
-// path-glob / CIDR parse drop inside warnPathGlobErrs. The
-// pre-instantiated {kind} label set means any non-zero scrape
-// value pages the operator — a rule shipped broken is an
-// actionable correctness signal, not a headroom signal.
+// ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments the
+// compile-time error counter. Called from
+// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs when a rule's
+// glob/path/CIDR failed to parse at boot. kind is one of the seven
+// shipped kinds; the loader dropped the offending rule and is serving
+// traffic without it. Nil-safe so the loader doesn't need a nil guard.
 func (m *Metrics) ObserveEdgeRuleCompileError(kind string) {
 	if m == nil {
 		return

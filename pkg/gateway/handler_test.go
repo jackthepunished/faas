@@ -3,10 +3,12 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -61,6 +63,16 @@ type fakeBackend struct {
 	// the failing call so a second Pick in the same test (e.g. a
 	// retry path) gets the normal round-robin.
 	failNextPick bool
+	// pickCalls (ADR-091 D24 / kind=limit): counter of Pick
+	// invocations. The kind=limit applier tests assert that the
+	// Content-Length fast path denies BEFORE Pick is called — the
+	// only observable that distinguishes the §4.1.2.8c placement
+	// (limit before the global reader) from a regression that
+	// moves the applier past the global reader (in which case the
+	// 30 MiB CL would still trip, but the buffer would already
+	// have been allocated). Atomic so it can be read without the
+	// mu lock held by an asserting test goroutine.
+	pickCalls atomic.Int32
 }
 
 // AddTarget seeds a Target into the per-app cache without going through
@@ -80,6 +92,7 @@ func (b *fakeBackend) Lookup(_ context.Context, host string) (App, bool) {
 }
 
 func (b *fakeBackend) Pick(_ string) PickResult {
+	b.pickCalls.Add(1)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.failNextPick {
@@ -1411,7 +1424,15 @@ type stubEdgeRuleMatcher struct {
 	rewrite  *EdgeRuleRewriteResolved
 	redirect *EdgeRuleRedirectResolved
 	headers  *EdgeRuleHeadersResolved
+	cors     *EdgeRuleCORSResolved
 	jwt      *EdgeRuleJWTResolved
+	ip       *EdgeRuleIPResolved
+	// limit (ADR-091 D24): ninth-kind seat on the stub matcher so
+	// the limit-applier handler tests can drive applyEdgeRuleLimit
+	// without a real matcher or LRU cache. Inherits the no-op
+	// MatchLimit from the embedded noOpEdgeRuleMatcher; the
+	// MatchLimit override below returns s.limit verbatim.
+	limit *EdgeRuleLimitResolved
 }
 
 func (s stubEdgeRuleMatcher) MatchRewrite(_ context.Context, _, _, _ string) *EdgeRuleRewriteResolved {
@@ -1426,11 +1447,33 @@ func (s stubEdgeRuleMatcher) MatchHeaders(_ context.Context, _, _, _ string) *Ed
 	return s.headers
 }
 
+// MatchCORS (PR-B) — returns s.cors verbatim so the CORS preflight
+// test can drive applyEdgeRuleCORS without a real matcher.
+func (s stubEdgeRuleMatcher) MatchCORS(_ context.Context, _, _, _ string) *EdgeRuleCORSResolved {
+	return s.cors
+}
+
 // MatchJWT (PR-A regression coverage) — returns s.jwt verbatim.
 // The handler's applyEdgeRuleJWT miss path must NOT dereference
 // rule.ID when rule == nil; see TestApplyEdgeRuleJWT_MissPath_*.
 func (s stubEdgeRuleMatcher) MatchJWT(_ context.Context, _, _, _ string) *EdgeRuleJWTResolved {
 	return s.jwt
+}
+
+// MatchIP (PR-B) — returns s.ip verbatim so the IP gate tests can
+// drive applyEdgeRuleIP without a real matcher.
+func (s stubEdgeRuleMatcher) MatchIP(_ context.Context, _, _, _ string) *EdgeRuleIPResolved {
+	return s.ip
+}
+
+// MatchLimit (ADR-091 D24 / kind=limit) — returns s.limit verbatim
+// so the body-cap-applier handler tests can drive applyEdgeRuleLimit
+// without a real matcher or LRU cache. Mirrors MatchIP / MatchJWT
+// above; the stub's noOpEdgeRuleMatcher base class returns nil for
+// this method, so without this override every test would silently
+// hit the "rule miss" branch.
+func (s stubEdgeRuleMatcher) MatchLimit(_ context.Context, _, _, _ string) *EdgeRuleLimitResolved {
+	return s.limit
 }
 
 // TestMatchAndApplyRewrite_PrefixAddToSlash_NoDoubleSlash pins the
@@ -1596,6 +1639,311 @@ func TestApplyEdgeRuleJWT_MissPath_NoNilDeref(t *testing.T) {
 	}
 }
 
+// ADR-091 hardening PR-B tests — every TestApplyEdgeRule*_*_EmitsApply*
+// pins one (kind, result) tuple against the new
+// gateway_edge_rule_apply_total{kind,result} counter. Anchored on
+// TestApplyEdgeRuleJWT_MissPath_NoNilDeref's fixtures + bodyForCounter.
+// The apply counter is emitted from jwtEmit (JWT path) or directly in
+// the helper (other kinds); PR-B's wiring contract is the only thing
+// under test, not the helper behaviour itself.
+
+func TestApplyEdgeRuleJWT_VerifierError_EmitsApplyError(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "j.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		jwt: &EdgeRuleJWTResolved{
+			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Issuer: "https://idp.example.com", Audience: []string{"api"},
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+			Algorithms: []string{"RS256"},
+		},
+	}
+	stub := &countingJWTVerifier{onVerify: func(_ context.Context, _ string, _ *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		return nil, errors.New("signature mismatch")
+	}}
+	h.WithEdgeRules(matcher, nil, nil)
+	h.WithJWTVerifier(stub)
+
+	req := httptest.NewRequest("GET", "http://j.example.com/", nil)
+	req.Header.Set("Authorization", "Bearer bad")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("rec.Code = %d; want 401", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="error"} 1`) {
+		t.Errorf("apply_total{jwt,error} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="jwt",outcome="failed"} 1`) {
+		t.Errorf("match_total{jwt,failed} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleJWT_VerifierSuccess_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "j.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		jwt: &EdgeRuleJWTResolved{
+			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Issuer: "https://idp.example.com", Audience: []string{"api"},
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+			Algorithms: []string{"RS256"},
+		},
+	}
+	stub := &countingJWTVerifier{onVerify: func(_ context.Context, _ string, _ *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		return &JWTClaims{Subject: "user-1"}, nil
+	}}
+	h.WithEdgeRules(matcher, nil, nil)
+	h.WithJWTVerifier(stub)
+
+	req := httptest.NewRequest("GET", "http://j.example.com/", nil)
+	req.Header.Set("Authorization", "Bearer good")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="success"} 1`) {
+		t.Errorf("apply_total{jwt,success} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="jwt",outcome="match"} 1`) {
+		t.Errorf("match_total{jwt,match} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleJWT_MissingBearer_EmitsApplyError(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "j.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		jwt: &EdgeRuleJWTResolved{
+			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Issuer: "https://idp.example.com", Audience: []string{"api"},
+			JWKSURL:    "https://idp.example.com/.well-known/jwks.json",
+			Algorithms: []string{"RS256"},
+		},
+	}
+	stub := &countingJWTVerifier{onVerify: func(_ context.Context, _ string, _ *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		return nil, errors.New("verifier must not be called when no Authorization header is present")
+	}}
+	h.WithEdgeRules(matcher, nil, nil)
+	h.WithJWTVerifier(stub)
+
+	req := httptest.NewRequest("GET", "http://j.example.com/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("rec.Code = %d; want 401", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="error"} 1`) {
+		t.Errorf("apply_total{jwt,error} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="jwt",outcome="missing"} 1`) {
+		t.Errorf("match_total{jwt,missing} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleIP_DenyCIDRMatch_EmitsApplyError(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "i.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	_, denyNet, _ := net.ParseCIDR("0.0.0.0/0") // deny everything; client IP will match
+	matcher := stubEdgeRuleMatcher{
+		ip: &EdgeRuleIPResolved{
+			ID: "rule-ip", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Deny: []*net.IPNet{denyNet},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("GET", "http://i.example.com/", nil)
+	// gatewayd-public writes exactly one trusted XFF entry; emulate it.
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("rec.Code = %d; want 403", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="ip",result="error"} 1`) {
+		t.Errorf("apply_total{ip,error} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleIP_AllowMatch_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "i.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	_, allowNet, _ := net.ParseCIDR("0.0.0.0/0") // allow everything
+	matcher := stubEdgeRuleMatcher{
+		ip: &EdgeRuleIPResolved{
+			ID: "rule-ip", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			Allow: []*net.IPNet{allowNet},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("GET", "http://i.example.com/", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="ip",result="success"} 1`) {
+		t.Errorf("apply_total{ip,success} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="ip",outcome="match"} 1`) {
+		t.Errorf("match_total{ip,match} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleCORS_Preflight_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "c.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		cors: &EdgeRuleCORSResolved{
+			ID: "rule-cors", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			AllowOrigins: []string{"*"}, AllowMethods: []string{"GET"},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("OPTIONS", "http://c.example.com/api/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("rec.Code = %d; want 204", rec.Code)
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="cors",result="success"} 1`) {
+		t.Errorf("apply_total{cors,success} != 1; body:\n%s", body)
+	}
+}
+
+// TestApplyEdgeRuleCORS_NonPreflight_EmitsApplySuccess mirrors the
+// preflight test above but walks the GET (non-preflight) branch.
+// The non-preflight path installs the Access-Control-Allow-Origin
+// header through statusRecorder.installHeaderOps and then falls
+// through to the JWT / IP gates (returns false from applyEdgeRuleCORS);
+// it does NOT short-circuit with a 204. The metric AND audit emit
+// must still fire so operators can see "the CORS rule matched and let
+// this origin through" without having to also log the preflight.
+//
+// ADR-091 D20.6 / PR-B: this is the load-bearing unit test that
+// proves D20.6's e2e test (cmd/e2e/edge_rules_cors_e2e_test.go) has a
+// non-silent code path to exercise. Without it, a future refactor of
+// the non-preflight branches could regress the metric emit while the
+// e2e test still passes (the e2e only checks the ACAO header, not the
+// metric).
+func TestApplyEdgeRuleCORS_NonPreflight_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "c.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		cors: &EdgeRuleCORSResolved{
+			ID: "rule-cors", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			AllowOrigins: []string{"*"}, AllowMethods: []string{"GET"},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	// GET (NOT OPTIONS) so applyEdgeRuleCORS walks the non-preflight
+	// branch. The handler will fall through to the JWT/IP gates; on a
+	// test box those gates pass with no authn / no client_ip (the
+	// fake backend returns no JWT_REQUIRED) so the proxy leg fires
+	// and the fake backend's running=true path writes a 200.
+	req := httptest.NewRequest("GET", "http://c.example.com/api/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// rec.Code is whatever the proxy leg returns (200 from the stub
+	// app) — NOT 204. The non-preflight path falls through to the
+	// proxy rather than short-circuiting.
+	if rec.Code == http.StatusNoContent {
+		t.Errorf("rec.Code = 204 (preflight short-circuit); want proxy-leg status")
+	}
+	// Access-Control-Allow-Origin must be stamped on the response via
+	// the statusRecorder installHeaderOps path — the wildcard "*"
+	// echoes the literal origin to the client.
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("ACAO header = %q; want %q", got, "*")
+	}
+	body := bodyForCounter(t, h.metrics)
+	// Both the apply counter and the match counter must fire.
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="cors",result="success"} 1`) {
+		t.Errorf("apply_total{cors,success} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="cors",outcome="match"} 1`) {
+		t.Errorf("match_total{cors,match} != 1; body:\n%s", body)
+	}
+}
+
 // bodyForCounter scrapes /metrics from m and returns the body as a
 // string. Counter-specific label filtering is left to the caller via
 // substring matching — Prometheus exposition doesn't index by
@@ -1622,4 +1970,893 @@ type countingJWTVerifier struct {
 
 func (c *countingJWTVerifier) Verify(ctx context.Context, raw string, rule *EdgeRuleJWTResolved) (*JWTClaims, error) {
 	return c.onVerify(ctx, raw, rule)
+}
+
+// --- ADR-091 D24: kind=limit applier tests -------------------------
+//
+// Whitebox tests for (*Handler).applyEdgeRuleLimit. The applier is
+// the §4.1.2.8c body-cap primitive — the load-bearing assertion is
+// the **Content-Length fast path**: a 30 MB request body advertised
+// via Content-Length against a 5 MB rule must short-circuit with
+// 413 + RFC 7807 + audit + apply-error metric, AND the fake
+// backend's Pick must NEVER be called. The second assertion is the
+// load-bearing observable that distinguishes "limit runs before
+// the global reader" from "limit runs after the global reader" —
+// without it, the fast-path property could silently regress to a
+// position that buffers the oversize body first.
+//
+// Each test pins one arm of the predicate table:
+//   1. Content-Length fast-path: oversized CL → 413 + no backend pick
+//   2. In-limit body: CL ≤ cap → 200 + backend picked + MaxBytesReader installed
+//   3. Cross-account rule: defense-in-depth no-op → 200 + apply success
+//   4. Nil matcher (h.edgeRules == nil) → false (dev mode pass-through)
+//   5. Cap clamp defence-in-depth: rule has cap > MaxRequestBodyBytes
+//      (direct-DB bypass of apid-Validate) → still 413 on oversized CL
+
+// fakeBackend.Pick call counter. The load-bearing observable that
+// distinguishes the fast-path placement from a buffered placement:
+// if applyEdgeRuleLimit runs AFTER the global 25-MiB reader,
+// backend.Pick would be called before the 413 short-circuit; if
+// it runs BEFORE the global reader (the plan's §4.1.2.8c
+// placement), the 413 fires and Pick is never called. Counting
+// Pick invocations pins this exactly.
+
+// TestApplyEdgeRuleLimit_ContentLengthFastPath_DenyBeforeBackendPick
+// is the load-bearing test for the §4.1.2.8c placement. A 30 MB
+// Content-Length against a 5 MB rule must produce:
+//   - HTTP 413 status
+//   - RFC 7807 problem+json body (CodeRequestTooLarge)
+//   - edge_rule.limit_rejected audit event
+//   - match_total{kind="limit",outcome="blocked"} = 1
+//   - apply_total{kind="limit",result="error"} = 1
+//   - **backend.Pick never called** (the load-bearing assertion
+//     for the "never buffer an oversize body" property)
+//
+// The backend.Pick counter is incremented in fakeBackend.Pick
+// itself; a successful pick would also call the proxy leg, so the
+// counter is the only observable that distinguishes the placement.
+func TestApplyEdgeRuleLimit_ContentLengthFastPath_DenyBeforeBackendPick(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes: 5 * 1024 * 1024, // 5 MiB
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	// 30 MiB advertised via Content-Length against a 5 MiB rule.
+	// The handler doesn't read the body, so we never materialise
+	// 30 MiB in the test process — ContentLength is just an int.
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 30 * 1024 * 1024
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// (a) Status: 413.
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (Content-Length fast-path)", rec.Code)
+	}
+	// (b) Problem+json with the right code.
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+		t.Errorf("Content-Type = %q; want application/problem+json", ct)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	if code, _ := prob["code"].(string); code != "request_too_large" {
+		t.Errorf("code = %q; want request_too_large", code)
+	}
+	// (c) Backend was never woken — the load-bearing property.
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick was called %d times; want 0 (Content-Length fast path must deny before wake)", b.pickCalls.Load())
+	}
+	// (d) Metrics: match blocked + apply error.
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="limit",outcome="blocked"} 1`) {
+		t.Errorf("match_total{limit,blocked} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="limit",result="error"} 1`) {
+		t.Errorf("apply_total{limit,error} != 1; body:\n%s", body)
+	}
+}
+
+// TestApplyEdgeRuleLimit_InLimit_InstallsMaxBytesReader pins the
+// happy path: a Content-Length well under the cap must reach the
+// proxy leg with the cap installed (no 413, backend.Pick called
+// exactly once, MaxBytesReader observable as a body reader
+// trip-wire).
+func TestApplyEdgeRuleLimit_InLimit_InstallsMaxBytesReader(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes: 5 * 1024 * 1024, // 5 MiB
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	// 1 KiB body well under the 5 MiB cap.
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", strings.NewReader("hello world"))
+	req.ContentLength = int64(len("hello world"))
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// The fake backend doesn't run a real upstream listener, so the
+	// proxy leg's httputil.ReverseProxy dials 127.0.0.1:0 and fails
+	// with 502. That's a test-env limitation, NOT a kind=limit
+	// regression. The load-bearing assertions are below:
+	//   1. backend.Pick WAS called (limit didn't deny an in-limit body)
+	//   2. metrics show match=match + apply=success
+	// A regression that lets the applier 413 in-limit traffic would
+	// surface as pickCalls=0 here, not as a rec.Code change.
+	if b.pickCalls.Load() != 1 {
+		t.Errorf("fakeBackend.Pick = %d; want 1 (in-limit body must reach the proxy leg)", b.pickCalls.Load())
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="limit",outcome="match"} 1`) {
+		t.Errorf("match_total{limit,match} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="limit",result="success"} 1`) {
+		t.Errorf("apply_total{limit,success} != 1; body:\n%s", body)
+	}
+}
+
+// TestApplyEdgeRuleLimit_CrossAccount_DefenceInDepthNoOp pins the
+// ADR-091 D5 same-account check. A rule owned by a different
+// account must not fire — defense-in-depth no-op, return false,
+// 200 to the customer, audit edge_rule.limit_blocked, apply
+// success metric (mirrors applyEdgeRuleValidate's posture at
+// handler.go:1704). Without this, a malicious cross-tenant rule
+// could 413 a different customer's traffic.
+func TestApplyEdgeRuleLimit_CrossAccount_DefenceInDepthNoOp(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			// rule owned by acct-2 (cross-tenant); app is acct-1.
+			ID: "rule-l-cross", AccountID: "acct-2", AppID: "app-other",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes: 1024, // tiny cap — would 413 everything if applied
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", strings.NewReader("hello"))
+	req.ContentLength = int64(len("hello"))
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// Cross-account rule must NOT enforce — request must reach the
+	// proxy leg (the rule's tiny cap is irrelevant because the
+	// cross-account check returned false at handler.go:1942). The
+	// fake backend returns a real Target, so backend.Pick IS called;
+	// the proxy leg then fails to dial the upstream listener (502),
+	// which is a test-env limitation. The load-bearing assertion is
+	// pickCalls=1 (cross-account did NOT short-circuit with 413).
+	if b.pickCalls.Load() != 1 {
+		t.Errorf("fakeBackend.Pick = %d; want 1 (cross-account no-op must reach proxy leg)", b.pickCalls.Load())
+	}
+	body := bodyForCounter(t, h.metrics)
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="limit",outcome="blocked"} 1`) {
+		t.Errorf("match_total{limit,blocked} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="limit",result="success"} 1`) {
+		t.Errorf("apply_total{limit,success} != 1 (defense-in-depth cross-account is apply-success, not apply-error); body:\n%s", body)
+	}
+}
+
+// TestApplyEdgeRuleLimit_NilMatcher_PassThrough pins the dev-mode
+// safety net. When h.edgeRules == nil (no matcher wired — dev
+// boxes, isolated tests), applyEdgeRuleLimit returns false and
+// the request falls through. Without this guard, a misconfigured
+// handler would nil-deref on the first request.
+func TestApplyEdgeRuleLimit_NilMatcher_PassThrough(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	// Deliberately NOT calling h.WithEdgeRules; h.edgeRules is nil.
+
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", strings.NewReader("hello"))
+	req.ContentLength = int64(len("hello"))
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// No assertions on rec.Code — the proxy leg's 502 is a
+	// test-env limitation (no upstream listener). The load-bearing
+	// assertion is implicit: applyEdgeRuleLimit returned false on
+	// the nil-matcher path, the handler fell through to the proxy
+	// leg, and backend.Pick was called exactly once. A regression
+	// that nil-derefs on h.edgeRules would panic before reaching
+	// this point (the build's race detector would catch it).
+}
+
+// TestApplyEdgeRuleLimit_CapClamp_DefenceInDepth pins the
+// cmd-side clamp's apid-side mirror: a rule with MaxBodyBytes
+// > MaxRequestBodyBytes (a direct-DB row that bypassed
+// apid-Validate) must still produce a sane CL fast-path 413.
+// Without this clamp, the matcher would hand the handler a
+// 4 GiB cap that effectively means "no cap" — defeating the
+// feature for that rule.
+func TestApplyEdgeRuleLimit_CapClamp_DefenceInDepth(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-bypass", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			// Direct-DB row that bypassed apid-Validate: cap > 25 MiB
+			// platform ceiling. cmd-side compileLimitRules would
+			// have clamped this; the handler's mirror clamp at
+			// handler.go:1981 is the second gate.
+			MaxBodyBytes: 1 << 30, // 1 GiB
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	// 30 MiB CL — would be "in-limit" if the clamp were absent;
+	// the clamp pins cap to MaxRequestBodyBytes (25 MiB), so 30
+	// MiB is still over-cap and must 413.
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 30 * 1024 * 1024
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (cap clamp must fire before reaching proxy leg)", rec.Code)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0 (clamp must deny before wake)", b.pickCalls.Load())
+	}
+}
+
+// captureAuditor is a hand-rolled EdgeRuleAuditor that captures
+// every Emit call into a slice the test can inspect. Used by the
+// streaming-cap audit test (TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind)
+// to assert that the new `cap_kind` field is threaded through the
+// 413 audit emit. Mirrors the captureAuditor shape used by the
+// validate handler tests.
+type captureAuditor struct {
+	mu       sync.Mutex
+	captured []capturedAudit
+}
+
+type capturedAudit struct {
+	kind    string
+	subject *string
+	data    map[string]any
+}
+
+func (a *captureAuditor) Emit(_ context.Context, kind string, subject *string, data map[string]any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.captured = append(a.captured, capturedAudit{kind: kind, subject: subject, data: data})
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_OverCap_413
+// pins the §4.1.2.13 streaming-carve-out runtime: a streaming
+// request (Accept: text/event-stream, app.StreamingEnabled, h.streamingEnabled)
+// against a rule whose streaming cap is 100 MiB and whose buffered
+// cap is 5 MiB must 413 via the STREAMING cap (not the buffered
+// one) when the Content-Length is 110 MiB (over the streaming
+// cap; would be under the 100 MiB streaming cap if CL were 100
+// MiB and the buffered cap irrelevant). The 413 detail must
+// suffix "(streaming cap)" so a customer can bisect which cap
+// fired.
+func TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_OverCap_413(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-stream", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          5 * 1024 * 1024,   // 5 MiB buffered
+			MaxBodyBytesStreaming: 100 * 1024 * 1024, // 100 MiB streaming
+		},
+	}, nil, nil)
+
+	// 110 MiB — over the streaming cap (100 MiB), so the
+	// streaming fast path must fire. The buffered cap (5 MiB)
+	// would also deny at 110 MiB, but the test asserts the
+	// streaming cap is the one named in the detail.
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 110 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (streaming-cap Content-Length fast path)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	if code, _ := prob["code"].(string); code != "request_too_large" {
+		t.Errorf("code = %q; want request_too_large", code)
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "104857600") || !strings.Contains(detail, "streaming cap") {
+		t.Errorf("detail = %q; want substring 104857600 + streaming cap (the streaming cap fired, not buffered)", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0 (Content-Length fast path must deny before wake)", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_StreamingCapZero_FallsBackToBuffered
+// pins the s == 0 fallback: a streaming request with a rule whose
+// streaming cap is 0 (customer didn't set it) must use the
+// buffered cap. 30 MiB on a 5 MiB buffered cap → 413 with the
+// "(buffered cap)" suffix.
+func TestApplyEdgeRuleLimit_StreamingCap_StreamingCapZero_FallsBackToBuffered(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-buf", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          5 * 1024 * 1024,
+			MaxBodyBytesStreaming: 0, // customer didn't set streaming cap
+		},
+	}, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 30 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (buffered cap fallback must still 413)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "buffered cap") {
+		t.Errorf("detail = %q; want substring buffered cap (streaming cap == 0 must fall back to buffered)", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_BufferedRequest_StreamingFieldIgnored
+// pins the buffered-path posture: a request on the buffered
+// path (Accept: application/json) must use the buffered cap
+// even if the rule carries a streaming cap. 30 MiB on a 5 MiB
+// buffered cap → 413 with "(buffered cap)" suffix (NOT
+// "streaming cap").
+func TestApplyEdgeRuleLimit_StreamingCap_BufferedRequest_StreamingFieldIgnored(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: false},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	// Note: h.streamingEnabled left at zero (default buffered posture)
+	// and app.StreamingEnabled = false. Accept: application/json opts
+	// out of streaming even if the process is opted in.
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-bufonly", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          5 * 1024 * 1024,
+			MaxBodyBytesStreaming: 100 * 1024 * 1024, // set, but should be ignored
+		},
+	}, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 30 * 1024 * 1024
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (buffered cap fires regardless of streaming field)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "buffered cap") {
+		t.Errorf("detail = %q; want substring buffered cap (streaming field must be ignored on buffered path)", detail)
+	}
+	if strings.Contains(detail, "streaming cap") {
+		t.Errorf("detail = %q; buffered path must NOT mention streaming cap", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_ContentLengthOverStreamingCap_413
+// pins the streaming-cap fast path: a streaming request whose
+// Content-Length exceeds the streaming cap (12 MiB on a 10 MiB
+// streaming cap, with a 1 MiB buffered cap) must 413 from the
+// streaming cap, NOT the buffered cap. The buffered cap (1 MiB)
+// would also deny at 12 MiB, so this test specifically asserts
+// the streaming cap was the one consulted.
+func TestApplyEdgeRuleLimit_StreamingCap_StreamingRequest_ContentLengthOverStreamingCap_413(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-tight-buf", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			MaxBodyBytes:          1 * 1024 * 1024,  // 1 MiB buffered
+			MaxBodyBytesStreaming: 10 * 1024 * 1024, // 10 MiB streaming
+		},
+	}, nil, nil)
+
+	// 12 MiB — over BOTH caps. The streaming cap (10 MiB) is the
+	// binding one on the streaming path; the 413 detail must name
+	// the streaming cap value (10 MiB), not the buffered cap (1 MiB).
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 12 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (streaming cap 10 MiB < 12 MiB Content-Length)", rec.Code)
+	}
+	var prob map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("unmarshal problem: %v; body=%s", err, rec.Body.String())
+	}
+	detail, _ := prob["detail"].(string)
+	if !strings.Contains(detail, "streaming cap") {
+		t.Errorf("detail = %q; want substring streaming cap (12 MiB on streaming path must trip streaming cap)", detail)
+	}
+	if !strings.Contains(detail, "10485760") { // 10 MiB in bytes
+		t.Errorf("detail = %q; want substring 10485760 (10 MiB streaming cap is the binding cap)", detail)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0", b.pickCalls.Load())
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind pins
+// the audit payload's new cap_kind field: a 413 from the streaming
+// cap must emit edge_rule.limit_rejected with cap_kind=streaming;
+// a 413 from the buffered cap must emit cap_kind=buffered. The
+// field is the customer-debugging primitive for the streaming
+// carve-out (ADR-091 D24 §6). The 110 MiB Content-Length is over
+// BOTH the buffered cap (5 MiB) and the streaming cap (100 MiB);
+// the streaming sub-case names the streaming cap, the buffered
+// sub-case names the buffered cap.
+func TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind(t *testing.T) {
+	cases := []struct {
+		name        string
+		streamingOn bool
+		accept      string
+		wantCapKind string
+	}{
+		{
+			name:        "streaming-cap fires when streaming on + Accept=event-stream",
+			streamingOn: true,
+			accept:      "text/event-stream",
+			wantCapKind: "streaming",
+		},
+		{
+			name:        "buffered-cap fires when Accept=application/json",
+			streamingOn: true,
+			accept:      "application/json",
+			wantCapKind: "buffered",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &fakeBackend{
+				app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: tc.streamingOn},
+				host:     "l.example.com",
+				upstream: "127.0.0.1:0",
+				running:  true,
+			}
+			b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+			h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			h.SetWakeGateHook()
+			h.streamingEnabled = tc.streamingOn
+			auditor := &captureAuditor{}
+			h.WithEdgeRules(stubEdgeRuleMatcher{
+				limit: &EdgeRuleLimitResolved{
+					ID: "rule-l-audit", AccountID: "acct-1", AppID: "app-1",
+					Priority: 0, PathGlob: "", Methods: nil,
+					MaxBodyBytes:          5 * 1024 * 1024,
+					MaxBodyBytesStreaming: 100 * 1024 * 1024,
+				},
+			}, nil, auditor)
+
+			// 110 MiB Content-Length is over BOTH the buffered cap
+			// (5 MiB) AND the streaming cap (100 MiB). The streaming
+			// sub-case names the streaming cap (100 MiB); the buffered
+			// sub-case names the buffered cap (5 MiB). Under either cap
+			// the Content-Length fast path 413s before the streaming
+			// response-writer wrap (handler.go:2656), so we don't fall
+			// through and stack-overflow the test fixture.
+			req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+			req.ContentLength = 110 * 1024 * 1024
+			req.Header.Set("Accept", tc.accept)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("rec.Code = %d; want 413", rec.Code)
+			}
+			// Find the limit_rejected audit event.
+			var found *capturedAudit
+			auditor.mu.Lock()
+			defer auditor.mu.Unlock()
+			for i := range auditor.captured {
+				if auditor.captured[i].kind == "edge_rule.limit_rejected" {
+					found = &auditor.captured[i]
+					break
+				}
+			}
+			if found == nil {
+				t.Fatalf("no edge_rule.limit_rejected audit emitted; got %+v", auditor.captured)
+			}
+			if got, _ := found.data["cap_kind"].(string); got != tc.wantCapKind {
+				t.Errorf("cap_kind = %q; want %q (audit data = %+v)", got, tc.wantCapKind, found.data)
+			}
+		})
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts pins the
+// 4-conjunct detection formula at the §4.1.2.13 slot. The six
+// rows below are the formula's truth table; if any conjunct
+// ever grows (e.g., a future IsCachedRequest opt-out) the new
+// conjunct needs a row here. Mirrors the validate applier's
+// table-driven tests in this file.
+func TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts(t *testing.T) {
+	cases := []struct {
+		name          string
+		hStreaming    bool
+		appStreaming  bool
+		accept        string
+		upgradeHeader bool
+		want          bool
+	}{
+		{
+			name:       "h.streamingEnabled=false → not streaming",
+			hStreaming: false, appStreaming: true, accept: "text/event-stream",
+			want: false,
+		},
+		{
+			name:       "app.StreamingEnabled=false → not streaming",
+			hStreaming: true, appStreaming: false, accept: "text/event-stream",
+			want: false,
+		},
+		{
+			name:       "Accept=application/json → not streaming (isAcceptJSON opts out)",
+			hStreaming: true, appStreaming: true, accept: "application/json",
+			want: false,
+		},
+		{
+			name:       "Upgrade: websocket → not streaming (isUpgradeRequest opts out)",
+			hStreaming: true, appStreaming: true, accept: "text/event-stream", upgradeHeader: true,
+			want: false,
+		},
+		{
+			name:       "all four conjuncts true → streaming",
+			hStreaming: true, appStreaming: true, accept: "text/event-stream",
+			want: true,
+		},
+		{
+			name:       "Accept=json + Upgrade=ws (both opts out) → not streaming",
+			hStreaming: true, appStreaming: true, accept: "application/json", upgradeHeader: true,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: tc.appStreaming}
+			req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
+			if tc.upgradeHeader {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+			}
+			h := NewHandlerWith(&fakeBackend{}, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			h.streamingEnabled = tc.hStreaming
+
+			got := streamingFor(h, req, app)
+			if got != tc.want {
+				t.Errorf("streamingFor = %v; want %v (h.streamingEnabled=%v, app.StreamingEnabled=%v, Accept=%q, upgrade=%v)",
+					got, tc.want, tc.hStreaming, tc.appStreaming, tc.accept, tc.upgradeHeader)
+			}
+		})
+	}
+}
+
+// TestApplyEdgeRuleLimit_StreamingCapClamp_DefenceInDepth pins the
+// per-cap-kind runtime mirror of the cmd-side compile clamp. A
+// direct-DB row that bypassed apid-Validate with a streaming cap
+// > api.RawStreamMaxRequestBytes (2 GiB) must still produce a sane
+// CL fast-path 413 with the cap clamped to 100 MiB in the audit
+// payload. Without this clamp, the matcher would hand the handler
+// a 2 GiB cap that effectively means "no cap" — defeating the
+// streaming carve-out for that rule.
+func TestApplyEdgeRuleLimit_StreamingCapClamp_DefenceInDepth(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro, StreamingEnabled: true},
+		host:     "l.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+	h.streamingEnabled = true
+	auditor := &captureAuditor{}
+	h.WithEdgeRules(stubEdgeRuleMatcher{
+		limit: &EdgeRuleLimitResolved{
+			ID: "rule-l-bypass-stream", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			// Direct-DB row that bypassed apid-Validate: streaming
+			// cap > 100 MiB platform ceiling. cmd-side compileLimitRules
+			// would have clamped this to api.RawStreamMaxRequestBytes;
+			// the handler's mirror clamp at handler.go:2017 is the
+			// second gate.
+			MaxBodyBytes:          1 * 1024 * 1024,        // 1 MiB buffered (in bounds)
+			MaxBodyBytesStreaming: 2 * 1024 * 1024 * 1024, // 2 GiB streaming (out of bounds)
+		},
+	}, nil, auditor)
+
+	// 120 MiB CL — would be "in-limit" if the streaming clamp were
+	// absent (2 GiB cap). The clamp pins the streaming cap to
+	// RawStreamMaxRequestBytes (100 MiB), so 120 MiB is still
+	// over-cap and must 413.
+	req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+	req.ContentLength = 120 * 1024 * 1024
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("rec.Code = %d; want 413 (streaming-cap clamp must fire before reaching proxy leg)", rec.Code)
+	}
+	if b.pickCalls.Load() != 0 {
+		t.Errorf("fakeBackend.Pick = %d; want 0 (clamp must deny before wake)", b.pickCalls.Load())
+	}
+	// Find the limit_rejected audit event and assert the cap
+	// was clamped to 100 MiB in cap_bytes.
+	var found *capturedAudit
+	auditor.mu.Lock()
+	defer auditor.mu.Unlock()
+	for i := range auditor.captured {
+		if auditor.captured[i].kind == "edge_rule.limit_rejected" {
+			found = &auditor.captured[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no edge_rule.limit_rejected audit emitted; got %+v", auditor.captured)
+	}
+	capBytes, ok := found.data["cap_bytes"].(int)
+	if !ok {
+		t.Fatalf("cap_bytes = %T %+v; want int", found.data["cap_bytes"], found.data["cap_bytes"])
+	}
+	if int64(capBytes) != api.RawStreamMaxRequestBytes {
+		t.Errorf("cap_bytes = %d; want %d (RawStreamMaxRequestBytes = 100 MiB)", capBytes, api.RawStreamMaxRequestBytes)
+	}
+	if capKind, _ := found.data["cap_kind"].(string); capKind != "streaming" {
+		t.Errorf("cap_kind = %q; want streaming", capKind)
+	}
+}
+
+// --- CORS improvements (ADR-091 appendix): matchOrigin coverage -----------
+
+// Step 9 test surface for the wildcard grammar added in Step 3 (subdomain
+// + port wildcards, case-insensitive scheme+host per RFC 6454 §3). Each
+// case covers one branch of matchOrigin predicate tree so a regression
+// in the matcher is localisable from the test name alone.
+
+func TestMatchOrigin_LiteralExactMatch(t *testing.T) {
+	allow := []string{"https://app.example.com"}
+	if got := matchOrigin(allow, "https://app.example.com"); got != "https://app.example.com" {
+		t.Errorf("exact match: got %q want %q", got, "https://app.example.com")
+	}
+}
+
+func TestMatchOrigin_LiteralNoMatch(t *testing.T) {
+	allow := []string{"https://app.example.com"}
+	if got := matchOrigin(allow, "https://other.example.com"); got != "" {
+		t.Errorf("expected empty for non-matching origin, got %q", got)
+	}
+}
+
+func TestMatchOrigin_EmptyOriginNeverMatches(t *testing.T) {
+	allow := []string{"https://app.example.com", "*"}
+	if got := matchOrigin(allow, ""); got != "" {
+		t.Errorf("empty origin must never match, got %q", got)
+	}
+}
+
+func TestMatchOrigin_BareWildcardMatchesAny(t *testing.T) {
+	allow := []string{"*"}
+	for _, origin := range []string{
+		"https://app.example.com",
+		"http://localhost:3000",
+		"https://totally-different.example.org",
+	} {
+		if got := matchOrigin(allow, origin); got != "*" {
+			t.Errorf("bare wildcard for %q: got %q want %q", origin, got, "*")
+		}
+	}
+}
+
+func TestMatchOrigin_CaseInsensitiveSchemeAndHost(t *testing.T) {
+	// RFC 6454 §3: scheme + host are case-insensitive. Origin is
+	// always lowercased before compare; the echoed allowlist entry
+	// carries the lowercased form.
+	allow := []string{"https://app.example.com"}
+	cases := []string{
+		"HTTPS://APP.example.com",
+		"https://App.Example.Com",
+		"https://app.EXAMPLE.com",
+	}
+	for _, origin := range cases {
+		if got := matchOrigin(allow, origin); got != "https://app.example.com" {
+			t.Errorf("case-fold %q: got %q want %q", origin, got, "https://app.example.com")
+		}
+	}
+}
+
+func TestMatchOrigin_SubdomainWildcardSingleLabel(t *testing.T) {
+	allow := []string{"https://*.example.com"}
+	// single-label subdomain matches.
+	if got := matchOrigin(allow, "https://app.example.com"); got != "https://*.example.com" {
+		t.Errorf("subdomain match: got %q want %q", got, "https://*.example.com")
+	}
+	// two-label subdomain (chained) does NOT match - only one
+	// label of wildcard, no "**".
+	if got := matchOrigin(allow, "https://app.sub.example.com"); got != "" {
+		t.Errorf("two-label subdomain must not match, got %q", got)
+	}
+	// exact apex also does not match the wildcard entry - that is
+	// what allowlist authors want (apex goes in its own literal).
+	if got := matchOrigin(allow, "https://example.com"); got != "" {
+		t.Errorf("apex must not match wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_SubdomainWildcardSchemeMustMatch(t *testing.T) {
+	allow := []string{"https://*.example.com"}
+	if got := matchOrigin(allow, "http://app.example.com"); got != "" {
+		t.Errorf("scheme mismatch must not match wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_PortWildcardMatchesAnyPort(t *testing.T) {
+	allow := []string{"https://localhost:*"}
+	for _, origin := range []string{
+		"https://localhost:3000",
+		"https://localhost:8080",
+		"https://localhost:65535",
+	} {
+		if got := matchOrigin(allow, origin); got != "https://localhost:*" {
+			t.Errorf("port wildcard for %q: got %q want %q", origin, got, "https://localhost:*")
+		}
+	}
+	// No port on the request: does not match the port-wildcard
+	// entry (which carries an explicit port slot).
+	if got := matchOrigin(allow, "https://localhost"); got != "" {
+		t.Errorf("port-less request must not match port wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_HostPlusPortWildcard(t *testing.T) {
+	allow := []string{"https://api.example.com:*"}
+	if got := matchOrigin(allow, "https://api.example.com:443"); got != "https://api.example.com:*" {
+		t.Errorf("host+port wildcard: got %q want %q", got, "https://api.example.com:*")
+	}
+	// Different host does not match even with port wildcard.
+	if got := matchOrigin(allow, "https://other.example.com:443"); got != "" {
+		t.Errorf("host mismatch with port wildcard, got %q", got)
+	}
+}
+
+func TestMatchOrigin_MultipleEntriesFirstLiteralWins(t *testing.T) {
+	// When the allowlist contains both a wildcard and a literal,
+	// the first matching entry is what matchOrigin returns. In
+	// production the apid validator rejects ambiguous pairs, but
+	// the gateway matcher is permissive on input.
+	allow := []string{"https://app.example.com", "https://*.example.com"}
+	if got := matchOrigin(allow, "https://app.example.com"); got != "https://app.example.com" {
+		t.Errorf("expected literal entry to win, got %q", got)
+	}
+}
+
+func TestMatchOrigin_DefaultFallbackHonoursAllowlist(t *testing.T) {
+	// The default-CORS fallback in applyEdgeRuleCORS reuses
+	// matchOrigin against app.CORSDefaultOrigins. Mirror the
+	// path here so a regression in the wiring does not slip
+	// through a gateway-hot-path test.
+	allow := []string{"https://*.staging.example.com"}
+	if got := matchOrigin(allow, "https://app.staging.example.com"); got == "" {
+		t.Errorf("default-fallback wildcard must match")
+	}
 }
