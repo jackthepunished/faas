@@ -1617,8 +1617,8 @@ type schedScaleUpEngine struct {
 // AdmitInstance implements scaleup.Engine: delegates to the wrapped
 // engine and lifts the relevant fields into the thinned
 // scaleup.AdmitResult.
-func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID string) (scaleup.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "")
+func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID, scope string) (scaleup.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
 	if err != nil {
 		return scaleup.AdmitResult{}, err
 	}
@@ -1665,8 +1665,8 @@ type schedTargetsEngine struct {
 // the re-observe branch is dead code and the metric loses the
 // per-tick AtCapacity signal that the dashboard's "would have
 // scaled but cap reached" pane depends on.
-func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (targets.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "")
+func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID, scope string) (targets.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
 	if err != nil {
 		return targets.AdmitResult{}, err
 	}
@@ -1704,8 +1704,8 @@ type schedFloorEngine struct {
 }
 
 // AdmitInstance implements floor.Engine.
-func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID, "")
+func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID, scope string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID, "", scope)
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}
@@ -1714,8 +1714,8 @@ func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floo
 
 // AdmitInstanceForDeployment implements floor.Engine (issue #557
 // closure / ADR-074 — per-deployment floor wake).
-func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID)
+func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID, scope)
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}

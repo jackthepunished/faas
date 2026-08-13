@@ -48,7 +48,7 @@ type fakeEngine struct {
 	errs    map[string]error
 }
 
-func (e *fakeEngine) AdmitInstance(_ context.Context, appID string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID)

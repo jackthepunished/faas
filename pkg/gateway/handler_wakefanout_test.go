@@ -76,7 +76,7 @@ func (b *wakefanoutBackend) Pick(_ string) gateway.PickResult {
 
 func (b *wakefanoutBackend) HealthyCount(_ string) int { return 1 }
 
-func (b *wakefanoutBackend) Admit(_ context.Context, _, deploymentID string, _ int) (string, gateway.WakeMethod, bool, error) {
+func (b *wakefanoutBackend) Admit(_ context.Context, _, deploymentID, _ string, _ int) (string, gateway.WakeMethod, bool, error) {
 	b.totalAdmits.Add(1)
 	b.mu.Lock()
 	defer b.mu.Unlock()

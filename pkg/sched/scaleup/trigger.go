@@ -78,7 +78,10 @@ type Ledger interface {
 // the cap rejection path. The signature intentionally avoids importing
 // sched (see AdmitResult's doc comment for the cycle rationale).
 type Engine interface {
-	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
+	// AdmitInstance (PR-B / issue #272): scope is the preview
+	// scope (`pr-{N}`) forwarded to the underlying sched.Engine.
+	// Empty = prod (legacy).
+	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
 	// EnsureWake (ADR-098): the single-flight wake entry. Routes
 	// through this so a scaleup tick racing the gateway, cron, floor,
 	// or targets triggers on the same parked app coalesces into one

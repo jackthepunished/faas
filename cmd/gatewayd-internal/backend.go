@@ -76,6 +76,16 @@ func (r pgRouter) slugFor(host string) (string, bool) {
 	return label, true
 }
 
+// previewScopeFromHost (issue #272 / ADR-095 PR-B) peels a preview-hostname
+// shape `pr-{N}.{parent-slug}.apps.<zone>` into `(number, parent-slug)` so
+// the routing layer can resolve it to the preview app row whose slug is
+// `pr-{N}-{parent-slug}` (the convention the webhook provisioner uses per
+// ADR-094). The parser is shared with pkg/gateway's on-demand cert
+// allowlist so the two paths can't drift on what counts as a preview host.
+func (r pgRouter) previewScopeFromHost(host string) (number int, slug string, ok bool) {
+	return gateway.PreviewScopeFromHost(r.appsSuffix, host)
+}
+
 // toApp joins the app to its account's plan (the plan lives on the account, not
 // the app) and filters out deleted apps. AccountID is plumbed through to the
 // gateway.App so the per-account rate limiter (ADR-040 / issue #292) can key

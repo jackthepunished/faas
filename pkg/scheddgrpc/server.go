@@ -122,7 +122,12 @@ type SchedAPI interface {
 	// passed through to the engine; empty falls through to the
 	// newest live deployment (Phase-1 fast path). Additive per
 	// ADR-016.
-	Wake(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error)
+	//
+	// scope (PR-B / issue #272): the preview scope (`pr-{N}`)
+	// the gateway parsed from the inbound Host header. Empty =
+	// prod (legacy single-deployment behaviour). Threaded through
+	// WithScope into the engine's resolveApp / loadAPIEnv.
+	Wake(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error)
 	// AdmitInstance is the schedule scale-out primitive (issue #168).
 	// Bypasses the Phase-1 fast-path so a gateway can demand a new
 	// instance even when others are already RUNNING. Returns a typed
@@ -139,7 +144,9 @@ type SchedAPI interface {
 	// the engine's default (newest live deployment) — the legacy
 	// single-deployment path. Non-empty asks the engine to admit on
 	// that specific live deployment. Additive per ADR-016.
-	AdmitInstance(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error)
+	//
+	// scope (PR-B / issue #272): the preview scope (`pr-{N}`).
+	AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error)
 	// EnsureWake (ADR-098) is the single-flight-safe wake RPC. The engine
 	// coalesces every concurrent EnsureWake call for the same app into one
 	// virtual boot; followers see the leader's outcome. The leader runs
@@ -314,7 +321,11 @@ func (s *Server) Wake(ctx context.Context, req *scheddpb.WakeRequest) (*scheddpb
 		return nil, err
 	}
 	start := time.Now()
-	res, err := s.engine.Wake(ctx, req.GetAppId(), req.GetDeploymentId())
+	// PR-B (issue #272 / ADR-095): scope is read from the wire
+	// request — the gateway sets it from the parsed
+	// `pr-{N}.{slug}.apps.<zone>` Host header. Empty scope = legacy
+	// prod behaviour, threaded via WithScope at the engine entry.
+	res, err := s.engine.Wake(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))
@@ -351,7 +362,10 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 		return nil, err
 	}
 	start := time.Now()
-	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId())
+	// PR-B (issue #272): scope threaded through AdmitInstance the
+	// same way as Wake. Empty scope = legacy prod; the engine's
+	// resolveApp then reads the LiveDeployment row by appID only.
+	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))

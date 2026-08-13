@@ -722,7 +722,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "")
+			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "", "")
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -744,7 +744,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke resolve schedd %s: %w", appID, err)
 			}
-			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "")
+			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "", "")
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}
@@ -1787,7 +1787,7 @@ func (unwiredBackend) Lookup(context.Context, string) (gateway.App, bool) {
 }
 func (unwiredBackend) Pick(string) gateway.PickResult { return gateway.PickResult{} }
 func (unwiredBackend) HealthyCount(string) int        { return 0 }
-func (unwiredBackend) Admit(context.Context, string, string, int) (string, gateway.WakeMethod, bool, error) {
+func (unwiredBackend) Admit(context.Context, string, string, string, int) (string, gateway.WakeMethod, bool, error) {
 	return "", gateway.WakeMethodUnspecified, false, nil
 }
 

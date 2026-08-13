@@ -54,13 +54,13 @@ type stubSchedd struct {
 	target string
 }
 
-func (s *stubSchedd) AdmitInstance(context.Context, string, string) (string, string, string, string, int32, bool, int, error) {
+func (s *stubSchedd) AdmitInstance(context.Context, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	panic("stubSchedd.AdmitInstance")
 }
 func (s *stubSchedd) EnsureWake(context.Context, string) (string, string, string, string, int32, int, error) {
 	panic("stubSchedd.EnsureWake")
 }
-func (s *stubSchedd) Wake(context.Context, string, string) (string, string, string, string, int, error) {
+func (s *stubSchedd) Wake(context.Context, string, string, string) (string, string, string, string, int, error) {
 	panic("stubSchedd.Wake")
 }
 func (s *stubSchedd) ReportActivity(context.Context, []state.InstanceTouch) (int, error) {

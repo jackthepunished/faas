@@ -16,21 +16,28 @@
 package gateway
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 )
 
 // OnDemandAllowlist is consulted by the HTTP-01 solver for every on-demand
-// (custom-domain) certificate request. Returning true means the hostname is in
-// the custom_domains table AND its TXT challenge has been satisfied — proceed
-// to mint. Returning false means reject: the close-the-cert-mint-abuse-vector
-// guard from spec §11. The callback is invoked on the cert-mint goroutine,
-// which is rate-limited and cached by certmagic — direct Postgres calls are
-// fine, but consider a short-lived cache if the table grows past ~10k rows.
+// (custom-domain or preview-host) certificate request. Returning (true, nil)
+// means the hostname is in the custom_domains table (verified) OR is a
+// preview host whose preview apps row is in state='open' — proceed to mint.
+// Returning (false, nil) means reject: the close-the-cert-mint-abuse-vector
+// guard from spec §11. Returning (false, err) means the lookup failed and
+// the caller should fail closed.
 //
-// The signature is host-keyed because certmagic presents the request's SNI/Host
-// to the decision func — there is no appID context at issuance time.
-type OnDemandAllowlist func(host string) bool
+// The signature is (ctx, host) → (bool, error) because (a) the allowlist
+// reads from Postgres on the cert-mint goroutine, so a per-call deadline
+// gives us a clean shutdown path, and (b) preview-host verification
+// (issue #272 / ADR-095 PR-B) needs ctx for the apps-table lookup with
+// the same 2-second budget the custom-domain path uses. Pre-PR-B callers
+// wrote func(host string) bool — that signature is broken by this widening.
+// The repo-wide grep confirms no third-party embedder; the only callers
+// are cmd/gatewayd-internal/ and pkg/gateway/.
+type OnDemandAllowlist func(ctx context.Context, host string) (bool, error)
 
 // TLSConfig is the configuration bucket cmd/gatewayd-internal/reads from TOML. Empty
 // fields mean "TLS is off; serve plain HTTP" — the legacy dev/e2e path.
