@@ -88,6 +88,72 @@ underlying HTTP shape.
 - SDK binding: `pkg/api.Client.DeployFromSourceRef` (Go) /
   `DeploymentsService.createDeploymentFromSourceRef` (Node).
 
+## GitHub Actions
+
+For teams that want explicit-CI deploys (workflow run, not push
+listener), the first-party `poyrazK/faas/.github/actions/deploy`
+action wraps this same endpoint. The action is a composite that
+vendors the `gregale` CLI per release, so a workflow pin (`@v1`)
+is deterministic and a bundled `cli-version` output surfaces the
+exact version for drift detection.
+
+### Generate a starter workflow
+
+From the repo where you want the workflow, run:
+
+```sh
+gregale deploy --github --name my-app > .github/workflows/deploy.yml
+```
+
+The CLI emits a copy-paste workflow body to stdout. When run
+inside an Actions runner (the `GITHUB_REPOSITORY` +
+`GITHUB_SHA` env vars are set), the snippet hard-codes
+`repo` and `ref` to those values; run from a local checkout
+and the snippet emits the `${{ github.repository }}` /
+`${{ github.sha }}` expressions so the same file is portable
+across repos.
+
+### What goes in the snippet
+
+- `api-key: ${{ secrets.GREGALE_API_KEY }}` — never a literal.
+  Provision a deploy-scoped API key in the Gregale dashboard
+  and add it to the workflow's environment secrets.
+- `api-base: https://api.faas.example` — substitute your
+  control-plane host. Hobby/Pro/Scale customers each have a
+  different host. The snippet's `api-base` placeholder is a
+  string the customer is expected to edit.
+- `app: my-app` — the slug from `gregale connect`. The snippet
+  generator picks the slug from `--name` / cwd.
+
+### Failure modes (Action-specific)
+
+The action reuses the same `Failure modes` table above. The
+action additionally:
+
+- Redacts `gh*_`, `Bearer …`, and `FAAS_TOKEN=…` substrings from
+  any `::error` annotation it emits.
+- Surfaces the RFC 7807 `Code` + `Detail` as a single
+  `::error file=action.yml,line=1::code=<code> — <detail>` line.
+- Writes the new `deployment_id`, `status`, `url`, and
+  `cli-version` to `$GITHUB_OUTPUT` so downstream steps can
+  chain off them.
+
+### What's NOT in the first action
+
+- **OIDC / keyless deployment.** The first action uses the
+  existing bearer-token contract. A follow-up proposal will
+  add `permissions: id-token: write` + a token-exchange step.
+- **PR-preview environments.** Each deploy is a fresh
+  deployment id; the action does not create or tear down
+  preview URLs.
+- **A redirect to the webhook push-to-deploy path.** The
+  action is a complement to the push listener; both stamp
+  `DeploymentKind = "github"` and customers pick the one
+  that matches their CI shape.
+
+See ADR-093 for the design rationale and the explicit
+non-goals.
+
 ## Webhook secrets (push-to-deploy)
 
 The push-to-deploy loop is wired end-to-end (issue #739

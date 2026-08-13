@@ -534,6 +534,19 @@ type Limits struct {
 	// flag via PATCH (gated by Plan.WebSocketResponseAllowed so
 	// Free stays off even when an admin backfills the column).
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) gates the per-app per-route
+	// observability surface: when true, gatewayd-internal emits three
+	// additional Prometheus series keyed by an enumerated `route`
+	// label (method + raw path, bounded per-app at 50 distinct entries
+	// with __route_other__ as the non-evicting overflow bucket) and
+	// serves the per-app reader at GET /v1/internal/apps/{slug}/routes.
+	// Hobby/Pro/Scale default on; Free stays off (the abuse-floor tier
+	// where per-route cardinality would not have a budget). The
+	// plan-level default is applied at CreateApp time via buildApp
+	// using Plan.RouteMetricsEnabled(); an existing app may still flip
+	// the flag via PATCH (gated by Plan.RouteMetricsResponseAllowed
+	// so Free stays off even when an admin backfills the column).
+	RouteMetricsEnabled bool
 	// MaxResponseBodyBytes is the per-response body cap (spec §4.1
 	// for the legacy 25 MB bound; issue #471 raises the cap for
 	// Hobby+ to 100 MB so LLM-style streams have headroom). 0 means
@@ -799,6 +812,12 @@ var planLimits = map[Plan]Limits{
 		// Default off; apid PATCH rejects with 403
 		// plan_websocket_not_allowed.
 		WebSocketEnabled: false,
+		// Per-route metrics (ADR-093): Free is the abuse-floor tier
+		// — per-route cardinality would not have a budget (Free
+		// apps share the §12 dashboard series set with paid apps).
+		// Default off; apid PATCH rejects with 403
+		// plan_route_metrics_not_allowed. Hobby+ customers opt in.
+		RouteMetricsEnabled: false,
 		// Warm-snapshot (issue #470 / ADR-055): Free is off by
 		// plan. Warm-tier apps keep warm.snap + init.snap on the
 		// parked disk budget; doubling the per-app snapshot
@@ -1005,6 +1024,12 @@ var planLimits = map[Plan]Limits{
 		// 100 MB / 900 s caps above cover a long-poll or chat WS
 		// session comfortably.
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Hobby is the first paid tier
+		// — opt-in by default (Hobby customers hosting APIs are the
+		// core "which endpoint is slow?" use case). The per-app
+		// route cap (50) + __route_other__ overflow bound the
+		// cardinality regardless of the customer's traffic shape.
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Hobby is gated off
 		// for the same cost-shape reason as Free — doubling the
 		// parked per-app snapshot footprint doesn't fit the
@@ -1200,6 +1225,11 @@ var planLimits = map[Plan]Limits{
 		// the first tier where production workloads sit — opt-in by
 		// default for the same reason as Hobby (LLM / agent SDKs).
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Pro is the first tier where
+		// production workloads sit — opt-in by default for the same
+		// reason as Hobby (production APIs want the per-route
+		// breakdown by default).
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Pro is the first
 		// tier where warm-snapshot is on by default. Per the issue
 		// body's acceptance: "for a Pro+ app that has served ≥5
@@ -1398,6 +1428,10 @@ var planLimits = map[Plan]Limits{
 		// stays on by default — production workloads at this tier
 		// are expected to run agent / WS-backed services.
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Scale stays on by default
+		// for the same reason as Pro — production workloads want
+		// the per-route breakdown without a PATCH round-trip.
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Scale stays on
 		// by default — the per-app parked footprint cost fits
 		// inside the 452 GB budget, and the customer's wake-p50
@@ -1565,6 +1599,28 @@ const (
 	MaxRequestBodyBytes = 25 * 1024 * 1024 // 25 MB either direction
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
+
+	// MaxEdgeRuleLimitBodyBytesStreaming (ADR-091 D24 / kind=limit
+	// streaming carve-out) is the upper bound on the optional
+	// `max_body_bytes_streaming` field of a kind=limit edge rule.
+	// The buffered-path field (`max_body_bytes`) is capped by
+	// MaxRequestBodyBytes (25 MiB) above; the streaming opt-in
+	// raises the cap to RawStreamMaxRequestBytes (100 MiB, ADR-080
+	// raw-bridge parity) so an LLM-style streaming POST against a
+	// /v1/chat/completions endpoint has the same headroom the
+	// raw-bridge ForwardStream has. Runtime enforcement ships
+	// alongside the field (D24 §6 amendment). The cap-selection
+	// algorithm at pkg/gateway/handler.go::applyEdgeRuleLimit
+	// consults this field only when the request is on the
+	// streaming opt-in path (4-conjunct detection: h.streamingEnabled
+	// && app.StreamingEnabled && !isAcceptJSON(Accept) && !isUpgradeRequest).
+	// The DTO's `s ≥ b` invariant (pkg/api/dto.go) is the single
+	// source of truth — the runtime trusts it without re-check.
+	// Matches RawStreamMaxRequestBytes byte-for-byte so a
+	// customer can set `max_body_bytes_streaming` = RawStreamMaxRequestBytes
+	// and the value survives the apid-Validate round-trip without
+	// surprise trimming.
+	MaxEdgeRuleLimitBodyBytesStreaming int64 = 100 * 1024 * 1024
 
 	// MaxEdgeRuleValidateSchemaBytes bounds the JSON Schema body of a
 	// kind=validate edge rule at apid-create time (Cloudflare-style
@@ -2605,6 +2661,45 @@ func (p Plan) WebSocketResponseAllowed() bool {
 	return l.WebSocketEnabled
 }
 
+// RouteMetricsEnabled reports whether the plan defaults the per-app
+// apps.route_metrics_enabled column to true (ADR-093). Hobby/Pro/Scale
+// opt in; Free stays off (the abuse-floor tier where per-route
+// cardinality would not have a budget). The plan-level default is
+// applied at CreateApp time in cmd/apid/handlers.go::buildApp using
+// the RouteMetricsEnabled() accessor. Unknown plans fail closed
+// (return false) — same contract as WebSocketEnabled / StreamingEnabled.
+func (p Plan) RouteMetricsEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.RouteMetricsEnabled
+}
+
+// RouteMetricsResponseAllowed reports whether the plan permits a customer
+// to set apps.route_metrics_enabled=true via PATCH. Hobby+ opt in; Free
+// returns false so apid's updateApp handler can surface 403
+// plan_route_metrics_not_allowed (ADR-093 AC #2). Same fail-closed
+// contract as RouteMetricsEnabled above.
+func (p Plan) RouteMetricsResponseAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.RouteMetricsEnabled
+}
+
+// RouteMetricsPerAppCap is the per-app hard cap on the number of
+// distinct routes admitted into the routeLabelSet (ADR-093 D2). When
+// exceeded, all new routes collapse into the reserved __route_other__
+// bucket. The cap is a constant — not per-plan — because the
+// cardinality bound is the same regardless of plan: any single app
+// exceeding 50 distinct routes is a wildcard-shape pattern that the
+// __route_other__ signal was designed to surface. Halo constant: do
+// not make this per-plan without a separate ADR (the §12 budget math
+// is global, not per-tenant).
+const RouteMetricsPerAppCap = 50
+
 // WarmSnapshotEnabled reports whether the plan's default for the
 // per-app two-tier snapshot flag is on. Pro/Scale return true; Free /
 // Hobby return false. The accessor is fail-closed — an unknown plan
@@ -3276,4 +3371,23 @@ const (
 	// of the operator surface.
 	ObsAdminRateLimitLimitDefault = 100
 	ObsAdminRateLimitLimitMax     = ObsAdminPaginationMax
+
+	// ObsAdminAuditLogLimitDefault / ObsAdminAuditLogLimitMax bound
+	// the top-N size of /v1/admin/obs/audit-log/search (ADR-091 §3.7 /
+	// PR #3). Default 200 covers the operator's "what happened in
+	// the last hour" drill-down; cap 500 = ObsAdminPaginationMax
+	// for parity with the rest of the operator surface. The underlying
+	// store is bounded by an over-read on the same idiom as
+	// listAuditLogOverRead (cmd/apid/handlers_audit_log.go:67).
+	ObsAdminAuditLogLimitDefault = 200
+	ObsAdminAuditLogLimitMax     = ObsAdminPaginationMax
+
+	// ObsAdminEventsLimitDefault / ObsAdminEventsLimitMax bound the
+	// top-N size of /v1/admin/obs/events (ADR-091 §3.7 / PR #3).
+	// Same shape as the audit-log search: default 200, cap 500. The
+	// events table is append-only with no retention pruning today
+	// so the over-read budget is also bounded by the
+	// (kind, at DESC) index added by 00190_admin_obs_index.sql.
+	ObsAdminEventsLimitDefault = 200
+	ObsAdminEventsLimitMax     = ObsAdminPaginationMax
 )

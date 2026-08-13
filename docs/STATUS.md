@@ -658,6 +658,80 @@ ADR-075 / issue #475 / migration 00138.
 
 ADR-076 / issue #476 / migrations 00140 + 00141.
 
+## M8 — Per-route observability (ADR-093). 🚧
+
+Opt-in per-app route breakdown on the gatewayd-internal hot path,
+surfaced as Prometheus `_by_route` series and a control-listener
+reader at `GET /v1/apps/{slug}/routes`. Bounded by a 50-route cap
+with a non-evicting `__route_other__` overflow bucket (ADR-093 D2).
+
+- **Schema / State** — `apps.route_metrics_enabled boolean` (migration
+  00216). Partial index `WHERE route_metrics_enabled = true` keeps
+  the col-store cheap on Free-tier (where the column is always false).
+- **Plan gate** — Hobby/Pro/Scale default-on; Free stays off. Two
+  accessors at `pkg/api/limits.go:2649` `RouteMetricsEnabled()`
+  (create-time default) and `:2662` `RouteMetricsResponseAllowed()`
+  (PATCH-time gate) so a Free PATCHing true surfaces
+  `plan_route_metrics_not_allowed` (403, `pkg/api/errors.go:720`).
+- **Metric primitives** — `pkg/gateway/metrics.go:404-417`
+  `requestsByRoute`, `durationByRoute`, `failuresByRoute`. The
+  `_by_route` suffix is required so the new `{route}` label set
+  doesn't collide with the pre-existing `{app, code}` CounterVec
+  (Prometheus rejects two CounterVecs with the same name but
+  different label sets at registration time).
+- **API** — `GET /v1/apps/{slug}/routes` (apid reverse-proxy to
+  gatewayd-internal `GET /v1/internal/apps/{slug}/routes`).
+  OperationId `getAppRoutes` (api/openapi.yaml:1394-1427, `x-issue: 273`).
+- **Operator kill-switch** — `route_metrics_enabled` toml + env
+  `FAAS_GATEWAY_ROUTE_METRICS` (`cmd/gatewayd-internal/config.go:107-121`).
+  Cluster default wired by commit 5 of this PR
+  (`deploy/ansible/roles/gatewayd_internal_service/templates/gatewayd.toml.j2`).
+- **Alert** — `GatewayWildcardRoute` — sustained
+  `__route_other__` overflow > 1 reqps for 10m. Runbook
+  `docs/runbooks/GatewayWildcardRoute.md`. Recording rules + the
+  alert land on the box via
+  `deploy/ansible/roles/prometheus/tasks/main.yml` (commit 1 of
+  this PR — G1+G2 closure).
+
+### Tier A — observation period
+
+Operational follow-up (no code change). 2-week observation window
+after PR #856 lands. Empirical answer to "does the 50-cap actually
+bound cardinality or do apps collapse into `__route_other__`?" feeds
+either Tier B hardening (per-method cap, post-rewrite route label,
+`AppRoutesResponse` cap-visibility) or Tier C bigger ADRs (per-route
+SLI, per-plan budget).
+
+- **Alert surface** — `GatewayWildcardRoute` is `severity: info`
+  and routes to the EMPTY `faas-silent` receiver
+  (`alertmanager.yml.j2:53-56`). No page, no email, no Slack. Visible
+  in Prometheus `/alerts` and Grafana only. The status-page degraded
+  pill filters `severity=~"page|warn"` (line 519-541), so this alert
+  does **not** move the pill by design.
+- **Weekly review** — pull firing alerts directly:
+
+  ```sh
+  curl -s http://127.0.0.1:9090/api/v1/alerts \
+    | jq '.data.alerts[] | select(.labels.alertname=="GatewayWildcardRoute")'
+  ```
+
+- **Mid-sprint Hobby-tier audit** — run
+  `make hobby-route-audit` (uses `deploy/scripts/adr093-hobby-audit.sh`)
+  against the control plane. Counts `__route_other__` vs real-route
+  entries per Hobby-tier app. Read-only.
+- **Post-deploy smoke** — operator-side runbook at
+  `docs/runbooks/PostDeployAdr093.md`. Four artefact checks (rule
+  file, systemd unit, toml, Grafana panels 103/104) + a rule-load
+  check + an end-state snapshot. Read-only.
+- **Decision at end-of-sprint**:
+  - *Cap sufficient* (no Hobby-tier app saturated) → Tier B polish;
+    Tier C (per-route SLI + per-plan budget) becomes the next major ADR.
+  - *Cap partial* (some Hobby apps saturated, most didn't) → Tier B
+    per-method cap.
+  - *Cap insufficient* (most Hobby apps immediately saturated) →
+    ADR-093 needs re-scoping (lower default cap, revert Hobby's
+    default-on, or move to a customer-driven enable per plan).
+
 ## Auth default flip — issue #695 / ADR-080
 
 Closes spec §17 G15. Cloud Run's analogue is IAM-authenticated by

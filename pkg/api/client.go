@@ -1769,6 +1769,19 @@ func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetric
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// GetAppRoutes returns the per-route label snapshot for the named
+// app (ADR-093). The bounded label set is served by the
+// gatewayd-internal control listener and reverse-proxied by apid;
+// each entry is "METHOD /raw/path" with overflow collapsed to
+// "__route_other__" when the per-app cap (50) is exceeded. Source
+// is "live" on success and "unavailable" when the control
+// listener dial failed — callers should render both branches the
+// same way (empty list, distinct chip).
+func (c *Client) GetAppRoutes(ctx context.Context, slug string) (AppRoutesResponse, error) {
+	var out AppRoutesResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/routes", nil, &out)
+}
+
 // GetAppsMetrics returns the account-wide per-app metrics rollup
 // (issue #393). One call replaces N per-app GetAppMetrics calls;
 // the response is keyed by app_slug so the dashboard renders rows

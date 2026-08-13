@@ -1428,6 +1428,85 @@ func (q *Queries) ListAPIKeys(ctx context.Context, db DBTX, accountID pgtype.UUI
 	return items, nil
 }
 
+const listAllEventsPaged = `-- name: ListAllEventsPaged :many
+select id, at, actor, kind, subject, data
+from events
+where ($1 = '' or actor = $1)
+  and ($2 = '' or kind like $2 || '%')
+  and ($3 = '' or subject = $3::uuid)
+  and ($4 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $4)
+order by at desc, id desc
+limit $5::int8
+`
+
+type ListAllEventsPagedParams struct {
+	Column1 interface{}
+	Column2 interface{}
+	Column3 interface{}
+	Column4 interface{}
+	Column5 int64
+}
+
+type ListAllEventsPagedRow struct {
+	ID      int64
+	At      pgtype.Timestamptz
+	Actor   string
+	Kind    string
+	Subject pgtype.UUID
+	Data    []byte
+}
+
+// ADR-091 §3.7 / PR #3 — operator-obs backend audit-reading surface.
+// Reads the live events table (NOT audit_log — distinct source of
+// truth per ADR-091 §3.7.4). Optional filters:
+//   - $1 actor    — exact match (handler passes "" to skip)
+//   - $2 kind_prefix — LIKE 'prefix%' (handler passes "" to skip)
+//   - $3 subject  — exact match (handler passes "" to skip)
+//   - $4 since    — RFC 3339 timestamptz (handler passes zero time to skip)
+//   - $5 limit    — top-N rows (handler default 200, cap 500;
+//     cast to int8 so sqlc emits int64 Params and the
+//     handler's int→int64 widening is safe)
+//
+// Order: at DESC, id DESC — the id tiebreaker keeps the planner on
+// the (kind, at DESC) index added by 00190_admin_obs_index.sql for
+// kind-prefix queries and avoids an unstable sort on the
+// over-read window.
+// Subject is uuid (nullable in the schema); the cast is left to
+// the handler so the handler can pass an empty string for "no
+// subject filter" without a NULL literal.
+func (q *Queries) ListAllEventsPaged(ctx context.Context, db DBTX, arg ListAllEventsPagedParams) ([]ListAllEventsPagedRow, error) {
+	rows, err := db.Query(ctx, listAllEventsPaged,
+		arg.Column1,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllEventsPagedRow{}
+	for rows.Next() {
+		var i ListAllEventsPagedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.At,
+			&i.Actor,
+			&i.Kind,
+			&i.Subject,
+			&i.Data,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listApps = `-- name: ListApps :many
 select id, account_id, slug, type, coalesce(runtime, ''), ram_mb, coalesce(idle_timeout_s, 0),
        max_concurrency, status, manifest, created_at
@@ -2074,6 +2153,74 @@ func (q *Queries) ListOrgsForAccount(ctx context.Context, db DBTX, accountID pgt
 			&i.DeletedPending,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRecentEventsForAccount = `-- name: ListRecentEventsForAccount :many
+select id, at, actor, kind, subject, data
+from events
+where actor_account_id = $1
+  and ($2 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $2)
+order by at desc, id desc
+limit $3::int8
+`
+
+type ListRecentEventsForAccountParams struct {
+	ActorAccountID pgtype.UUID
+	Column2        interface{}
+	Column3        int64
+}
+
+type ListRecentEventsForAccountRow struct {
+	ID      int64
+	At      pgtype.Timestamptz
+	Actor   string
+	Kind    string
+	Subject pgtype.UUID
+	Data    []byte
+}
+
+// ADR-091 §3.7 / PR #3 — per-account events drill-down. Backed by
+// the partial index events_actor_account_idx on
+// (actor_account_id) WHERE actor_account_id IS NOT NULL
+// (migrations/00099_orgs_memberships_invitations.sql). Filters:
+//   - $1 actor_account_id — uuid (the account the actor belonged to)
+//   - $2 since             — RFC 3339 timestamptz (handler passes
+//     zero time to skip; the predicate is
+//     uniform with ListAllEventsPaged)
+//   - $3 limit             — top-N rows (handler default 200, cap 500;
+//     cast to int8 so sqlc emits int64 Params
+//     and the handler's int→int64 widening is
+//     safe)
+//
+// Order: at DESC, id DESC — same rationale as ListAllEventsPaged.
+// PR #3 wires the per-account filter on the SSE mirror's
+// per-account projections; the broader ?actor + ?subject filter
+// shape lives on ListAllEventsPaged.
+func (q *Queries) ListRecentEventsForAccount(ctx context.Context, db DBTX, arg ListRecentEventsForAccountParams) ([]ListRecentEventsForAccountRow, error) {
+	rows, err := db.Query(ctx, listRecentEventsForAccount, arg.ActorAccountID, arg.Column2, arg.Column3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRecentEventsForAccountRow{}
+	for rows.Next() {
+		var i ListRecentEventsForAccountRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.At,
+			&i.Actor,
+			&i.Kind,
+			&i.Subject,
+			&i.Data,
 		); err != nil {
 			return nil, err
 		}
@@ -2744,6 +2891,151 @@ func (q *Queries) TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg Traf
 		if err := rows.Scan(
 			&i.AccountID,
 			&i.AppID,
+			&i.Minute,
+			&i.CurrentMbSeconds,
+			&i.MeanMbSeconds,
+			&i.StddevMbSeconds,
+			&i.SampleCount,
+			&i.ZScore,
+			&i.Reason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const trafficAnomalyAggregateByNode = `-- name: TrafficAnomalyAggregateByNode :many
+with baseline as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           extract(hour from um.minute) as hour_of_day,
+           avg(um.mb_seconds)::float8 as mean_mb_seconds,
+           coalesce(stddev_pop(um.mb_seconds), 0)::float8 as stddev_mb_seconds,
+           count(*)::int as sample_count
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $2
+      and um.minute <  $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, extract(hour from um.minute)
+),
+current_pool as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           um.minute,
+           sum(um.mb_seconds)::float8 as current_mb_seconds
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, um.minute
+),
+scored as (
+    select c.account_id,
+           c.app_id,
+           c.node_id,
+           c.minute,
+           c.current_mb_seconds,
+           b.mean_mb_seconds,
+           b.stddev_mb_seconds,
+           b.sample_count,
+           case
+               when b.sample_count < 3 then null
+               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+               when b.stddev_mb_seconds >= 1.0
+                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+               else null
+           end as z_score,
+           case
+               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+               else 'hour_of_day'
+           end as reason
+    from current_pool c
+    join baseline b
+      on c.account_id = b.account_id
+     and c.app_id    = b.app_id
+     and c.node_id   = b.node_id
+     and extract(hour from c.minute) = b.hour_of_day
+)
+select account_id,
+       app_id,
+       node_id,
+       minute,
+       current_mb_seconds,
+       mean_mb_seconds,
+       stddev_mb_seconds,
+       sample_count,
+       z_score,
+       reason
+from scored
+where z_score is not null
+order by z_score desc
+limit $3::int8
+`
+
+type TrafficAnomalyAggregateByNodeParams struct {
+	Minute   pgtype.Timestamptz
+	Minute_2 pgtype.Timestamptz
+	Column3  int64
+}
+
+type TrafficAnomalyAggregateByNodeRow struct {
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	NodeID           pgtype.UUID
+	Minute           pgtype.Timestamptz
+	CurrentMbSeconds float64
+	MeanMbSeconds    float64
+	StddevMbSeconds  float64
+	SampleCount      int32
+	ZScore           interface{}
+	Reason           string
+}
+
+// PR #4 (ADR-092 §3.4 amendment) — per-node variant of
+// TrafficAnomalyAggregate. Joins usage_minutes to instances to
+// recover the hosting node_id, then groups by
+// (account_id, app_id, node_id, EXTRACT(HOUR FROM minute)) for
+// the baseline. The current_pool also groups by node_id so the
+// "today" anomaly is per-node, not per-app-wide.
+//
+// Why a separate query and not a sqlc parameter on the existing
+// one: the baseline math is identical, but the GROUP BY keys
+// differ by one column, and trying to thread that through a
+// nullable WHERE filter would either lose the per-node grain
+// (NULL filter collapses the group) or return the wrong rollup
+// (a per-node "current" against an app-wide baseline reports
+// spurious anomalies when the fleet is unevenly loaded). A
+// separate query keeps each path simple and self-contained.
+//
+// Index path: same as TrafficAnomalyAggregate — usage_minutes
+// primary key (instance_id, minute) is fine for the 24h current
+// window in single-box posture. The instances.node_id lookup
+// is by PK; the join is O(matches) on the PK.
+func (q *Queries) TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error) {
+	rows, err := db.Query(ctx, trafficAnomalyAggregateByNode, arg.Minute, arg.Minute_2, arg.Column3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TrafficAnomalyAggregateByNodeRow{}
+	for rows.Next() {
+		var i TrafficAnomalyAggregateByNodeRow
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.AppID,
+			&i.NodeID,
 			&i.Minute,
 			&i.CurrentMbSeconds,
 			&i.MeanMbSeconds,

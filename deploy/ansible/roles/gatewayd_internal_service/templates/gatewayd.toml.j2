@@ -1,0 +1,14 @@
+{# gatewayd-internal config drop (ADR-093). #}
+{# Mirrors the alertmanager role's alertmanager.yml.j2 pattern: a #}
+{# single toml key controlling the per-cluster toggle. The two-level #}
+{# kill switch shape (operator env + per-app apps.route_metrics_enabled) #}
+{# lives in cmd/gatewayd-internal/config.go:107-121 and is read by #}
+{# FAAS_GATEWAY_ROUTE_METRICS env override. Operators downgrade #}
+{# cluster-wide with `-e gatewayd_route_metrics_enabled=false` at #}
+{# the playbook call site. #}
+
+# ADR-093 operator kill-switch. Default-on (true) so the rollout
+# reaches Hobby/Pro/Scale customers who didn't flip the per-app
+# apps.route_metrics_enabled flag at create time. Operators
+# downgrade with -e gatewayd_route_metrics_enabled=false.
+route_metrics_enabled = {{ gatewayd_route_metrics_enabled | default(true) | string | lower }}

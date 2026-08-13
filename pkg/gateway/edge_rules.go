@@ -309,15 +309,23 @@ type EdgeRuleCache struct {
 // `cache.Put(host, &gateway.HostEntry{...})` — see how the cmd-side
 // loadHost builds the entry. PR 5 widens with CORS / JWT / IP slots.
 type HostEntry struct {
-	Host         string
-	Route        []EdgeRuleResolved
-	Rewrite      []EdgeRuleRewriteResolved
-	Redirect     []EdgeRuleRedirectResolved
-	Headers      []EdgeRuleHeadersResolved
-	CORS         []EdgeRuleCORSResolved
-	JWT          []EdgeRuleJWTResolved
-	IP           []EdgeRuleIPResolved
-	Validate     []EdgeRuleValidateResolved
+	Host     string
+	Route    []EdgeRuleResolved
+	Rewrite  []EdgeRuleRewriteResolved
+	Redirect []EdgeRuleRedirectResolved
+	Headers  []EdgeRuleHeadersResolved
+	CORS     []EdgeRuleCORSResolved
+	JWT      []EdgeRuleJWTResolved
+	IP       []EdgeRuleIPResolved
+	Validate []EdgeRuleValidateResolved
+	// Limit carries the kind=limit subset (ADR-091 D24). Same
+	// shape as Validate above; the applier
+	// (handler.go::applyEdgeRuleLimit) installs MaxBytesReader on
+	// r.Body at the per-rule cap. Stored as a plain slice to match
+	// the surrounding fields — the cache primitive is
+	// kind-agnostic and the cmd-side loader threads one slice per
+	// kind into the HostEntry.
+	Limit        []EdgeRuleLimitResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -460,6 +468,24 @@ func (c *EdgeRuleCache) GetValidate(host string) ([]EdgeRuleValidateResolved, bo
 	return out, true
 }
 
+// GetLimit is the D24 accessor for the kind=limit slice. Same shape
+// as GetValidate: returns a value-copy of the underlying slice and
+// a hit bool; nil slice with ok=true means "entry exists but no
+// limit rule for this host".
+func (c *EdgeRuleCache) GetLimit(host string) ([]EdgeRuleLimitResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Limit == nil {
+		return nil, true
+	}
+	src := entry.Limit
+	out := make([]EdgeRuleLimitResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
 // getEntry promotes the entry on hit and returns it. Internal —
 // the Get* family wraps this so each returns a typed slice.
 //
@@ -520,7 +546,7 @@ func (c *EdgeRuleCache) Put(host string, e *HostEntry) {
 	if len(e.Route) == 0 && len(e.Rewrite) == 0 &&
 		len(e.Redirect) == 0 && len(e.Headers) == 0 &&
 		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 &&
-		len(e.Validate) == 0 {
+		len(e.Validate) == 0 && len(e.Limit) == 0 {
 		return
 	}
 	e.Host = host
@@ -603,6 +629,7 @@ type EdgeRuleMatcher interface {
 	MatchJWT(ctx context.Context, host, path, method string) *EdgeRuleJWTResolved
 	MatchIP(ctx context.Context, host, path, method string) *EdgeRuleIPResolved
 	MatchValidate(ctx context.Context, host, path, method string) *EdgeRuleValidateResolved
+	MatchLimit(ctx context.Context, host, path, method string) *EdgeRuleLimitResolved
 	Reset()
 }
 
@@ -752,6 +779,9 @@ func (noOpEdgeRuleMatcher) MatchIP(context.Context, string, string, string) *Edg
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchValidate(context.Context, string, string, string) *EdgeRuleValidateResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchLimit(context.Context, string, string, string) *EdgeRuleLimitResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}

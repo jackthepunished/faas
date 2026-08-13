@@ -496,7 +496,7 @@ func TestOpsMetrics_ObserveScaleUpClosedSet(t *testing.T) {
 	}
 }
 
-// TestOpsMetrics_ObserveWakePhase (ADR-093, P1B) — the schedd-side
+// TestOpsMetrics_ObserveWakePhase (ADR-097, P1B) — the schedd-side
 // wake-phase histogram vector is pre-instantiated at boot with the
 // closed 3-phase label set under the empty-app sentinel so the §12
 // wake-latency-decomposition panel surfaces zero rows from an idle
@@ -523,7 +523,7 @@ func TestOpsMetrics_ObserveWakePhase(t *testing.T) {
 		`schedd_wake_rpc_duration_seconds_count{app="app-1",phase="rpc_call"} 1`,
 		`schedd_wake_rpc_duration_seconds_count{app="app-1",phase="rpc_to_running"} 1`,
 		// Pre-instantiated empty-app sentinel rows for the closed set.
-		// P1B / ADR-093: the closed set is {admit_to_rpc, rpc_call,
+		// P1B / ADR-097: the closed set is {admit_to_rpc, rpc_call,
 		// rpc_to_running}; every value must surface from boot so the
 		// dashboard panel has zero rows at idle (PR #826 precedent).
 		// Metric name is *_wake_rpc_duration_seconds (not the
@@ -539,7 +539,7 @@ func TestOpsMetrics_ObserveWakePhase(t *testing.T) {
 	}
 }
 
-// TestOpsMetrics_ObserveWakePhaseNilSafe (ADR-093, P1B) — a nil
+// TestOpsMetrics_ObserveWakePhaseNilSafe (ADR-097, P1B) — a nil
 // *OpsMetrics receiver must not panic on WakeRPCDuration access.
 // The convention (mirroring GuestInitDuration at metrics.go:2729
 // and the existing TestOpsMetrics_GuestInitDurationNilSafe) is to

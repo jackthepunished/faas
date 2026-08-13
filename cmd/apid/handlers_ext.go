@@ -266,6 +266,24 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				"Free tier does not support per-app WebSocket; upgrade to Hobby or higher.")
 		}
 	}
+	// ADR-093: per-route observability opt-in. Same plan-gate
+	// shape as WebSocket above — Free + true = 403
+	// plan_route_metrics_not_allowed. The per-app route cap (50)
+	// + __route_other__ overflow bounds the cardinality regardless
+	// of the customer's traffic shape, but Free is the abuse-floor
+	// tier where per-route rollups would not have a budget
+	// alongside the per-app rollups. Hobby+ customers may PATCH
+	// true → false to opt out (a small app that does not want
+	// per-route cardinality on the box); the false direction
+	// needs no gate.
+	if req.RouteMetricsEnabled != nil && *req.RouteMetricsEnabled {
+		if !acct.Plan.RouteMetricsResponseAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanRouteMetricsNotAllowed,
+				"Per-route metrics are not allowed on this plan",
+				"Free tier does not support per-route observability; upgrade to Hobby or higher.")
+		}
+	}
 	// Issue #470 / ADR-055: per-app two-tier-snapshot flag. Same
 	// plan-gate shape as streaming — Free/Hobby + true = 403
 	// plan_warm_snapshot_not_allowed. Out-of-range thresholds =
@@ -686,6 +704,13 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// gated the plan; the store is a plain column write.
 		WebSocketEnabled:    req.WebSocketEnabled,
 		SetWebSocketEnabled: req.WebSocketEnabled != nil,
+		// ADR-093: per-route observability opt-in. Same Set-bit
+		// convention as WebSocketEnabled above; apid validation
+		// already gated the plan (CodePlanRouteMetricsNotAllowed
+		// for Free customers PATCHing true), so the store is a
+		// plain column write.
+		RouteMetricsEnabled:    req.RouteMetricsEnabled,
+		SetRouteMetricsEnabled: req.RouteMetricsEnabled != nil,
 		// Issue #462 / ADR-058: per-app scaling policy. The
 		// setter bit on UpdateAppParams distinguishes "don't
 		// touch" (nil pointer) from "explicit zero policy"

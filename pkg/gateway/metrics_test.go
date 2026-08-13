@@ -44,7 +44,7 @@ func TestMetricsWakeQueueWaitNilSafe(t *testing.T) {
 func TestMetricsIssue273Exposition(t *testing.T) {
 	m := NewMetrics()
 	m.PreInstantiateApp("app-1")
-	m.ObserveColdBoot("app-1", 250*time.Millisecond)
+	m.ObserveColdBoot("app-1", 250*time.Millisecond, "node-1")
 	m.ObserveRequestDuration("app-1", "2xx", 12*time.Millisecond)
 	m.ObserveRequestDuration("app-1", "5xx", 500*time.Millisecond)
 

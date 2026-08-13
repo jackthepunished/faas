@@ -139,7 +139,7 @@ type OpsMetrics struct {
 	// 0.3/0.35 pair is intentional (the 350 ms warm-wake budget needs
 	// tight resolution near 0.35).
 	guestInitDuration *prometheus.HistogramVec
-	// wakeRPCDuration (ADR-093, P1B) measures schedd-side wall-clock
+	// wakeRPCDuration (ADR-097, P1B) measures schedd-side wall-clock
 	// for each wake phase: admit_to_rpc (gRPC handler → vmmd RPC
 	// start), rpc_call (vmmd Create{FromSnapshot,ColdBoot} round
 	// trip), rpc_to_running (RPC return → WAKING/COLD_BOOTING → RUNNING
@@ -1195,7 +1195,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
 	}, []string{"app", "runner"})
 	guestInitDuration.WithLabelValues("", "")
-	// ADR-093 (P1B): schedd-side wake RPC duration histogram. Phase
+	// ADR-097 (P1B): schedd-side wake RPC duration histogram. Phase
 	// ∈ {admit_to_rpc, rpc_call, rpc_to_running}. Bucket set is spec
 	// §6.3 verbatim plus a 0.01 low-end bucket for admit_to_rpc.
 	// Empty-app sentinel rows are pre-instantiated for every phase
@@ -1214,7 +1214,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// break the wake-latency panel that ships to day-1.
 	wakeRPCDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_wake_rpc_duration_seconds",
-		Help: "Wall-clock seconds for each schedd-side wake RPC phase (ADR-093). phase ∈ {admit_to_rpc, rpc_call, rpc_to_running}; app label is apps.id. admit_to_rpc covers the gRPC handler → vmmd RPC start window (lock + admitGate + ledger + placement). rpc_call covers the vmmd Create{FromSnapshot,ColdBoot} round trip. rpc_to_running covers the RPC return → WAKING/COLD_BOOTING → RUNNING transition. wake_id is attached as a prometheus.Exemplar on each observation so operators can join to gateway_wake_latency_seconds and to the events table. Bucket set reuses spec §6.3 verbatim with a 0.01 low-end bucket for admit_to_rpc.",
+		Help: "Wall-clock seconds for each schedd-side wake RPC phase (ADR-097). phase ∈ {admit_to_rpc, rpc_call, rpc_to_running}; app label is apps.id. admit_to_rpc covers the gRPC handler → vmmd RPC start window (lock + admitGate + ledger + placement). rpc_call covers the vmmd Create{FromSnapshot,ColdBoot} round trip. rpc_to_running covers the RPC return → WAKING/COLD_BOOTING → RUNNING transition. wake_id is attached as a prometheus.Exemplar on each observation so operators can join to gateway_wake_latency_seconds and to the events table. Bucket set reuses spec §6.3 verbatim with a 0.01 low-end bucket for admit_to_rpc.",
 		Buckets: []float64{0.01, 0.05, 0.1, 0.2, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
 	}, []string{"app", "phase"})
 	wakeRPCDuration.WithLabelValues("", "admit_to_rpc")
@@ -2176,7 +2176,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Count of LocalCacheBackend stale-cache fallback serves (ADR-054 acceptance). Fires once per Get that returned a last-known-good cached blob because the parent backend failed AND FAAS_STORAGE_CACHE_SERVE_STALE=true. No labels (deployment-level policy; per-key labels would explode cardinality). A non-zero rate means 'registry is down' — alertable via the §12 storage panel.",
 	})
 	commonCollectors = append(commonCollectors, storageCacheStaleFallback)
-	// ADR-093 (P1B): schedd-side wake RPC duration histogram. Same
+	// ADR-097 (P1B): schedd-side wake RPC duration histogram. Same
 	// MustRegister pattern as the legacy wakePhaseDur at line 1998
 	// (events-platform ADR-064) but a distinct metric name and label
 	// set — see metrics.go:1208-1227 for the naming rationale.
@@ -2227,12 +2227,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		apidStatelessAdvisoryEventsTotal.WithLabelValues(sev)
 	}
 	// issue #432 phase 5: pre-instantiate the githubd bridge
-	// `kind` label set ({github} — the only kind the bridge
-	// produces today; the loop is forward-compat for future
-	// daemon-to-daemon build sources). Same pattern as the
-	// pre-instantiations above so the row surfaces in /metrics
-	// from boot.
-	for _, kind := range []string{"github"} {
+	// `kind` label set ({github, preview} — push → github,
+	// pull_request → preview, issue #272 / ADR-094). Same pattern
+	// as the pre-instantiations above so the row surfaces in
+	// /metrics from boot. Mirrors the constants in this file
+	// (GithubdBridgeKind* below).
+	for _, kind := range []string{"github", "preview"} {
 		apidGithubdBridgeEnqueuedTotal.WithLabelValues(kind)
 	}
 	// issue #432 phase 5 / ADR-050 §109: pre-instantiate the
@@ -2745,7 +2745,7 @@ func (m *OpsMetrics) GuestInitDuration(app, runner string) prometheus.Observer {
 	return m.guestInitDuration.WithLabelValues(app, runner)
 }
 
-// WakeRPCDuration (ADR-093, P1B) returns the {(app, phase)}-labeled
+// WakeRPCDuration (ADR-097, P1B) returns the {(app, phase)}-labeled
 // histogram observer for schedd-side wake-phase duration. phase is
 // the closed set {admit_to_rpc, rpc_call, rpc_to_running}; callers
 // attach wake_id as a prometheus.Exemplar via ObserveWithExemplar
@@ -4444,15 +4444,21 @@ const (
 	AdvisorySeverityInfo = "info"
 )
 
-// GithubdBridgeKindGitHub is the only value the `kind` label
-// takes on the githubd → apid build enqueue counter (issue #432
-// phase 5). Mirrored as the constant the apid-side bridge
-// increments via IncGithubdBridgeEnqueued. The loop in
-// NewOpsMetrics pre-instantiates this value so the row surfaces
-// in /metrics from boot — same precedent as the advisorySeverity
-// closed-set above.
+// GithubdBridgeKind* are the closed-set values for the `kind`
+// label on githubd_bridge_enqueued_total (issue #432 phase 5;
+// extended for issue #272 / ADR-094 PR-preview environments).
+// The bridge stamps DeploymentKindGitHub for push events and
+// DeploymentKindPreview for pull_request events — the metric
+// label mirrors the resolved deployment kind so dashboards
+// can split preview traffic from production-push traffic.
+//
+// The closed-set switch in IncGithubdBridgeEnqueued drops
+// unknown values silently (CardinalityGuard). The pre-
+// instantiation loop in NewOpsMetrics pre-fills both values
+// so the rows surface in /metrics from boot.
 const (
-	GithubdBridgeKindGitHub = "github"
+	GithubdBridgeKindGitHub  = "github"
+	GithubdBridgeKindPreview = "preview"
 )
 
 // PathFilterMode* are the closed-set values for the `mode`
@@ -4540,14 +4546,15 @@ func (m *OpsMetrics) ObserveStatelessAdvisory(severity string) {
 }
 
 // IncGithubdBridgeEnqueued increments
-// githubd_bridge_enqueued_total{kind} (issue #432 phase 5). Called
-// from cmd/apid/githubd_bridge.go's EnqueueBuild handler on each
-// landed build row. kind is GithubdBridgeKindGitHub — the only
-// value the githubd bridge produces today; the switch is
-// forward-compat for future daemon-to-daemon build sources. Unknown
-// values produce no increment (closed-set guard). Nil receiver is
-// allowed for parity with the other Observe* accessors — apid
-// unit tests that don't wire metrics keep working.
+// githubd_bridge_enqueued_total{kind} (issue #432 phase 5;
+// extended for issue #272 / ADR-094 PR-preview environments).
+// Called from cmd/apid/githubd_bridge.go's EnqueueBuild handler
+// on each landed build row. kind is one of GithubdBridgeKindGitHub
+// (production push) or GithubdBridgeKindPreview (pull_request
+// preview). Unknown values produce no increment (closed-set
+// guard). Nil receiver is allowed for parity with the other
+// Observe* accessors — apid unit tests that don't wire metrics
+// keep working.
 //
 // The function name uses the Inc* prefix (not Observe*) because
 // it accepts a state.DeploymentKind-shaped enum value, not a
@@ -4560,7 +4567,7 @@ func (m *OpsMetrics) IncGithubdBridgeEnqueued(kind string) {
 		return
 	}
 	switch kind {
-	case GithubdBridgeKindGitHub:
+	case GithubdBridgeKindGitHub, GithubdBridgeKindPreview:
 		m.apidGithubdBridgeEnqueuedTotal.WithLabelValues(kind).Inc()
 	}
 }

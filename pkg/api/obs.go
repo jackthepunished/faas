@@ -25,7 +25,10 @@
 // non-nil Items slice so the JSON shape is stable.
 package api
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ObsOverviewResponse is the body of GET /v1/admin/obs/overview.
 // A single-object response (not a list) because the overview is a
@@ -175,6 +178,13 @@ type ObsTenantCounts struct {
 // existing operator tooling can switch over with no client
 // changes; the only addition is LastHeartbeatAt omitempty for
 // never-heartbeated nodes.
+//
+// PR #4 (ADR-092) extends this with 7 live-utilization fields:
+// Instances{Live,Running,Waking,ColdBooting}, RAMUsedMB,
+// AdmissionMarginMB (the §6.2 invariant #2 derivative),
+// CPUPct60s, and DiskUsedBytes. The omitempty tags on the stat
+// pointers mean a node that hasn't heartbeated since the
+// migration won't render "0%" / "0 MB" — it renders "—".
 type ObsNodeRow struct {
 	ID                 string    `json:"id"`
 	Name               string    `json:"name"`
@@ -186,6 +196,34 @@ type ObsNodeRow struct {
 	OverlayIP          string    `json:"overlay_ip,omitempty"`
 	LastHeartbeatAt    time.Time `json:"last_heartbeat_at,omitempty"`
 	CreatedAt          time.Time `json:"created_at"`
+
+	// PR #4 live utilization. InstancesLive counts rows in
+	// {WAKING, COLD_BOOTING, RUNNING} on this node (§6.2
+	// invariant #1 set); the per-state counters break that
+	// total down so the operator UI can render "12 running /
+	// 3 waking / 0 cold-booting" tiles.
+	InstancesLive        int64 `json:"instances_live"`
+	InstancesRunning     int64 `json:"instances_running"`
+	InstancesWaking      int64 `json:"instances_waking"`
+	InstancesColdBooting int64 `json:"instances_cold_booting"`
+	// RAMUsedMB is the §6.2 invariant #2 number for this node:
+	// Σ(ram_mb + 8) over live instances. The +8 is folded into
+	// the SQL SUM and the memstore accumulator so the per-node
+	// value sums to the fleet ceiling AdmissionCeilingMB.
+	RAMUsedMB int64 `json:"ram_used_mb"`
+	// AdmissionMarginMB is AdmissionCeilingMB - RAMUsedMB. A
+	// negative value is rendered as a "near-ceiling" badge on
+	// the operator UI; zero or positive is the headroom. Both
+	// fields are int64 for the same reason RAMUsedMB is int64.
+	AdmissionMarginMB int64 `json:"admission_margin_mb"`
+
+	// PR #4 heartbeat stats (nullable; omitempty means pre-PR #4
+	// heartbeats render as "—"). CPUPct60s is the 60-second
+	// sliding-window CPU% bounded [0.00, 100.00]; DiskUsedBytes
+	// is the byte size of /srv/fc/snapshots + spool scratchpad
+	// at heartbeat-mint time.
+	CPUPct60s     *float64 `json:"cpu_pct_60s,omitempty"`
+	DiskUsedBytes *int64   `json:"disk_used_bytes,omitempty"`
 }
 
 // ObsNodeListResponse is the body of GET /v1/admin/obs/nodes.
@@ -214,6 +252,35 @@ type ObsHeartbeatListResponse struct {
 	Limit        int               `json:"limit"`
 }
 
+// ObsWakeLatencyQuantile is one row of per-node wake-latency
+// quantiles (PR #4 / ADR-092 §3.6). NodeID is the compute_nodes.id
+// UUID; NodeName is the human-friendly name resolved by the
+// handler via ListComputeNodes. P50MS / P95MS / P99MS are
+// milliseconds. SampleCount is the underlying observation count
+// (sum across the labelled histogram over the window) — a node
+// with 0 samples renders as a row with all quantiles at 0 and
+// the operator UI shows "no data".
+type ObsWakeLatencyQuantile struct {
+	NodeID      string  `json:"node_id"`
+	NodeName    string  `json:"node_name"`
+	P50MS       float64 `json:"p50_ms"`
+	P95MS       float64 `json:"p95_ms"`
+	P99MS       float64 `json:"p99_ms"`
+	SampleCount int64   `json:"sample_count"`
+}
+
+// ObsNodeWakeLatencyResponse is the body of
+// GET /v1/admin/obs/nodes/wake-latency. The window is fixed at
+// 5m (matches the existing fleet wake_p95 cadence in
+// handlers_account_scoped.go) so the operator can compare the
+// per-node numbers to the fleet p95 in the same window.
+type ObsNodeWakeLatencyResponse struct {
+	Window     string                   `json:"window"`
+	Quantiles  []ObsWakeLatencyQuantile `json:"quantiles"`
+	FleetP95MS float64                  `json:"fleet_p95_ms"`
+	AsOf       time.Time                `json:"as_of"`
+}
+
 // ObsHeartbeatRow is one row of the heartbeat list. The fields
 // mirror the existing compute_node_heartbeats table; GapToPrevious
 // is the millisecond gap from the prior row (handler-computed)
@@ -239,9 +306,18 @@ type ObsHeartbeatRow struct {
 // and never reach the wire. Reason explains which detector fired:
 // "hour_of_day" for the primary Z-score, "raw_z" for the low-
 // traffic fallback (baseline_mean × 5 with stddev < 1.0).
+//
+// PR #4 (ADR-092 §3.4 amendment) adds NodeID + NodeName
+// (omitempty): these are populated only when the operator
+// passed ?group_by=node. The default ?group_by=app leaves them
+// empty so existing dashboard renderers don't have to learn
+// about the new field. NodeName is resolved server-side via
+// the existing computeNodes slice in the handler.
 type ObsAnomalyRow struct {
 	AccountID       string   `json:"account_id"`
 	AppID           string   `json:"app_id"`
+	NodeID          string   `json:"node_id,omitempty"`
+	NodeName        string   `json:"node_name,omitempty"`
 	Minute          string   `json:"minute"`  // RFC 3339, parsed server-side
 	Current         float64  `json:"current"` // mb_seconds in the minute
 	BaselineMean    float64  `json:"baseline_mean"`
@@ -254,12 +330,15 @@ type ObsAnomalyRow struct {
 // ObsAnomalyListResponse is the body of GET /v1/admin/obs/anomalies.
 // GeneratedAt + WindowHours + BaselineWindowDays surface the query
 // parameters the operator passed so the dashboard can render
-// "scanned 24h vs 7d baseline" inline. Items is always non-nil;
+// "scanned 24h vs 7d baseline" inline. GroupBy echoes the caller's
+// ?group_by= parameter (default "app", opt-in "node") so the
+// operator UI can confirm the grain. Items is always non-nil;
 // an empty window returns an empty slice, not null.
 type ObsAnomalyListResponse struct {
 	GeneratedAt        time.Time       `json:"generated_at"`
 	WindowHours        int             `json:"window_hours"`
 	BaselineWindowDays int             `json:"baseline_window_days"`
+	GroupBy            string          `json:"group_by"`
 	Items              []ObsAnomalyRow `json:"items"`
 }
 
@@ -305,4 +384,86 @@ type ObsRateLimitResponse struct {
 	LagSeconds  int                      `json:"lag_seconds"`
 	Durable     []ObsRateLimitDurableRow `json:"durable"`
 	Live        []ObsRateLimitLiveRow    `json:"live"`
+}
+
+// ObsAuditLogSearchResponse is the body of GET /v1/admin/obs/audit-log/search
+// (ADR-091 §3.7 / PR #3). Rows are projected verbatim from the FK-free
+// audit_log table (migrations/00163) — the table has no GIN index on
+// data and per ADR-091 §3.7.1 (amended 2026-08-10) the search surface
+// does NOT offer free-text on data. Filters are ?account_id, ?kind_prefix,
+// ?since, ?include_anonymous, ?limit; the full filter set is in
+// pkg/state.AuditLogFilter. PII access is logged separately by the
+// handler (every include_anonymous=true call emits a pii.accessed audit
+// row keyed on the caller).
+//
+// Items is always non-nil so the JSON shape is stable on empty windows;
+// IncludeAnonymous is the effective value (caller's request, not the
+// server's default) so the operator UI can render "anonymous rows
+// surfacing" without a second round-trip.
+type ObsAuditLogSearchResponse struct {
+	GeneratedAt      time.Time        `json:"generated_at"`
+	Items            []ObsAuditLogRow `json:"items"`
+	Limit            int              `json:"limit"`
+	IncludeAnonymous bool             `json:"include_anonymous"`
+	WindowHours      int              `json:"window_hours"`
+	KindPrefix       string           `json:"kind_prefix,omitempty"`
+	AccountID        string           `json:"account_id,omitempty"`
+}
+
+// ObsAuditLogRow is one row of the audit-log search. The fields are
+// the audit_log table verbatim — AccountID is the canonical UUID
+// (empty for anonymous rows), AccountEmail is the copy-time capture
+// (empty for anonymous rows), and Data is the verbatim JSON payload.
+// The grep tests in handlers_admin_obs_pr3_security_test.go pin the
+// omission of any caller-side redaction; this struct IS the wire shape.
+type ObsAuditLogRow struct {
+	ID           string          `json:"id"`
+	Kind         string          `json:"kind"`
+	AccountID    string          `json:"account_id,omitempty"`
+	AccountEmail string          `json:"account_email,omitempty"`
+	Actor        string          `json:"actor,omitempty"`
+	ReceivedAt   time.Time       `json:"received_at"`
+	Data         json.RawMessage `json:"data,omitempty"`
+}
+
+// ObsEventListResponse is the body of GET /v1/admin/obs/events
+// (ADR-091 §3.7 / PR #3). Distinct from ObsAuditLogSearchResponse
+// in two load-bearing axes (ADR-091 §3.7.4, "one source of truth per
+// intent"):
+//
+//   - Source table: events (live, bigint id, append-only) vs
+//     audit_log (FK-free, copy-time evidence). The two surfaces do
+//     NOT overlap.
+//   - Filter set: events has no `include_anonymous` toggle (every
+//     events row has an actor) and surfaces `actor` / `subject` /
+//     `kind_prefix` instead of `account_id` / `kind_prefix`.
+//
+// Items is always non-nil so the JSON shape is stable on empty windows.
+type ObsEventListResponse struct {
+	GeneratedAt time.Time     `json:"generated_at"`
+	Items       []ObsEventRow `json:"items"`
+	Limit       int           `json:"limit"`
+	WindowHours int           `json:"window_hours"`
+	KindPrefix  string        `json:"kind_prefix,omitempty"`
+	Actor       string        `json:"actor,omitempty"`
+	Subject     string        `json:"subject,omitempty"`
+}
+
+// ObsEventRow is one row of the events table read. The bigint id
+// surfaces as a string so JavaScript clients don't lose precision;
+// At is the event timestamp (RFC 3339 wire format). Subject is the
+// optional UUID the event relates to (e.g. an app_id for wake.* events).
+// Data is the verbatim JSON payload — admins need to see wake_id,
+// sidecar_name, instance_id, etc.
+//
+// PR #3 deliberately does NOT redact Data; the operator surface is
+// admin-only and the data column is the source of truth for the
+// related wire payloads (DEC-2 / ADR-091 §3.7.4).
+type ObsEventRow struct {
+	ID      int64           `json:"id"`
+	At      time.Time       `json:"at"`
+	Actor   string          `json:"actor"`
+	Kind    string          `json:"kind"`
+	Subject string          `json:"subject,omitempty"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }

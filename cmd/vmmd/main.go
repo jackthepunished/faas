@@ -860,6 +860,33 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("vmmd: load schedd client TLS: %w", err)
 	}
 	deps.scheddClientTLS = scheddClientTLS
+
+	// ADR-052 §5 / PR-E: route the server + schedd-client loads
+	// through the WithReload factories so a SIGHUP-driven reload
+	// (`gregale pki rotate` → `kill -HUP $(pidof faas-vmmd)`)
+	// swaps material on the next inbound / outbound handshake
+	// without restart. serverRotator / scheddClientRotator hold
+	// the live *tls.Config; Listen's tls.Config + the per-handshake
+	// stdlib callback consult the rotator's Reload closure at
+	// handshake time.
+	serverRotator := wire.NewTLSRotator(serverTLS)
+	scheddClientRotator := wire.NewTLSRotator(scheddClientTLS)
+	// Replace the boot-time configs with reload-wrapped variants
+	// so Listen + ServerCreds + the schedd dial go through the
+	// rotator's Reload path. Listen and the publisher dial cache
+	// *tls.Config pointers — the rotator's Get() is observed on
+	// subsequent operations after Set.
+	serverTLS, err = cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, serverRotator.Reload(serverTLS))
+	if err != nil {
+		return fmt.Errorf("vmmd: load server TLS (reload): %w", err)
+	}
+	serverRotator.Set(serverTLS)
+	scheddClientTLS, err = cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(nodeVerifier, scheddClientRotator.Reload(scheddClientTLS))
+	if err != nil {
+		return fmt.Errorf("vmmd: load schedd client TLS (reload): %w", err)
+	}
+	scheddClientRotator.Set(scheddClientTLS)
+	deps.scheddClientTLS = scheddClientTLS
 	lis, err := deps.listen(ctx, listenTarget, serverTLS, cfg.OwnerUser)
 	if err != nil {
 		return fmt.Errorf("vmmd: listen %s: %w", listenTarget, err)
@@ -1116,6 +1143,31 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	signal.Notify(hupCh, syscall.SIGHUP)
 	defer signal.Stop(hupCh)
 	go watchEgressBundleReload(ctx, mgr, cfg.EgressOperatorAllowlist, log, hupCh)
+	// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation on the
+	// same hupCh the egress-bundle reload watches. Reuses the
+	// channel — each signal is consumed by both watchers — and
+	// uses the best-effort failure posture WatchTLSReload pins
+	// (matches watchEgressBundleReload's contract: a malformed
+	// cert file does NOT brick the daemon's mTLS leg).
+	serverReload := func() (*tls.Config, error) {
+		return cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	scheddClientReload := func() (*tls.Config, error) {
+		return cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	}
+	// serverHupCh + scheddHupCh get every SIGHUP (signal.Notify
+	// fans the signal out to every registered channel). The
+	// single hupCh above is owned by watchEgressBundleReload and
+	// is consumed there; the new channels keep the tls reloads
+	// independent of that path.
+	serverHupCh := make(chan os.Signal, 1)
+	signal.Notify(serverHupCh, syscall.SIGHUP)
+	defer signal.Stop(serverHupCh)
+	scheddClientHupCh := make(chan os.Signal, 1)
+	signal.Notify(scheddClientHupCh, syscall.SIGHUP)
+	defer signal.Stop(scheddClientHupCh)
+	go wire.WatchTLSReload(ctx, log, serverHupCh, serverRotator, serverReload)
+	go wire.WatchTLSReload(ctx, log, scheddClientHupCh, scheddClientRotator, scheddClientReload)
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)

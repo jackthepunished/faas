@@ -733,6 +733,11 @@ func cmdDeployTarball(args []string) int {
 	// explicit 1-exit error.
 	repo := fs.String("repo", "", "GitHub repo to deploy from (owner/name)")
 	ref := fs.String("ref", "", "git ref for --repo (branch, tag, or 40-char SHA)")
+	// Issue #270: --github emits a copy-paste-ready GitHub Actions
+	// workflow snippet to stdout and exits 0. No auth, no side effects,
+	// mirrors `cmdBillingPortal --print` (commands_billing.go:104-157).
+	// See cmd_deploy_github.go for the snippet body.
+	githubSnippet := fs.Bool("github", false, "emit a GitHub Actions workflow snippet for the faas-deploy-action")
 	templateName := fs.String("template", "", "start from an embedded template (run with a bad value to see available names)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine|node24|python313)")
@@ -781,9 +786,30 @@ func cmdDeployTarball(args []string) int {
 	// gregale.yaml with a `triggers:` block is applied AFTER CreateApp
 	// (and BEFORE the deploy body ships) — see deployManifestTriggers.
 	noTriggers := fs.Bool("no-triggers", false, "skip the `gregale.yaml` triggers fan-out (issue #791 PR-C)")
+	// PR-0 of the deploy-diff cluster (see docs/adr/ draft):
+	// gregale deploy --diff renders what the deploy would change
+	// against the live state and exits per the gate. --json emits
+	// the stable wire shape; --strict (default) blocks on schema
+	// break / quota violation / missing required env; --lenient
+	// exits 0 even on breaks (still renders them). --server-diff
+	// routes the baseline + projection through apid's
+	// POST /v1/apps/{slug}/diff (PR-1), not the SDK client
+	// locally. The flag pair --strict / --lenient mirrors the
+	// existing --require-authn / --no-require-authn mutex shape
+	// at commands2.go:791-799.
+	diff := fs.Bool("diff", false, "preview what would change without deploying")
+	diffJSON := fs.Bool("json", false, "emit JSON output (only with --diff)")
+	diffStrict := fs.Bool("strict", false, "exit non-zero on schema/quota/env breaks (default with --diff)")
+	diffLenient := fs.Bool("lenient", false, "exit zero even on breaks; --diff still renders them")
+	serverDiff := fs.Bool("server-diff", false, "compute the diff on apid via POST /v1/apps/{slug}/diff (PR-1) instead of locally")
 	if err := fs.Parse(args); err != nil {
 		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
+	}
+	// --strict / --lenient mutex. Same rationale as
+	// --require-authn / --no-require-authn above.
+	if *diffStrict && *diffLenient {
+		return printErr("Invalid flags", fmt.Errorf("--strict and --lenient are mutually exclusive"))
 	}
 	// Issue #560: flag-pair mutex check (mirrors cmdApp /
 	// cmdAppScale --warm-snapshot/--no-warm-snapshot). Setting
@@ -845,6 +871,19 @@ func cmdDeployTarball(args []string) int {
 	slug := *name
 	if slug == "" {
 		slug = deriveName()
+	}
+
+	// --github emits a copy-paste GitHub Actions workflow snippet to
+	// stdout and exits 0 (issue #270). No auth, no side effects — this
+	// is a documentation-generation path, not a deploy path. The snippet
+	// uses the resolved slug from --name / cwd (slug variable above)
+	// and emits ${{ github.* }} placeholders by default, or concrete
+	// values when running inside a Actions runner (GITHUB_REPOSITORY +
+	// GITHUB_SHA env vars). Slots above the --repo short-circuit so a
+	// customer can run `gregale deploy --github --name my-app` without
+	// a --ref. The slug is the only required input.
+	if *githubSnippet {
+		return cmdDeployGithubSnippet([]string{"--app", slug})
 	}
 
 	// --repo is the headless source-ref deploy path (issue #739 /
@@ -1043,6 +1082,20 @@ func cmdDeployTarball(args []string) int {
 		return printErr("Not logged in", err)
 	}
 	ctx := context.Background()
+
+	// Deploy-diff short-circuit (PR-0 of the deploy-diff cluster).
+	// Runs AFTER authedClient so the SDK reads can resolve, and
+	// BEFORE the Phase 3 / CreateApp / Deploy body so no writes
+	// happen. --diff never ships a deploy.
+	if *diff {
+		opts := buildDiffOptions(slug, resolvedShape, *runtime, *handler, *image, cwd, requireAuthnPtr)
+		opts.JSON = *diffJSON
+		// --strict is the default; --lenient opts out.
+		opts.Strict = !*diffLenient
+		opts.Lenient = *diffLenient
+		opts.ServerDiff = *serverDiff
+		return runDiff(ctx, client, opts)
+	}
 
 	// Phase 3 (repo decomposition) one-key provision path. Triggered
 	// by --only or --project-slug on a --tarball / --template / zero-config

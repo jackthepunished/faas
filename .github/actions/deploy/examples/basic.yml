@@ -1,0 +1,21 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    environment: production             # opt-in; remove if not using GitHub Environments
+    permissions:
+      contents: read
+      id-token: none                    # OIDC is out of scope for the first action
+    steps:
+      - uses: poyrazK/faas/.github/actions/deploy@v1
+        with:
+          api-key: ${{ secrets.GREGALE_API_KEY }}
+          api-base: https://api.faas.example
+          app: my-app
+          # repo / ref default to ${{ github.repository }} / ${{ github.sha }}
+          wait: "true"

@@ -14,6 +14,14 @@ unrelated in concern).
   routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
   `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
   the new file locations.
+- **Partially superseded (in §1 only, ADR-093):** opt-in apps with
+  `apps.route_metrics_enabled=true` additionally emit
+  `gateway_request_duration_seconds{app,route,class}` and an
+  in-memory control-listener reader at
+  `GET /v1/internal/apps/{slug}/routes`. The decision to drop the
+  `route` label for **non-opt-in** apps is preserved verbatim. The
+  `{app, class}` histogram and the `cold_wake` → `cold_boot` rename
+  are untouched. See ADR-093 for the bounded-per-app opt-in shape.
 
 ## Context
 

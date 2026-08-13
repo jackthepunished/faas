@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { RouteRow } from './RouteRow.js';
 /**
  * Per-app metrics snapshot (issue #273 / ADR-041). Latencies are
  * milliseconds for the 2xx class only; failures surface as
@@ -61,5 +62,17 @@ export type AppMetricsResponse = {
    * Per-app egress byte delta over the window (informational; not billed). ADR-046. Source: schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until then this field stays 0).
    */
   egress_bytes?: number;
+  /**
+   * Per-route breakdown for opt-in apps (ADR-093). Absent when
+   * `route_metrics_enabled` is false on the app — the dashboard
+   * distinguishes "feature off" (field absent) from "feature
+   * on, no traffic" (empty array). Each row is the bounded
+   * detail from the gatewayd-internal in-memory reader: max
+   * 50 distinct routes + the `__route_other__` wildcard-path
+   * overflow bucket. The route label is method + raw path
+   * (pre-rewrite, ADR-093 D6).
+   *
+   */
+  routes?: Array<RouteRow>;
 };
 

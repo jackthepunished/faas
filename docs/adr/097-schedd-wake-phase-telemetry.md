@@ -1,9 +1,12 @@
-# ADR-093 · schedd wake-phase telemetry
+# ADR-097 · schedd wake-phase telemetry
 
-- **Status:** accepted v1.0 (2026-08-12)
+- **Status:** accepted v1.0 (2026-08-12; renumbered 093 → 096 → 097 to avoid
+  collisions with ADR-093 (per-route-app-metrics, issue #273 / PR #861) and
+  ADR-096 (customer-facing error grouping, PR #863 PR-A — reserves the slot
+  for PR-C's `docs/adr/096-customer-error-grouping.md`))
 - **Date:** 2026-08-12
 - **Decision:** Add a single new Prometheus HistogramVec
-  `schedd_wake_phase_duration_seconds{app, phase}` on schedd, with closed-set
+  `schedd_wake_rpc_duration_seconds{app, phase}` on schedd, with closed-set
   `phase ∈ {admit_to_rpc, rpc_call, rpc_to_running}`. Bucket set reuses the
   spec §6.3 wake-latency budget (`0.05`–`5` seconds) with one extra low-end
   bucket (`0.01`) for the admit-to-RPC phase, which is dominated by
@@ -84,7 +87,7 @@
     metric. Add a paragraph naming the new histogram and stating which
     schedd phase corresponds to which histogram row. Spec §12.1 (the
     metric catalogue at line 788) gets a new table row for
-    `schedd_wake_phase_duration_seconds`.
+    `schedd_wake_rpc_duration_seconds`.
   - **No behaviour change.** All three observations are
     `prometheus.Observer.Observe(seconds)` calls — pure telemetry, no
     conditional branches on the value. The new `time.Now()` calls are
@@ -134,7 +137,7 @@ introduces:
   (`engine_test.go:52-53`) with a 50 ms sleep, asserting non-zero
   observation count for all three phases after a single wake.
 - **`docs/faas_implementation_spec.md`** — §6.3 paragraph + §12.1 row.
-- **`docs/adr/093-schedd-wake-phase-telemetry.md`** — this file.
+- **`docs/adr/097-schedd-wake-phase-telemetry.md`** — this file.
 
 ## Future work
 

@@ -1727,7 +1727,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			RequestedAt: bootInput.startedAt, // best-effort stamp
 		})
 	}
-	// ADR-093 (P1B): capture the schedd-side wake-phase boundaries.
+	// ADR-097 (P1B): capture the schedd-side wake-phase boundaries.
 	//   - rpcStartedAt: the moment just before the vmmd
 	//     CreateFromSnapshot / CreateColdBoot RPC fires. Used to
 	//     observe admit_to_rpc (gap from bootInput.startedAt) and
@@ -1839,7 +1839,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	release2 := e.lockApp(bootInput.appID)
 	defer release2()
 
-	// ADR-093 (P1B): success-path RPC end capture. The error branch
+	// ADR-097 (P1B): success-path RPC end capture. The error branch
 	// above does NOT capture rpcEndedAt — error duration is already
 	// surfaced via the events.BootFailed - events.BootStarted math
 	// (see engine.go:1810-1817). We only need the success-path
@@ -1932,7 +1932,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
-	// ADR-093 (P1B): observe the three schedd-side wake phases.
+	// ADR-097 (P1B): observe the three schedd-side wake phases.
 	//   - admit_to_rpc = rpcStartedAt - bootInput.startedAt.
 	//     Covers the gRPC handler → admitGate → ledger → placement
 	//     → bootInput construction window. bootInput.startedAt is

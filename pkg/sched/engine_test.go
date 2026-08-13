@@ -1029,7 +1029,7 @@ func TestEngineWake_ColdBoot(t *testing.T) {
 	}
 }
 
-// TestEngineWake_PhaseHistograms_Recorded (ADR-093, P1B) — pinning the
+// TestEngineWake_PhaseHistograms_Recorded (ADR-097, P1B) — pinning the
 // schedd-side wake-phase decomposition. A cold-boot wake that takes
 // 50ms inside the fakeVMM RPC must produce a non-zero observation
 // count on every closed-set (app, phase) tuple:

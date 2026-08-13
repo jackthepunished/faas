@@ -18,6 +18,30 @@
     mode: "0644"
   register: gatewayd_internal_unit
 
+# ADR-093 — drop the per-cluster operator kill-switch. Mirrors the
+# alertmanager role's `alertmanager.yml.j2` template drop (tasks/
+# main.yml:126-134). A toml key change restarts the daemon so the
+# new value lands in cmd/gatewayd-internal/config.go:178-216's
+# startup-time LoadConfig. The env-override path
+# (FAAS_GATEWAY_ROUTE_METRICS) is the live-reload escape hatch and
+# does not require this file to change.
+- name: gatewayd_internal_service — ensure /etc/faas exists
+  ansible.builtin.file:
+    path: /etc/faas
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+
+- name: gatewayd_internal_service — render gatewayd.toml
+  ansible.builtin.template:
+    src: gatewayd.toml.j2
+    dest: "{{ gatewayd_config_path }}"
+    owner: root
+    group: faas
+    mode: "0640"
+  notify: restart faas-gatewayd-internal
+
 - name: gatewayd_internal_service — systemctl daemon-reload (idempotent, after new unit file)
   ansible.builtin.systemd:
     daemon_reload: true
