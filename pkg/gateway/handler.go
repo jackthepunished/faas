@@ -2693,6 +2693,34 @@ func (h *Handler) streamingFallbackLog(appID, contentType string) {
 		"app", appID, "content_type", contentType)
 }
 
+// streamingFor is the canonical 4-conjunct gate that decides
+// whether a request is on the streaming opt-in path. Used at
+// the §4.1.2.13 slot (applyEdgeRuleLimit call site) to pick
+// between a rule's buffered and streaming caps. The proxy leg
+// at handler.go has its own inline copy of the same formula
+// because the streaming response-writer wrap is a separate
+// concern from edge-rule application; a future refactor can lift
+// both to this helper. Keep them in lockstep if the conjuncts
+// ever grow.
+//
+// The four conjuncts, in order:
+//
+//   - h.streamingEnabled: the process-wide opt-in flag, set via
+//     WithStreamingEnabled on the Handler (cmd/gatewayd-internal).
+//   - app.StreamingEnabled: the per-app opt-in flag, persisted in
+//     apps.streaming_enabled and surfaced through the per-host
+//     app cache.
+//   - !isAcceptJSON(Accept): the streaming bridge is reserved
+//     for long-lived event/stream responses.
+//   - !isUpgradeRequest(r): WebSocket / HTTP/2 upgrade requests
+//     are long-lived but their body is read by the proxy leg's
+//     hijacker, not buffered.
+func streamingFor(h *Handler, r *http.Request, app App) bool {
+	return h.streamingEnabled && app.StreamingEnabled &&
+		!isAcceptJSON(r.Header.Get("Accept")) &&
+		!isUpgradeRequest(r)
+}
+
 // isAcceptJSON reports whether the request's Accept header opts the
 // request into the buffered path regardless of the per-app
 // streaming_enabled flag (spec §4.1, ADR-047). The check is case-
