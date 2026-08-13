@@ -4318,6 +4318,87 @@ func (a *EdgeRuleMaintenanceAction) Validate() *Problem {
 	return nil
 }
 
+// EdgeRuleThrottleAction is the wire shape for a kind=throttle edge
+// rule (ADR-091 D20.5 amendment, issue #881). The per-route
+// token-bucket primitive: customers tighten the per-route rps/burst
+// below their plan's plan.RateLimitRPS — the apid validator enforces
+// the sub-plan ceiling; the gateway compiler enforces it again at
+// load time.
+//
+// Sub-plan ceiling — the load-bearing constraint. A throttle rule is
+// STRICTLY a tightening primitive. The per-handler parameter passed
+// by the apid handler is the customer's plan row; the ceiling is
+// plan.RateLimitRPS / plan.RateLimitBurst. A rule that exceeds the
+// ceiling is rejected with 422 BEFORE any DB write — a customer
+// cannot raise their plan limit by registering a throttle rule.
+//
+// The wire shape uses float64 for RequestsPerSecond so the
+// recommendation endpoint (which emits ceil(observed_rps * 2)) can
+// hand over a non-integer without coercing the customer's intent.
+// The bucket math spends the float directly in `tokens += dt *
+// rps`, so fractional values are exact under the refill formula.
+//
+// Validate enforces:
+//   - RequestsPerSecond > 0 (a 0-rps rule is a silent no-op AND
+//     would create a bucket that never refills — that bucket is
+//     OUT OF THE EVICTABLE SET per pkg/gateway/ratelimit.go's
+//     full-bucket-only invariant, so it would be a permanent
+//     memory leak).
+//   - RequestsPerSecond ≤ plan.RateLimitRPS (sub-plan ceiling).
+//   - Burst > 0 (same leak rationale as above).
+//   - Burst ≤ plan.RateLimitBurst (sub-plan ceiling).
+//
+// Per-IP sub-keying is deliberately absent in v1 — see
+// pkg/state/types.go::EdgeRuleThrottleAction for the design rationale.
+type EdgeRuleThrottleAction struct {
+	RequestsPerSecond float64 `json:"requests_per_second"`
+	Burst             int     `json:"burst"`
+}
+
+// ThrottleValidationContext is the per-plan ceiling that
+// validateEdgeRuleAction passes into EdgeRuleThrottleAction.Validate.
+// Keeping the boundary explicit (rather than reading limits globally)
+// makes the validator unit-testable without spinning up a plan row —
+// see pkg/api/dto_edge_rules_test.go for the test pattern.
+type ThrottleValidationContext struct {
+	PlanMaxRPS   float64
+	PlanMaxBurst int
+}
+
+func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Problem {
+	if a == nil {
+		return ErrValidation("throttle action is required")
+	}
+	if a.RequestsPerSecond <= 0 {
+		// 0 / negative rps is rejected for two reasons: (1) it is a
+		// silent no-op at request time — every request would be
+		// dropped, indistinguishable from a misconfig; (2) the
+		// bucket's refill formula uses rps as a multiplier, so a 0
+		// rate means the bucket never refills — under
+		// pkg/gateway/ratelimit.go's full-bucket-only invariant the
+		// bucket is permanently unevictable, which is a memory leak.
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: requests_per_second must be > 0 (got %g) — a 0-rps rule is a silent no-op AND would create a permanently unevictable bucket",
+			a.RequestsPerSecond))
+	}
+	if a.Burst <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: burst must be > 0 (got %d) — same rationale as a 0-rps rule",
+			a.Burst))
+	}
+	if ctx.PlanMaxRPS > 0 && a.RequestsPerSecond > ctx.PlanMaxRPS {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: requests_per_second %g exceeds the plan ceiling %g — a throttle rule is strictly a tightening primitive; customers can only narrow, never widen",
+			a.RequestsPerSecond, ctx.PlanMaxRPS))
+	}
+	if ctx.PlanMaxBurst > 0 && a.Burst > ctx.PlanMaxBurst {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: burst %d exceeds the plan ceiling %d — a throttle rule is strictly a tightening primitive",
+			a.Burst, ctx.PlanMaxBurst))
+	}
+	return nil
+}
+
 // EdgeRuleResponse is the wire shape for an edge rule. Action is
 // kept as json.RawMessage so the generated Node/Python SDKs don't
 // need seven per-kind models today; a typed SDK unmarshals into

@@ -6009,6 +6009,29 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 			}
 		}
 	}
+	// kind='throttle' per-app quota (ADR-091 D20.5 amendment, issue
+	// #881). Mirrors the geo shape: tighter cap than
+	// EdgeRulesPerApp because per-route throttles are a
+	// higher-touch cardinality lever. Free customers get 1 rule
+	// under EdgeRulesThrottlePerApp; Hobby 5; Pro 25; Scale 100.
+	// Same FOR UPDATE lock on apps carried by the count above.
+	if in.Kind == EdgeRuleKindThrottle && limits.EdgeRulesThrottlePerApp > 0 {
+		var throttlePerApp int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from edge_rules where app_id = $1 and kind = 'throttle'`, in.AppID,
+		).Scan(&throttlePerApp); err != nil {
+			return EdgeRule{}, fmt.Errorf("state: count edge_rules by kind=throttle for app %s: %w", in.AppID, err)
+		}
+		if throttlePerApp >= limits.EdgeRulesThrottlePerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesThrottlePerApp,
+				Observed:   throttlePerApp,
+				Kind:       string(EdgeRuleKindThrottle),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 
 	actionBytes, err := json.Marshal(in.Action)
 	if err != nil {

@@ -9657,6 +9657,27 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 			}
 		}
 	}
+	// kind='throttle' per-app quota (ADR-091 D20.5 amendment, issue
+	// #881). Mirror of the pgstore branch: race-free under the
+	// memstore's own m.mu (pgstore needs the explicit FOR UPDATE
+	// on apps for race-freedom that the local slice doesn't).
+	if in.Kind == EdgeRuleKindThrottle && limits.EdgeRulesThrottlePerApp > 0 {
+		kindCount := 0
+		for _, r := range m.edgeRules {
+			if r.AppID == in.AppID && r.Kind == EdgeRuleKindThrottle {
+				kindCount++
+			}
+		}
+		if kindCount >= limits.EdgeRulesThrottlePerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesThrottlePerApp,
+				Observed:   kindCount,
+				Kind:       string(EdgeRuleKindThrottle),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 	if in.MatchMethods == nil {
 		in.MatchMethods = []string{}
 	}

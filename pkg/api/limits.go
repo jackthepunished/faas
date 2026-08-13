@@ -434,6 +434,31 @@ type Limits struct {
 	// field; apid-Validate throws CodePlanEdgeRuleKindQuotaReached
 	// when this trips.
 	EdgeRulesGeoPerApp int
+	// EdgeRulesThrottlePerApp caps how many kind='throttle' rules
+	// one app may hold. ADR-091 D20.5 amendment (issue #881):
+	// per-route per-method token-bucket rate limiting customers
+	// attach to one (host, path, http_method) triple. Cardinality
+	// is bounded by configured rules (bucket key is appID+"\x00"+
+	// ruleID), so the per-app quota mirrors EdgeRulesGeoPerApp:
+	// the same Free-allowed posture keeps the abuse-desk path open
+	// and the same per-tier doubling shape (1/5/25/100) keeps the
+	// upgrade curve predictable.
+	//
+	// The finer-grained sub-plan ceiling on the action itself
+	// (rps ≤ plan.RateLimitRPS, burst ≤ plan.RateLimitBurst) is
+	// enforced twice: at apid create/update by
+	// api.EdgeRuleThrottleAction.Validate, and again at gateway
+	// compile time by cmd/gatewayd-internal/edge_rules.go::
+	// compileThrottleRules (defence-in-depth against a direct-DB
+	// write that bypassed apid).
+	//
+	// Per-plan: Free 1, Hobby 5, Pro 25, Scale 100. Throttle is
+	// available on ALL plans including Free (ADR-091 D20.5
+	// sub-decision — same posture as Geo: a customer can size a
+	// throttle on Free before upgrading). Plan gate is enforced
+	// via the EdgeRulesQuotaError.Kind field; apid-Validate
+	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
+	EdgeRulesThrottlePerApp int
 
 	// WebhookPerApp caps how many outbound webhook subscriptions a
 	// single app may register (issue #476 / ADR-076). The plan gate
@@ -823,6 +848,11 @@ var planLimits = map[Plan]Limits{
 		// except DE") is one rule. The upgrade path raises the cap
 		// to 5/25/100.
 		EdgeRulesGeoPerApp: 1,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp so the
+		// upgrade curve from Free → Scale is a single double/triple
+		// progression a customer can predict.
+		EdgeRulesThrottlePerApp: 1,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
@@ -1044,6 +1074,9 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  5,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 5,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
@@ -1254,6 +1287,9 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  25,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 25,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
@@ -1457,6 +1493,9 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  100,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 100,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
