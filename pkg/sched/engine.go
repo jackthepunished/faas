@@ -1132,7 +1132,7 @@ func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, er
 	// This is the load-bearing single-flight coalescing invariant (spec
 	// §4.1, ADR-098 §Decision). Mirror of pkg/gateway/gate.go Wait
 	// goroutine detach.
-	res, err := e.Wake(leaderCtx, appID, "")
+	res, err := e.Wake(leaderCtx, appID, "", "")
 	if err != nil {
 		out.Err = err
 		return out, err

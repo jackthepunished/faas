@@ -71,7 +71,7 @@ func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID, sco
 // EnsureWake (ADR-098): the bufconn tests don't exercise single-flight,
 // so this delegates to the underlying Wake so legacy tests keep passing.
 func (f *fakeEngine) EnsureWake(ctx context.Context, appID string) (sched.CoordOutcome, error) {
-	res, err := f.Wake(ctx, appID, "")
+	res, err := f.Wake(ctx, appID, "", "")
 	if err != nil {
 		return sched.CoordOutcome{}, err
 	}
