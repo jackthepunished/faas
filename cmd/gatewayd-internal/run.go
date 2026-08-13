@@ -1503,8 +1503,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (CLAUDE.md ownership); the gateway never opens a direct
 	// Postgres connection for this store.
 	//
-	// Kill-switch: FAAS_APP_ERRORS_ENABLED defaults to false
-	// (PR-A's stable point). PR-B flips it to true. When false,
+	// Kill-switch: FAAS_APP_ERRORS_ENABLED defaults to true
+	// (PR-B's stable point — PR-A shipped it OFF so the schema
+	// populated only by hand; PR-B flips the default to ON now
+	// that the customer-facing surface is in place). When false,
 	// the recorder middleware is a pass-through (no per-request
 	// cost beyond a single int compare) and the publisher
 	// goroutine is NOT started.
@@ -1513,7 +1515,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// ADR-015 unix-socket DAC convention shared with schedd +
 	// vmmd). Operators override via FAAS_APID_SOCKET when the
 	// socket path diverges (containerised deployments, etc).
-	appErrorsEnabled := osGetenv("FAAS_APP_ERRORS_ENABLED") == "true"
+	appErrorsEnabled := osGetenv("FAAS_APP_ERRORS_ENABLED") != "false"
 	apidAppErrorsSock := osGetenv("FAAS_APID_APP_ERRORS_SOCKET")
 	if apidAppErrorsSock == "" {
 		apidAppErrorsSock = "/run/faas/app_errors.sock"
@@ -1540,7 +1542,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log.Info("app_errors recorder enabled", "apid_socket", apidAppErrorsSock)
 		}
 	} else {
-		log.Info("app_errors recorder disabled (FAAS_APP_ERRORS_ENABLED != \"true\")")
+		log.Info("app_errors recorder disabled (FAAS_APP_ERRORS_ENABLED == \"false\")")
 	}
 
 	// Issue #249 / spec §11: mount security response headers at the

@@ -585,6 +585,12 @@ const testDomain = "apps.test.example"
 // coexistence marker (passed-through by PR #845's renumber,
 // kept as a no-op so the contiguity gate doesn't trip on the
 // renumber chain).
+//
+// PR-B (this PR, #875, ADR-096 handlers + SDK + OpenAPI) adds
+// NO migration; the head stays at 237 against main at merge.
+// PR-C (e2e + ADR-096 docs) will need its own slot fence —
+// pre-check via `gh api .../contents/migrations?ref=main`
+// before opening the PR per the cross-PR slot precheck pattern.
 const e2eMigrationTarget = 237
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:

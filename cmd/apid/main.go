@@ -1455,12 +1455,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// ADR-096 PR-A: customer-facing automatic error grouping.
 	// The IncrementAppError gRPC server lives behind
-	// FAAS_APP_ERRORS_ENABLED (PR-A ships the kill-switch OFF so the
-	// schema is populated only by hand); the retention purge goroutine
-	// is started alongside it so PR-B can flip the flag without
-	// touching this main(). The reader-path handlers + DTOs + OpenAPI
-	// are PR-B work.
-	if deps.getenv("FAAS_APP_ERRORS_ENABLED") == "true" { //nolint:goconst // kill-switch sentinel; the canonical "true" env literal.
+	// FAAS_APP_ERRORS_ENABLED. PR-A shipped the kill-switch OFF
+	// so the schema populated only by hand; PR-B ships the
+	// customer-facing surface (handlers + SDK + OpenAPI) and
+	// flips the kill-switch to default-on. Set
+	// FAAS_APP_ERRORS_ENABLED=false to cleanly disable both
+	// the writer (apid gRPC) and the gateway-side recorder.
+	if deps.getenv("FAAS_APP_ERRORS_ENABLED") != "false" { //nolint:goconst // kill-switch sentinel; the canonical "true" env literal.
 		appErrSrv, appErrLis, err := runAppErrorsServer(ctx, srv.store, srv.ops, log)
 		if err != nil {
 			_ = l.Close()

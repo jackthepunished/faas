@@ -832,6 +832,15 @@ func (s *server) handler() http.Handler {
 	// caller is an API key with ScopesReadSurface. IDOR-safe
 	// via loadApp (cross-account slug → 404).
 	mux.HandleFunc("GET /v1/apps/{slug}/slo", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppSLO)))
+	// ADR-096 / PR-B — customer-facing automatic error
+	// grouping. Read-only, no MFA, primary caller is an API key
+	// with ScopesReadSurface. IDOR-safe via loadApp
+	// (cross-account slug → 404, byte-identical to a real 404).
+	// The three handlers delegate sqlc → wire DTO conversion to
+	// handlers_app_errors_projection.go.
+	mux.HandleFunc("GET /v1/apps/{slug}/errors/summary", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppErrorsSummary)))
+	mux.HandleFunc("GET /v1/apps/{slug}/errors/{fingerprint}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listAppErrorRequests)))
+	mux.HandleFunc("GET /v1/apps/{slug}/errors/{fingerprint}/first", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppErrorSample)))
 	// Issue #696 / ADR-082 — account-scoped SLO rollup. Flat
 	// scalar responses (Billing-derivable instance_hours /
 	// gb_hours), so the auth chain matches /v1/usage (MFA +

@@ -125,6 +125,7 @@ var sdkMethodExclude = map[string]bool{
 	"BaseURL":             true,
 	"Token":               true,
 	"ListDeploymentsAll":  true, // cursor walker; not a route
+	"ListAppErrorRequestsAll": true, // cursor walker; not a route (ADR-096 / PR-B)
 	"DeployMultipart":     true, // open-ended reader-based upload; CLI's DeployTarball is the wired route
 	"MintCliAuthCode":     true, // anonymous device-code mint; route excluded above
 	"ExchangeCliAuthCode": true, // anonymous device-code poll; route excluded above
@@ -377,6 +378,15 @@ var methodRouteMap = map[string]string{
 	// sibling per-app family (GetAppMetrics, GetAppSLO, GetApp,
 	// ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/routes": "GetAppRoutes",
+
+	// ADR-096 / PR-B — customer-facing automatic error grouping.
+	// SDK names are pinned to the per-app family (GetAppErrorsSummary,
+	// ListAppErrorRequests, GetAppErrorSample) — auto-derivation would
+	// produce GetAppsSlugErrorsSummary / GetAppsSlugErrorsFingerprintFirst
+	// (Swagger-style) which breaks the navigability match.
+	"GET /v1/apps/{slug}/errors/summary":             "GetAppErrorsSummary",
+	"GET /v1/apps/{slug}/errors/{fingerprint}":       "ListAppErrorRequests",
+	"GET /v1/apps/{slug}/errors/{fingerprint}/first": "GetAppErrorSample",
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the

@@ -255,11 +255,19 @@ type Querier interface {
 	// Index path: app_errors_account_app_last_seen_idx covers the
 	// primary scan; the (count DESC) sort happens post-filter on the
 	// bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+	//
+	// sqlc.arg(name) annotations disambiguate the cursor predicate
+	// types — without them sqlc infers both $5 and $6 as timestamptz
+	// from the leading (last_seen_at) reference, breaking pagination.
 	ListAppErrorGroups(ctx context.Context, db DBTX, arg ListAppErrorGroupsParams) ([]ListAppErrorGroupsRow, error)
 	// Drill-down rows for one fingerprint. Cursor paginated via
 	// (received_at, request_id). Index path:
 	// app_error_requests_drill_idx. Does NOT include headers_sample
 	// or redactions — those are returned only by GetAppErrorSample.
+	//
+	// sqlc.arg(name) annotations disambiguate the cursor predicate
+	// types — without them sqlc infers $5 as timestamptz from the
+	// leading (received_at) reference, breaking pagination.
 	ListAppErrorRequests(ctx context.Context, db DBTX, arg ListAppErrorRequestsParams) ([]ListAppErrorRequestsRow, error)
 	ListApps(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAppsRow, error)
 	// CP-1: read heartbeat history for one node, newest first. The

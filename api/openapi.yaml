@@ -1495,6 +1495,140 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/errors/summary:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppErrorsSummary
+      summary: Per-app customer-facing automatic error grouping summary (ADR-096 / PR-B).
+      description: |
+        Sentry-style grouped error view scoped to a customer's
+        app. One row per `(account_id, app_id, fingerprint)` over
+        the requested `[since, until]` window, sorted by `count
+        DESC, last_seen_at DESC, fingerprint ASC`. Distinct from
+        `GET /v1/apps/{slug}/slo` (issue #696 / ADR-082) which is
+        the closed-set SLO summary (`1h` / `24h` / `7d`) — the
+        errors summary uses a continuous `[since, until]` window
+        with an explicit RFC3339Nano stamp instead.
+
+        The window is clamped to `AppErrorsWindowMaxHours` (168h).
+        When the clamp fires, `window_clamped` is true so the
+        dashboard can render a "you widened the window past the
+        cap" tile. The endpoint returns 200 with `items: []`
+        when no fingerprints are present in the window — never
+        404. Cross-account slug is a 404 (IDOR-safe; the error
+        is byte-identical to a real "no such app" 404).
+
+        Fingerprints are derived at write time as
+        `sha256(route_template || "\x1f" || http_status ||
+        "\x1f" || error_class)`. The route is the matched
+        template (e.g. `/users/{id}`), NEVER the expanded URL —
+        this is the load-bearing cardinality fix that keeps the
+        top-N bounded.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date-time }
+          description: "RFC3339Nano UTC window start. Defaults to `until - 24h`."
+        - name: until
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date-time }
+          description: "RFC3339Nano UTC window end. Defaults to `now()`."
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: "Opaque pagination cursor from the previous response's `next_cursor`. Empty for the first page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+          description: "Page size. Default `AppErrorsSummaryDefaultLimit=20`, capped at `AppErrorsSummaryMaxLimit=100`."
+      responses:
+        '200':
+          description: The grouped error summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppErrorsSummaryResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/errors/{fingerprint}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: fingerprint
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+        description: "64-hex-char SHA-256 fingerprint (ADR-096 §3.5)."
+    get:
+      tags: [apps]
+      operationId: listAppErrorRequests
+      summary: Per-fingerprint drill-down rows (ADR-096 / PR-B).
+      description: |
+        Cursor-paginated drill-down over the request rows that
+        landed on this fingerprint. Returns 404 when the
+        fingerprint has been purged by the retention cron or
+        never existed; the cross-account slug case is also 404
+        (IDOR-safe byte-identical to a real "no such app" 404).
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: "Opaque pagination cursor (received_at, request_id compound). Empty for the first page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+          description: "Page size. Default `AppErrorsSummaryDefaultLimit=20`."
+      responses:
+        '200':
+          description: The drill-down rows (newest-first).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppErrorRequestsResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/errors/{fingerprint}/first:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: fingerprint
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+        description: "64-hex-char SHA-256 fingerprint (ADR-096 §3.5)."
+    get:
+      tags: [apps]
+      operationId: getAppErrorSample
+      summary: Single oldest sample row + redacted headers (ADR-096 / PR-B).
+      description: |
+        Returns the OLDEST request row for the fingerprint plus
+        the redacted `headers_sample` (jsonb-decoded) and the
+        list of `redactions_applied` pattern names so the
+        dashboard can render a "we redacted X / Y / Z" badge.
+        Returns 404 when the fingerprint has been purged.
+      responses:
+        '200':
+          description: The sample row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppErrorSampleResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/deployments:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -10801,6 +10935,123 @@ components:
         throttled_total: { type: integer, format: int64, description: "Per-app rate-limit count over the window." }
       x-since: "2026-08"
       x-issue: "696"
+
+    AppErrorsSummaryResponse:
+      description: |
+        Grouped error summary returned by `GET /v1/apps/{slug}/errors/summary`
+        (ADR-096 / PR-B). One row per fingerprint over the
+        requested `[since, until]` window. Distinct from
+        `AppSLOResponse` (ADR-082) which is the closed-set SLO
+        summary — the errors summary uses a continuous window
+        with explicit RFC3339Nano stamps.
+
+        Empty result returns 200 with `items: []` and the
+        window echo set. `window_clamped` is true when the
+        requested span was clamped to `AppErrorsWindowMaxHours`
+        (168h). `next_cursor` is empty when the page is the
+        last one.
+      type: object
+      required: [generated_at, app_id, app_slug, window_start, window_end, window_clamped, items, limit]
+      properties:
+        generated_at: { type: string, format: date-time, description: "RFC3339Nano UTC stamp at which the summary was assembled." }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        app_slug: { type: string }
+        window_start: { type: string, format: date-time, description: "Echoed (clamped) window start, RFC3339Nano UTC." }
+        window_end: { type: string, format: date-time, description: "Echoed (clamped) window end, RFC3339Nano UTC." }
+        window_clamped: { type: boolean, description: "True when the requested span was clamped to AppErrorsWindowMaxHours (168h)." }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AppErrorSummaryItem' }
+        next_cursor: { type: [string, 'null'], description: "Opaque base64 cursor for the next page. Empty when the current page is the last." }
+        limit: { type: integer, description: "Echoed limit applied (post-clamp to AppErrorsSummaryMaxLimit=100)." }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorSummaryItem:
+      description: One row of the errors summary (ADR-096 / PR-B).
+      type: object
+      required: [fingerprint, error_class, route, http_status, count, request_count, first_seen_at, last_seen_at, sample_message]
+      properties:
+        fingerprint: { type: string, pattern: '^[a-f0-9]{64}$', description: "64-hex-char SHA-256 fingerprint (ADR-096 §3.5)." }
+        error_class:
+          type: string
+          enum: [db_timeout, stripe_timeout, null_pointer, invalid_json, wake_failed, upstream_5xx, unhandled, client_error]
+          description: "Closed-vocabulary error class. 'unhandled' is collapsed under 'Other' in the UI; the DB stores the precise class."
+        route: { type: string, description: "Matched route template (e.g. `/users/{id}`), NEVER the expanded URL." }
+        http_status: { type: integer, format: int32, minimum: 400, maximum: 599 }
+        count: { type: integer, format: int64, description: "Issue count (deduped within AppErrorsDedupeWindowSeconds=3600)." }
+        request_count: { type: integer, format: int64, description: "Total distinct request rows for this fingerprint." }
+        first_seen_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        sample_message: { type: string, description: "PII-redacted sample message (already-redacted at write time; ≤AppErrorsSampleMessageCapBytes=512 bytes)." }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorRequestsResponse:
+      description: |
+        Drill-down page returned by `GET /v1/apps/{slug}/errors/{fingerprint}`
+        (ADR-096 / PR-B). The header fields (fingerprint,
+        error_class, route, http_status) are denormalised from the
+        parent summary row so the dashboard renders the page header
+        without a second round-trip. Does NOT include
+        `headers_sample` or `redactions` — those are on the
+        `/first` endpoint only.
+      type: object
+      required: [fingerprint, error_class, route, http_status, requests]
+      properties:
+        fingerprint: { type: string, pattern: '^[a-f0-9]{64}$' }
+        error_class: { type: string }
+        route: { type: string }
+        http_status: { type: integer, format: int32 }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/AppErrorRequestItem' }
+        next_cursor: { type: [string, 'null'] }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorRequestItem:
+      description: One row of the drill-down page (ADR-096 / PR-B).
+      type: object
+      required: [request_id, received_at, route, http_status, error_class, sample_message]
+      properties:
+        request_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        received_at: { type: string, format: date-time }
+        route: { type: string }
+        http_status: { type: integer, format: int32 }
+        error_class: { type: string }
+        sample_message: { type: string }
+        deployment_id: { type: [string, 'null'], pattern: '^[a-f0-9]{32}$', description: "Nullable — the FK is ON DELETE SET NULL so an evicted deployment leaves the drill-down row intact." }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorSampleResponse:
+      description: |
+        Single sample row returned by `GET /v1/apps/{slug}/errors/{fingerprint}/first`
+        (ADR-096 / PR-B). Embeds `AppErrorRequestItem` plus the
+        redacted `headers_sample` (jsonb-decoded to map) and the
+        `redactions_applied` pattern names so the dashboard can
+        render a "we redacted X / Y / Z" badge.
+      type: object
+      required: [request_id, received_at, route, http_status, error_class, sample_message, headers_sample, redactions_applied]
+      properties:
+        request_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        received_at: { type: string, format: date-time }
+        route: { type: string }
+        http_status: { type: integer, format: int32 }
+        error_class: { type: string }
+        sample_message: { type: string }
+        deployment_id: { type: [string, 'null'], pattern: '^[a-f0-9]{32}$' }
+        headers_sample:
+          type: object
+          additionalProperties: { type: string }
+          description: "PII-redacted request headers (≤8 keys)."
+        redactions_applied:
+          type: array
+          items: { type: string }
+          description: "Names of the redactor patterns that fired (e.g. `email`, `card`, `bearer`)."
+      x-since: "2026-08"
+      x-issue: "ADR-096"
 
     AccountSLOResponse:
       description: |
