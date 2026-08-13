@@ -3694,3 +3694,44 @@ func TestUpdateAppEgressAllowlist_ExtraAppliedToValidatorMessage(t *testing.T) {
 		t.Errorf("problem.limit = %d, want 20 (plan_cap=16 + extra=4)", *p.Limit)
 	}
 }
+
+// TestUpdateAppWebSocket_FreeGate (issue #676 / ADR-080 follow-up)
+// confirms the Free plan fail-closed contract on the PATCH path:
+// Free customers cannot opt-in to per-app WebSocket at PATCH time.
+// The request-time 501 path is covered by
+// pkg/gateway/forwardproxy_handler_test.go::TestServeHTTP_FreePlan_WebSocketNotAllowed;
+// this test pins the apid-layer gate so a future refactor that drops
+// the plan check surfaces here, not in production.
+//
+// The gate is asymmetric (cmd/apid/handlers_ext.go:258-262): opt-in
+// (websocket_enabled: true) is 403 plan_websocket_not_allowed; opt-out
+// (false) is a 200 — Free customers can always disable the flag. The
+// sibling test below pins the opt-out path so a future tightening
+// that adds a symmetric gate on false surfaces here too.
+func TestUpdateAppWebSocket_FreeGate(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-ws")
+	tru := true
+	rec := e.do(t, "PATCH", "/v1/apps/free-ws", api.UpdateAppRequest{WebSocketEnabled: &tru}, nil)
+	assertProblem(t, rec, 403, api.CodePlanWebSocketNotAllowed)
+}
+
+// TestUpdateAppWebSocket_FreeOptOut (issue #676 / ADR-080 follow-up)
+// confirms the asymmetric gate: Free customers may PATCH
+// websocket_enabled=false even though opt-in is 403. Mirrors the
+// streaming_enabled pattern (cmd/apid/handlers_ext.go:248-252): the
+// fail-closed contract is opt-in only, because opt-out is the safe
+// direction (a Free customer turning off WS doesn't cost Gregale
+// anything). Plan.WebSocketResponseAllowed() vs
+// Plan.WebSocketEnabled() collapse to the same bool but the apid
+// layer calls the response-allowed accessor for the gate per ADR-080
+// §"Per-app + per-plan gating".
+func TestUpdateAppWebSocket_FreeOptOut(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-ws-out")
+	fal := false
+	rec := e.do(t, "PATCH", "/v1/apps/free-ws-out", api.UpdateAppRequest{WebSocketEnabled: &fal}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d, want 200 (asymmetric gate; opt-out always allowed): %s", rec.Code, rec.Body)
+	}
+}

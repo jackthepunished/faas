@@ -157,6 +157,35 @@ func streamingEnabledFromEnv() bool {
 	return false
 }
 
+// rawStreamEnabledFromEnv (issue #676 / ADR-080 follow-up) resolves the
+// FAAS_GATEWAY_RAW_STREAM_ENABLED operator kill switch. Default is true
+// — production already runs the raw-bytes Upgrade bridge; defaulting
+// to false would silently regress every deployment until operators
+// set the env. Accepted truthy values mirror FAAS_GATEWAY_STREAMING
+// (1/true/yes, case-insensitive); anything else falls through to
+// false (operator must opt out explicitly) and is logged via slog
+// at startup so a typo is visible.
+//
+// When the env resolves to false the handler.WithRawForwarding call
+// is skipped below (run.go: ~line 1090), leaving h.rawByNode nil. The
+// three-input gate at pkg/gateway/handler.go:2899
+// (isUpgradeRequest(r) && app.WebSocketEnabled && h.rawByNode != nil)
+// falls through to writeWebSocketNotAllowed with the
+// forwarderMissing=true detail — a deterministic 501 with
+// x-faas-error-reason: websocket_not_on_plan. The kill switch is
+// therefore load-bearing: it is the first operator control to reach
+// for when the raw forwarder itself is misbehaving (per-app PATCH
+// only helps if the bridge is healthy for OTHER apps on the box).
+func rawStreamEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_RAW_STREAM_ENABLED", streamingFlagTrue)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
 // gRPC client + the in-process gateway handler. Move 1 widens the
 // surface from Wake-only to two methods so the synthetic HTTP envelope
@@ -1085,7 +1114,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// three-input gate routes Connection: Upgrade requests
 		// here BEFORE falling through to WithForwarding's
 		// ForwardHTTPStream bridge.
-		handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		//
+		// Operator kill switch (issue #676 follow-up): when
+		// FAAS_GATEWAY_RAW_STREAM_ENABLED=false, the call is
+		// skipped — h.rawByNode stays nil, and the three-input
+		// gate at pkg/gateway/handler.go:2899 falls through to
+		// writeWebSocketNotAllowed(forwarderMissing=true),
+		// returning a deterministic 501 + x-faas-error-reason:
+		// websocket_not_on_plan. Default is true; see
+		// rawStreamEnabledFromEnv above.
+		if rawStreamEnabledFromEnv() {
+			handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		} else {
+			slog.Info("gatewayd-internal: raw-bytes Upgrade bridge disabled by FAAS_GATEWAY_RAW_STREAM_ENABLED=false",
+				"fallthrough", "writeWebSocketNotAllowed(forwarderMissing=true)")
+		}
 	}
 
 	// Per-instance last_request_at flush loop (spec §4.1). Present in production;
