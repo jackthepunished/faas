@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00223_deployments_secret_findings.sql — secret-scan v2 audit row.
+-- 00231_deployments_secret_findings.sql — secret-scan v2 audit row.
 --
 -- Closes v1 gap B: when the server-side scan (cmd/apid/secretscan.go)
 -- finds secret-shaped bytes in a deployment, the findings list and
@@ -40,7 +40,7 @@
 -- (deployments_scope) and 00203 (app_envs_scope_shape).
 --
 -- Slot reservation: this migration replaces
--- migrations/00223_reserve_slot.sql, which held the slot before
+-- migrations/00231_reserve_slot.sql, which held the slot before
 -- PR-A landed. The fence file is removed in the same PR that
 -- introduces this real migration.
 
