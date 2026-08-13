@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+    from ..models.edge_rule_geo_action import EdgeRuleGeoAction
     from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
     from ..models.edge_rule_ip_action import EdgeRuleIPAction
     from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
@@ -35,6 +36,7 @@ class UpdateEdgeRuleRequest:
     enabled: bool | Unset = UNSET
     action: (
         EdgeRuleCORSAction
+        | EdgeRuleGeoAction
         | EdgeRuleHeadersAction
         | EdgeRuleIPAction
         | EdgeRuleJWTAction
@@ -117,6 +119,7 @@ class UpdateEdgeRuleRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+        from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
         from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
@@ -142,6 +145,7 @@ class UpdateEdgeRuleRequest:
             data: object,
         ) -> (
             EdgeRuleCORSAction
+            | EdgeRuleGeoAction
             | EdgeRuleHeadersAction
             | EdgeRuleIPAction
             | EdgeRuleJWTAction
@@ -227,11 +231,23 @@ class UpdateEdgeRuleRequest:
                 return action_type_8
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            if not isinstance(data, dict):
-                raise TypeError()
-            action_type_9 = EdgeRuleMaintenanceAction.from_dict(data)
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_9 = EdgeRuleMaintenanceAction.from_dict(data)
 
-            return action_type_9
+                return action_type_9
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_10 = EdgeRuleGeoAction.from_dict(data)
+
+                return action_type_10
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return None
 
         action = _parse_action(d.pop("action", UNSET))
 

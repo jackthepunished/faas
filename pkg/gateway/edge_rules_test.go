@@ -510,13 +510,17 @@ func TestEdgeRuleCache_HostEntryKindIsolation(t *testing.T) {
 func TestEdgeRuleMatcher_WidenedInterfaceSatisfied(t *testing.T) {
 	// Compile-time check: noOpEdgeRuleMatcher (which provides
 	// default no-op behaviour) satisfies the widened EdgeRuleMatcher
-	// interface. If PR 5-7 add new Match* methods and forget to
-	// add a noOp default, this assignment fails to compile.
+	// interface. If PR 5-7 (or PR 8 kind=geo) add new Match* methods
+	// and forget to add a noOp default, this assignment fails to compile.
 	var m EdgeRuleMatcher = noOpEdgeRuleMatcher{}
 	_ = m.MatchRoute(nil, "h", "/", "GET")
 	_ = m.MatchRewrite(nil, "h", "/", "GET")
 	_ = m.MatchRedirect(nil, "h", "/", "GET")
 	_ = m.MatchHeaders(nil, "h", "/", "GET")
+	_ = m.MatchCORS(nil, "h", "/", "GET")
+	_ = m.MatchJWT(nil, "h", "/", "GET")
+	_ = m.MatchIP(nil, "h", "/", "GET")
+	_ = m.MatchGeo(nil, "h", "/", "GET")
 	m.Reset()
 }
 
@@ -662,10 +666,11 @@ func sampleMaintenanceRule(id string, prio int, host string) EdgeRuleMaintenance
 	}
 }
 
-// putEntryAll is the PR 6 widening of putEntry: covers all 10 kinds
-// after the kind=maintenance extension (ADR-091 amendment, §4.1.2.13).
-// The validate widening was PR-B; the limit widening was D24; the
-// maintenance widening is this PR. Mirrors cmd-side loadHost's
+// putEntryAll is the PR 6 widening of putEntry: covers all 11 kinds
+// after the kind=maintenance and kind=geo extensions (ADR-091 D21
+// amendment, §4.1.2.13). The validate widening was PR-B; the limit
+// widening was D24; the maintenance widening is PR-A; the geo
+// widening is PR-A's sibling cluster. Mirrors cmd-side loadHost's
 // single-pass compile pattern — the production loader always
 // populates every kind at once; this test helper does the same.
 //
@@ -684,6 +689,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 	validate []EdgeRuleValidateResolved,
 	limit []EdgeRuleLimitResolved,
 	maintenance []EdgeRuleMaintenanceResolved,
+	geo []EdgeRuleGeoResolved,
 ) {
 	c.Put(host, &HostEntry{
 		Host:        host,
@@ -697,6 +703,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 		Validate:    validate,
 		Limit:       limit,
 		Maintenance: maintenance,
+		Geo:         geo,
 	})
 }
 
@@ -840,28 +847,28 @@ func TestPickFirstLimitMatch_MethodsFilter(t *testing.T) {
 
 // --- PR 6: wholesale-Reset() property test (ADR-091 D17) ----------
 //
-// The EdgeRuleCache is the LRU mirror for all 8 edge-rule kinds
-// (route, rewrite, redirect, headers, cors, jwt, ip, validate).
+// The EdgeRuleCache is the LRU mirror for all 9 edge-rule kinds
+// (route, rewrite, redirect, headers, cors, jwt, ip, validate, geo).
 // pg_notify-driven invalidation in cmd/gatewayd-internal/backend.go
 // fires Reset() wholesale — a regression against any single kind
 // fails this test, surfacing as a cache-consistency violation for
-// ALL 8 kinds simultaneously. The deterministic 8-row table is the
+// ALL 9 kinds simultaneously. The deterministic 9-row table is the
 // load-bearing assertion; the fuzz target is hardening on top.
 //
 // Why one row per kind: the cache stores a HostEntry whose slices
-// cover all 8 kinds together. Reset() drops the whole HostEntry
+// cover all 9 kinds together. Reset() drops the whole HostEntry
 // (and every kind's slice inside it). Pinning that pre-Reset each
 // kind's GetK returns a hit AND post-Reset each kind's GetK returns
 // (nil, false) is the invariant that catches "Reset forgot kind X"
 // regressions before they ship.
 
-// TestEdgeRuleReset_WholesaleAcrossAllTenKinds is the deterministic
-// 10-row table that pins the wholesale-Reset invariant. The PR-C
+// TestEdgeRuleReset_WholesaleAcrossAllElevenKinds is the deterministic
+// 11-row table that pins the wholesale-Reset invariant. The PR-C
 // rename widened the original PR-6 SevenKinds test to cover the
 // kind=validate slice added by PR-B; PR #855 widened it again for
-// kind=limit (ADR-091 D24); the ADR-091 amendment widens it once
-// more for kind=maintenance (§4.1.2.13). See plan §D1 + D24.
-func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
+// kind=limit (ADR-091 D24); PR-A widens it for kind=maintenance
+// (§4.1.2.13) and for kind=geo (D21). See plan §D1 + D21 + D24.
+func TestEdgeRuleReset_WholesaleAcrossAllElevenKinds(t *testing.T) {
 	c := NewEdgeRuleCache(EdgeRuleCacheCap)
 	host := "a.example.com"
 	putEntryAll(c, host,
@@ -875,6 +882,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
 		[]EdgeRuleValidateResolved{sampleValidateRule("vd", 0, host)},
 		[]EdgeRuleLimitResolved{sampleLimitRule("lm", 0, host)},
 		[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", 0, host)},
+		[]EdgeRuleGeoResolved{sampleGeoRule("geo", 0, []string{"DE"}, nil, "")},
 	)
 
 	// Sanity: every GetK returns a hit pre-Reset.
@@ -892,6 +900,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
 		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
 		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
+		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
 	}
 	for _, c0 := range preChecks {
 		if !c0.f() {
@@ -915,6 +924,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllTenKinds(t *testing.T) {
 		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
 		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
+		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
 	}
 	for _, c0 := range postChecks {
 		if c0.f() {
@@ -977,6 +987,7 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 						[]EdgeRuleValidateResolved{sampleValidateRule("vd", j, hostA)},
 						[]EdgeRuleLimitResolved{sampleLimitRule("lm", j, hostA)},
 						[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", j, hostA)},
+						[]EdgeRuleGeoResolved{sampleGeoRule("geo", j, []string{"DE"}, nil, "")},
 					)
 				case 1:
 					_, _ = c.Get(hostA)
@@ -986,12 +997,13 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 					_, _ = c.GetValidate(hostA)
 					_, _ = c.GetLimit(hostA)
 					_, _ = c.GetMaintenance(hostA)
+					_, _ = c.GetGeo(hostA)
 				case 2:
 					c.Reset()
 				case 3:
 					putEntryAll(c, hostB,
 						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
-						nil, nil, nil, nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					)
 				}
 			}
@@ -1021,10 +1033,11 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 // host keyed by `i % 4`, then asserts the wholesale invariant:
 // Len() stays within [0, cap]. PR 6 ships three seeds; CI's default
 // fuzz corpus is short, so the deterministic
-// TestEdgeRuleReset_WholesaleAcrossAllEightKinds is the load-bearing
+// TestEdgeRuleReset_WholesaleAcrossAllNineKinds is the load-bearing
 // assertion (the fuzz is hardening on top). PR-C widens the putEntryAll
-// call to cover kind=validate so a regression that bound only 7
-// kinds in the cache would trip under fuzzing.
+// call to cover kind=validate; this PR widens to 9 with kind=geo
+// per ADR-091 D21 so a regression that bound only 8 kinds in the
+// cache would trip under fuzzing.
 func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 	// Three seeds that together exercise Put→Get→Reset,
 	// Put→Reset→Put→Get, and back-to-back Reset patterns.
@@ -1049,6 +1062,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 					[]EdgeRuleValidateResolved{sampleValidateRule("vd", i, host)},
 					[]EdgeRuleLimitResolved{sampleLimitRule("lm", i, host)},
 					[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", i, host)},
+					[]EdgeRuleGeoResolved{sampleGeoRule("geo", i, []string{"DE"}, nil, "")},
 				)
 			case 1: // GetK (any kind)
 				_, _ = c.Get(host)
@@ -1061,6 +1075,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 				_, _ = c.GetValidate(host)
 				_, _ = c.GetLimit(host)
 				_, _ = c.GetMaintenance(host)
+				_, _ = c.GetGeo(host)
 			case 2: // Reset
 				c.Reset()
 			}

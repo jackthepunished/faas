@@ -94,6 +94,7 @@ export type { DiffPayload } from './models/DiffPayload.js';
 export type { DiffRequest } from './models/DiffRequest.js';
 export type { DiffResponse } from './models/DiffResponse.js';
 export type { EdgeRuleCORSAction } from './models/EdgeRuleCORSAction.js';
+export type { EdgeRuleGeoAction } from './models/EdgeRuleGeoAction.js';
 export type { EdgeRuleHeaderOp } from './models/EdgeRuleHeaderOp.js';
 export type { EdgeRuleHeadersAction } from './models/EdgeRuleHeadersAction.js';
 export type { EdgeRuleIPAction } from './models/EdgeRuleIPAction.js';

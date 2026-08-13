@@ -1673,13 +1673,27 @@ const (
 	CodeEdgeRuleConflict           = "edge_rule_conflict"
 	CodePlanLimitEdgeRules         = "plan_limit_edge_rules"
 	CodePlanEdgeRuleKindNotAllowed = "plan_edge_rule_kind_not_allowed"
-	CodeCORSOriginNotAllowed       = "cors_origin_not_allowed"
-	CodeJWTMissingToken            = "jwt_missing_token"
-	CodeJWTMissingIssuer           = "jwt_missing_issuer"
-	CodeJWTAudienceMismatch        = "jwt_audience_mismatch"
-	CodeJWTSignatureInvalid        = "jwt_signature_invalid"
-	CodeIPDenied                   = "ip_denied"
-	CodeHeaderMutationForbidden    = "header_mutation_forbidden"
+	// CodePlanEdgeRuleKindQuotaReached is the per-kind quota error
+	// (ADR-091 D22). Distinct from CodePlanLimitEdgeRules so the
+	// customer sees the specific kind that tripped ("1/1 geo rules
+	// on Free; upgrade to Hobby for 5") rather than the generic
+	// "edge rules cap reached" message. The href in the problem
+	// payload points to the per-kind paragraphs in the docs.
+	CodePlanEdgeRuleKindQuotaReached = "plan_edge_rule_kind_quota_reached"
+	CodeCORSOriginNotAllowed         = "cors_origin_not_allowed"
+	CodeJWTMissingToken              = "jwt_missing_token"
+	CodeJWTMissingIssuer             = "jwt_missing_issuer"
+	CodeJWTAudienceMismatch          = "jwt_audience_mismatch"
+	CodeJWTSignatureInvalid          = "jwt_signature_invalid"
+	CodeIPDenied                     = "ip_denied"
+	// CodeGeoDenied mirrors CodeIPDenied for the kind=geo primitive
+	// (ADR-091 D21). Distinct so dashboards / metrics can
+	// disambiguate a geo deny from any other 403 on the wire — a
+	// geo deny is policy-driven (ISO 3166-1 allow/deny), not an
+	// auth failure or scope check, and the stable code lets
+	// customers write runbooks that key on code !=
+	// insufficient_scope without parsing titles.
+	CodeGeoDenied = "geo_denied"
 	// CodeRequestValidationFailed is the 422 a kind=validate edge
 	// rule emits when the inbound request body fails the customer's
 	// JSON Schema. Carries Problem.Errors (Cloudflare / Stripe shape)
@@ -1688,6 +1702,7 @@ const (
 	// from CodeValidation (the apid body-shape guard) because the
 	// gating policy and the actor are different.
 	CodeRequestValidationFailed = "request_validation_failed"
+	CodeHeaderMutationForbidden = "header_mutation_forbidden"
 )
 
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
@@ -2934,6 +2949,21 @@ func ErrPlanEdgeRuleKindNotAllowed(plan Plan, kind string) *Problem {
 		WithDocs(docsBase + "/plans#edge-rules")
 }
 
+// ErrPlanEdgeRuleKindQuotaReached is the 403 returned when the
+// per-kind edge-rule quota is reached (ADR-091 D22 — currently only
+// kind=geo has a separate per-kind cap; future paid-kind additions
+// can reuse the same RFC 7807 code with their own kind arg). distinct
+// from ErrPlanEdgeRulesQuotaReached which is the GENERAL cap trip
+// (no kind-specific signal). Surfacing the kind lets the customer see
+// "kind=geo: 1/1 rules used on Free; upgrade to Hobby for 5".
+func ErrPlanEdgeRuleKindQuotaReached(plan Plan, kind string, observed, limit int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanEdgeRuleKindQuotaReached,
+		"Edge rule kind quota reached",
+		fmt.Sprintf("the %s plan allows %d %s edge rule(s) per app; you have used %d. Upgrade to a higher tier for a larger quota.",
+			plan, limit, kind, observed)).
+		WithDocs(docsBase + "/plans#edge-rules")
+}
+
 // ErrCORSOriginNotAllowed is the 403 returned when a CORS rule's
 // allow_origins list rejects the request's Origin header.
 //
@@ -2996,6 +3026,25 @@ func ErrIPDenied(ip string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeIPDenied,
 		"IP address not allowed",
 		fmt.Sprintf("client IP %s is not in the allowlist and matched the deny list for this route.", ip))
+}
+
+// ErrGeoDenied is the 403 returned when a kind=geo rule's allow/deny
+// evaluator rejects the client country. The country is the ISO 3166-1
+// alpha-2 code resolved by the pkg/geoip.Reader lookup; decision is
+// either "deny" (rule.Deny matched) or "implicit_deny" (Allow was
+// non-empty and the country was not on it).
+func ErrGeoDenied(country, decision string) *Problem {
+	var detail string
+	switch decision {
+	case "deny":
+		detail = fmt.Sprintf("client country %s is on the deny list for this route.", country)
+	case "implicit_deny":
+		detail = fmt.Sprintf("client country %s is not on the allow list for this route.", country)
+	default:
+		detail = fmt.Sprintf("client country %s is not allowed for this route.", country)
+	}
+	return NewProblem(http.StatusForbidden, CodeGeoDenied,
+		"Country not allowed", detail)
 }
 
 // ErrHeaderMutationForbidden is the 422 returned when a kind=headers

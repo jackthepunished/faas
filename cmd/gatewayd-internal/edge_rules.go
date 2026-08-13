@@ -128,6 +128,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	validate, validateErrs := g.compileValidateRules(storeRules)
 	limit, limitErrs := compileLimitRules(storeRules)
 	maintenance, maintenanceErrs := compileMaintenanceRules(storeRules)
+	geo, geoErrs := compileGeoRules(storeRules)
 	entry := &gateway.HostEntry{
 		Route:       route,
 		Rewrite:     rewrite,
@@ -139,6 +140,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		Validate:    validate,
 		Limit:       limit,
 		Maintenance: maintenance,
+		Geo:         geo,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -149,6 +151,8 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, validateErrs...)
 	parseErrs = append(parseErrs, limitErrs...)
 	parseErrs = append(parseErrs, maintenanceErrs...)
+	parseErrs = append(parseErrs, geoErrs...)
+
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
 	}
@@ -447,6 +451,34 @@ func (g *gatewaydEdgeRules) MatchMaintenance(ctx context.Context, host, requestP
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstMaintenanceMatch(rules, requestPath, method)
+}
+
+// MatchGeo returns the highest-priority `kind=geo` rule whose
+// host, path, and method match, or nil (ADR-091 D21). Same cache
+// primitive as MatchIP. The applier (handler.go::applyEdgeRuleGeo)
+// reads the trusted XFF entry, looks up the country via the
+// configured pkg/geoip.Reader, and evaluates against this rule's
+// Allow/Deny sets. The lookup itself happens in the applier — the
+// matcher stays a pure path/methods filter so the cache hit path
+// stays cheap (the DB-IP mmap lookup is the expensive step).
+func (g *gatewaydEdgeRules) MatchGeo(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleGeoResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetGeo(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Geo
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstGeoMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -823,6 +855,82 @@ func compileIPRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleIPResolved, 
 	return out, parseErrs
 }
 
+// compileGeoRules mirrors compileIPRules for kind=geo (ADR-091
+// D21). The action carries Allow / Deny as ISO 3166-1 alpha-2
+// country codes rather than CIDR strings; the compile side
+// uppercases + dedupes one more time before stashing into a
+// map[string]struct{} for O(1) per-request membership checks.
+//
+// apid-Validate already drops reserved codes (AA, etc.) and
+// enforces the ≤50-entry cardinality cap, so the compile side
+// does not re-validate the wire shape — it just performs the
+// shape conversion. A bad rule that slipped past the validator
+// still routes correctly: an unknown country code simply never
+// matches during the lookup (the DB-IP DB returns the customer's
+// real country, which is not in the rule's set, so the rule's
+// allow/deny both miss and the request flows through).
+func compileGeoRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleGeoResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleGeoResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindGeo {
+			continue
+		}
+		if r.Action.Geo == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		action := r.Action.Geo
+		allow := compileGeoSet(action.Allow)
+		deny := compileGeoSet(action.Deny)
+		out = append(out, gateway.EdgeRuleGeoResolved{
+			ID:        r.ID,
+			AccountID: r.AccountID,
+			AppID:     r.AppID,
+			Priority:  r.Priority,
+			PathGlob:  r.MatchPath,
+			Methods:   buildMethodsMap(r.MatchMethods),
+			Allow:     allow,
+			Deny:      deny,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileGeoSet uppercases + dedupes a country-code list into
+// a map[string]struct{} for O(1) membership checks. Returns
+// nil (NOT an empty map) for an empty input so the runtime
+// check `if len(rule.Allow) > 0` stays the canonical "is
+// there an allowlist?" predicate.
+func compileGeoSet(codes []string) map[string]struct{} {
+	if len(codes) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(codes))
+	for _, c := range codes {
+		upper := strings.ToUpper(c)
+		if upper == "" {
+			continue
+		}
+		out[upper] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // parseCIDRs turns a []string CIDR list into a []*net.IPNet slice.
 // Per-entry parse errors are returned as PathGlobError so the
 // caller can log them and drop the rule. nil entries in the input
@@ -898,13 +1006,6 @@ func compileLimitRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleLimitReso
 		if maxBody <= 0 || maxBody > api.MaxRequestBodyBytes {
 			maxBody = api.MaxRequestBodyBytes
 		}
-		// This streaming clamp is the second gate (after
-		// apid-Validate in pkg/api/dto.go) and the runtime mirror
-		// in applyEdgeRuleLimit (pkg/gateway/handler.go) trusts
-		// the value it produces. A direct-DB row that violates the
-		// DTO's `s ≥ b` invariant passes this compile and falls
-		// back to the buffered cap at runtime via the
-		// `MaxBodyBytesStreaming == 0` branch — safe degradation.
 		// Streaming cap: only clamp on the upper bound; 0 means
 		// "no carve-out, fall back to MaxBodyBytes" (the applier
 		// handles that). The negative check is defence-in-depth

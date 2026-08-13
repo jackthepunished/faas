@@ -9637,6 +9637,26 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 			Observed: appCount,
 		}
 	}
+	// Per-kind quota (ADR-091 D22). Same shape as the pgstore
+	// branch. The memstore holds the entire edgeRules slice under
+	// m.mu so the per-kind count is trivially race-free.
+	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
+		kindCount := 0
+		for _, r := range m.edgeRules {
+			if r.AppID == in.AppID && r.Kind == EdgeRuleKindGeo {
+				kindCount++
+			}
+		}
+		if kindCount >= limits.EdgeRulesGeoPerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesGeoPerApp,
+				Observed:   kindCount,
+				Kind:       string(EdgeRuleKindGeo),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 	if in.MatchMethods == nil {
 		in.MatchMethods = []string{}
 	}
@@ -9755,6 +9775,26 @@ func (m *MemStore) CountEdgeRulesForApp(_ context.Context, appID string) (int, e
 	n := 0
 	for _, r := range m.edgeRules {
 		if r.AppID == appID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// CountEdgeRulesByKindForApp mirrors pgstore. The memstore doesn't
+// enforce the per-kind cap in CreateEdgeRuleIfUnderQuota today
+// (the FOR UPDATE lock pattern is strictly a Postgres race-defence
+// — the test-only insert path on MemStore runs under the same
+// m.mu lock, so a per-kind check is also straightforward if
+// callers need it). The count is here so the Store interface
+// stays single-shape and the apid handler's surface is identical
+// across backends.
+func (m *MemStore) CountEdgeRulesByKindForApp(_ context.Context, appID string, kind EdgeRuleKind) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.edgeRules {
+		if r.AppID == appID && r.Kind == kind {
 			n++
 		}
 	}

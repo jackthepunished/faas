@@ -132,6 +132,12 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage) *api.Problem {
 			return api.ErrValidation(fmt.Sprintf("maintenance action: %v", err))
 		}
 		return a.Validate()
+	case state.EdgeRuleKindGeo:
+		var a api.EdgeRuleGeoAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("geo action: %v", err))
+		}
+		return a.Validate()
 	}
 	return api.ErrValidation("edge rule action validation fell through — internal bug")
 }
@@ -202,6 +208,12 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 	// Plan-kind gate. Hobby+ unlocks jwt and ip; Free customers get
 	// a clean 402 BEFORE loadApp (mirrors ErrPlanAlertRulesNotAllowed)
 	// so a Free customer doesn't get a 404 leak.
+	//
+	// EdgeRuleKindGeo is NOT paid-only (ADR-091 D21 sub-decision
+	// hop) — Free customers can post a single geo rule (cap=1).
+	// The per-kind cap is enforced inside the store's
+	// CreateEdgeRuleIfUnderQuota FOR UPDATE lock and surfaced
+	// below via qe.PerKind / ErrPlanEdgeRuleKindQuotaReached.
 	if state.EdgeRuleKind(req.Kind).IsPaidOnly() {
 		limits, ok := api.LimitsFor(acct.Plan)
 		if !ok {
@@ -258,7 +270,11 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		var qe *state.EdgeRuleQuotaError
 		switch {
 		case errors.As(err, &qe):
-			api.WriteProblem(w, api.ErrPlanLimitEdgeRules(acct.Plan, qe.Limit, qe.Observed))
+			if qe.PerKind {
+				api.WriteProblem(w, api.ErrPlanEdgeRuleKindQuotaReached(acct.Plan, qe.Kind, qe.Limit, qe.Observed))
+			} else {
+				api.WriteProblem(w, api.ErrPlanLimitEdgeRules(acct.Plan, qe.Limit, qe.Observed))
+			}
 		case errors.Is(err, state.ErrNotFound):
 			s.notFound(w, "no such app")
 		case errors.Is(err, state.ErrConflict):
@@ -423,6 +439,11 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 				RetryAfterSeconds: a.RetryAfterSeconds,
 				Message:           a.Message,
 			}
+		}
+	case state.EdgeRuleKindGeo:
+		var a api.EdgeRuleGeoAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			out.Geo = &state.EdgeRuleGeoAction{Allow: a.Allow, Deny: a.Deny}
 		}
 	}
 	return out

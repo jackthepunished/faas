@@ -46,6 +46,30 @@ func pgSampleEdgeRuleParams(accountID, appID, host string) state.CreateEdgeRuleP
 	}
 }
 
+// pgSampleGeoRuleParams mirrors pgSampleEdgeRuleParams for kind=geo
+// (ADR-091 D21). The action carries allow + deny ISO 3166-1 alpha-2
+// codes that exercise the geo compile path: allow list restricts
+// to a specific set, deny list vetoes everything else.
+func pgSampleGeoRuleParams(accountID, appID, host string) state.CreateEdgeRuleParams {
+	return state.CreateEdgeRuleParams{
+		AccountID:    accountID,
+		AppID:        appID,
+		MatchHost:    host,
+		MatchPath:    "/",
+		MatchMethods: []string{"GET", "POST"},
+		Priority:     100,
+		Enabled:      true,
+		Kind:         state.EdgeRuleKindGeo,
+		Action: state.EdgeRuleAction{
+			Kind: state.EdgeRuleKindGeo,
+			Geo: &state.EdgeRuleGeoAction{
+				Allow: []string{"DE", "FR"},
+				Deny:  []string{"US"},
+			},
+		},
+	}
+}
+
 // pgEdgeRuleSeedAccount stands up an account + app with a unique
 // slug + email so multiple tests in the same schema don't trip the
 // (email) UNIQUE or the (slug) UNIQUE on apps.
@@ -185,6 +209,170 @@ func TestPgStore_CreateEdgeRuleIfUnderQuota_PerAppCap(t *testing.T) {
 	}
 	if qe.Observed != limits.EdgeRulesPerApp {
 		t.Errorf("observed = %d, want %d", qe.Observed, limits.EdgeRulesPerApp)
+	}
+}
+
+// TestPgStore_EdgeRule_GeoRoundTrip pins the kind=geo storage path
+// (ADR-091 D21). The action union's Geo slot round-trips through
+// PG with the allow/deny slices preserved. Mirrors the RoundTrip
+// test above, but on the kind=geo surface — a regression in
+// scanEdgeRuleCols that drops the Geo slot (the column is shared
+// with all other kinds via the action JSONB) would surface as a
+// nil Geo on the read side.
+//
+// Created via CreateEdgeRule (not CreateEdgeRuleIfUnderQuota) so
+// the test isn't entangled with the per-kind quota test below.
+func TestPgStore_EdgeRule_GeoRoundTrip(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "geo-rt")
+
+	in := pgSampleGeoRuleParams(acct, app, "geo-rt.example.com")
+	created, err := s.CreateEdgeRule(ctx, in)
+	if err != nil {
+		t.Fatalf("CreateEdgeRule(geo): %v", err)
+	}
+	if created.Kind != state.EdgeRuleKindGeo {
+		t.Errorf("kind = %q, want %q", created.Kind, state.EdgeRuleKindGeo)
+	}
+	if created.Action.Geo == nil {
+		t.Fatalf("action.Geo = nil after Create; want populated slice")
+	}
+	if got := len(created.Action.Geo.Allow); got != 2 {
+		t.Errorf("Allow len = %d, want 2", got)
+	}
+	if got := len(created.Action.Geo.Deny); got != 1 {
+		t.Errorf("Deny len = %d, want 1", got)
+	}
+
+	got, err := s.GetEdgeRuleByID(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetEdgeRuleByID: %v", err)
+	}
+	if got.Action.Geo == nil {
+		t.Fatalf("action.Geo = nil after Get; want populated slice")
+	}
+	if got.Action.Geo.Allow[0] != "DE" || got.Action.Geo.Allow[1] != "FR" {
+		t.Errorf("Allow = %+v, want [DE, FR]", got.Action.Geo.Allow)
+	}
+	if got.Action.Geo.Deny[0] != "US" {
+		t.Errorf("Deny = %+v, want [US]", got.Action.Geo.Deny)
+	}
+	if got.Action.Route != nil || got.Action.IP != nil {
+		t.Errorf("non-geo action slots leaked: route=%+v ip=%+v", got.Action.Route, got.Action.IP)
+	}
+}
+
+// TestPgStore_EdgeRule_GeoKindAcceptedByCheckConstraint confirms
+// the migration 00207 widening is wired through the runtime: a
+// kind='geo' insert succeeds against the live CHECK. The CHECK
+// name (`edge_rules_kind_check`) is auto-assigned by PG to the
+// inline column constraint, so the migration re-uses the same name.
+func TestPgStore_EdgeRule_GeoKindAcceptedByCheckConstraint(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "geo-ck")
+	_, err := s.CreateEdgeRule(ctx, pgSampleGeoRuleParams(acct, app, "geo-ck.example.com"))
+	if err != nil {
+		t.Fatalf("CreateEdgeRule(geo) under widened CHECK: %v", err)
+	}
+}
+
+// TestPgStore_EdgeRule_NonGeoKindStillAccepted pins that the
+// migration 00207 widening did NOT regress the closed set: all 7
+// pre-existing kinds still round-trip cleanly.
+func TestPgStore_EdgeRule_NonGeoKindStillAccepted(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "non-geo")
+	for i, k := range []state.EdgeRuleKind{
+		state.EdgeRuleKindRoute,
+		state.EdgeRuleKindRewrite,
+		state.EdgeRuleKindRedirect,
+		state.EdgeRuleKindHeaders,
+		state.EdgeRuleKindCORSA,
+		state.EdgeRuleKindJWT,
+		state.EdgeRuleKindIP,
+	} {
+		in := pgSampleEdgeRuleParams(acct, app, "ngeo-"+strconv.Itoa(i)+".example.com")
+		in.Kind = k
+		in.Action.Kind = k
+		if _, err := s.CreateEdgeRule(ctx, in); err != nil {
+			t.Errorf("CreateEdgeRule(%s): %v", k, err)
+		}
+	}
+}
+
+// TestPgStore_CreateEdgeRuleIfUnderQuota_GeoPerAppCap fills an app
+// to its per-kind geo cap (Pro: EdgeRulesGeoPerApp = 25) and
+// asserts the next kind=geo insert returns *state.EdgeRuleQuotaError
+// with the per-kind limit. Pins the per-kind gate inside the same
+// FOR UPDATE lock as the general cap (ADR-091 D22). We use Pro so
+// the seed loop is short and stable across CI shards.
+func TestPgStore_CreateEdgeRuleIfUnderQuota_GeoPerAppCap(t *testing.T) {
+	s, ctx := pgStore(t)
+	limits := api.MustLimitsFor(api.PlanPro)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "geo-quota")
+
+	// Fill to per-kind cap.
+	for i := 0; i < limits.EdgeRulesGeoPerApp; i++ {
+		in := pgSampleGeoRuleParams(acct, app, "gq-"+strconv.Itoa(i)+".example.com")
+		if _, err := s.CreateEdgeRule(ctx, in); err != nil {
+			t.Fatalf("seed geo #%d: %v", i, err)
+		}
+	}
+
+	// One more kind=geo must trip the per-kind quota.
+	overflow := pgSampleGeoRuleParams(acct, app, "gq-overflow.example.com")
+	_, err := s.CreateEdgeRuleIfUnderQuota(ctx, overflow, limits)
+	if err == nil {
+		t.Fatal("expected *EdgeRuleQuotaError at per-kind geo cap, got nil")
+	}
+	var qe *state.EdgeRuleQuotaError
+	if !errors.As(err, &qe) {
+		t.Fatalf("expected *EdgeRuleQuotaError, got %T: %v", err, err)
+	}
+	if !qe.PerKind {
+		t.Errorf("qe.PerKind = false, want true (per-kind quota path)")
+	}
+	if qe.Kind != string(state.EdgeRuleKindGeo) {
+		t.Errorf("qe.Kind = %q, want %q", qe.Kind, string(state.EdgeRuleKindGeo))
+	}
+	if qe.Limit != limits.EdgeRulesGeoPerApp {
+		t.Errorf("limit = %d, want %d", qe.Limit, limits.EdgeRulesGeoPerApp)
+	}
+}
+
+// TestPgStore_CountEdgeRulesByKindForApp_GeoScoped pins the new
+// store method (ADR-091 D22). Counts of kind=geo must be scoped
+// to (app_id, kind) — not bleeding across kinds.
+func TestPgStore_CountEdgeRulesByKindForApp_GeoScoped(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, app := pgEdgeRuleSeedAccount(t, s, ctx, api.PlanPro, "geo-count")
+
+	// 2 route + 3 geo = 5 total.
+	for i := 0; i < 2; i++ {
+		if _, err := s.CreateEdgeRule(ctx, pgSampleEdgeRuleParams(acct, app, "rc-"+strconv.Itoa(i)+".example.com")); err != nil {
+			t.Fatalf("seed route #%d: %v", i, err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := s.CreateEdgeRule(ctx, pgSampleGeoRuleParams(acct, app, "gc-"+strconv.Itoa(i)+".example.com")); err != nil {
+			t.Fatalf("seed geo #%d: %v", i, err)
+		}
+	}
+
+	geoCount, err := s.CountEdgeRulesByKindForApp(ctx, app, state.EdgeRuleKindGeo)
+	if err != nil {
+		t.Fatalf("CountEdgeRulesByKindForApp(geo): %v", err)
+	}
+	if geoCount != 3 {
+		t.Errorf("geo count = %d, want 3", geoCount)
+	}
+
+	routeCount, err := s.CountEdgeRulesByKindForApp(ctx, app, state.EdgeRuleKindRoute)
+	if err != nil {
+		t.Fatalf("CountEdgeRulesByKindForApp(route): %v", err)
+	}
+	if routeCount != 2 {
+		t.Errorf("route count = %d, want 2", routeCount)
 	}
 }
 

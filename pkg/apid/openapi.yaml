@@ -43,7 +43,7 @@ tags:
   - name: deploydiff
     description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules
-    description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip) per app.
+    description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip, validate, geo) per app.
   - name: deployments
     description: Deployments & build status.
   - name: instances
@@ -3567,10 +3567,11 @@ paths:
       operationId: createEdgeRule
       summary: Create an edge rule on an app.
       description: |
-        Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip}.
-        `action` is a kind-tagged jsonb body — the per-kind shape is
-        documented under components/schemas. Plan-kind gate: jwt/ip
-        return 402 plan_edge_rule_kind_not_allowed on Free. Per-app
+        Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip,
+        validate, geo}. `action` is a kind-tagged jsonb body — the per-kind
+        shape is documented under components/schemas. Plan-kind gate:
+        jwt/ip return 402 plan_edge_rule_kind_not_allowed on Free; geo
+        is allowed on Free with a tighter per-app quota. Per-app
         quota returns 402 plan_limit_edge_rules once EdgeRulesPerApp
         is reached.
       requestBody:
@@ -9414,7 +9415,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9428,6 +9429,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9445,7 +9447,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9459,6 +9461,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9484,6 +9487,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
             - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -9788,6 +9792,40 @@ components:
             customer's status page so monitoring / curl users see
             why the endpoint is dark.
           example: "Rolling out v2; back at 14:00 UTC."
+
+    EdgeRuleGeoAction:
+      description: |
+        ISO 3166-1 alpha-2 country allow/deny evaluator (ADR-091
+        D21 / §4.1.2.8b). Mirrors `EdgeRuleIPAction` exactly: `allow`
+        and `deny` are parallel ISO 3166-1 alpha-2 country-code
+        lists; the matcher walks deny AFTER allow so a single-country
+        deny wins even when the allow list is broad.
+
+        The match port is `gatewayd-internal` which consults a
+        DB-IP Lite `.mmdb` file at request time to translate the
+        trusted XFF client IP into a country code. Plan-tier quota
+        is enforced at apid-create time via `Limits.EdgeRulesGeoPerApp`
+        (Free=1, Hobby=5, Pro=25, Scale=100) inside the same apps-row
+        FOR UPDATE lock as the general edge-rule cap. Geo is NOT in
+        IsPaidOnly — Free customers get one rule before they upgrade.
+
+        Failure posture is fail-open: missing `.mmdb`, IP not in
+        any country, RFC1918/bogon, or corrupt file → the rule does
+        not fire → the request flows through. The
+        `gateway_edge_rule_match_total{kind="geo",result="failed"}`
+        counter increments and an `edge_rule.geo_failed` audit event
+        emits.
+      type: object
+      properties:
+        allow:
+          type: array
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the allowlist." }
+          description: "ISO 3166-1 alpha-2 country allowlist. Empty + deny non-empty = deny-only. Empty + deny empty = no-op (create-time 422)."
+        deny:
+          type: array
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the denylist." }
+          description: "ISO 3166-1 alpha-2 country denylist. Evaluated AFTER allow; single-country deny wins."
+
 
     # ─── API keys ─────────────────────────────────────────────────────────
 

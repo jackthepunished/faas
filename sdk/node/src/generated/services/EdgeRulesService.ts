@@ -63,10 +63,11 @@ export class EdgeRulesService {
   }
   /**
    * Create an edge rule on an app.
-   * Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip}.
-   * `action` is a kind-tagged jsonb body — the per-kind shape is
-   * documented under components/schemas. Plan-kind gate: jwt/ip
-   * return 402 plan_edge_rule_kind_not_allowed on Free. Per-app
+   * Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip,
+   * validate, geo}. `action` is a kind-tagged jsonb body — the per-kind
+   * shape is documented under components/schemas. Plan-kind gate:
+   * jwt/ip return 402 plan_edge_rule_kind_not_allowed on Free; geo
+   * is allowed on Free with a tighter per-app quota. Per-app
    * quota returns 402 plan_limit_edge_rules once EdgeRulesPerApp
    * is reached.
    *
