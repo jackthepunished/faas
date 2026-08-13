@@ -56,6 +56,27 @@ env:
   # EX44 ansible roles.
   SQLC_VERSION: "1.31.1"
   SQLC_SHA256_LINUX_AMD64: "497ae4fcdfa64c5b0c311ffe4c2bd991e43991e82e5367792ed78bc2dca27354"
+  # protoc is the wire-codegen tool used by `make proto-check`. We pin it
+  # to the same source-of-truth release that arduino/setup-protoc@v3
+  # resolves '33.x' to (v33.6, the latest 33.x line) and download the
+  # zip directly from the protocolbuffers/protobuf GitHub release. The
+  # SHA-256 mirrors the supply-chain pin pattern used by vacuum + sqlc
+  # above and every binary in the EX44 ansible roles (cd-2 daemonunit
+  # generator convention). Bumping requires editing both lines in lock-
+  # step.
+  #
+  # Why not arduino/setup-protoc@v3: that action hits GitHub's release-
+  # resolution REST API for binary lookup and is subject to the per-IP
+  # unauthenticated rate limit (60/hr) — concurrent jobs across the
+  # shared GH runner fleet trip it at peak load and the step flakes
+  # with `API rate limit exceeded for <runner-IP>`. This direct download
+  # uses `curl --fail` against the static release-asset URL (which is
+  # subject only to the per-asset 5000/hr authenticated limit when
+  # GITHUB_TOKEN is forwarded) and the same --check --strict sha256
+  # posture the vacuum / sqlc pins use. Memory:
+  # ci-arduino-protoc-rate-limit-flake.md.
+  PROTOC_VERSION: "33.6"
+  PROTOC_SHA256_LINUX_AMD64: "9c49962391ff8b5754342509efc3885db91dfe11a358e1e98c9a71518f0ad199"
 
 jobs:
   # Three parallel jobs (PR #167) so the long poles — unit tests (~4:20)
@@ -200,23 +221,45 @@ jobs:
           done
 
       # M1+ (ADR-013): *.pb.go is checked in; this step verifies it's in sync
-      # with the .proto sources. arduino/setup-protoc pins a modern protoc
-      # matching what 'go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11'
-      # expects. Drift on the 'protoc v X.Y.Z' header comment is filtered by
-      # Makefile's proto-normalize so toolchain patch bumps don't break CI.
+      # with the .proto sources. The Makefile's proto-normalize target
+      # strips the 'protoc v X.Y.Z' header comment so toolchain patch
+      # bumps don't break CI; the wire bytes protoc produces are
+      # unaffected. The pin stays on the 33.x line that the previous
+      # arduino/setup-protoc@v3 '33.x' selection resolved to (v33.6).
       #
-      # Pass `GITHUB_TOKEN` so the action's release-resolution API calls
-      # authenticate; without it the runner IP is subject to GitHub's
-      # 60/hr per-IP unauthenticated rate limit and the step flakes when
-      # many jobs land simultaneously. Authenticated requests get
-      # 5000/hr per-token, which is plenty. See memory
-      # `ci-arduino-protoc-rate-limit-flake.md`.
+      # Replaces arduino/setup-protoc@v3 (memory
+      # ci-arduino-protoc-rate-limit-flake.md): that action hit GitHub's
+      # release-resolution REST API and flaked on per-IP rate limits at
+      # peak load. The direct curl+sha256 download matches the vacuum +
+      # sqlc + grype install precedent (ci.yml:469-500 / 948-973 /
+      # 686-696) and is gated by `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION`
+      # not being needed. `GITHUB_TOKEN` raises the asset-fetch quota
+      # from 60/hr unauth to 5000/hr authenticated.
       - name: install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: '33.x'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" != "x86_64" ]; then
+            echo "::error::protoc install assumes x86_64; runner is $(uname -m)"
+            exit 1
+          fi
+          PROTOC_TARBALL="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_TARBALL}"
+          mkdir -p "$HOME/.local/protoc/bin"
+          ZIP="$RUNNER_TEMP/${PROTOC_TARBALL}"
+          echo "→ downloading $PROTOC_URL"
+          curl --fail --silent --show-error --location --output "$ZIP" --header "Authorization: Bearer ${GITHUB_TOKEN}" "$PROTOC_URL"
+          echo "→ verifying SHA-256"
+          echo "${PROTOC_SHA256_LINUX_AMD64}  $ZIP" | sha256sum --check --strict
+          echo "→ extracting"
+          # The zip lays out bin/protoc + include/google/protobuf/*. The
+          # tarball has no top-level directory prefix, so we extract
+          # into a scratch dir and copy the binary to the stable install
+          # path. `unzip` is on every ubuntu-latest runner by default.
+          (cd "$RUNNER_TEMP" && unzip -q "$ZIP")
+          cp "$RUNNER_TEMP/bin/protoc" "$HOME/.local/protoc/bin/protoc"
+          chmod +x "$HOME/.local/protoc/bin/protoc"
+          echo "→ installed: $("$HOME/.local/protoc/bin/protoc" --version)"
+          echo "$HOME/.local/protoc/bin" >> "$GITHUB_PATH"
       - name: install protoc plugins
         run: |
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
