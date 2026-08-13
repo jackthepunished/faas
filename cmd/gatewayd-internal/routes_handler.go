@@ -140,7 +140,7 @@ func internalRoutesHandler(h *gateway.Handler, appLookup gateway.ResolveSlugFn, 
 			})
 			return
 		}
-		routes := h.RoutesFor(appID)
+		routes, capHit := h.RoutesFor(appID)
 		if routes == nil {
 			// Either the app is not opted in, or no traffic
 			// has reached the per-route path yet (routeSetFor
@@ -155,6 +155,7 @@ func internalRoutesHandler(h *gateway.Handler, appLookup gateway.ResolveSlugFn, 
 			Slug:   slug,
 			AppID:  appID,
 			Routes: routes,
+			CapHit: capHit,
 		})
 	}
 }
@@ -169,10 +170,20 @@ func internalRoutesHandler(h *gateway.Handler, appLookup gateway.ResolveSlugFn, 
 // Routes is an empty slice (not nil) on the "not opted in" /
 // "no traffic yet" paths so the JSON encoder emits `[]` rather
 // than `null` — the dashboard JS would crash on the null shape.
+//
+// CapHit (ADR-093 Tier B item #1) is true iff the app's
+// routeLabelSet has reached RouteMetricsPerAppCap (50) and
+// additional routes are collapsing into the reserved
+// __route_other__ bucket. The apid-side AppRoutesResponse mirrors
+// this field so the dashboard renders "you have hit the 50-route
+// cap" without counting Routes (which is ambiguous: 5 real
+// routes + __route_other__ for a one-off wildcard probe is
+// indistinguishable from 50 real routes + overflow).
 type routesResponseJSON struct {
 	Slug   string   `json:"slug"`
 	AppID  string   `json:"app_id"`
 	Routes []string `json:"routes"`
+	CapHit bool     `json:"cap_hit"`
 }
 
 func writeRoutesJSON(w http.ResponseWriter, status int, body routesResponseJSON) {

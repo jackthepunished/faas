@@ -22,8 +22,15 @@ import (
 // Within each section, changes come before breaks so a customer
 // reading the table sees "what would change" before "what would
 // fail".
-func Compute(slug string, baseline Baseline, pending Pending) Diff {
-	plan := inferPlan(baseline.App)
+//
+// plan is the customer's subscription tier (Free / Hobby / Pro /
+// Scale). PR-0's stub `inferPlan` returned empty; PR-1 takes it
+// as a parameter so the apid handler can pass acct.Plan directly
+// without going through an SDK round-trip. Empty string is allowed
+// (the CLI's Whoami fallback) — when empty the quota gate's plan
+// feature branches fall through to the "not allowed" code paths
+// and the renderer still renders correctly.
+func Compute(slug string, plan Plan, baseline Baseline, pending Pending) Diff {
 	out := Diff{
 		Slug:    slug,
 		Changes: []Change{},
@@ -50,17 +57,6 @@ func Compute(slug string, baseline Baseline, pending Pending) Diff {
 	detectSchemaBreak(&out, baseline.LatestDeployment, pending)
 
 	return out
-}
-
-// inferPlan reads the plan from the baseline's App.Slug-free view
-// (the AppResponse has no Plan field; the apid handler passes it
-// separately in PR-1 via [Pending]). PR-0 leaves Plan empty until
-// the apid handler wires it through.
-func inferPlan(app *api.AppResponse) Plan {
-	if app == nil {
-		return ""
-	}
-	return ""
 }
 
 // diffAppConfig is the per-scalar pointer-aware comparison. Each
@@ -391,12 +387,11 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 		baseByKey[erKey{r.MatchHost, r.MatchPath, r.Kind}] = r
 	}
 	pendByKey := map[erKey]api.CreateEdgeRuleRequest{}
-	seen := map[erKey]int{} // first-seen index for stable dup reporting
 	for i, r := range pending {
 		k := erKey{r.MatchHost, r.MatchPath, r.Kind}
 		if _, dup := pendByKey[k]; dup {
-			// Surface the dup with its first-occurrence index so
-			// the customer's eye lands on the right row.
+			// Surface the dup with its current-occurrence index
+			// so the customer's eye lands on the right row.
 			label := k.kind + " " + k.host + k.path
 			out.Breaks = append(out.Breaks, Break{
 				Code:     "edge_rule_duplicate_key",
@@ -408,7 +403,6 @@ func diffEdgeRules(out *Diff, base []api.EdgeRuleResponse, pending []api.CreateE
 			continue
 		}
 		pendByKey[k] = pending[i]
-		seen[k] = i
 	}
 
 	allKeys := make([]erKey, 0, len(baseByKey)+len(pendByKey))
@@ -581,7 +575,13 @@ func detectSchemaBreak(out *Diff, base *api.DeploymentResponse, p Pending) {
 	// EnvSecrets change → sealed-secret ref change. The wire form
 	// carries OverrideEnvSecretRefs (map[string]string) — refs are
 	// non-secret by design, so we CAN compare values here.
-	if len(p.Manifest.EnvSecrets) > 0 && !stringMapsEqual(p.Manifest.EnvSecrets, base.OverrideEnvSecretRefs) {
+	//
+	// We emit whenever the manifest is present — including when
+	// the customer removes every sealed-secret ref (the previous
+	// `len(...) > 0` guard silently dropped that case, mirroring
+	// the Env-path bug noted above).
+	pendSecretRefs := p.Manifest.EnvSecrets
+	if !stringMapsEqual(pendSecretRefs, base.OverrideEnvSecretRefs) {
 		out.Breaks = append(out.Breaks, Break{
 			Code:     "schema_env_changed",
 			Severity: SeverityWarn,

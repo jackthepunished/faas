@@ -3998,13 +3998,32 @@ func (h *Handler) RouteSetForTest(appID string) *routeLabelSet {
 // returned slice is a copy so the caller can iterate without
 // holding the lock. Returning the underlying map directly would
 // race with admit() on the hot path.
-func (h *Handler) RoutesFor(appID string) []string {
+//
+// Returns (routes, overflowed) so the dashboard-side caller can
+// render "you have hit the 50-route cap" without counting Routes
+// (which is ambiguous: 5 real routes + __route_other__ for a
+// one-off wildcard probe is indistinguishable from 50 real routes
+// + overflow). overflowed is true iff the app's routeLabelSet has
+// reached its cap (routeLabelSetCap = 50 in production, smaller
+// in tests) and additional routes are collapsing into
+// __route_other__. The cap constant is exported separately as
+// `routeLabelSetCap`; the function returns only the values the
+// caller actually consumes (PR-B1 code-review finding: the
+// earlier 3-tuple widened the surface for a value no production
+// caller read).
+//
+// On unknown apps (routeSetFor never created the set, either
+// because the app isn't opted in or because no traffic has
+// reached the per-route path yet) the function returns (nil,
+// false) — the caller normalises nil routes to [] and treats the
+// empty state as "no data", not "below cap".
+func (h *Handler) RoutesFor(appID string) (routes []string, overflowed bool) {
 	if h == nil {
-		return nil
+		return nil, false
 	}
 	v, ok := h.routeSets.Load(appID)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	s := v.(*routeLabelSet)
 	s.mu.Lock()
@@ -4014,7 +4033,15 @@ func (h *Handler) RoutesFor(appID string) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
-	return out
+	// Cap-hit is the same condition admit() checks at
+	// route_label_set.go:152: len(admitted) - reservedCount >= cap.
+	// Duplicated here rather than exported as a method on
+	// routeLabelSet to avoid widening the type's surface (the
+	// only callers are the dashboard-side wire reader and the
+	// observe_route tests; both can carry the trivially-cheap
+	// subtraction).
+	const reservedCount = 2
+	return out, len(s.admitted)-reservedCount >= s.cap
 }
 
 // preInstantiateAppRoute (ADR-093) records (appID, route) once

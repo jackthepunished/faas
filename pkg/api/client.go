@@ -686,6 +686,21 @@ func (c *Client) DeployFromSourceRef(ctx context.Context, slug string, req Sourc
 		"/v1/apps/"+slug+"/deployments/source-ref", req, &out)
 }
 
+// Diff returns a read-only preview of what a deploy would change
+// without writing. CI calls this in the same job that calls
+// Deploy; non-zero exit (or Blocking=true in the wire) means
+// "don't deploy". Mirrors the CLI's `gregale deploy --diff --json`
+// output byte-for-byte — a CI consumer parsing either path
+// agrees.
+//
+// Read-only: auth chain on the server is apps:read (no MFA, no
+// deploy:write required). The handler does not call CreateApp /
+// CreateDeployment / anything in the write path.
+func (c *Client) Diff(ctx context.Context, slug string, req DiffRequest) (DiffResponse, error) {
+	var out DiffResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/diff", req, &out)
+}
+
 // GetApp returns the app metadata for a slug.
 func (c *Client) GetApp(ctx context.Context, slug string) (AppResponse, error) {
 	var out AppResponse
@@ -1777,6 +1792,16 @@ func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetric
 // is "live" on success and "unavailable" when the control
 // listener dial failed — callers should render both branches the
 // same way (empty list, distinct chip).
+//
+// CapHit (ADR-093 Tier B item #1) is true iff the app's route
+// label set reached RouteMetricsPerAppCap (50) and additional
+// routes are collapsing into the reserved __route_other__ bucket.
+// When true, len(Routes) == 52 (50 real + reserved empty +
+// __route_other__). When false, the dashboard can render "you have
+// N admitted routes" without counting. CapHit is the zero value
+// (false) on the source: unavailable path — the cap state is
+// unknown when the gatewayd-internal dial fails, so the field is
+// not part of the unreliable wire.
 func (c *Client) GetAppRoutes(ctx context.Context, slug string) (AppRoutesResponse, error) {
 	var out AppRoutesResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/routes", nil, &out)
