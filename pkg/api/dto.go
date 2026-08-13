@@ -3744,7 +3744,7 @@ type EdgeRuleCORSAction struct {
 // "https://*.example.com" expands to a concrete origin at
 // request time, so browsers permit credentials for it; the
 // guard is intentionally narrow.
-var CorsOriginPattern = regexp.MustCompile(`^(?:\*|https?://(?:\*\.[a-zA-Z0-9.\-]+|[a-zA-Z0-9.\-]+\*|localhost|\*)(?::\*|\:[0-9]+)?|https?://[a-zA-Z0-9.\-]+(?::\*|\:[0-9]+)?)$`)
+var CorsOriginPattern = regexp.MustCompile(`^(?:\*|https?://(?:\*\.[a-zA-Z0-9.\-]+|localhost)(?::\*|\:[0-9]+)?|https?://[a-zA-Z0-9.\-]+(?::\*|\:[0-9]+)?)$`)
 
 func (a *EdgeRuleCORSAction) Validate() *Problem {
 	if a == nil {

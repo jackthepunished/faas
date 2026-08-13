@@ -134,10 +134,19 @@ type App struct {
 	// through pgRouter.toApp so applyEdgeRuleCORS
 	// can stamp a soft CORS header set on the
 	// response when no kind=cors rule matches the
-	// host/path. Default-false in fakeBackend unit
-	// tests (the in-memory backend doesn't populate
-	// the column). See spec §4.1.2.6 CORS defaults.
-	CORSDefaultEnabled bool
+	// Pointer (not plain bool) for the same
+	// reason state.App uses a pointer: legacy
+	// rows (never PATCHed) hydrate as *false;
+	// an explicit opt-out hydrates as *false;
+	// an opt-in hydrates as *true. The
+	// nil-vs-*false distinction only matters on
+	// the WRITE path; the hot path collapses
+	// both to false by checking for non-nil
+	// before deref (see applyEdgeRuleCORS).
+	// fakeBackend unit tests use *bool(true)
+	// to exercise the default-fallback stamp.
+	// See spec §4.1.2.6a CORS defaults.
+	CORSDefaultEnabled *bool
 	// CORS improvements D1: per-app default CORS
 	// allowlist. Plumbed from apps.cors_default_origins
 	// (text[]) through pgRouter.toApp so the gateway
@@ -1304,7 +1313,13 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 		// reaches the customer code; the response gets
 		// Allow-Origin + Allow-Methods + Allow-Headers
 		// stamped on the way out.
-		if app.CORSDefaultEnabled && len(app.CORSDefaultOrigins) > 0 {
+		// nil → never set (schema default); *false →
+		// explicit opt-out (col == false); *true →
+		// opt-in. The nil-safe check collapses the
+		// "schema default" + "explicit opt-out"
+		// cases to a single "don't stamp" path so
+		// the hot path is a single non-nil test.
+		if app.CORSDefaultEnabled != nil && *app.CORSDefaultEnabled && len(app.CORSDefaultOrigins) > 0 {
 			origin := r.Header.Get("Origin")
 			allowedOrigin := matchOrigin(app.CORSDefaultOrigins, origin)
 			if origin != "" && allowedOrigin != "" && rec != nil {

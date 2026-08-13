@@ -558,24 +558,16 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// CORS improvements D1: per-app default CORS opt-in +
 		// allowlist. Projected from the apps row so a customer
 		// can verify their PATCH landed without a second
-		// round-trip. The CORSDefaultEnabled pointer carries
-		// NULL on legacy rows (no customer choice yet) so the
-		// wire shape distinguishes "never set" from "explicitly
-		// false"; CORSDefaultOrigins is materialised as a
-		// non-nil slice so the JSON shape is `[]` (never `null`)
-		// for the same ergonomic reasons as EgressAllowlist
-		// above.
-		CORSDefaultEnabled: cORSEnabledPtr(a.CORSDefaultEnabled),
+		// round-trip. The store-layer field is already *bool
+		// so the three-state shape (nil = schema default,
+		// *false = explicit opt-out, *true = opt-in)
+		// flows through unchanged. CORSDefaultOrigins is
+		// materialised as a non-nil slice so the JSON shape
+		// is `[]` (never `null`) for the same ergonomic
+		// reasons as EgressAllowlist above.
+		CORSDefaultEnabled: a.CORSDefaultEnabled,
 		CORSDefaultOrigins: cORSOriginsList(a.CORSDefaultOrigins),
 	}
-}
-
-// cORSEnabledPtr lifts the state-layer bool into the wire pointer
-// shape used by AppResponse. Returns nil for the schema default
-// (false) so legacy rows project as JSON null on the wire — the
-// dashboards branch on field-presence rather than a sentinel value.
-func cORSEnabledPtr(v bool) *bool {
-	return &v
 }
 
 // cORSOriginsList materialises the text[] column as a non-nil slice.

@@ -825,18 +825,22 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		OverflowNode:    nilStringPtr(overflowUUID),
 		SetOverflowNode: req.OverflowNode != nil,
 		// CORS improvements D1: per-app default CORS opt-in.
-		// `req.CORSDefaultEnabled != nil` distinguishes
-		// "don't touch" from "explicit flip" so a
-		// RAM-only PATCH never re-stamps the column.
-		// The validator (above) already enforced the
-		// non-empty origins rule when true; the pointer
-		// shape mirrors OverflowNode so a stale PATCH
-		// with nil origins + nil enabled is a clean
-		// no-op on the store.
+		// The opt-out contract is asymmetric on purpose:
+		// a customer who flips the flag to false (or
+		// doesn't touch the flag) does NOT carry a
+		// brand-new origins list — the "flip to off"
+		// PATCH must never wipe a previously configured
+		// allowlist as a side effect. So
+		// SetCORSDefaultOrigins is true ONLY when the
+		// customer is enabling (or staying enabled);
+		// the validator already 422'd the
+		// (enabled=true + nil/empty origins) case so
+		// reaching this branch with enabled=true means
+		// a valid non-empty list is in hand.
 		CORSDefaultEnabled:    req.CORSDefaultEnabled,
 		SetCORSDefaultEnabled: req.CORSDefaultEnabled != nil,
 		CORSDefaultOrigins:    req.CORSDefaultOrigins,
-		SetCORSDefaultOrigins: req.CORSDefaultOrigins != nil,
+		SetCORSDefaultOrigins: req.CORSDefaultEnabled != nil && *req.CORSDefaultEnabled,
 	}
 	if req.PublicAuth != nil {
 		// params.PublicAuth is unset when req.PublicAuth is

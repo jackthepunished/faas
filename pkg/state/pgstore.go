@@ -11133,6 +11133,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var allowlistText string
 	var workloadClassStr string
 	var scalingPolicyBytes []byte
+	var corsDefaultEnabled bool // ADR-091 CORS defaults (D1) — hydrated into *bool below.
 	// Tier A10 / ADR-088: scratch sink for the overflow_node
 	// projection. coalesce(overflow_node::text, '') returns
 	// '' for the NULL-preference case, which we promote to
@@ -11206,19 +11207,19 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// directly (pgx handles SQL NULL → Go nil natively).
 		//
 		// ADR-091 CORS improvements D1: per-app default CORS
-		// opt-in. cors_default_enabled is NOT NULL DEFAULT false
-		// in the schema, so we scan into a local plain bool
-		// and lift it into *bool below the Scan() call so the
-		// wire projection can distinguish legacy rows (never
-		// PATCHed) from explicit opt-out (PATCHed to false).
-		// The three-state collapse (nil = never touched,
-		// *false = PATCHed-to-false, *true = opted in) lives
-		// on the write path; the read path always returns a
-		// non-nil pointer on hydrated rows. cors_default_origins
-		// is text[] — pgx maps a NULL array to a nil Go slice,
-		// which is exactly the "deny all" sentinel the gateway
-		// uses (mirrors how EgressAllowlist handles the empty
-		// case).
+		// opt-in + allowlist. cors_default_enabled is NOT
+		// NULL DEFAULT false in the schema so the scan lands
+		// a plain bool; we lift it into *bool below so the
+		// wire projection surfaces the legacy-row nil vs.
+		// explicit opt-out *false distinction. The three-state
+		// collapse (nil = never touched, *false = PATCHed-to-
+		// false, *true = opted in) lives on the write path;
+		// the read path always returns a non-nil pointer.
+		// cors_default_origins is text[] — pgx maps a NULL
+		// array to a nil Go slice, which is exactly the
+		// "deny all" sentinel the gateway uses (mirrors how
+		// EgressAllowlist handles the empty case). No helper
+		// normalisation needed.
 		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt,
 		&corsDefaultEnabled, &a.CORSDefaultOrigins); err != nil {
 		return mapErr(err)

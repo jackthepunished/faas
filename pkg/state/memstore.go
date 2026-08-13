@@ -3092,7 +3092,12 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	// fallback). The validator runs above the store layer so
 	// we never see (enabled=true, origins=nil) here.
 	if p.SetCORSDefaultEnabled {
-		a.CORSDefaultEnabled = boolOrFalse(p.CORSDefaultEnabled)
+		// Lifts nullable wire shape into the
+		// store-layer pointer field. nil → nil
+		// (legacy row, opt-out triple collapse),
+		// *v → *v (no copy needed; the apid
+		// caller already handed off ownership).
+		a.CORSDefaultEnabled = p.CORSDefaultEnabled
 	}
 	if p.SetCORSDefaultOrigins {
 		if p.CORSDefaultOrigins == nil {
