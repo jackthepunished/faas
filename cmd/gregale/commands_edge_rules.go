@@ -31,16 +31,13 @@ import (
 
 // edgeRuleKindVocab mirrors the closed `kind` set in
 // migrations/00192_edge_rules.sql's CHECK constraint (extended by
-// migrations/00214 for validate, 00219 for limit, and 00220 for
-// geo). Surfacing a typo locally avoids a 400 round-trip on every
-// `edge-rules create` call (same posture as webhookClosedVocab in
-// commands_webhooks.go).
-// source of truth. The kind=geo entry is gated on PR #845's
-// migration landing; it will land in a follow-up commit when the
-// CHECK widens to 10 values.
+// migrations/00214 for validate, 00219 for limit, 00220 for geo,
+// and 00244 for throttle). Surfacing a typo locally avoids a
+// 400 round-trip on every `edge-rules create` call (same posture
+// as webhookClosedVocab in commands_webhooks.go).
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
-	"validate", "limit", "geo",
+	"validate", "limit", "geo", "throttle",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
@@ -102,7 +99,7 @@ func cmdEdgeRules(args []string) int {
 func cmdEdgeRulesList(args []string) int {
 	fs := flag.NewFlagSet("edge-rules list", flag.ContinueOnError)
 	slug := fs.String("app", "", "filter to a single app slug")
-	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip|validate|limit)")
+	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -160,7 +157,7 @@ func cmdEdgeRulesList(args []string) int {
 func cmdEdgeRulesCreate(args []string) int {
 	fs := flag.NewFlagSet("edge-rules create", flag.ContinueOnError)
 	slug := fs.String("app", "", "app slug (required)")
-	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip|validate|limit (required)")
+	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle (required)")
 	matchHost := fs.String("match-host", "", "host to match (required)")
 	matchPath := fs.String("match-path", "/", "path to match")
 	var matchMethods multiFlag
@@ -232,6 +229,18 @@ func cmdEdgeRulesCreate(args []string) int {
 	fs.Var(&geoAllow, "geo-allow", "kind=geo: allow country code (ISO 3166-1 alpha-2; repeat)")
 	fs.Var(&geoDeny, "geo-deny", "kind=geo: deny country code (ISO 3166-1 alpha-2; repeat)")
 
+	// throttle (ADR-091 D20.5 amendment, issue #881). Per-route
+	// token-bucket cap. rps is required-as-positive (the apid
+	// validator rejects 0 / negative with 422 to prevent a
+	// permanently unevictable bucket under the LRU invariant —
+	// see pkg/gateway/ratelimit.go::NewLimiterWithLRU). burst is
+	// required-as-positive for the same reason. Sub-plan ceiling
+	// check happens server-side (the CLI is HTTP-only and doesn't
+	// have the plan row; the apid sub-plan validator against
+	// acct.Plan is the authoritative gate).
+	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: refill rate (req/s; >0; <=plan.RateLimitRPS)")
+	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: token-bucket burst (>0; <=plan.RateLimitBurst)")
+
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -272,6 +281,8 @@ func cmdEdgeRulesCreate(args []string) int {
 		LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
 		GeoAllow:                   geoAllow,
 		GeoDeny:                    geoDeny,
+		ThrottleRPS:                *throttleRPS,
+		ThrottleBurst:              *throttleBurst,
 	})
 	if err != nil {
 		return printErr("Invalid flags for --kind="+*kind, err)
@@ -397,6 +408,15 @@ func cmdEdgeRulesUpdate(args []string) int {
 	limitMaxBodyBytes := fs.Int("limit-max-body-bytes", 0, "kind=limit: buffered body cap in bytes")
 	limitMaxBodyBytesStreaming := fs.Int("limit-max-body-bytes-streaming", 0, "kind=limit: streaming body cap in bytes (0=inherit buffered)")
 
+	// throttle (ADR-091 D20.5 amendment, issue #881). Mirror of
+	// the create-side flags. Both flags carry a "0 means save-as-
+	// is platform default" semantics — but for throttle, 0 is a
+	// 422 from the apid validator (a 0-rps rule is a leak under
+	// the LRU invariant), so the CLI explicitly rejects 0/negative
+	// here AND the validator rejects it server-side.
+	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: new refill rate (req/s; >0; <=plan.RateLimitRPS)")
+	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: new token-bucket burst (>0; <=plan.RateLimitBurst)")
+
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -482,6 +502,8 @@ func cmdEdgeRulesUpdate(args []string) int {
 			LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
 			GeoAllow:                   geoAllow,
 			GeoDeny:                    geoDeny,
+			ThrottleRPS:                *throttleRPS,
+			ThrottleBurst:              *throttleBurst,
 		})
 		if err != nil {
 			return printErr("Invalid flags for --kind="+*kind, err)
@@ -580,6 +602,16 @@ type edgeRuleActionInputs struct {
 	// geo (ADR-091 D21). ISO 3166-1 alpha-2 country codes;
 	// uppercased + space-stripped before the validator runs.
 	GeoAllow, GeoDeny []string
+	// throttle (ADR-091 D20.5 amendment, issue #881). Per-route
+	// token-bucket. Float64 for rps so the recommendation
+	// endpoint's ceil(observed_rps * 2) hands over a non-integer
+	// without coercing the customer's intent. The apid sub-plan
+	// validator (PlanMaxRPS / PlanMaxBurst) is the authoritative
+	// ceiling check — the CLI does the structural checks only
+	// (positive rps, positive burst) so the local error mirrors
+	// the server's "0-rps is a leak" message.
+	ThrottleRPS   float64
+	ThrottleBurst int
 }
 
 // buildEdgeRuleAction marshals the per-kind inputs into the matching
@@ -701,6 +733,42 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 		deny := upperCountryCodes(in.GeoDeny)
 		a := api.EdgeRuleGeoAction{Allow: allow, Deny: deny}
 		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "throttle":
+		// ADR-091 D20.5 amendment / issue #881. Per-route
+		// token-bucket cap. The CLI does the structural checks
+		// (positive rps, positive burst) so the user gets the
+		// same error locally as the server would return.
+		//
+		// The CLI does NOT take a plan row (HTTP-only per
+		// memory/cli-is-http-only-not-direct-db) so the
+		// sub-plan ceiling check is performed server-side by the
+		// apid validator against acct.Plan. A "0" or "negative"
+		// rps is rejected here because the server would 422 with
+		// the same rationale — surfacing it locally saves a
+		// round-trip.
+		if in.ThrottleRPS <= 0 {
+			return nil, fmt.Errorf("throttle action: requests_per_second must be > 0 (got %g) — a 0-rps rule is a silent no-op AND would create a permanently unevictable bucket", in.ThrottleRPS)
+		}
+		if in.ThrottleBurst <= 0 {
+			return nil, fmt.Errorf("throttle action: burst must be > 0 (got %d) — same rationale as a 0-rps rule", in.ThrottleBurst)
+		}
+		a := api.EdgeRuleThrottleAction{
+			RequestsPerSecond: in.ThrottleRPS,
+			Burst:             in.ThrottleBurst,
+		}
+		// The server's EdgeRuleThrottleAction.Validate takes a
+		// ThrottleValidationContext (per-plan ceiling). The CLI
+		// calls Validate with a zero context so the structural
+		// checks fire (ctx.PlanMaxRPS / ctx.PlanMaxBurst are 0,
+		// which the validator treats as "no ceiling", so the
+		// sub-plan check is skipped at the CLI and left to the
+		// server). This matches the "fail OPEN on unknown /
+		// unavailable context" posture documented on the
+		// Validate() method.
+		if err := a.Validate(api.ThrottleValidationContext{}); err != nil {
 			return nil, errToError(err)
 		}
 		return marshalAction(a)
@@ -853,6 +921,7 @@ func anyKindFlagVisited(visited map[string]bool) bool {
 		"jwt-issuer", "jwt-jwks-url", "jwt-audience", "jwt-algorithm", "jwt-required-claim",
 		"ip-allow", "ip-deny",
 		"limit-max-body-bytes", "limit-max-body-bytes-streaming",
+		"throttle-requests-per-second", "throttle-burst",
 	}
 	for _, name := range kindFlagNames {
 		if visited[name] {
