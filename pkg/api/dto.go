@@ -2880,11 +2880,28 @@ type RouteRow struct {
 // reachable, X-Faas-Routes-State: unavailable header). Routes
 // is []string (not nil) on the unavailable path so the JSON
 // encoder emits `[]` rather than `null`.
+//
+// CapHit (ADR-093 Tier B item #1, issue #273 follow-up) is true
+// iff the app's routeLabelSet has reached RouteMetricsPerAppCap
+// (pkg/api.RouteMetricsPerAppCap = 50) and additional routes are
+// collapsing into the reserved __route_other__ bucket. On the
+// "live" path the dashboard renders CapHit=true as a "you have
+// hit the 50-route cap" chip rather than counting Routes and
+// trying to disambiguate "5 real routes + __route_other__
+// because of one wildcard probe" from "50 real routes +
+// overflow". On the "unavailable" path CapHit is the zero
+// value (false) — the upstream decode doesn't carry it, and
+// the dashboard already renders unavailable as a distinct chip.
 type AppRoutesResponse struct {
 	Slug   string   `json:"slug"`
 	AppID  string   `json:"app_id,omitempty"`
 	Routes []string `json:"routes"`
 	Source string   `json:"source"`
+	// CapHit mirrors gatewayd-internal's routesResponseJSON.CapHit.
+	// ADR-093 §D2 invariant: when CapHit==true, len(Routes) ==
+	// RouteMetricsPerAppCap + 2 (the +2 is reservedRouteLabelEmpty
+	// + __route_other__).
+	CapHit bool `json:"cap_hit"`
 }
 
 // --- Account-scoped metrics rollup (issue #393) --------------------------

@@ -1422,6 +1422,7 @@ paths:
                 app_id: 11111111-1111-1111-1111-111111111111
                 routes: ["GET /users", "POST /orders", "__route_other__"]
                 source: live
+                cap_hit: true
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -10393,6 +10394,18 @@ components:
         an admitted route, or the reserved `"__route_other__"` overflow
         bucket label. Bounded at 50 distinct real routes + the reserved
         overflow per app (ADR-093 D2).
+
+        `cap_hit` (ADR-093 Tier B item #1) is true iff the app's
+        route label set has reached `RouteMetricsPerAppCap` (50) and
+        additional routes are collapsing into the reserved
+        `__route_other__` overflow bucket. When `cap_hit` is true,
+        `len(routes) == RouteMetricsPerAppCap + 2` (50 real + the
+        reserved empty label + `__route_other__`). When false, the
+        dashboard can render "you have N admitted routes" without
+        having to count the array (which is ambiguous: 5 real routes
+        + `__route_other__` is indistinguishable from 50 real routes
+        + overflow). Omitted on the `source: unavailable` path —
+        the gatewayd-internal dial failed, the cap state is unknown.
       type: object
       required: [slug, routes, source]
       properties:
@@ -10408,6 +10421,17 @@ components:
           enum: ["live", "unavailable"]
           x-since: "2026-08"
           x-issue: "273"
+        cap_hit:
+          type: boolean
+          default: false
+          x-since: "2026-08"
+          x-issue: "273"
+          description: |
+            True iff the route label set has hit `RouteMetricsPerAppCap`
+            (50) and additional routes are collapsing into
+            `__route_other__`. Omitted on `source: unavailable` paths
+            (cap state is unknown when the gatewayd-internal dial
+            fails).
 
     ListInstancesResponse:
       description: |
