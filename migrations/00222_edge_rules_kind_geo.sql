@@ -1,4 +1,4 @@
--- filename: 00221_edge_rules_kind_geo.sql
+-- filename: 00222_edge_rules_kind_geo.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -21,7 +21,7 @@
 --
 -- This migration lands after 00220 (PR #851 / preview_app_columns).
 -- PR #845 (this PR) renumbered kind=geo through 00207 → 00215 →
--- 00216 → 00217 → 00218 → 00220 → 00221 as main picked up sibling
+-- 00216 → 00217 → 00218 → 00220 → 00221 → 00222 as main picked up sibling
 -- migrations that claimed the earlier slots (PR #844 ADR-093,
 -- PR #849 ADR-092, PR #855 ADR-091 D24, PR #851 issue-272). The
 -- fenced slots at 00217 + 00218 carry cross-PR coordination fences
