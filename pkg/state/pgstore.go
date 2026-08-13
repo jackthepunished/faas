@@ -14733,3 +14733,208 @@ func (s *PgStore) GetGithubWebhookSecret(ctx context.Context, installationID int
 	}
 	return secret, nil
 }
+
+// --- ADR-096 customer-facing automatic error grouping ---
+//
+// The sqlc-generated methods (pkg/state/sqlc/queries.sql.go) own
+// the canonical SQL text. PgStore delegates to them via a
+// per-call sqlc.New() Queries instance + s.pool as the DBTX —
+// the pool's pgx connection handles satisfy the sqlc.DBTX
+// interface (pgxpool.Pool.Exec / Query / QueryRow match the
+// generated signature). The conversion from sqlc row types
+// (pgtype.UUID, pgtype.Timestamptz) to the domain types
+// (uuid.UUID, time.Time) happens here so callers (handlers in
+// PR-B + the nightly purge cron) don't have to thread pgtype
+// values through their own code. This matches the precedent
+// for TrafficAnomalyAggregate / PerAccountRateLimitAggregate
+// which the Store interface exposes at sqlc types directly.
+
+// appErrorsQueries is a per-call helper that returns a fresh
+// Queries instance. The Queries struct carries no state (see
+// pkg/state/sqlc/db.go) so there's no need to cache it on
+// PgStore. Allocating per call is cheap.
+func (s *PgStore) appErrorsQueries() *sqlc.Queries { return sqlc.New() }
+
+// uuidFromPgtype converts a sqlc/pgtype.UUID to google/uuid.UUID.
+// Returns uuid.Nil if the input is invalid (the migration's id
+// columns are NOT NULL uuid, so this is a defensive guard).
+func uuidFromPgtype(id pgtype.UUID) uuid.UUID {
+	if !id.Valid {
+		return uuid.Nil
+	}
+	return uuid.UUID(id.Bytes)
+}
+
+// timeFromPgtype converts a sqlc/pgtype.Timestamptz to time.Time.
+// Returns time.Time{} if the input is invalid.
+func timeFromPgtype(t pgtype.Timestamptz) time.Time {
+	if !t.Valid {
+		return time.Time{}
+	}
+	return t.Time
+}
+
+// pgtypeFromUUID wraps google/uuid.UUID into pgtype.UUID with
+// Valid=true. Used by the writer methods to map domain types
+// to sqlc params.
+func pgtypeFromUUID(id uuid.UUID) pgtype.UUID {
+	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+// pgtypeFromTime wraps time.Time into pgtype.Timestamptz.
+func pgtypeFromTime(t time.Time) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: t, Valid: !t.IsZero()}
+}
+
+// IncrementAppError is the dedupe-merge INSERT called by the
+// apid gRPC server-side handler. The handler wraps N calls in
+// a single pgx transaction; this method runs ONE call at a
+// time — the caller is responsible for the tx (via
+// pgxpool.Pool's BeginTx in the grpc handler).
+func (s *PgStore) IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error) {
+	return s.appErrorsQueries().IncrementAppError(ctx, s.pool, arg)
+}
+
+// InsertAppErrorRequest writes one drill-down row per request.
+// Paired with IncrementAppError on the same gRPC stream batch.
+func (s *PgStore) InsertAppErrorRequest(ctx context.Context, arg sqlc.InsertAppErrorRequestParams) error {
+	return s.appErrorsQueries().InsertAppErrorRequest(ctx, s.pool, arg)
+}
+
+// ListAppErrorGroups converts sqlc.ListAppErrorGroupsRow to
+// the domain AppErrorGroup at the boundary so handlers don't
+// touch pgtype.
+func (s *PgStore) ListAppErrorGroups(ctx context.Context, arg sqlc.ListAppErrorGroupsParams) ([]AppErrorGroup, error) {
+	rows, err := s.appErrorsQueries().ListAppErrorGroups(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppErrorGroup, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, AppErrorGroup{
+			ID:            uuidFromPgtype(r.ID),
+			Fingerprint:   r.Fingerprint,
+			ErrorClass:    r.ErrorClass,
+			Route:         r.Route,
+			HTTPStatus:    r.HttpStatus,
+			Count:         r.Count,
+			RequestCount:  r.RequestCount,
+			FirstSeenAt:   timeFromPgtype(r.FirstSeenAt),
+			LastSeenAt:    timeFromPgtype(r.LastSeenAt),
+			SampleMessage: r.SampleMessage,
+		})
+	}
+	return out, nil
+}
+
+// ListAppErrorRequests converts sqlc.ListAppErrorRequestsRow to
+// the domain AppErrorRequestRow.
+func (s *PgStore) ListAppErrorRequests(ctx context.Context, arg sqlc.ListAppErrorRequestsParams) ([]AppErrorRequestRow, error) {
+	rows, err := s.appErrorsQueries().ListAppErrorRequests(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppErrorRequestRow, 0, len(rows))
+	for _, r := range rows {
+		var depID *uuid.UUID
+		if r.DeploymentID.Valid {
+			d := uuidFromPgtype(r.DeploymentID)
+			depID = &d
+		}
+		out = append(out, AppErrorRequestRow{
+			ID:            uuidFromPgtype(r.ID),
+			RequestID:     uuidFromPgtype(r.RequestID),
+			ReceivedAt:    timeFromPgtype(r.ReceivedAt),
+			Route:         r.Route,
+			HTTPStatus:    r.HttpStatus,
+			ErrorClass:    r.ErrorClass,
+			SampleMessage: r.SampleMessage,
+			DeploymentID:  depID,
+		})
+	}
+	return out, nil
+}
+
+// GetAppErrorSample returns the single oldest request row for
+// one fingerprint, with headers_sample + redactions populated
+// for the wire-side "we redacted X / Y / Z" badge.
+func (s *PgStore) GetAppErrorSample(ctx context.Context, arg sqlc.GetAppErrorSampleParams) (AppErrorSampleRow, error) {
+	row, err := s.appErrorsQueries().GetAppErrorSample(ctx, s.pool, arg)
+	if err != nil {
+		return AppErrorSampleRow{}, err
+	}
+	var depID *uuid.UUID
+	if row.DeploymentID.Valid {
+		d := uuidFromPgtype(row.DeploymentID)
+		depID = &d
+	}
+	headers := []byte(nil)
+	if row.HeadersSample != nil {
+		headers = row.HeadersSample
+	}
+	return AppErrorSampleRow{
+		AppErrorRequestRow: AppErrorRequestRow{
+			ID:            uuidFromPgtype(row.ID),
+			RequestID:     uuidFromPgtype(row.RequestID),
+			ReceivedAt:    timeFromPgtype(row.ReceivedAt),
+			Route:         row.Route,
+			HTTPStatus:    row.HttpStatus,
+			ErrorClass:    row.ErrorClass,
+			SampleMessage: row.SampleMessage,
+			DeploymentID:  depID,
+		},
+		HeadersSample: headers,
+		Redactions:    row.Redactions,
+	}, nil
+}
+
+// ListAppErrorFingerprintsForPurge is the read-side of the
+// nightly retention purge (cmd/apid/app_errors_purge.go).
+func (s *PgStore) ListAppErrorFingerprintsForPurge(ctx context.Context, arg sqlc.ListAppErrorFingerprintsForPurgeParams) ([]uuid.UUID, error) {
+	rows, err := s.appErrorsQueries().ListAppErrorFingerprintsForPurge(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, uuidFromPgtype(r))
+	}
+	return out, nil
+}
+
+// DeleteAppErrorsByIDs removes app_errors rows by ID array.
+// The sqlc-generated method takes []pgtype.UUID; we convert
+// here.
+func (s *PgStore) DeleteAppErrorsByIDs(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	pgIDs := make([]pgtype.UUID, len(ids))
+	for i, id := range ids {
+		pgIDs[i] = pgtypeFromUUID(id)
+	}
+	return s.appErrorsQueries().DeleteAppErrorsByIDs(ctx, s.pool, pgIDs)
+}
+
+// DeleteAppErrorRequestsByIDs removes app_error_requests rows
+// by ID array.
+func (s *PgStore) DeleteAppErrorRequestsByIDs(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	pgIDs := make([]pgtype.UUID, len(ids))
+	for i, id := range ids {
+		pgIDs[i] = pgtypeFromUUID(id)
+	}
+	return s.appErrorsQueries().DeleteAppErrorRequestsByIDs(ctx, s.pool, pgIDs)
+}
+
+// DeleteAppErrorRequestsOlderThan removes ALL app_error_requests
+// rows for one account older than cutoff. Used by the nightly
+// retention purge to age out orphaned request rows.
+func (s *PgStore) DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error {
+	return s.appErrorsQueries().DeleteAppErrorRequestsOlderThan(ctx, s.pool, sqlc.DeleteAppErrorRequestsOlderThanParams{
+		AccountID:  pgtypeFromUUID(accountID),
+		ReceivedAt: pgtypeFromTime(cutoff),
+	})
+}

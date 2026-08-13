@@ -158,6 +158,39 @@ type AppEnv struct {
 	OrgID     pgtype.UUID
 }
 
+type AppError struct {
+	ID            pgtype.UUID
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	DeploymentID  pgtype.UUID
+	Fingerprint   string
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	Count         int64
+	RequestCount  int64
+	FirstSeenAt   pgtype.Timestamptz
+	LastSeenAt    pgtype.Timestamptz
+	CreatedAt     pgtype.Timestamptz
+}
+
+type AppErrorRequest struct {
+	ID            pgtype.UUID
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	Fingerprint   string
+	RequestID     pgtype.UUID
+	ReceivedAt    pgtype.Timestamptz
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  pgtype.UUID
+	HeadersSample []byte
+	Redactions    []string
+}
+
 type AppRegistryCredential struct {
 	ID                pgtype.UUID
 	AccountID         pgtype.UUID

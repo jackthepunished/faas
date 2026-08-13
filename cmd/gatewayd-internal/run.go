@@ -42,6 +42,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid"
+	"github.com/onebox-faas/faas/pkg/apidgrpc"
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
@@ -1332,6 +1333,54 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// `deps.pgStore` (tests) skips the replay check, matching the
 	// pre-#294 behaviour.
 	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log, newGatewaydAuditor(deps.pgStore, log))
+
+	// ADR-096: customer-facing automatic error grouping writer
+	// path. gatewayd-internal records every 4xx/5xx response on
+	// the public edge and ships batches to apid via the
+	// unix-socket gRPC IncrementAppError streaming RPC. apid is
+	// the sole writer to app_errors / app_error_requests
+	// (CLAUDE.md ownership); the gateway never opens a direct
+	// Postgres connection for this store.
+	//
+	// Kill-switch: FAAS_APP_ERRORS_ENABLED defaults to false
+	// (PR-A's stable point). PR-B flips it to true. When false,
+	// the recorder middleware is a pass-through (no per-request
+	// cost beyond a single int compare) and the publisher
+	// goroutine is NOT started.
+	//
+	// apid socket: defaults to /run/faas/apid.sock (the
+	// ADR-015 unix-socket DAC convention shared with schedd +
+	// vmmd). Operators override via FAAS_APID_SOCKET when the
+	// socket path diverges (containerised deployments, etc).
+	appErrorsEnabled := osGetenv("FAAS_APP_ERRORS_ENABLED") == "true"
+	apidAppErrorsSock := osGetenv("FAAS_APID_APP_ERRORS_SOCKET")
+	if apidAppErrorsSock == "" {
+		apidAppErrorsSock = "/run/faas/app_errors.sock"
+	}
+	if appErrorsEnabled && deps.opsMetrics != nil {
+		// Build the recorder + publisher; wire the publisher
+		// goroutine; wrap the public handler with the
+		// recorder's middleware.
+		cli, dialErr := apidgrpc.DialContext(ctx, apidAppErrorsSock, nil)
+		if dialErr != nil {
+			log.Warn("app_errors: apid socket dial failed; recorder disabled", "err", dialErr)
+		} else {
+			recorder := newAppErrorsRecorder(appErrorsRecorderConfig{
+				Enabled:               true,
+				DedupeWindowSeconds:   3600,
+				CardinalityLimit:      10000,
+				SampleMessageCapBytes: 512,
+				HeadersSampleMaxKeys:  8,
+			}, nil, deps.opsMetrics, log)
+			publisher := newAppErrorsPublisher(recorder, cli, deps.opsMetrics, log)
+			recorder.pub = publisher
+			go publisher.Run(ctx)
+			publicHandler = recorder.Middleware(publicHandler)
+			log.Info("app_errors recorder enabled", "apid_socket", apidAppErrorsSock)
+		}
+	} else {
+		log.Info("app_errors recorder disabled (FAAS_APP_ERRORS_ENABLED != \"true\")")
+	}
 
 	// Issue #249 / spec §11: mount security response headers at the
 	// outermost wrapper of the public listener.

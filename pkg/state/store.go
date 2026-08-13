@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
@@ -258,6 +259,45 @@ type PaddleOverageDedupeSchemaResult struct {
 	// `select count(*) filter (where state = …)` query.
 	PendingRows   int64
 	CompletedRows int64
+}
+
+// AppErrorGroup is the typed row produced by the
+// /v1/apps/{slug}/errors/summary endpoint (ADR-096). It mirrors
+// sqlc.ListAppErrorGroupsRow but uses stdlib uuid.UUID + time.Time
+// so handlers don't have to thread pgtype values through the
+// wire layer. PgStore converts at the boundary.
+type AppErrorGroup struct {
+	ID            uuid.UUID
+	Fingerprint   string
+	ErrorClass    string
+	Route         string
+	HTTPStatus    int32
+	Count         int64
+	RequestCount  int64
+	FirstSeenAt   time.Time
+	LastSeenAt    time.Time
+	SampleMessage string
+}
+
+// AppErrorRequestRow is the typed drill-down row for
+// /v1/apps/{slug}/errors/{fingerprint}.
+type AppErrorRequestRow struct {
+	ID            uuid.UUID
+	RequestID     uuid.UUID
+	ReceivedAt    time.Time
+	Route         string
+	HTTPStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  *uuid.UUID
+}
+
+// AppErrorSampleRow is the typed single-sample row for
+// /v1/apps/{slug}/errors/{fingerprint}/first.
+type AppErrorSampleRow struct {
+	AppErrorRequestRow
+	HeadersSample []byte // jsonb raw; handler parses to map[string]string
+	Redactions    []string
 }
 
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
@@ -3375,4 +3415,70 @@ type Store interface {
 	// /deliveries/{id}/retry) and the dispatcher-side audit
 	// emission that needs to read the row's account_id + app_id.
 	AppWebhookDeliveryByID(ctx context.Context, id string) (AppWebhookDelivery, error)
+
+	// --- ADR-096 customer-facing automatic error grouping ---
+	//
+	// The writer methods (IncrementAppError / InsertAppErrorRequest)
+	// are called by the apid gRPC server-side handler in
+	// cmd/apid/grpc_server_apperrors.go; gatewayd-internal dials
+	// apid over a unix socket and never touches the Store
+	// directly. The reader methods back the
+	// /v1/apps/{slug}/errors/* handlers in PR-B.
+
+	// IncrementAppError is the dedupe-merge INSERT called by
+	// grpc_server_apperrors.go. Runs ON CONFLICT (account_id,
+	// app_id, fingerprint) DO UPDATE so a fresh row with an
+	// existing fingerprint bumps count + request_count + bumps
+	// last_seen_at. The handler wraps N calls in a single pgx
+	// transaction (one per gRPC stream batch). params use sqlc
+	// types to match the generated query method (ADR-006 +
+	// TrafficAnomalyAggregate precedent at pkg/state/store.go
+	// line 2611 — sqlc types leak through the Store interface
+	// for the queries that sqlc owns; readers convert to typed
+	// AppErrorGroup/Row/Row at the boundary).
+	IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error)
+
+	// InsertAppErrorRequest writes one drill-down row per request
+	// that hit the fingerprint. No ON CONFLICT — every request
+	// gets its own row. Paired with IncrementAppError on the same
+	// gRPC stream batch.
+	InsertAppErrorRequest(ctx context.Context, arg sqlc.InsertAppErrorRequestParams) error
+
+	// ListAppErrorGroups backs GET /v1/apps/{slug}/errors/summary
+	// (PR-B). Cursor-paginated via (last_seen_at, fingerprint)
+	// when cursor != ""; otherwise first page. limit MUST be
+	// pre-clamped to api.AppErrorsSummaryMaxLimit by the handler.
+	ListAppErrorGroups(ctx context.Context, arg sqlc.ListAppErrorGroupsParams) ([]AppErrorGroup, error)
+
+	// ListAppErrorRequests backs GET /v1/apps/{slug}/errors/{fp}
+	// (PR-B). Cursor-paginated via (received_at, request_id).
+	// limit MUST be pre-clamped by the handler.
+	ListAppErrorRequests(ctx context.Context, arg sqlc.ListAppErrorRequestsParams) ([]AppErrorRequestRow, error)
+
+	// GetAppErrorSample backs GET /v1/apps/{slug}/errors/{fp}/first
+	// (PR-B). Returns the OLDEST request row for one fingerprint.
+	// headers_sample + redactions are populated for the
+	// wire-side "we redacted X / Y / Z" badge.
+	GetAppErrorSample(ctx context.Context, arg sqlc.GetAppErrorSampleParams) (AppErrorSampleRow, error)
+
+	// ListAppErrorFingerprintsForPurge is the read-side of the
+	// nightly retention purge (cmd/apid/app_errors_purge.go).
+	// Returns IDs of app_errors rows for an account older than
+	// cutoff, capped at 10000 per call. DeleteAppErrorsByIDs +
+	// DeleteAppErrorRequestsByIDs follow.
+	ListAppErrorFingerprintsForPurge(ctx context.Context, arg sqlc.ListAppErrorFingerprintsForPurgeParams) ([]uuid.UUID, error)
+
+	// DeleteAppErrorsByIDs removes app_errors rows by ID array.
+	// Used by the nightly retention purge.
+	DeleteAppErrorsByIDs(ctx context.Context, ids []uuid.UUID) error
+
+	// DeleteAppErrorRequestsByIDs removes app_error_requests rows
+	// by ID array. Used by the nightly retention purge.
+	DeleteAppErrorRequestsByIDs(ctx context.Context, ids []uuid.UUID) error
+
+	// DeleteAppErrorRequestsOlderThan removes ALL
+	// app_error_requests rows for one account older than the
+	// cutoff timestamp. Used by the nightly retention purge to
+	// age out orphaned request rows.
+	DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error
 }

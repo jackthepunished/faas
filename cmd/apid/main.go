@@ -1453,39 +1453,61 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}()
 	}
 
-	// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. Apid
-	// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
-	// by watchLogLevelReload). Install three parallel ones — each
-	// gets every SIGHUP (signal.Notify fans the signal out to every
-	// registered channel). Best-effort failure posture (matches
-	// egress bundle): a failed reload keeps prior material live,
-	// never bricks. WatchTLSReload returns immediately on ctx cancel.
-	if cfg != nil && cfg.GithubdClientTLSCAPath != "" {
-		githubdHupCh := make(chan os.Signal, 1)
-		signal.Notify(githubdHupCh, syscall.SIGHUP)
-		defer signal.Stop(githubdHupCh)
-		githubdReload := func() (*tls.Config, error) {
-			return cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+	// ADR-096 PR-A: customer-facing automatic error grouping.
+	// The IncrementAppError gRPC server lives behind
+	// FAAS_APP_ERRORS_ENABLED (PR-A ships the kill-switch OFF so the
+	// schema is populated only by hand); the retention purge goroutine
+	// is started alongside it so PR-B can flip the flag without
+	// touching this main(). The reader-path handlers + DTOs + OpenAPI
+	// are PR-B work.
+	if deps.getenv("FAAS_APP_ERRORS_ENABLED") == "true" { //nolint:goconst // kill-switch sentinel; the canonical "true" env literal.
+		appErrSrv, appErrLis, err := runAppErrorsServer(ctx, srv.store, srv.ops, log)
+		if err != nil {
+			_ = l.Close()
+			return fmt.Errorf("apid: app errors server: %w", err)
 		}
-		go wire.WatchTLSReload(ctx, log, githubdHupCh, githubdRotator, githubdReload)
-	}
-	if cfg != nil && cfg.AdvisoryTLSCAPath != "" {
-		advisoryHupCh := make(chan os.Signal, 1)
-		signal.Notify(advisoryHupCh, syscall.SIGHUP)
-		defer signal.Stop(advisoryHupCh)
-		advisoryReload := func() (*tls.Config, error) {
-			return cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+		go func() {
+			log.Info("apid app errors server listening")
+			if err := appErrSrv.Serve(appErrLis); err != nil {
+				log.Error("apid app errors serve", "err", err)
+			}
+		}()
+		go newAppErrorsPurger(srv.store, nil, srv.ops, log, true).Run(ctx)
+
+		// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. Apid
+		// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
+		// by watchLogLevelReload). Install three parallel ones — each
+		// gets every SIGHUP (signal.Notify fans the signal out to every
+		// registered channel). Best-effort failure posture (matches
+		// egress bundle): a failed reload keeps prior material live,
+		// never bricks. WatchTLSReload returns immediately on ctx cancel.
+		if cfg != nil && cfg.GithubdClientTLSCAPath != "" {
+			githubdHupCh := make(chan os.Signal, 1)
+			signal.Notify(githubdHupCh, syscall.SIGHUP)
+			defer signal.Stop(githubdHupCh)
+			githubdReload := func() (*tls.Config, error) {
+				return cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, githubdHupCh, githubdRotator, githubdReload)
 		}
-		go wire.WatchTLSReload(ctx, log, advisoryHupCh, advisoryRotator, advisoryReload)
-	}
-	if cfg != nil && cfg.GithubdBridgeTLSCAPath != "" {
-		bridgeHupCh := make(chan os.Signal, 1)
-		signal.Notify(bridgeHupCh, syscall.SIGHUP)
-		defer signal.Stop(bridgeHupCh)
-		bridgeReload := func() (*tls.Config, error) {
-			return cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+		if cfg != nil && cfg.AdvisoryTLSCAPath != "" {
+			advisoryHupCh := make(chan os.Signal, 1)
+			signal.Notify(advisoryHupCh, syscall.SIGHUP)
+			defer signal.Stop(advisoryHupCh)
+			advisoryReload := func() (*tls.Config, error) {
+				return cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, advisoryHupCh, advisoryRotator, advisoryReload)
 		}
-		go wire.WatchTLSReload(ctx, log, bridgeHupCh, bridgeRotator, bridgeReload)
+		if cfg != nil && cfg.GithubdBridgeTLSCAPath != "" {
+			bridgeHupCh := make(chan os.Signal, 1)
+			signal.Notify(bridgeHupCh, syscall.SIGHUP)
+			defer signal.Stop(bridgeHupCh)
+			bridgeReload := func() (*tls.Config, error) {
+				return cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, bridgeHupCh, bridgeRotator, bridgeReload)
+		}
 	}
 
 	errc := make(chan error, 1)
@@ -1870,4 +1892,28 @@ func isUnixSocketPath(target string) bool {
 		return true
 	}
 	return false
+}
+
+// runAppErrorsServer brings up the AppErrors gRPC server
+// (ADR-096 §3.5: gatewayd-internal → apid IncrementAppError
+// streaming RPC). Listens on a unix socket under /run/faas so
+// the gateway-side dial is loopback-only and TLS-free (single-box
+// mode). The socket path is hard-coded to /run/faas/app_errors.sock
+// — gatewayd-internal dials it via FAAS_APID_APP_ERRORS_SOCK env
+// (defaulting to the same path). PR-A wires this server behind
+// FAAS_APP_ERRORS_ENABLED so the surface exists but is dormant
+// until PR-B flips the flag.
+//
+// Returns the server (caller calls Serve) and the listener. Errors
+// here are non-fatal: the caller logs and continues without the
+// app_errors gRPC server (the apid HTTP listener still serves).
+func runAppErrorsServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/app_errors.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("app errors listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerAppErrorsReceiver(srv, store, ops, true)
+	return srv, lis, nil
 }

@@ -298,6 +298,69 @@ type OpsMetrics struct {
 	// faas_apid_error_rate_5m, _3d_baseline, _ratio) read from
 	// one counter.
 	requestTotal *prometheus.CounterVec
+	// appErrorsRecorded (ADR-096) — counter the gatewayd-internal
+	// recorder (cmd/gatewayd-internal/app_errors_recorder.go) and
+	// the apid gRPC handler (cmd/apid/grpc_server_apperrors.go)
+	// increment per outcome. outcome ∈ {ok, redaction_failed,
+	// rate_limited, db_error}. `ok` is the §12 customer-error-
+	// ingest panel (rate over 5m); `redaction_failed` is the
+	// tripwire for pkg/redact panicking (must stay at 0); the
+	// closed label set keeps cardinality bounded. Single-registry:
+	// registered on every daemon; only gatewayd-internal +
+	// apid increment via ObserveAppErrorsRecorded.
+	//
+	// NOTE (post-review): `db_error` increments per-row on EVERY
+	// failure — not just the 5th-consecutive. A batch is drained
+	// from the ringbuffer in tryFlush BEFORE flushBatch is called,
+	// so a failure means those rows are already lost; suppressing
+	// the per-row observe until the tripwire fires would let the
+	// first four failures of every outage disappear from the
+	// dashboard.
+	appErrorsRecorded *prometheus.CounterVec
+	// appErrorsFingerprintCacheHits (ADR-096) — counter for the
+	// gatewayd-internal recorder's in-process LRU fingerprint
+	// cache. Every hit is a record() that did NOT need to call
+	// the regex / dedupe logic; every miss did. The hit rate
+	// (over 5m, divided by requestFailures) is the §12
+	// fingerprint-cache-effectiveness panel; a sustained <80%
+	// rate means the LRU is too small for the customer's traffic
+	// shape. Unlabelled — no cardinality risk. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFingerprintCacheHit.
+	appErrorsFingerprintCacheHits prometheus.Counter
+	// appErrorsDedupeMerges (ADR-096) — counter for server-side
+	// dedupe-merge hits in the apid gRPC handler. Increments
+	// once per ON CONFLICT (account_id, app_id, fingerprint) DO
+	// UPDATE that bumps the existing row's count + last_seen_at
+	// (within AppErrorsDedupeWindowSeconds). The dedupe-merge
+	// rate vs the new-fingerprint insert rate is the §12
+	// dedupe-effectiveness panel; if 100% of inserts are merges,
+	// the LRU backstop in the recorder is effectively never
+	// firing. Unlabelled. Single-registry: registered on every
+	// daemon; only apid increments via ObserveAppErrorsDedupeMerge.
+	appErrorsDedupeMerges prometheus.Counter
+	// appErrorsFlushDuration (ADR-096) — histogram of the
+	// gatewayd-internal publisher's per-flush wall-clock
+	// duration (FlushInterval or FlushBatchSize, whichever
+	// first). Bucket set {0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
+	// 1, 5}: the 1ms bucket catches the empty-drain case
+	// (FlushInterval fires with nothing to do); the 5s bucket
+	// catches a stuck DB connection (alertable via
+	// FlushDurationP99Slo). Unlabelled. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFlushDuration.
+	appErrorsFlushDuration prometheus.Histogram
+	// appErrorsPurges (ADR-096) — counter for the apid retention
+	// cron (cmd/apid/app_errors_purge.go). outcome ∈
+	// {ok, no_accounts, failed}. `ok` is the §12 retention-
+	// enforcement panel (rate over 24h, MUST be >0 once an
+	// account iterator lands); `no_accounts` is the signal that
+	// the cron ran but had no accounts to walk (PR-A ships with
+	// no iterator wired, so this fires every 24h until PR-B);
+	// `failed` is the tripwire for a SQL-level failure (alertable).
+	// Single-registry: registered on every daemon; only apid
+	// increments via ObserveAppErrorsPurge.
+	appErrorsPurges *prometheus.CounterVec
 	// accountLabels: the bounded admission set shared by the
 	// account_id-labelled metrics above. See accountLabelSet docs
 	// for the fixed-capacity, non-evicting contract — an evicting
@@ -2163,6 +2226,74 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Cross-node LIVE-instance migration decisions (Tier A5 / ADR-066), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, lease_expired, peer_failure}. `migrated` is the §12 dashboard panel. `lease_expired` is the tripwire for the four-phase handoff timing out; `peer_failure` is the tripwire for the new-owner vmmd failing the AdoptMigratedInstance RPC. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveLiveMigration.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, liveMigrationDecisions)
+	// ADR-096: customer-facing automatic error grouping ingest
+	// counter. Labelled by outcome ∈ {ok, redaction_failed,
+	// rate_limited, db_error}. `ok` is the §12 customer-error-
+	// ingest panel (rate over 5m); `redaction_failed` is the
+	// tripwire for pkg/redact panicking — must stay at 0.
+	// `rate_limited` is the LRU-cardinality backstop firing
+	// (CardinalityLimit hit). `db_error` is the publisher's
+	// 5th-consecutive-failure drop. Single-registry: registered
+	// on every daemon (mirrors liveMigrationDecisions); only
+	// gatewayd-internal + apid increment via
+	// ObserveAppErrorsRecorded.
+	appErrorsRecorded := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_recorded_total",
+		Help: "Customer-facing automatic error grouping ingest outcomes (ADR-096), labelled by outcome ∈ {ok, redaction_failed, rate_limited, db_error}. `ok` is the §12 customer-error-ingest panel (rate over 5m). `redaction_failed` is the tripwire for pkg/redact panicking — MUST stay at 0. `rate_limited` is the LRU-cardinality backstop firing when an app exceeds CardinalityLimit fingerprints. `db_error` is the publisher's per-row drop signal — incremented for EVERY row of a failed flush batch (the batch is drained before flushBatch is called, so failures always lose data; per-row observe gives the §12 panel an accurate outage timeline rather than only the 5th-consecutive-failure tripwire). Single-registry: registered on every daemon; only gatewayd-internal + apid increment via ObserveAppErrorsRecorded.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, appErrorsRecorded)
+	// ADR-096: in-process LRU fingerprint cache hit counter.
+	// Unlabelled (no cardinality risk). Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFingerprintCacheHit.
+	appErrorsFingerprintCacheHits := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_fingerprint_cache_hits_total",
+		Help: "In-process LRU fingerprint cache hits in the gatewayd-internal error recorder (ADR-096). Hit rate over 5m divided by requestFailures is the §12 fingerprint-cache-effectiveness panel; sustained <80% means the LRU is too small for the customer's traffic shape. No labels; no cardinality risk. Single-registry: registered on every daemon; only gatewayd-internal increments via ObserveAppErrorsFingerprintCacheHit.",
+	})
+	commonCollectors = append(commonCollectors, appErrorsFingerprintCacheHits)
+	// ADR-096: server-side dedupe-merge counter. Fires once per
+	// ON CONFLICT DO UPDATE that bumps an existing row's count
+	// + last_seen_at within AppErrorsDedupeWindowSeconds.
+	// Unlabelled. Single-registry: registered on every daemon;
+	// only apid increments via ObserveAppErrorsDedupeMerge.
+	appErrorsDedupeMerges := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_dedupe_merges_total",
+		Help: "Server-side dedupe-merge hits in the apid gRPC handler (ADR-096). Increments once per ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE that bumps an existing row's count + last_seen_at within AppErrorsDedupeWindowSeconds. Merge rate vs new-fingerprint insert rate is the §12 dedupe-effectiveness panel. No labels. Single-registry: registered on every daemon; only apid increments via ObserveAppErrorsDedupeMerge.",
+	})
+	commonCollectors = append(commonCollectors, appErrorsDedupeMerges)
+	// ADR-096: per-flush wall-clock duration histogram for the
+	// gatewayd-internal publisher. Unlabelled. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFlushDuration.
+	appErrorsFlushDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    prefix + "_app_errors_flush_duration_seconds",
+		Help:    "Per-flush wall-clock duration in the gatewayd-internal app_errors publisher (ADR-096). One observation per drain of the ringbuffer (FlushInterval or FlushBatchSize, whichever first). Bucket set {0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5}: the 1ms bucket catches the empty-drain case (FlushInterval fires with nothing to do); the 5s bucket catches a stuck DB connection (alertable via FlushDurationP99Slo). No labels. Single-registry: registered on every daemon; only gatewayd-internal increments via ObserveAppErrorsFlushDuration.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
+	})
+	commonCollectors = append(commonCollectors, appErrorsFlushDuration)
+	// ADR-096: retention cron outcome counter (apid-side).
+	// Labelled by outcome ∈ {ok, no_accounts, failed}. `ok` is
+	// the §12 retention-enforcement panel (rate over 24h, MUST
+	// be >0 once an account iterator lands); `no_accounts` is
+	// the signal that the cron ran but had no accounts to walk
+	// (PR-A ships with no iterator wired, so this fires every
+	// 24h until PR-B); `failed` is the tripwire for a SQL-level
+	// failure (alertable). Pre-instantiated at boot so the row
+	// surfaces in /metrics from the moment apid starts (single-
+	// registry rule).
+	appErrorsPurges := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_purges_total",
+		Help: "Retention cron outcomes for the customer-facing error grouping store (ADR-096), labelled by outcome ∈ {ok, no_accounts, failed}. `ok` is the §12 retention-enforcement panel (rate over 24h, MUST be >0 once an account iterator lands — Free 1d / Hobby 7d / Pro 30d / Scale 90d ceiling). `no_accounts` is the signal that the cron ran but had no accounts to walk (PR-A ships with no iterator wired, so this fires every 24h until PR-B lands the account iterator alongside the reader-path handlers). `failed` is the tripwire for a SQL-level failure (alertable). Single-registry: registered on every daemon; only apid increments via ObserveAppErrorsPurge.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, appErrorsPurges)
+	// Pre-instantiate the outcome set so /metrics surfaces the
+	// rows from a fresh process (Prometheus skips zero-valued
+	// CounterVec series by default). Extending the outcome
+	// vocabulary requires extending this loop in lock-step with
+	// the cmd/apid/app_errors_purge.go::Run dispatch.
+	for _, outcome := range []string{"ok", "no_accounts", "failed"} {
+		appErrorsPurges.WithLabelValues(outcome)
+	}
 	// ADR-067 / Tier A6: migrating-instance watchdog reconcile counter.
 	// Labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}.
 	// The reinvited label is the §12 dashboard panel (sum over 5m for
@@ -2626,6 +2757,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		accountOrgMismatch:                 accountOrgMismatch,
 		requestFailures:                    requestFailures,
 		requestTotal:                       requestTotal,
+		appErrorsRecorded:                  appErrorsRecorded,
+		appErrorsFingerprintCacheHits:      appErrorsFingerprintCacheHits,
+		appErrorsDedupeMerges:              appErrorsDedupeMerges,
+		appErrorsFlushDuration:             appErrorsFlushDuration,
+		appErrorsPurges:                    appErrorsPurges,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,
@@ -2811,6 +2947,62 @@ func (m *OpsMetrics) WriteRedirectLatency() prometheus.Observer {
 		return nil
 	}
 	return m.writeRedirectLatency
+}
+
+// ObserveAppErrorsRecorded increments the customer-facing
+// automatic error grouping ingest counter (ADR-096). outcome
+// MUST be one of {ok, redaction_failed, rate_limited, db_error};
+// the closed set is enforced by the canonical ADR-096 spec
+// (the apid gRPC handler + gatewayd-internal recorder share
+// this contract). nil-safe — no-op if m is nil.
+func (m *OpsMetrics) ObserveAppErrorsRecorded(outcome string) {
+	if m == nil || m.appErrorsRecorded == nil {
+		return
+	}
+	m.appErrorsRecorded.WithLabelValues(outcome).Inc()
+}
+
+// ObserveAppErrorsFingerprintCacheHit increments the in-process
+// LRU fingerprint cache hit counter (ADR-096). nil-safe.
+func (m *OpsMetrics) ObserveAppErrorsFingerprintCacheHit() {
+	if m == nil || m.appErrorsFingerprintCacheHits == nil {
+		return
+	}
+	m.appErrorsFingerprintCacheHits.Inc()
+}
+
+// ObserveAppErrorsDedupeMerge increments the server-side
+// dedupe-merge counter (ADR-096). Fires once per ON CONFLICT
+// DO UPDATE that bumps an existing row's count + last_seen_at.
+// nil-safe.
+func (m *OpsMetrics) ObserveAppErrorsDedupeMerge() {
+	if m == nil || m.appErrorsDedupeMerges == nil {
+		return
+	}
+	m.appErrorsDedupeMerges.Inc()
+}
+
+// ObserveAppErrorsFlushDuration records one sample of the
+// gatewayd-internal publisher's per-flush wall-clock duration
+// (ADR-096). Callers should pass seconds. nil-safe — no-op if
+// m is nil.
+func (m *OpsMetrics) ObserveAppErrorsFlushDuration(seconds float64) {
+	if m == nil || m.appErrorsFlushDuration == nil {
+		return
+	}
+	m.appErrorsFlushDuration.Observe(seconds)
+}
+
+// ObserveAppErrorsPurge records one observation of the apid
+// retention cron (ADR-096). outcome ∈ {ok, no_accounts,
+// failed}. nil-safe — no-op if m is nil or the metric was
+// pre-instantiated without labels. The closed outcome set keeps
+// cardinality bounded.
+func (m *OpsMetrics) ObserveAppErrorsPurge(outcome string) {
+	if m == nil || m.appErrorsPurges == nil {
+		return
+	}
+	m.appErrorsPurges.WithLabelValues(outcome).Inc()
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram

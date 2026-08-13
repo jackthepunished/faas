@@ -889,3 +889,141 @@ SET secret_value = EXCLUDED.secret_value,
 -- webhook is rejected rather than falling back to the platform-
 -- wide FAAS_GITHUB_WEBHOOK_SECRET).
 SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1;
+
+-- ---------------------------------------------------------------------------
+-- ADR-096 customer-facing automatic error grouping.
+-- Tables live in migrations/00222_app_errors.sql. gatewayd-internal
+-- writes via the apid gRPC IncrementAppError handler (pkg/apidgrpc/
+-- apperrors.proto); apid is the only direct writer to the table
+-- per the owner rules. The apid handlers in
+-- cmd/apid/handlers_app_errors.go (PR-B) and the nightly purge
+-- cron in cmd/apid/app_errors_purge.go (PR-A) read here.
+--
+-- Index paths pinned in the migration file (NOT regenerated here
+-- — sqlc doesn't manage indexes, only the typed query surface).
+-- ---------------------------------------------------------------------------
+
+-- name: IncrementAppError :one
+-- ADR-096 §3.5 dedupe-merge INSERT. The grpc_server_apperrors.go
+-- handler runs this inside a single pgx transaction per stream
+-- batch. ON CONFLICT target is app_errors_dedupe_uniq (the
+-- migration's UNIQUE on (account_id, app_id, fingerprint)).
+-- The dedupe window is enforced by the writer's LRU; this
+-- unique constraint is the last-resort tripwire.
+--
+-- Returns (inserted bool) via the canonical Postgres
+-- (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+-- on an UPDATE. This lets the handler distinguish
+-- outcomeInserted vs outcomeMerged on the wire — the gateway
+-- uses that signal to update its in-process LRU freshness.
+INSERT INTO app_errors (
+    id, account_id, app_id, deployment_id, fingerprint,
+    route, http_status, error_class, sample_message,
+    count, request_count, first_seen_at, last_seen_at
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8, $9,
+    1, 1, $10, $10
+)
+ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE SET
+    count         = app_errors.count + 1,
+    request_count = app_errors.request_count + 1,
+    last_seen_at  = greatest(app_errors.last_seen_at, $10)
+RETURNING (xmax = 0) AS inserted;
+
+-- name: InsertAppErrorRequest :exec
+-- One row per request that hit the grouped fingerprint. No
+-- ON CONFLICT — every request gets its own row. request_count
+-- on app_errors is bumped on the paired IncrementAppError
+-- call; the read path derives the joined total at query time.
+INSERT INTO app_error_requests (
+    id, account_id, app_id, fingerprint, request_id, received_at,
+    route, http_status, error_class, sample_message,
+    deployment_id, headers_sample, redactions
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9, $10,
+    $11, $12, $13
+);
+
+-- name: ListAppErrorGroups :many
+-- ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
+-- one (account_id, app_id) over a (since, until) window.
+-- Cursor pagination via the (last_seen_at, fingerprint) compound
+-- tuple (distinct from the operator's (created_at, id) cursor).
+-- Index path: app_errors_account_app_last_seen_idx covers the
+-- primary scan; the (count DESC) sort happens post-filter on the
+-- bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+SELECT
+    id, fingerprint, error_class, route, http_status,
+    count, request_count, first_seen_at, last_seen_at,
+    sample_message
+FROM app_errors
+WHERE account_id = $1
+  AND app_id     = $2
+  AND last_seen_at >= $3
+  AND last_seen_at <= $4
+  AND ($5::timestamptz IS NULL OR (last_seen_at, fingerprint) < ($5, $6))
+ORDER BY count DESC, last_seen_at DESC, fingerprint ASC
+LIMIT $7;
+
+-- name: ListAppErrorRequests :many
+-- Drill-down rows for one fingerprint. Cursor paginated via
+-- (received_at, request_id). Index path:
+-- app_error_requests_drill_idx. Does NOT include headers_sample
+-- or redactions — those are returned only by GetAppErrorSample.
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id
+FROM app_error_requests
+WHERE account_id  = $1
+  AND app_id      = $2
+  AND fingerprint = $3
+  AND ($4::timestamptz IS NULL OR (received_at, request_id) < ($4, $5))
+ORDER BY received_at DESC, request_id DESC
+LIMIT $6;
+
+-- name: GetAppErrorSample :one
+-- Single oldest request row for one fingerprint, used by the
+-- UI's "what does this look like" preview. Returns
+-- headers_sample + redactions for the wire-side "we redacted
+-- X / Y / Z" badge.
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id,
+    headers_sample, redactions
+FROM app_error_requests
+WHERE account_id  = $1
+  AND app_id      = $2
+  AND fingerprint = $3
+ORDER BY received_at ASC, request_id ASC
+LIMIT 1;
+
+-- name: ListAppErrorFingerprintsForPurge :many
+-- Nightly retention purge read path (cmd/apid/app_errors_purge.go).
+-- Returns IDs of app_errors rows for an account older than
+-- `cutoff`. Capped at 10000 per call so the DELETE loop can
+-- iterate without blocking. Sorted by last_seen_at ASC so the
+-- oldest rows are deleted first (a future eviction policy
+-- could swap to "least recent activity" without touching this
+-- query).
+SELECT id FROM app_errors
+WHERE account_id = $1
+  AND last_seen_at < $2
+ORDER BY last_seen_at ASC
+LIMIT $3;
+
+-- name: DeleteAppErrorsByIDs :exec
+DELETE FROM app_errors WHERE id = ANY($1::uuid[]);
+
+-- name: DeleteAppErrorRequestsByIDs :exec
+DELETE FROM app_error_requests WHERE id = ANY($1::uuid[]);
+
+-- name: DeleteAppErrorRequestsOlderThan :exec
+-- The retention purge also runs on app_error_requests
+-- independently — a customer's drill-down can age out without
+-- the parent fingerprint row being removed (e.g. Hobby with
+-- 100 rows/fingerprint cap evicts oldest request rows first).
+DELETE FROM app_error_requests
+WHERE account_id = $1
+  AND received_at < $2;

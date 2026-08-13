@@ -97,11 +97,23 @@ type Querier interface {
 	// dismissed scopes. list_secrets-shaped variant of DeleteAPIKey.
 	DeleteAPIKeyReturning(ctx context.Context, db DBTX, arg DeleteAPIKeyReturningParams) (DeleteAPIKeyReturningRow, error)
 	DeleteApp(ctx context.Context, db DBTX, id pgtype.UUID) error
+	DeleteAppErrorRequestsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error
+	// The retention purge also runs on app_error_requests
+	// independently — a customer's drill-down can age out without
+	// the parent fingerprint row being removed (e.g. Hobby with
+	// 100 rows/fingerprint cap evicts oldest request rows first).
+	DeleteAppErrorRequestsOlderThan(ctx context.Context, db DBTX, arg DeleteAppErrorRequestsOlderThanParams) error
+	DeleteAppErrorsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error
 	DeleteCron(ctx context.Context, db DBTX, arg DeleteCronParams) error
 	DeleteCustomDomain(ctx context.Context, db DBTX, domain interface{}) error
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
+	// Single oldest request row for one fingerprint, used by the
+	// UI's "what does this look like" preview. Returns
+	// headers_sample + redactions for the wire-side "we redacted
+	// X / Y / Z" badge.
+	GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErrorSampleParams) (GetAppErrorSampleRow, error)
 	// Returns the bytea secret for the given installation_id. The
 	// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
 	// webhook is rejected rather than falling back to the platform-
@@ -116,6 +128,36 @@ type Querier interface {
 	// Primary-key lookup; called on every authenticated dashboard request.
 	// sql.ErrNoRows from pgx maps to state.ErrNotFound in pgstore.
 	GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetSessionRow, error)
+	// ---------------------------------------------------------------------------
+	// ADR-096 customer-facing automatic error grouping.
+	// Tables live in migrations/00222_app_errors.sql. gatewayd-internal
+	// writes via the apid gRPC IncrementAppError handler (pkg/apidgrpc/
+	// apperrors.proto); apid is the only direct writer to the table
+	// per the owner rules. The apid handlers in
+	// cmd/apid/handlers_app_errors.go (PR-B) and the nightly purge
+	// cron in cmd/apid/app_errors_purge.go (PR-A) read here.
+	//
+	// Index paths pinned in the migration file (NOT regenerated here
+	// — sqlc doesn't manage indexes, only the typed query surface).
+	// ---------------------------------------------------------------------------
+	// ADR-096 §3.5 dedupe-merge INSERT. The grpc_server_apperrors.go
+	// handler runs this inside a single pgx transaction per stream
+	// batch. ON CONFLICT target is app_errors_dedupe_uniq (the
+	// migration's UNIQUE on (account_id, app_id, fingerprint)).
+	// The dedupe window is enforced by the writer's LRU; this
+	// unique constraint is the last-resort tripwire.
+	//
+	// Returns (inserted bool) via the canonical Postgres
+	// (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+	// on an UPDATE. This lets the handler distinguish
+	// outcomeInserted vs outcomeMerged on the wire — the gateway
+	// uses that signal to update its in-process LRU freshness.
+	IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) (bool, error)
+	// One row per request that hit the grouped fingerprint. No
+	// ON CONFLICT — every request gets its own row. request_count
+	// on app_errors is bumped on the paired IncrementAppError
+	// call; the read path derives the joined total at query time.
+	InsertAppErrorRequest(ctx context.Context, db DBTX, arg InsertAppErrorRequestParams) error
 	// CP-1 (operator observability): append one row to the heartbeat
 	// history. The schedd Heartbeat.Tick goroutine is the only writer.
 	// We deliberately do NOT use ON CONFLICT DO NOTHING — a duplicate
@@ -151,6 +193,27 @@ type Querier interface {
 	// the handler so the handler can pass an empty string for "no
 	// subject filter" without a NULL literal.
 	ListAllEventsPaged(ctx context.Context, db DBTX, arg ListAllEventsPagedParams) ([]ListAllEventsPagedRow, error)
+	// Nightly retention purge read path (cmd/apid/app_errors_purge.go).
+	// Returns IDs of app_errors rows for an account older than
+	// `cutoff`. Capped at 10000 per call so the DELETE loop can
+	// iterate without blocking. Sorted by last_seen_at ASC so the
+	// oldest rows are deleted first (a future eviction policy
+	// could swap to "least recent activity" without touching this
+	// query).
+	ListAppErrorFingerprintsForPurge(ctx context.Context, db DBTX, arg ListAppErrorFingerprintsForPurgeParams) ([]pgtype.UUID, error)
+	// ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
+	// one (account_id, app_id) over a (since, until) window.
+	// Cursor pagination via the (last_seen_at, fingerprint) compound
+	// tuple (distinct from the operator's (created_at, id) cursor).
+	// Index path: app_errors_account_app_last_seen_idx covers the
+	// primary scan; the (count DESC) sort happens post-filter on the
+	// bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+	ListAppErrorGroups(ctx context.Context, db DBTX, arg ListAppErrorGroupsParams) ([]ListAppErrorGroupsRow, error)
+	// Drill-down rows for one fingerprint. Cursor paginated via
+	// (received_at, request_id). Index path:
+	// app_error_requests_drill_idx. Does NOT include headers_sample
+	// or redactions — those are returned only by GetAppErrorSample.
+	ListAppErrorRequests(ctx context.Context, db DBTX, arg ListAppErrorRequestsParams) ([]ListAppErrorRequestsRow, error)
 	ListApps(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAppsRow, error)
 	// CP-1: read heartbeat history for one node, newest first. The
 	// $2 parameter is nullable: passing pgtype.Timestamptz{} (the Go
