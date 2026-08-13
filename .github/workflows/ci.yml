@@ -236,6 +236,14 @@ jobs:
       # not being needed. `GITHUB_TOKEN` raises the asset-fetch quota
       # from 60/hr unauth to 5000/hr authenticated.
       - name: install protoc
+        # Forward GITHUB_TOKEN explicitly into the step env. The runner
+        # auto-injects it as a workflow-level var, but `set -u` requires
+        # the variable to be referenced from inside an `env:` block —
+        # otherwise `${GITHUB_TOKEN}` is unbound and the script fails
+        # before the curl call lands. arduino/setup-protoc@v3 hid this
+        # because it read the token via the GitHub Action runtime API.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ "$(uname -m)" != "x86_64" ]; then
@@ -247,7 +255,15 @@ jobs:
           mkdir -p "$HOME/.local/protoc/bin"
           ZIP="$RUNNER_TEMP/${PROTOC_TARBALL}"
           echo "→ downloading $PROTOC_URL"
-          curl --fail --silent --show-error --location --output "$ZIP" --header "Authorization: Bearer ${GITHUB_TOKEN}" "$PROTOC_URL"
+          # Authenticated release-asset fetch: 5000/hr per-token
+          # (vs 60/hr per-IP unauthenticated) so the download can't
+          # be tripped by the same fleet-wide rate limit the arduino
+          # action used to hit. SHA-256 below is the supply-chain
+          # anchor — a malicious or substituted tarball would change
+          # the digest and fail the `--check --strict` step.
+          curl --fail --silent --show-error --location \
+            --output "$ZIP" --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "$PROTOC_URL"
           echo "→ verifying SHA-256"
           echo "${PROTOC_SHA256_LINUX_AMD64}  $ZIP" | sha256sum --check --strict
           echo "→ extracting"
