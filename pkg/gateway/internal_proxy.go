@@ -265,7 +265,14 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	outReq := r.Clone(r.Context())
 	outReq.URL.Scheme = p.Target.Scheme
 	outReq.URL.Host = p.Target.Host
-	outReq.Host = p.Target.Host
+	// Keep the inbound Host as the routing key. gatewayd-internal
+	// resolves the app from r.Host (handler.go ServeHTTP → backend
+	// Lookup), so rewriting it to the internal target name makes
+	// every request 404 with "no app is routed to
+	// \"gatewayd-internal\"". The URL.Host above is what the
+	// transport dials (the unix-socket dialer ignores it anyway);
+	// the Host header must stay the customer-facing hostname.
+	outReq.Host = r.Host
 	outReq.RequestURI = "" // required for outgoing client requests
 	// Strip hop-by-hop in place (no second map alloc). The strip
 	// is correct for plain HTTP (RFC 7230 §6.1) — but it would
