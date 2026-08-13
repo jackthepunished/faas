@@ -405,3 +405,49 @@ func TestAuditor_Emit_NoSpanPreservesCustomerTraceID(t *testing.T) {
 		t.Errorf("span_id = %v, want absent when no span is active", data["span_id"])
 	}
 }
+
+// typedNilAuditOps is a typed-nil concrete that satisfies audit.Ops
+// (returns nil Counter/Observer from each method). SetOps must
+// normalise this to nil so the Emit guard stays accurate. PR-B
+// code review surfaced this as a latent footgun — same pattern
+// pkg/eventretention.Cleanup.SetOps now guards against.
+type typedNilAuditOps struct{}
+
+func (*typedNilAuditOps) AuditWriteFailures(_ string) prometheus.Counter {
+	return nil
+}
+func (*typedNilAuditOps) AuditWriteFailureDuration(_ string) prometheus.Observer {
+	return nil
+}
+
+// TestSetOps_TypedNilDoesNotPin traps the typed-nil interface
+// regression on the audit side. Real-world failure mode:
+// apid hands a.SetOps(srv.ops) where srv.ops is a nil
+// *wire.OpsMetrics; the per-method nil-receiver guards return nil
+// Counter/Observer; .Inc/.Observe on nil panics. The guard
+// normalises this to nil so the per-Emit guard stays accurate.
+func TestSetOps_TypedNilDoesNotPin(t *testing.T) {
+	store := state.NewMemStore()
+	var p *typedNilAuditOps
+	var ops audit.Ops = p // non-nil interface wrapping typed-nil pointer
+
+	if ops == nil {
+		t.Fatal("pre-condition broken: typed-nil interface unexpectedly nil")
+	}
+	a := audit.New(store, silentLog(), ops, "apid")
+
+	// Emit must NOT panic — and it must NOT touch any wire
+	// counter, since the typed-nil interface was normalised to
+	// nil by SetOps.
+	a.Emit(context.Background(), "system.boot", nil, map[string]any{"k": "v"})
+
+	rows, _ := store.ListEvents(context.Background(), "", 0)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+}
+
+// Compile-time witness: *typedNilAuditOps implements audit.Ops (with
+// nil-returning methods) so the typed-nil test above exercises the
+// same call-shape production uses.
+var _ audit.Ops = (*typedNilAuditOps)(nil)

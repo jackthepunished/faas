@@ -7,15 +7,18 @@
 -- fence was what kept PR #845's local embed set contiguous while
 -- PR #845's real migration cycles through renumbers.
 --
--- PR #845's kind=geo finally settled at slot 00222 after 7
+-- PR #845's kind=geo finally settled at slot 00223 after 8
 -- renumbers across the PR's lifetime (00207 → 215 → 216 → 217
--- → 218 → 220 → 221 → 222). The 00221 hop was caused by PR #854
--- (ADR-095 scale-to-zero T1 single-flight + phase telemetry)
--- claiming 00221_instances_request_count.sql on main while
--- PR #845 was rebasing — PR #845 had to step one slot further
--- to 00222. This 00207 fence stays as a historical marker;
--- it's no longer adjacent to PR #845's slot but it preserves
--- the test fixture for any reference that relied on it before
--- the renumber chain.
+-- → 218 → 220 → 221 → 222 → 223). The 00221 hop was caused by
+-- PR #854 (ADR-095 scale-to-zero T1 single-flight + phase
+-- telemetry) claiming 00221_instances_request_count.sql on
+-- main while PR #845 was rebasing — PR #845 had to step one
+-- slot further to 00222. The 00222 → 00223 hop was caused by
+-- PR #863 (ADR-096 customer-facing error grouping PR-A) landing
+-- 00222_app_errors.sql on main — PR #845 had to step one slot
+-- further to 00223. This 00207 fence stays as a historical
+-- marker; it's no longer adjacent to PR #845's slot but it
+-- preserves the test fixture for any reference that relied on
+-- it before the renumber chain.
 SELECT 1;
 -- +goose StatementEnd

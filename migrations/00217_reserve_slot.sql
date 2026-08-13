@@ -15,3 +15,8 @@
 -- sibling PR-A PR-B, and must stay at those slots).
 SELECT 1;
 -- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+SELECT 1;
+-- +goose StatementEnd

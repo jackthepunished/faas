@@ -1,17 +1,32 @@
--- filename: 00221_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Reserve slot 221 for PR #854 (ADR-095 scale-to-zero T1 single-flight
--- + phase-decomposed telemetry, migrations/00221_instances_request_count.sql).
--- This branch (PR #845, ADR-091 D21 kind=geo) is at slot 00222; the
--- fence here preserves contiguity (00220 → 00221 → 00222) so the
--- TestMigrationsContiguous gate in migrations/embed_test.go does not
--- trip on PR #845's rebase.
 --
--- Cross-PR coordination reminder for whoever lands PR #854: when
--- you replace this fence with the real 00221_instances_request_count.sql,
--- DO NOT bump the slot — keep it at 00221. PR #845 is locked to 00222
--- (this 00221 fence is the PR #854 reservation; the 00217 + 00218
--- fences are PR #849 / PR #845-sibling gates).
-SELECT 1;
+-- 00221_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- 2026-08-12 slot survey: slots 00215-00220 are fenced in flight
+-- across open PRs #849 (00216/00217), #845 (00217/00218),
+-- #854 (00215/00216), #858 (00219), #851 (00220). 00221 is the
+-- next free slot for the ADR-096 customer-facing error grouping
+-- PR-A cluster. The real schema lands at 00222_app_errors.sql.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
 -- +goose StatementEnd

@@ -29,11 +29,13 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/onebox-faas/faas/pkg/auditutil"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -69,8 +71,21 @@ type Auditor struct {
 //
 // nil ops is allowed — Emit will skip the counter increment and the
 // latency observation so unit tests can run without an OpsMetrics.
+//
+// Typed-nil guard: routes the ops argument through SetOps so the
+// same nil-normalisation logic fires regardless of whether the
+// caller constructs via New or wires later via SetOps. Without this
+// routing, a `var p *wire.OpsMetrics = nil; a := audit.New(..., p, ...)`
+// would leave a.ops as a typed-nil interface and the next
+// .AuditWriteFailureDuration(...).Observe(...) call would panic —
+// the nil-receiver guard on the concrete Counter/Observer returns
+// nil and .Observe on nil dereferences. Mirrors the same routing
+// pkg/eventretention.New does NOT need (it accepts Ops via a
+// Params struct field and a constructor helper).
 func New(store state.Store, log *slog.Logger, ops Ops, actor string) *Auditor {
-	return &Auditor{actor: actor, store: store, log: log, ops: ops}
+	a := &Auditor{actor: actor, store: store, log: log}
+	a.SetOps(ops)
+	return a
 }
 
 // SetOps replaces the Ops interface after construction. Used by the
@@ -78,8 +93,36 @@ func New(store state.Store, log *slog.Logger, ops Ops, actor string) *Auditor {
 // OpsMetrics (which may need to be constructed after the registry
 // wiring), so the auditor starts with nil ops and gets a real one
 // later. Pass nil to disable the counter/histogram path.
+//
+// Typed-nil guard: storing a non-nil interface wrapping a
+// typed-nil pointer (e.g. SetOps(srv.ops) when srv.ops is a nil
+// *wire.OpsMetrics) would panic at the next metric call — the
+// nil-receiver guard on the concrete Counter/Observer returns nil
+// and .Inc/.Observe on nil panics. isTypedNil normalises both
+// flavours to the same nil a.ops value so the per-call guard stays
+// accurate. Mirrors pkg/eventretention.Cleanup.SetOps.
 func (a *Auditor) SetOps(ops Ops) {
+	if isTypedNilAuditOps(ops) {
+		a.ops = nil
+		return
+	}
 	a.ops = ops
+}
+
+// isTypedNilAuditOps is the audit-side twin of
+// pkg/eventretention.isTypedNil. Duplicated rather than shared so
+// pkg/audit stays import-clean (pkg/audit is widely imported —
+// pulling in pkg/eventretention would reverse the dep direction).
+func isTypedNilAuditOps(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Chan, reflect.Func, reflect.Map, reflect.Slice, reflect.Interface:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // Emit writes one events row. accountID is optional (nil allowed for
@@ -91,7 +134,34 @@ func (a *Auditor) SetOps(ops Ops) {
 // in-memory trace ring on the same key. The lift is best-effort: a
 // missing span context (legacy single-box without OTel) leaves the
 // data unchanged.
+//
+// ADR-091 D20 PR-B: emit sites that want to stamp the binary
+// `result` field call [EmitResult] (or wrap their data with
+// auditutil.WithResult before calling Emit). Emit itself does NOT
+// stamp a default result — keeps the cmd/gatewayd-internal mirror
+// in lock-step (it does NOT call this method) and avoids a second
+// silent wire-format change. Legacy emit sites without a meaningful
+// outcome stay on Emit unchanged.
 func (a *Auditor) Emit(ctx context.Context, kind string, accountID *string, data map[string]any) {
+	a.emit(ctx, kind, accountID, data, "")
+}
+
+// EmitResult is the result-bearing twin of [Emit]. result is the
+// literal value written to data["result"] — "success" / "error" in
+// the load-bearing case, or a finer-grained form (e.g.
+// "error:code=im403") for sites that want to encode context. The
+// stamp goes through [auditutil.WithResult] so a caller's explicit
+// value on data["result"] always wins over the supplied result.
+func (a *Auditor) EmitResult(ctx context.Context, kind string, accountID *string, data map[string]any, result string) {
+	a.emit(ctx, kind, accountID, data, result)
+}
+
+// emit is the shared body. result == "" is the legacy Emit path;
+// result != "" is the EmitResult path. Single source of truth for
+// the trace lift, marshal, store call, and metric observation —
+// keeping the two entry points in lock-step.
+func (a *Auditor) emit(ctx context.Context, kind string, accountID *string, data map[string]any, result string) {
+	data = auditutil.WithResult(data, result)
 	if data == nil {
 		data = map[string]any{}
 	}

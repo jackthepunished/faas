@@ -85,6 +85,18 @@ import (
 // of truth and goconst stops nagging on the literal.
 const archiveQueryDateLayout = "2006-01-02"
 
+// Archive-end-reason vocabulary. Stable wire contract (issue #562
+// AC3 / Wire shape comment above) — the SDK branches on these
+// strings, so renaming is a breaking change. Pinning them here is
+// also the goconst enforcement: the three-terminal frame names
+// appear in renderArchiveTerminal's call sites + the test corpus
+// + the doc-comment block above.
+const (
+	archiveReasonComplete = "archive_complete"
+	archiveReasonMissing  = "archive_missing"
+	archiveReasonDegraded = "archive_degraded"
+)
+
 // archiveDateRegex pins the ?date= format to YYYY-MM-DD. Defends
 // against path-traversal-shaped strings ("..", "2025-01-01/",
 // "2025/01/01") before they reach the S3 key — the bucket proxy
@@ -527,10 +539,10 @@ func renderArchiveTerminal(w http.ResponseWriter, flusher http.Flusher, reason s
 // set.
 func archiveTerminalForError(err error) string {
 	if err == nil {
-		return "archive_complete"
+		return archiveReasonComplete
 	}
 	if logarchive.IsPermanent(err) {
-		return "archive_missing"
+		return archiveReasonMissing
 	}
-	return "archive_degraded"
+	return archiveReasonDegraded
 }

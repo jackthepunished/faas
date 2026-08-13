@@ -97,9 +97,20 @@ func internalRoutesHandler(h *gateway.Handler, appLookup gateway.ResolveSlugFn, 
 		// Slug is the last path segment; we accept the literal
 		// /v1/internal/apps/<slug>/routes form. http.ServeMux's
 		// pattern routing doesn't carry path segments into the
-		// mux-keyed handler — we read r.URL.Path and trim.
-		slug := strings.TrimPrefix(r.URL.Path, "/v1/internal/apps/")
-		slug = strings.TrimSuffix(slug, "/routes")
+		// mux-keyed handler — we read r.URL.Path and trim. The
+		// /routes suffix is required: the mux mounts on the
+		// prefix /v1/internal/apps/ (run.go), so a request to
+		// /v1/internal/apps/foo would otherwise reach the
+		// handler with slug="foo" and serve foo's routes.
+		// Validate the suffix BEFORE trimming so the malformed
+		// path 404s instead of silently answering the wrong app.
+		rest := strings.TrimPrefix(r.URL.Path, "/v1/internal/apps/")
+		if !strings.HasSuffix(rest, "/routes") {
+			writeProblemRoutes(w, http.StatusNotFound, "not_found",
+				"path must match /v1/internal/apps/<slug>/routes")
+			return
+		}
+		slug := strings.TrimSuffix(rest, "/routes")
 		slug = strings.Trim(slug, "/")
 		if slug == "" {
 			writeProblemRoutes(w, http.StatusBadRequest, "missing_slug",

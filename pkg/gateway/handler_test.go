@@ -1877,6 +1877,73 @@ func TestApplyEdgeRuleCORS_Preflight_EmitsApplySuccess(t *testing.T) {
 	}
 }
 
+// TestApplyEdgeRuleCORS_NonPreflight_EmitsApplySuccess mirrors the
+// preflight test above but walks the GET (non-preflight) branch.
+// The non-preflight path installs the Access-Control-Allow-Origin
+// header through statusRecorder.installHeaderOps and then falls
+// through to the JWT / IP gates (returns false from applyEdgeRuleCORS);
+// it does NOT short-circuit with a 204. The metric AND audit emit
+// must still fire so operators can see "the CORS rule matched and let
+// this origin through" without having to also log the preflight.
+//
+// ADR-091 D20.6 / PR-B: this is the load-bearing unit test that
+// proves D20.6's e2e test (cmd/e2e/edge_rules_cors_e2e_test.go) has a
+// non-silent code path to exercise. Without it, a future refactor of
+// the non-preflight branches could regress the metric emit while the
+// e2e test still passes (the e2e only checks the ACAO header, not the
+// metric).
+func TestApplyEdgeRuleCORS_NonPreflight_EmitsApplySuccess(t *testing.T) {
+	b := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro},
+		host:     "c.example.com",
+		upstream: "127.0.0.1:0",
+		running:  true,
+	}
+	b.targets = append(b.targets, Target{NodeID: b.upstream, InstanceID: "i-fake"})
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.SetWakeGateHook()
+
+	matcher := stubEdgeRuleMatcher{
+		cors: &EdgeRuleCORSResolved{
+			ID: "rule-cors", AccountID: "acct-1", AppID: "app-1",
+			Priority: 0, PathGlob: "", Methods: nil,
+			AllowOrigins: []string{"*"}, AllowMethods: []string{"GET"},
+		},
+	}
+	h.WithEdgeRules(matcher, nil, nil)
+
+	// GET (NOT OPTIONS) so applyEdgeRuleCORS walks the non-preflight
+	// branch. The handler will fall through to the JWT/IP gates; on a
+	// test box those gates pass with no authn / no client_ip (the
+	// fake backend returns no JWT_REQUIRED) so the proxy leg fires
+	// and the fake backend's running=true path writes a 200.
+	req := httptest.NewRequest("GET", "http://c.example.com/api/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// rec.Code is whatever the proxy leg returns (200 from the stub
+	// app) — NOT 204. The non-preflight path falls through to the
+	// proxy rather than short-circuiting.
+	if rec.Code == http.StatusNoContent {
+		t.Errorf("rec.Code = 204 (preflight short-circuit); want proxy-leg status")
+	}
+	// Access-Control-Allow-Origin must be stamped on the response via
+	// the statusRecorder installHeaderOps path — the wildcard "*"
+	// echoes the literal origin to the client.
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("ACAO header = %q; want %q", got, "*")
+	}
+	body := bodyForCounter(t, h.metrics)
+	// Both the apply counter and the match counter must fire.
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="cors",result="success"} 1`) {
+		t.Errorf("apply_total{cors,success} != 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="cors",outcome="match"} 1`) {
+		t.Errorf("match_total{cors,match} != 1; body:\n%s", body)
+	}
+}
+
 // bodyForCounter scrapes /metrics from m and returns the body as a
 // string. Counter-specific label filtering is left to the caller via
 // substring matching — Prometheus exposition doesn't index by

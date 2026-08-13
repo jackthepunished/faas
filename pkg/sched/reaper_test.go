@@ -150,7 +150,7 @@ func TestReapAggressiveSkipsInstanceWithTailCount(t *testing.T) {
 	// the two tail-bearing instances.
 	const testAppID = "app1"
 	desiredByApp := map[string]int{testAppID: 0}
-	got := ReapAggressive(now, instances, desiredByApp)
+	got := ReapAggressive(now, instances, desiredByApp, nil)
 	if containsString(got, "tail-stale") {
 		t.Errorf("ReapAggressive picked tail-stale (TailCount=3, stale); the tail-count gate is not honored; got %v", got)
 	}
@@ -392,7 +392,7 @@ func TestReapAggressive_ParkToBuffer(t *testing.T) {
 		mkAggressive("app1", "newer", 30*time.Minute, 0, 1),
 		mkAggressive("app1", "newest", 15*time.Minute, 0, 1),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	// limit = max(1, 0+1) = 1; extra = 4-1 = 3. Wait — 4 candidates, 3
 	// extra → park 3, keep the freshest.
 	if !equalSet(got, []string{"oldest", "older", "newer"}) {
@@ -409,7 +409,7 @@ func TestReapAggressive_WithinBuffer(t *testing.T) {
 		mkAggressive("app1", "b", 45*time.Minute, 0, 0),
 		mkAggressive("app1", "c", 30*time.Minute, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 2})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 2}, nil)
 	if len(got) != 0 {
 		t.Fatalf("3-inst / desired=2 / within buffer: got %v, want empty", got)
 	}
@@ -424,7 +424,7 @@ func TestReapAggressive_JustAboveBuffer(t *testing.T) {
 		mkAggressive("app1", "mid", 45*time.Minute, 0, 0),
 		mkAggressive("app1", "newest", 30*time.Minute, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 1})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 1}, nil)
 	if len(got) != 1 || got[0] != "oldest" {
 		t.Fatalf("got %v, want [oldest]", got)
 	}
@@ -445,7 +445,7 @@ func TestReapAggressive_OpenConnsProtect(t *testing.T) {
 		mkAggressive("app1", "open", 45*time.Minute, 3, 0),
 		mkAggressive("app1", "newest", 30*time.Minute, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	if !equalSet(got, []string{"oldest", "newest"}) {
 		t.Fatalf("got %v, want [oldest newest] (open-conns instance is the only survivor)", got)
 	}
@@ -468,7 +468,7 @@ func TestReapAggressive_MinInstanceAgeProtects(t *testing.T) {
 		fresh,
 		mkAggressive("app1", "old", time.Hour, 0, 0),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	// fresh: not in candidates (too young). old: in candidates.
 	// limit=max(0, 0+1)=1; extra=2-1=1; park 1 = "old".
 	if !equalSet(got, []string{"old"}) {
@@ -481,7 +481,7 @@ func TestReapAggressive_MinInstanceAgeProtects(t *testing.T) {
 func TestReapAggressive_SingleInstanceApp(t *testing.T) {
 	now := time.Now()
 	instances := []InstanceInfo{mkAggressive("app1", "only", time.Hour, 0, 0)}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	if len(got) != 0 {
 		t.Fatalf("single instance must not be reaped, got %v", got)
 	}
@@ -497,7 +497,7 @@ func TestReapAggressive_NilDesired_DefersToReapIdle(t *testing.T) {
 		mkAggressive("hobby-app", "b", 45*time.Minute, 0, 0),
 	}
 	// desiredByApp has no entry for hobby-app.
-	got := ReapAggressive(now, instances, nil)
+	got := ReapAggressive(now, instances, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("apps absent from desiredByApp must not be reaped, got %v", got)
 	}
@@ -515,7 +515,7 @@ func TestReapAggressive_ZeroTarget_ClampsToFloor(t *testing.T) {
 		mkAggressive("app1", "newer", 15*time.Minute, 0, 2),
 		mkAggressive("app1", "newest", 5*time.Minute, 0, 2),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	if !equalSet(got, []string{"oldest", "older", "mid"}) {
 		t.Fatalf("got %v, want [oldest older mid] (floor 2 + 3 extra)", got)
 	}
@@ -543,7 +543,7 @@ func TestReapAggressive_TwoApps(t *testing.T) {
 	got := ReapAggressive(now, instances, map[string]int{
 		"appA": 0,
 		"appB": 1,
-	})
+	}, nil)
 	want := []string{"appA_oldest", "appA_older", "appB_oldest", "appB_older"}
 	if !equalSet(got, want) {
 		t.Fatalf("two apps: got %v, want %v", got, want)
@@ -561,7 +561,7 @@ func TestReapAggressive_FloorExceedsRunning(t *testing.T) {
 		mkAggressive("app1", "b", 45*time.Minute, 0, 10),
 		mkAggressive("app1", "c", 30*time.Minute, 0, 10),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	if len(got) != 0 {
 		t.Fatalf("floor (10) > running (3): got %v, want empty", got)
 	}
@@ -580,7 +580,7 @@ func TestReapAggressive_EmptyCandidates(t *testing.T) {
 	}
 	// Override Started so the second instance is MinInstanceAge-young.
 	instances[1].Started = now.Add(-10 * time.Second)
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	if len(got) != 0 {
 		t.Fatalf("all candidates protected: got %v, want empty", got)
 	}
@@ -647,7 +647,7 @@ func TestReapAggressive_WorkerClassCarveOut(t *testing.T) {
 	// http-1 as a candidate. workers must not run, not enter the
 	// candidate set, and not park.
 	desired := map[string]int{"app1": 0}
-	got := ReapAggressive(now, instances, desired)
+	got := ReapAggressive(now, instances, desired, nil)
 	// Running=1 (only http-1), limit=max(0, 0+1)=1, extra=0 → no park.
 	for _, id := range got {
 		if id == "worker-1" || id == "worker-2" {
@@ -656,7 +656,7 @@ func TestReapAggressive_WorkerClassCarveOut(t *testing.T) {
 	}
 	// also with desired=10 — must NOT park workers under "running is 3".
 	desired10 := map[string]int{"app1": 10}
-	got = ReapAggressive(now, instances, desired10)
+	got = ReapAggressive(now, instances, desired10, nil)
 	for _, id := range got {
 		if id == "worker-1" || id == "worker-2" {
 			t.Errorf("ReapAggressive carved-out worker under desired=10; got %v", id)
@@ -729,7 +729,7 @@ func TestReapAggressiveRespectsScaleInCooldownUnder(t *testing.T) {
 		mkAggressiveWithStamp("app1", "b", 45*time.Minute, 0, 0, &last, 60),
 		mkAggressiveWithStamp("app1", "c", 30*time.Minute, 0, 0, &last, 60),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	if len(got) != 0 {
 		t.Errorf("ReapAggressive (cooldown 59s remaining) = %v, want [] (cooldown_held)", got)
 	}
@@ -748,7 +748,7 @@ func TestReapAggressiveRespectsScaleInCooldownOver(t *testing.T) {
 		mkAggressiveWithStamp("app1", "b", 45*time.Minute, 0, 0, &last, 60),
 		mkAggressiveWithStamp("app1", "c", 30*time.Minute, 0, 0, &last, 60),
 	}
-	got := ReapAggressive(now, instances, map[string]int{"app1": 0})
+	got := ReapAggressive(now, instances, map[string]int{"app1": 0}, nil)
 	if !equalSet(got, []string{"a", "b"}) {
 		t.Errorf("ReapAggressive (cooldown elapsed) = %v, want [a b] (park 2 oldest)", got)
 	}

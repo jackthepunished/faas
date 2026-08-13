@@ -1,4 +1,4 @@
--- filename: 00222_edge_rules_kind_geo.sql
+-- filename: 00223_edge_rules_kind_geo.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -19,13 +19,14 @@
 -- A plain ADD CONSTRAINT is correct: validity check is free because
 -- the new set is a strict superset of the old set.
 --
--- This migration lands after 00220 (PR #851 / preview_app_columns).
--- PR #845 (this PR) renumbered kind=geo through 00207 → 00215 →
--- 00216 → 00217 → 00218 → 00220 → 00221 → 00222 as main picked up sibling
--- migrations that claimed the earlier slots (PR #844 ADR-093,
--- PR #849 ADR-092, PR #855 ADR-091 D24, PR #851 issue-272). The
--- fenced slots at 00217 + 00218 carry cross-PR coordination fences
--- (see migrations/00217_reserve_slot.sql + migrations/00218_reserve_slot.sql).
+-- This migration lands after 00222 (PR #863 / ADR-096 PR-A
+-- app_errors). PR #845 (this PR) renumbered kind=geo through
+-- 00207 → 00215 → 00216 → 00217 → 00218 → 00220 → 00221 → 00222
+-- → 00223 as main picked up sibling migrations that claimed the
+-- earlier slots (PR #844 ADR-093, PR #849 ADR-092, PR #855
+-- ADR-091 D24, PR #851 issue-272, PR #854 ADR-095, PR #863
+-- ADR-096 PR-A). The fenced slots at 00217 + 00218 + 00221
+-- carry cross-PR coordination fences.
 --
 -- Sub-decision hop (D21) deviates from the team's ADR-091 D14 default
 -- of "Hobby+ only" for non-trivial edge-rule kinds: geo is allowed on

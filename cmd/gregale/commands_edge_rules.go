@@ -140,9 +140,9 @@ func cmdEdgeRulesList(args []string) int {
 	}
 	_, _ = fmt.Fprintf(osStdout, "%-36s %-12s %-9s %-32s %s\n", "ID", "KIND", "PRIORITY", "MATCH HOST", "MATCH PATH")
 	for _, it := range items {
-		enabled := "on"
+		enabled := secretScanOn
 		if !it.Enabled {
-			enabled = "off"
+			enabled = secretScanOff
 		}
 		_, _ = fmt.Fprintf(osStdout, "%-36s %-12s %-9d %-32s %s  [%s]\n",
 			it.ID, it.Kind, it.Priority, truncate(it.MatchHost, 32), it.MatchPath, enabled)

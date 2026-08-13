@@ -75,9 +75,15 @@ func applyJSONFlag(args []string) []string {
 // jsonBoolTrue maps a --json= suffix to a boolean. Falsy spellings
 // (false / no / off / 0) disable JSON; everything else (including
 // typos and the empty string) enables it. Case-insensitive.
+//
+// The literal tokens are referenced via the requireSignedTrue /
+// requireSignedFalse consts declared in commands_app_security.go:56-59
+// (the same ones parseSecretScanFlag in pack.go uses) so goconst
+// (golangci-lint v2.4.0) counts the closed-enum literals once across
+// the binary instead of separately per switch.
 func jsonBoolTrue(s string) bool {
 	switch strings.ToLower(s) {
-	case "false", "no", "off", "0":
+	case requireSignedFalse, "no", "off", "0":
 		return false
 	}
 	return true

@@ -501,20 +501,38 @@ const testDomain = "apps.test.example"
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
 //
-// PR #845 (kind=geo, ADR-091 D21): bumped 215 → 222 after
-// PR #844 (ADR-093 per-route app metrics) landed
-// 00216_apps_route_metrics_enabled.sql on main, after
-// PR #855 (ADR-091 D24 kind=limit) landed
-// 00219_edge_rules_kind_limit.sql, after PR #851
-// (issue-272 PR-preview environments) landed
-// 00220_preview_app_columns.sql, and after PR #854
-// (ADR-095 scale-to-zero T1 single-flight + phase
-// telemetry) claimed 00221_instances_request_count.sql —
-// which pushed PR #845's kind=geo from 00220 → 00221 → 00222.
+// PR #845 (kind=geo, ADR-091 D21) + PR #863 (ADR-096 PR-A
+// app_errors): both bumped 215/216 → 223 in flight. The
+// renumber chain tracks the gate's "next free slot past the
+// live head" rule when sibling PRs race for the same N.
+//
+//   - 215 → 223 after PR #844 (ADR-093 per-route app metrics)
+//     landed 00216_apps_route_metrics_enabled.sql, after
+//     PR #855 (ADR-091 D24 kind=limit) landed
+//     00219_edge_rules_kind_limit.sql, after PR #851
+//     (issue-272 PR-preview environments) landed
+//     00220_preview_app_columns.sql, after PR #854
+//     (ADR-095 scale-to-zero T1 single-flight + phase
+//     telemetry) claimed 00221_instances_request_count.sql,
+//     and after PR #863 (ADR-096 PR-A app_errors) landed
+//     00222_app_errors.sql — which pushed PR #845's kind=geo
+//     from 00220 → 00221 → 00222 → 00223.
+//   - 215/216 → 223 by ADR-096 PR-A (app_errors schema at
+//     00222, leaving 00223 free for PR #845). The in-flight
+//     cross-PR fences at 215..221 sit between main's 214
+//     (edge-rules-kind=validate) and 223 (kind=geo): 215
+//     compute_node_heartbeats_stats (PR #851), 216
+//     apps_route_metrics_enabled (PR #860), 217 ADR-092
+//     app_secrets_scope (PR #849), 218 preview-envs (PR
+//     preview-envs ADR-095), 219 edge_rules_kind_limit (PR
+//     kind=validate PR-C), 220 preview_app_columns (PR preview
+//     envs), and 221 ADR-096 reserve fence for slot 222 itself.
+//
 // The 00217 + 00218 slots carry `*_reserve_slot.sql` fences
 // for PR #849 (ADR-092 PR-A app_secrets.scope) and PR #845's
-// own fence respectively.
-const e2eMigrationTarget = 222
+// own fence respectively; the 00221 fence is PR #863's
+// ADR-096 reservation.
+const e2eMigrationTarget = 223
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
