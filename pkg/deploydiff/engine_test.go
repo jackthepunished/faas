@@ -19,7 +19,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 	baseline := Baseline{App: base}
 
 	t.Run("nil fields produce no changes", func(t *testing.T) {
-		got := Compute("api", baseline, Pending{})
+		got := Compute("api", "", baseline, Pending{})
 		if len(got.Changes) != 0 {
 			t.Fatalf("nil fields should produce 0 changes; got %+v", got.Changes)
 		}
@@ -27,7 +27,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 
 	t.Run("non-nil equal value produces no change", func(t *testing.T) {
 		v := 256
-		got := Compute("api", baseline, Pending{
+		got := Compute("api", "", baseline, Pending{
 			AppConfig: AppConfigPatch{RAMMB: &v},
 		})
 		if len(got.Changes) != 0 {
@@ -37,7 +37,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 
 	t.Run("non-nil different value produces a Change", func(t *testing.T) {
 		v := 512
-		got := Compute("api", baseline, Pending{
+		got := Compute("api", "", baseline, Pending{
 			AppConfig: AppConfigPatch{RAMMB: &v},
 		})
 		if len(got.Changes) != 1 {
@@ -54,7 +54,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 
 	t.Run("explicit false on boolean is not nil", func(t *testing.T) {
 		f := false
-		got := Compute("api", baseline, Pending{
+		got := Compute("api", "", baseline, Pending{
 			AppConfig: AppConfigPatch{StreamingEnabled: &f},
 		})
 		if len(got.Changes) != 1 {
@@ -68,7 +68,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 func TestCompute_FreshApp(t *testing.T) {
 	v := 256
 	c := 2
-	got := Compute("new-app", Baseline{}, Pending{
+	got := Compute("new-app", "", Baseline{}, Pending{
 		AppConfig: AppConfigPatch{RAMMB: &v, MaxConcurrency: &c},
 	})
 	if len(got.Changes) != 2 {
@@ -94,7 +94,7 @@ func TestCompute_EnvByScope(t *testing.T) {
 			"staging": {{Key: "DEBUG", Value: "1"}},
 		},
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 
 	// FOO removed, BAZ added (default), DEBUG added (staging).
 	wantAdds := map[string]bool{
@@ -143,7 +143,7 @@ func TestCompute_Crons(t *testing.T) {
 			{Schedule: "0 * * * *", Path: "/hourly"},
 		},
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 
 	removed := false
 	added1 := false
@@ -192,7 +192,7 @@ func TestCompute_EdgeRules(t *testing.T) {
 			},
 		},
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 
 	modified := false
 	added := false
@@ -230,7 +230,7 @@ func TestCompute_DeploymentImmutable(t *testing.T) {
 	pending := Pending{
 		ImageRef: "ghcr.io/me/api@sha256:new",
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 	found := false
 	for _, b := range got.Breaks {
 		if b.Code == "would_create_deployment" {
@@ -249,7 +249,7 @@ func TestCompute_DeploymentImmutable(t *testing.T) {
 			Healthz:    "/healthz",
 		},
 	}
-	got = Compute("api", baseline, pending)
+	got = Compute("api", "", baseline, pending)
 	found = false
 	for _, b := range got.Breaks {
 		if b.Code == "would_create_deployment" {
@@ -272,7 +272,7 @@ func TestCompute_DeploymentImmutable_HealthzClear(t *testing.T) {
 		OverrideHealthcheck: &api.DeploymentHealthcheck{Path: "/healthz"},
 	}
 	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
-	got := Compute("api", baseline, Pending{
+	got := Compute("api", "", baseline, Pending{
 		Manifest: &api.AppManifest{Healthz: ""}, // explicitly clear
 	})
 	found := false
@@ -296,7 +296,7 @@ func TestCompute_SchemaEnvChanged_KeyClear(t *testing.T) {
 		OverrideEnvKeys: []string{"FOO", "BAR"},
 	}
 	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
-	got := Compute("api", baseline, Pending{
+	got := Compute("api", "", baseline, Pending{
 		Manifest: &api.AppManifest{Env: map[string]string{}}, // cleared
 	})
 	found := false
@@ -328,7 +328,7 @@ func TestCompute_EdgeRules_DuplicateKey(t *testing.T) {
 			Kind: "route", Action: mkAction("/v1/v2"), // same key, different action
 		},
 	}
-	got := Compute("api", Baseline{}, Pending{EdgeRules: pending})
+	got := Compute("api", "", Baseline{}, Pending{EdgeRules: pending})
 	dupCount := 0
 	for _, b := range got.Breaks {
 		if b.Code == "edge_rule_duplicate_key" {

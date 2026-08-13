@@ -686,6 +686,21 @@ func (c *Client) DeployFromSourceRef(ctx context.Context, slug string, req Sourc
 		"/v1/apps/"+slug+"/deployments/source-ref", req, &out)
 }
 
+// Diff returns a read-only preview of what a deploy would change
+// without writing. CI calls this in the same job that calls
+// Deploy; non-zero exit (or Blocking=true in the wire) means
+// "don't deploy". Mirrors the CLI's `gregale deploy --diff --json`
+// output byte-for-byte — a CI consumer parsing either path
+// agrees.
+//
+// Read-only: auth chain on the server is apps:read (no MFA, no
+// deploy:write required). The handler does not call CreateApp /
+// CreateDeployment / anything in the write path.
+func (c *Client) Diff(ctx context.Context, slug string, req DiffRequest) (DiffResponse, error) {
+	var out DiffResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/diff", req, &out)
+}
+
 // GetApp returns the app metadata for a slug.
 func (c *Client) GetApp(ctx context.Context, slug string) (AppResponse, error) {
 	var out AppResponse
