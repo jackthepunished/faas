@@ -4,11 +4,14 @@
 -- Reserve slot 207 for PR #845 (edge_rules_kind_geo.sql, ADR-091
 -- D21/D22/D23). Same fence rationale as 00210; see
 -- cross-pr-slot-fence-pagination-gate for the pattern. This
--- fence is what keeps the local embed set contiguous while
--- PR #845's real migration lands.
+-- fence was what kept PR #845's local embed set contiguous while
+-- PR #845's real migration cycles through renumbers.
 --
--- The fence will be removed when PR #845 lands. ADR-093's
--- real migration sits at 00216, beyond PR #845's 00207, so
--- the cross-PR slot gate stays clean.
+-- PR #845's kind=geo finally settled at slot 00221 after 6
+-- renumbers across the PR's lifetime (00207 → 215 → 216 → 217
+-- → 218 → 220 → 221). This 00207 fence stays as a historical
+-- marker; it's no longer adjacent to PR #845's slot but it
+-- preserves the test fixture for any reference that relied on
+-- it before the renumber chain.
 SELECT 1;
 -- +goose StatementEnd

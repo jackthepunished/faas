@@ -2092,31 +2092,6 @@ func (m *MemStore) AppBySlug(_ context.Context, slug string) (App, error) {
 	return App{}, ErrNotFound
 }
 
-// PreviewAppsByParent (ADR-094 / issue #272) is the MemStore mirror
-// of PgStore.PreviewAppsByParent. Walks the in-memory map under the
-// same lock as CreateApp / AppByID / ListApps. Returns an empty slice
-// (not an error) when no previews exist for the parent — the
-// dashboard's preview pane projects the empty list as "no previews
-// yet", matching the MemStore zero-value convention everywhere else.
-func (m *MemStore) PreviewAppsByParent(_ context.Context, accountID, parentSlug string) ([]App, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var out []App
-	for _, a := range m.apps {
-		if a.AccountID != accountID || a.PreviewOfSlug != parentSlug || a.Status == AppDeleted {
-			continue
-		}
-		out = append(out, a)
-	}
-	// Stable sort: newest first. matches the pgstore ORDER BY
-	// created_at DESC. Tests that assert on row order should not
-	// depend on map iteration randomness.
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.After(out[j].CreatedAt)
-	})
-	return out, nil
-}
-
 func (m *MemStore) ListApps(_ context.Context, accountID string) ([]App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -9570,17 +9545,16 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 			Observed: appCount,
 		}
 	}
-// Per-kind quota (ADR-091 D22). Same shape as the pgstore
+	// Per-kind quota (ADR-091 D22). Same shape as the pgstore
 	// branch. The memstore holds the entire edgeRules slice under
-	// m.mu so the per-kind count is trivially race-free; we route
-	// through the unlocked private helper countEdgeRulesByKindForAppLocked
-	// because the public CountEdgeRulesByKindForApp re-acquires
-	// m.mu, and Go's sync.Mutex is not reentrant — calling the
-	// public helper here would deadlock the goroutine. Mirrors the
-	// pgstore's tx-side countEdgeRulesByKindForAppTx (review
-	// finding from the PR #845 medium pass).
+	// m.mu so the per-kind count is trivially race-free.
 	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
-		kindCount := m.countEdgeRulesByKindForAppLocked(in.AppID, EdgeRuleKindGeo)
+		kindCount := 0
+		for _, r := range m.edgeRules {
+			if r.AppID == in.AppID && r.Kind == EdgeRuleKindGeo {
+				kindCount++
+			}
+		}
 		if kindCount >= limits.EdgeRulesGeoPerApp {
 			return EdgeRule{}, &EdgeRuleQuotaError{
 				Limit:      limits.EdgeRulesGeoPerApp,
@@ -9726,24 +9700,13 @@ func (m *MemStore) CountEdgeRulesForApp(_ context.Context, appID string) (int, e
 func (m *MemStore) CountEdgeRulesByKindForApp(_ context.Context, appID string, kind EdgeRuleKind) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.countEdgeRulesByKindForAppLocked(appID, kind), nil
-}
-
-// countEdgeRulesByKindForAppLocked is the unlocked variant — the
-// caller MUST hold m.mu. Used by CreateEdgeRuleIfUnderQuota, which
-// already holds m.mu for the duration of the apps-row check and
-// the edge-rule write. Go's sync.Mutex is not reentrant, so calling
-// the public CountEdgeRulesByKindForApp from inside the locked
-// region deadlocks the goroutine. Mirrors the pgstore's tx-side
-// countEdgeRulesByKindForAppTx.
-func (m *MemStore) countEdgeRulesByKindForAppLocked(appID string, kind EdgeRuleKind) int {
 	n := 0
 	for _, r := range m.edgeRules {
 		if r.AppID == appID && r.Kind == kind {
 			n++
 		}
 	}
-	return n
+	return n, nil
 }
 
 // MatchEdgeRulesForHost is the gateway hot-path read (same shape

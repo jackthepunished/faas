@@ -1604,7 +1604,7 @@ const (
 	CodeEdgeRuleConflict           = "edge_rule_conflict"
 	CodePlanLimitEdgeRules         = "plan_limit_edge_rules"
 	CodePlanEdgeRuleKindNotAllowed = "plan_edge_rule_kind_not_allowed"
-// CodePlanEdgeRuleKindQuotaReached is the per-kind quota error
+	// CodePlanEdgeRuleKindQuotaReached is the per-kind quota error
 	// (ADR-091 D22). Distinct from CodePlanLimitEdgeRules so the
 	// customer sees the specific kind that tripped ("1/1 geo rules
 	// on Free; upgrade to Hobby for 5") rather than the generic
@@ -2877,6 +2877,21 @@ func ErrPlanEdgeRuleKindNotAllowed(plan Plan, kind string) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanEdgeRuleKindNotAllowed,
 		"Edge rule kind unavailable on this plan",
 		fmt.Sprintf("the %s plan does not include edge rule kind %q; upgrade to Hobby or above to use it.", plan, kind)).
+		WithDocs(docsBase + "/plans#edge-rules")
+}
+
+// ErrPlanEdgeRuleKindQuotaReached is the 403 returned when the
+// per-kind edge-rule quota is reached (ADR-091 D22 — currently only
+// kind=geo has a separate per-kind cap; future paid-kind additions
+// can reuse the same RFC 7807 code with their own kind arg). distinct
+// from ErrPlanEdgeRulesQuotaReached which is the GENERAL cap trip
+// (no kind-specific signal). Surfacing the kind lets the customer see
+// "kind=geo: 1/1 rules used on Free; upgrade to Hobby for 5".
+func ErrPlanEdgeRuleKindQuotaReached(plan Plan, kind string, observed, limit int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanEdgeRuleKindQuotaReached,
+		"Edge rule kind quota reached",
+		fmt.Sprintf("the %s plan allows %d %s edge rule(s) per app; you have used %d. Upgrade to a higher tier for a larger quota.",
+			plan, limit, kind, observed)).
 		WithDocs(docsBase + "/plans#edge-rules")
 }
 

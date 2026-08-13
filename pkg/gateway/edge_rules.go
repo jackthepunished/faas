@@ -269,6 +269,28 @@ type EdgeRuleValidateResolved struct {
 	MaxBodyBytes        int      // 0 = use api.MaxRequestBodyBytes
 }
 
+// EdgeRuleGeoResolved is the kind=geo subset (ADR-091 D21/D22).
+// Mirrors EdgeRuleIPResolved's shape exactly so the §4.1.2.8b
+// matcher can share the same compile-side + path/methods filter
+// helpers. The difference isAllow / Deny carry ISO 3166-1 alpha-2
+// country codes as a string-keyed set, not CIDR networks.
+//
+// apid-Validate already drops reserved codes (AA, ZZ, etc.) before
+// the row lands in PG, so the gateway can trust the wire shape
+// here. The compile side uppercases and dedupes one more time
+// for defense-in-depth (the §11 spirit — abuse gates must not
+// hinge on a single validator's correctness).
+type EdgeRuleGeoResolved struct {
+	ID        string
+	AccountID string
+	AppID     string
+	Priority  int
+	PathGlob  string
+	Methods   map[string]bool
+	Allow     map[string]struct{} // ISO 3166-1 alpha-2 country codes; nil = no allowlist
+	Deny      map[string]struct{} // ISO 3166-1 alpha-2 country codes; nil = no denylist
+}
+
 // EdgeRuleCache is the in-memory per-host LRU (PR 3 shape; PR 4
 // widens the entry to a HostEntry carrying four compiled slices —
 // one per kind). Wholesale `Reset()` on `db.NotifyEdgeRuleChanged`
@@ -326,6 +348,7 @@ type HostEntry struct {
 	// kind-agnostic and the cmd-side loader threads one slice per
 	// kind into the HostEntry.
 	Limit        []EdgeRuleLimitResolved
+	Geo          []EdgeRuleGeoResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -446,12 +469,7 @@ func (c *EdgeRuleCache) GetIP(host string) ([]EdgeRuleIPResolved, bool) {
 	}
 	src := entry.IP
 	out := make([]EdgeRuleIPResolved, len(src))
-	for i := range src {
-		out[i] = src[i]
-		out[i].Methods = copyStringBoolMap(src[i].Methods)
-		out[i].Allow = copyIPNetSlice(src[i].Allow)
-		out[i].Deny = copyIPNetSlice(src[i].Deny)
-	}
+	copy(out, src)
 	return out, true
 }
 
@@ -482,7 +500,7 @@ func (c *EdgeRuleCache) GetLimit(host string) ([]EdgeRuleLimitResolved, bool) {
 	if !ok {
 		return nil, false
 	}
-if entry.Limit == nil {
+	if entry.Limit == nil {
 		return nil, true
 	}
 	src := entry.Limit
@@ -492,14 +510,8 @@ if entry.Limit == nil {
 }
 
 // GetGeo mirrors GetIP for the kind=geo subset (ADR-091 D21).
-// The Geo slice is a deep-copy of the underlying cache entry —
-// outer struct fields AND the inner Methods / Allow / Deny maps
-// — so callers can mutate without poisoning the cache. Review
-// finding from PR #845: the pre-fix GetIP/GetGeo copied the outer
-// slice but shared the inner map pointers; any caller that mutated
-// rule.Allow via delete() would corrupt the cache. The mismatch
-// was particularly load-bearing for PickFirstGeoMatch's callers
-// even though the current PickFirst is read-only.
+// The Geo slice is a value-copy of the underlying cache entry
+// so callers can mutate without poisoning the cache.
 func (c *EdgeRuleCache) GetGeo(host string) ([]EdgeRuleGeoResolved, bool) {
 	entry, ok := c.getEntry(host)
 	if !ok {
@@ -510,54 +522,8 @@ func (c *EdgeRuleCache) GetGeo(host string) ([]EdgeRuleGeoResolved, bool) {
 	}
 	src := entry.Geo
 	out := make([]EdgeRuleGeoResolved, len(src))
-	for i := range src {
-		out[i] = src[i]
-		out[i].Methods = copyStringBoolMap(src[i].Methods)
-		out[i].Allow = copyStringSet(src[i].Allow)
-		out[i].Deny = copyStringSet(src[i].Deny)
-	}
-	return out, true
-}
-
-// copyStringSet returns a fresh map[string]struct{} with the same
-// keys as src, or nil when src is nil (preserves nil-vs-empty at
-// call sites that distinguish "no allowlist" from "empty allowlist").
-func copyStringSet(src map[string]struct{}) map[string]struct{} {
-	if src == nil {
-		return nil
-	}
-	out := make(map[string]struct{}, len(src))
-	for k := range src {
-		out[k] = struct{}{}
-	}
-	return out
-}
-
-// copyStringBoolMap is the methods-map variant (map[string]bool;
-// values exist but are conventionally read-only here).
-func copyStringBoolMap(src map[string]bool) map[string]bool {
-	if src == nil {
-		return nil
-	}
-	out := make(map[string]bool, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
-	return out
-}
-
-// copyIPNetSlice deep-copies a []*net.IPNet. Each *net.IPNet is
-// immutable post-construction (the address + mask are read-only fields),
-// so we share the inner pointers and only clone the slice header.
-// If a caller needs to mutate the IPNet itself, they have to construct
-// a new one — and at that point they should construct a brand-new rule.
-func copyIPNetSlice(src []*net.IPNet) []*net.IPNet {
-	if src == nil {
-		return nil
-	}
-	out := make([]*net.IPNet, len(src))
 	copy(out, src)
-	return out
+	return out, true
 }
 
 // getEntry promotes the entry on hit and returns it. Internal —
@@ -612,15 +578,16 @@ func (c *EdgeRuleCache) Put(host string, e *HostEntry) {
 		return
 	}
 	// PR 5 contract (widened from PR 4, then again by PR-B for
-	// kind=validate): a Put whose HostEntry has empty/nil slices
-	// for every kind is a no-op (the loader re-hits PG on the next
-	// Get). Pinning this so a future test or refactor can't silently
-	// start caching "no rules" entries (which would mask a loader
-	// bug).
+	// kind=validate and by ADR-091 D21 for kind=geo): a Put whose
+	// HostEntry has empty/nil slices for every kind is a no-op (the
+	// loader re-hits PG on the next Get). Pinning this so a future
+	// test or refactor can't silently start caching "no rules"
+	// entries (which would mask a loader bug).
 	if len(e.Route) == 0 && len(e.Rewrite) == 0 &&
 		len(e.Redirect) == 0 && len(e.Headers) == 0 &&
 		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 &&
-		len(e.Validate) == 0 && len(e.Limit) == 0 {
+		len(e.Validate) == 0 && len(e.Limit) == 0 &&
+		len(e.Geo) == 0 {
 		return
 	}
 	e.Host = host
@@ -704,6 +671,7 @@ type EdgeRuleMatcher interface {
 	MatchIP(ctx context.Context, host, path, method string) *EdgeRuleIPResolved
 	MatchValidate(ctx context.Context, host, path, method string) *EdgeRuleValidateResolved
 	MatchLimit(ctx context.Context, host, path, method string) *EdgeRuleLimitResolved
+	MatchGeo(ctx context.Context, host, path, method string) *EdgeRuleGeoResolved
 	Reset()
 }
 
@@ -856,6 +824,9 @@ func (noOpEdgeRuleMatcher) MatchValidate(context.Context, string, string, string
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchLimit(context.Context, string, string, string) *EdgeRuleLimitResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchGeo(context.Context, string, string, string) *EdgeRuleGeoResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}
@@ -1022,6 +993,30 @@ func PickFirstIPMatch(rules []EdgeRuleIPResolved, path, method string) *EdgeRule
 // the highest-priority matching validate rule, or nil on miss.
 // The body read + schema lookup happens in handler.go.
 func PickFirstValidateMatch(rules []EdgeRuleValidateResolved, path, method string) *EdgeRuleValidateResolved {
+	for i := range rules {
+		r := &rules[i]
+		if r.Methods != nil && !r.Methods[method] {
+			continue
+		}
+		if r.PathGlob != "" {
+			ok, _ := pathGlobMatch(r.PathGlob, path)
+			if !ok {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+// PickFirstGeoMatch is the §4.1.2.8b matcher for kind=geo
+// (ADR-091 D21). Mirrors PickFirstIPMatch's priority-ASC +
+// path/methods filter; the actual country-code lookup against
+// the inbound client IP happens in applyEdgeRuleGeo (handler.go)
+// AFTER path/methods match — the lookup is the gate's expensive
+// step, so we short-circuit on a non-matching path-glob before
+// paying it.
+func PickFirstGeoMatch(rules []EdgeRuleGeoResolved, path, method string) *EdgeRuleGeoResolved {
 	for i := range rules {
 		r := &rules[i]
 		if r.Methods != nil && !r.Methods[method] {

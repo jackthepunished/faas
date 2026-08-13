@@ -500,7 +500,18 @@ const testDomain = "apps.test.example"
 // discipline (memory: cross-pr-slot-gate-fence-pattern) is that
 // the only line a migration land touches in this file is this
 // constant + the doc-comment history above.
-const e2eMigrationTarget = 216
+//
+// PR #845 (kind=geo, ADR-091 D21): bumped 215 → 221 after
+// PR #844 (ADR-093 per-route app metrics) landed
+// 00216_apps_route_metrics_enabled.sql on main, after
+// PR #855 (ADR-091 D24 kind=limit) landed
+// 00219_edge_rules_kind_limit.sql, and after PR #851
+// (issue-272 PR-preview environments) landed
+// 00220_preview_app_columns.sql — which pushed PR #845's
+// kind=geo from 00220 → 00221. The 00217 + 00218 slots carry
+// `*_reserve_slot.sql` fences for PR #849 (ADR-092 PR-A
+// app_secrets.scope) and PR #845's own fence respectively.
+const e2eMigrationTarget = 221
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
