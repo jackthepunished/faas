@@ -52,7 +52,7 @@ func TestRouteSetFor_EnabledLazilyCreates(t *testing.T) {
 
 func TestRoutesFor_NilWhenAppUnknown(t *testing.T) {
 	h := &Handler{}
-	if got := h.RoutesFor("app-does-not-exist"); got != nil {
+	if got, _ := h.RoutesFor("app-does-not-exist"); got != nil {
 		t.Fatalf("RoutesFor(unknown) = %v, want nil", got)
 	}
 }
@@ -67,9 +67,12 @@ func TestRoutesFor_ReturnsSortedSnapshot(t *testing.T) {
 	for _, r := range want {
 		set.admit(r)
 	}
-	got := h.RoutesFor("app-1")
+	got, overflowed := h.RoutesFor("app-1")
 	if got == nil {
 		t.Fatalf("RoutesFor(_) = nil after admits, want populated snapshot")
+	}
+	if overflowed {
+		t.Fatalf("RoutesFor overflowed = true at 3 admitted routes (under cap=50); want false")
 	}
 	sort.Strings(want)
 	// Snapshot must include reserved labels + the admitted ones.
@@ -107,12 +110,69 @@ func TestRoutesFor_OverflowCollapsesToOther(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		set.admit("GET /probe/" + itoaForTest(i))
 	}
-	got := h.RoutesFor("app-cap")
+	got, overflowed := h.RoutesFor("app-cap")
 	if got == nil {
 		t.Fatalf("RoutesFor after overflow = nil, want populated snapshot")
 	}
+	if !overflowed {
+		t.Fatalf("RoutesFor overflowed = false after 60 admits; want true (cap=50 hit)")
+	}
 	if len(got) != 52 {
 		t.Fatalf("RoutesFor length after overflow = %d, want 52 (50 cap + 2 reserved)", len(got))
+	}
+}
+
+// TestRoutesFor_ReportsOverflowed is the new regression test
+// added in PR-B1 (ADR-093 Tier B item #1). It pins the
+// `overflowed` return value separately from the slice length
+// because the dashboard distinguishes "cap hit" from "under cap"
+// via the dedicated cap_hit bool, not by counting the array
+// (which is ambiguous: 5 real + __route_other__ is
+// indistinguishable from 50 real + overflow).
+//
+// Boundary semantics: RoutesFor reports overflowed when
+// `len(admitted)-reservedCount >= cap`. With reservedCount=2
+// and cap=50, the routeLabelSet holds 2 reserved + 49 reals
+// (= 51 entries) when the 50th real admit is attempted. The
+// gate trips BEFORE the insert: 51-2=49 is NOT >= 50, so the
+// 50th admit succeeds and len becomes 52. RoutesFor then
+// reports overflowed=true at that point (52-2=50 >= 50). The
+// 51st distinct real admit collapses to __route_other__
+// without inserting.
+func TestRoutesFor_ReportsOverflowed(t *testing.T) {
+	h := &Handler{}
+	set := h.routeSetFor("app-1", true)
+	// 49 real routes admitted — one below cap. overflowed must
+	// remain false even though __route_other__ is pre-admitted
+	// (admitting 49 real routes does not consume the overflow
+	// bucket itself).
+	for i := 0; i < 49; i++ {
+		set.admit("GET /real/" + itoaForTest(i))
+	}
+	_, overflowed := h.RoutesFor("app-1")
+	if overflowed {
+		t.Fatalf("RoutesFor overflowed = true at 49 admits (under cap=50); want false")
+	}
+	// 50th admit: gate trip happens at the 51st admit attempt,
+	// so the 50th real route is admitted. RoutesFor then
+	// reports overflowed=true because len(admitted)-reservedCount
+	// now equals cap.
+	set.admit("GET /real/49")
+	_, overflowed = h.RoutesFor("app-1")
+	if !overflowed {
+		t.Fatalf("RoutesFor overflowed = false after 50 admits (== cap); want true (cap reached)")
+	}
+	// 51st admit attempt: collapses to __route_other__ (no
+	// insert), overflowed stays true. Asserts the snapshot is
+	// still 52 entries (50 real + 2 reserved) — overflow
+	// doesn't add a third bucket.
+	collapsed := set.admit("GET /real/50")
+	if collapsed != otherRouteLabel {
+		t.Fatalf("admit() = %q, want %q (51st distinct must collapse to overflow bucket)", collapsed, otherRouteLabel)
+	}
+	routes, _ := h.RoutesFor("app-1")
+	if len(routes) != 52 {
+		t.Fatalf("RoutesFor length after 51st admit attempt = %d, want 52 (overflow collapsed, no extra bucket)", len(routes))
 	}
 }
 

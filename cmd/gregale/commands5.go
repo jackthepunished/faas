@@ -35,7 +35,10 @@ import (
 
 // `gregale app` subcommand names — lifted to constants so goconst stops
 // flagging the repeated "scale"/"rename" string literals across the
-// dispatch table (cmdAppDispatch) and the usage hints.
+// dispatch table (cmdAppDispatch) and the usage hints. subSecurity
+// lives in commands_app_security.go (its verb constant is colocated
+// with the leaf it dispatches to); subRoutes follows the same
+// colocated pattern in commands_app_routes.go.
 const (
 	subScale  = "scale"
 	subRename = "rename"
@@ -584,12 +587,12 @@ func cmdAppRename(slug, newSlug string) int {
 }
 
 // cmdAppDispatch routes `gregale app <slug> ...` to either the new
-// subcommand form (scale / rename) or the legacy flag-form (`gregale app
-// <slug> --ram N`, `gregale app <slug>`). Pulled out of main.go so the
-// switch stays small.
+// subcommand form (scale / rename / security / routes) or the legacy
+// flag-form (`gregale app <slug> --ram N`, `gregale app <slug>`).
+// Pulled out of main.go so the switch stays small.
 func cmdAppDispatch(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> [scale|rename <new>|security [--require-signed=true|false]|--ram N|--max-concurrency N|--idle SEC|--min N]", "apps")
+		PrintUsage(os.Stderr, "usage: gregale app <slug> [scale|rename <new>|security [--require-signed=true|false]|routes|--ram N|--max-concurrency N|--idle SEC|--min N]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -605,6 +608,8 @@ func cmdAppDispatch(args []string) int {
 			return cmdAppRename(slug, args[2])
 		case subSecurity:
 			return cmdAppSecurity(slug, args[2:])
+		case subRoutes:
+			return cmdAppsRoutes(slug, args[2:])
 		}
 	}
 	// Backwards-compat: legacy flag-form dispatch is the existing cmdApp.

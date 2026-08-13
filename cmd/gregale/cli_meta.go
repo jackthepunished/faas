@@ -168,6 +168,7 @@ var cliCommands = []cliCommand{
 		Short:   "List your apps",
 		Subcommands: []cliSub{
 			{Name: "ls", Short: "Alias for the default list action"},
+			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
 			{Name: "-q", Short: "Delete one app (positional: <slug>)"},
 			{Name: "--quiet", Short: "Delete one app (positional: <slug>)"},
 		},
@@ -181,6 +182,7 @@ var cliCommands = []cliCommand{
 			{Name: "scale", Short: "Set max_concurrency / ram_mb"},
 			{Name: "rename", Short: "Rename an app"},
 			{Name: "security", Short: "Toggle require_signed on deploys"},
+			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
 		},
 		Positionals: []string{"<slug>"},
 		Flags: []cliFlag{
