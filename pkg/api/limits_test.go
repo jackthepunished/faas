@@ -53,6 +53,13 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
 			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1,
+			// ADR-099 (#879): tenant surfaces — Free is the abuse-floor
+			// tier. The `tenant_surfaces` feature is the upsell; Free
+			// customers carry the single-tenant case via the legacy
+			// `custom_domains` path. Allowed=false means the create
+			// handler returns 402 CodeTenantSurfaceQuotaReached before
+			// the store is touched.
+			TenantSurfacesPerAccount: 0, TenantHostnamesPerSurface: 0, TenantSurfacesAllowed: false,
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
 			WebhookPerApp: 0, WebhookPerAccount: 0,
@@ -153,6 +160,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
 			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5,
+			// ADR-099 (#879): tenant surfaces — Hobby is the entry
+			// paid tier. 1 surface with up to 10 verified hostnames.
+			// The "single SaaS customer, handful of end-customer
+			// subdomains" use case is the Hobby use case.
+			TenantSurfacesPerAccount: 1, TenantHostnamesPerSurface: 10, TenantSurfacesAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
 			// (10) one-to-one. Pending invitations = members/2
 			// because the default 7d TTL keeps the live set small.
@@ -250,6 +262,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
 			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25,
+			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
+			// with up to 50 verified hostnames each. Each surface
+			// still binds to one app (the multi-app variant is the
+			// deferred footgun).
+			TenantSurfacesPerAccount: 5, TenantHostnamesPerSurface: 50, TenantSurfacesAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
 			// (50) one-to-one — every team member can hold a key
 			// for their own deploy target. Financial model is
@@ -350,6 +367,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
 			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100,
+			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
+			// with up to 250 verified hostnames each. The 250 cap is
+			// bounded by LE's 100-SAN-per-cert limit (per_host_san
+			// falls back to per_host above ~100, surfaced via the
+			// cert engine, not quota).
+			TenantSurfacesPerAccount: 25, TenantHostnamesPerSurface: 250, TenantSurfacesAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
 			// (200) one-to-one — SaaS-scale multi-team + rotating-CI.
 			// Financial model is authoritative — derived value,

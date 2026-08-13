@@ -1416,7 +1416,7 @@ func cmdDomains(args []string) int {
 			return printErr("Could not add domain", err)
 		}
 		fmt.Printf("Add this TXT record to your DNS:\n\n")
-		fmt.Printf("  _gregale-verify.%s  TXT  %s\n\n", d.Domain, d.ChallengeToken)
+		fmt.Printf("  _faas-verify.%s  TXT  %s\n\n", d.Domain, d.ChallengeToken)
 		fmt.Printf("Then run 'gregale domains list' to see when verification completes.\n")
 		return 0
 	case subRm:

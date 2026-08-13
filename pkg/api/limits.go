@@ -435,6 +435,38 @@ type Limits struct {
 	// when this trips.
 	EdgeRulesGeoPerApp int
 
+	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
+	// (ADR-099 / issue #879) a single account may own. The cap
+	// defends against a SaaS customer pinning one surface per
+	// end-customer and inflating the per-account cert inventory.
+	// Per-plan: Free 0, Hobby 1, Pro 5, Scale 25. Surfacing tenant
+	// hostnames beyond the cap returns 402
+	// CodeTenantSurfaceQuotaReached; verified out-of-band (apid
+	// doesn't dispatch cert mint). Plan gate is enforced via the
+	// TenantSurfaceQuotaError.PerPlan field (TBD PR-A), apid-Validate
+	// throws CodeTenantSurfaceQuotaReached when this trips.
+	TenantSurfacesPerAccount int
+	// TenantHostnamesPerSurface caps how many verified hostnames one
+	// surface may hold. Independent of TenantSurfacesPerAccount — the
+	// per-surface cap defends against the 1-surface-times-N-hostnames
+	// bypass. Per-plan: Free 0 (irrelevant because Free cannot create
+	// surfaces), Hobby 10, Pro 50, Scale 250. The cap is enforced in
+	// pkg/state.AddTenantHostnameIfUnderQuota (TBD PR-A) under a
+	// tenant_surfaces-row FOR UPDATE lock — same TOCTOU-defence
+	// pattern as CreateEdgeRuleIfUnderQuota (pgstore.go:5914-5974).
+	// 0 with TenantSurfacesAllowed=false (Free); non-zero with
+	// TenantSurfacesAllowed=true (Hobby/Pro/Scale).
+	TenantHostnamesPerSurface int
+	// TenantSurfacesAllowed toggles the `tenant_surfaces` feature
+	// (ADR-099 / issue #879) on the plan. Free stays off — the
+	// legacy `custom_domains` path (one FQDN, one cert) carries the
+	// single-tenant use case; the surface route is the upsell.
+	// Hobby/Pro/Scale = true. apid's createTenantSurface handler
+	// rejects a POST with 402 CodeTenantSurfaceQuotaReached when this
+	// is false (a Free customer's POST hits the gate before the store
+	// is touched).
+	TenantSurfacesAllowed bool
+
 	// WebhookPerApp caps how many outbound webhook subscriptions a
 	// single app may register (issue #476 / ADR-076). The plan gate
 	// is enforced in pkg/state.CreateAppWebhookIfUnderQuota under an
@@ -823,6 +855,15 @@ var planLimits = map[Plan]Limits{
 		// except DE") is one rule. The upgrade path raises the cap
 		// to 5/25/100.
 		EdgeRulesGeoPerApp: 1,
+		// Tenant surfaces (ADR-099 / issue #879): Free is the
+		// abuse-floor tier. The `tenant_surfaces` feature is the
+		// upsell — Free customers carry the single-tenant case via
+		// the legacy `custom_domains` path. apid's createTenantSurface
+		// handler rejects 402 CodeTenantSurfaceQuotaReached before
+		// the store is touched.
+		TenantSurfacesPerAccount:  0,
+		TenantHostnamesPerSurface: 0,
+		TenantSurfacesAllowed:     false,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
@@ -1044,6 +1085,13 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  5,
+		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
+		// entry paid tier — 1 surface with up to 10 verified
+		// hostnames. The "single SaaS customer, a handful of
+		// end-customer subdomains" use case is the hobby use case.
+		TenantSurfacesPerAccount:  1,
+		TenantHostnamesPerSurface: 10,
+		TenantSurfacesAllowed:     true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
@@ -1254,6 +1302,14 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  25,
+		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
+		// with up to 50 verified hostnames each — the growing-SaaS
+		// tier. Each surface still binds to one app, so 5 surfaces
+		// means 5 distinct customer-facing apps behind the same
+		// account (the multi-app variant is the deferred footgun).
+		TenantSurfacesPerAccount:  5,
+		TenantHostnamesPerSurface: 50,
+		TenantSurfacesAllowed:     true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
@@ -1457,6 +1513,15 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  100,
+		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
+		// surfaces with up to 250 verified hostnames each — the
+		// established-SaaS tier. The 250 cap is bounded by LE's
+		// 100-SAN-per-cert limit (`per_host_san` falls back to
+		// `per_host` above ~100 — surfaced via the cert engine, not
+		// quota).
+		TenantSurfacesPerAccount:  25,
+		TenantHostnamesPerSurface: 250,
+		TenantSurfacesAllowed:     true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
