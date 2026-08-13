@@ -1605,9 +1605,9 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
-		 returning ` + appsSelectColumns
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
 	// create path keeps the schema DEFAULT behaviour. The column is NOT
@@ -1634,7 +1634,15 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
 		// from the column, same as NodeID above.
-		nullString(derefString(app.OverflowNode)))
+		nullString(derefString(app.OverflowNode)),
+		// Issue #272 / ADR-094: per-app preview metadata. Empty
+		// strings + zero ints + nil time all land as SQL NULL
+		// via the existing nullString / nullable helpers — the
+		// create path is the production path, and production
+		// apps never carry preview metadata. The bind site is
+		// the canonical "all four columns are NULL" producer.
+		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt))
 	return scanApp(row)
 }
 
@@ -1775,9 +1783,9 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
-		 returning ` + appsSelectColumns
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+		returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
 	// column DEFAULT is documented as 'active' but the explicit INSERT
@@ -1800,7 +1808,13 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
 		// from the column, same as NodeID above.
-		nullString(derefString(app.OverflowNode)))
+		nullString(derefString(app.OverflowNode)),
+		// Issue #272 / ADR-094: per-app preview metadata. Same
+		// NULL-all shape as CreateApp above — production apps
+		// (and quota-counted inserts that happen to land via
+		// this path) never carry preview metadata.
+		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt))
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -1821,6 +1835,30 @@ func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 	sel := `select ` + appsSelectColumns + ` from apps where slug = $1 and status <> 'deleted'`
 	row := s.pool.QueryRow(ctx, sel, slug)
 	return scanApp(row)
+}
+
+// PreviewAppsByParent (ADR-094 / issue #272) returns every preview
+// app whose preview_of_slug = parentSlug, scoped to accountID. The
+// query plan uses the partial index apps_preview_of_slug_idx
+// (migration 00218), which carries the same WHERE preview_of_slug IS
+// NOT NULL predicate. Soft-deleted previews (apps.status = 'deleted')
+// are filtered out so the dashboard doesn't render "torn down" rows
+// in the live pane — they remain queryable via the janitor's
+// tombstone-aware sweep in PR-C.
+//
+// The account_id predicate is non-negotiable: a customer should
+// never see another customer's preview rows even if the
+// preview_of_slug happened to collide (it can't today — slugs are
+// globally unique — but defence-in-depth matches the pattern every
+// other apps query uses).
+func (s *PgStore) PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+appsSelectColumns+` from apps where account_id = $1 and preview_of_slug = $2 and status <> 'deleted' order by created_at desc`,
+		accountID, parentSlug)
+	if err != nil {
+		return nil, fmt.Errorf("state: preview apps by parent %q/%q: %w", accountID, parentSlug, err)
+	}
+	return scanApps(rows)
 }
 
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
@@ -3272,15 +3310,23 @@ func (s *PgStore) ApplyProjectPlan(
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
-		     project_id, root_dir, workload_name, workload_class, start_command)
+		     project_id, root_dir, workload_name, workload_class, start_command,
+			     preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
 		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
-		        $11, $12, $13, $14, $15)
+		        $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
 			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
+			// Issue #272 / ADR-094: preview columns default to
+			// NULL on ApplyProjectPlan — repo-decomposed
+			// projects never carry preview metadata at create
+			// time. The preview path provisions rows via
+			// CreateApp / CreateAppIfUnderQuota directly.
+			nullString(a.PreviewOfSlug), a.PreviewPrNumber,
+			nullString(a.PreviewPrState), nullableTimestamptzPtr(a.PreviewExpiresAt),
 		)
 		app, err := scanApp(row)
 		if err != nil {
@@ -5858,32 +5904,24 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 			Observed: appCount,
 		}
 	}
-
-	// Per-kind quota (ADR-091 D22). Geo is allowed on Free but with a
-	// tighter cap (EdgeRulesGeoPerApp = 1 on Free vs EdgeRulesPerApp
-	// = 5), so the per-kind count must be checked inside the same
-	// FOR UPDATE lock as the general count. The check fires AFTER
-	// the general cap so the pre-existing EdgeRuleQuotaError result
-	// is preserved for non-geo kinds (the per-kind error surfaces
-	// only when the kind-specific cap trips while the general cap
-	// would have allowed).
-	//
-	// Only `geo` has a per-kind cap today; future kinds that grow
-	// a per-kind cap reuse this branch by extending the table.
-	geoPerAppCap := limits.EdgeRulesGeoPerApp
-	if in.Kind == EdgeRuleKindGeo && geoPerAppCap > 0 {
-		var kindCount int
+	// Per-kind quota (ADR-091 D22). The general EdgeRulesPerApp
+	// count above covers the cheap-tier guardrail; geo gets its own
+	// tighter cap (Free=1, Hobby=5, Pro=25, Scale=100) so the
+	// abuse-desk customer persona ("block everything except DE")
+	// has one rule before the upgrade path kicks in. Both branches
+	// share the same FOR UPDATE lock on apps for race-freedom.
+	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
+		var geoPerApp int
 		if err := tx.QueryRow(ctx,
-			`select count(*) from edge_rules where app_id = $1 and kind = $2`,
-			in.AppID, string(in.Kind),
-		).Scan(&kindCount); err != nil {
-			return EdgeRule{}, fmt.Errorf("state: count edge_rules by kind for app %s: %w", in.AppID, err)
+			`select count(*) from edge_rules where app_id = $1 and kind = 'geo'`, in.AppID,
+		).Scan(&geoPerApp); err != nil {
+			return EdgeRule{}, fmt.Errorf("state: count edge_rules by kind=geo for app %s: %w", in.AppID, err)
 		}
-		if kindCount >= geoPerAppCap {
+		if geoPerApp >= limits.EdgeRulesGeoPerApp {
 			return EdgeRule{}, &EdgeRuleQuotaError{
-				Limit:      geoPerAppCap,
-				Observed:   kindCount,
-				Kind:       string(in.Kind),
+				Limit:      limits.EdgeRulesGeoPerApp,
+				Observed:   geoPerApp,
+				Kind:       string(EdgeRuleKindGeo),
 				PerAppOnly: true,
 				PerKind:    true,
 			}
@@ -6019,19 +6057,20 @@ func (s *PgStore) CountEdgeRulesForApp(ctx context.Context, appID string) (int, 
 	return n, nil
 }
 
-// CountEdgeRulesByKindForApp is the per-kind quota check used by
-// CreateEdgeRuleIfUnderQuota (ADR-091 D22). The `kind` argument is
-// matched against the schema CHECK-validated kind column; passing
-// an unknown kind returns 0 (matches the schema's silent rejection
-// of unknown values — the calling handler validates kind BEFORE
-// this method via EdgeRuleKind.IsValid).
+// CountEdgeRulesByKindForApp is the per-kind quota reader
+// (ADR-091 D22). Same shape as CountEdgeRulesForApp but filtered
+// by kind. The Postgres runtime index edge_rules_app_kind_idx
+// (composite on (app_id, kind)) makes this O(log n) without
+// needing a sequence scan. The check that's load-bearing for race
+// freedom lives inside CreateEdgeRuleIfUnderQuoTa (FOR UPDATE on
+// the apps row) — this public method is the apid handler's
+// read-side probe to surface "X/Y used" in 200 responses.
 func (s *PgStore) CountEdgeRulesByKindForApp(ctx context.Context, appID string, kind EdgeRuleKind) (int, error) {
 	var n int
 	if err := s.pool.QueryRow(ctx,
-		`select count(*) from edge_rules where app_id = $1 and kind = $2`,
-		appID, string(kind),
+		`select count(*) from edge_rules where app_id = $1 and kind = $2`, appID, string(kind),
 	).Scan(&n); err != nil {
-		return 0, fmt.Errorf("state: count edge_rules by kind for app %s: %w", appID, err)
+		return 0, err
 	}
 	return n, nil
 }
@@ -11140,7 +11179,22 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// column-list normalisation handles other nullable
 		// string-shaped values like RootDir / WorkloadName
 		// (see below).
-		&overflowNodeStr); err != nil {
+		&overflowNodeStr,
+		// Issue #272 / ADR-094: per-app preview metadata. The
+		// column projection wraps preview_of_slug and
+		// preview_pr_state in coalesce(..., '') so the scan
+		// targets can be plain strings (NULL → '' round-trips
+		// through). preview_pr_number is wrapped in
+		// coalesce(..., 0) so the scan can use a plain *int
+		// target — pgx rejects SQL NULL into *int with
+		// "cannot scan NULL into *int" (the strict default
+		// for the int4 → Go int mapping). The 0 sentinel is
+		// distinguishable from "preview with pr_number=0" via
+		// the preview_of_slug discriminator (prod apps have
+		// preview_of_slug=NULL → ''). preview_expires_at is
+		// nullable timestamptz scanned into *time.Time
+		// directly (pgx handles SQL NULL → Go nil natively).
+		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
@@ -11233,7 +11287,22 @@ const appsSelectColumns = `
 	-- coerces to the empty string via coalesce so the pgx
 	-- scan sees a string target — the App.OverflowNode field
 	-- is *string (nil = no preference = default A9 fallback).
-	coalesce(overflow_node::text, '')`
+	coalesce(overflow_node::text, ''),
+	-- Issue #272 / ADR-094: per-app preview metadata. NULL on
+	-- production apps. preview_of_slug carries the parent app's
+	-- slug (no FK — parent may be deleted while previews are
+	-- still open). preview_pr_state is the closed-set label
+	-- enforced by apps_preview_pr_state_chk (migration 00218);
+	-- the coalesce() wraps NULL → '' so the pgx scan into a
+	-- plain string is safe. preview_pr_number is wrapped in
+	-- coalesce(..., 0) so the scan can target *int directly
+	-- (pgx rejects SQL NULL into *int with "cannot scan NULL
+	-- into *int"; the 0 sentinel is distinguishable from a real
+	-- PR-number-0 preview via the preview_of_slug discriminator).
+	-- preview_expires_at is nullable timestamptz scanned into
+	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
+	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
+	coalesce(preview_pr_state, ''), preview_expires_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

@@ -936,6 +936,14 @@ type Store interface {
 	// call CountDeployedApps before this method (that's the bug).
 	CreateAppIfUnderQuota(ctx context.Context, app App, limits api.Limits) (App, error)
 	AppByID(ctx context.Context, id string) (App, error)
+	// PreviewAppsByParent (ADR-094 / issue #272) lists every
+	// preview app whose preview_of_slug matches the parent. Used
+	// by the dashboard's "preview environments" pane and the
+	// schedd's teardown janitor (cmd/schedd/janitor_preview.go,
+	// PR-C). Results are ordered by created_at DESC so the
+	// dashboard's newest-first display is free. Returns an empty
+	// slice (not an error) when the parent has no previews.
+	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and
@@ -1868,12 +1876,12 @@ type Store interface {
 	// count inside the FOR UPDATE on the apps row).
 	CountEdgeRulesForApp(ctx context.Context, appID string) (int, error)
 	// CountEdgeRulesByKindForApp is the per-kind quota check
-	// (ADR-091 D22). Geo is allowed on Free but with a tighter cap
-	// (EdgeRulesGeoPerApp = 1 on Free vs EdgeRulesPerApp = 5), so
-	// the apid handler must check the kind-specific count BEFORE
-	// the general count. The per-kind count is enforced inside the
-	// same apps-row FOR UPDATE lock as the general count so the
-	// two checks can't TOCTOU against each other.
+	// (ADR-091 D22 — kind=geo has a tighter per-app cap than the
+	// general EdgeRulesPerApp; Free=1 vs 5). Called by the apid
+	// handler to surface the specific kind + cap to the customer
+	// (e.g. "kind=geo: 1/1 rules used on Free"). The store
+	// implementations run the count inside the same apps-row FOR
+	// UPDATE lock for race-freedom against parallel inserts.
 	CountEdgeRulesByKindForApp(ctx context.Context, appID string, kind EdgeRuleKind) (int, error)
 	// MatchEdgeRulesForHost is the gateway hot-path read. Returns
 	// every enabled rule whose match_host matches `host` (or "*"),
