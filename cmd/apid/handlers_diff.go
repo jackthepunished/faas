@@ -72,21 +72,46 @@ func (s *server) diffApp(w http.ResponseWriter, r *http.Request, acct state.Acco
 		return
 	}
 
-	// App load. loadApp is the IDOR-safe seam (handlers.go +
-	// auth_facade.go): missing app or cross-account slug → 404.
-	// For the diff path the not-found case is "would create" —
-	// we don't surface a 404, we let the engine emit a
-	// would-create-app Change and the quota gate fires against
-	// the would-be fresh app. See handlers_diff.go docstring.
-	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
-	if !ok {
-		// 404 path. If the error envelope was already written by
-		// loadApp, return — nothing more to do.
+	// App load. The diff is a "what if" query (the docstring at
+	// the top of this file promises 200 + would-create-app Change
+	// for fresh-app deploys), so we deliberately do NOT use
+	// s.loadApp here — loadApp writes a 404 and the customer
+	// loses the preview path. Read the store directly and
+	// distinguish the two failure modes:
+	//
+	//   - not found          → continue with a zero-value app
+	//                          (engine emits would-create-app
+	//                          Changes; quota gate fires against
+	//                          the would-be fresh app).
+	//   - cross-account slug → 404 (IDOR protection must not be
+	//                          weakened by the diff path).
+	//
+	// Defensive: if a non-NotFound error escapes AppBySlug, we
+	// 500 via ErrCapacity — the customer sees a hard failure
+	// rather than a misleading "would create" preview.
+	slug := r.PathValue("slug")
+	app, err := s.store.AppBySlug(r.Context(), slug)
+	switch {
+	case err == nil:
+		// Found — enforce the IDOR boundary before the engine
+		// sees the row.
+		if app.AccountID != acct.ID {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Not found", "no such app"))
+			return
+		}
+	case errors.Is(err, state.ErrNotFound):
+		// Fresh-app preview path. Fall through with zero-value
+		// app; buildDiffBaseline handles App == nil by emitting
+		// would-create-app Changes from the AppConfigPatch walk.
+		app = state.App{AccountID: acct.ID, Slug: slug}
+	default:
+		api.WriteProblem(w, api.ErrCapacity("could not load app"))
 		return
 	}
 
 	// Build the baseline from pkg/state. App-found path:
 	// populate App + LatestDeployment + env + crons + edge rules.
+	// App-missing path: emit would-create-app Changes.
 	baseline, err := s.buildDiffBaseline(r.Context(), app, acct)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not read baseline"))
