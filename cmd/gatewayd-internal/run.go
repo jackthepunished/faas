@@ -236,14 +236,13 @@ func routeMetricsEnabledFromEnv() bool {
 // pair when PR-C is ready, unsets it to roll back without
 // bouncing any daemon.
 //
-// The metrics pointer is nil at the call site today
-// (NewMetrics is wired in cmd/gregale/serve_gatewayd_internal);
-// passing nil is safe — ObserveTenantSurfaceCert guards.
-func certIssuerFor(store state.Store, enabled bool) gateway.CertIssuer {
+// metrics may be nil (tests + the pre-construction window before
+// deps.metrics is built); ObserveTenantSurfaceCert guards.
+func certIssuerFor(store state.Store, metrics *gateway.Metrics, enabled bool) gateway.CertIssuer {
 	if !enabled {
 		return nil
 	}
-	return gateway.NewTenantSurfaceCertIssuer(store, nil)
+	return gateway.NewTenantSurfaceCertIssuer(store, metrics)
 }
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
@@ -681,8 +680,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// FAAS_TENANT_SURFACES_ENABLED (same dark-launch
 		// switch as the apid HTTP surface, PR-C) so a
 		// misconfigured rollout can be reverted by unsetting
-		// the env var without bouncing the daemon.
-		WithCertIssuer(certIssuerFor(pgStore, api.TenantSurfacesEnabled()))
+		// the env var without bouncing the daemon. The
+		// issuer is re-armed via WithCertIssuer below
+		// (after deps.metrics is built) so the
+		// gateway_tenant_surface_cert_total counter ticks
+		// from boot.
+		WithCertIssuer(certIssuerFor(pgStore, nil, api.TenantSurfacesEnabled()))
 
 	// Phase 2 / Gate A: gate the resolveSched legacy fallback on the
 	// active fleet. Single-box posture (only default-local active)
@@ -802,6 +805,17 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// (certmagic, httpsec, :443/:80 ACME mux). This daemon stays
 	// plain HTTP on :8080; the resolved-TLS branch was removed in PR-A.
 	deps.metrics = gateway.NewMetrics()
+
+	// ADR-100 / issue #879: re-arm the per-surface cert-remint
+	// engine with the now-built metrics registry so
+	// gateway_tenant_surface_cert_total{result,kind} ticks from
+	// boot. The earlier WithCertIssuer call (in the chained
+	// builder above) ran with a nil metrics pointer because
+	// deps.metrics didn't exist yet; ObserveTenantSurfaceCert
+	// guards on nil but skipping the increment in production
+	// made the dashboard panel observability-dead. The feature
+	// flag is the same env var (PR-C dark-launch switch).
+	backend.WithCertIssuer(certIssuerFor(pgStore, deps.metrics, api.TenantSurfacesEnabled()))
 
 	// Forward the operator-configured apid loopback URL through the
 	// test seam so runWithDeps can stay TOML-free (issue #85).
