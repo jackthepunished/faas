@@ -647,7 +647,46 @@ type App struct {
 	// customer so they can pin a preview they want to keep. NULL
 	// on production apps.
 	PreviewExpiresAt *time.Time
-	CreatedAt        time.Time
+	// CORSDefaultEnabled is the per-app default CORS opt-in
+	// (ADR-091 CORS improvements D1 / spec §4.1.2.6). When
+	// false (the default for every pre-PR app), the gateway
+	// applies no default CORS and the "no rule → no CORS"
+	// contract is preserved unchanged. When true, the gateway
+	// consults CORSDefaultOrigins for every request that
+	// misses a kind=cors edge rule and stamps
+	// Access-Control-Allow-Origin + Allow-Methods +
+	// Allow-Headers on the response. The OPTIONS
+	// short-circuit is intentionally SKIPPED on the default
+	// path so the customer's backend remains the authority
+	// on the preflight answer. Free on every plan; no
+	// plan gate (per-issue #561 framing — the fallback is
+	// the "just allow my origin" surface that customers
+	// expect from any FaaS).
+	//
+	// Pointer (not plain bool) because the wire
+	// DISTINGUISHES "schema default false" (legacy rows,
+	// pre-PR apps) from "explicit PATCH false"
+	// (customer opted out after enabling once). With a
+	// plain bool both project identically, and the
+	// customer-facing "did I ever turn this on?" question
+	// becomes unanswerable on the wire. nil = never set /
+	// schema default; *true = opt-in; *false = explicit
+	// opt-out. The pgstore layer hydrates legacy rows as
+	// *false so the wire shape collapses schema-default and
+	// opt-out to the same wire value (false) — the
+	// three-way distinction lives only on the write path.
+	CORSDefaultEnabled *bool
+	// CORSDefaultOrigins is the per-app default CORS
+	// allowlist. Same string shape as
+	// edge_rules_cors.allow_origins; the gateway reuses the
+	// matchOrigin matcher verbatim (which is widened in the
+	// same PR to accept subdomain/port wildcards). nil and
+	// an empty slice are both treated as "deny all" by
+	// the gateway. The column is text[] (not jsonb) so the
+	// matcher is reused bit-for-bit; see migration
+	// 00215_apps_cors_defaults.sql for the rationale.
+	CORSDefaultOrigins []string
+	CreatedAt          time.Time
 }
 
 // EvictionPriorityOrBestEffort (issue #475) snaps the empty Go zero
@@ -1854,6 +1893,18 @@ type Instance struct {
 	// untouched. NOT NULL DEFAULT 0 enforced by migration 00151;
 	// pre-existing rows are backfilled to 0 on apply.
 	TailCount int
+	// RequestCount is the per-instance monotonically-increasing
+	// request counter (ADR-098 C8/C9/C10). Persisted in the
+	// `request_count` column added by migrations/00221_instances_request_count.sql.
+	// The counter is the gate for warm-snapshot promotion (C10):
+	// when count >= WarmSnapshotMinRequests (per-app config), the
+	// captured snapshot is promoted to a permanent warm key. Bigint
+	// even at 100 RPS sustained — a 73-day-running instance
+	// accumulates ~6.3e8 rows; int4's 2.1e9 ceiling would be the
+	// next upgrade cycle's blocker. Mirrored here so the warm-gate
+	// reads request_count alongside TailCount without a second SQL
+	// hop. NOT NULL DEFAULT 0 enforced by migration 00221.
+	RequestCount int64
 }
 
 // ComputeNode is one vmmd host in the fleet (issue #97 / ADR-025 axis
@@ -1982,6 +2033,19 @@ type PerNodeStats struct {
 type InstanceTouch struct {
 	InstanceID  string
 	LastRequest time.Time
+	// RequestDelta (ADR-098 C9) is the per-instance request count
+	// delta the gateway has observed since the last touch. The
+	// gateway's per-instance cache (Target.RequestCount) is the
+	// authoritative hot path; the engine batched-writer flushes
+	// per-instance deltas into the instances.request_count column
+	// in the same transaction as last_request_at. 0 = no delta
+	// (the gateway observed a request but the per-instance counter
+	// already moved — the explicit zero avoids a no-op UPDATE).
+	// The increment is additive ("request_count = request_count +
+	// delta") so a re-delivered batch is idempotent on
+	// Phase-4-loser re-applies, mirroring the writer in
+	// pkg/state/pgstore.go::IncInstanceRequestCount.
+	RequestDelta int64
 }
 
 // Event is one row in the append-only audit log (spec §6.1).
@@ -2413,6 +2477,27 @@ type UpdateAppParams struct {
 	// identity + ON-cascade contract.
 	OverflowNode    *string
 	SetOverflowNode bool
+	// CORSDefaultEnabled is the per-app default CORS opt-in
+	// (ADR-091 CORS improvements D1). SetCORSDefaultEnabled
+	// distinguishes "unset" (don't touch) from "explicit
+	// false" (turn the default off). PATCHing from true →
+	// false is non-destructive: the column is metadata only,
+	// no row is touched on the gateway hot path until the
+	// next request.
+	CORSDefaultEnabled    *bool
+	SetCORSDefaultEnabled bool
+	// CORSDefaultOrigins is the per-app default CORS
+	// allowlist. SetCORSDefaultOrigins distinguishes "unset"
+	// (don't touch) from "explicit empty slice" (clear the
+	// allowlist — back to deny all). The validator
+	// (apid's updateApp handler) rejects nil when
+	// SetCORSDefaultOrigins is true and CORSDefaultEnabled is
+	// nil pointer (we need a value to know whether the
+	// explicit-empty case is intentional or a wire-shape
+	// bug). The column is text[]; the gateway reuses the
+	// matchOrigin matcher verbatim against this list.
+	CORSDefaultOrigins    *[]string
+	SetCORSDefaultOrigins bool
 }
 
 // AppPublicAuthUpdate (issue #477 / ADR-079) is the

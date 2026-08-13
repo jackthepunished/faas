@@ -146,6 +146,34 @@ type App struct {
 	// existing route cache (apps_update / domain_changed wipes
 	// the route cache, and the next Lookup re-derives).
 	Scope string
+	// CORS improvements D1: per-app default CORS
+	// opt-in. Plumbed from apps.cors_default_enabled
+	// through pgRouter.toApp so applyEdgeRuleCORS
+	// can stamp a soft CORS header set on the
+	// response when no kind=cors rule matches the
+	// Pointer (not plain bool) for the same
+	// reason state.App uses a pointer: legacy
+	// rows (never PATCHed) hydrate as *false;
+	// an explicit opt-out hydrates as *false;
+	// an opt-in hydrates as *true. The
+	// nil-vs-*false distinction only matters on
+	// the WRITE path; the hot path collapses
+	// both to false by checking for non-nil
+	// before deref (see applyEdgeRuleCORS).
+	// fakeBackend unit tests use *bool(true)
+	// to exercise the default-fallback stamp.
+	// See spec §4.1.2.6a CORS defaults.
+	CORSDefaultEnabled *bool
+	// CORS improvements D1: per-app default CORS
+	// allowlist. Plumbed from apps.cors_default_origins
+	// (text[]) through pgRouter.toApp so the gateway
+	// reuses the same matchOrigin matcher against
+	// this list as against edge_rules_cors.allow_origins.
+	// nil and len==0 are both treated as "deny all"
+	// by the gateway; the apid handler validates that
+	// CORSDefaultEnabled=true ⇒ a non-nil value is
+	// provided.
+	CORSDefaultOrigins []string
 }
 
 // PublicAuthConfig (issue #477 / ADR-079) is the per-app
@@ -1307,6 +1335,29 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 		if h.metrics != nil {
 			h.metrics.ObserveEdgeRuleMatch("cors", "miss")
 		}
+		// CORS improvements D1/D4: per-app default CORS
+		// fallback. Runs after the kind=cors miss and
+		// before the JWT/IP gates. The OPTIONS
+		// short-circuit is intentionally SKIPPED here —
+		// the customer's backend is the authority on
+		// the preflight answer; the gateway only
+		// stamps response headers. A preflight still
+		// reaches the customer code; the response gets
+		// Allow-Origin + Allow-Methods + Allow-Headers
+		// stamped on the way out.
+		// nil → never set (schema default); *false →
+		// explicit opt-out (col == false); *true →
+		// opt-in. The nil-safe check collapses the
+		// "schema default" + "explicit opt-out"
+		// cases to a single "don't stamp" path so
+		// the hot path is a single non-nil test.
+		if app.CORSDefaultEnabled != nil && *app.CORSDefaultEnabled && len(app.CORSDefaultOrigins) > 0 {
+			origin := r.Header.Get("Origin")
+			allowedOrigin := matchOrigin(app.CORSDefaultOrigins, origin)
+			if origin != "" && allowedOrigin != "" && rec != nil {
+				rec.installHeaderOps(corsDefaultOps(allowedOrigin))
+			}
+		}
 		return false
 	}
 	if rule.AccountID != app.AccountID {
@@ -1383,20 +1434,116 @@ func (h *Handler) applyEdgeRuleCORS(w http.ResponseWriter, r *http.Request, app 
 }
 
 // matchOrigin returns the value to stamp in
-// Access-Control-Allow-Origin — either "*" (echo back the wildcard)
-// or the literal origin from the request (if it matches an entry in
-// allowList). Empty string means "no match; do not stamp the
-// header".
+// Access-Control-Allow-Origin — either "*" (echo back the wildcard),
+// a literal origin from the request (if it matches an entry in
+// allowList), or the echoed origin when it matches a
+// subdomain/port-wildcard entry. Empty string means "no match; do
+// not stamp the header".
+//
+// CORS improvements D2/D6:
+//   - Subdomain wildcards: "https://*.example.com" matches
+//     "https://app.example.com" but not
+//     "https://app.sub.example.com" (only one label of wildcard,
+//     no chained "**").
+//   - Port wildcards: "https://localhost:*" matches
+//     "https://localhost:3000" and "https://localhost:8080".
+//   - Case-insensitive on scheme + host (RFC 6454 §3 says origins
+//     are case-insensitive on scheme + host, case-sensitive on
+//     path). Path matching is unchanged: a request Origin of
+//     "https://APP.example.com/Path" still does NOT match an
+//     allowList entry of "https://app.example.com" if the path
+//     component is also part of the comparison (today it isn't —
+//     Origin header has no path).
+//
+// The function is called once per request on the gateway hot path,
+// so it is O(n) over allowList. The corsOriginPattern regex in
+// pkg/api/dto.go validates the allowList entries at create-time;
+// this function is the runtime mirror.
 func matchOrigin(allowList []string, origin string) string {
 	if origin == "" {
 		return ""
 	}
-	for _, a := range allowList {
+	// RFC 6454 §3: scheme + host are case-insensitive.
+	// Lowercase the scheme and host of the request Origin so
+	// "HTTPS://App.Example.COM" matches the
+	// "https://app.example.com" allowlist entry.
+	origin = strings.ToLower(origin)
+	for _, raw := range allowList {
+		a := strings.ToLower(raw)
 		if a == "*" || a == origin {
 			return a
 		}
+		// Subdomain wildcard: "https://*.example.com" → match
+		// any "https://<single-label>.example.com". We split
+		// on "://" so the ".*" pattern only applies to the
+		// host segment, not the scheme.
+		sch, hostSuffix, ok := splitScheme(a)
+		if !ok {
+			continue
+		}
+		rSch, rHost, ok2 := splitScheme(origin)
+		if !ok2 {
+			continue
+		}
+		if sch != rSch {
+			continue
+		}
+		// Subdomain wildcard: "*.<rest>" — match any host
+		// with exactly one extra label prefixed to <rest>.
+		if strings.HasPrefix(hostSuffix, "*.") {
+			suffix := hostSuffix[2:] // strip "*."
+			suffixLabels := strings.Count(suffix, ".")
+			if strings.HasSuffix(rHost, "."+suffix) &&
+				strings.Count(rHost, ".") == suffixLabels+1 {
+				return a // echo the lower-cased allowlist entry
+			}
+		}
+		// Port wildcard: "<host>:*" — match any port.
+		if strings.HasSuffix(hostSuffix, ":*") {
+			prefix := strings.TrimSuffix(hostSuffix, ":*")
+			if strings.HasPrefix(rHost, prefix+":") {
+				return a
+			}
+		}
 	}
 	return ""
+}
+
+// splitScheme is a tiny helper that returns (scheme, "host[:port]")
+// for an origin of the form "scheme://host[:port]". Used by
+// matchOrigin to peel off the scheme before applying the
+// subdomain/port wildcard predicates. Returns false when the input
+// has no "://" separator (which the apid validator rejects at
+// create-time, so this is a runtime guard against a future schema
+// loosening that bypasses apid).
+func splitScheme(origin string) (scheme, rest string, ok bool) {
+	idx := strings.Index(origin, "://")
+	if idx < 0 {
+		return "", "", false
+	}
+	return origin[:idx], origin[idx+3:], true
+}
+
+// corsDefaultOps is the per-app default CORS header op set (CORS
+// improvements D1). Mirrors the shape of corsResponseOps above
+// but is opinionated: the gateway stamps a fixed
+// Allow-Methods (GET, POST, OPTIONS — the methods a CORS client
+// is most likely to need) and Allow-Headers: * (the per-app
+// default is permissive because the customer has opted in
+// to "just allow my origin" — the per-method / per-header
+// surface is what kind=cors edge rules are for). No
+// Allow-Credentials (the default is for uncredentialed
+// cross-origin GETs; a customer wanting credentials adds a
+// kind=cors rule, which takes precedence over the default).
+// The function takes the resolved allowedOrigin (already
+// lower-cased + matched by matchOrigin) so the response
+// always echoes the matched entry verbatim.
+func corsDefaultOps(allowedOrigin string) []EdgeRuleHeaderOp {
+	return []EdgeRuleHeaderOp{
+		{Action: "set", Name: "Access-Control-Allow-Origin", Value: allowedOrigin},
+		{Action: "set", Name: "Access-Control-Allow-Methods", Value: "GET, POST, OPTIONS"},
+		{Action: "set", Name: "Access-Control-Allow-Headers", Value: "*"},
+	}
 }
 
 // corsResponseOps turns a CORS rule + resolved allowedOrigin into the
@@ -3843,13 +3990,32 @@ func (h *Handler) RouteSetForTest(appID string) *routeLabelSet {
 // returned slice is a copy so the caller can iterate without
 // holding the lock. Returning the underlying map directly would
 // race with admit() on the hot path.
-func (h *Handler) RoutesFor(appID string) []string {
+//
+// Returns (routes, overflowed) so the dashboard-side caller can
+// render "you have hit the 50-route cap" without counting Routes
+// (which is ambiguous: 5 real routes + __route_other__ for a
+// one-off wildcard probe is indistinguishable from 50 real routes
+// + overflow). overflowed is true iff the app's routeLabelSet has
+// reached its cap (routeLabelSetCap = 50 in production, smaller
+// in tests) and additional routes are collapsing into
+// __route_other__. The cap constant is exported separately as
+// `routeLabelSetCap`; the function returns only the values the
+// caller actually consumes (PR-B1 code-review finding: the
+// earlier 3-tuple widened the surface for a value no production
+// caller read).
+//
+// On unknown apps (routeSetFor never created the set, either
+// because the app isn't opted in or because no traffic has
+// reached the per-route path yet) the function returns (nil,
+// false) — the caller normalises nil routes to [] and treats the
+// empty state as "no data", not "below cap".
+func (h *Handler) RoutesFor(appID string) (routes []string, overflowed bool) {
 	if h == nil {
-		return nil
+		return nil, false
 	}
 	v, ok := h.routeSets.Load(appID)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	s := v.(*routeLabelSet)
 	s.mu.Lock()
@@ -3859,7 +4025,15 @@ func (h *Handler) RoutesFor(appID string) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
-	return out
+	// Cap-hit is the same condition admit() checks at
+	// route_label_set.go:152: len(admitted) - reservedCount >= cap.
+	// Duplicated here rather than exported as a method on
+	// routeLabelSet to avoid widening the type's surface (the
+	// only callers are the dashboard-side wire reader and the
+	// observe_route tests; both can carry the trivially-cheap
+	// subtraction).
+	const reservedCount = 2
+	return out, len(s.admitted)-reservedCount >= s.cap
 }
 
 // preInstantiateAppRoute (ADR-093) records (appID, route) once
@@ -4234,6 +4408,23 @@ func (h *Handler) coldStart(ctx context.Context, appID, scope string, maxConcurr
 			cold = true
 			return nil
 		},
+		// ADR-098 C7: bootstrap-cap predicate. The detached leader
+		// polls this on a 1s tick; if the queue drained (the gate
+		// itself tracks waiters) and there's still no live instance,
+		// the leader aborts with reason "queue_empty_no_instance"
+		// instead of staying alive for the full TTL. The plan
+		// MaxMinInstances check would require the coldStart path to
+		// re-resolve the app; the gate's own waiter count already
+		// reflects the relevant signal — coldStart only runs when
+		// the picker fast-path found no live instance. onAbort bumps
+		// the gateway_leader_bootstrap_aborts_total counter and
+		// surfaces the abort reason on the §12 dashboard chip.
+		func() bool {
+			return h.gate.InflightFollowers(appID) == 0 && h.backend.HealthyCount(appID) == 0
+		},
+		func(reason string) {
+			h.metrics.ObserveLeaderBootstrapAbort(reason)
+		},
 	)
 	if werr != nil {
 		return false, "", WakeMethodUnspecified, werr
@@ -4247,6 +4438,14 @@ func writeWakeError(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", "5")
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
 			"Briefly at capacity", "the wake queue is full; retry shortly"))
+	case errors.Is(err, ErrBootstrapAborted):
+		// ADR-098 C7: the leader aborted under the bootstrap cap
+		// (queue empty AND no live instance). The customer should
+		// retry — the next request finds the picker fast-path
+		// still empty, so a fresh wake fires immediately.
+		w.Header().Set("Retry-After", "1")
+		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
+			"Leader bootstrap aborted", "no live instance and no plan floor; retry to wake"))
 	default:
 		var prob *api.Problem
 		if errors.As(err, &prob) {

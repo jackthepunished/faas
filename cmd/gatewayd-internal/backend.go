@@ -135,6 +135,18 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		// column DEFAULT (migration 00212).
 		RouteMetricsEnabled: app.RouteMetricsEnabled,
 		RequireAuthn:        app.RequireAuthn,
+		// CORS improvements D1: per-app default CORS
+		// plumbed through pgRouter.toApp from the apps
+		// row. CORSDefaultEnabled is *bool (tri-state:
+		// nil = legacy never-PATCHed, *false = explicit
+		// opt-out, *true = opt-in). The pgstore Scan
+		// target is always a non-nil pointer on hydrated
+		// rows, so the gateway sees false on legacy
+		// apps (the opt-in check uses `*a.CORSDefaultEnabled`)
+		// and never consults the origins list — making
+		// the legacy wake path bit-for-bit unchanged.
+		CORSDefaultEnabled: app.CORSDefaultEnabled,
+		CORSDefaultOrigins: app.CORSDefaultOrigins,
 		PublicAuth: gateway.PublicAuthConfig{
 			Mode:        app.PublicAuthMode,
 			BasicSealed: app.PublicAuthBasicSealed,

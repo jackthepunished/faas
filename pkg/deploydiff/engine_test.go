@@ -19,7 +19,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 	baseline := Baseline{App: base}
 
 	t.Run("nil fields produce no changes", func(t *testing.T) {
-		got := Compute("api", baseline, Pending{})
+		got := Compute("api", "", baseline, Pending{})
 		if len(got.Changes) != 0 {
 			t.Fatalf("nil fields should produce 0 changes; got %+v", got.Changes)
 		}
@@ -27,7 +27,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 
 	t.Run("non-nil equal value produces no change", func(t *testing.T) {
 		v := 256
-		got := Compute("api", baseline, Pending{
+		got := Compute("api", "", baseline, Pending{
 			AppConfig: AppConfigPatch{RAMMB: &v},
 		})
 		if len(got.Changes) != 0 {
@@ -37,7 +37,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 
 	t.Run("non-nil different value produces a Change", func(t *testing.T) {
 		v := 512
-		got := Compute("api", baseline, Pending{
+		got := Compute("api", "", baseline, Pending{
 			AppConfig: AppConfigPatch{RAMMB: &v},
 		})
 		if len(got.Changes) != 1 {
@@ -54,7 +54,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 
 	t.Run("explicit false on boolean is not nil", func(t *testing.T) {
 		f := false
-		got := Compute("api", baseline, Pending{
+		got := Compute("api", "", baseline, Pending{
 			AppConfig: AppConfigPatch{StreamingEnabled: &f},
 		})
 		if len(got.Changes) != 1 {
@@ -68,7 +68,7 @@ func TestCompute_PointerAwareAppConfig(t *testing.T) {
 func TestCompute_FreshApp(t *testing.T) {
 	v := 256
 	c := 2
-	got := Compute("new-app", Baseline{}, Pending{
+	got := Compute("new-app", "", Baseline{}, Pending{
 		AppConfig: AppConfigPatch{RAMMB: &v, MaxConcurrency: &c},
 	})
 	if len(got.Changes) != 2 {
@@ -94,7 +94,7 @@ func TestCompute_EnvByScope(t *testing.T) {
 			"staging": {{Key: "DEBUG", Value: "1"}},
 		},
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 
 	// FOO removed, BAZ added (default), DEBUG added (staging).
 	wantAdds := map[string]bool{
@@ -143,7 +143,7 @@ func TestCompute_Crons(t *testing.T) {
 			{Schedule: "0 * * * *", Path: "/hourly"},
 		},
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 
 	removed := false
 	added1 := false
@@ -192,7 +192,7 @@ func TestCompute_EdgeRules(t *testing.T) {
 			},
 		},
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 
 	modified := false
 	added := false
@@ -230,7 +230,7 @@ func TestCompute_DeploymentImmutable(t *testing.T) {
 	pending := Pending{
 		ImageRef: "ghcr.io/me/api@sha256:new",
 	}
-	got := Compute("api", baseline, pending)
+	got := Compute("api", "", baseline, pending)
 	found := false
 	for _, b := range got.Breaks {
 		if b.Code == "would_create_deployment" {
@@ -249,7 +249,7 @@ func TestCompute_DeploymentImmutable(t *testing.T) {
 			Healthz:    "/healthz",
 		},
 	}
-	got = Compute("api", baseline, pending)
+	got = Compute("api", "", baseline, pending)
 	found = false
 	for _, b := range got.Breaks {
 		if b.Code == "would_create_deployment" {
@@ -272,7 +272,7 @@ func TestCompute_DeploymentImmutable_HealthzClear(t *testing.T) {
 		OverrideHealthcheck: &api.DeploymentHealthcheck{Path: "/healthz"},
 	}
 	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
-	got := Compute("api", baseline, Pending{
+	got := Compute("api", "", baseline, Pending{
 		Manifest: &api.AppManifest{Healthz: ""}, // explicitly clear
 	})
 	found := false
@@ -296,7 +296,7 @@ func TestCompute_SchemaEnvChanged_KeyClear(t *testing.T) {
 		OverrideEnvKeys: []string{"FOO", "BAR"},
 	}
 	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
-	got := Compute("api", baseline, Pending{
+	got := Compute("api", "", baseline, Pending{
 		Manifest: &api.AppManifest{Env: map[string]string{}}, // cleared
 	})
 	found := false
@@ -328,7 +328,7 @@ func TestCompute_EdgeRules_DuplicateKey(t *testing.T) {
 			Kind: "route", Action: mkAction("/v1/v2"), // same key, different action
 		},
 	}
-	got := Compute("api", Baseline{}, Pending{EdgeRules: pending})
+	got := Compute("api", "", Baseline{}, Pending{EdgeRules: pending})
 	dupCount := 0
 	for _, b := range got.Breaks {
 		if b.Code == "edge_rule_duplicate_key" {
@@ -404,3 +404,107 @@ func mkAction(s string) json.RawMessage {
 // intPtr returns &v; used for pointer-typed fields on
 // api.CreateEdgeRuleRequest (Priority, Enabled).
 func intPtr(v int) *int { return &v }
+
+// TestCompute_SchemaBreak_StructuralRouteRemoved — PR-2:
+// removing a route edge rule between baseline and pending must
+// surface a schema_response_changed break anchored to the path.
+// This pins the structural diff path that pkg/openapidiff opens:
+// the engine wires in via detectStructuralSchemaBreak, which
+// projects both edge-rule lists onto the embedded OpenAPI spec
+// and emits one Break per SchemaBreak.
+//
+// Severity must be "error" (vs the PR-0 text-only path's
+// "warn") — route removal is a wire-shape break customers
+// must react to, not a behavioural hint.
+func TestCompute_SchemaBreak_StructuralRouteRemoved(t *testing.T) {
+	baseRules := []api.EdgeRuleResponse{
+		{ID: "rule_1", Kind: "route", MatchHost: "api.example.com", MatchPath: "/v1/foo"},
+	}
+	baseline := Baseline{
+		App:       &api.AppResponse{Slug: "api"},
+		EdgeRules: baseRules,
+	}
+	// Pending: same manifest, but the route rule has been
+	// removed. No new rule takes its place.
+	pending := Pending{
+		EdgeRules: nil,
+	}
+	got := Compute("api", "", baseline, pending)
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "schema_response_changed" &&
+			b.Severity == SeverityError &&
+			b.Field != "" && // path/method/status anchor
+			contains(b.Field, "api.example.com/v1/foo") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("removing a route edge rule must fire a structural schema_response_changed error break; got %+v", got.Breaks)
+	}
+}
+
+// TestCompute_SchemaBreak_StructuralRouteAdded_NoBreak — PR-2:
+// adding a NEW route edge rule does NOT fire a break (path
+// adds are Diff.Changes, not Breaks). This pins the asymmetry:
+// removing a route is a wire-shape break, adding one is a
+// positive change.
+func TestCompute_SchemaBreak_StructuralRouteAdded_NoBreak(t *testing.T) {
+	baseline := Baseline{App: &api.AppResponse{Slug: "api"}}
+	pending := Pending{
+		EdgeRules: []api.CreateEdgeRuleRequest{
+			{Kind: "route", MatchHost: "api.example.com", MatchPath: "/v1/foo"},
+		},
+	}
+	got := Compute("api", "", baseline, pending)
+	for _, b := range got.Breaks {
+		if b.Code == "schema_response_changed" && b.Severity == SeverityError {
+			t.Fatalf("adding a new route must NOT fire an error break; got %+v", b)
+		}
+	}
+}
+
+// TestCompute_SchemaBreak_TextOnlyStillFires — PR-2: the PR-0
+// text-only schema_env_changed / entrypoint signals must
+// still fire on the manifest-present path. The structural
+// pass is additive, not a replacement.
+func TestCompute_SchemaBreak_TextOnlyStillFires(t *testing.T) {
+	base := &api.DeploymentResponse{
+		OverrideEnvKeys: []string{"FOO"},
+	}
+	baseline := Baseline{App: &api.AppResponse{Slug: "api"}, LatestDeployment: base}
+	got := Compute("api", "", baseline, Pending{
+		Manifest: &api.AppManifest{
+			Env: map[string]string{"BAR": "v"},
+		},
+	})
+	found := false
+	for _, b := range got.Breaks {
+		if b.Code == "schema_env_changed" && b.Field == "manifest.env" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("text-only schema_env_changed must still fire when manifest env key set changes; got %+v", got.Breaks)
+	}
+}
+
+// contains is a tiny substring helper; the test anchor uses
+// string-contains rather than exact equality because the
+// field string is path + method + status, and we only want
+// to assert the path is in there.
+func contains(haystack, needle string) bool {
+	return len(needle) <= len(haystack) && indexOf(haystack, needle) >= 0
+}
+
+func indexOf(haystack, needle string) int {
+	if needle == "" {
+		return 0
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return i
+		}
+	}
+	return -1
+}

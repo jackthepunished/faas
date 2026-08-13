@@ -30,6 +30,7 @@ package deploydiff
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -202,6 +203,79 @@ func (d Diff) HasBlockingBreaks() bool {
 		}
 	}
 	return false
+}
+
+// ToWire converts an engine [Diff] to the canonical wire envelope
+// [api.DiffResponse]. The conversion is byte-stable with
+// [RenderJSON]'s output (sorted Changes by Field ASC; sorted Breaks
+// by Code ASC with errors first), so a CI consumer can pipe the
+// CLI's --json and the server's response through the same parser.
+//
+// Polymorphic values (Before / After / Observed / Limit) are
+// re-emitted as [json.RawMessage] via [json.Marshal] on the
+// [anyJSON.Value] payload — the encoder already returns the right
+// bytes for primitives, slices, maps, and structs. nil payload
+// values become JSON null (then omitted by the parent struct's
+// omitempty tag), matching the engine's omitempty contract.
+func (d Diff) ToWire() api.DiffResponse {
+	changes := sortedChanges(d.Changes)
+	breaks := sortedBreaks(d.Breaks)
+	wireChanges := make([]api.DiffChange, 0, len(changes))
+	for _, c := range changes {
+		wireChanges = append(wireChanges, api.DiffChange{
+			Field:  c.Field,
+			Kind:   string(c.Kind),
+			Before: anyJSONToRaw(c.Before),
+			After:  anyJSONToRaw(c.After),
+		})
+	}
+	wireBreaks := make([]api.DiffBreak, 0, len(breaks))
+	for _, b := range breaks {
+		wireBreaks = append(wireBreaks, api.DiffBreak{
+			Code:     b.Code,
+			Severity: b.Severity,
+			Reason:   b.Reason,
+			Field:    b.Field,
+			Observed: anyJSONToRaw(b.Observed),
+			Limit:    anyJSONToRaw(b.Limit),
+		})
+	}
+	plan := string(d.Plan)
+	payload := api.DiffPayload{
+		Slug:    d.Slug,
+		Changes: wireChanges,
+		Breaks:  wireBreaks,
+		Plan:    plan,
+	}
+	return api.DiffResponse{
+		Diff:     payload,
+		Blocking: d.HasBlockingBreaks(),
+		Slug:     d.Slug,
+		Plan:     plan,
+	}
+}
+
+// anyJSONToRaw re-encodes an engine [anyJSON.Value] as a
+// [json.RawMessage] suitable for the wire. nil → empty bytes
+// (the parent's omitempty drops it); otherwise the value is
+// round-tripped through json.Marshal. The wire DTOs declare
+// `omitempty` on these fields so the engine's "Add has no
+// Before; Remove has no After" contract is preserved end-to-end.
+func anyJSONToRaw(v anyJSON) json.RawMessage {
+	if v.Value == nil {
+		return nil
+	}
+	b, err := json.Marshal(v.Value)
+	if err != nil {
+		// Fall back to the literal string form so the wire never
+		// silently drops a value due to a serialisation error.
+		// json.Marshal fails only on unrepresentable types
+		// (channels, functions); in practice the engine hands us
+		// primitives, slices, and maps.
+		s, _ := json.Marshal(fmt.Sprintf("%v", v.Value))
+		return s
+	}
+	return b
 }
 
 // anyJSON is a small wrapper that JSON-encodes whatever value the

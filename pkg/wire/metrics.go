@@ -1158,8 +1158,9 @@ type OpsMetrics struct {
 	// registered on every daemon so the struct stays a single
 	// registry — only schedd / vmmd / gatewayd-internal / builderd / apid
 	// increment via Platform.Emit in production; other daemons
-	// sit at zero. Closed set is the 13 phases from
-	// pkg/events/wake.go.
+	// sit at zero. Closed set is the 15 phases from
+	// pkg/events/wake.go (extended by ADR-098 C11 to surface
+	// the three vmmd-side phase-decomposed wake timings).
 	wakePhaseEmitted *prometheus.CounterVec
 	// wakePhaseDur: lifecycle histogram for wake phases. Same
 	// (phase, result) tuple as wakePhaseEmitted. Buckets sized
@@ -1902,8 +1903,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// consult in ReapAggressive (pkg/sched/reaper.go) skipped the
 	// entire app — the app is absent from the park slice and the
 	// caller never iterates over it. Idle branch (ReapIdle) emits
-	// no decision metrics today; adding a parallel emission there
-	// is a separate change.
+	// the same three of the four outcomes (cooldown_held, park,
+	// min_floor_already) since P1D; `keep` is intentionally omitted
+	// because ReapIdle has no traffic-signal consult (no
+	// desiredByApp).
 	scaleDownDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_down_decisions_total",
 		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already, cooldown_held}; app label is the apps.id.",
@@ -2521,7 +2524,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		deadNodeReconcileDecisions.WithLabelValues(outcome)
 	}
 	// Issue #517 / PR-C / ADR-064: pre-instantiate the closed
-	// 13-phase × 2-result label set for wakePhaseEmitted and
+	// 15-phase × 2-result label set for wakePhaseEmitted and
 	// wakePhaseDur so the §12 wake-latency panel surfaces zero
 	// on an idle daemon (mirrors the buildDuration / stripePush
 	// pre-instantiation precedents above). The phase list mirrors
@@ -2533,6 +2536,16 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"boot_failed", "readiness_200", "proxy_first_byte",
 		"park_started", "park_completed", "stalled",
 		"build_succeeded", "build_failed", "deploy_failed",
+		// ADR-098 C11: vmmd-side phase-decomposed wake timings
+		// (mirrors the three typed scalars on
+		// api/proto/onebox/faas/vmmd/v1/vmmd.proto WakeResponse).
+		// result=ok on measurement, result=failed on the boundary
+		// exception path. result=failed on `restore_ms` is a
+		// separate signal from result=failed on `boot_failed` —
+		// restore_ms surfaces the /snapshot/load sub-window so
+		// the §12 panel can split "restore slow" from "guest
+		// init slow" without collapsing them.
+		"restore_ms", "netns_tap_ms", "guest_ready_ms",
 	} {
 		for _, result := range []string{"ok", "failed"} {
 			wakePhaseEmitted.WithLabelValues(phase, result)
@@ -4599,11 +4612,12 @@ func (m *OpsMetrics) ObserveScaleUp(app, outcome string) {
 	m.scaleUpDecisions.WithLabelValues(app, outcome).Inc()
 }
 
-// ObserveScaleDown records one aggressive-reaper scale-down decision
-// (issue #171). One observation per app per 10 s reaper tick that ran
-// the new code path. outcome ∈ {park, keep}; "park" is emitted once
-// per app per tick even when multiple instances are parked. Safe on
-// a nil receiver so schedd unit tests without metrics keep working.
+// ObserveScaleDown records one reaper scale-down decision per app
+// per 10 s reaper tick that ran the new code path. outcome ∈
+// {park, keep, min_floor_already, cooldown_held}; emitted by both
+// ReapIdle (P1D) and ReapAggressive (P1C), one observation per
+// app per reaper branch per tick. Safe on a nil receiver so schedd
+// unit tests without metrics keep working.
 func (m *OpsMetrics) ObserveScaleDown(app, outcome string) {
 	if m == nil {
 		return

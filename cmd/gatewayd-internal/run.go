@@ -563,7 +563,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled}, true, nil
 		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)

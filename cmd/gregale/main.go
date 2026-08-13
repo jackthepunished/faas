@@ -34,6 +34,7 @@ Commands:
   audit-events Audit-log query (audit-events list|get <id>)
   apps         List your apps
   apps ls      Alias for 'gregale apps'
+  apps routes  List admitted per-route labels for one app (ADR-093)
   apps -q      Delete an app
   app          Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
   backup       Operator rclone config unseal (backup unseal-rclone)
@@ -177,6 +178,25 @@ func run(args []string) int {
 		if len(args) > 1 && args[1] == "ls" {
 			return cmdApps()
 		}
+		// `gregale apps routes <slug>` — ADR-093 Tier B item #2
+		// operator entry point. Must come before the default
+		// fall-through so a slug-shaped token ("routes") is never
+		// misread as the delete path. The delete path requires
+		// `-q`/`--quiet`; the routes path takes the slug as args[2]
+		// (a 3-token form, distinct from the 2-token delete form).
+		if len(args) > 1 && args[1] == "routes" {
+			// CR-B1: CodeQL off-by-one (alerts #208 + #209) flagged
+			// the unguarded `args[2]` / `args[3:]` access below.
+			// Outer guard verified args[1] == "routes" but did not
+			// bounds-check args[2]. `len(args) < 3` falls through
+			// to the default cmdApps() path so `gregale apps
+			// routes` (no slug) doesn't panic; the leaf's
+			// PrintUsage exits 1 with the usage hint.
+			if len(args) < 3 {
+				return cmdApps()
+			}
+			return cmdAppsRoutes(args[2], args[3:])
+		}
 		// `gregale apps -q <slug>` is the delete path.
 		if len(args) > 1 && (args[1] == "-q" || args[1] == "--quiet") {
 			return cmdAppsRm(args[2:])
@@ -229,6 +249,14 @@ func run(args []string) int {
 		// itself is cmdEdgeRules. --json round-trips through the
 		// pkg/api SDK methods (ListEdgeRules / CreateEdgeRule / etc.).
 		return cmdEdgeRules(args[1:])
+	case "cors":
+		// CORS improvements D5: thin shim over the typed SDK
+		// helper CreateCORSEdgeRule. Sub-commands live in
+		// commands_cors.go; the dispatcher is cmdCors. Not a
+		// parallel wire surface - customers who need the full
+		// edge-rule power (priority, enable/disable, multi-host)
+		// still go through `gregale edge-rules create --kind cors`.
+		return cmdCors(args[1:])
 	case "crons":
 		return cmdCrons(args[1:])
 	case "delayed-task":

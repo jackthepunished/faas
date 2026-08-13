@@ -4,13 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // WarmHintFunc is the sticky-warm affinity source for the picker
@@ -769,6 +766,13 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope string
 	// to schedd's default (newest live deployment) — the legacy
 	// single-deployment path.
 	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID, deploymentID, scope)
+	// NOTE: ADR-098's `EnsureWake(ctx, appID)` is the new single-flight
+	// hot-path primitive on the gateway's Wake flow (pkg/gateway/pgbackend.go
+	// Wake method, issue #854 / PR #854 / 93059ff4). EnsureWake does NOT yet
+	// take a scope — its scope support is a future ADR-098 follow-up. PR-B
+	// (issue #272 / ADR-095) keeps AdmitInstance's 4-arg signature so the
+	// preview path can route to the preview ledger. Both interfaces stay
+	// additive per ADR-016.
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
 	}
@@ -779,13 +783,14 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope string
 		deploymentID = returnedDeploymentID
 	}
 	method := scheddWakeMethodToGateway(rawMethod)
-	if atCapacity {
+	// AdmitInstance carries atCapacity as a dedicated field
+	// (issue #168). Empty nodeID/instanceID are the legacy
+	// "no live deployment" signal — kept for parity with
+	// the EnsureWake path main migrates the Wake flow onto
+	// (ADR-098); AdmitInstance's typed at-capacity is the
+	// primary signal here.
+	if atCapacity || nodeID == "" || instanceID == "" {
 		return "", WakeMethodUnspecified, true, nil
-	}
-	if nodeID == "" || instanceID == "" {
-		return "", WakeMethodUnspecified, false, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity, "schedd admit returned empty ids",
-			fmt.Sprintf("instance=%q node=%q wake=%q", instanceID, nodeID, wakeID))
 	}
 	// Pre-PR-B fallback: a pre-PR-B schedd returns deploymentID="".
 	// The picker collapses to single-targetSet behaviour when there

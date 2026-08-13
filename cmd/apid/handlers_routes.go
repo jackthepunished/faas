@@ -158,6 +158,7 @@ func (s *server) getAppRoutes(w http.ResponseWriter, r *http.Request, acct state
 		AppID:  upstream.AppID,
 		Routes: upstream.Routes,
 		Source: "live",
+		CapHit: upstream.CapHit,
 	})
 }
 
@@ -166,8 +167,14 @@ func (s *server) getAppRoutes(w http.ResponseWriter, r *http.Request, acct state
 // type from api.AppRoutesResponse because the field renames
 // (omitempty for AppID) and the Source field (only present on
 // the apid side) shouldn't bleed across the package boundary.
+//
+// CapHit (ADR-093 Tier B item #1) flows through unchanged from
+// the gatewayd wire shape to api.AppRoutesResponse.CapHit — the
+// three types must stay in sync when adding fields, per the
+// `tier-b-shape-drift` repo memory.
 type routesUpstreamResponse struct {
 	Slug   string   `json:"slug"`
 	AppID  string   `json:"app_id"`
 	Routes []string `json:"routes"`
+	CapHit bool     `json:"cap_hit"`
 }

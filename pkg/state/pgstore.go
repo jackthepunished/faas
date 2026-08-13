@@ -2692,7 +2692,28 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- with ON DELETE SET NULL (migration 00167)
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
-			   overflow_node = case when $49 then $50 else overflow_node end
+			   overflow_node = case when $49 then $50 else overflow_node end,
+			   -- ADR-091 CORS improvements D1: per-app
+			   -- default CORS opt-in. SetCORSDefaultEnabled
+			   -- distinguishes "don't touch" from
+			   -- "explicit false" (opt out); apid gates
+			   -- the request shape so the SQL never sees
+			   -- an illegal value. Plan-tier agnostic -
+			   -- the fallback is the "just allow my
+			   -- origin" surface customers expect from
+			   -- any FaaS, so no plan gate.
+			   cors_default_enabled = case when $51 then $52 else cors_default_enabled end,
+			   -- ADR-091 CORS improvements D1:
+			   -- per-app default CORS allowlist. Set bit
+			   -- gates the ARRAY write; nil + Set=true
+			   -- is rejected upstream by apid (the
+			   -- validator requires a value when the
+			   -- Set bit is true, same convention as
+			   -- EgressAllowlist). The array shape
+			   -- matches edge_rules_cors.allow_origins
+			   -- so the gateway reuses the matchOrigin
+			   -- matcher verbatim.
+			   cors_default_origins = case when $53 then $54::text[] else cors_default_origins end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2773,7 +2794,17 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// the column. The Set bit distinguishes "don't
 		// touch" (don't run the SET clause) from "explicit
 		// NULL" (clear — back to A9 fallback).
-		p.SetOverflowNode, nullString(derefString(p.OverflowNode)))
+		p.SetOverflowNode, nullString(derefString(p.OverflowNode)),
+		// ADR-091 CORS improvements D1: per-app default CORS
+		// opt-in + allowlist. Same Set*/optional-pointer
+		// pattern as overflow_node / streaming_enabled.
+		// The validator on the apid side rejects
+		// CORSDefaultEnabled = true with an empty
+		// CORSDefaultOrigins (applies the same
+		// explicit-empty-must-mean-something rule as
+		// EgressAllowlist).
+		p.SetCORSDefaultEnabled, boolOrFalse(p.CORSDefaultEnabled),
+		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins))
 	return scanApp(row)
 }
 
@@ -2808,6 +2839,20 @@ func ptrOrEmpty(p *AppPublicAuthUpdate) *string {
 func derefString(s *string) string {
 	if s == nil {
 		return ""
+	}
+	return *s
+}
+
+// derefStrings returns the dereferenced value of a *[]string, or nil if
+// the pointer is nil. Mirrors derefString above for the string case.
+// Used by the UpdateApp SQL wrapper for the CORS_DEFAULT_ORIGINS arg;
+// the CASE in the SQL guards the nil so a missing pointer never
+// touches the wire (Set bit is false in that case). When the Set bit
+// is true, the apid validator guarantees a non-nil pointer, so the
+// dereference is safe.
+func derefStrings(s *[]string) []string {
+	if s == nil {
+		return nil
 	}
 	return *s
 }
@@ -7401,6 +7446,53 @@ func (s *PgStore) UpdateInstanceStateToTerminal(ctx context.Context, id, state s
 	return nil
 }
 
+// IncInstanceRequestCount (ADR-098 C8) bumps the per-instance
+// request_count column by the supplied delta. The writer is
+// additive ("request_count = request_count + delta") on purpose:
+// schedd batches 250ms of per-instance request events into a
+// single UPDATE, and a Phase-4-loser re-apply (the same delta
+// computed twice) must be idempotent on the row. The batched
+// flush path (C9) is the only caller; the writer is deliberately
+// not used at single-request granularity because that would
+// re-create the per-request UPDATE hot-path the gate's
+// amortization is closing.
+//
+// The writer returns the post-increment total so the caller can
+// spot instances that have crossed the per-app WarmSnapshotMinRequests
+// threshold without a separate SELECT — the gate's
+// "count >= min" comparison is a single conditional on the
+// returned value. Returns int64(-1) when the row is gone (Phase-4
+// loser landed after the instance was evicted); the caller
+// treats this as a no-op (the gate falls through to the cold-boot
+// path and the next instance will start fresh at request_count=0).
+func (s *PgStore) IncInstanceRequestCount(ctx context.Context, id string, delta int64) (int64, error) {
+	if delta == 0 {
+		// The writer is additive; a zero delta is a spare round-trip
+		// we can skip. But callers may still want the post-increment
+		// value, so we read it.
+		var cur int64
+		err := s.pool.QueryRow(ctx, `select request_count from instances where id = $1`, id).Scan(&cur)
+		if err != nil {
+			return -1, err
+		}
+		return cur, nil
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances set request_count = request_count + $2 where id = $1`,
+		id, delta)
+	if err != nil {
+		return -1, err
+	}
+	if tag.RowsAffected() == 0 {
+		return -1, nil //nolint:nilerr // row gone; not a hard error
+	}
+	var cur int64
+	if err := s.pool.QueryRow(ctx, `select request_count from instances where id = $1`, id).Scan(&cur); err != nil {
+		return -1, err
+	}
+	return cur, nil
+}
+
 // SetInstanceFrameworkReadyAt stamps `framework_ready_at` on the
 // instances row for the vmmd gRPC `FrameworkReady` handler
 // (PR #470-FU-B). Mirrors the no-op-on-missing-row convention of
@@ -7707,6 +7799,49 @@ func (s *PgStore) TouchInstancesLastSeen(ctx context.Context, touches []Instance
 		`update instances i set last_request_at = b.ts
 		 from (select unnest($1::uuid[]) as id, unnest($2::timestamptz[]) as ts) b
 		 where i.id = b.id`, ids, ts)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// TouchInstancesWithRequestDelta (ADR-098 C9) is the batched
+// request_count writer. Same shape as TouchInstancesLastSeen
+// (unnest, single round-trip) but additionally bumps
+// request_count by the supplied delta on each row. The delta is
+// additive ("request_count = request_count + delta") so a
+// re-delivered batch is idempotent on Phase-4-loser re-applies.
+//
+// Mirrors IncInstanceRequestCount's writer contract — the engine
+// prefers this batched path because ReportActivity already carries
+// a per-instance touch batch; piggybacking avoids a separate
+// per-instance UPDATE round-trip.
+//
+// Returns the number of rows updated. Rows whose instance_id is
+// gone (a reaped instance) are silently dropped — the SQL filter
+// `i.id = b.id` does not match deleted rows, so a re-delivered
+// batch loses that delta. Same shape as TouchInstancesLastSeen.
+func (s *PgStore) TouchInstancesWithRequestDelta(ctx context.Context, touches []InstanceTouch) (int, error) {
+	if len(touches) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(touches))
+	ts := make([]time.Time, len(touches))
+	deltas := make([]int64, len(touches))
+	for i, t := range touches {
+		ids[i] = t.InstanceID
+		ts[i] = t.LastRequest
+		deltas[i] = t.RequestDelta
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances i
+			set last_request_at = b.ts,
+			    request_count   = coalesce(i.request_count, 0) + b.delta
+		 from (select unnest($1::uuid[]) as id,
+		              unnest($2::timestamptz[]) as ts,
+		              unnest($3::bigint[]) as delta) b
+		 where i.id = b.id`,
+		ids, ts, deltas)
 	if err != nil {
 		return 0, err
 	}
@@ -11093,6 +11228,12 @@ func scanAppInto(a *App, row pgx.Row) error {
 	// '' for the NULL-preference case, which we promote to
 	// App.OverflowNode == nil below.
 	var overflowNodeStr string
+	// ADR-091 CORS improvements D1: scratch sink for the
+	// cors_default_enabled scan target. The schema's NOT
+	// NULL DEFAULT false makes the bool value always present
+	// at scan time; the *bool field is built by lifting
+	// this local below.
+	var corsDefaultEnabled bool
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
@@ -11153,13 +11294,38 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// preview_of_slug=NULL → ''). preview_expires_at is
 		// nullable timestamptz scanned into *time.Time
 		// directly (pgx handles SQL NULL → Go nil natively).
-		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt); err != nil {
+		//
+		// ADR-091 CORS improvements D1: per-app default CORS
+		// opt-in + allowlist. cors_default_enabled is NOT
+		// NULL DEFAULT false in the schema so the scan lands
+		// a plain bool; we lift it into *bool below so the
+		// wire projection surfaces the legacy-row nil vs.
+		// explicit opt-out *false distinction. The three-state
+		// collapse (nil = never touched, *false = PATCHed-to-
+		// false, *true = opted in) lives on the write path;
+		// the read path always returns a non-nil pointer.
+		// cors_default_origins is text[] — pgx maps a NULL
+		// array to a nil Go slice, which is exactly the
+		// "deny all" sentinel the gateway uses (mirrors how
+		// EgressAllowlist handles the empty case). No helper
+		// normalisation needed.
+		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt,
+		&corsDefaultEnabled, &a.CORSDefaultOrigins); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
 		s := overflowNodeStr
 		a.OverflowNode = &s
 	}
+	// Lift hydrated cors_default_enabled into the
+	// store-layer pointer field. The schema's NOT
+	// NULL DEFAULT false makes the bool value always
+	// present at scan time; the *bool shape exists
+	// because the wire projection needs the nil vs
+	// *false distinction (legacy rows vs explicit
+	// opt-out hydrates identically to *false — the
+	// three-state lives on the write path only).
+	a.CORSDefaultEnabled = &corsDefaultEnabled
 	a.Type = AppType(typeStr)
 	a.Status = AppStatus(statusStr)
 	a.WorkloadClass = WorkloadClass(workloadClassStr)
@@ -11261,7 +11427,13 @@ const appsSelectColumns = `
 	-- preview_expires_at is nullable timestamptz scanned into
 	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
 	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
-	coalesce(preview_pr_state, ''), preview_expires_at`
+	coalesce(preview_pr_state, ''), preview_expires_at,
+	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
+	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00223);
+	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the
+	-- pgx scan sees a non-nil slice on legacy rows (the gateway treats
+	-- len==0 as "deny all" — same contract as EgressAllowlist).
+	cors_default_enabled, coalesce(cors_default_origins, '{}'::text[])`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
