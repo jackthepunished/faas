@@ -222,18 +222,13 @@ func TestWakeRateLimiter_WithNoopAlwaysAllows(t *testing.T) {
 	}
 }
 
-func TestWakeRateLimiter_EngineAdmitsBurstThenThrottles(t *testing.T) {
-	// End-to-end: build an Engine, drain the rate-limit budget via
-	// repeated admitAndDispatch calls, observe the AtCapacity lift
-	// on the spillover. Pure in-memory fakes — no vmm, no PG.
-	clock, _ := frozenClock()
-	l := NewWakeRateLimiterWithClock(clock)
-	limiter := NewWakeRateLimiterWithClock(clock)
-	limiter = l
-	_ = limiter
-
-	// The Engine wire-up is exercised in pkg/sched/engine_test.go's
-	// existing admitAndDispatch tests. The unit here is just the
-	// limiter; the Engine integration is a property test in a
-	// follow-up commit (per the PR-0 acceptance gate).
-}
+// Engine-integration test pins:
+//
+// The Engine wire-up of WakeRateLimiter is exercised in
+// pkg/sched/engine_test.go's existing admitAndDispatch tests
+// (the nil-receiver path covers every existing test). The
+// rate-limit-aware variant (drain the per-app bucket, observe
+// AtCapacity lift) is a follow-up property test in PR-C alongside
+// the dispatch_jobs.go tick — the Engine is hot enough today that
+// a new test would need shared fakes more elaborate than this PR
+// can carry in its reviewable-in-10-min budget.
