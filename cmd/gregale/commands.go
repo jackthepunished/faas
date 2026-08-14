@@ -364,6 +364,16 @@ func sanitizeSlug(s string) string {
 // Otherwise (UX §3.2), the leading `✗` glyph is dropped when stdout is
 // not a TTY or NO_COLOR is set; the body of each line is unchanged.
 func printErr(title string, err error) int {
+	// Strict secret-scan dispatch (PR-A v2): extract the typed error
+	// BEFORE the nested-marker-hint branch so the JSON envelope carries
+	// the full findings array (under `extra.findings`) plus a
+	// `extra.hint` line for programmatic consumers. Text mode emits
+	// one line per finding under the title. Both modes return exit
+	// code 1; callers that want to distinguish strict-scan-rejected
+	// from a 4xx API rejection can route on the JSON envelope's
+	// `code` ("secret_scan_strict").
+	var strictErr *StrictSecretScanError
+	hasStrict := errors.As(err, &strictErr)
 	// Issue #744 / ADR-086: extract the nested-marker workspace hint
 	// from the error chain BEFORE the jsonOutput branch so both modes
 	// can route it to stderr. The hint must NEVER appear on stdout (it
@@ -372,6 +382,9 @@ func printErr(title string, err error) int {
 	// appends the hint to the existing PrintFail line.
 	var hintErr *NestedMarkerHintError
 	hasHint := errors.As(err, &hintErr)
+	if hasStrict {
+		return renderStrictSecretScanError(title, strictErr)
+	}
 	if jsonOutput {
 		var ae *APIError
 		if errors.As(err, &ae) {
@@ -419,6 +432,63 @@ func printErr(title string, err error) int {
 		return 1
 	}
 	PrintFail(osStderr, "%s\n  %s", title, err.Error())
+	return 1
+}
+
+// renderStrictSecretScanError is the dispatch target for *StrictSecretScanError.
+// Two output shapes:
+//
+//   - Text mode: prints the title, then one line per finding
+//     (file:line [provider] snippet), then the hint line. Goes to
+//     stderr; returns 1.
+//
+//   - JSON mode: synthesises a 422 Problem with
+//     code=secret_scan_strict, the full findings array under
+//     `secret_findings`, and the hint under `secret_hint`, then
+//     writeJSONProblem. Returns 1 so CI pipelines see a non-zero
+//     exit and can route on the envelope code.
+//
+// Both modes share the Problem-shape contract so a CI script can
+// `jq -r '.code'` regardless of which side fired.
+func renderStrictSecretScanError(title string, e *StrictSecretScanError) int {
+	if e == nil {
+		PrintFail(osStderr, "%s\n  unknown strict-scan error", title)
+		return 1
+	}
+	if jsonOutput {
+		findings := make([]api.SecretFinding, 0, len(e.Findings))
+		for _, f := range e.Findings {
+			findings = append(findings, api.SecretFinding{
+				File:     f.File,
+				Line:     f.Line,
+				Key:      f.Key,
+				Provider: f.Provider,
+				Severity: f.Severity.String(),
+				Snippet:  f.Snippet,
+			})
+		}
+		_ = writeJSONProblem(api.Problem{
+			Status:         422,
+			Code:           api.CodeSecretScanStrict,
+			Title:          title,
+			Detail:         fmt.Sprintf("%d secret-shaped value(s) found", len(findings)),
+			SecretFindings: findings,
+			SecretHint:     e.Hint,
+			DocsURL:        docsURLForCode(api.CodeSecretScanStrict),
+		})
+		return 1
+	}
+	PrintFail(osStderr, "%s", title)
+	for _, f := range e.Findings {
+		// text/lint tripwire-safe (no glyph literals): format is
+		// `file:line [provider] snippet` mirroring the .env warning
+		// shape from renderSecretScanWarnings so customers see a
+		// consistent format across both modes.
+		PrintWarn(osStderr, "  %s:%d [%s] %s", f.File, f.Line, f.Provider, f.Snippet)
+	}
+	if e.Hint != "" {
+		PrintWarn(osStderr, "%s", e.Hint)
+	}
 	return 1
 }
 

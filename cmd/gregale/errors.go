@@ -35,6 +35,7 @@ var errorDocsURL = map[string]string{
 	api.CodePlanLimitConcur:            docsURLPrefix + "/plan-limit-concurrency",
 	api.CodeSourceTooLarge:             docsURLPrefix + "/build/source#size",
 	api.CodeSourceInvalid:              docsURLPrefix + "/build/source",
+	api.CodeSecretScanStrict:           docsURLPrefix + "/cli/secrets",
 	api.CodeAppLayerTooBig:             docsURLPrefix + "/build/limits#app-layer",
 	api.CodeBuildUndetected:            docsURLPrefix + "/build/detect",
 	api.CodeBuildOOM:                   docsURLPrefix + "/build/limits#memory",

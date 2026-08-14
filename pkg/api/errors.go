@@ -88,6 +88,22 @@ type Problem struct {
 	// omitempty so every other problem+json site keeps its existing
 	// flat shape unchanged.
 	Errors []FieldError `json:"errors,omitempty"`
+	// SecretFindings carries per-line secret-scan detail for the
+	// 422 secret_scan_strict path. Populated by cmd/apid/secretscan.go
+	// when the server-side scan rejects an upload and by
+	// cmd/gregale/printErr when --secret-scan=strict fires locally. The
+	// shape is shared with the on-disk Deployment.SecretScan response
+	// (cmd/apid/handlers_ext.go::secretScanResponse) so a programmatic
+	// consumer can render the same UI for either rejection path.
+	// Optional + omitempty so every other problem+json site keeps its
+	// existing flat shape unchanged.
+	SecretFindings []SecretFinding `json:"secret_findings,omitempty"`
+	// SecretHint is the customer-facing remediation nudge attached to
+	// a strict-mode 422 envelope (e.g. "move detected secrets to
+	// `gregale secrets set`"). Mirrors FieldError-shaped metadata so
+	// the dashboard / SDK can render the hint as a one-line footer
+	// without parsing prose. Optional + omitempty.
+	SecretHint string `json:"secret_hint,omitempty"`
 	// extraHeaders are non-JSON response headers attached via WithHeader.
 	// Kept unexported so the wire body (RFC 7807 problem+json) is
 	// exactly the spec; WriteProblem flushes these onto the wire
@@ -104,6 +120,22 @@ type FieldError struct {
 	Field    string `json:"field"`
 	Expected string `json:"expected"`
 	Got      string `json:"got,omitempty"`
+}
+
+// SecretFinding is one per-line entry of Problem.SecretFindings. The
+// shape mirrors pkg/secretscan.Finding but is decoupled so the wire
+// schema can evolve independently of the scanner's internal fields
+// (which carry Line + Severity as unexported-int enums). Snippet is the
+// pre-truncated safe representation (first 6 chars + "…" + last 4) —
+// never the raw value, matching the snippet policy documented in
+// pkg/secretscan/scan.go.
+type SecretFinding struct {
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Key      string `json:"key,omitempty"`
+	Provider string `json:"provider"`
+	Severity string `json:"severity"`
+	Snippet  string `json:"snippet"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -161,6 +193,18 @@ func (p *Problem) WithDocs(url string) *Problem {
 	return p
 }
 
+// WithSecretScan attaches the per-line findings + customer-facing
+// hint that the cmd/apid server-side secret-scan rejection (and the
+// CLI's --secret-scan=strict mode) emit. The fields are flat on the
+// RFC 7807 problem body so a programmatic consumer can render the
+// same one-line-per-finding UI for both rejection paths. Returns the
+// same pointer for chaining.
+func (p *Problem) WithSecretScan(findings []SecretFinding, hint string) *Problem {
+	p.SecretFindings = findings
+	p.SecretHint = hint
+	return p
+}
+
 // WithHeader attaches a single response header to the Problem so
 // gatewayd-internal's writeWakeError can write it onto the wire without
 // branches on each error code. Used today by the build-attestation
@@ -193,6 +237,14 @@ const (
 	CodePlanLimitConcur = "plan_limit_concurrency"
 	CodeSourceTooLarge  = "source_too_large"
 	CodeSourceInvalid   = "source_invalid"
+	// CodeSecretScanStrict is the 422 sentinel returned by both
+	//   - cmd/apid/scan_service.go (server-side tree scan rejected)
+	//   - cmd/gregale/printErr (--secret-scan=strict client-side rejected)
+	// The Problem body carries SecretFindings []SecretFinding +
+	// SecretHint string so the SDK can render the same UI for either
+	// rejection path. Distinct from CodeSourceInvalid (tarball shape
+	// is fine — the SECRET inside is the problem).
+	CodeSecretScanStrict = "secret_scan_strict"
 	// CodeInvalidRef is the DEPLOY-PROV-4 / ADR-092 (issue #739)
 	// 400 sentinel for POST /v1/apps/{slug}/deployments/source-ref
 	// when the supplied ref is not a valid commit SHA / branch /

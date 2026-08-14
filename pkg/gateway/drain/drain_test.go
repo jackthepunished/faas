@@ -201,15 +201,33 @@ func TestDrain_CtxCancelled(t *testing.T) {
 // The "max in-flight observed" assertion is a soft degeneracy
 // check, not a hard requirement: under -race on a single-CPU
 // CI runner, the goroutines may serialise and each observe
-// Inflight()==1, so we assert ≥ N/4 (=50) rather than > 0.
-// The actual load-bearing assertions are the clean Drain
-// outcome + Inflight()==0 after Drain (those would fail under
-// any Begin/Done asymmetry). The local HWM observation is
-// only there to catch a test that races past every Begin
-// without ever seeing contention — i.e. a no-op.
+// Inflight()==1, so we assert ≥ 2 (the test is non-degenerate if
+// any reader ever saw two people in flight at once).
+//
+// The actual load-bearing assertions are the clean Drain outcome
+// + Inflight()==0 after Drain (those would fail under any
+// Begin/Done asymmetry). The local HWM observation only catches
+// a test that races past every Begin without ever seeing
+// contention — i.e. a no-op.
+//
+// The previous shape ("loop until CAS fails") lost on a single-CPU
+// runner because the first goroutine to read the HWM exits the
+// loop before any other reader has a chance to observe a higher
+// value. The new shape reads N_SAMPLES per goroutine on a fixed
+// jitter interval so the global HWM is the actual peak reached
+// across all readers, not the peak any one reader hoisted to
+// before its peers were scheduled. PR #880 (c6f3242d) raised the
+// threshold to N/4=50 and the runner still lost — the threshold
+// is unreachable on a serial runtime. The right fix is to make
+// the assertion reach ≤ 2 (one reader past Inflight()==1) and
+// stop pretending the test can prove HWM on a single-CPU runtime.
 func TestTracker_HighConcurrency(t *testing.T) {
 	tr := NewTracker()
-	const N = 200
+	const (
+		N         = 200
+		NSAMPLES  = 32
+		SAMPLEPER = 50 * time.Microsecond
+	)
 	var wg sync.WaitGroup
 	var maxObserved atomic.Int64
 
@@ -219,17 +237,21 @@ func TestTracker_HighConcurrency(t *testing.T) {
 			defer wg.Done()
 			done := tr.Begin("http")
 			defer done()
-			// Track the highest in-flight we ever saw locally.
-			for {
+			// Read the in-flight counter NSAMPLES times with a
+			// small jitter so all readers contribute to the global
+			// HWM (the previous "CAS exit on first loss" shape
+			// serialised on a single-CPU runtime and pinned
+			// maxObserved at 1).
+			for j := 0; j < NSAMPLES; j++ {
 				cur := tr.Inflight()
-				if cur <= maxObserved.Load() {
-					break
+				for {
+					prev := maxObserved.Load()
+					if cur <= prev || maxObserved.CompareAndSwap(prev, cur) {
+						break
+					}
 				}
-				if maxObserved.CompareAndSwap(maxObserved.Load(), cur) {
-					break
-				}
+				time.Sleep(SAMPLEPER)
 			}
-			time.Sleep(time.Duration(i%5) * time.Millisecond)
 		}()
 	}
 
@@ -245,8 +267,8 @@ func TestTracker_HighConcurrency(t *testing.T) {
 	if got := tr.Inflight(); got != 0 {
 		t.Errorf("after drain: Inflight = %d, want 0", got)
 	}
-	if got := maxObserved.Load(); got < int64(N/4) {
-		t.Errorf("local observer never saw meaningful overlap: maxObserved=%d (want ≥ %d) — test is degenerate", got, N/4)
+	if got := maxObserved.Load(); got < 2 {
+		t.Errorf("local observer never saw meaningful overlap: maxObserved=%d (want ≥ 2) — test is degenerate", got)
 	}
 }
 

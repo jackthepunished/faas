@@ -27,7 +27,7 @@
 // NEVER emitted — neither in the Finding struct nor in the renderer. This
 // matters because the warning line is printed to stderr and may be captured
 // in CI logs that get uploaded to third-party dashboards.
-package gregalesecretscan
+package secretscan
 
 import (
 	"bytes"
@@ -155,6 +155,18 @@ type Pair struct {
 // safely with no findings.
 func ScanEnvContent(path string, data []byte) []Finding {
 	var out []Finding
+	// inPEMBlock tracks whether the current line is inside an
+	// armoured-key block (-----BEGIN ... PRIVATE KEY----- ...
+	// -----END ... PRIVATE KEY-----). When true, the entropy
+	// fallback is suppressed on body lines because the BEGIN regex
+	// already produced a single finding for the whole block; without
+	// this, a 100-line PEM body would produce ~100 high_entropy
+	// findings, drowning the customer in one warning per base64 line
+	// for what is logically a single secret. The state resets on the
+	// -----END marker. The pattern check is intentionally cheap
+	// (byte-substring) and intentionally separate from the regex
+	// because we're tracking scope, not matching tokens.
+	inPEMBlock := false
 	// Manual line scan: bytes.IndexByte avoids copying the whole file into
 	// memory just to iterate lines. The repo is on Go 1.25 per go.mod and
 	// bytes.SplitSeq would also work, but the loop is small enough that
@@ -173,7 +185,19 @@ func ScanEnvContent(path string, data []byte) []Finding {
 		// `git config core.autocrlf=true`) don't leak the CR into the
 		// matched value and corrupt the entropy calculation.
 		line = bytes.TrimRight(line, "\r")
-		if f := matchLine(path, lineNo, line); f != nil {
+		// Update PEM-block tracker BEFORE the match pass so the
+		// -----BEGIN line itself still produces its finding (it has
+		// KEY=VALUE shape with an empty key in the env-parser path —
+		// scanOneLine routes it through the whole-line candidate
+		// branch). The -----END line resets the flag so the next
+		// key's body is scanned normally.
+		if bytes.Contains(line, []byte("-----BEGIN ")) && bytes.Contains(line, []byte("PRIVATE KEY")) {
+			inPEMBlock = true
+		}
+		if bytes.Contains(line, []byte("-----END ")) && bytes.Contains(line, []byte("PRIVATE KEY")) {
+			inPEMBlock = false
+		}
+		if f := matchLine(path, lineNo, line, inPEMBlock); f != nil {
 			out = append(out, *f)
 		}
 		if len(data) == 0 {
@@ -193,7 +217,11 @@ func ScanEnvPairs(pairs []Pair, origin string) []Finding {
 		// have the original file, so report the 1-indexed position in the
 		// pairs slice. This is consistent with how envPush surfaces
 		// parse errors today (commands5.go:277: "Bad .env line N").
-		if f := matchValue(origin, i+1, p.Key, []byte(p.Value)); f != nil {
+		// inPEMBlock is always false here — envPush only ever feeds
+		// us KEY=VALUE pairs (already parsed), never raw PEM body
+		// lines, so the armoured-key state never applies on this
+		// path. Passing false preserves the original behaviour.
+		if f := matchValue(origin, i+1, p.Key, []byte(p.Value), false); f != nil {
 			out = append(out, *f)
 		}
 	}
@@ -203,7 +231,12 @@ func ScanEnvPairs(pairs []Pair, origin string) []Finding {
 // matchLine handles one line of env content: skip blanks/comments, parse
 // KEY=VALUE, run the value through pattern matches + entropy check. Returns
 // nil for a clean line so the caller doesn't have to filter.
-func matchLine(path string, lineNo int, line []byte) *Finding {
+//
+// inPEMBlock is the scanner's armoured-key state — see ScanEnvContent
+// for the multi-line PEM dedup contract. When true, the entropy
+// fallback is suppressed because the BEGIN regex already produced
+// the single finding for this block.
+func matchLine(path string, lineNo int, line []byte, inPEMBlock bool) *Finding {
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) == 0 || trimmed[0] == '#' {
 		return nil
@@ -225,12 +258,15 @@ func matchLine(path string, lineNo int, line []byte) *Finding {
 	// KEY='literal $not-expanded' both resolve to the inner content for
 	// scanning purposes.
 	value = unquote(value)
-	return matchValue(path, lineNo, key, value)
+	return matchValue(path, lineNo, key, value, inPEMBlock)
 }
 
 // matchValue is the inner check: regex patterns keyed by KeyHint, then the
 // entropy fallback. Returns nil if nothing fires.
-func matchValue(file string, lineNo int, key string, value []byte) *Finding {
+//
+// inPEMBlock suppresses the entropy fallback on body lines of an
+// armoured-key block (see matchLine).
+func matchValue(file string, lineNo int, key string, value []byte, inPEMBlock bool) *Finding {
 	valStr := string(value)
 	keyLower := strings.ToLower(key)
 
@@ -256,11 +292,19 @@ func matchValue(file string, lineNo int, key string, value []byte) *Finding {
 		}
 	}
 
-	// 2. Entropy fallback. Skipped if value is too short or matches the
-	// "looks-like-a-URL" carve-out (URLs naturally have high entropy
-	// because of their host/path/hash components; treating every URL as
-	// a secret would flag DATABASE_URL=postgres://… which is not what
-	// the customer asked us to do).
+	// 2. Entropy fallback. Skipped if:
+	//   - value is too short
+	//   - value matches the "looks-like-a-URL" carve-out (URLs have
+	//     high entropy naturally; treating every URL as a secret would
+	//     flag DATABASE_URL=postgres://… which is not what the customer
+	//     asked us to do)
+	//   - the line is inside an armoured-key block (the BEGIN regex
+	//     already produced a single finding; without this gate, a
+	//     100-line PEM body would produce ~100 high_entropy findings
+	//     for one logical secret — review finding #3).
+	if inPEMBlock {
+		return nil
+	}
 	if len(value) < entropyMinLen {
 		return nil
 	}
