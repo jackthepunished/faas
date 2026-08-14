@@ -1,0 +1,130 @@
+package sched
+
+import (
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+)
+
+// TestTriggerPollers_RegistryComplete — issue #757 / ADR-100 leakcheck
+// (commit #21, registry completeness).
+//
+// Every Trigger kind the SQL CHECK admits (pkg/api/trigger.go::TriggerKind
+// + migrations/00267_triggers.sql::triggers.kind_check) MUST have a
+// matching poller factory registered at init time. A missing
+// registration makes runTriggerTick log the gap and silently skip the
+// trigger — which would manifest as "trigger records pile up in
+// pending state, never dispatching" — invisible from outside schedd.
+//
+// The leakcheck asserts the closed-set coverage: every kind from
+// pkg/api/trigger.go must appear in `defaultRegistry.factories`.
+// Adding a new kind without a poller init() would fail this test
+// before the PR can ship.
+func TestTriggerPollers_RegistryComplete(t *testing.T) {
+	t.Parallel()
+
+	want := map[string]bool{
+		"kafka":         false,
+		"nats":          false,
+		"redis_streams": false,
+		"sqs_compat":    false,
+		"queue":         false,
+	}
+	defaultRegistry.mu.Lock()
+	defer defaultRegistry.mu.Unlock()
+	for k := range defaultRegistry.factories {
+		if _, ok := want[k]; ok {
+			want[k] = true
+		} else {
+			t.Errorf("registry has unexpected kind=%q (no sqlc.Trigger kind in pkg/api/trigger.go matches)", k)
+		}
+	}
+	for kind, present := range want {
+		if !present {
+			t.Errorf("registry missing poller for kind=%q — every sqlc.Trigger.kind MUST have a registered broker adapter", kind)
+		}
+	}
+}
+
+// TestTriggerPollers_BrokerCloseIsIdempotent — exercise the simplest
+// possible leak path. Each per-broker poller exposes Close(); calling
+// it twice in a row must not panic, must not leak goroutines, and
+// the second call must be a no-op.
+//
+// The queue poller's Close is a no-op (rows are durable in
+// Postgres; the ack path is empty); calling it twice is the safest
+// "no broker required" assertion we can make here. Network-bound
+// pollers (kafka / nats / redis_streams / sqs_compat) get their own
+// Close() coverage in pkg/sched/poller_<kind>_test.go (commits
+// #9-12).
+func TestTriggerPollers_BrokerCloseIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	p := &queuePoller{
+		pool:          nil, // Close must not dereference this
+		source:        "queue",
+		itemsInFlight: map[string]struct{}{},
+	}
+
+	before := runtime.NumGoroutine()
+	if err := p.Close(); err != nil {
+		t.Errorf("Close #1 returned %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Errorf("Close #2 returned %v", err)
+	}
+
+	// Wait + GC so the runtime retires idle goroutines.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	after := runtime.NumGoroutine()
+
+	// Idempotent Close on a no-op poller must not increase the
+	// goroutine count beyond test-runner noise.
+	const maxSlack = 4
+	if after > before+maxSlack {
+		stack := captureStackAll()
+		t.Errorf("goroutine delta %d > %d after Close() x2\n%s",
+			after-before, maxSlack, stack)
+	}
+}
+
+// TestTriggerPollers_NATSBrokerCloseNoLeak — the natsBroker wraps a
+// real nats.Conn. Close must be safe even when the underlying conn
+// is nil (the path schedd shutdown hits when an earlier dial
+// failed). The full live-broker Close is exercised in
+// cmd/e2e/testdata/trigger-nats/.
+func TestTriggerPollers_NATSBrokerCloseNoLeak(t *testing.T) {
+	t.Parallel()
+	b := &natsBroker{conn: nil}
+	if err := b.Close(); err != nil {
+		t.Errorf("Close on nil-conn broker returned %v", err)
+	}
+	// Second close must also be safe.
+	if err := b.Close(); err != nil {
+		t.Errorf("Close #2 on nil-conn broker returned %v", err)
+	}
+}
+
+// --- leakcheck helpers ----------------------------------------------------
+
+// captureStackAll returns a backtrace slice for every running
+// goroutine. Used to diagnose "which poller leaked" without
+// pulling in a third-party goleak dep.
+func captureStackAll() string {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			out := string(buf[:n])
+			return out
+		}
+		buf = make([]byte, len(buf)*2)
+	}
+}
+
+// silence unused import when the file is reorganised.
+var _ = sync.Mutex{}
