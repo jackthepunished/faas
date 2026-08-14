@@ -1626,6 +1626,70 @@ type CreateCustomDomainRequest struct {
 	AppID  string `json:"app_id"`
 }
 
+// TenantSurfaceResponse is a tenant surface's wire shape (ADR-100 /
+// issue #879). Hostnames carries the full list (verified +
+// unverified) so the dashboard + CLI can render a single
+// round-trip; TXTRecord is the convenience field the customer
+// publishes at _faas-verify.<hostname>. Status / CertState mirror
+// the state machine values (pending/active/suspended/deleted,
+// none/pending/issued/failed) verbatim.
+type TenantSurfaceResponse struct {
+	ID            string                   `json:"id"`
+	AccountID     string                   `json:"account_id"`
+	AppID         string                   `json:"app_id"`
+	Name          string                   `json:"name"`
+	CertKind      string                   `json:"cert_kind"`
+	Status        string                   `json:"status"`
+	CertState     string                   `json:"cert_state"`
+	CertNotAfter  string                   `json:"cert_not_after,omitempty"`
+	CertLastError string                   `json:"cert_last_error,omitempty"`
+	CreatedAt     string                   `json:"created_at"`
+	UpdatedAt     string                   `json:"updated_at"`
+	Hostnames     []TenantHostnameResponse `json:"hostnames"`
+}
+
+// TenantHostnameResponse is a hostname within a surface. Mirror
+// shape of the unverified/verified columns on tenant_hostnames
+// (post-PR-C the verifier flips Verified + VerifiedAt; v1
+// surfaces the column shape now so the API contract doesn't shift
+// when verification lands).
+type TenantHostnameResponse struct {
+	Hostname       string `json:"hostname"`
+	ChallengeToken string `json:"challenge_token,omitempty"`
+	Verified       bool   `json:"verified"`
+	VerifiedAt     string `json:"verified_at,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	TXTRecord      string `json:"txt_record,omitempty"` // convenience
+}
+
+// CreateTenantSurfaceRequest creates a tenant surface (one app, one
+// cert, N hostnames). Hostnames is the seed list (can be empty
+// initially; the customer POSTs additional hostnames via
+// /v1/apps/{slug}/tenant-surfaces/{id}/hostnames). CertKind is
+// optional and defaults to "per_host_san" when empty.
+type CreateTenantSurfaceRequest struct {
+	AppID     string   `json:"app_id"`
+	Name      string   `json:"name"`
+	CertKind  string   `json:"cert_kind,omitempty"`
+	Hostnames []string `json:"hostnames,omitempty"`
+}
+
+// ListTenantSurfacesResponse paginates a /v1/apps/{slug}/tenant-surfaces
+// listing. We use a flat array (no cursor) because the per-app
+// dataset is bounded by the surface quota (Pro 5 / Scale 25 today);
+// dashboards want the whole list to render a single component.
+type ListTenantSurfacesResponse struct {
+	Surfaces []TenantSurfaceResponse `json:"surfaces"`
+}
+
+// AddTenantHostnameRequest appends a hostname to an existing
+// surface. Hostname is required and must be a unique FQDN
+// (lowercase, RFC 1035 compliant); the store enforces the global
+// UQ on tenant_hostnames.hostname.
+type AddTenantHostnameRequest struct {
+	Hostname string `json:"hostname"`
+}
+
 // CronResponse mirrors the crons table. LastFiredAt is the most
 // recent fire stamp schedd wrote (MarkCronFired). Zero-valued
 // crons serialize as "" — the dashboard only shows the column
