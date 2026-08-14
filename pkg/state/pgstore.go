@@ -15638,3 +15638,275 @@ func (s *PgStore) ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sq
 func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error {
 	return s.dataUpstreamsQueries().PruneDataUpstreamProbesOlderThan(ctx, s.pool, pgtypeFromTime(cutoff))
 }
+
+// Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
+// The store methods below mirror the cron CreateCronIfUnderQuota /
+// CronByID / UpdateCron / DeleteCron / ListCronsForApp shape so the
+// apid handler can stay symmetric. The schedd-side methods
+// (ClaimTriggerRecords / Mark* / InsertTriggerDeadLetter) live on
+// the same struct and are called by pkg/sched/dispatch_triggers.go
+// (commit #14).
+//
+// Quota enforcement: CreateTriggerIfUnderQuota opens a tx, locks the
+// parent apps row FOR UPDATE, counts existing triggers for app +
+// account under the same lock, and inserts under that lock. The
+// pattern is byte-for-byte the cron CreateCronIfUnderQuota pattern
+// at lines 5431-5511 — same TOCTOU defence, same QuotaError type
+// shape, same per-app + per-account split.
+
+// CreateTriggerIfUnderQuota creates a non-cron trigger (kafka / nats
+// / redis_streams / sqs_compat / queue) under the apps-row FOR
+// UPDATE lock. Returns *TriggerQuotaError when the per-app or
+// per-account cap is reached; ErrNotFound when the app row is gone
+// or already deleted. The cron kind routes through the existing
+// CreateCronIfUnderQuota path because cron needs the crons row + the
+// schedule+path cron-specific schema.
+func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID pgtype.UUID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts int32, limits api.Limits) (sqlc.Trigger, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// 1. Lock the parent apps row (apps_pkey serves the lock search).
+	var locked int
+	err = tx.QueryRow(ctx,
+		`select 1 from apps where id = $1 and status <> 'deleted' for update`, appID,
+	).Scan(&locked)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return sqlc.Trigger{}, ErrNotFound
+		}
+		return sqlc.Trigger{}, fmt.Errorf("state: lock app %s: %w", appID, err)
+	}
+
+	// 2. Per-app count, authoritative under the lock.
+	var appCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from triggers where app_id = $1`, appID,
+	).Scan(&appCount); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: count triggers for app %s: %w", appID, err)
+	}
+	if appCount >= limits.TriggerLimitPerApp {
+		return sqlc.Trigger{}, &TriggerQuotaError{
+			Scope:    TriggerQuotaScopeApp,
+			Limit:    limits.TriggerLimitPerApp,
+			Observed: appCount,
+		}
+	}
+
+	// 3. Per-account count under the same tx. account_id is read off
+	//    the apps row we just locked (no second round-trip).
+	var accountID pgtype.UUID
+	if err := tx.QueryRow(ctx,
+		`select account_id from apps where id = $1`, appID,
+	).Scan(&accountID); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: read account_id for app %s: %w", appID, err)
+	}
+	var accountCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from triggers t
+		 join apps a on a.id = t.app_id
+		 where a.account_id = $1 and a.status <> 'deleted'`,
+		accountID,
+	).Scan(&accountCount); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: count triggers for account %s: %w", accountID, err)
+	}
+	if accountCount >= limits.TriggerLimitPerAccount {
+		return sqlc.Trigger{}, &TriggerQuotaError{
+			Scope:    TriggerQuotaScopeAccount,
+			Limit:    limits.TriggerLimitPerAccount,
+			Observed: accountCount,
+		}
+	}
+
+	// 4. Insert under the same lock. cron_id + source are NULL for
+	//    the five non-cron kinds; the SQL CHECK + table-level
+	//    constraint enforces that the cron kind has cron_id set and
+	//    non-cron kinds have it NULL. We default both to NULL here;
+	//    the apid handler routes cron-kind creations through
+	//    CreateCron (the existing path) and this method is for the
+	//    five non-cron kinds only.
+	row := tx.QueryRow(ctx,
+		`insert into triggers (account_id, app_id, kind, slug, enabled, config,
+		                       batch_size_max, batch_window_ms, max_attempts,
+		                       cron_id, source)
+		 values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+		 returning id, account_id, app_id, kind, slug, enabled, config,
+		           batch_size_max, batch_window_ms, max_attempts,
+		           cron_id, source, created_at, updated_at`,
+		accountID, appID, kind, slug, enabled, config,
+		batchSizeMax, batchWindowMs, maxAttempts,
+		pgtype.UUID{}, pgtype.Text{})
+	t := sqlc.Trigger{}
+	if err := row.Scan(
+		&t.ID, &t.AccountID, &t.AppID, &t.Kind, &t.Slug, &t.Enabled,
+		&t.Config, &t.BatchSizeMax, &t.BatchWindowMs, &t.MaxAttempts,
+		&t.CronID, &t.Source, &t.CreatedAt, &t.UpdatedAt,
+	); err != nil {
+		return sqlc.Trigger{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return sqlc.Trigger{}, fmt.Errorf("state: commit create trigger: %w", err)
+	}
+	return t, nil
+}
+
+// TriggerByID returns the trigger with the given ID. Returns
+// ErrNotFound when the row is gone.
+func (s *PgStore) TriggerByID(ctx context.Context, id pgtype.UUID) (sqlc.Trigger, error) {
+	return s.triggerQueries().TriggerByID(ctx, s.pool, id)
+}
+
+// UpdateTrigger patches the mutable fields (enabled, config,
+// batch_size_max, batch_window_ms, max_attempts). The kind + slug
+// + cron_id + source fields are immutable after creation; the
+// apid handler rejects PATCHes that touch them with
+// trigger_immutable_field. The cron_id linkage is set at creation
+// only (kind='cron' is created via the legacy CreateCron path).
+//
+// We bypass the sqlc.UpdateTrigger generated stub because sqlc
+// generated the coalesce() UPDATE with non-nullable parameter
+// types (Enabled bool, Column3 []byte, etc.) which collapses the
+// "absent" / "explicit" distinction the apid handler needs (the
+// cron UpdateCron precedent handles this same coalesce-via-pool
+// pattern at line 5523+). Bypassing sqlc here keeps the PATCH
+// semantics correct at the cost of losing auto-generated type
+// safety — net-positive because the alternative would force the
+// handler to send "current values" for unset fields and break the
+// JSON `omitempty` round-trip.
+func (s *PgStore) UpdateTrigger(ctx context.Context, id pgtype.UUID, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts *int32) (sqlc.Trigger, error) {
+	var enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg any
+	if enabled != nil {
+		enabledArg = *enabled
+	}
+	if config != nil {
+		configArg = config
+	}
+	if batchSizeMax != nil {
+		batchSizeArg = *batchSizeMax
+	}
+	if batchWindowMs != nil {
+		batchWindowArg = *batchWindowMs
+	}
+	if maxAttempts != nil {
+		maxAttemptsArg = *maxAttempts
+	}
+	row := s.pool.QueryRow(ctx,
+		`update triggers set
+		   enabled = coalesce($2, enabled),
+		   config = coalesce($3::jsonb, config),
+		   batch_size_max = coalesce($4, batch_size_max),
+		   batch_window_ms = coalesce($5, batch_window_ms),
+		   max_attempts = coalesce($6, max_attempts)
+		 where id = $1
+		 returning id, account_id, app_id, kind, slug, enabled, config,
+		           batch_size_max, batch_window_ms, max_attempts,
+		           cron_id, source, created_at, updated_at`,
+		id, enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg)
+	t := sqlc.Trigger{}
+	if err := row.Scan(
+		&t.ID, &t.AccountID, &t.AppID, &t.Kind, &t.Slug, &t.Enabled,
+		&t.Config, &t.BatchSizeMax, &t.BatchWindowMs, &t.MaxAttempts,
+		&t.CronID, &t.Source, &t.CreatedAt, &t.UpdatedAt,
+	); err != nil {
+		return sqlc.Trigger{}, mapErr(err)
+	}
+	return t, nil
+}
+
+// DeleteTrigger removes a trigger + cascades to trigger_records +
+// trigger_dead_letter via the ON DELETE CASCADE FKs. The appID
+// argument is the authz guard — the apid handler must pass the
+// app_id it loaded; the WHERE id=$1 AND app_id=$2 clause refuses to
+// delete a trigger that doesn't belong to the requested app
+// (cross-app tenant bypass defence).
+func (s *PgStore) DeleteTrigger(ctx context.Context, id, appID pgtype.UUID) error {
+	return s.triggerQueries().DeleteTrigger(ctx, s.pool, sqlc.DeleteTriggerParams{ID: id, AppID: appID})
+}
+
+// ListTriggersForApp is the dashboard read-back (GET /v1/triggers).
+func (s *PgStore) ListTriggersForApp(ctx context.Context, appID pgtype.UUID) ([]sqlc.Trigger, error) {
+	return s.triggerQueries().ListTriggersForApp(ctx, s.pool, appID)
+}
+
+// ListEnabledTriggers is the schedd-side read on each 1-second
+// cadence. Returns the full enabled-triggers set; the dispatch
+// tick filters by kind to pick the per-kind poller.
+func (s *PgStore) ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, error) {
+	return s.triggerQueries().ListEnabledTriggers(ctx, s.pool)
+}
+
+// ClaimTriggerRecords is the schedd-side pull from the per-trigger
+// pending/retry queue. FOR UPDATE SKIP LOCKED (set in queries.sql)
+// lets concurrent schedd replicas each claim disjoint row sets —
+// ADR-099 PR-C precedent for claim_job_tasks.
+func (s *PgStore) ClaimTriggerRecords(ctx context.Context, triggerID pgtype.UUID, limit int32) ([]sqlc.TriggerRecord, error) {
+	return s.triggerQueries().ClaimTriggerRecords(ctx, s.pool, sqlc.ClaimTriggerRecordsParams{TriggerID: triggerID, Limit: limit})
+}
+
+// MarkTriggerRecordSucceeded transitions a claimed record to the
+// succeeded state. Called from the dispatch tick after the runner
+// envelope returns 2xx with no ReportBatchItemFailures entry for
+// this item_identifier.
+func (s *PgStore) MarkTriggerRecordSucceeded(ctx context.Context, id pgtype.UUID) error {
+	return s.triggerQueries().MarkTriggerRecordSucceeded(ctx, s.pool, id)
+}
+
+// MarkTriggerRecordRetry schedules a retry with exponential
+// backoff. The dispatch tick calls this with attempts < max_attempts.
+func (s *PgStore) MarkTriggerRecordRetry(ctx context.Context, id pgtype.UUID, lastError string, nextFireAt time.Time) error {
+	return s.triggerQueries().MarkTriggerRecordRetry(ctx, s.pool, sqlc.MarkTriggerRecordRetryParams{
+		ID:         id,
+		LastError:  pgtype.Text{String: lastError, Valid: lastError != ""},
+		NextFireAt: pgtypeFromTime(nextFireAt),
+	})
+}
+
+// MarkTriggerRecordDeadLetter transitions a claimed record to the
+// dead_letter state. Called when the runner envelope returns a
+// batchItemFailures entry AND attempts >= max_attempts OR the
+// record carries a poison_record signature (malformed response
+// JSON, missing item_identifier, etc.).
+func (s *PgStore) MarkTriggerRecordDeadLetter(ctx context.Context, id pgtype.UUID, lastError string) error {
+	return s.triggerQueries().MarkTriggerRecordDeadLetter(ctx, s.pool, sqlc.MarkTriggerRecordDeadLetterParams{
+		ID:        id,
+		LastError: pgtype.Text{String: lastError, Valid: lastError != ""},
+	})
+}
+
+// InsertTriggerDeadLetter writes the closed-vocab failure-routing
+// row that pairs with a dead-lettered record. detail carries any
+// per-reason payload (broker error text, payload size that tripped
+// the 6MB cap, etc.) for the dashboard read-back.
+func (s *PgStore) InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID pgtype.UUID, reason, routedTo string, detail []byte) error {
+	var detailArg any = []byte("{}")
+	if detail != nil {
+		detailArg = detail
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into trigger_dead_letter (record_id, trigger_id, reason, routed_to, detail)
+		 values ($1, $2, $3, $4, $5::jsonb)`,
+		recordID, triggerID, reason, routedTo, detailArg)
+	return err
+}
+
+// ListTriggerDeadLetter reads the per-trigger DLQ rows for the
+// dashboard + GET /v1/triggers/{id}/metrics?include_dlq=true.
+func (s *PgStore) ListTriggerDeadLetter(ctx context.Context, triggerID pgtype.UUID, limit int32) ([]sqlc.TriggerDeadLetter, error) {
+	return s.triggerQueries().ListTriggerDeadLetter(ctx, s.pool, sqlc.ListTriggerDeadLetterParams{TriggerID: triggerID, Limit: limit})
+}
+
+// ListTriggerRecordsForTrigger reads the records for a trigger in
+// dispatch-time order. Used by GET /v1/triggers/{id}/records.
+func (s *PgStore) ListTriggerRecordsForTrigger(ctx context.Context, triggerID pgtype.UUID, limit int32) ([]sqlc.TriggerRecord, error) {
+	return s.triggerQueries().ListTriggerRecordsForTrigger(ctx, s.pool, sqlc.ListTriggerRecordsForTriggerParams{TriggerID: triggerID, Limit: limit})
+}
+
+// triggerQueries returns a fresh sqlc.Queries for the trigger table.
+// Pattern after appErrorsQueries (line 15120) and
+// dataUpstreamsQueries (line 15324): sqlc.Queries carries no state,
+// so a per-call allocation is cheap and avoids a cache invalidation
+// hazard if PgStore ever pools across multiple DB connections in a
+// future scale-out.
+func (s *PgStore) triggerQueries() *sqlc.Queries { return sqlc.New() }

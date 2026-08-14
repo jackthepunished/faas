@@ -1190,3 +1190,141 @@ LIMIT $4;
 -- partition tail (rows in the default partition or
 -- the current month that are older than cutoff).
 DELETE FROM data_upstream_probes WHERE sampled_at < $1;
+
+-- Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
+-- Mirrors the cron `CreateCron` / `UpdateCron` / `DeleteCron` /
+-- `CronByID` / `ListCronsForApp` shape so the apid handler can stay
+-- symmetric with the existing cron surface. The dispatch tick
+-- (pkg/sched/dispatch_triggers.go, commit #14) writes
+-- ClaimTriggerRecords / MarkTriggerRecordSucceeded /
+-- MarkTriggerRecordRetry / MarkTriggerRecordDeadLetter, which the
+-- schedd uses under FOR UPDATE SKIP LOCKED to drain batches
+-- concurrently.
+--
+-- The FOR UPDATE SKIP LOCKED on ClaimTriggerRecords mirrors the
+-- precedent set by ADR-099 PR-C's claim_job_tasks query (issue
+-- tracker 'job-task pull'): concurrent schedd replicas each claim
+-- disjoint row sets with no advisory-lock plumbing.
+
+-- name: CreateTrigger :one
+insert into triggers (account_id, app_id, kind, slug, enabled, config,
+                       batch_size_max, batch_window_ms, max_attempts,
+                       cron_id, source)
+values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+returning id, account_id, app_id, kind, slug, enabled, config,
+          batch_size_max, batch_window_ms, max_attempts,
+          cron_id, source, created_at, updated_at;
+
+-- name: UpdateTrigger :one
+update triggers set
+  enabled = coalesce($2, enabled),
+  config = coalesce($3::jsonb, config),
+  batch_size_max = coalesce($4, batch_size_max),
+  batch_window_ms = coalesce($5, batch_window_ms),
+  max_attempts = coalesce($6, max_attempts)
+where id = $1
+returning id, account_id, app_id, kind, slug, enabled, config,
+          batch_size_max, batch_window_ms, max_attempts,
+          cron_id, source, created_at, updated_at;
+
+-- name: DeleteTrigger :exec
+delete from triggers where id = $1 and app_id = $2;
+
+-- name: TriggerByID :one
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, created_at, updated_at
+from triggers where id = $1;
+
+-- name: ListTriggersForApp :many
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, created_at, updated_at
+from triggers where app_id = $1 order by created_at desc;
+
+-- name: ListEnabledTriggers :many
+-- Pulled by schedd's runTriggerTick on each 1-second cadence. The
+-- query is unfiltered by kind because the dispatch tick reads
+-- triggers.enabled = true regardless of kind and dispatches via the
+-- per-kind poller (pkg/sched/poller.go).
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, created_at, updated_at
+from triggers where enabled = true;
+
+-- name: CountTriggersByApp :one
+select count(*) from triggers where app_id = $1;
+
+-- name: CountTriggersByAccount :one
+select count(*) from triggers t
+join apps a on a.id = t.app_id
+where a.account_id = $1 and a.status <> 'deleted';
+
+-- name: ClaimTriggerRecords :many
+-- FOR UPDATE SKIP LOCKED is the ADR-099 PR-C claim_job_tasks
+-- precedent: concurrent schedd replicas each claim disjoint row
+-- sets. Returns at most $1 records in (pending, retry) state whose
+-- next_fire_at <= now(). The trigger_id constraint scopes the
+-- claim so the poller drains one trigger at a time.
+select id, trigger_id, item_identifier, payload, headers, metadata,
+       state, attempts, next_fire_at, received_at, last_error,
+       last_dispatched_at
+from trigger_records
+where trigger_id = $1
+  and state in ('pending','retry')
+  and next_fire_at <= now()
+order by next_fire_at
+limit $2
+for update skip locked;
+
+-- name: MarkTriggerRecordSucceeded :exec
+update trigger_records
+   set state = 'succeeded',
+       last_dispatched_at = now()
+ where id = $1;
+
+-- name: MarkTriggerRecordRetry :exec
+update trigger_records
+   set state = 'retry',
+       attempts = attempts + 1,
+       last_error = $2,
+       last_dispatched_at = now(),
+       next_fire_at = $3
+ where id = $1;
+
+-- name: MarkTriggerRecordDeadLetter :exec
+update trigger_records
+   set state = 'dead_letter',
+       attempts = attempts + 1,
+       last_error = $2,
+       last_dispatched_at = now()
+ where id = $1;
+
+-- name: InsertTriggerDeadLetter :exec
+-- One row per dead-lettered record. The reason is the closed-vocab
+-- failure mode (rate_limited, poison_record, max_attempts,
+-- broker_error, plan_quota, payload_too_large, customer_disabled);
+-- the routed_to is the closed-vocab terminal action (drop,
+-- manual_retry, customer_dlq). detail carries any per-reason payload
+-- (the broker error text, the payload size that tripped the 6MB
+-- cap, etc.) for the dashboard read-back.
+insert into trigger_dead_letter (record_id, trigger_id, reason, routed_to, detail)
+values ($1, $2, $3, $4, $5::jsonb);
+
+-- name: ListTriggerDeadLetter :many
+select record_id, trigger_id, reason, routed_to, detail, created_at
+from trigger_dead_letter
+where trigger_id = $1
+order by created_at desc
+limit $2;
+
+-- name: ListTriggerRecordsForTrigger :many
+-- Used by GET /v1/triggers/{id}/records (dashboard + apid handler).
+-- Returns records in dispatch-time order with the standard projection.
+select id, trigger_id, item_identifier, payload, headers, metadata,
+       state, attempts, next_fire_at, received_at, last_error,
+       last_dispatched_at
+from trigger_records
+where trigger_id = $1
+order by received_at desc
+limit $2;

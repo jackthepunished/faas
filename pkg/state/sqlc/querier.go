@@ -51,7 +51,15 @@ type Querier interface {
 	// follow-up SELECT. Returns ErrNotFound when the instance row is
 	// missing (pgx.ErrNoRows maps to state.ErrNotFound in pgstore).
 	BumpInstanceTailCount(ctx context.Context, db DBTX, arg BumpInstanceTailCountParams) (int32, error)
+	// FOR UPDATE SKIP LOCKED is the ADR-099 PR-C claim_job_tasks
+	// precedent: concurrent schedd replicas each claim disjoint row
+	// sets. Returns at most $1 records in (pending, retry) state whose
+	// next_fire_at <= now(). The trigger_id constraint scopes the
+	// claim so the poller drains one trigger at a time.
+	ClaimTriggerRecords(ctx context.Context, db DBTX, arg ClaimTriggerRecordsParams) ([]TriggerRecord, error)
 	CountDeployedApps(ctx context.Context, db DBTX, accountID pgtype.UUID) (int64, error)
+	CountTriggersByAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) (int64, error)
+	CountTriggersByApp(ctx context.Context, db DBTX, appID pgtype.UUID) (int64, error)
 	// scopes is $4 (text[]). The handler is responsible for validating the
 	// scope vocabulary; the store does not. See ADR-034 rev2.
 	CreateAPIKey(ctx context.Context, db DBTX, arg CreateAPIKeyParams) (CreateAPIKeyRow, error)
@@ -77,6 +85,21 @@ type Querier interface {
 	// value). issued_ip is an inet ('' cast to NULL means "RemoteAddr
 	// unparseable" — surfaced as "" on read by coalesce(host(...))).
 	CreateSession(ctx context.Context, db DBTX, arg CreateSessionParams) (CreateSessionRow, error)
+	// Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
+	// Mirrors the cron `CreateCron` / `UpdateCron` / `DeleteCron` /
+	// `CronByID` / `ListCronsForApp` shape so the apid handler can stay
+	// symmetric with the existing cron surface. The dispatch tick
+	// (pkg/sched/dispatch_triggers.go, commit #14) writes
+	// ClaimTriggerRecords / MarkTriggerRecordSucceeded /
+	// MarkTriggerRecordRetry / MarkTriggerRecordDeadLetter, which the
+	// schedd uses under FOR UPDATE SKIP LOCKED to drain batches
+	// concurrently.
+	//
+	// The FOR UPDATE SKIP LOCKED on ClaimTriggerRecords mirrors the
+	// precedent set by ADR-099 PR-C's claim_job_tasks query (issue
+	// tracker 'job-task pull'): concurrent schedd replicas each claim
+	// disjoint row sets with no advisory-lock plumbing.
+	CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerParams) (Trigger, error)
 	CronByID(ctx context.Context, db DBTX, id pgtype.UUID) (CronByIDRow, error)
 	// issue #667 / ADR-078 — canonical "tail task reached terminal" path.
 	// Equivalent to BumpInstanceTailCount(ctx, id, -n) but kept as a
@@ -114,6 +137,7 @@ type Querier interface {
 	// the GDPR path (delete-account cascades through
 	// apps → data_upstreams).
 	DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error
+	DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
@@ -216,6 +240,14 @@ type Querier interface {
 	// path; the partition creator (PR-C) drops old
 	// partitions wholesale.
 	InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg InsertDataUpstreamProbeParams) error
+	// One row per dead-lettered record. The reason is the closed-vocab
+	// failure mode (rate_limited, poison_record, max_attempts,
+	// broker_error, plan_quota, payload_too_large, customer_disabled);
+	// the routed_to is the closed-vocab terminal action (drop,
+	// manual_retry, customer_dlq). detail carries any per-reason payload
+	// (the broker error text, the payload size that tripped the 6MB
+	// cap, etc.) for the dashboard read-back.
+	InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg InsertTriggerDeadLetterParams) error
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)
@@ -319,6 +351,11 @@ type Querier interface {
 	ListDomainsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListDomainsForAccountRow, error)
 	ListDomainsForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListDomainsForAppRow, error)
 	ListEnabledCrons(ctx context.Context, db DBTX) ([]ListEnabledCronsRow, error)
+	// Pulled by schedd's runTriggerTick on each 1-second cadence. The
+	// query is unfiltered by kind because the dispatch tick reads
+	// triggers.enabled = true regardless of kind and dispatches via the
+	// per-kind poller (pkg/sched/poller.go).
+	ListEnabledTriggers(ctx context.Context, db DBTX) ([]Trigger, error)
 	ListEvents(ctx context.Context, db DBTX, arg ListEventsParams) ([]ListEventsRow, error)
 	// issue #517 / PR-C / ADR-064 — wake-timeline read-side query.
 	// Filters on the jsonb expression index events_wake_id_idx
@@ -355,9 +392,17 @@ type Querier interface {
 	ListRecentEventsForAccount(ctx context.Context, db DBTX, arg ListRecentEventsForAccountParams) ([]ListRecentEventsForAccountRow, error)
 	// Active rows only, newest first. Partial index keeps the scan tight.
 	ListSessions(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListSessionsRow, error)
+	ListTriggerDeadLetter(ctx context.Context, db DBTX, arg ListTriggerDeadLetterParams) ([]TriggerDeadLetter, error)
+	// Used by GET /v1/triggers/{id}/records (dashboard + apid handler).
+	// Returns records in dispatch-time order with the standard projection.
+	ListTriggerRecordsForTrigger(ctx context.Context, db DBTX, arg ListTriggerRecordsForTriggerParams) ([]TriggerRecord, error)
+	ListTriggersForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]Trigger, error)
 	MarkDeploymentLive(ctx context.Context, db DBTX, id pgtype.UUID) error
 	MarkDeploymentSuperseded(ctx context.Context, db DBTX, id pgtype.UUID) error
 	MarkDomainVerified(ctx context.Context, db DBTX, domain interface{}) error
+	MarkTriggerRecordDeadLetter(ctx context.Context, db DBTX, arg MarkTriggerRecordDeadLetterParams) error
+	MarkTriggerRecordRetry(ctx context.Context, db DBTX, arg MarkTriggerRecordRetryParams) error
+	MarkTriggerRecordSucceeded(ctx context.Context, db DBTX, id pgtype.UUID) error
 	OrgByID(ctx context.Context, db DBTX, id pgtype.UUID) (OrgByIDRow, error)
 	OrgByPersonalAccount(ctx context.Context, db DBTX, personalOwnerAccountID pgtype.UUID) (OrgByPersonalAccountRow, error)
 	OrgBySlug(ctx context.Context, db DBTX, lower string) (OrgBySlugRow, error)
@@ -464,6 +509,7 @@ type Querier interface {
 	// window in single-box posture. The instances.node_id lookup
 	// is by PK; the join is O(matches) on the PK.
 	TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error)
+	TriggerByID(ctx context.Context, db DBTX, id pgtype.UUID) (Trigger, error)
 	UpdateAccountPlan(ctx context.Context, db DBTX, arg UpdateAccountPlanParams) error
 	UpdateAccountStatus(ctx context.Context, db DBTX, arg UpdateAccountStatusParams) error
 	UpdateApp(ctx context.Context, db DBTX, arg UpdateAppParams) (UpdateAppRow, error)
@@ -473,6 +519,7 @@ type Querier interface {
 	UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateInstanceStateParams) error
 	UpdateOrgPlan(ctx context.Context, db DBTX, arg UpdateOrgPlanParams) error
 	UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error
+	UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (Trigger, error)
 	// ---------------------------------------------------------------------------
 	// PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
 	//

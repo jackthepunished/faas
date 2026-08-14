@@ -423,12 +423,92 @@ func (q *Queries) BumpInstanceTailCount(ctx context.Context, db DBTX, arg BumpIn
 	return tail_count, err
 }
 
+const claimTriggerRecords = `-- name: ClaimTriggerRecords :many
+select id, trigger_id, item_identifier, payload, headers, metadata,
+       state, attempts, next_fire_at, received_at, last_error,
+       last_dispatched_at
+from trigger_records
+where trigger_id = $1
+  and state in ('pending','retry')
+  and next_fire_at <= now()
+order by next_fire_at
+limit $2
+for update skip locked
+`
+
+type ClaimTriggerRecordsParams struct {
+	TriggerID pgtype.UUID
+	Limit     int32
+}
+
+// FOR UPDATE SKIP LOCKED is the ADR-099 PR-C claim_job_tasks
+// precedent: concurrent schedd replicas each claim disjoint row
+// sets. Returns at most $1 records in (pending, retry) state whose
+// next_fire_at <= now(). The trigger_id constraint scopes the
+// claim so the poller drains one trigger at a time.
+func (q *Queries) ClaimTriggerRecords(ctx context.Context, db DBTX, arg ClaimTriggerRecordsParams) ([]TriggerRecord, error) {
+	rows, err := db.Query(ctx, claimTriggerRecords, arg.TriggerID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TriggerRecord{}
+	for rows.Next() {
+		var i TriggerRecord
+		if err := rows.Scan(
+			&i.ID,
+			&i.TriggerID,
+			&i.ItemIdentifier,
+			&i.Payload,
+			&i.Headers,
+			&i.Metadata,
+			&i.State,
+			&i.Attempts,
+			&i.NextFireAt,
+			&i.ReceivedAt,
+			&i.LastError,
+			&i.LastDispatchedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countDeployedApps = `-- name: CountDeployedApps :one
 select count(*) from apps where account_id = $1 and status in ('active', 'evicted_cold')
 `
 
 func (q *Queries) CountDeployedApps(ctx context.Context, db DBTX, accountID pgtype.UUID) (int64, error) {
 	row := db.QueryRow(ctx, countDeployedApps, accountID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countTriggersByAccount = `-- name: CountTriggersByAccount :one
+select count(*) from triggers t
+join apps a on a.id = t.app_id
+where a.account_id = $1 and a.status <> 'deleted'
+`
+
+func (q *Queries) CountTriggersByAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) (int64, error) {
+	row := db.QueryRow(ctx, countTriggersByAccount, accountID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countTriggersByApp = `-- name: CountTriggersByApp :one
+select count(*) from triggers where app_id = $1
+`
+
+func (q *Queries) CountTriggersByApp(ctx context.Context, db DBTX, appID pgtype.UUID) (int64, error) {
+	row := db.QueryRow(ctx, countTriggersByApp, appID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -935,6 +1015,79 @@ func (q *Queries) CreateSession(ctx context.Context, db DBTX, arg CreateSessionP
 	return i, err
 }
 
+const createTrigger = `-- name: CreateTrigger :one
+
+insert into triggers (account_id, app_id, kind, slug, enabled, config,
+                       batch_size_max, batch_window_ms, max_attempts,
+                       cron_id, source)
+values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+returning id, account_id, app_id, kind, slug, enabled, config,
+          batch_size_max, batch_window_ms, max_attempts,
+          cron_id, source, created_at, updated_at
+`
+
+type CreateTriggerParams struct {
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	Kind          string
+	Slug          string
+	Enabled       bool
+	Column6       []byte
+	BatchSizeMax  int32
+	BatchWindowMs int32
+	MaxAttempts   int32
+	CronID        pgtype.UUID
+	Source        pgtype.Text
+}
+
+// Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
+// Mirrors the cron `CreateCron` / `UpdateCron` / `DeleteCron` /
+// `CronByID` / `ListCronsForApp` shape so the apid handler can stay
+// symmetric with the existing cron surface. The dispatch tick
+// (pkg/sched/dispatch_triggers.go, commit #14) writes
+// ClaimTriggerRecords / MarkTriggerRecordSucceeded /
+// MarkTriggerRecordRetry / MarkTriggerRecordDeadLetter, which the
+// schedd uses under FOR UPDATE SKIP LOCKED to drain batches
+// concurrently.
+//
+// The FOR UPDATE SKIP LOCKED on ClaimTriggerRecords mirrors the
+// precedent set by ADR-099 PR-C's claim_job_tasks query (issue
+// tracker 'job-task pull'): concurrent schedd replicas each claim
+// disjoint row sets with no advisory-lock plumbing.
+func (q *Queries) CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerParams) (Trigger, error) {
+	row := db.QueryRow(ctx, createTrigger,
+		arg.AccountID,
+		arg.AppID,
+		arg.Kind,
+		arg.Slug,
+		arg.Enabled,
+		arg.Column6,
+		arg.BatchSizeMax,
+		arg.BatchWindowMs,
+		arg.MaxAttempts,
+		arg.CronID,
+		arg.Source,
+	)
+	var i Trigger
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AppID,
+		&i.Kind,
+		&i.Slug,
+		&i.Enabled,
+		&i.Config,
+		&i.BatchSizeMax,
+		&i.BatchWindowMs,
+		&i.MaxAttempts,
+		&i.CronID,
+		&i.Source,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const cronByID = `-- name: CronByID :one
 select id, app_id, schedule, path, enabled, created_at
 from crons where id = $1
@@ -1126,6 +1279,20 @@ DELETE FROM data_upstreams WHERE id = $1
 // apps → data_upstreams).
 func (q *Queries) DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error {
 	_, err := db.Exec(ctx, deleteDataUpstreamByID, id)
+	return err
+}
+
+const deleteTrigger = `-- name: DeleteTrigger :exec
+delete from triggers where id = $1 and app_id = $2
+`
+
+type DeleteTriggerParams struct {
+	ID    pgtype.UUID
+	AppID pgtype.UUID
+}
+
+func (q *Queries) DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error {
+	_, err := db.Exec(ctx, deleteTrigger, arg.ID, arg.AppID)
 	return err
 }
 
@@ -1663,6 +1830,37 @@ func (q *Queries) InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg Inse
 		arg.Ok,
 		arg.ErrorClass,
 		arg.ProbeNode,
+	)
+	return err
+}
+
+const insertTriggerDeadLetter = `-- name: InsertTriggerDeadLetter :exec
+insert into trigger_dead_letter (record_id, trigger_id, reason, routed_to, detail)
+values ($1, $2, $3, $4, $5::jsonb)
+`
+
+type InsertTriggerDeadLetterParams struct {
+	RecordID  pgtype.UUID
+	TriggerID pgtype.UUID
+	Reason    string
+	RoutedTo  string
+	Column5   []byte
+}
+
+// One row per dead-lettered record. The reason is the closed-vocab
+// failure mode (rate_limited, poison_record, max_attempts,
+// broker_error, plan_quota, payload_too_large, customer_disabled);
+// the routed_to is the closed-vocab terminal action (drop,
+// manual_retry, customer_dlq). detail carries any per-reason payload
+// (the broker error text, the payload size that tripped the 6MB
+// cap, etc.) for the dashboard read-back.
+func (q *Queries) InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg InsertTriggerDeadLetterParams) error {
+	_, err := db.Exec(ctx, insertTriggerDeadLetter,
+		arg.RecordID,
+		arg.TriggerID,
+		arg.Reason,
+		arg.RoutedTo,
+		arg.Column5,
 	)
 	return err
 }
@@ -2635,6 +2833,52 @@ func (q *Queries) ListEnabledCrons(ctx context.Context, db DBTX) ([]ListEnabledC
 	return items, nil
 }
 
+const listEnabledTriggers = `-- name: ListEnabledTriggers :many
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, created_at, updated_at
+from triggers where enabled = true
+`
+
+// Pulled by schedd's runTriggerTick on each 1-second cadence. The
+// query is unfiltered by kind because the dispatch tick reads
+// triggers.enabled = true regardless of kind and dispatches via the
+// per-kind poller (pkg/sched/poller.go).
+func (q *Queries) ListEnabledTriggers(ctx context.Context, db DBTX) ([]Trigger, error) {
+	rows, err := db.Query(ctx, listEnabledTriggers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Trigger{}
+	for rows.Next() {
+		var i Trigger
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.AppID,
+			&i.Kind,
+			&i.Slug,
+			&i.Enabled,
+			&i.Config,
+			&i.BatchSizeMax,
+			&i.BatchWindowMs,
+			&i.MaxAttempts,
+			&i.CronID,
+			&i.Source,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEvents = `-- name: ListEvents :many
 select id, at, actor, kind, subject, data
 from events where subject = $1 order by at desc limit $2
@@ -3085,6 +3329,138 @@ func (q *Queries) ListSessions(ctx context.Context, db DBTX, accountID pgtype.UU
 	return items, nil
 }
 
+const listTriggerDeadLetter = `-- name: ListTriggerDeadLetter :many
+select record_id, trigger_id, reason, routed_to, detail, created_at
+from trigger_dead_letter
+where trigger_id = $1
+order by created_at desc
+limit $2
+`
+
+type ListTriggerDeadLetterParams struct {
+	TriggerID pgtype.UUID
+	Limit     int32
+}
+
+func (q *Queries) ListTriggerDeadLetter(ctx context.Context, db DBTX, arg ListTriggerDeadLetterParams) ([]TriggerDeadLetter, error) {
+	rows, err := db.Query(ctx, listTriggerDeadLetter, arg.TriggerID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TriggerDeadLetter{}
+	for rows.Next() {
+		var i TriggerDeadLetter
+		if err := rows.Scan(
+			&i.RecordID,
+			&i.TriggerID,
+			&i.Reason,
+			&i.RoutedTo,
+			&i.Detail,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTriggerRecordsForTrigger = `-- name: ListTriggerRecordsForTrigger :many
+select id, trigger_id, item_identifier, payload, headers, metadata,
+       state, attempts, next_fire_at, received_at, last_error,
+       last_dispatched_at
+from trigger_records
+where trigger_id = $1
+order by received_at desc
+limit $2
+`
+
+type ListTriggerRecordsForTriggerParams struct {
+	TriggerID pgtype.UUID
+	Limit     int32
+}
+
+// Used by GET /v1/triggers/{id}/records (dashboard + apid handler).
+// Returns records in dispatch-time order with the standard projection.
+func (q *Queries) ListTriggerRecordsForTrigger(ctx context.Context, db DBTX, arg ListTriggerRecordsForTriggerParams) ([]TriggerRecord, error) {
+	rows, err := db.Query(ctx, listTriggerRecordsForTrigger, arg.TriggerID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TriggerRecord{}
+	for rows.Next() {
+		var i TriggerRecord
+		if err := rows.Scan(
+			&i.ID,
+			&i.TriggerID,
+			&i.ItemIdentifier,
+			&i.Payload,
+			&i.Headers,
+			&i.Metadata,
+			&i.State,
+			&i.Attempts,
+			&i.NextFireAt,
+			&i.ReceivedAt,
+			&i.LastError,
+			&i.LastDispatchedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTriggersForApp = `-- name: ListTriggersForApp :many
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, created_at, updated_at
+from triggers where app_id = $1 order by created_at desc
+`
+
+func (q *Queries) ListTriggersForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]Trigger, error) {
+	rows, err := db.Query(ctx, listTriggersForApp, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Trigger{}
+	for rows.Next() {
+		var i Trigger
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.AppID,
+			&i.Kind,
+			&i.Slug,
+			&i.Enabled,
+			&i.Config,
+			&i.BatchSizeMax,
+			&i.BatchWindowMs,
+			&i.MaxAttempts,
+			&i.CronID,
+			&i.Source,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markDeploymentLive = `-- name: MarkDeploymentLive :exec
 update deployments set status = 'live' where id = $1
 `
@@ -3109,6 +3485,58 @@ update custom_domains set verified_at = now() where domain = $1
 
 func (q *Queries) MarkDomainVerified(ctx context.Context, db DBTX, domain interface{}) error {
 	_, err := db.Exec(ctx, markDomainVerified, domain)
+	return err
+}
+
+const markTriggerRecordDeadLetter = `-- name: MarkTriggerRecordDeadLetter :exec
+update trigger_records
+   set state = 'dead_letter',
+       attempts = attempts + 1,
+       last_error = $2,
+       last_dispatched_at = now()
+ where id = $1
+`
+
+type MarkTriggerRecordDeadLetterParams struct {
+	ID        pgtype.UUID
+	LastError pgtype.Text
+}
+
+func (q *Queries) MarkTriggerRecordDeadLetter(ctx context.Context, db DBTX, arg MarkTriggerRecordDeadLetterParams) error {
+	_, err := db.Exec(ctx, markTriggerRecordDeadLetter, arg.ID, arg.LastError)
+	return err
+}
+
+const markTriggerRecordRetry = `-- name: MarkTriggerRecordRetry :exec
+update trigger_records
+   set state = 'retry',
+       attempts = attempts + 1,
+       last_error = $2,
+       last_dispatched_at = now(),
+       next_fire_at = $3
+ where id = $1
+`
+
+type MarkTriggerRecordRetryParams struct {
+	ID         pgtype.UUID
+	LastError  pgtype.Text
+	NextFireAt pgtype.Timestamptz
+}
+
+func (q *Queries) MarkTriggerRecordRetry(ctx context.Context, db DBTX, arg MarkTriggerRecordRetryParams) error {
+	_, err := db.Exec(ctx, markTriggerRecordRetry, arg.ID, arg.LastError, arg.NextFireAt)
+	return err
+}
+
+const markTriggerRecordSucceeded = `-- name: MarkTriggerRecordSucceeded :exec
+update trigger_records
+   set state = 'succeeded',
+       last_dispatched_at = now()
+ where id = $1
+`
+
+func (q *Queries) MarkTriggerRecordSucceeded(ctx context.Context, db DBTX, id pgtype.UUID) error {
+	_, err := db.Exec(ctx, markTriggerRecordSucceeded, id)
 	return err
 }
 
@@ -3878,6 +4306,35 @@ func (q *Queries) TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, ar
 	return items, nil
 }
 
+const triggerByID = `-- name: TriggerByID :one
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, created_at, updated_at
+from triggers where id = $1
+`
+
+func (q *Queries) TriggerByID(ctx context.Context, db DBTX, id pgtype.UUID) (Trigger, error) {
+	row := db.QueryRow(ctx, triggerByID, id)
+	var i Trigger
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AppID,
+		&i.Kind,
+		&i.Slug,
+		&i.Enabled,
+		&i.Config,
+		&i.BatchSizeMax,
+		&i.BatchWindowMs,
+		&i.MaxAttempts,
+		&i.CronID,
+		&i.Source,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const updateAccountPlan = `-- name: UpdateAccountPlan :exec
 update accounts set plan = $2 where id = $1
 `
@@ -4093,6 +4550,57 @@ type UpdateOrgStatusParams struct {
 func (q *Queries) UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error {
 	_, err := db.Exec(ctx, updateOrgStatus, arg.ID, arg.Status)
 	return err
+}
+
+const updateTrigger = `-- name: UpdateTrigger :one
+update triggers set
+  enabled = coalesce($2, enabled),
+  config = coalesce($3::jsonb, config),
+  batch_size_max = coalesce($4, batch_size_max),
+  batch_window_ms = coalesce($5, batch_window_ms),
+  max_attempts = coalesce($6, max_attempts)
+where id = $1
+returning id, account_id, app_id, kind, slug, enabled, config,
+          batch_size_max, batch_window_ms, max_attempts,
+          cron_id, source, created_at, updated_at
+`
+
+type UpdateTriggerParams struct {
+	ID            pgtype.UUID
+	Enabled       bool
+	Column3       []byte
+	BatchSizeMax  int32
+	BatchWindowMs int32
+	MaxAttempts   int32
+}
+
+func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (Trigger, error) {
+	row := db.QueryRow(ctx, updateTrigger,
+		arg.ID,
+		arg.Enabled,
+		arg.Column3,
+		arg.BatchSizeMax,
+		arg.BatchWindowMs,
+		arg.MaxAttempts,
+	)
+	var i Trigger
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AppID,
+		&i.Kind,
+		&i.Slug,
+		&i.Enabled,
+		&i.Config,
+		&i.BatchSizeMax,
+		&i.BatchWindowMs,
+		&i.MaxAttempts,
+		&i.CronID,
+		&i.Source,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const upsertGithubWebhookSecret = `-- name: UpsertGithubWebhookSecret :execrows

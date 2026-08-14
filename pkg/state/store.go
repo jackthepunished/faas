@@ -184,6 +184,42 @@ func (e *CronQuotaError) Is(target error) bool {
 // ErrCronQuotaExceeded is the sentinel callers compare against via errors.Is.
 var ErrCronQuotaExceeded = errors.New("state: cron quota exceeded")
 
+// TriggerQuotaScope names the cap that CreateTriggerIfUnderQuota
+// tripped on. Mirrors CronQuotaScope so the apid handler can render
+// the same "delete one to add another" copy regardless of which
+// surface (cron / webhook / trigger) the quota came from.
+type TriggerQuotaScope string
+
+const (
+	// TriggerQuotaScopeApp is set when limits.TriggerLimitPerApp was reached.
+	TriggerQuotaScopeApp TriggerQuotaScope = "app"
+	// TriggerQuotaScopeAccount is set when limits.TriggerLimitPerAccount was reached.
+	TriggerQuotaScopeAccount TriggerQuotaScope = "account"
+)
+
+// TriggerQuotaError is returned by CreateTriggerIfUnderQuota when
+// either cap (per-app or per-account) is reached (issue #757 /
+// ADR-0NN). Distinct from CronQuotaError so the apid handler can
+// branch on the typed error and emit CodePlanTriggerQuota rather
+// than CodePlanCronQuota. errors.As recovers Scope/Limit/Observed.
+type TriggerQuotaError struct {
+	Scope    TriggerQuotaScope
+	Limit    int
+	Observed int
+}
+
+func (e *TriggerQuotaError) Error() string {
+	return fmt.Sprintf("state: trigger quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
+// Is allows errors.Is(err, ErrTriggerQuotaExceeded) to match any *TriggerQuotaError.
+func (e *TriggerQuotaError) Is(target error) bool {
+	return target == ErrTriggerQuotaExceeded
+}
+
+// ErrTriggerQuotaExceeded is the sentinel callers compare against via errors.Is.
+var ErrTriggerQuotaExceeded = errors.New("state: trigger quota exceeded")
+
 // ErrReplay is returned by CheckWebhookReplay when a webhook delivery
 // has been seen inside its dedupe window. Webhook ingresses respond
 // 200 on this error (idempotent — the upstream provider interprets
