@@ -92,6 +92,7 @@ export type { DiffEnvRow } from './DiffEnvRow.js';
 export type { DiffPayload } from './DiffPayload.js';
 export type { DiffRequest } from './DiffRequest.js';
 export type { DiffResponse } from './DiffResponse.js';
+export type { EdgeRuleBudgetAction } from './EdgeRuleBudgetAction.js';
 export type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
 export type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 export type { EdgeRuleHeaderOp } from './EdgeRuleHeaderOp.js';

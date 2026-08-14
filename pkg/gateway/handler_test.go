@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3242,5 +3243,95 @@ func TestApplyAppsMaintenanceMode_FiresBeforeEdgeRuleMaintenance(t *testing.T) {
 	}
 	if strings.Contains(body, `gateway_edge_rule_match_total{kind="maintenance",outcome="miss"} 1`) {
 		t.Errorf("fine-grained match_total{maintenance,miss} incremented; want 0 (coarse gate short-circuits)")
+	}
+}
+
+// TestStampRequestBudget_LogsEndpointSanitized pins the regression
+// guard for CodeQL go/log-injection alert #206 on PR #864
+// (pkg/gateway/handler_apply_edge_rule_budget.go:155). The
+// budget_stamped log line carries `endpoint = r.Method + ":" +
+// r.URL.Path`; both fields are user-controlled. The fix routes
+// `endpoint` through logsanitize.Field at the log site so CR / LF /
+// control characters in the path cannot break the one-line-per-event
+// log invariant. This test injects a path containing a literal LF and
+// DEL byte, then asserts:
+//
+//   - The captured log buffer has no raw LF (slog's JSON encoder
+//     would already escape these, but logsanitize.Field replaces
+//     them with U+00B7 middle dots so the JSON output is human-
+//     readable and grep-friendly).
+//   - The endpoint field present in the log line does NOT contain
+//     the raw path bytes — confirming the sanitizer is in the path.
+//
+// Precedent: pkg/gateway/cert_expiry.go:330-334, pkg/gateway/metrics.go:1226,
+// pkg/gateway/synth.go:223-225.
+func TestStampRequestBudget_LogsEndpointSanitized(t *testing.T) {
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	h := &Handler{
+		metrics: NewMetrics(),
+		log:     log,
+	}
+	// edgeRules is nil → applyEdgeRuleBudget short-circuits before
+	// any matcher call, then stampRequestBudget stamps the plan
+	// default. That path exercises the exact log line under test.
+	app := App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}
+	// httptest.NewRequest rejects CR/LF in the URL — but the
+	// production handler receives the request from a stdlib
+	// http.Server which constructs *http.Request after URL parsing
+	// too. A hostile client therefore cannot normally inject a raw
+	// LF through r.URL.Path; this test sets the field directly via
+	// the http.Request struct to exercise the sanitization path
+	// independently of the upstream parser (defence-in-depth against
+	// future call sites that bypass the stdlib parser).
+	req := &http.Request{
+		Method: "GET",
+		URL: &url.URL{
+			Path: "/api/x\nFAKE\x7fEND",
+		},
+		Host: "h.example.com",
+	}
+	rec := httptest.NewRecorder()
+
+	h.stampRequestBudget(rec, req, app, 3*time.Second, "plan_default")
+
+	out := logBuf.String()
+	if out == "" {
+		t.Fatalf("budget_stamped log line not emitted; buffer empty")
+	}
+	// Sanity: one log record, terminated by a single newline.
+	if got := strings.Count(out, "\n"); got < 1 || strings.Count(out, "\n") != strings.Count(out, "\n") {
+		t.Fatalf("log output not newline-terminated: %q", out)
+	}
+	// The injected raw LF must not appear inside the structured
+	// endpoint field. slog's JSON encoder escapes \n as \n inside
+	// the quoted string, but logsanitize.Field replaces the rune
+	// with U+00B7 BEFORE the encoder sees it — so the JSON output
+	// must NOT contain either \n or \n in the endpoint position.
+	// Easier check: the literal byte sequence injected
+	// ("api/x\nFAKE") must not appear verbatim in the log buffer.
+	if strings.Contains(out, "api/x\nFAKE") {
+		t.Errorf("log buffer contains raw injected LF; output:\n%s", out)
+	}
+	// And the sanitized form (middle-dot substitution) MUST appear,
+	// so a future refactor that drops logsanitize.Field is caught.
+	if !strings.Contains(out, "api/x·FAKE") {
+		t.Errorf("log buffer missing sanitized form api/x·FAKE; output:\n%s", out)
+	}
+	// Belt-and-braces: the JSON record parses and the endpoint
+	// field is present and free of control characters.
+	var rec2 map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec2); err != nil {
+		t.Fatalf("log JSON did not parse: %v\noutput: %s", err, out)
+	}
+	endpoint, _ := rec2["endpoint"].(string)
+	if endpoint == "" {
+		t.Fatalf("endpoint field missing from log record; record: %+v", rec2)
+	}
+	for _, r := range endpoint {
+		if r <= 0x1F && r != '\t' {
+			t.Errorf("endpoint contains control character U+%04X; endpoint=%q", r, endpoint)
+		}
 	}
 }

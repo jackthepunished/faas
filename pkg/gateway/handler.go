@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/geoip"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -1747,6 +1748,16 @@ func (h *Handler) jwtEmit(ctx context.Context, kind, outcome, ruleID, fromHost s
 // deadline (server ReadTimeout / client cancellation) so the
 // tighter of the two wins.
 //
+// ADR-093 / PR-C: when the inbound request carries an end-to-end
+// budget (installed at the gatewayd-public edge), the JWT verify
+// hop becomes a child of that budget via reqbudget.WithCeiling.
+// childDeadline = min(parentRemaining, EdgeRuleJWTVerifyTimeoutDefault)
+// — the 5 s ceiling is unchanged; the budget can only tighten the
+// cap. When no Budget is attached to ctx (admin / apid path that
+// doesn't run through the edge middleware), the legacy
+// context.WithTimeout ceiling is preserved so the JWT verify hop's
+// hard 5 s safety cap cannot regress on the non-edge path.
+//
 // Returns the verifier's typed error verbatim — applyEdgeRuleJWT
 // maps it into a 401 + edge_rule.jwt_failed audit + match counter
 // increment. A deadline-exceeded error from context.WithTimeout
@@ -1757,6 +1768,13 @@ func (h *Handler) jwtEmit(ctx context.Context, kind, outcome, ruleID, fromHost s
 func (h *Handler) verifyJWTWithDeadline(ctx context.Context, raw string, rule *EdgeRuleJWTResolved) (*JWTClaims, error) {
 	if h.jwtVerifier == nil {
 		return nil, errors.New("jwt verifier not configured")
+	}
+	// PR-C: budget-aware ceiling when a budget is attached; legacy
+	// 5 s WithTimeout when not (see doc comment).
+	if b, ok := reqbudget.FromContext(ctx); ok {
+		jwtCtx, cancel, _ := b.WithCeiling(ctx, api.EdgeRuleJWTVerifyTimeoutDefault)
+		defer cancel()
+		return h.jwtVerifier.Verify(jwtCtx, raw, rule)
 	}
 	ctx, cancel := context.WithTimeout(ctx, api.EdgeRuleJWTVerifyTimeoutDefault)
 	defer cancel()
@@ -3796,6 +3814,19 @@ haveApp:
 		return
 	}
 
+	// ADR-093: stamp the per-request wall-clock budget onto
+	// r.Context() via reqbudget.WithRemaining. Runs AFTER the
+	// validate applier (which needs the inbound body read) and
+	// BEFORE the wake gate (so a slow upstream never pins
+	// listener / goroutine / socket resources for the full
+	// platform WriteTimeout — deadline fires at the budget
+	// boundary and the handler chain unwinds). The middleware
+	// observes the deadline fire and writes 504 + RFC 7807
+	// `code: request_budget_exceeded`; this applier never
+	// short-circuits (it always stamps a budget, even on
+	// miss — the plan-level default applies).
+	h.applyEdgeRuleBudget(w, r, app)
+
 	// Issue #560 / per-deployment require_authn. Runs AFTER
 	// Host→app resolution (so we know which app's
 	// require_authn to consult) and BEFORE the per-account
@@ -4025,6 +4056,19 @@ haveApp:
 		!isUpgradeRequest(r)
 	if streaming {
 		writeTimeout := app.Plan.ResponseWriteTimeout()
+		// ADR-093 / PR-C: clamp the per-flush writeTimeout to the
+		// inbound budget's remaining time when one is attached.
+		// The flush loop re-installs the deadline on every flush
+		// (statusRecorder.installFlushHook), so capping the
+		// initial value caps the entire session's wall-clock
+		// budget. The plan's ResponseWriteTimeout is the absolute
+		// ceiling — the budget can only shorten it. When no
+		// Budget is on ctx the per-flush deadline is unchanged.
+		if b, ok := reqbudget.FromContext(r.Context()); ok { //nolint:contextcheck // request ctx at handler boundary; budget lookup is a reader (ctx.Value equivalent).
+			if rem := b.Remaining(time.Time{}); rem > 0 && rem < writeTimeout {
+				writeTimeout = rem
+			}
+		}
 		w = h.setupStreamingWriter(w, rec, app, target, writeTimeout)
 		// Internal header stamp (PR-B + PR-C / ADR-047). The
 		// forwarder (pkg/gateway/forwardproxy.go) reads this to

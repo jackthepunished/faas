@@ -4479,6 +4479,101 @@ func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Proble
 	return nil
 }
 
+// EdgeRuleBudgetAction is the wire shape for a kind=budget edge rule
+// (ADR-093 §Decision). The per-request wall-clock budget primitive:
+// a customer pins a hard wall-clock deadline on `POST /payment` →
+// 3 s the same way they already pin JWT / IP / geo edge rules. The
+// platform then propagates the remaining time to every downstream
+// hop (DB, gRPC, outbound HTTP) and surfaces deadline fire as 504 +
+// RFC 7807 `code: request_budget_exceeded`.
+//
+// Field-by-field:
+//
+//   - BudgetMs: required per-request budget in milliseconds. Must
+//     be > 0 and ≤ api.RequestBudgetMaxMs (30 s). 0 is rejected
+//     with 422 — a kind=budget rule with no budget is a silent
+//     no-op, worst shape for a safety feature. The hard upper bound
+//     matches api.RequestBudgetMaxMs so a kind=budget rule can
+//     never widen past the platform ceiling; if a customer wants a
+//     longer per-route budget they're mis-using this primitive
+//     (api.RequestBudgetMax is the absolute ceiling).
+//   - AllowOverrideHeader: optional HTTP header name (default
+//     `x-faas-budget-ms`) whose numeric value, if present on the
+//     inbound request, overrides BudgetMs for that single request.
+//     A runtime per-customer-tunable knob layered on top of the
+//     static rule. Header name must be 1..128 chars matching
+//     `^[A-Za-z][A-Za-z0-9-]*$` (RFC 7230 token shape) — empty
+//     is allowed (the runtime then uses the default
+//     `x-faas-budget-ms`). An absent or unparseable header falls
+//     through to BudgetMs unchanged.
+//
+// The runtime is `pkg/reqbudget`. The matched rule's BudgetMs
+// stamps the inbound ctx via `reqbudget.WithRemaining`; every
+// downstream hop wraps via `reqbudget.WithOverhead` / `WithCeiling`.
+// The hot-path applier is
+// pkg/gateway.(*Handler).applyEdgeRuleBudget (§4.1.2.8d).
+type EdgeRuleBudgetAction struct {
+	BudgetMs            int    `json:"budget_ms"`
+	AllowOverrideHeader string `json:"allow_override_header,omitempty"`
+}
+
+func (a *EdgeRuleBudgetAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("budget action is required")
+	}
+	if a.BudgetMs <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"budget action: budget_ms must be > 0 (got %d) — a kind=budget rule with no budget is a silent no-op; drop the rule if you want the platform default to apply",
+			a.BudgetMs))
+	}
+	if a.BudgetMs > int(RequestBudgetMax.Milliseconds()) {
+		return ErrValidation(fmt.Sprintf(
+			"budget action: budget_ms (%d) exceeds the platform ceiling (%d ms = %s)",
+			a.BudgetMs, int(RequestBudgetMax.Milliseconds()), RequestBudgetMax))
+	}
+	if a.AllowOverrideHeader != "" {
+		if len(a.AllowOverrideHeader) > 128 {
+			return ErrValidation(fmt.Sprintf(
+				"budget action: allow_override_header must be 1..128 chars (got %d)",
+				len(a.AllowOverrideHeader)))
+		}
+		// RFC 7230 token shape — first char letter, rest
+		// letters/digits/hyphens. Reject whitespace, commas, colons,
+		// and other separator chars that would break header parsing.
+		if !isHeaderToken(a.AllowOverrideHeader) {
+			return ErrValidation(fmt.Sprintf(
+				"budget action: allow_override_header %q must match RFC 7230 token shape (^[A-Za-z][A-Za-z0-9-]*$)",
+				a.AllowOverrideHeader))
+		}
+	}
+	return nil
+}
+
+// isHeaderToken reports whether s matches the RFC 7230 token
+// production used for HTTP header names: a letter followed by
+// letters, digits, or hyphens. Used by EdgeRuleBudgetAction.Validate
+// to reject malformed header-name overrides before the gateway
+// sees them.
+func isHeaderToken(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-':
+		default:
+			return false
+		}
+		if i == 0 && (r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // EdgeRuleResponse is the wire shape for an edge rule. Action is
 // kept as json.RawMessage so the generated Node/Python SDKs don't
 // need seven per-kind models today; a typed SDK unmarshals into
