@@ -15661,7 +15661,7 @@ func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff t
 // or already deleted. The cron kind routes through the existing
 // CreateCronIfUnderQuota path because cron needs the crons row + the
 // schedule+path cron-specific schema.
-func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID pgtype.UUID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts int32, limits api.Limits) (sqlc.Trigger, error) {
+func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts int32, limits api.Limits) (sqlc.Trigger, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return sqlc.Trigger{}, fmt.Errorf("state: begin tx: %w", err)
@@ -15754,8 +15754,8 @@ func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID pgtype.UU
 
 // TriggerByID returns the trigger with the given ID. Returns
 // ErrNotFound when the row is gone.
-func (s *PgStore) TriggerByID(ctx context.Context, id pgtype.UUID) (sqlc.Trigger, error) {
-	return s.triggerQueries().TriggerByID(ctx, s.pool, id)
+func (s *PgStore) TriggerByID(ctx context.Context, id string) (sqlc.Trigger, error) {
+	return s.triggerQueries().TriggerByID(ctx, s.pool, mustPgUUID(id))
 }
 
 // UpdateTrigger patches the mutable fields (enabled, config,
@@ -15775,7 +15775,7 @@ func (s *PgStore) TriggerByID(ctx context.Context, id pgtype.UUID) (sqlc.Trigger
 // safety — net-positive because the alternative would force the
 // handler to send "current values" for unset fields and break the
 // JSON `omitempty` round-trip.
-func (s *PgStore) UpdateTrigger(ctx context.Context, id pgtype.UUID, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts *int32) (sqlc.Trigger, error) {
+func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts *int32) (sqlc.Trigger, error) {
 	var enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg any
 	if enabled != nil {
 		enabledArg = *enabled
@@ -15821,13 +15821,13 @@ func (s *PgStore) UpdateTrigger(ctx context.Context, id pgtype.UUID, enabled *bo
 // app_id it loaded; the WHERE id=$1 AND app_id=$2 clause refuses to
 // delete a trigger that doesn't belong to the requested app
 // (cross-app tenant bypass defence).
-func (s *PgStore) DeleteTrigger(ctx context.Context, id, appID pgtype.UUID) error {
-	return s.triggerQueries().DeleteTrigger(ctx, s.pool, sqlc.DeleteTriggerParams{ID: id, AppID: appID})
+func (s *PgStore) DeleteTrigger(ctx context.Context, id, appID string) error {
+	return s.triggerQueries().DeleteTrigger(ctx, s.pool, sqlc.DeleteTriggerParams{ID: mustPgUUID(id), AppID: mustPgUUID(appID)})
 }
 
 // ListTriggersForApp is the dashboard read-back (GET /v1/triggers).
-func (s *PgStore) ListTriggersForApp(ctx context.Context, appID pgtype.UUID) ([]sqlc.Trigger, error) {
-	return s.triggerQueries().ListTriggersForApp(ctx, s.pool, appID)
+func (s *PgStore) ListTriggersForApp(ctx context.Context, appID string) ([]sqlc.Trigger, error) {
+	return s.triggerQueries().ListTriggersForApp(ctx, s.pool, mustPgUUID(appID))
 }
 
 // ListEnabledTriggers is the schedd-side read on each 1-second
@@ -15841,23 +15841,23 @@ func (s *PgStore) ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, erro
 // pending/retry queue. FOR UPDATE SKIP LOCKED (set in queries.sql)
 // lets concurrent schedd replicas each claim disjoint row sets —
 // ADR-099 PR-C precedent for claim_job_tasks.
-func (s *PgStore) ClaimTriggerRecords(ctx context.Context, triggerID pgtype.UUID, limit int32) ([]sqlc.TriggerRecord, error) {
-	return s.triggerQueries().ClaimTriggerRecords(ctx, s.pool, sqlc.ClaimTriggerRecordsParams{TriggerID: triggerID, Limit: limit})
+func (s *PgStore) ClaimTriggerRecords(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	return s.triggerQueries().ClaimTriggerRecords(ctx, s.pool, sqlc.ClaimTriggerRecordsParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
 }
 
 // MarkTriggerRecordSucceeded transitions a claimed record to the
 // succeeded state. Called from the dispatch tick after the runner
 // envelope returns 2xx with no ReportBatchItemFailures entry for
 // this item_identifier.
-func (s *PgStore) MarkTriggerRecordSucceeded(ctx context.Context, id pgtype.UUID) error {
-	return s.triggerQueries().MarkTriggerRecordSucceeded(ctx, s.pool, id)
+func (s *PgStore) MarkTriggerRecordSucceeded(ctx context.Context, id string) error {
+	return s.triggerQueries().MarkTriggerRecordSucceeded(ctx, s.pool, mustPgUUID(id))
 }
 
 // MarkTriggerRecordRetry schedules a retry with exponential
 // backoff. The dispatch tick calls this with attempts < max_attempts.
-func (s *PgStore) MarkTriggerRecordRetry(ctx context.Context, id pgtype.UUID, lastError string, nextFireAt time.Time) error {
+func (s *PgStore) MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error {
 	return s.triggerQueries().MarkTriggerRecordRetry(ctx, s.pool, sqlc.MarkTriggerRecordRetryParams{
-		ID:         id,
+		ID:         mustPgUUID(id),
 		LastError:  pgtype.Text{String: lastError, Valid: lastError != ""},
 		NextFireAt: pgtypeFromTime(nextFireAt),
 	})
@@ -15868,9 +15868,9 @@ func (s *PgStore) MarkTriggerRecordRetry(ctx context.Context, id pgtype.UUID, la
 // batchItemFailures entry AND attempts >= max_attempts OR the
 // record carries a poison_record signature (malformed response
 // JSON, missing item_identifier, etc.).
-func (s *PgStore) MarkTriggerRecordDeadLetter(ctx context.Context, id pgtype.UUID, lastError string) error {
+func (s *PgStore) MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error {
 	return s.triggerQueries().MarkTriggerRecordDeadLetter(ctx, s.pool, sqlc.MarkTriggerRecordDeadLetterParams{
-		ID:        id,
+		ID:        mustPgUUID(id),
 		LastError: pgtype.Text{String: lastError, Valid: lastError != ""},
 	})
 }
@@ -15879,7 +15879,7 @@ func (s *PgStore) MarkTriggerRecordDeadLetter(ctx context.Context, id pgtype.UUI
 // row that pairs with a dead-lettered record. detail carries any
 // per-reason payload (broker error text, payload size that tripped
 // the 6MB cap, etc.) for the dashboard read-back.
-func (s *PgStore) InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID pgtype.UUID, reason, routedTo string, detail []byte) error {
+func (s *PgStore) InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID, reason, routedTo string, detail []byte) error {
 	var detailArg any = []byte("{}")
 	if detail != nil {
 		detailArg = detail
@@ -15893,14 +15893,14 @@ func (s *PgStore) InsertTriggerDeadLetter(ctx context.Context, recordID, trigger
 
 // ListTriggerDeadLetter reads the per-trigger DLQ rows for the
 // dashboard + GET /v1/triggers/{id}/metrics?include_dlq=true.
-func (s *PgStore) ListTriggerDeadLetter(ctx context.Context, triggerID pgtype.UUID, limit int32) ([]sqlc.TriggerDeadLetter, error) {
-	return s.triggerQueries().ListTriggerDeadLetter(ctx, s.pool, sqlc.ListTriggerDeadLetterParams{TriggerID: triggerID, Limit: limit})
+func (s *PgStore) ListTriggerDeadLetter(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerDeadLetter, error) {
+	return s.triggerQueries().ListTriggerDeadLetter(ctx, s.pool, sqlc.ListTriggerDeadLetterParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
 }
 
 // ListTriggerRecordsForTrigger reads the records for a trigger in
 // dispatch-time order. Used by GET /v1/triggers/{id}/records.
-func (s *PgStore) ListTriggerRecordsForTrigger(ctx context.Context, triggerID pgtype.UUID, limit int32) ([]sqlc.TriggerRecord, error) {
-	return s.triggerQueries().ListTriggerRecordsForTrigger(ctx, s.pool, sqlc.ListTriggerRecordsForTriggerParams{TriggerID: triggerID, Limit: limit})
+func (s *PgStore) ListTriggerRecordsForTrigger(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	return s.triggerQueries().ListTriggerRecordsForTrigger(ctx, s.pool, sqlc.ListTriggerRecordsForTriggerParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
 }
 
 // triggerQueries returns a fresh sqlc.Queries for the trigger table.
@@ -15910,3 +15910,77 @@ func (s *PgStore) ListTriggerRecordsForTrigger(ctx context.Context, triggerID pg
 // hazard if PgStore ever pools across multiple DB connections in a
 // future scale-out.
 func (s *PgStore) triggerQueries() *sqlc.Queries { return sqlc.New() }
+
+// parsePgUUID decodes a hyphenated hex string UUID into pgtype.UUID.
+// Used at the seam between the Store interface (string-typed) and
+// the typed sqlc.Params structs (pgtype.UUID) for every trigger
+// store method.
+func parsePgUUID(s string) (pgtype.UUID, error) {
+	uid, err := uuid.Parse(s)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("state: invalid uuid %q: %w", s, err)
+	}
+	var p pgtype.UUID
+	copy(p.Bytes[:], uid[:])
+	p.Valid = true
+	return p, nil
+}
+
+// mustPgUUID is the same as parsePgUUID but elides the error — used
+// when the caller has already validated the input upstream (the
+// apid handler's parseTriggerID rejects malformed UUIDs at the HTTP
+// boundary). On a malformed input here the row simply doesn't exist
+// (we bind the zero uuid, which never matches), so callers see a
+// natural "not found" rather than a 500.
+func mustPgUUID(s string) pgtype.UUID {
+	p, err := parsePgUUID(s)
+	if err != nil {
+		return pgtype.UUID{}
+	}
+	return p
+}
+
+// RetryTriggerRecordByOperator (issue #757 / ADR-0NN, commit #6)
+// resets a record's state to 'pending' with attempts=0, last_error
+// cleared, and next_fire_at=NOW(). Distinct from
+// MarkTriggerRecordRetry (which the dispatcher uses with
+// exp-backoff): the operator verb has no exp-backoff and no
+// last_error carry-over — the operator is signalling "re-drive this
+// record from clean". Returns state.ErrNotFound when the row does
+// not exist so the handler can emit a 404.
+func (s *PgStore) RetryTriggerRecordByOperator(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update trigger_records
+		   set state = 'pending',
+		       attempts = 0,
+		       last_error = null,
+		       next_fire_at = now()
+		 where id = $1`,
+		id)
+	if err != nil {
+		return fmt.Errorf("state: retry trigger_record %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DropTriggerRecordByOperator (issue #757 / ADR-0NN, commit #6)
+// deletes the record outright — an operator verb for "this row
+// should not be retried". Distinct from the dead_letter transition
+// (which preserves history); this verb preserves no DLQ row. The
+// record's parent trigger is untouched; this is a record-level
+// operation only.
+func (s *PgStore) DropTriggerRecordByOperator(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from trigger_records where id = $1`,
+		id)
+	if err != nil {
+		return fmt.Errorf("state: drop trigger_record %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

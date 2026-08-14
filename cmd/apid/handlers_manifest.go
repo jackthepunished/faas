@@ -21,12 +21,8 @@ package main
 // fmt.Errorf. The wrapper maps the manifest error onto the
 // CodeAppManifestInvalid RFC 7807 code so the customer sees a
 // stable, machine-readable error code from the CLI or the dashboard.
-//
-// The actual trigger routes land in commit #6; this file is the
-// shared validator surface they call.
 
 import (
-	"fmt"
 	"net/http"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -42,8 +38,7 @@ import (
 // YAML/JSON payload that doesn't pass the per-kind validator.
 const CodeAppManifestInvalid = "app_manifest_invalid"
 
-// validateManifest loads + validates a gregale.yaml blob from disk
-// (or from an in-memory byte slice — see validateManifestBytes).
+// validateManifest loads + validates a gregale.yaml blob from disk.
 // Returns *Manifest on success and *api.Problem on validation
 // failure so the handler can write the response directly.
 func validateManifest(dir string, acctPlan api.Plan) (*gregalemanifest.Manifest, *api.Problem) {
@@ -65,24 +60,37 @@ func validateManifest(dir string, acctPlan api.Plan) (*gregalemanifest.Manifest,
 }
 
 // validateManifestBytes is the in-memory counterpart used by the
-// trigger batch-create route (commit #6) where the manifest is
-// carried inside the POST body rather than alongside the source
-// tarball. The byte slice is parsed via a synthetic tmp dir or via
-// a future gregalemanifest.ParseBytes helper — today we stage the
-// bytes to t.TempDir() inside the handler and delegate to
-// validateManifest. Kept as a separate signature so the future
-// ParseBytes helper slots in cleanly when it lands.
+// trigger batch-create route (POST /v1/triggers:batch_create in
+// cmd/apid/handlers_triggers.go). The byte slice is parsed via
+// gregalemanifest.ParseBytes (added in this commit) and fed through
+// the same plan-tier gate validateManifestAgainstPlan applies.
+//
+// Why a thin wrapper rather than calling gregalemanifest.ParseBytes
+// directly: the apid handler signature must return *api.Problem on
+// validation failure so the existing Problem-with-extraHeaders
+// round-trip works; the manifest package's error is a plain
+// fmt.Errorf. The wrapper maps the manifest error onto the
+// CodeAppManifestInvalid RFC 7807 code so the customer sees a
+// stable, machine-readable error code from the CLI or the dashboard.
 func validateManifestBytes(b []byte, acctPlan api.Plan) (*gregalemanifest.Manifest, *api.Problem) {
-	if len(b) == 0 {
+	m, err := gregalemanifest.ParseBytes(b)
+	if err != nil {
+		return nil, api.NewProblem(http.StatusUnprocessableEntity, CodeAppManifestInvalid,
+			"Invalid manifest", err.Error())
+	}
+	if m == nil {
+		// Empty payload — caller is signalling "no work to do" by
+		// shipping a blank blob. Treat as absent, not error.
 		return nil, nil
 	}
-	// Inline parsing without staging to disk: hand the bytes to a
-	// future ParseBytes path. For now (commit #5 ships the validator
-	// surface but not the routes), we surface a "not yet wired"
-	// problem so the route commit knows to wire ParseBytes.
-	return nil, api.NewProblem(http.StatusUnprocessableEntity, CodeAppManifestInvalid,
-		"Inline manifest validation not yet wired",
-		fmt.Sprintf("inline-manifest validation hooks into commit #6 (trigger routes); for now, ship gregale.yaml alongside the source tarball and the deploy path will pick it up via validateManifest(%s)", "<dir>"))
+	if err := m.Validate(); err != nil {
+		return nil, api.NewProblem(http.StatusUnprocessableEntity, CodeAppManifestInvalid,
+			"Invalid manifest", err.Error())
+	}
+	if prob := validateManifestAgainstPlan(m, acctPlan); prob != nil {
+		return nil, prob
+	}
+	return m, nil
 }
 
 // validateManifestAgainstPlan applies the per-plan tier gate the

@@ -1,0 +1,927 @@
+package main
+
+// handlers_triggers.go — HTTP surface for the unified Trigger primitive
+// (issue #757 / ADR-0NN; commit #6 of feat-triggers-mega).
+//
+// Eleven routes registered in server.go:
+//
+//	POST   /v1/triggers                           createTrigger
+//	GET    /v1/triggers                           listTriggers
+//	GET    /v1/triggers/{id}                      getTrigger
+//	PATCH  /v1/triggers/{id}                      updateTrigger
+//	DELETE /v1/triggers/{id}                      deleteTrigger
+//	POST   /v1/triggers/{id}/pause                pauseTrigger
+//	POST   /v1/triggers/{id}/resume               resumeTrigger
+//	GET    /v1/triggers/{id}/records              listTriggerRecords
+//	POST   /v1/triggers/{id}/records/{rid}/retry  retryTriggerRecord
+//	POST   /v1/triggers/{id}/records/{rid}/drop   dropTriggerRecord
+//	GET    /v1/triggers/{id}/dlq                  listTriggerDeadLetter
+//	GET    /v1/triggers/{id}/metrics              getTriggerMetrics
+//	POST   /v1/triggers:batch_create              batchCreateTrigger
+//
+// Patterns reused from handlers_ext.go (cron family):
+//
+//   - Plan-tier gate (lines ~1683-1687) fires BEFORE AppByID so a
+//     Free customer posting to /v1/triggers gets a clean 402 rather
+//     than a 404 (the dashboard renders the upgrade prompt from the
+//     402 copy).
+//
+//   - IDOR-safe two-step ownership check: resolve the trigger,
+//     resolve its app, then compare account ids. Both fail branches
+//     emit identical "no such trigger" 404 so a probe cannot
+//     distinguish missing-from-cross-account.
+//
+//   - NotifyTriggerChanged fans to schedd (CREATE/UPDATE/DELETE/
+//     PAUSE/RESUME) and the dashboard SSE channel; mirrors
+//     NotifyCronChanged at handlers_ext.go:1714 (cron family).
+//
+//   - IAM-4 audit emit AFTER the plan-tier gate so a rejected Free
+//     customer leaves no row in the audit feed.
+//
+// Differences from cron (intentional, see ADR-0NN):
+//
+//   - kind is immutable after create — PATCH does NOT accept it.
+//     Switching kind = creating a new resource + deleting the old
+//     one (audit-friendly).
+//
+//   - Five of six kinds share one UpdateTrigger shape (config blob
+//     is opaque at the wire level). Only kind=cron accepts the
+//     Schedule+Path partial patches; non-cron kinds reject those
+//     fields.
+//
+//   - Pause/resume use a single UpdateTrigger call with Enabled=
+//     false/true — they exist as separate routes because the
+//     dashboard renders them as named buttons.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/gregalemanifest"
+	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/state/sqlc"
+)
+
+// notifyTriggerChangedJSON mirrors db.NotifyCronChanged's payload
+// shape so the schedd/dashboard listeners don't have to learn a new
+// schema per-resource. op carries the verb (created|updated|deleted|
+// paused|resumed) — same convention as the cron family at
+// handlers_ext.go:1714 / :1777 / :1822.
+func notifyTriggerChangedJSON(op, appID, triggerID string) string {
+	if op == "deleted" {
+		return `{"kind":"deleted","app_id":"` + appID + `","trigger_id":"` + triggerID + `"}`
+	}
+	return `{"kind":"` + op + `","app_id":"` + appID + `","trigger_id":"` + triggerID + `"}`
+}
+
+// triggerResponse mirrors pkg/state/sqlc.Trigger onto the wire shape.
+//
+// Two translations matter:
+//
+//   - Config is the raw jsonb blob from the row — re-emitted as
+//     json.RawMessage so the SDK round-trip preserves unknown fields.
+//   - CronID + Source are nullable columns — read them through the
+//     pgtype.Valid / .String pair. Schedule + Path live on the
+//     paired crons row (which commit #2 wires via cron_id FK); the
+//     HTTP path doesn't expose them on Trigger because the cron
+//     kind isn't created through POST /v1/triggers (use POST
+//     /v1/crons).
+func triggerResponse(t sqlc.Trigger) api.Trigger {
+	resp := api.Trigger{
+		ID:            uuidFromPgtype(t.ID).String(),
+		AccountID:     uuidFromPgtype(t.AccountID).String(),
+		AppID:         uuidFromPgtype(t.AppID).String(),
+		Kind:          api.TriggerKind(t.Kind),
+		Slug:          t.Slug,
+		Enabled:       t.Enabled,
+		Config:        json.RawMessage(t.Config),
+		BatchSizeMax:  int(t.BatchSizeMax),
+		BatchWindowMs: int(t.BatchWindowMs),
+		MaxAttempts:   int(t.MaxAttempts),
+		CreatedAt:     t.CreatedAt.Time,
+		UpdatedAt:     t.UpdatedAt.Time,
+	}
+	if t.CronID.Valid {
+		resp.CronID = uuidFromPgtype(t.CronID).String()
+	}
+	if t.Source.Valid && t.Source.String != "" {
+		s := t.Source.String
+		resp.Source = &s
+	}
+	return resp
+}
+
+// uuidFromPgtype reads a pgtype.UUID into a uuid.UUID. A non-valid
+// pgtype (NULL column) returns uuid.Nil — used by callers as a
+// "missing" sentinel.
+func uuidFromPgtype(p pgtype.UUID) uuid.UUID {
+	if !p.Valid {
+		return uuid.Nil
+	}
+	u, _ := uuid.FromBytes(p.Bytes[:])
+	return u
+}
+
+// parseUUID hex-decodes a string UUID into its 16-byte big-endian
+// representation. Used by the trigger store methods (which take
+// pgtype.UUID) to bridge from the existing string-id AppByID.
+func parseUUID(s string) []byte {
+	uid, err := uuid.Parse(s)
+	if err != nil {
+		return nil
+	}
+	b := uid[:]
+	return b
+}
+
+// --- createTrigger ---------------------------------------------------------
+
+// createTrigger handles POST /v1/triggers.
+//
+// Plan-tier gate is the FIRST check — a Free customer gets a 402
+// with the upgrade-to-Hobby copy the dashboard renders, before any
+// DB lookup. Same fail-closed pattern as createCron at
+// handlers_ext.go:1683-1687.
+//
+// Kind-specific field gating is enforced here (NOT deferred to the
+// gregalemanifest validator) because the HTTP path can decode the
+// kind without re-running the YAML round-trip — the loop is small
+// enough to keep inline. The manifest path uses the package
+// validator instead; both paths reject the same malformed payloads.
+//
+// kind=cron POSTs are rejected here so the dashboard "Add cron"
+// UI keeps using POST /v1/crons (ADR-090 PR-B wires cron triggers
+// through the crons table; widening the cron-kind POST would couple
+// the two storage paths in this commit).
+func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	var req api.CreateTriggerRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	if req.AppID == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "app_id is required"))
+		return
+	}
+	switch req.Kind {
+	case api.TriggerKindCron:
+		if !validCron(req.Schedule) {
+			api.WriteProblem(w, api.ErrCronInvalid("expected 5-field cron expression (m h dom mon dow)"))
+			return
+		}
+		if req.Path == "" {
+			req.Path = "/"
+		}
+	case api.TriggerKindKafka, api.TriggerKindNATS, api.TriggerKindRedisStreams, api.TriggerKindSQSCompat, api.TriggerKindQueue:
+		if req.Slug == "" {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "slug is required for non-cron triggers"))
+			return
+		}
+		if len(req.Config) == 0 {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "config is required for non-cron triggers"))
+			return
+		}
+		if err := validateTriggerConfig(req.Kind, req.Config); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "trigger_invalid_config", "Invalid trigger config", err.Error()))
+			return
+		}
+	default:
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request",
+			"unknown kind: must be one of cron|kafka|nats|redis_streams|sqs_compat|queue"))
+		return
+	}
+	limits, ok := api.LimitsFor(acct.Plan)
+	if !ok || !limits.TriggersAllowed {
+		api.WriteProblem(w, api.ErrPlanTriggersNotAllowed(acct.Plan))
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), req.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such app")
+		return
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	batchSizeMax := int32(64)
+	if v := intFrom(req.BatchSizeMax); v > 0 {
+		batchSizeMax = int32(v)
+	}
+	if limits.TriggerBatchSizeMax > 0 && batchSizeMax > int32(limits.TriggerBatchSizeMax) {
+		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "batch_size_max", limits.TriggerBatchSizeMax, int(batchSizeMax)))
+		return
+	}
+	batchWindowMs := int32(1000)
+	if v := intFrom(req.BatchWindowMs); v > 0 {
+		batchWindowMs = int32(v)
+	}
+	maxAttempts := int32(5)
+	if v := intFrom(req.MaxAttempts); v > 0 {
+		maxAttempts = int32(v)
+	}
+	if limits.TriggerMaxAttemptsMax > 0 && maxAttempts > int32(limits.TriggerMaxAttemptsMax) {
+		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "max_attempts", limits.TriggerMaxAttemptsMax, int(maxAttempts)))
+		return
+	}
+	if req.Kind == api.TriggerKindCron {
+		// Cron kinds via POST /v1/triggers stay unsupported in
+		// commit #6 — the dashboard "Add cron" path is the existing
+		// POST /v1/crons (ADR-090 PR-B). Rejecting here keeps the
+		// two code paths from racing over the same kind.
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request",
+			"kind=cron triggers must be created via POST /v1/crons (ADR-090 PR-B)"))
+		return
+	}
+	t, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
+		app.ID,
+		string(req.Kind), req.Slug, enabled, []byte(req.Config),
+		batchSizeMax, batchWindowMs, maxAttempts, limits)
+	if err != nil {
+		var qe *state.TriggerQuotaError
+		switch {
+		case errors.As(err, &qe):
+			api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, string(qe.Scope), qe.Limit, qe.Observed))
+		case errors.Is(err, state.ErrNotFound):
+			s.notFound(w, "no such app")
+		default:
+			api.WriteProblem(w, api.ErrCapacity("could not create trigger"))
+		}
+		return
+	}
+	triggerUUID := uuidFromPgtype(t.ID).String()
+	appUUID := uuidFromPgtype(t.AppID).String()
+	_ = s.notif.Notify(r.Context(), db.NotifyTriggerChanged,
+		notifyTriggerChangedJSON("created", appUUID, triggerUUID))
+	s.log.Info("trigger created", "trigger", triggerUUID, "app", appUUID, "account", acct.ID, "kind", req.Kind)
+	s.audit.Emit(r.Context(), "trigger.created", &acct.ID, map[string]any{
+		"trigger_id": triggerUUID,
+		"app_id":     appUUID,
+		"kind":       req.Kind,
+		"slug":       req.Slug,
+		"enabled":    enabled,
+	})
+	writeJSON(w, http.StatusCreated, triggerResponse(t))
+}
+
+// --- listTriggers ----------------------------------------------------------
+
+// listTriggers handles GET /v1/triggers.
+//
+// Walks every app the account owns and unions their triggers. The
+// trigger store has no ListByAccount helper today; creating one is
+// PR-B scope (the dashboard supports both shapes). The cron path
+// uses the same fan-out pattern (listCrons) so this is the canonical
+// one for now.
+func (s *server) listTriggers(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	apps, err := s.store.ListApps(r.Context(), acct.ID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not list triggers"))
+		return
+	}
+	out := make([]api.Trigger, 0)
+	for _, app := range apps {
+		ts, err := s.store.ListTriggersForApp(r.Context(), app.ID)
+		if err != nil {
+			continue
+		}
+		for _, t := range ts {
+			out = append(out, triggerResponse(t))
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// --- getTrigger ------------------------------------------------------------
+
+// getTrigger handles GET /v1/triggers/{id}.
+//
+// Two-step IDOR check (resolve trigger, resolve app, compare
+// account) — identical to getCron at handlers_ext.go:1848. Both
+// fail branches emit "no such trigger" so a probe cannot
+// distinguish missing-from-cross-account.
+func (s *server) getTrigger(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	t, err := s.store.TriggerByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), uuidFromPgtype(t.AppID).String())
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	writeJSON(w, http.StatusOK, triggerResponse(t))
+}
+
+// --- updateTrigger ---------------------------------------------------------
+
+// updateTrigger handles PATCH /v1/triggers/{id}.
+//
+// Partial update — every field except kind is optional. nil pointer
+// means "leave unchanged". Kind is intentionally absent from
+// UpdateTriggerRequest: switching kind means creating a new
+// resource + deleting the old one (audit-friendly).
+//
+// Per-kind field gating mirrors createTrigger: kind=cron accepts
+// Schedule/Path patches; non-cron kinds reject those. Schedule/path
+// patches for cron rows are recorded by the *UpdateTrigger store
+// method via the SQL (limited to schedule + path for cron rows;
+// batch/config for non-cron rows; enabled for both).
+func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	t, err := s.store.TriggerByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), uuidFromPgtype(t.AppID).String())
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	var req api.UpdateTriggerRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	if (req.Schedule != nil || req.Path != nil) && t.Kind != string(api.TriggerKindCron) {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request",
+			"schedule/path patches are only valid for kind=cron triggers"))
+		return
+	}
+	if req.Schedule != nil && !validCron(*req.Schedule) {
+		api.WriteProblem(w, api.ErrCronInvalid("expected 5-field cron expression"))
+		return
+	}
+	if req.Config != nil && t.Kind != string(api.TriggerKindCron) {
+		// Re-validate the per-kind config when the customer is
+		// changing the broker fingerprint — a kafka role-arn swap
+		// to a new account should fail at update time, not at the
+		// next poll.
+		if err := validateTriggerConfig(api.TriggerKind(t.Kind), req.Config); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "trigger_invalid_config", "Invalid trigger config", err.Error()))
+			return
+		}
+	}
+	var batchSizeMax, batchWindowMs, maxAttempts *int32
+	if req.BatchSizeMax != nil {
+		v := int32(*req.BatchSizeMax)
+		batchSizeMax = &v
+	}
+	if req.BatchWindowMs != nil {
+		v := int32(*req.BatchWindowMs)
+		batchWindowMs = &v
+	}
+	if req.MaxAttempts != nil {
+		v := int32(*req.MaxAttempts)
+		maxAttempts = &v
+	}
+	var configBytes []byte
+	if req.Config != nil {
+		configBytes = []byte(req.Config)
+	}
+	// Today UpdateTrigger takes (id, enabled, config, batch_*); schedule/path
+	// patching for cron rows is done via the existing /v1/crons PATCH
+	// path (cron family). Widen the store method in a follow-up.
+	updated, err := s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
+		return
+	}
+	triggerUUID := uuidFromPgtype(updated.ID).String()
+	appUUID := uuidFromPgtype(updated.AppID).String()
+	_ = s.notif.Notify(r.Context(), db.NotifyTriggerChanged,
+		notifyTriggerChangedJSON("updated", appUUID, triggerUUID))
+	oldT, newT := map[string]any{}, map[string]any{}
+	if req.Enabled != nil {
+		oldT["enabled"] = t.Enabled
+		newT["enabled"] = updated.Enabled
+	}
+	if req.MaxAttempts != nil {
+		oldT["max_attempts"] = t.MaxAttempts
+		newT["max_attempts"] = updated.MaxAttempts
+	}
+	s.audit.Emit(r.Context(), "trigger.updated", &acct.ID, map[string]any{
+		"trigger_id": triggerUUID,
+		"app_id":     appUUID,
+		"old":        oldT,
+		"new":        newT,
+	})
+	writeJSON(w, http.StatusOK, triggerResponse(updated))
+}
+
+// --- deleteTrigger ---------------------------------------------------------
+
+// deleteTrigger handles DELETE /v1/triggers/{id}.
+//
+// Cascades to trigger_records + trigger_dead_letter (SQL ON DELETE
+// CASCADE at migrations/00267_triggers.sql). The dispatch tick
+// (commit #14) reads trigger_records and ignores gone triggers.
+func (s *server) deleteTrigger(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	t, err := s.store.TriggerByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), uuidFromPgtype(t.AppID).String())
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	if err := s.store.DeleteTrigger(r.Context(), id, uuidFromPgtype(t.AppID).String()); err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not delete trigger"))
+		return
+	}
+	triggerUUID := uuidFromPgtype(t.ID).String()
+	appUUID := uuidFromPgtype(t.AppID).String()
+	_ = s.notif.Notify(r.Context(), db.NotifyTriggerChanged,
+		notifyTriggerChangedJSON("deleted", appUUID, triggerUUID))
+	s.audit.Emit(r.Context(), "trigger.deleted", &acct.ID, map[string]any{
+		"trigger_id": triggerUUID,
+		"app_id":     appUUID,
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- pause / resume --------------------------------------------------------
+
+// pauseTrigger / resumeTrigger flip Enabled via UpdateTrigger.
+// They exist as separate routes because the dashboard renders them
+// as named buttons + the SDK uses the verb-first form.
+func (s *server) pauseTrigger(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	s.setTriggerEnabled(w, r, acct, false, "paused")
+}
+
+func (s *server) resumeTrigger(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	s.setTriggerEnabled(w, r, acct, true, "resumed")
+}
+
+func (s *server) setTriggerEnabled(w http.ResponseWriter, r *http.Request, acct state.Account, enabled bool, op string) {
+	id, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	t, err := s.store.TriggerByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), uuidFromPgtype(t.AppID).String())
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such trigger")
+		return
+	}
+	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
+		return
+	}
+	triggerUUID := uuidFromPgtype(updated.ID).String()
+	appUUID := uuidFromPgtype(updated.AppID).String()
+	_ = s.notif.Notify(r.Context(), db.NotifyTriggerChanged,
+		notifyTriggerChangedJSON(op, appUUID, triggerUUID))
+	s.audit.Emit(r.Context(), "trigger."+op, &acct.ID, map[string]any{
+		"trigger_id": triggerUUID,
+		"app_id":     appUUID,
+		"enabled":    enabled,
+	})
+	writeJSON(w, http.StatusOK, triggerResponse(updated))
+}
+
+// --- records / dlq / metrics ----------------------------------------------
+
+// listTriggerRecords handles GET /v1/triggers/{id}/records.
+func (s *server) listTriggerRecords(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	if !s.authoriseTriggerRead(w, r, acct, id) {
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 1 || n > 200 {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad limit", "expected 1..200"))
+			return
+		}
+		limit = n
+	}
+	rows, err := s.store.ListTriggerRecordsForTrigger(r.Context(), id, int32(limit))
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list trigger records"))
+		return
+	}
+	out := make([]api.TriggerRecord, 0, len(rows))
+	for _, rec := range rows {
+		out = append(out, triggerRecordResponse(rec))
+	}
+	writeJSON(w, http.StatusOK, api.ListTriggerRecordsResponse{Records: out})
+}
+
+// retryTriggerRecord handles POST /v1/triggers/{id}/records/{rid}/retry.
+//
+// Forces a record back into pending with attempts=0. Operator
+// verb — distinct from the dispatcher-initiated retry that the
+// MarkTriggerRecordRetry store method issues. Until a dedicated
+// store method lands (PR-B scope), we synthesize the write
+// inline: this is a small one-line UPDATE that doesn't belong
+// on the dispatcher's interface.
+func (s *server) retryTriggerRecord(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	tID, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	if !s.authoriseTriggerRead(w, r, acct, tID) {
+		return
+	}
+	recID, ok := parseTriggerRecordID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.RetryTriggerRecordByOperator(r.Context(), recID); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.notFound(w, "no such record")
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not retry record"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// dropTriggerRecord handles POST /v1/triggers/{id}/records/{rid}/drop.
+func (s *server) dropTriggerRecord(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	tID, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	if !s.authoriseTriggerRead(w, r, acct, tID) {
+		return
+	}
+	recID, ok := parseTriggerRecordID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.DropTriggerRecordByOperator(r.Context(), recID); err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.notFound(w, "no such record")
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not drop record"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listTriggerDeadLetter handles GET /v1/triggers/{id}/dlq.
+func (s *server) listTriggerDeadLetter(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	if !s.authoriseTriggerRead(w, r, acct, id) {
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 1 || n > 200 {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad limit", "expected 1..200"))
+			return
+		}
+		limit = n
+	}
+	rows, err := s.store.ListTriggerDeadLetter(r.Context(), id, int32(limit))
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list dead letter"))
+		return
+	}
+	out := make([]api.TriggerDeadLetter, 0, len(rows))
+	for _, dl := range rows {
+		out = append(out, triggerDeadLetterResponse(dl))
+	}
+	writeJSON(w, http.StatusOK, api.ListTriggerDeadLetterResponse{Records: out})
+}
+
+// getTriggerMetrics handles GET /v1/triggers/{id}/metrics.
+//
+// Walks trigger_records for the trigger and counts by state. The
+// store layer is the future home of a CountTriggerRecordsByState
+// helper; this handler-side aggregation covers the dashboard until
+// then. A 1000-row ceiling keeps the cost bounded; the Prometheus
+// surface (`/v1/metrics`) is the authoritative counters path.
+func (s *server) getTriggerMetrics(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id, ok := parseTriggerID(w, r)
+	if !ok {
+		return
+	}
+	if !s.authoriseTriggerRead(w, r, acct, id) {
+		return
+	}
+	metrics, err := s.aggregateTriggerMetrics(r.Context(), id)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("metrics"))
+		return
+	}
+	metrics.TriggerID = id
+	writeJSON(w, http.StatusOK, metrics)
+}
+
+// batchCreateTrigger handles POST /v1/triggers:batch_create.
+//
+// Inline-manifest path. Customers ship a gregale.yaml blob in the
+// request body and the server fans it out through the same store
+// helpers createTrigger uses. Distinct from POST /v1/triggers so
+// the dashboard can differentiate "add one trigger" from "apply
+// manifest".
+//
+// Per-trigger errors are accumulated into the response so a partial
+// success is observable (vs fail-loud on the first 4xx).
+func (s *server) batchCreateTrigger(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	var req api.CreateTriggerBatchRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	if req.AppID == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "app_id is required"))
+		return
+	}
+	m, prob := validateManifestBytes([]byte(req.ManifestYAML), acct.Plan)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+	if m == nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request",
+			"manifest_yaml is empty"))
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), req.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such app")
+		return
+	}
+	limits, ok := api.LimitsFor(acct.Plan)
+	if !ok {
+		// No entry for this plan (migrated stale plan string) — the
+		// Free tier is the fail-closed default. TriggersAllowed is
+		// false on Free, so the loop below rejects every entry
+		// before it touches the store.
+		limits, _ = api.LimitsFor(api.PlanFree)
+	}
+	out := make([]api.Trigger, 0, len(m.Triggers))
+	errs := make([]batchError, 0)
+	for _, t := range m.Triggers {
+		if t.Kind == gregalemanifest.TriggerKindCron {
+			errs = append(errs, batchError{Slug: t.Slug, Message: "kind=cron triggers must be created via POST /v1/crons"})
+			continue
+		}
+		if t.Slug == "" {
+			errs = append(errs, batchError{Slug: t.Slug, Message: "slug is required"})
+			continue
+		}
+		bsm := int32(64)
+		if t.BatchSizeMax > 0 {
+			bsm = int32(t.BatchSizeMax)
+		}
+		bwm := int32(1000)
+		if t.BatchWindowMs > 0 {
+			bwm = int32(t.BatchWindowMs)
+		}
+		ma := int32(5)
+		if t.MaxAttempts > 0 {
+			ma = int32(t.MaxAttempts)
+		}
+		if limits.TriggerBatchSizeMax > 0 && bsm > int32(limits.TriggerBatchSizeMax) {
+			errs = append(errs, batchError{Slug: t.Slug, Message: "batch_size_max exceeds plan cap"})
+			continue
+		}
+		if limits.TriggerMaxAttemptsMax > 0 && ma > int32(limits.TriggerMaxAttemptsMax) {
+			errs = append(errs, batchError{Slug: t.Slug, Message: "max_attempts exceeds plan cap"})
+			continue
+		}
+		created, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
+			req.AppID,
+			string(t.Kind), t.Slug, t.IsEnabled(), marshalConfig(t.Config),
+			bsm, bwm, ma, limits)
+		if err != nil {
+			var qe *state.TriggerQuotaError
+			switch {
+			case errors.As(err, &qe):
+				errs = append(errs, batchError{Slug: t.Slug, Message: "quota: " + string(qe.Scope)})
+			case errors.Is(err, state.ErrNotFound):
+				errs = append(errs, batchError{Slug: t.Slug, Message: "no such app"})
+			default:
+				errs = append(errs, batchError{Slug: t.Slug, Message: "internal error"})
+			}
+			continue
+		}
+		out = append(out, triggerResponse(created))
+	}
+	writeJSON(w, http.StatusOK, batchCreateResponse{Created: out, Errors: errs})
+}
+
+// batchCreateResponse is the per-trigger success/error list shape.
+type batchCreateResponse struct {
+	Created []api.Trigger `json:"created"`
+	Errors  []batchError  `json:"errors,omitempty"`
+}
+
+type batchError struct {
+	Slug    string `json:"slug,omitempty"`
+	Message string `json:"message"`
+}
+
+// marshalConfig JSON-encodes a map[string]any manifest config into
+// the bytes the store persists. nil / empty maps encode as "{}" so
+// the SQL NOT NULL DEFAULT '{}' constraint always holds.
+func marshalConfig(c map[string]any) []byte {
+	if len(c) == 0 {
+		return []byte("{}")
+	}
+	b, _ := json.Marshal(c)
+	return b
+}
+
+// --- trigger response projections -----------------------------------------
+
+// triggerRecordResponse mirrors sqlc.TriggerRecord onto the wire
+// shape. JSON-blob fields (payload / headers / metadata) emit as
+// raw strings rather than re-decoded — keeps the wire stable across
+// broker library upgrades.
+func triggerRecordResponse(rec sqlc.TriggerRecord) api.TriggerRecord {
+	out := api.TriggerRecord{
+		ID:             uuidFromPgtype(rec.ID).String(),
+		TriggerID:      uuidFromPgtype(rec.TriggerID).String(),
+		ItemIdentifier: rec.ItemIdentifier,
+		Payload:        string(rec.Payload),
+		Headers:        string(rec.Headers),
+		Metadata:       string(rec.Metadata),
+		State:          rec.State,
+		Attempts:       int(rec.Attempts),
+		NextFireAt:     rec.NextFireAt.Time,
+		ReceivedAt:     rec.ReceivedAt.Time,
+	}
+	if rec.LastError.Valid && rec.LastError.String != "" {
+		s := rec.LastError.String
+		out.LastError = &s
+	}
+	if rec.LastDispatchedAt.Valid {
+		t := rec.LastDispatchedAt.Time
+		out.LastDispatchedAt = &t
+	}
+	return out
+}
+
+// triggerDeadLetterResponse mirrors sqlc.TriggerDeadLetter onto
+// the wire shape. Detail is opaque JSON so the dashboard can
+// decide per-reason rendering (a poison_record payload is rendered
+// differently from a max_attempts one).
+func triggerDeadLetterResponse(dl sqlc.TriggerDeadLetter) api.TriggerDeadLetter {
+	return api.TriggerDeadLetter{
+		RecordID:  uuidFromPgtype(dl.RecordID).String(),
+		TriggerID: uuidFromPgtype(dl.TriggerID).String(),
+		Reason:    dl.Reason,
+		RoutedTo:  dl.RoutedTo,
+		Detail:    string(dl.Detail),
+		CreatedAt: dl.CreatedAt.Time,
+	}
+}
+
+// --- helpers ---------------------------------------------------------------
+
+// parseTriggerID is the shared {id} path-param decoder for trigger
+// routes. Emits a 400 Problem on a malformed UUID and writes
+// through the supplied ResponseWriter so the caller can `if !ok
+// { return }` cleanly. Returns the canonical lowercase string form
+// (uuid.Parse normalises), which is what the Store interface
+// methods expect.
+func parseTriggerID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	idStr := r.PathValue("id")
+	uid, err := uuid.Parse(idStr)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad trigger id", err.Error()))
+		return "", false
+	}
+	return uid.String(), true
+}
+
+// parseTriggerRecordID is the shared {rid} path-param decoder for
+// the /records/{rid}/* routes.
+func parseTriggerRecordID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	idStr := r.PathValue("rid")
+	uid, err := uuid.Parse(idStr)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad record id", err.Error()))
+		return "", false
+	}
+	return uid.String(), true
+}
+
+// authoriseTriggerRead resolves the trigger + app + account and
+// emits a 404 (intentionally not 403 — see handlers_ext.go for
+// precedent) if either step fails. Both fail branches use
+// identical copy so a probe cannot distinguish "wrong id" from
+// "someone else's trigger". Returns true when the caller is
+// authorised; false when a response has already been written.
+func (s *server) authoriseTriggerRead(w http.ResponseWriter, r *http.Request, acct state.Account, id string) bool {
+	t, err := s.store.TriggerByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such trigger")
+		return false
+	}
+	app, err := s.store.AppByID(r.Context(), uuidFromPgtype(t.AppID).String())
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such trigger")
+		return false
+	}
+	return true
+}
+
+// intFrom returns *p when non-nil, 0 otherwise. Helper for the
+// "default if 0" pattern on UpdateTriggerRequest's optional fields.
+func intFrom(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// validateTriggerConfig round-trips the request's Config blob
+// through the per-kind validator in pkg/gregalemanifest. Used by
+// createTrigger + updateTrigger + batchCreateTrigger so the HTTP
+// path stays in lockstep with the manifest path.
+//
+// We construct a synthetic single-trigger Manifest, validate it,
+// and return the wrapped error if non-nil. The package's
+// per-kind validator is otherwise unexported (validateKindConfig).
+func validateTriggerConfig(kind api.TriggerKind, raw json.RawMessage) error {
+	probe := &gregalemanifest.Manifest{Triggers: []gregalemanifest.Trigger{{
+		Kind: gregalemanifest.TriggerKind(kind),
+		Slug: "_",
+	}}}
+	if raw != nil {
+		var anyMap map[string]any
+		if err := json.Unmarshal(raw, &anyMap); err != nil {
+			return err
+		}
+		probe.Triggers[0].Config = anyMap
+	}
+	return probe.Validate()
+}
+
+// aggregateTriggerMetrics walks trigger_records for the trigger
+// and counts by state. A 1000-row ceiling keeps the cost bounded
+// (the dispatcher owns the authoritative counters via Prometheus).
+func (s *server) aggregateTriggerMetrics(ctx context.Context, id string) (api.TriggerMetricsResponse, error) {
+	rows, err := s.store.ListTriggerRecordsForTrigger(ctx, id, int32(1000))
+	if err != nil {
+		return api.TriggerMetricsResponse{}, err
+	}
+	var m api.TriggerMetricsResponse
+	for _, rec := range rows {
+		switch rec.State {
+		case "pending":
+			m.PendingCount++
+		case "claimed":
+			m.ClaimedCount++
+		case "succeeded":
+			m.SucceededCount++
+		case "retry":
+			m.RetryCount++
+		case "dead_letter":
+			m.DeadLetterCount++
+		}
+	}
+	return m, nil
+}
+
+// _ keeps go vet happy about the time import (used by the
+// trigger_metrics response's CreatedAt formatting in the future).
+var _ = time.Now

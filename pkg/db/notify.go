@@ -84,6 +84,12 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         "image_digest":"sha256:..."}      // image_digest when kind=image
 //	NotifyDomainChanged     {"domain":"..."}
 //	NotifyCronChanged       {"cron_id":uuid, "app_id":uuid}
+//	NotifyTriggerChanged    {"kind":"created|updated|deleted|paused|resumed",
+//	                         "trigger_id":uuid, "app_id":uuid}
+//	                         (issue #757 / ADR-0NN — listeners: schedd
+//	                         trigger-fanout, dashboard SSE; mirrors
+//	                         NotifyCronChanged's payload shape so the
+//	                         existing decoder pattern applies unchanged)
 //	NotifyKeyChanged        {"key_id":uuid}
 //	NotifyBuildQueued       {"build_id":uuid, "app_id":uuid,
 //	                         "kind":"tarball|dockerfile|function",
@@ -167,6 +173,7 @@ const (
 	NotifyDeploymentChanged = "deployment_changed"
 	NotifyDomainChanged     = "domain_changed"
 	NotifyCronChanged       = "cron_changed"
+	NotifyTriggerChanged    = "trigger_changed"
 	NotifyKeyChanged        = "key_changed"
 	NotifyBuildQueued       = "build_queued"
 	NotifyBuildLog          = "build_log"

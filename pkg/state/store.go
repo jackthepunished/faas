@@ -1931,6 +1931,47 @@ type Store interface {
 	// lastFiredAt map; PgStore uses a column added in migration 00003.
 	MarkCronFired(ctx context.Context, cronID string, at time.Time) error
 
+	// Trigger primitive (issue #757 / ADR-0NN; commit #5 + commit #6).
+	// Per-method notes:
+	//
+	//   - TriggerByID / UpdateTrigger / DeleteTrigger take string IDs
+	//     because the customer-facing api surfaces string UUIDs on
+	//     the wire. The pgx-via-pgtype.UUID conversions live inside
+	//     PgStore so the Store interface is uniform with the cron
+	//     family (CreateCronIfUnderQuota, CronByID, etc.).
+	//
+	//   - CreateTriggerIfUnderQuota mirrors CreateCronIfUnderQuota's
+	//     FOR UPDATE apps-row lock to defeat the per-app vs
+	//     per-account TOCTOU window (see cron precedent in this
+	//     Store interface above).
+	//
+	//   - ListTriggersForApp is the dashboard read-back
+	//     (GET /v1/triggers). ListEnabledTriggers is the schedd's
+	//     1-second tick scan (commit #14).
+	//
+	//   - ClaimTriggerRecords uses FOR UPDATE SKIP LOCKED so two
+	//     concurrent dispatch workers (multi-host scale-out)
+	//     distribute claims without retry-on-collision. Each call
+	//     claims up to `limit` records for one trigger.
+	//
+	//   - Mark* writers are dispatcher-owned (commit #14): the
+	//     apid-side operator verbs (retry / drop) bypass this seam.
+	TriggerByID(ctx context.Context, id string) (sqlc.Trigger, error)
+	UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts *int32) (sqlc.Trigger, error)
+	DeleteTrigger(ctx context.Context, id, appID string) error
+	ListTriggersForApp(ctx context.Context, appID string) ([]sqlc.Trigger, error)
+	ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, error)
+	CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts int32, limits api.Limits) (sqlc.Trigger, error)
+	ClaimTriggerRecords(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error)
+	MarkTriggerRecordSucceeded(ctx context.Context, id string) error
+	MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error
+	MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error
+	InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID, reason, routedTo string, detail []byte) error
+	ListTriggerDeadLetter(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerDeadLetter, error)
+	ListTriggerRecordsForTrigger(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error)
+	RetryTriggerRecordByOperator(ctx context.Context, id string) error
+	DropTriggerRecordByOperator(ctx context.Context, id string) error
+
 	// Fire-now request queue (ADR-090 PR-C / migrations/00193).
 	// apid inserts on POST /v1/crons/{id}/run; schedd claims +
 	// dispatches via RunCronNow. The interface is the single seam

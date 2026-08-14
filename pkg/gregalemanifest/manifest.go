@@ -26,6 +26,7 @@
 package gregalemanifest
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -218,13 +219,30 @@ func Load(dir string) (*Manifest, bool, error) {
 	return nil, false, nil
 }
 
+// ParseBytes decodes a manifest blob (yaml) without staging to disk.
+// Strict-decode + Validate are applied identically to Load — only
+// the file-vs-blob input differs. Returns (nil, nil) for an empty
+// payload so handlers treat absent-blob the same as absent-file.
+//
+// Used by the apid's POST /v1/triggers:batch_create route (commit
+// #6 of feat-triggers-mega) where the dashboard ships an inline
+// manifest blob alongside a source tarball — staging the bytes to
+// a tempfile here would just be an extra round-trip through tmpfs
+// for the validator to land.
+func ParseBytes(b []byte) (*Manifest, error) {
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil, nil
+	}
+	return parseManifest(b)
+}
+
 // parseManifest decodes the bytes with strict unknown-field rejection.
 // Without KnownFields(true), a typo'd `trigger:` (singular) would
 // silently drop every entry — the customer's deploy would ship a
 // no-op `triggers:` and they'd discover the gap in production. Strict
 // decoding turns the typo into a load-time error.
 func parseManifest(b []byte) (*Manifest, error) {
-	dec := yaml.NewDecoder(strings.NewReader(string(b)))
+	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	m := &Manifest{}
 	if err := dec.Decode(m); err != nil {
