@@ -455,6 +455,18 @@ type Handler struct {
 	// customer-configured rule scope shares no bucket slots with
 	// platform-shared throttles.
 	routeLimiter *Limiter
+	// routeConsumerLimiter (ADR-104, issue #881 Phase 3) is the
+	// per-rule per-consumer bucket map, separate from routeLimiter
+	// so the per-rule scope (`appID+"\x00"+ruleID`, 10k entries) and
+	// the per-consumer scope (one bucket per authenticated identity
+	// plus a pinned __other__ collapse bucket per rule) do not
+	// fight for slots. Constructed with NewLimiterWithLRU so
+	// the per-rule consumer map is bounded by
+	// EdgeRuleConsumerCacheCap. nil when WithRouteConsumerLimiter
+	// wasn't wired — applyEdgeRuleThrottle treats nil as
+	// "per-consumer throttling disabled", matching the back-compat
+	// posture for tests that don't exercise Phase 3.
+	routeConsumerLimiter *Limiter
 	// accountLimiter is the per-account token-bucket throttle (ADR-040 /
 	// issue #292). Runs BEFORE limiter (per-app) in ServeHTTP so a botnet
 	// rotating across many apps is rejected before any per-app bucket
@@ -718,11 +730,22 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 		// cannot grow unboundedly; full-bucket-only eviction
 		// invariant means an attacker cannot weaponise eviction to
 		// bypass a partially-drained rule.
-		routeLimiter:   NewLimiterWithLRU(EdgeRuleCacheCap),
-		accountLimiter: NewLimiter(),
-		gate:           NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
-		metrics:        m,
-		log:            log,
+		routeLimiter: NewLimiterWithLRU(EdgeRuleCacheCap),
+		// routeConsumerLimiter (ADR-104, issue #881 Phase 3) is
+		// the per-rule per-consumer bucket map, separate scope so
+		// per-rule buckets and per-consumer buckets never fight
+		// for slots. Sized 10x the per-rule cap because the
+		// per-consumer scope multiplies by the per-rule
+		// MaxKeysPerRule ceiling (default 1000) — see plan
+		// §"Eviction interaction". The full-bucket-only invariant
+		// is inherited from routeLimiter's discipline; the
+		// __other__ collapse bucket is additionally pinned (see
+		// ratelimit.go::bucket.pinned).
+		routeConsumerLimiter: NewLimiterWithLRU(EdgeRuleConsumerCacheCap),
+		accountLimiter:       NewLimiter(),
+		gate:                 NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
+		metrics:              m,
+		log:                  log,
 	}
 	// piApps is a value-typed sync.Map wrapper; its zero value is valid
 	// and no init is required (avoiding a lazy-init write that would
@@ -761,6 +784,20 @@ func (h *Handler) WithLastSeenSink(sink LastSeenSink) *Handler {
 // as a test-only seam; do NOT expose it as a config knob.
 func (h *Handler) WithLimiter(l *Limiter) *Handler {
 	h.limiter = l
+	return h
+}
+
+// WithRouteConsumerLimiter (ADR-104, issue #881 Phase 3) installs
+// the per-rule per-consumer token-bucket throttle. Production
+// wires NewLimiterWithLRU(EdgeRuleConsumerCacheCap) in NewHandlerWith
+// alongside WithLimiter; load tests install a noop limiter so
+// per-consumer accounting doesn't constrain the test's own rate
+// generator. nil disables per-consumer throttling — the throttle
+// applier falls back to the per-rule AllowWithParams path (PR #887
+// back-compat shape), so a test that doesn't wire this surface
+// exercises the Phase 1+2 behaviour bit-for-bit.
+func (h *Handler) WithRouteConsumerLimiter(l *Limiter) *Handler {
+	h.routeConsumerLimiter = l
 	return h
 }
 
@@ -1027,6 +1064,16 @@ func (h *Handler) enforceRequireAuthn(w http.ResponseWriter, r *http.Request, re
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return false
 	}
+	// Phase 3 (ADR-104, issue #881): stamp the resolved API key
+	// id on the request context so applyEdgeRuleThrottle can key
+	// a per-consumer bucket when the matched rule opts into
+	// key_by="api_key". Pre-Phase-3 code dropped key.ID at the
+	// audit boundary; Phase 3 keeps it via withAuthenticated. The
+	// context.Value setter is a single map insertion — no
+	// measurable cost on the authn hot path.
+	*r = *r.WithContext(withAuthenticated(r.Context(), Authenticated{
+		APIKeyID: key.ID,
+	}))
 	return true
 }
 
@@ -1696,6 +1743,17 @@ func (h *Handler) applyEdgeRuleJWT(w http.ResponseWriter, r *http.Request, app A
 		return true
 	}
 	h.jwtEmit(r.Context(), "jwt", "match", rule.ID, r.Host, nil, map[string]any{"sub": claims.Subject})
+	// Phase 3 (ADR-104, issue #881): stamp the resolved JWT
+	// subject + custom claims on the request context so
+	// applyEdgeRuleThrottle can key a per-consumer bucket when the
+	// matched rule opts into key_by="jwt_subject" or
+	// key_by="jwt_claim". Claims.Custom is the string→string
+	// subset the verifier extracted from rule.RequiredClaims — no
+	// extra parse cost on the hot path.
+	*r = *r.WithContext(withAuthenticated(r.Context(), Authenticated{
+		JWTSubject: claims.Subject,
+		JWTClaims:  claims.Custom,
+	}))
 	return false
 }
 
@@ -2695,6 +2753,18 @@ func (h *Handler) applyEdgeRuleGeo(w http.ResponseWriter, r *http.Request, app A
 // metric `outcome=blocked`), so a direct-DB write that ignores
 // same-account governance doesn't get to gate traffic.
 //
+// Phase 3 (ADR-104, issue #881 Phase 3): when the matched rule
+// opts into a per-consumer KeyBy value (`api_key`, `jwt_subject`,
+// `jwt_claim`), this applier reads the Authenticated struct from
+// the request context (populated by enforceRequireAuthn and
+// applyEdgeRuleJWT) and routes the bucket lookup through the
+// routeConsumerLimiter (separate scope so per-rule and
+// per-consumer buckets don't share slots). The __other__ collapse
+// bucket — see ratelimit.go::AllowWithConsumerKey — is pinned
+// non-evictable so an attacker cannot weaponise key-space growth
+// to bypass the throttle. Empty KeyBy (and the "none" sentinel)
+// preserve PR #887's `appID+"\x00"+ruleID` bucket key bit-for-bit.
+//
 // Returns true iff the caller MUST return (short-circuit on 429).
 func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, app App) bool {
 	if h.edgeRules == nil || h.routeLimiter == nil {
@@ -2727,16 +2797,63 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 		}
 		return false
 	}
-	// Bucket key is `appID + "\x00" + ruleID` so the per-rule
-	// bucket is bounded by *configured rules*, not by traffic.
-	// Per-IP sub-keying is deliberately excluded from v1 — that
-	// would multiply cardinality by unique-IP count, which is
-	// unbounded and attacker-controlled, against a limiter that
-	// has never had eviction. PR-B (#887) added LRU eviction with
-	// the full-bucket-only invariant so the bucket map cannot
-	// grow unboundedly even with many configured rules.
+	// Bucket key is `appID + "\x00" + ruleID` for PR #887 rules
+	// (KeyBy == "" or "none"). Per-consumer keying (Phase 3)
+	// constructs a longer key by appending the resolved consumer
+	// identity — see resolveConsumerKey below. The routeConsumerLimiter
+	// owns the consumer-keyed buckets and applies the __other__
+	// collapse; routeLimiter owns the rule-only buckets and is
+	// untouched. Phase 1+2 rules never enter the per-consumer branch.
 	bucketKey := app.ID + "\x00" + rule.ID
-	if !h.routeLimiter.AllowWithParams(bucketKey, rule.RequestsPerSecond, float64(rule.Burst)) {
+	allowed := h.routeLimiter.AllowWithParams(bucketKey, rule.RequestsPerSecond, float64(rule.Burst))
+	if allowed && api.ThrottleKeyByIsPerConsumer(rule.KeyBy) {
+		authed := authenticatedFrom(r.Context())
+		consumerID, ok := resolveConsumerKey(rule.KeyBy, rule.JWTClaimName, authed)
+		if ok {
+			// The consumer bucket key is the same
+			// `appID+"\x00"+ruleID` prefix used by the per-rule
+			// bucket, plus a "\x00"+consumerID suffix. The per-rule
+			// AllowWithParams call above already admitted the
+			// request into the rule scope (token decrement on the
+			// rule bucket — the parent bucket the per-consumer
+			// sub-buckets ride on); the per-consumer AllowWithConsumerKey
+			// call throttles within that scope.
+			//
+			// When MaxKeysPerRule == 0 (resolver-default; cmd-side
+			// compileThrottleRules substitutes the plan default) we
+			// surface a sensible ceiling here. cmd-side is the source
+			// of truth — but defence-in-depth against a direct-DB
+			// write that bypassed compileThrottleRules.
+			cap := rule.MaxKeysPerRule
+			if cap <= 0 {
+				cap = api.ThrottleMaxKeysPerRuleDefault
+			}
+			if !h.routeConsumerLimiter.AllowWithConsumerKey(bucketKey, consumerID, rule.RequestsPerSecond, float64(rule.Burst), cap) {
+				allowed = false
+				h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, "throttle")
+			} else {
+				h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, "admit")
+			}
+		} else {
+			// Anonymous on a per-consumer rule — emit the
+			// `anonymous` outcome so the dashboard can flag
+			// authn-gated apps that are seeing unauthenticated
+			// traffic on a per-consumer rule (a misconfiguration
+			// signal).
+			h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, "anonymous")
+		}
+		// resolveConsumerKey returning ok=false means anonymous
+		// traffic on a per-consumer rule (e.g. an unauthenticated
+		// request hitting a rule with key_by=api_key). The PR #887
+		// rule-only bucket has already been consumed; we treat
+		// anonymous on a per-consumer rule as a free pass through
+		// the per-consumer layer — anonymous collapses into the
+		// rule scope via the AllowWithParams token. A future
+		// hardening may explicitly 401 here, but for Phase 3 the
+		// documented behaviour matches today (per-rule bucket
+		// already throttled).
+	}
+	if !allowed {
 		w.Header().Set("Retry-After", "1")
 		// `route` is a new scope value alongside `account` + `app`
 		// (established by per-account / per-app 429 paths

@@ -145,6 +145,19 @@ type Metrics struct {
 	// one of {success, error} — a 2-element closed set; expanding it
 	// requires a new metric (the apply-error mix is its own surface).
 	edgeRuleApply *prometheus.CounterVec
+	// routeConsumerThrottleDecisions (ADR-104, issue #881 Phase 3):
+	// counter of per-consumer throttle decisions, labelled by
+	// {kind, outcome}. `kind` is the KeyBy dimension
+	// (none | api_key | jwt_subject | jwt_claim — closed set per
+	// pkg/api.ThrottleKeyBy* constants). `outcome` is the
+	// decision (admit | throttle | anonymous — the third covers
+	// anonymous traffic on a per-consumer rule, which the limiter
+	// passes through to the rule-only bucket). Distinct from
+	// edgeRuleApply (which tracks the per-rule throttle path
+	// separately) so a §12 dashboard panel can read both:
+	// edgeRuleApply tracks per-rule bucket denies, this counter
+	// tracks per-consumer denies within the per-rule scope.
+	routeConsumerThrottleDecisions *prometheus.CounterVec
 	// edgeRuleCompileError (ADR-091 hardening PR-A): counter of
 	// compile-time failures inside the cmd-side loader
 	// (cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs). A
@@ -472,6 +485,20 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_apply_total",
 			Help: "Edge-rule apply-path outcomes (success|error), labelled by kind. ADR-091 hardening PR-A.",
 		}, []string{"kind", "result"}),
+		// ADR-104 (issue #881 Phase 3) — per-consumer throttle
+		// decisions, distinct from the per-rule edgeRuleApply path.
+		// `kind` ∈ {none, api_key, jwt_subject, jwt_claim} tracks the
+		// KeyBy dimension; `outcome` ∈ {admit, throttle, anonymous}
+		// tracks the per-consumer admit/deny split. The anonymous
+		// outcome covers anonymous traffic on a per-consumer rule —
+		// the limiter passes through to the per-rule bucket, but the
+		// dashboard surfaces this so an operator can see when an
+		// authn-gated app is seeing unauthenticated traffic on a
+		// per-consumer rule (which is a misconfiguration).
+		routeConsumerThrottleDecisions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "route_consumer_throttle_decisions_total",
+			Help: "Per-consumer throttle decisions, labelled by KeyBy kind (none|api_key|jwt_subject|jwt_claim) and outcome (admit|throttle|anonymous). ADR-104, issue #881 Phase 3.",
+		}, []string{"kind", "outcome"}),
 		// ADR-091 hardening PR-A — compile-time errors caught by
 		// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs. A
 		// non-zero value here means a rule shipped broken and was
@@ -906,6 +933,18 @@ func NewMetrics() *Metrics {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
 	}
+	// Phase 3 (ADR-104, issue #881): pre-instantiate the closed
+	// (kind, outcome) cross product for the per-consumer throttle
+	// decision counter. `kind` matches the KeyBy dimension
+	// (api.ThrottleKeyBy* constants); `outcome` is the per-request
+	// admit/deny split. The "anonymous" outcome covers
+	// unauthenticated traffic on a per-consumer rule — a
+	// misconfiguration signal for the dashboard.
+	for _, kind := range []string{"none", "api_key", "jwt_subject", "jwt_claim"} {
+		for _, outcome := range []string{"admit", "throttle", "anonymous"} {
+			m.routeConsumerThrottleDecisions.WithLabelValues(kind, outcome)
+		}
+	}
 	for _, outcome := range []string{"match", "miss", "blocked", "failed", "missing"} {
 		m.edgeRuleMatch.WithLabelValues("jwt", outcome)
 	}
@@ -1011,7 +1050,7 @@ func NewMetrics() *Metrics {
 	// surfaces from boot. The pre-instantiate loop above (where
 	// tenantSurfaceCert is stamped across the closed (result, kind)
 	// cartesian) is the same pattern as the rest of the family.
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions)
 	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
 	// observability. Same shape as the wire.OpsMetrics series,
 	// registered on the gateway.Metrics registry so it surfaces
@@ -1376,6 +1415,26 @@ func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
 		return
 	}
 	m.edgeRuleApply.WithLabelValues(kind, result).Inc()
+}
+
+// ObserveRouteConsumerThrottleDecision (ADR-104, issue #881 Phase 3)
+// increments the per-consumer throttle decision counter. Called
+// from applyEdgeRuleThrottle after the AllowWithConsumerKey result
+// is in. kind is the resolved KeyBy dimension
+// (pkg/api.ThrottleKeyByNone | ...APIKey | ...JWTSubject | ...JWTClaim)
+// — normalised to the closed set, with "" coerced to "none" so an
+// empty wire payload doesn't add a new label tuple. outcome is
+// one of {admit, throttle, anonymous} — anonymous is the
+// authn-missing path on a per-consumer rule, a misconfiguration
+// signal for the dashboard. Nil-safe.
+func (m *Metrics) ObserveRouteConsumerThrottleDecision(kind, outcome string) {
+	if m == nil {
+		return
+	}
+	if kind == "" {
+		kind = "none"
+	}
+	m.routeConsumerThrottleDecisions.WithLabelValues(kind, outcome).Inc()
 }
 
 // ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments the

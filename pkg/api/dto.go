@@ -4474,6 +4474,38 @@ const (
 	ThrottleKeyByJWTClaim   = "jwt_claim"
 )
 
+// ThrottleMaxKeysPerRuleDefault is the fallback MaxKeysPerRule the
+// gateway uses when the resolved rule carries a zero — defensive
+// against a direct-DB write that bypassed the apid-validator AND
+// cmd-side compileThrottleRules. Matches the Hobby plan ceiling
+// (pkg/api/limits.go::ThrottleMaxKeysPerRule) — middle of the
+// ladder, neither Free-tight (100) nor Scale-loose (10_000). The
+// cmd-side compile is the source of truth for the value the
+// limiter actually uses at runtime; this constant exists so a
+// misconfigured rule doesn't accidentally promote a per-consumer
+// rule to unbounded cardinality (the worst-case attack surface).
+const ThrottleMaxKeysPerRuleDefault = 1000
+
+// ThrottleKeyByIsPerConsumer reports whether the supplied KeyBy
+// value opts the rule into per-consumer bucket keying
+// (ADR-104, issue #881 Phase 3). Empty string is treated as
+// back-compat (PR #887's `appID+"\x00"+ruleID` shape) — only
+// the explicit "none" and the four other close-vocab values
+// trigger per-consumer routing. The single source of truth for
+// "is this a per-consumer KeyBy?" — pkg/gateway/handler.go and
+// cmd/gatewayd-internal/edge_rules.go both consult this rather
+// than duplicating the membership test, so adding a future
+// Phase 4 value (e.g. "ip") is a one-line constant + this helper
+// update.
+func ThrottleKeyByIsPerConsumer(keyBy string) bool {
+	switch keyBy {
+	case ThrottleKeyByAPIKey, ThrottleKeyByJWTSubject, ThrottleKeyByJWTClaim:
+		return true
+	default:
+		return false
+	}
+}
+
 // ThrottleValidationContext is the per-plan ceiling that
 // validateEdgeRuleAction passes into EdgeRuleThrottleAction.Validate.
 // Keeping the boundary explicit (rather than reading limits globally)

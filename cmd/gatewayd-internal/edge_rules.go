@@ -1210,6 +1210,28 @@ func compileThrottleRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleThrott
 		if burst < 1 {
 			burst = 1
 		}
+		// Phase 3 (ADR-104, issue #881): clamp MaxKeysPerRule to
+		// the plan ceiling (Hobby default 1000). The apid
+		// validator already enforces per-plan value via
+		// Limits.ThrottleMaxKeysPerRule (Free 100 / Hobby 1000 /
+		// Pro 5000 / Scale 10000); a 0 from a direct-DB write
+		// gets a sensible default here. The cmd-side compile
+		// cannot know the per-call plan at this point (the
+		// compile is per-rule, not per-request), so it picks
+		// the Hobby plan ceiling — middle of the ladder — as
+		// the safe default for any plan that didn't pre-set
+		// the value. The cmd-side is the source of truth at
+		// runtime; apid is the source of truth at create.
+		maxKeys := r.Action.Throttle.MaxKeysPerRule
+		if maxKeys <= 0 {
+			maxKeys = api.ThrottleMaxKeysPerRuleDefault
+		}
+		if maxKeys > api.ThrottleMaxKeysPerRuleDefault*10 {
+			// Scale ceiling is 10x the default; anything beyond
+			// is either a bug or a malicious direct-DB write.
+			// Clamp to Scale ceiling.
+			maxKeys = api.ThrottleMaxKeysPerRuleDefault * 10
+		}
 		out = append(out, gateway.EdgeRuleThrottleResolved{
 			ID:                r.ID,
 			AccountID:         r.AccountID,
@@ -1219,6 +1241,16 @@ func compileThrottleRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleThrott
 			Methods:           buildMethodsMap(r.MatchMethods),
 			RequestsPerSecond: rps,
 			Burst:             burst,
+			// Phase 3 (ADR-104): wire KeyBy + JWTClaimName +
+			// MaxKeysPerRule to the resolved rule. Empty
+			// KeyBy + empty JWTClaimName + clamped MaxKeys
+			// preserve PR #887 behaviour bit-for-bit (the
+			// per-consumer branch in applyEdgeRuleThrottle
+			// only fires when KeyBy ∈
+			// {api_key, jwt_subject, jwt_claim}).
+			KeyBy:          r.Action.Throttle.KeyBy,
+			JWTClaimName:   r.Action.Throttle.JWTClaimName,
+			MaxKeysPerRule: maxKeys,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
