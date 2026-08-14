@@ -112,7 +112,8 @@ func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate valida
 // list to include malformed CIDR parse errors from compileIPRules
 // (reuses the same PathGlobError tuple shape); PR-B widens it
 // to include kind=validate compile errors; the maintenance
-// amendment widens it again to include kind=maintenance.
+// amendment widens it again to include kind=maintenance; the D20.5
+// amendment widens it once more for kind=throttle (issue #881).
 func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway.HostEntry, error) {
 	storeRules, err := g.store.MatchEdgeRulesForHost(ctx, host)
 	if err != nil {
@@ -129,6 +130,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	limit, limitErrs := compileLimitRules(storeRules)
 	maintenance, maintenanceErrs := compileMaintenanceRules(storeRules)
 	geo, geoErrs := compileGeoRules(storeRules)
+	throttle, throttleErrs := compileThrottleRules(storeRules)
 	entry := &gateway.HostEntry{
 		Route:       route,
 		Rewrite:     rewrite,
@@ -141,6 +143,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		Limit:       limit,
 		Maintenance: maintenance,
 		Geo:         geo,
+		Throttle:    throttle,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -152,6 +155,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, limitErrs...)
 	parseErrs = append(parseErrs, maintenanceErrs...)
 	parseErrs = append(parseErrs, geoErrs...)
+	parseErrs = append(parseErrs, throttleErrs...)
 
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
@@ -479,6 +483,36 @@ func (g *gatewaydEdgeRules) MatchGeo(ctx context.Context, host, requestPath, met
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstGeoMatch(rules, requestPath, method)
+}
+
+// MatchThrottle returns the highest-priority `kind=throttle` rule
+// whose host, path, and method match, or nil (ADR-091 D20.5
+// amendment, issue #881). Same cache primitive as MatchLimit — a
+// miss triggers the same loadHost pass that also recompiles the
+// other 11 kinds. The applier (handler.go::applyEdgeRuleThrottle)
+// constructs the rule-scoped bucket key (AppID+"\x00"+ID) and
+// decrements via pkg/gateway.(*Limiter).AllowToken before the
+// route hits the body — runs AFTER Limit (so the body-cap 413
+// still consumes a bucket) and BEFORE Validate (so the
+// schema-gate 422 does not cost a bucket).
+func (g *gatewaydEdgeRules) MatchThrottle(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleThrottleResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetThrottle(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Throttle
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstThrottleMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -1103,6 +1137,88 @@ func compileMaintenanceRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleMai
 			Methods:           buildMethodsMap(r.MatchMethods),
 			RetryAfterSeconds: retry,
 			Message:           r.Action.Maintenance.Message,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileThrottleRules mirrors compileMaintenanceRules for
+// kind=throttle (ADR-091 D20.5 amendment, issue #881). The
+// compiled slice carries the per-rule RequestsPerSecond + Burst
+// the applier (handler.go::applyEdgeRuleThrottle) hands to
+// pkg/gateway.(*Limiter).AllowToken.
+//
+// apid-Validate (pkg/api/dto.go::EdgeRuleThrottleAction.Validate)
+// already enforces:
+//
+//   - requests_per_second ≥ 1
+//   - burst ≥ 1
+//   - requests_per_second ≤ plan.RateLimitRPS
+//   - burst ≤ plan.RateLimitBurst
+//
+// — see the ThrottleValidationContext the validator threads.
+// This compile step is the defence-in-depth pass: a direct-DB
+// write (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect)
+// that bypassed apid gets clamped here to {1, 1}, and a rule
+// with invalid numerics is dropped from the slice (the customer
+// sees pass-through — the rule simply does not fire).
+//
+// The plan-tier ceiling is NOT re-applied here without the
+// limit context (the cmd-side compile doesn't carry per-call plan
+// state); the apid validator is the only call that can know the
+// plan. A direct-DB write of {rps:1e6, burst:1e9} simply gets
+// clamped to {1, 1} so the rule still fires at the
+// minimum-useful rate instead of being silently dropped — better
+// a weak throttle than no throttle.
+//
+// Like compileMaintenanceRules + compileLimitRules, the compile
+// is a free function — it doesn't need any adapter state.
+// Out-of-bound values are clamped silently; the caller logs a
+// slog.Warn with the rule ID.
+func compileThrottleRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleThrottleResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleThrottleResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindThrottle {
+			continue
+		}
+		if r.Action.Throttle == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp rps/burst to the minimum-useful positive values.
+		// A 0/0 from a direct-DB write would let the limiter build
+		// a bucket that always-deny (burst=0 means every AllowToken
+		// call consumes a token that was never refilled), and a
+		// negative value would panic the limiter. Floor at {1, 1}.
+		rps := r.Action.Throttle.RequestsPerSecond
+		if rps < 1 {
+			rps = 1
+		}
+		burst := r.Action.Throttle.Burst
+		if burst < 1 {
+			burst = 1
+		}
+		out = append(out, gateway.EdgeRuleThrottleResolved{
+			ID:                r.ID,
+			AccountID:         r.AccountID,
+			AppID:             r.AppID,
+			Priority:          r.Priority,
+			PathGlob:          r.MatchPath,
+			Methods:           buildMethodsMap(r.MatchMethods),
+			RequestsPerSecond: rps,
+			Burst:             burst,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })

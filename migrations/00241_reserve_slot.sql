@@ -1,13 +1,32 @@
--- filename: 00241_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Co-fence for the issue #879 / ADR-100 tenant-surfaces PR-cluster.
--- See 00238_reserve_slot.sql for the rationale. Body is a no-op
--- SELECT 1; slot 241 is held by the cluster's PR-A.
-SELECT 1;
+--
+-- 00241_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change. The replay-safety gate in
+-- ci.yml drops files whose basename matches the reservation regex
+-- from its "added migration versions" computation, so this slot
+-- never appears in the applied set.
+--
+-- Slot 00238 is fenced on this branch (PR #887, issue #881
+-- kind=throttle) AND on PR #884 (ADR-099 / issue #879 PR-0
+-- slot fence). Whichever PR merges second cleans up the
+-- duplicated reservation in a follow-up commit per the
+-- cross-PR slot fence pattern.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-SELECT 1;
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
 -- +goose StatementEnd

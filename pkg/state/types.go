@@ -3328,6 +3328,16 @@ const (
 	// (no IsPaidOnly change). See migrations/00220_edge_rules_kind_maintenance.sql
 	// for the schema CHECK widening.
 	EdgeRuleKindMaintenance EdgeRuleKind = "maintenance"
+	// EdgeRuleKindThrottle is the per-route token-bucket rate limit
+	// (ADR-091 D20.5 amendment, issue #881). Customers tighten the
+	// per-route rps/burst below their plan's plan.RateLimitRPS — the
+	// apid validator enforces the sub-plan ceiling; the gateway
+	// compiler enforces it again at load time. Plan-gated
+	// Free-and-above (no IsPaidOnly change) with the same per-app
+	// quota posture as geo: Free=1, Hobby=5, Pro=25, Scale=100
+	// (Limits.EdgeRulesThrottlePerApp). Migration 00244 widens the
+	// schema CHECK to admit the value.
+	EdgeRuleKindThrottle EdgeRuleKind = "throttle"
 	// EdgeRuleKindGeo is the country allow/deny primitive (ADR-091 D21).
 	// Migration 00229 widens the schema CHECK from 9 to 10 values
 	// (post-00219 'limit', post-00214 'validate'). Not in IsPaidOnly
@@ -3344,7 +3354,7 @@ func (k EdgeRuleKind) IsValid() bool {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
 		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit,
-		EdgeRuleKindMaintenance, EdgeRuleKindGeo:
+		EdgeRuleKindMaintenance, EdgeRuleKindThrottle, EdgeRuleKindGeo:
 		return true
 	}
 	return false
@@ -3534,6 +3544,39 @@ type EdgeRuleGeoAction struct {
 	Deny  []string `json:"deny,omitempty"`
 }
 
+// EdgeRuleThrottleAction is the per-rule token-bucket parameter set
+// for kind=throttle (ADR-091 D20.5 amendment, issue #881). The
+// runtime is pkg/gateway/ratelimit.go::Limiter — the gateway matcher
+// resolves the matched rule and consumes one token per request from a
+// bucket keyed by (appID, ruleID). The bucket is LRU-evicted (see
+// ratelimit.go::NewLimiterWithLRU) so the unbounded route-key space
+// is bounded by the configured edge-rule count.
+//
+// RequestsPerSecond is the refill rate (float, ≥ 1, ≤ plan.RateLimitRPS).
+// Burst is the bucket ceiling (int, ≥ 1, ≤ plan.RateLimitBurst). The
+// sub-plan-ceiling is enforced at apid-create time
+// (pkg/api/dto.go::EdgeRuleThrottleAction.Validate) and again at
+// gatewayd compile time
+// (cmd/gatewayd-internal/edge_rules.go::compileThrottleRules).
+//
+// The wire shape's primary motivation for float rps: the
+// recommendation endpoint (cmd/apid/handlers_throttle_suggestions.go)
+// emits ceil(observed_rps * 2) which can be a non-integer —
+// coercing to int would shave headroom from the suggestion. The
+// runtime spends the float as `tokens += dt * rps` so fractional
+// values are exact under the refill formula.
+//
+// Per-IP sub-keying is deliberately absent in v1 — a per-IP boolean
+// would multiply the limiter's map cardinality by unique-IP count
+// (unbounded, attacker-controlled). If a per-IP variant is wanted
+// later it gets its own bounded design (ADR-093-style cap + an
+// `__ip_other__` overflow that still consumes the parent rule's
+// bucket). Shipping the field now and bounding it later is not safe.
+type EdgeRuleThrottleAction struct {
+	RequestsPerSecond float64 `json:"requests_per_second"`
+	Burst             int     `json:"burst"`
+}
+
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
 // as jsonb. The wire shape lives in pkg/api/dto.go (one struct per
 // kind); the state-side mirror is intentionally minimal — the
@@ -3577,6 +3620,16 @@ type EdgeRuleAction struct {
 	// enforced at apid-create time via Limits.EdgeRulesGeoPerApp —
 	// see pkg/api/dto.go::EdgeRuleGeoAction.Validate.
 	Geo *EdgeRuleGeoAction `json:"geo,omitempty"`
+	// Throttle carries the per-route token-bucket parameters for
+	// kind=throttle. The Sub-plan ceiling (rps ≤ plan.RateLimitRPS,
+	// burst ≤ plan.RateLimitBurst) is enforced at apid-create time
+	// (pkg/api/dto.go::EdgeRuleThrottleAction.Validate) and again
+	// at gatewayd compile time
+	// (cmd/gatewayd-internal/edge_rules.go::compileThrottleRules).
+	// Run-time enforcement is pkg/gateway/ratelimit.go's LRU
+	// limiter; the bucket is keyed by (appID, ruleID) so a single
+	// rule's throttle does not bleed into another rule's bucket.
+	Throttle *EdgeRuleThrottleAction `json:"throttle,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.

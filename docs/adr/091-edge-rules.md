@@ -298,6 +298,51 @@ PR-A/B/C — keep their cite numbers untouched.)
     - **D20.5 — Per-rule rate limit.** Token-bucket per rule (e.g.,
       "this JWKS-protected endpoint gets 100 RPS per IP"). Out of
       ADR-091 — new ADR needed.
+      **Amendment 3 (issue #881, PR-A + PR-C + PR-D + PR-E, 2026-08-13):**
+      D20.5 lands as an *amendment* to ADR-091 (matching the
+      D20.6 / D24 precedent), not a new ADR slot. The shape:
+      - **kind=throttle** as an 11th edge-rule kind
+        (migration 00244 — extends the union from 11 to 12
+        values; the kind CHECK widens in the same DDL).
+      - **Sub-plan ceiling only.** A throttle rule is STRICTLY a
+        tightening primitive: `requests_per_second ≤ plan.RateLimitRPS`
+        and `burst ≤ plan.RateLimitBurst`. The apid validator
+        (pkg/api/dto.go::EdgeRuleThrottleAction.Validate) enforces
+        the ceiling; the gateway compiler enforces it again at
+        load time and clamps + warns. A customer cannot raise
+        their plan limit by registering a throttle rule.
+      - **Bucket key: `appID + "\x00" + ruleID`.** Rule-scoped,
+        so cardinality is bounded by *configured rules*, not by
+        traffic. Per-IP sub-keying is deliberately out of v1
+        (memory-bounded limiter + attacker-controlled IP
+        cardinality = unbounded bucket growth).
+      - **Prerequisite: LRU eviction.** The existing Limiter has
+        no eviction; the throttle bucket-multiplies the
+        cardinality. New `NewLimiterWithLRU(cap)` constructor
+        + **full-bucket-only invariant** — only buckets with
+        `tokens >= burst` are evictable; partially-drained buckets
+        are pinned to prevent a forced-eviction bypass. Cap =
+        `pkg/gateway.EdgeRuleCacheCap` (10,000) for consistency.
+      - **Phase 1 (PR-A, ships alone):** read-only recommender.
+        `GET /v1/apps/{slug}/throttle-suggestions?range=` returns
+        `suggested_rps = clamp(ceil(observed_rps * 2), 1, plan.RateLimitRPS)`
+        per route, with `__route_other__` excluded from the
+        suggestions. New `pkg/promql.QueryGrouped` seam +
+        `pkg/throttlerec` package.
+      - **Phase 2 (PR-C + PR-D, land together):** enforcement.
+        `applyEdgeRuleThrottle` runs between `applyEdgeRuleLimit`
+        and the global MaxBytesReader on the hot path. Rejected
+        requests (jwt/ip/geo) don't consume a route token. Throttle
+        runs BEFORE the wake gate so throttled traffic never wakes
+        a VM. 429 carries `x-faas-rate-limit-scope: route` +
+        `X-RouteRateLimit-{Limit,Remaining,Reset}`.
+      - **Quota (Free-allowed, per-kind cap):**
+        `Limits.EdgeRulesThrottlePerApp` Free=1 / Hobby=5 / Pro=25
+        / Scale=100. Same precedent as `kind=geo` (Free-allowed
+        with a per-app cap; not gated by `IsPaidOnly`).
+      - **Per-consumer/API-key keying remains OUT of scope**
+        (Phase 3 — needs the ADR-040 policy question settled:
+        opaque X-API-Key header vs JWT claim). D20.5 closed.
     - **D20.6 — CORS non-preflight e2e path.** PR 6 covers CORS
       preflight e2e; non-preflight stamp-the-Origin flow is
       unit-tested at `pkg/gateway/handler.go:1175-1220` and the e2e

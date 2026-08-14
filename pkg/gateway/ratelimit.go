@@ -5,11 +5,19 @@
 package gateway
 
 import (
+	"container/list"
 	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
+
+// LimiterEvictScan bounds how many least-recently-used buckets one
+// eviction pass inspects before giving up. The scan walks back-to-front
+// looking for a bucket that is safe to drop (see evictOneLocked); the
+// bound keeps allowToken's worst case constant under the limiter mutex
+// rather than O(n) when every bucket is mid-drain.
+const LimiterEvictScan = 32
 
 // Limiter is a per-app token-bucket rate limiter (spec §4.1). Each app refills at
 // its plan's rps with a plan burst; an over-limit request is rejected (the caller
@@ -21,6 +29,20 @@ import (
 // instances are constructed in pkg/gateway/handler.go (one per scope) so SIGHUP
 // ForgetAll can target each scope independently and load tests can bypass one
 // without bypassing the other.
+//
+// # Bucket-map growth and optional LRU discipline
+//
+// A limiter built with NewLimiter / NewLimiterWithClock keeps every bucket it
+// has ever created: the map shrinks only via Forget / ForgetAccount /
+// ForgetAll (SIGHUP). That is sound for the per-app and per-account scopes
+// because the key space is bounded by the number of apps/accounts the node
+// routes for.
+//
+// Scopes whose key space is NOT bounded that way (issue #881's per-route
+// throttle keys on appID+ruleID) must use NewLimiterWithLRU, which caps the
+// map and evicts least-recently-used buckets. Eviction is only ever applied
+// to buckets that carry no state — see evictOneLocked for the invariant and
+// why violating it would be a limit bypass.
 type Limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -30,6 +52,16 @@ type Limiter struct {
 	// to assert the underlying handler path. DO NOT expose as a config
 	// knob in production.
 	noop bool
+	// cap is the maximum number of buckets retained when LRU discipline is
+	// enabled. Zero means unbounded (the historical behaviour that Allow /
+	// AllowAccount rely on); a positive value activates the recency list.
+	cap int
+	// ll orders buckets most-recently-used at the front. Non-nil only when
+	// cap > 0, so the unbounded path pays no list bookkeeping at all.
+	ll *list.List
+	// elems maps bucket key → its element in ll. Kept in lockstep with
+	// buckets whenever ll is non-nil.
+	elems map[string]*list.Element
 }
 
 type bucket struct {
@@ -37,6 +69,9 @@ type bucket struct {
 	rps    float64
 	burst  float64
 	last   time.Time
+	// key is duplicated here so evictOneLocked can delete the map entry
+	// from a list element without a reverse scan.
+	key string
 }
 
 // NewLimiter returns a limiter using the wall clock.
@@ -50,6 +85,39 @@ func NewLimiter() *Limiter {
 // the package-private now field. Production code uses NewLimiter.
 func NewLimiterWithClock(now func() time.Time) *Limiter {
 	return &Limiter{buckets: map[string]*bucket{}, now: now}
+}
+
+// NewLimiterWithLRU returns a limiter that retains at most cap buckets,
+// evicting least-recently-used entries once the map is full. Intended for
+// scopes whose key space is not bounded by the app/account count — issue
+// #881's per-route throttle keys on (appID, ruleID), so a customer with many
+// rules across many apps would otherwise grow the map without limit.
+//
+// cap <= 0 yields the historical unbounded limiter, so callers can pass a
+// config value through without a nil check. Pass EdgeRuleCacheCap to match
+// the edge-rule cache's ceiling.
+//
+// Eviction never resets an in-flight throttle: only buckets that have
+// refilled completely are candidates (see evictOneLocked).
+func NewLimiterWithLRU(cap int) *Limiter {
+	return newLimiterWithLRU(cap, time.Now)
+}
+
+// NewLimiterWithLRUClock is NewLimiterWithLRU with an injectable clock. Test
+// seam mirroring NewLimiterWithClock; eviction behaviour depends on elapsed
+// time, so the tests need a frozen clock to be deterministic.
+func NewLimiterWithLRUClock(cap int, now func() time.Time) *Limiter {
+	return newLimiterWithLRU(cap, now)
+}
+
+func newLimiterWithLRU(cap int, now func() time.Time) *Limiter {
+	l := &Limiter{buckets: map[string]*bucket{}, now: now}
+	if cap > 0 {
+		l.cap = cap
+		l.ll = list.New()
+		l.elems = map[string]*list.Element{}
+	}
+	return l
 }
 
 // Allow reports whether a request for appID on plan may proceed, consuming a
@@ -72,6 +140,36 @@ func (l *Limiter) Allow(appID string, plan api.Plan) bool {
 // the per-minute refill kicks in. Distinct from Allow (per-app) so a botnet
 // rotating across many apps within an account cannot evade this limiter by
 // keeping per-app rps low.
+// AllowWithParams is the rule-scoped variant for kind=throttle
+// (ADR-091 D20.5 amendment, issue #881). Caller (cmd-side
+// applyEdgeRuleThrottle) supplies the rule's bucket key (the
+// convention `appID + "\x00" + ruleID` so the bucket is bounded by
+// configured rules, not traffic — see plan §"Bucket key") together
+// with the rule's per-rule rps and burst. Returns true on a
+// consumed token, false when the bucket is empty (caller responds
+// 429 with `x-faas-rate-limit-scope: route` +
+// `X-RouteRateLimit-{Limit,Remaining,Reset}` headers — see
+// applyEdgeRuleThrottle). Distinct from Allow (per-app) and
+// AllowAccount (per-account) so customer-configured throttles
+// don't fight the platform-shared limits for map slots.
+//
+// rps must be > 0; the cmd-side compile clamps to 1 as
+// defence-in-depth against a direct-DB row that bypassed
+// apid-Validate, so call sites can rely on rps/burst > 0 here.
+// When the limiter was built with NewLimiterWithLRU, each call
+// also marks the bucket most-recently-used and, on inserting
+// into a full map, tries to evict (PR #887 invariant: only full
+// buckets are evictable, so an attacker cannot force eviction to
+// bypass a partially-drained rule bucket).
+func (l *Limiter) AllowWithParams(id string, rps, burst float64) bool {
+	if l.noop {
+		return true
+	}
+	if rps < 0 || burst < 0 {
+		return false
+	}
+	return l.allowToken(id, rps, burst)
+}
 func (l *Limiter) AllowAccount(accountID string, plan api.Plan) bool {
 	if l.noop {
 		return true
@@ -88,6 +186,10 @@ func (l *Limiter) AllowAccount(accountID string, plan api.Plan) bool {
 // burst is the bucket ceiling. Returns true on a consumed token, false when
 // the bucket is empty (caller responds 429). Plan changes update rps/burst
 // without losing in-flight tokens — see TestLimiterAllowAccount_PlanChange.
+//
+// When the limiter was built with NewLimiterWithLRU, each call also marks the
+// bucket most-recently-used and, on inserting into a full map, tries to evict.
+// The refill math itself is identical in both modes.
 func (l *Limiter) allowToken(id string, rps, burst float64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -95,8 +197,18 @@ func (l *Limiter) allowToken(id string, rps, burst float64) bool {
 	now := l.now()
 	b := l.buckets[id]
 	if b == nil {
-		b = &bucket{tokens: burst, rps: rps, burst: burst, last: now}
+		// Make room before inserting so the map never exceeds cap. If
+		// nothing is safe to evict the map is allowed to overshoot —
+		// correctness of in-flight throttles outranks the memory bound,
+		// and BucketCount surfaces the overshoot to /metrics.
+		if l.cap > 0 && len(l.buckets) >= l.cap {
+			l.evictOneLocked(now)
+		}
+		b = &bucket{tokens: burst, rps: rps, burst: burst, last: now, key: id}
 		l.buckets[id] = b
+		if l.ll != nil {
+			l.elems[id] = l.ll.PushFront(b)
+		}
 	} else {
 		// A plan change updates the bucket's parameters without losing tokens.
 		b.rps, b.burst = rps, burst
@@ -105,6 +217,11 @@ func (l *Limiter) allowToken(id string, rps, burst float64) bool {
 			b.tokens = b.burst
 		}
 		b.last = now
+		if l.ll != nil {
+			if el := l.elems[id]; el != nil {
+				l.ll.MoveToFront(el)
+			}
+		}
 	}
 
 	if b.tokens >= 1 {
@@ -114,10 +231,83 @@ func (l *Limiter) allowToken(id string, rps, burst float64) bool {
 	return false
 }
 
+// evictOneLocked drops at most one bucket to make room. Caller holds l.mu.
+//
+// # The safety invariant
+//
+// A bucket may only be evicted when it has refilled to its ceiling
+// (tokens >= burst). Such a bucket carries no information: re-creating it on
+// the next request produces a full bucket, which is exactly what was dropped,
+// so the eviction is unobservable.
+//
+// Evicting a partially drained bucket would be a LIMIT BYPASS. A caller who
+// has spent its tokens is meant to receive 429s until the bucket refills;
+// dropping that bucket hands them a fresh full one. Because bucket creation
+// is driven by request traffic, an attacker who can push the map to its cap
+// could then reset their own throttle at will — turning the memory bound into
+// an attack primitive. The scan therefore skips any bucket that is mid-drain,
+// even though that means the map can exceed cap under sustained pressure.
+//
+// The walk is back-to-front (least- to most-recently-used) and inspects at
+// most LimiterEvictScan entries so the mutex is never held for an O(n) sweep.
+func (l *Limiter) evictOneLocked(now time.Time) {
+	if l.ll == nil {
+		return
+	}
+	el := l.ll.Back()
+	for i := 0; el != nil && i < LimiterEvictScan; i++ {
+		prev := el.Prev()
+		b, _ := el.Value.(*bucket)
+		if b != nil && bucketFull(b, now) {
+			l.removeElementLocked(el)
+			return
+		}
+		el = prev
+	}
+}
+
+// bucketFull reports whether b would be at its ceiling if refilled to now.
+// Mirrors allowToken's refill formula but without writing back, so a bucket
+// is judged by what the next request would see rather than by the stale
+// token count left over from its previous call.
+func bucketFull(b *bucket, now time.Time) bool {
+	if b.burst <= 0 {
+		return false
+	}
+	tokens := b.tokens
+	if dt := now.Sub(b.last).Seconds(); dt > 0 {
+		tokens += dt * b.rps
+	}
+	return tokens >= b.burst
+}
+
+// removeElementLocked drops one element from both the recency list and the
+// bucket map. Caller holds l.mu. Mirrors EdgeRuleCache.removeElement.
+func (l *Limiter) removeElementLocked(el *list.Element) {
+	b, _ := el.Value.(*bucket)
+	l.ll.Remove(el)
+	if b != nil {
+		delete(l.buckets, b.key)
+		delete(l.elems, b.key)
+	}
+}
+
+// forgetLocked drops one key from the map and, when LRU discipline is on,
+// from the recency list too. Caller holds l.mu.
+func (l *Limiter) forgetLocked(id string) {
+	delete(l.buckets, id)
+	if l.ll != nil {
+		if el := l.elems[id]; el != nil {
+			l.ll.Remove(el)
+			delete(l.elems, id)
+		}
+	}
+}
+
 // Forget drops an app's bucket (e.g. on delete) to bound memory.
 func (l *Limiter) Forget(appID string) {
 	l.mu.Lock()
-	delete(l.buckets, appID)
+	l.forgetLocked(appID)
 	l.mu.Unlock()
 }
 
@@ -260,6 +450,61 @@ func (l *Limiter) PeekAccount(accountID string, plan api.Plan) (limit, remaining
 	return limit, remaining, resetSeconds, true
 }
 
+// PeekWithParams is the rule-scoped variant of Peek for
+// kind=throttle (ADR-091 D20.5 amendment, issue #881). Returns the
+// post-consume snapshot of the bucket at id (the same id used in
+// AllowWithParams — the convention is `appID + "\x00" + ruleID`)
+// using the supplied rps/burst as the bucket parameters. Caller
+// (applyEdgeRuleThrottle → writeRouteRateLimitHeaders) renders
+// the values into X-RouteRateLimit-{Limit,Remaining,Reset}. The
+// limit field is the burst (i.e. the bucket ceiling), matching
+// the X-RateLimit-Limit convention for the per-app + per-account
+// paths so a customer dashboard that auto-parses limit-style
+// headers sees one shape across all three scopes. Returns
+// ok=false on noop or a missing bucket (the "never seen" contract
+// shared with Peek / PeekAccount — the absence of the headers is
+// the loader-side signal that the value is "not yet established").
+func (l *Limiter) PeekWithParams(id string, rps, burst float64) (limit, remaining, resetSeconds int, ok bool) {
+	if l == nil || l.noop {
+		return 0, 0, 0, false
+	}
+	if rps <= 0 || burst <= 0 {
+		return 0, 0, 0, false
+	}
+	limit = int(burst)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.buckets[id]
+	if b == nil {
+		return limit, 0, 0, false
+	}
+	tokens := b.tokens
+	last := b.last
+	now := l.now()
+	dt := now.Sub(last).Seconds()
+	if dt > 0 {
+		tokens += dt * rps
+		if tokens > burst {
+			tokens = burst
+		}
+	}
+	if tokens < 0 {
+		tokens = 0
+	}
+	remaining = int(tokens)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if tokens < 1 {
+		resetSeconds = int((1-tokens)/rps + 1)
+		if resetSeconds < 1 {
+			resetSeconds = 1
+		}
+	}
+	return limit, remaining, resetSeconds, true
+}
+
 // ForgetAccount drops an account's bucket (ADR-040). Symmetric with Forget
 // for the per-account scope. SIGHUP uses ForgetAll which covers both scopes
 // at once; ForgetAccount is the per-scope escape hatch (e.g. for an admin
@@ -267,7 +512,7 @@ func (l *Limiter) PeekAccount(accountID string, plan api.Plan) (limit, remaining
 // the whole fleet — not wired today, but the seam is here).
 func (l *Limiter) ForgetAccount(accountID string) {
 	l.mu.Lock()
-	delete(l.buckets, accountID)
+	l.forgetLocked(accountID)
 	l.mu.Unlock()
 }
 
@@ -278,6 +523,10 @@ func (l *Limiter) ForgetAll() int {
 	l.mu.Lock()
 	n := len(l.buckets)
 	l.buckets = map[string]*bucket{}
+	if l.ll != nil {
+		l.ll.Init()
+		l.elems = map[string]*list.Element{}
+	}
 	l.mu.Unlock()
 	return n
 }
@@ -292,6 +541,10 @@ func (l *Limiter) ForgetAll() int {
 // The returned limiter shares l's bucket map (read-only after construction
 // in tests; no Allow path mutates it). Constructing a fresh mutex is
 // intentional — copying a sync.Mutex is a vet error.
+//
+// LRU state is deliberately NOT carried over: the noop limiter never inserts
+// buckets, so leaving cap at zero keeps the recency list out of a path that
+// would otherwise have to keep it in lockstep for no benefit.
 func (l *Limiter) WithNoop() *Limiter {
 	return &Limiter{
 		buckets: l.buckets,

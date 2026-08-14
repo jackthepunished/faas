@@ -895,10 +895,13 @@ func NewMetrics() *Metrics {
 	// failure modes than the other kinds because every sentinel
 	// error in pkg/edgejwks maps to a separate outcome for the
 	// dashboard). CORS + IP keep the closed {match, miss, blocked}
-	// triple. The closed set guarantees the §12 dashboard panel
-	// "edge rule match rate" surfaces every (kind, outcome)
-	// tuple from first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance", "geo"} {
+	// triple. The D20.5 amendment (issue #881) widens the loop
+	// with `throttle` so the §12 dashboard panel surfaces
+	// per-rule throttle match/deny rates from first scrape. The
+	// closed set guarantees the §12 dashboard panel "edge rule
+	// match rate" surfaces every (kind, outcome) tuple from
+	// first scrape.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
 		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
 		}
@@ -961,9 +964,9 @@ func NewMetrics() *Metrics {
 	// so the §12 dashboard chip "edge rule apply rate" + "edge rule
 	// compile errors" surface every tuple from first scrape. Closed
 	// set: {route, rewrite, redirect, headers, cors, jwt, ip, validate,
-	// limit, maintenance, geo}. Adding a new kind requires extending
-	// this slice — the metric name is stable.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance", "geo"} {
+	// limit, maintenance, geo, throttle}. Adding a new kind requires
+	// extending this slice — the metric name is stable.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
 		for _, result := range []string{"success", "error"} {
 			m.edgeRuleApply.WithLabelValues(kind, result)
 		}

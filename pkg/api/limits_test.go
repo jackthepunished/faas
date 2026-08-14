@@ -52,7 +52,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (route|rewrite|redirect|headers|cors) but jwt/ip stay
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
-			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1,
+			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1,
 			// ADR-099 (#879): tenant surfaces — Free is the abuse-floor
 			// tier. The `tenant_surfaces` feature is the upsell; Free
 			// customers carry the single-tenant case via the legacy
@@ -162,7 +162,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND the jwt|ip kinds. The plan-kind gate surface
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
-			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5,
+			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5,
 			// ADR-099 (#879): tenant surfaces — Hobby is the entry
 			// paid tier. 1 surface with up to 10 verified hostnames.
 			// The "single SaaS customer, handful of end-customer
@@ -267,7 +267,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-089 (planned): edge rules — Pro unlocks 100 rules
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
-			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25,
+			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25,
 			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
 			// with up to 50 verified hostnames each. Each surface
 			// still binds to one app (the multi-app variant is the
@@ -375,7 +375,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (5× Pro) AND jwt|ip. The 500 cap is the practical upper
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
-			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100,
+			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100,
 			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
 			// with up to 250 verified hostnames each. The 250 cap is
 			// bounded by LE's 100-SAN-per-cert limit (per_host_san
@@ -1940,6 +1940,50 @@ func TestEdgeRulesGeoPerApp_MonotonicLadder(t *testing.T) {
 		if currL.EdgeRulesGeoPerApp < prevL.EdgeRulesGeoPerApp {
 			t.Errorf("%s.EdgeRulesGeoPerApp (%d) < %s.EdgeRulesGeoPerApp (%d)",
 				ladder[i], currL.EdgeRulesGeoPerApp, ladder[i-1], prevL.EdgeRulesGeoPerApp)
+		}
+	}
+}
+
+// TestEdgeRulesThrottlePerApp_PerPlanMatrix pins the per-plan matrix
+// for EdgeRulesThrottlePerApp (ADR-091 D20.5 amendment, issue #881).
+// Free 1, Hobby 5, Pro 25, Scale 100 — mirrors EdgeRulesGeoPerApp
+// so the upgrade curve is predictable.
+func TestEdgeRulesThrottlePerApp_PerPlanMatrix(t *testing.T) {
+	want := map[Plan]int{
+		PlanFree:  1,
+		PlanHobby: 5,
+		PlanPro:   25,
+		PlanScale: 100,
+	}
+	for plan, expected := range want {
+		l, ok := LimitsFor(plan)
+		if !ok {
+			t.Errorf("plan %s: missing from LimitsFor", plan)
+			continue
+		}
+		if l.EdgeRulesThrottlePerApp != expected {
+			t.Errorf("%s: EdgeRulesThrottlePerApp = %d, want %d", plan, l.EdgeRulesThrottlePerApp, expected)
+		}
+		// Sanity: throttle cap is bounded by total EdgeRulesPerApp.
+		if l.EdgeRulesThrottlePerApp > l.EdgeRulesPerApp {
+			t.Errorf("%s: EdgeRulesThrottlePerApp (%d) > EdgeRulesPerApp (%d); per-kind cap cannot exceed the per-app total",
+				plan, l.EdgeRulesThrottlePerApp, l.EdgeRulesPerApp)
+		}
+	}
+}
+
+// TestEdgeRulesThrottlePerApp_MonotonicLadder pins that the per-plan
+// throttle-cap ladder is non-decreasing. Same load-bearing reasoning
+// as the geo ladder — the upgrade story and the billing model both
+// depend on Free ≤ Hobby ≤ Pro ≤ Scale.
+func TestEdgeRulesThrottlePerApp_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.EdgeRulesThrottlePerApp < prevL.EdgeRulesThrottlePerApp {
+			t.Errorf("%s.EdgeRulesThrottlePerApp (%d) < %s.EdgeRulesThrottlePerApp (%d)",
+				ladder[i], currL.EdgeRulesThrottlePerApp, ladder[i-1], prevL.EdgeRulesThrottlePerApp)
 		}
 	}
 }

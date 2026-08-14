@@ -455,6 +455,31 @@ type Limits struct {
 	// field; apid-Validate throws CodePlanEdgeRuleKindQuotaReached
 	// when this trips.
 	EdgeRulesGeoPerApp int
+	// EdgeRulesThrottlePerApp caps how many kind='throttle' rules
+	// one app may hold. ADR-091 D20.5 amendment (issue #881):
+	// per-route per-method token-bucket rate limiting customers
+	// attach to one (host, path, http_method) triple. Cardinality
+	// is bounded by configured rules (bucket key is appID+"\x00"+
+	// ruleID), so the per-app quota mirrors EdgeRulesGeoPerApp:
+	// the same Free-allowed posture keeps the abuse-desk path open
+	// and the same per-tier doubling shape (1/5/25/100) keeps the
+	// upgrade curve predictable.
+	//
+	// The finer-grained sub-plan ceiling on the action itself
+	// (rps ≤ plan.RateLimitRPS, burst ≤ plan.RateLimitBurst) is
+	// enforced twice: at apid create/update by
+	// api.EdgeRuleThrottleAction.Validate, and again at gateway
+	// compile time by cmd/gatewayd-internal/edge_rules.go::
+	// compileThrottleRules (defence-in-depth against a direct-DB
+	// write that bypassed apid).
+	//
+	// Per-plan: Free 1, Hobby 5, Pro 25, Scale 100. Throttle is
+	// available on ALL plans including Free (ADR-091 D20.5
+	// sub-decision — same posture as Geo: a customer can size a
+	// throttle on Free before upgrading). Plan gate is enforced
+	// via the EdgeRulesQuotaError.Kind field; apid-Validate
+	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
+	EdgeRulesThrottlePerApp int
 
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
@@ -876,6 +901,11 @@ var planLimits = map[Plan]Limits{
 		// except DE") is one rule. The upgrade path raises the cap
 		// to 5/25/100.
 		EdgeRulesGeoPerApp: 1,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp so the
+		// upgrade curve from Free → Scale is a single double/triple
+		// progression a customer can predict.
+		EdgeRulesThrottlePerApp: 1,
 		// Tenant surfaces (ADR-099 / issue #879): Free is the
 		// abuse-floor tier. The `tenant_surfaces` feature is the
 		// upsell — Free customers carry the single-tenant case via
@@ -1113,6 +1143,9 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  5,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 5,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
 		// entry paid tier — 1 surface with up to 10 verified
 		// hostnames. The "single SaaS customer, a handful of
@@ -1337,6 +1370,9 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  25,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 25,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
 		// with up to 50 verified hostnames each — the growing-SaaS
 		// tier. Each surface still binds to one app, so 5 surfaces
@@ -1556,6 +1592,9 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
 		EdgeRulesGeoPerApp:  100,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 100,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
 		// surfaces with up to 250 verified hostnames each — the
 		// established-SaaS tier. The 250 cap is bounded by LE's

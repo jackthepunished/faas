@@ -4398,6 +4398,87 @@ func (a *EdgeRuleMaintenanceAction) Validate() *Problem {
 	return nil
 }
 
+// EdgeRuleThrottleAction is the wire shape for a kind=throttle edge
+// rule (ADR-091 D20.5 amendment, issue #881). The per-route
+// token-bucket primitive: customers tighten the per-route rps/burst
+// below their plan's plan.RateLimitRPS — the apid validator enforces
+// the sub-plan ceiling; the gateway compiler enforces it again at
+// load time.
+//
+// Sub-plan ceiling — the load-bearing constraint. A throttle rule is
+// STRICTLY a tightening primitive. The per-handler parameter passed
+// by the apid handler is the customer's plan row; the ceiling is
+// plan.RateLimitRPS / plan.RateLimitBurst. A rule that exceeds the
+// ceiling is rejected with 422 BEFORE any DB write — a customer
+// cannot raise their plan limit by registering a throttle rule.
+//
+// The wire shape uses float64 for RequestsPerSecond so the
+// recommendation endpoint (which emits ceil(observed_rps * 2)) can
+// hand over a non-integer without coercing the customer's intent.
+// The bucket math spends the float directly in `tokens += dt *
+// rps`, so fractional values are exact under the refill formula.
+//
+// Validate enforces:
+//   - RequestsPerSecond > 0 (a 0-rps rule is a silent no-op AND
+//     would create a bucket that never refills — that bucket is
+//     OUT OF THE EVICTABLE SET per pkg/gateway/ratelimit.go's
+//     full-bucket-only invariant, so it would be a permanent
+//     memory leak).
+//   - RequestsPerSecond ≤ plan.RateLimitRPS (sub-plan ceiling).
+//   - Burst > 0 (same leak rationale as above).
+//   - Burst ≤ plan.RateLimitBurst (sub-plan ceiling).
+//
+// Per-IP sub-keying is deliberately absent in v1 — see
+// pkg/state/types.go::EdgeRuleThrottleAction for the design rationale.
+type EdgeRuleThrottleAction struct {
+	RequestsPerSecond float64 `json:"requests_per_second"`
+	Burst             int     `json:"burst"`
+}
+
+// ThrottleValidationContext is the per-plan ceiling that
+// validateEdgeRuleAction passes into EdgeRuleThrottleAction.Validate.
+// Keeping the boundary explicit (rather than reading limits globally)
+// makes the validator unit-testable without spinning up a plan row —
+// see pkg/api/dto_edge_rules_test.go for the test pattern.
+type ThrottleValidationContext struct {
+	PlanMaxRPS   float64
+	PlanMaxBurst int
+}
+
+func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Problem {
+	if a == nil {
+		return ErrValidation("throttle action is required")
+	}
+	if a.RequestsPerSecond <= 0 {
+		// 0 / negative rps is rejected for two reasons: (1) it is a
+		// silent no-op at request time — every request would be
+		// dropped, indistinguishable from a misconfig; (2) the
+		// bucket's refill formula uses rps as a multiplier, so a 0
+		// rate means the bucket never refills — under
+		// pkg/gateway/ratelimit.go's full-bucket-only invariant the
+		// bucket is permanently unevictable, which is a memory leak.
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: requests_per_second must be > 0 (got %g) — a 0-rps rule is a silent no-op AND would create a permanently unevictable bucket",
+			a.RequestsPerSecond))
+	}
+	if a.Burst <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: burst must be > 0 (got %d) — same rationale as a 0-rps rule",
+			a.Burst))
+	}
+	if ctx.PlanMaxRPS > 0 && a.RequestsPerSecond > ctx.PlanMaxRPS {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: requests_per_second %g exceeds the plan ceiling %g — a throttle rule is strictly a tightening primitive; customers can only narrow, never widen",
+			a.RequestsPerSecond, ctx.PlanMaxRPS))
+	}
+	if ctx.PlanMaxBurst > 0 && a.Burst > ctx.PlanMaxBurst {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: burst %d exceeds the plan ceiling %d — a throttle rule is strictly a tightening primitive",
+			a.Burst, ctx.PlanMaxBurst))
+	}
+	return nil
+}
+
 // EdgeRuleResponse is the wire shape for an edge rule. Action is
 // kept as json.RawMessage so the generated Node/Python SDKs don't
 // need seven per-kind models today; a typed SDK unmarshals into
@@ -4459,6 +4540,61 @@ type RekeyProgress struct {
 	Skipped int64  `json:"skipped"`
 	Failed  int64  `json:"failed"`
 	LastID  string `json:"last_id,omitempty"`
+}
+
+// ThrottleSuggestionRow is one (route → suggested rate) row in the
+// payload returned by GET /v1/apps/{slug}/throttle-suggestions
+// (ADR-091 D20.5 amendment, issue #881 / PR-E). The recommender is
+// read-only — it never auto-applies — and the suggestion is always
+// ≤ the customer's plan ceiling (pkg/api.Limits.RateLimitRPS) so a
+// customer can act on it without a 422 from apid's sub-plan
+// validator.
+//
+// `Route` is the bounded label exactly as emitted on the Prometheus
+// side: method + raw path (the same shape RouteRow.Route uses, ADR-093
+// D6). The recommender never sees the reserved __route_other__
+// overflow bucket — it is dropped from the suggestions slice and
+// the count surfaces as RoutesCollapsed so the customer can tell
+// "wildcard-shape pattern" from "low traffic on a real route".
+//
+// `ObservedRPS` is the rate() value over the window (already
+// per-second). `SuggestedRPS` is `ceil(observed_rps * 2)` clamped
+// into [1, plan.RateLimitRPS] — the 2× headroom is documented on
+// the wire so the number is auditable rather than magic. The
+// `Multiplier` field pins the formula version so a future change
+// to the recommendation strategy can be distinguished from drift.
+type ThrottleSuggestionRow struct {
+	Route          string  `json:"route"`
+	ObservedRPS    float64 `json:"observed_rps"`
+	SuggestedRPS   float64 `json:"suggested_rps"`
+	SuggestedBurst int     `json:"suggested_burst"`
+	Multiplier     float64 `json:"multiplier"`
+}
+
+// ThrottleSuggestionsResponse is the wire shape for
+// GET /v1/apps/{slug}/throttle-suggestions. Source degrades the
+// same way AppMetricsResponse does: "prometheus" on success,
+// "degraded: <reason>" otherwise. RouteMetricsDisabled is true
+// when apps.route_metrics_enabled=false (Free plan) — the response
+// carries empty Suggestions plus that flag so the dashboard can
+// render the upsell rather than a misleading zero.
+//
+// RoutesCollapsed reports the count of routes that collapsed into
+// __route_other__ during the window (ADR-093 cap = 50). It's a
+// coverage signal, not a recommendation signal — a non-zero value
+// tells the customer their throttle will be partial-coverage
+// regardless of what limit they set.
+type ThrottleSuggestionsResponse struct {
+	AppID                string                  `json:"app_id"`
+	Range                string                  `json:"range"`
+	Source               string                  `json:"source"`
+	AsOf                 string                  `json:"as_of"`
+	RouteMetricsDisabled bool                    `json:"route_metrics_disabled"`
+	RoutesCollapsed      int                     `json:"routes_collapsed"`
+	PlanCeilingRPS       int                     `json:"plan_ceiling_rps"`
+	PlanCeilingBurst     int                     `json:"plan_ceiling_burst"`
+	Multiplier           float64                 `json:"multiplier"`
+	Suggestions          []ThrottleSuggestionRow `json:"suggestions"`
 }
 
 // AppErrorsSummaryResponse is the wire body for

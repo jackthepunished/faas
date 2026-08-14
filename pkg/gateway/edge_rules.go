@@ -366,7 +366,19 @@ type HostEntry struct {
 	// plain slice to match the surrounding fields — the cache
 	// primitive is kind-agnostic and the cmd-side loader threads
 	// one slice per kind into the HostEntry.
-	Geo          []EdgeRuleGeoResolved
+	Geo []EdgeRuleGeoResolved
+	// Throttle carries the kind=throttle subset (ADR-091 D20.5
+	// amendment, issue #881). Same shape as Limit / Maintenance
+	// above; the applier (handler.go::applyEdgeRuleThrottle) reads
+	// the resolved rule's RequestsPerSecond + Burst, constructs a
+	// rule-scoped bucket key (AppID + "\x00" + ID), and decrements
+	// it on every passing request. The bucket is held in the shared
+	// limiter built with NewLimiterWithLRU (#887) so the wake path
+	// never exceeds the configured cardinality. Stored as a plain
+	// slice to match the surrounding fields — the cache primitive
+	// is kind-agnostic and the cmd-side loader threads one slice
+	// per kind into the HostEntry.
+	Throttle     []EdgeRuleThrottleResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -596,6 +608,26 @@ func (c *EdgeRuleCache) GetGeo(host string) ([]EdgeRuleGeoResolved, bool) {
 	return out, true
 }
 
+// GetThrottle is the kind=throttle accessor (ADR-091 D20.5
+// amendment, issue #881). Same shape as GetLimit: returns a
+// value-copy of the underlying slice and a hit bool; nil slice
+// with ok=true means "entry exists but no throttle rule for this
+// host". The applier (handler.go::applyEdgeRuleThrottle) consults
+// the priority-ordered slice via PickFirstThrottleMatch.
+func (c *EdgeRuleCache) GetThrottle(host string) ([]EdgeRuleThrottleResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Throttle == nil {
+		return nil, true
+	}
+	src := entry.Throttle
+	out := make([]EdgeRuleThrottleResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
 // getEntry promotes the entry on hit and returns it. Internal —
 // the Get* family wraps this so each returns a typed slice.
 //
@@ -743,6 +775,7 @@ type EdgeRuleMatcher interface {
 	MatchLimit(ctx context.Context, host, path, method string) *EdgeRuleLimitResolved
 	MatchMaintenance(ctx context.Context, host, path, method string) *EdgeRuleMaintenanceResolved
 	MatchGeo(ctx context.Context, host, path, method string) *EdgeRuleGeoResolved
+	MatchThrottle(ctx context.Context, host, path, method string) *EdgeRuleThrottleResolved
 	Reset()
 }
 
@@ -901,6 +934,9 @@ func (noOpEdgeRuleMatcher) MatchMaintenance(context.Context, string, string, str
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchGeo(context.Context, string, string, string) *EdgeRuleGeoResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchThrottle(context.Context, string, string, string) *EdgeRuleThrottleResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}
