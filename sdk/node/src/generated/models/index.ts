@@ -34,6 +34,7 @@ export type { AppSecretListResponse } from './AppSecretListResponse.js';
 export type { AppSecretResponse } from './AppSecretResponse.js';
 export type { AppSecurityRequest } from './AppSecurityRequest.js';
 export type { AppSecurityResponse } from './AppSecurityResponse.js';
+export type { AppStreamingStatus } from './AppStreamingStatus.js';
 export type { AppTrustedSignerListResponse } from './AppTrustedSignerListResponse.js';
 export type { AppWebhookDeliveryListResponse } from './AppWebhookDeliveryListResponse.js';
 export type { AppWebhookDeliveryResponse } from './AppWebhookDeliveryResponse.js';

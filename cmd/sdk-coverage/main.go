@@ -386,6 +386,15 @@ var methodRouteMap = map[string]string{
 	// ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/routes": "GetAppRoutes",
 
+	// ADR-102 D6 — per-app streaming classification probe. The
+	// auto-derivation would produce GetAppsSlugStreaming-cap
+	// (Swagger-style with literal hyphen); the SDK names it
+	// GetAppStreamingStatus to match the sibling per-app family
+	// (GetAppRoutes, GetAppMetrics, GetAppSLO) — drop the slug
+	// placeholder from the verb and use the SDK type name
+	// (AppStreamingStatus) for the noun.
+	"GET /v1/apps/{slug}/streaming-cap": "GetAppStreamingStatus",
+
 	// ADR-096 / PR-B — customer-facing automatic error grouping.
 	// SDK names are pinned to the per-app family (GetAppErrorsSummary,
 	// ListAppErrorRequests, GetAppErrorSample) — auto-derivation would

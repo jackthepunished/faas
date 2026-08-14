@@ -43,6 +43,7 @@ export type { AppSecurityRequest } from './models/AppSecurityRequest.js';
 export type { AppSecurityResponse } from './models/AppSecurityResponse.js';
 export type { AppSLOResponse } from './models/AppSLOResponse.js';
 export type { AppsMetricsResponse } from './models/AppsMetricsResponse.js';
+export type { AppStreamingStatus } from './models/AppStreamingStatus.js';
 export type { AppTrustedSignerListResponse } from './models/AppTrustedSignerListResponse.js';
 export type { AppWebhookDeliveryListResponse } from './models/AppWebhookDeliveryListResponse.js';
 export type { AppWebhookDeliveryResponse } from './models/AppWebhookDeliveryResponse.js';
