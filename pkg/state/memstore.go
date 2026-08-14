@@ -989,9 +989,11 @@ func (m *MemStore) ListOIDCTrustPoliciesForAccount(_ context.Context, accountID 
 	return out, nil
 }
 
-// InsertOIDCExchangedToken stores a fresh exchanged-token row.
-// The hash field is the unique key.
-func (m *MemStore) InsertOIDCExchangedToken(_ context.Context, t *OIDCExchangedToken) error {
+// InsertOIDCExchangedToken stores a fresh exchanged-token row and
+// returns the server-minted row id. The hash field is the unique
+// key; the id is the audit-correlation key — pkg/oidc/handler.go
+// echoes it in the response and stamps it on the audit row.
+func (m *MemStore) InsertOIDCExchangedToken(_ context.Context, t *OIDCExchangedToken) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if t.ID == "" {
@@ -1001,7 +1003,7 @@ func (m *MemStore) InsertOIDCExchangedToken(_ context.Context, t *OIDCExchangedT
 		t.CreatedAt = time.Now()
 	}
 	m.oidcExchangedTokens[hex.EncodeToString(t.TokenHash)] = *t
-	return nil
+	return t.ID, nil
 }
 
 // GetOIDCExchangedTokenByHash returns the row whose TokenHash

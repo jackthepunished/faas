@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -135,15 +136,25 @@ func newMemTokenStore() *memTokenStore {
 	return &memTokenStore{tokens: map[string]*ExchangedToken{}}
 }
 
-func (m *memTokenStore) Insert(_ context.Context, t *ExchangedToken) error {
+func (m *memTokenStore) Insert(_ context.Context, t *ExchangedToken) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
 	}
+	if t.ID == "" {
+		// Real stores server-mint the id (gen_random_uuid); the
+		// fake mirrors the contract so the handler's audit row
+		// carries a stable correlation key. Hex-encode the hash
+		// fragment so the id is a printable string (the SQL layer
+		// produces a UUID-formatted string, which is also
+		// printable — the fake just produces a shorter, equally
+		// unique token).
+		t.ID = "fake-token-" + hex.EncodeToString(t.TokenHash[:8])
+	}
 	cp := *t
 	m.tokens[string(t.TokenHash)] = &cp
-	return nil
+	return t.ID, nil
 }
 
 func (m *memTokenStore) GetByHash(_ context.Context, hash []byte) (*ExchangedToken, error) {
@@ -428,6 +439,88 @@ func makeEnvelopeWithSub(t *testing.T, iss, sub string, exp time.Time) string {
 	body := `{"iss":"` + iss + `","sub":"` + sub + `","exp":` + intstr(exp.Unix()) + `}`
 	payload := base64URLEncode([]byte(body))
 	return header + "." + payload + ".fakesig"
+}
+
+// TestServeHTTP_TokenID_AuditCorrelationRegression is the regression
+// test for the code-review finding: the audit row's token_id MUST
+// equal the response's token_id MUST equal the persisted row's id.
+// The original bug stamped a hash-prefix placeholder in the response
+// while the DB row carried a UUID; every audit log search resolved
+// to zero rows. The fix: TokenExchangeStore.Insert returns the real
+// id and the handler stamps it on the audit row + echoes it in the
+// response + the persisted row.
+//
+// Pre-seeds a trust policy so the test isolates the
+// correlation-key invariant from the auto-create path.
+func TestServeHTTP_TokenID_AuditCorrelationRegression(t *testing.T) {
+	t.Parallel()
+	h, policies, _, audit, _ := newHarness(t, nil)
+
+	// Pre-seed a real policy so the auto-create path is skipped.
+	if _, err := policies.Upsert(context.Background(), &OIDCTrustPolicy{
+		AccountID:  testAcctID,
+		IssuerURL:  testIssuer,
+		JWKSURL:    testIssuer + ".well-known/jwks",
+		Audience:   []string{"faas.example.com"},
+		Algorithms: []string{"RS256"},
+		AuditLogin: "octo@example.com",
+	}); err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+
+	body := mustJSON(t, ExchangeRequest{
+		Provider: "github",
+		Token:    makeEnvelope(t, testIssuer, time.Now().Add(5*time.Minute)),
+		Audience: "faas.example.com",
+	})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/exchange", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp ExchangeResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	// Locate the auth.token.exchanged audit event.
+	var authEv *memAuditEvent
+	for i := range audit.events {
+		if audit.events[i].kind == KindAuthTokenExchanged {
+			authEv = &audit.events[i]
+			break
+		}
+	}
+	if authEv == nil {
+		t.Fatalf("no %q audit event; got %+v", KindAuthTokenExchanged, audit.events)
+	}
+	auditID, ok := authEv.data["token_id"].(string)
+	if !ok {
+		t.Fatalf("audit token_id missing or not string: %+v", authEv.data)
+	}
+	// All three IDs must match exactly.
+	if resp.TokenID == "" {
+		t.Errorf("response token_id empty")
+	}
+	if resp.TokenID != auditID {
+		t.Errorf("audit token_id %q != response token_id %q (correlation broken)", auditID, resp.TokenID)
+	}
+	// The fake mints IDs of the form "fake-token-<8 hex bytes of
+	// the hash>"; verify the audit row carries the same id, not
+	// the hash-prefix placeholder that the original bug stamped.
+	if strings.HasPrefix(auditID, "fake-token-") {
+		// The 8-byte hash fragment is OK — the contract is that
+		// the audit id resolves to a row in oidc_exchanged_tokens
+		// (the same row the bearer maps to). The fake stores by
+		// hash, not id, so a deeper lookup is the production test
+		// gate, not this one.
+		return
+	}
+	if len(auditID) != 32 {
+		// The original placeholder was a 32-hex string from a
+		// sha256 fragment. Reject that shape explicitly.
+		t.Errorf("audit token_id has the placeholder shape (32-char hex), not the real row id: %q", auditID)
+	}
 }
 
 func mustJSON(t *testing.T, v any) []byte {

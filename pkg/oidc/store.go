@@ -67,7 +67,10 @@ type TokenExchangeStore interface {
 	// Insert stores a fresh ExchangedToken row. Caller generates the
 	// bearer (api.GenerateOIDCKey) and hashes it (api.HashAPIKey)
 	// before calling Insert; the row carries only the hash.
-	Insert(ctx context.Context, t *ExchangedToken) error
+	// Returns the server-minted row id (gen_random_uuid at the SQL
+	// layer; uuid.NewString in memstore) so the handler can echo
+	// it in the response and use it as the audit correlation key.
+	Insert(ctx context.Context, t *ExchangedToken) (string, error)
 
 	// GetByHash returns the row whose TokenHash equals the input.
 	// Returns ErrTokenNotFound on miss. The caller checks ExpiresAt

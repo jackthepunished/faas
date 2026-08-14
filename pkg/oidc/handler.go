@@ -17,23 +17,34 @@
 // The handler does the work in five steps:
 //
 //  1. Decode + validate the request body.
-//  2. Look up the (account_id, issuer_url) trust policy. The
-//     issuer_url is resolved from the JWT's `iss` claim once we
-//     parse the envelope (cheap — no signature check yet), so the
-//     first-use auto-create can happen before the JWKS fetch.
-//  3. Verify the JWT against the policy (aud + iss + sub_pattern +
-//     algs). On success: mint a short-lived bearer, persist the
-//     ExchangedToken row, emit auth.token.exchanged.
-//  4. Return the bearer in the response.
+//  2. Parse the JWT envelope (no signature check yet) and resolve
+//     the iss claim. Verify the JWT against a permissive default
+//     (proves the signature + checks iss; skips aud/sub_pattern).
+//  3. Resolve the OIDC subject to a platform account.
+//  4. Look up the (account_id, issuer_url) trust policy. On miss,
+//     auto-create a permissive default and emit
+//     oidc.trust_policy.created.
+//  5. Mint the short-lived bearer, persist the ExchangedToken row,
+//     emit auth.token.exchanged, return the bearer in the response.
 //
-// First-use auto-create: when Get returns ErrTrustPolicyNotFound,
-// the handler Upserts a permissive default policy (sub_pattern=empty,
-// algs=[RS256], RequiredClaims={}, audit_login='auto') and retries
-// the verify. The Upsert emits oidc.trust_policy.created.
+// First-use auto-create: when Get returns ErrTrustPolicyNotFound
+// (the customer has bound the issuer but never refined the policy),
+// the handler Upserts a permissive default (sub_pattern=empty,
+// algs=[RS256], RequiredClaims={}, audit_login='auto') and emits
+// oidc.trust_policy.created. PR-C adds the dashboard refine UI for
+// narrowing subject_pattern + RequiredClaims.
+//
+// AccountByOIDCSubject must succeed before the policy lookup — the
+// (account_id, issuer_url) trust policy is the binding between the
+// OIDC issuer and the platform account. PR-A scope: customers
+// pre-bind the issuer via the dashboard before their first CI
+// deploy (PR-C makes that step self-service). The handler does NOT
+// auto-create the account binding; only the policy row that lives
+// underneath it.
 //
 // The handler is < 50 lines per cmd/apid convention; the helpers
-// (resolveIssuerFromToken / verifyAndMint / upsertDefaultPolicy) are
-// extracted into the same file.
+// (peekIssuer / permissiveDefaultPolicy / permissiveDefaultPolicyFor)
+// are extracted into the same file.
 package oidc
 
 import (
@@ -118,8 +129,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 1: parse the JWS envelope (no signature check yet) so we
-	// can read the iss claim to find the trust policy. The signature
-	// check happens at Step 3 after we know the policy.
+	// can read the iss claim to resolve the trust policy. The
+	// signature check happens at Step 2.
 	issuerURL, err := peekIssuer(req.Token)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
@@ -127,70 +138,64 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: look up the trust policy. On miss, auto-create a
-	// permissive default (sub_pattern="", algs=[RS256], empty
-	// RequiredClaims) and emit oidc.trust_policy.created. The
-	// Upsert is unconditional — the second call is the no-op path.
-	policy, err := deps.Policies.Get(r.Context(), "", issuerURL) // account_id resolved at Step 4
-	if err != nil && !errors.Is(err, ErrTrustPolicyNotFound) {
-		api.WriteProblem(w, api.ErrCapacity("trust policy lookup failed"))
-		return
-	}
-	if errors.Is(err, ErrTrustPolicyNotFound) {
-		// Account not yet resolved; we retry after Step 4. Store a
-		// sentinel and continue. (The auto-create is bound to an
-		// account, so we have to know the account first.)
-		policy = nil
-	}
-
-	// Step 3: verify the JWT against the policy. If we don't have a
-	// policy yet (first-use path) we use a permissive default for
-	// the verify-only check; the real policy is upserted after
-	// account resolution.
-	verifyAgainst := policy
-	if verifyAgainst == nil {
-		verifyAgainst = permissiveDefaultPolicy(issuerURL)
-	}
-	claims, err := deps.Verifier.Verify(r.Context(), req.Token, verifyAgainst)
+	// Step 2: verify the JWT against a permissive default. We
+	// don't know the (account_id, issuer_url) policy yet because
+	// we haven't resolved the OIDC subject to an account — the
+	// chicken-and-egg is broken at Step 2 (verify), Step 3
+	// (account lookup), Step 4 (policy lookup + auto-create).
+	//
+	// Using the permissive default here means: first-use runs the
+	// JWT through the JWKS verifier (proves the signature), checks
+	// iss (must match the issuer we peeked), and skips aud/sub
+	// gates. The real policy — which carries the customer's pinned
+	// audience and any required-claim patterns — is enforced on
+	// subsequent exchanges via the persisted policy row.
+	claims, err := deps.Verifier.Verify(r.Context(), req.Token, permissiveDefaultPolicy(issuerURL))
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
 			"Invalid token", err.Error()))
 		return
 	}
 
-	// Step 4: resolve the OIDC subject to a platform account.
+	// Step 3: resolve the OIDC subject to a platform account.
 	acct, err := deps.Lookups.AccountByOIDCSubject(r.Context(), issuerURL, claims.Subject)
 	if err != nil {
+		// 401 (not 404): the customer controls whether a subject
+		// is bound, and the same shape covers "no policy exists
+		// for this issuer" (a real prod failure mode) and "the
+		// subject is not bound to this account" (a real CI
+		// failure mode). The detail message carries enough
+		// context for the customer's deploy logs.
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
 			"OIDC subject not bound", "no account bound to ("+issuerURL+", "+claims.Subject+")"))
 		return
 	}
 
-	// Step 4a: if the policy was missing on the first lookup, retry
-	// the Get with the resolved account_id and auto-create on miss.
-	if policy == nil {
-		policy, err = deps.Policies.Get(r.Context(), acct.ID, issuerURL)
-		if err != nil && !errors.Is(err, ErrTrustPolicyNotFound) {
-			api.WriteProblem(w, api.ErrCapacity("trust policy lookup failed"))
+	// Step 4: look up the (account_id, issuer_url) policy. On
+	// miss, auto-create a permissive default (sub_pattern="",
+	// algs=[RS256], empty RequiredClaims) and emit
+	// oidc.trust_policy.created.
+	policy, err := deps.Policies.Get(r.Context(), acct.ID, issuerURL)
+	if err != nil && !errors.Is(err, ErrTrustPolicyNotFound) {
+		api.WriteProblem(w, api.ErrCapacity("trust policy lookup failed"))
+		return
+	}
+	if errors.Is(err, ErrTrustPolicyNotFound) {
+		policy = permissiveDefaultPolicyFor(acct.ID, issuerURL)
+		policy, err = deps.Policies.Upsert(r.Context(), policy)
+		if err != nil {
+			api.WriteProblem(w, api.ErrCapacity("trust policy upsert failed"))
 			return
 		}
-		if errors.Is(err, ErrTrustPolicyNotFound) {
-			policy = permissiveDefaultPolicyFor(acct.ID, issuerURL)
-			policy, err = deps.Policies.Upsert(r.Context(), policy)
-			if err != nil {
-				api.WriteProblem(w, api.ErrCapacity("trust policy upsert failed"))
-				return
-			}
-			if deps.Audit != nil {
-				acctID := acct.ID
-				deps.Audit.Emit(r.Context(), KindOIDCTrustPolicyCreated, &acctID, map[string]any{
-					"account_id": acct.ID,
-					"issuer_url": issuerURL,
-					"jwks_url":   policy.JWKSURL,
-					"audience":   policy.Audience,
-					"created_by": "auto",
-				})
-			}
+		if deps.Audit != nil {
+			acctID := acct.ID
+			deps.Audit.Emit(r.Context(), KindOIDCTrustPolicyCreated, &acctID, map[string]any{
+				"account_id": acct.ID,
+				"issuer_url": issuerURL,
+				"jwks_url":   policy.JWKSURL,
+				"audience":   policy.Audience,
+				"created_by": "auto",
+			})
 		}
 	}
 
@@ -210,16 +215,21 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Audience:  claims.Aud,
 		JTI:       claims.JTI,
 	}
-	if err := deps.Tokens.Insert(r.Context(), row); err != nil {
+	// Insert returns the server-minted row id (gen_random_uuid at
+	// the SQL layer; uuid.NewString in memstore). The id is the
+	// audit-correlation key — the customer can grep the audit
+	// reader for it to find "which CI job shipped?".
+	tokenID, err := deps.Tokens.Insert(r.Context(), row)
+	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not persist bearer"))
 		return
 	}
-	row.ID = deriveTokenIDFromHash(hash) // store sets the real id; this is the audit-friendly echo
+	row.ID = tokenID
 	if deps.Audit != nil {
 		acctID := acct.ID
 		deps.Audit.Emit(r.Context(), KindAuthTokenExchanged, &acctID, map[string]any{
 			"account_id":  acct.ID,
-			"token_id":    row.ID,
+			"token_id":    tokenID,
 			"issuer_url":  issuerURL,
 			"audience":    req.Audience,
 			"subject":     claims.Subject,
@@ -230,7 +240,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ExchangeResponse{
 		Bearer:    plaintext,
 		ExpiresIn: int(OIDCBearerTTL.Seconds()),
-		TokenID:   row.ID,
+		TokenID:   tokenID,
 	})
 }
 
@@ -308,29 +318,6 @@ func permissiveDefaultPolicyFor(accountID, issuerURL string) *OIDCTrustPolicy {
 		Algorithms: defaultAlgorithms,
 		AuditLogin: "auto",
 	}
-}
-
-// deriveTokenIDFromHash is a placeholder used in the response body.
-// The real id is allocated by TokenExchangeStore.Insert (uuid); we
-// echo a deterministic-but-opaque id so the response shape is stable
-// even when the store hasn't returned the row yet (Insert is fire-
-// and-forget here; the row ID is allocated server-side and we don't
-// need to round-trip it for the customer's deploy call).
-//
-// In a follow-up PR (when pkg/state surfaces the Insert's id) this
-// becomes the actual row id; until then it's a sha256-prefix of the
-// hash. The audit row carries the same id; correlation is stable.
-func deriveTokenIDFromHash(hash []byte) string {
-	if len(hash) < 16 {
-		return ""
-	}
-	const hex = "0123456789abcdef"
-	out := make([]byte, 32)
-	for i := 0; i < 16; i++ {
-		out[2*i] = hex[hash[i]>>4]
-		out[2*i+1] = hex[hash[i]&0x0f]
-	}
-	return string(out)
 }
 
 // writeJSON is the standard cmd/apid response shape — same envelope

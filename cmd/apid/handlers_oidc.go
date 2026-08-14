@@ -24,6 +24,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/onebox-faas/faas/pkg/oidc"
@@ -113,7 +114,17 @@ func (a oidcTrustPolicyStoreAdapter) Upsert(ctx context.Context, p *oidc.OIDCTru
 }
 
 func (a oidcTrustPolicyStoreAdapter) Get(ctx context.Context, accountID, issuerURL string) (*oidc.OIDCTrustPolicy, error) {
-	return a.store.GetOIDCTrustPolicy(ctx, accountID, issuerURL)
+	policy, err := a.store.GetOIDCTrustPolicy(ctx, accountID, issuerURL)
+	if errors.Is(err, state.ErrNotFound) {
+		// The pkg/state contract is "ErrNotFound" but the
+		// pkg/oidc-side interface uses a distinct sentinel so the
+		// exchange handler can tell "no policy" from "store
+		// failure". Translate at the adapter boundary so the
+		// handler's errors.Is(err, ErrTrustPolicyNotFound) check
+		// works for both PgStore and MemStore.
+		return nil, oidc.ErrTrustPolicyNotFound
+	}
+	return policy, err
 }
 
 func (a oidcTrustPolicyStoreAdapter) ListForAccount(ctx context.Context, accountID string) ([]*oidc.OIDCTrustPolicy, error) {
@@ -130,12 +141,28 @@ func storeAsTokenExchangeStore(s state.Store) oidc.TokenExchangeStore {
 
 type tokenExchangeStoreAdapter struct{ store state.Store }
 
-func (a tokenExchangeStoreAdapter) Insert(ctx context.Context, t *oidc.ExchangedToken) error {
-	return a.store.InsertOIDCExchangedToken(ctx, t)
+func (a tokenExchangeStoreAdapter) Insert(ctx context.Context, t *oidc.ExchangedToken) (string, error) {
+	id, err := a.store.InsertOIDCExchangedToken(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	// Return the server-minted row id so the handler can echo it
+	// in the response and use it as the audit correlation key.
+	t.ID = id
+	return id, nil
 }
 
 func (a tokenExchangeStoreAdapter) GetByHash(ctx context.Context, hash []byte) (*oidc.ExchangedToken, error) {
-	return a.store.GetOIDCExchangedTokenByHash(ctx, hash)
+	tok, err := a.store.GetOIDCExchangedTokenByHash(ctx, hash)
+	if errors.Is(err, state.ErrNotFound) {
+		// Same sentinel translation as
+		// oidcTrustPolicyStoreAdapter.Get — the pkg/state contract
+		// is "ErrNotFound" but pkg/oidc wants ErrTokenNotFound so
+		// the auth middleware can distinguish "key never existed"
+		// from "long-lived key was revoked".
+		return nil, oidc.ErrTokenNotFound
+	}
+	return tok, err
 }
 
 func (a tokenExchangeStoreAdapter) Delete(ctx context.Context, id string) error {

@@ -674,7 +674,10 @@ type Store interface {
 	// InsertOIDCExchangedToken stores a fresh exchanged-token row.
 	// The caller has already generated the bearer (api.GenerateOIDCKey)
 	// and hashed it (api.HashAPIKey); the row carries only the hash.
-	InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchangedToken) error
+	// Returns the server-minted row id (gen_random_uuid at the SQL
+	// layer) so the caller can echo it in the response and stamp
+	// it on the audit row as the correlation key.
+	InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchangedToken) (string, error)
 	// GetOIDCExchangedTokenByHash returns the row whose TokenHash
 	// equals the input. Returns ErrNotFound on miss. The caller
 	// checks ExpiresAt before using the row — a stale row that

@@ -413,20 +413,26 @@ func (s *PgStore) ListOIDCTrustPoliciesForAccount(ctx context.Context, accountID
 	return out, nil
 }
 
-// InsertOIDCExchangedToken stores a fresh exchanged-token row.
-// See Store.InsertOIDCExchangedToken for the contract.
+// InsertOIDCExchangedToken stores a fresh exchanged-token row and
+// returns the server-minted row id (gen_random_uuid at the SQL
+// layer). The id is the audit-correlation key — pkg/oidc/handler.go
+// echoes it in the response and stamps it on the audit row so a
+// customer can correlate "which fp_oidc_<…> bearer did CI ship?"
+// to "which row in oidc_exchanged_tokens".
 //
-// The SQL lands when migration 00266 merges. Stub for now.
-func (s *PgStore) InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchangedToken) error {
+// Returns ErrNotFound when the inputs are empty so the handler can
+// surface a 500 cleanly without leaking the underlying SQL error
+// to the wire.
+func (s *PgStore) InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchangedToken) (string, error) {
 	if t.AccountID == "" || len(t.TokenHash) == 0 || t.ExpiresAt.IsZero() {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	accountUUID, err := uuid.Parse(t.AccountID)
 	if err != nil {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	q := sqlc.New()
-	_, err = q.InsertOIDCExchangedToken(ctx, s.pool, sqlc.InsertOIDCExchangedTokenParams{
+	row, err := q.InsertOIDCExchangedToken(ctx, s.pool, sqlc.InsertOIDCExchangedTokenParams{
 		AccountID: pgtypeFromUUID(accountUUID),
 		TokenHash: t.TokenHash,
 		ExpiresAt: pgtypeFromTime(t.ExpiresAt),
@@ -435,7 +441,10 @@ func (s *PgStore) InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchanged
 		Audience:  t.Audience,
 		Jti:       pgtype.Text{String: t.JTI, Valid: t.JTI != ""},
 	})
-	return err
+	if err != nil {
+		return "", err
+	}
+	return uuidFromPgtype(row.ID).String(), nil
 }
 
 // GetOIDCExchangedTokenByHash returns the row whose TokenHash
