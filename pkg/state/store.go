@@ -1812,6 +1812,59 @@ type Store interface {
 	MarkDomainVerified(ctx context.Context, domain string) error
 	DeleteCustomDomain(ctx context.Context, domain string) error
 
+	// Tenant surfaces (ADR-100; apid is sole writer to tenant_surfaces
+	// and tenant_hostnames). The pg_notify trigger
+	// (migrations/00243_tenant_surfaces.sql) bubbles mutations to
+	// gatewayd-internal's cert-remint subscriber; the store itself is
+	// pure SQL. Create*IfUnderQuota return:
+	//   - (TenantSurface{}, *TenantSurfaceQuotaError) when limit trips
+	//   - (TenantSurface{}, ErrTenantSurfacesNotAllowed) when the plan
+	//     gate is off (Free today)
+	//   - (TenantSurface{}, ErrNotFound) when the parent row is gone
+	//   - (TenantSurface{}, ErrConflict) on FK + UQ violations
+	// The TOCTOU defence is a BeginTx + FOR UPDATE on the accounts row
+	// (surfaces) or tenant_surfaces row (hostnames), mirroring
+	// CreateEdgeRuleIfUnderQuota at pgstore.go:5951.
+	CreateTenantSurfaceIfUnderQuota(ctx context.Context, in CreateTenantSurfaceParams, limits api.Limits) (TenantSurface, error)
+	GetTenantSurfaceByID(ctx context.Context, id string) (TenantSurface, error)
+	GetTenantSurfaceByName(ctx context.Context, accountID, name string) (TenantSurface, error)
+	ListTenantSurfacesForAccount(ctx context.Context, accountID string) ([]TenantSurface, error)
+	ListTenantSurfacesForApp(ctx context.Context, appID string) ([]TenantSurface, error)
+	CountTenantSurfacesForAccount(ctx context.Context, accountID string) (int, error)
+	UpdateTenantSurfaceStatus(ctx context.Context, id string, status SurfaceStatus) error
+	UpdateTenantSurfaceCert(ctx context.Context, in UpdateSurfaceCertParams) error
+	// DeleteTenantSurface soft-deletes: status flips to 'deleted',
+	// the row stays for audit / cert_history. Hard DELETE cascades
+	// hostnames via the FK ON DELETE CASCADE.
+	DeleteTenantSurface(ctx context.Context, id string) error
+	// TenantSurfaceByHostname — hot-path lookup from pgRouter.ResolveHost.
+	// Falls through to ErrNotFound when the hostname is not claimed
+	// by any surface (the caller then consults DomainByName). Joins
+	// tenant_hostnames → tenant_surfaces in SQL.
+	TenantSurfaceByHostname(ctx context.Context, hostname string) (TenantSurface, error)
+
+	// Hostname CRUD under per-surface quota. CreateTenantHostnameIfUnderQuota
+	// takes a FOR UPDATE lock on the parent tenant_surfaces row before
+	// counting. The global (per-hostname) UQ on tenant_hostnames.hostname
+	// surfaces as ErrConflict when a hostname is already claimed by a
+	// different surface (the apid handler maps this to
+	// CodeTenantHostnameAlreadyClaimed in PR-C).
+	CreateTenantHostnameIfUnderQuota(ctx context.Context, in CreateTenantHostnameParams, limits api.Limits) (TenantHostname, error)
+	ListTenantHostnamesForSurface(ctx context.Context, surfaceID string) ([]TenantHostname, error)
+	// ListVerifiedTenantHostnamesForSurface is the SAN-assembly hot path
+	// used by CertIssuer.RequestCertForSurface; returns sorted by hostname
+	// for deterministic primary/SAN assignment.
+	ListVerifiedTenantHostnamesForSurface(ctx context.Context, surfaceID string) ([]TenantHostname, error)
+	CountTenantHostnamesForSurface(ctx context.Context, surfaceID string) (int, error)
+	MarkTenantHostnameVerified(ctx context.Context, hostname string) error
+	MarkTenantHostnameCheckFailed(ctx context.Context, hostname, reason string) error
+	// ListPendingTenantHostnames — dns_poller queue. Returns the
+	// `limit` oldest unverified rows whose last_check_at is older than
+	// `olderThan` (the poller sleeps batch+1 interval seconds between
+	// passes, so a row re-enters the queue roughly every batch-time).
+	ListPendingTenantHostnames(ctx context.Context, olderThan time.Time, limit int) ([]TenantHostname, error)
+	DeleteTenantHostname(ctx context.Context, hostname string) error
+
 	// Crons (apid CRUDs; schedd fires).
 	CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error)
 	// CreateCronIfUnderQuota inserts a cron iff the per-app and

@@ -1044,6 +1044,36 @@ const (
 	CodeOrgLastOwner             = "org_last_owner"
 	CodeOrgPersonalImmutable     = "org_personal_immutable"
 	CodeOrgAPIKeyRequiresOrg     = "org_api_key_requires_org"
+	// CodeTenantSurfacesNotAllowed marks POST /v1/apps/{slug}/tenant-surfaces
+	// when the account's plan does not enable surfaces (Free today, ADR-100
+	// / issue #879). Distinct from CodeTenantSurfaceQuota (the surface
+	// cap is met) so the customer sees "upgrade your plan" vs "delete a
+	// surface" — the next action is different. 402 mirrors the
+	// *NotAllowed siblings (CodePlanCronsNotAllowed, etc.).
+	CodeTenantSurfacesNotAllowed = "tenant_surfaces_not_allowed"
+	// CodeTenantSurfaceQuota marks the per-account tenant_surfaces cap
+	// (Hobby 1 / Pro 5 / Scale 25). The Problem carries Limit +
+	// Observed (the observed count is the cap) so the dashboard can
+	// show "you have N surfaces, the cap is M". 429.
+	CodeTenantSurfaceQuota = "tenant_surface_quota"
+	// CodeTenantHostnameQuota marks the per-surface tenant_hostnames
+	// cap (Hobby 10 / Pro 50 / Scale 250). The Problem carries Limit
+	// + Observed + SurfaceID so the customer can name the overflowing
+	// surface in the support ticket. 429.
+	CodeTenantHostnameQuota = "tenant_hostname_quota"
+	// CodeTenantHostnameAlreadyClaimed marks POST
+	// /v1/apps/{slug}/tenant-surfaces/{id}/hostnames when the
+	// hostname is already attached to another surface on any account
+	// (the UQ on tenant_hostnames.hostname is global, not
+	// account-scoped). 409.
+	CodeTenantHostnameAlreadyClaimed = "tenant_hostname_already_claimed"
+	// CodeTenantSurfaceCertKindInvalid marks a surface create / update
+	// with cert_kind not in the closed set (per_host_san only today;
+	// shared_wildcard is schema-accepted but issuer-rejected per
+	// ADR-100 D4). Distinct from CodeValidation because the wire
+	// contract for the customer surface is "the cert engine can't
+	// mint this kind yet". 400.
+	CodeTenantSurfaceCertKindInvalid = "tenant_surface_cert_kind_invalid"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
@@ -1921,6 +1951,69 @@ func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem 
 func ErrAppWebhookInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeAppWebhookInvalid,
 		"Invalid webhook", reason)
+}
+
+// ErrTenantSurfacesNotAllowed is returned by apid's createTenantSurface
+// handler when the account's plan does not enable surfaces (Free today,
+// ADR-100 / issue #879). Fires BEFORE the store is touched so a Free
+// customer gets a clean 402 instead of a quota round-trip. Mirrors the
+// ErrPlanCronsNotAllowed shape.
+func ErrTenantSurfacesNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodeTenantSurfacesNotAllowed,
+		"Tenant surfaces unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include tenant surfaces; upgrade to Hobby or above to expose one app to many customer hostnames under a single cert.", p)).
+		WithDocs(docsBase + "/plans#tenant-surfaces")
+}
+
+// ErrTenantSurfaceQuota is returned when
+// CreateTenantSurfaceIfUnderQuota surfaces a *state.TenantSurfaceQuotaError.
+// 403 (not 402) because the plan DOES unlock surfaces — the right copy
+// is "delete a surface to add another", not "upgrade to Hobby". The
+// Problem's Limit/Observed carry the cap values so the dashboard can
+// render the count.
+func ErrTenantSurfaceQuota(p Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTenantSurfaceQuota,
+		"Tenant surface limit reached",
+		fmt.Sprintf("%s plan caps tenant surfaces at %d per account; you have %d. Delete one to add another.",
+			p, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#tenant-surfaces")
+}
+
+// ErrTenantHostnameQuota is returned when
+// CreateTenantHostnameIfUnderQuota surfaces a *state.TenantHostnameQuotaError.
+// The Problem's Limit/Observed/SurfaceID together name the overflowing
+// surface in the support ticket. 403 mirrors the sibling per-scope
+// quota factories.
+func ErrTenantHostnameQuota(p Plan, surfaceID string, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTenantHostnameQuota,
+		"Tenant hostname limit reached",
+		fmt.Sprintf("%s plan caps tenant hostnames at %d per surface; you have %d on surface %s. Remove one to add another.",
+			p, limit, observed, surfaceID)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#tenant-surfaces")
+}
+
+// ErrTenantHostnameAlreadyClaimed is returned when the global UQ on
+// tenant_hostnames.hostname trips (the same hostname is already
+// attached to another surface on any account). 409 surfaces the
+// ownership invariant — the customer must pick a unique hostname.
+func ErrTenantHostnameAlreadyClaimed(hostname string) *Problem {
+	return NewProblem(http.StatusConflict, CodeTenantHostnameAlreadyClaimed,
+		"Tenant hostname already claimed",
+		fmt.Sprintf("hostname %q is already attached to another tenant surface; pick a unique hostname.", hostname))
+}
+
+// ErrTenantSurfaceCertKindInvalid is returned when the apid validator
+// rejects an unsupported cert_kind at create / update time. The
+// schema accepts (per_host_san, shared_wildcard) for forward
+// compatibility, but the issuer rejects shared_wildcard today (the
+// customer-zone DNS-01 solver ships in a follow-up ADR per ADR-100
+// D4). 400 mirrors the other *Invalid code family.
+func ErrTenantSurfaceCertKindInvalid(kind string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeTenantSurfaceCertKindInvalid,
+		"Unsupported cert kind",
+		fmt.Sprintf("cert kind %q is not supported in v1; use per_host_san.", kind))
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't
