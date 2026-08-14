@@ -10,10 +10,10 @@ import type { EdgeRuleIPAction } from './EdgeRuleIPAction.js';
 import type { EdgeRuleJWTAction } from './EdgeRuleJWTAction.js';
 import type { EdgeRuleLimitAction } from './EdgeRuleLimitAction.js';
 import type { EdgeRuleMaintenanceAction } from './EdgeRuleMaintenanceAction.js';
-import type { EdgeRuleThrottleAction } from './EdgeRuleThrottleAction.js';
 import type { EdgeRuleRedirectAction } from './EdgeRuleRedirectAction.js';
 import type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
 import type { EdgeRuleRouteAction } from './EdgeRuleRouteAction.js';
+import type { EdgeRuleThrottleAction } from './EdgeRuleThrottleAction.js';
 import type { EdgeRuleValidateAction } from './EdgeRuleValidateAction.js';
 /**
  * A customer-configurable edge rule. The `action` blob is a
