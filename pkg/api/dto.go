@@ -4430,20 +4430,72 @@ func (a *EdgeRuleMaintenanceAction) Validate() *Problem {
 //
 // Per-IP sub-keying is deliberately absent in v1 — see
 // pkg/state/types.go::EdgeRuleThrottleAction for the design rationale.
+//
+// Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881 Phase 3)
+// extends the wire shape with optional per-consumer keying. The new
+// fields default to zero-values that produce bit-identical behaviour
+// to PR #887's bucket key (appID+"\x00"+ruleID):
+//
+//   - KeyBy ∈ {"", "none", "api_key", "jwt_subject", "jwt_claim"}.
+//     Empty string and "none" are equivalent — the empty value is the
+//     pre-Phase-3 shape; "none" is the explicit Phase-3 opt-out. Both
+//     preserve back-compat (the bucket key is unchanged).
+//   - JWTClaimName is REQUIRED iff KeyBy == "jwt_claim"; the value
+//     names the JWT custom claim to extract (e.g., "tier", "org_id").
+//     Format constraint mirrors CodeQL `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`.
+//   - MaxKeysPerRule caps how many distinct consumers may own a
+//     bucket against this rule. Distinct consumers above the cap
+//     collapse into a single non-evicting "__other__" bucket that
+//     STILL consumes tokens (ADR-104 §"Consequences" load-bearing
+//     safety property). Defaults to 0 meaning "use plan default".
+//
+// The bounded design is enforced at the limiter layer
+// (pkg/gateway/ratelimit.go::AllowWithConsumerKey, Phase 3). The
+// apid validator only checks shape + plan ceiling; the limiter owns
+// the actual collapse semantics.
 type EdgeRuleThrottleAction struct {
 	RequestsPerSecond float64 `json:"requests_per_second"`
 	Burst             int     `json:"burst"`
+	KeyBy             string  `json:"key_by,omitempty"`
+	JWTClaimName      string  `json:"jwt_claim_name,omitempty"`
+	MaxKeysPerRule    int     `json:"max_keys_per_rule,omitempty"`
 }
+
+// ThrottleKeyByNone is the explicit Phase-3 opt-out value. The empty
+// string "" and "none" both preserve PR #887's behaviour — the
+// difference is that "none" makes the customer's intent visible in the
+// wire payload (debugging + audit). The validator treats "" and "none"
+// as equivalent; the limiter constructor never sees the empty value
+// because the wire→state mapping normalises "" → "none".
+const (
+	ThrottleKeyByNone       = "none"
+	ThrottleKeyByAPIKey     = "api_key"
+	ThrottleKeyByJWTSubject = "jwt_subject"
+	ThrottleKeyByJWTClaim   = "jwt_claim"
+)
 
 // ThrottleValidationContext is the per-plan ceiling that
 // validateEdgeRuleAction passes into EdgeRuleThrottleAction.Validate.
 // Keeping the boundary explicit (rather than reading limits globally)
 // makes the validator unit-testable without spinning up a plan row —
 // see pkg/api/dto_edge_rules_test.go for the test pattern.
+//
+// PlanMaxKeysPerRule is the Phase 3 ceiling on per-rule consumer
+// cardinality. 0 means the plan doesn't expose per-consumer throttling
+// (the validator rejects any rule that opts into a non-"none" KeyBy).
 type ThrottleValidationContext struct {
-	PlanMaxRPS   float64
-	PlanMaxBurst int
+	PlanMaxRPS         float64
+	PlanMaxBurst       int
+	PlanMaxKeysPerRule int
 }
+
+// jwtClaimNameRegex pins the JWTClaimName format. Anchored, allows a
+// leading letter or underscore, then [A-Za-z0-9_] up to 63 chars total.
+// Mirrors the CodeQL go-clear-text-logging precedent for untrusted
+// identifiers landing in metric labels and log fields — anything looser
+// risks a label-cardinality explosion or a CodeQL finding on a future
+// refactor.
+var jwtClaimNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
 
 func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Problem {
 	if a == nil {
@@ -4475,6 +4527,86 @@ func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Proble
 		return ErrValidation(fmt.Sprintf(
 			"throttle action: burst %d exceeds the plan ceiling %d — a throttle rule is strictly a tightening primitive",
 			a.Burst, ctx.PlanMaxBurst))
+	}
+	// Phase 3 (ADR-104): per-consumer keying validation. KeyBy is
+	// optional; the empty value preserves PR #887's behaviour and
+	// needs no further checks. Non-empty values must be in the closed
+	// vocab + require the right supporting field.
+	switch a.KeyBy {
+	case "", ThrottleKeyByNone:
+		// Pre-Phase-3 shape: bucket key is appID+"\x00"+ruleID.
+		// JWTClaimName and MaxKeysPerRule MUST be unset — a customer
+		// mixing "key_by=none" with non-zero MaxKeysPerRule would
+		// silently never trip the cap, which is a footgun.
+		if a.JWTClaimName != "" {
+			return ErrValidation("throttle action: jwt_claim_name requires key_by=\"jwt_claim\" (got key_by=\"\")")
+		}
+		if a.MaxKeysPerRule != 0 {
+			return ErrValidation("throttle action: max_keys_per_rule requires key_by != \"none\" (got key_by=\"\")")
+		}
+	case ThrottleKeyByAPIKey, ThrottleKeyByJWTSubject:
+		if a.JWTClaimName != "" {
+			return ErrValidation(fmt.Sprintf(
+				"throttle action: jwt_claim_name is only valid with key_by=\"jwt_claim\" (got key_by=%q)",
+				a.KeyBy))
+		}
+		if err := validateThrottleMaxKeys(a.MaxKeysPerRule, ctx.PlanMaxKeysPerRule); err != nil {
+			return err
+		}
+	case ThrottleKeyByJWTClaim:
+		if a.JWTClaimName == "" {
+			return ErrValidation("throttle action: jwt_claim_name is required when key_by=\"jwt_claim\"")
+		}
+		if !jwtClaimNameRegex.MatchString(a.JWTClaimName) {
+			return ErrValidation(fmt.Sprintf(
+				"throttle action: jwt_claim_name %q must match ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$ (CodeQL safe-identifier contract)",
+				a.JWTClaimName))
+		}
+		if err := validateThrottleMaxKeys(a.MaxKeysPerRule, ctx.PlanMaxKeysPerRule); err != nil {
+			return err
+		}
+	default:
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: key_by %q is not in the closed vocab (allowed: \"\", \"none\", \"api_key\", \"jwt_subject\", \"jwt_claim\")",
+			a.KeyBy))
+	}
+	return nil
+}
+
+// validateThrottleMaxKeys enforces the per-rule MaxKeysPerRule ceiling.
+//
+//   - MaxKeysPerRule < 0 is a shape error.
+//   - MaxKeysPerRule == 0 means "use plan default" — the limiter layer
+//     resolves the default at run time; the validator only rejects
+//     values above the plan ceiling when the plan has one.
+//   - planMax == 0 means the plan doesn't expose per-consumer throttling
+//     AND the customer is opting into per-consumer keying — that
+//     combination is rejected up front. Without this guard a customer
+//     could set key_by="api_key" with max_keys_per_rule=0 and silently
+//     get the plan-default behaviour, which on a plan with
+//     PlanMaxKeysPerRule=0 would mean "no consumers tracked" — a
+//     useless rule that wastes the throttle-quota slot. (See
+//     ADR-104 §"Rejected alternatives — Server-side consumer allowlist
+//     is deferred"; the closest analogous case is "rule whose runtime
+//     effect is zero".)
+func validateThrottleMaxKeys(maxKeys, planMax int) *Problem {
+	if maxKeys < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: max_keys_per_rule must be >= 0 (got %d)",
+			maxKeys))
+	}
+	if planMax == 0 {
+		// Plan doesn't expose per-consumer throttling. The caller in
+		// Validate() has already gated on key_by != "none", so reaching
+		// here means the customer is opting into a feature their plan
+		// doesn't support. Reject.
+		return ErrValidation(
+			"throttle action: this plan does not support per-consumer throttling — upgrade or set key_by=\"none\"")
+	}
+	if maxKeys > planMax {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: max_keys_per_rule %d exceeds the plan ceiling %d",
+			maxKeys, planMax))
 	}
 	return nil
 }

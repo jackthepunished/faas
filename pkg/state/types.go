@@ -3572,9 +3572,22 @@ type EdgeRuleGeoAction struct {
 // later it gets its own bounded design (ADR-093-style cap + an
 // `__ip_other__` overflow that still consumes the parent rule's
 // bucket). Shipping the field now and bounding it later is not safe.
+//
+// Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881 Phase 3)
+// extends the wire shape with optional per-consumer keying. The new
+// fields are byte-identical to the DTO mirror at
+// pkg/api/dto.go::EdgeRuleThrottleAction — gatewayd reads them through
+// the limiter constructor (pkg/gateway/ratelimit.go::AllowWithConsumerKey,
+// Phase 3) which owns the __other__ collapse. See ADR-104 §"Consequences"
+// for the load-bearing safety property (the collapse bucket is
+// pinned non-evictable so an attacker can't bypass the throttle by
+// minting many keys).
 type EdgeRuleThrottleAction struct {
 	RequestsPerSecond float64 `json:"requests_per_second"`
 	Burst             int     `json:"burst"`
+	KeyBy             string  `json:"key_by,omitempty"`
+	JWTClaimName      string  `json:"jwt_claim_name,omitempty"`
+	MaxKeysPerRule    int     `json:"max_keys_per_rule,omitempty"`
 }
 
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
