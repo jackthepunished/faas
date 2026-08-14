@@ -736,3 +736,219 @@ func TestEdgeRuleThrottleAction_Validate_AcceptsPlanZero(t *testing.T) {
 		}
 	})
 }
+// ADR-093 / kind=budget DTO tests. The kind=budget validator
+// pins the apid-side wire contract for the per-request wall-clock
+// budget primitive. Mirrors the kind=limit shape (two simple
+// fields, table-driven negative arms) — the action shape is
+// intentionally tiny so the apid-side predicate is the entire
+// wire contract and the gateway compile step
+// (cmd/gatewayd-internal/edge_rules.go::compileBudgetRules) is
+// defence-in-depth only.
+// ----------------------------------------------------------------------------
+
+// happyEdgeRuleBudgetAction returns a well-formed kind=budget
+// action: 3-second per-request budget, no per-customer-tunable
+// header (the runtime falls back to the platform default
+// api.RequestBudgetDefaultOverrideHeader).
+func happyEdgeRuleBudgetAction() EdgeRuleBudgetAction {
+	return EdgeRuleBudgetAction{
+		BudgetMs: 3000,
+	}
+}
+
+// TestEdgeRuleBudgetAction_Validate_HappyPath pins the canonical
+// in-range action. 3000 ms is well inside the [1, 30 s] window.
+func TestEdgeRuleBudgetAction_Validate_HappyPath(t *testing.T) {
+	a := happyEdgeRuleBudgetAction()
+	if p := a.Validate(); p != nil {
+		t.Fatalf("happy path returned %v, want nil", p)
+	}
+}
+
+// TestEdgeRuleBudgetAction_Validate_Accepts_HeaderVariants walks
+// the per-customer-tunable AllowOverrideHeader field's accepted
+// RFC 7230 token shapes. Empty is allowed (the runtime defaults
+// to api.RequestBudgetDefaultOverrideHeader).
+func TestEdgeRuleBudgetAction_Validate_Accepts_HeaderVariants(t *testing.T) {
+	cases := []struct {
+		name        string
+		headerName  string
+		wantProblem bool
+	}{
+		{"empty_default_runtime", "", false},
+		{"single_char_letter", "x", false},
+		{"kebab_case", "x-faas-budget-ms", false},
+		{"alphanumeric", "XFaas123", false},
+		{"long_but_in_range", "x-" + strings.Repeat("a", 126), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := happyEdgeRuleBudgetAction()
+			a.AllowOverrideHeader = tc.headerName
+			p := a.Validate()
+			if tc.wantProblem && p == nil {
+				t.Fatalf("Validate() = nil, want *Problem")
+			}
+			if !tc.wantProblem && p != nil {
+				t.Fatalf("Validate() = %v, want nil", p)
+			}
+		})
+	}
+}
+
+// TestEdgeRuleBudgetAction_Validate_Rejects is the table-driven
+// negative arm. Each row mutates one field of the happy action
+// and asserts the returned *Problem.Detail contains wantSub.
+// The substring pin lets a re-wording of unrelated wording not
+// churn the table — the load-bearing substring is the load-bearing
+// predicate name (e.g. "budget_ms must be > 0").
+func TestEdgeRuleBudgetAction_Validate_Rejects(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(a *EdgeRuleBudgetAction)
+		wantSub string
+	}{
+		{
+			// A kind=budget rule with no budget is a silent no-op
+			// (every request gets the platform default — but the
+			// customer's intent was to override, so a zero-budget
+			// rule is misconfiguration, not a default-asking
+			// pattern). apid-Validate rejects with 422.
+			name: "budget_ms_zero",
+			mutate: func(a *EdgeRuleBudgetAction) {
+				a.BudgetMs = 0
+			},
+			wantSub: "budget_ms must be > 0",
+		},
+		{
+			// Negative budget is meaningless (negative time).
+			// Same predicate as the zero case.
+			name: "budget_ms_negative",
+			mutate: func(a *EdgeRuleBudgetAction) {
+				a.BudgetMs = -1
+			},
+			wantSub: "budget_ms must be > 0",
+		},
+		{
+			// The hard upper bound is api.RequestBudgetMax (30 s).
+			// A budget rule can never widen past the global
+			// ceiling; if the customer wants a longer per-route
+			// budget they're mis-using this primitive (or have
+			// mis-configured their platform ceiling). The error
+			// message names the platform ceiling verbatim so the
+			// operator sees both observed and cap.
+			name: "budget_ms_over_platform_ceiling",
+			mutate: func(a *EdgeRuleBudgetAction) {
+				a.BudgetMs = int(RequestBudgetMax.Milliseconds()) + 1
+			},
+			wantSub: "exceeds the platform ceiling",
+		},
+		{
+			// Header name > 128 chars is rejected — the wire
+			// contract bans unbounded header names. The limit
+			// mirrors pkg/api/limits.go's MaxEdgeRuleValidateSchemaBytes
+			// posture (an arbitrary-but-load-bearing sanity cap).
+			name: "allow_override_header_too_long",
+			mutate: func(a *EdgeRuleBudgetAction) {
+				a.AllowOverrideHeader = "x-" + strings.Repeat("a", 200)
+			},
+			wantSub: "must be 1..128 chars",
+		},
+		{
+			// Header name with whitespace / separator chars would
+			// break HTTP header parsing at the runtime layer. The
+			// RFC 7230 token shape rejects them at apid-Validate
+			// instead of letting them surface as a wire error at
+			// request time.
+			name: "allow_override_header_with_space",
+			mutate: func(a *EdgeRuleBudgetAction) {
+				a.AllowOverrideHeader = "x faas budget"
+			},
+			wantSub: "RFC 7230 token shape",
+		},
+		{
+			// Header name starting with a digit is rejected —
+			// RFC 7230 token production requires the first char
+			// be a letter. Catches a copy-paste typo before it
+			// lands at runtime.
+			name: "allow_override_header_leading_digit",
+			mutate: func(a *EdgeRuleBudgetAction) {
+				a.AllowOverrideHeader = "1budget"
+			},
+			wantSub: "RFC 7230 token shape",
+		},
+		{
+			// Header name starting with a hyphen is rejected —
+			// same RFC 7230 token shape. Catches the
+			// "looks-like-an-http-flag" typo.
+			name: "allow_override_header_leading_hyphen",
+			mutate: func(a *EdgeRuleBudgetAction) {
+				a.AllowOverrideHeader = "-budget"
+			},
+			wantSub: "RFC 7230 token shape",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := happyEdgeRuleBudgetAction()
+			tc.mutate(&a)
+			p := a.Validate()
+			if p == nil {
+				t.Fatalf("Validate() = nil, want *Problem containing %q", tc.wantSub)
+			}
+			if !strings.Contains(p.Detail, tc.wantSub) {
+				t.Errorf("Detail = %q, want substring %q", p.Detail, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestEdgeRuleBudgetAction_Validate_NilReceiver pins the
+// nil-receiver arm. Same posture as the validate / limit action
+// — the dispatcher checks `a == nil` first because Go's
+// reflect-based dispatch would panic on a nil pointer. Validate()
+// must short-circuit with a 422 problem, not crash.
+func TestEdgeRuleBudgetAction_Validate_NilReceiver(t *testing.T) {
+	var a *EdgeRuleBudgetAction
+	p := a.Validate()
+	if p == nil {
+		t.Fatal("nil receiver returned nil, want *Problem")
+	}
+	if !strings.Contains(p.Detail, "budget action is required") {
+		t.Errorf("Detail = %q, want substring %q", p.Detail, "budget action is required")
+	}
+}
+
+// TestIsHeaderToken walks the helper directly. Pin: the regex
+// is RFC 7230 token production, not a relaxed shape — a future
+// "be lenient" refactor that loosens to "anything without
+// whitespace" would silently allow separator chars (commas,
+// colons, semicolons) that break HTTP header parsing at the
+// runtime layer.
+func TestIsHeaderToken(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"x-faas-budget-ms", true},
+		{"X-Faas-Budget-MS", true},
+		{"x", true},
+		{"X", true},
+		{"a1b2c3", true},
+		{"", false},
+		{"1abc", false},
+		{"-abc", false},
+		{"abc def", false},
+		{"abc:def", false},
+		{"abc,def", false},
+		{"abc;def", false},
+		{"abc/def", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := isHeaderToken(tc.in); got != tc.want {
+				t.Errorf("isHeaderToken(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}

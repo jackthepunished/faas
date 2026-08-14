@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/cursor"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
@@ -1487,6 +1488,11 @@ func (s *PgStore) RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldK
 // --- apps --------------------------------------------------------------------
 
 func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
+	// ADR-093 / PR-E: DB call seam — propagate the inbound budget
+	// with a 10 ms overhead reservation. Hot-path Store methods
+	// follow this pattern; the wrapper is a no-op when no Budget
+	// is attached.
+	ctx = db.WithBudget(ctx)
 	manifest := app.Manifest
 	if manifest.Entrypoint == nil && manifest.Env == nil {
 		manifest = AppManifest{}

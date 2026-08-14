@@ -136,6 +136,14 @@ type SecretFinding struct {
 	Provider string `json:"provider"`
 	Severity string `json:"severity"`
 	Snippet  string `json:"snippet"`
+	// Layer is the per-walk source label ("app" for the main
+	// image, "sidecar-<slug>" for each sidecar, "" for the apid
+	// source-tree scanner). Added in PR-A so the dashboard can
+	// attribute findings to the right image segment. The
+	// omitempty keeps the apid source-tree rejections at
+	// /v1/projects[/scan] from picking up an empty layer field
+	// (the cmd/apid 422 path doesn't know about image layers).
+	Layer string `json:"layer,omitempty"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -245,6 +253,19 @@ const (
 	// rejection path. Distinct from CodeSourceInvalid (tarball shape
 	// is fine — the SECRET inside is the problem).
 	CodeSecretScanStrict = "secret_scan_strict"
+	// CodeImageSecretDetected is the wire-stable 422 sentinel
+	// for imaged-side secret findings in the assembled image
+	// (PR-A). Distinct from CodeSecretScanStrict (the
+	// cmd/apid source-tree upload path) because the scan
+	// source is different: CodeSecretScanStrict fires on the
+	// customer's source-tree bytes; CodeImageSecretDetected
+	// fires on the post-build OCI image bytes (Dockerfile
+	// ENV, --build-arg, COPY'd .env files). Both surface as
+	// 422 envelopes with `extra.secret_findings`, but the
+	// dashboard renders the image-layer case separately so
+	// the customer knows to look at the build path rather
+	// than the source tree.
+	CodeImageSecretDetected = "image_secret_detected"
 	// CodeInvalidRef is the DEPLOY-PROV-4 / ADR-092 (issue #739)
 	// 400 sentinel for POST /v1/apps/{slug}/deployments/source-ref
 	// when the supplied ref is not a valid commit SHA / branch /
@@ -1785,6 +1806,15 @@ const (
 	// gating policy and the actor are different.
 	CodeRequestValidationFailed = "request_validation_failed"
 	CodeHeaderMutationForbidden = "header_mutation_forbidden"
+	// CodeRequestBudgetExceeded is the 504 a kind=budget edge rule
+	// (or its plan-level default) emits when the per-request
+	// wall-clock budget fires before the handler can write a
+	// response. The platform-enforced budget — the load-bearing
+	// contract is "deadline fires from any hop, not just the
+	// handler body" — surfaces this single stable code on every
+	// outbound problem envelope so an SDK can branch on it
+	// without parsing prose. ADR-093 §Decision.
+	CodeRequestBudgetExceeded = "request_budget_exceeded"
 )
 
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler

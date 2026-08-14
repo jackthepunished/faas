@@ -83,6 +83,21 @@ env:
   # ci-arduino-protoc-rate-limit-flake.md.
   PROTOC_VERSION: "33.6"
   PROTOC_SHA256_LINUX_AMD64: "9c49962391ff8b5754342509efc3885db91dfe11a358e1e98c9a71518f0ad199"
+  # promtool is downloaded from the Prometheus release tarball to lint the
+  # spec §12 alert rules. Both the version and the SHA-256 pin mirror the
+  # same `curl+sha256sum+tar` posture as vacuum + sqlc + protoc above and
+  # the EX44 ansible roles' `prom_release_sha256` (asserted at bootstrap
+  # via `make bootstrap`). The unpinned download was the source of a
+  # `curl: (35) Recv failure: Connection reset by peer` flake on two
+  # consecutive main-CI runs in 2026-08-14 — curl exits 35 on a torn
+  # TCP connection and `tar` never runs, leaving us with a half-written
+  # tarball on `/tmp` and no idea whether the bytes we got are the bytes
+  # we asked for. The SHA-256 pin catches both the silent-truncation case
+  # (curl returned 0 but the stream was cut short) and any future tamper
+  # with a one-line `sha256sum --check --strict` mismatch. Bumping
+  # requires editing both lines in lock-step.
+  PROM_VERSION: "2.54.1"
+  PROM_TARBALL_SHA256_LINUX_AMD64: "31715ef65e8a898d0f97c8c08c03b6b9afe485ac84e1698bcfec90fc6e62924f"
 
 jobs:
   # Three parallel jobs (PR #167) so the long poles — unit tests (~4:20)
@@ -158,10 +173,11 @@ jobs:
       - name: promtool check rules
         run: |
           set -euo pipefail
-          PROM_VERSION="2.54.1"
           PROM_TARBALL="prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
-          curl -fsSL -o "/tmp/${PROM_TARBALL}" \
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            -o "/tmp/${PROM_TARBALL}" \
             "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${PROM_TARBALL}"
+          echo "${PROM_TARBALL_SHA256_LINUX_AMD64}  /tmp/${PROM_TARBALL}" | sha256sum --check --strict
           tar -xzf "/tmp/${PROM_TARBALL}" -C /tmp "prometheus-${PROM_VERSION}.linux-amd64/promtool"
           sudo mv "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
           promtool check rules deploy/ansible/roles/prometheus/files/faas.rules.yml

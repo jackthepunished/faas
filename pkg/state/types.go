@@ -3325,9 +3325,15 @@ const (
 	// (24 h) is enforced at apid-create time. Optional Message
 	// goes into Problem.detail (≤ 512 B; same payload-size budget
 	// as EdgeRuleValidateAction.Schema). Plan-gated Free-and-above
-	// (no IsPaidOnly change). See migrations/00220_edge_rules_kind_maintenance.sql
+	// (no IsPaidOnly change). See migrations/00236_edge_rules_kind_maintenance.sql
 	// for the schema CHECK widening.
 	EdgeRuleKindMaintenance EdgeRuleKind = "maintenance"
+	// EdgeRuleKindGeo is the country allow/deny primitive (ADR-091 D21).
+	// Migration 00229 widens the schema CHECK from 9 to 10 values
+	// (post-00219 'limit', post-00214 'validate'). Not in IsPaidOnly
+	// — Free customers get one rule under a tighter per-app quota
+	// (Limits.EdgeRulesGeoPerApp=1).
+	EdgeRuleKindGeo EdgeRuleKind = "geo"
 	// EdgeRuleKindThrottle is the per-route token-bucket rate limit
 	// (ADR-091 D20.5 amendment, issue #881). Customers tighten the
 	// per-route rps/burst below their plan's plan.RateLimitRPS — the
@@ -3338,12 +3344,20 @@ const (
 	// (Limits.EdgeRulesThrottlePerApp). Migration 00244 widens the
 	// schema CHECK to admit the value.
 	EdgeRuleKindThrottle EdgeRuleKind = "throttle"
-	// EdgeRuleKindGeo is the country allow/deny primitive (ADR-091 D21).
-	// Migration 00229 widens the schema CHECK from 9 to 10 values
-	// (post-00219 'limit', post-00214 'validate'). Not in IsPaidOnly
-	// — Free customers get one rule under a tighter per-app quota
-	// (Limits.EdgeRulesGeoPerApp=1).
-	EdgeRuleKindGeo EdgeRuleKind = "geo"
+	// EdgeRuleKindBudget pins a per-request wall-clock budget on
+	// the matched (host, path, method) tuple (ADR-093 §Decision).
+	// The runtime is `pkg/reqbudget`: the gateway matcher resolves
+	// the matched rule and stamps the budget onto the inbound ctx
+	// via `reqbudget.WithRemaining`, then every downstream hop
+	// (JWT verify, forward, gRPC, DB) propagates remaining time via
+	// `reqbudget.WithOverhead` / `WithCeiling`. Deadline fire
+	// surfaces as 504 + RFC 7807 `code: request_budget_exceeded`.
+	// Open to Free and every other plan (no IsPaidOnly change — a
+	// 3 s default budget is a baseline safety floor that all
+	// customers benefit from). See
+	// migrations/00254_edge_rules_kind_budget.sql for the schema
+	// CHECK widening.
+	EdgeRuleKindBudget EdgeRuleKind = "budget"
 )
 
 // IsValid reports whether k is a closed-set kind. New kinds land via
@@ -3354,7 +3368,8 @@ func (k EdgeRuleKind) IsValid() bool {
 	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
 		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit,
-		EdgeRuleKindMaintenance, EdgeRuleKindThrottle, EdgeRuleKindGeo:
+		EdgeRuleKindMaintenance, EdgeRuleKindThrottle, EdgeRuleKindGeo,
+		EdgeRuleKindBudget:
 		return true
 	}
 	return false
@@ -3544,6 +3559,34 @@ type EdgeRuleGeoAction struct {
 	Deny  []string `json:"deny,omitempty"`
 }
 
+// EdgeRuleBudgetAction carries the per-rule wall-clock budget for
+// kind=budget (ADR-093 §Decision). BudgetMs is the per-request budget
+// the gateway stamps onto the inbound ctx via
+// `reqbudget.WithRemaining`. The runtime range is [1 ms,
+// api.RequestBudgetMaxMs]; 0 / negative / > ceiling is rejected at
+// apid-create time (pkg/api/dto.go::EdgeRuleBudgetAction.Validate)
+// and clamped at cmd-side compileBudgetRules as defence-in-depth
+// against a direct-DB write.
+//
+// AllowOverrideHeader is the optional customer-tunable knob: when
+// set, the gateway reads the named HTTP header (default
+// `x-faas-budget-ms`) on the inbound request and, if it parses as a
+// positive integer ≤ api.RequestBudgetMaxMs, uses that value as the
+// per-request budget for that single request — a runtime
+// per-customer override of the static rule's BudgetMs. An absent or
+// unparseable header falls through to BudgetMs unchanged. Header
+// overrides never WIDEN past BudgetMs or the per-plan
+// api.RequestBudgetMaxMs ceiling.
+//
+// The state mirror carries the values verbatim so the gatewayd
+// compile step (cmd/gatewayd-internal/edge_rules.go::compileBudgetRules)
+// can defence-in-depth against any direct-DB row that bypassed
+// apid-Validate.
+type EdgeRuleBudgetAction struct {
+	BudgetMs            int    `json:"budget_ms"`
+	AllowOverrideHeader string `json:"allow_override_header,omitempty"`
+}
+
 // EdgeRuleThrottleAction is the per-rule token-bucket parameter set
 // for kind=throttle (ADR-091 D20.5 amendment, issue #881). The
 // runtime is pkg/gateway/ratelimit.go::Limiter — the gateway matcher
@@ -3643,6 +3686,12 @@ type EdgeRuleAction struct {
 	// limiter; the bucket is keyed by (appID, ruleID) so a single
 	// rule's throttle does not bleed into another rule's bucket.
 	Throttle *EdgeRuleThrottleAction `json:"throttle,omitempty"`
+	// Budget carries the per-request wall-clock budget for kind=budget.
+	// BudgetMs is the per-request budget the gateway stamps via
+	// `reqbudget.WithRemaining`. AllowOverrideHeader is the optional
+	// per-customer-tunable knob (`x-faas-budget-ms` by default).
+	// See EdgeRuleBudgetAction for the full per-field contract.
+	Budget *EdgeRuleBudgetAction `json:"budget,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.

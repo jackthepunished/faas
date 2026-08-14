@@ -29,6 +29,20 @@ const (
 	PlanScale Plan = "scale"
 )
 
+// StreamingStatus is the per-request classification emitted via the
+// Streaming-Status response header (ADR-102 D1/D2). String alias so
+// the JSON encoder marshals the wire value verbatim and HTTP header
+// Set/Get round-trips losslessly. The canonical wire values are the
+// lower-case string forms of the StreamingStatus* constants declared
+// in the streaming constants block below; see that block for per-value
+// semantics.
+//
+// All non-streaming variants carry the plan-level buffered cap
+// (MaxResponseBodyBytes); only the streaming variant can carry an
+// endpoint-rule cap (max_body_bytes_streaming from a matched edge
+// rule).
+type StreamingStatus string
+
 // Plans lists every plan low-to-high. Order matters for upgrade/downgrade logic
 // and for deterministic tests — do not reorder.
 var Plans = []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
@@ -86,6 +100,15 @@ type Limits struct {
 	// Runtime shape.
 	VCPU         int // firecracker vcpu_count (spec §4.4)
 	IdleTimeoutS int // default idle-reaper timeout (spec §4.3)
+
+	// End-to-end request budget (ADR-093). Per-plan overrides for
+	// the platform's wall-clock deadline on every customer-facing
+	// request. 0 falls back to RequestBudgetDefault /
+	// RequestBudgetMax in the limits.go const block. Per-route
+	// overrides via edge-rule kind=budget take precedence at
+	// request time.
+	RequestBudgetMs    int // 0 → RequestBudgetDefault; non-zero clamped to [1, RequestBudgetMaxMs]
+	RequestBudgetMaxMs int // 0 → RequestBudgetMax; non-zero must be ≥ RequestBudgetMs
 
 	// CPU fairness (issue #301 / ADR-044). The 3-level cgroup hierarchy
 	// (faas-tenant.slice/tenant-<plan>.slice/<instance>) enforces these
@@ -1973,6 +1996,69 @@ const (
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
 	StreamingFlushIntervalDefault       = 200 * time.Millisecond
 
+	// StreamingStatus is the per-request classification emitted via
+	// the Streaming-Status response header (ADR-102 D1/D2). The
+	// canonical wire values are the lower-case string forms of the
+	// constants below; the Go type is a string alias so the JSON
+	// encoder marshals the wire value verbatim and HTTP header
+	// Set/Get round-trips losslessly. Six states, six wire values,
+	// no aliases.
+	//
+	// StreamingStatusStreaming is the happy path — the platform's
+	// four-conjunct streaming gate (operator opt-in + per-app flag
+	// + non-JSON Accept + non-Upgrade request) all hold and the
+	// capWriter / per-flush metering wrap is installed.
+	//
+	// StreamingStatusAcceptJSONDowngrade is the post-D3 advisory
+	// variant: the request set Accept: application/json which
+	// would have downgraded the gate pre-ADR-102 but no longer
+	// does. Status is informational for one release cycle so
+	// pinned-SDK customers (whose Accept defaults to JSON) can
+	// self-diagnose via the header. The variant is deleted in
+	// ADR-102-followup ~30 days post-merge.
+	//
+	// StreamingStatusFlagDisabled means apps.streaming_enabled=false.
+	// StreamingStatusOperatorDisabled means FAAS_GATEWAY_STREAMING
+	// env was not set on the gatewayd-internal process.
+	// StreamingStatusPlanDisallows means the plan is Free (legacy
+	// pre-D5 rows only — D5 closes CreateApp at apid).
+	// StreamingStatusUpgradeBypass means Connection: Upgrade is
+	// set — the raw-bytes bridge handles this path, not the
+	// streaming path.
+	//
+	// All non-streaming variants carry the plan-level buffered cap
+	// (MaxResponseBodyBytes); only the streaming variant can carry
+	// an endpoint-rule cap (max_body_bytes_streaming from a
+	// matched edge rule).
+	StreamingStatusStreaming           StreamingStatus = "streaming"
+	StreamingStatusAcceptJSONDowngrade StreamingStatus = "accept-json-downgrade"
+	StreamingStatusFlagDisabled        StreamingStatus = "flag-disabled"
+	StreamingStatusOperatorDisabled    StreamingStatus = "operator-disabled"
+	StreamingStatusPlanDisallows       StreamingStatus = "plan-disallows"
+	StreamingStatusUpgradeBypass       StreamingStatus = "upgrade-bypass"
+
+	// StreamingStatusHeader is the canonical response header name
+	// carrying the StreamingStatus enum (ADR-102 D2). Title-Case
+	// per the IETF visible-header convention (Retry-After,
+	// X-RateLimit-*); not the x-faas-* internal prefix because
+	// this is customer-visible (and surfaceable to browser JS
+	// via CORS Expose-Headers per ADR-102 D8).
+	StreamingStatusHeader = "Streaming-Status"
+
+	// StreamingStatusAcceptHintHeader is the one-cycle advisory
+	// header (ADR-102 D3) stamped on the FIRST response after
+	// upgrade when the request would have downgraded pre-D3
+	// (i.e. Accept: application/json was set). Pinned-SDK
+	// customers whose SDK defaults Accept to JSON see this
+	// header and self-diagnose. Deleted in ADR-102-followup
+	// when the accept-json-downgrade enum variant is retired.
+	StreamingStatusAcceptHintHeader = "Streaming-Status-Accept-Hint"
+
+	// StreamingStatusAcceptHintValue is the wire value of the
+	// advisory header. Constant so a customer grepping for
+	// "would-buffer-pre-D3" finds exactly the call site.
+	StreamingStatusAcceptHintValue = "would-buffer-pre-D3"
+
 	// Raw-bridge (issue #676 / ADR-080) inbound cap. The raw-bytes
 	// bridge carries Upgrade / WebSocket / long-poll traffic from
 	// gatewayd-internal into the guest's netns TCP socket. The cap
@@ -3773,3 +3859,110 @@ const (
 	ObsAdminEventsLimitDefault = 200
 	ObsAdminEventsLimitMax     = ObsAdminPaginationMax
 )
+
+// End-to-end request budgets (ADR-093). The platform enforces a
+// wall-clock budget on every customer-facing request and propagates
+// the remaining time to every downstream call (DB, gRPC, outbound
+// HTTP). The values here are the *defaults* — per-route overrides
+// live on the edge-rule kind=budget JSON document, and per-plan
+// overrides live on Limits.RequestBudgetMs (added below).
+//
+// Source of truth: pkg/reqbudget re-exports these as reqbudget.*
+// so call-sites can use one import.
+const (
+	// RequestBudgetDefault is the per-request wall-clock budget the
+	// gatewayd-public BudgetMiddleware installs when no edge-rule
+	// kind=budget matches. 3 s matches the example in the user's
+	// feature ask ("POST /payment → 3 s"). A misconfigured
+	// deployment that wants a tighter or looser default can override
+	// per-route via kind=budget, or per-plan via the
+	// Limits.RequestBudgetMs accessor.
+	RequestBudgetDefault = 3 * time.Second
+	// RequestBudgetMax is the absolute upper bound on any per-request
+	// budget. Defends against a misconfiguration that would re-pin a
+	// 300 s stdlib WriteTimeout as the request budget. Per-plan max
+	// lives on Limits.RequestBudgetMaxMs; 0 falls back here.
+	RequestBudgetMax = 30 * time.Second
+	// RequestBudgetApidDefault is the apid-side default budget.
+	// apid serves dashboards + admin + sync-invoke long-polls that
+	// are already capped at 910 s upstream (fwdStream) so 5 s is
+	// the floor, not the ceiling; per-call context.WithTimeout calls
+	// in handlers continue to enforce their own sub-ceilings
+	// (EdgeRuleJWTVerifyTimeoutDefault, dashboard 3s, billing 30s,
+	// sync-invoke 5-30s).
+	RequestBudgetApidDefault = 5 * time.Second
+	// RequestBudgetDefaultOverrideHeader is the platform-wide
+	// default header name a kind=budget rule's AllowOverrideHeader
+	// resolves to when the rule leaves the field empty. Customers
+	// can override per-request by sending
+	// `x-faas-budget-ms: 3000` on the inbound request — the value
+	// is parsed as a positive integer milliseconds and replaces
+	// the static rule's BudgetMs for that single request, subject
+	// to the per-plan RequestBudgetMaxDuration ceiling. A
+	// per-rule AllowOverrideHeader takes precedence over this
+	// default when set.
+	RequestBudgetDefaultOverrideHeader = "x-faas-budget-ms"
+
+	// DefaultOverheadDB is the per-hop reservation for a local PG
+	// round-trip. Reservation, not measurement — it ensures a
+	// downstream call starts with at most (parentRemaining - 10 ms)
+	// even before its own work begins. Sized for local control
+	// plane; cross-region deployments may need larger reservations
+	// in a follow-up.
+	DefaultOverheadDB = 10 * time.Millisecond
+	// DefaultOverheadGRPC is the per-hop reservation for a local
+	// vmmd gRPC call. Same shape as DefaultOverheadDB — reservation,
+	// not measurement.
+	DefaultOverheadGRPC = 5 * time.Millisecond
+	// DefaultOverheadHTTP is the per-hop reservation for an outbound
+	// HTTP call (e.g. the public→internal RoundTrip).
+	DefaultOverheadHTTP = 20 * time.Millisecond
+	// DefaultOverheadStream is the per-hop reservation for a
+	// streaming first-byte ack. Larger than DB/gRPC because the
+	// first-byte acknowledgment involves one extra round-trip vs
+	// the unary case.
+	DefaultOverheadStream = 50 * time.Millisecond
+	// DefaultOverheadQueue is the per-hop reservation for a wake /
+	// enqueue / poll call. Small because these are local ops.
+	DefaultOverheadQueue = 5 * time.Millisecond
+)
+
+// RequestBudget returns the wall-clock deadline the platform
+// installs on customer-facing requests for this plan, falling back
+// to RequestBudgetDefault when the per-plan field is unset. The
+// returned duration is clamped to [1, RequestBudgetMax] so a
+// misconfigured Limits row cannot pin the budget to zero or to a
+// value larger than RequestBudgetMax. Per-route edge-rule
+// kind=budget overrides still take precedence at request time —
+// this accessor is the *baseline* the middleware starts from.
+//
+// ADR-093.
+func (l Limits) RequestBudget() time.Duration {
+	d := time.Duration(l.RequestBudgetMs) * time.Millisecond
+	if d <= 0 {
+		d = RequestBudgetDefault
+	}
+	if d > RequestBudgetMax {
+		d = RequestBudgetMax
+	}
+	return d
+}
+
+// RequestBudgetMaxDuration returns the absolute upper bound for any
+// per-request budget on this plan. 0 falls back to
+// RequestBudgetMax. Per-plan override clamps to [RequestBudget(),
+// 5 * RequestBudgetMax] so a customer with a 5 s plan default
+// cannot accidentally configure a 100 ms max (which would force the
+// default down to 100 ms).
+//
+// ADR-093.
+func (l Limits) RequestBudgetMaxDuration() time.Duration {
+	d := time.Duration(l.RequestBudgetMaxMs) * time.Millisecond
+	if d <= 0 {
+		d = RequestBudgetMax
+	}
+	if d < l.RequestBudget() {
+		d = l.RequestBudget()
+	}
+	return d
+}

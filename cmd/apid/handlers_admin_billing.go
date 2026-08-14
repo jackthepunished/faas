@@ -31,7 +31,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -161,7 +160,11 @@ func (s *server) syncPaddleCatalog(w http.ResponseWriter, r *http.Request, acct 
 		writeProviderNotImplemented(w, "sync", s.billingProvider)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), billingOpsTimeout)
+	// ADR-093 / PR-D: budget-aware ceiling — childDeadline =
+	// min(parentRemaining, billingOpsTimeout). When no budget is
+	// attached (direct dashboard call without gatewayd-public
+	// upstream), the legacy 30 s WithTimeout ceiling is preserved.
+	ctx, cancel := budgetCtx(r.Context(), billingOpsTimeout)
 	defer cancel()
 	entries, err := ops.SyncCatalog(ctx)
 	if err != nil {

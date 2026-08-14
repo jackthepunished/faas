@@ -124,6 +124,22 @@ type SecretScanResult struct {
 	Status    string          `json:"status"`
 	ScannedAt string          `json:"scanned_at,omitempty"`
 	Findings  []SecretFinding `json:"findings"`
+	// ImageDigest is the OCI digest the layered scan was run
+	// against (PR-A). Mirrors ScanResult.ImageDigest (Grype
+	// path) so a customer comparing scan + secret-scan rows
+	// for the same deploy can see both scans ran against the
+	// same bytes. Omitted from the apid source-tree
+	// rejection payload (the cmd/apid 422 path doesn't have
+	// an image digest — the customer hasn't uploaded yet).
+	ImageDigest string `json:"image_digest,omitempty"`
+	// Error carries an in-band explanation when the audit
+	// row is unreadable (jsonb decode failed, server logs
+	// carry the detail). Mirrors ScanResult.Error so the
+	// dashboard's "scan summary unavailable" pill has
+	// something to render for a malformed row. Omitted on
+	// the success path (Status carries the closed-set
+	// signal: "complete" | "complete_with_redactions").
+	Error string `json:"error,omitempty"`
 }
 
 // SeverityCounts is the per-severity bucket count of CVEs

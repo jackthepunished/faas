@@ -5,6 +5,7 @@
 import type { DeploymentHealthcheck } from './DeploymentHealthcheck.js';
 import type { DeploymentLivenessProbe } from './DeploymentLivenessProbe.js';
 import type { ScanResult } from './ScanResult.js';
+import type { SecretScanResult } from './SecretScanResult.js';
 /**
  * One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps. The optional `has_overrides` and `override_*` fields are the persisted echo of the create-time overrides object (issue #460 / ADR-053); they round-trip via `GET /v1/apps/{slug}/deployments/{id}` so a customer can audit what their last deploy pinned. Env values are NEVER echoed — only the keys (`override_env_keys`); env_secrets refs ARE echoed because the ref shape is non-secret by design.
  */
@@ -78,5 +79,23 @@ export type DeploymentResponse = {
    * Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`.
    */
   scope?: string | null;
+  /**
+   * Per-deploy secret-scan audit row (PR-A / ADR-101). Mirrors
+   * the `scan` field shape — absent when the row has not been
+   * scanned yet (deploy mid-pipeline or pre-PR-A), present
+   * with `findings=[]` for a clean walk, present with
+   * one-or-more entries for a hit. Read by the dashboard's
+   * "secret scan" card and the CLI's `--show-secret-scan`
+   * flag. Stamped both for the imaged-side layer walk (main
+   * image + each sidecar; post-build, loud-fail on any
+   * finding) and — forward-compat — for the apid-side
+   * source-tree 422 path. Status closed-set the writer
+   * stamps: "complete" (clean) | "complete_with_redactions"
+   * (hit). The `image_digest` sub-field records which OCI
+   * digest the imaged walk ran against; null on legacy
+   * pre-PR-A rows. See `pkg/imaged/secretscan.go`.
+   *
+   */
+  secret_scan?: (SecretScanResult | null);
 };
 

@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/geoip"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -1652,11 +1653,22 @@ func splitScheme(origin string) (scheme, rest string, ok bool) {
 // The function takes the resolved allowedOrigin (already
 // lower-cased + matched by matchOrigin) so the response
 // always echoes the matched entry verbatim.
+//
+// ADR-102: Streaming-Status + Streaming-Status-Accept-Hint are
+// custom (non-simple) response headers, so a CORS client cannot
+// read them unless the server whitelists them via
+// Access-Control-Expose-Headers. The default uncredentialed path
+// appends both header names so browser clients see the
+// discoverability signal without the customer authoring a
+// kind=cors rule. A kind=cors rule that sets its own
+// Expose-Headers (corsResponseOps) takes precedence per the
+// existing precedence rule and overrides this default.
 func corsDefaultOps(allowedOrigin string) []EdgeRuleHeaderOp {
 	return []EdgeRuleHeaderOp{
 		{Action: "set", Name: "Access-Control-Allow-Origin", Value: allowedOrigin},
 		{Action: "set", Name: "Access-Control-Allow-Methods", Value: "GET, POST, OPTIONS"},
 		{Action: "set", Name: "Access-Control-Allow-Headers", Value: "*"},
+		{Action: "set", Name: "Access-Control-Expose-Headers", Value: "Streaming-Status, Streaming-Status-Accept-Hint"},
 	}
 }
 
@@ -1805,6 +1817,16 @@ func (h *Handler) jwtEmit(ctx context.Context, kind, outcome, ruleID, fromHost s
 // deadline (server ReadTimeout / client cancellation) so the
 // tighter of the two wins.
 //
+// ADR-093 / PR-C: when the inbound request carries an end-to-end
+// budget (installed at the gatewayd-public edge), the JWT verify
+// hop becomes a child of that budget via reqbudget.WithCeiling.
+// childDeadline = min(parentRemaining, EdgeRuleJWTVerifyTimeoutDefault)
+// — the 5 s ceiling is unchanged; the budget can only tighten the
+// cap. When no Budget is attached to ctx (admin / apid path that
+// doesn't run through the edge middleware), the legacy
+// context.WithTimeout ceiling is preserved so the JWT verify hop's
+// hard 5 s safety cap cannot regress on the non-edge path.
+//
 // Returns the verifier's typed error verbatim — applyEdgeRuleJWT
 // maps it into a 401 + edge_rule.jwt_failed audit + match counter
 // increment. A deadline-exceeded error from context.WithTimeout
@@ -1815,6 +1837,13 @@ func (h *Handler) jwtEmit(ctx context.Context, kind, outcome, ruleID, fromHost s
 func (h *Handler) verifyJWTWithDeadline(ctx context.Context, raw string, rule *EdgeRuleJWTResolved) (*JWTClaims, error) {
 	if h.jwtVerifier == nil {
 		return nil, errors.New("jwt verifier not configured")
+	}
+	// PR-C: budget-aware ceiling when a budget is attached; legacy
+	// 5 s WithTimeout when not (see doc comment).
+	if b, ok := reqbudget.FromContext(ctx); ok {
+		jwtCtx, cancel, _ := b.WithCeiling(ctx, api.EdgeRuleJWTVerifyTimeoutDefault)
+		defer cancel()
+		return h.jwtVerifier.Verify(jwtCtx, raw, rule)
 	}
 	ctx, cancel := context.WithTimeout(ctx, api.EdgeRuleJWTVerifyTimeoutDefault)
 	defer cancel()
@@ -2352,10 +2381,121 @@ func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, 
 //     are long-lived but their body is read by the proxy leg's
 //     hijacker, not buffered. Treat them as buffered for the
 //     cap-selection purpose (the cap is the buffered cap).
+//
+// ADR-102: this gate is preserved for the applyEdgeRuleLimit call
+// site which only needs a bool. The richer streamingDecision struct
+// (with status + cap + capKind) lives in decideStreaming below;
+// both helpers share the same four-conjunct predicate so they
+// always agree on the boolean outcome.
 func streamingFor(h *Handler, r *http.Request, app App) bool {
-	return h.streamingEnabled && app.StreamingEnabled &&
-		!isAcceptJSON(r.Header.Get("Accept")) &&
-		!isUpgradeRequest(r)
+	_, isStreaming := decideStreaming(h, r, app)
+	return isStreaming
+}
+
+// streamingDecision is the per-request resolution of the four-conjunct
+// streaming gate (ADR-102 D1/D2). Status is the canonical enum value
+// stamped into the Streaming-Status response header; Cap is the
+// effective response body byte cap (plan-level for non-streaming
+// variants, possibly overridden by a matched edge-rule for the
+// streaming variant); CapKind labels the cap source for telemetry.
+//
+// All non-streaming variants carry the plan-level buffered cap
+// (app.Plan.MaxResponseBodyBytes()); only StreamingStatusStreaming
+// can carry an endpoint-rule cap (max_body_bytes_streaming from a
+// matched edge rule — see effectiveResponseCap).
+type streamingDecision struct {
+	Status  api.StreamingStatus
+	Cap     int64
+	CapKind string // "plan" | "endpoint-rule" | "none"
+}
+
+// decideStreaming is the ADR-102 canonical gate (D1/D2). Returns
+// the per-request classification that backs the Streaming-Status
+// response header. The boolean second return value is the same
+// four-conjunct predicate as the legacy streamingFor helper above,
+// retained so applyEdgeRuleLimit's bool-typed signature doesn't
+// need to change in this PR. The two helpers MUST agree — see
+// streamingFor's body.
+//
+// Conjuncts, evaluated in precedence order (first failure wins):
+//
+//  1. h.streamingEnabled (operator opt-in via FAAS_GATEWAY_STREAMING)
+//     → operator-disabled (plan cap)
+//  2. app.StreamingEnabled (per-app flag from apps.streaming_enabled)
+//     → flag-disabled (plan cap)
+//  3. app.Plan.StreamingResponseAllowed() (D5 defense-in-depth
+//     mirror of the apid CreateApp 403 — Free + flag rows must
+//     never reach the streaming path even if a pre-D5 row
+//     survives the data-tier migration gap)
+//     → plan-disallows (plan cap)
+//  4. isUpgradeRequest(r) (Connection: Upgrade set)
+//     → upgrade-bypass (plan cap; the raw-bytes bridge handles it)
+//  5. isAcceptJSON(r.Header.Get("Accept")) (pre-D3 advisory only;
+//     D3 hard-flip means this does NOT downgrade to buffered
+//     anymore, but the status still reflects what would have
+//     downgraded pre-D3 so pinned-SDK customers can self-diagnose)
+//     → accept-json-downgrade (plan cap)
+//  5. otherwise → streaming (cap = plan or endpoint-rule cap)
+//
+// The plan cap is app.Plan.MaxResponseBodyBytes(); the endpoint-rule
+// cap is set by looking up the matched edge rule at this call site
+// (h.edgeRules.MatchLimit). The lookup is duplicated relative to
+// applyEdgeRuleLimit's own call below at line ~2440 — accepted as
+// cheap in-memory lookup; alternative (stashing the rule on the
+// Handler between the two call sites) was rejected as cross-cutting
+// state mutation that's harder to reason about than the double
+// lookup. Same-account check is enforced inside MatchLimit so the
+// endpoint-rule cap can never be hijacked cross-account.
+func decideStreaming(h *Handler, r *http.Request, app App) (streamingDecision, bool) {
+	planCap := app.Plan.MaxResponseBodyBytes()
+
+	if !h.streamingEnabled {
+		return streamingDecision{Status: api.StreamingStatusOperatorDisabled, Cap: planCap, CapKind: "plan"}, false
+	}
+	if !app.StreamingEnabled {
+		return streamingDecision{Status: api.StreamingStatusFlagDisabled, Cap: planCap, CapKind: "plan"}, false
+	}
+	// Defense-in-depth mirror of the apid D5 CreateApp 403. By the
+	// time the request reaches the gateway, the apid gate should
+	// have prevented any Free + flag row from being persisted. If
+	// a pre-D5 row survives (data-tier migration gap), this gate
+	// turns the next request into a buffered response with the
+	// plan-disallows enum so the Streaming-Status response header
+	// surfaces the violation. The deferred CHECK constraint
+	// (ADR-102 follow-up) ships once telemetry confirms zero
+	// Free+flag rows in production.
+	if !app.Plan.StreamingResponseAllowed() {
+		return streamingDecision{Status: api.StreamingStatusPlanDisallows, Cap: planCap, CapKind: "plan"}, false
+	}
+	if isUpgradeRequest(r) {
+		return streamingDecision{Status: api.StreamingStatusUpgradeBypass, Cap: planCap, CapKind: "plan"}, false
+	}
+
+	// Per-endpoint RESPONSE cap (ADR-102 D4). Mirrors the
+	// request-side lookup that applyEdgeRuleLimit does at line
+	// 2440; the duplicate call is the explicit decision per the
+	// helper's doc above. Cap is the larger of the two
+	// (request-side MaxBodyBytes clamped to 100 MiB;
+	// response-side MaxBodyBytesStreaming up to the plan cap).
+	cap, capKind := planCap, "plan"
+	if h.edgeRules != nil {
+		rule := h.edgeRules.MatchLimit(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+		if rule != nil && rule.AccountID == app.AccountID && rule.MaxBodyBytesStreaming > 0 {
+			cap = int64(rule.MaxBodyBytesStreaming)
+			capKind = "endpoint-rule"
+		}
+	}
+
+	if isAcceptJSON(r.Header.Get("Accept")) {
+		// D3 advisory: status is informational, the request DOES
+		// stream. The accept-json-downgrade enum variant exists
+		// for one release cycle so pinned-SDK customers whose
+		// Accept defaults to JSON can self-diagnose via the
+		// Streaming-Status header + Streaming-Status-Accept-Hint
+		// advisory header.
+		return streamingDecision{Status: api.StreamingStatusAcceptJSONDowngrade, Cap: cap, CapKind: capKind}, true
+	}
+	return streamingDecision{Status: api.StreamingStatusStreaming, Cap: cap, CapKind: capKind}, true
 }
 
 // applyEdgeRuleLimit (ADR-091 D24 / new ADR-0NN-edge-rule-limit)
@@ -3433,7 +3573,15 @@ func isAcceptJSON(accept string) bool {
 // Handler then calls proxy.ServeHTTP(w, r) with this writer;
 // every Write hits the cap check, the recorder's maybeFlush,
 // and the recorder's flush (which calls onFlush).
-func (h *Handler) setupStreamingWriter(w http.ResponseWriter, rec *statusRecorder, app App, target Target, writeTimeout time.Duration) http.ResponseWriter {
+// setupStreamingWriter installs the per-flush metering + cap-wrap
+// pipeline on w. The cap parameter is the ADR-102-resolved response
+// body byte cap (plan cap by default; endpoint-rule
+// MaxBodyBytesStreaming if a kind=limit edge rule matched the
+// request — see decideStreaming at handler.go:~2295). Pre-ADR-102
+// the cap was always plan-derived (app.Plan.MaxResponseBodyBytes
+// hardcoded below), so this signature change is the D4 wire-up
+// point.
+func (h *Handler) setupStreamingWriter(w http.ResponseWriter, rec *statusRecorder, app App, target Target, cap int64, writeTimeout time.Duration) http.ResponseWriter {
 	var lastReported int64
 	onFlush := func(cumulative int64) {
 		delta := cumulative - lastReported
@@ -3474,7 +3622,6 @@ func (h *Handler) setupStreamingWriter(w http.ResponseWriter, rec *statusRecorde
 	// response goroutine via the closed channel, the response
 	// goroutine writes the 413 problem+json and disables
 	// further writes via the capWriter.disabled flag.
-	cap := app.Plan.MaxResponseBodyBytes()
 	return &capWriter{
 		ResponseWriter: rec,
 		cap:            cap,
@@ -3913,6 +4060,19 @@ haveApp:
 		return
 	}
 
+	// ADR-093: stamp the per-request wall-clock budget onto
+	// r.Context() via reqbudget.WithRemaining. Runs AFTER the
+	// validate applier (which needs the inbound body read) and
+	// BEFORE the wake gate (so a slow upstream never pins
+	// listener / goroutine / socket resources for the full
+	// platform WriteTimeout — deadline fires at the budget
+	// boundary and the handler chain unwinds). The middleware
+	// observes the deadline fire and writes 504 + RFC 7807
+	// `code: request_budget_exceeded`; this applier never
+	// short-circuits (it always stamps a budget, even on
+	// miss — the plan-level default applies).
+	h.applyEdgeRuleBudget(w, r, app)
+
 	// Issue #560 / per-deployment require_authn. Runs AFTER
 	// Host→app resolution (so we know which app's
 	// require_authn to consult) and BEFORE the per-account
@@ -4137,12 +4297,58 @@ haveApp:
 	// before any body bytes flow, so the cap is meaningless on
 	// the upgrade path. Skipping the wrap here keeps the WS
 	// session alive past 100 MiB of cumulative response bytes.
-	streaming := h.streamingEnabled && app.StreamingEnabled &&
-		!isAcceptJSON(r.Header.Get("Accept")) &&
-		!isUpgradeRequest(r)
-	if streaming {
+	// ADR-102 D2 + D4: resolve the per-request streaming decision
+	// once. The decision carries:
+	//   - Status: the Streaming-Status enum value, stamped
+	//     UNCONDITIONALLY below so buffered responses also carry
+	//     the header (and pinned-SDK customers with Accept:
+	//     application/json see the accept-json-downgrade variant
+	//     + the advisory header per D3).
+	//   - Cap: the effective response body byte cap. For non-
+	//     streaming variants this is the plan-level buffered cap;
+	//     for StreamingStatusStreaming it may be overridden by a
+	//     matched edge rule's MaxBodyBytesStreaming field (D4).
+	//   - isStreaming: the same four-conjunct predicate as the
+	//     legacy streamingFor helper, used to gate the writer
+	//     wrap below.
+	decision, isStreaming := decideStreaming(h, r, app)
+
+	// Streaming-Status header stamp (ADR-102 D2). UNCONDITIONAL —
+	// the header must land on EVERY response (streaming AND
+	// buffered) so customers can self-diagnose. Precedent:
+	// x-faas-request-id at handler.go:3443-3451 (also stamped
+	// before any Write). Status-only; the per-endpoint cap
+	// doesn't go in the header — that's surfaced via the SDK
+	// probe at GET /v1/apps/{slug}/streaming-cap (D6).
+	w.Header().Set(api.StreamingStatusHeader, string(decision.Status))
+
+	// Advisory header (ADR-102 D3). One-cycle hint for pinned-SDK
+	// customers whose Accept defaults to application/json. The
+	// accept-json-downgrade status already tells them what
+	// happened; the advisory header names the action ("would have
+	// buffered pre-D3") so a customer grepping for the migration
+	// marker finds the doc. Deleted in ADR-102-followup when
+	// the enum variant is retired.
+	if decision.Status == api.StreamingStatusAcceptJSONDowngrade {
+		w.Header().Set(api.StreamingStatusAcceptHintHeader, api.StreamingStatusAcceptHintValue)
+	}
+
+	if isStreaming {
 		writeTimeout := app.Plan.ResponseWriteTimeout()
-		w = h.setupStreamingWriter(w, rec, app, target, writeTimeout)
+		// ADR-093 / PR-C: clamp the per-flush writeTimeout to the
+		// inbound budget's remaining time when one is attached.
+		// The flush loop re-installs the deadline on every flush
+		// (statusRecorder.installFlushHook), so capping the
+		// initial value caps the entire session's wall-clock
+		// budget. The plan's ResponseWriteTimeout is the absolute
+		// ceiling — the budget can only shorten it. When no
+		// Budget is on ctx the per-flush deadline is unchanged.
+		if b, ok := reqbudget.FromContext(r.Context()); ok { //nolint:contextcheck // request ctx at handler boundary; budget lookup is a reader (ctx.Value equivalent).
+			if rem := b.Remaining(time.Time{}); rem > 0 && rem < writeTimeout {
+				writeTimeout = rem
+			}
+		}
+		w = h.setupStreamingWriter(w, rec, app, target, decision.Cap, writeTimeout)
 		// Internal header stamp (PR-B + PR-C / ADR-047). The
 		// forwarder (pkg/gateway/forwardproxy.go) reads this to
 		// switch to the bidi ForwardHTTPStream RPC and lift the
@@ -4168,7 +4374,7 @@ haveApp:
 	// gauge. The streaming path is the only path that incremented;
 	// the buffered path is a no-op for the Dec.
 	defer func() {
-		if streaming && h.metrics != nil {
+		if isStreaming && h.metrics != nil {
 			h.metrics.ObserveStreamEnd(app.ID, string(app.Plan))
 		}
 	}()
@@ -4291,7 +4497,16 @@ haveApp:
 	// allocation-free after the first observation per
 	// (appID, contentType), so the log fires at most once per
 	// misconfigured app.
-	if !streaming && app.StreamingEnabled &&
+	// streamingFallbackLog gate (ADR-102). Pre-ADR-102 this fired
+	// whenever a Free app with streaming_enabled=true served a
+	// text/event-stream response — the silent buffered fallback
+	// that D5 closes at apid. Post-ADR-102 the gate fires on
+	// plan-disallows (legacy Free rows that pre-date D5) and on
+	// flag-disabled (a customer with streaming_enabled=false who
+	// is hitting a text/event-stream endpoint). D3's
+	// accept-json-downgrade variant does NOT fire — that case
+	// streams for real, the status is informational only.
+	if !isStreaming && app.StreamingEnabled &&
 		app.Plan == api.PlanFree &&
 		strings.HasPrefix(strings.ToLower(rec.ContentType), "text/event-stream") {
 		h.streamingFallbackLog(app.ID, rec.ContentType)

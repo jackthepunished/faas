@@ -112,8 +112,7 @@ func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate valida
 // list to include malformed CIDR parse errors from compileIPRules
 // (reuses the same PathGlobError tuple shape); PR-B widens it
 // to include kind=validate compile errors; the maintenance
-// amendment widens it again to include kind=maintenance; the D20.5
-// amendment widens it once more for kind=throttle (issue #881).
+// amendment widens it again to include kind=maintenance.
 func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway.HostEntry, error) {
 	storeRules, err := g.store.MatchEdgeRulesForHost(ctx, host)
 	if err != nil {
@@ -131,6 +130,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	maintenance, maintenanceErrs := compileMaintenanceRules(storeRules)
 	geo, geoErrs := compileGeoRules(storeRules)
 	throttle, throttleErrs := compileThrottleRules(storeRules)
+	budget, budgetErrs := compileBudgetRules(storeRules)
 	entry := &gateway.HostEntry{
 		Route:       route,
 		Rewrite:     rewrite,
@@ -144,6 +144,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		Maintenance: maintenance,
 		Geo:         geo,
 		Throttle:    throttle,
+		Budget:      budget,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -156,7 +157,7 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, maintenanceErrs...)
 	parseErrs = append(parseErrs, geoErrs...)
 	parseErrs = append(parseErrs, throttleErrs...)
-
+	parseErrs = append(parseErrs, budgetErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
 	}
@@ -197,6 +198,15 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 		}
 		for range maintenanceErrs {
 			g.metrics.ObserveEdgeRuleCompileError("maintenance")
+		}
+		for range geoErrs {
+			g.metrics.ObserveEdgeRuleCompileError("geo")
+		}
+		for range budgetErrs {
+			g.metrics.ObserveEdgeRuleCompileError("budget")
+		}
+		for range throttleErrs {
+			g.metrics.ObserveEdgeRuleCompileError("throttle")
 		}
 	}
 	return entry, nil
@@ -513,6 +523,36 @@ func (g *gatewaydEdgeRules) MatchThrottle(ctx context.Context, host, requestPath
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstThrottleMatch(rules, requestPath, method)
+}
+
+// MatchBudget is the ADR-093 matcher for the kind=budget subset.
+// Same shape as MatchLimit: cache hit returns immediately; cache
+// miss triggers loadHost which compiles every kind's slice in one
+// SQL roundtrip (the SQL dominates; the kind-specific compile
+// walks are irrelevant). On cache miss with no kind=budget rule
+// the cache still records a nil Budget slice, so a future
+// MatchBudget on the same host hits the cache instead of
+// reloading. Returns the highest-priority matching rule or nil on
+// miss; the applier (handler.go::applyEdgeRuleBudget) falls back
+// to the plan-level default budget on nil.
+func (g *gatewaydEdgeRules) MatchBudget(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleBudgetResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetBudget(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Budget
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstBudgetMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -1251,6 +1291,61 @@ func compileThrottleRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleThrott
 			KeyBy:          r.Action.Throttle.KeyBy,
 			JWTClaimName:   r.Action.Throttle.JWTClaimName,
 			MaxKeysPerRule: maxKeys,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileBudgetRules mirrors compileLimitRules for kind=budget
+// (ADR-093). The compile is a free function — it doesn't need any
+// adapter state. Out-of-bound BudgetMs values are clamped silently
+// to the platform ceiling, the same defence-in-depth posture as
+// compileLimitRules (a hot-fix that bypassed apid still gets
+// clamped here, and a row with a non-positive BudgetMs degrades
+// to the platform ceiling rather than 0-deadlining every request).
+// The customer never sees the warning (their rule still fires, just
+// at the platform ceiling).
+func compileBudgetRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleBudgetResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleBudgetResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindBudget {
+			continue
+		}
+		if r.Action.Budget == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp the budget to the platform ceiling. Non-positive or
+		// > ceiling → api.RequestBudgetMaxMs (a 0 budget would
+		// 504 every request, which is worse than the platform
+		// default; the same defence-in-depth posture as
+		// compileLimitRules silently dropping malformed caps).
+		budgetMs := r.Action.Budget.BudgetMs
+		maxBudgetMs := int(api.RequestBudgetMax.Milliseconds())
+		if budgetMs <= 0 || budgetMs > maxBudgetMs {
+			budgetMs = maxBudgetMs
+		}
+		out = append(out, gateway.EdgeRuleBudgetResolved{
+			ID:                  r.ID,
+			AccountID:           r.AccountID,
+			AppID:               r.AppID,
+			Priority:            r.Priority,
+			PathGlob:            r.MatchPath,
+			Methods:             buildMethodsMap(r.MatchMethods),
+			BudgetMs:            budgetMs,
+			AllowOverrideHeader: r.Action.Budget.AllowOverrideHeader,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })

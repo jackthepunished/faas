@@ -135,3 +135,94 @@ func (s *server) scanResponse(d state.Deployment) *api.ScanResult {
 	}
 	return &out
 }
+
+// getDeploymentSecretScan is the GET
+// /v1/deployments/{id}/secret-scan handler (PR-A, imaged-layer
+// secret scan). Mirrors getDeploymentScan structurally — same
+// IDOR posture (AppByID + AccountID check → cross-account probes
+// get 404), same 404 on no-row-yet. The "no scan yet" case is
+// derived from `SecretScannedAt == nil` rather than a dedicated
+// secret_scan_status column (migration 00264 added the audit
+// jsonb + scanned_at timestamptz but no status column; the
+// wire-level Status is reconstructed from the jsonb payload).
+//
+// Auth: authLimited + requireMFA + read scope — same chain as
+// getDeployment at server.go:712. Handler body kept small (≤50
+// lines per CLAUDE.md convention) by delegating wire-shape
+// construction to secretScanResponse.
+func (s *server) getDeploymentSecretScan(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	d, err := s.store.DeploymentByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.notFound(w, "no such deployment")
+			return
+		}
+		api.WriteProblem(w, api.ErrInternal(
+			fmt.Sprintf("load deployment: %v", err)))
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), d.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		// Same posture as getDeployment + getDeploymentScan:
+		// cross-account probes get 404, not 403 — we never
+		// reveal whether the deployment_id exists in
+		// another account.
+		s.notFound(w, "no such deployment")
+		return
+	}
+	resp := s.secretScanResponse(d)
+	if resp == nil {
+		// No scan has run yet — the deploy is still
+		// mid-pipeline or predates PR-A entirely. 404 is
+		// the right answer; the dashboard's "scan
+		// pending" pill renders on the absence
+		// (SecretScan == nil on DeploymentResponse).
+		s.notFound(w, "secret scan not yet available")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// secretScanResponse builds the wire-shape
+// *api.SecretScanResult from a state.Deployment row. Returns
+// nil when the row has no SecretFindings yet (deploy
+// mid-pipeline, pre-PR-A row). The returned pointer is the
+// SINGLE source of truth for the per-deploy secret-scan wire
+// shape — deploymentResponse (PR-A, handlers_ext.go
+// deploymentResponse) and getDeploymentSecretScan both go
+// through it, so the two endpoints stay byte-identical for a
+// given row.
+//
+// Decode-failure convention: a corrupt jsonb payload does NOT
+// surface a 500. The handler logs at WARN and the returned
+// SecretScanResult carries an empty Findings slice + Status =
+// "complete" (the dashboard renders the same "scan failed"
+// pill it renders for an unreadable row). ImageDigest /
+// ScannedAt fall back to the row columns when the jsonb
+// payload can't decode.
+func (s *server) secretScanResponse(d state.Deployment) *api.SecretScanResult {
+	if d.SecretScannedAt == nil {
+		return nil
+	}
+	// Status starts empty. The earlier "Status: 'complete'"
+	// default silently miscategorised finding-positive rows
+	// whose jsonb failed to unmarshal — Status would read
+	// "complete" while findings>0 implied "complete_with_redactions".
+	// Treating the decoded payload as authoritative means a
+	// decode failure surfaces an Error+empty-Status result the
+	// dashboard can render as the same "scan summary unavailable"
+	// pill it renders for an unreadable row.
+	out := api.SecretScanResult{}
+	out.ScannedAt = d.SecretScannedAt.UTC().Format(time.RFC3339Nano)
+	out.ImageDigest = d.ImageDigest
+	if len(d.SecretFindings) > 0 {
+		if err := json.Unmarshal(d.SecretFindings, &out); err != nil {
+			out.Findings = nil
+			out.Error = "secret_findings decode failed (server logs carry the detail)"
+			s.log.Warn("apid: decode secret_findings",
+				"deployment", d.ID, "err", err)
+		}
+	}
+	return &out
+}
