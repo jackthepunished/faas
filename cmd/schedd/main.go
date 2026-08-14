@@ -1417,6 +1417,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			loop.WithGatewaySynth(synth)
 		}
 	}
+
+	// Issue #757 / ADR-100 (commits #13/#14): wire the HTTP transport
+	// the trigger dispatch tick uses to post batch envelopes to
+	// /v1/invocations:dispatch_batch. The gateway side serves that
+	// route on the same unix socket as the cron dispatch path
+	// (cmd/gatewayd-internal/run.go::gatewaydInternalSocket);
+	// postBatch() strips the unix:// scheme and dials that path
+	// directly. We keep a separate http.Client (rather than sharing
+	// the synth RPC) because the cron surface uses gRPC semantics
+	// over a unix socket transport, while the batch endpoint is
+	// plain HTTP/1.1 JSON — different idle-pool shapes, different
+	// request timeouts. A nil Dial here is non-fatal: the dispatch
+	// tick logs "gateway http client not configured" and exits each
+	// batch to retry land (commits #13 retry FSM).
+	// mirror the Unix socket path the synth target falls back to.
+	triggerClient, triggerBase, triggerDialErr := sched.HTTPClientForGatewaySynthTarget(synthTarget)
+	if triggerDialErr != nil {
+		log.Warn("gateway http dial: trigger batch dispatch disabled until gatewayd-internal is up",
+			"target", synthTarget, "err", triggerDialErr)
+	} else {
+		loop.WithGatewayHTTPClient(triggerClient, triggerBase)
+	}
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- loop.Run(ctx) }()
 

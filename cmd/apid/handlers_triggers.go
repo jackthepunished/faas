@@ -172,15 +172,34 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "app_id is required"))
 		return
 	}
-	switch req.Kind {
-	case api.TriggerKindCron:
+	// Review finding #6: reject cron-kind POSTs BEFORE the
+	// plan-quota lookup. ADR-090 PR-B wires cron triggers
+	// through the crons table (the dashboard "Add cron" UI is
+	// POST /v1/crons); accepting them here would couple the
+	// two storage paths in this commit. Rejecting early also
+	// avoids the AppByID roundtrip + the per-plan
+	// TriggerLimitPerApp / TriggerLimitPerAccount caps work
+	// for a POST that would have been rejected a few lines
+	// later — a Free-plan customer hitting POST /v1/triggers
+	// with kind=cron gets a clean 400 rather than the 402
+	// "triggers not allowed on plan free" response that
+	// would be misleading.
+	if req.Kind == api.TriggerKindCron {
 		if !validCron(req.Schedule) {
 			api.WriteProblem(w, api.ErrCronInvalid("expected 5-field cron expression (m h dom mon dow)"))
 			return
 		}
+		// Path default kept here for parity with the cron table.
 		if req.Path == "" {
 			req.Path = "/"
 		}
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest,
+			"trigger_immutable",
+			"kind=cron not supported on POST /v1/triggers — use POST /v1/crons",
+			""))
+		return
+	}
+	switch req.Kind {
 	case api.TriggerKindKafka, api.TriggerKindNATS, api.TriggerKindRedisStreams, api.TriggerKindSQSCompat, api.TriggerKindQueue:
 		if req.Slug == "" {
 			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "slug is required for non-cron triggers"))
@@ -233,15 +252,11 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "max_attempts", limits.TriggerMaxAttemptsMax, int(maxAttempts)))
 		return
 	}
-	if req.Kind == api.TriggerKindCron {
-		// Cron kinds via POST /v1/triggers stay unsupported in
-		// commit #6 — the dashboard "Add cron" path is the existing
-		// POST /v1/crons (ADR-090 PR-B). Rejecting here keeps the
-		// two code paths from racing over the same kind.
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request",
-			"kind=cron triggers must be created via POST /v1/crons (ADR-090 PR-B)"))
-		return
-	}
+	// (cron-kind POSTs are rejected earlier in the handler — the
+	// ADR-090 PR-B path. The review finding #6 fix shifts the
+	// rejection above the AppByID roundtrip so a kind=cron POST
+	// never pays for the plan-tier gate or per-record cap
+	// checks below.)
 	t, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
 		app.ID,
 		string(req.Kind), req.Slug, enabled, []byte(req.Config),

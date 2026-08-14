@@ -51,6 +51,15 @@ type redisPoller struct {
 
 	mu       sync.Mutex
 	inFlight map[string]string // id → original stream value (for header passthrough)
+
+	// closeOnce + closeErr make Close idempotent (review
+	// finding #7). The underlying redis.Client uses atomic CAS
+	// internally and returns redis.ErrClosed on the second call;
+	// wrapping in sync.Once avoids surfacing that error twice
+	// for callers (leakcheck's TestTriggerPollers_*) which
+	// expect Close#2 == nil.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // redisConfig is the per-kind config blob.
@@ -288,13 +297,27 @@ func (r *redisPoller) Nack(ctx context.Context, _ sqlc.Trigger, ids []string, re
 }
 
 // Close closes the redis client.
+//
+// Idempotent (review finding #7): the underlying redis.Client
+// uses atomic.CompareAndSwapUint32 on its Close path and
+// returns redis.ErrClosed on the second call. schedd can
+// hit Close twice on the same instance (trigger delete +
+// schedd shutdown unwind race), so we guard behind a
+// sync.Once inside the per-instance mutex. The mutex
+// ordering is mu, then Once — Close always holds mu until
+// the underlying Close() has returned, so concurrent
+// first-call Close + parallel cleanup observers can't
+// race on the in-flight map.
 func (r *redisPoller) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for k := range r.inFlight {
 		delete(r.inFlight, k)
 	}
-	return r.client.Close()
+	r.closeOnce.Do(func() {
+		r.closeErr = r.client.Close()
+	})
+	return r.closeErr
 }
 
 func init() {

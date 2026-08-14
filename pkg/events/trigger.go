@@ -137,6 +137,15 @@ type TriggerDLQEvent struct {
 	AppID     string `json:"app_id"`
 	Reason    string `json:"reason"`
 	Attempts  int    `json:"attempts"`
+	// LastError is the function-supplied error string the
+	// gateway captured in the dispatch response. Review
+	// finding #8: the prior code dropped status.Error on the
+	// floor and hardcoded Reason='max_attempts' regardless of
+	// cause. Carrying LastError here lets operators reading the
+	// audit timeline distinguish "function timed out" from "we
+	// exhausted retries". Optional; omitted when the gateway
+	// response had no Error string.
+	LastError string `json:"last_error,omitempty"`
 }
 
 // Kind returns the audit kind for TriggerDLQEvent.

@@ -35,6 +35,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -140,9 +141,34 @@ func (l *Loop) runTriggerTick(ctx context.Context) {
 	if len(triggers) == 0 {
 		return
 	}
+	// Cache per-app+plan lookup so the per-record rate-limit gate
+	// (review finding #4: was hardcoded to api.PlanFree) can
+	// re-use the AccountPlan across the loop. The whole batch
+	// for one trigger is one wake plan; the cache halves the
+	// per-tick Postgres load when many triggers share an app.
+	planCache := map[string]api.Plan{}
+	resolvePlan := func(appID string) api.Plan {
+		if p, ok := planCache[appID]; ok {
+			return p
+		}
+		// Look up app → account to read the actual plan.
+		app, appErr := l.engine.Store().AppByID(ctx, appID)
+		if appErr != nil {
+			return api.PlanFree
+		}
+		acct, acctErr := l.engine.Store().AccountByID(ctx, app.AccountID)
+		if acctErr != nil {
+			return api.PlanFree
+		}
+		if acct.Plan == "" {
+			return api.PlanFree
+		}
+		planCache[appID] = acct.Plan
+		return acct.Plan
+	}
 	for i := range triggers {
 		t := triggers[i]
-		if err := l.dispatchOneTrigger(ctx, t, store); err != nil {
+		if err := l.dispatchOneTrigger(ctx, t, store, resolvePlan); err != nil {
 			l.log.Warn("sched trigger tick: dispatch",
 				"trigger_id", t.ID.String(),
 				"kind", t.Kind,
@@ -151,8 +177,11 @@ func (l *Loop) runTriggerTick(ctx context.Context) {
 	}
 }
 
-// dispatchOneTrigger runs one trigger's per-tick work.
-func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store storeLike) error {
+// dispatchOneTrigger runs one trigger's per-tick work. The planFor
+// resolver is consulted at the rate-limit gate so Hobby/Pro/Scale
+// apps get their per-plan WakeBurstPerApp + TriggerRecordsPerSecondPerApp
+// caps rather than collapsing to Free.
+func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store storeLike, planFor func(string) api.Plan) error {
 	// 1. Poller lookup. Cached on the Loop.
 	if l.triggerPollers == nil {
 		l.triggerPollers = map[string]triggerSource{}
@@ -193,7 +222,15 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	}
 
 	// 4. Rate-limit gate. Deny → dead_letter(reason='rate_limited').
-	if l.rateLimiter != nil && !l.rateLimiter.AllowWakeApp(t.AppID.String(), api.PlanFree) {
+	// review finding #4: the plan argument was hardcoded to api.PlanFree,
+	// which collapsed Hobby/Pro/Scale customers to the Free bucket's
+	// 1-wake-per-minute ceiling. Resolve the actual account plan via
+	// the per-tick plan cache (constructed in runTriggerTick).
+	appPlan := api.PlanFree
+	if planFor != nil {
+		appPlan = planFor(t.AppID.String())
+	}
+	if l.rateLimiter != nil && !l.rateLimiter.AllowWakeApp(t.AppID.String(), appPlan) {
 		items := batchItemIDs(batch)
 		l.deadLetterAll(ctx, t.ID.String(), items, "rate_limited", "wake rate limit exceeded", store)
 		return nil
@@ -245,6 +282,8 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	succeedIDs := []string{}
 	retryIDs := []string{}
 	dlqIDs := []string{}
+	dlqReasons := []string{} // parallel to dlqIDs; review finding #8
+	dlqErrors := []string{}  // parallel to dlqIDs; review finding #8
 	succeedItems := []string{}
 	retryItems := []string{}
 	dlqItems := []string{}
@@ -267,6 +306,16 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		case "dead_letter":
 			dlqIDs = append(dlqIDs, c.ID.String())
 			dlqItems = append(dlqItems, itemID)
+			// Review finding #8: the old code dropped
+			// status.Error on the floor and stampped the
+			// audit Reason='max_attempts' regardless of
+			// cause. Map the gateway-supplied status.Error
+			// onto one of the trigger_dead_letter.reason
+			// CHECK values; fall through to 'poison_record'
+			// when the gateway didn't classify.
+			reason := classifyDLQReason(status.Error)
+			dlqReasons = append(dlqReasons, reason)
+			dlqErrors = append(dlqErrors, status.Error)
 		default:
 			retryIDs = append(retryIDs, c.ID.String())
 			retryItems = append(retryItems, itemID)
@@ -313,8 +362,10 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		}
 	}
 	if len(dlqIDs) > 0 {
-		for _, id := range dlqIDs {
-			if err := store.MarkTriggerRecordDeadLetter(ctx, id, ""); err != nil {
+		for i, id := range dlqIDs {
+			reason := dlqReasons[i]
+			lastErr := dlqErrors[i]
+			if err := store.MarkTriggerRecordDeadLetter(ctx, id, lastErr); err != nil {
 				l.log.Warn("sched trigger tick: mark dlq",
 					"id", id, "err", err)
 			}
@@ -322,8 +373,9 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				TriggerID: t.ID.String(),
 				RecordID:  id,
 				AppID:     t.AppID.String(),
-				Reason:    "max_attempts",
+				Reason:    reason,
 				Attempts:  1,
+				LastError: lastErr,
 			})
 		}
 		if err := poller.Nack(ctx, t, dlqItems, "poison_record"); err != nil {
@@ -484,6 +536,43 @@ func (r *byteReadCloser) Close() error { return nil }
 
 // Compile-time guarantee the helpers we use are wired.
 var _ = slog.Default
+
+// classifyDLQReason maps the gateway's per-record error string
+// onto one of trigger_dead_letter.reason's CHECK values
+// (migrations/00267_triggers.sql::trigger_dead_letter.reason_check).
+// Review finding #8: the prior code hardcoded 'max_attempts'
+// for every Status='dead_letter' record.
+//
+// The string-match heuristic looks at substrings of the gateway's
+// per-record Error field. Real causes the gateway distinguishes
+// today (pkg/gateway/synth.go::handleInvocationDispatchBatch):
+//   - "function response malformed" → poison_record
+//   - "reported in batchItemFailures" → max_attempts (the function
+//     decided to give up — it called back into the report with the
+//     same id which means it has exhausted its own retries)
+//   - "function state=timeout" → max_attempts
+//   - everything else → poison_record (last resort)
+//
+// Refining this into a structured gateway error type is PR-B
+// scope (the gateway only emits the strings today, so the
+// disambiguation logic lives here).
+func classifyDLQReason(gatewayErr string) string {
+	if gatewayErr == "" {
+		return "poison_record"
+	}
+	switch {
+	case strings.Contains(gatewayErr, "batchItemFailures"):
+		return "max_attempts"
+	case strings.Contains(gatewayErr, "timeout"):
+		return "max_attempts"
+	case strings.Contains(gatewayErr, "malformed"),
+		strings.Contains(gatewayErr, "broker_error"),
+		strings.Contains(gatewayErr, "payload_b64"):
+		return "poison_record"
+	default:
+		return "poison_record"
+	}
+}
 
 // emitAudit writes an audit row via the loop's audit.Auditor.
 // Nil-safe (no-ops if the Loop has no Auditor wired — keeps tests

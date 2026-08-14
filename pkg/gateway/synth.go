@@ -509,13 +509,17 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 			s.log.Warn("gateway synth: batch failures parse",
 				"item", logsanitize.Field(rec.ItemIdentifier),
 				"err", parseErr)
-			// Malformed function response — treat as broker_error
-			// so the schedd dead-letters this record with
-			// reason='poison_record'.
+			// Malformed function response — emit Status='retry'
+			// so the schedd's retry FSM can advance attempts and
+			// only escalate to dead_letter when the per-trigger
+			// max_attempts budget is exhausted. review finding #5:
+			// the prior code skipped straight to dead_letter on
+			// the first transient 5xx, bypassing the customer's
+			// retry budget entirely.
 			results = append(results, batchDispatchResult{
 				ItemIdentifier: rec.ItemIdentifier,
-				Status:         "dead_letter",
-				Error:          "function response malformed",
+				Status:         "retry",
+				Error:          "function response malformed: " + parseErr.Error(),
 			})
 			continue
 		}
