@@ -337,7 +337,7 @@ func (p *Probe) ProbeOnce(ctx context.Context, tgt state.DataUpstreamTarget) Pro
 	// floor after the handshake — it never reaches the metric
 	// surface, the audit kind, the pg_notify payload, or any
 	// slog line (ADR-098 §11 invariant).
-	tlsConfig := &tls.Config{}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		_ = tlsConn.Close()
