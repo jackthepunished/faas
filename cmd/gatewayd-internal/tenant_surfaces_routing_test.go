@@ -46,6 +46,15 @@ func seedSurface(t *testing.T, store state.Store, slug, hostname string, status 
 	}, lim); err != nil {
 		t.Fatalf("CreateTenantHostnameIfUnderQuota: %v", err)
 	}
+	// PR-B review finding #1: the routing branch gates on
+	// hostname.Verified() (mirrors dom.Verified() at the legacy
+	// custom_domains branch). Mark the seed hostname verified by
+	// default; tests that want the unverified path skip the
+	// MarkVerified call via the seedSurfaceUnverified variant
+	// (or don't call this helper at all).
+	if err := store.MarkTenantHostnameVerified(ctx, hostname); err != nil {
+		t.Fatalf("MarkTenantHostnameVerified: %v", err)
+	}
 	if status != state.SurfaceStatusPending {
 		if err := store.UpdateTenantSurfaceStatus(ctx, surf.ID, status); err != nil {
 			t.Fatalf("UpdateTenantSurfaceStatus: %v", err)
@@ -165,5 +174,187 @@ func TestPgRouter_TenantSurfaceOrderingWithPreview(t *testing.T) {
 	// intercept.
 	if _, ok, _ := r.ResolveHost(context.Background(), "pr-42.blog.apps.gregale.dev"); ok {
 		t.Fatal("surface branch consumed a preview host")
+	}
+}
+
+// TestPgRouter_TenantSurfaceUnverifiedHostnameFallsThrough pins
+// the security gate added by PR-B review finding #1: a hostname
+// row exists on an active surface, but the dns_poller has not yet
+// verified the TXT challenge. The legacy custom_domains path
+// already gates on dom.Verified(); the tenant-surface branch must
+// mirror that gate (or pre-challenge hostnames would route,
+// handing traffic to an attacker-controlled DNS that pointed at
+// us mid-challenge). Surface branch falls through to legacy; with
+// no custom_domains row, this is a clean 404.
+func TestPgRouter_TenantSurfaceUnverifiedHostnameFallsThrough(t *testing.T) {
+	t.Setenv("FAAS_TENANT_SURFACES_ENABLED", "true")
+	store := state.NewMemStore()
+	ctx := context.Background()
+	app := seedApp(t, store, "blog", api.PlanPro)
+	lim := api.Limits{
+		TenantSurfacesPerAccount:  5,
+		TenantHostnamesPerSurface: 10,
+		TenantSurfacesAllowed:     true,
+	}
+	surf, err := store.CreateTenantSurfaceIfUnderQuota(ctx, state.CreateTenantSurfaceParams{
+		AccountID: app.AccountID,
+		AppID:     app.ID,
+		Name:      "pre-challenge",
+	}, lim)
+	if err != nil {
+		t.Fatalf("CreateTenantSurfaceIfUnderQuota: %v", err)
+	}
+	if err := store.UpdateTenantSurfaceStatus(ctx, surf.ID, state.SurfaceStatusActive); err != nil {
+		t.Fatalf("UpdateTenantSurfaceStatus: %v", err)
+	}
+	// Insert hostname WITHOUT calling MarkTenantHostnameVerified —
+	// this is the pre-challenge state the dns_poller hasn't yet
+	// confirmed. The seedSurface helper verifies by default; this
+	// test deliberately skips that step.
+	if _, err := store.CreateTenantHostnameIfUnderQuota(ctx, state.CreateTenantHostnameParams{
+		SurfaceID:      surf.ID,
+		Hostname:       "api.customer-a.com",
+		ChallengeToken: "tok",
+	}, lim); err != nil {
+		t.Fatalf("CreateTenantHostnameIfUnderQuota: %v", err)
+	}
+	r := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
+
+	if _, ok, _ := r.ResolveHost(context.Background(), "api.customer-a.com"); ok {
+		t.Fatal("pre-challenge (unverified) hostname was routed — security gate bypassed")
+	}
+}
+
+// TestPgRouter_TenantSurfaceCrossAccountMismatchFallsThrough pins
+// the security gate added by PR-B review finding #8: an invariant
+// violation in the store layer (or a future soft-delete+reassign
+// race) leaves the surface→account and the app→account fields
+// disagreeing. The routing branch must NOT trust surface.AppID
+// alone — it must verify the accounts agree. With a mismatched
+// pair, the routing branch returns ok=false (falls through to
+// legacy) instead of routing to the wrong account's app.
+func TestPgRouter_TenantSurfaceCrossAccountMismatchFallsThrough(t *testing.T) {
+	t.Setenv("FAAS_TENANT_SURFACES_ENABLED", "true")
+	store := state.NewMemStore()
+	ctx := context.Background()
+	// Account A owns the surface; account B owns the app the
+	// surface points at (a hypothetical invariant violation).
+	appA := seedApp(t, store, "blog", api.PlanPro)
+	appB := seedApp(t, store, "shop", api.PlanPro)
+	lim := api.Limits{
+		TenantSurfacesPerAccount:  5,
+		TenantHostnamesPerSurface: 10,
+		TenantSurfacesAllowed:     true,
+	}
+	// Create the surface against account A's app, then mutate the
+	// app_id field to point at account B's app — simulating the
+	// invariant violation. The store layer doesn't prevent this
+	// (the cross-account check is the routing layer's job).
+	surf, err := store.CreateTenantSurfaceIfUnderQuota(ctx, state.CreateTenantSurfaceParams{
+		AccountID: appA.AccountID,
+		AppID:     appB.ID, // wrong account
+		Name:      "mismatch",
+	}, lim)
+	if err != nil {
+		t.Fatalf("CreateTenantSurfaceIfUnderQuota: %v", err)
+	}
+	if err := store.UpdateTenantSurfaceStatus(ctx, surf.ID, state.SurfaceStatusActive); err != nil {
+		t.Fatalf("UpdateTenantSurfaceStatus: %v", err)
+	}
+	if _, err := store.CreateTenantHostnameIfUnderQuota(ctx, state.CreateTenantHostnameParams{
+		SurfaceID:      surf.ID,
+		Hostname:       "api.customer-a.com",
+		ChallengeToken: "tok",
+	}, lim); err != nil {
+		t.Fatalf("CreateTenantHostnameIfUnderQuota: %v", err)
+	}
+	if err := store.MarkTenantHostnameVerified(ctx, "api.customer-a.com"); err != nil {
+		t.Fatalf("MarkTenantHostnameVerified: %v", err)
+	}
+	r := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
+
+	if _, ok, _ := r.ResolveHost(context.Background(), "api.customer-a.com"); ok {
+		t.Fatal("cross-account mismatch was routed — would deliver account A's traffic to account B's app")
+	}
+}
+
+// TestPgRouter_TenantSurfacePrecedenceOverCustomDomain pins the
+// routing order (PR-B review finding #4): when a hostname matches
+// BOTH a tenant-surface row AND a custom_domains row, the surface
+// branch must win. This is the load-bearing design decision —
+// a customer who has a custom_domain from before surfaces shipped
+// and then later adds a surface on the same hostname (the apid
+// path forbids this, but the store allows it because the citext
+// UQ is per-table, not cross-table) must see the surface route,
+// not the legacy custom_domain. The reverse precedence would
+// silently route around a customer's explicit surface config.
+func TestPgRouter_TenantSurfacePrecedenceOverCustomDomain(t *testing.T) {
+	t.Setenv("FAAS_TENANT_SURFACES_ENABLED", "true")
+	store := state.NewMemStore()
+	ctx := context.Background()
+	// One account owns both apps (the customer scenario: surface
+	// points at the new app, legacy custom_domain pre-dates the
+	// surface and points at an older app). seedApp auto-creates
+	// a fresh account each call, so we create one account and
+	// attach both apps directly.
+	acct, err := store.CreateAccount(ctx, "blog@local", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	surfApp, err := store.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: "blog", Type: state.AppTypeApp, RAMMB: 128, Status: state.AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp(surf): %v", err)
+	}
+	legacyApp, err := store.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: "legacy", Type: state.AppTypeApp, RAMMB: 128, Status: state.AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp(legacy): %v", err)
+	}
+	lim := api.Limits{
+		TenantSurfacesPerAccount:  5,
+		TenantHostnamesPerSurface: 10,
+		TenantSurfacesAllowed:     true,
+	}
+	surf, err := store.CreateTenantSurfaceIfUnderQuota(ctx, state.CreateTenantSurfaceParams{
+		AccountID: acct.ID,
+		AppID:     surfApp.ID,
+		Name:      "primary",
+	}, lim)
+	if err != nil {
+		t.Fatalf("CreateTenantSurfaceIfUnderQuota: %v", err)
+	}
+	if err := store.UpdateTenantSurfaceStatus(ctx, surf.ID, state.SurfaceStatusActive); err != nil {
+		t.Fatalf("UpdateTenantSurfaceStatus: %v", err)
+	}
+	if _, err := store.CreateTenantHostnameIfUnderQuota(ctx, state.CreateTenantHostnameParams{
+		SurfaceID:      surf.ID,
+		Hostname:       "api.customer-a.com",
+		ChallengeToken: "tok",
+	}, lim); err != nil {
+		t.Fatalf("CreateTenantHostnameIfUnderQuota: %v", err)
+	}
+	if err := store.MarkTenantHostnameVerified(ctx, "api.customer-a.com"); err != nil {
+		t.Fatalf("MarkTenantHostnameVerified: %v", err)
+	}
+	// Legacy custom_domains row on the same hostname, owned by
+	// the same account (the legacy app). Without surface
+	// precedence this would route to legacyApp.
+	if _, err := store.CreateCustomDomain(ctx, "api.customer-a.com", legacyApp.ID, "tok"); err != nil {
+		t.Fatalf("CreateCustomDomain: %v", err)
+	}
+	if err := store.MarkDomainVerified(ctx, "api.customer-a.com"); err != nil {
+		t.Fatalf("MarkDomainVerified: %v", err)
+	}
+	r := pgRouter{store: store, appsSuffix: ".apps.gregale.dev"}
+
+	got, ok, err := r.ResolveHost(context.Background(), "api.customer-a.com")
+	if err != nil || !ok {
+		t.Fatalf("ResolveHost ok=%v err=%v, want true/nil", ok, err)
+	}
+	if got.ID != surfApp.ID {
+		t.Fatalf("surface did not win precedence: got=%s, want surface app id=%s", got.ID, surfApp.ID)
 	}
 }

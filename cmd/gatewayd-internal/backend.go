@@ -32,38 +32,42 @@ var _ gateway.Router = pgRouter{}
 // clean ok=false (404); only an actual store failure returns a non-nil error.
 func (r pgRouter) ResolveHost(ctx context.Context, host string) (gateway.App, bool, error) {
 	if slug, ok := r.slugFor(host); ok {
-		app, err := r.store.AppBySlug(ctx, slug)
-		if errors.Is(err, state.ErrNotFound) {
-			return gateway.App{}, false, nil
-		}
+		return r.appBySlug(ctx, slug)
+	}
+	// Tenant surface (issue #879 / ADR-100 PR-B). Dark behind
+	// FAAS_TENANT_SURFACES_ENABLED; a non-surface host or a
+	// surface miss falls through to the legacy custom_domains
+	// path. resolveTenantSurface owns the parser check + the
+	// routing so ResolveHost stays ≤ 50 lines.
+	if api.TenantSurfacesEnabled() {
+		app, ok, err := r.resolveTenantSurface(ctx, host)
 		if err != nil {
 			return gateway.App{}, false, err
 		}
-		return r.toApp(ctx, app)
-	}
-
-	// Tenant surface (issue #879 / ADR-100 PR-B). Gated by the
-	// feature flag so the cluster ships dark until PR-C lands.
-	// SurfaceParse validates the host shape; only well-formed
-	// customer-zone hosts reach the store. A miss (ErrNotFound)
-	// or a non-Active surface falls through to the legacy
-	// custom_domains path — a hostname may match neither surface
-	// nor legacy and that is a clean 404. A store error (other
-	// than ErrNotFound) returns immediately per the fail-closed
-	// contract: a Postgres blip must not silently mis-route.
-	if api.TenantSurfacesEnabled() {
-		if _, _, ok := gateway.SurfaceParse(host); ok {
-			app, ok, err := r.resolveTenantSurface(ctx, host)
-			if err != nil {
-				return gateway.App{}, false, err
-			}
-			if ok {
-				return app, true, nil
-			}
+		if ok {
+			return app, true, nil
 		}
 	}
+	return r.customDomain(ctx, host)
+}
 
-	// Custom domain: must exist AND be verified before we route to it (spec §7).
+// appBySlug — slugFor hit branch. Extracted to keep ResolveHost
+// ≤ 50 lines (CLAUDE.md convention).
+func (r pgRouter) appBySlug(ctx context.Context, slug string) (gateway.App, bool, error) {
+	app, err := r.store.AppBySlug(ctx, slug)
+	if errors.Is(err, state.ErrNotFound) {
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	return r.toApp(ctx, app)
+}
+
+// customDomain — the legacy custom_domains branch (spec §7).
+// Must exist AND be verified before we route to it; a deleted
+// parent app falls through to a clean 404.
+func (r pgRouter) customDomain(ctx context.Context, host string) (gateway.App, bool, error) {
 	dom, err := r.store.DomainByName(ctx, host)
 	if errors.Is(err, state.ErrNotFound) {
 		return gateway.App{}, false, nil
@@ -86,9 +90,20 @@ func (r pgRouter) ResolveHost(ctx context.Context, host string) (gateway.App, bo
 
 // resolveTenantSurface — pgRouter.ResolveHost's tenant-surface branch.
 // Pulled out to keep ResolveHost ≤ 50 lines (CLAUDE.md convention).
-// Returns (app, true, nil) on a routable active surface; ({}, false, nil)
-// on a miss or non-Active surface (caller falls through to legacy
-// custom_domains); or (zero, false, err) on a store error.
+// Returns (app, true, nil) on a routable, verified hostname on an
+// active surface; ({}, false, nil) on a miss, suspended surface,
+// unverified hostname, deleted parent app, or cross-account
+// mismatch (caller falls through to legacy custom_domains); or
+// (zero, false, err) on a store error.
+//
+// Two security gates the legacy custom_domains path already has
+// and this branch must mirror:
+//   - hostname.Verified() == true (pre-challenge TXT records
+//     must not route; the apid verify handler flips this)
+//   - surface.AccountID == app.AccountID (defends against a
+//     hypothetical appID re-use race during a soft-delete window:
+//     the surface is keyed to an account, the app is keyed to an
+//     account, and they must agree before we route)
 func (r pgRouter) resolveTenantSurface(ctx context.Context, host string) (gateway.App, bool, error) {
 	surface, err := r.store.TenantSurfaceByHostname(ctx, host)
 	if errors.Is(err, state.ErrNotFound) {
@@ -104,6 +119,21 @@ func (r pgRouter) resolveTenantSurface(ctx context.Context, host string) (gatewa
 		// row that pre-dates the surface — fall through to honour it.
 		return gateway.App{}, false, nil
 	}
+	hostname, err := r.store.GetTenantHostnameByName(ctx, host)
+	if errors.Is(err, state.ErrNotFound) {
+		// Surface row exists but the hostname row was deleted
+		// between the two lookups (dns_poller GC; rare). Fall
+		// through to legacy; the next request re-joins cleanly.
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	if !hostname.Verified() {
+		// Pre-challenge hostname must not route. Mirror the
+		// dom.Verified() gate at the custom_domains branch below.
+		return gateway.App{}, false, nil
+	}
 	app, err := r.store.AppByID(ctx, surface.AppID)
 	if errors.Is(err, state.ErrNotFound) {
 		// App deleted while surface still active — route-around.
@@ -111,6 +141,13 @@ func (r pgRouter) resolveTenantSurface(ctx context.Context, host string) (gatewa
 	}
 	if err != nil {
 		return gateway.App{}, false, err
+	}
+	if surface.AccountID != app.AccountID {
+		// Defence in depth: surface→account and app→account must
+		// agree. A drift here would be an invariant violation
+		// (every surface is created against an app owned by the
+		// same account), but we fail closed rather than route.
+		return gateway.App{}, false, nil
 	}
 	return r.toApp(ctx, app)
 }

@@ -31,17 +31,15 @@ import (
 // Constraints (each locked; mirrors preview_parser.go):
 //   - apex is 2+ labels
 //   - each label is non-empty, 1-63 octets
-//   - each label matches [a-z0-9-] (ASCII only; no IDN here —
-//     the apid handler punycode-encodes via idna.ToASCII before
-//     reaching the parser)
+//   - each label matches [a-zA-Z0-9-] (case-insensitive per
+//     RFC 1035 §2.3.1 — case is preserved at this layer; the
+//     store normalises via citext on tenant_hostnames.hostname)
 //   - no leading or trailing hyphen in any label
 //   - total length ≤ 253 octets (RFC 1035)
 //   - no wildcard host ("*.customer-a.com" is rejected at this
 //     layer; SAN aggregation is the v1 cert flavour, wildcard is
 //     a separate ADR)
 //   - no trailing dot (consumers normalise)
-//   - case-insensitive: output labels are lowercased; the store
-//     layer normalises via citext
 //
 // Returns:
 //   - tenantLabel: the leftmost label (sub case) or joined
@@ -130,12 +128,9 @@ func splitLabels(host string) []string {
 }
 
 // validLabel enforces the per-label constraints: non-empty, 1-63
-// octets, [a-z0-9-] charset, no leading/trailing hyphen. Case
-// is checked against [a-z0-9-] because the parser normalises to
-// lowercase before reaching this function (caller's responsibility
-// or via the strings.ToLower in SurfaceParse); the function
-// itself does not lowercase to keep the no-allocation hot path
-// simple.
+// octets, [a-zA-Z0-9-] charset (DNS hostnames are case-insensitive
+// per RFC 1035 §2.3.1; case is preserved for the store layer's
+// citext column, not normalised here), no leading/trailing hyphen.
 func validLabel(l string) bool {
 	if l == "" || len(l) > 63 {
 		return false
@@ -145,12 +140,13 @@ func validLabel(l string) bool {
 	}
 	for i := 0; i < len(l); i++ {
 		c := l[i]
-		if c < 'a' || c > 'z' {
-			if c < '0' || c > '9' {
-				if c != '-' {
-					return false
-				}
-			}
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
 		}
 	}
 	return true

@@ -31,10 +31,13 @@ func TestSurfaceParse(t *testing.T) {
 		{"multi_sub", "auth.api.customer-a.com", "auth.api", "customer-a.com", true},
 		{"multi_sub_5", "a.b.c.d.example.com", "a.b.c.d", "example.com", true},
 
-		// --- case normalisation handled by caller; case-insensitive
-		// match is enforced via lowercase comparison in the parser. The
-		// parser's input is assumed lowercase; this test pins that. ---
-		{"uppercase_rejected_at_label_level", "API.customer-a.com", "", "", false},
+		// --- case: DNS hostnames are case-insensitive (RFC 1035
+		// §2.3.1); the parser preserves case at this layer (the
+		// store normalises via citext on tenant_hostnames.hostname).
+		// This pins the case-insensitive acceptance + the
+		// preserved-case output. ---
+		{"uppercase_accepted_at_label_level", "API.customer-a.com", "API", "customer-a.com", true},
+		{"mixed_case_preserved", "Customer-a.MyApp.COM", "Customer-a", "MyApp.COM", true},
 
 		// --- wildcard: rejected (SAN-aggregation is v1) ---
 		{"wildcard_rejected", "*.customer-a.com", "", "", false},
@@ -57,8 +60,19 @@ func TestSurfaceParse(t *testing.T) {
 		// --- label too long (>63) ---
 		{"label_too_long", "this-label-has-far-more-than-sixty-three-characters-which-is-illegal-per-rfc-1035.com", "", "", false},
 
-		// --- total host length > 253 ---
-		{"total_too_long", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com", "", "", false},
+		// --- total host length > 253 (RFC 1035 §2.3.4). Fixture
+		// is 4 labels of 63 chars + 1 label of 2 chars + 4 dots =
+		// 258 octets; every per-label check passes, so this pins
+		// the total-length branch specifically. ---
+		{"total_too_long", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aa", "", "", false},
+
+		// --- edge: 253 octets (allowed). 4 labels of (63,63,63,61)
+		// + 3 dots = 253. tenantLabel is the joined first 2 labels
+		// ("a*63.a*63"); apex is the joined last 2 labels
+		// ("a*63.a*61"). The fixture reads cleaner than the
+		// 5-label form because the per-label lengths are
+		// distinct and the dot count is minimal. ---
+		{"total_at_max", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true},
 
 		// --- leading/trailing hyphen in label ---
 		{"leading_hyphen", "-api.customer-a.com", "", "", false},
