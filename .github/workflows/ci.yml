@@ -836,29 +836,8 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      - name: make test-load (3-attempt retry for TestTracker_HighConcurrency cold-runner flake)
-        # Per saved memory testtracker-highconcurrency-flake.md: PR-895
-        # already removed the HWM-degenerate check; the remaining flake
-        # is a cold-runner transient on the 2-vCPU shared runner. The
-        # test code itself is correct (drain_test.go is unchanged on
-        # this PR); retrying the make target absorbs the flake without
-        # widening review surface. 10s sleep gives the runner enough
-        # time to drain + re-jit. On a clean pass the loop exits after
-        # the first attempt — no wall-clock cost on green.
-        run: |
-          for i in 1 2 3; do
-            echo "::group::test-load attempt $i/3"
-            if make test-load; then
-              echo "::endgroup::"
-              echo "test-load green on attempt $i"
-              exit 0
-            fi
-            echo "::endgroup::"
-            echo "test-load attempt $i failed; sleeping 10s before retry"
-            sleep 10
-          done
-          echo "test-load exhausted 3 attempts"
-          exit 1
+      - name: make test-load
+        run: make test-load
 
   metal:
     # Manual trigger from the Actions tab. Marked workflow_dispatch so the
