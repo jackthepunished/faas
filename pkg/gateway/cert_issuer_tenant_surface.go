@@ -94,9 +94,14 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 		// deleted between the notify and the lookup);
 		// the operator doesn't need a logged error for a
 		// clean-up race. We still observe the metric so
-		// dashboards count the skipped branches.
-		i.metrics.ObserveTenantSurfaceCert("skipped", string(surf.CertKind))
-		return nil
+		// dashboards count the skipped branches. The kind
+		// label is empty because the row is gone — the closed
+		// cartesian (result, kind) is stamped at boot with
+		// kind ∈ {per_host_san, shared_wildcard}, so the
+		// missing-row case increments under kind="".
+		_ = err // ErrNotFound is deliberately swallowed; we still tick the metric
+		i.metrics.ObserveTenantSurfaceCert("skipped", "")
+		return nil //nolint:nilerr // ErrNotFound is the documented skip path
 	}
 	if surf.Status == state.SurfaceStatusDeleted {
 		i.metrics.ObserveTenantSurfaceCert("skipped", string(surf.CertKind))

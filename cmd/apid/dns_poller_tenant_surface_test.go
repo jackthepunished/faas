@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -55,10 +53,6 @@ func newPollerServer() *tenantSurfacePollerServer {
 		store: state.NewMemStore(),
 		notif: &tenantPollerNotifier{},
 	}
-}
-
-func testPollerLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func TestDNSPoller_TenantHostname_VerifiesOnTXTMatch(t *testing.T) {
