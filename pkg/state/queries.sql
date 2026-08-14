@@ -1190,3 +1190,98 @@ LIMIT $4;
 -- partition tail (rows in the default partition or
 -- the current month that are older than cutoff).
 DELETE FROM data_upstream_probes WHERE sampled_at < $1;
+
+-- ─── OIDC / keyless deploy auth (ADR-101, issue #270) ───────────────────
+--
+-- Per-(account_id, issuer_url) trust policy CRUD + exchanged-token
+-- CRUD. PR-A scope. The composite PK on oidc_trust_policies is the
+-- lookup key; the per-account dashboard list (PR-C) walks the
+-- same index. token_hash UNIQUE on oidc_exchanged_tokens is the
+-- bearer hot-path lookup.
+
+-- name: GetOIDCTrustPolicy :one
+-- Account-by-issuer lookup. Used by the OIDC exchange handler's
+-- first-use auto-create path (PR-A) and the dashboard's Refine
+-- form (PR-C).
+select account_id, issuer_url, jwks_url, audience,
+       coalesce(subject_pattern, '') as subject_pattern,
+       algorithms, required_claims, created_at, updated_at,
+       audit_login
+from oidc_trust_policies
+where account_id = $1 and issuer_url = $2;
+
+-- name: UpsertOIDCTrustPolicy :one
+-- PK conflict on (account_id, issuer_url) updates the mutable
+-- columns (audience, subject_pattern, algorithms, required_claims,
+-- updated_at, audit_login) and preserves created_at. Returns the
+-- full row as stored.
+insert into oidc_trust_policies
+    (account_id, issuer_url, jwks_url, audience, subject_pattern,
+     algorithms, required_claims, audit_login)
+values ($1, $2, $3, $4, $5, $6, $7, $8)
+on conflict (account_id, issuer_url) do update
+    set audience = excluded.audience,
+        subject_pattern = excluded.subject_pattern,
+        algorithms = excluded.algorithms,
+        required_claims = excluded.required_claims,
+        updated_at = now(),
+        audit_login = excluded.audit_login
+returning account_id, issuer_url, jwks_url, audience,
+          coalesce(subject_pattern, '') as subject_pattern,
+          algorithms, required_claims, created_at, updated_at,
+          audit_login;
+
+-- name: ListOIDCTrustPoliciesForAccount :many
+-- Per-account dashboard list (PR-C). Empty slice on miss.
+select account_id, issuer_url, jwks_url, audience,
+       coalesce(subject_pattern, '') as subject_pattern,
+       algorithms, required_claims, created_at, updated_at,
+       audit_login
+from oidc_trust_policies
+where account_id = $1
+order by created_at desc;
+
+-- name: AccountByOIDCIssuerSubject :one
+-- Resolves an OIDC (issuer, subject) pair to the platform
+-- account it's bound to. The binding is implicit: any trust
+-- policy row with matching issuer_url + subject_pattern that
+-- matches the subject claim. Empty subject_pattern = permissive
+-- (accept any subject). PR-A matches on issuer_url only with
+-- permissive subject semantics; PR-C will refine the per-issuer
+-- subject index.
+select a.id, a.email, a.plan, a.status,
+       coalesce(a.provider_customer_id, ''), a.created_at
+from accounts a
+join oidc_trust_policies p on p.account_id = a.id
+where p.issuer_url = $1
+  and (p.subject_pattern is null or p.subject_pattern = ''
+       or $2 ~ p.subject_pattern)
+limit 1;
+
+-- name: InsertOIDCExchangedToken :one
+-- Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
+-- Returns the full row (with created_at server-stamped).
+insert into oidc_exchanged_tokens
+    (account_id, token_hash, expires_at, issuer_url, subject,
+     audience, jti)
+values ($1, $2, $3, $4, $5, $6, $7)
+returning id, account_id, token_hash, expires_at, issuer_url,
+          subject, audience, coalesce(jti, '') as jti,
+          created_at;
+
+-- name: GetOIDCExchangedTokenByHash :one
+-- Bearer hot-path lookup. Filters past-TTL rows out at the SQL
+-- layer so the pg contract is "WHERE expires_at > NOW()". The
+-- MemStore mirror in pkg/state/memstore.go lazy-deletes instead.
+select id, account_id, token_hash, expires_at, issuer_url, subject,
+       audience, coalesce(jti, '') as jti, created_at
+from oidc_exchanged_tokens
+where token_hash = $1
+  and expires_at > now();
+
+-- name: DeleteOIDCExchangedToken :exec
+-- Operator-driven revoke path (PR-C). Returns 0 rows on miss;
+-- the caller maps that to ErrNotFound. The 5-min TTL is the
+-- natural expiry path; Delete is the "kill this CI job's
+-- credential now" lever.
+delete from oidc_exchanged_tokens where id = $1;

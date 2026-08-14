@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -153,6 +154,20 @@ type MemStore struct {
 	// is needed. Soft-delete semantics (apps.status='deleted') are
 	// mirrored by the per-app lookup in the quota-check branch.
 	edgeRules map[string]EdgeRule
+	// oidcTrustPolicies is keyed by (accountID, issuerURL) — the
+	// composite primary key shape from migration 00265. The
+	// per-account lookup OIDCTrustPoliciesForAccount is the only
+	// scan needed (MemStore holds the entire dataset under m.mu).
+	// ADR-101 / issue #270.
+	oidcTrustPolicies map[string]OIDCTrustPolicy
+	// oidcExchangedTokens is keyed by the hex-encoded SHA-256 of the
+	// raw bearer (the UNIQUE token_hash index from migration 00266).
+	// The expires_at-driven expiry is in-memory only; lazy-flip is
+	// not strictly necessary because the 5-min TTL is short enough
+	// that a MemStore process restart would clear them anyway. The
+	// store MAY garbage-collect expired rows on every read; the pg
+	// contract is "WHERE expires_at > NOW()".
+	oidcExchangedTokens map[string]OIDCExchangedToken
 	// tenantSurfaces is keyed by TenantSurface.ID (uuid); the
 	// account-keyed lookup GetTenantSurfaceByName and the host-keyed
 	// TenantSurfaceByHostname linear-scan on demand. MemStore holds
@@ -533,6 +548,10 @@ func NewMemStore() *MemStore {
 		appWebhookDeliveries: map[string]AppWebhookDelivery{},
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
+		// ADR-101 / issue #270 — OIDC trust policies + exchanged
+		// bearers. Start empty; tests inject rows directly.
+		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
+		oidcExchangedTokens: map[string]OIDCExchangedToken{},
 		// ADR-100 / tenant surfaces — see memstore_tenant_surface.go.
 		tenantSurfaces:   map[string]TenantSurface{},
 		tenantHostnames:  map[string]TenantHostname{},
@@ -804,6 +823,220 @@ func (m *MemStore) APIKeyByHash(_ context.Context, hash []byte) (APIKey, error) 
 // The MemStore mutation is the analogue of the pgstore UPDATE:
 // coalesce(revoked_at, now()) → the first observation stamps, the
 // second is a no-op.
+// AuthenticateOIDCBearer resolves an OIDC-derived short-lived bearer
+// (issue #270 / ADR-101). Hash lookup hits the in-memory
+// oidcExchangedTokens map (the UNIQUE token_hash index from
+// migration 00266); rows past ExpiresAt return ErrNotFound (the
+// 5-min TTL is the natural expiry path; no lazy-flip required).
+// Returns the Account + a synthetic APIKey projection with
+// Scopes=["deploy:write"] and Status="active" so the principal
+// stamp + downstream requireScope chain works unchanged.
+//
+// The contract is identical to the PgStore impl modulo the
+// concrete storage. Both return ErrNotFound; both project a
+// synthetic APIKey with status=active.
+//
+// The Caller does NOT call TouchKeyLastUsed on this branch — the
+// 5-min TTL bounds the write load, and the per-exchange audit row
+// in pkg/oidc/handler.go is the durable record.
+func (m *MemStore) AuthenticateOIDCBearer(_ context.Context, hash []byte) (Account, APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.oidcExchangedTokens[hex.EncodeToString(hash)]
+	if !ok {
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	acct, ok := m.accounts[row.AccountID]
+	if !ok {
+		// Account was deleted between the exchange and the bearer
+		// hit. Treat as not-found; the audit reader can correlate
+		// from the row (which is also gone via FK CASCADE in pg).
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	if !row.ExpiresAt.IsZero() && row.ExpiresAt.Before(time.Now()) {
+		// Lazy-flip: the row is past TTL. Remove it now so a
+		// follow-up request doesn't go through the same code path.
+		// The pg contract is `WHERE expires_at > NOW()`; the
+		// MemStore mirrors by physically deleting on miss.
+		delete(m.oidcExchangedTokens, hex.EncodeToString(hash))
+		return Account{}, APIKey{}, ErrNotFound
+	}
+	return acct, row.ToAPIKey(), nil
+}
+
+// AccountByOIDCSubject resolves an OIDC subject to the platform
+// account it's bound to. Used by pkg/oidc/handler.go step 4 to
+// determine the (account_id, issuer_url) trust-policy row.
+//
+// The binding is implicit: the trust policy owns the issuer URL,
+// the OIDC subject is part of the issuer's contract. For the
+// first-use auto-create to commit, the handler Upserts on
+// ErrTrustPolicyNotFound AFTER resolving the account — so this
+// method needs to short-circuit any caller that doesn't have a
+// matching account_by_oidc_subject row.
+//
+// Today (PR-A) we tie the binding to the account's email match
+// against a configurable subject template (subject_pattern).
+// PR-C will refine the binding surface (per-org memberships,
+// service-account subjects).
+func (m *MemStore) AccountByOIDCSubject(_ context.Context, issuerURL, subject string) (Account, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Scan the trust-policy map for an (account_id, issuer_url,
+	// subject_pattern) match. The subject_pattern is a regex
+	// compiled on the OIDC side (pkg/edgejwks layer); here we
+	// pass it through without recompiling — the store contract is
+	// "match the policy, return the account".
+	//
+	// The simplest "match" rule that matches the customer's
+	// expectation: any account that has a trust policy for this
+	// issuer_url. Order = iteration order of the map (Go map
+	// iteration is randomized; callers don't depend on a specific
+	// account being picked).
+	//
+	// For the PR-A scope this is correct: the trust policy is
+	// auto-created on first exchange, AFTER AccountByOIDCSubject
+	// succeeds, so the first call for a new (issuer, subject) MUST
+	// return ErrNotFound for the auto-create to fire on the
+	// subsequent retry. The handler's two-phase flow (verify +
+	// resolve account + retry Get) handles the chicken-and-egg.
+	//
+	// TODO(ADR-101 PR-C): replace the map scan with a per-issuer
+	// reverse index once the dashboard exposes "which subjects
+	// does this account trust" — needs a column on the trust
+	// policy for binding subjects explicitly.
+	for _, policy := range m.oidcTrustPolicies {
+		if policy.IssuerURL != issuerURL {
+			continue
+		}
+		// Empty subject_pattern = accept any subject. Real
+		// pattern = regex match.
+		matched := policy.SubjectPattern == ""
+		if !matched {
+			matched = regexpMatch(policy.SubjectPattern, subject)
+		}
+		if !matched {
+			continue
+		}
+		acct, ok := m.accounts[policy.AccountID]
+		if !ok {
+			continue
+		}
+		return acct, nil
+	}
+	return Account{}, ErrNotFound
+}
+
+// regexpMatch is a tiny inlined wrapper to keep the import surface
+// minimal. The subject pattern is a fragment of Go's regexp
+// syntax (matches `regexp.MatchString`); compile-once-per-policy
+// is a future PR-C refinement (caching the compiled regex on the
+// policy row).
+func regexpMatch(pattern, s string) bool {
+	return regexp.MustCompile(pattern).MatchString(s)
+}
+
+// UpsertOIDCTrustPolicy is the per-(account, issuer) insert-or-update
+// path (issue #270 / ADR-101). Mirrors the PgStore shape (ON
+// CONFLICT in pg; in m.oidcTrustPolicies the same key just
+// overwrites). The CreatedAt is preserved across upserts so the
+// audit row's "first-use" timestamp is stable.
+func (m *MemStore) UpsertOIDCTrustPolicy(_ context.Context, p *OIDCTrustPolicy) (*OIDCTrustPolicy, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := p.AccountID + "\x00" + p.IssuerURL
+	if existing, ok := m.oidcTrustPolicies[key]; ok {
+		// Preserve CreatedAt across upserts.
+		p.CreatedAt = existing.CreatedAt
+	}
+	p.UpdatedAt = time.Now()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	m.oidcTrustPolicies[key] = *p
+	// Return a copy so the caller can't mutate the in-memory row.
+	cp := *p
+	return &cp, nil
+}
+
+// GetOIDCTrustPolicy is the (account_id, issuer_url) lookup.
+// Returns ErrNotFound on miss.
+func (m *MemStore) GetOIDCTrustPolicy(_ context.Context, accountID, issuerURL string) (*OIDCTrustPolicy, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := accountID + "\x00" + issuerURL
+	p, ok := m.oidcTrustPolicies[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := p
+	return &cp, nil
+}
+
+// ListOIDCTrustPoliciesForAccount returns every trust policy the
+// account owns. Empty slice on miss.
+func (m *MemStore) ListOIDCTrustPoliciesForAccount(_ context.Context, accountID string) ([]*OIDCTrustPolicy, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*OIDCTrustPolicy, 0)
+	for _, p := range m.oidcTrustPolicies {
+		if p.AccountID != accountID {
+			continue
+		}
+		cp := p
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+// InsertOIDCExchangedToken stores a fresh exchanged-token row.
+// The hash field is the unique key.
+func (m *MemStore) InsertOIDCExchangedToken(_ context.Context, t *OIDCExchangedToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t.ID == "" {
+		t.ID = uuid.NewString()
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now()
+	}
+	m.oidcExchangedTokens[hex.EncodeToString(t.TokenHash)] = *t
+	return nil
+}
+
+// GetOIDCExchangedTokenByHash returns the row whose TokenHash
+// equals the input. Returns ErrNotFound on miss. Lazy-expires
+// past-TTL rows (mirrors the pg `WHERE expires_at > NOW()`
+// contract).
+func (m *MemStore) GetOIDCExchangedTokenByHash(_ context.Context, hash []byte) (*OIDCExchangedToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.oidcExchangedTokens[hex.EncodeToString(hash)]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if !row.ExpiresAt.IsZero() && row.ExpiresAt.Before(time.Now()) {
+		delete(m.oidcExchangedTokens, hex.EncodeToString(hash))
+		return nil, ErrNotFound
+	}
+	cp := row
+	return &cp, nil
+}
+
+// DeleteOIDCExchangedToken is the operator-driven revoke path.
+// Returns ErrNotFound when no row matches.
+func (m *MemStore) DeleteOIDCExchangedToken(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, row := range m.oidcExchangedTokens {
+		if row.ID == id {
+			delete(m.oidcExchangedTokens, k)
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
 func (m *MemStore) AuthenticateKey(_ context.Context, hash []byte) (Account, APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

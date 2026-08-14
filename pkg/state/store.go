@@ -639,11 +639,62 @@ type Store interface {
 	// the auth middleware (which has the Auditor dependency), not
 	// here. See pkg/auth/middleware for the HTTP-side translation.
 	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
+	// AuthenticateOIDCBearer resolves an OIDC-derived short-lived
+	// bearer (issue #270 / ADR-101) to its account + synthetic
+	// APIKey. The hash lookup hits oidc_exchanged_tokens.token_hash
+	// (UNIQUE index). Rows past ExpiresAt return ErrNotFound — the
+	// 5-min TTL is the natural expiry path; no lazy-flip required.
+	// The returned APIKey is a synthetic projection
+	// (status='active', scopes=['deploy:write']) so the principal
+	// stamp + downstream requireScope chain works unchanged. Returns
+	// ErrNotFound when no row matches.
+	AuthenticateOIDCBearer(ctx context.Context, hash []byte) (Account, APIKey, error)
+	// AccountByOIDCSubject resolves an OIDC subject to the platform
+	// account it's bound to. The binding lives in oidc_trust_policies
+	// (issue #270 / ADR-101); a successful exchange requires the
+	// (issuer_url, subject) pair to have an existing account_id
+	// FK. Returns ErrNotFound when no binding exists. The handler
+	// (pkg/oidc/handler.go) maps that to 401 "OIDC subject not
+	// bound" — distinct from a bad-signature 401 so the customer
+	// can tell "wrong CI job" from "wrong customer".
+	AccountByOIDCSubject(ctx context.Context, issuerURL, subject string) (Account, error)
+	// UpsertOIDCTrustPolicy inserts or updates the per-(account,
+	// issuer) policy row. Used by the OIDC exchange handler's
+	// first-use auto-create path (PR-A) and the dashboard's
+	// refine form (PR-C). Returns ErrAlreadyExists on conflicting
+	// PK inserts — the caller retries as UpdateOIDCTrustPolicy.
+	UpsertOIDCTrustPolicy(ctx context.Context, p *OIDCTrustPolicy) (*OIDCTrustPolicy, error)
+	// GetOIDCTrustPolicy returns the policy for (account_id,
+	// issuer_url). Returns ErrNotFound on miss.
+	GetOIDCTrustPolicy(ctx context.Context, accountID, issuerURL string) (*OIDCTrustPolicy, error)
+	// ListOIDCTrustPoliciesForAccount returns every trust policy
+	// the account owns. Empty slice on miss. Used by the dashboard
+	// list page (PR-C).
+	ListOIDCTrustPoliciesForAccount(ctx context.Context, accountID string) ([]*OIDCTrustPolicy, error)
+	// InsertOIDCExchangedToken stores a fresh exchanged-token row.
+	// The caller has already generated the bearer (api.GenerateOIDCKey)
+	// and hashed it (api.HashAPIKey); the row carries only the hash.
+	InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchangedToken) error
+	// GetOIDCExchangedTokenByHash returns the row whose TokenHash
+	// equals the input. Returns ErrNotFound on miss. The caller
+	// checks ExpiresAt before using the row — a stale row that
+	// survived a TTL race surfaces as 401, not silent acceptance.
+	GetOIDCExchangedTokenByHash(ctx context.Context, hash []byte) (*OIDCExchangedToken, error)
+	// DeleteOIDCExchangedToken is the operator-driven revoke path
+	// (PR-C). A 5-min TTL row is normally reaped by lazy-Get
+	// (GetByHash on a row past ExpiresAt returns ErrNotFound);
+	// Delete is for the "kill this CI job's credential now" case.
+	DeleteOIDCExchangedToken(ctx context.Context, id string) error
 	// TouchKeyLastUsed bumps the key's last_used_at to now(). Called
 	// fire-and-forget on every successful bearer auth in the apid
 	// middleware so the dashboard can show "X used 2 minutes ago"
 	// (PRD §4.4) without coupling request latency to a non-critical
 	// observability write.
+	//
+	// Not invoked by the OIDC branch — a 5-min TTL row would
+	// dominate write load if every CI request stamped last_used_at.
+	// The mint-time audit row (auth.token.exchanged) is the durable
+	// record.
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
 
 	// CreateAPIKeyWithExpiry is the IAM-5 (issue #189) shape. The

@@ -79,6 +79,16 @@ type Authenticator interface {
 	// bearer token. state.ErrNotFound = invalid key. The caller
 	// (RequireSession) maps ErrNotFound to 401.
 	AuthenticateKey(ctx context.Context, hash []byte) (state.Account, state.APIKey, error)
+	// AuthenticateOIDCBearer returns the Account + APIKey for an
+	// OIDC-derived short-lived bearer (issue #270 / ADR-101). The
+	// returned APIKey is a synthetic projection (state.APIKey struct
+	// with Scopes=["deploy:write"], Status="active") so the principal
+	// stamp + downstream requireScope chain works unchanged. The
+	// hash lookup hits oidc_exchanged_tokens.token_hash (UNIQUE
+	// index); rows past ExpiresAt return state.ErrNotFound so the
+	// 5-min TTL is the natural expiry path. state.ErrNotFound =
+	// unknown / expired token. The caller maps ErrNotFound to 401.
+	AuthenticateOIDCBearer(ctx context.Context, hash []byte) (state.Account, state.APIKey, error)
 	// AccountByID is the post-session-verify account lookup.
 	// state.ErrNotFound = unknown account (defensive — should not
 	// happen since the AEAD binds AccountID into the envelope).
@@ -91,6 +101,8 @@ type Authenticator interface {
 	// TouchKeyLastUsed stamps last_used_at on the api_key row.
 	// MUST be detached + bounded (2s timeout) — the caller fires
 	// it in a goroutine and the request context must not gate it.
+	// Not invoked by the OIDC branch — a 5-min TTL row would
+	// dominate write load if every request stamped last_used_at.
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
 }
 
@@ -496,6 +508,55 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 				next(w, r, acct)
 				return
 			}
+		}
+
+		// (1b) OIDC-derived short-lived bearer branch
+		// (issue #270 / ADR-101). Disjoint prefix from ValidAPIKeyFormat
+		// so the two checks never cross-match; same bearer-token
+		// extraction as the fp_live_ branch. The synthetic principal
+		// carries Scopes=["deploy:write"] (per ADR-101 customer-locked
+		// decision) so requireScope(ScopesDeployWriteSurface) works
+		// unchanged downstream.
+		//
+		// What this branch does NOT do:
+		//   - TouchKeyLastUsed — a 5-min TTL row would dominate
+		//     write load if every CI request stamped last_used_at.
+		//     The audit row (auth.token.exchanged, emitted at mint
+		//     time in pkg/oidc/handler.go) is the durable record.
+		//   - emit any audit here — mint-time audit (in pkg/oidc) is
+		//     the contract. This branch only verifies + stamps.
+		//
+		// What it DOES do:
+		//   - Same Active() short-circuit as the fp_live_ branch
+		//     (billing-past-due 402).
+		//   - Same pointer-mutation contract (withPrincipal writes
+		//     into r.Context() so observeWrap in cmd/apid sees the
+		//     principal via principalFrom(r)).
+		if api.ValidOIDCKeyFormat(tok) {
+			acct, key, err := m.Authn.AuthenticateOIDCBearer(r.Context(), api.HashAPIKey(tok))
+			if err == nil {
+				if !acct.Active() {
+					if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
+						api.WriteProblem(w, api.NewProblem(http.StatusPaymentRequired, api.CodeBillingPastDue,
+							"Account suspended", "resolve billing to continue: https://"+wire.DocsHost+"/billing"))
+						return
+					}
+				}
+				*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key, Membership: nil}))
+				// No withMFAPending — bearer principals bypass MFA
+				// (IAM-2 design decision 3; same posture as the
+				// fp_live_ branch above).
+				next(w, r, acct)
+				return
+			}
+			// ErrNotFound → fall through to the cookie branch (the
+			// same "the bearer may have been deleted or simply
+			// unknown" semantics as the fp_live_ branch's
+			// non-sentinel errors at line 467). The 5-min TTL is
+			// handled inside the store (GetByHash returns
+			// ErrNotFound for rows past ExpiresAt), so a stale OIDC
+			// bearer naturally falls through and 401s via the
+			// no-credentials terminal below.
 		}
 
 		// (2) Session-cookie branch — verify AEAD, cross-check

@@ -3988,3 +3988,79 @@ type DataUpstreamTarget struct {
 	// on the floor.
 	Host string
 }
+
+// OIDCTrustPolicy is the per-(account, issuer) admission rule for
+// OIDC-derived bearer exchanges (issue #270 / ADR-101). Mirrors the
+// 1:N variant of github_installations (one account can trust many
+// issuers). SubjectPattern is a regex matched against the JWT
+// `sub` claim (compile-once at the edgejwks layer; this type
+// stays stringy for portability). RequiredClaims is the strict-
+// equality gate (e.g. {"actor":"poyrazk"}); the regex variant
+// lives on pkg/edgejwks.VerifierRule.RequiredClaimPatterns.
+//
+// audit_login='auto' marks a policy the system created on first use
+// (the dashboard "refine" CTA uses this to distinguish "you set
+// this" from "system defaulted this"). For an OIDC trust policy
+// the "login" is the customer's account_id rather than a real
+// login name — the column is reused for symmetry with the GitHub
+// install shape.
+type OIDCTrustPolicy struct {
+	AccountID      string
+	IssuerURL      string
+	JWKSURL        string
+	Audience       []string
+	SubjectPattern string
+	Algorithms     []string
+	RequiredClaims map[string]string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	AuditLogin     string
+}
+
+// OIDCExchangedToken is the persisted row behind an exchanged
+// short-lived bearer (fp_oidc_<48 hex>). The wire-side bearer is
+// hashed (TokenHash); the row carries the OIDC provenance so the
+// audit reader can answer "which CI job shipped this?" without
+// joining against the IdP. TTL bounds GDPR deletion; the
+// account_id FK CASCADE is the contractual guarantee.
+//
+// JTI is the optional JWT ID claim (empty if the IdP omits it).
+// Customer-side billing attribution excludes the JTI — it's the
+// audit-only key that lets a customer correlate a row to an IdP
+// log entry when investigating a deploy.
+type OIDCExchangedToken struct {
+	ID        string
+	AccountID string
+	TokenHash []byte
+	ExpiresAt time.Time
+	IssuerURL string
+	Subject   string
+	Audience  []string
+	JTI       string
+	CreatedAt time.Time
+}
+
+// ToAPIKey projects the OIDC-bearer row into a synthetic state.APIKey
+// for the principal stamp in pkg/auth/middleware. The struct is
+// reused (no new type) so the principalHasScope + requireScope chain
+// works unchanged. Status is fixed at APIKeyStatusActive — there is
+// no revoked state for 5-min TTL tokens; the row disappears via TTL
+// or FK CASCADE, both of which surface as ErrNotFound to the lookup.
+//
+// The method lives here (not on pkg/oidc.ExchangedToken) because Go
+// type aliases don't carry over method sets defined on the alias:
+//
+//	type A = B  // A has whatever methods B has
+//
+// Since the store layer needs to call row.ToAPIKey() on the
+// state-side value (the alias is the only public surface), the
+// method set must be on the canonical type. The pkg/oidc-side
+// alias gets the method for free.
+func (e OIDCExchangedToken) ToAPIKey() APIKey {
+	return APIKey{
+		ID:        e.ID,
+		AccountID: e.AccountID,
+		Scopes:    []string{"deploy:write"},
+		Status:    string(APIKeyStatusActive),
+	}
+}
