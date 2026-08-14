@@ -248,12 +248,16 @@ func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct sta
 		return
 	}
 	// Audit + log. NO plaintext host. NO DSN. NO scope value
-	// beyond the field-replaced form.
+	// beyond the field-replaced form. req.Kind was narrowed to
+	// the 14-value DataUpstreamKind closed vocabulary by
+	// req.Validate() at line 175 before this log line is reached;
+	// audit-also includes the same string under the same guarantee.
+	kindStr := string(req.Kind) // codeql[go/log-injection]
 	s.log.Info("data_upstream created",
 		"app", app.Slug,
 		"account", acct.ID,
 		"upstream_id", rowID,
-		"kind", string(req.Kind),
+		"kind", kindStr,
 		"scope", logsanitize.Field(scope),
 		"host_redacted_hash", hash[:8],
 	)

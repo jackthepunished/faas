@@ -181,10 +181,12 @@ func ExtractHostPort(raw string) (host string, port int, kind string, ok bool) {
 		}
 		if k, kok := KindFromScheme(u.Scheme); kok {
 			kind = k
-		} else if kind == "" {
+		} else {
 			// URL parsed but scheme isn't in the closed vocab.
 			// Try the env-key path (only meaningful if the
-			// caller supplies the key separately).
+			// caller supplies the key separately). The caller
+			// can still succeed by passing the env key alongside
+			// the value; this branch only fails the URL path.
 			return host, port, "", false
 		}
 		if port == 0 {

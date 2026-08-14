@@ -507,6 +507,18 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 		// on the wire (the SQL column is bytea-shaped
 		// and not in the GET response). The hash is
 		// the only on-wire identifier.
+		// Clamp row.Port into the sqlc int32 range. The schema
+		// CHECK constraint in migration 00226 pins port to
+		// BETWEEN 1 AND 65535 (well within int32), so the
+		// narrow is safe-by-construction. The explicit
+		// round-trip check below makes the bound visible to
+		// CodeQL's `go/incorrect-integer-conversion` query.
+		var port32 int32
+		if row.Port < 0 || row.Port > 65535 {
+			return fmt.Errorf("apid: inferred port %d out of [1, 65535] range", row.Port)
+		}
+		// codeql[go/incorrect-integer-conversion]
+		port32 = int32(row.Port)
 		_, err = s.store.InsertDataUpstream(ctx, sqlc.InsertDataUpstreamParams{
 			ID:               state.NewPgtypeUUID(uuid.New()),
 			AccountID:        state.NewPgtypeUUID(acctUUID),
@@ -515,7 +527,7 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 			Scope:            scope,
 			Kind:             row.Kind,
 			Host:             row.Host,
-			Port:             int32(row.Port),
+			Port:             port32,
 			HostRedactedHash: hash,
 			DeclaredRegion:   state.Text{},
 			LastRttMs:        state.Int4{},

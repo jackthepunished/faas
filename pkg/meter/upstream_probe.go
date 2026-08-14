@@ -313,14 +313,18 @@ func (p *Probe) ProbeOnce(ctx context.Context, tgt state.DataUpstreamTarget) Pro
 	// handshake is the load-bearing RTT signal — an HTTP
 	// GET would add another round-trip and surface the
 	// plaintext Host: header.
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		// ServerName is empty; the probe doesn't care
-		// about the SNI match (we're not validating cert
-		// trust — we're measuring latency). The SNI
-		// remains the dial target hash's first 8 chars,
-		// not the plaintext host.
-		InsecureSkipVerify: true, //nolint:gosec // probe measures handshake latency, not cert trust
-	})
+	// ServerName is empty; the probe doesn't care about the
+	// SNI match (we're not validating cert trust — we're
+	// measuring latency). The SNI remains the dial target
+	// hash's first 8 chars, not the plaintext host.
+	//
+	// The dialed plaintext host is captured in
+	// data_upstreams.host (bytea column) and dropped on the
+	// floor after the handshake — it never reaches the metric
+	// surface, the audit kind, the pg_notify payload, or any
+	// slog line (ADR-098 §11 invariant).
+	tlsConfig := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // codeql[go/disabled-certificate-check]
+	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		_ = tlsConn.Close()
 		res.ErrorClass = classifyDialError(err)
