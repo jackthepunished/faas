@@ -566,6 +566,141 @@ surface.
 
 ---
 
+### 4.10 Triggers and event-source mappings (issue #757 / ADR-100)
+
+The unified Trigger primitive replaces six unrelated invocation surfaces with one resource + one batch envelope + one FSM.
+
+#### Resource model
+
+One row per customer surface in the `triggers` table (migrations/00267_triggers.sql). The discriminator is `kind`:
+
+| Kind | Backend | Library / surface |
+|------|---------|-------------------|
+| `cron` | robfig/cron/v3 schedule parser | pre-existing `crons` table; this kind pins the row via `cron_id` |
+| `kafka` | consumer group | segmentio/kafka-go (commit #10) |
+| `nats` | JetStream durable consumer | nats.go/jetstream (commit #9) |
+| `redis_streams` | XReadGroup + XAck | redis/go-redis/v9 (commit #11) |
+| `sqs_compat` | long-poll HTTP queue | stdlib net/http (commit #12) |
+| `queue` | in-platform unified queue | pgxpool + `invocations` rows where source IN ('queue','delayed_task') (commit #8) |
+
+#### Per-kind config schema
+
+Stored as `config jsonb` on the trigger row. Decoded lazily per kind via `pkg/sched/poller_*.go::decodeXConfig`:
+
+- `kafka`:        `{"brokers":[...], "topic":"...", "group":"..."}`
+- `nats`:         `{"url":"nats://...", "stream":"...", "subject":"...", "durable":"..."}`
+- `redis_streams`: `{"addr":"redis:6379", "stream":"...", "group":"..."}`
+- `sqs_compat`:   `{"queue_url":"http://...", "long_poll_secs":20}`
+- `queue`:        `{"mode":"queue|delayed_task"}` (source discriminator)
+
+#### Batch semantics
+
+Every non-cron kind shares the same envelope:
+
+- `batch_size_max`   1..5000 (per-plan cap; Free 0, Hobby 50, Pro 500, Scale 5000)
+- `batch_window_ms`  10..600000 (per-plan cap; Free 0, Hobby 30000, Pro 300000, Scale 300000)
+- `max_attempts`     1..25 (per-plan cap; Free 0, Hobby 3, Pro 10, Scale 25)
+- 6MB payload cap (Lambda's hard cap; fixed)
+
+A batch closes on ANY of: `len == batch_size_max`, `now >= window_deadline`, `Σ(payload_bytes) >= 6MB`.
+
+#### Wire envelope
+
+`POST /v1/invocations:dispatch_batch` on the gateway synth server. The function receives:
+
+```
+POST /_triggers/<kind>/<trigger_slug>
+x-faas-trigger-id:   <uuid>
+x-faas-trigger-kind: <kind>
+x-faas-batch-size:   <N>
+body_b64: <JSON-array-of-records-b64>
+```
+
+Response shape (stolen verbatim from AWS Lambda):
+
+```json
+{"batchItemFailures":[{"itemIdentifier":"..."}]}
+```
+
+Empty / missing ⇒ full success. `pkg/gateway/synth.go::parseBatchFailures` decodes the response.
+
+#### Per-record FSM
+
+```
+pending ── claim ─▶ claimed ── succeeded
+                            ── retry ─▶ retry (next_fire_at=future)
+                                          └▶ attempts >= max ─▶ dead_letter
+                            ── poison_record ─▶ dead_letter
+```
+
+The `trigger_records` table (migrations/00267_triggers.sql) is the ledger; the `trigger_dead_letter` table is the terminal failure store. `ClaimTriggerRecords` uses `FOR UPDATE SKIP LOCKED` so two schedd instances racing on the same trigger each get a disjoint slice.
+
+#### Plan caps
+
+`pkg/api/limits.go::Limits` (commit #4):
+
+| Cap | Free | Hobby | Pro | Scale |
+|-----|------|-------|-----|-------|
+| TriggersAllowed | false | true | true | true |
+| TriggerLimitPerApp | 0 | 2 | 10 | 50 |
+| TriggerLimitPerAccount | 0 | 10 | 50 | 200 |
+| TriggerBatchSizeMax | 0 | 50 | 500 | 5000 |
+| TriggerBatchWindowMaxSec | 0 | 30 | 300 | 300 |
+| TriggerMaxAttemptsMax | 0 | 3 | 10 | 25 |
+| TriggerRecordsPerSecondPerApp | 0 | 100 | 1000 | 10000 |
+
+#### Audit + wire events
+
+Audit kinds (commit #15):
+
+- `trigger.fired`         per-record: broker delivered + dispatched
+- `trigger.fired.batch`   per-batch: aggregated outcome counts
+- `trigger.retry`         per-record: state → retry, next_fire_at
+- `trigger.dlq`           per-record: state → dead_letter
+
+pg_notify channels (commit #16):
+
+- `NotifyTriggerReady`    schedd wakeup (every broker-delivered record)
+- `NotifyTriggerChanged`  apid → schedd + dashboard SSE (CRUD + pause/resume)
+
+#### Broker adapter behavior
+
+One file per broker (`pkg/sched/poller_*.go`). Each implements:
+
+```go
+type triggerSource interface {
+    Kind() string
+    Poll(ctx, t sqlc.Trigger) PollResult
+    Ack(ctx, t, ids) error
+    Nack(ctx, t, ids, reason) error
+    Close() error
+}
+```
+
+Ack semantics per broker: queue → no-op (rows already in `invocations`); kafka → `CommitMessages`; nats → `Msg.Ack()`; redis → `XAck`; sqs → `POST .../delete`.
+
+Nack semantics: queue → no-op; kafka → `SetOffset` rewind; nats → `NakWithDelay(2s)`; redis → `XClaim` after 30s idle; sqs → `POST .../release`. `poison_record` becomes a broker-side drop on every broker.
+
+#### Failure routing
+
+| Reason | Source | Routing |
+|--------|--------|---------|
+| `rate_limited` | wake rate-limit gate deny | dead_letter, drop |
+| `poison_record` | malformed function response | dead_letter, manual_retry |
+| `max_attempts` | attempts reached per-trigger cap | dead_letter, customer_dlq |
+| `broker_error` | gateway transport failure | retry → max → dead_letter |
+| `payload_too_large` | record exceeds 6MB | dead_letter, drop |
+| `plan_quota` | per-app / per-account cap reached | dead_letter, drop |
+| `customer_disabled` | pause / delete mid-dispatch | dead_letter, drop |
+
+#### Migration safety
+
+- `00267_triggers.sql` is a single transaction; `invocations.source` widening uses `DROP CONSTRAINT … ADD CONSTRAINT` (PG15 has no `CREATE TRIGGER IF NOT EXISTS`, per the trigger-replay-safety precedent).
+- The pg_notify trigger `trg_notify_trigger_ready` fires AFTER INSERT ON trigger_records.
+- Cross-PR slot precheck before PR creation per `migration-gates-collision-and-replay.md`.
+
+---
+
 ## 5. Data model (Postgres, authoritative excerpt)
 
 `sqlc` against this schema; migrations via `goose`, numbered, never edited after merge.
