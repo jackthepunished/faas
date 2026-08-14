@@ -35,6 +35,7 @@ Commands:
   apps         List your apps
   apps ls      Alias for 'gregale apps'
   apps routes  List admitted per-route labels for one app (ADR-093)
+  apps streaming-cap  Per-app streaming classification probe (ADR-102 D6)
   apps -q      Delete an app
   app          Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
   backup       Operator rclone config unseal (backup unseal-rclone)
@@ -196,6 +197,18 @@ func run(args []string) int {
 				return cmdApps()
 			}
 			return cmdAppsRoutes(args[2], args[3:])
+		}
+		// `gregale apps streaming-cap <slug>` — ADR-102 D6 operator
+		// entry point. Same shape as the routes arm above: 3-token
+		// form (`apps streaming-cap <slug>`), placed BEFORE the
+		// `-q`/`--quiet` delete fall-through so a slug-shaped token
+		// never hits the delete path. Mirrors the routes CodeQL
+		// off-by-one guard (`len(args) < 3` falls through).
+		if len(args) > 1 && args[1] == subStreamingCap {
+			if len(args) < 3 {
+				return cmdApps()
+			}
+			return cmdAppsStreamingCap(args[2], args[3:])
 		}
 		// `gregale apps -q <slug>` is the delete path.
 		if len(args) > 1 && (args[1] == "-q" || args[1] == "--quiet") {
