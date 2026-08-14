@@ -323,7 +323,18 @@ func (p *Probe) ProbeOnce(ctx context.Context, tgt state.DataUpstreamTarget) Pro
 	// floor after the handshake — it never reaches the metric
 	// surface, the audit kind, the pg_notify payload, or any
 	// slog line (ADR-098 §11 invariant).
-	tlsConfig := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // codeql[go/disabled-certificate-check]
+	//
+	// codeql[go/disabled-certificate-check]: InsecureSkipVerify is
+	// deliberately true on the probe path. The probe measures
+	// TLS-handshake latency, not cert trust — the customer's TLS
+	// client is the trust boundary. Without InsecureSkipVerify the
+	// probe would abort on every cert-mismatch endpoint and the
+	// data_upstream_probes.ok counter would be permanently zero,
+	// which would defeat schedd's chooser bias (C6). The same
+	// rationale is documented at the ADR-098 §11 invariant block
+	// above. ServerName is left empty so the SNI remains the dial
+	// target's host hash, not the plaintext host.
+	tlsConfig := &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		_ = tlsConn.Close()

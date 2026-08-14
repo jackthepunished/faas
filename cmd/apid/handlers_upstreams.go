@@ -252,12 +252,18 @@ func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct sta
 	// the 14-value DataUpstreamKind closed vocabulary by
 	// req.Validate() at line 175 before this log line is reached;
 	// audit-also includes the same string under the same guarantee.
-	kindStr := string(req.Kind) // codeql[go/log-injection]
+	//
+	// CodeQL go/log-injection: even though req.Kind is a closed
+	// vocab after req.Validate(), the request-body origin isn't
+	// visible to the dataflow analysis. Wrap through logsanitize.Field
+	// (the project precedent — see handlers_registry_auth.go:181 and
+	// handlers_env.go:282) so the value flows through the
+	// package's recognised sanitiser and CodeQL drops the alert.
 	s.log.Info("data_upstream created",
 		"app", app.Slug,
 		"account", acct.ID,
 		"upstream_id", rowID,
-		"kind", kindStr,
+		"kind", logsanitize.Field(string(req.Kind)),
 		"scope", logsanitize.Field(scope),
 		"host_redacted_hash", hash[:8],
 	)
