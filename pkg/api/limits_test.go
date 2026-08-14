@@ -63,6 +63,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
 			WebhookPerApp: 0, WebhookPerAccount: 0,
+			// ADR-0NN (#757): Free is gated off the Trigger primitive
+			// entirely. Handler returns 402 CodePlanTriggersNotAllowed
+			// before the store is touched; the 0/0/0/0/0/0/0 tuple
+			// here is the defence-in-depth value the store still reads.
+			TriggersAllowed: false, TriggerLimitPerApp: 0, TriggerLimitPerAccount: 0, TriggerBatchSizeMax: 0, TriggerBatchWindowMaxSec: 0, TriggerMaxAttemptsMax: 0, TriggerRecordsPerSecondPerApp: 0,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
@@ -177,6 +182,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-076 (#476): Hobby gets 3 per-app and 10 per-account
 			// — mirrors the alert-rule ratio.
 			WebhookPerApp: 3, WebhookPerAccount: 10,
+			// ADR-0NN (#757): Hobby unlocks the in-platform queue +
+			// sqs_compat kinds. Tight caps (50/30s/3) so a Hobby
+			// customer's fan-out can't saturate schedd's per-app
+			// WakeRateLimiter bucket.
+			TriggersAllowed: true, TriggerLimitPerApp: 2, TriggerLimitPerAccount: 10, TriggerBatchSizeMax: 50, TriggerBatchWindowMaxSec: 30, TriggerMaxAttemptsMax: 3, TriggerRecordsPerSecondPerApp: 100,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
@@ -281,6 +291,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-076 (#476): Pro gets 10 per-app and 30 per-account
 			// — mirrors the alert-rule ratio.
 			WebhookPerApp: 10, WebhookPerAccount: 30,
+			// ADR-0NN (#757): Pro is the first tier where external
+			// broker kinds unlock (Kafka/NATS/Redis-streams). Caps jump
+			// to 10/50 + 500/5min/10 attempts so a Pro customer's
+			// 1k-msg/s Kafka consumer can be drained with one trigger.
+			TriggersAllowed: true, TriggerLimitPerApp: 10, TriggerLimitPerAccount: 50, TriggerBatchSizeMax: 500, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 10, TriggerRecordsPerSecondPerApp: 1000,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
 			// ADR-099 PR-0: Pro wake-admission throttle (20/30).
@@ -390,6 +405,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-076 (#476): Scale gets 25 per-app and 100 per-account
 			// — mirrors the alert-rule ratio.
 			WebhookPerApp: 25, WebhookPerAccount: 100,
+			// ADR-0NN (#757): Scale is the upper tier — caps align with
+			// the SQL CHECK ceilings (5000 records / 5 min window /
+			// 25 attempts) so a Scale customer's SQS-compatible or
+			// Kafka consumer can be drained at full throughput.
+			TriggersAllowed: true, TriggerLimitPerApp: 50, TriggerLimitPerAccount: 200, TriggerBatchSizeMax: 5000, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 25, TriggerRecordsPerSecondPerApp: 10000,
 			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
@@ -1015,6 +1035,143 @@ func TestPlanCronLimits(t *testing.T) {
 		}
 		if got := c.plan.CronLimitPerAccount(); got != c.wantPerAcct {
 			t.Errorf("%s.CronLimitPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+	}
+}
+
+// TestPlanTriggerLimits pins the per-plan Trigger primitive caps
+// (issue #757 / ADR-0NN). Free 0/0 (handler returns 402
+// CodePlanTriggersNotAllowed before the store is touched);
+// Hobby 2/10 — the entry paid tier gets queue + sqs_compat;
+// Pro 10/50 — external broker kinds unlock (Kafka/NATS/Redis);
+// Scale 50/200 — SaaS-scale fan-out. Mirrors the TestPlanCronLimits
+// shape so the cron ↔ trigger comparison stays visible. Unknown
+// plans must fail closed (return 0) — same contract as CronLimitPerApp.
+func TestPlanTriggerLimits(t *testing.T) {
+	cases := []struct {
+		plan                    Plan
+		wantPerApp, wantPerAcct int
+	}{
+		{PlanFree, 0, 0},
+		{PlanHobby, 2, 10},
+		{PlanPro, 10, 50},
+		{PlanScale, 50, 200},
+		{Plan("unknown"), 0, 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.TriggerLimitPerApp(); got != c.wantPerApp {
+			t.Errorf("%s.TriggerLimitPerApp() = %d, want %d", c.plan, got, c.wantPerApp)
+		}
+		if got := c.plan.TriggerLimitPerAccount(); got != c.wantPerAcct {
+			t.Errorf("%s.TriggerLimitPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+	}
+}
+
+// TestPlanTriggerAllowed pins the per-plan feature gate for the
+// Trigger primitive (issue #757 / ADR-0NN). Free = false (the
+// abuse-floor tier doesn't get pull-from-broker primitives); Hobby+
+// = true. apid's createTrigger handler reads this via
+// Plan.TriggersAllowed() and rejects with 402
+// CodePlanTriggersNotAllowed. Unknown plans must fail closed
+// (return false) — same contract as EvictionPriorityReservedAllowed.
+func TestPlanTriggerAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.TriggersAllowed(); got != c.want {
+			t.Errorf("%s.TriggersAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanTriggerBatchAndAttemptCaps pins the per-plan ceilings on
+// batch_size_max / batch_window_ms / max_attempts (issue #757 /
+// ADR-0NN). Hobby 50/30s/3, Pro 500/300s/10, Scale 5000/300s/25 —
+// the Scale ceiling matches the SQL CHECK [1, 5000] upper bound
+// (migration 00267). Free 0/0/0 because TriggersAllowed=false there.
+// Unknown plans must fail closed (return 0).
+func TestPlanTriggerBatchAndAttemptCaps(t *testing.T) {
+	cases := []struct {
+		plan                            Plan
+		wantBatch, wantWindow, wantAtts int
+	}{
+		{PlanFree, 0, 0, 0},
+		{PlanHobby, 50, 30, 3},
+		{PlanPro, 500, 300, 10},
+		{PlanScale, 5000, 300, 25},
+		{Plan("unknown"), 0, 0, 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.TriggerBatchSizeMax(); got != c.wantBatch {
+			t.Errorf("%s.TriggerBatchSizeMax() = %d, want %d", c.plan, got, c.wantBatch)
+		}
+		if got := c.plan.TriggerBatchWindowMaxSec(); got != c.wantWindow {
+			t.Errorf("%s.TriggerBatchWindowMaxSec() = %d, want %d", c.plan, got, c.wantWindow)
+		}
+		if got := c.plan.TriggerMaxAttemptsMax(); got != c.wantAtts {
+			t.Errorf("%s.TriggerMaxAttemptsMax() = %d, want %d", c.plan, got, c.wantAtts)
+		}
+	}
+}
+
+// TestPlanTriggerRecordsPerSecond pins the per-plan steady-state
+// dispatch-rate ceiling on a single trigger (issue #757 / ADR-0NN).
+// Hobby 100, Pro 1000, Scale 10000 — tracks the 10× rule the per-app
+// rps tier already follows. Unknown plans must fail closed.
+func TestPlanTriggerRecordsPerSecond(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 100},
+		{PlanPro, 1000},
+		{PlanScale, 10000},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.TriggerRecordsPerSecondPerApp(); got != c.want {
+			t.Errorf("%s.TriggerRecordsPerSecondPerApp() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanTriggerAccessorsMatchTable pins that each new accessor
+// reads the same value the Limits struct holds. Catches a regression
+// where a future contributor edits the struct field but forgets the
+// accessor (or vice versa). Mirrors TestPlanKeysMaxAccessorsMatchTable.
+func TestPlanTriggerAccessorsMatchTable(t *testing.T) {
+	for _, p := range Plans {
+		l := MustLimitsFor(p)
+		if got, want := p.TriggersAllowed(), l.TriggersAllowed; got != want {
+			t.Errorf("Plan(%s).TriggersAllowed() = %v, table = %v", p, got, want)
+		}
+		if got, want := p.TriggerLimitPerApp(), l.TriggerLimitPerApp; got != want {
+			t.Errorf("Plan(%s).TriggerLimitPerApp() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.TriggerLimitPerAccount(), l.TriggerLimitPerAccount; got != want {
+			t.Errorf("Plan(%s).TriggerLimitPerAccount() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.TriggerBatchSizeMax(), l.TriggerBatchSizeMax; got != want {
+			t.Errorf("Plan(%s).TriggerBatchSizeMax() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.TriggerBatchWindowMaxSec(), l.TriggerBatchWindowMaxSec; got != want {
+			t.Errorf("Plan(%s).TriggerBatchWindowMaxSec() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.TriggerMaxAttemptsMax(), l.TriggerMaxAttemptsMax; got != want {
+			t.Errorf("Plan(%s).TriggerMaxAttemptsMax() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.TriggerRecordsPerSecondPerApp(), l.TriggerRecordsPerSecondPerApp; got != want {
+			t.Errorf("Plan(%s).TriggerRecordsPerSecondPerApp() = %d, table = %d", p, got, want)
 		}
 	}
 }
