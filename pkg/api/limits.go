@@ -490,17 +490,6 @@ type Limits struct {
 	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
 	EdgeRulesThrottlePerApp int
 
-	// DataPlacementHintsPerApp (ADR-098 §D5) caps how many
-	// inferred/explicit data_upstreams rows one app may hold. The
-	// per-app cap defends against a noisy customer pinning hundreds
-	// of DB/cache hints on a hot app (the schedd wake-time chooser
-	// iterates the per-app scores at placement time). Free = 0
-	// (the customer can only see metadata via the dashboard; the
-	// capture path is fail-closed at the handler level via
-	// CodePlanLimitDataUpstreams). Per-plan: Free 0, Hobby 3, Pro
-	// 10, Scale 50.
-	DataPlacementHintsPerApp int
-
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
 	// defends against a SaaS customer pinning one surface per

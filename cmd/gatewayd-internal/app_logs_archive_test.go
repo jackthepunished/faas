@@ -181,11 +181,8 @@ func TestArchiveStream_HappyPath(t *testing.T) {
 	// Hobby 7-day retention cap forever — calendar drift can't expire
 	// it. The bucket-key assertion pins YYYY/MM/DD derived from the
 	// same `now` so a future drift in archiveObjectKey fails loud.
-	now := time.Now().UTC()
-	day := now.AddDate(0, 0, -1)
-	dayStr := day.Format("2006-01-02")
-	dayKey := day.Format("2006/01")
-	stamp := day.Format("2006-01-02") + "T12:00:00Z"
+	day := archiveTestDate()
+	stamp := "2026-08-07T12:00:00Z"
 	lines := []string{
 		`{"seq":1,"stream":"stdout","ts":"` + stamp + `","msg":"hello"}`,
 		`{"seq":2,"stream":"stdout","ts":"` + stamp + `","msg":"world"}`,
@@ -207,7 +204,6 @@ func TestArchiveStream_HappyPath(t *testing.T) {
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Backstop: 5 * time.Second,
 	}
-	day := archiveTestDate()
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
 		"archive=1&instance=inst-abc&date="+day)
 
@@ -278,7 +274,7 @@ func TestArchiveStream_S3NotFound_ArchiveMissing(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-"archive=1&instance=inst-abc&date="+archiveTestDate())
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	if !strings.Contains(body_out, `"reason":"archive_missing"`) {
 		t.Errorf("body missing archive_missing: %s", body_out)
@@ -298,7 +294,7 @@ func TestArchiveStream_S3ServerError_ArchiveDegraded(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-"archive=1&instance=inst-abc&date="+archiveTestDate())
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	if !strings.Contains(body_out, `"reason":"archive_degraded"`) {
 		t.Errorf("body missing archive_degraded: %s", body_out)
@@ -456,7 +452,7 @@ func TestArchiveStream_MalformedJSONLine(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-"archive=1&instance=inst-abc&date="+archiveTestDate())
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	if !strings.Contains(body_out, `"reason":"archive_degraded"`) {
 		t.Errorf("malformed JSON should degrade: %s", body_out)
@@ -554,7 +550,7 @@ func TestArchiveStream_FramePayloadShape(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-"archive=1&instance=inst-abc&date="+archiveTestDate())
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	// Extract the first event: log payload to inspect the keys.
 	i := strings.Index(body_out, "data: {")
