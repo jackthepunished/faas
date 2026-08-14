@@ -21,11 +21,17 @@ import (
 
 // tenantSurfaceCols is the canonical SELECT column list for a
 // tenant_surfaces row. Matches the order of scanTenantSurface.
-// Prefixed with `s.` so JOINs against tenant_hostnames (which also
-// has id + created_at) don't trip SQLSTATE 42702 (ambiguous
-// column reference). The bare form is acceptable for single-table
-// queries; the `s`-prefix is also accepted by Postgres for them.
-const tenantSurfaceCols = `s.id, s.account_id, s.app_id, s.name, s.cert_kind, s.status,
+// Bare columns are fine for INSERT...RETURNING and single-table
+// queries (where the FROM alias is also `s`); the qualified
+// variant tenantSurfaceColsQ prefixes every column with `s.` so
+// JOINs against tenant_hostnames (which also has id + created_at)
+// don't trip SQLSTATE 42702 (ambiguous column reference).
+const tenantSurfaceCols = `id, account_id, app_id, name, cert_kind, status,
+	cert_state, coalesce(cert_not_after, 'epoch'::timestamptz),
+	coalesce(cert_last_error, ''), created_at, updated_at`
+
+// tenantSurfaceColsQ — JOIN-safe form of tenantSurfaceCols.
+const tenantSurfaceColsQ = `s.id, s.account_id, s.app_id, s.name, s.cert_kind, s.status,
 	s.cert_state, coalesce(s.cert_not_after, 'epoch'::timestamptz),
 	coalesce(s.cert_last_error, ''), s.created_at, s.updated_at`
 
@@ -192,7 +198,7 @@ func (s *PgStore) CreateTenantSurfaceIfUnderQuota(ctx context.Context, in Create
 // GetTenantSurfaceByID — primary-key lookup.
 func (s *PgStore) GetTenantSurfaceByID(ctx context.Context, id string) (TenantSurface, error) {
 	row := s.pool.QueryRow(ctx,
-		`select `+tenantSurfaceCols+` from tenant_surfaces where id = $1`, id)
+		`select `+tenantSurfaceColsQ+` from tenant_surfaces s where s.id = $1`, id)
 	return scanTenantSurface(row)
 }
 
@@ -200,8 +206,8 @@ func (s *PgStore) GetTenantSurfaceByID(ctx context.Context, id string) (TenantSu
 // soft-deleted rows so audit / cert_history flows can find them.
 func (s *PgStore) GetTenantSurfaceByName(ctx context.Context, accountID, name string) (TenantSurface, error) {
 	row := s.pool.QueryRow(ctx,
-		`select `+tenantSurfaceCols+` from tenant_surfaces
-		 where account_id = $1 and name = $2`,
+		`select `+tenantSurfaceColsQ+` from tenant_surfaces s
+		 where s.account_id = $1 and s.name = $2`,
 		accountID, name)
 	return scanTenantSurface(row)
 }
@@ -210,9 +216,9 @@ func (s *PgStore) GetTenantSurfaceByName(ctx context.Context, accountID, name st
 // soft-deleted surfaces (they live in audit trails).
 func (s *PgStore) ListTenantSurfacesForAccount(ctx context.Context, accountID string) ([]TenantSurface, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+tenantSurfaceCols+` from tenant_surfaces
-		 where account_id = $1 and status <> 'deleted'
-		 order by created_at, id`,
+		`select `+tenantSurfaceColsQ+` from tenant_surfaces s
+		 where s.account_id = $1 and s.status <> 'deleted'
+		 order by s.created_at, s.id`,
 		accountID)
 	if err != nil {
 		return nil, err
@@ -225,9 +231,9 @@ func (s *PgStore) ListTenantSurfacesForAccount(ctx context.Context, accountID st
 // reverse-lookup from an app id.
 func (s *PgStore) ListTenantSurfacesForApp(ctx context.Context, appID string) ([]TenantSurface, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+tenantSurfaceCols+` from tenant_surfaces
-		 where app_id = $1 and status <> 'deleted'
-		 order by created_at, id`,
+		`select `+tenantSurfaceColsQ+` from tenant_surfaces s
+		 where s.app_id = $1 and s.status <> 'deleted'
+		 order by s.created_at, s.id`,
 		appID)
 	if err != nil {
 		return nil, err
@@ -302,7 +308,7 @@ func (s *PgStore) DeleteTenantSurface(ctx context.Context, id string) error {
 // caller then consults custom_domains via DomainByName).
 func (s *PgStore) TenantSurfaceByHostname(ctx context.Context, hostname string) (TenantSurface, error) {
 	row := s.pool.QueryRow(ctx,
-		`select `+tenantSurfaceCols+` from tenant_surfaces s
+		`select `+tenantSurfaceColsQ+` from tenant_surfaces s
 		    join tenant_hostnames h on h.surface_id = s.id
 		  where h.hostname = $1
 		    and s.status <> 'deleted'`,
