@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00265_oidc_trust_policies.sql — ADR-101 / issue #270 / PR-A.
+-- 00267_oidc_trust_policies.sql — ADR-101 / issue #270 / PR-A.
 --
 -- Per-(account_id, issuer_url) OIDC / keyless deploy auth policy.
 -- One row per (account, issuer) pair the customer trusts. The

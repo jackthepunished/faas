@@ -175,13 +175,17 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// miss, auto-create a permissive default (sub_pattern="",
 	// algs=[RS256], empty RequiredClaims) and emit
 	// oidc.trust_policy.created.
-	policy, err := deps.Policies.Get(r.Context(), acct.ID, issuerURL)
-	if err != nil && !errors.Is(err, ErrTrustPolicyNotFound) {
-		api.WriteProblem(w, api.ErrCapacity("trust policy lookup failed"))
-		return
-	}
-	if errors.Is(err, ErrTrustPolicyNotFound) {
-		policy = permissiveDefaultPolicyFor(acct.ID, issuerURL)
+	if _, err := deps.Policies.Get(r.Context(), acct.ID, issuerURL); err != nil {
+		if !errors.Is(err, ErrTrustPolicyNotFound) {
+			api.WriteProblem(w, api.ErrCapacity("trust policy lookup failed"))
+			return
+		}
+		// Auto-create path: the (account, issuer) binding is
+		// already in place (Step 3 resolved the account); we just
+		// need to persist a default policy row so subsequent
+		// exchanges can enforce it. The audit row carries the
+		// upserted policy's jwks_url + audience + 'auto' marker.
+		policy := permissiveDefaultPolicyFor(acct.ID, issuerURL)
 		policy, err = deps.Policies.Upsert(r.Context(), policy)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("trust policy upsert failed"))

@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00265 (oidc_trust_policies). Pins
+// Migration-apply test for 00267 (oidc_trust_policies). Pins
 // the load-bearing PR-A schema contract:
 //
-//   1. The migration applies cleanly through 00265.
+//   1. The migration applies cleanly through 00267.
 //   2. All 10 columns are present with the right types and NOT NULL
 //      constraints.
 //   3. The composite PK is (account_id, issuer_url).
@@ -26,7 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00265_OIDCTrustPolicies(t *testing.T) {
+func TestMigrations_00267_OIDCTrustPolicies(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
@@ -123,7 +123,7 @@ func TestMigrations_00265_OIDCTrustPolicies(t *testing.T) {
 
 	// (3) Seed an account + insert a real policy row. We need a
 	// real account to satisfy the FK constraint.
-	const seedAcct = "00000000-0000-0000-0000-000000000265"
+	const seedAcct = "00000000-0000-0000-0000-000000000267"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan) values ($1::uuid, 'm265@example.com', 'free')
 		on conflict (id) do nothing

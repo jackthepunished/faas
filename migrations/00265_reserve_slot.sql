@@ -1,8 +1,8 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00266_reserve_slot.sql — slot reservation placeholder
--- (ADR-101 / issue #270 PR-A slot collision carve-out).
+-- 00265_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #906 ADR-101 PR-A slot collision carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
 -- migrations/embed_test.go::TestMigrationsContiguous requirement
@@ -14,10 +14,11 @@
 --
 -- PR #906 (ADR-101 PR-A) renumbered the OIDC tables from 00265 to
 -- 00267 + 00266 → 00268 after the cross-PR collision detector
--- rejected 00265 (claimed by open PR #887, merged as commit
--- 5ba460ab with `00265_edge_rules_kind_throttle.sql`). Without the
--- reservation at 00266, the branch's embedded FS would have a gap
--- and TestMigrationsContiguous would fail at PR time.
+-- rejected 00265 (claimed by PR #887, merged as commit 5ba460ab
+-- with `00265_edge_rules_kind_throttle.sql` while PR #906 was
+-- still in flight). The branch was forked off main before
+-- PR #887's merge, so the reservation is the canonical way to
+-- claim the slot for the OIDC PR without rewriting history.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change.

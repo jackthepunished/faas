@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00266 (oidc_exchanged_tokens). Pins
+// Migration-apply test for 00268 (oidc_exchanged_tokens). Pins
 // the load-bearing PR-A schema contract:
 //
-//   1. The migration applies cleanly through 00266.
+//   1. The migration applies cleanly through 00268.
 //   2. All 9 columns are present with the right types and NOT NULL
 //      constraints.
 //   3. The token_hash UNIQUE index is present and enforced.
@@ -27,7 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00266_OIDCExchangedTokens(t *testing.T) {
+func TestMigrations_00268_OIDCExchangedTokens(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	if err := db.MigrateUp(ctx, pool); err != nil {
@@ -91,7 +91,7 @@ func TestMigrations_00266_OIDCExchangedTokens(t *testing.T) {
 
 	// (3) Seed an account + insert a real token row. We need a
 	// real account to satisfy the FK constraint.
-	const seedAcct = "00000000-0000-0000-0000-000000000266"
+	const seedAcct = "00000000-0000-0000-0000-000000000268"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan) values ($1::uuid, 'm266@example.com', 'free')
 		on conflict (id) do nothing
