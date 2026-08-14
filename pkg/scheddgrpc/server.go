@@ -677,9 +677,6 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	// arm; the line-frame fields stay zero (matches the wire
 	// shape mirrors the vmmd proto).
 	sink := func(f sched.LogFrame) error {
-		if stream.Context().Err() != nil {
-			return stream.Context().Err()
-		}
 		// Filter (issue #309 / tier-2 DX). Apply BEFORE building
 		// the proto response so a filtered line costs us only
 		// the MatchLine check, not the proto marshal + Send.
@@ -690,6 +687,18 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 		// "show me when logs stopped" guarantee). The counter
 		// increments only on line-frame drops so the dashboard
 		// panel surfaces a real rate.
+		//
+		// The stream-context check is intentionally BELOW the
+		// filter branch so a drop the engine has already decided
+		// still increments apid_logs_dropped_total. Without that
+		// ordering, a consumer that cancels right after the last
+		// delivered frame would race the engine's next sink()
+		// call: the engine sees the cancel and returns without
+		// crediting the drop, the metric undercounts, and the
+		// FilterLevelDropsAndCounts / FilterGrepDropsAndCounts
+		// tests flake (see memory `scheddgrpc-filterleveldropsflake`).
+		// The drop decision is local + atomic; the increment is
+		// safe to honour regardless of stream-side state.
 		if !f.IsGap && !filter.NoFilter() && !filter.MatchLine(f.Line) {
 			// MatchLine already returned false — the line
 			// failed at least one active filter. Recompute

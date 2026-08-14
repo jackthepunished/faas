@@ -34,7 +34,13 @@ permissions:
   security-events: write
 
 env:
-  GO_VERSION: "1.25"
+  # Pinned to a patch (not a minor) so the govulncheck image-scan gate
+  # and the go.mod `go 1.25.7` directive resolve to the same Go runtime.
+  # go1.25.12 carries 7 stdlib vulnerabilities (GO-2026-5026/5972/6088/
+  # 6089/6090/6091/6218) fixed in go1.25.13 — the image-scan gate fails
+  # closed when the runner resolves "1.25" to a vulnerable patch. Bump
+  # in lock-step with the go.mod `go` directive.
+  GO_VERSION: "1.25.13"
   # vacuum is the OpenAPI ruleset linter used by `make spec-check`.
   # Both the version and the SHA-256 pin are mirrored from the upstream
   # checksum file at https://github.com/daveshanley/vacuum/releases — never
@@ -51,7 +57,7 @@ env:
   # because the `go install` path cross-compiles sqlc (with its cgo
   # pganalyze/pg_query_go tree) from source on every cold runner (~30 s)
   # and v1.31.1's go.mod requires Go >= 1.26, which the ubuntu-latest
-  # runner (Go 1.25.12) cannot satisfy under GOTOOLCHAIN=local.
+  # runner (Go 1.25.13) cannot satisfy under GOTOOLCHAIN=local.
   # Same supply-chain pin pattern as vacuum above and every binary in the
   # EX44 ansible roles.
   SQLC_VERSION: "1.31.1"
