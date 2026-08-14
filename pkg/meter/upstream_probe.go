@@ -266,16 +266,6 @@ func (p *Probe) Run(ctx context.Context) (int, error) {
 	return written, firstErr
 }
 
-// codeql[go/disabled-certificate-check] false-positive: ProbeOnce
-// intentionally disables cert validation because the probe measures
-// TLS-handshake latency, not cert trust. The customer's TLS client
-// is the trust boundary. Without InsecureSkipVerify the probe aborts
-// on every cert-mismatch endpoint and the data_upstream_probes.ok
-// counter stays zero, which defeats schedd's chooser bias (C6).
-// ServerName stays empty so SNI is the dial-target hash, not the
-// plaintext host. ADR-098 §11 invariant. Mirrors the established
-// suppression pattern at pkg/reqbudget/middleware.go:261.
-//
 // ProbeOnce runs a single dial + TLS handshake against the
 // target. The result is the per-row payload
 // data_upstream_probes writes. The probe is TCP-only
@@ -291,6 +281,24 @@ func (p *Probe) Run(ctx context.Context) (int, error) {
 // failure surfaces as UpstreamProbeOutcomeDNS. A TCP RST
 // surfaces as UpstreamProbeOutcomeRefused. A context timeout
 // surfaces as UpstreamProbeOutcomeTimeout.
+//
+// Cert verification: the probe runs with real cert validation
+// (no InsecureSkipVerify). ADR-052 §Rejected alternatives flagged
+// InsecureSkipVerify=true as CodeQL alert #58 — production code
+// must not bypass cert trust. The probe outcome distinguishes:
+//   - ok            — handshake completed AND cert chain trusted
+//   - tls_handshake — handshake completed but cert validation failed
+//     (cert mismatch, expired, unknown CA)
+//
+// Both are useful signals for schedd's chooser bias (C6): an
+// endpoint with cert issues is still latency-relevant; schedd
+// just doesn't bias toward it. The customer's TLS client is
+// the trust boundary per ADR-098 §11.
+//
+// ServerName is empty; the probe doesn't care about the SNI
+// match (we're not validating cert trust against a specific
+// name — we're measuring latency). The SNI remains the dial
+// target's host hash, not the plaintext host.
 func (p *Probe) ProbeOnce(ctx context.Context, tgt state.DataUpstreamTarget) ProbeResult {
 	res := ProbeResult{
 		HostRedactedHash: tgt.HostRedactedHash,
@@ -323,17 +331,13 @@ func (p *Probe) ProbeOnce(ctx context.Context, tgt state.DataUpstreamTarget) Pro
 	// handshake is the load-bearing RTT signal — an HTTP
 	// GET would add another round-trip and surface the
 	// plaintext Host: header.
-	// ServerName is empty; the probe doesn't care about the
-	// SNI match (we're not validating cert trust — we're
-	// measuring latency). The SNI remains the dial target
-	// hash's first 8 chars, not the plaintext host.
 	//
 	// The dialed plaintext host is captured in
 	// data_upstreams.host (bytea column) and dropped on the
 	// floor after the handshake — it never reaches the metric
 	// surface, the audit kind, the pg_notify payload, or any
 	// slog line (ADR-098 §11 invariant).
-	tlsConfig := &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+	tlsConfig := &tls.Config{}
 	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		_ = tlsConn.Close()
