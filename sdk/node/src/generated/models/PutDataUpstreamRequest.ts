@@ -2,6 +2,14 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+/**
+ * Upsert payload for a customer data upstream. The (kind, host, port)
+ * tuple is the deduplication key — repeating the PUT updates the
+ * existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
+ * inferred-source tag. Plaintext host is never persisted; the on-disk
+ * column is `host_redacted_hash`.
+ *
+ */
 export type PutDataUpstreamRequest = {
   /**
    * Closed vocabulary (ADR-098 §D1). Adding a new kind requires an ADR.

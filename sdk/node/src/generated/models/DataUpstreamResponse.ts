@@ -2,6 +2,12 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+/**
+ * A single customer data upstream. The plaintext host is replaced by
+ * `host_redacted_hash` (sha256(salt||host) 8-hex prefix); the §11
+ * barrier means the wire format never carries the customer's DSN.
+ *
+ */
 export type DataUpstreamResponse = {
   id: string;
   /**
@@ -19,7 +25,7 @@ export type DataUpstreamResponse = {
   host_last4?: string;
   port: number;
   /**
-   * ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash).
+   * ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Echoes the value persisted on the row; absent when the default scope applies.
    */
   scope?: string;
   /**
