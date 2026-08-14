@@ -11,7 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-"net/url"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
