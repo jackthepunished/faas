@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,10 +37,31 @@ import (
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-	pool               *pgxpool.Pool
-	engine             *Engine
-	log                *slog.Logger
-	gateway            GatewaySynth
+	pool    *pgxpool.Pool
+	engine  *Engine
+	log     *slog.Logger
+	gateway GatewaySynth
+	// Issue #757 / ADR-0NN (commit #14): the trigger dispatch tick
+	// posts batch envelopes to the gateway's batch endpoint.
+	// gatewayHTTPClient + gatewayBaseURL carry the http.Client +
+	// base URL so dispatch_triggers.go doesn't have to reach
+	// through the GatewaySynth interface.
+	gatewayHTTPClient *http.Client
+	gatewayBaseURL    string
+	// triggerPollers caches one triggerSource per trigger id. The
+	// cache is invalidated by NotifyTriggerChanged (commit #16);
+	// for now we never rebuild within a process lifetime.
+	triggerPollers map[string]triggerSource
+	// rateLimiter is the per-app wake rate limiter (shared with
+	// cron dispatch via pkg/sched/rate_limit.go).
+	rateLimiter *WakeRateLimiter
+	// triggerWakeup is the channel-side wakeup signal the schedd's
+	// pg_notify subscriber delivers on every NotifyTriggerReady +
+	// NotifyTriggerChanged payload (commit #16). The Loop's run
+	// selects on it alongside the 1s ticker so an idle broker
+	// doesn't sit for a full 1s tick before the first batch.
+	triggerWakeup      chan struct{}
+	triggerWakeupOnce  sync.Once
 	now                func() time.Time
 	flowCounts         FlowCounter
 	ops                *wire.OpsMetrics       // issue #171 shared registry; nil safe

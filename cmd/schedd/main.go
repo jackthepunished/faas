@@ -1420,6 +1420,33 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- loop.Run(ctx) }()
 
+	// Issue #757 / ADR-0NN (commit #16): trigger dispatch
+	// wakeups. Subscribe to the trigger_ready + trigger_changed
+	// channels and forward every payload as a single
+	// Loop.WakeupTriggers() nudge so an idle broker doesn't sit
+	// for a full 1s tick before the first batch. The 1s ticker
+	// remains the safety net (PR-C pattern).
+	triggerNotifC, triggerSubErr := db.SubscribeWithReconnect(ctx, pool,
+		[]string{db.NotifyTriggerReady, db.NotifyTriggerChanged}, log)
+	if triggerSubErr != nil {
+		log.Error("schedd: trigger notify subscribe failed; safety ticker still runs",
+			"err", triggerSubErr)
+	} else {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case _, ok := <-triggerNotifC:
+					if !ok {
+						return
+					}
+					loop.WakeupTriggers()
+				}
+			}
+		}()
+	}
+
 	// Issue #791 PR-D: fire-now is folded into loop.Run's existing
 	// LISTEN (db.NotifyCronRunNow is multiplexed onto the same
 	// long-term connection as NotifyAppChanged / NotifyDeploymentChanged

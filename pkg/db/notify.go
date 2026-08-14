@@ -174,17 +174,29 @@ const (
 	NotifyDomainChanged     = "domain_changed"
 	NotifyCronChanged       = "cron_changed"
 	NotifyTriggerChanged    = "trigger_changed"
-	NotifyKeyChanged        = "key_changed"
-	NotifyBuildQueued       = "build_queued"
-	NotifyBuildLog          = "build_log"
-	NotifyDomainVerify      = "domain_verify"
-	NotifyInstanceChanged   = "instance_changed"
-	NotifySnapshotPrime     = "snapshot_prime"
-	NotifySnapshotBoot      = "snapshot_boot"
-	NotifySnapshotWritten   = "snapshot_written"
-	NotifyBillingPastDue    = "billing_past_due"
-	NotifyQuotaWarning      = "quota_warning"
-	NotifyCronFired         = "cron_fired"
+	// NotifyTriggerReady fires when a row is inserted into
+	// trigger_records (migrations/00267_triggers.sql). schedd's
+	// dispatch tick consumes via cmd/schedd/main.go's existing
+	// SubscribeWithReconnect block. Listeners:
+	//   - pkg/sched/dispatch_triggers.go (runTriggerTick fan-in
+	//     from any source — kind=queue pulls existing rows on
+	//     next tick, kind=kafka/nats/redis/sqs get the immediate
+	//     wake-up signal so an idle broker doesn't sit for a
+	//     full 1s tick before the first batch)
+	//   - dashboard SSE (commit #16 / §4.7.X — operator-facing
+	//     "your trigger just received a record" notification)
+	NotifyTriggerReady    = "trigger_ready"
+	NotifyKeyChanged      = "key_changed"
+	NotifyBuildQueued     = "build_queued"
+	NotifyBuildLog        = "build_log"
+	NotifyDomainVerify    = "domain_verify"
+	NotifyInstanceChanged = "instance_changed"
+	NotifySnapshotPrime   = "snapshot_prime"
+	NotifySnapshotBoot    = "snapshot_boot"
+	NotifySnapshotWritten = "snapshot_written"
+	NotifyBillingPastDue  = "billing_past_due"
+	NotifyQuotaWarning    = "quota_warning"
+	NotifyCronFired       = "cron_fired"
 	// NotifyCronRunNow fires when a row is inserted into
 	// cron_fire_now_requests (migrations/00193) — apid emits, schedd
 	// consumes via cmd/schedd/main.go's existing SubscribeWithReconnect
