@@ -1,19 +1,32 @@
--- filename: 00268_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Contiguity filler for PR #916 (issue #911 / ADR-110 PR-3a).
--- PR-3a targets 00271 (compute_nodes release columns) +
--- 00272 (release_bundles table). Slots 00268/00269/00270 are
--- reserved by sibling PRs (#906 ADR-101 OIDC PR-A, #910 unified
--- triggers) — body is a no-op SELECT 1; so PR-3a stays
--- contiguous when those siblings land before or after PR-3a
--- merges. This fence will be reaped in a follow-up PR if
--- #906 / #910 land first and shadow the slot (per ADR-041 the
--- owning PR drops the fence in a follow-up).
-SELECT 1;
+--
+-- 00268_reserve_slot.sql — slot reservation placeholder
+-- (ADR-101 / issue #270 PR-A second-renumber carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- PR #906 (ADR-101 PR-A) originally picked 00267 + 00268 for the
+-- OIDC tables, then renumbered to 00267 → 00269 + 00268 → 00270
+-- after PR #910 (worktree-feat-triggers-mega) claimed slot 00267
+-- with `00267_triggers.sql`. Slot 00268 was empty so this fence
+-- bridges the contiguity chain from main's 00265_edge_rules_kind_throttle.sql
+-- + the 00266 fence to the OIDC tables on this branch.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-SELECT 1;
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
 -- +goose StatementEnd

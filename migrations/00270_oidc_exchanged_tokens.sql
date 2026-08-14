@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00268_oidc_exchanged_tokens.sql — ADR-101 / issue #270 / PR-A.
+-- 00270_oidc_exchanged_tokens.sql — ADR-101 / issue #270 / PR-A.
 --
 -- Short-lived opaque bearer backing table. One row per
 -- successful POST /v1/auth/oidc/exchange. The wire-side bearer
