@@ -29,6 +29,20 @@ const (
 	PlanScale Plan = "scale"
 )
 
+// StreamingStatus is the per-request classification emitted via the
+// Streaming-Status response header (ADR-102 D1/D2). String alias so
+// the JSON encoder marshals the wire value verbatim and HTTP header
+// Set/Get round-trips losslessly. The canonical wire values are the
+// lower-case string forms of the StreamingStatus* constants declared
+// in the streaming constants block below; see that block for per-value
+// semantics.
+//
+// All non-streaming variants carry the plan-level buffered cap
+// (MaxResponseBodyBytes); only the streaming variant can carry an
+// endpoint-rule cap (max_body_bytes_streaming from a matched edge
+// rule).
+type StreamingStatus string
+
 // Plans lists every plan low-to-high. Order matters for upgrade/downgrade logic
 // and for deterministic tests — do not reorder.
 var Plans = []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
@@ -1950,6 +1964,69 @@ const (
 	ResponseWriteTimeoutDefault         = 300              // 300 s (spec §4.1)
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
 	StreamingFlushIntervalDefault       = 200 * time.Millisecond
+
+	// StreamingStatus is the per-request classification emitted via
+	// the Streaming-Status response header (ADR-102 D1/D2). The
+	// canonical wire values are the lower-case string forms of the
+	// constants below; the Go type is a string alias so the JSON
+	// encoder marshals the wire value verbatim and HTTP header
+	// Set/Get round-trips losslessly. Six states, six wire values,
+	// no aliases.
+	//
+	// StreamingStatusStreaming is the happy path — the platform's
+	// four-conjunct streaming gate (operator opt-in + per-app flag
+	// + non-JSON Accept + non-Upgrade request) all hold and the
+	// capWriter / per-flush metering wrap is installed.
+	//
+	// StreamingStatusAcceptJSONDowngrade is the post-D3 advisory
+	// variant: the request set Accept: application/json which
+	// would have downgraded the gate pre-ADR-102 but no longer
+	// does. Status is informational for one release cycle so
+	// pinned-SDK customers (whose Accept defaults to JSON) can
+	// self-diagnose via the header. The variant is deleted in
+	// ADR-102-followup ~30 days post-merge.
+	//
+	// StreamingStatusFlagDisabled means apps.streaming_enabled=false.
+	// StreamingStatusOperatorDisabled means FAAS_GATEWAY_STREAMING
+	// env was not set on the gatewayd-internal process.
+	// StreamingStatusPlanDisallows means the plan is Free (legacy
+	// pre-D5 rows only — D5 closes CreateApp at apid).
+	// StreamingStatusUpgradeBypass means Connection: Upgrade is
+	// set — the raw-bytes bridge handles this path, not the
+	// streaming path.
+	//
+	// All non-streaming variants carry the plan-level buffered cap
+	// (MaxResponseBodyBytes); only the streaming variant can carry
+	// an endpoint-rule cap (max_body_bytes_streaming from a
+	// matched edge rule).
+	StreamingStatusStreaming           StreamingStatus = "streaming"
+	StreamingStatusAcceptJSONDowngrade StreamingStatus = "accept-json-downgrade"
+	StreamingStatusFlagDisabled        StreamingStatus = "flag-disabled"
+	StreamingStatusOperatorDisabled    StreamingStatus = "operator-disabled"
+	StreamingStatusPlanDisallows       StreamingStatus = "plan-disallows"
+	StreamingStatusUpgradeBypass       StreamingStatus = "upgrade-bypass"
+
+	// StreamingStatusHeader is the canonical response header name
+	// carrying the StreamingStatus enum (ADR-102 D2). Title-Case
+	// per the IETF visible-header convention (Retry-After,
+	// X-RateLimit-*); not the x-faas-* internal prefix because
+	// this is customer-visible (and surfaceable to browser JS
+	// via CORS Expose-Headers per ADR-102 D8).
+	StreamingStatusHeader = "Streaming-Status"
+
+	// StreamingStatusAcceptHintHeader is the one-cycle advisory
+	// header (ADR-102 D3) stamped on the FIRST response after
+	// upgrade when the request would have downgraded pre-D3
+	// (i.e. Accept: application/json was set). Pinned-SDK
+	// customers whose SDK defaults Accept to JSON see this
+	// header and self-diagnose. Deleted in ADR-102-followup
+	// when the accept-json-downgrade enum variant is retired.
+	StreamingStatusAcceptHintHeader = "Streaming-Status-Accept-Hint"
+
+	// StreamingStatusAcceptHintValue is the wire value of the
+	// advisory header. Constant so a customer grepping for
+	// "would-buffer-pre-D3" finds exactly the call site.
+	StreamingStatusAcceptHintValue = "would-buffer-pre-D3"
 
 	// Raw-bridge (issue #676 / ADR-080) inbound cap. The raw-bytes
 	// bridge carries Upgrade / WebSocket / long-poll traffic from

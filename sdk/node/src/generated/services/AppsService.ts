@@ -10,6 +10,7 @@ import type { AppResponse } from '../models/AppResponse.js';
 import type { AppRoutesResponse } from '../models/AppRoutesResponse.js';
 import type { AppSLOResponse } from '../models/AppSLOResponse.js';
 import type { AppsMetricsResponse } from '../models/AppsMetricsResponse.js';
+import type { AppStreamingStatus } from '../models/AppStreamingStatus.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
 import type { UpdateAppRequest } from '../models/UpdateAppRequest.js';
@@ -249,6 +250,61 @@ export class AppsService {
     return __request(OpenAPI, {
       method: 'GET',
       url: '/v1/apps/{slug}/routes',
+      path: {
+        'slug': slug,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app streaming classification probe (ADR-102 D6).
+   * Returns the streaming-status enum (one of `streaming`,
+   * `accept-json-downgrade`, `flag-disabled`, `plan-disallows`,
+   * `operator-disabled`, `upgrade-bypass`) the gatewayd handler
+   * would stamp on the `Streaming-Status` response header for a
+   * representative request to this app, plus the effective
+   * response-body cap (in bytes) and the per-gate flags.
+   *
+   * The probe is a pure read against the apid cache (the
+   * per-account `Plan` and the per-app `streaming_enabled`
+   * flag). It does NOT dial gatewayd-internal — the operator
+   * opt-in (`FAAS_GATEWAY_STREAMING` env) and per-edge-rule
+   * cap override are gatewayd-side state, so `effective_cap_bytes`
+   * reflects the plan cap (`cap_kind="plan"`) on every probe.
+   * A customer evaluating "will my next request stream?" must
+   * consider the operator-side flag separately; the canonical
+   * signal is the `Streaming-Status` response header on a real
+   * request, not this probe.
+   *
+   * `status=plan-disallows` means the customer's plan tier
+   * forbids `streaming_enabled=true`; the CreateApp gate (D5)
+   * already returns 403 `CodePlanStreamingNotAllowed` so this
+   * row should be unreachable from a properly-validated app,
+   * but the probe still reflects the persisted state for
+   * audits and pinned-SDK migrations.
+   *
+   * @returns AppStreamingStatus The streaming classification for the app.
+   * @throws ApiError
+   */
+  public static getAppStreamingCap({
+    slug,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+  }): CancelablePromise<AppStreamingStatus> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/streaming-cap',
       path: {
         'slug': slug,
       },

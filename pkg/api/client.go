@@ -1941,6 +1941,25 @@ func (c *Client) GetAppRoutes(ctx context.Context, slug string) (AppRoutesRespon
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/routes", nil, &out)
 }
 
+// GetAppStreamingStatus returns the per-request streaming
+// classification for the named app (ADR-102 D6). The endpoint is
+// the SDK-side mirror of pkg/gateway.(*Handler).decideStreaming —
+// a customer hitting this endpoint sees exactly what the gateway's
+// gate machine would resolve for the next inbound request, with the
+// same status enum (api.StreamingStatus*) and the same effective
+// cap (plan cap by default; endpoint-rule MaxBodyBytesStreaming if
+// a kind=limit edge rule matched).
+//
+// Use case: a customer evaluating "will my next request stream?"
+// fires this endpoint pre-flight instead of probing with a real
+// request and reading the Streaming-Status response header. The
+// probe does NOT mutate state and does NOT warm a wake — it's a
+// pure read against the per-app cache.
+func (c *Client) GetAppStreamingStatus(ctx context.Context, slug string) (AppStreamingStatus, error) {
+	var out AppStreamingStatus
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/streaming-cap", nil, &out)
+}
+
 // GetAppsMetrics returns the account-wide per-app metrics rollup
 // (issue #393). One call replaces N per-app GetAppMetrics calls;
 // the response is keyed by app_slug so the dashboard renders rows

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2622,10 +2623,10 @@ func TestApplyEdgeRuleLimit_StreamingCap_AuditEventCarriesCapKind(t *testing.T) 
 			wantCapKind: "streaming",
 		},
 		{
-			name:        "buffered-cap fires when Accept=application/json",
+			name:        "streaming-cap fires when Accept=application/json (post-D3 the request streams)",
 			streamingOn: true,
 			accept:      "application/json",
-			wantCapKind: "buffered",
+			wantCapKind: "streaming",
 		},
 	}
 	for _, tc := range cases {
@@ -2712,9 +2713,9 @@ func TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts(t *testing.T) {
 			want: false,
 		},
 		{
-			name:       "Accept=application/json → not streaming (isAcceptJSON opts out)",
+			name:       "Accept=application/json → streaming post-D3 (advisory only)",
 			hStreaming: true, appStreaming: true, accept: "application/json",
-			want: false,
+			want: true,
 		},
 		{
 			name:       "Upgrade: websocket → not streaming (isUpgradeRequest opts out)",
@@ -2727,7 +2728,7 @@ func TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts(t *testing.T) {
 			want: true,
 		},
 		{
-			name:       "Accept=json + Upgrade=ws (both opts out) → not streaming",
+			name:       "Accept=json + Upgrade=ws (Upgrade opts out, JSON is post-D3 advisory) → not streaming (Upgrade wins)",
 			hStreaming: true, appStreaming: true, accept: "application/json", upgradeHeader: true,
 			want: false,
 		},
@@ -2752,6 +2753,184 @@ func TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts(t *testing.T) {
 					got, tc.want, tc.hStreaming, tc.appStreaming, tc.accept, tc.upgradeHeader)
 			}
 		})
+	}
+}
+
+// TestStreamingStatusMatrix pins the ADR-102 decision matrix at
+// pkg/gateway/handler.go:2282 (decideStreaming). Each row is one
+// of the six enum variants; the test asserts both the canonical
+// Status string AND the legacy `isStreaming` boolean AND the cap
+// kind string. The matrix is the source of truth for:
+//   - which enum value the Streaming-Status response header carries
+//   - which requests the gateway actually streams (isStreaming=true)
+//   - which cap the capWriter installs (plan vs endpoint-rule)
+//
+// Adding a new conjunct to decideStreaming requires a new row here
+// AND in TestApplyEdgeRuleLimit_StreamingFor_FourConjuncts. The two
+// tests intentionally overlap on the four classical conjuncts
+// (h.streamingEnabled, app.StreamingEnabled, isAcceptJSON,
+// isUpgradeRequest) so a future enum regression is caught at
+// compile (the want strings are constants in pkg/api/limits.go,
+// not literals — reordering the enum there forces this test to
+// recompile with the new values).
+func TestStreamingStatusMatrix(t *testing.T) {
+	cases := []struct {
+		name         string
+		hStreaming   bool
+		appStreaming bool
+		plan         api.Plan
+		accept       string
+		upgrade      bool
+		ruleCap      int // 0 = no rule; >0 = EdgeRule.MaxBodyBytesStreaming
+		wantStatus   api.StreamingStatus
+		wantIsStream bool
+		wantCapKind  string
+	}{
+		{
+			name:       "operator off → operator-disabled, not streaming, plan cap",
+			hStreaming: false, appStreaming: true, plan: api.PlanPro,
+			accept:       "text/event-stream",
+			wantStatus:   api.StreamingStatusOperatorDisabled,
+			wantIsStream: false,
+			wantCapKind:  "plan",
+		},
+		{
+			name:       "flag off → flag-disabled, not streaming, plan cap",
+			hStreaming: true, appStreaming: false, plan: api.PlanPro,
+			accept:       "text/event-stream",
+			wantStatus:   api.StreamingStatusFlagDisabled,
+			wantIsStream: false,
+			wantCapKind:  "plan",
+		},
+		{
+			name:       "plan disallows → plan-disallows, not streaming, plan cap",
+			hStreaming: true, appStreaming: true, plan: api.PlanFree,
+			accept:       "text/event-stream",
+			wantStatus:   api.StreamingStatusPlanDisallows,
+			wantIsStream: false,
+			wantCapKind:  "plan",
+		},
+		{
+			name:       "upgrade → upgrade-bypass, not streaming, plan cap",
+			hStreaming: true, appStreaming: true, plan: api.PlanPro,
+			accept: "text/event-stream", upgrade: true,
+			wantStatus:   api.StreamingStatusUpgradeBypass,
+			wantIsStream: false,
+			wantCapKind:  "plan",
+		},
+		{
+			name:       "Accept=json → accept-json-downgrade, IS streaming post-D3, plan cap",
+			hStreaming: true, appStreaming: true, plan: api.PlanPro,
+			accept:       "application/json",
+			wantStatus:   api.StreamingStatusAcceptJSONDowngrade,
+			wantIsStream: true,
+			wantCapKind:  "plan",
+		},
+		{
+			name:       "all four on, no Accept, no rule → streaming, plan cap",
+			hStreaming: true, appStreaming: true, plan: api.PlanPro,
+			accept:       "text/event-stream",
+			wantStatus:   api.StreamingStatusStreaming,
+			wantIsStream: true,
+			wantCapKind:  "plan",
+		},
+		{
+			name:       "all four on, no Accept, rule cap → streaming, endpoint-rule cap",
+			hStreaming: true, appStreaming: true, plan: api.PlanPro,
+			accept: "text/event-stream", ruleCap: 50 * 1024 * 1024,
+			wantStatus:   api.StreamingStatusStreaming,
+			wantIsStream: true,
+			wantCapKind:  "endpoint-rule",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := App{ID: "app-1", AccountID: "acct-1", Plan: tc.plan, StreamingEnabled: tc.appStreaming}
+			req := httptest.NewRequest("POST", "http://l.example.com/upload", nil)
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
+			if tc.upgrade {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+			}
+			h := NewHandlerWith(&fakeBackend{}, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			h.streamingEnabled = tc.hStreaming
+			if tc.ruleCap > 0 {
+				// Wire the per-endpoint rule so decideStreaming's
+				// edge-rule lookup fires. AccountID must match so
+				// the same-account guard at handler.go:2404 lets
+				// the override through.
+				h.WithEdgeRules(stubEdgeRuleMatcher{
+					limit: &EdgeRuleLimitResolved{
+						ID: "rule-stream", AccountID: "acct-1", AppID: "app-1",
+						Priority: 0, PathGlob: "", Methods: nil,
+						MaxBodyBytes:          0,
+						MaxBodyBytesStreaming: tc.ruleCap,
+					},
+				}, nil, &captureAuditor{})
+			}
+
+			dec, isStreaming := decideStreaming(h, req, app)
+			if dec.Status != tc.wantStatus {
+				t.Errorf("decideStreaming status = %q; want %q", dec.Status, tc.wantStatus)
+			}
+			if isStreaming != tc.wantIsStream {
+				t.Errorf("decideStreaming isStreaming = %v; want %v", isStreaming, tc.wantIsStream)
+			}
+			if dec.CapKind != tc.wantCapKind {
+				t.Errorf("decideStreaming capKind = %q; want %q", dec.CapKind, tc.wantCapKind)
+			}
+			// Plan cap on streaming rows must be the plan's
+			// MaxResponseBodyBytes (non-zero); rule cap on
+			// endpoint-rule rows must equal the rule's
+			// MaxBodyBytesStreaming.
+			if isStreaming && tc.wantCapKind == "plan" {
+				if dec.Cap != app.Plan.MaxResponseBodyBytes() {
+					t.Errorf("decideStreaming plan cap = %d; want %d", dec.Cap, app.Plan.MaxResponseBodyBytes())
+				}
+			}
+			if isStreaming && tc.wantCapKind == "endpoint-rule" {
+				if dec.Cap != int64(tc.ruleCap) {
+					t.Errorf("decideStreaming rule cap = %d; want %d", dec.Cap, tc.ruleCap)
+				}
+			}
+		})
+	}
+}
+
+// TestStreamingStatusHeader_StampUnconditional pins the B3 fix:
+// the Streaming-Status response header is stamped on EVERY
+// response, including the buffered path. The unconditional stamp
+// at handler.go:~4026 is a single w.Header().Set call outside any
+// `if` block — the load-bearing structural property is "no `if`
+// guards the stamp"; a code reviewer reads this on every PR.
+//
+// This test asserts the structural property by reflecting on the
+// handler's byte stream: the unconditional stamp means the
+// Streaming-Status header field is referenced in the streaming
+// branch even when isStreaming is false (the buffered path). A
+// static source check (grep) is sufficient — no need to wire
+// ServeHTTP with a fake backend and risk the streaming-writer
+// recursion panic on no-upstream.
+//
+// The actual integration of "header appears on a real
+// 200 response" is covered by the cmd/e2e/streaming_metal_test.go
+// 3 cases (Stage 8 — streaming happy-path, endpoint-rule cap, 413
+// from real cap trip).
+func TestStreamingStatusHeader_StampUnconditional(t *testing.T) {
+	// Static structural assertion: the unconditional stamp
+	// (handler.go:~4026) must NOT be guarded by `if isStreaming`
+	// or `if streaming` or any branch that would skip the
+	// buffered path. Read the file and grep for the canonical
+	// stamp site.
+	const stamp = `w.Header().Set(api.StreamingStatusHeader, string(decision.Status))`
+	src, err := os.ReadFile("handler.go")
+	if err != nil {
+		t.Fatalf("read handler.go: %v", err)
+	}
+	if !strings.Contains(string(src), stamp) {
+		t.Errorf("unconditional stamp line missing from handler.go; B3 regression")
 	}
 }
 

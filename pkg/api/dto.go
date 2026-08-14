@@ -3062,6 +3062,35 @@ type AppRoutesResponse struct {
 	CapHit bool `json:"cap_hit"`
 }
 
+// AppStreamingStatus is the per-request streaming classification
+// returned by GET /v1/apps/{slug}/streaming-cap (ADR-102 D6). It is
+// the wire-level mirror of pkg/gateway.(*Handler).decideStreaming —
+// a customer hitting this endpoint sees exactly what the gateway's
+// gate machine resolved for the next inbound request, with the same
+// status enum and the same effective cap.
+//
+// Status is one of the api.StreamingStatus* constants. CapKind
+// labels the cap source: "plan" means app.Plan.MaxResponseBodyBytes
+// (the buffered cap; for non-streaming statuses this is also the
+// streaming cap because no edge rule matched), "endpoint-rule"
+// means a kind=limit edge rule with a non-zero MaxBodyBytesStreaming
+// field matched and overrode the plan cap. CapKind is omitted from
+// the wire when there is no override so a customer whose plan cap
+// applied sees a clean three-field response.
+//
+// PlanAllowed + FlagEnabled mirror the two booleans that gated the
+// decision, so a customer can self-diagnose without a separate
+// GET /v1/apps/{slug} round-trip.
+type AppStreamingStatus struct {
+	AppID        string          `json:"app_id"`
+	Status       StreamingStatus `json:"status"`
+	EffectiveCap int64           `json:"effective_cap_bytes"`
+	PlanCap      int64           `json:"plan_cap_bytes"`
+	FlagEnabled  bool            `json:"flag_enabled"`
+	PlanAllowed  bool            `json:"plan_allowed"`
+	CapKind      string          `json:"cap_kind,omitempty"`
+}
+
 // --- Account-scoped metrics rollup (issue #393) --------------------------
 
 // AppsMetricsResponse is the rollup for GET /v1/apps/metrics?range=

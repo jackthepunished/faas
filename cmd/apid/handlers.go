@@ -197,6 +197,31 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	// plan_streaming_not_allowed). The Plan accessor keeps the
 	// fail-closed contract (pkg/api/limits.go) — Free's accessor
 	// returns false just like LimitsFor(false) would.
+	//
+	// ADR-102 D5: plan-gate at create-time. A Free customer
+	// POSTing streaming_enabled=true gets 403
+	// plan_streaming_not_allowed BEFORE the App is built — same
+	// shape as the PATCH-time gate (cmd/apid/handlers_ext.go:245).
+	// Without this gate a Free customer's create request would
+	// silently land as true (bypassing the Free-tier contract that
+	// StreamingResponseAllowed is supposed to enforce). The
+	// status code 403 mirrors UpdateApp exactly so the same
+	// CodePlanStreamingNotAllowed returns the same status on
+	// POST vs PATCH — telemetry collapsing on `code` is uniform.
+	//
+	// TODO(ADR-102-followup): add apps_streaming_enabled_plan_check
+	// Postgres CHECK constraint via NOT VALID + VALIDATE
+	// migrations once production telemetry confirms zero Free+
+	// streaming_enabled=true rows. Until then this runtime gate is
+	// the only enforcement; a direct-DB write or backup-restore
+	// can still violate the invariant. The follow-up ships a
+	// 1-cycle telemetry window after this PR lands.
+	if req.StreamingEnabled != nil && *req.StreamingEnabled && !acct.Plan.StreamingResponseAllowed() {
+		return state.App{}, api.NewProblem(http.StatusForbidden,
+			api.CodePlanStreamingNotAllowed,
+			"Streaming responses are not allowed on this plan",
+			"Free tier does not support per-app streaming; upgrade to Hobby or higher.")
+	}
 	streaming := acct.Plan.StreamingEnabled()
 	if req.StreamingEnabled != nil {
 		streaming = *req.StreamingEnabled

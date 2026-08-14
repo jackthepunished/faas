@@ -1428,6 +1428,58 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/streaming-cap:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppStreamingCap
+      summary: Per-app streaming classification probe (ADR-102 D6).
+      description: |
+        Returns the streaming-status enum (one of `streaming`,
+        `accept-json-downgrade`, `flag-disabled`, `plan-disallows`,
+        `operator-disabled`, `upgrade-bypass`) the gatewayd handler
+        would stamp on the `Streaming-Status` response header for a
+        representative request to this app, plus the effective
+        response-body cap (in bytes) and the per-gate flags.
+
+        The probe is a pure read against the apid cache (the
+        per-account `Plan` and the per-app `streaming_enabled`
+        flag). It does NOT dial gatewayd-internal — the operator
+        opt-in (`FAAS_GATEWAY_STREAMING` env) and per-edge-rule
+        cap override are gatewayd-side state, so `effective_cap_bytes`
+        reflects the plan cap (`cap_kind="plan"`) on every probe.
+        A customer evaluating "will my next request stream?" must
+        consider the operator-side flag separately; the canonical
+        signal is the `Streaming-Status` response header on a real
+        request, not this probe.
+
+        `status=plan-disallows` means the customer's plan tier
+        forbids `streaming_enabled=true`; the CreateApp gate (D5)
+        already returns 403 `CodePlanStreamingNotAllowed` so this
+        row should be unreachable from a properly-validated app,
+        but the probe still reflects the persisted state for
+        audits and pinned-SDK migrations.
+      responses:
+        '200':
+          description: The streaming classification for the app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppStreamingStatus'
+              example:
+                app_id: 11111111-1111-1111-1111-111111111111
+                status: streaming
+                effective_cap_bytes: 104857600
+                plan_cap_bytes: 104857600
+                flag_enabled: true
+                plan_allowed: true
+                cap_kind: plan
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/slo:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -11113,6 +11165,78 @@ components:
           items: { $ref: '#/components/schemas/ThrottleSuggestionRow' }
           x-since: "2026-08"
           x-issue: "881"
+
+    AppStreamingStatus:
+      description: |
+        Per-app streaming classification (ADR-102 D6). The probe
+        returns the same `Streaming-Status` enum value the
+        gatewayd handler would stamp on the response header for a
+        representative request to this app, plus the effective
+        response-body cap and the per-gate flags that produced it.
+
+        `status` values (closed enum, see `pkg/api/limits.go`):
+
+          - `streaming` — request will stream. `effective_cap_bytes`
+            is the cap `capWriter` will enforce.
+          - `accept-json-downgrade` — pre-D3 customers with
+            `Accept: application/json` would have been buffered.
+            Post-D3 (this PR), the request streams regardless of
+            Accept; the enum variant survives one cycle so pinned
+            SDKs can grep for it.
+          - `flag-disabled` — `streaming_enabled=false` on the app.
+          - `plan-disallows` — plan tier forbids `streaming_enabled=true`;
+            CreateApp (D5) already returns 403 on this combination,
+            so this value should be unreachable on a properly-validated
+            app.
+          - `operator-disabled` — operator opt-in env is off; visible
+            only on the gatewayd side, not this probe.
+          - `upgrade-bypass` — request is an HTTP/1.1 Upgrade (e.g.
+            WebSocket) and bypasses the streaming path.
+
+        `effective_cap_bytes` is the plan cap (`cap_kind="plan"`)
+        on every probe in this PR. The per-edge-rule override lives
+        in gatewayd state and is not part of the apid cache; a
+        customer who needs the live cap fires a real request and
+        reads the `Streaming-Status` response header.
+      type: object
+      required: [app_id, status, effective_cap_bytes, plan_cap_bytes, flag_enabled, plan_allowed]
+      properties:
+        app_id: {type: string, x-since: "2026-08", x_issue: "102"}
+        status:
+          type: string
+          enum: [streaming, accept-json-downgrade, flag-disabled, plan-disallows, operator-disabled, upgrade-bypass]
+          x-since: "2026-08"
+          x_issue: "102"
+        effective_cap_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-since: "2026-08"
+          x_issue: "102"
+        plan_cap_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-since: "2026-08"
+          x_issue: "102"
+        flag_enabled:
+          type: boolean
+          x-since: "2026-08"
+          x_issue: "102"
+        plan_allowed:
+          type: boolean
+          x-since: "2026-08"
+          x_issue: "102"
+        cap_kind:
+          type: string
+          enum: [plan, endpoint-rule, none]
+          x-since: "2026-08"
+          x_issue: "102"
+          description: |
+            `plan` is the only value this probe ever returns in
+            this PR. The endpoint-rule and none values are reserved
+            for the future gatewayd-side dial path described in
+            `cmd/apid/handlers_streaming_cap.go`.
 
     ListInstancesResponse:
       description: |

@@ -1436,6 +1436,118 @@ func TestCmdAppDispatch_RoutesSubcommandSingular(t *testing.T) {
 	}
 }
 
+// --- apps streaming-cap <slug> dispatch (ADR-102 D6) ---
+
+// TestCmdAppsDispatch_StreamingCapSubcommand exercises the
+// `gregale apps streaming-cap <slug>` arm added in ADR-102 D6.
+// Drives through run() end-to-end so the dispatcher + leaf are
+// both exercised, and asserts the hit-path is
+// /v1/apps/<slug>/streaming-cap — same as the singular form
+// `gregale app <slug> streaming-cap` so the two dispatch arms
+// converge on the same SDK call.
+//
+// Mirrors TestCmdAppsDispatch_RoutesSubcommand verbatim so a
+// reviewer can compare the two side-by-side. The fixture response
+// exercises the streaming / plan-cap / flag-enabled portion of
+// the DTO; the no-flag, no-edge-rule path covers all the fields
+// the SDK currently exposes.
+func TestCmdAppsDispatch_StreamingCapSubcommand(t *testing.T) {
+	resetJSONOut(t)
+	var hit string
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.Path
+		writeJSONTest(w, api.AppStreamingStatus{
+			AppID:        "app-uuid-1",
+			Status:       api.StreamingStatusStreaming,
+			EffectiveCap: 104857600,
+			PlanCap:      104857600,
+			FlagEnabled:  true,
+			PlanAllowed:  true,
+			CapKind:      "plan",
+		})
+	}))
+	defer sink.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", sink.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := run([]string{"apps", "streaming-cap", "demo"}); code != 0 {
+		t.Errorf("run(apps streaming-cap demo) = %d, want 0", code)
+	}
+	if hit != "/v1/apps/demo/streaming-cap" {
+		t.Errorf("apps streaming-cap demo hit %q, want /v1/apps/demo/streaming-cap", hit)
+	}
+}
+
+// TestCmdAppDispatch_StreamingCapSubcommandSingular exercises
+// the `gregale app <slug> streaming-cap` arm added in ADR-102 D6.
+// Same wire path as the plural form; the two should converge on
+// the same SDK call so a dashboard-redirect or alias wouldn't
+// drift the wire surface.
+func TestCmdAppDispatch_StreamingCapSubcommandSingular(t *testing.T) {
+	resetJSONOut(t)
+	var hit string
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.Path
+		writeJSONTest(w, api.AppStreamingStatus{
+			AppID:        "app-uuid-1",
+			Status:       api.StreamingStatusFlagDisabled,
+			EffectiveCap: 104857600,
+			PlanCap:      104857600,
+			FlagEnabled:  false,
+			PlanAllowed:  true,
+			CapKind:      "plan",
+		})
+	}))
+	defer sink.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", sink.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := run([]string{"app", "demo", "streaming-cap"}); code != 0 {
+		t.Errorf("run(app demo streaming-cap) = %d, want 0", code)
+	}
+	if hit != "/v1/apps/demo/streaming-cap" {
+		t.Errorf("app demo streaming-cap hit %q, want /v1/apps/demo/streaming-cap", hit)
+	}
+}
+
+// TestCmdAppsDispatch_StreamingCapNoSlugDoesNotPanic is the
+// no-slug-fallthrough regression test for the streaming-cap arm.
+// Mirrors TestCmdAppsDispatch_RoutesNoSlugDoesNotPanic — the
+// streaming-cap dispatcher arm must bounds-check args[2] the same
+// way so a `gregale apps streaming-cap` invocation falls through
+// to the default cmdApps() path WITHOUT panicking on args[2].
+//
+// Same accept-any-non-panic shape as the routes counterpart: the
+// load-bearing invariant is "no panic" because the dispatcher has
+// both fall-through paths (cmdApps default, or leaf's slug==""
+// usage hint) available after the fix, and pinning a specific exit
+// code would over-specify.
+func TestCmdAppsDispatch_StreamingCapNoSlugDoesNotPanic(t *testing.T) {
+	resetJSONOut(t)
+	// Panic guard is the load-bearing assertion. If the bounds
+	// check regresses and args[2] is read on an empty slice, this
+	// defer catches it.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("run(apps streaming-cap no-slug) panicked: %v", r)
+		}
+	}()
+	// Wire a fake API so cmdApps() fallback (if it lands there)
+	// has a 200 path and exits 0. Empty body simulates the
+	// "no apps yet" list response.
+	f := newFakeAPI(t, `[]`, http.StatusOK)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", f.srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	code := run([]string{"apps", "streaming-cap"})
+	if code == 0 {
+		t.Logf("got exit 0 (dispatcher fell through to cmdApps on no-slug); acceptable")
+	}
+}
+
 // TestCmdAppsDispatch_RoutesNoSlugDoesNotPanic is the
 // regression test for the CodeQL off-by-one finding (alerts
 // #208 + #209 at cmd/gregale/main.go:187, PR-B1). Before

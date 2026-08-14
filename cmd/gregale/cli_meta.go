@@ -169,6 +169,7 @@ var cliCommands = []cliCommand{
 		Subcommands: []cliSub{
 			{Name: "ls", Short: "Alias for the default list action"},
 			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
+			{Name: "streaming-cap", Short: "Per-app streaming classification probe (ADR-102 D6)"},
 			{Name: "-q", Short: "Delete one app (positional: <slug>)"},
 			{Name: "--quiet", Short: "Delete one app (positional: <slug>)"},
 		},
