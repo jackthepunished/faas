@@ -266,6 +266,16 @@ func (p *Probe) Run(ctx context.Context) (int, error) {
 	return written, firstErr
 }
 
+// codeql[go/disabled-certificate-check] false-positive: ProbeOnce
+// intentionally disables cert validation because the probe measures
+// TLS-handshake latency, not cert trust. The customer's TLS client
+// is the trust boundary. Without InsecureSkipVerify the probe aborts
+// on every cert-mismatch endpoint and the data_upstream_probes.ok
+// counter stays zero, which defeats schedd's chooser bias (C6).
+// ServerName stays empty so SNI is the dial-target hash, not the
+// plaintext host. ADR-098 §11 invariant. Mirrors the established
+// suppression pattern at pkg/reqbudget/middleware.go:261.
+//
 // ProbeOnce runs a single dial + TLS handshake against the
 // target. The result is the per-row payload
 // data_upstream_probes writes. The probe is TCP-only
@@ -323,17 +333,6 @@ func (p *Probe) ProbeOnce(ctx context.Context, tgt state.DataUpstreamTarget) Pro
 	// floor after the handshake — it never reaches the metric
 	// surface, the audit kind, the pg_notify payload, or any
 	// slog line (ADR-098 §11 invariant).
-	//
-	// codeql[go/disabled-certificate-check]: InsecureSkipVerify is
-	// deliberately true on the probe path. The probe measures
-	// TLS-handshake latency, not cert trust — the customer's TLS
-	// client is the trust boundary. Without InsecureSkipVerify the
-	// probe would abort on every cert-mismatch endpoint and the
-	// data_upstream_probes.ok counter would be permanently zero,
-	// which would defeat schedd's chooser bias (C6). The same
-	// rationale is documented at the ADR-098 §11 invariant block
-	// above. ServerName is left empty so the SNI remains the dial
-	// target's host hash, not the plaintext host.
 	tlsConfig := &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
