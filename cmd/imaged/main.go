@@ -41,6 +41,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/rootfs"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/secretscan"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -272,6 +273,15 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// installation gap it actually is.
 		WithGrypeRun(makeGrypeRunner(os.Getenv("FAAS_GRYPE_BIN"))).
 		WithSyftRun(makeSyftRunner(os.Getenv("FAAS_SYFT_BIN"))).
+		// PR-A: layer-side secret-scan walker. Wired
+		// unconditionally so the default in
+		// pkg/imaged/secretscan.go::runDeployLayerSecretScan
+		// fires — the same engine cmd/apid
+		// (cmd/apid/secretscan.go::scanExtractedTreeSecrets)
+		// uses, so the apid source-tree path and the imaged
+		// image-layer path agree on patterns + severities.
+		// Loud-fail on findings — see handler.go runDeployLayerSecretScan.
+		WithSecretScanRun(makeSecretScanRunner()).
 		// ADR-053: imaged asks vmmd to loopback-mount the parent
 		// ext4 read-only for the parent-ref staging path. The
 		// client is constructed eagerly but the gRPC conn is lazy
@@ -553,4 +563,16 @@ func makeSyftRunner(bin string) func(ctx context.Context, dir string) ([]byte, e
 		}
 		return imaged.RunSyft(ctx, dir)
 	}
+}
+
+// makeSecretScanRunner wires the package-level default walker
+// (PR-A, imaged-layer secret scan). No subprocess binary to
+// configure — the walker is a pure-Go filepath.WalkDir + secretscan.ScanFile
+// caller (mirrors cmd/apid::scanExtractedTreeSecrets). The harness
+// exists for symmetry with makeGrypeRunner / makeSyftRunner so a
+// future operator override (e.g. a `FAAS_SECRETSCAN_BIN` shim
+// against a custom scanner) can land here without churning the
+// WithSecretScanRun wiring in main().
+func makeSecretScanRunner() func(ctx context.Context, dir, layer string) ([]secretscan.Finding, error) {
+	return imaged.RunDeployLayerSecretScan
 }

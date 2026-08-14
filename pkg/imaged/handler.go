@@ -28,6 +28,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/rootfs"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/secretscan"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -177,6 +178,23 @@ type Handler struct {
 	// still succeeds (the SBOM is observational, not a deployment
 	// precondition — schema §4.2).
 	syftRun func(ctx context.Context, dir string) ([]byte, error)
+	// secretScanRun is the post-build secretscan walker used at the
+	// end of buildImageLayer / buildSidecarLayers to detect secrets
+	// baked into the assembled image (PR-A, closes the v2 source-tree
+	// gap for OCI image bytes — Dockerfile ENV, --build-arg, COPY'd
+	// .env files all slip past cmd/apid source-tree scanning but
+	// land baked into the image). Wired via WithSecretScanRun; nil
+	// = default to a filepath.WalkDir + secretscan.ScanFile walker
+	// (mirrors cmd/apid::scanExtractedTreeSecrets). Tests inject a
+	// stub returning canned findings so the deploy-fail path is
+	// hermetic and doesn't require secretscan.ScanFile to actually
+	// match. Loud-fail posture: a finding stamps the audit row via
+	// state.Store.UpsertDeploymentSecretFindings and the deploy
+	// transitions to state.DeployFailed with errImageSecretDetected.
+	// The grype CVE path (runDeployScan above) is best-effort by
+	// design (ADR-075 AC #4); the secret path is intentionally NOT
+	// — secrets are a security boundary, not metadata.
+	secretScanRun func(ctx context.Context, dir, layer string) ([]secretscan.Finding, error)
 	// vmmClient (ADR-053) is the imaged-side gRPC client to vmmd
 	// used by the parent-ref staging branch of EnsureBaseExt4. vmmd
 	// owns the loopback mount; imaged is not root (User=faas-imaged
@@ -519,6 +537,39 @@ func (h *Handler) WithSyftRun(fn func(ctx context.Context, dir string) ([]byte, 
 	return h
 }
 
+// WithSecretScanRun injects the post-build secretscan walker
+// (PR-A, imaged-layer secret scan). Mirrors WithGrypeRun's
+// fluent setter shape. Tests wire a stub returning canned
+// secretscan.Finding slices so the deploy-fail path is hermetic.
+// Production leaves the field nil so the default walker in
+// pkg/imaged/secretscan.go::runDeployLayerSecretScan fires —
+// which uses the same pkg/secretscan.IsTextFile + ScanFile
+// engine as the cmd/apid source-tree path so the two paths
+// agree on patterns, providers, and severities.
+//
+// The "layer" argument on the callback is the per-walk source
+// label ("app" | "sidecar-<slug>") that gets stamped onto every
+// finding in the audit row — the API surface needs the label
+// to know whether a finding is in the main image or in a
+// sidecar (different blast radius).
+func (h *Handler) WithSecretScanRun(fn func(ctx context.Context, dir, layer string) ([]secretscan.Finding, error)) *Handler {
+	h.secretScanRun = fn
+	return h
+}
+
+// runSecretScan dispatches to the wired secretScanRun callback
+// when present, else falls back to the package-level default
+// walker. Mirrors runGrype above (handler.go:579-584). The
+// "layer" argument is the per-walk source label forwarded into
+// the runner so the audit row can attribute findings to the
+// right image segment.
+func (h *Handler) runSecretScan(ctx context.Context, dir, layer string) ([]secretscan.Finding, error) {
+	if h.secretScanRun != nil {
+		return h.secretScanRun(ctx, dir, layer)
+	}
+	return runDeployLayerSecretScan(ctx, dir, layer)
+}
+
 // WithVMMClient wires the vmmd gRPC client used by the
 // ADR-053 parent-ref staging branch of EnsureBaseExt4. The
 // client is nil-safe: the legacy "apply all layers" path
@@ -815,6 +866,119 @@ func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.De
 		"deployment", dep.ID, "app", app.Slug,
 		"critical", result.Critical, "high", result.High,
 		"medium", result.Medium, "low", result.Low, "unknown", result.Unknown)
+}
+
+// errImageSecretDetected is the typed sentinel runDeployLayerSecretScan
+// returns to markDeployFailed on a finding. Mirrors the
+// errStatefulViolation style in pkg/imaged/base.go (G13 closure) —
+// markDeployFailed lifts the sentinel to the wire-stable code
+// "image_secret_detected" via the error_code column. ADR-075 ships
+// the same pattern for grype-side failures; this is the secret-side
+// analog. Free-text column (migration 00021), no schema widening
+// required.
+var errImageSecretDetected = errors.New("imaged: secret-shaped values detected in image layer")
+
+// runDeployLayerSecretScan runs the post-build secretscan walker
+// against the per-deploy ext4 and stamps the audit row on findings.
+// Mirrors runDeployScan structurally (same stageScanExt4 helper,
+// same UpsertDeployment* seam, same observation log line) but the
+// posture is loud-fail: a single finding fails the deploy with
+// errImageSecretDetected. The grype CVE path is best-effort by
+// design (ADR-075 AC #4 — don't block deploys on supply-chain
+// metadata); the secret path is intentionally NOT — secrets are a
+// security boundary, not metadata.
+//
+// `layer` is the per-walk source label ("app" for the main image,
+// "sidecar-<slug>" for each sidecar). It's stamped into every
+// SecretFinding.Layer in the audit row so the dashboard can render
+// which ext4 the finding came from.
+//
+// Returns true iff the deploy was marked failed (the caller MUST
+// short-circuit the snapshotting transition in that case).
+//
+// Failure modes:
+//
+//   - storageFor error or stageScanExt4 error: log WARN, skip the
+//     scan. Best-effort here matches runDeployScan — if we can't
+//     even stage the ext4, the build itself is already in trouble,
+//     and we don't want to mask the root cause with a noise
+//     secret-scan failure. The build error path will surface
+//     downstream. Returns false (deploy continues).
+//   - runSecretScan returns walk-level error: log WARN + return
+//     false. Best-effort matches cmd/apid::scanExtractedTreeSecrets.
+//   - runSecretScan returns findings > 0: STAMP the audit row
+//     (best-effort on the write itself, but the deploy MUST fail),
+//     then markDeployFailed with errImageSecretDetected. Returns
+//     true so the caller short-circuits the snapshotting transition.
+//
+// The markDeployFailed path is what guards the security boundary;
+// even if the audit-row write fails (DB blip, schema drift), the
+// deploy fails loudly so the customer's next attempt sees a clean
+// state.
+func (h *Handler) runDeployLayerSecretScan(ctx context.Context, app state.App, dep state.Deployment, layer string) (failed bool) {
+	if h.store == nil || h.log == nil {
+		// Defensive: tests that build a Handler without wiring
+		// store/log skip the scan entirely (no row to write, no
+		// log channel). Production wires both at cmd/imaged wiring
+		// so the nil branches are unreachable in prod.
+		return false
+	}
+	start := time.Now()
+	be, err := h.storageFor()
+	if err != nil {
+		h.log.Warn("imaged: layer secret scan skipped, storageFor",
+			"deployment", dep.ID, "app", app.Slug, "layer", layer, "err", err)
+		return false
+	}
+	scanDir, cleanup, err := h.stageScanExt4(ctx, be, app, dep)
+	if err != nil {
+		h.log.Warn("imaged: layer secret scan skipped, stage",
+			"deployment", dep.ID, "app", app.Slug, "layer", layer, "err", err)
+		return false
+	}
+	defer cleanup()
+	findings, walkErr := h.runSecretScan(ctx, scanDir, layer)
+	if walkErr != nil {
+		// Walk-level error: log + return. The build itself is
+		// unaffected — secrets are a security scan, not a deploy
+		// precondition. (Loud-fail posture is for PATTERN-LEVEL
+		// findings, not walk errors. cmd/apid::scanExtractedTreeSecrets
+		// makes the same distinction.)
+		h.log.Warn("imaged: layer secret scan walk failed",
+			"deployment", dep.ID, "app", app.Slug, "layer", layer,
+			"err", walkErr, "elapsed", time.Since(start))
+		return false
+	}
+	if len(findings) == 0 {
+		h.log.Info("imaged: layer secret scan clean",
+			"deployment", dep.ID, "app", app.Slug, "layer", layer,
+			"elapsed", time.Since(start))
+		// Stamp the "scanned clean" row for parity with the
+		// hit branch — the dashboard renders "scan complete · 0
+		// findings" rather than "scan pending". PR-A only — a
+		// future change could skip the clean-stamp on hot paths
+		// if the jsonb write cost shows up in profiling.
+		scannedAt := time.Now().UTC()
+		upsertDeploymentSecretFindings(ctx, h.store, dep.ID, nil, layer, dep.ImageDigest, scannedAt, h.log)
+		return false
+	}
+	// Findings > 0. Stamp the audit row (best-effort) and
+	// fail the deploy loudly. The deploy's snapshotting
+	// transition does NOT fire — handleDeployment returns
+	// errImageSecretDetected which the caller treats as a
+	// terminal failure.
+	scannedAt := time.Now().UTC()
+	upsertDeploymentSecretFindings(ctx, h.store, dep.ID, findings, layer, dep.ImageDigest, scannedAt, h.log)
+	if markErr := h.markDeployFailed(ctx, dep.ID, errImageSecretDetected, "image-layer secret detected"); markErr != nil {
+		h.log.Warn("imaged: mark deploy failed on layer secret",
+			"deployment", dep.ID, "app", app.Slug, "layer", layer,
+			"err", markErr)
+	} else {
+		h.log.Warn("imaged: layer secret scan rejected deploy",
+			"deployment", dep.ID, "app", app.Slug, "layer", layer,
+			"findings", len(findings), "elapsed", time.Since(start))
+	}
+	return true
 }
 
 // storageFor returns the wired StorageBackend, building a default
@@ -1136,6 +1300,23 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 	default:
 		if err := h.buildImageLayer(ctx, app, dep, acct); err != nil {
 			return err
+		}
+		// Per-deploy secret-can-on-image scan (PR-A, imaged-layer
+		// secret scan). Runs AFTER buildImageLayer has stamped
+		// SetDeploymentRootfs (i.e. the per-app ext4 is on disk) and
+		// BEFORE the grype CVE scan + the pending→snapshotting
+		// transition. Loud-fail posture: a finding marks the deploy
+		// row failed with errImageSecretDetected + stamps the audit
+		// row via state.Store.UpsertDeploymentSecretFindings, and we
+		// return the wrapped error so the snapshotting transition
+		// does NOT fire. Function deploys are out of scope (they
+		// don't have a Dockerfile path — the runner injects the
+		// only customer-tarball contents, scanned at apid time).
+		// runDeployLayerSecretScan is best-effort on the walk /
+		// audit-row write; the FAILURE-PATH markDeployFailed is
+		// what guards the security boundary.
+		if h.runDeployLayerSecretScan(ctx, app, dep, "app") {
+			return errImageSecretDetected
 		}
 	}
 
@@ -1635,6 +1816,18 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 		}); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q stamp: %s", sc.Name, err.Error()))
 			return fmt.Errorf("imaged: sidecar %q stamp: %w", sc.Name, err)
+		}
+		// Per-sidecar secret-can-on-image scan (PR-A). Mirrors the
+		// main-image scan above — same engine, same loud-fail
+		// posture, same UpsertDeploymentSecretFindings audit-row
+		// seam. The "layer" label is "sidecar-<slug>" so the
+		// dashboard can attribute findings to the right sidecar.
+		// Returns errImageSecretDetected on a finding so the
+		// buildSidecarLayers caller short-circuits the rest of the
+		// sidecar loop (a partial sidecar set is worse than a clean
+		// failure — see the comment block above).
+		if h.runDeployLayerSecretScan(ctx, app, dep, "sidecar-"+sc.Name) {
+			return errImageSecretDetected
 		}
 		h.log.Info("imaged: build sidecar layer",
 			"app", app.Slug, "sidecar", sc.Name, "kind", sc.Type,

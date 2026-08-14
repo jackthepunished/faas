@@ -892,6 +892,11 @@ func (s *server) handler() http.Handler {
 	// not-yet-scanned or cross-account; IDOR posture
 	// identical to getDeployment above.
 	mux.HandleFunc("GET /v1/deployments/{id}/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentScan))))
+	// PR-A: per-deploy image-layer secret-scan audit surface.
+	// Mirrors /scan — same auth chain (authLimited + requireMFA +
+	// read scope), same IDOR posture (cross-account → 404), same
+	// 404-on-pending drilldown shape.
+	mux.HandleFunc("GET /v1/deployments/{id}/secret-scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentSecretScan))))
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamDeploymentLogs))))
 	// Issue #557 closure / ADR-072 — PATCH the per-deployment floor
 	// (MinInstances). Reuses the deploy-write scope (the only mutable

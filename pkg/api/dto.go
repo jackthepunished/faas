@@ -1387,6 +1387,17 @@ type DeploymentResponse struct {
 	// rows). Always non-nil for post-feature rows in any of
 	// the {pending, complete, failed, skipped} states.
 	Scan *ScanResult `json:"scan,omitempty"`
+	// SecretScan is the per-deploy secret-scan audit row (PR-A,
+	// imaged-layer; distinct from the cmd/apid source-tree path).
+	// Mirrors the Scan field shape: nil when the row has not
+	// been scanned yet, non-nil with Findings=[] for a clean
+	// scan, non-nil with Findings=[…] for a hit. Read by the
+	// dashboard's "secret scan" card and the CLI's
+	// `--show-secret-scan` flag. The `omitempty` matches Scan so
+	// absence == "scan pending" on both surfaces — the
+	// /v1/deployments/{id}/secret-scan route is the
+	// 404-on-missing drilldown.
+	SecretScan *SecretScanResult `json:"secret_scan,omitempty"`
 	// ParkedReason / ParkedAt (issue #554 / ADR-079 follow-up)
 	// surface the per-deployment parking columns from migration
 	// 00157 on the GET /v1/deployments/{id} response. omitempty
