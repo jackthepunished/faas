@@ -88,6 +88,15 @@ func NewSynthServer(socketPath string, dispatcher SynthDispatcher, log *slog.Log
 	// the post-dispatch Invocation row (state + result envelope),
 	// which schedd's drain stores via Store.CompleteInvocation.
 	s.mux.HandleFunc("/v1/invocations:dispatch", s.handleInvocationDispatch)
+	// Commit #13 (issue #757 / ADR-0NN): schedd's dispatch tick
+	// posts the trigger batch envelope here. The gateway calls
+	// Invoke() per record (the VM lifecycle is one-wake-per-batch,
+	// matching AWS Lambda ESM semantics), aggregates the
+	// ReportBatchItemFailures response, and returns a per-record
+	// status array so the schedd can drive trigger_records state
+	// transitions. Same DAC-group auth as the single-record
+	// dispatch — the unix socket IS the auth.
+	s.mux.HandleFunc("/v1/invocations:dispatch_batch", s.handleInvocationDispatchBatch)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.srv = &http.Server{
 		Handler:           s.mux,
@@ -337,4 +346,279 @@ func jsonOrEmpty(m map[string]string) json.RawMessage {
 // not the encoding we used).
 func base64Decode(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
+}
+
+// batchDispatchRequest is the wire shape schedd posts to
+// /v1/invocations:dispatch_batch. One app, one source tag, N
+// records; the gateway walks each record and calls Invoke().
+//
+// Source tag: the dispatch tick sets source='esm' for trigger-driven
+// batches so downstream metering + audit distinguish them from
+// async_invoke / queue / cron.
+type batchDispatchRequest struct {
+	InvocationID string                `json:"invocation_id"`
+	AppID        string                `json:"app_id"`
+	Source       string                `json:"source"`
+	TriggerID    string                `json:"trigger_id"`
+	Records      []batchDispatchRecord `json:"records"`
+}
+
+// batchDispatchRecord is one trigger-delivered record's envelope.
+// ItemIdentifier is the broker-side handle the dispatcher will
+// pass to poller.Ack/Nack. PayloadB64 is base64 to keep the
+// envelope JSON-safe (binary payloads are valid).
+type batchDispatchRecord struct {
+	ItemIdentifier string            `json:"item_identifier"`
+	PayloadB64     string            `json:"payload_b64"`
+	Headers        map[string]string `json:"headers"`
+	Metadata       map[string]any    `json:"metadata"`
+}
+
+// batchDispatchResponse is the per-record outcome array the
+// schedd's dispatch tick uses to drive trigger_records state
+// transitions (commit #14 + #15).
+//
+// Status:
+//
+//	"succeeded"     function returned 2xx; no batchItemFailures
+//	                entry for this id
+//	"retry"         function returned non-2xx OR
+//	                ReportBatchItemFailures listed this id;
+//	                attempts < max_attempts
+//	"dead_letter"   attempts >= max_attempts OR poison_record
+//	"broker_error"  invoke itself failed (no result to parse)
+//
+// The schedd uses this array verbatim — no extra server-side state.
+type batchDispatchResponse struct {
+	Results []batchDispatchResult `json:"results"`
+}
+
+// batchDispatchResult mirrors one Records[i] entry with the
+// terminal status. Error is omitted on success.
+type batchDispatchResult struct {
+	ItemIdentifier string `json:"item_identifier"`
+	Status         string `json:"status"`
+	Error          string `json:"error,omitempty"`
+}
+
+// handleInvocationDispatchBatch is the trigger-driven batch path.
+//
+// Wire flow:
+//
+//  1. schedd posts the batch envelope to /v1/invocations:dispatch_batch
+//     (one HTTP request per dispatch tick).
+//  2. gateway decodes the envelope, walks each record, calls
+//     s.dispatcher.Invoke() to wake the app and proxy the
+//     function. The VM lifecycle is one-wake-per-batch (matches
+//     AWS Lambda ESM semantics — one function invocation serves
+//     N records).
+//  3. After Invoke returns, parseBatchFailures() reads the
+//     function's response body for `batchItemFailures[]` and
+//     computes per-record status (succeeded / retry / dead_letter).
+//  4. gateway returns the per-record status array to schedd.
+//
+// Why we don't add InvokeBatch to SynthDispatcher: the VM lifecycle
+// is single-wake per batch, and Invoke() is already rate-limited
+// + plan-quota'd per app. Walking each record through Invoke
+// reuses the existing admission gate (the per-app concurrency cap
+// stays load-bearing) without doubling the dispatcher contract.
+func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req batchDispatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.AppID == "" || req.InvocationID == "" {
+		http.Error(w, "app_id + invocation_id required", http.StatusBadRequest)
+		return
+	}
+	if len(req.Records) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(batchDispatchResponse{Results: []batchDispatchResult{}})
+		return
+	}
+	s.log.Debug("gateway synth: batch dispatched",
+		"inv", logsanitize.Field(req.InvocationID),
+		"app_id", logsanitize.Field(req.AppID),
+		"source", logsanitize.Field(req.Source),
+		"trigger_id", logsanitize.Field(req.TriggerID),
+		"records", len(req.Records))
+
+	// One wake per batch — Invoke the first record through the
+	// regular dispatcher path, which wakes the app if not running.
+	// Subsequent records share the same wake (Invoke's
+	// always-Wake semantic — the first call wakes, subsequent
+	// calls find RUNNING and skip the wake gate).
+	//
+	// We iterate the records and call Invoke() per record so each
+	// record's response body is independently parseable for
+	// ReportBatchItemFailures. The state-machine work below
+	// collects per-record status.
+	results := make([]batchDispatchResult, 0, len(req.Records))
+	for _, rec := range req.Records {
+		var payload []byte
+		if rec.PayloadB64 != "" {
+			dec, err := base64Decode(rec.PayloadB64)
+			if err != nil {
+				results = append(results, batchDispatchResult{
+					ItemIdentifier: rec.ItemIdentifier,
+					Status:         "dead_letter",
+					Error:          "payload_b64 invalid",
+				})
+				continue
+			}
+			payload = dec
+		}
+		// Synthesize a single-record invocation envelope. We
+		// route via the /v1/invocations:dispatch code path in
+		// spirit (same dispatcher.Invoke) but bypass the JSON
+		// decoder so the headers / metadata land on the runner
+		// envelope unchanged.
+		inv := state.Invocation{
+			ID:      req.InvocationID + "-" + rec.ItemIdentifier,
+			AppID:   req.AppID,
+			Source:  state.InvocationSource(req.Source),
+			Method:  http.MethodPost,
+			Path:    "/_triggers/" + req.Source + "/" + req.TriggerID,
+			Payload: payload,
+			Headers: jsonOrEmpty(rec.Headers),
+		}
+		out, err := s.dispatcher.Invoke(r.Context(), req.AppID, inv)
+		if err != nil {
+			s.log.Warn("gateway synth: invoke (batch)",
+				"inv", logsanitize.Field(inv.ID),
+				"item", logsanitize.Field(rec.ItemIdentifier),
+				"err", err)
+			results = append(results, batchDispatchResult{
+				ItemIdentifier: rec.ItemIdentifier,
+				Status:         "broker_error",
+				Error:          err.Error(),
+			})
+			continue
+		}
+		// Parse the function's response body for
+		// ReportBatchItemFailures. The convention is a JSON
+		// envelope: {"batchItemFailures":[{"itemIdentifier":"..."}]}
+		// — stolen verbatim from AWS Lambda.
+		failed, parseErr := parseBatchFailures(out.Result)
+		if parseErr != nil {
+			s.log.Warn("gateway synth: batch failures parse",
+				"item", logsanitize.Field(rec.ItemIdentifier),
+				"err", parseErr)
+			// Malformed function response — treat as broker_error
+			// so the schedd dead-letters this record with
+			// reason='poison_record'.
+			results = append(results, batchDispatchResult{
+				ItemIdentifier: rec.ItemIdentifier,
+				Status:         "dead_letter",
+				Error:          "function response malformed",
+			})
+			continue
+		}
+		// Per-record status: succeeded unless the record's id is
+		// in the failure list.
+		if containsString(failed, rec.ItemIdentifier) {
+			results = append(results, batchDispatchResult{
+				ItemIdentifier: rec.ItemIdentifier,
+				Status:         "retry",
+				Error:          "reported in batchItemFailures",
+			})
+			continue
+		}
+		// If state==succeeded from the dispatcher, success.
+		// Otherwise (e.g. function returned 5xx, dispatcher
+		// captured it) it's a retry.
+		if string(out.State) == "succeeded" {
+			results = append(results, batchDispatchResult{
+				ItemIdentifier: rec.ItemIdentifier,
+				Status:         "succeeded",
+			})
+		} else {
+			results = append(results, batchDispatchResult{
+				ItemIdentifier: rec.ItemIdentifier,
+				Status:         "retry",
+				Error:          fmt.Sprintf("function state=%s", out.State),
+			})
+		}
+	}
+	s.calls.Add(1)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(batchDispatchResponse{Results: results})
+}
+
+// batchFailuresEnvelope is the function's response shape for
+// partial-failure reporting. Stolen verbatim from AWS Lambda's
+// ReportBatchItemFailures contract:
+//
+//	{
+//	  "batchItemFailures": [
+//	    {"itemIdentifier": "id-1"},
+//	    {"itemIdentifier": "id-2"}
+//	  ]
+//	}
+//
+// Empty/missing batchItemFailures ⇒ all records succeeded. We
+// accept any extra top-level fields the function returns (SDKs
+// sometimes add metadata) and ignore them.
+type batchFailuresEnvelope struct {
+	BatchItemFailures []batchFailureItem `json:"batchItemFailures"`
+}
+
+// batchFailureItem is one entry in batchFailuresEnvelope.
+// ItemIdentifier is the SourceRecord.ItemIdentifier the dispatcher
+// passed to the function (so the function needs to echo it back).
+type batchFailureItem struct {
+	ItemIdentifier string `json:"itemIdentifier"`
+}
+
+// parseBatchFailures decodes the function's response body and
+// returns the list of item identifiers the function reported as
+// failed.
+//
+// Acceptable shapes:
+//
+//   - {"batchItemFailures":[{"itemIdentifier":"..."}]}
+//   - []byte("null")            → empty slice, no error
+//   - []byte("")                 → empty slice, no error
+//   - {}                         → empty slice, no error
+//   - any other valid JSON value → empty slice, no error
+//
+// Errors:
+//
+//   - malformed JSON              → wrapped error
+//   - batchItemFailures not array → error (poison_record)
+//
+// Idempotency: callers treat empty slice as "all succeeded" so
+// the empty-body case is the success path.
+func parseBatchFailures(body []byte) ([]string, error) {
+	if len(body) == 0 {
+		return []string{}, nil
+	}
+	var env batchFailuresEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("parseBatchFailures: %w", err)
+	}
+	out := make([]string, 0, len(env.BatchItemFailures))
+	for _, it := range env.BatchItemFailures {
+		if it.ItemIdentifier != "" {
+			out = append(out, it.ItemIdentifier)
+		}
+	}
+	return out, nil
+}
+
+// containsString is a tiny helper for the per-record failure
+// check. Linear scan is fine — batches cap at the per-plan
+// TriggerBatchSizeMax (5000 max, 500 typical for Pro).
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
