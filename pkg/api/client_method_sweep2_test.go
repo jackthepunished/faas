@@ -309,6 +309,10 @@ func TestClientSweep2_NoArgMethods(t *testing.T) {
 			_, err := c.GetDeploymentScan(ctx, "d")
 			return err
 		}},
+		{"GetDeploymentSecretScan", obj.URL, func(t *testing.T, c *Client) error {
+			_, err := c.GetDeploymentSecretScan(ctx, "d")
+			return err
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

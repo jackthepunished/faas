@@ -520,6 +520,23 @@ func (c *Client) GetDeploymentScan(ctx context.Context, id string) (ScanResult, 
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/scan", nil, &out)
 }
 
+// GetDeploymentSecretScan returns the per-deploy image-layer
+// secret-scan payload (PR-A). Same IDOR posture as
+// GetDeploymentScan (404 on missing-deployment OR cross-account
+// OR scan-pending). The wire shape is SecretScanResult — a
+// closed-form {status, scanned_at, findings[], image_digest}
+// envelope where the findings carry the per-finding layer
+// label ("app" | "sidecar-<slug>") so the CLI / dashboard can
+// attribute findings to the right image segment.
+//
+// Status is the closed enum (complete | complete_with_redactions)
+// — distinct from the grype-side Status field on ScanResult
+// because the two pipelines stamp separate audit rows.
+func (c *Client) GetDeploymentSecretScan(ctx context.Context, id string) (SecretScanResult, error) {
+	var out SecretScanResult
+	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/secret-scan", nil, &out)
+}
+
 // PatchDeployment sets the per-deployment cold-wake floor override
 // (issue #557 closure / ADR-072). MinInstances is the only mutable
 // field on a deployment post-create — image / digest / overrides /

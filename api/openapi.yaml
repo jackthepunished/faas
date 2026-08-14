@@ -2864,6 +2864,60 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/deployments/{id}/secret-scan:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getDeploymentSecretScan
+      summary: Get per-deploy image-layer secret scan.
+      description: |
+        Returns the per-deploy secret-scan audit row (PR-A /
+        ADR-101). The scan runs on the per-app ext4 in imaged's
+        deploy-complete path (after `SetDeploymentRootfs`, before
+        the pending→snapshotting transition) using the same
+        `pkg/secretscan` engine the apid source-tree rejection
+        path uses — same patterns, same providers, same Severity
+        table, same snippet policy.
+
+        Status field is the closed enum:
+          - `complete` — image layer walked clean; `findings=[]`.
+            Stamped on every scan (clean OR hit) so the dashboard
+            renders the audit row immediately after the build.
+          - `complete_with_redactions` — at least one finding
+            landed in the audit row; `error_code =
+            'image_secret_detected'` on the deployment. The
+            deploy's pending→snapshotting transition does NOT
+            fire.
+
+        A 404 is returned when:
+          - the deployment row does not exist,
+          - the deployment belongs to a different account
+            (IDOR-safe; no account-existence leak),
+          - no scan has run yet (the deploy is still
+            mid-pipeline or the row predates PR-A entirely).
+
+        Each finding carries a `layer` label that attributes the
+        finding to the per-walk source (`app` for the main image,
+        `sidecar-<slug>` for each sidecar). Pre-PR-A rows
+        (rejected source-tree bytes via the v2 422 path) carry
+        `layer` empty or absent.
+      responses:
+        '200':
+          description: The typed secret-scan payload. Shape mirrors the `deployments.secret_findings` jsonb column.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretScanResult'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Deployment row missing, cross-account probe, or secret scan has not been stamped for this deploy yet (pre-PR-A rows return 404 because the `secret_findings` jsonb has never been written).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Builds (ADR-038, Tier 3 / issue #197 B3.10-read half) ───────────────
   # The provenance route is the only /v1/builds surface today.
   # deployments.id remains the parent resource; Build:read scope
@@ -8069,6 +8123,25 @@ components:
           pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
           description: "Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`."
           example: "staging"
+        secret_scan:
+          oneOf:
+            - $ref: '#/components/schemas/SecretScanResult'
+            - type: 'null'
+          description: |
+            Per-deploy secret-scan audit row (PR-A / ADR-101). Mirrors
+            the `scan` field shape — absent when the row has not been
+            scanned yet (deploy mid-pipeline or pre-PR-A), present
+            with `findings=[]` for a clean walk, present with
+            one-or-more entries for a hit. Read by the dashboard's
+            "secret scan" card and the CLI's `--show-secret-scan`
+            flag. Stamped both for the imaged-side layer walk (main
+            image + each sidecar; post-build, loud-fail on any
+            finding) and — forward-compat — for the apid-side
+            source-tree 422 path. Status closed-set the writer
+            stamps: "complete" (clean) | "complete_with_redactions"
+            (hit). The `image_digest` sub-field records which OCI
+            digest the imaged walk ran against; null on legacy
+            pre-PR-A rows. See `pkg/imaged/secretscan.go`.
 
     UpdateDeploymentRequest:
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
@@ -11638,15 +11711,20 @@ components:
       type: object
       description: |
         Per-line entry of `Problem.secret_findings` AND
-        `SecretScanResult.findings` (issue #862 + secret-scan v2).
-        The shape mirrors `pkg/secretscan.Finding` but is decoupled
-        so the wire schema can evolve independently of the scanner's
-        internal fields. `snippet` is the pre-truncated safe
-        representation (first 6 chars + "…" + last 4) — never the
-        raw value, matching the snippet policy documented in
-        `pkg/secretscan/scan.go`. Closed-set `provider` keys:
-        stripe_live, stripe_test, github_pat, aws_access, openai,
-        anthropic, private_key_block.
+        `SecretScanResult.findings` (issue #862 + secret-scan v2,
+        PR #873; PR-A 101 extends the surfaced shape via the new
+        `layer` field). The shape mirrors `pkg/secretscan.Finding`
+        but is decoupled so the wire schema can evolve
+        independently of the scanner's internal fields. `snippet`
+        is the pre-truncated safe representation (first 6 chars +
+        "…" + last 4) — never the raw value, matching the snippet
+        policy documented in `pkg/secretscan/scan.go`. Closed-set
+        `provider` keys: stripe_live, stripe_test, github_pat,
+        aws_access, openai, anthropic, private_key_block. The
+        optional `layer` field (PR-A) names the per-walk source
+        label — "app" for the main image, "sidecar-<slug>" for
+        each sidecar, or absent for the apid source-tree
+        rejection path (legacy).
       required: [file, line, provider, severity, snippet]
       properties:
         file: { type: string, example: ".env.production" }
@@ -11658,33 +11736,57 @@ components:
           enum: [high, medium]
           example: high
         snippet: { type: string, example: "sk_liv…XXXX" }
+        layer:
+          type: string
+          description: |
+            Per-walk source label (PR-A). "app" for findings in
+            the main image; "sidecar-<slug>" for findings in a
+            sidecar (e.g. "sidecar-redis"); absent or "" for
+            findings from the legacy apid source-tree rejection
+            path (cmd/apid/secretscan.go).
+          example: app
 
     SecretScanResult:
       type: object
       description: |
         Customer-facing wire shape of one deployment's secret-scan
-        audit row (migrations/00221, secret-scan v2). Mirrors the
-        `ScanResult` shape but for the server-side secret pipeline
-        (cmd/apid/secretscan.go) — the two never overlap because
-        they stamp different columns on the `deployments` row. The
-        `status` enum mirrors the `deployments.scan_status` column
-        for the secret scan: only `pending` (not scanned yet) and
-        `complete_with_redactions` (scan found secrets) are stamped
-        by the secret-scan pipeline; the grype pipeline writes the
-        other values (`complete` / `failed` / `skipped`).
+        audit row. Mirrors the `ScanResult` shape but for the
+        secret-scan pipeline. The `status` enum is the closed set
+        the imaged-side writer (PR-A) stamps: `complete` for a
+        clean walk, `complete_with_redactions` for a hit (mirrors
+        the v2 widening on `deployments_scan_status_chk` from
+        migration 00264). `image_digest` is the OCI digest the
+        scan ran against (PR-A) — mirrors
+        `ScanResult.image_digest` so a side-by-side compare
+        renders both scans against the same bytes. `findings[]`
+        may be empty (clean walk); the field is always present
+        for round-trip JSON stability.
       required: [status, findings]
       properties:
-        status: { type: string, example: "complete_with_redactions" }
+        status: { type: string, example: "complete" }
         scanned_at:
           type: string
           format: date-time
           description: |
             RFC 3339 UTC. Empty when the deployment hasn't been
-            secret-scanned yet (Status = "pending" or the row
-            pre-dates migration 00221).
+            secret-scanned yet.
+        image_digest:
+          type: string
+          description: |
+            OCI digest the scan ran against (PR-A). Mirrors
+            `ScanResult.image_digest` for cross-pipeline
+            comparison. Empty for pre-PR-A rows.
+          example: sha256:abc...
         findings:
           type: array
           items: { $ref: '#/components/schemas/SecretFinding' }
+        error:
+          type: string
+          description: |
+            In-band explanation when the audit row is unreadable
+            (jsonb decode failed). Mirrors `ScanResult.error`.
+            Empty on the success path — `status` carries the
+            closed-set signal there.
 
     Problem:
       type: object
