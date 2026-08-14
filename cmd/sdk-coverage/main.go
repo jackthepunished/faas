@@ -499,6 +499,31 @@ var methodRouteMap = map[string]string{
 	"GET /v1/orgs/{slug}/keys/{id}":         "GetOrgAPIKey",
 	"DELETE /v1/orgs/{slug}/keys/{id}":      "RevokeOrgAPIKey",
 	"POST /v1/orgs/{slug}/keys/{id}/rotate": "RotateOrgAPIKey",
+
+	// Issue #757 / ADR-100 — unified Trigger primitive. Pin every
+	// trigger route; auto-derivation reads either "Triggers" or
+	// "TriggersId<Segment>" depending on whether the path carries
+	// hyphens, and we want the SDK verb surface to be uniform.
+	// The two colon-suffixed routes use the colon-stripped Go name
+	// (Go identifiers can't carry `:` so the SDK normalises the
+	// path component to the next segment word).
+	"POST /v1/triggers":                          "PostTriggers",
+	"GET /v1/triggers":                           "GetTriggers",
+	"POST /v1/triggers:batch_create":             "PostTriggersBatchCreate",
+	"GET /v1/triggers/{id}":                      "GetTriggersId",
+	"PATCH /v1/triggers/{id}":                    "PatchTriggersId",
+	"DELETE /v1/triggers/{id}":                   "DeleteTriggersId",
+	"POST /v1/triggers/{id}/pause":               "PostTriggersIdPause",
+	"POST /v1/triggers/{id}/resume":              "PostTriggersIdResume",
+	"GET /v1/triggers/{id}/records":              "GetTriggersIdRecords",
+	"POST /v1/triggers/{id}/records/{rid}/retry": "PostTriggersIdRecordsRidRetry",
+	"POST /v1/triggers/{id}/records/{rid}/drop":  "PostTriggersIdRecordsRidDrop",
+	"GET /v1/triggers/{id}/dlq":                  "GetTriggersIdDlq",
+	"GET /v1/triggers/{id}/metrics":              "GetTriggersIdMetrics",
+	// Internal — schedd posts the batch envelope to the gateway.
+	// The SDK surface is optional; the handler is registered on
+	// the gateway synth plane.
+	"POST /v1/invocations:dispatch_batch": "PostInvocationsDispatchBatch",
 }
 
 func main() {
