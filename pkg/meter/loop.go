@@ -277,8 +277,11 @@ func (l *Loop) Run(ctx context.Context) error {
 	}
 	if l.partitionCreate != nil {
 		go func() {
-			l.partitionCreate(ctx)
-			errc <- nil
+			errc <- l.runTicks(ctx, l.cfg.UpstreamPartitionCreateInterval,
+				func(c context.Context) error {
+					l.partitionCreate(c)
+					return nil
+				}, "upstream_part")
 		}()
 	}
 	// Block until either ctx cancels or a hard error fires.

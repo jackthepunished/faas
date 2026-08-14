@@ -119,6 +119,18 @@ tags:
       per-app cosign trusted-publisher list.
   - name: usage
     description: Usage roll-up and metering.
+  - name: upstreams
+    description: |
+      Customer-managed data upstreams (ADR-098 §9.A / PR-A + B).
+      Each row is an outbound connection the platform probes for
+      RTT before biasing wake-time placement toward the region with
+      the lowest observed latency. The probe loop in meterd dials
+      `host:port` via `crypto/tls.Dial` (never `http.Get`) and
+      records per-region samples in `data_upstream_probes`; the
+      chooser in schedd reads them synchronously at wake via
+      `upstreamAffinity.Score(appID)`. Plaintext host is never
+      emitted on the wire — only the sha256(salt||host) 8-hex
+      prefix appears as a metric label.
   - name: billing
     description: |
       Billing surface (issue #253 / #259). Today: the operator-
@@ -10835,6 +10847,12 @@ components:
     PutDataUpstreamRequest:
       type: object
       required: [kind, host, port]
+      description: |
+        Upsert payload for a customer data upstream. The (kind, host, port)
+        tuple is the deduplication key — repeating the PUT updates the
+        existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
+        inferred-source tag. Plaintext host is never persisted; the on-disk
+        column is `host_redacted_hash`.
       properties:
         kind:
           type: string
@@ -10854,6 +10872,10 @@ components:
     DataUpstreamResponse:
       type: object
       required: [id, source, kind, host_redacted_hash, port, created_at, last_seen_at]
+      description: |
+        A single customer data upstream. The plaintext host is replaced by
+        `host_redacted_hash` (sha256(salt||host) 8-hex prefix); the §11
+        barrier means the wire format never carries the customer's DSN.
       properties:
         id: { type: string, format: uuid }
         source:
@@ -10876,7 +10898,7 @@ components:
           maximum: 65535
         scope:
           type: string
-          description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash)."
+          description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Echoes the value persisted on the row; absent when the default scope applies."
         declared_region:
           type: string
           description: "Region hint (nullable). Empty on capture; populated by the operator or the classify-flow follow-up."
@@ -10893,6 +10915,10 @@ components:
     DataUpstreamListResponse:
       type: object
       required: [upstreams, quota_max, count]
+      description: |
+        List response wrapper. `quota_max` is the per-plan cap from
+        `pkg/api/limits.go::DataPlacementHintsPerApp`; `count` is the
+        number of rows in `upstreams` (may be less than `quota_max`).
       properties:
         upstreams:
           type: array
