@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -41,6 +42,27 @@ func (r pgRouter) ResolveHost(ctx context.Context, host string) (gateway.App, bo
 		return r.toApp(ctx, app)
 	}
 
+	// Tenant surface (issue #879 / ADR-100 PR-B). Gated by the
+	// feature flag so the cluster ships dark until PR-C lands.
+	// SurfaceParse validates the host shape; only well-formed
+	// customer-zone hosts reach the store. A miss (ErrNotFound)
+	// or a non-Active surface falls through to the legacy
+	// custom_domains path — a hostname may match neither surface
+	// nor legacy and that is a clean 404. A store error (other
+	// than ErrNotFound) returns immediately per the fail-closed
+	// contract: a Postgres blip must not silently mis-route.
+	if api.TenantSurfacesEnabled() {
+		if _, _, ok := gateway.SurfaceParse(host); ok {
+			app, ok, err := r.resolveTenantSurface(ctx, host)
+			if err != nil {
+				return gateway.App{}, false, err
+			}
+			if ok {
+				return app, true, nil
+			}
+		}
+	}
+
 	// Custom domain: must exist AND be verified before we route to it (spec §7).
 	dom, err := r.store.DomainByName(ctx, host)
 	if errors.Is(err, state.ErrNotFound) {
@@ -54,6 +76,37 @@ func (r pgRouter) ResolveHost(ctx context.Context, host string) (gateway.App, bo
 	}
 	app, err := r.store.AppByID(ctx, dom.AppID)
 	if errors.Is(err, state.ErrNotFound) {
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	return r.toApp(ctx, app)
+}
+
+// resolveTenantSurface — pgRouter.ResolveHost's tenant-surface branch.
+// Pulled out to keep ResolveHost ≤ 50 lines (CLAUDE.md convention).
+// Returns (app, true, nil) on a routable active surface; ({}, false, nil)
+// on a miss or non-Active surface (caller falls through to legacy
+// custom_domains); or (zero, false, err) on a store error.
+func (r pgRouter) resolveTenantSurface(ctx context.Context, host string) (gateway.App, bool, error) {
+	surface, err := r.store.TenantSurfaceByHostname(ctx, host)
+	if errors.Is(err, state.ErrNotFound) {
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	if !surface.Active() {
+		// Soft-deleted / suspended surface: route-around, not 404.
+		// A suspended surface is a customer-visible state change;
+		// the legacy custom_domains path may still own a domain
+		// row that pre-dates the surface — fall through to honour it.
+		return gateway.App{}, false, nil
+	}
+	app, err := r.store.AppByID(ctx, surface.AppID)
+	if errors.Is(err, state.ErrNotFound) {
+		// App deleted while surface still active — route-around.
 		return gateway.App{}, false, nil
 	}
 	if err != nil {
