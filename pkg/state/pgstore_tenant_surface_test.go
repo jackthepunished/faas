@@ -231,12 +231,22 @@ func TestPgStore_TenantHostname_PerSurfaceQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Per-surface cap counts VERIFIED hostnames only (see
+	// limits.go:449-450 doc, PR-A review finding K). The two
+	// hostnames below are both verified before the third
+	// insert attempts to land — that's how the cap trips.
 	for _, h := range []string{"a.example", "b.example"} {
 		if _, err := s.CreateTenantHostnameIfUnderQuota(ctx, state.CreateTenantHostnameParams{
 			SurfaceID: surf.ID, Hostname: h, ChallengeToken: "tok",
 		}, lim); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := s.MarkTenantHostnameVerified(ctx, "a.example"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTenantHostnameVerified(ctx, "b.example"); err != nil {
+		t.Fatal(err)
 	}
 	_, err = s.CreateTenantHostnameIfUnderQuota(ctx, state.CreateTenantHostnameParams{
 		SurfaceID: surf.ID, Hostname: "c.example", ChallengeToken: "tok",

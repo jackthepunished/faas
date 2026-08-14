@@ -21,9 +21,13 @@ import (
 
 // tenantSurfaceCols is the canonical SELECT column list for a
 // tenant_surfaces row. Matches the order of scanTenantSurface.
-const tenantSurfaceCols = `id, account_id, app_id, name, cert_kind, status,
-	cert_state, coalesce(cert_not_after, 'epoch'::timestamptz),
-	coalesce(cert_last_error, ''), created_at, updated_at`
+// Prefixed with `s.` so JOINs against tenant_hostnames (which also
+// has id + created_at) don't trip SQLSTATE 42702 (ambiguous
+// column reference). The bare form is acceptable for single-table
+// queries; the `s`-prefix is also accepted by Postgres for them.
+const tenantSurfaceCols = `s.id, s.account_id, s.app_id, s.name, s.cert_kind, s.status,
+	s.cert_state, coalesce(s.cert_not_after, 'epoch'::timestamptz),
+	coalesce(s.cert_last_error, ''), s.created_at, s.updated_at`
 
 // tenantHostnameCols — single column order used everywhere a hostname
 // row scans. The zero-value sentinel for verified_at / last_check_at
