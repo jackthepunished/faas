@@ -178,7 +178,7 @@ func (s *server) appListItem(ctx context.Context, app state.App, latest map[stri
 	if !lastDeployed.IsZero() {
 		lastStr = lastDeployed.UTC().Format("2006-01-02 15:04 MST")
 	}
-	return dashboard.AppListItem{
+	item := dashboard.AppListItem{
 		Slug:            app.Slug,
 		Status:          string(app.Status),
 		URL:             "https://" + app.Slug + ".apps." + s.domain,
@@ -192,7 +192,21 @@ func (s *server) appListItem(ctx context.Context, app state.App, latest map[stri
 		// empty here so a partial migration doesn't render a
 		// confusing cell.
 		AppID: app.ID,
+		// ADR-095 PR-C / issue #272: stamp preview metadata at
+		// the same edge as the production URL so the apps list
+		// can render the "preview" chip without re-querying.
+		// Scope is the canonical preview subdomain label
+		// ("pr-{N}.{parent}"); the apps list template renders it
+		// as the URL on a preview row so a customer can copy /
+		// click straight to the preview host without re-deriving
+		// the shape.
+		IsPreview: app.PreviewOfSlug != "",
 	}
+	if app.PreviewOfSlug != "" && app.PreviewPrNumber > 0 {
+		item.Scope = fmt.Sprintf("pr-%d.%s", app.PreviewPrNumber, app.PreviewOfSlug)
+		item.URL = "https://" + item.Scope + ".apps." + s.domain
+	}
+	return item
 }
 
 // renderAppsList renders /dashboard/apps — every deployed app + a
@@ -423,11 +437,30 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 	appRow := s.appListItem(ctx, app, latest, time.Time{})
 	appRow.Plan = string(acct.Plan)
 	appRow.QuotaLabel = dashboardEmDash
+	// ADR-095 PR-C / issue #272 — preview environments panel. Fetched
+	// only when the page is a production app (a preview row never has
+	// its own previews) and only when the store is in a state where
+	// a failure is non-fatal. PreviewAppsByParent filters tombed rows
+	// so the live pane never surfaces a deleted preview.
+	var previews []dashboard.PreviewItem
+	if appRow.IsPreview {
+		previews = nil
+	} else {
+		previewRows, perr := s.store.PreviewAppsByParent(ctx, acct.ID, app.Slug)
+		if perr != nil {
+			log.Warn("dashboard renderAppDetail: list previews",
+				"account_id", acct.ID, "app_slug", app.Slug, "err", perr)
+			previews = nil
+		} else {
+			previews = projectPreviewItems(previewRows, app.Slug, s.domain)
+		}
+	}
 	page := dashboard.Page{Title: app.Slug, Body: "app_detail", Account: dashboardAccountView(view, appCount), Data: dashboard.AppDetailData{
 		App:             appRow,
 		Manifest:        dashboardManifestView(app),
 		Deployments:     deps,
 		Crons:           cronItems,
+		Previews:        previews,
 		RecentInstances: recentItems,
 		// Issue #791 PR-E / ADR-090 closure — cron fire-now
 		// post-redirect banner. Reads ?fired=1 / ?fired=error and
@@ -1786,4 +1819,56 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 		CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 		Error:     d.Error,
 	}
+}
+
+// projectPreviewItems (ADR-095 PR-C / issue #272) materialises a
+// dashboard.PreviewItem slice from the raw state.App preview rows.
+// The preview-host label ("pr-{N}.{parent-slug}") is derived from
+// PreviewOfSlug + PreviewPrNumber rather than parsed from any
+// stored field because the column is the canonical input — the
+// dashboard never round-trips a host header to mint URLs.
+//
+// URL is the FULL https form (e.g.
+// "https://pr-42.myapp.apps.gregale.dev") matching the apps-list
+// convention in appListItem above — both the visible link and the
+// Copy-URL button read .URL, and a relative host label would hand
+// the user a non-clickable string.
+//
+// parentSlug is the slug of the page being rendered (used to
+// resolve the preview-app slug back to its host label); domain
+// is the apps-zone ("apps.gregale.dev"). When domain is empty
+// (local dev), the URL falls back to the bare host label so
+// dev-environment renders don't render a broken link to
+// "https://...apps.".
+//
+// The result is sorted newest-first because PreviewAppsByParent
+// already orders that way (preview apps are not frequently re-
+// ordered), and the dashboard template iterates in slice order.
+func projectPreviewItems(rows []state.App, parentSlug, domain string) []dashboard.PreviewItem {
+	out := make([]dashboard.PreviewItem, 0, len(rows))
+	for _, a := range rows {
+		scope := fmt.Sprintf("pr-%d.%s", a.PreviewPrNumber, parentSlug)
+		var url string
+		if domain != "" {
+			url = "https://" + scope + ".apps." + domain
+		} else {
+			url = scope
+		}
+		item := dashboard.PreviewItem{
+			Slug:       a.Slug,
+			URL:        url,
+			PrNumber:   a.PreviewPrNumber,
+			PrState:    a.PreviewPrState,
+			StateLabel: a.PreviewPrState,
+			StateClass: "preview-state-" + a.PreviewPrState,
+		}
+		if !a.CreatedAt.IsZero() {
+			item.CreatedAt = a.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		if a.PreviewExpiresAt != nil && !a.PreviewExpiresAt.IsZero() {
+			item.ExpiresAt = a.PreviewExpiresAt.UTC().Format(time.RFC3339)
+		}
+		out = append(out, item)
+	}
+	return out
 }

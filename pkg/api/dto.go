@@ -2880,6 +2880,22 @@ type AppMetricsResponse struct {
 	// future egress-billing PR picks the unit; this field
 	// reports the Prometheus counter verbatim.
 	EgressBytes int64 `json:"egress_bytes"`
+	// TxBytes (ADR-046 PR-2 / issue #415 PR-2) is the
+	// gateway-side mirror of EgressBytes. Source:
+	// gateway_egress_tx_bytes_total{app} (the byte
+	// counter drained from the per-instance ring by
+	// pkg/gateway/egressgrpc/server.go; the
+	// gateway-side stream consumer in
+	// cmd/gatewayd-internal/egress_grpc.go feeds the
+	// counter). Same window semantics as EgressBytes;
+	// the dashboard surfaces both columns so operators
+	// can see gateway-side vs schedd-side independently
+	// (a divergence indicates the EgressSink ring is
+	// dropping bytes or the gRPC stream is wedged).
+	// 0 when Prometheus is degraded or the gateway
+	// hasn't drained yet. Unit: interface bytes
+	// (includes framing).
+	TxBytes int64 `json:"tx_bytes"`
 	// Routes (ADR-093) is the per-route breakdown for opt-in apps
 	// (apps.route_metrics_enabled=true). nil when the app is not
 	// opt-in — the dashboard distinguishes "feature off" (Routes
@@ -4515,4 +4531,99 @@ type ThrottleSuggestionsResponse struct {
 	PlanCeilingBurst     int                     `json:"plan_ceiling_burst"`
 	Multiplier           float64                 `json:"multiplier"`
 	Suggestions          []ThrottleSuggestionRow `json:"suggestions"`
+}
+
+// AppErrorsSummaryResponse is the wire body for
+// GET /v1/apps/{slug}/errors/summary (ADR-096 PR-B). Items is the
+// grouped top-N view: one row per (account_id, app_id, fingerprint)
+// that fired within (since, until), sorted by count DESC, then
+// last_seen_at DESC, then fingerprint ASC (mirrors the SQL ORDER BY
+// in pkg/state/queries.sql::ListAppErrorGroups). WindowStart /
+// WindowEnd echo the CLAMPED window after the AppErrorsWindowMaxHours
+// cap; WindowClamped=true tells the dashboard that the requested
+// span was wider than the server accepts.
+//
+// SampleMessage is the redacted string the writer stored (gatewayd-
+// internal's Redactor.Apply trims to AppErrorsSampleMessageCapBytes
+// BEFORE INSERT), so the dashboard renders it verbatim — but the
+// handlers_app_errors_security_test.go grep tripwire re-checks every
+// SampleMessage against the email + card regex on the way out.
+type AppErrorsSummaryResponse struct {
+	GeneratedAt   string                `json:"generated_at"` // RFC3339Nano UTC, mirrors AppSLOResponse.AsOf
+	AppID         string                `json:"app_id"`
+	AppSlug       string                `json:"app_slug"`
+	WindowStart   string                `json:"window_start"`          // RFC3339Nano UTC
+	WindowEnd     string                `json:"window_end"`            // RFC3339Nano UTC
+	WindowClamped bool                  `json:"window_clamped"`        // true iff requested span > AppErrorsWindowMaxHours
+	Items         []AppErrorSummaryItem `json:"items"`                 // never nil; JSON emits [] on empty (same contract as AppRoutesResponse.Routes)
+	NextCursor    string                `json:"next_cursor,omitempty"` // opaque (last_seen_at, fingerprint) base64; mirrors pkg/cursor/cursor.go:52
+	Limit         int                   `json:"limit"`                 // echo of the post-clamp limit applied
+}
+
+// AppErrorSummaryItem is one row of the summary top-N. The
+// (Fingerprint, ErrorClass, Route, HTTPStatus) tuple is the grouping
+// key; Count is the issue count (post-dedupe), RequestCount is the
+// total distinct app_error_requests rows linked to this fingerprint.
+// The two diverge after a dedupe-merge within the dedupe window
+// (AppErrorsDedupeWindowSeconds).
+type AppErrorSummaryItem struct {
+	Fingerprint   string `json:"fingerprint"` // 64-char lowercase hex
+	ErrorClass    string `json:"error_class"` // closed-vocab enum (CHECK constraint)
+	Route         string `json:"route"`       // matched template, NOT expanded URL
+	HTTPStatus    int32  `json:"http_status"`
+	Count         int64  `json:"count"`          // issue count (post-dedupe)
+	RequestCount  int64  `json:"request_count"`  // distinct app_error_requests rows
+	FirstSeenAt   string `json:"first_seen_at"`  // RFC3339Nano UTC
+	LastSeenAt    string `json:"last_seen_at"`   // RFC3339Nano UTC
+	SampleMessage string `json:"sample_message"` // already redacted at write time
+}
+
+// AppErrorRequestsResponse is the body of
+// GET /v1/apps/{slug}/errors/{fingerprint} (ADR-096 PR-B). The four
+// header fields (Fingerprint, ErrorClass, Route, HTTPStatus) are
+// denormalised here so the drill-down page header renders without a
+// second round-trip. Requests is the cursor-paginated window over
+// app_error_requests for this fingerprint, ordered by received_at
+// DESC, request_id DESC (matches the
+// app_error_requests_drill_idx path).
+type AppErrorRequestsResponse struct {
+	Fingerprint string                `json:"fingerprint"`
+	ErrorClass  string                `json:"error_class"`
+	Route       string                `json:"route"`
+	HTTPStatus  int32                 `json:"http_status"`
+	Requests    []AppErrorRequestItem `json:"requests"` // never nil
+	NextCursor  string                `json:"next_cursor,omitempty"`
+}
+
+// AppErrorRequestItem is one row of the drill-down. RequestID is the
+// gateway's x-faas-request-id (uuid v7). SampleMessage is the
+// redacted string the writer stored. DeploymentID is the deployment
+// the error originated from; nil when the deployment has been
+// deleted (FK ON DELETE SET NULL).
+type AppErrorRequestItem struct {
+	RequestID     string `json:"request_id"`  // uuid v7 from gateway
+	ReceivedAt    string `json:"received_at"` // RFC3339Nano UTC
+	Route         string `json:"route"`
+	HTTPStatus    int32  `json:"http_status"`
+	ErrorClass    string `json:"error_class"`
+	SampleMessage string `json:"sample_message"`
+	DeploymentID  string `json:"deployment_id,omitempty"` // uuid string, omitted when NULL
+}
+
+// AppErrorSampleResponse is the body of
+// GET /v1/apps/{slug}/errors/{fingerprint}/first (ADR-096 PR-B).
+// Embeds AppErrorRequestItem so the wire shape is uniform across the
+// drill-down list and the /first endpoint; HeadersSample is the
+// jsonb-decoded header subset the writer stored (max 8 keys,
+// 256 bytes/value, total ≤8 KiB per the schema CHECK); RedactionsApplied
+// is the sorted-unique list of pattern names the Redactor.Apply +
+// Redactor.ApplyHeaders calls applied (matches pkg/redact/redact.go:85).
+//
+// nil-when-empty contract: a request that didn't match any pattern
+// has RedactionsApplied=nil (the writer's Redactor returns (s, nil)
+// for no-match). The dashboard renders "No redactions" on nil.
+type AppErrorSampleResponse struct {
+	AppErrorRequestItem
+	HeadersSample     map[string]string `json:"headers_sample"`
+	RedactionsApplied []string          `json:"redactions_applied"`
 }

@@ -2092,7 +2092,7 @@ func (m *MemStore) AppBySlug(_ context.Context, slug string) (App, error) {
 	return App{}, ErrNotFound
 }
 
-// PreviewAppsByParent (ADR-094 / issue #272) is the MemStore mirror
+// PreviewAppsByParent (ADR-095 / issue #272) is the MemStore mirror
 // of PgStore.PreviewAppsByParent. Walks the in-memory map under the
 // same lock as CreateApp / AppByID / ListApps. Returns an empty slice
 // (not an error) when no previews exist for the parent — the
@@ -2115,6 +2115,75 @@ func (m *MemStore) PreviewAppsByParent(_ context.Context, accountID, parentSlug 
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
 	return out, nil
+}
+
+// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) is the MemStore
+// mirror of PgStore.ListPreviewsForTeardown. Same contract: return
+// every non-torn_down preview row that is either in a terminal-ish
+// PR state (closed / stale) or past its preview_expires_at TTL.
+// Deliberately does NOT filter on Status == AppDeleted — see the
+// Store-interface docstring for why the janitor needs to observe
+// tombstoned rows on subsequent ticks.
+func (m *MemStore) ListPreviewsForTeardown(_ context.Context, now time.Time, maxPerTick int) ([]App, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.PreviewOfSlug == "" {
+			continue
+		}
+		if a.PreviewPrState == PreviewPrStateTornDown {
+			continue
+		}
+		if a.PreviewPrState == PreviewPrStateClosed || a.PreviewPrState == PreviewPrStateStale {
+			out = append(out, a)
+			continue
+		}
+		if a.PreviewExpiresAt != nil && a.PreviewExpiresAt.Before(now) {
+			out = append(out, a)
+		}
+	}
+	// pgstore orders preview_expires_at ASC NULLS LAST + a per-tick
+	// cap. Mirror that here so the janitor's logic is identical on
+	// both backends; tests that pin a deterministic order need it.
+	sort.Slice(out, func(i, j int) bool {
+		oi, oj := out[i].PreviewExpiresAt, out[j].PreviewExpiresAt
+		switch {
+		case oi == nil && oj == nil:
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		case oi == nil:
+			return false
+		case oj == nil:
+			return true
+		}
+		return oi.Before(*oj)
+	})
+	if len(out) > maxPerTick {
+		out = out[:maxPerTick]
+	}
+	return out, nil
+}
+
+// SetPreviewPrState (ADR-095 PR-C / issue #272) is the MemStore
+// mirror of PgStore.SetPreviewPrState. Preview-only by construction:
+// a row with empty PreviewOfSlug returns ErrNotFound so a bug in the
+// janitor cannot relabel a production app.
+func (m *MemStore) SetPreviewPrState(_ context.Context, appID, prState string) (App, error) {
+	if !PreviewPrStateIsValid(prState) {
+		return App{}, fmt.Errorf("state: set preview pr_state %q for app %q: %w", prState, appID, ErrInvalidPreviewPrState)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok || a.PreviewOfSlug == "" {
+		return App{}, ErrNotFound
+	}
+	a.PreviewPrState = prState
+	m.apps[appID] = a
+	return a, nil
 }
 
 func (m *MemStore) ListApps(_ context.Context, accountID string) ([]App, error) {
@@ -3786,6 +3855,27 @@ func (m *MemStore) UpsertDeploymentScanResult(_ context.Context, id string, scan
 	d.ScanResult = append([]byte(nil), scanResult...) // defensive copy
 	d.ScanStatus = status
 	d.ScannedAt = time.Now()
+	m.deployments[id] = d
+	return nil
+}
+
+// UpsertDeploymentSecretFindings mirrors
+// PgStore.UpsertDeploymentSecretFindings (migrations/00221,
+// secret-scan v2). Stamps the per-deploy secret-scan audit row
+// (findings + status + scannedAt) on the in-memory deployments
+// row. The Deployment struct's SecretFindings + SecretScannedAt
+// fields were added in this PR — the in-memory mirror needed its
+// own counterpart.
+func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, findings []byte, status string, scannedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.SecretFindings = append([]byte(nil), findings...) // defensive copy
+	d.ScanStatus = status
+	d.SecretScannedAt = &scannedAt
 	m.deployments[id] = d
 	return nil
 }

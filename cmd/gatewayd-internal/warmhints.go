@@ -64,22 +64,92 @@ import (
 // and writes via cache.update; the picker reads via cache.hint
 // on every Pick.
 //
+// onTouch is a callback the consumer invokes after every
+// successful cache.Update — and once at construction (see
+// the /readyz staleness-signal wiring in run.go). The
+// callback drives a gateway.NewStalenessSignal instance so
+// the daemon's /readyz reflects "the warm-hint stream is
+// alive and delivering" rather than the looser "the
+// consumer was constructed". An absent callback (no /readyz
+// staleness wired, e.g. the e2e harness) is a no-op so the
+// same consumer shape works in tests that don't construct
+// the probe.
+//
 // log is the gatewayd daemon logger; nil → slog.Default().
 type warmHintConsumer struct {
-	sched scheddgrpc.ScheddClient
-	cache *gateway.WarmHintCache
-	log   *slog.Logger
+	sched   scheddgrpc.ScheddClient
+	cache   *gateway.WarmHintCache
+	log     *slog.Logger
+	onTouch func()
 }
 
 // newWarmHintConsumer wires the consumer. sched must be
 // non-nil (production dial fails loudly if it's nil); cache may
 // be nil only in tests that drive Run directly with a stub
 // stream and don't exercise the cache-write path.
-func newWarmHintConsumer(sched scheddgrpc.ScheddClient, cache *gateway.WarmHintCache, log *slog.Logger) *warmHintConsumer {
+//
+// onTouch is invoked once at construction so the
+// /readyz staleness signal's first helper-goroutine tick
+// observes `touched > 0` and stays in "fresh" state —
+// without this, the goroutine reads `touched == 0` on every
+// tick and flips the signal false with reason "no touch yet"
+// (see gateway.NewStalenessSignal — the signal is pre-armed
+// true at construction, but the helper goroutine overrides
+// that on the first tick when lastTouch is still zero).
+// nil onTouch is allowed; the consumer then doesn't touch.
+func newWarmHintConsumer(sched scheddgrpc.ScheddClient, cache *gateway.WarmHintCache, log *slog.Logger, onTouch func()) *warmHintConsumer {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &warmHintConsumer{sched: sched, cache: cache, log: log}
+	c := &warmHintConsumer{sched: sched, cache: cache, log: log, onTouch: onTouch}
+	// Touch once at construction. This is the fix for the
+	// PR-B1 regression caught by code review of PR #880:
+	// before the touch was called from newWarmHintConsumer,
+	// the staleness helper's goroutine saw touched == 0
+	// forever and flipped the signal false with reason
+	// "no touch yet" on every tick — /readyz was 503
+	// forever (the LB never routed traffic). Now Run()
+	// also touches on every successful delivery (and on
+	// reconnect after the helper goroutine has already
+	// stalled), but this initial touch makes the
+	// "consumer constructed but no events yet delivered"
+	// window safe.
+	//
+	// In production run.go's runDeps() constructs the consumer
+	// BEFORE /readyz staleness is wired (the staleness signal
+	// is built in runWithDeps once the probe is in scope), so
+	// runDeps passes nil here. The real touch callback is
+	// supplied via SetOnTouch right after the staleness
+	// signal is constructed, and that call invokes the touch
+	// once immediately to cover the gap between consumer
+	// construction (runDeps) and signal wiring (runWithDeps).
+	if onTouch != nil {
+		onTouch()
+	}
+	return c
+}
+
+// SetOnTouch installs (or replaces) the onTouch callback after
+// construction. The caller invokes it once immediately to seed
+// the staleness signal's lastTouch timestamp, so the helper
+// goroutine observes `touched > 0` from its first tick onwards
+// and the signal stays in "fresh" state across the natural gap
+// between consumer construction (runDeps) and probe wiring
+// (runWithDeps).
+//
+// Replaces any prior callback; passing nil is allowed and
+// effectively disables the staleness touch (e.g. tests that
+// construct the consumer without a probe).
+func (g *warmHintConsumer) SetOnTouch(touch func()) {
+	g.onTouch = touch
+	if touch != nil {
+		// Seed the staleness signal's lastTouch so the helper
+		// goroutine doesn't observe "no touch yet" on its first
+		// tick (see NewStalenessSignal — the goroutine flips the
+		// signal false with reason "no touch yet" until the first
+		// touch lands, irrespective of the pre-arm at construction).
+		touch()
+	}
 }
 
 // Run is the long-lived consumer loop. It dials schedd's
@@ -131,6 +201,17 @@ func (g *warmHintConsumer) Run(ctx context.Context) {
 		// reconnect starts from 1s again.
 		backoff = 1 * time.Second
 		g.log.Info("gatewayd: warm hint stream connected")
+		// Touch the /readyz staleness signal as soon as the
+		// stream establishes. Without this, the staleness
+		// window (2 minutes in production) starts ticking
+		// from construction rather than from the actual
+		// first successful dial, and a slow schedd cold-boot
+		// that takes >2 min to listen would cause /readyz to
+		// flip false with reason "stale" before the stream
+		// ever delivers an event.
+		if g.onTouch != nil {
+			g.onTouch()
+		}
 		err = g.drain(ctx, stream)
 		switch {
 		case err == nil, errors.Is(err, io.EOF), status.Code(err) == codes.Canceled:
@@ -189,6 +270,22 @@ func (g *warmHintConsumer) drain(ctx context.Context, stream scheddgrpc.WarmHint
 			continue
 		}
 		g.cache.Update(ev.AppID, ev.NodeID)
+		// Touch the /readyz staleness signal on every successful
+		// delivery. The signal's helper goroutine (see
+		// gateway.NewStalenessSignal) flips the bit false after
+		// 2 minutes without a touch; in steady state the schedd
+		// stream emits sub-second, so a touch per delivery keeps
+		// the staleness window well-respected and surfaces
+		// "stream silently deadlocked" within 2 minutes as a
+		// /readyz=503 (the LB then takes this daemon out of
+		// rotation until a delivery resumes).
+		//
+		// touch() is itself nil-safe via the consumer's onTouch
+		// guard, so the same shape works when /readyz staleness
+		// isn't wired (e2e harness, unit tests).
+		if g.onTouch != nil {
+			g.onTouch()
+		}
 	}
 }
 

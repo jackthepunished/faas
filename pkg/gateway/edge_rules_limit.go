@@ -23,8 +23,6 @@ package gateway
 // detection lives in `streamingFor(h, r, app)` at handler.go —
 // pkg/gateway keeps the matcher free of io.Reader juggling.
 
-import "path"
-
 // EdgeRuleLimitResolved is the kind=limit subset the gateway matcher
 // reads on every request. Mirrors EdgeRuleValidateResolved
 // (pkg/gateway/edge_rules.go:258) shape-for-shape minus the
@@ -66,8 +64,11 @@ type EdgeRuleLimitResolved struct {
 //   - non-empty map = request method MUST be present (case-folded
 //     to upper by the loader)
 //
-// path glob: passed through stdlib path.Match; "" = match all;
-// "*" = match all; "/api/*" = prefix-wildcard on the second segment.
+// path glob: passed through pathGlobMatch (edge_rules.go:1136), the
+// same adapter every other per-kind matcher uses — stdlib path.Match
+// underneath, with "" and "*" short-circuited to match-all before the
+// stdlib call (path.Match itself would return false for "").
+// "/api/*" = prefix-wildcard on the second segment.
 func PickFirstLimitMatch(rules []EdgeRuleLimitResolved, requestPath, method string) *EdgeRuleLimitResolved {
 	for i := range rules {
 		r := &rules[i]
@@ -84,9 +85,3 @@ func PickFirstLimitMatch(rules []EdgeRuleLimitResolved, requestPath, method stri
 	}
 	return nil
 }
-
-// path is imported so the doc comment can reference stdlib path.Match
-// semantics; the actual import is via the parent package
-// (pkg/gateway/edge_rules.go:47). Keeping this alias prevents an
-// unused-import error if a future refactor trims the function.
-var _ = path.Match

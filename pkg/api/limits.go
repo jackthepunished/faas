@@ -122,6 +122,27 @@ type Limits struct {
 	// the per-minute sum across all their apps.
 	RateLimitPerAccountRPM int
 
+	// Wake-side admission (schedd layer). Throttles the rate at which
+	// schedd will admit a *new* wake operation for an app or account.
+	// Distinct from RateLimitRPS/Burst which throttle inbound HTTP
+	// requests at the gateway edge — these cap the downstream
+	// consequence (one wake per cold-boot, one wake per warm fan-out,
+	// N wakes per cron tick). Consumed by
+	// pkg/sched.WakeRateLimiter (ADR-099 PR-0 / ADR-080 Risk #1).
+	//
+	// Units: per-minute refill, with `WakeBurstPerApp` as the bucket
+	// ceiling. The minute-scale (vs second-scale at the gateway) is
+	// deliberate: wake admissions are burstier than HTTP requests (a
+	// cron tick legitimately fires N wakes in the same second) and
+	// the per-minute budget still bounds a runaway dispatch fan-out.
+	//
+	// WakeBurstPerAccount caps the per-account sum so a customer
+	// fanning out across many apps in the same account cannot evade
+	// the per-app ceiling by keeping each app under its own cap. Same
+	// evasion shape as pkg/gateway.Limiter.AllowAccount.
+	WakeBurstPerApp     int
+	WakeBurstPerAccount int
+
 	// Networking (spec §7).
 	EgressMbit int // per-instance egress bandwidth cap via tc
 
@@ -459,6 +480,38 @@ type Limits struct {
 	// via the EdgeRulesQuotaError.Kind field; apid-Validate
 	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
 	EdgeRulesThrottlePerApp int
+
+	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
+	// (ADR-099 / issue #879) a single account may own. The cap
+	// defends against a SaaS customer pinning one surface per
+	// end-customer and inflating the per-account cert inventory.
+	// Per-plan: Free 0, Hobby 1, Pro 5, Scale 25. Surfacing tenant
+	// hostnames beyond the cap returns 402
+	// CodeTenantSurfaceQuotaReached; verified out-of-band (apid
+	// doesn't dispatch cert mint). Plan gate is enforced via the
+	// TenantSurfaceQuotaError.PerPlan field (TBD PR-A), apid-Validate
+	// throws CodeTenantSurfaceQuotaReached when this trips.
+	TenantSurfacesPerAccount int
+	// TenantHostnamesPerSurface caps how many verified hostnames one
+	// surface may hold. Independent of TenantSurfacesPerAccount — the
+	// per-surface cap defends against the 1-surface-times-N-hostnames
+	// bypass. Per-plan: Free 0 (irrelevant because Free cannot create
+	// surfaces), Hobby 10, Pro 50, Scale 250. The cap is enforced in
+	// pkg/state.AddTenantHostnameIfUnderQuota (TBD PR-A) under a
+	// tenant_surfaces-row FOR UPDATE lock — same TOCTOU-defence
+	// pattern as CreateEdgeRuleIfUnderQuota (pgstore.go:5914-5974).
+	// 0 with TenantSurfacesAllowed=false (Free); non-zero with
+	// TenantSurfacesAllowed=true (Hobby/Pro/Scale).
+	TenantHostnamesPerSurface int
+	// TenantSurfacesAllowed toggles the `tenant_surfaces` feature
+	// (ADR-099 / issue #879) on the plan. Free stays off — the
+	// legacy `custom_domains` path (one FQDN, one cert) carries the
+	// single-tenant use case; the surface route is the upsell.
+	// Hobby/Pro/Scale = true. apid's createTenantSurface handler
+	// rejects a POST with 402 CodeTenantSurfaceQuotaReached when this
+	// is false (a Free customer's POST hits the gate before the store
+	// is touched).
+	TenantSurfacesAllowed bool
 
 	// WebhookPerApp caps how many outbound webhook subscriptions a
 	// single app may register (issue #476 / ADR-076). The plan gate
@@ -853,6 +906,15 @@ var planLimits = map[Plan]Limits{
 		// upgrade curve from Free → Scale is a single double/triple
 		// progression a customer can predict.
 		EdgeRulesThrottlePerApp: 1,
+		// Tenant surfaces (ADR-099 / issue #879): Free is the
+		// abuse-floor tier. The `tenant_surfaces` feature is the
+		// upsell — Free customers carry the single-tenant case via
+		// the legacy `custom_domains` path. apid's createTenantSurface
+		// handler rejects 402 CodeTenantSurfaceQuotaReached before
+		// the store is touched.
+		TenantSurfacesPerAccount:  0,
+		TenantHostnamesPerSurface: 0,
+		TenantSurfacesAllowed:     false,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
@@ -861,6 +923,13 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
+		// Wake-side admission throttle (ADR-099 PR-0). Free caps
+		// wake admissions at 1/min per app + 1/min per account — the
+		// abuse-floor tier should never burst-wake. The apid-side
+		// Free-plan gate is the primary block; this is the schedd
+		// backstop for the path that bypasses apid (cron, jobs).
+		WakeBurstPerApp:     1,
+		WakeBurstPerAccount: 1,
 		// Log deployment filter (issue #517 / PR-B): Free is the
 		// abuse-floor tier — the filter is a paid feature.
 		// Handler returns WritePlanDeploymentFilterNotAllowedError
@@ -1077,6 +1146,13 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 5,
+		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
+		// entry paid tier — 1 surface with up to 10 verified
+		// hostnames. The "single SaaS customer, a handful of
+		// end-customer subdomains" use case is the hobby use case.
+		TenantSurfacesPerAccount:  1,
+		TenantHostnamesPerSurface: 10,
+		TenantSurfacesAllowed:     true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
@@ -1085,6 +1161,13 @@ var planLimits = map[Plan]Limits{
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
 		RateLimitPerAccountRPM: 200,
+		// Wake-side admission throttle (ADR-099 PR-0). Hobby
+		// permits a small wake burst — a cron tick on a Hobby
+		// customer's job can legitimately want 5 wakes/min across
+		// their apps. The per-account cap (10/min) is the ceiling
+		// for a fan-out across many apps in the same account.
+		WakeBurstPerApp:     5,
+		WakeBurstPerAccount: 10,
 		// Log deployment filter (issue #517 / PR-B): Hobby gets
 		// 1 — the typical Hobby customer runs one staging
 		// deployment alongside their prod slot, and the filter
@@ -1290,6 +1373,14 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 25,
+		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
+		// with up to 50 verified hostnames each — the growing-SaaS
+		// tier. Each surface still binds to one app, so 5 surfaces
+		// means 5 distinct customer-facing apps behind the same
+		// account (the multi-app variant is the deferred footgun).
+		TenantSurfacesPerAccount:  5,
+		TenantHostnamesPerSurface: 50,
+		TenantSurfacesAllowed:     true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
@@ -1297,6 +1388,14 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
+		// Wake-side admission throttle (ADR-099 PR-0). Pro is the
+		// production tier — the per-app burst ceiling of 20/min is
+		// calibrated against a customer running a cron fleet
+		// (~1 cron tick per minute per app, plus a burst on
+		// deploy-driven cold starts). The per-account ceiling of
+		// 30/min bounds cross-app fan-out.
+		WakeBurstPerApp:     20,
+		WakeBurstPerAccount: 30,
 		// Log deployment filter (issue #517 / PR-B): Pro gets 10
 		// — covers the typical multi-staging fan-out (prod + 3-5
 		// staging branches + a few ephemeral preview slots) without
@@ -1496,6 +1595,15 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 100,
+		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
+		// surfaces with up to 250 verified hostnames each — the
+		// established-SaaS tier. The 250 cap is bounded by LE's
+		// 100-SAN-per-cert limit (`per_host_san` falls back to
+		// `per_host` above ~100 — surfaced via the cert engine, not
+		// quota).
+		TenantSurfacesPerAccount:  25,
+		TenantHostnamesPerSurface: 250,
+		TenantSurfacesAllowed:     true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
@@ -1506,6 +1614,14 @@ var planLimits = map[Plan]Limits{
 		// paid customer's bucket fills, which is the intended signal:
 		// coordinated abuse, not baseline load.
 		RateLimitPerAccountRPM: 5000,
+		// Wake-side admission throttle (ADR-099 PR-0). Scale is
+		// the upper tier — 100 wakes/min per app is enough to drain
+		// a 1000-task parallel job run in 10 min wall-clock, which
+		// matches ADR-099 §Acceptance. The per-account cap of
+		// 150/min allows a customer to fan out across several apps
+		// without exhausting the throttle.
+		WakeBurstPerApp:     100,
+		WakeBurstPerAccount: 150,
 		// Log deployment filter (issue #517 / PR-B): Scale gets 50
 		// — 5× Pro (10→50), tracks Scale's larger app budget
 		// (100 apps vs Pro's 25) and the multi-region staging fan-out

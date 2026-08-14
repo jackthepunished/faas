@@ -120,6 +120,19 @@ type AppListItem struct {
 	// Glyph ("ok" / "warn" / "down") inside the row's
 	// "SLO" cell.
 	SLO *views.SLOBadge
+	// IsPreview (ADR-095 PR-C / issue #272) is true when this row
+	// is a preview-app entry (apps.preview_of_slug != ''). The
+	// dashboard's apps list uses it to add a "preview" badge and
+	// indent the row so production apps and their previews read
+	// as a hierarchy. Mirrors state.App.PreviewOfSlug but lives
+	// here so pkg/dashboard stays free of pkg/state imports.
+	IsPreview bool
+	// Scope is the canonical preview subdomain ("pr-42.acme" for a
+	// PR #42 preview of the acme app) used as the copy target for
+	// the dashboard's preview-panel "Copy URL" button. Empty when
+	// IsPreview is false. Pre-formatted at the handler edge so
+	// the template stays a pure renderer.
+	Scope string
 }
 
 // ManifestView is the runner-scaffold snapshot shown on the app detail
@@ -166,6 +179,37 @@ type ScanSummary struct {
 	Medium    int
 	Low       int
 	Unknown   int
+}
+
+// PreviewItem (ADR-095 PR-C / issue #272) is one row on the
+// app detail page's preview-environments panel. The panel
+// surfaces every preview app whose preview_of_slug matches the
+// parent (apps.preview_of_slug), with status, the full preview
+// URL ("https://pr-42.acme.apps.gregale.dev"), the underlying
+// PR number, and the current PR state (open / closed / stale /
+// torn_down). Pre-format all labels at the handler edge so the
+// template stays a pure renderer.
+//
+// Branch / HeadSHA are intentionally absent: the preview-app
+// schema (migrations/00220_preview_app_columns.sql) only carries
+// preview_of_slug / preview_pr_number / preview_pr_state /
+// preview_expires_at; per-deploy source-ref details are out of
+// scope for PR-C and arrive with the preview-deploy webhook
+// follow-up tracked separately.
+//
+// URL is the FULL https form (matching apps-list appListItem.URL)
+// so the rendered <a href> and the Copy URL button both hand the
+// user a clickable absolute URL. A bare host label here would
+// emit a relative href and a non-clickable clipboard copy.
+type PreviewItem struct {
+	Slug       string // preview app slug (e.g. "demo-pr-42")
+	URL        string // full preview URL (e.g. "https://pr-42.demo.apps.gregale.dev")
+	PrNumber   int
+	PrState    string // closed vocab: open / closed / stale / torn_down
+	CreatedAt  string // RFC 3339 UTC
+	ExpiresAt  string // RFC 3339 UTC; empty when no TTL
+	StateLabel string // pre-formatted chip label ("open", "closed", etc.)
+	StateClass string // CSS class matching PrState for the chip
 }
 
 // CronItem is one row on the app detail page's crons tab
@@ -219,6 +263,15 @@ type AppDetailData struct {
 	Manifest    ManifestView
 	Deployments []DeploymentItem
 	Crons       []CronItem
+	// Previews (ADR-095 PR-C / issue #272) lists every preview app
+	// whose preview_of_slug matches this app's slug. Empty when
+	// this app is itself a preview (or a production app with no
+	// previews); the template renders a single "no preview
+	// environments yet" hint in the empty case. The panel is
+	// suppressed entirely for a preview row (the parent already
+	// surfaces its previews) so a preview-of-preview loop can't
+	// occur.
+	Previews []PreviewItem
 	// FiredFlash is the post-redirect banner surfaced after a
 	// dashboard cron fire-now POST. Values:
 	//   "ok"    — handler redirected with ?fired=1

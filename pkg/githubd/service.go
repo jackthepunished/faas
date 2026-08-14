@@ -663,6 +663,35 @@ func previewSlug(parentSlug string, prNumber int) (string, error) {
 	return fmt.Sprintf("pr-%d-%s", prNumber, parentSlug), nil
 }
 
+// stampPreviewPrState (ADR-095 PR-C) advances one preview row's
+// lifecycle label via SetPreviewPrState. It exists as a Service
+// method so the dispatcher's helper stays above the
+// Handler ≤ 50-line cap and the test rig (newPreviewService) can
+// stub it when an action's handler should not exercise the store.
+//
+// The implementation is a thin delegate — the closed-set
+// validator and the preview-only enforcement live inside
+// SetPreviewPrState, so a bug here can never relabel a
+// production app or trip the CHECK constraint. Returns nil when
+// the store declines (production row, ErrNotFound) — the
+// dispatcher has already passed the preview-path gate, so
+// ErrNotFound means a concurrent delete raced us; in that case
+// the row is gone and there's nothing to stamp.
+func (s *Service) stampPreviewPrState(ctx context.Context, appID, prState string) error {
+	if s.Reconcile == nil || s.Reconcile.Store == nil {
+		return nil
+	}
+	updated, err := s.Reconcile.Store.SetPreviewPrState(ctx, appID, prState)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	_ = updated
+	return nil
+}
+
 // WritePreviewCheck is the seam HandlePullRequest uses for the
 // queued / building / live preview Check Run. Wired by
 // cmd/githubd/main.go to a *ChecksAPI.WritePreviewCheck;
@@ -881,15 +910,49 @@ func (s *Service) handlePullRequest(ctx context.Context, body []byte) (reconcile
 		}
 		// Pre-existing row on (account_id, slug) → ErrConflict.
 		// That's the idempotent path: a 2nd synchronize /
-		// reopened event for the same PR. We treat it as success
-		// — the row is already provisioned, and the Check Run
-		// we'll write below is the right outbound signal. (A
-		// failed Create that wasn't quota AND wasn't conflict
-		// is a real error — surface it.)
+		// reopened / closed event for the same PR. We treat it as
+		// success — the row is already provisioned. The state
+		// machine still has to advance, though, so the dispatcher
+		// looks the existing row up by slug (the freshly-failed
+		// INSERT didn't mint an ID) and stamps preview_pr_state
+		// on it. Before PR-C this branch swallowed ErrConflict
+		// silently, which meant a `closed` event never actually
+		// mutated the row's preview_pr_state — the janitor's
+		// only signal was preview_expires_at, so PRs that were
+		// reopened-then-closed stayed open forever.
+		// ADR-095 PR-C.1.
 		if !errors.Is(err, state.ErrConflict) {
 			return reconcile.Result{}, fmt.Errorf("githubd: create preview app: %w", err)
 		}
-		created = previewApp
+		existing, lookupErr := s.Reconcile.Store.AppBySlug(ctx, previewSlugVal)
+		if lookupErr != nil {
+			// The row vanished between the ErrConflict and the
+			// lookup — treat it as a teardown race: the row is
+			// already gone, so there's nothing to stamp and
+			// nothing for the janitor to reap. Return success
+			// so GitHub doesn't retry; the Check Run we'll
+			// write below reflects the live preview URL, which
+			// is fine because the row's deletion makes it 410.
+			s.Log.Info("githubd pull_request: conflict path lost row to concurrent delete",
+				"err", lookupErr, "preview_slug", previewSlugVal)
+			return reconcile.Result{}, nil
+		}
+		created = existing
+	}
+
+	// 5b. Stamp preview_pr_state on the existing row. This covers
+	//     two paths the INSERT above can't: (a) the
+	//     opened-on-already-existing-row case (ErrConflict from
+	//     step 5), and (b) the explicit closed-action teardown
+	//     arm — even when the row was first provisioned earlier
+	//     in the PR's lifetime, we now flip the label so the
+	//     janitor's 24h grace clock starts. SetPreviewPrState
+	//     refuses production rows and out-of-vocabulary values,
+	//     so this UPDATE cannot relabel a customer's live app
+	//     or trip the CHECK constraint.
+	if err := s.stampPreviewPrState(ctx, created.ID, previewState); err != nil {
+		s.Log.Warn("githubd: stamp preview_pr_state",
+			"err", err, "app_id", created.ID, "state", previewState)
 	}
 
 	// 6. Write the queued Check Run with the preview URL. The

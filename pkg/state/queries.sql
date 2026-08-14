@@ -949,39 +949,58 @@ INSERT INTO app_error_requests (
 -- name: ListAppErrorGroups :many
 -- ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
 -- one (account_id, app_id) over a (since, until) window.
--- Cursor pagination via the (last_seen_at, fingerprint) compound
--- tuple (distinct from the operator's (created_at, id) cursor).
+-- Cursor pagination via the (count, last_seen_at, fingerprint)
+-- compound tuple (distinct from the operator's (created_at, id)
+-- cursor). All three columns are part of the ORDER BY so the
+-- cursor predicate must include all three — dropping `count`
+-- breaks pagination: rows with smaller count but newer
+-- last_seen_at are silently dropped across pages (the cursor
+-- predicate on (last_seen_at, fingerprint) only considers the
+-- inner order, missing the leading count-DESC boundary).
 -- Index path: app_errors_account_app_last_seen_idx covers the
 -- primary scan; the (count DESC) sort happens post-filter on the
 -- bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+--
+-- sqlc.arg(name) annotations disambiguate the cursor predicate
+-- types — without them sqlc infers the timestamps as timestamptz
+-- from the leading (count, last_seen_at) references and breaks
+-- pagination.
 SELECT
     id, fingerprint, error_class, route, http_status,
     count, request_count, first_seen_at, last_seen_at,
     sample_message
 FROM app_errors
-WHERE account_id = $1
-  AND app_id     = $2
-  AND last_seen_at >= $3
-  AND last_seen_at <= $4
-  AND ($5::timestamptz IS NULL OR (last_seen_at, fingerprint) < ($5, $6))
+WHERE account_id = sqlc.arg('account_id')
+  AND app_id     = sqlc.arg('app_id')
+  AND last_seen_at >= sqlc.arg('since')
+  AND last_seen_at <= sqlc.arg('until')
+  AND (sqlc.arg('cursor_count')::bigint IS NULL
+       OR count < sqlc.arg('cursor_count')
+       OR (count = sqlc.arg('cursor_count')
+           AND (last_seen_at, fingerprint) < (sqlc.arg('cursor_last_seen'), sqlc.arg('cursor_fingerprint')::text)))
 ORDER BY count DESC, last_seen_at DESC, fingerprint ASC
-LIMIT $7;
+LIMIT sqlc.arg('limit');
 
 -- name: ListAppErrorRequests :many
 -- Drill-down rows for one fingerprint. Cursor paginated via
 -- (received_at, request_id). Index path:
 -- app_error_requests_drill_idx. Does NOT include headers_sample
 -- or redactions — those are returned only by GetAppErrorSample.
+--
+-- sqlc.arg(name) annotations disambiguate the cursor predicate
+-- types — without them sqlc infers $5 as timestamptz from the
+-- leading (received_at) reference, breaking pagination.
 SELECT
     id, request_id, received_at, route, http_status,
     error_class, sample_message, deployment_id
 FROM app_error_requests
-WHERE account_id  = $1
-  AND app_id      = $2
-  AND fingerprint = $3
-  AND ($4::timestamptz IS NULL OR (received_at, request_id) < ($4, $5))
+WHERE account_id  = sqlc.arg('account_id')
+  AND app_id      = sqlc.arg('app_id')
+  AND fingerprint = sqlc.arg('fingerprint')
+  AND (sqlc.arg('cursor_received_at')::timestamptz IS NULL
+       OR (received_at, request_id) < (sqlc.arg('cursor_received_at'), sqlc.arg('cursor_request_id')::uuid))
 ORDER BY received_at DESC, request_id DESC
-LIMIT $6;
+LIMIT sqlc.arg('limit');
 
 -- name: GetAppErrorSample :one
 -- Single oldest request row for one fingerprint, used by the

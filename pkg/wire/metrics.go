@@ -159,6 +159,17 @@ type OpsMetrics struct {
 	// add a wake_id label, so cardinality stays O(autoscale-enabled
 	// apps × 3 phase values).
 	wakeRPCDuration *prometheus.HistogramVec
+	// gatewayDrainWaitSeconds (issue #587 / PR-A) — histogram
+	// for the per-daemon graceful-shutdown drain. Closed label
+	// set {daemon, outcome} pre-instantiated in NewOpsMetrics so
+	// /metrics surfaces the closed cross-product from boot.
+	gatewayDrainWaitSeconds *prometheus.HistogramVec
+	// gatewayInflightRequests (issue #587 / PR-A) — gauge for
+	// the per-daemon drain.Tracker in-flight count. Closed
+	// label set {daemon, op}; no plan or app label per the
+	// cluster plan's "Decisions baked in" §2 (Prometheus
+	// cardinality discipline).
+	gatewayInflightRequests *prometheus.GaugeVec
 	// wakeSnapshotTier (issue #470 / PR C / ADR-074) — closed-set
 	// counter for the warm-vs-init-vs-cold-boot choice Engine.usableSnapshotForWake
 	// makes on every wake. Labels ∈ {warm, init, cold_boot_fallback}.
@@ -361,6 +372,17 @@ type OpsMetrics struct {
 	// Single-registry: registered on every daemon; only apid
 	// increments via ObserveAppErrorsPurge.
 	appErrorsPurges *prometheus.CounterVec
+	// previewJanitorOutcomes (ADR-095 PR-C) — counter for the
+	// preview teardown cron (cmd/apid/preview_janitor.go).
+	// outcome ∈ {ok, failed, torn_down}. `ok` fires every tick
+	// the sweep ran cleanly (whether or not it tombstoned a
+	// row); `torn_down` fires per-row when a preview app
+	// reaches the torn_down state and is soft-deleted (the
+	// §12 teardown-rate panel sums this over 1h to chart PR-
+	// close cadence); `failed` is the tripwire for a SQL-level
+	// failure (alertable). Single-registry: registered on every
+	// daemon; only apid increments via ObservePreviewJanitor.
+	previewJanitorOutcomes *prometheus.CounterVec
 	// accountLabels: the bounded admission set shared by the
 	// account_id-labelled metrics above. See accountLabelSet docs
 	// for the fixed-capacity, non-evicting contract — an evicting
@@ -2297,6 +2319,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"ok", "no_accounts", "failed"} {
 		appErrorsPurges.WithLabelValues(outcome)
 	}
+	// ADR-095 PR-C: preview teardown janitor outcomes. Mirror of
+	// appErrorsPurges for the preview-row sweep. The closed-set
+	// outcome vocabulary keeps cardinality bounded per
+	// ObserveAppErrorsPurge convention.
+	previewJanitorOutcomes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_preview_janitor_outcomes_total",
+		Help: "Preview teardown cron outcomes (ADR-095 PR-C, issue #272), labelled by outcome ∈ {ok, failed, torn_down}. `ok` fires every tick the sweep ran cleanly (whether or not it tombstoned a row); `torn_down` fires per-row when a preview app reaches torn_down and is soft-deleted (the §12 teardown-rate panel sums this over 1h to chart PR-close cadence); `failed` is the tripwire for a SQL-level failure (alertable). Single-registry: registered on every daemon; only apid increments via ObservePreviewJanitor.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, previewJanitorOutcomes)
+	for _, outcome := range []string{"ok", "failed", "torn_down"} {
+		previewJanitorOutcomes.WithLabelValues(outcome)
+	}
 	// ADR-067 / Tier A6: migrating-instance watchdog reconcile counter.
 	// Labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}.
 	// The reinvited label is the §12 dashboard panel (sum over 5m for
@@ -2393,6 +2427,52 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// (events-platform ADR-064) but a distinct metric name and label
 	// set — see metrics.go:1208-1227 for the naming rationale.
 	commonCollectors = append(commonCollectors, wakeRPCDuration)
+	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
+	// observability. Two series with a closed label set:
+	//
+	//   * gatewayDrainWaitSeconds histogram {daemon, outcome} —
+	//     wall-clock seconds the drain waited before every
+	//     in-flight request goroutine finished (or the deadline
+	//     fired). outcome ∈ {clean, deadline_exceeded, ctx_cancelled}
+	//     so an operator can tell "drained fast" from "we
+	//     force-cut requests" without re-reading the daemon log.
+	//     Bucket set covers <100ms (idle) up to the full
+	//     DrainGrace=25s ceiling.
+	//
+	//   * gatewayInflightRequests gauge {daemon, op} — current
+	//     in-flight Begin() count. op ∈ {http, upgrade, control}
+	//     (NO plan or app label — Prometheus cardinality
+	//     discipline per the cluster plan's "Decisions baked in"
+	//     §2). Operators who want per-plan or per-app in-flight
+	//     counts can add them later if a real incident needs them.
+	//
+	// Both metrics are pre-instantiated for the closed label
+	// cross-product so /metrics surfaces rows from boot —
+	// matches the pre-instantiation pattern used by every other
+	// per-daemon collector (see e.g. writeRedirectTotal at
+	// metrics.go:1136-1142).
+	gatewayDrainWaitSeconds := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_drain_wait_seconds",
+		Help:    "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGrace=25s ceiling.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 25},
+	}, []string{"daemon", "outcome"})
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-internal", "clean")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-internal", "deadline_exceeded")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-internal", "ctx_cancelled")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-public", "clean")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-public", "deadline_exceeded")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-public", "ctx_cancelled")
+	gatewayInflightRequests := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_inflight_requests",
+		Help: "Current in-flight request count tracked by the per-daemon drain.Tracker (issue #587 / PR-A / pkg/gateway/drain). Labelled by {daemon, op}; op ∈ {http, upgrade, control}. NO plan or app label — Prometheus cardinality discipline (per the cluster plan's 'Decisions baked in' §2).",
+	}, []string{"daemon", "op"})
+	gatewayInflightRequests.WithLabelValues("gatewayd-internal", "http")
+	gatewayInflightRequests.WithLabelValues("gatewayd-internal", "upgrade")
+	gatewayInflightRequests.WithLabelValues("gatewayd-internal", "control")
+	gatewayInflightRequests.WithLabelValues("gatewayd-public", "http")
+	gatewayInflightRequests.WithLabelValues("gatewayd-public", "upgrade")
+	gatewayInflightRequests.WithLabelValues("gatewayd-public", "control")
+	commonCollectors = append(commonCollectors, gatewayDrainWaitSeconds, gatewayInflightRequests)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -2759,6 +2839,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
 		wakeRPCDuration:                    wakeRPCDuration,
+		gatewayDrainWaitSeconds:            gatewayDrainWaitSeconds,
+		gatewayInflightRequests:            gatewayInflightRequests,
 		wakeSnapshotTier:                   wakeSnapshotTier,
 		guestTailSeconds:                   guestTailSeconds,
 		guestTailFailedTotal:               guestTailFailedTotal,
@@ -2775,6 +2857,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsDedupeMerges:              appErrorsDedupeMerges,
 		appErrorsFlushDuration:             appErrorsFlushDuration,
 		appErrorsPurges:                    appErrorsPurges,
+		previewJanitorOutcomes:             previewJanitorOutcomes,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,
@@ -2865,6 +2948,35 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 // CounterVec is shared with other label tuples.
 func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter {
 	return m.watchdogKills.WithLabelValues(fromState, toState)
+}
+
+// ObserveDrainWait (issue #587 / PR-A) records the wall-clock
+// duration of a drain.Tracker.Drain call. outcome is one of
+// drain.Outcome{Clean,DeadlineExceeded,Cancelled} — the caller
+// passes the string it got back from Drain. daemon ∈ {gatewayd-public,
+// gatewayd-internal} — the prefix is the per-daemon scope, not
+// the metric name (the metric is `gatewayd_drain_wait_seconds`
+// in production with the gatewayd prefix; the prefix is already
+// applied by NewOpsMetrics). Nil-safe: nil receiver is a no-op
+// so unit tests don't have to wire metrics.
+func (m *OpsMetrics) ObserveDrainWait(daemon, outcome string, seconds float64) {
+	if m == nil || m.gatewayDrainWaitSeconds == nil {
+		return
+	}
+	m.gatewayDrainWaitSeconds.WithLabelValues(daemon, outcome).Observe(seconds)
+}
+
+// SetInflightRequests (issue #587 / PR-A) sets the per-daemon
+// per-op in-flight gauge. op ∈ {http, upgrade, control}. Called
+// by the daemon at boot (zero) and after every drain.Tracker
+// state change (the tracker exposes Inflight() and
+// MaxInflight()). daemon follows the same convention as
+// ObserveDrainWait. Nil-safe.
+func (m *OpsMetrics) SetInflightRequests(daemon, op string, count float64) {
+	if m == nil || m.gatewayInflightRequests == nil {
+		return
+	}
+	m.gatewayInflightRequests.WithLabelValues(daemon, op).Set(count)
 }
 
 // LivenessRestarts returns the per-(app, deployment) counter the
@@ -3016,6 +3128,19 @@ func (m *OpsMetrics) ObserveAppErrorsPurge(outcome string) {
 		return
 	}
 	m.appErrorsPurges.WithLabelValues(outcome).Inc()
+}
+
+// ObservePreviewJanitor records one observation of the apid
+// preview teardown cron (ADR-095 PR-C / issue #272). outcome ∈
+// {ok, failed, torn_down}. nil-safe — no-op if m is nil or the
+// metric was pre-instantiated without labels. The closed outcome
+// set keeps cardinality bounded per the ObserveAppErrorsPurge
+// convention (ADR-096 retention cron shares the same pattern).
+func (m *OpsMetrics) ObservePreviewJanitor(outcome string) {
+	if m == nil || m.previewJanitorOutcomes == nil {
+		return
+	}
+	m.previewJanitorOutcomes.WithLabelValues(outcome).Inc()
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram

@@ -585,6 +585,12 @@ const testDomain = "apps.test.example"
 // coexistence marker (passed-through by PR #845's renumber,
 // kept as a no-op so the contiguity gate doesn't trip on the
 // renumber chain).
+//
+// PR-B (this PR, #875, ADR-096 handlers + SDK + OpenAPI) adds
+// NO migration; the head stays at 237 against main at merge.
+// PR-C (e2e + ADR-096 docs) will need its own slot fence —
+// pre-check via `gh api .../contents/migrations?ref=main`
+// before opening the PR per the cross-PR slot precheck pattern.
 const e2eMigrationTarget = 237
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
@@ -839,6 +845,19 @@ func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []strin
 //     the daemon's wire.ListenOrRecreateByName errors on a host without
 //     the `faas` group, which is every CI runner and dev Mac. Production
 //     deploys have the group; the ansible role creates it at bootstrap.
+//   - FAAS_APP_ERRORS_ENABLED=false — ADR-096 / PR-B flipped the
+//     kill-switch to default-on in cmd/apid/main.go, which now tries
+//     to bind /run/faas/app_errors.sock in runAppErrorsServer on every
+//     apid boot. The CI runner / dev Mac lacks the `faas-apid` user
+//     that the listener boot probes (config.go:144-149); the lookup
+//     returns an error and the apid never reaches the main HTTP
+//     listener, so e2e `waitTCP(t, addr, 10s)` exhausts and every
+//     test reports "did not accept within 10s". Production deploys
+//     have the user (the systemd unit runs as `faas-apid`); the e2e
+//     harness sets this off so the apid skips the new gRPC listener
+//     and the main HTTP path boots cleanly. The reader-path handlers
+//     (cmd/apid/handlers_app_errors.go) are not affected — they read
+//     from the SQL store regardless of the gRPC listener state.
 //   - FAAS_MFA_RECOVERY_HMAC_KEY=<per-test hex> — see Harness
 //     .RecoveryHMACKeyHex. apid refuses to boot without a recovery
 //     HMAC key (cmd/apid/main.go:loadOrGenerateRecoveryHMACKey); the
@@ -858,6 +877,7 @@ func testEnvCommon(dbURL string) []string {
 	env := []string{
 		"DATABASE_URL=" + dbURL,
 		"FAAS_SKIP_SOCKET_GROUP=1",
+		"FAAS_APP_ERRORS_ENABLED=false",
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 	}

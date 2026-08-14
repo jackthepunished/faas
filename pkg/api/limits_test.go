@@ -53,12 +53,22 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
 			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1,
+			// ADR-099 (#879): tenant surfaces — Free is the abuse-floor
+			// tier. The `tenant_surfaces` feature is the upsell; Free
+			// customers carry the single-tenant case via the legacy
+			// `custom_domains` path. Allowed=false means the create
+			// handler returns 402 CodeTenantSurfaceQuotaReached before
+			// the store is touched.
+			TenantSurfacesPerAccount: 0, TenantHostnamesPerSurface: 0, TenantSurfacesAllowed: false,
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
 			WebhookPerApp: 0, WebhookPerAccount: 0,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
+			// ADR-099 PR-0: Free wake-admission throttle (1/1).
+			WakeBurstPerApp:     1,
+			WakeBurstPerAccount: 1,
 			// Issue #471 / ADR-047 (PR-A): Free is gated out of streaming
 			// entirely. The 25 MiB / 300 s caps are the legacy pre-#471
 			// defaults — kept here so a Free customer that PATCHes
@@ -153,6 +163,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
 			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5,
+			// ADR-099 (#879): tenant surfaces — Hobby is the entry
+			// paid tier. 1 surface with up to 10 verified hostnames.
+			// The "single SaaS customer, handful of end-customer
+			// subdomains" use case is the Hobby use case.
+			TenantSurfacesPerAccount: 1, TenantHostnamesPerSurface: 10, TenantSurfacesAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
 			// (10) one-to-one. Pending invitations = members/2
 			// because the default 7d TTL keeps the live set small.
@@ -166,6 +181,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
 			RateLimitPerAccountRPM: 200,
+			// ADR-099 PR-0: Hobby wake-admission throttle (5/10).
+			WakeBurstPerApp:     5,
+			WakeBurstPerAccount: 10,
 			// Issue #471 / ADR-047 (PR-A): Hobby unlocks streaming
 			// (100 MiB / 900 s) — the first paid tier. PR-A wires
 			// the flag + accessor; PR-B activates the Flusher path.
@@ -250,6 +268,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
 			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25,
+			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
+			// with up to 50 verified hostnames each. Each surface
+			// still binds to one app (the multi-app variant is the
+			// deferred footgun).
+			TenantSurfacesPerAccount: 5, TenantHostnamesPerSurface: 50, TenantSurfacesAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
 			// (50) one-to-one — every team member can hold a key
 			// for their own deploy target. Financial model is
@@ -260,6 +283,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			WebhookPerApp: 10, WebhookPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
+			// ADR-099 PR-0: Pro wake-admission throttle (20/30).
+			WakeBurstPerApp:     20,
+			WakeBurstPerAccount: 30,
 			// Issue #471 / ADR-047 (PR-A): Pro keeps the same streaming
 			// envelope as Hobby. The cap is the same; the per-app
 			// streaming path is gatewayd-internal-edged, not per-tier.
@@ -350,6 +376,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
 			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100,
+			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
+			// with up to 250 verified hostnames each. The 250 cap is
+			// bounded by LE's 100-SAN-per-cert limit (per_host_san
+			// falls back to per_host above ~100, surfaced via the
+			// cert engine, not quota).
+			TenantSurfacesPerAccount: 25, TenantHostnamesPerSurface: 250, TenantSurfacesAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
 			// (200) one-to-one — SaaS-scale multi-team + rotating-CI.
 			// Financial model is authoritative — derived value,
@@ -362,6 +394,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
 			RateLimitPerAccountRPM: 5000,
+			// ADR-099 PR-0: Scale wake-admission throttle (100/150).
+			WakeBurstPerApp:     100,
+			WakeBurstPerAccount: 150,
 			// Issue #471 / ADR-047 (PR-A): Scale keeps the same envelope
 			// as Hobby/Pro. The streaming cap is uniform across paid
 			// tiers — the spec's paid-only unlock is the boolean, not

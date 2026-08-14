@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { FieldError } from './FieldError.js';
+import type { SecretFinding } from './SecretFinding.js';
 /**
  * RFC 7807 problem+json envelope. The `code` field is the stable
  * machine-readable identifier; clients branch on it. `limit` and
@@ -62,5 +63,26 @@ export type Problem = {
    *
    */
   errors?: Array<FieldError>;
+  /**
+   * Per-line secret-scan detail. Populated by 422 sites with
+   * `code: secret_scan_strict` (cmd/apid/secretscan.go
+   * server-side scan rejection; cmd/gregale printErr
+   * --secret-scan=strict client-side rejection). The shape
+   * is shared with the on-disk `SecretScanResult` so a
+   * programmatic consumer can render the same UI for both
+   * rejection paths. Optional + omitempty.
+   *
+   */
+  secret_findings?: Array<SecretFinding>;
+  /**
+   * Customer-facing remediation nudge attached to a
+   * `code: secret_scan_strict` 422 envelope (e.g. "move
+   * detected secrets to `gregale secrets set`"). Mirrors
+   * the `FieldError` shape's prose pattern so the dashboard
+   * / SDK can render the hint as a one-line footer without
+   * parsing prose. Optional + omitempty.
+   *
+   */
+  secret_hint?: string;
 };
 

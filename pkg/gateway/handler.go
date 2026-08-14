@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/geoip"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -662,6 +663,21 @@ type Handler struct {
 	// short-circuits to fall-through when nil — same posture
 	// as jwtVerifier above.
 	validator Validator
+
+	// drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// tracker the gateway's shutdown drain waits on. nil = drain
+	// disabled (default for unit tests + the e2e harness that
+	// doesn't exercise graceful shutdown). Wired from
+	// cmd/gatewayd-internal/main.go via WithInFlightTracker so
+	// production has ONE tracker per daemon, shared with the
+	// control mux + InternalReverseProxy + TraceHandler via the
+	// same setter on each. ServeHTTP does
+	// `defer h.drain.Begin("http")()` so every return path
+	// (including the early-out problem writes) is bounded by
+	// the drain budget. The Begin closure is no-op-safe when
+	// h.drain == nil — see the wrapper in serveHTTPWithDrain
+	// for the nil guard.
+	drain *drain.Tracker
 }
 
 // emptyAccountWarned is the process-wide trip flag for
@@ -3421,6 +3437,44 @@ func (h *Handler) WithEgressSink(sink *egresssink.EgressSink) *Handler {
 	return h
 }
 
+// WithInFlightTracker installs the per-request WaitGroup-backed
+// drain tracker (pkg/gateway/drain) the gateway's graceful
+// shutdown uses to bound the listener exit by known in-flight
+// request goroutines, not a hard wall-clock deadline (issue
+// #587 / PR-A). nil-safe: passing nil disables drain tracking,
+// matching the pre-PR-A behaviour; the production path installs
+// a single tracker shared with the control mux + InternalReverseProxy
+// + TraceHandler so the drain WaitGroup covers every ServeHTTP
+// surface in the daemon.
+//
+// Must be called BEFORE the listener starts accepting traffic.
+// The daemons call it once in main() after the tracker is
+// constructed and before servers.Serve is invoked.
+//
+// Mutates the receiver in place; the returned *Handler is the same
+// pointer, provided for fluent chaining. Discarding the return
+// value (statement-form `h.WithInFlightTracker(...)`) is correct.
+func (h *Handler) WithInFlightTracker(tracker *drain.Tracker) *Handler {
+	h.drain = tracker
+	return h
+}
+
+// serveHTTPWithDrain is the per-request drain Begin/Done pair.
+// nil-safe: returns a no-op closure when h.drain is nil so the
+// call site stays a single line. The deferred closure fires on
+// every return path of ServeHTTP, including the early-out problem
+// writes, so a request that 4xx/5xx immediately still drains
+// cleanly. Label is fixed at "http" for the per-request path; the
+// raw-stream Upgrade hijacker (pkg/gateway/forwardproxy.go:830)
+// uses Begin("upgrade") directly so the conn-scoped pump
+// goroutine can hold its own Done closure past ServeHTTP return.
+func (h *Handler) serveHTTPWithDrain() func() {
+	if h.drain == nil {
+		return func() {}
+	}
+	return h.drain.Begin("http")
+}
+
 // SetWakeGateHook installs a callback that wakes the queue-depth gauge each
 // time WakeGate mutates an entry, and hands the wake-queue histogram to the
 // gate so Wait can observe per-caller wait duration. Called by main once the
@@ -3497,6 +3551,14 @@ func (h *Handler) writeWebSocketNotAllowed(w http.ResponseWriter, appID string, 
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Drain tracker (issue #587 / PR-A): the returned closure fires
+	// on every return path below, including the early-out problem
+	// writes. nil-safe via serveHTTPWithDrain — unit tests that
+	// don't wire WithInFlightTracker pay zero overhead. Place BEFORE
+	// statusRecorder creation so even panic-recovered paths keep
+	// the drain balanced.
+	defer h.serveHTTPWithDrain()()
+
 	// Status-class capture (used for metrics + slog). Doesn't buffer the body
 	// or alter the headers — strictly observability.
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}

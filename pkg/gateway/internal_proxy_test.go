@@ -55,6 +55,32 @@ func (d *stubDialer) DialContext(ctx context.Context, target string) (net.Conn, 
 	return net.Dial("tcp", d.server.Listener.Addr().String())
 }
 
+// TestInternalReverseProxy_PreservesInboundHost pins the routing-key
+// contract of the public→internal hop: the outbound Host header must
+// stay the customer-facing hostname. gatewayd-internal resolves the
+// app from r.Host; rewriting it to the internal target name 404s
+// every request with "no app is routed to \"gatewayd-internal\"".
+func TestInternalReverseProxy_PreservesInboundHost(t *testing.T) {
+	var gotHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	dialer := &stubDialer{server: upstream}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "hello-node-test.apps.gregale.dev"
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if gotHost != "hello-node-test.apps.gregale.dev" {
+		t.Errorf("upstream Host = %q, want the inbound hostname preserved", gotHost)
+	}
+}
+
 // TestInternalReverseProxy_StripsHopByHopHeaders pins the RFC 7230
 // §6.1 contract: the inbound hop-by-hop headers are NOT forwarded
 // to the upstream.

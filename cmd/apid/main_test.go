@@ -59,6 +59,15 @@ func withTestHMACFiles(t *testing.T) {
 	}
 	t.Setenv("FAAS_AUDIT_HMAC_KEY_FILE", filepath.Join(dir, "audit-hmac.key"))
 	t.Setenv("FAAS_RECOVERY_HMAC_KEY_FILE", filepath.Join(dir, "recovery-hmac.key"))
+	// ADR-096 / PR-B kill-switch OFF for in-process apid tests. The
+	// default-on gate (cmd/apid/main.go runAppErrorsServer boot path)
+	// probes the `faas-apid` unix user via wire.ListenOrRecreateByName;
+	// CI runners and dev Macs don't have that user, so the user lookup
+	// blocks and runWithDeps never reaches httpSrv.Serve — which makes
+	// TestRunWithDeps_ServesUntilCancel's GET /v1/account hit
+	// "connection refused" inside its 3s deadline. Mirrors the
+	// FAAS_APP_ERRORS_ENABLED=false env used in the e2e harness.
+	t.Setenv("FAAS_APP_ERRORS_ENABLED", "false")
 }
 
 // --- seedDevAccount --------------------------------------------------------

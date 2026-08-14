@@ -1854,14 +1854,14 @@ func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 	return scanApp(row)
 }
 
-// PreviewAppsByParent (ADR-094 / issue #272) returns every preview
+// PreviewAppsByParent (ADR-095 / issue #272) returns every preview
 // app whose preview_of_slug = parentSlug, scoped to accountID. The
 // query plan uses the partial index apps_preview_of_slug_idx
-// (migration 00218), which carries the same WHERE preview_of_slug IS
+// (migration 00220), which carries the same WHERE preview_of_slug IS
 // NOT NULL predicate. Soft-deleted previews (apps.status = 'deleted')
 // are filtered out so the dashboard doesn't render "torn down" rows
 // in the live pane — they remain queryable via the janitor's
-// tombstone-aware sweep in PR-C.
+// tombstone-aware ListPreviewsForTeardown sweep.
 //
 // The account_id predicate is non-negotiable: a customer should
 // never see another customer's preview rows even if the
@@ -1876,6 +1876,75 @@ func (s *PgStore) PreviewAppsByParent(ctx context.Context, accountID, parentSlug
 		return nil, fmt.Errorf("state: preview apps by parent %q/%q: %w", accountID, parentSlug, err)
 	}
 	return scanApps(rows)
+}
+
+// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) returns the
+// preview rows the teardown janitor should consider on this tick.
+// See the Store interface docstring for the full contract; the
+// load-bearing points restated here because they look like bugs:
+//
+//  1. No `status <> 'deleted'` filter. The janitor sets that status
+//     itself; excluding tombstoned rows would strand any row whose
+//     tombstone write landed but whose preview_pr_state write did
+//     not (apid crash between the two). The torn_down predicate
+//     below is what actually bounds the result set — once a row
+//     reaches torn_down it never comes back.
+//
+//  2. `now` is a parameter, not now(). The janitor owns its clock
+//     so tests (and the e2e TTL case) can drive a 7-day expiry
+//     without sleeping. Passing the Go-side clock also keeps the
+//     sweep deterministic when apid and Postgres disagree by a few
+//     hundred ms.
+//
+// The predicate is an OR of "PR is in a terminal-ish state" and
+// "TTL elapsed", which lets the partial index
+// apps_preview_expires_at_idx serve the second arm. preview_of_slug
+// is not null is what keeps production rows out entirely.
+func (s *PgStore) ListPreviewsForTeardown(ctx context.Context, now time.Time, maxPerTick int) ([]App, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	sel := `select ` + appsSelectColumns + `
+	          from apps
+	         where preview_of_slug is not null
+	           and coalesce(preview_pr_state, '') <> $1
+	           and (coalesce(preview_pr_state, '') in ($2, $3)
+	                or (preview_expires_at is not null and preview_expires_at < $4))
+	         order by preview_expires_at asc nulls last
+	         limit $5`
+	rows, err := s.pool.Query(ctx, sel,
+		PreviewPrStateTornDown, PreviewPrStateClosed, PreviewPrStateStale,
+		now.UTC(), maxPerTick)
+	if err != nil {
+		return nil, fmt.Errorf("state: list previews for teardown: %w", err)
+	}
+	return scanApps(rows)
+}
+
+// SetPreviewPrState (ADR-095 PR-C / issue #272) advances one preview
+// row's lifecycle label. The `preview_of_slug is not null` predicate
+// is a safety interlock, not an optimisation: it means a bug in the
+// janitor's sweep can never relabel a customer's production app —
+// the UPDATE simply matches zero rows and returns ErrNotFound.
+//
+// The Go-side PreviewPrStateIsValid check runs first so an invalid
+// value surfaces as a wrapped Go error with the offending string,
+// rather than as SQLSTATE 23514 from apps_preview_pr_state_chk.
+// Both gates are kept: the CHECK is authoritative for any writer,
+// this one is for a legible error message.
+func (s *PgStore) SetPreviewPrState(ctx context.Context, appID, prState string) (App, error) {
+	if !PreviewPrStateIsValid(prState) {
+		return App{}, fmt.Errorf("state: set preview pr_state %q for app %q: %w", prState, appID, ErrInvalidPreviewPrState)
+	}
+	var a App
+	row := s.pool.QueryRow(ctx, `
+		update apps set preview_pr_state = $2
+		where id = $1 and preview_of_slug is not null
+		returning `+appsSelectColumns, appID, prState)
+	if err := scanAppInto(&a, row); err != nil {
+		return App{}, mapErr(err)
+	}
+	return a, nil
 }
 
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
@@ -4727,6 +4796,37 @@ func (s *PgStore) UpsertDeploymentScanResult(ctx context.Context, deploymentID s
 		    set scan_result = $2, scan_status = $3, scanned_at = now()
 		  where id = $1`,
 		deploymentID, scanResult, nullString(status))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpsertDeploymentSecretFindings writes the secret-scan audit row
+// (migrations/00221, secret-scan v2). Mirrors UpsertDeploymentScanResult:
+// scopes to one deployment row, overwrites (not creates a second),
+// and returns ErrNotFound on a missing row so a misuse at the call
+// site fails closed. The scan_status on the deployment row is
+// updated to the closed-set value the caller passes
+// ('complete_with_redactions' on a non-empty findings list) so the
+// dashboard pill reflects what the customer actually uploaded.
+//
+// We update scan_status in the SAME statement (rather than two
+// round-trips) so the audit row + dashboard pill can never disagree:
+// a future reader either sees both updated or neither. The
+// `complete_with_redactions` value is enforced by the
+// migrations/00221 CHECK widening.
+func (s *PgStore) UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set secret_findings = $2,
+		        scan_status = $3,
+		        secret_scanned_at = $4
+		  where id = $1`,
+		deploymentID, findings, nullString(status), scannedAt)
 	if err != nil {
 		return err
 	}
@@ -11609,6 +11709,7 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at,
+	secret_findings, secret_scanned_at,
 	coalesce(parked_reason,''), parked_at,
 	traffic_percent,
 	scope`
@@ -11639,6 +11740,7 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.sidecars, '[]'::jsonb),
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
+	d.secret_findings, d.secret_scanned_at,
 	coalesce(d.parked_reason,''), d.parked_at,
 	d.traffic_percent,
 	d.scope`
@@ -11701,6 +11803,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
+		&d.SecretFindings, &d.SecretScannedAt,
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
 		&d.Scope); err != nil {
 		return mapErr(err)

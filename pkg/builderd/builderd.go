@@ -74,6 +74,14 @@ type Config struct {
 	CacheDir string `toml:"cache_dir"`
 	// SourceSpoolDir mirrors apid's source spool; builderd reads from here.
 	SourceSpoolDir string `toml:"source_spool_dir"`
+	// SourceWaitTimeout is how long a claimed build waits for its
+	// source tarball to appear in the spool before requeueing.
+	// The LISTEN/NOTIFY claim races the box-to-box spool sync
+	// (pg_notify lands in ~ms; the tarball rsync needs ~1s), so on a
+	// split-box fleet the notify-driven claim can observe the spool
+	// dir before the file lands. Zero falls back to the 10s default
+	// in New — the legacy instant-fail behaviour is gone.
+	SourceWaitTimeout time.Duration `toml:"source_wait_timeout"`
 	// ResidentProbeSocket is where builderd reaches schedd's residency
 	// reporting. Empty disables the opportunistic 2nd slot.
 	ResidentProbeSocket string `toml:"resident_probe_socket"`
@@ -149,6 +157,9 @@ func New(store state.Store, notif Notifier, vm VM, cache *Cache, det *Detector, 
 	}
 	if cfg.BuildTimeoutSeconds == 0 {
 		cfg.BuildTimeoutSeconds = api.BuildTimeoutSeconds
+	}
+	if cfg.SourceWaitTimeout == 0 {
+		cfg.SourceWaitTimeout = 10 * time.Second
 	}
 	return &Builderd{
 		store:    store,
@@ -336,6 +347,24 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	// nil-safe at the call sites (M-6 fix).
 	buildStart := time.Now()
 
+	// Split-box spool sync is eventually consistent: pg_notify lands
+	// on builderd in ~ms, while the apid→compute-node rsync of the
+	// source tarball needs ~1s. A notify-driven claim can therefore
+	// observe the spool before the file exists and previously failed
+	// the build outright. When SourceWaitTimeout > 0, wait for the
+	// source to appear; if it still hasn't by the deadline, requeue
+	// (same contract as ErrNoSlot: the row stays queued, the durable
+	// worker re-claims it on the next tick).
+	if b.cfg.SourceWaitTimeout > 0 {
+		if err := b.waitForSource(ctx, dep.SourcePath, b.cfg.SourceWaitTimeout); err != nil {
+			b.emitBuildLog(ctx, build.ID, fmt.Sprintf("source spool lag — requeued (%v)\n", err))
+			if rerr := b.store.RequeueBuild(ctx, build.ID); rerr != nil {
+				b.log.Warn("builderd: requeue on source-lag", "build", build.ID, "err", rerr)
+			}
+			return BuildResult{}, err
+		}
+	}
+
 	fw, ver, err := b.detector.DetectWithVersion(dep.SourcePath)
 	if err != nil {
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureUserError, "framework detect: "+err.Error(), buildStart)
@@ -441,6 +470,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		LogPath:      dep.LogPath,
 		RAMMB:        api.BuildVMRAMMB,
 		TimeoutSec:   b.cfg.BuildTimeoutSeconds,
+		Plan:         string(acct.Plan),
 	})
 	if err != nil {
 		// Translate a context-deadline to timeout-class; everything else is infra.
@@ -772,6 +802,38 @@ func (b *Builderd) emitBuildLog(ctx context.Context, buildID, line string) {
 	payload := fmt.Sprintf(`{"build":"%s","line":%q}`, buildID, line)
 	if err := b.notif.Notify(ctx, db.NotifyBuildLog, payload); err != nil {
 		b.log.Warn("builderd: notify log", "build", buildID, "err", err)
+	}
+}
+
+// waitForSource blocks until the source tarball at path exists or the
+// timeout expires. It is the split-box spool-sync guard: the
+// notify-driven claim beats the rsync to the compute node, and the
+// detector would otherwise hard-fail the build on a transient ENOENT.
+// Polling cadence is 100ms — far shorter than the rsync's ~1s lag, so
+// the wait is effectively free once the file lands.
+func (b *Builderd) waitForSource(ctx context.Context, path string, timeout time.Duration) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("builderd: stat source: %w", err)
+	}
+	deadline := time.Now().Add(timeout)
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			if _, err := os.Stat(path); err == nil {
+				return nil
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("builderd: stat source: %w", err)
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("builderd: source %s did not appear within %s", path, timeout)
+			}
+		}
 	}
 }
 

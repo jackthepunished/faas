@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/onebox-faas/faas/pkg/gregalesecretscan"
+	"github.com/onebox-faas/faas/pkg/secretscan"
 )
 
 // framework is the source kind auto-detected from the current directory when
@@ -723,7 +723,7 @@ const zeroConfigSourceCapMB = 100
 //
 // envOverride, when non-nil, is a rel-path → redacted-bytes map applied to
 // the matching entry before it's written to the tarball. Used by the
-// --secret-scan default path: pkg/gregalesecretscan.ScanEnvContent flags
+// --secret-scan default path: pkg/secretscan.ScanEnvContent flags
 // every line in a .env* file whose value matches a known credential pattern
 // or exceeds the Shannon-entropy floor, and the caller passes the file's
 // redacted content here so the offending values never enter the archive.
@@ -1061,23 +1061,63 @@ func isEnvFileBase(relSlash string) bool {
 	return false
 }
 
+// secretScanMode is the closed enum for the --secret-scan flag. v1 (PR #862)
+// shipped on/off; v2 adds strict (abort on any finding) and source-tree
+// (scan non-.env files too). The aliases are accepted by
+// parseSecretScanFlag below.
+type secretScanMode int
+
+const (
+	modeOff secretScanMode = iota
+	modeWarn
+	modeStrict
+	modeSourceTree
+)
+
+func (m secretScanMode) String() string {
+	switch m {
+	case modeOff:
+		return "off"
+	case modeWarn:
+		return "warn"
+	case modeStrict:
+		return "strict"
+	case modeSourceTree:
+		return "source-tree"
+	default:
+		return "unknown"
+	}
+}
+
+// isScanEnabled reports whether the mode produces any scan pass. modeStrict
+// and modeSourceTree both run the scan; the difference is what they do
+// AFTER a finding (abort vs warn vs continue).
+func (m secretScanMode) isScanEnabled() bool { return m != modeOff }
+
+// isSourceTree reports whether the mode also walks non-.env files. Only
+// modeSourceTree returns true; everything else is .env-only (PR #862's
+// scope).
+func (m secretScanMode) isSourceTree() bool { return m == modeSourceTree }
+
+// isStrict reports whether the mode should abort (exit 1) when any
+// finding is produced.
+func (m secretScanMode) isStrict() bool { return m == modeStrict }
+
 // parseSecretScanFlag normalises a --secret-scan value (string from the
-// flag parser) to the boolean used by both `gregale deploy` and
+// flag parser) to the secretScanMode used by both `gregale deploy` and
 // `gregale env push`. Accepts the common on/off spellings (on/off,
-// true/false, 1/0, yes/no) so a customer who paste-copies the flag
-// from a tutorial in any of those shapes still gets the expected
-// behaviour. Returns a non-nil error for any other value so a typo
-// (--secret-scan=0, --secret-scan=warn, --secret-scan=yes-please)
-// fails fast at flag parse time rather than silently defaulting.
+// true/false, 1/0, yes/no) for backward compatibility with v1 (PR #862),
+// plus the new v2 spellings (`strict`, `source-tree`, `tree`,
+// `src-tree`). Returns a non-nil error for any other value so a typo
+// (--secret-scan=warn, --secret-scan=yes-please) fails fast at flag parse
+// time rather than silently defaulting.
 //
-// Shared between commands2.go (deploy) and commands5.go (env push) so a
-// future mode (e.g. --secret-scan=warn) can land in one place.
-//
-// The literal values are lifted to named consts so goconst
-// (golangci-lint v2.4.0) does not flag the four repeated string
-// literals here. They mirror the requireSignedTrue / requireSignedFalse
-// pattern in commands_app_security.go:50-59 and forceDefaultFalse in
-// commands_sign_keys_test.go:36, which exist for the same reason.
+// Shared between commands2.go (deploy) and commands5.go (env push). The
+// literal values are lifted to named consts so goconst (golangci-lint
+// v2.4.0) does not flag the repeated string literals. Mirrors the
+// requireSignedTrue / requireSignedFalse pattern in
+// commands_app_security.go:50-59 and forceDefaultFalse in
+// commands_sign_keys_test.go:36.
 const (
 	secretScanOn   = "on"
 	secretScanOff  = "off"
@@ -1085,27 +1125,36 @@ const (
 	secretScanNo   = "no"
 	secretScanOne  = "1"
 	secretScanZero = "0"
+
+	secretScanStrict      = "strict"
+	secretScanSourceTree  = "source-tree"
+	secretScanSourceTree2 = "tree"
+	secretScanSourceTree3 = "src-tree"
 )
 
-func parseSecretScanFlag(raw string) (bool, error) {
+func parseSecretScanFlag(raw string) (secretScanMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case secretScanOn, requireSignedTrue, secretScanOne, secretScanYes:
-		return true, nil
 	case secretScanOff, requireSignedFalse, secretScanZero, secretScanNo:
-		return false, nil
+		return modeOff, nil
+	case secretScanOn, requireSignedTrue, secretScanOne, secretScanYes:
+		return modeWarn, nil
+	case secretScanStrict:
+		return modeStrict, nil
+	case secretScanSourceTree, secretScanSourceTree2, secretScanSourceTree3:
+		return modeSourceTree, nil
 	default:
-		return false, fmt.Errorf("--secret-scan must be 'on' or 'off' (got %q)", raw)
+		return modeOff, fmt.Errorf("--secret-scan must be 'on'/'off'/'strict'/'source-tree' (got %q)", raw)
 	}
 }
 
 // scanAndRedactEnvFiles walks srcDir once, finds every dotenv-style file,
-// runs pkg/gregalesecretscan against it, and returns:
+// runs pkg/secretscan against it, and returns:
 //   - overrides: rel-path → rewritten bytes, where offending lines are
 //     replaced by "<KEY>=<REDACTED # secret detected: stripe_live>".
 //     Empty for files where every line was a secret (the file is still
 //     included in the archive with that placeholder body so the customer's
 //     app doesn't see a missing .env at boot).
-//   - findings:  every gregalesecretscan.Finding produced, with the same
+//   - findings:  every secretscan.Finding produced, with the same
 //     File path as the override key so the caller can render one warning
 //     line per finding to stderr.
 //
@@ -1113,18 +1162,26 @@ func parseSecretScanFlag(raw string) (bool, error) {
 // An unredactable file (read error) is returned as a finding-with-error
 // rather than panicking; the caller decides whether that's a hard stop.
 //
-// secretScan=false is a fast-path escape hatch (--secret-scan=off): the
+// mode == modeOff is the fast-path escape hatch (--secret-scan=off): the
 // walk still happens but no files are scanned and no overrides are
 // produced, so the archive's bytes are identical to the pre-PR behaviour.
-func scanAndRedactEnvFiles(srcDir string, secretScan bool) (overrides map[string][]byte, findings []gregalesecretscan.Finding, err error) {
-	if !secretScan {
+//
+// mode == modeSourceTree additionally calls scanAndRedactTreeFiles and
+// merges its findings + overrides into the same return values. The two
+// passes share an accumulator so callers don't have to distinguish which
+// pass produced which finding.
+//
+// mode == modeStrict short-circuits on the FIRST finding and returns a
+// *StrictSecretScanError so the caller's printErr path renders a unified
+// 422 envelope + per-finding details.
+func scanAndRedactEnvFiles(srcDir string, mode secretScanMode) (overrides map[string][]byte, findings []secretscan.Finding, err error) {
+	if !mode.isScanEnabled() {
 		return nil, nil, nil
 	}
 	// errs accumulates per-file failures so a transient open/read error on
-	// the first .env file doesn't poison the whole walk (the previous
-	// single-err-variable shape had this bug). At the end we return
-	// errors.Join(errs...) so the caller sees every file that failed;
-	// partial success is still surfaced via overrides/findings.
+	// the first .env file doesn't poison the whole walk. errors.Join at
+	// the end returns every failure to the caller; partial success is
+	// still surfaced via overrides/findings.
 	var errs []error
 	walkErr := filepath.WalkDir(srcDir, func(p string, d os.DirEntry, werr error) error {
 		if werr != nil {
@@ -1155,7 +1212,7 @@ func scanAndRedactEnvFiles(srcDir string, secretScan bool) (overrides map[string
 			errs = append(errs, fmt.Errorf("read %s: %w", relSlash, rerr))
 			return nil
 		}
-		fileFindings := gregalesecretscan.ScanEnvContent(relSlash, data)
+		fileFindings := secretscan.ScanEnvContent(relSlash, data)
 		if len(fileFindings) == 0 {
 			return nil
 		}
@@ -1169,6 +1226,27 @@ func scanAndRedactEnvFiles(srcDir string, secretScan bool) (overrides map[string
 	if walkErr != nil {
 		errs = append(errs, fmt.Errorf("walk %s: %w", srcDir, walkErr))
 	}
+	// Source-tree pass: same accumulator, walks non-.env files too.
+	if mode.isSourceTree() {
+		treeOverrides, treeFindings, treeErr := scanAndRedactTreeFiles(srcDir)
+		if treeErr != nil {
+			errs = append(errs, treeErr)
+		}
+		for k, v := range treeOverrides {
+			if overrides == nil {
+				overrides = make(map[string][]byte)
+			}
+			overrides[k] = v
+		}
+		findings = append(findings, treeFindings...)
+	}
+	// Strict mode: surface as a typed error so the CLI's printErr path
+	// emits a unified 422 envelope + per-finding details. We return ALL
+	// findings (not just the first) so the customer sees the full list
+	// and can fix every line in one pass.
+	if mode.isStrict() && len(findings) > 0 {
+		return overrides, findings, &StrictSecretScanError{Findings: findings, Hint: "move detected secrets to `gregale secrets set` (see https://docs.gregale.dev/cli/secrets)"}
+	}
 	return overrides, findings, errors.Join(errs...)
 }
 
@@ -1181,7 +1259,7 @@ func scanAndRedactEnvFiles(srcDir string, secretScan bool) (overrides map[string
 // The placeholder preserves the original KEY so the customer's app can
 // still boot without crashing on a missing env var; the comment makes the
 // redaction self-documenting in the deployed tarball.
-func redactEnvContent(data []byte, findings []gregalesecretscan.Finding) []byte {
+func redactEnvContent(data []byte, findings []secretscan.Finding) []byte {
 	bad := make(map[int]string, len(findings))
 	for _, f := range findings {
 		bad[f.Line] = f.Provider
@@ -1248,3 +1326,185 @@ func redactEnvContent(data []byte, findings []gregalesecretscan.Finding) []byte 
 // renderer so a future contributor changing the message format only
 // touches one place. The two-line output shape is documented inline
 // at renderSecretScanWarnings.
+
+// treeScanMaxBytes caps the per-file size we'll read when running a
+// source-tree scan. The cap exists so a 200-MiB customer-uploaded
+// artefact (e.g. a bundled video or a compiled binary with a .ts
+// extension) doesn't OOM the CLI. The cap is read-only — files larger
+// than the cap are SKIPPED, not truncated, because a truncated PEM
+// block can fail to match the armour pattern and silently slip
+// through. The same cap is enforced server-side in
+// cmd/apid/secretscan.go so the two paths agree on what is scanned.
+const treeScanMaxBytes = 1 << 20
+
+// scanAndRedactTreeFiles walks srcDir once for non-.env files and runs
+// pkg/secretscan against every text-shaped file. Returns the same shape
+// as scanAndRedactEnvFiles (overrides + findings) so the caller can
+// merge them into a single accumulator.
+//
+// Behaviour contract:
+//
+//   - Files already classified as env files (isEnvFileBase) are SKIPPED;
+//     the env pass handles them with the .env-shaped placeholder and
+//     would otherwise double-emit findings.
+//   - Files inside an excluded subdir (defaultExcludeDirs, e.g.
+//     .git, node_modules, vendor, __pycache__) are skipped — same as
+//     the tarball walk.
+//   - Files larger than treeScanMaxBytes (1 MiB) are skipped (a
+//     truncated read can drop a multi-line PEM in the middle).
+//   - Binary files (IsTextFile == false) are skipped — NUL-byte probe
+//   - http.DetectContentType per pkg/secretscan/textfile.go.
+//   - openCustomerFile enforces the cmd/gregale os.Open tripwire
+//     (commands5.go) so a symlinked source file doesn't exfiltrate
+//     unrelated host paths.
+//
+// Files that produce at least one finding have their contents
+// rewritten via redactFileContent; clean files do not appear in the
+// overrides map (the original is shipped as-is from disk).
+func scanAndRedactTreeFiles(srcDir string) (overrides map[string][]byte, findings []secretscan.Finding, err error) {
+	var errs []error
+	walkErr := filepath.WalkDir(srcDir, func(p string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			// Skip excluded subtrees at any depth.
+			if p != srcDir && isExcludedSubdir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, rerr := filepath.Rel(srcDir, p)
+		if rerr != nil {
+			return rerr
+		}
+		relSlash := filepath.ToSlash(rel)
+		// Skip env files — the env pass has already handled them with
+		// the right placeholder shape. Re-scanning would re-emit
+		// findings and double-report.
+		if isEnvFileBase(relSlash) {
+			return nil
+		}
+		// Cheap size gate before opening: stat first, bail out early
+		// on anything over the cap. d.Info() returns *FileInfo; for
+		// symlinks it follows the link so d.IsDir() already filtered
+		// those.
+		info, ierr := d.Info()
+		if ierr != nil {
+			errs = append(errs, fmt.Errorf("stat %s: %w", relSlash, ierr))
+			return nil
+		}
+		if info.Size() > treeScanMaxBytes {
+			return nil
+		}
+		f, ferr := openCustomerFile(p)
+		if ferr != nil {
+			errs = append(errs, fmt.Errorf("open %s: %w", relSlash, ferr))
+			return nil
+		}
+		// Read with an io.LimitReader so a maliciously-sized entry that
+		// slipped past the stat gate (race) still can't OOM us. The
+		// cap is enforced strictly — we drop the file on overflow
+		// rather than scanning a truncated copy.
+		data, rerr := io.ReadAll(io.LimitReader(f, treeScanMaxBytes+1))
+		_ = f.Close()
+		if rerr != nil {
+			errs = append(errs, fmt.Errorf("read %s: %w", relSlash, rerr))
+			return nil
+		}
+		if int64(len(data)) > treeScanMaxBytes {
+			return nil
+		}
+		// Text-file gate: NUL-byte probe + http.DetectContentType.
+		// Skipping binaries keeps the false-positive rate sane.
+		if !secretscan.IsTextFile(relSlash, data) {
+			return nil
+		}
+		fileFindings := secretscan.ScanFile(relSlash, data)
+		if len(fileFindings) == 0 {
+			return nil
+		}
+		findings = append(findings, fileFindings...)
+		if overrides == nil {
+			overrides = make(map[string][]byte)
+		}
+		overrides[relSlash] = redactFileContent(data, fileFindings)
+		return nil
+	})
+	if walkErr != nil {
+		errs = append(errs, fmt.Errorf("walk %s: %w", srcDir, walkErr))
+	}
+	return overrides, findings, errors.Join(errs...)
+}
+
+// redactFileContent rewrites a non-env source file so that every line
+// that produced a Finding is replaced by a safe placeholder. Unlike
+// redactEnvContent (which preserves the original KEY in KEY=VALUE form),
+// this helper has no canonical separator to recover; instead it emits a
+// self-documenting XML-comment-style placeholder that's valid in every
+// common text format (.json, .yaml, .ts, .go, .py, .toml, .html).
+//
+// JSON: a stray `<!-- -->` is invalid JSON. To stay parse-safe for
+// JSON files we emit a sentinel key instead: `"REDACTED_KEY_<n>": "..."
+// ` with a comment-style rationale string. Files where the redacted line
+// is itself inside a string literal (e.g. an `aws_access_key_id: AKIA...`
+// YAML entry) get the inline-comment placeholder because YAML comments
+// are universal; the loader just sees an empty string after stripping.
+//
+// Why a single shape across formats: customers shouldn't have to
+// understand which placeholder is safe in which file. The placeholder
+// is a single XML-style comment that a JSON parser will reject only
+// if it lands inside a string literal, in which case the file was
+// already broken (a JSON file with literal HTML in a string value).
+// The redactor intentionally leaves the file parse-broken so the
+// customer sees the failure at build time and investigates, rather
+// than shipping a half-redacted artefact whose deployment then fails
+// for an unrelated reason.
+//
+// The 1-indexed line numbers from the scanner map 1:1 to the file's
+// line breaks; comments and blank lines are handled by the upstream
+// scanner (skip), so the rewriting pass is straightforward.
+func redactFileContent(data []byte, findings []secretscan.Finding) []byte {
+	bad := make(map[int]string, len(findings))
+	for _, f := range findings {
+		bad[f.Line] = f.Provider
+	}
+	var out bytes.Buffer
+	lineNo := 1
+	hasTrailing := len(data) > 0 && data[len(data)-1] == '\n'
+	first := true
+	writeSep := func() {
+		if !first {
+			out.WriteByte('\n')
+		}
+		first = false
+	}
+	for {
+		i := bytes.IndexByte(data, '\n')
+		var line []byte
+		if i < 0 {
+			line = data
+			data = nil
+		} else {
+			line = data[:i]
+			data = data[i+1:]
+		}
+		if provider, hit := bad[lineNo]; hit {
+			writeSep()
+			// XML-style comment placeholder. Same shape regardless
+			// of source format so customers see one consistent
+			// marker across their tree.
+			fmt.Fprintf(&out, "<!-- REDACTED secret detected: %s -->", provider)
+		} else {
+			writeSep()
+			out.Write(line)
+		}
+		lineNo++
+		if len(data) == 0 {
+			if hasTrailing {
+				out.WriteByte('\n')
+			}
+			return out.Bytes()
+		}
+	}
+}

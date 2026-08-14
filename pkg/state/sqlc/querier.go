@@ -250,16 +250,31 @@ type Querier interface {
 	ListAppErrorFingerprintsForPurge(ctx context.Context, db DBTX, arg ListAppErrorFingerprintsForPurgeParams) ([]pgtype.UUID, error)
 	// ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
 	// one (account_id, app_id) over a (since, until) window.
-	// Cursor pagination via the (last_seen_at, fingerprint) compound
-	// tuple (distinct from the operator's (created_at, id) cursor).
+	// Cursor pagination via the (count, last_seen_at, fingerprint)
+	// compound tuple (distinct from the operator's (created_at, id)
+	// cursor). All three columns are part of the ORDER BY so the
+	// cursor predicate must include all three — dropping `count`
+	// breaks pagination: rows with smaller count but newer
+	// last_seen_at are silently dropped across pages (the cursor
+	// predicate on (last_seen_at, fingerprint) only considers the
+	// inner order, missing the leading count-DESC boundary).
 	// Index path: app_errors_account_app_last_seen_idx covers the
 	// primary scan; the (count DESC) sort happens post-filter on the
 	// bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+	//
+	// sqlc.arg(name) annotations disambiguate the cursor predicate
+	// types — without them sqlc infers the timestamps as timestamptz
+	// from the leading (count, last_seen_at) references and breaks
+	// pagination.
 	ListAppErrorGroups(ctx context.Context, db DBTX, arg ListAppErrorGroupsParams) ([]ListAppErrorGroupsRow, error)
 	// Drill-down rows for one fingerprint. Cursor paginated via
 	// (received_at, request_id). Index path:
 	// app_error_requests_drill_idx. Does NOT include headers_sample
 	// or redactions — those are returned only by GetAppErrorSample.
+	//
+	// sqlc.arg(name) annotations disambiguate the cursor predicate
+	// types — without them sqlc infers $5 as timestamptz from the
+	// leading (received_at) reference, breaking pagination.
 	ListAppErrorRequests(ctx context.Context, db DBTX, arg ListAppErrorRequestsParams) ([]ListAppErrorRequestsRow, error)
 	ListApps(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAppsRow, error)
 	// CP-1: read heartbeat history for one node, newest first. The

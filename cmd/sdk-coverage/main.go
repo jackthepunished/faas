@@ -121,17 +121,18 @@ var routeExclude = map[string]bool{
 // response-shape getters (HTTPClient/BaseURL/Token) belong here so
 // the gate doesn't false-positive on them.
 var sdkMethodExclude = map[string]bool{
-	"HTTPClient":          true,
-	"BaseURL":             true,
-	"Token":               true,
-	"ListDeploymentsAll":  true, // cursor walker; not a route
-	"DeployMultipart":     true, // open-ended reader-based upload; CLI's DeployTarball is the wired route
-	"MintCliAuthCode":     true, // anonymous device-code mint; route excluded above
-	"ExchangeCliAuthCode": true, // anonymous device-code poll; route excluded above
-	"GetStatusSLO":        true, // public status; route excluded above
-	"Logout":              true, // POST /logout is a browser-form post (excluded above); the SDK wraps the same handler as a convenience
-	"GetAccountDPA":       true, // public markdown; route excluded above (also reachable from /security)
-	"GetMyOrg":            true, // GET /v1/orgs/me was added in PR #722 before the OpenAPI spec tracked it; track both in lockstep on the next spec pass
+	"HTTPClient":              true,
+	"BaseURL":                 true,
+	"Token":                   true,
+	"ListDeploymentsAll":      true, // cursor walker; not a route
+	"ListAppErrorRequestsAll": true, // cursor walker; not a route (ADR-096 / PR-B)
+	"DeployMultipart":         true, // open-ended reader-based upload; CLI's DeployTarball is the wired route
+	"MintCliAuthCode":         true, // anonymous device-code mint; route excluded above
+	"ExchangeCliAuthCode":     true, // anonymous device-code poll; route excluded above
+	"GetStatusSLO":            true, // public status; route excluded above
+	"Logout":                  true, // POST /logout is a browser-form post (excluded above); the SDK wraps the same handler as a convenience
+	"GetAccountDPA":           true, // public markdown; route excluded above (also reachable from /security)
+	"GetMyOrg":                true, // GET /v1/orgs/me was added in PR #722 before the OpenAPI spec tracked it; track both in lockstep on the next spec pass
 }
 
 // methodRouteMap pins the routes whose natural SDK verb doesn't
@@ -383,6 +384,15 @@ var methodRouteMap = map[string]string{
 	// sibling per-app family (GetAppMetrics, GetAppSLO, GetApp,
 	// ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/routes": "GetAppRoutes",
+
+	// ADR-096 / PR-B — customer-facing automatic error grouping.
+	// SDK names are pinned to the per-app family (GetAppErrorsSummary,
+	// ListAppErrorRequests, GetAppErrorSample) — auto-derivation would
+	// produce GetAppsSlugErrorsSummary / GetAppsSlugErrorsFingerprintFirst
+	// (Swagger-style) which breaks the navigability match.
+	"GET /v1/apps/{slug}/errors/summary":             "GetAppErrorsSummary",
+	"GET /v1/apps/{slug}/errors/{fingerprint}":       "ListAppErrorRequests",
+	"GET /v1/apps/{slug}/errors/{fingerprint}/first": "GetAppErrorSample",
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the

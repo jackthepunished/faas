@@ -1945,6 +1945,122 @@ func (c *Client) GetAccountSLO(ctx context.Context, window string) (AccountSLORe
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// AppErrorsSummaryOptions controls the query for GetAppErrorsSummary.
+// Both Since and Until are RFC3339Nano strings (NOT time.Time — the
+// wire form is the canonical string so caller-side parse failures
+// surface at the SDK boundary, not inside the transport). When Since
+// or Until is empty, the server applies its own defaults
+// (until=now(), since=until-24h) and may clamp the span to
+// AppErrorsWindowMaxHours (168h). Cursor is an opaque base64 token
+// from a previous response's NextCursor; empty starts a fresh scan.
+// Limit defaults to AppErrorsSummaryDefaultLimit (20) and is capped
+// at AppErrorsSummaryMaxLimit (100) by the server. ADR-096 / PR-B.
+type AppErrorsSummaryOptions struct {
+	Since  string
+	Until  string
+	Cursor string
+	Limit  int
+}
+
+// appendAppErrorsSummaryQuery joins since/until/cursor/limit onto a
+// path with the right separator. Shared by GetAppErrorsSummary so
+// the query-string shape stays consistent regardless of which subset
+// of fields the caller populates.
+func appendAppErrorsSummaryQuery(path string, opts AppErrorsSummaryOptions) string {
+	q := url.Values{}
+	if opts.Since != "" {
+		q.Set("since", opts.Since)
+	}
+	if opts.Until != "" {
+		q.Set("until", opts.Until)
+	}
+	if opts.Cursor != "" {
+		q.Set("cursor", opts.Cursor)
+	}
+	if opts.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", opts.Limit))
+	}
+	if len(q) == 0 {
+		return path
+	}
+	return path + "?" + q.Encode()
+}
+
+// GetAppErrorsSummary returns the per-app top-N grouped error
+// fingerprints for slug over the [since, until] window (Sentry-style
+// continuous window, NOT the SLO closed-set ?window= vocabulary). One
+// row per (account_id, app_id, fingerprint), sorted by count DESC,
+// then last_seen_at DESC, then fingerprint ASC. The server clamps the
+// span to AppErrorsWindowMaxHours (168h) and reports
+// WindowClamped=true on the response when it does so. ADR-096 /
+// PR-B. Sibling surface: GetAppSLO is the latency/error-rate panel
+// (ADR-082); GetAppRoutes is the per-route panel (ADR-093).
+func (c *Client) GetAppErrorsSummary(ctx context.Context, slug string, opts AppErrorsSummaryOptions) (AppErrorsSummaryResponse, error) {
+	var out AppErrorsSummaryResponse
+	path := appendAppErrorsSummaryQuery("/v1/apps/"+slug+"/errors/summary", opts)
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// ListAppErrorRequests paginates the drill-down rows for one
+// fingerprint under GET /v1/apps/{slug}/errors/{fingerprint}. The
+// response's NextCursor (when non-empty) feeds the next call's
+// cursor arg. limit defaults to AppErrorsSummaryDefaultLimit on the
+// server when zero; passing 0 from the SDK hits the same default.
+// Returns 404 when the fingerprint has been purged by the retention
+// cron or never existed (cross-account slug returns 404 too — the
+// IDOR posture is byte-identical). ADR-096 / PR-B.
+func (c *Client) ListAppErrorRequests(ctx context.Context, slug, fingerprint, cursor string, limit int) (AppErrorRequestsResponse, error) {
+	var out AppErrorRequestsResponse
+	path := "/v1/apps/" + slug + "/errors/" + fingerprint
+	q := url.Values{}
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// ListAppErrorRequestsAll is the cursor walker; NOT a route — the
+// route returns a single page, this method pages through to the
+// end. Mirrors the ListOrgInvitationsAll / ListAuditLogAll walker
+// shape. Returns the accumulated []AppErrorRequestItem slice;
+// terminates cleanly when NextCursor is empty. ADR-096 / PR-B.
+func (c *Client) ListAppErrorRequestsAll(ctx context.Context, slug, fingerprint string) ([]AppErrorRequestItem, error) {
+	var out []AppErrorRequestItem
+	cursor := ""
+	for {
+		page, err := c.ListAppErrorRequests(ctx, slug, fingerprint, cursor, 100)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, page.Requests...)
+		if page.NextCursor == "" {
+			return out, nil
+		}
+		cursor = page.NextCursor
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+	}
+}
+
+// GetAppErrorSample returns the single sample row for fingerprint
+// under GET /v1/apps/{slug}/errors/{fingerprint}/first — the row that
+// surfaces the redacted headers_sample + the list of redaction
+// pattern names applied (so the dashboard can render "we redacted X
+// / Y / Z"). When the fingerprint has been purged the server returns
+// 404 (same posture as ListAppErrorRequests). ADR-096 / PR-B.
+func (c *Client) GetAppErrorSample(ctx context.Context, slug, fingerprint string) (AppErrorSampleResponse, error) {
+	var out AppErrorSampleResponse
+	path := "/v1/apps/" + slug + "/errors/" + fingerprint + "/first"
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // UsageSummary returns the account-wide monthly roll-up
 // (used_gb_hours, included_gb_hours, overage_gb_hours, overage_cents).
 // Distinct from GetUsage which returns per-app rows; empty month falls

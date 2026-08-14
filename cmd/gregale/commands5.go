@@ -31,7 +31,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
-	"github.com/onebox-faas/faas/pkg/gregalesecretscan"
+	"github.com/onebox-faas/faas/pkg/secretscan"
 )
 
 // `gregale app` subcommand names — lifted to constants so goconst stops
@@ -251,11 +251,11 @@ func envPush(args []string) int {
 	// the platform's sealed secret store where the customer expects
 	// "SECRET_KEY", not "my live Stripe key". Override with
 	// --secret-scan=off for local-dev sandbox keys (e.g. sk_test_…).
-	secretScan := fs.String("secret-scan", "on", "scan pairs for known credential patterns before pushing (on|off; default on)")
+	secretScan := fs.String("secret-scan", "on", "scan pairs for known credential patterns before pushing (on|off|strict|source-tree; default on)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
-	secretScanOn, secretScanErr := parseSecretScanFlag(*secretScan)
+	secretScanMode, secretScanErr := parseSecretScanFlag(*secretScan)
 	if secretScanErr != nil {
 		PrintFail(os.Stderr, "%s", secretScanErr)
 		return 1
@@ -333,16 +333,40 @@ func envPush(args []string) int {
 	// and a stderr warning to be rendered. The origin string is the
 	// input path or "<stdin>" so the warning says `File: <stdin>` for
 	// pipe input (matches how envPush surfaces other parse errors).
-	if secretScanOn {
+	if secretScanMode.isScanEnabled() {
 		origin := *in
 		if *fromStdin {
 			origin = "<stdin>"
 		}
-		scanPairs := make([]gregalesecretscan.Pair, len(pairs))
+		scanPairs := make([]secretscan.Pair, len(pairs))
 		for i, p := range pairs {
-			scanPairs[i] = gregalesecretscan.Pair{Key: p.k, Value: p.v}
+			scanPairs[i] = secretscan.Pair{Key: p.k, Value: p.v}
 		}
-		findings := gregalesecretscan.ScanEnvPairs(scanPairs, origin)
+		findings := secretscan.ScanEnvPairs(scanPairs, origin)
+		// Strict mode: same shape as deploy's StrictSecretScanError so
+		// the printErr dispatcher renders the unified 422 envelope.
+		// ScanEnvPairs already stamps a 1-indexed Line on each
+		// Finding (the pair-index in the .env file), so we forward
+		// it as-is rather than rewriting Line=0 — the JSON envelope's
+		// `secret_findings[].line` and the text-mode `:N` renderer
+		// both depend on the contract documented in
+		// pkg/secretscan/scan.go.
+		if secretScanMode.isStrict() && len(findings) > 0 {
+			wireFindings := make([]secretscan.Finding, 0, len(findings))
+			for _, f := range findings {
+				wireFindings = append(wireFindings, secretscan.Finding{
+					File:     origin,
+					Line:     f.Line,
+					Key:      f.Key,
+					Provider: f.Provider,
+					Severity: f.Severity,
+					Snippet:  f.Snippet,
+				})
+			}
+			return printErr("Secret scan rejected the push",
+				&StrictSecretScanError{Findings: wireFindings,
+					Hint: "move detected secrets to `gregale secrets set` (see https://docs.gregale.dev/cli/secrets)"})
+		}
 		if len(findings) > 0 {
 			renderEnvPushScanWarnings(findings, osStderr)
 			// Build a drop set keyed by (key, value) so a duplicate
@@ -416,7 +440,7 @@ func envPush(args []string) int {
 // Summary line (only if any findings fired):
 //
 //	! 1 secret(s) skipped from the push. Move to: skip
-func renderEnvPushScanWarnings(findings []gregalesecretscan.Finding, w io.Writer) {
+func renderEnvPushScanWarnings(findings []secretscan.Finding, w io.Writer) {
 	if len(findings) == 0 {
 		return
 	}
