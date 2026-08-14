@@ -852,7 +852,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops).
 		WithEgress(egress).
 		WithProbe(probe).
-		WithPartitionCreate(PartitionCreateLoopFn(poolAdapter{pool}, mc.UpstreamPartitionCreateInterval, log))
+		WithPartitionCreate(PartitionCreateOnceFn(poolAdapter{pool}, log))
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
 
@@ -1097,9 +1097,33 @@ func buildUpstreamProbe(deps runDeps, store state.Store, ops *wire.OpsMetrics, l
 // parameters on its own surface). Called from main only when
 // FAAS_UPSTREAM_PROBE is on; Loop.Health omits "upstream_part"
 // from /healthz when the helper isn't wired.
+//
+// Note: callers that want recordTick("upstream_part", ...) to
+// fire each tick should use PartitionCreateOnceFn instead — the
+// loop variant blocks inside its own ticker, so wrapping it in
+// Loop.runTicks never returns and recordTick is never observed.
 func PartitionCreateLoopFn(db meter.PartitionCreateExecer, interval time.Duration, log *slog.Logger) func(ctx context.Context) {
 	return func(ctx context.Context) {
 		meter.PartitionCreateLoop(ctx, db, interval, log)
+	}
+}
+
+// PartitionCreateOnceFn wraps meter.PartitionCreateOnce (the
+// single-shot sweep) into a func(ctx context.Context) signature.
+// Loop.runTicks then drives the cadence via its own ticker and
+// observes each tick via recordTick("upstream_part", ...), so the
+// /healthz endpoint reports a fresh timestamp instead of "never".
+// This is the wiring TestRun_MetricsAddrServesEndpoints asserts on
+// (cmd/meterd/main_test.go:308-313). The earlier Loop-wrapping
+// pattern blocked inside PartitionCreateLoop's own ticker and
+// starved recordTick — caught by the meterd pg-shard-2 CI gate
+// on R13 fix #2 v1.
+func PartitionCreateOnceFn(db meter.PartitionCreateExecer, log *slog.Logger) func(ctx context.Context) {
+	return func(ctx context.Context) {
+		_, err := meter.PartitionCreateOnce(ctx, db, time.Now())
+		if log != nil && err != nil {
+			log.Error("upstream partition create tick failed", "err", err)
+		}
 	}
 }
 
