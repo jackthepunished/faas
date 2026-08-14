@@ -2338,8 +2338,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// also reads from the same data_upstream_probes table
 	// rather than scraping these metrics.
 	dataUpstreamRTT := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name: prefix + "_data_upstream_rtt_ms",
-		Help: "Observed RTT (ms) bucketed per (kind, host_redacted_hash, region). Buckets cover 1ms..3s — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. The label set is closed: kind ∈ {postgres, redis, mongo, ...}; host_redacted_hash is the 8-hex-char prefix of sha256(salt||host); region is the meterd node's compute_nodes.region. The plaintext host is NEVER in the labels (ADR-098 §11). §12 data-placement dashboard panel.",
+		Name:    prefix + "_data_upstream_rtt_ms",
+		Help:    "Observed RTT (ms) bucketed per (kind, host_redacted_hash, region). Buckets cover 1ms..3s — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. The label set is closed: kind ∈ {postgres, redis, mongo, ...}; host_redacted_hash is the 8-hex-char prefix of sha256(salt||host); region is the meterd node's compute_nodes.region. The plaintext host is NEVER in the labels (ADR-098 §11). §12 data-placement dashboard panel.",
 		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 3000},
 	}, []string{"kind", "host_redacted_hash", "region"})
 	dataUpstreamProbes := prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -2347,8 +2347,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Probe outcomes (TCP+TLS via crypto/tls.Dial). Closed-set labels: outcome ∈ {ok, timeout, refused, tls_handshake, dns, unreachable}. §12 data-placement panel; pre-instantiated so the rows surface from a fresh process.",
 	}, []string{"outcome"})
 	dataUpstreamProbeDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name: prefix + "_data_upstream_probe_duration_seconds",
-		Help: "Per-probe wall-clock duration (TCP+TLS handshake). Buckets cover the 1ms..3s range — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. §12 data-placement panel.",
+		Name:    prefix + "_data_upstream_probe_duration_seconds",
+		Help:    "Per-probe wall-clock duration (TCP+TLS handshake). Buckets cover the 1ms..3s range — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. §12 data-placement panel.",
 		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 3},
 	})
 	commonCollectors = append(commonCollectors, dataUpstreamRTT, dataUpstreamProbes, dataUpstreamProbeDuration)

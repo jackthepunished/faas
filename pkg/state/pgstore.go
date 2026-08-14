@@ -15531,19 +15531,19 @@ type AppUpstreamProbeScore struct {
 // is a single statement and adding it via sqlc would require a
 // schema-bound regeneration):
 //
-//   SELECT DISTINCT ON (u.id, p.region)
-//          u.host_redacted_hash, p.region, u.kind, u.port,
-//          p.rtt_ms, p.ok
-//   FROM data_upstreams u
-//   LEFT JOIN LATERAL (
-//     SELECT region, rtt_ms, ok
-//     FROM data_upstream_probes
-//     WHERE host_redacted_hash = u.host_redacted_hash
-//     ORDER BY sampled_at DESC
-//     LIMIT 1
-//   ) p ON true
-//   WHERE u.account_id = $1 AND u.app_id = $2
-//     AND u.declared_region IS NOT NULL
+//	SELECT DISTINCT ON (u.id, p.region)
+//	       u.host_redacted_hash, p.region, u.kind, u.port,
+//	       p.rtt_ms, p.ok
+//	FROM data_upstreams u
+//	LEFT JOIN LATERAL (
+//	  SELECT region, rtt_ms, ok
+//	  FROM data_upstream_probes
+//	  WHERE host_redacted_hash = u.host_redacted_hash
+//	  ORDER BY sampled_at DESC
+//	  LIMIT 1
+//	) p ON true
+//	WHERE u.account_id = $1 AND u.app_id = $2
+//	  AND u.declared_region IS NOT NULL
 //
 // The LATERAL subquery keeps the index-driven lookup hot
 // (data_upstream_probes partitioned by sampled_at, the
@@ -15609,12 +15609,12 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 	var out []DataUpstream
 	for rows.Next() {
 		var (
-			id, accountIDpg, appIDpg pgtype.UUID
+			id, accountIDpg, appIDpg                                    pgtype.UUID
 			source, scope, kind, host, hostRedactedHash, declaredRegion string
-			port                                                                                    int32
-			lastRTT                                                                                  pgtype.Int4
-			lastProbedAt                                                                             pgtype.Timestamptz
-			lastSeenAt, createdAt                                                                    pgtype.Timestamptz
+			port                                                        int32
+			lastRTT                                                     pgtype.Int4
+			lastProbedAt                                                pgtype.Timestamptz
+			lastSeenAt, createdAt                                       pgtype.Timestamptz
 		)
 		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
 			&hostRedactedHash, &declaredRegion,

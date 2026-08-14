@@ -1620,8 +1620,8 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	placement, err := e.choosePlacementLocked(ctx, Request{
 		AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-		PreferredNodeID:   warmHint,
-		PreferredRegion:   preferredRegion,
+		PreferredNodeID: warmHint,
+		PreferredRegion: preferredRegion,
 	})
 	if err != nil {
 		release()

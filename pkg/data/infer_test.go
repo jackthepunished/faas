@@ -82,9 +82,9 @@ func TestExtractHostPort_HappyPaths(t *testing.T) {
 // common env row in a Postgres shop, which is a §D1.a tripwire.
 func TestKindFromEnvKey_ClosedSet(t *testing.T) {
 	cases := []struct {
-		key     string
-		want    string
-		wantOK  bool
+		key    string
+		want   string
+		wantOK bool
 	}{
 		{"DATABASE_URL", "postgres", true},
 		{"POSTGRES_URL", "postgres", true},
@@ -329,11 +329,11 @@ func TestClassifier_NoPlaintextHostInLogs(t *testing.T) {
 	// Real HashHost; default salt-path → real hash.
 
 	const (
-		plaintextHost  = "very-secret-db-host.example.com"
-		plaintextUser  = "very-secret-user"
-		plaintextPass  = "very-secret-pass"
-		plaintextPort  = "65432"
-		plaintextDSN   = "postgres://"
+		plaintextHost = "very-secret-db-host.example.com"
+		plaintextUser = "very-secret-user"
+		plaintextPass = "very-secret-pass"
+		plaintextPort = "65432"
+		plaintextDSN  = "postgres://"
 	)
 	envs := []EnvRow{
 		{Key: "DATABASE_URL",

@@ -59,25 +59,25 @@ import (
 // Outcome classes:
 //
 //   - ok              — TCP+TLS handshake completed within
-//                       ProbeTimeoutMs.
+//     ProbeTimeoutMs.
 //   - timeout         — context / dial timeout exceeded.
 //   - refused         — TCP RST received (server actively
-//                       refused the connection).
+//     refused the connection).
 //   - tls_handshake   — TCP completed but TLS handshake
-//                       failed (cert mismatch, expired,
-//                       unsupported version).
+//     failed (cert mismatch, expired,
+//     unsupported version).
 //   - dns             — DNS lookup failed.
 //   - unreachable     — Network unreachable / no route to
-//                       host (EHOSTUNREACH on the dial).
+//     host (EHOSTUNREACH on the dial).
 type UpstreamProbeOutcome string
 
 const (
-	UpstreamProbeOutcomeOK          UpstreamProbeOutcome = "ok"
-	UpstreamProbeOutcomeTimeout     UpstreamProbeOutcome = "timeout"
-	UpstreamProbeOutcomeRefused     UpstreamProbeOutcome = "refused"
+	UpstreamProbeOutcomeOK           UpstreamProbeOutcome = "ok"
+	UpstreamProbeOutcomeTimeout      UpstreamProbeOutcome = "timeout"
+	UpstreamProbeOutcomeRefused      UpstreamProbeOutcome = "refused"
 	UpstreamProbeOutcomeTLSHandshake UpstreamProbeOutcome = "tls_handshake"
-	UpstreamProbeOutcomeDNS         UpstreamProbeOutcome = "dns"
-	UpstreamProbeOutcomeUnreachable UpstreamProbeOutcome = "unreachable"
+	UpstreamProbeOutcomeDNS          UpstreamProbeOutcome = "dns"
+	UpstreamProbeOutcomeUnreachable  UpstreamProbeOutcome = "unreachable"
 )
 
 // DefaultProbeTimeout is the per-dial timeout (TCP connect +

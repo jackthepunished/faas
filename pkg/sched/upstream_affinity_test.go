@@ -83,7 +83,7 @@ func TestScoreForUpstreams_SkipsFailing(t *testing.T) {
 	rows := []state.DataUpstreamProbe{
 		{Region: "eu-fra", OK: true, RTTMs: ptrInt(40)},
 		{Region: "us-east", OK: false, RTTMs: ptrInt(5)}, // ignored
-		{Region: "us-east", OK: true, RTTMs: nil},       // NULL RTT
+		{Region: "us-east", OK: true, RTTMs: nil},        // NULL RTT
 		{Region: "us-east", OK: true, RTTMs: ptrInt(80)},
 	}
 	region, mean := scoreForUpstreams(rows)

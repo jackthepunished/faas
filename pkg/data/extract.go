@@ -49,26 +49,26 @@ const (
 // pkg-api-cannot-import-pkg-state) and the env-classifier needs
 // the same vocabulary.
 var schemeKindMap = map[string]string{
-	"postgres":     "postgres",
-	"postgresql":   "postgres",
-	"redis":        "redis",
-	"rediss":       "redis",
-	"mongodb":      "mongo",
-	"mongodb+srv":  "mongo",
-	"cassandra":    "cassandra",
-	"clickhouse":   "clickhouse",
+	"postgres":      "postgres",
+	"postgresql":    "postgres",
+	"redis":         "redis",
+	"rediss":        "redis",
+	"mongodb":       "mongo",
+	"mongodb+srv":   "mongo",
+	"cassandra":     "cassandra",
+	"clickhouse":    "clickhouse",
 	"elasticsearch": "elasticsearch",
-	"opensearch":   "opensearch",
-	"amqp":         "rabbitmq",
-	"amqps":        "rabbitmq",
-	"kafka":        "kafka",
-	"nats":         "nats",
-	"minio":        "minio",
-	"s3":           "s3",
-	"memcached":    "memcached",
-	"etcd":         "etcd",
-	"https":        "https_api",
-	"http":         "https_api",
+	"opensearch":    "opensearch",
+	"amqp":          "rabbitmq",
+	"amqps":         "rabbitmq",
+	"kafka":         "kafka",
+	"nats":          "nats",
+	"minio":         "minio",
+	"s3":            "s3",
+	"memcached":     "memcached",
+	"etcd":          "etcd",
+	"https":         "https_api",
+	"http":          "https_api",
 }
 
 // KindFromEnvKey maps an env-var name (DATABASE_URL, REDIS_URL,
@@ -157,7 +157,7 @@ var bareHostPattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,253}[a-zA
 
 // cassandraContactPointsPattern matches comma-separated
 // host[:port] entries. Same shape as Kafka.
-var cassandraContactPointsPattern = kafkaBootstrapPattern// ExtractHostPort parses a connection-string-shaped env value
+var cassandraContactPointsPattern = kafkaBootstrapPattern // ExtractHostPort parses a connection-string-shaped env value
 // and returns (host, port, kind, ok). The classifier at
 // infer.go uses this for URL-shaped values and the
 // raw-extractor path for the comma-separated values

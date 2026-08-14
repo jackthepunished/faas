@@ -320,4 +320,3 @@ func TestConnectionAwareE2E_UpstreamDelete(t *testing.T) {
 		t.Errorf("list after delete: got %d, want 0", len(list2.Upstreams))
 	}
 }
-

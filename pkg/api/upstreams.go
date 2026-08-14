@@ -256,18 +256,18 @@ func (r PutDataUpstreamRequest) Validate() *Problem {
 // is the hash, not the fragment — the fragment is the response
 // surface, not a database field).
 type DataUpstreamResponse struct {
-	ID                string             `json:"id"`
-	Source            DataUpstreamSource `json:"source"`
-	Kind              DataUpstreamKind   `json:"kind"`
-	HostRedactedHash  string             `json:"host_redacted_hash"`
-	HostLast4         string             `json:"host_last4,omitempty"`
-	Port              int                `json:"port"`
-	Scope             string             `json:"scope,omitempty"`
-	DeclaredRegion    string             `json:"declared_region,omitempty"`
-	LastRTTMs         *int               `json:"last_rtt_ms,omitempty"`
-	LastProbedAt      string             `json:"last_probed_at,omitempty"`
-	CreatedAt         string             `json:"created_at"`
-	LastSeenAt        string             `json:"last_seen_at"`
+	ID               string             `json:"id"`
+	Source           DataUpstreamSource `json:"source"`
+	Kind             DataUpstreamKind   `json:"kind"`
+	HostRedactedHash string             `json:"host_redacted_hash"`
+	HostLast4        string             `json:"host_last4,omitempty"`
+	Port             int                `json:"port"`
+	Scope            string             `json:"scope,omitempty"`
+	DeclaredRegion   string             `json:"declared_region,omitempty"`
+	LastRTTMs        *int               `json:"last_rtt_ms,omitempty"`
+	LastProbedAt     string             `json:"last_probed_at,omitempty"`
+	CreatedAt        string             `json:"created_at"`
+	LastSeenAt       string             `json:"last_seen_at"`
 }
 
 // DataUpstreamListResponse is the wrapped GET response: the

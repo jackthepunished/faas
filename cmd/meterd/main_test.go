@@ -93,16 +93,24 @@ func stubMeterdDeps(cfgPath, metricsAddr string, pool *pgxpool.Pool, listenFn fu
 }
 
 // subSecondIntervalsEnv returns an env reader that pins every
-// FAAS_*_INTERVAL knob to 20 ms. Used by tests that need the four
-// meterd timers (sample / quota / stripe / dunning) to each fire at
-// least once during a brief run; without this, the production
-// defaults (60 s / 3 min / 60 min / 60 min) leave stripe + dunning
+// FAAS_*_INTERVAL knob to 20 ms. Used by tests that need the meterd
+// timers (sample / quota / stripe / dunning / upstream_probe /
+// upstream_part) to each fire at least once during a brief run;
+// without this, the production defaults (60 s / 3 min / 60 min /
+// 60 min / 30 s / 1 h) leave stripe + dunning + upstream_part
 // dormant for the life of any unit test.
+//
+// The upstream_part knob is load-bearing: the C8 wiring always
+// spawns the partition cron via WithPartitionCreate, so /healthz
+// will report upstream_part="never" under the production default
+// (1 h) and trip the FreshTick assertion downstream. Pin both
+// upstream knobs the same way the historical four were pinned.
 func subSecondIntervalsEnv() func(string) string {
 	return func(k string) string {
 		switch k {
 		case "FAAS_SAMPLE_INTERVAL", "FAAS_QUOTA_INTERVAL",
-			"FAAS_STRIPE_INTERVAL", "FAAS_DUNNING_INTERVAL":
+			"FAAS_STRIPE_INTERVAL", "FAAS_DUNNING_INTERVAL",
+			"FAAS_UPSTREAM_PROBE_INTERVAL", "FAAS_UPSTREAM_PARTITION_INTERVAL":
 			return "20ms"
 		}
 		return ""
@@ -249,14 +257,22 @@ func TestRun_MetricsAddrServesEndpoints(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runWithDeps(ctx, discardLog(), deps) }()
 
-	// Wait for the goroutine to register the handler AND for the four
-	// timers to land at least one tick each.
+	// Wait for the goroutine to register the handler AND for every
+	// tracked timer (sample, quota, stripe, upstream_probe,
+	// upstream_part) to land at least one tick each. The healthz
+	// response below will flip Healthy=false on any "never" Ticks entry,
+	// so we need each timer to have fired before we read the body.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		mu.Lock()
 		got := captured
 		mu.Unlock()
-		if got != nil && time.Now().After(deadline.Add(-1500*time.Millisecond)) {
+		// Give the timer goroutines a generous tail window so the
+		// freshly-spawned cron (upstream_part) at least one tick lands
+		// before we read /healthz. 1.5s comfortably covers the
+		// sub-second intervals the test factory sets.
+		ready := got != nil && time.Now().After(deadline.Add(-1500*time.Millisecond))
+		if ready {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -265,9 +281,11 @@ func TestRun_MetricsAddrServesEndpoints(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// /healthz — with the sub-second intervals the four loops have
-	// already ticked, so the JSON body reports Healthy=true and a
-	// status of 200.
+	// /healthz — every wired loop has ticked at least once
+	// (sub-second intervals), so the JSON body reports Healthy=true
+	// and a status of 200. If a new cron is added without bumping
+	// the wait window, this test will flake via the "never" check
+	// below — the assertion is the canonical regression tripwire.
 	rec := httptest.NewRecorder()
 	captured.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK {
@@ -290,7 +308,7 @@ func TestRun_MetricsAddrServesEndpoints(t *testing.T) {
 	}
 	for name, ts := range status.Ticks {
 		if ts == "never" {
-			t.Errorf("/healthz Ticks[%q] = \"never\" after the four timers fired", name)
+			t.Errorf("/healthz Ticks[%q] = \"never\" after the timers fired", name)
 		}
 	}
 

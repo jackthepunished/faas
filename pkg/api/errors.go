@@ -576,7 +576,7 @@ const (
 	// Mirrors the CodePlanWebhooksNotAllowed vs CodePlanWebhookQuota
 	// split at line 533/534.
 	CodePlanDataUpstreamsNotAllowed = "plan_data_upstreams_not_allowed" // 402, Free
-	CodePlanLimitDataUpstreams      = "plan_limit_data_upstreams"        // 403, per-app cap reached
+	CodePlanLimitDataUpstreams      = "plan_limit_data_upstreams"       // 403, per-app cap reached
 
 	// ADR-098 §D4 + §11: explicit-upstream write surface validation.
 	// Distinct codes from CodeEnvVarInvalidKey / CodeEnvVarValueTooLarge
@@ -586,10 +586,10 @@ const (
 	// plaintext host never reaches the response body or the audit
 	// surface. Mirrors the CodePlanRegistryCredentialNotAllowed /
 	// CodeInvalidRegistryHost split at line 533/535.
-	CodeUpstreamInvalidKind = "upstream_invalid_kind"  // 400, closed-vocab check
-	CodeUpstreamInvalidHost = "upstream_invalid_host"  // 400, RFC-952/1123 hostname check
-	CodeUpstreamInvalidPort = "upstream_invalid_port"  // 400, 1..65535 range check
-	CodeUpstreamNotFound    = "upstream_not_found"     // 404, DELETE/GET absent
+	CodeUpstreamInvalidKind = "upstream_invalid_kind" // 400, closed-vocab check
+	CodeUpstreamInvalidHost = "upstream_invalid_host" // 400, RFC-952/1123 hostname check
+	CodeUpstreamInvalidPort = "upstream_invalid_port" // 400, 1..65535 range check
+	CodeUpstreamNotFound    = "upstream_not_found"    // 404, DELETE/GET absent
 
 	// ADR-091 / PR-D: per-deployment env scope collision. The
 	// partial unique index `deployments_app_scope_live_uniq`
