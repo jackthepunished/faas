@@ -378,7 +378,7 @@ type HostEntry struct {
 	// slice to match the surrounding fields — the cache primitive
 	// is kind-agnostic and the cmd-side loader threads one slice
 	// per kind into the HostEntry.
-	Throttle     []EdgeRuleThrottleResolved
+	Throttle []EdgeRuleThrottleResolved
 	// Budget carries the kind=budget subset (ADR-093). The applier
 	// (handler.go::applyEdgeRuleBudget) stamps the per-rule
 	// BudgetMs onto r.Context() via reqbudget.WithRemaining. Stored
