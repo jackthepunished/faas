@@ -879,34 +879,49 @@ func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.De
 var errImageSecretDetected = errors.New("imaged: secret-shaped values detected in image layer")
 
 // runDeployLayerSecretScan runs the post-build secretscan walker
-// against the per-deploy ext4 and stamps the audit row on findings.
+// against the per-deploy ext4 for ONE layer and returns the typed
+// findings WITHOUT writing the audit row or failing the deploy.
+// The caller (handleDeployment) accumulates findings across the
+// main "app" layer + each "sidecar-<slug>" layer and stamps the
+// audit row once at the end — otherwise each layer scan overwrites
+// the row and a multi-sidecar deploy with findings-in-sidecar-A
+// only would lose them when sidecar-B's clean walk stamps a
+// fresh "complete, 0 findings" row.
+//
 // Mirrors runDeployScan structurally (same stageScanExt4 helper,
-// same UpsertDeployment* seam, same observation log line) but the
-// posture is loud-fail: a single finding fails the deploy with
-// errImageSecretDetected. The grype CVE path is best-effort by
-// design (ADR-075 AC #4 — don't block deploys on supply-chain
-// metadata); the secret path is intentionally NOT — secrets are a
-// security boundary, not metadata.
+// same observation log line) but the posture is loud-fail: a
+// single finding fails the deploy with errImageSecretDetected.
+// The grype CVE path is best-effort by design (ADR-075 AC #4 —
+// don't block deploys on supply-chain metadata); the secret path
+// is intentionally NOT — secrets are a security boundary, not
+// metadata.
 //
 // `layer` is the per-walk source label ("app" for the main image,
 // "sidecar-<slug>" for each sidecar). It's stamped into every
 // SecretFinding.Layer in the audit row so the dashboard can render
 // which ext4 the finding came from.
 //
-// Returns true iff the deploy was marked failed (the caller MUST
-// short-circuit the snapshotting transition in that case).
+// Returns findings (possibly nil for a clean walk) and a walk-level
+// error. A walk-level error is non-fatal for the scan itself —
+// the caller logs and continues; secrets are a security scan, not
+// a deploy precondition. Storage/stage failures also return
+// non-fatal errors. The CALLER decides how to react to a hit:
+//
+//	findings, walkErr := h.runDeployLayerSecretScan(...)
+//	if walkErr != nil { /* log + skip */ }
+//	if len(findings) > 0 { /* accumulate + fail */ }
 //
 // Failure modes:
 //
-//   - storageFor error or stageScanExt4 error: log WARN, skip the
-//     scan. Best-effort here matches runDeployScan — if we can't
-//     even stage the ext4, the build itself is already in trouble,
-//     and we don't want to mask the root cause with a noise
-//     secret-scan failure. The build error path will surface
-//     downstream. Returns false (deploy continues).
+//   - storageFor error or stageScanExt4 error: log WARN, return
+//     (nil, err). Matches runDeployScan — if we can't even stage
+//     the ext4, the build itself is already in trouble, and we
+//     don't want to mask the root cause with a noise secret-scan
+//     failure. The build error path will surface downstream.
 //   - runSecretScan returns walk-level error: log WARN + return
-//     false. Best-effort matches cmd/apid::scanExtractedTreeSecrets.
-//   - runSecretScan returns findings > 0: STAMP the audit row
+//     (nil, err). Best-effort matches cmd/apid::scanExtractedTreeSecrets.
+//   - runSecretScan returns findings (possibly empty): return the
+//     findings slice; the caller accumulates + stamps once.
 //     (best-effort on the write itself, but the deploy MUST fail),
 //     then markDeployFailed with errImageSecretDetected. Returns
 //     true so the caller short-circuits the snapshotting transition.
@@ -915,26 +930,26 @@ var errImageSecretDetected = errors.New("imaged: secret-shaped values detected i
 // even if the audit-row write fails (DB blip, schema drift), the
 // deploy fails loudly so the customer's next attempt sees a clean
 // state.
-func (h *Handler) runDeployLayerSecretScan(ctx context.Context, app state.App, dep state.Deployment, layer string) (failed bool) {
+func (h *Handler) runDeployLayerSecretScan(ctx context.Context, app state.App, dep state.Deployment, layer string) ([]secretscan.Finding, error) {
 	if h.store == nil || h.log == nil {
 		// Defensive: tests that build a Handler without wiring
 		// store/log skip the scan entirely (no row to write, no
 		// log channel). Production wires both at cmd/imaged wiring
 		// so the nil branches are unreachable in prod.
-		return false
+		return nil, nil
 	}
 	start := time.Now()
 	be, err := h.storageFor()
 	if err != nil {
 		h.log.Warn("imaged: layer secret scan skipped, storageFor",
 			"deployment", dep.ID, "app", app.Slug, "layer", layer, "err", err)
-		return false
+		return nil, err
 	}
 	scanDir, cleanup, err := h.stageScanExt4(ctx, be, app, dep)
 	if err != nil {
 		h.log.Warn("imaged: layer secret scan skipped, stage",
 			"deployment", dep.ID, "app", app.Slug, "layer", layer, "err", err)
-		return false
+		return nil, err
 	}
 	defer cleanup()
 	findings, walkErr := h.runSecretScan(ctx, scanDir, layer)
@@ -947,38 +962,14 @@ func (h *Handler) runDeployLayerSecretScan(ctx context.Context, app state.App, d
 		h.log.Warn("imaged: layer secret scan walk failed",
 			"deployment", dep.ID, "app", app.Slug, "layer", layer,
 			"err", walkErr, "elapsed", time.Since(start))
-		return false
+		return nil, walkErr
 	}
 	if len(findings) == 0 {
 		h.log.Info("imaged: layer secret scan clean",
 			"deployment", dep.ID, "app", app.Slug, "layer", layer,
 			"elapsed", time.Since(start))
-		// Stamp the "scanned clean" row for parity with the
-		// hit branch — the dashboard renders "scan complete · 0
-		// findings" rather than "scan pending". PR-A only — a
-		// future change could skip the clean-stamp on hot paths
-		// if the jsonb write cost shows up in profiling.
-		scannedAt := time.Now().UTC()
-		upsertDeploymentSecretFindings(ctx, h.store, dep.ID, nil, layer, dep.ImageDigest, scannedAt, h.log)
-		return false
 	}
-	// Findings > 0. Stamp the audit row (best-effort) and
-	// fail the deploy loudly. The deploy's snapshotting
-	// transition does NOT fire — handleDeployment returns
-	// errImageSecretDetected which the caller treats as a
-	// terminal failure.
-	scannedAt := time.Now().UTC()
-	upsertDeploymentSecretFindings(ctx, h.store, dep.ID, findings, layer, dep.ImageDigest, scannedAt, h.log)
-	if markErr := h.markDeployFailed(ctx, dep.ID, errImageSecretDetected, "image-layer secret detected"); markErr != nil {
-		h.log.Warn("imaged: mark deploy failed on layer secret",
-			"deployment", dep.ID, "app", app.Slug, "layer", layer,
-			"err", markErr)
-	} else {
-		h.log.Warn("imaged: layer secret scan rejected deploy",
-			"deployment", dep.ID, "app", app.Slug, "layer", layer,
-			"findings", len(findings), "elapsed", time.Since(start))
-	}
-	return true
+	return findings, nil
 }
 
 // storageFor returns the wired StorageBackend, building a default
@@ -1298,25 +1289,15 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 			return err
 		}
 	default:
+		// PR-A imaged-layer secret scan orchestration lives
+		// inside buildImageLayer (it needs the layer-findings
+		// accumulator across both the main layer and each
+		// sidecar so the audit row is stamped ONCE at the end).
+		// Function deploys are out of scope — they don't go
+		// through buildImageLayer; the runner tarball is
+		// scanned at apid source-tree time.
 		if err := h.buildImageLayer(ctx, app, dep, acct); err != nil {
 			return err
-		}
-		// Per-deploy secret-can-on-image scan (PR-A, imaged-layer
-		// secret scan). Runs AFTER buildImageLayer has stamped
-		// SetDeploymentRootfs (i.e. the per-app ext4 is on disk) and
-		// BEFORE the grype CVE scan + the pending→snapshotting
-		// transition. Loud-fail posture: a finding marks the deploy
-		// row failed with errImageSecretDetected + stamps the audit
-		// row via state.Store.UpsertDeploymentSecretFindings, and we
-		// return the wrapped error so the snapshotting transition
-		// does NOT fire. Function deploys are out of scope (they
-		// don't have a Dockerfile path — the runner injects the
-		// only customer-tarball contents, scanned at apid time).
-		// runDeployLayerSecretScan is best-effort on the walk /
-		// audit-row write; the FAILURE-PATH markDeployFailed is
-		// what guards the security boundary.
-		if h.runDeployLayerSecretScan(ctx, app, dep, "app") {
-			return errImageSecretDetected
 		}
 	}
 
@@ -1691,7 +1672,39 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 	// deploy — a partial sidecar set is worse than a clean
 	// failure because vmmd expects every name in the jsonb
 	// contract surface to have a row.
-	return h.buildSidecarLayers(ctx, app, dep, acct)
+	scFindings, err := h.buildSidecarLayers(ctx, app, dep, acct)
+	if err != nil {
+		return err
+	}
+	// Per-deploy secret-can-on-image scan (PR-A, imaged-layer
+	// secret scan). Runs AFTER buildSidecarLayers has stamped
+	// SetDeploymentSidecarLayer for every sidecar (i.e. every
+	// per-app ext4 is on disk) and BEFORE the grype CVE scan
+	// + the pending→snapshotting transition. Loud-fail
+	// posture: a single finding fails the deploy with
+	// errImageSecretDetected + stamps the audit row via
+	// state.Store.UpsertDeploymentSecretFindings ONCE at the
+	// end with all main+sidecar findings accumulated.
+	// Function deploys are out of scope — buildFunctionLayer
+	// is the only path that doesn't run this scan.
+	mainFindings, walkErr := h.runDeployLayerSecretScan(ctx, app, dep, "app")
+	if walkErr != nil {
+		h.log.Warn("imaged: layer secret scan walk failed (main, non-fatal)",
+			"deployment", dep.ID, "app", app.Slug, "err", walkErr)
+	}
+	allFindings := append(mainFindings, scFindings...)
+	if len(allFindings) == 0 {
+		return nil
+	}
+	scannedAt := time.Now().UTC()
+	upsertDeploymentSecretFindings(ctx, h.store, dep.ID,
+		allFindings, layerSecretScanStatusCompleteWithRedactions,
+		dep.ImageDigest, scannedAt, h.log)
+	if markErr := h.markDeployFailed(ctx, dep.ID, errImageSecretDetected, "image-layer secret detected"); markErr != nil {
+		h.log.Warn("imaged: mark deploy failed on layer secret",
+			"deployment", dep.ID, "app", app.Slug, "err", markErr)
+	}
+	return errImageSecretDetected
 }
 
 // buildSidecarLayers handles the per-sidecar image build for
@@ -1722,22 +1735,23 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 // Returns nil when the deployment carries zero sidecars (the
 // common case today); the api.Sidecar parse and the per-sidecar
 // pullers only run when there's actual work to do.
-func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep state.Deployment, acct state.Account) error {
+func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep state.Deployment, acct state.Account) ([]secretscan.Finding, error) {
+	findings := []secretscan.Finding{}
 	if len(dep.Sidecars) == 0 || string(dep.Sidecars) == "null" {
-		return nil
+		return findings, nil
 	}
 	var sidecars api.Sidecars
 	if err := json.Unmarshal(dep.Sidecars, &sidecars); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "decode sidecars: "+err.Error())
-		return fmt.Errorf("imaged: decode sidecars: %w", err)
+		return findings, fmt.Errorf("imaged: decode sidecars: %w", err)
 	}
 	if len(sidecars) == 0 {
-		return nil
+		return findings, nil
 	}
 	for _, sc := range sidecars {
 		if sc.Name == "" {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "sidecar: missing name")
-			return fmt.Errorf("imaged: sidecar missing name")
+			return findings, fmt.Errorf("imaged: sidecar missing name")
 		}
 		// Re-validate the deny list at the storage boundary.
 		// The API gate already rejected stateful image refs;
@@ -1745,7 +1759,7 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 		if hint, denied := StatefulDenyListMatch(sc.Image); denied {
 			msg := fmt.Sprintf("sidecar %q image refused: stateful pattern; %s", sc.Name, hint)
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, msg)
-			return fmt.Errorf("imaged: %s", msg)
+			return findings, fmt.Errorf("imaged: %s", msg)
 		}
 		layerKey := sched.AppSidecarLayerKey(app.Slug, dep.ID, sc.Name)
 		// Per-sidecar pull path. We use the same h.oci
@@ -1771,7 +1785,7 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 		h.ops.ObserveImagedOCIPull("sidecar_blob", pullResult(err), time.Since(start))
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q pull: %s", sc.Name, err.Error()))
-			return fmt.Errorf("imaged: sidecar %q pull: %w", sc.Name, err)
+			return findings, fmt.Errorf("imaged: sidecar %q pull: %w", sc.Name, err)
 		}
 		defer func() {
 			for _, r := range pulled.Layers {
@@ -1781,7 +1795,7 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 		be, err := h.storageFor()
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "sidecar storage init: "+err.Error())
-			return fmt.Errorf("imaged: sidecar storage init: %w", err)
+			return findings, fmt.Errorf("imaged: sidecar storage init: %w", err)
 		}
 		// rootfs.Builder.Build input. The sidecar's
 		// `ram_mb` is the memory.max the sidecar cgroup gets
@@ -1805,7 +1819,7 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 		})
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q build: %s", sc.Name, err.Error()))
-			return fmt.Errorf("imaged: sidecar %q build: %w", sc.Name, err)
+			return findings, fmt.Errorf("imaged: sidecar %q build: %w", sc.Name, err)
 		}
 		if _, err := h.store.SetDeploymentSidecarLayer(ctx, state.DeploymentSidecarLayer{
 			DeploymentID:  dep.ID,
@@ -1815,26 +1829,30 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 			ContentDigest: sc.Image,
 		}); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q stamp: %s", sc.Name, err.Error()))
-			return fmt.Errorf("imaged: sidecar %q stamp: %w", sc.Name, err)
+			return findings, fmt.Errorf("imaged: sidecar %q stamp: %w", sc.Name, err)
 		}
 		// Per-sidecar secret-can-on-image scan (PR-A). Mirrors the
 		// main-image scan above — same engine, same loud-fail
-		// posture, same UpsertDeploymentSecretFindings audit-row
-		// seam. The "layer" label is "sidecar-<slug>" so the
+		// posture. The "layer" label is "sidecar-<slug>" so the
 		// dashboard can attribute findings to the right sidecar.
-		// Returns errImageSecretDetected on a finding so the
-		// buildSidecarLayers caller short-circuits the rest of the
-		// sidecar loop (a partial sidecar set is worse than a clean
-		// failure — see the comment block above).
-		if h.runDeployLayerSecretScan(ctx, app, dep, "sidecar-"+sc.Name) {
-			return errImageSecretDetected
+		// We ACCUMULATE findings here and let handleDeployment
+		// stamp the audit row ONCE at the end — otherwise each
+		// sidecar's clean walk would overwrite the prior sidecar's
+		// findings (UpsertDeploymentSecretFindings is an
+		// overwrite-not-append). The first failure for any sidecar
+		// short-circuits the rest of the sidecar loop (a partial
+		// sidecar set is worse than a clean failure — see the
+		// comment block above).
+		if scFindings, _ := h.runDeployLayerSecretScan(ctx, app, dep, "sidecar-"+sc.Name); len(scFindings) > 0 {
+			findings = append(findings, scFindings...)
+			return findings, errImageSecretDetected
 		}
 		h.log.Info("imaged: build sidecar layer",
 			"app", app.Slug, "sidecar", sc.Name, "kind", sc.Type,
 			"key", layerKey, "bytes", result.ContentBytes,
 			"layers", len(pulled.Layers))
 	}
-	return nil
+	return findings, nil
 }
 
 // buildFunctionLayer assembles a function deploy's app-layer ext4:

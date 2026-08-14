@@ -11498,6 +11498,13 @@ components:
         findings:
           type: array
           items: { $ref: '#/components/schemas/SecretFinding' }
+        error:
+          type: string
+          description: |
+            In-band explanation when the audit row is unreadable
+            (jsonb decode failed). Mirrors `ScanResult.error`.
+            Empty on the success path — `status` carries the
+            closed-set signal there.
 
     Problem:
       type: object

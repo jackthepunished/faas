@@ -205,22 +205,21 @@ func (s *server) secretScanResponse(d state.Deployment) *api.SecretScanResult {
 	if d.SecretScannedAt == nil {
 		return nil
 	}
-	out := api.SecretScanResult{
-		Status: "complete",
-	}
-	if !d.SecretScannedAt.IsZero() {
-		out.ScannedAt = d.SecretScannedAt.UTC().Format(time.RFC3339Nano)
-	}
+	// Status starts empty. The earlier "Status: 'complete'"
+	// default silently miscategorised finding-positive rows
+	// whose jsonb failed to unmarshal — Status would read
+	// "complete" while findings>0 implied "complete_with_redactions".
+	// Treating the decoded payload as authoritative means a
+	// decode failure surfaces an Error+empty-Status result the
+	// dashboard can render as the same "scan summary unavailable"
+	// pill it renders for an unreadable row.
+	out := api.SecretScanResult{}
+	out.ScannedAt = d.SecretScannedAt.UTC().Format(time.RFC3339Nano)
 	out.ImageDigest = d.ImageDigest
 	if len(d.SecretFindings) > 0 {
 		if err := json.Unmarshal(d.SecretFindings, &out); err != nil {
-			// Decode failure is logged but doesn't
-			// surface a 500 — the row carries a Status
-			// the customer can act on (re-deploy,
-			// contact support). The empty Findings
-			// renders as the "scan summary unavailable"
-			// view on the dashboard.
 			out.Findings = nil
+			out.Error = "secret_findings decode failed (server logs carry the detail)"
 			s.log.Warn("apid: decode secret_findings",
 				"deployment", d.ID, "err", err)
 		}

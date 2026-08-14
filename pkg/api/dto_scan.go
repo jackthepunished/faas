@@ -132,6 +132,14 @@ type SecretScanResult struct {
 	// rejection payload (the cmd/apid 422 path doesn't have
 	// an image digest — the customer hasn't uploaded yet).
 	ImageDigest string `json:"image_digest,omitempty"`
+	// Error carries an in-band explanation when the audit
+	// row is unreadable (jsonb decode failed, server logs
+	// carry the detail). Mirrors ScanResult.Error so the
+	// dashboard's "scan summary unavailable" pill has
+	// something to render for a malformed row. Omitted on
+	// the success path (Status carries the closed-set
+	// signal: "complete" | "complete_with_redactions").
+	Error string `json:"error,omitempty"`
 }
 
 // SeverityCounts is the per-severity bucket count of CVEs
