@@ -73,22 +73,8 @@ func imagedLayerSecretScanIsExcludedDir(name string) bool {
 	return false
 }
 
-// layerSecretScanRunner is the post-build filesystem walker PR-A
-// injects into imaged's Handler. Signature mirrors runGrype
-// (pkg/imaged/handler.go) — caller hands a staged filesystem root
-// (typically the path stageScanExt4 unmounted onto); the function
-// returns the typed secretscan.Finding slice (empty == clean) plus
-// a fatal error if the walk itself was unrecoverable.
-//
-// The "layer" parameter carries the per-walk source label
-// ("app" | "sidecar-<slug>") that gets stamped onto every
-// api.SecretFinding in the audit row — the API surface needs the
-// label to know whether a finding is in the main image or in a
-// sidecar (different blast radius).
-type layerSecretScanRunner func(ctx context.Context, dir, layer string) ([]secretscan.Finding, error)
-
 // runDeployLayerSecretScan is the imaged-side default
-// implementation of layerSecretScanRunner. Mirrors
+// implementation of the post-build layer walker. Mirrors
 // cmd/apid/secretscan.go::scanExtractedTreeSecrets exactly — same
 // open-with-Lstat-guard, same 1 MiB strict cap, same IsTextFile
 // gate, same ScanFile entry. The "layer" argument is purely

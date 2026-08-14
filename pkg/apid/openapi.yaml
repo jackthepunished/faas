@@ -2911,7 +2911,7 @@ paths:
                 $ref: '#/components/schemas/SecretScanResult'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
-          description: Deployment row missing, cross-account probe, or scan has not run yet.
+          description: Deployment row missing, cross-account probe, or secret scan has not been stamped for this deploy yet (pre-PR-A rows return 404 because the `secret_findings` jsonb has never been written).
           content:
             application/problem+json:
               schema:
