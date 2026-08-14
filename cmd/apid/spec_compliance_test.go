@@ -147,6 +147,17 @@ var dtoExclude = map[string]bool{
 	// the wire — apid inlines the per-plan values from the
 	// acct.Plan row at validateEdgeRuleAction time.
 	"ThrottleValidationContext": true,
+	// Issue #879 / ADR-100 PR-A — the wire DTOs for tenant surfaces
+	// are declared in pkg/api/dto.go so the state surface + cert
+	// engine + dns_poller extension have a typed contract, but the
+	// HTTP routes are dark until PR-C lights them behind
+	// FAAS_TENANT_SURFACES_ENABLED. The OpenAPI schemas ship with
+	// PR-C so the spec is updated in lockstep with the routes.
+	"TenantSurfaceResponse":      true,
+	"TenantHostnameResponse":     true,
+	"CreateTenantSurfaceRequest": true,
+	"ListTenantSurfacesResponse": true,
+	"AddTenantHostnameRequest":   true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the

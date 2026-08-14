@@ -328,6 +328,17 @@ const (
 	//   informational — the consumer re-reads the row to defend
 	//   against notify loss. Consumed by cmd/githubd/main.go.
 	NotifyGithubWebhookSecretChanged = "github_webhook_secret_changed"
+	// NotifyTenantSurfaceChanged {"surface_id":uuid}
+	//   any tenant_surfaces / tenant_hostnames mutation →
+	//   cmd/gatewayd-internal: the cert-remint goroutine
+	//   re-assembles the SAN set for the surface and asks the
+	//   issuer (pkg/gateway/cert_issuer.go) for a fresh cert.
+	//   ADR-100 D3 (issue #879). Payload is the bare surface
+	//   uuid — the consumer re-reads the row + hostnames
+	//   (defence against notify loss; the trigger at
+	//   migrations/00243 fires on every INSERT/UPDATE/DELETE of
+	//   either table, including verified flips).
+	NotifyTenantSurfaceChanged = "tenant_surface_changed"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

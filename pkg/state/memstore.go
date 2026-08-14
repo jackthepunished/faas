@@ -153,6 +153,20 @@ type MemStore struct {
 	// is needed. Soft-delete semantics (apps.status='deleted') are
 	// mirrored by the per-app lookup in the quota-check branch.
 	edgeRules map[string]EdgeRule
+	// tenantSurfaces is keyed by TenantSurface.ID (uuid); the
+	// account-keyed lookup GetTenantSurfaceByName and the host-keyed
+	// TenantSurfaceByHostname linear-scan on demand. MemStore holds
+	// the entire dataset under m.mu so per-table indexes are
+	// unnecessary — every method synchronises against m.mu.
+	//
+	// tenantHostnames is keyed by hostname (citext storage in
+	// tenant_hostnames.hostname); the unique-across-surfaces invariant
+	// is enforced by scanning and rejecting duplicates in
+	// CreateTenantHostnameIfUnderQuota.
+	//
+	// ADR-100 / issue #879.
+	tenantSurfaces  map[string]TenantSurface
+	tenantHostnames map[string]TenantHostname
 	// invocations is the Move 1 event-shaped queue (async_invoke,
 	// queue, delayed_task, cron). MemStore mirrors PgStore's `select
 	// ... for update skip locked` semantics by serialising every access
@@ -519,14 +533,17 @@ func NewMemStore() *MemStore {
 		appWebhookDeliveries: map[string]AppWebhookDelivery{},
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
-		invocations:          map[string]Invocation{},
-		instances:            map[string]Instance{},
-		loginTokens:          map[string]LoginToken{},
-		cliAuthCodes:         map[string]CliAuthCode{},
-		accountPasswords:     map[string]AccountPassword{},
-		oauthLinks:           map[string]OAuthLink{},
-		deploymentLogs:       map[string][]LogEntry{},
-		deploymentSeq:        map[string]int64{},
+		// ADR-100 / tenant surfaces — see memstore_tenant_surface.go.
+		tenantSurfaces:   map[string]TenantSurface{},
+		tenantHostnames:  map[string]TenantHostname{},
+		invocations:      map[string]Invocation{},
+		instances:        map[string]Instance{},
+		loginTokens:      map[string]LoginToken{},
+		cliAuthCodes:     map[string]CliAuthCode{},
+		accountPasswords: map[string]AccountPassword{},
+		oauthLinks:       map[string]OAuthLink{},
+		deploymentLogs:   map[string][]LogEntry{},
+		deploymentSeq:    map[string]int64{},
 		// Issue #463 / ADR-069 / PR-B — per-workload filesystem
 		// handles (mirrors migration 00119's PK + ON CONFLICT
 		// semantics).
