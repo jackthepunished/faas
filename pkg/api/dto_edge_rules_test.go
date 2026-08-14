@@ -736,6 +736,7 @@ func TestEdgeRuleThrottleAction_Validate_AcceptsPlanZero(t *testing.T) {
 		}
 	})
 }
+
 // ADR-093 / kind=budget DTO tests. The kind=budget validator
 // pins the apid-side wire contract for the per-request wall-clock
 // budget primitive. Mirrors the kind=limit shape (two simple
