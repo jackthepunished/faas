@@ -1,13 +1,13 @@
 //go:build !no_pg
 
-// Migration-apply test for 00244_edge_rules_kind_throttle.sql
+// Migration-apply test for 00265_edge_rules_kind_throttle.sql
 // (ADR-091 D20.5 amendment, issue #881 PR-A, kind=throttle).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00244 (no goose
+//  1. Migration set applies cleanly through 00265 (no goose
 //     duplicate-version panic). The kind=throttle slot lands at
-//     00244 after the kind=maintenance widening at 00236 (PR #867)
+//     00265 after the kind=maintenance widening at 00236 (PR #867)
 //     and PR #884's reservation fences at 00238-00243; see
 //     cross-pr-slot-fence-reservation-fence-pattern. Future
 //     renumbering must re-verify `git ls-tree origin/main
@@ -34,7 +34,7 @@
 //  5. All 11 pre-existing kinds still accept (load-bearing
 //     regression pin for the CHECK-rewrite race between this
 //     migration and the kind=geo widening at 00229 / kind=
-//     maintenance at 00236 — the 00244 vocabulary must still
+//     maintenance at 00236 — the 00265 vocabulary must still
 //     round-trip after this migration).
 //  6. A typo kind='throttel' is rejected with 23514
 //     (check_violation). Pins the closed vocabulary contract.
@@ -64,17 +64,17 @@ var throttleMigrationVocab = []string{
 	"maintenance", "throttle",
 }
 
-func TestMigrations_00244_EdgeRulesKindThrottle(t *testing.T) {
+func TestMigrations_00265_EdgeRulesKindThrottle(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00244 should land last
+	// (1) Run the full migration set. 00265 should land last
 	// (alongside 00245 if a PR-A trailing fence was needed; for
-	// this PR 00244 carries the real DDL and there is no
+	// this PR 00265 carries the real DDL and there is no
 	// 00245 from this branch). PR #884's 00238-00243 fences
 	// must not interfere — they're pure fences with no DDL.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00236 maintenance and 00244 throttle)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00236 maintenance and 00265 throttle)", err)
 	}
 
 	// (2) CHECK constraint shape + (3) constraint name pin.
@@ -103,7 +103,7 @@ func TestMigrations_00244_EdgeRulesKindThrottle(t *testing.T) {
 	// reads back. Seeds an account + app + edge_rule with the
 	// kind=throttle action jsonb shape (requests_per_second:float
 	// + burst:int). pgstore.MigrateUp has already applied
-	// 00244 — the row goes through the active CHECK.
+	// 00265 — the row goes through the active CHECK.
 	accountID := "00000000-0000-0000-0000-000000002244a"
 	appID := "00000000-0000-0000-0000-000000022441b"
 	ruleID := "00000000-0000-0000-0000-000000022244c"
@@ -158,8 +158,8 @@ func TestMigrations_00244_EdgeRulesKindThrottle(t *testing.T) {
 	}
 
 	// (5) All 11 pre-existing kinds still accept. Walk the
-	// 00244 vocabulary (route..maintenance) and assert each
-	// inserts successfully. The 00244 widening must not have
+	// 00265 vocabulary (route..maintenance) and assert each
+	// inserts successfully. The 00265 widening must not have
 	// narrowed the CHECK.
 	preExistingKinds := []string{
 		"route", "rewrite", "redirect", "headers",

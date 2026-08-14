@@ -1,4 +1,4 @@
--- filename: 00244_edge_rules_kind_throttle.sql
+-- filename: 00265_edge_rules_kind_throttle.sql
 -- +goose Up
 -- +goose StatementBegin
 
@@ -60,10 +60,10 @@
 -- drop them from the closed vocabulary.
 --
 -- PR #884 (ADR-099 tenant-surfaces PR-0) reserves 00238-00243 on
--- its open branch; this migration takes the next slot 00244 so
+-- its open branch; this migration takes the next slot 00265 so
 -- the merge order is unambiguous: PR #884 lands first (its fences
 -- do not depend on schema), then this one re-merges on top.
--- After rebase the kind=throttle file stays at 00244 because none
+-- After rebase the kind=throttle file stays at 00265 because none
 -- of 00238-00243 contain real DDL — they're pure fences.
 --
 -- PR #864 (kind=budget, slot 00231) widens to include 'budget'
