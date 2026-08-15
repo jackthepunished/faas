@@ -138,6 +138,76 @@ var DefaultHostPolicy = HostPolicy{
 	MasqueradeCIDR: "10.100.0.0/16",
 }
 
+// OverlayCIDRError is returned by ValidateOverlayCIDRs when an
+// overlay entry sits inside a DenySet entry. Both the overlay
+// prefix and the deny entry that swallowed it are recorded so the
+// operator can pick a non-overlapping CIDR without re-reading the
+// spec. Used by HostPolicy.Render (which converts the error into a
+// panic — the renderer runs late in boot after SIGHUP-driven policy
+// reloads; the panic surfaces immediately at the failure site) AND
+// by cmd/vmmd/config.go::LoadConfig (which converts the error into
+// a startup-time config error so the operator sees the message
+// before any SIGHUP-driven reload, instead of crash-looping
+// vmmd on a pg_notify EgressPolicyChanged).
+//
+// Mega-PR-B review M3: a single validator shared by the config
+// loader and the renderer is the only way to keep the two
+// checks byte-equivalent — the renderer can't catch what the
+// loader already let through, and the loader can't catch what
+// the renderer later panics on. The struct + Error() here is
+// the load-bearing shared shape.
+type OverlayCIDRError struct {
+	Index   int          // index into the operator's CIDR slice
+	Overlay netip.Prefix // the operator-supplied overlay CIDR
+	Deny    netip.Prefix // the DenySet entry the overlay is a subset of
+	DenySrc string       // SourceADR of the swallowed deny entry (spec §11, ADR-NNN, RFC-NNN)
+}
+
+// Error renders the operator-facing message. Format is stable
+// (operators grep on "subset of deny entry"); the panic / startup-
+// error sites pass it through verbatim.
+func (e *OverlayCIDRError) Error() string {
+	return fmt.Sprintf(
+		"netns: OverlayCIDRs[%d]=%s is a subset of deny entry %s "+
+			"(source: %s) — an accept-before-deny rule would silently "+
+			"disable the lateral-movement contract. Pick an overlay CIDR "+
+			"that sits outside the §11 deny list.",
+		e.Index, e.Overlay, e.Deny, e.DenySrc)
+}
+
+// ValidateOverlayCIDRs walks a slice of CIDR strings (the same
+// shape HostPolicy.OverlayCIDRs and cmd/vmmd.config.go.
+// ComputeNodeConfig.OverlayCIDR share) and rejects any entry that
+// is a subset of any deny entry. Returns nil on success or the
+// first *OverlayCIDRError found.
+//
+// Empty input is valid (single-host dev). A malformed CIDR
+// returns a plain error (parse failures are operator typos, not
+// security events). The same isSubset helper HostPolicy.Render
+// uses is the load-bearing check (range-based; survives
+// /23-vs-/24 and v4-vs-v6 edges — see the isSubset doc comment).
+//
+// Mega-PR-B review M3.
+func ValidateOverlayCIDRs(cidrs []string, deny DenySet) error {
+	for i, overlayStr := range cidrs {
+		overlay, err := netip.ParsePrefix(overlayStr)
+		if err != nil {
+			return fmt.Errorf("netns: OverlayCIDRs[%d] %q: %w", i, overlayStr, err)
+		}
+		for _, e := range deny.Entries {
+			if isSubset(overlay, e.Prefix) {
+				return &OverlayCIDRError{
+					Index:   i,
+					Overlay: overlay,
+					Deny:    e.Prefix,
+					DenySrc: e.SourceADR,
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // Render produces the full /etc/nftables.conf body, including the shebang
 // line (so the file is exec'd directly by `nft -f`) and a `flush ruleset`
 // to clear any prior rules before loading ours.
@@ -172,26 +242,17 @@ func (h HostPolicy) Render() string {
 		panic("netns: HostPolicy.Render: BridgeName, PublicIface, and MasqueradeCIDR are required")
 	}
 
-	// Mega-PR-B Commit 2 panic gate: reject OverlayCIDRs entries that
-	// are subsets of any DenySet entry. An overlay CIDR inside a
-	// denied range would render an `ip saddr <overlay> accept` rule
-	// in the forward chain (see below) that *overrides* the §11
-	// RFC1918 deny — silently disabling the lateral-movement contract
-	// for that overlay. The deny table is RFC1918-anchored (spec §11
-	// ship-blocker); overlay CIDRs must sit OUTSIDE all deny entries.
-	for i, overlayStr := range h.OverlayCIDRs {
-		overlay, err := netip.ParsePrefix(overlayStr)
-		if err != nil {
-			panic(fmt.Sprintf("netns: HostPolicy.Render: OverlayCIDRs[%d] %q: %v", i, overlayStr, err))
-		}
-		for _, e := range h.DenySet.Entries {
-			if overlay.Overlaps(e.Prefix) && isSubset(overlay, e.Prefix) {
-				panic(fmt.Sprintf("netns: HostPolicy.Render: OverlayCIDRs[%d]=%s is a subset of deny entry %s — "+
-					"an accept-before-deny rule would silently disable the lateral-movement contract. "+
-					"Pick an overlay CIDR that sits outside the §11 deny list.",
-					i, overlay, e.Prefix))
-			}
-		}
+	// Mega-PR-B Commit 2 panic gate (delegated to ValidateOverlayCIDRs
+	// so cmd/vmmd/config.go::LoadConfig and HostPolicy.Render share
+	// exactly one range-based subset check — see M3 doc at the
+	// validator). This remains the load-bearing last-line-of-defense
+	// for programmatic misuse (a future caller could mutate
+	// HostPolicy.OverlayCIDRs post-LoadConfig and bypass the
+	// startup-time check); panic surfaces at the failure site so
+	// SIGHUP-driven EgressPolicyChanged reloads can't crash-loop
+	// silently.
+	if err := ValidateOverlayCIDRs(h.OverlayCIDRs, h.DenySet); err != nil {
+		panic(fmt.Sprintf("netns: HostPolicy.Render: %v", err))
 	}
 
 	denyPorts := h.DenySet.SMTPPortsCommaSet()

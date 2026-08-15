@@ -13,6 +13,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -373,6 +374,22 @@ func LoadConfig(path string) (*Config, error) {
 	// also empty).
 	if v := os.Getenv("FAAS_HOST_BRIDGE_CIDR"); v != "" {
 		c.ComputeNode.HostBridgeCIDR = v
+	}
+	// Mega-PR-B review M3: validate [compute_node].overlay_cidr
+	// against the §11 deny set at config-load time, BEFORE vmmd
+	// accepts any traffic or registers with schedd. The render-time
+	// panic in pkg/netns.HostPolicy.Render stays as belt-and-braces
+	// for programmatic misuse (a future caller could mutate the
+	// HostPolicy struct post-load), but operators editing vmmd.toml
+	// get a clear startup error naming both CIDRs instead of a
+	// crash-loop on the first pg_notify EgressPolicyChanged reload.
+	// The validator is the same one the renderer uses — single
+	// source of truth for the subset check, no drift between the
+	// load-time and render-time gates.
+	if overlay := strings.TrimSpace(c.ComputeNode.OverlayCIDR); overlay != "" {
+		if err := netns.ValidateOverlayCIDRs([]string{overlay}, netns.NewDefaultDenySet()); err != nil {
+			return nil, fmt.Errorf("vmmd: [compute_node].overlay_cidr %q invalid: %w", overlay, err)
+		}
 	}
 	return c, nil
 }

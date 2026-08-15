@@ -1,6 +1,7 @@
 package netns
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -621,11 +622,11 @@ func TestHostPolicyRenderSubstitutesMasqueradeCIDR(t *testing.T) {
 // (TestHostPolicyRenderPanicsOnOverlayCIDRInsideDenyCIDR). Each
 // non-denied overlay CIDR must produce:
 //
-//   1. A MASQUERADE sibling in the postrouting chain (per the
-//      per-overlay MASQUERADE loop).
-//   2. An `ip saddr <overlay> accept` rule in the forward chain
-//      BETWEEN the per-CIDR deny block and the broad bridged-tenant
-//      allow (the deny-collision fix).
+//  1. A MASQUERADE sibling in the postrouting chain (per the
+//     per-overlay MASQUERADE loop).
+//  2. An `ip saddr <overlay> accept` rule in the forward chain
+//     BETWEEN the per-CIDR deny block and the broad bridged-tenant
+//     allow (the deny-collision fix).
 //
 // The order assertion is load-bearing — an accept rule emitted
 // BEFORE the per-CIDR deny would be silently shadowed by the deny on
@@ -692,6 +693,112 @@ func TestHostPolicyRenderPanicsOnOverlayCIDRInsideDenyCIDR(t *testing.T) {
 	p := DefaultHostPolicy
 	p.OverlayCIDRs = []string{"10.0.0.0/16"} // subset of 10.0.0.0/8 deny
 	_ = p.Render()
+}
+
+// TestValidateOverlayCIDRs_AcceptsEmptyInput pins the single-host
+// dev shape (OverlayCIDRs nil / empty is valid; the §11 deny set
+// never appears in the forward chain).
+func TestValidateOverlayCIDRs_AcceptsEmptyInput(t *testing.T) {
+	if err := ValidateOverlayCIDRs(nil, NewDefaultDenySet()); err != nil {
+		t.Fatalf("ValidateOverlayCIDRs(nil) must return nil for single-host dev; got %v", err)
+	}
+	if err := ValidateOverlayCIDRs([]string{}, NewDefaultDenySet()); err != nil {
+		t.Fatalf("ValidateOverlayCIDRs([]) must return nil for single-host dev; got %v", err)
+	}
+}
+
+// TestValidateOverlayCIDRs_AcceptsPublicRange pins the success
+// path for the cluster-shipped overlays (TEST-NET-3 203.0.113.0/24
+// + Google 34.0.0.0/8 — both sit OUTSIDE the §11 deny set).
+func TestValidateOverlayCIDRs_AcceptsPublicRange(t *testing.T) {
+	if err := ValidateOverlayCIDRs([]string{"203.0.113.0/24", "34.0.0.0/8"}, NewDefaultDenySet()); err != nil {
+		t.Fatalf("ValidateOverlayCIDRs(public CIDRs) must succeed; got %v", err)
+	}
+}
+
+// TestValidateOverlayCIDRs_RejectsRFC1918Subset is the load-bearing
+// negative case: 10.0.0.0/16 ⊂ 10.0.0.0/8 → error. The error
+// must be *OverlayCIDRError (not a plain string) so callers can
+// surface a stable, grep-able message.
+func TestValidateOverlayCIDRs_RejectsRFC1918Subset(t *testing.T) {
+	err := ValidateOverlayCIDRs([]string{"10.0.0.0/16"}, NewDefaultDenySet())
+	if err == nil {
+		t.Fatal("ValidateOverlayCIDRs(10.0.0.0/16) must return error; got nil")
+	}
+	var ocErr *OverlayCIDRError
+	if !errors.As(err, &ocErr) {
+		t.Fatalf("expected *OverlayCIDRError; got %T (%v)", err, err)
+	}
+	// Message stability: operators grep on "subset of deny entry".
+	if !strings.Contains(err.Error(), "subset of deny entry") {
+		t.Errorf("error message must contain %q for grep-ability; got %q",
+			"subset of deny entry", err.Error())
+	}
+	// Must name the offending deny entry (10.0.0.0/8) so operators
+	// don't have to re-read spec §11.
+	if !strings.Contains(err.Error(), "10.0.0.0/8") {
+		t.Errorf("error message must name the swallowing deny entry 10.0.0.0/8; got %q",
+			err.Error())
+	}
+}
+
+// TestValidateOverlayCIDRs_RejectsCGNATSubset pins the
+// "carrier-grade NAT 100.64.0.0/10 is in the deny set" path —
+// Tailscale's default subnet sits inside §11's CGN deny (RFC6598).
+// Operators using Tailscale MUST override overlay_cidr to a
+// public-range CIDR routed over the mesh.
+func TestValidateOverlayCIDRs_RejectsCGNATSubset(t *testing.T) {
+	err := ValidateOverlayCIDRs([]string{"100.64.0.0/10"}, NewDefaultDenySet())
+	if err == nil {
+		t.Fatal("ValidateOverlayCIDRs(100.64.0.0/10) must return error; got nil")
+	}
+	var ocErr *OverlayCIDRError
+	if !errors.As(err, &ocErr) {
+		t.Fatalf("expected *OverlayCIDRError; got %T", err)
+	}
+	if !strings.Contains(err.Error(), "100.64.0.0/10") {
+		t.Errorf("error message must name the swallowed deny entry 100.64.0.0/10; got %q",
+			err.Error())
+	}
+}
+
+// TestValidateOverlayCIDRs_RejectsMalformedCIDR confirms a
+// non-numeric CIDR string returns an error wrapping the parse
+// failure (operator typo, not a security event — return plain
+// error, not *OverlayCIDRError).
+func TestValidateOverlayCIDRs_RejectsMalformedCIDR(t *testing.T) {
+	err := ValidateOverlayCIDRs([]string{"not-a-cidr"}, NewDefaultDenySet())
+	if err == nil {
+		t.Fatal("ValidateOverlayCIDRs(not-a-cidr) must return error; got nil")
+	}
+	var ocErr *OverlayCIDRError
+	if errors.As(err, &ocErr) {
+		t.Fatalf("malformed CIDR must return plain error (operator typo); got *OverlayCIDRError")
+	}
+	if !strings.Contains(err.Error(), "not-a-cidr") {
+		t.Errorf("error must name the bad CIDR; got %q", err.Error())
+	}
+}
+
+// TestValidateOverlayCIDRs_ReportsIndex pins the Index field —
+// the validator must surface WHICH entry in a multi-CIDR config
+// tripped the gate, not just that some entry did.
+func TestValidateOverlayCIDRs_ReportsIndex(t *testing.T) {
+	// Index 1 (second entry) is the bad one.
+	err := ValidateOverlayCIDRs(
+		[]string{"203.0.113.0/24", "10.0.0.0/16", "34.0.0.0/8"},
+		NewDefaultDenySet(),
+	)
+	if err == nil {
+		t.Fatal("expected error from RFC1918 subset; got nil")
+	}
+	var ocErr *OverlayCIDRError
+	if !errors.As(err, &ocErr) {
+		t.Fatalf("expected *OverlayCIDRError; got %T", err)
+	}
+	if ocErr.Index != 1 {
+		t.Errorf("expected Index=1 (second entry); got %d", ocErr.Index)
+	}
 }
 
 // TestHostPolicyRenderNftSyntaxCheck is the local equivalent of the

@@ -35,6 +35,30 @@ const (
 // Allocator.SetHostIPBase before Acquire so per-instance host IPs land
 // in the operator's chosen /16.
 var (
+	// hostIPBase is the per-host bridge network address the veth
+	// host-side allocation starts from (spec §7, 10.100.x.y/16).
+	// Slot 0 maps to hostIPBase + hostIPOffset so the bridge address
+	// (hostIPBase + 1) and the network address (hostIPBase + 0) are
+	// reserved for the bridge itself.
+	//
+	// Mega-PR-B Commit 1 (issue #911 / ADR-110 Tier-1 BLOCKING) lifts
+	// the bridge CIDR from a Go const into per-host config
+	// (pkg/api.DefaultHostBridgeCIDR + cmd/vmmd/config.go::ComputeNode
+	// Config.HostBridgeCIDR). Single-host dev keeps the legacy
+	// 10.100.0.0 base; multi-host deployments call Allocator.SetHostIP
+	// Base before Acquire so per-instance host IPs land in the
+	// operator's chosen /16.
+	//
+	// hostIPBaseMu guards hostIPBase + hostIPOffset. Acquire/Release
+	// take the read lock for the duration of one hostIPForSlot call;
+	// SetHostIPBase takes the write lock for the duration of the swap.
+	// Not strictly required by the single-call-site discipline (vmmd
+	// main calls SetHostIPBase exactly once at boot, before any
+	// Acquire), but the package-level mutable makes the race
+	// detector the only tripwire without this — the lock makes it
+	// silent-by-construction even if a future test or external caller
+	// races the two operations. Mega-PR-B review M1.
+	hostIPBaseMu sync.RWMutex
 	hostIPBase   = netip.MustParseAddr("10.100.0.0")
 	hostIPOffset = uint32(2)
 )
@@ -47,9 +71,17 @@ var (
 // never hands them out. The setter is additive; legacy callers that
 // don't invoke it keep the v1 single-host 10.100.0.0 base.
 //
-// Not safe for concurrent calls with Acquire/Release; the vmmd main
-// calls SetHostIPBase exactly once at boot, before any Acquire.
+// Cheap to call repeatedly — the RWMutex write-lock path is fast and
+// the swap is a single word (netip.Addr is a 16-byte value but Go's
+// interface boxing doesn't apply here, so it's an atomic-style
+// assignment under the lock).
+//
+// Safe for concurrent calls with Acquire/Release. vmmd main calls
+// SetHostIPBase exactly once at boot, before any Acquire; the lock
+// documents the contract but does not depend on it.
 func SetHostIPBase(addr netip.Addr) {
+	hostIPBaseMu.Lock()
+	defer hostIPBaseMu.Unlock()
 	hostIPBase = addr
 }
 
@@ -153,8 +185,14 @@ func leaseForSlot(instance string, slot int) Lease {
 }
 
 // hostIPForSlot maps a slot into 10.100.0.0/16 starting at .0.2.
+// Takes the read lock so a concurrent SetHostIPBase serializes
+// against the load; reads see either the old or new value, never a
+// torn one. Mega-PR-B review M1.
 func hostIPForSlot(slot int) netip.Addr {
-	v := hostIPBase.As4()
+	hostIPBaseMu.RLock()
+	base := hostIPBase
+	hostIPBaseMu.RUnlock()
+	v := base.As4()
 	n := uint32(v[0])<<24 | uint32(v[1])<<16 | uint32(v[2])<<8 | uint32(v[3])
 	n += hostIPOffset + uint32(slot)
 	return netip.AddrFrom4([4]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)})

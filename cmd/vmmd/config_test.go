@@ -160,6 +160,61 @@ func TestLoadConfig_ReadErrorOther(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_RejectsOverlayCIDRInsideDenySet pins the M3
+// load-time validator: an [compute_node].overlay_cidr that's a
+// subset of any §11 deny entry (RFC1918 / CGNAT / link-local) MUST
+// fail at LoadConfig, NOT at the first EgressPolicyChanged reload
+// where the renderer would panic. The error must name BOTH the
+// offending overlay CIDR and the swallowing deny entry so the
+// operator can fix it without re-reading spec §11.
+func TestLoadConfig_RejectsOverlayCIDRInsideDenySet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmmd.toml")
+	toml := []byte(`
+[compute_node]
+name = "vmmd-fsn-2"
+overlay_cidr = "10.0.0.0/16"  # subset of §11 10.0.0.0/8 deny
+`)
+	if err := os.WriteFile(path, toml, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig must reject overlay_cidr inside §11 deny set; got nil")
+	}
+	if !strings.Contains(err.Error(), "overlay_cidr") {
+		t.Errorf("error %q must name the offending field for operator grep", err.Error())
+	}
+	if !strings.Contains(err.Error(), "10.0.0.0/16") {
+		t.Errorf("error %q must name the offending overlay CIDR", err.Error())
+	}
+	if !strings.Contains(err.Error(), "10.0.0.0/8") {
+		t.Errorf("error %q must name the swallowing deny entry", err.Error())
+	}
+}
+
+// TestLoadConfig_AcceptsOverlayCIDROutsideDenySet pins the happy
+// path: a public-range overlay (TEST-NET-3 203.0.113.0/24) loads
+// without error. Default-empty overlay_cidr (single-host dev) is
+// also accepted (covered by TestLoadConfig_OverridesFromTOML).
+func TestLoadConfig_AcceptsOverlayCIDROutsideDenySet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmmd.toml")
+	toml := []byte(`
+[compute_node]
+name = "vmmd-fsn-2"
+overlay_cidr = "203.0.113.0/24"  # TEST-NET-3; outside §11 deny set
+`)
+	if err := os.WriteFile(path, toml, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig must accept public-range overlay CIDR; got %v", err)
+	}
+	if cfg.ComputeNode.OverlayCIDR != "203.0.113.0/24" {
+		t.Errorf("overlay_cidr not loaded: got %q", cfg.ComputeNode.OverlayCIDR)
+	}
+}
+
 // Issue #95: ResolveListenTarget prefers listen_addr, falls back to
 // unix://+socket_path. The fallback must remain unchanged for
 // single-box deployments.
