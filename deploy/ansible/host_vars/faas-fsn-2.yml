@@ -12,3 +12,9 @@
 
 faas_box_role: compute-only
 faas_node_name: fsn-2
+
+# Ansible connection vars. See host_vars/faas-fsn-1.yml for the
+# rationale. `ansible_host` is the dial target schedd/gatewayd use
+# to reach this box from fsn-1; the same layer-3 mesh endpoint.
+ansible_host: 10.42.0.2
+ansible_python_interpreter: /usr/bin/python3
