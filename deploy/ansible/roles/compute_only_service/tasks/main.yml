@@ -72,6 +72,30 @@
     group: faas
     mode: "0775"
 
+# Mega-PR-C (issue #911 / ADR-110) — fix the reboot race. The
+# chown above only runs at provisioning time; on every reboot
+# of fsn-2, /run/faas is created by systemd's
+# RuntimeDirectory=faas as root:root 0755 first (systemd does
+# NOT honor RuntimeDirectoryGroup on a unit without User= and
+# vmmd has no User=). The chown above does NOT re-fire. Mirror
+# control_plane_service's PR-D pattern: ship a tmpfiles.d rule
+# + run systemd-tmpfiles --create during deploy so /run/faas
+# exists with the canonical root:faas 0775 ownership BEFORE
+# the first vmmd activation on a fresh box. The vmmd unit's
+# ExecStartPre chown remains in place as defense-in-depth
+# (covers a box that runs `systemctl restart faas-vmmd` after
+# a manual /run wipe without a tmpfiles-d apply).
+- name: compute_only_service — install /run/faas tmpfiles.d rule (Mega-PR-C)
+  ansible.builtin.copy:
+    src: faas.conf
+    dest: /etc/tmpfiles.d/faas.conf
+    owner: root
+    group: root
+    mode: "0644"
+- name: compute_only_service — apply /run/faas tmpfiles.d rule (Mega-PR-C)
+  ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf
+  changed_when: false
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the imaged unit so the boot log carries the right
 # identity without a TOML edit (imaged has no config.go). The

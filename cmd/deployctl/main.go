@@ -122,12 +122,30 @@ const cpcpIndex = 0
 // `gregale secrets init` lands) deletes the v1 tree; the cpcpIndex slot
 // will then rebind to a v2 path. The tombstone RETIRED.md in
 // deploy/controlplane/ explains the v1 → v2 mapping for operators.
+//
+// Mega-PR-C: index 0's `skip: cpcpSkipOnlyBuilderd` ensures the new
+// builderd registry entry does NOT emit into the v1 tombstone. The
+// tombstone is a v1 snapshot — adding a post-v1 daemon to it would
+// (a) leave an untracked faas-builderd.service after every
+// `make generate`, breaking `make generate-check`, and (b) confuse
+// the v1→v2 operator narrative.
 var defaultTargets = []target{
-	{dir: "deploy/controlplane/systemd"},
+	{dir: "deploy/controlplane/systemd", skip: cpcpSkipOnlyBuilderd()},
 	{dir: "deploy/systemd", skip: legacySkips()},
 	{dir: "deploy/ansible/roles/control_plane_service/files", skip: ansibleRoleSkips()},
 	{dir: "deploy/ansible/roles/githubd_service/files", skip: githubdOnlySkips()},
 	{dir: "deploy/ansible/roles/compute_only_service/files", skip: computeOnlySkips()},
+}
+
+// cpcpSkipOnlyBuilderd: the v1 cp-cp tombstone (deploy/controlplane/systemd)
+// is a frozen snapshot of the EX44-era daemon set. Daemons that
+// joined AFTER the tombstone was retired (Mega-PR-C: builderd) get
+// skipped so they emit only into the modern trees. The tombstone's
+// 8 v1 unit files stay byte-identical under `make generate-check`.
+func cpcpSkipOnlyBuilderd() map[string]bool {
+	return map[string]bool{
+		"builderd": true,
+	}
 }
 
 // ansibleRoleSkips: the ansible control_plane_service role only ships

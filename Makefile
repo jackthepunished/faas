@@ -441,8 +441,16 @@ tidy: ## go mod tidy
 # the package defaults (eth0 + 10.100.0.0/16); a Hetzner compute
 # node invokes the binary with the env overrides, captures the
 # output, and the ansible template ships THAT to the host.
+#
+# Commit 2 (Mega-PR-C) moved the Jinja2 template from
+# roles/nftables/files/ to roles/nftables/templates/ so ansible's
+# `template:` module resolves at deploy time. The artifact path
+# stays at the legacy files/ location — the committed static is
+# a fallback for operators running `make egress-render` to
+# refresh the canonical-default ruleset; ansible renders the
+# per-host file at bootstrap directly from templates/.
 EGRESS_ARTIFACT := deploy/ansible/roles/nftables/files/policy_nftables.conf
-EGRESS_JINJA2 := deploy/ansible/roles/nftables/files/policy_nftables.conf.j2
+EGRESS_JINJA2 := deploy/ansible/roles/nftables/templates/policy_nftables.conf.j2
 
 .PHONY: egress-render
 egress-render: ## (re)generate the host nft ruleset artifact from pkg/netns/policy.go
@@ -465,8 +473,8 @@ egress-render: ## (re)generate the host nft ruleset artifact from pkg/netns/poli
 # This mirrors what cmd/e2e/sec11_sweep_test.go's
 # TestSec11_PerHostEgressTemplating does.
 .PHONY: egress-render-cross-check
-egress-render-cross-check: ## Diff the Go render against the Jinja2 template render for {default-local, mesh, hetzner} inputs
-	@bash scripts/egress-render-cross-check.sh $(CURDIR)
+egress-render-cross-check: ## Cheap Go ↔ Jinja2 byte-equality smoke for the canonical default-local input (CI per-push gate)
+	@FAAS_EGRESS_ROW_SELECTOR=default-local bash scripts/egress-render-cross-check.sh $(CURDIR)
 
 # CI matrix (ADR-055): exercise the renderer for a non-default
 # public_iface to confirm the substitution path works under the
@@ -484,7 +492,7 @@ egress-render-cross-check: ## Diff the Go render against the Jinja2 template ren
 # keeping the row table in one place avoids the cross-check and
 # matrix diverging over time.
 .PHONY: egress-render-matrix
-egress-render-matrix: ## Render + cross-check 5-row matrix (default-local, mesh-overlay, mesh-overlay-v6, hetzner-ens5, multi-overlay)
+egress-render-matrix: ## Render + cross-check the full 5-row matrix (default-local, mesh-overlay, mesh-overlay-v6, hetzner-ens5, multi-overlay)
 	@bash scripts/egress-render-cross-check.sh $(CURDIR)
 
 .PHONY: egress-check

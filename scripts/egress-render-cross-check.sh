@@ -83,22 +83,42 @@ compare() {
 main() {
   local status=0
   # row format: "label|iface|cidr|overlay|v6"
-  local rows=(
-    # Default-local (every box ships this on day 0)
-    "default-local|eth0|10.100.0.0/16||"
-    # Multi-host mesh: overlay + v6 (the shape Mega-PR-C Commit 6
-    # wires through host_vars/faas-fsn-{1,2}.yml). Use a public-range
-    # overlay (TEST-NET-3 203.0.113.0/24 is RFC5737 documentation; the
-    # §11 deny set excludes it) so HostPolicy.Render's panic gate
-    # approves the input.
-    "mesh-overlay|eth0|10.100.0.0/16|203.0.113.0/24|"
-    "mesh-overlay-v6|eth0|10.100.0.0/16|203.0.113.0/24|fc00::/7"
-    # Hetzner compute node on a renamed NIC
-    "hetzner-ens5|ens5|10.101.0.0/16||"
-    # Stress: multi-CIDR overlay (the spec's "two boxes share a
-    # /24" future case). Both CIDRs are public-range.
-    "multi-overlay|eth0|10.100.0.0/16|203.0.113.0/25,203.0.113.128/25|fc00::/7"
-  )
+  # FAAS_EGRESS_ROW_SELECTOR lets the Makefile targets pick a
+  # subset vs. the full matrix:
+  #   default  → full 5-row matrix (used by egress-render-matrix,
+  #              the canonical input space the Ansible host_vars
+  #              can carry)
+  #   default-local → the day-0 single-row smoke
+  #              (used by egress-render-cross-check on every push,
+  #              fast enough to gate a CI run)
+  local rows=()
+  case "${FAAS_EGRESS_ROW_SELECTOR:-all}" in
+    default-local)
+      rows=("default-local|eth0|10.100.0.0/16||")
+      ;;
+    all)
+      rows=(
+        # Default-local (every box ships this on day 0)
+        "default-local|eth0|10.100.0.0/16||"
+        # Multi-host mesh: overlay + v6 (the shape Mega-PR-C Commit 6
+        # wires through host_vars/faas-fsn-{1,2}.yml). Use a public-range
+        # overlay (TEST-NET-3 203.0.113.0/24 is RFC5737 documentation; the
+        # §11 deny set excludes it) so HostPolicy.Render's panic gate
+        # approves the input.
+        "mesh-overlay|eth0|10.100.0.0/16|203.0.113.0/24|"
+        "mesh-overlay-v6|eth0|10.100.0.0/16|203.0.113.0/24|fc00::/7"
+        # Hetzner compute node on a renamed NIC
+        "hetzner-ens5|ens5|10.101.0.0/16||"
+        # Stress: multi-CIDR overlay (the spec's "two boxes share a
+        # /24" future case). Both CIDRs are public-range.
+        "multi-overlay|eth0|10.100.0.0/16|203.0.113.0/25,203.0.113.128/25|fc00::/7"
+      )
+      ;;
+    *)
+      echo "unknown FAAS_EGRESS_ROW_SELECTOR: $FAAS_EGRESS_ROW_SELECTOR" >&2
+      return 2
+      ;;
+  esac
   for row in "${rows[@]}"; do
     IFS='|' read -r label iface cidr overlay v6 <<< "$row"
     local go_out jinja_out

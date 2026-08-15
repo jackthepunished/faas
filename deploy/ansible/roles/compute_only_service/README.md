@@ -24,3 +24,14 @@ with `DATABASE_URL` (gap G2).
 - Installs the imaged example TOML to `/etc/faas/imaged.toml.example`
   (operator copies to `imaged.toml`).
 - Installs the systemd unit to `/etc/systemd/system/faas-imaged.service`.
+- **Mega-PR-C**: chowns `/run/faas` to root:faas 0775 at deploy time AND
+  ships a `/etc/tmpfiles.d/faas.conf` rule so the same ownership
+  survives every reboot. Mirrors `control_plane_service`'s PR-D + PR-M
+  pattern (the same runtime dir + ownership on fsn-1). The role's
+  trips here so the vmmd unit's `RuntimeDirectory=faas` (declared on
+  the vmmd unit alone — the comment in
+  `deploy/systemd/faas-vmmd.service` explains why only one faas unit
+  may declare it) creates the dirent with the canonical ownership
+  before the first scheduler tick. The vmmd unit's own `ExecStartPre`
+  chown remains as defense-in-depth for the edge case where someone
+  wipes `/run` between reboots without the tmpfiles-d firing.
