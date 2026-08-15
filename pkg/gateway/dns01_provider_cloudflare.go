@@ -46,6 +46,15 @@ import (
 // via newCloudflareDNSProviderForTest.
 const cloudflareBaseURL = "https://api.cloudflare.com/client/v4"
 
+// dnsRecordTypeTXT is the libdns record-type discriminator the DNS-01
+// solver passes through. Lifted from a literal to a const because the
+// type name appears in both the type-check and the create-body field,
+// and golangci-lint's goconst heuristic flags the duplicate in this
+// PR-8 file. Matches the equivalent "TXT" literal in
+// dns01_provider_hetzner.go (pre-existing code; goconst drift there is
+// out of scope for PR-8).
+const dnsRecordTypeTXT = "TXT"
+
 // CloudflareDNSProvider implements libdns.RecordAppender + RecordDeleter.
 // Struct fields are unexported because callers should use the constructor.
 type CloudflareDNSProvider struct {
@@ -95,11 +104,11 @@ func (p *CloudflareDNSProvider) AppendRecords(ctx context.Context, zone string, 
 	out := make([]libdns.Record, 0, len(recs))
 	for _, rec := range recs {
 		rr := rec.RR()
-		if rr.Type != "TXT" {
+		if rr.Type != dnsRecordTypeTXT {
 			return nil, fmt.Errorf("cloudflare dns: unsupported record type %q (only TXT for DNS-01)", rr.Type)
 		}
 		body := cloudflareCreateRecordReq{
-			Type:    "TXT",
+			Type:    dnsRecordTypeTXT,
 			Name:    rr.Name,
 			Content: rr.Data,
 			TTL:     60,
@@ -147,7 +156,15 @@ func (p *CloudflareDNSProvider) DeleteRecords(ctx context.Context, _ string, rec
 		// zone metadata. On a single-zone deployment the ZoneID cache
 		// would let us skip the lookup — that's a follow-up if the
 		// per-delete latency matters in practice.
-		zoneID, err := p.zoneID(context.Background(), p.zone)
+		//
+		// context.WithoutCancel(ctx) (Go 1.21+) inherits the caller's
+		// request-scoped values (request IDs, slog attrs) without
+		// inheriting its cancellation — the zone lookup should outlive
+		// a tight inner-loop deadline so a slow Cloudflare response
+		// doesn't half-delete a record. golangci-lint's contextcheck
+		// would otherwise flag `context.Background()` here as a
+		// detached context.
+		zoneID, err := p.zoneID(context.WithoutCancel(ctx), p.zone)
 		if err != nil {
 			return nil, fmt.Errorf("cloudflare dns: zone lookup for delete: %w", err)
 		}
