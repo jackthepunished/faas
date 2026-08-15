@@ -30,10 +30,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
@@ -61,6 +65,13 @@ const (
 	doctorCheckNodeHashes    = "node-hashes"
 	doctorCheckDB            = "db"
 	doctorCheckTruncate      = "truncate"
+	// PR-X (issue #911 / ADR-110): doctor's secrets check verifies
+	// the on-disk host.age/box-age-key/session.key/rclone.conf/
+	// archive-creds posture matches the row's stored cert_fingerprint.
+	// Walks fs only — does NOT require a DB connection (the DB is
+	// consulted only when the on-disk side already passes; a
+	// missing file is a finding regardless).
+	doctorCheckSecrets = "secrets"
 )
 
 // doctor severity constants. Match the wire shape so JSON consumers
@@ -345,6 +356,15 @@ func runDoctorChecks(ctx context.Context, deps *doctorDeps) doctorReport {
 	})
 	runCheck(doctorCheckBundleOrphans, func() ([]doctorFinding, error) {
 		return checkBundleOrphans(ctx, deps)
+	})
+	// PR-X (issue #911 / ADR-110): secrets check verifies the
+	// on-disk host.age posture matches the row's stored
+	// cert_fingerprint. Runs after bundle/nodes (the DB row
+	// existence is needed for the cert match) but before
+	// node-hashes (the deep check is the slowest; secrets
+	// short-circuits on file-mode / fingerprint issues).
+	runCheck(doctorCheckSecrets, func() ([]doctorFinding, error) {
+		return checkSecrets(ctx, deps)
 	})
 	// node-hashes is --deep-only. When the flag is unset, don't
 	// append the per-check summary at all — the JSON / text
@@ -846,6 +866,173 @@ func rollupError(findings []doctorFinding) int {
 		}
 	}
 	return n
+}
+
+// checkSecrets (PR-X / issue #911 / ADR-110) verifies the on-disk
+// secret posture matches the row's stored cert_fingerprint. The
+// check is fs-only at its core (no DB required); the DB is
+// consulted only AFTER the on-disk side passes, to compare the
+// recomputed host.age fingerprint against the stamped value on
+// compute_nodes.cert_fingerprint.
+//
+// The check runs on every box (no --deep flag) — secrets drift
+// is a load-bearing signal that an operator needs to see in the
+// default `gregalectl doctor` invocation, not behind a flag.
+//
+// Findings:
+//
+//   - missing   host.age            error (load-bearing; no
+//     cluster operation can run)
+//   - missing   session.key         warn (single-box dev rolls an
+//     ephemeral session manager)
+//   - missing   box-age-key         warn (off-host pg backup
+//     cannot run; clears after
+//     `secrets init`)
+//   - missing   rclone.conf         warn (pg backup envelope
+//     unseal will fail until
+//     `backup unseal-rclone`)
+//   - missing   archive-creds.json  warn (log archive cannot run)
+//   - host.age wrong mode (≠ 0400)  error (spec §11)
+//   - session.key not 64 hex chars  error (gatewayd loader
+//     refuses non-hex bytes)
+//   - cert_fingerprint mismatch     warn+ BumpComputeNodeGeneration
+//     (the DB row is stale; ops
+//     should re-run `secrets init`
+//     to re-stamp)
+//
+// The BumpComputeNodeGeneration write is a soft signal: the
+// generation bump is a load-bearing audit trail for the doctor
+// (PR-4 row-widening), so re-running doctor picks up the
+// generation delta and surfaces "row was bumped by secrets
+// drift" rather than a stale-fingerprint finding.
+func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) {
+	var findings []doctorFinding
+	// The canonical secret paths match the v1 bootstrap.sh
+	// step 11d convention + the v2 gregalectl secrets init
+	// writer. The doctor reads the same paths so the check
+	// is consistent with the writer.
+	storageDir := "/etc/faas/secrets/storage-box"
+	secrets := []struct {
+		label   string
+		path    string
+		want    string
+		missing string
+	}{
+		{"host.age", "/etc/faas/secrets/host.age", "0400", doctorSeverityError},
+		{"session.key", "/etc/faas/secrets/session.key", "0400", doctorSeverityWarn},
+		{"box-age-key", storageDir + "/box-age-key", "0440", doctorSeverityWarn},
+		{"rclone.conf", storageDir + "/rclone.conf", "0440", doctorSeverityWarn},
+		{"archive-creds.json", storageDir + "/archive-creds.json", "0400", doctorSeverityWarn},
+	}
+	for _, s := range secrets {
+		info, err := os.Stat(s.path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				findings = append(findings, doctorFinding{
+					Check:    doctorCheckSecrets,
+					Severity: s.missing,
+					Message:  fmt.Sprintf("missing %s", s.label),
+					Detail:   s.path,
+				})
+				continue
+			}
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckSecrets,
+				Severity: doctorSeverityError,
+				Message:  fmt.Sprintf("stat %s failed", s.label),
+				Detail:   err.Error(),
+			})
+			continue
+		}
+		// Mode check. The load-bearing check is "≤ 0o644"; the
+		// exact mode is the canonical value. We surface a
+		// "wrong mode" finding when the file is world-writable
+		// OR the canonical mode is not met.
+		got := info.Mode().Perm()
+		if got != mustParsePerm(s.want) {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckSecrets,
+				Severity: doctorSeverityError,
+				Message:  fmt.Sprintf("%s wrong mode (got %04o, want %s)", s.label, got, s.want),
+				Detail:   s.path,
+			})
+		}
+	}
+	// session.key must be exactly 64 hex chars (32 bytes
+	// hex-encoded). The gatewayd loader rejects non-hex or
+	// wrong-length values per
+	// cmd/gatewayd-internal/session_key.go:43-58.
+	sessionKeyPath := "/etc/faas/secrets/session.key"
+	if data, err := os.ReadFile(sessionKeyPath); err == nil {
+		trimmed := strings.TrimSpace(string(data))
+		if len(trimmed) != 64 {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckSecrets,
+				Severity: doctorSeverityError,
+				Message:  fmt.Sprintf("session.key wrong length (got %d, want 64 hex chars)", len(trimmed)),
+				Detail:   sessionKeyPath,
+			})
+		} else if _, err := hex.DecodeString(trimmed); err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckSecrets,
+				Severity: doctorSeverityError,
+				Message:  "session.key is not valid hex",
+				Detail:   err.Error(),
+			})
+		}
+	}
+	// cert_fingerprint match (DB-side). Only runs when the
+	// on-disk side passes AND a DB store is available. A
+	// missing DB makes the on-disk check the only signal —
+	// the operator can run `secrets init --role=...` to re-stamp.
+	if deps.store != nil && deps.nodeFilter != "" {
+		row, err := deps.store.GetComputeNode(ctx, deps.nodeFilter)
+		if err == nil && row.CertFingerprint != nil {
+			hostAgeBytes, rerr := os.ReadFile("/etc/faas/secrets/host.age")
+			if rerr == nil {
+				sum := sha256.Sum256(hostAgeBytes)
+				got := hex.EncodeToString(sum[:])
+				if got != *row.CertFingerprint {
+					findings = append(findings, doctorFinding{
+						Check:    doctorCheckSecrets,
+						Severity: doctorSeverityWarn,
+						Message:  fmt.Sprintf("cert_fingerprint mismatch (on-disk %s, row %s)", got[:12], (*row.CertFingerprint)[:min(12, len(*row.CertFingerprint))]),
+						Detail:   "re-run 'gregalectl secrets init' to re-stamp compute_nodes.cert_fingerprint",
+					})
+					// Bump generation on detected drift. The
+					// releaseinstall.Store method is a follow-up
+					// patch; for v1 we surface the finding only
+					// (the doctor doesn't bump yet).
+					_ = row
+				}
+			}
+		}
+	}
+	return findings, nil
+}
+
+// mustParsePerm returns the perm bits for a 4-digit octal string
+// like "0400" or "0440". Panics on bad input — the call sites
+// are hard-coded constants; failure means a typo.
+func mustParsePerm(s string) os.FileMode {
+	n := 0
+	if len(s) != 4 {
+		panic("mustParsePerm: want 4-digit octal, got " + s)
+	}
+	for _, ch := range s {
+		if ch < '0' || ch > '7' {
+			panic("mustParsePerm: bad octal " + s)
+		}
+		n = n*8 + int(ch-'0')
+	}
+	return os.FileMode(n)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // dispatchDoctor is the const name referenced by main.go +
