@@ -151,12 +151,14 @@ func cpcpSkipOnlyBuilderd() map[string]bool {
 // ansibleRoleSkips: the ansible control_plane_service role only ships
 // 3 of the 8 daemons today (apid, meterd, schedd). imaged moved to
 // compute_only_service in Gate-B PR-2; vmmd + gatewayd-internal +
-// gatewayd-public + githubd are NOT shipped by this role. Widening
-// the role to all 8 is a separate ops change.
+// gatewayd-public + githubd + builderd are NOT shipped by this role
+// (builderd lives on fsn-2 via builderd_service). Widening the role
+// to all 8 is a separate ops change.
 func ansibleRoleSkips() map[string]bool {
 	return map[string]bool{
 		"githubd":           true,
 		"vmmd":              true,
+		"builderd":          true,
 		"imaged":            true,
 		"gatewayd-public":   true,
 		"gatewayd-internal": true,
@@ -166,6 +168,7 @@ func ansibleRoleSkips() map[string]bool {
 // githubdOnlySkips: githubd_service is single-daemon (Gate-B PR-2).
 // Every daemon other than githubd is skipped so the role's files/
 // tree only carries faas-githubd.service + githubd.toml.example.
+// builderd lives on fsn-2 via its own role, so it's skipped here too.
 func githubdOnlySkips() map[string]bool {
 	return map[string]bool{
 		"apid":              true,
@@ -173,6 +176,7 @@ func githubdOnlySkips() map[string]bool {
 		"meterd":            true,
 		"imaged":            true,
 		"vmmd":              true,
+		"builderd":          true,
 		"gatewayd-public":   true,
 		"gatewayd-internal": true,
 	}
