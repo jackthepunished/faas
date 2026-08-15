@@ -470,11 +470,6 @@ func (m *Manifest) Validate() Errors {
 				m.SchemaVersion, SupportedSchemaVersions),
 		})
 	}
-	if m.SchemaVersion != "" && m.SchemaVersion != SchemaVersion &&
-		!contains(SupportedSchemaVersions, m.SchemaVersion) {
-		// Already reported above; this branch is here only to keep
-		// the reads tight.
-	}
 	errs = append(errs, m.Fleet.validate()...)
 	errs = append(errs, m.Daemons.validate()...)
 	errs = append(errs, m.Overlay.validate()...)
@@ -522,9 +517,10 @@ func (f *Fleet) validate() Errors {
 		}
 	}
 	// Single-box sanity: at most one host when role == single-box.
-	if len(f.Hosts) == 1 && f.Hosts[0].Role == "single-box" {
-		// no-op: single-box with one host is canonical.
-	}
+	// Single-box sanity: at most one host when role == single-box is
+	// the canonical shape and requires no further checks; the split-box
+	// branch below catches the multi-host case where role combinations
+	// matter (control-plane + compute-only).
 	if len(f.Hosts) > 1 {
 		hasCtl, hasCompute := false, false
 		for _, h := range f.Hosts {

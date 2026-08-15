@@ -267,7 +267,7 @@ func ValidateTOMLPlacement(daemon string, rendered map[string]string) Errors {
 	if !ok {
 		errs = append(errs, Error{
 			fmt.Sprintf("daemons.%s", daemon),
-			fmt.Sprintf("no HostKeys descriptor registered (renderer bug: add a row to manifest.HostKeys)"),
+			"no HostKeys descriptor registered (renderer bug: add a row to manifest.HostKeys)",
 		})
 		return errs
 	}

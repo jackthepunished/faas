@@ -145,4 +145,16 @@ func TestCmdManifestDispatch_Help(t *testing.T) {
 	if code := cmdManifestDispatch([]string{"--help"}); code != 0 {
 		t.Fatalf("cmdManifestDispatch = %d, want 0", code)
 	}
+	if code := cmdManifestDispatch([]string{"-h"}); code != 0 {
+		t.Fatalf("cmdManifestDispatch(-h) = %d, want 0", code)
+	}
+}
+
+func TestCmdManifestValidate_Help(t *testing.T) {
+	if code := cmdManifestValidate([]string{"--help"}); code != 0 {
+		t.Fatalf("cmdManifestValidate(--help) = %d, want 0", code)
+	}
+	if code := cmdManifestValidate([]string{"-h"}); code != 0 {
+		t.Fatalf("cmdManifestValidate(-h) = %d, want 0", code)
+	}
 }

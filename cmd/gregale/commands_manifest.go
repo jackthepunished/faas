@@ -32,8 +32,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/manifest"
 )
 
-const dispatchManifest = "manifest"
-
 // subValidate is the leaf name. Render / Install follow in PR-2 / PR-3.
 const subValidate = "validate"
 
@@ -47,7 +45,7 @@ func cmdManifestDispatch(args []string) int {
 	switch args[0] {
 	case subValidate:
 		return cmdManifestValidate(args[1:])
-	case "--help", "-h":
+	case flagHelpShort, flagHelpLong:
 		printManifestUsage(os.Stderr)
 		return 0
 	default:
@@ -57,7 +55,7 @@ func cmdManifestDispatch(args []string) int {
 }
 
 func printManifestUsage(w io.Writer) {
-	fmt.Fprintf(w, `usage: gregale manifest <subcommand> [flags]
+	_, _ = fmt.Fprintf(w, `usage: gregale manifest <subcommand> [flags]
 
 Subcommands:
   validate    Validate a manifest YAML file (canonical path: pkg/manifest.Validate)
@@ -86,7 +84,7 @@ Examples:
 // (`make lint-manifest`) can distinguish "manifest is fine" from
 // "manifest is broken" from "we can't even read the file".
 func cmdManifestValidate(args []string) int {
-	if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
 		PrintUsage(os.Stderr, "usage: gregale manifest validate --file PATH", "manifest")
 		return 0
 	}
@@ -97,7 +95,7 @@ func cmdManifestValidate(args []string) int {
 		return 1
 	}
 	if *filePath == "" {
-		fmt.Fprintln(os.Stderr, "gregale manifest validate: --file is required")
+		_, _ = fmt.Fprintln(os.Stderr, "gregale manifest validate: --file is required")
 		return 1
 	}
 	m, err := manifest.Load(*filePath)
@@ -116,7 +114,7 @@ func cmdManifestValidate(args []string) int {
 				Load:  err.Error(),
 			})
 		} else {
-			fmt.Fprintf(os.Stderr, "gregale manifest validate: %s: %v\n", *filePath, err)
+			_, _ = fmt.Fprintf(os.Stderr, "gregale manifest validate: %s: %v\n", *filePath, err)
 		}
 		return 3
 	}
@@ -131,7 +129,7 @@ func cmdManifestValidate(args []string) int {
 				Daemons: catalogHostKeys(),
 			})
 		} else {
-			fmt.Fprintf(os.Stdout, "%s: valid (schema=%s, hosts=%d, daemons=%d)\n",
+			_, _ = fmt.Fprintf(os.Stdout, "%s: valid (schema=%s, hosts=%d, daemons=%d)\n",
 				*filePath, m.SchemaVersion, len(m.Fleet.Hosts), len(catalogHostKeys()))
 		}
 		return 0
@@ -146,9 +144,9 @@ func cmdManifestValidate(args []string) int {
 			Errors: errs,
 		})
 	} else {
-		fmt.Fprintf(os.Stdout, "%s: invalid (%d errors)\n", *filePath, len(errs))
+		_, _ = fmt.Fprintf(os.Stdout, "%s: invalid (%d errors)\n", *filePath, len(errs))
 		for _, e := range errs {
-			fmt.Fprintf(os.Stdout, "  %s: %s\n", e.Path, e.Message)
+			_, _ = fmt.Fprintf(os.Stdout, "  %s: %s\n", e.Path, e.Message)
 		}
 	}
 	return 1
@@ -175,10 +173,10 @@ type manifestReport struct {
 func jsonEmit(w io.Writer, v interface{}) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gregale manifest: marshal: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregale manifest: marshal: %v\n", err)
 		return
 	}
-	fmt.Fprintln(w, string(b))
+	_, _ = fmt.Fprintln(w, string(b))
 }
 
 // jsonEnabled reports whether the gregale-wide --json flag is in
