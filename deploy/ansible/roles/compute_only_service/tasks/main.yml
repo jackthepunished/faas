@@ -56,6 +56,22 @@
     daemon_reload: true
   when: imaged_unit.changed
 
+# Mega-PR-C (issue #911 / ADR-110) — replace the legacy vmmd unit's
+# ExecStartPre chown chain with a deploy-time role fixup. The
+# imaged + vmmd + builderd units all sit on fsn-2 and all need
+# /run/faas to be root:faas 0775 BEFORE systemd activates the vmmd
+# unit. Mirrors the control_plane_service PR-D + PR-M chain on
+# fsn-1 (the same runtime dir, same ownership, same group).
+# Idempotent: ansible's `file:` module is a no-op when ownership
+# + mode already match.
+- name: compute_only_service — chown /run/faas to root:faas 0775 (Mega-PR-C)
+  ansible.builtin.file:
+    path: /run/faas
+    state: directory
+    owner: root
+    group: faas
+    mode: "0775"
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the imaged unit so the boot log carries the right
 # identity without a TOML edit (imaged has no config.go). The
@@ -161,18 +177,32 @@
 #
 # The list is read from the unit file (not hardcoded) so a unit
 # edit does not silently drift from the role's mkdir list.
-- name: compute_only_service — assert imaged ReadWritePaths= targets exist (spec §11)
+#
+# Mega-PR-C extends the tripwire to cover vmmd + builderd alongside
+# imaged. All three units run on fsn-2; the tripwire travels with
+# the compute-only role so the assert fires on the box the daemons
+# actually run on (rather than the control-plane where the units
+# never activate). The role loops over the per-unit lookup so
+# adding a fourth unit is a one-line list append.
+- name: compute_only_service — assert ReadWritePaths= targets exist per unit (spec §11)
   ansible.builtin.stat:
     path: "{{ item }}"
-  loop: "{{ faas_imaged_rwp_paths }}"
+  loop: "{{ faas_rwp_paths_flat }}"
   vars:
-    faas_imaged_rwp_raw: >-
-      {{ lookup('file', role_path + '/files/faas-imaged.service')
-         | regex_search('ReadWritePaths=([^\n]+)', '\\1')
-         | first }}
-    faas_imaged_rwp_paths: "{{ faas_imaged_rwp_raw.split() }}"
-  register: faas_imaged_rwp_stat
-  failed_when: not faas_imaged_rwp_stat.stat.exists
+    faas_rwp_unit_files:
+      - "{{ role_path }}/files/faas-imaged.service"
+      - "{{ role_path }}/../vmmd_service/files/faas-vmmd.service"
+      - "{{ role_path }}/../builderd_service/files/faas-builderd.service"
+    faas_rwp_paths_flat: >-
+      {{ faas_rwp_unit_files
+         | map('regex_search', '^ReadWritePaths=([^\n]+)', '\\1', multiline=True)
+         | map('first')
+         | map('split')
+         | flatten
+         | unique
+         | list }}
+  register: faas_rwp_stat
+  failed_when: not faas_rwp_stat.stat.exists
   loop_control:
     label: "{{ item }}"
 

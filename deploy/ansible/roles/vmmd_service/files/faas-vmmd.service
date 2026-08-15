@@ -40,12 +40,12 @@ ReadWritePaths=/etc/faas/secrets /run/faas /srv/fc /var/log/faas
 # RuntimeDirectory creates the dir as root:root. Mode 0775 gives the
 # OWNER group (root, not faas) write+execute, so faas-schedd still gets
 # `bind: permission denied` even though it sits in the `faas` group.
-# We can't change the OWNER via RuntimeDirectory (vmmd has no User=,
-# and there's no `RuntimeDirectoryGroup=` directive), so ExecStartPre
-# re-chowns to root:faas 0775 right after systemd creates the dir.
-# Idempotent on restart (chown of matching ownership is a no-op).
-ExecStartPre=/usr/bin/chown root:faas /run/faas
-ExecStartPre=/usr/bin/chmod 0775 /run/faas
+# vmmd has no User= and there is no `RuntimeDirectoryGroup=` directive,
+# so the group is fixed by the compute_only_service role at deploy time
+# (the role's `/run/faas chown root:faas 0775` block mirrors the
+# control_plane_service PR-D + PR-M chain on fsn-1). The unit is
+# idempotent on restart — RuntimeDirectory is no-op if the dirent
+# already exists with the right mode.
 PrivateTmp=no
 RuntimeDirectory=faas
 RuntimeDirectoryMode=0775
