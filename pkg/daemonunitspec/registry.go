@@ -64,6 +64,22 @@ var Registry = []Entry{
 	{Name: "meterd", Unit: UnitMeterd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "githubd", Unit: UnitGithubd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "imaged", Unit: UnitImaged, Critical: false, Lifecycle: Lifecycle{After: []string{"vmmd"}, Probe: ProbeTCP, ProbeTarget: "127.0.0.1:9102"}},
+	// Mega-PR-C (issue #911 / ADR-110): builderd is the build
+	// orchestrator on fsn-2 (compute-only). Spawns ephemeral
+	// builder microVMs through vmmd (ADR-003) — no KVM direct
+	// from this unit. After=vmmd: the build path needs the
+	// per-box capacity signal vmmd writes at boot, otherwise
+	// the first build_claim can race the vmmd register row.
+	//
+	// builderd does NOT depend on apid — apid runs on the
+	// control-plane box only (fsn-1), while builderd runs on
+	// the compute-only box (fsn-2). On fsn-2, the faas-apid
+	// unit doesn't exist; `After=apid` would silently no-op
+	// to a 90s boot timeout before systemd fails the unit.
+	// builderd schedules builds via gRPC over the wire to
+	// apid on fsn-1 (the [apphub] layer), so there is no
+	// ordering dependency at unit-activation time.
+	{Name: "builderd", Unit: UnitBuilderd, Critical: true, Lifecycle: Lifecycle{After: []string{"vmmd"}, Probe: ProbeUnix, ProbeTarget: "/run/faas/builderd.sock"}},
 }
 
 // UnitByName returns the daemonunit.Unit for the given daemon name.

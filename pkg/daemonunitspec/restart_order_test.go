@@ -57,7 +57,10 @@ func TestRestartOrder_RespectsLifecycleAfter(t *testing.T) {
 // mirrors the documented dependency graph in registry.go: vmmd and
 // apid are roots; schedd depends on vmmd; gatewayd-internal depends on
 // schedd, apid; gatewayd-public depends on gatewayd-internal; meterd +
-// githubd depend on apid; imaged depends on vmmd.
+// githubd depend on apid; imaged depends on vmmd; builderd depends on
+// vmmd only (apid runs on the control-plane box only, so on the
+// compute-only box builderd cannot depend on apid — apid is a
+// cross-host peer, not a same-host After target; see registry.go).
 //
 // Among siblings at equal depth the registry slice order is the
 // tiebreaker — explicit in restart_order.go so a reader can audit it
@@ -76,6 +79,7 @@ func TestRestartOrder_MatchesExpected(t *testing.T) {
 		"meterd",            // After[apid] — Registry idx 5
 		"githubd",           // After[apid] — Registry idx 6
 		"imaged",            // After[vmmd] — Registry idx 7
+		"builderd",          // After[vmmd] — Registry idx 8, vmmd has popped
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len(got)=%d, len(want)=%d; got=%v want=%v", len(got), len(want), got, want)

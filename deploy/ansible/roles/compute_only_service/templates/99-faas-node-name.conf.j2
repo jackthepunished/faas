@@ -1,9 +1,0 @@
-[Service]
-# Mega-PR-A (issue #911 / ADR-110 PR-1): expose this box's compute_node
-# identity to imaged (and builderd, when co-installed) so the role
-# gate + boot log carry the right name. imaged has no config.go today
-# (env-only); the env is the only source.
-#
-# Mirrors deploy/ansible/roles/control_plane_service/templates/
-# 99-faas-node-name.conf.j2 — body is identical across roles.
-Environment=FAAS_NODE_NAME={{ faas_node_name }}

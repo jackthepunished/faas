@@ -1,0 +1,12 @@
+[Service]
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to builderd via FAAS_BUILDERD_ROLE so
+# cmd/builderd/config.go::LoadConfig picks up faas_box_role
+# (compute-only on fsn-2). Without this drop-in builderd falls back
+# to RoleSingleBox and the per-daemon role gate is unenforced.
+#
+# The drop-in wins over the unit's [Service] section
+# (systemd.unit(5) "later wins") and the unit has no Environment=
+# line on FAAS_BUILDERD_ROLE, so the drop-in is the only source of
+# the env var. Idempotent.
+Environment=FAAS_BUILDERD_ROLE={{ faas_box_role }}

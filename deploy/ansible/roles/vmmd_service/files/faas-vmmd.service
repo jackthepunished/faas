@@ -6,6 +6,8 @@ Wants=faas-tenant.slice faas-cp.slice
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/chown root:faas /run/faas
+ExecStartPre=/usr/bin/chmod 0775 /run/faas
 ExecStart=/opt/faas/bin/vmmd --config /etc/faas/vmmd.toml
 Restart=on-failure
 RestartSec=2s
@@ -37,15 +39,20 @@ ReadWritePaths=/etc/faas/secrets /run/faas /srv/fc /var/log/faas
 # (run 30841750214, post-#619). Keeping the declaration on vmmd
 # alone ensures all writes go through the same bind-mount.
 #
-# RuntimeDirectory creates the dir as root:root. Mode 0775 gives the
-# OWNER group (root, not faas) write+execute, so faas-schedd still gets
-# `bind: permission denied` even though it sits in the `faas` group.
-# We can't change the OWNER via RuntimeDirectory (vmmd has no User=,
-# and there's no `RuntimeDirectoryGroup=` directive), so ExecStartPre
-# re-chowns to root:faas 0775 right after systemd creates the dir.
-# Idempotent on restart (chown of matching ownership is a no-op).
-ExecStartPre=/usr/bin/chown root:faas /run/faas
-ExecStartPre=/usr/bin/chmod 0775 /run/faas
+# /run/faas ownership race: RuntimeDirectory=faas creates the dirent
+# as root:root 0755 (systemd has no RuntimeDirectoryGroup= directive,
+# and vmmd has no User=). The ExecStartPre chain above fixes the
+# ownership to root:faas 0775 right after systemd creates the dir.
+# This is the activation-time fixup; on a fresh box it runs BEFORE
+# schedd or gatewayd-internal (which sit in the `faas` group) get a
+# chance to bind() their .sock into /run/faas. Without it the
+# "bind: permission denied" cycle returns (run 31121004495, post
+# PR #633 deploy 2026-08-04). Defense-in-depth: the
+# compute_only_service role also (a) chowns /run/faas at deploy
+# time and (b) ships a tmpfiles.d rule so the canonical ownership
+# survives every reboot. The ExecStartPre covers the case where
+# someone wipes /run between reboots without the tmpfiles-d firing
+# (e.g. `systemctl restart faas-vmmd` after a manual rm -rf /run/faas).
 PrivateTmp=no
 RuntimeDirectory=faas
 RuntimeDirectoryMode=0775

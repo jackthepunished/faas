@@ -114,7 +114,7 @@
 # `systemctl enable --now` picks the drop-in up automatically.
 - name: control_plane_service — install FAAS_NODE_NAME drop-in per unit (Mega-PR-A)
   ansible.builtin.template:
-    src: 99-faas-node-name.conf.j2
+    src: ../../_shared/templates/99-faas-node-name.conf.j2
     dest: "/etc/systemd/system/{{ item }}.service.d/99-faas-node-name.conf"
     owner: root
     group: root
@@ -122,6 +122,25 @@
   loop:
     - faas-schedd
     - faas-apid
+    - faas-meterd
+
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to the three control-plane daemons (apid, schedd,
+# meterd) via FAAS_<DAEMON>_ROLE. One drop-in per daemon — the
+# template sets three Environment= lines so the single render
+# covers all three daemons' env-var contracts. See
+# roles/control_plane_service/templates/99-faas-role.conf.j2
+# for the full rationale.
+- name: control_plane_service — install FAAS_<DAEMON>_ROLE drop-in per unit (Mega-PR-C)
+  ansible.builtin.template:
+    src: 99-faas-role.conf.j2
+    dest: "/etc/systemd/system/{{ item }}.service.d/99-faas-role.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - faas-apid
+    - faas-schedd
     - faas-meterd
 
 - name: control_plane_service — create runtime dirs (logs, spool, statuspage)

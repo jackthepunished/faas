@@ -1,8 +1,0 @@
-[Service]
-# Mega-PR-A (issue #911 / ADR-110 PR-1): expose this box's compute_node
-# identity to gatewayd-internal so the multi-box handshake layer
-# reads the right name without a TOML edit.
-#
-# Mirrors deploy/ansible/roles/control_plane_service/templates/
-# 99-faas-node-name.conf.j2 — body is identical across roles.
-Environment=FAAS_NODE_NAME={{ faas_node_name }}

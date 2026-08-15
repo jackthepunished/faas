@@ -122,23 +122,43 @@ const cpcpIndex = 0
 // `gregale secrets init` lands) deletes the v1 tree; the cpcpIndex slot
 // will then rebind to a v2 path. The tombstone RETIRED.md in
 // deploy/controlplane/ explains the v1 → v2 mapping for operators.
+//
+// Mega-PR-C: index 0's `skip: cpcpSkipOnlyBuilderd` ensures the new
+// builderd registry entry does NOT emit into the v1 tombstone. The
+// tombstone is a v1 snapshot — adding a post-v1 daemon to it would
+// (a) leave an untracked faas-builderd.service after every
+// `make generate`, breaking `make generate-check`, and (b) confuse
+// the v1→v2 operator narrative.
 var defaultTargets = []target{
-	{dir: "deploy/controlplane/systemd"},
+	{dir: "deploy/controlplane/systemd", skip: cpcpSkipOnlyBuilderd()},
 	{dir: "deploy/systemd", skip: legacySkips()},
 	{dir: "deploy/ansible/roles/control_plane_service/files", skip: ansibleRoleSkips()},
 	{dir: "deploy/ansible/roles/githubd_service/files", skip: githubdOnlySkips()},
 	{dir: "deploy/ansible/roles/compute_only_service/files", skip: computeOnlySkips()},
 }
 
+// cpcpSkipOnlyBuilderd: the v1 cp-cp tombstone (deploy/controlplane/systemd)
+// is a frozen snapshot of the EX44-era daemon set. Daemons that
+// joined AFTER the tombstone was retired (Mega-PR-C: builderd) get
+// skipped so they emit only into the modern trees. The tombstone's
+// 8 v1 unit files stay byte-identical under `make generate-check`.
+func cpcpSkipOnlyBuilderd() map[string]bool {
+	return map[string]bool{
+		"builderd": true,
+	}
+}
+
 // ansibleRoleSkips: the ansible control_plane_service role only ships
 // 3 of the 8 daemons today (apid, meterd, schedd). imaged moved to
 // compute_only_service in Gate-B PR-2; vmmd + gatewayd-internal +
-// gatewayd-public + githubd are NOT shipped by this role. Widening
-// the role to all 8 is a separate ops change.
+// gatewayd-public + githubd + builderd are NOT shipped by this role
+// (builderd lives on fsn-2 via builderd_service). Widening the role
+// to all 8 is a separate ops change.
 func ansibleRoleSkips() map[string]bool {
 	return map[string]bool{
 		"githubd":           true,
 		"vmmd":              true,
+		"builderd":          true,
 		"imaged":            true,
 		"gatewayd-public":   true,
 		"gatewayd-internal": true,
@@ -148,6 +168,7 @@ func ansibleRoleSkips() map[string]bool {
 // githubdOnlySkips: githubd_service is single-daemon (Gate-B PR-2).
 // Every daemon other than githubd is skipped so the role's files/
 // tree only carries faas-githubd.service + githubd.toml.example.
+// builderd lives on fsn-2 via its own role, so it's skipped here too.
 func githubdOnlySkips() map[string]bool {
 	return map[string]bool{
 		"apid":              true,
@@ -155,14 +176,16 @@ func githubdOnlySkips() map[string]bool {
 		"meterd":            true,
 		"imaged":            true,
 		"vmmd":              true,
+		"builderd":          true,
 		"gatewayd-public":   true,
 		"gatewayd-internal": true,
 	}
 }
 
 // computeOnlySkips: compute_only_service ships imaged only (Gate-B
-// PR-2). vmmd + gatewayd-internal have their own ansible roles;
-// builderd is out of scope until PR-4's runbook TODO is acted on.
+// PR-2). vmmd + gatewayd-internal + builderd have their own ansible
+// roles (Mega-PR-C added builderd_service); the registry adds their
+// units so the deployctl generator skips them in this tree's emit.
 func computeOnlySkips() map[string]bool {
 	return map[string]bool{
 		"apid":              true,
@@ -170,6 +193,7 @@ func computeOnlySkips() map[string]bool {
 		"meterd":            true,
 		"githubd":           true,
 		"vmmd":              true,
+		"builderd":          true,
 		"gatewayd-public":   true,
 		"gatewayd-internal": true,
 	}

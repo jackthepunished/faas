@@ -9,7 +9,7 @@ import (
 
 func TestActivationOrder(t *testing.T) {
 	got := ActivationOrder()
-	want := []string{"vmmd", "apid", "schedd", "gatewayd-internal", "gatewayd-public", "meterd", "githubd", "imaged"}
+	want := []string{"vmmd", "apid", "schedd", "gatewayd-internal", "gatewayd-public", "meterd", "githubd", "imaged", "builderd"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ActivationOrder() = %v, want %v", got, want)
 	}
@@ -85,28 +85,31 @@ func TestRegistryIsSubsetOfHostKeys(t *testing.T) {
 // cardinality assertion for issue #911 / ADR-110 (PR-6). It is
 // stronger than TestRegistryIsSubsetOfHostKeys above:
 //
-//   - Pins |Registry| = 8 (the systemd-managed daemon set).
-//   - Pins |manifest.HostKeys| = 9 (8 daemons + exactly one extra
-//     non-systemd entry).
-//   - Pins the named except-set: HostKeys \ Registry == {"builderd"}.
-//     builderd is ephemeral per-build (ADR-003 — vmmd spawns it
-//     inside an ephemeral microVM, so it never has a unit file).
+//   - Pins |Registry| = 9 (the systemd-managed daemon set).
+//   - Pins |manifest.HostKeys| = 9 (no extra — the schema catalog
+//     and the daemon registry are now lockstep).
+//   - Pins the named except-set: HostKeys \ Registry == {} (empty).
+//     Mega-PR-C moved builderd from the "ephemeral per-build" except
+//     set into the Registry proper, alongside its daemonunitspec
+//     constructor (pkg/daemonunitspec/builderd.go::UnitBuilderd),
+//     its deploy role (deploy/ansible/roles/builderd_service/),
+//     and its deploy/systemd/ tree copy.
 //
-// Why the cardinality check matters: a future PR that adds a 9th
-// daemon to the Registry MUST also add it to manifest.HostKeys
-// (renderer reads HostKeys; without the row, renderTOML fails at
-// runtime). The reverse — adding a HostKey without a Registry entry
-// — is allowed but only for ADR-documented ephemeral daemons;
-// "builderd" is the canonical example today.
+// Why the cardinality check matters: a future PR that adds a daemon
+// to the Registry MUST also add it to manifest.HostKeys (renderer
+// reads HostKeys; without the row, renderTOML fails at runtime).
+// The reverse — adding a HostKey without a Registry entry — is
+// allowed but only for ADR-documented ephemeral daemons; the
+// previous canonical example was builderd, which Mega-PR-C
+// promoted out of the except-set.
 //
 // Reuses the dashed→underscored translation from the test above:
 // gatewayd-internal → gatewayd_internal, gatewayd-public →
 // gatewayd_public; rest are identity.
 func TestRegistryDaemonSet_LockstepWithHostKeys(t *testing.T) {
 	const (
-		wantRegistrySize = 8
+		wantRegistrySize = 9
 		wantHostKeysSize = 9
-		wantExtra        = "builderd"
 	)
 	if got := len(Registry); got != wantRegistrySize {
 		t.Errorf("Registry len = %d, want %d (adding a daemon requires updating manifest.HostKeys too)",
@@ -127,29 +130,29 @@ func TestRegistryDaemonSet_LockstepWithHostKeys(t *testing.T) {
 		}
 	}
 	if got := len(manifest.HostKeys); got != wantHostKeysSize {
-		t.Errorf("manifest.HostKeys len = %d, want %d (Registry=%d, exactly one extra ephemeral entry expected)",
+		t.Errorf("manifest.HostKeys len = %d, want %d (Registry=%d, lockstep cardinality)",
 			got, wantHostKeysSize, len(Registry))
 	}
-	// Build the symmetric difference: HostKeys \ Registry.
+	// Build the symmetric difference: HostKeys \ Registry. Mega-PR-C
+	// moved builderd from the except-set into the Registry, so this
+	// is now expected to be empty. A future non-systemd ephemeral
+	// daemon (e.g. a per-build ephemeral sshd) would re-introduce
+	// an entry here and require an ADR-documented exception.
 	extra := make(map[string]bool)
 	for hk := range manifest.HostKeys {
 		if !registrySet[hk] {
 			extra[hk] = true
 		}
 	}
-	if len(extra) != 1 {
+	if len(extra) != 0 {
 		names := make([]string, 0, len(extra))
 		for n := range extra {
 			names = append(names, n)
 		}
-		t.Errorf("HostKeys \\ Registry has %d entries (%v), want exactly 1 (%q). "+
-			"Either add the missing daemon to Registry or remove the extra HostKeys entry.",
-			len(extra), names, wantExtra)
-		return
-	}
-	if !extra[wantExtra] {
-		t.Errorf("HostKeys \\ Registry = %v, want {%q} (ADR-003: builderd is the only ephemeral per-build daemon)",
-			extra, wantExtra)
+		t.Errorf("HostKeys \\ Registry has %d entries (%v), want empty. "+
+			"Mega-PR-C promoted builderd into the Registry; a future entry here "+
+			"requires an ADR-documented ephemeral exception.",
+			len(extra), names)
 	}
 	// Reverse direction — every Registry entry must have a HostKeys
 	// row (preserved from TestRegistryIsSubsetOfHostKeys).
