@@ -1007,14 +1007,15 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 		})
 		return findings, fmt.Errorf("list compute_nodes: %w", err)
 	}
-	hostAgeBytes, rerr := os.ReadFile("/etc/faas/secrets/host.age")
-	if rerr != nil {
+	hostAgeBytes, readErr := os.ReadFile("/etc/faas/secrets/host.age")
+	if readErr != nil {
 		// Already surfaced above as a "missing host.age"
 		// finding; skip the per-row fingerprint walk because
-		// every row would mismatch. rerr is intentional
-		// (the mode loop surfaced the missing-file finding).
-		_ = rerr
-		return findings, nil
+		// every row would mismatch. Propagate readErr so
+		// runCheck's existing error→finding synthesis picks
+		// it up (the missing-file finding is also added
+		// above as a side-channel for the operator).
+		return findings, fmt.Errorf("read host.age: %w", readErr)
 	}
 	sum := sha256.Sum256(hostAgeBytes)
 	got := hex.EncodeToString(sum[:])
