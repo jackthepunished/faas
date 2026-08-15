@@ -32,6 +32,7 @@ func TestCompletion_ManifestDrift(t *testing.T) {
 		"dispatchBackup":   "backup",
 		"dispatchManifest": "manifest",
 		"dispatchRelease":  "release",
+		"dispatchDoctor":   "doctor",
 	}
 	caseNames, err := extractMainCaseArms(dispatchConsts)
 	if err != nil {

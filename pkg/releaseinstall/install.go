@@ -123,6 +123,30 @@ func AtomicFlip(releasesRoot, gitSHA string) error {
 	return nil
 }
 
+// IsBundleOnDisk reports whether the per-release directory
+// <root>/<gitSHA>/ exists on disk. Returns (false, nil) when the
+// directory is absent (a recoverable state — the bundle was either
+// never installed or was gc'd). Returns a non-nil error only for
+// non-NotExist stat failures (permission denied, broken symlink
+// chain, etc.) so the caller can distinguish "missing on purpose"
+// from "couldn't check".
+//
+// Used by PR-4 doctor's bundle-orphans check to detect unapplied
+// release_bundles rows whose on-disk tree has been removed.
+func IsBundleOnDisk(root, gitSHA string) (bool, error) {
+	if root == "" || gitSHA == "" {
+		return false, fmt.Errorf("releaseinstall: IsBundleOnDisk requires root and git_sha")
+	}
+	info, err := os.Stat(BundleRoot(root, gitSHA))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("releaseinstall: stat bundle: %w", err)
+	}
+	return info.IsDir(), nil
+}
+
 // SetCurrentRelease is the legacy /opt/faas/releases/current variant —
 // kept for the dryrun audit's path-enumeration check. Most callers
 // should use AtomicFlip instead. The symlink lives at

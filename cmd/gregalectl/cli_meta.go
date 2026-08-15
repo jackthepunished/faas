@@ -149,6 +149,21 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		// PR-4 (issue #911 / ADR-110): read-only cluster diagnostic.
+		// Walks the on-disk release tree + the release_bundles +
+		// compute_nodes tables and reports drift. NEVER writes.
+		Name:    dispatchDoctor,
+		DocSlug: "doctor",
+		Short:   "Read-only diagnostic for the cluster-shipped release bundle (doctor [--node NAME] [--release SHA] [--deep]; PR-4 / ADR-110)",
+		Flags: []cliFlag{
+			{Name: "node", Short: "compute_nodes.name filter (default: all)"},
+			{Name: "release", Short: "release_bundles.git_sha filter (default: all)"},
+			{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
+			{Name: "deep", Short: "re-hash on-disk daemons per-node (slow on large fleets)"},
+			{Name: "fail-on", Short: "exit non-zero threshold: warn | error (default error)", ClosedSet: []string{"warn", "error"}},
+		},
+	},
+	{
 		Name:    dispatchPKI,
 		DocSlug: "pki",
 		Short:   "Operator local-dev PKI bootstrap (pki init|status|rotate)",

@@ -19,6 +19,7 @@ package releaseinstall
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -139,6 +140,37 @@ func (s *fakeStore) ListApplied(_ context.Context) ([]BundleRow, error) {
 	return out, nil
 }
 
+// ListAllBundles implements Store (PR-4). Drops the applied_at
+// filter and orders by created_at desc.
+func (s *fakeStore) ListAllBundles(_ context.Context) ([]BundleRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []BundleRow
+	for _, row := range s.rows {
+		hashes, err := DecodeDaemonHashes(row.DaemonJSON)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, BundleRow{
+			ID:           row.ID,
+			GitSHA:       row.Bundle.GitSHA,
+			ManifestHash: row.Bundle.ManifestHash,
+			DaemonHashes: hashes,
+			CreatedAt:    row.CreatedAt,
+			AppliedAt:    row.AppliedAt,
+		})
+	}
+	// order by created_at desc
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].CreatedAt.After(out[i].CreatedAt) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
+}
+
 // UpsertComputeNode implements Store (PR-6). Mirrors the pgStore
 // behaviour: input validation via validGitSHA/validManifestHash,
 // idempotent INSERT...ON CONFLICT keyed by name, returns the row id.
@@ -171,8 +203,13 @@ func (s *fakeStore) UpsertComputeNode(_ context.Context, name, gitSHA, manifestH
 	return id, nil
 }
 
-// GetComputeNode implements Store (PR-6). Mirrors GetByGitSHA's
-// ErrNotFound convention with the dedicated ErrComputeNodeNotFound.
+// GetComputeNode implements Store (PR-6, widened PR-4). Mirrors
+// GetByGitSHA's ErrNotFound convention with the dedicated
+// ErrComputeNodeNotFound. The widened row carries the same shape
+// as the production SELECT — host_certificate / cert_fingerprint /
+// role / generation are nil pointers unless the fake has stamped
+// them via UpsertComputeNode (today PR-4 only writes the original
+// four fields, so the new pointers stay nil).
 func (s *fakeStore) GetComputeNode(_ context.Context, name string) (ComputeNodeRow, error) {
 	if name == "" {
 		return ComputeNodeRow{}, errors.New("releaseinstall: empty compute_nodes name")
@@ -184,6 +221,24 @@ func (s *fakeStore) GetComputeNode(_ context.Context, name string) (ComputeNodeR
 		return ComputeNodeRow{}, ErrComputeNodeNotFound
 	}
 	return *row, nil
+}
+
+// ListComputeNodes implements Store (PR-4). Walks the existing
+// cnRows map; orders by name for PQ-stable parity with the
+// production SELECT.
+func (s *fakeStore) ListComputeNodes(_ context.Context) ([]ComputeNodeRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	names := make([]string, 0, len(s.cnRows))
+	for k := range s.cnRows {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	out := make([]ComputeNodeRow, 0, len(names))
+	for _, n := range names {
+		out = append(out, *s.cnRows[n])
+	}
+	return out, nil
 }
 
 func sampleBundle(sha string) Bundle {
@@ -450,6 +505,132 @@ func TestFakeStore_GetComputeNode_NotFound(t *testing.T) {
 	_, err := s.GetComputeNode(context.Background(), "no-such-node")
 	if !errors.Is(err, ErrComputeNodeNotFound) {
 		t.Errorf("GetComputeNode on missing row = %v, want ErrComputeNodeNotFound", err)
+	}
+}
+
+// PR-4 tests: ListComputeNodes + ListAllBundles + the widened
+// ComputeNodeRow shape. Doctor depends on these to walk all
+// per-node membership and detect drift against the on-disk bundle.
+
+func TestFakeStore_ListComputeNodes_Empty(t *testing.T) {
+	s := newFakeStore()
+	got, err := s.ListComputeNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ListComputeNodes: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListComputeNodes on empty = %d rows, want 0", len(got))
+	}
+}
+
+func TestFakeStore_ListComputeNodes_OrdersByName(t *testing.T) {
+	s := newFakeStore()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	mh := "sha256:" + strings.Repeat("a", 64)
+	for _, name := range []string{"node-c", "node-a", "node-b"} {
+		if _, err := s.UpsertComputeNode(context.Background(), name, sha, mh); err != nil {
+			t.Fatalf("UpsertComputeNode(%s): %v", name, err)
+		}
+	}
+	got, err := s.ListComputeNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ListComputeNodes: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("ListComputeNodes = %d rows, want 3", len(got))
+	}
+	want := []string{"node-a", "node-b", "node-c"}
+	for i, n := range want {
+		if got[i].Name != n {
+			t.Errorf("ListComputeNodes[%d] = %q, want %q", i, got[i].Name, n)
+		}
+	}
+}
+
+func TestFakeStore_ListComputeNodes_RoundTripsNewColumns(t *testing.T) {
+	// The new fields (host_certificate / cert_fingerprint / role /
+	// generation) are nil while UpsertComputeNode keeps ignoring
+	// them — matches the production INSERT (store.go:288-294) which
+	// writes generation=0 and NULLs to the others. The widening is
+	// observable on ListComputeNodes: the widened columns must
+	// round-trip as nil (the pointer stays nil) and the original
+	// four fields must stay populated.
+	s := newFakeStore()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	mh := "sha256:" + strings.Repeat("a", 64)
+	if _, err := s.UpsertComputeNode(context.Background(), "node-x", sha, mh); err != nil {
+		t.Fatalf("UpsertComputeNode: %v", err)
+	}
+	got, err := s.ListComputeNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ListComputeNodes: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListComputeNodes = %d rows, want 1", len(got))
+	}
+	row := got[0]
+	if row.ID == "" || row.Name != "node-x" || row.ReleaseID != sha || row.ManifestHash != mh {
+		t.Errorf("ListComputeNodes[0] = %+v, want id+name+release_id+manifest_hash populated", row)
+	}
+	if row.HostCertificate != nil {
+		t.Errorf("HostCertificate = %q, want nil (UpsertComputeNode doesn't write it)", *row.HostCertificate)
+	}
+	if row.CertFingerprint != nil {
+		t.Errorf("CertFingerprint = %q, want nil", *row.CertFingerprint)
+	}
+	if row.Role != nil {
+		t.Errorf("Role = %q, want nil", *row.Role)
+	}
+	if row.Generation != nil {
+		t.Errorf("Generation = %d, want nil", *row.Generation)
+	}
+}
+
+func TestFakeStore_ListAllBundles_IncludesUnapplied(t *testing.T) {
+	s := newFakeStore()
+	sha1 := "0000000000000000000000000000000000000001"
+	sha2 := "0000000000000000000000000000000000000002"
+	for _, sha := range []string{sha1, sha2} {
+		if _, err := s.Insert(context.Background(), sampleBundle(sha)); err != nil {
+			t.Fatalf("Insert %s: %v", sha, err)
+		}
+	}
+	// Mark only sha1 applied.
+	if _, err := s.MarkApplied(context.Background(), sha1); err != nil {
+		t.Fatalf("MarkApplied sha1: %v", err)
+	}
+	got, err := s.ListAllBundles(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllBundles: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("ListAllBundles = %d rows, want 2 (includes unapplied)", len(got))
+	}
+}
+
+func TestFakeStore_ListAllBundles_OrdersByCreatedDesc(t *testing.T) {
+	s := newFakeStore()
+	sha1 := "0000000000000000000000000000000000000001"
+	sha2 := "0000000000000000000000000000000000000002"
+	sha3 := "0000000000000000000000000000000000000003"
+	for _, sha := range []string{sha1, sha2, sha3} {
+		if _, err := s.Insert(context.Background(), sampleBundle(sha)); err != nil {
+			t.Fatalf("Insert %s: %v", sha, err)
+		}
+		time.Sleep(2 * time.Millisecond) // make created_at distinguishable
+	}
+	got, err := s.ListAllBundles(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllBundles: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("ListAllBundles = %d rows, want 3", len(got))
+	}
+	if got[0].GitSHA != sha3 {
+		t.Errorf("ListAllBundles[0] = %q, want %q (newest first)", got[0].GitSHA, sha3)
+	}
+	if got[2].GitSHA != sha1 {
+		t.Errorf("ListAllBundles[2] = %q, want %q (oldest last)", got[2].GitSHA, sha1)
 	}
 }
 
