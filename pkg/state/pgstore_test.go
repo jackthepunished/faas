@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -3575,7 +3576,11 @@ func TestPg_UpsertComputeNodeFromOperator_RoundTripsAllNewColumns(t *testing.T) 
 		{"Role", nullRow.Role},
 		{"Generation", nullRow.Generation},
 	} {
-		if c.ptr != nil {
+		// interface{} wrapping a typed nil pointer is NOT == nil —
+		// the interface carries a type tag with no value. Use
+		// reflect to dereference the typed-nil correctly.
+		v := reflect.ValueOf(c.ptr)
+		if v.Kind() == reflect.Ptr && !v.IsNil() { //nolint:govet // reflect.Ptr is a stdlib constant; inlining it adds noise without clarity benefit.
 			t.Errorf("null row %s = %v, want nil pointer (nullable contract)", c.name, c.ptr)
 		}
 	}
@@ -3622,20 +3627,21 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 	// vmmd struct. COALESCE(compute_nodes.X, excluded.X) must
 	// keep the operator-POSTed value, NOT overwrite with NULL.
 	vmmdReReg := state.ComputeNode{
-		Name:            "pr3a-vmmd-preserve",
-		TargetURL:       "tcp://10.0.0.5:7777", // same — common case
-		VPCPUs:          8,                     // vmmd reports higher
-		MemMB:           16384,
-		MaxConcurrency:  10,
-		VCPUBudget:      40,
-		Region:          nil, // vmmd doesn't know about region yet
-		Zone:            nil,
-		ReleaseID:       nil, // CRITICAL: must not overwrite operator's value
-		ManifestHash:    nil,
-		HostCertificate: nil,
-		CertFingerprint: nil,
-		Role:            nil,
-		Generation:      nil,
+		Name:               "pr3a-vmmd-preserve",
+		TargetURL:          "tcp://10.0.0.5:7777", // same — common case
+		VPCPUs:             8,                     // vmmd reports higher
+		MemMB:              16384,
+		MaxConcurrency:     10,
+		VCPUBudget:         40,
+		AdmissionCeilingMB: 4096, // CHECK (admission_ceiling_mb > 0)
+		Region:             nil,  // vmmd doesn't know about region yet
+		Zone:               nil,
+		ReleaseID:          nil, // CRITICAL: must not overwrite operator's value
+		ManifestHash:       nil,
+		HostCertificate:    nil,
+		CertFingerprint:    nil,
+		Role:               nil,
+		Generation:         nil,
 	}
 	if _, err := s.UpsertComputeNodeFromVmmd(ctx, vmmdReReg); err != nil {
 		t.Fatalf("vmmd re-register: %v", err)
