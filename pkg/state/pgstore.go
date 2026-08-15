@@ -9039,10 +9039,20 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 // index on active=true used by placement; this method is admin-only
 // and so pays the full-table scan cost only on operator dashboards).
 func (s *PgStore) ListComputeNodes(ctx context.Context, includeInactive bool) ([]ComputeNode, error) {
+	// Column order is locked to scanComputeNode's 22-arg projection
+	// (pgstore.go:8346). PR-3a (issue #911 / ADR-110) widened it
+	// from 14 to 22 by adding public_ip / public_ip_set_at (migration
+	// 00174 closure) + release_id / manifest_hash / host_certificate
+	// / cert_fingerprint / role / generation (migration 00266).
+	// Drift here surfaces as pgx's "number of field descriptions
+	// must equal number of destinations, got 14 and 22" — the same
+	// class of failure TestPg_CoverageInstanceLists pins.
 	q := `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 	`
 	if !includeInactive {

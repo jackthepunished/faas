@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -3404,15 +3405,16 @@ func TestPg_UpsertComputeNodeFromOperator_RoundTripsAllNewColumns(t *testing.T) 
 	popPublicIP := netip.MustParseAddr("203.0.113.42")
 	popPublicIPAt := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 	in := state.ComputeNode{
-		Name:           "pr3a-populated",
-		TargetURL:      "unix:///run/faas/vmmd.sock",
-		VPCPUs:         4,
-		MemMB:          8192,
-		MaxConcurrency: 5,
-		VCPUBudget:     20,
-		Active:         true,
-		Region:         ptrStr("eu-fra"),
-		Zone:           ptrStr("eu-fra-1"),
+		Name:               "pr3a-populated",
+		TargetURL:          "unix:///run/faas/vmmd.sock",
+		VPCPUs:             4,
+		MemMB:              8192,
+		MaxConcurrency:     5,
+		AdmissionCeilingMB: 8192,
+		VCPUBudget:         20,
+		Active:             true,
+		Region:             ptrStr("eu-fra"),
+		Zone:               ptrStr("eu-fra-1"),
 		// Latent-drift columns (PR A8, migration 00174) — PR-3a
 		// closes the schema/code asymmetry by projecting them.
 		PublicIp:      &popPublicIP,
@@ -3574,8 +3576,16 @@ func TestPg_UpsertComputeNodeFromOperator_RoundTripsAllNewColumns(t *testing.T) 
 		{"Role", nullRow.Role},
 		{"Generation", nullRow.Generation},
 	} {
+		// reflect-based nil check: typed-nil pointers (e.g. *netip.Addr(nil),
+		// *string(nil), *int(nil)) wrapped in interface{} compare != nil
+		// in plain Go (the interface holds a non-nil type tag), so the
+		// naive `c.ptr != nil` test reports every typed-nil as a failure.
+		// reflect.Value.IsNil() unwraps the typed nil correctly.
 		if c.ptr != nil {
-			t.Errorf("null row %s = %v, want nil pointer (nullable contract)", c.name, c.ptr)
+			rv := reflect.ValueOf(c.ptr)
+			if rv.Kind() != reflect.Ptr || !rv.IsNil() {
+				t.Errorf("null row %s = %v, want nil pointer (nullable contract)", c.name, c.ptr)
+			}
 		}
 	}
 }
@@ -3594,20 +3604,21 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 
 	// Step 1: operator POSTs the node with a release-bundle stamp.
 	operatorFirst := state.ComputeNode{
-		Name:            "pr3a-vmmd-preserve",
-		TargetURL:       "tcp://10.0.0.5:7777", // operator-POSTed
-		VPCPUs:          4,
-		MemMB:           8192,
-		MaxConcurrency:  5,
-		VCPUBudget:      20,
-		Region:          ptrStr("eu-fra"),
-		Zone:            ptrStr("eu-fra-1"),
-		ReleaseID:       ptrStr("0123456789abcdef0123456789abcdef01234567"),
-		ManifestHash:    ptrStr("sha256:" + strings.Repeat("a", 64)),
-		HostCertificate: ptrStr("op-stamped-cert"),
-		CertFingerprint: ptrStr("sha256:" + strings.Repeat("b", 64)),
-		Role:            ptrStr("control-plane"),
-		Generation:      ptrInt(7),
+		Name:               "pr3a-vmmd-preserve",
+		TargetURL:          "tcp://10.0.0.5:7777", // operator-POSTed
+		VPCPUs:             4,
+		MemMB:              8192,
+		MaxConcurrency:     5,
+		AdmissionCeilingMB: 8192,
+		VCPUBudget:         20,
+		Region:             ptrStr("eu-fra"),
+		Zone:               ptrStr("eu-fra-1"),
+		ReleaseID:          ptrStr("0123456789abcdef0123456789abcdef01234567"),
+		ManifestHash:       ptrStr("sha256:" + strings.Repeat("a", 64)),
+		HostCertificate:    ptrStr("op-stamped-cert"),
+		CertFingerprint:    ptrStr("sha256:" + strings.Repeat("b", 64)),
+		Role:               ptrStr("control-plane"),
+		Generation:         ptrInt(7),
 	}
 	if _, err := s.UpsertComputeNodeFromOperator(ctx, operatorFirst); err != nil {
 		t.Fatalf("operator first upsert: %v", err)
@@ -3620,20 +3631,21 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 	// vmmd struct. COALESCE(compute_nodes.X, excluded.X) must
 	// keep the operator-POSTed value, NOT overwrite with NULL.
 	vmmdReReg := state.ComputeNode{
-		Name:            "pr3a-vmmd-preserve",
-		TargetURL:       "tcp://10.0.0.5:7777", // same — common case
-		VPCPUs:          8,                     // vmmd reports higher
-		MemMB:           16384,
-		MaxConcurrency:  10,
-		VCPUBudget:      40,
-		Region:          nil, // vmmd doesn't know about region yet
-		Zone:            nil,
-		ReleaseID:       nil, // CRITICAL: must not overwrite operator's value
-		ManifestHash:    nil,
-		HostCertificate: nil,
-		CertFingerprint: nil,
-		Role:            nil,
-		Generation:      nil,
+		Name:               "pr3a-vmmd-preserve",
+		TargetURL:          "tcp://10.0.0.5:7777", // same — common case
+		VPCPUs:             8,                     // vmmd reports higher
+		MemMB:              16384,
+		MaxConcurrency:     10,
+		AdmissionCeilingMB: 16384,
+		VCPUBudget:         40,
+		Region:             nil, // vmmd doesn't know about region yet
+		Zone:               nil,
+		ReleaseID:          nil, // CRITICAL: must not overwrite operator's value
+		ManifestHash:       nil,
+		HostCertificate:    nil,
+		CertFingerprint:    nil,
+		Role:               nil,
+		Generation:         nil,
 	}
 	if _, err := s.UpsertComputeNodeFromVmmd(ctx, vmmdReReg); err != nil {
 		t.Fatalf("vmmd re-register: %v", err)
