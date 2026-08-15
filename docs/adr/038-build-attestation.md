@@ -197,7 +197,7 @@ Compatibility:
     verifier already accepts `0o440` (alongside `0o400`), so no
     schema change. The installer (`deploy/digitalocean/bootstrap.sh` —
     no longer in tree; canonical path was `deploy/controlplane/bootstrap.sh`,
-    RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale
+    RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregalectl
     secrets init` — step 11c, `deploy/ansible/roles/control_plane_service/
     tasks/main.yml`) is responsible for the ownership step because
     the install context varies (root in bootstrap, the faas user in

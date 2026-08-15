@@ -195,7 +195,7 @@
 
 # Issue #316 / ADR-057 — soft assert on host.age.previous. The
 # rotation-overlap twin of host.age appears during the 30-day
-# window after `gregale host-age rotate --commit`. Its presence
+# window after `gregalectl host-age rotate --commit`. Its presence
 # is INTENTIONAL (the runbook tolerates the overlap so MFA
 # envelopes sealed under the previous key still unseal); ansible
 # must NOT refuse to deploy on a box mid-rotation. We stat it
@@ -238,7 +238,7 @@
 # leaf's chmod (cmd/gregale/commands_backup_unseal_archive.go).
 # apid reads the envelope via LoadCredential= so it never
 # touches the on-disk 0400 file; the tripwire is for the box
-# that runs `gregale backup unseal-archive-creds` and would
+# that runs `gregalectl backup unseal-archive-creds` and would
 # otherwise write a loose-perm file.
 - name: control_plane_service — assert archive-creds.json mode is 0400 root:root if present (issue #562)
   ansible.builtin.stat:
@@ -304,7 +304,7 @@
 # bootstrap lays out /etc/faas/tls/{ca,<daemon>/} with 0400
 # private keys and 0444 public certs; this stat-assert proves
 # the bootstrap ran on a control-plane node (compute nodes run
-# `gregale pki init` via their own vmmd_service role and are
+# `gregalectl pki init` via their own vmmd_service role and are
 # checked there). Failing the play here surfaces a misconfigured
 # bootstrap before the daemons attempt to load the certs and
 # start with a confusing TLS handshake failure.

@@ -302,6 +302,13 @@ metal-lima-2node: ## Tier A5 / ADR-066: two-node Lima fleet for the cross-node l
 	limactl shell --workdir "$(CURDIR)" faas-metal sudo env FAAS_NODE_NAME=node-a ./deploy/lima/run-metal.sh
 	limactl shell --workdir "$(CURDIR)" faas-metal-2b sudo env FAAS_NODE_NAME=node-b ./deploy/lima/run-metal.sh
 
+.PHONY: metal-lima-splitbox
+metal-lima-splitbox: ## Issue #911 / ADR-110 PR-7: two-role Lima harness (control-plane + compute-only) — drives gregalectl manifest validate + render + release install + doctor end-to-end
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-splitbox-cp || limactl start --name faas-metal-splitbox-cp deploy/lima/faas-metal-splitbox.yaml --tty=false
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-splitbox-cx || limactl start --name faas-metal-splitbox-cx deploy/lima/faas-metal-splitbox.yaml --tty=false
+	limactl shell --workdir "$(CURDIR)" faas-metal-splitbox-cp sudo env FAAS_BOX_ROLE=control-plane FAAS_HOST_NAME=fsn-1 ./deploy/lima/run-metal-splitbox.sh
+	limactl shell --workdir "$(CURDIR)" faas-metal-splitbox-cx sudo env FAAS_BOX_ROLE=compute-only  FAAS_HOST_NAME=fsn-2 ./deploy/lima/run-metal-splitbox.sh
+
 .PHONY: ha-failover-drill
 ha-failover-drill: ## Tier A8 / ADR-083: active-passive HA fail-over drill on the two-node Lima fleet (§14 M8)
 	# Reuses the existing Tier A5 two-node fleet (faas-metal +

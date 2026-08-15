@@ -116,7 +116,7 @@ The PR-B handler logs one of:
   bucket. Customers can hit `?archive=1`.
 - `log archive config parse failed` — the envelope has a
   bad key (the JSON is unparseable). Run
-  `gregale backup unseal-archive-creds` again.
+  `gregalectl backup unseal-archive-creds` again.
 
 ### Bucket lifecycle policy
 
@@ -177,7 +177,7 @@ In order — each step assumes the previous didn't help:
    auth failure is a stale access key after a vendor
    rotation. Run the unseal CLI (PR-A leaf):
    ```bash
-   sudo gregale backup unseal-archive-creds
+   sudo gregalectl backup unseal-archive-creds
    sudo systemctl restart apid
    ```
    The unseal reads the host.age-sealed form, decrypts it
@@ -257,7 +257,7 @@ In order — each step assumes the previous didn't help:
    99-faas-log-archive.conf`) re-loads the envelope on the
    next boot. If the customer error persists after the
    restart, the envelope has rotted; run
-   `sudo gregale backup unseal-archive-creds` and the
+   `sudo gregalectl backup unseal-archive-creds` and the
    restart again.
 
 ## Escalation
@@ -268,7 +268,7 @@ In order — each step assumes the previous didn't help:
   spool caps will trip within ~1h under default 5m flush +
   normal customer load; raise `FAAS_LOG_ARCHIVE_LOCAL_BYTES_MAX`
   to buy time per *Recover #4*.
-- **Creds envelope rotted AND `gregale backup unseal-archive-creds` fails:** the host.age-sealed source form is
+- **Creds envelope rotted AND `gregalectl backup unseal-archive-creds` fails:** the host.age-sealed source form is
   unreadable. Re-fetch from the sealed secrets bucket
   (`/etc/faas/secrets/host.age` + the cosign-keypair) and
   re-run the unseal. If the cosign-keypair is also gone,

@@ -38,7 +38,6 @@ Commands:
   apps streaming-cap  Per-app streaming classification probe (ADR-102 D6)
   apps -q      Delete an app
   app          Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
-  backup       Operator rclone config unseal (backup unseal-rclone)
   billing      Manage billing (gregale billing portal)
   build        Build provenance + sbom (build provenance <id>|build sbom <id>)
   connect      Connect a third-party service (github)
@@ -52,7 +51,6 @@ Commands:
   domains      Manage custom domains
   edge-rules   Per-app edge rules (route|rewrite|redirect|headers|cors|jwt|ip; ADR-089)
   env          Pull/push .env <-> sealed secrets (--app <slug>)
-  host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
   invoke       Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])
   invocations  Per-account invocation ledger (invocations list|get <id> [--replay])
@@ -61,7 +59,6 @@ Commands:
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
-  manifest     Operator split-box deployment manifest (manifest validate --file PATH; issue #911 / ADR-110)
   signup       Create a new account (signup [--email-only EMAIL])
   man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
@@ -71,7 +68,6 @@ Commands:
   orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|keys ...|transfer-ownership|seat-usage|invitations ...|me)
   overage-cap  Set / clear the account's overage cap (--clear | <cents>)
   park         Park an app cold (kill all live instances)
-  pki          Operator local-dev PKI bootstrap (pki init|status|rotate)
   plan         Change plan (free|hobby|pro|scale)
   ps           Show live instances + state for an app
   queue        Inspect the wake-queue depth (queue tail|send|receive|state|peek|dead-letter|ack)
@@ -79,7 +75,6 @@ Commands:
   rollback     Re-promote the previous deployment
   scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
   secrets      Manage env secrets (secrets list|set|unset|list-all)
-  sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
   slo          Per-app SLO panel (gregale slo <slug> [--window 24h])
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)

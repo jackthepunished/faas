@@ -556,5 +556,8 @@ Closes the §14 M8 "Gate-A runbook (2nd box active-passive)" row:
   + A5 sections that this builds on)
 - `docs/runbooks/multi-host-rollout.md` (mirror of the §14 M5
   / M8 / M9 rows)
+- `docs/runbooks/manifest-renderer-cutover.md` (PR-7): the
+  canonical cutover narrative from a legacy single-box installation
+  to the split-box world this ADR's HA topology sits on top of.
 - Issue #297 (umbrella), issue #681 (snapshot de-localization,
   unrelated but listed for completeness)

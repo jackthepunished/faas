@@ -31,6 +31,28 @@ ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml --check --d
                        # dry run, great for PR review
 ```
 
+### Bootstrap targets (issue #911 / ADR-110)
+
+The three-group inventory (`deploy/ansible/inventory/hosts.ini`) maps
+to three Makefile targets. All three run `bootstrap.yml`; the
+inventory's `--limit` selects the host set:
+
+| Target | Inventory `--limit` | Hosts | When |
+|---|---|---|---|
+| `make bootstrap` | `box` | `[box]` (legacy single-box dev/lima) | dev / lima / 127.0.0.1 |
+| `make bootstrap-control-plane` | `control_plane` | fsn-1 (control-plane) | split-box provisioning (PG-1) |
+| `make bootstrap-compute` | `compute_nodes` | fsn-2 (compute-only) | split-box provisioning (PG-1) |
+
+PR-7 split the inventory to three groups so `bootstrap.yml`'s three
+plays (control_plane / compute_nodes / box) all match a host set. The
+legacy `make bootstrap` against 127.0.0.1 still works because
+`[box:children]` aggregates `[control_plane]` + `[compute_nodes]`.
+
+Per-box `faas_box_role` + `faas_node_name` + connection vars
+(`ansible_host`, `ansible_python_interpreter`) live in
+`host_vars/faas-fsn-{1,2}.yml`. Edit those, not `hosts.ini`, when the
+fleet layout changes.
+
 ## Do NOT run this on a non-bare-metal host without reading this section
 
 The XFS `prjquota` requirement and the LVM `lv-system`/`lv-fc`
