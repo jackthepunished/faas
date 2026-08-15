@@ -327,6 +327,14 @@ func validGitSHA(s string) bool {
 	return true
 }
 
+// ValidGitSHA is the exported form of validGitSHA. Callers that
+// want to gate a 40-char lowercase hex git_sha (e.g. the doctor
+// command's per-node release_id checks) should use this so the
+// predicate stays in one place. PR-3 had to keep the helper
+// unexported because the only consumer was inside the package;
+// PR-4 doctor is the first external caller.
+func ValidGitSHA(s string) bool { return validGitSHA(s) }
+
 func validManifestHash(s string) bool {
 	if len(s) != 7+64 {
 		return false

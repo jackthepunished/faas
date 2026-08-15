@@ -34,7 +34,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
@@ -88,11 +87,9 @@ const (
 	doctorFailOnError = "error"
 )
 
-// validGitSHAPattern is the same shape as the DB CHECK constraint
-// from migration 00272 and pkg/releaseinstall.validGitSHA — duplicated
-// here so the doctor can match a per-node release_id without
-// importing the unexported helper.
-var validGitSHAPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
+// validGitSHAPattern lives in pkg/releaseinstall as ValidGitSHA. The
+// doctor delegates to it so the per-node release_id check stays in
+// one place (mirrors the DB CHECK constraint from migration 00272).
 
 // doctorFinding is one row in the JSON report. The check name ties
 // the row to a check; severity is from the {ok, warn, error} closed
@@ -139,7 +136,10 @@ type doctorReport struct {
 
 // doctorDeps is the cross-check bundle. checkSymlink writes
 // currentGitSHA so the downstream checks can compare against the
-// active release without re-reading the symlink.
+// active release without re-reading the symlink. bundlesBySHA is
+// populated once by runDoctorChecks when the store is wired, so
+// the DB-touching checks (checkNodes + checkNodeHashes) share a
+// single SELECT instead of issuing one per node.
 type doctorDeps struct {
 	releasesRoot  string
 	nodeFilter    string
@@ -150,6 +150,12 @@ type doctorDeps struct {
 	// read by checkBundle. nil-safe via the doctor.medianScoped
 	// pattern — checks that don't need it just ignore it.
 	currentGitSHA string
+	// bundlesBySHA is keyed by release_bundles.git_sha. Populated
+	// lazily by the first DB check that needs it; nil means
+	// "not yet loaded". The map's value carries the row's
+	// manifest_hash so the deep check can do a single map
+	// lookup per node (no N+1 SELECT).
+	bundlesBySHA map[string]releaseinstall.BundleRow
 }
 
 // cmdDoctorDispatch is the entry point for `gregalectl doctor`.
@@ -216,6 +222,20 @@ func cmdDoctorDispatch(args []string) int {
 	} else {
 		defer pool.Close()
 		deps.store = releaseinstall.NewStore(pool)
+		// Pre-load the release_bundles table once so the
+		// DB-touching checks (nodes + bundle-orphans + node-hashes)
+		// share a single SELECT instead of issuing one per node.
+		// Loaded here (not in each check) so all three reads
+		// stay consistent — a concurrent INSERT between
+		// ListAllBundles and ListComputeNodes would otherwise
+		// produce a false-positive orphan-release_id finding.
+		bundles, err := deps.store.ListAllBundles(context.Background())
+		if err == nil {
+			deps.bundlesBySHA = make(map[string]releaseinstall.BundleRow, len(bundles))
+			for _, b := range bundles {
+				deps.bundlesBySHA[b.GitSHA] = b
+			}
+		}
 	}
 
 	report := runDoctorChecks(context.Background(), deps)
@@ -285,25 +305,24 @@ func runDoctorChecks(ctx context.Context, deps *doctorDeps) doctorReport {
 		t := time.Now()
 		findings, err := fn()
 		dur := time.Since(t)
-		sum := doctorCheckSum{
-			Name:       name,
-			DurationMS: dur.Milliseconds(),
-			Notes:      len(findings),
-		}
 		if err != nil {
-			sum.Status = doctorStatusError
-			report.Counts.Error++
+			// Synthesize a single error finding before the
+			// roll-up runs so Counts stays consistent with
+			// len(Findings). The check summary's status is
+			// pinned to error since the runner only emits a
+			// finding when the check itself failed.
 			findings = append(findings, doctorFinding{
 				Check:    name,
 				Severity: doctorSeverityError,
 				Message:  "check failed",
 				Detail:   err.Error(),
 			})
-		} else {
-			// Doctor's findings have their own severity; the
-			// check's roll-up is the max-of-severity across
-			// its findings.
-			sum.Status = maxSeverity(findings)
+		}
+		sum := doctorCheckSum{
+			Name:       name,
+			Status:     maxSeverity(findings),
+			DurationMS: dur.Milliseconds(),
+			Notes:      len(findings),
 		}
 		report.Counts.OK += rollupOK(findings)
 		report.Counts.Warn += rollupWarn(findings)
@@ -327,17 +346,21 @@ func runDoctorChecks(ctx context.Context, deps *doctorDeps) doctorReport {
 	runCheck(doctorCheckBundleOrphans, func() ([]doctorFinding, error) {
 		return checkBundleOrphans(ctx, deps)
 	})
-	runCheck(doctorCheckNodeHashes, func() ([]doctorFinding, error) {
-		if !deps.deep {
-			// Skipped, not an error. Surface as a single info
-			// finding so the JSON report is readable.
-			return []doctorFinding{}, nil
-		}
-		return checkNodeHashes(ctx, deps)
-	})
+	// node-hashes is --deep-only. When the flag is unset, don't
+	// append the per-check summary at all — the JSON / text
+	// output should clearly show the check was not run. apid
+	// admin observers (PR-X) read the checks array as the
+	// authoritative source for "what did we run", so a skipped
+	// check must be absent, not present-with-zero-findings.
+	if deps.deep {
+		runCheck(doctorCheckNodeHashes, func() ([]doctorFinding, error) {
+			return checkNodeHashes(ctx, deps)
+		})
+	}
 
-	// Truncate findings if exceeded the cap and append a single
-	// error pointing the operator at --node / --release.
+	// Truncate findings if exceeded the cap. Counts is then
+	// RE-DERIVED from the truncated slice so the wire shape
+	// stays consistent: len(Findings) == sum(Counts).
 	if len(report.Findings) > doctorFindingsCap {
 		dropped := len(report.Findings) - doctorFindingsCap
 		report.Findings = report.Findings[:doctorFindingsCap]
@@ -347,9 +370,20 @@ func runDoctorChecks(ctx context.Context, deps *doctorDeps) doctorReport {
 			Message:  fmt.Sprintf("findings truncated at %d; use --node / --release to narrow", doctorFindingsCap),
 			Detail:   fmt.Sprintf("dropped %d additional findings", dropped),
 		})
-		report.Counts.Error++
 	}
-
+	report.Counts.OK = 0
+	report.Counts.Warn = 0
+	report.Counts.Error = 0
+	for _, f := range report.Findings {
+		switch f.Severity {
+		case doctorSeverityOK:
+			report.Counts.OK++
+		case doctorSeverityWarn:
+			report.Counts.Warn++
+		case doctorSeverityError:
+			report.Counts.Error++
+		}
+	}
 	report.Counts.Total = report.Counts.OK + report.Counts.Warn + report.Counts.Error
 	report.FinishedAt = time.Now()
 	report.Healthy = report.Counts.Error == 0
@@ -482,14 +516,13 @@ func checkNodes(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) 
 		}}, nil
 	}
 
-	// Pre-load release_bundles for orphan-release_id checks.
-	bundles, err := deps.store.ListAllBundles(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list bundles: %w", err)
-	}
-	knownSHAs := make(map[string]releaseinstall.BundleRow, len(bundles))
-	for _, b := range bundles {
-		knownSHAs[b.GitSHA] = b
+	// Use the shared pre-load from cmdDoctorDispatch. A nil map
+	// means the pre-load failed (deps.store.ListAllBundles err'd);
+	// in that case we surface the failure as a hard error so
+	// the operator sees the DB read failure rather than a
+	// silent skip.
+	if deps.bundlesBySHA == nil {
+		return nil, fmt.Errorf("release_bundles pre-load missing")
 	}
 
 	nodes, err := deps.store.ListComputeNodes(ctx)
@@ -502,10 +535,10 @@ func checkNodes(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) 
 		if deps.nodeFilter != "" && n.Name != deps.nodeFilter {
 			continue
 		}
-		// Filter by release: only flag nodes whose release_id matches.
-		if deps.releaseFilter != "" && n.ReleaseID != deps.releaseFilter {
-			continue
-		}
+		// Validity runs BEFORE the --release filter: empty /
+		// malformed / orphan release_ids are exactly the drift
+		// the check exists to surface, and an operator
+		// triaging a specific SHA must see those defects.
 		// release_id sanity.
 		if n.ReleaseID == "" {
 			findings = append(findings, doctorFinding{
@@ -516,7 +549,7 @@ func checkNodes(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) 
 			})
 			continue
 		}
-		if !validGitSHAPattern.MatchString(n.ReleaseID) {
+		if !releaseinstall.ValidGitSHA(n.ReleaseID) {
 			findings = append(findings, doctorFinding{
 				Check:    doctorCheckNodes,
 				Severity: doctorSeverityError,
@@ -527,7 +560,7 @@ func checkNodes(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) 
 			continue
 		}
 		// Orphan release_id: points at a row that doesn't exist.
-		if _, ok := knownSHAs[n.ReleaseID]; !ok {
+		if _, ok := deps.bundlesBySHA[n.ReleaseID]; !ok {
 			findings = append(findings, doctorFinding{
 				Check:    doctorCheckNodes,
 				Severity: doctorSeverityError,
@@ -536,10 +569,17 @@ func checkNodes(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) 
 			})
 			continue
 		}
+		// --release filter is applied AFTER the validity
+		// checks above. The remaining comparison (manifest_hash
+		// vs. active release) only matters for nodes on the
+		// filtered release.
+		if deps.releaseFilter != "" && n.ReleaseID != deps.releaseFilter {
+			continue
+		}
 		// manifest_hash drift: the row's manifest_hash must match
 		// the active release's manifest_hash (when active).
 		if deps.currentGitSHA != "" && n.ReleaseID == deps.currentGitSHA && n.ManifestHash != "" {
-			bundle, ok := knownSHAs[n.ReleaseID]
+			bundle, ok := deps.bundlesBySHA[n.ReleaseID]
 			if ok && bundle.ManifestHash != n.ManifestHash {
 				findings = append(findings, doctorFinding{
 					Check:    doctorCheckNodes,
@@ -577,12 +617,11 @@ func checkBundleOrphans(ctx context.Context, deps *doctorDeps) ([]doctorFinding,
 			Message:  "FAAS_PG_DSN not set; skipping bundle-orphans",
 		}}, nil
 	}
-	bundles, err := deps.store.ListAllBundles(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list bundles: %w", err)
+	if deps.bundlesBySHA == nil {
+		return nil, fmt.Errorf("release_bundles pre-load missing")
 	}
 	var findings []doctorFinding
-	for _, b := range bundles {
+	for _, b := range deps.bundlesBySHA {
 		if deps.releaseFilter != "" && b.GitSHA != deps.releaseFilter {
 			continue
 		}
@@ -614,7 +653,7 @@ func checkBundleOrphans(ctx context.Context, deps *doctorDeps) ([]doctorFinding,
 		return []doctorFinding{{
 			Check:    doctorCheckBundleOrphans,
 			Severity: doctorSeverityOK,
-			Message:  fmt.Sprintf("scanned %d release_bundles rows", len(bundles)),
+			Message:  fmt.Sprintf("scanned %d release_bundles rows", len(deps.bundlesBySHA)),
 		}}, nil
 	}
 	return findings, nil
@@ -675,14 +714,16 @@ func checkNodeHashes(ctx context.Context, deps *doctorDeps) ([]doctorFinding, er
 			continue
 		}
 		// Cross-check against the DB row's manifest_hash too.
-		bundle, err := deps.store.GetByGitSHA(ctx, n.ReleaseID)
-		if err != nil {
+		// Uses the shared pre-load from cmdDoctorDispatch (one
+		// SELECT for the whole fleet) — no per-node GetByGitSHA.
+		bundle, ok := deps.bundlesBySHA[n.ReleaseID]
+		if !ok {
 			findings = append(findings, doctorFinding{
 				Check:    doctorCheckNodeHashes,
 				Severity: doctorSeverityError,
 				Target:   n.Name,
-				Message:  "cannot load release_bundles row",
-				Detail:   err.Error(),
+				Message:  "compute_nodes.release_id missing from release_bundles pre-load",
+				Detail:   n.ReleaseID,
 			})
 			continue
 		}
