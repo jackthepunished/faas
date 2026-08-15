@@ -26,16 +26,16 @@ import (
 
 // fakeStore is the in-memory Store used by these tests.
 type fakeStore struct {
-	mu    sync.Mutex
-	rows  map[string]*fakeRow
+	mu   sync.Mutex
+	rows map[string]*fakeRow
 }
 
 type fakeRow struct {
-	ID           string
-	Bundle       Bundle
-	DaemonJSON   []byte
-	CreatedAt    time.Time
-	AppliedAt    *time.Time
+	ID         string
+	Bundle     Bundle
+	DaemonJSON []byte
+	CreatedAt  time.Time
+	AppliedAt  *time.Time
 }
 
 func newFakeStore() *fakeStore {

@@ -121,8 +121,8 @@ func (s pgStore) GetByGitSHA(ctx context.Context, gitSHA string) (BundleRow, err
 		return BundleRow{}, fmt.Errorf("releaseinstall: empty git_sha")
 	}
 	var (
-		row         BundleRow
-		daemonJSON  []byte
+		row        BundleRow
+		daemonJSON []byte
 	)
 	err := s.pool.QueryRow(ctx, `
 		select id,

@@ -46,11 +46,11 @@ const BinDirName = "bin"
 // across rebuilds: CreatedAt (always now()), DaemonHashes (depends
 // on which daemons the build produced binaries for).
 type Manifest struct {
-	FormatVersion int            `json:"format_version"`
-	GitSHA        string         `json:"git_sha"`
-	ManifestHash  string         `json:"manifest_hash"`
+	FormatVersion int               `json:"format_version"`
+	GitSHA        string            `json:"git_sha"`
+	ManifestHash  string            `json:"manifest_hash"`
 	DaemonHashes  map[string]string `json:"daemon_hashes"` // daemon name -> "sha256:<64hex>"
-	CreatedAt     time.Time      `json:"created_at"`
+	CreatedAt     time.Time         `json:"created_at"`
 	// Signature is reserved for a future PR-3.5 cosign verification
 	// pass. Always empty for PR-3. Kept on the struct so the JSON
 	// shape is stable when signing lands.

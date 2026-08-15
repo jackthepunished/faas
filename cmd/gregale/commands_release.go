@@ -38,7 +38,7 @@ import (
 
 // release subcommands.
 const (
-	subReleaseBundle = "bundle"
+	subReleaseBundle  = "bundle"
 	subReleaseInstall = "install"
 )
 

@@ -285,6 +285,19 @@ linters:
       - path: "pkg/daemonunitspec/.+\\.go$"
         linters:
           - goconst
+      # pkg/wire/metrics.go is the per-daemon Prometheus metric
+      # registry: every daemon's switch case uses the literal
+      # daemon name ("vmmd", "schedd", "apid", ...) as the
+      # discriminator and the metric-Names prefix. The literal
+      # IS the schema — pkg/manifest.SortedHostKeys owns the
+      # canonical list, so promoting the strings to consts
+      # inside pkg/wire would (a) duplicate the catalog and
+      # (b) invert the data-table pattern that mirrors
+      # pkg/daemonunitspec. Same pattern as the capbits +
+      # daemonunitspec exemptions above.
+      - path: "pkg/wire/metrics\\.go$"
+        linters:
+          - goconst
       # cmd/deployctl/main.go: gosec G703 (path-traversal via taint)
       # and G122 (filepath.Walk TOCTOU) fire on os.WriteFile /
       # os.Stat / filepath.Walk calls. Every path here is either a

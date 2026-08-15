@@ -263,7 +263,7 @@ func TestValidateManifest_RejectsBadHashes(t *testing.T) {
 		"sha256:" + strings.Repeat("Z", 64), // non-hex
 		"sha256:" + strings.Repeat("a", 63), // short
 		"md5:" + strings.Repeat("a", 64),    // wrong prefix
-		strings.Repeat("a", 64),              // missing prefix (no "sha256:")
+		strings.Repeat("a", 64),             // missing prefix (no "sha256:")
 	} {
 		hm := make(map[string]string, len(good))
 		for k, v := range good {

@@ -92,8 +92,8 @@ const ComputeNodeKeysPayload = "compute_node_keys"
 // column is in the same SELECT.
 type PGNodeVerifier struct {
 	mu     sync.RWMutex
-	snap   map[string]string      // cn (== name) -> id
-	fps    map[string]string      // cn (== name) -> cert fingerprint; PR-3 widening
+	snap   map[string]string // cn (== name) -> id
+	fps    map[string]string // cn (== name) -> cert fingerprint; PR-3 widening
 	loader NodeLoader
 	log    *slog.Logger
 }
