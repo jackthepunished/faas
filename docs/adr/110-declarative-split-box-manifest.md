@@ -1,6 +1,6 @@
 # ADR-110 · Declarative split-box deployment manifest
 
-- **Status:** proposed (PR-0 of the issue #911 PR cluster)
+- **Status:** **Accepted** (revised 2026-08-16) (PR-0 of the issue #911 PR cluster)
 - **Date:** 2026-08-15
 - **Decision:** Adopt a single, versioned, declarative deployment
   manifest as the source of truth for every host in a multi-box

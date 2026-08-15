@@ -1,6 +1,6 @@
 # ADR-062 · Tier A: per-node schedd + schedd-side async placement claim
 
-- **Status:** proposed
+- **Status:** **Accepted** (revised 2026-08-16)
 - **Superseded (in part, PR-E):** prose referred to the monolithic
   `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
   edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
