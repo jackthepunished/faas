@@ -8,6 +8,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/pki"
 )
 
+// PKIOutput carries one PKI leaf's path + whether it was issued fresh
+// ("wrote") or skipped because it was already fresh ("unchanged").
+// The renderer uses this to emit per-path OutputReport entries even
+// on the idempotent second run — the doctor's PKI-health signal
+// depends on every leaf being visible in the report (PR-4).
+type PKIOutput struct {
+	Path   string
+	Issued bool // true if EnsureLeaf actually wrote a new leaf; false on ErrLeafNotExpiringSoon
+}
+
 // renderPKI ensures the per-host PKI leaves exist under rootDir. The
 // leaf set is filtered by hostRole via `pkg/pki.RolesForBox` — a
 // control-plane box doesn't get vmmd's leaves, a compute-only box
@@ -23,10 +33,11 @@ import (
 // renderer is the canary that ships the same CA on a freshly-
 // bootstrapped dev/lima box).
 //
-// Returns the per-role paths that were reissued (skipped leaves are
-// not counted in the OutputReport) so the caller can stamp the
-// RenderReport.
-func renderPKI(rootDir, hostRole string) ([]string, error) {
+// Returns one PKIOutput per cert+key pair across all roles. Skipped
+// leaves are reported with Issued=false so the second-run report
+// surfaces every leaf (with Action="unchanged") — the doctor's
+// PKI-health signal depends on every leaf being visible.
+func renderPKI(rootDir, hostRole string) ([]PKIOutput, error) {
 	// EnsureCA is idempotent (force=false → don't re-issue if a
 	// fresh CA already exists). On a fresh box this generates the
 	// CA cert + key at <rootDir>/ca/{ca.crt,ca.key}. The mode
@@ -45,19 +56,16 @@ func renderPKI(rootDir, hostRole string) ([]string, error) {
 		return nil, fmt.Errorf("renderer: pki: no roles for host role %q (known: control-plane|compute-only|single-box)", hostRole)
 	}
 
-	var issued []string
+	var out []PKIOutput
 	for _, role := range roles {
 		err := pki.EnsureLeaf(rootDir, role, caCert, caKey, false)
-		if err != nil {
-			if errors.Is(err, pki.ErrLeafNotExpiringSoon) {
-				// Idempotent: leaf already exists and is fresh.
-				continue
-			}
+		issued := err == nil
+		if err != nil && !errors.Is(err, pki.ErrLeafNotExpiringSoon) {
 			return nil, fmt.Errorf("renderer: pki: ensure leaf %s/%s: %w", role.Directory, role.Filename, err)
 		}
 		certPath, keyPath := pki.LeafPaths(rootDir, role)
-		issued = append(issued, filepath.ToSlash(certPath))
-		issued = append(issued, filepath.ToSlash(keyPath))
+		out = append(out, PKIOutput{Path: filepath.ToSlash(certPath), Issued: issued})
+		out = append(out, PKIOutput{Path: filepath.ToSlash(keyPath), Issued: issued})
 	}
-	return issued, nil
+	return out, nil
 }

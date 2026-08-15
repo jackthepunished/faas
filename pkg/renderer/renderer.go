@@ -175,19 +175,27 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// the host's role filters them out (we never short-circuit by
 	// Critical — best-effort daemons still ship on the host they
 	// run on).
+	//
+	// Note: builderd is NOT in the registry because it is not a
+	// long-running systemd service — vmmd spawns it per-build inside
+	// an ephemeral builder microVM (ADR-003). The registry shape
+	// (8 daemons) is correct; the renderer's role filter must mirror
+	// it (no "builderd" entry — adding one would be a no-op against
+	// ActivationOrder() and a footgun for future readers).
 	daemons := daemonunitspec.ActivationOrder()
 	if host.Role == "compute-only" {
-		// Compute-only boxes run vmmd, builderd, imaged, gatewayd-
-		// internal, and the cross-box standby dialer. They do NOT
-		// run apid, meterd, githubd, or gatewayd-public.
-		daemons = filterDaemons(daemons, "vmmd", "builderd", "imaged", "gatewayd-internal")
+		// Compute-only boxes run vmmd, imaged, and gatewayd-internal.
+		// They do NOT run apid, schedd, meterd, githubd, or
+		// gatewayd-public. (builderd is per-build via vmmd; not a
+		// systemd unit — see comment above.)
+		daemons = filterDaemons(daemons, "vmmd", "imaged", "gatewayd-internal")
 	} else if host.Role == "control-plane" {
 		// Control-plane boxes run apid, schedd, meterd, githubd,
-		// gatewayd-public. They do NOT run vmmd, builderd, imaged,
-		// or gatewayd-internal.
+		// gatewayd-public. They do NOT run vmmd, imaged, or
+		// gatewayd-internal.
 		daemons = filterDaemons(daemons, "apid", "schedd", "meterd", "githubd", "gatewayd-public")
 	}
-	// single-box: all 8 + imaged (Registry already includes imaged).
+	// single-box: all 8 (Registry already includes imaged).
 
 	// Compute every output in memory first. Phase 3 publishes them
 	// atomically. The two-phase approach makes the renderer
@@ -220,9 +228,14 @@ func render(opts RenderOptions) (RenderReport, error) {
 		// The renderer names daemons with dashes (gatewayd-internal,
 		// gatewayd-public) for the registry + on-disk shape; the
 		// manifest's HostKeys uses underscores. The translation
-		// is the bridge the renderer owns.
-		hostKeyName := registryToHostKey(d)
-		tomlBody, _, err := renderTOML(hostKeyName, dc, hostSANs)
+		// is the bridge the renderer owns. renderTOML accepts
+		// either form via registryToHostKey.
+		tomlBody, _, err := renderTOML(tomlRenderCtx{
+			Daemon:     d,
+			DC:         dc,
+			AppsDomain: m.DNS.AppsDomain,
+			HostSANs:   hostSANs,
+		})
 		if err != nil {
 			return report, err
 		}
@@ -243,21 +256,28 @@ func render(opts RenderOptions) (RenderReport, error) {
 	outputs = append(outputs, computedOutput{path: slicePath, body: sliceBody, mode: 0o644})
 
 	// 4. /etc/faas/tls/<role>/<file>.{crt,key}
-	// renderPKI ensures the leaves exist on disk. The renderer's
-	// output for PKI is the list of paths the call touched.
+	// renderPKI ensures the leaves exist on disk. The renderer
+	// returns one PKIOutput per leaf (Issued=true on first run,
+	// Issued=false on the idempotent second run). Every leaf
+	// gets an OutputReport entry regardless — the doctor's
+	// PKI-health signal depends on every leaf being visible.
+	// The PKI OutputReports are emitted AFTER the publish loop
+	// (below) so anyWritten is computed first; we just stash the
+	// PKI outputs here.
+	var pkiOutputs []OutputReport
 	if !opts.DryRun {
-		issued, err := renderPKI(opts.PKIRootDir, host.Role)
+		leafOutputs, err := renderPKI(opts.PKIRootDir, host.Role)
 		if err != nil {
 			return report, err
 		}
-		// Emit OutputReport entries for each issued path. SHA256
-		// is empty (the renderer does not hash the cert bytes);
-		// Action is "wrote" if just issued, "unchanged" if
-		// already there.
-		for _, p := range issued {
-			report.Outputs = append(report.Outputs, OutputReport{
-				Path:   p,
-				Action: "wrote",
+		for _, lo := range leafOutputs {
+			action := "unchanged"
+			if lo.Issued {
+				action = "wrote"
+			}
+			pkiOutputs = append(pkiOutputs, OutputReport{
+				Path:   lo.Path,
+				Action: action,
 			})
 		}
 	}
@@ -308,6 +328,17 @@ func render(opts RenderOptions) (RenderReport, error) {
 			SHA256: digest,
 			Action: action,
 		})
+	}
+	// Append PKI outputs after the publish loop so every leaf is
+	// visible in the report on every run (idempotent or not). The
+	// doctor's PKI-health signal depends on this visibility.
+	// PKI leaves also count toward anyWritten — re-issuing a leaf
+	// IS a write for Skipped semantics.
+	for _, pkiOut := range pkiOutputs {
+		report.Outputs = append(report.Outputs, pkiOut)
+		if pkiOut.Action == "wrote" {
+			anyWritten = true
+		}
 	}
 	// Skipped is true only if no writes happened (idempotent).
 	// Any actual write flips it to false.

@@ -36,7 +36,10 @@ func fixtureTOML(daemon string) *manifest.DaemonConfig {
 }
 
 func TestRenderTOML_Schedd(t *testing.T) {
-	body, flat, err := renderTOML("schedd", fixtureTOML("schedd"), nil)
+	body, flat, err := renderTOML(tomlRenderCtx{
+		Daemon: "schedd",
+		DC:     fixtureTOML("schedd"),
+	})
 	if err != nil {
 		t.Fatalf("renderTOML: %v", err)
 	}
@@ -56,6 +59,12 @@ func TestRenderTOML_Schedd(t *testing.T) {
 	if strings.Contains(string(body), "[compute_node]") {
 		t.Errorf("schedd body unexpectedly contains [compute_node]\nbody:\n%s", body)
 	}
+	// schedd's PrivateKeys do not include apps_domain (per the
+	// HostKeys catalog); an AppsDomain value flows through but
+	// writeTOMLKV skips it because schedd doesn't declare it.
+	if strings.Contains(string(body), "apps_domain") {
+		t.Errorf("schedd body unexpectedly contains apps_domain\nbody:\n%s", body)
+	}
 	// FlatMap keys must match HostKeys.
 	host := manifest.HostKeys["schedd"]
 	for _, k := range host.PrivateKeys {
@@ -66,7 +75,10 @@ func TestRenderTOML_Schedd(t *testing.T) {
 }
 
 func TestRenderTOML_Apid(t *testing.T) {
-	body, _, err := renderTOML("apid", fixtureTOML("apid"), nil)
+	body, _, err := renderTOML(tomlRenderCtx{
+		Daemon: "apid",
+		DC:     fixtureTOML("apid"),
+	})
 	if err != nil {
 		t.Fatalf("renderTOML: %v", err)
 	}
@@ -80,7 +92,10 @@ func TestRenderTOML_GatewaydInternal(t *testing.T) {
 	dc := &manifest.DaemonConfig{
 		Bind: "tcp://0.0.0.0:9090",
 	}
-	body, flat, err := renderTOML("gatewayd-internal", dc, nil)
+	body, flat, err := renderTOML(tomlRenderCtx{
+		Daemon: "gatewayd-internal",
+		DC:     dc,
+	})
 	if err != nil {
 		t.Fatalf("renderTOML: %v", err)
 	}
@@ -93,18 +108,32 @@ func TestRenderTOML_GatewaydInternal(t *testing.T) {
 	if v := flat["socket_path"]; v != "" {
 		t.Errorf("flatMap socket_path = %q, want empty (tcp bind)", v)
 	}
+	// gatewayd-internal listens on 9090; its metrics_addr is the
+	// canonical Prometheus port for that daemon — NOT the
+	// catch-all 9091.
+	if !strings.Contains(string(body), "metrics_addr = \"127.0.0.1:9090\"") {
+		t.Errorf("gatewayd-internal body missing metrics_addr 9090\nbody:\n%s", body)
+	}
 }
 
 func TestRenderTOML_VmmdWithComputeNode(t *testing.T) {
 	// vmmd has both PrivateKeys AND ComputeNodeBlock. Confirm
 	// both flow into the flatMap and the body has the [compute_node]
 	// section.
-	body, flat, err := renderTOML("vmmd", fixtureTOML("vmmd"), []string{"vmmd-1.faas.example.com"})
+	body, flat, err := renderTOML(tomlRenderCtx{
+		Daemon:   "vmmd",
+		DC:       fixtureTOML("vmmd"),
+		HostSANs: []string{"vmmd-1.faas.example.com"},
+	})
 	if err != nil {
 		t.Fatalf("renderTOML: %v", err)
 	}
 	if !strings.Contains(string(body), "[compute_node]") {
 		t.Errorf("vmmd body missing [compute_node]\nbody:\n%s", body)
+	}
+	// vmmd metrics port is 9095 — the per-daemon table, not 9091.
+	if !strings.Contains(string(body), "metrics_addr = \"127.0.0.1:9095\"") {
+		t.Errorf("vmmd body missing metrics_addr 9095\nbody:\n%s", body)
 	}
 	// Validator walk: flatMap must contain every HostKeys.ComputeNodeBlock
 	// key under the "compute_node." prefix.
@@ -118,19 +147,76 @@ func TestRenderTOML_VmmdWithComputeNode(t *testing.T) {
 }
 
 func TestRenderTOML_NilDaemonConfig(t *testing.T) {
-	_, _, err := renderTOML("schedd", nil, nil)
+	_, _, err := renderTOML(tomlRenderCtx{Daemon: "schedd", DC: nil})
 	if err == nil {
 		t.Errorf("nil DaemonConfig = nil err, want error")
 	}
 }
 
 func TestRenderTOML_UnknownDaemon(t *testing.T) {
-	_, _, err := renderTOML("no-such-daemon", &manifest.DaemonConfig{}, nil)
+	_, _, err := renderTOML(tomlRenderCtx{Daemon: "no-such-daemon", DC: &manifest.DaemonConfig{}})
 	if err == nil {
 		t.Errorf("unknown daemon = nil err, want error")
 	}
 	if err != nil && !strings.Contains(err.Error(), "HostKeys") {
 		t.Errorf("err = %v, want HostKeys drift message", err)
+	}
+}
+
+// TestRenderTOML_PerDaemonMetricsAddr pins the per-daemon metrics
+// port table. A future refactor that moves the port to
+// daemonunitspec.Entry must keep these mappings.
+func TestRenderTOML_PerDaemonMetricsAddr(t *testing.T) {
+	cases := []struct {
+		daemon string
+		want   string
+	}{
+		{"vmmd", "127.0.0.1:9095"},
+		{"gatewayd-internal", "127.0.0.1:9090"},
+		{"gatewayd-public", "127.0.0.1:8080"},
+		{"apid", "127.0.0.1:9091"},
+		{"schedd", "127.0.0.1:9091"},
+		{"meterd", "127.0.0.1:9091"},
+		{"githubd", "127.0.0.1:9091"},
+		{"imaged", "127.0.0.1:9091"},
+	}
+	for _, c := range cases {
+		got := defaultMetricsAddrForDaemon(c.daemon)
+		if got != c.want {
+			t.Errorf("defaultMetricsAddrForDaemon(%q) = %q, want %q", c.daemon, got, c.want)
+		}
+	}
+}
+
+// TestRenderTOML_AppsDomainFlowsThrough pins that the manifest's
+// DNS.AppsDomain flows into apid + gatewayd-internal TOMLs (the two
+// daemons whose HostKeys declare apps_domain). An empty AppsDomain
+// omits the key, matching the daemon's env-var fallback.
+func TestRenderTOML_AppsDomainFlowsThrough(t *testing.T) {
+	for _, d := range []string{"apid", "gatewayd-internal"} {
+		body, _, err := renderTOML(tomlRenderCtx{
+			Daemon:     d,
+			DC:         fixtureTOML(d),
+			AppsDomain: "apps.gregale.dev",
+		})
+		if err != nil {
+			t.Fatalf("%s: renderTOML: %v", d, err)
+		}
+		if !strings.Contains(string(body), `apps_domain = "apps.gregale.dev"`) {
+			t.Errorf("%s body missing apps_domain\nbody:\n%s", d, body)
+		}
+	}
+	// Empty apps_domain → writeTOMLKV omits the key entirely.
+	body, _, err := renderTOML(tomlRenderCtx{
+		Daemon:     "apid",
+		DC:         fixtureTOML("apid"),
+		AppsDomain: "",
+	})
+	if err != nil {
+		t.Fatalf("renderTOML: %v", err)
+	}
+	if strings.Contains(string(body), "apps_domain") {
+		t.Errorf("apid body should not contain apps_domain when empty\nbody:\n%s", body)
 	}
 }
 

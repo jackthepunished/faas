@@ -320,14 +320,40 @@ func TestRenderer_ResolvesControlPlaneDaemons(t *testing.T) {
 		CgroupRoot:   filepath.Join(dir, "cgroup"),
 		DryRun:       true,
 	}
-	_, err := Render(opts)
+	report, err := Render(opts)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	// Daemons that landed in the report. Confirm control-plane
-	// boxes don't get vmmd's TOML.
-	// (Failing here is a schema-drift signal: a control-plane
-	// box should not receive vmmd.toml.)
+	// Schema-drift guard: a control-plane box MUST NOT emit
+	// vmmd.toml / faas-vmmd.service (those belong on a compute-
+	// only box). Failure here is the canonical "role filter
+	// regressed" signal.
+	for _, mustNotContain := range []string{
+		"vmmd.toml",
+		"faas-vmmd.service",
+		"builderd.toml",
+		"imaged.toml",
+		"gatewayd-internal.toml",
+	} {
+		for _, o := range report.Outputs {
+			if strings.Contains(o.Path, mustNotContain) {
+				t.Errorf("control-plane box must not emit %s, got %s", mustNotContain, o.Path)
+			}
+		}
+	}
+	// And it MUST emit the control-plane set.
+	gotPaths := map[string]bool{}
+	for _, o := range report.Outputs {
+		gotPaths[filepath.Base(o.Path)] = true
+	}
+	for _, want := range []string{
+		"apid.toml", "schedd.toml", "meterd.toml", "githubd.toml",
+		"gatewayd-public.toml", "faas-cp.slice",
+	} {
+		if !gotPaths[want] {
+			t.Errorf("control-plane box missing %s in output", want)
+		}
+	}
 }
 
 func TestRenderer_ResolvesComputeOnlyDaemons(t *testing.T) {
@@ -342,9 +368,38 @@ func TestRenderer_ResolvesComputeOnlyDaemons(t *testing.T) {
 		CgroupRoot:   filepath.Join(dir, "cgroup"),
 		DryRun:       true,
 	}
-	_, err := Render(opts)
+	report, err := Render(opts)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
+	}
+	// Schema-drift guard: a compute-only box MUST NOT emit
+	// apid / schedd / meterd / githubd / gatewayd-public
+	// TOMLs or service units.
+	for _, mustNotContain := range []string{
+		"apid.toml", "schedd.toml", "meterd.toml",
+		"githubd.toml", "gatewayd-public.toml",
+		"faas-apid.service", "faas-schedd.service",
+	} {
+		for _, o := range report.Outputs {
+			if strings.Contains(o.Path, mustNotContain) {
+				t.Errorf("compute-only box must not emit %s, got %s", mustNotContain, o.Path)
+			}
+		}
+	}
+	// And it MUST emit the compute-only set. (builderd is NOT
+	// in the registry because vmmd spawns it per-build; the
+	// renderer's role filter mirrors the registry.)
+	gotPaths := map[string]bool{}
+	for _, o := range report.Outputs {
+		gotPaths[filepath.Base(o.Path)] = true
+	}
+	for _, want := range []string{
+		"vmmd.toml", "imaged.toml", "gatewayd-internal.toml",
+		"faas-cp.slice",
+	} {
+		if !gotPaths[want] {
+			t.Errorf("compute-only box missing %s in output", want)
+		}
 	}
 }
 

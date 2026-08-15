@@ -22,35 +22,37 @@ func TestUnitSlice_Renders(t *testing.T) {
 		t.Error("Description is empty")
 	}
 
-	body := string(u.Render())
-	// Shape checks: every load-bearing directive must be present.
+	// Slice units MUST render through RenderSlice() — NOT Render().
+	// Render() emits [Service] which silently drops MemoryMax.
+	// The 3 GB ceiling is the load-bearing directive for tenant
+	// admission (CLAUDE.md §11).
+	body := string(u.RenderSlice())
 	for _, want := range []string{
 		"[Unit]",
 		"Description=",
-		// [Slice] MemoryMax renders as a top-level Slice= directive
-		// in pkg/daemonunit's emitter (the Slice field is shared
-		// between slice units and service units that pin a Slice).
-		"Slice=faas-cp.slice",
+		"[Slice]",
 		"MemoryMax=3G",
 		"[Install]",
 		"WantedBy=multi-user.target",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("Render() missing %q\n--- body ---\n%s", want, body)
+			t.Errorf("RenderSlice() missing %q\n--- body ---\n%s", want, body)
 		}
 	}
+	// And it MUST NOT contain a [Service] section — if it does,
+	// systemd will read the unit as a service unit and ignore
+	// MemoryMax (which lives in [Slice]).
+	if strings.Contains(body, "[Service]") {
+		t.Errorf("RenderSlice() contains [Service] section; MemoryMax will be ignored\n--- body ---\n%s", body)
+	}
 
-	// Round-trip via Decode confirms the struct is well-formed.
-	parsed, err := daemonunit.Decode([]byte(body))
-	if err != nil {
-		t.Fatalf("Decode: %v\nbody:\n%s", err, body)
-	}
-	if parsed.Slice != "faas-cp.slice" {
-		t.Errorf("round-trip Slice = %q", parsed.Slice)
-	}
-	if parsed.MemoryMax != "3G" {
-		t.Errorf("round-trip MemoryMax = %q", parsed.MemoryMax)
-	}
+	// Note: Decode only walks [Unit] / [Service] / [Install] — it
+	// can't round-trip a [Slice] body. That's a pkg/daemonunit
+	// future improvement. The struct field assertions above are
+	// the round-trip guarantee: a future change to UnitSlice()
+	// must keep Slice/MemoryMax/WantedBy/Description populated, and
+	// RenderSlice() must keep them written into the body.
+	_ = daemonunit.Decode // keep the import; may be replaced by a slice-aware decoder later
 }
 
 func TestFaasCPSliceMemoryMax_DefaultIsThreeGigabytes(t *testing.T) {

@@ -37,19 +37,34 @@ import (
 // renderer copies the keys into the flatMap. New keys land in the
 // catalog first, then in the renderer-emitting code via this loop.
 //
+// tomlRenderCtx bundles the per-daemon inputs renderTOML consumes.
+// AppsDomain comes from the manifest's DNS block (global per host);
+// the per-daemon Bind / TLS / Outbound come from the DaemonConfig.
+// HostSANs is the per-host SAN list (vmmd's [compute_node] uses it).
+// Both AppsDomain and hostSANs are optional — empty values render
+// fine (writeTOMLKV omits empty values; the daemon's loader uses
+// its built-in default).
+type tomlRenderCtx struct {
+	Daemon     string
+	DC         *manifest.DaemonConfig
+	AppsDomain string
+	HostSANs   []string
+}
+
 // The flatMap is what ValidateTOMLPlacement walks. The validation
 // happens BEFORE the renderer returns to its caller — a tombstone
 // hit aborts the publish.
-func renderTOML(daemon string, dc *manifest.DaemonConfig, hostSANs []string) ([]byte, map[string]string, error) {
-	if dc == nil {
-		return nil, nil, fmt.Errorf("renderer: %s: nil DaemonConfig", daemon)
+func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
+	if ctx.DC == nil {
+		return nil, nil, fmt.Errorf("renderer: %s: nil DaemonConfig", ctx.Daemon)
 	}
 	// Daemon may arrive in either registry form (gatewayd-internal)
-	// or HostKeys form (gatewayd_internal). Translate so direct
-	// callers can use either name.
-	host, ok := manifest.HostKeys[registryToHostKey(daemon)]
+	// or HostKeys form (gatewayd_internal). Translate once at the
+	// boundary; everything below sees the HostKeys form.
+	hostKey := registryToHostKey(ctx.Daemon)
+	host, ok := manifest.HostKeys[hostKey]
 	if !ok {
-		return nil, nil, fmt.Errorf("renderer: %s: no HostKeys descriptor (add a row to pkg/manifest.HostKeys)", daemon)
+		return nil, nil, fmt.Errorf("renderer: %s: no HostKeys descriptor (add a row to pkg/manifest.HostKeys)", ctx.Daemon)
 	}
 
 	// FlatMap = "table.leaf" key/value. Top-level keys use the leaf
@@ -60,22 +75,22 @@ func renderTOML(daemon string, dc *manifest.DaemonConfig, hostSANs []string) ([]
 	// by name. The renderer uses the canonical schema names from
 	// HostKeys.PrivateKeys; unknown keys (a renderer bug) are caught
 	// by the validator at the "key not in catalog" check.
-	if err := emitPrivateKeys(daemon, dc, host.PrivateKeys, flat); err != nil {
+	if err := emitPrivateKeys(ctx.Daemon, ctx.DC, ctx.AppsDomain, host.PrivateKeys, flat); err != nil {
 		return nil, nil, err
 	}
 
 	// [compute_node] table-block (vmmd only today). The renderer
 	// pulls the values from the manifest's DaemonConfig (Outbound
 	// for the dial target, hostSANs for the per-host SAN overlay).
-	if err := emitComputeNodeBlock(daemon, dc, host.ComputeNodeBlock, hostSANs, flat); err != nil {
+	if err := emitComputeNodeBlock(ctx.Daemon, ctx.DC, host.ComputeNodeBlock, ctx.HostSANs, flat); err != nil {
 		return nil, nil, err
 	}
 
 	// Validator gate. The renderer calls the SAME validator the
 	// CLI's `manifest validate` runs (PR-0 carve-out). A tombstone
 	// hit or a private-key-in-table hit aborts the publish.
-	if errs := manifest.ValidateTOMLPlacement(registryToHostKey(daemon), flat); errs != nil {
-		return nil, nil, fmt.Errorf("renderer: %s: %s", daemon, errs.Error())
+	if errs := manifest.ValidateTOMLPlacement(hostKey, flat); errs != nil {
+		return nil, nil, fmt.Errorf("renderer: %s: %s", ctx.Daemon, errs.Error())
 	}
 
 	// Serialise. Hand-rolled emitter — the schema is fixed and small
@@ -88,9 +103,9 @@ func renderTOML(daemon string, dc *manifest.DaemonConfig, hostSANs []string) ([]
 // flatMap under their leaf names. Missing manifest values (e.g. a
 // schedd with no apps_domain) yield an empty value; the validator +
 // daemon-load path handle the absent-key shape.
-func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, keys []string, flat map[string]string) error {
+func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, appsDomain string, keys []string, flat map[string]string) error {
 	for _, k := range keys {
-		v, err := privateKeyValue(dc, k)
+		v, err := privateKeyValue(daemon, dc, appsDomain, k)
 		if err != nil {
 			return fmt.Errorf("renderer: %s: %s: %w", daemon, k, err)
 		}
@@ -108,7 +123,13 @@ func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, keys []string, fl
 // reflection table — the schema is small and the failure mode of an
 // unhandled key is loud (empty value flows into the validator as
 // "key not in catalog").
-func privateKeyValue(dc *manifest.DaemonConfig, key string) (string, error) {
+//
+// The appsDomain arg comes from the manifest's global DNS block
+// (DNS.AppsDomain) — schedd / apid / gatewayd-internal publish it
+// into their TOML so the daemons can serve tenant requests with
+// the canonical apps_domain. Empty appsDomain is acceptable (the
+// daemon falls back to FAAS_APPS_DOMAIN env var).
+func privateKeyValue(daemon string, dc *manifest.DaemonConfig, appsDomain, key string) (string, error) {
 	switch key {
 	case "socket_path":
 		// unix:///run/faas/<daemon>.sock → /run/faas/<daemon>.sock
@@ -124,16 +145,15 @@ func privateKeyValue(dc *manifest.DaemonConfig, key string) (string, error) {
 		// unix:// binds use socket_path, not listen_addr.
 		return "", nil
 	case "metrics_addr":
-		// Convention: every daemon exposes a Prometheus endpoint on
-		// 127.0.0.1:<port>. The port is daemon-specific (today all
-		// share 9091 outside of gatewayd-{internal=9090,public=8080});
-		// the renderer emits the canonical port from this table.
-		// A schema-level audit (PR-4) is the load-bearing check — the
-		// renderer cannot assert against metric-frame versions.
+		// Per-daemon Prometheus endpoint. The mapping is hardcoded
+		// against the 8 daemons in pkg/daemonunitspec; a refactor
+		// would carry the port on the daemonunitspec.Entry struct
+		// itself, but for PR-2 the in-renderer table is the source
+		// of truth and pkg/daemonunitspec is the audit target.
 		if dc.Bind == "" {
 			return "", nil
 		}
-		return defaultMetricsAddrFromBind(dc.Bind), nil
+		return defaultMetricsAddrForDaemon(daemon), nil
 	case "db_url":
 		// The renderer's only consumer of the PostgreSQL block is
 		// db_url. The schema pins it; the renderer emits it as-is.
@@ -142,14 +162,12 @@ func privateKeyValue(dc *manifest.DaemonConfig, key string) (string, error) {
 		// territory.
 		return "", nil
 	case "apps_domain":
-		// The renderer doesn't have access to DNS.AppsDomain here
-		// (the renderer is per-daemon; the DNS block is global). The
-		// caller threads the global via the hostSANs sidecar OR via
-		// a separate GlobalContext held by the renderer entry point.
-		// For PR-2, this is a forward-compat stub: the renderer emits
-		// the empty string and the daemon-load path tolerates it.
-		// PR-4 doctor will flag the absent field on first run.
-		return "", nil
+		// schedd + apid + gatewayd-internal carry this. The daemon
+		// loader uses the empty value as a "use the env var" signal
+		// (FAAS_APPS_DOMAIN). Passing through the manifest's
+		// DNS.AppsDomain makes the renderer's output deterministic
+		// — no surprise per-host env-var overrides.
+		return appsDomain, nil
 	case "vmmd_socket", "gateway_synth_socket":
 		// schedd-specific dials — the manifest's DaemonConfig.Outbound
 		// carries the vmmd target. The renderer maps
@@ -183,23 +201,32 @@ func privateKeyValue(dc *manifest.DaemonConfig, key string) (string, error) {
 	return "", nil
 }
 
-// defaultMetricsAddrFromBind returns the Prometheus metrics endpoint
-// for a daemon. Hardcoded for the 8 daemons in pkg/daemonunitspec;
+// defaultMetricsAddrForDaemon returns the Prometheus metrics endpoint
+// for daemon. Hardcoded for the 8 daemons in pkg/daemonunitspec —
 // the renderer's job is to emit the right value, not to compute it.
 //
-// The mapping is the same as daemonunitspec.UnitXxx()'s private
-// convention: scheduler+apis+builders+imaged+meterd+githubd on 9091,
-// gatewayd-internal on 9090, gatewayd-public on 8080, vmmd on 9095.
-// The PR-2 renderer ONLY emits the metrics_addr for the daemons the
-// daemonunitspec catalog owns.
-func defaultMetricsAddrFromBind(bind string) string {
-	// Daemon name is in the renderer.caller's context, not parsed
-	// here. We default to 9091 (the most common Prometheus port
-	// across the platform) and let the caller override per-daemon.
-	// The renderer thread is per-daemon already — the caller passes
-	// the daemon name to renderTOML, so a future refactor can pass
-	// the daemon name down. For PR-2 the default is sufficient.
-	_ = bind
+// The mapping mirrors pkg/daemonunitspec's per-daemon
+// CapabilityBoundingSet / metrics convention: most daemons expose
+// 127.0.0.1:9091; the three exceptions are:
+//   - vmmd: 9095 (low-port bind requires CAP_NET_BIND_SERVICE; vmmd is
+//     the only daemon that holds it)
+//   - gatewayd-internal: 9090 (split off from gatewayd-public in
+//     Tier A7; ADR-070)
+//   - gatewayd-public: 8080 (public listener; ADR-070)
+//
+// A future refactor would carry MetricsAddr on the
+// pkg/daemonunitspec.Entry struct; today the renderer table is the
+// source of truth and pkg/daemonunitspec is the audit target.
+func defaultMetricsAddrForDaemon(daemon string) string {
+	switch daemon {
+	case "vmmd":
+		return "127.0.0.1:9095"
+	case "gatewayd-internal":
+		return "127.0.0.1:9090"
+	case "gatewayd-public":
+		return "127.0.0.1:8080"
+	}
+	// Most daemons share the canonical Prometheus port.
 	return "127.0.0.1:9091"
 }
 

@@ -29,7 +29,13 @@ func renderSystemd(daemon string) ([]byte, error) {
 // renderSliceUnit returns the bytes for /etc/systemd/system/faas-cp.slice.
 // The slice is emitted once per host (it is the wrapper for all 8
 // daemons, not a daemon itself). pkg/daemonunitspec.UnitSlice() is the
-// source of truth.
+// source of truth for the field values.
+//
+// The renderer calls RenderSlice() (NOT Render()) because slice units
+// must use the [Slice] section for MemoryMax — Render() emits
+// [Service] which silently drops the 3 GB ceiling. Per daemonunit's
+// godoc on RenderSlice(), this is the load-bearing invariant for
+// tenant admission.
 func renderSliceUnit() []byte {
-	return daemonunitspec.UnitSlice().Render()
+	return daemonunitspec.UnitSlice().RenderSlice()
 }
