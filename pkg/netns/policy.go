@@ -22,6 +22,7 @@ package netns
 
 import (
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -87,6 +88,34 @@ type HostPolicy struct {
 	// v4 rule). Byte-for-byte locked with deploy/ansible/roles/nftables/
 	// files/policy_nftables.conf.j2; `make egress-check` is the gate.
 	MasqueradeCIDR6 string
+
+	// OverlayCIDRs (Mega-PR-B Commit 2) lists the per-host overlay
+	// subnets the multi-host mesh uses — e.g. a public-range
+	// WireGuard mesh (the operator's `AllowedIPs` from `wg0.conf`)
+	// or a public-range VPC CIDR. Two renderer effects:
+	//
+	//   1. Postrouting chain — for each OverlayCIDRs entry, emit a
+	//      MASQUERADE sibling: `ip saddr <overlay> oifname <iface>
+	//      masquerade`. Compute-node-originated traffic that travels
+	//      out the public IFace still gets the host's public IP.
+	//   2. Forward chain — for each OverlayCIDRs entry, emit an
+	//      `ip saddr <overlay> accept` rule BETWEEN the per-CIDR
+	//      deny block and the broad `iifname BridgeName oifname
+	//      PublicIface accept` allow. Compute-to-compute mesh
+	//      traffic that arrives bridged from br-tenants would
+	//      otherwise hit the §11 RFC1918 deny when the overlay
+	//      CIDR lives inside 10/8 — a Tier-1 BLOCKING trap.
+	//
+	// SAFETY: Render() PANICS if any OverlayCIDRs entry is a
+	// subset of any DenySet.Entries.Prefix — an overlay CIDR
+	// inside a denied range (RFC1918, link-local, CGNAT, ULA, or
+	// any of the §11 catalogue) would silently disable the
+	// lateral-movement contract for that overlay. Tailscale
+	// (`100.64.0.0/10`) and any WireGuard mesh sitting inside
+	// RFC1918 are rejected by this gate; operators must use a
+	// public-range overlay (e.g. operator-owned IPs routed over
+	// the mesh, or a public-cloud VPC). See Render panic gate.
+	OverlayCIDRs []string
 }
 
 // DefaultHostPolicy is the platform-wide host nftables policy. Source of
@@ -143,6 +172,28 @@ func (h HostPolicy) Render() string {
 		panic("netns: HostPolicy.Render: BridgeName, PublicIface, and MasqueradeCIDR are required")
 	}
 
+	// Mega-PR-B Commit 2 panic gate: reject OverlayCIDRs entries that
+	// are subsets of any DenySet entry. An overlay CIDR inside a
+	// denied range would render an `ip saddr <overlay> accept` rule
+	// in the forward chain (see below) that *overrides* the §11
+	// RFC1918 deny — silently disabling the lateral-movement contract
+	// for that overlay. The deny table is RFC1918-anchored (spec §11
+	// ship-blocker); overlay CIDRs must sit OUTSIDE all deny entries.
+	for i, overlayStr := range h.OverlayCIDRs {
+		overlay, err := netip.ParsePrefix(overlayStr)
+		if err != nil {
+			panic(fmt.Sprintf("netns: HostPolicy.Render: OverlayCIDRs[%d] %q: %v", i, overlayStr, err))
+		}
+		for _, e := range h.DenySet.Entries {
+			if overlay.Overlaps(e.Prefix) && isSubset(overlay, e.Prefix) {
+				panic(fmt.Sprintf("netns: HostPolicy.Render: OverlayCIDRs[%d]=%s is a subset of deny entry %s — "+
+					"an accept-before-deny rule would silently disable the lateral-movement contract. "+
+					"Pick an overlay CIDR that sits outside the §11 deny list.",
+					i, overlay, e.Prefix))
+			}
+		}
+	}
+
 	denyPorts := h.DenySet.SMTPPortsCommaSet()
 	allowPorts := joinInts(h.InputAllowTCPPorts, ",")
 
@@ -197,6 +248,19 @@ func (h HostPolicy) Render() string {
 		fmt.Fprintf(&b, "    %s daddr %s counter name %q drop\n",
 			family, e.Prefix.String(), e.CounterName)
 	}
+	// Mega-PR-B Commit 2: per-overlay accept rules emitted AFTER the
+	// per-CIDR deny block and BEFORE the broad bridged-tenant allow.
+	// The deny-set stays identical (lateral-movement contract intact);
+	// the overlay-accept rules unblock bridge-to-overlay traffic that
+	// would otherwise hit the §11 RFC1918 deny (Tier-1 BLOCKING trap
+	// when the overlay CIDR lives inside 10/8). The panic gate above
+	// ensures no overlay CIDR is a subset of a deny entry, so the
+	// accept rules are *additive* — they cannot silently disable a
+	// deny. Empty OverlayCIDRs (single-host dev) emits zero rules;
+	// the rendered bytes are byte-identical to the pre-Commit-2 output.
+	for _, overlayStr := range h.OverlayCIDRs {
+		fmt.Fprintf(&b, "    ip saddr %s accept\n", overlayStr)
+	}
 	fmt.Fprintf(&b, "    iifname %q oifname %q accept\n", h.BridgeName, h.PublicIface)
 	b.WriteString("  }\n")
 	b.WriteString("\n")
@@ -207,6 +271,15 @@ func (h HostPolicy) Render() string {
 	b.WriteString("  chain postrouting {\n")
 	b.WriteString("    type nat hook postrouting priority srcnat; policy accept;\n")
 	fmt.Fprintf(&b, "    ip saddr %s oifname %q masquerade\n", h.MasqueradeCIDR, h.PublicIface)
+	// Mega-PR-B Commit 2: per-overlay MASQUERADE siblings. Each
+	// OverlayCIDRs entry produces one MASQUERADE sibling after the
+	// bridge CIDR rule, so compute-node-originated overlay traffic
+	// that leaves via PublicIface still exits under the host's
+	// public IP. Empty OverlayCIDRs emits zero siblings; the
+	// rendered bytes are byte-identical to the pre-Commit-2 output.
+	for _, overlayStr := range h.OverlayCIDRs {
+		fmt.Fprintf(&b, "    ip saddr %s oifname %q masquerade\n", overlayStr, h.PublicIface)
+	}
 	// IPv6 sibling — emitted only when MasqueradeCIDR6 is non-empty so
 	// v4-only deployments ship an unchanged ruleset. The sibling mirrors
 	// the v4 rule exactly (same oifname, same nat chain); without it,
@@ -229,4 +302,97 @@ func joinInts(in []int, sep string) string {
 		parts[i] = strconv.Itoa(n)
 	}
 	return strings.Join(parts, sep)
+}
+
+// isSubset reports whether every address in inner is also in outer
+// (Mega-PR-B Commit 2 panic gate). Equal prefixes are considered
+// subsets so the gate rejects both the overlap and the exact-match
+// case (e.g. an overlay == part of a deny entry). Different address
+// families (v4 vs v6) never compare as subsets.
+//
+// The check is range-based: the BROADCAST address of `inner` must
+// fall at or below the broadcast address of `outer` (after masking).
+// Naive byte comparison of network addresses misses the case where
+// the inner prefix has a higher Bits() than outer but its network
+// address is still inside outer's range — e.g. 10.42.0.0/24 has
+// network 10.42.0.0 with Bits=24; 10.0.0.0/8 has broadcast 10.255.255.255.
+// 10.42.0.255 (the highest address in /24) IS in 10.0.0.0/8 — so the
+// /24 IS a subset of the /8.
+func isSubset(inner, outer netip.Prefix) bool {
+	if inner == outer {
+		return true
+	}
+	if inner.Bits() < outer.Bits() {
+		return false
+	}
+	if inner.Addr().BitLen() != outer.Addr().BitLen() {
+		return false
+	}
+	// The broadcast of inner (highest address) must be <= broadcast of outer.
+	// For prefixes, network+bits uniquely identifies the range; we walk the
+	// top-of-inner vs top-of-outer.
+	innerTop := prefixTopAddr(inner)
+	outerTop := prefixTopAddr(outer)
+	if compareAddr(innerTop, outerTop) > 0 {
+		return false
+	}
+	// And the bottom of inner (its network address) must be >= bottom of outer.
+	innerBot := inner.Masked().Addr()
+	outerBot := outer.Masked().Addr()
+	return compareAddr(innerBot, outerBot) >= 0
+}
+
+// prefixTopAddr returns the highest address in a prefix's range
+// (network address | host bits all set). For 10.0.0.0/8 → 10.255.255.255;
+// for 10.42.0.0/24 → 10.42.0.255. Renamed from lastAddr to avoid
+// colliding with netip.Prefix.lastAddr (Go 1.22+ method of the same
+// name).
+func prefixTopAddr(p netip.Prefix) netip.Addr {
+	addr := p.Addr()
+	bits := p.Bits()
+	addrLen := addr.BitLen()
+	if bits == addrLen {
+		return addr
+	}
+	// For a v4 prefix with Bits=8, the host bits span 24 positions.
+	// We set them by OR-ing with a host-bits mask.
+	bytes := addr.AsSlice()
+	hostBits := uint(addrLen - bits)
+	// Walk from the rightmost byte, set all host bits to 1.
+	for i := len(bytes) - 1; i >= 0 && hostBits > 0; i-- {
+		setInThis := hostBits
+		if setInThis > 8 {
+			setInThis = 8
+		}
+		mask := byte((1 << setInThis) - 1)
+		bytes[i] |= mask
+		hostBits -= setInThis
+	}
+	a, _ := netip.AddrFromSlice(bytes)
+	return a
+}
+
+// compareAddr returns -1, 0, or +1 according to whether a < b, ==, or >.
+// v4 < v6 ordering is preserved: all v4 addresses sort below all v6.
+func compareAddr(a, b netip.Addr) int {
+	if a == b {
+		return 0
+	}
+	aLen, bLen := a.BitLen(), b.BitLen()
+	if aLen != bLen {
+		if aLen < bLen {
+			return -1
+		}
+		return 1
+	}
+	ab, bb := a.AsSlice(), b.AsSlice()
+	for i := range ab {
+		if ab[i] < bb[i] {
+			return -1
+		}
+		if ab[i] > bb[i] {
+			return 1
+		}
+	}
+	return 0
 }

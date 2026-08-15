@@ -609,6 +609,91 @@ func TestHostPolicyRenderSubstitutesMasqueradeCIDR(t *testing.T) {
 	}
 }
 
+// TestHostPolicyRenderSubstitutesOverlayCIDRs (Mega-PR-B Commit 2) pins
+// the multi-CIDR substitution of OverlayCIDRs. Vary two overlay CIDRs
+// BOTH outside the §11 deny set: a public-range operator WireGuard
+// mesh (203.0.113.0/24, TEST-NET-3 — RFC5737 documentation range, safe
+// for tests) and a public-range GCP VPC (34.0.0.0/8, Google's actual
+// public allocation). Tailscale CGNAT (100.64.0.0/10), RFC1918 ranges
+// (10/8, 172.16/12, 192.168/16), link-local (169.254/16), and ULA
+// (fc00::/7) are ALL in the deny set — overlays inside them are
+// rejected by the panic gate
+// (TestHostPolicyRenderPanicsOnOverlayCIDRInsideDenyCIDR). Each
+// non-denied overlay CIDR must produce:
+//
+//   1. A MASQUERADE sibling in the postrouting chain (per the
+//      per-overlay MASQUERADE loop).
+//   2. An `ip saddr <overlay> accept` rule in the forward chain
+//      BETWEEN the per-CIDR deny block and the broad bridged-tenant
+//      allow (the deny-collision fix).
+//
+// The order assertion is load-bearing — an accept rule emitted
+// BEFORE the per-CIDR deny would be silently shadowed by the deny on
+// overlap (nft first-match).
+func TestHostPolicyRenderSubstitutesOverlayCIDRs(t *testing.T) {
+	p := DefaultHostPolicy
+	p.OverlayCIDRs = []string{"203.0.113.0/24", "34.0.0.0/8"}
+	out := p.Render()
+	// Postrouting siblings.
+	for _, cidr := range p.OverlayCIDRs {
+		want := fmt.Sprintf(`ip saddr %s oifname %q masquerade`, cidr, p.PublicIface)
+		if !strings.Contains(out, want) {
+			t.Errorf("postrouting chain missing overlay MASQUERADE %q:\n%s", want, out)
+		}
+	}
+	// Forward-chain accept rules.
+	for _, cidr := range p.OverlayCIDRs {
+		want := fmt.Sprintf(`ip saddr %s accept`, cidr)
+		if !strings.Contains(out, want) {
+			t.Errorf("forward chain missing overlay accept %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestHostPolicyForwardOverlayAcceptAfterDeny asserts the
+// load-bearing order: overlay accept rules must appear in the
+// forward chain AFTER the per-CIDR deny block (so the deny is
+// evaluated first on collision) and BEFORE the broad bridged-tenant
+// allow. The test uses a public-range overlay CIDR (203.0.113.0/24,
+// TEST-NET-3 — RFC5737) outside the deny list — overlays that
+// overlap a deny CIDR are caught by the panic gate
+// (TestHostPolicyRenderPanicsOnOverlayCIDRInsideDenyCIDR).
+func TestHostPolicyForwardOverlayAcceptAfterDeny(t *testing.T) {
+	p := DefaultHostPolicy
+	p.OverlayCIDRs = []string{"203.0.113.0/24"}
+	out := p.Render()
+	denyIdx := strings.Index(out, "ip daddr 10.0.0.0/8")
+	acceptIdx := strings.Index(out, "ip saddr 203.0.113.0/24 accept")
+	if denyIdx < 0 {
+		t.Fatalf("RFC1918 10.0.0.0/8 deny not found in render:\n%s", out)
+	}
+	if acceptIdx < 0 {
+		t.Fatalf("overlay accept rule not found in render:\n%s", out)
+	}
+	if acceptIdx <= denyIdx {
+		t.Errorf("overlay accept (idx %d) must appear AFTER the 10.0.0.0/8 deny (idx %d); "+
+			"otherwise nft first-match drops the mesh traffic:\n%s",
+			acceptIdx, denyIdx, out)
+	}
+}
+
+// TestHostPolicyRenderPanicsOnOverlayCIDRInsideDenyCIDR exercises the
+// panic gate. Setting OverlayCIDRs to a CIDR inside the 10.0.0.0/8
+// deny would otherwise render an accept rule that *overrides* the
+// deny on the same address space — silently disabling lateral-
+// movement protection for that overlay. Render() must refuse to
+// produce a broken ruleset.
+func TestHostPolicyRenderPanicsOnOverlayCIDRInsideDenyCIDR(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("Render() must panic when OverlayCIDRs entry is a subset of a DenySet entry; got no panic")
+		}
+	}()
+	p := DefaultHostPolicy
+	p.OverlayCIDRs = []string{"10.0.0.0/16"} // subset of 10.0.0.0/8 deny
+	_ = p.Render()
+}
+
 // TestHostPolicyRenderNftSyntaxCheck is the local equivalent of the
 // ansible role's `nft -c -f /etc/nftables.conf` step. CI gates this via
 // `make egress-check` (regenerates + byte-compares the artifact), but on
