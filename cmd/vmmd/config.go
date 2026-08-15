@@ -189,6 +189,22 @@ type ComputeNodeConfig struct {
 	MaxConcurrency     int    `toml:"max_concurrency"`      // parallel live instances
 	AdmissionCeilingMB int    `toml:"admission_ceiling_mb"` // Σ(ram_mb + 8) cap
 	OverlayIP          string `toml:"overlay_ip"`           // Tailscale/Wireguard IP; auto-detected when empty
+	// HostBridgeCIDR is the per-host bridge CIDR (the /16 the veth
+	// host-side addresses live in). Mega-PR-B Commit 1 supersedes
+	// the former pkg/netns Go const; defaults to
+	// api.DefaultHostBridgeCIDR() (10.100.0.0/16) when empty. The
+	// bridge IP is the .1 of whatever CIDR the operator ships.
+	// Single-host dev keeps the default; multi-host deployments
+	// override per-host via env-overlay or TOML.
+	HostBridgeCIDR string `toml:"host_bridge_cidr"`
+	// OverlayCIDR is the per-host overlay subnet the vmmd overlay
+	// detector prefers when multiple IPv4 candidates come back from
+	// `tailscale ip -4` (Mega-PR-B Commit 3). Defaults to
+	// api.DefaultOverlayCIDR() (Tailscale 100.64.0.0/10) when empty.
+	// The same CIDR is rendered into the host forward chain's
+	// overlay-accept rules (Commit 2) so mesh traffic survives the
+	// §11 RFC1918 deny.
+	OverlayCIDR string `toml:"overlay_cidr"`
 }
 
 // ResolveListenTarget returns the gRPC target the server should bind.
@@ -347,6 +363,16 @@ func LoadConfig(path string) (*Config, error) {
 	// compat — short hostname).
 	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
 		c.ComputeNode.NodeName = v
+	}
+	// Mega-PR-B (issue #911 / ADR-110 Tier-1 BLOCKING Commit 1):
+	// env-var overlay for [compute_node].host_bridge_cidr so the
+	// per-host bridge CIDR is configurable without a TOML edit
+	// (mirrors the FAAS_NODE_NAME pattern above). The default
+	// single-host bridge CIDR lives in pkg/api.DefaultHostBridgeCIDR().
+	// Empty keeps the TOML value (or the api default when TOML is
+	// also empty).
+	if v := os.Getenv("FAAS_HOST_BRIDGE_CIDR"); v != "" {
+		c.ComputeNode.HostBridgeCIDR = v
 	}
 	return c, nil
 }

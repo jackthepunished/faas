@@ -12,6 +12,7 @@ package api
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"testing"
@@ -2598,6 +2599,36 @@ const (
 // helper resolves to the same integer today — no behavior change.
 func DefaultComputeNodeCeilingMB() int {
 	return RAMAdmissionCeilingMB
+}
+
+// DefaultHostBridgeCIDR is the per-host bridge CIDR the vmmd tenant
+// netns' veth host-side addresses live in (Mega-PR-B Commit 1;
+// supersedes the former pkg/netns Go const HostBridgeCIDR). The /16
+// default keeps single-host dev identical to the v1 behaviour; multi-
+// host deployments override via ComputeNodeConfig.HostBridgeCIDR
+// (cmd/vmmd/config.go) — the bridge IP is the .1 of whatever CIDR the
+// operator ships. The MasqueradeCIDR default mirrors this value so the
+// host forward chain's `ip saddr ... oifname ... masquerade` rule still
+// covers the per-instance bridge.
+func DefaultHostBridgeCIDR() netip.Prefix {
+	return netip.MustParsePrefix("10.100.0.0/16")
+}
+
+// DefaultMasqueradeCIDR is the host postrouting nat chain MASQUERADE
+// source CIDR (must equal the NETWORK form of DefaultHostBridgeCIDR —
+// see pkg/netns/policy.go::Render panic gate). Exposed as a string
+// for renderer/tests that don't need the netip.Prefix.
+var DefaultMasqueradeCIDR = DefaultHostBridgeCIDR().String()
+
+// DefaultOverlayCIDR is the per-host overlay subnet the vmmd overlay
+// detector prefers when multiple IPv4 candidates come back from
+// `tailscale ip -4` (Mega-PR-B Commit 3). The default matches the
+// Tailscale CGNAT range (100.64.0.0/10); WireGuard deployments override
+// via ComputeNodeConfig.OverlayCIDR. Mesh traffic between compute nodes
+// lands here; the host forward chain's overlay-accept rules (Commit 2)
+// unblock it past the §11 RFC1918 deny.
+func DefaultOverlayCIDR() netip.Prefix {
+	return netip.MustParsePrefix("100.64.0.0/10")
 }
 
 // ConntrackCapProbe returns the effective per-instance conntrack cap.

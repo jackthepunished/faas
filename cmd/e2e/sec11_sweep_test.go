@@ -1127,8 +1127,8 @@ func TestSec11_EgressPolicyMigrationShape(t *testing.T) {
 	if publicIface != "eth0" {
 		t.Errorf("egress_policy.public_iface = %q, want eth0", publicIface)
 	}
-	if masqueradeCIDR != "10.100.0.0/16" {
-		t.Errorf("egress_policy.masquerade_cidr = %q, want 10.100.0.0/16", masqueradeCIDR)
+	if masqueradeCIDR != api.DefaultMasqueradeCIDR {
+		t.Errorf("egress_policy.masquerade_cidr = %q, want %s", masqueradeCIDR, api.DefaultMasqueradeCIDR)
 	}
 
 	// 3. The pg_notify channel fires when the audit row is updated.
@@ -1187,8 +1187,8 @@ func TestSec11_EgressPolicyMigrationShape(t *testing.T) {
 	if payload.PublicIface != "eth0" {
 		t.Errorf("payload.public_iface = %q, want eth0", payload.PublicIface)
 	}
-	if payload.MasqueradeCIDR != "10.100.0.0/16" {
-		t.Errorf("payload.masquerade_cidr = %q, want 10.100.0.0/16", payload.MasqueradeCIDR)
+	if payload.MasqueradeCIDR != api.DefaultMasqueradeCIDR {
+		t.Errorf("payload.masquerade_cidr = %q, want %s", payload.MasqueradeCIDR, api.DefaultMasqueradeCIDR)
 	}
 	if payload.ChangedAt == "" {
 		t.Errorf("payload.changed_at empty; want non-empty timestamptz echo")

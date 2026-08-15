@@ -27,10 +27,31 @@ const (
 // hostIPBase is the /16 the veth host-side addresses live in (spec §7,
 // 10.100.x.y/16). Slot 0 maps to hostIPBase + hostIPOffset so the bridge address
 // (10.100.0.1) and network address are never handed to an instance.
+//
+// Mega-PR-B (issue #911 / ADR-110 Tier-1 BLOCKING Commit 1) lifts the
+// bridge CIDR from a Go const into per-host config (pkg/api.DefaultHostBridgeCIDR
+// + cmd/vmmd/config.go::ComputeNodeConfig.HostBridgeCIDR). Single-host
+// dev keeps the legacy 10.100.0.0 base; multi-host deployments call
+// Allocator.SetHostIPBase before Acquire so per-instance host IPs land
+// in the operator's chosen /16.
 var (
 	hostIPBase   = netip.MustParseAddr("10.100.0.0")
 	hostIPOffset = uint32(2)
 )
+
+// SetHostIPBase overrides the per-instance veth host-side address base
+// (Mega-PR-B Commit 1). Pass the network address of the per-host /16
+// (e.g. 10.101.0.0 for a 10.101.0.0/16 deployment). The bridge IP
+// (hostIPBase + 1) and the network address (hostIPBase + 0) are
+// reserved — slot 0 maps to hostIPBase + hostIPOffset so the allocator
+// never hands them out. The setter is additive; legacy callers that
+// don't invoke it keep the v1 single-host 10.100.0.0 base.
+//
+// Not safe for concurrent calls with Acquire/Release; the vmmd main
+// calls SetHostIPBase exactly once at boot, before any Acquire.
+func SetHostIPBase(addr netip.Addr) {
+	hostIPBase = addr
+}
 
 // Lease is the set of unique resources bound to one running instance. It is
 // returned by Allocator.Acquire and must be handed back via Allocator.Release
