@@ -666,13 +666,36 @@ func sampleMaintenanceRule(id string, prio int, host string) EdgeRuleMaintenance
 	}
 }
 
-// putEntryAll is the PR 6 widening of putEntry: covers all 11 kinds
-// after the kind=maintenance and kind=geo extensions (ADR-091 D21
-// amendment, §4.1.2.13). The validate widening was PR-B; the limit
-// widening was D24; the maintenance widening is PR-A; the geo
-// widening is PR-A's sibling cluster. Mirrors cmd-side loadHost's
-// single-pass compile pattern — the production loader always
-// populates every kind at once; this test helper does the same.
+// sampleBudgetRule (ADR-093 / kind=budget) is the eleventh-kind
+// mirror of sampleIPRule's shape. BudgetMs is the per-request
+// wall-clock budget; AllowOverrideHeader is empty (the runtime
+// falls back to api.RequestBudgetDefaultOverrideHeader). The
+// cmd-side compileBudgetRules clamps out-of-range values to
+// api.RequestBudgetMaxMs; these samples stay in-range so the
+// resolver-level unit test doesn't have to simulate the clamp
+// path (which has its own cmd-side test in
+// cmd/gatewayd-internal/edge_rules_test.go).
+func sampleBudgetRule(id string, prio int, host string) EdgeRuleBudgetResolved {
+	return EdgeRuleBudgetResolved{
+		ID:                  id,
+		AccountID:           "acc_" + id,
+		AppID:               "app_" + id,
+		Priority:            prio,
+		PathGlob:            "",
+		Methods:             nil,
+		BudgetMs:            3000,
+		AllowOverrideHeader: "",
+	}
+}
+
+// putEntryAll is the PR 6 widening of putEntry: covers all 12 kinds
+// after the kind=maintenance, kind=geo, and kind=budget extensions
+// (ADR-091 D21 amendment, §4.1.2.13, ADR-093). The validate widening
+// was PR-B; the limit widening was D24; the maintenance widening is
+// PR-A; the geo widening is PR-A's sibling cluster; the budget
+// widening is ADR-093. Mirrors cmd-side loadHost's single-pass
+// compile pattern — the production loader always populates every
+// kind at once; this test helper does the same.
 //
 // Adding a new edge-rule kind requires extending this signature.
 // The compiler enforces it across every callsite — that's the
@@ -690,6 +713,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 	limit []EdgeRuleLimitResolved,
 	maintenance []EdgeRuleMaintenanceResolved,
 	geo []EdgeRuleGeoResolved,
+	budget []EdgeRuleBudgetResolved,
 ) {
 	c.Put(host, &HostEntry{
 		Host:        host,
@@ -704,6 +728,7 @@ func putEntryAll(c *EdgeRuleCache, host string,
 		Limit:       limit,
 		Maintenance: maintenance,
 		Geo:         geo,
+		Budget:      budget,
 	})
 }
 
@@ -845,6 +870,58 @@ func TestPickFirstLimitMatch_MethodsFilter(t *testing.T) {
 	}
 }
 
+// TestPickFirstBudgetMatch_PriorityOrdering (ADR-093 / kind=budget)
+// pins the priority-ASC + first-match-wins shape. Mirrors
+// TestPickFirstLimitMatch_PriorityOrdering — the small copy keeps
+// the per-kind return type precise without paying for a
+// runtime-type assertion on every request.
+func TestPickFirstBudgetMatch_PriorityOrdering(t *testing.T) {
+	host := "a.example.com"
+	rules := []EdgeRuleBudgetResolved{
+		sampleBudgetRule("high", 0, host),
+		sampleBudgetRule("low", 100, host),
+	}
+	got := PickFirstBudgetMatch(rules, "/", "POST")
+	if got == nil || got.ID != "high" {
+		t.Fatalf("got %v, want high priority-0", got)
+	}
+}
+
+// TestPickFirstBudgetMatch_PathGlob pins the path-glob filter for
+// kind=budget. A rule with PathGlob=`/v1/payment/*` must NOT
+// match `/healthz` even at lower priority; without the filter,
+// the rule would falsely claim a hit on every method+path
+// combination.
+func TestPickFirstBudgetMatch_PathGlob(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleBudgetRule("glob", 0, host)
+	rule.PathGlob = "/v1/payment/*"
+	rules := []EdgeRuleBudgetResolved{rule}
+	if got := PickFirstBudgetMatch(rules, "/healthz", "POST"); got != nil {
+		t.Fatalf("got %v, want nil (path-glob filter)", got)
+	}
+	if got := PickFirstBudgetMatch(rules, "/v1/payment/intent", "POST"); got == nil || got.ID != "glob" {
+		t.Fatalf("got %v, want glob match on /v1/payment/intent", got)
+	}
+}
+
+// TestPickFirstBudgetMatch_MethodsFilter pins the HTTP-method filter
+// for kind=budget. The resolver still respects a per-rule Methods
+// map; a rule declared for POST must not match GET, even at
+// priority 0. Mirrors the limit-methods test.
+func TestPickFirstBudgetMatch_MethodsFilter(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleBudgetRule("post-only", 0, host)
+	rule.Methods = map[string]bool{"POST": true}
+	rules := []EdgeRuleBudgetResolved{rule}
+	if got := PickFirstBudgetMatch(rules, "/", "GET"); got != nil {
+		t.Fatalf("got %v, want nil (methods filter excluded GET)", got)
+	}
+	if got := PickFirstBudgetMatch(rules, "/", "POST"); got == nil || got.ID != "post-only" {
+		t.Fatalf("got %v, want post-only match on POST", got)
+	}
+}
+
 // --- PR 6: wholesale-Reset() property test (ADR-091 D17) ----------
 //
 // The EdgeRuleCache is the LRU mirror for all 9 edge-rule kinds
@@ -867,8 +944,9 @@ func TestPickFirstLimitMatch_MethodsFilter(t *testing.T) {
 // rename widened the original PR-6 SevenKinds test to cover the
 // kind=validate slice added by PR-B; PR #855 widened it again for
 // kind=limit (ADR-091 D24); PR-A widens it for kind=maintenance
-// (§4.1.2.13) and for kind=geo (D21). See plan §D1 + D21 + D24.
-func TestEdgeRuleReset_WholesaleAcrossAllElevenKinds(t *testing.T) {
+// (§4.1.2.13) and for kind=geo (D21); ADR-093 widens it once more
+// for kind=budget. See plan §D1 + D21 + D24 + ADR-093 §Decision.
+func TestEdgeRuleReset_WholesaleAcrossAllTwelveKinds(t *testing.T) {
 	c := NewEdgeRuleCache(EdgeRuleCacheCap)
 	host := "a.example.com"
 	putEntryAll(c, host,
@@ -883,6 +961,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllElevenKinds(t *testing.T) {
 		[]EdgeRuleLimitResolved{sampleLimitRule("lm", 0, host)},
 		[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", 0, host)},
 		[]EdgeRuleGeoResolved{sampleGeoRule("geo", 0, []string{"DE"}, nil, "")},
+		[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", 0, host)},
 	)
 
 	// Sanity: every GetK returns a hit pre-Reset.
@@ -901,6 +980,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllElevenKinds(t *testing.T) {
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
 		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
+		{"GetBudget", func() bool { _, ok := c.GetBudget(host); return ok }},
 	}
 	for _, c0 := range preChecks {
 		if !c0.f() {
@@ -925,6 +1005,7 @@ func TestEdgeRuleReset_WholesaleAcrossAllElevenKinds(t *testing.T) {
 		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
 		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
 		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
+		{"GetBudget", func() bool { _, ok := c.GetBudget(host); return ok }},
 	}
 	for _, c0 := range postChecks {
 		if c0.f() {
@@ -988,6 +1069,7 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 						[]EdgeRuleLimitResolved{sampleLimitRule("lm", j, hostA)},
 						[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", j, hostA)},
 						[]EdgeRuleGeoResolved{sampleGeoRule("geo", j, []string{"DE"}, nil, "")},
+						[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", j, hostA)},
 					)
 				case 1:
 					_, _ = c.Get(hostA)
@@ -998,12 +1080,13 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 					_, _ = c.GetLimit(hostA)
 					_, _ = c.GetMaintenance(hostA)
 					_, _ = c.GetGeo(hostA)
+					_, _ = c.GetBudget(hostA)
 				case 2:
 					c.Reset()
 				case 3:
 					putEntryAll(c, hostB,
 						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
-						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					)
 				}
 			}
@@ -1063,6 +1146,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 					[]EdgeRuleLimitResolved{sampleLimitRule("lm", i, host)},
 					[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", i, host)},
 					[]EdgeRuleGeoResolved{sampleGeoRule("geo", i, []string{"DE"}, nil, "")},
+					[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", i, host)},
 				)
 			case 1: // GetK (any kind)
 				_, _ = c.Get(host)
@@ -1076,6 +1160,7 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 				_, _ = c.GetLimit(host)
 				_, _ = c.GetMaintenance(host)
 				_, _ = c.GetGeo(host)
+				_, _ = c.GetBudget(host)
 			case 2: // Reset
 				c.Reset()
 			}

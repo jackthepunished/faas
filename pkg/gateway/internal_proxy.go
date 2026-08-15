@@ -47,6 +47,7 @@ import (
 	"golang.org/x/net/http2"
 
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
 // InternalDialer is the seam the public daemon wires to reach a
@@ -255,7 +256,20 @@ func newInternalProxyH2CTransport(dialer InternalDialer, dialTimeout time.Durati
 // finding #4) and any future change to the timeout semantics
 // (e.g. a min-deadline with the inbound ctx) only needs to update
 // this function. Returns the dialer's net.Conn (or error).
+//
+// ADR-093 / PR-C: when the inbound ctx carries a Budget, the dial
+// step takes a reqbudget.WithOverhead reservation
+// (DefaultOverheadGRPC, 5 ms) so the next downstream hop starts
+// with less declared budget than the inbound dial had. The
+// reservation is only the budget's bookkeeping — it doesn't add
+// wall-clock latency. When no Budget is attached, the dial ctx is
+// the inbound ctx unchanged (no overhead).
 func dialWithTimeout(ctx context.Context, dialer InternalDialer, dialTimeout time.Duration) (net.Conn, error) {
+	if b, ok := reqbudget.FromContext(ctx); ok {
+		var cancel context.CancelFunc
+		ctx, cancel, _ = b.WithOverhead(ctx, "grpc-dial", reqbudget.DefaultOverheadGRPC)
+		defer cancel()
+	}
 	if dialTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, dialTimeout)

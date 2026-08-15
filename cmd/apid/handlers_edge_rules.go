@@ -160,6 +160,12 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage, plan api.Plan) *ap
 			return api.ErrValidation(fmt.Sprintf("geo action: %v", err))
 		}
 		return a.Validate()
+	case state.EdgeRuleKindBudget:
+		var a api.EdgeRuleBudgetAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("budget action: %v", err))
+		}
+		return a.Validate()
 	}
 	return api.ErrValidation("edge rule action validation fell through — internal bug")
 }
@@ -483,6 +489,20 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 		var a api.EdgeRuleGeoAction
 		if err := json.Unmarshal(raw, &a); err == nil {
 			out.Geo = &state.EdgeRuleGeoAction{Allow: a.Allow, Deny: a.Deny}
+		}
+	case state.EdgeRuleKindBudget:
+		var a api.EdgeRuleBudgetAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Mirror the validate / limit path's pattern: structural
+			// decode only. The gateway re-compiles the budget
+			// (cmd-side compileBudgetRules, cmd/gatewayd-internal/
+			// edge_rules.go) and clamps out-of-range values as
+			// defence-in-depth against a direct-DB row that bypassed
+			// apid-Validate.
+			out.Budget = &state.EdgeRuleBudgetAction{
+				BudgetMs:            a.BudgetMs,
+				AllowOverrideHeader: a.AllowOverrideHeader,
+			}
 		}
 	}
 	return out

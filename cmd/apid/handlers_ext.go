@@ -3149,6 +3149,23 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 	// tag then drops the field from the wire response. The
 	// dashboard renders "scan pending" on the absence.
 	resp.Scan = s.scanResponse(d)
+	// PR-A: per-deploy secret-scan audit row. Mirrors the
+	// Scan field above — same single-source-of-truth pattern
+	// (s.secretScanResponse is also used by
+	// /v1/deployments/{id}/secret-scan). The handler-side
+	// conversion from the on-disk jsonb shape
+	// (state.Deployment.SecretFindings []byte) into the wire
+	// DTO (api.SecretScanResult) happens here so this
+	// endpoint and the /secret-scan drill-down route emit
+	// IDENTICAL typed payloads for a given row.
+	//
+	// Returns nil when the row has SecretScannedAt == nil
+	// (mid-pipeline / pre-PR-A row); the SecretScan field's
+	// omitempty tag then drops the field from the wire
+	// response. The dashboard renders "secret scan pending"
+	// on the absence. A present-but-clean row has
+	// SecretScan != nil with Findings = [].
+	resp.SecretScan = s.secretScanResponse(d)
 	// Issue #554 / ADR-079 follow-up (AC #3 wire): surface the
 	// per-deployment parked_reason + parked_at columns from
 	// migration 00157. omitempty on the DTO handles the "never

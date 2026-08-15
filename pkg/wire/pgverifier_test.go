@@ -265,3 +265,300 @@ func TestPGNodeVerifier_Run_NilReceiverBlocksUntilCancel(t *testing.T) {
 		t.Fatal("Run did not return after ctx cancel")
 	}
 }
+
+// PR-5 / issue #911 — heartbeat-only payload discrimination.
+//
+// The 'compute_node_changed' pg_notify channel carries two payload
+// shapes. compute_nodes writes emit JSON {node_id, active} (migration
+// 00026) and compute_node_keys writes emit the literal string
+// "compute_node_keys" (migration 00076's TG_TABLE_NAME piggyback). The
+// verifier reads ONLY compute_nodes, so Run filters the keys payload
+// at the receiver — no Refresh, no log line, no loader round-trip.
+
+// TestPGNodeVerifier_Run_SkipsComputeNodeKeysPayload asserts that a
+// notify carrying the literal "compute_node_keys" payload triggers
+// zero loader calls. This is the discriminator fix for issue #911.
+func TestPGNodeVerifier_Run_SkipsComputeNodeKeysPayload(t *testing.T) {
+	loader := &stubNodeLoader{rows: []NodeRow{
+		{CN: "vmmd", ID: "uuid-1"},
+	}}
+	v := NewPGNodeVerifier(loader, newSilentLogger())
+
+	// Initial Refresh to populate the snapshot (and register one
+	// loader call as the baseline).
+	if _, err := v.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh err=%v; want nil", err)
+	}
+	baseline := loader.calls.Load()
+
+	ch := make(chan db.Notification, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- v.Run(ctx, ch) }()
+
+	// Send three keys-only notifies — none should drive a Refresh.
+	for i := 0; i < 3; i++ {
+		ch <- db.Notification{
+			Channel: db.NotifyComputeNodeChanged,
+			Payload: ComputeNodeKeysPayload,
+		}
+	}
+
+	// Give the drain a moment to (not) process.
+	time.Sleep(50 * time.Millisecond)
+	if got := loader.calls.Load(); got != baseline {
+		t.Errorf("loader calls=%d after keys-only notifies; want %d (no Refresh)",
+			got, baseline)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestPGNodeVerifier_Run_RefreshesOnComputeNodePayload asserts that a
+// notify carrying a JSON {node_id, active} payload (or any non-keys
+// payload) drives a Refresh — i.e. the discriminator only filters
+// the keys shape, everything else triggers the loader.
+func TestPGNodeVerifier_Run_RefreshesOnComputeNodePayload(t *testing.T) {
+	loader := &stubNodeLoader{rows: []NodeRow{
+		{CN: "vmmd", ID: "uuid-1"},
+	}}
+	v := NewPGNodeVerifier(loader, newSilentLogger())
+
+	ch := make(chan db.Notification, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- v.Run(ctx, ch) }()
+
+	// Two JSON-payload notifies should drive two Refresh calls.
+	ch <- db.Notification{
+		Channel: db.NotifyComputeNodeChanged,
+		Payload: `{"node_id":"uuid-1","active":true}`,
+	}
+	ch <- db.Notification{
+		Channel: db.NotifyComputeNodeChanged,
+		Payload: `{"node_id":"uuid-2","active":false}`,
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if loader.calls.Load() >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := loader.calls.Load(); got < 2 {
+		t.Errorf("loader calls=%d after JSON notifies; want >= 2", got)
+	}
+
+	cancel()
+	<-done
+}
+
+// PR-5 / issue #911 — heartbeat-only short-circuit.
+//
+// Refresh's loader fetch always returns the SAME row set on every
+// heartbeat-stamp write (active=true → true, no other field
+// changes). The pre-PR-5 code unconditionally swapped the snapshot,
+// churning downstream log lines and any consumer that diffs the
+// snapshot. Refresh now short-circuits when fresh equals prior.
+
+func TestPGNodeVerifier_Refresh_ShortCircuitsOnIdenticalSnapshot(t *testing.T) {
+	loader := &stubNodeLoader{rows: []NodeRow{
+		{CN: "vmmd", ID: "uuid-1"},
+		{CN: "schedd", ID: "uuid-2"},
+	}}
+	v := NewPGNodeVerifier(loader, newSilentLogger())
+
+	// First Refresh populates the snapshot.
+	if _, err := v.Refresh(context.Background()); err != nil {
+		t.Fatalf("first Refresh err=%v; want nil", err)
+	}
+
+	// Capture the prior map address — second Refresh must NOT swap
+	// it (snapshot unchanged, skip-swap contract).
+	v.mu.RLock()
+	priorAddr := v.snap
+	v.mu.RUnlock()
+
+	// Second Refresh with identical rows must short-circuit.
+	if _, err := v.Refresh(context.Background()); err != nil {
+		t.Fatalf("second Refresh err=%v; want nil", err)
+	}
+
+	// Probe the short-circuit contract via PublishSnapshot (which
+	// reads the internal map under RLock). The internal map must
+	// still expose the same CN set + IDs after the second Refresh.
+	post := v.PublishSnapshot()
+	if len(post) != len(priorAddr) {
+		t.Fatalf("PublishSnapshot len=%d after identical Refresh; want %d",
+			len(post), len(priorAddr))
+	}
+	for _, r := range post {
+		if gotID, ok := priorAddr[r.CN]; !ok || gotID != r.ID {
+			t.Errorf("PublishSnapshot[%q]=%q after identical Refresh; want %q (snapshot unchanged contract)",
+				r.CN, r.ID, gotID)
+		}
+	}
+
+	// Third Refresh with a different row set MUST swap (regression
+	// check: the short-circuit must not freeze the snapshot).
+	loader.rows = []NodeRow{
+		{CN: "vmmd", ID: "uuid-1"},
+		{CN: "schedd", ID: "uuid-2"},
+		{CN: "imaged", ID: "uuid-3"},
+	}
+	if n, err := v.Refresh(context.Background()); err != nil || n != 3 {
+		t.Fatalf("third Refresh n=%d, err=%v; want n=3, err=nil", n, err)
+	}
+	if got := v.Size(); got != 3 {
+		t.Errorf("Size after content-changing Refresh=%d; want 3", got)
+	}
+}
+
+// PR-5 / issue #911 — stable snapshot publish keys.
+//
+// PublishSnapshot returns a CN-sorted []NodeRow regardless of Go's
+// randomized map iteration. This is the stable-publish-key contract
+// for the doctor (PR-4) and release bundle (PR-3).
+
+func TestPGNodeVerifier_PublishSnapshot_SortsByCN(t *testing.T) {
+	loader := &stubNodeLoader{rows: []NodeRow{
+		{CN: "vmmd", ID: "uuid-1"},
+		{CN: "schedd", ID: "uuid-2"},
+		{CN: "apid", ID: "uuid-3"},
+	}}
+	v := NewPGNodeVerifier(loader, newSilentLogger())
+	if _, err := v.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh err=%v; want nil", err)
+	}
+
+	// Run 100 iterations and assert the same CN-sorted order each time.
+	var prev []NodeRow
+	for i := 0; i < 100; i++ {
+		got := v.PublishSnapshot()
+		if len(got) != 3 {
+			t.Fatalf("PublishSnapshot len=%d on iter %d; want 3", len(got), i)
+		}
+		if got[0].CN != "apid" || got[1].CN != "schedd" || got[2].CN != "vmmd" {
+			t.Fatalf("PublishSnapshot order=%v on iter %d; want [apid,schedd,vmmd]",
+				[]string{got[0].CN, got[1].CN, got[2].CN}, i)
+		}
+		if i == 0 {
+			prev = got
+			continue
+		}
+		// Slice identity should NOT alias the verifier's internal
+		// map (mutating the returned slice must not affect future
+		// PublishSnapshot calls).
+		if &got[0] == &prev[0] {
+			t.Errorf("PublishSnapshot aliased prior slice on iter %d", i)
+		}
+	}
+
+	// Mutate the last-returned slice and re-publish — the verifier
+	// must not be affected.
+	last := v.PublishSnapshot()
+	last[0].CN = "MUTATED"
+	if again := v.PublishSnapshot(); again[0].CN != "apid" {
+		t.Errorf("PublishSnapshot leaked mutation: again[0].CN=%q; want apid", again[0].CN)
+	}
+}
+
+func TestPGNodeVerifier_PublishSnapshot_NilReceiver(t *testing.T) {
+	var v *PGNodeVerifier
+	if got := v.PublishSnapshot(); got != nil {
+		t.Errorf("nil receiver PublishSnapshot=%v; want nil", got)
+	}
+}
+
+func TestPGNodeVerifier_PublishSnapshot_Empty(t *testing.T) {
+	loader := &stubNodeLoader{rows: nil}
+	v := NewPGNodeVerifier(loader, newSilentLogger())
+	// Note: no Refresh — snapshot stays empty.
+	got := v.PublishSnapshot()
+	if len(got) != 0 {
+		t.Errorf("empty-snapshot PublishSnapshot len=%d; want 0", len(got))
+	}
+}
+
+// TestPGNodeVerifier_CertFingerprintByCN covers PR-3:
+//   - registered CN with a fingerprint returns the fingerprint
+//   - registered CN with an empty fingerprint returns ErrCertFingerprintNotRegistered
+//   - unknown CN returns ErrCertFingerprintNotRegistered
+//   - nil receiver returns ErrCertFingerprintNotRegistered
+//   - PublishSnapshot includes the fingerprint field (pre-PR-3
+//     boxes published only CN+ID — the doctor consumes the new
+//     field via PublishSnapshot too)
+func TestPGNodeVerifier_CertFingerprintByCN(t *testing.T) {
+	loader := &stubNodeLoader{rows: []NodeRow{
+		{CN: "vmmd", ID: "uuid-1", CertFingerprint: "sha256:" + repeat64("a")},
+		{CN: "schedd", ID: "uuid-2", CertFingerprint: "sha256:" + repeat64("b")},
+		{CN: "imaged", ID: "uuid-3", CertFingerprint: ""}, // pre-PR-X box
+	}}
+	v := NewPGNodeVerifier(loader, newSilentLogger())
+	if _, err := v.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// Registered CN with fingerprint.
+	if got, err := v.CertFingerprintByCN("vmmd"); err != nil {
+		t.Errorf("CertFingerprintByCN(vmmd) err=%v; want nil", err)
+	} else if got != "sha256:"+repeat64("a") {
+		t.Errorf("CertFingerprintByCN(vmmd) = %q; want %q", got, "sha256:"+repeat64("a"))
+	}
+
+	// Registered CN with empty fingerprint (pre-PR-X box).
+	if got, err := v.CertFingerprintByCN("imaged"); !errors.Is(err, ErrCertFingerprintNotRegistered) {
+		t.Errorf("CertFingerprintByCN(imaged) err=%v; want ErrCertFingerprintNotRegistered", err)
+	} else if got != "" {
+		t.Errorf("CertFingerprintByCN(imaged) = %q; want empty", got)
+	}
+
+	// Unknown CN.
+	if got, err := v.CertFingerprintByCN("unknown"); !errors.Is(err, ErrCertFingerprintNotRegistered) {
+		t.Errorf("CertFingerprintByCN(unknown) err=%v; want ErrCertFingerprintNotRegistered", err)
+	} else if got != "" {
+		t.Errorf("CertFingerprintByCN(unknown) = %q; want empty", got)
+	}
+
+	// nil receiver.
+	var nilV *PGNodeVerifier
+	if got, err := nilV.CertFingerprintByCN("vmmd"); !errors.Is(err, ErrCertFingerprintNotRegistered) {
+		t.Errorf("nil CertFingerprintByCN err=%v; want ErrCertFingerprintNotRegistered", err)
+	} else if got != "" {
+		t.Errorf("nil CertFingerprintByCN = %q; want empty", got)
+	}
+
+	// PublishSnapshot must include the fingerprint.
+	snap := v.PublishSnapshot()
+	if len(snap) != 3 {
+		t.Fatalf("PublishSnapshot len=%d; want 3", len(snap))
+	}
+	found := false
+	for _, r := range snap {
+		if r.CN == "vmmd" {
+			found = true
+			if r.CertFingerprint != "sha256:"+repeat64("a") {
+				t.Errorf("PublishSnapshot vmmd CertFingerprint = %q; want %q", r.CertFingerprint, "sha256:"+repeat64("a"))
+			}
+		}
+	}
+	if !found {
+		t.Errorf("PublishSnapshot missing vmmd row")
+	}
+}
+
+// repeat64 returns the same byte repeated 64 times — a small helper
+// to keep fingerprint literals readable.
+func repeat64(b string) string {
+	out := make([]byte, 0, 64)
+	for i := 0; i < 64; i++ {
+		out = append(out, b[0])
+	}
+	return string(out)
+}

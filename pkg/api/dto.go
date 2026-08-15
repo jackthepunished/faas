@@ -1387,6 +1387,17 @@ type DeploymentResponse struct {
 	// rows). Always non-nil for post-feature rows in any of
 	// the {pending, complete, failed, skipped} states.
 	Scan *ScanResult `json:"scan,omitempty"`
+	// SecretScan is the per-deploy secret-scan audit row (PR-A,
+	// imaged-layer; distinct from the cmd/apid source-tree path).
+	// Mirrors the Scan field shape: nil when the row has not
+	// been scanned yet, non-nil with Findings=[] for a clean
+	// scan, non-nil with Findings=[…] for a hit. Read by the
+	// dashboard's "secret scan" card and the CLI's
+	// `--show-secret-scan` flag. The `omitempty` matches Scan so
+	// absence == "scan pending" on both surfaces — the
+	// /v1/deployments/{id}/secret-scan route is the
+	// 404-on-missing drilldown.
+	SecretScan *SecretScanResult `json:"secret_scan,omitempty"`
 	// ParkedReason / ParkedAt (issue #554 / ADR-079 follow-up)
 	// surface the per-deployment parking columns from migration
 	// 00157 on the GET /v1/deployments/{id} response. omitempty
@@ -3051,6 +3062,35 @@ type AppRoutesResponse struct {
 	CapHit bool `json:"cap_hit"`
 }
 
+// AppStreamingStatus is the per-request streaming classification
+// returned by GET /v1/apps/{slug}/streaming-cap (ADR-102 D6). It is
+// the wire-level mirror of pkg/gateway.(*Handler).decideStreaming —
+// a customer hitting this endpoint sees exactly what the gateway's
+// gate machine resolved for the next inbound request, with the same
+// status enum and the same effective cap.
+//
+// Status is one of the api.StreamingStatus* constants. CapKind
+// labels the cap source: "plan" means app.Plan.MaxResponseBodyBytes
+// (the buffered cap; for non-streaming statuses this is also the
+// streaming cap because no edge rule matched), "endpoint-rule"
+// means a kind=limit edge rule with a non-zero MaxBodyBytesStreaming
+// field matched and overrode the plan cap. CapKind is omitted from
+// the wire when there is no override so a customer whose plan cap
+// applied sees a clean three-field response.
+//
+// PlanAllowed + FlagEnabled mirror the two booleans that gated the
+// decision, so a customer can self-diagnose without a separate
+// GET /v1/apps/{slug} round-trip.
+type AppStreamingStatus struct {
+	AppID        string          `json:"app_id"`
+	Status       StreamingStatus `json:"status"`
+	EffectiveCap int64           `json:"effective_cap_bytes"`
+	PlanCap      int64           `json:"plan_cap_bytes"`
+	FlagEnabled  bool            `json:"flag_enabled"`
+	PlanAllowed  bool            `json:"plan_allowed"`
+	CapKind      string          `json:"cap_kind,omitempty"`
+}
+
 // --- Account-scoped metrics rollup (issue #393) --------------------------
 
 // AppsMetricsResponse is the rollup for GET /v1/apps/metrics?range=
@@ -4477,6 +4517,101 @@ func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Proble
 			a.Burst, ctx.PlanMaxBurst))
 	}
 	return nil
+}
+
+// EdgeRuleBudgetAction is the wire shape for a kind=budget edge rule
+// (ADR-093 §Decision). The per-request wall-clock budget primitive:
+// a customer pins a hard wall-clock deadline on `POST /payment` →
+// 3 s the same way they already pin JWT / IP / geo edge rules. The
+// platform then propagates the remaining time to every downstream
+// hop (DB, gRPC, outbound HTTP) and surfaces deadline fire as 504 +
+// RFC 7807 `code: request_budget_exceeded`.
+//
+// Field-by-field:
+//
+//   - BudgetMs: required per-request budget in milliseconds. Must
+//     be > 0 and ≤ api.RequestBudgetMaxMs (30 s). 0 is rejected
+//     with 422 — a kind=budget rule with no budget is a silent
+//     no-op, worst shape for a safety feature. The hard upper bound
+//     matches api.RequestBudgetMaxMs so a kind=budget rule can
+//     never widen past the platform ceiling; if a customer wants a
+//     longer per-route budget they're mis-using this primitive
+//     (api.RequestBudgetMax is the absolute ceiling).
+//   - AllowOverrideHeader: optional HTTP header name (default
+//     `x-faas-budget-ms`) whose numeric value, if present on the
+//     inbound request, overrides BudgetMs for that single request.
+//     A runtime per-customer-tunable knob layered on top of the
+//     static rule. Header name must be 1..128 chars matching
+//     `^[A-Za-z][A-Za-z0-9-]*$` (RFC 7230 token shape) — empty
+//     is allowed (the runtime then uses the default
+//     `x-faas-budget-ms`). An absent or unparseable header falls
+//     through to BudgetMs unchanged.
+//
+// The runtime is `pkg/reqbudget`. The matched rule's BudgetMs
+// stamps the inbound ctx via `reqbudget.WithRemaining`; every
+// downstream hop wraps via `reqbudget.WithOverhead` / `WithCeiling`.
+// The hot-path applier is
+// pkg/gateway.(*Handler).applyEdgeRuleBudget (§4.1.2.8d).
+type EdgeRuleBudgetAction struct {
+	BudgetMs            int    `json:"budget_ms"`
+	AllowOverrideHeader string `json:"allow_override_header,omitempty"`
+}
+
+func (a *EdgeRuleBudgetAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("budget action is required")
+	}
+	if a.BudgetMs <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"budget action: budget_ms must be > 0 (got %d) — a kind=budget rule with no budget is a silent no-op; drop the rule if you want the platform default to apply",
+			a.BudgetMs))
+	}
+	if a.BudgetMs > int(RequestBudgetMax.Milliseconds()) {
+		return ErrValidation(fmt.Sprintf(
+			"budget action: budget_ms (%d) exceeds the platform ceiling (%d ms = %s)",
+			a.BudgetMs, int(RequestBudgetMax.Milliseconds()), RequestBudgetMax))
+	}
+	if a.AllowOverrideHeader != "" {
+		if len(a.AllowOverrideHeader) > 128 {
+			return ErrValidation(fmt.Sprintf(
+				"budget action: allow_override_header must be 1..128 chars (got %d)",
+				len(a.AllowOverrideHeader)))
+		}
+		// RFC 7230 token shape — first char letter, rest
+		// letters/digits/hyphens. Reject whitespace, commas, colons,
+		// and other separator chars that would break header parsing.
+		if !isHeaderToken(a.AllowOverrideHeader) {
+			return ErrValidation(fmt.Sprintf(
+				"budget action: allow_override_header %q must match RFC 7230 token shape (^[A-Za-z][A-Za-z0-9-]*$)",
+				a.AllowOverrideHeader))
+		}
+	}
+	return nil
+}
+
+// isHeaderToken reports whether s matches the RFC 7230 token
+// production used for HTTP header names: a letter followed by
+// letters, digits, or hyphens. Used by EdgeRuleBudgetAction.Validate
+// to reject malformed header-name overrides before the gateway
+// sees them.
+func isHeaderToken(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-':
+		default:
+			return false
+		}
+		if i == 0 && (r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // EdgeRuleResponse is the wire shape for an edge rule. Action is

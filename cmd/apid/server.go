@@ -827,6 +827,14 @@ func (s *server) handler() http.Handler {
 	// never auto-applies; customers confirm via POST
 	// /v1/apps/{slug}/edge-rules.
 	mux.HandleFunc("GET /v1/apps/{slug}/throttle-suggestions", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppThrottleSuggestions)))
+	// ADR-102 D6 — per-app streaming-cap probe. Read-only, no MFA,
+	// primary caller is an API key with ScopesReadSurface. IDOR-safe
+	// via loadApp (cross-account slug → 404, not 200 with another
+	// tenant's streaming-cap data — leaking cap data lets a
+	// customer probe another tenant's plan tier). See
+	// handlers_streaming_cap.go for the full decision tree and the
+	// deliberate non-dial to gatewayd-internal.
+	mux.HandleFunc("GET /v1/apps/{slug}/streaming-cap", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppStreamingCap)))
 	// Account-scoped metrics rollup (issue #393). One call replaces
 	// N per-app /v1/apps/{slug}/metrics calls. Same auth chain as
 	// the per-app endpoint (read-only, no MFA). Cross-account
@@ -900,6 +908,11 @@ func (s *server) handler() http.Handler {
 	// not-yet-scanned or cross-account; IDOR posture
 	// identical to getDeployment above.
 	mux.HandleFunc("GET /v1/deployments/{id}/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentScan))))
+	// PR-A: per-deploy image-layer secret-scan audit surface.
+	// Mirrors /scan — same auth chain (authLimited + requireMFA +
+	// read scope), same IDOR posture (cross-account → 404), same
+	// 404-on-pending drilldown shape.
+	mux.HandleFunc("GET /v1/deployments/{id}/secret-scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentSecretScan))))
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamDeploymentLogs))))
 	// Issue #557 closure / ADR-072 — PATCH the per-deployment floor
 	// (MinInstances). Reuses the deploy-write scope (the only mutable

@@ -51,6 +51,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
 // cookieOnlyPathRE matches API routes that are gated server-side to
@@ -220,6 +222,27 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 // recipe; methods that need a custom header set it on req before
 // calling doReq.
 func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
+	// ADR-093 / PR-E: outbound SDK call becomes a child of the
+	// inbound budget when one is attached. The CLI / SDK never
+	// receives a Budget from the user today — but apid's
+	// gatewayd-internal handlers do call into the SDK to issue
+	// outbound HTTP (issue #739 / ADR-092 source-ref refresh), so
+	// the SDK honours any budget that's on the inbound ctx.
+	// childDeadline = min(parentRemaining, cli.Timeout) — the
+	// client's Timeout stays as the absolute ceiling; the budget
+	// can only tighten it. cli.Timeout == 0 is treated as "no
+	// ceiling configured" by WithCeiling (it inherits the
+	// parent's remaining time) so a default-constructed
+	// http.Client{} doesn't immediately expire; cli.Do then
+	// applies no Timeout of its own — the SDK no longer enforces
+	// a wall-clock cap on those calls, same as pre-PR-E. When
+	// no Budget is on the inbound ctx, cli.Timeout alone bounds
+	// the request (the legacy contract).
+	if b, ok := reqbudget.FromContext(req.Context()); ok {
+		newCtx, cancel, _ := b.WithCeiling(req.Context(), cli.Timeout)
+		defer cancel()
+		req = req.Clone(newCtx)
+	}
 	resp, err := cli.Do(req)
 	if err != nil {
 		return fmt.Errorf("could not reach the API: %w", err)
@@ -495,6 +518,23 @@ func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentRespon
 func (c *Client) GetDeploymentScan(ctx context.Context, id string) (ScanResult, error) {
 	var out ScanResult
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/scan", nil, &out)
+}
+
+// GetDeploymentSecretScan returns the per-deploy image-layer
+// secret-scan payload (PR-A). Same IDOR posture as
+// GetDeploymentScan (404 on missing-deployment OR cross-account
+// OR scan-pending). The wire shape is SecretScanResult — a
+// closed-form {status, scanned_at, findings[], image_digest}
+// envelope where the findings carry the per-finding layer
+// label ("app" | "sidecar-<slug>") so the CLI / dashboard can
+// attribute findings to the right image segment.
+//
+// Status is the closed enum (complete | complete_with_redactions)
+// — distinct from the grype-side Status field on ScanResult
+// because the two pipelines stamp separate audit rows.
+func (c *Client) GetDeploymentSecretScan(ctx context.Context, id string) (SecretScanResult, error) {
+	var out SecretScanResult
+	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/secret-scan", nil, &out)
 }
 
 // PatchDeployment sets the per-deployment cold-wake floor override
@@ -1899,6 +1939,25 @@ func (c *Client) GetAppThrottleSuggestions(ctx context.Context, slug, rng string
 func (c *Client) GetAppRoutes(ctx context.Context, slug string) (AppRoutesResponse, error) {
 	var out AppRoutesResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/routes", nil, &out)
+}
+
+// GetAppStreamingStatus returns the per-request streaming
+// classification for the named app (ADR-102 D6). The endpoint is
+// the SDK-side mirror of pkg/gateway.(*Handler).decideStreaming —
+// a customer hitting this endpoint sees exactly what the gateway's
+// gate machine would resolve for the next inbound request, with the
+// same status enum (api.StreamingStatus*) and the same effective
+// cap (plan cap by default; endpoint-rule MaxBodyBytesStreaming if
+// a kind=limit edge rule matched).
+//
+// Use case: a customer evaluating "will my next request stream?"
+// fires this endpoint pre-flight instead of probing with a real
+// request and reading the Streaming-Status response header. The
+// probe does NOT mutate state and does NOT warm a wake — it's a
+// pure read against the per-app cache.
+func (c *Client) GetAppStreamingStatus(ctx context.Context, slug string) (AppStreamingStatus, error) {
+	var out AppStreamingStatus
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/streaming-cap", nil, &out)
 }
 
 // GetAppsMetrics returns the account-wide per-app metrics rollup

@@ -178,7 +178,8 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/account/egress_allowlist_extra":    "SetEgressAllowlistExtra",
 	"GET /v1/apps/{slug}/logs":                    "StreamAppLogs",
 	"GET /v1/deployments/{id}/logs":               "StreamDeploymentLogs",
-	"GET /v1/deployments/{id}/scan":               "GetDeploymentScan", // issue #464 / ADR-055; per-deploy grype CVE drill-down
+	"GET /v1/deployments/{id}/scan":               "GetDeploymentScan",       // issue #464 / ADR-055; per-deploy grype CVE drill-down
+	"GET /v1/deployments/{id}/secret-scan":        "GetDeploymentSecretScan", // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
 	"GET /v1/deployments/{id}":                    "GetDeployment",
 	"PATCH /v1/deployments/{id}":                  "PatchDeployment", // ADR-072 / issue #557 closure; min_instances override
 	"GET /v1/deployments":                         "ListDeployments",
@@ -384,6 +385,15 @@ var methodRouteMap = map[string]string{
 	// sibling per-app family (GetAppMetrics, GetAppSLO, GetApp,
 	// ListApps) — drop the slug placeholder from the verb.
 	"GET /v1/apps/{slug}/routes": "GetAppRoutes",
+
+	// ADR-102 D6 — per-app streaming classification probe. The
+	// auto-derivation would produce GetAppsSlugStreaming-cap
+	// (Swagger-style with literal hyphen); the SDK names it
+	// GetAppStreamingStatus to match the sibling per-app family
+	// (GetAppRoutes, GetAppMetrics, GetAppSLO) — drop the slug
+	// placeholder from the verb and use the SDK type name
+	// (AppStreamingStatus) for the noun.
+	"GET /v1/apps/{slug}/streaming-cap": "GetAppStreamingStatus",
 
 	// ADR-096 / PR-B — customer-facing automatic error grouping.
 	// SDK names are pinned to the per-app family (GetAppErrorsSummary,

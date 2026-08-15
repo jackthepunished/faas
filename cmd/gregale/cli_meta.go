@@ -169,6 +169,7 @@ var cliCommands = []cliCommand{
 		Subcommands: []cliSub{
 			{Name: "ls", Short: "Alias for the default list action"},
 			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
+			{Name: "streaming-cap", Short: "Per-app streaming classification probe (ADR-102 D6)"},
 			{Name: "-q", Short: "Delete one app (positional: <slug>)"},
 			{Name: "--quiet", Short: "Delete one app (positional: <slug>)"},
 		},
@@ -485,6 +486,44 @@ var cliCommands = []cliCommand{
 		Short:       "Set / clear the account's overage cap (--clear | <cents>)",
 		Flags:       []cliFlag{{Name: "clear", Short: "remove the overage cap"}},
 		Positionals: []string{"<cents>"},
+	},
+	{
+		Name:    "manifest",
+		DocSlug: "manifest",
+		Short:   "Operator split-box deployment manifest (manifest validate --file PATH; issue #911 / ADR-110)",
+		Subcommands: []cliSub{
+			{
+				Name:  "validate",
+				Short: "Validate a manifest YAML file (canonical path: pkg/manifest.Validate)",
+				Flags: []cliFlag{{Name: "file", Short: "path to the manifest YAML file (required)"}},
+			},
+		},
+	},
+	{
+		Name:    "release",
+		DocSlug: "release",
+		Short:   "Cluster-shipped release bundle (release bundle|install --git-sha SHA; PR-3 / ADR-110)",
+		Subcommands: []cliSub{
+			{
+				Name:  "bundle",
+				Short: "Materialise a release bundle from a pre-built bin directory and INSERT into release_bundles",
+				Flags: []cliFlag{
+					{Name: "bin-dir", Short: "path to daemon binaries directory (required)", Req: true},
+					{Name: "git-sha", Short: "40-char lowercase hex git SHA (required)", Req: true},
+					{Name: "manifest-hash", Short: "manifest hash as 'sha256:<64hex>' (required)", Req: true},
+					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
+				},
+			},
+			{
+				Name:  "install",
+				Short: "Install a release on the local box (atomic symlink flip + applied_at first-write-wins stamp)",
+				Flags: []cliFlag{
+					{Name: "git-sha", Short: "40-char lowercase hex git SHA to install (required)", Req: true},
+					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
+					{Name: "node", Short: "compute_nodes.name to stamp (default: hostname)"},
+				},
+			},
+		},
 	},
 	{
 		Name:    "park",

@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { EdgeRuleBudgetAction } from './EdgeRuleBudgetAction.js';
 import type { EdgeRuleCORSAction } from './EdgeRuleCORSAction.js';
 import type { EdgeRuleGeoAction } from './EdgeRuleGeoAction.js';
 import type { EdgeRuleHeadersAction } from './EdgeRuleHeadersAction.js';
@@ -23,10 +24,10 @@ export type CreateEdgeRuleRequest = {
   match_methods?: Array<string>;
   priority?: number;
   enabled?: boolean;
-  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle';
+  kind: 'route' | 'rewrite' | 'redirect' | 'headers' | 'cors' | 'jwt' | 'ip' | 'validate' | 'limit' | 'maintenance' | 'geo' | 'throttle' | 'budget';
   /**
    * Kind-tagged action body — shape depends on `kind`.
    */
-  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction);
+  action: (EdgeRuleRouteAction | EdgeRuleRewriteAction | EdgeRuleRedirectAction | EdgeRuleHeadersAction | EdgeRuleCORSAction | EdgeRuleJWTAction | EdgeRuleIPAction | EdgeRuleValidateAction | EdgeRuleLimitAction | EdgeRuleMaintenanceAction | EdgeRuleGeoAction | EdgeRuleThrottleAction | EdgeRuleBudgetAction);
 };
 

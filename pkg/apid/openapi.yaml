@@ -1428,6 +1428,58 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/streaming-cap:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppStreamingCap
+      summary: Per-app streaming classification probe (ADR-102 D6).
+      description: |
+        Returns the streaming-status enum (one of `streaming`,
+        `accept-json-downgrade`, `flag-disabled`, `plan-disallows`,
+        `operator-disabled`, `upgrade-bypass`) the gatewayd handler
+        would stamp on the `Streaming-Status` response header for a
+        representative request to this app, plus the effective
+        response-body cap (in bytes) and the per-gate flags.
+
+        The probe is a pure read against the apid cache (the
+        per-account `Plan` and the per-app `streaming_enabled`
+        flag). It does NOT dial gatewayd-internal — the operator
+        opt-in (`FAAS_GATEWAY_STREAMING` env) and per-edge-rule
+        cap override are gatewayd-side state, so `effective_cap_bytes`
+        reflects the plan cap (`cap_kind="plan"`) on every probe.
+        A customer evaluating "will my next request stream?" must
+        consider the operator-side flag separately; the canonical
+        signal is the `Streaming-Status` response header on a real
+        request, not this probe.
+
+        `status=plan-disallows` means the customer's plan tier
+        forbids `streaming_enabled=true`; the CreateApp gate (D5)
+        already returns 403 `CodePlanStreamingNotAllowed` so this
+        row should be unreachable from a properly-validated app,
+        but the probe still reflects the persisted state for
+        audits and pinned-SDK migrations.
+      responses:
+        '200':
+          description: The streaming classification for the app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppStreamingStatus'
+              example:
+                app_id: 11111111-1111-1111-1111-111111111111
+                status: streaming
+                effective_cap_bytes: 104857600
+                plan_cap_bytes: 104857600
+                flag_enabled: true
+                plan_allowed: true
+                cap_kind: plan
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/slo:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -2858,6 +2910,60 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: Deployment row missing, cross-account probe, or scan has not run yet.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/deployments/{id}/secret-scan:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getDeploymentSecretScan
+      summary: Get per-deploy image-layer secret scan.
+      description: |
+        Returns the per-deploy secret-scan audit row (PR-A /
+        ADR-101). The scan runs on the per-app ext4 in imaged's
+        deploy-complete path (after `SetDeploymentRootfs`, before
+        the pending→snapshotting transition) using the same
+        `pkg/secretscan` engine the apid source-tree rejection
+        path uses — same patterns, same providers, same Severity
+        table, same snippet policy.
+
+        Status field is the closed enum:
+          - `complete` — image layer walked clean; `findings=[]`.
+            Stamped on every scan (clean OR hit) so the dashboard
+            renders the audit row immediately after the build.
+          - `complete_with_redactions` — at least one finding
+            landed in the audit row; `error_code =
+            'image_secret_detected'` on the deployment. The
+            deploy's pending→snapshotting transition does NOT
+            fire.
+
+        A 404 is returned when:
+          - the deployment row does not exist,
+          - the deployment belongs to a different account
+            (IDOR-safe; no account-existence leak),
+          - no scan has run yet (the deploy is still
+            mid-pipeline or the row predates PR-A entirely).
+
+        Each finding carries a `layer` label that attributes the
+        finding to the per-walk source (`app` for the main image,
+        `sidecar-<slug>` for each sidecar). Pre-PR-A rows
+        (rejected source-tree bytes via the v2 422 path) carry
+        `layer` empty or absent.
+      responses:
+        '200':
+          description: The typed secret-scan payload. Shape mirrors the `deployments.secret_findings` jsonb column.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretScanResult'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Deployment row missing, cross-account probe, or secret scan has not been stamped for this deploy yet (pre-PR-A rows return 404 because the `secret_findings` jsonb has never been written).
           content:
             application/problem+json:
               schema:
@@ -8069,6 +8175,25 @@ components:
           pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
           description: "Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`."
           example: "staging"
+        secret_scan:
+          oneOf:
+            - $ref: '#/components/schemas/SecretScanResult'
+            - type: 'null'
+          description: |
+            Per-deploy secret-scan audit row (PR-A / ADR-101). Mirrors
+            the `scan` field shape — absent when the row has not been
+            scanned yet (deploy mid-pipeline or pre-PR-A), present
+            with `findings=[]` for a clean walk, present with
+            one-or-more entries for a hit. Read by the dashboard's
+            "secret scan" card and the CLI's `--show-secret-scan`
+            flag. Stamped both for the imaged-side layer walk (main
+            image + each sidecar; post-build, loud-fail on any
+            finding) and — forward-compat — for the apid-side
+            source-tree 422 path. Status closed-set the writer
+            stamps: "complete" (clean) | "complete_with_redactions"
+            (hit). The `image_digest` sub-field records which OCI
+            digest the imaged walk ran against; null on legacy
+            pre-PR-A rows. See `pkg/imaged/secretscan.go`.
 
     UpdateDeploymentRequest:
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
@@ -9591,7 +9716,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -9607,6 +9732,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -9624,7 +9750,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -9640,6 +9766,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -9667,6 +9794,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -10045,6 +10173,57 @@ components:
             clamped at compile time.
           example: 200
 
+    EdgeRuleBudgetAction:
+      description: |
+        Per-route end-to-end request budget (ADR-093 / §4.1.2.16).
+        The primitive for "POST /payment → 3 s, POST /signup → 10 s"
+        without writing timeout-propagation code in the customer's
+        app. The hot-path applier (cmd/gatewayd-public/main.go:PR-B
+        + pkg/gateway/handler_apply_edge_rule_budget.go) installs a
+        per-request `Budget` onto `r.Context()` via
+        `reqbudget.WithRemaining`; every downstream hop (DB, gRPC,
+        HTTP) tightens itself against the budget via
+        `reqbudget.WithOverhead` / `WithCeiling`.
+
+        On expiry the platform returns 504 + RFC 7807 problem
+        envelope (`code: request_budget_exceeded`) BEFORE the
+        customer's handler runs — the goal is bounded resource
+        pin per request, not customer-visible timer logic. Customer
+        code can read `reqbudget.FromContext(r.Context()).Remaining`
+        if it wants to short-circuit its own work early.
+
+        Field-by-field:
+          * `budget_ms` — required wall-clock budget. Must be > 0
+            and ≤ the per-plan max (`Plan.RequestBudgetMaxMs`, default
+            `RequestBudgetMax = 30 s`). A 0 or negative value is
+            rejected at create-time with 422.
+          * `allow_override_header` — optional HTTP request header
+            that lets a customer set a per-request override
+            (default `x-faas-budget-ms`). Empty (default) =
+            no override accepted; the edge-rule value is the
+            authoritative budget. The header is parsed as a
+            decimal integer in `[1, math.MaxInt32]`; out-of-range
+            values are ignored and the edge-rule value wins
+            (silent clamp, no 400 — the budget is a quality
+            primitive, not a security gate).
+
+        Rejections never reach the wake gate, the auth chain, or
+        the rate limiter — same posture as the other kind=budget
+        edge-rule appliers. Free-and-above (no plan gate).
+      type: object
+      required: [budget_ms]
+      properties:
+        budget_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 30000
+          description: "Per-request wall-clock budget in milliseconds (1 ms – 30 s)."
+        allow_override_header:
+          type: string
+          maxLength: 128
+          pattern: '^[A-Za-z][A-Za-z0-9-]*$'
+          description: "Optional RFC 7230 token header name for per-request override (default `x-faas-budget-ms`). Empty = no override."
 
     # ─── API keys ─────────────────────────────────────────────────────────
 
@@ -10987,6 +11166,78 @@ components:
           x-since: "2026-08"
           x-issue: "881"
 
+    AppStreamingStatus:
+      description: |
+        Per-app streaming classification (ADR-102 D6). The probe
+        returns the same `Streaming-Status` enum value the
+        gatewayd handler would stamp on the response header for a
+        representative request to this app, plus the effective
+        response-body cap and the per-gate flags that produced it.
+
+        `status` values (closed enum, see `pkg/api/limits.go`):
+
+          - `streaming` — request will stream. `effective_cap_bytes`
+            is the cap `capWriter` will enforce.
+          - `accept-json-downgrade` — pre-D3 customers with
+            `Accept: application/json` would have been buffered.
+            Post-D3 (this PR), the request streams regardless of
+            Accept; the enum variant survives one cycle so pinned
+            SDKs can grep for it.
+          - `flag-disabled` — `streaming_enabled=false` on the app.
+          - `plan-disallows` — plan tier forbids `streaming_enabled=true`;
+            CreateApp (D5) already returns 403 on this combination,
+            so this value should be unreachable on a properly-validated
+            app.
+          - `operator-disabled` — operator opt-in env is off; visible
+            only on the gatewayd side, not this probe.
+          - `upgrade-bypass` — request is an HTTP/1.1 Upgrade (e.g.
+            WebSocket) and bypasses the streaming path.
+
+        `effective_cap_bytes` is the plan cap (`cap_kind="plan"`)
+        on every probe in this PR. The per-edge-rule override lives
+        in gatewayd state and is not part of the apid cache; a
+        customer who needs the live cap fires a real request and
+        reads the `Streaming-Status` response header.
+      type: object
+      required: [app_id, status, effective_cap_bytes, plan_cap_bytes, flag_enabled, plan_allowed]
+      properties:
+        app_id: {type: string, x-since: "2026-08", x_issue: "102"}
+        status:
+          type: string
+          enum: [streaming, accept-json-downgrade, flag-disabled, plan-disallows, operator-disabled, upgrade-bypass]
+          x-since: "2026-08"
+          x_issue: "102"
+        effective_cap_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-since: "2026-08"
+          x_issue: "102"
+        plan_cap_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-since: "2026-08"
+          x_issue: "102"
+        flag_enabled:
+          type: boolean
+          x-since: "2026-08"
+          x_issue: "102"
+        plan_allowed:
+          type: boolean
+          x-since: "2026-08"
+          x_issue: "102"
+        cap_kind:
+          type: string
+          enum: [plan, endpoint-rule, none]
+          x-since: "2026-08"
+          x_issue: "102"
+          description: |
+            `plan` is the only value this probe ever returns in
+            this PR. The endpoint-rule and none values are reserved
+            for the future gatewayd-side dial path described in
+            `cmd/apid/handlers_streaming_cap.go`.
+
     ListInstancesResponse:
       description: |
         Page shape for `GET /v1/instances` (issue #393). `instances`
@@ -11584,15 +11835,20 @@ components:
       type: object
       description: |
         Per-line entry of `Problem.secret_findings` AND
-        `SecretScanResult.findings` (issue #862 + secret-scan v2).
-        The shape mirrors `pkg/secretscan.Finding` but is decoupled
-        so the wire schema can evolve independently of the scanner's
-        internal fields. `snippet` is the pre-truncated safe
-        representation (first 6 chars + "…" + last 4) — never the
-        raw value, matching the snippet policy documented in
-        `pkg/secretscan/scan.go`. Closed-set `provider` keys:
-        stripe_live, stripe_test, github_pat, aws_access, openai,
-        anthropic, private_key_block.
+        `SecretScanResult.findings` (issue #862 + secret-scan v2,
+        PR #873; PR-A 101 extends the surfaced shape via the new
+        `layer` field). The shape mirrors `pkg/secretscan.Finding`
+        but is decoupled so the wire schema can evolve
+        independently of the scanner's internal fields. `snippet`
+        is the pre-truncated safe representation (first 6 chars +
+        "…" + last 4) — never the raw value, matching the snippet
+        policy documented in `pkg/secretscan/scan.go`. Closed-set
+        `provider` keys: stripe_live, stripe_test, github_pat,
+        aws_access, openai, anthropic, private_key_block. The
+        optional `layer` field (PR-A) names the per-walk source
+        label — "app" for the main image, "sidecar-<slug>" for
+        each sidecar, or absent for the apid source-tree
+        rejection path (legacy).
       required: [file, line, provider, severity, snippet]
       properties:
         file: { type: string, example: ".env.production" }
@@ -11604,33 +11860,57 @@ components:
           enum: [high, medium]
           example: high
         snippet: { type: string, example: "sk_liv…XXXX" }
+        layer:
+          type: string
+          description: |
+            Per-walk source label (PR-A). "app" for findings in
+            the main image; "sidecar-<slug>" for findings in a
+            sidecar (e.g. "sidecar-redis"); absent or "" for
+            findings from the legacy apid source-tree rejection
+            path (cmd/apid/secretscan.go).
+          example: app
 
     SecretScanResult:
       type: object
       description: |
         Customer-facing wire shape of one deployment's secret-scan
-        audit row (migrations/00221, secret-scan v2). Mirrors the
-        `ScanResult` shape but for the server-side secret pipeline
-        (cmd/apid/secretscan.go) — the two never overlap because
-        they stamp different columns on the `deployments` row. The
-        `status` enum mirrors the `deployments.scan_status` column
-        for the secret scan: only `pending` (not scanned yet) and
-        `complete_with_redactions` (scan found secrets) are stamped
-        by the secret-scan pipeline; the grype pipeline writes the
-        other values (`complete` / `failed` / `skipped`).
+        audit row. Mirrors the `ScanResult` shape but for the
+        secret-scan pipeline. The `status` enum is the closed set
+        the imaged-side writer (PR-A) stamps: `complete` for a
+        clean walk, `complete_with_redactions` for a hit (mirrors
+        the v2 widening on `deployments_scan_status_chk` from
+        migration 00264). `image_digest` is the OCI digest the
+        scan ran against (PR-A) — mirrors
+        `ScanResult.image_digest` so a side-by-side compare
+        renders both scans against the same bytes. `findings[]`
+        may be empty (clean walk); the field is always present
+        for round-trip JSON stability.
       required: [status, findings]
       properties:
-        status: { type: string, example: "complete_with_redactions" }
+        status: { type: string, example: "complete" }
         scanned_at:
           type: string
           format: date-time
           description: |
             RFC 3339 UTC. Empty when the deployment hasn't been
-            secret-scanned yet (Status = "pending" or the row
-            pre-dates migration 00221).
+            secret-scanned yet.
+        image_digest:
+          type: string
+          description: |
+            OCI digest the scan ran against (PR-A). Mirrors
+            `ScanResult.image_digest` for cross-pipeline
+            comparison. Empty for pre-PR-A rows.
+          example: sha256:abc...
         findings:
           type: array
           items: { $ref: '#/components/schemas/SecretFinding' }
+        error:
+          type: string
+          description: |
+            In-band explanation when the audit row is unreadable
+            (jsonb decode failed). Mirrors `ScanResult.error`.
+            Empty on the success path — `status` carries the
+            closed-set signal there.
 
     Problem:
       type: object

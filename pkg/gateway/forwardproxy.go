@@ -42,6 +42,7 @@ import (
 	evts "github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -262,8 +263,23 @@ func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient
 // events-aware variant of fwdStreamOnce. wake.proxy_first_byte is
 // emitted on the first downstream byte (the Response Init
 // frame's WriteHeader). nil events opts out (pre-PR-C fixtures).
+//
+// ADR-093 / PR-C: when the inbound request carries an end-to-end
+// budget, the 910 s stream session is bounded by the budget's
+// remaining time (min(parentRemaining, 910s)). The 910 s ceiling is
+// unchanged — the budget can only shorten it. When no Budget is
+// attached to ctx, the legacy context.WithTimeout(910s) ceiling is
+// preserved.
 func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform) {
-	ctx, cancel := context.WithTimeout(r.Context(), 910*time.Second)
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if b, ok := reqbudget.FromContext(r.Context()); ok {
+		ctx, cancel, _ = b.WithCeiling(r.Context(), 910*time.Second)
+	} else {
+		ctx, cancel = context.WithTimeout(r.Context(), 910*time.Second)
+	}
 	defer cancel()
 
 	stream, err := cli.ForwardHTTPStream(ctx)
@@ -498,8 +514,23 @@ const rawStreamSessionDeadline = 24 * time.Hour
 //     records the disconnect.
 //
 // nil events opts out (legacy callers and the test corpus).
+//
+// ADR-093 / PR-C: when the inbound request carries an end-to-end
+// budget, the 24 h raw-stream session is bounded by the budget's
+// remaining time (min(parentRemaining, rawStreamSessionDeadline)).
+// The 24 h ceiling is unchanged — the budget can only shorten it.
+// When no Budget is attached to ctx, the legacy
+// context.WithTimeout(rawStreamSessionDeadline) ceiling is preserved.
 func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform, sink *egresssink.EgressSink) {
-	ctx, cancel := context.WithTimeout(r.Context(), rawStreamSessionDeadline)
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if b, ok := reqbudget.FromContext(r.Context()); ok {
+		ctx, cancel, _ = b.WithCeiling(r.Context(), rawStreamSessionDeadline)
+	} else {
+		ctx, cancel = context.WithTimeout(r.Context(), rawStreamSessionDeadline)
+	}
 	defer cancel()
 
 	// Issue #676 / ADR-080 follow-up, PR-B: instrument the WS

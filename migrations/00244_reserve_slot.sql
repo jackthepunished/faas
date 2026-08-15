@@ -1,12 +1,13 @@
 -- filename: 00244_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Contiguity filler for PR #873 (secret-scan v2, renumbered
--- from 00233 to 00264 after PR #875 landed 00221/00222 on main;
--- ADRs 091/093/099 cluster owns 00244-00263 in their open
--- PRs #864/#895/#887). Body is a no-op SELECT 1; will be
--- shadowed by the owning PR's real DDL when it merges (per
--- ADR-041, the owning PR drops this fence in a follow-up).
+-- Co-fence for PR #887 (kind=throttle, ADR-091 amendment D20.5,
+-- issue #881). PR #887 owns 00244_*.sql on its open branch.
+-- PR #864 (reqbudget) re-renumbered its slot from 00244 to
+-- 00245 once PR #887's reservation surfaced. Body is a no-op
+-- SELECT 1; will be shadowed by PR #887's real DDL when it
+-- merges (per ADR-041, PR #887 drops this fence in a
+-- follow-up commit).
 SELECT 1;
 -- +goose StatementEnd
 

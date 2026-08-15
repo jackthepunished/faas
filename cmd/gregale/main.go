@@ -35,6 +35,7 @@ Commands:
   apps         List your apps
   apps ls      Alias for 'gregale apps'
   apps routes  List admitted per-route labels for one app (ADR-093)
+  apps streaming-cap  Per-app streaming classification probe (ADR-102 D6)
   apps -q      Delete an app
   app          Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
   backup       Operator rclone config unseal (backup unseal-rclone)
@@ -60,6 +61,7 @@ Commands:
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
+  manifest     Operator split-box deployment manifest (manifest validate --file PATH; issue #911 / ADR-110)
   signup       Create a new account (signup [--email-only EMAIL])
   man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
@@ -196,6 +198,18 @@ func run(args []string) int {
 				return cmdApps()
 			}
 			return cmdAppsRoutes(args[2], args[3:])
+		}
+		// `gregale apps streaming-cap <slug>` — ADR-102 D6 operator
+		// entry point. Same shape as the routes arm above: 3-token
+		// form (`apps streaming-cap <slug>`), placed BEFORE the
+		// `-q`/`--quiet` delete fall-through so a slug-shaped token
+		// never hits the delete path. Mirrors the routes CodeQL
+		// off-by-one guard (`len(args) < 3` falls through).
+		if len(args) > 1 && args[1] == subStreamingCap {
+			if len(args) < 3 {
+				return cmdApps()
+			}
+			return cmdAppsStreamingCap(args[2], args[3:])
 		}
 		// `gregale apps -q <slug>` is the delete path.
 		if len(args) > 1 && (args[1] == "-q" || args[1] == "--quiet") {
@@ -408,6 +422,22 @@ func run(args []string) int {
 		// above the plan's included GB-h). schedd refuses new wakes
 		// once the cap is hit.
 		return cmdOverageCap(args[1:])
+	case "manifest":
+		// Issue #911 / ADR-110: operator-side manifest loader.
+		// `gregale manifest validate --file=PATH` runs the
+		// canonical validator (pkg/manifest/Validate); PR-2 adds
+		// `manifest render`; the install path lives under
+		// `gregale release install` (PR-3), not `manifest install`.
+		// The dispatcher is cmdManifestDispatch in commands_manifest.go.
+		return cmdManifestDispatch(args[1:])
+	case "release":
+		// Issue #911 / ADR-110: cluster-shipped release bundle
+		// (PR-3). `gregale release bundle` materialises the
+		// daemon-binary bundle and INSERTs into release_bundles;
+		// `gregale release install` flips the local
+		// /opt/faas/current symlink + stamps applied_at. The
+		// dispatcher is cmdReleaseDispatch in commands_release.go.
+		return cmdReleaseDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1

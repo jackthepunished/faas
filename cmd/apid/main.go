@@ -32,6 +32,8 @@ import (
 
 	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -48,6 +50,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -1079,6 +1082,32 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
 	srv.WithOpsMetrics(ctx, ops)
+
+	// ADR-093 / PR-D: end-to-end request budgets on the apid
+	// listener. Same shape as gatewayd-public PR-B: a fresh
+	// prometheus registry holds the budget histogram + counter,
+	// the middleware stamps a per-request Budget onto r.Context(),
+	// and the /metrics handler combines ops + budget gatherers
+	// into a single scrape. Default is api.RequestBudgetApidDefault
+	// (5 s); Max is api.RequestBudgetMax (30 s); apid handlers
+	// that have an existing per-call WithTimeout (PromQL 3 s,
+	// billingOps 30 s, sync-invoke 5 s / 30 s) tighten themselves
+	// against the budget via reqbudget.WithCeiling (PR-D §3).
+	budgetReg := prometheus.NewRegistry()
+	budgetMetrics, err := reqbudget.NewMetrics(budgetReg, "apid")
+	if err != nil {
+		return fmt.Errorf("apid: reqbudget metrics: %w", err)
+	}
+	budgetCfg, err := reqbudget.NewMiddlewareConfig(reqbudget.MiddlewareConfig{
+		Default: api.RequestBudgetApidDefault,
+		Max:     api.RequestBudgetMax,
+		Route:   "admin",
+		Metrics: budgetMetrics,
+		Log:     log,
+	})
+	if err != nil {
+		return fmt.Errorf("apid: reqbudget middleware config: %w", err)
+	}
 	// issue #517 / PR-C / ADR-064: thread the events Platform
 	// into the server so the audit subscriber (which receives
 	// the signature-rejection kinds from imaged's verify hook)
@@ -1322,7 +1351,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 
 	listenBind := cfg.GetListenAddr(deps.getenv)
-	httpSrv := deps.newSrv(listenBind, srv.handler())
+	// ADR-093 / PR-D: wrap srv.handler() with the BudgetMiddleware
+	// so every apid request runs under a Budget-decorated ctx.
+	// Per-handler WithTimeout ceilings (PromQL 3 s, billingOps 30 s,
+	// sync-invoke 5 s / 30 s) become children of the budget via
+	// reqbudget.WithCeiling — the budget tightens the cap, never
+	// loosens it.
+	httpSrv := deps.newSrv(listenBind, budgetCfg.Middleware(srv.handler()))
 
 	l, err := deps.listen("tcp", listenBind)
 	if err != nil {
@@ -1339,11 +1374,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// empty-disable semantic by reading FAAS_APID_METRICS_ADDR via
 	// the test seam (deps.getenv), then falls back to cfg.GetMetricsAddr
 	// (TOML), then to metricsAddrDefault.
+	//
+	// ADR-093 / PR-D: combine ops + budgetReg into a single
+	// prometheus.Gatherers so /metrics scrapes both the standard
+	// apid_* ops metrics AND the budget histogram + counter
+	// families in one round-trip.
 	var metricsSrv *http.Server
 	if metricsAddr := resolveMetricsAddr(deps.getenv, cfg.GetMetricsAddr(deps.getenv)); metricsAddr != "" {
 		metricsSrv = &http.Server{
-			Addr:              metricsAddr,
-			Handler:           ops.Handler(),
+			Addr: metricsAddr,
+			// promhttp.HandlerFor over a Gatherers chain serves
+			// both registries on a single scrape; the
+			// HandlerOpts.Registry is the writer for the `go_*`
+			// runtime collectors (registered against ops').
+			Handler: promhttp.HandlerFor(
+				prometheus.Gatherers{ops.Registry(), budgetReg},
+				promhttp.HandlerOpts{Registry: ops.Registry()},
+			),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		mLis, err := net.Listen("tcp", metricsAddr)

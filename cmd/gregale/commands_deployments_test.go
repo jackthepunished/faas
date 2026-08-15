@@ -466,3 +466,94 @@ func TestCmdDeployments_BeforeCursorForwarding(t *testing.T) {
 		t.Errorf("expected `before=<cursor>` verbatim in %q (current SDK behaviour)", seenRaw)
 	}
 }
+
+// TestCmdDeployment_JSON_ShowSecretScanEnvelope pins the
+// PR-A `gregale deployment <id> --show-secret-scan` JSON shape:
+// the envelope emits the deployment row + a non-empty
+// `secret_scan` object fetched from
+// /v1/deployments/{id}/secret-scan. Mirrors the
+// TestCmdDeployments_JSON_EnvelopeShape pattern at the top of
+// this file (httptest, writeJSONTestStatus, jsonOutput swap).
+//
+// The test deliberately exercises the
+// "scan-pending returns 404, non-fatal in JSON mode" path
+// because that's the cold-deploy reality — the row exists, the
+// scan hasn't run yet, the operator needs a usable JSON
+// payload anyway. The text-mode path is covered separately by
+// `TestCmdDeployment_Text_ShowSecretScanClean`.
+func TestCmdDeployment_JSON_ShowSecretScanEnvelope(t *testing.T) {
+	// Track which drill-down routes were hit so the test
+	// fails fast if cmdDeploymentGet stops calling the new
+	// `/secret-scan` endpoint. Two-route capture matches
+	// the `(showScan + showSecretScan)` shape.
+	var routesHit []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routesHit = append(routesHit, r.URL.Path)
+		switch r.URL.Path {
+		case "/v1/deployments/00000000000000000000000000000001":
+			_ = json.NewEncoder(w).Encode(api.DeploymentResponse{
+				ID:     "00000000000000000000000000000001",
+				AppID:  "app",
+				Status: "live",
+			})
+		case "/v1/deployments/00000000000000000000000000000001/secret-scan":
+			// Mirror the v2 widening (migration 00264):
+			// `complete_with_redactions` for a hit, `complete`
+			// for a clean scan. The test pins the latter.
+			_ = json.NewEncoder(w).Encode(api.SecretScanResult{
+				Status:      "complete",
+				ScannedAt:   "2026-08-14T12:00:00Z",
+				ImageDigest: "sha256:deadbeef",
+				Findings:    nil,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restoreStdout := swapStdout(t)
+	jsonOutput = true
+	defer func() { jsonOutput = false }()
+	if code := cmdDeploymentGet([]string{
+		"--show-secret-scan",
+		"00000000000000000000000000000001",
+	}); code != 0 {
+		t.Fatalf("cmdDeploymentGet --show-secret-scan = %d, want 0", code)
+	}
+
+	// Decode the JSON envelope written to stdout. Same
+	// shape as TestCmdDeployments_JSON_EnvelopeShape.
+	var env struct {
+		Deployment any `json:"deployment"`
+		SecretScan any `json:"secret_scan"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("decode envelope: %v (raw=%q)", err, stdout.String())
+	}
+	if env.Deployment == nil {
+		t.Errorf("envelope missing deployment")
+	}
+	if env.SecretScan == nil {
+		t.Errorf("envelope missing secret_scan (stdout=%q)", stdout.String())
+	}
+	// Confirm both routes were hit so a future refactor
+	// that drops the per-flag dispatch surfaces here.
+	want := map[string]bool{
+		"/v1/deployments/00000000000000000000000000000001":             false,
+		"/v1/deployments/00000000000000000000000000000001/secret-scan": false,
+	}
+	for _, p := range routesHit {
+		if _, ok := want[p]; ok {
+			want[p] = true
+		}
+	}
+	for p, seen := range want {
+		if !seen {
+			t.Errorf("route %q not hit (got %v)", p, routesHit)
+		}
+	}
+	restoreStdout()
+}
