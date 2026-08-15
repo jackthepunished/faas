@@ -15,13 +15,13 @@
 // --node-key / --node-key-pub flags). It is the load-bearing
 // companion to docs/runbooks/multi-host-rollout.md §3 ("Bootstrap:
 // node signing key") so an operator can run a single
-// `gregale node-key init` instead of hand-rolling openssl + chown.
+// `gregalectl node-key init` instead of hand-rolling openssl + chown.
 //
 // The namespace `gregale keys` is already taken by the customer-
 // facing API-key manager (commands2.go::cmdKeys); the operator-side
-// cosign keypair CLI is `gregale sign-keys` (commands_sign_keys.go);
+// cosign keypair CLI is `gregalectl sign-keys` (commands_sign_keys.go);
 // the per-node slice-3 signing key lives in its own namespace
-// `gregale node-key` for symmetry. Three leaves:
+// `gregalectl node-key` for symmetry. Three leaves:
 //   - init   — write a fresh keypair (refuses overwrite)
 //   - rotate — write a fresh keypair with --force
 //   - status — print mode + fingerprint + paths for both files
@@ -85,7 +85,7 @@ const (
 func cmdNodeKey(args []string) int {
 	parent, _ := lookupCliCommand("node-key")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale node-key <init|rotate|status> [flags]", "node-key")
+		PrintUsage(os.Stderr, "usage: gregalectl node-key <init|rotate|status> [flags]", "node-key")
 		return 1
 	}
 	switch args[0] {
@@ -97,7 +97,7 @@ func cmdNodeKey(args []string) int {
 		return cmdNodeKeyStatus(args[1:])
 	default:
 		sug, _ := suggestSubcommand(args[0], parent)
-		fmt.Fprintf(os.Stderr, "gregale node-key: unknown subcommand %q (known: init, rotate, status)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl node-key: unknown subcommand %q (known: init, rotate, status)\n", args[0])
 		maybeSuggestSub(sug)
 		return 1
 	}
@@ -240,7 +240,7 @@ func cmdNodeKeyInit(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale node-key init [flags]", "node-key")
+		PrintUsage(os.Stderr, "usage: gregalectl node-key init [flags]", "node-key")
 		return 1
 	}
 	if err := writeNodeKeyPair(f.force, f.nodeKey, f.nodePub); err != nil {
@@ -273,7 +273,7 @@ func cmdNodeKeyRotate(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale node-key rotate [flags]", "node-key")
+		PrintUsage(os.Stderr, "usage: gregalectl node-key rotate [flags]", "node-key")
 		return 1
 	}
 	if err := writeNodeKeyPair(f.force, f.nodeKey, f.nodePub); err != nil {
@@ -298,7 +298,7 @@ func cmdNodeKeyStatus(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale node-key status [flags]", "node-key")
+		PrintUsage(os.Stderr, "usage: gregalectl node-key status [flags]", "node-key")
 		return 1
 	}
 	for _, p := range []struct {

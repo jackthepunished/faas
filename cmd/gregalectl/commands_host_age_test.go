@@ -37,7 +37,7 @@ import (
 
 // TestHostAgeFlagDefaults pins the per-leaf --force asymmetry.
 // Mirrors TestSignKeyFlagDefaults — the DefValue string is what
-// operators read in `gregale host-age <leaf> --help`, so we pin
+// operators read in `gregalectl host-age <leaf> --help`, so we pin
 // both the struct field (what newHostAgeFlags returns) and the
 // flag.FlagSet's DefValue (the help-text spelling).
 func TestHostAgeFlagDefaults(t *testing.T) {
@@ -68,7 +68,7 @@ func TestHostAgeFlagDefaults(t *testing.T) {
 }
 
 // TestHostAgeInit_RefuseExisting pins the refuse-overwrite contract
-// for `gregale host-age init`. Mirrors
+// for `gregalectl host-age init`. Mirrors
 // commands_backup_test.go::TestUnsealRclone_RefuseOverwrite — a
 // silent overwrite of an existing identity strands every SealedSecret
 // ever written under the old key.

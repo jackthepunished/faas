@@ -73,9 +73,10 @@ func TestTierCInvoicesUsage(t *testing.T) {
 
 // TestTierCBackupUsage, TestTierCHostAgeInitUsage,
 // TestTierCHostAgeRotateUsage, and TestTierCHostAgePrunePreviousUsage
-// moved to cmd/gregalectl/commands_tier_c_operator_test.go in PR-6.5
-// (those tests cover operator-side dispatchers that no longer exist
-// in this package).
+// were deleted in PR-6.5 (they covered operator-side dispatchers that
+// moved to cmd/gregalectl/ — coverage now lives in
+// cmd/gregalectl/commands_backup_test.go and
+// cmd/gregalectl/commands_host_age_test.go).
 
 // TestTierCBuildUsage pins cmdBuild's argument count check.
 func TestTierCBuildUsage(t *testing.T) {

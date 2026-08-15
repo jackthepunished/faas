@@ -4,8 +4,8 @@
 // Mirrors cmd/gregale/commands_completion_test.go byte-for-byte
 // except the dispatchConsts map is restricted to operator-side
 // consts (dispatchHostAge, dispatchPKI, dispatchSignKeys,
-// dispatchNodeKey, dispatchBackup). Customer-side consts stay in
-// the gregale drift test.
+// dispatchNodeKey, dispatchBackup, dispatchManifest, dispatchRelease).
+// Customer-side consts stay in the gregale drift test.
 //
 // Each drift test runs in its own binary's `go test ./cmd/<x>/...`
 // and pins its binary's surface; adding a customer command to

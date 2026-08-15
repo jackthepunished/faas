@@ -5,7 +5,7 @@
 // (and host.age.previous during the 30-day rotation overlap).
 // No authedClient() call, no API hit, no remote round-trip.
 //
-// The namespace `gregale host-age` has four leaves:
+// The namespace `gregalectl host-age` has four leaves:
 //
 //   - init            — write a fresh keypair (refuses overwrite)
 //   - rotate          — drop a new current key, move the old to
@@ -92,7 +92,7 @@ var (
 	// ErrRotateNoCurrent is returned by hostAgeRotate when host.age
 	// does not exist on disk (operator skipped init or wiped the
 	// secret dir). The error message points the operator at init.
-	ErrRotateNoCurrent = errors.New("host-age: rotate requires an existing host.age (run 'gregale host-age init' first)")
+	ErrRotateNoCurrent = errors.New("host-age: rotate requires an existing host.age (run 'gregalectl host-age init' first)")
 
 	// ErrPruneMissingPrevious is returned by hostAgePrunePrevious
 	// when host.age.previous does not exist. Surfaces as a clear
@@ -114,7 +114,7 @@ var (
 func cmdHostAge(args []string) int {
 	parent, _ := lookupCliCommand("host-age")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale host-age <init|rotate|status|prune-previous> [flags]", "host-age")
+		PrintUsage(os.Stderr, "usage: gregalectl host-age <init|rotate|status|prune-previous> [flags]", "host-age")
 		return 1
 	}
 	switch args[0] {
@@ -128,7 +128,7 @@ func cmdHostAge(args []string) int {
 		return cmdHostAgePrunePrevious(args[1:])
 	default:
 		sug, _ := suggestSubcommand(args[0], parent)
-		fmt.Fprintf(os.Stderr, "gregale host-age: unknown subcommand %q (known: init, rotate, status, prune-previous)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl host-age: unknown subcommand %q (known: init, rotate, status, prune-previous)\n", args[0])
 		maybeSuggestSub(sug)
 		return 1
 	}
@@ -197,13 +197,13 @@ func cmdHostAgeInit(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale host-age init [flags]", "host-age")
+		PrintUsage(os.Stderr, "usage: gregalectl host-age init [flags]", "host-age")
 		return 1
 	}
 	if err := hostAgeInit(f.dir, f.force); err != nil {
 		return printErr("init failed", err)
 	}
-	PrintOK(osStdout, "Wrote %s/host.age (0400 root:root)\n  Recipient: see gregale host-age status\n  Next: systemctl restart faas-apid faas-vmmd faas-meterd faas-githubd", f.dir)
+	PrintOK(osStdout, "Wrote %s/host.age (0400 root:root)\n  Recipient: see gregalectl host-age status\n  Next: systemctl restart faas-apid faas-vmmd faas-meterd faas-githubd", f.dir)
 	return 0
 }
 
@@ -260,14 +260,14 @@ func cmdHostAgeRotate(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale host-age rotate [flags]", "host-age")
+		PrintUsage(os.Stderr, "usage: gregalectl host-age rotate [flags]", "host-age")
 		return 1
 	}
 	newRecipient, prevRecipient, err := hostAgeRotate(f.dir, f.force)
 	if err != nil {
 		return printErr("rotate failed", err)
 	}
-	PrintOK(osStdout, "Rotated host.age → host.age.previous; new current written.\n  New recipient:     %s\n  Previous (now .previous): %s\n  Next: chown root:root %s/host.age %s/host.age.previous && chmod 0400 both (if not already root)\n  Next: systemctl restart faas-vmmd first (it owns host.age.pub), then faas-apid faas-meterd faas-githubd\n  Next: gregale host-age status (verify all daemons on the new fingerprint after restart)\n  Next: 30-day overlap window starts now; run 'gregale host-age prune-previous' after that",
+	PrintOK(osStdout, "Rotated host.age → host.age.previous; new current written.\n  New recipient:     %s\n  Previous (now .previous): %s\n  Next: chown root:root %s/host.age %s/host.age.previous && chmod 0400 both (if not already root)\n  Next: systemctl restart faas-vmmd first (it owns host.age.pub), then faas-apid faas-meterd faas-githubd\n  Next: gregalectl host-age status (verify all daemons on the new fingerprint after restart)\n  Next: 30-day overlap window starts now; run 'gregalectl host-age prune-previous' after that",
 		newRecipient, prevRecipient, f.dir, f.dir)
 	return 0
 }
@@ -371,7 +371,7 @@ func cmdHostAgeStatus(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale host-age status [flags]", "host-age")
+		PrintUsage(os.Stderr, "usage: gregalectl host-age status [flags]", "host-age")
 		return 1
 	}
 	paths := hostAgePaths(f.dir)
@@ -444,7 +444,7 @@ func cmdHostAgePrunePrevious(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale host-age prune-previous [--min-overlap-days N] [--force] [--promote]", "host-age")
+		PrintUsage(os.Stderr, "usage: gregalectl host-age prune-previous [--min-overlap-days N] [--force] [--promote]", "host-age")
 		return 1
 	}
 	dir := f.dir

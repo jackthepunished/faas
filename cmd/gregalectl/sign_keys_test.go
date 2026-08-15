@@ -1,5 +1,5 @@
 // Tests for the operator-side cosign keypair CLI
-// (`gregale sign-keys init|rotate|status`). The dispatcher lives in
+// (`gregalectl sign-keys init|rotate|status`). The dispatcher lives in
 // commands_sign_keys.go; main_test.go pins its placement in the
 // `run` switch. This file narrowly covers the leaves and the
 // rotate-path safety rail (refuses overwrite without --force).
@@ -85,7 +85,7 @@ func TestCmdSignKeys_NoArgs_PrintsUsage(t *testing.T) {
 		t.Errorf("cmdSignKeys(nil) = %d, want 1", code)
 	}
 	got := readStderr()
-	if !strings.Contains(got, "usage: gregale sign-keys") {
+	if !strings.Contains(got, "usage: gregalectl sign-keys") {
 		t.Errorf("stderr = %q, want usage line", got)
 	}
 	if !strings.Contains(got, "init|rotate|status") {
@@ -141,7 +141,7 @@ func TestCmdSignKeysInit_WritesBothFilesWithCanonicalModes(t *testing.T) {
 	// "operator can immediately restart gregale-imaged without any
 	// post-fixup" guarantee — the v1 bootstrap.sh chown root:gregale
 	// step (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
-	// `gregale secrets init`) only needs the file mode to be correct
+	// `gregalectl secrets init`) only needs the file mode to be correct
 	// on its own.
 	privBytes, err := os.ReadFile(privPath)
 	if err != nil {
@@ -201,7 +201,7 @@ func TestCmdSignKeysInit_ExtraArgsRejected(t *testing.T) {
 	if code := cmdSignKeysInit([]string{"--sign-key", privPath, "--verify-key", pubPath, "extra", "args"}); code != 1 {
 		t.Errorf("code = %d, want 1 for extra positional args", code)
 	}
-	if !strings.Contains(readStderr(), "usage: gregale sign-keys init") {
+	if !strings.Contains(readStderr(), "usage: gregalectl sign-keys init") {
 		t.Errorf("stderr = %q, want usage line", readStderr())
 	}
 }

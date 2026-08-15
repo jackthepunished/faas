@@ -4,8 +4,8 @@
 // leaf is a local file-system operation against the canonical
 // /etc/faas/tls/{ca,<daemon>/} paths.
 //
-// The namespace `gregale pki` is a separate top-level command from
-// `gregale sign-keys` (cosign keypair, ADR-038 phase 3) because the
+// The namespace `gregalectl pki` is a separate top-level command from
+// `gregalectl sign-keys` (cosign keypair, ADR-038 phase 3) because the
 // two systems have different trust roots and different rotation cadences:
 //
 //   - sign-keys: per-box ECDSA P-256 keypair, 0440 root:faas, rotated by
@@ -17,7 +17,7 @@
 //     every box that trusts it. Operators rotate per-leaf (cheap, no CA
 //     change) and the CA itself only on the 5-year NotAfter boundary.
 //
-// `gregale pki init|status|rotate` mirrors the sign-keys dispatcher
+// `gregalectl pki init|status|rotate` mirrors the sign-keys dispatcher
 // pattern (cmd/gregale/commands_sign_keys.go). All three leaves share
 // the `--root-dir` flag (default /etc/faas/tls) and the per-daemon
 // leaf set is fixed in pkg/pki.Roles() — operators don't pick leaves.
@@ -35,7 +35,7 @@
 //
 // `status` is read-only: per-leaf mode + serial + expires_at + CN +
 // SAN list. Exit 0 if every leaf is valid, exit 1 if any is missing or
-// has insecure mode (mirrors `gregale sign-keys status`).
+// has insecure mode (mirrors `gregalectl sign-keys status`).
 package main
 
 import (
@@ -67,7 +67,7 @@ const (
 func cmdPKI(args []string) int {
 	parent, _ := lookupCliCommand("pki")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale pki <init|status|rotate> [flags]", "pki")
+		PrintUsage(os.Stderr, "usage: gregalectl pki <init|status|rotate> [flags]", "pki")
 		return 1
 	}
 	switch args[0] {
@@ -79,7 +79,7 @@ func cmdPKI(args []string) int {
 		return cmdPKIRotate(args[1:])
 	default:
 		sug, _ := suggestSubcommand(args[0], parent)
-		fmt.Fprintf(os.Stderr, "gregale pki: unknown subcommand %q (known: init, status, rotate)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl pki: unknown subcommand %q (known: init, status, rotate)\n", args[0])
 		maybeSuggestSub(sug)
 		return 1
 	}
@@ -128,7 +128,7 @@ func newPKIFlags(name string, defaultForce bool) (*flag.FlagSet, *pkiFlags) {
 
 // cmdPKIInit issues the CA + every per-daemon leaf. Idempotent: leaves
 // with NotAfter >= ReissueThreshold are skipped silently so re-running
-// `gregale pki init` after a partial failure doesn't churn the rest of
+// `gregalectl pki init` after a partial failure doesn't churn the rest of
 // the fleet. Pass --force to re-issue unconditionally.
 func cmdPKIInit(args []string) int {
 	fs, f := newPKIFlags("pki init", false)
@@ -136,7 +136,7 @@ func cmdPKIInit(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale pki init [flags]", "pki")
+		PrintUsage(os.Stderr, "usage: gregalectl pki init [flags]", "pki")
 		return 1
 	}
 	caCert, caKey, err := pki.EnsureCA(f.rootDir, f.force)
@@ -166,7 +166,7 @@ func cmdPKIStatus(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale pki status [flags]", "pki")
+		PrintUsage(os.Stderr, "usage: gregalectl pki status [flags]", "pki")
 		return 1
 	}
 	reportCAStatus(os.Stdout, f.rootDir)
@@ -176,7 +176,7 @@ func cmdPKIStatus(args []string) int {
 	// non-fatal for the human reader but useful as a Nagios-style
 	// alarm signal.
 	if anyExpiringSoon(f.rootDir, pki.ReissueThreshold) {
-		fmt.Fprintf(os.Stderr, "gregale pki status: at least one leaf expires within %s — run `gregale pki init` or `gregale pki rotate`\n",
+		fmt.Fprintf(os.Stderr, "gregalectl pki status: at least one leaf expires within %s — run `gregalectl pki init` or `gregalectl pki rotate`\n",
 			pki.ReissueThreshold)
 		return 1
 	}
@@ -184,7 +184,7 @@ func cmdPKIStatus(args []string) int {
 }
 
 // cmdPKIRotate re-issues every leaf unconditionally. Equivalent to
-// `gregale pki init --force`. The CLI splits them so the operator's
+// `gregalectl pki init --force`. The CLI splits them so the operator's
 // intent (initialize vs. rotate) is recorded in shell history and
 // stdout, not just by a flag toggle.
 //
@@ -202,7 +202,7 @@ func cmdPKIRotate(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale pki rotate [flags]", "pki")
+		PrintUsage(os.Stderr, "usage: gregalectl pki rotate [flags]", "pki")
 		return 1
 	}
 	// Rotate is destructive on the leaves; the CA is preserved unless
@@ -319,7 +319,7 @@ func ensureAllLeaves(rootDir string, caCert *x509.Certificate, caKey *ecdsa.Priv
 // boxRole is the Gate-B per-box subset filter (--box-role on the CLI).
 // When boxRole is non-empty, only the leaves whose Directory survives
 // the per-box filter are eligible for the --daemon narrowing; this is
-// how `gregale pki rotate --box-role=compute-only --daemon=imaged`
+// how `gregalectl pki rotate --box-role=compute-only --daemon=imaged`
 // would only rotate the imaged server leaf on fsn-2.
 func ensureAllLeavesFiltered(rootDir string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, force bool, daemon string, boxRole string) (int, int, []error) {
 	if daemon == "" {
@@ -369,7 +369,7 @@ func reportCAStatus(w io.Writer, rootDir string) {
 
 // reportLeafStatusAll prints one line per leaf in
 // pki.RolesForBox(boxRole) (or pki.Roles() when boxRole==""). Mirrors
-// ensureAllLeaves so `gregale pki status` on fsn-2 only walks the
+// ensureAllLeaves so `gregalectl pki status` on fsn-2 only walks the
 // leaves that box actually owns.
 func reportLeafStatusAll(w io.Writer, rootDir, boxRole string) {
 	for _, role := range pki.RolesForBox(boxRole) {

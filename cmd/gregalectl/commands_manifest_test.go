@@ -167,7 +167,7 @@ func TestCmdManifestValidate_Help(t *testing.T) {
 // the doctor (PR-4) will consume against the rendered /etc/faas/*.toml
 // on each box. PR-5 wires a CLI-context pin so the validator is
 // reachable from the operator surface — the doctor can call the same
-// function directly, but a future `gregale manifest doctor --role=...`
+// function directly, but a future `gregalectl manifest doctor --role=...`
 // will run this check from this package. The test asserts the function
 // surfaces the tombstone error for the canonical "tls_*_path leaked
 // into [compute_node]" bug class from issue #911.
@@ -199,7 +199,7 @@ func TestTOMLPlacement_TombstoneReachableFromCLIPackage(t *testing.T) {
 
 // PR-5 / issue #911 — TOML placement MUST also be reachable from a
 // YAML manifest path for the operator CLI. Today the operator runs
-// `gregale manifest validate --file=...` on the YAML; once the
+// `gregalectl manifest validate --file=...` on the YAML; once the
 // renderer (PR-2) ships, the same CLI dispatch chain will accept a
 // --rendered-from flag and feed the produced map into
 // ValidateTOMLPlacement. This test pins the contract that the
@@ -214,7 +214,7 @@ func TestTOMLPlacement_HostKeysCatalogSize(t *testing.T) {
 	}
 }
 
-// PR-2 / issue #911 — `gregale manifest render` CLI leaf. The
+// PR-2 / issue #911 — `gregalectl manifest render` CLI leaf. The
 // renderer is the read-side of the release-bundle flow (PR-3 ships
 // the write-side). The CLI leaf must reject missing flags, surface
 // a non-zero exit on render errors, and emit a JSON-shaped

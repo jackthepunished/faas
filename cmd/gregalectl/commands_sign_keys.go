@@ -10,7 +10,7 @@
 // API-key manager (cmdKeys in commands2.go:725-780 — every leaf
 // calls authedClient() and hits apid). Operator-side provisioning
 // has no business in that namespace; this is a separate top-level
-// command `gregale sign-keys` with three leaves:
+// command `gregalectl sign-keys` with three leaves:
 //   - init   — write a fresh keypair (refuses overwrite)
 //   - rotate — write a fresh keypair with --force (overwrite allowed
 //     after archiving the old public key)
@@ -53,7 +53,7 @@ const (
 func cmdSignKeys(args []string) int {
 	parent, _ := lookupCliCommand("sign-keys")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale sign-keys <init|rotate|status> [flags]", "sign-keys")
+		PrintUsage(os.Stderr, "usage: gregalectl sign-keys <init|rotate|status> [flags]", "sign-keys")
 		return 1
 	}
 	switch args[0] {
@@ -65,7 +65,7 @@ func cmdSignKeys(args []string) int {
 		return cmdSignKeysStatus(args[1:])
 	default:
 		sug, _ := suggestSubcommand(args[0], parent)
-		fmt.Fprintf(os.Stderr, "gregale sign-keys: unknown subcommand %q (known: init, rotate, status)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl sign-keys: unknown subcommand %q (known: init, rotate, status)\n", args[0])
 		maybeSuggestSub(sug)
 		return 1
 	}
@@ -77,7 +77,7 @@ func cmdSignKeys(args []string) int {
 //
 // force defaults: init=false (refuse overwrite by default; an operator
 // who re-runs `init` mid-deploy is almost certainly making a mistake),
-// rotate=true (a bare `gregale sign-keys rotate` MUST overwrite —
+// rotate=true (a bare `gregalectl sign-keys rotate` MUST overwrite —
 // that's the whole point of the subcommand; running rotate without
 // overwrite is a no-op, see cmdSignKeysRotate body for the rotation
 // flow).
@@ -126,9 +126,9 @@ func writeKeyPair(force bool, privPath, pubPath string) error {
 // cmdSignKeysInit writes a fresh keypair. Refuses to overwrite
 // existing files. The caller is expected to be the bootstrap or
 // an ansible task running as root (so the post-write chown to
-// root:gregale succeeds). `gregale sign-keys init --force` is allowed
+// root:gregale succeeds). `gregalectl sign-keys init --force` is allowed
 // for emergency re-init but the operator should normally use
-// `gregale sign-keys rotate` for that flow — `init --force` skips
+// `gregalectl sign-keys rotate` for that flow — `init --force` skips
 // the rename of the existing pub file that rotate performs in a
 // future patch (out of scope here).
 func cmdSignKeysInit(args []string) int {
@@ -137,7 +137,7 @@ func cmdSignKeysInit(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale sign-keys init [flags]", "sign-keys")
+		PrintUsage(os.Stderr, "usage: gregalectl sign-keys init [flags]", "sign-keys")
 		return 1
 	}
 	if err := writeKeyPair(f.force, f.signKey, f.verify); err != nil {
@@ -164,7 +164,7 @@ func cmdSignKeysRotate(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale sign-keys rotate [flags]", "sign-keys")
+		PrintUsage(os.Stderr, "usage: gregalectl sign-keys rotate [flags]", "sign-keys")
 		return 1
 	}
 	if err := writeKeyPair(f.force, f.signKey, f.verify); err != nil {
@@ -188,7 +188,7 @@ func cmdSignKeysStatus(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale sign-keys status [flags]", "sign-keys")
+		PrintUsage(os.Stderr, "usage: gregalectl sign-keys status [flags]", "sign-keys")
 		return 1
 	}
 	for _, p := range []struct {
