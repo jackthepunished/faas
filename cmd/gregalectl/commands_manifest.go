@@ -22,6 +22,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"sort"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/releaseinstall"
 	"github.com/onebox-faas/faas/pkg/renderer"
 )
 
@@ -279,6 +281,23 @@ func cmdManifestRender(args []string) int {
 		}
 		return 1
 	}
+	// PR-2 (issue #911 / ADR-110): persist the host's role onto
+	// compute_nodes.role after the file-write phase succeeds.
+	// The renderer's scope is purely filesystem; the DB write
+	// belongs at the CLI leaf (the same place cmdReleaseInstall
+	// writes UpsertComputeNode from PR-6). Dry-run skips the
+	// DB write (the operator is browsing, not committing); an
+	// empty host name (single-box dev) skips the write because
+	// compute_nodes.role stays NULL.
+	//
+	// FAAS_PG_DSN missing is logged as a warning, not an error —
+	// file-write succeeded, the role-write is a downstream signal
+	// the doctor will detect on the next run.
+	if !*dryRun && report.Host != "" && report.Role != "" {
+		if err := writeComputeNodeRole(report.Host, report.Role); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl manifest render: warning: write compute_nodes.role (host=%s, role=%s): %v\n", report.Host, report.Role, err)
+		}
+	}
 	if jsonEnabled() {
 		jsonEmit(os.Stdout, report)
 	} else {
@@ -296,4 +315,29 @@ func cmdManifestRender(args []string) int {
 		}
 	}
 	return 0
+}
+
+// writeComputeNodeRole persists the host's role onto
+// compute_nodes.role after a successful render. The DB pool is
+// short-lived (one open per call) — the manifest-render workflow
+// is operator-triggered, not load-bearing on a long-lived pool,
+// and the existing openPgPoolFromEnv helper (commands_release.go)
+// is the canonical voice for FAAS_PG_DSN. A missing DSN is a soft
+// warning (the render itself succeeded; the operator can re-run
+// with FAAS_PG_DSN set after the next deploy).
+func writeComputeNodeRole(name, role string) error {
+	pool, err := openPgPoolFromEnv()
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	store := releaseinstall.NewStore(pool)
+	updated, err := store.SetComputeNodeRole(context.Background(), name, role)
+	if err != nil {
+		return err
+	}
+	if updated {
+		_, _ = fmt.Fprintf(os.Stdout, "gregalectl manifest render: compute_nodes.role updated (host=%s, role=%s)\n", name, role)
+	}
+	return nil
 }

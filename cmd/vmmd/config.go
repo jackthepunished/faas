@@ -336,5 +336,17 @@ func LoadConfig(path string) (*Config, error) {
 	// gate at boot calls role.Require to refuse to start under the
 	// wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_VMMD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// [compute_node].name so the systemd drop-in (deploy/ansible/
+	// roles/vmmd_service/files/faas-vmmd.service.d/
+	// 99-faas-node-name.conf) can override the TOML value on every
+	// box. The vmmd ComputeNode self-registration (cmd/vmmd/register.go)
+	// writes this name into compute_nodes.name at startup, so the
+	// env overlay is the load-bearing identity for the multi-box
+	// handshake. Empty keeps the TOML value (single-box dev back-
+	// compat — short hostname).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.ComputeNode.NodeName = v
+	}
 	return c, nil
 }

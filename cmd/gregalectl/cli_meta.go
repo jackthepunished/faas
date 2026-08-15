@@ -63,6 +63,7 @@ type cliFlag struct {
 //   - sign-keys (init | rotate | status)
 //   - node-key  (init | rotate | status)
 //   - backup    (unseal-rclone | unseal-archive-creds)
+//   - secrets   (init | rotate | status)
 //   - trusted-publishers (add | remove | list)
 //   - version   (internal)
 //   - completion (bash | zsh | fish | powershell) (internal)
@@ -199,6 +200,29 @@ var cliCommands = []cliCommand{
 		Flags: []cliFlag{
 			{Name: "node-key", Short: "path to the node signing private key"},
 			{Name: "node-key-pub", Short: "path to the node signing public key"},
+		},
+	},
+	{
+		// PR-X (issue #911 / ADR-110): post-bootstrap secrets
+		// initialisation. Replaces v1 bootstrap.sh step 11d
+		// (RETIRED 2026-08-15). Writes 5 secret files in one
+		// batch and stamps compute_nodes.{host_certificate,
+		// cert_fingerprint}.
+		Name:    dispatchSecrets,
+		DocSlug: "secrets",
+		Short:   "Post-bootstrap secrets init (secrets init|rotate|status; PR-X / issue #911 / ADR-110)",
+		Subcommands: []cliSub{
+			{Name: subInit, Short: "Initialise the 5 on-disk secrets (host.age, session.key, box-age-key, rclone.conf, archive-creds.json)"},
+			{Name: subRotate, Short: "Rotate host.age (delegates to host-age rotate)"},
+			{Name: subStatus, Short: "Show mode/mtime/sha256 for the 5 secret files"},
+		},
+		Flags: []cliFlag{
+			{Name: "dir", Short: "root secrets directory (default /etc/faas/secrets)"},
+			{Name: "host", Short: "compute_nodes.name to stamp (default: hostname)"},
+			{Name: "role", Short: "compute_nodes.role to stamp (default: empty)"},
+			{Name: "pg-dsn", Short: "PostgreSQL DSN (default: $FAAS_PG_DSN)"},
+			{Name: "no-db", Short: "skip the compute_nodes.cert_fingerprint write"},
+			{Name: "force", Short: "overwrite existing secret files (default false)"},
 		},
 	},
 	// Internal surface — version, completion, man.

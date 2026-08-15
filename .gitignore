@@ -45,3 +45,7 @@ vmlinux-*
 /gatewayd-internal
 /gregale
 /gregale-mfa-qr.png
+
+# CLIs (build output)
+/gregalectl
+/gregale

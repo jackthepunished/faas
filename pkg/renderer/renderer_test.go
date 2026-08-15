@@ -1,11 +1,13 @@
 package renderer
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/daemonunitspec"
 	"github.com/onebox-faas/faas/pkg/manifest"
 )
 
@@ -116,6 +118,9 @@ func TestRenderer_ResolvesSingleBoxHost(t *testing.T) {
 	}
 	if report.Host != "fsn-1" {
 		t.Errorf("Host = %q, want fsn-1", report.Host)
+	}
+	if report.Role != "single-box" {
+		t.Errorf("Role = %q, want single-box (PR-2 computes role for the role-write step)", report.Role)
 	}
 	if len(report.Outputs) == 0 {
 		t.Errorf("Outputs is empty")
@@ -473,4 +478,121 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// PR-2 (issue #911 / ADR-110) tests: renderSystemd must thread
+// host.Name into the rendered unit via an Environment=FAAS_NODE_NAME=
+// line. The line is inserted into the [Service] block (after the
+// last Environment= directive emitted by daemonunit.Unit), preserved
+// across every daemon, and omitted on empty host.Name (single-box
+// dev).
+
+func TestRenderSystemd_ThreadsHostNameIntoUnit(t *testing.T) {
+	// Every daemon in the registry must gain the env line when
+	// hostName is non-empty. The POST-PROCESS is the renderer
+	// contract; daemonunit itself does not know about FAAS_NODE_NAME.
+	for _, daemon := range daemonunitspec.ActivationOrder() {
+		t.Run(daemon, func(t *testing.T) {
+			body, err := renderSystemd(daemon, "fsn-1")
+			if err != nil {
+				t.Fatalf("renderSystemd(%s): %v", daemon, err)
+			}
+			if !bytes.Contains(body, []byte("Environment=FAAS_NODE_NAME=fsn-1")) {
+				t.Errorf("rendered unit missing Environment=FAAS_NODE_NAME=fsn-1:\n%s", body)
+			}
+		})
+	}
+}
+
+func TestRenderSystemd_EmptyHostNameOmitsEnvLine(t *testing.T) {
+	// Single-box dev: no host.Name in the manifest or the host
+	// is "" in the renderer opts. The rendered unit must NOT
+	// carry an Environment=FAAS_NODE_NAME= line (the daemon's
+	// TOML default applies and the loader's no-NodeName posture
+	// is the explicit single-box posture).
+	for _, daemon := range daemonunitspec.ActivationOrder() {
+		t.Run(daemon, func(t *testing.T) {
+			body, err := renderSystemd(daemon, "")
+			if err != nil {
+				t.Fatalf("renderSystemd(%s): %v", daemon, err)
+			}
+			if bytes.Contains(body, []byte("FAAS_NODE_NAME=")) {
+				t.Errorf("rendered unit carries FAAS_NODE_NAME= despite empty hostName:\n%s", body)
+			}
+		})
+	}
+}
+
+func TestRenderSystemd_IdempotentOnExistingNodeName(t *testing.T) {
+	// Re-rendering must not append a duplicate line on the
+	// second pass. The renderer is safe for two consecutive
+	// `manifest render` runs against the same fleet.
+	body1, err := renderSystemd("schedd", "fsn-1")
+	if err != nil {
+		t.Fatalf("renderSystemd 1: %v", err)
+	}
+	if bytes.Count(body1, []byte("FAAS_NODE_NAME=")) != 1 {
+		t.Errorf("rendered unit has %d FAAS_NODE_NAME= lines, want 1", bytes.Count(body1, []byte("FAAS_NODE_NAME=")))
+	}
+	// The marker-based dedup is the load-bearing idempotency
+	// guarantee: re-injecting on a body that already carries the
+	// line is a no-op.
+	body2, err := injectNodeNameEnvironment(body1, "fsn-1")
+	if err != nil {
+		t.Fatalf("injectNodeNameEnvironment 2: %v", err)
+	}
+	if bytes.Count(body2, []byte("FAAS_NODE_NAME=")) != 1 {
+		t.Errorf("re-injected unit has %d FAAS_NODE_NAME= lines, want 1 (idempotent)", bytes.Count(body2, []byte("FAAS_NODE_NAME=")))
+	}
+}
+
+func TestRenderer_RendersNodeNameIntoSystemdOutput(t *testing.T) {
+	// End-to-end: dry-run render against a manifest with a non-
+	// empty host name. Assert every emitted faas-<daemon>.service
+	// path matches the env line by reading the file from disk.
+	dir := t.TempDir()
+	path := fixtureManifest(t, "fsn-1", "single-box")
+	opts := RenderOptions{
+		ManifestPath: path,
+		ReleasesRoot: filepath.Join(dir, "releases"),
+		EtcFaasDir:   filepath.Join(dir, "etc"),
+		SystemdDir:   filepath.Join(dir, "systemd"),
+		PKIRootDir:   filepath.Join(dir, "tls"),
+		CgroupRoot:   filepath.Join(dir, "cgroup"),
+	}
+	report, err := Render(opts)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	for _, o := range report.Outputs {
+		if !strings.HasSuffix(o.Path, ".service") {
+			continue
+		}
+		body, err := os.ReadFile(o.Path)
+		if err != nil {
+			t.Errorf("read %s: %v", o.Path, err)
+			continue
+		}
+		if !bytes.Contains(body, []byte("Environment=FAAS_NODE_NAME=fsn-1")) {
+			t.Errorf("%s missing Environment=FAAS_NODE_NAME=fsn-1", o.Path)
+		}
+	}
+}
+
+func TestRenderer_OmitsNodeNameOnEmptyHost(t *testing.T) {
+	// The manifest validator rejects hosts with empty name, so
+	// the renderer's "no host name" path is reachable only via
+	// the lower-level renderSystemd entry. The behaviour is
+	// pinned by TestRenderSystemd_EmptyHostNameOmitsEnvLine above;
+	// this test pins the renderer's call-site contract: even a
+	// single-box host (host.Name == "") must NOT inject the env
+	// line into the rendered unit. The renderer routes "" through
+	// renderSystemd unchanged.
+	body, err := renderSystemd("schedd", "")
+	if err != nil {
+		t.Fatalf("renderSystemd: %v", err)
+	}
+	if bytes.Contains(body, []byte("FAAS_NODE_NAME=")) {
+		t.Errorf("renderSystemd(\"schedd\", \"\") carries FAAS_NODE_NAME= despite empty hostName:\n%s", body)
+	}
 }

@@ -117,6 +117,19 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): capture FAAS_NODE_NAME
+	// before any control-plane handshake so the boot log carries the
+	// identity. imaged has no config.go today (env-only); the systemd
+	// drop-in (deploy/ansible/roles/compute_only_service/files/
+	// faas-imaged.service.d/99-faas-node-name.conf) is the only
+	// source. Empty + log.Info("legacy single-box") mirrors the schedd
+	// owner-node line.
+	if nodeName := os.Getenv("FAAS_NODE_NAME"); nodeName != "" {
+		log.Info("imaged owner node", "node_name", nodeName)
+	} else {
+		log.Info("imaged: legacy single-box (FAAS_NODE_NAME unset)")
+	}
+
 	// PR-5 / issue #911 — manifest reconcile against FAAS_BUILDER_BASE_REF.
 	// When FAAS_MANIFEST_PATH is set, load the split-box deployment
 	// manifest and assert the manifest's release.builder_base_digest

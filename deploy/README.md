@@ -28,11 +28,9 @@ make test               # cross-platform unit tests
   via the `nftables` ansible role.
 - `scripts/` — ops helpers (`leakcheck.sh` for the shell-side check,
   restore drill planned for M8).
-- `controlplane/` — **RETIRED 2026-08-15** (issue #911 / PR-1 / ADR-110).
-  The v1 standalone Control Plane installer (bootstrap.sh + deploy.sh +
-  config/ + systemd/ + tmpfiles.d/ + sealed.env.example) is a tombstone
-  now. See [`controlplane/RETIRED.md`](controlplane/RETIRED.md) for the
-  v2 path mapping. The v2 control plane is bootstrapped by `make bootstrap`
-  + `gregale manifest {validate,render}` + `gregale release install`
-  (PR-0 / PR-2 / PR-3); the secrets surface lands in PR-X `gregale
-  secrets init`.
+- `controlplane/` — **RETIRED 2026-08-15** (issue #911 / PR-1 / ADR-110;
+  tombstone files `controlplane/bootstrap.sh` + `controlplane/RETIRED.md`
+  deleted by issue #911 / PR-1 Phase 2 on 2026-08-15). The v2 control
+  plane is bootstrapped by `make bootstrap` + `gregale manifest
+  {validate,render}` + `gregale release install` (PR-0 / PR-2 / PR-3);
+  the secrets surface lands in PR-X `gregale secrets init`.

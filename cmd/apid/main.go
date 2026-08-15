@@ -528,6 +528,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}
 	deps.config = cfg
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity so an operator reading the systemd journal
+	// can map the daemon to the right compute_node row. Mirrors the
+	// schedd owner-node line so the playbook shape is identical
+	// across daemons.
+	if cfg.NodeName != "" {
+		log.Info("apid owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("apid: legacy single-box (cfg.NodeName empty)")
+	}
 	deps.notif = func() Notifier { return pgNotifier{pool: pool} }
 	// ADR-094: hand runWithDeps the same closePool helper so the
 	// post-bind defer (installed just before srv.Serve) and every

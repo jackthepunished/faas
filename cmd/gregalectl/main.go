@@ -11,6 +11,7 @@
 //   - sign-keys init|rotate|status   — cosign sign keypair (local fs)
 //   - node-key init|rotate|status    — per-node CapacityReport keypair
 //   - backup init|unseal-archive-creds|unseal-rclone — backup creds
+//   - secrets init|rotate|status                     — post-bootstrap secrets
 //   - trusted-publishers stays in `gregale` (admin API surface; see
 //     PR-6.5 deviation note) — NOT shipped here.
 //   - version, completion, man        — internal surface
@@ -50,6 +51,7 @@ Commands:
   sign-keys    Provision the cosign sign keypair (sign-keys init|rotate|status; --sign-key / --verify-key)
   node-key     Provision the per-node CapacityReport signing keypair (node-key init|rotate|status)
   backup       Operator rclone / archive credentials (backup init|unseal-archive-creds|unseal-rclone)
+  secrets      Post-bootstrap secrets init (secrets init|rotate|status; PR-X / issue #911 / ADR-110)
   version      Print the CLI version
   completion   Print a shell completion script (bash|zsh|fish|powershell)
   man          Print the gregalectl(1) man page (or gregalectl-<command>(1) with one arg)
@@ -144,6 +146,12 @@ func run(args []string) int {
 		// fans to init / unseal-rclone / unseal-archive-creds. Local
 		// fs only — never hits apid.
 		return cmdBackup(args[1:])
+	case dispatchSecrets:
+		// Post-bootstrap secrets init (issue #911 / ADR-110 PR-X).
+		// Replaces v1 bootstrap.sh step 11d. cmdSecretsDispatch
+		// fans to init / rotate / status. Local fs + optional
+		// compute_nodes write — never hits apid.
+		return cmdSecretsDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregalectl: unknown command %q\nRun 'gregalectl help' for usage.\n", args[0])
 		return 1
