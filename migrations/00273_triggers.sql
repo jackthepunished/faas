@@ -1,4 +1,4 @@
--- filename: 00267_triggers.sql
+-- filename: 00273_triggers.sql
 -- Trigger primitive (event-source mappings, closes #757).
 --
 -- Adds the unified `triggers` table — one resource with a `kind`

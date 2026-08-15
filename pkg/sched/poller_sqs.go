@@ -276,7 +276,7 @@ func (s *sqsPoller) Nack(ctx context.Context, _ sqlc.Trigger, ids []string, reas
 	if err != nil {
 		return fmt.Errorf("sqs_poller: release: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("sqs_poller: release status %d: %s", resp.StatusCode, raw)

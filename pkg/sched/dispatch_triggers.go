@@ -222,7 +222,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			"trigger_id", t.ID.String(),
 			"kind", t.Kind,
 			"err", res.Error)
-		return nil
+		return fmt.Errorf("poll trigger %s: %w", t.ID, res.Error)
 	}
 	if len(res.Records) == 0 {
 		return nil
@@ -479,7 +479,7 @@ func (l *Loop) postBatch(ctx context.Context, env triggerDispatchRequest) ([]byt
 	if err != nil {
 		return nil, fmt.Errorf("post: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, raw)

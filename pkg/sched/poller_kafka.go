@@ -246,7 +246,7 @@ func (k *kafkaPoller) Nack(commitCtx context.Context, _ sqlc.Trigger, ids []stri
 			continue
 		}
 		var err error
-		if reason == "poison_record" {
+		if reason == triggerReasonPoisonRecord {
 			// Commit so the offset advances. The dispatch tick
 			// has already recorded this as dead_letter so
 			// redelivery is not desired.
