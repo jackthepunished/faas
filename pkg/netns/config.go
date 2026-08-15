@@ -12,12 +12,12 @@ import (
 // per-instance uniqueness lives entirely on the host side (veth + host IP),
 // never inside the guest. Do not make these per-VM.
 const (
-	GuestIP        = "10.0.0.2"
-	GuestGateway   = "10.0.0.1"
-	GuestPrefix    = "10.0.0.2/30"
-	TapPrefix      = "10.0.0.1/30" // host (tap0) side of the /30 inside the netns
-	AppPort        = 8080          // the :8080 contract (spec §2)
-	TenantBridge = "br-tenants" // root-ns bridge the veth host-side enslaves to
+	GuestIP      = "10.0.0.2"
+	GuestGateway = "10.0.0.1"
+	GuestPrefix  = "10.0.0.2/30"
+	TapPrefix    = "10.0.0.1/30" // host (tap0) side of the /30 inside the netns
+	AppPort      = 8080          // the :8080 contract (spec §2)
+	TenantBridge = "br-tenants"  // root-ns bridge the veth host-side enslaves to
 	// nft chain-policy words (ADR-031). Forwarded as the `policy`
 	// value in the per-netns forward-chain argv, so goconst demands
 	// the literals live in named constants.
@@ -41,15 +41,15 @@ var DefaultHostBridgeIP = netip.MustParseAddr("10.100.0.1")
 //	                                  │  (veth pair)
 //	netns fc-<instance>:  vethPeer(10.100.x.y/16) ── [route/DNAT] ── tap0(10.0.0.1) ── guest(10.0.0.2)
 type Config struct {
-	Instance   string     // instance id
-	Netns      string     // fc-<instance>
-	Tap        string     // tap0 (identical in every netns)
-	VethHost   string     // root-ns end, enslaved to br-tenants
-	VethPeer    string     // netns end, holds HostIP
-	HostIP      netip.Addr // routable identity, 10.100.x.y
+	Instance     string     // instance id
+	Netns        string     // fc-<instance>
+	Tap          string     // tap0 (identical in every netns)
+	VethHost     string     // root-ns end, enslaved to br-tenants
+	VethPeer     string     // netns end, holds HostIP
+	HostIP       netip.Addr // routable identity, 10.100.x.y
 	HostBridgeIP netip.Addr // root-ns bridge IP the netns default-routes through (HostBridgeCIDR/.1). Defaults to DefaultHostBridgeIP (10.100.0.1); multi-host deployments override per-host.
-	HostBits    int        // prefix length for HostIP (16)
-	EgressMbit int        // per-plan egress cap via tc on VethHost; 0 = no cap (legacy / disabled)
+	HostBits     int        // prefix length for HostIP (16)
+	EgressMbit   int        // per-plan egress cap via tc on VethHost; 0 = no cap (legacy / disabled)
 	// DenySet is the typed egress denylist applied at the per-netns
 	// forward chain. Defaults to NewDefaultDenySet() when zero
 	// (pkg/fcvm/manager.go::Wake does not set it; the renderer falls
@@ -106,14 +106,14 @@ func NewConfig(instance, netnsName, vethHost, vethPeer string, hostIP netip.Addr
 // commands silently fail when the route points at an invalid gateway.
 func NewConfigWithBridge(instance, netnsName, vethHost, vethPeer string, hostIP, bridgeIP netip.Addr) Config {
 	return Config{
-		Instance:    instance,
-		Netns:       netnsName,
-		Tap:         "tap0",
-		VethHost:    vethHost,
-		VethPeer:    vethPeer,
-		HostIP:      hostIP,
+		Instance:     instance,
+		Netns:        netnsName,
+		Tap:          "tap0",
+		VethHost:     vethHost,
+		VethPeer:     vethPeer,
+		HostIP:       hostIP,
 		HostBridgeIP: bridgeIP,
-		HostBits:    16,
+		HostBits:     16,
 	}
 }
 

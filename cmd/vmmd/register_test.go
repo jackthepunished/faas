@@ -442,7 +442,7 @@ func TestDetectOverlayIP_PrefersCIDRMatch(t *testing.T) {
 	got, err := detectOverlayIP(context.Background(), OverlayDetector{
 		TailscaleBinaryPath: "/nonexistent-but-not-looked-up",
 		PreferCIDR:          netip.MustParsePrefix("100.64.0.0/10"),
-		Run: func(_ context.Context) ([]byte, error) { return stub, nil },
+		Run:                 func(_ context.Context) ([]byte, error) { return stub, nil },
 	})
 	if err != nil {
 		t.Fatalf("detectOverlayIP: %v", err)
