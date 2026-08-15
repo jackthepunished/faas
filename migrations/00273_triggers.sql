@@ -125,10 +125,12 @@ END$$;
 
 -- E) pg_notify trigger (analog to invocation_due).
 --
--- Drop+recreate the function so the second apply on a drifted DB
--- (function present, schema stale) lands on the same final shape.
--- CREATE OR REPLACE alone would fail with SQLSTATE 42P13 (parameter
--- names changed) on a drifted DO-box; DROP + CREATE is unconditional.
+-- PG15 has no CREATE TRIGGER IF NOT EXISTS — drop and recreate (per
+-- trigger-replay-safety-drop-before-create). The trigger must be
+-- dropped BEFORE the function it depends on; otherwise the DROP
+-- FUNCTION tripwires SQLSTATE 2BP01 "cannot drop function ... other
+-- objects depend on it".
+DROP TRIGGER IF EXISTS trigger_ready_notify ON trigger_records;
 DROP FUNCTION IF EXISTS trg_notify_trigger_ready();
 
 CREATE OR REPLACE FUNCTION trg_notify_trigger_ready() RETURNS trigger AS $$
@@ -140,9 +142,6 @@ BEGIN
     RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
--- PG15 has no CREATE TRIGGER IF NOT EXISTS — drop and recreate (per
--- trigger-replay-safety-drop-before-create).
-DROP TRIGGER IF EXISTS trigger_ready_notify ON trigger_records;
 CREATE TRIGGER trigger_ready_notify
     AFTER INSERT ON trigger_records
     FOR EACH ROW EXECUTE FUNCTION trg_notify_trigger_ready();
