@@ -53,16 +53,6 @@ table inet faas {
     ip6 daddr fe80::/10 counter name "drop_v6_fe80___10" drop
     ip6 daddr ff00::/8 counter name "drop_v6_ff00___8" drop
 {%- if overlay_cidrs is defined and overlay_cidrs %}
-    # Mega-PR-B Commit 2 — per-overlay accept rules (multi-host mesh
-    # safe). Each OverlayCIDRs entry produces one rule AFTER the
-    # per-CIDR deny block and BEFORE the broad bridged-tenant allow,
-    # so lateral-movement protection (the §11 denylist) is preserved
-    # AND bridge-to-overlay mesh traffic reaches compute peers. The
-    # Go renderer (pkg/netns/policy.go::HostPolicy.Render) PANICS if
-    # any overlay CIDR is a subset of a deny entry; operators must
-    # pick a public-range overlay (RFC1918 / CGNAT / ULA / link-local
-    # are all in the §11 deny set). Single-host deployments leave
-    # overlay_cidrs unset -> zero rules -> byte-identical output.
 {%- for cidr in overlay_cidrs %}
     ip saddr {{ cidr }} accept
 {%- endfor %}

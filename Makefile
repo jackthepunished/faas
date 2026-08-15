@@ -465,41 +465,27 @@ egress-render: ## (re)generate the host nft ruleset artifact from pkg/netns/poli
 # This mirrors what cmd/e2e/sec11_sweep_test.go's
 # TestSec11_PerHostEgressTemplating does.
 .PHONY: egress-render-cross-check
-egress-render-cross-check: ## Diff the Go render against the Jinja2 template render for default values
-	@bash -c 'set -e; status=0; \
-	  go_out=$$(go run ./cmd/faas-nft-render | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	  jinja_out=$$(python3 -c "from jinja2 import Template; print(Template(open(\"$(EGRESS_JINJA2)\").read()).render(public_iface=\"eth0\", masquerade_cidr=\"10.100.0.0/16\"), end=\"\")" | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	  if [ "$$go_out" != "$$jinja_out" ]; then \
-	    echo "egress-render-cross-check: Go render and Jinja2 render DIVERGE for default values"; \
-	    diff <(echo "$$go_out") <(echo "$$jinja_out") || true; \
-	    status=1; \
-	  else \
-	    echo "egress-render-cross-check: Go render and Jinja2 render byte-identical for eth0/10.100.0.0/16"; \
-	  fi; \
-	  exit $$status'
+egress-render-cross-check: ## Diff the Go render against the Jinja2 template render for {default-local, mesh, hetzner} inputs
+	@bash scripts/egress-render-cross-check.sh $(CURDIR)
 
 # CI matrix (ADR-055): exercise the renderer for a non-default
 # public_iface to confirm the substitution path works under the
 # test rig. The Jinja2 template is rendered with the same value
 # and the two MUST match. This is the load-bearing contract for
 # a Hetzner compute node on `ens5`.
+#
+# Mega-PR-C: the matrix now exercises the overlay + v6 branches
+# too. The 5-row shape (default-local, mesh-overlay, mesh-overlay-v6,
+# hetzner-ens5, multi-overlay) is the canonical input space the
+# Ansible host_vars can carry; a future Hetzner multi-host fleet
+# populates overlay_cidrs with the per-box /14 slices and
+# masquerade_cidr_v6 with the ULA pool. The script
+# `scripts/egress-render-cross-check.sh` is the shared body —
+# keeping the row table in one place avoids the cross-check and
+# matrix diverging over time.
 .PHONY: egress-render-matrix
-egress-render-matrix: ## Render + cross-check for {eth0, ens5} public_iface variants
-	@bash -c 'set -e; status=0; \
-	  for iface in eth0 ens5; do \
-	    for cidr in 10.100.0.0/16 10.101.0.0/16; do \
-	      go_out=$$(FAAS_PUBLIC_IFACE=$$iface FAAS_MASQUERADE_CIDR=$$cidr go run ./cmd/faas-nft-render | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	      jinja_out=$$(python3 -c "from jinja2 import Template; print(Template(open(\"$(EGRESS_JINJA2)\").read()).render(public_iface=\"$$iface\", masquerade_cidr=\"$$cidr\"), end=\"\")" | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	      if [ "$$go_out" != "$$jinja_out" ]; then \
-	        echo "egress-render-matrix: DIVERGE for iface=$$iface cidr=$$cidr"; \
-	        diff <(echo "$$go_out") <(echo "$$jinja_out") || true; \
-	        status=1; \
-	      else \
-	        echo "egress-render-matrix: OK iface=$$iface cidr=$$cidr"; \
-	      fi; \
-	    done; \
-	  done; \
-	  exit $$status'
+egress-render-matrix: ## Render + cross-check 5-row matrix (default-local, mesh-overlay, mesh-overlay-v6, hetzner-ens5, multi-overlay)
+	@bash scripts/egress-render-cross-check.sh $(CURDIR)
 
 .PHONY: egress-check
 egress-check: egress-render-cross-check ## Cross-check the Go render against the Jinja2 template + nft -c -f if available + bridge-name guard test
