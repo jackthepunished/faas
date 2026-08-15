@@ -37,6 +37,14 @@ import (
 // on the listener side.
 var ErrNodeVerifierCNMismatch = errors.New("wire: peer CN not in compute_node registry")
 
+// ErrCertFingerprintNotRegistered is returned by
+// PGNodeVerifier.CertFingerprintByCN (PR-3) when the CN is unknown
+// or the cert_fingerprint column is empty (pre-PR-X box). The
+// doctor (PR-4) uses this as a sentinel to surface
+// `Boot/<n>× CertFingerprintNotRegistered` as a single failure
+// mode; consumers must errors.Is this sentinel.
+var ErrCertFingerprintNotRegistered = errors.New("wire: cert fingerprint not registered for CN")
+
 // NodeVerifier is the handshake-layer CN-binding seam. The stdlib TLS
 // verifier (chain/SAN/EKU) runs first in the same pass; this hook is
 // invoked AFTER stdlib trust succeeds, so the verifier augments

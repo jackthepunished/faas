@@ -55,11 +55,18 @@ type NodeLoader interface {
 
 // NodeRow is the minimal projection of compute_nodes needed by the
 // verifier: the leaf-CN (== per-daemon identity from the leaf cert
-// and == compute_nodes.name) and the compute_nodes.id (UUID) for
-// diagnostics.
+// and == compute_nodes.name), the compute_nodes.id (UUID) for
+// diagnostics, and the cert fingerprint (sha256:<64hex> of the
+// leaf cert) — PR-3 widening. The fingerprint is the join key
+// the doctor (PR-4) uses to validate the running TLS leaf matches
+// the registered one; PR-3 reads it but does not consume it on
+// the handshake path (a missing fingerprint returns "" — the
+// doctor surfaces this as a separate `Boot/<n>× CertFingerprintNotRegistered`
+// issue, not as a handshake failure).
 type NodeRow struct {
-	CN string // matches Subject.CommonName on the registered leaf (== compute_nodes.name)
-	ID string // compute_nodes.id (uuid); for diagnostics only
+	CN              string // matches Subject.CommonName on the registered leaf (== compute_nodes.name)
+	ID              string // compute_nodes.id (uuid); for diagnostics only
+	CertFingerprint string // compute_nodes.cert_fingerprint (sha256:<64hex>); empty if unset
 }
 
 // ComputeNodeKeysPayload is the literal pg_notify payload string
@@ -75,9 +82,18 @@ const ComputeNodeKeysPayload = "compute_node_keys"
 // (covering both compute_nodes AND compute_node_keys per migration
 // 00075's broader trigger). The snapshot is read on every handshake;
 // the read path takes RLock, so concurrent dials don't serialize.
+//
+// PR-3 widening: the snapshot now also carries the cert fingerprint
+// (sha256:<64hex> of the leaf cert) per CN. The handshake path
+// (LookupCN) still only consults the CN→ID map; the fingerprint
+// is read via CertFingerprintByCN by the doctor (PR-4) and the
+// secrets-init path (PR-X). The extra field doesn't widen the
+// hot path — the loader already loads one row per CN; the cert
+// column is in the same SELECT.
 type PGNodeVerifier struct {
 	mu     sync.RWMutex
-	snap   map[string]string // cn (== name) -> id
+	snap   map[string]string      // cn (== name) -> id
+	fps    map[string]string      // cn (== name) -> cert fingerprint; PR-3 widening
 	loader NodeLoader
 	log    *slog.Logger
 }
@@ -89,6 +105,7 @@ type PGNodeVerifier struct {
 func NewPGNodeVerifier(loader NodeLoader, log *slog.Logger) *PGNodeVerifier {
 	return &PGNodeVerifier{
 		snap:   make(map[string]string),
+		fps:    make(map[string]string),
 		loader: loader,
 		log:    log,
 	}
@@ -115,6 +132,39 @@ func (v *PGNodeVerifier) LookupCN(cn string) error {
 	}
 	_ = id // retained for an id-discriminating policy; today unused
 	return nil
+}
+
+// CertFingerprintByCN returns the registered sha256:<64hex> leaf-cert
+// fingerprint for the given CN (== compute_nodes.name). Used by the
+// doctor (PR-4) to validate the running TLS leaf matches the
+// registered one, and by the secrets-init path (PR-X) to detect a
+// freshly-rotated cert.
+//
+// Returns ("", ErrCertFingerprintNotRegistered) when:
+//   - the CN isn't in the snapshot at all (compute_nodes row missing
+//     or inactive), OR
+//   - the CN is registered but the fingerprint column is empty
+//     (pre-PR-X box; the secrets init hasn't run yet).
+//
+// The two cases are conflated deliberately — the doctor's caller is
+// either going to ignore the fingerprint entirely (a missing-row CN
+// is also a missing-handshake-CN) or it will surface
+// `Boot/<n>× CertFingerprintNotRegistered` as the single failure
+// mode. Splitting them would force the doctor to do its own
+// membership check first.
+//
+// nil receiver returns ("", ErrCertFingerprintNotRegistered).
+func (v *PGNodeVerifier) CertFingerprintByCN(cn string) (string, error) {
+	if v == nil {
+		return "", ErrCertFingerprintNotRegistered
+	}
+	v.mu.RLock()
+	fp, ok := v.fps[cn]
+	v.mu.RUnlock()
+	if !ok || fp == "" {
+		return "", ErrCertFingerprintNotRegistered
+	}
+	return fp, nil
 }
 
 // Refresh swaps the snapshot for a fresh load. Errors keep the
@@ -149,6 +199,7 @@ func (v *PGNodeVerifier) Refresh(ctx context.Context) (int, error) {
 		return v.Size(), fmt.Errorf("wire: load nodes: %w", err)
 	}
 	fresh := make(map[string]string, len(rows))
+	freshFP := make(map[string]string, len(rows))
 	for _, r := range rows {
 		if r.CN == "" {
 			// Skip malformed rows (defensive: an empty CN would
@@ -156,14 +207,16 @@ func (v *PGNodeVerifier) Refresh(ctx context.Context) (int, error) {
 			continue
 		}
 		fresh[r.CN] = r.ID
+		freshFP[r.CN] = r.CertFingerprint
 	}
 	v.mu.Lock()
 	prior := v.snap
-	if snapshotEqual(prior, fresh) {
-		// Heartbeat-only refresh: same CN set, same IDs. Don't
-		// swap (publishing an unchanged snapshot would still
-		// trigger downstream log/snapshot churn), but keep the
-		// map identity intact so equality semantics stay stable.
+	if snapshotEqual(prior, fresh) && fingerprintsEqual(v.fps, freshFP) {
+		// Heartbeat-only refresh: same CN set, same IDs, same
+		// fingerprints. Don't swap (publishing an unchanged
+		// snapshot would still trigger downstream log/snapshot
+		// churn), but keep the map identity intact so equality
+		// semantics stay stable.
 		v.mu.Unlock()
 		if v.log != nil {
 			v.log.Debug("wire: node verifier snapshot unchanged, skipping swap",
@@ -172,6 +225,7 @@ func (v *PGNodeVerifier) Refresh(ctx context.Context) (int, error) {
 		return len(fresh), nil
 	}
 	v.snap = fresh
+	v.fps = freshFP
 	v.mu.Unlock()
 	if v.log != nil {
 		v.log.Info("wire: node verifier snapshot refreshed",
@@ -200,6 +254,11 @@ func (v *PGNodeVerifier) Size() int {
 // The read path takes RLock; the returned slice is a fresh
 // allocation that does NOT alias the verifier's internal map, so
 // the caller can mutate it freely. nil-receiver returns nil.
+//
+// PR-3 widening: CertFingerprint is included in the published rows.
+// Pre-PR-3 boxes that don't have a registered fingerprint will
+// publish rows with an empty CertFingerprint — callers must tolerate
+// this (the doctor surfaces it as a separate failure mode).
 func (v *PGNodeVerifier) PublishSnapshot() []NodeRow {
 	if v == nil {
 		return nil
@@ -207,7 +266,7 @@ func (v *PGNodeVerifier) PublishSnapshot() []NodeRow {
 	v.mu.RLock()
 	out := make([]NodeRow, 0, len(v.snap))
 	for cn, id := range v.snap {
-		out = append(out, NodeRow{CN: cn, ID: id})
+		out = append(out, NodeRow{CN: cn, ID: id, CertFingerprint: v.fps[cn]})
 	}
 	v.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].CN < out[j].CN })
@@ -223,6 +282,23 @@ func snapshotEqual(a, b map[string]string) bool {
 	}
 	for cn, id := range a {
 		if bID, ok := b[cn]; !ok || bID != id {
+			return false
+		}
+	}
+	return true
+}
+
+// fingerprintsEqual reports whether two cn->fingerprint maps are
+// identical (same CN set, same fingerprints per CN). Empty maps
+// are equal. PR-3 helper for the heartbeat-only short-circuit —
+// fingerprint changes (a cert rotation by secrets init) must still
+// trigger a snapshot swap.
+func fingerprintsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for cn, fp := range a {
+		if bFP, ok := b[cn]; !ok || bFP != fp {
 			return false
 		}
 	}
