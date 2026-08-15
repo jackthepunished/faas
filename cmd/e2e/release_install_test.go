@@ -76,9 +76,9 @@ func TestReleaseInstall_RoundTrip(t *testing.T) {
 	// Drive the CLI as a subprocess so we exercise the public
 	// surface (not the in-process Go functions). This catches
 	// CLI-only regressions (flag.Parse wiring, exit codes).
-	gregaleBin := buildGregale(t)
+	gregalectlBin := buildGregaleCtl(t)
 	runCmd := func(args ...string) (int, string, string) {
-		cmd := exec.Command(gregaleBin, args...)
+		cmd := exec.Command(gregalectlBin, args...)
 		cmd.Env = append(os.Environ(), "FAAS_PG_DSN="+dsn)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -260,14 +260,14 @@ func TestReleaseInstall_RoundTrip(t *testing.T) {
 	}
 }
 
-// buildGregale builds ./cmd/gregale into a temp binary and returns
-// its path. Cached across the test binary's lifetime by the
-// harness's TestMain in the e2e package, but this helper is a
-// safety net for tests that don't share a TestMain.
-func buildGregale(t *testing.T) string {
+// buildGregaleCtl builds ./cmd/gregalectl (the operator-side CLI,
+// PR-6.5) into a temp binary. Kept as a per-test build rather than
+// a TestMain cache to dodge the pre-existing harness's tight
+// coupling to the apid/vmmd pair.
+func buildGregaleCtl(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "gregale")
+	bin := filepath.Join(dir, "gregalectl")
 	wd, _ := os.Getwd()
 	root := wd
 	for i := 0; i < 8; i++ {
@@ -276,13 +276,13 @@ func buildGregale(t *testing.T) string {
 		}
 		root = filepath.Dir(root)
 	}
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/gregale")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd/gregalectl")
 	cmd.Dir = root
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("go build gregale: %v\n%s", err, out.String())
+		t.Fatalf("go build gregalectl: %v\n%s", err, out.String())
 	}
 	return bin
 }

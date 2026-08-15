@@ -294,39 +294,16 @@ func run(args []string) int {
 		return cmdWebhooks(args[1:])
 	case "keys":
 		return cmdKeys(args[1:])
-	case dispatchSignKeys:
-		return cmdSignKeys(args[1:])
-	case dispatchNodeKey:
-		// ADR-053 — operator-side provisioning for the per-node
-		// CapacityReport signing keypair. Mirrors sign-keys shape
-		// (init|rotate|status) but writes /etc/faas/secrets/vmmd/
-		// {node.key (0400 root:root), node.pub (0444)} and prints
-		// the key_id (SHA-256 hex of the SPKI) at init time so an
-		// operator can confirm the same value schedd will register.
-		return cmdNodeKey(args[1:])
 	case dispatchTrustedPublishers:
 		// Issue #472 / ADR-054 — operator CLI for the per-app
 		// cosign trusted-publisher list. Admin API key required;
 		// every leaf calls authedClient() and hits apid. The
-		// sibling operator surface `sign-keys` (above) hits the
-		// local fs, never apid.
+		// operator-only surfaces (sign-keys, node-key, pki,
+		// host-age, manifest, release, backup) moved to
+		// `gregalectl` in PR-6.5 — this is the only operator verb
+		// that stayed in `gregale` because it's a customer/admin
+		// API surface.
 		return cmdTrustedPublishers(args[1:])
-	case dispatchHostAge:
-		// Operator-side host.age rotation (issue #316 / ADR-057).
-		// Same operator-only surface as sign-keys / pki: every
-		// leaf is a local fs operation against /etc/faas/secrets/.
-		// Sibling — never reuse the `keys` namespace (that's the
-		// customer API-key manager in commands2.go::cmdKeys which
-		// hits apid via authedClient()).
-		return cmdHostAge(args[1:])
-	case dispatchBackup:
-		return cmdBackup(args[1:])
-	case dispatchPKI:
-		// Operator-side local-dev PKI bootstrap (ADR-052). Issues
-		// /etc/faas/tls/{ca,<daemon>/} material for multi-box mTLS.
-		// Distinct from sign-keys because the trust root is the CA,
-		// not the per-box cosign keypair.
-		return cmdPKI(args[1:])
 	case "secrets":
 		return cmdSecrets(args[1:])
 	case "github-webhook-secret":
@@ -422,23 +399,6 @@ func run(args []string) int {
 		// above the plan's included GB-h). schedd refuses new wakes
 		// once the cap is hit.
 		return cmdOverageCap(args[1:])
-	case "manifest":
-		// Issue #911 / ADR-110: operator-side manifest loader.
-		// `gregale manifest validate --file=PATH` runs the
-		// canonical validator (pkg/manifest/Validate); PR-2 ships
-		// `manifest render --manifest-file=PATH` (pkg/renderer.Render).
-		// The install path lives under `gregale release install`
-		// (PR-3), not `manifest install`.
-		// The dispatcher is cmdManifestDispatch in commands_manifest.go.
-		return cmdManifestDispatch(args[1:])
-	case "release":
-		// Issue #911 / ADR-110: cluster-shipped release bundle
-		// (PR-3). `gregale release bundle` materialises the
-		// daemon-binary bundle and INSERTs into release_bundles;
-		// `gregale release install` flips the local
-		// /opt/faas/current symlink + stamps applied_at. The
-		// dispatcher is cmdReleaseDispatch in commands_release.go.
-		return cmdReleaseDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1

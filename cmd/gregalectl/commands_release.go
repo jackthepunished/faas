@@ -1,13 +1,13 @@
 // commands_release.go — operator-side CLI for the cluster-shipped
 // release bundle (issue #911 / ADR-110).
 //
-// `gregale release` is the operator surface that materialises a
+// `gregalectl release` is the operator surface that materialises a
 // release bundle from a pre-built bin directory and installs it on
 // the local box. The two subcommands map to the two halves of
 // PR-3:
 //
-//   gregale release bundle --bin-dir PATH --git-sha SHA --manifest-hash HASH
-//   gregale release install --git-sha SHA [--releases-root PATH] [--node NAME]
+//   gregalectl release bundle --bin-dir PATH --git-sha SHA --manifest-hash HASH
+//   gregalectl release install --git-sha SHA [--releases-root PATH] [--node NAME]
 //
 // Dispatcher shape mirrors commands_manifest.go:
 // flag.Parse for the leaf's own flags, subcommand fan-out in
@@ -17,7 +17,7 @@
 // OUT of scope: PR-3 only flips the symlink + writes the
 // release_bundles row + stamps the first-write-wins applied_at.
 // The operator runs the deterministic build target out-of-band and
-// hands `gregale release bundle` the resulting bin directory.
+// hands `gregalectl release bundle` the resulting bin directory.
 
 package main
 
@@ -57,13 +57,13 @@ func cmdReleaseDispatch(args []string) int {
 		printReleaseUsage(os.Stderr)
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "gregale release: unknown subcommand %q (expected: bundle | install)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl release: unknown subcommand %q (expected: bundle | install)\n", args[0])
 		return 1
 	}
 }
 
 func printReleaseUsage(w io.Writer) {
-	_, _ = fmt.Fprintf(w, `usage: gregale release <subcommand> [flags]
+	_, _ = fmt.Fprintf(w, `usage: gregalectl release <subcommand> [flags]
 
 Subcommands:
   bundle    Materialise a release bundle from a pre-built bin directory.
@@ -90,9 +90,9 @@ Exit codes:
   3  platform/infra (file missing, DB unreachable, symlink target invalid)
 
 Examples:
-  gregale release bundle --bin-dir=out/bin --git-sha=$(git rev-parse HEAD) \
+  gregalectl release bundle --bin-dir=out/bin --git-sha=$(git rev-parse HEAD) \
       --manifest-hash=sha256:$(sha256sum manifest.yaml | cut -d' ' -f1)
-  gregale release install --git-sha=$(git rev-parse HEAD)
+  gregalectl release install --git-sha=$(git rev-parse HEAD)
 `)
 }
 
@@ -106,7 +106,7 @@ Examples:
 // the git_sha + manifest_hash that go with it.
 func cmdReleaseBundle(args []string) int {
 	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
-		PrintUsage(os.Stderr, "usage: gregale release bundle --bin-dir PATH --git-sha SHA --manifest-hash HASH", "release")
+		PrintUsage(os.Stderr, "usage: gregalectl release bundle --bin-dir PATH --git-sha SHA --manifest-hash HASH", "release")
 		return 0
 	}
 	fs := flag.NewFlagSet("release bundle", flag.ContinueOnError)
@@ -119,7 +119,7 @@ func cmdReleaseBundle(args []string) int {
 		return 1
 	}
 	if *binDir == "" || *gitSHA == "" || *manifestHash == "" {
-		_, _ = fmt.Fprintln(os.Stderr, "gregale release bundle: --bin-dir, --git-sha, and --manifest-hash are required")
+		_, _ = fmt.Fprintln(os.Stderr, "gregalectl release bundle: --bin-dir, --git-sha, and --manifest-hash are required")
 		return 1
 	}
 	// Validate git_sha / manifest_hash shape BEFORE touching the
@@ -130,7 +130,7 @@ func cmdReleaseBundle(args []string) int {
 		GitSHA:        *gitSHA,
 		ManifestHash:  *manifestHash,
 	}); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release bundle: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: %v\n", err)
 		return 1
 	}
 
@@ -138,25 +138,25 @@ func cmdReleaseBundle(args []string) int {
 	// directory walks the same paths the verifier (PR-4) will.
 	absBin, err := filepath.Abs(*binDir)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release bundle: resolve bin-dir: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: resolve bin-dir: %v\n", err)
 		return 3
 	}
 	if _, err := os.Stat(absBin); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release bundle: bin-dir: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: bin-dir: %v\n", err)
 		return 3
 	}
 	if err := copyBinIntoRelease(*releasesRoot, *gitSHA, absBin); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release bundle: stage bin: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: stage bin: %v\n", err)
 		return 3
 	}
 	now := time.Now().UTC()
 	m, err := releaseinstall.Build(*releasesRoot, *gitSHA, *manifestHash, now)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release bundle: build manifest: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: build manifest: %v\n", err)
 		return 1
 	}
 	if err := releaseinstall.Write(*releasesRoot, m); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release bundle: write manifest: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: write manifest: %v\n", err)
 		return 3
 	}
 	// INSERT into release_bundles. If the DB is unreachable, we
@@ -183,7 +183,7 @@ func cmdReleaseBundle(args []string) int {
 	store := releaseinstall.NewStore(pool)
 	id, err := store.Insert(context.Background(), releaseinstall.FromManifest(m))
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release bundle: insert release_bundles: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: insert release_bundles: %v\n", err)
 		return 3
 	}
 	if jsonEnabled() {
@@ -241,7 +241,7 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 // table.
 func cmdReleaseInstall(args []string) int {
 	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
-		PrintUsage(os.Stderr, "usage: gregale release install --git-sha SHA", "release")
+		PrintUsage(os.Stderr, "usage: gregalectl release install --git-sha SHA", "release")
 		return 0
 	}
 	fs := flag.NewFlagSet("release install", flag.ContinueOnError)
@@ -253,7 +253,7 @@ func cmdReleaseInstall(args []string) int {
 		return 1
 	}
 	if *gitSHA == "" {
-		_, _ = fmt.Fprintln(os.Stderr, "gregale release install: --git-sha is required")
+		_, _ = fmt.Fprintln(os.Stderr, "gregalectl release install: --git-sha is required")
 		return 1
 	}
 	// Verify the bundle on disk before flipping the symlink —
@@ -262,15 +262,15 @@ func cmdReleaseInstall(args []string) int {
 	// active release.
 	m, err := releaseinstall.Read(*releasesRoot, *gitSHA)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release install: read manifest: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: read manifest: %v\n", err)
 		return 3
 	}
 	if err := releaseinstall.Verify(*releasesRoot, m); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release install: verify manifest: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: verify manifest: %v\n", err)
 		return 3
 	}
 	if err := releaseinstall.AtomicFlip(*releasesRoot, *gitSHA); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release install: flip symlink: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: flip symlink: %v\n", err)
 		return 3
 	}
 	// DB writes — best effort. The on-disk symlink flip is the
@@ -293,7 +293,7 @@ func cmdReleaseInstall(args []string) int {
 	store := releaseinstall.NewStore(pool)
 	first, err := store.MarkApplied(context.Background(), *gitSHA)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale release install: mark applied: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: mark applied: %v\n", err)
 		return 3
 	}
 	node := *nodeName
@@ -320,7 +320,7 @@ func cmdReleaseInstall(args []string) int {
 				ComputeNodeError: cnErr.Error(),
 			})
 		} else {
-			_, _ = fmt.Fprintf(os.Stderr, "gregale release install: upsert compute_nodes: %v\n", cnErr)
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: upsert compute_nodes: %v\n", cnErr)
 		}
 		return 3
 	}
@@ -357,7 +357,7 @@ func openPgPoolFromEnv() (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// releaseBundleReport is the JSON wire shape for `gregale release
+// releaseBundleReport is the JSON wire shape for `gregalectl release
 // bundle --json`.
 type releaseBundleReport struct {
 	GitSHA       string `json:"git_sha"`
@@ -367,7 +367,7 @@ type releaseBundleReport struct {
 	DBError      string `json:"db_error,omitempty"`
 }
 
-// releaseInstallReport is the JSON wire shape for `gregale release
+// releaseInstallReport is the JSON wire shape for `gregalectl release
 // install --json`.
 type releaseInstallReport struct {
 	GitSHA       string `json:"git_sha"`

@@ -1,7 +1,7 @@
 // commands_manifest.go — operator-side CLI for the split-box
 // deployment manifest (issue #911 / ADR-110).
 //
-// `gregale manifest` is the operator surface that loads the
+// `gregalectl manifest` is the operator surface that loads the
 // deployment manifest, validates its shape, and (in later PRs)
 // renders it to /etc/faas/*.toml + systemd units + cgroup
 // subtree_control. PR-0 ships the validator only — the renderer
@@ -10,7 +10,7 @@
 //
 // Dispatcher shape (mirrors commands_sign_keys.go):
 //
-//   gregale manifest validate --file PATH [--json]
+//   gregalectl manifest validate --file PATH [--json]
 //
 // Flags are flag-package's stdlib. Output is JSON when --json
 // (matches the gregale-wide convention of `FAAS_JSON=1` /
@@ -56,13 +56,13 @@ func cmdManifestDispatch(args []string) int {
 		printManifestUsage(os.Stderr)
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "gregale manifest: unknown subcommand %q (expected: validate, render)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl manifest: unknown subcommand %q (expected: validate, render)\n", args[0])
 		return 1
 	}
 }
 
 func printManifestUsage(w io.Writer) {
-	_, _ = fmt.Fprintf(w, `usage: gregale manifest <subcommand> [flags]
+	_, _ = fmt.Fprintf(w, `usage: gregalectl manifest <subcommand> [flags]
 
 Subcommands:
   validate    Validate a manifest YAML file (canonical path: pkg/manifest.Validate)
@@ -95,9 +95,9 @@ Exit codes:
      or unsupported schema_version).
 
 Examples:
-  gregale manifest validate --file=deploy/manifest/examples/splitbox.example.yaml
-  gregale manifest validate --file=splitbox.yaml --json
-  gregale manifest render --manifest-file=splitbox.yaml --host=fsn-1 --dry-run --json
+  gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml
+  gregalectl manifest validate --file=splitbox.yaml --json
+  gregalectl manifest render --manifest-file=splitbox.yaml --host=fsn-1 --dry-run --json
 `)
 }
 
@@ -109,7 +109,7 @@ Examples:
 // "manifest is broken" from "we can't even read the file".
 func cmdManifestValidate(args []string) int {
 	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
-		PrintUsage(os.Stderr, "usage: gregale manifest validate --file PATH", "manifest")
+		PrintUsage(os.Stderr, "usage: gregalectl manifest validate --file PATH", "manifest")
 		return 0
 	}
 	fs := flag.NewFlagSet("manifest validate", flag.ContinueOnError)
@@ -119,7 +119,7 @@ func cmdManifestValidate(args []string) int {
 		return 1
 	}
 	if *filePath == "" {
-		_, _ = fmt.Fprintln(os.Stderr, "gregale manifest validate: --file is required")
+		_, _ = fmt.Fprintln(os.Stderr, "gregalectl manifest validate: --file is required")
 		return 1
 	}
 	m, err := manifest.Load(*filePath)
@@ -138,7 +138,7 @@ func cmdManifestValidate(args []string) int {
 				Load:  err.Error(),
 			})
 		} else {
-			_, _ = fmt.Fprintf(os.Stderr, "gregale manifest validate: %s: %v\n", *filePath, err)
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl manifest validate: %s: %v\n", *filePath, err)
 		}
 		return 3
 	}
@@ -176,7 +176,7 @@ func cmdManifestValidate(args []string) int {
 	return 1
 }
 
-// manifestReport is the JSON wire shape for `gregale manifest validate
+// manifestReport is the JSON wire shape for `gregalectl manifest validate
 // --json`. Mirrors the load failure shape so a single jq pattern
 // (`-r '.errors[]? | "\(.path): \(.message)"'`) handles both valid
 // and invalid runs.
@@ -197,7 +197,7 @@ type manifestReport struct {
 func jsonEmit(w io.Writer, v interface{}) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregale manifest: marshal: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl manifest: marshal: %v\n", err)
 		return
 	}
 	_, _ = fmt.Fprintln(w, string(b))
@@ -227,7 +227,7 @@ func catalogHostKeys() []string {
 // cgroup write failed, manifest.toml placement rejected, etc.).
 func cmdManifestRender(args []string) int {
 	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
-		PrintUsage(os.Stderr, "usage: gregale manifest render --manifest-file PATH [--host NAME] [--dry-run] [--json]", "manifest")
+		PrintUsage(os.Stderr, "usage: gregalectl manifest render --manifest-file PATH [--host NAME] [--dry-run] [--json]", "manifest")
 		return 0
 	}
 	fs := flag.NewFlagSet("manifest render", flag.ContinueOnError)
@@ -245,7 +245,7 @@ func cmdManifestRender(args []string) int {
 		return 1
 	}
 	if *manifestFile == "" {
-		_, _ = fmt.Fprintln(os.Stderr, "gregale manifest render: --manifest-file is required")
+		_, _ = fmt.Fprintln(os.Stderr, "gregalectl manifest render: --manifest-file is required")
 		return 1
 	}
 	opts := renderer.RenderOptions{
@@ -275,7 +275,7 @@ func cmdManifestRender(args []string) int {
 				Error string `json:"error"`
 			}{*manifestFile, *host, err.Error()})
 		} else {
-			_, _ = fmt.Fprintf(os.Stderr, "gregale manifest render: %v\n", err)
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl manifest render: %v\n", err)
 		}
 		return 1
 	}

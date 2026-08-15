@@ -192,14 +192,8 @@ var cliCommands = []cliCommand{
 			{Name: "require-signed", Short: "toggle require_signed", ClosedSet: []string{"true", "false"}},
 		},
 	},
-	{
-		Name:    "backup",
-		DocSlug: "backup",
-		Short:   "Operator rclone config unseal (backup unseal-rclone)",
-		Subcommands: []cliSub{
-			{Name: "unseal-rclone", Short: "Unseal the rclone config"},
-		},
-	},
+	// operator-side "backup" verb moved to gregalectl in PR-6.5
+	// (sealed-cred rotation is an operator concern; see plan §Scope).
 	{
 		Name:    "billing",
 		DocSlug: "billing",
@@ -337,17 +331,6 @@ var cliCommands = []cliCommand{
 		DocSlug: "env",
 		Short:   "Pull/push .env <-> sealed secrets (--app <slug>)",
 		Flags:   []cliFlag{{Name: "app", Short: "app slug", Req: true}},
-	},
-	{
-		Name:    dispatchHostAge,
-		DocSlug: "host-age",
-		Short:   "Operator host.age rotation (host-age init|rotate|status|prune-previous)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise host.age"},
-			{Name: subRotate, Short: "Rotate host.age"},
-			{Name: "status", Short: "Show host.age status"},
-			{Name: "prune-previous", Short: "Prune the previous host.age key"},
-		},
 	},
 	{
 		Name:    "init",
@@ -488,72 +471,9 @@ var cliCommands = []cliCommand{
 		Positionals: []string{"<cents>"},
 	},
 	{
-		Name:    "manifest",
-		DocSlug: "manifest",
-		Short:   "Operator split-box deployment manifest (manifest validate|render; issue #911 / ADR-110)",
-		Subcommands: []cliSub{
-			{
-				Name:  "validate",
-				Short: "Validate a manifest YAML file (canonical path: pkg/manifest.Validate)",
-				Flags: []cliFlag{{Name: "file", Short: "path to the manifest YAML file (required)"}},
-			},
-			{
-				Name:  "render",
-				Short: "Render a validated manifest to /etc/faas/*.toml + systemd units + cgroup subtree_control + PKI leaves (canonical path: pkg/renderer.Render)",
-				Flags: []cliFlag{
-					{Name: "manifest-file", Short: "path to the manifest YAML file (required)", Req: true},
-					{Name: "host", Short: "host in the manifest to render (default: first host)"},
-					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
-					{Name: "etc-faas-dir", Short: "TOML root (default /etc/faas)"},
-					{Name: "systemd-dir", Short: "systemd unit tree (default /etc/systemd/system)"},
-					{Name: "pki-root-dir", Short: "PKI root (default /etc/faas/tls)"},
-					{Name: "cgroup-root", Short: "cgroup v2 mount root (default /sys/fs/cgroup)"},
-					{Name: "host-san-file", Short: "optional JSON file with per-host SANs"},
-					{Name: "dry-run", Short: "compute outputs but do not write"},
-				},
-			},
-		},
-	},
-	{
-		Name:    "release",
-		DocSlug: "release",
-		Short:   "Cluster-shipped release bundle (release bundle|install --git-sha SHA; PR-3 / ADR-110)",
-		Subcommands: []cliSub{
-			{
-				Name:  "bundle",
-				Short: "Materialise a release bundle from a pre-built bin directory and INSERT into release_bundles",
-				Flags: []cliFlag{
-					{Name: "bin-dir", Short: "path to daemon binaries directory (required)", Req: true},
-					{Name: "git-sha", Short: "40-char lowercase hex git SHA (required)", Req: true},
-					{Name: "manifest-hash", Short: "manifest hash as 'sha256:<64hex>' (required)", Req: true},
-					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
-				},
-			},
-			{
-				Name:  "install",
-				Short: "Install a release on the local box (atomic symlink flip + applied_at first-write-wins stamp)",
-				Flags: []cliFlag{
-					{Name: "git-sha", Short: "40-char lowercase hex git SHA to install (required)", Req: true},
-					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
-					{Name: "node", Short: "compute_nodes.name to stamp (default: hostname)"},
-				},
-			},
-		},
-	},
-	{
 		Name:    "park",
 		DocSlug: "park-wake",
 		Short:   "Park an app cold (kill all live instances)",
-	},
-	{
-		Name:    dispatchPKI,
-		DocSlug: "pki",
-		Short:   "Operator local-dev PKI bootstrap (pki init|status|rotate)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise the local PKI"},
-			{Name: statusLiteral, Short: "Show PKI status"},
-			{Name: subRotate, Short: "Rotate the PKI"},
-		},
 	},
 	{
 		Name:      "plan",
@@ -632,34 +552,8 @@ var cliCommands = []cliCommand{
 			{Name: "set", Short: "Rotate the secret for one installation_id"},
 		},
 	},
-	{
-		Name:    dispatchSignKeys,
-		DocSlug: "sign-keys",
-		Short:   "Provision the cosign sign keypair (operator; --sign-key / --verify-key)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise the cosign keypair"},
-			{Name: subRotate, Short: "Rotate the cosign keypair"},
-			{Name: statusLiteral, Short: "Show keypair status"},
-		},
-		Flags: []cliFlag{
-			{Name: "sign-key", Short: "path to the sign key"},
-			{Name: "verify-key", Short: "path to the verify key"},
-		},
-	},
-	{
-		Name:    dispatchNodeKey,
-		DocSlug: "node-key",
-		Short:   "Provision the per-node CapacityReport signing keypair (operator; ADR-053)",
-		Subcommands: []cliSub{
-			{Name: subNodeInit, Short: "Initialise the node signing keypair"},
-			{Name: subNodeRotate, Short: "Rotate the node signing keypair"},
-			{Name: subNodeStatus, Short: "Show node keypair status"},
-		},
-		Flags: []cliFlag{
-			{Name: "node-key", Short: "path to the node signing private key"},
-			{Name: "node-key-pub", Short: "path to the node signing public key"},
-		},
-	},
+	// operator-side verbs (sign-keys, node-key) moved to gregalectl
+	// in PR-6.5; see cmd/gregale/constants.go for the dispatch consts.
 	{
 		Name:    "slo",
 		DocSlug: "slo",

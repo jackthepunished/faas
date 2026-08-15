@@ -12,7 +12,11 @@ GOARCH  ?= $(shell $(GO) env GOARCH)
 export GOOS GOARCH
 PKGS    := ./...
 COVERAGE_DIR := coverage
-DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge vmmd-stream-bridge builderd imaged meterd gregale githubd hostage-gen
+DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge vmmd-stream-bridge builderd imaged meterd githubd hostage-gen
+# gregale is the customer-facing CLI; gregalectl is the
+# operator-only companion CLI (issue #911 / ADR-110 PR-6.5).
+# Both are built into ./bin by `make build`.
+CLIS := gregale gregalectl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
@@ -25,11 +29,15 @@ help: ## List targets
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: guest-runners ## Build every daemon + function runners into ./bin
+build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
 	@mkdir -p $(BINDIR)
 	@for d in $(DAEMONS); do \
 	  echo "building $$d"; \
 	  $(GO) build -ldflags '$(LDFLAGS)' -o $(BINDIR)/$$d ./cmd/$$d || exit 1; \
+	done
+	@for c in $(CLIS); do \
+	  echo "building $$c (CLI)"; \
+	  $(GO) build -ldflags '$(LDFLAGS)' -o $(BINDIR)/$$c ./cmd/$$c || exit 1; \
 	done
 
 # Function-runner shims live in the guest at /usr/local/bin/faas-runner and

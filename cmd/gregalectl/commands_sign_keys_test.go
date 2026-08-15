@@ -6,7 +6,7 @@
 //   - sharedFlags default-force asymmetry: init defaults --force to
 //     false (refuse overwrite; an operator who re-runs `init`
 //     mid-deploy is almost certainly making a mistake), rotate
-//     defaults --force to true (a bare `gregale sign-keys rotate`
+//     defaults --force to true (a bare `gregalectl sign-keys rotate`
 //     MUST overwrite — that's the whole point of the subcommand;
 //     rotate-without-overwrite is a no-op).
 //
@@ -42,7 +42,7 @@ const (
 //
 // Asserts both the struct field (what newSignKeyFlags returns) AND
 // the flag.FlagSet's DefValue string (what the help text shows via
-// `gregale sign-keys rotate --help`). The DefValue pin catches a
+// `gregalectl sign-keys rotate --help`). The DefValue pin catches a
 // regression class that the struct-field check alone misses: a
 // future refactor that stops honouring the defaultForce argument
 // (e.g. always passes true) would still leave initFlags.force ==
@@ -55,7 +55,7 @@ func TestSignKeyFlagDefaults(t *testing.T) {
 		t.Fatal("sign-keys init must default --force to false (refuse overwrite; a mid-deploy re-init is almost certainly a mistake)")
 	}
 	if got := fsInit.Lookup("force").DefValue; got != forceDefaultFalse {
-		t.Fatalf("sign-keys init --force DefValue = %q, want %q (the help text printed by `gregale sign-keys init --help` shows this string)", got, forceDefaultFalse)
+		t.Fatalf("sign-keys init --force DefValue = %q, want %q (the help text printed by `gregalectl sign-keys init --help` shows this string)", got, forceDefaultFalse)
 	}
 
 	fsRotate, rotateFlags := newSignKeyFlags("sign-keys rotate", true)
@@ -63,7 +63,7 @@ func TestSignKeyFlagDefaults(t *testing.T) {
 		t.Fatal("sign-keys rotate must default --force to true (rotate-without-overwrite is a no-op — that's the whole point of the subcommand)")
 	}
 	if got := fsRotate.Lookup("force").DefValue; got != forceDefaultTrue {
-		t.Fatalf("sign-keys rotate --force DefValue = %q, want %q (the help text printed by `gregale sign-keys rotate --help` shows this string)", got, forceDefaultTrue)
+		t.Fatalf("sign-keys rotate --force DefValue = %q, want %q (the help text printed by `gregalectl sign-keys rotate --help` shows this string)", got, forceDefaultTrue)
 	}
 
 	fsStatus, statusFlags := newSignKeyFlags("sign-keys status", false)

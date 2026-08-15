@@ -3,7 +3,7 @@
 // of commands_backup_unseal_rclone.go (storage-box rclone.conf
 // envelope, issue #250 / ADR-056).
 //
-// The namespace is `gregale backup` and the leaf today is:
+// The namespace is `gregalectl backup` and the leaf today is:
 //
 //   - unseal-archive-creds  — decrypt a host.age-sealed
 //     `archive-creds.json` envelope using the on-box age identity
@@ -19,7 +19,7 @@
 // to /etc/faas/secrets/storage-box/box-age-key — the canonical
 // install site written by the v1 bootstrap.sh step 11d
 // (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
-// `gregale secrets init`).
+// `gregalectl secrets init`).
 //
 // The wire shape (`{endpoint, region, key_id, secret}`) is
 // read by cmd/apid/main.go::readArchiveCreds (issue #562
@@ -80,7 +80,7 @@ func newUnsealArchiveCredsFlags(name string) (*flag.FlagSet, *unsealArchiveCreds
 // and writes the plaintext to /etc/faas/secrets/storage-box/
 // archive-creds.json (mode 0400 root:root). The v1 bootstrap.sh
 // step 11d handshake (RETIRED 2026-08-15 by issue #911 / PR-1;
-// v2 path is PR-X `gregale secrets init`): the operator scp's the
+// v2 path is PR-X `gregalectl secrets init`): the operator scp's the
 // .age envelope to /root/, this command unseals it, then
 // shreds the envelope so a future host.age-key compromise
 // can't replay it.
@@ -98,7 +98,7 @@ func cmdBackupUnsealArchiveCreds(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale backup unseal-archive-creds [flags]", "backup")
+		PrintUsage(os.Stderr, "usage: gregalectl backup unseal-archive-creds [flags]", "backup")
 		return 1
 	}
 	if err := unsealArchiveCreds(f); err != nil {

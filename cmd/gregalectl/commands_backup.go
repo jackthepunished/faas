@@ -5,7 +5,7 @@
 // /etc/faas/secrets/storage-box/ paths (or caller-supplied
 // --in / --out flags). No authedClient() call, no API hit.
 //
-// The namespace is `gregale backup` with one leaf today:
+// The namespace is `gregalectl backup` with one leaf today:
 //
 //   - unseal-rclone  — decrypt a host.age-sealed `rclone.conf` envelope
 //     using the on-box age identity (box-age-key) and write the
@@ -18,7 +18,7 @@
 // The age identity path defaults to
 // /etc/faas/secrets/storage-box/box-age-key (the canonical install
 // site written by the v1 bootstrap.sh step 11d — RETIRED 2026-08-15
-// by issue #911 / PR-1; the v2 path is PR-X `gregale secrets init`).
+// by issue #911 / PR-1; the v2 path is PR-X `gregalectl secrets init`).
 // The input envelope path defaults to /root/rclone.conf.age — the
 // staging location where the operator scp's the .age envelope. Output
 // defaults to /etc/faas/secrets/storage-box/rclone.conf.
@@ -45,7 +45,7 @@ import (
 
 // Canonical install paths for off-host pg backup secrets. These
 // match the v1 bootstrap.sh step 11d staging convention (RETIRED
-// 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale secrets
+// 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregalectl secrets
 // init`) and the ansible role's stat-assert
 // (postgres_backup/tasks/main.yml).
 const (
@@ -62,7 +62,7 @@ const subUnsealRclone = "unseal-rclone"
 func cmdBackup(args []string) int {
 	parent, _ := lookupCliCommand("backup")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale backup <subcommand> [flags]\n  known subcommands: unseal-rclone, unseal-archive-creds", "backup")
+		PrintUsage(os.Stderr, "usage: gregalectl backup <subcommand> [flags]\n  known subcommands: unseal-rclone, unseal-archive-creds", "backup")
 		return 1
 	}
 	switch args[0] {
@@ -72,7 +72,7 @@ func cmdBackup(args []string) int {
 		return cmdBackupUnsealArchiveCreds(args[1:])
 	default:
 		sug, _ := suggestSubcommand(args[0], parent)
-		fmt.Fprintf(os.Stderr, "gregale backup: unknown subcommand %q (known: unseal-rclone, unseal-archive-creds)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl backup: unknown subcommand %q (known: unseal-rclone, unseal-archive-creds)\n", args[0])
 		maybeSuggestSub(sug)
 		return 1
 	}
@@ -104,8 +104,8 @@ func newUnsealRcloneFlags(name string) (*flag.FlagSet, *unsealRcloneFlags) {
 // plaintext to /etc/faas/secrets/storage-box/rclone.conf (mode
 // 0400 root:root). This is the unseal side of the v1 bootstrap.sh
 // step 11d handshake (RETIRED 2026-08-15 by issue #911 / PR-1;
-// v2 path is PR-X `gregale secrets init`): the operator scp's the
-// .age envelope to /root/, gregale backup unseal-rclone decrypts
+// v2 path is PR-X `gregalectl secrets init`): the operator scp's the
+// .age envelope to /root/, gregalectl backup unseal-rclone decrypts
 // it, then shreds the envelope so a future host.age-key compromise
 // can't replay it.
 //
@@ -120,7 +120,7 @@ func cmdBackupUnsealRclone(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale backup unseal-rclone [flags]", "backup")
+		PrintUsage(os.Stderr, "usage: gregalectl backup unseal-rclone [flags]", "backup")
 		return 1
 	}
 	if err := unsealRclone(f); err != nil {

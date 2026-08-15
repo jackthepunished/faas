@@ -1,5 +1,5 @@
 // Tests for the operator-side per-node CapacityReport signing
-// keypair CLI (`gregale node-key init|rotate|status`).
+// keypair CLI (`gregalectl node-key init|rotate|status`).
 //
 // Mirrors sign_keys_test.go's surface (commands_sign_keys.go is the
 // upstream pattern from PR #371 / ADR-038). The differences worth
@@ -46,7 +46,7 @@ func TestCmdNodeKey_NoArgs_PrintsUsage(t *testing.T) {
 		t.Errorf("cmdNodeKey(nil) = %d, want 1", code)
 	}
 	got := readStderr()
-	if !strings.Contains(got, "usage: gregale node-key") {
+	if !strings.Contains(got, "usage: gregalectl node-key") {
 		t.Errorf("stderr = %q, want usage line", got)
 	}
 	if !strings.Contains(got, "init|rotate|status") {
