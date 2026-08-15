@@ -909,6 +909,17 @@ The CSP gate is `cmd/gatewayd-internal/proxy.go::isApidPath` for `gatewayd-inter
 
 The inline `onclick="return confirm(…)"` in `pkg/dashboard/templates/account.html` was refactored to a per-page `<script nonce="…">` block using `addEventListener`. Browsers do not propagate `nonce` onto event-handler attributes, so leaving the inline handler in place would silently disable the delete-account confirm prompt the moment CSP ships.
 
+**Active-passive standby topology (ADR-083, accepted 2026-08-16):** every
+control-plane schedd cluster member carries a `StandbyState` gauge
+(`warming | warm | draining`) and the standby side redirects writes to the
+active leader. The redirection rate is exposed as
+`gatewayd_internal_write_redirect_total{outcome,auth_kind}` per ADR-083
+§"Open #2". Failure drill runbook at
+`docs/runbooks/active-passive-ha.md`; two-node Lima harness at
+`deploy/lima/faas-metal-2node-ha.yaml`. Probe timeout bounded by
+`HAFailoverProbeTimeoutMS = 500 ms` in `pkg/api/limits.go`; drain
+deadline bounded by `HADNSRecordStaleSeconds = 30`.
+
 ---
 
 ## 12. Observability and SLOs
@@ -951,6 +962,16 @@ explicitly because per-instance Prometheus cardinality is
 unbounded under the §6.2 fan-out invariant. Future scale policy
 work (#171 reaper, #169 scale-up trigger) reads from the Reader
 directly, not from Prometheus.
+
+**Per-node wake-latency surfaces:** `gateway_wake_latency_seconds` is a
+single histogram (no `{node}` label). Adding `node` would blow
+cardinality under the §6.2 invariant and would not survive the 90 s
+two-node acceptance budget. Per-node wake attribution is achieved
+*via* `wake_id` `prometheus.Exemplar` (ADR-097 P1B) — operators join the
+histogram to `pkg/wire.OpsMetrics.WakeRPCDuration{phase,app}` and to the
+`events` table on `wake_id`. The `wake_locality_host_total` (ADR-028
+v1.1, line 793) already covers host-local vs. cross-node routing
+counts at a non-cardinality-blowing granularity.
 
 `gateway_request_duration_seconds{app,class}` (ADR-042, issue #273)
 is the per-app full-request-duration histogram exposed on the
@@ -1160,8 +1181,8 @@ Conventions for all milestones: Go ≥ 1.23; integration tests that need KVM are
 | **M6** | builderd + Railpack/Dockerfile in builder VMs | `faas deploy` a bare Node and Python repo (no config) → live; OOM bomb build kills only its VM (tenant latency unaffected — measured); cache makes 2nd build ≥ 2× faster |
 | **M7** | meterd + Stripe: usage, quotas, overage, dunning; functions runtime (runner-node22, runner-node24, runner-python312, runner-python313, runner-go124, runner-go124-alpine); cron | invoice shadow equals hand-computed GB-h for a scripted 24 h scenario (< 0.1 % delta); function hello-world p95 wake < 1 s; Free-tier hard stop verified; **egress metering (ADR-046):** scripted guest egress produces a `net_tx_bytes` row whose sum equals the kernel `vethHost.rx_bytes` delta within 0 bytes, `GET /v1/usage` reflects `tx_bytes` and `net_tx_bytes`, and `billing.Provider.PushUsageRecord` is **not** called for the new columns |
 | **M7.5** | Git-deploy + thin dashboard (see `ux_spec.md` §5, §4; ADR-011/012): `githubd`/module, GitHub App, OAuth + repo picker, apps/usage/billing dashboard | push to `main` auto-deploys via the normal pipeline; commit status written back; dashboard connect-repo → live URL end-to-end; least-privilege scopes verified |
-| **M8** | Hardening + ops: §11 checklist, backups + **timed restore drill**, status page, docs site, Gate-A runbook (2nd box active-passive); UX: cold-wake transparency surfaces (`ux_spec.md` §6), account export/delete (G6) | restore drill: PG + one app back serving on a clean VM < 30 min, documented as executed; security checklist signed off item-by-item; SLO dashboard live; first-time user reaches live URL < 5 min via CLI **and** GitHub connect |
-| **M9** | Multi-box scale (ADR-025 axis 3 + ADR-066): cross-node live-instance migration, `OCIRegistryStorageBackend` end-to-end (ADR-054), per-node schedd + per-node placement (PR #509, Tier A4), Tier A6 migrating-instance watchdog (ADR-067). Two-node Lima fleet target (`make metal-lima-2node`) exercises the full four-phase handoff end-to-end. ADR-066 flips `Proposed → Accepted`. | drain a node live (`UPDATE compute_nodes SET active=false`): within `MigrateLiveLeaseSeconds` (90s) + ~5s, every RUNNING instance lands on a live peer; `select node_id, state, migrated_from_node_id from instances` shows `state='running'` + `node_id` flipped; `schedd_live_migration_decisions_total{outcome="migrated"}` increments per successful handoff; `apps.migrated_at` stamped in the same transaction as `instances.migrated_at`; `make leakcheck` zero leaked netns/TAPs/cgroups; `make test-metal` exercises the full four-phase path against the §14 source-of-truth bare-metal x86_64 control-plane node |
+| **M8** | Hardening + ops: §11 checklist, backups + **timed restore drill**, status page, docs site, Gate-A runbook (2nd box active-passive; ADR-083 active-passive standby topology, accepted 2026-08-16); UX: cold-wake transparency surfaces (`ux_spec.md` §6), account export/delete (G6) | restore drill: PG + one app back serving on a clean VM < 30 min, documented as executed; security checklist signed off item-by-item; SLO dashboard live; first-time user reaches live URL < 5 min via CLI **and** GitHub connect |
+| **M9** | Multi-box scale (ADR-025 axis 3 + ADR-066): cross-node live-instance migration, `OCIRegistryStorageBackend` end-to-end (ADR-054), per-node schedd + per-node placement (PR #509, Tier A4), Tier A6 migrating-instance watchdog (ADR-067). Two-node Lima fleet target (`make metal-lima-2node`) exercises the full four-phase handoff end-to-end. ADR-066 flips `Proposed → Accepted`. ADR cross-refs: ADR-062 (per-node schedd, accepted 2026-08-16), ADR-063 (snapshot de-localization, accepted 2026-08-16), ADR-083 (active-passive standby, accepted 2026-08-16), ADR-110 (declarative split-box manifest, accepted 2026-08-16). | drain a node live (`UPDATE compute_nodes SET active=false`): within `MigrateLiveLeaseSeconds` (90s) + ~5s, every RUNNING instance lands on a live peer; `select node_id, state, migrated_from_node_id from instances` shows `state='running'` + `node_id` flipped; `schedd_live_migration_decisions_total{outcome="migrated"}` increments per successful handoff; `apps.migrated_at` stamped in the same transaction as `instances.migrated_at`; `make leakcheck` zero leaked netns/TAPs/cgroups; `make test-metal` exercises the full four-phase path against the §14 source-of-truth bare-metal x86_64 control-plane node |
 
 Post-M8 = private beta (founding doc roadmap M2–M3: hand-held first ten customers).
 

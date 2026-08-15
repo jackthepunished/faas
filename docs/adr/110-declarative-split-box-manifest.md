@@ -1,6 +1,6 @@
 # ADR-110 · Declarative split-box deployment manifest
 
-- **Status:** proposed (PR-0 of the issue #911 PR cluster)
+- **Status:** **Accepted** (revised 2026-08-16) (PR-0 of the issue #911 PR cluster)
 - **Date:** 2026-08-15
 - **Decision:** Adopt a single, versioned, declarative deployment
   manifest as the source of truth for every host in a multi-box
@@ -41,8 +41,8 @@
     surface, and `make lint-manifest` is the CI gate. There is no
     "third-party" validator that disagrees with the canonical one.
   - **TOML table-placement catalog (PR-0):** the bug at
-    `deploy/etc/vmmd.toml.example:96-103` (duplicated `tls_*_path`
-    inside `[compute_node]`) is the load-bearing failure mode
+    `deploy/ansible/roles/vmmd_service/files/vmmd.toml.example:96-103`
+    (duplicated `tls_*_path` inside `[compute_node]`) is the load-bearing failure mode
     issue #911 calls out. The schema's `pkg/manifest/toml_check.go`
     catalog is the source of truth for which key belongs to
     which TOML table. The renderer (PR-2) consumes the same

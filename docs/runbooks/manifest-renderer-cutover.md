@@ -3,14 +3,15 @@
 The cutover from a legacy single-box installation to the split-box
 world defined by
 [`docs/adr/110-declarative-split-box-manifest.md`](../adr/110-declarative-split-box-manifest.md).
-The 8 PRs that shipped before PR-7 (#912 / #913 / #914 / #915 /
-#917 / #918 / #919 / #920 / #921) put the **code** in place; this
-runbook is the operator narrative that closes the cluster.
+The 12 PRs that shipped before PR-7 (#912 / #913 / #914 / #915 /
+#917 / #918 / #919 / #920 / #921 / #922 / #923 / #924) put the
+**code** in place; this runbook is the operator narrative that
+closes the cluster.
 
 > Cross-links:
 > - Operator reference (one-page): [`docs/ops/gregalectl-operator-quickstart.md`](../ops/gregalectl-operator-quickstart.md).
 > - Multi-host horizontal-scale variant (2nd compute node): [`docs/runbooks/multi-host-rollout.md`](multi-host-rollout.md).
-> - Active-passive HA topology (Tier A8, future): [`docs/ad ADR-083`](../adr/083-active-passive-ha-topology.md).
+> - Active-passive HA topology (Tier A8, accepted 2026-08-16): [`ADR-083`](../adr/083-active-passive-ha-topology.md).
 > - The split-box manifest schema: [`deploy/manifest/examples/splitbox.example.yaml`](../../deploy/manifest/examples/splitbox.example.yaml).
 
 ## Topology

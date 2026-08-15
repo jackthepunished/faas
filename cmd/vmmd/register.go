@@ -35,10 +35,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/exec"
+	"net/netip"
 	"strings"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -117,32 +117,31 @@ func registerComputeNode(ctx context.Context, st state.Store, cfg ComputeNodeCon
 	return got, nil
 }
 
-// defaultDetectOverlayIP runs `tailscale ip -4` if tailscale is on
-// $PATH, returning the first IPv4 it emits. Returns ("", nil) when
-// tailscale isn't installed (single-box dev) or returns an empty
-// string (WireGuard-mode operators set [compute_node].overlay_ip
-// explicitly). Returns ("", err) on an actual exec failure that
-// isn't "binary missing" — e.g. tailscale installed but the daemon
-// is down — so the caller can log the failure rather than silently
-// proceeding.
-func defaultDetectOverlayIP(ctx context.Context) (string, error) {
-	if _, err := exec.LookPath("tailscale"); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return "", nil
+// defaultDetectOverlayIP runs `tailscale ip -4` and prefers the IP
+// that lives in cfg.OverlayCIDR (falling back to
+// api.DefaultOverlayCIDR() when the field is unset).
+//
+// Returns ("", nil) when tailscale isn't installed (single-box dev)
+// or when no overlay IP is configured (WireGuard-mode operators
+// set [compute_node].overlay_ip explicitly). Returns ("", err) on
+// an actual exec failure that isn't "binary missing" — e.g.
+// tailscale installed but the daemon is down — so the caller can
+// log the failure rather than silently proceeding.
+//
+// Mega-PR-B Commit 3: the v1 first-line behavior is preserved as
+// the fall-through path when no candidate matches PreferCIDR. The
+// scoring logic (parseTailscaleIPLines, scoreByCIDR) lives in
+// overlay_detect.go so it's unit-testable without shelling out.
+func defaultDetectOverlayIP(ctx context.Context, cfg ComputeNodeConfig) (string, error) {
+	prefer := api.DefaultOverlayCIDR()
+	if cidr := strings.TrimSpace(cfg.OverlayCIDR); cidr != "" {
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return "", fmt.Errorf("compute_node.overlay_cidr %q: %w", cidr, err)
 		}
-		return "", err
+		prefer = p
 	}
-	cmd := exec.CommandContext(ctx, "tailscale", "ip", "-4")
-	cmd.Env = append(os.Environ(), "TS_NO_LOGS_NO_SUPPORT=true")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("tailscale ip -4: %w", err)
-	}
-	ip := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
-	if ip == "" {
-		return "", errors.New("tailscale ip -4 returned empty")
-	}
-	return ip, nil
+	return detectOverlayIP(ctx, OverlayDetector{PreferCIDR: prefer})
 }
 
 // registerComputeNodeKey writes the public half of vmmd's signing

@@ -489,6 +489,28 @@ spinner) and PR #51 (the closeout batch):
 
 The §14 M8 gates still on the board are listed in [What's next](#whats-next).
 
+- **Active-passive standby topology (ADR-083, accepted 2026-08-16):**
+  lex-min leader election over `compute_nodes.name WHERE active=true`; `pkg/gateway/leader`
+  package (`ElectLeader`, `Leader`, `LeaderStore`); `StandbyState` gauge
+  (`<prefix>_gateway_standby_state`, enum warming/warm/draining) +
+  `ActivePassiveFailoversTotal` counter (`<prefix>_gateway_active_passive_failovers_total{outcome}`,
+  outcomes: `dns_flipped` | `dns_stale` | `peer_unreachable` | `manual_drain`); probe
+  timeout bounded by `HAFailoverProbeTimeoutMS = 500` (in `pkg/api/limits.go`); drain
+  deadline bounded by `HADNSRecordStaleSeconds = 30`. Failure drill: `make ha-failover-drill`
+  on two-node Lima fleet (`deploy/lima/faas-metal-2node-ha.yaml`); standalone runbook at
+  `docs/runbooks/active-passive-ha.md`. Closes the Gate-A row "2nd box active-passive" in
+  spec §14 M8.
+
+## M9 — multi-box scale. 🚧
+
+- **ADR-066** (Tier A5 cross-node live-instance migration, accepted 2026-08-07): four-phase handoff (Park → mint lease → `MigrateInstanceOwner` → ack), `schedd_live_migration_decisions_total{outcome}` counter, `apps.migrated_at` + `instances.migrated_at` stamped in the same transaction. Bundled with PR #509 (Tier A4 per-node schedd), PRs in the ADR-066 → 067 → 068 cluster.
+- **ADR-062** (per-node schedd + async placement claim, accepted 2026-08-16): single-writer-per-host invariant survives multi-host deploys; `apid_control_plane_only` depguard in `.golangci.yml` prevents a control-plane path from calling a compute-only peer.
+- **ADR-063** (snapshot de-localization, accepted 2026-08-16): snapshots are per-schedd-local caches; authoritative blob lives in the shared OCI registry (ADR-054). Cross-node wake pulls on demand; acceptable for v1.0 because the cold-boot path (ADR-005) is the slow path.
+- **ADR-067** (migrating-instance watchdog, accepted 2026-08-16): 1 s ticker self-heals stuck `state='migrating'` rows that never committed (peer died mid-handoff, gRPC dropped, operator killed the new owner). The watchdog is the only writer that can move a row out of `migrating` without a peer commit.
+- **ADR-110** (declarative split-box manifest, accepted 2026-08-16): versioned YAML + typed schema at `deploy/manifest/splitbox.yaml` + `pkg/manifest/`; SemVer `schema_version (1.0.0)`; canonical validation through `gregalectl manifest validate` + the renderer + the release bundle installer + the doctor + the metal harness. PR-cluster shipped (PRs #912 #913 #914 #915 #917 #918 #919 #920 #921 #922 #923 #924).
+
+End-to-end smoke: `make metal-lima-2node` exercises the full four-phase handoff against a two-node Lima fleet. The acceptance row in spec §14 M9 is the gating test for the cluster.
+
 ### M8 — alert pipeline. ✅ (this PR)
 
 The §12 dashboard pipeline is wired end-to-end:
