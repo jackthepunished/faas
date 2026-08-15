@@ -137,6 +137,8 @@
   vars:
     public_iface: "{{ public_iface | default('eth0') }}"
     masquerade_cidr: "{{ masquerade_cidr | default('10.100.0.0/16') }}"
+    overlay_cidrs: "{{ overlay_cidrs | default([]) }}"
+    masquerade_cidr_v6: "{{ masquerade_cidr_v6 | default('') }}"
   register: nft_drop
 
 - name: nftables — syntax-check the ruleset
