@@ -1,0 +1,187 @@
+# builderd_service — install systemd unit + example config for
+# builderd (spec §4.5, ADR-003, ADR-005).
+#
+# builderd is the build orchestrator: it consumes build_queued
+# notifications from apid, claims the build row, and runs the
+# build inside an ephemeral Firecracker microVM (ADR-003) via
+# vmmd's jailer. The produced app-layer ext4 is stamped onto the
+# deployment row and the existing imaged→schedd snapshot_prime
+# handshake takes over.
+#
+# builderd lives on the compute-only box (fsn-2) per ADR-092.
+# The role is parallel to vmmd_service — a single daemon, a
+# single unit, a single drop-in set. Like vmmd_service, this role
+# does NOT enable or start the daemon: the operator does that once
+# the binary is deployed and /etc/faas/sealed.env has DATABASE_URL.
+# Idempotency: copy tasks use `mode:` to keep state predictable;
+# daemon_reload fires only when the unit file actually changed.
+
+- name: builderd_service — ensure 'faas' group exists (socket auth group, ADR-015)
+  ansible.builtin.group:
+    name: faas
+    state: present
+    system: true
+
+- name: builderd_service — ensure 'faas-builderd' system user exists (builderd socket owner)
+  ansible.builtin.user:
+    name: faas-builderd
+    group: faas
+    shell: /usr/sbin/nologin
+    system: true
+    create_home: false
+    password: "*"
+
+- name: builderd_service — install /etc/faas (mode 0750 root:faas)
+  ansible.builtin.file:
+    path: /etc/faas
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+
+- name: builderd_service — drop example TOML (operator copies to builderd.toml)
+  ansible.builtin.copy:
+    src: builderd.toml.example
+    dest: /etc/faas/builderd.toml.example
+    owner: root
+    group: faas
+    mode: "0640"
+
+- name: builderd_service — install systemd unit
+  ansible.builtin.copy:
+    src: faas-builderd.service
+    dest: /etc/systemd/system/faas-builderd.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: builderd_unit
+
+- name: builderd_service — systemctl daemon-reload (idempotent, after new unit file)
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: builderd_unit.changed
+
+# Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
+# env line into the builderd unit so the build_claimed log lines
+# carry the canonical host identity. Mirrors the vmmd / schedd /
+# control-plane roles.
+- name: builderd_service — install FAAS_NODE_NAME drop-in (Mega-PR-A)
+  ansible.builtin.template:
+    src: 99-faas-node-name.conf.j2
+    dest: /etc/systemd/system/faas-builderd.service.d/99-faas-node-name.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to builderd via FAAS_BUILDERD_ROLE so
+# cmd/builderd/config.go::LoadConfig picks up faas_box_role
+# (compute-only on fsn-2). See roles/builderd_service/templates/
+# 99-faas-role.conf.j2 for the full rationale.
+- name: builderd_service — install FAAS_BUILDERD_ROLE drop-in (Mega-PR-C)
+  ansible.builtin.template:
+    src: 99-faas-role.conf.j2
+    dest: /etc/systemd/system/faas-builderd.service.d/99-faas-role.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+# ADR-053: /srv/fc/builder is the build-staging root. builderd
+# writes the produced app-layer ext4 here for the imaged→schedd
+# snapshot_prime handshake to read. Must be writable by
+# faas-builderd (the unit's ReadWritePaths= pass at this exact path
+# is the load-bearing pair). Mode 0750 root:faas — sibling to the
+# vmmd /srv/fc/parent dir that the imaged role also reads.
+- name: builderd_service — ensure /srv/fc/builder exists (ADR-053 build staging)
+  ansible.builtin.file:
+    path: /srv/fc/builder
+    state: directory
+    owner: faas-builderd
+    group: faas
+    mode: "0750"
+
+# Spec §11 — ProtectSystem=strict ReadWritePaths= assert. Mirrors
+# the same shape as imaged (compute_only_service/tasks/main.yml) and
+# vmmd (vmmd_service/tasks/main.yml, after Mega-PR-C Commit 10
+# extends it). The list is read from the unit file (not hardcoded)
+# so a unit edit does not silently drift from the role's mkdir
+# list. Fail loud before systemd daemon-reload so a drift on a
+# fresh box never reaches production.
+- name: builderd_service — assert ReadWritePaths= whitelist matches mkdir list
+  ansible.builtin.set_fact:
+    builderd_rwpaths: >-
+      {{ (lookup('file', role_path + '/files/faas-builderd.service')
+          | regex_search('ReadWritePaths=([^\\n]+)', '\\1')
+          | first).split() }}
+
+- name: builderd_service — assert every ReadWritePaths= target exists
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ builderd_rwpaths }}"
+  register: builderd_rwpath_stat
+  failed_when: not builderd_rwpath_stat.stat.exists
+
+# Tier 1 control-plane mTLS (ADR-052). builderd on a multi-box
+# compute node is one of the daemons that runs `gregalectl pki
+# init`; the operator-side bootstrap lays out
+# /etc/faas/tls/builderd/{server,vmmd-client}.crt. The assert
+# surfaces a missing bootstrap before builderd attempts to start
+# and refuses to bind with a confusing TLS handshake error.
+- name: builderd_service — assert builderd PKI leaves exist (Tier 1)
+  ansible.builtin.stat:
+    path: "/etc/faas/tls/builderd/{{ item }}.crt"
+  loop:
+    - server
+    - vmmd-client
+  register: faas_pki_builderd_leaf_stat
+  failed_when: not faas_pki_builderd_leaf_stat.stat.exists
+
+# Spec §11 — node-key (ADR-053 slice-3). builderd signs the build
+# artifact with the same node signing key vmmd uses for capacity
+# reports (cmd/builderd/main.go reads loadNodeSigningKey the same
+# way). The 0400 root:root contract is shared; the ansible-side
+# tripwire mirrors the vmmd assert.
+- name: builderd_service — assert node-key mode is 0400 root:root (ADR-053)
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/builderd/node.key
+  register: faas_builderd_node_key_stat
+- name: builderd_service — fail loud if builderd node.key missing or loose (ADR-053)
+  ansible.builtin.fail:
+    msg: >-
+      /etc/faas/secrets/builderd/node.key mode {{ faas_builderd_node_key_stat.stat.mode | default('absent') }}
+      {{ faas_builderd_node_key_stat.stat.pw_name | default('?') }}:{{ faas_builderd_node_key_stat.stat.gr_name | default('?') }} —
+      want 0400 root:root. Re-run `gregalectl node-key init` from the
+      multi-host rollout runbook (docs/runbooks/multi-host-rollout.md
+      §3 "Bootstrap: node signing key").
+  when: >-
+    not faas_builderd_node_key_stat.stat.exists
+    or faas_builderd_node_key_stat.stat.mode != "0400"
+    or faas_builderd_node_key_stat.stat.pw_name != "root"
+    or faas_builderd_node_key_stat.stat.gr_name != "root"
+
+# Tier 1 — sealed.env presence tripwire. builderd's unit sets
+# EnvironmentFile=/etc/faas/sealed.env so DATABASE_URL is in scope.
+# The 0640 root:faas mode is the sealed.env standard (gap G2, §17).
+# Existing /etc/faas/sealed.env is asserted here as a soft tripwire
+# (debug message only — the operator may populate it post-bootstrap).
+- name: builderd_service — soft assert /etc/faas/sealed.env exists
+  ansible.builtin.stat:
+    path: /etc/faas/sealed.env
+  register: faas_sealed_env_stat
+- name: builderd_service — debug sealed.env presence
+  ansible.builtin.debug:
+    msg: >-
+      /etc/faas/sealed.env present — builderd will read DATABASE_URL
+      at boot. mtime={{ faas_sealed_env_stat.stat.mtime | default('absent') }}
+      mode={{ faas_sealed_env_stat.stat.mode | default('absent') }}
+  when: faas_sealed_env_stat.stat.exists
+
+- name: builderd_service — note for operators (NOT auto-enabled)
+  ansible.builtin.debug:
+    msg: >-
+      builderd installed but NOT enabled. Operator runs:
+        systemctl enable --now faas-builderd
+      once /etc/faas/sealed.env has DATABASE_URL and the binary is
+      installed at /opt/faas/current/bin/builderd. The role wires
+      the per-box role gate (FAAS_BUILDERD_ROLE=compute-only on fsn-2)
+      via the 99-faas-role.conf drop-in.

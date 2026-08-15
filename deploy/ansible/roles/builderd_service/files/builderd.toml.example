@@ -1,0 +1,36 @@
+# builderd example config — operator copies to /etc/faas/builderd.toml.
+# Mirrors cmd/builderd/config.go::Config. Used by the compute-only
+# play (Gate-B, issue #911 / ADR-092). builderd is non-root; runs
+# as faas-builderd:faas (Group=faas lets it read the cosign sign-pub.pem
+# 0444 root:root and any per-app trusted-publisher PEMs).
+#
+# FAAS_BUILDERD_ROLE is set via the 99-faas-role.conf drop-in emitted
+# by this role's tasks/main.yml — the TOML `role` field is the legacy
+# single-box fallback. On a multi-box fleet the env-var wins
+# (cmd/builderd/config.go::LoadConfig pattern with
+# role.FromConfig(string(c.Role), "FAAS_BUILDERD_ROLE")).
+
+# socket path — schedd + vmmd dial this on the same host (compute-only
+# box). Default /run/faas/builderd.sock; image-scan and build-claim
+# RPCs land here.
+socket_path = "/run/faas/builderd.sock"
+
+# Postgres DSN read from /etc/faas/sealed.env (DATABASE_URL). The TOML
+# override is the single-box dev path; production ships the env-var.
+# database_url = "postgres://faas@127.0.0.1:5432/faas?sslmode=disable"
+
+# builderd's ephemeral VMs ride vmmd's jailer (ADR-003) — no KVM
+# surface from this unit. drv = "vmmd" is the only supported value
+# at v1; the vmmd-raw-bridge driver lives in pkg/builderd for the
+# e2e harness path.
+drv = "vmmd"
+
+# /srv/fc/builder is the staging root for the build artifact ext4.
+# On the compute-only box vmmd mounts the parent ext4 from
+# /srv/fc/parent (per ADR-053 slice-3) and builderd reads through
+# it to fetch the cache hit. The dir must be writable by faas-builderd.
+build_staging_root = "/srv/fc/builder"
+
+# MemoryMax=512M is enforced by the unit (above). The build VM
+# (spec §4.5) gets 2 vCPU / 2048 MB / 10 minutes — wired by
+# vmmd's Wake RPC, not by builderd's TOML.

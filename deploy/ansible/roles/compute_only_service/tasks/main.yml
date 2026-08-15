@@ -4,11 +4,11 @@
 #
 # This role is the single source of truth for the fsn-2 (compute-only)
 # imaged install. vmmd + gatewayd-internal + builderd each have their
-# own role (vmmd_service, gatewayd_internal_service, builderd is out of
-# scope today — see docs/runbooks/gate-b.md PR-4); imaged's tripwires
-# travel with the imaged unit so a future unit edit that drops a
-# ReadWritePaths= target fails the playbook on the box the daemon
-# actually runs on, rather than firing a false positive on fsn-1.
+# own role (vmmd_service, gatewayd_internal_service, builderd_service —
+# Mega-PR-C added builderd); imaged's tripwires travel with the imaged
+# unit so a future unit edit that drops a ReadWritePaths= target fails
+# the playbook on the box the daemon actually runs on, rather than
+# firing a false positive on fsn-1.
 #
 # The role does NOT enable or start imaged: the operator does that
 # once /srv/fc/base is populated (firecracker role) and the binary

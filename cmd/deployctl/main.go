@@ -161,8 +161,9 @@ func githubdOnlySkips() map[string]bool {
 }
 
 // computeOnlySkips: compute_only_service ships imaged only (Gate-B
-// PR-2). vmmd + gatewayd-internal have their own ansible roles;
-// builderd is out of scope until PR-4's runbook TODO is acted on.
+// PR-2). vmmd + gatewayd-internal + builderd have their own ansible
+// roles (Mega-PR-C added builderd_service); the registry adds their
+// units so the deployctl generator skips them in this tree's emit.
 func computeOnlySkips() map[string]bool {
 	return map[string]bool{
 		"apid":              true,
@@ -170,6 +171,7 @@ func computeOnlySkips() map[string]bool {
 		"meterd":            true,
 		"githubd":           true,
 		"vmmd":              true,
+		"builderd":          true,
 		"gatewayd-public":   true,
 		"gatewayd-internal": true,
 	}

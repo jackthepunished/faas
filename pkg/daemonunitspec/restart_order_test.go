@@ -76,6 +76,7 @@ func TestRestartOrder_MatchesExpected(t *testing.T) {
 		"meterd",            // After[apid] — Registry idx 5
 		"githubd",           // After[apid] — Registry idx 6
 		"imaged",            // After[vmmd] — Registry idx 7
+		"builderd",          // After[vmmd, apid] — Registry idx 8, both roots have popped
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len(got)=%d, len(want)=%d; got=%v want=%v", len(got), len(want), got, want)

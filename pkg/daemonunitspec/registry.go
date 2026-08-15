@@ -64,6 +64,13 @@ var Registry = []Entry{
 	{Name: "meterd", Unit: UnitMeterd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "githubd", Unit: UnitGithubd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "imaged", Unit: UnitImaged, Critical: false, Lifecycle: Lifecycle{After: []string{"vmmd"}, Probe: ProbeTCP, ProbeTarget: "127.0.0.1:9102"}},
+	// Mega-PR-C (issue #911 / ADR-110): builderd is the build
+	// orchestrator on fsn-2 (compute-only). Spawns ephemeral
+	// builder microVMs through vmmd (ADR-003) — no KVM direct
+	// from this unit. After=vmmd: the build path needs the
+	// per-box capacity signal vmmd writes at boot, otherwise
+	// the first build_claim can race the vmmd register row.
+	{Name: "builderd", Unit: UnitBuilderd, Critical: true, Lifecycle: Lifecycle{After: []string{"vmmd", "apid"}, Probe: ProbeUnix, ProbeTarget: "/run/faas/builderd.sock"}},
 }
 
 // UnitByName returns the daemonunit.Unit for the given daemon name.
