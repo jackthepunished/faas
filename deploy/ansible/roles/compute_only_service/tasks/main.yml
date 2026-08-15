@@ -70,6 +70,19 @@
     group: root
     mode: "0644"
 
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to imaged via FAAS_IMAGED_ROLE so cmd/imaged/main.go
+# picks up faas_box_role (compute-only on fsn-2). See
+# roles/compute_only_service/templates/99-faas-role.conf.j2 for
+# the full rationale.
+- name: compute_only_service — install FAAS_IMAGED_ROLE drop-in (Mega-PR-C)
+  ansible.builtin.template:
+    src: 99-faas-role.conf.j2
+    dest: /etc/systemd/system/faas-imaged.service.d/99-faas-role.conf
+    owner: root
+    group: root
+    mode: "0644"
+
 # ADR-038 build attestations. Must exist before faas-imaged starts:
 # a ReadWritePaths= target that does not exist makes systemd fail the
 # mount-namespace setup, so creating the dir and listing it in the unit

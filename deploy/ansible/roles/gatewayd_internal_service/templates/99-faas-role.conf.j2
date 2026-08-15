@@ -1,0 +1,18 @@
+[Service]
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to gatewayd-internal so cmd/gatewayd-internal/config.go
+# ::LoadConfig picks the right role.FromConfig sentinel
+# (FAAS_GATEWAYD_ROLE). gatewayd-internal lives on fsn-2 (the
+# compute-only box) and the role is RoleComputeOnly.
+#
+# Note: gatewayd-internal and gatewayd-public share the binary
+# name "gatewayd" in the env-var namespace
+# (FAAS_GATEWAYD_ROLE), not FAAS_GATEWAYD_INTERNAL_ROLE.
+# gatewayd-public uses a distinct FAAS_GATEWAYD_PUBLIC_ROLE
+# (see gatewayd_public_service/templates/99-faas-role.conf.j2).
+#
+# The drop-in wins over the unit's [Service] section
+# (systemd.unit(5) "later wins") and the unit has no
+# Environment= line on FAAS_GATEWAYD_ROLE, so the drop-in is the
+# only source of the env var. Idempotent.
+Environment=FAAS_GATEWAYD_ROLE={{ faas_box_role }}
