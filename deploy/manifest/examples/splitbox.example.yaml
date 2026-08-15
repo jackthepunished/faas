@@ -1,0 +1,155 @@
+# splitbox.example.yaml — reference split-box deployment manifest
+# (issue #911 / ADR-110).
+#
+# This file is the canonical example for a multi-box Fleet:
+# one control-plane host (fsn-1) and one compute-only host (fsn-2).
+# It is loaded by `gregale manifest validate` and by the `make
+# lint-manifest` CI gate. The same shape (minus the Fleet block)
+# works for a single-box install — replace the Fleet with a single
+# `single-box` host.
+#
+# Conventions:
+#   - Every required field is documented inline. Removing a value
+#     causes `gregale manifest validate` to fail with the
+#     `path: is required` message.
+#   - Every digest is sha256 (64 hex) except git_sha (40 hex).
+#     The validator rejects the wrong length.
+#   - The `cgroups.controllers` MUST include `memory` (issue #911
+#     calls out the cgroup memory controller as load-bearing for
+#     tenant admission).
+#   - Every host's `address` is `host:port` or `unix://path`.
+#   - The TLS material `mode` is an octal string ("0400", "0440",
+#     "0600"). Plain decimal or text is rejected.
+#
+# Editing tips:
+#   - Run `gregale manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`
+#     locally after every edit.
+#   - The TOML table-placement catalog (pkg/manifest/toml_check.go)
+#     is the source of truth for which table a daemon key belongs
+#     to. The renderer (PR-2) consumes the same catalog.
+
+schema_version: "1.0.0"
+
+# Fleet — every host in the deployment. Names are unique. Roles
+# come from pkg/role.AllRoles (single-box | control-plane |
+# compute-only). A single-box install declares one host with
+# role: single-box; a split-box install declares at least one
+# control-plane and one compute-only host.
+fleet:
+  hosts:
+    - name: fsn-1
+      role: control-plane
+      address: 10.42.0.1:7100
+      tags: ["primary", "vpc-pub"]
+    - name: fsn-2
+      role: compute-only
+      address: 10.42.0.2:50051
+      tags: ["vpc-pub"]
+
+# Daemons — per-daemon configuration. The renderer (PR-2) writes
+# one TOML per host for the daemons that host runs. The `tls`
+# block is the on-disk material the daemon's listener uses; the
+# `outbound` block is the dial target the daemon uses to talk to
+# remote daemons.
+daemons:
+  schedd:
+    bind: tcp://0.0.0.0:7100
+    tls:
+      cert_path: /etc/faas/tls/schedd/server.crt
+      key_path: /etc/faas/tls/schedd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+  vmmd:
+    bind: tcp://0.0.0.0:50051
+    tls:
+      cert_path: /etc/faas/tls/vmmd/server.crt
+      key_path: /etc/faas/tls/vmmd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+  apid:
+    bind: unix:///run/faas/apid.sock
+  meterd:
+    bind: unix:///run/faas/meterd.sock
+  gatewayd_public:
+    bind: tcp://0.0.0.0:443
+  gatewayd_internal:
+    bind: unix:///run/faas/gatewayd-internal.sock
+
+# Overlay — per-host overlay network identity. The renderer writes
+# /etc/hosts entries so the canonical DNS names (schedd.faas,
+# vmmd.faas) resolve to the control-plane VPC address. The CIDR
+# is the overlay subnet; each host's address must fall within it.
+overlay:
+  provider: wireguard
+  cidr: 10.42.0.0/24
+
+# DNS — public-facing hostname contract. apps_domain is the single
+# source of truth consumed by gatewayd-internal, apid, and the
+# CLI's PrintOK paths (PR-4 replaces the hard-coded
+# `apps.gregale.dev` literals in cmd/gregale/commands2.go and
+# cmd/gatewayd-internal/backend.go).
+dns:
+  apps_domain: apps.gregale.dev
+  mode: cloudflare
+
+# PostgreSQL — database cluster configuration. The renderer writes
+# the per-daemon db_url and the faas_map pg ident map. The
+# migration policy is on-boot for multi-box; on-boot-offline is
+# the single-box dev default.
+postgresql:
+  dsn: postgres://faas@127.0.0.1:5432/faas
+  database: faas
+  migration_max_slot: 265
+  policy: on-boot
+
+# Release — the immutable release-tuple anchor. PR-0 validates
+# the shape; PR-3 ships the bundle/install path that materialises
+# the tuple at /opt/faas/releases/<id>/. The doctor (PR-4)
+# asserts the running binary's SHA matches git_sha and the
+# per-host digests match the values below.
+#
+# The values below are placeholders — replace with the digests
+# you actually ship. The validator accepts any 64-char sha256 (or
+# 40-char sha1 for git_sha).
+release:
+  id: v1.4.0-12-gabc1234
+  git_sha: abc1234567890abcdef1234567890abcdef12345
+  architecture: x86_64
+  firecracker_version: 1.10.0
+  firecracker_digest: 0000000000000000000000000000000000000000000000000000000000000000
+  kernel_digest: 1111111111111111111111111111111111111111111111111111111111111111
+  builder_base_digest: 2222222222222222222222222222222222222222222222222222222222222222
+  runtime_base_digest: 3333333333333333333333333333333333333333333333333333333333333333
+
+# Storage — per-host filesystem layout. The renderer creates
+# these directories with the documented ownership/modes. The run
+# dir is the unix-socket directory; the renderer also creates
+# /run/faas/stream with mode 0770 root:faas (closes the vmmd
+# stream-bridge bind race that bit the GCP deploy).
+storage:
+  fast_root: /srv/fc
+  spool_root: /var/spool/faas
+  log_root: /var/log/faas
+  run_dir: /run/faas
+
+# Cgroups — cgroup v2 controller requirements. The renderer
+# writes +memory +cpu +io +pids to the per-host subtree_control
+# (the only place the production path lands this today — the
+# Lima metal shim at deploy/lima/run-metal.sh:84; bootstrap.sh
+# and ansible both skip it).
+cgroups:
+  slice: faas-cp.slice
+  controllers: "memory,cpu,io,pids"
+
+# PKI — certificate authority wiring. The renderer issues per-
+# daemon leaves via pkg/pki.RolesForBox(); the manifest declares
+# the CA cert fingerprint the doctor enforces on every box.
+pki:
+  root_dir: /etc/faas/tls
+  ca_fingerprint: 4444444444444444444444444444444444444444444444444444444444444444
+  allowed_sans:
+    - schedd.faas
+    - vmmd.faas
+    - apid.faas
+    - gatewayd-public.faas
+    - gatewayd-internal-public.faas

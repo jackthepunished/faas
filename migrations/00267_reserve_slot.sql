@@ -1,0 +1,36 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00267_reserve_slot.sql — slot reservation placeholder (ADR-041 / PR #391
+-- migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement that the
+-- embedded migration set is exactly {1, 2, …, N} with no gaps. It carries
+-- no schema change and does not appear in any apply path (the replay-safety
+-- gate in ci.yml drops files whose basename matches the reservation regex
+-- from its "added migration versions" computation).
+--
+-- This reservation is for PR-3a of the issue #911 PR cluster (declarative
+-- split-box deployment manifest + gregale doctor). The body lands in
+-- migrations/00267_release_bundles.sql and creates the release_bundles
+-- table that records every bundled release tuple (id, git_sha,
+-- manifest_hash, daemon_hashes, created_at, applied_at). PR-3 itself
+-- (release bundle + cross-box artifact sync) consumes this table.
+--
+-- If another PR lands first at slot 267, this reservation drops on rebase.
+-- The renumber-helper chain (`scripts/ci/check_migration_slots.sh`) catches
+-- any duplicate-prefix collision at merge time.
+--
+-- Body: `select 1;` — executes against the live DB at apply time but
+-- produces no schema change. Future-proof against upstream generator drift
+-- without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
