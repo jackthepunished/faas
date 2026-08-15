@@ -44,6 +44,7 @@ Usage:
 Commands:
   manifest     Validate/render a split-box deployment manifest (manifest validate|render; issue #911 / ADR-110)
   release      Materialise / install a cluster-shipped release bundle (release bundle|install --git-sha SHA)
+  doctor       Read-only diagnostic for the cluster-shipped release bundle (doctor [--node NAME] [--release SHA] [--deep]; PR-4 / ADR-110)
   host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   pki          Operator local-dev PKI bootstrap (pki init|status|rotate)
   sign-keys    Provision the cosign sign keypair (sign-keys init|rotate|status; --sign-key / --verify-key)
@@ -113,6 +114,13 @@ func run(args []string) int {
 		// /opt/faas/current symlink + stamps applied_at. The
 		// dispatcher is cmdReleaseDispatch in commands_release.go.
 		return cmdReleaseDispatch(args[1:])
+	case dispatchDoctor:
+		// PR-4 (issue #911 / ADR-110): read-only cluster diagnostic.
+		// Walks the on-disk release tree + the release_bundles +
+		// compute_nodes tables and reports drift. Exit 0 healthy,
+		// exit 3 drift. NEVER writes. The dispatcher is
+		// cmdDoctorDispatch in commands_doctor.go.
+		return cmdDoctorDispatch(args[1:])
 	case dispatchHostAge:
 		// Operator-side host.age rotation (issue #316 / ADR-057).
 		// Local fs only — never hits apid.
