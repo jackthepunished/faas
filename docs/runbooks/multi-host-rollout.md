@@ -591,11 +591,15 @@ If the handoff stalls in `state='migrating'` past the lease
   `secretbox.LoadHostKeys` multi-identity plumbing. v2
   follow-up (`issue-316-followup-rekey`) covers the
   background re-seal of pre-rotation envelopes.
-- **Active-passive HA ADR** — no ADR exists yet; the
-  current runbook is the multi-host horizontal-scale
-  variant only. The active-passive topology is tracked in
-  `docs/runbooks/gate-a.md`. A separate ADR + acceptance PR
-  will follow when the topology is ready to ship.
+- **Active-passive HA: ADR-083** (accepted 2026-08-16) — see
+  `docs/runbooks/active-passive-ha.md` for the dedicated
+  runbook (lex-min leader election over
+  `compute_nodes.name WHERE active=true`, standby warm-up,
+  drain protocol). Multi-host horizontal-scale (this runbook)
+  is now orthogonal: you run BOTH for full HA coverage. A
+  `make ha-failover-drill` target on the two-node Lima fleet
+  (`deploy/lima/faas-metal-2node-ha.yaml`) exercises the
+  failover end-to-end.
 
 ## Acceptance
 
