@@ -11,7 +11,7 @@
 //   - --public-iface <name>          (env: FAAS_PUBLIC_IFACE)
 //   - --masquerade-cidr <cidr>       (env: FAAS_MASQUERADE_CIDR)
 //   - --overlay-cidr <cidr>          (env: FAAS_OVERLAY_CIDRS, repeatable,
-//                                     comma-separated; multi-host mesh)
+//     comma-separated; multi-host mesh)
 //   - --masquerade-cidr-v6 <cidr>    (env: FAAS_MASQUERADE_CIDR_V6)
 //
 // When all are unset, the render uses `pkg/netns.DefaultHostPolicy`
