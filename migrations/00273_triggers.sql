@@ -16,12 +16,22 @@
 -- per concern, default-OFF staging), ADR-098 single-flight wake gate,
 -- ADR-090 cron-fire-now manifest slot (kind='cron' is a thin pointer
 -- to the existing `crons` table).
+--
+-- Replay-safety (per the contract migrations/replay_safety_test.go
+-- asserts): CREATE TABLE is IF NOT EXISTS; every CREATE INDEX is IF
+-- NOT EXISTS; the pg_notify trigger is created via DROP TRIGGER IF
+-- EXISTS + CREATE TRIGGER (PG15 has no CREATE TRIGGER IF NOT EXISTS —
+-- see trigger-replay-safety-drop-before-create); the notify function
+-- is dropped+recreated; the invocations_source_check widening uses the
+-- DO-block guard established by 00159_invocations_replay_source.sql.
+-- A drifted box (relations present, goose row missing) re-applies
+-- cleanly without tripping SQLSTATE 42P07 / 42710 / 42P06.
 
 -- +goose Up
 -- +goose StatementBegin
 
 -- A) The unified Trigger resource.
-CREATE TABLE triggers (
+CREATE TABLE IF NOT EXISTS triggers (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     app_id          UUID NOT NULL REFERENCES apps(id)    ON DELETE CASCADE,
@@ -47,12 +57,12 @@ CREATE TABLE triggers (
     ),
     UNIQUE (app_id, slug)
 );
-CREATE INDEX triggers_account_kind_idx ON triggers(account_id, kind);
-CREATE INDEX triggers_app_kind_enabled ON triggers(app_id, kind) WHERE enabled;
-CREATE INDEX triggers_cron_id_idx      ON triggers(cron_id) WHERE cron_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS triggers_account_kind_idx ON triggers(account_id, kind);
+CREATE INDEX IF NOT EXISTS triggers_app_kind_enabled ON triggers(app_id, kind) WHERE enabled;
+CREATE INDEX IF NOT EXISTS triggers_cron_id_idx      ON triggers(cron_id) WHERE cron_id IS NOT NULL;
 
 -- B) One row per source record (Lambda ESM shape, ReportBatchItemFailures).
-CREATE TABLE trigger_records (
+CREATE TABLE IF NOT EXISTS trigger_records (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     trigger_id      UUID NOT NULL REFERENCES triggers(id) ON DELETE CASCADE,
     item_identifier TEXT NOT NULL,
@@ -69,15 +79,15 @@ CREATE TABLE trigger_records (
     last_dispatched_at TIMESTAMPTZ NULL,
     UNIQUE (trigger_id, item_identifier)
 );
-CREATE INDEX trigger_records_due_idx
+CREATE INDEX IF NOT EXISTS trigger_records_due_idx
     ON trigger_records(trigger_id, next_fire_at)
     WHERE state IN ('pending','retry');
-CREATE INDEX trigger_records_dlq_idx
+CREATE INDEX IF NOT EXISTS trigger_records_dlq_idx
     ON trigger_records(trigger_id, state)
     WHERE state = 'dead_letter';
 
 -- C) Closed-vocab failure routing for terminal records.
-CREATE TABLE trigger_dead_letter (
+CREATE TABLE IF NOT EXISTS trigger_dead_letter (
     record_id   UUID PRIMARY KEY REFERENCES trigger_records(id) ON DELETE CASCADE,
     trigger_id  UUID NOT NULL,
     reason      TEXT NOT NULL
@@ -88,18 +98,39 @@ CREATE TABLE trigger_dead_letter (
     detail      JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX trigger_dlq_trigger_reason_idx ON trigger_dead_letter(trigger_id, reason);
+CREATE INDEX IF NOT EXISTS trigger_dlq_trigger_reason_idx ON trigger_dead_letter(trigger_id, reason);
 
 -- D) Widen invocations.source enum to admit 'esm' for batch dispatch.
 -- Lambda ESM dispatches share the same wake path as customer HTTP traffic
 -- (per pkg/sched/drain.go:65-67 — "no second admission policy"). The
 -- runner envelope is delivered to the same VM (instances.kind='wake',
 -- not a new flavor).
-ALTER TABLE invocations DROP CONSTRAINT invocations_source_check;
-ALTER TABLE invocations ADD CONSTRAINT invocations_source_check
-    CHECK (source IN ('async_invoke','queue','delayed_task','cron','replay','esm'));
+--
+-- DO-block guard mirrors 00159_invocations_replay_source.sql: drop the
+-- existing constraint (if any) before re-adding with the new membership,
+-- so a fresh DB and a drifted DB both land on the same final shape.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'invocations_source_check'
+          AND conrelid = 'invocations'::regclass
+    ) THEN
+        ALTER TABLE invocations DROP CONSTRAINT invocations_source_check;
+    END IF;
+
+    ALTER TABLE invocations ADD CONSTRAINT invocations_source_check
+        CHECK (source IN ('async_invoke','queue','delayed_task','cron','replay','esm'));
+END$$;
 
 -- E) pg_notify trigger (analog to invocation_due).
+--
+-- Drop+recreate the function so the second apply on a drifted DB
+-- (function present, schema stale) lands on the same final shape.
+-- CREATE OR REPLACE alone would fail with SQLSTATE 42P13 (parameter
+-- names changed) on a drifted DO-box; DROP + CREATE is unconditional.
+DROP FUNCTION IF EXISTS trg_notify_trigger_ready();
+
 CREATE OR REPLACE FUNCTION trg_notify_trigger_ready() RETURNS trigger AS $$
 BEGIN
     PERFORM pg_notify('trigger_ready',
@@ -109,6 +140,9 @@ BEGIN
     RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
+-- PG15 has no CREATE TRIGGER IF NOT EXISTS — drop and recreate (per
+-- trigger-replay-safety-drop-before-create).
+DROP TRIGGER IF EXISTS trigger_ready_notify ON trigger_records;
 CREATE TRIGGER trigger_ready_notify
     AFTER INSERT ON trigger_records
     FOR EACH ROW EXECUTE FUNCTION trg_notify_trigger_ready();
@@ -120,9 +154,22 @@ CREATE TRIGGER trigger_ready_notify
 DROP TRIGGER IF EXISTS trigger_ready_notify ON trigger_records;
 DROP FUNCTION IF EXISTS trg_notify_trigger_ready();
 
-ALTER TABLE invocations DROP CONSTRAINT invocations_source_check;
-ALTER TABLE invocations ADD CONSTRAINT invocations_source_check
-    CHECK (source IN ('async_invoke','queue','delayed_task','cron','replay'));
+-- Reverse the invocations.source widening back to the prior membership.
+-- DO-block guard (mirror of the Up path) so a down on a drifted DB
+-- doesn't trip 42P16 / 42P07.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'invocations_source_check'
+          AND conrelid = 'invocations'::regclass
+    ) THEN
+        ALTER TABLE invocations DROP CONSTRAINT invocations_source_check;
+    END IF;
+
+    ALTER TABLE invocations ADD CONSTRAINT invocations_source_check
+        CHECK (source IN ('async_invoke','queue','delayed_task','cron','replay'));
+END$$;
 
 DROP INDEX IF EXISTS trigger_dlq_trigger_reason_idx;
 DROP TABLE IF EXISTS trigger_dead_letter;

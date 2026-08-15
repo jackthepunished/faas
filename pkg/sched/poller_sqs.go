@@ -259,7 +259,7 @@ func (s *sqsPoller) Nack(ctx context.Context, _ sqlc.Trigger, ids []string, reas
 	if len(ids) == 0 {
 		return nil
 	}
-	if reason == "poison_record" {
+	if reason == triggerReasonPoisonRecord {
 		return s.deleteReceipts(ctx, ids)
 	}
 	body, _ := json.Marshal(map[string]any{

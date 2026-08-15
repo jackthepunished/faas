@@ -303,7 +303,7 @@ func (n *natsPoller) Nack(_ context.Context, _ sqlc.Trigger, ids []string, reaso
 			continue
 		}
 		var err error
-		if reason == "poison_record" {
+		if reason == triggerReasonPoisonRecord {
 			err = msg.TermWithReason("poison")
 		} else {
 			err = msg.NakWithDelay(2 * time.Second)
