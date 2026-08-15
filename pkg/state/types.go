@@ -1975,6 +1975,21 @@ type Instance struct {
 // the seeded default-local row is backfilled to ('local','local')
 // in the migration so the single-box deploy has a deterministic
 // ordering.
+//
+// PublicIp / PublicIpSetAt were added by migration 00174 (PR A8
+// multi-IP work) to the SQL schema but historically not surfaced
+// on this Go struct — sqlc-generated models.go carries them. PR-3a
+// adds them here to close the latent drift so the consumer-shaped
+// pgstore scanner can return them.
+//
+// ReleaseID / ManifestHash / HostCertificate / CertFingerprint / Role
+// / Generation are nullable columns added by migration 00266
+// (issue #911 / ADR-110 PR-3a) for release-bundle storage. PR-3
+// (release bundle install) stamps ReleaseID + CertFingerprint; PR-2
+// renderer stamps ManifestHash + Role; PR-X secrets init stamps
+// HostCertificate + CertFingerprint; PR-4 doctor bumps Generation
+// on mismatch. The pointer types mirror Region/Zone (a SQL NULL
+// round-trips as nil, never collapsing into "").
 type ComputeNode struct {
 	ID                 string
 	Name               string
@@ -2016,6 +2031,45 @@ type ComputeNode struct {
 	// 'unix:///run/faas/schedd.sock' by migration 00090 so
 	// single-box installs preserve bit-for-bit behaviour.
 	ScheddTargetURL *string
+	// PublicIp is the per-node public-facing IP for the multi-IP
+	// (PR-A8) bring-up path. nil for the synthetic default-local
+	// row + pre-00174 operator rows. Reuses pkg/netip's value type
+	// because the column stores a Postgres INET.
+	PublicIp *netip.Addr
+	// PublicIpSetAt is the wall-clock time PublicIp was last set
+	// (migration 00174). nil for rows that haven't been assigned a
+	// public IP yet (single-box installs stay on the legacy dial path).
+	PublicIpSetAt *time.Time
+	// ReleaseID is the release_bundles.git_sha this node claims
+	// membership in (PR-3a, ADR-110). nil = pre-bundle row, or a
+	// node registered against a release that hasn't been bundled
+	// yet. PR-3 release install stamps this on UPSERT.
+	ReleaseID *string
+	// ManifestHash is the sha256:<64hex> hash of the manifest the
+	// PR-2 renderer materialised on this node (PR-3a, ADR-110).
+	// nil = pre-manifest row. PR-4 doctor compares this against
+	// release_bundles.manifest_hash for the ReleaseID to detect
+	// manifest drift between fleet boxes.
+	ManifestHash *string
+	// HostCertificate is the PEM-encoded leaf certificate for this
+	// node (PR-3a, ADR-110). nil = pre-PR-X or pre-cmd/hostage-gen
+	// row. PR-4 doctor reads to verify the cert on disk matches
+	// CertFingerprint.
+	HostCertificate *string
+	// CertFingerprint is the sha256:<64hex> fingerprint of
+	// HostCertificate (PR-3a, ADR-110). nil until PR-X secrets
+	// init or cmd/hostage-gen stamps it. PR-3 release install
+	// and PR-4 doctor compare against pkg/pki.LoadCertificateFingerprint
+	// at mTLS handshake time.
+	CertFingerprint *string
+	// Role is the per-node role label: control-plane | compute-node
+	// (PR-3a, ADR-110). Populated from manifest.fleet.hosts[].role
+	// by PR-2 renderer. nil = pre-manifest row.
+	Role *string
+	// Generation is a monotonic counter bumped by PR-4 doctor on
+	// per-node inconsistency detection (PR-3a, ADR-110). nil on
+	// pre-PR-3a rows (treated as 0); never decreases.
+	Generation *int
 }
 
 // ComputeNodeHeartbeat is one row in the append-only
