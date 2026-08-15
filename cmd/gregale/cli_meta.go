@@ -488,6 +488,18 @@ var cliCommands = []cliCommand{
 		Positionals: []string{"<cents>"},
 	},
 	{
+		Name:    "manifest",
+		DocSlug: "manifest",
+		Short:   "Operator split-box deployment manifest (manifest validate --file PATH; issue #911 / ADR-110)",
+		Subcommands: []cliSub{
+			{
+				Name:  "validate",
+				Short: "Validate a manifest YAML file (canonical path: pkg/manifest.Validate)",
+				Flags: []cliFlag{{Name: "file", Short: "path to the manifest YAML file (required)"}},
+			},
+		},
+	},
+	{
 		Name:    "park",
 		DocSlug: "park-wake",
 		Short:   "Park an app cold (kill all live instances)",

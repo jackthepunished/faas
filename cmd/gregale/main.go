@@ -61,6 +61,7 @@ Commands:
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
+  manifest     Operator split-box deployment manifest (manifest validate --file PATH; issue #911 / ADR-110)
   signup       Create a new account (signup [--email-only EMAIL])
   man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
@@ -421,6 +422,13 @@ func run(args []string) int {
 		// above the plan's included GB-h). schedd refuses new wakes
 		// once the cap is hit.
 		return cmdOverageCap(args[1:])
+	case "manifest":
+		// Issue #911 / ADR-110: operator-side manifest loader.
+		// `gregale manifest validate --file=PATH` runs the
+		// canonical validator (pkg/manifest/Validate); PR-2 adds
+		// `manifest render`; PR-3 adds `manifest install`. The
+		// dispatcher is cmdManifestDispatch in commands_manifest.go.
+		return cmdManifestDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1
