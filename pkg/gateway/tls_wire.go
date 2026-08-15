@@ -2,7 +2,7 @@
 //
 // Production layout (cmd/gatewayd-public/main.go calls into this):
 //
-//	cfg, err := gateway.NewCertMagicConfig(ctx, gatewayd-publicConfig.TLS, hetznerToken, log)
+//	cfg, err := gateway.NewCertMagicConfig(ctx, gatewayd-publicConfig.TLS, dnsToken, log)
 //	// cfg.GetCertificate is the tls.Config.GetCertificate callback
 //	// cfg.HTTPChallengeHandler is the :80 handler for ACME challenges
 //	// cfg.OnDemandDecisionFunc mirrors what we set here for tests
@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
@@ -82,11 +83,16 @@ type TLSBundle struct {
 var silentZap = zapNop()
 
 // DNSProviderFactory builds the libdns.DNSProvider used by certmagic's
-// DNS-01 solver. Production passes nil to NewCertMagicConfig, which uses
-// NewHetznerDNSProvider against https://dns.hetzner.com/api/v1. Tests pass
-// a closure that returns a *HetznerDNSProvider wired against an httptest
-// stub so the wire shape (auth header, record create/delete, zone lookup)
-// can be exercised without hitting the real Hetzner API.
+// DNS-01 solver. Production passes nil to NewCertMagicConfig, which
+// returns a factory that dispatches on FAAS_DNS_PROVIDER
+// (cloudflare|hetzner|route53|manual per ADR-024 §6 — route53 slot is
+// reserved, not yet implemented; manual returns nil and the
+// DNSHandoff subscriber takes over). Cloudflare is the production
+// default; Hetzner stays as one option so operators on Hetzner DNS
+// keep working. Tests pass a closure that returns a provider wired
+// against an httptest stub so the wire shape (auth header, record
+// create/delete, zone lookup) can be exercised without hitting the
+// real DNS API.
 type DNSProviderFactory func(token, zone string) certmagic.DNSProvider
 
 // NewCertMagicConfig constructs the wired TLSBundle from thegatewayd-internal
@@ -102,7 +108,7 @@ type DNSProviderFactory func(token, zone string) certmagic.DNSProvider
 // and the counter hook becomes a no-op through the Metrics nil-safe
 // helpers — same pattern as ObserveBuildCount / SetResidentGBPerCustomer
 // in pkg/wire/metrics.go).
-func NewCertMagicConfig(ctx context.Context, cfg TLSConfig, hetznerToken string, log *slog.Logger, dnsFactory DNSProviderFactory, m *Metrics) (*TLSBundle, error) {
+func NewCertMagicConfig(ctx context.Context, cfg TLSConfig, dnsToken string, log *slog.Logger, dnsFactory DNSProviderFactory, m *Metrics) (*TLSBundle, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -145,15 +151,31 @@ func NewCertMagicConfig(ctx context.Context, cfg TLSConfig, hetznerToken string,
 
 	factory := dnsFactory
 	if factory == nil {
+		// PR-8: dispatch on FAAS_DNS_PROVIDER (already gated in
+		// cmd/gatewayd-public/ha_components.go:70 for the A8 A-record
+		// handoff path — same env var, separate dispatch surface).
+		// Default is cloudflare per ADR-024 §6; hetzner stays as one
+		// option (operators on Hetzner DNS keep working); manual
+		// returns nil and the DNSHandoff subscriber takes over.
+		// route53 is reserved for a future implementation slot.
 		factory = func(token, zone string) certmagic.DNSProvider {
-			return NewHetznerDNSProvider(token, zone)
+			switch strings.ToLower(strings.TrimSpace(envOr("FAAS_DNS_PROVIDER", "cloudflare"))) {
+			case "cloudflare":
+				return NewCloudflareDNSProvider(token, zone)
+			case "hetzner":
+				return NewHetznerDNSProvider(token, zone)
+			case "manual", "":
+				return nil
+			default:
+				return nil
+			}
 		}
 	}
 	issuerTemplate := certmagic.ACMEIssuer{
 		Email: contactEmail,
 		DNS01Solver: &certmagic.DNS01Solver{
 			DNSManager: certmagic.DNSManager{
-				DNSProvider: factory(hetznerToken, cfg.HetznerZone),
+				DNSProvider: factory(dnsToken, cfg.HetznerZone),
 			},
 		},
 		Agreed: true,
@@ -316,4 +338,15 @@ func allowlistToDecisionFunc(allow OnDemandAllowlist, log *slog.Logger, m *Metri
 		}
 		return nil
 	}
+}
+
+// envOr returns os.Getenv(key) if non-empty, else def. Used by the
+// DNSProviderFactory dispatch in NewCertMagicConfig (PR-8) to read
+// FAAS_DNS_PROVIDER. Centralised here so a future move to config-bound
+// values keeps the call sites the same.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
