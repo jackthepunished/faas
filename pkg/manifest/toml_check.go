@@ -33,7 +33,7 @@ import (
 	"strings"
 )
 
-// tableKey describes which TOML table a key belongs to, and whether
+// TableKey describes which TOML table a key belongs to, and whether
 // it is daemon-private (the daemon that produces the TOML owns the
 // key) or daemon-public (a remote daemon's identity lives on it).
 //
@@ -41,7 +41,7 @@ import (
 // `Scope` is "private" (vmmd-owned) or "public" (a remote daemon's
 // CN/SAN/data). The validator rejects a manifest whose declared
 // `tls` material's Owner doesn't match the table's expected owner.
-type tableKey struct {
+type TableKey struct {
 	// Table is the TOML table name (e.g. "compute_node"). Empty
 	// string means top-level (no `[...]` section).
 	Table string
@@ -59,7 +59,7 @@ type tableKey struct {
 
 // String renders the key as a TOML path for error messages
 // ("compute_node.tls_cert_path").
-func (k tableKey) String() string {
+func (k TableKey) String() string {
 	if k.Table == "" {
 		return k.Key
 	}
@@ -91,7 +91,7 @@ type HostBlock struct {
 	// (public), and vice versa. The descriptor below forces the
 	// renderer to consult the same descriptor the validator
 	// checks, so the two cannot drift.
-	ComputeNodeBlock []tableKey
+	ComputeNodeBlock []TableKey
 }
 
 // HostKeys is the per-daemon TOML key catalog. Use by the validator
@@ -125,7 +125,7 @@ var HostKeys = map[string]HostBlock{
 			"tls_key_path",
 			"tls_ca_path",
 		},
-		ComputeNodeBlock: []tableKey{
+		ComputeNodeBlock: []TableKey{
 			// Self-registration identity — the vmmd box tells
 			// schedd who it is. These are the `[compute_node]`
 			// keys and they DO NOT belong at top level.

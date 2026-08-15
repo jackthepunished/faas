@@ -1,6 +1,10 @@
 package daemonunitspec
 
-import "github.com/onebox-faas/faas/pkg/daemonunit"
+import (
+	"fmt"
+
+	"github.com/onebox-faas/faas/pkg/daemonunit"
+)
 
 // Entry is one row of the daemon registry — the canonical (name, unit,
 // restart classification) tuple that the deploy generator emits into
@@ -60,6 +64,25 @@ var Registry = []Entry{
 	{Name: "meterd", Unit: UnitMeterd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "githubd", Unit: UnitGithubd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "imaged", Unit: UnitImaged, Critical: false, Lifecycle: Lifecycle{After: []string{"vmmd"}, Probe: ProbeTCP, ProbeTarget: "127.0.0.1:9102"}},
+}
+
+// UnitByName returns the daemonunit.Unit for the given daemon name.
+// The mapping is the canonical manifest.HostKeys → daemonunitspec.Unit
+// name (the manifest uses underscores in two cases — gatewayd_internal,
+// gatewayd_public — which the renderer flattens to dashes before
+// reaching this lookup). Returns an error if name is not in the
+// Registry; the renderer surfaces this as a schema-drift ship-blocker.
+//
+// The Registry's Unit field is itself a constructor (`func() daemonunit.Unit`)
+// so the renderer gets a fresh copy per call — every renderer run
+// produces a per-daemon unit without cross-run aliasing.
+func UnitByName(name string) (daemonunit.Unit, error) {
+	for _, e := range Registry {
+		if e.Name == name {
+			return e.Unit(), nil
+		}
+	}
+	return daemonunit.Unit{}, fmt.Errorf("daemonunitspec: unknown daemon %q (known: %v)", name, ActivationOrder())
 }
 
 // FaasCPSlice is the [Slice] MemoryMax=3G ceiling for the entire

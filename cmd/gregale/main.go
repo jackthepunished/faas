@@ -425,9 +425,10 @@ func run(args []string) int {
 	case "manifest":
 		// Issue #911 / ADR-110: operator-side manifest loader.
 		// `gregale manifest validate --file=PATH` runs the
-		// canonical validator (pkg/manifest/Validate); PR-2 adds
-		// `manifest render`; the install path lives under
-		// `gregale release install` (PR-3), not `manifest install`.
+		// canonical validator (pkg/manifest/Validate); PR-2 ships
+		// `manifest render --manifest-file=PATH` (pkg/renderer.Render).
+		// The install path lives under `gregale release install`
+		// (PR-3), not `manifest install`.
 		// The dispatcher is cmdManifestDispatch in commands_manifest.go.
 		return cmdManifestDispatch(args[1:])
 	case "release":

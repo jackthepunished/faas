@@ -298,6 +298,19 @@ linters:
       - path: "pkg/wire/metrics\\.go$"
         linters:
           - goconst
+      # pkg/renderer is the issue #911 / ADR-110 manifest
+      # renderer (PR-2): the per-daemon TOML writer uses literal
+      # strings ("socket_path", "listen_addr", "vmmd_socket",
+      # "+memory", "[compute_node]", ...) as the schema-discriminator
+      # of the canonical TOML output. The literal IS the schema —
+      # pkg/manifest.HostKeys is the catalog; promoting every
+      # emitted TOML key to a const inside pkg/renderer would (a)
+      # duplicate the catalog and (b) invert the data-table
+      # pattern that mirrors pkg/daemonunitspec +
+      # pkg/wire/metrics. Same exemption rationale.
+      - path: "pkg/renderer/.+\\.go$"
+        linters:
+          - goconst
       # cmd/deployctl/main.go: gosec G703 (path-traversal via taint)
       # and G122 (filepath.Walk TOCTOU) fire on os.WriteFile /
       # os.Stat / filepath.Walk calls. Every path here is either a
