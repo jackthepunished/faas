@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/sched"
@@ -419,4 +420,180 @@ func mustPEMBlock(t *testing.T, b *pem.Block, msg string) *pem.Block {
 		t.Fatal(msg)
 	}
 	return b
+}
+
+// ----------------------------------------------------------------------------
+// Mega-PR-B Commit 3 — overlay IP detection scoring
+//
+// Pure helpers + a no-exec stub-detector path, so the tests don't
+// need a tailscale binary on PATH. Each case pins one branch of
+// detectOverlayIP / parseTailscaleIPLines / scoreByCIDR; the
+// production defaultDetectOverlayIP is exercised through the
+// cfg-bearing entry point at the bottom.
+// ----------------------------------------------------------------------------
+
+// TestDetectOverlayIP_PrefersCIDRMatch exercises the load-bearing
+// branch: when tailscale prints multiple IPv4 lines, the candidate
+// that lives in PreferCIDR wins. Anti-regression for the Tier-1
+// BLOCKING tail-1 NIC ambiguity where a multi-NIC host's first
+// `tailscale ip -4` line was a non-overlay secondary IP.
+func TestDetectOverlayIP_PrefersCIDRMatch(t *testing.T) {
+	stub := []byte("100.64.0.5\n192.168.1.10\n100.100.100.1\n")
+	got, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/nonexistent-but-not-looked-up",
+		PreferCIDR:          netip.MustParsePrefix("100.64.0.0/10"),
+		Run: func(_ context.Context) ([]byte, error) { return stub, nil },
+	})
+	if err != nil {
+		t.Fatalf("detectOverlayIP: %v", err)
+	}
+	if got != "100.64.0.5" {
+		t.Errorf("overlay IP = %q, want 100.64.0.5 (Tailscale CGNAT in PreferCIDR/10)", got)
+	}
+}
+
+// TestDetectOverlayIP_FirstLineWhenNoCIDRMatch asserts the v1
+// fall-through: when no candidate matches PreferCIDR, the first
+// line wins (legacy first-line behavior preserved). An operator
+// who set PreferCIDR too narrow still gets an answer.
+func TestDetectOverlayIP_FirstLineWhenNoCIDRMatch(t *testing.T) {
+	stub := []byte("192.168.1.10\n100.64.0.5\n")
+	got, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/not-used",
+		PreferCIDR:          netip.MustParsePrefix("203.0.113.0/24"), // no candidate in this /24
+		Run:                 func(_ context.Context) ([]byte, error) { return stub, nil },
+	})
+	if err != nil {
+		t.Fatalf("detectOverlayIP: %v", err)
+	}
+	if got != "192.168.1.10" {
+		t.Errorf("overlay IP = %q, want 192.168.1.10 (first-line fall-through)", got)
+	}
+}
+
+// TestDetectOverlayIP_FirstLineWhenNoPreferCIDR is the explicit
+// v1 contract: zero-value PreferCIDR (no manifest overlay.cidr)
+// returns the first IP line. The Mega-PR-A config that omitted
+// overlay_cidr must not break.
+func TestDetectOverlayIP_FirstLineWhenNoPreferCIDR(t *testing.T) {
+	stub := []byte("100.64.0.5\n192.168.1.10\n")
+	got, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/not-used",
+		Run:                 func(_ context.Context) ([]byte, error) { return stub, nil },
+	})
+	if err != nil {
+		t.Fatalf("detectOverlayIP: %v", err)
+	}
+	if got != "100.64.0.5" {
+		t.Errorf("overlay IP = %q, want 100.64.0.5 (zero-PreferCIDR v1 behavior)", got)
+	}
+}
+
+// TestDetectOverlayIP_ErrorsOnEmptyOutput pins the malformed-binary
+// path: tailscale exists but produces no output. Must error (not
+// silently return ""), so the caller logs and continues rather
+// than accidentally skipping overlay detection.
+func TestDetectOverlayIP_ErrorsOnEmptyOutput(t *testing.T) {
+	_, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/not-used",
+		Run:                 func(_ context.Context) ([]byte, error) { return nil, nil },
+	})
+	if err == nil {
+		t.Fatal("detectOverlayIP: want error on empty output, got nil")
+	}
+}
+
+// TestParseTailscaleIPLines covers the pure parser. Filters IPv6,
+// trims whitespace, rejects garbage lines, skips blanks. Pinned so
+// a future edit that accidentally accepts `fe80::1` (or returns
+// silently on garbage) fails here.
+func TestParseTailscaleIPLines(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string // stringified netip.Addr for equality
+		err  bool
+	}{
+		{"ipv4-only", "100.64.0.5\n", []string{"100.64.0.5"}, false},
+		{"ipv4-with-ipv6", "100.64.0.5\nfe80::1\n", []string{"100.64.0.5"}, false},
+		{"trailing-whitespace", "100.64.0.5   \n", []string{"100.64.0.5"}, false},
+		{"blank-lines", "100.64.0.5\n\n100.64.0.6\n", []string{"100.64.0.5", "100.64.0.6"}, false},
+		{"garbage-line", "100.64.0.5\nnot-an-ip\n", nil, true},
+		{"empty-after-trim", " \n \n", []string{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addrs, err := parseTailscaleIPLines([]byte(tc.in))
+			if tc.err {
+				if err == nil {
+					t.Fatalf("parseTailscaleIPLines: want error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseTailscaleIPLines: %v", err)
+			}
+			if len(addrs) != len(tc.want) {
+				t.Fatalf("parseTailscaleIPLines: got %d addrs, want %d (%v vs %v)",
+					len(addrs), len(tc.want), addrs, tc.want)
+			}
+			for i, a := range addrs {
+				if a.String() != tc.want[i] {
+					t.Errorf("parseTailscaleIPLines[%d] = %s, want %s", i, a, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestScoreByCIDR pins the scoring priority order:
+//
+//   - empty PreferCIDR → first element
+//   - PreferCIDR with match → first match (stable order)
+//   - PreferCIDR with no match → first element (fall-through)
+//
+// The stable-order-on-tie clause is load-bearing: when two
+// candidates both live in PreferCIDR, the earlier one wins
+// (the legacy first-line contract is preserved on ties).
+func TestScoreByCIDR(t *testing.T) {
+	mkAddrs := func(s ...string) []netip.Addr {
+		out := make([]netip.Addr, 0, len(s))
+		for _, v := range s {
+			out = append(out, netip.MustParseAddr(v))
+		}
+		return out
+	}
+	t.Run("empty-prefer", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("100.64.0.5", "192.168.1.10"), netip.Prefix{})
+		if got.String() != "100.64.0.5" {
+			t.Errorf("got %s, want 100.64.0.5", got)
+		}
+	})
+	t.Run("single-match", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("192.168.1.10", "100.64.0.5", "100.100.100.1"),
+			netip.MustParsePrefix("100.64.0.0/10"))
+		if got.String() != "100.64.0.5" {
+			t.Errorf("got %s, want 100.64.0.5", got)
+		}
+	})
+	t.Run("tie-stable-order", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("100.64.0.5", "100.64.0.6"),
+			netip.MustParsePrefix("100.64.0.0/10"))
+		if got.String() != "100.64.0.5" {
+			t.Errorf("got %s, want 100.64.0.5 (first tie wins)", got)
+		}
+	})
+	t.Run("no-match", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("192.168.1.10", "100.64.0.5"),
+			netip.MustParsePrefix("203.0.113.0/24"))
+		if got.String() != "192.168.1.10" {
+			t.Errorf("got %s, want 192.168.1.10 (no-match fall-through)", got)
+		}
+	})
+	t.Run("empty-list", func(t *testing.T) {
+		got := scoreByCIDR(nil, netip.MustParsePrefix("100.64.0.0/10"))
+		if got.IsValid() {
+			t.Errorf("got %s, want zero Addr for empty list", got)
+		}
+	})
 }
