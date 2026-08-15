@@ -93,9 +93,9 @@ func writeRenderManifest(t *testing.T) string {
 // RenderReport describing every file that would have been written.
 func TestManifestRender_DryRunRoundTrip(t *testing.T) {
 	manifestPath := writeRenderManifest(t)
-	gregaleBin := buildGregale(t)
+	gregalectlBin := buildGregaleCtl(t)
 
-	cmd := exec.Command(gregaleBin,
+	cmd := exec.Command(gregalectlBin,
 		"manifest", "render",
 		"--manifest-file", manifestPath,
 		"--dry-run",
@@ -154,7 +154,7 @@ func TestManifestRender_DryRunRoundTrip(t *testing.T) {
 // `gregale manifest render` must be a no-op when nothing changed.
 func TestManifestRender_WriteAndIdempotent(t *testing.T) {
 	manifestPath := writeRenderManifest(t)
-	gregaleBin := buildGregale(t)
+	gregalectlBin := buildGregaleCtl(t)
 	dir := t.TempDir()
 
 	args := []string{
@@ -168,7 +168,7 @@ func TestManifestRender_WriteAndIdempotent(t *testing.T) {
 	}
 	run := func(extraArgs ...string) (int, string, string) {
 		fullArgs := append(append([]string{}, args...), extraArgs...)
-		cmd := exec.Command(gregaleBin, fullArgs...)
+		cmd := exec.Command(gregalectlBin, fullArgs...)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -232,9 +232,9 @@ func TestManifestRender_WriteAndIdempotent(t *testing.T) {
 // re-rendered the wrong box.
 func TestManifestRender_RejectsBadHost(t *testing.T) {
 	manifestPath := writeRenderManifest(t)
-	gregaleBin := buildGregale(t)
+	gregalectlBin := buildGregaleCtl(t)
 
-	cmd := exec.Command(gregaleBin,
+	cmd := exec.Command(gregalectlBin,
 		"manifest", "render",
 		"--manifest-file", manifestPath,
 		"--host", "no-such-host",
@@ -274,9 +274,9 @@ func TestManifestRender_RejectsMissingMemoryC(t *testing.T) {
 		t.Fatalf("write bad: %v", err)
 	}
 
-	gregaleBin := buildGregale(t)
+	gregalectlBin := buildGregaleCtl(t)
 	dir = t.TempDir() // output target must be empty for the no-filesystem-touch pin
-	cmd := exec.Command(gregaleBin,
+	cmd := exec.Command(gregalectlBin,
 		"manifest", "render",
 		"--manifest-file", manifestPath,
 		"--releases-root", filepath.Join(dir, "releases"),

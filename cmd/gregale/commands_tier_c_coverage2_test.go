@@ -71,13 +71,11 @@ func TestTierCInvoicesUsage(t *testing.T) {
 	}
 }
 
-// TestTierCBackupUsage pins cmdBackup's argument count check.
-func TestTierCBackupUsage(t *testing.T) {
-	resetJSONOut(t)
-	if code := cmdBackup(nil); code != 1 {
-		t.Errorf("cmdBackup() = %d, want 1", code)
-	}
-}
+// TestTierCBackupUsage, TestTierCHostAgeInitUsage,
+// TestTierCHostAgeRotateUsage, and TestTierCHostAgePrunePreviousUsage
+// moved to cmd/gregalectl/commands_tier_c_operator_test.go in PR-6.5
+// (those tests cover operator-side dispatchers that no longer exist
+// in this package).
 
 // TestTierCBuildUsage pins cmdBuild's argument count check.
 func TestTierCBuildUsage(t *testing.T) {
@@ -132,30 +130,6 @@ func TestTierCAlertRmUsage(t *testing.T) {
 	resetJSONOut(t)
 	if code := cmdAlertRm(nil); code != 1 {
 		t.Errorf("cmdAlertRm() = %d, want 1", code)
-	}
-}
-
-// TestTierCHostAgeInitUsage pins cmdHostAgeInit's argument count check.
-func TestTierCHostAgeInitUsage(t *testing.T) {
-	resetJSONOut(t)
-	if code := cmdHostAgeInit(nil); code != 1 {
-		t.Errorf("cmdHostAgeInit() = %d, want 1", code)
-	}
-}
-
-// TestTierCHostAgeRotateUsage pins cmdHostAgeRotate's argument count check.
-func TestTierCHostAgeRotateUsage(t *testing.T) {
-	resetJSONOut(t)
-	if code := cmdHostAgeRotate(nil); code != 1 {
-		t.Errorf("cmdHostAgeRotate() = %d, want 1", code)
-	}
-}
-
-// TestTierCHostAgePrunePreviousUsage pins cmdHostAgePrunePrevious's argument count check.
-func TestTierCHostAgePrunePreviousUsage(t *testing.T) {
-	resetJSONOut(t)
-	if code := cmdHostAgePrunePrevious(nil); code != 1 {
-		t.Errorf("cmdHostAgePrunePrevious() = %d, want 1", code)
 	}
 }
 

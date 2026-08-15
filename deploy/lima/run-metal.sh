@@ -108,9 +108,12 @@ for _idx in /sys/devices/system/cpu/cpu[0-9]*/cache/index[0-9]*; do
   mount --bind "$_tmp" "$_idx"
 done
 
-# PR-6 (issue #911 / ADR-110): exercise gregale release bundle|install
-# on the metal harness so the lockstep test (pkg/daemonunitspec) and the
-# compute_nodes UPSERT (pkg/releaseinstall.Store) are wired end-to-end.
+# PR-6 / PR-6.5 (issue #911 / ADR-110): exercise `gregalectl release
+# bundle|install` on the metal harness so the lockstep test
+# (pkg/daemonunitspec) and the compute_nodes UPSERT
+# (pkg/releaseinstall.Store) are wired end-to-end. gregalectl is the
+# operator-only CLI (PR-6.5 split); gregale is the customer-facing
+# CLI and does not carry release install — operators run this wire.
 # Warn-and-continue: PR-6's metal wire is smoke, not gate. The real gate
 # is the lockstep unit test (CI pure-Go shard) and the cmd/e2e round-trip
 # test. A failure here logs but does not abort the harness so the M0/M1/
@@ -124,25 +127,25 @@ done
 # exported locally.
 export FAAS_PG_DSN="${FAAS_PG_DSN:-postgres://faas@127.0.0.1:5432/faas?sslmode=disable}"
 
-if [[ "${RUN_GREGALE_RELEASE_INSTALL:-1}" == "1" ]] && command -v gregale >/dev/null 2>&1; then
+if [[ "${RUN_GREGALE_RELEASE_INSTALL:-1}" == "1" ]] && command -v gregalectl >/dev/null 2>&1; then
     BIN_DIR="${METAL_BIN_DIR:-/tmp/faas-metal-bin}"
     if [[ -d "${BIN_DIR}" ]]; then
         GIT_SHA="$(git rev-parse HEAD 2>/dev/null || printf '0123456789abcdef0123456789abcdef01234567')"
         MANIFEST_HASH="sha256:$(printf '%064d' 0)"
-        if ! gregale release bundle \
+        if ! gregalectl release bundle \
             --bin-dir="${BIN_DIR}" \
             --git-sha="${GIT_SHA}" \
             --manifest-hash="${MANIFEST_HASH}" \
             --releases-root=/opt/faas/releases \
         ; then
-            echo "WARN: gregale release bundle failed (PR-6 smoke — non-fatal)" >&2
+            echo "WARN: gregalectl release bundle failed (PR-6 smoke — non-fatal)" >&2
         fi
-        if ! gregale release install \
+        if ! gregalectl release install \
             --git-sha="${GIT_SHA}" \
             --releases-root=/opt/faas/releases \
             --node="$(hostname)" \
         ; then
-            echo "WARN: gregale release install failed (PR-6 smoke — non-fatal)" >&2
+            echo "WARN: gregalectl release install failed (PR-6 smoke — non-fatal)" >&2
         fi
     else
         echo "WARN: PR-6 metal wire skipped: bin-dir ${BIN_DIR} not found" >&2

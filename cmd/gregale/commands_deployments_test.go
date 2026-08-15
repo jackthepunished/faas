@@ -514,7 +514,11 @@ func TestCmdDeployment_JSON_ShowSecretScanEnvelope(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	stdout, restoreStdout := swapStdout(t)
+	stdoutBuf := &bytes.Buffer{}
+	prevStdout := osStdout
+	osStdout = stdoutBuf
+	restoreStdout := func() { osStdout = prevStdout }
+	stdout := stdoutBuf
 	jsonOutput = true
 	defer func() { jsonOutput = false }()
 	if code := cmdDeploymentGet([]string{

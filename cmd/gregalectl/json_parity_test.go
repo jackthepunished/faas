@@ -1,20 +1,16 @@
-// json_parity_test.go — Tier A8.2 / ADR-083 follow-up.
+// json_parity_test.go — operator-side Tier A8.2 JSON-flag parity gate
+// (issue #911 / ADR-110 PR-6.5).
 //
-// Pins the "every JSON-emitting top-level cmdXxx has a test"
-// contract. We walk the cliCommands manifest (the user-facing
-// surface) and for each entry whose dispatcher branches on
-// jsonOutput, assert that a sibling test exists which sets
-// jsonOutput = true for the dispatcher path.
+// Mirrors cmd/gregale/json_parity_test.go byte-for-byte except the
+// `nonJSONAllowList` is restricted to operator-side dispatchers:
+// cmdBackup, cmdHostAge, cmdPKI, cmdSignKeys, cmdNodeKey. The
+// customer-side list (cmdAccount, cmdInit, cmdLogin, cmdLogout,
+// cmdMfa, cmdOverageCap, cmdRestore, cmdWhoami, cmdTrustedPublishers)
+// stays in cmd/gregale/json_parity_test.go — moving them here would
+// invert the gate.
 //
-// We intentionally do NOT audit per-leaf jsonOutput branches
-// (cmdAlertList, cmdRegistryList, etc.). Leaves are exercised
-// through their parent dispatcher's test; the parent dispatcher
-// is the user-facing surface and the right unit of audit.
-//
-// The nonJSONAllowList MUST stay co-located with the rationale
-// comment in json_flag.go:18 — both lists move together when a
-// command is added or removed.
-
+// Drift-test for cliCommands ↔ main.go lives in
+// commands_completion_test.go::TestCompletion_ManifestDrift.
 package main
 
 import (
@@ -26,33 +22,19 @@ import (
 	"testing"
 )
 
-// nonJSONAllowList is the closed set of top-level cmdXxx funcs
-// that DELIBERATELY emit no JSON. Mirrored in the comment block
-// in json_flag.go so the audit list and the rationale stay
-// co-located. Both lists must move together when adding or
-// removing a non-JSON command.
-//
-// Keep entries in alphabetical order for review diff readability.
+// nonJSONAllowList is the closed set of operator-side cmdXxx funcs
+// that DELIBERATELY emit no JSON. Keep entries alphabetical.
 var nonJSONAllowList = map[string]string{
-	"cmdAccount":    "delegate leaves; cmdAccountStatus is the only JSON leaf (covered)",
-	"cmdInit":       "file writes + human template table",
-	"cmdLogin":      "interactive paste-code flow",
-	"cmdLogout":     "side-effect only; no body",
-	"cmdMfa":        "enroll is the only JSON leaf (covered); others are write-only",
-	"cmdOverageCap": "side-effect (set/clear both write-only)",
-	"cmdRestore":    "side-effect only; no body",
-	"cmdWhoami":     "shell-sourceable plaintext exports",
+	"cmdBackup":   "operator fs writes",
+	"cmdHostAge":  "operator fs writes",
+	"cmdPKI":      "operator fs writes",
+	"cmdSignKeys": "operator fs writes",
+	"cmdNodeKey":  "operator fs writes",
 }
-
-// cmdTrustedPublishers and other operator-side verbs (cmdBackup,
-// cmdHostAge, cmdPKI, cmdSignKeys, cmdManifestDispatch,
-// cmdReleaseDispatch) moved to cmd/gregalectl/ in PR-6.5 — their
-// nonJSONAllowList entries live in cmd/gregalectl/json_parity_test.go.
 
 // TestJSONOutputHonored is the parity gate. Fails loudly when a
 // top-level cmdXxx references jsonOutput (or any of its leaves
-// does) but no test exercises that branch. Fails loudly when
-// an old test gets removed and the reference lingers.
+// does) but no test exercises that branch.
 func TestJSONOutputHonored(t *testing.T) {
 	jsonCmds, err := collectJSONEmitters()
 	if err != nil {
@@ -62,7 +44,6 @@ func TestJSONOutputHonored(t *testing.T) {
 		t.Fatal("no jsonOutput emitters found — extractor is broken")
 	}
 
-	// Reduce leaf bodies to their top-level dispatcher name.
 	topLevel := map[string]bool{}
 	for _, name := range jsonCmds {
 		top := topLevelDispatcher(name)
@@ -86,10 +67,6 @@ func TestJSONOutputHonored(t *testing.T) {
 	}
 }
 
-// topLevelDispatcher maps a leaf cmdXxx to its top-level parent
-// by walking cliCommands and matching the longest prefix. For
-// example, cmdRegistryList → cmdRegistry, cmdAlertAdd → cmdAlerts.
-// Returns "" for the top-level cmd itself.
 func topLevelDispatcher(leaf string) string {
 	best := ""
 	for _, c := range cliCommands {
@@ -106,8 +83,7 @@ func topLevelDispatcher(leaf string) string {
 // collectJSONEmitters walks every non-test .go file in the
 // current package directory and returns the set of func cmdXxx
 // names whose body references the package-level jsonOutput
-// identifier. Mirrors the AST-walk pattern in
-// extractPrintUsageTopics (commands_completion_test.go).
+// identifier. Mirrors cmd/gregale/json_parity_test.go:111.
 func collectJSONEmitters() ([]string, error) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -140,7 +116,11 @@ func collectJSONEmitters() ([]string, error) {
 				if !ok {
 					return true
 				}
-				if id.Name == "jsonOutput" {
+				// Operator-side dispatchers reference jsonOutput
+				// either directly OR through the jsonEnabled()
+				// wrapper (commands_manifest.go:211). Both signal
+				// "this dispatcher honours --json".
+				if id.Name == "jsonOutput" || id.Name == "jsonEnabled" {
 					hasJSON = true
 					return false
 				}
@@ -157,9 +137,7 @@ func collectJSONEmitters() ([]string, error) {
 
 // jsonTestedTopLevel walks every _test.go file and maps every
 // jsonOutput reference to the enclosing top-level cmdXxx
-// dispatcher. Strips the "Test" prefix and the "_..." suffix to
-// derive the cmdXxx name. Returns the set of top-level cmdXxx
-// names that have at least one JSON test.
+// dispatcher. Mirrors cmd/gregale/json_parity_test.go:163.
 func jsonTestedTopLevel() map[string]bool {
 	tested := map[string]bool{}
 	entries, _ := os.ReadDir(".")
@@ -172,7 +150,6 @@ func jsonTestedTopLevel() map[string]bool {
 		if err != nil {
 			continue
 		}
-		// Build list of Test* funcs with start positions.
 		type tfunc struct {
 			name  string
 			start token.Pos
@@ -191,15 +168,12 @@ func jsonTestedTopLevel() map[string]bool {
 				return true
 			}
 			rest = strings.TrimPrefix(rest, "Cmd")
-			// Strip optional _<subtest> suffix.
 			if idx := strings.Index(rest, "_"); idx >= 0 {
 				rest = rest[:idx]
 			}
 			tests = append(tests, tfunc{name: rest, start: fn.Body.Pos()})
 			return true
 		})
-		// Find every jsonOutput reference; bucket it into the
-		// earliest test whose start position is ≤ the reference.
 		ast.Inspect(f, func(n ast.Node) bool {
 			id, ok := n.(*ast.Ident)
 			if !ok || id.Name != "jsonOutput" {
@@ -207,10 +181,6 @@ func jsonTestedTopLevel() map[string]bool {
 			}
 			for _, tf := range tests {
 				if tf.start <= id.Pos() {
-					// Map the test name back to a top-level
-					// dispatcher. The test name is "Cmd" + leaf
-					// (e.g. "CmdBillingPortal"); reduce via the
-					// same `topLevelDispatcher` helper.
 					full := "cmd" + tf.name
 					top := topLevelDispatcher(full)
 					if top == "" {
