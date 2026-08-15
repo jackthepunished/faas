@@ -30,13 +30,18 @@ import (
 	"sort"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
+	"github.com/onebox-faas/faas/pkg/renderer"
 )
 
-// subValidate is the leaf name. Render / Install follow in PR-2 / PR-3.
-const subValidate = "validate"
+// subValidate is the leaf name. Render follows in PR-2.
+const (
+	subValidate = "validate"
+	subRender   = "render"
+)
 
 // cmdManifestDispatch is the parent dispatcher. With zero args it
-// prints usage; with `validate` it fans to cmdManifestValidate.
+// prints usage; with `validate` it fans to cmdManifestValidate;
+// with `render` it fans to cmdManifestRender (PR-2).
 func cmdManifestDispatch(args []string) int {
 	if len(args) == 0 {
 		printManifestUsage(os.Stderr)
@@ -45,11 +50,13 @@ func cmdManifestDispatch(args []string) int {
 	switch args[0] {
 	case subValidate:
 		return cmdManifestValidate(args[1:])
+	case subRender:
+		return cmdManifestRender(args[1:])
 	case flagHelpShort, flagHelpLong:
 		printManifestUsage(os.Stderr)
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "gregale manifest: unknown subcommand %q (expected: validate)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregale manifest: unknown subcommand %q (expected: validate, render)\n", args[0])
 		return 1
 	}
 }
@@ -59,21 +66,38 @@ func printManifestUsage(w io.Writer) {
 
 Subcommands:
   validate    Validate a manifest YAML file (canonical path: pkg/manifest.Validate)
+  render      Render a validated manifest to /etc/faas/*.toml +
+              systemd units + cgroup subtree_control + PKI leaves
+              (canonical path: pkg/renderer.Render)
 
 Flags (validate):
   --file PATH   Path to the manifest YAML file (required).
   --json        Emit JSON output instead of human-readable text.
                 FAAS_JSON=1 env also works.
 
+Flags (render):
+  --manifest-file PATH     Path to the manifest YAML file (required).
+  --host NAME              Host in the manifest to render (default: first host).
+  --releases-root DIR      Releases root (default /opt/faas/releases).
+  --etc-faas-dir DIR       TOML root (default /etc/faas).
+  --systemd-dir DIR        systemd unit tree (default /etc/systemd/system).
+  --pki-root-dir DIR       PKI root (default /etc/faas/tls).
+  --cgroup-root DIR        cgroup v2 mount root (default /sys/fs/cgroup).
+  --host-san-file PATH     Optional JSON file with per-host SANs.
+  --dry-run                Compute all outputs but do not write.
+  --json                   Emit JSON output instead of human-readable text.
+
 Exit codes:
-  0  Manifest is valid.
-  1  Manifest is invalid (one or more validation errors).
+  0  Manifest is valid / render succeeded (or short-circuited).
+  1  Manifest is invalid (one or more validation errors) / render
+     failed (validator rejected, manifest missing, path rejected).
   3  Manifest could not be loaded (file missing, parse error,
      or unsupported schema_version).
 
 Examples:
   gregale manifest validate --file=deploy/manifest/examples/splitbox.example.yaml
   gregale manifest validate --file=splitbox.yaml --json
+  gregale manifest render --manifest-file=splitbox.yaml --host=fsn-1 --dry-run --json
 `)
 }
 
@@ -194,4 +218,82 @@ func jsonEnabled() bool {
 // validator.
 func catalogHostKeys() []string {
 	return manifest.SortedHostKeys()
+}
+
+// cmdManifestRender runs the renderer against a manifest. The
+// function returns 0 for a successful render (including a no-op
+// idempotent short-circuit), 1 for a load / validate / path
+// failure, 3 for a renderer-level error (PKI generation failed,
+// cgroup write failed, manifest.toml placement rejected, etc.).
+func cmdManifestRender(args []string) int {
+	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
+		PrintUsage(os.Stderr, "usage: gregale manifest render --manifest-file PATH [--host NAME] [--dry-run] [--json]", "manifest")
+		return 0
+	}
+	fs := flag.NewFlagSet("manifest render", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	manifestFile := fs.String("manifest-file", "", "path to the manifest YAML file (required)")
+	host := fs.String("host", "", "host in the manifest to render (default: first host)")
+	releasesRoot := fs.String("releases-root", "", "releases root (default /opt/faas/releases)")
+	etcFaasDir := fs.String("etc-faas-dir", "", "TOML root (default /etc/faas)")
+	systemdDir := fs.String("systemd-dir", "", "systemd unit tree (default /etc/systemd/system)")
+	pkiRootDir := fs.String("pki-root-dir", "", "PKI root (default /etc/faas/tls)")
+	cgroupRoot := fs.String("cgroup-root", "", "cgroup v2 mount root (default /sys/fs/cgroup)")
+	hostSANFile := fs.String("host-san-file", "", "optional JSON file with per-host SANs")
+	dryRun := fs.Bool("dry-run", false, "compute outputs but do not write")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *manifestFile == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "gregale manifest render: --manifest-file is required")
+		return 1
+	}
+	opts := renderer.RenderOptions{
+		ManifestPath: *manifestFile,
+		Host:         *host,
+		ReleasesRoot: *releasesRoot,
+		EtcFaasDir:   *etcFaasDir,
+		SystemdDir:   *systemdDir,
+		PKIRootDir:   *pkiRootDir,
+		CgroupRoot:   *cgroupRoot,
+		HostSANFile:  *hostSANFile,
+		DryRun:       *dryRun,
+	}
+	report, err := renderer.Render(opts)
+	if err != nil {
+		// Distinguish render-side errors (validator reject, PKI
+		// failure, cgroup write) from load errors. Load errors
+		// already prefix "renderer: load ..."; render errors
+		// prefix "renderer: <daemon>: ..." or "renderer: cgroup:
+		// ...". Both surface exit code 1 (operator-visible
+		// failure); code 3 is reserved for the validator's load
+		// contract.
+		if jsonEnabled() {
+			jsonEmit(os.Stderr, struct {
+				File  string `json:"file"`
+				Host  string `json:"host,omitempty"`
+				Error string `json:"error"`
+			}{*manifestFile, *host, err.Error()})
+		} else {
+			_, _ = fmt.Fprintf(os.Stderr, "gregale manifest render: %v\n", err)
+		}
+		return 1
+	}
+	if jsonEnabled() {
+		jsonEmit(os.Stdout, report)
+	} else {
+		action := "wrote"
+		if report.Skipped {
+			action = "skipped (idempotent)"
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "%s: %s (host=%s, manifest_hash=%s, outputs=%d)\n",
+			*manifestFile, action, report.Host, report.ManifestHash, len(report.Outputs))
+		for _, o := range report.Outputs {
+			_, _ = fmt.Fprintf(os.Stdout, "  %s: %s (%d bytes)\n", o.Action, o.Path, o.Bytes)
+		}
+		for _, a := range report.Audit {
+			_, _ = fmt.Fprintf(os.Stdout, "  audit: %s\n", a)
+		}
+	}
+	return 0
 }

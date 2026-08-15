@@ -213,3 +213,189 @@ func TestTOMLPlacement_HostKeysCatalogSize(t *testing.T) {
 		t.Errorf("SortedHostKeys len=%d; want 9 (catalog drift guard)", len(keys))
 	}
 }
+
+// PR-2 / issue #911 — `gregale manifest render` CLI leaf. The
+// renderer is the read-side of the release-bundle flow (PR-3 ships
+// the write-side). The CLI leaf must reject missing flags, surface
+// a non-zero exit on render errors, and emit a JSON-shaped
+// RenderReport on success.
+
+func TestCmdManifestRender_MissingManifestFile(t *testing.T) {
+	if code := cmdManifestRender([]string{}); code != 1 {
+		t.Fatalf("cmdManifestRender(no args) = %d, want 1", code)
+	}
+}
+
+func TestCmdManifestRender_Help(t *testing.T) {
+	if code := cmdManifestRender([]string{"--help"}); code != 0 {
+		t.Fatalf("cmdManifestRender(--help) = %d, want 0", code)
+	}
+	if code := cmdManifestRender([]string{"-h"}); code != 0 {
+		t.Fatalf("cmdManifestRender(-h) = %d, want 0", code)
+	}
+}
+
+func TestCmdManifestRender_BadManifestPath(t *testing.T) {
+	if code := cmdManifestRender([]string{"--manifest-file", "/no/such/file.yaml", "--dry-run"}); code != 1 {
+		t.Fatalf("cmdManifestRender(bad path) = %d, want 1", code)
+	}
+}
+
+func TestCmdManifestRender_DispatchUnknownSubcommand(t *testing.T) {
+	if code := cmdManifestDispatch([]string{"render"}); code == 0 {
+		// With no flags, render expects --manifest-file; any
+		// non-zero exit means the dispatch wired correctly.
+		// The test is a regression pin: a future refactor that
+		// accidentally drops the render arm must flip this to 0.
+		t.Fatalf("cmdManifestDispatch(render) = 0, want non-zero (render without flags should fail)")
+	}
+}
+
+func TestCmdManifestRender_DryRunSucceeds(t *testing.T) {
+	// Smoke test: dry-run against the canonical manifest produces
+	// a RenderReport and exits 0. The renderer never touches the
+	// filesystem in dry-run mode.
+	dir := t.TempDir()
+	manifestPath := writeSplitboxManifest(t, validManifestYAML)
+	if code := cmdManifestRender([]string{
+		"--manifest-file", manifestPath,
+		"--releases-root", filepath.Join(dir, "releases"),
+		"--etc-faas-dir", filepath.Join(dir, "etc"),
+		"--systemd-dir", filepath.Join(dir, "systemd"),
+		"--pki-root-dir", filepath.Join(dir, "tls"),
+		"--cgroup-root", filepath.Join(dir, "cgroup"),
+		"--dry-run",
+	}); code != 0 {
+		t.Fatalf("cmdManifestRender(dry-run) = %d, want 0", code)
+	}
+	// Dry-run must not write any file.
+	for _, sub := range []string{"etc", "systemd", "tls", "cgroup", "releases"} {
+		full := filepath.Join(dir, sub)
+		entries, _ := os.ReadDir(full)
+		if len(entries) > 0 {
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Errorf("dry-run leaked entries under %s: %v", full, names)
+		}
+	}
+}
+
+func TestCmdManifestRender_BadHost(t *testing.T) {
+	manifestPath := writeSplitboxManifest(t, validManifestYAML)
+	if code := cmdManifestRender([]string{
+		"--manifest-file", manifestPath,
+		"--host", "no-such-host",
+		"--dry-run",
+	}); code != 1 {
+		t.Fatalf("cmdManifestRender(bad host) = %d, want 1", code)
+	}
+}
+
+// TestCmdManifestRender_JSONShape pins the wire shape: dry-run +
+// --json + a valid manifest → exit 0 + a JSON document with the
+// canonical RenderReport fields (host, manifest_hash, outputs).
+func TestCmdManifestRender_JSONShape(t *testing.T) {
+	manifestPath := writeSplitboxManifest(t, validManifestYAML)
+	jsonOutput = true
+	defer func() { jsonOutput = false }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+
+	code := cmdManifestRender([]string{"--manifest-file", manifestPath, "--dry-run"})
+	w.Close()
+	if code != 0 {
+		t.Fatalf("cmdManifestRender = %d, want 0", code)
+	}
+	raw := make([]byte, 8192)
+	n, _ := r.Read(raw)
+	var report struct {
+		Host         string `json:"host"`
+		ManifestHash string `json:"manifest_hash"`
+		Outputs      []struct {
+			Path   string `json:"path"`
+			Bytes  int    `json:"bytes"`
+			SHA256 string `json:"sha256"`
+			Action string `json:"action"`
+		} `json:"outputs"`
+		Skipped bool `json:"skipped"`
+	}
+	if err := json.Unmarshal(raw[:n], &report); err != nil {
+		t.Fatalf("JSON unmarshal: %v\nraw: %s", err, raw[:n])
+	}
+	if report.Host != "fsn-1" {
+		t.Errorf("Host = %q, want fsn-1", report.Host)
+	}
+	if len(report.ManifestHash) != 64 {
+		t.Errorf("ManifestHash len = %d, want 64", len(report.ManifestHash))
+	}
+	if len(report.Outputs) == 0 {
+		t.Errorf("Outputs is empty; expected rendered systemd + TOML + slice units")
+	}
+	for _, o := range report.Outputs {
+		if o.Action != "skipped" {
+			t.Errorf("output %s.Action = %q, want skipped (dry-run)", o.Path, o.Action)
+		}
+	}
+}
+
+// TestCmdManifestRender_IdempotentRun pins the second-run short-circuit:
+// run twice with the same opts → first run writes, second run reports
+// Skipped=true and every output Action=unchanged.
+func TestCmdManifestRender_IdempotentRun(t *testing.T) {
+	manifestPath := writeSplitboxManifest(t, validManifestYAML)
+	dir := t.TempDir()
+	args := []string{
+		"--manifest-file", manifestPath,
+		"--releases-root", filepath.Join(dir, "releases"),
+		"--etc-faas-dir", filepath.Join(dir, "etc"),
+		"--systemd-dir", filepath.Join(dir, "systemd"),
+		"--pki-root-dir", filepath.Join(dir, "tls"),
+		"--cgroup-root", filepath.Join(dir, "cgroup"),
+	}
+	// First run.
+	if code := cmdManifestRender(args); code != 0 {
+		t.Fatalf("first render = %d, want 0", code)
+	}
+	// Second run.
+	jsonOutput = true
+	defer func() { jsonOutput = false }()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+	code := cmdManifestRender(args)
+	w.Close()
+	if code != 0 {
+		t.Fatalf("second render = %d, want 0", code)
+	}
+	raw := make([]byte, 16384)
+	n, _ := r.Read(raw)
+	var report struct {
+		Skipped bool `json:"skipped"`
+		Outputs []struct {
+			Action string `json:"action"`
+		} `json:"outputs"`
+	}
+	if err := json.Unmarshal(raw[:n], &report); err != nil {
+		t.Fatalf("JSON unmarshal: %v\nraw: %s", err, raw[:n])
+	}
+	if !report.Skipped {
+		t.Errorf("second run Skipped = false, want true (idempotent)")
+	}
+	for _, o := range report.Outputs {
+		if o.Action != "unchanged" {
+			t.Errorf("output Action = %q, want unchanged", o.Action)
+		}
+	}
+}

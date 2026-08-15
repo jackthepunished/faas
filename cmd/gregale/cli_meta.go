@@ -490,12 +490,27 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "manifest",
 		DocSlug: "manifest",
-		Short:   "Operator split-box deployment manifest (manifest validate --file PATH; issue #911 / ADR-110)",
+		Short:   "Operator split-box deployment manifest (manifest validate|render; issue #911 / ADR-110)",
 		Subcommands: []cliSub{
 			{
 				Name:  "validate",
 				Short: "Validate a manifest YAML file (canonical path: pkg/manifest.Validate)",
 				Flags: []cliFlag{{Name: "file", Short: "path to the manifest YAML file (required)"}},
+			},
+			{
+				Name:  "render",
+				Short: "Render a validated manifest to /etc/faas/*.toml + systemd units + cgroup subtree_control + PKI leaves (canonical path: pkg/renderer.Render)",
+				Flags: []cliFlag{
+					{Name: "manifest-file", Short: "path to the manifest YAML file (required)", Req: true},
+					{Name: "host", Short: "host in the manifest to render (default: first host)"},
+					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
+					{Name: "etc-faas-dir", Short: "TOML root (default /etc/faas)"},
+					{Name: "systemd-dir", Short: "systemd unit tree (default /etc/systemd/system)"},
+					{Name: "pki-root-dir", Short: "PKI root (default /etc/faas/tls)"},
+					{Name: "cgroup-root", Short: "cgroup v2 mount root (default /sys/fs/cgroup)"},
+					{Name: "host-san-file", Short: "optional JSON file with per-host SANs"},
+					{Name: "dry-run", Short: "compute outputs but do not write"},
+				},
 			},
 		},
 	},
