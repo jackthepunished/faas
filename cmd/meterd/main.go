@@ -623,6 +623,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err := role.Require("meterd", cfg.Role, role.RoleSingleBox, role.RoleControlPlane); err != nil {
 		return err
 	}
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity. Mirrors schedd/apid/gatewayd-public so
+	// the playbook shape is identical across daemons.
+	if cfg.NodeName != "" {
+		log.Info("meterd owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("meterd: legacy single-box (cfg.NodeName empty)")
+	}
 	mc, err := deps.loadMeter(cfg)
 	if err != nil {
 		return err

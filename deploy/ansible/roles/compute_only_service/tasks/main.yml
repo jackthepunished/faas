@@ -56,6 +56,20 @@
     daemon_reload: true
   when: imaged_unit.changed
 
+# Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
+# env line into the imaged unit so the boot log carries the right
+# identity without a TOML edit (imaged has no config.go). The
+# drop-in mirrors deploy/ansible/roles/control_plane_service/
+# templates/99-faas-node-name.conf.j2 — body is identical across
+# roles.
+- name: compute_only_service — install FAAS_NODE_NAME drop-in (Mega-PR-A)
+  ansible.builtin.template:
+    src: 99-faas-node-name.conf.j2
+    dest: /etc/systemd/system/faas-imaged.service.d/99-faas-node-name.conf
+    owner: root
+    group: root
+    mode: "0644"
+
 # ADR-038 build attestations. Must exist before faas-imaged starts:
 # a ReadWritePaths= target that does not exist makes systemd fail the
 # mount-namespace setup, so creating the dir and listing it in the unit

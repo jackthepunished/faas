@@ -146,6 +146,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): capture FAAS_NODE_NAME
+	// before any control-plane handshake so the boot log carries the
+	// identity. gatewayd-public has no config.go today (env-only);
+	// the systemd drop-in (deploy/ansible/roles/gatewayd_public_service/
+	// files/faas-gatewayd-public.service.d/99-faas-node-name.conf) is
+	// the only source. Empty + log.Info("legacy single-box") mirrors
+	// the schedd owner-node line so an operator reading either journal
+	// gets the same diagnostic shape.
+	if nodeName := os.Getenv("FAAS_NODE_NAME"); nodeName != "" {
+		log.Info("gatewayd-public owner node", "node_name", nodeName)
+	} else {
+		log.Info("gatewayd-public: legacy single-box (FAAS_NODE_NAME unset)")
+	}
+
 	log.Info("gatewayd-public: starting", "pid", os.Getpid())
 
 	// Postgres — required for the readiness ping (no other PG

@@ -1,0 +1,17 @@
+[Service]
+# Mega-PR-A (issue #911 / ADR-110 PR-1): expose this box's compute_node
+# identity to every control-plane daemon (apid / schedd / meterd /
+# githubd) so the multi-box handshake layer reads the right name
+# without requiring a TOML edit on each box add. The value comes from
+# host_vars faas_node_name (deploy/ansible/host_vars/faas-fsn-N.yml);
+# ansible renders this drop-in at deploy time and systemd loads it
+# automatically when the unit is reloaded. Empty FAAS_NODE_NAME on a
+# single-box dev box is OK — every daemonside LoadConfig short-
+# circuits to "legacy single-box" when the env is unset, so a missed
+# host_var never silently misconfigures.
+#
+# Mirrors deploy/ansible/roles/<other_role>/templates/
+# 99-faas-node-name.conf.j2 — the body is intentionally identical
+# across roles so an operator only ever needs to set faas_node_name
+# once per host.
+Environment=FAAS_NODE_NAME={{ faas_node_name }}

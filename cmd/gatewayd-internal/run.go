@@ -563,6 +563,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := role.Require("gatewayd-internal", cfg.Role, role.RoleSingleBox, role.RoleComputeOnly); err != nil {
 		return err
 	}
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity. Mirrors schedd/apid/meterd/githubd/
+	// gatewayd-public so the playbook shape is identical across
+	// daemons.
+	if cfg.NodeName != "" {
+		log.Info("gatewayd-internal owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("gatewayd-internal: legacy single-box (cfg.NodeName empty)")
+	}
 
 	// Phase 2 / Gate A: per-node schedd client cache. Wires the
 	// production dial closure (cross-box via pkg/overlay for tcp
