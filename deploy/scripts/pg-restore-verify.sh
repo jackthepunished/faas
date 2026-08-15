@@ -52,10 +52,16 @@ LIVE_PG_BIN="${LIVE_PG_BIN:-/usr/lib/postgresql/15/bin}"
 # Off-host storage-box wiring — driven by the same env vars the
 # postgres_backup role reads at ansible-run time. Source
 # /etc/faas/sealed.env before running.
-RCLONE_REMOTE="${RCLONE_REMOTE:-hertznerbox}"
+#
+# PR-8 (issue #911 / ADR-110 deferred): HETZNER_STORAGE_BOX_* vars
+# → OFF_HOST_BACKUP_*. Rclone remote alias hertznerbox: → offhostbox:.
+# The on-disk secret path /etc/faas/secrets/storage-box/rclone.conf
+# stays (the LoadCredential= in 99-faas-off-host-backup.conf references
+# it). Operators must rename env vars in /etc/faas/sealed.env.
+RCLONE_REMOTE="${RCLONE_REMOTE:-offhostbox}"
 RCLONE_CONF="${RCLONE_CONF:-/etc/faas/secrets/storage-box/rclone.conf}"
-BASEBACKUP_PATH="${HETZNER_STORAGE_BOX_BASEBACKUP_PATH:-faas-pg-basebackup}"
-WAL_PATH="${HETZNER_STORAGE_BOX_WAL_PATH:-faas-pg-wal}"
+BASEBACKUP_PATH="${OFF_HOST_BACKUP_BASEBACKUP_PATH:-faas-pg-basebackup}"
+WAL_PATH="${OFF_HOST_BACKUP_WAL_PATH:-faas-pg-wal}"
 
 heading() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok()      { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
