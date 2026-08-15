@@ -59,7 +59,8 @@
 
 # Owner of the vmmd unix socket. The runtime toml default
 # `owner_user = "faas-vmmd"` (cmd/vmmd/config.go::Config.OwnerUser,
-# deploy/etc/vmmd.toml.example:15) requires this uid to exist on
+# see deploy/ansible/roles/vmmd_service/files/vmmd.toml.example
+# for the canonical reference copy) requires this uid to exist on
 # the host — pkg/wire/ListenOrRecreate looks it up via user.Lookup
 # to chown the socket (pkg/wire/grpc.go:340-343). Without it,
 # the 61fedaa and earlier binaries refuse to bind

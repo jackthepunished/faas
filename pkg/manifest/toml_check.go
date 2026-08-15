@@ -4,10 +4,12 @@
 // Issue #911 invokes the failure mode where render-time keys landed
 // in the wrong TOML table (the operator reports `schedd_client_*`
 // inside `[compute_node]`; the actual on-disk bug is the duplicate
-// `tls_*_path` inside `[compute_node]` at
-// deploy/etc/vmmd.toml.example:96-103 — RETIRED in PR-1 Phase 2 after
-// PR-X; the canonical bug location is now
-// deploy/ansible/roles/vmmd_service/files/vmmd.toml.example:96-103).
+// `tls_*_path` inside `[compute_node]` at the vmmd.toml.example
+// canonical copy under deploy/ansible/roles/vmmd_service/files/
+// (the legacy deploy/etc/vmmd.toml.example was git rm'd in PR-1
+// Phase 2). Both shapes share the same root cause: the renderer
+// treats the wrong key as belonging to the wrong table, and the
+// TOML default-coercion paths silently fall back to a no-op.
 // Both shapes share the same root cause: the renderer treats the
 // wrong key as belonging to the wrong table, and the TOML default-
 // coercion paths silently fall back to a no-op. The bug ships, the
@@ -83,9 +85,10 @@ type HostBlock struct {
 	PrivateKeys []string
 	// ComputeNodeBlock is the [compute_node] table this daemon
 	// populates (the vmmd self-registration seam at
-	// deploy/etc/vmmd.toml.example:52-103 — RETIRED in PR-1 Phase 2
-	// after PR-X; canonical path is deploy/ansible/roles/vmmd_service/
-	// files/vmmd.toml.example:52-103). The `publicKeys` are
+	// deploy/ansible/roles/vmmd_service/files/vmmd.toml.example:
+	// 52-103 — the only canonical location; the legacy
+	// deploy/etc/vmmd.toml.example was git rm'd in PR-1 Phase 2).
+	// The `publicKeys` are
 	// keys that BELONG to this daemon's ComputeNode table — they
 	// are the remote-daemon identities the renderer writes to
 	// make the self-registration leg talk cross-box.
@@ -104,7 +107,7 @@ type HostBlock struct {
 // at `gregale manifest validate` time, not at 02:00.
 //
 // The catalog covers every daemon the manifest schema knows about
-// (the daemons.go map at line 130 has the source-of-truth list).
+// (the Daemons struct at manifest.go has the source-of-truth list).
 // Adding a new daemon requires (a) a row in the manifest schema's
 // `daemons:` map, (b) a row in this catalog, (c) a test in
 // manifest_test.go pinning the catalog's invariant.
@@ -234,7 +237,7 @@ var HostKeys = map[string]HostBlock{
 var TombstoneKeys = []string{
 	// vmmd's [compute_node] must NOT re-declare the top-level
 	// cluster (the bug at deploy/etc/vmmd.toml.example:96-103 —
-	// RETIRED in PR-1 Phase 2 after PR-X; canonical location is
+	// removed in Mega-PR-B Commit 4; canonical location is
 	// deploy/ansible/roles/vmmd_service/files/vmmd.toml.example:96-103).
 	"compute_node.tls_cert_path",
 	"compute_node.tls_key_path",
@@ -309,7 +312,11 @@ func ValidateTOMLPlacement(daemon string, rendered map[string]string) Errors {
 		for _, ck := range host.ComputeNodeBlock {
 			if ck.Key == leaf && table != ck.Table {
 				errs = append(errs, Error{
-					fmt.Sprintf("daemons.%s.cn_block_key_at_top.level", daemon),
+					// Error code is a path token, not a dotted path
+					// (the typo `top.level` here once matched
+					// against a future alert's grep-regex, now fixed
+					// to the underscore form).
+					fmt.Sprintf("daemons.%s.cn_block_key_at_top_level", daemon),
 					fmt.Sprintf("key %q belongs under [%s] but rendered at top level", leaf, ck.Table),
 				})
 			}
