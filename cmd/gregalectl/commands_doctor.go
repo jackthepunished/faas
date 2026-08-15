@@ -944,12 +944,17 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			})
 			continue
 		}
-		// Mode check. The load-bearing check is "≤ 0o644"; the
-		// exact mode is the canonical value. We surface a
-		// "wrong mode" finding when the file is world-writable
-		// OR the canonical mode is not met.
+		// Mode check. The load-bearing contract is "no
+		// group/world bits + user bits ≤ canonical" — spec §11
+		// says secrets are not world- or group-readable. We
+		// accept a stricter mode (e.g. 0o400 instead of 0o440)
+		// but never a looser one, and never anything with group
+		// or world bits set. The exact-mode comparison was
+		// over-strict: a 0o000 mode (rare but valid for an
+		// un-read file) wouldn't match 0o400.
 		got := info.Mode().Perm()
-		if got != mustParsePerm(s.want) {
+		want := mustParsePerm(s.want)
+		if got&(0o077) != 0 || got&0o700 > want&0o700 {
 			findings = append(findings, doctorFinding{
 				Check:    doctorCheckSecrets,
 				Severity: doctorSeverityError,
@@ -984,28 +989,67 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 	// cert_fingerprint match (DB-side). Only runs when the
 	// on-disk side passes AND a DB store is available. A
 	// missing DB makes the on-disk check the only signal —
-	// the operator can run `secrets init --role=...` to re-stamp.
-	if deps.store != nil && deps.nodeFilter != "" {
-		row, err := deps.store.GetComputeNode(ctx, deps.nodeFilter)
-		if err == nil && row.CertFingerprint != nil {
-			hostAgeBytes, rerr := os.ReadFile("/etc/faas/secrets/host.age")
-			if rerr == nil {
-				sum := sha256.Sum256(hostAgeBytes)
-				got := hex.EncodeToString(sum[:])
-				if got != *row.CertFingerprint {
-					findings = append(findings, doctorFinding{
-						Check:    doctorCheckSecrets,
-						Severity: doctorSeverityWarn,
-						Message:  fmt.Sprintf("cert_fingerprint mismatch (on-disk %s, row %s)", got[:12], (*row.CertFingerprint)[:min(12, len(*row.CertFingerprint))]),
-						Detail:   "re-run 'gregalectl secrets init' to re-stamp compute_nodes.cert_fingerprint",
-					})
-					// Bump generation on detected drift. The
-					// releaseinstall.Store method is a follow-up
-					// patch; for v1 we surface the finding only
-					// (the doctor doesn't bump yet).
-					_ = row
-				}
-			}
+	// the operator can run `secrets init` to re-stamp. The
+	// check walks EVERY compute_nodes row (no --node filter
+	// gate) so a per-node drift on a multi-host cluster
+	// surfaces even when the operator runs `gregalectl
+	// doctor` without flags.
+	if deps.store == nil {
+		return findings, nil
+	}
+	nodes, err := deps.store.ListComputeNodes(ctx)
+	if err != nil {
+		findings = append(findings, doctorFinding{
+			Check:    doctorCheckSecrets,
+			Severity: doctorSeverityError,
+			Message:  "cert_fingerprint check: list compute_nodes failed",
+			Detail:   err.Error(),
+		})
+		return findings, nil
+	}
+	hostAgeBytes, rerr := os.ReadFile("/etc/faas/secrets/host.age")
+	if rerr != nil {
+		// Already surfaced above as a "missing host.age"
+		// finding; skip the per-row fingerprint walk because
+		// every row would mismatch.
+		return findings, nil
+	}
+	sum := sha256.Sum256(hostAgeBytes)
+	got := hex.EncodeToString(sum[:])
+	for _, n := range nodes {
+		if n.CertFingerprint == nil {
+			continue
+		}
+		rowFP := *n.CertFingerprint
+		if rowFP == got {
+			continue
+		}
+		rowFPShort := rowFP
+		if len(rowFPShort) > 12 {
+			rowFPShort = rowFPShort[:12]
+		}
+		gotShort := got
+		if len(gotShort) > 12 {
+			gotShort = gotShort[:12]
+		}
+		findings = append(findings, doctorFinding{
+			Check:    doctorCheckSecrets,
+			Severity: doctorSeverityWarn,
+			Message:  fmt.Sprintf("%s cert_fingerprint mismatch (on-disk %s, row %s)", n.Name, gotShort, rowFPShort),
+			Detail:   "re-run 'gregalectl secrets init' to re-stamp compute_nodes.cert_fingerprint",
+		})
+		// Bump generation as a soft audit-trail signal —
+		// the next doctor run surfaces this as a generation
+		// bump rather than a stale-fingerprint finding. A bump
+		// failure is non-fatal for checkSecrets (the warning
+		// is the primary signal).
+		if _, bumpErr := deps.store.BumpComputeNodeGeneration(ctx, n.Name); bumpErr != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckSecrets,
+				Severity: doctorSeverityWarn,
+				Message:  fmt.Sprintf("%s generation bump failed after fingerprint drift", n.Name),
+				Detail:   bumpErr.Error(),
+			})
 		}
 	}
 	return findings, nil

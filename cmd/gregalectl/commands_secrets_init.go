@@ -44,11 +44,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"filippo.io/age"
 
+	"github.com/onebox-faas/faas/pkg/releaseinstall"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Canonical installation paths for the four post-bootstrap secrets.
@@ -105,15 +111,17 @@ func cmdSecretsDispatch(args []string) int {
 }
 
 // secretsInitFlags is the shared flag struct for the init leaf.
-// host/role are the PostgreSQL compute_nodes lookup keys (the
-// renderer's SetComputeNodeRole post-render target).
+// host is the PostgreSQL compute_nodes.name lookup key.
+// The role column is intentionally NOT here — the renderer
+// (Commit 2) writes compute_nodes.role, not secrets init.
+// The --no-db flag was removed in PR-924 follow-up: a missing
+// FAAS_PG_DSN is a soft warning, not an opt-out switch; the DB
+// write fires whenever the DSN is set.
 type secretsInitFlags struct {
 	dir   string
 	force bool
 	host  string
-	role  string
 	dsn   string
-	noDB  bool
 }
 
 func newSecretsInitFlags(name string, defaultForce bool) (*flag.FlagSet, *secretsInitFlags) {
@@ -122,9 +130,7 @@ func newSecretsInitFlags(name string, defaultForce bool) (*flag.FlagSet, *secret
 	fs.StringVar(&f.dir, "dir", defaultSecretsDir, "root secrets directory (default /etc/faas/secrets)")
 	fs.BoolVar(&f.force, "force", defaultForce, "overwrite existing secret files (default false)")
 	fs.StringVar(&f.host, "host", "", "compute_nodes.name to stamp (default: hostname from os.Hostname)")
-	fs.StringVar(&f.role, "role", "", "compute_nodes.role to stamp (default: empty; renderer will set on next render)")
 	fs.StringVar(&f.dsn, "pg-dsn", "", "PostgreSQL DSN (default: $FAAS_PG_DSN)")
-	fs.BoolVar(&f.noDB, "no-db", false, "skip the compute_nodes.cert_fingerprint write even when FAAS_PG_DSN is set")
 	return fs, f
 }
 
@@ -182,7 +188,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// chown root:postgres (best-effort; postgres may not exist
 	// on a dev box).
 	boxAgePath := filepath.Join(storageDir, "box-age-key")
-	if err := writeBoxAgeKey(boxAgePath, f.force); err != nil {
+	if err := writeBoxAgeKey(boxAgePath, f.force, stdout); err != nil {
 		return err
 	}
 
@@ -202,7 +208,7 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 	// (postgres_backup/tasks/main.yml) passes before the unseal
 	// step.
 	rclonePath := filepath.Join(storageDir, "rclone.conf")
-	if err := writeRcloneStub(rclonePath, f.force); err != nil {
+	if err := writeRcloneStub(rclonePath, f.force, stdout); err != nil {
 		return err
 	}
 
@@ -227,13 +233,51 @@ func secretsInit(f *secretsInitFlags, stdout io.Writer) error {
 		}
 		host = h
 	}
-	if !f.noDB && (f.dsn != "" || os.Getenv("FAAS_PG_DSN") != "") {
-		if err := writeComputeNodeCert(host, hostCertPEM, hostCertFP, f.dsn, stdout); err != nil {
+	dsn := f.dsn
+	if dsn == "" {
+		dsn = os.Getenv("FAAS_PG_DSN")
+	}
+	if dsn != "" {
+		if err := writeComputeNodeCert(dsn, host, hostCertPEM, hostCertFP, stdout); err != nil {
 			// Soft warning — the file writes succeeded; the DB
 			// write is a downstream signal the doctor will
 			// detect on the next run.
 			_, _ = fmt.Fprintf(stdout, "warning: compute_nodes.cert_fingerprint write failed: %v\n", err)
 		}
+	}
+	return nil
+}
+
+// chownRootPostgres sets the file group to postgres (best-effort —
+// the postgres group may not exist on a dev box; emit a warning on
+// lookup failure rather than refusing init, since the canonical
+// owner:root:root posture plus the 0440 mode is the load-bearing
+// identity contract per spec §11). Failures of the actual Chown
+// syscall (path mismatch, EPERM) DO error — those are config drift.
+func chownRootPostgres(path string, stdout io.Writer) error {
+	g, err := user.LookupGroup("postgres")
+	if err != nil {
+		if stdout != nil {
+			_, _ = fmt.Fprintf(stdout, "warning: postgres group lookup failed (chown skipped for %s): %v\n", path, err)
+		}
+		return nil
+	}
+	gid, gerr := strconv.Atoi(g.Gid)
+	if gerr != nil {
+		return fmt.Errorf("parse postgres gid %q: %w", g.Gid, gerr)
+	}
+	if err := os.Chown(path, 0, gid); err != nil {
+		return fmt.Errorf("chown root:postgres %s: %w", path, err)
+	}
+	return nil
+}
+
+// enforceFileMode re-applies the requested mode after WriteFile.
+// The umask may loosen the mode WriteFile requests, so a post-write
+// Chmod is the only way to guarantee the contract on disk.
+func enforceFileMode(path string, mode os.FileMode) error {
+	if err := os.Chmod(path, mode); err != nil {
+		return fmt.Errorf("chmod %04o %s: %w", mode, path, err)
 	}
 	return nil
 }
@@ -254,6 +298,9 @@ func writeHostAge(path string, force bool) (*age.X25519Identity, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := enforceFileMode(path, 0o400); err != nil {
+		return nil, err
+	}
 	return id, nil
 }
 
@@ -263,7 +310,7 @@ func writeHostAge(path string, force bool) (*age.X25519Identity, error) {
 // (the file content is the identity string per filippo.io/age
 // convention). Postgres may not exist on a dev install — the
 // chown is best-effort and the mode is the load-bearing contract.
-func writeBoxAgeKey(path string, force bool) error {
+func writeBoxAgeKey(path string, force bool, stdout io.Writer) error {
 	if !force {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("%w: %s", ErrSecretsInitRefuseOverwrite, path)
@@ -274,8 +321,11 @@ func writeBoxAgeKey(path string, force bool) error {
 	if _, err := secretbox.GenerateAndSaveHostKey(path); err != nil {
 		return err
 	}
-	if err := os.Chmod(path, 0o440); err != nil {
-		return fmt.Errorf("chmod 0440 %s: %w", path, err)
+	if err := enforceFileMode(path, 0o440); err != nil {
+		return err
+	}
+	if err := chownRootPostgres(path, stdout); err != nil {
+		return err
 	}
 	return nil
 }
@@ -299,6 +349,9 @@ func writeSessionKey(path string, force bool) error {
 	if err := os.WriteFile(path, hexBytes, 0o400); err != nil {
 		return fmt.Errorf("write session.key %s: %w", path, err)
 	}
+	if err := enforceFileMode(path, 0o400); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -306,7 +359,7 @@ func writeSessionKey(path string, force bool) error {
 // replaces it with the real plaintext via `backup unseal-rclone`.
 // The stub is a single line of JSON so the ansible stat-assert
 // (postgres_backup/tasks/main.yml:198) passes.
-func writeRcloneStub(path string, force bool) error {
+func writeRcloneStub(path string, force bool, stdout io.Writer) error {
 	if !force {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("%w: %s", ErrSecretsInitRefuseOverwrite, path)
@@ -317,6 +370,12 @@ func writeRcloneStub(path string, force bool) error {
 	stub := []byte(`{"_":"secrets init stub — replace via 'gregalectl backup unseal-rclone'"}`)
 	if err := os.WriteFile(path, stub, 0o440); err != nil {
 		return fmt.Errorf("write rclone.conf stub %s: %w", path, err)
+	}
+	if err := enforceFileMode(path, 0o440); err != nil {
+		return err
+	}
+	if err := chownRootPostgres(path, stdout); err != nil {
+		return err
 	}
 	return nil
 }
@@ -338,22 +397,27 @@ func writeArchiveStub(path string, force bool) error {
 	if err := os.WriteFile(path, stub, 0o400); err != nil {
 		return fmt.Errorf("write archive-creds.json stub %s: %w", path, err)
 	}
+	if err := enforceFileMode(path, 0o400); err != nil {
+		return err
+	}
 	return nil
 }
 
 // writeComputeNodeCert writes the host_certificate +
 // cert_fingerprint columns. Mirrors the Write path in
 // pkg/releaseinstall/store.go (PR-X / Commit 3).
-func writeComputeNodeCert(host string, pem, fingerprint []byte, dsn string, stdout io.Writer) error {
-	_ = host
-	_ = pem
-	_ = fingerprint
-	_ = dsn
-	_ = stdout
-	// The releaseinstall.Store method is wired in Commit 3's
-	// follow-up patch (UpdateCertFingerprint). The stub keeps
-	// the file-write side green; the DB write is a no-op today
-	// and will be flipped on when the Store method lands.
+func writeComputeNodeCert(dsn, host string, pem, fingerprint []byte, stdout io.Writer) error {
+	pool, err := openPgPoolFromDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("open pg pool: %w", err)
+	}
+	defer pool.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := releaseinstall.NewStore(pool)
+	if err := store.StampHostCertificate(ctx, host, string(pem), string(fingerprint)); err != nil {
+		return fmt.Errorf("stamp host cert: %w", err)
+	}
 	return nil
 }
 
@@ -446,7 +510,22 @@ func sha256Hex(data []byte) []byte {
 	return out
 }
 
-// context.Background is a thin wrapper around context.Background
-// kept here so the file-imports stay flat. Used by future
-// follow-up patches that wire the releaseinstall.Store method.
-var _ = context.Background
+// openPgPoolFromDSN returns a pgxpool.Pool from an explicit DSN
+// (does NOT consult FAAS_PG_DSN — callers that want env-fallback
+// must resolve the DSN first; secrets init flags do exactly this).
+// Used by writeComputeNodeCert; mirrors openPgPoolFromEnv in
+// commands_release.go.
+func openPgPoolFromDSN(dsn string) (*pgxpool.Pool, error) {
+	if dsn == "" {
+		return nil, fmt.Errorf("dsn is empty")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse dsn: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("open pgxpool: %w", err)
+	}
+	return pool, nil
+}

@@ -86,6 +86,27 @@ type Store interface {
 	// false if the role was already set to the same value
 	// (idempotent second render).
 	SetComputeNodeRole(ctx context.Context, name, role string) (bool, error)
+	// StampHostCertificate writes the host_certificate +
+	// cert_fingerprint columns on the row whose name matches. PR-X
+	// secrets init (issue #911 / ADR-110) calls this after writing
+	// the on-disk host.age identity so the doctor's secrets check
+	// (PR-4) can compare the recomputed fingerprint against the
+	// stamped value. Idempotent (UPDATE ... WHERE name = $1).
+	//
+	// Returns ErrComputeNodeNotFound if no row exists for the
+	// given name — the secrets init's typical sequence is
+	// UpsertComputeNode (PR-6) then StampHostCertificate; a
+	// missing row at this step means releaseinstall was skipped,
+	// which is a deploy-order bug.
+	StampHostCertificate(ctx context.Context, name, pem, fingerprint string) error
+	// BumpComputeNodeGeneration increments the generation column
+	// on the row whose name matches. PR-4 doctor (issue #911 /
+	// ADR-110) calls this when checkSecrets detects a
+	// cert_fingerprint drift so the next doctor run surfaces
+	// "row was bumped by secrets drift" rather than a
+	// stale-fingerprint finding. Returns (newGen, nil) on success
+	// or ErrComputeNodeNotFound when the row is missing.
+	BumpComputeNodeGeneration(ctx context.Context, name string) (int, error)
 }
 
 // ErrNotFound is returned by GetByGitSHA when no row matches.
@@ -96,6 +117,23 @@ var ErrNotFound = errors.New("releaseinstall: bundle not found")
 // from ErrNotFound so callers can distinguish "no bundle row" from
 // "no compute node row" without parsing the message.
 var ErrComputeNodeNotFound = errors.New("releaseinstall: compute node not found")
+
+// ErrInvalidRole is returned by SetComputeNodeRole when the role
+// argument is not one of the canonical values (issue #911 / ADR-110).
+// The set is closed: only values that have a manifest case in
+// pkg/manifest are accepted. Empty string is permitted as the
+// "unset" sentinel used by single-box dev (no role column write).
+var ErrInvalidRole = errors.New("releaseinstall: invalid compute_nodes role (must be single-box, control-plane, compute-only, or empty)")
+
+// canonicalComputeNodeRoles is the closed enum SetComputeNodeRole
+// accepts. Every additive role gets a new branch here + a new case
+// in pkg/manifest/toml_check.go (per doc-comment on the store).
+var canonicalComputeNodeRoles = map[string]bool{
+	"":              true,
+	"single-box":    true,
+	"control-plane": true,
+	"compute-only":  true,
+}
 
 // ComputeNodeRow mirrors the columns PR-6 reads from compute_nodes
 // after UpsertComputeNode. The original four fields (id, name,
@@ -439,8 +477,8 @@ func (s pgStore) SetComputeNodeRole(ctx context.Context, name, role string) (boo
 	if name == "" {
 		return false, fmt.Errorf("releaseinstall: empty compute_nodes name")
 	}
-	if role == "" {
-		return false, fmt.Errorf("releaseinstall: empty role")
+	if !canonicalComputeNodeRoles[role] {
+		return false, fmt.Errorf("%w (got %q)", ErrInvalidRole, role)
 	}
 	// Conditional UPDATE returns the row only when the role actually
 	// changed; if the row already has the role, RETURNING is empty
@@ -470,4 +508,59 @@ func (s pgStore) SetComputeNodeRole(ctx context.Context, name, role string) (boo
 		return false, fmt.Errorf("releaseinstall: set compute_nodes role: %w", err)
 	}
 	return true, nil
+}
+
+// StampHostCertificate implements Store. Conditional UPDATE keyed
+// by name; returns ErrComputeNodeNotFound when the row is absent
+// (the doctor's row-walk never lands here because PR-6 stamps the
+// row first, but the safety net matters for the
+// `gregalectl secrets init` first-run path where the operator
+// hasn't yet run releaseinstall).
+func (s pgStore) StampHostCertificate(ctx context.Context, name, pem, fingerprint string) error {
+	if name == "" {
+		return fmt.Errorf("releaseinstall: empty compute_nodes name")
+	}
+	if pem == "" {
+		return fmt.Errorf("releaseinstall: empty host_certificate pem")
+	}
+	if fingerprint == "" {
+		return fmt.Errorf("releaseinstall: empty cert_fingerprint")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		update compute_nodes
+		   set host_certificate = $2,
+		       cert_fingerprint = $3
+		 where name = $1
+	`, name, pem, fingerprint)
+	if err != nil {
+		return fmt.Errorf("releaseinstall: stamp host cert: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrComputeNodeNotFound
+	}
+	return nil
+}
+
+// BumpComputeNodeGeneration implements Store. Atomic
+// generation = generation + 1 RETURNING — the next doctor run
+// picks up the delta as a generation-bump finding rather than a
+// stale-fingerprint finding (the audit trail the operator needs).
+func (s pgStore) BumpComputeNodeGeneration(ctx context.Context, name string) (int, error) {
+	if name == "" {
+		return 0, fmt.Errorf("releaseinstall: empty compute_nodes name")
+	}
+	var newGen int
+	err := s.pool.QueryRow(ctx, `
+		update compute_nodes
+		   set generation = coalesce(generation, 0) + 1
+		 where name = $1
+		returning generation
+	`, name).Scan(&newGen)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrComputeNodeNotFound
+		}
+		return 0, fmt.Errorf("releaseinstall: bump generation: %w", err)
+	}
+	return newGen, nil
 }

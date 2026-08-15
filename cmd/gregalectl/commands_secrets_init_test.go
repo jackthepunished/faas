@@ -26,8 +26,15 @@ import (
 // functions with --dir=<tmp> so the operator default
 // (/etc/faas/secrets) is bypassed in the dev loop. The dispatcher
 // itself is tested directly (TestSecretsDispatch_*).
+//
+// The init tests assert file-side effects only, so we forcibly
+// clear FAAS_PG_DSN for the duration of the call (t.Setenv rolls
+// back automatically on test exit). This matches the original
+// `--no-db` semantics without carrying a CLI flag that's only
+// meaningful in tests.
 func runSecretsInit(t *testing.T, dir string, args []string) (string, error) {
 	t.Helper()
+	t.Setenv("FAAS_PG_DSN", "")
 	args = append([]string{"--dir", dir}, args...)
 	return captureStdout(t, func() int {
 		return cmdSecretsInit(args)
@@ -96,7 +103,7 @@ func TestSecretsInit_RefuseNonRoot(t *testing.T) {
 		t.Skip("CI runs gregalectl tests as root; non-root path is exercised manually")
 	}
 	dir := t.TempDir()
-	_, err := runSecretsInit(t, dir, []string{"--no-db"})
+	_, err := runSecretsInit(t, dir, nil)
 	if err == nil {
 		t.Fatalf("expected non-root error, got nil")
 	}
@@ -113,7 +120,7 @@ func TestSecretsInit_WriteAllFive(t *testing.T) {
 		t.Skip("test requires root (CI default; dev-loop Mac regular users skip)")
 	}
 	dir := t.TempDir()
-	out, err := runSecretsInit(t, dir, []string{"--no-db"})
+	out, err := runSecretsInit(t, dir, nil)
 	if err != nil {
 		t.Fatalf("secrets init: %v (out=%s)", err, out)
 	}
@@ -176,10 +183,10 @@ func TestSecretsInit_RefuseOverwrite(t *testing.T) {
 		t.Skip("test requires root")
 	}
 	dir := t.TempDir()
-	if _, err := runSecretsInit(t, dir, []string{"--no-db"}); err != nil {
+	if _, err := runSecretsInit(t, dir, nil); err != nil {
 		t.Fatalf("first init: %v", err)
 	}
-	_, err := runSecretsInit(t, dir, []string{"--no-db"})
+	_, err := runSecretsInit(t, dir, nil)
 	if err == nil {
 		t.Errorf("second init without --force = nil err, want refuse-overwrite")
 	}
@@ -191,10 +198,10 @@ func TestSecretsInit_ForceOverwrite(t *testing.T) {
 		t.Skip("test requires root")
 	}
 	dir := t.TempDir()
-	if _, err := runSecretsInit(t, dir, []string{"--no-db"}); err != nil {
+	if _, err := runSecretsInit(t, dir, nil); err != nil {
 		t.Fatalf("first init: %v", err)
 	}
-	out, err := runSecretsInit(t, dir, []string{"--force", "--no-db"})
+	out, err := runSecretsInit(t, dir, []string{"--force"})
 	if err != nil {
 		t.Errorf("force re-init: %v (out=%s)", err, out)
 	}
@@ -206,7 +213,7 @@ func TestSecretsInit_ForceOverwrite(t *testing.T) {
 func TestSecretsStatus_PrintsFileModes(t *testing.T) {
 	dir := t.TempDir()
 	if os.Geteuid() == 0 {
-		if _, err := runSecretsInit(t, dir, []string{"--no-db"}); err != nil {
+		if _, err := runSecretsInit(t, dir, nil); err != nil {
 			t.Fatalf("init: %v", err)
 		}
 	}

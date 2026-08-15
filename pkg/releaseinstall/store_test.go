@@ -19,6 +19,7 @@ package releaseinstall
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -249,8 +250,8 @@ func (s *fakeStore) SetComputeNodeRole(_ context.Context, name, role string) (bo
 	if name == "" {
 		return false, errors.New("releaseinstall: empty compute_nodes name")
 	}
-	if role == "" {
-		return false, errors.New("releaseinstall: empty role")
+	if !canonicalComputeNodeRoles[role] {
+		return false, fmt.Errorf("%w (got %q)", ErrInvalidRole, role)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -263,6 +264,48 @@ func (s *fakeStore) SetComputeNodeRole(_ context.Context, name, role string) (bo
 	}
 	row.Role = &role
 	return true, nil
+}
+
+// StampHostCertificate implements Store (PR-X / Commit 6).
+func (s *fakeStore) StampHostCertificate(_ context.Context, name, pem, fingerprint string) error {
+	if name == "" {
+		return errors.New("releaseinstall: empty compute_nodes name")
+	}
+	if pem == "" {
+		return errors.New("releaseinstall: empty host_certificate pem")
+	}
+	if fingerprint == "" {
+		return errors.New("releaseinstall: empty cert_fingerprint")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.cnRows[name]
+	if !ok {
+		return ErrComputeNodeNotFound
+	}
+	row.HostCertificate = &pem
+	row.CertFingerprint = &fingerprint
+	return nil
+}
+
+// BumpComputeNodeGeneration implements Store (PR-4 / Commit 6).
+func (s *fakeStore) BumpComputeNodeGeneration(_ context.Context, name string) (int, error) {
+	if name == "" {
+		return 0, errors.New("releaseinstall: empty compute_nodes name")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.cnRows[name]
+	if !ok {
+		return 0, ErrComputeNodeNotFound
+	}
+	gen := 0
+	if row.Generation != nil {
+		gen = *row.Generation
+	}
+	gen++
+	row.Generation = &gen
+	return gen, nil
 }
 
 func sampleBundle(sha string) Bundle {
@@ -769,3 +812,95 @@ func TestFakeStore_SetComputeNodeRole_EmptyInputs(t *testing.T) {
 // 	}
 // 	return out
 // }
+
+// PR-6 follow-up: SetComputeNodeRole rejects any value not in the
+// canonical enum {single-box, control-plane, compute-only, ""}.
+func TestFakeStore_SetComputeNodeRole_InvalidRole(t *testing.T) {
+	s := newFakeStore()
+	for _, bad := range []string{"primary", "all", "control_plane", "controlplane", "Compute-Only"} {
+		if _, err := s.SetComputeNodeRole(context.Background(), "node-X", bad); err == nil {
+			t.Errorf("SetComputeNodeRole(%q) = nil err, want ErrInvalidRole", bad)
+		} else if !errors.Is(err, ErrInvalidRole) {
+			t.Errorf("SetComputeNodeRole(%q) err = %v, want ErrInvalidRole", bad, err)
+		}
+	}
+}
+
+// TestFakeStore_StampHostCertificate_HappyPath pins the PR-X
+// writer: secrets init sets host_certificate + cert_fingerprint
+// keyed by name. Idempotent re-call overwrites with the new
+// fingerprint (rotate path).
+func TestFakeStore_StampHostCertificate_HappyPath(t *testing.T) {
+	s := newFakeStore()
+	sha := strings.Repeat("a", 40)
+	mh := "sha256:" + strings.Repeat("a", 64)
+	if _, err := s.UpsertComputeNode(context.Background(), "node-1", sha, mh); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := s.StampHostCertificate(context.Background(), "node-1", "PEM-A", "fp-A"); err != nil {
+		t.Fatalf("StampHostCertificate: %v", err)
+	}
+	row, err := s.GetComputeNode(context.Background(), "node-1")
+	if err != nil {
+		t.Fatalf("GetComputeNode: %v", err)
+	}
+	if row.HostCertificate == nil || *row.HostCertificate != "PEM-A" {
+		t.Errorf("HostCertificate = %v, want PEM-A", row.HostCertificate)
+	}
+	if row.CertFingerprint == nil || *row.CertFingerprint != "fp-A" {
+		t.Errorf("CertFingerprint = %v, want fp-A", row.CertFingerprint)
+	}
+	// Idempotent overwrite (rotate).
+	if err := s.StampHostCertificate(context.Background(), "node-1", "PEM-B", "fp-B"); err != nil {
+		t.Fatalf("StampHostCertificate (rotate): %v", err)
+	}
+	row, _ = s.GetComputeNode(context.Background(), "node-1")
+	if row.HostCertificate == nil || *row.HostCertificate != "PEM-B" {
+		t.Errorf("after rotate, HostCertificate = %v, want PEM-B", row.HostCertificate)
+	}
+}
+
+func TestFakeStore_StampHostCertificate_NotFound(t *testing.T) {
+	s := newFakeStore()
+	err := s.StampHostCertificate(context.Background(), "ghost", "PEM", "fp")
+	if !errors.Is(err, ErrComputeNodeNotFound) {
+		t.Errorf("err = %v, want ErrComputeNodeNotFound", err)
+	}
+}
+
+// TestFakeStore_BumpComputeNodeGeneration pins PR-4 doctor's
+// drift signal: BumpGeneration bumps the generation column,
+// idempotent re-calls keep stepping up.
+func TestFakeStore_BumpComputeNodeGeneration(t *testing.T) {
+	s := newFakeStore()
+	sha := strings.Repeat("b", 40)
+	mh := "sha256:" + strings.Repeat("b", 64)
+	if _, err := s.UpsertComputeNode(context.Background(), "node-1", sha, mh); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	gen1, err := s.BumpComputeNodeGeneration(context.Background(), "node-1")
+	if err != nil {
+		t.Fatalf("Bump1: %v", err)
+	}
+	if gen1 != 1 {
+		t.Errorf("Bump1 gen = %d, want 1", gen1)
+	}
+	gen2, err := s.BumpComputeNodeGeneration(context.Background(), "node-1")
+	if err != nil {
+		t.Fatalf("Bump2: %v", err)
+	}
+	if gen2 != 2 {
+		t.Errorf("Bump2 gen = %d, want 2", gen2)
+	}
+	row, _ := s.GetComputeNode(context.Background(), "node-1")
+	if row.Generation == nil || *row.Generation != 2 {
+		t.Errorf("Generation = %v, want 2", row.Generation)
+	}
+}
+
+func TestFakeStore_BumpComputeNodeGeneration_NotFound(t *testing.T) {
+	s := newFakeStore()
+	if _, err := s.BumpComputeNodeGeneration(context.Background(), "ghost"); !errors.Is(err, ErrComputeNodeNotFound) {
+		t.Errorf("err = %v, want ErrComputeNodeNotFound", err)
+	}
+}
