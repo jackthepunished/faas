@@ -13,9 +13,10 @@
 #
 # Set HETZNER_STORAGE_BOX_USER / HETZNER_STORAGE_BOX_HOST in
 # /etc/faas/sealed.env (operator-provisioned surface — see
-# deploy/controlplane/sealed.env.example). The vars are intentionally
-# left un-defaulted; the postgres_backup role refuses to deploy
-# off-host backup without a real endpoint.
+# deploy/controlplane/sealed.env.example, RETIRED 2026-08-15 by
+# issue #911 / PR-1; the v2 path is PR-X `gregale secrets init`).
+# The vars are intentionally left un-defaulted; the postgres_backup
+# role refuses to deploy off-host backup without a real endpoint.
 
 hetzner_storage_box_user: "{{ lookup('env', 'HETZNER_STORAGE_BOX_USER') | default('', true) }}"
 hetzner_storage_box_host: "{{ lookup('env', 'HETZNER_STORAGE_BOX_HOST') | default('', true) }}"

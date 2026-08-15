@@ -5,11 +5,13 @@
 // in the wrong TOML table (the operator reports `schedd_client_*`
 // inside `[compute_node]`; the actual on-disk bug is the duplicate
 // `tls_*_path` inside `[compute_node]` at
-// deploy/etc/vmmd.toml.example:96-103). Both shapes share the same
-// root cause: the renderer treats the wrong key as belonging to the
-// wrong table, and the TOML default-coercion paths silently fall
-// back to a no-op. The bug ships, the daemon refuses to start, and
-// the operator debugs at 02:00.
+// deploy/etc/vmmd.toml.example:96-103 — RETIRED in PR-1 Phase 2 after
+// PR-X; the canonical bug location is now
+// deploy/ansible/roles/vmmd_service/files/vmmd.toml.example:96-103).
+// Both shapes share the same root cause: the renderer treats the
+// wrong key as belonging to the wrong table, and the TOML default-
+// coercion paths silently fall back to a no-op. The bug ships, the
+// daemon refuses to start, and the operator debugs at 02:00.
 //
 // The fix is a structural check that runs during
 // `gregale manifest validate` and refuses any manifest whose daemon
@@ -81,7 +83,9 @@ type HostBlock struct {
 	PrivateKeys []string
 	// ComputeNodeBlock is the [compute_node] table this daemon
 	// populates (the vmmd self-registration seam at
-	// deploy/etc/vmmd.toml.example:52-103). The `publicKeys` are
+	// deploy/etc/vmmd.toml.example:52-103 — RETIRED in PR-1 Phase 2
+	// after PR-X; canonical path is deploy/ansible/roles/vmmd_service/
+	// files/vmmd.toml.example:52-103). The `publicKeys` are
 	// keys that BELONG to this daemon's ComputeNode table — they
 	// are the remote-daemon identities the renderer writes to
 	// make the self-registration leg talk cross-box.
@@ -229,7 +233,9 @@ var HostKeys = map[string]HostBlock{
 // The slice is sorted for stable error messages.
 var TombstoneKeys = []string{
 	// vmmd's [compute_node] must NOT re-declare the top-level
-	// cluster (the bug at deploy/etc/vmmd.toml.example:96-103).
+	// cluster (the bug at deploy/etc/vmmd.toml.example:96-103 —
+	// RETIRED in PR-1 Phase 2 after PR-X; canonical location is
+	// deploy/ansible/roles/vmmd_service/files/vmmd.toml.example:96-103).
 	"compute_node.tls_cert_path",
 	"compute_node.tls_key_path",
 	"compute_node.tls_ca_path",

@@ -874,9 +874,11 @@ jobs:
     # exceeded`) on the Azure centralus runner. Switch the image to
     # mirror.gcr.io (Google's transparent mirror of Docker Hub, no auth,
     # no per-IP rate limit) — same pattern as FAAS_BUILDER_BASE_REF on
-    # the prod box (deploy/controlplane/sealed.env.example:22). A
-    # pre-step `docker pull` with retry covers the case where the service
-    # container's own pull path flakes before the retry.
+    # the prod box (deploy/controlplane/sealed.env.example:22 —
+    # RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+    # `gregale secrets init`). A pre-step `docker pull` with retry
+    # covers the case where the service container's own pull path
+    # flakes before the retry.
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1067,9 +1069,14 @@ jobs:
     # pkg/daemonunitspec. Asserts that the systemd unit files in the
     # three deploy trees (cp-cp, cp-sys, cp-ans) + daemons.json are
     # byte-equal to what `make generate` would emit from the current
-    # spec files. Pattern matches proto-check / sqlc-check / egress-
-    # check (regenerate-to-tmpdir + git diff --exit-code). PR authors
-    # who edit a UnitXxx() must run `make generate` locally and
+    # spec files. PR-1: cp-cp is the v1 deploy/controlplane/systemd
+    # tree (tombstone now; deletion in PR-1 Phase 2 after PR-X); the
+    # CD pipeline rewired in PR-1 reads units from per-role ansible
+    # files/ instead. cp-cp stays in the gate until Phase 2 lands so
+    # a daemonunitspec change cannot silently drift. Pattern matches
+    # proto-check / sqlc-check / egress-check (regenerate-to-tmpdir
+    # + git diff --exit-code). PR authors who edit a UnitXxx() must
+    # run `make generate` locally and
     # commit the regenerated trees.
     name: daemonunit-check (generated drift)
     runs-on: ubuntu-latest

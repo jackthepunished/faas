@@ -36,10 +36,12 @@
 #     (NOT a faas concern; documented in the runbook).
 #   * No `gregale backup unseal-archive-creds` invocation
 #     here — that CLI ships in PR-A and the operator
-#     runs it once during bootstrap.sh step 11d (mirrors
-#     the unseal-rclone flow at deploy/ansible/roles/
-#     postgres/files/postgresql.service.d/
-#     99-faas-storage-box.conf). This role assumes the
+#     runs it once during bootstrap.sh step 11d (RETIRED
+#     2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+#     `gregale secrets init`); mirrors the unseal-rclone
+#     flow at deploy/ansible/roles/postgres/files/
+#     postgresql.service.d/99-faas-storage-box.conf).
+#     This role assumes the
 #     envelope is already on disk; the assert catches
 #     any future perms drift.
 #   * No S3 lifecycle policy attachment — that's an
@@ -67,9 +69,11 @@
   failed_when: false  # chroot/CI may not have /etc/faas/secrets
 
 # Skipped in chroot/CI (no /etc/faas/secrets/ yet). On a real
-# EX44 the bootstrap.sh step that unseals host.age-sealed
+# EX44 the v1 bootstrap.sh step that unseals host.age-sealed
 # secrets into the staging dir is required before this role
-# passes — same shape as the postgres_backup perms assert.
+# passes (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is
+# PR-X `gregale secrets init`) — same shape as the postgres_backup
+# perms assert.
 - name: log_archive — assert creds envelope matches perms profile
   ansible.builtin.assert:
     that:

@@ -877,7 +877,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
 	// /healthz, 5s graceful shutdown on drain. Empty cfg.MetricsAddr
 	// disables both endpoints (the production default in
-	// deploy/etc/meterd.toml.example).
+	// deploy/etc/meterd.toml.example — RETIRED in PR-1 Phase 2 after
+	// PR-X; the v2 path is deploy/ansible/roles/control_plane_service/
+	// files/meterd.toml.example).
 	const metricsPath = "/metrics"
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {

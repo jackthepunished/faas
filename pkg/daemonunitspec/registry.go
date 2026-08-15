@@ -8,8 +8,8 @@ import (
 
 // Entry is one row of the daemon registry — the canonical (name, unit,
 // restart classification) tuple that the deploy generator emits into
-// both the systemd tree and the cd-controlplane workflow's
-// daemons.json.
+// the per-role systemd files/ tree and the cd-controlplane workflow's
+// daemons.json output target.
 //
 // `Critical` controls which list the daemon lands in
 // deploy/etc/daemons.json:
@@ -93,6 +93,10 @@ func UnitByName(name string) (daemonunit.Unit, error) {
 // stabilises post-DEPLOY-1).
 //
 // The slice is emitted to deploy/controlplane/systemd/faas-cp.slice
-// only; it is NOT a daemon and lives outside the Registry iteration
-// because it is the wrapper, not a member.
+// AND mirrored to deploy/ansible/roles/control_plane_service/files/
+// faas-cp.slice (PR-1: the v2 tree is the canonical source for the CD
+// pipeline; the v1 deploy/controlplane/ is a tombstone now, scheduled
+// for deletion in PR-1 Phase 2 after PR-X). The slice is NOT a daemon
+// and lives outside the Registry iteration because it is the wrapper,
+// not a member.
 const FaasCPSlice = "faas-cp.slice"

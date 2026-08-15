@@ -108,7 +108,9 @@
 
 ## Config additions
 
-Per-daemon `*.toml.example` files gain three new fields per remote role:
+Per-daemon `*.toml.example` files gain three new fields per remote role
+(PR-1: the v1 deploy/etc/*.toml.example fixtures are a tombstone now;
+canonical is deploy/ansible/roles/*/files/*.toml.example):
 
 ```toml
 # vmmd.toml — new client cluster for schedd + apid-advisory
@@ -325,7 +327,7 @@ dial to a remote role.
 | `cmd/apid/config.go` | new `AdvisoryTLSCfg` + `GithubdTLSCfg` |
 | `cmd/apid/main.go` | thread TLS into advisory listener + githubd client |
 | `cmd/apid/githubd_client.go` | accept TLS config from caller |
-| `deploy/ansible/roles/*/files/*.toml.example` | new fields in 5 files |
+| `deploy/ansible/roles/*/files/*.toml.example` | new fields in 5 files (PR-1: canonical TOML fixtures) |
 | `deploy/ansible/roles/control_plane_service/tasks/main.yml` | new stat-assert task for `/etc/faas/tls/` |
 | `Makefile` | no change — CLI rides on `gregale` binary |
 | `docs/adr/025-decoupled-control-plane-and-compute.md` | update §1 to remove stale `credentials.NewTLS(creds)` snippet, reference `wire.LoadClientTLSConfig*` |

@@ -86,7 +86,7 @@ Gate-B is the deployment-shape layer on top of these three. No new mTLS primitiv
 ## Future work
 
 - **PGNodeVerifier wiring on cross-box mTLS dials.** The first cross-box mTLS dial lands in a future slice (Tier A10 PR-D standby write-redirect already exposes this gap). When the first cross-box hop arrives, wire `PGNodeVerifier` on the dialer + receiver's server-side `LoadServerTLSConfigWithPrefixAndVerifier` + client-side `LoadClientTLSConfigWithPrefixAndVerifier` paths, mirroring `cmd/vmmd/main.go:826-844`.
-- **`builderd` ansible role.** `builderd` has no unit file in tree today and is only deployed via `make metal-lima` / `bootstrap.sh`. A future slice adds `deploy/ansible/roles/builderd_service/` parallel to `vmmd_service`.
+- **`builderd` ansible role.** `builderd` has no unit file in tree today and is only deployed via `make metal-lima` / `bootstrap.sh` (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap` + `gregale manifest {validate,render}` + `gregale release install`). A future slice adds `deploy/ansible/roles/builderd_service/` parallel to `vmmd_service`.
 - **Live-cutover runbook.** The current runbook `docs/runbooks/multi-host-rollout.md` §Pre-flight is the Gate-B operator-facing reference. A future `docs/runbooks/gate-b-live-cutover.md` should capture the fsn-1 / fsn-2 in-place migration sequence (which boxes to drain first, the `faas-fsn-2` capacity-report pre-warm, the first cross-box handshake sanity check).
 - **Multi-host HA (ADR-083 Tier A8 active-passive).** Already shipped as `pkg/gateway/leader/leader.go`. Gate-B is the cutover step; the N+1 active-passive topology is a follow-up.
 

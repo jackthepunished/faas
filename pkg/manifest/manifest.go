@@ -14,9 +14,10 @@
 // The renderer (PR-2), the release bundle installer (PR-3), and the
 // doctor (PR-4) consume this package but ship in later PRs.
 //
-// Out of scope (PR-0): provisioning secrets (PR-X refactor of
-// deploy/controlplane/bootstrap.sh), the actual file generation
-// (PR-2), runtime checks against a live fleet (PR-4).
+// Out of scope (PR-0): provisioning secrets (PR-X refactor of the
+// v1 deploy/controlplane/bootstrap.sh, now RETIRED 2026-08-15 by
+// issue #911 / PR-1 — see deploy/controlplane/RETIRED.md), the actual
+// file generation (PR-2), runtime checks against a live fleet (PR-4).
 package manifest
 
 import (
@@ -123,8 +124,8 @@ type Manifest struct {
 	// Cgroups is the cgroup v2 controller requirements. The
 	// renderer writes +memory +cpu +io +pids to the per-host
 	// subtree_control (the only place the production path lands
-	// today is deploy/lima/run-metal.sh:84; bootstrap.sh + ansible
-	// both skip it — issue #911).
+	// today is deploy/lima/run-metal.sh:84 + the renderer; the
+	// v1 bootstrap.sh + ansible skip it — issue #911).
 	Cgroups Cgroups `yaml:"cgroups"`
 
 	// PKI is the certificate authority wiring. The renderer issues
@@ -254,7 +255,8 @@ type DNS struct {
 // PostgreSQL is the database cluster configuration. The renderer needs
 // the role names and the database name to write the per-daemon
 // `pg_hba.conf` / `pg_ident.conf` entries (the `faas_map` ident map
-// is bootstrap.sh-only today; PR-2 / PR-X wire it into the renderer).
+// is the v1 bootstrap.sh-only today — RETIRED 2026-08-15 by issue #911
+// / PR-1; PR-2 / PR-X wire it into the renderer).
 type PostgreSQL struct {
 	// DSN is the connection string the daemons use (`postgres://…`).
 	// The validator only checks the shape; the renderer writes it

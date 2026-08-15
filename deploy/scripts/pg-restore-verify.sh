@@ -69,7 +69,7 @@ heading "0/5 Pre-flight"
 [[ "$(uname -s)" == "Linux" ]] || fail "verify must run on the EX44 (Linux)"
 [[ $EUID -eq 0 ]] || fail "must run as root (writes /var/lib/pgsql, opens privileged ports)"
 command -v rclone >/dev/null 2>&1 || fail "rclone not on PATH — apt install rclone first"
-[[ -f "$RCLONE_CONF" ]] || fail "$RCLONE_CONF missing — run bootstrap.sh's storage-box unseal step"
+[[ -f "$RCLONE_CONF" ]] || fail "$RCLONE_CONF missing — run 'gregale backup unseal-rclone' (PR-X 'gregale secrets init' supersedes bootstrap.sh; PR-1 retired bootstrap.sh 2026-08-15)"
 [[ "$(stat -c '%a %U %G' "$RCLONE_CONF")" == "400 root root" ]] \
   || fail "$RCLONE_CONF must be 0400 root:root (spec §11)"
 

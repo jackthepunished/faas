@@ -84,7 +84,12 @@
 # /run/faas as root:root 0755 first, so tmpfiles finds it existing
 # and skips the chown. Without this, githubd (User=faas Group=faas)
 # can't bind() /run/faas/githubd.sock on every re-run. Idempotent.
-# See deploy/controlplane/tmpfiles.d/faas.conf for the canonical rationale.
+# The canonical rationale lives at this file's mirror
+# (deploy/controlplane/tmpfiles.d/faas.conf, a tombstone now —
+# RETIRED 2026-08-15 by issue #911 / PR-1; see
+# deploy/controlplane/RETIRED.md). PR-1 rewrote the CD pipeline to
+# read this file from deploy/ansible/roles/control_plane_service/
+# files/faas.conf instead.
 - name: control_plane_service — chown /run/faas to root:faas 0775 (PR-M)
   ansible.builtin.file:
     path: /run/faas

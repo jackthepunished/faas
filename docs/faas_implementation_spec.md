@@ -139,7 +139,7 @@ As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-
 | `/auth/reset`, `/auth/reset/...`       | Password reset completion (issue #165 / PR #180)          | Auth flows                                       |
 | `/logout`, `/logout/`, `/logout/...`   | Session logout                                             | Auth flows                                       |
 | `/status`, `/status/`, `/status/...`   | Public status page (§12)                                   | Spec §12 panel surface                           |
-| `/healthz`                             | Loopback infra probe (CD health check)                     | Required by `deploy/digitalocean/bootstrap.sh` and `cd-digitalocean.yml` post-deploy smoke |
+| `/healthz`                             | Loopback infra probe (CD health check)                     | Required by `deploy/digitalocean/bootstrap.sh` (no longer in tree; canonical path was `deploy/controlplane/bootstrap.sh`, RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap` + `gregale manifest {validate,render}` + `gregale release install`) and `cd-digitalocean.yml` post-deploy smoke |
 | `/cli-auth`                            | Device-code approval page (§2.2)                           | CLI pairing                                      |
 | `/v1/apps/{slug}/logs`                 | Carve-out — `gatewayd-internal`'s own `AppLogsHandler` (issue #254 / Move 4 PR-2) | Customer log stream routed via gatewayd-internal→schedd  |
 

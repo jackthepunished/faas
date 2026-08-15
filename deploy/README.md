@@ -28,7 +28,11 @@ make test               # cross-platform unit tests
   via the `nftables` ansible role.
 - `scripts/` — ops helpers (`leakcheck.sh` for the shell-side check,
   restore drill planned for M8).
-- `controlplane/` — standalone Control Plane deploy path (any KVM-capable cloud: GCP, DigitalOcean, Hetzner Cloud, etc.):
-  bootstrap.sh for first-time host setup, deploy.sh for re-runs, and `sealed.env.example`
-  for the operator-supplied env file. See [`controlplane/README.md`](controlplane/README.md)
-  for the OAuth sign-in env vars (issue #419 / ADR-046).
+- `controlplane/` — **RETIRED 2026-08-15** (issue #911 / PR-1 / ADR-110).
+  The v1 standalone Control Plane installer (bootstrap.sh + deploy.sh +
+  config/ + systemd/ + tmpfiles.d/ + sealed.env.example) is a tombstone
+  now. See [`controlplane/RETIRED.md`](controlplane/RETIRED.md) for the
+  v2 path mapping. The v2 control plane is bootstrapped by `make bootstrap`
+  + `gregale manifest {validate,render}` + `gregale release install`
+  (PR-0 / PR-2 / PR-3); the secrets surface lands in PR-X `gregale
+  secrets init`.
