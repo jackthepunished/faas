@@ -17,10 +17,11 @@
 //
 // The age identity path defaults to
 // /etc/faas/secrets/storage-box/box-age-key (the canonical install
-// site written by bootstrap.sh step 11d). The input envelope path
-// defaults to /root/rclone.conf.age — the staging location where
-// bootstrap.sh expects the operator's scp to land. Output defaults
-// to /etc/faas/secrets/storage-box/rclone.conf.
+// site written by the v1 bootstrap.sh step 11d — RETIRED 2026-08-15
+// by issue #911 / PR-1; the v2 path is PR-X `gregale secrets init`).
+// The input envelope path defaults to /root/rclone.conf.age — the
+// staging location where the operator scp's the .age envelope. Output
+// defaults to /etc/faas/secrets/storage-box/rclone.conf.
 //
 // The unseal deliberately uses the locally-stored age identity (NOT
 // the on-host host.age key) so the on-disk `rclone.conf` can be
@@ -43,8 +44,10 @@ import (
 )
 
 // Canonical install paths for off-host pg backup secrets. These
-// match the bootstrap.sh step 11d staging convention and the
-// ansible role's stat-assert (postgres_backup/tasks/main.yml).
+// match the v1 bootstrap.sh step 11d staging convention (RETIRED
+// 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale secrets
+// init`) and the ansible role's stat-assert
+// (postgres_backup/tasks/main.yml).
 const (
 	defaultStorageBoxDir = "/etc/faas/secrets/storage-box"
 	defaultRcloneConf    = defaultStorageBoxDir + "/rclone.conf"
@@ -99,11 +102,12 @@ func newUnsealRcloneFlags(name string) (*flag.FlagSet, *unsealRcloneFlags) {
 // cmdBackupUnsealRclone decrypts a host.age-sealed rclone.conf
 // envelope using the box-local age identity and writes the
 // plaintext to /etc/faas/secrets/storage-box/rclone.conf (mode
-// 0400 root:root). This is the unseal side of the bootstrap.sh
-// step 11d handshake: the operator scp's the .age envelope to
-// /root/, bootstrap.sh calls gregale backup unseal-rclone, then
-// shreds the envelope so a future host.age-key compromise can't
-// replay it.
+// 0400 root:root). This is the unseal side of the v1 bootstrap.sh
+// step 11d handshake (RETIRED 2026-08-15 by issue #911 / PR-1;
+// v2 path is PR-X `gregale secrets init`): the operator scp's the
+// .age envelope to /root/, gregale backup unseal-rclone decrypts
+// it, then shreds the envelope so a future host.age-key compromise
+// can't replay it.
 //
 // Refuses to overwrite an existing plaintext unless --force is
 // passed. Mirrors the cosign sign-keys init flow (refuse rotation

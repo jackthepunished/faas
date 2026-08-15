@@ -8,11 +8,13 @@
 // verbatim. Mode 0440 root:faas is set after the write so vmmd (root)
 // + apid (faas group) can both read; no other service user can.
 //
-// Called from deploy/digitalocean/bootstrap.sh on the first install
-// and on re-bootstrap when the perms drifted. Idempotent: a second
-// invocation with the file already present refuses to overwrite so
-// a half-applied bootstrap can't accidentally rotate the key and
-// invalidate every customer's MFA enrollment.
+// Called from deploy/controlplane/bootstrap.sh on the first install
+// (the v1 installer — RETIRED 2026-08-15 by issue #911 / PR-1;
+// v2 path is PR-X `gregale secrets init`) and on re-bootstrap when the
+// perms drifted. Idempotent: a second invocation with the file already
+// present refuses to overwrite so a half-applied bootstrap can't
+// accidentally rotate the key and invalidate every customer's MFA
+// enrollment.
 package main
 
 import (

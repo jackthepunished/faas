@@ -193,8 +193,10 @@
 #     /etc/faas/secrets/host.age and /etc/faas/secrets/session.key.
 #
 # Skipped in chroot/CI (no /etc/faas/secrets/storage-box/ yet). On a
-# real EX44 the bootstrap.sh step that decrypts host.age-sealed
-# secrets into the staging dir is required before this role passes.
+# real EX44 the v1 bootstrap.sh step that decrypts host.age-sealed
+# secrets into the staging dir is required before this role passes
+# (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+# `gregale secrets init`).
 - name: postgres_backup — stat storage-box secrets
   ansible.builtin.stat:
     path: "/etc/faas/secrets/storage-box/{{ item.name }}"
@@ -214,10 +216,12 @@
     fail_msg: >-
       /etc/faas/secrets/storage-box/{{ item.item.name }} must be
       {{ item.item.mode }} {{ item.item.owner }}:{{ item.item.group }}
-      (issue #250, spec §11). Re-run bootstrap.sh's storage-box
-      unseal step (step 11d) to repopulate from the host.age-sealed
-      form. The rclone.conf profile is group-readable to postgres so
-      archive_command can rclone WAL via the systemd LoadCredential
+      (issue #250, spec §11). Re-run `gregale backup unseal-rclone`
+      (PR-X `gregale secrets init` supersedes the v1 bootstrap.sh —
+      RETIRED 2026-08-15 by issue #911 / PR-1) to repopulate from
+      the host.age-sealed form. The rclone.conf profile is
+      group-readable to postgres so archive_command can rclone WAL
+      via the systemd LoadCredential
       staging dir.
   loop: "{{ pg_sb_stat.results }}"
   loop_control:

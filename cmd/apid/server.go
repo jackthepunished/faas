@@ -1626,9 +1626,11 @@ func (s *server) handler() http.Handler {
 
 	// Loopback infra probe (issue #85). gatewayd-internal forwards /healthz to
 	// apid through the apidProxy chain, so this is what the
-	// deploy/digitalocean CD smoke test and deploy/digitalocean/
-	// bootstrap.sh health check actually hit on the public listener.
-	// No auth, no DB call — the daemon process being up is what we're
+	// deploy/digitalocean CD smoke test and the v1
+	// deploy/digitalocean/bootstrap.sh health check (RETIRED
+	// 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale
+	// secrets init`) actually hit on the public listener. No auth,
+	// no DB call — the daemon process being up is what we're
 	// asserting; richer readiness semantics (DB ping, etc.) belong
 	// in /readyz later. Mirrors pkg/gateway/control.go::ControlMux.
 	mux.HandleFunc("GET /healthz", s.healthz)

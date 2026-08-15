@@ -190,15 +190,19 @@ Compatibility:
     topology is `/etc/faas/secrets/sign.key` at mode `0440
     root:faas` (not `0400 root:root`), because `faas-imaged` runs
     as `User=faas-imaged Group=faas` (see
-    `deploy/digitalocean/systemd/faas-imaged.service`) and reads
-    the key via group access. The `pkg/cosign.LoadPrivateKeyFile`
+    `deploy/digitalocean/systemd/faas-imaged.service` — RETIRED
+    2026-08-15 by issue #911 / PR-1; canonical path is
+    `deploy/ansible/roles/compute_only_service/files/faas-imaged.service`)
+    and reads the key via group access. The `pkg/cosign.LoadPrivateKeyFile`
     verifier already accepts `0o440` (alongside `0o400`), so no
-    schema change. The installer (`deploy/digitalocean/bootstrap.sh`
-    step 11c, `deploy/ansible/roles/control_plane_service/tasks/main.yml`)
-    is responsible for the ownership step because the install
-    context varies (root in bootstrap, the faas user in ansible,
-    the test process in `go test`); the cosign package enforces
-    only the file mode. The owner-only `0o400` path remains
+    schema change. The installer (`deploy/digitalocean/bootstrap.sh` —
+    no longer in tree; canonical path was `deploy/controlplane/bootstrap.sh`,
+    RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale
+    secrets init` — step 11c, `deploy/ansible/roles/control_plane_service/
+    tasks/main.yml`) is responsible for the ownership step because
+    the install context varies (root in bootstrap, the faas user in
+    ansible, the test process in `go test`); the cosign package
+    enforces only the file mode. The owner-only `0o400` path remains
     available via `pkg/cosign.WriteKeyPair` for single-operator
     installs that don't need group access.
   - **Rotate fix**: `pkg/cosign.writeKeyFile` (the helper behind

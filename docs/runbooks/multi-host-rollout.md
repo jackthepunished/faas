@@ -221,10 +221,14 @@ ssh gregale-fsn-2 'cd /opt/onebox-faas && git pull && sudo make bootstrap'
 ```
 
 > **Note:** the `/opt/onebox-faas` filesystem path is the bootstrap
-> layout from `deploy/scripts/bootstrap.sh` (filesystem layout is
-> code-side, not part of the docs rebrand). A follow-up code-identity
-> pass renames the path to match the host `gregale` user; until then
-> the path is stable across all bootstrap invocations.
+> layout from `deploy/scripts/bootstrap.sh` (file does NOT exist;
+> canonical path is `deploy/controlplane/bootstrap.sh`, RETIRED
+> 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap` +
+> `gregale manifest {validate,render}` + `gregale release install`).
+> Filesystem layout is code-side, not part of the docs rebrand.
+> A follow-up code-identity pass renames the path to match the host
+> `gregale` user; until then the path is stable across all bootstrap
+> invocations.
 
 The bootstrap role provisions the daemon fleet + applies the
 `overlay` role (Tailscale + Wireguard stub) + renders

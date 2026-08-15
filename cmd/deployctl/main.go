@@ -113,6 +113,15 @@ const cpcpIndex = 0
 // tree + dev VMs; index 2+ are the per-box ansible role drop-ins
 // (Gate-B PR-2: split into control_plane_service, githubd_service,
 // compute_only_service so each role ships only its own daemons).
+//
+// PR-1 (issue #911 / ADR-110): index 0 still targets the v1 cp-cp
+// tree (deploy/controlplane/systemd/) so the `make generate` /
+// `make generate-check` gate continues to function. The cd-controlplane
+// workflow (CD pipeline) no longer reads from this tree — it walks the
+// per-role files/ paths (defaultTargets[2..]). Phase 2 (after PR-X
+// `gregale secrets init` lands) deletes the v1 tree; the cpcpIndex slot
+// will then rebind to a v2 path. The tombstone RETIRED.md in
+// deploy/controlplane/ explains the v1 → v2 mapping for operators.
 var defaultTargets = []target{
 	{dir: "deploy/controlplane/systemd"},
 	{dir: "deploy/systemd", skip: legacySkips()},
@@ -473,6 +482,13 @@ func runCheck(args []string, quiet bool) error {
 //     faas.conf) are preserved on purpose — removing them is a separate ops
 //     change, not a generator regression. Preserved artefacts do NOT trip
 //     the gate.
+//
+// PR-1 (issue #911 / ADR-110): the v1 cp-cp tree
+// (deploy/controlplane/systemd/) is now a tombstone; the CD pipeline no
+// longer reads from it. Phase 2 (after PR-X) deletes it. Until then,
+// `make generate-check` keeps comparing the regenerated tmpdir against
+// the committed cp-cp tree so a daemonunitspec change cannot silently
+// drift.
 //
 // Reports the names that drift; `quiet` controls print/no-print.
 func compareTrees(committed, regenerated string, quiet bool) error {

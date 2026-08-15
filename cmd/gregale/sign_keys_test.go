@@ -139,8 +139,10 @@ func TestCmdSignKeysInit_WritesBothFilesWithCanonicalModes(t *testing.T) {
 
 	// And the loader accepts the freshly-written files. This is the
 	// "operator can immediately restart gregale-imaged without any
-	// post-fixup" guarantee — the bootstrap.sh chown root:gregale step
-	// only needs the file mode to be correct on its own.
+	// post-fixup" guarantee — the v1 bootstrap.sh chown root:gregale
+	// step (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+	// `gregale secrets init`) only needs the file mode to be correct
+	// on its own.
 	privBytes, err := os.ReadFile(privPath)
 	if err != nil {
 		t.Fatalf("read priv: %v", err)

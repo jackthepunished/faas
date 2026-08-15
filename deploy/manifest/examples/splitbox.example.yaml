@@ -135,8 +135,9 @@ storage:
 # Cgroups — cgroup v2 controller requirements. The renderer
 # writes +memory +cpu +io +pids to the per-host subtree_control
 # (the only place the production path lands this today — the
-# Lima metal shim at deploy/lima/run-metal.sh:84; bootstrap.sh
-# and ansible both skip it).
+# Lima metal shim at deploy/lima/run-metal.sh:84 + the renderer;
+# the v1 bootstrap.sh and ansible both skip it — RETIRED
+# 2026-08-15 by issue #911 / PR-1).
 cgroups:
   slice: faas-cp.slice
   controllers: "memory,cpu,io,pids"

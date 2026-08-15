@@ -277,9 +277,10 @@ func TestSec11_HostAgeIdentity_OnDiskInsecurePermsFailsFast(t *testing.T) {
 	recipientPath := filepath.Join(tmp, "host.age.pub")
 	// Mode 0440 (group-readable) — the regression we want to
 	// catch. The on-disk 0o400 contract (spec §11) is tightened
-	// back by bootstrap.sh on first boot; a regression that
-	// drops the chmod and leaves the file at the umask default
-	// ends up here.
+	// back by the v1 bootstrap.sh on first boot (RETIRED
+	// 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale
+	// secrets init`); a regression that drops the chmod and leaves
+	// the file at the umask default ends up here.
 	writePrivateKeyFixture(t, onDiskPath, 0o440)
 	// Public half also has to be valid (recipient-load path is
 	// separate but runs first; if it's broken the test would fire

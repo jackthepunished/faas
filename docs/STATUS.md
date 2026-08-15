@@ -909,7 +909,10 @@ sometimes implied they were closed; they aren't.
   validate `Plan` via `api.Plan.Valid()`.
 - **#148** — `bootstrap.sh` should pin the Go toolchain via
   SHA-256 (closes a toolchain-supply-chain gap; sister to #143,
-  which is closed).
+  which is closed). RETIRED 2026-08-15 by issue #911 / PR-1:
+  the v1 bootstrap.sh is a tombstone now; the v2 path is the
+  renderer + release install (PR-2 + PR-3). The toolchain-pinning
+  gap lives on in the cd-controlplane.yml / `make build` paths.
 - **#145** — streamed OCI blob SHA-256 verification against the
   URL-path digest (spec's digest-pinned immutability).
 - **#125** — `sqlc-check` in the CI bundle to prevent sqlc source

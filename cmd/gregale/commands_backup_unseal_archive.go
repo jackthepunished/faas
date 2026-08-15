@@ -17,7 +17,9 @@
 // (re-unsealing is a deliberate rotation step, not a
 // bootstrap-time side effect). The age identity path defaults
 // to /etc/faas/secrets/storage-box/box-age-key — the canonical
-// install site written by bootstrap.sh step 11d.
+// install site written by the v1 bootstrap.sh step 11d
+// (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+// `gregale secrets init`).
 //
 // The wire shape (`{endpoint, region, key_id, secret}`) is
 // read by cmd/apid/main.go::readArchiveCreds (issue #562
@@ -42,7 +44,9 @@ import (
 // Default install paths for the S3 archive credentials envelope
 // (issue #562). Matches the apid wire-up's
 // /etc/faas/secrets/storage-box/archive-creds.json expectation
-// and the bootstrap.sh step 11d staging convention.
+// and the v1 bootstrap.sh step 11d staging convention (RETIRED
+// 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale
+// secrets init`).
 const (
 	defaultArchiveCredsPath = defaultStorageBoxDir + "/archive-creds.json"
 	defaultArchiveAgeIn     = "/root/archive-creds.json.age"
@@ -74,8 +78,9 @@ func newUnsealArchiveCredsFlags(name string) (*flag.FlagSet, *unsealArchiveCreds
 // cmdBackupUnsealArchiveCreds decrypts a host.age-sealed
 // archive-creds.json envelope using the box-local age identity
 // and writes the plaintext to /etc/faas/secrets/storage-box/
-// archive-creds.json (mode 0400 root:root). The bootstrap.sh
-// step 11d handshake (issue #562): the operator scp's the
+// archive-creds.json (mode 0400 root:root). The v1 bootstrap.sh
+// step 11d handshake (RETIRED 2026-08-15 by issue #911 / PR-1;
+// v2 path is PR-X `gregale secrets init`): the operator scp's the
 // .age envelope to /root/, this command unseals it, then
 // shreds the envelope so a future host.age-key compromise
 // can't replay it.
