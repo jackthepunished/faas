@@ -2,6 +2,12 @@
 // RecordAppender + RecordDeleter shape that certmagic.DNSProvider requires
 // (certmagic v0.25 uses libdns@v1.1.1).
 //
+// PR-8 (issue #911 / ADR-110 deferred): renamed from dns01_hetzner.go.
+// One of three pluggable DNS-01 providers wired through
+// DNSProviderFactory in tls_wire.go (cloudflare|route53|hetzner|manual —
+// route53 slot is reserved, not yet implemented). Cloudflare is the
+// default in production per ADR-024 §6; Hetzner stays as one option.
+//
 // Endpoints used (Hetzner DNS API, https://dns.hetzner.com/api/v1):
 //
 //	GET    /api/v1/zones?name=<zone>           → list zones (find Zone ID by name)
@@ -52,8 +58,10 @@ type HetznerDNSProvider struct {
 // NewHetznerDNSProvider returns a libdns-shaped provider wired against the
 // Hetzner DNS API. token is the Auth-API-Token value (loaded by
 // loadHetznerDNSToken from /etc/faas/secrets/hetzner-dns.token with a 0400
-// perm check). zone is the zone name (e.g. "example.com") that this provider
-// serves; the wildcard cert *.apps.gregale.dev lives in this zone.
+// perm check — the on-disk path stays for backward compat; a future
+// generic-token path is PR-9 scope). zone is the zone name
+// (e.g. "example.com") that this provider serves; the wildcard cert
+// *.apps.gregale.dev lives in this zone.
 func NewHetznerDNSProvider(token, zone string) *HetznerDNSProvider {
 	return &HetznerDNSProvider{
 		token:  strings.TrimSpace(token),

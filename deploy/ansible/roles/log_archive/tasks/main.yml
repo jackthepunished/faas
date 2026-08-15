@@ -40,7 +40,7 @@
 #     2026-08-15 by issue #911 / PR-1; v2 path is PR-X
 #     `gregalectl secrets init`); mirrors the unseal-rclone
 #     flow at deploy/ansible/roles/postgres/files/
-#     postgresql.service.d/99-faas-storage-box.conf).
+#     postgresql.service.d/99-faas-off-host-backup.conf).
 #     This role assumes the
 #     envelope is already on disk; the assert catches
 #     any future perms drift.
@@ -69,7 +69,7 @@
   failed_when: false  # chroot/CI may not have /etc/faas/secrets
 
 # Skipped in chroot/CI (no /etc/faas/secrets/ yet). On a real
-# EX44 the v1 bootstrap.sh step that unseals host.age-sealed
+# production box the v1 bootstrap.sh step that unseals host.age-sealed
 # secrets into the staging dir is required before this role
 # passes (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is
 # PR-X `gregalectl secrets init`) — same shape as the postgres_backup

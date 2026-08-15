@@ -7,7 +7,7 @@
 #   * `/var/lib/pgsql/archive` exists (postgres role:158-165),
 #   * WAL archiving is wired (wal_level=replica, archive_mode=on,
 #     archive_command wired — issue #250 rewrites the cp-only baseline
-#     to rclone to Hetzner Storage Box).
+#     to rclone to the off-host backup box).
 #
 # This role does NOT change PG config — the producer only consumes the
 # existing GUCs. It drops four systemd units into /etc/systemd/system/
@@ -20,23 +20,25 @@
 #     sealed-at-rest via host.age (PR #371 cosign precedent) and
 #     decrypted into a tmpfs staging dir at ansible-run time. systemd
 #     `LoadCredential=` surfaces the plaintext file inside the push
-#     unit's $CREDENTIALS_DIRECTORY; rclone reads `%d/faas_storage_box_rclone`.
+#     unit's $CREDENTIALS_DIRECTORY; rclone reads `%d/faas_off_host_backup_rclone`.
 #   * Fail-closed asserts on mode + owner + group for every secret
 #     file (mirrors the canonical `stat` + `failed_when` block in
 #     control_plane_service/tasks/main.yml:108-209).
-#   * HETZNER_STORAGE_BOX_USER / HETZNER_STORAGE_BOX_HOST env vars
+#   * OFF_HOST_BACKUP_USER / OFF_HOST_BACKUP_HOST env vars
 #     are read from /etc/faas/sealed.env (operator-provisioned
-#     secret surface — see deploy/controlplane/sealed.env.example).
+#     secret surface — see deploy/controlplane/sealed.env.example,
+#     RETIRED 2026-08-15 by issue #911 / PR-1; the v2 path is
+#     PR-X `gregalectl secrets init`).
 
-- name: postgres_backup — fail-closed on missing Hetzner Storage Box env
+- name: postgres_backup — fail-closed on missing off-host backup env
   ansible.builtin.assert:
     that:
-      - hetzner_storage_box_user is defined and hetzner_storage_box_user != ''
-      - hetzner_storage_box_host is defined and hetzner_storage_box_host != ''
-      - hetzner_storage_box_basebackup_path is defined and hetzner_storage_box_basebackup_path != ''
-      - hetzner_storage_box_wal_path is defined and hetzner_storage_box_wal_path != ''
+      - off_host_backup_user is defined and off_host_backup_user != ''
+      - off_host_backup_host is defined and off_host_backup_host != ''
+      - off_host_backup_basebackup_path is defined and off_host_backup_basebackup_path != ''
+      - off_host_backup_wal_path is defined and off_host_backup_wal_path != ''
     fail_msg: >-
-      HETZNER_STORAGE_BOX_USER + HETZNER_STORAGE_BOX_HOST env vars
+      OFF_HOST_BACKUP_USER + OFF_HOST_BACKUP_HOST env vars
       must be set in the operator shell (issue #250). The role
       refuses to deploy off-host backup without an endpoint; source
       /etc/faas/sealed.env before re-running.
@@ -123,12 +125,12 @@
 # task "changed" on every run. The sentinel `true` command is
 # unconditional — we only mark the role idempotent, we don't claim
 # "this never changes."
-- name: postgres_backup — create Storage Box dirs (issue #250 / F3)
+- name: postgres_backup — create off-host backup dirs (issue #250 / F3)
   ansible.builtin.command:
     cmd: >-
       rclone mkdir
-      hertznerbox:{{ hetzner_storage_box_basebackup_path }}
-      hertznerbox:{{ hetzner_storage_box_wal_path }}
+      offhostbox:{{ off_host_backup_basebackup_path }}
+      offhostbox:{{ off_host_backup_wal_path }}
       --config=/etc/faas/secrets/storage-box/rclone.conf
       --stats=0 --quiet
   args:
@@ -193,9 +195,9 @@
 #     /etc/faas/secrets/host.age and /etc/faas/secrets/session.key.
 #
 # Skipped in chroot/CI (no /etc/faas/secrets/storage-box/ yet). On a
-# real EX44 the v1 bootstrap.sh step that decrypts host.age-sealed
-# secrets into the staging dir is required before this role passes
-# (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+# real production box the v1 bootstrap.sh step that decrypts
+# host.age-sealed secrets into the staging dir is required before this
+# role passes (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
 # `gregalectl secrets init`).
 - name: postgres_backup — stat storage-box secrets
   ansible.builtin.stat:

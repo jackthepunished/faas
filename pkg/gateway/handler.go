@@ -2092,7 +2092,7 @@ func (h *Handler) applyEdgeRuleMaintenance(w http.ResponseWriter, r *http.Reques
 // the downstream proxy leg reads the same bytes. This is the
 // first production hot-path body-restore in pkg/gateway (no
 // existing handler does this); the test-file idiom at
-// pkg/gateway/dns01_hetzner_test.go:48-49 informed the choice of
+// pkg/gateway/dns01_provider_hetzner_test.go:48-49 informed the choice of
 // io.NopCloser(bytes.NewReader(buf)).
 func (h *Handler) applyEdgeRuleValidate(w http.ResponseWriter, r *http.Request, app App, rec *statusRecorder) bool {
 	if h.edgeRules == nil || h.validator == nil {
