@@ -1,4 +1,7 @@
 -- filename: 00273_triggers.sql
+-- +goose Up
+-- +goose StatementBegin
+--
 -- Trigger primitive (event-source mappings, closes #757).
 --
 -- Adds the unified `triggers` table — one resource with a `kind`
@@ -26,9 +29,6 @@
 -- DO-block guard established by 00159_invocations_replay_source.sql.
 -- A drifted box (relations present, goose row missing) re-applies
 -- cleanly without tripping SQLSTATE 42P07 / 42710 / 42P06.
-
--- +goose Up
--- +goose StatementBegin
 
 -- A) The unified Trigger resource.
 CREATE TABLE IF NOT EXISTS triggers (
