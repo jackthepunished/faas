@@ -231,8 +231,8 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 }
 
 // cmdReleaseInstall installs a release on the local box: flips
-// /opt/faas/current to <git-sha>, stamps compute_nodes.release_id
-// (when --node is given), and runs the release_bundles.applied_at
+// /opt/faas/current to <git-sha>, UPSERTs compute_nodes.release_id
+// + manifest_hash (PR-6), and runs the release_bundles.applied_at
 // first-write-wins UPDATE.
 //
 // DB writes go through the releaseinstall.Store abstraction so
@@ -304,15 +304,36 @@ func cmdReleaseInstall(args []string) int {
 			node = "unknown"
 		}
 	}
+	// PR-6 (issue #911 / ADR-110): stamp the per-node release
+	// membership on compute_nodes. The on-disk symlink flip is the
+	// load-bearing side; the UPSERT is best-effort like the existing
+	// MarkApplied write. Doctor (PR-4) reads release_id / manifest_hash
+	// off this row to detect per-node drift across the cluster.
+	cnID, cnErr := store.UpsertComputeNode(context.Background(), node, *gitSHA, m.ManifestHash)
+	if cnErr != nil {
+		if jsonEnabled() {
+			jsonEmit(os.Stdout, releaseInstallReport{
+				GitSHA:           *gitSHA,
+				FirstApplied:     first,
+				Node:             node,
+				SymlinkOnly:      true,
+				ComputeNodeError: cnErr.Error(),
+			})
+		} else {
+			_, _ = fmt.Fprintf(os.Stderr, "gregale release install: upsert compute_nodes: %v\n", cnErr)
+		}
+		return 3
+	}
 	if jsonEnabled() {
 		jsonEmit(os.Stdout, releaseInstallReport{
-			GitSHA:       *gitSHA,
-			FirstApplied: first,
-			Node:         node,
+			GitSHA:        *gitSHA,
+			FirstApplied:  first,
+			Node:          node,
+			ComputeNodeID: cnID,
 		})
 	} else {
-		_, _ = fmt.Fprintf(os.Stdout, "flipped current -> %s (first_applied=%v, node=%s)\n",
-			*gitSHA, first, node)
+		_, _ = fmt.Fprintf(os.Stdout, "flipped current -> %s (first_applied=%v, node=%s, compute_node=%s)\n",
+			*gitSHA, first, node, cnID)
 	}
 	return 0
 }
@@ -354,6 +375,11 @@ type releaseInstallReport struct {
 	Node         string `json:"node,omitempty"`
 	SymlinkOnly  bool   `json:"symlink_only,omitempty"`
 	DBError      string `json:"db_error,omitempty"`
+	// PR-6: compute_nodes UPSERT result. ComputeNodeID is the row id
+	// from gen_random_uuid(); ComputeNodeError surfaces best-effort
+	// UPSERT failures without dropping the load-bearing symlink flip.
+	ComputeNodeID    string `json:"compute_node_id,omitempty"`
+	ComputeNodeError string `json:"compute_node_error,omitempty"`
 }
 
 // _ keeps bytes imported even if the future JSON marshaller is
