@@ -15,15 +15,15 @@
 //
 //  2. The three new tables exist with the expected columns + types:
 //     triggers          (id, account_id, app_id, kind, slug, enabled,
-//                        config, batch_size_max, batch_window_ms,
-//                        max_attempts, cron_id, source, created_at,
-//                        updated_at)
+//     config, batch_size_max, batch_window_ms,
+//     max_attempts, cron_id, source, created_at,
+//     updated_at)
 //     trigger_records   (id, trigger_id, item_identifier, payload,
-//                        headers, metadata, state, attempts,
-//                        next_fire_at, received_at, last_error,
-//                        last_dispatched_at)
+//     headers, metadata, state, attempts,
+//     next_fire_at, received_at, last_error,
+//     last_dispatched_at)
 //     trigger_dead_letter (record_id, trigger_id, reason, routed_to,
-//                        detail, created_at)
+//     detail, created_at)
 //
 //  3. The kind CHECK admits the closed-vocab six values
 //     (cron, kafka, nats, redis_streams, sqs_compat, queue). Pins
@@ -53,7 +53,7 @@
 //  9. Negative round-trip: inserting a trigger with kind='junk'
 //     fails the CHECK. Pins the closed-vocab contract.
 //
-// 10. Replay safety: re-running db.MigrateUp is a no-op. The
+//  10. Replay safety: re-running db.MigrateUp is a no-op. The
 //     apply_walk_test harness pins this at the directory level;
 //     per-migration shape is asserted here as defence in depth.
 //

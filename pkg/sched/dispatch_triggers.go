@@ -43,6 +43,19 @@ import (
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
+// trigger DLQ reason constants (match the CHECK on
+// trigger_dead_letter.reason in migrations/00273_triggers.sql).
+// CI lint rule goconst would otherwise flag the per-reason
+// comparisons in classifyDLQReason() + the path-through call
+// sites as duplicates.
+const (
+	triggerReasonPoisonRecord    = "poison_record"
+	triggerReasonMaxAttempts     = "max_attempts"
+	triggerReasonBrokerError     = "broker_error"
+	triggerReasonRateLimited     = "rate_limited"
+	triggerReasonPayloadTooLarge = "payload_too_large"
+)
+
 // triggerDispatchRecord is one broker-delivered record the
 // dispatch tick packages for the gateway batch envelope.
 type triggerDispatchRecord struct {
@@ -232,7 +245,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	}
 	if l.rateLimiter != nil && !l.rateLimiter.AllowWakeApp(t.AppID.String(), appPlan) {
 		items := batchItemIDs(batch)
-		l.deadLetterAll(ctx, t.ID.String(), items, "rate_limited", "wake rate limit exceeded", store)
+		l.deadLetterAll(ctx, t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
 		return nil
 	}
 
@@ -242,7 +255,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		l.log.Warn("sched trigger tick: claim",
 			"trigger_id", t.ID.String(),
 			"err", claimErr)
-		return nil
+		return fmt.Errorf("dispatchOneTrigger claim: %w", claimErr)
 	}
 	if len(claimed) == 0 {
 		return nil
@@ -256,7 +269,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			"trigger_id", t.ID.String(),
 			"err", postErr)
 		l.markRetryAll(ctx, claimed, postErr.Error(), store)
-		_ = poller.Nack(ctx, t, batchItemIDs(batch), "broker_error")
+		_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError)
 		return nil
 	}
 
@@ -269,8 +282,8 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		for _, c := range claimed {
 			ids = append(ids, c.ID.String())
 		}
-		l.deadLetterAll(ctx, t.ID.String(), ids, "poison_record", "gateway response malformed", store)
-		_ = poller.Nack(ctx, t, batchItemIDs(batch), "poison_record")
+		l.deadLetterAll(ctx, t.ID.String(), ids, triggerReasonPoisonRecord, "gateway response malformed", store)
+		_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonPoisonRecord)
 		return nil
 	}
 
@@ -329,7 +342,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 					"id", id, "err", err)
 			}
 			// Audit: trigger.fired per succeeded record.
-			l.emitAudit(events.TriggerFiredEvent{
+			l.emitAudit(ctx, events.TriggerFiredEvent{
 				TriggerID: t.ID.String(),
 				RecordID:  id,
 				AppID:     t.AppID.String(),
@@ -348,7 +361,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				l.log.Warn("sched trigger tick: mark retry",
 					"id", id, "err", err)
 			}
-			l.emitAudit(events.TriggerRetryEvent{
+			l.emitAudit(ctx, events.TriggerRetryEvent{
 				TriggerID:  t.ID.String(),
 				RecordID:   id,
 				AppID:      t.AppID.String(),
@@ -356,7 +369,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				NextFireAt: nextFireAt,
 			})
 		}
-		if err := poller.Nack(ctx, t, retryItems, "broker_error"); err != nil {
+		if err := poller.Nack(ctx, t, retryItems, triggerReasonBrokerError); err != nil {
 			l.log.Warn("sched trigger tick: poller nack",
 				"trigger_id", t.ID.String(), "err", err)
 		}
@@ -369,7 +382,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				l.log.Warn("sched trigger tick: mark dlq",
 					"id", id, "err", err)
 			}
-			l.emitAudit(events.TriggerDLQEvent{
+			l.emitAudit(ctx, events.TriggerDLQEvent{
 				TriggerID: t.ID.String(),
 				RecordID:  id,
 				AppID:     t.AppID.String(),
@@ -378,13 +391,13 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				LastError: lastErr,
 			})
 		}
-		if err := poller.Nack(ctx, t, dlqItems, "poison_record"); err != nil {
+		if err := poller.Nack(ctx, t, dlqItems, triggerReasonPoisonRecord); err != nil {
 			l.log.Warn("sched trigger tick: poller nack (dlq)",
 				"trigger_id", t.ID.String(), "err", err)
 		}
 	}
 	// Audit: trigger.fired.batch — aggregated counts.
-	l.emitAudit(events.TriggerFiredBatchEvent{
+	l.emitAudit(ctx, events.TriggerFiredBatchEvent{
 		TriggerID:      t.ID.String(),
 		BatchSize:      len(batch),
 		AttemptTotal:   len(batch),
@@ -558,19 +571,19 @@ var _ = slog.Default
 // disambiguation logic lives here).
 func classifyDLQReason(gatewayErr string) string {
 	if gatewayErr == "" {
-		return "poison_record"
+		return triggerReasonPoisonRecord
 	}
 	switch {
 	case strings.Contains(gatewayErr, "batchItemFailures"):
-		return "max_attempts"
+		return triggerReasonMaxAttempts
 	case strings.Contains(gatewayErr, "timeout"):
-		return "max_attempts"
+		return triggerReasonMaxAttempts
 	case strings.Contains(gatewayErr, "malformed"),
 		strings.Contains(gatewayErr, "broker_error"),
 		strings.Contains(gatewayErr, "payload_b64"):
-		return "poison_record"
+		return triggerReasonPoisonRecord
 	default:
-		return "poison_record"
+		return triggerReasonPoisonRecord
 	}
 }
 
@@ -582,14 +595,13 @@ func classifyDLQReason(gatewayErr string) string {
 // Auditor's typed path. The Auditor writes a single events row
 // per call (pkg/audit/audit.go mirrors pkg/events.Platform's
 // best-effort semantics).
-func (l *Loop) emitAudit(ev events.WakeEvent) {
+//
+// ctx is threaded through so the call honours the dispatch tick's
+// lifecycle (CI lint: contextcheck). pkg/audit.Auditor.Emit
+// already accepts context.
+func (l *Loop) emitAudit(ctx context.Context, ev events.WakeEvent) {
 	if l == nil || l.audit == nil || ev == nil {
 		return
 	}
-	// pkg/audit.Auditor.Emit takes (kind, *accountID, map[string]any).
-	// We pull the payload map off the WakeEvent and pass it
-	// through. A future commit adds WakeEvent support to the
-	// Auditor so the dispatch tick + cron tick share one emit
-	// path.
-	l.audit.Emit(context.Background(), ev.Kind(), nil, ev.Payload())
+	l.audit.Emit(ctx, ev.Kind(), nil, ev.Payload())
 }

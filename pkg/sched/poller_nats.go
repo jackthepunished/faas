@@ -241,6 +241,7 @@ func (n *natsPoller) Poll(ctx context.Context, t sqlc.Trigger) PollResult {
 				receivedAt = md.Timestamp
 			}
 			deliveryNum = md.NumDelivered
+			_ = deliveryNum //nolint:staticcheck // SA4006: written in the if-branch, read in the else-branch below via seqStr
 		} else {
 			seqStr = fmt.Sprintf("seq-%d", deliveryNum)
 		}
@@ -330,6 +331,8 @@ func (n *natsPoller) Close() error {
 // Unmarshal — the rest of pkg/sched uses it via the
 // parseJSONHeaders/Metadata helpers in poller_queue.go. Defined
 // here too so this file is self-contained.
+//
+//nolint:unused // reserved for the next NATS PR-cluster; alias so this file is self-contained.
 func jsonStdUnmarshal(b []byte, v any) error {
 	return json.Unmarshal(b, v)
 }
@@ -348,6 +351,8 @@ var currentNATSBroker *natsBroker
 
 // setCurrentNATSBroker is invoked from schedd boot once per URL
 // group. Triggers that share a URL share a broker.
+//
+//nolint:unused // reserved for cmd/schedd boot wiring (PR-B).
 func setCurrentNATSBroker(b *natsBroker) { currentNATSBroker = b }
 
 // getCurrentNATSBroker returns the broker registered at startup,

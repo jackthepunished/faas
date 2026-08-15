@@ -52,6 +52,16 @@ tags:
     description: Custom domain bindings.
   - name: crons
     description: Scheduled synthetic POSTs.
+  - name: triggers
+    description: |
+      Event source mappings (issue #757 / ADR-100). A trigger is a
+      unified resource that pulls records from a broker (kafka, nats,
+      redis_streams, sqs_compat, queue) or a schedule (cron) and fans
+      them into the function via batched invocations. The cron kind
+      is a thin alias over /v1/crons — see the `crons` tag for the
+      canonical cron API. Records carry ReportBatchItemFailures
+      semantics stolen verbatim from AWS Lambda (the function
+      returns `{"batchItemFailures":[{"item_identifier":"..."}]}`).
   - name: webhooks
     description: |
       Outbound webhook subscriptions (issue #476 / ADR-076). One row
@@ -117,6 +127,13 @@ tags:
       PATCH /v1/apps/{slug}/security (admin + MFA) flips the
       require_signed flag; trusted_signers CRUD manages the
       per-app cosign trusted-publisher list.
+  - name: internal
+    description: |
+      Inter-daemon RPC surface (schedd ↔ gatewayd-internal). The
+      `invocations:dispatch_batch` endpoint under this tag is
+      scheduler-driven — schedd calls gatewayd-internal to dispatch
+      a batch of records against a parked instance, and the function
+      runner returns ReportBatchItemFailures. Not customer-facing.
   - name: usage
     description: Usage roll-up and metering.
   - name: billing
@@ -3501,10 +3518,17 @@ paths:
         - name: app_id
           in: query
           required: false
+          description: |
+            Optional app UUID to scope the listing to one app; the
+            caller's account is still the authorization boundary.
           schema: { type: string, pattern: '^[a-f0-9]{32}$' }
         - name: kind
           in: query
           required: false
+          description: |
+            Optional trigger kind filter (kafka / nats / redis_streams
+            / sqs_compat / queue). Invalid values produce an empty list,
+            not 400 — see the trigger list paginator in pkg/apid.
           schema: { $ref: '#/components/schemas/TriggerKind' }
       responses:
         '200':
@@ -3646,7 +3670,7 @@ paths:
         Sets `enabled=true` and pg_notify's `trigger_changed`.
         Schedd restarts the broker poller on the next tick.
       responses:
-        '204': { description: No body. }
+        '204': { description: 'Trigger resumed (no body).' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -3665,10 +3689,16 @@ paths:
         - name: state
           in: query
           required: false
+          description: |
+            Optional state filter — pending / claimed / succeeded /
+            retry / dead_letter. Lets the dashboard narrow to
+            in-flight or DLQ rows.
           schema: { $ref: '#/components/schemas/TriggerRecordState' }
         - name: limit
           in: query
           required: false
+          description: |
+            Page size; default 50, capped at 200.
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
       responses:
         '200':
@@ -3687,7 +3717,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-f0-9]{32}$' }
-        description: "Record id (UUID hex, no dashes)."
+        description: "Record id (UUID hex, no dashes) — used by retry/drop."
     post:
       tags: [triggers]
       operationId: retryTriggerRecord
@@ -3696,7 +3726,7 @@ paths:
         Resets state to `pending`, attempts to 0. Operator-only scope
         — the dashboard surfaces this as "Re-drive from DLQ".
       responses:
-        '204': { description: No body. }
+        '204': { description: 'Record re-driven (no body).' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/TriggerRecordRetryFailed' }
@@ -3709,7 +3739,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-f0-9]{32}$' }
-        description: "Record id (UUID hex, no dashes)."
+        description: "Record id (UUID hex, no dashes) — used by drop."
     post:
       tags: [triggers]
       operationId: dropTriggerRecord
@@ -3719,7 +3749,7 @@ paths:
         default; this is the explicit acknowledgement). Operator-only
         scope.
       responses:
-        '204': { description: No body. }
+        '204': { description: 'Record dropped (no body).' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -3735,10 +3765,15 @@ paths:
         - name: reason
           in: query
           required: false
+          description: |
+            Optional DLQ reason filter (poison_record / max_attempts /
+            broker_error / rate_limited / payload_too_large).
           schema: { $ref: '#/components/schemas/TriggerDeadLetterReason' }
         - name: limit
           in: query
           required: false
+          description: |
+            DLQ page size; default 50, capped at 200.
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
       responses:
         '200':
@@ -4998,7 +5033,7 @@ paths:
         Idempotent: a re-cancel (or a cancel of an already-fired row)
         is a 204. The drain ignores cancelled rows at dispatch.
       responses:
-        '204': { description: No body. }
+        '204': { description: 'Cron disabled (no body).' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }

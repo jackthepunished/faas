@@ -134,6 +134,8 @@ func uuidFromPgtype(p pgtype.UUID) uuid.UUID {
 // parseUUID hex-decodes a string UUID into its 16-byte big-endian
 // representation. Used by the trigger store methods (which take
 // pgtype.UUID) to bridge from the existing string-id AppByID.
+//
+//nolint:unused // reserved for the PATCH trigger handler path PR-B.
 func parseUUID(s string) []byte {
 	uid, err := uuid.Parse(s)
 	if err != nil {
@@ -922,15 +924,15 @@ func (s *server) aggregateTriggerMetrics(ctx context.Context, id string) (api.Tr
 	var m api.TriggerMetricsResponse
 	for _, rec := range rows {
 		switch rec.State {
-		case "pending":
+		case triggerRecordStatePending:
 			m.PendingCount++
-		case "claimed":
+		case triggerRecordStateClaimed:
 			m.ClaimedCount++
-		case "succeeded":
+		case triggerRecordStateSucceeded:
 			m.SucceededCount++
-		case "retry":
+		case triggerRecordStateRetry:
 			m.RetryCount++
-		case "dead_letter":
+		case triggerRecordStateDeadLetter:
 			m.DeadLetterCount++
 		}
 	}
@@ -940,3 +942,15 @@ func (s *server) aggregateTriggerMetrics(ctx context.Context, id string) (api.Tr
 // _ keeps go vet happy about the time import (used by the
 // trigger_metrics response's CreatedAt formatting in the future).
 var _ = time.Now
+
+// trigger_records state-machine constants (match the CHECK on
+// trigger_records.state in migrations/00273_triggers.sql). CI
+// lint rule goconst would otherwise flag the per-record status
+// comparisons in aggregateTriggerMetrics as duplicates.
+const (
+	triggerRecordStatePending    = "pending"
+	triggerRecordStateClaimed    = "claimed"
+	triggerRecordStateSucceeded  = "succeeded"
+	triggerRecordStateRetry      = "retry"
+	triggerRecordStateDeadLetter = "dead_letter"
+)

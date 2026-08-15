@@ -167,7 +167,7 @@ func (s *sqsPoller) Poll(ctx context.Context, t sqlc.Trigger) PollResult {
 	if err != nil {
 		return PollResult{Error: fmt.Errorf("sqs_poller: receive: %w", err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == 204 {
 		// Empty long-poll response.
 		return PollResult{Records: []SourceRecord{}}
@@ -235,7 +235,7 @@ func (s *sqsPoller) deleteReceipts(ctx context.Context, ids []string) error {
 	if err != nil {
 		return fmt.Errorf("sqs_poller: delete: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("sqs_poller: delete status %d: %s", resp.StatusCode, raw)

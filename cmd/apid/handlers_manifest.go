@@ -41,6 +41,8 @@ const CodeAppManifestInvalid = "app_manifest_invalid"
 // validateManifest loads + validates a gregale.yaml blob from disk.
 // Returns *Manifest on success and *api.Problem on validation
 // failure so the handler can write the response directly.
+//
+//nolint:unused // reserved for the manifest scan-service reconciliation PR.
 func validateManifest(dir string, acctPlan api.Plan) (*gregalemanifest.Manifest, *api.Problem) {
 	m, ok, err := gregalemanifest.Load(dir)
 	if err != nil {

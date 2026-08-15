@@ -223,6 +223,8 @@ var currentLoopPool *pgxpool.Pool
 
 // setCurrentLoopPool is invoked from Loop.New at schedd startup.
 // Race-free at startup (called once before any Poll happens).
+//
+//nolint:unused // reserved for cmd/schedd boot wiring (PR-B).
 func setCurrentLoopPool(p *pgxpool.Pool) { currentLoopPool = p }
 
 // getCurrentLoopPool returns the pool a Loop registered at
