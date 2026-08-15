@@ -27,6 +27,31 @@
 #   - The TOML table-placement catalog (pkg/manifest/toml_check.go)
 #     is the source of truth for which table a daemon key belongs
 #     to. The renderer (PR-2) consumes the same catalog.
+#
+# ------------------------------------------------------------------------------
+# ILLUSTRATIVE ONLY — the addresses below are PLACEHOLDERS, not real operator
+# values. Replace with the actual CIDRs of your overlay before deploying:
+#
+#   fleet.hosts[].address (currently 10.42.0.1:7100, 10.42.0.2:50051):
+#     Replace each `host:port` with the routable dial address other daemons
+#     use to reach that host. This is NOT necessarily the public IP — it
+#     should be the overlay/mesh-routable address (Tailscale 100.64/10 exit
+#     node, WireGuard AllowedIPs, or the operator's VPC peer IP).
+#
+#   overlay.cidr (currently 10.42.0.0/24):
+#     The overlay subnet every host's address must fall inside. Pick a
+#     /16+ from your operator-owned range. RFC1918 (10/8, 172.16/12,
+#     192.168/16) and CGNAT (100.64/10) are valid for the overlay
+#     itself, but the runtime overlay-accept rules in
+#     pkg/netns/policy.go::HostPolicy.Render require the overlay CIDR
+#     to sit OUTSIDE the §11 deny list (RFC1918 / link-local / CGNAT
+#     are ALL denied — see OverlayCIDRs doc). Pick a public-range
+#     overlay for the mesh.
+#
+# See pkg/manifest/manifest.go for the overlay provider enum
+# (`provider: wireguard | tailscale | static`) and the per-host
+# overlay validation contract.
+# ------------------------------------------------------------------------------
 
 schema_version: "1.0.0"
 

@@ -475,3 +475,37 @@ func TestHostKeys_DaemonsStructReference(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitboxExample_ValidatesAndIllustratesOverlay (Mega-PR-B
+// Commit 5) loads the splitbox.example.yaml reference file and
+// pins two invariants:
+//
+//  1. The example file PARSES and VALIDATES without errors —
+//     future edits that drift away from the schema
+//     (e.g. remove a required field) fail here.
+//  2. The example file contains the ILLUSTRATIVE ONLY marker
+//     introduced in Mega-PR-B Commit 5 — future edits that drop
+//     the illustrative header fail here. An operator reading the
+//     file MUST be alerted that the addresses (10.42.0.1, 10.42.0.2,
+//     overlay.cidr 10.42.0.0/24) are PLACEHOLDERS, not real
+//     operator values, before they `gregalectl manifest apply`.
+//     The marker also cross-references the §11 deny-list trap
+//     RFC1918/CGNAT overlayers fall into (separate from the
+//     example-load assertion).
+func TestSplitboxExample_ValidatesAndIllustratesOverlay(t *testing.T) {
+	const examplePath = "../../deploy/manifest/examples/splitbox.example.yaml"
+	raw, err := os.ReadFile(examplePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", examplePath, err)
+	}
+	m, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if errs := m.Validate(); len(errs) > 0 {
+		t.Fatalf("Validate: %v", errs)
+	}
+	if !strings.Contains(string(raw), "ILLUSTRATIVE ONLY") {
+		t.Errorf("splitbox.example.yaml missing the ILLUSTRATIVE ONLY marker — operators will read the placeholder addresses (10.42.0.x) as a real deployable config. Add the marker before `schema_version: \"1.0.0\"`.")
+	}
+}
