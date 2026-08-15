@@ -29,7 +29,7 @@
 #   single-box (legacy):   every daemon
 #
 # The `vars_files` block is conditional on the host running postgres
-# (i.e. on [control_plane] or [box]); the four hetzner_storage_box_*
+# (i.e. on [control_plane] or [box]); the four off_host_backup_*
 # vars are read from /etc/faas/sealed.env at ansible-run time and are
 # not box-shape-conditional themselves.
 
@@ -41,7 +41,7 @@
   max_fail_percentage: 0
 
   vars_files:
-    - group_vars/box/hetzner.yml
+    - group_vars/box/off_host_backup.yml
 
   roles:
     # Shared preconditions (every box):
@@ -102,7 +102,7 @@
   max_fail_percentage: 0
 
   vars_files:
-    - group_vars/box/hetzner.yml
+    - group_vars/box/off_host_backup.yml
 
   roles:
     # Everything; the legacy single-box shape. PR-2 keeps this working

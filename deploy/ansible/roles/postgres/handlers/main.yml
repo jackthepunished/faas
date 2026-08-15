@@ -9,7 +9,7 @@
 # one restart per idleness epoch.
 #
 # failed_when: false on both — chroot/CI bootstrap has no systemd.
-# Production EX44 runs systemd and gets the real restart/reload.
+# Production boxes run systemd and get the real restart/reload.
 
 - name: restart postgresql
   ansible.builtin.service:
@@ -24,7 +24,7 @@
   failed_when: false
 
 # Issue #250 — daemon-reload handler for the postgresql.service.d/
-# storage-box drop-in. Without this, a changed drop-in doesn't take
+# off-host backup drop-in. Without this, a changed drop-in doesn't take
 # effect until the next manual `systemctl daemon-reload`. Mirror the
 # canonical fail-closed pattern from control_plane_service/tasks/main.yml.
 - name: daemon-reload postgres
