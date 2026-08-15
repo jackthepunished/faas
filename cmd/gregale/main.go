@@ -426,9 +426,18 @@ func run(args []string) int {
 		// Issue #911 / ADR-110: operator-side manifest loader.
 		// `gregale manifest validate --file=PATH` runs the
 		// canonical validator (pkg/manifest/Validate); PR-2 adds
-		// `manifest render`; PR-3 adds `manifest install`. The
-		// dispatcher is cmdManifestDispatch in commands_manifest.go.
+		// `manifest render`; the install path lives under
+		// `gregale release install` (PR-3), not `manifest install`.
+		// The dispatcher is cmdManifestDispatch in commands_manifest.go.
 		return cmdManifestDispatch(args[1:])
+	case "release":
+		// Issue #911 / ADR-110: cluster-shipped release bundle
+		// (PR-3). `gregale release bundle` materialises the
+		// daemon-binary bundle and INSERTs into release_bundles;
+		// `gregale release install` flips the local
+		// /opt/faas/current symlink + stamps applied_at. The
+		// dispatcher is cmdReleaseDispatch in commands_release.go.
+		return cmdReleaseDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1
