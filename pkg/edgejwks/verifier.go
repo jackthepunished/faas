@@ -235,7 +235,7 @@ func (v *joseVerifier) Verify(ctx context.Context, rawToken string, rule Verifie
 					re, err := regexp.Compile(pat)
 					if err != nil {
 						// A bad pattern is a server-side bug; fail closed.
-						return nil, fmt.Errorf("%w: %s pattern invalid: %v", ErrJWTMissingClaim, k, err)
+						return nil, fmt.Errorf("%w: %s pattern invalid: %w", ErrJWTMissingClaim, k, err)
 					}
 					if !re.MatchString(s) {
 						return nil, fmt.Errorf("%w: %s", ErrJWTMissingClaim, k)

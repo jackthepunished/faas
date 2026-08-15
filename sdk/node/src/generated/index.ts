@@ -158,6 +158,8 @@ export type { MFARecoverResponse } from './models/MFARecoverResponse.js';
 export type { MFAVerifyRequest } from './models/MFAVerifyRequest.js';
 export type { MFAVerifyResponse } from './models/MFAVerifyResponse.js';
 export type { OAuthProviderCapability } from './models/OAuthProviderCapability.js';
+export type { OIDCExchangeRequest } from './models/OIDCExchangeRequest.js';
+export type { OIDCExchangeResponse } from './models/OIDCExchangeResponse.js';
 export type { OrgAccountID } from './models/OrgAccountID.js';
 export type { OrgInvitationResponse } from './models/OrgInvitationResponse.js';
 export type { OrgListResponse } from './models/OrgListResponse.js';
