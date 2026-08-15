@@ -241,6 +241,30 @@ func (s *fakeStore) ListComputeNodes(_ context.Context) ([]ComputeNodeRow, error
 	return out, nil
 }
 
+// SetComputeNodeRole implements Store (PR-2 / issue #911 / ADR-110).
+// Mirrors the pgStore behaviour: ErrComputeNodeNotFound on a missing
+// row, (false, nil) if the role is already the same value,
+// (true, nil) on a real update.
+func (s *fakeStore) SetComputeNodeRole(_ context.Context, name, role string) (bool, error) {
+	if name == "" {
+		return false, errors.New("releaseinstall: empty compute_nodes name")
+	}
+	if role == "" {
+		return false, errors.New("releaseinstall: empty role")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.cnRows[name]
+	if !ok {
+		return false, ErrComputeNodeNotFound
+	}
+	if row.Role != nil && *row.Role == role {
+		return false, nil
+	}
+	row.Role = &role
+	return true, nil
+}
+
 func sampleBundle(sha string) Bundle {
 	// EncodeDaemonHashes requires every daemon in the catalog; the
 	// sample bundle is canonical-complete.
@@ -631,6 +655,107 @@ func TestFakeStore_ListAllBundles_OrdersByCreatedDesc(t *testing.T) {
 	}
 	if got[2].GitSHA != sha1 {
 		t.Errorf("ListAllBundles[2] = %q, want %q (oldest last)", got[2].GitSHA, sha1)
+	}
+}
+
+// PR-2 (issue #911 / ADR-110) tests: SetComputeNodeRole. The
+// renderer calls this after the file-write phase so the manifest
+// host.role value lands on compute_nodes.role. The contract:
+//
+//   - ErrComputeNodeNotFound when no row exists for the given name
+//     (deploy-order bug: releaseinstall was skipped before render)
+//   - (false, nil) when the row already has the same role
+//     (idempotent second render — no audit log noise)
+//   - (true, nil) on a real role change
+//   - rejects empty name + empty role with explicit errors
+
+func TestFakeStore_SetComputeNodeRole_NewRow(t *testing.T) {
+	s := newFakeStore()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	mh := "sha256:" + strings.Repeat("a", 64)
+	if _, err := s.UpsertComputeNode(context.Background(), "node-A", sha, mh); err != nil {
+		t.Fatalf("UpsertComputeNode: %v", err)
+	}
+	updated, err := s.SetComputeNodeRole(context.Background(), "node-A", "control-plane")
+	if err != nil {
+		t.Fatalf("SetComputeNodeRole: %v", err)
+	}
+	if !updated {
+		t.Errorf("SetComputeNodeRole first call = false, want true (row role changed)")
+	}
+	got, err := s.GetComputeNode(context.Background(), "node-A")
+	if err != nil {
+		t.Fatalf("GetComputeNode: %v", err)
+	}
+	if got.Role == nil || *got.Role != "control-plane" {
+		t.Errorf("Role = %v, want control-plane", got.Role)
+	}
+}
+
+func TestFakeStore_SetComputeNodeRole_Idempotent(t *testing.T) {
+	s := newFakeStore()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	mh := "sha256:" + strings.Repeat("a", 64)
+	if _, err := s.UpsertComputeNode(context.Background(), "node-B", sha, mh); err != nil {
+		t.Fatalf("UpsertComputeNode: %v", err)
+	}
+	first, err := s.SetComputeNodeRole(context.Background(), "node-B", "compute-only")
+	if err != nil {
+		t.Fatalf("SetComputeNodeRole 1: %v", err)
+	}
+	if !first {
+		t.Errorf("first SetComputeNodeRole = false, want true")
+	}
+	second, err := s.SetComputeNodeRole(context.Background(), "node-B", "compute-only")
+	if err != nil {
+		t.Fatalf("SetComputeNodeRole 2 (same role): %v", err)
+	}
+	if second {
+		t.Errorf("second SetComputeNodeRole (same role) = true, want false (idempotent)")
+	}
+}
+
+func TestFakeStore_SetComputeNodeRole_RoleChange(t *testing.T) {
+	s := newFakeStore()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	mh := "sha256:" + strings.Repeat("a", 64)
+	if _, err := s.UpsertComputeNode(context.Background(), "node-C", sha, mh); err != nil {
+		t.Fatalf("UpsertComputeNode: %v", err)
+	}
+	if _, err := s.SetComputeNodeRole(context.Background(), "node-C", "control-plane"); err != nil {
+		t.Fatalf("SetComputeNodeRole control-plane: %v", err)
+	}
+	updated, err := s.SetComputeNodeRole(context.Background(), "node-C", "compute-only")
+	if err != nil {
+		t.Fatalf("SetComputeNodeRole compute-only: %v", err)
+	}
+	if !updated {
+		t.Errorf("SetComputeNodeRole role change = false, want true (control-plane → compute-only)")
+	}
+	got, err := s.GetComputeNode(context.Background(), "node-C")
+	if err != nil {
+		t.Fatalf("GetComputeNode: %v", err)
+	}
+	if got.Role == nil || *got.Role != "compute-only" {
+		t.Errorf("Role = %v, want compute-only", got.Role)
+	}
+}
+
+func TestFakeStore_SetComputeNodeRole_MissingRow(t *testing.T) {
+	s := newFakeStore()
+	_, err := s.SetComputeNodeRole(context.Background(), "no-such-node", "control-plane")
+	if !errors.Is(err, ErrComputeNodeNotFound) {
+		t.Errorf("SetComputeNodeRole on missing row = %v, want ErrComputeNodeNotFound", err)
+	}
+}
+
+func TestFakeStore_SetComputeNodeRole_EmptyInputs(t *testing.T) {
+	s := newFakeStore()
+	if _, err := s.SetComputeNodeRole(context.Background(), "", "control-plane"); err == nil {
+		t.Errorf("SetComputeNodeRole empty name = nil err, want error")
+	}
+	if _, err := s.SetComputeNodeRole(context.Background(), "node-D", ""); err == nil {
+		t.Errorf("SetComputeNodeRole empty role = nil err, want error")
 	}
 }
 

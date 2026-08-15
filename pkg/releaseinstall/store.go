@@ -71,6 +71,21 @@ type Store interface {
 	// release membership and detect drift against the on-disk
 	// bundle + the release_bundles table.
 	ListComputeNodes(ctx context.Context) ([]ComputeNodeRow, error)
+	// SetComputeNodeRole writes the role column on the row whose
+	// name matches. PR-2 (issue #911 / ADR-110) renderer calls this
+	// after the file-write phase so the manifest's host.role value
+	// (single-box / control-plane / compute-only) ends up on
+	// compute_nodes.role. Returns ErrComputeNodeNotFound if no row
+	// exists for the given name — the renderer's typical sequence
+	// is UpsertComputeNode (PR-6) then SetComputeNodeRole (PR-2);
+	// a missing row at the SetComputeNodeRole step means the
+	// releaseinstall step was skipped, which is a deploy-order bug,
+	// not a transient DB error.
+	//
+	// Returns true if the row was updated (the role column changed),
+	// false if the role was already set to the same value
+	// (idempotent second render).
+	SetComputeNodeRole(ctx context.Context, name, role string) (bool, error)
 }
 
 // ErrNotFound is returned by GetByGitSHA when no row matches.
@@ -406,4 +421,53 @@ func (s pgStore) ListComputeNodes(ctx context.Context) ([]ComputeNodeRow, error)
 		return nil, fmt.Errorf("releaseinstall: iterate compute_nodes: %w", err)
 	}
 	return out, nil
+}
+
+// SetComputeNodeRole implements Store (PR-2 / issue #911 / ADR-110).
+// Writes the role column on the row keyed by name. The query is
+// intentional: a plain UPDATE returns ErrNotFound via pgx.ErrNoRows
+// only when the row doesn't exist (Postgres skips the WHERE silently
+// when zero rows match, so we use RETURNING + a follow-up scan to
+// distinguish "no row" from "row already had the same role").
+//
+// The role column is plain text per migrations/00271; the
+// single-box / control-plane / compute-only enum is enforced by the
+// renderer (the only writer), not the DB. PR-4 doctor reads the
+// column to verify the renderer's claim matches the on-disk
+// daemonset.
+func (s pgStore) SetComputeNodeRole(ctx context.Context, name, role string) (bool, error) {
+	if name == "" {
+		return false, fmt.Errorf("releaseinstall: empty compute_nodes name")
+	}
+	if role == "" {
+		return false, fmt.Errorf("releaseinstall: empty role")
+	}
+	// Conditional UPDATE returns the row only when the role actually
+	// changed; if the row already has the role, RETURNING is empty
+	// and we treat it as a no-op (false). The follow-up lookup
+	// distinguishes "no row" (ErrComputeNodeNotFound) from "row +
+	// same role" (false, nil).
+	var newRole string
+	err := s.pool.QueryRow(ctx, `
+		update compute_nodes
+		   set role = $2
+		 where name = $1
+		   and (role IS DISTINCT FROM $2)
+		returning role
+	`, name, role).Scan(&newRole)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Either the row doesn't exist, or it already has
+			// the role. Disambiguate.
+			row, gerr := s.GetComputeNode(ctx, name)
+			if gerr != nil {
+				return false, gerr
+			}
+			// Row exists; same role.
+			_ = row
+			return false, nil
+		}
+		return false, fmt.Errorf("releaseinstall: set compute_nodes role: %w", err)
+	}
+	return true, nil
 }

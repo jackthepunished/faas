@@ -61,8 +61,14 @@ type RenderOptions struct {
 // jq pattern handles both. The Skipped bool flips true on a
 // second-run idempotent short-circuit where every output's on-disk
 // sha256 matches the rendered sha256.
+//
+// Role is the manifest host's role (single-box / control-plane /
+// compute-only) — PR-2 stores it on compute_nodes.role after the
+// file-write phase. Empty Role means the driver doesn't know
+// (single-box dev where the manifest host name is empty).
 type RenderReport struct {
 	Host         string         `json:"host"`
+	Role         string         `json:"role,omitempty"`
 	ManifestHash string         `json:"manifest_hash"`
 	Outputs      []OutputReport `json:"outputs"`
 	Skipped      bool           `json:"skipped"`
@@ -209,7 +215,7 @@ func render(opts RenderOptions) (RenderReport, error) {
 		mode os.FileMode
 	}
 	var outputs []computedOutput
-	report := RenderReport{Host: host.Name, ManifestHash: manifestHash}
+	report := RenderReport{Host: host.Name, Role: host.Role, ManifestHash: manifestHash}
 
 	// 1. /etc/faas/<daemon>.toml  +  2. /etc/systemd/system/faas-<daemon>.service
 	for _, d := range daemons {
@@ -240,7 +246,12 @@ func render(opts RenderOptions) (RenderReport, error) {
 		tomlPath := filepath.Join(opts.EtcFaasDir, d+".toml")
 		outputs = append(outputs, computedOutput{path: tomlPath, body: tomlBody, mode: 0o644})
 
-		systemdBody, err := renderSystemd(d)
+		// PR-2 (issue #911 / ADR-110): thread host.Name so the
+		// rendered unit carries Environment=FAAS_NODE_NAME=<host>.
+		// Empty host.Name (single-box dev) emits no Environment= line
+		// — the daemon's TOML default applies and the unit boots
+		// without a multi-host identity anchor.
+		systemdBody, err := renderSystemd(d, host.Name)
 		if err != nil {
 			return report, err
 		}
