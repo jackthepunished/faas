@@ -2,8 +2,6 @@ package renderer
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -44,27 +42,6 @@ func renderCgroupBody(sliceName, controllers string) ([]byte, error) {
 		body.WriteByte('\n')
 	}
 	return []byte(body.String()), nil
-}
-
-// renderCgroup ensures the slice directory exists and publishes
-// the subtree_control body via publishAtomic. The slice mkdir is
-// not part of the idempotent short-circuit (it's a no-op once the
-// slice exists) and runs before publish so publishAtomic sees a
-// usable target path.
-func renderCgroup(rootDir, sliceName, controllers string) error {
-	body, err := renderCgroupBody(sliceName, controllers)
-	if err != nil {
-		return err
-	}
-	slicePath := filepath.Join(rootDir, sliceName)
-	if err := os.MkdirAll(slicePath, 0o755); err != nil {
-		return fmt.Errorf("renderer: cgroup: mkdir %s: %w", slicePath, err)
-	}
-	ctrlPath := filepath.Join(slicePath, "subtree_control")
-	if _, _, err := publishAtomic(ctrlPath, body, 0o644); err != nil {
-		return fmt.Errorf("renderer: cgroup: write %s: %w", ctrlPath, err)
-	}
-	return nil
 }
 
 // parseControllers splits the manifest's `controllers` string into a

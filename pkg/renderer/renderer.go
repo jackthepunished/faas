@@ -183,19 +183,20 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// it (no "builderd" entry — adding one would be a no-op against
 	// ActivationOrder() and a footgun for future readers).
 	daemons := daemonunitspec.ActivationOrder()
-	if host.Role == "compute-only" {
+	switch host.Role {
+	case "compute-only":
 		// Compute-only boxes run vmmd, imaged, and gatewayd-internal.
 		// They do NOT run apid, schedd, meterd, githubd, or
 		// gatewayd-public. (builderd is per-build via vmmd; not a
 		// systemd unit — see comment above.)
 		daemons = filterDaemons(daemons, "vmmd", "imaged", "gatewayd-internal")
-	} else if host.Role == "control-plane" {
+	case "control-plane":
 		// Control-plane boxes run apid, schedd, meterd, githubd,
 		// gatewayd-public. They do NOT run vmmd, imaged, or
 		// gatewayd-internal.
 		daemons = filterDaemons(daemons, "apid", "schedd", "meterd", "githubd", "gatewayd-public")
 	}
-	// single-box: all 8 (Registry already includes imaged).
+	// single-box (and ""): all 8 (Registry already includes imaged).
 
 	// Compute every output in memory first. Phase 3 publishes them
 	// atomically. The two-phase approach makes the renderer
@@ -203,12 +204,9 @@ func render(opts RenderOptions) (RenderReport, error) {
 	// tombstone hit) aborts the publish phase with no partial
 	// state.
 	type computedOutput struct {
-		path       string
-		body       []byte
-		mode       os.FileMode
-		ensureOnly bool // for PKI: ensures leaves exist; the
-		// body is the cert+key path list, not file content
-		ensurePaths []string
+		path string
+		body []byte
+		mode os.FileMode
 	}
 	var outputs []computedOutput
 	report := RenderReport{Host: host.Name, ManifestHash: manifestHash}

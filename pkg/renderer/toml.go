@@ -414,10 +414,7 @@ func sectionHeaderEmitted(buf *bytes.Buffer, section string) bool {
 	// Confirm the header is the last section header (no other
 	// section header after it).
 	rest := body[idx+len(marker):]
-	if strings.Contains(rest, "[") {
-		return false
-	}
-	return true
+	return !strings.Contains(rest, "[")
 }
 
 func containsString(xs []string, x string) bool {
