@@ -1005,13 +1005,15 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 			Message:  "cert_fingerprint check: list compute_nodes failed",
 			Detail:   err.Error(),
 		})
-		return findings, nil
+		return findings, fmt.Errorf("list compute_nodes: %w", err)
 	}
 	hostAgeBytes, rerr := os.ReadFile("/etc/faas/secrets/host.age")
 	if rerr != nil {
 		// Already surfaced above as a "missing host.age"
 		// finding; skip the per-row fingerprint walk because
-		// every row would mismatch.
+		// every row would mismatch. rerr is intentional
+		// (the mode loop surfaced the missing-file finding).
+		_ = rerr
 		return findings, nil
 	}
 	sum := sha256.Sum256(hostAgeBytes)
@@ -1070,13 +1072,6 @@ func mustParsePerm(s string) os.FileMode {
 		n = n*8 + int(ch-'0')
 	}
 	return os.FileMode(n)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // dispatchDoctor is the const name referenced by main.go +
