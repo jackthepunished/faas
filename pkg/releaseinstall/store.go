@@ -42,10 +42,45 @@ type Store interface {
 	// (the partial-uniq index release_bundles_applied_at_idx keeps
 	// this fast). Used by the operator dashboard.
 	ListApplied(ctx context.Context) ([]BundleRow, error)
+	// UpsertComputeNode writes the per-node release membership on
+	// the compute_nodes table (PR-6 / issue #911). Stamps
+	// release_id + manifest_hash keyed by name (the host's
+	// --node flag or hostname). Idempotent via ON CONFLICT (name)
+	// DO UPDATE. generation stays at 0 — PR-4 doctor bumps it on
+	// detected drift.
+	//
+	// Returns the row id (uuid) so the caller can include it in
+	// the JSON report. host_certificate / cert_fingerprint /
+	// role columns are intentionally NOT written here (PR-X secrets
+	// init owns host_certificate/cert_fingerprint; PR-2 renderer
+	// owns role).
+	UpsertComputeNode(ctx context.Context, name, gitSHA, manifestHash string) (string, error)
+	// GetComputeNode reads the per-node release membership. Returns
+	// ErrComputeNodeNotFound if no row exists for the given name.
+	// Used by PR-4 doctor + e2e tests to assert post-install state.
+	GetComputeNode(ctx context.Context, name string) (ComputeNodeRow, error)
 }
 
 // ErrNotFound is returned by GetByGitSHA when no row matches.
 var ErrNotFound = errors.New("releaseinstall: bundle not found")
+
+// ErrComputeNodeNotFound is returned by GetComputeNode when no
+// compute_nodes row matches the given name. Distinct error var
+// from ErrNotFound so callers can distinguish "no bundle row" from
+// "no compute node row" without parsing the message.
+var ErrComputeNodeNotFound = errors.New("releaseinstall: compute node not found")
+
+// ComputeNodeRow mirrors the columns PR-6 reads from compute_nodes
+// after UpsertComputeNode. Only the release_id/manifest_hash
+// columns + the surrogate id are populated; the other PR-3a columns
+// (host_certificate, cert_fingerprint, role, generation) stay
+// zero-valued until their respective writers land.
+type ComputeNodeRow struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	ReleaseID    string `json:"release_id"`
+	ManifestHash string `json:"manifest_hash"`
+}
 
 // pgStore is the production Store, backed by pgxpool. Construct
 // it via NewStore passing a pool.
@@ -199,4 +234,61 @@ func (s pgStore) ListApplied(ctx context.Context) ([]BundleRow, error) {
 		return nil, fmt.Errorf("releaseinstall: iterate: %w", err)
 	}
 	return out, nil
+}
+
+// UpsertComputeNode implements Store.
+//
+// Writes the per-node release membership on compute_nodes. The
+// conflict target is compute_nodes_name_key (UNIQUE on name) per
+// migrations/00024_compute_nodes.sql. The migration 00271 columns
+// (release_id, manifest_hash) are plain text with no DB CHECK, so
+// Go-side validation (validGitSHA + validManifestHash) is the gate.
+//
+// generation is intentionally set to 0 on every write — the doctor
+// (PR-4) bumps it on detected drift; PR-6 does not pre-empt that
+// signal. host_certificate, cert_fingerprint, and role are NOT
+// touched (PR-X / PR-2 own those columns).
+func (s pgStore) UpsertComputeNode(ctx context.Context, name, gitSHA, manifestHash string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("releaseinstall: empty compute_nodes name")
+	}
+	if !validGitSHA(gitSHA) {
+		return "", fmt.Errorf("releaseinstall: git_sha %q is not 40-char lowercase hex", gitSHA)
+	}
+	if !validManifestHash(manifestHash) {
+		return "", fmt.Errorf("releaseinstall: manifest_hash %q is not sha256:<64hex>", manifestHash)
+	}
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		insert into compute_nodes (name, release_id, manifest_hash, generation)
+		values ($1, $2, $3, 0)
+		on conflict (name) do update
+		set    release_id    = excluded.release_id,
+		       manifest_hash = excluded.manifest_hash
+		returning id
+	`, name, gitSHA, manifestHash).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("releaseinstall: upsert compute_nodes: %w", err)
+	}
+	return id, nil
+}
+
+// GetComputeNode implements Store.
+func (s pgStore) GetComputeNode(ctx context.Context, name string) (ComputeNodeRow, error) {
+	if name == "" {
+		return ComputeNodeRow{}, fmt.Errorf("releaseinstall: empty compute_nodes name")
+	}
+	var row ComputeNodeRow
+	err := s.pool.QueryRow(ctx, `
+		select id, name, release_id, manifest_hash
+		  from compute_nodes
+		 where name = $1
+	`, name).Scan(&row.ID, &row.Name, &row.ReleaseID, &row.ManifestHash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ComputeNodeRow{}, ErrComputeNodeNotFound
+		}
+		return ComputeNodeRow{}, fmt.Errorf("releaseinstall: get compute node: %w", err)
+	}
+	return row, nil
 }

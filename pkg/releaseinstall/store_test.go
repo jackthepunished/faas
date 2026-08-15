@@ -19,6 +19,7 @@ package releaseinstall
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,8 +27,10 @@ import (
 
 // fakeStore is the in-memory Store used by these tests.
 type fakeStore struct {
-	mu   sync.Mutex
-	rows map[string]*fakeRow
+	mu       sync.Mutex
+	rows     map[string]*fakeRow
+	cnRows   map[string]*ComputeNodeRow // PR-6: keyed by compute_nodes.name
+	cnNextID int
 }
 
 type fakeRow struct {
@@ -39,7 +42,10 @@ type fakeRow struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{rows: map[string]*fakeRow{}}
+	return &fakeStore{
+		rows:   map[string]*fakeRow{},
+		cnRows: map[string]*ComputeNodeRow{},
+	}
 }
 
 func (s *fakeStore) Insert(_ context.Context, b Bundle) (string, error) {
@@ -131,6 +137,53 @@ func (s *fakeStore) ListApplied(_ context.Context) ([]BundleRow, error) {
 		}
 	}
 	return out, nil
+}
+
+// UpsertComputeNode implements Store (PR-6). Mirrors the pgStore
+// behaviour: input validation via validGitSHA/validManifestHash,
+// idempotent INSERT...ON CONFLICT keyed by name, returns the row id.
+func (s *fakeStore) UpsertComputeNode(_ context.Context, name, gitSHA, manifestHash string) (string, error) {
+	if name == "" {
+		return "", errors.New("releaseinstall: empty compute_nodes name")
+	}
+	if !validGitSHA(gitSHA) {
+		return "", errors.New("releaseinstall: invalid git_sha")
+	}
+	if !validManifestHash(manifestHash) {
+		return "", errors.New("releaseinstall: invalid manifest_hash")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.cnRows[name]; ok {
+		// Update in place. Idempotent on re-install.
+		existing.ReleaseID = gitSHA
+		existing.ManifestHash = manifestHash
+		return existing.ID, nil
+	}
+	s.cnNextID++
+	id := "fake-cn-" + name
+	s.cnRows[name] = &ComputeNodeRow{
+		ID:           id,
+		Name:         name,
+		ReleaseID:    gitSHA,
+		ManifestHash: manifestHash,
+	}
+	return id, nil
+}
+
+// GetComputeNode implements Store (PR-6). Mirrors GetByGitSHA's
+// ErrNotFound convention with the dedicated ErrComputeNodeNotFound.
+func (s *fakeStore) GetComputeNode(_ context.Context, name string) (ComputeNodeRow, error) {
+	if name == "" {
+		return ComputeNodeRow{}, errors.New("releaseinstall: empty compute_nodes name")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.cnRows[name]
+	if !ok {
+		return ComputeNodeRow{}, ErrComputeNodeNotFound
+	}
+	return *row, nil
 }
 
 func sampleBundle(sha string) Bundle {
@@ -293,6 +346,110 @@ func TestFakeStore_ListApplied_OrdersDescAndFiltersUnapplied(t *testing.T) {
 	}
 	if got[1].GitSHA != sha1 {
 		t.Errorf("ListApplied[1] = %q, want %q (oldest last)", got[1].GitSHA, sha1)
+	}
+}
+
+// PR-6: UpsertComputeNode + GetComputeNode tests.
+//
+// The first-write-wins semantics on the bundle table (MarkApplied)
+// intentionally do NOT apply here: a re-install from the same box
+// on the same release is idempotent (release_id + manifest_hash stay
+// the same), but a re-install onto a NEW release must overwrite
+// release_id + manifest_hash with the new values. ON CONFLICT (name)
+// DO UPDATE delivers both behaviours.
+
+func TestFakeStore_UpsertComputeNode_NewRow(t *testing.T) {
+	s := newFakeStore()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	mh := "sha256:" + strings.Repeat("a", 64)
+	id, err := s.UpsertComputeNode(context.Background(), "node-A", sha, mh)
+	if err != nil {
+		t.Fatalf("UpsertComputeNode: %v", err)
+	}
+	if id == "" {
+		t.Errorf("UpsertComputeNode returned empty id")
+	}
+	got, err := s.GetComputeNode(context.Background(), "node-A")
+	if err != nil {
+		t.Fatalf("GetComputeNode: %v", err)
+	}
+	if got.ID != id {
+		t.Errorf("round-trip id = %q, want %q", got.ID, id)
+	}
+	if got.ReleaseID != sha {
+		t.Errorf("release_id = %q, want %q", got.ReleaseID, sha)
+	}
+	if got.ManifestHash != mh {
+		t.Errorf("manifest_hash = %q, want %q", got.ManifestHash, mh)
+	}
+}
+
+func TestFakeStore_UpsertComputeNode_RerunUpdates(t *testing.T) {
+	s := newFakeStore()
+	sha1 := "0123456789abcdef0123456789abcdef01234567"
+	mh1 := "sha256:" + strings.Repeat("a", 64)
+	sha2 := "89abcdef0123456789abcdef0123456789abcdef"
+	mh2 := "sha256:" + strings.Repeat("b", 64)
+	// First install.
+	id1, err := s.UpsertComputeNode(context.Background(), "node-A", sha1, mh1)
+	if err != nil {
+		t.Fatalf("UpsertComputeNode 1: %v", err)
+	}
+	// Re-install with the SAME release (idempotent).
+	id2, err := s.UpsertComputeNode(context.Background(), "node-A", sha1, mh1)
+	if err != nil {
+		t.Fatalf("UpsertComputeNode 1b (same release): %v", err)
+	}
+	if id1 != id2 {
+		t.Errorf("idempotent re-install id = %q, want %q (id stable across re-installs)", id2, id1)
+	}
+	// Re-install with a NEW release (overwrites release_id + manifest_hash).
+	id3, err := s.UpsertComputeNode(context.Background(), "node-A", sha2, mh2)
+	if err != nil {
+		t.Fatalf("UpsertComputeNode 2 (new release): %v", err)
+	}
+	if id3 != id1 {
+		t.Errorf("new-release id = %q, want %q (id stable across releases)", id3, id1)
+	}
+	got, err := s.GetComputeNode(context.Background(), "node-A")
+	if err != nil {
+		t.Fatalf("GetComputeNode: %v", err)
+	}
+	if got.ReleaseID != sha2 {
+		t.Errorf("post-overwrite release_id = %q, want %q", got.ReleaseID, sha2)
+	}
+	if got.ManifestHash != mh2 {
+		t.Errorf("post-overwrite manifest_hash = %q, want %q", got.ManifestHash, mh2)
+	}
+}
+
+func TestFakeStore_GetComputeNode_RoundTrips(t *testing.T) {
+	s := newFakeStore()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	mh := "sha256:" + strings.Repeat("c", 64)
+	if _, err := s.UpsertComputeNode(context.Background(), "node-B", sha, mh); err != nil {
+		t.Fatalf("UpsertComputeNode: %v", err)
+	}
+	got, err := s.GetComputeNode(context.Background(), "node-B")
+	if err != nil {
+		t.Fatalf("GetComputeNode: %v", err)
+	}
+	if got.Name != "node-B" {
+		t.Errorf("Name = %q, want %q", got.Name, "node-B")
+	}
+	if got.ReleaseID != sha {
+		t.Errorf("ReleaseID = %q, want %q", got.ReleaseID, sha)
+	}
+	if got.ManifestHash != mh {
+		t.Errorf("ManifestHash = %q, want %q", got.ManifestHash, mh)
+	}
+}
+
+func TestFakeStore_GetComputeNode_NotFound(t *testing.T) {
+	s := newFakeStore()
+	_, err := s.GetComputeNode(context.Background(), "no-such-node")
+	if !errors.Is(err, ErrComputeNodeNotFound) {
+		t.Errorf("GetComputeNode on missing row = %v, want ErrComputeNodeNotFound", err)
 	}
 }
 

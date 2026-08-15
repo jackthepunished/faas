@@ -80,3 +80,82 @@ func TestRegistryIsSubsetOfHostKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestRegistryDaemonSet_LockstepWithHostKeys is the load-bearing
+// cardinality assertion for issue #911 / ADR-110 (PR-6). It is
+// stronger than TestRegistryIsSubsetOfHostKeys above:
+//
+//   - Pins |Registry| = 8 (the systemd-managed daemon set).
+//   - Pins |manifest.HostKeys| = 9 (8 daemons + exactly one extra
+//     non-systemd entry).
+//   - Pins the named except-set: HostKeys \ Registry == {"builderd"}.
+//     builderd is ephemeral per-build (ADR-003 — vmmd spawns it
+//     inside an ephemeral microVM, so it never has a unit file).
+//
+// Why the cardinality check matters: a future PR that adds a 9th
+// daemon to the Registry MUST also add it to manifest.HostKeys
+// (renderer reads HostKeys; without the row, renderTOML fails at
+// runtime). The reverse — adding a HostKey without a Registry entry
+// — is allowed but only for ADR-documented ephemeral daemons;
+// "builderd" is the canonical example today.
+//
+// Reuses the dashed→underscored translation from the test above:
+// gatewayd-internal → gatewayd_internal, gatewayd-public →
+// gatewayd_public; rest are identity.
+func TestRegistryDaemonSet_LockstepWithHostKeys(t *testing.T) {
+	const (
+		wantRegistrySize = 8
+		wantHostKeysSize = 9
+		wantExtra        = "builderd"
+	)
+	if got := len(Registry); got != wantRegistrySize {
+		t.Errorf("Registry len = %d, want %d (adding a daemon requires updating manifest.HostKeys too)",
+			got, wantRegistrySize)
+	}
+	registrySet := make(map[string]bool, len(Registry))
+	for _, e := range Registry {
+		// Apply the same dashed→underscored translation as
+		// TestRegistryIsSubsetOfHostKeys so the set comparison
+		// uses the HostKeys convention.
+		switch e.Name {
+		case "gatewayd-internal":
+			registrySet["gatewayd_internal"] = true
+		case "gatewayd-public":
+			registrySet["gatewayd_public"] = true
+		default:
+			registrySet[e.Name] = true
+		}
+	}
+	if got := len(manifest.HostKeys); got != wantHostKeysSize {
+		t.Errorf("manifest.HostKeys len = %d, want %d (Registry=%d, exactly one extra ephemeral entry expected)",
+			got, wantHostKeysSize, len(Registry))
+	}
+	// Build the symmetric difference: HostKeys \ Registry.
+	extra := make(map[string]bool)
+	for hk := range manifest.HostKeys {
+		if !registrySet[hk] {
+			extra[hk] = true
+		}
+	}
+	if len(extra) != 1 {
+		names := make([]string, 0, len(extra))
+		for n := range extra {
+			names = append(names, n)
+		}
+		t.Errorf("HostKeys \\ Registry has %d entries (%v), want exactly 1 (%q). "+
+			"Either add the missing daemon to Registry or remove the extra HostKeys entry.",
+			len(extra), names, wantExtra)
+		return
+	}
+	if !extra[wantExtra] {
+		t.Errorf("HostKeys \\ Registry = %v, want {%q} (ADR-003: builderd is the only ephemeral per-build daemon)",
+			extra, wantExtra)
+	}
+	// Reverse direction — every Registry entry must have a HostKeys
+	// row (preserved from TestRegistryIsSubsetOfHostKeys).
+	for name := range registrySet {
+		if _, ok := manifest.HostKeys[name]; !ok {
+			t.Errorf("Registry name %q has no HostKeys row — renderer will fail at renderTOML", name)
+		}
+	}
+}
