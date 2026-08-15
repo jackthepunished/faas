@@ -959,8 +959,13 @@ func TestSec11_PerHostEgressTemplating(t *testing.T) {
 				t.Logf("jinja2 not importable on this host; skipping Go-vs-Jinja2 cross-check for %s", tc.name)
 				return
 			}
+			// Mega-PR-C Commit 2 moved the Jinja2 template from
+			// `nftables/files/` to `nftables/templates/` so ansible's
+			// `template:` module resolves it (the deployctl generator
+			// also lives on the templates/ side). Cross-check
+			// against the canonical ansible input, not a stale copy.
 			tmplPath := filepath.Join(root,
-				"deploy/ansible/roles/nftables/files/policy_nftables.conf.j2")
+				"deploy/ansible/roles/nftables/templates/policy_nftables.conf.j2")
 			tmplBytes, err := os.ReadFile(tmplPath)
 			if err != nil {
 				t.Fatalf("read Jinja2 template %s: %v", tmplPath, err)

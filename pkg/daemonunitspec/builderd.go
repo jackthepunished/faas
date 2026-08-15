@@ -39,10 +39,10 @@ func UnitBuilderd() daemonunit.Unit {
 		After:         []string{"network.target", "faas-cp.slice", "faas-vmmd.service"},
 		Wants:         []string{"faas-cp.slice", "faas-vmmd.service"},
 
-		Type:   "simple",
-		User:   "faas-builderd",
-		Group:  "faas",
-		ExecStart: "/opt/faas/current/bin/builderd",
+		Type:       "simple",
+		User:       "faas-builderd",
+		Group:      "faas",
+		ExecStart:  "/opt/faas/current/bin/builderd",
 		Restart:    "on-failure",
 		RestartSec: "2s",
 
