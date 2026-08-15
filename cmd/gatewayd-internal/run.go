@@ -1780,6 +1780,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// the three routes registered in NewSynthServer.
 		unifiedMux.Handle("/v1/synthesize", deps.synth.Mux())
 		unifiedMux.Handle("/v1/invocations:dispatch", deps.synth.Mux())
+		// Issue #757 / ADR-100 (commit #13): schedd's dispatch tick
+		// posts trigger-driven batches here. SynthServer.handleInvocationDispatchBatch
+		// fans each record through the same Invoke path and aggregates
+		// the AWS Lambda ReportBatchItemFailures response back to the
+		// schedd. The "POST /..." method-routed Handle below is the
+		// route the spec-check AST scanner walks; the inner
+		// unifiedMux.Handle above is the runtime prefix that
+		// actually serves traffic on the unix socket.
+		unifiedMux.Handle("POST /v1/invocations:dispatch_batch", deps.synth.Mux())
+		unifiedMux.Handle("/v1/invocations:dispatch_batch", deps.synth.Mux())
 		unifiedMux.Handle("/healthz", deps.synth.Mux())
 		// Wrap with h2c so the in-process unix-socket hop negotiates
 		// H2C prior knowledge (no TLS). The customer publicHandler

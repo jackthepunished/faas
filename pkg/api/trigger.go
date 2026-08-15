@@ -228,6 +228,26 @@ type CreateTriggerBatchRequest struct {
 	ManifestYAML string `json:"manifest_yaml"`
 }
 
+// CreateTriggerBatchResult is one row of CreateTriggerBatchResponse.Created.
+// Either `id` is set (created) or `error` is set (rejected) — never both.
+// Mirrors the per-row shape in api/openapi.yaml:9562 + 9567-9576.
+type CreateTriggerBatchResult struct {
+	Slug  string  `json:"slug"`
+	Kind  string  `json:"kind"`
+	ID    *string `json:"id"`
+	Error *string `json:"error,omitempty"`
+}
+
+// CreateTriggerBatchResponse answers POST /v1/triggers:batch_create.
+// One row per trigger the manifest described, in the same order. A
+// row carries either `id` (created) or `error` (rejected with an
+// RFC 7807 code), never both — the dashboard renders the per-row
+// "did this succeed?" inline. Rejections don't roll back successful
+// rows in the same batch.
+type CreateTriggerBatchResponse struct {
+	Created []CreateTriggerBatchResult `json:"created"`
+}
+
 // TriggerMetricsResponse answers GET /v1/triggers/{id}/metrics.
 // Aggregated counters keyed by state — not a Prometheus scrape (the
 // /v1/metrics Prometheus surface is separate, issue #684).
