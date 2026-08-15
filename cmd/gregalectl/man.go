@@ -35,11 +35,12 @@ const manDocsTopic = "man"
 // case) across every page in the section.
 const manSourceBrand = "gregale"
 
-// gregaleVersion is read from wire.Version at startup via
-// initGregaleVersion() (set in main.go via a tiny init() or
-// assigned at process boot — wire.Version is a string constant
-// already, so this is just an indirection so tests can swap it).
-var gregaleVersion = "dev"
+// gregalectlVersion is read from wire.Version at startup via the
+// init() in main.go:69. Mirrors cmd/gregale/man.go:42's gregaleVersion
+// — the man page `.TH GREGALECTL(1) "version"` header reflects the
+// binary the operator is running, not a hardcoded literal. Declared
+// here so tests can swap it without touching main.go.
+var gregalectlVersion = "dev"
 
 // cmdMan dispatches `gregale man [command]`. With no arg, prints
 // the top-level gregale(1) page; with one arg, prints the
@@ -233,7 +234,7 @@ func renderManCommand(w io.Writer, c cliCommand) {
 // renderManCommand via manSection("NAME", ...) — keeping all .SH
 // openings in one place.
 func manHeader(w io.Writer, title, subtitle, source string) {
-	_, _ = fmt.Fprintf(w, ".TH %s 1 \"%s\" \"%s\"\n", title, gregaleVersion, source)
+	_, _ = fmt.Fprintf(w, ".TH %s 1 \"%s\" \"%s\"\n", title, gregalectlVersion, source)
 	_ = subtitle // subtitle is rendered inside the NAME section body
 }
 

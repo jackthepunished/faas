@@ -260,37 +260,10 @@ func TestReleaseInstall_RoundTrip(t *testing.T) {
 	}
 }
 
-// buildGregale builds ./cmd/gregale into a temp binary and returns
-// its path. Cached across the test binary's lifetime by the
-// harness's TestMain in the e2e package, but this helper is a
-// safety net for tests that don't share a TestMain.
-func buildGregale(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "gregale")
-	wd, _ := os.Getwd()
-	root := wd
-	for i := 0; i < 8; i++ {
-		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
-			break
-		}
-		root = filepath.Dir(root)
-	}
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/gregale")
-	cmd.Dir = root
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("go build gregale: %v\n%s", err, out.String())
-	}
-	return bin
-}
-
 // buildGregaleCtl builds ./cmd/gregalectl (the operator-side CLI,
-// PR-6.5) into a temp binary. Mirrors buildGregale — kept as a
-// per-test build rather than a TestMain cache to dodge the
-// pre-existing harness's tight coupling to the apid/vmmd pair.
+// PR-6.5) into a temp binary. Kept as a per-test build rather than
+// a TestMain cache to dodge the pre-existing harness's tight
+// coupling to the apid/vmmd pair.
 func buildGregaleCtl(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

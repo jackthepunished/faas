@@ -37,37 +37,6 @@ func stdoutIsTTY() bool {
 	return v
 }
 
-// stdinIsTTY reports whether os.Stdin is attached to a terminal on
-// unix-likes. Same gate logic as stdoutIsTTY — we cache once and let
-// the test seam override the result. The CLI uses it to decide
-// whether to surface a confirmation prompt (issue #313 zero-config
-// flow only prompts on a real TTY).
-//
-// phase 3 (== repo decomposition) added this; the original file only
-// carried stdoutIsTTY and the §3.2 §3.3 §3.4 plan explicitly avoided
-// stdin because the early PRs only emitted UX lines, never read
-// input. cmdDeployTarball's --yes flag now needs to know whether a
-// TTY is available for the new confirmPlan caller in commands_decompose.go.
-func stdinIsTTY() bool {
-	if testOnlyTTY != nil {
-		return *testOnlyTTY
-	}
-	if isStdinTTYOnce.Load() {
-		return isStdinTTYVal.Load()
-	}
-	v := term.IsTerminal(int(os.Stdin.Fd()))
-	isStdinTTYVal.Store(v)
-	isStdinTTYOnce.Store(true)
-	return v
-}
-
-// isStdinTTYCache holds the once-computed stdin TTY result. Same
-// shape as the stdout cache above.
-var (
-	isStdinTTYOnce atomic.Bool
-	isStdinTTYVal  atomic.Bool
-)
-
 // isStdoutTTYCache holds the once-computed stdout TTY result. The cache
 // is intentionally not inverted: a cached "false" is rare in practice
 // (tests run non-TTY), and any disagreement heals on the next invocation

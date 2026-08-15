@@ -56,6 +56,3 @@ func jsonBoolTrue(s string) bool {
 	}
 	return true
 }
-
-// resetJSONOutput is for tests only. Production code never calls it.
-func resetJSONOutput() { jsonOutput = false }

@@ -45,10 +45,3 @@ var osStdout io.Writer = os.Stdout
 // output without touching the real os.Stderr file descriptor.
 // Declared here so the operator package compiles in isolation.
 var osStderr io.Writer = os.Stderr
-
-// gregalectlVersion is the value substituted into the man page header
-// (`.TH GREGALECTL(1) "version"`). Wired once at process boot from
-// wire.Version (main.go:73) so the man page reflects the binary the
-// operator is running, not a hardcoded literal. Mirrors
-// cmd/gregale/main.go:114's `gregaleVersion`.
-var gregalectlVersion string
