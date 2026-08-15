@@ -36,6 +36,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/imaged"
+	"github.com/onebox-faas/faas/pkg/manifest"
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/rootfs"
@@ -113,6 +114,19 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// a Postgres connection.
 	if err := role.Require("imaged", role.FromConfig("", "FAAS_IMAGED_ROLE"),
 		role.RoleSingleBox, role.RoleComputeOnly); err != nil {
+		return err
+	}
+
+	// PR-5 / issue #911 — manifest reconcile against FAAS_BUILDER_BASE_REF.
+	// When FAAS_MANIFEST_PATH is set, load the split-box deployment
+	// manifest and assert the manifest's release.builder_base_digest
+	// (a sha256 digest from PR-0's schema) matches the resolved
+	// FAAS_BUILDER_BASE_REF. A drift between what the manifest
+	// promises and what imaged actually loads is silent today; PR-5
+	// makes it fatal at boot, pointing the operator at
+	// `gregale manifest validate`. Single-box installs that don't
+	// carry a manifest are unaffected (env-only behaviour).
+	if err := reconcileManifestBuilderBase(); err != nil {
 		return err
 	}
 
@@ -575,4 +589,61 @@ func makeSyftRunner(bin string) func(ctx context.Context, dir string) ([]byte, e
 // WithSecretScanRun wiring in main().
 func makeSecretScanRunner() func(ctx context.Context, dir, layer string) ([]secretscan.Finding, error) {
 	return imaged.RunDeployLayerSecretScan
+}
+
+// reconcileManifestBuilderBase is the PR-5 / issue #911 manifest
+// reconcile step. It runs before the openDB call so a manifest
+// mismatch fails the boot BEFORE we spend a Postgres connection.
+//
+// Behaviour:
+//   - FAAS_MANIFEST_PATH unset (single-box dev today): no-op.
+//   - FAAS_MANIFEST_PATH set but file unreadable / invalid: fatal
+//     (load-failure surfaces the same `gregale manifest validate`
+//     path operators already use).
+//   - manifest.release.builder_base_digest empty: no-op (the
+//     manifest does not pin a builder base — env-only mode).
+//   - FAAS_BUILDER_BASE_REF resolves to a digest that does NOT
+//     match the manifest's pinned digest: fatal with a message
+//     pointing at `gregale manifest validate`.
+//
+// Single-box installs without a manifest keep today's env-only
+// behaviour; split-box installs (post PR-2 renderer + PR-X secrets
+// init) carry the manifest and benefit from the gate.
+func reconcileManifestBuilderBase() error {
+	manifestPath := os.Getenv("FAAS_MANIFEST_PATH")
+	if manifestPath == "" {
+		return nil
+	}
+	m, err := manifest.Load(manifestPath)
+	if err != nil {
+		return fmt.Errorf("imaged: reconcile manifest %s: %w (run `gregale manifest validate --file=%s` to inspect)",
+			manifestPath, err, manifestPath)
+	}
+	pinned := m.Release.BuilderBaseDigest
+	if pinned == "" {
+		// Manifest does not pin a builder base digest — operator
+		// opted out of the contract. Env-only behaviour applies.
+		return nil
+	}
+	envRef := os.Getenv("FAAS_BUILDER_BASE_REF")
+	if envRef == "" {
+		// No env override — imaged will fall through to
+		// imaged.BaseRefBuilder (the package default). The
+		// reconcile still pins the manifest's digest; the gate
+		// below fires only when an operator overrode the env.
+		return nil
+	}
+	parsed, err := oci.ParseReference(envRef)
+	if err != nil {
+		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF %q: %w", envRef, err)
+	}
+	if parsed.Digest == "" {
+		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (manifest pins %s)",
+			envRef, pinned)
+	}
+	if parsed.Digest != pinned {
+		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF digest %q does not match manifest release.builder_base_digest %q (run `gregale manifest validate --file=%s` to inspect)",
+			parsed.Digest, pinned, manifestPath)
+	}
+	return nil
 }

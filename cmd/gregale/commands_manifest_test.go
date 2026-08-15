@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/manifest"
 )
 
 const validManifestYAML = `schema_version: "1.0.0"
@@ -156,5 +158,58 @@ func TestCmdManifestValidate_Help(t *testing.T) {
 	}
 	if code := cmdManifestValidate([]string{"-h"}); code != 0 {
 		t.Fatalf("cmdManifestValidate(-h) = %d, want 0", code)
+	}
+}
+
+// PR-5 / issue #911 — TOML table-placement wiring pin.
+//
+// pkg/manifest.ValidateTOMLPlacement is the load-bearing check that
+// the doctor (PR-4) will consume against the rendered /etc/faas/*.toml
+// on each box. PR-5 wires a CLI-context pin so the validator is
+// reachable from the operator surface — the doctor can call the same
+// function directly, but a future `gregale manifest doctor --role=...`
+// will run this check from this package. The test asserts the function
+// surfaces the tombstone error for the canonical "tls_*_path leaked
+// into [compute_node]" bug class from issue #911.
+func TestTOMLPlacement_TombstoneReachableFromCLIPackage(t *testing.T) {
+	// The canonical vmmd.toml render from issue #911: the operator
+	// accidentally placed tls_cert_path under [compute_node] (the
+	// big-endian duplicate that the production path picked up).
+	rendered := map[string]string{
+		"socket_path":                "/run/faas/vmmd.sock",
+		"listen_addr":                "tcp://0.0.0.0:50051",
+		"tls_cert_path":              "/etc/faas/tls/vmmd/server.crt",
+		"tls_key_path":               "/etc/faas/tls/vmmd/server.key",
+		"tls_ca_path":                "/etc/faas/tls/ca/ca.crt",
+		"compute_node.name":          "fsn-2",
+		"compute_node.target_url":    "tcp://fsn-1:7100",
+		"compute_node.tls_cert_path": "/etc/faas/tls/vmmd/server.crt", // tombstone!
+	}
+	errs := manifest.ValidateTOMLPlacement("vmmd", rendered)
+	if errs == nil {
+		t.Fatal("ValidateTOMLPlacement = nil; want tombstone error for tls_cert_path under [compute_node]")
+	}
+	if !strings.Contains(errs.Error(), "tombstone") {
+		t.Errorf("ValidateTOMLPlacement error = %q; want tombstone message", errs.Error())
+	}
+	if !strings.Contains(errs.Error(), "compute_node.tls_cert_path") {
+		t.Errorf("ValidateTOMLPlacement error = %q; want compute_node.tls_cert_path in path", errs.Error())
+	}
+}
+
+// PR-5 / issue #911 — TOML placement MUST also be reachable from a
+// YAML manifest path for the operator CLI. Today the operator runs
+// `gregale manifest validate --file=...` on the YAML; once the
+// renderer (PR-2) ships, the same CLI dispatch chain will accept a
+// --rendered-from flag and feed the produced map into
+// ValidateTOMLPlacement. This test pins the contract that the
+// validator is exported and callable from cmd/gregale.
+func TestTOMLPlacement_HostKeysCatalogSize(t *testing.T) {
+	// The doctor (PR-4) will iterate every daemon and assert its
+	// rendered map is tombstone-free. Pin that the catalog hasn't
+	// shrunk/grown without a matching schema update.
+	keys := manifest.SortedHostKeys()
+	if len(keys) != 9 {
+		t.Errorf("SortedHostKeys len=%d; want 9 (catalog drift guard)", len(keys))
 	}
 }

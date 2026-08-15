@@ -16,6 +16,21 @@
 // would brick the cluster's mTLS legs — a single bad Postgres read
 // would force every daemon's mTLS handshake to fail. The fresh
 // snapshot only swaps in on success.
+//
+// PR-5 issue #911 — payload discrimination. The 'compute_node_changed'
+// pg_notify channel carries two payload shapes (migrations/00026 +
+// migrations/00076): a JSON object `{node_id, active}` for compute_nodes
+// writes, and the literal string `compute_node_keys` for compute_node_keys
+// writes (table-name piggyback). The verifier reads ONLY compute_nodes,
+// so the keys-table payload is filtered out at the receiver (Run inspects
+// Payload before calling Refresh). Without this, every keys-table write
+// forced an unnecessary Refresh + log line.
+//
+// PR-5 also adds the heartbeat-only short-circuit: a Refresh whose
+// freshly-loaded map equals the prior snapshot is a no-op (no swap, no
+// publish-equivalent event). This kills heartbeat-churn noise where
+// `active=true → true` writes fire notify but produce an identical
+// snapshot.
 
 package wire
 
@@ -23,6 +38,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/onebox-faas/faas/pkg/db"
@@ -45,6 +61,14 @@ type NodeRow struct {
 	CN string // matches Subject.CommonName on the registered leaf (== compute_nodes.name)
 	ID string // compute_nodes.id (uuid); for diagnostics only
 }
+
+// ComputeNodeKeysPayload is the literal pg_notify payload string
+// emitted by the compute_node_keys trigger (migrations/00076:
+// `compute_node_keys_notify` writes `TG_TABLE_NAME`). The verifier
+// does NOT read compute_node_keys — those writes are owned by
+// pkg/sched.NodeKeyRegistry — so the discriminator lets Run skip
+// the loader round-trip entirely on keys-only notifies.
+const ComputeNodeKeysPayload = "compute_node_keys"
 
 // PGNodeVerifier is the production NodeVerifier. Holds a snapshot
 // (cn -> id) map, refreshed on every 'compute_node_changed' notify
@@ -98,6 +122,13 @@ func (v *PGNodeVerifier) LookupCN(cn string) error {
 // must not de-sync the verifier to "allow nothing"). Returns the
 // new size for diagnostics.
 //
+// PR-5 short-circuit: when the freshly-loaded CN->ID map is identical
+// to the prior snapshot (same CN set, same IDs), Refresh returns
+// without swapping and without publishing. This kills heartbeat-only
+// churn where `active=true → true` writes fire notify but produce an
+// identical snapshot. The size returned is the unchanged size; the
+// only side effect is a Debug-level log line.
+//
 // A nil receiver returns an error so a forgotten wire at startup
 // fails loudly (the daemon's NewPGNodeVerifier call must always
 // succeed; if Refresh is never called, the snapshot stays empty
@@ -127,11 +158,24 @@ func (v *PGNodeVerifier) Refresh(ctx context.Context) (int, error) {
 		fresh[r.CN] = r.ID
 	}
 	v.mu.Lock()
+	prior := v.snap
+	if snapshotEqual(prior, fresh) {
+		// Heartbeat-only refresh: same CN set, same IDs. Don't
+		// swap (publishing an unchanged snapshot would still
+		// trigger downstream log/snapshot churn), but keep the
+		// map identity intact so equality semantics stay stable.
+		v.mu.Unlock()
+		if v.log != nil {
+			v.log.Debug("wire: node verifier snapshot unchanged, skipping swap",
+				"size", len(fresh))
+		}
+		return len(fresh), nil
+	}
 	v.snap = fresh
 	v.mu.Unlock()
 	if v.log != nil {
 		v.log.Info("wire: node verifier snapshot refreshed",
-			"size", len(fresh))
+			"size", len(fresh), "prior_size", len(prior))
 	}
 	return len(fresh), nil
 }
@@ -146,12 +190,57 @@ func (v *PGNodeVerifier) Size() int {
 	return len(v.snap)
 }
 
+// PublishSnapshot returns a deterministic, CN-sorted copy of the
+// current snapshot as []NodeRow. This is the stable-publish-key
+// contract for the doctor (PR-4) and release bundle (PR-3): any
+// caller that needs to serialize the snapshot (a JSON marshal, a
+// log line, a comparison) gets a stable order regardless of Go's
+// randomized map iteration.
+//
+// The read path takes RLock; the returned slice is a fresh
+// allocation that does NOT alias the verifier's internal map, so
+// the caller can mutate it freely. nil-receiver returns nil.
+func (v *PGNodeVerifier) PublishSnapshot() []NodeRow {
+	if v == nil {
+		return nil
+	}
+	v.mu.RLock()
+	out := make([]NodeRow, 0, len(v.snap))
+	for cn, id := range v.snap {
+		out = append(out, NodeRow{CN: cn, ID: id})
+	}
+	v.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].CN < out[j].CN })
+	return out
+}
+
+// snapshotEqual reports whether two cn->id maps are identical
+// (same CN set, same IDs per CN). Order doesn't matter — both
+// sides are maps. Length mismatch short-circuits to false.
+func snapshotEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for cn, id := range a {
+		if bID, ok := b[cn]; !ok || bID != id {
+			return false
+		}
+	}
+	return true
+}
+
 // Run drains an already-opened 'compute_node_changed' channel (or any
 // other notification source) and refreshes the snapshot on every
-// delivery. Every notify triggers Refresh; the loop survives
-// transient loader failures because Refresh keeps the last-known-good
-// snapshot. nil receiver is tolerated (no-op drain on ctx; identical
-// shape to pkg/sched.NodeKeyRegistry.Run).
+// delivery. The loop survives transient loader failures because Refresh
+// keeps the last-known-good snapshot. nil receiver is tolerated
+// (no-op drain on ctx; identical shape to pkg/sched.NodeKeyRegistry.Run).
+//
+// PR-5 payload discrimination (issue #911): the channel carries two
+// payload shapes — JSON {node_id,active} for compute_nodes writes
+// (migrations/00026) and the literal "compute_node_keys" for keys
+// writes (migrations/00076). The verifier reads only compute_nodes,
+// so Run skips the loader round-trip on keys-table notifies. Any
+// other payload (JSON or unknown literal) triggers Refresh.
 //
 // Panic-recovery: none. The reference drain loops (see
 // pkg/sched.NodeKeyRegistry.Run and cmd/vmmd/egress_watcher.go::Run)
@@ -171,6 +260,8 @@ func (v *PGNodeVerifier) Size() int {
 //     spurious warning on every reconnect tick.
 //   - loader-failure Refresh results are swallowed (Refresh already
 //     logs at Warn and the snapshot stays on last-known-good).
+//   - keys-only payloads (Payload == ComputeNodeKeysPayload) are
+//     filtered out — no Refresh call, no log line.
 func (v *PGNodeVerifier) Run(ctx context.Context, ch <-chan db.Notification) error {
 	if v == nil {
 		<-ctx.Done()
@@ -180,13 +271,19 @@ func (v *PGNodeVerifier) Run(ctx context.Context, ch <-chan db.Notification) err
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case _, ok := <-ch:
+		case n, ok := <-ch:
 			if !ok {
 				// Channel close is a reconnect signal from
 				// db.Subscribe; production drain loops interpret
 				// nil as "open a fresh Subscribe". See the
 				// package doc above for the full contract.
 				return nil
+			}
+			if n.Payload == ComputeNodeKeysPayload {
+				// The verifier doesn't read compute_node_keys —
+				// pkg/sched.NodeKeyRegistry.Run handles those.
+				// Skip the loader round-trip entirely.
+				continue
 			}
 			if _, err := v.Refresh(ctx); err != nil {
 				// Refresh already logs at Warn; the loop survives
