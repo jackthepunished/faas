@@ -10,7 +10,7 @@
 
 ## Context
 
-ADR-057 shipped the host-key rotation path: `gregale host-age {init,rotate,
+ADR-057 shipped the host-key rotation path: `gregalectl host-age {init,rotate,
 status,prune-previous}` plus the multi-recipient envelope (`pkg/secretbox.
 OpenMulti`) and the 30-day overlap window. The v1 deliverable was sufficient
 for the solo-operator deployment because every daemon unseals under either
@@ -27,11 +27,11 @@ ADR-057 explicitly deferred three follow-up items (lines 156-178):
 Two further gaps surfaced in production use:
 
 4. **No per-secret rotation endpoint.** Rotating one secret today means
-   `gregale secrets set KEY=…` (a set operation indistinguishable from a
+   `gregalectl secrets set KEY=…` (a set operation indistinguishable from a
    first-time set in the audit log). The platform has per-secret rotation
    for alert webhooks (`POST /v1/apps/{slug}/alerts/{id}/rotate-secret`,
    `cmd/apid/handlers_alerts.go:519`) and per-API-key rotation
-   (`gregale keys rotate`), but not for the per-app `app_secrets` surface
+   (`gregalectl keys rotate`), but not for the per-app `app_secrets` surface
    that ADR-020 introduced.
 5. **No `secret.rotated` audit kind.** Today `secret.set` is the only
    signal — dashboards cannot distinguish "first-time set" from "rotation

@@ -25,7 +25,7 @@ different trees, all hand-edited and all drifted:
   (issue #911 / ADR-110) rewire: `cd-controlplane.yml` now reads
   systemd units + slice + tmpfiles.d from the per-role ansible
   `files/` tree; this cp-cp tree is a tombstone now, scheduled for
-  deletion in PR-1 Phase 2 after PR-X `gregale secrets init`.
+  deletion in PR-1 Phase 2 after PR-X `gregalectl secrets init`.
 - `deploy/ansible/roles/control_plane_service/files/` — what the
   ansible `control_plane_service` role drops in (4 services: apid,
   imaged, meterd, schedd). Doesn't ship vmmd, gatewayd-internal,

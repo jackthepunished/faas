@@ -7,12 +7,12 @@
   Gregale fleet. The manifest is a YAML document at
   `deploy/manifest/splitbox.yaml` (operator-supplied) plus a typed
   schema at `pkg/manifest/` (in tree). Every reader of the manifest
-  — the validator (`gregale manifest validate`), the renderer
+  — the validator (`gregalectl manifest validate`), the renderer
   (PR-2), the release bundle installer (PR-3), the doctor
   preflight (PR-4), and the metal harness (PR-6) — consumes the same
   `pkg/manifest` package. **One canonical validation path**. The
   legacy `deploy/controlplane/bootstrap.sh` is retired (PR-1) once
-  the per-secret replacement (`gregale secrets init`, PR-X) and the
+  the per-secret replacement (`gregalectl secrets init`, PR-X) and the
   replacement ansible roles land.
 - **Why:** Issue #911 records that a 10+ hour live-debugging session
   on the GCP split-box deployment was caused by configuration drift
@@ -37,7 +37,7 @@
   - **Canonical validation path (PR-0):** every reader of the
     manifest consumes `pkg/manifest.Manifest.Validate`. Issue #911's
     "completeness contract" explicitly requires this; the
-    `cmd/gregale manifest validate` subcommand is the operator
+    `cmd/gregalectl manifest validate` subcommand is the operator
     surface, and `make lint-manifest` is the CI gate. There is no
     "third-party" validator that disagrees with the canonical one.
   - **TOML table-placement catalog (PR-0):** the bug at
@@ -53,19 +53,19 @@
     entries on "migration gates collision" and "cross-PR slot
     precheck"). The bodies land in PR-3a (the `compute_nodes`
     release columns + the `release_bundles` table).
-  - **Renderer (PR-2):** `gregale manifest render --role=…`
+  - **Renderer (PR-2):** `gregalectl manifest render --role=…`
     consumes the manifest and emits `/etc/faas/*.toml`,
     systemd units, tmpfiles (including `/run/faas/stream`),
     cgroup v2 `subtree_control` (the load-bearing gap — only
     `deploy/lima/run-metal.sh:84` writes `subtree_control` today),
     and PKI leaves via `pkg/pki.RolesForBox()`. Idempotent
     (hash-match short-circuit); atomic publication via tmpfs `mv`.
-  - **Doctor (PR-4):** `gregale doctor` is the operator-facing
+  - **Doctor (PR-4):** `gregalectl doctor` is the operator-facing
     preflight that surfaces every drift the issue's
     "must report actionable failures for" list names. The doctor
     consumes the manifest schema and the rendered TOML catalog;
     the manifest drives the checks.
-  - **Release bundle (PR-3):** `gregale release bundle <git-sha>`
+  - **Release bundle (PR-3):** `gregalectl release bundle --git-sha <sha>`
     produces a content-addressed tuple at
     `/opt/faas/releases/<id>/` containing the binaries, the
     rendered config hash, the migration version, the FC/kernel
@@ -75,7 +75,7 @@
     is the only writer today for `deploy_ed25519` (the CD
     deploy-key), `host.age`, `session.key`, and the storage-box
     `rclone.conf` / `box-age-key` files. PR-X ships
-    `gregale secrets init` (env-var → canonical paths) plus the
+    `gregalectl secrets init` (env-var → canonical paths) plus the
     parallel ansible roles. Once PR-X lands, PR-1 deletes
     bootstrap.sh.
   - **Metal harness (PR-6):** `deploy/lima/faas-metal-splitbox.yaml`
@@ -109,12 +109,12 @@ The schema's TOML table-placement catalog is at
 
 ## Out of scope (explicit, v1.1+)
 
-- **Vault integration for secrets** — PR-X's `gregale secrets init`
+- **Vault integration for secrets** — PR-X's `gregalectl secrets init`
   accepts base64-encoded env vars. A Hashicorp Vault / AWS Secrets
   Manager integration is a v1.1 follow-up; the issue doesn't
   mention a vault.
 - **Operator-facing manifest editor** — the v1 surface is a YAML
-  file plus `gregale manifest validate`. A `gregale manifest
+  file plus `gregalectl manifest validate`. A `gregalectl manifest
   edit` interactive surface is a v1.1 follow-up.
 - **Schema auto-migration** — when a manifest's schema_version
   is older than the running binary's SchemaVersion, the
@@ -167,3 +167,14 @@ bodies land in PR-3a:
 - `pkg/wire/pgverifier.go`: the receiver fix in PR-5.
 - `docs/runbooks/multi-host-rollout.md`: the operator narrative
   this ADR replaces.
+- `docs/runbooks/manifest-renderer-cutover.md` (PR-7): the
+  cutover runbook from legacy single-box to this world. The
+  canonical operator narrative for first-time deployment.
+- `docs/ops/gregalectl-operator-quickstart.md` (PR-7): the
+  one-page operator reference; install `gregalectl`, bootstrap,
+  write a manifest, validate, render, install, doctor.
+- `deploy/lima/faas-metal-splitbox.yaml` (PR-7): the two-role
+  Lima fleet that runs the issue #911 acceptance chain under
+  `make metal-lima-splitbox`. The harness consumes the same
+  manifest the renderer consumes, so the dev loop and the
+  production deploy path cannot diverge.

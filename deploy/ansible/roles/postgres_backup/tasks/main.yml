@@ -187,7 +187,7 @@
 #     fail loud with "config not found").
 #
 #   box-age-key  → 0400 root:root
-#     Used only by the bootstrap-time `gregale backup unseal-rclone`
+#     Used only by the bootstrap-time `gregalectl backup unseal-rclone`
 #     CLI which runs as root. Never read by a daemon, so the
 #     tighter 0400 root:root profile is correct. Same shape as
 #     /etc/faas/secrets/host.age and /etc/faas/secrets/session.key.
@@ -196,7 +196,7 @@
 # real EX44 the v1 bootstrap.sh step that decrypts host.age-sealed
 # secrets into the staging dir is required before this role passes
 # (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
-# `gregale secrets init`).
+# `gregalectl secrets init`).
 - name: postgres_backup — stat storage-box secrets
   ansible.builtin.stat:
     path: "/etc/faas/secrets/storage-box/{{ item.name }}"
@@ -216,8 +216,8 @@
     fail_msg: >-
       /etc/faas/secrets/storage-box/{{ item.item.name }} must be
       {{ item.item.mode }} {{ item.item.owner }}:{{ item.item.group }}
-      (issue #250, spec §11). Re-run `gregale backup unseal-rclone`
-      (PR-X `gregale secrets init` supersedes the v1 bootstrap.sh —
+      (issue #250, spec §11). Re-run `gregalectl backup unseal-rclone`
+      (PR-X `gregalectl secrets init` supersedes the v1 bootstrap.sh —
       RETIRED 2026-08-15 by issue #911 / PR-1) to repopulate from
       the host.age-sealed form. The rclone.conf profile is
       group-readable to postgres so archive_command can rclone WAL

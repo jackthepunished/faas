@@ -144,7 +144,7 @@
 └── node.key                 # CapacityReport signing, mode 0400  ← NEW
 ```
 
-The bootstrap step (`gregale pki init`) generates both `vmmd.{crt,key}`
+The bootstrap step (`gregalectl pki init`) generates both `vmmd.{crt,key}`
 and (per-slice-3) `node.key`. The `control_plane_service` ansible role
 gains a per-daemon `stat`-assert for `node.key`.
 

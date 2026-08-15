@@ -12,7 +12,7 @@
 #   - sealed.env entries for GITHUB_WEBHOOK_SECRET + the GitHub App
 #     private key (PEM, base64-wrapped)
 #   - PKI leaves under /etc/faas/tls/githubd/ (laid out by
-#     `gregale pki init --box-role=control-plane` — PR-3)
+#     `gregalectl pki init --box-role=control-plane` — PR-3)
 #   - enable the unit (`systemctl enable --now faas-githubd`)
 #   - run the daemon (the apid-side bridged client is the trigger)
 

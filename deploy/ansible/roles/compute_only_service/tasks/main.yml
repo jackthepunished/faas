@@ -154,8 +154,8 @@
 # loopback mount exchanges a client leaf with vmmd). The
 # compute_only role asserts the imaged server leaf + the
 # vmmd-client leaf are laid out under /etc/faas/tls/imaged/. The
-# matching `gregale pki init --box-role=compute-only` lands these
-# (PR-3); on a single-box legacy install, gregale pki init issues
+# matching `gregalectl pki init --box-role=compute-only` lands these
+# (PR-3); on a single-box legacy install, gregalectl pki init issues
 # every leaf.
 - name: compute_only_service — assert imaged PKI leaves exist (Tier 1)
   ansible.builtin.stat:

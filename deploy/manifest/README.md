@@ -2,14 +2,14 @@
 
 This directory holds the Gregale split-box deployment manifest —
 the source of truth for every host in a multi-box fleet. The
-`gregale manifest validate` subcommand and the `make lint-manifest`
+`gregalectl manifest validate` subcommand and the `make lint-manifest`
 CI gate both consume this directory's contents.
 
 ## Files
 
 - `examples/splitbox.example.yaml` — canonical split-box example
   (one control-plane host + one compute-only host). Load it with
-  `gregale manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`.
+  `gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`.
 
 ## Layout
 
@@ -24,17 +24,17 @@ The schema is Go-side at `pkg/manifest/`. The schema's `Validate`
 function is the canonical validation path for every manifest
 reader in the codebase (issue #911 explicitly requires this).
 The renderer (PR-2), the release bundle installer (PR-3), and the
-`gregale doctor` preflight (PR-4) all consume the same package.
+`gregalectl doctor` preflight (PR-4) all consume the same package.
 
 ## Quick start
 
 ```
 # Validate the example manifest.
-go run ./cmd/gregale manifest validate \
+go run ./cmd/gregalectl manifest validate \
     --file=deploy/manifest/examples/splitbox.example.yaml
 
 # Validate your own manifest.
-go run ./cmd/gregale manifest validate --file=/path/to/splitbox.yaml
+go run ./cmd/gregalectl manifest validate --file=/path/to/splitbox.yaml
 ```
 
 The validator fails closed on every missing field, every

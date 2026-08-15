@@ -36,7 +36,7 @@ active-passive)".
 >   handler-layer peer binding is in place per ADR-052. Wire
 >   package: `pkg/wire.DialContext` / `wire.Listen`. Cert
 >   material under `/etc/faas/tls/{ca,schedd,vmmd,...}/`
->   at 0400 root:root, generated via `gregale pki init`.
+>   at 0400 root:root, generated via `gregalectl pki init`.
 > - **Tier 1 Phase 2 (`node_signature` on `CapacityReport`)** —
 >   ✓ shipped in PR #457 (commit `bfd1d2ca`, ADR-053 bundle).
 >   vmmd signs the `CapacityReport` it emits via `pkg/wire.NodeSigner`
@@ -109,7 +109,7 @@ active-passive)".
 >   retired from ADR-025 the same day.
 > - **#316 (`host.age` rotation runbook)** — ✓ shipped
 >   (PR for issue #316, ADR-057). 30-day rotation-overlap
->   window via `gregale host-age {init,rotate,status,prune-previous}`,
+>   window via `gregalectl host-age {init,rotate,status,prune-previous}`,
 >   all five unseal sites migrated to `secretbox.OpenMulti`.
 >   See `docs/ops/host-age-rotation.md` for the operator
 >   runbook. v2 re-seal follow-up filed as
@@ -224,7 +224,7 @@ ssh gregale-fsn-2 'cd /opt/onebox-faas && git pull && sudo make bootstrap'
 > layout from `deploy/scripts/bootstrap.sh` (file does NOT exist;
 > canonical path is `deploy/controlplane/bootstrap.sh`, RETIRED
 > 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap` +
-> `gregale manifest {validate,render}` + `gregale release install`).
+> `gregalectl manifest {validate,render}` + `gregalectl release install`).
 > Filesystem layout is code-side, not part of the docs rebrand.
 > A follow-up code-identity pass renames the path to match the host
 > `gregale` user; until then the path is stable across all bootstrap
@@ -247,7 +247,7 @@ ok: [faas-fsn-2] => {
 ```
 
 If any stat-assert fails, **stop** and re-run
-`gregale pki init --force` on the new node.
+`gregalectl pki init --force` on the new node.
 
 ### 3. `compute_nodes` row — operator-side POST
 
@@ -467,7 +467,7 @@ If the cut-over fails irrecoverably:
   and vmmd's self-registration — `make bootstrap` against the
   failed node with `--force` re-issues the leaves; the vmmd leaf
   CN must match the operator-POST row's `target_url` host.
-- **mTLS handshake failure** — re-run `gregale pki status` on
+- **mTLS handshake failure** — re-run `gregalectl pki status` on
   both boxes; confirm the leaf CN matches the operator-side
   expected-CN map. The handler-layer peer binding (ADR-052) is
   the load-bearing enforcement that survives a forged leaf.
@@ -587,7 +587,7 @@ If the handoff stalls in `state='migrating'` past the lease
   Tier 2 pre-requisites bullet was retired from ADR-025 on
   2026-08-09.
 - **#316 (`host.age` rotation runbook)** — shipped
-  (ADR-057); 30-day overlap via `gregale host-age` CLI +
+  (ADR-057); 30-day overlap via `gregalectl host-age` CLI +
   `secretbox.LoadHostKeys` multi-identity plumbing. v2
   follow-up (`issue-316-followup-rekey`) covers the
   background re-seal of pre-rotation envelopes.

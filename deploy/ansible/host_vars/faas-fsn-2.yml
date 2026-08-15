@@ -2,7 +2,7 @@
 # fsn-2 runs vmmd, gatewayd-internal, builderd, imaged.
 # Postgres + the Tier 1 PKI CA live on fsn-1; this box dials schedd over
 # the overlay network (Tail/wg) with the per-node client cert vmmd's
-# `gregale pki init --box-role=compute-only` (PR-3) lays out under
+# `gregalectl pki init --box-role=compute-only` (PR-3) lays out under
 # /etc/faas/tls/vmmd/schedd-client.{crt,key}.
 #
 # The role gate (pkg/role, PR-1) refuses to start vmmd/gatewayd-internal/
