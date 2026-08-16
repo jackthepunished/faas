@@ -1788,8 +1788,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// route the spec-check AST scanner walks; the inner
 		// unifiedMux.Handle above is the runtime prefix that
 		// actually serves traffic on the unix socket.
+		//
+		// POST-only at the unified-mux level — a future GET surface
+		// for a status read MUST go in the inner sub-mux
+		// (synth.go:99), not here. Registering a bare
+		// "/v1/invocations:dispatch_batch" pattern on top of the
+		// POST-specific one was a copy-paste hazard: a future
+		// maintainer adding GET for a status read would
+		// silently fail because the bare pattern dispatches into
+		// the POST handler's mux, which returns 405, not the
+		// intended GET handler. Audit round 2 finding #3 (PR
+		// #910).
 		unifiedMux.Handle("POST /v1/invocations:dispatch_batch", deps.synth.Mux())
-		unifiedMux.Handle("/v1/invocations:dispatch_batch", deps.synth.Mux())
 		unifiedMux.Handle("/healthz", deps.synth.Mux())
 		// Wrap with h2c so the in-process unix-socket hop negotiates
 		// H2C prior knowledge (no TLS). The customer publicHandler
