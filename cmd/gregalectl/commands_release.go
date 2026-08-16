@@ -398,15 +398,15 @@ func cmdReleaseInstall(args []string) int {
 	//
 	// Three states, fail-closed posture (review finding #3):
 	//
-//   (a) SBoM file absent  → skip gate (legacy operators continue).
-//   (b) SBoM file present but 0 bytes → skip gate with a log
-//       message (canary partial-failure mode — review finding #8:
-//       distinguish "not yet ready" from "malformed" so operators
-//       don't get a misleading parse error).
-//   (c) SBoM file present and parseable → run Diff vs baseline.
-//       Baseline MUST exist (fail-closed: missing baseline is
-//       ErrNilBaseline wrapped; the operator must run
-//       `release KGV init` from PR-B to accept the SBoM).
+	//   (a) SBoM file absent  → skip gate (legacy operators continue).
+	//   (b) SBoM file present but 0 bytes → skip gate with a log
+	//       message (canary partial-failure mode — review finding #8:
+	//       distinguish "not yet ready" from "malformed" so operators
+	//       don't get a misleading parse error).
+	//   (c) SBoM file present and parseable → run Diff vs baseline.
+	//       Baseline MUST exist (fail-closed: missing baseline is
+	//       ErrNilBaseline wrapped; the operator must run
+	//       `release KGV init` from PR-B to accept the SBoM).
 	//
 	// The error message names the regression class so operators
 	// can route the failure (roll back, rotate KGV, etc.).
