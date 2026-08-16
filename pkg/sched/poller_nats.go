@@ -108,6 +108,12 @@ type natsPoller struct {
 
 	mu       sync.Mutex
 	inFlight map[string]natsMsg
+	// seqFallback is an atomic-ish counter incremented under mu
+	// and used to disambiguate seqStr when msg.Metadata() returns
+	// an error or nil (e.g. legacy un-acked JetStream messages).
+	// Without this, every such message collides on "seq-0" and
+	// the dispatch tick treats them as the same record.
+	seqFallback uint64
 }
 
 // natsMsg is the minimal interface we need from a JetStream
@@ -243,7 +249,18 @@ func (n *natsPoller) Poll(ctx context.Context, t sqlc.Trigger) PollResult {
 			deliveryNum = md.NumDelivered
 			_ = deliveryNum //nolint:staticcheck // SA4006: written in the if-branch, read in the else-branch below via seqStr
 		} else {
-			seqStr = fmt.Sprintf("seq-%d", deliveryNum)
+			// msg.Metadata() returned an error or nil — fall
+			// back to a per-instance monotonic counter so the
+			// ItemIdentifier is unique across messages in this
+			// Poll. The previous code used the zero-value
+			// deliveryNum (always 0) here, which collided on
+			// "seq-0" and made the dispatch tick treat all
+			// such messages as one record (audit #3).
+			n.mu.Lock()
+			n.seqFallback++
+			fb := n.seqFallback
+			n.mu.Unlock()
+			seqStr = fmt.Sprintf("seq-fallback-%d", fb)
 		}
 		out = append(out, SourceRecord{
 			ItemIdentifier: seqStr,

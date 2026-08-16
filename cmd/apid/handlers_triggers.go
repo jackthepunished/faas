@@ -414,13 +414,36 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	if req.Config != nil {
 		configBytes = []byte(req.Config)
 	}
-	// Today UpdateTrigger takes (id, enabled, config, batch_*); schedule/path
-	// patching for cron rows is done via the existing /v1/crons PATCH
-	// path (cron family). Widen the store method in a follow-up.
-	updated, err := s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts)
-	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
-		return
+	// Review finding #4 (PR #910): for kind=cron rows the
+	// schedule/path columns live on the `crons` table (the
+	// triggers.cron_id FK points at it). The old code accepted
+	// the schedule/path patch silently, validated the cron
+	// expression, and then DROPPED it on the floor because
+	// UpdateTrigger doesn't touch the crons table. Route cron
+	// patches through UpdateCron via the cron_id FK.
+	var updated sqlc.Trigger
+	if t.Kind == string(api.TriggerKindCron) {
+		if !t.CronID.Valid {
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, "trigger_inconsistent", "Trigger has no cron_id",
+				"kind=cron trigger is missing the cron_id FK"))
+			return
+		}
+		if _, err := s.store.UpdateCron(r.Context(), uuidFromPgtype(t.CronID).String(), req.Schedule, req.Path, req.Enabled, nil); err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not update cron schedule/path"))
+			return
+		}
+		// Update the non-cron fields on the triggers row.
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts)
+		if err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
+			return
+		}
+	} else {
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts)
+		if err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
+			return
+		}
 	}
 	triggerUUID := uuidFromPgtype(updated.ID).String()
 	appUUID := uuidFromPgtype(updated.AppID).String()
