@@ -1,8 +1,10 @@
 // amazon-ebs.pkr.hcl — AWS builder for the Gregale Compute Image.
 //
-// ADR-111: composes the shared scaffolding + Ubuntu 24.04 base + role
-// overlay (same as hcloud.pkr.hcl). The output is an AWS AMI tagged with
-// `local.image_tag`; rolling forward means a new AMI + ASG replacement.
+// ADR-112: composes the shared scaffolding + Ubuntu 24.04 base (same as
+// hcloud.pkr.hcl). The output is an AWS AMI tagged with `local.image_tag`;
+// rolling forward means a new AMI + ASG replacement. The image is
+// role-agnostic — first-boot `gregalectl release install --role` does the
+// role templating.
 //
 // Per-cloud specifics (this file):
 //   - source_ami_filter: official Ubuntu 24.04 LTS AMI
@@ -69,7 +71,7 @@ source "amazon-ebs" "compute" {
 }
 
 build {
-  name    = "amazon-ebs-${var.role}"
+  name    = "amazon-ebs"
   sources = ["source.amazon-ebs.compute"]
 
   // Same provisioner chain as hcloud.pkr.hcl. The script files are
@@ -90,7 +92,7 @@ build {
   }
   provisioner "shell" {
     script = "scripts/build-base.sh"
-    environment_vars = ["FAAS_BOX_ROLE=${var.role}", "FAAS_GIT_SHA=${var.git_sha}"]
+    environment_vars = ["FAAS_GIT_SHA=${var.git_sha}"]
   }
   provisioner "shell" { script = "scripts/verify-no-secrets.sh" }
 }

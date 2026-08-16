@@ -8,11 +8,12 @@
 # Build flags match the canonical `-trimpath -ldflags='-s -w'` posture so
 # binaries are reproducible + small.
 #
-# Per ADR-092: per-role subset is enforced OUTSIDE this script (the per-role
-# drop-in 99-faas-role.conf decides which daemons start; this script bakes
-# ALL daemons regardless of role). The role-overlay.pkr.hcl documents that
-# the role subset is consumed by `systemd start`, not by build-time
-# omission. (Trade-off: larger image by ~30 MB; we accept that for simpler
+# Per ADR-092 + ADR-112: per-role subset is enforced OUTSIDE this script
+# (the per-daemon 99-faas-role.conf drop-in decides which daemons start;
+# this script bakes ALL 8 daemons regardless of role). ADR-112 collapsed
+# role out of the image entirely — there is no role-overlay.pkr.hcl —
+# so first-boot `gregalectl release install --role` writes the drop-ins.
+# (Trade-off: larger image by ~30 MB; we accept that for the simpler
 # build pipeline + the per-role PKI subset still constrains runtime.)
 set -euo pipefail
 

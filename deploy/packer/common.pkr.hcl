@@ -1,12 +1,19 @@
 // common.pkr.hcl — shared build block consumed by every per-cloud builder.
 //
-// ADR-111: image tag contract
-//   gregale-compute-{role}-{fc_release}-{kernel_version}-{git_sha}
+// ADR-112: image tag contract
+//   gregale-compute-{fc_release}-{kernel_version}-{git_sha}
+//
+// The previous ADR-111 4-tuple `{role, fc_release, kernel_version, git_sha}`
+// collapsed the role segment out of the image (ADR-112). Role is first-boot
+// metadata templated by `gregalectl release install --role`, NOT image content.
+// One image binary per `{fc, kernel, sha}` triple; the operator's
+// "which image do I launch?" question now has one answer per content triple
+// instead of one per role.
 //
 // Every per-cloud builder (hcloud, amazon-ebs, iso) sources this file and
 // inherits:
-//   - the tag-synthesis variables (fc_release, kernel_version, git_sha, role)
-//   - the canonical label set (image_role + image_fc_release + image_kernel_version
+//   - the tag-synthesis variables (fc_release, kernel_version, git_sha)
+//   - the canonical label set (image_fc_release + image_kernel_version
 //     + image_git_sha + image_created_unix)
 //   - the post-processor chain that emits the synthesized tag on every output
 //
@@ -22,22 +29,16 @@ packer {
 }
 
 // ---------------------------------------------------------------------------
-// Image identity — the 4-tuple that pins every image to a specific build of
+// Image identity — the 3-tuple that pins every image to a specific build of
 // the platform. Changing any variable in this block requires a new image tag;
 // rolling forward is always "new tag + lazy re-snapshot", never an in-place
 // host-side binary upgrade (ADR-005).
+//
+// ADR-112: role is NOT image content. The image bakes the maximal daemon
+// binary set; per-daemon drop-ins (99-faas-role.conf), cgroup slices, and
+// the active daemon subset are templated at first-boot by
+// `gregalectl release install --role`. Every box runs the same image.
 // ---------------------------------------------------------------------------
-variable "role" {
-  type        = string
-  description = "Box role this image provisions. ADR-092: {control-plane, compute-only}. Per-role subsets mean a control-plane image does NOT ship compute-only daemons and vice versa."
-  default     = "control-plane"
-
-  validation {
-    condition     = contains(["control-plane", "compute-only"], var.role)
-    error_message = "Role must be control-plane or compute-only (ADR-092)."
-  }
-}
-
 variable "fc_release" {
   type        = string
   description = "Firecracker release baked into the image. Must match deploy/ansible/roles/firecracker/defaults/main.yml:fc_release."
@@ -67,14 +68,13 @@ variable "git_sha" {
 // the canonical image tag.
 // ---------------------------------------------------------------------------
 locals {
-  image_tag = "gregale-compute-${var.role}-fc${var.fc_release}-kernel${var.kernel_version}-g${var.git_sha}"
+  image_tag = "gregale-compute-fc${var.fc_release}-kernel${var.kernel_version}-g${var.git_sha}"
 
   // Strip the leading "v" from fc_release + kernel_version for compactness in
   // the tag. v1.7.0 → "1.7.0"; 6.1.134 → "6.1.134" (no leading v).
-  image_tag_compact = "gregale-compute-${var.role}-fc${replace(var.fc_release, "v", "")}-kernel${var.kernel_version}-g${var.git_sha}"
+  image_tag_compact = "gregale-compute-fc${replace(var.fc_release, "v", "")}-kernel${var.kernel_version}-g${var.git_sha}"
 
   image_labels = {
-    image_role            = var.role
     image_fc_release      = var.fc_release
     image_kernel_version  = var.kernel_version
     image_git_sha         = var.git_sha

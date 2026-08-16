@@ -1,10 +1,13 @@
 // hcloud.pkr.hcl — Hetzner Cloud builder for the Gregale Compute Image.
 //
-// ADR-111: this file composes deploy/packer/common.pkr.hcl (variables +
-// label synthesis + image_tag) + deploy/packer/ubuntu-2404.pkr.hcl
-// (Ubuntu 24.04 LTS base variables) + deploy/packer/role-overlay.pkr.hcl
-// (per-role daemon subset). Per-cloud builders MUST source the shared
-// scaffolding and override cloud-specific source fields only.
+// ADR-112: this file composes deploy/packer/common.pkr.hcl (3-tuple image
+// identity: {fc_release, kernel_version, git_sha}) + deploy/packer/
+// ubuntu-2404.pkr.hcl (Ubuntu 24.04 LTS base variables). Per-cloud builders
+// MUST source the shared scaffolding and override cloud-specific source
+// fields only.
+//
+// ADR-112: the image is role-agnostic. Role templating happens at first-boot
+// via `gregalectl release install --role`. This build does NOT inject a role.
 //
 // Per-cloud specifics (this file):
 //   - source_image: hcloud's Ubuntu 24.04 snapshot id
@@ -71,7 +74,7 @@ source "hcloud" "compute" {
 // The build host is destroyed by Packer after the snapshot is taken.
 // ---------------------------------------------------------------------------
 build {
-  name    = "hcloud-${var.role}"
+  name    = "hcloud"
   sources = ["source.hcloud.compute"]
 
   provisioner "shell" {
@@ -104,7 +107,6 @@ build {
   provisioner "shell" {
     script = "scripts/build-base.sh"
     environment_vars = [
-      "FAAS_BOX_ROLE=${var.role}",
       "FAAS_GIT_SHA=${var.git_sha}",
     ]
   }
