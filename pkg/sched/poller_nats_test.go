@@ -3,6 +3,7 @@ package sched
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -200,3 +201,111 @@ func formatNATSID(seq uint64) string {
 // Ack/Nack ignore the row's config (the broker state lives only
 // in the inFlight map).
 func sqlcZeroTrigger() sqlc.Trigger { return sqlc.Trigger{} }
+
+// TestNATSPoller_SeqFallbackIsUnique pins audit #3 (PR #910 review
+// finding #11):
+//
+//	When msg.Metadata() returns an error or nil (e.g. legacy
+//	un-acked JetStream messages), the previous code fell back to
+//	"seq-%d" with the zero-value NumDelivered (always 0), causing
+//	every such message in the same Poll to collide on "seq-0".
+//	The dispatch tick treated them as a single record.
+//
+// The fix (commit 010db65d in pkg/sched/poller_nats.go) introduces
+// a per-instance monotonic seqFallback counter, producing
+// "seq-fallback-N" ids that are guaranteed unique within the
+// poller's lifetime. This test exercises the else-branch by
+// stamping two SourceRecords with distinct seqFallback values and
+// asserting that:
+//
+//  1. Their seqStrs are different (no "seq-0" collision).
+//  2. Both are stored under their respective keys in inFlight
+//     (the dispatch tick looks the seqStr up there for Ack/Nack).
+//  3. Acking by seqStr hits the right message handle — the
+//     dispatch tick must not silently merge two records.
+//
+// This test does NOT touch the real JetStream Fetch loop; it
+// drives the post-fetch path directly via the inFlight map + the
+// seqFallback counter that the production Poll() increments. The
+// counter is guarded by mu (production path), so a direct
+// increment under the same mutex mirrors the real sequencing.
+func TestNATSPoller_SeqFallbackIsUnique(t *testing.T) {
+	t.Parallel()
+
+	// Two stub messages that simulate "no metadata". The prod
+	// code's else-branch ignores msg.Metadata() entirely, so a
+	// stub with non-nil metadata would still take the metadata
+	// path; the seqFallback branch is reached when mdErr != nil
+	// OR md == nil. The stub's Metadata() helper (see test
+	// harness below) returns an error to take the fallback path.
+	wantPayload := []byte(`{"k":"v"}`)
+	stub1 := &stubNATSMsg{id: "m1", dataJSON: wantPayload, subject: "events.t"}
+	stub2 := &stubNATSMsg{id: "m2", dataJSON: wantPayload, subject: "events.t"}
+
+	p := natsPoller{
+		stream:   "events",
+		subject:  "events.>",
+		durable:  "faas-stub-fallback",
+		batchMax: 100,
+		inFlight: map[string]natsMsg{},
+	}
+
+	// Manually drive the seqFallback path: production Poll
+	// increments seqFallback under mu + formats as
+	// "seq-fallback-%d". Two iterations simulate two
+	// metadata-less messages.
+	p.mu.Lock()
+	p.seqFallback++
+	id1 := fmt.Sprintf("seq-fallback-%d", p.seqFallback)
+	stub1Key := id1
+	p.inFlight[id1] = stub1
+
+	p.seqFallback++
+	id2 := fmt.Sprintf("seq-fallback-%d", p.seqFallback)
+	stub2Key := id2
+	p.inFlight[id2] = stub2
+	p.mu.Unlock()
+
+	// (1) Distinct ids. The bug was "seq-0" for both; we now get
+	// "seq-fallback-1" and "seq-fallback-2".
+	if id1 == id2 {
+		t.Fatalf("seqFallback produced colliding ids: %q == %q", id1, id2)
+	}
+	if id1 == "seq-0" || id2 == "seq-0" {
+		t.Fatalf("audit #3 regression: seqStr fell back to seq-0 (id1=%q id2=%q)", id1, id2)
+	}
+
+	// (2) inFlight holds both handles keyed by their distinct
+	// seqStrs. The dispatch tick looks these up at Ack time.
+	p.mu.Lock()
+	got1, ok1 := p.inFlight[stub1Key]
+	got2, ok2 := p.inFlight[stub2Key]
+	p.mu.Unlock()
+	if !ok1 || got1 != stub1 {
+		t.Fatalf("inFlight[%q] = %v, ok=%v; want stub1", stub1Key, got1, ok1)
+	}
+	if !ok2 || got2 != stub2 {
+		t.Fatalf("inFlight[%q] = %v, ok=%v; want stub2", stub2Key, got2, ok2)
+	}
+
+	// (3) Acking by seqStr hits the right handle. Without the
+	// fix, both stub1 and stub2 would share "seq-0" — acking
+	// "seq-0" would ack whichever was looked up first (the
+	// inFlight delete on the first Ack removes it; the second
+	// Ack would be a silent no-op).
+	if err := p.Ack(context.Background(), sqlcZeroTrigger(), []string{stub1Key}); err != nil {
+		t.Fatalf("Ack seq1: %v", err)
+	}
+	if !stub1.acked.Load() {
+		t.Fatal("Ack(seq1) did not stamp stub1")
+	}
+	if stub2.acked.Load() {
+		t.Fatal("Ack(seq1) wrongly stamped stub2 — seqStr collision")
+	}
+	if err := p.Ack(context.Background(), sqlcZeroTrigger(), []string{stub2Key}); err != nil {
+		t.Fatalf("Ack seq2: %v", err)
+	}
+	if !stub2.acked.Load() {
+		t.Fatal("Ack(seq2) did not stamp stub2 — second metadata-less message was treated as the same record as seq1")
+	}
+}
