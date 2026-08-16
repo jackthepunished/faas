@@ -87,6 +87,17 @@ func (s *server) runVerifyOnce(ctx context.Context, log *slog.Logger) {
 			// every relevant column change including verified_at).
 			// The gatewayd cert-remint subscriber picks it up and
 			// asks the issuer for a fresh SAN-aggregated cert.
+			//
+			// Audit row: tenant_hostname.verified is the third
+			// event of the surface lifecycle (added / removed /
+			// verified). The data carries the surface_id so the
+			// dashboard "verified at" timeline keys off it.
+			if s.audit != nil {
+				s.audit.Emit(ctx, "tenant_hostname.verified", nil, map[string]any{
+					"hostname":  h.Hostname,
+					"surface_id": h.SurfaceID,
+				})
+			}
 			log.Info("tenant hostname verified", "hostname", h.Hostname, "surface", h.SurfaceID)
 		}
 	}
