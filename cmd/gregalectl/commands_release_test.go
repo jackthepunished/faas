@@ -78,3 +78,36 @@ func TestCmdReleaseInstall_MissingFlags(t *testing.T) {
 		t.Errorf("cmdReleaseInstall(nil) = %d, want 1", code)
 	}
 }
+
+// TestCmdReleaseInstall_BadGitSHA asserts the new gitSHA-validity
+// gate added by ADR-113 review-fix #4: any non-40-char-lowercase-
+// hex --git-sha is rejected at flag-validation time (exit 2,
+// before any side effects), so the path-traversal gosec on the
+// SBoM-on-disk writefile can never receive an attacker-controlled
+// gitSHA.
+func TestCmdReleaseInstall_BadGitSHA(t *testing.T) {
+	for _, bad := range []string{
+		"../etc/passwd",
+		"not-a-sha",
+		"0123456789ABCDEF0123456789ABCDEF01234567", // uppercase
+	} {
+		code := cmdReleaseInstall([]string{"--git-sha=" + bad})
+		if code != 2 {
+			t.Errorf("cmdReleaseInstall(--git-sha=%q) = %d, want 2 (rejected at flag-validation)", bad, code)
+		}
+	}
+}
+
+// TestCmdReleaseInstall_LegacyAndTarballMutuallyExclusive asserts
+// review-fix #4: passing both --legacy-bundle-dir and
+// --tarball-path is a usage error (exit 2), not a runtime error.
+func TestCmdReleaseInstall_LegacyAndTarballMutuallyExclusive(t *testing.T) {
+	code := cmdReleaseInstall([]string{
+		"--git-sha=0123456789abcdef0123456789abcdef01234567",
+		"--legacy-bundle-dir=/tmp/x",
+		"--tarball-path=/tmp/y",
+	})
+	if code != 2 {
+		t.Errorf("cmdReleaseInstall(legacy+tarball) = %d, want 2 (mutually exclusive)", code)
+	}
+}

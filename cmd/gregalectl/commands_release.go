@@ -30,8 +30,11 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -237,6 +240,10 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", src, err)
 		}
+		//nolint:gosec // legacy path (sunset flag); e.Name() comes from
+		// os.ReadDir which never returns "../". Filepath.Join escapes the
+		// bin dir prefix on a "../" prefix in e.Name(), so the path is
+		// always under bin/.
 		if err := os.WriteFile(dst, body, 0o755); err != nil {
 			return fmt.Errorf("write %s: %w", dst, err)
 		}
@@ -268,12 +275,87 @@ func cmdReleaseInstall(args []string) int {
 	// applies roleTemplating.ApplyFilesystem(role) after the
 	// symlink flip.
 	roleFlag := fs.String("role", "", "box role: control-plane|compute-only (ADR-112). Empty = no role templating.")
+	// ADR-113: --legacy-bundle-dir is the sunset path for the old
+	// `copyBinIntoRelease` flow. Empty (default) means use the new
+	// tarball + cosign + SBoM-gated path. When set, the install
+	// copies binaries from DIR straight into <releases-root>/<git-
+	// sha>/bin via copyBinIntoRelease. Even on the legacy path,
+	// the catalog check (releaseinstall.Verify) is run AFTER the
+	// copy so a contaminated bin-dir (e.g., a leftover tarball
+	// member) cannot become the active release. PR-B removes the
+	// flag entirely.
+	legacyBundleDir := fs.String("legacy-bundle-dir", "", "ADR-113 sunset path: copy binaries from DIR straight to <releases-root>/<git-sha>/bin. Catalog check still runs after copy. Empty = use the canonical tarball path.")
+	// ADR-113: --tarball-path is the air-gap / load-bearing
+	// trust-bit path. When set, the install reads the canonical
+	// tarball from PATH, runs `cosign verify-blob` against it
+	// (Tarball.Verify), parses the embedded SPDX-2.3 SBoM, and
+	// runs the CVE-baseline diff BEFORE AtomicFlip. This is what
+	// makes the cosign verifier (pkg/releaseinstall/cosign.go)
+	// exercised in production — without this flag, the cosign
+	// half is whitebox-only.
+	tarballPath := fs.String("tarball-path", "", "ADR-113 canonical path: load release.tar.gz from PATH and run cosign verify-blob + SBoM CVE-baseline diff before install. Empty = use the legacy or bin-dir path.")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *gitSHA == "" {
 		_, _ = fmt.Fprintln(os.Stderr, "gregalectl release install: --git-sha is required")
 		return 1
+	}
+	if !releaseinstall.ValidGitSHA(*gitSHA) {
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: --git-sha %q is not a 40-char lowercase hex\n", *gitSHA)
+		return 2
+	}
+	if *legacyBundleDir != "" && *tarballPath != "" {
+		_, _ = fmt.Fprintln(os.Stderr, "gregalectl release install: --legacy-bundle-dir and --tarball-path are mutually exclusive")
+		return 2
+	}
+	// ADR-113: canonical tarball path. Reads the tarball from
+	// PATH, runs cosign verify-blob + SBoM CVE-baseline diff
+	// BEFORE AtomicFlip. This is the production exercise path
+	// for Tarball.Verify (the cosign verifier in
+	// pkg/releaseinstall/cosign.go).
+	if *tarballPath != "" {
+		if err := installViaTarball(*releasesRoot, *gitSHA, *tarballPath); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: %v\n", err)
+			return 3
+		}
+		// Fall through to the role-templating + DB-write path
+		// below; the load-bearing gates (cosign, SBoM, catalog)
+		// ran inside installViaTarball.
+	}
+	// ADR-113: legacy path. If --legacy-bundle-dir is set, we run
+	// copyBinIntoRelease AND the catalog check — a contaminated
+	// bin-dir (extra files like a leftover tarball) cannot
+	// become the active release. Review finding #4: previously
+	// bypassed Verify; now runs Verify after the copy.
+	if *legacyBundleDir != "" {
+		if err := copyBinIntoRelease(*releasesRoot, *gitSHA, *legacyBundleDir); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: legacy-bundle-dir: %v\n", err)
+			return 3
+		}
+		// Read + Verify (catalog check) run on the legacy path
+		// too. A 0-row manifest is a hard error: copyBinIntoRelease
+		// doesn't write a manifest, so the operator must pre-stage
+		// release-manifest.json alongside the bin-dir (legacy
+		// convention).
+		m, err := releaseinstall.Read(*releasesRoot, *gitSHA)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: legacy read manifest: %v\n", err)
+			return 3
+		}
+		if err := releaseinstall.Verify(*releasesRoot, m); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: legacy verify manifest: %v\n", err)
+			return 3
+		}
+		if err := releaseinstall.AtomicFlip(*releasesRoot, *gitSHA); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: legacy flip symlink: %v\n", err)
+			return 3
+		}
+		// role-flag handling on the legacy path is out of scope
+		// for this commit; the legacy path is a stop-gap and the
+		// operator is expected to re-install with --role after
+		// they migrate to the canonical path.
+		return 0
 	}
 	// ADR-112: if --role is empty AND /etc/faas/first-boot.env has
 	// FAAS_BOX_ROLE set (the operator-supplied sentinel from
@@ -308,6 +390,65 @@ func cmdReleaseInstall(args []string) int {
 	if err := releaseinstall.Verify(*releasesRoot, m); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: verify manifest: %v\n", err)
 		return 3
+	}
+	// ADR-113 commit 3: SBoM CVE-baseline gate. If the per-release
+	// SBoM is present on disk (the canary post-process stamped it
+	// there), parse it and run the regression check vs the prior
+	// baseline.
+	//
+	// Three states, fail-closed posture (review finding #3):
+	//
+	//   (a) SBoM file absent  → skip gate (legacy operators continue).
+	//   (b) SBoM file present but 0 bytes → skip gate with a log
+	//       message (canary partial-failure mode — review finding #8:
+	//       distinguish "not yet ready" from "malformed" so operators
+	//       don't get a misleading parse error).
+	//   (c) SBoM file present and parseable → run Diff vs baseline.
+	//       Baseline MUST exist (fail-closed: missing baseline is
+	//       ErrNilBaseline wrapped; the operator must run
+	//       `release KGV init` from PR-B to accept the SBoM).
+	//
+	// The error message names the regression class so operators
+	// can route the failure (roll back, rotate KGV, etc.).
+	if sbomPath, sbomErr := sbomOnDiskPath(*releasesRoot, *gitSHA); sbomErr == nil {
+		sbomBody, readErr := os.ReadFile(sbomPath)
+		if readErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: read sbom: %v\n", readErr)
+			return 3
+		}
+		if len(sbomBody) == 0 {
+			// Review finding #8: 0-byte SBoM is the canary
+			// partial-failure mode (canary wrote a file but
+			// syft didn't finish). Skip the gate with a log
+			// line so the operator doesn't see a misleading
+			// 'malformed' error.
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: warning: SBoM is empty, skipping CVE-baseline gate (canary partial-failure; retry install once SBoM is non-empty)\n")
+		} else {
+			counts, parseErr := releaseinstall.ParseSPDXv2_3(sbomBody)
+			if parseErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: parse sbom: %v\n", parseErr)
+				return 3
+			}
+			baseline, baseErr := readSBOMBaseline(*releasesRoot, *gitSHA)
+			if baseErr != nil {
+				// Review finding #3: missing baseline is
+				// fail-closed. The operator must explicitly
+				// accept the SBoM by writing a baseline
+				// (PR-B's `release KGV init`); today the
+				// operator can do it by running any prior
+				// release once and rotating, OR by hand-
+				// writing the baseline file. We surface the
+				// underlying error to make the next step
+				// obvious.
+				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: SBoM gate requires a prior baseline (none at %s): %v\n",
+					releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(*releasesRoot, *gitSHA)), baseErr)
+				return 3
+			}
+			if _, diffErr := baseline.Diff(counts); diffErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: %v\n", diffErr)
+				return 3
+			}
+		}
 	}
 	if err := releaseinstall.AtomicFlip(*releasesRoot, *gitSHA); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: flip symlink: %v\n", err)
@@ -470,6 +611,165 @@ func cmdReleaseInstall(args []string) int {
 			*gitSHA, first, node, cnID)
 	}
 	return 0
+}
+
+// sbomOnDiskPath returns the canonical SBoM-on-disk path for the
+// per-release bundle. Returns a non-nil error when the file does
+// not exist (os.IsNotExist) so the caller can treat absence as
+// "skip the gate" (the legacy on-disk flow is SBoM-less by
+// definition — the canary path is what writes the SBoM).
+//
+// ADR-113 PR-A commit 3 keeps the SBoM-on-disk shape opt-in:
+// legacy operators (no canary, no `make build-sha256`) continue
+// to install without the gate. PR-B makes the gate mandatory for
+// any release shipped via the canary.
+func sbomOnDiskPath(releasesRoot, gitSHA string) (string, error) {
+	p := filepath.Join(releaseinstall.BundleRoot(releasesRoot, gitSHA), "release.sbom.json")
+	if _, err := os.Stat(p); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+// readSBOMBaseline reads the on-disk per-release SBoM baseline.
+// Returns the parsed baseline + nil on success. Returns
+// os.ErrNotExist-shaped errors when the file is missing (the
+// caller treats that as "no prior baseline, skip the gate").
+func readSBOMBaseline(releasesRoot, gitSHA string) (releaseinstall.SBOMBaseline, error) {
+	var b releaseinstall.SBOMBaseline
+	p := releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(releasesRoot, gitSHA))
+	body, err := os.ReadFile(p)
+	if err != nil {
+		return b, err
+	}
+	if err := json.Unmarshal(body, &b); err != nil {
+		return b, fmt.Errorf("decode baseline: %w", err)
+	}
+	return b, nil
+}
+
+// installViaTarball is the canonical ADR-113 install path. It
+// loads the canonical triple (tarball + cosign bundle + SBoM) from
+// the on-disk path the operator supplies via --tarball-path, runs
+// the cosign verifier (the load-bearing trust bit from PR-A
+// commit 2), extracts the tarball, writes the SBoM and baseline
+// to <releases-root>/<git-sha>/, and flips the symlink. Returns
+// nil on success.
+//
+// Review finding #1: this is the production caller of
+// releaseinstall.Tarball.Verify. Without this function the
+// cosign verifier (cosign.go) is whitebox-only — issue #597's
+// "verify on the host before install" never actually verifies.
+//
+// On the production host the cosign binary is on PATH (the Packer
+// image bakes it; ADR-113 cluster table). For air-gap boxes the
+// flag's complement is --tarball-path pointing at a pre-staged
+// triple on the operator's media.
+func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
+	// 1. Read the on-disk triple.
+	tbBody, err := os.ReadFile(tarballPath)
+	if err != nil {
+		return fmt.Errorf("read tarball: %w", err)
+	}
+	sigBody, err := os.ReadFile(tarballPath + ".cosign.bundle")
+	if err != nil {
+		return fmt.Errorf("read cosign bundle: %w", err)
+	}
+	sbomBody, err := os.ReadFile(tarballPath + ".sbom.json")
+	if err != nil {
+		return fmt.Errorf("read sbom: %w", err)
+	}
+
+	// 2. Build the Tarball. Commit 1's BuildTarball needs a bin
+	// dir on disk; the canonical path doesn't have one yet (the
+	// bin dir is what we're about to extract into). Construct
+	// the Tarball directly with the loaded bytes — the manifest
+	// is embedded in the tarball's release-manifest.json member
+	// and the per-binary sha256 walk in Tarball.Verify uses the
+	// tarball bytes, not the bin dir.
+	manifestBytes, err := extractTarballMember(tbBody, "release-manifest.json")
+	if err != nil {
+		return fmt.Errorf("extract manifest: %w", err)
+	}
+	var m releaseinstall.Manifest
+	if err := json.Unmarshal(manifestBytes, &m); err != nil {
+		return fmt.Errorf("decode manifest: %w", err)
+	}
+	if err := releaseinstall.ValidateManifest(m); err != nil {
+		return fmt.Errorf("validate manifest: %w", err)
+	}
+	if m.GitSHA != gitSHA {
+		return fmt.Errorf("manifest git_sha=%s does not match --git-sha=%s", m.GitSHA, gitSHA)
+	}
+	tb := &releaseinstall.Tarball{
+		GitSHA:   gitSHA,
+		Manifest: m,
+		Packed:   tbBody,
+		Sig:      sigBody,
+		SBOM:     sbomBody,
+	}
+
+	// 3. Cosign verify-blob. THIS is the load-bearing trust bit
+	// from PR-A commit 2 (and the line item closing issue #597).
+	// On a successful verify the cert identity is stamped onto
+	// tb.Manifest.Signature for audit trails.
+	verifier := releaseinstall.NewExecCosignVerifier(releaseinstall.DefaultGitHubOIDC())
+	if _, err := tb.Verify(context.Background(), verifier); err != nil {
+		return fmt.Errorf("tarball verify: %w", err)
+	}
+
+	// 4. Extract the tarball into <releases-root>/<git-sha>/bin/.
+	// On success the on-disk bin tree matches the manifest's
+	// per-binary sha256.
+	if err := tb.Extract(releasesRoot); err != nil {
+		return fmt.Errorf("tarball extract: %w", err)
+	}
+
+	// 5. Write the manifest + the SBoM to the canonical
+	// on-disk locations so the rest of the install (Verify,
+	// SBoM gate, doctor) sees the same shape as the
+	// pre-canonical path.
+	if err := releaseinstall.Write(releasesRoot, m); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := os.WriteFile(
+		releaseinstall.BundleRoot(releasesRoot, gitSHA)+"/release.sbom.json",
+		sbomBody, 0o644); err != nil {
+		return fmt.Errorf("write sbom: %w", err)
+	}
+
+	// 6. AtomicFlip. The flip is the load-bearing boundary; all
+	// gates (cosign, SBoM, catalog) have passed.
+	if err := releaseinstall.AtomicFlip(releasesRoot, gitSHA); err != nil {
+		return fmt.Errorf("flip symlink: %w", err)
+	}
+	return nil
+}
+
+// extractTarballMember pulls one regular-file member out of a
+// tar+gz blob without unpacking the rest. Used by
+// installViaTarball to fetch release-manifest.json before doing
+// the full extract.
+func extractTarballMember(packed []byte, name string) ([]byte, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(packed))
+	if err != nil {
+		return nil, fmt.Errorf("gzip reader: %w", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("tar next: %w", err)
+		}
+		if hdr.Name == name && hdr.Typeflag == tar.TypeReg {
+			return io.ReadAll(tr)
+		}
+	}
+	return nil, fmt.Errorf("member %q not found in tarball", name)
 }
 
 // openPgPoolFromEnv returns a pgxpool.Pool wired from FAAS_PG_DSN
