@@ -63,6 +63,29 @@ func fakeBinDir(t *testing.T) (binDir, releasesRoot, gitSHA, manifestHash string
 	return binDir, root, gitSHA, manifestHash
 }
 
+// signedTarball is the helper every happy-path test uses: it
+// builds a Tarball and stamps a fake cosign signature onto it so
+// Tarball.Verify's cosign half has something to verify against
+// the fixture. Commit 2's load-bearing seam: BuildTarball alone
+// leaves Sig empty; the fixture verifier is what allows the
+// happy-path tests to assert on the identity-stamping side
+// without a live cosign binary.
+//
+// Tests that want to assert the *negative* path (sig missing,
+// tampered tarball, etc.) skip this helper and mutate the
+// returned Tarball directly.
+func signedTarball(t *testing.T) (*releaseinstall.Tarball, string) {
+	t.Helper()
+	_, root, gitSHA, manifestHash := fakeBinDir(t)
+	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	const identity = "https://github.com/poyrazK/faas/.github/workflows/build-sha256.yml@refs/tags/v1.2.3"
+	tb.Sig = []byte("fake-cosign-bundle-for-" + identity)
+	return tb, identity
+}
+
 // catalogDaemons is the in-test alias for the canonical daemon
 // catalog. Tests use this to enumerate the set without
 // hard-coding names.
@@ -115,41 +138,94 @@ func TestTarball_Build_HashStable(t *testing.T) {
 	}
 }
 
-// TestTarball_Verify_BlessedManifests asserts Verify returns nil on
-// a tarball that was just produced (the happy path — no tampering).
+// TestTarball_Verify_BlessedManifests asserts Verify returns nil
+// on a tarball that was just produced and stamped with a fake cosign
+// signature (the happy path — no tampering, the fixture verifier
+// says "yes, the OIDC identity matches"). Also asserts the cert
+// identity got stamped onto Manifest.Signature so audit trails see
+// who signed it.
 func TestTarball_Verify_BlessedManifests(t *testing.T) {
-	_, root, gitSHA, manifestHash := fakeBinDir(t)
-	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Now().UTC())
+	tb, wantIdentity := signedTarball(t)
+	verifier := &releaseinstall.FixtureCosignVerifier{Identity: wantIdentity}
+
+	gotIdentity, err := tb.Verify(context.Background(), verifier)
 	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	if err := tb.Verify(context.Background()); err != nil {
 		t.Fatalf("verify blessed tarball: %v", err)
+	}
+	if gotIdentity != wantIdentity {
+		t.Fatalf("verify blessed tarball: identity = %q, want %q", gotIdentity, wantIdentity)
+	}
+	if tb.Manifest.Signature != wantIdentity {
+		t.Fatalf("verify blessed tarball: manifest.Signature = %q, want %q", tb.Manifest.Signature, wantIdentity)
 	}
 }
 
 // TestTarball_Verify_RejectsTampered asserts that bit-flipping the
 // tarball bytes makes Verify fail closed with ErrTarballTampered.
-// Cosign-blob verification (commit 2) is the load-bearing trust
-// path; this test is the half PR-A commit 1 owns.
+// The cosign half runs first in the Verify pipeline only AFTER the
+// hash-walk half; a tampered Packed will fail hashWalk before the
+// fixture verifier is consulted. Commit 2's load-bearing test: even
+// if the cosign path were "yes" (the fixture), the hash half refuses
+// the tarball — defence-in-depth.
 func TestTarball_Verify_RejectsTampered(t *testing.T) {
-	_, root, gitSHA, manifestHash := fakeBinDir(t)
-	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
+	tb, identity := signedTarball(t)
 	// Flip a bit in the middle of the gz payload.
 	tampered := append([]byte(nil), tb.Packed...)
 	tampered[len(tampered)/2] ^= 0x01
 	tb2 := *tb
 	tb2.Packed = tampered
 
-	err = tb2.Verify(context.Background())
+	verifier := &releaseinstall.FixtureCosignVerifier{Identity: identity}
+	_, err := tb2.Verify(context.Background(), verifier)
 	if err == nil {
 		t.Fatalf("verify on tampered tarball: want error, got nil")
 	}
 	if !errors.Is(err, releaseinstall.ErrTarballTampered) {
 		t.Fatalf("verify on tampered tarball: got %v, want ErrTarballTampered", err)
+	}
+}
+
+// TestTarball_Verify_RejectsMissingSig asserts that a Tarball with
+// an empty Sig field fails closed with ErrCosignSigMissing — even
+// if the hash walk would otherwise pass. This is the trust-bit
+// invariant: a tarball without a sig is NOT a canonical tarball.
+func TestTarball_Verify_RejectsMissingSig(t *testing.T) {
+	tb, identity := signedTarball(t)
+	tb.Sig = nil
+
+	verifier := &releaseinstall.FixtureCosignVerifier{Identity: identity}
+	_, err := tb.Verify(context.Background(), verifier)
+	if !errors.Is(err, releaseinstall.ErrCosignSigMissing) {
+		t.Fatalf("verify on unsigned tarball: got %v, want ErrCosignSigMissing", err)
+	}
+}
+
+// TestTarball_Verify_NilCosignVerifier asserts the commit-2
+// invariant: a nil verifier is a programmer error, surfaced as a
+// non-nil error (not a panic on a nil-interface call).
+func TestTarball_Verify_NilCosignVerifier(t *testing.T) {
+	tb, _ := signedTarball(t)
+	_, err := tb.Verify(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("verify with nil verifier: want error, got nil")
+	}
+	if errors.Is(err, releaseinstall.ErrTarballTampered) {
+		t.Fatalf("verify with nil verifier: should not be ErrTarballTampered, got %v", err)
+	}
+}
+
+// TestTarball_Verify_PropagatesVerifierErr asserts that when the
+// fixture verifier returns an error, Verify wraps and surfaces it
+// (not as ErrTarballTampered — the trust-bit path has its own
+// error class).
+func TestTarball_Verify_PropagatesVerifierErr(t *testing.T) {
+	tb, _ := signedTarball(t)
+	sentinel := errors.New("fixture: cert expired")
+	verifier := &releaseinstall.FixtureCosignVerifier{Err: sentinel}
+
+	_, err := tb.Verify(context.Background(), verifier)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("verify with failing verifier: got %v, want wraps %v", err, sentinel)
 	}
 }
 

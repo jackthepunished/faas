@@ -174,61 +174,83 @@ func tarGzBin(bin string, daemonNames []string) ([]byte, error) {
 }
 
 // Verify is the consumer-side counter to Build. PR-A commit 1
-// exposes only the SHA256 walk over the manifest entries (i.e.,
-// redaction check — the same check cmdReleaseInstall does against
-// the on-disk tree today, lifted into the package). Cosign signature
-// verification (commit 2) and CVE-baseline gating (commit 3) are
-// layered on top.
+// exposes the SHA256 walk over the manifest entries (i.e.,
+// redaction check). PR-A commit 2 wires the cosign signature
+// verification through the verifier seam. CVE-baseline gating
+// (commit 3) is layered on top.
 //
 // Returns ErrTarballTampered wrapped with the offending daemon name
 // when any tarball entry's sha256 disagrees with the manifest.
-func (t *Tarball) Verify(ctx context.Context) error {
+// Returns whatever the CosignVerifier returns on cosign failure
+// (typically ErrCosignSigMissing on a tarball missing Sig).
+//
+// verifier is required. The signature is the trust bit PR-A's
+// tier-2 ship-blocker (#597) adds; a tarball-shaped Manifest.Verify
+// with no verifier is a fail-closed shell used by whitebox tests
+// to focus on the hash-walk half. To run the cosign path in
+// tests, build with FixtureCosignVerifier.
+func (t *Tarball) Verify(ctx context.Context, verifier CosignVerifier) (string, error) {
 	if t == nil {
-		return errors.New("releaseinstall: nil tarball")
+		return "", errors.New("releaseinstall: nil tarball")
+	}
+	if verifier == nil {
+		return "", errors.New("releaseinstall: Verify requires a non-nil CosignVerifier (commit 2 invariant)")
 	}
 	if err := ValidateManifest(t.Manifest); err != nil {
-		return fmt.Errorf("releaseinstall: tarball manifest: %w", err)
+		return "", fmt.Errorf("releaseinstall: tarball manifest: %w", err)
 	}
 
-	entryHashes, err := tarballEntryHashes(t.Packed)
+	// 1. SHA-256 walk. PR-A commit 1's surface, delegated to the
+	// hashWalk helper.
+	if err := t.hashWalk(); err != nil {
+		return "", err
+	}
+
+	// 2. Cosign sig verify. PR-A commit 2's load-bearing trust
+	// bit. Note: the verifier expects the tarball BYTES; in PR-A
+	// we hand it a temp file written from Packed (cosign CLI
+	// inspects files, not stdin — load-bearing change vs the
+	// TUF-style in-memory verifier).
+	if len(t.Sig) == 0 {
+		return "", ErrCosignSigMissing
+	}
+	sigTmp, err := os.CreateTemp("", "release-cosign-sig-*.bundle")
 	if err != nil {
-		return err
+		return "", fmt.Errorf("releaseinstall: cosign sig tmp: %w", err)
 	}
-	// Compare every manifest entry against the tarball entries.
-	// Mismatch = tampered. We iterate by SortedHostKeys so the
-	// error message is deterministic.
-	daemonNames := manifest.SortedHostKeys()
-	for _, name := range daemonNames {
-		wantHex, ok := t.BinSHA256[name]
-		if !ok {
-			return fmt.Errorf("%w: manifest missing daemon %s", ErrTarballTampered, name)
-		}
-		gotHex, ok := entryHashes[name]
-		if !ok {
-			return fmt.Errorf("%w: tarball missing daemon %s", ErrTarballTampered, name)
-		}
-		if gotHex != wantHex {
-			return fmt.Errorf("%w: %s sha256=%s want %s", ErrTarballTampered, name, gotHex, wantHex)
-		}
+	sigTmpPath := sigTmp.Name()
+	defer func() { _ = os.Remove(sigTmpPath) }()
+	if _, err := sigTmp.Write(t.Sig); err != nil {
+		_ = sigTmp.Close()
+		return "", fmt.Errorf("releaseinstall: cosign sig tmp write: %w", err)
 	}
-	// Surface any tarball entries that AREN'T in the catalog. A
-	// tarball with rogue daemons is a tampering signal even if
-	// every catalog entry matches.
-	roster := make(map[string]struct{}, len(daemonNames))
-	for _, n := range daemonNames {
-		roster[n] = struct{}{}
+	if err := sigTmp.Close(); err != nil {
+		return "", fmt.Errorf("releaseinstall: cosign sig tmp close: %w", err)
 	}
-	var unknown []string
-	for name := range entryHashes {
-		if _, ok := roster[name]; !ok {
-			unknown = append(unknown, name)
-		}
+	tarTmp, err := os.CreateTemp("", "release-tarball-*.tgz")
+	if err != nil {
+		return "", fmt.Errorf("releaseinstall: cosign tarball tmp: %w", err)
 	}
-	if len(unknown) > 0 {
-		sort.Strings(unknown)
-		return fmt.Errorf("%w: tarball contains non-catalog files: %s", ErrTarballTampered, strings.Join(unknown, ", "))
+	tarTmpPath := tarTmp.Name()
+	defer func() { _ = os.Remove(tarTmpPath) }()
+	if _, err := tarTmp.Write(t.Packed); err != nil {
+		_ = tarTmp.Close()
+		return "", fmt.Errorf("releaseinstall: cosign tarball tmp write: %w", err)
 	}
-	return nil
+	if err := tarTmp.Close(); err != nil {
+		return "", fmt.Errorf("releaseinstall: cosign tarball tmp close: %w", err)
+	}
+	identity, err := verifier.VerifyBlob(ctx, tarTmpPath, sigTmpPath)
+	if err != nil {
+		return "", fmt.Errorf("releaseinstall: cosign: %w", err)
+	}
+	// Stamp the cert identity onto the manifest's reserved
+	// Signature field so audit trails see who signed it. The
+	// struct's Signature field has been reserved-empty since
+	// PR-3.5 (commit 1 comment at bundle.go:54-57); commit 2
+	// populates it.
+	t.Manifest.Signature = identity
+	return identity, nil
 }
 
 // Extract unpacks the tarball into <root>/<git-sha>/bin/ — the same
@@ -285,17 +307,55 @@ func (t *Tarball) Extract(root string) error {
 	return nil
 }
 
-// tarballEntryHashes returns a daemon-name → sha256-hex map of every
-// tar entry's bytes. Used by Verify to compare against the manifest
-// without extracting anywhere.
-//
-// Every parse failure surfaces as ErrTarballTampered — there is no
-// other legitimate reason a tarball we just produced would fail to
-// parse, and the verifier is the fail-closed half of the contract.
-// A tampered tarball that breaks tar parsing MUST be rejected on
-// the same path as a tarball whose body has been silently altered
-// post-sign (the cosign verify-blob half of commit 2 covers the
-// signature; this covers the payload).
+// hashWalk runs the manifest-sha256-walk half of Verify against
+// t.Packed. Returns nil on success; ErrTarballTampered wrapped on
+// mismatch (or "tarball has files the catalog doesn't recognise,
+// which is also tampering"). Extracted so callers that want
+// hash-only checks (e.g., a doctor probe that doesn't need the
+// cosign signature half) can call it without spinning up the
+// full Tarball.Verify machinery.
+func (t *Tarball) hashWalk() error {
+	entryHashes, err := tarballEntryHashes(t.Packed)
+	if err != nil {
+		return err
+	}
+	daemonNames := manifest.SortedHostKeys()
+	for _, name := range daemonNames {
+		wantHex, ok := t.BinSHA256[name]
+		if !ok {
+			return fmt.Errorf("%w: manifest missing daemon %s", ErrTarballTampered, name)
+		}
+		gotHex, ok := entryHashes[name]
+		if !ok {
+			return fmt.Errorf("%w: tarball missing daemon %s", ErrTarballTampered, name)
+		}
+		if gotHex != wantHex {
+			return fmt.Errorf("%w: %s sha256=%s want %s", ErrTarballTampered, name, gotHex, wantHex)
+		}
+	}
+	roster := make(map[string]struct{}, len(daemonNames))
+	for _, n := range daemonNames {
+		roster[n] = struct{}{}
+	}
+	var unknown []string
+	for name := range entryHashes {
+		if _, ok := roster[name]; !ok {
+			unknown = append(unknown, name)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return fmt.Errorf("%w: tarball contains non-catalog files: %s", ErrTarballTampered, strings.Join(unknown, ", "))
+	}
+	return nil
+}
+
+// tarballEntryHashes walks the packed tarball and returns the sha256
+// of every regular-file member keyed by its basename. Wraps every
+// tar/gzip parse error in ErrTarballTampered: a tarball that this
+// package produced must always parse, so a parse failure is treated
+// as tampering (defence against a host that constructed a tarball
+// the verifier can't read).
 func tarballEntryHashes(packed []byte) (map[string]string, error) {
 	out := make(map[string]string)
 	gz, err := gzip.NewReader(bytes.NewReader(packed))
