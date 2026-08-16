@@ -181,8 +181,9 @@ func (nopProvider) Capabilities() billing.CapabilitySet { return 0 }
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
 // runWithDeps must not invoke the metricsListenAndServe factory at all. This
 // pins the production default (deploy/etc/meterd.toml.example leaves
-// metrics_addr commented) and ensures the wire-up guard doesn't accidentally
-// bind a socket.
+// metrics_addr commented — RETIRED in PR-1 Phase 2 after PR-X; the v2 path
+// is deploy/ansible/roles/control_plane_service/files/meterd.toml.example)
+// and ensures the wire-up guard doesn't accidentally bind a socket.
 func TestRun_MetricsAddrEmptySkipsListener(t *testing.T) {
 	dir := shortDir(t)
 	cfgPath := writeMeterdConfig(t, dir, "")

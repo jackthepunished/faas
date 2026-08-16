@@ -209,3 +209,49 @@ func TestSetCurrentRelease_InsideReleasesRoot(t *testing.T) {
 		t.Errorf("legacy symlink path %q not inside releasesRoot", link)
 	}
 }
+
+// PR-4 tests: IsBundleOnDisk. The doctor depends on this to
+// distinguish "bundle row exists but on-disk tree was gc'd" from
+// "bundle row exists and on-disk tree is intact".
+
+func TestIsBundleOnDisk_AbsentReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	releasesRoot := filepath.Join(dir, "releases")
+	if err := os.MkdirAll(releasesRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	ok, err := IsBundleOnDisk(releasesRoot, gitSHA)
+	if err != nil {
+		t.Errorf("IsBundleOnDisk on absent = err %v, want nil", err)
+	}
+	if ok {
+		t.Errorf("IsBundleOnDisk on absent = true, want false")
+	}
+}
+
+func TestIsBundleOnDisk_PresentReturnsTrue(t *testing.T) {
+	dir := t.TempDir()
+	releasesRoot := filepath.Join(dir, "releases")
+	if err := os.MkdirAll(releasesRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	setupReleaseDir(t, releasesRoot, gitSHA)
+	ok, err := IsBundleOnDisk(releasesRoot, gitSHA)
+	if err != nil {
+		t.Errorf("IsBundleOnDisk on present = err %v, want nil", err)
+	}
+	if !ok {
+		t.Errorf("IsBundleOnDisk on present = false, want true")
+	}
+}
+
+func TestIsBundleOnDisk_RejectsEmptyArgs(t *testing.T) {
+	if _, err := IsBundleOnDisk("", "0123456789abcdef0123456789abcdef01234567"); err == nil {
+		t.Errorf("IsBundleOnDisk empty root = nil err, want error")
+	}
+	if _, err := IsBundleOnDisk("/tmp", ""); err == nil {
+		t.Errorf("IsBundleOnDisk empty git_sha = nil err, want error")
+	}
+}

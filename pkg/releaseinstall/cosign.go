@@ -1,0 +1,211 @@
+// cosign.go — cosign verify-blob wrapper for the canonical daemon
+// tarball (ADR-113 canonical daemon tarball, PR-A commit 2).
+//
+// The sigstore `cosign verify-blob` CLI is the load-bearing trust
+// path for Gregale releases: every release.tar.gz published by the
+// Packer canary is signed with cosign's keyless-OIDC flow
+// (Fulcio + Rekor), and every host that pulls the tarball runs
+// `cosign verify-blob` before installing it. This file owns the
+// in-process wrapper.
+//
+// Load-bearing invariants:
+//
+//  1. The CosignVerifier is an INTERFACE. Production is the
+//     exec-backed impl (`ExecCosignVerifier`); tests use a fixture.
+//     This is the test-seam pattern PR-B's
+//     `commands_release.go:systemctlExec` established.
+//  2. The OIDC issuer and certificate-identity-regexp are
+//     PIPELINE CONFIGURATION, not file-level constants. They
+//     travel with the operator's release source so a multi-org
+//     deployment (e.g., a fork of the upstream Gregale repo
+//     under a different GitHub org) can pin its own identity
+//     without recompiling.
+//  3. The verifier returns the certificate-identity that
+//     produced the signature so callers can log it. Production
+//     never accepts a blob whose identity doesn't match the
+//     configured regex; an empty identity is a verifier bug
+//     or a tampered cosign output, and surfaces as an error.
+//
+// NOTE on namespacing: `pkg/cosign/` (PR-3, schedd) is a
+// local-ECDSA subsystem and is NOT used here. The names collide
+// only at the literal `cosign` string; `pkg/releaseinstall` does
+// not import `pkg/cosign`. Future contributors moving the
+// schedd-side verifier here should NOT collapse the two: one is
+// a primitive, the other an in-process CLI wrapper.
+package releaseinstall
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"regexp"
+)
+
+// CosignVerifier verifies a blob's cosign-signed signature bundle.
+//
+// Implementations MUST be safe for concurrent use; the production
+// ExecCosignVerifier holds no state.
+type CosignVerifier interface {
+	// VerifyBlob runs `cosign verify-blob` against the tarball at
+	// tarballPath using the bundle at sigPath. Returns the
+	// certificate identity string on success (a URL of the form
+	// "https://github.com/<org>/<repo>/.github/workflows/<yml>@refs/tags/<tag>")
+	// or a non-nil error on failure.
+	VerifyBlob(ctx context.Context, tarballPath, sigPath string) (certIdentity string, err error)
+}
+
+// CosignVerifyConfig carries the OIDC issuer + identity regex
+// pins. Lives at the wrapper level so swapping from
+// token.actions.githubusercontent.com (GitHub) to
+// accounts.google.com (GCP) is a one-line config change, not a
+// recompile.
+type CosignVerifyConfig struct {
+	// Issuer is the OIDC token issuer that must have signed the
+	// cosign bundle. Default to
+	// "https://token.actions.githubusercontent.com" for the
+	// upstream GitHub Actions integration; operators on a fork
+	// override via /etc/faas/release-source.conf.
+	Issuer string
+
+	// IdentityRegexp is the regex that the certificate-identity
+	// field must match. The upstream canonical pin is
+	// "^https://github.com/poyrazK/faas/.github/workflows/build-sha256\\.yml@refs/tags/.*$".
+	// Operators MUST verify both ends — the workflow path AND the
+	// refs/tags/ peg — to defeat ref-based privilege escalation.
+	IdentityRegexp *regexp.Regexp
+
+	// CosignPath is the cosign binary's absolute path. Tests can
+	// pin this to a fixture; production relies on PATH lookup.
+	CosignPath string
+}
+
+// DefaultGitHubOIDC returns the upstream-pinned config. Pulled
+// into a helper so the production ExecCosignVerifier can be
+// defaulted without each call site re-typing the GitHub issuer.
+//
+// Use NewExecCosignVerifier(cfg) with this cfg for the production
+// install-time verifier.
+func DefaultGitHubOIDC() CosignVerifyConfig {
+	re := regexp.MustCompile(`^https://github\.com/poyrazK/faas/\.github/workflows/build-sha256\.yml@refs/tags/.+$`)
+	return CosignVerifyConfig{
+		Issuer:         "https://token.actions.githubusercontent.com",
+		IdentityRegexp: re,
+		CosignPath:     "cosign",
+	}
+}
+
+// NewExecCosignVerifier returns the production verifier. It
+// shells out to the binary named by cfg.CosignPath (typically the
+// cosign on PATH); callers MUST ensure the binary is present at
+// that path before install time. The Packer image bakes the
+// upstream cosign binary, so this is satisfied automatically for
+// the canonical install path; air-gap deployments using
+// `--legacy-bundle-dir` (the sunset flag) do NOT exercise this
+// verifier.
+func NewExecCosignVerifier(cfg CosignVerifyConfig) *ExecCosignVerifier {
+	if cfg.Issuer == "" {
+		cfg.Issuer = DefaultGitHubOIDC().Issuer
+	}
+	if cfg.IdentityRegexp == nil {
+		cfg.IdentityRegexp = DefaultGitHubOIDC().IdentityRegexp
+	}
+	if cfg.CosignPath == "" {
+		cfg.CosignPath = "cosign"
+	}
+	return &ExecCosignVerifier{cfg: cfg}
+}
+
+// ExecCosignVerifier is the production CosignVerifier.
+//
+// `cosign verify-blob` invocation:
+//
+//	cosign verify-blob \
+//	    --certificate-identity-regexp "$RE" \
+//	    --certificate-oidc-issuer "$ISSUER" \
+//	    --signature "$SIG" \
+//	    --insecure-ignore-tlog          (PR-A: TODO remove with Rekor trust root)
+//	    "$TARBALL"
+//
+// PR-A's cosign call uses --insecure-ignore-tlog: the operator's
+// host doesn't yet trust Rekor's transparency-log public key. That
+// trust root is PR-B + the spec-side SBoM audit. Today the
+// signature alone is the trust bit; the tlog check is a follow-up.
+type ExecCosignVerifier struct {
+	cfg CosignVerifyConfig
+}
+
+// VerifyBlob runs `cosign verify-blob --certificate-identity-regexp ...`
+// against the tarball. Returns the certificate identity on success.
+//
+// Output parsing: `cosign verify-blob` writes the certificate
+// identity on stdout when verification succeeds. We capture
+// stdout; the trailing newline is trimmed.
+func (v *ExecCosignVerifier) VerifyBlob(ctx context.Context, tarballPath, sigPath string) (string, error) {
+	if tarballPath == "" {
+		return "", errors.New("releaseinstall: cosign: empty tarball path")
+	}
+	if sigPath == "" {
+		return "", errors.New("releaseinstall: cosign: empty signature path")
+	}
+	args := []string{
+		"verify-blob",
+		"--certificate-identity-regexp", v.cfg.IdentityRegexp.String(),
+		"--certificate-oidc-issuer", v.cfg.Issuer,
+		"--signature", sigPath,
+		"--insecure-ignore-tlog",
+		tarballPath,
+	}
+	cmd := exec.CommandContext(ctx, v.cfg.CosignPath, args...)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("releaseinstall: cosign verify-blob: %w (stderr=%s)", err, stderr.String())
+	}
+	identity := bytes.TrimSpace(stdout.Bytes())
+	if len(identity) == 0 {
+		return "", errors.New("releaseinstall: cosign verify-blob: empty certificate identity on stdout")
+	}
+	// Re-confirm the identity matches the configured regex. This
+	// is defence-in-depth: if cosign ever changes its output
+	// shape to print, say, "verify OK" instead of the cert
+	// identity, the regex check is the canonical contract.
+	if !v.cfg.IdentityRegexp.Match(identity) {
+		return "", fmt.Errorf("releaseinstall: cosign verify-blob: identity %q does not match configured regex %s",
+			identity, v.cfg.IdentityRegexp)
+	}
+	return string(identity), nil
+}
+
+// FixtureCosignVerifier is the test seam. Constructor takes the
+// expected identity and an optional error: nil = succeed;
+// non-nil = verify-blob failed.
+//
+// Used by tarball_test.go for the cosign-half of the
+// "tampered" acceptance tests PR-A commit 2 owns.
+type FixtureCosignVerifier struct {
+	Identity    string
+	Err         error
+	CallTarball string
+	CallSig     string
+	CallCount   int
+}
+
+// VerifyBlob records the call and returns Identity / Err.
+func (f *FixtureCosignVerifier) VerifyBlob(_ context.Context, tarballPath, sigPath string) (string, error) {
+	f.CallCount++
+	f.CallTarball = tarballPath
+	f.CallSig = sigPath
+	if f.Err != nil {
+		return "", f.Err
+	}
+	return f.Identity, nil
+}
+
+// ErrCosignSigMissing is the failure signal a Tarball.Verify run
+// surfaces when the Sig field is empty but the verifier says "you
+// must verify". Callers map this to a 4 (operator error).
+var ErrCosignSigMissing = errors.New("releaseinstall: tarball has no signature; cosign verify is required")

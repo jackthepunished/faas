@@ -1,6 +1,6 @@
 # ADR-067 · Tier A6 migrating-instance watchdog
 
-- **Status:** proposed
+- **Status:** **Accepted** (revised 2026-08-16)
 - **Date:** 2026-08-02
 - **Decision:** Wire a 1 s schedd tick that self-heals stuck `state='migrating'`
   rows that never committed (the new owner vmmd died mid-handoff, the

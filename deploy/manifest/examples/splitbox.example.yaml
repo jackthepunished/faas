@@ -3,14 +3,14 @@
 #
 # This file is the canonical example for a multi-box Fleet:
 # one control-plane host (fsn-1) and one compute-only host (fsn-2).
-# It is loaded by `gregale manifest validate` and by the `make
+# It is loaded by `gregalectl manifest validate` and by the `make
 # lint-manifest` CI gate. The same shape (minus the Fleet block)
 # works for a single-box install — replace the Fleet with a single
 # `single-box` host.
 #
 # Conventions:
 #   - Every required field is documented inline. Removing a value
-#     causes `gregale manifest validate` to fail with the
+#     causes `gregalectl manifest validate` to fail with the
 #     `path: is required` message.
 #   - Every digest is sha256 (64 hex) except git_sha (40 hex).
 #     The validator rejects the wrong length.
@@ -22,11 +22,36 @@
 #     "0600"). Plain decimal or text is rejected.
 #
 # Editing tips:
-#   - Run `gregale manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`
+#   - Run `gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`
 #     locally after every edit.
 #   - The TOML table-placement catalog (pkg/manifest/toml_check.go)
 #     is the source of truth for which table a daemon key belongs
 #     to. The renderer (PR-2) consumes the same catalog.
+#
+# ------------------------------------------------------------------------------
+# ILLUSTRATIVE ONLY — the addresses below are PLACEHOLDERS, not real operator
+# values. Replace with the actual CIDRs of your overlay before deploying:
+#
+#   fleet.hosts[].address (currently 10.42.0.1:7100, 10.42.0.2:50051):
+#     Replace each `host:port` with the routable dial address other daemons
+#     use to reach that host. This is NOT necessarily the public IP — it
+#     should be the overlay/mesh-routable address (Tailscale 100.64/10 exit
+#     node, WireGuard AllowedIPs, or the operator's VPC peer IP).
+#
+#   overlay.cidr (currently 10.42.0.0/24):
+#     The overlay subnet every host's address must fall inside. Pick a
+#     /16+ from your operator-owned range. RFC1918 (10/8, 172.16/12,
+#     192.168/16) and CGNAT (100.64/10) are valid for the overlay
+#     itself, but the runtime overlay-accept rules in
+#     pkg/netns/policy.go::HostPolicy.Render require the overlay CIDR
+#     to sit OUTSIDE the §11 deny list (RFC1918 / link-local / CGNAT
+#     are ALL denied — see OverlayCIDRs doc). Pick a public-range
+#     overlay for the mesh.
+#
+# See pkg/manifest/manifest.go for the overlay provider enum
+# (`provider: wireguard | tailscale | static`) and the per-host
+# overlay validation contract.
+# ------------------------------------------------------------------------------
 
 schema_version: "1.0.0"
 
@@ -135,8 +160,9 @@ storage:
 # Cgroups — cgroup v2 controller requirements. The renderer
 # writes +memory +cpu +io +pids to the per-host subtree_control
 # (the only place the production path lands this today — the
-# Lima metal shim at deploy/lima/run-metal.sh:84; bootstrap.sh
-# and ansible both skip it).
+# Lima metal shim at deploy/lima/run-metal.sh:84 + the renderer;
+# the v1 bootstrap.sh and ansible both skip it — RETIRED
+# 2026-08-15 by issue #911 / PR-1).
 cgroups:
   slice: faas-cp.slice
   controllers: "memory,cpu,io,pids"

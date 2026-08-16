@@ -11,7 +11,7 @@
 
 ## Why
 
-PR #371 (merged) shipped `gregale sign-keys init|rotate|status` and
+PR #371 (merged) shipped `gregalectl sign-keys init|rotate|status` and
 `pkg/cosign`, so operators can generate and rotate a cosign keypair
 on the box. ADR-038's build-side wiring (used by schedd at cold-boot)
 verifies ext4 layer signatures against `/etc/faas/secrets/sign-pub.pem`.

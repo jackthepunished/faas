@@ -1,6 +1,6 @@
 # ADR-063 · Tier A: snapshot de-localization (residual local-cache semantics)
 
-- **Status:** proposed
+- **Status:** **Accepted** (revised 2026-08-16)
 - **Date:** 2026-08-01
 - **Issue:** Phase 2 / Gate A — record the snapshot locality decision
   taken as a side effect of Tier 1's OCI storage rollout

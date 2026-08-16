@@ -111,5 +111,13 @@ func LoadConfig(path string) (*Config, error) {
 	// role gate at boot calls role.Require to refuse to start
 	// under the wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_GITHUBD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// NodeName so the systemd drop-in (deploy/ansible/roles/
+	// githubd_service/files/faas-githubd.service.d/
+	// 99-faas-node-name.conf) can override the TOML node_name on
+	// every box. Empty keeps the TOML value (single-box dev).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.NodeName = v
+	}
 	return c, nil
 }

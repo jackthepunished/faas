@@ -1,6 +1,7 @@
 {
   "critical": [
     "apid",
+    "builderd",
     "gatewayd-internal",
     "gatewayd-public",
     "githubd",

@@ -122,10 +122,6 @@ const (
 	// appSlugFallback — the dispatch table places it before the
 	// "app" case so `gregale deployment <id>` is never read as an app slug.
 	dispatchDeployment = "deployment"
-
-	// Plural orgs list. Mirrors dispatchApps shape; user runs
-	// `gregale orgs` to list accounts they belong to.
-	dispatchOrgs = "orgs"
 )
 
 // cmdApp implements `gregale app <slug>` (GET /v1/apps/{slug}), `gregale app <slug>

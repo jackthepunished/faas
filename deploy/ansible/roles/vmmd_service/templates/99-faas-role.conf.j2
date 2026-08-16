@@ -1,0 +1,14 @@
+[Service]
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to vmmd so cmd/vmmd/config.go::LoadConfig picks the
+# right role.FromConfig sentinel (FAAS_VMMD_ROLE). Without this
+# drop-in vmmd falls back to RoleSingleBox on a multi-box fleet
+# and the [compute_node] register row writes role=single-box —
+# incompatible with fsn-2's RoleComputeOnly contract (ADR-092).
+#
+# The drop-in wins over the unit's [Service] section
+# (systemd.unit(5) "later wins") and the unit has no Environment=
+# line on FAAS_VMMD_ROLE, so the drop-in is the only source of
+# the env var. Idempotent — `ansible.builtin.template` is no-op
+# when the rendered file is byte-identical.
+Environment=FAAS_VMMD_ROLE={{ faas_box_role }}

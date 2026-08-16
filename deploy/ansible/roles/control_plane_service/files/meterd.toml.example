@@ -23,7 +23,7 @@
 # paths empty and the dial skips TLS. Multi-box deployments point
 # schedd_socket at a tcp:// or dns:// target and populate the
 # schedd_tls_* cluster with the per-daemon leaf issued by
-# `gregale pki init` (see /etc/faas/tls/meterd/schedd-client.{crt,key}
+# `gregalectl pki init` (see /etc/faas/tls/meterd/schedd-client.{crt,key}
 # + /etc/faas/tls/ca/ca.crt). Partial cluster is rejected at startup
 # with the exact field name(s) missing.
 # schedd_tls_cert_path = "/etc/faas/tls/meterd/schedd-client.crt"

@@ -13,6 +13,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -189,6 +190,22 @@ type ComputeNodeConfig struct {
 	MaxConcurrency     int    `toml:"max_concurrency"`      // parallel live instances
 	AdmissionCeilingMB int    `toml:"admission_ceiling_mb"` // Σ(ram_mb + 8) cap
 	OverlayIP          string `toml:"overlay_ip"`           // Tailscale/Wireguard IP; auto-detected when empty
+	// HostBridgeCIDR is the per-host bridge CIDR (the /16 the veth
+	// host-side addresses live in). Mega-PR-B Commit 1 supersedes
+	// the former pkg/netns Go const; defaults to
+	// api.DefaultHostBridgeCIDR() (10.100.0.0/16) when empty. The
+	// bridge IP is the .1 of whatever CIDR the operator ships.
+	// Single-host dev keeps the default; multi-host deployments
+	// override per-host via env-overlay or TOML.
+	HostBridgeCIDR string `toml:"host_bridge_cidr"`
+	// OverlayCIDR is the per-host overlay subnet the vmmd overlay
+	// detector prefers when multiple IPv4 candidates come back from
+	// `tailscale ip -4` (Mega-PR-B Commit 3). Defaults to
+	// api.DefaultOverlayCIDR() (Tailscale 100.64.0.0/10) when empty.
+	// The same CIDR is rendered into the host forward chain's
+	// overlay-accept rules (Commit 2) so mesh traffic survives the
+	// §11 RFC1918 deny.
+	OverlayCIDR string `toml:"overlay_cidr"`
 }
 
 // ResolveListenTarget returns the gRPC target the server should bind.
@@ -336,5 +353,43 @@ func LoadConfig(path string) (*Config, error) {
 	// gate at boot calls role.Require to refuse to start under the
 	// wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_VMMD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// [compute_node].name so the systemd drop-in (deploy/ansible/
+	// roles/vmmd_service/files/faas-vmmd.service.d/
+	// 99-faas-node-name.conf) can override the TOML value on every
+	// box. The vmmd ComputeNode self-registration (cmd/vmmd/register.go)
+	// writes this name into compute_nodes.name at startup, so the
+	// env overlay is the load-bearing identity for the multi-box
+	// handshake. Empty keeps the TOML value (single-box dev back-
+	// compat — short hostname).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.ComputeNode.NodeName = v
+	}
+	// Mega-PR-B (issue #911 / ADR-110 Tier-1 BLOCKING Commit 1):
+	// env-var overlay for [compute_node].host_bridge_cidr so the
+	// per-host bridge CIDR is configurable without a TOML edit
+	// (mirrors the FAAS_NODE_NAME pattern above). The default
+	// single-host bridge CIDR lives in pkg/api.DefaultHostBridgeCIDR().
+	// Empty keeps the TOML value (or the api default when TOML is
+	// also empty).
+	if v := os.Getenv("FAAS_HOST_BRIDGE_CIDR"); v != "" {
+		c.ComputeNode.HostBridgeCIDR = v
+	}
+	// Mega-PR-B review M3: validate [compute_node].overlay_cidr
+	// against the §11 deny set at config-load time, BEFORE vmmd
+	// accepts any traffic or registers with schedd. The render-time
+	// panic in pkg/netns.HostPolicy.Render stays as belt-and-braces
+	// for programmatic misuse (a future caller could mutate the
+	// HostPolicy struct post-load), but operators editing vmmd.toml
+	// get a clear startup error naming both CIDRs instead of a
+	// crash-loop on the first pg_notify EgressPolicyChanged reload.
+	// The validator is the same one the renderer uses — single
+	// source of truth for the subset check, no drift between the
+	// load-time and render-time gates.
+	if overlay := strings.TrimSpace(c.ComputeNode.OverlayCIDR); overlay != "" {
+		if err := netns.ValidateOverlayCIDRs([]string{overlay}, netns.NewDefaultDenySet()); err != nil {
+			return nil, fmt.Errorf("vmmd: [compute_node].overlay_cidr %q invalid: %w", overlay, err)
+		}
+	}
 	return c, nil
 }

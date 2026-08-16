@@ -2,7 +2,7 @@
 # fsn-2 runs vmmd, gatewayd-internal, builderd, imaged.
 # Postgres + the Tier 1 PKI CA live on fsn-1; this box dials schedd over
 # the overlay network (Tail/wg) with the per-node client cert vmmd's
-# `gregale pki init --box-role=compute-only` (PR-3) lays out under
+# `gregalectl pki init --box-role=compute-only` (PR-3) lays out under
 # /etc/faas/tls/vmmd/schedd-client.{crt,key}.
 #
 # The role gate (pkg/role, PR-1) refuses to start vmmd/gatewayd-internal/
@@ -12,3 +12,30 @@
 
 faas_box_role: compute-only
 faas_node_name: fsn-2
+
+# Ansible connection vars. See host_vars/faas-fsn-1.yml for the
+# rationale. `ansible_host` is the dial target schedd/gatewayd use
+# to reach this box from fsn-1; the same layer-3 mesh endpoint.
+ansible_host: 10.42.0.2
+ansible_python_interpreter: /usr/bin/python3
+
+# Multi-host mesh (ADR-092): fsn-2 is the compute-only box and
+# needs the overlay mesh to reach peer compute boxes (fsn-3+ when
+# they land). The Jinja2 template at
+# deploy/ansible/roles/nftables/templates/policy_nftables.conf.j2
+# emits one `ip saddr <cidr> accept` rule per entry AND one
+# `ip saddr <cidr> oifname <public_iface> masquerade` rule per
+# entry — so the bridged-tenant talk to overlay mesh is allowed
+# at the forward chain AND the return path MASQUERADE is in
+# place on postrouting.
+#
+# Empty list = single-box dev (no mesh). The pair
+# (overlay_cidrs=[], masquerade_cidr_v6="") renders the canonical
+# default-local ruleset byte-identical to the pre-Mega-PR-C output.
+# A future Hetzner multi-host fleet populates overlay_cidrs with
+# the per-box /16 slices (e.g. [100.64.0.0/14]) and
+# masquerade_cidr_v6 with the ULA pool (fc00::/7). The Go renderer
+# (pkg/netns/policy.go::HostPolicy.Render) accepts the same shape;
+# `make egress-render-cross-check` is the byte-equality gate.
+overlay_cidrs: []
+masquerade_cidr_v6: ''

@@ -1,11 +1,15 @@
 package daemonunitspec
 
-import "github.com/onebox-faas/faas/pkg/daemonunit"
+import (
+	"fmt"
+
+	"github.com/onebox-faas/faas/pkg/daemonunit"
+)
 
 // Entry is one row of the daemon registry — the canonical (name, unit,
 // restart classification) tuple that the deploy generator emits into
-// both the systemd tree and the cd-controlplane workflow's
-// daemons.json.
+// the per-role systemd files/ tree and the cd-controlplane workflow's
+// daemons.json output target.
 //
 // `Critical` controls which list the daemon lands in
 // deploy/etc/daemons.json:
@@ -60,6 +64,41 @@ var Registry = []Entry{
 	{Name: "meterd", Unit: UnitMeterd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "githubd", Unit: UnitGithubd, Critical: true, Lifecycle: Lifecycle{After: []string{"apid"}, Probe: ProbeSystemd}},
 	{Name: "imaged", Unit: UnitImaged, Critical: false, Lifecycle: Lifecycle{After: []string{"vmmd"}, Probe: ProbeTCP, ProbeTarget: "127.0.0.1:9102"}},
+	// Mega-PR-C (issue #911 / ADR-110): builderd is the build
+	// orchestrator on fsn-2 (compute-only). Spawns ephemeral
+	// builder microVMs through vmmd (ADR-003) — no KVM direct
+	// from this unit. After=vmmd: the build path needs the
+	// per-box capacity signal vmmd writes at boot, otherwise
+	// the first build_claim can race the vmmd register row.
+	//
+	// builderd does NOT depend on apid — apid runs on the
+	// control-plane box only (fsn-1), while builderd runs on
+	// the compute-only box (fsn-2). On fsn-2, the faas-apid
+	// unit doesn't exist; `After=apid` would silently no-op
+	// to a 90s boot timeout before systemd fails the unit.
+	// builderd schedules builds via gRPC over the wire to
+	// apid on fsn-1 (the [apphub] layer), so there is no
+	// ordering dependency at unit-activation time.
+	{Name: "builderd", Unit: UnitBuilderd, Critical: true, Lifecycle: Lifecycle{After: []string{"vmmd"}, Probe: ProbeUnix, ProbeTarget: "/run/faas/builderd.sock"}},
+}
+
+// UnitByName returns the daemonunit.Unit for the given daemon name.
+// The mapping is the canonical manifest.HostKeys → daemonunitspec.Unit
+// name (the manifest uses underscores in two cases — gatewayd_internal,
+// gatewayd_public — which the renderer flattens to dashes before
+// reaching this lookup). Returns an error if name is not in the
+// Registry; the renderer surfaces this as a schema-drift ship-blocker.
+//
+// The Registry's Unit field is itself a constructor (`func() daemonunit.Unit`)
+// so the renderer gets a fresh copy per call — every renderer run
+// produces a per-daemon unit without cross-run aliasing.
+func UnitByName(name string) (daemonunit.Unit, error) {
+	for _, e := range Registry {
+		if e.Name == name {
+			return e.Unit(), nil
+		}
+	}
+	return daemonunit.Unit{}, fmt.Errorf("daemonunitspec: unknown daemon %q (known: %v)", name, ActivationOrder())
 }
 
 // FaasCPSlice is the [Slice] MemoryMax=3G ceiling for the entire
@@ -70,6 +109,10 @@ var Registry = []Entry{
 // stabilises post-DEPLOY-1).
 //
 // The slice is emitted to deploy/controlplane/systemd/faas-cp.slice
-// only; it is NOT a daemon and lives outside the Registry iteration
-// because it is the wrapper, not a member.
+// AND mirrored to deploy/ansible/roles/control_plane_service/files/
+// faas-cp.slice (PR-1: the v2 tree is the canonical source for the CD
+// pipeline; the v1 deploy/controlplane/ is a tombstone now, scheduled
+// for deletion in PR-1 Phase 2 after PR-X). The slice is NOT a daemon
+// and lives outside the Registry iteration because it is the wrapper,
+// not a member.
 const FaasCPSlice = "faas-cp.slice"

@@ -310,8 +310,16 @@ func hashFile(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
 	}
+	return sha256Hex(body), nil
+}
+
+// sha256Hex returns hex-encoded SHA256 of body (64 lowercase chars).
+// Extracted so the tarball producer (PR-A commit 1) can hash in-memory
+// tar entries without round-tripping to disk, and so hashFile stays
+// the canonical "what's the digest of this file" predicate.
+func sha256Hex(body []byte) string {
 	hash := sha256.Sum256(body)
-	return hex.EncodeToString(hash[:]), nil
+	return hex.EncodeToString(hash[:])
 }
 
 func validGitSHA(s string) bool {
@@ -326,6 +334,14 @@ func validGitSHA(s string) bool {
 	}
 	return true
 }
+
+// ValidGitSHA is the exported form of validGitSHA. Callers that
+// want to gate a 40-char lowercase hex git_sha (e.g. the doctor
+// command's per-node release_id checks) should use this so the
+// predicate stays in one place. PR-3 had to keep the helper
+// unexported because the only consumer was inside the package;
+// PR-4 doctor is the first external caller.
+func ValidGitSHA(s string) bool { return validGitSHA(s) }
 
 func validManifestHash(s string) bool {
 	if len(s) != 7+64 {

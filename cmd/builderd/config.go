@@ -112,7 +112,23 @@ type Config struct {
 	// the same name. Operators can override via this field when
 	// builderd runs on a non-default node (multi-node deployments
 	// post-PR-B).
+	//
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): the FAAS_NODE_NAME env
+	// overlay (below) overrides BuilderNodeID at LoadConfig so the
+	// systemd drop-in (deploy/ansible/roles/compute_only_service/
+	// files/faas-builderd.service.d/99-faas-node-name.conf) is the
+	// single deploy-time source of truth — no need for operators
+	// to edit vmmd.toml or builderd.toml on a fresh node add.
 	BuilderNodeID string `toml:"builder_node_id"`
+
+	// NodeName is the multi-box identity for the builderd process
+	// (issue #678 / ADR-093 PR-0). When non-empty, builderd stamps
+	// this onto build_provenance rows instead of BuilderNodeID. The
+	// env overlay FAAS_NODE_NAME (Mega-PR-A) wins over the TOML
+	// value at LoadConfig — single source of truth is the systemd
+	// drop-in. Mirrors the schedd/apid/meterd/githubd NodeName
+	// field shape so operator playbooks read the same way.
+	NodeName string `toml:"node_name"`
 
 	// Role is the box shape this builderd inhabits (Gate-B; env
 	// override FAAS_BUILDERD_ROLE wins when set). builderd is a
@@ -176,6 +192,14 @@ func LoadConfig(path string) (*Config, error) {
 			// empty TOML default. role.FromConfig falls back to
 			// RoleSingleBox when the env is unset.
 			c.Role = role.FromConfig(string(c.Role), "FAAS_BUILDERD_ROLE")
+			// Mega-PR-A: same env overlay as the success path —
+			// keeps missing-file + single-box dev consistent.
+			if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+				c.NodeName = v
+				if c.BuilderNodeID == "" || c.BuilderNodeID == "default-local" {
+					c.BuilderNodeID = v
+				}
+			}
 			return c, nil
 		}
 		return nil, fmt.Errorf("builderd: read %q: %w", path, err)
@@ -190,5 +214,17 @@ func LoadConfig(path string) (*Config, error) {
 	// role gate at boot calls role.Require to refuse to start
 	// under the wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_BUILDERD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// NodeName — wins over TOML node_name. When set, also
+	// overrides the legacy BuilderNodeID (kept for back-compat
+	// with deployments that still set it via TOML; only when the
+	// TOML value is the default-local sentinel — operators that
+	// intentionally set a different ID keep their choice).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.NodeName = v
+		if c.BuilderNodeID == "" || c.BuilderNodeID == "default-local" {
+			c.BuilderNodeID = v
+		}
+	}
 	return c, nil
 }

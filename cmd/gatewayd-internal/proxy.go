@@ -18,7 +18,8 @@
 //     /logout, /logout/, /logout/* (magic-link + session auth)
 //   - /status, /status/, /status/* (spec §12 public status page)
 //   - /healthz (loopback infra probe — required for the CD health
-//     check in deploy/digitalocean/bootstrap.sh and the
+//     check in deploy/controlplane/bootstrap.sh (RETIRED 2026-08-15
+//     by issue #911 / PR-1; v2 path is the CD + doctor) and the
 //     cd-digitalocean.yml post-deploy smoke test)
 //
 // apid binds loopback-only, so this proxy is the only way external

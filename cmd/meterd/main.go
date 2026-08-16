@@ -623,6 +623,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err := role.Require("meterd", cfg.Role, role.RoleSingleBox, role.RoleControlPlane); err != nil {
 		return err
 	}
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity. Mirrors schedd/apid/gatewayd-public so
+	// the playbook shape is identical across daemons.
+	if cfg.NodeName != "" {
+		log.Info("meterd owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("meterd: legacy single-box (cfg.NodeName empty)")
+	}
 	mc, err := deps.loadMeter(cfg)
 	if err != nil {
 		return err
@@ -877,7 +885,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
 	// /healthz, 5s graceful shutdown on drain. Empty cfg.MetricsAddr
 	// disables both endpoints (the production default in
-	// deploy/etc/meterd.toml.example).
+	// deploy/etc/meterd.toml.example — RETIRED in PR-1 Phase 2 after
+	// PR-X; the v2 path is deploy/ansible/roles/control_plane_service/
+	// files/meterd.toml.example).
 	const metricsPath = "/metrics"
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {

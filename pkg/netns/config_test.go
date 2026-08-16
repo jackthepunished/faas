@@ -13,6 +13,14 @@ func testConfig() Config {
 	return NewConfig("abc123", "fc-abc123", "vh7", "vp7", netip.MustParseAddr("10.100.0.9"))
 }
 
+// testConfigWithBridge is the multi-host variant of testConfig: same per-
+// instance hostIP, but a non-default HostBridgeIP so the argv substitution
+// in TestSetupSubstitutesHostBridgeIP can be exercised without touching
+// the legacy single-host default.
+func testConfigWithBridge(bridgeIP netip.Addr) Config {
+	return NewConfigWithBridge("abc123", "fc-abc123", "vh7", "vp7", netip.MustParseAddr("10.100.0.9"), bridgeIP)
+}
+
 func TestNewConfigDefaults(t *testing.T) {
 	c := testConfig()
 	if c.Tap != "tap0" {
@@ -210,6 +218,48 @@ func TestSetupDefaultRouteArgvIsExact(t *testing.T) {
 	}
 	if hits > 1 {
 		t.Errorf("SetupCommands emitted %d argvs matching the default-route shape; want exactly 1", hits)
+	}
+}
+
+// TestSetupSubstitutesHostBridgeIP is the per-host equivalent of
+// TestSetupInstallsNetnsDefaultRouteViaBridge: vary HostBridgeIP to a
+// non-default value (10.101.0.1, matching ADR-055's per-host substitution
+// pattern) and assert the argv at config.go:166 picks it up. The
+// legacy default (10.100.0.1) MUST NOT appear in the rendered argv when
+// HostBridgeIP is non-default — anti-regression for the "config knob
+// lives in 3 places" debt PR-0 retired.
+func TestSetupSubstitutesHostBridgeIP(t *testing.T) {
+	c := testConfigWithBridge(netip.MustParseAddr("10.101.0.1"))
+	cmds := c.SetupCommands()
+	want := []string{
+		"ip", "netns", "exec", c.Netns,
+		"ip", "route", "add", "default", "via", "10.101.0.1", "dev", c.VethPeer,
+	}
+	hit := false
+	for _, cmd := range cmds {
+		if len(cmd) != len(want) {
+			continue
+		}
+		match := true
+		for j := range want {
+			if cmd[j] != want[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		t.Fatalf("SetupCommands missing per-host bridge argv %v; got:\n%s", want, flatten(cmds))
+	}
+	// Anti-regression: the legacy default must NOT leak when HostBridgeIP
+	// is non-default — a future edit that re-introduces the Go const
+	// would surface here.
+	if flatten(cmds) != "" && strings.Contains(flatten(cmds), "via 10.100.0.1") {
+		t.Errorf("SetupCommands leaked legacy default 10.100.0.1 when HostBridgeIP=10.101.0.1:\n%s", flatten(cmds))
 	}
 }
 

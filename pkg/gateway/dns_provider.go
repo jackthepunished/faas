@@ -23,8 +23,17 @@
 // pkg/gateway/dns01_hetzner.go (the legacy ACME DNS-01 solver).
 // Round 2 deletes it — production runs Cloudflare + Caddy, and
 // the Hetzner plumbing was dead weight (see ADR-083 §3
-// follow-up revision). The legacy ACME DNS-01 path stays until
-// the ADR-024 PR-C sweep.
+// follow-up revision).
+//
+// PR-8 (issue #911 / ADR-110 deferred): the ACME DNS-01 solver is
+// now a generic DNSProviderFactory dispatch in tls_wire.go
+// (cloudflare|hetzner|route53|manual); this file's DNSProvider
+// interface is a SEPARATE surface — the A8 leader-election A-record
+// orchestrator — gated on FAAS_DNS_PROVIDER via cmd/gatewayd-public/
+// ha_components.go:70. The errDNSProviderUnknown enum below remains
+// {cloudflare, manual} because that's the A8 dispatch; PR-9 (follow-
+// up) will widen it to {cloudflare, manual, hetzner} if a third
+// production deployment needs the A8 path on Hetzner.
 //
 // The package holds no state of its own; every call goes through
 // the interface so the dns_handoff orchestrator in

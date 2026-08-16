@@ -84,7 +84,12 @@
 # /run/faas as root:root 0755 first, so tmpfiles finds it existing
 # and skips the chown. Without this, githubd (User=faas Group=faas)
 # can't bind() /run/faas/githubd.sock on every re-run. Idempotent.
-# See deploy/controlplane/tmpfiles.d/faas.conf for the canonical rationale.
+# The canonical rationale lives at this file's mirror
+# (deploy/controlplane/tmpfiles.d/faas.conf, a tombstone now —
+# RETIRED 2026-08-15 by issue #911 / PR-1; see
+# deploy/controlplane/RETIRED.md). PR-1 rewrote the CD pipeline to
+# read this file from deploy/ansible/roles/control_plane_service/
+# files/faas.conf instead.
 - name: control_plane_service — chown /run/faas to root:faas 0775 (PR-M)
   ansible.builtin.file:
     path: /run/faas
@@ -97,6 +102,46 @@
   ansible.builtin.systemd:
     daemon_reload: true
   when: cp_units.changed
+
+# Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
+# env line into every control-plane unit so the multi-box identity
+# travels from host_vars to the daemons without a TOML edit on every
+# box add. The drop-in is identical across schedd / apid / meterd
+# (templates/99-faas-node-name.conf.j2) and is rendered from
+# faas_node_name (deploy/ansible/host_vars/faas-fsn-N.yml). The role
+# does not restart the daemons itself (it ships them but does not
+# enable/start per the role's idempotency contract); the operator's
+# `systemctl enable --now` picks the drop-in up automatically.
+- name: control_plane_service — install FAAS_NODE_NAME drop-in per unit (Mega-PR-A)
+  ansible.builtin.template:
+    src: ../../_shared/templates/99-faas-node-name.conf.j2
+    dest: "/etc/systemd/system/{{ item }}.service.d/99-faas-node-name.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - faas-schedd
+    - faas-apid
+    - faas-meterd
+
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to the three control-plane daemons (apid, schedd,
+# meterd) via FAAS_<DAEMON>_ROLE. One drop-in per daemon — the
+# template sets three Environment= lines so the single render
+# covers all three daemons' env-var contracts. See
+# roles/control_plane_service/templates/99-faas-role.conf.j2
+# for the full rationale.
+- name: control_plane_service — install FAAS_<DAEMON>_ROLE drop-in per unit (Mega-PR-C)
+  ansible.builtin.template:
+    src: 99-faas-role.conf.j2
+    dest: "/etc/systemd/system/{{ item }}.service.d/99-faas-role.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - faas-apid
+    - faas-schedd
+    - faas-meterd
 
 - name: control_plane_service — create runtime dirs (logs, spool, statuspage)
   ansible.builtin.file:
@@ -190,7 +235,7 @@
 
 # Issue #316 / ADR-057 — soft assert on host.age.previous. The
 # rotation-overlap twin of host.age appears during the 30-day
-# window after `gregale host-age rotate --commit`. Its presence
+# window after `gregalectl host-age rotate --commit`. Its presence
 # is INTENTIONAL (the runbook tolerates the overlap so MFA
 # envelopes sealed under the previous key still unseal); ansible
 # must NOT refuse to deploy on a box mid-rotation. We stat it
@@ -233,7 +278,7 @@
 # leaf's chmod (cmd/gregale/commands_backup_unseal_archive.go).
 # apid reads the envelope via LoadCredential= so it never
 # touches the on-disk 0400 file; the tripwire is for the box
-# that runs `gregale backup unseal-archive-creds` and would
+# that runs `gregalectl backup unseal-archive-creds` and would
 # otherwise write a loose-perm file.
 - name: control_plane_service — assert archive-creds.json mode is 0400 root:root if present (issue #562)
   ansible.builtin.stat:
@@ -299,7 +344,7 @@
 # bootstrap lays out /etc/faas/tls/{ca,<daemon>/} with 0400
 # private keys and 0444 public certs; this stat-assert proves
 # the bootstrap ran on a control-plane node (compute nodes run
-# `gregale pki init` via their own vmmd_service role and are
+# `gregalectl pki init` via their own vmmd_service role and are
 # checked there). Failing the play here surfaces a misconfigured
 # bootstrap before the daemons attempt to load the certs and
 # start with a confusing TLS handshake failure.

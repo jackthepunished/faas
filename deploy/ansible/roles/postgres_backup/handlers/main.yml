@@ -6,9 +6,9 @@
 #
 # `failed_when` is conditional: we only swallow the failure when systemd
 # is genuinely unavailable (chroot / CI sandbox without an init system).
-# On a real EX44 a daemon-reload failure means a corrupted unit drop and
-# we want to fail loudly so the operator sees it before the next task
-# (enable + start) reports a confusing "unit not found" error.
+# On a real production box a daemon-reload failure means a corrupted unit
+# drop and we want to fail loudly so the operator sees it before the next
+# task (enable + start) reports a confusing "unit not found" error.
 
 - name: detect systemd availability
   ansible.builtin.stat:

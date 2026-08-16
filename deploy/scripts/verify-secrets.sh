@@ -37,12 +37,14 @@ check "/etc/faas/secrets/session.key exists with mode 0400 root:root" bash -c '
 '
 
 # 2. sealed.env MUST NOT carry FAAS_SESSION_KEY any more — that
-#    was the A4 leak. Operators migrating from a pre-A4 bootstrap
-#    need to re-run bootstrap.sh to scrub the file. Note: the file's
-#    existence is asserted first so a fresh host that hasn't
-#    bootstrapped at all reports red ✗ rather than silently passing
-#    on a missing-file grep (grep -q exits 2 on a missing file,
-#    which `!` would otherwise flip to a false-positive 0).
+#    was the A4 leak. Operators migrating from a pre-A4 install need
+#    to re-run the v2 secrets init (PR-X `gregale secrets init`, pending)
+#    or hand-edit sealed.env to scrub the key. The historical v1
+#    bootstrap.sh was retired in issue #911 / PR-1 (ADR-110); the file's
+#    existence is asserted first so a fresh host that hasn't bootstrapped
+#    at all reports red � rather than silently passing on a missing-file
+#    grep (grep -q exits 2 on a missing file, which `!` would otherwise
+#    flip to a false-positive 0).
 check "sealed.env does NOT contain FAAS_SESSION_KEY" bash -c '
   [[ -f /etc/faas/sealed.env ]] \
     && ! grep -q "^FAAS_SESSION_KEY=" /etc/faas/sealed.env
