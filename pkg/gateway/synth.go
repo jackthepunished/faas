@@ -417,6 +417,43 @@ type batchDispatchResult struct {
 	Code           string `json:"code,omitempty"`
 }
 
+// batchDispatchPerRecordTimeout bounds each per-record Invoke
+// call inside handleInvocationDispatchBatch. Audit round 2
+// finding #4 (PR #910): a single stuck Invoke (e.g. function
+// hangs forever, dispatcher blocks waiting on a wake that never
+// completes) used to block the loop indefinitely; we now wrap
+// each Invoke in a 30s context.WithTimeout. On per-record
+// timeout the record is marked Status="retry",
+// Code="invoke_timeout" so the schedd's retry FSM can advance
+// attempts and only escalate to dead_letter when the
+// per-trigger max_attempts budget is exhausted.
+//
+// Implemented as `var` (not `const`) so tests in the same
+// package can shrink the timeout via a package-local override.
+// Production code reads the var; tests write it.
+var batchDispatchPerRecordTimeout = 30 * time.Second
+
+// batchDispatchTotalTimeout bounds the entire
+// handleInvocationDispatchBatch handler. Audit round 2 finding
+// #4 (PR #910): a 1000-record batch held the gateway HTTP
+// request for the whole loop duration. We now wrap the loop in
+// a 5-minute context.WithTimeout so a stuck Invoke can't pin
+// the gateway for hours. On total timeout, the remaining
+// unprocessed records are marked Status="retry",
+// Code="batch_timeout" so the schedd Nacks them and re-delivers
+// them on the next tick.
+//
+// 5 minutes is well above the hot-path latency (sub-second per
+// record for warm apps) but well below the schedd's
+// gatewayHTTPClient timeout — if a batch needs > 5min the
+// dispatch is broken in a way that retrying is the right move,
+// not waiting forever.
+//
+// Implemented as `var` (not `const`) so tests in the same
+// package can shrink the timeout via a package-local override.
+// Production code reads the var; tests write it.
+var batchDispatchTotalTimeout = 5 * time.Minute
+
 // handleInvocationDispatchBatch is the trigger-driven batch path.
 //
 // Wire flow:
@@ -424,17 +461,39 @@ type batchDispatchResult struct {
 //  1. schedd posts the batch envelope to /v1/invocations:dispatch_batch
 //     (one HTTP request per dispatch tick).
 //  2. gateway decodes the envelope, walks each record, calls
-//     s.dispatcher.Invoke() to wake the app and proxy the
-//     function. The VM lifecycle is one-wake-per-batch (matches
-//     AWS Lambda ESM semantics — one function invocation serves
-//     N records).
-//  3. After Invoke returns, parseBatchFailures() reads the
+//     s.dispatcher.Invoke() per record (NOT the AWS Lambda ESM
+//     semantic of one invocation handling N records — see
+//     dispatchBatchRecord below for why).
+//  3. After each Invoke returns, parseBatchFailures() reads the
 //     function's response body for `batchItemFailures[]` and
 //     computes per-record status (succeeded / retry / dead_letter).
 //  4. gateway returns the per-record status array to schedd.
 //
+// Per-record semantics (NOT Lambda ESM): the handler is
+// single-threaded — N sequential function invocations per
+// batch, each paying its own wake gate + admission cost. The
+// schedd's HTTP client is held for the entire batch duration.
+// Audit round 2 finding #4 (PR #910) documents this explicitly
+// because a future maintainer reading the dispatch path expects
+// Lambda ESM "one VM serves N records" — that is NOT what this
+// code does today. A future PR can batch-encode and short-circuit
+// Invoke() if a target VM is already RUNNING; that change is
+// out of scope here.
+//
+// Safety rails (audit round 2 finding #4):
+//
+//   - Per-record 30s timeout (batchDispatchPerRecordTimeout):
+//     wraps each Invoke call. On timeout, the record is marked
+//     Status="retry", Code="invoke_timeout".
+//   - Total-batch 5min timeout (batchDispatchTotalTimeout):
+//     wraps the entire loop. On timeout, unprocessed records
+//     are marked Status="retry", Code="batch_timeout" and the
+//     gateway returns a partial 200 with the marked results —
+//     schedd Nacks the unprocessed items and re-delivers on
+//     the next tick.
+//
 // Why we don't add InvokeBatch to SynthDispatcher: the VM lifecycle
-// is single-wake per batch, and Invoke() is already rate-limited
+// is single-wake per record, and Invoke() is already rate-limited
 // + plan-quota'd per app. Walking each record through Invoke
 // reuses the existing admission gate (the per-app concurrency cap
 // stays load-bearing) without doubling the dispatcher contract.
@@ -464,115 +523,159 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 		"trigger_id", logsanitize.Field(req.TriggerID),
 		"records", len(req.Records))
 
-	// One wake per batch — Invoke the first record through the
-	// regular dispatcher path, which wakes the app if not running.
-	// Subsequent records share the same wake (Invoke's
-	// always-Wake semantic — the first call wakes, subsequent
-	// calls find RUNNING and skip the wake gate).
-	//
-	// We iterate the records and call Invoke() per record so each
-	// record's response body is independently parseable for
-	// ReportBatchItemFailures. The state-machine work below
-	// collects per-record status.
+	// Audit round 2 finding #4: wrap the whole loop in a
+	// 5-minute timeout so a stuck Invoke can't pin the gateway
+	// for hours. The ctx is derived from r.Context() so
+	// client-side disconnects still cancel the loop.
+	ctx, cancel := context.WithTimeout(r.Context(), batchDispatchTotalTimeout)
+	defer cancel()
+
 	results := make([]batchDispatchResult, 0, len(req.Records))
 	for _, rec := range req.Records {
-		var payload []byte
-		if rec.PayloadB64 != "" {
-			dec, err := base64Decode(rec.PayloadB64)
-			if err != nil {
-				results = append(results, batchDispatchResult{
-					ItemIdentifier: rec.ItemIdentifier,
-					Status:         "dead_letter",
-					Error:          "payload_b64 invalid",
-					Code:           "payload_b64_invalid",
-				})
-				continue
-			}
-			payload = dec
-		}
-		// Synthesize a single-record invocation envelope. We
-		// route via the /v1/invocations:dispatch code path in
-		// spirit (same dispatcher.Invoke) but bypass the JSON
-		// decoder so the headers / metadata land on the runner
-		// envelope unchanged.
-		inv := state.Invocation{
-			ID:      req.InvocationID + "-" + rec.ItemIdentifier,
-			AppID:   req.AppID,
-			Source:  state.InvocationSource(req.Source),
-			Method:  http.MethodPost,
-			Path:    "/_triggers/" + req.Source + "/" + req.TriggerID,
-			Payload: payload,
-			Headers: jsonOrEmpty(rec.Headers),
-		}
-		out, err := s.dispatcher.Invoke(r.Context(), req.AppID, inv)
-		if err != nil {
-			s.log.Warn("gateway synth: invoke (batch)",
-				"inv", logsanitize.Field(inv.ID),
-				"item", logsanitize.Field(rec.ItemIdentifier),
-				"err", err)
-			results = append(results, batchDispatchResult{
-				ItemIdentifier: rec.ItemIdentifier,
-				Status:         "broker_error",
-				Error:          err.Error(),
-				Code:           "invoke_error",
-			})
-			continue
-		}
-		// Parse the function's response body for
-		// ReportBatchItemFailures. The convention is a JSON
-		// envelope: {"batchItemFailures":[{"itemIdentifier":"..."}]}
-		// — stolen verbatim from AWS Lambda.
-		failed, parseErr := parseBatchFailures(out.Result)
-		if parseErr != nil {
-			s.log.Warn("gateway synth: batch failures parse",
-				"item", logsanitize.Field(rec.ItemIdentifier),
-				"err", parseErr)
-			// Malformed function response — emit Status='retry'
-			// so the schedd's retry FSM can advance attempts and
-			// only escalate to dead_letter when the per-trigger
-			// max_attempts budget is exhausted. review finding #5:
-			// the prior code skipped straight to dead_letter on
-			// the first transient 5xx, bypassing the customer's
-			// retry budget entirely.
+		if ctx.Err() != nil {
+			// Total-batch timeout fired (or client disconnected).
+			// Mark every remaining record with batch_timeout so
+			// schedd Nacks them and re-delivers on the next tick.
+			// Without this, the loop would just stop and the
+			// schedd would have no idea which records were
+			// processed vs dropped.
 			results = append(results, batchDispatchResult{
 				ItemIdentifier: rec.ItemIdentifier,
 				Status:         "retry",
-				Error:          "function response malformed: " + parseErr.Error(),
-				Code:           "response_malformed",
+				Error:          "batch_timeout: handler exceeded " + batchDispatchTotalTimeout.String(),
+				Code:           "batch_timeout",
 			})
 			continue
 		}
-		// Per-record status: succeeded unless the record's id is
-		// in the failure list.
-		if containsString(failed, rec.ItemIdentifier) {
-			results = append(results, batchDispatchResult{
-				ItemIdentifier: rec.ItemIdentifier,
-				Status:         "retry",
-				Error:          "reported in batchItemFailures",
-				Code:           "function_failed",
-			})
-			continue
-		}
-		// If state==succeeded from the dispatcher, success.
-		// Otherwise (e.g. function returned 5xx, dispatcher
-		// captured it) it's a retry.
-		if string(out.State) == "succeeded" {
-			results = append(results, batchDispatchResult{
-				ItemIdentifier: rec.ItemIdentifier,
-				Status:         "succeeded",
-			})
-		} else {
-			results = append(results, batchDispatchResult{
-				ItemIdentifier: rec.ItemIdentifier,
-				Status:         "retry",
-				Error:          fmt.Sprintf("function state=%s", out.State),
-				Code:           "function_state_" + string(out.State),
-			})
-		}
+		results = append(results, s.dispatchBatchRecord(ctx, req, rec))
 	}
 	s.calls.Add(1)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchDispatchResponse{Results: results})
+}
+
+// dispatchBatchRecord handles one record inside the batch loop.
+// Extracted from handleInvocationDispatchBatch so the per-record
+// processing reads cleanly and the timeout wrappers stay
+// localised. The handler itself stays under the 50-line cap
+// CLAUDE.md enforces.
+//
+// Per-record 30s timeout (batchDispatchPerRecordTimeout): on
+// timeout, the record is marked Status="retry",
+// Code="invoke_timeout" — the schedd's retry FSM advances the
+// attempts counter and only escalates to dead_letter when the
+// per-trigger max_attempts budget is exhausted.
+//
+// Note: the per-record context is derived from the total-batch
+// context (ctx), so a total-batch timeout ALSO trips the
+// per-record timeout for the next iteration; ctx.Err() check
+// above catches the next iteration. The two timeouts compose
+// cleanly because context.WithTimeout is short-circuiting.
+func (s *SynthServer) dispatchBatchRecord(ctx context.Context, req batchDispatchRequest, rec batchDispatchRecord) batchDispatchResult {
+	// Per-record timeout (audit round 2 finding #4). Wraps the
+	// Invoke call so a stuck function or stuck dispatcher can't
+	// pin a single record.
+	recCtx, recCancel := context.WithTimeout(ctx, batchDispatchPerRecordTimeout)
+	defer recCancel()
+	var payload []byte
+	if rec.PayloadB64 != "" {
+		dec, err := base64Decode(rec.PayloadB64)
+		if err != nil {
+			return batchDispatchResult{
+				ItemIdentifier: rec.ItemIdentifier,
+				Status:         "dead_letter",
+				Error:          "payload_b64 invalid",
+				Code:           "payload_b64_invalid",
+			}
+		}
+		payload = dec
+	}
+	// Synthesize a single-record invocation envelope. We
+	// route via the /v1/invocations:dispatch code path in
+	// spirit (same dispatcher.Invoke) but bypass the JSON
+	// decoder so the headers / metadata land on the runner
+	// envelope unchanged.
+	inv := state.Invocation{
+		ID:      req.InvocationID + "-" + rec.ItemIdentifier,
+		AppID:   req.AppID,
+		Source:  state.InvocationSource(req.Source),
+		Method:  http.MethodPost,
+		Path:    "/_triggers/" + req.Source + "/" + req.TriggerID,
+		Payload: payload,
+		Headers: jsonOrEmpty(rec.Headers),
+	}
+	out, err := s.dispatcher.Invoke(recCtx, req.AppID, inv)
+	if err != nil {
+		s.log.Warn("gateway synth: invoke (batch)",
+			"inv", logsanitize.Field(inv.ID),
+			"item", logsanitize.Field(rec.ItemIdentifier),
+			"err", err)
+		// Per-record timeout: recCtx.Err() returns
+		// context.DeadlineExceeded when the per-record timeout
+		// fired (and NOT when only the total-batch timeout
+		// fired — the next-iteration check above catches that).
+		// Map it to a stable invoke_timeout Code so the schedd's
+		// classifyDLQReason can switch on it instead of
+		// substring-matching err.Error().
+		code := "invoke_error"
+		if errors.Is(recCtx.Err(), context.DeadlineExceeded) {
+			code = "invoke_timeout"
+		}
+		return batchDispatchResult{
+			ItemIdentifier: rec.ItemIdentifier,
+			Status:         "retry",
+			Error:          err.Error(),
+			Code:           code,
+		}
+	}
+	// Parse the function's response body for
+	// ReportBatchItemFailures. The convention is a JSON
+	// envelope: {"batchItemFailures":[{"itemIdentifier":"..."}]}
+	// — stolen verbatim from AWS Lambda.
+	failed, parseErr := parseBatchFailures(out.Result)
+	if parseErr != nil {
+		s.log.Warn("gateway synth: batch failures parse",
+			"item", logsanitize.Field(rec.ItemIdentifier),
+			"err", parseErr)
+		// Malformed function response — emit Status='retry'
+		// so the schedd's retry FSM can advance attempts and
+		// only escalate to dead_letter when the per-trigger
+		// max_attempts budget is exhausted. review finding #5:
+		// the prior code skipped straight to dead_letter on
+		// the first transient 5xx, bypassing the customer's
+		// retry budget entirely.
+		return batchDispatchResult{
+			ItemIdentifier: rec.ItemIdentifier,
+			Status:         "retry",
+			Error:          "function response malformed: " + parseErr.Error(),
+			Code:           "response_malformed",
+		}
+	}
+	// Per-record status: succeeded unless the record's id is
+	// in the failure list.
+	if containsString(failed, rec.ItemIdentifier) {
+		return batchDispatchResult{
+			ItemIdentifier: rec.ItemIdentifier,
+			Status:         "retry",
+			Error:          "reported in batchItemFailures",
+			Code:           "function_failed",
+		}
+	}
+	// If state==succeeded from the dispatcher, success.
+	// Otherwise (e.g. function returned 5xx, dispatcher
+	// captured it) it's a retry.
+	if string(out.State) == "succeeded" {
+		return batchDispatchResult{
+			ItemIdentifier: rec.ItemIdentifier,
+			Status:         "succeeded",
+		}
+	}
+	return batchDispatchResult{
+		ItemIdentifier: rec.ItemIdentifier,
+		Status:         "retry",
+		Error:          fmt.Sprintf("function state=%s", out.State),
+		Code:           "function_state_" + string(out.State),
+	}
 }
 
 // batchFailuresEnvelope is the function's response shape for

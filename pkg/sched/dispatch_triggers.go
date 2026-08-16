@@ -509,6 +509,18 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 
 // closeBatch truncates the polled slice to honour the per-trigger
 // batch_size_max + 6MB payload cap.
+//
+// Per-record semantics at the gateway (audit round 2 finding #4,
+// PR #910): the gateway's handleInvocationDispatchBatch loops
+// Invoke() once per record — the handler is single-threaded,
+// the schedd's HTTP client is held for the entire batch
+// duration, and each record pays its own wake gate + admission
+// cost. The doc-comment at pkg/gateway/synth.go:420 pins this
+// explicitly because the original wording ("one function
+// invocation serves N records", Lambda ESM) was misleading.
+// A future PR can batch-encode and short-circuit Invoke() if a
+// target VM is already RUNNING; that change is out of scope
+// here.
 func closeBatch(records []SourceRecord, sizeMax, byteCap int) []SourceRecord {
 	if sizeMax <= 0 {
 		sizeMax = len(records)
