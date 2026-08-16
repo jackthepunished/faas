@@ -117,6 +117,14 @@ tags:
       PATCH /v1/apps/{slug}/security (admin + MFA) flips the
       require_signed flag; trusted_signers CRUD manages the
       per-app cosign trusted-publisher list.
+  - name: tenant-surfaces
+    description: |
+      Tenant hostname groupings (issue #879 / ADR-100). One surface
+      holds N hostnames under one SAN bundle. Soft-deleted surfaces
+      are filtered out of list/get; the cert engine picks up
+      pending-state surfaces via pg_notify('tenant_surface_changed')
+      to mint the cert. Returns 402 when the
+      `FAAS_TENANT_SURFACES_ENABLED` flag is off.
   - name: usage
     description: Usage roll-up and metering.
   - name: billing
@@ -2663,6 +2671,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being added to.
     post:
       tags: [tenant-surfaces]
       operationId: addTenantHostname
@@ -2694,6 +2703,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being removed from.
       - name: hostname
         in: path
         required: true

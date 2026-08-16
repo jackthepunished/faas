@@ -128,6 +128,7 @@ func TestE2E_TenantSurfaces_VerticalSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
+	defer rec.Body.Close()
 	if rec.StatusCode != http.StatusOK {
 		t.Fatalf("list status = %d, want 200", rec.StatusCode)
 	}
@@ -147,6 +148,7 @@ func TestE2E_TenantSurfaces_VerticalSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
+	defer rec.Body.Close()
 	if rec.StatusCode != http.StatusOK {
 		t.Fatalf("get status = %d, want 200", rec.StatusCode)
 	}
@@ -170,6 +172,7 @@ func TestE2E_TenantSurfaces_VerticalSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add hostname: %v", err)
 	}
+	defer rec.Body.Close()
 	if rec.StatusCode != http.StatusAccepted {
 		body, _ := readAll(rec.Body)
 		t.Fatalf("add hostname status = %d, want 202; body=%s", rec.StatusCode, body)
@@ -180,6 +183,7 @@ func TestE2E_TenantSurfaces_VerticalSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add hostname 2nd: %v", err)
 	}
+	defer rec.Body.Close()
 	if rec.StatusCode != http.StatusConflict {
 		t.Errorf("duplicate add status = %d, want 409", rec.StatusCode)
 	}
@@ -213,6 +217,7 @@ func TestE2E_TenantSurfaces_VerticalSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("remove hostname: %v", err)
 	}
+	defer rec.Body.Close()
 	if rec.StatusCode != http.StatusNoContent {
 		t.Fatalf("remove status = %d, want 204", rec.StatusCode)
 	}
@@ -225,6 +230,7 @@ func TestE2E_TenantSurfaces_VerticalSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("delete surface: %v", err)
 	}
+	defer rec.Body.Close()
 	if rec.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete status = %d, want 204", rec.StatusCode)
 	}
@@ -237,6 +243,8 @@ func TestE2E_TenantSurfaces_VerticalSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-delete get: %v", err)
 	}
+	_, _ = io.Copy(io.Discard, rec.Body)
+	_ = rec.Body.Close()
 	if rec.StatusCode != http.StatusNotFound {
 		t.Errorf("post-delete get status = %d, want 404", rec.StatusCode)
 	}
