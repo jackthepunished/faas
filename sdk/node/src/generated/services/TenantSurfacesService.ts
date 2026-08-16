@@ -169,6 +169,9 @@ export class TenantSurfacesService {
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
      */
     slug: string,
+    /**
+     * The tenant surface id this hostname is being added to.
+     */
     id: string,
     requestBody: AddTenantHostnameRequest,
     /**
@@ -214,6 +217,9 @@ export class TenantSurfacesService {
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
      */
     slug: string,
+    /**
+     * The tenant surface id this hostname is being removed from.
+     */
     id: string,
     /**
      * The hostname (lowercased canonical form).
