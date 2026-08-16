@@ -1,9 +1,10 @@
 // iso.pkr.hcl — bare-metal ISO builder for the Gregale Compute Image.
 //
-// ADR-111: composes the shared scaffolding + Ubuntu 24.04 base + role
-// overlay (same as hcloud / amazon-ebs). The output is an Ubuntu 24.04
-// autoinstall ISO; PXE-booting the EX44 with this ISO installs the
-// Gregale Compute Image as the bare-metal host.
+// ADR-112: composes the shared scaffolding + Ubuntu 24.04 base (same as
+// hcloud / amazon-ebs). The output is an Ubuntu 24.04 autoinstall ISO;
+// PXE-booting the EX44 with this ISO installs the Gregale Compute Image
+// as the bare-metal host. The image is role-agnostic — first-boot
+// `gregalectl release install --role` does the role templating.
 //
 // Per-cloud specifics (this file):
 //   - source: Ubuntu 24.04 live-server ISO + autoinstall user-data
@@ -35,8 +36,8 @@ variable "ubuntu_iso_sha256" {
 
 variable "autoinstall_path" {
   type        = string
-  description = "Path on the build host's http_directory containing the autoinstall user-data (cloud-init / NoCloud equivalent)."
-  default     = "cloud-init/control-plane.yaml.tpl"
+  description = "Path on the build host's http_directory containing the autoinstall user-data (cloud-init / NoCloud equivalent). ADR-112: a single template for both roles (per-role surface lives in user-data)."
+  default     = "cloud-init/first-boot.yaml.tpl"
 }
 
 source "iso" "compute" {
@@ -54,7 +55,7 @@ source "iso" "compute" {
 
   // The ISO builder runs the install via QEMU/KVM locally. The output
   // is a fresh .iso with the autoinstall baked in — no image upload.
-  output_directory = "packer-iso-${var.role}"
+  output_directory = "packer-iso"
 
   // Default QEMU shape: 2 vCPU, 4 GB — matches the AWS t3.medium so
   // build behaviour matches cloud. The EX44 has 16 vCPU / 64 GB but
@@ -66,16 +67,16 @@ source "iso" "compute" {
 }
 
 build {
-  name    = "iso-${var.role}"
+  name    = "iso"
   sources = ["source.iso.compute"]
 
   // The iso builder runs the entire install via cloud-init user-data.
-  // PR #930's first-boot cloud-init user-data is the authoritative
+  // ADR-112's first-boot cloud-init user-data is the authoritative
   // source; this file references the SAME scripts the cloud builders
   // invoke post-install.
   provisioner "shell" {
     script = "scripts/build-base.sh"
-    environment_vars = ["FAAS_BOX_ROLE=${var.role}", "FAAS_GIT_SHA=${var.git_sha}"]
+    environment_vars = ["FAAS_GIT_SHA=${var.git_sha}"]
   }
 
   // Post-install, re-pack the install into a redistributable .iso

@@ -7,7 +7,7 @@
 // PR-3:
 //
 //   gregalectl release bundle --bin-dir PATH --git-sha SHA --manifest-hash HASH
-//   gregalectl release install --git-sha SHA [--releases-root PATH] [--node NAME]
+//   gregalectl release install --git-sha SHA [--releases-root PATH] [--node NAME] [--role ROLE]
 //
 // Dispatcher shape mirrors commands_manifest.go:
 // flag.Parse for the leaf's own flags, subcommand fan-out in
@@ -18,6 +18,14 @@
 // release_bundles row + stamps the first-write-wins applied_at.
 // The operator runs the deterministic build target out-of-band and
 // hands `gregalectl release bundle` the resulting bin directory.
+//
+// ADR-112 (role-image-collapse):
+//   --role is a NEW flag on `release install`. First-boot flow:
+//     `release install --role $FAAS_BOX_ROLE` (or the equivalent
+//     implicit read from /etc/faas/first-boot.env when --role is
+//     empty). PR-B (issue #935) extends --role to be the in-place
+//     mutation flag: `release install --role compute-only` on an
+//     already-running control-plane box transitions the subset.
 
 package main
 
@@ -28,12 +36,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
+	"github.com/onebox-faas/faas/pkg/roleTemplating"
 )
 
 // release subcommands.
@@ -241,7 +252,7 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 // table.
 func cmdReleaseInstall(args []string) int {
 	if len(args) > 0 && (args[0] == flagHelpLong || args[0] == flagHelpShort) {
-		PrintUsage(os.Stderr, "usage: gregalectl release install --git-sha SHA", "release")
+		PrintUsage(os.Stderr, "usage: gregalectl release install --git-sha SHA [--role ROLE]", "release")
 		return 0
 	}
 	fs := flag.NewFlagSet("release install", flag.ContinueOnError)
@@ -249,12 +260,36 @@ func cmdReleaseInstall(args []string) int {
 	gitSHA := fs.String("git-sha", "", "40-char lowercase hex git SHA to install (required)")
 	releasesRoot := fs.String("releases-root", "/opt/faas/releases", "releases root directory")
 	nodeName := fs.String("node", "", "compute_nodes.name to stamp (default: hostname)")
+	// ADR-112: --role is the role-templating trigger. Empty means
+	// "do nothing here" (legacy callers); when set, the binary
+	// applies roleTemplating.ApplyFilesystem(role) after the
+	// symlink flip.
+	roleFlag := fs.String("role", "", "box role: control-plane|compute-only (ADR-112). Empty = no role templating.")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *gitSHA == "" {
 		_, _ = fmt.Fprintln(os.Stderr, "gregalectl release install: --git-sha is required")
 		return 1
+	}
+	// ADR-112: if --role is empty AND /etc/faas/first-boot.env has
+	// FAAS_BOX_ROLE set (the operator-supplied sentinel from
+	// cloud-init user-data), adopt it. This makes first-boot work
+	// without passing --role explicitly on the runbook step.
+	if *roleFlag == "" {
+		if envRole, ok := readFirstBootRole(); ok {
+			*roleFlag = envRole
+		}
+	}
+	// Validate --role BEFORE any side-effects (no symlink flip if
+	// role is bogus). Per the [[gregalectl-dispatch-manifest-
+	// completeness]] lesson: stable exit codes; usage errors exit 2,
+	// runtime errors exit ≥3.
+	if *roleFlag != "" {
+		if err := roleTemplating.Validate(roleTemplating.Role(*roleFlag)); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: %v\n", err)
+			return 2
+		}
 	}
 	// Verify the bundle on disk before flipping the symlink —
 	// PR-4 doctor will do this same check; PR-3's install path
@@ -272,6 +307,34 @@ func cmdReleaseInstall(args []string) int {
 	if err := releaseinstall.AtomicFlip(*releasesRoot, *gitSHA); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: flip symlink: %v\n", err)
 		return 3
+	}
+	// ADR-112: after the symlink flip (the load-bearing step),
+	// apply role templating. The drop-ins + daemon-reload are
+	// what materially makes FAAS_BOX_ROLE take effect on the box.
+	// Failure here aborts the install with exit 4 — the symlink is
+	// flipped but the daemons aren't role-correct yet. Doctor
+	// (PR #921) will flag this; the operator re-runs with the
+	// correct --role to recover.
+	if *roleFlag != "" {
+		role := roleTemplating.Role(*roleFlag)
+		if err := roleTemplating.ApplyFilesystem(role, ""); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: apply role %s: %v\n", *roleFlag, err)
+			return 4
+		}
+		// Start the role-appropriate subset. PR-A runs Apply on a
+		// blank box (first-boot); idempotency is preserved
+		// because systemctl start on an already-active unit is
+		// a no-op.
+		daemons, _ := roleTemplating.Subset(role)
+		for _, d := range daemons {
+			cmd := exec.Command("systemctl", "start", fmt.Sprintf("faas-%s.service", d))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"gregalectl release install: start faas-%s.service: %v (%s)\n",
+					d, err, string(out))
+				return 4
+			}
+		}
 	}
 	// DB writes — best effort. The on-disk symlink flip is the
 	// load-bearing side; the DB row records the audit trail and
@@ -355,6 +418,46 @@ func openPgPoolFromEnv() (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("open pgxpool: %w", err)
 	}
 	return pool, nil
+}
+
+// readFirstBootRole parses /etc/faas/first-boot.env (the file the
+// cloud-init user-data wrote at server-create time, ADR-112) and
+// returns the FAAS_BOX_ROLE value. Returns ok=false if the file is
+// missing or FAAS_BOX_ROLE is unset.
+//
+// The sentinel `__SET_BY_OPERATOR_AT_LAUNCH__` is the explicit
+// "operator did NOT override FAAS_BOX_ROLE in user-data" marker; the
+// cloud-init first-boot runcmd's assert-first-boot-env.sh detects it
+// and fails loud BEFORE this code runs. We treat the sentinel
+// identically to "absent" (returns ok=false), so the cmdReleaseInstall
+// caller can decide what to do — typically, surface a clearer error.
+func readFirstBootRole() (string, bool) {
+	const path = "/etc/faas/first-boot.env"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "FAAS_BOX_ROLE=") {
+			continue
+		}
+		value := strings.TrimPrefix(line, "FAAS_BOX_ROLE=")
+		value = strings.Trim(value, "\"'")
+		if value == "" ||
+			value == "__SET_BY_OPERATOR_AT_LAUNCH__" ||
+			value == "control-plane" ||
+			value == "compute-only" {
+			if value == "control-plane" || value == "compute-only" {
+				return value, true
+			}
+			return "", false
+		}
+		// Unknown role value — surface to caller as if absent;
+		// cmdReleaseInstall will exit 2 with the validation error.
+		return "", false
+	}
+	return "", false
 }
 
 // releaseBundleReport is the JSON wire shape for `gregalectl release

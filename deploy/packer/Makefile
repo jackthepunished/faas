@@ -1,5 +1,10 @@
 # deploy/packer/Makefile — Packer build + validation targets for the
-# Gregale Compute Image (ADR-111).
+# Gregale Compute Image (ADR-111 + ADR-112).
+#
+# ADR-112: image identity is the 3-tuple (fc_release, kernel_version,
+# git_sha); role is first-boot metadata, NOT image content. Per-cloud
+# builds below take NO `role` variable; first-boot
+# `gregalectl release install --role` does the templating.
 #
 # Targets:
 #   make image-validate     — syntax-validate every per-cloud + shared builder
@@ -8,8 +13,14 @@
 #   make image-build-amazon-ebs — build + register AWS AMI (requires AWS creds)
 #   make image-build-iso    — build bare-metal autoinstall ISO (no creds)
 #   make image-list         — list every tagged image across clouds
-#   make image-test-first-boot IMAGE_TAG=<tag> — e2e: boot VM, assert user-data
+#   make image-test-first-boot IMAGE_TAG=<tag> ROLE=<role> — e2e: boot VM,
+#                             assert user-data, assert role templating
+#                             (PR #930 + ADR-112). The image bytes are
+#                             identical for every ROLE — same IMAGE_TAG
+#                             boots both control-plane AND compute-only.
 #   make image-test-upgrade OLD=<tag> NEW=<tag> — e2e: rolling upgrade
+#   make image-test-role-mutation — e2e: in-place role mutation (PR-B /
+#                             ADR-112 cluster second PR)
 #
 # Convention: IMAGE_TAG synthesis lives in common.pkr.hcl:local.image_tag.
 # Override `IMAGE_TAG` env var when a downstream need wants a custom tag.
@@ -91,11 +102,17 @@ image-list: ## List every tagged image across clouds (operator readout)
 # e2e tests (delegate to cmd/e2e — added in PR #930 and PR #931).
 # ---------------------------------------------------------------------------
 .PHONY: image-test-first-boot
-image-test-first-boot: ## e2e: boot image + assert first-boot user-data (PR #930)
-	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG required (e.g. gregale-compute-control-plane-fc1.7.0-kernel6.1.134-g1234567)" >&2; exit 1; }
+image-test-first-boot: ## e2e: boot image + assert first-boot user-data + role templating (PR #930 + ADR-112)
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG required (e.g. gregale-compute-fc1.7.0-kernel6.1.134-g1234567 — note: NO role segment, ADR-112)" >&2; exit 1; }
+	@test -n "$(ROLE)" || { echo "ROLE required (control-plane|compute-only) — operator supplies via cloud-init user-data, not image tag" >&2; exit 1; }
 	cd $(PKR_DIR)../.. && go test -tags=e2eimage -run TestImageFirstBoot -count=1 ./cmd/e2e/...
 
 .PHONY: image-test-upgrade
 image-test-upgrade: ## e2e: drain + signal image rollout + assert per-daemon Probe gate (PR #931)
 	@test -n "$(OLD)" -a -n "$(NEW)" || { echo "OLD and NEW tags required" >&2; exit 1; }
 	cd $(PKR_DIR)../.. && go test -tags=e2eimage -run TestImageUpgrade -count=1 ./cmd/e2e/...
+
+.PHONY: image-test-role-mutation
+image-test-role-mutation: ## e2e: in-place role mutation control-plane → compute-only → control-plane (PR-B / ADR-112 cluster)
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG required" >&2; exit 1; }
+	cd $(PKR_DIR)../.. && go test -tags=e2eimage -run TestImageRoleMutation -count=1 ./cmd/e2e/...
