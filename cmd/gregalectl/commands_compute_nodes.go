@@ -90,7 +90,7 @@ func cmdComputeNodesDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
 		return 1
 	}
-	fmt.Fprintf(os.Stdout, "drained %s\n", *node)
+	_, _ = fmt.Fprintf(os.Stdout, "drained %s\n", *node)
 	return 0
 }
 
@@ -135,10 +135,10 @@ func cmdComputeNodesDrainStatus(args []string) int {
 		}
 	}
 	if live > 0 {
-		fmt.Fprintf(os.Stdout, "instances still on %s: %d\n", *node, live)
+		_, _ = fmt.Fprintf(os.Stdout, "instances still on %s: %d\n", *node, live)
 		return 1
 	}
-	fmt.Fprintf(os.Stdout, "drain-safe: %s has 0 live instances\n", *node)
+	_, _ = fmt.Fprintf(os.Stdout, "drain-safe: %s has 0 live instances\n", *node)
 	return 0
 }
 
@@ -167,7 +167,7 @@ func cmdComputeNodesActivate(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
 		return 1
 	}
-	fmt.Fprintf(os.Stdout, "activated %s\n", *node)
+	_, _ = fmt.Fprintf(os.Stdout, "activated %s\n", *node)
 	return 0
 }
 
@@ -203,6 +203,6 @@ func cmdComputeNodesForceDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
 		return 1
 	}
-	fmt.Fprintf(os.Stdout, "force-drained %s\n", *node)
+	_, _ = fmt.Fprintf(os.Stdout, "force-drained %s\n", *node)
 	return 0
 }

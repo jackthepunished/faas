@@ -97,6 +97,21 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		// PR-911 image rollout (PR #929 mega; ADR-110 + ADR-111). Operator
+		// surfaces draining + activation of compute_nodes rows so the
+		// deployctl upgrade-node orchestrator can reason about which box
+		// is eligible for placement.
+		Name:    dispatchComputeNodes,
+		DocSlug: "compute-nodes",
+		Short:   "Compute-node state machine (compute-nodes drain|drain-status|activate|force-drain)",
+		Subcommands: []cliSub{
+			{Name: "drain", Short: "Mark the node inactive (UPDATE compute_nodes SET active=false)"},
+			{Name: "drain-status", Short: "Report whether any live instances remain on the node (exit 1 if so)"},
+			{Name: "activate", Short: "Re-mark the node active (UPDATE compute_nodes SET active=true)"},
+			{Name: "force-drain", Short: "Force-drain: --yes override for stuck nodes (operator-acknowledged)"},
+		},
+	},
+	{
 		Name:    "manifest",
 		DocSlug: "manifest",
 		Short:   "Operator split-box deployment manifest (manifest validate|render; issue #911 / ADR-110)",
