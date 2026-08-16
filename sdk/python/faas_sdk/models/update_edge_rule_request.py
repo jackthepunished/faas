@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
     from ..models.edge_rule_cors_action import EdgeRuleCORSAction
     from ..models.edge_rule_geo_action import EdgeRuleGeoAction
     from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
@@ -36,7 +37,8 @@ class UpdateEdgeRuleRequest:
     priority: int | Unset = UNSET
     enabled: bool | Unset = UNSET
     action: (
-        EdgeRuleCORSAction
+        EdgeRuleBudgetAction
+        | EdgeRuleCORSAction
         | EdgeRuleGeoAction
         | EdgeRuleHeadersAction
         | EdgeRuleIPAction
@@ -64,6 +66,7 @@ class UpdateEdgeRuleRequest:
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
+        from ..models.edge_rule_throttle_action import EdgeRuleThrottleAction
         from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
         match_host = self.match_host
@@ -103,6 +106,8 @@ class UpdateEdgeRuleRequest:
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleGeoAction):
             action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleThrottleAction):
+            action = self.action.to_dict()
         else:
             action = self.action.to_dict()
 
@@ -126,6 +131,7 @@ class UpdateEdgeRuleRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
         from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
@@ -153,7 +159,8 @@ class UpdateEdgeRuleRequest:
         def _parse_action(
             data: object,
         ) -> (
-            EdgeRuleCORSAction
+            EdgeRuleBudgetAction
+            | EdgeRuleCORSAction
             | EdgeRuleGeoAction
             | EdgeRuleHeadersAction
             | EdgeRuleIPAction
@@ -257,11 +264,19 @@ class UpdateEdgeRuleRequest:
                 return action_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_11 = EdgeRuleThrottleAction.from_dict(data)
+
+                return action_type_11
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            action_type_11 = EdgeRuleThrottleAction.from_dict(data)
+            action_type_12 = EdgeRuleBudgetAction.from_dict(data)
 
-            return action_type_11
+            return action_type_12
 
         action = _parse_action(d.pop("action", UNSET))
 

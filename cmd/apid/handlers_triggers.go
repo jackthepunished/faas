@@ -97,19 +97,20 @@ func notifyTriggerChangedJSON(op, appID, triggerID string) string {
 //     /v1/crons).
 func triggerResponse(t sqlc.Trigger) api.Trigger {
 	resp := api.Trigger{
-		ID:              uuidFromPgtype(t.ID).String(),
-		AccountID:       uuidFromPgtype(t.AccountID).String(),
-		AppID:           uuidFromPgtype(t.AppID).String(),
-		Kind:            api.TriggerKind(t.Kind),
-		Slug:            t.Slug,
-		Enabled:         t.Enabled,
-		Config:          json.RawMessage(t.Config),
-		BatchSizeMax:    int(t.BatchSizeMax),
-		BatchWindowMs:   int(t.BatchWindowMs),
-		MaxAttempts:     int(t.MaxAttempts),
-		PayloadMaxBytes: int(t.PayloadMaxBytes),
-		CreatedAt:       t.CreatedAt.Time,
-		UpdatedAt:       t.UpdatedAt.Time,
+		ID:                   uuidFromPgtype(t.ID).String(),
+		AccountID:            uuidFromPgtype(t.AccountID).String(),
+		AppID:                uuidFromPgtype(t.AppID).String(),
+		Kind:                 api.TriggerKind(t.Kind),
+		Slug:                 t.Slug,
+		Enabled:              t.Enabled,
+		Config:               json.RawMessage(t.Config),
+		BatchSizeMax:         int(t.BatchSizeMax),
+		BatchWindowMs:        int(t.BatchWindowMs),
+		MaxAttempts:          int(t.MaxAttempts),
+		PayloadMaxBytes:      int(t.PayloadMaxBytes),
+		BrokerPoisonStrategy: t.BrokerPoisonStrategy,
+		CreatedAt:            t.CreatedAt.Time,
+		UpdatedAt:            t.UpdatedAt.Time,
 	}
 	if t.CronID.Valid {
 		resp.CronID = uuidFromPgtype(t.CronID).String()
@@ -269,6 +270,16 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "payload_max_bytes", limits.TriggerPayloadMaxBytes, int(payloadMaxBytes)))
 		return
 	}
+	// Audit #10 (migration 00275): kafka-only broker-poison
+	// handling strategy. nil → "commit" default (the previous
+	// hardcoded behaviour; broker offset advances on poison).
+	// The apid handler does not gate this on kind yet — non-kafka
+	// kinds ignore the field; the SQL CHECK rejects malformed
+	// values; the kafka poller is the only consumer.
+	brokerPoisonStrategy := api.BrokerPoisonStrategyCommit
+	if req.BrokerPoisonStrategy != nil && *req.BrokerPoisonStrategy != "" {
+		brokerPoisonStrategy = *req.BrokerPoisonStrategy
+	}
 	// (cron-kind POSTs are rejected earlier in the handler — the
 	// ADR-090 PR-B path. The review finding #6 fix shifts the
 	// rejection above the AppByID roundtrip so a kind=cron POST
@@ -277,7 +288,8 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	t, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
 		app.ID,
 		string(req.Kind), req.Slug, enabled, []byte(req.Config),
-		batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, limits)
+		batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes,
+		brokerPoisonStrategy, limits)
 	if err != nil {
 		var qe *state.TriggerQuotaError
 		switch {
@@ -429,6 +441,17 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		v := int32(*req.PayloadMaxBytes)
 		payloadMaxBytes = &v
 	}
+	// Audit #10 (migration 00275): the apid handler passes the
+	// pointer straight through; nil = "leave unchanged" via the
+	// SQL coalesce() in the pgstore UpdateTrigger path. Empty
+	// string would be coerced to "commit" but is rejected at the
+	// JSON decoder level (omitempty drops it before reaching
+	// here).
+	var brokerPoisonStrategy *string
+	if req.BrokerPoisonStrategy != nil && *req.BrokerPoisonStrategy != "" {
+		bps := *req.BrokerPoisonStrategy
+		brokerPoisonStrategy = &bps
+	}
 	var configBytes []byte
 	if req.Config != nil {
 		configBytes = []byte(req.Config)
@@ -452,13 +475,13 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 			return
 		}
 		// Update the non-cron fields on the triggers row.
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
 		}
 	} else {
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
@@ -551,7 +574,7 @@ func (s *server) setTriggerEnabled(w http.ResponseWriter, r *http.Request, acct 
 		s.notFound(w, "no such trigger")
 		return
 	}
-	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil, nil)
+	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 		return
@@ -779,6 +802,16 @@ func (s *server) batchCreateTrigger(w http.ResponseWriter, r *http.Request, acct
 		if t.PayloadMaxBytes > 0 {
 			pmb = int32(t.PayloadMaxBytes)
 		}
+		// Audit #10 (migration 00275): kafka-only broker-poison
+		// handling strategy. The YAML validator at
+		// pkg/gregalemanifest/manifest.go:Validate rejects
+		// anything outside the closed vocab; an empty string
+		// falls through to "commit" (the previous hardcoded
+		// behaviour).
+		bps := api.BrokerPoisonStrategyCommit
+		if t.BrokerPoisonStrategy != "" {
+			bps = t.BrokerPoisonStrategy
+		}
 		if limits.TriggerBatchSizeMax > 0 && bsm > int32(limits.TriggerBatchSizeMax) {
 			errs = append(errs, batchError{Slug: t.Slug, Message: "batch_size_max exceeds plan cap"})
 			continue
@@ -794,7 +827,7 @@ func (s *server) batchCreateTrigger(w http.ResponseWriter, r *http.Request, acct
 		created, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
 			req.AppID,
 			string(t.Kind), t.Slug, t.IsEnabled(), marshalConfig(t.Config),
-			bsm, bwm, ma, pmb, limits)
+			bsm, bwm, ma, pmb, bps, limits)
 		if err != nil {
 			var qe *state.TriggerQuotaError
 			switch {

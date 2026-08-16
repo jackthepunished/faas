@@ -120,6 +120,17 @@ type Trigger struct {
 	// are DLQ'd with reason='payload_too_large' at insert
 	// time rather than silently truncated.
 	PayloadMaxBytes int `yaml:"payload_max_bytes,omitempty"`
+	// BrokerPoisonStrategy (migration 00275) controls how the
+	// kafka poller reconciles its broker offset with a
+	// dead-lettered record. Closed vocab: "commit" (default —
+	// broker offset advances; same as no field) and
+	// "seek-to-offset" (the kafka poller calls SetOffset so the
+	// next Poll re-fetches the same message). Empty string
+	// means "use the plan default"; per-kind validator at
+	// Validate() rejects anything outside the closed vocabulary
+	// so a YAML typo surfaces at load time rather than at
+	// poison-record dispatch time.
+	BrokerPoisonStrategy string `yaml:"broker_poison_strategy,omitempty"`
 	// Config is the per-kind JSON object. Validated strictly per
 	// kind in Validate(). Absent Config defaults to `{}` so a
 	// bare trigger entry validates against the per-kind zero-value
@@ -343,6 +354,16 @@ func (m *Manifest) Validate() error {
 			// than letting the row insert fail at the DB layer.
 			if t.PayloadMaxBytes != 0 && (t.PayloadMaxBytes < 1024 || t.PayloadMaxBytes > 67108864) {
 				return fmt.Errorf("trigger[%d]: payload_max_bytes=%d out of range [1024, 67108864]", i, t.PayloadMaxBytes)
+			}
+			// broker_poison_strategy (migration 00275) mirrors the
+			// SQL CHECK closed vocab. Empty string is treated as
+			// the absent/zero case and falls through to the DB
+			// default 'commit'; anything else must match the
+			// closed vocabulary exactly so a YAML typo surfaces at
+			// load time rather than at poison-record dispatch
+			// time.
+			if t.BrokerPoisonStrategy != "" && t.BrokerPoisonStrategy != "commit" && t.BrokerPoisonStrategy != "seek-to-offset" {
+				return fmt.Errorf("trigger[%d]: broker_poison_strategy=%q invalid; must be one of commit, seek-to-offset", i, t.BrokerPoisonStrategy)
 			}
 		}
 		k := triggerKey{app: t.App, kind: t.Kind, schedule: t.Schedule, path: t.Path, slug: t.Slug}

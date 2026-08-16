@@ -45,6 +45,22 @@ export type Trigger = {
    *
    */
   payload_max_bytes: number;
+  /**
+   * Kafka-only poison-record handling strategy (migration 00275,
+   * audit #10). "commit" (default) advances the broker offset
+   * via CommitMessages when the dispatcher dead-letters a
+   * record — the broker offset and the DB dead-letter state
+   * are permanently out of sync for that offset; operator
+   * retry works via the dashboard's "re-drive from DLQ"
+   * action which mints a fresh trigger_records row from the
+   * same item_id. "seek-to-offset" calls SetOffset(msg.Offset)
+   * instead so the next Poll re-fetches the same message —
+   * operator retry combines a trigger re-enable with a
+   * dashboard "reset offset" action that re-fetches the
+   * dead-lettered payload. No effect on non-kafka kinds.
+   *
+   */
+  broker_poison_strategy: 'commit' | 'seek-to-offset';
   schedule?: string | null;
   path?: string | null;
   cron_id?: string | null;

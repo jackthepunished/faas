@@ -10,6 +10,7 @@ from attrs import field as _attrs_field
 from ..models.edge_rule_response_kind import EdgeRuleResponseKind, check_edge_rule_response_kind
 
 if TYPE_CHECKING:
+    from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
     from ..models.edge_rule_cors_action import EdgeRuleCORSAction
     from ..models.edge_rule_geo_action import EdgeRuleGeoAction
     from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
@@ -46,7 +47,8 @@ class EdgeRuleResponse:
     """Empty array = match any method."""
     kind: EdgeRuleResponseKind
     action: (
-        EdgeRuleCORSAction
+        EdgeRuleBudgetAction
+        | EdgeRuleCORSAction
         | EdgeRuleGeoAction
         | EdgeRuleHeadersAction
         | EdgeRuleIPAction
@@ -77,6 +79,7 @@ class EdgeRuleResponse:
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
+        from ..models.edge_rule_throttle_action import EdgeRuleThrottleAction
         from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
         id = self.id
@@ -120,6 +123,8 @@ class EdgeRuleResponse:
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleGeoAction):
             action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleThrottleAction):
+            action = self.action.to_dict()
         else:
             action = self.action.to_dict()
 
@@ -150,6 +155,7 @@ class EdgeRuleResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
         from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
@@ -185,7 +191,8 @@ class EdgeRuleResponse:
         def _parse_action(
             data: object,
         ) -> (
-            EdgeRuleCORSAction
+            EdgeRuleBudgetAction
+            | EdgeRuleCORSAction
             | EdgeRuleGeoAction
             | EdgeRuleHeadersAction
             | EdgeRuleIPAction
@@ -286,11 +293,19 @@ class EdgeRuleResponse:
                 return action_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_11 = EdgeRuleThrottleAction.from_dict(data)
+
+                return action_type_11
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            action_type_11 = EdgeRuleThrottleAction.from_dict(data)
+            action_type_12 = EdgeRuleBudgetAction.from_dict(data)
 
-            return action_type_11
+            return action_type_12
 
         action = _parse_action(d.pop("action"))
 

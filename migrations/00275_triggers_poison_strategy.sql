@@ -1,0 +1,66 @@
+-- filename: 00275_triggers_poison_strategy.sql
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00275_triggers_poison_strategy.sql — operator-controlled Kafka
+-- poison-record handling (audit #10 from PR #910).
+--
+-- Before: when the dispatcher dead-lettered a record with
+-- reason='poison_record', the kafka poller (pkg/sched/poller_kafka.go)
+-- advanced the broker offset via CommitMessages AND the DB row in
+-- trigger_records transitioned to state='dead_letter'. The two
+-- sides never re-aligned: an operator retry from the dashboard
+-- could mint a new trigger_records row, but the original offset
+-- had already been committed, so the broker would never re-deliver
+-- the same payload. A misclassified poison could not be retried
+-- even by hand.
+--
+-- After: each trigger carries an explicit broker_poison_strategy
+-- column with the closed vocabulary:
+--
+--   'commit'           — commit the broker offset (current default
+--                         behaviour; the DB row is dead-lettered and
+--                         the broker is asked to move past the
+--                         message). Operators retry by re-driving
+--                         from the dashboard, which mints a fresh
+--                         trigger_records row from the same item_id
+--                         (or replaying from the customer's DLQ).
+--   'seek-to-offset'   — rewind the broker to msg.Offset via
+--                         SetOffset; the next Poll re-fetches the
+--                         same message. The DB row is still
+--                         dead-lettered. Operators retry by
+--                         flipping the trigger back to enabled AND
+--                         resetting the broker offset (the
+--                         dashboard surfaces a "replay poison"
+--                         action that combines both).
+--
+-- Default 'commit' preserves every existing trigger's behaviour.
+-- The new strategy is opt-in per trigger; the manifest renderer
+-- and the apid HTTP surface both surface it as a literal string
+-- field (no Go enum dependency on pkg/state — pkg/api cannot
+-- import pkg/state per pkg-api-cannot-import-pkg-state).
+--
+-- Replay-safety (per migrations/replay_safety_test.go + the
+-- established ADD COLUMN IF NOT EXISTS pattern from
+-- 00274_triggers_payload_max.sql + 00053_deployments_source_url):
+--
+--   - ADD COLUMN IF NOT EXISTS guards the apply path so a drifted
+--     box (relation present, goose row missing) re-applies cleanly
+--     without tripping SQLSTATE 42701 ("column already exists").
+--   - DEFAULT 'commit' on existing rows preserves the previous
+--     behaviour byte-for-byte.
+--   - The CHECK constraint is added in the same ALTER; on a
+--     fresh DB the column lands with both the default + the check,
+--     on a drifted DB the ALTER adds the column with the default
+--     and the check simultaneously (no two-step dance, no
+--     window where unconstrained rows could land).
+ALTER TABLE triggers
+    ADD COLUMN IF NOT EXISTS broker_poison_strategy TEXT NOT NULL DEFAULT 'commit'
+        CHECK (broker_poison_strategy IN ('commit','seek-to-offset'));
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+ALTER TABLE triggers DROP COLUMN IF EXISTS broker_poison_strategy;
+-- +goose StatementEnd

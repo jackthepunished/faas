@@ -16,6 +16,14 @@ export type UpdateTriggerRequest = {
   batch_window_ms?: number | null;
   max_attempts?: number | null;
   payload_max_bytes?: number | null;
+  /**
+   * Kafka-only poison-record handling strategy. null/omitted
+   * means "leave unchanged" (the SQL coalesce() in
+   * pkg/state/pgstore.go::UpdateTrigger keeps the existing
+   * value). Same semantics as the Trigger read shape.
+   *
+   */
+  broker_poison_strategy?: 'commit' | 'seek-to-offset';
   schedule?: string | null;
   path?: string | null;
 };

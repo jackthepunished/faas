@@ -40,6 +40,22 @@ import (
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
+// kafkaBrokerOp is the minimal broker-side surface the poller's
+// Ack/Nack methods need. Defined as an interface so unit tests
+// can drive the poison-record branch without a real
+// segmentio/kafka-go Reader — the test injects a stub that
+// records CommitMessages vs SetOffset and the test asserts on
+// the recorded calls.
+//
+// Production wires the concrete *kafka.Reader (which satisfies
+// every method below) in newKafkaPoller.
+type kafkaBrokerOp interface {
+	FetchMessage(ctx context.Context) (kafka.Message, error)
+	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
+	SetOffset(offset int64) error
+	Close() error
+}
+
 // kafkaPoller wraps a segmentio/kafka-go Reader. One per
 // kind=kafka trigger.
 //
@@ -47,7 +63,7 @@ import (
 // Ack/Nack can find them — segmentio/kafka-go's CommitMessages
 // takes Message values, not offsets.
 type kafkaPoller struct {
-	reader   *kafka.Reader
+	reader   kafkaBrokerOp
 	brokers  []string
 	topic    string
 	groupID  string
@@ -233,10 +249,25 @@ func (k *kafkaPoller) Ack(commitCtx context.Context, _ sqlc.Trigger, ids []strin
 // rewind to msg.Offset — next FetchMessage will redeliver.
 //
 // poison_record is different: we don't want infinite redelivery
-// for a poison pill. We commit the message so the offset
-// advances, but the dispatch tick has already minted a
-// dead_letter row (commit #15 audit + DLQ table).
-func (k *kafkaPoller) Nack(commitCtx context.Context, _ sqlc.Trigger, ids []string, reason string) error {
+// for a poison pill. The dispatch tick has already minted a
+// dead_letter row (commit #15 audit + DLQ table); what the
+// broker side does depends on the trigger's broker_poison_strategy
+// (audit #10, migration 00275):
+//
+//   - "commit" (default) — call CommitMessages so the broker
+//     offset advances. The broker offset and the DB
+//     dead-letter state are permanently out of sync for that
+//     offset; operator retry works via the dashboard's
+//     "re-drive from DLQ" action.
+//   - "seek-to-offset" — call SetOffset(msg.Offset) so the next
+//     FetchMessage re-fetches the same message. Operator retry
+//     combines a trigger re-enable with a dashboard "reset
+//     offset" action that re-fetches the dead-lettered payload.
+//
+// Non-poison failures always rewind via SetOffset regardless of
+// broker_poison_strategy — the strategy only governs the
+// poison-specific terminal behaviour.
+func (k *kafkaPoller) Nack(commitCtx context.Context, t sqlc.Trigger, ids []string, reason string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	var firstErr error
@@ -247,10 +278,29 @@ func (k *kafkaPoller) Nack(commitCtx context.Context, _ sqlc.Trigger, ids []stri
 		}
 		var err error
 		if reason == triggerReasonPoisonRecord {
-			// Commit so the offset advances. The dispatch tick
-			// has already recorded this as dead_letter so
-			// redelivery is not desired.
-			err = k.reader.CommitMessages(commitCtx, msg)
+			// Audit #10: the strategy column gates the
+			// poison-specific terminal broker op. The empty
+			// default ("") is treated as "commit" — matches the
+			// pre-migration behaviour byte-for-byte.
+			strategy := t.BrokerPoisonStrategy
+			if strategy == "" {
+				strategy = "commit"
+			}
+			switch strategy {
+			case "seek-to-offset":
+				// Rewind the broker to the failed offset so the
+				// next FetchMessage re-fetches it. SetOffset
+				// advances the reader's local position; no
+				// commit-side bookkeeping is touched.
+				err = k.reader.SetOffset(msg.Offset)
+			default:
+				// "commit" or any unknown value — fall
+				// through to the previous CommitMessages
+				// path. An unknown value is rejected by the
+				// SQL CHECK on insert, so by the time we see
+				// it here it's a deliberate "commit".
+				err = k.reader.CommitMessages(commitCtx, msg)
+			}
 		} else {
 			// Rewind to the failed offset. segmentio/kafka-go's
 			// Reader tracks its own offset; SetOffset rewinds.

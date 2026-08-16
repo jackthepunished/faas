@@ -15661,7 +15661,7 @@ func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff t
 // or already deleted. The cron kind routes through the existing
 // CreateCronIfUnderQuota path because cron needs the crons row + the
 // schedule+path cron-specific schema.
-func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes int32, limits api.Limits) (sqlc.Trigger, error) {
+func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes int32, brokerPoisonStrategy string, limits api.Limits) (sqlc.Trigger, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return sqlc.Trigger{}, fmt.Errorf("state: begin tx: %w", err)
@@ -15730,22 +15730,33 @@ func (s *PgStore) CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, sl
 	//    00274) defaults to 6291456 (6 MiB) at the DB layer; we
 	//    surface it as a parameter so the apid handler can
 	//    override per-trigger without a follow-up migration.
+	//    broker_poison_strategy (migration 00275) carries the
+	//    audit-#10 poison-record handling flag; "" → DB default
+	//    'commit' so callers that don't yet know about the
+	//    strategy land the previous behaviour byte-for-byte.
+	bps := brokerPoisonStrategy
+	if bps == "" {
+		bps = "commit"
+	}
 	row := tx.QueryRow(ctx,
 		`insert into triggers (account_id, app_id, kind, slug, enabled, config,
 		                       batch_size_max, batch_window_ms, max_attempts,
-		                       cron_id, source, payload_max_bytes)
-		 values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
+		                       cron_id, source, payload_max_bytes,
+		                       broker_poison_strategy)
+		 values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
 		 returning id, account_id, app_id, kind, slug, enabled, config,
 		           batch_size_max, batch_window_ms, max_attempts,
-		           cron_id, source, payload_max_bytes, created_at, updated_at`,
+		           cron_id, source, payload_max_bytes, broker_poison_strategy,
+		           created_at, updated_at`,
 		accountID, appID, kind, slug, enabled, config,
 		batchSizeMax, batchWindowMs, maxAttempts,
-		pgtype.UUID{}, pgtype.Text{}, payloadMaxBytes)
+		pgtype.UUID{}, pgtype.Text{}, payloadMaxBytes, bps)
 	t := sqlc.Trigger{}
 	if err := row.Scan(
 		&t.ID, &t.AccountID, &t.AppID, &t.Kind, &t.Slug, &t.Enabled,
 		&t.Config, &t.BatchSizeMax, &t.BatchWindowMs, &t.MaxAttempts,
-		&t.CronID, &t.Source, &t.PayloadMaxBytes, &t.CreatedAt, &t.UpdatedAt,
+		&t.CronID, &t.Source, &t.PayloadMaxBytes, &t.BrokerPoisonStrategy,
+		&t.CreatedAt, &t.UpdatedAt,
 	); err != nil {
 		return sqlc.Trigger{}, mapErr(err)
 	}
@@ -15778,8 +15789,8 @@ func (s *PgStore) TriggerByID(ctx context.Context, id string) (sqlc.Trigger, err
 // safety — net-positive because the alternative would force the
 // handler to send "current values" for unset fields and break the
 // JSON `omitempty` round-trip.
-func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32) (sqlc.Trigger, error) {
-	var enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg any
+func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string) (sqlc.Trigger, error) {
+	var enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg any
 	if enabled != nil {
 		enabledArg = *enabled
 	}
@@ -15798,6 +15809,9 @@ func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, c
 	if payloadMaxBytes != nil {
 		payloadMaxArg = *payloadMaxBytes
 	}
+	if brokerPoisonStrategy != nil {
+		brokerPoisonArg = *brokerPoisonStrategy
+	}
 	row := s.pool.QueryRow(ctx,
 		`update triggers set
 		   enabled = coalesce($2, enabled),
@@ -15805,17 +15819,20 @@ func (s *PgStore) UpdateTrigger(ctx context.Context, id string, enabled *bool, c
 		   batch_size_max = coalesce($4, batch_size_max),
 		   batch_window_ms = coalesce($5, batch_window_ms),
 		   max_attempts = coalesce($6, max_attempts),
-		   payload_max_bytes = coalesce($7, payload_max_bytes)
+		   payload_max_bytes = coalesce($7, payload_max_bytes),
+		   broker_poison_strategy = coalesce($8, broker_poison_strategy)
 		 where id = $1
 		 returning id, account_id, app_id, kind, slug, enabled, config,
 		           batch_size_max, batch_window_ms, max_attempts,
-		           cron_id, source, payload_max_bytes, created_at, updated_at`,
-		id, enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg)
+		           cron_id, source, payload_max_bytes, broker_poison_strategy,
+		           created_at, updated_at`,
+		id, enabledArg, configArg, batchSizeArg, batchWindowArg, maxAttemptsArg, payloadMaxArg, brokerPoisonArg)
 	t := sqlc.Trigger{}
 	if err := row.Scan(
 		&t.ID, &t.AccountID, &t.AppID, &t.Kind, &t.Slug, &t.Enabled,
 		&t.Config, &t.BatchSizeMax, &t.BatchWindowMs, &t.MaxAttempts,
-		&t.CronID, &t.Source, &t.PayloadMaxBytes, &t.CreatedAt, &t.UpdatedAt,
+		&t.CronID, &t.Source, &t.PayloadMaxBytes, &t.BrokerPoisonStrategy,
+		&t.CreatedAt, &t.UpdatedAt,
 	); err != nil {
 		return sqlc.Trigger{}, mapErr(err)
 	}

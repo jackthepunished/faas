@@ -30,6 +30,13 @@ from .api_key_response_status import APIKeyResponseStatus
 from .app_env_list_response import AppEnvListResponse
 from .app_env_list_response_env_by_scope import AppEnvListResponseEnvByScope
 from .app_env_response import AppEnvResponse
+from .app_error_request_item import AppErrorRequestItem
+from .app_error_requests_response import AppErrorRequestsResponse
+from .app_error_sample_response import AppErrorSampleResponse
+from .app_error_sample_response_headers_sample import AppErrorSampleResponseHeadersSample
+from .app_error_summary_item import AppErrorSummaryItem
+from .app_error_summary_item_error_class import AppErrorSummaryItemErrorClass
+from .app_errors_summary_response import AppErrorsSummaryResponse
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
 from .app_manifest_env_secrets import AppManifestEnvSecrets
@@ -50,6 +57,9 @@ from .app_security_request import AppSecurityRequest
 from .app_security_response import AppSecurityResponse
 from .app_slo_response import AppSLOResponse
 from .app_slo_response_window import AppSLOResponseWindow
+from .app_streaming_status import AppStreamingStatus
+from .app_streaming_status_cap_kind import AppStreamingStatusCapKind
+from .app_streaming_status_status import AppStreamingStatusStatus
 from .app_trusted_signer_list_response import AppTrustedSignerListResponse
 from .app_webhook_delivery_list_response import AppWebhookDeliveryListResponse
 from .app_webhook_delivery_response import AppWebhookDeliveryResponse
@@ -123,6 +133,18 @@ from .create_key_request_scopes_item import CreateKeyRequestScopesItem
 from .create_org_api_key_request import CreateOrgAPIKeyRequest
 from .create_org_api_key_request_scopes_item import CreateOrgAPIKeyRequestScopesItem
 from .create_org_request import CreateOrgRequest
+from .create_trigger_batch_request import CreateTriggerBatchRequest
+from .create_trigger_batch_response import CreateTriggerBatchResponse
+from .create_trigger_batch_response_created_item import CreateTriggerBatchResponseCreatedItem
+from .create_trigger_request import CreateTriggerRequest
+from .create_trigger_request_broker_poison_strategy_type_1 import CreateTriggerRequestBrokerPoisonStrategyType1
+from .create_trigger_request_broker_poison_strategy_type_2_type_1 import (
+    CreateTriggerRequestBrokerPoisonStrategyType2Type1,
+)
+from .create_trigger_request_broker_poison_strategy_type_3_type_1 import (
+    CreateTriggerRequestBrokerPoisonStrategyType3Type1,
+)
+from .create_trigger_request_config import CreateTriggerRequestConfig
 from .cron_response import CronResponse
 from .cron_run import CronRun
 from .cron_run_outcome import CronRunOutcome
@@ -155,6 +177,12 @@ from .diff_request import DiffRequest
 from .diff_request_env_by_scope import DiffRequestEnvByScope
 from .diff_response import DiffResponse
 from .diff_response_plan import DiffResponsePlan
+from .dispatch_invocation_batch_body import DispatchInvocationBatchBody
+from .dispatch_invocation_batch_body_records_item import DispatchInvocationBatchBodyRecordsItem
+from .dispatch_invocation_batch_body_records_item_headers import DispatchInvocationBatchBodyRecordsItemHeaders
+from .dispatch_invocation_batch_body_records_item_metadata import DispatchInvocationBatchBodyRecordsItemMetadata
+from .dispatch_invocation_batch_response_200 import DispatchInvocationBatchResponse200
+from .edge_rule_budget_action import EdgeRuleBudgetAction
 from .edge_rule_cors_action import EdgeRuleCORSAction
 from .edge_rule_geo_action import EdgeRuleGeoAction
 from .edge_rule_header_op import EdgeRuleHeaderOp
@@ -225,6 +253,8 @@ from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
 from .list_org_api_keys_response import ListOrgAPIKeysResponse
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
+from .list_trigger_dead_letter_response import ListTriggerDeadLetterResponse
+from .list_trigger_records_response import ListTriggerRecordsResponse
 from .magic_link_signup_request import MagicLinkSignupRequest
 from .member_list_response import MemberListResponse
 from .mfa_confirm_request import MFAConfirmRequest
@@ -322,6 +352,9 @@ from .scan_result_status import ScanResultStatus
 from .scoped_app_env_response import ScopedAppEnvResponse
 from .seat_usage_response import SeatUsageResponse
 from .seat_usage_response_plan import SeatUsageResponsePlan
+from .secret_finding import SecretFinding
+from .secret_finding_severity import SecretFindingSeverity
+from .secret_scan_result import SecretScanResult
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -348,6 +381,20 @@ from .trace_span import TraceSpan
 from .trace_span_attributes import TraceSpanAttributes
 from .trace_span_status import TraceSpanStatus
 from .transfer_ownership_request import TransferOwnershipRequest
+from .trigger import Trigger
+from .trigger_broker_poison_strategy import TriggerBrokerPoisonStrategy
+from .trigger_config import TriggerConfig
+from .trigger_dead_letter import TriggerDeadLetter
+from .trigger_dead_letter_detail import TriggerDeadLetterDetail
+from .trigger_dead_letter_reason import TriggerDeadLetterReason
+from .trigger_kind import TriggerKind
+from .trigger_metrics_response import TriggerMetricsResponse
+from .trigger_record import TriggerRecord
+from .trigger_record_state import TriggerRecordState
+from .trigger_routed_to import TriggerRoutedTo
+from .trigger_source_type_1 import TriggerSourceType1
+from .trigger_source_type_2_type_1 import TriggerSourceType2Type1
+from .trigger_source_type_3_type_1 import TriggerSourceType3Type1
 from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
 from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparison
@@ -365,6 +412,15 @@ from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBo
 from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
+from .update_trigger_request import UpdateTriggerRequest
+from .update_trigger_request_broker_poison_strategy_type_1 import UpdateTriggerRequestBrokerPoisonStrategyType1
+from .update_trigger_request_broker_poison_strategy_type_2_type_1 import (
+    UpdateTriggerRequestBrokerPoisonStrategyType2Type1,
+)
+from .update_trigger_request_broker_poison_strategy_type_3_type_1 import (
+    UpdateTriggerRequestBrokerPoisonStrategyType3Type1,
+)
+from .update_trigger_request_config_type_0 import UpdateTriggerRequestConfigType0
 from .usage_export_response import UsageExportResponse
 from .usage_response import UsageResponse
 from .usage_summary_response import UsageSummaryResponse
@@ -405,6 +461,13 @@ __all__ = (
     "AppEnvListResponse",
     "AppEnvListResponseEnvByScope",
     "AppEnvResponse",
+    "AppErrorRequestItem",
+    "AppErrorRequestsResponse",
+    "AppErrorSampleResponse",
+    "AppErrorSampleResponseHeadersSample",
+    "AppErrorsSummaryResponse",
+    "AppErrorSummaryItem",
+    "AppErrorSummaryItemErrorClass",
     "AppliedBuild",
     "ApplyResponse",
     "ApplyResponseAppsItem",
@@ -431,6 +494,9 @@ __all__ = (
     "AppsMetricsResponse",
     "AppsMetricsResponseAppsType0",
     "AppsMetricsResponseRange",
+    "AppStreamingStatus",
+    "AppStreamingStatusCapKind",
+    "AppStreamingStatusStatus",
     "AppTrustedSignerListResponse",
     "AppWebhookDeliveryListResponse",
     "AppWebhookDeliveryResponse",
@@ -498,6 +564,14 @@ __all__ = (
     "CreateOrgAPIKeyRequest",
     "CreateOrgAPIKeyRequestScopesItem",
     "CreateOrgRequest",
+    "CreateTriggerBatchRequest",
+    "CreateTriggerBatchResponse",
+    "CreateTriggerBatchResponseCreatedItem",
+    "CreateTriggerRequest",
+    "CreateTriggerRequestBrokerPoisonStrategyType1",
+    "CreateTriggerRequestBrokerPoisonStrategyType2Type1",
+    "CreateTriggerRequestBrokerPoisonStrategyType3Type1",
+    "CreateTriggerRequestConfig",
     "CronResponse",
     "CronRun",
     "CronRunOutcome",
@@ -530,6 +604,12 @@ __all__ = (
     "DiffRequestEnvByScope",
     "DiffResponse",
     "DiffResponsePlan",
+    "DispatchInvocationBatchBody",
+    "DispatchInvocationBatchBodyRecordsItem",
+    "DispatchInvocationBatchBodyRecordsItemHeaders",
+    "DispatchInvocationBatchBodyRecordsItemMetadata",
+    "DispatchInvocationBatchResponse200",
+    "EdgeRuleBudgetAction",
     "EdgeRuleCORSAction",
     "EdgeRuleGeoAction",
     "EdgeRuleHeaderOp",
@@ -600,6 +680,8 @@ __all__ = (
     "ListInvocationsResponse",
     "ListOrgAPIKeysResponse",
     "ListSecretsForAccountResponse",
+    "ListTriggerDeadLetterResponse",
+    "ListTriggerRecordsResponse",
     "MagicLinkSignupRequest",
     "MemberListResponse",
     "MFAConfirmRequest",
@@ -695,6 +777,9 @@ __all__ = (
     "ScopedAppEnvResponse",
     "SeatUsageResponse",
     "SeatUsageResponsePlan",
+    "SecretFinding",
+    "SecretFindingSeverity",
+    "SecretScanResult",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",
@@ -721,6 +806,20 @@ __all__ = (
     "TraceSpanAttributes",
     "TraceSpanStatus",
     "TransferOwnershipRequest",
+    "Trigger",
+    "TriggerBrokerPoisonStrategy",
+    "TriggerConfig",
+    "TriggerDeadLetter",
+    "TriggerDeadLetterDetail",
+    "TriggerDeadLetterReason",
+    "TriggerKind",
+    "TriggerMetricsResponse",
+    "TriggerRecord",
+    "TriggerRecordState",
+    "TriggerRoutedTo",
+    "TriggerSourceType1",
+    "TriggerSourceType2Type1",
+    "TriggerSourceType3Type1",
     "TrustedSigner",
     "UpdateAlertRuleRequest",
     "UpdateAlertRuleRequestComparison",
@@ -738,6 +837,11 @@ __all__ = (
     "UpdateDeploymentRequest",
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",
+    "UpdateTriggerRequest",
+    "UpdateTriggerRequestBrokerPoisonStrategyType1",
+    "UpdateTriggerRequestBrokerPoisonStrategyType2Type1",
+    "UpdateTriggerRequestBrokerPoisonStrategyType3Type1",
+    "UpdateTriggerRequestConfigType0",
     "UsageExportResponse",
     "UsageResponse",
     "UsageSummaryResponse",

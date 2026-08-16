@@ -68,6 +68,32 @@ const (
 	TriggerKindQueue        TriggerKind = "queue"
 )
 
+// BrokerPoisonStrategy is the closed-vocabulary carrier for the
+// audit #10 column added in migration 00275_triggers_poison_strategy.sql.
+// Pinned by the SQL CHECK on triggers.broker_poison_strategy.
+//
+// Literal-string constants (NOT a Go enum) because pkg/api cannot
+// import pkg/state (per pkg-api-cannot-import-pkg-state). The
+// string values are the exact SQL CHECK membership tokens, so
+// passing one straight through to a sqlc parameter round-trips
+// without a translation hop.
+const (
+	// BrokerPoisonStrategyCommit (default) — the dispatcher
+	// dead-letters the record AND the kafka poller commits the
+	// broker offset. The two sides are permanently out of sync
+	// for that offset; operator retry works via the dashboard's
+	// "re-drive from DLQ" action which mints a fresh
+	// trigger_records row from the same item_id.
+	BrokerPoisonStrategyCommit = "commit"
+	// BrokerPoisonStrategySeekToOffset — the dispatcher
+	// dead-letters the record AND the kafka poller rewinds the
+	// consumer-group offset via SetOffset. The next Poll
+	// re-fetches the same message; operator retry combines a
+	// trigger re-enable with a dashboard "reset offset" action
+	// that re-fetches the dead-lettered payload.
+	BrokerPoisonStrategySeekToOffset = "seek-to-offset"
+)
+
 // Trigger is the wire shape returned by GET/POST/PATCH on
 // /v1/triggers. Mirrors the triggers table (commits #2/#3). The
 // Config blob is opaque at the wire level — every kind's
@@ -92,6 +118,17 @@ type Trigger struct {
 	// silently truncated. Default 6291456 (6 MiB); the SQL CHECK
 	// admits [1024, 67108864].
 	PayloadMaxBytes int `json:"payload_max_bytes"`
+
+	// BrokerPoisonStrategy (migration 00275) controls how the
+	// kafka poller reconciles its broker offset with a
+	// dead-lettered record. Default "commit" preserves the
+	// previous behaviour (broker offset advances; DB marks
+	// dead_letter). "seek-to-offset" rewinds the consumer-group
+	// offset via SetOffset so the next Poll re-fetches the same
+	// message — operator retry then re-drives from the
+	// dashboard's "replay poison" action. Closed vocab pinned by
+	// the SQL CHECK.
+	BrokerPoisonStrategy string `json:"broker_poison_strategy"`
 
 	// Cron-only: kind=cron rows mirror a crons row via cron_id.
 	// Mutually exclusive with the non-cron fields below (enforced
@@ -134,6 +171,12 @@ type CreateTriggerRequest struct {
 	// nil → default 6291456 (6 MiB); the SQL CHECK rejects values
 	// outside [1024, 67108864].
 	PayloadMaxBytes *int `json:"payload_max_bytes,omitempty"`
+	// BrokerPoisonStrategy is the kafka-only poison-record
+	// handling strategy. nil → default "commit" (the previous
+	// hardcoded behaviour; broker offset advances on poison).
+	// Only meaningful for kind='kafka' triggers; the apid
+	// handler ignores it for every other kind.
+	BrokerPoisonStrategy *string `json:"broker_poison_strategy,omitempty"`
 
 	// Cron-only fields.
 	Schedule string `json:"schedule,omitempty"`
@@ -146,12 +189,13 @@ type CreateTriggerRequest struct {
 // a new resource + deleting the old one, which the customer has
 // to do explicitly).
 type UpdateTriggerRequest struct {
-	Enabled         *bool           `json:"enabled,omitempty"`
-	Config          json.RawMessage `json:"config,omitempty"`
-	BatchSizeMax    *int            `json:"batch_size_max,omitempty"`
-	BatchWindowMs   *int            `json:"batch_window_ms,omitempty"`
-	MaxAttempts     *int            `json:"max_attempts,omitempty"`
-	PayloadMaxBytes *int            `json:"payload_max_bytes,omitempty"`
+	Enabled              *bool           `json:"enabled,omitempty"`
+	Config               json.RawMessage `json:"config,omitempty"`
+	BatchSizeMax         *int            `json:"batch_size_max,omitempty"`
+	BatchWindowMs        *int            `json:"batch_window_ms,omitempty"`
+	MaxAttempts          *int            `json:"max_attempts,omitempty"`
+	PayloadMaxBytes      *int            `json:"payload_max_bytes,omitempty"`
+	BrokerPoisonStrategy *string         `json:"broker_poison_strategy,omitempty"`
 
 	// Cron-only patches. Cron kinds accept schedule+path patches
 	// (e.g. updating an existing cron); non-cron kinds reject
