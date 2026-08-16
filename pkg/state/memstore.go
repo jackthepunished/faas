@@ -6302,6 +6302,29 @@ func (m *MemStore) MarkComputeNodeInactive(_ context.Context, nodeID string) err
 	return nil
 }
 
+// SetComputeNodeRole overwrites the role column on a row by id
+// (ADR-112 PR-B). Mirrors PgStore.SetComputeNodeRole behavior:
+// same allow-list validation, same idempotent semantics, same
+// ErrNotFound on a missing row. MemStore holds role as a *string
+// (nullable, legacy "un-templated" sentinel); the setter accepts
+// only {control-plane, compute-only} and writes the pointer form
+// so the pointer-vs-value distinction survives a round-trip.
+func (m *MemStore) SetComputeNodeRole(_ context.Context, nodeID, role string) error {
+	if err := validateRoleForState(role); err != nil {
+		return fmt.Errorf("state: set role compute_node %s: %w", nodeID, err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.computeNodes[nodeID]
+	if !ok {
+		return ErrNotFound
+	}
+	r := role
+	n.Role = &r
+	m.computeNodes[nodeID] = n
+	return nil
+}
+
 func (m *MemStore) CreateComputeNode(_ context.Context, node ComputeNode) (ComputeNode, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

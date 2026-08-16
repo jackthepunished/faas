@@ -2600,6 +2600,21 @@ type Store interface {
 	// gatewayd-internal can add or drop its per-node client without a
 	// restart. ErrNotFound when the id has no row.
 	SetComputeNodeActive(ctx context.Context, id string, active bool) error
+	// SetComputeNodeRole overwrites the role column on a row by id
+	// (ADR-112 PR-B). PR-A's first-boot path populates the column via
+	// UpsertComputeNodeFromOperator (keyed by name); PR-B's in-place
+	// mutation needs a dedicated setter because the runtime identity
+	// is the box's node-id, not the manifest name. The role value is
+	// validated against the {empty, control-plane, compute-only}
+	// allow-list at the Go boundary (matches pkg/roleTemplating.Validate)
+	// so a SQL injection via an operator-supplied role is impossible —
+	// the parameter is length-capped at 32 chars and member-tested.
+	// Idempotent: writing the same role twice is a no-op UPDATE. Returns
+	// ErrNotFound if the row is gone. Emits compute_node_changed via
+	// the pg_notify trigger so gatewayd-internal's per-node cache and
+	// schedd's chooser re-rank immediately (the chooser currently
+	// ignores role, but the family is wired for ADR-110 follow-ons).
+	SetComputeNodeRole(ctx context.Context, id string, role string) error
 	// ListComputeNodes returns every compute_node in name order.
 	// includeInactive=false (default) returns only active rows
 	// (placement-equivalent); apid's GET /v1/compute-nodes handler

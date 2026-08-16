@@ -155,7 +155,7 @@ var cliCommands = []cliCommand{
 			},
 			{
 				Name:  subReleaseInstall,
-				Short: "Install a release on the local box (atomic symlink flip + applied_at first-write-wins stamp + compute_nodes UPSERT + optional role templating)",
+				Short: "Install a release on the local box (atomic symlink flip + applied_at first-write-wins stamp + compute_nodes UPSERT). --role is the dual-purpose flag: on first-boot it templates drop-ins + starts the role subset; on a running box with a different existing role it triggers PR-B in-place mutation (drain-gate, Mutate(stop+start), role UPSERT).",
 				Flags: []cliFlag{
 					{Name: "git-sha", Short: "40-char lowercase hex git SHA to install (required)", Req: true},
 					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
