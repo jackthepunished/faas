@@ -291,11 +291,58 @@ func (t *Tarball) Extract(root string) error {
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		outPath := filepath.Join(bin, filepath.Base(hdr.Name))
-		// Reject tarball entries that climb out of the bin dir
-		// (defense against a tar with hdr.Name like
-		// "../../etc/passwd"). filepath.Base + a BinDir-bound
-		// join means any escape attempt lands back in bin/.
+		// Defence against Zip Slip (CodeQL CWE-22): a tarball
+		// entry whose Name contains '..' or an absolute path
+		// must NEVER escape the bin/ directory. The robust
+		// check is post-Clean containment: filepath.Base
+		// alone is not enough because a header like
+		// "../../etc/passwd" becomes "passwd" via Base and
+		// lands safely, BUT a header like "foo/../../bar"
+		// joined with bin/ and cleaned could still escape
+		// when the BinDir parent contains a symlink. We do
+		// both: Base() the name AND verify post-join
+		// containment via filepath.EvalSymlinks. Refusing
+		// the entry as ErrTarballTampered matches the
+		// existing failure-class convention (this file
+		// already treats any anomaly in a canary-built
+		// tarball as tampering).
+		base := filepath.Base(hdr.Name)
+		if base == "." || base == "/" || base == "" {
+			return fmt.Errorf("%w: tarball entry %q has unsafe basename",
+				ErrTarballTampered, hdr.Name)
+		}
+		// Reject absolute-path and parent-traversal header
+		// Names up front. filepath.Base alone would silently
+		// accept "/etc/passwd" (becomes "passwd") and
+		// "../../escape" (becomes "escape"); that is "safe"
+		// from the perspective of escaping the bin dir but is
+		// not safe in the sense that the canary's contract
+		// says only catalog-named entries ship. A tarball
+		// with such a header IS tampering.
+		if strings.HasPrefix(hdr.Name, "/") || strings.Contains(hdr.Name, "..") {
+			return fmt.Errorf("%w: tarball entry %q has unsafe name (absolute or parent-traversal)",
+				ErrTarballTampered, hdr.Name)
+		}
+		outPath := filepath.Join(bin, base)
+		// Resolve any symlinks in the bin path so a malicious
+		// tarball entry that targets bin/../../foo doesn't
+		// escape via an intermediate symlink. MkdirAll above
+		// already rejected escape paths during mkdir, so
+		// EvalSymlinks should resolve to a real path under
+		// root/.
+		binReal, evalErr := filepath.EvalSymlinks(bin)
+		if evalErr != nil {
+			return fmt.Errorf("releaseinstall: eval bin symlinks: %w", evalErr)
+		}
+		outReal := filepath.Join(binReal, base)
+		// Verify containment: outReal must be inside binReal.
+		// Use filepath.Rel rather than HasPrefix because the
+		// latter is fooled by "/foo/bar2" vs "/foo/bar".
+		rel, relErr := filepath.Rel(binReal, outReal)
+		if relErr != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+			return fmt.Errorf("%w: tarball entry %q escapes bin dir (%s)",
+				ErrTarballTampered, hdr.Name, rel)
+		}
 		body, err := io.ReadAll(tr)
 		if err != nil {
 			return fmt.Errorf("releaseinstall: extract read %s: %w", hdr.Name, err)
