@@ -692,6 +692,9 @@ func computeRetryBackoff(attempts int32) time.Duration {
 	if base > 5*time.Minute {
 		base = 5 * time.Minute
 	}
+	//nolint:gosec // G404: jitter on retry backoff has no security value — the
+	// worst a malicious caller can do is nudge our delay by ±20%, which
+	// the dispatch tick absorbs. math/rand/v2 is correct here.
 	jitter := time.Duration(float64(base) * (0.8 + 0.01*float64(rand.Uint64()%41)))
 	return jitter
 }
