@@ -119,22 +119,18 @@ func TestCreateTenantSurface_HappyPath(t *testing.T) {
 		}
 	}
 
-	// NotifyTenantSurfaceChanged must fire on add — the cert engine
-	// listens for this to re-mint. Kind=surface_added is the gatewayd
-	// routing-side filter (matches the patch in PR-B).
+	// Notify: the handler does NOT call s.notif.Notify here. The
+	// surface row INSERT fires the trigger at migrations/00243:127-145
+	// which emits pg_notify('tenant_surface_changed', bare_surface_uuid).
+	// A second explicit emit was redundant — it produced a JSON payload
+	// the gatewayd consumer parsed as a UUID and silently dropped
+	// (review finding #1 on PR #937).
 	notif.mu.Lock()
 	defer notif.mu.Unlock()
-	emitted := 0
 	for _, n := range notif.emitted {
 		if n.Channel == "tenant_surface_changed" {
-			emitted++
-			if !strings.Contains(n.Payload, "surface_added") {
-				t.Errorf("notify payload missing surface_added kind: %s", n.Payload)
-			}
+			t.Errorf("unexpected explicit tenant_surface_changed emit: payload=%s (the trigger handles this)", n.Payload)
 		}
-	}
-	if emitted != 1 {
-		t.Errorf("tenant_surface_changed emits = %d, want 1; all: %+v", emitted, notif.emitted)
 	}
 }
 
@@ -216,6 +212,28 @@ func TestCreateTenantSurface_QuotaExceeded(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "tenant_surface_quota") {
 		t.Errorf("body missing tenant_surface_quota code: %s", rec.Body.String())
+	}
+}
+
+// TestCreateTenantSurface_InvalidCertKind pins fix #3 from the
+// PR #937 review: the handler must validate cert_kind against the
+// state.CertKind whitelist BEFORE the store call so a bogus value
+// returns 400 with the dedicated code instead of falling through to
+// the SQL CHECK constraint and surfacing as a 500 capacity error.
+func TestCreateTenantSurface_InvalidCertKind(t *testing.T) {
+	withTenantSurfacesEnabled(t)
+	e, _ := newTestServerWithCapturingNotifier(t, api.PlanPro)
+	appID := mustSeedApp(t, e, "cert-kind-app")
+
+	req := makeTenantSurfaceReq(appID, "bogus-cert", "api.example.com")
+	req.CertKind = "not_a_real_kind"
+	rec := e.do(t, "POST", "/v1/apps/cert-kind-app/tenant-surfaces", req, nil)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid cert_kind status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "tenant_surface_cert_kind_invalid") {
+		t.Errorf("body missing tenant_surface_cert_kind_invalid code: %s", rec.Body.String())
 	}
 }
 

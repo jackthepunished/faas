@@ -25,7 +25,6 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -75,8 +74,14 @@ func (s *server) createTenantSurface(w http.ResponseWriter, r *http.Request, acc
 		api.WriteProblem(w, problem)
 		return
 	}
-	_ = s.notif.Notify(r.Context(), db.NotifyTenantSurfaceChanged,
-		`{"kind":"surface_added","surface_id":"`+surf.ID+`","app_id":"`+app.ID+`"}`)
+	// pg_notify on tenant_surface_changed is emitted by the trigger
+	// at migrations/00243:127-145 on every relevant row change
+	// (surface + hostname INSERT/UPDATE/DELETE). The payload is
+	// the bare surface UUID — what the cert-engine listener in
+	// cmd/gatewayd-internal/backend.go:542 parses. An explicit
+	// notif.Notify here would fire a SECOND event with the wrong
+	// payload shape and triple-count the surface in the dashboard.
+	// dns_poller.go:85-88 follows the same pattern.
 	s.log.Info("tenant surface created",
 		"surface", surf.ID, "name", logsanitize.Field(surf.Name),
 		"app", app.ID, "account", acct.ID, "hostnames", len(hostnames))
@@ -106,6 +111,16 @@ func (s *server) createSurfaceUnderQuotas(
 	certKind := state.CertKind(req.CertKind)
 	if certKind == "" {
 		certKind = state.CertKindPerHostSAN
+	}
+	// Validate cert_kind BEFORE the store call. Without this, a
+	// bogus value reaches the SQL CHECK constraint and surfaces as
+	// ErrInvalidArgument, which the handler's surfaceCreateProblem
+	// maps to ErrCapacity (500) instead of the dedicated
+	// tenant_surface_cert_kind_invalid (400) the dashboard
+	// expects. The PR-A-reserved code (pkg/api/errors.go:2043)
+	// is the customer-facing signal that the field is malformed.
+	if !certKind.Valid() {
+		return state.TenantSurface{}, nil, api.ErrTenantSurfaceCertKindInvalid(string(certKind))
 	}
 	surf, err := s.store.CreateTenantSurfaceIfUnderQuota(ctx, state.CreateTenantSurfaceParams{
 		AccountID: acct.ID,
@@ -271,17 +286,29 @@ func (s *server) deleteTenantSurface(w http.ResponseWriter, r *http.Request, acc
 		return
 	}
 	// Cascade hostnames first so a future re-add of the same
-	// hostname to a new surface doesn't trip ErrConflict.
-	hostnames, _ := s.store.ListTenantHostnamesForSurface(r.Context(), surf.ID)
+	// hostname to a new surface doesn't trip ErrConflict. The
+	// first failure (list OR per-row delete) is propagated to
+	// the caller as a 500 — a partial-cascade leaves orphan
+	// hostname rows that block the re-add via the global UQ
+	// (migrations/00243:99). Surface is NOT deleted if the
+	// cascade fails; the operator can retry the DELETE.
+	hostnames, err := s.store.ListTenantHostnamesForSurface(r.Context(), surf.ID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not list tenant hostnames for cascade"))
+		return
+	}
 	for _, h := range hostnames {
-		_ = s.store.DeleteTenantHostname(r.Context(), h.Hostname)
+		if err := s.store.DeleteTenantHostname(r.Context(), h.Hostname); err != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not cascade delete tenant hostname"))
+			return
+		}
 	}
 	if err := s.store.DeleteTenantSurface(r.Context(), surf.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not delete tenant surface"))
 		return
 	}
-	_ = s.notif.Notify(r.Context(), db.NotifyTenantSurfaceChanged,
-		`{"kind":"surface_removed","surface_id":"`+surf.ID+`"}`)
+	// No explicit notify: the trigger at migrations/00243:127-145
+	// fires on the surface + each hostname DELETE.
 	s.log.Info("tenant surface deleted",
 		"surface", surf.ID, "app", surf.AppID, "account", acct.ID)
 	s.audit.Emit(r.Context(), "tenant_surface.removed", &acct.ID, map[string]any{
@@ -339,8 +366,8 @@ func (s *server) addTenantHostname(w http.ResponseWriter, r *http.Request, acct 
 		api.WriteProblem(w, hostnameCreateProblem(err, acct.Plan, surf.ID))
 		return
 	}
-	_ = s.notif.Notify(r.Context(), db.NotifyTenantSurfaceChanged,
-		`{"kind":"hostname_added","surface_id":"`+surf.ID+`","hostname":"`+h.Hostname+`"}`)
+	// No explicit notify: the trigger at migrations/00243:127-145
+	// fires on the hostname INSERT.
 	s.log.Info("tenant hostname added",
 		"hostname", logsanitize.Field(h.Hostname),
 		"surface", surf.ID, "account", acct.ID)
@@ -383,8 +410,8 @@ func (s *server) removeTenantHostname(w http.ResponseWriter, r *http.Request, ac
 		api.WriteProblem(w, api.ErrCapacity("could not delete tenant hostname"))
 		return
 	}
-	_ = s.notif.Notify(r.Context(), db.NotifyTenantSurfaceChanged,
-		`{"kind":"hostname_removed","surface_id":"`+surf.ID+`","hostname":"`+hostname+`"}`)
+	// No explicit notify: the trigger at migrations/00243:127-145
+	// fires on the hostname DELETE.
 	s.log.Info("tenant hostname removed",
 		"hostname", logsanitize.Field(hostname),
 		"surface", surf.ID, "account", acct.ID)
