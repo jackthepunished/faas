@@ -216,8 +216,8 @@ func TestCheckVerifyTarballSBOM_HappyPath(t *testing.T) {
 	if !strings.Contains(findings[0].Message, "signature=test-identity@github.com") {
 		t.Errorf("message missing signature identity: %q", findings[0].Message)
 	}
-	if !strings.Contains(findings[0].Message, "counts=critical:0 high:0 medium:0 low:0") {
-		t.Errorf("message missing counts: %q", findings[0].Message)
+	if !strings.Contains(findings[0].Message, "baseline=critical:0 high:0 medium:0 low:0 live=critical:0 high:0 medium:0 low:0") {
+		t.Errorf("message missing baseline/live counts side-by-side: %q", findings[0].Message)
 	}
 	if verifier.CallCount != 1 {
 		t.Errorf("verifier call count = %d, want 1", verifier.CallCount)

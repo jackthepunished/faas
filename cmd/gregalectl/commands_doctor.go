@@ -1114,6 +1114,7 @@ func checkVerifyTarballSBOM(ctx context.Context, deps *doctorDeps) ([]doctorFind
 			continue
 		}
 		baseline, baseErr := releaseinstall.ReadBaseline(deps.releasesRoot, gitSHA)
+		var baselineCounts *releaseinstall.SBOMCounts
 		switch {
 		case baseErr == nil:
 			if _, diffErr := baseline.Diff(counts); diffErr != nil {
@@ -1126,6 +1127,13 @@ func checkVerifyTarballSBOM(ctx context.Context, deps *doctorDeps) ([]doctorFind
 				})
 				continue
 			}
+			// Snapshot the baseline counts so the OK row below can
+			// print both baseline and live side-by-side. The rotate
+			// contract is "baseline counts", not the live SBoM;
+			// operators reading the doctor JSON must see the same
+			// numbers they rotated to, not the new SBoM's tally.
+			c := baseline.Counts
+			baselineCounts = &c
 		case errors.Is(baseErr, releaseinstall.ErrNilBaseline):
 			findings = append(findings, doctorFinding{
 				Check:    doctorCheckVerifyTarballSBOM,
@@ -1145,14 +1153,26 @@ func checkVerifyTarballSBOM(ctx context.Context, deps *doctorDeps) ([]doctorFind
 			continue
 		}
 		// OK finding: tarball verified + counts baseline-clean.
-		// Emit one OK row per release so the doctor JSON shows
-		// the per-release signature identity + counts.
+		// Print the baseline counts the operator rotated to AND
+		// the live SBoM counts side-by-side, so the JSON line
+		// matches the rotate contract (baseline) without losing
+		// the current SBoM tally. When baseline is missing, only
+		// the live counts are available (KGVZero fallback).
+		var msg string
+		if baselineCounts != nil {
+			msg = fmt.Sprintf("signature=%s baseline=critical:%d high:%d medium:%d low:%d live=critical:%d high:%d medium:%d low:%d",
+				identity,
+				baselineCounts.CriticalN, baselineCounts.HighN, baselineCounts.MediumN, baselineCounts.LowN,
+				counts.CriticalN, counts.HighN, counts.MediumN, counts.LowN)
+		} else {
+			msg = fmt.Sprintf("signature=%s counts=critical:%d high:%d medium:%d low:%d",
+				identity, counts.CriticalN, counts.HighN, counts.MediumN, counts.LowN)
+		}
 		findings = append(findings, doctorFinding{
 			Check:    doctorCheckVerifyTarballSBOM,
 			Severity: doctorSeverityOK,
 			Target:   gitSHA,
-			Message: fmt.Sprintf("signature=%s counts=critical:%d high:%d medium:%d low:%d",
-				identity, counts.CriticalN, counts.HighN, counts.MediumN, counts.LowN),
+			Message:  msg,
 		})
 	}
 	if len(findings) == 0 {
