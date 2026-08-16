@@ -22,6 +22,7 @@ export type CreateTriggerRequest = {
   batch_size_max?: number | null;
   batch_window_ms?: number | null;
   max_attempts?: number | null;
+  payload_max_bytes?: number | null;
   schedule?: string | null;
   path?: string | null;
 };

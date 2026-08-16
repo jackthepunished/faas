@@ -36,6 +36,15 @@ export type Trigger = {
    */
   batch_window_ms: number;
   max_attempts: number;
+  /**
+   * Per-record broker payload byte cap (migration 00274).
+   * Records above this size are DLQ'd at insert time with
+   * reason='payload_too_large' rather than silently truncated.
+   * Plan-level ceiling in /v1/limits TriggerPayloadMaxBytes.
+   * Default 6291456 (6 MiB) when omitted on create.
+   *
+   */
+  payload_max_bytes: number;
   schedule?: string | null;
   path?: string | null;
   cron_id?: string | null;
