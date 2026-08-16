@@ -32,6 +32,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -41,6 +42,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
@@ -348,13 +350,16 @@ func cmdReleaseInstall(args []string) int {
 		// by id) over the env fallback. The DB can fail (no DSN, no row)
 		// — that's the legacy first-boot path; we fall through to env
 		// or to the blank-box Apply.
-		current := readCurrentRole(context.Background(), openPool, node)
+		cnID, current := readCurrentRole(context.Background(), openPool, node)
 		if current == target {
 			// Idempotent re-run. No drop-in re-templating, no
-			// daemon restarts. Print a clear no-op line so the
-			// operator sees their intent was honored.
+			// daemon restarts, NO compute_nodes UPDATE — the
+			// latter matters because every UPDATE fires the
+			// compute_nodes trigger + pg_notify storm across the
+			// cluster for no reason. Print a clear no-op line so
+			// the operator sees their intent was honored.
 			_, _ = fmt.Fprintf(os.Stderr,
-				"gregalectl release install: already role=%s; no-op (sealed-env and daemons untouched)\n",
+				"gregalectl release install: already role=%s; no-op (sealed-env and daemons untouched, no DB write)\n",
 				current)
 		} else {
 			// Drain gate. Hard block on live instances.
@@ -389,6 +394,22 @@ func cmdReleaseInstall(args []string) int {
 			_, _ = fmt.Fprintf(os.Stderr,
 				"gregalectl release install: re-rolled %s -> %s (stopped %v, started %v)\n",
 				current, target, stopped, started)
+			// PR-B (issue #935): stamp the post-mutation role on
+			// compute_nodes.role keyed by id. Done HERE (inside the
+			// else branch) so idempotent re-runs (current == target
+			// above) do NOT fire a pg_notify storm across the cluster.
+			// The runtime allow-list is narrower than the renderer's
+			// (see pkg/state.pgstore docstring); a `single-box`
+			// renderer write is fine but a runtime re-role to that
+			// value is rejected — by design, post-#930.
+			if cnID != "" {
+				pgstore := state.NewPgStore(openPool)
+				if err := pgstore.SetComputeNodeRole(context.Background(), cnID, string(target)); err != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: set compute_nodes.role: %v\n", err)
+					// Don't fail the install; the on-disk state is
+					// the source of truth. Doctor will report the drift.
+				}
+			}
 		}
 	}
 	// DB writes — best effort. The on-disk symlink flip is the
@@ -433,23 +454,10 @@ func cmdReleaseInstall(args []string) int {
 		}
 		return 3
 	}
-	// PR-B (issue #935): stamp the post-mutation role on
-	// compute_nodes.role keyed by id. Wraps pkg/state.PgStore
-	// (raw Exec UPDATE) — the runtime path is keyed by id, not
-	// by name; the renderer's releaseinstall.Store.SetComputeNodeRole
-	// (PR-2, name-keyed) is the manifest-time path and intentionally
-	// separate. Mirrors the existing "best-effort like MarkApplied"
-	// semantics: a write failure here logs but doesn't fail the
-	// install (the on-disk symlink flip + drop-ins are the
-	// load-bearing side; doctor --deep will surface the drift).
-	if *roleFlag != "" {
-		pgstore := state.NewPgStore(openPool)
-		if err := pgstore.SetComputeNodeRole(context.Background(), cnID, *roleFlag); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: set compute_nodes.role: %v\n", err)
-			// Don't fail the install; the on-disk state is the
-			// source of truth. Doctor will report the drift.
-		}
-	}
+	// PR-B (issue #935): the post-mutation role write happens
+	// INSIDE the role-branch else-block above (so idempotent re-runs
+	// do NOT fire the compute_nodes UPDATE trigger + pg_notify storm).
+	// Do not duplicate the write here.
 	if jsonEnabled() {
 		jsonEmit(os.Stdout, releaseInstallReport{
 			GitSHA:        *gitSHA,
@@ -520,34 +528,43 @@ func readFirstBootRole() (string, bool) {
 }
 
 // readCurrentRole resolves the box's current role (ADR-112 PR-B).
-// Tries compute_nodes.role via pgxpool first (the DB is the source
-// of truth per the PR-B plan), then falls back to FAAS_BOX_ROLE
-// from /etc/faas/first-boot.env, then returns the empty Role as
-// "blank-box first-boot" (no current role to compare against).
+// Returns the compute_nodes.id alongside the role so the caller
+// can re-use it for the post-mutation SetComputeNodeRole write
+// (pkg/state keys by id, not by name — the renderer side keys by
+// name, but the runtime path is id-keyed). The id is the same row
+// that the existing UpsertComputeNode returns later in
+// cmdReleaseInstall, so callers can pass it through to
+// SetComputeNodeRole directly and skip the duplicate lookup.
 //
-// All failure modes are silent-by-design: PR-B is best-effort. The
-// caller treats empty Role as "no current role" and runs the
-// blank-box Apply path (PR-A behavior, unchanged).
+// Source-of-truth ordering:
 //
-// We read by node NAME on the compute_nodes table (the primary key
-// is id, but the manifest renderer keys by name; the row is unique
-// on name). The id is fetched in the same Query so the caller can
-// re-use it for the SetComputeNodeRole by-id write later.
-func readCurrentRole(ctx context.Context, pool *pgxpool.Pool, nodeName string) roleTemplating.Role {
+//  1. compute_nodes.role via pgxpool (DB truth).
+//  2. FAAS_BOX_ROLE from /etc/faas/first-boot.env (legacy
+//     first-boot path, no DB row yet).
+//  3. Empty Role, empty id — "blank-box first-boot" (no current
+//     role to compare against). The caller runs the blank-box
+//     Apply path (PR-A behaviour, unchanged).
+//
+// All failure modes are silent-by-design: PR-B is best-effort.
+// The DB read errors are treated as "no row" — the env fallback
+// kicks in. The env fallback returning "" is the blank-box path.
+func readCurrentRole(ctx context.Context, pool *pgxpool.Pool, nodeName string) (cnID string, current roleTemplating.Role) {
 	if pool != nil && nodeName != "" {
-		row := pool.QueryRow(ctx,
-			`SELECT id, role FROM compute_nodes WHERE name = $1`, nodeName)
 		var id, role *string
-		if err := row.Scan(&id, &role); err == nil {
+		err := pool.QueryRow(ctx,
+			`SELECT id, role FROM compute_nodes WHERE name = $1`, nodeName).Scan(&id, &role)
+		if err == nil && id != nil {
+			cnID = *id
 			if role != nil && *role != "" {
-				return roleTemplating.Role(*role)
+				return cnID, roleTemplating.Role(*role)
 			}
+			return cnID, "" // row exists, role unset — env fallback below
 		}
 	}
 	if envRole, ok := readFirstBootRole(); ok && envRole != "" {
-		return roleTemplating.Role(envRole)
+		return "", roleTemplating.Role(envRole)
 	}
-	return ""
+	return "", ""
 }
 
 // assertDrainStatus fails PR-B's drain gate. Returns nil if the
@@ -560,19 +577,46 @@ func readCurrentRole(ctx context.Context, pool *pgxpool.Pool, nodeName string) r
 // Postgres query counts rows in (WAKING, COLD_BOOTING, RUNNING)
 // keyed by the node_id column on the instances table.
 //
-// Errors reading the DB are treated as "fail closed" — better to
-// block a re-role than to mutate a node whose instance state we
-// couldn't prove was safe.
+// Three terminal states, all disambiguated explicitly:
+//
+//  1. compute_nodes row MISSING for this name — return an explicit
+//     error. The previous shape used
+//     `WHERE node_id = (SELECT id ...)` which evaluates the
+//     subquery to NULL and the predicate to UNKNOWN (not FALSE),
+//     silently treating "no row" as "zero live instances" and
+//     bypassing the gate. Fail-closed is the right default: a
+//     half-mutated box whose row was deleted out-of-band must NOT
+//     re-role without operator acknowledgement.
+//  2. DB error reading the row or the count — fail-closed (block
+//     the re-role).
+//  3. live > 0 — return a loud error pointing at force-drain.
+//
+// The legacy first-boot path (no DB / empty node name) keeps its
+// pass-through behaviour because there is literally no compute_nodes
+// row to disambiguate against.
 func assertDrainStatus(ctx context.Context, pool *pgxpool.Pool, nodeName string) error {
 	if pool == nil || nodeName == "" {
 		return nil // no DB / no node: skip the gate (legacy first-boot)
 	}
+	// 1. Resolve the row by name. ErrNoRows is treated as an explicit
+	// gate failure, not as "zero live instances".
+	var cnID string
+	err := pool.QueryRow(ctx,
+		`SELECT id FROM compute_nodes WHERE name = $1`, nodeName).Scan(&cnID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("drain gate: compute_nodes row missing for name %q; cannot verify live instances (refusing to re-role)", nodeName)
+		}
+		return fmt.Errorf("drain gate: cannot read compute_nodes row: %w", err)
+	}
+	// 2. Count live instances keyed by id (the safe join shape — no
+	// NULL coercion of the subquery).
 	var live int
-	err := pool.QueryRow(ctx, `
+	err = pool.QueryRow(ctx, `
 		SELECT count(*) FROM instances
-		 WHERE node_id = (SELECT id FROM compute_nodes WHERE name = $1)
+		 WHERE node_id = $1
 		   AND state IN ('WAKING', 'COLD_BOOTING', 'RUNNING')
-	`, nodeName).Scan(&live)
+	`, cnID).Scan(&live)
 	if err != nil {
 		return fmt.Errorf("drain gate: cannot read live-instance count: %w", err)
 	}

@@ -9034,12 +9034,33 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 
 // SetComputeNodeRole overwrites the role column on a row by id
 // (ADR-112 PR-B). The role value is validated against the
-// {empty, control-plane, compute-only} allow-list at the Go boundary
-// (matches pkg/roleTemplating.Validate) before the SQL touch — empty
-// role is rejected with a loud error (use UpsertComputeNodeFromOperator
-// with role=NULL if the un-templated sentinel is ever needed). The
-// migration 00271 column is nullable text (no CHECK constraint); the
-// Go-side validation is the effective constraint.
+// {control-plane, compute-only} allow-list at the Go boundary
+// (empty role is rejected with a loud error — use
+// UpsertComputeNodeFromOperator with role=NULL if the un-templated
+// sentinel is ever needed). The migration 00271 column is nullable
+// text (no CHECK constraint); the Go-side validation is the
+// effective constraint.
+//
+// Allow-list divergence vs pkg/releaseinstall: the manifest
+// renderer's SetComputeNodeRole (pkg/releaseinstall.store.go:131,
+// name-keyed, manifest-time) accepts {empty, single-box,
+// control-plane, compute-only}; this runtime path
+// (id-keyed, PR-B) accepts only {control-plane, compute-only}.
+// The asymmetry is intentional and load-bearing:
+//
+//   - `single-box` is the legacy single-box dev posture
+//     (pkg/roleTemplating/role.go:64-69). The renderer allows it
+//     because pre-PR-A manifests still pass it through for
+//     backwards compat with v1 bootstrap.sh.
+//   - PR-B is the runtime re-role contract; "re-role a box to
+//     single-box" is not a thing the architecture supports after
+//     the ADR-112 collapse. A box that was first-boot templated as
+//     single-box CANNOT be re-rolled via this path; the operator
+//     must image-rebuild if they need to leave single-box.
+//
+// Future "re-role to single-box" support, if ever needed, is a
+// separate ADR — bumping the allow-list here without one would
+// re-introduce the per-role-image pathology ADR-112 fixed.
 //
 // The pg_notify trigger on compute_nodes (PR-3a) fires on every UPDATE
 // regardless of which column changed, so gatewayd-internal's per-node
@@ -9048,6 +9069,11 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 // load-bearing invariant is that the cluster-wide view in
 // compute_nodes.role matches the box's on-disk FAAS_BOX_ROLE (read
 // from the per-daemon drop-in); a drift is loud via doctor --deep.
+//
+// Callers MUST short-circuit when current == target — every
+// unconditional UPDATE here fires the trigger + notify storm. The
+// cmd/gregalectl role-branch does this idempotency short-circuit
+// at the caller side; this method itself stays unconditional.
 func (s *PgStore) SetComputeNodeRole(ctx context.Context, id string, role string) error {
 	if err := validateRoleForState(role); err != nil {
 		return fmt.Errorf("state: set role compute_node %s: %w", id, err)

@@ -10,7 +10,8 @@
 // and asserts after each cycle:
 //
 //   - compute_nodes.role (Postgres) flipped to the new role via
-//     psqlExec on DATABASE_URL (the post-#931 PR-B runtime path)
+//     pgxpool.QueryRow with $1 parameter binding (the post-#931 PR-B
+//     runtime path; hostname is untrusted, so we never shell-quote it)
 //   - every daemon in the new subset reports active (systemctl
 //     is-active via SSH), every daemon NOT in the subset reports
 //     inactive — the per-daemon gate the Mutate contract enforces
@@ -43,6 +44,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // sealedPaths is the canonical "what MUST be byte-identical pre/post"
@@ -72,6 +75,31 @@ func sealedFingerprint(ctx context.Context, t *testing.T, ip, user, key string) 
 	h := sha256.New()
 	h.Write([]byte(out))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// readRoleFromDB fetches the role column of the compute_nodes row
+// keyed by hostname using $1 parameter binding (CodeQL CWE-89 — the
+// hostname comes from a shell `hostname` command and is not
+// trustworthy). Returns "" only when allowNull is true and the
+// column is NULL; otherwise fails the test on NULL / ErrNoRows.
+//
+// Defined here (not in the shared psqlExec helper file) because
+// psqlExec uses shell interpolation; the operator-side role-mutation
+// assertion needs parameter binding end-to-end.
+func readRoleFromDB(ctx context.Context, t *testing.T, pool *pgxpool.Pool, hostname string, allowNull bool) string {
+	t.Helper()
+	var role *string
+	if err := pool.QueryRow(ctx,
+		`SELECT role FROM compute_nodes WHERE name = $1`, hostname).Scan(&role); err != nil {
+		t.Fatalf("readRoleFromDB(%s): %v", hostname, err)
+	}
+	if role == nil {
+		if allowNull {
+			return ""
+		}
+		t.Fatalf("readRoleFromDB(%s): role IS NULL", hostname)
+	}
+	return *role
 }
 
 // assertDaemonSubset asserts every daemon in `wantActive` reports
@@ -109,7 +137,7 @@ func TestImageRoleMutation(t *testing.T) {
 	}
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		t.Skip("DATABASE_URL not set; skip e2eimage role-mutation test (needs psqlExec against compute_nodes.role)")
+		t.Skip("DATABASE_URL not set; skip e2eimage role-mutation test (needs compute_nodes.role read)")
 	}
 	sshKey := os.Getenv("SSH_KEY_PATH")
 	sshUser := os.Getenv("SSH_USER")
@@ -119,6 +147,20 @@ func TestImageRoleMutation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
+
+	// Pool against the operator-side Postgres. We use pgxpool with $1
+	// parameter binding rather than interpolating the hostname into a
+	// shell-psql query — CodeQL flagged the hostname as untrusted
+	// (CWE-89). The pool is closed via t.Cleanup; psql is not used.
+	pgCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse DATABASE_URL: %v", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, pgCfg)
+	if err != nil {
+		t.Fatalf("open pgxpool: %v", err)
+	}
+	t.Cleanup(func() { pool.Close() })
 
 	// 1. Spawn a fresh VM with control-plane first-boot.
 	serverIP, serverCleanup := spawnHcloudServer(ctx, t, imageTag, sshKey)
@@ -130,8 +172,7 @@ func TestImageRoleMutation(t *testing.T) {
 	// C → CO → C round-trip byte-for-byte.
 	preSealedCP := sealedFingerprint(ctx, t, serverIP, sshUser, sshKey)
 	hostname := strings.TrimSpace(sshExec(ctx, t, serverIP, sshUser, sshKey, "hostname"))
-	preRoleCP := strings.TrimSpace(psqlExec(ctx, t, dsn,
-		fmt.Sprintf("SELECT COALESCE(role, '') FROM compute_nodes WHERE name = '%s'", hostname)))
+	preRoleCP := readRoleFromDB(ctx, t, pool, hostname, true /* allowNull */)
 	if preRoleCP != "control-plane" {
 		t.Fatalf("baseline role: want control-plane, got %q (first-boot path failed?)", preRoleCP)
 	}
@@ -143,8 +184,7 @@ func TestImageRoleMutation(t *testing.T) {
 		"gregalectl release install --role=compute-only")
 
 	// 3. Assert compute_nodes.role flipped.
-	roleAfterFlip1 := strings.TrimSpace(psqlExec(ctx, t, dsn,
-		fmt.Sprintf("SELECT role FROM compute_nodes WHERE name = '%s'", hostname)))
+	roleAfterFlip1 := readRoleFromDB(ctx, t, pool, hostname, false /* allowNull */)
 	if roleAfterFlip1 != "compute-only" {
 		t.Fatalf("post-flip1 role: want compute-only, got %q", roleAfterFlip1)
 	}
@@ -182,8 +222,7 @@ func TestImageRoleMutation(t *testing.T) {
 		"gregalectl release install --role=control-plane")
 
 	// 8. Assert role + daemon subset flipped back.
-	roleAfterFlip2 := strings.TrimSpace(psqlExec(ctx, t, dsn,
-		fmt.Sprintf("SELECT role FROM compute_nodes WHERE name = '%s'", hostname)))
+	roleAfterFlip2 := readRoleFromDB(ctx, t, pool, hostname, false /* allowNull */)
 	if roleAfterFlip2 != "control-plane" {
 		t.Fatalf("post-flip2 role: want control-plane, got %q", roleAfterFlip2)
 	}

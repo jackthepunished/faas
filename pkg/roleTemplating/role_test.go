@@ -474,6 +474,38 @@ func TestMutateNoChange(t *testing.T) {
 	}
 }
 
+// TestMutateBlankBox is the regression for PR-B review-fix #1:
+// empty `from` is the documented blank-box first-boot path and
+// must NOT be rejected by Validate. The expected behaviour is
+// "start the entire `to` subset, stop nothing".
+func TestMutateBlankBox(t *testing.T) {
+	var calls []string
+	exec := func(name string, args ...string) (string, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return "", nil
+	}
+	stopped, started, err := Mutate(Role(""), RoleControlPlane, exec)
+	if err != nil {
+		t.Fatalf("Mutate(\"\", control-plane) error: %v", err)
+	}
+	if len(stopped) != 0 {
+		t.Fatalf("blank-box Mutate should stop nothing, got stopped=%v", stopped)
+	}
+	wantStart, _ := Subset(RoleControlPlane)
+	if len(started) != len(wantStart) {
+		t.Fatalf("blank-box Mutate should start the entire control-plane subset (%v), got started=%v",
+			wantStart, started)
+	}
+	if len(calls) == 0 {
+		t.Fatalf("blank-box Mutate invoked no systemctl calls; expected %d starts", len(wantStart))
+	}
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "systemctl start ") {
+			t.Fatalf("blank-box Mutate must only start; got call %q", c)
+		}
+	}
+}
+
 func TestMutateUnknownRole(t *testing.T) {
 	exec := func(name string, args ...string) (string, error) {
 		return "", nil

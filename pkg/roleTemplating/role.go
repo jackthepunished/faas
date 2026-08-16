@@ -450,15 +450,24 @@ func ApplyFilesystem(r Role) error {
 // directly; tests inject a recording implementation. Returns
 // (stoppedDaemons, startedDaemons) for assertion.
 func Mutate(from, to Role, execCommand func(name string, args ...string) (string, error)) (stopped, started []string, err error) {
-	if err := Validate(from); err != nil {
-		return nil, nil, fmt.Errorf("roleTemplating: from: %w", err)
+	// `from` may be empty: that is the blank-box first-boot path
+	// (no compute_nodes row, or `--no-db` legacy) and there is
+	// nothing to stop. `Validate` would still reject "" against the
+	// strict allow-list — so we skip it explicitly here and treat
+	// from as "no from-set". The CLI-side `Validate` keeps its loud
+	// contract for flag validation.
+	var fromSet []string
+	if from != "" {
+		if err := Validate(from); err != nil {
+			return nil, nil, fmt.Errorf("roleTemplating: from: %w", err)
+		}
+		fromSet, err = Subset(from)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := Validate(to); err != nil {
 		return nil, nil, fmt.Errorf("roleTemplating: to: %w", err)
-	}
-	fromSet, err := Subset(from)
-	if err != nil {
-		return nil, nil, err
 	}
 	toSet, err := Subset(to)
 	if err != nil {
@@ -495,14 +504,16 @@ func Mutate(from, to Role, execCommand func(name string, args ...string) (string
 			gwLast = &pd
 			continue
 		}
-		if _, err := execCommand("systemctl", "stop", "faas-"+d+".service"); err != nil {
-			return stopped, started, fmt.Errorf("roleTemplating: stop %s: %w", d, err)
+		out, err := execCommand("systemctl", "stop", "faas-"+d+".service")
+		if err != nil {
+			return stopped, started, fmt.Errorf("roleTemplating: stop %s: %s: %w", d, strings.TrimSpace(out), err)
 		}
 		stopped = append(stopped, d)
 	}
 	if gwLast != nil {
-		if _, err := execCommand("systemctl", "stop", "faas-gatewayd-public.service"); err != nil {
-			return stopped, started, fmt.Errorf("roleTemplating: stop gatewayd-public: %w", err)
+		out, err := execCommand("systemctl", "stop", "faas-gatewayd-public.service")
+		if err != nil {
+			return stopped, started, fmt.Errorf("roleTemplating: stop gatewayd-public: %s: %w", strings.TrimSpace(out), err)
 		}
 		stopped = append(stopped, *gwLast)
 	}
@@ -514,8 +525,9 @@ func Mutate(from, to Role, execCommand func(name string, args ...string) (string
 		if _, alreadyRunning := fromMap[d]; alreadyRunning {
 			continue
 		}
-		if _, err := execCommand("systemctl", "start", "faas-"+d+".service"); err != nil {
-			return stopped, started, fmt.Errorf("roleTemplating: start %s: %w", d, err)
+		out, err := execCommand("systemctl", "start", "faas-"+d+".service")
+		if err != nil {
+			return stopped, started, fmt.Errorf("roleTemplating: start %s: %s: %w", d, strings.TrimSpace(out), err)
 		}
 		started = append(started, d)
 	}

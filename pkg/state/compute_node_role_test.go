@@ -142,10 +142,34 @@ func TestSetComputeNodeRole_PgStore_AllowList(t *testing.T) {
 				if err == nil {
 					t.Fatalf("SetComputeNodeRole(%q) = nil err, want error", tc.role)
 				}
+				// Negative case: confirm the row's role did NOT change.
+				got, gerr := s.ComputeNodeByID(ctx, node.ID)
+				if gerr != nil {
+					t.Fatalf("ComputeNodeByID(%s): %v", node.ID, gerr)
+				}
+				if got.Role != nil && *got.Role == tc.role {
+					t.Fatalf("rejected role %q was still written to the row", tc.role)
+				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("SetComputeNodeRole(%q) = %v, want nil", tc.role, err)
+			}
+			// Round-trip: read the row back and confirm the role
+			// matches what we wrote. Mirrors the MemStore test's
+			// post-success assertion; without this check a future
+			// SQL refactor that drops the role column from the
+			// UPDATE SET list would silently no-op while keeping
+			// the test green.
+			got, gerr := s.ComputeNodeByID(ctx, node.ID)
+			if gerr != nil {
+				t.Fatalf("ComputeNodeByID(%s): %v", node.ID, gerr)
+			}
+			if got.Role == nil {
+				t.Fatalf("Role is nil after SetComputeNodeRole(%q)", tc.role)
+			}
+			if *got.Role != tc.role {
+				t.Fatalf("Role round-trip: got %q, want %q", *got.Role, tc.role)
 			}
 		})
 	}
