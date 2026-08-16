@@ -35,6 +35,7 @@ func TestCompletion_ManifestDrift(t *testing.T) {
 		"dispatchDoctor":       "doctor",
 		"dispatchSecrets":      "secrets",
 		"dispatchComputeNodes": "compute-nodes", // PR-911 image rollout (PR #929; ADR-110 + ADR-111)
+		"dispatchDeploy":       "deploy",        // PR-B (multi-host scale-out gap #2)
 	}
 	caseNames, err := extractMainCaseArms(dispatchConsts)
 	if err != nil {

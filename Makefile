@@ -424,17 +424,17 @@ scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (
 .PHONY: bootstrap
 bootstrap: ## Idempotent single-box setup (ansible) — dev/lima. Back-compat for `make bootstrap` against 127.0.0.1.
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit box -e faas_box_role=single-box
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $$BOX -e faas_box_role=single-box
 
 .PHONY: bootstrap-control-plane
-bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout
+bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit control_plane -e faas_box_role=control-plane
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane} -e faas_box_role=control-plane
 
 .PHONY: bootstrap-compute
-bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout
+bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit compute_nodes -e faas_box_role=compute-only
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes} -e faas_box_role=compute-only
 
 .PHONY: tidy
 tidy: ## go mod tidy

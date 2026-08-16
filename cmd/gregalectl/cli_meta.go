@@ -100,15 +100,67 @@ var cliCommands = []cliCommand{
 		// PR-911 image rollout (PR #929 mega; ADR-110 + ADR-111). Operator
 		// surfaces draining + activation of compute_nodes rows so the
 		// deployctl upgrade-node orchestrator can reason about which box
-		// is eligible for placement.
+		// is eligible for placement. The `add` verb is the operator-side
+		// pre-registration path — it POSTs a row before vmmd boots on the
+		// new box (multi-host scale-out gap #1; PR-A in the
+		// tier-1-scaleout pair).
 		Name:    dispatchComputeNodes,
 		DocSlug: "compute-nodes",
-		Short:   "Compute-node state machine (compute-nodes drain|drain-status|activate|force-drain)",
+		Short:   "Compute-node state machine (compute-nodes add|drain|drain-status|activate|force-drain)",
 		Subcommands: []cliSub{
+			{
+				Name:  "add",
+				Short: "Pre-register a compute node (POST /v1/compute-nodes; the operator's target_url wins on conflict)",
+				Flags: []cliFlag{
+					{Name: "name", Short: "fqdn / short-hostname of the new node (required)"},
+					{Name: "target-url", Short: "routable dial target for vmmd (tcp://vmmd-N.faas:50051 or unix://...)"},
+					{Name: "vpcpus", Short: "vCPU count reported to schedd"},
+					{Name: "mem-mb", Short: "RAM MB reported to schedd"},
+					{Name: "max-concurrency", Short: "max concurrent live instances"},
+					{Name: "admission-ceiling-mb", Short: "tenant RAM admission ceiling (85% of mem-mb for production nodes)"},
+					{Name: "from-file", Short: "JSON payload matching computeNodePayload (PR-B bridge)"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
+				},
+			},
 			{Name: "drain", Short: "Mark the node inactive (UPDATE compute_nodes SET active=false)"},
 			{Name: "drain-status", Short: "Report whether any live instances remain on the node (exit 1 if so)"},
 			{Name: "activate", Short: "Re-mark the node active (UPDATE compute_nodes SET active=true)"},
 			{Name: "force-drain", Short: "Force-drain: --yes override for stuck nodes (operator-acknowledged)"},
+		},
+	},
+	{
+		// Multi-host scale-out gap #2 (companion to gap #1 closed by
+		// compute-nodes add). operator-side coordinator that writes
+		// host_vars/<fqdn>.yml + hosts.ini + commits + ssh bootstrap
+		// + POSTs the compute_nodes row. Closes the 5-step hand-curated
+		// runbook into a single command.
+		Name:    dispatchDeploy,
+		DocSlug: "deploy",
+		Short:   "Fleet topology coordinator (deploy add-node; multi-host scale-out gap #2)",
+		Subcommands: []cliSub{
+			{
+				Name:  "add-node",
+				Short: "Add a node to the fleet: write host_vars + hosts.ini + git commit + ssh bootstrap + POST compute_nodes",
+				Flags: []cliFlag{
+					{Name: "role", Short: "control-plane or compute-only (default: compute-only)"},
+					{Name: "ansible-host", Short: "cross-box dial target (required)"},
+					{Name: "public-iface", Short: "nftables substitution iface (compute-only only)"},
+					{Name: "masquerade-cidr", Short: "per-host overlay CIDR (compute-only only)"},
+					{Name: "masquerade-cidr-v6", Short: "ULA pool (compute-only only)"},
+					{Name: "overlay-cidrs", Short: "comma-separated multi-host mesh entries (compute-only only)"},
+					{Name: "target-url", Short: "compute_nodes target_url (compute-only only)"},
+					{Name: "vpcpus", Short: "compute_nodes row vCPU count (compute-only only)"},
+					{Name: "mem-mb", Short: "compute_nodes row RAM MB (compute-only only)"},
+					{Name: "max-concurrency", Short: "compute_nodes row max concurrent live instances (compute-only only)"},
+					{Name: "admission-ceiling-mb", Short: "compute_nodes row tenant RAM admission ceiling (compute-only only)"},
+					{Name: "ssh", Short: "SSH target for bootstrap (default: gregale@<fqdn>)"},
+					{Name: "skip-bootstrap", Short: "write host_vars + commit but do not SSH bootstrap"},
+					{Name: "skip-compute-nodes-post", Short: "do not POST the compute_nodes row after bootstrap"},
+					{Name: "repo-root", Short: "path to the cloned faas repo (default: ascend two levels)"},
+					{Name: "yes", Short: "skip the pre-flight confirmation prompt"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
+				},
+			},
 		},
 	},
 	{

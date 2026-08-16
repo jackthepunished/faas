@@ -52,6 +52,8 @@ Commands:
   node-key     Provision the per-node CapacityReport signing keypair (node-key init|rotate|status)
   backup       Operator rclone / archive credentials (backup init|unseal-archive-creds|unseal-rclone)
   secrets      Post-bootstrap secrets init (secrets init|rotate|status; PR-X / issue #911 / ADR-110)
+  compute-nodes  Compute-node state machine (add|drain|drain-status|activate|force-drain; PR-A / multi-host scale-out)
+  deploy        Fleet topology coordinator (deploy add-node; PR-B / multi-host scale-out gap #2)
   version      Print the CLI version
   completion   Print a shell completion script (bash|zsh|fish|powershell)
   man          Print the gregalectl(1) man page (or gregalectl-<command>(1) with one arg)
@@ -153,11 +155,19 @@ func run(args []string) int {
 		// compute_nodes write — never hits apid.
 		return cmdSecretsDispatch(args[1:])
 	case dispatchComputeNodes:
-		// PR #929 (image rollout). Subcommands drain / drain-status /
-		// activate / force-drain map to state.Store.MarkComputeNodeInactive
-		// / SetComputeNodeActive. Signature matches every other
+		// PR #929 (image rollout) + PR-A (multi-host scale-out
+		// gap #1). Subcommands: add (operator POST → state.Store.
+		// UpsertComputeNodeFromOperator), drain / drain-status /
+		// activate / force-drain (→ state.Store.MarkComputeNodeInactive
+		// / SetComputeNodeActive). Signature matches every other
 		// dispatch* arm (see commands_release.go:cmdReleaseDispatch).
 		return cmdComputeNodesDispatch(args[1:])
+	case dispatchDeploy:
+		// PR-B (multi-host scale-out gap #2). Single subcommand
+		// today: add-node (host_vars + hosts.ini + git commit +
+		// ssh bootstrap + POST compute_nodes). The four-step
+		// coordination lives in cmd/gregalectl/commands_deploy.go.
+		return cmdDeployDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregalectl: unknown command %q\nRun 'gregalectl help' for usage.\n", args[0])
 		return 1
