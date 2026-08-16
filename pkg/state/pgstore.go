@@ -15733,3 +15733,198 @@ func (s *PgStore) ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sq
 func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error {
 	return s.dataUpstreamsQueries().PruneDataUpstreamProbesOlderThan(ctx, s.pool, pgtypeFromTime(cutoff))
 }
+
+// AppUpstreamProbeScore is the JOIN-collapsed per-upstream
+// probe summary. One row per (data_upstreams.id, region) with
+// the freshest probe's RTT. Old name: aggregate per
+// (host_redacted_hash, region) — the new per-app-scoped
+// reader returns one row per inferred upstream + region.
+//
+// The schedd chooser (PR-D) reads this in a single round-trip
+// on the wake path. The previous N+1 design (1 ListAllAppDataUpstreams
+// + N ListDataUpstreamProbesByHostRegion) cost N+1 PG round-trips
+// per wake; for a Scale plan app with DataPlacementHintsPerApp=50,
+// that's 51 round-trips on the wake goroutine under appMu —
+// far past the < 1 ms wake-budget claim. The JOIN collapses
+// the read to a single round-trip.
+type AppUpstreamProbeScore struct {
+	HostRedactedHash string
+	Region           string
+	Kind             DataUpstreamKind
+	Port             int
+	RTTMs            *int
+	OK               bool
+}
+
+// ListAppUpstreamProbeScores (ADR-098 PR-D) returns the freshest
+// probe per (data_upstreams.id, region) for the given app.
+//
+// SQL shape (hand-rolled, not sqlc — the JOIN with DISTINCT ON
+// is a single statement and adding it via sqlc would require a
+// schema-bound regeneration):
+//
+//	SELECT DISTINCT ON (u.id, p.region)
+//	       u.host_redacted_hash, p.region, u.kind, u.port,
+//	       p.rtt_ms, p.ok
+//	FROM data_upstreams u
+//	LEFT JOIN LATERAL (
+//	  SELECT region, rtt_ms, ok
+//	  FROM data_upstream_probes
+//	  WHERE host_redacted_hash = u.host_redacted_hash
+//	  ORDER BY sampled_at DESC
+//	  LIMIT 1
+//	) p ON true
+//	WHERE u.account_id = $1 AND u.app_id = $2
+//	  AND u.declared_region IS NOT NULL
+//
+// The LATERAL subquery keeps the index-driven lookup hot
+// (data_upstream_probes partitioned by sampled_at, the
+// (host_redacted_hash, sampled_at) index is the probe-loop's
+// hot path). One round-trip per wake.
+func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]AppUpstreamProbeScore, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (u.id, p.region)
+		       u.host_redacted_hash, p.region, u.kind, u.port,
+		       p.rtt_ms, p.ok
+		FROM data_upstreams u
+		LEFT JOIN LATERAL (
+			SELECT region, rtt_ms, ok
+			FROM data_upstream_probes
+			WHERE host_redacted_hash = u.host_redacted_hash
+			ORDER BY sampled_at DESC
+			LIMIT 1
+		) p ON true
+		WHERE u.account_id = $1 AND u.app_id = $2
+		  AND u.declared_region IS NOT NULL
+	`, accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppUpstreamProbeScore
+	for rows.Next() {
+		var s AppUpstreamProbeScore
+		var kind string
+		var rtt *int32
+		if err := rows.Scan(&s.HostRedactedHash, &s.Region, &kind, &s.Port, &rtt, &s.OK); err != nil {
+			return nil, err
+		}
+		if rtt != nil {
+			v := int(*rtt)
+			s.RTTMs = &v
+		}
+		s.Kind = DataUpstreamKind(kind)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListAllAppDataUpstreams returns every data_upstreams row on the
+// app across all scopes, scoped to accountID. Used by apid's
+// GET /v1/apps/{slug}/upstreams?scope=__all__ arm to render the
+// full list without a cursor. The row count is bounded by
+// DataPlacementHintsPerApp (0/3/10/50 by plan per ADR-098 §D5)
+// so the scan is cheap.
+func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, account_id, app_id, source, scope, kind, host, port,
+		        host_redacted_hash, coalesce(declared_region, ''),
+		        last_rtt_ms, last_probed_at, last_seen_at, created_at
+		 from data_upstreams
+		 where account_id = $1 and app_id = $2
+		 order by created_at desc, id desc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstream
+	for rows.Next() {
+		var (
+			id, accountIDpg, appIDpg                                    pgtype.UUID
+			source, scope, kind, host, hostRedactedHash, declaredRegion string
+			port                                                        int32
+			lastRTT                                                     pgtype.Int4
+			lastProbedAt                                                pgtype.Timestamptz
+			lastSeenAt, createdAt                                       pgtype.Timestamptz
+		)
+		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
+			&hostRedactedHash, &declaredRegion,
+			&lastRTT, &lastProbedAt, &lastSeenAt, &createdAt); err != nil {
+			return nil, err
+		}
+		var rttPtr *int
+		if lastRTT.Valid {
+			v := int(lastRTT.Int32)
+			rttPtr = &v
+		}
+		var probedPtr *time.Time
+		if lastProbedAt.Valid {
+			t := timeFromPgtype(lastProbedAt)
+			probedPtr = &t
+		}
+		out = append(out, DataUpstream{
+			ID:               uuidFromPgtype(id),
+			AccountID:        uuidFromPgtype(accountIDpg),
+			AppID:            uuidFromPgtype(appIDpg),
+			Source:           DataUpstreamSource(source),
+			Scope:            scope,
+			Kind:             DataUpstreamKind(kind),
+			Host:             host,
+			Port:             int(port),
+			HostRedactedHash: hostRedactedHash,
+			DeclaredRegion:   declaredRegion,
+			LastRTTMs:        rttPtr,
+			LastProbedAt:     probedPtr,
+			LastSeenAt:       timeFromPgtype(lastSeenAt),
+			CreatedAt:        timeFromPgtype(createdAt),
+		})
+	}
+	return out, rows.Err()
+}
+
+// CountDataUpstreamsByApp is the per-plan quota helper. Counts
+// ALL scope values for the app per ADR-098 §D5
+// (DataPlacementHintsPerApp is per-app, not per-scope). Mirrors
+// CountAppEnv's posture.
+func (s *PgStore) CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from data_upstreams where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
+// ListDistinctUpstreamHostHashes walks data_upstreams and
+// returns the deduplicated set of
+// (host_redacted_hash, kind, port, host) tuples. Used by the
+// meterd probe loop (PR-C).
+//
+// The plaintext host is included in the row so the probe can
+// resolve the dial address. §11 invariant scope: the host
+// NEVER reaches the Prom metric labels, the audit emit, the
+// pg_notify payload, or any log line. The probe carries the
+// plaintext in-process ONLY for the duration of the dial,
+// then drops it. The customer-facing list/get endpoints
+// return host_redacted_hash + host_last4 — NEVER plaintext.
+func (s *PgStore) ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error) {
+	rows, err := s.pool.Query(ctx,
+		`select host_redacted_hash, kind, port, host
+		 from data_upstreams
+		 group by host_redacted_hash, kind, port, host`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstreamTarget
+	for rows.Next() {
+		var t DataUpstreamTarget
+		var kind string
+		if err := rows.Scan(&t.HostRedactedHash, &kind, &t.Port, &t.Host); err != nil {
+			return nil, err
+		}
+		t.Kind = DataUpstreamKind(kind)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}

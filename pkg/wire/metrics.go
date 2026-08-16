@@ -383,6 +383,22 @@ type OpsMetrics struct {
 	// failure (alertable). Single-registry: registered on every
 	// daemon; only apid increments via ObservePreviewJanitor.
 	previewJanitorOutcomes *prometheus.CounterVec
+	// dataUpstreamRTT (ADR-098 PR-C) — observed RTT bucketed
+	// per (kind, host_redacted_hash, region). The label set is
+	// closed: kind ∈ closed-vocab; host_redacted_hash is the
+	// 8-hex prefix of sha256(salt||host); region is the meterd
+	// node's compute_nodes.region. §11: the plaintext host NEVER
+	// appears in any label. Histogram (not Gauge) — the alert
+	// rules at faas.rules.yml:1062-1087 read p95 RTT via
+	// histogram_quantile() over the `_bucket` series.
+	dataUpstreamRTT *prometheus.HistogramVec
+	// dataUpstreamProbes (ADR-098 PR-C) — counter for the
+	// probe outcome class. outcome ∈ {ok, timeout, refused,
+	// tls_handshake, dns, unreachable}.
+	dataUpstreamProbes *prometheus.CounterVec
+	// dataUpstreamProbeDuration (ADR-098 PR-C) — wall-clock
+	// duration of each probe (TCP+TLS handshake).
+	dataUpstreamProbeDuration prometheus.Histogram
 	// accountLabels: the bounded admission set shared by the
 	// account_id-labelled metrics above. See accountLabelSet docs
 	// for the fixed-capacity, non-evicting contract — an evicting
@@ -2311,6 +2327,34 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Retention cron outcomes for the customer-facing error grouping store (ADR-096), labelled by outcome ∈ {ok, no_accounts, failed}. `ok` is the §12 retention-enforcement panel (rate over 24h, MUST be >0 once an account iterator lands — Free 1d / Hobby 7d / Pro 30d / Scale 90d ceiling). `no_accounts` is the signal that the cron ran but had no accounts to walk (PR-A ships with no iterator wired, so this fires every 24h until PR-B lands the account iterator alongside the reader-path handlers). `failed` is the tripwire for a SQL-level failure (alertable). Single-registry: registered on every daemon; only apid increments via ObserveAppErrorsPurge.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, appErrorsPurges)
+
+	// --- ADR-098 connection-aware execution (PR-C) -----------
+	//
+	// Three new metrics for the meterd probe loop. Labels
+	// carry ONLY the host_redacted_hash (8-char prefix from
+	// logsanitize.HashShort) — the plaintext host NEVER
+	// appears in any label. The metric set is the §12
+	// "data placement" panel; schedd's chooser bias (PR-D)
+	// also reads from the same data_upstream_probes table
+	// rather than scraping these metrics.
+	dataUpstreamRTT := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_data_upstream_rtt_ms",
+		Help:    "Observed RTT (ms) bucketed per (kind, host_redacted_hash, region). Buckets cover 1ms..3s — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. The label set is closed: kind ∈ {postgres, redis, mongo, ...}; host_redacted_hash is the 8-hex-char prefix of sha256(salt||host); region is the meterd node's compute_nodes.region. The plaintext host is NEVER in the labels (ADR-098 §11). §12 data-placement dashboard panel.",
+		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 3000},
+	}, []string{"kind", "host_redacted_hash", "region"})
+	dataUpstreamProbes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_data_upstream_probes_total",
+		Help: "Probe outcomes (TCP+TLS via crypto/tls.Dial). Closed-set labels: outcome ∈ {ok, timeout, refused, tls_handshake, dns, unreachable}. §12 data-placement panel; pre-instantiated so the rows surface from a fresh process.",
+	}, []string{"outcome"})
+	dataUpstreamProbeDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    prefix + "_data_upstream_probe_duration_seconds",
+		Help:    "Per-probe wall-clock duration (TCP+TLS handshake). Buckets cover the 1ms..3s range — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. §12 data-placement panel.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 3},
+	})
+	commonCollectors = append(commonCollectors, dataUpstreamRTT, dataUpstreamProbes, dataUpstreamProbeDuration)
+	for _, o := range []string{"ok", "timeout", "refused", "tls_handshake", "dns", "unreachable"} {
+		dataUpstreamProbes.WithLabelValues(o)
+	}
 	// Pre-instantiate the outcome set so /metrics surfaces the
 	// rows from a fresh process (Prometheus skips zero-valued
 	// CounterVec series by default). Extending the outcome
@@ -2858,6 +2902,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appErrorsFlushDuration:             appErrorsFlushDuration,
 		appErrorsPurges:                    appErrorsPurges,
 		previewJanitorOutcomes:             previewJanitorOutcomes,
+		dataUpstreamRTT:                    dataUpstreamRTT,
+		dataUpstreamProbes:                 dataUpstreamProbes,
+		dataUpstreamProbeDuration:          dataUpstreamProbeDuration,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,

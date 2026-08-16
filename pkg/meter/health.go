@@ -44,12 +44,20 @@ type HealthStatus struct {
 // a dunning timer doesn't permanently report `dunning` in Stale.
 func (l *Loop) Health(now time.Time) HealthStatus {
 	intervals := map[string]time.Duration{
-		"sample": l.cfg.SampleInterval,
-		"quota":  l.cfg.QuotaInterval,
-		"stripe": l.cfg.StripeInterval,
+		"sample":         l.cfg.SampleInterval,
+		"quota":          l.cfg.QuotaInterval,
+		"stripe":         l.cfg.StripeInterval,
+		"upstream_probe": l.cfg.UpstreamProbeInterval,
+		"upstream_part":  l.cfg.UpstreamPartitionCreateInterval,
 	}
 	if l.dunning != nil {
 		intervals["dunning"] = l.cfg.DunningInterval
+	}
+	if l.probe == nil {
+		delete(intervals, "upstream_probe")
+	}
+	if l.partitionCreate == nil {
+		delete(intervals, "upstream_part")
 	}
 	s := HealthStatus{Ticks: make(map[string]string, len(intervals))}
 	for name, interval := range intervals {

@@ -501,6 +501,29 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return fmt.Errorf("schedd: init engine: %w", err)
 	}
 	engine.WithOpsMetrics(ops)
+	// ADR-098 PR-D: connection-aware upstream affinity. Wired
+	// when FAAS_UPSTREAM_AFFINITY=1 is set (default OFF per the
+	// cluster outline's rollout gate — flip PR-D last, one
+	// month after PR-C). When OFF, the engine's upstreamAffinity
+	// stays nil and the chooser falls back to the legacy
+	// tie-break (Score returns ok=false → Request.PreferredRegion
+	// stays empty). FAAS_UPSTREAM_AFFINITY_TTL is operator-
+	// overridable (default api.UpstreamAffinityTTL = 30 s, matching
+	// the meterd probe cadence so the cache is never more than
+	// one probe-cycle stale).
+	if os.Getenv("FAAS_UPSTREAM_AFFINITY") != "" {
+		ttl := api.UpstreamAffinityTTL
+		if v := os.Getenv("FAAS_UPSTREAM_AFFINITY_TTL"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				ttl = d
+			} else {
+				log.Warn("FAAS_UPSTREAM_AFFINITY_TTL parse failed; using default", "got", v, "err", err)
+			}
+		}
+		engine.WithUpstreamAffinity(sched.NewUpstreamAffinity(ttl, store))
+	} else {
+		log.Info("schedd: upstream affinity disabled — FAAS_UPSTREAM_AFFINITY unset; using legacy chooser")
+	}
 
 	// Issue #555 PR-6 — per-deployment 100% sampling window.
 	//

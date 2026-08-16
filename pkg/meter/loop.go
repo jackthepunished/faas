@@ -69,6 +69,15 @@ type Loop struct {
 	// PR-2 once the gateway gRPC stream is wired).
 	egress EgressSource
 
+	// probe (ADR-098 PR-C) is the connection-aware upstream
+	// probe driver. nil ⇒ the probe tick is skipped (FAAS_UPSTREAM_PROBE
+	// flag is off). Set via WithProbe from cmd/meterd/main.go.
+	probe *Probe
+	// partitionCreate (ADR-098 PR-C) is the data_upstream_probes
+	// partition-create cron. nil ⇒ the partition tick is
+	// skipped. Set via WithPartitionCreate from cmd/meterd/main.go.
+	partitionCreate func(ctx context.Context)
+
 	lastTickMu sync.RWMutex
 	// lastTick records the wall-clock time each named tick body last
 	// completed successfully. Keys mirror the runTicks "name" argument:
@@ -135,6 +144,42 @@ func NewLoop(store state.Store, cpu CPUSource, parker ScheddParker, pusher billi
 // PRs.
 func (l *Loop) WithEgress(egress EgressSource) *Loop {
 	l.egress = egress
+	return l
+}
+
+// WithProbe attaches the ADR-098 PR-C connection-aware probe
+// driver. cmd/meterd calls this when FAAS_UPSTREAM_PROBE=1 is
+// set; tests that don't exercise the probe surface leave it
+// unwired (the loop skips the upstream_probe tick when l.probe
+// is nil — see Run and Health). Returns the receiver so the
+// call site is one line:
+//
+//	loop := meter.NewLoop(...).WithProbe(meter.NewProbe(...))
+//
+// Nil receiver is rejected so a misconfigured daemon cannot
+// silently disable the probe; a unit test that wants the nil
+// path simply omits the setter call.
+func (l *Loop) WithProbe(p *Probe) *Loop {
+	if p == nil {
+		return l
+	}
+	l.probe = p
+	return l
+}
+
+// WithPartitionCreate attaches the data_upstream_probes
+// partition-create cron. cmd/meterd calls this when
+// FAAS_UPSTREAM_PROBE=1; the cron is gated on the same feature
+// flag as the probe driver so the table's partitions are
+// pre-created on the same one-month rollout boundary. nil
+// disables the tick (Loop.Run skips the goroutine and
+// Loop.Health omits "upstream_part" from /healthz). Returns
+// the receiver so the call site mirrors WithProbe.
+func (l *Loop) WithPartitionCreate(fn func(ctx context.Context)) *Loop {
+	if fn == nil {
+		return l
+	}
+	l.partitionCreate = fn
 	return l
 }
 
@@ -209,6 +254,34 @@ func (l *Loop) Run(ctx context.Context) error {
 					_, err := l.evaluator.RunOnce(c)
 					return err
 				}, "alerts")
+		}()
+	}
+	// ADR-098 PR-C: connection-aware upstream probe + partition
+	// cron. Both gated on the FAAS_UPSTREAM_PROBE feature flag;
+	// cmd/meterd wires WithProbe + WithPartitionCreate when the
+	// flag is on. The probe tick body calls Probe.Run which
+	// fans out per-(host_redacted_hash, kind, port) dials up to
+	// Probe.MaxConcurrent and writes one data_upstream_probes
+	// row per (hash, region). The partition cron is a free-
+	// function loop (PartitionCreateLoop in upstream_partitions.go)
+	// — the loop just owns the ctx so a daemon shutdown stops
+	// both ticks cleanly.
+	if l.probe != nil {
+		go func() {
+			errc <- l.runTicks(ctx, l.cfg.UpstreamProbeInterval,
+				func(c context.Context) error {
+					_, err := l.probe.Run(c)
+					return err
+				}, "upstream_probe")
+		}()
+	}
+	if l.partitionCreate != nil {
+		go func() {
+			errc <- l.runTicks(ctx, l.cfg.UpstreamPartitionCreateInterval,
+				func(c context.Context) error {
+					l.partitionCreate(c)
+					return nil
+				}, "upstream_part")
 		}()
 	}
 	// Block until either ctx cancels or a hard error fires.

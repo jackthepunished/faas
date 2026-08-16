@@ -125,6 +125,22 @@ func rekeyEnabledFromEnv(getenv func(string) string) bool {
 	return false
 }
 
+// dataPlacementEnabledFromEnv reads FAAS_DATA_PLACEMENT via the
+// test seam (deps.getenv) and parses the canonical truthy
+// spellings. Default false preserves the v1 no-op posture —
+// pre-PR-B operators see exactly zero data-upstream handler
+// activity (no row INSERT, no audit kind, no pg_notify trigger
+// trip). Mirrors rekeyEnabledFromEnv's shape.
+func dataPlacementEnabledFromEnv(getenv func(string) string) bool {
+	v := strings.ToLower(strings.TrimSpace(getenv("FAAS_DATA_PLACEMENT")))
+	for _, lit := range rekeyTruthyLiterals {
+		if v == lit {
+			return true
+		}
+	}
+	return false
+}
+
 // firstNonEmpty returns the first non-empty string among the
 // args. Used by the log archive wire-up so an explicit env
 // var (FAAS_LOG_ARCHIVE_*) wins over a value in the sealed
@@ -1118,6 +1134,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("apid: reqbudget middleware config: %w", err)
 	}
+
+	// ADR-098 PR-B / C4 — per-PR feature flag
+	// (FAAS_DATA_PLACEMENT=1). Default OFF preserves the
+	// pre-PR-B byte-for-byte posture. Ops flips the flag
+	// per-node after the cluster-outline's "Rollout gate"
+	// one-month soak.
+	srv.WithDataPlacement(dataPlacementEnabledFromEnv(deps.getenv))
 	// issue #517 / PR-C / ADR-064: thread the events Platform
 	// into the server so the audit subscriber (which receives
 	// the signature-rejection kinds from imaged's verify hook)

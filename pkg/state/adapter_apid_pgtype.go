@@ -41,6 +41,16 @@ type UUID = pgtype.UUID
 // without importing pgtype directly.
 type Timestamptz = pgtype.Timestamptz
 
+// Text is the sqlc/pgtype.Text exposed under the state package's
+// surface so cmd/apid can build sqlc params for nullable text
+// columns (declared_region) without importing pgtype directly.
+type Text = pgtype.Text
+
+// Int4 is the sqlc/pgtype.Int4 exposed under the state package's
+// surface so cmd/apid can build sqlc params for nullable int4
+// columns (last_rtt_ms) without importing pgtype directly.
+type Int4 = pgtype.Int4
+
 // NewPgtypeUUID wraps google/uuid.UUID into pgtype.UUID with
 // Valid=true. Use this for NOT NULL uuid columns (account_id,
 // app_id, fingerprint lookup keys).
