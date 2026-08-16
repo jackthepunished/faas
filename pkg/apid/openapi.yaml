@@ -9534,7 +9534,8 @@ components:
       type: object
       required:
         [id, account_id, app_id, kind, config, batch_size_max, batch_window_ms,
-         max_attempts, enabled, created_at, updated_at]
+         max_attempts, payload_max_bytes, broker_poison_strategy, enabled,
+         created_at, updated_at]
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
@@ -9567,6 +9568,32 @@ components:
           type: integer
           minimum: 1
           maximum: 25
+        payload_max_bytes:
+          type: integer
+          minimum: 1024
+          maximum: 67108864
+          description: |
+            Per-record broker payload byte cap (migration 00274).
+            Records above this size are DLQ'd at insert time with
+            reason='payload_too_large' rather than silently truncated.
+            Plan-level ceiling in /v1/limits TriggerPayloadMaxBytes.
+            Default 6291456 (6 MiB) when omitted on create.
+        broker_poison_strategy:
+          type: string
+          enum: [commit, seek-to-offset]
+          description: |
+            Kafka-only poison-record handling strategy (migration 00275,
+            audit #10). "commit" (default) advances the broker offset
+            via CommitMessages when the dispatcher dead-letters a
+            record — the broker offset and the DB dead-letter state
+            are permanently out of sync for that offset; operator
+            retry works via the dashboard's "re-drive from DLQ"
+            action which mints a fresh trigger_records row from the
+            same item_id. "seek-to-offset" calls SetOffset(msg.Offset)
+            instead so the next Poll re-fetches the same message —
+            operator retry combines a trigger re-enable with a
+            dashboard "reset offset" action that re-fetches the
+            dead-lettered payload. No effect on non-kafka kinds.
         # Cron-only fields; mutually exclusive with slug (SQL CHECK).
         schedule: { type: [string, "null"], example: "*/5 * * * *" }
         path: { type: [string, "null"] }
@@ -9601,6 +9628,14 @@ components:
         batch_size_max: { type: [integer, "null"], minimum: 1, maximum: 5000 }
         batch_window_ms: { type: [integer, "null"], minimum: 10, maximum: 600000 }
         max_attempts: { type: [integer, "null"], minimum: 1, maximum: 25 }
+        payload_max_bytes: { type: [integer, "null"], minimum: 1024, maximum: 67108864 }
+        broker_poison_strategy:
+          type: [string, "null"]
+          enum: [commit, seek-to-offset, null]
+          description: |
+            Kafka-only poison-record handling strategy. null/omitted
+            falls through to the DB default 'commit'. Same semantics
+            as the Trigger read shape.
         schedule: { type: [string, "null"], example: "*/5 * * * *" }
         path: { type: [string, "null"] }
 
@@ -9617,6 +9652,15 @@ components:
         batch_size_max: { type: [integer, "null"], minimum: 1, maximum: 5000 }
         batch_window_ms: { type: [integer, "null"], minimum: 10, maximum: 600000 }
         max_attempts: { type: [integer, "null"], minimum: 1, maximum: 25 }
+        payload_max_bytes: { type: [integer, "null"], minimum: 1024, maximum: 67108864 }
+        broker_poison_strategy:
+          type: [string, "null"]
+          enum: [commit, seek-to-offset, null]
+          description: |
+            Kafka-only poison-record handling strategy. null/omitted
+            means "leave unchanged" (the SQL coalesce() in
+            pkg/state/pgstore.go::UpdateTrigger keeps the existing
+            value). Same semantics as the Trigger read shape.
         schedule: { type: [string, "null"], example: "*/5 * * * *" }
         path: { type: [string, "null"] }
 
