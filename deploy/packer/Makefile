@@ -16,7 +16,17 @@
 
 PACKER ?= packer
 PKR_DIR := $(dir $(abspath $(firstword $(MAKEFILE_LIST))))
-COMMON_FLAGS ?= -syntax-only -color=false
+
+# Packer's `validate` and `build` subcommands accept disjoint flag sets:
+#   - validate accepts: -syntax-only, -except=, -only=, -machine-readable,
+#     -var=, -var-file=, -no-warn-undeclared-var, -evaluate-datasources
+#   - build accepts the same PLUS -color, -force, -parallel-build=N, etc.
+# Conflating them (older `COMMON_FLAGS=-syntax-only -color=false`) makes
+# `packer validate -color=false` reject the unknown flag in 1.10.0:
+#   flag provided but not defined: -color
+# (PR #929 CI fix: split per-subcommand.)
+VALIDATE_FLAGS ?= -syntax-only
+BUILD_FLAGS    ?= -color=false
 
 # Pin Packer version per ADR-111 so local + CI agree byte-for-byte.
 # Install via ../scripts/install-packer.sh — apt's packer is too new.
@@ -41,7 +51,7 @@ image-validate: ## CI gate: syntax-validate every builder (works without cloud c
 	}
 	@for f in $(PKR_DIR)*.pkr.hcl; do \
 	  echo "image-validate: $$f"; \
-	  $(PACKER) validate $(COMMON_FLAGS) $$f || exit 1; \
+	  $(PACKER) validate $(VALIDATE_FLAGS) $$f || exit 1; \
 	done
 
 # ---------------------------------------------------------------------------
@@ -53,20 +63,20 @@ image-validate: ## CI gate: syntax-validate every builder (works without cloud c
 .PHONY: image-build-hcloud
 image-build-hcloud: ## Build + upload hcloud snapshot (requires HCLOUD_TOKEN)
 	@test -n "$$HCLOUD_TOKEN" || { echo "HCLOUD_TOKEN required" >&2; exit 1; }
-	$(PACKER) build -color=false deploy/packer/hcloud.pkr.hcl
+	$(PACKER) build $(BUILD_FLAGS) deploy/packer/hcloud.pkr.hcl
 
 .PHONY: image-build-hcloud-canary
 image-build-hcloud-canary: ## CI canary: build a tag-suffixed canary image
 	@test -n "$$HCLOUD_TOKEN" || { echo "HCLOUD_TOKEN required" >&2; exit 1; }
-	$(PACKER) build -color=false -var git_sha=canary-$$(date +%s) deploy/packer/hcloud.pkr.hcl
+	$(PACKER) build $(BUILD_FLAGS) -var git_sha=canary-$$(date +%s) deploy/packer/hcloud.pkr.hcl
 
 .PHONY: image-build-amazon-ebs
 image-build-amazon-ebs: ## Build + register AWS AMI (requires AWS creds via env)
-	$(PACKER) build -color=false deploy/packer/amazon-ebs.pkr.hcl
+	$(PACKER) build $(BUILD_FLAGS) deploy/packer/amazon-ebs.pkr.hcl
 
 .PHONY: image-build-iso
 image-build-iso: ## Build bare-metal autoinstall ISO (no cloud creds; output is an .iso)
-	$(PACKER) build -color=false deploy/packer/iso.pkr.hcl
+	$(PACKER) build $(BUILD_FLAGS) deploy/packer/iso.pkr.hcl
 
 # ---------------------------------------------------------------------------
 # Inspect / list

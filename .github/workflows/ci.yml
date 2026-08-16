@@ -1322,10 +1322,10 @@ jobs:
     # job doesn't block the PR. On merge to main, the rule is
     # required green (enforced via branch protection, NOT this file).
     #
-    # Required secrets: HCLOUD_TOKEN (Hetzner Cloud API token). The
-    # canary writes to a Hetzner project that's separate from
-    # production — operator maintains the project ID via
-    # HCLOUD_PROJECT_ID. Both are stored as GitHub Actions secrets.
+    # Required secrets (hcloud steps only): HCLOUD_TOKEN. PRs from forks
+    # don't get repo-scoped secrets, so the canary build only runs on
+    # PRs whose head repo IS poyrazK/faas (i.e. internal contributors).
+    # External PRs gate on `image-validate` (no creds) instead.
     name: image-build-canary (hcloud)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1334,7 +1334,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: install-packer (pinned)
         run: scripts/install-packer.sh
-      - name: hcloud CLI
+      - name: install hcloud CLI
         run: |
           set -euo pipefail
           # Asset name + SHA-256 from
@@ -1352,11 +1352,20 @@ jobs:
           tar -xzf /tmp/hcloud.tar.gz -C /tmp hcloud
           sudo mv /tmp/hcloud /usr/local/bin/
           hcloud version
+      # Syntactic gate, runs on every PR regardless of secret wiring.
+      # Uses VALIDATE_FLAGS (-syntax-only) which works against any
+      # HCL without cloud creds. Replaces `image-build-hcloud-canary`
+      # as the no-creds gate; the build step below runs only when
+      # HCLOUD_TOKEN is wired (merge to main, internal PRs).
+      - name: validate every builder
+        run: make -C deploy/packer image-validate
       - name: build canary snapshot
+        if: ${{ env.HCLOUD_TOKEN != '' }}
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: make -C deploy/packer image-build-hcloud-canary
       - name: "smoke: list canary snapshot"
+        if: ${{ env.HCLOUD_TOKEN != '' }}
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
