@@ -210,7 +210,7 @@ func TestKafka_NackBrokerErrorAlwaysRewinds(t *testing.T) {
 
 	for _, stratName := range []string{"commit", "seek-to-offset", ""} {
 		stratName := stratName
-		t.Run("strat="+stratName, func(t *testing.T) {
+		t.Run("strategy="+stratName, func(t *testing.T) {
 			t.Parallel()
 
 			rdr := &poisonStrategyReader{}
@@ -218,15 +218,15 @@ func TestKafka_NackBrokerErrorAlwaysRewinds(t *testing.T) {
 			trig := sqlc.Trigger{BrokerPoisonStrategy: stratName}
 
 			if err := k.Nack(context.Background(), trig, []string{id}, triggerReasonBrokerError); err != nil {
-				t.Fatalf("Nack strat=%q: %v", stratName, err)
+				t.Fatalf("Nack strategy=%q: %v", stratName, err)
 			}
 			rdr.mu.Lock()
 			defer rdr.mu.Unlock()
 			if rdr.poisonOp != poisonOpSetOffset {
-				t.Fatalf("broker_error strat=%q: poison op = %v, want %v (broker_error must always SetOffset)", stratName, rdr.poisonOp, poisonOpSetOffset)
+				t.Fatalf("broker_error strategy=%q: poison op = %v, want %v (broker_error must always SetOffset)", stratName, rdr.poisonOp, poisonOpSetOffset)
 			}
 			if len(rdr.offsets) != 1 || rdr.offsets[0] != 123 {
-				t.Fatalf("broker_error strat=%q: rewound offsets = %v, want [123]", stratName, rdr.offsets)
+				t.Fatalf("broker_error strategy=%q: rewound offsets = %v, want [123]", stratName, rdr.offsets)
 			}
 		})
 	}
