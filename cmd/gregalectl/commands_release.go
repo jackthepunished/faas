@@ -45,6 +45,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/releaseinstall"
 	"github.com/onebox-faas/faas/pkg/roleTemplating"
+	"github.com/onebox-faas/faas/pkg/state"
 )
 
 // release subcommands.
@@ -310,65 +311,16 @@ func cmdReleaseInstall(args []string) int {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: flip symlink: %v\n", err)
 		return 3
 	}
-	// ADR-112: after the symlink flip (the load-bearing step),
-	// apply role templating. The drop-ins + daemon-reload are
-	// what materially makes FAAS_BOX_ROLE take effect on the box.
-	// Failure here aborts the install with exit 4 — the symlink is
-	// flipped but the daemons aren't role-correct yet. Doctor
-	// (PR #921) will flag this; the operator re-runs with the
-	// correct --role to recover.
-	if *roleFlag != "" {
-		role := roleTemplating.Role(*roleFlag)
-		if err := roleTemplating.ApplyFilesystem(role); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: apply role %s: %v\n", *roleFlag, err)
-			return 4
-		}
-		// Start the role-appropriate subset in DEPENDENCY ORDER
-		// (post-#930 review Fix 8). pkg/roleTemplating.StartOrder
-		// intersects pkg/daemonunitspec.RestartOrder (Kahn on
-		// Lifecycle.After) with the role subset, so vmmd starts
-		// before schedd, schedd before gatewayd-internal,
-		// gatewayd-internal before gatewayd-public. PR-A runs
-		// Apply on a blank box (first-boot); idempotency is
-		// preserved because systemctl start on an already-active
-		// unit is a no-op.
-		daemons, err := roleTemplating.StartOrder(role)
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: StartOrder(%s): %v\n", *roleFlag, err)
-			return 4
-		}
-		for _, d := range daemons {
-			cmd := exec.Command("systemctl", "start", fmt.Sprintf("faas-%s.service", d))
-			if out, err := cmd.CombinedOutput(); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr,
-					"gregalectl release install: start faas-%s.service: %v (%s)\n",
-					d, err, string(out))
-				return 4
-			}
-		}
-	}
-	// DB writes — best effort. The on-disk symlink flip is the
-	// load-bearing side; the DB row records the audit trail and
-	// first-write-wins mark.
-	pool, dbErr := openPgPoolFromEnv()
+	// Open the DB pool BEFORE the role branch so PR-B's drain gate
+	// and compute_nodes.role read can use it. The DB can fail
+	// (no DSN, no row) — that's the legacy first-boot path; we
+	// fall through to the env fallback. node is the canonical
+	// compute_nodes.name for this box.
+	openPool, dbErr := openPgPoolFromEnv()
 	if dbErr != nil {
-		if jsonEnabled() {
-			jsonEmit(os.Stdout, releaseInstallReport{
-				GitSHA:      *gitSHA,
-				DBError:     dbErr.Error(),
-				SymlinkOnly: true,
-			})
-		} else {
-			_, _ = fmt.Fprintf(os.Stdout, "flipped current -> %s (DB unreachable: %v)\n", *gitSHA, dbErr)
-		}
-		return 3
-	}
-	defer pool.Close()
-	store := releaseinstall.NewStore(pool)
-	first, err := store.MarkApplied(context.Background(), *gitSHA)
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: mark applied: %v\n", err)
-		return 3
+		openPool = nil // legacy / --no-db mode
+	} else {
+		defer openPool.Close()
 	}
 	node := *nodeName
 	if node == "" {
@@ -377,6 +329,89 @@ func cmdReleaseInstall(args []string) int {
 		if herr != nil {
 			node = "unknown"
 		}
+	}
+	// ADR-112: after the symlink flip (the load-bearing step),
+	// apply role templating. The drop-ins + daemon-reload are
+	// what materially makes FAAS_BOX_ROLE take effect on the box.
+	//
+	// PR-B (issue #935) extends `--role` to be the in-place role
+	// mutation flag. On a running box with a different existing
+	// role, the flow is: read current role from DB (or env fallback),
+	// short-circuit on same-role, drain-gate on live instances,
+	// then Mutate(stop old subset, start new subset) instead of
+	// the blank-box Apply path. sealed.env / host.age / rclone.conf
+	// / cosign keys / TLS leaves are NOT touched — the mutation is
+	// purely a "what daemons run here" change.
+	if *roleFlag != "" {
+		target := roleTemplating.Role(*roleFlag)
+		// Read the current role. PR-B prefers the DB (compute_nodes.role
+		// by id) over the env fallback. The DB can fail (no DSN, no row)
+		// — that's the legacy first-boot path; we fall through to env
+		// or to the blank-box Apply.
+		current := readCurrentRole(context.Background(), openPool, node)
+		if current == target {
+			// Idempotent re-run. No drop-in re-templating, no
+			// daemon restarts. Print a clear no-op line so the
+			// operator sees their intent was honored.
+			_, _ = fmt.Fprintf(os.Stderr,
+				"gregalectl release install: already role=%s; no-op (sealed-env and daemons untouched)\n",
+				current)
+		} else {
+			// Drain gate. Hard block on live instances.
+			if err := assertDrainStatus(context.Background(), openPool, node); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"gregalectl release install: %v\n"+
+						"  run: gregalectl compute-nodes drain-status --node %s\n"+
+						"  then: gregalectl compute-nodes force-drain --node %s --yes (operator override)\n",
+					err, node, node)
+				return 4
+			}
+			// Re-template drop-ins for the new role. Idempotent
+			// write of identical bytes (the only thing that
+			// differs is the FAAS_BOX_ROLE / FAAS_<DAEMON>_ROLE
+			// values).
+			if err := roleTemplating.ApplyFilesystem(target); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: apply role %s: %v\n", target, err)
+				return 4
+			}
+			// Run the Mutate contract: stop the (from \ to) subset
+			// in reverse dependency order with gatewayd-public last,
+			// start the (to \ from) subset in forward dependency order.
+			// Empty from (blank-box first-boot) or from == target
+			// (idempotent) means no systemctl calls.
+			stopped, started, err := roleTemplating.Mutate(current, target, systemctlExec)
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"gregalectl release install: mutate role %s -> %s: %v\n",
+					current, target, err)
+				return 4
+			}
+			_, _ = fmt.Fprintf(os.Stderr,
+				"gregalectl release install: re-rolled %s -> %s (stopped %v, started %v)\n",
+				current, target, stopped, started)
+		}
+	}
+	// DB writes — best effort. The on-disk symlink flip is the
+	// load-bearing side; the DB row records the audit trail and
+	// first-write-wins mark. Reuse openPool (already opened above
+	// for the PR-B role branch).
+	if openPool == nil {
+		if jsonEnabled() {
+			jsonEmit(os.Stdout, releaseInstallReport{
+				GitSHA:      *gitSHA,
+				DBError:     "FAAS_PG_DSN not set",
+				SymlinkOnly: true,
+			})
+		} else {
+			_, _ = fmt.Fprintf(os.Stdout, "flipped current -> %s (DB unreachable: FAAS_PG_DSN not set)\n", *gitSHA)
+		}
+		return 3
+	}
+	store := releaseinstall.NewStore(openPool)
+	first, err := store.MarkApplied(context.Background(), *gitSHA)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: mark applied: %v\n", err)
+		return 3
 	}
 	// PR-6 (issue #911 / ADR-110): stamp the per-node release
 	// membership on compute_nodes. The on-disk symlink flip is the
@@ -397,6 +432,23 @@ func cmdReleaseInstall(args []string) int {
 			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: upsert compute_nodes: %v\n", cnErr)
 		}
 		return 3
+	}
+	// PR-B (issue #935): stamp the post-mutation role on
+	// compute_nodes.role keyed by id. Wraps pkg/state.PgStore
+	// (raw Exec UPDATE) — the runtime path is keyed by id, not
+	// by name; the renderer's releaseinstall.Store.SetComputeNodeRole
+	// (PR-2, name-keyed) is the manifest-time path and intentionally
+	// separate. Mirrors the existing "best-effort like MarkApplied"
+	// semantics: a write failure here logs but doesn't fail the
+	// install (the on-disk symlink flip + drop-ins are the
+	// load-bearing side; doctor --deep will surface the drift).
+	if *roleFlag != "" {
+		pgstore := state.NewPgStore(openPool)
+		if err := pgstore.SetComputeNodeRole(context.Background(), cnID, *roleFlag); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: set compute_nodes.role: %v\n", err)
+			// Don't fail the install; the on-disk state is the
+			// source of truth. Doctor will report the drift.
+		}
 	}
 	if jsonEnabled() {
 		jsonEmit(os.Stdout, releaseInstallReport{
@@ -465,6 +517,80 @@ func readFirstBootRole() (string, bool) {
 		return value, true
 	}
 	return "", false
+}
+
+// readCurrentRole resolves the box's current role (ADR-112 PR-B).
+// Tries compute_nodes.role via pgxpool first (the DB is the source
+// of truth per the PR-B plan), then falls back to FAAS_BOX_ROLE
+// from /etc/faas/first-boot.env, then returns the empty Role as
+// "blank-box first-boot" (no current role to compare against).
+//
+// All failure modes are silent-by-design: PR-B is best-effort. The
+// caller treats empty Role as "no current role" and runs the
+// blank-box Apply path (PR-A behavior, unchanged).
+//
+// We read by node NAME on the compute_nodes table (the primary key
+// is id, but the manifest renderer keys by name; the row is unique
+// on name). The id is fetched in the same Query so the caller can
+// re-use it for the SetComputeNodeRole by-id write later.
+func readCurrentRole(ctx context.Context, pool *pgxpool.Pool, nodeName string) roleTemplating.Role {
+	if pool != nil && nodeName != "" {
+		row := pool.QueryRow(ctx,
+			`SELECT id, role FROM compute_nodes WHERE name = $1`, nodeName)
+		var id, role *string
+		if err := row.Scan(&id, &role); err == nil {
+			if role != nil && *role != "" {
+				return roleTemplating.Role(*role)
+			}
+		}
+	}
+	if envRole, ok := readFirstBootRole(); ok && envRole != "" {
+		return roleTemplating.Role(envRole)
+	}
+	return ""
+}
+
+// assertDrainStatus fails PR-B's drain gate. Returns nil if the
+// node has no live instances (drain-safe), or a loud error pointing
+// at the operator-override path otherwise.
+//
+// Walks the same SQL as cmdComputeNodesDrainStatus (the dedicated
+// compute-nodes subcommand) for parity, but inlined here so the
+// gate is a single function call without forking the CLI. The
+// Postgres query counts rows in (WAKING, COLD_BOOTING, RUNNING)
+// keyed by the node_id column on the instances table.
+//
+// Errors reading the DB are treated as "fail closed" — better to
+// block a re-role than to mutate a node whose instance state we
+// couldn't prove was safe.
+func assertDrainStatus(ctx context.Context, pool *pgxpool.Pool, nodeName string) error {
+	if pool == nil || nodeName == "" {
+		return nil // no DB / no node: skip the gate (legacy first-boot)
+	}
+	var live int
+	err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM instances
+		 WHERE node_id = (SELECT id FROM compute_nodes WHERE name = $1)
+		   AND state IN ('WAKING', 'COLD_BOOTING', 'RUNNING')
+	`, nodeName).Scan(&live)
+	if err != nil {
+		return fmt.Errorf("drain gate: cannot read live-instance count: %w", err)
+	}
+	if live > 0 {
+		return fmt.Errorf("node %q has %d live instances; re-role would kill them mid-request", nodeName, live)
+	}
+	return nil
+}
+
+// systemctlExec is the production execCommand adapter for
+// roleTemplating.Mutate. Returns the combined stdout+stderr string
+// (so Mutate's error path can include systemctl's diagnostic
+// output) or an error. Mutate swallows the output on the success
+// path; the error path's string is what the operator sees.
+func systemctlExec(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // releaseBundleReport is the JSON wire shape for `gregalectl release
