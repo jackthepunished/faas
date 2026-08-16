@@ -1978,6 +1978,15 @@ type Store interface {
 	MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error
 	MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error
 	InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID, reason, routedTo string, detail []byte) error
+	// TriggerRecordIDByItemIdentifier resolves a broker-side handle
+	// (kafka offset, NATS seq, SQS receipt handle, Redis entry-id,
+	// queue invocation_id) to the durable trigger_records.id UUID
+	// the dead_letter FK expects. Returns ("", nil) when no row
+	// exists yet (rate-limit fires before the record insert on the
+	// next dispatch step); callers MUST treat the empty string as
+	// "skip the dead_letter insert; the record will be retried on
+	// the next tick". See audit round 2 finding #1 (PR #910).
+	TriggerRecordIDByItemIdentifier(ctx context.Context, triggerID, itemIdentifier string) (string, error)
 	ListTriggerDeadLetter(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerDeadLetter, error)
 	ListTriggerRecordsForTrigger(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error)
 	RetryTriggerRecordByOperator(ctx context.Context, id string) error

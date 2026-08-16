@@ -118,6 +118,11 @@ type storeLike interface {
 	MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error
 	MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error
 	InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID, reason, routedTo string, detail []byte) error
+	// TriggerRecordIDByItemIdentifier (audit round 2 finding #1)
+	// bridges the broker-handle namespace (kafka offset, NATS
+	// seq, SQS receipt handle, Redis entry-id, queue invocation_id)
+	// to the trigger_records.id UUID the dead_letter FK expects.
+	TriggerRecordIDByItemIdentifier(ctx context.Context, triggerID, itemIdentifier string) (string, error)
 }
 
 // triggerWakeup is the channel-side wakeup signal the schedd's
@@ -576,17 +581,62 @@ func (l *Loop) postBatch(ctx context.Context, env triggerDispatchRequest) ([]byt
 
 // deadLetterAll marks every record as dead_letter + inserts a
 // trigger_dead_letter row.
+//
+// The `ids` slice is the list of item_identifiers the broker
+// delivered — broker handles (kafka offset, NATS seq, SQS receipt
+// handle, Redis entry-id, queue invocation_id), NOT trigger_records
+// row UUIDs. The trigger_dead_letter.record_id column is a UUID FK
+// into trigger_records.id, so we resolve each item_identifier to
+// its row UUID via TriggerRecordIDByItemIdentifier before the
+// InsertTriggerDeadLetter call.
+//
+// Audit round 2 finding #1 (PR #910): without this lookup every
+// rate-limit denial tripped SQLSTATE 23503, the dead_letter row
+// was silently dropped, MarkTriggerRecordDeadLetter updated 0
+// rows, the record stayed in poller.inFlight forever, and the
+// broker offset never advanced.
+//
+// If the row hasn't been inserted yet (rate-limit fires before
+// the InsertTriggerRecord loop on the next dispatch step), the
+// lookup returns an empty UUID — we skip the DLQ insert + skip
+// the MarkTriggerRecordDeadLetter call and leave the record in
+// poller.inFlight for the next tick to retry. Rate-limited records
+// MUST come back, not be silently lost.
+//
+// The poisoned-response path at dispatch_triggers.go:354 calls
+// this helper with row UUIDs already (it walks the `claimed`
+// result-set and reads c.ID.String()). That works because the
+// UUID lookup self-resolves: the row is by construction present,
+// so the lookup returns the same UUID we passed in.
 func (l *Loop) deadLetterAll(ctx context.Context, triggerID string, ids []string, reason, detail string, store storeLike) {
 	if store == nil || len(ids) == 0 {
 		return
 	}
 	for _, id := range ids {
-		if err := store.InsertTriggerDeadLetter(ctx, id, triggerID, reason, "drop", []byte(detail)); err != nil {
-			l.log.Warn("sched trigger tick: insert dlq", "id", id, "err", err)
+		uuid, lookupErr := store.TriggerRecordIDByItemIdentifier(ctx, triggerID, id)
+		if lookupErr != nil {
+			l.log.Warn("sched trigger tick: dlq record_id lookup",
+				"trigger_id", triggerID,
+				"item_identifier", id,
+				"err", lookupErr)
 			continue
 		}
-		if err := store.MarkTriggerRecordDeadLetter(ctx, id, reason); err != nil {
-			l.log.Warn("sched trigger tick: mark dlq", "id", id, "err", err)
+		// Empty UUID = row not yet in trigger_records (rate-limit
+		// fired before InsertTriggerRecord). Skip — the broker
+		// offset stays where it is and the next tick retries.
+		if uuid == "" {
+			l.log.Warn("sched trigger tick: dlq row missing (rate-limit before insert; record will be retried)",
+				"trigger_id", triggerID,
+				"item_identifier", id,
+				"reason", reason)
+			continue
+		}
+		if err := store.InsertTriggerDeadLetter(ctx, uuid, triggerID, reason, "drop", []byte(detail)); err != nil {
+			l.log.Warn("sched trigger tick: insert dlq", "id", uuid, "err", err)
+			continue
+		}
+		if err := store.MarkTriggerRecordDeadLetter(ctx, uuid, reason); err != nil {
+			l.log.Warn("sched trigger tick: mark dlq", "id", uuid, "err", err)
 		}
 	}
 }

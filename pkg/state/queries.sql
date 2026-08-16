@@ -1360,3 +1360,28 @@ from trigger_records
 where trigger_id = $1
 order by received_at desc
 limit $2;
+
+-- name: TriggerRecordIDByItemIdentifier :one
+-- Audit round 2 finding #1 (PR #910): deadLetterAll() is invoked
+-- with broker-side handles (kafka offset, NATS seq, SQS receipt
+-- handle, Redis entry-id, queue invocation_id) but the
+-- trigger_dead_letter.record_id column is a UUID FK into
+-- trigger_records.id. The dispatcher needs to bridge the
+-- item_identifier namespace to the row UUID before calling
+-- InsertTriggerDeadLetter — otherwise every rate-limit denial
+-- trips SQLSTATE 23503 and the dead_letter row is silently
+-- dropped, MarkTriggerRecordDeadLetter updates 0 rows, the
+-- record stays in poller.inFlight forever, and the broker
+-- offset never advances.
+--
+-- Returns the trigger_records.id for the (trigger_id,
+-- item_identifier) pair, or an empty pgtype.UUID (and nil
+-- error) when no row exists yet — that case fires when the
+-- rate-limit gate denies a record before InsertTriggerRecord
+-- has had a chance to run. Callers MUST treat the empty UUID
+-- as "skip the dead_letter insert; leave the record in
+-- poller.inFlight for the next tick to retry".
+select id
+from trigger_records
+where trigger_id = $1
+  and item_identifier = $2;

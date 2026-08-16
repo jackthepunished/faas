@@ -4931,6 +4931,23 @@ func (m *MemStore) InsertTriggerDeadLetter(_ context.Context, _, _, _, _ string,
 	return nil
 }
 
+// TriggerRecordIDByItemIdentifier (audit round 2 finding #1,
+// PR #910): the MemStore's InsertTriggerRecord builds a UUID
+// for the row at insert time; the bridge helper walks m.records
+// to find the matching UUID. Returns "" (nil err) when no row
+// matches — callers treat that as "rate-limit fired before
+// insert; skip the dead_letter; record will be retried".
+func (m *MemStore) TriggerRecordIDByItemIdentifier(_ context.Context, triggerID, itemIdentifier string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.ItemIdentifier == itemIdentifier {
+			return r.ID.String(), nil
+		}
+	}
+	return "", nil
+}
+
 func (m *MemStore) ListTriggerDeadLetter(_ context.Context, _ string, _ int32) ([]sqlc.TriggerDeadLetter, error) {
 	return nil, nil
 }

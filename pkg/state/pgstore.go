@@ -15963,6 +15963,16 @@ func (s *PgStore) MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError
 // row that pairs with a dead-lettered record. detail carries any
 // per-reason payload (broker error text, payload size that tripped
 // the 6MB cap, etc.) for the dashboard read-back.
+//
+// Audit round 2 finding #1 (PR #910): the recordID parameter MUST
+// be the trigger_records.id UUID, not a broker-side handle. The
+// trigger_dead_letter.record_id column is a UUID FK into
+// trigger_records.id; passing a kafka offset / NATS seq / SQS
+// receipt handle / Redis entry-id / queue invocation_id trips
+// SQLSTATE 23503, the dead_letter row is silently dropped, and
+// MarkTriggerRecordDeadLetter updates 0 rows. Callers must look
+// up the UUID via TriggerRecordIDByItemIdentifier before invoking
+// this method.
 func (s *PgStore) InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID, reason, routedTo string, detail []byte) error {
 	var detailArg any = []byte("{}")
 	if detail != nil {
@@ -15979,6 +15989,48 @@ func (s *PgStore) InsertTriggerDeadLetter(ctx context.Context, recordID, trigger
 // dashboard + GET /v1/triggers/{id}/metrics?include_dlq=true.
 func (s *PgStore) ListTriggerDeadLetter(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerDeadLetter, error) {
 	return s.triggerQueries().ListTriggerDeadLetter(ctx, s.pool, sqlc.ListTriggerDeadLetterParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
+}
+
+// TriggerRecordIDByItemIdentifier resolves a broker-side handle
+// (kafka offset, NATS seq, SQS receipt handle, Redis entry-id,
+// queue invocation_id) to the durable trigger_records.id UUID
+// the dead_letter FK expects.
+//
+// Audit round 2 finding #1 (PR #910): the dispatcher needs this
+// bridge because the broker side speaks the per-broker handle
+// namespace (a string) while the trigger_records table uses a
+// global UUID identity and the trigger_dead_letter.record_id FK
+// is on the UUID column. Without this lookup every rate-limit
+// denial tripped SQLSTATE 23503.
+//
+// Returns ("", nil) — empty string + nil error — when no row
+// matches. That case fires when the rate-limit gate denies a
+// record BEFORE InsertTriggerRecord has had a chance to persist
+// it (the lookup misses on the very first tick after a fresh
+// broker poll). Callers MUST treat the empty string as "skip the
+// dead_letter insert; the record will be retried on the next
+// dispatch tick". pgx.ErrNoRows is collapsed to a plain
+// ("", nil) for caller convenience.
+//
+// Also collapses malformed triggerID strings to ("", nil) via
+// mustPgUUID — a parse failure means the row simply doesn't
+// exist (the zero UUID never matches anything).
+func (s *PgStore) TriggerRecordIDByItemIdentifier(ctx context.Context, triggerID, itemIdentifier string) (string, error) {
+	id, err := s.triggerQueries().TriggerRecordIDByItemIdentifier(ctx, s.pool,
+		sqlc.TriggerRecordIDByItemIdentifierParams{
+			TriggerID:      mustPgUUID(triggerID),
+			ItemIdentifier: itemIdentifier,
+		})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	if !id.Valid {
+		return "", nil
+	}
+	return id.String(), nil
 }
 
 // ListTriggerRecordsForTrigger reads the records for a trigger in
