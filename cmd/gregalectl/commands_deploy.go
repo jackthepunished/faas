@@ -259,7 +259,7 @@ func cmdDeployAddNode(args []string) int {
 		jsonEmit(os.Stdout, report)
 		return 0
 	}
-	fmt.Fprintf(os.Stdout, "OK fqdn=%s role=%s host_vars=%s commit=%s bootstrap_passed=%t compute_node_row=%s\n",
+	_, _ = fmt.Fprintf(os.Stdout, "OK fqdn=%s role=%s host_vars=%s commit=%s bootstrap_passed=%t compute_node_row=%s\n",
 		report.FQDN, report.Role, report.HostVarsPath, report.CommitSHA, report.BootstrapPassed, report.ComputeNodeRowID)
 	return 0
 }
@@ -437,7 +437,7 @@ func addNodeExecute(p addNodeParams) (addNodeReport, int) {
 		fmt.Fprintf(os.Stderr, "gregalectl deploy add-node: create scratch: %v\n", err)
 		return report, 1
 	}
-	defer os.Remove(scratch.Name())
+	defer func() { _ = os.Remove(scratch.Name()) }()
 	if _, err := scratch.Write(payloadBytes); err != nil {
 		fmt.Fprintf(os.Stderr, "gregalectl deploy add-node: write scratch: %v\n", err)
 		return report, 1
