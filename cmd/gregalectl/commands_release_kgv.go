@@ -26,6 +26,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -137,6 +138,40 @@ func cmdReleaseKGVRotate(args []string) int {
 			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release kgv rotate: parse SBoM at %s: %v\n", sbomPath, parseErr)
 			return 3
 		}
+		// PR-B review fix #4: the SBoM body must belong to the
+		// same git_sha as the manifest. PR-A's install path
+		// already enforces this on the manifest side; the SBoM
+		// is the second producer-side artifact and can outlive
+		// a manual directory swap (e.g., a stale `release
+		// install --tarball-path` from a prior git_sha that
+		// ended up under this dir). Path-based isolation
+		// (<root>/<git-sha>/) catches dir mix-up but not
+		// in-dir staleness. The canary stamps the SPDX
+		// documentNamespace with the git_sha (see
+		// scripts/build-canonical-tarball.sh); if present,
+		// assert it matches. Absence is permissive (older
+		// syft + hand-crafted SBoMs may not stamp it).
+		var sbomDoc struct {
+			DocumentNamespace string `json:"documentNamespace"`
+			Name              string `json:"name"`
+		}
+		if jsonErr := json.Unmarshal(sbomBody, &sbomDoc); jsonErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release kgv rotate: decode SBoM envelope at %s: %v\n", sbomPath, jsonErr)
+			return 3
+		}
+		stamped := sbomDoc.DocumentNamespace
+		if stamped == "" {
+			stamped = sbomDoc.Name
+		}
+		// Detect a clearly-stamped wrong git_sha. The canary
+		// convention is `https://gregale.dev/spdxdocs/<git_sha>`;
+		// look for any 40-char lowercase hex in the stamped
+		// field and assert it equals --git-sha.
+		if stamped != "" && !sbomDocMatchesGitSHA(stamped, *gitSHA) {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release kgv rotate: SBoM documentNamespace=%q does not reference --git-sha=%q; refusing to inherit counts from a stale SBoM\n",
+				stamped, *gitSHA)
+			return 3
+		}
 		baseline = releaseinstall.SBOMBaseline{
 			GitSHA:    *gitSHA,
 			Counts:    counts,
@@ -171,4 +206,36 @@ func cmdReleaseKGVRotate(args []string) int {
 		baseline.Counts.CriticalN, baseline.Counts.HighN, baseline.Counts.MediumN, baseline.Counts.LowN,
 		releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(*releasesRoot, *gitSHA)))
 	return 0
+}
+
+// sbomDocMatchesGitSHA returns true when `stamped` is permissive of
+// the operator-supplied git_sha. The canary stamps
+// `documentNamespace` (or `name`) with the git_sha; the function
+// returns true if (a) no 40-char lowercase hex is present (older
+// SBoMs without stamping are allowed through), or (b) the stamped
+// SHA equals `gitSHA`. A stamped SHA that disagrees is the leak
+// vector — see PR-B review fix #4.
+//
+// Defensive parsing: instead of validating the full namespace
+// shape, we extract any 40-char lowercase hex substring and compare
+// it directly. This covers the canary's
+// `https://gregale.dev/spdxdocs/<sha>` convention without coupling
+// to the path scheme.
+func sbomDocMatchesGitSHA(stamped, gitSHA string) bool {
+	if !releaseinstall.ValidGitSHA(gitSHA) {
+		return true // gate above already rejected; defensive only
+	}
+	// Scan for any 40-char lowercase hex substring.
+	for i := 0; i+40 <= len(stamped); i++ {
+		candidate := stamped[i : i+40]
+		if !releaseinstall.ValidGitSHA(candidate) {
+			continue
+		}
+		// Found a stamped SHA. Match means OK; mismatch means leak.
+		return candidate == gitSHA
+	}
+	// No stamped SHA present — older SBoM without stamping;
+	// permissive pass-through (the dir-based git_sha check above
+	// is the load-bearing guard).
+	return true
 }
