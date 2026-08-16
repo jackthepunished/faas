@@ -87,8 +87,28 @@ func decodeSQSConfig(t sqlc.Trigger) (sqsConfig, error) {
 	if cfg.QueueURL == "" {
 		return cfg, fmt.Errorf("sqs_poller: trigger missing queue_url")
 	}
-	if _, err := url.Parse(cfg.QueueURL); err != nil {
+	u, err := url.Parse(cfg.QueueURL)
+	if err != nil {
 		return cfg, fmt.Errorf("sqs_poller: invalid queue_url %q: %w", cfg.QueueURL, err)
+	}
+	// Audit round 2 finding #2 (PR #910): url.Parse only fails on
+	// truly malformed strings (missing brackets, invalid escape
+	// sequences). A schemeless URL like
+	// `faas-queue:9090/queues/ext-jobs` parses successfully with
+	// Scheme="" + Host="" + Path=`faas-queue:9090/queues/ext-jobs`,
+	// and at Poll time the poller concatenates
+	// `s.baseURL + "/receive?wait=20"` to get
+	// `faas-queue:9090/queues/ext-jobs/receive?wait=20`, which
+	// http.NewRequestWithContext parses with Scheme="faas-queue"
+	// and a malformed Host — the dial fails with the generic
+	// "no Host in request URL" transport error logged at runtime,
+	// NOT at config validation time. Reject schemeless URLs AND
+	// URLs that parse but lack a host up front.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return cfg, fmt.Errorf("sqs_poller: invalid queue_url %q: must include http:// or https:// scheme", cfg.QueueURL)
+	}
+	if u.Host == "" {
+		return cfg, fmt.Errorf("sqs_poller: invalid queue_url %q: missing host", cfg.QueueURL)
 	}
 	if cfg.LongPollSec < 0 || cfg.LongPollSec > 20 {
 		// SQS-compatible brokers cap long-poll at 20s (AWS SQS
