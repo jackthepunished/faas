@@ -67,7 +67,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// entirely. Handler returns 402 CodePlanTriggersNotAllowed
 			// before the store is touched; the 0/0/0/0/0/0/0 tuple
 			// here is the defence-in-depth value the store still reads.
-			TriggersAllowed: false, TriggerLimitPerApp: 0, TriggerLimitPerAccount: 0, TriggerBatchSizeMax: 0, TriggerBatchWindowMaxSec: 0, TriggerMaxAttemptsMax: 0, TriggerRecordsPerSecondPerApp: 0,
+			TriggersAllowed: false, TriggerLimitPerApp: 0, TriggerLimitPerAccount: 0, TriggerBatchSizeMax: 0, TriggerBatchWindowMaxSec: 0, TriggerMaxAttemptsMax: 0, TriggerRecordsPerSecondPerApp: 0, TriggerPayloadMaxBytes: 0,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
@@ -186,7 +186,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// sqs_compat kinds. Tight caps (50/30s/3) so a Hobby
 			// customer's fan-out can't saturate schedd's per-app
 			// WakeRateLimiter bucket.
-			TriggersAllowed: true, TriggerLimitPerApp: 2, TriggerLimitPerAccount: 10, TriggerBatchSizeMax: 50, TriggerBatchWindowMaxSec: 30, TriggerMaxAttemptsMax: 3, TriggerRecordsPerSecondPerApp: 100,
+			TriggersAllowed: true, TriggerLimitPerApp: 2, TriggerLimitPerAccount: 10, TriggerBatchSizeMax: 50, TriggerBatchWindowMaxSec: 30, TriggerMaxAttemptsMax: 3, TriggerRecordsPerSecondPerApp: 100, TriggerPayloadMaxBytes: 1048576,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
@@ -295,7 +295,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// broker kinds unlock (Kafka/NATS/Redis-streams). Caps jump
 			// to 10/50 + 500/5min/10 attempts so a Pro customer's
 			// 1k-msg/s Kafka consumer can be drained with one trigger.
-			TriggersAllowed: true, TriggerLimitPerApp: 10, TriggerLimitPerAccount: 50, TriggerBatchSizeMax: 500, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 10, TriggerRecordsPerSecondPerApp: 1000,
+			TriggersAllowed: true, TriggerLimitPerApp: 10, TriggerLimitPerAccount: 50, TriggerBatchSizeMax: 500, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 10, TriggerRecordsPerSecondPerApp: 1000, TriggerPayloadMaxBytes: 6291456,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
 			// ADR-099 PR-0: Pro wake-admission throttle (20/30).
@@ -409,7 +409,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the SQL CHECK ceilings (5000 records / 5 min window /
 			// 25 attempts) so a Scale customer's SQS-compatible or
 			// Kafka consumer can be drained at full throughput.
-			TriggersAllowed: true, TriggerLimitPerApp: 50, TriggerLimitPerAccount: 200, TriggerBatchSizeMax: 5000, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 25, TriggerRecordsPerSecondPerApp: 10000,
+			TriggersAllowed: true, TriggerLimitPerApp: 50, TriggerLimitPerAccount: 200, TriggerBatchSizeMax: 5000, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 25, TriggerRecordsPerSecondPerApp: 10000, TriggerPayloadMaxBytes: 16777216,
 			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
