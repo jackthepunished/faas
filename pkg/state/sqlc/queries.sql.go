@@ -1865,6 +1865,52 @@ func (q *Queries) InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg Inse
 	return err
 }
 
+const insertTriggerRecord = `-- name: InsertTriggerRecord :one
+insert into trigger_records (trigger_id, item_identifier, payload, headers, metadata)
+values ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+on conflict (trigger_id, item_identifier) do nothing
+returning id
+`
+
+type InsertTriggerRecordParams struct {
+	TriggerID      pgtype.UUID
+	ItemIdentifier string
+	Column3        []byte
+	Column4        []byte
+	Column5        []byte
+}
+
+// Review finding #1 (PR #910): the dispatcher MUST persist every
+// broker-delivered record into trigger_records BEFORE
+// ClaimTriggerRecords can find them. Without this insert the
+// entire dispatch tick is dead — ClaimTriggerRecords returns 0
+// rows, the broker messages accumulate forever in poller.inFlight,
+// and the unified Trigger primitive never fires a function.
+//
+// ON CONFLICT (trigger_id, item_identifier) DO NOTHING mirrors the
+// broker-side dedupe guarantee (kafka per-partition offset,
+// NATS stream sequence, Redis entry-id, SQS receipt handle,
+// in-platform invocation_id — all globally unique within their
+// own ledger). A re-poll after a partial commit + Ack timeout
+// therefore never inserts a duplicate row.
+//
+// Returning id gives the dispatcher the trigger_records.id that
+// ClaimTriggerRecords surfaces under FOR UPDATE SKIP LOCKED,
+// bridging the item_identifier → row_id namespace the
+// ReportBatchItemFailures handler needs.
+func (q *Queries) InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTriggerRecordParams) (pgtype.UUID, error) {
+	row := db.QueryRow(ctx, insertTriggerRecord,
+		arg.TriggerID,
+		arg.ItemIdentifier,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const instanceByID = `-- name: InstanceByID :one
 select id, app_id, deployment_id, state, coalesce(netns, ''), coalesce(guest_uid, 0),
        coalesce(host_ip::text, ''), ram_mb, started_at, last_request_at, parked_at

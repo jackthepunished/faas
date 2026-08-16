@@ -1963,6 +1963,17 @@ type Store interface {
 	ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, error)
 	CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts int32, limits api.Limits) (sqlc.Trigger, error)
 	ClaimTriggerRecords(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error)
+	// InsertTriggerRecord persists a single broker-delivered record
+	// into the trigger_records FSM queue so a subsequent
+	// ClaimTriggerRecords call can pick it up. Returns the
+	// persisted (or existing-on-conflict) trigger_records.id; the
+	// dispatcher uses this id as the durable identity for the rest
+	// of the FSM walk (succeeded / retry / dead_letter transitions).
+	//
+	// Review finding #1 (PR #910): without this insert, the
+	// dispatch tick is structurally dead — ClaimTriggerRecords
+	// returns 0 rows because nothing ever writes to trigger_records.
+	InsertTriggerRecord(ctx context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error)
 	MarkTriggerRecordSucceeded(ctx context.Context, id string) error
 	MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error
 	MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error

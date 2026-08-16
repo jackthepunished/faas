@@ -248,6 +248,25 @@ type Querier interface {
 	// (the broker error text, the payload size that tripped the 6MB
 	// cap, etc.) for the dashboard read-back.
 	InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg InsertTriggerDeadLetterParams) error
+	// Review finding #1 (PR #910): the dispatcher MUST persist every
+	// broker-delivered record into trigger_records BEFORE
+	// ClaimTriggerRecords can find them. Without this insert the
+	// entire dispatch tick is dead — ClaimTriggerRecords returns 0
+	// rows, the broker messages accumulate forever in poller.inFlight,
+	// and the unified Trigger primitive never fires a function.
+	//
+	// ON CONFLICT (trigger_id, item_identifier) DO NOTHING mirrors the
+	// broker-side dedupe guarantee (kafka per-partition offset,
+	// NATS stream sequence, Redis entry-id, SQS receipt handle,
+	// in-platform invocation_id — all globally unique within their
+	// own ledger). A re-poll after a partial commit + Ack timeout
+	// therefore never inserts a duplicate row.
+	//
+	// Returning id gives the dispatcher the trigger_records.id that
+	// ClaimTriggerRecords surfaces under FOR UPDATE SKIP LOCKED,
+	// bridging the item_identifier → row_id namespace the
+	// ReportBatchItemFailures handler needs.
+	InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTriggerRecordParams) (pgtype.UUID, error)
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)

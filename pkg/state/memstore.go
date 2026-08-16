@@ -4838,6 +4838,48 @@ func (m *MemStore) ClaimTriggerRecords(_ context.Context, triggerID string, limi
 	return out, nil
 }
 
+// InsertTriggerRecord mirrors PgStore.InsertTriggerRecord for the
+// in-memory store. Returns the persisted (or existing-on-duplicate)
+// record id. Mirrors the ON CONFLICT (trigger_id, item_identifier)
+// DO NOTHING semantics with a Map key probe; on a duplicate the
+// existing row's id is returned so callers don't need a second
+// lookup. Review finding #1 (PR #910).
+func (m *MemStore) InsertTriggerRecord(_ context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Dedup probe — mirrors ON CONFLICT DO NOTHING on the
+	// (trigger_id, item_identifier) unique pair.
+	for id, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.ItemIdentifier == itemIdentifier {
+			return id, nil
+		}
+	}
+	id := uuid.NewString()
+	now := time.Now()
+	if payload == nil {
+		payload = []byte("{}")
+	}
+	if headers == nil {
+		headers = []byte("{}")
+	}
+	if metadata == nil {
+		metadata = []byte("{}")
+	}
+	m.records[id] = sqlc.TriggerRecord{
+		ID:             pgtype.UUID{Bytes: parseMemUUIDString(id), Valid: true},
+		TriggerID:      pgtype.UUID{Bytes: parseMemUUIDString(triggerID), Valid: true},
+		ItemIdentifier: itemIdentifier,
+		Payload:        payload,
+		Headers:        headers,
+		Metadata:       metadata,
+		State:          "pending",
+		Attempts:       0,
+		NextFireAt:     pgtypeFromTime(now),
+		ReceivedAt:     pgtypeFromTime(now),
+	}
+	return id, nil
+}
+
 func (m *MemStore) MarkTriggerRecordSucceeded(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

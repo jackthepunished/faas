@@ -15845,6 +15845,66 @@ func (s *PgStore) ClaimTriggerRecords(ctx context.Context, triggerID string, lim
 	return s.triggerQueries().ClaimTriggerRecords(ctx, s.pool, sqlc.ClaimTriggerRecordsParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
 }
 
+// InsertTriggerRecord persists a single broker-delivered record
+// into the trigger_records FSM queue. Returns the persisted (or
+// existing-on-conflict) trigger_records.id so the dispatcher can
+// hold a stable row identity across the per-record FSM transitions.
+//
+// Review finding #1 (PR #910): without this insert, the dispatch
+// tick is structurally dead — ClaimTriggerRecords returns 0 rows
+// because nothing ever writes to trigger_records. This is the
+// seam every per-broker poller calls inside Poll() so a broker
+// message becomes a row BEFORE the dispatch tick can decide what
+// to do with it.
+//
+// ON CONFLICT (trigger_id, item_identifier) DO NOTHING (set in
+// queries.sql) mirrors the broker-side dedupe guarantee (kafka
+// per-partition offset, NATS stream sequence, Redis entry-id, SQS
+// receipt-handle, in-platform invocation_id). A re-poll after a
+// partial commit + Ack timeout therefore never inserts a duplicate
+// row; the existing row's id is returned via the no-rows path
+// (ON CONFLICT suppresses RETURNING, so we read-back the id with a
+// second SELECT only when the INSERT returns zero rows).
+func (s *PgStore) InsertTriggerRecord(ctx context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error) {
+	if payload == nil {
+		payload = []byte("{}")
+	}
+	if headers == nil {
+		headers = []byte("{}")
+	}
+	if metadata == nil {
+		metadata = []byte("{}")
+	}
+	id, err := s.triggerQueries().InsertTriggerRecord(ctx, s.pool,
+		sqlc.InsertTriggerRecordParams{
+			TriggerID:      mustPgUUID(triggerID),
+			ItemIdentifier: itemIdentifier,
+			Column3:        payload,
+			Column4:        headers,
+			Column5:        metadata,
+		})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// ON CONFLICT path — the row already existed (a
+			// previous Poll inserted and the dispatch tick has
+			// not yet Ack'd). Read back the existing id so the
+			// dispatcher can attribute FSM transitions to one
+			// canonical row identity.
+			var existing string
+			if err := s.pool.QueryRow(ctx,
+				`select id::text from trigger_records
+				 where trigger_id = $1 and item_identifier = $2`,
+				mustPgUUID(triggerID), itemIdentifier,
+			).Scan(&existing); err != nil {
+				return "", fmt.Errorf("state: insert trigger_record conflict read-back: %w", err)
+			}
+			return existing, nil
+		}
+		return "", fmt.Errorf("state: insert trigger_record: %w", err)
+	}
+	return pgUUIDString(id), nil
+}
+
 // MarkTriggerRecordSucceeded transitions a claimed record to the
 // succeeded state. Called from the dispatch tick after the runner
 // envelope returns 2xx with no ReportBatchItemFailures entry for
@@ -15938,6 +15998,25 @@ func mustPgUUID(s string) pgtype.UUID {
 		return pgtype.UUID{}
 	}
 	return p
+}
+
+// pgUUIDString encodes a pgtype.UUID as the canonical hyphenated
+// hex string form. Used at the seam between sqlc-generated types
+// (pgtype.UUID) and the Store interface's string-typed ids (the
+// apid handlers + sched dispatch path take strings throughout).
+// Returns the empty string for an invalid pgtype.UUID so callers
+// can branch on the empty-string sentinel rather than panicking.
+func pgUUIDString(id pgtype.UUID) string {
+	if !id.Valid {
+		return ""
+	}
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		id.Bytes[0:4],
+		id.Bytes[4:6],
+		id.Bytes[6:8],
+		id.Bytes[8:10],
+		id.Bytes[10:16],
+	)
 }
 
 // RetryTriggerRecordByOperator (issue #757 / ADR-0NN, commit #6)

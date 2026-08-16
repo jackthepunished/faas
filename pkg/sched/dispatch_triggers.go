@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -105,6 +106,9 @@ func (l *Loop) loopStore() storeLike {
 type storeLike interface {
 	ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, error)
 	ClaimTriggerRecords(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error)
+	// InsertTriggerRecord bridges broker-delivered records into
+	// the trigger_records FSM queue (review finding #1, PR #910).
+	InsertTriggerRecord(ctx context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error)
 	MarkTriggerRecordSucceeded(ctx context.Context, id string) error
 	MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error
 	MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error
@@ -248,8 +252,61 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		l.deadLetterAll(ctx, t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
 		return nil
 	}
+	// Review finding #8: also consult the per-account bucket so a
+	// runaway broker fan-out across many apps under one account
+	// is rejected even when each app stays within its per-app
+	// cap. The lookup walks app → account inline because the
+	// per-tick plan cache above only stores AccountPlan, not the
+	// account_id; an extra round-trip per trigger (one per tick)
+	// is acceptable because the deny path is the hot path we
+	// want to keep fast.
+	if l.rateLimiter != nil {
+		app, appErr := l.engine.Store().AppByID(ctx, t.AppID.String())
+		if appErr == nil {
+			if !l.rateLimiter.AllowWakeAccount(app.AccountID, appPlan) {
+				items := batchItemIDs(batch)
+				l.deadLetterAll(ctx, t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
+				return nil
+			}
+		}
+	}
 
-	// 5. Claim trigger_records rows.
+	// 5. Persist polled records into trigger_records (review finding
+	// #1, PR #910: without this insert, ClaimTriggerRecords returns 0
+	// rows and the entire dispatch tick is structurally dead — every
+	// record never reaches the gateway and the function never fires).
+	//
+	// Each Poll() returned SourceRecord becomes one trigger_records
+	// row BEFORE we attempt to claim + dispatch. ON CONFLICT
+	// (trigger_id, item_identifier) DO NOTHING (set in
+	// queries.sql:1283-1310) means a re-poll after a partial commit
+	// + Ack timeout reuses the existing row id rather than doubling
+	// the queue depth.
+	//
+	// Rollback semantics: if the insert fails for a record, the
+	// dispatch tick continues without claiming it (the row didn't
+	// land, so SKIP LOCKED can't see it) and the broker message
+	// stays in poller.inFlight. On the next poll cycle the broker
+	// library re-delivers; the next tick tries the insert again.
+	// This is the "Ack only after the row exists" guarantee the
+	// audit pins: dispatch_triggers.go never calls poller.Ack on a
+	// record whose trigger_records row is missing.
+	for _, rec := range batch {
+		payload := rec.Payload
+		if payload == nil {
+			payload = []byte("{}")
+		}
+		headers := marshalJSON(rec.Headers)
+		metadata := marshalJSON(rec.Metadata)
+		if _, err := store.InsertTriggerRecord(ctx, t.ID.String(), rec.ItemIdentifier, payload, headers, metadata); err != nil {
+			l.log.Warn("sched trigger tick: insert record",
+				"trigger_id", t.ID.String(),
+				"item_identifier", rec.ItemIdentifier,
+				"err", err)
+		}
+	}
+
+	// 6. Claim trigger_records rows.
 	claimed, claimErr := store.ClaimTriggerRecords(ctx, t.ID.String(), int32(len(batch)))
 	if claimErr != nil {
 		l.log.Warn("sched trigger tick: claim",
@@ -295,8 +352,10 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	succeedIDs := []string{}
 	retryIDs := []string{}
 	dlqIDs := []string{}
-	dlqReasons := []string{} // parallel to dlqIDs; review finding #8
-	dlqErrors := []string{}  // parallel to dlqIDs; review finding #8
+	dlqReasons := []string{}  // parallel to dlqIDs; review finding #8
+	dlqErrors := []string{}   // parallel to dlqIDs; review finding #8
+	dlqAttempts := []int32{}  // parallel to dlqIDs; review finding #10
+	retryAttempts := []int32{} // parallel to retryIDs; review finding #10
 	succeedItems := []string{}
 	retryItems := []string{}
 	dlqItems := []string{}
@@ -307,6 +366,9 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		if !found {
 			retryIDs = append(retryIDs, c.ID.String())
 			retryItems = append(retryItems, itemID)
+			// Review finding #10: report the post-increment
+			// Attempts value.
+			retryAttempts = append(retryAttempts, c.Attempts+1)
 			continue
 		}
 		switch status.Status {
@@ -316,9 +378,11 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		case "retry", "broker_error":
 			retryIDs = append(retryIDs, c.ID.String())
 			retryItems = append(retryItems, itemID)
+			retryAttempts = append(retryAttempts, c.Attempts+1)
 		case "dead_letter":
 			dlqIDs = append(dlqIDs, c.ID.String())
 			dlqItems = append(dlqItems, itemID)
+			dlqAttempts = append(dlqAttempts, c.Attempts+1)
 			// Review finding #8: the old code dropped
 			// status.Error on the floor and stampped the
 			// audit Reason='max_attempts' regardless of
@@ -332,6 +396,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		default:
 			retryIDs = append(retryIDs, c.ID.String())
 			retryItems = append(retryItems, itemID)
+			retryAttempts = append(retryAttempts, c.Attempts+1)
 		}
 	}
 
@@ -355,8 +420,12 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		}
 	}
 	if len(retryIDs) > 0 {
-		nextFireAt := time.Now().Add(2 * time.Second)
-		for _, id := range retryIDs {
+		for i, id := range retryIDs {
+			attempts := retryAttempts[i]
+			// Review finding #9: exponential backoff + ±20%
+			// jitter replaces the prior hardcoded 2s.
+			backoff := computeRetryBackoff(attempts)
+			nextFireAt := time.Now().Add(backoff)
 			if err := store.MarkTriggerRecordRetry(ctx, id, "", nextFireAt); err != nil {
 				l.log.Warn("sched trigger tick: mark retry",
 					"id", id, "err", err)
@@ -365,7 +434,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				TriggerID:  t.ID.String(),
 				RecordID:   id,
 				AppID:      t.AppID.String(),
-				Attempt:    1,
+				Attempt:    int(attempts),
 				NextFireAt: nextFireAt,
 			})
 		}
@@ -378,6 +447,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		for i, id := range dlqIDs {
 			reason := dlqReasons[i]
 			lastErr := dlqErrors[i]
+			attempts := dlqAttempts[i]
 			if err := store.MarkTriggerRecordDeadLetter(ctx, id, lastErr); err != nil {
 				l.log.Warn("sched trigger tick: mark dlq",
 					"id", id, "err", err)
@@ -387,7 +457,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				RecordID:  id,
 				AppID:     t.AppID.String(),
 				Reason:    reason,
-				Attempts:  1,
+				Attempts:  int(attempts),
 				LastError: lastErr,
 			})
 		}
@@ -546,6 +616,51 @@ func (r *byteReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *byteReadCloser) Close() error { return nil }
+
+// marshalJSON turns a generic map into a JSONB-ready byte slice.
+// Returns "{}" when the input is nil so the ON CONFLICT DO NOTHING
+// branch on InsertTriggerRecord stays deterministic across the
+// broker adapters (kafka / nats / redis_streams all produce
+// slightly different header / metadata shapes — every nil map
+// must serialise to the same empty-object payload).
+func marshalJSON(v any) []byte {
+	if v == nil {
+		return []byte("{}")
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return []byte("{}")
+	}
+	return out
+}
+
+// computeRetryBackoff returns the retry delay for an attempt at
+// the post-increment `attempts` count. Review finding #9: replaces
+// the hardcoded 2s previously used on every retry. Shape: 1s
+// base, doubling each attempt up to a 5-minute ceiling, with
+// ±20% jitter so a burst of synchronous broker failures doesn't
+// re-fire on the same tick.
+//
+//	attempts=1 → ~1s  (range 0.8s..1.2s)
+//	attempts=2 → ~2s  (range 1.6s..2.4s)
+//	attempts=3 → ~4s  (range 3.2s..4.8s)
+//	attempts=4 → ~8s
+//	attempts=N → min(2^(N-1), 300)s
+func computeRetryBackoff(attempts int32) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	exp := attempts - 1
+	if exp > 9 {
+		exp = 9
+	}
+	base := time.Second << exp
+	if base > 5*time.Minute {
+		base = 5 * time.Minute
+	}
+	jitter := time.Duration(float64(base) * (0.8 + 0.01*float64(rand.Uint64()%41)))
+	return jitter
+}
 
 // Compile-time guarantee the helpers we use are wired.
 var _ = slog.Default
