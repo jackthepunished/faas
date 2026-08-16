@@ -783,6 +783,17 @@ func floorTick(t *time.Ticker) <-chan time.Time {
 // three sibling functions.
 const httpUnixBasePrefix = "http://unix"
 
+// httpScheme + httpsScheme are the URL schemes for the gatewayd-internal
+// synth dial when the dial is TCP or DNS. httpScheme is the TLS-off
+// fallback; httpsScheme is used when tlsCfg is non-nil. Two
+// sibling functions (DialGatewaySynthTarget + HTTPClientForGatewaySynthTarget)
+// each reference both — collapse into constants so goconst doesn't flag
+// the literal three times across the package.
+const (
+	httpScheme  = "http"
+	httpsScheme = "https"
+)
+
 // MaxParksPerTickPerApp bounds the aggressive-reaper (issue #171)
 // per-app per-tick park count. Without a cap, a single tick could
 // block the reaper for `N × ~150 ms` ≈ 7.5 s on a 50-instance
@@ -1775,9 +1786,9 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 			log:        log,
 		}, nil
 	case wire.SchemeTCP, wire.SchemeDNS:
-		scheme := "http"
+		scheme := httpScheme
 		if tlsCfg != nil {
-			scheme = "https"
+			scheme = httpsScheme
 		}
 		tr := &http.Transport{
 			TLSClientConfig:       tlsCfg,
@@ -1836,7 +1847,7 @@ func HTTPClientForGatewaySynthTarget(target string) (*http.Client, string, error
 		}
 		return &http.Client{Transport: tr, Timeout: 60 * time.Second}, httpUnixBasePrefix, nil
 	case wire.SchemeTCP, wire.SchemeDNS:
-		scheme := "http"
+		scheme := httpScheme
 		return &http.Client{Timeout: 60 * time.Second}, scheme + "://" + t.Address, nil
 	default:
 		return nil, "", fmt.Errorf("sched: gateway synth target scheme %q not supported", t.Scheme)

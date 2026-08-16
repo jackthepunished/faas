@@ -17,6 +17,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// batchDispatchStatus values are the per-record terminal states the
+// batch dispatch handler writes back to trigger_records. They are
+// package-level constants so goconst doesn't flag the literal three
+// times across handleInvocationDispatchBatch and its sibling
+// response-parsing helpers.
+const (
+	batchDispatchStatusSucceeded = "succeeded"
+	batchDispatchStatusRetry     = "retry"
+)
+
 // SynthDispatcher is the slice of the gateway the internal schedd
 // RPC needs. Going through Wake/Invoke (rather than reimplementing
 // routing + proxying) ensures capacity + plan-quota admission apply
@@ -541,7 +551,7 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 			// processed vs dropped.
 			results = append(results, batchDispatchResult{
 				ItemIdentifier: rec.ItemIdentifier,
-				Status:         "retry",
+				Status:         batchDispatchStatusRetry,
 				Error:          "batch_timeout: handler exceeded " + batchDispatchTotalTimeout.String(),
 				Code:           "batch_timeout",
 			})
@@ -623,7 +633,7 @@ func (s *SynthServer) dispatchBatchRecord(ctx context.Context, req batchDispatch
 		}
 		return batchDispatchResult{
 			ItemIdentifier: rec.ItemIdentifier,
-			Status:         "retry",
+			Status:         batchDispatchStatusRetry,
 			Error:          err.Error(),
 			Code:           code,
 		}
@@ -646,7 +656,7 @@ func (s *SynthServer) dispatchBatchRecord(ctx context.Context, req batchDispatch
 		// retry budget entirely.
 		return batchDispatchResult{
 			ItemIdentifier: rec.ItemIdentifier,
-			Status:         "retry",
+			Status:         batchDispatchStatusRetry,
 			Error:          "function response malformed: " + parseErr.Error(),
 			Code:           "response_malformed",
 		}
@@ -656,7 +666,7 @@ func (s *SynthServer) dispatchBatchRecord(ctx context.Context, req batchDispatch
 	if containsString(failed, rec.ItemIdentifier) {
 		return batchDispatchResult{
 			ItemIdentifier: rec.ItemIdentifier,
-			Status:         "retry",
+			Status:         batchDispatchStatusRetry,
 			Error:          "reported in batchItemFailures",
 			Code:           "function_failed",
 		}
@@ -664,15 +674,15 @@ func (s *SynthServer) dispatchBatchRecord(ctx context.Context, req batchDispatch
 	// If state==succeeded from the dispatcher, success.
 	// Otherwise (e.g. function returned 5xx, dispatcher
 	// captured it) it's a retry.
-	if string(out.State) == "succeeded" {
+	if string(out.State) == batchDispatchStatusSucceeded {
 		return batchDispatchResult{
 			ItemIdentifier: rec.ItemIdentifier,
-			Status:         "succeeded",
+			Status:         batchDispatchStatusSucceeded,
 		}
 	}
 	return batchDispatchResult{
 		ItemIdentifier: rec.ItemIdentifier,
-		Status:         "retry",
+		Status:         batchDispatchStatusRetry,
 		Error:          fmt.Sprintf("function state=%s", out.State),
 		Code:           "function_state_" + string(out.State),
 	}
