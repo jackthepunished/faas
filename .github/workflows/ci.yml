@@ -1356,7 +1356,7 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: make -C deploy/packer image-build-hcloud-canary
-      - name: smoke: list canary snapshot
+      - name: "smoke: list canary snapshot"
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
