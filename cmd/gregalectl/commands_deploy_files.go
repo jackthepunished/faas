@@ -37,12 +37,12 @@ import (
 // which parses as the key `ansible_host` with value `50051` and the rest
 // as a string-typed fragment — ansible then fails to load the file.
 func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDRv6, overlayCIDRs string) string {
-	roleComment := "control-plane box"
-	roleMarker := "control-plane"
+	roleComment := roleControlPlane + " box"
+	roleMarker := roleControlPlane
 	hosts := []string{"postgres", "scheduler", "metering", "gateway-public", "githubd"}
-	if role == "compute-only" {
-		roleComment = "compute-only box"
-		roleMarker = "compute-only"
+	if role == roleComputeOnly {
+		roleComment = roleComputeOnly + " box"
+		roleMarker = roleComputeOnly
 		hosts = []string{"vmmd", "gatewayd-internal", "builderd", "imaged"}
 	}
 
@@ -72,7 +72,7 @@ func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDR
 	fmt.Fprintf(&b, "# python3.12 so we never depend on a venv.\n")
 	fmt.Fprintf(&b, "ansible_host: %s\n", yamlQuote(ansibleHost))
 	fmt.Fprintf(&b, "ansible_python_interpreter: /usr/bin/python3\n")
-	if role == "compute-only" {
+	if role == roleComputeOnly {
 		fmt.Fprintf(&b, "\n")
 		fmt.Fprintf(&b, "# nftables substitution: the public-iface is the outbound interface the\n")
 		fmt.Fprintf(&b, "# postrouting chain MASQUERADES tenant overlay traffic on. Operators set\n")
