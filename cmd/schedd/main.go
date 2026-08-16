@@ -1428,17 +1428,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the synth RPC) because the cron surface uses gRPC semantics
 	// over a unix socket transport, while the batch endpoint is
 	// plain HTTP/1.1 JSON — different idle-pool shapes, different
-	// request timeouts. A nil Dial here is non-fatal: the dispatch
-	// tick logs "gateway http client not configured" and exits each
-	// batch to retry land (commits #13 retry FSM).
-	// mirror the Unix socket path the synth target falls back to.
+	// request timeouts.
+	//
+	// Audit finding #5: trigger batch dispatch is critical-path —
+	// every trigger wake funnels through /v1/invocations:dispatch_batch.
+	// A failed dial means the daemon would silently lose every
+	// wake, only surfacing the failure as a stack of dead-letter
+	// rows. Fail loud: the boot returns a typed error so the
+	// systemd unit restarts and an operator gets a journal signal.
+	// The cron synth dial above stays best-effort because cron is
+	// "should fire on schedule" while triggers are "must wake on
+	// broker delivery".
 	triggerClient, triggerBase, triggerDialErr := sched.HTTPClientForGatewaySynthTarget(synthTarget)
 	if triggerDialErr != nil {
-		log.Warn("gateway http dial: trigger batch dispatch disabled until gatewayd-internal is up",
-			"target", synthTarget, "err", triggerDialErr)
-	} else {
-		loop.WithGatewayHTTPClient(triggerClient, triggerBase)
+		return fmt.Errorf("schedd: trigger batch dispatch dial %s: %w (gatewayd-internal must be up before schedd)", synthTarget, triggerDialErr)
 	}
+	loop.WithGatewayHTTPClient(triggerClient, triggerBase)
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- loop.Run(ctx) }()
 
@@ -1448,11 +1453,55 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Loop.WakeupTriggers() nudge so an idle broker doesn't sit
 	// for a full 1s tick before the first batch. The 1s ticker
 	// remains the safety net (PR-C pattern).
+	//
+	// Audit finding #9: a failed first Subscribe was previously
+	// logged and the daemon kept running — the 1s ticker caught
+	// every trigger_ready notify that arrived during the outage,
+	// but a missed delivery on a stream-of-record entry stays
+	// missed until the trigger re-fires. Pair the boot-fatal
+	// (sibling to the dial above) with a 5s retry ticker so a
+	// transient Postgres blip recovers without a daemon restart.
 	triggerNotifC, triggerSubErr := db.SubscribeWithReconnect(ctx, pool,
 		[]string{db.NotifyTriggerReady, db.NotifyTriggerChanged}, log)
 	if triggerSubErr != nil {
-		log.Error("schedd: trigger notify subscribe failed; safety ticker still runs",
+		log.Error("schedd: trigger notify first-subscribe failed; safety ticker + retry-loop running",
 			"err", triggerSubErr)
+		// Pair #5 + #9: spawn a retry loop so a transient blip
+		// doesn't strand the dispatch tick until next restart.
+		// 5s cadence balances (operator wants visibility) vs
+		// (Postgres LISTEN recovery is usually < 1s). On
+		// success we install the notifier exactly like the
+		// happy path.
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					ch, sErr := db.SubscribeWithReconnect(ctx, pool,
+						[]string{db.NotifyTriggerReady, db.NotifyTriggerChanged}, log)
+					if sErr != nil {
+						log.Warn("schedd: trigger notify subscribe retry failed",
+							"err", sErr)
+						continue
+					}
+					log.Info("schedd: trigger notify subscribe recovered")
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case _, ok := <-ch:
+							if !ok {
+								break
+							}
+							loop.WakeupTriggers()
+						}
+					}
+				}
+			}
+		}()
 	} else {
 		go func() {
 			for {
