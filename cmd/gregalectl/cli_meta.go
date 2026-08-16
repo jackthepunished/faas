@@ -155,11 +155,12 @@ var cliCommands = []cliCommand{
 			},
 			{
 				Name:  subReleaseInstall,
-				Short: "Install a release on the local box (atomic symlink flip + applied_at first-write-wins stamp + compute_nodes UPSERT)",
+				Short: "Install a release on the local box (atomic symlink flip + applied_at first-write-wins stamp + compute_nodes UPSERT + optional role templating)",
 				Flags: []cliFlag{
 					{Name: "git-sha", Short: "40-char lowercase hex git SHA to install (required)", Req: true},
 					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
 					{Name: "node", Short: "compute_nodes.name to stamp (default: hostname)"},
+					{Name: "role", Short: "box role: control-plane|compute-only (ADR-112); empty = no role templating. Reads /etc/faas/first-boot.env's FAAS_BOX_ROLE when unset.", ClosedSet: []string{"", "control-plane", "compute-only"}},
 				},
 			},
 		},

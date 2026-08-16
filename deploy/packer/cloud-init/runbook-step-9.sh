@@ -33,30 +33,39 @@ source /etc/faas/first-boot.env
 
 CURRENT_SHA="$(cat /opt/faas/current/VERSION 2>/dev/null || echo missing)"
 
+# Single-pass invocation: `--git-sha=X --role=Y` does the atomic
+# symlink flip AND the per-daemon drop-in + start pass in one call.
+# `gregalectl release install` rejects empty --git-sha (FA_PG_DSN
+# §5), so the previous split "install --git-sha then install --role"
+# aborted under set -e (post-#930 review Fix 3).
+#
+# FAAS_BOX_ROLE is operator-supplied via cloud-init user-data. If
+# it's the sentinel `__SET_BY_OPERATOR_AT_LAUNCH__` we already failed
+# loud in first-boot.yaml.tpl's runcmd (assert-first-boot-env.sh
+# exit 11). If it's missing entirely (legacy boxes), pass no
+# --role so the call degrades to a plain --git-sha install.
 if [[ "${CURRENT_SHA}" == "${FAAS_MANIFEST_GIT_SHA}" ]]; then
     echo "runbook-step-9: /opt/faas/current already pinned to ${FAAS_MANIFEST_GIT_SHA}; still running --role for safety"
 else
+    ROLE_FLAG=""
+    if [[ -n "${FAAS_BOX_ROLE:-}" ]] \
+       && [[ "${FAAS_BOX_ROLE}" != "__SET_BY_OPERATOR_AT_LAUNCH__" ]]; then
+        ROLE_FLAG="--role=${FAAS_BOX_ROLE}"
+    else
+        echo "runbook-step-9: FAAS_BOX_ROLE unset or sentinel; running --git-sha only (legacy/dev path)"
+    fi
+
     # Registry DSN is supplied via /etc/faas/registry.env (written
     # by pki init at runbook-step-4). The release install fetches
     # from the registry + verifies the manifest's release_bundles
     # row (PR #919 lockstep contract).
+    #
+    # shellcheck disable=SC2086 # ROLE_FLAG may be empty by design.
     gregalectl release install \
-        --git-sha="${FAAS_MANIFEST_GIT_SHA}"
+        --git-sha="${FAAS_MANIFEST_GIT_SHA}" \
+        ${ROLE_FLAG}
 
     # Stamp the VERSION file so the next run is idempotent.
     echo "${FAAS_MANIFEST_GIT_SHA}" > /opt/faas/current/VERSION
     echo "runbook-step-9: /opt/faas/current pinned to ${FAAS_MANIFEST_GIT_SHA}"
-fi
-
-# ADR-112: role templating. FAAS_BOX_ROLE is operator-supplied via
-# cloud-init user-data; if it's the sentinel `__SET_BY_OPERATOR_AT_LAUNCH__`
-# we already failed loud in first-boot.yaml.tpl's runcmd (assert-first-boot-env.sh
-# exit 11). If it's missing entirely (no file), we also don't run
-# (legacy boxes / dev images without the new template don't need this).
-if [[ -n "${FAAS_BOX_ROLE:-}" ]] \
-   && [[ "${FAAS_BOX_ROLE}" != "__SET_BY_OPERATOR_AT_LAUNCH__" ]]; then
-    gregalectl release install --role="${FAAS_BOX_ROLE}"
-    echo "runbook-step-9: applied role ${FAAS_BOX_ROLE}"
-else
-    echo "runbook-step-9: FAAS_BOX_ROLE unset or sentinel; skipping role templating (legacy/dev path)"
 fi
