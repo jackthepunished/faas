@@ -1091,6 +1091,29 @@ jobs:
       - name: generate-check
         run: make generate-check
 
+  packer-validate:
+    # ADR-111: Packer-builder syntax gate. PR #928 lands
+    # deploy/packer/{common,ubuntu-2404,role-overlay}.pkr.hcl + the
+    # per-cloud builders in PR #929 (hcloud + amazon-ebs). PR #927's ADR
+    # decides that production host provisioning flows through a Packer-
+    # built image; this CI job is the tripwire that fails PRs with a
+    # syntactically broken .pkr.hcl before any builder creds would have
+    # to be touched.
+    #
+    # `packer validate -syntax-only` works without cloud creds because
+    # the source blocks don't actually resolve until a real builder runs.
+    # Mirrors daemonunit-check / sqlc-check / egress-check: stateless,
+    # fast, runs on every PR.
+    name: packer-validate (ADR-111)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: install-packer (pinned)
+        run: scripts/install-packer.sh
+      - name: packer validate -syntax-only
+        run: make image-validate
+
   e2e-shard1:
     name: e2e (shard 1 — 18 tests)
     runs-on: ubuntu-latest
