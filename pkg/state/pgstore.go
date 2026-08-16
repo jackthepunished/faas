@@ -9032,6 +9032,65 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 	return nil
 }
 
+// SetComputeNodeRole overwrites the role column on a row by id
+// (ADR-112 PR-B). The role value is validated against the
+// {empty, control-plane, compute-only} allow-list at the Go boundary
+// (matches pkg/roleTemplating.Validate) before the SQL touch — empty
+// role is rejected with a loud error (use UpsertComputeNodeFromOperator
+// with role=NULL if the un-templated sentinel is ever needed). The
+// migration 00271 column is nullable text (no CHECK constraint); the
+// Go-side validation is the effective constraint.
+//
+// The pg_notify trigger on compute_nodes (PR-3a) fires on every UPDATE
+// regardless of which column changed, so gatewayd-internal's per-node
+// cache and the schedd chooser re-rank immediately. The chooser
+// currently treats role as a tie-break only (ADR-110 PR-2), but the
+// load-bearing invariant is that the cluster-wide view in
+// compute_nodes.role matches the box's on-disk FAAS_BOX_ROLE (read
+// from the per-daemon drop-in); a drift is loud via doctor --deep.
+func (s *PgStore) SetComputeNodeRole(ctx context.Context, id string, role string) error {
+	if err := validateRoleForState(role); err != nil {
+		return fmt.Errorf("state: set role compute_node %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update compute_nodes set role = $2 where id = $1`, id, role)
+	if err != nil {
+		return fmt.Errorf("state: set role compute_node %s = %q: %w", id, role, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// validateRoleForState enforces the {empty, control-plane,
+// compute-only} allow-list at the Go boundary. Lives next to the
+// implementation (not in pkg/roleTemplating) because pkg/state must
+// not import pkg/roleTemplating — the chain is pkg/state → pkg/role
+// (the type layer), and pkg/roleTemplating sits on top of both.
+//
+// Empty role is rejected (the legacy un-templated sentinel is gone
+// post-PR-A; UpsertComputeNodeFromOperator writes NULL on insert and
+// preserves it on conflict via COALESCE, which is the canonical
+// "un-templated" path).
+var allowedRolesForState = map[string]struct{}{
+	"control-plane": {},
+	"compute-only":  {},
+}
+
+func validateRoleForState(role string) error {
+	if role == "" {
+		return fmt.Errorf("role cannot be empty; use UpsertComputeNodeFromOperator for un-templated rows")
+	}
+	if len(role) > 32 {
+		return fmt.Errorf("role %q exceeds 32-char column limit", role)
+	}
+	if _, ok := allowedRolesForState[role]; !ok {
+		return fmt.Errorf("role %q not in {control-plane, compute-only}", role)
+	}
+	return nil
+}
+
 // ListComputeNodes returns every compute_node in name order. The
 // optional includeInactive flag controls whether drained rows are
 // visible; apid's GET /v1/compute-nodes passes true so operators can
