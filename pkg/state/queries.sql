@@ -1209,11 +1209,11 @@ DELETE FROM data_upstream_probes WHERE sampled_at < $1;
 -- name: CreateTrigger :one
 insert into triggers (account_id, app_id, kind, slug, enabled, config,
                        batch_size_max, batch_window_ms, max_attempts,
-                       cron_id, source)
-values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+                       cron_id, source, payload_max_bytes)
+values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
 returning id, account_id, app_id, kind, slug, enabled, config,
           batch_size_max, batch_window_ms, max_attempts,
-          cron_id, source, created_at, updated_at;
+          cron_id, source, payload_max_bytes, created_at, updated_at;
 
 -- name: UpdateTrigger :one
 update triggers set
@@ -1221,11 +1221,12 @@ update triggers set
   config = coalesce($3::jsonb, config),
   batch_size_max = coalesce($4, batch_size_max),
   batch_window_ms = coalesce($5, batch_window_ms),
-  max_attempts = coalesce($6, max_attempts)
+  max_attempts = coalesce($6, max_attempts),
+  payload_max_bytes = coalesce($7, payload_max_bytes)
 where id = $1
 returning id, account_id, app_id, kind, slug, enabled, config,
           batch_size_max, batch_window_ms, max_attempts,
-          cron_id, source, created_at, updated_at;
+          cron_id, source, payload_max_bytes, created_at, updated_at;
 
 -- name: DeleteTrigger :exec
 delete from triggers where id = $1 and app_id = $2;
@@ -1233,13 +1234,13 @@ delete from triggers where id = $1 and app_id = $2;
 -- name: TriggerByID :one
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
-       cron_id, source, created_at, updated_at
+       cron_id, source, payload_max_bytes, created_at, updated_at
 from triggers where id = $1;
 
 -- name: ListTriggersForApp :many
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
-       cron_id, source, created_at, updated_at
+       cron_id, source, payload_max_bytes, created_at, updated_at
 from triggers where app_id = $1 order by created_at desc;
 
 -- name: ListEnabledTriggers :many
@@ -1249,7 +1250,7 @@ from triggers where app_id = $1 order by created_at desc;
 -- per-kind poller (pkg/sched/poller.go).
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
-       cron_id, source, created_at, updated_at
+       cron_id, source, payload_max_bytes, created_at, updated_at
 from triggers where enabled = true;
 
 -- name: CountTriggersByApp :one

@@ -111,6 +111,15 @@ type Trigger struct {
 	BatchSizeMax  int `yaml:"batch_size_max,omitempty"`
 	BatchWindowMs int `yaml:"batch_window_ms,omitempty"`
 	MaxAttempts   int `yaml:"max_attempts,omitempty"`
+	// PayloadMaxBytes (migration 00274) bounds the per-record
+	// broker payload size. The migration's SQL CHECK admits
+	// [1024, 67108864]; per-plan caps in pkg/api/limits.go
+	// (TriggerPayloadMaxBytes) cap this BELOW the SQL ceiling.
+	// Zero means "use the plan default" — same opt-out
+	// semantics as BatchSizeMax above. Records above the cap
+	// are DLQ'd with reason='payload_too_large' at insert
+	// time rather than silently truncated.
+	PayloadMaxBytes int `yaml:"payload_max_bytes,omitempty"`
 	// Config is the per-kind JSON object. Validated strictly per
 	// kind in Validate(). Absent Config defaults to `{}` so a
 	// bare trigger entry validates against the per-kind zero-value
@@ -327,6 +336,13 @@ func (m *Manifest) Validate() error {
 			}
 			if t.MaxAttempts != 0 && (t.MaxAttempts < 1 || t.MaxAttempts > 25) {
 				return fmt.Errorf("trigger[%d]: max_attempts=%d out of range [1, 25]", i, t.MaxAttempts)
+			}
+			// payload_max_bytes mirrors the migration 00274 SQL
+			// CHECK floor + ceiling. 0 means "use the plan
+			// default". Surface the customer-facing error rather
+			// than letting the row insert fail at the DB layer.
+			if t.PayloadMaxBytes != 0 && (t.PayloadMaxBytes < 1024 || t.PayloadMaxBytes > 67108864) {
+				return fmt.Errorf("trigger[%d]: payload_max_bytes=%d out of range [1024, 67108864]", i, t.PayloadMaxBytes)
 			}
 		}
 		k := triggerKey{app: t.App, kind: t.Kind, schedule: t.Schedule, path: t.Path, slug: t.Slug}

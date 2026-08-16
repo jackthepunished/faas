@@ -604,6 +604,15 @@ type Limits struct {
 	// broker (back-pressure on Kafka consumer groups breaks the
 	// group-rebalance contract). 0 with TriggersAllowed=false (Free).
 	TriggerRecordsPerSecondPerApp int
+	// TriggerPayloadMaxBytes (migration 00274 / audit #7) caps the
+	// per-trigger `payload_max_bytes` the customer may set. SQL
+	// CHECK admits [1024, 67108864] (1 KiB floor, 64 MiB ceiling);
+	// this plan-level cap is below that ceiling so Hobby can't
+	// park 64 MiB records that would balloon trigger_records rows.
+	// Hobby 1 MiB / Pro 6 MiB / Scale 16 MiB. apid's createTrigger
+	// handler rejects a value above the plan cap with
+	// trigger_payload_too_large before the SQL CHECK fires.
+	TriggerPayloadMaxBytes int
 
 	// EgressAllowlistAllowed toggles the per-app outbound IP allowlist
 	// (ADR-031, tier-2 of the network roadmap). Free + Hobby keep
@@ -1010,6 +1019,7 @@ var planLimits = map[Plan]Limits{
 		TriggerBatchWindowMaxSec:      0,
 		TriggerMaxAttemptsMax:         0,
 		TriggerRecordsPerSecondPerApp: 0,
+		TriggerPayloadMaxBytes:        0,
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
@@ -1262,6 +1272,11 @@ var planLimits = map[Plan]Limits{
 		TriggerBatchWindowMaxSec:      30,
 		TriggerMaxAttemptsMax:         3,
 		TriggerRecordsPerSecondPerApp: 100,
+		// Hobby payload cap: 1 MiB — keeps trigger_records rows
+		// small enough that Hobby fan-out doesn't bloat Postgres.
+		// The migration-00274 SQL ceiling is 64 MiB so there's
+		// headroom for Pro+ below the hard limit.
+		TriggerPayloadMaxBytes: 1048576,
 		// Per-account rate limit (ADR-040): Hobby gets 200/min — ~10× the
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
@@ -1503,6 +1518,10 @@ var planLimits = map[Plan]Limits{
 		TriggerBatchWindowMaxSec:      300,
 		TriggerMaxAttemptsMax:         10,
 		TriggerRecordsPerSecondPerApp: 1000,
+		// Pro payload cap: 6 MiB — matches the previous
+		// hardcoded closeBatch byte cap so Pro customers behave
+		// identically pre/post migration 00274.
+		TriggerPayloadMaxBytes: 6291456,
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
@@ -1739,6 +1758,13 @@ var planLimits = map[Plan]Limits{
 		TriggerBatchWindowMaxSec:      300,
 		TriggerMaxAttemptsMax:         25,
 		TriggerRecordsPerSecondPerApp: 10000,
+		// Scale payload cap: 16 MiB — covers the largest
+		// realistic per-record broker payloads (SQS max 256 KiB,
+		// Kafka default 1 MiB, NATS typically < 8 MiB). Below
+		// the migration-00274 SQL ceiling of 64 MiB so the
+		// column CHECK remains a safety net, not a binding
+		// constraint.
+		TriggerPayloadMaxBytes: 16777216,
 		// Per-account rate limit (ADR-040): Scale gets 5000/min — ~10× the
 		// Scale per-app rps (500). The fleet-summed alert at 100/min/5m
 		// (FaasPerAccountRateLimitSpike) triggers well before any single

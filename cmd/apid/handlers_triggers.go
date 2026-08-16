@@ -97,18 +97,19 @@ func notifyTriggerChangedJSON(op, appID, triggerID string) string {
 //     /v1/crons).
 func triggerResponse(t sqlc.Trigger) api.Trigger {
 	resp := api.Trigger{
-		ID:            uuidFromPgtype(t.ID).String(),
-		AccountID:     uuidFromPgtype(t.AccountID).String(),
-		AppID:         uuidFromPgtype(t.AppID).String(),
-		Kind:          api.TriggerKind(t.Kind),
-		Slug:          t.Slug,
-		Enabled:       t.Enabled,
-		Config:        json.RawMessage(t.Config),
-		BatchSizeMax:  int(t.BatchSizeMax),
-		BatchWindowMs: int(t.BatchWindowMs),
-		MaxAttempts:   int(t.MaxAttempts),
-		CreatedAt:     t.CreatedAt.Time,
-		UpdatedAt:     t.UpdatedAt.Time,
+		ID:              uuidFromPgtype(t.ID).String(),
+		AccountID:       uuidFromPgtype(t.AccountID).String(),
+		AppID:           uuidFromPgtype(t.AppID).String(),
+		Kind:            api.TriggerKind(t.Kind),
+		Slug:            t.Slug,
+		Enabled:         t.Enabled,
+		Config:          json.RawMessage(t.Config),
+		BatchSizeMax:    int(t.BatchSizeMax),
+		BatchWindowMs:   int(t.BatchWindowMs),
+		MaxAttempts:     int(t.MaxAttempts),
+		PayloadMaxBytes: int(t.PayloadMaxBytes),
+		CreatedAt:       t.CreatedAt.Time,
+		UpdatedAt:       t.UpdatedAt.Time,
 	}
 	if t.CronID.Valid {
 		resp.CronID = uuidFromPgtype(t.CronID).String()
@@ -254,6 +255,20 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "max_attempts", limits.TriggerMaxAttemptsMax, int(maxAttempts)))
 		return
 	}
+	// Audit finding #7 (migration 00274): per-trigger broker payload
+	// size cap. Default 6 MiB when the request omits the field.
+	// Surface a plan-level 403 (rather than letting the SQL CHECK
+	// 422 the request) so the response carries the plan cap + the
+	// observed value, matching the existing batch_size_max /
+	// max_attempts gates above.
+	payloadMaxBytes := int32(6291456)
+	if req.PayloadMaxBytes != nil && *req.PayloadMaxBytes > 0 {
+		payloadMaxBytes = int32(*req.PayloadMaxBytes)
+	}
+	if limits.TriggerPayloadMaxBytes > 0 && payloadMaxBytes > int32(limits.TriggerPayloadMaxBytes) {
+		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "payload_max_bytes", limits.TriggerPayloadMaxBytes, int(payloadMaxBytes)))
+		return
+	}
 	// (cron-kind POSTs are rejected earlier in the handler — the
 	// ADR-090 PR-B path. The review finding #6 fix shifts the
 	// rejection above the AppByID roundtrip so a kind=cron POST
@@ -262,7 +277,7 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	t, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
 		app.ID,
 		string(req.Kind), req.Slug, enabled, []byte(req.Config),
-		batchSizeMax, batchWindowMs, maxAttempts, limits)
+		batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, limits)
 	if err != nil {
 		var qe *state.TriggerQuotaError
 		switch {
@@ -397,7 +412,7 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 			return
 		}
 	}
-	var batchSizeMax, batchWindowMs, maxAttempts *int32
+	var batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32
 	if req.BatchSizeMax != nil {
 		v := int32(*req.BatchSizeMax)
 		batchSizeMax = &v
@@ -409,6 +424,10 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	if req.MaxAttempts != nil {
 		v := int32(*req.MaxAttempts)
 		maxAttempts = &v
+	}
+	if req.PayloadMaxBytes != nil {
+		v := int32(*req.PayloadMaxBytes)
+		payloadMaxBytes = &v
 	}
 	var configBytes []byte
 	if req.Config != nil {
@@ -433,13 +452,13 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 			return
 		}
 		// Update the non-cron fields on the triggers row.
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
 		}
 	} else {
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
@@ -532,7 +551,7 @@ func (s *server) setTriggerEnabled(w http.ResponseWriter, r *http.Request, acct 
 		s.notFound(w, "no such trigger")
 		return
 	}
-	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil)
+	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil, nil)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 		return
@@ -756,6 +775,10 @@ func (s *server) batchCreateTrigger(w http.ResponseWriter, r *http.Request, acct
 		if t.MaxAttempts > 0 {
 			ma = int32(t.MaxAttempts)
 		}
+		pmb := int32(6291456)
+		if t.PayloadMaxBytes > 0 {
+			pmb = int32(t.PayloadMaxBytes)
+		}
 		if limits.TriggerBatchSizeMax > 0 && bsm > int32(limits.TriggerBatchSizeMax) {
 			errs = append(errs, batchError{Slug: t.Slug, Message: "batch_size_max exceeds plan cap"})
 			continue
@@ -764,10 +787,14 @@ func (s *server) batchCreateTrigger(w http.ResponseWriter, r *http.Request, acct
 			errs = append(errs, batchError{Slug: t.Slug, Message: "max_attempts exceeds plan cap"})
 			continue
 		}
+		if limits.TriggerPayloadMaxBytes > 0 && pmb > int32(limits.TriggerPayloadMaxBytes) {
+			errs = append(errs, batchError{Slug: t.Slug, Message: "payload_max_bytes exceeds plan cap"})
+			continue
+		}
 		created, err := s.store.CreateTriggerIfUnderQuota(r.Context(),
 			req.AppID,
 			string(t.Kind), t.Slug, t.IsEnabled(), marshalConfig(t.Config),
-			bsm, bwm, ma, limits)
+			bsm, bwm, ma, pmb, limits)
 		if err != nil {
 			var qe *state.TriggerQuotaError
 			switch {

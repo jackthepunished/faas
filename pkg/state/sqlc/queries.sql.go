@@ -1019,25 +1019,26 @@ const createTrigger = `-- name: CreateTrigger :one
 
 insert into triggers (account_id, app_id, kind, slug, enabled, config,
                        batch_size_max, batch_window_ms, max_attempts,
-                       cron_id, source)
-values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+                       cron_id, source, payload_max_bytes)
+values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
 returning id, account_id, app_id, kind, slug, enabled, config,
           batch_size_max, batch_window_ms, max_attempts,
-          cron_id, source, created_at, updated_at
+          cron_id, source, payload_max_bytes, created_at, updated_at
 `
 
 type CreateTriggerParams struct {
-	AccountID     pgtype.UUID
-	AppID         pgtype.UUID
-	Kind          string
-	Slug          string
-	Enabled       bool
-	Column6       []byte
-	BatchSizeMax  int32
-	BatchWindowMs int32
-	MaxAttempts   int32
-	CronID        pgtype.UUID
-	Source        pgtype.Text
+	AccountID       pgtype.UUID
+	AppID           pgtype.UUID
+	Kind            string
+	Slug            string
+	Enabled         bool
+	Column6         []byte
+	BatchSizeMax    int32
+	BatchWindowMs   int32
+	MaxAttempts     int32
+	CronID          pgtype.UUID
+	Source          pgtype.Text
+	PayloadMaxBytes int32
 }
 
 // Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
@@ -1067,6 +1068,7 @@ func (q *Queries) CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerP
 		arg.MaxAttempts,
 		arg.CronID,
 		arg.Source,
+		arg.PayloadMaxBytes,
 	)
 	var i Trigger
 	err := row.Scan(
@@ -1082,6 +1084,7 @@ func (q *Queries) CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerP
 		&i.MaxAttempts,
 		&i.CronID,
 		&i.Source,
+		&i.PayloadMaxBytes,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -2882,7 +2885,7 @@ func (q *Queries) ListEnabledCrons(ctx context.Context, db DBTX) ([]ListEnabledC
 const listEnabledTriggers = `-- name: ListEnabledTriggers :many
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
-       cron_id, source, created_at, updated_at
+       cron_id, source, payload_max_bytes, created_at, updated_at
 from triggers where enabled = true
 `
 
@@ -2912,6 +2915,7 @@ func (q *Queries) ListEnabledTriggers(ctx context.Context, db DBTX) ([]Trigger, 
 			&i.MaxAttempts,
 			&i.CronID,
 			&i.Source,
+			&i.PayloadMaxBytes,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -3468,7 +3472,7 @@ func (q *Queries) ListTriggerRecordsForTrigger(ctx context.Context, db DBTX, arg
 const listTriggersForApp = `-- name: ListTriggersForApp :many
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
-       cron_id, source, created_at, updated_at
+       cron_id, source, payload_max_bytes, created_at, updated_at
 from triggers where app_id = $1 order by created_at desc
 `
 
@@ -3494,6 +3498,7 @@ func (q *Queries) ListTriggersForApp(ctx context.Context, db DBTX, appID pgtype.
 			&i.MaxAttempts,
 			&i.CronID,
 			&i.Source,
+			&i.PayloadMaxBytes,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -4355,7 +4360,7 @@ func (q *Queries) TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, ar
 const triggerByID = `-- name: TriggerByID :one
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
-       cron_id, source, created_at, updated_at
+       cron_id, source, payload_max_bytes, created_at, updated_at
 from triggers where id = $1
 `
 
@@ -4375,6 +4380,7 @@ func (q *Queries) TriggerByID(ctx context.Context, db DBTX, id pgtype.UUID) (Tri
 		&i.MaxAttempts,
 		&i.CronID,
 		&i.Source,
+		&i.PayloadMaxBytes,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -4604,20 +4610,22 @@ update triggers set
   config = coalesce($3::jsonb, config),
   batch_size_max = coalesce($4, batch_size_max),
   batch_window_ms = coalesce($5, batch_window_ms),
-  max_attempts = coalesce($6, max_attempts)
+  max_attempts = coalesce($6, max_attempts),
+  payload_max_bytes = coalesce($7, payload_max_bytes)
 where id = $1
 returning id, account_id, app_id, kind, slug, enabled, config,
           batch_size_max, batch_window_ms, max_attempts,
-          cron_id, source, created_at, updated_at
+          cron_id, source, payload_max_bytes, created_at, updated_at
 `
 
 type UpdateTriggerParams struct {
-	ID            pgtype.UUID
-	Enabled       bool
-	Column3       []byte
-	BatchSizeMax  int32
-	BatchWindowMs int32
-	MaxAttempts   int32
+	ID              pgtype.UUID
+	Enabled         bool
+	Column3         []byte
+	BatchSizeMax    int32
+	BatchWindowMs   int32
+	MaxAttempts     int32
+	PayloadMaxBytes int32
 }
 
 func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (Trigger, error) {
@@ -4628,6 +4636,7 @@ func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerP
 		arg.BatchSizeMax,
 		arg.BatchWindowMs,
 		arg.MaxAttempts,
+		arg.PayloadMaxBytes,
 	)
 	var i Trigger
 	err := row.Scan(
@@ -4643,6 +4652,7 @@ func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerP
 		&i.MaxAttempts,
 		&i.CronID,
 		&i.Source,
+		&i.PayloadMaxBytes,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

@@ -1920,6 +1920,7 @@ CREATE TABLE public.triggers (
     max_attempts integer DEFAULT 5 NOT NULL,
     cron_id uuid,
     source text,
+    payload_max_bytes integer DEFAULT 6291456 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT triggers_batch_size_max_check CHECK (((batch_size_max >= 1) AND (batch_size_max <= 5000))),
@@ -1927,6 +1928,7 @@ CREATE TABLE public.triggers (
     CONSTRAINT triggers_check CHECK ((((kind = 'cron'::text) AND (cron_id IS NOT NULL) AND (source IS NULL)) OR ((kind <> 'cron'::text) AND (cron_id IS NULL)))),
     CONSTRAINT triggers_kind_check CHECK ((kind = ANY (ARRAY['cron'::text, 'kafka'::text, 'nats'::text, 'redis_streams'::text, 'sqs_compat'::text, 'queue'::text]))),
     CONSTRAINT triggers_max_attempts_check CHECK (((max_attempts >= 1) AND (max_attempts <= 25))),
+    CONSTRAINT triggers_payload_max_bytes_check CHECK (((payload_max_bytes >= 1024) AND (payload_max_bytes <= 67108864))),
     CONSTRAINT triggers_source_check CHECK (((source IS NULL) OR (source = ANY (ARRAY['queue'::text, 'delayed_task'::text]))))
 );
 

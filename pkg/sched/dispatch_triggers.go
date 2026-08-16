@@ -233,7 +233,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	}
 
 	// 3. Batch close: size / 6MB.
-	batch := closeBatch(res.Records, int(t.BatchSizeMax), 6*1024*1024)
+	batch := closeBatch(res.Records, int(t.BatchSizeMax), int(t.PayloadMaxBytes))
 	if len(batch) == 0 {
 		return nil
 	}

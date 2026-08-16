@@ -86,6 +86,13 @@ type Trigger struct {
 	BatchWindowMs int             `json:"batch_window_ms"`
 	MaxAttempts   int             `json:"max_attempts"`
 
+	// PayloadMaxBytes (migration 00274) bounds the per-record
+	// broker payload size. Records above this cap are DLQ'd at
+	// insert time with reason='payload_too_large' rather than
+	// silently truncated. Default 6291456 (6 MiB); the SQL CHECK
+	// admits [1024, 67108864].
+	PayloadMaxBytes int `json:"payload_max_bytes"`
+
 	// Cron-only: kind=cron rows mirror a crons row via cron_id.
 	// Mutually exclusive with the non-cron fields below (enforced
 	// by SQL CHECK).
@@ -123,6 +130,10 @@ type CreateTriggerRequest struct {
 	BatchSizeMax  *int            `json:"batch_size_max,omitempty"`
 	BatchWindowMs *int            `json:"batch_window_ms,omitempty"`
 	MaxAttempts   *int            `json:"max_attempts,omitempty"`
+	// PayloadMaxBytes is the broker-payload byte cap per record.
+	// nil → default 6291456 (6 MiB); the SQL CHECK rejects values
+	// outside [1024, 67108864].
+	PayloadMaxBytes *int `json:"payload_max_bytes,omitempty"`
 
 	// Cron-only fields.
 	Schedule string `json:"schedule,omitempty"`
@@ -135,11 +146,12 @@ type CreateTriggerRequest struct {
 // a new resource + deleting the old one, which the customer has
 // to do explicitly).
 type UpdateTriggerRequest struct {
-	Enabled       *bool           `json:"enabled,omitempty"`
-	Config        json.RawMessage `json:"config,omitempty"`
-	BatchSizeMax  *int            `json:"batch_size_max,omitempty"`
-	BatchWindowMs *int            `json:"batch_window_ms,omitempty"`
-	MaxAttempts   *int            `json:"max_attempts,omitempty"`
+	Enabled         *bool           `json:"enabled,omitempty"`
+	Config          json.RawMessage `json:"config,omitempty"`
+	BatchSizeMax    *int            `json:"batch_size_max,omitempty"`
+	BatchWindowMs   *int            `json:"batch_window_ms,omitempty"`
+	MaxAttempts     *int            `json:"max_attempts,omitempty"`
+	PayloadMaxBytes *int            `json:"payload_max_bytes,omitempty"`
 
 	// Cron-only patches. Cron kinds accept schedule+path patches
 	// (e.g. updating an existing cron); non-cron kinds reject

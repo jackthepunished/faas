@@ -4729,7 +4729,7 @@ func (m *MemStore) ListEnabledCrons(_ context.Context) ([]Cron, error) {
 // (#14) reads from ListEnabledTriggers + ClaimTriggerRecords; both
 // are stubbed here so tests can run without a live Postgres.
 
-func (m *MemStore) CreateTriggerIfUnderQuota(_ context.Context, appID, kind, slug string, enabled bool, _ []byte, _, _, _ int32, limits api.Limits) (sqlc.Trigger, error) {
+func (m *MemStore) CreateTriggerIfUnderQuota(_ context.Context, appID, kind, slug string, enabled bool, _ []byte, _, _, _, payloadMaxBytes int32, limits api.Limits) (sqlc.Trigger, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	perApp := 0
@@ -4748,19 +4748,23 @@ func (m *MemStore) CreateTriggerIfUnderQuota(_ context.Context, appID, kind, slu
 	if limits.TriggerLimitPerAccount > 0 && perAccount >= limits.TriggerLimitPerAccount {
 		return sqlc.Trigger{}, &TriggerQuotaError{Scope: TriggerQuotaScopeAccount, Limit: limits.TriggerLimitPerAccount, Observed: perAccount}
 	}
+	if payloadMaxBytes <= 0 {
+		payloadMaxBytes = 6291456
+	}
 	t := sqlc.Trigger{
-		ID:            pgtype.UUID{Bytes: memNewUUID(), Valid: true},
-		AccountID:     pgtype.UUID{Bytes: memNewUUID(), Valid: true},
-		AppID:         pgtype.UUID{Bytes: parseMemUUIDString(appID), Valid: true},
-		Kind:          kind,
-		Slug:          slug,
-		Enabled:       enabled,
-		Config:        []byte("{}"),
-		BatchSizeMax:  64,
-		BatchWindowMs: 1000,
-		MaxAttempts:   5,
-		CreatedAt:     pgtype.Timestamptz{Time: time.Now(), Valid: true},
-		UpdatedAt:     pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		ID:              pgtype.UUID{Bytes: memNewUUID(), Valid: true},
+		AccountID:       pgtype.UUID{Bytes: memNewUUID(), Valid: true},
+		AppID:           pgtype.UUID{Bytes: parseMemUUIDString(appID), Valid: true},
+		Kind:            kind,
+		Slug:            slug,
+		Enabled:         enabled,
+		Config:          []byte("{}"),
+		BatchSizeMax:    64,
+		BatchWindowMs:   1000,
+		MaxAttempts:     5,
+		PayloadMaxBytes: payloadMaxBytes,
+		CreatedAt:       pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		UpdatedAt:       pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
 	if m.triggers == nil {
 		m.triggers = map[string]sqlc.Trigger{}
@@ -4779,7 +4783,7 @@ func (m *MemStore) TriggerByID(_ context.Context, id string) (sqlc.Trigger, erro
 	return t, nil
 }
 
-func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ []byte, _, _, _ *int32) (sqlc.Trigger, error) {
+func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ []byte, _, _, _, payloadMaxBytes *int32) (sqlc.Trigger, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t, ok := m.triggers[id]
@@ -4788,6 +4792,9 @@ func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ 
 	}
 	if enabled != nil {
 		t.Enabled = *enabled
+	}
+	if payloadMaxBytes != nil {
+		t.PayloadMaxBytes = *payloadMaxBytes
 	}
 	t.UpdatedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	m.triggers[id] = t

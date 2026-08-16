@@ -871,20 +871,21 @@ type TenantSurface struct {
 }
 
 type Trigger struct {
-	ID            pgtype.UUID
-	AccountID     pgtype.UUID
-	AppID         pgtype.UUID
-	Kind          string
-	Slug          string
-	Enabled       bool
-	Config        []byte
-	BatchSizeMax  int32
-	BatchWindowMs int32
-	MaxAttempts   int32
-	CronID        pgtype.UUID
-	Source        pgtype.Text
-	CreatedAt     pgtype.Timestamptz
-	UpdatedAt     pgtype.Timestamptz
+	ID              pgtype.UUID
+	AccountID       pgtype.UUID
+	AppID           pgtype.UUID
+	Kind            string
+	Slug            string
+	Enabled         bool
+	Config          []byte
+	BatchSizeMax    int32
+	BatchWindowMs   int32
+	MaxAttempts     int32
+	CronID          pgtype.UUID
+	Source          pgtype.Text
+	PayloadMaxBytes int32
+	CreatedAt       pgtype.Timestamptz
+	UpdatedAt       pgtype.Timestamptz
 }
 
 type TriggerDeadLetter struct {
