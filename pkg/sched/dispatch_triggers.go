@@ -87,6 +87,11 @@ type triggerDispatchResult struct {
 	ItemIdentifier string `json:"item_identifier"`
 	Status         string `json:"status"`
 	Error          string `json:"error,omitempty"`
+	// Code (audit #8) is the structured counterpart to Error —
+	// a stable machine-readable string the dispatch tick
+	// switches on instead of substring-matching Error. Mirrors
+	// pkg/gateway/synth.go::batchDispatchResult.Code.
+	Code string `json:"code,omitempty"`
 }
 
 // loopStoreAccessor returns the store the Loop uses. The store
@@ -402,7 +407,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			// onto one of the trigger_dead_letter.reason
 			// CHECK values; fall through to 'poison_record'
 			// when the gateway didn't classify.
-			reason := classifyDLQReason(status.Error)
+			reason := classifyDLQReason(status.Code, status.Error)
 			dlqReasons = append(dlqReasons, reason)
 			dlqErrors = append(dlqErrors, status.Error)
 		default:
@@ -694,26 +699,59 @@ func computeRetryBackoff(attempts int32) time.Duration {
 // Compile-time guarantee the helpers we use are wired.
 var _ = slog.Default
 
-// classifyDLQReason maps the gateway's per-record error string
-// onto one of trigger_dead_letter.reason's CHECK values
+// classifyDLQReason maps the gateway's per-record outcome onto
+// one of trigger_dead_letter.reason's CHECK values
 // (migrations/00273_triggers.sql::trigger_dead_letter.reason_check).
-// Review finding #8: the prior code hardcoded 'max_attempts'
-// for every Status='dead_letter' record.
 //
-// The string-match heuristic looks at substrings of the gateway's
-// per-record Error field. Real causes the gateway distinguishes
-// today (pkg/gateway/synth.go::handleInvocationDispatchBatch):
-//   - "function response malformed" → poison_record
-//   - "reported in batchItemFailures" → max_attempts (the function
-//     decided to give up — it called back into the report with the
-//     same id which means it has exhausted its own retries)
-//   - "function state=timeout" → max_attempts
-//   - everything else → poison_record (last resort)
+// Audit finding #8: the prior code hardcoded 'max_attempts' for
+// every Status='dead_letter' record AND substring-matched the
+// Error field — both brittle. Substring matching broke the moment
+// the gateway added a new error path with overlapping words
+// (e.g. "timeout" matching "broker timeout" but also "request
+// timeout from client").
 //
-// Refining this into a structured gateway error type is PR-B
-// scope (the gateway only emits the strings today, so the
-// disambiguation logic lives here).
-func classifyDLQReason(gatewayErr string) string {
+// The Code field (added in audit #8) is the structured counterpart
+// the gateway emits — a stable machine-readable string the dispatch
+// tick switches on. Real causes the gateway distinguishes today
+// (pkg/gateway/synth.go::handleInvocationDispatchBatch):
+//
+//	"payload_b64_invalid"   → poison_record
+//	"response_malformed"    → poison_record
+//	"invoke_error"          → broker_error
+//	"function_failed"       → max_attempts (the function decided
+//	                                   to give up — it called
+//	                                   back into the report with
+//	                                   the same id which means it
+//	                                   has exhausted its own
+//	                                   retries)
+//	"function_state_<X>"    → max_attempts (function returned
+//	                                   non-succeeded state)
+//	"" (empty, legacy gw)   → fall through to substring match
+//	                            on Error for back-compat
+//
+// The substring fallback only fires for older gateway versions
+// that pre-date the Code field. New deployments always go through
+// the structured switch.
+func classifyDLQReason(code, gatewayErr string) string {
+	if code != "" {
+		switch code {
+		case "function_failed":
+			return triggerReasonMaxAttempts
+		case "function_state_timeout",
+			"function_state_failed",
+			"function_state_killed",
+			"function_state_lost":
+			return triggerReasonMaxAttempts
+		case "payload_b64_invalid",
+			"response_malformed":
+			return triggerReasonPoisonRecord
+		case "invoke_error":
+			return triggerReasonBrokerError
+		default:
+			return triggerReasonPoisonRecord
+		}
+	}
+	// Substring fallback for older gateways without a Code field.
 	if gatewayErr == "" {
 		return triggerReasonPoisonRecord
 	}

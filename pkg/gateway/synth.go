@@ -395,10 +395,26 @@ type batchDispatchResponse struct {
 
 // batchDispatchResult mirrors one Records[i] entry with the
 // terminal status. Error is omitted on success.
+//
+// Code (audit #8) is a stable machine-readable string the schedd
+// can switch on instead of substring-matching Error. Mirrors
+// api.Problem.Code; the values below are the dispatch-specific
+// subset:
+//
+//	"payload_b64_invalid"   payload base64 decode failed
+//	"invoke_error"          dispatcher.Invoke returned err
+//	"response_malformed"    function response parse failed
+//	"function_failed"       function reported batchItemFailure
+//	"function_state_<X>"    function returned non-succeeded state
+//
+// schedd's classifyDLQReason prefers Code and falls back to
+// Error substring matching only when Code is empty (older gateway
+// versions).
 type batchDispatchResult struct {
 	ItemIdentifier string `json:"item_identifier"`
 	Status         string `json:"status"`
 	Error          string `json:"error,omitempty"`
+	Code           string `json:"code,omitempty"`
 }
 
 // handleInvocationDispatchBatch is the trigger-driven batch path.
@@ -468,6 +484,7 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 					ItemIdentifier: rec.ItemIdentifier,
 					Status:         "dead_letter",
 					Error:          "payload_b64 invalid",
+					Code:           "payload_b64_invalid",
 				})
 				continue
 			}
@@ -497,6 +514,7 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 				ItemIdentifier: rec.ItemIdentifier,
 				Status:         "broker_error",
 				Error:          err.Error(),
+				Code:           "invoke_error",
 			})
 			continue
 		}
@@ -520,6 +538,7 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 				ItemIdentifier: rec.ItemIdentifier,
 				Status:         "retry",
 				Error:          "function response malformed: " + parseErr.Error(),
+				Code:           "response_malformed",
 			})
 			continue
 		}
@@ -530,6 +549,7 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 				ItemIdentifier: rec.ItemIdentifier,
 				Status:         "retry",
 				Error:          "reported in batchItemFailures",
+				Code:           "function_failed",
 			})
 			continue
 		}
@@ -546,6 +566,7 @@ func (s *SynthServer) handleInvocationDispatchBatch(w http.ResponseWriter, r *ht
 				ItemIdentifier: rec.ItemIdentifier,
 				Status:         "retry",
 				Error:          fmt.Sprintf("function state=%s", out.State),
+				Code:           "function_state_" + string(out.State),
 			})
 		}
 	}
