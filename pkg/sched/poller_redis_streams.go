@@ -193,9 +193,6 @@ func (r *redisPoller) Poll(ctx context.Context, t sqlc.Trigger) PollResult {
 		return PollResult{Error: fmt.Errorf("redis_poller: xreadgroup: %w", err)}
 	}
 	r.appendOutFromXReadGroup(out, newRes)
-	if out == nil {
-		out = []SourceRecord{}
-	}
 	return PollResult{Records: out}
 }
 
