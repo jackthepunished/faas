@@ -44,7 +44,7 @@ Usage:
 
 Commands:
   manifest     Validate/render a split-box deployment manifest (manifest validate|render; issue #911 / ADR-110)
-  release      Materialise / install a cluster-shipped release bundle (release bundle|install --git-sha SHA)
+  release      Materialise / install / rotate a cluster-shipped release bundle (release bundle|install|kgv)
   doctor       Read-only diagnostic for the cluster-shipped release bundle (doctor [--node NAME] [--release SHA] [--deep]; PR-4 / ADR-110)
   host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   pki          Operator local-dev PKI bootstrap (pki init|status|rotate)
