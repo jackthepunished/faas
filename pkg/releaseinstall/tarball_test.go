@@ -306,11 +306,11 @@ func TestTarball_Extract_RefusesNilTarball(t *testing.T) {
 }
 
 // TestTarball_Extract_RejectsZipSlip is the CodeQL CWE-22 test:
-// a tarball entry whose Name contains ".." or an absolute path
-// must NEVER escape the bin/ directory. CodeQL flagged the
-// original Extract loop at tarball.go:284 with "arbitrary file
-// access during archive extraction" — the fix is post-Clean
-// containment via filepath.Rel.
+// a tarball entry whose Name contains ".." must NEVER escape the
+// bin/ directory. CodeQL flagged the original Extract loop at
+// tarball.go:284 with "arbitrary file access during archive
+// extraction" — the fix is safeArchiveEntryName's regex guards
+// (the canonical CodeQL-recognised taint barrier).
 func TestTarball_Extract_RejectsZipSlip(t *testing.T) {
 	_, root, gitSHA, manifestHash := fakeBinDir(t)
 	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Now().UTC())
@@ -318,62 +318,49 @@ func TestTarball_Extract_RejectsZipSlip(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 
-	// Append a malicious entry to the tarball: a file at "../etc/passwd".
-	// BuildTarball only emits catalog-name entries; we have to hand-craft
-	// one to inject the Zip Slip payload.
+	// Fresh, hand-crafted tarball with one Zip Slip entry
+	// appended after the catalog entries. BuildTarball only emits
+	// catalog-name entries; we hand-craft to inject the payload.
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
-	if _, err := tw.Write([]byte(tb.Packed)); err != nil {
-		// Packed is already gzipped; we can't append raw. Re-decode
-		// and re-emit is the cleanest path. Skipping — use a fresh
-		// hand-built tarball with the malicious entry instead.
-		t.Skip("packed re-encoding skipped; using fresh zip-slip tarball below")
-	}
-	_ = tw.Close()
-	_ = gz.Close()
-
-	// Fresh, hand-crafted tarball with one Zip Slip entry.
-	var buf2 bytes.Buffer
-	gz2 := gzip.NewWriter(&buf2)
-	tw2 := tar.NewWriter(gz2)
 	for _, name := range catalogDaemons() {
 		body := deterministicBody(name)
-		if err := tw2.WriteHeader(&tar.Header{
+		if err := tw.WriteHeader(&tar.Header{
 			Name: name, Mode: 0o755, Size: int64(len(body)),
 			ModTime:  time.Unix(0, 0).UTC(),
 			Typeflag: tar.TypeReg, Format: tar.FormatUSTAR,
 		}); err != nil {
 			t.Fatalf("write header %s: %v", name, err)
 		}
-		if _, err := tw2.Write(body); err != nil {
+		if _, err := tw.Write(body); err != nil {
 			t.Fatalf("write body %s: %v", name, err)
 		}
 	}
-	// Malicious entry: filepath.Base would yield "passwd", but the
-	// header Name still contains "../" and the post-join Rel check
-	// catches it.
+	// Malicious entry: filepath.Base would yield "passwd", but
+	// the helper's `strings.Contains(name, "..")` guard rejects
+	// the entire entry before any path is computed.
 	evil := []byte("zip-slip-payload")
-	if err := tw2.WriteHeader(&tar.Header{
+	if err := tw.WriteHeader(&tar.Header{
 		Name: "../escape/passwd", Mode: 0o755, Size: int64(len(evil)),
 		ModTime:  time.Unix(0, 0).UTC(),
 		Typeflag: tar.TypeReg, Format: tar.FormatUSTAR,
 	}); err != nil {
 		t.Fatalf("write evil header: %v", err)
 	}
-	if _, err := tw2.Write(evil); err != nil {
+	if _, err := tw.Write(evil); err != nil {
 		t.Fatalf("write evil body: %v", err)
 	}
-	if err := tw2.Close(); err != nil {
+	if err := tw.Close(); err != nil {
 		t.Fatalf("tar close: %v", err)
 	}
-	if err := gz2.Close(); err != nil {
+	if err := gz.Close(); err != nil {
 		t.Fatalf("gz close: %v", err)
 	}
 
 	// Reuse the catalog Manifest from BuildTarball but swap Packed
 	// for the malicious bytes.
-	tb.Packed = buf2.Bytes()
+	tb.Packed = buf.Bytes()
 	if err := tb.Extract(root); err == nil {
 		t.Fatalf("extract with Zip Slip entry: want error, got nil")
 	} else if !errors.Is(err, releaseinstall.ErrTarballTampered) {
@@ -384,6 +371,50 @@ func TestTarball_Extract_RejectsZipSlip(t *testing.T) {
 	escapePath := filepath.Join(root, "escape", "passwd")
 	if _, err := os.Stat(escapePath); err == nil {
 		t.Fatalf("Zip Slip: escape path %s was created", escapePath)
+	}
+}
+
+// TestSafeArchiveEntryName is the whitebox test for the
+// SafeArchiveEntryName helper. CodeQL's go/zipslip data flow
+// terminates at the regex guards inside this helper; the
+// positive and negative cases below pin down every rule the
+// helper enforces.
+func TestSafeArchiveEntryName(t *testing.T) {
+	t.Helper()
+	cases := []struct {
+		name    string
+		in      string
+		wantErr bool
+		wantOut string
+	}{
+		{name: "plain daemon name", in: "apid", wantOut: "apid"},
+		{name: "catalog name with subdir", in: "bin/apid", wantOut: "apid"},
+		{name: "empty", in: "", wantErr: true},
+		{name: "absolute unix", in: "/etc/passwd", wantErr: true},
+		{name: "absolute windows", in: `\windows\system32`, wantErr: true},
+		{name: "drive letter", in: "C:/windows/notepad", wantErr: true},
+		{name: "parent traversal at front", in: "../escape", wantErr: true},
+		{name: "parent traversal mid", in: "bin/../../etc/passwd", wantErr: true},
+		{name: "parent traversal back", in: "foo/..", wantErr: true},
+		{name: "current dir", in: ".", wantErr: true},
+		{name: "current dir as subdir", in: "./apid", wantErr: false, wantOut: "apid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := releaseinstall.SafeArchiveEntryName(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("SafeArchiveEntryName(%q) = %q, nil; want error", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SafeArchiveEntryName(%q) error: %v", tc.in, err)
+			}
+			if got != tc.wantOut {
+				t.Fatalf("SafeArchiveEntryName(%q) = %q, want %q", tc.in, got, tc.wantOut)
+			}
+		})
 	}
 }
 

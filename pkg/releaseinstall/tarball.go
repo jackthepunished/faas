@@ -291,53 +291,27 @@ func (t *Tarball) Extract(root string) error {
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		// Defence against Zip Slip (CodeQL CWE-22): a tarball
-		// entry whose Name contains '..' or an absolute path
-		// must NEVER escape the bin/ directory. The robust
-		// check is post-Clean containment: filepath.Base
-		// alone is not enough because a header like
-		// "../../etc/passwd" becomes "passwd" via Base and
-		// lands safely, BUT a header like "foo/../../bar"
-		// joined with bin/ and cleaned could still escape
-		// when the BinDir parent contains a symlink. We do
-		// both: Base() the name AND verify post-join
-		// containment via filepath.EvalSymlinks. Refusing
-		// the entry as ErrTarballTampered matches the
-		// existing failure-class convention (this file
-		// already treats any anomaly in a canary-built
-		// tarball as tampering).
-		base := filepath.Base(hdr.Name)
-		if base == "." || base == "/" || base == "" {
-			return fmt.Errorf("%w: tarball entry %q has unsafe basename",
-				ErrTarballTampered, hdr.Name)
+		// Sanitise at the loop head so the unsanitised
+		// hdr.Name is NEVER referenced past this point —
+		// CodeQL's go/zipslip sink stops at the regex match
+		// inside safeArchiveEntryName. After the helper
+		// returns successfully, only `safe` (the returned
+		// string) is used in any filepath.Join or
+		// os.WriteFile call, severing the taint flow that
+		// the previous version left open.
+		safe, sErr := SafeArchiveEntryName(hdr.Name)
+		if sErr != nil {
+			return fmt.Errorf("%w: %w", ErrTarballTampered, sErr)
 		}
-		// Reject absolute-path and parent-traversal header
-		// Names up front. filepath.Base alone would silently
-		// accept "/etc/passwd" (becomes "passwd") and
-		// "../../escape" (becomes "escape"); that is "safe"
-		// from the perspective of escaping the bin dir but is
-		// not safe in the sense that the canary's contract
-		// says only catalog-named entries ship. A tarball
-		// with such a header IS tampering.
-		if strings.HasPrefix(hdr.Name, "/") || strings.Contains(hdr.Name, "..") {
-			return fmt.Errorf("%w: tarball entry %q has unsafe name (absolute or parent-traversal)",
-				ErrTarballTampered, hdr.Name)
-		}
-		outPath := filepath.Join(bin, base)
-		// Resolve any symlinks in the bin path so a malicious
-		// tarball entry that targets bin/../../foo doesn't
-		// escape via an intermediate symlink. MkdirAll above
-		// already rejected escape paths during mkdir, so
-		// EvalSymlinks should resolve to a real path under
-		// root/.
+		// Post-join containment defence: even a sanitised
+		// basename could escape bin/ if the bin dir is a
+		// symlink itself. EvalSymlinks + filepath.Rel
+		// guarantees outReal stays inside binReal.
 		binReal, evalErr := filepath.EvalSymlinks(bin)
 		if evalErr != nil {
 			return fmt.Errorf("releaseinstall: eval bin symlinks: %w", evalErr)
 		}
-		outReal := filepath.Join(binReal, base)
-		// Verify containment: outReal must be inside binReal.
-		// Use filepath.Rel rather than HasPrefix because the
-		// latter is fooled by "/foo/bar2" vs "/foo/bar".
+		outReal := filepath.Join(binReal, safe)
 		rel, relErr := filepath.Rel(binReal, outReal)
 		if relErr != nil || strings.HasPrefix(rel, "..") || rel == ".." {
 			return fmt.Errorf("%w: tarball entry %q escapes bin dir (%s)",
@@ -347,11 +321,65 @@ func (t *Tarball) Extract(root string) error {
 		if err != nil {
 			return fmt.Errorf("releaseinstall: extract read %s: %w", hdr.Name, err)
 		}
+		outPath := filepath.Join(bin, safe)
 		if err := os.WriteFile(outPath, body, 0o755); err != nil {
 			return fmt.Errorf("releaseinstall: extract write %s: %w", outPath, err)
 		}
 	}
 	return nil
+}
+
+// SafeArchiveEntryName validates a tar.Header.Name and returns a
+// path-safe basename. The returned string is the ONLY value the
+// caller may pass to filepath.Join / os.WriteFile.
+//
+// CodeQL (go/zipslip, CWE-22) recognises the explicit string-prefix
+// + substring guards below as taint barriers: the data flow from
+// hdr.Name to a filesystem sink is severed at this function's
+// return value. Returning `base` only when every guard passes
+// (and returning an error otherwise) is the canonical CodeQL
+// "sanitize-then-use" pattern — the older version of this code
+// performed the same checks inline but the data flow still
+// reached the sink because Go's filepath.Base is not a
+// recognised sanitizer.
+//
+// Rules (defence in depth, all must pass):
+//
+//  1. Name is non-empty.
+//  2. Name does not start with '/' or a Windows drive letter.
+//  3. Name contains no parent-traversal segment ("..").
+//  4. filepath.Base(Name) yields a non-empty, non-root string.
+//
+// Exported (rather than unexported) so callers building canary-side
+// tar validators can reuse the same CodeQL-recognised barrier; the
+// helper is the documented public seam for "give me a tar header
+// name that's safe to feed to filepath.Join".
+func SafeArchiveEntryName(name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("archive entry has empty name")
+	}
+	// Path-traversal patterns CodeQL flags: leading '/', a '..'
+	// segment anywhere in the path, Windows backslash absolute
+	// paths, and Windows drive-letter prefixes (which would
+	// resolve to absolute on Windows even though filepath.Base
+	// silently strips them on Linux/macOS).
+	if strings.HasPrefix(name, "/") ||
+		strings.HasPrefix(name, `\`) ||
+		strings.HasPrefix(name, "..") ||
+		strings.Contains(name, "..") ||
+		// Windows drive letter: a single ASCII letter followed
+		// by ':'. CodeQL's go/zipslip flags this pattern on
+		// cross-platform analysis; the regex is the
+		// recognised barrier.
+		(len(name) >= 2 && name[1] == ':' &&
+			((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z'))) {
+		return "", fmt.Errorf("archive entry %q contains path-traversal segment", name)
+	}
+	base := filepath.Base(name)
+	if base == "." || base == "/" || base == `\` || base == "" {
+		return "", fmt.Errorf("archive entry %q has unsafe basename", name)
+	}
+	return base, nil
 }
 
 // hashWalk runs the manifest-sha256-walk half of Verify against
