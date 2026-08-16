@@ -57,6 +57,7 @@ import (
 const (
 	subReleaseBundle  = "bundle"
 	subReleaseInstall = "install"
+	subReleaseKGV     = "kgv"
 )
 
 // cmdReleaseDispatch is the parent dispatcher.
@@ -70,11 +71,13 @@ func cmdReleaseDispatch(args []string) int {
 		return cmdReleaseBundle(args[1:])
 	case subReleaseInstall:
 		return cmdReleaseInstall(args[1:])
+	case subReleaseKGV:
+		return cmdReleaseKGV(args[1:])
 	case flagHelpShort, flagHelpLong:
 		printReleaseUsage(os.Stderr)
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "gregalectl release: unknown subcommand %q (expected: bundle | install)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl release: unknown subcommand %q (expected: bundle | install | kgv)\n", args[0])
 		return 1
 	}
 }
