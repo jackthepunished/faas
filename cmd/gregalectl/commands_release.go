@@ -32,6 +32,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -268,12 +269,44 @@ func cmdReleaseInstall(args []string) int {
 	// applies roleTemplating.ApplyFilesystem(role) after the
 	// symlink flip.
 	roleFlag := fs.String("role", "", "box role: control-plane|compute-only (ADR-112). Empty = no role templating.")
+	// ADR-113: --legacy-bundle-dir is the sunset path for the old
+	// `copyBinIntoRelease` flow. Empty (default) means use the new
+	// tarball + cosign + SBoM-gated path. When set, the install
+	// copies binaries from DIR straight into <releases-root>/<git-
+	// sha>/bin via copyBinIntoRelease and bypasses every ADR-113
+	// gate. The flag is supported for one release cycle only.
+	// PR-B removes the flag entirely.
+	legacyBundleDir := fs.String("legacy-bundle-dir", "", "ADR-113 sunset path: copy binaries from DIR straight to <releases-root>/<git-sha>/bin, skipping cosign+SBoM gates. Empty = use the canonical tarball path.")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *gitSHA == "" {
 		_, _ = fmt.Fprintln(os.Stderr, "gregalectl release install: --git-sha is required")
 		return 1
+	}
+	// ADR-113: legacy path. If --legacy-bundle-dir is set, we run
+	// copyBinIntoRelease and stop — no cosign, no SBoM gate, no
+	// manifest re-validation. The legacy path is the fail-open
+	// sunset for operators who can't roll the image into the new
+	// tarball shape yet; PR-B removes it.
+	if *legacyBundleDir != "" {
+		if err := copyBinIntoRelease(*releasesRoot, *gitSHA, *legacyBundleDir); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: legacy-bundle-dir: %v\n", err)
+			return 3
+		}
+		// Even on the legacy path, AtomicFlip is still expected —
+		// the load-bearing invariant (the symlink flip) is the
+		// install boundary, not the producer surface. Legacy
+		// callers skip the gates, not the flip.
+		if err := releaseinstall.AtomicFlip(*releasesRoot, *gitSHA); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: legacy flip symlink: %v\n", err)
+			return 3
+		}
+		// role-flag handling on the legacy path is out of scope
+		// for this commit; the legacy path is a stop-gap and the
+		// operator is expected to re-install with --role after
+		// they migrate to the canonical path.
+		return 0
 	}
 	// ADR-112: if --role is empty AND /etc/faas/first-boot.env has
 	// FAAS_BOX_ROLE set (the operator-supplied sentinel from
@@ -308,6 +341,41 @@ func cmdReleaseInstall(args []string) int {
 	if err := releaseinstall.Verify(*releasesRoot, m); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: verify manifest: %v\n", err)
 		return 3
+	}
+	// ADR-113 commit 3: SBoM CVE-baseline gate. If the per-release
+	// SBoM is present on disk (the canary post-process stamped it
+	// there), parse it and run the regression check vs the prior
+	// baseline. If the SBoM is absent, the install falls through
+	// (legacy operators without the canary path are still allowed
+	// to install — the canary path is opt-in via the tarball
+	// flow, which is PR-B). The gate is opt-in via the presence
+	// of /opt/faas/releases/<git-sha>/release.sbom.json.
+	//
+	// The error message names the regression class so operators
+	// can route the failure (roll back, rotate KGV, etc.).
+	if sbomPath, sbomErr := sbomOnDiskPath(*releasesRoot, *gitSHA); sbomErr == nil {
+		sbomBody, readErr := os.ReadFile(sbomPath)
+		if readErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: read sbom: %v\n", readErr)
+			return 3
+		}
+		counts, parseErr := releaseinstall.ParseSPDXv2_3(sbomBody)
+		if parseErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: parse sbom: %v\n", parseErr)
+			return 3
+		}
+		baseline, baseErr := readSBOMBaseline(*releasesRoot, *gitSHA)
+		if baseErr == nil {
+			// A baseline exists — run the diff. Nil baseline
+			// (no prior install) is a no-op; the operator
+			// accepts the SBoM by writing a baseline after the
+			// first install. PR-B's `release KGV rotate` is
+			// the long-term answer.
+			if _, diffErr := baseline.Diff(counts); diffErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: %v\n", diffErr)
+				return 3
+			}
+		}
 	}
 	if err := releaseinstall.AtomicFlip(*releasesRoot, *gitSHA); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: flip symlink: %v\n", err)
@@ -470,6 +538,41 @@ func cmdReleaseInstall(args []string) int {
 			*gitSHA, first, node, cnID)
 	}
 	return 0
+}
+
+// sbomOnDiskPath returns the canonical SBoM-on-disk path for the
+// per-release bundle. Returns a non-nil error when the file does
+// not exist (os.IsNotExist) so the caller can treat absence as
+// "skip the gate" (the legacy on-disk flow is SBoM-less by
+// definition — the canary path is what writes the SBoM).
+//
+// ADR-113 PR-A commit 3 keeps the SBoM-on-disk shape opt-in:
+// legacy operators (no canary, no `make build-sha256`) continue
+// to install without the gate. PR-B makes the gate mandatory for
+// any release shipped via the canary.
+func sbomOnDiskPath(releasesRoot, gitSHA string) (string, error) {
+	p := filepath.Join(releaseinstall.BundleRoot(releasesRoot, gitSHA), "release.sbom.json")
+	if _, err := os.Stat(p); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+// readSBOMBaseline reads the on-disk per-release SBoM baseline.
+// Returns the parsed baseline + nil on success. Returns
+// os.ErrNotExist-shaped errors when the file is missing (the
+// caller treats that as "no prior baseline, skip the gate").
+func readSBOMBaseline(releasesRoot, gitSHA string) (releaseinstall.SBOMBaseline, error) {
+	var b releaseinstall.SBOMBaseline
+	p := releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(releasesRoot, gitSHA))
+	body, err := os.ReadFile(p)
+	if err != nil {
+		return b, err
+	}
+	if err := json.Unmarshal(body, &b); err != nil {
+		return b, fmt.Errorf("decode baseline: %w", err)
+	}
+	return b, nil
 }
 
 // openPgPoolFromEnv returns a pgxpool.Pool wired from FAAS_PG_DSN
