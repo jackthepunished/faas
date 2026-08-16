@@ -277,12 +277,12 @@ func (t *Tarball) Extract(root string) error {
 	if err != nil {
 		return fmt.Errorf("releaseinstall: gzip reader: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
 
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -360,24 +360,24 @@ func tarballEntryHashes(packed []byte) (map[string]string, error) {
 	out := make(map[string]string)
 	gz, err := gzip.NewReader(bytes.NewReader(packed))
 	if err != nil {
-		return nil, fmt.Errorf("%w: gzip reader: %v", ErrTarballTampered, err)
+		return nil, fmt.Errorf("%w: gzip reader: %w", ErrTarballTampered, err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%w: tar next: %v", ErrTarballTampered, err)
+			return nil, fmt.Errorf("%w: tar next: %w", ErrTarballTampered, err)
 		}
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
 		body, err := io.ReadAll(tr)
 		if err != nil {
-			return nil, fmt.Errorf("%w: tar read %s: %v", ErrTarballTampered, hdr.Name, err)
+			return nil, fmt.Errorf("%w: tar read %s: %w", ErrTarballTampered, hdr.Name, err)
 		}
 		out[filepath.Base(hdr.Name)] = sha256Hex(body)
 	}

@@ -166,7 +166,7 @@ func ParseSPDXv2_3(body []byte) (SBOMCounts, error) {
 		BOMFormat   string `json:"bomFormat"` // CycloneDX
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
-		return SBOMCounts{}, fmt.Errorf("%w: top-level: %v", ErrSBOMMalformed, err)
+		return SBOMCounts{}, fmt.Errorf("%w: top-level: %w", ErrSBOMMalformed, err)
 	}
 	if !strings.HasPrefix(probe.SPDXVersion, "SPDX-2.") {
 		return SBOMCounts{}, fmt.Errorf("%w: spdxVersion=%q (want SPDX-2.3)",
@@ -187,7 +187,7 @@ func ParseSPDXv2_3(body []byte) (SBOMCounts, error) {
 		} `json:"packages"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return SBOMCounts{}, fmt.Errorf("%w: packages: %v", ErrSBOMMalformed, err)
+		return SBOMCounts{}, fmt.Errorf("%w: packages: %w", ErrSBOMMalformed, err)
 	}
 
 	var c SBOMCounts
