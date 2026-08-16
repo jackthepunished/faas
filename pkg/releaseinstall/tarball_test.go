@@ -305,6 +305,61 @@ func TestTarball_Extract_RefusesNilTarball(t *testing.T) {
 	}
 }
 
+// TestTarball_ReadManifest_AfterExtract asserts that after
+// Extract + the on-disk WriteManifest round-trip, ReadManifest
+// reads back the manifest written by the canary and overwrites
+// t.Manifest with the disk truth. PR-B commit 1 surface — the
+// doctor probe uses it to verify tarball-side and disk-side
+// state agree.
+func TestTarball_ReadManifest_AfterExtract(t *testing.T) {
+	bin, root, gitSHA, manifestHash := fakeBinDir(t)
+	tb, err := releaseinstall.BuildTarball(root, gitSHA, manifestHash, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := releaseinstall.Write(root, tb.Manifest); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := tb.Extract(root); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	// Mutate the on-disk manifest's Signature (simulating a
+	// cosign Verify that ran AFTER the tarball was unpacked)
+	// and confirm ReadManifest picks it up.
+	diskManifest, err := releaseinstall.Read(root, gitSHA)
+	if err != nil {
+		t.Fatalf("read disk manifest: %v", err)
+	}
+	diskManifest.Signature = "https://github.com/poyrazK/faas/.github/workflows/build-sha256.yml@refs/tags/v9.9.9"
+	if err := releaseinstall.Write(root, diskManifest); err != nil {
+		t.Fatalf("write disk manifest: %v", err)
+	}
+
+	if err := tb.ReadManifest(root); err != nil {
+		t.Fatalf("readmanifest: %v", err)
+	}
+	if tb.Manifest.Signature != "https://github.com/poyrazK/faas/.github/workflows/build-sha256.yml@refs/tags/v9.9.9" {
+		t.Errorf("ReadManifest did not pick up disk Signature: got %q", tb.Manifest.Signature)
+	}
+	// Sanity: Extract wrote the catalog binaries; they are still
+	// on disk and untouched by ReadManifest.
+	for _, name := range catalogDaemons() {
+		if _, err := os.Stat(filepath.Join(bin, name)); err != nil {
+			t.Errorf("daemon %s missing after Extract+ReadManifest: %v", name, err)
+		}
+	}
+}
+
+// TestTarball_ReadManifest_RejectsNilTarball is the symmetry
+// guard with TestTarball_Extract_RefusesNilTarball.
+func TestTarball_ReadManifest_RejectsNilTarball(t *testing.T) {
+	var tb *releaseinstall.Tarball
+	if err := tb.ReadManifest(t.TempDir()); err == nil {
+		t.Fatalf("nil tarball ReadManifest: want error, got nil")
+	}
+}
+
 // TestTarball_Extract_RejectsZipSlip is the CodeQL CWE-22 test:
 // a tarball entry whose Name contains ".." must NEVER escape the
 // bin/ directory. CodeQL flagged the original Extract loop at

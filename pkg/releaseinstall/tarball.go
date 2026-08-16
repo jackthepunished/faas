@@ -352,6 +352,57 @@ func (t *Tarball) Extract(root string) error {
 //
 // Exported (rather than unexported) so callers building canary-side
 // tar validators can reuse the same CodeQL-recognised barrier; the
+// ReadManifest re-loads the per-release manifest at
+// <root>/<git-sha>/release-manifest.json and overwrites
+// t.Manifest with its contents. The companion to Extract: after
+// the tarball has been unpacked into bin/, the on-disk manifest
+// (which is what AtomicFlip + Verify on disk actually reads) MUST
+// agree with t.Manifest (which is what Verify stamped the
+// Signature onto). PR-B's doctor verify-tarball-sbom probe uses
+// ReadManifest to give the operator a single source of truth
+// across the tarball-side and disk-side state.
+//
+// Errors:
+//   - manifest file missing → wraps os.IsNotExist error
+//   - JSON malformed or ValidateManifest fails → wraps the error
+func (t *Tarball) ReadManifest(root string) error {
+	if t == nil {
+		return errors.New("releaseinstall: nil tarball")
+	}
+	if t.GitSHA == "" {
+		return errors.New("releaseinstall: tarball missing git_sha")
+	}
+	m, err := Read(root, t.GitSHA)
+	if err != nil {
+		return fmt.Errorf("releaseinstall: read manifest: %w", err)
+	}
+	t.Manifest = m
+	return nil
+}
+
+// SafeArchiveEntryName validates a tar.Header.Name and returns a
+// path-safe basename. The returned string is the ONLY value the
+// caller may pass to filepath.Join / os.WriteFile.
+//
+// CodeQL (go/zipslip, CWE-22) recognises the explicit string-prefix
+// + substring guards below as taint barriers: the data flow from
+// hdr.Name to a filesystem sink is severed at this function's
+// return value. Returning `base` only when every guard passes
+// (and returning an error otherwise) is the canonical CodeQL
+// "sanitize-then-use" pattern — the older version of this code
+// performed the same checks inline but the data flow still
+// reached the sink because Go's filepath.Base is not a
+// recognised sanitizer.
+//
+// Rules (defence in depth, all must pass):
+//
+//  1. Name is non-empty.
+//  2. Name does not start with '/' or a Windows drive letter.
+//  3. Name contains no parent-traversal segment ("..").
+//  4. filepath.Base(Name) yields a non-empty, non-root string.
+//
+// Exported (rather than unexported) so callers building canary-side
+// tar validators can reuse the same CodeQL-recognised barrier; the
 // helper is the documented public seam for "give me a tar header
 // name that's safe to feed to filepath.Join".
 func SafeArchiveEntryName(name string) (string, error) {

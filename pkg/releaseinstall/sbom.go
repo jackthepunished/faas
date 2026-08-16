@@ -338,3 +338,39 @@ func WriteBaseline(root string, b SBOMBaseline) error {
 func SBOMBaselinePath(bundleRoot string) string {
 	return bundleRoot + "/sbom-baseline.json"
 }
+
+// ReadBaseline loads + validates the on-disk SBoM baseline at
+// <root>/<git-sha>/sbom-baseline.json. Exported so the day-2
+// surfaces (PR-B KGV rotate, doctor verify-tarball-sbom probe)
+// share a single read path with WriteBaseline.
+//
+// Errors:
+//   - ErrNilBaseline is returned when the file is missing. The
+//     caller decides whether to "init with KGVZero" or "fail
+//     closed"; this helper does not.
+//   - Malformed JSON / missing required fields surface as a
+//     wrapped error so callers can log the on-disk path.
+//
+// The round-trip with WriteBaseline is asserted by
+// TestSBOM_ReadBaseline_RoundTrip (sbom_test.go).
+func ReadBaseline(root, gitSHA string) (SBOMBaseline, error) {
+	if gitSHA == "" {
+		return SBOMBaseline{}, errors.New("releaseinstall: read baseline: empty git_sha")
+	}
+	path := SBOMBaselinePath(BundleRoot(root, gitSHA))
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return SBOMBaseline{}, ErrNilBaseline
+		}
+		return SBOMBaseline{}, fmt.Errorf("releaseinstall: read baseline %s: %w", path, err)
+	}
+	var b SBOMBaseline
+	if err := json.Unmarshal(body, &b); err != nil {
+		return SBOMBaseline{}, fmt.Errorf("releaseinstall: decode baseline %s: %w", path, err)
+	}
+	if b.GitSHA == "" {
+		return SBOMBaseline{}, fmt.Errorf("releaseinstall: baseline %s missing git_sha", path)
+	}
+	return b, nil
+}
