@@ -310,8 +310,16 @@ func hashFile(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
 	}
+	return sha256Hex(body), nil
+}
+
+// sha256Hex returns hex-encoded SHA256 of body (64 lowercase chars).
+// Extracted so the tarball producer (PR-A commit 1) can hash in-memory
+// tar entries without round-tripping to disk, and so hashFile stays
+// the canonical "what's the digest of this file" predicate.
+func sha256Hex(body []byte) string {
 	hash := sha256.Sum256(body)
-	return hex.EncodeToString(hash[:]), nil
+	return hex.EncodeToString(hash[:])
 }
 
 func validGitSHA(s string) bool {
