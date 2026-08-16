@@ -22,7 +22,9 @@ package roleTemplating
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -60,23 +62,17 @@ func TestSubset(t *testing.T) {
 	tests := []struct {
 		name string
 		role Role
-		want []string // alphabetical per Subset()'s contract
+		want []string // pkg/daemonunitspec.Registry declaration order, filtered by Allows[r]
 	}{
 		{
 			"control-plane subset",
 			RoleControlPlane,
-			[]string{
-				"apid", "gatewayd-internal", "gatewayd-public",
-				"githubd", "imaged", "meterd", "schedd", "vmmd",
-			},
+			[]string{"apid", "schedd", "gatewayd-public", "meterd", "githubd"},
 		},
 		{
 			"compute-only subset",
 			RoleComputeOnly,
-			[]string{
-				"builderd", "gatewayd-internal", "gatewayd-public",
-				"imaged", "vmmd",
-			},
+			[]string{"vmmd", "gatewayd-internal", "imaged", "builderd"},
 		},
 	}
 	for _, tt := range tests {
@@ -98,6 +94,99 @@ func TestSubset(t *testing.T) {
 			t.Fatalf("Subset(nope) returned nil error")
 		}
 	})
+}
+
+// TestSubsetHonorsDaemonRoleGates is the post-#930 adversarial-review
+// invariant: a daemon's presence in the subset for role r MUST be
+// true iff cmd/<daemon>/main.go::role.Require(..., r, ...) would
+// accept r. The role.Require allow-list lives one package over
+// (pkg/role); this test is the cross-check that
+// pkg/roleTemplating.daemonInfoTable agrees.
+//
+// If a future edit renames a daemon, adds a new role to a daemon's
+// Require allow-list, or extends the daemonunitspec.Registry, this
+// test fails first with a precise list of drift.
+func TestSubsetHonorsDaemonRoleGates(t *testing.T) {
+	// Hard-coded map from per-daemon role.Require call sites. Any
+	// change to cmd/<daemon>/main.go's role.Require MUST be mirrored
+	// here, otherwise the review invariant regresses silently.
+	dmnAllows := map[string]map[Role]bool{
+		"vmmd":              {RoleSingleBox: true, RoleComputeOnly: true},
+		"apid":              {RoleSingleBox: true, RoleControlPlane: true},
+		"schedd":            {RoleSingleBox: true, RoleControlPlane: true},
+		"meterd":            {RoleSingleBox: true, RoleControlPlane: true},
+		"githubd":           {RoleSingleBox: true, RoleControlPlane: true},
+		"gatewayd-public":   {RoleSingleBox: true, RoleControlPlane: true},
+		"imaged":            {RoleSingleBox: true, RoleComputeOnly: true},
+		"gatewayd-internal": {RoleSingleBox: true, RoleComputeOnly: true},
+		"builderd":          {RoleSingleBox: true, RoleComputeOnly: true},
+	}
+	for dmn, want := range dmnAllows {
+		for _, r := range AllowedRoles {
+			wantIn := want[r]
+			subset, err := Subset(r)
+			if err != nil {
+				t.Fatalf("Subset(%q) error: %v", r, err)
+			}
+			gotIn := slices.Contains(subset, dmn)
+			if gotIn != wantIn {
+				t.Errorf("Subset(%q) contains %q = %v, want %v (daemon role.Require allow-list disagrees with daemonInfoTable.Allows)",
+					r, dmn, gotIn, wantIn)
+			}
+		}
+	}
+}
+
+// TestDropInEnvVarMatchesDaemon ensures each daemon's drop-in emits
+// the EnvKey the daemon's config.go reads (cmd/<daemon>/config.go
+// role.FromConfig(..., envKey)). The adversarial review caught
+// gatewayd-internal reading FAAS_GATEWAYD_ROLE, not the uppercased
+// pattern; this test would catch a re-introduction of that mistake.
+func TestDropInEnvVarMatchesDaemon(t *testing.T) {
+	cases := []struct {
+		daemon string
+		envKey string
+		role   Role
+	}{
+		{"vmmd", "FAAS_VMMD_ROLE", RoleComputeOnly},
+		{"apid", "FAAS_APID_ROLE", RoleControlPlane},
+		{"schedd", "FAAS_SCHEDD_ROLE", RoleControlPlane},
+		{"meterd", "FAAS_METERD_ROLE", RoleControlPlane},
+		{"githubd", "FAAS_GITHUBD_ROLE", RoleControlPlane},
+		{"gatewayd-public", "FAAS_GATEWAYD_PUBLIC_ROLE", RoleControlPlane},
+		{"imaged", "FAAS_IMAGED_ROLE", RoleComputeOnly},
+		{"gatewayd-internal", "FAAS_GATEWAYD_ROLE", RoleComputeOnly},
+		{"builderd", "FAAS_BUILDERD_ROLE", RoleComputeOnly},
+	}
+	for _, tt := range cases {
+		t.Run(tt.daemon, func(t *testing.T) {
+			body, err := DropIn(tt.role, tt.daemon)
+			if err != nil {
+				t.Fatalf("DropIn(%q, %q) error: %v", tt.role, tt.daemon, err)
+			}
+			want := fmt.Sprintf("Environment=%s=%s", tt.envKey, tt.role)
+			if !strings.Contains(body, want) {
+				t.Errorf("DropIn output missing %q:\n  got: %q", want, body)
+			}
+		})
+	}
+}
+
+// TestDropInRefusesForbiddenRole is the defence-in-depth check: even
+// if a registry edit accidentally allows a role the daemon rejects,
+// DropIn refuses to emit a drop-in for that pair (better to fail
+// loud at install time than to fail loud on every daemon restart).
+func TestDropInRefusesForbiddenRole(t *testing.T) {
+	// vmmd allows compute-only, not control-plane.
+	_, err := DropIn(RoleControlPlane, "vmmd")
+	if err == nil {
+		t.Fatalf("DropIn(control-plane, vmmd) returned nil; should refuse because vmmd rejects control-plane")
+	}
+	// apid allows control-plane, not compute-only.
+	_, err = DropIn(RoleComputeOnly, "apid")
+	if err == nil {
+		t.Fatalf("DropIn(compute-only, apid) returned nil; should refuse because apid rejects compute-only")
+	}
 }
 
 func TestSubsetCrossChecksRegistry(t *testing.T) {
@@ -185,14 +274,18 @@ func TestDropIn(t *testing.T) {
 
 func TestDropInIdempotent(t *testing.T) {
 	// Two calls must produce byte-identical output. PR-A's first-boot
-	// re-run guarantee.
+	// re-run guarantee. Pick a daemon that DOES allow each role so
+	// the test exercises the idempotency contract, not the
+	// allows-side rejection.
+	daemonFor := map[Role]string{RoleControlPlane: "apid", RoleComputeOnly: "vmmd"}
 	for _, r := range AllowedRoles {
+		d := daemonFor[r]
 		t.Run(string(r), func(t *testing.T) {
-			a, err := DropIn(r, "vmmd")
+			a, err := DropIn(r, d)
 			if err != nil {
 				t.Fatalf("DropIn error: %v", err)
 			}
-			b, err := DropIn(r, "vmmd")
+			b, err := DropIn(r, d)
 			if err != nil {
 				t.Fatalf("DropIn error: %v", err)
 			}
@@ -216,31 +309,27 @@ func TestApplyWritesAllDropIns(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("daemonReload called %d times, want 1", calls)
 	}
-	for _, d := range []string{
-		"vmmd", "apid", "schedd", "meterd", "githubd",
-		"imaged", "gatewayd-internal", "gatewayd-public",
-	} {
-		want := "[Service]\nEnvironment=FAAS_BOX_ROLE=control-plane\n"
-		if d == "apid" {
-			want += "Environment=FAAS_APID_ROLE=control-plane\n"
-		} else if d == "schedd" {
-			want += "Environment=FAAS_SCHEDD_ROLE=control-plane\n"
-		} else if d == "githubd" {
-			want += "Environment=FAAS_GITHUBD_ROLE=control-plane\n"
-		} else if d == "meterd" {
-			want += "Environment=FAAS_METERD_ROLE=control-plane\n"
-		} else if d == "vmmd" {
-			want += "Environment=FAAS_VMMD_ROLE=control-plane\n"
-		} else if d == "imaged" {
-			want += "Environment=FAAS_IMAGED_ROLE=control-plane\n"
-		} else if d == "gatewayd-internal" {
-			want += "Environment=FAAS_GATEWAYD_INTERNAL_ROLE=control-plane\n"
-		} else if d == "gatewayd-public" {
-			want += "Environment=FAAS_GATEWAYD_PUBLIC_ROLE=control-plane\n"
+	// RoleControlPlane subset per daemonInfoTable + Registry
+	// declaration order (Fix 1, Fix 2 cross-check):
+	wantBodies := []string{
+		"== /etc/systemd/system/faas-apid.service.d ==\n[Service]\nEnvironment=FAAS_BOX_ROLE=control-plane\nEnvironment=FAAS_APID_ROLE=control-plane\n\n",
+		"== /etc/systemd/system/faas-schedd.service.d ==\n[Service]\nEnvironment=FAAS_BOX_ROLE=control-plane\nEnvironment=FAAS_SCHEDD_ROLE=control-plane\n\n",
+		"== /etc/systemd/system/faas-gatewayd-public.service.d ==\n[Service]\nEnvironment=FAAS_BOX_ROLE=control-plane\nEnvironment=FAAS_GATEWAYD_PUBLIC_ROLE=control-plane\n\n",
+		"== /etc/systemd/system/faas-meterd.service.d ==\n[Service]\nEnvironment=FAAS_BOX_ROLE=control-plane\nEnvironment=FAAS_METERD_ROLE=control-plane\n\n",
+		"== /etc/systemd/system/faas-githubd.service.d ==\n[Service]\nEnvironment=FAAS_BOX_ROLE=control-plane\nEnvironment=FAAS_GITHUBD_ROLE=control-plane\n\n",
+	}
+	got := buf.String()
+	for _, want := range wantBodies {
+		if !strings.Contains(got, want) {
+			t.Errorf("Apply output missing drop-in body %q\ngot:\n%s", want, got)
 		}
-		needle := "\n" + want
-		if !strings.Contains(buf.String(), needle) {
-			t.Errorf("Apply output missing %q drop-in body:\n%s", d, buf.String())
+	}
+	// Defensive: the daemons that REJECT control-plane must not
+	// be in the output (Fix 1 + Fix 2 regression guard).
+	forbidden := []string{"vmmd", "imaged", "gatewayd-internal", "builderd"}
+	for _, d := range forbidden {
+		if strings.Contains(got, "faas-"+d+".service.d ==") {
+			t.Errorf("Apply(control-plane) emitted %q; daemon does not allow control-plane — drop-in would fail systemd + daemon role.Require", d)
 		}
 	}
 }
@@ -292,39 +381,45 @@ func TestMutateControlPlaneToComputeOnly(t *testing.T) {
 		t.Fatalf("Mutate error: %v", err)
 	}
 
-	// Stop: apid, schedd, meterd, githubd (NOT vmmd/imaged/gatewayd-* —
-	// those are on both roles).
+	// Stop: 5 control-plane-only daemons (apid, schedd,
+	// gatewayd-public, meterd, githubd). Note gatewayd-public
+	// REJECTS compute-only (per cmd/gatewayd-public/main.go:144),
+	// so it IS in the stop list under the corrected model — the
+	// pre-review expectation was wrong.
 	wantStopped := map[string]bool{
-		"apid": true, "schedd": true, "meterd": true, "githubd": true,
+		"apid": true, "schedd": true, "gatewayd-public": true,
+		"meterd": true, "githubd": true,
 	}
 	for _, d := range stopped {
 		if !wantStopped[d] {
-			t.Errorf("Mutate stopped %q, expected only the 4 control-plane-only daemons", d)
+			t.Errorf("Mutate stopped %q, expected only %v", d, wantStopped)
 		}
 	}
 	if len(stopped) != len(wantStopped) {
 		t.Errorf("Mutate stopped %d daemons (%v), want exactly %v", len(stopped), stopped, wantStopped)
 	}
 
-	// Start: builderd only.
-	if len(started) != 1 || started[0] != "builderd" {
-		t.Errorf("Mutate started %v, want only [builderd]", started)
+	// Start: 4 compute-only daemons (vmmd, imaged, builderd,
+	// gatewayd-internal). gatewayd-public is NOT started because
+	// it's not in the compute-only role allow-list.
+	wantStarted := map[string]bool{
+		"vmmd": true, "imaged": true, "builderd": true, "gatewayd-internal": true,
+	}
+	for _, d := range started {
+		if !wantStarted[d] {
+			t.Errorf("Mutate started unexpected daemon %q", d)
+		}
+	}
+	if len(started) != len(wantStarted) {
+		t.Errorf("Mutate started %d daemons (%v), want exactly %v", len(started), started, wantStarted)
 	}
 
-	// Verify stop ordering: gatewayd-public is NOT in the stop list
-	// (it's on both roles). verify no extra systemctl calls were made.
-	if len(calls) == 0 {
-		t.Fatalf("Mutate made no systemctl calls")
-	}
-	// No "systemctl start faas-imaged" — imaged is on both roles.
-	for _, c := range calls {
-		if strings.Contains(c, "start faas-imaged") || strings.Contains(c, "start faas-vmmd") {
-			t.Errorf("Mutate invoked %q — vmmd/imaged are on both roles, should not be re-started", c)
-		}
-		if strings.Contains(c, "stop faas-vmmd") || strings.Contains(c, "stop faas-imaged") ||
-			strings.Contains(c, "stop faas-gatewayd-internal") || strings.Contains(c, "stop faas-gatewayd-public") {
-			t.Errorf("Mutate invoked %q — should not stop shared-role daemons", c)
-		}
+	// Defence-in-depth: gatewayd-public must be the LAST stop per
+	// the package's documented invariant (PR-B Fix 7). The Mutate
+	// function emits stops in reverse subset order, AND emits
+	// gatewayd-public last as a separate final pass.
+	if len(stopped) > 0 && stopped[len(stopped)-1] != "gatewayd-public" {
+		t.Errorf("Mutate's last stop is %q, want gatewayd-public (last-stop invariant)", stopped[len(stopped)-1])
 	}
 }
 
@@ -336,12 +431,24 @@ func TestMutateComputeOnlyToControlPlane(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mutate error: %v", err)
 	}
-	// Compute-only → Control-plane starts apid, schedd, meterd, githubd; stops builderd.
-	if len(stopped) != 1 || stopped[0] != "builderd" {
-		t.Errorf("Mutate stopped %v, want only [builderd]", stopped)
+	// Stop: vmmd, imaged, builderd, gatewayd-internal — the 4
+	// compute-only daemons. gatewayd-public is NOT in the stop
+	// list because it doesn't allow compute-only.
+	wantStopped := map[string]bool{
+		"vmmd": true, "imaged": true, "builderd": true, "gatewayd-internal": true,
 	}
+	for _, d := range stopped {
+		if !wantStopped[d] {
+			t.Errorf("Mutate stopped unexpected daemon %q", d)
+		}
+	}
+	if len(stopped) != len(wantStopped) {
+		t.Errorf("Mutate stopped %d daemons (%v), want exactly %v", len(stopped), stopped, wantStopped)
+	}
+	// Start: 5 control-plane daemons (apid, schedd, gatewayd-public, meterd, githubd).
 	wantStarted := map[string]bool{
-		"apid": true, "schedd": true, "meterd": true, "githubd": true,
+		"apid": true, "schedd": true, "gatewayd-public": true,
+		"meterd": true, "githubd": true,
 	}
 	for _, d := range started {
 		if !wantStarted[d] {
