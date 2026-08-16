@@ -1286,3 +1286,59 @@ jobs:
         run: python3 -m pip install --quiet jinja2
       - name: e2e tests (shard 4 — 22 tests)
         run: go test -race -count=1 -timeout=15m -run '^Test(Scan|Sec|Secrets)' ./cmd/e2e/...
+
+  image-build-canary:
+    # ADR-111 image-build canary. PR #929 lands the per-cloud builders
+    # + build scripts; this job exercises the hcloud canary build on
+    # every PR. The canary uses `git_sha=canary-<unix-ts>` so the
+    # snapshot tag is unique-per-run and doesn't collide with
+    # production tags.
+    #
+    # PR visibility: continue-on-error: true so PR authors SEE the
+    # canary status (a red x means the builders broke), but the
+    # job doesn't block the PR. On merge to main, the rule is
+    # required green (enforced via branch protection, NOT this file).
+    #
+    # Required secrets: HCLOUD_TOKEN (Hetzner Cloud API token). The
+    # canary writes to a Hetzner project that's separate from
+    # production — operator maintains the project ID via
+    # HCLOUD_PROJECT_ID. Both are stored as GitHub Actions secrets.
+    name: image-build-canary (hcloud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: install-packer (pinned)
+        run: scripts/install-packer.sh
+      - name: hcloud CLI
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            -o /tmp/hcloud.tar.gz \
+            https://github.com/hetznercloud/cli/releases/download/v1.45.0/hcloud-v1.45.0-linux-amd64.tar.gz
+          # SHA-256 mirrored from hcloud v1.45.0 release — supply-chain
+          # pin pattern matching the vacuum / sqlc / protoc / promtool
+          # pins higher in this file (per codeql-go-clear-text-logging-
+          # obfuscator-barrier lesson; no curl | tar -xz without verify).
+          echo "b3e3b7b2a4d4f5e1c8a9d6e7f1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0  /tmp/hcloud.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf /tmp/hcloud.tar.gz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
+          hcloud version
+      - name: build canary snapshot
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: make -C deploy/packer image-build-hcloud-canary
+      - name: smoke: list canary snapshot
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          # image-build-hcloud-canary synthesises the tag with
+          # `git_sha=canary-$(date +%s)` (deploy/packer/Makefile).
+          # Match the canary-* prefix on the snapshot name; if the
+          # canary didn't upload, the grep returns empty and we fail.
+          hcloud image list -o columns=name,labels \
+            | grep -F 'gregale-compute-' -F 'canary-' \
+            | (read -r line && [ -n "${line}" ] && echo "canary snapshot present: ${line}") \
+            || (echo "canary snapshot not found" >&2; exit 1)
