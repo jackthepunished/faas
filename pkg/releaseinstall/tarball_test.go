@@ -525,3 +525,34 @@ func TestTarball_Extract_RejectsAbsolutePath(t *testing.T) {
 		t.Fatalf("extract with absolute path entry: got %v, want ErrTarballTampered", err)
 	}
 }
+
+// TestTarball_Signature_Getter asserts the new PR-B getter:
+// Tarball.Signature() returns t.Manifest.Signature verbatim.
+// Empty string before Verify runs; non-empty after a successful
+// cosign verify-blob stamps the cert identity.
+//
+// The getter is nil-safe so callers don't have to guard.
+func TestTarball_Signature_Getter(t *testing.T) {
+	// nil receiver → empty string, no panic.
+	var nilTb *releaseinstall.Tarball
+	if got := nilTb.Signature(); got != "" {
+		t.Errorf("nil Tarball.Signature() = %q, want \"\"", got)
+	}
+	// Fresh Tarball has empty Signature.
+	tb := &releaseinstall.Tarball{}
+	if got := tb.Signature(); got != "" {
+		t.Errorf("fresh Tarball.Signature() = %q, want \"\"", got)
+	}
+	// After Verify stamps the field, the getter returns the
+	// stamped value. Reuse the existing signedTarball helper so
+	// the manifest shape matches the BlessedManifests test.
+	tb2, identity := signedTarball(t)
+	verifier := &releaseinstall.FixtureCosignVerifier{Identity: identity}
+	identity, err := tb2.Verify(context.Background(), verifier)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if got := tb2.Signature(); got != identity {
+		t.Errorf("Tarball.Signature() = %q, want %q (Verify's return)", got, identity)
+	}
+}

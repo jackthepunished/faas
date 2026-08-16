@@ -402,6 +402,42 @@ func (t *Tarball) ReadManifest(root string) error {
 //  4. filepath.Base(Name) yields a non-empty, non-root string.
 //
 // Exported (rather than unexported) so callers building canary-side
+// Signature returns the cosign cert identity stamped onto
+// t.Manifest by Verify. Empty string means Verify has not run
+// (or the tarball was constructed without going through the
+// canonical cosign path). PR-B's doctor verify-tarball-sbom
+// probe uses this getter for the per-release "signature=<identity>"
+// line in the JSON output. Returned by-value so callers can't
+// mutate the underlying Manifest.Signature field.
+func (t *Tarball) Signature() string {
+	if t == nil {
+		return ""
+	}
+	return t.Manifest.Signature
+}
+
+// SafeArchiveEntryName validates a tar.Header.Name and returns a
+// path-safe basename. The returned string is the ONLY value the
+// caller may pass to filepath.Join / os.WriteFile.
+//
+// CodeQL (go/zipslip, CWE-22) recognises the explicit string-prefix
+// + substring guards below as taint barriers: the data flow from
+// hdr.Name to a filesystem sink is severed at this function's
+// return value. Returning `base` only when every guard passes
+// (and returning an error otherwise) is the canonical CodeQL
+// "sanitize-then-use" pattern — the older version of this code
+// performed the same checks inline but the data flow still
+// reached the sink because Go's filepath.Base is not a
+// recognised sanitizer.
+//
+// Rules (defence in depth, all must pass):
+//
+//  1. Name is non-empty.
+//  2. Name does not start with '/' or a Windows drive letter.
+//  3. Name contains no parent-traversal segment ("..").
+//  4. filepath.Base(Name) yields a non-empty, non-root string.
+//
+// Exported (rather than unexported) so callers building canary-side
 // tar validators can reuse the same CodeQL-recognised barrier; the
 // helper is the documented public seam for "give me a tar header
 // name that's safe to feed to filepath.Join".
