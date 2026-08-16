@@ -245,8 +245,10 @@ func updateHostsINIAddNode(path, fqdn, role string) ([]byte, error) {
 			// line under it before EOF). Append at the end.
 			out.WriteString(fqdn)
 			out.WriteByte('\n')
-			inserted = true
 		}
+		// `inserted` is no longer consulted after the EOF
+		// fallback — the no-op at function exit covers it.
+		_ = inserted
 	}
 	return []byte(out.String()), nil
 }

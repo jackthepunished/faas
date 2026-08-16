@@ -54,6 +54,16 @@ import (
 // alongside the other dispatch* consts.
 const dispatchDeploy = "deploy"
 
+// roleComputeOnly and roleControlPlane are the canonical role
+// strings used throughout deploy add-node. Extracted as consts so
+// goconst doesn't flag the 6-occurrence literal; also matches
+// the `ansibleGroup` mapping in commands_deploy_files.go which
+// already keys on these values.
+const (
+	roleControlPlane = "control-plane"
+	roleComputeOnly  = "compute-only"
+)
+
 // cmdDeployDispatch fans to add-node today. Matches the
 // (args []string) int signature every other dispatch* arm uses.
 func cmdDeployDispatch(args []string) int {
@@ -72,14 +82,12 @@ func cmdDeployDispatch(args []string) int {
 
 // sshRunner is the seam tests use to swap in a fake ssh command
 // (e.g. one that exits 1 to exercise the bootstrap-failure path).
-// Production wires this to the real ssh binary; tests wire to a
-// shell or echo-stub via setSSHRunner. Indirection matches the
-// state-seam pattern in commands_compute_nodes.go.
+// Production wires this to the real ssh binary; tests assign
+// `sshRunner = func(...)` directly (the var is package-private;
+// there's no setSSHRunner — keeping the swap surface minimal).
+// Indirection matches the state-seam pattern in
+// commands_compute_nodes.go.
 var sshRunner = defaultSSHRunner
-
-func setSSHRunner(fn func(target string, args []string) (stdout, stderr []byte, err error)) {
-	sshRunner = fn
-}
 
 // defaultSSHRunner runs `ssh <target> <args...>` and streams
 // stdout+stderr to the caller. Returns (stdout, stderr, err).
@@ -125,7 +133,7 @@ func sshRunnerWithOverride(target string, args []string) ([]byte, []byte, error)
 func cmdDeployAddNode(args []string) int {
 	fs := flag.NewFlagSet("deploy add-node", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	role := fs.String("role", "compute-only", "control-plane or compute-only (default: compute-only)")
+	role := fs.String("role", roleComputeOnly, "control-plane or compute-only (default: compute-only)")
 	ansibleHost := fs.String("ansible-host", "", "cross-box dial target (Layer-3 mesh endpoint; required)")
 	publicIface := fs.String("public-iface", "", "nftables substitution iface (compute-only only; e.g. ens5)")
 	masqCIDR := fs.String("masquerade-cidr", "", "per-host overlay CIDR (compute-only only; e.g. 10.102.0.0/16)")
@@ -159,7 +167,7 @@ func cmdDeployAddNode(args []string) int {
 	// switch: control-plane adds to [control_plane], compute-only
 	// to [compute_nodes], and the host_vars shape differs.
 	switch *role {
-	case "control-plane", "compute-only":
+	case roleControlPlane, roleComputeOnly:
 	default:
 		fmt.Fprintf(os.Stderr, "gregalectl deploy add-node: --role must be control-plane or compute-only (got %q)\n", *role)
 		return 2
@@ -168,7 +176,7 @@ func cmdDeployAddNode(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl deploy add-node: --ansible-host required")
 		return 2
 	}
-	if *role == "compute-only" {
+	if *role == roleComputeOnly {
 		if *publicIface == "" {
 			fmt.Fprintln(os.Stderr, "gregalectl deploy add-node: --public-iface required for compute-only")
 			return 2
@@ -416,7 +424,7 @@ func addNodeExecute(p addNodeParams) (addNodeReport, int) {
 	report.BootstrapPassed = true
 
 	// Step 5: POST compute_nodes row (unless --skip-compute-nodes-post).
-	if p.SkipPOST || p.Role != "compute-only" {
+	if p.SkipPOST || p.Role != roleComputeOnly {
 		return report, 0
 	}
 	payload := computeNodePayload{
@@ -504,7 +512,7 @@ func defaultSSHTarget(fqdn, sshTarget string) string {
 // bootstrap-compute. Matches the Makefile mappings.
 func bootstrapTarget(role string) string {
 	switch role {
-	case "control-plane":
+	case roleControlPlane:
 		return "bootstrap-control-plane"
 	default:
 		return "bootstrap-compute"
@@ -514,7 +522,7 @@ func bootstrapTarget(role string) string {
 // ansibleGroup returns the inventory group name for the role.
 func ansibleGroup(role string) string {
 	switch role {
-	case "control-plane":
+	case roleControlPlane:
 		return "control_plane"
 	default:
 		return "compute_nodes"
