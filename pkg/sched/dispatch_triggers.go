@@ -326,7 +326,14 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			"trigger_id", t.ID.String(),
 			"err", postErr)
 		l.markRetryAll(ctx, claimed, postErr.Error(), store)
-		_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError)
+		// Audit finding #6: SKIP LOCKED may return fewer rows
+		// than len(batch). Nack only the records we actually
+		// claimed — the rest stay in poller.inFlight and re-poll
+		// on the next tick. Without this guard the broker side
+		// saw Ack/Nack on records that had no trigger_records row
+		// to retry, and the poller's in-flight bookkeeping
+		// dropped those entries on the floor.
+		_ = poller.Nack(ctx, t, claimedItemIDs(claimed), triggerReasonBrokerError)
 		return nil
 	}
 
@@ -340,7 +347,12 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			ids = append(ids, c.ID.String())
 		}
 		l.deadLetterAll(ctx, t.ID.String(), ids, triggerReasonPoisonRecord, "gateway response malformed", store)
-		_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonPoisonRecord)
+		// Audit finding #6 (paired with the post-error path
+		// above): same partial-claim guard — only Nack the
+		// item_identifiers that have a corresponding
+		// trigger_records row. The other batch entries stay
+		// in poller.inFlight until the next poll cycle.
+		_ = poller.Nack(ctx, t, claimedItemIDs(claimed), triggerReasonPoisonRecord)
 		return nil
 	}
 
@@ -352,9 +364,9 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	succeedIDs := []string{}
 	retryIDs := []string{}
 	dlqIDs := []string{}
-	dlqReasons := []string{}  // parallel to dlqIDs; review finding #8
-	dlqErrors := []string{}   // parallel to dlqIDs; review finding #8
-	dlqAttempts := []int32{}  // parallel to dlqIDs; review finding #10
+	dlqReasons := []string{}   // parallel to dlqIDs; review finding #8
+	dlqErrors := []string{}    // parallel to dlqIDs; review finding #8
+	dlqAttempts := []int32{}   // parallel to dlqIDs; review finding #10
 	retryAttempts := []int32{} // parallel to retryIDs; review finding #10
 	succeedItems := []string{}
 	retryItems := []string{}
@@ -596,6 +608,23 @@ func batchItemIDs(batch []SourceRecord) []string {
 	out := make([]string, 0, len(batch))
 	for _, r := range batch {
 		out = append(out, r.ItemIdentifier)
+	}
+	return out
+}
+
+// claimedItemIDs returns the item_identifiers from the ClaimTriggerRecords
+// result set. Distinct from batchItemIDs because SKIP LOCKED may return
+// fewer rows than the polled batch — Ack/Nack must operate only on
+// records that have a corresponding trigger_records row (audit #6).
+// Records that didn't get claimed stay in poller.inFlight and re-poll
+// naturally on the next tick.
+func claimedItemIDs(claimed []sqlc.TriggerRecord) []string {
+	if len(claimed) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(claimed))
+	for _, c := range claimed {
+		out = append(out, c.ItemIdentifier)
 	}
 	return out
 }
