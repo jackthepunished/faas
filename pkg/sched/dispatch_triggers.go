@@ -552,7 +552,7 @@ var _ = slog.Default
 
 // classifyDLQReason maps the gateway's per-record error string
 // onto one of trigger_dead_letter.reason's CHECK values
-// (migrations/00267_triggers.sql::trigger_dead_letter.reason_check).
+// (migrations/00273_triggers.sql::trigger_dead_letter.reason_check).
 // Review finding #8: the prior code hardcoded 'max_attempts'
 // for every Status='dead_letter' record.
 //
