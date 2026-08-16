@@ -151,34 +151,58 @@ func (r *redisPoller) Kind() string { return "redis_streams" }
 
 // Poll reads up to batchMax entries via XReadGroup.
 //
-// Block: 250ms — same as NATS / Kafka so the dispatch tick
-// treats brokers uniformly. Count: limit so we don't pull more
-// than the trigger's batch_size_max in one round trip.
+// Two passes (audit finding #4):
 //
-// The ">" id is the "give me entries never delivered to this
-// consumer" sentinel — new entries only. Pending entries
-// (delivered but not acked) are picked up by the Claim path
-// (Nack / next-tick re-delivery) instead.
+//  1. id="0" with Block=50ms — drains the consumer's PEL
+//     (entries delivered earlier but never acked). Without
+//     this pass, every PEL entry is leaked until the consumer
+//     re-claims it via XClaim after the visibility timeout.
+//  2. id=">" with Block=250ms — new entries that haven't
+//     been delivered to any consumer yet.
+//
+// Both passes share the same Count (limit) so the dispatcher
+// never exceeds the trigger's batch_size_max in a single tick.
+// PEL entries take priority because they've already been
+// counted toward the dispatcher's in-flight budget — leaving
+// them stranded would amplify the broker-side backlog.
 func (r *redisPoller) Poll(ctx context.Context, t sqlc.Trigger) PollResult {
 	limit := int64(r.batchMax)
 	if t.BatchSizeMax > 0 && int32(limit) > t.BatchSizeMax {
 		limit = int64(t.BatchSizeMax)
 	}
-	res, err := r.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+	out := make([]SourceRecord, 0, limit)
+	pelRes, pelErr := r.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    r.group,
+		Consumer: r.consumer,
+		Streams:  []string{r.stream, "0"},
+		Count:    limit,
+		Block:    50 * time.Millisecond,
+	}).Result()
+	if pelErr != nil && !errors.Is(pelErr, redis.Nil) {
+		return PollResult{Error: fmt.Errorf("redis_poller: xreadgroup pel: %w", pelErr)}
+	}
+	r.appendOutFromXReadGroup(out, pelRes)
+	newRes, err := r.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    r.group,
 		Consumer: r.consumer,
 		Streams:  []string{r.stream, ">"},
-		Count:    limit,
+		Count:    limit - int64(len(out)),
 		Block:    250 * time.Millisecond,
 	}).Result()
-	if err != nil {
-		// redis.Nil is "no entries" — normal idle.
-		if errors.Is(err, redis.Nil) {
-			return PollResult{Records: []SourceRecord{}}
-		}
+	if err != nil && !errors.Is(err, redis.Nil) {
 		return PollResult{Error: fmt.Errorf("redis_poller: xreadgroup: %w", err)}
 	}
-	out := make([]SourceRecord, 0, limit)
+	r.appendOutFromXReadGroup(out, newRes)
+	if out == nil {
+		out = []SourceRecord{}
+	}
+	return PollResult{Records: out}
+}
+
+// appendOutFromXReadGroup flattens the XReadGroup result into the
+// accumulator slice. Shared by the PEL-drain and new-entry passes
+// in Poll (audit #4 split — same body, two callers).
+func (r *redisPoller) appendOutFromXReadGroup(out []SourceRecord, res []redis.XStream) []SourceRecord {
 	for _, stream := range res {
 		if stream.Stream != r.stream {
 			continue
@@ -229,10 +253,7 @@ func (r *redisPoller) Poll(ctx context.Context, t sqlc.Trigger) PollResult {
 			r.mu.Unlock()
 		}
 	}
-	if out == nil {
-		out = []SourceRecord{}
-	}
-	return PollResult{Records: out}
+	return out
 }
 
 // Ack removes the entries from the consumer's PEL via XAck.
