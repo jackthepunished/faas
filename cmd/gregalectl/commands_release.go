@@ -274,8 +274,10 @@ func cmdReleaseInstall(args []string) int {
 	}
 	// ADR-112: if --role is empty AND /etc/faas/first-boot.env has
 	// FAAS_BOX_ROLE set (the operator-supplied sentinel from
-	// cloud-init user-data), adopt it. This makes first-boot work
-	// without passing --role explicitly on the runbook step.
+	// cloud-init user-data), adopt the raw value and let Validate
+	// catch unknown / typo'd strings (post-#930 review Fix 5).
+	// Unknown values used to be silently dropped here, leaving the
+	// install to exit 0 with no role templating — a footgun.
 	if *roleFlag == "" {
 		if envRole, ok := readFirstBootRole(); ok {
 			*roleFlag = envRole
@@ -317,15 +319,24 @@ func cmdReleaseInstall(args []string) int {
 	// correct --role to recover.
 	if *roleFlag != "" {
 		role := roleTemplating.Role(*roleFlag)
-		if err := roleTemplating.ApplyFilesystem(role, ""); err != nil {
+		if err := roleTemplating.ApplyFilesystem(role); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: apply role %s: %v\n", *roleFlag, err)
 			return 4
 		}
-		// Start the role-appropriate subset. PR-A runs Apply on a
-		// blank box (first-boot); idempotency is preserved
-		// because systemctl start on an already-active unit is
-		// a no-op.
-		daemons, _ := roleTemplating.Subset(role)
+		// Start the role-appropriate subset in DEPENDENCY ORDER
+		// (post-#930 review Fix 8). pkg/roleTemplating.StartOrder
+		// intersects pkg/daemonunitspec.RestartOrder (Kahn on
+		// Lifecycle.After) with the role subset, so vmmd starts
+		// before schedd, schedd before gatewayd-internal,
+		// gatewayd-internal before gatewayd-public. PR-A runs
+		// Apply on a blank box (first-boot); idempotency is
+		// preserved because systemctl start on an already-active
+		// unit is a no-op.
+		daemons, err := roleTemplating.StartOrder(role)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: StartOrder(%s): %v\n", *roleFlag, err)
+			return 4
+		}
 		for _, d := range daemons {
 			cmd := exec.Command("systemctl", "start", fmt.Sprintf("faas-%s.service", d))
 			if out, err := cmd.CombinedOutput(); err != nil {
@@ -422,15 +433,19 @@ func openPgPoolFromEnv() (*pgxpool.Pool, error) {
 
 // readFirstBootRole parses /etc/faas/first-boot.env (the file the
 // cloud-init user-data wrote at server-create time, ADR-112) and
-// returns the FAAS_BOX_ROLE value. Returns ok=false if the file is
-// missing or FAAS_BOX_ROLE is unset.
+// returns the FAAS_BOX_ROLE value (raw, unvalidated). Returns
+// ok=false ONLY when the file is missing OR FAAS_BOX_ROLE is unset
+// OR its value is the operator-override sentinel
+// `__SET_BY_OPERATOR_AT_LAUNCH__` (the marker the cloud-init
+// runcmd's assert-first-boot-env.sh detects and fails loud on).
 //
-// The sentinel `__SET_BY_OPERATOR_AT_LAUNCH__` is the explicit
-// "operator did NOT override FAAS_BOX_ROLE in user-data" marker; the
-// cloud-init first-boot runcmd's assert-first-boot-env.sh detects it
-// and fails loud BEFORE this code runs. We treat the sentinel
-// identically to "absent" (returns ok=false), so the cmdReleaseInstall
-// caller can decide what to do — typically, surface a clearer error.
+// UNKNOWN values (typos like "control-plan") are returned with
+// ok=true so cmdReleaseInstall's Validate() surfaces the error.
+// Pre-Fix-5 the function returned ("", false) for unknowns, leaving
+// `*roleFlag == ""` and silently skipping role templating — the
+// install exited 0 with no daemons templated, which is the worst
+// possible failure mode. The post-Fix-5 contract: be loud about
+// unknowns, fall back to legacy-only on absent/sentinel.
 func readFirstBootRole() (string, bool) {
 	const path = "/etc/faas/first-boot.env"
 	data, err := os.ReadFile(path)
@@ -444,18 +459,10 @@ func readFirstBootRole() (string, bool) {
 		}
 		value := strings.TrimPrefix(line, "FAAS_BOX_ROLE=")
 		value = strings.Trim(value, "\"'")
-		if value == "" ||
-			value == "__SET_BY_OPERATOR_AT_LAUNCH__" ||
-			value == "control-plane" ||
-			value == "compute-only" {
-			if value == "control-plane" || value == "compute-only" {
-				return value, true
-			}
+		if value == "" || value == "__SET_BY_OPERATOR_AT_LAUNCH__" {
 			return "", false
 		}
-		// Unknown role value — surface to caller as if absent;
-		// cmdReleaseInstall will exit 2 with the validation error.
-		return "", false
+		return value, true
 	}
 	return "", false
 }

@@ -12,8 +12,8 @@
 # image; per-daemon drop-ins (99-faas-role.conf) are templated at
 # first-boot by `gregalectl release install --role`, keyed off
 # `FAAS_BOX_ROLE` from the cloud-init user-data. The image bakes ALL
-# 8 daemon binaries as on-disk binaries + a stub
-# `/etc/faas/role/role.conf.tpl` template that first-boot reads.
+# 8 daemon binaries as on-disk binaries; the per-daemon env-var
+# names live in pkg/roleTemplating.daemonInfoTable.
 #
 # This script runs INSIDE the Packer VM (NOT on the operator's host).
 # The /tmp/src mount contains the cloned repo; we run ansible against
@@ -32,13 +32,19 @@ command -v ansible-playbook >/dev/null 2>&1 || apt-get install -y --no-install-r
 # Pin the inventory to the in-build VM. bootstrap.yml expects a host
 # inventory; we point at localhost.
 #
-# ADR-112: ansible runs with no faas_box_role override. The image is
-# role-agnostic; first-boot sets FAAS_BOX_ROLE via cloud-init
-# user-data and `gregalectl release install --role` does the
-# templating.
+# ADR-112: the image is role-agnostic; first-boot sets FAAS_BOX_ROLE
+# via cloud-init user-data and `gregalectl release install --role`
+# does the templating. But the in-build VM still needs a default
+# faas_box_role so the per-role ansible roles (especially
+# compute_only_service and control_plane_service, both of which
+# assert on faas_box_role) don't bomb out at Packer build time.
+# Use "single-box" — every daemon allows it (pkg/role/role.go), so
+# the in-build VM runs the maximal daemon set in dev posture. The
+# image bakes as full; first-boot re-templates for the actual role.
 ansible-playbook -i "localhost," -c local \
     deploy/ansible/bootstrap.yml \
     -e "faas_git_sha=${FAAS_GIT_SHA}" \
+    -e "faas_box_role=single-box" \
     --diff
 
 # /etc/profile.d/go.sh so the runtime PATH picks up /usr/local/go/bin.
@@ -74,18 +80,14 @@ if [[ -f "${SRC_ROOT}/deploy/scripts/verify-secrets.sh" ]]; then
         /usr/local/bin/faas-first-boot/verify-secrets.sh
 fi
 
-# ADR-112: drop the role-template stub that first-boot
-# `gregalectl release install --role` reads to write per-daemon
-# 99-faas-role.conf drop-ins. The template body is intentionally
-# generic — the actual role string is supplied at first-boot. The
-# template substitution is {{ROLE}} -> control-plane | compute-only.
-install -d -m 0755 /etc/faas/role
-cat > /etc/faas/role/role.conf.tpl <<'EOF'
-[Service]
-Environment=FAAS_BOX_ROLE={{ROLE}}
-Environment=FAAS_{{DAEMON_UPPER}}_ROLE={{ROLE}}
-EOF
-chmod 0644 /etc/faas/role/role.conf.tpl
+# ADR-112 follow-up: the role-template stub that first-boot
+# `gregalectl release install --role` would have read was removed.
+# DropIn() now owns the full per-daemon drop-in body — it knows
+# each daemon's env-var name (FAAS_GATEWAYD_ROLE, not the
+# uppercased pattern, for gatewayd-internal) — and the template
+# file had no consumers anyway. The drop-in body is consistent
+# across the daemon set; no per-daemon template override is
+# needed for first-boot or PR-B re-role.
 
 # Drop the role overlay's kernel args into GRUB_CMDLINE_LINUX (NOT
 # GRUB_CMDLINE_LINUX_DEFAULT — DEFAULT only shows on the recovery
