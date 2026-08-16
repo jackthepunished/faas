@@ -23,6 +23,15 @@
 //
 // Required binaries: cosign, syft, oras. Install via the
 // prerequisite step below OR via the runner's pre-baked image.
+//
+// Note on `oras push` (PR-B review fix #1): the original draft used
+// `oras copy --to-oci`, which is wrong — `oras copy` requires both
+// sides to be resolvable OCI refs (it transfers between registries,
+// not from local files). To push a local artifact to OCI you must
+// use `oras push` with `<to-ref> <file:mediatype>`. The digest-pinned
+// `<to-ref>` (`@sha256:<digest>`) is still content-addressed the same
+// way as before; consumers can pin either tag (mutable) or digest
+// (immutable) per the OCI spec.
 
 packer {
   required_version = ">= 1.10.0"
@@ -87,7 +96,7 @@ source "null" "canary" {
 //
 //   1. tools        — install cosign, syft, oras (idempotent; uses
 //                     the host's pre-installed binaries when present)
-//   2. publish-tar  — oras copy the canonical tarball to OCI
+//   2. publish-tar  — oras push the canonical tarball to OCI
 //   3. attach-cosign — oras attach the cosign bundle as a referrer
 //   4. attach-sbom  — oras attach the SPDX-2.3 SBoM as a referrer
 //   5. verify       — sanity-check the OCI pull list (defensive)
@@ -120,7 +129,7 @@ build {
       "test -f \"$ARTIFACTS_DIR/release.tar.gz\" || { echo 'Missing required artifact: release.tar.gz. Run scripts/build-canonical-tarball.sh first.' >&2; exit 1; }",
       "DIGEST=$(sha256sum \"$ARTIFACTS_DIR/release.tar.gz\" | awk '{print $1}')",
       "echo \"Publishing $ARTIFACTS_DIR/release.tar.gz -> $OCI_REF@sha256:$DIGEST\"",
-      "oras copy --to-oci \"$OCI_REF@sha256:$DIGEST\" \"$ARTIFACTS_DIR/release.tar.gz:$MEDIA_TYPE\"",
+      "oras push \"$OCI_REF@sha256:$DIGEST\" \"$ARTIFACTS_DIR/release.tar.gz:$MEDIA_TYPE\"",
     ]
   }
 
