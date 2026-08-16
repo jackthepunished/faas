@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -72,6 +73,13 @@ const (
 	// consulted only when the on-disk side already passes; a
 	// missing file is a finding regardless).
 	doctorCheckSecrets = "secrets"
+	// PR-B (ADR-113 day-2): verify-tarball-sbom walks the on-disk
+	// canonical triple (release.tar.gz + release.cosign.bundle +
+	// release.sbom.json) per release and runs cosign verify-blob +
+	// the SBoM CVE-baseline diff. Deep-only because the verifier
+	// shells out to cosign; legacy operators (no canary) see a
+	// clean "triple missing" warn-finding and continue.
+	doctorCheckVerifyTarballSBOM = "verify-tarball-sbom"
 )
 
 // doctor severity constants. Match the wire shape so JSON consumers
@@ -167,6 +175,13 @@ type doctorDeps struct {
 	// manifest_hash so the deep check can do a single map
 	// lookup per node (no N+1 SELECT).
 	bundlesBySHA map[string]releaseinstall.BundleRow
+	// verifier is the cosign verifier (PR-B / ADR-113 day-2)
+	// used by the verify-tarball-sbom probe. Lazily constructed
+	// in cmdDoctorDispatch via releaseinstall.NewExecCosignVerifier
+	// (production) or held nil for tests that inject a Fixture.
+	// Field is on doctorDeps so it can be swapped in whitebox
+	// tests without monkey-patching the package globals.
+	verifier releaseinstall.CosignVerifier
 }
 
 // cmdDoctorDispatch is the entry point for `gregalectl doctor`.
@@ -247,6 +262,15 @@ func cmdDoctorDispatch(args []string) int {
 				deps.bundlesBySHA[b.GitSHA] = b
 			}
 		}
+	}
+
+	// PR-B (ADR-113 day-2): build the cosign verifier lazily. The
+	// ExecCosignVerifier holds no state and is safe to share across
+	// releases; DefaultGitHubOIDC() pins the issuer + identity regex
+	// from PR-A. Whitebox tests inject a FixtureCosignVerifier via
+	// deps.verifier before runDoctorChecks is called.
+	if deps.verifier == nil {
+		deps.verifier = releaseinstall.NewExecCosignVerifier(releaseinstall.DefaultGitHubOIDC())
 	}
 
 	report := runDoctorChecks(context.Background(), deps)
@@ -375,6 +399,14 @@ func runDoctorChecks(ctx context.Context, deps *doctorDeps) doctorReport {
 	if deps.deep {
 		runCheck(doctorCheckNodeHashes, func() ([]doctorFinding, error) {
 			return checkNodeHashes(ctx, deps)
+		})
+		// PR-B (ADR-113 day-2): verify-tarball-sbom is the canonical
+		// triple check (cosign + SBoM-baseline diff). Deep-only
+		// because the verifier shells out to cosign. Skipped on
+		// legacy operators (no triple on disk) with a single
+		// warn-finding per release.
+		runCheck(doctorCheckVerifyTarballSBOM, func() ([]doctorFinding, error) {
+			return checkVerifyTarballSBOM(ctx, deps)
 		})
 	}
 
@@ -900,11 +932,239 @@ func rollupError(findings []doctorFinding) int {
 //     should re-run `secrets init`
 //     to re-stamp)
 //
-// The BumpComputeNodeGeneration write is a soft signal: the
-// generation bump is a load-bearing audit trail for the doctor
-// (PR-4 row-widening), so re-running doctor picks up the
-// generation delta and surfaces "row was bumped by secrets
-// drift" rather than a stale-fingerprint finding.
+// checkVerifyTarballSBOM (PR-B / ADR-113 day-2): walks the
+// canonical on-disk triple (release.tar.gz + release.cosign.bundle
+// + release.sbom.json) per release and runs:
+//
+//  1. cosign verify-blob via deps.verifier (the load-bearing
+//     trust bit from PR-A commit 2). On failure: emit an error
+//     finding with the verifier's stderr in the Detail field.
+//  2. SBoM CVE-baseline diff against the on-disk
+//     sbom-baseline.json (the KGV). On regression: emit an
+//     error finding listing the regressed severities.
+//
+// The probe is deep-only because the verifier shells out to
+// `cosign` (PR-A's exec-backed impl). Legacy operators (no
+// canary) get a single warn-finding per release that the triple
+// is missing — distinct from a 'verify failed' error so the
+// on-disk shape is enumerated, not just success/failure.
+//
+// Per-SHA findings are emitted so the operator can see exactly
+// which release regressed. The check-level summary stays
+// rolled-up (max severity + finding count via runCheck).
+func checkVerifyTarballSBOM(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) {
+	var findings []doctorFinding
+	entries, err := os.ReadDir(deps.releasesRoot)
+	if err != nil {
+		// releases_root missing is a separate finding (bundle/symlink
+		// checks already cover it). Don't double-report here.
+		if os.IsNotExist(err) {
+			return []doctorFinding{{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityWarn,
+				Message:  "releases root not present",
+				Detail:   deps.releasesRoot,
+			}}, nil
+		}
+		return nil, fmt.Errorf("read releases root: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		gitSHA := e.Name()
+		if !releaseinstall.ValidGitSHA(gitSHA) {
+			continue
+		}
+		if deps.releaseFilter != "" && gitSHA != deps.releaseFilter {
+			continue
+		}
+		// Resolve the canonical triple. Missing files → warn
+		// (legacy operators continue); present-and-malformed
+		// → error (the canary partially failed).
+		dir := releaseinstall.BundleRoot(deps.releasesRoot, gitSHA)
+		tarballPath := filepath.Join(dir, "release.tar.gz")
+		sigPath := filepath.Join(dir, "release.cosign.bundle")
+		sbomPath := filepath.Join(dir, "release.sbom.json")
+		if _, err := os.Stat(tarballPath); err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityWarn,
+				Target:   gitSHA,
+				Message:  "canonical triple missing (legacy bundle path; SBoM gate not enforced)",
+			})
+			continue
+		}
+		if _, err := os.Stat(sigPath); err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "cosign bundle missing",
+				Detail:   sigPath,
+			})
+			continue
+		}
+		if _, err := os.Stat(sbomPath); err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "SBoM missing",
+				Detail:   sbomPath,
+			})
+			continue
+		}
+		// Build the Tarball + run Verify. Packed/Sig/SBOM are
+		// the bytes the verifier inspects. The fixture
+		// verifier (whitebox) skips the cosign shell-out.
+		tbBody, err := os.ReadFile(tarballPath)
+		if err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "read tarball",
+				Detail:   err.Error(),
+			})
+			continue
+		}
+		sigBody, err := os.ReadFile(sigPath)
+		if err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "read cosign bundle",
+				Detail:   err.Error(),
+			})
+			continue
+		}
+		sbomBody, err := os.ReadFile(sbomPath)
+		if err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "read SBoM",
+				Detail:   err.Error(),
+			})
+			continue
+		}
+		// Read the on-disk manifest. Tarball.Verify requires a
+		// valid manifest; the same file is what the install
+		// path consumes on the way to AtomicFlip, so reading
+		// here matches the production call site.
+		m, err := releaseinstall.Read(deps.releasesRoot, gitSHA)
+		if err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "read manifest",
+				Detail:   err.Error(),
+			})
+			continue
+		}
+		tb := &releaseinstall.Tarball{
+			GitSHA:   gitSHA,
+			Manifest: m,
+			Packed:   tbBody,
+			Sig:      sigBody,
+			SBOM:     sbomBody,
+		}
+		// BuildTarball computes BinSHA256 from manifest.DaemonHashes
+		// (the canonical hash-of-each-binary map). When the probe
+		// reconstructs a Tarball from on-disk bytes, the BinSHA256
+		// map isn't populated by anything — derive it here so
+		// Tarball.hashWalk passes. Without this, every release
+		// emits "manifest missing daemon <name>" and the OK path
+		// never fires.
+		tb.BinSHA256 = make(map[string]string, len(m.DaemonHashes))
+		for name, h := range m.DaemonHashes {
+			hex := strings.TrimPrefix(h, "sha256:")
+			tb.BinSHA256[name] = hex
+		}
+		identity, err := tb.Verify(ctx, deps.verifier)
+		if err != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "tarball verify failed",
+				Detail:   err.Error(),
+			})
+			continue
+		}
+		// SBoM CVE-baseline diff. ReadBaseline returns the
+		// ErrNilBaseline sentinel for missing basline; that
+		// is operator-actionable (rotate) but not a doctor
+		// error — the install-time gate already enforces it.
+		// We surface it as a warn so operators see the
+		// pending rotation in the doctor output.
+		counts, parseErr := releaseinstall.ParseSPDXv2_3(sbomBody)
+		if parseErr != nil {
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "parse SBoM",
+				Detail:   parseErr.Error(),
+			})
+			continue
+		}
+		baseline, baseErr := releaseinstall.ReadBaseline(deps.releasesRoot, gitSHA)
+		switch {
+		case baseErr == nil:
+			if _, diffErr := baseline.Diff(counts); diffErr != nil {
+				findings = append(findings, doctorFinding{
+					Check:    doctorCheckVerifyTarballSBOM,
+					Severity: doctorSeverityError,
+					Target:   gitSHA,
+					Message:  "SBoM CVE regression",
+					Detail:   diffErr.Error(),
+				})
+				continue
+			}
+		case errors.Is(baseErr, releaseinstall.ErrNilBaseline):
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityWarn,
+				Target:   gitSHA,
+				Message:  "SBoM baseline missing; run `gregalectl release kgv rotate --git-sha " + gitSHA + "`",
+				Detail:   releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(deps.releasesRoot, gitSHA)),
+			})
+		default:
+			findings = append(findings, doctorFinding{
+				Check:    doctorCheckVerifyTarballSBOM,
+				Severity: doctorSeverityError,
+				Target:   gitSHA,
+				Message:  "read SBoM baseline",
+				Detail:   baseErr.Error(),
+			})
+			continue
+		}
+		// OK finding: tarball verified + counts baseline-clean.
+		// Emit one OK row per release so the doctor JSON shows
+		// the per-release signature identity + counts.
+		findings = append(findings, doctorFinding{
+			Check:    doctorCheckVerifyTarballSBOM,
+			Severity: doctorSeverityOK,
+			Target:   gitSHA,
+			Message: fmt.Sprintf("signature=%s counts=critical:%d high:%d medium:%d low:%d",
+				identity, counts.CriticalN, counts.HighN, counts.MediumN, counts.LowN),
+		})
+	}
+	if len(findings) == 0 {
+		return []doctorFinding{{
+			Check:    doctorCheckVerifyTarballSBOM,
+			Severity: doctorSeverityOK,
+			Message:  "no releases on disk",
+		}}, nil
+	}
+	return findings, nil
+}
+
 func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) {
 	var findings []doctorFinding
 	// The canonical secret paths match the v1 bootstrap.sh
