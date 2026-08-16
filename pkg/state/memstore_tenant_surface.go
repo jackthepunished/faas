@@ -392,6 +392,31 @@ func (m *MemStore) DeleteTenantHostname(_ context.Context, hostname string) erro
 	return nil
 }
 
+// GetTenantHostnameByName — pgRouter.ResolveHost's tenant-surface
+// branch uses this to fail closed on hostname.Verified() == false.
+// Mirrors the citext storage contract the SQL schema enforces:
+// callers pass the canonical lowercase form, but the in-memory map
+// also indexes the lowercased form so a casing typo from the
+// caller side doesn't return ErrNotFound in tests. Soft-deleted
+// parent surfaces (status='deleted') are filtered out, matching
+// the SQL JOIN's `s.status <> 'deleted'` predicate.
+func (m *MemStore) GetTenantHostnameByName(_ context.Context, hostname string) (TenantHostname, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.tenantHostnames[hostname]
+	if !ok {
+		h, ok = m.tenantHostnames[strings.ToLower(hostname)]
+	}
+	if !ok {
+		return TenantHostname{}, ErrNotFound
+	}
+	s, ok := m.tenantSurfaces[h.SurfaceID]
+	if !ok || s.Status == SurfaceStatusDeleted {
+		return TenantHostname{}, ErrNotFound
+	}
+	return h, nil
+}
+
 // errors.Is is used by tests for *TenantSurfaceQuotaError +
 // *TenantHostnameQuotaError assertions; keep the symbol live so the
 // blank import doesn't get stripped from the editor view.

@@ -1864,6 +1864,14 @@ type Store interface {
 	// passes, so a row re-enters the queue roughly every batch-time).
 	ListPendingTenantHostnames(ctx context.Context, olderThan time.Time, limit int) ([]TenantHostname, error)
 	DeleteTenantHostname(ctx context.Context, hostname string) error
+	// GetTenantHostnameByName — pgRouter.ResolveHost's tenant-surface
+	// branch needs the hostname row alongside the surface so it can
+	// fail closed on hostname.Verified() == false (a pre-challenge
+	// TXT record must not be routable; the legacy custom_domains
+	// path's parallel contract is dom.Verified()). ErrNotFound when
+	// the hostname is unclaimed. The hostname column is citext so
+	// callers pass the canonical lowercase form.
+	GetTenantHostnameByName(ctx context.Context, hostname string) (TenantHostname, error)
 
 	// Crons (apid CRUDs; schedd fires).
 	CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error)
