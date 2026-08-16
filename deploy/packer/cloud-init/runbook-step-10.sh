@@ -21,8 +21,20 @@ source /etc/faas/first-boot.env
 gregalectl doctor --deep --output=json > /var/log/faas-first-boot/doctor.json
 
 # Surface a structured success line on stdout so the operator can grep
-# serial console / metadata API.
-echo "doctor: $(jq -r '.summary // "ok"' /var/log/faas-first-boot/doctor.json)"
+# serial console / metadata API. The doctor JSON shape is
+# {"healthy": bool, "counts": {...}, ...} — the "summary" key does
+# NOT exist (PR #929 review-fix M8). jq's // default keeps a sane
+# line if the JSON is malformed.
+echo "doctor: healthy=$(jq -r '.healthy // false' /var/log/faas-first-boot/doctor.json)"
+
+# Loud structured success — when healthy=true, this surfaces to the
+# operator's hcloud metadata API as node-ready: true.
+if [ "$(jq -r '.healthy // false' /var/log/faas-first-boot/doctor.json)" = "true" ]; then
+    logger -t faas-first-boot "doctor: healthy=true"
+else
+    logger -t faas-first-boot -p user.err "doctor: healthy=false — node-ready: false"
+    exit 1
+fi
 
 # Always succeed — doctor itself sets the per-daemon Probe state; this
 # script's only job is to surface the result. A non-zero doctor exits

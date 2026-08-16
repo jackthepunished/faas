@@ -72,10 +72,12 @@ func TestImageFirstBoot(t *testing.T) {
 	// 3. Run gregalectl doctor --deep. The doctor is the canonical
 	// "node ready" gate (PR #921 / ADR-110 PR-4). It exits 0 iff every
 	// daemon in the Registry is active + every ProbeTarget passes.
+	// JSON shape: {"healthy": bool, "counts": {...}, "findings": [], "checks": []}.
+	// The "summary" key does NOT exist (PR #929 review-fix M7).
 	doctorOutput := sshExec(ctx, t, serverIP, sshUser, sshKey,
 		"gregalectl doctor --deep --output=json")
-	if !strings.Contains(doctorOutput, "\"summary\":\"ok\"") {
-		t.Fatalf("doctor --deep: expected summary=ok, got %s", doctorOutput)
+	if !strings.Contains(doctorOutput, "\"healthy\":true") {
+		t.Fatalf("doctor --deep: expected healthy=true, got %s", doctorOutput)
 	}
 
 	// 4. Per-daemon Probe gate — same gate upgrade-node uses.

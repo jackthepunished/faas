@@ -13,7 +13,11 @@
 set -euo pipefail
 
 VERSION="${1:-1.10.0}"
-SHA="cb14c061888195dc834d4c0e57a7669b8e15b51b94bfa9c50e3bf5a6227c764e"
+# SHA-256 of packer_1.10.0_linux_amd64.zip from
+# https://releases.hashicorp.com/packer/1.10.0/packer_1.10.0_SHA256SUMS.
+# Mirror the supply-chain pin pattern used by vacuum / sqlc / protoc /
+# promtool in .github/workflows/ci.yml.
+SHA="a8442e7041db0a7db48f468e353ee07fa6a7b35276ec62f60813c518ca3296c1"
 URL="https://releases.hashicorp.com/packer/${VERSION}/packer_${VERSION}_linux_amd64.zip"
 
 if command -v packer >/dev/null 2>&1; then

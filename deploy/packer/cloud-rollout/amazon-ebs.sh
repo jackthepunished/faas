@@ -39,7 +39,11 @@ fi
 # Capture the old instance's metadata (subnet, sg, iam, user-data) so
 # the new instance comes up identical. user-data is the cloud-init
 # first-boot template (control-plane.yaml.tpl / compute-only.yaml.tpl)
-# from PR #930.
+# from PR #930. ALL of these MUST be captured BEFORE terminate — once
+# the instance is gone, AWS returns None for every field (PR #929
+# review-fix M6).
+INSTANCE_TYPE="$(aws ec2 describe-instances --instance-ids "${INSTANCE_ID}" \
+    --query 'Reservations[0].Instances[0].InstanceType' --output text)"
 SUBNET_ID="$(aws ec2 describe-instances --instance-ids "${INSTANCE_ID}" \
     --query 'Reservations[0].Instances[0].SubnetId' --output text)"
 SG_IDS="$(aws ec2 describe-instances --instance-ids "${INSTANCE_ID}" \
@@ -54,8 +58,7 @@ aws ec2 wait instance-terminated --instance-ids "${INSTANCE_ID}"
 # Launch the new one with the same metadata + the new AMI.
 NEW_INSTANCE_ID="$(aws ec2 run-instances \
     --image-id "${AMI_ID}" \
-    --instance-type "$(aws ec2 describe-instances --instance-ids "${INSTANCE_ID}" \
-        --query 'Reservations[0].Instances[0].InstanceType' --output text)" \
+    --instance-type "${INSTANCE_TYPE}" \
     --subnet-id "${SUBNET_ID}" \
     --security-group-ids ${SG_IDS} \
     --iam-instance-profile "Arn=${IAM_ARN}" \

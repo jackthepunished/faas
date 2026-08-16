@@ -12,7 +12,7 @@ set -euo pipefail
 GO_VERSION="${GO_VERSION:-1.25.13}"
 # SHA-256 of go1.25.13.linux-amd64.tar.gz from https://go.dev/dl/.
 # Pinned; CI install-golang uses the same value (action v5).
-GO_SHA="081668ad9bc78f6cd05d1afbc6f30ad5a09cdf84a5d34c33b16e9ca1d3d51c83"
+GO_SHA="39042a078ea9ceebe3ecda4a7188f0f5b96e14a071d27923ba7f40b456e85ae3"
 URL="https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
 
 TMP="$(mktemp -d)"

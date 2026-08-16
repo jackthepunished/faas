@@ -37,17 +37,14 @@ export FAAS_BOX_ROLE
 EOF
 chmod 0644 /etc/profile.d/go.sh
 
-# Kernel kargs (per CLAUDE.md §11). These belong to boot, not bake — but
-# on bare-metal we set them via grub config; on cloud we rely on the
-# provider's `cmdline` knob. The cloud-init user-data (PR #930) handles
-# the cloud side; this script handles the bare-metal / ISO side.
-if [[ -f /etc/default/grub ]]; then
-    sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 cgroup_no_v1=0 unprivileged_userns_clone=0"/' \
-        /etc/default/grub
-    if command -v update-grub >/dev/null 2>&1; then
-        update-grub
-    fi
-fi
+# Kernel kargs (per CLAUDE.md §11) — handled in the install pass below
+# after the per-role drop-ins. The block at the bottom of this file
+# is idempotent (guarded by `grep -q cgroup_no_v1=0`) and adds
+# `systemd.unified_cgroup_hierarchy=1` so cgroups v2 is enforced.
+#
+# PR #929 review-fix M11: this section used to non-idempotently sed
+# GRUB_CMDLINE_LINUX_DEFAULT on every run, doubling the args after
+# re-builds; the new block at the bottom replaces it.
 
 # Per-role 99-faas-role.conf drop-in (Mega-PR-C Commit 4). Iterated
 # over the role-overlay.pkr.hcl's local.active_daemons subset.
@@ -65,3 +62,36 @@ EOF
 done
 
 echo "build-base: applied ${FAAS_BOX_ROLE} role to ${DAEMON_LIST}"
+
+# Install the first-boot runbook-step scripts + verify-secrets.sh into
+# the image at /usr/local/bin/faas-first-boot/. The cloud-init runcmd
+# invokes them by absolute path; without this install pass, the
+# runbook can't run (PR #929 review-fix M10).
+install -d -m 0755 /usr/local/bin/faas-first-boot
+for s in "${SRC_ROOT}/deploy/packer/cloud-init/runbook-step-"*.sh; do
+    install -m 0755 "${s}" /usr/local/bin/faas-first-boot/
+done
+# verify-secrets.sh is the canonical schema check (same script the
+# in-build verify-no-secrets.sh runs at build time). Lives at
+# deploy/scripts/verify-secrets.sh.
+if [[ -f "${SRC_ROOT}/deploy/scripts/verify-secrets.sh" ]]; then
+    install -m 0755 "${SRC_ROOT}/deploy/scripts/verify-secrets.sh" \
+        /usr/local/bin/faas-first-boot/verify-secrets.sh
+fi
+
+# Drop the role overlay's kernel args into GRUB_CMDLINE_LINUX (NOT
+# GRUB_CMDLINE_LINUX_DEFAULT — DEFAULT only shows on the recovery
+# menu; LINUX is what normal boots use). Idempotent: skip if the args
+# are already present (PR #929 review-fix M11).
+if [[ -f /etc/default/grub ]]; then
+    if ! grep -q 'cgroup_no_v1=0' /etc/default/grub; then
+        sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 cgroup_no_v1=0 unprivileged_userns_clone=0 systemd.unified_cgroup_hierarchy=1"/' \
+            /etc/default/grub
+        # Also drop the args into DEFAULT so recovery menu sees them.
+        sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 cgroup_no_v1=0 unprivileged_userns_clone=0 systemd.unified_cgroup_hierarchy=1"/' \
+            /etc/default/grub
+        if command -v update-grub >/dev/null 2>&1; then
+            update-grub
+        fi
+    fi
+fi

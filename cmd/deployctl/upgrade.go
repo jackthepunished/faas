@@ -30,7 +30,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,12 +44,19 @@ import (
 // upgradeArgs parses argv (everything after `deployctl upgrade-node`).
 // Operator invocation:
 //
-//   deployctl upgrade-node --image-tag=gregale-compute-control-plane-...
-//                          --node=fsn-1
-//                          [--cloud=hcloud|amazon-ebs|bare-metal]
-//                          [--drain-timeout=120s]
-//                          [--ready-timeout=300s]
-//                          [--cloud-rollout=/path/to/cloud-specific.sh]
+//	deployctl upgrade-node --image-tag=gregale-compute-control-plane-...
+//	                       --node=fsn-1
+//	                       [--cloud=hcloud|amazon-ebs|bare-metal]
+//	                       [--drain-timeout=120s]
+//	                       [--ready-timeout=300s]
+//	                       [--cloud-rollout=/path/to/cloud-specific.sh]
+//	                       [--ssh-user=root]
+//	                       [--ssh-key=/path/to/key]
+//
+// SSH flags are used by the per-daemon Probe gate (waitForReady) to
+// ssh into the TARGET box being upgraded — without them, the gate
+// would probe the operator's local /run/faas/*.sock (PR #929 review
+// finding M5: "waitOneReady probes operator box").
 type upgradeArgs struct {
 	imageTag     string
 	node         string
@@ -54,6 +64,8 @@ type upgradeArgs struct {
 	drainTimeout time.Duration
 	readyTimeout time.Duration
 	cloudRollout string
+	sshUser      string
+	sshKey       string
 }
 
 func parseUpgradeArgs(stdout io.Writer, args []string) (*upgradeArgs, error) {
@@ -61,6 +73,7 @@ func parseUpgradeArgs(stdout io.Writer, args []string) (*upgradeArgs, error) {
 		drainTimeout: time.Duration(api.MigrateLiveLeaseSeconds)*time.Second + 5*time.Second,
 		readyTimeout: 5 * time.Minute,
 		cloud:        "hcloud",
+		sshUser:      "root",
 	}
 
 	fs := flag.NewFlagSet("upgrade-node", flag.ContinueOnError)
@@ -71,6 +84,8 @@ func parseUpgradeArgs(stdout io.Writer, args []string) (*upgradeArgs, error) {
 	fs.DurationVar(&a.drainTimeout, "drain-timeout", a.drainTimeout, "time to wait for live instances to land on peers (MigrateLiveLeaseSeconds + 5s grace)")
 	fs.DurationVar(&a.readyTimeout, "ready-timeout", a.readyTimeout, "time to wait for every Lifecycle.Probe on every Registry entry to pass")
 	fs.StringVar(&a.cloudRollout, "cloud-rollout", "", "path to the cloud-specific rollout shell wrapper (defaults to deploy/packer/cloud-rollout/<cloud>.sh)")
+	fs.StringVar(&a.sshUser, "ssh-user", a.sshUser, "ssh user for the target box (default root)")
+	fs.StringVar(&a.sshKey, "ssh-key", "", "path to the ssh private key for the target box (defaults to $HOME/.ssh/id_rsa if unset)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -81,6 +96,9 @@ func parseUpgradeArgs(stdout io.Writer, args []string) (*upgradeArgs, error) {
 	}
 	if a.node == "" {
 		return nil, errors.New("--node required (fqdn of the target box)")
+	}
+	if a.sshKey == "" {
+		a.sshKey = filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
 	}
 	if !strings.HasPrefix(a.imageTag, "gregale-compute-") {
 		return nil, fmt.Errorf("--image-tag must satisfy the ADR-111 contract; got %q", a.imageTag)
@@ -190,41 +208,92 @@ func runCloudRollout(ctx context.Context, a *upgradeArgs) error {
 
 // waitForReady polls every Lifecycle.Probe / ProbeTarget in
 // pkg/daemonunitspec.Registry IN REGISTRATION ORDER until every entry
-// reports ready. Reuses runtime.go:295-299's probe primitives — the
-// same waitPath / waitTCP / waitSystemdActive that `deployctl deploy`
-// uses to gate per-service readiness.
+// reports ready. The probes run against the TARGET box (a.node),
+// not the operator's host — every probe is wrapped in an ssh hop.
+//
+// Reuses runtime.go:295-299's waitPath / waitTCP / waitSystemdActive
+// primitives indirectly: each sshExec invokes the canonical probe on
+// the remote box (test -S for unix probes, /dev/tcp/<host>/<port> for
+// tcp probes, `systemctl is-active` for systemd probes). The wire
+// shape matches what `deployctl deploy` uses to gate per-service
+// readiness — but the gate is on the box being upgraded, not the
+// operator's box (PR #929 review-fix M5).
 func waitForReady(ctx context.Context, a *upgradeArgs) error {
 	deadline := time.Now().Add(a.readyTimeout)
 	for _, entry := range daemonunitspec.Registry {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("ready gate: deadline exceeded before %s", entry.Name)
 		}
-		if err := waitOneReady(ctx, entry, time.Until(deadline)); err != nil {
+		if err := waitOneReadyOnTarget(ctx, a, entry, time.Until(deadline)); err != nil {
 			return fmt.Errorf("ready gate: %s not ready: %w", entry.Name, err)
 		}
 	}
 	return nil
 }
 
-// waitOneReady maps daemonunitspec.Lifecycle.Probe to the existing
-// runtime probe helpers (waitPath / waitTCP / waitSystemdActive).
-// The switch is byte-identical to runtime.go:295-299.
-func waitOneReady(ctx context.Context, entry daemonunitspec.Entry, timeout time.Duration) error {
+// waitOneReadyOnTarget probes entry.Lifecycle.Probe on the TARGET box
+// via ssh. The local-host probes (127.0.0.1) are remapped to the
+// target's loopback; cross-host probes dial via the box's eth0.
+//
+// Per the registry's ProbeTarget conventions:
+//
+//	ProbeUnix    → /run/faas/<daemon>.sock on the target
+//	ProbeTCP     → 127.0.0.1:<port> on the target (or eth0 if set)
+//	ProbeSystemd → `systemctl is-active faas-<daemon>.service` on the target
+func waitOneReadyOnTarget(ctx context.Context, a *upgradeArgs, entry daemonunitspec.Entry, timeout time.Duration) error {
 	if timeout < 0 {
 		timeout = 0
 	}
-	rctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	deadline := time.Now().Add(timeout)
+
+	var probeCmd string
 	switch entry.Lifecycle.Probe {
 	case daemonunitspec.ProbeUnix:
-		return waitPath(rctx, entry.Lifecycle.ProbeTarget, timeout)
+		probeCmd = fmt.Sprintf("test -S %s", entry.Lifecycle.ProbeTarget)
 	case daemonunitspec.ProbeTCP:
-		return waitTCP(rctx, entry.Lifecycle.ProbeTarget, timeout)
+		// ProbeTarget is host:port. Re-target localhost loopback since
+		// the ssh session is already inside the box.
+		_, port, splitErr := net.SplitHostPort(entry.Lifecycle.ProbeTarget)
+		if splitErr != nil {
+			return fmt.Errorf("daemon %s: bad tcp probe %q: %w", entry.Name, entry.Lifecycle.ProbeTarget, splitErr)
+		}
+		probeCmd = fmt.Sprintf("bash -c 'echo > /dev/tcp/127.0.0.1/%s'", port)
 	case daemonunitspec.ProbeSystemd:
-		return waitSystemdActive(rctx, "faas-"+entry.Name+".service", timeout)
+		probeCmd = fmt.Sprintf("systemctl is-active faas-%s.service", entry.Name)
 	default:
 		return fmt.Errorf("unknown readiness probe for %s", entry.Name)
 	}
+
+	for time.Now().Before(deadline) {
+		err := sshProbeTarget(ctx, a, probeCmd)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return fmt.Errorf("daemon %s probe %s not ready within %s", entry.Name, entry.Lifecycle.Probe, timeout)
+}
+
+// sshProbeTarget invokes probeCmd on the target box via ssh. The
+// agent key (a.sshKey) is the only auth path; StrictHostKeyChecking
+// is permissive on first contact (the upgrade orchestrator is itself
+// a fresh VM whose fingerprint isn't pinned).
+func sshProbeTarget(ctx context.Context, a *upgradeArgs, probeCmd string) error {
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-i", a.sshKey,
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "BatchMode=yes",
+		fmt.Sprintf("%s@%s", a.sshUser, a.node),
+		probeCmd,
+	)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run()
 }
 
 // runActivate flips compute_nodes.active=true via gregalectl

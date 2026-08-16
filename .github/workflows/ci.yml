@@ -1337,14 +1337,17 @@ jobs:
       - name: hcloud CLI
         run: |
           set -euo pipefail
+          # Asset name + SHA-256 from
+          # https://github.com/hetznercloud/cli/releases/tag/v1.45.0 —
+          # the actual asset is hcloud-linux-amd64.tar.gz (no version
+          # segment embedded in the filename). SHA mirrors the supply-
+          # chain pin pattern used by vacuum / sqlc / protoc / promtool
+          # higher in this file (per codeql-go-clear-text-logging-
+          # obfuscator-barrier lesson; no curl | tar -xz without verify).
           curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
             -o /tmp/hcloud.tar.gz \
-            https://github.com/hetznercloud/cli/releases/download/v1.45.0/hcloud-v1.45.0-linux-amd64.tar.gz
-          # SHA-256 mirrored from hcloud v1.45.0 release — supply-chain
-          # pin pattern matching the vacuum / sqlc / protoc / promtool
-          # pins higher in this file (per codeql-go-clear-text-logging-
-          # obfuscator-barrier lesson; no curl | tar -xz without verify).
-          echo "b3e3b7b2a4d4f5e1c8a9d6e7f1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0  /tmp/hcloud.tar.gz" \
+            https://github.com/hetznercloud/cli/releases/download/v1.45.0/hcloud-linux-amd64.tar.gz
+          echo "7918b2058eaf2df180caef34e4db1c7bcf5a6004ef6fd136402ebb7acb25d0eb  /tmp/hcloud.tar.gz" \
             | sha256sum --check --strict
           tar -xzf /tmp/hcloud.tar.gz -C /tmp hcloud
           sudo mv /tmp/hcloud /usr/local/bin/

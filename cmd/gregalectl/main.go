@@ -152,6 +152,12 @@ func run(args []string) int {
 		// fans to init / rotate / status. Local fs + optional
 		// compute_nodes write — never hits apid.
 		return cmdSecretsDispatch(args[1:])
+	case dispatchComputeNodes:
+		// PR #929 (image rollout). Subcommands drain / drain-status /
+		// activate / force-drain map to state.Store.MarkComputeNodeInactive
+		// / SetComputeNodeActive. Signature matches every other
+		// dispatch* arm (see commands_release.go:cmdReleaseDispatch).
+		return cmdComputeNodesDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregalectl: unknown command %q\nRun 'gregalectl help' for usage.\n", args[0])
 		return 1

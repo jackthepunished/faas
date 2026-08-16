@@ -24,13 +24,13 @@ packer {
 variable "ubuntu_iso_url" {
   type        = string
   description = "URL of the Ubuntu 24.04 live-server ISO."
-  default     = "https://releases.ubuntu.com/24.04/ubuntu-24.04.2-live-server-amd64.iso"
+  default     = "https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso"
 }
 
 variable "ubuntu_iso_sha256" {
   type        = string
-  description = "SHA-256 of the Ubuntu 24.04 ISO. Pinned; supply-chain check before boot."
-  default     = "145f4e7be5c1f8a1b6e1b7c4a5d3e2f8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4"
+  description = "SHA-256 of the Ubuntu 24.04 ISO. Pinned; supply-chain check before boot. Mirrors releases.ubuntu.com/24.04/SHA256SUMS."
+  default     = "c3514bf0056180d09376462a7a1b4f213c1d6e8ea67fae5c25099c6fd3d8274b"
 }
 
 variable "autoinstall_path" {
