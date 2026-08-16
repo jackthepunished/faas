@@ -20,9 +20,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 
@@ -261,6 +263,18 @@ func cmdComputeNodesForceDrain(args []string) int {
 // per-host dial-target discipline (rejecting loopback / 0.0.0.0 /
 // empty / missing scheme).
 func cmdComputeNodesAdd(args []string) int {
+	return cmdComputeNodesAddTo(args, os.Stdout)
+}
+
+// cmdComputeNodesAddTo is the seam that takes an explicit
+// stdout writer. PR-A's CLI calls through cmdComputeNodesAdd
+// (which writes to os.Stdout); PR-B's deploy add-node calls
+// cmdComputeNodesAddTo with io.Discard so the inner OK line /
+// JSON blob doesn't pollute the outer report's stdout.
+//
+// Same flag set, same validation, same exit codes — only the
+// stdout destination differs.
+func cmdComputeNodesAddTo(args []string, stdout io.Writer) int {
 	fs := flag.NewFlagSet("add", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	name := fs.String("name", "", "fqdn / short-hostname of the new node (required)")
@@ -331,14 +345,37 @@ func cmdComputeNodesAdd(args []string) int {
 	}
 	defer closeFn()
 
-	row, err := st.UpsertComputeNodeFromOperator(context.Background(), state.ComputeNode{
+	// Build the row. The CLI only knows 6 fields; the SQL
+	// ON CONFLICT clause (pgstore.go:8873-8889) writes
+	// release_id / manifest_hash / host_certificate /
+	// cert_fingerprint / role from `excluded.*` — so passing
+	// nil for those fields would NULL them out on a re-add and
+	// break the installed node's PKI + release metadata.
+	//
+	// Read the existing row first; copy the operator-side
+	// pointer fields (Role, ReleaseID, ManifestHash,
+	// HostCertificate, CertFingerprint) so the UPSERT
+	// preserves them. The cold-insert branch (no existing row)
+	// leaves them nil — same as the pre-PR-A apid behavior.
+	node := state.ComputeNode{
 		Name:               payload.Name,
 		TargetURL:          payload.TargetURL,
 		VPCPUs:             payload.VPCPUs,
 		MemMB:              payload.MemMB,
 		MaxConcurrency:     payload.MaxConcurrency,
 		AdmissionCeilingMB: payload.AdmissionCeilingMB,
-	})
+	}
+	if existing, lookupErr := st.ComputeNodeByName(context.Background(), payload.Name); lookupErr == nil {
+		node.Role = existing.Role
+		node.ReleaseID = existing.ReleaseID
+		node.ManifestHash = existing.ManifestHash
+		node.HostCertificate = existing.HostCertificate
+		node.CertFingerprint = existing.CertFingerprint
+	} else if !errors.Is(lookupErr, state.ErrNotFound) {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: lookup existing: %v\n", lookupErr)
+		return 1
+	}
+	row, err := st.UpsertComputeNodeFromOperator(context.Background(), node)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: upsert: %v\n", err)
 		return 1
@@ -354,9 +391,9 @@ func cmdComputeNodesAdd(args []string) int {
 		return 1
 	}
 	if *jsonOut {
-		return emitComputeNodeAddedJSON(os.Stdout, row)
+		return emitComputeNodeAddedJSON(stdout, row)
 	}
-	_, _ = fmt.Fprintf(os.Stdout, "OK name=%s id=%s target_url=%s vpcpus=%d mem_mb=%d max_concurrency=%d admission_ceiling_mb=%d\n",
+	_, _ = fmt.Fprintf(stdout, "OK name=%s id=%s target_url=%s vpcpus=%d mem_mb=%d max_concurrency=%d admission_ceiling_mb=%d\n",
 		row.Name, row.ID, row.TargetURL, row.VPCPUs, row.MemMB, row.MaxConcurrency, row.AdmissionCeilingMB)
 	return 0
 }
@@ -432,6 +469,13 @@ func validComputeNodeName(name string) bool {
 // `0.0.0.0` resolves to the local host's own vmmd, not the second
 // box; `127.0.0.1` is loopback-only. The remaining schemes
 // (tcp://, unix://) match pkg/wire/grpc.go's URL parser.
+//
+// The IPv4 loopback checks cover `0.0.0.0`, `127.0.0.1` and the
+// `127.0.0.0/8` range. The IPv6 checks cover `::`, `::1`, the
+// `fc00::/7` ULA range (routable on the box but never from a peer),
+// and `fe80::/10` link-local. Without them, an operator pasting
+// `tcp://[::1]:50051` or `tcp://[::]:50051` slips past the v4
+// check and the peer box's dial loops back to itself.
 func validDialTargetURL(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("empty target_url")
@@ -442,11 +486,12 @@ func validDialTargetURL(raw string) error {
 		if host == "" {
 			return fmt.Errorf("tcp:// with empty host")
 		}
-		if host == "0.0.0.0" || strings.HasPrefix(host, "0.0.0.0:") {
-			return fmt.Errorf("tcp://0.0.0.0 is non-routable from a peer box; use the box's overlay or routable IP")
-		}
-		if host == "127.0.0.1" || strings.HasPrefix(host, "127.0.0.1:") {
-			return fmt.Errorf("tcp://127.0.0.1 is loopback; peer boxes cannot dial")
+		// Strip an optional :port — the bracketed-IPv6 form
+		// (`[::1]:50051`) needs the bracket stripped before the
+		// host check; the bare form (`[::1]`) needs the same.
+		hostOnly, _ := splitHostPort(host)
+		if isNonRoutableHost(hostOnly) {
+			return fmt.Errorf("tcp://%s is non-routable from a peer box; use the box's overlay or routable IP", hostOnly)
 		}
 		if !strings.Contains(host, ":") {
 			return fmt.Errorf("tcp:// host missing port")
@@ -465,4 +510,53 @@ func validDialTargetURL(raw string) error {
 	default:
 		return fmt.Errorf("scheme must be tcp://, unix://, or dns:// (got %q)", raw)
 	}
+}
+
+// splitHostPort splits `tcp://host:port` into host + port for
+// IPv4 and bracketed-IPv6 forms. For unbracketed IPv6 (`::1`) the
+// port is empty (the caller has already failed the `strings.Contains(host, ":")`
+// check). Returns the trimmed host part and the trimmed port
+// (empty if absent).
+func splitHostPort(host string) (string, string) {
+	if strings.HasPrefix(host, "[") {
+		// bracketed IPv6: [host]:port — close bracket required
+		end := strings.Index(host, "]")
+		if end < 0 {
+			return strings.TrimPrefix(host, "["), ""
+		}
+		h := host[1:end]
+		rest := strings.TrimPrefix(host[end+1:], ":")
+		return h, rest
+	}
+	// IPv4 / hostname: last `:` is the port separator.
+	idx := strings.LastIndex(host, ":")
+	if idx < 0 {
+		return host, ""
+	}
+	return host[:idx], host[idx+1:]
+}
+
+// isNonRoutableHost returns true for IPs that resolve to the
+// local box (loopback / unspecified / link-local / ULA). The
+// runbook's §3.5 cross-box dial discipline rejects these — a
+// peer box cannot reach `vmmd` on the operator's loopback.
+func isNonRoutableHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	// IPv4 literal
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate()
+	}
+	// Handle the bracketed-literal case the parser above missed
+	// (e.g. host arrives as `[::1]` due to upstream format drift).
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate()
+	}
+	// Hostname — hostname:port with no literal IP is operator's
+	// own FQDN. Don't reject; the resolver can return a public IP.
+	// (The actual dial failure will surface in the gRPC layer.)
+	return false
 }

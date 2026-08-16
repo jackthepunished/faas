@@ -48,12 +48,28 @@ func installFakeSSH(t *testing.T, result fakeSSHResult) func() {
 }
 
 // installFakeGit swaps the git seam to a no-op. Tests can pass a
-// custom fn to assert on commit messages.
-func installFakeGit(t *testing.T, fn func(repoRoot string, args ...string) error) func() {
+// custom fn to assert on commit messages. The seam returns
+// (stdout, err) so the report's commit_sha can be captured.
+//
+// The default fake returns a dirty `git status --porcelain` line
+// for the two files deploy add-node touches (` M` = unstaged
+// modification) so the deploy path proceeds through the commit
+// step instead of short-circuiting on the idempotency check.
+// Tests that exercise the no-op path should pass a custom fn
+// that returns empty stdout for `status --porcelain`.
+func installFakeGit(t *testing.T, fn func(repoRoot string, args ...string) ([]byte, error)) func() {
 	t.Helper()
 	prev := gitRunner
 	if fn == nil {
-		gitRunner = func(repoRoot string, args ...string) error { return nil }
+		gitRunner = func(repoRoot string, args ...string) ([]byte, error) {
+			// Detect the `status --porcelain` invocation the
+			// idempotency check uses and return a dirty line so
+			// the deploy path doesn't short-circuit.
+			if len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain" {
+				return []byte(" M deploy/ansible/host_vars/foo.yml\n"), nil
+			}
+			return nil, nil
+		}
 	} else {
 		gitRunner = fn
 	}
@@ -173,14 +189,14 @@ func TestCmdDeployAddNode_WritesHostVars(t *testing.T) {
 	if !strings.Contains(string(body), "faas_node_name: faas-fsn-3") {
 		t.Errorf("missing faas_node_name\n%s", body)
 	}
-	if !strings.Contains(string(body), "ansible_host: 10.42.0.3") {
-		t.Errorf("missing ansible_host\n%s", body)
+	if !strings.Contains(string(body), `ansible_host: "10.42.0.3"`) {
+		t.Errorf("missing quoted ansible_host\n%s", body)
 	}
-	if !strings.Contains(string(body), "public_iface: ens5") {
-		t.Errorf("missing public_iface\n%s", body)
+	if !strings.Contains(string(body), `public_iface: "ens5"`) {
+		t.Errorf("missing quoted public_iface\n%s", body)
 	}
-	if !strings.Contains(string(body), "masquerade_cidr: 10.102.0.0/16") {
-		t.Errorf("missing masquerade_cidr\n%s", body)
+	if !strings.Contains(string(body), `masquerade_cidr: "10.102.0.0/16"`) {
+		t.Errorf("missing quoted masquerade_cidr\n%s", body)
 	}
 }
 
@@ -238,6 +254,58 @@ func TestCmdDeployAddNode_HostsINI_Idempotent(t *testing.T) {
 	}
 }
 
+// TestCmdDeployAddNode_NoDirtyTreeShortCircuits asserts the
+// idempotency path: when neither host_vars nor hosts.ini changed
+// (gitDirty returns false), the deploy flow short-circuits with
+// a "no-op" stderr message and the existing commit SHA, exits 0,
+// and does NOT attempt the SSH bootstrap a second time.
+func TestCmdDeployAddNode_NoDirtyTreeShortCircuits(t *testing.T) {
+	resetComputeNodesStore(t)
+	repo := makeFakeRepo(t)
+	// Custom fake: status --porcelain returns empty (clean
+	// index), rev-parse HEAD returns a known SHA. Tracks whether
+	// the SSH seam was called (it shouldn't be).
+	sshCalled := false
+	defer installFakeSSH(t, fakeSSHResult{
+		Stdout: []byte("ok"),
+		Stderr: []byte(""),
+		Err:    nil,
+	})()
+	defer installFakeGit(t, nil)()
+	// Override SSH to fail loudly if called (test should not
+	// reach the bootstrap step on the no-op path).
+	prevSSH := sshRunner
+	sshRunner = func(target string, args []string) ([]byte, []byte, error) {
+		sshCalled = true
+		return []byte(""), []byte("ssh should not be called on no-op"), errors.New("exit 1")
+	}
+	defer func() { sshRunner = prevSSH }()
+
+	// Override git seam: status --porcelain returns empty (clean),
+	// rev-parse HEAD returns a known SHA so the report surfaces it.
+	setGitRunner(func(repoRoot string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain" {
+			return []byte(""), nil
+		}
+		if len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
+			return []byte("abc1234567890abcdef1234567890abcdef12345\n"), nil
+		}
+		return nil, nil
+	})
+
+	stderr := captureStderrComputeNodes(t, func() {
+		if code := cmdDeployAddNode(buildAddNodeArgs(repo, "faas-fsn-3")); code != 0 {
+			t.Fatalf("cmdDeployAddNode(no-op) = %d, want 0", code)
+		}
+	})
+	if !strings.Contains(stderr, "no repo changes") {
+		t.Errorf("stderr missing no-op hint: %q", stderr)
+	}
+	if sshCalled {
+		t.Error("ssh must not be called on the no-op path")
+	}
+}
+
 // TestRenderHostVarsYAML_MatchesExisting asserts the renderer's
 // output for fsn-1 (control-plane) carries the same shape as
 // deploy/ansible/host_vars/faas-fsn-1.yml on disk. Drift gate.
@@ -246,7 +314,7 @@ func TestRenderHostVarsYAML_MatchesExisting(t *testing.T) {
 	for _, want := range []string{
 		"faas_box_role: control-plane",
 		"faas_node_name: fsn-1",
-		"ansible_host: 10.42.0.1",
+		`ansible_host: "10.42.0.1"`,
 		"ansible_python_interpreter: /usr/bin/python3",
 		"overlay_cidrs: []",
 	} {
@@ -435,15 +503,53 @@ func TestRenderHostVarsYAML_ComputeOnly(t *testing.T) {
 	for _, want := range []string{
 		"faas_box_role: compute-only",
 		"faas_node_name: fsn-3",
-		"ansible_host: 10.42.0.3",
-		"public_iface: ens5",
-		"masquerade_cidr: 10.102.0.0/16",
-		"masquerade_cidr_v6: fc00::/7",
-		"overlay_cidrs: [100.64.0.0/14]",
+		`ansible_host: "10.42.0.3"`,
+		`public_iface: "ens5"`,
+		`masquerade_cidr: "10.102.0.0/16"`,
+		`masquerade_cidr_v6: "fc00::/7"`,
+		`overlay_cidrs: ["100.64.0.0/14"]`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("fsn-3 render missing %q\n%s", want, got)
 		}
+	}
+}
+
+// TestYamlQuote asserts the YAML-quoting helper escapes the
+// dangerous characters (": # " `*&!|>'%@`) and round-trips the
+// safe ones byte-identical.
+func TestYamlQuote(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"ens5", `"ens5"`},
+		{"10.42.0.1", `"10.42.0.1"`},
+		{`weird"value`, `"weird\"value"`},
+		{`back\slash`, `"back\\slash"`},
+		{"a:b", `"a:b"`},
+		{"a#b", `"a#b"`},
+		{"*anchor", `"*anchor"`},
+		{"", `""`},
+	}
+	for _, tc := range cases {
+		if got := yamlQuote(tc.in); got != tc.want {
+			t.Errorf("yamlQuote(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestYamlQuoteList asserts the comma-separated list renderer
+// quotes each entry and returns [] for empty input.
+func TestYamlQuoteList(t *testing.T) {
+	if got := yamlQuoteList(""); got != "[]" {
+		t.Errorf("yamlQuoteList(\"\") = %q, want []", got)
+	}
+	if got := yamlQuoteList("100.64.0.0/14, 10.42.0.0/16"); got != `["100.64.0.0/14", "10.42.0.0/16"]` {
+		t.Errorf("yamlQuoteList(\"100.64.0.0/14, 10.42.0.0/16\") = %q", got)
+	}
+	// Hostile input: a value with `:` and a quote — must not break YAML.
+	if got := yamlQuoteList("a:b,weird\"x"); got != `["a:b", "weird\"x"]` {
+		t.Errorf("yamlQuoteList hostile = %q", got)
 	}
 }
 
@@ -471,11 +577,11 @@ func TestBuildFakeGit_BehaviorIsCallable(t *testing.T) {
 	prev := gitRunner
 	defer func() { gitRunner = prev }()
 	called := false
-	gitRunner = func(repoRoot string, args ...string) error {
+	gitRunner = func(repoRoot string, args ...string) ([]byte, error) {
 		called = true
-		return nil
+		return []byte("ok"), nil
 	}
-	if err := gitRunner("/tmp", "status"); err != nil {
+	if _, err := gitRunner("/tmp", "status"); err != nil {
 		t.Errorf("gitRunner: %v", err)
 	}
 	if !called {

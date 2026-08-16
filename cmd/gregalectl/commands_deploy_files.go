@@ -27,6 +27,15 @@ import (
 // The control-plane subset drops masquerade_cidr + masquerade_cidr_v6
 // (no overlay traffic on the CP box — per host_vars/faas-fsn-1.yml:24-37).
 // The compute-only subset carries them per host_vars/faas-fsn-2.yml:25-39.
+//
+// All operator-supplied string values are YAML-quoted via yamlQuote
+// so a value containing `:`, `#`, `"`, or starting with `*&!|>'%@`
+// can't break YAML parsing or smuggle anchors. The input fields come
+// from CLI flags (--ansible-host, --public-iface, --masquerade-cidr…);
+// an operator pasting a value with a typo (e.g. `10.42.0.3:50051` for
+// `--ansible-host`) would otherwise produce `ansible_host: 10.42.0.3:50051`
+// which parses as the key `ansible_host` with value `50051` and the rest
+// as a string-typed fragment — ansible then fails to load the file.
 func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDRv6, overlayCIDRs string) string {
 	roleComment := "control-plane box"
 	roleMarker := "control-plane"
@@ -37,6 +46,10 @@ func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDR
 		hosts = []string{"vmmd", "gatewayd-internal", "builderd", "imaged"}
 	}
 
+	// Anchor `fqdn` and `roleMarker` are validated upstream by
+	// validComputeNodeName / the role enum and never contain
+	// shell-meaningful chars — left unquoted for human diff.
+	// Everything else is operator-supplied and quoted.
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Gate-B (issue #297 / ADR-025 §Tier 2) %s.\n", roleComment)
 	fmt.Fprintf(&b, "# %s runs %s.\n", fqdn, strings.Join(hosts, ", "))
@@ -57,17 +70,17 @@ func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDR
 	fmt.Fprintf(&b, "# or routable FQDN — operator-supplied per-fleet). The\n")
 	fmt.Fprintf(&b, "# `ansible_python_interpreter` pin matches the Ubuntu 24.04 system\n")
 	fmt.Fprintf(&b, "# python3.12 so we never depend on a venv.\n")
-	fmt.Fprintf(&b, "ansible_host: %s\n", ansibleHost)
+	fmt.Fprintf(&b, "ansible_host: %s\n", yamlQuote(ansibleHost))
 	fmt.Fprintf(&b, "ansible_python_interpreter: /usr/bin/python3\n")
 	if role == "compute-only" {
 		fmt.Fprintf(&b, "\n")
 		fmt.Fprintf(&b, "# nftables substitution: the public-iface is the outbound interface the\n")
 		fmt.Fprintf(&b, "# postrouting chain MASQUERADES tenant overlay traffic on. Operators set\n")
 		fmt.Fprintf(&b, "# this to the box's WAN-facing NIC (e.g. ens5 on Hetzner, eth0 on bare metal).\n")
-		fmt.Fprintf(&b, "public_iface: %s\n", publicIface)
-		fmt.Fprintf(&b, "masquerade_cidr: %s\n", masqCIDR)
+		fmt.Fprintf(&b, "public_iface: %s\n", yamlQuote(publicIface))
+		fmt.Fprintf(&b, "masquerade_cidr: %s\n", yamlQuote(masqCIDR))
 		if masqCIDRv6 != "" {
-			fmt.Fprintf(&b, "masquerade_cidr_v6: %s\n", masqCIDRv6)
+			fmt.Fprintf(&b, "masquerade_cidr_v6: %s\n", yamlQuote(masqCIDRv6))
 		} else {
 			fmt.Fprintf(&b, "masquerade_cidr_v6: ''\n")
 		}
@@ -79,7 +92,7 @@ func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDR
 		if overlayCIDRs == "" {
 			fmt.Fprintf(&b, "overlay_cidrs: []\n")
 		} else {
-			fmt.Fprintf(&b, "overlay_cidrs: [%s]\n", overlayCIDRs)
+			fmt.Fprintf(&b, "overlay_cidrs: %s\n", yamlQuoteList(overlayCIDRs))
 		}
 	} else {
 		fmt.Fprintf(&b, "\n")
@@ -92,6 +105,51 @@ func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDR
 		fmt.Fprintf(&b, "# not \"0.0.0.0/0\".\n")
 		fmt.Fprintf(&b, "overlay_cidrs: []\n")
 	}
+	return b.String()
+}
+
+// yamlQuote returns a YAML double-quoted scalar for v. Always
+// quoted (even for already-safe values) so the diff is byte-stable
+// across reformattings. Backslashes and embedded double-quotes are
+// escaped per YAML 1.2 §5.2.
+func yamlQuote(v string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range v {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// yamlQuoteList wraps a comma-separated list into a flow-style YAML
+// sequence with each entry double-quoted. Empty input returns "[]".
+func yamlQuoteList(csv string) string {
+	if strings.TrimSpace(csv) == "" {
+		return "[]"
+	}
+	var b strings.Builder
+	b.WriteByte('[')
+	first := true
+	for _, f := range strings.Split(csv, ",") {
+		if !first {
+			b.WriteString(", ")
+		}
+		first = false
+		b.WriteString(yamlQuote(strings.TrimSpace(f)))
+	}
+	b.WriteByte(']')
 	return b.String()
 }
 
@@ -127,6 +185,14 @@ func updateHostsINIAddNode(path, fqdn, role string) ([]byte, error) {
 	groupSeen := false
 	for scanner.Scan() {
 		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		// Reset groupSeen on every group header — keeps the
+		// "append under the right group" logic honest when an
+		// earlier group was non-empty (the false-positive path
+		// otherwise finds the new fqdn in the wrong group).
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			groupSeen = trimmed == groupHeader
+		}
 		out.WriteString(line)
 		out.WriteByte('\n')
 		if !inserted && groupSeen && line != "" && !strings.HasPrefix(line, "#") && line != groupHeader {
@@ -136,14 +202,6 @@ func updateHostsINIAddNode(path, fqdn, role string) ([]byte, error) {
 			out.WriteString(fqdn)
 			out.WriteByte('\n')
 			inserted = true
-		}
-		if strings.TrimSpace(line) == groupHeader {
-			groupSeen = true
-			// Handle the degenerate case: an empty group section
-			// (only the header followed by a blank line or EOF).
-			// Lookahead: if the next non-blank line is the next
-			// group header, insert <fqdn> directly under the
-			// group's header.
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -159,22 +217,35 @@ func updateHostsINIAddNode(path, fqdn, role string) ([]byte, error) {
 		// Re-scan and insert directly under the header line.
 		scanner = bufio.NewScanner(strings.NewReader(string(body)))
 		out.Reset()
-		groupSeen = false
+		// `groupSeen` is set the moment we hit the target group
+		// header so the next iteration (which is the line UNDER
+		// the header) can decide whether to insert here or fall
+		// through to the data-line append path.
+		groupSeen := false
+		inserted = false
 		for scanner.Scan() {
 			line := scanner.Text()
-			if !inserted && groupSeen && strings.TrimSpace(line) == groupHeader {
-				out.WriteString(line)
-				out.WriteByte('\n')
+			trimmed := strings.TrimSpace(line)
+			if !inserted && groupSeen && trimmed == "" {
+				// We're on the first blank line under the target
+				// group header. Insert <fqdn> ahead of it: the
+				// preserved ordering is [header]\n<fqdn>\n(blank).
 				out.WriteString(fqdn)
 				out.WriteByte('\n')
 				inserted = true
-				continue
 			}
 			out.WriteString(line)
 			out.WriteByte('\n')
-			if strings.TrimSpace(line) == groupHeader {
+			if trimmed == groupHeader {
 				groupSeen = true
 			}
+		}
+		if !inserted {
+			// Group was the last section in the file (no blank
+			// line under it before EOF). Append at the end.
+			out.WriteString(fqdn)
+			out.WriteByte('\n')
+			inserted = true
 		}
 	}
 	return []byte(out.String()), nil

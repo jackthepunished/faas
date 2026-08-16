@@ -152,8 +152,13 @@ func TestCmdComputeNodesAdd_BadTargetURL(t *testing.T) {
 		url     string
 		wantErr string
 	}{
-		{"loopback-ipv4", "tcp://127.0.0.1:50051", "loopback"},
+		{"loopback-ipv4", "tcp://127.0.0.1:50051", "non-routable"},
 		{"any-address", "tcp://0.0.0.0:50051", "non-routable"},
+		{"loopback-ipv6", "tcp://[::1]:50051", "non-routable"},
+		{"unspecified-ipv6", "tcp://[::]:50051", "non-routable"},
+		{"link-local-ipv6", "tcp://[fe80::1]:50051", "non-routable"},
+		{"private-ipv4", "tcp://10.42.0.1:50051", "non-routable"},
+		{"private-ipv6-ula", "tcp://[fc00::1]:50051", "non-routable"},
 		{"missing-port", "tcp://vmmd-3.faas", "missing port"},
 		{"missing-scheme", "vmmd-3.faas:50051", "scheme must be"},
 		{"unix-empty", "unix://", "with empty path"},
