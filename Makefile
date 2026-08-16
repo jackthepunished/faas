@@ -393,8 +393,23 @@ ha-write-redirect-drill: ## Tier A9 / ADR-089: standby write-redirect drill on t
 	  exit 0'
 
 .PHONY: lint
-lint: egress-check lint-incompatible-mods ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate
+lint: egress-check lint-incompatible-mods image-validate ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate + packer-builder syntax (ADR-111)
 	@$(GO) tool golangci-lint run
+
+# ADR-111: packer-builder syntax gate. Delegates to deploy/packer/Makefile:image-validate,
+# which loops `packer validate -syntax-only` over every *.pkr.hcl. Works
+# without cloud creds; gates PR #928. install-packer.sh is the deterministic
+# installer. The outer target SKIPS when packer isn't on PATH (CI installs it
+# via scripts/install-packer.sh in the packer-validate job before invoking
+# `make image-validate`); a dev box without packer isn't broken — install via
+# `scripts/install-packer.sh` and rerun.
+.PHONY: image-validate
+image-validate: ## ADR-111 Packer-builder syntax gate (skips when packer not on PATH; CI installs)
+	@if command -v packer >/dev/null 2>&1; then \
+	  $(MAKE) -C deploy/packer image-validate; \
+	else \
+	  echo "image-validate: SKIP (packer not on PATH — install via scripts/install-packer.sh)"; \
+	fi
 
 .PHONY: scan
 scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (issue #299)
