@@ -141,7 +141,7 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "release",
 		DocSlug: "release",
-		Short:   "Cluster-shipped release bundle (release bundle|install --git-sha SHA; PR-3 / ADR-110)",
+		Short:   "Cluster-shipped release bundle (release bundle|install|kgv --git-sha SHA; PR-3 / ADR-110, PR-B / ADR-113)",
 		Subcommands: []cliSub{
 			{
 				Name:  subReleaseBundle,
@@ -161,6 +161,22 @@ var cliCommands = []cliCommand{
 					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
 					{Name: "node", Short: "compute_nodes.name to stamp (default: hostname)"},
 					{Name: "role", Short: "box role: control-plane|compute-only (ADR-112); empty = no role templating. Reads /etc/faas/first-boot.env's FAAS_BOX_ROLE when unset.", ClosedSet: []string{"", "control-plane", "compute-only"}},
+				},
+			},
+			{
+				// PR-B (ADR-113 day-2): operator escape hatch from the
+				// fail-closed SBoM CVE-baseline gate. The KGV is the
+				// "known good version" baseline the install path compares
+				// against; rotate re-stamps it from the on-disk release
+				// SBoM (or KGVZero with --from-zero). The KGV is
+				// operator-confirmed, never auto-rotated.
+				Name:  subReleaseKGV,
+				Short: "Refresh sbom-baseline.json (release kgv rotate --git-sha SHA [--from-zero]); operator escape hatch from ADR-113's fail-closed SBoM gate",
+				Flags: []cliFlag{
+					{Name: "git-sha", Short: "40-char lowercase hex git SHA (required)", Req: true},
+					{Name: "releases-root", Short: "releases root (default /opt/faas/releases)"},
+					{Name: "from-zero", Short: "write KGVZero (zero CRITICAL/HIGH) without parsing the on-disk SBoM"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
 				},
 			},
 		},

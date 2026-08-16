@@ -268,3 +268,67 @@ func TestSBOMBaseline_WriteRoundTrip(t *testing.T) {
 		t.Errorf("baseline body missing critical:1: %s", string(body))
 	}
 }
+
+// TestSBOM_ReadBaseline_RoundTrip asserts WriteBaseline + ReadBaseline
+// agree across the per-release tmp-then-rename publish path. PR-B
+// commit 1 surface.
+func TestSBOM_ReadBaseline_RoundTrip(t *testing.T) {
+	root := t.TempDir()
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+
+	want := releaseinstall.SBOMBaseline{
+		GitSHA: gitSHA,
+		Counts: releaseinstall.SBOMCounts{CriticalN: 3, HighN: 7, MediumN: 12, LowN: 4},
+	}
+	if err := releaseinstall.WriteBaseline(root, want); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	got, err := releaseinstall.ReadBaseline(root, gitSHA)
+	if err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	if got.GitSHA != want.GitSHA {
+		t.Errorf("git_sha round-trip: got %q, want %q", got.GitSHA, want.GitSHA)
+	}
+	if got.Counts != want.Counts {
+		t.Errorf("counts round-trip: got %+v, want %+v", got.Counts, want.Counts)
+	}
+}
+
+// TestSBOM_ReadBaseline_Missing asserts the missing-file path
+// returns ErrNilBaseline (not a wrapped os.IsNotExist). The
+// caller decides whether to init with KGVZero or fail closed;
+// the helper does not.
+func TestSBOM_ReadBaseline_Missing(t *testing.T) {
+	root := t.TempDir()
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	_, err := releaseinstall.ReadBaseline(root, gitSHA)
+	if !errors.Is(err, releaseinstall.ErrNilBaseline) {
+		t.Fatalf("missing baseline: got %v, want ErrNilBaseline", err)
+	}
+}
+
+// TestSBOM_ReadBaseline_Malformed asserts a non-JSON file
+// surfaces as a wrapped error (not ErrNilBaseline) so the
+// caller can distinguish "no baseline yet" from "baseline
+// corrupt".
+func TestSBOM_ReadBaseline_Malformed(t *testing.T) {
+	root := t.TempDir()
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	// Write a directory that has the baseline path as a regular
+	// file containing non-JSON bytes.
+	dir := releaseinstall.BundleRoot(root, gitSHA)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(releaseinstall.SBOMBaselinePath(dir), []byte("not json"), 0o644); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	_, err := releaseinstall.ReadBaseline(root, gitSHA)
+	if err == nil {
+		t.Fatalf("malformed baseline: want error, got nil")
+	}
+	if errors.Is(err, releaseinstall.ErrNilBaseline) {
+		t.Fatalf("malformed baseline: should not be ErrNilBaseline, got %v", err)
+	}
+}

@@ -329,6 +329,48 @@ func (t *Tarball) Extract(root string) error {
 	return nil
 }
 
+// ReadManifest re-loads the per-release manifest at
+// <root>/<git-sha>/release-manifest.json and overwrites
+// t.Manifest with its contents. The companion to Extract: after
+// the tarball has been unpacked into bin/, the on-disk manifest
+// (which is what AtomicFlip + Verify on disk actually reads) MUST
+// agree with t.Manifest (which is what Verify stamped the
+// Signature onto). PR-B's doctor verify-tarball-sbom probe uses
+// ReadManifest to give the operator a single source of truth
+// across the tarball-side and disk-side state.
+//
+// Errors:
+//   - manifest file missing → wraps os.IsNotExist error
+//   - JSON malformed or ValidateManifest fails → wraps the error
+func (t *Tarball) ReadManifest(root string) error {
+	if t == nil {
+		return errors.New("releaseinstall: nil tarball")
+	}
+	if t.GitSHA == "" {
+		return errors.New("releaseinstall: tarball missing git_sha")
+	}
+	m, err := Read(root, t.GitSHA)
+	if err != nil {
+		return fmt.Errorf("releaseinstall: read manifest: %w", err)
+	}
+	t.Manifest = m
+	return nil
+}
+
+// Signature returns the cosign cert identity stamped onto
+// t.Manifest by Verify. Empty string means Verify has not run
+// (or the tarball was constructed without going through the
+// canonical cosign path). PR-B's doctor verify-tarball-sbom
+// probe uses this getter for the per-release "signature=<identity>"
+// line in the JSON output. Returned by-value so callers can't
+// mutate the underlying Manifest.Signature field.
+func (t *Tarball) Signature() string {
+	if t == nil {
+		return ""
+	}
+	return t.Manifest.Signature
+}
+
 // SafeArchiveEntryName validates a tar.Header.Name and returns a
 // path-safe basename. The returned string is the ONLY value the
 // caller may pass to filepath.Join / os.WriteFile.

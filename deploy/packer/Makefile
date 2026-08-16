@@ -12,6 +12,12 @@
 #   make image-build-hcloud  — build + upload hcloud snapshot (requires HCLOUD_TOKEN)
 #   make image-build-amazon-ebs — build + register AWS AMI (requires AWS creds)
 #   make image-build-iso    — build bare-metal autoinstall ISO (no creds)
+#   make image-build-canary GIT_SHA=<sha> — publish canonical triple
+#                             (release.tar.gz + cosign bundle + SBoM) to
+#                             oci://ghcr.io/poyrazK/faas/release:v<sha> via
+#                             oras (ADR-113 PR-B). Requires cosign + syft +
+#                             oras on PATH; the existing `image-validate`
+#                             glob already syntax-validates this file.
 #   make image-list         — list every tagged image across clouds
 #   make image-test-first-boot IMAGE_TAG=<tag> ROLE=<role> — e2e: boot VM,
 #                             assert user-data, assert role templating
@@ -88,6 +94,19 @@ image-build-amazon-ebs: ## Build + register AWS AMI (requires AWS creds via env)
 .PHONY: image-build-iso
 image-build-iso: ## Build bare-metal autoinstall ISO (no cloud creds; output is an .iso)
 	$(PACKER) build $(BUILD_FLAGS) deploy/packer/iso.pkr.hcl
+
+# ---------------------------------------------------------------------------
+# ADR-113 PR-B (canonical daemon tarball) — OCI publish canary.
+# Distinct from the per-cloud image builds above: image-build-canary
+# is an *artifact* builder (it uses the null builder + shell) that
+# publishes the canonical triple (release.tar.gz + cosign bundle +
+# SBoM) to oci://ghcr.io/poyrazK/faas/release:v<git_sha>@sha256:<digest>.
+# Run from a host with cosign, syft, and oras on PATH.
+# ---------------------------------------------------------------------------
+.PHONY: image-build-canary
+image-build-canary: ## Publish canonical triple to OCI (requires cosign, syft, oras on PATH; git_sha via env or var)
+	@test -n "$(GIT_SHA)" || { echo "GIT_SHA required (40-char lowercase hex)" >&2; exit 1; }
+	$(PACKER) build $(BUILD_FLAGS) -var git_sha=$(GIT_SHA) deploy/packer/image-build-canary.pkr.hcl
 
 # ---------------------------------------------------------------------------
 # Inspect / list
