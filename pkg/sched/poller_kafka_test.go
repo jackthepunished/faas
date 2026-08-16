@@ -148,12 +148,12 @@ func TestKafka_NackPoisonSeekToOffset(t *testing.T) {
 	t.Parallel()
 
 	rdr := &poisonStrategyReader{}
-	k, id := kafkaNackFixture(rdr, 77)
+	k, _ := kafkaNackFixture(rdr, 77)
 	// Override the inFlight id for clarity (different offset).
 	k.inFlight = map[string]kafka.Message{
 		"0-77-200": {Topic: "orders.v1", Partition: 0, Offset: 77},
 	}
-	id = "0-77-200"
+	id := "0-77-200"
 	trig := sqlc.Trigger{BrokerPoisonStrategy: "seek-to-offset"}
 
 	if err := k.Nack(context.Background(), trig, []string{id}, triggerReasonPoisonRecord); err != nil {
@@ -183,11 +183,11 @@ func TestKafka_NackPoisonEmptyStrategyDefaultsToCommit(t *testing.T) {
 	t.Parallel()
 
 	rdr := &poisonStrategyReader{}
-	k, id := kafkaNackFixture(rdr, 99)
+	k, _ := kafkaNackFixture(rdr, 99)
 	k.inFlight = map[string]kafka.Message{
 		"0-99-300": {Topic: "orders.v1", Partition: 0, Offset: 99},
 	}
-	id = "0-99-300"
+	id := "0-99-300"
 	trig := sqlc.Trigger{BrokerPoisonStrategy: ""}
 
 	if err := k.Nack(context.Background(), trig, []string{id}, triggerReasonPoisonRecord); err != nil {
@@ -208,25 +208,25 @@ func TestKafka_NackPoisonEmptyStrategyDefaultsToCommit(t *testing.T) {
 func TestKafka_NackBrokerErrorAlwaysRewinds(t *testing.T) {
 	t.Parallel()
 
-	for _, strat := range []string{"commit", "seek-to-offset", ""} {
-		strat := strat
-		t.Run("strat="+strat, func(t *testing.T) {
+	for _, stratName := range []string{"commit", "seek-to-offset", ""} {
+		stratName := stratName
+		t.Run("strat="+stratName, func(t *testing.T) {
 			t.Parallel()
 
 			rdr := &poisonStrategyReader{}
 			k, id := kafkaNackFixture(rdr, 123)
-			trig := sqlc.Trigger{BrokerPoisonStrategy: strat}
+			trig := sqlc.Trigger{BrokerPoisonStrategy: stratName}
 
 			if err := k.Nack(context.Background(), trig, []string{id}, triggerReasonBrokerError); err != nil {
-				t.Fatalf("Nack strat=%q: %v", strat, err)
+				t.Fatalf("Nack strat=%q: %v", stratName, err)
 			}
 			rdr.mu.Lock()
 			defer rdr.mu.Unlock()
 			if rdr.poisonOp != poisonOpSetOffset {
-				t.Fatalf("broker_error strat=%q: poison op = %v, want %v (broker_error must always SetOffset)", strat, rdr.poisonOp, poisonOpSetOffset)
+				t.Fatalf("broker_error strat=%q: poison op = %v, want %v (broker_error must always SetOffset)", stratName, rdr.poisonOp, poisonOpSetOffset)
 			}
 			if len(rdr.offsets) != 1 || rdr.offsets[0] != 123 {
-				t.Fatalf("broker_error strat=%q: rewound offsets = %v, want [123]", strat, rdr.offsets)
+				t.Fatalf("broker_error strat=%q: rewound offsets = %v, want [123]", stratName, rdr.offsets)
 			}
 		})
 	}
