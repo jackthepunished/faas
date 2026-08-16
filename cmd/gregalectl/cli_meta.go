@@ -129,6 +129,41 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		// Multi-host scale-out gap #2 (companion to gap #1 closed by
+		// compute-nodes add). operator-side coordinator that writes
+		// host_vars/<fqdn>.yml + hosts.ini + commits + ssh bootstrap
+		// + POSTs the compute_nodes row. Closes the 5-step hand-curated
+		// runbook into a single command.
+		Name:    dispatchDeploy,
+		DocSlug: "deploy",
+		Short:   "Fleet topology coordinator (deploy add-node; multi-host scale-out gap #2)",
+		Subcommands: []cliSub{
+			{
+				Name:  "add-node",
+				Short: "Add a node to the fleet: write host_vars + hosts.ini + git commit + ssh bootstrap + POST compute_nodes",
+				Flags: []cliFlag{
+					{Name: "role", Short: "control-plane or compute-only (default: compute-only)"},
+					{Name: "ansible-host", Short: "cross-box dial target (required)"},
+					{Name: "public-iface", Short: "nftables substitution iface (compute-only only)"},
+					{Name: "masquerade-cidr", Short: "per-host overlay CIDR (compute-only only)"},
+					{Name: "masquerade-cidr-v6", Short: "ULA pool (compute-only only)"},
+					{Name: "overlay-cidrs", Short: "comma-separated multi-host mesh entries (compute-only only)"},
+					{Name: "target-url", Short: "compute_nodes target_url (compute-only only)"},
+					{Name: "vpcpus", Short: "compute_nodes row vCPU count (compute-only only)"},
+					{Name: "mem-mb", Short: "compute_nodes row RAM MB (compute-only only)"},
+					{Name: "max-concurrency", Short: "compute_nodes row max concurrent live instances (compute-only only)"},
+					{Name: "admission-ceiling-mb", Short: "compute_nodes row tenant RAM admission ceiling (compute-only only)"},
+					{Name: "ssh", Short: "SSH target for bootstrap (default: gregale@<fqdn>)"},
+					{Name: "skip-bootstrap", Short: "write host_vars + commit but do not SSH bootstrap"},
+					{Name: "skip-compute-nodes-post", Short: "do not POST the compute_nodes row after bootstrap"},
+					{Name: "repo-root", Short: "path to the cloned faas repo (default: ascend two levels)"},
+					{Name: "yes", Short: "skip the pre-flight confirmation prompt"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
+				},
+			},
+		},
+	},
+	{
 		Name:    "manifest",
 		DocSlug: "manifest",
 		Short:   "Operator split-box deployment manifest (manifest validate|render; issue #911 / ADR-110)",
