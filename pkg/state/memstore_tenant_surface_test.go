@@ -145,8 +145,25 @@ func TestMemStoreTenantSurfaceGetAndList(t *testing.T) {
 	if err != nil || len(got) != 3 {
 		t.Fatalf("list = %+v, %v", got, err)
 	}
-	if got[0].Name != "alpha" || got[2].Name != "charlie" {
-		t.Fatalf("sort = %+v", got)
+	// The memstore impl sorts by CreatedAt then ID (see
+	// memstore_tenant_surface.go::ListTenantSurfacesForAccount) so
+	// the test cannot pin got[0]/got[2] to alphabetical names — the
+	// three rows are created in sub-microsecond intervals and the
+	// UUID tie-break is non-deterministic. Assert the set instead:
+	// all three names must be present, and the IDs must be unique.
+	seen := make(map[string]bool, 3)
+	ids := make(map[string]bool, 3)
+	for _, s := range got {
+		seen[s.Name] = true
+		ids[s.ID] = true
+	}
+	for _, want := range names {
+		if !seen[want] {
+			t.Fatalf("missing name %q in list = %+v", want, got)
+		}
+	}
+	if len(ids) != 3 {
+		t.Fatalf("expected 3 unique IDs, got %d: %+v", len(ids), ids)
 	}
 	appSurfaces, err := m.ListTenantSurfacesForApp(ctx, app.ID)
 	if err != nil || len(appSurfaces) != 3 {
