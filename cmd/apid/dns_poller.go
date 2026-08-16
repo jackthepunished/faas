@@ -94,7 +94,7 @@ func (s *server) runVerifyOnce(ctx context.Context, log *slog.Logger) {
 			// dashboard "verified at" timeline keys off it.
 			if s.audit != nil {
 				s.audit.Emit(ctx, "tenant_hostname.verified", nil, map[string]any{
-					"hostname":  h.Hostname,
+					"hostname":   h.Hostname,
 					"surface_id": h.SurfaceID,
 				})
 			}

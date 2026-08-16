@@ -506,12 +506,12 @@ var methodRouteMap = map[string]string{
 	// (ListTenantSurfaces, CreateTenantSurface, etc.) so the
 	// explicit map drops the path-separator noise and keeps the SDK
 	// surface cohesive with the CLI (`gregale tenant-surfaces ...`).
-	"GET /v1/apps/{slug}/tenant-surfaces":                                                "ListTenantSurfaces",
-	"POST /v1/apps/{slug}/tenant-surfaces":                                               "CreateTenantSurface",
-	"GET /v1/apps/{slug}/tenant-surfaces/{id}":                                           "GetTenantSurface",
-	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}":                                        "DeleteTenantSurface",
-	"POST /v1/apps/{slug}/tenant-surfaces/{id}/hostnames":                                "AddTenantHostname",
-	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}":                   "RemoveTenantHostname",
+	"GET /v1/apps/{slug}/tenant-surfaces":                              "ListTenantSurfaces",
+	"POST /v1/apps/{slug}/tenant-surfaces":                             "CreateTenantSurface",
+	"GET /v1/apps/{slug}/tenant-surfaces/{id}":                         "GetTenantSurface",
+	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}":                      "DeleteTenantSurface",
+	"POST /v1/apps/{slug}/tenant-surfaces/{id}/hostnames":              "AddTenantHostname",
+	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}": "RemoveTenantHostname",
 }
 
 func main() {
