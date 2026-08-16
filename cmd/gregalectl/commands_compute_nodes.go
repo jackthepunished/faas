@@ -19,9 +19,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -32,15 +35,24 @@ import (
 // alongside the other dispatch* consts.
 const dispatchComputeNodes = "compute-nodes"
 
-// cmdComputeNodesDispatch fans to drain / drain-status / activate /
-// force-drain. Matches the (args []string) int signature every other
-// dispatch* arm uses (see commands_release.go:cmdReleaseDispatch).
+// cmdComputeNodesDispatch fans to add / drain / drain-status /
+// activate / force-drain. Matches the (args []string) int signature
+// every other dispatch* arm uses (see commands_release.go:cmdReleaseDispatch).
+//
+// `add` is the operator-side pre-registration path: it POSTs a row to
+// compute_nodes before vmmd has booted on the new box. The runbook's
+// `target_url` discipline (multi-host-rollout.md §3.5) makes this
+// order load-bearing — vmmd's self-registration UPSERT preserves the
+// operator's POSTed target_url via UpsertComputeNodeFromVmmd's
+// COALESCE, so the operator must land the row first.
 func cmdComputeNodesDispatch(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes: missing subcommand; want drain|drain-status|activate|force-drain")
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes: missing subcommand; want add|drain|drain-status|activate|force-drain")
 		return 2
 	}
 	switch args[0] {
+	case "add":
+		return cmdComputeNodesAdd(args[1:])
 	case "drain":
 		return cmdComputeNodesDrain(args[1:])
 	case "drain-status":
@@ -55,16 +67,39 @@ func cmdComputeNodesDispatch(args []string) int {
 	}
 }
 
+// computeNodesStoreOpener is the seam tests use to swap in a
+// MemStore without going through FAAS_PG_DSN. Production wires this
+// to openComputeNodesStore; tests wire to a MemStore-returning
+// helper via setComputeNodesStoreOpener.
+//
+// The opener returns a `close func()` instead of leaking the
+// *pgxpool.Pool back out — production wires close to pool.Close;
+// tests wire close to a no-op so the typed-nil pool never reaches
+// pgx internals. Keeps the seam minimal and test-friendly.
+var computeNodesStoreOpener = openComputeNodesStore
+
+// setComputeNodesStoreOpener is the test-only swap helper. NOT for
+// production use — the var is unexported so the only callers are
+// in the same package's _test.go files.
+func setComputeNodesStoreOpener(fn func() (state.Store, func(), error)) {
+	computeNodesStoreOpener = fn
+}
+
 // openComputeNodesStore wires a state.Store from FAAS_PG_DSN via the
 // existing openPgPoolFromEnv helper (commands_release.go:344). The
-// pool is returned alongside the store so the caller can close it.
-func openComputeNodesStore() (state.Store, *pgxpool.Pool, error) {
+// returned close func releases the pool when the caller defers it.
+func openComputeNodesStore() (state.Store, func(), error) {
 	pool, err := openPgPoolFromEnv()
 	if err != nil {
-		return nil, nil, fmt.Errorf("gregalectl compute-nodes: %w", err)
+		return nil, func() {}, fmt.Errorf("gregalectl compute-nodes: %w", err)
 	}
-	return state.NewPgStore(pool), pool, nil
+	return state.NewPgStore(pool), pool.Close, nil
 }
+
+// pgxpool reference kept so the build compiles when this file is the
+// only one that ever imported it — protects against future edits
+// deleting the import in a refactor.
+var _ = (*pgxpool.Pool)(nil)
 
 // cmdComputeNodesDrain runs `UPDATE compute_nodes SET active=false
 // WHERE id=<fqdn>` via state.Store.MarkComputeNodeInactive.
@@ -79,12 +114,12 @@ func cmdComputeNodesDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain: --node required")
 		return 2
 	}
-	st, pool, err := openComputeNodesStore()
+	st, closeFn, err := openComputeNodesStore()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer pool.Close()
+	defer closeFn()
 
 	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain:", err)
@@ -114,12 +149,12 @@ func cmdComputeNodesDrainStatus(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes drain-status: --node required")
 		return 2
 	}
-	st, pool, err := openComputeNodesStore()
+	st, closeFn, err := openComputeNodesStore()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer pool.Close()
+	defer closeFn()
 
 	ctx := context.Background()
 	insts, err := st.ListInstancesByNodeID(ctx, *node)
@@ -156,12 +191,12 @@ func cmdComputeNodesActivate(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate: --node required")
 		return 2
 	}
-	st, pool, err := openComputeNodesStore()
+	st, closeFn, err := openComputeNodesStore()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer pool.Close()
+	defer closeFn()
 
 	if err := st.SetComputeNodeActive(context.Background(), *node, true); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes activate:", err)
@@ -192,12 +227,12 @@ func cmdComputeNodesForceDrain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain: --yes required (live instances may be cold-evicted)")
 		return 2
 	}
-	st, pool, err := openComputeNodesStore()
+	st, closeFn, err := openComputeNodesStore()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer pool.Close()
+	defer closeFn()
 
 	if err := st.MarkComputeNodeInactive(context.Background(), *node); err != nil {
 		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes force-drain:", err)
@@ -205,4 +240,229 @@ func cmdComputeNodesForceDrain(args []string) int {
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "force-drained %s\n", *node)
 	return 0
+}
+
+// cmdComputeNodesAdd is the operator-side pre-registration entry
+// point for adding a compute node to the fleet. Mirrors the admin
+// POST handler at cmd/apid/compute_nodes.go:createOrUpdateComputeNode
+// (the apid handler is unchanged; this is a CLI wrapper that goes
+// straight to the state.Store via openComputeNodesStore).
+//
+// The `--from-file` flag is the bridge that PR-B's
+// `gregalectl deploy add-node` uses to invoke this subcommand with
+// a payload it builds in-memory. When `--from-file` is set, the
+// remaining flags are ignored; the JSON body must match
+// computeNodePayload's shape exactly.
+//
+// Field semantics mirror the apid handler's 400 surface so the
+// operator and the daemon agree on what "valid" means: zero-valued
+// capacity fields are a config bug, not a meaningful "I want a
+// node with zero RAM" state. target_url is validated against the
+// per-host dial-target discipline (rejecting loopback / 0.0.0.0 /
+// empty / missing scheme).
+func cmdComputeNodesAdd(args []string) int {
+	fs := flag.NewFlagSet("add", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	name := fs.String("name", "", "fqdn / short-hostname of the new node (required)")
+	targetURL := fs.String("target-url", "", "routable dial target for vmmd (tcp://vmmd-N.faas:50051 or unix://...)")
+	vpcpus := fs.Int("vpcpus", 0, "vCPU count reported to schedd")
+	memMB := fs.Int("mem-mb", 0, "RAM MB reported to schedd")
+	maxConc := fs.Int("max-concurrency", 0, "max concurrent live instances")
+	admCeil := fs.Int("admission-ceiling-mb", 0, "tenant RAM admission ceiling (85% of mem-mb for production nodes)")
+	fromFile := fs.String("from-file", "", "read a computeNodePayload-shaped JSON file instead of the per-field flags (PR-B bridge)")
+	jsonOut := fs.Bool("json", false, "emit structured JSON to stdout")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	var payload computeNodePayload
+	if *fromFile != "" {
+		body, err := os.ReadFile(*fromFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: read --from-file %s: %v\n", *fromFile, err)
+			return 1
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: parse --from-file %s: %v\n", *fromFile, err)
+			return 3
+		}
+	} else {
+		payload = computeNodePayload{
+			Name:               *name,
+			TargetURL:          *targetURL,
+			VPCPUs:             *vpcpus,
+			MemMB:              *memMB,
+			MaxConcurrency:     *maxConc,
+			AdmissionCeilingMB: *admCeil,
+		}
+	}
+
+	// Validation mirrors the apid 400 surface
+	// (cmd/apid/compute_nodes.go:createOrUpdateComputeNode). When
+	// --from-file is used the operator may not know the per-field
+	// shape; emitting the same messages keeps the runbook's
+	// "curl returned 400 because X" line true whether the operator
+	// ran curl or this CLI.
+	if payload.Name == "" {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes add: --name required")
+		return 2
+	}
+	if !validComputeNodeName(payload.Name) {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: --name %q is not a valid fqdn (must match ^[a-z0-9][a-z0-9.\\-]{0,62}[a-z0-9]$)\n", payload.Name)
+		return 2
+	}
+	if payload.TargetURL == "" {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes add: --target-url required (unix:///... or tcp://...)")
+		return 2
+	}
+	if err := validDialTargetURL(payload.TargetURL); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: --target-url invalid: %v\n", err)
+		return 2
+	}
+	if payload.VPCPUs <= 0 || payload.MemMB <= 0 || payload.MaxConcurrency <= 0 || payload.AdmissionCeilingMB <= 0 {
+		fmt.Fprintln(os.Stderr, "gregalectl compute-nodes add: vpcpus, mem-mb, max-concurrency, admission-ceiling-mb must all be > 0")
+		return 2
+	}
+
+	st, closeFn, err := computeNodesStoreOpener()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer closeFn()
+
+	row, err := st.UpsertComputeNodeFromOperator(context.Background(), state.ComputeNode{
+		Name:               payload.Name,
+		TargetURL:          payload.TargetURL,
+		VPCPUs:             payload.VPCPUs,
+		MemMB:              payload.MemMB,
+		MaxConcurrency:     payload.MaxConcurrency,
+		AdmissionCeilingMB: payload.AdmissionCeilingMB,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: upsert: %v\n", err)
+		return 1
+	}
+
+	// `compute_node_changed` pg_notify trigger (migration 00026) fires
+	// on the UPSERT; the operator's manual curl + jq workflow and
+	// this CLI share the same fan-out, so the runbook's "wait for
+	// pg_notify" paragraph stays accurate. We emit a single line on
+	// stderr naming the trigger channel so operators reading the
+	// log can correlate.
+	if _, err := fmt.Fprintln(os.Stderr, "compute_node_changed pg_notify fired (channel: compute_node_changed; subscribers: schedd, gatewayd-internal)"); err != nil {
+		return 1
+	}
+	if *jsonOut {
+		return emitComputeNodeAddedJSON(os.Stdout, row)
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "OK name=%s id=%s target_url=%s vpcpus=%d mem_mb=%d max_concurrency=%d admission_ceiling_mb=%d\n",
+		row.Name, row.ID, row.TargetURL, row.VPCPUs, row.MemMB, row.MaxConcurrency, row.AdmissionCeilingMB)
+	return 0
+}
+
+// computeNodePayload is the JSON shape consumed by --from-file.
+// Mirrors cmd/apid/compute_nodes.go:computeNodePayload exactly so
+// PR-B's deploy add-node can write the same payload to a scratch
+// file and pass it through.
+type computeNodePayload struct {
+	Name               string `json:"name"`
+	TargetURL          string `json:"target_url"`
+	VPCPUs             int    `json:"vpcpus"`
+	MemMB              int    `json:"mem_mb"`
+	MaxConcurrency     int    `json:"max_concurrency"`
+	AdmissionCeilingMB int    `json:"admission_ceiling_mb"`
+}
+
+// emitComputeNodeAddedJSON writes the upserted row as structured
+// JSON to w. Kept as a free function so tests can call it with a
+// bytes.Buffer without touching os.Stdout directly.
+func emitComputeNodeAddedJSON(w io.Writer, row state.ComputeNode) int {
+	body, err := json.Marshal(struct {
+		Name               string `json:"name"`
+		ID                 string `json:"id"`
+		TargetURL          string `json:"target_url"`
+		VPCPUs             int    `json:"vpcpus"`
+		MemMB              int    `json:"mem_mb"`
+		MaxConcurrency     int    `json:"max_concurrency"`
+		AdmissionCeilingMB int    `json:"admission_ceiling_mb"`
+		Active             bool   `json:"active"`
+	}{
+		Name: row.Name, ID: row.ID, TargetURL: row.TargetURL,
+		VPCPUs: row.VPCPUs, MemMB: row.MemMB,
+		MaxConcurrency: row.MaxConcurrency, AdmissionCeilingMB: row.AdmissionCeilingMB,
+		Active: row.Active,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: marshal json: %v\n", err)
+		return 1
+	}
+	if _, err := w.Write(body); err != nil {
+		fmt.Fprintf(os.Stderr, "gregalectl compute-nodes add: write json: %v\n", err)
+		return 1
+	}
+	_, _ = w.Write([]byte("\n"))
+	return 0
+}
+
+// validComputeNodeName is the local mirror of the apid handler's
+// name check. Kept minimal: short fqdn or short-hostname, lowercase,
+// no leading/trailing dashes, dot-allowed.
+func validComputeNodeName(name string) bool {
+	if len(name) == 0 || len(name) > 63 {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '-':
+			if i == 0 || i == len(name)-1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validDialTargetURL rejects loopback / unspecified / missing-scheme
+// targets. Cross-box dial discipline (multi-host-rollout.md §3.5):
+// `0.0.0.0` resolves to the local host's own vmmd, not the second
+// box; `127.0.0.1` is loopback-only. The remaining schemes
+// (tcp://, unix://) match pkg/wire/grpc.go's URL parser.
+func validDialTargetURL(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("empty target_url")
+	}
+	switch {
+	case strings.HasPrefix(raw, "tcp://"):
+		host := strings.TrimPrefix(raw, "tcp://")
+		if host == "" {
+			return fmt.Errorf("tcp:// with empty host")
+		}
+		if host == "0.0.0.0" || strings.HasPrefix(host, "0.0.0.0:") {
+			return fmt.Errorf("tcp://0.0.0.0 is non-routable from a peer box; use the box's overlay or routable IP")
+		}
+		if host == "127.0.0.1" || strings.HasPrefix(host, "127.0.0.1:") {
+			return fmt.Errorf("tcp://127.0.0.1 is loopback; peer boxes cannot dial")
+		}
+		if !strings.Contains(host, ":") {
+			return fmt.Errorf("tcp:// host missing port")
+		}
+		return nil
+	case strings.HasPrefix(raw, "unix://"):
+		if raw == "unix://" {
+			return fmt.Errorf("unix:// with empty path")
+		}
+		return nil
+	case strings.HasPrefix(raw, "dns://"):
+		if raw == "dns://" {
+			return fmt.Errorf("dns:// with empty hostname")
+		}
+		return nil
+	default:
+		return fmt.Errorf("scheme must be tcp://, unix://, or dns:// (got %q)", raw)
+	}
 }

@@ -100,11 +100,28 @@ var cliCommands = []cliCommand{
 		// PR-911 image rollout (PR #929 mega; ADR-110 + ADR-111). Operator
 		// surfaces draining + activation of compute_nodes rows so the
 		// deployctl upgrade-node orchestrator can reason about which box
-		// is eligible for placement.
+		// is eligible for placement. The `add` verb is the operator-side
+		// pre-registration path — it POSTs a row before vmmd boots on the
+		// new box (multi-host scale-out gap #1; PR-A in the
+		// tier-1-scaleout pair).
 		Name:    dispatchComputeNodes,
 		DocSlug: "compute-nodes",
-		Short:   "Compute-node state machine (compute-nodes drain|drain-status|activate|force-drain)",
+		Short:   "Compute-node state machine (compute-nodes add|drain|drain-status|activate|force-drain)",
 		Subcommands: []cliSub{
+			{
+				Name:  "add",
+				Short: "Pre-register a compute node (POST /v1/compute-nodes; the operator's target_url wins on conflict)",
+				Flags: []cliFlag{
+					{Name: "name", Short: "fqdn / short-hostname of the new node (required)"},
+					{Name: "target-url", Short: "routable dial target for vmmd (tcp://vmmd-N.faas:50051 or unix://...)"},
+					{Name: "vpcpus", Short: "vCPU count reported to schedd"},
+					{Name: "mem-mb", Short: "RAM MB reported to schedd"},
+					{Name: "max-concurrency", Short: "max concurrent live instances"},
+					{Name: "admission-ceiling-mb", Short: "tenant RAM admission ceiling (85% of mem-mb for production nodes)"},
+					{Name: "from-file", Short: "JSON payload matching computeNodePayload (PR-B bridge)"},
+					{Name: "json", Short: "emit structured JSON to stdout"},
+				},
+			},
 			{Name: "drain", Short: "Mark the node inactive (UPDATE compute_nodes SET active=false)"},
 			{Name: "drain-status", Short: "Report whether any live instances remain on the node (exit 1 if so)"},
 			{Name: "activate", Short: "Re-mark the node active (UPDATE compute_nodes SET active=true)"},
