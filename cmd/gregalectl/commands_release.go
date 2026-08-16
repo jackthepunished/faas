@@ -409,7 +409,7 @@ func cmdReleaseInstall(args []string) int {
 	//   (c) SBoM file present and parseable → run Diff vs baseline.
 	//       Baseline MUST exist (fail-closed: missing baseline is
 	//       ErrNilBaseline wrapped; the operator must run
-	//       `release KGV init` from PR-B to accept the SBoM).
+	//       `release KGV rotate` from PR-B to accept the SBoM).
 	//
 	// The error message names the regression class so operators
 	// can route the failure (roll back, rotate KGV, etc.).
@@ -432,18 +432,24 @@ func cmdReleaseInstall(args []string) int {
 				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: parse sbom: %v\n", parseErr)
 				return 3
 			}
-			baseline, baseErr := readSBOMBaseline(*releasesRoot, *gitSHA)
+			baseline, baseErr := releaseinstall.ReadBaseline(*releasesRoot, *gitSHA)
 			if baseErr != nil {
 				// Review finding #3: missing baseline is
 				// fail-closed. The operator must explicitly
 				// accept the SBoM by writing a baseline
-				// (PR-B's `release KGV init`); today the
+				// (PR-B's `release KGV rotate`); today the
 				// operator can do it by running any prior
 				// release once and rotating, OR by hand-
 				// writing the baseline file. We surface the
 				// underlying error to make the next step
 				// obvious.
-				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: SBoM gate requires a prior baseline (none at %s): %v\n",
+				if errors.Is(baseErr, releaseinstall.ErrNilBaseline) {
+					_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: SBoM gate requires a prior baseline (none at %s).\n"+
+						"  run: gregalectl release kgv rotate --git-sha %s [--from-zero]\n",
+						releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(*releasesRoot, *gitSHA)), *gitSHA)
+					return 3
+				}
+				_, _ = fmt.Fprintf(os.Stderr, "gregalectl release install: read SBoM baseline at %s: %v\n",
 					releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(*releasesRoot, *gitSHA)), baseErr)
 				return 3
 			}
@@ -632,23 +638,6 @@ func sbomOnDiskPath(releasesRoot, gitSHA string) (string, error) {
 		return "", err
 	}
 	return p, nil
-}
-
-// readSBOMBaseline reads the on-disk per-release SBoM baseline.
-// Returns the parsed baseline + nil on success. Returns
-// os.ErrNotExist-shaped errors when the file is missing (the
-// caller treats that as "no prior baseline, skip the gate").
-func readSBOMBaseline(releasesRoot, gitSHA string) (releaseinstall.SBOMBaseline, error) {
-	var b releaseinstall.SBOMBaseline
-	p := releaseinstall.SBOMBaselinePath(releaseinstall.BundleRoot(releasesRoot, gitSHA))
-	body, err := os.ReadFile(p)
-	if err != nil {
-		return b, err
-	}
-	if err := json.Unmarshal(body, &b); err != nil {
-		return b, fmt.Errorf("decode baseline: %w", err)
-	}
-	return b, nil
 }
 
 // installViaTarball is the canonical ADR-113 install path. It
