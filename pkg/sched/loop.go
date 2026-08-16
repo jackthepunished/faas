@@ -774,6 +774,15 @@ func floorTick(t *time.Ticker) <-chan time.Time {
 	return t.C
 }
 
+// httpUnixBasePrefix is the synthesized URL prefix for
+// gatewayd-internal when dialed over a unix socket. The dialer
+// writes bytes directly to the socket, so the request line carries
+// "http://<path>" — this constant is shared by DialGatewaySynth,
+// DialGatewaySynthTarget, and HTTPClientForGatewaySynthTarget so
+// goconst doesn't flag the string literal three times across the
+// three sibling functions.
+const httpUnixBasePrefix = "http://unix"
+
 // MaxParksPerTickPerApp bounds the aggressive-reaper (issue #171)
 // per-app per-tick park count. Without a cap, a single tick could
 // block the reaper for `N × ~150 ms` ≈ 7.5 s on a 50-instance
@@ -1722,7 +1731,7 @@ func DialGatewaySynth(socketPath string, log *slog.Logger) (GatewaySynth, error)
 	c := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 	return &httpGatewaySynth{
 		client:     c,
-		basePrefix: "http://unix",
+		basePrefix: httpUnixBasePrefix,
 		log:        log,
 	}, nil
 }
@@ -1762,7 +1771,7 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 		}
 		return &httpGatewaySynth{
 			client:     &http.Client{Transport: tr, Timeout: 30 * time.Second},
-			basePrefix: "http://unix",
+			basePrefix: httpUnixBasePrefix,
 			log:        log,
 		}, nil
 	case wire.SchemeTCP, wire.SchemeDNS:
@@ -1825,7 +1834,7 @@ func HTTPClientForGatewaySynthTarget(target string) (*http.Client, string, error
 				return net.Dial("unix", t.Address)
 			},
 		}
-		return &http.Client{Transport: tr, Timeout: 60 * time.Second}, "http://unix", nil
+		return &http.Client{Transport: tr, Timeout: 60 * time.Second}, httpUnixBasePrefix, nil
 	case wire.SchemeTCP, wire.SchemeDNS:
 		scheme := "http"
 		return &http.Client{Timeout: 60 * time.Second}, scheme + "://" + t.Address, nil
