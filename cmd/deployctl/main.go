@@ -88,6 +88,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, "deployctl legacy-import:", err)
 			os.Exit(1)
 		}
+	case "upgrade-node":
+		// ADR-111 image rollout orchestrator. See upgrade.go for the
+		// full drain → wait → cloud-rollout → Probe-gate → activate
+		// flow. The function is exported as runUpgradeNode to keep the
+		// switch statement flat.
+		if err := runUpgradeNode(args); err != nil {
+			fmt.Fprintln(os.Stderr, "deployctl upgrade-node:", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "unknown subcommand:", cmd)
 		os.Exit(2)
