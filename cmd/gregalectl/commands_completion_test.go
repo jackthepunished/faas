@@ -25,15 +25,16 @@ func TestCompletion_ManifestDrift(t *testing.T) {
 	// Also walk the dispatch constants (constants.go) to recover
 	// the values behind `case dispatchFoo:` forms.
 	dispatchConsts := map[string]string{
-		"dispatchHostAge":  "host-age",
-		"dispatchPKI":      "pki",
-		"dispatchSignKeys": "sign-keys",
-		"dispatchNodeKey":  "node-key",
-		"dispatchBackup":   "backup",
-		"dispatchManifest": "manifest",
-		"dispatchRelease":  "release",
-		"dispatchDoctor":   "doctor",
-		"dispatchSecrets":  "secrets",
+		"dispatchHostAge":      "host-age",
+		"dispatchPKI":          "pki",
+		"dispatchSignKeys":     "sign-keys",
+		"dispatchNodeKey":      "node-key",
+		"dispatchBackup":       "backup",
+		"dispatchManifest":     "manifest",
+		"dispatchRelease":      "release",
+		"dispatchDoctor":       "doctor",
+		"dispatchSecrets":      "secrets",
+		"dispatchComputeNodes": "compute-nodes", // PR-911 image rollout (PR #929; ADR-110 + ADR-111)
 	}
 	caseNames, err := extractMainCaseArms(dispatchConsts)
 	if err != nil {
