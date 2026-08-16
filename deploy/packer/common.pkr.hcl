@@ -34,7 +34,7 @@ variable "role" {
 
   validation {
     condition     = contains(["control-plane", "compute-only"], var.role)
-    error_message = "role must be control-plane or compute-only (ADR-092)."
+    error_message = "Role must be control-plane or compute-only (ADR-092)."
   }
 }
 
@@ -57,7 +57,7 @@ variable "git_sha" {
 
   validation {
     condition     = can(regex("^[a-f0-9]{7,40}$", var.git_sha))
-    error_message = "git_sha must be a 7-40 char hex git short SHA. Override only for canary builds; production must use the manifest's release.git_sha."
+    error_message = "Git_sha must be a 7-40 char hex git short SHA. Override only for canary builds; production must use the manifest's release.git_sha."
   }
 }
 

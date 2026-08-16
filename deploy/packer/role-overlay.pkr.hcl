@@ -34,7 +34,7 @@ variable "role" {
 
   validation {
     condition     = contains(["control-plane", "compute-only"], var.role)
-    error_message = "role must be control-plane or compute-only (ADR-092)."
+    error_message = "Role must be control-plane or compute-only (ADR-092)."
   }
 }
 

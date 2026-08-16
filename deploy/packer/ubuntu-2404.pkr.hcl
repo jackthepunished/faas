@@ -36,7 +36,7 @@ variable "ubuntu_arch" {
 
   validation {
     condition     = var.ubuntu_arch == "amd64"
-    error_message = "ubuntu_arch must be amd64; arm64 nested-virt Lima boxes do NOT produce production images (see deploy/lima/README.md caveat)."
+    error_message = "Ubuntu_arch must be amd64; arm64 nested-virt Lima boxes do NOT produce production images (see deploy/lima/README.md caveat)."
   }
 }
 
