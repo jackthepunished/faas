@@ -27,7 +27,47 @@ ARG RAILPACK_VERSION=0.31.1
 # the VM boundary is the actual security perimeter (ADR-003).
 ARG BUILDKIT_VERSION=0.31.2
 
-FROM --platform=$TARGETPLATFORM debian:12-slim@sha256:REPLACE_ME_AT_MERGE_TIME
+# ---- guest-init version (issue #938 / PR-B / ADR-114) -------------------
+# Multi-arch builds CANNOT pre-stage guest-init in the build context because
+# both arches would overwrite the same host path (review finding #2 on PR
+# #940). Instead, build guest-init inside the Dockerfile via cross-compile
+# so each arch's binary lands in its own image. The Go builder base is
+# digest-pinned via images/Dockerfile.lock just like debian:12-slim below.
+# Issue #938: building guest-init inside the image (instead of in the
+# workflow) also lets the Lima local-build path stage a multi-arch rootfs
+# via buildx without per-arch file juggling.
+# Note: the version is intentionally baked into the FROM line (no ARG)
+# so images/Dockerfile.lock has a literal "golang:1.25.7" alias to
+# match against. Bumping the Go version is a two-step: change this
+# line, run `make images-lock-update` to refresh the lock and digest.
+# We use 1.25.7 (not 1.23.x) because go.mod in this repo declares
+# `go 1.25.7` and a `tool` directive that older Go versions reject
+# with `unknown directive: tool` (verified during PR #940 review).
+
+# ---- stage 1: build guest-init for the target arch -----------------------
+# Image registry digest pinned via images/Dockerfile.lock; make
+# images-lock-update resolves the current digest and rewrites BOTH
+# this line and the lock entry. The base manifest-list digest pins
+# every per-arch child manifest so buildx's per-arch resolution
+# stays race-free under multi-arch build (per-arch digests are not
+# stable across re-pulls, but the manifest-list digest is).
+# $TARGETPLATFORM is implicit on multi-arch FROM; the explicit
+# `--platform=` would emit a RedundantTargetPlatform warning.
+FROM golang:1.25.7@sha256:5a79b94c34c299ac0361fbb7c7fca6dc552e166b42341050323fa3ab137d7be9 AS guest-init-build
+WORKDIR /src
+# guest-init is a pure-Go binary; no submodule vendoring needed. The
+# repository is the build context, so COPY . picks up the whole tree.
+# .dockerignore (repo root) keeps secrets, .git, and local caches out.
+COPY . /src
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+      go build -trimpath -tags linux \
+        -o /out/faas-guest-init ./guest/init
+
+# ---- stage 2: assemble the runtime rootfs -------------------------------
+# See the stage 1 FROM above re: $TARGETPLATFORM handling.
+FROM debian:12-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 # Issue #197 B3.5: the `debian:12-slim` tag is mutable. The digest is
 # pinned via images/Dockerfile.lock; `make images-lock-update` resolves
 # the current registry digest and updates BOTH the lock and the FROM
@@ -65,11 +105,10 @@ RUN case "${TARGETARCH}" in \
     rm /tmp/railpack.tgz && \
     /usr/local/bin/railpack --version
 
-# guest-init is built by `make guest-init` (or by CI before the docker build)
-# and stamped in at image-build time. The kernel cmdline hands PID1 to this
-# binary regardless of app vs build mode (mode is decided by which manifest
-# file exists at /etc/faas/).
-COPY guest-init /usr/local/bin/faas-guest-init
+# guest-init copied from the build stage. Each arch's manifest receives the
+# arch-matching binary because buildx resolves TARGETARCH per image in the
+# multi-arch build — no host-side pre-build required, no overwrite bug.
+COPY --from=guest-init-build /out/faas-guest-init /usr/local/bin/faas-guest-init
 RUN chmod +x /usr/local/bin/faas-guest-init
 
 WORKDIR /build

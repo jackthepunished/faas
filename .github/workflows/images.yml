@@ -1,0 +1,257 @@
+# .github/workflows/images.yml — Gregale OCI base image pipeline (issue #938, ADR-114).
+#
+# Builds and publishes ghcr.io/onebox-faas/builder-base for linux/amd64
+# + linux/arm64 on every push to main. PR builds run against a local
+# registry service container and a post-build crane-based verification
+# step asserts /usr/local/bin/faas-guest-init exists in the just-pushed
+# image's amd64 manifest (the kernel-cmdline PID1 binary every
+# builder microVM hands control to — see images/builder-base.Dockerfile).
+#
+# guest-init is built INSIDE the Dockerfile via a multi-stage cross-
+# compile (see images/builder-base.Dockerfile stage 1). Each arch's
+# manifest receives the arch-matching binary because buildx resolves
+# TARGETARCH per image in the multi-arch build — no host-side pre-
+# build, no overwrite bug (review finding #2 on PR #940).
+#
+# Why a separate workflow (not an extension of ci.yml):
+#  - ci.yml is the Go bundle (test, unit-tests-pg-*, metal, migrations,
+#    spec-check) with concurrency: cancel-in-progress on PR pushes —
+#    adding docker buildx jobs there would cancel each other and bloat
+#    the bundle.
+#  - This workflow needs packages:write to push to ghcr.io; scoping it
+#    to its own file keeps the elevated permission minimal.
+#
+# Trigger paths: changes to the Dockerfile, the digest lock, the
+# guest-init source, or this workflow file. workflow_dispatch is the
+# manual reroll path (e.g. after a BuildKit / Railpack bump).
+#
+# Why a service container for the local registry (PR #940 CI follow-
+# up, runs #1–#7): seven prior attempts all failed.
+#   #1 `docker run -d --network=host`           (ex44/local mental model)
+#   #2 `docker run -d -p 5000:5000`             (first workflow revision)
+#   #3 services:registry + ports[5000] (numeric index) — actionlint
+#      error: property access on string-keyed map.
+#   #4 services:registry + ports['5000'] + step-level env — YAML
+#      validated, but the curl/wait loop hung past its 30-iter
+#      ceiling for the full job timeout.
+#   #5 `localhost:5000` everywhere + custom buildkit driver — the
+#      curl/wait loop succeeded (curl on the runner namespace hits
+#      the bridge gateway), but the buildx push (running inside a
+#      separate `moby/buildkit:v0.31.2` container) hit
+#      `dial tcp [::1]:5000: connect: connection refused`.
+#   #6 `registry:5000` (service label) everywhere — runner's curl
+#      cannot resolve the label (DNS resolver doesn't try the
+#      docker bridge network); step 7 failed fast.
+#   #7 dual namespace (`localhost:5000` for runner, `registry:5000`
+#      for push) — step 7 succeeded, but buildkitd also could
+#      not resolve `registry` (`no such host`); buildkitd also
+#      defaulted to https:// for an HTTP-only endpoint.
+# Resolution (run #8+): one network, one address.
+#   - `driver-opts: network=host` puts buildkitd on the runner's
+#     host network namespace, where `localhost:5000` resolves to
+#     the same registry port-published to the runner's loopback
+#     (verified on runs #5 and #7: step 7's curl GET /v2/ → 200
+#     in <1s).
+#   - `BUILDKIT_TLS_VERIFY=0` env on step 9 stops buildkit from
+#     upgrading the push to https:// for an HTTP-only registry.
+# Service containers stay alive for the entire 25-min job —
+# sidestepping the death-mid-build bug that killed run #1/#2.
+
+name: images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'images/builder-base.Dockerfile'
+      - 'images/Dockerfile.lock'
+      - '.github/workflows/images.yml'
+      - 'guest/init/**'
+  pull_request:
+    paths:
+      - 'images/builder-base.Dockerfile'
+      - 'images/Dockerfile.lock'
+      - '.github/workflows/images.yml'
+      - 'guest/init/**'
+  workflow_dispatch:
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write   # ghcr.io/onebox-faas push (GITHUB_TOKEN)
+
+jobs:
+  builder-base:
+    name: builder-base (linux/amd64 + linux/arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Issue #938 / PR-B / ADR-114: PR builds push to a local
+    # registry service container so the verify step can `crane
+    # export` the just-built image. Service containers stay
+    # alive for the entire 25-min job — the docker-bridge-vs-
+    # host-net ambiguity and container-OOM issues from earlier
+    # attempts (PR #940 CI follow-ups) are sidestepped by
+    # GitHub's job-lifecycle guarantees.
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    env:
+      IMAGE_NAME: ghcr.io/onebox-faas/builder-base
+      BUILDKIT_VERSION: "0.31.2"
+      RAILPACK_VERSION: "0.31.1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - uses: docker/setup-buildx-action@v3
+        # `driver-opts: network=host` puts the buildkitd container
+        # on the runner's host network namespace. That makes
+        # `localhost:5000` resolve the same way in both namespaces:
+        #   - the runner's curl probes `localhost:5000` via the
+        #     service container's port publish to the runner's
+        #     loopback (verified in run #32013676953 — step 7's
+        #     curl GET /v2/ → 200 succeeded in <1s);
+        #   - buildkitd's push to `localhost:5000` also reaches the
+        #     same registry without needing DNS for the
+        #     `registry` service label (which only resolves inside
+        #     `github_network_*`, which neither namespace's DNS
+        #     can see, hence the `no such host` failure on
+        #     run #32013676953).
+        # Earlier attempts:
+        #   - default driver + service label `registry:5000` →
+        #     `dial tcp: lookup registry on 168.63.129.16:53: no
+        #     such host` (DNS lookup misses; also no network join).
+        #   - explicit `image=moby/buildkit:v0.31.2` driver +
+        #     `localhost:5000` → `dial tcp [::1]:5000: connect:
+        #     connection refused` (custom container is on its own
+        #     namespace; no host loopback).
+        # `network=host` sidesteps both.
+        with:
+          driver-opts: network=host
+
+      - name: Login to ghcr.io
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Wait probe: hit `localhost:5000` from the runner's namespace.
+      # With `driver-opts: network=host` on setup-buildx-action
+      # (step 5), buildkitd's namespace shares this view — the same
+      # `localhost:5000` works from buildkitd's push step below.
+      # Earlier service-label (`registry:5000`) and dual-namespace
+      # approaches both fell over (DNS lookup fails; custom
+      # buildkit containers don't share the loopback).
+      - name: Wait for registry (PR / dispatch)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf --connect-timeout 2 --max-time 3 \
+                 http://localhost:5000/v2/ >/dev/null; then
+              echo "registry ready on localhost:5000 (runner namespace)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::local registry did not become ready"
+          exit 1
+
+      - name: Build + push (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg BUILDKIT_VERSION \
+            --build-arg RAILPACK_VERSION \
+            --tag "${IMAGE_NAME}:latest" \
+            --tag "${IMAGE_NAME}:${GITHUB_SHA::12}" \
+            --push \
+            -f images/builder-base.Dockerfile .
+
+      - name: Build + push (PR / dispatch)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        env:
+          # buildkit (the daemon behind `docker buildx`) defaults
+          # to https:// for any registry endpoint it doesn't
+          # recognize as plaintext. The local registry on
+          # `localhost:5000` serves plain HTTP only; this env tells
+          # buildkit to skip the TLS upgrade.
+          BUILDKIT_TLS_VERIFY: "0"
+        run: |
+          # Build against `localhost:5000`. The buildkitd container
+          # is on the runner's host network (driver-opts above), so
+          # `localhost:5000` resolves to the same port-published
+          # registry as the runner's curl. Multi-arch with cross-
+          # compiled guest-init so each manifest carries the arch-
+          # matching /usr/local/bin/faas-guest-init binary
+          # (review finding #2 on PR #940).
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg BUILDKIT_VERSION \
+            --build-arg RAILPACK_VERSION \
+            --tag "localhost:5000/pr-${GITHUB_SHA::12}" \
+            --push \
+            -f images/builder-base.Dockerfile .
+
+      # Verify the linux/amd64 manifest in the just-built (or
+      # just-pushed) image contains /usr/local/bin/faas-guest-init.
+      # The Lima local-build path checks the same thing at
+      # deploy/lima/faas-metal.yaml:482-490; this is the CI
+      # equivalent. imaged rejects manifest lists at
+      # cmd/imaged/main.go:392-401 so operators will pin the
+      # amd64-specific digest via `crane digest --platform
+      # linux/amd64`.
+      - name: Verify faas-guest-init is in the image
+        run: |
+          set -euo pipefail
+          # Earlier attempts called `go install
+          # github.com/google/go-containerregistry/cmd/crane@latest`
+          # which surfaced exit 127 ('command not found') on
+          # Ubuntu 24.04 GitHub runners: go-containerregistry
+          # v0.21.9 requires Go ≥ 1.25.0, so go install switched
+          # the toolchain to go1.25.13 and dropped the binary in
+          # $GOPATH/bin, which isn't on the step's PATH by
+          # default. Skip the toolchain dance and install a
+          # static pre-built crane from the upstream release
+          # tarball instead — same code, no Go-toolchain auto-
+          # fetch race, lands at an absolute path.
+          curl -fsSL -o /tmp/crane.tgz \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.1/go-containerregistry_Linux_x86_64.tar.gz
+          tar -C /usr/local/bin -xzf /tmp/crane.tgz crane
+          chmod +x /usr/local/bin/crane
+          rm /tmp/crane.tgz
+          if [ "${GITHUB_REF_NAME:-}" = "main" ] && \
+             [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            REF="${IMAGE_NAME}:latest"
+          else
+            # Verify step runs from the runner namespace; the
+            # published port is reachable via the bridge
+            # gateway at localhost:5000 (same as step 7).
+            REF="localhost:5000/pr-${GITHUB_SHA::12}"
+          fi
+          DIGEST=$(crane manifest "${REF}" 2>/dev/null | \
+            jq -r '.manifests[] | select(.platform.architecture=="amd64").digest')
+          if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "null" ]; then
+            echo "::error::no amd64 manifest in ${REF}"
+            exit 1
+          fi
+          crane export "${REF}@${DIGEST}" /tmp/rootfs.tar
+          mkdir -p /tmp/rootfs && tar -xf /tmp/rootfs.tar -C /tmp/rootfs
+          if [ ! -x /tmp/rootfs/usr/local/bin/faas-guest-init ]; then
+            echo "::error::faas-guest-init missing from ${REF}@${DIGEST}"
+            echo "The build pipeline produced a rootfs without the PID1"
+            echo "binary. Check images/builder-base.Dockerfile COPY path"
+            echo "and the guest-init build stage."
+            exit 1
+          fi
+          echo "OK: ${REF}@${DIGEST} contains /usr/local/bin/faas-guest-init"
