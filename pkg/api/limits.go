@@ -1943,8 +1943,12 @@ const (
 	// Retry-After for both the kind=maintenance edge rule and the
 	// apps.maintenance_mode coarse gate. Override via
 	// FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS env var (parsed
-	// at boot — see pkg/api/env.go for the env-loading helpers;
-	// the constant here is the default when the env var is unset).
+	// once at first read — see pkg/api/limits_env.go, NOT env.go,
+	// which owns the customer env-var DTOs). Read the effective
+	// value through EdgeRuleMaintenanceRetryAfter(); this constant
+	// is the default when the env var is unset or unparseable
+	// (issue #899 finding 3 — before that fix the override was
+	// documented here but never implemented).
 	// Applied in pkg/gateway.(*Handler).applyEdgeRuleMaintenance and
 	// pkg/gateway.(*Handler).applyAppsMaintenanceMode via
 	// api.WriteProblem + WithHeader, mirroring the existing

@@ -1163,7 +1163,12 @@ func compileMaintenanceRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleMai
 		// cap.
 		retry := r.Action.Maintenance.RetryAfterSeconds
 		if retry <= 0 {
-			retry = api.EdgeRuleMaintenanceRetryAfterSeconds
+			// Issue #899 finding 3: the platform default is
+			// operator-tunable via
+			// FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS.
+			// Unset env → api.EdgeRuleMaintenanceRetryAfterSeconds
+			// (60 s), so the pre-#899 behaviour is unchanged.
+			retry = api.EdgeRuleMaintenanceRetryAfter()
 		}
 		if retry > api.MaxEdgeRuleMaintenanceRetryAfterSeconds {
 			retry = api.MaxEdgeRuleMaintenanceRetryAfterSeconds

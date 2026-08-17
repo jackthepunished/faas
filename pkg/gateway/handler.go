@@ -1965,7 +1965,13 @@ func (h *Handler) applyAppsMaintenanceMode(w http.ResponseWriter, r *http.Reques
 	if !app.MaintenanceMode {
 		return false
 	}
-	api.WriteProblem(w, api.ErrAppMaintenanceMode(api.EdgeRuleMaintenanceRetryAfterSeconds, app.Slug))
+	// Issue #899 finding 3: the effective value, not the raw
+	// constant — api.EdgeRuleMaintenanceRetryAfter() honours the
+	// FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS override this
+	// docstring has always promised. The env is parsed once, so
+	// this stays a plain load on the hot path.
+	retryAfter := api.EdgeRuleMaintenanceRetryAfter()
+	api.WriteProblem(w, api.ErrAppMaintenanceMode(retryAfter, app.Slug))
 	if h.edgeRuleAudit != nil {
 		h.edgeRuleAudit.Emit(r.Context(), "app.maintenance_mode_match", nil, map[string]any{
 			"app_id":      app.ID,
@@ -1973,7 +1979,7 @@ func (h *Handler) applyAppsMaintenanceMode(w http.ResponseWriter, r *http.Reques
 			"from_host":   r.Host,
 			"method":      r.Method,
 			"path":        r.URL.Path,
-			"retry_after": api.EdgeRuleMaintenanceRetryAfterSeconds,
+			"retry_after": retryAfter,
 		})
 	}
 	if h.metrics != nil {

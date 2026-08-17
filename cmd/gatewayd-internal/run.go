@@ -1052,6 +1052,21 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// The wire-up happens AFTER the public-auth unseal so an
 	// operator who rotates host.age picks up the new envelope
 	// on the same boot — no separate restart needed.
+	// Issue #899 finding 3: surface a rejected
+	// FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS at boot. The
+	// gate itself falls back to the 60 s platform default, so this
+	// is a warning rather than a fatal — but a silently-ignored
+	// override is the kind of drift an operator only discovers
+	// mid-incident, which is the worst possible moment.
+	if err := api.EdgeRuleMaintenanceRetryAfterEnvErr(); err != nil {
+		log.Warn("gatewayd-internal: maintenance Retry-After override ignored; using platform default",
+			"default_seconds", api.EdgeRuleMaintenanceRetryAfterSeconds,
+			"err", err)
+	} else if v := api.EdgeRuleMaintenanceRetryAfter(); v != api.EdgeRuleMaintenanceRetryAfterSeconds {
+		log.Info("gatewayd-internal: maintenance Retry-After overridden",
+			"seconds", v,
+			"env", api.EnvEdgeRuleMaintenanceRetryAfterSeconds)
+	}
 	archiveCfg, archiveCfgErr := logarchive.ConfigFromEnv(os.Getenv, log)
 	switch {
 	case archiveCfgErr != nil:
