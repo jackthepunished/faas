@@ -60,13 +60,11 @@ func open(ctx context.Context, dsnOverride, appName string) (*pgxpool.Pool, erro
 	// operator must see in the unit's first log line — not a
 	// first-dial failure minutes later under load. See dsn.go for
 	// the rules and the rationale.
-	if err := validateDSN(dsn); err != nil {
-		return nil, err
-	}
-
-	cfg, err := pgxpool.ParseConfig(dsn)
+	// validateDSN hands back the parsed config so the DSN is parsed
+	// exactly once — the config we validated is the config we dial.
+	cfg, err := validateDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("db: parse config: %w", err)
+		return nil, err
 	}
 	// Sane defaults for a one-box daemon. schedd + imaged may subscribe via
 	// LISTEN which holds a connection for the lifetime of the daemon.

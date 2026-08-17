@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -52,6 +53,12 @@ import (
 
 // dsnDocsURL is stamped into every validation error so the operator
 // reading a failed unit start has somewhere to go.
+//
+// Duplication note (mirrors pkg/api/errors.go::docsBase): the host
+// must stay in lock-step with pkg/wire.DocsHost, which pkg/db cannot
+// import — pkg/wire/pgverifier.go imports pkg/db, so the dependency
+// would cycle. A docs-host rotation edits pkg/wire/docs.go,
+// pkg/api/errors.go, and this constant.
 const dsnDocsURL = "https://docs.gregale.dev/operations/database-dsn"
 
 // standardSocketDirs are the two directories a distro-packaged
@@ -60,37 +67,42 @@ const dsnDocsURL = "https://docs.gregale.dev/operations/database-dsn"
 var standardSocketDirs = []string{"/run/postgresql", "/var/run/postgresql"}
 
 // validateDSN checks a Postgres DSN for the shape rules above and
-// returns a nil error when the DSN is safe to dial. The returned
-// error names the offending field and carries the docs URL, per the
-// CLAUDE.md error convention.
+// returns the parsed config when the DSN is safe to dial. The
+// returned error names the offending field and carries the docs URL,
+// per the CLAUDE.md error convention.
+//
+// It returns the *pgxpool.Config rather than just an error so open()
+// can reuse it instead of parsing the same string twice — one parse,
+// one set of pgx defaulting decisions, no chance of the validated
+// config and the dialled config diverging.
 //
 // It never dials and never touches the environment: `dsn` is the
 // already-resolved string (override → DATABASE_URL →
 // FAAS_DATABASE_URL → built-in default), so the test corpus can
 // exercise every branch without a live cluster.
-func validateDSN(dsn string) error {
+func validateDSN(dsn string) (*pgxpool.Config, error) {
 	if strings.TrimSpace(dsn) == "" {
-		return fmt.Errorf("db: DSN is empty: set DATABASE_URL or FAAS_DATABASE_URL; see %s", dsnDocsURL)
+		return nil, fmt.Errorf("db: DSN is empty: set DATABASE_URL or FAAS_DATABASE_URL; see %s", dsnDocsURL)
 	}
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		// Wrapped, not re-derived: pgx's message already names the
 		// bad token, and re-parsing to say it differently would
 		// just drift from pgx's grammar.
-		return fmt.Errorf("db: DSN parse failed: %w; see %s", err, dsnDocsURL)
+		return nil, fmt.Errorf("db: DSN parse failed: %w; see %s", err, dsnDocsURL)
 	}
 	host := cfg.ConnConfig.Host
 	if host == "" {
-		return fmt.Errorf("db: DSN has no host: set host= (unix socket dir) or a TCP host; see %s", dsnDocsURL)
+		return nil, fmt.Errorf("db: DSN has no host: set host= (unix socket dir) or a TCP host; see %s", dsnDocsURL)
 	}
 
 	if strings.HasPrefix(host, "/") {
 		for _, dir := range standardSocketDirs {
 			if host == dir {
-				return nil
+				return cfg, nil
 			}
 		}
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"db: DSN host=%q is a unix socket outside the standard directories %v; see %s",
 			host, standardSocketDirs, dsnDocsURL)
 	}
@@ -98,10 +110,10 @@ func validateDSN(dsn string) error {
 	// TCP from here down. pgx defaults the port to 5432, so a zero
 	// here means the DSN carried an explicit 0.
 	if cfg.ConnConfig.Port == 0 {
-		return fmt.Errorf("db: DSN port=0 is not a valid TCP port; see %s", dsnDocsURL)
+		return nil, fmt.Errorf("db: DSN port=0 is not a valid TCP port; see %s", dsnDocsURL)
 	}
 	if isLoopbackHost(host) {
-		return nil
+		return cfg, nil
 	}
 	mode := sslModeOf(dsn)
 	if mode != "verify-full" {
@@ -109,12 +121,12 @@ func validateDSN(dsn string) error {
 		if shown == "" {
 			shown = "<unset, defaults to prefer>"
 		}
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"db: DSN sslmode=%s is not allowed for the remote host %q: only sslmode=verify-full "+
 				"authenticates the server (require and verify-ca do not); see %s",
 			shown, host, dsnDocsURL)
 	}
-	return nil
+	return cfg, nil
 }
 
 // isLoopbackHost reports whether host addresses this machine. Covers
@@ -154,7 +166,15 @@ func sslModeOf(dsn string) string {
 			rest = rest[at+1:]
 		}
 		if q := strings.Index(rest, "?"); q >= 0 {
-			return queryParam(rest[q+1:], "sslmode")
+			// url.ParseQuery is safe HERE but not on the whole
+			// DSN: the characters that break url.Parse live in
+			// the userinfo, which the scan above already
+			// removed. Using it gets %-unescaping for free.
+			vals, err := url.ParseQuery(rest[q+1:])
+			if err != nil {
+				return ""
+			}
+			return vals.Get("sslmode")
 		}
 		return ""
 	}
@@ -166,21 +186,6 @@ func sslModeOf(dsn string) string {
 		k, v, ok := strings.Cut(field, "=")
 		if ok && k == "sslmode" {
 			return strings.Trim(v, `'"`)
-		}
-	}
-	return ""
-}
-
-// queryParam pulls one key out of a raw URL query string. url.Parse
-// is avoided here because a DSN password may contain characters that
-// make the whole URL fail to parse — this function must still be able
-// to report the sslmode in that case, since the surrounding
-// validateDSN has already accepted the DSN via pgx.
-func queryParam(rawQuery, key string) string {
-	for _, pair := range strings.Split(rawQuery, "&") {
-		k, v, ok := strings.Cut(pair, "=")
-		if ok && k == key {
-			return v
 		}
 	}
 	return ""

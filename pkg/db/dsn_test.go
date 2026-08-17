@@ -91,10 +91,15 @@ func TestValidateDSN(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateDSN(tc.dsn)
+			cfg, err := validateDSN(tc.dsn)
 			if tc.wantErrSub == "" {
 				if err != nil {
 					t.Fatalf("expected accept, got %v", err)
+				}
+				// The accepted config is what open() dials, so
+				// it must come back usable, not nil.
+				if cfg == nil {
+					t.Fatal("accepted DSN returned a nil config")
 				}
 				return
 			}
@@ -118,7 +123,7 @@ func TestValidateDSN(t *testing.T) {
 // start on a box with no DATABASE_URL set — this test catches that at
 // `make test` instead of on the node.
 func TestValidateDSNDefaultsToProductionShape(t *testing.T) {
-	if err := validateDSN("postgres:///faas?host=/run/postgresql&user=faas"); err != nil {
+	if _, err := validateDSN("postgres:///faas?host=/run/postgresql&user=faas"); err != nil {
 		t.Fatalf("built-in default DSN must validate: %v", err)
 	}
 }
