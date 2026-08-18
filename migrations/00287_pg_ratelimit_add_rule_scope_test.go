@@ -11,14 +11,12 @@
 //       - PR #910 (00281-00283 trigger cluster)
 //       - PR #916 (00265-00272 jobs PR-B)
 //       - PR #939 (00266-00272 + 00276 gap-12)
-//       - PR #964 (00281-00285 + 00286 data-upstreams — 00281-00285
-//         from the original audit, 00286 added when PR #964 also
-//         renumbered its real schema to 00286 to dodge a 00285
-//         collision on their branch).
-//       - this PR (00287 widening + 00286 reservation fence
-//         to maintain contiguity after the second rename + a
-//         00285 reservation fence from the prior 00285 → 00286
-//         rename).
+//       - PR #964 MERGED (00281-00285 + 00286 data-upstreams
+//         widening landed on main after the previous 00285 → 00286
+//         → 00287 renumbering chain on this branch).
+//       - this PR (00287 widening; the 00285 reservation fence on
+//         the merged-into-main base now lives on main, claimed by
+//         this PR per the merge resolution).
 //     Re-verify against open PRs immediately before push via
 //     scripts/ci/check_migration_slots.sh.
 //  2. The pg_ratelimit_counters CHECK accepts the new value
