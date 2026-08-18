@@ -7,13 +7,14 @@
 //
 //  1. Migration set applies cleanly through 00286 (no goose
 //     duplicate-version panic). Slot 00286 was picked as the next
-//     free slot on origin/main (which ends at 00280 post-PR #959
-//     merge) past the open-PR reservations:
+//     free slot on origin/main past the open-PR reservations:
 //       - PR #910 (00281-00283 trigger cluster)
 //       - PR #916 (00265-00272 jobs PR-B)
 //       - PR #939 (00266-00272 + 00276 gap-12)
 //       - PR #964 (00281-00285 data-upstreams, expanded slot
-//         after the initial PR #964 audit at 00277-00281).
+//         after the initial PR #964 audit at 00277-00281)
+//       - this PR (00286 widening + 00285 reservation fence
+//         to maintain contiguity after the rename).
 //     Re-verify against open PRs immediately before push via
 //     scripts/ci/check_migration_slots.sh.
 //  2. The pg_ratelimit_counters CHECK accepts the new value
