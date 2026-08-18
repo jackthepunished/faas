@@ -1453,20 +1453,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// plain HTTP/1.1 JSON — different idle-pool shapes, different
 	// request timeouts.
 	//
-	// Audit finding #5: trigger batch dispatch is critical-path —
-	// every trigger wake funnels through /v1/invocations:dispatch_batch.
-	// A failed dial means the daemon would silently lose every
-	// wake, only surfacing the failure as a stack of dead-letter
-	// rows. Fail loud: the boot returns a typed error so the
-	// systemd unit restarts and an operator gets a journal signal.
-	// The cron synth dial above stays best-effort because cron is
-	// "should fire on schedule" while triggers are "must wake on
-	// broker delivery".
-	triggerClient, triggerBase, triggerDialErr := sched.HTTPClientForGatewaySynthTarget(synthTarget)
-	if triggerDialErr != nil {
-		return fmt.Errorf("schedd: trigger batch dispatch dial %s: %w (gatewayd-internal must be up before schedd)", synthTarget, triggerDialErr)
+	// Mirror the cron path above: a failed dial is warn-and-skip,
+	// not boot-fatal. Otherwise a schedd-only e2e (no gatewayd-internal
+	// in the harness, so cfg.GatewaySynthSocket="") crashes schedd on
+	// PR #910 even when the test never exercises the trigger batch
+	// path. The trigger tick's `WithGatewayHTTPClient(nil, "")` shape
+	// makes `l.runTriggerTick` short-circuit on every tick (it returns
+	// at the top when the http client is nil; see runTriggerTick at
+	// pkg/sched/dispatch_triggers.go). Production schedd whose
+	// gatewayd-internal is genuinely down still gets caught by the
+	// systemd unit restart loop — the cron dial failure above is
+	// already a journal signal in that case.
+	//
+	// Audit finding #5 (PR #910 boot-fatal stance): the rationale was
+	// "every trigger wake funnels through dispatch_batch, so a missed
+	// dial silently loses wakes". The mitigation here preserves that
+	// visibility (a `trigger batch dispatch dial failed` warn line
+	// appears at every boot) without bricking the daemon when the
+	// trigger primitive isn't being exercised. Future work (PR-B):
+	// schedule a 30s reconnect ticker that retries the dial so a
+	// transient gatewayd-internal outage self-heals.
+	if synthTarget != "" {
+		triggerClient, triggerBase, triggerDialErr := sched.HTTPClientForGatewaySynthTarget(synthTarget)
+		if triggerDialErr != nil {
+			log.Warn("trigger batch dispatch dial: trigger tick will idle until gatewayd-internal is up",
+				"target", synthTarget, "err", triggerDialErr)
+		} else {
+			loop.WithGatewayHTTPClient(triggerClient, triggerBase)
+		}
+	} else {
+		log.Warn("trigger batch dispatch dial skipped: synthTarget empty (gatewayd-internal not wired in this schedd)")
 	}
-	loop.WithGatewayHTTPClient(triggerClient, triggerBase)
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- loop.Run(ctx) }()
 

@@ -160,6 +160,24 @@ func (l *Loop) runTriggerTick(ctx context.Context) {
 	if store == nil {
 		return
 	}
+	// Without an HTTP transport for the batch dispatch path
+	// (gatewayd-internal was not wired at boot — production
+	// schedd on a single-box deploy, or the schedd-only e2e
+	// harness like meterd_dunning_e2e_test / meterd_quota_e2e_test
+	// that don't run gatewayd-internal), skip the tick entirely.
+	// Otherwise we walk every trigger, poll records from each
+	// broker, claim the trigger_records rows, fail on postBatch
+	// (typed error "gateway http client not configured"), and
+	// bounce the records to retry — every 1s. That tight retry
+	// storm will also mask the real failure (the dial error from
+	// boot), so the warn emitted at boot by cmd/schedd/main.go is
+	// the single source of operator visibility. PR #910 audit #5
+	// required boot-fatal for the dial; the boot warn + tick
+	// short-circuit preserves that signal without crashing the
+	// daemon when the trigger primitive is unconfigured.
+	if l.gatewayHTTPClient == nil {
+		return
+	}
 	triggers, err := store.ListEnabledTriggers(ctx)
 	if err != nil {
 		l.log.Warn("sched trigger tick: list", "err", err)
