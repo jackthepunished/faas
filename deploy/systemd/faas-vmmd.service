@@ -6,9 +6,11 @@ Wants=faas-tenant.slice faas-cp.slice
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/chown root:faas /run/faas
+ExecStartPre=/usr/bin/install -d -o root -g faas -m 0775 /run/faas
 ExecStartPre=/usr/bin/chmod 0775 /run/faas
 ExecStart=/opt/faas/current/bin/vmmd --config /etc/faas/vmmd.toml
+ExecStartPost=/usr/bin/chown root:faas /run/faas
+ExecStartPost=/usr/bin/chmod 0775 /run/faas
 Restart=on-failure
 RestartSec=2s
 Slice=faas-cp.slice
@@ -22,8 +24,6 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadWritePaths=/etc/faas/secrets /run/faas /srv/fc /var/log/faas
-RuntimeDirectory=faas
-RuntimeDirectoryMode=0775
 
 [Install]
 WantedBy=multi-user.target

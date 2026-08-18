@@ -202,6 +202,15 @@ type server struct {
 	// sees rekey_no_identities instead of the misleading
 	// "set FAAS_REKEY_ENABLED and restart" detail.
 	rekeyRunnerOptedIn bool
+	// dataPlacementEnabled (ADR-098 PR-B / C4) is the per-PR
+	// feature flag (FAAS_DATA_PLACEMENT=1) that gates the
+	// data-upstream handler family
+	// (GET/PUT/DELETE /v1/apps/{slug}/upstreams[...]).
+	// Default false keeps the v1 byte-for-byte posture — the
+	// PR-A pg_notify trigger still fires but no handler reads
+	// from it. Wired via WithDataPlacement from
+	// cmd/apid/main.go::dataPlacementEnabledFromEnv.
+	dataPlacementEnabled bool
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -418,6 +427,18 @@ func (s *server) WithOAuthConfig(cfg auth.SignInConfig) *server {
 // pkg/builderd.Builderd.
 func (s *server) WithEventsPlatform(p *events.Platform) *server {
 	s.eventsPlatform = p
+	return s
+}
+
+// WithDataPlacement (ADR-098 PR-B / C4) attaches the per-PR
+// feature flag (FAAS_DATA_PLACEMENT=1) that gates the
+// data-upstream handler family. Default false preserves the
+// pre-PR-B byte-for-byte posture. Wired once at boot from
+// cmd/apid/main.go::dataPlacementEnabledFromEnv. Mirrors the
+// WithBillingProvider / WithOpsMetrics chain-method style so
+// existing positional call sites in tests don't need editing.
+func (s *server) WithDataPlacement(enabled bool) *server {
+	s.dataPlacementEnabled = enabled
 	return s
 }
 
@@ -1318,6 +1339,18 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps/{slug}/env", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listEnv)))
 	mux.HandleFunc("PUT /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.setEnv)))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.deleteEnv)))
+
+	// Data upstreams (ADR-098 §D4 / PR-B). The full handler family is
+	// gated on s.dataPlacementEnabled (FAAS_DATA_PLACEMENT=1); when
+	// the flag is off, each handler returns 402 plan_feature_gated so
+	// pre-PR-B callers see the exact same wire shape as before. The
+	// read endpoints (GET) use the read scope; the write endpoints
+	// (PUT/DELETE) use ScopesUpstreamWriteSurface, mirroring the env
+	// surface's split.
+	mux.HandleFunc("GET /v1/apps/{slug}/upstreams", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listUpstreams)))
+	mux.HandleFunc("GET /v1/apps/{slug}/upstreams/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getUpstream)))
+	mux.HandleFunc("PUT /v1/apps/{slug}/upstreams", s.authLimited(s.requireScope(api.ScopesUpstreamWriteSurface...)(s.createUpstream)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/upstreams/{id}", s.authLimited(s.requireScope(api.ScopesUpstreamWriteSurface...)(s.deleteUpstream)))
 
 	// Usage.
 	// Usage endpoints are narrower than the read surface — a deploy-write

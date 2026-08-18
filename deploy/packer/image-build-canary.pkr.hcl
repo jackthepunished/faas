@@ -6,7 +6,7 @@
 // (release.tar.gz + release.cosign.bundle + release.sbom.json) is
 // published to:
 //
-//   oci://ghcr.io/poyrazK/faas/release:v<git_sha>@sha256:<digest>
+//   oci://ghcr.io/poyrazk/faas/release:v<git_sha>@sha256:<digest>
 //
 // via the `oras` CLI shelling from per-step provisioners. No new
 // Go dependency is introduced — `oras` is on the canary runner's
@@ -44,8 +44,8 @@ variable "git_sha" {
 
 variable "oci_registry" {
   type        = string
-  description = "OCI registry namespace. Default: ghcr.io/poyrazK/faas (matches the dns01_provider_cloudflare / supply-chain convention)."
-  default     = "ghcr.io/poyrazK/faas"
+  description = "OCI registry namespace. Default: ghcr.io/poyrazk/faas (matches the dns01_provider_cloudflare / supply-chain convention)."
+  default     = "ghcr.io/poyrazk/faas"
 }
 
 variable "release_repo" {

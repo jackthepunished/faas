@@ -120,6 +120,13 @@
       - xz-utils
       - flex
       - bison
+      # Issue #938 / PR-B / ADR-114: e2fsprogs ships `debugfs`, which
+      # the gregalectl doctor "builder-base-ext4" check uses to verify
+      # /srv/fc/base/builder-base.ext4 contains the guest-init PID1
+      # binary. Without this package the doctor degrades to a warn-
+      # finding on every control-plane node, masking the load-bearing
+      # case where the alpine placeholder ref is shipped to imaged.
+      - e2fsprogs
     state: present
 
 - name: firecracker — download kernel source tarball
@@ -171,6 +178,20 @@
     line: "CONFIG_VIRTIO_BLK=y"
     state: present
 
+- name: firecracker — ensure CONFIG_FUSE_FS=y for rootless BuildKit
+  ansible.builtin.lineinfile:
+    path: /usr/src/linux-{{ fc_kernel_version }}/.config
+    regexp: "^(# )?CONFIG_FUSE_FS(=.*| is not set)$"
+    line: "CONFIG_FUSE_FS=y"
+    state: present
+
+- name: firecracker — ensure CONFIG_IP_PNP=y for static guest networking
+  ansible.builtin.lineinfile:
+    path: /usr/src/linux-{{ fc_kernel_version }}/.config
+    regexp: "^(# )?CONFIG_IP_PNP(=.*| is not set)$"
+    line: "CONFIG_IP_PNP=y"
+    state: present
+
 - name: firecracker — build kernel (vmlinux) with 4 jobs
   ansible.builtin.command: make -j4 ARCH=x86_64 CROSS_COMPILE= olddefconfig 2>&1
   args:
@@ -193,6 +214,15 @@
     group: root
     mode: "0644"
   register: vmlinux_copy
+
+- name: firecracker — publish version-keyed kernel artifact for vmmd
+  ansible.builtin.copy:
+    src: "/srv/fc/base/vmlinux-{{ fc_kernel_version }}"
+    dest: "/srv/fc/kernel/{{ fc_release | regex_replace('^v', '') }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
 
 - name: firecracker — compute and pin kernel SHA-256
   ansible.builtin.command: sha256sum /srv/fc/base/vmlinux-{{ fc_kernel_version }}

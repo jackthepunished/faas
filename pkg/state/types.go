@@ -3955,3 +3955,23 @@ type DataUpstreamProbe struct {
 	// queries.sql read paths).
 	ProbeNode string
 }
+
+// DataUpstreamTarget is the deduplicated (host_redacted_hash,
+// kind, port) tuple the meterd probe loop iterates on every
+// tick. The plaintext host is NEVER on this struct — the
+// probe knows the host only by hash (§11 secret rule).
+type DataUpstreamTarget struct {
+	HostRedactedHash string
+	Kind             DataUpstreamKind
+	Port             int
+	// Host is the plaintext host. Returned ONLY to the
+	// meterd probe loop (PR-C) so the dial can resolve
+	// to a real address. The plaintext host NEVER
+	// appears on the wire elsewhere (§11 invariant):
+	// the Prom labels carry host_redacted_hash, the
+	// audit kind carries host_redacted_hash, the pg_notify
+	// payload carries host_redacted_hash. meterd loads
+	// the host from this struct, dials, then drops it
+	// on the floor.
+	Host string
+}

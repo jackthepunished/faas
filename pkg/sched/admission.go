@@ -144,6 +144,17 @@ type Request struct {
 	// the preferred node still has headroom — affinity is bias, never
 	// a gate (ADR-005: cold boot must always work).
 	PreferredNodeID string
+	// PreferredRegion (ADR-098 PR-D) is the connection-aware
+	// placement bias. The Engine populates this from
+	// pkg/sched.UpstreamAffinity.Score(AppID) before calling the
+	// chooser; the chooser honors it via the upstream_fit
+	// tie-break in betterCandidate. Empty value means "no
+	// score, fall through to legacy tie-break" — the cache
+	// cold path (no probe yet) MUST NOT bias the chooser. Like
+	// PreferredNodeID, the region is bias, never a gate: a
+	// preferred region with no headroom falls through to the
+	// least-loaded path (ADR-005 cold-boot invariant).
+	PreferredRegion string
 	// NodeCeilingMB is the per-node RAM admission ceiling from
 	// compute_nodes.admission_ceiling_mb for the chosen node. The
 	// chooser already verified the request fits; the ledger uses this

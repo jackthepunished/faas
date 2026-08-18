@@ -121,3 +121,42 @@ func ValidateEnvKey(key string) *Problem {
 	}
 	return nil
 }
+
+// DataUpstreamSource (ADR-098 §D1.a / §D4) is the discriminator on
+// how a data_upstreams row was created. Lives in env.go (not a new
+// upstreams.go) for the C1 commit shape — the DTOs and validation
+// land in C3 (pkg/api/upstreams.go) where the response/request types
+// pick up the enum. Two values:
+//
+//   - DataUpstreamSourceInferred: the apid env-classifier recorded
+//     the row from a customer's env (DATABASE_URL,
+//     REDIS_URL, ...). The source is the DSN — never stored, only
+//     the host + port + scope + kind. Dashboard renders a
+//     "we inferred this" badge.
+//   - DataUpstreamSourceExplicit: the customer POSTed to
+//     /v1/apps/{slug}/upstreams (PR-B / C4). Dashboard renders a
+//     "you pinned this" badge.
+//
+// The SQL CHECK constraint at migration 00226
+// (`data_upstreams_source_check`) is the wire-bypass backstop; the
+// IsValid helper here is the apid-side closed-vocab check that
+// gates before the row reaches the store.
+type DataUpstreamSource string
+
+const (
+	DataUpstreamSourceInferred DataUpstreamSource = "inferred"
+	DataUpstreamSourceExplicit DataUpstreamSource = "explicit"
+)
+
+// DataUpstreamSourceIsValid returns true for the two closed
+// vocabulary values above. Used by apid's createUpstream handler
+// (C4) to reject an unknown source with 400 upstream_invalid_kind
+// BEFORE the store is touched. Mirrors the Closed-vocabulary enum
+// pattern in EdgeRuleKindIsValid at pkg/api/edge_rules.go.
+func DataUpstreamSourceIsValid(s DataUpstreamSource) bool {
+	switch s {
+	case DataUpstreamSourceInferred, DataUpstreamSourceExplicit:
+		return true
+	}
+	return false
+}

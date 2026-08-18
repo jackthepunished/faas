@@ -68,3 +68,21 @@ func (m *MemStore) ListDataUpstreamProbesByHostRegion(_ context.Context, _ sqlc.
 func (m *MemStore) PruneDataUpstreamProbesOlderThan(_ context.Context, _ time.Time) error {
 	return errMemStoreDataUpstreams
 }
+
+// ListAllAppDataUpstreams (ADR-098 PR-B) — MemStore stub.
+// Postgres-only. Used by GET /v1/apps/{slug}/upstreams?scope=__all__.
+func (m *MemStore) ListAllAppDataUpstreams(_ context.Context, _, _ string) ([]DataUpstream, error) {
+	return nil, errMemStoreDataUpstreams
+}
+
+// CountDataUpstreamsByApp (ADR-098 PR-B) — MemStore stub.
+// Postgres-only. Used by createUpstream for the per-plan quota.
+func (m *MemStore) CountDataUpstreamsByApp(_ context.Context, _, _ string) (int, error) {
+	return 0, errMemStoreDataUpstreams
+}
+
+// ListDistinctUpstreamHostHashes (ADR-098 PR-C) — MemStore
+// stub. Postgres-only. Used by the meterd probe loop.
+func (m *MemStore) ListDistinctUpstreamHostHashes(_ context.Context) ([]DataUpstreamTarget, error) {
+	return nil, errMemStoreDataUpstreams
+}

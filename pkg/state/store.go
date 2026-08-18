@@ -3684,6 +3684,19 @@ type Store interface {
 	// api.DataUpstreamsListMaxLimit by the handler.
 	ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error)
 
+	// ListAllAppDataUpstreams backs
+	// GET /v1/apps/{slug}/upstreams?scope=__all__ (PR-B).
+	// Returns every data_upstreams row on the app across all
+	// scopes — the count is bounded by
+	// DataPlacementHintsPerApp (per ADR-098 §D5) so the scan
+	// is cheap.
+	ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error)
+
+	// CountDataUpstreamsByApp backs the per-plan
+	// DataPlacementHintsPerApp quota in createUpstream
+	// (PR-B). Counts across ALL scopes per §D5.
+	CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error)
+
 	// GetDataUpstreamByID backs
 	// GET /v1/apps/{slug}/upstreams/{id} (PR-B).
 	GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUpstream, error)
@@ -3704,6 +3717,14 @@ type Store interface {
 	// Partition pruning on sampled_at drops everything outside
 	// the window.
 	ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error)
+
+	// ListDistinctUpstreamHostHashes (PR-C / meterd probe
+	// loop) walks data_upstreams and returns the
+	// deduplicated set of (host_redacted_hash, kind, port)
+	// tuples — the probe iterates this set on every tick.
+	// The plaintext host is NEVER returned; the §11 secret
+	// rule is the reason.
+	ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error)
 
 	// PruneDataUpstreamProbesOlderThan is the hourly retention
 	// purge. cutoff is typically now() - 30 days (matches the

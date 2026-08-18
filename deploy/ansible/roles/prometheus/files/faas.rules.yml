@@ -1040,3 +1040,49 @@ groups:
         annotations:
           summary: "Account {{ $labels.account_id }} drift > 5% for 15m"
           description: "Single-account drift exceeds 5% for 15m (ADR-049 §B.1). The 1h provider-aggregate BillingDrift alert may not fire for a single account if other accounts are quiet. Inspect the meterd_billing_drift_mb_seconds{account_id=…} gauge and Stripe's UsageRecordSummaries API for the affected subscription_item to confirm the gap."
+
+# ─────────────────────────────────────────────────────────────────
+# ADR-098 §9.A meterd data-upstream probe alerts.
+# Fires from the meterd_data_upstream_rtt_ms gauge (PR-C) + the
+# meterd_data_upstream_probes_total counter. The gauge is
+# labelled {kind, host_redacted_hash, region} — §11 invariant
+# preserved (host_redacted_hash is the only host-derived label).
+# The cluster outline (ADR-098 row §D4) calls for two alerts:
+#   1. p95 RTT below 5ms (info) — chooser bias is healthy,
+#      meterd is recording sub-5ms RTTs across regions.
+#   2. p95 RTT above 200ms (page) — connection degradation
+#      affecting customer apps.
+# Each runs a 10m aggregation window so transient blips don't
+# fire — well within the 30s probe cadence × UpstreamProbeMaxConcurrent
+# = 64 to surface a sustained signal.
+# ─────────────────────────────────────────────────────────────────
+  - name: faas_data_placement
+    interval: 30s
+    rules:
+      - alert: FaasUpstreamRttHealthy
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, kind, region) (rate(meterd_data_upstream_rtt_ms_bucket[10m]))
+          ) < 5
+        for: 10m
+        labels:
+          severity: info
+          component: meterd
+          family: data_placement
+        annotations:
+          summary: "Data-placement p95 RTT < 5ms for {{ $labels.kind }}/{{ $labels.region }}"
+          description: "The chooser bias for {{ $labels.kind }} upstreams in {{ $labels.region }} is observing p95 RTT < 5ms for 10m — the connection-aware placement is operating within the spec's healthy envelope. This is informational; no action required."
+      - alert: FaasUpstreamRttDegraded
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, kind, region) (rate(meterd_data_upstream_rtt_ms_bucket[10m]))
+          ) > 200
+        for: 10m
+        labels:
+          severity: page
+          component: meterd
+          family: data_placement
+        annotations:
+          summary: "Data-placement p95 RTT > 200ms for {{ $labels.kind }}/{{ $labels.region }}"
+          description: "Connection-aware probe loop reports sustained p95 RTT > 200ms for {{ $labels.kind }} upstreams in {{ $labels.region }} (10m window). Customer wakes are landing on a region with degraded connectivity — the chooser bias (C6) preserves the legacy fallthrough on stale scores so customer apps continue to wake, but the page signals a network condition worth investigating. Cross-reference with the recent deploy log; an outbound firewall change or inter-region route flap is the canonical cause."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamRttDegraded.md"

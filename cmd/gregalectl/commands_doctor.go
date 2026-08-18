@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -80,6 +81,17 @@ const (
 	// shells out to cosign; legacy operators (no canary) see a
 	// clean "triple missing" warn-finding and continue.
 	doctorCheckVerifyTarballSBOM = "verify-tarball-sbom"
+	// Issue #938 / PR-B / ADR-114: verify the on-disk builder-base
+	// ext4 contains /usr/local/bin/faas-guest-init (the kernel-cmdline
+	// PID1 binary every builder microVM hands control to). Walks the
+	// ext4 via debugfs when available; emits a warn-finding on macOS /
+	// non-debugfs hosts. A debugfs-found-but-file-absent case is
+	// SeverityError because the build pipeline silently produced a
+	// wrong rootfs — fail closed so the operator sees it before imaged
+	// tries to spawn a builder VM. Path is configurable via
+	// FAAS_BUILDER_BASE_PATH (mirroring cmd/imaged/main.go:403); empty
+	// keeps the default /srv/fc/base/builder-base.ext4.
+	doctorCheckBuilderBaseExt4 = "builder-base-ext4"
 )
 
 // doctor severity constants. Match the wire shape so JSON consumers
@@ -389,6 +401,15 @@ func runDoctorChecks(ctx context.Context, deps *doctorDeps) doctorReport {
 	// short-circuits on file-mode / fingerprint issues).
 	runCheck(doctorCheckSecrets, func() ([]doctorFinding, error) {
 		return checkSecrets(ctx, deps)
+	})
+	// Issue #938 / PR-B / ADR-114: builder-base-ext4 check verifies
+	// the staged ext4 contains /usr/local/bin/faas-guest-init. Always-
+	// on because the failure mode is silent (alpine placeholder boots
+	// to busybox and every build times out at vmmd's waitReady=30s).
+	// Degrades to SeverityWarn when debugfs is absent so macOS dev boxes
+	// and minimal container images still produce a useful report.
+	runCheck(doctorCheckBuilderBaseExt4, func() ([]doctorFinding, error) {
+		return checkBuilderBaseExt4(ctx, deps)
 	})
 	// node-hashes is --deep-only. When the flag is unset, don't
 	// append the per-check summary at all — the JSON / text
@@ -1336,6 +1357,105 @@ func checkSecrets(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error
 		}
 	}
 	return findings, nil
+}
+
+// builder-base ext4 hooks (issue #938 / PR-B / ADR-114). Package-level
+// vars so tests can stub the debugfs probe + stat path without going
+// through real disk. Production wiring points these at the canonical
+// /srv/fc/base/builder-base.ext4 and `debugfs` binary on PATH.
+var (
+	locateBuilderBasePathHook = func() string {
+		if v := os.Getenv("FAAS_BUILDER_BASE_PATH"); v != "" {
+			return v
+		}
+		return "/srv/fc/base/builder-base.ext4"
+	}
+	statHook       = os.Stat
+	lookPathHook   = exec.LookPath
+	runDebugfsHook = func(ctx context.Context, debugfs, ext4, target string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, debugfs, "-R", "stat "+target, ext4)
+		return cmd.CombinedOutput()
+	}
+)
+
+// checkBuilderBaseExt4 verifies the staged builder-base ext4 contains
+// /usr/local/bin/faas-guest-init (issue #938 / PR-B / ADR-114).
+//
+// Three states:
+//  1. ext4 missing → SeverityWarn (imaged stages on first cold boot;
+//     this finding self-resolves after imaged has run).
+//  2. ext4 present but debugfs absent → SeverityWarn (macOS / minimal
+//     containers; install e2fsprogs for full coverage — the ansible
+//     control-plane role ensures this on production boxes).
+//  3. ext4 present, debugfs runs, file absent → SeverityError
+//     (the build pipeline silently produced a wrong rootfs — every
+//     `gregale deploy` will time out at vmmd's waitReady=30s).
+//
+// All three states produce exactly one finding so the wire shape
+// stays consistent.
+//
+// ctx is plumbed through so the debugfs subprocess respects the
+// doctor's overall deadline (the runCheck above is non-cancellable
+// today; the ctx anchor lets future --json=streaming or timeout-
+// bounded wrappers reuse this check without churn).
+func checkBuilderBaseExt4(ctx context.Context, deps *doctorDeps) ([]doctorFinding, error) {
+	_ = deps
+	basePath := locateBuilderBasePathHook()
+	if _, err := statHook(basePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []doctorFinding{{
+				Check:    doctorCheckBuilderBaseExt4,
+				Severity: doctorSeverityWarn,
+				Message:  "builder-base.ext4 not staged",
+				Detail:   fmt.Sprintf("%s: imaged stages on first cold boot; this finding resolves after a successful cold boot", basePath),
+			}}, nil
+		}
+		return nil, fmt.Errorf("stat %s: %w", basePath, err)
+	}
+	debugfs, err := lookPathHook("debugfs")
+	if err != nil {
+		//nolint:nilerr // err is converted to a finding; runner does not need to see it.
+		return []doctorFinding{{
+			Check:    doctorCheckBuilderBaseExt4,
+			Severity: doctorSeverityWarn,
+			Message:  "debugfs unavailable; cannot verify builder-base contents",
+			Detail:   "install e2fsprogs on the box for full coverage (apt install e2fsprogs / brew install e2fsprogs)",
+		}}, nil
+	}
+	out, err := runDebugfsHook(ctx, debugfs, basePath, "/usr/local/bin/faas-guest-init")
+	if err != nil {
+		//nolint:nilerr // err is converted to a finding; runner does not need to see it.
+		return []doctorFinding{{
+			Check:    doctorCheckBuilderBaseExt4,
+			Severity: doctorSeverityError,
+			Message:  "faas-guest-init missing from builder-base.ext4",
+			Detail:   fmt.Sprintf("debugfs stat against %s returned: %s", basePath, strings.TrimSpace(string(out))),
+		}}, nil
+	}
+	// A successful debugfs stat prints (e2fsprogs 1.47.x):
+	//   Inode: 12345   File mode: 0755   Links: 1
+	// Both fields are always present on a hit; a missing file
+	// returns exit status 1 + "file not found" before this block
+	// runs, so the substring check is belt-and-braces against a
+	// future debugfs version that emits a different header shape.
+	// Requiring both fields (not just "Inode") avoids a false OK
+	// finding if debugfs ever prints "Inode" as part of an error
+	// banner (review finding #7 on PR #940).
+	outStr := string(out)
+	if !strings.Contains(outStr, "Inode:") || !strings.Contains(outStr, "File mode:") {
+		return []doctorFinding{{
+			Check:    doctorCheckBuilderBaseExt4,
+			Severity: doctorSeverityError,
+			Message:  "faas-guest-init missing from builder-base.ext4",
+			Detail:   fmt.Sprintf("debugfs stat output did not contain inode + mode records: %s", strings.TrimSpace(outStr)),
+		}}, nil
+	}
+	return []doctorFinding{{
+		Check:    doctorCheckBuilderBaseExt4,
+		Severity: doctorSeverityOK,
+		Message:  "faas-guest-init present in builder-base.ext4",
+		Detail:   fmt.Sprintf("debugfs confirmed %s exists in %s", "/usr/local/bin/faas-guest-init", basePath),
+	}}, nil
 }
 
 // mustParsePerm returns the perm bits for a 4-digit octal string

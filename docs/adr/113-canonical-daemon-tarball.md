@@ -41,7 +41,7 @@
   canary's CI runner, after `make build-sha256`. The image bakes the
   tarball itself (so a freshly-installed image can run from local
   artifact if the production source is unreachable), and an OCI
-  artifact (`oci://ghcr.io/poyrazK/faas/release@sha256:<digest>`) is
+  artifact (`oci://ghcr.io/poyrazk/faas/release@sha256:<digest>`) is
   pushed in parallel as the canonical reference. Day-2 upgrades pull
   from OCI by default; operators can pin `--tarball-path` for air-gap.
 
@@ -79,7 +79,7 @@
   - **Packer `image-build-canary` must learn to publish.**
     `deploy/packer/image-build-canary.pkr.hcl` runs the canary build,
     then a `post-process` step pushes the tarball to
-    `oci://ghcr.io/poyrazK/faas/release` (skipped on local dev;
+    `oci://ghcr.io/poyrazk/faas/release` (skipped on local dev;
     gated on `CI=true`).
   - **`pkg/releaseinstall` gains three types.**
     `Tarball{Spec, Build, Verify, Extract}`, `CosignVerifier`

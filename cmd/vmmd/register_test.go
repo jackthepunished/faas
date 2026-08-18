@@ -17,8 +17,10 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -39,8 +41,14 @@ func TestRegisterComputeNode_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registerComputeNode: %v", err)
 	}
-	if got.Name != "box-east-1" {
-		t.Errorf("name = %q", got.Name)
+	if got.Name != "box-east-1.faas" {
+		// Issue #900: vmmd auto-appends `.faas` to the
+		// registered name so the TLS CN verifier (which only
+		// accepts `*.faas` CMs) finds a match. The row's Name
+		// column is the rewritten form; the operator's TOML
+		// value is preserved on the config side (cfg.NodeName
+		// is not mutated).
+		t.Errorf("name = %q, want %q (auto-append .faas)", got.Name, "box-east-1.faas")
 	}
 	if got.ID == "" {
 		t.Error("id empty")
@@ -113,6 +121,77 @@ func TestRegisterComputeNode_RejectsZeroFields(t *testing.T) {
 	}
 }
 
+// TestRegisterComputeNode_RejectsNegativeVCPUBudget: issue #938 / PR-A.
+// The migration 00123 CHECK (vcpu_budget > 0) trips the upsert, so
+// LoadConfig also rejects it via FAAS_VCPU_BUDGET. A negative value at
+// the register boundary must surface as a startup error rather than
+// reaching the upsert.
+func TestRegisterComputeNode_RejectsNegativeVCPUBudget(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		VCPUBudget:         -1,
+	}
+	_, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err == nil {
+		t.Fatal("expected negative VCPUBudget to be rejected")
+	}
+	if !strings.Contains(err.Error(), "vcpu_budget") {
+		t.Errorf("error %q does not name vcpu_budget", err.Error())
+	}
+}
+
+// TestRegisterComputeNode_DefaultsVCPUBudgetFromAPI: issue #938 / PR-A.
+// When the operator leaves VCPUBudget at the struct-default zero value,
+// the upsert falls back to api.VCPUSlots so the migration 00123 CHECK
+// never trips on single-box dev. Pins the fallback to a single source
+// of truth (pkg/api.VCPUSlots).
+func TestRegisterComputeNode_DefaultsVCPUBudgetFromAPI(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		// VCPUBudget omitted → fallback to api.VCPUSlots
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.VCPUBudget != api.VCPUSlots {
+		t.Errorf("VCPUBudget = %d, want %d (api.VCPUSlots fallback)", got.VCPUBudget, api.VCPUSlots)
+	}
+}
+
+// TestRegisterComputeNode_HonorsExplicitVCPUBudget: issue #938 / PR-A.
+// Heterogeneous fleets override the per-host vCPU ceiling via
+// [compute_node].vcpu_budget; the value flows through verbatim to the
+// compute_nodes row.
+func TestRegisterComputeNode_HonorsExplicitVCPUBudget(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		VCPUBudget:         40, // smaller box, narrower ceiling
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.VCPUBudget != 40 {
+		t.Errorf("VCPUBudget = %d, want 40 (operator override)", got.VCPUBudget)
+	}
+}
+
 // TestRegisterComputeNode_OverlayDetectionErrorContinues: a tailscale
 // detection failure logs a warning and proceeds without the IP
 // rather than failing vmmd startup. This matters for single-box dev
@@ -131,8 +210,14 @@ func TestRegisterComputeNode_OverlayDetectionErrorContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("overlay failure should not block registration: %v", err)
 	}
-	if got.Name != "box-east-1" {
-		t.Errorf("name = %q", got.Name)
+	if got.Name != "box-east-1.faas" {
+		// Issue #900: vmmd auto-appends `.faas` to the
+		// registered name so the TLS CN verifier (which only
+		// accepts `*.faas` CMs) finds a match. The row's Name
+		// column is the rewritten form; the operator's TOML
+		// value is preserved on the config side (cfg.NodeName
+		// is not mutated).
+		t.Errorf("name = %q, want %q (auto-append .faas)", got.Name, "box-east-1.faas")
 	}
 }
 
@@ -157,9 +242,17 @@ func TestRegisterComputeNode_TargetURLPreservesOperatorValue(t *testing.T) {
 	st := state.NewMemStore()
 	ctx := context.Background()
 
-	// Step 1: operator POST (apid path).
+	// Step 1: operator POST (apid path). The operator's contract
+	// is to supply the FINAL row name (the rewritten form the
+	// vmmd self-registration will write). Pre-issue #900, the
+	// operator could supply `fsn-2` and vmmd would store
+	// `fsn-2`; the contract is now "supply the post-rewrite
+	// name" so the re-register's lookup by name finds the row.
+	// A pre-rewrite operator row would now be a no-op (vmmd
+	// inserts a NEW row with the appended suffix) — that's
+	// the breaking change tracked in the PR description.
 	operator, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
-		Name:      "fsn-2",
+		Name:      "fsn-2.faas",
 		TargetURL: "tcp://vmmd-2.faas:50051",
 		VPCPUs:    160, MemMB: 56000,
 		MaxConcurrency: 200, AdmissionCeilingMB: 47600,
@@ -169,7 +262,10 @@ func TestRegisterComputeNode_TargetURLPreservesOperatorValue(t *testing.T) {
 	}
 	operatorID := operator.ID
 
-	// Step 2: vmmd restart with a wrong target_url.
+	// Step 2: vmmd restart with a wrong target_url. The
+	// [compute_node].name "fsn-2" gets auto-rewritten to
+	// "fsn-2.faas" inside registerComputeNode (issue #900), so
+	// the upsert finds the operator's row by name.
 	got, err := registerComputeNode(ctx, st,
 		ComputeNodeConfig{
 			NodeName: "fsn-2", VPCPUs: 160, MemMB: 56000,
@@ -186,6 +282,14 @@ func TestRegisterComputeNode_TargetURLPreservesOperatorValue(t *testing.T) {
 	}
 	if got.ID != operatorID {
 		t.Errorf("id changed across re-register: %q -> %q", operatorID, got.ID)
+	}
+	// Issue #900: the row's Name column carries the rewritten
+	// form (auto-appended .faas), not the operator's TOML
+	// value. The TLS CN verifier (pkg/wire/node_verifier.go)
+	// consults the row's Name as the CN, so the rewritten form
+	// is what makes the handshake succeed.
+	if got.Name != "fsn-2.faas" {
+		t.Errorf("Name = %q, want %q (auto-append .faas)", got.Name, "fsn-2.faas")
 	}
 }
 
@@ -208,6 +312,90 @@ func TestRegisterComputeNode_TargetURLFromConfig(t *testing.T) {
 	}
 	if got.TargetURL != "tcp://100.64.0.1:50051" {
 		t.Errorf("target_url = %q, want tcp://100.64.0.1:50051", got.TargetURL)
+	}
+}
+
+// TestRegisterComputeNode_AppendsFaasSuffix pins the issue #900
+// auto-append behavior: when the operator's [compute_node].name
+// lacks the `.faas` suffix, the upsert row carries the rewritten
+// name with the suffix appended. The TLS CN verifier
+// (pkg/wire/node_verifier.go) only accepts `*.faas` CMs; without
+// the rewrite, the operator's name would never match a registered
+// CN and the handshake would abort with ErrNodeVerifierCNMismatch
+// (the gating symptom behind the ErrEmptySignature drop at
+// pkg/sched/capacity.go:99).
+func TestRegisterComputeNode_AppendsFaasSuffix(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "gcp-faas-node-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.Name != "gcp-faas-node-1.faas" {
+		t.Errorf("Name = %q, want %q (auto-append .faas)", got.Name, "gcp-faas-node-1.faas")
+	}
+	// Verify the row is actually stored under the rewritten name
+	// (MemStore exposes the projection; the upsert wrote the
+	// rewritten name, not the original).
+	row, err := st.ComputeNodeByName(context.Background(), "gcp-faas-node-1.faas")
+	if err != nil {
+		t.Fatalf("ComputeNodeByName: %v", err)
+	}
+	if row.Name != "gcp-faas-node-1.faas" {
+		t.Errorf("stored row Name = %q, want %q", row.Name, "gcp-faas-node-1.faas")
+	}
+}
+
+// TestRegisterComputeNode_PreservesExistingFaasSuffix pins the
+// idempotency contract: a name that already ends in `.faas` is
+// written verbatim — no double-append, no normalization. The
+// rewrite is a one-way trip from "no suffix" to "with suffix".
+func TestRegisterComputeNode_PreservesExistingFaasSuffix(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1.faas",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.Name != "box-east-1.faas" {
+		t.Errorf("Name = %q, want %q (no double-append)", got.Name, "box-east-1.faas")
+	}
+}
+
+// TestRegisterComputeNode_TrimmedNameAppendsSuffix pins the
+// ordering: the local TrimSpace before the suffix check means the
+// suffix is appended to the trimmed value, not the raw operator
+// input. A name like "  box-east-1  " becomes "box-east-1.faas".
+// Without the TrimSpace-before-suffix ordering, the rewrite would
+// land on "  box-east-1  .faas" (with embedded spaces) and the
+// verifier would never match — silent failure.
+func TestRegisterComputeNode_TrimmedNameAppendsSuffix(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "  box-east-1  ",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.Name != "box-east-1.faas" {
+		t.Errorf("Name = %q, want %q (TrimSpace before suffix check)", got.Name, "box-east-1.faas")
 	}
 }
 

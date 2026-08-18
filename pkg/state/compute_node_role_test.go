@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -114,10 +115,22 @@ func TestSetComputeNodeRole_MemStore_RowMissing(t *testing.T) {
 
 func TestSetComputeNodeRole_PgStore_AllowList(t *testing.T) {
 	pool := pgtest.Open(t)
-	s := state.NewPgStore(pool)
 	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	s := state.NewPgStore(pool)
 
-	node, err := s.CreateComputeNode(ctx, state.ComputeNode{Name: "role-pg-" + uuid.NewString()[:8], TargetURL: "unix:///run/vmmd.sock", Active: true})
+	node, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name:               "role-pg-" + uuid.NewString()[:8],
+		TargetURL:          "unix:///run/vmmd.sock",
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+		Active:             true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,13 +186,10 @@ func TestSetComputeNodeRole_PgStore_AllowList(t *testing.T) {
 			}
 		})
 	}
-}
 
-func TestSetComputeNodeRole_PgStore_RowMissing(t *testing.T) {
-	pool := pgtest.Open(t)
-	s := state.NewPgStore(pool)
-	ctx := context.Background()
-	if err := s.SetComputeNodeRole(ctx, "deadbeef-no-such-row", "control-plane"); !errors.Is(err, state.ErrNotFound) {
-		t.Fatalf("missing row: got %v, want ErrNotFound", err)
-	}
+	t.Run("row missing", func(t *testing.T) {
+		if err := s.SetComputeNodeRole(ctx, uuid.NewString(), "control-plane"); !errors.Is(err, state.ErrNotFound) {
+			t.Fatalf("missing row: got %v, want ErrNotFound", err)
+		}
+	})
 }

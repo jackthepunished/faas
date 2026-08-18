@@ -252,7 +252,7 @@ kernel_path = %q
 		)
 		// Optional builder-base override (Lima / CI without ghcr creds). When
 		// FAAS_TEST_BUILDER_BASE_REF is set, imaged pulls the base from there
-		// instead of the production ghcr.io/onebox-faas/builder-base:latest
+		// instead of the production ghcr.io/poyrazk/builder-base:latest
 		// (which 403s anonymously). FAAS_TEST_DEPLOY_BASE_REF, if set,
 		// overrides the per-runtime base ref used by aboveBaseLayers at
 		// deploy time so it also dials the stub registry. Default behavior
@@ -591,7 +591,16 @@ const testDomain = "apps.test.example"
 // PR-C (e2e + ADR-096 docs) will need its own slot fence —
 // pre-check via `gh api .../contents/migrations?ref=main`
 // before opening the PR per the cross-PR slot precheck pattern.
-const e2eMigrationTarget = 237
+//
+// Triggers-mega audit #10: bumped 237 → 275 for the
+// BrokerPoisonStrategy migration (00275_triggers_poison_strategy.sql).
+// 275 is the next free integer above the live head (00274
+// payload_max, also in this branch) so a future migration merely
+// bumps this constant again. The discipline (memory:
+// cross-pr-slot-gate-fence-pattern) is that the only line a
+// migration land touches in this file is this constant + the
+// doc-comment history above.
+const e2eMigrationTarget = 275
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

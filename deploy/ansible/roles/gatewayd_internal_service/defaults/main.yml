@@ -12,4 +12,11 @@ gatewayd_route_metrics_enabled: true
 
 # Path of the rendered config file on the box. The alertmanager role
 # uses the same shape (am_config_path) for the alertmanager.yml drop.
-gatewayd_config_path: /etc/faas/gatewayd.toml
+gatewayd_config_path: /etc/faas/gatewayd-internal.toml
+
+# TCP schedd targets require the same client certificate used by the
+# control-plane gatewayd process. Unix-only single-box deployments may
+# override these to empty values.
+gatewayd_schedd_tls_cert_path: /etc/faas/tls/gatewayd/schedd-client.crt
+gatewayd_schedd_tls_key_path: /etc/faas/tls/gatewayd/schedd-client.key
+gatewayd_schedd_tls_ca_path: /etc/faas/tls/ca/ca.crt
