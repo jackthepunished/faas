@@ -858,7 +858,7 @@ func cmdDeployTarball(args []string) int {
 	diffStrict := fs.Bool("strict", false, "exit non-zero on schema/quota/env breaks (default with --diff)")
 	diffLenient := fs.Bool("lenient", false, "exit zero even on breaks; --diff still renders them")
 	serverDiff := fs.Bool("server-diff", false, "compute the diff on apid via POST /v1/apps/{slug}/diff (PR-1) instead of locally")
-	// Cluster A (error-explanations, spec §6.4 amendment 1):
+// Cluster A (error-explanations, spec §6.4 amendment 1):
 	// run `gregale doctor` first and abort the deploy on any
 	// error-class finding. The doctor runs over the local cwd (or
 	// the auto-pack temp dir) BEFORE any HTTP call, so a
@@ -873,6 +873,17 @@ func cmdDeployTarball(args []string) int {
 	// doctor can scan); the server-side validators still run on
 	// upload.
 	doctorStrict := fs.Bool("doctor-strict", false, "run `gregale doctor` first; abort the deploy on any error-class finding (warnings are warn-only)")
+	// Issue #977 / ADR-116: deployment annotations surface. Three
+	// flags on the cmdDeployTarball path; the zero-config path
+	// auto-captures deployed_by from `git config user.name` and
+	// leaves reason/tag/PRNumber unset (no flags exposed there —
+	// reason/tag are operator input). --reason / --tag / --deployed-by
+	// map 1:1 to the api.DeployAnnotations struct that the multipart
+	// writer (pkg/api/multipart.go) emits as form fields. --tag is
+	// closed-set; the validator below rejects any other value.
+	reason := fs.String("reason", "", "free-text deploy reason recorded on the row (≤280 chars)")
+	tag := fs.String("tag", "", "annotation tag (incident_recovery|hotfix|scheduled_maintenance|compliance_hold|partner_request)")
+	deployedBy := fs.String("deployed-by", "", "operator label (auto-resolved from `git config user.name` when in a repo)")
 	if err := fs.Parse(args); err != nil {
 		PrintUsage(os.Stderr, "usage: gregale deploy [--doctor-strict] --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
@@ -903,6 +914,20 @@ func cmdDeployTarball(args []string) int {
 	secretScanMode, secretScanErr := parseSecretScanFlag(*secretScan)
 	if secretScanErr != nil {
 		return printErr("Invalid flags", secretScanErr)
+	}
+	// Issue #977 / ADR-116: --tag closed-set validation. Server-side
+	// validation is the source of truth (DB CHECK + handler regex);
+	// the CLI pre-validates so a typo never ships a half-formed
+	// annotation row. Reject early before any side effects so the
+	// customer's first response from the CLI is the explicit failure.
+	// Empty is allowed (no tag); non-empty must match the closed set.
+	if *tag != "" && !isValidDeploymentAnnotationTag(*tag) {
+		return printErr("Invalid --tag", fmt.Errorf("must be one of: incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request"))
+	}
+	// --reason length cap mirrors the DB CHECK (≤280 chars). Operators
+	// get a fast clear error here rather than a 422 after the upload.
+	if len(*reason) > 280 {
+		return printErr("Invalid --reason", fmt.Errorf("must be ≤280 characters (got %d)", len(*reason)))
 	}
 	// --app clears any --runtime/--handler the customer also set. The
 	// customer intended an app deploy; passing function fields is
@@ -989,7 +1014,11 @@ func cmdDeployTarball(args []string) int {
 			PrintFail(os.Stderr, "--repo cannot be combined with --only or --project-slug")
 			return 1
 		}
-		return cmdDeployRepoSourceRef(slug, *repo, *ref)
+		return cmdDeployRepoSourceRef(slug, *repo, *ref, api.DeployAnnotations{
+			Reason:     *reason,
+			Tag:        *tag,
+			DeployedBy: resolveDeployedBy(*deployedBy),
+		})
 	}
 
 	// --template materializes an embedded starter project. For function
@@ -1353,7 +1382,19 @@ func cmdDeployTarball(args []string) int {
 	}
 
 	if *tarball != "" {
-		dep, err := DeployTarball(client, ctx, slug, *tarball, *runtime, *handler, *dockerfile)
+		// Issue #977 / ADR-116: capture annotation fields onto the
+		// multipart form via the DeployAnnotations struct. The image
+		// path below uses CreateDeploymentRequest's *string/*int
+		// pointers so the wire can distinguish "absent" from
+		// "explicit zero" (omitempty). The tarball path goes through
+		// multipart so DeployAnnotations (value-type with zero
+		// collapsing to "absent") is the right shape.
+		ann := api.DeployAnnotations{
+			Reason:     *reason,
+			Tag:        *tag,
+			DeployedBy: resolveDeployedBy(*deployedBy),
+		}
+		dep, err := DeployTarball(client, ctx, slug, *tarball, *runtime, *handler, *dockerfile, ann)
 		if err != nil {
 			return printErr("Bad --tarball", err)
 		}
@@ -1362,7 +1403,22 @@ func cmdDeployTarball(args []string) int {
 		}
 		return streamDeployLogs(client, dep)
 	}
-	dep, err := client.Deploy(ctx, slug, api.CreateDeploymentRequest{Image: *image, TrafficPercent: optTrafficPercent(*trafficPercent)})
+	// Issue #977 / ADR-116: the image-deploy path uses the JSON wire
+	// (CreateDeploymentRequest), so the annotation fields ride on the
+	// pointer shape — nil vs empty-string matches the DTO convention.
+	annPtr := func(v string) *string {
+		if v == "" {
+			return nil
+		}
+		return &v
+	}
+	dep, err := client.Deploy(ctx, slug, api.CreateDeploymentRequest{
+		Image:          *image,
+		TrafficPercent: optTrafficPercent(*trafficPercent),
+		Reason:         annPtr(*reason),
+		Tag:            annPtr(*tag),
+		DeployedBy:     annPtr(resolveDeployedBy(*deployedBy)),
+	})
 	if err != nil {
 		return printErr("Deploy failed", err)
 	}

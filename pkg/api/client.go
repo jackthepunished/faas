@@ -705,9 +705,9 @@ func (c *Client) GetBuilds(ctx context.Context, app, status, before string, limi
 // For zero-knowledge of a customer file's provenance (the CLI's
 // `faas deploy --tarball` refuses symlinks via openCustomerFile),
 // wrap openCustomerFile before calling DeployMultipart.
-func (c *Client) DeployMultipart(ctx context.Context, slug string, source io.Reader, sourceName, runtime, handler string, dockerfile bool) (DeploymentResponse, error) {
+func (c *Client) DeployMultipart(ctx context.Context, slug string, source io.Reader, sourceName, runtime, handler string, dockerfile bool, ann DeployAnnotations) (DeploymentResponse, error) {
 	var b bytes.Buffer
-	w := newMultipartWriter(&b, slug, dockerfile, runtime, handler)
+	w := newMultipartWriter(&b, slug, dockerfile, runtime, handler, ann)
 	fw, err := w.CreateFormFile("source", sourceName)
 	if err != nil {
 		return DeploymentResponse{}, fmt.Errorf("create form file: %w", err)

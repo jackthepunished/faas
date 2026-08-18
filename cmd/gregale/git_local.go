@@ -198,3 +198,52 @@ func runGitCmd(gitDir string, args ...string) (string, error) {
 	}
 	return string(out), nil
 }
+
+// ErrNoGitConfigKey is returned by gitConfigUser when `git config --get`
+// exits with code 1 (the key is not set). Mirrors the MED-3 detection
+// pattern in gitRemoteOrigin (line 147): exit code 1 is the well-defined
+// "key absent" sentinel; any other non-zero exit is a real error to
+// propagate (config-file parse error, permission denied, etc.).
+var ErrNoGitConfigKey = errors.New("git config key not set")
+
+// gitConfigUser returns the trimmed value of `git config --get <key>`
+// from the repo at gitDir. Returns ErrNoGitConfigKey when the key is
+// not set; any other non-zero exit is wrapped with stderr so the
+// operator sees the underlying git message.
+//
+// Issue #977 / ADR-116: auto-capture of `user.name` so the CLI's
+// zero-config `gregale deploy` path can stamp `deployed_by` on the
+// deployment row without requiring a --deployed-by flag.
+func gitConfigUser(gitDir, key string) (string, error) {
+	out, err := runGitCmd(gitDir, "config", "--get", key)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return "", ErrNoGitConfigKey
+		}
+		return "", fmt.Errorf("gitConfigUser(%s): %w", key, err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// gitUserName returns the value of `git config --get user.name` in
+// gitDir, or "" when the key is unset (ErrNoGitConfigKey is swallowed
+// to match the "operator did not configure git" path — a CLI auto-
+// capture failure must not block the deploy; the operator can always
+// supply --deployed-by). Any other non-zero exit is propagated.
+//
+// Note: a global-only user.name (in ~/.gitconfig but not in the repo
+// or its includes) IS returned; `git config --get` walks the
+// include chain. This is the right behavior — most operators set
+// `git config --global user.name` once and never touch the repo
+// config.
+func gitUserName(gitDir string) (string, error) {
+	name, err := gitConfigUser(gitDir, "user.name")
+	if errors.Is(err, ErrNoGitConfigKey) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, nil
+}

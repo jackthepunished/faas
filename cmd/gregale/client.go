@@ -59,13 +59,13 @@ type APIError = api.APIError
 // Kept as a *Client method via a wrapper type rather than a free
 // function because the existing test surface in client_test.go
 // expects `c.DeployTarball(...)` as a method on the alias.
-func DeployTarball(c *Client, ctx context.Context, slug, path, runtime, handler string, dockerfile bool) (api.DeploymentResponse, error) {
+func DeployTarball(c *Client, ctx context.Context, slug, path, runtime, handler string, dockerfile bool, ann api.DeployAnnotations) (api.DeploymentResponse, error) {
 	f, err := openCustomerFile(path)
 	if err != nil {
 		return api.DeploymentResponse{}, err
 	}
 	defer func() { _ = f.Close() }()
-	return c.DeployMultipart(ctx, slug, f, filepath.Base(path), runtime, handler, dockerfile)
+	return c.DeployMultipart(ctx, slug, f, filepath.Base(path), runtime, handler, dockerfile, ann)
 }
 
 // ExportAccountFile fetches the GDPR export bundle and writes the

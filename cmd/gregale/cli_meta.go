@@ -355,6 +355,17 @@ var cliCommands = []cliCommand{
 			// The snippet uses --name / cwd as the app slug.
 			{Name: "github", Short: "emit a GitHub Actions workflow snippet for faas-deploy-action"},
 			{Name: "template", Short: "scaffold from a built-in template", ClosedSet: templateNames13},
+			// Issue #977 / ADR-116: deployment annotations surface.
+			// --reason is free text (≤280 chars); --tag is closed-set
+			// (see DeploymentAnnotationTags in cmd_deploy_annotations.go);
+			// --deployed-by auto-resolves to `git config user.name`
+			// when unset and cwd is in a git repo. The manifest is
+			// the source of truth for --tag's vocabulary (goconst
+			// package-wide; reusing the slice keeps completion + docs
+			// in lockstep).
+			{Name: "reason", Short: "free-text deploy reason (≤280 chars)"},
+			{Name: "tag", Short: "annotation tag", ClosedSet: DeploymentAnnotationTags},
+			{Name: "deployed-by", Short: "operator label (auto-resolved from git config user.name)"},
 		},
 	},
 	{
