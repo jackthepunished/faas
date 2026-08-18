@@ -52,10 +52,20 @@ flips to Paddle.
    Stripe-side grep checks and keeps the Paddle row + the
    `FAAS_BILLING_PROVIDER=paddle` assertion.
 
-3. **`pkg/billing/paddle/errors.go::ClassifyPushError`** (PR-C of the
-   launch cluster) closes the v1 "Negative/deferred" bullet. Paddle push
-   errors lift into `meterd_ops_total{op="paddle",code=…}` with the same
-   label set the Stripe implementation has used since ADR-027.
+3. **`pkg/billing/paddle/errors.go::ClassifyPushError`** (verified —
+   no code change required for v2). The Paddle classifier was landed
+   in a follow-up to PR-P3 on main (the `paddle-full-enable` cluster,
+   PR #204 follow-up). The classifier maps a Paddle push failure to a
+   closed 13-label set covering pre-SDK sentinels, transport errors,
+   and `*paddleerr.Error` Status codes. The meterd pusher
+   (`pkg/meter/pusher.go:208`) dispatches on the concrete provider type
+   and emits the label into `meterd_ops_total{op="paddle",code=…}`;
+   `pkg/wire/metrics.go:2725` pre-instantiates the histogram labels
+   from `paddle.PushResultLabels()` at registry init so the dashboard
+   panel renders even before the first push. The v1 "Negative/deferred"
+   bullet for the classifier is therefore closed at v2; the launch
+   cluster re-verifies the wiring with a focused test rather than
+   re-introducing the classifier.
 
 4. **The Idempotency-Key SDK transport wrapper** (PR-E) wires the
    existing `paddle.NewIdempotencyRT` RoundTripper into
