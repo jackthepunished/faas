@@ -104,11 +104,55 @@ type Problem struct {
 	// the dashboard / SDK can render the hint as a one-line footer
 	// without parsing prose. Optional + omitempty.
 	SecretHint string `json:"secret_hint,omitempty"`
+	// Hint is the single short next-action line shown on the CLI's
+	// 3-5 line renderer (spec §6.4 amendment 1). Mirrors SecretHint
+	// shape — a one-line remediation nudge. Distinct from SecretHint:
+	// Hint is generic across all error codes, SecretHint is
+	// narrow to the strict secret-scan path. Optional + omitempty so
+	// every other problem+json site keeps its existing flat shape
+	// unchanged.
+	Hint string `json:"hint,omitempty"`
+	// Why is the human-readable explanation of why the failure
+	// happened, including the observed value (e.g. "bound to
+	// 127.0.0.1; guest at 10.0.0.2 only sees requests proxied via
+	// the bridge"). Distinct from Detail: Detail is the platform's
+	// machine-stable message; Why is the customer-facing prose
+	// surfaced only on error UX paths. Multi-line ok (≤ 512 bytes,
+	// CLI tripwire enforces). Optional + omitempty.
+	Why string `json:"why,omitempty"`
+	// Fix is the prescriptive remediation (e.g. "set
+	// `app.listen('0.0.0.0')` or run `gregale env set PORT 8080`").
+	// Distinct from Hint: Hint is a single short line; Fix may be
+	// 1-3 lines. Optional + omitempty.
+	Fix string `json:"fix,omitempty"`
+	// RelevantLogs are the last N log lines that explain the failure,
+	// surfaced inline by the CLI renderer when the server attaches
+	// them. Capped at 20 entries × 512 bytes per Message (CLI
+	// tripwire enforces). Distinct from SecretFindings which is
+	// secret-scan specific. Optional + omitempty so every other
+	// problem+json site keeps its existing flat shape unchanged.
+	RelevantLogs []LogExcerpt `json:"relevant_logs,omitempty"`
 	// extraHeaders are non-JSON response headers attached via WithHeader.
 	// Kept unexported so the wire body (RFC 7807 problem+json) is
 	// exactly the spec; WriteProblem flushes these onto the wire
 	// before WriteHeader. nil = no extras.
 	extraHeaders map[string][]string `json:"-"`
+}
+
+// LogExcerpt is one entry of Problem.RelevantLogs — a small,
+// shape-stable slice of a log line that explains the failure inline.
+// Distinct from SecretFinding (which is narrow to secret-scan): the
+// CLI renderer prints this as a fenced block under the 3-5 line
+// explanation. Timestamp is RFC 3339; Level is one of info|warn|error;
+// Source tags the log origin so the customer can attribute the line
+// (build vs vm-init vs app vs gateway); Message is the line content,
+// capped at 512 bytes server-side (CLI tripwire enforces the cap
+// client-side as well).
+type LogExcerpt struct {
+	Timestamp string `json:"ts"`
+	Level     string `json:"level"`
+	Source    string `json:"source,omitempty"`
+	Message   string `json:"message"`
 }
 
 // FieldError is one per-field entry of Problem.Errors. The shape mirrors
@@ -210,6 +254,42 @@ func (p *Problem) WithDocs(url string) *Problem {
 func (p *Problem) WithSecretScan(findings []SecretFinding, hint string) *Problem {
 	p.SecretFindings = findings
 	p.SecretHint = hint
+	return p
+}
+
+// WithHint attaches the single short next-action line shown on the
+// CLI's 3-5 line renderer (spec §6.4 amendment 1). Mirrors
+// SecretHint shape — a one-line remediation nudge. Returns the same
+// pointer for chaining.
+func (p *Problem) WithHint(hint string) *Problem {
+	p.Hint = hint
+	return p
+}
+
+// WithWhy attaches the human-readable explanation of why the failure
+// happened (spec §6.4 amendment 1). Distinct from Detail: Detail is
+// the platform's machine-stable message; Why is the customer-facing
+// prose surfaced only on error UX paths. Multi-line ok (≤ 512 bytes;
+// CLI tripwire enforces). Returns the same pointer for chaining.
+func (p *Problem) WithWhy(why string) *Problem {
+	p.Why = why
+	return p
+}
+
+// WithFix attaches the prescriptive remediation (spec §6.4
+// amendment 1). Distinct from Hint: Hint is a single short line; Fix
+// may be 1-3 lines. Returns the same pointer for chaining.
+func (p *Problem) WithFix(fix string) *Problem {
+	p.Fix = fix
+	return p
+}
+
+// WithRelevantLogs attaches the last N log lines that explain the
+// failure, surfaced inline by the CLI renderer. Capped at 20
+// entries × 512 bytes per Message (CLI tripwire enforces). Returns
+// the same pointer for chaining.
+func (p *Problem) WithRelevantLogs(logs []LogExcerpt) *Problem {
+	p.RelevantLogs = logs
 	return p
 }
 
