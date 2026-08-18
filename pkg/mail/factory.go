@@ -6,12 +6,19 @@
 //	postmark → NewPostmarkSender (FAAS_MAIL_POSTMARK_TOKEN required)
 //	noop     → NoopSender (silent drop, for tests)
 //
-// The transport name comes from FAAS_MAIL_TRANSPORT. On misconfig
-// (e.g. transport=resend without an API key) we fall back to the
-// log sender with a warning — better than failing to start.
+// The transport name comes from FAAS_MAIL_TRANSPORT. When the operator
+// selects resend or postmark, the missing-credential branch is
+// fail-closed: SenderFromEnv returns (nil, ErrMailerMisconfigured)
+// wrapped with the underlying config error so the daemon refuses to
+// boot. The fail-soft behaviour is preserved for the unset-default
+// (FAAS_MAIL_TRANSPORT="" → LogSender) and for an unknown transport
+// name — those are dev/CI defaults, not production misconfig. See
+// docs/adr/115-transactional-email-provider-resend.md §D5 for the
+// G4-closure fail-closed contract.
 package mail
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -26,14 +33,40 @@ const (
 	TransportPostmark = "postmark"
 )
 
+// ErrMailerMisconfigured is the sentinel returned by SenderFromEnv when
+// the operator selected a live transport (resend or postmark) but the
+// required credential env var (FAAS_MAIL_RESEND_API_KEY or
+// FAAS_MAIL_POSTMARK_TOKEN) is empty. apid + meterd catch this on boot,
+// log a single ERROR record, and exit non-zero so the operator cannot
+// accidentally run a daemon that silently drops email into slog. The
+// unset-default branch (FAAS_MAIL_TRANSPORT empty) keeps the fail-soft
+// LogSender behaviour because the spec default for dev is LogSender;
+// the fail-closed contract only fires when an operator has explicitly
+// asked for a live transport.
+var ErrMailerMisconfigured = errors.New("mail: transport misconfigured")
+
+// ErrResendMissingAPIKey / ErrResendMissingFrom /
+// ErrPostmarkMissingToken / ErrPostmarkMissingFrom document the four
+// concrete credential-shape errors NewResendSender / NewPostmarkSender
+// return. They are wrapped by ErrMailerMisconfigured at the factory
+// layer so callers can errors.Is against either shape.
+var (
+	ErrResendMissingAPIKey  = errors.New("mail: Resend APIKey required")
+	ErrResendMissingFrom    = errors.New("mail: Resend From address required")
+	ErrPostmarkMissingToken = errors.New("mail: Postmark ServerToken required")
+	ErrPostmarkMissingFrom  = errors.New("mail: Postmark From address required")
+)
+
 // SenderFromEnv picks a Sender based on the FAAS_MAIL_TRANSPORT env
-// variable. Defaults to "log" when unset. On misconfig (transport set
-// but required envs missing), logs a warning and falls back to log so
-// the daemon still boots.
+// variable. Defaults to "log" when unset. When the operator selects a
+// live transport but the credential is missing, returns
+// (nil, ErrMailerMisconfigured wrapped with the underlying error) so
+// the daemon can refuse to boot. Unset-default and unknown-transport
+// stay fail-soft to LogSender for dev/CI.
 //
 // Resend: needs FAAS_MAIL_RESEND_API_KEY + FAAS_MAIL_FROM.
 // Postmark: needs FAAS_MAIL_POSTMARK_TOKEN + FAAS_MAIL_FROM.
-func SenderFromEnv(getenv func(string) string, log *slog.Logger) Sender {
+func SenderFromEnv(getenv func(string) string, log *slog.Logger) (Sender, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -43,7 +76,7 @@ func SenderFromEnv(getenv func(string) string, log *slog.Logger) Sender {
 	switch strings.ToLower(getenv("FAAS_MAIL_TRANSPORT")) {
 	case TransportNoop:
 		log.Info("mail.transport", "transport", TransportNoop)
-		return NoopSender{}
+		return NoopSender{}, nil
 	case TransportResend:
 		cfg := ResendConfig{
 			APIKey: getenv("FAAS_MAIL_RESEND_API_KEY"),
@@ -51,11 +84,10 @@ func SenderFromEnv(getenv func(string) string, log *slog.Logger) Sender {
 		}
 		s, err := NewResendSender(cfg)
 		if err != nil {
-			log.Warn("mail.transport invalid; falling back to log", "transport", TransportResend, "err", err)
-			return NewLogSender(log)
+			return nil, fmt.Errorf("mail: transport=resend: %w: %w", ErrMailerMisconfigured, err)
 		}
 		log.Info("mail.transport", "transport", TransportResend)
-		return s
+		return s, nil
 	case TransportPostmark:
 		cfg := PostmarkConfig{
 			ServerToken: getenv("FAAS_MAIL_POSTMARK_TOKEN"),
@@ -63,24 +95,16 @@ func SenderFromEnv(getenv func(string) string, log *slog.Logger) Sender {
 		}
 		s, err := NewPostmarkSender(cfg)
 		if err != nil {
-			log.Warn("mail.transport invalid; falling back to log", "transport", TransportPostmark, "err", err)
-			return NewLogSender(log)
+			return nil, fmt.Errorf("mail: transport=postmark: %w: %w", ErrMailerMisconfigured, err)
 		}
 		log.Info("mail.transport", "transport", TransportPostmark)
-		return s
+		return s, nil
 	case TransportLog, "":
 		log.Info("mail.transport", "transport", TransportLog)
-		return NewLogSender(log)
+		return NewLogSender(log), nil
 	default:
 		log.Warn("mail.transport unknown; falling back to log",
 			"transport", getenv("FAAS_MAIL_TRANSPORT"))
-		return NewLogSender(log)
+		return NewLogSender(log), nil
 	}
 }
-
-// Sentinel error for upstream-config failures (so tests can assert
-// on misconfig instead of substring-matching the warning string).
-var (
-	ErrResendMissingAPIKey  = fmt.Errorf("mail: Resend APIKey required")
-	ErrPostmarkMissingToken = fmt.Errorf("mail: Postmark ServerToken required")
-)

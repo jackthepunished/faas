@@ -155,7 +155,10 @@ func TestPostmarkSender_MissingToken(t *testing.T) {
 func TestSenderFromEnv_PicksLog(t *testing.T) {
 	getenv := func(string) string { return "" }
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := mail.SenderFromEnv(getenv, log)
+	s, err := mail.SenderFromEnv(getenv, log)
+	if err != nil {
+		t.Fatalf("SenderFromEnv: %v", err)
+	}
 	if _, ok := s.(*mail.LogSender); !ok {
 		t.Errorf("default transport = %T, want *mail.LogSender", s)
 	}
@@ -170,16 +173,21 @@ func TestSenderFromEnv_PicksNoop(t *testing.T) {
 		}
 		return ""
 	}
-	s := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("SenderFromEnv: %v", err)
+	}
 	if _, ok := s.(mail.NoopSender); !ok {
 		t.Errorf("transport = %T, want mail.NoopSender", s)
 	}
 }
 
-// TestSenderFromEnv_ResendFallsBackOnMissingAPIKey confirms a
-// misconfigured resend falls back to log + warning rather than
-// booting a half-working mailer.
-func TestSenderFromEnv_ResendFallsBackOnMissingAPIKey(t *testing.T) {
+// TestSenderFromEnv_ResendFailsClosedOnMissingAPIKey confirms the
+// fail-closed contract: an operator-selected resend transport with
+// FAAS_MAIL_RESEND_API_KEY empty returns ErrMailerMisconfigured so
+// apid/meterd refuse to boot (G4-closure ADR-115 §D5). The pre-#115
+// behaviour was a WARN + LogSender fallback.
+func TestSenderFromEnv_ResendFailsClosedOnMissingAPIKey(t *testing.T) {
 	getenv := func(k string) string {
 		switch k {
 		case "FAAS_MAIL_TRANSPORT":
@@ -189,9 +197,15 @@ func TestSenderFromEnv_ResendFallsBackOnMissingAPIKey(t *testing.T) {
 		}
 		return ""
 	}
-	s := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if _, ok := s.(*mail.LogSender); !ok {
-		t.Errorf("misconfig transport = %T, want *mail.LogSender (fallback)", s)
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !errors.Is(err, mail.ErrMailerMisconfigured) {
+		t.Fatalf("err = %v, want errors.Is(err, mail.ErrMailerMisconfigured)", err)
+	}
+	if s != nil {
+		t.Errorf("sender = %T, want nil on fail-closed", s)
+	}
+	if !errors.Is(err, mail.ErrResendMissingAPIKey) {
+		t.Errorf("err = %v, want wrapped mail.ErrResendMissingAPIKey", err)
 	}
 }
 
@@ -209,14 +223,45 @@ func TestSenderFromEnv_PicksResendLive(t *testing.T) {
 		}
 		return ""
 	}
-	s := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("SenderFromEnv: %v", err)
+	}
 	if _, ok := s.(*mail.ResendSender); !ok {
 		t.Errorf("transport = %T, want *mail.ResendSender", s)
 	}
 }
 
+// TestSenderFromEnv_PostmarkFailsClosedOnMissingToken mirrors
+// TestSenderFromEnv_ResendFailsClosedOnMissingAPIKey for the
+// Postmark sibling (ADR-115 §D5).
+func TestSenderFromEnv_PostmarkFailsClosedOnMissingToken(t *testing.T) {
+	getenv := func(k string) string {
+		switch k {
+		case "FAAS_MAIL_TRANSPORT":
+			return "postmark"
+		case "FAAS_MAIL_FROM":
+			return "ops@example.test"
+		}
+		return ""
+	}
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !errors.Is(err, mail.ErrMailerMisconfigured) {
+		t.Fatalf("err = %v, want errors.Is(err, mail.ErrMailerMisconfigured)", err)
+	}
+	if s != nil {
+		t.Errorf("sender = %T, want nil on fail-closed", s)
+	}
+	if !errors.Is(err, mail.ErrPostmarkMissingToken) {
+		t.Errorf("err = %v, want wrapped mail.ErrPostmarkMissingToken", err)
+	}
+}
+
 // TestSenderFromEnv_UnknownTransportFallsBack confirms an
-// unrecognised transport name falls back to log + warning.
+// unrecognised transport name falls back to log + warning. The
+// fail-soft behaviour is preserved here (and only here) because an
+// unknown transport is operator-typo territory, not production
+// misconfig.
 func TestSenderFromEnv_UnknownTransportFallsBack(t *testing.T) {
 	getenv := func(k string) string {
 		if k == "FAAS_MAIL_TRANSPORT" {
@@ -224,7 +269,10 @@ func TestSenderFromEnv_UnknownTransportFallsBack(t *testing.T) {
 		}
 		return ""
 	}
-	s := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err := mail.SenderFromEnv(getenv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("SenderFromEnv: %v", err)
+	}
 	if _, ok := s.(*mail.LogSender); !ok {
 		t.Errorf("unknown transport = %T, want *mail.LogSender (fallback)", s)
 	}
