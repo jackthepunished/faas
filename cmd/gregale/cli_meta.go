@@ -647,6 +647,18 @@ var cliCommands = []cliCommand{
 		Positionals: []string{"<slug>", "<wake-id>"},
 	},
 	{
+		Name:    "throttle-suggestions",
+		DocSlug: "throttle-suggestions",
+		Short:   "Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions <slug> [--range 5m] [--dry-run --candidate-rps N --candidate-burst N])",
+		Flags: []cliFlag{
+			{Name: "range", Short: "observation window (e.g. 5m|1h|24h)", ClosedSet: []string{"5m", "15m", "1h", "6h", "24h"}},
+			{Name: "dry-run", Short: "enable the dry-run preview pass (requires --candidate-rps)"},
+			{Name: "candidate-rps", Short: "candidate rate-limit rps for the dry-run preview"},
+			{Name: "candidate-burst", Short: "candidate burst for the dry-run preview"},
+		},
+		Positionals: []string{"<slug>"},
+	},
+	{
 		Name:    "wake",
 		DocSlug: "park-wake",
 		Short:   "Wake a parked app (pulls out of snapshot)",

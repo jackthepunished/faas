@@ -4326,7 +4326,7 @@ haveApp:
 	// keeps working without flooding logs.
 	if app.AccountID == "" {
 		h.warnEmptyAccountOnce()
-	} else if !h.accountLimiter.AllowAccount(r.Context(), app.AccountID, app.Plan) {
+	} else if !h.accountLimiter.AllowAccount(r.Context(), app.AccountID, app.Plan) { //nolint:contextcheck // r.Context() is the inherited per-request ctx in ServeHTTP
 		w.Header().Set("Retry-After", "1")
 		w.Header().Set("x-faas-rate-limit-scope", "account")
 		// Per-account 429 still surfaces the per-account bucket state
@@ -4345,7 +4345,7 @@ haveApp:
 	}
 
 	// Per-app rate limit (spec §4.1). Over-limit → 429.
-	if !h.limiter.Allow(r.Context(), app.ID, app.Plan) {
+	if !h.limiter.Allow(r.Context(), app.ID, app.Plan) { //nolint:contextcheck // r.Context() is the inherited per-request ctx in ServeHTTP
 		w.Header().Set("Retry-After", "1")
 		w.Header().Set("x-faas-rate-limit-scope", "app")
 		// 429 path: write the post-decrement bucket snapshot so

@@ -1013,7 +1013,7 @@ func splitCentralKey(centralKey string) (scope, subjectID, plan string, ok bool)
 		return "", "", "", false
 	}
 	switch scope {
-	case "app", "account", "rule":
+	case rateLimitScopeApp, rateLimitScopeAccount, rateLimitScopeRule:
 	default:
 		return "", "", "", false
 	}
