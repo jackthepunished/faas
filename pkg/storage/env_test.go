@@ -273,6 +273,33 @@ func TestBackendFromEnv_OCIRequiresRegistry(t *testing.T) {
 	}
 }
 
+// TestBackendFromEnv_OCI_LocalPrefixKeepsNamespace pins the split-box
+// routing contract: PrefixRouter strips the route before dispatch, so each
+// local-prefix backend must be rooted at that prefix's directory.
+func TestBackendFromEnv_OCI_LocalPrefixKeepsNamespace(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
+	t.Setenv("FAAS_OCI_REGISTRY", "http://127.0.0.1:0/fake")
+	t.Setenv("FAAS_STORAGE_ROOT", filepath.Join(tmp, "fc"))
+	t.Setenv("FAAS_STORAGE_LOCAL_PREFIXES", "kernel/,base/")
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", "")
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	if err := be.Put(t.Context(), "kernel/1.7.0", strings.NewReader("kernel")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	want := filepath.Join(tmp, "fc", "kernel", "1.7.0")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("kernel file at %s: %v", want, err)
+	}
+	wrong := filepath.Join(tmp, "fc", "1.7.0")
+	if _, err := os.Stat(wrong); err == nil {
+		t.Fatalf("kernel file landed at %s; prefix was stripped from local root", wrong)
+	}
+}
+
 // TestBackendFromEnv_OCIRejectsUnknown verifies unknown backend kinds
 // are rejected at startup.
 func TestBackendFromEnv_OCIRejectsUnknown(t *testing.T) {

@@ -71,6 +71,60 @@ func TestDecideMode_BadJSONFallsBackToApp(t *testing.T) {
 	}
 }
 
+func TestEnsureResolverFile_PreservesUsableConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	want := "nameserver 10.0.0.1\n"
+	if err := os.WriteFile(path, []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureResolverFile(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("resolver config changed: %q", got)
+	}
+}
+
+func TestEnsureResolverFileCreatesFallbackAndReplacesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	path := filepath.Join(dir, "resolv.conf")
+	if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureResolverFile(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("resolver path remained a symlink")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasNameserver(got) {
+		t.Fatalf("fallback has no nameserver: %q", got)
+	}
+	targetGot, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(targetGot) != "target" {
+		t.Fatalf("symlink target was modified: %q", targetGot)
+	}
+}
+
 // TestClassifyExitCodes is the canonical exit-code → FailureClass mapping.
 // builderd's ProcessOne consumes these strings.
 func TestClassifyExitCodes(t *testing.T) {
@@ -154,6 +208,33 @@ func TestFlattenSingleSourceDir(t *testing.T) {
 	}
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
 		t.Fatalf("archive root still exists: err=%v", err)
+	}
+}
+
+func TestStageExecutable_CopiesAndMarksExecutable(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source")
+	target := filepath.Join(dir, "nested", "mise")
+	want := []byte("mise-musl")
+	if err := os.WriteFile(source, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageExecutable(source, target); err != nil {
+		t.Fatalf("stageExecutable: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("target = %q, want %q", got, want)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("target mode = %o, want 755", info.Mode().Perm())
 	}
 }
 

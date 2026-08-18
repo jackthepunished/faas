@@ -64,6 +64,9 @@ func UnitImaged() daemonunit.Unit {
 
 		EnvironmentFile: "/etc/faas/sealed.env",
 		Environment: []daemonunit.KV{
+			// ProtectSystem=strict makes the host /tmp read-only. Keep OCI
+			// layer verification and upload scratch on the writable base disk.
+			{Key: "TMPDIR", Value: "/srv/fc/base"},
 			{Key: "FAAS_BASE_STAGING_ROOT", Value: "/dev/shm/faas-base-staging"},
 			{Key: "FAAS_BASE_EXTRACT_ROOT", Value: "/srv/fc/base-staging"},
 			{Key: "FAAS_BASE_TMP_ROOT", Value: "/srv/fc/base"},

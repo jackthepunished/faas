@@ -12,6 +12,15 @@
 # db_url: Postgres DSN. Empty => $DATABASE_URL from the environment.
 # db_url = ""
 
+# ADR-053 split-box vmmd client. FAAS_VMM_SOCK and the three
+# FAAS_VMM_TLS_*_PATH variables are read from /etc/faas/imaged.env.
+# Leave them unset for a single-box deployment using the Unix socket.
+# Example:
+#   FAAS_VMM_SOCK=tcp://vmmd.faas:50051
+#   FAAS_VMM_TLS_CERT_PATH=/etc/faas/tls/imaged/vmmd-client.crt
+#   FAAS_VMM_TLS_KEY_PATH=/etc/faas/tls/imaged/vmmd-client.key
+#   FAAS_VMM_TLS_CA_PATH=/etc/faas/tls/ca/ca.crt
+
 # Per-app cosign signature-enforcement (issue #472 / ADR-058).
 # imaged reads this directory once at startup and on every
 # pg_notify('trusted_signer_changed') event. Each .pem file is

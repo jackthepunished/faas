@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // grype.go — Grype subprocess runner (issue #299).
@@ -134,7 +136,12 @@ func RunGrypeAt(ctx context.Context, bin, dir string) (*ScanResult, error) {
 // the dashboard's handler-edge cap (cmd/apid/handlers_dashboard.go)
 // truncates to 10 before the template renders.
 func runGrypeImpl(ctx context.Context, bin, dir string) (*ScanResult, error) {
-	cmd := exec.CommandContext(ctx, bin, "dir:"+dir, "-o", "json")
+	scanDir, cleanup, err := prepareGrypeSource(ctx, dir)
+	if err != nil {
+		return nil, fmt.Errorf("imaged: prepare grype source %q: %w", dir, err)
+	}
+	defer cleanup()
+	cmd := exec.CommandContext(ctx, bin, "dir:"+scanDir, "-o", "json")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -142,6 +149,61 @@ func runGrypeImpl(ctx context.Context, bin, dir string) (*ScanResult, error) {
 		return nil, fmt.Errorf("imaged: grype scan dir %q: %w (stderr=%q)", dir, err, stderr.String())
 	}
 	return parseGrypeOutput(stdout.Bytes(), dir)
+}
+
+// prepareGrypeSource turns an ext4 image into a directory Grype can catalog.
+// Grype's dir source walks a filesystem tree; it does not mount or unpack an
+// ext4 file passed as dir:<path>. Base staging produces ext4 images, and the
+// remote per-deploy scan stages one as rootfs.ext4 inside a temporary folder,
+// so both shapes are normalized here before invoking the scanner.
+//
+// debugfs only reads the image. The extracted tree is temporary and is
+// removed by the returned cleanup function. The parent directory is selected
+// from the input path so OCI scan materialization stays under the daemon's
+// already-authorized scratch root rather than falling back to an arbitrary
+// system temp location.
+func prepareGrypeSource(ctx context.Context, source string) (string, func(), error) {
+	info, err := os.Stat(source)
+	if err != nil {
+		return "", func() {}, err
+	}
+	image := source
+	root := filepath.Dir(source)
+	if info.IsDir() {
+		candidate := filepath.Join(source, "rootfs.ext4")
+		candidateInfo, statErr := os.Stat(candidate)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return source, func() {}, nil
+			}
+			return "", func() {}, fmt.Errorf("stat rootfs image: %w", statErr)
+		}
+		if candidateInfo.IsDir() {
+			return source, func() {}, nil
+		}
+		image = candidate
+		root = filepath.Dir(source)
+	}
+
+	stageDir, err := os.MkdirTemp(root, "imaged-grype-")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("mkdir extraction dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(stageDir) }
+	request := fmt.Sprintf("rdump / %s", stageDir)
+	cmd := exec.CommandContext(ctx, "debugfs", "-R", request, image)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("debugfs extract: %w (output=%q)", err, string(output))
+	}
+	// debugfs preserves image ownership and modes. The scan runs as the
+	// unprivileged imaged user in the canonical unit, so make the temporary
+	// copy readable/traversable without changing the source image.
+	if output, err := exec.CommandContext(ctx, "chmod", "-R", "a+rX", stageDir).CombinedOutput(); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("chmod extraction: %w (output=%q)", err, string(output))
+	}
+	return stageDir, cleanup, nil
 }
 
 // parseGrypeOutput decodes the grype JSON output into a typed

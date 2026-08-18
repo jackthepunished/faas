@@ -61,6 +61,11 @@ type MiddlewareConfig struct {
 	// Now is the clock used to stamp Budget.Started at attach time.
 	// nil → time.Now.
 	Now func() time.Time
+	// DefaultFor optionally selects a route-specific default budget.
+	// Returning <= 0 keeps Default. The selected value is still
+	// clamped to Max, so a route callback cannot widen the configured
+	// absolute ceiling.
+	DefaultFor func(*http.Request) time.Duration
 }
 
 // NewMiddlewareConfig validates cfg and returns it. The constructor
@@ -134,6 +139,14 @@ func (cfg MiddlewareConfig) Middleware(next http.Handler) http.Handler {
 		// ReadTimeout / WriteTimeout on r.Context() at listener
 		// dispatch). WithRemaining does both clampings.
 		total := cfg.Default
+		if cfg.DefaultFor != nil {
+			if routeDefault := cfg.DefaultFor(r); routeDefault > 0 {
+				total = routeDefault
+			}
+		}
+		if total > cfg.Max {
+			total = cfg.Max
+		}
 		ctx, cancel, b := WithRemaining(r.Context(), total, cfg.Max, cfg.Route, cfg.Endpoint)
 		defer cancel()
 

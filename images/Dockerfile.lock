@@ -1,19 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "version": 1,
-  "comment": "Tier 3 (issue #197 B3.5 + B3.6). The FROM line in each Dockerfile below this lock is digest-pinned; this lock is the source of truth. `make images-lock-update` resolves the current registry digest and updates BOTH the lock and the FROM line. CI runs `make images-lock-check` to fail any PR that drifts (either a Dockerfile with a non-digest-pinned FROM, or a Dockerfile whose FROM line doesn't match the lock's `pinned_in_dockerfile` field). The PLACEHOLDER digests below fail the check by design — the operator runs `make images-lock-update` once at PR-merge time, before this file is squashed into main. `scratch` is the canonical empty image and is exempt from the lock (audit_dockerfile_froms.py whitelists it).",
-  "generated_at": "2026-07-26T00:00:00Z",
+  "comment": "Tier 3 (issue #197 B3.5 + B3.6). The FROM line in each Dockerfile below this lock is digest-pinned; this lock is the source of truth. `make images-lock-update` resolves the current registry digest and updates BOTH the lock and the FROM line. CI runs `make images-lock-check` to fail any PR that drifts (either a Dockerfile with a non-digest-pinned FROM, or a Dockerfile whose FROM line doesn't match the lock's `pinned_in_dockerfile` field). The PLACEHOLDER digests below fail the check by design \u2014 the operator runs `make images-lock-update` once at PR-merge time, before this file is squashed into main. `scratch` is the canonical empty image and is exempt from the lock (audit_dockerfile_froms.py whitelists it).",
+  "generated_at": "2026-08-18T13:24:34Z",
   "generated_by": "make images-lock-update",
   "pinned": [
     {
       "dockerfile": "images/builder-base.Dockerfile",
       "instruction": "FROM",
-      "alias": "debian:12-slim",
-      "resolved_repo": "docker.io/library/debian",
-      "resolved_tag": "12-slim",
+      "alias": "alpine:3.22",
+      "resolved_repo": "docker.io/library/alpine",
+      "resolved_tag": "3.22",
       "platform": "linux/amd64",
-      "digest": "sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241",
-      "pinned_in_dockerfile": "FROM debian:12-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241"
+      "digest": "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
+      "pinned_in_dockerfile": "FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
     },
     {
       "dockerfile": "images/builder-base.Dockerfile",
@@ -32,8 +32,8 @@
       "resolved_repo": "docker.io/library/debian",
       "resolved_tag": "12-slim",
       "platform": "linux/amd64",
-      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
-      "pinned_in_dockerfile": "FROM debian:12-slim@sha256:REPLACE_ME_AT_MERGE_TIME AS build"
+      "digest": "sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241",
+      "pinned_in_dockerfile": "FROM debian:12-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS build"
     },
     {
       "dockerfile": "images/runner-node22.Dockerfile",
@@ -42,8 +42,8 @@
       "resolved_repo": "docker.io/library/node",
       "resolved_tag": "22-bookworm-slim",
       "platform": "linux/amd64",
-      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
-      "pinned_in_dockerfile": "FROM node:22-bookworm-slim@sha256:REPLACE_ME_AT_MERGE_TIME"
+      "digest": "sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436",
+      "pinned_in_dockerfile": "FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436"
     },
     {
       "dockerfile": "images/runner-python312.Dockerfile",
@@ -52,8 +52,8 @@
       "resolved_repo": "docker.io/library/python",
       "resolved_tag": "3.12-slim-bookworm",
       "platform": "linux/amd64",
-      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
-      "pinned_in_dockerfile": "FROM python:3.12-slim-bookworm@sha256:REPLACE_ME_AT_MERGE_TIME"
+      "digest": "sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134",
+      "pinned_in_dockerfile": "FROM python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134"
     },
     {
       "dockerfile": "images/runner-go124.Dockerfile",
@@ -62,8 +62,8 @@
       "resolved_repo": "docker.io/library/golang",
       "resolved_tag": "1.24-bookworm",
       "platform": "linux/amd64",
-      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
-      "pinned_in_dockerfile": "FROM golang:1.24-bookworm@sha256:REPLACE_ME_AT_MERGE_TIME"
+      "digest": "sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac",
+      "pinned_in_dockerfile": "FROM golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac"
     },
     {
       "dockerfile": "images/runner-go124-alpine.Dockerfile",
@@ -72,8 +72,8 @@
       "resolved_repo": "docker.io/library/golang",
       "resolved_tag": "1.24-alpine",
       "platform": "linux/amd64",
-      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
-      "pinned_in_dockerfile": "FROM golang:1.24-alpine@sha256:REPLACE_ME_AT_MERGE_TIME"
+      "digest": "sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191",
+      "pinned_in_dockerfile": "FROM golang:1.24-alpine@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191"
     },
     {
       "dockerfile": "images/runner-node24.Dockerfile",
@@ -82,8 +82,8 @@
       "resolved_repo": "docker.io/library/node",
       "resolved_tag": "24-bookworm-slim",
       "platform": "linux/amd64",
-      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
-      "pinned_in_dockerfile": "FROM node:24-bookworm-slim@sha256:REPLACE_ME_AT_MERGE_TIME"
+      "digest": "sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03",
+      "pinned_in_dockerfile": "FROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03"
     },
     {
       "dockerfile": "images/runner-python313.Dockerfile",
@@ -92,8 +92,8 @@
       "resolved_repo": "docker.io/library/python",
       "resolved_tag": "3.13-slim-bookworm",
       "platform": "linux/amd64",
-      "digest": "sha256:REPLACE_ME_AT_MERGE_TIME",
-      "pinned_in_dockerfile": "FROM python:3.13-slim-bookworm@sha256:REPLACE_ME_AT_MERGE_TIME"
+      "digest": "sha256:00faa2debb87529f9f0764e9491d8ba400a3678976616c3bd7cb193745ac20d1",
+      "pinned_in_dockerfile": "FROM python:3.13-slim-bookworm@sha256:00faa2debb87529f9f0764e9491d8ba400a3678976616c3bd7cb193745ac20d1"
     }
   ]
 }

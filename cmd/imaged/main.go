@@ -293,6 +293,24 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		log.Info("imaged: split-box artifact replicator enabled", "helper", helper)
 	}
 
+	// ADR-053: imaged asks vmmd to mount parent ext4 layers. In a split-box
+	// deployment vmmd serves TCP with mTLS rather than the legacy local Unix
+	// socket, so load the optional client cluster before constructing the
+	// lazy client. All three paths empty preserves single-box behaviour.
+	vmmTLS, err := wire.LoadClientTLSConfigWithPrefix(
+		"vmm_",
+		envOr("FAAS_VMM_TLS_CERT_PATH", ""),
+		envOr("FAAS_VMM_TLS_KEY_PATH", ""),
+		envOr("FAAS_VMM_TLS_CA_PATH", ""),
+	)
+	if err != nil {
+		return fmt.Errorf("imaged: load vmmd client TLS: %w", err)
+	}
+	vmmTarget := envOr("FAAS_VMM_SOCK", imaged.DefaultVMMSock)
+	if vmmTLS != nil {
+		log.Info("imaged: vmmd mTLS client configured", "target", vmmTarget)
+	}
+
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
 		WithStorage(storageBackend).
 		WithArtifactReplicator(artifactReplicator).
@@ -335,7 +353,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// matches /run/faas/vmmd.sock (ADR-015); operators can
 		// override with FAAS_VMM_SOCK for dev (e.g. a bufconn
 		// test on a Mac).
-		WithVMMClient(imaged.NewVMMClient(envOr("FAAS_VMM_SOCK", imaged.DefaultVMMSock), log))
+		WithVMMClient(imaged.NewVMMClientWithTLS(vmmTarget, vmmTLS, log))
 
 	// Issue #461 / ADR-062: load the host age identity so imaged
 	// can transiently unseal per-app private-registry Basic Auth

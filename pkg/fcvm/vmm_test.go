@@ -29,6 +29,22 @@ import (
 // Compile-time proof the production VMM satisfies the interface the Manager uses.
 var _ VMM = (*JailerVMM)(nil)
 
+func TestConsoleShowsGuestHaltedReadsTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vm-build.console")
+	if err := os.WriteFile(path, []byte(strings.Repeat("noise\n", 2000)+"reboot: System halted\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if !consoleShowsGuestHalted(path) {
+		t.Fatal("expected terminal guest halt marker")
+	}
+	if err := os.WriteFile(path, []byte("guest still running\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if consoleShowsGuestHalted(path) {
+		t.Fatal("did not expect halt marker")
+	}
+}
+
 func TestProvisionRewritesPathsIntoChroot(t *testing.T) {
 	// provision hardlinks images into the chroot and rewrites config paths to
 	// their in-chroot basenames — the jailed firecracker sees only these.

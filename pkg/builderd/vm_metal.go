@@ -29,6 +29,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -106,7 +107,7 @@ func (d *VMMDriver) Close() error {
 
 // Spawn materialises the per-VM drive1, cold-boots the VM, and returns a
 // BuildHandle the caller can pass to WaitForCompletion. The VM base is
-// d.builderBase; drive1 is a throwaway 24 GiB ext4 that carries BuildManifest
+// d.builderBase; drive1 is a throwaway 28 GiB ext4 that carries BuildManifest
 // at /etc/faas/build.json; the produced OCI tarball comes back through
 // ExportDir during Destroy.
 //
@@ -173,7 +174,11 @@ func (d *VMMDriver) Spawn(ctx context.Context, req VMRequest) (BuildHandle, erro
 	resp, err := d.cli.CreateColdBoot(ctx, &vmmdpb.CreateColdBootRequest{
 		Instance: instance,
 		App: &vmmdpb.AppSpec{
-			BaseKey:    "base/builder-base.ext4", // ADR-025: storage key → vmmd resolves via StorageBackend
+			// Keep the builder base on the same per-arch key contract as
+			// imaged's staged base and vmmd's scan gate. The legacy
+			// builder-base.ext4 spelling bypassed the published scan
+			// sidecar and made every metal build fail closed.
+			BaseKey:    sched.BaseKey("builder"), // ADR-025: storage key → vmmd resolves via StorageBackend
 			LayerKey:   drive1Path,               // absolute host path; vmmd treats as direct path (abs path bypass)
 			VcpuCount:  api.BuildVMVCPU,
 			MemSizeMib: int32(api.BuildVMRAMMB),
@@ -257,6 +262,18 @@ func (d *VMMDriver) WaitForCompletion(ctx context.Context, h BuildHandle) (Build
 		ExportDir:  h.ExportDir,
 		InstanceID: h.Instance,
 	}
+	// The guest's build-done manifest is authoritative for builder results.
+	// Firecracker may be SIGKILLed after the guest has reached "System
+	// halted" because a halted Linux guest does not always terminate the
+	// VMM process. In that case the host process status is -9, while the
+	// guest has already flushed a successful OCI image and recorded exit 0.
+	// Prefer the durable in-guest result whenever vmmd exported it.
+	if done, ok := readBuildDone(h.ExportDir); ok {
+		exitCode = done.ExitCode
+		res.ExitCode = exitCode
+		res.LogTailBytes = int64(len(done.LogTail))
+		res.FailureClass = done.FailureClass
+	}
 	if exitCode == 0 {
 		res.FailureClass = ""
 		return res, nil
@@ -264,13 +281,24 @@ func (d *VMMDriver) WaitForCompletion(ctx context.Context, h BuildHandle) (Build
 
 	// Best-effort enrichment from build-done.json. Missing file is OK — the
 	// guest died before guest-init wrote it; fall back to exit-code class.
-	res.FailureClass = classifyBuildFailure(exitCode, h.ExportDir)
+	if res.FailureClass == "" {
+		res.FailureClass = classifyBuildFailure(exitCode, h.ExportDir)
+	}
 	return res, nil
+}
+
+func readBuildDone(exportDir string) (api.BuildDone, bool) {
+	var done api.BuildDone
+	data, err := os.ReadFile(filepath.Join(exportDir, "build-done.json"))
+	if err != nil || json.Unmarshal(data, &done) != nil {
+		return api.BuildDone{}, false
+	}
+	return done, true
 }
 
 // runJanitor scans d.driveDir for *.ext4 older than 1h and removes them.
 // Best-effort: no error returned. Per the plan's Risks, vmmd crashes
-// between boot and destroy would otherwise leak 24 GiB scratch files; this
+// between boot and destroy would otherwise leak 28 GiB scratch files; this
 // is the cheap, conservative cleanup.
 func (d *VMMDriver) runJanitor() {
 	cutoff := time.Now().Add(-1 * time.Hour)

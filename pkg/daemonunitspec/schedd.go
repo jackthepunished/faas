@@ -24,9 +24,12 @@ func UnitSchedd() daemonunit.Unit {
 		After:       []string{"network.target", "faas-cp.slice"},
 		Wants:       []string{"faas-cp.slice"},
 
-		Type:       "simple",
-		User:       "faas-schedd",
-		Group:      "faas",
+		Type:  "simple",
+		User:  "faas-schedd",
+		Group: "faas",
+		ExecStartPre: []string{
+			`/usr/bin/install -d -o faas-schedd -g faas -m 0770 /var/lib/faas/oci-tmp`,
+		},
 		ExecStart:  `/opt/faas/current/bin/schedd --config /etc/faas/schedd.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
@@ -35,6 +38,9 @@ func UnitSchedd() daemonunit.Unit {
 		MemoryMax: "256M",
 
 		EnvironmentFile: "/etc/faas/sealed.env",
+		Environment: []daemonunit.KV{
+			{Key: "TMPDIR", Value: "/var/lib/faas/oci-tmp"},
+		},
 
 		NoNewPrivileges:       true,
 		ProtectSystem:         "strict",
@@ -45,7 +51,7 @@ func UnitSchedd() daemonunit.Unit {
 		ProtectControlGroups:  true,
 
 		ReadOnlyPaths:  []string{"/etc/faas"},
-		ReadWritePaths: []string{"/run/faas", "/var/log/faas"},
+		ReadWritePaths: []string{"/run/faas", "/var/lib/faas", "/var/log/faas"},
 
 		WantedBy: "multi-user.target",
 	}

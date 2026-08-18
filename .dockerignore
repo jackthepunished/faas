@@ -1,0 +1,15 @@
+.git
+.claude
+.commandcode
+.repair-box-tables.sql
+bin
+**/*.ext4
+**/*.qcow2
+**/*.img
+**/*.tar.gz
+**/*.tgz
+**/*.key
+**/*.pem
+**/*.env
+**/*.env.*
+node_modules
