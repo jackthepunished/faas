@@ -887,6 +887,22 @@ type CreateDeploymentRequest struct {
 	// api.ValidateScope before storing. A duplicate live row on
 	// (app_id, scope) → 400 deployment_scope_collision.
 	Scope string `json:"scope,omitempty"`
+	// Annotation fields (issue #977 / ADR-116). All four are
+	// optional; nil/empty on the wire = no annotation. The CLI
+	// surfaces --reason / --tag / --deployed-by; the githubd
+	// bridge stamps DeployedBy from pusher.name and PRNumber from
+	// pull_request.number; the GitHub Action defaults DeployedBy
+	// to ${{ github.actor }} and PRNumber to
+	// ${{ github.event.pull_request.number }} when present.
+	//
+	// Reason     free-form prose, ≤280 chars (DB CHECK).
+	// Tag        closed-set enum (DB CHECK; handler validates too).
+	// DeployedBy human-readable actor label.
+	// PRNumber   positive int (DB CHECK; 0 collapses to NULL).
+	Reason     *string `json:"reason,omitempty"`
+	Tag        *string `json:"tag,omitempty"`
+	DeployedBy *string `json:"deployed_by,omitempty"`
+	PRNumber   *int    `json:"pr_number,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -1499,7 +1515,7 @@ type DeploymentResponse struct {
 	// `omitempty` so pre-#606 rows render unchanged on the wire
 	// (empty strings drop from the JSON). The closed-set
 	// vocabulary for DeployedVia is enforced at the schema
-	// layer via migrations/00303's CHECK constraint; the FK on
+	// layer via migrations/00305's CHECK constraint; the FK on
 	// DeployedByUserId is ON DELETE SET NULL so revoking an
 	// account never cascades into a deleted deployment row.
 	//
@@ -1535,6 +1551,18 @@ type DeploymentResponse struct {
 	// is the unmodified GH identity, suitable for downstream
 	// GitHub-API correlation.
 	PusherLogin string `json:"pusher_login,omitempty"`
+	// Annotation echo (issue #977 / ADR-116). Mirrors the four
+	// columns from migration 00321 verbatim onto the wire so the
+	// dashboard, CLI history, and SDK consumers can render the
+	// annotation without an audit round-trip. omitempty on each
+	// so pre-feature rows return the old wire shape with all
+	// four absent. The closed-set vocabulary on `tag` and the
+	// length cap on `reason` are enforced at the schema layer
+	// (deployments_tag_set_chk / deployments_reason_len_chk).
+	Reason     string `json:"reason,omitempty"`
+	Tag        string `json:"tag,omitempty"`
+	DeployedBy string `json:"deployed_by,omitempty"`
+	PRNumber   int    `json:"pr_number,omitempty"`
 }
 
 // BuildPlan describes what the build pipeline did with the source
@@ -3480,6 +3508,17 @@ type SourceRefDeployRequest struct {
 	Repo   string `json:"repo"`
 	Ref    string `json:"ref"`
 	Format string `json:"format,omitempty"`
+	// Annotation fields (issue #977 / ADR-116). The GitHub
+	// Action .github/actions/deploy passes these from the
+	// action.yml inputs (reason / tag / deployed-by / pr-number);
+	// deployed-by defaults to ${{ github.actor }} and pr-number
+	// defaults to ${{ github.event.pull_request.number }} on the
+	// Action side. All four are optional; the apid handler stamps
+	// them onto the deployment row + the audit data{} payload.
+	Reason     string `json:"reason,omitempty"`
+	Tag        string `json:"tag,omitempty"`
+	DeployedBy string `json:"deployed_by,omitempty"`
+	PRNumber   int    `json:"pr_number,omitempty"`
 }
 
 // SourceTarballDeployRequest is the CLI-uploaded tarball sidecar for
@@ -3491,6 +3530,17 @@ type SourceRefDeployRequest struct {
 type SourceTarballDeployRequest struct {
 	Repo string `json:"repo,omitempty"`
 	Ref  string `json:"ref,omitempty"`
+	// Annotation fields (issue #977 / ADR-116). All four are
+	// optional; the CLI's zero-config path auto-captures
+	// DeployedBy from `git config user.name` when in a repo (see
+	// cmd/gregale/cmd_deploy_zero_config.go). Reason and Tag
+	// come from --reason / --tag; PRNumber is not normally
+	// supplied on a tarball deploy (it would be inferred from
+	// a paired GitHub Action, not the tarball CLI).
+	Reason     string `json:"reason,omitempty"`
+	Tag        string `json:"tag,omitempty"`
+	DeployedBy string `json:"deployed_by,omitempty"`
+	PRNumber   int    `json:"pr_number,omitempty"`
 }
 
 // PlanWorkload mirrors reposcan.Workload (Phase 3 wire shape).
