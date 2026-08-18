@@ -17,21 +17,22 @@
 # Default: info
 # log_level = "info"
 
-# [billing] block — provider config (PR-P2). Every key has a working
-# default; missing block ⇒ runnable daemon on Stripe with all secrets
-# empty. Env wins over TOML: FAAS_BILLING_PROVIDER, STRIPE_API_KEY,
+# [billing] block — provider config (PR-P2 + ADR-032 v2). Every key
+# has a working default; missing block ⇒ runnable daemon on Paddle
+# (the production billing provider at v2) with all secrets empty.
+# Env wins over TOML: FAAS_BILLING_PROVIDER, STRIPE_API_KEY,
 # STRIPE_WEBHOOK_SECRET, FAAS_PADDLE_API_KEY, FAAS_PADDLE_WEBHOOK_SECRET,
 # FAAS_PADDLE_SANDBOX override the values below when set.
 #
 # [billing]
-# provider = "stripe"     # "" | "stripe" | "paddle"; default "" (legacy = Stripe)
+# provider = "paddle"     # "" | "stripe" | "paddle"; default "" (v2 = Paddle)
 #
-# [billing.stripe]
+# [billing.paddle]            # active at v2 (ADR-032 v2)
+# api_key        = ""     # pdl_live_… or pdl_sandbox_…; or FAAS_PADDLE_API_KEY env
+# webhook_secret = ""     # whk_…                  ; or FAAS_PADDLE_WEBHOOK_SECRET env
+# sandbox        = false  # true → api.sandbox.paddle.com; or FAAS_PADDLE_SANDBOX=1
+#
+# [billing.stripe]            # legacy opt-in (FAAS_BILLING_PROVIDER=stripe)
 # api_key           = ""  # sk_test_… or sk_live_…; or STRIPE_API_KEY env
 # webhook_secret    = ""  # whsec_…              ; or STRIPE_WEBHOOK_SECRET env
 # tolerance_seconds = 300 # Stripe-Signature timestamp tolerance (default 5 min)
-#
-# [billing.paddle]
-# api_key        = ""    # pdl_live_… or pdl_sandbox_…; or FAAS_PADDLE_API_KEY env
-# webhook_secret = ""    # whk_…                  ; or FAAS_PADDLE_WEBHOOK_SECRET env
-# sandbox        = false # true → api.sandbox.paddle.com; or FAAS_PADDLE_SANDBOX=1
