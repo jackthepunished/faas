@@ -328,6 +328,9 @@ func (s *Server) CreateFromSnapshot(ctx context.Context, req *vmmdpb.CreateFromS
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
+	if inst.Method == fcvm.WakeColdBoot && inst.RestoreError != "" {
+		s.log.Warn("vmmd: restore fell back to cold boot", "instance", req.GetInstance(), "err", inst.RestoreError)
+	}
 	return wakeResponseFromInstance(req.GetInstance(), wr, inst, vmmdpb.WakeMethod_WAKE_RESTORE), nil
 }
 

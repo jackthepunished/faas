@@ -98,8 +98,29 @@ func (h *Handler) EnsureBaseExt4(
 			"imaged: EnsureBaseExt4: puller %T does not implement ManifestPuller", h.oci)
 	}
 
+	be, err := h.storageFor()
+	if err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: storageFor for base stage: %w", err)
+	}
+
 	manifest, err := mp.PullManifest(ctx, ref)
 	if err != nil {
+		// A node may already have a valid, operator-provisioned base but
+		// temporarily lack registry access (for example, during a GHCR
+		// outage or while credentials are being rotated). Preserve that
+		// installed artifact rather than taking the whole daemon down. The
+		// fallback is deliberately limited to an artifact that the storage
+		// backend can open; a missing base remains fail-closed below.
+		if rc, getErr := be.Get(ctx, baseKey); getErr == nil {
+			_ = rc.Close()
+			h.log.Warn("imaged: base manifest pull failed; using existing on-disk base image",
+				"ref", ref, "key", baseKey, "err", err)
+			return BaseStageResult{
+				OutImage:   outImage,
+				StorageKey: baseKey,
+				Skipped:    true,
+			}, nil
+		}
 		return BaseStageResult{}, fmt.Errorf("imaged: pull base manifest %s: %w", ref, err)
 	}
 
@@ -109,10 +130,6 @@ func (h *Handler) EnsureBaseExt4(
 	// restart would be wasteful and would also race the cold-boot path
 	// if a build happened to land mid-stage.
 	wantDigest := manifest.Config.Digest
-	be, err := h.storageFor()
-	if err != nil {
-		return BaseStageResult{}, fmt.Errorf("imaged: storageFor for base stage: %w", err)
-	}
 	// Idempotency: trust the digest sidecar. When it matches, the base
 	// ext4 is the right artifact — we don't re-stream its bytes here.
 	// A bare Get-and-close on baseKey would stream 130 MB through the
@@ -155,7 +172,7 @@ func (h *Handler) EnsureBaseExt4(
 	// still closes layers 0..N-1. PullBlob streams the gzipped tarball; we
 	// hand it to Builder.BuildBase which copies it through ApplyLayerGz.
 	//
-	// PullBlob takes a repo like "ghcr.io/onebox-faas/builder-base" — the
+	// PullBlob takes a repo like "ghcr.io/poyrazk/builder-base" — the
 	// host:port + path with no tag/digest suffix. ParseReference splits
 	// the ref for us (same parser the registry client uses internally).
 	ociRef, err := oci.ParseReference(ref)
@@ -182,9 +199,10 @@ func (h *Handler) EnsureBaseExt4(
 	}()
 
 	res, err := h.builder.BuildBase(ctx, rootfs.BaseBuildInput{
-		Layers:     readers,
-		Storage:    be,
-		StorageKey: baseKey,
+		Layers:        readers,
+		Storage:       be,
+		StorageKey:    baseKey,
+		GuestInitPath: h.guestInitPath,
 	})
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: build base ext4: %w", err)
@@ -420,8 +438,9 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	}
 
 	res, err := h.builder.BuildBaseFromStaging(ctx, merged, rootfs.BaseBuildInput{
-		Storage:    be,
-		StorageKey: baseKey,
+		Storage:       be,
+		StorageKey:    baseKey,
+		GuestInitPath: h.guestInitPath,
 	})
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref build base ext4: %w", err)

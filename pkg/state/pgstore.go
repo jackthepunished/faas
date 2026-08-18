@@ -4193,7 +4193,7 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 // per the ListDeploymentsForApp comment) this stays sub-10ms.
 func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumnsWithRootfs+`
+		`select `+deploymentSelectColumnsQualified+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.status <> 'deleted'
@@ -4215,7 +4215,7 @@ func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) 
 // the plan stays a single index scan + nested loop, sub-5ms.
 func (s *PgStore) ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumnsWithRootfs+`
+		`select `+deploymentSelectColumnsQualified+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.node_id = $1
@@ -6832,6 +6832,39 @@ func (s *PgStore) ClaimInvocation(ctx context.Context, id, instanceID string, le
 	return inv, nil
 }
 
+// RequeueExpiredInvocations returns abandoned dispatches to pending. The
+// row-locking CTE makes the bounded sweep safe if more than one schedd-like
+// worker is ticking at once; only rows still carrying an expired lease can be
+// reclaimed.
+func (s *PgStore) RequeueExpiredInvocations(ctx context.Context, now time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	tag, err := s.pool.Exec(ctx, `
+		with expired as (
+			select id
+			  from invocations
+			 where state = 'dispatching'
+			   and lease_expires_at is not null
+			   and lease_expires_at <= $1
+			 order by lease_expires_at, id
+			 for update skip locked
+			 limit $2
+		)
+		update invocations as i
+		   set state = 'pending',
+		       due_at = $1,
+		       lease_expires_at = null,
+		       instance_id = null,
+		       last_error = 'dispatch lease expired; requeued'
+		  from expired
+		 where i.id = expired.id`, now.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("state: invocations reclaim expired: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json.RawMessage) error {
 	// outcome (issue #791) is stamped alongside state so the cron
 	// run-history read never has to infer success from state.
@@ -6842,7 +6875,7 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 		       completed_at = now(),
 		       received_at = coalesce(received_at, now()),
 		       result = coalesce($2, result)
-		 where id = $1 and state in ('dispatching','pending')`, id, nullableJSON(result))
+		 where id = $1 and state = 'dispatching'`, id, nullableJSON(result))
 	if err != nil {
 		return err
 	}
@@ -8318,12 +8351,39 @@ type SnapshotSize struct {
 // for the per-vm fixed cost (spec §4.7 / §6.2-2). Importing pkg/api here
 // is safe: pkg/api has no outbound dependency on pkg/state, so no cycle.
 
+// scanComputeNode reads a single compute_nodes row, projecting the
+// canonical 22-column layout (matches the SELECT / RETURNING lists
+// in ActiveComputeNodes, ListAllComputeNodes, ComputeNodeByID,
+// ComputeNodeByName, CreateComputeNode, UpsertComputeNode,
+// UpsertComputeNodeFromOperator, UpsertComputeNodeFromVmmd).
+//
+// Column order (must stay locked against the SQL projections):
+//
+//	id, name, target_url, vpcpus, mem_mb, max_concurrency,
+//	admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
+//	region, zone, schedd_target_url,
+//	public_ip, public_ip_set_at,
+//	release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
+//
+// A mismatch between this Scan arg list and any of the SQL projections
+// fails at runtime with pgx's column count error — the wire-level
+// contract every helper above enforces.
+//
+// PR-3a (issue #911 / ADR-110) widened the projection from 14 to 22
+// columns: public_ip / public_ip_set_at (migration 00174 closure)
+// + release_id / manifest_hash / host_certificate / cert_fingerprint /
+// role / generation (migration 00266). Pre-PR-3a callers that hand-rolled
+// SQL against the 14-column layout must be updated together; the only
+// readers of the wider shape are the 8 helpers listed in the comment
+// above (4 SELECTs + 4 INSERT/UPSERTs).
 func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 	var n ComputeNode
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
 		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.VCPUBudget, &n.Active,
 		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone,
-		&n.ScheddTargetURL); err != nil {
+		&n.ScheddTargetURL, &n.PublicIp, &n.PublicIpSetAt,
+		&n.ReleaseID, &n.ManifestHash, &n.HostCertificate, &n.CertFingerprint,
+		&n.Role, &n.Generation); err != nil {
 		return ComputeNode{}, mapErr(err)
 	}
 	return n, nil
@@ -8333,7 +8393,9 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 where active = true
 		 order by name
@@ -8362,7 +8424,9 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 order by name
 	`)
@@ -8385,7 +8449,9 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 where id = $1
 	`, id)
@@ -8400,7 +8466,9 @@ func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNo
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 where name = $1
 	`, name)
@@ -8703,18 +8771,32 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// region/zone (issue #254 / PR #429) are nullable and default to
 	// NULL on INSERT — schedd's placement chooser doesn't yet surface
 	// them at register time, so we explicitly project NULL when the
-	// caller leaves the pointer nil. RETURNING projects all 13 columns
-	// to match scanComputeNode's scan width.
+	// caller leaves the pointer nil. The PR-3a release-bundle columns
+	// (release_id, manifest_hash, host_certificate, cert_fingerprint,
+	// role, generation) are also nullable on INSERT — operator-added
+	// pre-PR-3a rows accept the schema without a backfill. RETURNING
+	// projects all 22 columns to match scanComputeNode's scan width.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, $8,
+		        $9, $10,
+		        $11, $12,
+		        $13, $14, $15, $16, $17, $18)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Active, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Active,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	return scanComputeNode(row)
 }
 
@@ -8735,16 +8817,30 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // rows to api.VCPUSlots (160); pre-migration rows see the same
 // default via the column DEFAULT clause.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {
-	// region/zone are projected to match scanComputeNode's 14-column
+	// region/zone are projected to match scanComputeNode's 22-column
 	// scan. On conflict the existing region/zone values are preserved
 	// (operator-driven locality label, not a vmmd-side knob); see
 	// migrations/00069_compute_nodes_region_zone.sql for the
-	// default-local backfill. RETURNING projects all 14 columns.
+	// default-local backfill. The PR-3a release-bundle columns
+	// (release_id, manifest_hash, host_certificate, cert_fingerprint,
+	// role, generation) mirror the existing owner-driven split:
+	// release_id / manifest_hash / role are operator-tunable (bundle
+	// install + renderer stamp them) and re-apply on conflict;
+	// host_certificate / cert_fingerprint are secrets-init-driven and
+	// use COALESCE to preserve any value PR-X wrote first; generation
+	// is doctor-driven and uses COALESCE so the doctor's bump is
+	// monotonic (a later UPSERT with nil generation must not lower the
+	// counter). RETURNING projects all 22 columns.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, true,
+		        $8, $9,
+		        $10, $11,
+		        $12, $13, $14, $15, $16, $17)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
@@ -8752,12 +8848,27 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
-		      active              = true
+		      active              = true,
+		      region              = excluded.region,
+		      zone                = excluded.zone,
+		      schedd_target_url   = excluded.schedd_target_url,
+		      release_id          = excluded.release_id,
+		      manifest_hash       = excluded.manifest_hash,
+		      role                = excluded.role,
+		      host_certificate    = coalesce(compute_nodes.host_certificate, excluded.host_certificate),
+		      cert_fingerprint    = coalesce(compute_nodes.cert_fingerprint, excluded.cert_fingerprint),
+		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node %q: %w", node.Name, err)
@@ -8775,11 +8886,23 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 // an operator-side COALESCE for region/zone that vmmd shouldn't
 // touch) has exactly one place to land.
 func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node ComputeNode) (ComputeNode, error) {
+	// Operator owns the release-bundle metadata too: PR-X secrets init
+	// stamps host_certificate / cert_fingerprint at first contact, the
+	// renderer (PR-2) stamps manifest_hash + role, release install
+	// (PR-3) stamps release_id. Every PR-3a column re-applies on
+	// conflict so the operator's POST wins across the board. The
+	// generation counter still uses COALESCE because the doctor's bump
+	// must be monotonic — a subsequent operator POST must not lower it.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, true,
+		        $8, $9,
+		        $10, $11,
+		        $12, $13, $14, $15, $16, $17)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
@@ -8787,12 +8910,27 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
-		      active              = true
+		      active              = true,
+		      region              = excluded.region,
+		      zone                = excluded.zone,
+		      schedd_target_url   = excluded.schedd_target_url,
+		      release_id          = excluded.release_id,
+		      manifest_hash       = excluded.manifest_hash,
+		      host_certificate    = excluded.host_certificate,
+		      cert_fingerprint    = excluded.cert_fingerprint,
+		      role                = excluded.role,
+		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node (operator) %q: %w", node.Name, err)
@@ -8819,11 +8957,26 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 // instead of the second box. See
 // docs/runbooks/multi-host-rollout.md §3.5 + §4.5.
 func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNode) (ComputeNode, error) {
+	// vmmd self-registration — the vmmd-owned resource numbers win on
+	// conflict, while operator-POSTed values are PRESERVED via COALESCE
+	// (the load-bearing fix for the second-box cutover, see the prose
+	// comment on this method). The PR-3a release-bundle columns follow
+	// the same shape: release_id / manifest_hash / role are operator-
+	// POSTed and use COALESCE (vmmd must not overwrite them), and
+	// host_certificate / cert_fingerprint are secrets-init-driven and
+	// use COALESCE on the existing value too (vmmd doesn't write cert
+	// material; only PR-X secrets init does). generation uses
+	// COALESCE so the doctor's monotonic counter survives.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, true,
+		        $8, $9,
+		        $10, $11,
+		        $12, $13, $14, $15, $16, $17)
 		on conflict (name) do update
 		  set vpcpus              = excluded.vpcpus,
 		      mem_mb              = excluded.mem_mb,
@@ -8831,12 +8984,29 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
 		      active              = true,
-		      target_url          = coalesce(compute_nodes.target_url, excluded.target_url)
+		      target_url          = coalesce(compute_nodes.target_url, excluded.target_url),
+		      region              = coalesce(compute_nodes.region, excluded.region),
+		      zone                = coalesce(compute_nodes.zone, excluded.zone),
+		      schedd_target_url   = coalesce(compute_nodes.schedd_target_url, excluded.schedd_target_url),
+		      public_ip           = coalesce(compute_nodes.public_ip, excluded.public_ip),
+		      public_ip_set_at    = coalesce(compute_nodes.public_ip_set_at, excluded.public_ip_set_at),
+		      release_id          = coalesce(compute_nodes.release_id, excluded.release_id),
+		      manifest_hash       = coalesce(compute_nodes.manifest_hash, excluded.manifest_hash),
+		      host_certificate    = coalesce(compute_nodes.host_certificate, excluded.host_certificate),
+		      cert_fingerprint    = coalesce(compute_nodes.cert_fingerprint, excluded.cert_fingerprint),
+		      role                = coalesce(compute_nodes.role, excluded.role),
+		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node (vmmd) %q: %w", node.Name, err)
@@ -8895,6 +9065,91 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 	return nil
 }
 
+// SetComputeNodeRole overwrites the role column on a row by id
+// (ADR-112 PR-B). The role value is validated against the
+// {control-plane, compute-only} allow-list at the Go boundary
+// (empty role is rejected with a loud error — use
+// UpsertComputeNodeFromOperator with role=NULL if the un-templated
+// sentinel is ever needed). The migration 00271 column is nullable
+// text (no CHECK constraint); the Go-side validation is the
+// effective constraint.
+//
+// Allow-list divergence vs pkg/releaseinstall: the manifest
+// renderer's SetComputeNodeRole (pkg/releaseinstall.store.go:131,
+// name-keyed, manifest-time) accepts {empty, single-box,
+// control-plane, compute-only}; this runtime path
+// (id-keyed, PR-B) accepts only {control-plane, compute-only}.
+// The asymmetry is intentional and load-bearing:
+//
+//   - `single-box` is the legacy single-box dev posture
+//     (pkg/roleTemplating/role.go:64-69). The renderer allows it
+//     because pre-PR-A manifests still pass it through for
+//     backwards compat with v1 bootstrap.sh.
+//   - PR-B is the runtime re-role contract; "re-role a box to
+//     single-box" is not a thing the architecture supports after
+//     the ADR-112 collapse. A box that was first-boot templated as
+//     single-box CANNOT be re-rolled via this path; the operator
+//     must image-rebuild if they need to leave single-box.
+//
+// Future "re-role to single-box" support, if ever needed, is a
+// separate ADR — bumping the allow-list here without one would
+// re-introduce the per-role-image pathology ADR-112 fixed.
+//
+// The pg_notify trigger on compute_nodes (PR-3a) fires on every UPDATE
+// regardless of which column changed, so gatewayd-internal's per-node
+// cache and the schedd chooser re-rank immediately. The chooser
+// currently treats role as a tie-break only (ADR-110 PR-2), but the
+// load-bearing invariant is that the cluster-wide view in
+// compute_nodes.role matches the box's on-disk FAAS_BOX_ROLE (read
+// from the per-daemon drop-in); a drift is loud via doctor --deep.
+//
+// Callers MUST short-circuit when current == target — every
+// unconditional UPDATE here fires the trigger + notify storm. The
+// cmd/gregalectl role-branch does this idempotency short-circuit
+// at the caller side; this method itself stays unconditional.
+func (s *PgStore) SetComputeNodeRole(ctx context.Context, id string, role string) error {
+	if err := validateRoleForState(role); err != nil {
+		return fmt.Errorf("state: set role compute_node %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update compute_nodes set role = $2 where id = $1`, id, role)
+	if err != nil {
+		return fmt.Errorf("state: set role compute_node %s = %q: %w", id, role, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// validateRoleForState enforces the {empty, control-plane,
+// compute-only} allow-list at the Go boundary. Lives next to the
+// implementation (not in pkg/roleTemplating) because pkg/state must
+// not import pkg/roleTemplating — the chain is pkg/state → pkg/role
+// (the type layer), and pkg/roleTemplating sits on top of both.
+//
+// Empty role is rejected (the legacy un-templated sentinel is gone
+// post-PR-A; UpsertComputeNodeFromOperator writes NULL on insert and
+// preserves it on conflict via COALESCE, which is the canonical
+// "un-templated" path).
+var allowedRolesForState = map[string]struct{}{
+	"control-plane": {},
+	"compute-only":  {},
+}
+
+func validateRoleForState(role string) error {
+	if role == "" {
+		return fmt.Errorf("role cannot be empty; use UpsertComputeNodeFromOperator for un-templated rows")
+	}
+	if len(role) > 32 {
+		return fmt.Errorf("role %q exceeds 32-char column limit", role)
+	}
+	if _, ok := allowedRolesForState[role]; !ok {
+		return fmt.Errorf("role %q not in {control-plane, compute-only}", role)
+	}
+	return nil
+}
+
 // ListComputeNodes returns every compute_node in name order. The
 // optional includeInactive flag controls whether drained rows are
 // visible; apid's GET /v1/compute-nodes passes true so operators can
@@ -8902,10 +9157,20 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 // index on active=true used by placement; this method is admin-only
 // and so pays the full-table scan cost only on operator dashboards).
 func (s *PgStore) ListComputeNodes(ctx context.Context, includeInactive bool) ([]ComputeNode, error) {
+	// Column order is locked to scanComputeNode's 22-arg projection
+	// (pgstore.go:8346). PR-3a (issue #911 / ADR-110) widened it
+	// from 14 to 22 by adding public_ip / public_ip_set_at (migration
+	// 00174 closure) + release_id / manifest_hash / host_certificate
+	// / cert_fingerprint / role / generation (migration 00266).
+	// Drift here surfaces as pgx's "number of field descriptions
+	// must equal number of destinations, got 14 and 22" — the same
+	// class of failure TestPg_CoverageInstanceLists pins.
 	q := `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 	`
 	if !includeInactive {
@@ -15500,4 +15765,199 @@ func (s *PgStore) ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sq
 // partitions); PR-C's partition creator handles whole-partition drops.
 func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error {
 	return s.dataUpstreamsQueries().PruneDataUpstreamProbesOlderThan(ctx, s.pool, pgtypeFromTime(cutoff))
+}
+
+// AppUpstreamProbeScore is the JOIN-collapsed per-upstream
+// probe summary. One row per (data_upstreams.id, region) with
+// the freshest probe's RTT. Old name: aggregate per
+// (host_redacted_hash, region) — the new per-app-scoped
+// reader returns one row per inferred upstream + region.
+//
+// The schedd chooser (PR-D) reads this in a single round-trip
+// on the wake path. The previous N+1 design (1 ListAllAppDataUpstreams
+// + N ListDataUpstreamProbesByHostRegion) cost N+1 PG round-trips
+// per wake; for a Scale plan app with DataPlacementHintsPerApp=50,
+// that's 51 round-trips on the wake goroutine under appMu —
+// far past the < 1 ms wake-budget claim. The JOIN collapses
+// the read to a single round-trip.
+type AppUpstreamProbeScore struct {
+	HostRedactedHash string
+	Region           string
+	Kind             DataUpstreamKind
+	Port             int
+	RTTMs            *int
+	OK               bool
+}
+
+// ListAppUpstreamProbeScores (ADR-098 PR-D) returns the freshest
+// probe per (data_upstreams.id, region) for the given app.
+//
+// SQL shape (hand-rolled, not sqlc — the JOIN with DISTINCT ON
+// is a single statement and adding it via sqlc would require a
+// schema-bound regeneration):
+//
+//	SELECT DISTINCT ON (u.id, p.region)
+//	       u.host_redacted_hash, p.region, u.kind, u.port,
+//	       p.rtt_ms, p.ok
+//	FROM data_upstreams u
+//	LEFT JOIN LATERAL (
+//	  SELECT region, rtt_ms, ok
+//	  FROM data_upstream_probes
+//	  WHERE host_redacted_hash = u.host_redacted_hash
+//	  ORDER BY sampled_at DESC
+//	  LIMIT 1
+//	) p ON true
+//	WHERE u.account_id = $1 AND u.app_id = $2
+//	  AND u.declared_region IS NOT NULL
+//
+// The LATERAL subquery keeps the index-driven lookup hot
+// (data_upstream_probes partitioned by sampled_at, the
+// (host_redacted_hash, sampled_at) index is the probe-loop's
+// hot path). One round-trip per wake.
+func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]AppUpstreamProbeScore, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (u.id, p.region)
+		       u.host_redacted_hash, p.region, u.kind, u.port,
+		       p.rtt_ms, p.ok
+		FROM data_upstreams u
+		LEFT JOIN LATERAL (
+			SELECT region, rtt_ms, ok
+			FROM data_upstream_probes
+			WHERE host_redacted_hash = u.host_redacted_hash
+			ORDER BY sampled_at DESC
+			LIMIT 1
+		) p ON true
+		WHERE u.account_id = $1 AND u.app_id = $2
+		  AND u.declared_region IS NOT NULL
+	`, accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppUpstreamProbeScore
+	for rows.Next() {
+		var s AppUpstreamProbeScore
+		var kind string
+		var rtt *int32
+		if err := rows.Scan(&s.HostRedactedHash, &s.Region, &kind, &s.Port, &rtt, &s.OK); err != nil {
+			return nil, err
+		}
+		if rtt != nil {
+			v := int(*rtt)
+			s.RTTMs = &v
+		}
+		s.Kind = DataUpstreamKind(kind)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListAllAppDataUpstreams returns every data_upstreams row on the
+// app across all scopes, scoped to accountID. Used by apid's
+// GET /v1/apps/{slug}/upstreams?scope=__all__ arm to render the
+// full list without a cursor. The row count is bounded by
+// DataPlacementHintsPerApp (0/3/10/50 by plan per ADR-098 §D5)
+// so the scan is cheap.
+func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, account_id, app_id, source, scope, kind, host, port,
+		        host_redacted_hash, coalesce(declared_region, ''),
+		        last_rtt_ms, last_probed_at, last_seen_at, created_at
+		 from data_upstreams
+		 where account_id = $1 and app_id = $2
+		 order by created_at desc, id desc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstream
+	for rows.Next() {
+		var (
+			id, accountIDpg, appIDpg                                    pgtype.UUID
+			source, scope, kind, host, hostRedactedHash, declaredRegion string
+			port                                                        int32
+			lastRTT                                                     pgtype.Int4
+			lastProbedAt                                                pgtype.Timestamptz
+			lastSeenAt, createdAt                                       pgtype.Timestamptz
+		)
+		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
+			&hostRedactedHash, &declaredRegion,
+			&lastRTT, &lastProbedAt, &lastSeenAt, &createdAt); err != nil {
+			return nil, err
+		}
+		var rttPtr *int
+		if lastRTT.Valid {
+			v := int(lastRTT.Int32)
+			rttPtr = &v
+		}
+		var probedPtr *time.Time
+		if lastProbedAt.Valid {
+			t := timeFromPgtype(lastProbedAt)
+			probedPtr = &t
+		}
+		out = append(out, DataUpstream{
+			ID:               uuidFromPgtype(id),
+			AccountID:        uuidFromPgtype(accountIDpg),
+			AppID:            uuidFromPgtype(appIDpg),
+			Source:           DataUpstreamSource(source),
+			Scope:            scope,
+			Kind:             DataUpstreamKind(kind),
+			Host:             host,
+			Port:             int(port),
+			HostRedactedHash: hostRedactedHash,
+			DeclaredRegion:   declaredRegion,
+			LastRTTMs:        rttPtr,
+			LastProbedAt:     probedPtr,
+			LastSeenAt:       timeFromPgtype(lastSeenAt),
+			CreatedAt:        timeFromPgtype(createdAt),
+		})
+	}
+	return out, rows.Err()
+}
+
+// CountDataUpstreamsByApp is the per-plan quota helper. Counts
+// ALL scope values for the app per ADR-098 §D5
+// (DataPlacementHintsPerApp is per-app, not per-scope). Mirrors
+// CountAppEnv's posture.
+func (s *PgStore) CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from data_upstreams where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
+// ListDistinctUpstreamHostHashes walks data_upstreams and
+// returns the deduplicated set of
+// (host_redacted_hash, kind, port, host) tuples. Used by the
+// meterd probe loop (PR-C).
+//
+// The plaintext host is included in the row so the probe can
+// resolve the dial address. §11 invariant scope: the host
+// NEVER reaches the Prom metric labels, the audit emit, the
+// pg_notify payload, or any log line. The probe carries the
+// plaintext in-process ONLY for the duration of the dial,
+// then drops it. The customer-facing list/get endpoints
+// return host_redacted_hash + host_last4 — NEVER plaintext.
+func (s *PgStore) ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error) {
+	rows, err := s.pool.Query(ctx,
+		`select host_redacted_hash, kind, port, host
+		 from data_upstreams
+		 group by host_redacted_hash, kind, port, host`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstreamTarget
+	for rows.Next() {
+		var t DataUpstreamTarget
+		var kind string
+		if err := rows.Scan(&t.HostRedactedHash, &kind, &t.Port, &t.Host); err != nil {
+			return nil, err
+		}
+		t.Kind = DataUpstreamKind(kind)
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }

@@ -1,27 +1,36 @@
--- filename: 00267_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
--- Contiguity filler for issue #881 Phase 3 (per-consumer rate-limit
--- keying, ADR-104). Claimed on 2026-08-14 ahead of the real DDL in
--- PR-1 (apid/state action extension). The real schema widens
--- `EdgeRuleAction` jsonb with three new properties (`key_by`,
--- `jwt_claim_name`, `max_keys_per_rule`) — jsonb carries no CHECK
--- constraint today, so the DDL is purely additive and does NOT
--- require this fence; the fence exists so the cluster's slot
--- reservation is unambiguous and survives a sibling-PR claim race.
--- Body is a no-op SELECT 1; will be shadowed by PR-1's real DDL or
--- dropped in a follow-up if the cluster abandons the slot (per
--- ADR-041 reservation fence pattern).
 --
--- Slot 00266 was claimed first but cross-PR precheck found that
--- ADR-101 (OIDC, worktree-adr-101-pr-a) had already published
--- 00265_oidc_trust_policies.sql + 00266_oidc_exchanged_tokens.sql
--- before our fence landed; renumbered to 00267 to clear the
--- collision per memory [[cross-pr-slot-fence-pagination-gate]].
-SELECT 1;
+-- 00267_reserve_slot.sql — slot reservation placeholder (ADR-041 / PR #391
+-- migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement that the
+-- embedded migration set is exactly {1, 2, …, N} with no gaps. It carries
+-- no schema change and does not appear in any apply path (the replay-safety
+-- gate in ci.yml drops files whose basename matches the reservation regex
+-- from its "added migration versions" computation).
+--
+-- This reservation is for PR-3a of the issue #911 PR cluster (declarative
+-- split-box deployment manifest + gregale doctor). The body lands in
+-- migrations/00267_release_bundles.sql and creates the release_bundles
+-- table that records every bundled release tuple (id, git_sha,
+-- manifest_hash, daemon_hashes, created_at, applied_at). PR-3 itself
+-- (release bundle + cross-box artifact sync) consumes this table.
+--
+-- If another PR lands first at slot 267, this reservation drops on rebase.
+-- The renumber-helper chain (`scripts/ci/check_migration_slots.sh`) catches
+-- any duplicate-prefix collision at merge time.
+--
+-- Body: `select 1;` — executes against the live DB at apply time but
+-- produces no schema change. Future-proof against upstream generator drift
+-- without chasing each new template revision.
+--
+select 1;
+
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-SELECT 1;
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
 -- +goose StatementEnd

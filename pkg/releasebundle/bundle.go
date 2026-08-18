@@ -16,6 +16,43 @@ import (
 
 const ManifestName = "manifest.json"
 
+// forbiddenBundlePaths is the PR-5 / issue #911 denylist of file-path
+// substrings that the bundle must never include. The split-box cluster
+// does not run faas-tunnel today (zero grep hits across the repo); the
+// bundle Build rejects any path containing one of these substrings so a
+// future re-introduction of faas-tunnel is caught at bundle-creation
+// time, not at install-time on the box. The denylist is intentionally
+// case-folded and substring-based (not exact-match) — any unit or
+// binary with `faas-tunnel` in the name is rejected, including future
+// variants like `faas-tunnel-client` or `FAAS-TUNNEL.service`.
+//
+// The denylist is consumed by Build (early bail-out) and by
+// ValidateManifest (defensive double-check, since Build only walks a
+// tree the operator staged).
+var forbiddenBundlePaths = []string{"faas-tunnel"}
+
+// isForbiddenPath reports whether rel should be refused per the
+// PR-5 denylist. Match is case-insensitive substring.
+func isForbiddenPath(rel string) bool {
+	return IsForbiddenPath(rel)
+}
+
+// IsForbiddenPath is the exported form of the PR-5 denylist check.
+// pkg/releaseinstall/ (PR-3) calls this for daemon-name validation
+// at bundle-build time so a future re-introduction of faas-tunnel
+// is caught when the bundle is materialised, not when the box
+// installs it. The case-folded substring semantics are the same as
+// the unexported isForbiddenPath.
+func IsForbiddenPath(rel string) bool {
+	lower := strings.ToLower(rel)
+	for _, deny := range forbiddenBundlePaths {
+		if strings.Contains(lower, deny) {
+			return true
+		}
+	}
+	return false
+}
+
 type Manifest struct {
 	FormatVersion int       `json:"format_version"`
 	ReleaseID     string    `json:"release_id"`
@@ -64,6 +101,9 @@ func Build(root, releaseID, commitSHA, target string, now time.Time) (Manifest, 
 		}
 		if err := validatePath(rel); err != nil {
 			return err
+		}
+		if isForbiddenPath(rel) {
+			return fmt.Errorf("releasebundle: forbidden path %q (issue #911 denylist: %s)", rel, strings.Join(forbiddenBundlePaths, ", "))
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -227,6 +267,9 @@ func ValidateManifest(manifest Manifest) error {
 	for _, file := range manifest.Files {
 		if err := validatePath(file.Path); err != nil {
 			return err
+		}
+		if isForbiddenPath(file.Path) {
+			return fmt.Errorf("releasebundle: forbidden path %q in manifest (issue #911 denylist)", file.Path)
 		}
 		if file.Path <= previous {
 			return fmt.Errorf("releasebundle: files are not strictly sorted at %s", file.Path)

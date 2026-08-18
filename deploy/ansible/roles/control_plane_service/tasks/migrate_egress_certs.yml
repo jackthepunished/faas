@@ -4,14 +4,14 @@
 # under the directory named after the (now-removed) monolithic
 # gatewayd daemon. PR-C renames the directory + cert identity to
 # /etc/faas/tls/egress/egress.{crt,key}; this task moves the
-# existing leaf in place so `gregale pki rotate --daemon egress`
+# existing leaf in place so `gregalectl pki rotate --daemon egress`
 # can issue against the new path without first running an
 # operator-driven `cp`.
 #
 # Idempotency: the `creates:` sentinel points at the new key file
 # — once it exists the task no-ops on subsequent runs. The CA
 # bundle (/etc/faas/tls/ca/) is unchanged; the tls-san.cnf file
-# (used by `gregale pki init` to seed SAN extensions) is copied
+# (used by `gregalectl pki init` to seed SAN extensions) is copied
 # if present so a re-run of the PKI init doesn't fail because of
 # a missing reference config.
 #
@@ -23,7 +23,7 @@
 #
 # Out of scope: the meterd client leaf (formerly
 # /etc/faas/tls/meterd/gatewayd-egress-client.crt) is regenerated
-# by `gregale pki rotate --daemon egress` — its filename rename
+# by `gregalectl pki rotate --daemon egress` — its filename rename
 # lands in the same rotation cycle, no manual move needed.
 
 - name: control_plane_service — stat pre-PR-C egress cert dir

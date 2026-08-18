@@ -192,14 +192,8 @@ var cliCommands = []cliCommand{
 			{Name: "require-signed", Short: "toggle require_signed", ClosedSet: []string{"true", "false"}},
 		},
 	},
-	{
-		Name:    "backup",
-		DocSlug: "backup",
-		Short:   "Operator rclone config unseal (backup unseal-rclone)",
-		Subcommands: []cliSub{
-			{Name: "unseal-rclone", Short: "Unseal the rclone config"},
-		},
-	},
+	// operator-side "backup" verb moved to gregalectl in PR-6.5
+	// (sealed-cred rotation is an operator concern; see plan §Scope).
 	{
 		Name:    "billing",
 		DocSlug: "billing",
@@ -337,17 +331,6 @@ var cliCommands = []cliCommand{
 		DocSlug: "env",
 		Short:   "Pull/push .env <-> sealed secrets (--app <slug>)",
 		Flags:   []cliFlag{{Name: "app", Short: "app slug", Req: true}},
-	},
-	{
-		Name:    dispatchHostAge,
-		DocSlug: "host-age",
-		Short:   "Operator host.age rotation (host-age init|rotate|status|prune-previous)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise host.age"},
-			{Name: subRotate, Short: "Rotate host.age"},
-			{Name: "status", Short: "Show host.age status"},
-			{Name: "prune-previous", Short: "Prune the previous host.age key"},
-		},
 	},
 	{
 		Name:    "init",
@@ -493,16 +476,6 @@ var cliCommands = []cliCommand{
 		Short:   "Park an app cold (kill all live instances)",
 	},
 	{
-		Name:    dispatchPKI,
-		DocSlug: "pki",
-		Short:   "Operator local-dev PKI bootstrap (pki init|status|rotate)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise the local PKI"},
-			{Name: statusLiteral, Short: "Show PKI status"},
-			{Name: subRotate, Short: "Rotate the PKI"},
-		},
-	},
-	{
 		Name:      "plan",
 		DocSlug:   "plan",
 		Short:     "Change plan (free|hobby|pro|scale)",
@@ -579,34 +552,8 @@ var cliCommands = []cliCommand{
 			{Name: "set", Short: "Rotate the secret for one installation_id"},
 		},
 	},
-	{
-		Name:    dispatchSignKeys,
-		DocSlug: "sign-keys",
-		Short:   "Provision the cosign sign keypair (operator; --sign-key / --verify-key)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise the cosign keypair"},
-			{Name: subRotate, Short: "Rotate the cosign keypair"},
-			{Name: statusLiteral, Short: "Show keypair status"},
-		},
-		Flags: []cliFlag{
-			{Name: "sign-key", Short: "path to the sign key"},
-			{Name: "verify-key", Short: "path to the verify key"},
-		},
-	},
-	{
-		Name:    dispatchNodeKey,
-		DocSlug: "node-key",
-		Short:   "Provision the per-node CapacityReport signing keypair (operator; ADR-053)",
-		Subcommands: []cliSub{
-			{Name: subNodeInit, Short: "Initialise the node signing keypair"},
-			{Name: subNodeRotate, Short: "Rotate the node signing keypair"},
-			{Name: subNodeStatus, Short: "Show node keypair status"},
-		},
-		Flags: []cliFlag{
-			{Name: "node-key", Short: "path to the node signing private key"},
-			{Name: "node-key-pub", Short: "path to the node signing public key"},
-		},
-	},
+	// operator-side verbs (sign-keys, node-key) moved to gregalectl
+	// in PR-6.5; see cmd/gregale/constants.go for the dispatch consts.
 	{
 		Name:    "slo",
 		DocSlug: "slo",

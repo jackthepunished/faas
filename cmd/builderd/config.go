@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -47,6 +48,10 @@ type Config struct {
 	// writes <dir>/<build_id>/build-done.json + /build/out/* here during
 	// Destroy. /var/lib/faas/build-out (default).
 	BuildExportDir string `toml:"build_export_dir"`
+	// BuildTimeoutSeconds is the guest build wall-clock budget. Zero keeps
+	// the platform default from pkg/api/limits.go. The host-side export
+	// headroom is added separately by the metal VM driver.
+	BuildTimeoutSeconds int `toml:"build_timeout_seconds"`
 	// ScheddMetricsURL is where builderd polls schedd's /metrics
 	// endpoint for the fcvm_resident_ram_pct gauge (spec §4.5
 	// opportunistic-slot rule).
@@ -112,7 +117,23 @@ type Config struct {
 	// the same name. Operators can override via this field when
 	// builderd runs on a non-default node (multi-node deployments
 	// post-PR-B).
+	//
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): the FAAS_NODE_NAME env
+	// overlay (below) overrides BuilderNodeID at LoadConfig so the
+	// systemd drop-in (deploy/ansible/roles/compute_only_service/
+	// files/faas-builderd.service.d/99-faas-node-name.conf) is the
+	// single deploy-time source of truth — no need for operators
+	// to edit vmmd.toml or builderd.toml on a fresh node add.
 	BuilderNodeID string `toml:"builder_node_id"`
+
+	// NodeName is the multi-box identity for the builderd process
+	// (issue #678 / ADR-093 PR-0). When non-empty, builderd stamps
+	// this onto build_provenance rows instead of BuilderNodeID. The
+	// env overlay FAAS_NODE_NAME (Mega-PR-A) wins over the TOML
+	// value at LoadConfig — single source of truth is the systemd
+	// drop-in. Mirrors the schedd/apid/meterd/githubd NodeName
+	// field shape so operator playbooks read the same way.
+	NodeName string `toml:"node_name"`
 
 	// Role is the box shape this builderd inhabits (Gate-B; env
 	// override FAAS_BUILDERD_ROLE wins when set). builderd is a
@@ -137,6 +158,20 @@ func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfig(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath)
 }
 
+// normalizeConfig prevents the stuck-build reaper from racing a valid build.
+// A running row remains durable until the guest budget plus host teardown
+// margin has elapsed; the VM driver owns the more precise export deadline.
+func (c *Config) normalizeConfig() {
+	buildTimeout := c.BuildTimeoutSeconds
+	if buildTimeout <= 0 {
+		buildTimeout = api.BuildTimeoutSeconds
+	}
+	minimum := time.Duration(buildTimeout)*time.Second + 10*time.Minute
+	if c.StuckBuildThreshold < minimum {
+		c.StuckBuildThreshold = minimum
+	}
+}
+
 // LoadConfig reads a TOML file at path with defaults filled in. A missing
 // file is not an error — the defaults produce a working daemon.
 func LoadConfig(path string) (*Config, error) {
@@ -154,7 +189,7 @@ func LoadConfig(path string) (*Config, error) {
 		// next customer's queued build without an SLA-busting wait.
 		FairnessWindow:          30 * time.Second,
 		StuckBuildSweepInterval: 10 * time.Minute,
-		StuckBuildThreshold:     15 * time.Minute,
+		StuckBuildThreshold:     time.Duration(api.BuildTimeoutSeconds)*time.Second + 10*time.Minute,
 		// B2.1 (issue #196): cache GC. 50 GB cap matches the spec
 		// fleet budget. 30-day TTL matches the only other retention
 		// constant the platform has (api.DefaultInstanceRetention).
@@ -176,6 +211,15 @@ func LoadConfig(path string) (*Config, error) {
 			// empty TOML default. role.FromConfig falls back to
 			// RoleSingleBox when the env is unset.
 			c.Role = role.FromConfig(string(c.Role), "FAAS_BUILDERD_ROLE")
+			// Mega-PR-A: same env overlay as the success path —
+			// keeps missing-file + single-box dev consistent.
+			if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+				c.NodeName = v
+				if c.BuilderNodeID == "" || c.BuilderNodeID == "default-local" {
+					c.BuilderNodeID = v
+				}
+			}
+			c.normalizeConfig()
 			return c, nil
 		}
 		return nil, fmt.Errorf("builderd: read %q: %w", path, err)
@@ -183,6 +227,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("builderd: parse %q: %w", path, err)
 	}
+	c.normalizeConfig()
 	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
 	// c.Role is consulted against FAAS_BUILDERD_ROLE. Setting Role
 	// in the defaults-struct literal lets toml.Unmarshal overwrite
@@ -190,5 +235,17 @@ func LoadConfig(path string) (*Config, error) {
 	// role gate at boot calls role.Require to refuse to start
 	// under the wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_BUILDERD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// NodeName — wins over TOML node_name. When set, also
+	// overrides the legacy BuilderNodeID (kept for back-compat
+	// with deployments that still set it via TOML; only when the
+	// TOML value is the default-local sentinel — operators that
+	// intentionally set a different ID keep their choice).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.NodeName = v
+		if c.BuilderNodeID == "" || c.BuilderNodeID == "default-local" {
+			c.BuilderNodeID = v
+		}
+	}
 	return c, nil
 }

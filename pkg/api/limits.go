@@ -12,6 +12,7 @@ package api
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"testing"
@@ -556,6 +557,17 @@ type Limits struct {
 	// is touched).
 	TenantSurfacesAllowed bool
 
+	// DataPlacementHintsPerApp (ADR-098 §D5) caps how many
+	// inferred/explicit data_upstreams rows one app may hold. The
+	// per-app cap defends against a noisy customer pinning hundreds
+	// of DB/cache hints on a hot app (the schedd wake-time chooser
+	// iterates the per-app scores at placement time). Free = 0
+	// (the customer can only see metadata via the dashboard; the
+	// capture path is fail-closed at the handler level via
+	// CodePlanLimitDataUpstreams). Per-plan: Free 0, Hobby 3, Pro
+	// 10, Scale 50.
+	DataPlacementHintsPerApp int
+
 	// WebhookPerApp caps how many outbound webhook subscriptions a
 	// single app may register (issue #476 / ADR-076). The plan gate
 	// is enforced in pkg/state.CreateAppWebhookIfUnderQuota under an
@@ -828,6 +840,33 @@ type Limits struct {
 	AppErrorsMaxRequestRowsPerFingerprint int
 }
 
+// UpstreamProbeMaxConcurrent (ADR-098 §D2) is the global worker-pool
+// cap on meterd's upstream-probe loop. Read by cmd/meterd at boot
+// time and by pkg/meter/upstream_probe.go on each loop tick. NOT a
+// per-plan field — the probe runs on the meterd daemon, not on the
+// customer app, and the global cap defends the meterd node's fd /
+// goroutine budget under burst. Lives as a top-level constant (not
+// on the Limits struct) per ADR-098 §263.
+const UpstreamProbeMaxConcurrent = 64
+
+// UpstreamFitMinDeltaMs (ADR-098 §D3) is the global threshold below
+// which schedd's chooser bias is suppressed (the legacy
+// RAM/vCPU/region tie-break wins). Defends against flapping: a
+// probe-sample delta of <5 ms is noise, not a signal. Lives as a
+// top-level constant (not on the Limits struct) per ADR-098 §263.
+const UpstreamFitMinDeltaMs = 5
+
+// UpstreamAffinityTTL (ADR-098 §D2) is the staleness budget on
+// schedd's in-process upstream-affinity cache. Matches the
+// meterd probe cadence (pkg/meter/upstream_probe.go
+// DefaultUpstreamProbeInterval = 30 s) so the cached preferred
+// region is never more than one probe-cycle stale. Overridable
+// via FAAS_UPSTREAM_AFFINITY_TTL on schedd startup; the engine
+// constructor takes a duration so callers can stub it in tests.
+// Lives as a top-level constant (not on the Limits struct) per
+// ADR-098 §263.
+const UpstreamAffinityTTL = 30 * time.Second
+
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
 // limits, §4.3 idle timeouts, §4.6 app-layer caps, §7 egress, §10 prices.
 //
@@ -963,6 +1002,11 @@ var planLimits = map[Plan]Limits{
 		TenantSurfacesPerAccount:  0,
 		TenantHostnamesPerSurface: 0,
 		TenantSurfacesAllowed:     false,
+		// Data-placement hints (ADR-098 §D5): Free is gated off —
+		// the handler returns 402 CodePlanLimitDataUpstreams before
+		// any regex match. The 0 here is a defence-in-depth value
+		// the handler still reads.
+		DataPlacementHintsPerApp: 0,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
@@ -1203,6 +1247,9 @@ var planLimits = map[Plan]Limits{
 		TenantSurfacesPerAccount:  1,
 		TenantHostnamesPerSurface: 10,
 		TenantSurfacesAllowed:     true,
+		// Data-placement hints (ADR-098 §D5): Hobby unlocks the
+		// capture path with a 3-hint cap per app.
+		DataPlacementHintsPerApp: 3,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
@@ -1433,6 +1480,9 @@ var planLimits = map[Plan]Limits{
 		TenantSurfacesPerAccount:  5,
 		TenantHostnamesPerSurface: 50,
 		TenantSurfacesAllowed:     true,
+		// Data-placement hints (ADR-098 §D5): Pro unlocks the
+		// capture path with a 10-hint cap per app.
+		DataPlacementHintsPerApp: 10,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
@@ -1658,6 +1708,11 @@ var planLimits = map[Plan]Limits{
 		TenantSurfacesPerAccount:  25,
 		TenantHostnamesPerSurface: 250,
 		TenantSurfacesAllowed:     true,
+		// Data-placement hints (ADR-098 §D5): Scale unlocks the
+		// capture path with a 50-hint cap per app — large enough
+		// for a multi-DB SaaS (primary + replicas + read-only +
+		// analytics + cache + queue).
+		DataPlacementHintsPerApp: 50,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
@@ -1808,7 +1863,7 @@ const (
 	// tenant RAM.
 	BuildVMRAMMB           = 2_048
 	BuildVMVCPU            = 2
-	BuildTimeoutSeconds    = 600 // 10 min build
+	BuildTimeoutSeconds    = 900 // 15 min build; cold rootless Railpack export needs headroom
 	BuildE2ETimeoutSeconds = 900 // 15 min end-to-end
 
 	// Snapshots / disk (spec §1, §8).
@@ -2629,6 +2684,36 @@ const (
 // helper resolves to the same integer today — no behavior change.
 func DefaultComputeNodeCeilingMB() int {
 	return RAMAdmissionCeilingMB
+}
+
+// DefaultHostBridgeCIDR is the per-host bridge CIDR the vmmd tenant
+// netns' veth host-side addresses live in (Mega-PR-B Commit 1;
+// supersedes the former pkg/netns Go const HostBridgeCIDR). The /16
+// default keeps single-host dev identical to the v1 behaviour; multi-
+// host deployments override via ComputeNodeConfig.HostBridgeCIDR
+// (cmd/vmmd/config.go) — the bridge IP is the .1 of whatever CIDR the
+// operator ships. The MasqueradeCIDR default mirrors this value so the
+// host forward chain's `ip saddr ... oifname ... masquerade` rule still
+// covers the per-instance bridge.
+func DefaultHostBridgeCIDR() netip.Prefix {
+	return netip.MustParsePrefix("10.100.0.0/16")
+}
+
+// DefaultMasqueradeCIDR is the host postrouting nat chain MASQUERADE
+// source CIDR (must equal the NETWORK form of DefaultHostBridgeCIDR —
+// see pkg/netns/policy.go::Render panic gate). Exposed as a string
+// for renderer/tests that don't need the netip.Prefix.
+var DefaultMasqueradeCIDR = DefaultHostBridgeCIDR().String()
+
+// DefaultOverlayCIDR is the per-host overlay subnet the vmmd overlay
+// detector prefers when multiple IPv4 candidates come back from
+// `tailscale ip -4` (Mega-PR-B Commit 3). The default matches the
+// Tailscale CGNAT range (100.64.0.0/10); WireGuard deployments override
+// via ComputeNodeConfig.OverlayCIDR. Mesh traffic between compute nodes
+// lands here; the host forward chain's overlay-accept rules (Commit 2)
+// unblock it past the §11 RFC1918 deny.
+func DefaultOverlayCIDR() netip.Prefix {
+	return netip.MustParsePrefix("100.64.0.0/10")
 }
 
 // ConntrackCapProbe returns the effective per-instance conntrack cap.

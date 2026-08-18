@@ -12,3 +12,26 @@
 
 faas_box_role: control-plane
 faas_node_name: fsn-1
+
+# Ansible connection vars. `ansible_host` is the cross-box addressing
+# target (Layer-3 mesh endpoint: Tailscale/Wireguard IP, internal LAN,
+# or routable FQDN — operator-supplied per-fleet). The
+# `ansible_python_interpreter` pin matches the Ubuntu 24.04 system
+# python3.12 so we never depend on a venv.
+ansible_host: 10.42.0.1
+ansible_python_interpreter: /usr/bin/python3
+
+# Multi-host mesh (ADR-092): fsn-1 is the control-plane box and does
+# NOT route overlay traffic — it sets up Postgres + the CP-only
+# daemons. The N+ overlay mesh runs between the compute_only boxes
+# (fsn-2 today; future fsn-3+); nftables therefore sees zero overlay
+# entries on fsn-1 and the template renders the default ruleset
+# (no per-overlay accept, no per-overlay MASQUERADE). Empty list
+# is the canonical "no overlay" sentinel — not "0.0.0.0/0".
+#
+# Mega-PR-C (issue #911 / ADR-110): this is the Go-side parity
+# shape — pkg/netns/policy.go::HostPolicy.Render accepts an empty
+# overlay slice as the single-box default. Kept explicit here so a
+# future operator override lands with a non-empty list by intent,
+# not by drift.
+overlay_cidrs: []

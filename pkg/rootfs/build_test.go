@@ -290,6 +290,44 @@ func writeGzTar(t *testing.T, path, name string, body []byte) {
 	}
 }
 
+func TestApplyTarball_StripsProjectRoot(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	tarball := filepath.Join(dir, "src.tar.gz")
+	writeGzTar(t, tarball, "function-node/handler.js", []byte("export const handler = async () => ({statusCode: 200});"))
+
+	if err := ApplyTarball(staging, tarball, 1024*1024); err != nil {
+		t.Fatalf("ApplyTarball: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "app", "function-node")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("project root was not stripped; stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "app", "handler.js")); err != nil {
+		t.Fatalf("handler.js not unpacked at /app: %v", err)
+	}
+}
+
+func TestNormalizeFunctionHandler_NodeAlias(t *testing.T) {
+	staging := t.TempDir()
+	source := filepath.Join(staging, "app", "handler.js")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("handler"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandler(staging, "/app/node22.js"); err != nil {
+		t.Fatalf("NormalizeFunctionHandler: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(staging, "app", "node22.js"))
+	if err != nil {
+		t.Fatalf("node22.js: %v", err)
+	}
+	if string(got) != "handler" {
+		t.Errorf("node22.js = %q, want handler source", got)
+	}
+}
+
 // TestApplyTarball_RespectsCap — issue #197 B3.7. A tarball whose
 // single entry's declared size exceeds capBytes must be rejected
 // with *ErrTarballExceedsCap before the file is written to disk.

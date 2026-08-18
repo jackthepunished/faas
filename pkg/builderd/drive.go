@@ -3,7 +3,7 @@
 // Package builderd — drive1 preparation for ephemeral builder VMs.
 //
 // CreateBuildDrive1 materialises the per-VM ext4 that the builder VM boots
-// with. It writes an 8 GiB image, formats it ext4, mounts it loopback rw,
+// with. It writes a 24 GiB image, formats it ext4, mounts it loopback rw,
 // writes /etc/faas/build.json (the BuildManifest guest-init reads to know
 // it's a build VM), copies the customer source tarball in at /build/src.tar
 // (issue #54), and unmounts. The same binary runs in app VMs with a
@@ -20,6 +20,7 @@ package builderd
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -32,11 +33,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
-// BuildDriveSizeBytes is the drive1 image size for builder VMs (M6). 8 GiB
-// matches spec §4.5's "8 GB scratch" budget — plenty for a Node/Python build
-// dependency cache, with room to spare. The produced app layer (in
-// /build/out) is typically < 500 MB; 8 GiB is just the unconstrained scratch.
-const BuildDriveSizeBytes = 8 << 30
+// BuildDriveSizeBytes is the drive1 image size for builder VMs (M6). 24 GiB
+// gives rootless native BuildKit enough room for Railpack's builder/runtime
+// images, dependency layers, and the native local exporter; the previous
+// 8 GiB budget exhausted while copying those layers. The produced app layer
+// (in /build/out) is typically
+// < 500 MB; the rest is transient build scratch.
+const BuildDriveSizeBytes = 24 << 30
 
 // mkfs utility + label used for the build drive1 image.
 const (
@@ -44,7 +47,7 @@ const (
 	buildLabel = "faas-build"
 )
 
-// CreateBuildDrive1 writes an 8 GiB ext4 image at dest containing the
+// CreateBuildDrive1 writes a 24 GiB ext4 image at dest containing the
 // BuildManifest at /etc/faas/build.json and (when sourcePath is non-empty)
 // the customer's source tarball copied to /build/src.tar. Idempotent on
 // host filesystem blocks — overwrites dest. Returns immediately on permission
@@ -107,15 +110,67 @@ func CreateBuildDrive1(ctx context.Context, dest string, m api.BuildManifest, so
 	if err := copySourceTarball(mp, sourcePath); err != nil {
 		return fmt.Errorf("builderd: copy source: %w", err)
 	}
+	if err := writeBuildEntropy(mp); err != nil {
+		return fmt.Errorf("builderd: write entropy seed: %w", err)
+	}
+	// guest-init mounts drive1 at /overlay and uses /overlay/upper as the
+	// overlay upperdir. Put the build manifest and source below upper/ so they
+	// are visible from the merged root inside the builder VM.
+	if err := wrapBuildUpper(mp); err != nil {
+		return fmt.Errorf("builderd: wrap drive1 upper: %w", err)
+	}
 	// Sanity: confirm the bytes that landed on disk match the host source.
 	// Catches a torn copy / quota-hit / ENOSPC that would otherwise surface
 	// as a silent truncated tarball inside the VM.
-	gotSum, err := fileSHA256(filepath.Join(mp, "build", "src.tar"))
+	gotSum, err := fileSHA256(filepath.Join(mp, "upper", "build", "src.tar"))
 	if err != nil {
 		return fmt.Errorf("builderd: re-stat staged tarball: %w", err)
 	}
 	if gotSum != srcSum {
 		return fmt.Errorf("builderd: staged tarball sha256 mismatch: got %s, want %s", gotSum, srcSum)
+	}
+	return nil
+}
+
+// writeBuildEntropy stages fresh host-generated entropy for the guest's cold
+// boot. Firecracker snapshots the VM's early entropy state, and virtio-rng
+// may not seed the guest before BuildKit's RSA proxy-CA generation calls
+// crypto/rand. The seed is consumed and removed by guest-init before any
+// customer build command runs.
+func writeBuildEntropy(mountPoint string) error {
+	dir := filepath.Join(mountPoint, filepath.Dir(api.BuildEntropyPath))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	seed := make([]byte, 256)
+	if _, err := rand.Read(seed); err != nil {
+		return fmt.Errorf("generate seed: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(mountPoint, api.BuildEntropyPath[1:]), seed, 0o600); err != nil {
+		return fmt.Errorf("write seed: %w", err)
+	}
+	return nil
+}
+
+// wrapBuildUpper moves the staged drive contents under upper/, preserving the
+// overlayfs layout guest-init expects while keeping build.json and src.tar on
+// the same ext4 image as the overlay work directory.
+func wrapBuildUpper(mountPoint string) error {
+	upper := filepath.Join(mountPoint, "upper")
+	if err := os.MkdirAll(upper, 0o755); err != nil {
+		return fmt.Errorf("mkdir upper: %w", err)
+	}
+	entries, err := os.ReadDir(mountPoint)
+	if err != nil {
+		return fmt.Errorf("read drive: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "upper" {
+			continue
+		}
+		if err := os.Rename(filepath.Join(mountPoint, entry.Name()), filepath.Join(upper, entry.Name())); err != nil {
+			return fmt.Errorf("wrap %s in upper: %w", entry.Name(), err)
+		}
 	}
 	return nil
 }

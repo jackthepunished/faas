@@ -112,6 +112,48 @@ func TestInvocationClaimCompleteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestInvocationExpiredLeaseIsRequeued(t *testing.T) {
+	m, appID, acctID := seedInvocationApp(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	inv, err := m.EnqueueInvocation(ctx, Invocation{
+		AppID: appID, AccountID: acctID, Source: InvocationAsyncInvoke, DueAt: now,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueInvocation: %v", err)
+	}
+	if _, err := m.ClaimInvocation(ctx, inv.ID, "inst-old", 30); err != nil {
+		t.Fatalf("ClaimInvocation: %v", err)
+	}
+	row, err := m.InvocationByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("InvocationByID: %v", err)
+	}
+	expired := now.Add(-time.Second)
+	row.LeaseExpiresAt = &expired
+	if err := m.stampInvocationRowForTest(row); err != nil {
+		t.Fatalf("stage expired row: %v", err)
+	}
+	if n, err := m.RequeueExpiredInvocations(ctx, now, 10); err != nil || n != 1 {
+		t.Fatalf("RequeueExpiredInvocations = %d, %v", n, err)
+	}
+	got, err := m.InvocationByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("InvocationByID after reclaim: %v", err)
+	}
+	if got.State != InvocationPending || got.LeaseExpiresAt != nil || got.InstanceID != "" || !got.DueAt.Equal(now) {
+		t.Fatalf("reclaimed row = %+v", got)
+	}
+	// A completion from the abandoned dispatch must not terminally complete
+	// the requeued row.
+	if err := m.CompleteInvocation(ctx, inv.ID, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("late completion error = %v, want ErrNotFound", err)
+	}
+	if _, err := m.ClaimInvocation(ctx, inv.ID, "inst-new", 30); err != nil {
+		t.Fatalf("reclaim should permit a fresh claim: %v", err)
+	}
+}
+
 // FailInvocation with retryAfter>0 must put the row back into pending
 // + bump attempts (transient); retryAfter==0 must terminal it.
 func TestInvocationFailTransientAndPermanent(t *testing.T) {

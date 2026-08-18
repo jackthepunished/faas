@@ -32,6 +32,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
+// reaperParkTimeout bounds the synchronous Engine.Park call made by the
+// scheduler loop. Firecracker snapshot creation is normally fast, but a
+// saturated disk can take considerably longer; without a bound, one stalled
+// park blocks the loop and prevents the state watchdog from reclaiming the
+// row. Deployment priming is intentionally separate and keeps its existing
+// build/snapshot budget.
+const reaperParkTimeout = 2 * time.Minute
+
 // Loop subscribes to the pg_notify channels schedd cares about and reacts. It
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
@@ -1115,6 +1123,16 @@ func (l *Loop) runReaper(ctx context.Context) {
 			continue
 		}
 		for _, ins := range instances {
+			// ListInstancesForApp is also used by dashboard and audit
+			// surfaces, so it intentionally returns terminal rows. The
+			// reaper must apply the same live-state filter as
+			// ListAllInstances before warming conntrack or asking for a
+			// flow count; terminal rows have no veth and can otherwise
+			// flood the log and monopolise this synchronous loop, starving
+			// snapshot_prime notifications.
+			if !reaperInstanceState(state.State(ins.State)) {
+				continue
+			}
 			// G7 flow count (spec §17): the conntrack reader is the
 			// production source; nil/error falls back to 0 so a flow-source
 			// glitch fails open (LastRequest-only path; safe default).
@@ -1257,7 +1275,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 	idleParkByApp := map[string]struct{}{}
 	cooldownHeldByApp := map[string]struct{}{}
 	for _, id := range ReapIdle(now, snapshot, l.ops, cooldownHeldByApp) {
-		if err := l.engine.Park(ctx, id); err != nil {
+		if err := l.parkFromReaper(ctx, id); err != nil {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
 			continue
 		}
@@ -1345,6 +1363,28 @@ func (l *Loop) runReaper(ctx context.Context) {
 				counter.Inc()
 			}
 		}
+	}
+}
+
+// parkFromReaper keeps a slow or wedged snapshot from monopolising Loop.Run.
+// Engine.Park remains the single lifecycle owner; this wrapper only supplies
+// the reaper-specific deadline so the existing STOPPED/error transition runs
+// through the normal Engine path when the deadline expires.
+func (l *Loop) parkFromReaper(ctx context.Context, instanceID string) error {
+	parkCtx, cancel := context.WithTimeout(ctx, reaperParkTimeout)
+	defer cancel()
+	return l.engine.Park(parkCtx, instanceID)
+}
+
+// reaperInstanceState mirrors the SQL partial-index predicate used by
+// ListAllInstances. Keeping the filter at the per-app expansion site is
+// necessary because ListInstancesForApp deliberately has a broader contract.
+func reaperInstanceState(s state.State) bool {
+	switch s {
+	case state.StateRunning, state.StateWaking, state.StateColdBooting, state.StateSnapshotting:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1513,7 +1553,7 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		// post-enrichment app-wide max floor.
 		aggressiveParkOK := false
 		for _, id := range ids {
-			if err := l.engine.Park(ctx, id); err != nil {
+			if err := l.parkFromReaper(ctx, id); err != nil {
 				l.log.Warn("reaper: aggressive park", "instance", id, "err", err)
 				continue
 			}

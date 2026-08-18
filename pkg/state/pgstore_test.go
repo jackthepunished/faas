@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -3378,3 +3380,324 @@ func TestPg_UpdateDeploymentTraffic_RejectsNonLive(t *testing.T) {
 		t.Errorf("UpdateDeploymentTraffic(superseded dep, 100) err = %v, want ErrInvalidTrafficPercent", err)
 	}
 }
+
+// TestPg_UpsertComputeNodeFromOperator_RoundTripsAllNewColumns pins
+// the issue #911 / ADR-110 PR-3a schema-carrier contract: every one
+// of the 8 widened ComputeNode fields round-trips through
+// UpsertComputeNodeFromOperator and reads back via ComputeNodeByName
+// with pointer equality intact. The two halves of the contract —
+// the 6 PR-3a columns AND the 2 latent-drift columns (PublicIp /
+// PublicIpSetAt from migration 00174) — must both be projected by
+// every read site (ByID + ByName + ActiveComputeNodes +
+// ListAllComputeNodes) once UpsertComputeNodeFromOperator runs.
+//
+// Why this is the load-bearing pin: if any of the 8 columns is
+// dropped from the scanComputeNode row.Scan arg list (or from the
+// INSERT/UPSERT col-list), Postgres will return a row-count
+// mismatch and the upsert will fail. This test catches that drift
+// before PR-3 / PR-4 try to read these columns in production.
+func TestPg_UpsertComputeNodeFromOperator_RoundTripsAllNewColumns(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+
+	// Populated node — drives all 8 widened columns non-nil. The
+	// IP + time.Time fields must be non-nil pointer values; the
+	// *string / *int fields are likewise populated.
+	popPublicIP := netip.MustParseAddr("203.0.113.42")
+	popPublicIPAt := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	in := state.ComputeNode{
+		Name:               "pr3a-populated",
+		TargetURL:          "unix:///run/faas/vmmd.sock",
+		VPCPUs:             4,
+		MemMB:              8192,
+		MaxConcurrency:     5,
+		AdmissionCeilingMB: 8192,
+		VCPUBudget:         20,
+		Active:             true,
+		Region:             ptrStr("eu-fra"),
+		Zone:               ptrStr("eu-fra-1"),
+		// Latent-drift columns (PR A8, migration 00174) — PR-3a
+		// closes the schema/code asymmetry by projecting them.
+		PublicIp:      &popPublicIP,
+		PublicIpSetAt: &popPublicIPAt,
+		// PR-3a storage-carrier columns.
+		ReleaseID:       ptrStr("0123456789abcdef0123456789abcdef01234567"),
+		ManifestHash:    ptrStr("sha256:" + strings.Repeat("a", 64)),
+		HostCertificate: ptrStr("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"),
+		CertFingerprint: ptrStr("sha256:" + strings.Repeat("b", 64)),
+		Role:            ptrStr("control-plane"),
+		Generation:      ptrInt(1),
+	}
+	got, err := s.UpsertComputeNodeFromOperator(ctx, in)
+	if err != nil {
+		t.Fatalf("UpsertComputeNodeFromOperator(populated): %v", err)
+	}
+	// ID is generated server-side; everything else must match.
+	if got.ID == "" {
+		t.Errorf("UpsertComputeNodeFromOperator returned empty ID")
+	}
+	if got.Name != in.Name {
+		t.Errorf("Name = %q, want %q", got.Name, in.Name)
+	}
+	if got.TargetURL != in.TargetURL {
+		t.Errorf("TargetURL = %q, want %q", got.TargetURL, in.TargetURL)
+	}
+	if got.Region == nil || *got.Region != "eu-fra" {
+		t.Errorf("Region = %v, want pointer to \"eu-fra\"", got.Region)
+	}
+	if got.Zone == nil || *got.Zone != "eu-fra-1" {
+		t.Errorf("Zone = %v, want pointer to \"eu-fra-1\"", got.Zone)
+	}
+	if got.PublicIp == nil || *got.PublicIp != popPublicIP {
+		t.Errorf("PublicIp = %v, want pointer to %v", got.PublicIp, popPublicIP)
+	}
+	if got.PublicIpSetAt == nil || !got.PublicIpSetAt.Equal(popPublicIPAt) {
+		t.Errorf("PublicIpSetAt = %v, want pointer to %v", got.PublicIpSetAt, popPublicIPAt)
+	}
+	if got.ReleaseID == nil || *got.ReleaseID != *in.ReleaseID {
+		t.Errorf("ReleaseID = %v, want pointer to %q", got.ReleaseID, *in.ReleaseID)
+	}
+	if got.ManifestHash == nil || *got.ManifestHash != *in.ManifestHash {
+		t.Errorf("ManifestHash = %v, want pointer to %q", got.ManifestHash, *in.ManifestHash)
+	}
+	if got.HostCertificate == nil || *got.HostCertificate != *in.HostCertificate {
+		t.Errorf("HostCertificate round-trip mismatch (len=%d, want len=%d)", len(*got.HostCertificate), len(*in.HostCertificate))
+	}
+	if got.CertFingerprint == nil || *got.CertFingerprint != *in.CertFingerprint {
+		t.Errorf("CertFingerprint = %v, want pointer to %q", got.CertFingerprint, *in.CertFingerprint)
+	}
+	if got.Role == nil || *got.Role != "control-plane" {
+		t.Errorf("Role = %v, want pointer to \"control-plane\"", got.Role)
+	}
+	if got.Generation == nil || *got.Generation != 1 {
+		t.Errorf("Generation = %v, want pointer to 1", got.Generation)
+	}
+
+	// Cross-read via ComputeNodeByName — same row, different read
+	// path. Catches a scan-arg mismatch that happens to line up by
+	// accident on one read path.
+	byName, err := s.ComputeNodeByName(ctx, in.Name)
+	if err != nil {
+		t.Fatalf("ComputeNodeByName(%q): %v", in.Name, err)
+	}
+	if byName.ReleaseID == nil || *byName.ReleaseID != *in.ReleaseID {
+		t.Errorf("ByName.ReleaseID = %v, want pointer to %q", byName.ReleaseID, *in.ReleaseID)
+	}
+	if byName.ManifestHash == nil || *byName.ManifestHash != *in.ManifestHash {
+		t.Errorf("ByName.ManifestHash = %v, want pointer to %q", byName.ManifestHash, *in.ManifestHash)
+	}
+	if byName.Role == nil || *byName.Role != "control-plane" {
+		t.Errorf("ByName.Role = %v, want pointer to \"control-plane\"", byName.Role)
+	}
+	if byName.PublicIp == nil || *byName.PublicIp != popPublicIP {
+		t.Errorf("ByName.PublicIp = %v, want pointer to %v", byName.PublicIp, popPublicIP)
+	}
+
+	// ActiveComputeNodes must project all 8 widened columns too —
+	// the operator dashboard (PR-4) reads through this path.
+	active, err := s.ActiveComputeNodes(ctx)
+	if err != nil {
+		t.Fatalf("ActiveComputeNodes: %v", err)
+	}
+	var activeRow state.ComputeNode
+	for _, n := range active {
+		if n.Name == in.Name {
+			activeRow = n
+			break
+		}
+	}
+	if activeRow.Name == "" {
+		t.Fatalf("ActiveComputeNodes missing %q (got %v)", in.Name, namesOf(active))
+	}
+	if activeRow.ReleaseID == nil || *activeRow.ReleaseID != *in.ReleaseID {
+		t.Errorf("ActiveComputeNodes[%q].ReleaseID = %v", in.Name, activeRow.ReleaseID)
+	}
+	if activeRow.CertFingerprint == nil || *activeRow.CertFingerprint != *in.CertFingerprint {
+		t.Errorf("ActiveComputeNodes[%q].CertFingerprint = %v", in.Name, activeRow.CertFingerprint)
+	}
+
+	// ListAllComputeNodes — same check on the read path that the
+	// release-bundle install machinery (PR-3) walks to pick a node.
+	all, err := s.ListAllComputeNodes(ctx)
+	if err != nil {
+		t.Fatalf("ListAllComputeNodes: %v", err)
+	}
+	var allRow state.ComputeNode
+	for _, n := range all {
+		if n.Name == in.Name {
+			allRow = n
+			break
+		}
+	}
+	if allRow.Name == "" {
+		t.Fatalf("ListAllComputeNodes missing %q", in.Name)
+	}
+	if allRow.ManifestHash == nil || *allRow.ManifestHash != *in.ManifestHash {
+		t.Errorf("ListAllComputeNodes[%q].ManifestHash = %v", in.Name, allRow.ManifestHash)
+	}
+	if allRow.HostCertificate == nil || *allRow.HostCertificate != *in.HostCertificate {
+		t.Errorf("ListAllComputeNodes[%q].HostCertificate round-trip mismatch", in.Name)
+	}
+	if allRow.Generation == nil || *allRow.Generation != 1 {
+		t.Errorf("ListAllComputeNodes[%q].Generation = %v, want pointer to 1", in.Name, allRow.Generation)
+	}
+
+	// Null-node case — drives the nullable contract. Insert a row
+	// via raw SQL with the 8 PR-3a + drift columns omitted, read
+	// it back via ComputeNodeByID, and confirm every field is a
+	// nil pointer (not an empty-string collapse or a zero-int
+	// collapse). This is the "pre-PR-3a row accepts the schema
+	// without a backfill UPDATE" contract — see
+	// migrations/00271_compute_nodes_release_test.go:108.
+	var idNullCols string
+	if err := pool.QueryRow(ctx, `
+		insert into compute_nodes
+		    (name, target_url, vpcpus, mem_mb, max_concurrency,
+		     admission_ceiling_mb, active)
+		values ($1, $2, $3, $4, $5, $6, $7)
+		returning id
+	`, "pr3a-null-cols", "unix:///run/faas/vmmd.sock",
+		2, 1024, 1, 1024, true).Scan(&idNullCols); err != nil {
+		t.Fatalf("insert with null PR-3a columns: %v", err)
+	}
+	nullRow, err := s.ComputeNodeByID(ctx, idNullCols)
+	if err != nil {
+		t.Fatalf("ComputeNodeByID(null PR-3a cols): %v", err)
+	}
+	for _, c := range []struct {
+		name string
+		ptr  interface{}
+	}{
+		{"PublicIp", nullRow.PublicIp},
+		{"PublicIpSetAt", nullRow.PublicIpSetAt},
+		{"ReleaseID", nullRow.ReleaseID},
+		{"ManifestHash", nullRow.ManifestHash},
+		{"HostCertificate", nullRow.HostCertificate},
+		{"CertFingerprint", nullRow.CertFingerprint},
+		{"Role", nullRow.Role},
+		{"Generation", nullRow.Generation},
+	} {
+		// reflect-based nil check: typed-nil pointers (e.g. *netip.Addr(nil),
+		// *string(nil), *int(nil)) wrapped in interface{} compare != nil
+		// in plain Go (the interface holds a non-nil type tag), so the
+		// naive `c.ptr != nil` test reports every typed-nil as a failure.
+		// reflect.Value.IsNil() unwraps the typed nil correctly.
+		if c.ptr != nil {
+			rv := reflect.ValueOf(c.ptr)
+			if rv.Kind() != reflect.Ptr || !rv.IsNil() {
+				t.Errorf("null row %s = %v, want nil pointer (nullable contract)", c.name, c.ptr)
+			}
+		}
+	}
+}
+
+// TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID pins
+// the second-box cutover invariant for PR-3a (ADR-110): when an
+// operator-POSTed row with a populated release_id is later
+// re-registered by vmmd (UpsertComputeNodeFromVmmd), the operator's
+// release_id / manifest_hash / host_certificate / cert_fingerprint
+// / role / generation must SURVIVE — vmmd self-registration must
+// not overwrite operator-POSTed data on the existing row. This is
+// the load-bearing COALESCE pattern from pgstore.go:8834 applied to
+// the 8 PR-3a columns.
+func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	// Step 1: operator POSTs the node with a release-bundle stamp.
+	operatorFirst := state.ComputeNode{
+		Name:               "pr3a-vmmd-preserve",
+		TargetURL:          "tcp://10.0.0.5:7777", // operator-POSTed
+		VPCPUs:             4,
+		MemMB:              8192,
+		MaxConcurrency:     5,
+		AdmissionCeilingMB: 8192,
+		VCPUBudget:         20,
+		Region:             ptrStr("eu-fra"),
+		Zone:               ptrStr("eu-fra-1"),
+		ReleaseID:          ptrStr("0123456789abcdef0123456789abcdef01234567"),
+		ManifestHash:       ptrStr("sha256:" + strings.Repeat("a", 64)),
+		HostCertificate:    ptrStr("op-stamped-cert"),
+		CertFingerprint:    ptrStr("sha256:" + strings.Repeat("b", 64)),
+		Role:               ptrStr("control-plane"),
+		Generation:         ptrInt(7),
+	}
+	if _, err := s.UpsertComputeNodeFromOperator(ctx, operatorFirst); err != nil {
+		t.Fatalf("operator first upsert: %v", err)
+	}
+
+	// Step 2: vmmd self-registers on boot. It posts different
+	// resource numbers AND a fresh TargetURL (the path the boot
+	// script learns from the running config). It does NOT have a
+	// release_id / cert to write — those columns are nil in the
+	// vmmd struct. COALESCE(compute_nodes.X, excluded.X) must
+	// keep the operator-POSTed value, NOT overwrite with NULL.
+	vmmdReReg := state.ComputeNode{
+		Name:               "pr3a-vmmd-preserve",
+		TargetURL:          "tcp://10.0.0.5:7777", // same — common case
+		VPCPUs:             8,                     // vmmd reports higher
+		MemMB:              16384,
+		MaxConcurrency:     10,
+		AdmissionCeilingMB: 16384,
+		VCPUBudget:         40,
+		Region:             nil, // vmmd doesn't know about region yet
+		Zone:               nil,
+		ReleaseID:          nil, // CRITICAL: must not overwrite operator's value
+		ManifestHash:       nil,
+		HostCertificate:    nil,
+		CertFingerprint:    nil,
+		Role:               nil,
+		Generation:         nil,
+	}
+	if _, err := s.UpsertComputeNodeFromVmmd(ctx, vmmdReReg); err != nil {
+		t.Fatalf("vmmd re-register: %v", err)
+	}
+
+	// Step 3: read back. The operator-POSTed PR-3a columns MUST
+	// survive intact. The vmmd-owned resource numbers MUST be
+	// updated to the new values.
+	got, err := s.ComputeNodeByName(ctx, "pr3a-vmmd-preserve")
+	if err != nil {
+		t.Fatalf("ComputeNodeByName: %v", err)
+	}
+
+	// vmmd-owned: updated.
+	if got.VPCPUs != 8 {
+		t.Errorf("VPCPUs = %d, want 8 (vmmd owns resource numbers)", got.VPCPUs)
+	}
+	if got.MemMB != 16384 {
+		t.Errorf("MemMB = %d, want 16384", got.MemMB)
+	}
+	if got.MaxConcurrency != 10 {
+		t.Errorf("MaxConcurrency = %d, want 10", got.MaxConcurrency)
+	}
+
+	// operator-POSTed PR-3a columns: PRESERVED via COALESCE.
+	if got.ReleaseID == nil || *got.ReleaseID != *operatorFirst.ReleaseID {
+		t.Errorf("ReleaseID = %v, want preserved operator value %q", got.ReleaseID, *operatorFirst.ReleaseID)
+	}
+	if got.ManifestHash == nil || *got.ManifestHash != *operatorFirst.ManifestHash {
+		t.Errorf("ManifestHash = %v, want preserved operator value", got.ManifestHash)
+	}
+	if got.HostCertificate == nil || *got.HostCertificate != "op-stamped-cert" {
+		t.Errorf("HostCertificate = %v, want preserved operator value \"op-stamped-cert\"", got.HostCertificate)
+	}
+	if got.CertFingerprint == nil || *got.CertFingerprint != *operatorFirst.CertFingerprint {
+		t.Errorf("CertFingerprint = %v, want preserved operator value", got.CertFingerprint)
+	}
+	if got.Role == nil || *got.Role != "control-plane" {
+		t.Errorf("Role = %v, want preserved operator value \"control-plane\"", got.Role)
+	}
+	if got.Generation == nil || *got.Generation != 7 {
+		t.Errorf("Generation = %v, want preserved operator value 7", got.Generation)
+	}
+	if got.Region == nil || *got.Region != "eu-fra" {
+		t.Errorf("Region = %v, want preserved operator value \"eu-fra\"", got.Region)
+	}
+	if got.Zone == nil || *got.Zone != "eu-fra-1" {
+		t.Errorf("Zone = %v, want preserved operator value \"eu-fra-1\"", got.Zone)
+	}
+}
+
+// ptrStr / ptrInt are tiny helpers for the *string / *int pointer
+// fields that PR-3a widens. Kept private to this file.
+func ptrStr(s string) *string { return &s }
+func ptrInt(i int) *int       { return &i }

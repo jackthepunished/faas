@@ -1864,6 +1864,14 @@ type Store interface {
 	// passes, so a row re-enters the queue roughly every batch-time).
 	ListPendingTenantHostnames(ctx context.Context, olderThan time.Time, limit int) ([]TenantHostname, error)
 	DeleteTenantHostname(ctx context.Context, hostname string) error
+	// GetTenantHostnameByName — pgRouter.ResolveHost's tenant-surface
+	// branch needs the hostname row alongside the surface so it can
+	// fail closed on hostname.Verified() == false (a pre-challenge
+	// TXT record must not be routable; the legacy custom_domains
+	// path's parallel contract is dom.Verified()). ErrNotFound when
+	// the hostname is unclaimed. The hostname column is citext so
+	// callers pass the canonical lowercase form.
+	GetTenantHostnameByName(ctx context.Context, hostname string) (TenantHostname, error)
 
 	// Crons (apid CRUDs; schedd fires).
 	CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error)
@@ -2600,6 +2608,21 @@ type Store interface {
 	// gatewayd-internal can add or drop its per-node client without a
 	// restart. ErrNotFound when the id has no row.
 	SetComputeNodeActive(ctx context.Context, id string, active bool) error
+	// SetComputeNodeRole overwrites the role column on a row by id
+	// (ADR-112 PR-B). PR-A's first-boot path populates the column via
+	// UpsertComputeNodeFromOperator (keyed by name); PR-B's in-place
+	// mutation needs a dedicated setter because the runtime identity
+	// is the box's node-id, not the manifest name. The role value is
+	// validated against the {empty, control-plane, compute-only}
+	// allow-list at the Go boundary (matches pkg/roleTemplating.Validate)
+	// so a SQL injection via an operator-supplied role is impossible —
+	// the parameter is length-capped at 32 chars and member-tested.
+	// Idempotent: writing the same role twice is a no-op UPDATE. Returns
+	// ErrNotFound if the row is gone. Emits compute_node_changed via
+	// the pg_notify trigger so gatewayd-internal's per-node cache and
+	// schedd's chooser re-rank immediately (the chooser currently
+	// ignores role, but the family is wired for ADR-110 follow-ons).
+	SetComputeNodeRole(ctx context.Context, id string, role string) error
 	// ListComputeNodes returns every compute_node in name order.
 	// includeInactive=false (default) returns only active rows
 	// (placement-equivalent); apid's GET /v1/compute-nodes handler
@@ -3661,6 +3684,19 @@ type Store interface {
 	// api.DataUpstreamsListMaxLimit by the handler.
 	ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error)
 
+	// ListAllAppDataUpstreams backs
+	// GET /v1/apps/{slug}/upstreams?scope=__all__ (PR-B).
+	// Returns every data_upstreams row on the app across all
+	// scopes — the count is bounded by
+	// DataPlacementHintsPerApp (per ADR-098 §D5) so the scan
+	// is cheap.
+	ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error)
+
+	// CountDataUpstreamsByApp backs the per-plan
+	// DataPlacementHintsPerApp quota in createUpstream
+	// (PR-B). Counts across ALL scopes per §D5.
+	CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error)
+
 	// GetDataUpstreamByID backs
 	// GET /v1/apps/{slug}/upstreams/{id} (PR-B).
 	GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUpstream, error)
@@ -3681,6 +3717,14 @@ type Store interface {
 	// Partition pruning on sampled_at drops everything outside
 	// the window.
 	ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error)
+
+	// ListDistinctUpstreamHostHashes (PR-C / meterd probe
+	// loop) walks data_upstreams and returns the
+	// deduplicated set of (host_redacted_hash, kind, port)
+	// tuples — the probe iterates this set on every tick.
+	// The plaintext host is NEVER returned; the §11 secret
+	// rule is the reason.
+	ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error)
 
 	// PruneDataUpstreamProbesOlderThan is the hourly retention
 	// purge. cutoff is typically now() - 30 days (matches the

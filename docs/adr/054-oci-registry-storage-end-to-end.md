@@ -100,7 +100,7 @@
     pick a registry (Hetzner Container Registry, GHCR, self-hosted
     distribution) at deploy time; the same registry serves every
     compute node. The `FAAS_OCI_*` env vars and the
-    `cmd/gregale pki init`-style bootstrap story extend naturally.
+    `cmd/gregalectl pki init`-style bootstrap story extend naturally.
   - **Registry outage degrades cold boot.** The
     `LocalCacheBackend` keeps last-known-good blobs on disk; a
     registry outage means stale layers are served (which can still

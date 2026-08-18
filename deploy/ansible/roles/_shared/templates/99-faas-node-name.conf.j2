@@ -1,0 +1,16 @@
+[Service]
+# Mega-PR-A (issue #911 / ADR-110 PR-1): expose this box's compute_node
+# identity to every service-role daemon via FAAS_NODE_NAME. The value
+# comes from host_vars faas_node_name (deploy/ansible/host_vars/
+# faas-fsn-N.yml); ansible renders this drop-in at deploy time and
+# systemd loads it automatically when the unit is reloaded. Empty
+# FAAS_NODE_NAME on a single-box dev box is OK — every daemonside
+# LoadConfig short-circuits to "legacy single-box" when the env is
+# unset, so a missed host_var never silently misconfigures.
+#
+# Shared body — every <role>_service/tasks/main.yml templates this
+# file (via its `src: ../../_shared/templates/99-faas-node-name.conf.j2`
+# lookup) so an operator only ever needs to set faas_node_name once
+# per host. Per-role rationale (which daemon reads the env, what it
+# does with it) lives in the consuming role's README.md.
+Environment=FAAS_NODE_NAME={{ faas_node_name }}

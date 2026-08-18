@@ -60,6 +60,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// handler returns 402 CodeTenantSurfaceQuotaReached before
 			// the store is touched.
 			TenantSurfacesPerAccount: 0, TenantHostnamesPerSurface: 0, TenantSurfacesAllowed: false,
+			DataPlacementHintsPerApp: 0,
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
 			WebhookPerApp: 0, WebhookPerAccount: 0,
@@ -171,6 +172,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// The "single SaaS customer, handful of end-customer
 			// subdomains" use case is the Hobby use case.
 			TenantSurfacesPerAccount: 1, TenantHostnamesPerSurface: 10, TenantSurfacesAllowed: true,
+			DataPlacementHintsPerApp: 3,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
 			// (10) one-to-one. Pending invitations = members/2
 			// because the default 7d TTL keeps the live set small.
@@ -279,6 +281,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// still binds to one app (the multi-app variant is the
 			// deferred footgun).
 			TenantSurfacesPerAccount: 5, TenantHostnamesPerSurface: 50, TenantSurfacesAllowed: true,
+			DataPlacementHintsPerApp: 10,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
 			// (50) one-to-one — every team member can hold a key
 			// for their own deploy target. Financial model is
@@ -391,6 +394,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// falls back to per_host above ~100, surfaced via the
 			// cert engine, not quota).
 			TenantSurfacesPerAccount: 25, TenantHostnamesPerSurface: 250, TenantSurfacesAllowed: true,
+			DataPlacementHintsPerApp: 50,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
 			// (200) one-to-one — SaaS-scale multi-team + rotating-CI.
 			// Financial model is authoritative — derived value,
@@ -1996,6 +2000,58 @@ func TestEdgeRulesThrottlePerApp_MonotonicLadder(t *testing.T) {
 		if currL.EdgeRulesThrottlePerApp < prevL.EdgeRulesThrottlePerApp {
 			t.Errorf("%s.EdgeRulesThrottlePerApp (%d) < %s.EdgeRulesThrottlePerApp (%d)",
 				ladder[i], currL.EdgeRulesThrottlePerApp, ladder[i-1], prevL.EdgeRulesThrottlePerApp)
+		}
+	}
+}
+
+// TestDataPlacementHintsPerApp_PerPlanMatrix pins the per-plan
+// matrix for the ADR-098 §D5 data-placement cap. A regression that
+// swaps the per-plan values breaks the customer quota dashboard
+// ("you have N/M data upstreams").
+func TestDataPlacementHintsPerApp_PerPlanMatrix(t *testing.T) {
+	want := map[Plan]int{
+		PlanFree:  0,
+		PlanHobby: 3,
+		PlanPro:   10,
+		PlanScale: 50,
+	}
+	for plan, expected := range want {
+		l, ok := LimitsFor(plan)
+		if !ok {
+			t.Fatalf("LimitsFor(%s) returned !ok", plan)
+		}
+		if l.DataPlacementHintsPerApp != expected {
+			t.Errorf("%s: DataPlacementHintsPerApp = %d, want %d",
+				plan, l.DataPlacementHintsPerApp, expected)
+		}
+	}
+	// Sanity: the global UpstreamProbeMaxConcurrent and
+	// UpstreamFitMinDeltaMs constants live on the api package (not
+	// per-plan). A regression that moves them onto the Limits
+	// struct would break the meterd boot-time read path
+	// (cmd/meterd/main.go) which dereferences them as api.X, not
+	// planLimits[plan].X.
+	if UpstreamProbeMaxConcurrent <= 0 {
+		t.Errorf("UpstreamProbeMaxConcurrent must be positive, got %d", UpstreamProbeMaxConcurrent)
+	}
+	if UpstreamFitMinDeltaMs <= 0 {
+		t.Errorf("UpstreamFitMinDeltaMs must be positive, got %d", UpstreamFitMinDeltaMs)
+	}
+}
+
+// TestDataPlacementHintsPerApp_MonotonicLadder pins that the
+// per-plan data-placement-cap ladder is non-decreasing. Mirrors the
+// EdgeRulesGeoPerApp ladder — a regression where Pro < Hobby or
+// Scale < Pro breaks the upgrade story.
+func TestDataPlacementHintsPerApp_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.DataPlacementHintsPerApp < prevL.DataPlacementHintsPerApp {
+			t.Errorf("%s.DataPlacementHintsPerApp (%d) < %s.DataPlacementHintsPerApp (%d)",
+				ladder[i], currL.DataPlacementHintsPerApp,
+				ladder[i-1], prevL.DataPlacementHintsPerApp)
 		}
 	}
 }

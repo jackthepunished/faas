@@ -874,9 +874,11 @@ jobs:
     # exceeded`) on the Azure centralus runner. Switch the image to
     # mirror.gcr.io (Google's transparent mirror of Docker Hub, no auth,
     # no per-IP rate limit) — same pattern as FAAS_BUILDER_BASE_REF on
-    # the prod box (deploy/controlplane/sealed.env.example:22). A
-    # pre-step `docker pull` with retry covers the case where the service
-    # container's own pull path flakes before the retry.
+    # the prod box (deploy/controlplane/sealed.env.example:22 —
+    # RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+    # `gregale secrets init`). A pre-step `docker pull` with retry
+    # covers the case where the service container's own pull path
+    # flakes before the retry.
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1067,9 +1069,14 @@ jobs:
     # pkg/daemonunitspec. Asserts that the systemd unit files in the
     # three deploy trees (cp-cp, cp-sys, cp-ans) + daemons.json are
     # byte-equal to what `make generate` would emit from the current
-    # spec files. Pattern matches proto-check / sqlc-check / egress-
-    # check (regenerate-to-tmpdir + git diff --exit-code). PR authors
-    # who edit a UnitXxx() must run `make generate` locally and
+    # spec files. PR-1: cp-cp is the v1 deploy/controlplane/systemd
+    # tree (tombstone now; deletion in PR-1 Phase 2 after PR-X); the
+    # CD pipeline rewired in PR-1 reads units from per-role ansible
+    # files/ instead. cp-cp stays in the gate until Phase 2 lands so
+    # a daemonunitspec change cannot silently drift. Pattern matches
+    # proto-check / sqlc-check / egress-check (regenerate-to-tmpdir
+    # + git diff --exit-code). PR authors who edit a UnitXxx() must
+    # run `make generate` locally and
     # commit the regenerated trees.
     name: daemonunit-check (generated drift)
     runs-on: ubuntu-latest
@@ -1083,6 +1090,29 @@ jobs:
           cache-dependency-path: go.sum
       - name: generate-check
         run: make generate-check
+
+  packer-validate:
+    # ADR-111: Packer-builder syntax gate. PR #928 lands
+    # deploy/packer/{common,ubuntu-2404,role-overlay}.pkr.hcl + the
+    # per-cloud builders in PR #929 (hcloud + amazon-ebs). PR #927's ADR
+    # decides that production host provisioning flows through a Packer-
+    # built image; this CI job is the tripwire that fails PRs with a
+    # syntactically broken .pkr.hcl before any builder creds would have
+    # to be touched.
+    #
+    # `packer validate -syntax-only` works without cloud creds because
+    # the source blocks don't actually resolve until a real builder runs.
+    # Mirrors daemonunit-check / sqlc-check / egress-check: stateless,
+    # fast, runs on every PR.
+    name: packer-validate (ADR-111)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: install-packer (pinned)
+        run: scripts/install-packer.sh
+      - name: packer validate -syntax-only
+        run: make image-validate
 
   e2e-shard1:
     name: e2e (shard 1 — 18 tests)
@@ -1279,3 +1309,71 @@ jobs:
         run: python3 -m pip install --quiet jinja2
       - name: e2e tests (shard 4 — 22 tests)
         run: go test -race -count=1 -timeout=15m -run '^Test(Scan|Sec|Secrets)' ./cmd/e2e/...
+
+  image-build-canary:
+    # ADR-111 image-build canary. PR #929 lands the per-cloud builders
+    # + build scripts; this job exercises the hcloud canary build on
+    # every PR. The canary uses `git_sha=canary-<unix-ts>` so the
+    # snapshot tag is unique-per-run and doesn't collide with
+    # production tags.
+    #
+    # PR visibility: continue-on-error: true so PR authors SEE the
+    # canary status (a red x means the builders broke), but the
+    # job doesn't block the PR. On merge to main, the rule is
+    # required green (enforced via branch protection, NOT this file).
+    #
+    # Required secrets (hcloud steps only): HCLOUD_TOKEN. PRs from forks
+    # don't get repo-scoped secrets, so the canary build only runs on
+    # PRs whose head repo IS poyrazK/faas (i.e. internal contributors).
+    # External PRs gate on `image-validate` (no creds) instead.
+    name: image-build-canary (hcloud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: install-packer (pinned)
+        run: scripts/install-packer.sh
+      - name: install hcloud CLI
+        run: |
+          set -euo pipefail
+          # Asset name + SHA-256 from
+          # https://github.com/hetznercloud/cli/releases/tag/v1.45.0 —
+          # the actual asset is hcloud-linux-amd64.tar.gz (no version
+          # segment embedded in the filename). SHA mirrors the supply-
+          # chain pin pattern used by vacuum / sqlc / protoc / promtool
+          # higher in this file (per codeql-go-clear-text-logging-
+          # obfuscator-barrier lesson; no curl | tar -xz without verify).
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            -o /tmp/hcloud.tar.gz \
+            https://github.com/hetznercloud/cli/releases/download/v1.45.0/hcloud-linux-amd64.tar.gz
+          echo "7918b2058eaf2df180caef34e4db1c7bcf5a6004ef6fd136402ebb7acb25d0eb  /tmp/hcloud.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf /tmp/hcloud.tar.gz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
+          hcloud version
+      # Syntactic gate, runs on every PR regardless of secret wiring.
+      # Uses VALIDATE_FLAGS (-syntax-only) which works against any
+      # HCL without cloud creds. Replaces `image-build-hcloud-canary`
+      # as the no-creds gate; the build step below runs only when
+      # HCLOUD_TOKEN is wired (merge to main, internal PRs).
+      - name: validate every builder
+        run: make -C deploy/packer image-validate
+      - name: build canary snapshot
+        if: ${{ env.HCLOUD_TOKEN != '' }}
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: make -C deploy/packer image-build-hcloud-canary
+      - name: "smoke: list canary snapshot"
+        if: ${{ env.HCLOUD_TOKEN != '' }}
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          # image-build-hcloud-canary synthesises the tag with
+          # `git_sha=canary-$(date +%s)` (deploy/packer/Makefile).
+          # Match the canary-* prefix on the snapshot name; if the
+          # canary didn't upload, the grep returns empty and we fail.
+          hcloud image list -o columns=name,labels \
+            | grep -F 'gregale-compute-' -F 'canary-' \
+            | (read -r line && [ -n "${line}" ] && echo "canary snapshot present: ${line}") \
+            || (echo "canary snapshot not found" >&2; exit 1)

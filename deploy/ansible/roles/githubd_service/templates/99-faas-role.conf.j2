@@ -1,0 +1,14 @@
+[Service]
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to githubd so cmd/githubd/config.go::LoadConfig picks
+# the right role.FromConfig sentinel (FAAS_GITHUBD_ROLE). githubd
+# is a control-plane daemon; on fsn-1 the drop-in sets
+# FAAS_GITHUBD_ROLE=control-plane. Without this drop-in githubd
+# falls back to RoleSingleBox and the per-daemon role gate is
+# unenforced.
+#
+# The drop-in wins over the unit's [Service] section
+# (systemd.unit(5) "later wins") and the unit has no
+# Environment= line on FAAS_GITHUBD_ROLE, so the drop-in is the
+# only source of the env var. Idempotent.
+Environment=FAAS_GITHUBD_ROLE={{ faas_box_role }}

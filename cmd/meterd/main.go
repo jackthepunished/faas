@@ -623,6 +623,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err := role.Require("meterd", cfg.Role, role.RoleSingleBox, role.RoleControlPlane); err != nil {
 		return err
 	}
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity. Mirrors schedd/apid/gatewayd-public so
+	// the playbook shape is identical across daemons.
+	if cfg.NodeName != "" {
+		log.Info("meterd owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("meterd: legacy single-box (cfg.NodeName empty)")
+	}
 	mc, err := deps.loadMeter(cfg)
 	if err != nil {
 		return err
@@ -739,6 +747,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	applyEnvTick("FAAS_RECONCILE_INTERVAL", &mc.ReconcileInterval, deps.getenv, log)
 	applyEnvTick("FAAS_STORAGE_ROLLUP_INTERVAL", &mc.StorageRollupInterval, deps.getenv, log)
 	applyEnvTick("FAAS_RETENTION_INTERVAL", &mc.RetentionInterval, deps.getenv, log)
+	// ADR-098 PR-C: connection-aware probe + partition cadences.
+	// Defaults live in pkg/meter/{config,upstream_probe,upstream_partitions}.go;
+	// the env override is here so the e2e test can shrink the
+	// 30 s probe cadence to sub-second when the FAAS_UPSTREAM_PROBE
+	// flag is on. A bad parse logs and falls through to mc.Defaults().
+	applyEnvTick("FAAS_UPSTREAM_PROBE_INTERVAL", &mc.UpstreamProbeInterval, deps.getenv, log)
+	applyEnvTick("FAAS_UPSTREAM_PROBE_PARTITION_INTERVAL", &mc.UpstreamPartitionCreateInterval, deps.getenv, log)
 
 	// Dunning timer: drives the 7-day past_due → suspended and 21-day
 	// suspended → deleted_pending transitions (spec §4.7, §17). Wired
@@ -833,8 +848,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// loop's contract is "at most one", matching the design note at
 	// pkg/alerts/evaluator.go.
 	evaluator := buildAlertEvaluator(deps, store, log, ops)
+	// ADR-098 PR-C: connection-aware upstream probe + partition
+	// cron. The FAAS_UPSTREAM_PROBE feature flag is OFF by default
+	// (per the cluster outline's rollout gate — flip PR-C last);
+	// when OFF both helpers return nil and the loop skips the
+	// upstream_probe + upstream_part ticks. The probe needs the
+	// meterd region (declared on the host via FAAS_REGION, mirrored
+	// from schedd) so each data_upstream_probes row carries the
+	// region label.
+	probe := buildUpstreamProbe(deps, store, ops, log)
 	loop := meter.NewLoop(store, cpu, parker, pusher, pn, mailer, dunning, residency, evaluator, deps.now, log, mc, ops).
-		WithEgress(egress)
+		WithEgress(egress).
+		WithProbe(probe).
+		WithPartitionCreate(PartitionCreateOnceFn(poolAdapter{pool}, log))
 	errc := make(chan error, 1)
 	go func() { errc <- loop.Run(ctx) }()
 
@@ -877,7 +903,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// per-daemon Prometheus registry (ADR-015), mux at /metrics +
 	// /healthz, 5s graceful shutdown on drain. Empty cfg.MetricsAddr
 	// disables both endpoints (the production default in
-	// deploy/etc/meterd.toml.example).
+	// deploy/etc/meterd.toml.example — RETIRED in PR-1 Phase 2 after
+	// PR-X; the v2 path is deploy/ansible/roles/control_plane_service/
+	// files/meterd.toml.example).
 	const metricsPath = "/metrics"
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {
@@ -1040,6 +1068,73 @@ func buildAlertEvaluator(deps runDeps, store state.Store, log *slog.Logger, ops 
 		Log:        log,
 		Ops:        ops,
 	})
+}
+
+// buildUpstreamProbe (ADR-098 PR-C) wires the connection-aware
+// upstream probe driver. Returns nil when FAAS_UPSTREAM_PROBE is
+// unset (default OFF per the cluster outline's rollout gate —
+// flip PR-C last, one month after PR-B). When ON, instantiates
+// the probe with:
+//
+//   - the meterd region (declared on the host via FAAS_REGION,
+//     mirrored from schedd) so each data_upstream_probes row
+//     carries the region label.
+//   - the production Prom registry (ops) so the
+//     meterd_data_upstream_rtt_ms + ..._probes_total + ...
+//     _probe_duration_seconds metrics surface alongside the
+//     other per-daemon gauges.
+//
+// The probe is keyed on the dedup'd (host_redacted_hash, kind,
+// port) target set (Probe.Run fans out dials up to
+// api.UpstreamProbeMaxConcurrent) — never plain host strings —
+// so the §11 secret rule is enforced end-to-end.
+func buildUpstreamProbe(deps runDeps, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) *meter.Probe {
+	if deps.getenv("FAAS_UPSTREAM_PROBE") == "" {
+		log.Info("meterd: upstream probe disabled — FAAS_UPSTREAM_PROBE unset; running without upstream_probe tick")
+		return nil
+	}
+	region := deps.getenv("FAAS_REGION")
+	if region == "" {
+		log.Warn("meterd: FAAS_UPSTREAM_PROBE set but FAAS_REGION empty; using \"unknown\" region label")
+		region = "unknown"
+	}
+	return meter.NewProbe(store, region, log)
+}
+
+// PartitionCreateLoopFn wraps meter.PartitionCreateLoop into a
+// func(ctx context.Context) signature so Loop.WithPartitionCreate
+// stays thin (it doesn't need the execer / interval / log
+// parameters on its own surface). Called from main only when
+// FAAS_UPSTREAM_PROBE is on; Loop.Health omits "upstream_part"
+// from /healthz when the helper isn't wired.
+//
+// Note: callers that want recordTick("upstream_part", ...) to
+// fire each tick should use PartitionCreateOnceFn instead — the
+// loop variant blocks inside its own ticker, so wrapping it in
+// Loop.runTicks never returns and recordTick is never observed.
+func PartitionCreateLoopFn(db meter.PartitionCreateExecer, interval time.Duration, log *slog.Logger) func(ctx context.Context) {
+	return func(ctx context.Context) {
+		meter.PartitionCreateLoop(ctx, db, interval, log)
+	}
+}
+
+// PartitionCreateOnceFn wraps meter.PartitionCreateOnce (the
+// single-shot sweep) into a func(ctx context.Context) signature.
+// Loop.runTicks then drives the cadence via its own ticker and
+// observes each tick via recordTick("upstream_part", ...), so the
+// /healthz endpoint reports a fresh timestamp instead of "never".
+// This is the wiring TestRun_MetricsAddrServesEndpoints asserts on
+// (cmd/meterd/main_test.go:308-313). The earlier Loop-wrapping
+// pattern blocked inside PartitionCreateLoop's own ticker and
+// starved recordTick — caught by the meterd pg-shard-2 CI gate
+// on R13 fix #2 v1.
+func PartitionCreateOnceFn(db meter.PartitionCreateExecer, log *slog.Logger) func(ctx context.Context) {
+	return func(ctx context.Context) {
+		_, err := meter.PartitionCreateOnce(ctx, db, time.Now())
+		if log != nil && err != nil {
+			log.Error("upstream partition create tick failed", "err", err)
+		}
+	}
 }
 
 // poolAdapter adapts *pgxpool.Pool to the meter.execer contract

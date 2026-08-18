@@ -342,6 +342,12 @@ func TestMkdirBaseExtraction_ParentsRootDir(t *testing.T) {
 func TestMkdirBaseExtraction_UnitFileSetsDiskBackedRoot(t *testing.T) {
 	for _, unitPath := range []string{
 		"../../deploy/systemd/faas-imaged.service",
+		// PR-1 (issue #911 / ADR-110): the v1 controlplane copy is a
+		// tombstone now — the canonical imaged.service is the v2 ansible
+		// role file (deploy/ansible/roles/compute_only_service/files/
+		// faas-imaged.service). The test checks the v2 path first so a
+		// future ops change that drifts the v1 copy fails loudly.
+		"../../deploy/ansible/roles/compute_only_service/files/faas-imaged.service",
 		"../../deploy/controlplane/systemd/faas-imaged.service",
 	} {
 		body, err := os.ReadFile(unitPath)
@@ -373,7 +379,10 @@ func TestMkdirBaseStaging_UnitFileSetsDevShm(t *testing.T) {
 		t.Errorf("%s does not contain %q\n--- unit file ---\n%s",
 			unitPath, want, string(body))
 	}
-	// Symmetric coverage for the deploy/controlplane copy.
+	// Symmetric coverage for the deploy/controlplane copy. PR-1: this
+	// path is a tombstone (Phase 2 deletes it after PR-X); the canonical
+	// imaged.service is the v2 ansible role file. We keep this assertion
+	// for the Phase 1 cluster to guard against an unintended v1/v2 drift.
 	const cpUnit = "../../deploy/controlplane/systemd/faas-imaged.service"
 	cpBody, err := os.ReadFile(cpUnit)
 	if err != nil {

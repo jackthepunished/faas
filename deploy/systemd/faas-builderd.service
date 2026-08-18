@@ -1,0 +1,28 @@
+[Unit]
+Description=onebox-faas builderd — build orchestrator + ephemeral builder microVMs (spec §4.5, ADR-003, ADR-005)
+Documentation=https://docs.gregale.dev/ops/builderd
+After=network.target faas-cp.slice faas-vmmd.service
+Wants=faas-cp.slice faas-vmmd.service
+
+[Service]
+Type=simple
+User=faas-builderd
+Group=faas
+ExecStart=/opt/faas/current/bin/builderd
+Restart=on-failure
+RestartSec=2s
+Slice=faas-cp.slice
+MemoryMax=512M
+EnvironmentFile=/etc/faas/sealed.env
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadOnlyPaths=/etc/faas
+ReadWritePaths=/srv/fc/builder /srv/fc/base /var/log/faas /var/spool/faas
+
+[Install]
+WantedBy=multi-user.target
