@@ -16189,12 +16189,12 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 	var out []DataUpstream
 	for rows.Next() {
 		var (
-			id, accountIDpg, appIDpg                                    pgtype.UUID
+			id, accountIDpg, appIDpg                                                     pgtype.UUID
 			source, scope, deploymentScope, kind, host, hostRedactedHash, declaredRegion string
-			port                                                        int32
-			lastRTT                                                     pgtype.Int4
-			lastProbedAt                                                pgtype.Timestamptz
-			lastSeenAt, createdAt                                       pgtype.Timestamptz
+			port                                                                         int32
+			lastRTT                                                                      pgtype.Int4
+			lastProbedAt                                                                 pgtype.Timestamptz
+			lastSeenAt, createdAt                                                        pgtype.Timestamptz
 		)
 		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &deploymentScope, &kind, &host, &port,
 			&hostRedactedHash, &declaredRegion,
@@ -16212,11 +16212,11 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 			probedPtr = &t
 		}
 		out = append(out, DataUpstream{
-			ID:               uuidFromPgtype(id),
-			AccountID:        uuidFromPgtype(accountIDpg),
-			AppID:            uuidFromPgtype(appIDpg),
-			Source:           DataUpstreamSource(source),
-			Scope:            scope,
+			ID:        uuidFromPgtype(id),
+			AccountID: uuidFromPgtype(accountIDpg),
+			AppID:     uuidFromPgtype(appIDpg),
+			Source:    DataUpstreamSource(source),
+			Scope:     scope,
 			// DeploymentScope (ADR-098 amendment issue #954) — the
 			// ?scope=__all__ arm of listUpstreams must surface the
 			// same deployment overlay the per-page arm does;

@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00281_data_upstreams_deployment_scope.sql
+// Migration-apply test for 00285_data_upstreams_deployment_scope.sql
 // (issue #954 / ADR-098-deployment-scope-overlay amendment).
 //
 // Pins:
@@ -45,7 +45,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00281_DataUpstreamsDeploymentScope(t *testing.T) {
+func TestMigrations_00285_DataUpstreamsDeploymentScope(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
