@@ -18,9 +18,12 @@
 --   4. CREATE the widened UNIQUE INDEX
 --      (app_id, scope, deployment_scope, kind, host, port).
 --   5. Widen the pg_notify pipe-payload to 7 fields
---      (app_id|scope|deployment_scope|kind|host|port|op). schedd's
---      pkg/sched/listen.go parses on a fixed split and must update
---      in the same PR.
+--      (app_id|scope|deployment_scope|kind|host|port|op). The format
+--      change is forward-only — schedd does NOT currently LISTEN on
+--      data_upstreams_changed (per ADR §D2 the chooser reads
+--      synchronously at wake, not via pg_notify). The widened pipe
+--      is dormant today and a future PR that turns on subscribers
+--      will land its parser in lockstep.
 --
 -- Replay-safety: the harness at migrations/replay_safety_test.go
 -- (TestNewMigrationsAreReplaySafe) applies the migration twice in a
@@ -39,9 +42,24 @@
 ALTER TABLE data_upstreams
   ADD COLUMN IF NOT EXISTS deployment_scope text NOT NULL DEFAULT 'default';
 
-ALTER TABLE data_upstreams
-  ADD CONSTRAINT data_upstreams_deployment_scope_shape
-    CHECK (deployment_scope ~ '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$');
+-- Constrained-name guard per the harness spec at
+-- migrations/replay_safety_test.go:91-95 ("constraints + enum-value
+-- additions: guard with a DO block that checks pg_constraint first").
+-- PG rejects `ADD CONSTRAINT IF NOT EXISTS` (42710 on the second
+-- pass), so the DO-block pattern from 00053 is the load-bearing
+-- idiom. See the same shape in 00053_deployments_source_url.sql.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conname = 'data_upstreams_deployment_scope_shape'
+          AND conrelid = 'data_upstreams'::regclass
+    ) THEN
+        ALTER TABLE data_upstreams
+            ADD CONSTRAINT data_upstreams_deployment_scope_shape
+                CHECK (deployment_scope ~ '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$');
+    END IF;
+END$$;
 
 -- Widen the dedupe UNIQUE INDEX to include deployment_scope.
 DROP INDEX IF EXISTS data_upstreams_dedupe_uniq;
@@ -49,11 +67,13 @@ DROP INDEX IF EXISTS data_upstreams_dedupe_uniq;
 CREATE UNIQUE INDEX IF NOT EXISTS data_upstreams_dedupe_uniq
   ON data_upstreams (app_id, scope, deployment_scope, kind, host, port);
 
--- Widen the pg_notify pipe payload to 7 fields so schedd's
--- pkg/sched/listen.go parser can identify the row across the
--- widened key. The 6->7 widening is forward-only and the
--- same-PR contract for schedd's parser is documented in the
--- DOWN block below.
+-- Widen the pg_notify pipe payload to 7 fields
+-- (app_id|scope|deployment_scope|kind|host|port|op). schedd does
+-- not currently LISTEN on data_upstreams_changed (per ADR §D2
+-- the chooser reads synchronously at wake, not via pg_notify),
+-- so this widening is dormant today; the down-migration
+-- recreates the 6-field function so a replay still produces
+-- the pre-00281 shape on the rollback path.
 DROP TRIGGER IF EXISTS data_upstreams_notify_trg ON data_upstreams;
 DROP FUNCTION IF EXISTS data_upstreams_notify();
 

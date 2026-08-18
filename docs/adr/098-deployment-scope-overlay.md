@@ -49,12 +49,16 @@ currently keys on `(app_id, scope, …)` for an
   `CREATE UNIQUE INDEX data_upstreams_dedupe_uniq
    ON data_upstreams (app_id, scope, deployment_scope, kind, host, port)`.
 - `data_upstreams_notify()` widens the pg_notify pipe-payload from 6
-  to 7 fields: `app_id|scope|deployment_scope|kind|host|port|op`. Schedd's
-  `pkg/sched/listen.go` parser updates in the same PR.
+  to 7 fields: `app_id|scope|deployment_scope|kind|host|port|op`. Schedd
+  does NOT currently LISTEN on `data_upstreams_changed` (per ADR §D2
+  the chooser reads synchronously at wake, not via pg_notify), so the
+  widening is dormant today — a future PR that turns on subscribers
+  lands its parser in lockstep with this format.
 
 The down-migration reverses the index first, then drops the column,
-and restores the 6-field pipe format. Forward-only on the wire change
-(schedd must update in lockstep).
+and restores the 6-field pipe format. Forward-only on the wire
+change; the hazard is theoretical until the subscriber path is
+re-introduced.
 
 ### D2. Writer — `pkg/state/queries.sql::InsertDataUpstream`
 
@@ -136,9 +140,11 @@ PR #960 (`gregale inspect <slug> --upstreams`) renders the new
   separate slots but still share the cap. Documented in the limits
   table comment.
 - **pg_notify wire change.** Forward-only on the 6→7 field pipe
-  payload. Down-migration recreates the 6-field function but a
-  fleet mid-upgrade would see two-way traffic; not a load-bearing
-  concern at single-host deploys.
+  payload, but no consumer subscribes to `data_upstreams_changed`
+  today (per ADR §D2 the chooser reads synchronously at wake). The
+  widened pipe is dormant; the down-migration's recreation of the
+  6-field function exists for replay-safety symmetry, not because
+  a subscriber depends on it.
 - **Chooser cache key collisions.** The new key is
   `appID + "\x00" + deploymentScope`. Pre-amendment entries keyed on
   `appID` alone are not load-bearing at restart (cache TTL is short
@@ -152,11 +158,14 @@ PR #960 (`gregale inspect <slug> --upstreams`) renders the new
 The down-migration reverses the index first
 (`DROP INDEX … ; CREATE UNIQUE INDEX … ON … (app_id, scope, kind, host, port)`),
 then drops the column, then restores the 6-field pg_notify function.
-Forward-only on the pipe payload means a down-migration before schedd
-upgrades would leave the parser crashing on `len(parts) != 6` — the
-PR merges the migration + schedd in lockstep, so this is a hazard
-only if a hot-fix unbundles them.
+The pipe-format reverse is for replay-safety symmetry, not because
+any consumer reads the 6-field payload today (schedd does not
+LISTEN on `data_upstreams_changed` — see §D1 step 5).
 
-PR-B (capture) + PR-D (chooser) shipped with `deployment_scope ==
-'app' implicit`. PR-A's table defaulting matches that. Single-deployment
-apps see no behavior change.
+Single-deployment apps see no behavior change: the migration's
+`DEFAULT 'default'` stamp matches the apid writer's fallback
+(`defaultEnvScope = "default"`), and the schedd cold-path wake
+threads `defaultDeploymentScope = "default"` when the engine has
+no `dep` row in scope. The whole widening is observable only when
+a customer has actually created two deployments with distinct
+`scope` values.
