@@ -273,8 +273,14 @@ func TestSecretsScopeSurfacePg(t *testing.T) {
 	// The key name "GAMMA" is the new (4th) key — re-PUT of an existing
 	// key would re-upsert (off-by-one rule) and NOT count against quota,
 	// so a fresh key is what proves the cross-scope posture.
+	//
+	// The scope "qa-prod" (5 chars) is the minimal valid scope slug
+	// beyond "default" — keeps the assertion on the cross-scope quota
+	// path (the load-bearing assertion) rather than 400 env_scope_invalid
+	// (which would fire for shorter slugs like "qa" that fail the
+	// EnvScopePattern regex `^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$`).
 	assertProblemAPID(t, h, key, http.MethodPut,
-		"/v1/apps/"+slug+"/secrets/GAMMA?scope=qa",
+		"/v1/apps/"+slug+"/secrets/GAMMA?scope=qa-prod",
 		api.PutAppSecretRequest{Value: "v-qa-gamma"},
 		http.StatusForbidden,
 		api.CodePlanLimitSecrets)
