@@ -1,0 +1,85 @@
+# Prometheus rules — ADR-098 §9.A meterd data-upstream probes (issue #951).
+#
+# Loaded by ansible: deploy/ansible/roles/prometheus/tasks/main.yml drops
+# this file alongside faas.rules.yml + pg_backup.rules.yml and lists it
+# in rule_files: at templates/prometheus.yml.j2:17-22. CI lints it via
+# .github/workflows/ci.yml (promtool check rules) and the Go-side
+# TestFaasRulesSyntax (extended to a list of rule files in issue #951).
+#
+# Metric surface (pkg/wire/metrics.go:2331-2357):
+#   meterd_data_upstream_rtt_ms_bucket{kind, host_redacted_hash, region, le}
+#     Buckets: {1, 5, 10, 50, 100, 500, 1000, 3000} ms.
+#   meterd_data_upstream_probes_total{outcome}
+#     outcome ∈ {ok, timeout, refused, tls_handshake, dns, unreachable}.
+#   meterd_data_upstream_probe_duration_seconds_bucket{le}
+#     Buckets: {0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 3} seconds.
+#
+# §11 invariant: host_redacted_hash is the only host-derived label and
+# is dropped from every alert's `by` clause to bound cardinality.
+# Do not add a new outcome value to the closed-vocab without extending
+# the pre-instantiation loop at pkg/wire/metrics.go:2355-2357.
+
+groups:
+  - name: faas_data_placement
+    interval: 30s
+    rules:
+      - alert: FaasUpstreamRttHealthy
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, kind, region) (rate(meterd_data_upstream_rtt_ms_bucket[10m]))
+          ) < 5
+        for: 10m
+        labels:
+          severity: info
+          component: meterd
+          family: data_placement
+        annotations:
+          summary: "Data-placement p95 RTT < 5ms for {{ $labels.kind }}/{{ $labels.region }}"
+          description: "The chooser bias for {{ $labels.kind }} upstreams in {{ $labels.region }} is observing p95 RTT < 5ms for 10m — the connection-aware placement is operating within the spec's healthy envelope. This is informational; no action required."
+
+      - alert: FaasUpstreamRttDegraded
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, kind, region) (rate(meterd_data_upstream_rtt_ms_bucket[10m]))
+          ) > 200
+        for: 10m
+        labels:
+          severity: page
+          component: meterd
+          family: data_placement
+        annotations:
+          summary: "Data-placement p95 RTT > 200ms for {{ $labels.kind }}/{{ $labels.region }}"
+          description: "Connection-aware probe loop reports sustained p95 RTT > 200ms for {{ $labels.kind }} upstreams in {{ $labels.region }} (10m window). Customer wakes are landing on a region with degraded connectivity — the chooser bias (C6) preserves the legacy fallthrough on stale scores so customer apps continue to wake, but the page signals a network condition worth investigating. Cross-reference with the recent deploy log; an outbound firewall change or inter-region route flap is the canonical cause."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamRttDegraded.md"
+
+      - alert: FaasUpstreamProbeHighFailureRate
+        expr: |
+          (
+            sum(rate(meterd_data_upstream_probes_total{outcome=~"timeout|refused"}[10m]))
+            /
+            sum(rate(meterd_data_upstream_probes_total{outcome="ok"}[10m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warn
+          component: meterd
+          family: data_placement
+        annotations:
+          summary: "Data-placement probe failure rate > 5% for 10m"
+          description: "ratio of timeout/refused probes to ok probes exceeded 5% for 10m. ADR-098 §11 keeps cert validation non-bypassable, so a sustained bump is most often a network/firewall change, not a TLS regression. Cross-reference FaasUpstreamRttDegraded alerts for the same window."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamRttDegraded.md"
+
+      - alert: FaasUpstreamProbeSlow
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(meterd_data_upstream_probe_duration_seconds_bucket[10m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warn
+          component: meterd
+          family: data_placement
+        annotations:
+          summary: "Data-placement probe p95 wall-clock > 1s for 10m"
+          description: "Per-probe TCP+TLS handshake exceeded 1s p95 for 10m. The handshake payload is bounded by the customer's CA chain, not our control — a slow probe is overwhelmingly a network condition, not a customer cert issue. If the ratio of tls_handshake outcomes also rises, treat it as a TLS regression and escalate."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamRttDegraded.md"
