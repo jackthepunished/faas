@@ -214,9 +214,15 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "connect",
 		DocSlug: "connect",
-		Short:   "Connect a third-party service (github)",
+		Short:   "Connect a third-party service (github | repo OWNER/NAME)",
 		Subcommands: []cliSub{
 			{Name: "github", Short: "Connect a GitHub account for repo deploys"},
+			// Issue #961 / Mega-B PR-1: `connect repo <owner>/<name>`
+			// opens the dashboard's /dashboard/apps/new?repo=... wizard
+			// (PR-3 wires the server side). The CLI stays out of the
+			// OAuth dance — the cookie-session dashboard is the
+			// install-token trust root.
+			{Name: "repo", Short: "Open the dashboard wizard to bind <owner>/<name> to a Gregale app"},
 		},
 	},
 	{
