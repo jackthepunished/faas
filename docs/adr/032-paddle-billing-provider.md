@@ -115,10 +115,15 @@ flips to Paddle.
 ### Negative / deferred
 
 - The Stripe module stays in the workspace. The `stripe-go v70.15.0+incompatible`
-  pin in `go.mod:28` is unchanged; the conventional-modules lint gate
-  in `.github/workflows/ci.yml:149-156` is relaxed for the `stripe`
-  module (one-line edit documented in PR-D's diff) because the module
-  is no longer a runtime dependency.
+  pin in `go.mod:28` is unchanged; the `+incompatible` direct-dep
+  lint gate in `.github/workflows/ci.yml:149-156` (release blocker
+  B1) is intentionally **not** relaxed by this ADR. The Stripe
+  SDK is still loaded by the admin endpoints + tests, and removing
+  the gate would silently allow future `+incompatible` direct deps.
+  The Stripe upgrade is a separate workstream. The launch cluster
+  ships with the lint gate in its current state; the B1 gate forces
+  the Stripe upgrade to land as part of the v1.0 release rather than
+  getting backburnered.
 - The financial-model re-validation is operator-owned and out of scope
   for this PR cluster. The model is the source of truth for unit
   economics; if it disagrees with Paddle's fee shape, the deviation is

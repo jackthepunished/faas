@@ -1,0 +1,59 @@
+name: paddle sandbox
+
+# Manual-only acceptance job for the Paddle Billing v2 sandbox live
+# walk (ADR-032 v2, PR-F of the launch cluster). Runs the four
+# cmd/e2e tests in billing_paddle_sandbox_test.go against a real
+# api.sandbox.paddle.com merchant:
+#
+#   - TestPaddleSandbox_ChangePlanReturnsCheckoutURL — POSTs to
+#     /v1/account/plan, asserts the 402 surfaces paddle_checkout_url
+#     + tx_id.
+#   - TestPaddleSandbox_SubscriptionCreatedStampsCustomerID —
+#     subscription.created webhook stamps acct.ProviderCustomerID.
+#   - TestPaddleSandbox_TransactionCompletedIsNoop — informational
+#     event does not flip dunning state.
+#   - TestPaddleSandbox_PerWindowClaimRoundTrip — the meterd
+#     production path stamps paddle_overage_dedupe.
+#   - TestPaddleSandbox_WebhookSignatureRoundTrip — SDK-side
+#     pinning of the contract the apid layer consumes.
+#
+# The paddle_sandbox_e2e build tag and FAAS_PADDLE_SANDBOX_E2E=1 env
+# gate keep this off the default `go test ./...` path. The CI
+# workflow is workflow_dispatch only — Paddle sandbox availability
+# must not block merges. Mirrors the gating pattern the metallima
+# and stripex-sandbox jobs use.
+#
+# Required repo secrets:
+#   - PADDLE_SANDBOX_API_KEY        (pdl_sandbox_… from api.sandbox.paddle.com)
+#   - PADDLE_SANDBOX_WEBHOOK_SECRET (whk_… from the sandbox Webhook endpoint)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox:
+    runs-on: ubuntu-latest
+    env:
+      PADDLE_SANDBOX_API_KEY: ${{ secrets.PADDLE_SANDBOX_API_KEY }}
+      PADDLE_SANDBOX_WEBHOOK_SECRET: ${{ secrets.PADDLE_SANDBOX_WEBHOOK_SECRET }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: paddle sandbox live walk
+        run: |
+          set -euo pipefail
+          # secrets/.env.sandbox is the operator-only file the
+          # cmd/e2e harness reads. Generate it from the GH Actions
+          # secrets so the build doesn't depend on a checked-in
+          # file. The CI workflow never commits secrets/.env.sandbox.
+          mkdir -p secrets
+          cat > secrets/.env.sandbox <<EOF
+          FAAS_PADDLE_SANDBOX_API_KEY=${PADDLE_SANDBOX_API_KEY}
+          FAAS_PADDLE_SANDBOX_WEBHOOK_SECRET=${PADDLE_SANDBOX_WEBHOOK_SECRET}
+          EOF
+          FAAS_PADDLE_SANDBOX_E2E=1 go test -tags paddle_sandbox_e2e -race -count=1 -run=PaddleSandbox -timeout=10m -v ./cmd/e2e/...
