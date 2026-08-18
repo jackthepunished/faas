@@ -1,4 +1,4 @@
--- filename: 00286_pg_ratelimit_add_rule_scope.sql
+-- filename: 00287_pg_ratelimit_add_rule_scope.sql
 -- +goose Up
 -- +goose StatementBegin
 
