@@ -181,6 +181,7 @@ var schemaSpecOnly = map[string]bool{
 	"Trace":                  true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
 	"TraceSpan":              true, // issue #555: subtree of Trace; gateway-internal type
 	"RaiseOverageCapRequest": true, // issue #561: inline {OverageCapCents *int64} in cmd/apid/handlers_ext.go
+	"TemplateView":           true, // issue #961 / Mega-B PR-3: inline {Name, Category, Description string} in cmd/apid/handlers_templates.go
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.
