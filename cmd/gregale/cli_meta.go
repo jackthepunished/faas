@@ -359,6 +359,22 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:        dispatchInspect,
+		DocSlug:     "inspect",
+		Short:       "Read-only operator surface (inspect <slug> --upstreams [--scope <scope>] [--json])",
+		Positionals: []string{"<slug>"},
+		// Leaf-selectors are flags on this verb, not positional
+		// sub-verbs (issue #952 UX: `gregale inspect <slug>
+		// --upstreams`). Future leaves (--env, --crons,
+		// --instances) add another `cliFlag` entry below. The
+		// completion backend and man-page renderer read this
+		// Flags block to surface the right verb shape.
+		Flags: []cliFlag{
+			{Name: "upstreams", Short: "List data upstreams captured for this app (ADR-098 §9.A)"},
+			{Name: "scope", Short: "filter by scope (forwarded as ?scope=, used with --upstreams)"},
+		},
+	},
+	{
 		Name:    "invoke",
 		DocSlug: "invoke",
 		Short:   "Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])",
