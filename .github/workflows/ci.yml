@@ -1125,7 +1125,10 @@ jobs:
   e2e-shard1:
     name: e2e (shard 1 — 18 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The test command has a 15m package timeout; leave runner cleanup
+    # headroom so slow shared runners fail with the test result instead of
+    # being cancelled by the job budget first.
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1174,7 +1177,7 @@ jobs:
   e2e-shard2:
     name: e2e (shard 2 — 15 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1223,7 +1226,7 @@ jobs:
   e2e-shard3:
     name: e2e (shard 3 — 24 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1272,7 +1275,7 @@ jobs:
   e2e-shard4:
     name: e2e (shard 4 — 22 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
