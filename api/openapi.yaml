@@ -187,6 +187,15 @@ tags:
       The active-org hint is accepted via `X-Active-Org` / `?org=`
       on every org-scoped route (matches LoadOrg middleware precedence);
       path-scoped routes resolve via `{slug}` regardless.
+  - name: templates
+    description: |
+      Starter template catalog (issue #961 / Mega-B PR-3). The
+      dashboard's /dashboard/apps/new wizard renders the GET
+      /v1/templates response as the "Starting template" dropdown;
+      the CLI's `gregale deploy --template NAME` and `gregale init
+      --template NAME` validators reference the same source on the
+      CLI side. Cookie-session-authenticated (NOT API-key) per
+      ADR-116 — the dashboard is the install-token trust root.
 
 security:
   - bearerAuth: []

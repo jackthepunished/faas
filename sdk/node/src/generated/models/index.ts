@@ -232,6 +232,7 @@ export type { SourceRefDeployRequest } from './SourceRefDeployRequest.js';
 export type { SourceTarballDeployRequest } from './SourceTarballDeployRequest.js';
 export type { StorageUsageListResponse } from './StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './StorageUsageResponse.js';
+export type { TemplateView } from './TemplateView.js';
 export type { TenantHostnameResponse } from './TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './TenantSurfaceResponse.js';
 export type { ThrottlePreviewRow } from './ThrottlePreviewRow.js';
