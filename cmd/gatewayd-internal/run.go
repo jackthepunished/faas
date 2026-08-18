@@ -268,9 +268,9 @@ func certIssuerFor(store state.Store, metrics *gateway.Metrics, enabled bool, dn
 		}
 		var dnsProvider certmagic.DNSProvider
 		switch provider {
-		case "hetzner":
+		case api.DNSProviderHetzner:
 			dnsProvider = gateway.NewHetznerDNSProvider(token, "")
-		case "cloudflare":
+		case api.DNSProviderCloudflare:
 			dnsProvider = gateway.NewCloudflareDNSProvider(token, "")
 		}
 		// dnsProvider may be nil (operator hasn't supplied a

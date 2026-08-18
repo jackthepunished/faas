@@ -1,23 +1,28 @@
 -- +goose Up
 -- +goose StatementBegin
-SELECT 'up SQL: 00277 — tenant_surfaces add per_host to cert_kind CHECK';
--- +goose StatementEnd
 
--- PR-D cert-engine-real-mint commit 5: widen the cert_kind
--- closed-set on tenant_surfaces to include 'per_host'. The
--- per_host value represents the >MaxSANPerCert fallback
--- shape (ADR-100 §"Cert engine shape" line 76): one cert per
--- hostname in the verified set, no SAN bundling, but still
--- served from the same on-disk certmagic storage layout.
+-- 00277_tenant_surfaces_per_host_kind.sql — PR-D
+-- cert-engine-real-mint (issue #879 / ADR-100) commit 5.
+-- Widen the cert_kind closed-set on tenant_surfaces to include
+-- 'per_host'. The per_host value represents the >MaxSANPerCert
+-- fallback shape (ADR-100 §"Cert engine shape" line 76): one
+-- cert per hostname in the verified set, no SAN bundling, but
+-- still served from the same on-disk certmagic storage layout.
 --
 -- The wrapper at pkg/gateway/cert_issuer_tenant_surface.go
 -- today rejects per_host with a clear 'per-host bundler
--- ships in follow-up ADR-114' last_error. Adding the
--- constant now so:
+-- ships in follow-up ADR-114' last_error. Adding the constant
+-- now so:
 --   - the schema is forward-compat (an operator writing
 --     per_host via raw SQL doesn't hit the CHECK)
 --   - ADR-114 doesn't need a schema-touching migration
 --   - the type-level CertKind closed-set mirrors reality
+--
+-- The whole body must land in a single StatementBegin/End block
+-- so pgx delivers it as one round trip — naive statement
+-- splitting on `;` mangles the DO $$ body (SQLSTATE 42601
+-- 'unterminated dollar-quoted string'). Mirrors the
+-- StatementBegin/End envelope used by 00074 and 00213.
 --
 -- The CHECK is inline (anonymous) in 00243_tenant_surfaces.sql
 -- so postgres auto-named the constraint
@@ -48,10 +53,10 @@ ALTER TABLE tenant_surfaces
     ADD CONSTRAINT tenant_surfaces_cert_kind_check
     CHECK (cert_kind IN ('per_host_san', 'shared_wildcard', 'per_host'));
 
+-- +goose StatementEnd
+
 -- +goose Down
 -- +goose StatementBegin
-SELECT 'down SQL: 00277 — tenant_surfaces narrow cert_kind CHECK back to v1';
--- +goose StatementEnd
 
 -- The rollback is conservative: ANY row already written
 -- with cert_kind='per_host' would block the narrowing,
@@ -79,3 +84,5 @@ END $$;
 ALTER TABLE tenant_surfaces
     ADD CONSTRAINT tenant_surfaces_cert_kind_check
     CHECK (cert_kind IN ('per_host_san', 'shared_wildcard'));
+
+-- +goose StatementEnd

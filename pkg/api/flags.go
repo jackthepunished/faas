@@ -79,15 +79,25 @@ func CertEngineStaging() bool {
 	return true
 }
 
-// CertEngineDNSProvider returns the DNS provider name (hetzner,
-// cloudflare). Defaults to cloudflare per ADR-024 §6. The
-// token for the provider is supplied separately via the
-// operator-sealed DNS token (FAAS_TLS_DNS_TOKEN — looked up
-// through the DNSProviderFactory seam, not here).
+// DNS provider identifiers (PR-D cert engine). Constants are
+// package-scoped so pkg/api/flags_test.go can assert against
+// them by symbol — extracting also tames the golangci-lint
+// goconst check (the package-wide occurrence counter flags any
+// literal used 3+ times).
+const (
+	DNSProviderHetzner    = "hetzner"
+	DNSProviderCloudflare = "cloudflare"
+)
+
+// CertEngineDNSProvider returns the DNS provider name. Defaults
+// to cloudflare per ADR-024 §6. The token for the provider is
+// supplied separately via the operator-sealed DNS token
+// (FAAS_TLS_DNS_TOKEN — looked up through the DNSProviderFactory
+// seam, not here).
 func CertEngineDNSProvider() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("FAAS_TLS_DNS_PROVIDER"))) {
-	case "hetzner":
-		return "hetzner"
+	case DNSProviderHetzner:
+		return DNSProviderHetzner
 	}
-	return "cloudflare"
+	return DNSProviderCloudflare
 }

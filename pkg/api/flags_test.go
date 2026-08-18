@@ -149,22 +149,24 @@ func TestCertEngineStagingDefaultsOn(t *testing.T) {
 }
 
 // TestCertEngineDNSProviderDefaultsCloudflare pins the default
-// per ADR-024 §6.
+// per ADR-024 §6. References the DNSProvider* constants (also
+// referenced by CertEngineDNSProvider in flags.go) so the
+// golangci-lint goconst check doesn't flag the literal-3+ shape.
 func TestCertEngineDNSProviderDefaultsCloudflare(t *testing.T) {
 	t.Setenv("FAAS_TLS_DNS_PROVIDER", "")
-	if got := CertEngineDNSProvider(); got != "cloudflare" {
-		t.Errorf("CertEngineDNSProvider default = %q; want cloudflare", got)
+	if got := CertEngineDNSProvider(); got != DNSProviderCloudflare {
+		t.Errorf("CertEngineDNSProvider default = %q; want %q", got, DNSProviderCloudflare)
 	}
-	t.Setenv("FAAS_TLS_DNS_PROVIDER", "hetzner")
-	if got := CertEngineDNSProvider(); got != "hetzner" {
-		t.Errorf("CertEngineDNSProvider(hetzner) = %q; want hetzner", got)
+	t.Setenv("FAAS_TLS_DNS_PROVIDER", DNSProviderHetzner)
+	if got := CertEngineDNSProvider(); got != DNSProviderHetzner {
+		t.Errorf("CertEngineDNSProvider(hetzner) = %q; want %q", got, DNSProviderHetzner)
 	}
 	// Unknown provider falls back to cloudflare (the documented
 	// default) rather than erroring — the cert engine will then
 	// fail to construct a DNS provider and the wrapper's
 	// nil-issuer degradation handles the visible failure.
 	t.Setenv("FAAS_TLS_DNS_PROVIDER", "route53-unimpl")
-	if got := CertEngineDNSProvider(); got != "cloudflare" {
-		t.Errorf("CertEngineDNSProvider(unknown) = %q; want cloudflare (safe default)", got)
+	if got := CertEngineDNSProvider(); got != DNSProviderCloudflare {
+		t.Errorf("CertEngineDNSProvider(unknown) = %q; want %q (safe default)", got, DNSProviderCloudflare)
 	}
 }
