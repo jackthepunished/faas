@@ -67,7 +67,7 @@ func TestLimiter_NoopBackend_NeverConsultsCentral(t *testing.T) {
 	// goroutine-y cost on the central path.
 	l := NewLimiter()
 	for i := 0; i < 100; i++ {
-		if !l.Allow("appid", api.PlanHobby) {
+		if !l.Allow(context.Background(), "appid", api.PlanHobby) {
 			t.Fatalf("hobby plan rejected admit #%d (back-compat: noop backend never blocks)", i)
 		}
 	}
@@ -112,7 +112,7 @@ func TestLimiter_RealBackend_BoundaryConsultOnly(t *testing.T) {
 	// First 100 admits fit in burst; the frozen clock prevents
 	// any refill between them. Zero central round-trips.
 	for i := 0; i < 100; i++ {
-		if !l.AllowWithCentralParams("appid", rps, burst, centralKey) {
+		if !l.AllowWithCentralParams(context.Background(), "appid", rps, burst, centralKey) {
 			t.Fatalf("hobby admit #%d rejected in burst (in-process should serve)", i)
 		}
 	}
@@ -123,7 +123,7 @@ func TestLimiter_RealBackend_BoundaryConsultOnly(t *testing.T) {
 	// Bucket drained. The next call must consult central exactly
 	// once. Central returns (5, nil) → admit.
 	fake.peekResult = func() (int, error) { return 5, nil }
-	if !l.AllowWithCentralParams("appid", rps, burst, centralKey) {
+	if !l.AllowWithCentralParams(context.Background(), "appid", rps, burst, centralKey) {
 		t.Errorf("hobby admit on drained bucket rejected; central said admit (remaining=5)")
 	}
 	if got := fake.peekCalls.Load(); got != 1 {
@@ -132,7 +132,7 @@ func TestLimiter_RealBackend_BoundaryConsultOnly(t *testing.T) {
 
 	// Central still rejects → reject.
 	fake.peekResult = func() (int, error) { return 0, nil }
-	if l.AllowWithCentralParams("appid", rps, burst, centralKey) {
+	if l.AllowWithCentralParams(context.Background(), "appid", rps, burst, centralKey) {
 		t.Error("hobby admit accepted despite central reject (degraded posture must preserve local reject)")
 	}
 	if got := fake.peekCalls.Load(); got != 2 {
@@ -160,9 +160,9 @@ func TestLimiter_RealBackend_PGErrorDegradesSoft(t *testing.T) {
 	const rps, burst = 1500.0, 3000.0
 	const centralKey = "app:00000000-0000-0000-0000-000000000002:scale"
 	for i := 0; i < 3000; i++ {
-		l.AllowWithCentralParams("appid", rps, burst, centralKey)
+		l.AllowWithCentralParams(context.Background(), "appid", rps, burst, centralKey)
 	}
-	if l.AllowWithCentralParams("appid", rps, burst, centralKey) {
+	if l.AllowWithCentralParams(context.Background(), "appid", rps, burst, centralKey) {
 		t.Error("scale admit accepted despite PG error (degraded posture must preserve local reject)")
 	}
 	if got := fake.peekCalls.Load(); got == 0 {
@@ -231,7 +231,7 @@ func TestLimiter_AllowWithCentralParams_NoCentralKey_NoConsult(t *testing.T) {
 	fake := newFakeCentral()
 	l := NewLimiterWithCentral(fake)
 	for i := 0; i < 50; i++ {
-		l.AllowWithCentralParams("appid", 50, 100, "")
+		l.AllowWithCentralParams(context.Background(), "appid", 50, 100, "")
 	}
 	if got := fake.peekCalls.Load(); got != 0 {
 		t.Errorf("peek calls with empty centralKey = %d, want 0 (back-compat)", got)

@@ -250,6 +250,19 @@ const (
 	authnReasonRevoked       = "revoked"
 )
 
+// Rate-limit closed vocabulary (goconst: literal duplicates that
+// crossed the package-wide goconst threshold once Phase 4 added
+// the per-rule consult + the X-RouteRateLimit-Policy header).
+// These mirror the constants in pkg/gateway/ratelimit.go
+// (centralKey triple) and the KindEdgeRule constants in
+// pkg/api/dto.go — keep them in sync when adding new values.
+const (
+	rateLimitScopeApp     = "app"
+	rateLimitScopeAccount = "account"
+	rateLimitScopeRule    = "rule"
+	rateLimitScopeRoute   = "route"
+)
+
 // AppSidecar (issue #463 / ADR-069 / ADR-071 / PR-C §5) is
 // the narrow subset of pkg/api.SidecarSpec the public
 // listener's routing-key split uses. The full spec lives
@@ -839,15 +852,15 @@ func (h *Handler) InvalidateRateLimit(scope, subjectID, plan string) {
 		return
 	}
 	switch scope {
-	case "app":
+	case rateLimitScopeApp:
 		for _, l := range h.limiters() {
 			l.Forget(subjectID)
 		}
-	case "account":
+	case rateLimitScopeAccount:
 		for _, l := range h.limiters() {
 			l.ForgetAccount(subjectID)
 		}
-	case "rule":
+	case rateLimitScopeRule:
 		// Rule scope: per-rule bucket key is
 		// appID+"\x00"+ruleID. We don't have appID in the
 		// payload (subject_id IS the rule UUID), so we walk
@@ -1241,7 +1254,7 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 	rule := h.edgeRules.MatchRoute(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
 	if rule == nil {
 		if h.metrics != nil {
-			h.metrics.ObserveEdgeRuleMatch("route", "miss")
+			h.metrics.ObserveEdgeRuleMatch(rateLimitScopeRoute, "miss")
 		}
 		return false
 	}
@@ -1251,7 +1264,7 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 		// pending, or the slug was never on this box).
 		// Silent fall-through; next request re-resolves.
 		if h.metrics != nil {
-			h.metrics.ObserveEdgeRuleMatch("route", "miss")
+			h.metrics.ObserveEdgeRuleMatch(rateLimitScopeRoute, "miss")
 		}
 		return false
 	}
@@ -1271,11 +1284,11 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 			})
 		}
 		if h.metrics != nil {
-			h.metrics.ObserveEdgeRuleMatch("route", "blocked")
+			h.metrics.ObserveEdgeRuleMatch(rateLimitScopeRoute, "blocked")
 			// PR-B: cross-account is a defense-in-depth no-op, not an
 			// apply failure. Surface as success so the §12 apply-rate
 			// panel counts it as a successful (no-op) apply.
-			h.metrics.ObserveEdgeRuleApply("route", "success")
+			h.metrics.ObserveEdgeRuleApply(rateLimitScopeRoute, "success")
 		}
 		return false
 	}
@@ -1289,10 +1302,10 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 		})
 	}
 	if h.metrics != nil {
-		h.metrics.ObserveEdgeRuleMatch("route", "match")
+		h.metrics.ObserveEdgeRuleMatch(rateLimitScopeRoute, "match")
 		// PR-B: route substitution is the apply-path outcome. Every
 		// successful match is a successful apply (substitute ran).
-		h.metrics.ObserveEdgeRuleApply("route", "success")
+		h.metrics.ObserveEdgeRuleApply(rateLimitScopeRoute, "success")
 	}
 	*app = target
 	return true
@@ -3058,7 +3071,21 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 	// collapse; routeLimiter owns the rule-only buckets and is
 	// untouched. Phase 1+2 rules never enter the per-consumer branch.
 	bucketKey := app.ID + "\x00" + rule.ID
-	allowed := h.routeLimiter.AllowWithParams(bucketKey, rule.RequestsPerSecond, float64(rule.Burst))
+	// Per-rule throttle consult (ADR-104 amendment 5, issue #881
+	// Phase 4 C3). When the daemon is running under
+	// [ratelimit] mode = "central" (the cross-replica drift fix
+	// documented in amendment 5), the local-would-reject branch
+	// transparently consults pg_ratelimit_counters — wired via
+	// AllowWithCentralParams + the centralKey "rule:<ruleID>:<plan>"
+	// triple. Empty centralKey (mode = "local", the default) reproduces
+	// today's AllowWithParams byte-for-byte. The fix to the Phase 4
+	// C3 wiring gap: the per-rule call site MUST use the central-aware
+	// sibling even though the boundary-case consult is invisible
+	// under mode=local — otherwise enabling central mode in TOML
+	// would not affect per-rule buckets and the multi-replica drift
+	// documented in the 00126 schema would remain.
+	centralKey := "rule:" + rule.ID + ":" + string(app.Plan)
+	allowed := h.routeLimiter.AllowWithCentralParams(r.Context(), bucketKey, rule.RequestsPerSecond, float64(rule.Burst), centralKey)
 	// consumerID is hoisted out of the per-consumer branch so the
 	// 429 path (below) can read it for the X-RouteRateLimit-Policy
 	// collapse detection (ADR-104 amendment 5, issue #881 Phase 4
@@ -3129,7 +3156,7 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 		// AND the consumer collapsed into the __other__ bucket
 		// (the collapse-bucket invariant from
 		// pkg/gateway/ratelimit.go:119-124).
-		policy := "route"
+		policy := rateLimitScopeRoute
 		// Per-consumer collapse detection (ADR-104 amendment 5,
 		// issue #881 Phase 4 H1): the 429 path's bucketKey is the
 		// RULE-level key (app.ID+"\x00"+rule.ID); the per-consumer
@@ -4299,7 +4326,7 @@ haveApp:
 	// keeps working without flooding logs.
 	if app.AccountID == "" {
 		h.warnEmptyAccountOnce()
-	} else if !h.accountLimiter.AllowAccount(app.AccountID, app.Plan) {
+	} else if !h.accountLimiter.AllowAccount(r.Context(), app.AccountID, app.Plan) {
 		w.Header().Set("Retry-After", "1")
 		w.Header().Set("x-faas-rate-limit-scope", "account")
 		// Per-account 429 still surfaces the per-account bucket state
@@ -4318,7 +4345,7 @@ haveApp:
 	}
 
 	// Per-app rate limit (spec §4.1). Over-limit → 429.
-	if !h.limiter.Allow(app.ID, app.Plan) {
+	if !h.limiter.Allow(r.Context(), app.ID, app.Plan) {
 		w.Header().Set("Retry-After", "1")
 		w.Header().Set("x-faas-rate-limit-scope", "app")
 		// 429 path: write the post-decrement bucket snapshot so
@@ -5026,7 +5053,7 @@ func (h *Handler) writeRouteRateLimitHeaders(w http.ResponseWriter, bucketKey st
 	// route vs per-consumer collapse scope without polluting
 	// the existing x-faas-rate-limit-scope enum.
 	if policy == "" {
-		policy = "route"
+		policy = rateLimitScopeRoute
 	}
 	w.Header().Set("X-RouteRateLimit-Policy", policy)
 }

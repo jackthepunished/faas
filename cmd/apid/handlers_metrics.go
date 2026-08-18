@@ -33,6 +33,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/throttlerec"
 )
 
+// truthyTrue is the string the dry_run query param matches.
+// Hoisted to a constant for goconst (the "true" literal would
+// otherwise duplicate the truthyFlagLiterals slice in
+// cmd/apid/deploy_inputs.go:511 + the rekeyTruthyLiterals slice
+// in rekey_runner.go:85, package-wide count crossing the
+// threshold). Used only by the dry_run parser; other "true"
+// comparisons in this file (none today) should reuse the same
+// constant.
+const truthyTrue = "true"
+
 // getAppMetrics serves GET /v1/apps/{slug}/metrics?range=.
 // Mirrors getApp's auth chain (without requireMFA — read-only,
 // primary caller is an API key with ScopesReadSurface).
@@ -96,7 +106,7 @@ func (s *server) getAppThrottleSuggestions(w http.ResponseWriter, r *http.Reques
 	// D2). Parse + validate BEFORE invoking throttlerec.Fetch so
 	// a malformed payload doesn't waste a Prometheus round-trip.
 	q := r.URL.Query()
-	dryRun := q.Get("dry_run") == "true"
+	dryRun := q.Get("dry_run") == truthyTrue
 	candidateRPS := 0.0
 	candidateBurst := 0
 	if dryRun {

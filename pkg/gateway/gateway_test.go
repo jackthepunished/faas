@@ -22,7 +22,7 @@ func TestLimiterBurstThenRefill(t *testing.T) {
 	// Free plan: 5 rps, burst 20. First 20 allowed, 21st denied.
 	allowed := 0
 	for i := 0; i < 25; i++ {
-		if l.Allow("app", api.PlanFree) {
+		if l.Allow(context.Background(), "app", api.PlanFree) {
 			allowed++
 		}
 	}
@@ -33,7 +33,7 @@ func TestLimiterBurstThenRefill(t *testing.T) {
 	clock = clock.Add(time.Second)
 	refill := 0
 	for i := 0; i < 10; i++ {
-		if l.Allow("app", api.PlanFree) {
+		if l.Allow(context.Background(), "app", api.PlanFree) {
 			refill++
 		}
 	}
@@ -48,12 +48,12 @@ func TestLimiterIsPerApp(t *testing.T) {
 	l.now = func() time.Time { return clock }
 	// Drain app A's burst.
 	for i := 0; i < 20; i++ {
-		l.Allow("A", api.PlanFree)
+		l.Allow(context.Background(), "A", api.PlanFree)
 	}
-	if l.Allow("A", api.PlanFree) {
+	if l.Allow(context.Background(), "A", api.PlanFree) {
 		t.Error("A should be rate-limited")
 	}
-	if !l.Allow("B", api.PlanFree) {
+	if !l.Allow(context.Background(), "B", api.PlanFree) {
 		t.Error("B should have its own bucket")
 	}
 }
@@ -62,11 +62,11 @@ func TestLimiterCapsAtBurst(t *testing.T) {
 	l := NewLimiter()
 	clock := time.Now()
 	l.now = func() time.Time { return clock }
-	l.Allow("app", api.PlanPro)  // create bucket (burst 500)
-	clock = clock.Add(time.Hour) // huge idle
+	l.Allow(context.Background(), "app", api.PlanPro) // create bucket (burst 500)
+	clock = clock.Add(time.Hour)                      // huge idle
 	allowed := 0
 	for i := 0; i < 1000; i++ {
-		if l.Allow("app", api.PlanPro) {
+		if l.Allow(context.Background(), "app", api.PlanPro) {
 			allowed++
 		}
 	}
@@ -77,9 +77,9 @@ func TestLimiterCapsAtBurst(t *testing.T) {
 
 func TestLimiterForgetAll(t *testing.T) {
 	l := NewLimiter()
-	l.Allow("a", api.PlanFree)
-	l.Allow("b", api.PlanFree)
-	l.Allow("c", api.PlanPro)
+	l.Allow(context.Background(), "a", api.PlanFree)
+	l.Allow(context.Background(), "b", api.PlanFree)
+	l.Allow(context.Background(), "c", api.PlanPro)
 	if l.BucketCount() != 3 {
 		t.Fatalf("setup: BucketCount = %d, want 3", l.BucketCount())
 	}
@@ -101,7 +101,7 @@ func TestLimiterAllowAccount_BurstThenRefill(t *testing.T) {
 	// Hobby plan: 200/min → burst 200, refill 200/60 = 3.333… rps.
 	allowed := 0
 	for i := 0; i < 220; i++ {
-		if l.AllowAccount("acct", api.PlanHobby) {
+		if l.AllowAccount(context.Background(), "acct", api.PlanHobby) {
 			allowed++
 		}
 	}
@@ -112,7 +112,7 @@ func TestLimiterAllowAccount_BurstThenRefill(t *testing.T) {
 	clock = clock.Add(60 * time.Second)
 	refill := 0
 	for i := 0; i < 220; i++ {
-		if l.AllowAccount("acct", api.PlanHobby) {
+		if l.AllowAccount(context.Background(), "acct", api.PlanHobby) {
 			refill++
 		}
 	}
@@ -128,18 +128,18 @@ func TestLimiterAllowAccount_FractionalRefill(t *testing.T) {
 	l.now = func() time.Time { return clock }
 	// Drain the burst.
 	for i := 0; i < 50; i++ {
-		if !l.AllowAccount("acct-free", api.PlanFree) {
+		if !l.AllowAccount(context.Background(), "acct-free", api.PlanFree) {
 			t.Fatalf("burst should have allowed 50, denied at iteration %d", i)
 		}
 	}
-	if l.AllowAccount("acct-free", api.PlanFree) {
+	if l.AllowAccount(context.Background(), "acct-free", api.PlanFree) {
 		t.Fatal("51st request should be denied at burst ceiling")
 	}
 	// Advance 60 seconds; expect ~50 tokens back.
 	clock = clock.Add(60 * time.Second)
 	allowed := 0
 	for i := 0; i < 60; i++ {
-		if l.AllowAccount("acct-free", api.PlanFree) {
+		if l.AllowAccount(context.Background(), "acct-free", api.PlanFree) {
 			allowed++
 		}
 	}
@@ -156,20 +156,20 @@ func TestLimiterAllowAccount_PerAccountIsolation(t *testing.T) {
 	l.now = func() time.Time { return clock }
 	// Drain acct1's Hobby bucket (200).
 	for i := 0; i < 200; i++ {
-		l.AllowAccount("acct1", api.PlanHobby)
+		l.AllowAccount(context.Background(), "acct1", api.PlanHobby)
 	}
-	if l.AllowAccount("acct1", api.PlanHobby) {
+	if l.AllowAccount(context.Background(), "acct1", api.PlanHobby) {
 		t.Error("acct1 should be rate-limited")
 	}
 	// acct2's bucket is independent.
-	if !l.AllowAccount("acct2", api.PlanHobby) {
+	if !l.AllowAccount(context.Background(), "acct2", api.PlanHobby) {
 		t.Error("acct2 should have its own bucket")
 	}
 }
 
 func TestLimiterAllowAccount_UnknownPlanFailsClosed(t *testing.T) {
 	l := NewLimiter()
-	if l.AllowAccount("acct", api.Plan("unknown")) {
+	if l.AllowAccount(context.Background(), "acct", api.Plan("unknown")) {
 		t.Error("unknown plan should fail closed (return false)")
 	}
 	// Bucket must NOT be created on the denied path — every call hits the
@@ -185,11 +185,11 @@ func TestLimiterAllowAccount_PlanChange(t *testing.T) {
 	l.now = func() time.Time { return clock }
 	// Drain Hobby bucket (200) almost empty.
 	for i := 0; i < 199; i++ {
-		l.AllowAccount("acct", api.PlanHobby)
+		l.AllowAccount(context.Background(), "acct", api.PlanHobby)
 	}
 	// Flip to Pro mid-flight (1000 burst). Allow should retune rps/burst
 	// without losing tokens (1 token left in the Hobby bucket).
-	if !l.AllowAccount("acct", api.PlanPro) {
+	if !l.AllowAccount(context.Background(), "acct", api.PlanPro) {
 		t.Fatal("flip to Pro should succeed (1 token available)")
 	}
 	// Pro burst is 1000; we have ~1 token, so the next call denies.
@@ -198,7 +198,7 @@ func TestLimiterAllowAccount_PlanChange(t *testing.T) {
 	clock = clock.Add(time.Second)
 	allowed := 0
 	for i := 0; i < 30; i++ {
-		if l.AllowAccount("acct", api.PlanPro) {
+		if l.AllowAccount(context.Background(), "acct", api.PlanPro) {
 			allowed++
 		}
 	}
@@ -209,8 +209,8 @@ func TestLimiterAllowAccount_PlanChange(t *testing.T) {
 
 func TestLimiterForgetAccount(t *testing.T) {
 	l := NewLimiter()
-	l.AllowAccount("a", api.PlanPro)
-	l.AllowAccount("b", api.PlanPro)
+	l.AllowAccount(context.Background(), "a", api.PlanPro)
+	l.AllowAccount(context.Background(), "b", api.PlanPro)
 	if l.BucketCount() != 2 {
 		t.Fatalf("setup: BucketCount = %d, want 2", l.BucketCount())
 	}
@@ -219,7 +219,7 @@ func TestLimiterForgetAccount(t *testing.T) {
 		t.Errorf("after ForgetAccount(a) BucketCount = %d, want 1", l.BucketCount())
 	}
 	// b's bucket is untouched.
-	if !l.AllowAccount("b", api.PlanPro) {
+	if !l.AllowAccount(context.Background(), "b", api.PlanPro) {
 		t.Error("b's bucket should still be present")
 	}
 }
@@ -231,7 +231,7 @@ func TestNewLimiterWithClock(t *testing.T) {
 	l := NewLimiterWithClock(func() time.Time { return clock })
 	// First call uses the injected clock.
 	clock = clock.Add(time.Hour) // bucket caps at burst; doesn't matter for test
-	if !l.Allow("x", api.PlanPro) {
+	if !l.Allow(context.Background(), "x", api.PlanPro) {
 		t.Fatal("clock injection should produce a working limiter")
 	}
 }
@@ -495,7 +495,7 @@ func TestInvariant5_NoSecondWakeAfterShouldWakeFalse(t *testing.T) {
 func TestLimiterForget(t *testing.T) {
 	clock := time.Now()
 	l := NewLimiterWithClock(func() time.Time { return clock })
-	if !l.Allow("app", api.PlanPro) {
+	if !l.Allow(context.Background(), "app", api.PlanPro) {
 		t.Fatal("first allow should succeed")
 	}
 	// Forget must drop the bucket so the next Allow is again a fresh burst.
@@ -504,7 +504,7 @@ func TestLimiterForget(t *testing.T) {
 	limits := api.MustLimitsFor(api.PlanPro)
 	consumed := 0
 	for i := 0; i < limits.RateLimitBurst+5; i++ {
-		if l.Allow("app", api.PlanPro) {
+		if l.Allow(context.Background(), "app", api.PlanPro) {
 			consumed++
 		}
 	}

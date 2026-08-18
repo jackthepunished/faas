@@ -190,14 +190,14 @@ func (l *Limiter) AllowWithConsumerKey(ruleKey, consumerID string, rps, burst fl
 //
 // centralKey is the colon-separated triple
 // "<scope>:<subject_id>:<plan>"; splitCentralKey parses it.
-func (l *Limiter) AllowWithCentralParams(id string, rps, burst float64, centralKey string) bool {
+func (l *Limiter) AllowWithCentralParams(ctx context.Context, id string, rps, burst float64, centralKey string) bool {
 	if l.noop {
 		return true
 	}
 	if rps < 0 || burst < 0 {
 		return false
 	}
-	return l.allowTokenWithCentralKey(id, rps, burst, centralKey)
+	return l.allowTokenWithCentralKey(ctx, id, rps, burst, centralKey)
 }
 
 // allowWithConsumerKey is the locked core of AllowWithConsumerKey.
@@ -426,7 +426,12 @@ func NewLimiterWithCentralLRU(cap int, central CentralBackend, now func() time.T
 
 // Allow reports whether a request for appID on plan may proceed, consuming a
 // token if so. Plan rps/burst come from the limits table (never inlined).
-func (l *Limiter) Allow(appID string, plan api.Plan) bool {
+//
+// ctx is propagated so the central-mode consult (Phase 4 C3, ADR-104
+// amendment 5) can time-bound the boundary-case PeekToken round-trip
+// against the caller's deadline; the local-only mode (default for
+// single-box) ignores ctx because the consult never happens.
+func (l *Limiter) Allow(ctx context.Context, appID string, plan api.Plan) bool {
 	if l.noop {
 		return true
 	}
@@ -434,7 +439,7 @@ func (l *Limiter) Allow(appID string, plan api.Plan) bool {
 	if !ok {
 		return false
 	}
-	return l.allowToken(appID, float64(limits.RateLimitRPS), float64(limits.RateLimitBurst))
+	return l.allowToken(ctx, appID, float64(limits.RateLimitRPS), float64(limits.RateLimitBurst))
 }
 
 // AllowAccount consumes one token from the bucket keyed by accountID (ADR-040 /
@@ -465,16 +470,20 @@ func (l *Limiter) Allow(appID string, plan api.Plan) bool {
 // into a full map, tries to evict (PR #887 invariant: only full
 // buckets are evictable, so an attacker cannot force eviction to
 // bypass a partially-drained rule bucket).
-func (l *Limiter) AllowWithParams(id string, rps, burst float64) bool {
+func (l *Limiter) AllowWithParams(ctx context.Context, id string, rps, burst float64) bool {
 	if l.noop {
 		return true
 	}
 	if rps < 0 || burst < 0 {
 		return false
 	}
-	return l.allowToken(id, rps, burst)
+	return l.allowToken(ctx, id, rps, burst)
 }
-func (l *Limiter) AllowAccount(accountID string, plan api.Plan) bool {
+
+// AllowAccount is the per-account sibling of Allow. Same ctx rationale
+// as Allow — propagated to the central-mode consult so the
+// boundary-case PeekToken can be time-bounded.
+func (l *Limiter) AllowAccount(ctx context.Context, accountID string, plan api.Plan) bool {
 	if l.noop {
 		return true
 	}
@@ -482,7 +491,7 @@ func (l *Limiter) AllowAccount(accountID string, plan api.Plan) bool {
 	if rpm <= 0 {
 		return false // fail closed on unknown plan (mirrors CronLimitPerAccount)
 	}
-	return l.allowToken(accountID, float64(rpm)/60.0, float64(rpm))
+	return l.allowToken(ctx, accountID, float64(rpm)/60.0, float64(rpm))
 }
 
 // allowToken is the shared token-bucket math used by both Allow (per-app) and
@@ -513,8 +522,8 @@ func (l *Limiter) AllowAccount(accountID string, plan api.Plan) bool {
 // behaviour with the default noop backend is identical to the
 // pre-Phase-4 in-process map. The fast-path-cache contract lives
 // in pkg/gateway/ratelimit_central.go.
-func (l *Limiter) allowToken(id string, rps, burst float64) bool {
-	return l.allowTokenWithCentralKey(id, rps, burst, "")
+func (l *Limiter) allowToken(ctx context.Context, id string, rps, burst float64) bool {
+	return l.allowTokenWithCentralKey(ctx, id, rps, burst, "")
 }
 
 // allowTokenWithCentralKey is the central-aware variant of
@@ -525,7 +534,7 @@ func (l *Limiter) allowToken(id string, rps, burst float64) bool {
 // in cmd/gatewayd-internal/run.go's compileThrottleRules path),
 // the local-would-reject branch consults the central counter
 // before rejecting.
-func (l *Limiter) allowTokenWithCentralKey(id string, rps, burst float64, centralKey string) bool {
+func (l *Limiter) allowTokenWithCentralKey(ctx context.Context, id string, rps, burst float64, centralKey string) bool {
 	l.mu.Lock()
 	now := l.now()
 	b := l.buckets[id]
@@ -577,7 +586,7 @@ func (l *Limiter) allowTokenWithCentralKey(id string, rps, burst float64, centra
 	if !ok {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), centralConsultTimeout)
+	ctx, cancel := context.WithTimeout(ctx, centralConsultTimeout)
 	defer cancel()
 	remaining, err := l.central.PeekToken(ctx, scope, subjectID, plan)
 	if err != nil || remaining <= 0 {
