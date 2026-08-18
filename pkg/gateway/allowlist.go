@@ -35,6 +35,27 @@ import (
 // pkg/gateway stays free of pkg/state.
 type OnDemandLookup func(ctx context.Context, domain string) (any, error)
 
+// OnDemandSurfaceLookup is the tenant-surface half of the allowlist
+// (PR-D commit 4 / ADR-100 amendment). The closure is expected
+// to load the tenant_surface that claims `host` (via
+// state.PgStore.TenantSurfaceByHostname) and return a struct
+// satisfying the tenantSurfaceVerified interface below. A
+// nil surfaceLookup disables the branch — useful for tests
+// and for staging paths that don't mint per-surface certs.
+//
+// Mirrors OnDemandLookup's shape: returns (any, error).
+// Callers MUST surface ErrNotFound from the lookup closure
+// when no row exists; other errors fail closed at Warn level.
+type OnDemandSurfaceLookup func(ctx context.Context, host string) (any, error)
+
+// tenantSurfaceVerified is the shape NewPGAllowlist needs
+// from the surface-lookup result. The concrete state.TenantHostname
+// satisfies it; tests use a local fake. Mirrors the verified
+// interface for custom domains.
+type tenantSurfaceVerified interface {
+	Verified() bool
+}
+
 // OnDemandPreviewLookup is the preview-host half of the allowlist. It is
 // invoked with (PR number, parent-slug) extracted from the hostname by
 // PreviewScopeFromHost; the closure is expected to load the preview apps row
@@ -85,15 +106,24 @@ var ErrNotFound = errors.New("gateway: domain not found in allowlist")
 // path uses it to peel pr-{N}.{parent-slug}.{suffix} via
 // PreviewScopeFromHost. Empty appsSuffix disables the preview branch.
 //
+// surfaceLookup is the tenant-surface branch (PR-D commit 4):
+// when set, the closure is consulted AFTER the custom-domain
+// branch fails ErrNotFound and BEFORE the preview branch.
+// The returned struct's Verified() must return true (the
+// hostname row must have a non-zero VerifiedAt) for the
+// allowlist to admit the host. nil surfaceLookup disables
+// the branch — useful for staging paths that don't mint
+// per-surface certs.
+//
 // NewPGAllowlist never panics on a nil lookup: nil is treated as
 // deny-all, which is the safe fail-closed default for an unconfigured edge.
-func NewPGAllowlist(customLookup OnDemandLookup, previewLookup OnDemandPreviewLookup, appsSuffix string, log *slog.Logger) OnDemandAllowlist {
+func NewPGAllowlist(customLookup OnDemandLookup, previewLookup OnDemandPreviewLookup, surfaceLookup OnDemandSurfaceLookup, appsSuffix string, log *slog.Logger) OnDemandAllowlist {
 	if log == nil {
 		log = slog.Default()
 	}
 	return func(ctx context.Context, host string) (bool, error) {
 		// Custom-domain path (legacy). On ErrNotFound we fall through to
-		// the preview path; on any other error we fail closed.
+		// the tenant-surface path; on any other error we fail closed.
 		if customLookup != nil {
 			dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			raw, err := customLookup(dbCtx, host)
@@ -114,6 +144,39 @@ func NewPGAllowlist(customLookup OnDemandLookup, previewLookup OnDemandPreviewLo
 			}
 			if !errors.Is(err, ErrNotFound) {
 				log.Warn("gateway: allowlist lookup failed; failing closed",
+					"host", host, "err", err)
+				return false, nil
+			}
+		}
+
+		// Tenant-surface path (PR-D commit 4 / ADR-100 amendment).
+		// Mirrors the custom-domain branch shape: ErrNotFound
+		// falls through to the preview path; other errors fail
+		// closed. The row's Verified() must return true — the
+		// caller has published the _faas-verify TXT record and
+		// the dns_poller has flipped verified_at. Soft-deleted
+		// parent surfaces are filtered out by the store so the
+		// row's Verified() is meaningful.
+		if surfaceLookup != nil {
+			dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			raw, err := surfaceLookup(dbCtx, host)
+			cancel()
+			if err == nil {
+				v, ok := raw.(tenantSurfaceVerified)
+				if !ok {
+					log.Warn("gateway: surface allowlist lookup returned non-verified type; failing closed",
+						"host", host)
+					return false, nil
+				}
+				if !v.Verified() {
+					log.Info("gateway: on-demand denied: surface hostname exists but TXT challenge unverified",
+						"host", host)
+					return false, nil
+				}
+				return true, nil
+			}
+			if !errors.Is(err, ErrNotFound) {
+				log.Warn("gateway: surface allowlist lookup failed; failing closed",
 					"host", host, "err", err)
 				return false, nil
 			}
