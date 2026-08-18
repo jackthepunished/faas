@@ -68,7 +68,7 @@ type postmarkResponse struct {
 // ServerToken or From is an error — we fail closed.
 func NewPostmarkSender(cfg PostmarkConfig) (Sender, error) {
 	if strings.TrimSpace(cfg.ServerToken) == "" {
-		return nil, errors.New("mail: Postmark ServerToken is required")
+		return nil, ErrPostmarkMissingToken
 	}
 	if strings.TrimSpace(cfg.From) == "" {
 		return nil, errors.New("mail: Postmark From is required")

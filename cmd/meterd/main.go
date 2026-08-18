@@ -724,10 +724,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// Mailer: defaults to mail.SenderFromEnv so FAAS_MAIL_TRANSPORT
 	// selects the transport (resend/postmark/log/noop). The dunning
-	// timer needs this for its transition emails.
+	// timer needs this for its transition emails. Operator-selected
+	// resend / postmark with the credential env var empty is
+	// fail-closed (ADR-115 §D5); the wrapped ErrMailerMisconfigured
+	// propagates here so the daemon refuses to boot instead of
+	// silently dropping email into slog.
 	mailer := deps.mailer
 	if mailer == nil {
-		mailer = mail.SenderFromEnv(deps.getenv, log)
+		var err error
+		mailer, err = mail.SenderFromEnv(deps.getenv, log)
+		if err != nil {
+			return fmt.Errorf("meterd: %w (set FAAS_MAIL_TRANSPORT=log or supply the missing credential in /etc/faas/sealed.env)", err)
+		}
 	}
 
 	// FAAS_QUOTA_INTERVAL / FAAS_SAMPLE_INTERVAL / FAAS_STRIPE_INTERVAL /

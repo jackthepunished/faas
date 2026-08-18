@@ -52,13 +52,17 @@ func (r *recordingSender) snapshot() []mail.Message {
 
 // TestMailFactory_PicksCorrectTransport covers every FAAS_MAIL_TRANSPORT
 // branch the factory exposes. The output of mail.SenderFromEnv must
-// have the expected concrete type for each env shape, and the
-// mailAdapter we wrap it in must forward a probe message through.
+// have the expected concrete type for each happy-path env shape, and
+// the mailAdapter we wrap it in must forward a probe message through.
+// Fail-closed rows (resend / postmark selected without the credential)
+// assert the typed error sentinel — apid/meterd catch it on boot
+// and refuse to start (ADR-115 §D5).
 func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 	cases := []struct {
-		name     string
-		env      map[string]string
-		wantType string // fmt.Sprintf("%T", sender) for the chosen transport
+		name        string
+		env         map[string]string
+		wantType    string // empty = expect nil sender (fail-closed)
+		wantFailIs  error  // non-nil = expect errors.Is(err, sentinel)
 	}{
 		{
 			name:     "unset-transport-defaults-to-log",
@@ -85,9 +89,15 @@ func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 			wantType: "*mail.ResendSender",
 		},
 		{
-			name:     "resend-without-key-falls-back-to-log",
-			env:      map[string]string{"FAAS_MAIL_TRANSPORT": "resend"},
-			wantType: "*mail.LogSender",
+			// ADR-115 §D5: operator-selected resend with no
+			// FAAS_MAIL_RESEND_API_KEY fails closed. The pre-#115
+			// behaviour was a WARN + LogSender fallback; the
+			// fail-closed contract makes the boot refuse to start
+			// so the operator cannot run a daemon that silently
+			// drops email.
+			name:       "resend-without-key-fails-closed",
+			env:        map[string]string{"FAAS_MAIL_TRANSPORT": "resend"},
+			wantFailIs: mail.ErrMailerMisconfigured,
 		},
 		{
 			name: "postmark-with-token",
@@ -99,11 +109,13 @@ func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 			wantType: "*mail.PostmarkSender",
 		},
 		{
-			name:     "postmark-without-token-falls-back-to-log",
-			env:      map[string]string{"FAAS_MAIL_TRANSPORT": "postmark"},
-			wantType: "*mail.LogSender",
+			name:       "postmark-without-token-fails-closed",
+			env:        map[string]string{"FAAS_MAIL_TRANSPORT": "postmark"},
+			wantFailIs: mail.ErrMailerMisconfigured,
 		},
 		{
+			// ADR-115 §D5: unknown transport names stay fail-soft
+			// (operator-typo territory, not production misconfig).
 			name:     "bogus-transport-falls-back-to-log",
 			env:      map[string]string{"FAAS_MAIL_TRANSPORT": "carrier-pigeon"},
 			wantType: "*mail.LogSender",
@@ -128,9 +140,25 @@ func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 			}
 
 			log := slog.New(slog.NewTextHandler(io.Discard, nil))
-			m := mail.SenderFromEnv(os.Getenv, log)
+			m, err := mail.SenderFromEnv(os.Getenv, log)
+			if tc.wantFailIs != nil {
+				if !errors.Is(err, tc.wantFailIs) {
+					t.Fatalf("err = %v, want errors.Is(err, %v)", err, tc.wantFailIs)
+				}
+				if m != nil {
+					t.Errorf("sender = %T, want nil on fail-closed", m)
+				}
+				// Mirror runWithDeps: never call newMailerAdapter
+				// with a nil sender when the factory returned an
+				// error — the boot path exits non-zero before
+				// reaching the adapter.
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error on happy path: %v", err)
+			}
 			if m == nil {
-				t.Fatal("SenderFromEnv returned nil")
+				t.Fatal("SenderFromEnv returned nil on happy path")
 			}
 			gotType := fmt.Sprintf("%T", m)
 			if gotType != tc.wantType {
