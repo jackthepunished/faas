@@ -31,10 +31,12 @@ import (
 // vdb, builds an overlay with the base as the read-only lower and the layer as
 // the writable upper, pivots into it, then execs the app.
 const (
-	layerDevice = "/dev/vdb"
-	layerMount  = "/overlay"
-	newRoot     = "/overlay/merged"
-	builderPATH = "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	layerDevice        = "/dev/vdb"
+	layerMount         = "/overlay"
+	newRoot            = "/overlay/merged"
+	builderPATH        = "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	railpackMiseSource = "/usr/local/lib/faas/mise/mise-2026.7.6"
+	railpackMiseTarget = "/tmp/railpack/mise/mise-2026.7.6"
 )
 
 // bootMode is which branch of the build (BuildManifest present) vs app
@@ -374,6 +376,86 @@ func decideMode(fsys fs.FS) (bootMode, api.BuildManifest, error) {
 	return modeApp, api.BuildManifest{}, nil
 }
 
+// ensureBuilderResolver makes the builder guest independent of container
+// runtime setup. OCI-to-ext4 conversion does not carry Docker's injected
+// /etc/resolv.conf, and Alpine images may omit it entirely. If a resolver is
+// already present, preserve the operator-provided configuration; otherwise
+// install the same public fallback used by the Debian builder image.
+func ensureBuilderResolver() error {
+	return ensureResolverFile("/etc/resolv.conf")
+}
+
+func ensureResolverFile(path string) error {
+	if data, err := os.ReadFile(path); err == nil && hasNameserver(data) {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale resolver file: %w", err)
+	}
+	const fallback = "# Gregale builder VM resolver\nnameserver 1.1.1.1\nnameserver 1.0.0.1\n"
+	if err := os.WriteFile(path, []byte(fallback), 0o644); err != nil {
+		return fmt.Errorf("write resolver file: %w", err)
+	}
+	return nil
+}
+
+func hasNameserver(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "nameserver ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "nameserver ")) != ""
+		}
+	}
+	return false
+}
+
+// ensureRailpackMise seeds Railpack's tmpfs-backed cache with the musl mise
+// binary shipped in the builder image. Railpack 0.31.1 downloads the glibc
+// linux-x64 asset by default, which cannot execute in the Alpine rootfs.
+func ensureRailpackMise() error {
+	return stageExecutable(railpackMiseSource, railpackMiseTarget)
+}
+
+func stageExecutable(source, target string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("create target directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".mise-*")
+	if err != nil {
+		return fmt.Errorf("create target: %w", err)
+	}
+	tmpName := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		return fmt.Errorf("copy binary: %w", err)
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		return fmt.Errorf("chmod binary: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close binary: %w", err)
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		return fmt.Errorf("install binary: %w", err)
+	}
+	keep = true
+	return nil
+}
+
 // runBuild is the builder-VM path (M6). It extracts the source tarball,
 // invokes the chosen build engine (Railpack / buildctl / auto), writes
 // build-done.json with the outcome, and powers off. poweroff is what makes
@@ -422,6 +504,12 @@ func runBuild(m api.BuildManifest) error {
 	if err := ensureFuseDevice(); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("fuse device: %w", err), "")
 	}
+	if err := ensureBuilderResolver(); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("builder resolver: %w", err), "")
+	}
+	if err := ensureRailpackMise(); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("railpack mise: %w", err), "")
+	}
 	// Railpack resolves language toolchains and package registries from inside
 	// the builder VM. Fail fast when the guest's DNS path is broken instead of
 	// spending the whole build budget in a registry client retry loop.
@@ -433,7 +521,10 @@ func runBuild(m api.BuildManifest) error {
 		return writeAndPoweroff(m, fmt.Errorf("registry DNS preflight: %w", dnsErr), string(dnsOut))
 	}
 	if m.Framework == api.FrameworkRailpackNode || m.Framework == api.FrameworkAuto {
-		httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// A fresh Firecracker guest may need a few seconds for its first
+		// routed TLS connection even after DNS is available. Keep this as a
+		// fail-fast guard, but leave enough room for the initial handshake.
+		httpCtx, httpCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		req, reqErr := http.NewRequestWithContext(httpCtx, http.MethodGet, "https://nodejs.org/dist/index.json", nil)
 		var httpErr error
 		if reqErr == nil {

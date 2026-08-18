@@ -130,7 +130,14 @@ def resolve_via_registry_api(repo: str, tag: str, platform: str) -> str | None:
         accept = (
             f"{accept};os={plat_os};architecture={plat_arch}"
         )
-    url = f"https://registry-1.docker.io/v2/{repo}/manifests/{tag}"
+    # `resolved_repo` is stored in the lock using a fully-qualified
+    # Docker Hub reference (`docker.io/library/debian`), while the
+    # registry v2 endpoint addresses the repository without its host
+    # prefix (`/v2/library/debian/...`). Keeping the host in the URL
+    # produces a valid-looking but nonexistent repository path and makes
+    # every anonymous Docker Hub resolution fail closed.
+    registry_repo = repo.removeprefix("docker.io/")
+    url = f"https://registry-1.docker.io/v2/{registry_repo}/manifests/{tag}"
     headers: dict[str, str] = {"Accept": accept}
     auth = _auth_header_for("registry-1.docker.io")
     if auth:

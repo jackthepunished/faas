@@ -1130,6 +1130,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		Route:   "admin",
 		Metrics: budgetMetrics,
 		Log:     log,
+		DefaultFor: func(r *http.Request) time.Duration {
+			if reqbudget.IsSyncInvokeRequest(r) {
+				// invokeApp applies the plan-specific 5s/30s wait;
+				// give that handler the full platform ceiling so the
+				// outer apid budget does not truncate paid plans.
+				return api.RequestBudgetMax
+			}
+			return 0
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("apid: reqbudget middleware config: %w", err)

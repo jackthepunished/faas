@@ -142,6 +142,16 @@ func (h *Handler) EnsureBaseExt4(
 		if rerr == nil && string(haveBytes) == wantDigest {
 			if rc, err := be.Get(ctx, baseKey); err == nil {
 				_ = rc.Close()
+				// A digest match proves the ext4 bytes are current, but
+				// older imaged versions could have written the scan sidecar
+				// from the legacy compatibility path. Refresh a sidecar that
+				// does not record the canonical scan source; once refreshed,
+				// subsequent restarts keep the cheap idempotent path.
+				if !h.scanSidecarSourceCurrent(ctx, be, baseKey, outImage) {
+					if scanErr := h.writeScanSidecar(ctx, baseKey, ref, outImage); scanErr != nil {
+						h.log.Warn("imaged: refresh grype scan sidecar", "key", wire.ScanKeyForBaseKey(baseKey), "err", scanErr)
+					}
+				}
 				return BaseStageResult{
 					OutImage:     outImage,
 					StorageKey:   baseKey,
@@ -541,7 +551,17 @@ func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage s
 	if err != nil {
 		return fmt.Errorf("imaged: writeScanSidecar storageFor: %w", err)
 	}
-	findings, scanErr := h.runGrype(ctx, outImage)
+	// Scan the artifact that was actually published under baseKey. The
+	// legacy outImage argument still points at /srv/fc/base/builder-base.ext4
+	// on current hosts, while the canonical storage key is
+	// base/runner-builder-<arch>.ext4. Using outImage in that layout made
+	// imaged write a sidecar for the new artifact from an older compatibility
+	// file, so vmmd rejected a clean builder with stale CRITICAL findings.
+	scanSource, err := scanSourceForBase(be, baseKey, outImage)
+	if err != nil {
+		return err
+	}
+	findings, scanErr := h.runGrype(ctx, scanSource)
 	if scanErr != nil || findings == nil {
 		h.log.Warn("imaged: grype scan failed; writing fail-closed sidecar",
 			"ref", ref, "err", scanErr)
@@ -560,10 +580,12 @@ func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage s
 	}
 	scanBlob, err := json.Marshal(struct {
 		Image     string         `json:"image"`
+		Source    string         `json:"source"`
 		Findings  map[string]int `json:"findings"`
 		ScannedAt time.Time      `json:"scanned_at"`
 	}{
 		Image:     ref,
+		Source:    scanSource,
 		Findings:  findings.toMap(),
 		ScannedAt: time.Now().UTC(),
 	})
@@ -575,6 +597,43 @@ func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage s
 		return fmt.Errorf("imaged: write scan sidecar %q: %w", scanKey, err)
 	}
 	return nil
+}
+
+// scanSourceForBase resolves the path Grype should inspect. Local storage
+// exposes the canonical path for baseKey; remote storage falls back to the
+// compatibility outImage supplied by the caller.
+func scanSourceForBase(be storage.StorageBackend, baseKey, outImage string) (string, error) {
+	if resolver, ok := be.(storage.LocalPathResolver); ok {
+		if localPath, localOK, pathErr := resolver.LocalPath(baseKey); pathErr != nil {
+			return "", fmt.Errorf("imaged: resolve scan source %q: %w", baseKey, pathErr)
+		} else if localOK {
+			return localPath, nil
+		}
+	}
+	return outImage, nil
+}
+
+// scanSidecarSourceCurrent identifies sidecars produced by the canonical
+// scan path. Sidecars written before the source field was added are treated
+// as stale and refreshed once, which repairs existing installations after
+// the storage-key migration without rescanning every clean base forever.
+func (h *Handler) scanSidecarSourceCurrent(ctx context.Context, be storage.StorageBackend, baseKey, outImage string) bool {
+	source, err := scanSourceForBase(be, baseKey, outImage)
+	if err != nil {
+		return false
+	}
+	rc, err := be.Get(ctx, wire.ScanKeyForBaseKey(baseKey))
+	if err != nil {
+		return false
+	}
+	defer func() { _ = rc.Close() }()
+	var sidecar struct {
+		Source string `json:"source"`
+	}
+	if err := json.NewDecoder(rc).Decode(&sidecar); err != nil {
+		return false
+	}
+	return sidecar.Source != "" && sidecar.Source == source
 }
 
 // RuntimeBaseRef pairs a runtime id with its default OCI ref and the

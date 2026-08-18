@@ -270,17 +270,23 @@ func ociBackendFromEnv() (StorageBackend, error) {
 		return nil, fmt.Errorf("storage: oci backend: %w", err)
 	}
 	storageRoot := envOr("FAAS_STORAGE_ROOT", "/srv/fc")
-	local, err := NewLocalStorageBackend(storageRoot)
-	if err != nil {
-		return nil, fmt.Errorf("storage: FAAS_STORAGE_ROOT=%q: %w", storageRoot, err)
-	}
 	prefixes, err := parseLocalPrefixes(os.Getenv("FAAS_STORAGE_LOCAL_PREFIXES"))
 	if err != nil {
 		return nil, err
 	}
 	routes := make(map[string]StorageBackend, len(prefixes))
 	for _, p := range prefixes {
-		routes[p] = local
+		// PrefixRouter strips the matched prefix before handing the
+		// operation to its route. Give each local route a backend rooted
+		// at that prefix's directory so kernel/1.7.0 resolves to
+		// FAAS_STORAGE_ROOT/kernel/1.7.0 rather than
+		// FAAS_STORAGE_ROOT/1.7.0. The old shared-root route silently
+		// dropped the namespace and broke VMMD kernel/base staging.
+		prefixRoot, err := NewLocalStorageBackend(filepath.Join(storageRoot, strings.TrimSuffix(p, "/")))
+		if err != nil {
+			return nil, fmt.Errorf("storage: local prefix %q: %w", p, err)
+		}
+		routes[p] = prefixRoot
 	}
 	router, err := NewPrefixRouter(routes, oci)
 	if err != nil {

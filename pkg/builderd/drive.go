@@ -3,7 +3,7 @@
 // Package builderd — drive1 preparation for ephemeral builder VMs.
 //
 // CreateBuildDrive1 materialises the per-VM ext4 that the builder VM boots
-// with. It writes a 24 GiB image, formats it ext4, mounts it loopback rw,
+// with. It writes a 28 GiB image, formats it ext4, mounts it loopback rw,
 // writes /etc/faas/build.json (the BuildManifest guest-init reads to know
 // it's a build VM), copies the customer source tarball in at /build/src.tar
 // (issue #54), and unmounts. The same binary runs in app VMs with a
@@ -33,13 +33,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
-// BuildDriveSizeBytes is the drive1 image size for builder VMs (M6). 24 GiB
+// BuildDriveSizeBytes is the drive1 image size for builder VMs (M6). 28 GiB
 // gives rootless native BuildKit enough room for Railpack's builder/runtime
 // images, dependency layers, and the native local exporter; the previous
-// 8 GiB budget exhausted while copying those layers. The produced app layer
+// 24 GiB budget exhausted while copying those layers. The produced app layer
 // (in /build/out) is typically
 // < 500 MB; the rest is transient build scratch.
-const BuildDriveSizeBytes = 24 << 30
+const BuildDriveSizeBytes = 28 << 30
 
 // mkfs utility + label used for the build drive1 image.
 const (
@@ -47,7 +47,7 @@ const (
 	buildLabel = "faas-build"
 )
 
-// CreateBuildDrive1 writes a 24 GiB ext4 image at dest containing the
+// CreateBuildDrive1 writes a 28 GiB ext4 image at dest containing the
 // BuildManifest at /etc/faas/build.json and (when sourcePath is non-empty)
 // the customer's source tarball copied to /build/src.tar. Idempotent on
 // host filesystem blocks — overwrites dest. Returns immediately on permission

@@ -8,6 +8,7 @@ package imaged
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"strings"
 	"testing"
@@ -124,6 +125,19 @@ func TestNewVMMClient_ExplicitTarget(t *testing.T) {
 	c := NewVMMClient(target, nil)
 	if c.target != target {
 		t.Errorf("target = %q, want %q", c.target, target)
+	}
+}
+
+// TestNewVMMClientWithTLS_PreservesConfig pins the split-box constructor's
+// transport seam without opening a network connection.
+func TestNewVMMClientWithTLS_PreservesConfig(t *testing.T) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
+	c := NewVMMClientWithTLS("tcp://vmmd.faas:50051", tlsCfg, nil)
+	if c.target != "tcp://vmmd.faas:50051" {
+		t.Errorf("target = %q, want tcp target", c.target)
+	}
+	if c.tls != tlsCfg {
+		t.Error("TLS config was not retained")
 	}
 }
 

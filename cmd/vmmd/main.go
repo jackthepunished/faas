@@ -927,6 +927,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		serviceVerifier.Set([]string{
 			"builderd.faas",
 			"gatewayd.faas",
+			"imaged.faas",
 			"schedd.faas",
 		})
 		serverVerifier = wire.NewAnyNodeVerifier(nodeVerifier, controlPlaneVerifier, serviceVerifier)

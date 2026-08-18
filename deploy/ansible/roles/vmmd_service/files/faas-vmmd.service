@@ -11,6 +11,7 @@ ExecStartPre=/usr/bin/chmod 0775 /run/faas
 ExecStart=/opt/faas/bin/vmmd --config /etc/faas/vmmd.toml
 ExecStartPost=/usr/bin/chown root:faas /run/faas
 ExecStartPost=/usr/bin/chmod 0775 /run/faas
+Environment=TMPDIR=/srv/fc/base
 Restart=on-failure
 RestartSec=2s
 

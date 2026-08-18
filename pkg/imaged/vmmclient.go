@@ -17,6 +17,7 @@ package imaged
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"os"
@@ -83,6 +84,7 @@ type VMMClientIface interface {
 type VMMClient struct {
 	target   string
 	nodeName string
+	tls      *tls.Config
 	log      *slog.Logger
 
 	mu   sync.Mutex
@@ -115,6 +117,14 @@ const imagedNodeNameEnv = "FAAS_IMAGED_NODE_NAME"
 // have to thread the env-read through its main wiring). Empty
 // = single-box dev back-compat.
 func NewVMMClient(target string, log *slog.Logger) *VMMClient {
+	return NewVMMClientWithTLS(target, nil, log)
+}
+
+// NewVMMClientWithTLS builds a client against target with the optional TLS
+// configuration. Unix targets keep the legacy insecure transport when tlsCfg
+// is nil; tcp/dns targets require a non-nil mTLS config in wire.DialContext.
+// The split-box deployment uses this constructor for imaged → vmmd calls.
+func NewVMMClientWithTLS(target string, tlsCfg *tls.Config, log *slog.Logger) *VMMClient {
 	if target == "" {
 		target = DefaultVMMSock
 	}
@@ -124,6 +134,7 @@ func NewVMMClient(target string, log *slog.Logger) *VMMClient {
 	return &VMMClient{
 		target:   target,
 		nodeName: os.Getenv(imagedNodeNameEnv),
+		tls:      tlsCfg,
 		log:      log,
 	}
 }
@@ -270,7 +281,7 @@ func (c *VMMClient) dial(ctx context.Context) (vmmdpb.VmmdClient, error) {
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, defaultVMMDialTimeout)
 	defer cancel()
-	conn, err := wire.DialContext(dialCtx, c.target, nil)
+	conn, err := wire.DialContext(dialCtx, c.target, c.tls)
 	if err != nil {
 		return nil, fmt.Errorf("imaged: vmmclient: dial %s: %w", c.target, err)
 	}

@@ -219,6 +219,20 @@ func NewLocalCacheBackend(parent StorageBackend, root string, maxBytes int64) (*
 // startup.
 func (c *LocalCacheBackend) Root() string { return c.root }
 
+// LocalPath preserves the parent's local-file capability through the
+// read-through cache. The cache stores a content-addressed copy under its
+// own hash paths, but callers that need to inspect a large artifact (for
+// example imaged's ext4 Grype scan) must use the canonical parent path so
+// they do not scan a stale compatibility file or copy the whole image again.
+// Remote parents intentionally return ok=false through this delegation.
+func (c *LocalCacheBackend) LocalPath(key string) (string, bool, error) {
+	resolver, ok := c.parent.(LocalPathResolver)
+	if !ok {
+		return "", false, nil
+	}
+	return resolver.LocalPath(key)
+}
+
 // cacheFileFor hashes the storage key into a path-safe
 // filename. The hash is hex-encoded SHA-256 (64 lowercase hex
 // chars), with the leading 2 chars used as the bucket directory
@@ -320,38 +334,36 @@ var errCacheBlobOversized = errors.New("storage: cache: blob exceeds maxBytes")
 // On parent failure, Get returns the wrapped error UNLESS
 // FAAS_STORAGE_CACHE_SERVE_STALE=true, in which case Get serves the
 // last-known-good cached blob (must have been Put earlier — the cache
-// only stores blobs the parent has accepted). The first readCache call
-// at the top of Get is the cache-first path; the second readCache call
+// only stores blobs the parent has accepted). The first openCache call
+// at the top of Get is the cache-first path; the second openCache call
 // below is the stale-fallback path. Both run only when the cache holds
 // the key (Put has mirrored it). When the cache is empty, stale-fallback
 // is a no-op and the wrapped parent error is returned regardless of the
-// env var.
+// env var. Cache hits and parent misses are file-backed so large OCI
+// layers never become a heap-sized byte slice.
 func (c *LocalCacheBackend) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
-	if data, ok := c.readCache(key); ok {
-		return io.NopCloser(strings.NewReader(string(data))), nil
+	if cached, ok := c.openCache(key); ok {
+		return cached, nil
 	}
 	rc, err := c.parent.Get(ctx, key)
 	if err != nil {
 		if c.serveStale() {
-			if data, ok := c.readCache(key); ok {
+			if cached, ok := c.openCache(key); ok {
 				c.notifyStaleFallback()
-				return io.NopCloser(strings.NewReader(string(data))), nil
+				return cached, nil
 			}
 		}
 		return nil, fmt.Errorf("storage: cache: get %q: parent: %w", key, err)
 	}
 	defer func() { _ = rc.Close() }()
-	data, err := io.ReadAll(rc)
+	cached, err := c.materializeCache(ctx, key, rc)
 	if err != nil {
 		return nil, fmt.Errorf("storage: cache: get %q: parent read: %w", key, err)
 	}
-	if cerr := c.writeCache(key, data); cerr != nil {
-		_ = cerr
-	}
-	return io.NopCloser(strings.NewReader(string(data))), nil
+	return cached, nil
 }
 
 // SetObserver wires a CacheObserver onto the cache. The observer
@@ -475,16 +487,16 @@ type cacheEntry struct {
 	modTime time.Time
 }
 
-// readCache attempts to read a cache entry. Returns the blob +
-// true on hit, nil + false on miss.
-func (c *LocalCacheBackend) readCache(key string) ([]byte, bool) {
+// openCache opens a cache entry without loading its contents into memory.
+// The returned file owns its descriptor and must be closed by the caller.
+func (c *LocalCacheBackend) openCache(key string) (io.ReadCloser, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	path, metaPath := c.cacheFileFor(key)
 	if _, err := os.Stat(metaPath); err != nil {
 		return nil, false
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, false
 	}
@@ -498,7 +510,87 @@ func (c *LocalCacheBackend) readCache(key string) ([]byte, bool) {
 	// on the next Get via the parent-round-trip fallback, so
 	// freshness is governed by upstream behaviour, not by the
 	// cache's read traffic.
-	return data, true
+	return f, true
+}
+
+// materializeCache streams a parent response into the cache and returns a
+// file reader for the resulting blob. It deliberately avoids a byte slice so
+// an OCI cache miss remains bounded by the copy buffer, not by layer size.
+func (c *LocalCacheBackend) materializeCache(ctx context.Context, key string, src io.Reader) (io.ReadCloser, error) {
+	path, metaPath := c.cacheFileFor(key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("cache mkdir %q: %w", filepath.Dir(path), err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".faas-cache-*")
+	if err != nil {
+		return nil, fmt.Errorf("cache temp %q: %w", filepath.Dir(path), err)
+	}
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		if !keep {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	n, err := copyContext(ctx, tmp, src)
+	if err != nil {
+		return nil, err
+	}
+	if err := tmp.Sync(); err != nil {
+		return nil, fmt.Errorf("cache sync %q: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, fmt.Errorf("cache close %q: %w", tmpPath, err)
+	}
+
+	// A single blob larger than the cache budget is still returned to the
+	// caller, but is not retained as a cache entry. Keep the temporary file
+	// open through a cleanup wrapper for that case.
+	if n > c.maxBytes {
+		f, err := os.Open(tmpPath)
+		if err != nil {
+			return nil, fmt.Errorf("cache reopen %q: %w", tmpPath, err)
+		}
+		keep = true
+		return &cacheTempReader{File: f, path: tmpPath}, nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := os.Rename(tmpPath, path); err != nil {
+		return nil, fmt.Errorf("cache install %q: %w", path, err)
+	}
+	keep = true
+	if err := os.WriteFile(metaPath, []byte(key), 0o644); err != nil {
+		// The blob remains usable; without its sidecar it is simply
+		// invisible to List and will be treated as a cache miss later.
+		_ = err
+	}
+	if err := c.enforceBudgetLocked(); err != nil {
+		_ = err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cache open %q: %w", path, err)
+	}
+	return f, nil
+}
+
+// cacheTempReader removes an oversized, non-cached materialization when the
+// caller closes it.
+type cacheTempReader struct {
+	*os.File
+	path string
+}
+
+func (r *cacheTempReader) Close() error {
+	err := r.File.Close()
+	if removeErr := os.Remove(r.path); err == nil {
+		err = removeErr
+	}
+	return err
 }
 
 // writeCache writes the blob + sidecar metadata to the cache

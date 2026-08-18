@@ -286,6 +286,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 		Route:   "forward",
 		Metrics: budgetMetrics,
 		Log:     log,
+		DefaultFor: func(r *http.Request) time.Duration {
+			if reqbudget.IsSyncInvokeRequest(r) {
+				// Synchronous invoke has its own plan-aware wait in apid;
+				// the public edge must not cut it at the general 3s
+				// forwarding budget before that handler can respond.
+				return api.RequestBudgetMax
+			}
+			return 0
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("gatewayd-public: reqbudget middleware config: %w", err)
