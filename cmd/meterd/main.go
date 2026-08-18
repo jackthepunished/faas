@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -1186,6 +1187,14 @@ func (a storageStoreAdapter) AppendSnapshotStorage(ctx context.Context, accountI
 // fallback) — means a TOML-only deploy doesn't trigger a false-positive
 // warn on every boot.
 //
+// Post-PR-#962 (Paddle is the v2 default): an empty Paddle key is now
+// a constructor error (NewProvider returns ErrNoAPIKey on empty /
+// whitespace-only keys — CRIT-2 fix), so the daemon refuses to start
+// rather than booting and warn-logging per tick. The Stripe branch
+// below is retained as a soft-warn because the legacy Stripe surface
+// has no equivalent guard (pushUsageRecordSDKSum returns an error per
+// call and the loop logs-and-skips).
+//
 // Extracted so tests can pin the behaviour without spinning up runWithDeps.
 func warnIfEmptyAPIKey(log *slog.Logger, billingCfg *billingloader.RootBillingConfig, provName string) {
 	if billingCfg == nil {
@@ -1196,8 +1205,16 @@ func warnIfEmptyAPIKey(log *slog.Logger, billingCfg *billingloader.RootBillingCo
 			"provider", provName)
 		return
 	}
-	if provName == provPaddle && billingCfg.Paddle != nil && billingCfg.Paddle.APIKey == "" {
-		log.Warn("Paddle API key is empty — daily Paddle push will no-op",
+	if provName == provPaddle && billingCfg.Paddle != nil && strings.TrimSpace(billingCfg.Paddle.APIKey) == "" {
+		// Pre-PR-#962 this was a soft-warn ('Paddle API key is empty —
+		// daily push will no-op'); post-PR-#962 the loader fatals at
+		// boot on the same condition so this branch is dead code on
+		// production. Retained for the test path (TestLoadProviderForMeterd*
+		// shapes construct a *Provider directly without going through
+		// the loader) and as a defensive tripwire if a future caller
+		// hands meterd a *Provider with an empty key (the SDK would
+		// silently dial api.paddle.com with no auth otherwise).
+		log.Error("Paddle API key is empty — this should have been caught at apid/meterd boot by NewProvider's ErrNoAPIKey guard (PR #962 CRIT-2). Treating the per-tick path as a no-op.",
 			"provider", provName)
 		return
 	}
