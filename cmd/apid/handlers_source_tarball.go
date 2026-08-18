@@ -46,6 +46,14 @@ type sidecarPayload struct {
 	Ref  string `json:"ref,omitempty"`
 }
 
+// fieldNameTarball is the multipart field name on both
+// source-ref + source-tarball deploy routes. Shared const because
+// goconst is package-wide (cmd/apid) and the literal "tarball"
+// would otherwise appear in three call sites. Keep the const
+// here (the new file) so any future field rename lands on a
+// single line.
+const fieldNameTarball = "tarball"
+
 func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok, limits := s.loadAppAndPreflight(w, r, acct)
 	if !ok {
@@ -94,7 +102,7 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	tarballFile, _, err := r.FormFile("tarball")
+	tarballFile, _, err := r.FormFile(fieldNameTarball)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 			"Missing tarball", "tarball field is required"))
