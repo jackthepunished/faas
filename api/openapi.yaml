@@ -11332,7 +11332,7 @@ components:
         key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128, example: "DATABASE_URL" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
-        kid: { type: string, description: "age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before migration 00166.", example: "age1q..." }
+        kid: { type: string, description: "age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before migration 00166. Mirrors the `kid` field on the parent `AppSecretResponse` — see that schema for the cross-reference.", example: "age1q..." }
 
     AppSecretListResponse:
       description: "Paginated list of sealed-secret envelopes (no plaintext). Discriminated union: `secrets` is the flat arm; `secrets_by_scope` is the `?scope=__all__` arm (ADR-092 PR-B)."
