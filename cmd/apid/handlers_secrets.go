@@ -154,10 +154,10 @@ func writeSecretListAll(w http.ResponseWriter, rows []state.AppSecret, quota int
 		ordered[scope] = bucket[scope]
 	}
 	writeJSON(w, http.StatusOK, api.AppSecretListResponse{
-		Secrets:       nil, // discriminated union: empty in the __all__ arm
+		Secrets:        nil, // discriminated union: empty in the __all__ arm
 		SecretsByScope: ordered,
-		Quota:         quota,
-		Count:         len(rows),
+		Quota:          quota,
+		Count:          len(rows),
 	})
 }
 

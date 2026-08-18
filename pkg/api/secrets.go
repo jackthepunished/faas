@@ -106,10 +106,10 @@ type SecretByScope map[string][]ScopedAppSecretResponse
 // Both arms are valid wire shapes for a GET /v1/apps/{slug}/secrets;
 // the `?scope=` query discriminates.
 type AppSecretListResponse struct {
-	Secrets       []AppSecretResponse `json:"secrets"`
-	SecretsByScope SecretByScope      `json:"secrets_by_scope,omitempty"`
-	Quota         int                 `json:"quota_max"`
-	Count         int                 `json:"count"`
+	Secrets        []AppSecretResponse `json:"secrets"`
+	SecretsByScope SecretByScope       `json:"secrets_by_scope,omitempty"`
+	Quota          int                 `json:"quota_max"`
+	Count          int                 `json:"count"`
 }
 
 // AccountAppSecretResponse is one row in GET /v1/secrets — a sealed
