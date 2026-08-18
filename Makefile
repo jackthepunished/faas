@@ -421,6 +421,15 @@ scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (
 	grype dir:images/ -o json --file bin/grype-results.json
 	syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "$$(git rev-parse --short HEAD)" --source-type directory
 
+.PHONY: public-endpoint-check
+public-endpoint-check: ## Validate the public HTTPS/Caddy endpoint (PUBLIC_ENDPOINT_URL required)
+	@test -n "$(PUBLIC_ENDPOINT_URL)" || { echo "PUBLIC_ENDPOINT_URL is required (example: https://apps.example.com)" >&2; exit 2; }
+	@PUBLIC_ENDPOINT_URL="$(PUBLIC_ENDPOINT_URL)" PUBLIC_HTTP_URL="$(PUBLIC_HTTP_URL)" PUBLIC_ENDPOINT_PATH="$(PUBLIC_ENDPOINT_PATH)" bash scripts/ci/check_public_endpoint.sh
+
+.PHONY: systemd-hardening-check
+systemd-hardening-check: ## Static release gate for production systemd isolation directives
+	bash scripts/ci/check_systemd_hardening.sh $(CURDIR)
+
 .PHONY: bootstrap
 bootstrap: ## Idempotent single-box setup (ansible) — dev/lima. Back-compat for `make bootstrap` against 127.0.0.1.
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
@@ -825,4 +834,3 @@ sdk-smoke-python: ## Build fakeapid fixture + run Python SDK smoke + unit tests
 .PHONY: sdk-unit-python
 sdk-unit-python: ## Run Python SDK unit tests (no fixture required)
 	@cd sdk/python && .venv/bin/python -m pytest tests/test_client.py tests/test_sse.py
-

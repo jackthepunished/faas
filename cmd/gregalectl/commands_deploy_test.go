@@ -499,7 +499,7 @@ func TestCmdDeployAddNode_YesPrompt(t *testing.T) {
 // TestRenderHostVarsYAML_ComputeOnly asserts the compute-only
 // renderer carries the right set of fields.
 func TestRenderHostVarsYAML_ComputeOnly(t *testing.T) {
-	got := renderHostVarsYAML("fsn-3", "compute-only", "10.42.0.3", "ens5", "10.102.0.0/16", "fc00::/7", "100.64.0.0/14")
+	got := renderHostVarsYAMLWithTargetURL("fsn-3", "compute-only", "10.42.0.3", "ens5", "10.102.0.0/16", "fc00::/7", "100.64.0.0/14", "tcp://vmmd-3.faas:50051")
 	for _, want := range []string{
 		"faas_box_role: compute-only",
 		"faas_node_name: fsn-3",
@@ -508,6 +508,8 @@ func TestRenderHostVarsYAML_ComputeOnly(t *testing.T) {
 		`masquerade_cidr: "10.102.0.0/16"`,
 		`masquerade_cidr_v6: "fc00::/7"`,
 		`overlay_cidrs: ["100.64.0.0/14"]`,
+		`faas_vmmd_listen_addr: "tcp://0.0.0.0:50051"`,
+		`faas_vmmd_target_url: "tcp://vmmd-3.faas:50051"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("fsn-3 render missing %q\n%s", want, got)

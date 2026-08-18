@@ -20,6 +20,11 @@ component and runs only on the EX44 hardware. The operator runs
   drop-in vmmd falls back to `RoleSingleBox` on a multi-host fleet and the
   `[compute_node]` register row writes `role=single-box` — incompatible with
   fsn-2's `RoleComputeOnly` contract (ADR-092).
+- `99-faas-routing.conf.j2` — on compute-only boxes, renders
+  `faas_vmmd_listen_addr` and `faas_vmmd_target_url` into a managed drop-in.
+  The first is the bind address; the second is the routable address written
+  during vmmd self-registration. Both are required by the role, so a fresh
+  bootstrap cannot regress to a unix-socket row that needs a manual DB patch.
 
 ## Side effects
 

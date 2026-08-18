@@ -65,6 +65,31 @@
     group: root
     mode: "0644"
 
+# Public multi-box release gate: vmmd must receive both routing values from
+# inventory. Without this assertion an operator can bootstrap a compute box
+# that self-registers its unix socket and later repair compute_nodes by hand.
+- name: vmmd_service — require canonical compute-node routing
+  ansible.builtin.assert:
+    that:
+      - faas_vmmd_listen_addr is defined
+      - (faas_vmmd_listen_addr | default('') | length) > 0
+      - faas_vmmd_target_url is defined
+      - (faas_vmmd_target_url | default('') | length) > 0
+    fail_msg: >-
+      compute-only vmmd requires faas_vmmd_listen_addr and
+      faas_vmmd_target_url in host_vars; do not patch compute_nodes.target_url
+      manually after boot.
+  when: (faas_box_role | default('single-box')) == 'compute-only'
+
+- name: vmmd_service — install canonical routing drop-in
+  ansible.builtin.template:
+    src: 99-faas-routing.conf.j2
+    dest: /etc/systemd/system/faas-vmmd.service.d/99-faas-routing.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: (faas_box_role | default('single-box')) == 'compute-only'
+
 - name: vmmd_service — ensure 'faas' group exists (socket auth group, ADR-015)
   ansible.builtin.group:
     name: faas

@@ -393,6 +393,17 @@ func LoadConfig(path string) (*Config, error) {
 	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
 		c.ComputeNode.NodeName = v
 	}
+	// Public multi-box deployment overlay: keep the bind target and the
+	// routable dial target in deployment-owned systemd drop-ins rather than
+	// asking an operator to patch compute_nodes.target_url by hand. The two
+	// values intentionally remain separate: vmmd may bind to 0.0.0.0 while
+	// schedd/gatewayd must dial a routable address for this host.
+	if v := os.Getenv("FAAS_VMMD_LISTEN_ADDR"); v != "" {
+		c.ListenAddr = v
+	}
+	if v := os.Getenv("FAAS_VMMD_TARGET_URL"); v != "" {
+		c.ComputeNode.TargetURL = v
+	}
 	// Mega-PR-B (issue #911 / ADR-110 Tier-1 BLOCKING Commit 1):
 	// env-var overlay for [compute_node].host_bridge_cidr so the
 	// per-host bridge CIDR is configurable without a TOML edit

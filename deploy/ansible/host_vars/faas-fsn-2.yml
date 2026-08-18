@@ -19,6 +19,13 @@ faas_node_name: fsn-2
 ansible_host: 10.42.0.2
 ansible_python_interpreter: /usr/bin/python3
 
+# Canonical vmmd routing. The bind address is intentionally wildcard while
+# the target URL is routable from the control plane. The vmmd role renders
+# these through a managed systemd drop-in; no post-boot compute_nodes DB patch
+# is required.
+faas_vmmd_listen_addr: "tcp://0.0.0.0:50051"
+faas_vmmd_target_url: "tcp://10.42.0.2:50051"
+
 # Multi-host mesh (ADR-092): fsn-2 is the compute-only box and
 # needs the overlay mesh to reach peer compute boxes (fsn-3+ when
 # they land). The Jinja2 template at
