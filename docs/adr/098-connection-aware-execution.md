@@ -153,6 +153,18 @@ Two SLOs land in `pkg/promqlrules/data_placement.yaml`:
 `data_upstream_rtt_ms:kube_quantile{quantile="0.95"} < 50` (info),
 alert at `>200`. Documented in `docs/faas_implementation_spec.md` §12.
 
+**Deploy wiring.** The file is staged onto the box by
+`deploy/ansible/roles/prometheus/tasks/main.yml` (a sibling `copy:`
+task next to the existing faas.rules.yml + pg_backup.rules.yml drops)
+and listed in the Prometheus scrape config's `rule_files:` block at
+`deploy/ansible/roles/prometheus/templates/prometheus.yml.j2:17-22`
+alongside `/etc/prometheus/faas.rules.yml` and
+`/etc/prometheus/pg_backup.rules.yml`. CI lints it via
+`promtool check rules` at `.github/workflows/ci.yml` (extended to
+cover the sibling in issue #951) and the Go-side
+`TestFaasRulesSyntax` (extended to a list of rule files in
+issue #951).
+
 ### D3. Placement signal: `Request.PreferredRegion`, wake-time bias only
 
 `pkg/sched/placement.go::Request` gains one field:
