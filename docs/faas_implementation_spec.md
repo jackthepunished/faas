@@ -800,12 +800,80 @@ This subsection is the cross-reference page for the three v1.1 ADRs. Steady-stat
 | WakeResponse wire shape reverts (someone re-adds `.addr`) | `pkg/scheddgrpc` proto compile fails; `grep -rn "\.addr" pkg/ cmd/` sweep | Proto compilation is the regression gate; pre-#199 clients fail at unmarshal | ADR-025 v1.1, ADR-028 v1.1, issue #168 |
 | `migration 00024` `default-local` `47600` literal backfilled changed | Admission ceiling would change | Anti-goal: do not touch the literal. Re-backfill requires a new ADR | ADR-025 v1.1 |
 | VM wedged (busy-loop / leaked FD / deadlocked runner), liveness probe fails N consecutive | `RUNNING → STOPPED` | 3 consecutive non-2xx / timeout / conn-refused on vsock 1028 STREAM → `Engine.DestroyForLivenessFailure` eagerly marks snapshot stale → next Wake cold-boots (per ADR-005). 3 destroys in 300 s → `Engine.ParkDeployment` flips parent app to `apps.status='evicted_cold'` + audit kind `instances.parked_liveness_exhausted`. Idle timer resets on destroy. | ADR-079, issue #554 |
+| App did not bind to `$PORT` (no listener on readiness probe) | `pkg/fcvm/vmm.go::waitReady` detects `ECONNREFUSED` over the readiness window | RFC 7807 `app_not_listening` 422 stamped via `SetDeploymentFailedEx`; CLI renders the 5-line shape from `pkg/whycopy` row `app_not_listening` (hint/why/fix/relevant_logs) | error-explanations cluster, amendment 1 |
+| App bound to `127.0.0.1` (loopback) instead of `0.0.0.0` | `pkg/fcvm/vmm.go::waitCharacterization` reads `listening_addrs` from the WakeCharacterizationReport | RFC 7807 `app_loopback_bound` 422 — the per-VM bridge forwards to `10.0.0.2` (ADR-009), so loopback-only binds never receive gateway traffic. CLI hints to bind `0.0.0.0` | error-explanations cluster, amendment 1 |
+| Binary tarball targets a non-linux/amd64 architecture | `pkg/builderd/vm_metal.go::classifyBuildFailure` detects `ENOEXEC` from the kernel + `pkg` discriminator | RFC 7807 `app_arch_mismatch` 422 with `pkg` (npm/pip/go/cargo/etc.) on the wire. CLI recommends `GOOS=linux GOARCH=amd64 go build` for Go, `cargo build --target x86_64-unknown-linux-gnu` for Rust | error-explanations cluster, amendment 1 |
+| Source references `$ENV_VAR` not declared in the app's env config | `pkg/reposcan/scan.go` + `cmd/gregale/commands_doctor.go::doctorCheckEnvRequired` preflight | RFC 7807 `env_var_missing` 422 — the runtime would crash on first access; preflight surfaces the source-side signal via `gregale doctor` so the customer fixes it before deploy | error-explanations cluster, amendment 1 |
+| `/healthz` returns 401 (or 403) | `cmd/vmmd/liveness_recv.go` discriminates 401/403 from the generic `liveness_non_200` path | RFC 7807 `app_healthz_unauthorized` 422 — after 3 consecutive 401s, the engine marks the deployment failed because we can't distinguish "the app is up but the healthz path is gated" from "the app is down". CLI hints to expose `/healthz` without auth or use `healthcheck_path` to point at a public route | error-explanations cluster, amendment 1 |
+| Container OOM (cgroup `memory.events` OOM kill on the workload) | `guest/init/cgroup_partition_linux.go` listens on `cgroup.events`; vsock msg_type=3 surfaces the kill | RFC 7807 `app_runtime_oom` 422 with the plan's RAM cap in the prose. CLI hints to upgrade plan or trim in-memory state | error-explanations cluster, amendment 1 |
+| Dependency install step (npm/pip/go mod/cargo) exited non-zero | `pkg/builderd/vm_metal.go::classifyBuildFailure` extended with the `pkg` discriminator | RFC 7807 `dep_install_failed` 422 with `pkg` (npm/pip/go/cargo) on the wire. CLI recommends `npm install` locally to reproduce | error-explanations cluster, amendment 1 |
+| App boot timeout (readiness probe waited the full `startup_timeout_s` and `/healthz` never returned 200) | `pkg/sched/engine.go::KillStuck` carries `StuckReason` into the typed Problem | RFC 7807 `app_startup_timeout` 422 distinct from idle timeout (which parks). CLI hints to increase `startup_timeout_s` or defer boot work until after the `/healthz` listener is up | error-explanations cluster, amendment 1 |
+| Tarball or base image is a stateful shape (Dockerfile `VOLUME`, top-level `data/` / `db/` / `var/`, or a stateful base image) | `pkg/oci` + G13 stateless-only gate | RFC 7807 `stateless_only_violation` 422 (already shipped pre-cluster). Now flows through the same 5-line renderer from `pkg/whycopy` row `stateless_only_violation` so the prose is uniform with the new codes | error-explanations cluster, amendment 1 |
 
 **Operator runbook pointers:**
 
 - Per-component verification scripts live in `docs/runbooks/multi-host-rollout.md` (Phase D of the Tier 2 plan, issue #297 — **TBD**, not yet written) and `docs/runbooks/gate-a.md` (G.1, Gate-A active-passive adoption).
 - Admin surface row-by-row CRUD: `apid GET/POST/DELETE /v1/compute-nodes` (ADR-029 v1.1).
 - Cross-box gRPC dial: `pkg/wire.DialContext` (ADR-025 axis 1).
+
+### 6.4.1 Explanation catalog (error-explanations cluster, amendment 1)
+
+The 9 new rows above all flow through a single static catalog at
+`pkg/whycopy/` so the customer-facing prose is reviewable in one
+place, table-driven tested, and tripwire-protected. Each row
+maps one RFC 7807 stable `Code…` to:
+
+- **Title** — overrides `Problem.Title` when non-empty
+- **Hint** — single short next-action line (≤200 bytes)
+- **Why** — cause with the observed value templated in (≤512 bytes)
+- **Fix** — prescriptive remediation, 1-3 lines (bullets separated by `\n`)
+- **DocsURL** — overrides `Problem.DocsURL` when set
+- **Observed** — optional per-code renderer that templates the observed value into Why/Fix (e.g. `app_not_listening` lifts the actual port the probe dialed)
+
+The catalog is the single source of truth for customer-facing
+prose. Detection sites call `whycopy.Decorate(p, code, observed)`
+after the constructor so the wire `Problem` carries the full
+Hint/Why/Fix/RelevantLogs block on every code path.
+
+**Persistence:** the same prose is stamped onto the
+`deployments` row alongside `error_code` (`migrations/00290`,
+4 new columns: `error_hint`, `error_why`, `error_fix`,
+`error_relevant_logs jsonb`). Post-mortem retrieval via
+`gregale inspect <slug> --errors` lifts the persisted prose
+without re-running the build.
+
+**CLI surfaces:**
+
+- `cmd/gregale/commands.go::renderAPIError` renders the
+  5-line shape (Title / Detail / Hint / Why / Fix / RelevantLogs
+  / DocsURL). Legacy 3-line shape preserved when the cluster
+  didn't stamp any of the new fields.
+- `cmd/gregale/commands_doctor.go` — `gregale doctor [path]`
+  customer preflight that scans the cwd for the source-side
+  failure modes (loopback-bind, env-var, arch, stateless shape).
+- `cmd/gregale/pack.go::runPackPreflight` — warn-only preflight
+  run during `gregale deploy`; surfaces PORT unset + loopback
+  bind + arch mismatch hints after the deploy summary.
+- `cmd/gregale/commands2.go::runLogs --explain` — 4-line
+  summary on stream end (last error, level counts, top patterns).
+- `cmd/gregale/commands_inspect_errors.go` — `gregale inspect
+  <slug> --errors` post-mortem leaf that lifts the persisted
+  prose from the latest failed deployment.
+
+**Tripwires:**
+
+- `cmd/gregale/lint_tripwires_test.go::TestEveryCodeHasWhycopyEntry` —
+  every `Code…` in `pkg/api/errors.go` must have a matching row
+  in `pkg/whycopy`. Build fails on missing rows.
+- `pkg/whycopy/whycopy_test.go::TestDecorate_AllCodesHaveProse` —
+  every catalog row must have non-empty Title/Hint/Fix (and
+  Hint ≤200 bytes, Why ≤512 bytes).
+- `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_NoGlyphLiteralOutsideOutput` —
+  every customer-facing glyph (`✓ ✗ → ! — 💡 ┌─ │ └─`) is
+  centralised in `cmd/gregale/output.go`; no other file may
+  use them verbatim.
+- `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_NoLiteralDocsDomainEverywhere` —
+  every docs URL routes through `wire.DocsHost`.
 
 ---
 
