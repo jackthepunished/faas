@@ -654,8 +654,9 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64, prefix string)
 				hdr.Name = strings.TrimPrefix(name, prefix+"/")
 			}
 		}
-		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime.
-		target, err := safeJoin(dst, hdr.Name)
+		// resolveEntryPath rejects traversal and clamps ancestor symlinks inside
+		// the staging root before applyEntry can create or replace an entry.
+		target, err := resolveEntryPath(dst, hdr.Name)
 		if err != nil {
 			return err
 		}
