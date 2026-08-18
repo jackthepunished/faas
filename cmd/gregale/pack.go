@@ -969,8 +969,11 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 		// Print uses the inferred values — the caller may still
 		// override them via an explicit --runtime / --handler (out of
 		// scope here, but the CLI does it just after this returns).
+		// Issue #961 / Mega-A PR-2: surface the class (function/app)
+		// alongside the runtime + handler so the banner matches the
+		// BuildPlan field on the DeploymentResponse.
 		if !jsonOutput {
-			PrintOK(osStdout, "Detected: function, runtime=%s, handler=%s", rt, hnd)
+			PrintOK(osStdout, "Detected: function, runtime=%s, handler=%s, class=function", rt, hnd)
 		}
 		return shapeFunction, rt, hnd, nil
 	case shapeApp:
@@ -980,11 +983,15 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 		// informational; the server independently re-derives it
 		// for build_provenance.framework_version.
 		ver := detectFrameworkVersion(srcDir, fw)
+		// Issue #961 / Mega-A PR-2: add `class=app` so the banner
+		// mirrors the auto-detected BuildPlan field on the deployment
+		// response. Mirrors the `class=function` line in the function
+		// branch above.
 		if !jsonOutput {
 			if ver != "" {
-				PrintOK(osStdout, "Detected: app, framework=%s, version=%s", fw, ver)
+				PrintOK(osStdout, "Detected: app, framework=%s, version=%s, class=app", fw, ver)
 			} else {
-				PrintOK(osStdout, "Detected: app, framework=%s", fw)
+				PrintOK(osStdout, "Detected: app, framework=%s, class=app", fw)
 			}
 		}
 		return shapeApp, "", "", nil

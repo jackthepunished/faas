@@ -102,6 +102,14 @@ type Limits struct {
 	VCPU         int // firecracker vcpu_count (spec §4.4)
 	IdleTimeoutS int // default idle-reaper timeout (spec §4.3)
 
+	// CertExpiryWarningDays (issue #961 / Mega-A PR-3) is the threshold
+	// below which the cert engine emits a `cert.expiring_soon` audit
+	// row and the dashboard renders the yellow banner. Same across
+	// plans (no per-plan override); days, NOT hours, so the
+	// customer-facing UI can render "30 days" once. Default applied
+	// in Plan.LimitsFor via CertExpiryWarningDaysDefault.
+	CertExpiryWarningDays int
+
 	// End-to-end request budget (ADR-093). Per-plan overrides for
 	// the platform's wall-clock deadline on every customer-facing
 	// request. 0 falls back to RequestBudgetDefault /
@@ -956,19 +964,20 @@ var planLimits = map[Plan]Limits{
 		// layer build ... Free 256 MB") and the limits table both read 256
 		// (PR #241 spec-drift audit, 2026-07-26). This is a no-op
 		// alignment comment; the value was 256 before this audit too.
-		AppLayerMaxMB:       256,
-		SourceTarballMaxMB:  100,
-		VCPU:                2,
-		IdleTimeoutS:        30,
-		IncludedGBHours:     5,
-		PriceMillicents:     0,
-		RateLimitRPS:        5,
-		RateLimitBurst:      20,
-		EgressMbit:          10,
-		SecretCountMax:      3,
-		SecretValueMaxBytes: 4 * 1024,
-		EnvVarsMax:          8,
-		EnvValueMaxBytes:    4 * 1024,
+		AppLayerMaxMB:         256,
+		SourceTarballMaxMB:    100,
+		VCPU:                  2,
+		IdleTimeoutS:          30,
+		CertExpiryWarningDays: 30,
+		IncludedGBHours:       5,
+		PriceMillicents:       0,
+		RateLimitRPS:          5,
+		RateLimitBurst:        20,
+		EgressMbit:            10,
+		SecretCountMax:        3,
+		SecretValueMaxBytes:   4 * 1024,
+		EnvVarsMax:            8,
+		EnvValueMaxBytes:      4 * 1024,
 		// TrustedSignerCountMax: Free keeps the open-deploy posture;
 		// signature enforcement is a regulated-workload feature that
 		// Free never needs (issue #472 / ADR-054).
@@ -1189,16 +1198,17 @@ var planLimits = map[Plan]Limits{
 		AppErrorsMaxRequestRowsPerFingerprint: 25,
 	},
 	PlanHobby: {
-		Plan:               PlanHobby,
-		DeployedApps:       5,
-		MaxConcurrency:     2,
-		RAMMB:              256,
-		AppLayerMaxMB:      512,
-		SourceTarballMaxMB: 100,
-		VCPU:               2,
-		IdleTimeoutS:       60,
-		IncludedGBHours:    50,
-		PriceMillicents:    900_000, // €9.00
+		Plan:                  PlanHobby,
+		DeployedApps:          5,
+		MaxConcurrency:        2,
+		RAMMB:                 256,
+		AppLayerMaxMB:         512,
+		SourceTarballMaxMB:    100,
+		VCPU:                  2,
+		IdleTimeoutS:          60,
+		CertExpiryWarningDays: 30,
+		IncludedGBHours:       50,
+		PriceMillicents:       900_000, // €9.00
 		// ConcurrencyPerVMBound (issue #559): Hobby = 5 — smallest
 		// paid tier, matches Cloud Run's framing. Spec §4.9.1.
 		ConcurrencyPerVMBound: 5,
@@ -1459,16 +1469,17 @@ var planLimits = map[Plan]Limits{
 		AppErrorsMaxRequestRowsPerFingerprint: 100,
 	},
 	PlanPro: {
-		Plan:               PlanPro,
-		DeployedApps:       25,
-		MaxConcurrency:     5,
-		RAMMB:              512,
-		AppLayerMaxMB:      1024,
-		SourceTarballMaxMB: 250,
-		VCPU:               2,
-		IdleTimeoutS:       300,
-		IncludedGBHours:    250,
-		PriceMillicents:    2_900_000, // €29.00
+		Plan:                  PlanPro,
+		DeployedApps:          25,
+		MaxConcurrency:        5,
+		RAMMB:                 512,
+		AppLayerMaxMB:         1024,
+		SourceTarballMaxMB:    250,
+		VCPU:                  2,
+		IdleTimeoutS:          300,
+		CertExpiryWarningDays: 30,
+		IncludedGBHours:       250,
+		PriceMillicents:       2_900_000, // €29.00
 		// ConcurrencyPerVMBound (issue #559): Pro allows up to
 		// 25 concurrent in-flight requests per VM. Matches the
 		// typical SaaS-tier workload envelope (one Node/Python
@@ -1697,16 +1708,17 @@ var planLimits = map[Plan]Limits{
 		AppErrorsMaxRequestRowsPerFingerprint: 500,
 	},
 	PlanScale: {
-		Plan:               PlanScale,
-		DeployedApps:       100,
-		MaxConcurrency:     20,
-		RAMMB:              1024,
-		AppLayerMaxMB:      2048,
-		SourceTarballMaxMB: 250,
-		VCPU:               4,
-		IdleTimeoutS:       600,
-		IncludedGBHours:    1500,
-		PriceMillicents:    9_900_000, // €99.00
+		Plan:                  PlanScale,
+		DeployedApps:          100,
+		MaxConcurrency:        20,
+		RAMMB:                 1024,
+		AppLayerMaxMB:         2048,
+		SourceTarballMaxMB:    250,
+		VCPU:                  4,
+		IdleTimeoutS:          600,
+		CertExpiryWarningDays: 30,
+		IncludedGBHours:       1500,
+		PriceMillicents:       9_900_000, // €99.00
 		// ConcurrencyPerVMBound (issue #559): Scale = 80 — same
 		// default as Cloud Run's `80 × vCPU` heuristic (the issue
 		// body cites this number directly). 80 concurrent requests
@@ -2657,6 +2669,42 @@ const (
 	ReplicaHeartbeatIntervalSeconds = 5
 	WarmHintCacheSize               = 1000
 	CertSyncIntervalSeconds         = 30
+
+	// Tenant-surface cert engine constants (ADR-100 amendment,
+	// PR-D cert-engine-real-mint). The cap + renew-window + tick live
+	// here per CLAUDE.md "Hard limits policy" — no inline numbers in
+	// the issuer.
+	//
+	// MaxSANPerCert is LE's per-order SAN hard cap. Anything above this
+	// must be split across multiple orders; PR-D fails closed (the
+	// follow-up ADR-114 wires the split-aware `per_host` fallback).
+	//
+	// CertRenewBeforeNotAfterDays is the renew-window threshold: a
+	// surface with cert_not_after < now+window is queued for re-mint
+	// on the next renewer tick. LE's per-order rate limit exempts
+	// renewals of existing certs, so this is the same shape for
+	// fresh issuance and renewal — the renewer reuses the existing
+	// certmagic.Renew path through the same surface-remint pipeline.
+	// 30 days mirrors LE's expiry notification cadence (30/7/1 day
+	// emails) so an operator reading the alert sees the same window.
+	//
+	// CertRenewTickSeconds is the renewer goroutine cadence — every
+	// tick reads `tenant_surfaces_cert_expiry_idx` and re-mints
+	// surfaces inside the window. 5 min keeps file I/O negligible
+	// (one SELECT per tick) and the dashboard's "time-to-cert"
+	// panel has sub-minute resolution.
+	MaxSANPerCert               = 100
+	CertRenewBeforeNotAfterDays = 30
+	CertRenewTickSeconds        = 300
+	// CertRenewTickBatchLimit bounds the renewer's per-tick
+	// page size (PR-D code review Candidate 6). One SQL
+	// query per tick returns up to this many due surfaces;
+	// the next tick continues from the keyset cursor. The
+	// 1k cap keeps a single tick's UPDATE + notify fan-out
+	// bounded so a CA outage that lands N>1000 surfaces in
+	// the renewal window does NOT spike IOPS into the
+	// quadratic region.
+	CertRenewTickBatchLimit = 1000
 
 	// Tier A8 (active-passive HA topology, ADR-083 — closes the
 	// §14 M8 "Gate-A runbook (2nd box active-passive)" gap left

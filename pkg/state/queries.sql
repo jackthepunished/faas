@@ -1069,28 +1069,32 @@ WHERE account_id = $1
 -- Dedupe-merge INSERT for data_upstreams. Mirrors the
 -- IncrementAppError ON CONFLICT pattern (queries.sql:906).
 -- The handler (PR-B's cmd/apid/extract.go) targets
--- data_upstreams_dedupe_uniq on (app_id, scope, kind,
--- host, port). On conflict: bump last_seen_at; refresh
--- last_rtt_ms / last_probed_at / declared_region from
--- EXCLUDED so the freshest classifier observation wins.
--- id is caller-supplied (uuidv7) so the row identity is
--- stable across the dedupe-merge.
+-- data_upstreams_dedupe_uniq on (app_id, scope,
+-- deployment_scope, kind, host, port) per ADR-098 amendment
+-- (issue #954 / 00281_data_upstreams_deployment_scope.sql).
+-- On conflict: bump last_seen_at; refresh last_rtt_ms /
+-- last_probed_at / declared_region / deployment_scope
+-- from EXCLUDED so a re-classification re-stamps the
+-- deployment overlay on the latest observation. id is
+-- caller-supplied (uuidv7) so the row identity is stable
+-- across the dedupe-merge.
 INSERT INTO data_upstreams (
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, declared_region,
     last_rtt_ms, last_probed_at,
     last_seen_at, created_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8,
-    $9, $10,
-    $11, $12,
+    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+    $10, $11,
+    $12, $13,
     now(), now()
 )
-ON CONFLICT (app_id, scope, kind, host, port) DO UPDATE SET
+ON CONFLICT (app_id, scope, deployment_scope, kind, host, port) DO UPDATE SET
     source          = EXCLUDED.source,
     declared_region = EXCLUDED.declared_region,
     last_rtt_ms     = EXCLUDED.last_rtt_ms,
     last_probed_at  = EXCLUDED.last_probed_at,
+    deployment_scope = EXCLUDED.deployment_scope,
     last_seen_at    = now()
 RETURNING id;
 
@@ -1101,20 +1105,27 @@ RETURNING id;
 -- data_upstreams is a stable list, not a hot recency
 -- list. Index path: data_upstreams_app_created_idx.
 --
--- sqlc.arg(...)::type casts disambiguate the two cursor
--- params — without them sqlc named both fields
--- `CreatedAt` (taken from the SELECT list) and the
--- generated Go wrapper bound a timestamptz to the $3
--- uuid slot, tripping a type error on every cursor page
--- past the first. See the cross-PR slot-fence
--- sqlc.arg-disambiguates-cursor memory; the same
+-- Optional ?deployment_scope= server-side filter lands via
+-- `cursor_deployment_scope` (issue #954 / ADR-098 amendment).
+-- Empty string means "no filter; return all deployments"
+-- — the wide-open default. Setting a non-empty value restricts
+-- to one deployment. Mirrors the existing ?scope= discipline.
+--
+-- sqlc.arg(...)::type casts disambiguate the cursor params
+-- — without them sqlc named both fields `CreatedAt` (taken
+-- from the SELECT list) and the generated Go wrapper bound a
+-- timestamptz to the $3 uuid slot, tripping a type error on
+-- every cursor page past the first. See the cross-PR slot-
+-- fence sqlc.arg-disambiguates-cursor memory; the same
 -- pattern pins ListAppErrorGroups.
 SELECT
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, coalesce(declared_region, ''),
     last_rtt_ms, last_probed_at, last_seen_at, created_at
 FROM data_upstreams
 WHERE app_id = sqlc.arg('app_id')::uuid
+  AND (sqlc.arg('cursor_deployment_scope')::text IS NULL OR sqlc.arg('cursor_deployment_scope')::text = ''
+       OR deployment_scope = sqlc.arg('cursor_deployment_scope')::text)
   AND (sqlc.arg('cursor_created_at')::timestamptz IS NULL
        OR (created_at, id) < (sqlc.arg('cursor_created_at')::timestamptz,
                               sqlc.arg('cursor_id')::uuid))
@@ -1124,9 +1135,11 @@ LIMIT sqlc.arg('page_limit')::int;
 -- name: GetDataUpstreamByID :one
 -- Single-row read for the dashboard's "edit upstream"
 -- pane (PR-B). Cursor-safe: no pagination; the handler
--- reads the row directly.
+-- reads the row directly. Projects the new deployment_scope
+-- column (issue #954) so the typed DataUpstream.DeploymentScope
+-- in pkg/state/types.go round-trips through sqlc.
 SELECT
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, coalesce(declared_region, ''),
     last_rtt_ms, last_probed_at, last_seen_at, created_at
 FROM data_upstreams
@@ -1385,3 +1398,97 @@ select id
 from trigger_records
 where trigger_id = $1
   and item_identifier = $2;
+-- ─── OIDC / keyless deploy auth (ADR-101, issue #270) ───────────────────
+--
+-- Per-(account_id, issuer_url) trust policy CRUD + exchanged-token
+-- CRUD. PR-A scope. The composite PK on oidc_trust_policies is the
+-- lookup key; the per-account dashboard list (PR-C) walks the
+-- same index. token_hash UNIQUE on oidc_exchanged_tokens is the
+-- bearer hot-path lookup.
+
+-- name: GetOIDCTrustPolicy :one
+-- Account-by-issuer lookup. Used by the OIDC exchange handler's
+-- first-use auto-create path (PR-A) and the dashboard's Refine
+-- form (PR-C).
+select account_id, issuer_url, jwks_url, audience,
+       coalesce(subject_pattern, '') as subject_pattern,
+       algorithms, required_claims, created_at, updated_at,
+       audit_login
+from oidc_trust_policies
+where account_id = $1 and issuer_url = $2;
+
+-- name: UpsertOIDCTrustPolicy :one
+-- PK conflict on (account_id, issuer_url) updates the mutable
+-- columns (audience, subject_pattern, algorithms, required_claims,
+-- updated_at, audit_login) and preserves created_at. Returns the
+-- full row as stored.
+insert into oidc_trust_policies
+    (account_id, issuer_url, jwks_url, audience, subject_pattern,
+     algorithms, required_claims, audit_login)
+values ($1, $2, $3, $4, $5, $6, $7, $8)
+on conflict (account_id, issuer_url) do update
+    set audience = excluded.audience,
+        subject_pattern = excluded.subject_pattern,
+        algorithms = excluded.algorithms,
+        required_claims = excluded.required_claims,
+        updated_at = now(),
+        audit_login = excluded.audit_login
+returning account_id, issuer_url, jwks_url, audience,
+          coalesce(subject_pattern, '') as subject_pattern,
+          algorithms, required_claims, created_at, updated_at,
+          audit_login;
+
+-- name: ListOIDCTrustPoliciesForAccount :many
+-- Per-account dashboard list (PR-C). Empty slice on miss.
+select account_id, issuer_url, jwks_url, audience,
+       coalesce(subject_pattern, '') as subject_pattern,
+       algorithms, required_claims, created_at, updated_at,
+       audit_login
+from oidc_trust_policies
+where account_id = $1
+order by created_at desc;
+
+-- name: AccountByOIDCIssuerSubject :one
+-- Resolves an OIDC (issuer, subject) pair to the platform
+-- account it's bound to. The binding is implicit: any trust
+-- policy row with matching issuer_url + subject_pattern that
+-- matches the subject claim. Empty subject_pattern = permissive
+-- (accept any subject). PR-A matches on issuer_url only with
+-- permissive subject semantics; PR-C will refine the per-issuer
+-- subject index.
+select a.id, a.email, a.plan, a.status,
+       coalesce(a.provider_customer_id, ''), a.created_at
+from accounts a
+join oidc_trust_policies p on p.account_id = a.id
+where p.issuer_url = $1
+  and (p.subject_pattern is null or p.subject_pattern = ''
+       or $2 ~ p.subject_pattern)
+limit 1;
+
+-- name: InsertOIDCExchangedToken :one
+-- Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
+-- Returns the full row (with created_at server-stamped).
+insert into oidc_exchanged_tokens
+    (account_id, token_hash, expires_at, issuer_url, subject,
+     audience, jti)
+values ($1, $2, $3, $4, $5, $6, $7)
+returning id, account_id, token_hash, expires_at, issuer_url,
+          subject, audience, coalesce(jti, '') as jti,
+          created_at;
+
+-- name: GetOIDCExchangedTokenByHash :one
+-- Bearer hot-path lookup. Filters past-TTL rows out at the SQL
+-- layer so the pg contract is "WHERE expires_at > NOW()". The
+-- MemStore mirror in pkg/state/memstore.go lazy-deletes instead.
+select id, account_id, token_hash, expires_at, issuer_url, subject,
+       audience, coalesce(jti, '') as jti, created_at
+from oidc_exchanged_tokens
+where token_hash = $1
+  and expires_at > now();
+
+-- name: DeleteOIDCExchangedToken :exec
+-- Operator-driven revoke path (PR-C). Returns 0 rows on miss;
+-- the caller maps that to ErrNotFound. The 5-min TTL is the
+-- natural expiry path; Delete is the "kill this CI job's
+-- credential now" lever.
+delete from oidc_exchanged_tokens where id = $1;

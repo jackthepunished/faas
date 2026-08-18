@@ -1145,7 +1145,7 @@ func (s *server) getDeployment(w http.ResponseWriter, r *http.Request, acct stat
 		s.notFound(w, "no such deployment")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.deploymentResponse(d))
+	writeJSON(w, http.StatusOK, s.deploymentResponse(d, app))
 }
 
 // updateDeploymentMinInstances (issue #557 closure / ADR-074) is the
@@ -1243,7 +1243,7 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 			"prev":          prev,
 		})
 	}
-	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))
+	writeJSON(w, http.StatusOK, s.deploymentResponse(updated, app))
 }
 
 // updateDeploymentTraffic is the handler for
@@ -1369,7 +1369,7 @@ func (s *server) updateDeploymentTraffic(w http.ResponseWriter, r *http.Request,
 			s.log.Warn("apid: notify deployment_changed (traffic) failed", "err", err)
 		}
 	}
-	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))
+	writeJSON(w, http.StatusOK, s.deploymentResponse(updated, app))
 }
 
 // planMaxFor resolves the per-plan MaxMinInstances cap for the
@@ -1443,7 +1443,7 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 		"from":   current.ID,
 		"to":     target.ID,
 	})
-	writeJSON(w, http.StatusAccepted, s.deploymentResponse(target))
+	writeJSON(w, http.StatusAccepted, s.deploymentResponse(target, app))
 }
 
 // parkApp marks the app evicted_cold; schedd reacts and tears down live
@@ -1654,6 +1654,157 @@ func (s *server) deleteDomain(w http.ResponseWriter, r *http.Request, acct state
 		"domain": domain,
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// verifyDomain (issue #961 / Mega-A PR-3) is the
+// POST /v1/domains/{domain}/verify handler. Re-runs the DNS + cert
+// walk and returns the canonical CustomDomainResponse (with
+// CertNotAfter / CertSANs populated when the cert dial succeeds).
+//
+// The handler is idempotent — POSTing twice does not change the
+// domain's verification state; it just re-reads the wire. The
+// `verifying` state machine is owned by the DNSVerifier goroutine
+// (cmd/apid/dns_poller.go); this handler is the read sibling.
+//
+// CRIT-1 + MED-4 fix: dialCert failures are surfaced rather than
+// silently returned as 200-with-empty-fields. The CDN mismatch maps
+// to 422 CodeDomainCertNotIssued (existing); any other dial failure
+// maps to 422 CodeDomainVerificationFailed with reason
+// "dial_failed:<subreason>" so the customer can distinguish "DNS not
+// propagated" from "cert not yet issued" from "TLS handshake
+// refused". The show endpoint (getDomain) intentionally keeps the
+// soft-fail behaviour — it is a read; the customer re-polls.
+func (s *server) verifyDomain(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	domain := strings.ToLower(r.PathValue("domain"))
+	d, ok := s.loadDomain(w, r, acct, domain)
+	if !ok {
+		return
+	}
+	resp, certErr := s.domainResponseWithCert(r.Context(), d)
+	if certErr != nil {
+		if errors.Is(certErr, errCDNCert) {
+			api.WriteProblem(w, api.ErrDomainCertNotIssued(d.Domain, certErr.Error()))
+			return
+		}
+		if errors.Is(certErr, errCertFailure) {
+			api.WriteProblem(w, api.ErrDomainVerificationFailed(d.Domain, "cert dial failed: "+certErr.Error()))
+			return
+		}
+		// Unwrap transport-level errors (net.OpError, context errors).
+		api.WriteProblem(w, api.ErrDomainVerificationFailed(d.Domain, "transport: "+certErr.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// getDomain (issue #961 / Mega-A PR-3) is the GET /v1/domains/{domain}
+// handler. Returns the durable domain row + the live cert chain
+// (NotAfter, SANs, CertStatus). The cert dial is wrapped in
+// dialCertFunc so tests inject a fake server.
+//
+// MED-4 fix: a failed dial does NOT abort the response. The handler
+// returns the durable row + CertStatus="dial_failed:<reason>" so the
+// customer can tell whether the cert is pending, missing, or
+// refused by an upstream CDN.
+func (s *server) getDomain(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	domain := strings.ToLower(r.PathValue("domain"))
+	d, ok := s.loadDomain(w, r, acct, domain)
+	if !ok {
+		return
+	}
+	resp, _ := s.domainResponseWithCert(r.Context(), d)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// loadDomain centralises the loadAccount + app-ownership check for
+// the new per-domain routes. Returns false when the response was
+// written (so the caller bails).
+func (s *server) loadDomain(w http.ResponseWriter, r *http.Request, acct state.Account, domain string) (state.CustomDomain, bool) {
+	d, err := s.store.DomainByName(r.Context(), domain)
+	if err != nil {
+		s.notFound(w, "no such domain")
+		return d, false
+	}
+	app, err := s.store.AppByID(r.Context(), d.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such domain")
+		return d, false
+	}
+	return d, true
+}
+
+// domainResponseWithCert is the building block for verify + show.
+// It mirrors the existing domainResponse (line ~3309) but extends
+// the wire with the live cert details. d is the loaded domain row
+// (already ownership-checked).
+//
+// MED-4 fix: the cert dial error is returned alongside the response.
+// On success the caller can write a 200 with CertStatus="issued".
+// On failure the caller decides whether to surface the error (verify
+// → 422) or to keep the soft-fail shape (show → 200 with
+// CertStatus="dial_failed:<reason>").
+func (s *server) domainResponseWithCert(ctx context.Context, d state.CustomDomain) (api.CustomDomainResponse, error) {
+	resp := domainResponse(d)
+	if !d.Verified() {
+		resp.CertStatus = certStatusPending
+		return resp, nil
+	}
+	cert, err := dialCert(ctx, d.Domain)
+	if err != nil {
+		resp.CertStatus = classifyCertError(err)
+		return resp, err
+	}
+	resp.CertNotAfter = cert.NotAfter.UTC().Format(time.RFC3339)
+	resp.CertSANs = cert.DNSNames
+	resp.CertStatus = certStatusIssued
+	return resp, nil
+}
+
+// classifyCertError maps a dialCert error to the CertStatus string
+// the CLI / dashboard renders. The shape is "dial_failed:<reason>"
+// where reason is a stable token the customer can grep.
+func classifyCertError(err error) string {
+	switch {
+	case errors.Is(err, errCDNCert):
+		return "dial_failed:cdn_cert"
+	case errors.Is(err, errCertFailure):
+		return "dial_failed:" + dialFailureReason(err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return "dial_failed:dial_timeout"
+	case errors.Is(err, context.Canceled):
+		return "dial_failed:cancelled"
+	default:
+		// net.OpError (DNS, connection refused) etc. Fall back to
+		// the wrapped error's message but cap the length so a
+		// hostile DNS server can't blow up the wire.
+		msg := err.Error()
+		if len(msg) > 96 {
+			msg = msg[:96] + "…"
+		}
+		return "dial_failed:" + msg
+	}
+}
+
+// dialFailureReason extracts the inner-most non-errCertFailure
+// error so the CertStatus surfaces the actual failure mode (e.g.
+// "dial_refused", "handshake_failed"). Falls back to a generic
+// "unknown" if the chain is empty.
+func dialFailureReason(err error) string {
+	for {
+		next := errors.Unwrap(err)
+		if next == nil {
+			break
+		}
+		err = next
+	}
+	if err == nil || err.Error() == "" {
+		return "unknown"
+	}
+	msg := err.Error()
+	if len(msg) > 96 {
+		msg = msg[:96] + "…"
+	}
+	return msg
 }
 
 // --- crons -----------------------------------------------------------------
@@ -3040,7 +3191,7 @@ func (s *server) lookupAccountByPaddleID(ctx context.Context, paddleID string) (
 
 // --- response helpers ------------------------------------------------------
 
-func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
+func (s *server) deploymentResponse(d state.Deployment, app state.App) api.DeploymentResponse {
 	// Issue #460 / ADR-053: echo the override_* columns on the
 	// response. Env values are NEVER echoed (override_env_keys
 	// carries only the key set). Env-secret refs ARE echoed
@@ -3174,6 +3325,49 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 	// is enforced at the schema layer.
 	resp.ParkedReason = d.ParkedReason
 	resp.ParkedAt = d.ParkedAt
+	// Issue #961 / Mega-A PR-2: surface the auto-detected build plan
+	// (framework, runtime, class, entrypoint, port) on every deployment
+	// response so the CLI can print a single "Detected:" line and the
+	// dashboard can render the same shape without a separate /build
+	// fetch. For DeploymentKindImage (no SourcePath on disk), BuildPlan
+	// is left nil — the wire's omitempty keeps the field off the
+	// response in that case and pre-PR-2 clients see bit-identical
+	// JSON.
+	//
+	// HIGH-2 fix: route the marker detection through
+	// getCachedBuildPlan so listDeployments doesn't open +
+	// parse every spooled tarball on every page render. The
+	// cache is keyed by path + mtime — a fresh spool write
+	// invalidates the entry.
+	//
+	// getCachedBuildPlan calls pkg/markers.DetectFromTarball
+	// directly (not builderd.NewDetector().Detect) because the
+	// builderd shim errors on FrameworkUnknown
+	// (pkg/builderd/detect.go:49-50), which would leave the
+	// BuildPlan field empty for monorepos. The markers API
+	// returns (FrameworkUnknown, nil) for missing markers —
+	// graceful degradation, no special error path.
+	if d.SourcePath != "" {
+		bp := &api.BuildPlan{Class: string(app.Type)}
+		if app.Runtime != "" {
+			bp.Runtime = app.Runtime
+		}
+		// HIGH-2 fix: route the marker detection through
+		// getCachedBuildPlan so listDeployments doesn't open +
+		// parse every spooled tarball on every page render. The
+		// cache is keyed by path + mtime — a fresh spool write
+		// invalidates the entry.
+		fw, ver := getCachedBuildPlan(d.SourcePath)
+		bp.Framework = string(fw)
+		bp.Version = ver
+		if len(d.OverrideEntrypoint) > 0 {
+			bp.Entrypoint = d.OverrideEntrypoint[0]
+		}
+		if d.OverridePort != 0 {
+			bp.Port = d.OverridePort
+		}
+		resp.BuildPlan = bp
+	}
 	return resp
 }
 
@@ -3337,9 +3531,20 @@ func (s *server) listDeployments(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.ErrCapacity("could not list deployments"))
 		return
 	}
+	// Issue #961 / Mega-A PR-2: Batch-load the account's apps once so
+	// deploymentResponse can populate BuildPlan (issue #961 leaf 2).
+	// Avoids N+1 AppByID calls per page. ListApps is bounded by the
+	// per-plan deployed cap (pkg/api/limits.go) so the in-memory map
+	// is small. AppByID failures fall through to a zero-value App
+	// (BuildPlan.Class is empty), which the wire renders as missing.
+	apps, _ := s.store.ListApps(r.Context(), acct.ID)
+	appByID := make(map[string]state.App, len(apps))
+	for _, a := range apps {
+		appByID[a.ID] = a
+	}
 	resp := api.DeploymentListResponse{Items: make([]api.DeploymentResponse, 0, len(rows))}
 	for _, d := range rows {
-		resp.Items = append(resp.Items, s.deploymentResponse(d))
+		resp.Items = append(resp.Items, s.deploymentResponse(d, appByID[d.AppID]))
 	}
 	if len(rows) == limit && limit > 0 && len(resp.Items) > 0 {
 		// NextBefore = CreatedAt of the LAST row (the oldest on this

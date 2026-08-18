@@ -3410,8 +3410,8 @@ func TestPg_UpsertComputeNodeFromOperator_RoundTripsAllNewColumns(t *testing.T) 
 		VPCPUs:             4,
 		MemMB:              8192,
 		MaxConcurrency:     5,
-		AdmissionCeilingMB: 8192,
 		VCPUBudget:         20,
+		AdmissionCeilingMB: 4096,
 		Active:             true,
 		Region:             ptrStr("eu-fra"),
 		Zone:               ptrStr("eu-fra-1"),
@@ -3576,16 +3576,12 @@ func TestPg_UpsertComputeNodeFromOperator_RoundTripsAllNewColumns(t *testing.T) 
 		{"Role", nullRow.Role},
 		{"Generation", nullRow.Generation},
 	} {
-		// reflect-based nil check: typed-nil pointers (e.g. *netip.Addr(nil),
-		// *string(nil), *int(nil)) wrapped in interface{} compare != nil
-		// in plain Go (the interface holds a non-nil type tag), so the
-		// naive `c.ptr != nil` test reports every typed-nil as a failure.
-		// reflect.Value.IsNil() unwraps the typed nil correctly.
-		if c.ptr != nil {
-			rv := reflect.ValueOf(c.ptr)
-			if rv.Kind() != reflect.Ptr || !rv.IsNil() {
-				t.Errorf("null row %s = %v, want nil pointer (nullable contract)", c.name, c.ptr)
-			}
+		// interface{} wrapping a typed nil pointer is NOT == nil —
+		// the interface carries a type tag with no value. Use
+		// reflect to dereference the typed-nil correctly.
+		v := reflect.ValueOf(c.ptr)
+		if v.Kind() == reflect.Ptr && !v.IsNil() { //nolint:govet // reflect.Ptr is a stdlib constant; inlining it adds noise without clarity benefit.
+			t.Errorf("null row %s = %v, want nil pointer (nullable contract)", c.name, c.ptr)
 		}
 	}
 }
@@ -3609,8 +3605,8 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 		VPCPUs:             4,
 		MemMB:              8192,
 		MaxConcurrency:     5,
-		AdmissionCeilingMB: 8192,
 		VCPUBudget:         20,
+		AdmissionCeilingMB: 4096,
 		Region:             ptrStr("eu-fra"),
 		Zone:               ptrStr("eu-fra-1"),
 		ReleaseID:          ptrStr("0123456789abcdef0123456789abcdef01234567"),
@@ -3636,9 +3632,9 @@ func TestPg_UpsertComputeNodeFromVmmd_PreservesOperatorReleaseID(t *testing.T) {
 		VPCPUs:             8,                     // vmmd reports higher
 		MemMB:              16384,
 		MaxConcurrency:     10,
-		AdmissionCeilingMB: 16384,
 		VCPUBudget:         40,
-		Region:             nil, // vmmd doesn't know about region yet
+		AdmissionCeilingMB: 4096, // CHECK (admission_ceiling_mb > 0)
+		Region:             nil,  // vmmd doesn't know about region yet
 		Zone:               nil,
 		ReleaseID:          nil, // CRITICAL: must not overwrite operator's value
 		ManifestHash:       nil,

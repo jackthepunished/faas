@@ -346,6 +346,18 @@ type ComputeNode struct {
 	VcpuBudget      int32
 	PublicIp        *netip.Addr
 	PublicIpSetAt   pgtype.Timestamptz
+	// release_bundles.git_sha this node claims membership in (PR-3a). NULL = pre-bundle row. Populated by PR-3 release install + PR-2 renderer.
+	ReleaseID pgtype.Text
+	// sha256:<64hex> hash of the manifest the PR-2 renderer materialized on this node (PR-3a). NULL = pre-manifest row. Compared against release_bundles.manifest_hash by PR-4 doctor.
+	ManifestHash pgtype.Text
+	// PEM-encoded leaf certificate for this node (PR-3a). NULL = pre-PR-X or pre-cmd/hostage-gen row. Doctor reads to verify cert on disk matches cert_fingerprint.
+	HostCertificate pgtype.Text
+	// sha256:<64hex> fingerprint of host_certificate (PR-3a). NULL until secrets init (PR-X) or cmd/hostage-gen stamps it. PR-3 bundle install + PR-4 doctor compare against pkg/pki.LoadCertificateFingerprint at mTLS handshake time.
+	CertFingerprint pgtype.Text
+	// per-node role label: control-plane | compute-node (PR-3a). Populated from manifest.fleet.hosts[].role by PR-2 renderer. NULL = pre-manifest row.
+	Role pgtype.Text
+	// monotonic counter bumped by PR-4 doctor on per-node inconsistency detection (PR-3a). Default 0; never decreases.
+	Generation pgtype.Int4
 }
 
 type ComputeNodeHeartbeat struct {
@@ -422,6 +434,7 @@ type DataUpstream struct {
 	LastProbedAt     pgtype.Timestamptz
 	LastSeenAt       pgtype.Timestamptz
 	CreatedAt        pgtype.Timestamptz
+	DeploymentScope  string
 }
 
 type DataUpstreamProbe struct {
@@ -521,10 +534,12 @@ type EdgeRule struct {
 }
 
 type EgressPolicy struct {
-	ID             string
-	PublicIface    string
-	MasqueradeCidr string
-	ChangedAt      pgtype.Timestamptz
+	ID                                 string
+	PublicIface                        string
+	MasqueradeCidr                     string
+	ChangedAt                          pgtype.Timestamptz
+	OverlayExceptions                  []string
+	DangerAcceptRfc1918LateralMovement bool
 }
 
 type Event struct {
@@ -726,6 +741,31 @@ type OauthLink struct {
 	CreatedAt       pgtype.Timestamptz
 }
 
+type OidcExchangedToken struct {
+	ID        pgtype.UUID
+	AccountID pgtype.UUID
+	TokenHash []byte
+	ExpiresAt pgtype.Timestamptz
+	IssuerUrl string
+	Subject   string
+	Audience  []string
+	Jti       pgtype.Text
+	CreatedAt pgtype.Timestamptz
+}
+
+type OidcTrustPolicy struct {
+	AccountID      pgtype.UUID
+	IssuerUrl      string
+	JwksUrl        string
+	Audience       []string
+	SubjectPattern pgtype.Text
+	Algorithms     []string
+	RequiredClaims []byte
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	AuditLogin     string
+}
+
 type Org struct {
 	ID                     pgtype.UUID
 	Slug                   string
@@ -765,14 +805,15 @@ type OrgMembership struct {
 }
 
 type PaddleOverageDedupe struct {
-	AccountID   pgtype.UUID
-	Month       pgtype.Timestamptz
-	PushedAt    pgtype.Timestamptz
-	WindowStart pgtype.Timestamptz
-	State       string
-	ClaimedAt   pgtype.Timestamptz
-	ClaimedBy   pgtype.Text
-	OrgID       pgtype.UUID
+	AccountID       pgtype.UUID
+	Month           pgtype.Timestamptz
+	PushedAt        pgtype.Timestamptz
+	WindowStart     pgtype.Timestamptz
+	State           string
+	ClaimedAt       pgtype.Timestamptz
+	ClaimedBy       pgtype.Text
+	OrgID           pgtype.UUID
+	PushedMbSeconds pgtype.Int8
 }
 
 type PgRatelimitCounter struct {
@@ -801,6 +842,15 @@ type RecentBuildClaim struct {
 	ClaimedAt pgtype.Timestamptz
 	BuildID   pgtype.UUID
 	OrgID     pgtype.UUID
+}
+
+type ReleaseBundle struct {
+	ID           pgtype.UUID
+	GitSha       string
+	ManifestHash string
+	DaemonHashes []byte
+	CreatedAt    pgtype.Timestamptz
+	AppliedAt    pgtype.Timestamptz
 }
 
 type Session struct {
@@ -912,7 +962,6 @@ type TriggerRecord struct {
 	LastError        pgtype.Text
 	LastDispatchedAt pgtype.Timestamptz
 }
-
 // Per-(account, app, day) materialised rollup of usage_minutes. Populated by the meterd cron tick FAAS_ROLLUP_INTERVAL (default 5 min) via INSERT ... SELECT ... GROUP BY with ON CONFLICT additive merge. Read by GET /v1/usage/daily. ADR-048. Informational — not billed.
 type UsageDaily struct {
 	AccountID  pgtype.UUID

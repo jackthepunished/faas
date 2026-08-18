@@ -229,6 +229,16 @@ type server struct {
 	//
 	// ADR-044.
 	authMw *authmw.Middleware
+	// oidcHandler is the POST /v1/auth/oidc/exchange handler
+	// (issue #270 / ADR-101). Wired from newServerWithDeps so
+	// the mutating handler state (the JWKS cache, the trust-policy
+	// store, the audit emitter) is constructed once at boot. nil
+	// means the OIDC route is not mounted — unit tests that don't
+	// exercise the OIDC path can build a server without wiring it.
+	// The handler's deps are constructed in newServerWithDeps
+	// (cmd/apid/server.go:540+); the production main.go never
+	// touches this field directly.
+	oidcHandler *oidcHandler
 	// orgResolver is the pkg/authz.OrgResolver the LoadOrg
 	// middleware reads to resolve (slug, membership) for the
 	// X-Active-Org / ?org= hint. Wraps the same pkg/state.Store
@@ -597,7 +607,7 @@ func newServerWithDeps(
 	// pass the inner Auditor into buildReconcileService — the
 	// resulting reconcile rows carry actor="apid" in events.actor.
 	aud := newAuditor(store, log, nil)
-	return &server{
+	s := &server{
 		store:                  store,
 		log:                    log,
 		domain:                 domain,
@@ -673,6 +683,14 @@ func newServerWithDeps(
 		// handler falls back to the store directly.
 		graceWindowCache: newGraceWindowCache(),
 	}
+	// Issue #270 / ADR-101 / PR-A: build the OIDC exchange
+	// handler after the struct is wired so the handler can read
+	// the apiAuthLimiter / audit / store / log / sessions
+	// already on s. The handler is anonymous (no session
+	// required); the route is mounted via middleware.AuthLimit
+	// (no requireX chain) in cmd/apid/server.go:870 below.
+	s.oidcHandler = s.buildOIDCHandler()
+	return s
 }
 
 // noopMailer drops every email. Default when the daemon hasn't wired a
@@ -918,6 +936,23 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/apps/{slug}/tenant-surfaces/{id}/hostnames", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.addTenantHostname)))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.removeTenantHostname))))
 
+	// Issue #270 / ADR-101 / PR-A: OIDC / keyless deploy auth.
+	// POST /v1/auth/oidc/exchange mints a short-lived opaque bearer
+	// from an IdP-issued JWT. The route is anonymous (the caller
+	// has no session, no bearer — the JWT IS the auth) so it's
+	// mounted via middleware.AuthLimit (per-IP rate limit, no
+	// session required) on the shared apiAuthLimiter. The 10/min/IP
+	// envelope is shared with the rest of the API surface so an
+	// OIDC brute-force contributes to the same counter as the
+	// bearer / login endpoints. The handler is built in
+	// newServerWithDeps (cmd/apid/server.go:670) and stamped on
+	// s.oidcHandler; nil here means a legacy test that hasn't
+	// wired the OIDC surface, in which case the route is
+	// intentionally not mounted.
+	if s.oidcHandler != nil {
+		mux.Handle("POST /v1/auth/oidc/exchange", middleware.AuthLimitWithLimiter(middleware.AuthLimitConfig{Log: s.log}, s.apiAuthLimiter)(s.oidcHandler))
+	}
+
 	// Deployments.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))
 	// DEPLOY-PROV-4 / ADR-092 / issue #739 — headless source-ref
@@ -928,6 +963,13 @@ func (s *server) handler() http.Handler {
 	// githubd gRPC bridge (cmd/apid/githubd_client.go) and streams
 	// the upstream tarball straight into validateAndSpool.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments/source-ref", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.handleSourceRefDeploy)))))
+	// Issue #961 / Mega-A PR-1 — zero-config local-tarball deploy.
+	// The CLI is the trust root on this path; apid does NOT consult
+	// github_installations and does NOT attempt a server-side git
+	// fetch. See docs/adr/0XX-local-tarball-deploy-trust-root.md.
+	// Parallel to source-ref, not a replacement — that gate stays
+	// load-bearing for `--repo X --ref SHA` semantics.
+	mux.HandleFunc("POST /v1/apps/{slug}/deployments/source-tarball", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.handleSourceTarballDeploy)))))
 	// PR-1 of the deploy-diff cluster — server-side pre-deploy
 	// preview. Read-only (no DB writes, no audit row, no deployment
 	// row), so the auth chain matches GET /v1/apps/{slug}/metrics
@@ -1022,6 +1064,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/domains", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listDomains))))
 	mux.HandleFunc("POST /v1/domains", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDomain)))))
 	mux.HandleFunc("DELETE /v1/domains/{domain}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteDomain))))
+	// Issue #961 / Mega-A PR-3: per-domain verify + show surfaces for
+	// `gregale domains verify | show`. GET /v1/domains/{domain} returns
+	// the row + cert (NotAfter, SANs); POST /v1/domains/{domain}/verify
+	// re-runs the DNS + cert walk and returns the result. Both mirror
+	// the existing custom-domains auth gates (write for verify, read for
+	// show).
+	mux.HandleFunc("POST /v1/domains/{domain}/verify", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.verifyDomain)))))
+	mux.HandleFunc("GET /v1/domains/{domain}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDomain))))
 
 	// Crons.
 	mux.HandleFunc("GET /v1/crons", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCrons))))

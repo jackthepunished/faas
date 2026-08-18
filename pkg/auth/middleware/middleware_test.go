@@ -30,6 +30,7 @@ import (
 
 type fakeAuthn struct {
 	authKey    map[string]authResult // hash → (acct, key)
+	authOIDC   map[string]authResult // hash → (acct, key) for the OIDC branch (issue #270 / ADR-101)
 	acctByID   map[string]state.Account
 	appBySlug  map[string]state.App
 	touchCalls []string
@@ -45,6 +46,7 @@ type authResult struct {
 func newFakeAuthn() *fakeAuthn {
 	return &fakeAuthn{
 		authKey:   map[string]authResult{},
+		authOIDC:  map[string]authResult{},
 		acctByID:  map[string]state.Account{},
 		appBySlug: map[string]state.App{},
 	}
@@ -54,6 +56,21 @@ func (f *fakeAuthn) AuthenticateKey(_ context.Context, hash []byte) (state.Accou
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.authKey[string(hash)]
+	if !ok {
+		return state.Account{}, state.APIKey{}, state.ErrNotFound
+	}
+	return r.acct, r.key, r.err
+}
+
+// AuthenticateOIDCBearer is the ADR-101 stub mirroring AuthenticateKey's
+// shape but keyed by a separate map so tests can drive the OIDC and
+// fp_live_ branches independently without hash collisions. Returns
+// state.ErrNotFound on miss (same posture as AuthenticateKey); the
+// middleware falls through to the cookie branch on miss.
+func (f *fakeAuthn) AuthenticateOIDCBearer(_ context.Context, hash []byte) (state.Account, state.APIKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.authOIDC[string(hash)]
 	if !ok {
 		return state.Account{}, state.APIKey{}, state.ErrNotFound
 	}
@@ -536,6 +553,107 @@ func TestRequireSession_BearerTouchKeyLastUsedDebounce(t *testing.T) {
 	defer authn.mu.Unlock()
 	if len(authn.touchCalls) != 1 {
 		t.Errorf("touch calls = %d, want 1 (debounce should fire only one)", len(authn.touchCalls))
+	}
+}
+
+// validOIDCBearerKey is the OIDC-derived bearer shape
+// (issue #270 / ADR-101): "fp_oidc_" (8) + 48 hex chars
+// (24 bytes of entropy). Format must pass api.ValidOIDCKeyFormat;
+// length is checked. The 5-min TTL means the path does NOT call
+// TouchKeyLastUsed — see TestRequireSession_OIDCBearer_KeyDebounceUnused
+// for the contract.
+const validOIDCBearerKey = "fp_oidc_0123456789abcdef0123456789abcdef0123456789abcdef" // len = 56
+
+func TestRequireSession_OIDCBearerHappyPath(t *testing.T) {
+	authn := newFakeAuthn()
+	hash := api.HashAPIKey(validOIDCBearerKey)
+	// The OIDC branch stamps a synthetic APIKey projection with
+	// Scopes=["deploy:write"] (ADR-101 customer-locked decision).
+	// The fake stores whatever the test stamps.
+	authn.authOIDC[string(hash)] = authResult{
+		acct: mkActiveAccount("acct-1"),
+		key:  mkKey("oidc-tok-1", api.ScopeDeployWrite),
+	}
+
+	mw := newMW(t, authn, nil, nil, nil)
+	hits := 0
+	h := mw.RequireSession(func(_ http.ResponseWriter, r *http.Request, acct state.Account) {
+		hits++
+		if acct.ID != "acct-1" {
+			t.Errorf("acct.ID = %q, want acct-1", acct.ID)
+		}
+		_, gotKey, ok := authmw.AccountFromContext(r)
+		if !ok || gotKey == nil || gotKey.ID != "oidc-tok-1" {
+			t.Errorf("ctx stamp missing or wrong: (key=%+v, ok=%v)", gotKey, ok)
+		}
+		if len(gotKey.Scopes) != 1 || gotKey.Scopes[0] != api.ScopeDeployWrite {
+			t.Errorf("scopes = %v, want [%s]", gotKey.Scopes, api.ScopeDeployWrite)
+		}
+	})
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", map[string]string{"Authorization": "Bearer " + validOIDCBearerKey}, nil)
+	h(rec, r)
+
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1", hits)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRequireSession_OIDCBearer_KeyDebounceUnused pins the
+// contract that the OIDC branch does NOT call TouchKeyLastUsed.
+// The 5-min TTL bounds the write profile; the per-exchange
+// audit row is the durable record. KeyDebounce is keyed on
+// api_keys.id, a different namespace, so the OIDC branch
+// wouldn't grow it anyway — this test just nails the
+// not-call invariant.
+func TestRequireSession_OIDCBearer_KeyDebounceUnused(t *testing.T) {
+	authn := newFakeAuthn()
+	hash := api.HashAPIKey(validOIDCBearerKey)
+	authn.authOIDC[string(hash)] = authResult{
+		acct: mkActiveAccount("acct-1"),
+		key:  mkKey("oidc-tok-1", api.ScopeDeployWrite),
+	}
+
+	mw := newMW(t, authn, nil, nil, nil)
+	h := mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {})
+
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		r := mkRequest("GET", "/v1/apps", map[string]string{"Authorization": "Bearer " + validOIDCBearerKey}, nil)
+		h(rec, r)
+	}
+
+	authn.mu.Lock()
+	defer authn.mu.Unlock()
+	if len(authn.touchCalls) != 0 {
+		t.Errorf("OIDC bearer should not call TouchKeyLastUsed, got %d calls", len(authn.touchCalls))
+	}
+}
+
+// TestRequireSession_OIDCBearer_NotFoundFallsThrough pins the
+// contract that an unknown OIDC bearer does not 401 on the OIDC
+// branch alone — the middleware falls through to the cookie
+// branch. Today the cookie branch also 401s (no cookie), so
+// the visible status is 401, but the path is "OIDC miss →
+// cookie miss → 401", not "OIDC miss → 401 short-circuit".
+func TestRequireSession_OIDCBearer_NotFoundFallsThrough(t *testing.T) {
+	authn := newFakeAuthn()
+	// authOIDC is empty — every hash returns ErrNotFound.
+	mw := newMW(t, authn, nil, nil, nil)
+	h := mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		t.Errorf("downstream should not be called when OIDC + cookie both miss")
+	})
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", map[string]string{"Authorization": "Bearer " + validOIDCBearerKey}, nil)
+	h(rec, r)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 (OIDC miss + cookie miss)", rec.Code)
 	}
 }
 

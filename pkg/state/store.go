@@ -675,11 +675,65 @@ type Store interface {
 	// the auth middleware (which has the Auditor dependency), not
 	// here. See pkg/auth/middleware for the HTTP-side translation.
 	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
+	// AuthenticateOIDCBearer resolves an OIDC-derived short-lived
+	// bearer (issue #270 / ADR-101) to its account + synthetic
+	// APIKey. The hash lookup hits oidc_exchanged_tokens.token_hash
+	// (UNIQUE index). Rows past ExpiresAt return ErrNotFound — the
+	// 5-min TTL is the natural expiry path; no lazy-flip required.
+	// The returned APIKey is a synthetic projection
+	// (status='active', scopes=['deploy:write']) so the principal
+	// stamp + downstream requireScope chain works unchanged. Returns
+	// ErrNotFound when no row matches.
+	AuthenticateOIDCBearer(ctx context.Context, hash []byte) (Account, APIKey, error)
+	// AccountByOIDCSubject resolves an OIDC subject to the platform
+	// account it's bound to. The binding lives in oidc_trust_policies
+	// (issue #270 / ADR-101); a successful exchange requires the
+	// (issuer_url, subject) pair to have an existing account_id
+	// FK. Returns ErrNotFound when no binding exists. The handler
+	// (pkg/oidc/handler.go) maps that to 401 "OIDC subject not
+	// bound" — distinct from a bad-signature 401 so the customer
+	// can tell "wrong CI job" from "wrong customer".
+	AccountByOIDCSubject(ctx context.Context, issuerURL, subject string) (Account, error)
+	// UpsertOIDCTrustPolicy inserts or updates the per-(account,
+	// issuer) policy row. Used by the OIDC exchange handler's
+	// first-use auto-create path (PR-A) and the dashboard's
+	// refine form (PR-C). Returns ErrAlreadyExists on conflicting
+	// PK inserts — the caller retries as UpdateOIDCTrustPolicy.
+	UpsertOIDCTrustPolicy(ctx context.Context, p *OIDCTrustPolicy) (*OIDCTrustPolicy, error)
+	// GetOIDCTrustPolicy returns the policy for (account_id,
+	// issuer_url). Returns ErrNotFound on miss.
+	GetOIDCTrustPolicy(ctx context.Context, accountID, issuerURL string) (*OIDCTrustPolicy, error)
+	// ListOIDCTrustPoliciesForAccount returns every trust policy
+	// the account owns. Empty slice on miss. Used by the dashboard
+	// list page (PR-C).
+	ListOIDCTrustPoliciesForAccount(ctx context.Context, accountID string) ([]*OIDCTrustPolicy, error)
+	// InsertOIDCExchangedToken stores a fresh exchanged-token row.
+	// The caller has already generated the bearer (api.GenerateOIDCKey)
+	// and hashed it (api.HashAPIKey); the row carries only the hash.
+	// Returns the server-minted row id (gen_random_uuid at the SQL
+	// layer) so the caller can echo it in the response and stamp
+	// it on the audit row as the correlation key.
+	InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchangedToken) (string, error)
+	// GetOIDCExchangedTokenByHash returns the row whose TokenHash
+	// equals the input. Returns ErrNotFound on miss. The caller
+	// checks ExpiresAt before using the row — a stale row that
+	// survived a TTL race surfaces as 401, not silent acceptance.
+	GetOIDCExchangedTokenByHash(ctx context.Context, hash []byte) (*OIDCExchangedToken, error)
+	// DeleteOIDCExchangedToken is the operator-driven revoke path
+	// (PR-C). A 5-min TTL row is normally reaped by lazy-Get
+	// (GetByHash on a row past ExpiresAt returns ErrNotFound);
+	// Delete is for the "kill this CI job's credential now" case.
+	DeleteOIDCExchangedToken(ctx context.Context, id string) error
 	// TouchKeyLastUsed bumps the key's last_used_at to now(). Called
 	// fire-and-forget on every successful bearer auth in the apid
 	// middleware so the dashboard can show "X used 2 minutes ago"
 	// (PRD §4.4) without coupling request latency to a non-critical
 	// observability write.
+	//
+	// Not invoked by the OIDC branch — a 5-min TTL row would
+	// dominate write load if every CI request stamped last_used_at.
+	// The mint-time audit row (auth.token.exchanged) is the durable
+	// record.
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
 
 	// CreateAPIKeyWithExpiry is the IAM-5 (issue #189) shape. The
@@ -1867,6 +1921,34 @@ type Store interface {
 	ListTenantSurfacesForAccount(ctx context.Context, accountID string) ([]TenantSurface, error)
 	ListTenantSurfacesForApp(ctx context.Context, appID string) ([]TenantSurface, error)
 	CountTenantSurfacesForAccount(ctx context.Context, accountID string) (int, error)
+	// ListTenantSurfacesNearingExpiry is the renewer hot-path
+	// (PR-D cert-engine-real-mint commit 3). Returns up to
+	// `limit` active surfaces with cert_state='issued' AND
+	// cert_not_after < cutoff, using a keyset cursor on
+	// (cert_not_after, id) for stable pagination. The renewer
+	// iterates the returned slice and triggers a re-mint
+	// through the existing pg_notify pipeline (via
+	// TouchTenantSurfaceForRenewal bumping updated_at, which
+	// fires the tenant_surface_changed notify trigger).
+	//
+	// PR-D code review (PR #959 candidate 6): the v1 unbounded
+	// shape would issue N UPDATEs per tick after a CA outage
+	// landed N>1000 surfaces in the renewal window. The
+	// limit-and-cursor shape bounds each tick to a hard
+	// cap (api.CertRenewTickBatchLimit, 1k) and the renewer
+	// keeps calling until fewer than `limit` rows return.
+	// afterCertNotAfter + afterID are the cursor (pass zero
+	// values on the first page).
+	ListTenantSurfacesNearingExpiry(ctx context.Context, cutoff time.Time, limit int, afterCertNotAfter time.Time, afterID string) ([]TenantSurface, error)
+	// TouchTenantSurfaceForRenewal bumps updated_at on the
+	// surface row so the tenant_surface_changed notify trigger
+	// fires; the pg_notify subscriber routes the bare surface
+	// UUID back through CertIssuer.RequestCertForSurface which
+	// re-runs the full state machine. The renewer doesn't need
+	// its own write path — it rides the existing pipeline so
+	// the in-flight state machine (none → pending → issued)
+	// stays the source of truth.
+	TouchTenantSurfaceForRenewal(ctx context.Context, id string) error
 	UpdateTenantSurfaceStatus(ctx context.Context, id string, status SurfaceStatus) error
 	UpdateTenantSurfaceCert(ctx context.Context, in UpdateSurfaceCertParams) error
 	// DeleteTenantSurface soft-deletes: status flips to 'deleted',
@@ -3173,9 +3255,11 @@ type Store interface {
 	// holds the claim (state='pending' with matching claimed_by) is
 	// allowed to complete; a foreign caller sees 0 rows updated
 	// and gets ErrClaimLost so the meterd can decide whether to
-	// alert or silently drop. mb_seconds is stamped on the row for
-	// ops debugging (the merchant dashboard already has the value
-	// in CustomData).
+	// alert or silently drop. mb_seconds is stamped on the row
+	// (column pushed_mb_seconds, added in migration 00280) so ops
+	// can read the wire value directly; the Paddle merchant
+	// dashboard's line item Quantity + CustomData["mb_seconds"]
+	// carry the same value at the merchant side.
 	CompletePaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, mbSeconds int64) error
 	// ReapStalePaddleOverageClaims resets pending rows whose
 	// claimed_at is older than olderThan so the next push tick can
@@ -3772,13 +3856,19 @@ type Store interface {
 
 	// InsertDataUpstream writes one data_upstreams row via the
 	// dedupe-merge ON CONFLICT tripwire on
-	// data_upstreams_dedupe_uniq (PR-B env-classifier).
+	// data_upstreams_dedupe_uniq (PR-B env-classifier). ADR-098
+	// amendment (issue #954) widens the dedupe key to include
+	// deployment_scope; the caller threads
+	// arg.DeploymentScope alongside scope, kind, host, port.
 	InsertDataUpstream(ctx context.Context, arg sqlc.InsertDataUpstreamParams) (uuid.UUID, error)
 
 	// ListDataUpstreamsByApp backs
 	// GET /v1/apps/{slug}/upstreams (PR-B). Cursor-paginated via
 	// (created_at, id); limit MUST be pre-clamped to
-	// api.DataUpstreamsListMaxLimit by the handler.
+	// api.DataUpstreamsListMaxLimit by the handler. ADR-098
+	// amendment (issue #954) adds an optional
+	// arg.CursorDeploymentScope server-side filter (empty =
+	// "return all deployments"; non-empty = "one deployment").
 	ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error)
 
 	// ListAllAppDataUpstreams backs

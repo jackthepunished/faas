@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/caddyserver/certmagic"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -238,11 +239,90 @@ func routeMetricsEnabledFromEnv() bool {
 //
 // metrics may be nil (tests + the pre-construction window before
 // deps.metrics is built); ObserveTenantSurfaceCert guards.
-func certIssuerFor(store state.Store, metrics *gateway.Metrics, enabled bool) gateway.CertIssuer {
+//
+// PR-D cert-engine-real-mint code review (PR #959 candidate 2):
+// production must wire a real *LetsEncryptCertIssuer when the
+// engine env config is present (FAAS_TLS_STORAGE_DIR +
+// FAAS_TLS_CONTACT_EMAIL + FAAS_TLS_DNS_PROVIDER). Without
+// this, every tenant surface lands cert_state=failed with
+// "cert engine unwired" last_error. The factory fallback
+// mirrors NewCertMagicConfig (tls_wire.go:152-172) so the
+// per-host engine and the wildcard path share the same DNS
+// dispatch. The token source is supplied via dnsTokenLookup
+// (cmd/apid/secrets.go or env-only fallback) so the operator
+// stored in a sealed secret per the §11 secrets-at-rest rule.
+func certIssuerFor(store state.Store, metrics *gateway.Metrics, enabled bool, dnsTokenLookup func(provider string) string, log *slog.Logger) gateway.CertIssuer {
 	if !enabled {
 		return nil
 	}
-	return gateway.NewTenantSurfaceCertIssuer(store, metrics)
+	// Wire the LetsEncryptCertIssuer when the env config is
+	// present. The wrapper's nil-issuer degradation is the
+	// fail-closed path when the operator hasn't finished the
+	// cert-engine rollout yet (PR-C dark-launch shape).
+	var le *gateway.LetsEncryptCertIssuer
+	if api.CertEngineWired() {
+		provider := api.CertEngineDNSProvider()
+		token := ""
+		if dnsTokenLookup != nil {
+			token = dnsTokenLookup(provider)
+		}
+		var dnsProvider certmagic.DNSProvider
+		switch provider {
+		case api.DNSProviderHetzner:
+			dnsProvider = gateway.NewHetznerDNSProvider(token, "")
+		case api.DNSProviderCloudflare:
+			dnsProvider = gateway.NewCloudflareDNSProvider(token, "")
+		}
+		// dnsProvider may be nil (operator hasn't supplied a
+		// token, or the provider doesn't exist yet). The
+		// wrapper's nil-issuer degradation handles the
+		// "engine wired but DNS provider missing" case the
+		// same way as the "engine not wired" case: log a
+		// clear last_error and keep the state machine
+		// moving.
+		if dnsProvider != nil {
+			built, err := gateway.NewLetsEncryptCertIssuer(
+				api.CertEngineStorageDir(),
+				api.CertEngineContactEmail(),
+				api.CertEngineStaging(),
+				dnsProvider,
+				log,
+			)
+			if err != nil {
+				log.Warn("cert engine: LetsEncryptCertIssuer construction failed; falling back to nil-issuer degradation", "err", err)
+			} else {
+				le = built
+				log.Info("cert engine: wired", "provider", provider, "staging", api.CertEngineStaging(), "storage_dir", api.CertEngineStorageDir())
+			}
+		} else {
+			log.Warn("cert engine: DNS provider missing; falling back to nil-issuer degradation", "provider", provider)
+		}
+	} else {
+		log.Info("cert engine: not wired (FAAS_TLS_STORAGE_DIR + FAAS_TLS_CONTACT_EMAIL unset); nil-issuer degradation engaged")
+	}
+	// The auditor param is nil today (PR-D commit 6): wiring
+	// a real *audit.Auditor requires the gatewayd-internal
+	// audit seam that lives outside the scope of this PR
+	// (cmd/apid/audit_subscriber.go handles apid-side audit;
+	// gatewayd-internal has no equivalent writer yet). The
+	// wrapper's emitCertTransition helper is nil-safe so the
+	// state-machine audit calls degrade cleanly until the
+	// gatewayd-internal audit seam lands.
+	return gateway.NewTenantSurfaceCertIssuer(store, metrics, le, nil)
+}
+
+// dnsTokenLookupFromEnv resolves the DNS provider's API token
+// from the FAAS_TLS_DNS_TOKEN environment variable. The token
+// is sealed at rest by the operator's host.age bundle (CLAUDE.md
+// §11 secret-at-rest rule); the daemon reads the unsealed form
+// from env after the systemd LoadCredential / ansible decryption
+// step. The sealed-at-rest refactor (gap G2, spec §17) widens
+// this to a sealed-secret lookup once the gatewayd-internal
+// audit seam lands (the follow-up ships the same secretbox
+// unseal closure cmd/gatewayd-public/main.go uses for the
+// wildcard TLS path).
+func dnsTokenLookupFromEnv(provider string) string {
+	return strings.TrimSpace(os.Getenv("FAAS_TLS_DNS_TOKEN"))
 }
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
@@ -698,7 +778,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// (after deps.metrics is built) so the
 		// gateway_tenant_surface_cert_total counter ticks
 		// from boot.
-		WithCertIssuer(certIssuerFor(pgStore, nil, api.TenantSurfacesEnabled()))
+		WithCertIssuer(certIssuerFor(pgStore, nil, api.TenantSurfacesEnabled(), dnsTokenLookupFromEnv, log))
 
 	// Phase 2 / Gate A: gate the resolveSched legacy fallback on the
 	// active fleet. Single-box posture (only default-local active)
@@ -828,7 +908,23 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// guards on nil but skipping the increment in production
 	// made the dashboard panel observability-dead. The feature
 	// flag is the same env var (PR-C dark-launch switch).
-	backend.WithCertIssuer(certIssuerFor(pgStore, deps.metrics, api.TenantSurfacesEnabled()))
+	backend.WithCertIssuer(certIssuerFor(pgStore, deps.metrics, api.TenantSurfacesEnabled(), dnsTokenLookupFromEnv, log))
+
+	// PR-D commit 3: cert-renewer goroutine. Periodically
+	// re-mints tenant surfaces whose cert_not_after < now +
+	// CertRenewBeforeNotAfterDays. The renewer rides the
+	// existing pg_notify pipeline (TouchTenantSurfaceForRenewal
+	// bumps updated_at → trigger fires → subscriber dispatches
+	// to CertIssuer.RequestCertForSurface), so the state
+	// machine stays single-writer.
+	//
+	// Skipped when the tenant-surfaces feature flag is off —
+	// the renewer would loop on a closed cartesian and emit
+	// noisy "0 due" log lines every tick.
+	if api.TenantSurfacesEnabled() {
+		renewer := gateway.NewSurfaceCertRenewer(pgStore, log)
+		go renewer.Run(ctx)
+	}
 
 	// Forward the operator-configured apid loopback URL through the
 	// test seam so runWithDeps can stay TOML-free (issue #85).

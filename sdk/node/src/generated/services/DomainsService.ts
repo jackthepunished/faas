@@ -66,6 +66,39 @@ export class DomainsService {
     });
   }
   /**
+   * Show a custom domain's cert details (issue
+   * Returns the durable domain row + the live cert chain
+   * (NotAfter, SANs) by dialing port-443 and reading the leaf
+   * cert. Used by `gregale domains show <domain>`.
+   *
+   * @returns CustomDomainResponse The domain row + cert details.
+   * @throws ApiError
+   */
+  public static getDomain({
+    domain,
+  }: {
+    /**
+     * The custom domain string (e.g. `app.example.com`).
+     */
+    domain: string,
+  }): CancelablePromise<CustomDomainResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/domains/{domain}',
+      path: {
+        'domain': domain,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
    * Remove a custom domain binding.
    * @returns void
    * @throws ApiError
@@ -87,6 +120,55 @@ export class DomainsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Re-verify a domain's DNS + cert (issue
+   * Re-runs the DNS verifier + cert dial; returns the canonical
+   * CustomDomainResponse. Used by `gregale domains verify
+   * <domain>`. Idempotent: POSTing twice does not change the
+   * durable verification state.
+   *
+   * @returns CustomDomainResponse The row + cert details. `cert_not_after` / `cert_sans` populated when the cert dial succeeds.
+   * @throws ApiError
+   */
+  public static verifyDomain({
+    domain,
+    idempotencyKey,
+  }: {
+    /**
+     * The custom domain to re-verify (e.g. `app.example.com`). The same shape as the GET path; verify walks DNS + cert while show returns the durable row.
+     */
+    domain: string,
+    /**
+     * Idempotency key for the POST. Stored for 24h. On replay the server
+     * returns the original response with `Idempotent-Replayed: true`.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<CustomDomainResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/domains/{domain}/verify',
+      path: {
+        'domain': domain,
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        422: `code: domain_verification_failed | domain_cert_not_issued.
+        DNS walk found a missing/mismatched TXT record, or the
+        port-443 cert is a CDN cert whose SANs do not include
+        the customer's domain.
+        `,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

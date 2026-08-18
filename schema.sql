@@ -135,9 +135,10 @@ CREATE FUNCTION public.data_upstreams_notify() RETURNS trigger
 BEGIN
     PERFORM pg_notify(
         'data_upstreams_changed',
-        format('%s|%s|%s|%s|%s|%s',
+        format('%s|%s|%s|%s|%s|%s|%s',
             COALESCE(NEW.app_id, OLD.app_id)::text,
             COALESCE(NEW.scope, OLD.scope),
+            COALESCE(NEW.deployment_scope, OLD.deployment_scope),
             COALESCE(NEW.kind, OLD.kind),
             COALESCE(NEW.host, OLD.host),
             COALESCE(NEW.port, OLD.port)::text,
@@ -218,6 +219,8 @@ begin
             'policy_id', new.id,
             'public_iface', new.public_iface,
             'masquerade_cidr', new.masquerade_cidr,
+            'overlay_exceptions', new.overlay_exceptions,
+            'danger_accept_rfc1918_lateral_movement', new.danger_accept_rfc1918_lateral_movement,
             'changed_at', new.changed_at
         )::text
     );
@@ -977,6 +980,12 @@ CREATE TABLE public.compute_nodes (
     vcpu_budget integer DEFAULT 160 NOT NULL,
     public_ip inet,
     public_ip_set_at timestamp with time zone,
+    release_id text,
+    manifest_hash text,
+    host_certificate text,
+    cert_fingerprint text,
+    role text,
+    generation integer,
     CONSTRAINT compute_nodes_admission_ceiling_mb_check CHECK ((admission_ceiling_mb > 0)),
     CONSTRAINT compute_nodes_max_concurrency_check CHECK ((max_concurrency > 0)),
     CONSTRAINT compute_nodes_mem_mb_check CHECK ((mem_mb > 0)),
@@ -1000,6 +1009,48 @@ COMMENT ON COLUMN public.compute_nodes.region IS 'Locality label for the chooser
 --
 
 COMMENT ON COLUMN public.compute_nodes.zone IS 'Finer locality inside region. Currently informational; nullable. ADR-025.';
+
+
+--
+-- Name: COLUMN compute_nodes.release_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.release_id IS 'release_bundles.git_sha this node claims membership in (PR-3a). NULL = pre-bundle row. Populated by PR-3 release install + PR-2 renderer.';
+
+
+--
+-- Name: COLUMN compute_nodes.manifest_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.manifest_hash IS 'sha256:<64hex> hash of the manifest the PR-2 renderer materialized on this node (PR-3a). NULL = pre-manifest row. Compared against release_bundles.manifest_hash by PR-4 doctor.';
+
+
+--
+-- Name: COLUMN compute_nodes.host_certificate; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.host_certificate IS 'PEM-encoded leaf certificate for this node (PR-3a). NULL = pre-PR-X or pre-cmd/hostage-gen row. Doctor reads to verify cert on disk matches cert_fingerprint.';
+
+
+--
+-- Name: COLUMN compute_nodes.cert_fingerprint; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.cert_fingerprint IS 'sha256:<64hex> fingerprint of host_certificate (PR-3a). NULL until secrets init (PR-X) or cmd/hostage-gen stamps it. PR-3 bundle install + PR-4 doctor compare against pkg/pki.LoadCertificateFingerprint at mTLS handshake time.';
+
+
+--
+-- Name: COLUMN compute_nodes.role; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.role IS 'per-node role label: control-plane | compute-node (PR-3a). Populated from manifest.fleet.hosts[].role by PR-2 renderer. NULL = pre-manifest row.';
+
+
+--
+-- Name: COLUMN compute_nodes.generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.generation IS 'monotonic counter bumped by PR-4 doctor on per-node inconsistency detection (PR-3a). Default 0; never decreases.';
 
 
 --
@@ -1130,7 +1181,9 @@ CREATE TABLE public.data_upstreams (
     last_probed_at timestamp with time zone,
     last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    deployment_scope text DEFAULT 'default'::text NOT NULL,
     CONSTRAINT data_upstreams_declared_region_check CHECK (((declared_region IS NULL) OR (declared_region ~ '^[a-z0-9_-]{1,32}$'::text))),
+    CONSTRAINT data_upstreams_deployment_scope_shape CHECK ((deployment_scope ~ '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'::text)),
     CONSTRAINT data_upstreams_host_check CHECK (((host ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'::text) AND (host !~ '^[0-9]+(\.[0-9]+)+$'::text) AND ((length(host) >= 1) AND (length(host) <= 253)))),
     CONSTRAINT data_upstreams_host_redacted_hash_check CHECK (((host_redacted_hash ~ '^[a-f0-9]{64}$'::text) OR (host_redacted_hash = '__unsalted__'::text))),
     CONSTRAINT data_upstreams_kind_check CHECK ((kind = ANY (ARRAY['postgres'::text, 'redis'::text, 'mongo'::text, 'cassandra'::text, 'clickhouse'::text, 'elasticsearch'::text, 'opensearch'::text, 'rabbitmq'::text, 'kafka'::text, 'nats'::text, 'minio'::text, 'memcached'::text, 'etcd'::text, 's3'::text, 'https_api'::text]))),
@@ -1260,7 +1313,7 @@ CREATE TABLE public.edge_rules (
     action jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT edge_rules_kind_check CHECK ((kind = ANY (ARRAY['route'::text, 'rewrite'::text, 'redirect'::text, 'headers'::text, 'cors'::text, 'jwt'::text, 'ip'::text, 'validate'::text, 'limit'::text, 'geo'::text, 'maintenance'::text]))),
+CONSTRAINT edge_rules_kind_check CHECK ((kind = ANY (ARRAY['route'::text, 'rewrite'::text, 'redirect'::text, 'headers'::text, 'cors'::text, 'jwt'::text, 'ip'::text, 'validate'::text, 'limit'::text, 'geo'::text, 'maintenance'::text, 'throttle'::text]))),
     CONSTRAINT edge_rules_priority_check CHECK (((priority >= 0) AND (priority <= 10000)))
 );
 
@@ -1274,6 +1327,9 @@ CREATE TABLE public.egress_policy (
     public_iface text NOT NULL,
     masquerade_cidr text NOT NULL,
     changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    overlay_exceptions text[] DEFAULT '{}'::text[] NOT NULL,
+    danger_accept_rfc1918_lateral_movement boolean DEFAULT false NOT NULL,
+    CONSTRAINT egress_policy_pair_check CHECK (((NOT danger_accept_rfc1918_lateral_movement) OR (COALESCE(array_length(overlay_exceptions, 1), 0) > 0))),
     CONSTRAINT egress_policy_singleton CHECK ((id = 'singleton'::text))
 );
 
@@ -1619,6 +1675,41 @@ CREATE TABLE public.oauth_links (
 
 
 --
+-- Name: oidc_exchanged_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.oidc_exchanged_tokens (
+    id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    token_hash bytea NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    issuer_url text NOT NULL,
+    subject text NOT NULL,
+    audience text[] NOT NULL,
+    jti text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: oidc_trust_policies; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.oidc_trust_policies (
+    account_id uuid NOT NULL,
+    issuer_url text NOT NULL,
+    jwks_url text NOT NULL,
+    audience text[] NOT NULL,
+    subject_pattern text,
+    algorithms text[] NOT NULL,
+    required_claims jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    audit_login text NOT NULL
+);
+
+
+--
 -- Name: org_invitations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1692,6 +1783,7 @@ CREATE TABLE public.paddle_overage_dedupe (
     claimed_at timestamp with time zone,
     claimed_by text,
     org_id uuid,
+    pushed_mb_seconds bigint,
     CONSTRAINT paddle_overage_dedupe_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'completed'::text])))
 );
 
@@ -1741,6 +1833,22 @@ CREATE TABLE public.recent_build_claims (
     claimed_at timestamp with time zone DEFAULT now() NOT NULL,
     build_id uuid NOT NULL,
     org_id uuid
+);
+
+
+--
+-- Name: release_bundles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.release_bundles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    git_sha text NOT NULL,
+    manifest_hash text NOT NULL,
+    daemon_hashes jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    applied_at timestamp with time zone,
+    CONSTRAINT release_bundles_git_sha_shape CHECK ((git_sha ~ '^[a-f0-9]{40}$'::text)),
+    CONSTRAINT release_bundles_manifest_shape CHECK ((manifest_hash ~ '^sha256:[a-f0-9]{64}$'::text))
 );
 
 
@@ -1859,7 +1967,7 @@ CREATE TABLE public.tenant_surfaces (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT tenant_surfaces_app_or_not_chk CHECK ((app_id IS NOT NULL)),
-    CONSTRAINT tenant_surfaces_cert_kind_check CHECK ((cert_kind = ANY (ARRAY['per_host_san'::text, 'shared_wildcard'::text]))),
+CONSTRAINT tenant_surfaces_cert_kind_check CHECK ((cert_kind = ANY (ARRAY['per_host_san'::text, 'shared_wildcard'::text, 'per_host'::text]))),
     CONSTRAINT tenant_surfaces_cert_state_check CHECK ((cert_state = ANY (ARRAY['none'::text, 'pending'::text, 'issued'::text, 'failed'::text]))),
     CONSTRAINT tenant_surfaces_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'suspended'::text, 'deleted'::text])))
 );
@@ -2597,6 +2705,30 @@ ALTER TABLE ONLY public.oauth_links
 
 
 --
+-- Name: oidc_exchanged_tokens oidc_exchanged_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_exchanged_tokens
+    ADD CONSTRAINT oidc_exchanged_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: oidc_exchanged_tokens oidc_exchanged_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_exchanged_tokens
+    ADD CONSTRAINT oidc_exchanged_tokens_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: oidc_trust_policies oidc_trust_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_trust_policies
+    ADD CONSTRAINT oidc_trust_policies_pkey PRIMARY KEY (account_id, issuer_url);
+
+
+--
 -- Name: org_invitations org_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2658,6 +2790,14 @@ ALTER TABLE ONLY public.projects
 
 ALTER TABLE ONLY public.projects
     ADD CONSTRAINT projects_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: release_bundles release_bundles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.release_bundles
+    ADD CONSTRAINT release_bundles_pkey PRIMARY KEY (id);
 
 
 --
@@ -3303,7 +3443,7 @@ CREATE INDEX data_upstreams_app_created_idx ON public.data_upstreams USING btree
 -- Name: data_upstreams_dedupe_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX data_upstreams_dedupe_uniq ON public.data_upstreams USING btree (app_id, scope, kind, host, port);
+CREATE UNIQUE INDEX data_upstreams_dedupe_uniq ON public.data_upstreams USING btree (app_id, scope, deployment_scope, kind, host, port);
 
 
 --
@@ -3657,6 +3797,13 @@ CREATE INDEX oauth_links_account_idx ON public.oauth_links USING btree (account_
 
 
 --
+-- Name: oidc_exchanged_tokens_expires_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX oidc_exchanged_tokens_expires_at_idx ON public.oidc_exchanged_tokens USING btree (expires_at);
+
+
+--
 -- Name: org_invitations_email_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3773,6 +3920,20 @@ CREATE INDEX recent_build_claims_claimed_at_idx ON public.recent_build_claims US
 --
 
 CREATE INDEX recent_build_claims_org_id_idx ON public.recent_build_claims USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
+-- Name: release_bundles_applied_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX release_bundles_applied_at_idx ON public.release_bundles USING btree (applied_at) WHERE (applied_at IS NOT NULL);
+
+
+--
+-- Name: release_bundles_git_sha_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX release_bundles_git_sha_idx ON public.release_bundles USING btree (git_sha);
 
 
 --
@@ -4749,6 +4910,22 @@ ALTER TABLE ONLY public.login_tokens
 
 ALTER TABLE ONLY public.oauth_links
     ADD CONSTRAINT oauth_links_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: oidc_exchanged_tokens oidc_exchanged_tokens_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_exchanged_tokens
+    ADD CONSTRAINT oidc_exchanged_tokens_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: oidc_trust_policies oidc_trust_policies_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_trust_policies
+    ADD CONSTRAINT oidc_trust_policies_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
 
 
 --

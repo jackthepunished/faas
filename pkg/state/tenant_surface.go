@@ -37,6 +37,16 @@ type CertKind string
 const (
 	CertKindPerHostSAN     CertKind = "per_host_san"
 	CertKindSharedWildcard CertKind = "shared_wildcard"
+	// CertKindPerHost is the >MaxSANPerCert fallback shape
+	// (ADR-100 §"Cert engine shape" line 76). One cert per
+	// hostname in the verified set, no SAN bundling. The
+	// wrapper at pkg/gateway/cert_issuer_tenant_surface.go
+	// rejects this value today with a clear
+	// "per-host bundler ships in follow-up ADR-114" last_error;
+	// the constant lands in PR-D commit 5 so the schema
+	// accepts it (migration 00284) and a follow-up ADR doesn't
+	// need a schema-touching migration.
+	CertKindPerHost CertKind = "per_host"
 )
 
 // SurfaceStatus — the lifecycle. Soft-delete only; pk stays
@@ -73,7 +83,7 @@ const (
 // unknown kind.
 func (k CertKind) Valid() bool {
 	switch k {
-	case CertKindPerHostSAN, CertKindSharedWildcard:
+	case CertKindPerHostSAN, CertKindSharedWildcard, CertKindPerHost:
 		return true
 	}
 	return false
@@ -223,3 +233,16 @@ var ErrTenantSurfacesNotAllowed = errors.New("state: tenant surfaces not allowed
 // in the set has VerifiedAt zero). Lives in pkg/state so the engine
 // and the store agree on the sentinel identity.
 var ErrTenantHostnameNotVerified = errors.New("state: tenant surface has no verified hostnames")
+
+// ErrUnsupportedCertKind — typed sentinel returned when the
+// cert_kind value on a surface is recognised by the schema
+// (CertKind.Valid() returns true) but the issuer refuses to
+// mint today. PR-D commit 5: the wrapper at
+// pkg/gateway/cert_issuer_tenant_surface.go returns this for
+// shared_wildcard (customer-zone DNS-01 deferred to ADR-114)
+// and per_host (>MaxSANPerCert bundler deferred to ADR-114).
+// Lives in pkg/state so the apid handler can errors.As this
+// sentinel uniformly when the cert engine logs it back through
+// cert_last_error — same shape as ErrTenantHostnameNotVerified
+// and ErrTenantSurfacesNotAllowed.
+var ErrUnsupportedCertKind = errors.New("state: cert_kind not mintable in v1")

@@ -11,6 +11,7 @@ import type { DeploymentResponse } from '../models/DeploymentResponse.js';
 import type { ScanResult } from '../models/ScanResult.js';
 import type { SecretScanResult } from '../models/SecretScanResult.js';
 import type { SourceRefDeployRequest } from '../models/SourceRefDeployRequest.js';
+import type { SourceTarballDeployRequest } from '../models/SourceTarballDeployRequest.js';
 import type { UpdateDeploymentTrafficRequest } from '../models/UpdateDeploymentTrafficRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
@@ -133,6 +134,80 @@ export class DeploymentsService {
         `,
         503: `githubd unreachable or source-ref tarball fetch failed
         (code: source_ref_unavailable). Retry in ~30s.
+        `,
+      },
+    });
+  }
+  /**
+   * Create a deployment from a CLI-uploaded local tarball (zero-config).
+   * Zero-config deploy path (issue #961 / Mega-A PR-1, ADR-115).
+   * The CLI uploads a gzipped tar via the `tarball` form field and
+   * an optional informational `{repo, ref}` JSON sidecar. The CLI
+   * binary is the trust root: apid does NOT consult
+   * `github_installations` and does NOT attempt a server-side git
+   * fetch.
+   *
+   * Distinct from the source-ref path
+   * (`POST /v1/apps/{slug}/deployments/source-ref`, ADR-092) which
+   * resolves the GitHub install and pins the tarball to a 40-char
+   * SHA. The source-ref handler is unchanged; this is a parallel
+   * trust path for first-deploy customers without the GitHub App
+   * installed.
+   *
+   * Wire shape:
+   * multipart/form-data with two fields:
+   * - `tarball` (required): the gzipped tar, capped at the
+   * per-plan `SourceTarballMaxMB`.
+   * - `sidecar` (optional): JSON `{repo, ref}` recorded on
+   * the build row for provenance; the build pipeline does
+   * NOT use it to fetch upstream.
+   *
+   * Audit kind: `deploy.local_tarball` (distinct from
+   * `deploy.source_ref`).
+   *
+   * @returns DeploymentResponse The local-tarball deployment whose build has been accepted and queued.
+   * @throws ApiError
+   */
+  public static createDeploymentFromSourceTarball({
+    slug,
+    formData,
+    idempotencyKey,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    formData: {
+      tarball: Blob;
+      sidecar?: SourceTarballDeployRequest;
+    },
+    /**
+     * Idempotency key for the POST. Stored for 24h. On replay the server
+     * returns the original response with `Idempotent-Replayed: true`.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<DeploymentResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/deployments/source-tarball',
+      path: {
+        'slug': slug,
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      formData: formData,
+      mediaType: 'multipart/form-data',
+      errors: {
+        400: `code: validation_failed. Missing \`tarball\` field, malformed
+        sidecar JSON, or invalid tarball shape.
+        `,
+        401: `code: unauthorized`,
+        413: `code: source_too_large`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
       },
     });

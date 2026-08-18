@@ -253,6 +253,236 @@ func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
 // The audit `key.expired` row is emitted by the auth middleware (which
 // has the Auditor dependency), not here. The store is
 // dependency-free.
+// AuthenticateOIDCBearer resolves an OIDC-derived short-lived bearer
+// (issue #270 / ADR-101). Hash lookup hits
+// oidc_exchanged_tokens.token_hash (UNIQUE index); rows past
+// ExpiresAt return ErrNotFound (the 5-min TTL is the natural expiry
+// path; no lazy-flip required). Returns the Account + a synthetic
+// APIKey projection with Scopes=["deploy:write"] and Status="active"
+// so the principal stamp + downstream requireScope chain works
+// unchanged.
+//
+// The SQL lands when migrations 00265/00266 merge. Until then the
+// method returns ErrNotFound unconditionally (the table doesn't
+// exist yet — the integration test is the gate, not unit tests
+// against PgStore).
+func (s *PgStore) AuthenticateOIDCBearer(ctx context.Context, hash []byte) (Account, APIKey, error) {
+	q := sqlc.New()
+	row, err := q.GetOIDCExchangedTokenByHash(ctx, s.pool, hash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Account{}, APIKey{}, ErrNotFound
+		}
+		return Account{}, APIKey{}, err
+	}
+	acct, err := s.AccountByID(ctx, uuidFromPgtype(row.AccountID).String())
+	if err != nil {
+		// FK CASCADE means a token row cannot outlive its account
+		// in steady state; if we hit ErrNotFound here the cascade
+		// is racing a delete — treat the bearer as gone.
+		return Account{}, APIKey{}, err
+	}
+	token := OIDCExchangedToken{
+		ID:        uuidFromPgtype(row.ID).String(),
+		AccountID: uuidFromPgtype(row.AccountID).String(),
+		TokenHash: row.TokenHash,
+		ExpiresAt: timeFromPgtype(row.ExpiresAt),
+		IssuerURL: row.IssuerUrl,
+		Subject:   row.Subject,
+		Audience:  row.Audience,
+		JTI:       row.Jti,
+		CreatedAt: timeFromPgtype(row.CreatedAt),
+	}
+	return acct, token.ToAPIKey(), nil
+}
+
+// AccountByOIDCSubject resolves an OIDC subject to the platform
+// account it's bound to. Used by pkg/oidc/handler.go step 4 to
+// determine the (account_id, issuer_url) trust-policy row.
+//
+// The SQL lands when migration 00265 merges. Until then the method
+// returns ErrNotFound unconditionally.
+func (s *PgStore) AccountByOIDCSubject(ctx context.Context, issuerURL, subject string) (Account, error) {
+	q := sqlc.New()
+	row, err := q.AccountByOIDCIssuerSubject(ctx, s.pool, sqlc.AccountByOIDCIssuerSubjectParams{
+		IssuerUrl:      issuerURL,
+		SubjectPattern: pgtype.Text{String: subject, Valid: subject != ""},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Account{}, ErrNotFound
+		}
+		return Account{}, err
+	}
+	return s.AccountByID(ctx, uuidFromPgtype(row.ID).String())
+}
+
+// UpsertOIDCTrustPolicy is the per-(account, issuer) insert-or-update
+// path (issue #270 / ADR-101). See Store.UpsertOIDCTrustPolicy for
+// the contract.
+//
+// The SQL lands when migration 00265 merges. Until then the method
+// returns ErrNotFound unconditionally.
+func (s *PgStore) UpsertOIDCTrustPolicy(ctx context.Context, p *OIDCTrustPolicy) (*OIDCTrustPolicy, error) {
+	if p.AccountID == "" || p.IssuerURL == "" {
+		return nil, ErrNotFound
+	}
+	accountUUID, err := uuid.Parse(p.AccountID)
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	claims := json.RawMessage(`{}`)
+	if len(p.RequiredClaims) > 0 {
+		buf, marshalErr := json.Marshal(p.RequiredClaims)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		claims = buf
+	}
+	q := sqlc.New()
+	row, err := q.UpsertOIDCTrustPolicy(ctx, s.pool, sqlc.UpsertOIDCTrustPolicyParams{
+		AccountID:      pgtypeFromUUID(accountUUID),
+		IssuerUrl:      p.IssuerURL,
+		JwksUrl:        p.JWKSURL,
+		Audience:       p.Audience,
+		SubjectPattern: pgtype.Text{String: p.SubjectPattern, Valid: p.SubjectPattern != ""},
+		Algorithms:     p.Algorithms,
+		RequiredClaims: claims,
+		AuditLogin:     p.AuditLogin,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return trustPolicyFromRow(
+		row.AccountID, row.IssuerUrl, row.JwksUrl, row.Audience,
+		row.SubjectPattern, row.Algorithms, row.RequiredClaims,
+		row.CreatedAt, row.UpdatedAt, row.AuditLogin,
+	), nil
+}
+
+// GetOIDCTrustPolicy is the (account_id, issuer_url) lookup.
+// See Store.GetOIDCTrustPolicy for the contract.
+//
+// The SQL lands when migration 00265 merges. Stub for now.
+func (s *PgStore) GetOIDCTrustPolicy(ctx context.Context, accountID, issuerURL string) (*OIDCTrustPolicy, error) {
+	accountUUID, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	q := sqlc.New()
+	row, err := q.GetOIDCTrustPolicy(ctx, s.pool, sqlc.GetOIDCTrustPolicyParams{
+		AccountID: pgtypeFromUUID(accountUUID),
+		IssuerUrl: issuerURL,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return trustPolicyFromRow(
+		row.AccountID, row.IssuerUrl, row.JwksUrl, row.Audience,
+		row.SubjectPattern, row.Algorithms, row.RequiredClaims,
+		row.CreatedAt, row.UpdatedAt, row.AuditLogin,
+	), nil
+}
+
+// ListOIDCTrustPoliciesForAccount returns every trust policy the
+// account owns. See Store.ListOIDCTrustPoliciesForAccount for the
+// contract.
+//
+// The SQL lands when migration 00265 merges. Stub for now.
+func (s *PgStore) ListOIDCTrustPoliciesForAccount(ctx context.Context, accountID string) ([]*OIDCTrustPolicy, error) {
+	accountUUID, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	q := sqlc.New()
+	rows, err := q.ListOIDCTrustPoliciesForAccount(ctx, s.pool, pgtypeFromUUID(accountUUID))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*OIDCTrustPolicy, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, trustPolicyFromRow(
+			r.AccountID, r.IssuerUrl, r.JwksUrl, r.Audience,
+			r.SubjectPattern, r.Algorithms, r.RequiredClaims,
+			r.CreatedAt, r.UpdatedAt, r.AuditLogin,
+		))
+	}
+	return out, nil
+}
+
+// InsertOIDCExchangedToken stores a fresh exchanged-token row and
+// returns the server-minted row id (gen_random_uuid at the SQL
+// layer). The id is the audit-correlation key — pkg/oidc/handler.go
+// echoes it in the response and stamps it on the audit row so a
+// customer can correlate "which fp_oidc_<…> bearer did CI ship?"
+// to "which row in oidc_exchanged_tokens".
+//
+// Returns ErrNotFound when the inputs are empty so the handler can
+// surface a 500 cleanly without leaking the underlying SQL error
+// to the wire.
+func (s *PgStore) InsertOIDCExchangedToken(ctx context.Context, t *OIDCExchangedToken) (string, error) {
+	if t.AccountID == "" || len(t.TokenHash) == 0 || t.ExpiresAt.IsZero() {
+		return "", ErrNotFound
+	}
+	accountUUID, err := uuid.Parse(t.AccountID)
+	if err != nil {
+		return "", ErrNotFound
+	}
+	q := sqlc.New()
+	row, err := q.InsertOIDCExchangedToken(ctx, s.pool, sqlc.InsertOIDCExchangedTokenParams{
+		AccountID: pgtypeFromUUID(accountUUID),
+		TokenHash: t.TokenHash,
+		ExpiresAt: pgtypeFromTime(t.ExpiresAt),
+		IssuerUrl: t.IssuerURL,
+		Subject:   t.Subject,
+		Audience:  t.Audience,
+		Jti:       pgtype.Text{String: t.JTI, Valid: t.JTI != ""},
+	})
+	if err != nil {
+		return "", err
+	}
+	return uuidFromPgtype(row.ID).String(), nil
+}
+
+// GetOIDCExchangedTokenByHash returns the row whose TokenHash
+// equals the input. See Store.GetOIDCExchangedTokenByHash for the
+// contract.
+//
+// The SQL lands when migration 00266 merges. Stub for now.
+func (s *PgStore) GetOIDCExchangedTokenByHash(ctx context.Context, hash []byte) (*OIDCExchangedToken, error) {
+	if len(hash) == 0 {
+		return nil, ErrNotFound
+	}
+	q := sqlc.New()
+	row, err := q.GetOIDCExchangedTokenByHash(ctx, s.pool, hash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return oidcExchangedTokenFromRow(row), nil
+}
+
+// DeleteOIDCExchangedToken is the operator-driven revoke path.
+// See Store.DeleteOIDCExchangedToken for the contract.
+//
+// The SQL lands when migration 00266 merges. Stub for now.
+func (s *PgStore) DeleteOIDCExchangedToken(ctx context.Context, id string) error {
+	if id == "" {
+		return ErrNotFound
+	}
+	tokenUUID, err := uuid.Parse(id)
+	if err != nil {
+		return ErrNotFound
+	}
+	q := sqlc.New()
+	return q.DeleteOIDCExchangedToken(ctx, s.pool, pgtypeFromUUID(tokenUUID))
+}
+
 func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error) {
 	acct, err := s.AccountByKeyHash(ctx, hash)
 	if err != nil {
@@ -10845,19 +11075,23 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 // pod that holds the claim (state='pending') is allowed to flip; a
 // foreign caller (or one whose lease expired and the row was
 // reaped+re-claimed) sees 0 rows updated and gets ErrClaimLost so
-// the caller can decide how to react. mb_seconds is stamped for ops
-// debugging — the merchant dashboard line item already carries the
-// value in CustomData.
+// the caller can decide how to react. mb_seconds is stamped on the
+// row (column added in migration 00280) so ops reconciliation can
+// read the integer wire value directly without joining against
+// usage_minutes; the Paddle merchant dashboard's line item
+// Quantity + CustomData["mb_seconds"] carry the same value at the
+// merchant side.
 func (s *PgStore) CompletePaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
 	windowStart = windowStart.UTC()
 	tag, err := s.pool.Exec(ctx,
 		`update paddle_overage_dedupe
 		   set state = 'completed',
-		       pushed_at = now()
+		       pushed_at = now(),
+		       pushed_mb_seconds = $3
 		 where account_id = $1
 		   and window_start = $2
 		   and state = 'pending'`,
-		accountID, windowStart,
+		accountID, windowStart, mbSeconds,
 	)
 	if err != nil {
 		return fmt.Errorf("paddle dedupe complete acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
@@ -10869,22 +11103,24 @@ func (s *PgStore) CompletePaddleOverageWindow(ctx context.Context, accountID str
 		// skipped Claim). Either way, the terminal state is correct
 		// and we don't want to alert.
 		//
-		// We do still want to stamp the mb_seconds for ops — re-do
-		// the UPDATE without the state filter, gated on a NOT EXISTS
-		// precheck so we don't clobber a different pending claim.
+		// We do still want to stamp pushed_mb_seconds for ops — re-do
+		// the UPDATE without the state filter so the value is
+		// materialised even on a re-stamped row. Idempotent re-stamp
+		// is OK: the new value is the same integer the previous
+		// complete call carried.
 		if _, err := s.pool.Exec(ctx,
 			`update paddle_overage_dedupe
-			   set pushed_at = now()
+			   set pushed_at = now(),
+			       pushed_mb_seconds = $3
 			 where account_id = $1
 			   and window_start = $2
 			   and state = 'completed'`,
-			accountID, windowStart,
+			accountID, windowStart, mbSeconds,
 		); err != nil {
 			return fmt.Errorf("paddle dedupe complete refresh acct=%s window=%s: %w", accountID, windowStart.Format(time.RFC3339), err)
 		}
 		return nil
 	}
-	_ = mbSeconds // currently not stamped on the row; CustomData carries the merchant-side value
 	return nil
 }
 
@@ -15444,6 +15680,63 @@ func pgtypeFromTime(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: !t.IsZero()}
 }
 
+// oidcExchangedTokenFromRow maps a sqlc row to the state-side
+// OIDCExchangedToken. JTI is coalesced in the SQL so we never
+// surface SQL NULL as the empty string differently from a real
+// empty jti.
+func oidcExchangedTokenFromRow(row sqlc.GetOIDCExchangedTokenByHashRow) *OIDCExchangedToken {
+	return &OIDCExchangedToken{
+		ID:        uuidFromPgtype(row.ID).String(),
+		AccountID: uuidFromPgtype(row.AccountID).String(),
+		TokenHash: row.TokenHash,
+		ExpiresAt: timeFromPgtype(row.ExpiresAt),
+		IssuerURL: row.IssuerUrl,
+		Subject:   row.Subject,
+		Audience:  row.Audience,
+		JTI:       row.Jti,
+		CreatedAt: timeFromPgtype(row.CreatedAt),
+	}
+}
+
+// trustPolicyFromRow is the shared row→struct mapper for the three
+// list / get / upsert shapes. They all expose the same column set
+// (account_id, issuer_url, jwks_url, audience, subject_pattern,
+// algorithms, required_claims, created_at, updated_at,
+// audit_login) — the only differences are row-typed vs the slice
+// element type, which the caller bridges.
+func trustPolicyFromRow(
+	accountID pgtype.UUID,
+	issuerURL, jwksURL string,
+	audience []string,
+	subjectPattern string,
+	algorithms []string,
+	requiredClaims []byte,
+	createdAt, updatedAt pgtype.Timestamptz,
+	auditLogin string,
+) *OIDCTrustPolicy {
+	claims := map[string]string{}
+	if len(requiredClaims) > 0 {
+		// Tolerate malformed JSON by leaving claims empty rather
+		// than failing the lookup — the row came from the
+		// dashboard's refine form, which always writes valid
+		// JSON, so a parse failure indicates disk corruption,
+		// not bad input.
+		_ = json.Unmarshal(requiredClaims, &claims)
+	}
+	return &OIDCTrustPolicy{
+		AccountID:      uuidFromPgtype(accountID).String(),
+		IssuerURL:      issuerURL,
+		JWKSURL:        jwksURL,
+		Audience:       audience,
+		SubjectPattern: subjectPattern,
+		Algorithms:     algorithms,
+		RequiredClaims: claims,
+		CreatedAt:      timeFromPgtype(createdAt),
+		UpdatedAt:      timeFromPgtype(updatedAt),
+		AuditLogin:     auditLogin,
+	}
+}
+
 // IncrementAppError is the dedupe-merge INSERT called by the
 // apid gRPC server-side handler. The handler wraps N calls in
 // a single pgx transaction; this method runs ONE call at a
@@ -15653,11 +15946,16 @@ func (s *PgStore) ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataU
 			probedAt = &t
 		}
 		out = append(out, DataUpstream{
-			ID:               uuidFromPgtype(r.ID),
-			AccountID:        uuidFromPgtype(r.AccountID),
-			AppID:            uuidFromPgtype(r.AppID),
-			Source:           DataUpstreamSource(r.Source),
-			Scope:            r.Scope,
+			ID:        uuidFromPgtype(r.ID),
+			AccountID: uuidFromPgtype(r.AccountID),
+			AppID:     uuidFromPgtype(r.AppID),
+			Source:    DataUpstreamSource(r.Source),
+			Scope:     r.Scope,
+			// DeploymentScope widens the dedupe key in ADR-098
+			// amendment (issue #954). Read-through; the column is
+			// NOT NULL DEFAULT 'default' on the SQL side so the
+			// empty-string default stamp is what backfills land as.
+			DeploymentScope:  r.DeploymentScope,
 			Kind:             DataUpstreamKind(r.Kind),
 			Host:             r.Host,
 			Port:             int(r.Port),
@@ -15690,11 +15988,16 @@ func (s *PgStore) GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUp
 		probedAt = &t
 	}
 	return DataUpstream{
-		ID:               uuidFromPgtype(row.ID),
-		AccountID:        uuidFromPgtype(row.AccountID),
-		AppID:            uuidFromPgtype(row.AppID),
-		Source:           DataUpstreamSource(row.Source),
-		Scope:            row.Scope,
+		ID:        uuidFromPgtype(row.ID),
+		AccountID: uuidFromPgtype(row.AccountID),
+		AppID:     uuidFromPgtype(row.AppID),
+		Source:    DataUpstreamSource(row.Source),
+		Scope:     row.Scope,
+		// DeploymentScope widens the dedupe key in ADR-098
+		// amendment (issue #954). Single-row read so the
+		// DELETE-handler audit site can round-trip the value
+		// into the data_upstream.deleted payload.
+		DeploymentScope:  row.DeploymentScope,
 		Kind:             DataUpstreamKind(row.Kind),
 		Host:             row.Host,
 		Port:             int(row.Port),
@@ -16291,7 +16594,12 @@ type AppUpstreamProbeScore struct {
 }
 
 // ListAppUpstreamProbeScores (ADR-098 PR-D) returns the freshest
-// probe per (data_upstreams.id, region) for the given app.
+// probe per (data_upstreams.id, region) for the given app, scoped
+// to a single deployment. ADR-098 amendment (issue #954) widens
+// the dedupe key to (app_id, scope, deployment_scope, ...); the
+// chooser must therefore scope its probe scan to the deployment
+// the wake targets — a staging deployment should bias on staging
+// probes, not production.
 //
 // SQL shape (hand-rolled, not sqlc — the JOIN with DISTINCT ON
 // is a single statement and adding it via sqlc would require a
@@ -16309,13 +16617,19 @@ type AppUpstreamProbeScore struct {
 //	  LIMIT 1
 //	) p ON true
 //	WHERE u.account_id = $1 AND u.app_id = $2
+//	  AND u.deployment_scope = $3
 //	  AND u.declared_region IS NOT NULL
 //
 // The LATERAL subquery keeps the index-driven lookup hot
 // (data_upstream_probes partitioned by sampled_at, the
 // (host_redacted_hash, sampled_at) index is the probe-loop's
 // hot path). One round-trip per wake.
-func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]AppUpstreamProbeScore, error) {
+//
+// deploymentScope is required (no fallback defaulting here —
+// the caller threads dep.ID from engine.go; pkg/sched/engine.go
+// applies defaultDeploymentScope="default" for the cold-path
+// branch where dep is nil).
+func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID, deploymentScope string) ([]AppUpstreamProbeScore, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT ON (u.id, p.region)
 		       u.host_redacted_hash, p.region, u.kind, u.port,
@@ -16329,8 +16643,9 @@ func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, app
 			LIMIT 1
 		) p ON true
 		WHERE u.account_id = $1 AND u.app_id = $2
+		  AND u.deployment_scope = $3
 		  AND u.declared_region IS NOT NULL
-	`, accountID, appID)
+	`, accountID, appID, deploymentScope)
 	if err != nil {
 		return nil, err
 	}
@@ -16361,7 +16676,7 @@ func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, app
 // so the scan is cheap.
 func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, app_id, source, scope, kind, host, port,
+		`select id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
 		        host_redacted_hash, coalesce(declared_region, ''),
 		        last_rtt_ms, last_probed_at, last_seen_at, created_at
 		 from data_upstreams
@@ -16375,14 +16690,14 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 	var out []DataUpstream
 	for rows.Next() {
 		var (
-			id, accountIDpg, appIDpg                                    pgtype.UUID
-			source, scope, kind, host, hostRedactedHash, declaredRegion string
-			port                                                        int32
-			lastRTT                                                     pgtype.Int4
-			lastProbedAt                                                pgtype.Timestamptz
-			lastSeenAt, createdAt                                       pgtype.Timestamptz
+			id, accountIDpg, appIDpg                                                     pgtype.UUID
+			source, scope, deploymentScope, kind, host, hostRedactedHash, declaredRegion string
+			port                                                                         int32
+			lastRTT                                                                      pgtype.Int4
+			lastProbedAt                                                                 pgtype.Timestamptz
+			lastSeenAt, createdAt                                                        pgtype.Timestamptz
 		)
-		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
+		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &deploymentScope, &kind, &host, &port,
 			&hostRedactedHash, &declaredRegion,
 			&lastRTT, &lastProbedAt, &lastSeenAt, &createdAt); err != nil {
 			return nil, err
@@ -16398,11 +16713,16 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 			probedPtr = &t
 		}
 		out = append(out, DataUpstream{
-			ID:               uuidFromPgtype(id),
-			AccountID:        uuidFromPgtype(accountIDpg),
-			AppID:            uuidFromPgtype(appIDpg),
-			Source:           DataUpstreamSource(source),
-			Scope:            scope,
+			ID:        uuidFromPgtype(id),
+			AccountID: uuidFromPgtype(accountIDpg),
+			AppID:     uuidFromPgtype(appIDpg),
+			Source:    DataUpstreamSource(source),
+			Scope:     scope,
+			// DeploymentScope (ADR-098 amendment issue #954) — the
+			// ?scope=__all__ arm of listUpstreams must surface the
+			// same deployment overlay the per-page arm does;
+			// otherwise the staging-vs-prod view regresses here.
+			DeploymentScope:  deploymentScope,
 			Kind:             DataUpstreamKind(kind),
 			Host:             host,
 			Port:             int(port),

@@ -17,6 +17,14 @@ type Querier interface {
 	AccountByEmail(ctx context.Context, db DBTX, email interface{}) (AccountByEmailRow, error)
 	AccountByID(ctx context.Context, db DBTX, id pgtype.UUID) (AccountByIDRow, error)
 	AccountByKeyHash(ctx context.Context, db DBTX, keySha256 []byte) (AccountByKeyHashRow, error)
+	// Resolves an OIDC (issuer, subject) pair to the platform
+	// account it's bound to. The binding is implicit: any trust
+	// policy row with matching issuer_url + subject_pattern that
+	// matches the subject claim. Empty subject_pattern = permissive
+	// (accept any subject). PR-A matches on issuer_url only with
+	// permissive subject semantics; PR-C will refine the per-issuer
+	// subject index.
+	AccountByOIDCIssuerSubject(ctx context.Context, db DBTX, arg AccountByOIDCIssuerSubjectParams) (AccountByOIDCIssuerSubjectRow, error)
 	AccountsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) ([]AccountsByIDsRow, error)
 	AppByID(ctx context.Context, db DBTX, id pgtype.UUID) (AppByIDRow, error)
 	AppBySlug(ctx context.Context, db DBTX, slug string) (AppBySlugRow, error)
@@ -137,7 +145,12 @@ type Querier interface {
 	// the GDPR path (delete-account cascades through
 	// apps → data_upstreams).
 	DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error
-	DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error
+DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error
+	// Operator-driven revoke path (PR-C). Returns 0 rows on miss;
+	// the caller maps that to ErrNotFound. The 5-min TTL is the
+	// natural expiry path; Delete is the "kill this CI job's
+	// credential now" lever.
+	DeleteOIDCExchangedToken(ctx context.Context, db DBTX, id pgtype.UUID) error
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
@@ -148,7 +161,9 @@ type Querier interface {
 	GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErrorSampleParams) (GetAppErrorSampleRow, error)
 	// Single-row read for the dashboard's "edit upstream"
 	// pane (PR-B). Cursor-safe: no pagination; the handler
-	// reads the row directly.
+	// reads the row directly. Projects the new deployment_scope
+	// column (issue #954) so the typed DataUpstream.DeploymentScope
+	// in pkg/state/types.go round-trips through sqlc.
 	GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) (GetDataUpstreamByIDRow, error)
 	// Returns the bytea secret for the given installation_id. The
 	// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
@@ -161,6 +176,21 @@ type Querier interface {
 	// shared_buffers under normal load. Returns ErrNotFound when the
 	// instance row is missing.
 	GetInstanceTailCount(ctx context.Context, db DBTX, id pgtype.UUID) (int32, error)
+	// Bearer hot-path lookup. Filters past-TTL rows out at the SQL
+	// layer so the pg contract is "WHERE expires_at > NOW()". The
+	// MemStore mirror in pkg/state/memstore.go lazy-deletes instead.
+	GetOIDCExchangedTokenByHash(ctx context.Context, db DBTX, tokenHash []byte) (GetOIDCExchangedTokenByHashRow, error)
+	// ─── OIDC / keyless deploy auth (ADR-101, issue #270) ───────────────────
+	//
+	// Per-(account_id, issuer_url) trust policy CRUD + exchanged-token
+	// CRUD. PR-A scope. The composite PK on oidc_trust_policies is the
+	// lookup key; the per-account dashboard list (PR-C) walks the
+	// same index. token_hash UNIQUE on oidc_exchanged_tokens is the
+	// bearer hot-path lookup.
+	// Account-by-issuer lookup. Used by the OIDC exchange handler's
+	// first-use auto-create path (PR-A) and the dashboard's Refine
+	// form (PR-C).
+	GetOIDCTrustPolicy(ctx context.Context, db DBTX, arg GetOIDCTrustPolicyParams) (GetOIDCTrustPolicyRow, error)
 	// Primary-key lookup; called on every authenticated dashboard request.
 	// sql.ErrNoRows from pgx maps to state.ErrNotFound in pgstore.
 	GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetSessionRow, error)
@@ -225,12 +255,15 @@ type Querier interface {
 	// Dedupe-merge INSERT for data_upstreams. Mirrors the
 	// IncrementAppError ON CONFLICT pattern (queries.sql:906).
 	// The handler (PR-B's cmd/apid/extract.go) targets
-	// data_upstreams_dedupe_uniq on (app_id, scope, kind,
-	// host, port). On conflict: bump last_seen_at; refresh
-	// last_rtt_ms / last_probed_at / declared_region from
-	// EXCLUDED so the freshest classifier observation wins.
-	// id is caller-supplied (uuidv7) so the row identity is
-	// stable across the dedupe-merge.
+	// data_upstreams_dedupe_uniq on (app_id, scope,
+	// deployment_scope, kind, host, port) per ADR-098 amendment
+	// (issue #954 / 00281_data_upstreams_deployment_scope.sql).
+	// On conflict: bump last_seen_at; refresh last_rtt_ms /
+	// last_probed_at / declared_region / deployment_scope
+	// from EXCLUDED so a re-classification re-stamps the
+	// deployment overlay on the latest observation. id is
+	// caller-supplied (uuidv7) so the row identity is stable
+	// across the dedupe-merge.
 	InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDataUpstreamParams) (pgtype.UUID, error)
 	// meterd's probe loop writer (PR-C). One row per
 	// (host_redacted_hash, region) per 30s sample. The
@@ -240,33 +273,36 @@ type Querier interface {
 	// path; the partition creator (PR-C) drops old
 	// partitions wholesale.
 	InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg InsertDataUpstreamProbeParams) error
-	// One row per dead-lettered record. The reason is the closed-vocab
-	// failure mode (rate_limited, poison_record, max_attempts,
-	// broker_error, plan_quota, payload_too_large, customer_disabled);
-	// the routed_to is the closed-vocab terminal action (drop,
-	// manual_retry, customer_dlq). detail carries any per-reason payload
-	// (the broker error text, the payload size that tripped the 6MB
-	// cap, etc.) for the dashboard read-back.
-	InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg InsertTriggerDeadLetterParams) error
-	// Review finding #1 (PR #910): the dispatcher MUST persist every
-	// broker-delivered record into trigger_records BEFORE
-	// ClaimTriggerRecords can find them. Without this insert the
-	// entire dispatch tick is dead — ClaimTriggerRecords returns 0
-	// rows, the broker messages accumulate forever in poller.inFlight,
-	// and the unified Trigger primitive never fires a function.
-	//
-	// ON CONFLICT (trigger_id, item_identifier) DO NOTHING mirrors the
-	// broker-side dedupe guarantee (kafka per-partition offset,
-	// NATS stream sequence, Redis entry-id, SQS receipt handle,
-	// in-platform invocation_id — all globally unique within their
-	// own ledger). A re-poll after a partial commit + Ack timeout
-	// therefore never inserts a duplicate row.
-	//
-	// Returning id gives the dispatcher the trigger_records.id that
-	// ClaimTriggerRecords surfaces under FOR UPDATE SKIP LOCKED,
-	// bridging the item_identifier → row_id namespace the
-	// ReportBatchItemFailures handler needs.
-	InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTriggerRecordParams) (pgtype.UUID, error)
+// One row per dead-lettered record. The reason is the closed-vocab
+// failure mode (rate_limited, poison_record, max_attempts,
+// broker_error, plan_quota, payload_too_large, customer_disabled);
+// the routed_to is the closed-vocab terminal action (drop,
+// manual_retry, customer_dlq). detail carries any per-reason payload
+// (the broker error text, the payload size that tripped the 6MB
+// cap, etc.) for the dashboard read-back.
+InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg InsertTriggerDeadLetterParams) error
+// Review finding #1 (PR #910): the dispatcher MUST persist every
+// broker-delivered record into trigger_records BEFORE
+// ClaimTriggerRecords can find them. Without this insert the
+// entire dispatch tick is dead — ClaimTriggerRecords returns 0
+// rows, the broker messages accumulate forever in poller.inFlight,
+// and the unified Trigger primitive never fires a function.
+//
+// ON CONFLICT (trigger_id, item_identifier) DO NOTHING mirrors the
+// broker-side dedupe guarantee (kafka per-partition offset,
+// NATS stream sequence, Redis entry-id, SQS receipt handle,
+// in-platform invocation_id — all globally unique within their
+// own ledger). A re-poll after a partial commit + Ack timeout
+// therefore never inserts a duplicate row.
+//
+// Returning id gives the dispatcher the trigger_records.id that
+// ClaimTriggerRecords surfaces under FOR UPDATE SKIP LOCKED,
+// bridging the item_identifier → row_id namespace the
+// ReportBatchItemFailures handler needs.
+InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTriggerRecordParams) (pgtype.UUID, error)
+	// Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
+	// Returns the full row (with created_at server-stamped).
+	InsertOIDCExchangedToken(ctx context.Context, db DBTX, arg InsertOIDCExchangedTokenParams) (InsertOIDCExchangedTokenRow, error)
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)
@@ -357,13 +393,18 @@ type Querier interface {
 	// data_upstreams is a stable list, not a hot recency
 	// list. Index path: data_upstreams_app_created_idx.
 	//
-	// sqlc.arg(...)::type casts disambiguate the two cursor
-	// params — without them sqlc named both fields
-	// `CreatedAt` (taken from the SELECT list) and the
-	// generated Go wrapper bound a timestamptz to the $3
-	// uuid slot, tripping a type error on every cursor page
-	// past the first. See the cross-PR slot-fence
-	// sqlc.arg-disambiguates-cursor memory; the same
+	// Optional ?deployment_scope= server-side filter lands via
+	// `cursor_deployment_scope` (issue #954 / ADR-098 amendment).
+	// Empty string means "no filter; return all deployments"
+	// — the wide-open default. Setting a non-empty value restricts
+	// to one deployment. Mirrors the existing ?scope= discipline.
+	//
+	// sqlc.arg(...)::type casts disambiguate the cursor params
+	// — without them sqlc named both fields `CreatedAt` (taken
+	// from the SELECT list) and the generated Go wrapper bound a
+	// timestamptz to the $3 uuid slot, tripping a type error on
+	// every cursor page past the first. See the cross-PR slot-
+	// fence sqlc.arg-disambiguates-cursor memory; the same
 	// pattern pins ListAppErrorGroups.
 	ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error)
 	ListDeploymentsForApp(ctx context.Context, db DBTX, arg ListDeploymentsForAppParams) ([]ListDeploymentsForAppRow, error)
@@ -389,6 +430,8 @@ type Querier interface {
 	// ADR-064 §"Compatibility".
 	ListEventsByWakeID(ctx context.Context, db DBTX, arg ListEventsByWakeIDParams) ([]ListEventsByWakeIDRow, error)
 	ListInstancesForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListInstancesForAppRow, error)
+	// Per-account dashboard list (PR-C). Empty slice on miss.
+	ListOIDCTrustPoliciesForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOIDCTrustPoliciesForAccountRow, error)
 	ListOrgInvitationsForOrg(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgInvitationsForOrgRow, error)
 	ListOrgMembers(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgMembersRow, error)
 	ListOrgsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOrgsForAccountRow, error)
@@ -576,6 +619,11 @@ type Querier interface {
 	// rotation is one statement. upgradedAt + upgradedBy form a §11
 	// audit trail.
 	UpsertGithubWebhookSecret(ctx context.Context, db DBTX, arg UpsertGithubWebhookSecretParams) (int64, error)
+	// PK conflict on (account_id, issuer_url) updates the mutable
+	// columns (audience, subject_pattern, algorithms, required_claims,
+	// updated_at, audit_login) and preserves created_at. Returns the
+	// full row as stored.
+	UpsertOIDCTrustPolicy(ctx context.Context, db DBTX, arg UpsertOIDCTrustPolicyParams) (UpsertOIDCTrustPolicyRow, error)
 	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error)
 }
 
