@@ -4417,6 +4417,50 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 	return scanDeployment(row)
 }
 
+// GetDeploymentByIDScopedToSuperseded returns the deployment only if it
+// (a) belongs to appID and (b) has status='superseded'. Used by SAFE-RELEASES-G
+// (issue #976, PR-G) to let callers rollback to a specific historical
+// deployment rather than only the most-recent superseded one.
+//
+// Returns ErrNoRollbackTarget if no row matches (deployment missing or
+// belongs to a different app). Returns ErrRollbackTargetAlreadyLive if
+// the row exists and belongs to appID but its status is not 'superseded'
+// (e.g. status='live' means caller is asking to "rollback" to the
+// already-current deployment — rejected explicitly rather than silently
+// no-op'd, per the SAFE-RELEASES-G plan).
+//
+// Uses scanDeploymentWithRootfs (matches DeploymentByID) so the caller has
+// the rootfs_path/key/bytes needed for downstream wake and audit. The
+// rollback handler deliberately does NOT add a "snapshot must exist" gate
+// here — per ADR-005 ("cold boot must always work") and CLAUDE.md invariant
+// #3, the wake path cold-boots from the returned rootfs when the rollback
+// target's snapshot is missing/stale, so this loader is purely a state
+// lookup and intentionally not coupled to snapshot retention.
+func (s *PgStore) GetDeploymentByIDScopedToSuperseded(ctx context.Context, appID, deploymentID string) (Deployment, error) {
+	if appID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty appID")
+	}
+	if deploymentID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty deploymentID")
+	}
+	row := s.pool.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments where id = $1 and app_id = $2`,
+		deploymentID, appID)
+	d, scanErr := scanDeploymentWithRootfs(row)
+	if scanErr != nil {
+		if errors.Is(scanErr, ErrNotFound) {
+			return Deployment{}, fmt.Errorf("state: rollback target %q for app %q: %w", deploymentID, appID, ErrNoRollbackTarget)
+		}
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: %w", scanErr)
+	}
+	if d.Status != DeploySuperseded {
+		return Deployment{}, fmt.Errorf("state: rollback target %q for app %q has status %q: %w",
+			deploymentID, appID, d.Status, ErrRollbackTargetAlreadyLive)
+	}
+	return d, nil
+}
+
 // ListAllDeployments returns every non-deleted deployment (parent
 // app is not 'deleted'). Issue #557 closure / ADR-072 — the floor
 // reconciler's wake sweep walks this list when no owner-node sharding
@@ -12797,6 +12841,19 @@ func scanSnapshot(row pgx.Row) (Snapshot, error) {
 // returns plain errors; PgStore maps pgx's unique-violation SQLSTATE here so
 // callers don't need to know about pgerrcode.
 var ErrConflict = errors.New("state: conflict")
+
+// ErrNoRollbackTarget is returned by GetDeploymentByIDScopedToSuperseded when
+// no row matches the (deployment_id, app_id) pair (missing deployment, or
+// deployment belongs to a different app). SAFE-RELEASES-G (issue #976). Maps
+// to API stable code rollback_target_not_found (404).
+var ErrNoRollbackTarget = errors.New("state: no rollback target")
+
+// ErrRollbackTargetAlreadyLive is returned by GetDeploymentByIDScopedToSuperseded
+// when the row exists and belongs to the app but has status != 'superseded'
+// (caller asked to rollback to the already-current deployment). Rejected
+// explicitly rather than silently no-op'd. Maps to API stable code
+// rollback_target_already_live (409).
+var ErrRollbackTargetAlreadyLive = errors.New("state: rollback target is already live")
 
 // ErrInvalidArgument is returned when a Store method receives a
 // required-empty argument (empty account_id, empty hash, etc).
