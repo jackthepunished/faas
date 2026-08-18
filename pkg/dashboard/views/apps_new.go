@@ -64,7 +64,7 @@ type AppsNewView struct {
 // AccountLogin to disambiguate a customer with multiple installations
 // (personal + work).
 type AppsNewInstallView struct {
-	ID            int64
-	AccountLogin  string
-	RepoCount     int
+	ID           int64
+	AccountLogin string
+	RepoCount    int
 }

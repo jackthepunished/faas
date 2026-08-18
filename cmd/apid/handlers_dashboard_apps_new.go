@@ -57,7 +57,7 @@ func (s *server) renderAppNew(w http.ResponseWriter, r *http.Request, log *slog.
 	view := views.AppsNewView{
 		PreFilledRepo:      prefilledRepo,
 		PreFilledInstallID: prefilledInstall,
-		PreFilledBranch:     prefilledBranch,
+		PreFilledBranch:    prefilledBranch,
 	}
 
 	// Templates — populated up-front so the post-connect redirect

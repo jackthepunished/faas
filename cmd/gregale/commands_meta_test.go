@@ -25,8 +25,8 @@ import (
 // ClosedSet literal in cli_meta.go references a name that exists in
 // templates.Names AND vice versa. Catches both directions:
 //
-//	- ClosedSet has "node22-http" but templates.Names does not → FAIL.
-//	- templates.Names has "foo" but ClosedSet does not → FAIL.
+//   - ClosedSet has "node22-http" but templates.Names does not → FAIL.
+//   - templates.Names has "foo" but ClosedSet does not → FAIL.
 func TestClosedSetTemplatesMatchEmbedFS(t *testing.T) {
 	closedSet := map[string]struct{}{}
 	for _, c := range cliCommands {
