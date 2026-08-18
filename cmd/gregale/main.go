@@ -251,6 +251,8 @@ func run(args []string) int {
 		return cmdTraffic(args[1:])
 	case "domains":
 		return cmdDomains(args[1:])
+	case "tenant-surfaces":
+		return cmdTenantSurfaces(args[1:])
 	case "edge-rules":
 		// PR 2 of Edge Rules rollout: customer CLI wrapper around the
 		// /v1/apps/{slug}/edge-rules CRUD surface (PR 1 #799). Sub-

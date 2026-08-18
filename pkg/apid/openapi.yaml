@@ -117,6 +117,14 @@ tags:
       PATCH /v1/apps/{slug}/security (admin + MFA) flips the
       require_signed flag; trusted_signers CRUD manages the
       per-app cosign trusted-publisher list.
+  - name: tenant-surfaces
+    description: |
+      Tenant hostname groupings (issue #879 / ADR-100). One surface
+      holds N hostnames under one SAN bundle. Soft-deleted surfaces
+      are filtered out of list/get; the cert engine picks up
+      pending-state surfaces via pg_notify('tenant_surface_changed')
+      to mint the cert. Returns 402 when the
+      `FAAS_TENANT_SURFACES_ENABLED` flag is off.
   - name: usage
     description: Usage roll-up and metering.
   - name: upstreams
@@ -2585,6 +2593,143 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '500': { $ref: '#/components/responses/ServerError' }
+
+  # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ────────────────────────
+  /v1/apps/{slug}/tenant-surfaces:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [tenant-surfaces]
+      operationId: listTenantSurfaces
+      summary: List tenant surfaces on an app.
+      description: |
+        Returns every active tenant surface on the app. Soft-deleted
+        surfaces are filtered out server-side. Returns 402 when the
+        `FAAS_TENANT_SURFACES_ENABLED` flag is off (the cluster ships
+        dark until the cert-engine real-mint ADR lands).
+      responses:
+        '200':
+          description: The active surfaces on the app.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListTenantSurfacesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [tenant-surfaces]
+      operationId: createTenantSurface
+      summary: Add a tenant surface with seed hostnames.
+      description: |
+        The customer-facing surface for issue #879 / ADR-100. One
+        surface holds N hostnames under one SAN bundle. Returns 202
+        (the cert engine has to mint; the surface is in pending/active
+        state).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTenantSurfaceRequest' }
+      responses:
+        '202':
+          description: The new surface (pending active).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id.
+    get:
+      tags: [tenant-surfaces]
+      operationId: getTenantSurface
+      summary: Get one tenant surface.
+      responses:
+        '200':
+          description: The surface + its hostnames.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [tenant-surfaces]
+      operationId: deleteTenantSurface
+      summary: Remove a tenant surface (soft-delete + cascade hostnames).
+      responses:
+        '204': { description: Surface and hostnames removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}/hostnames:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being added to.
+    post:
+      tags: [tenant-surfaces]
+      operationId: addTenantHostname
+      summary: Add a hostname to an existing surface.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddTenantHostnameRequest' }
+      responses:
+        '202':
+          description: The hostname (pending DNS-01 verification).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantHostnameResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being removed from.
+      - name: hostname
+        in: path
+        required: true
+        schema: { type: string }
+        description: The hostname (lowercased canonical form).
+    delete:
+      tags: [tenant-surfaces]
+      operationId: removeTenantHostname
+      summary: Remove a hostname from a surface.
+      responses:
+        '204': { description: Hostname removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/apps/{slug}/env:
     parameters:
@@ -9170,6 +9315,68 @@ components:
       properties:
         domain: { type: string , example: "app.example.com"}
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+
+    # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ──────────────────────
+
+    TenantSurfaceResponse:
+      description: "A tenant surface: a multi-hostname SAN bundle attached to one app."
+      type: object
+      required: [id, account_id, app_id, name, cert_kind, status, cert_state, hostnames]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        name: { type: string, example: "customer-zones" }
+        cert_kind: { type: string, enum: [per_host_san] }
+        status: { type: string, enum: [pending, active, suspended, deleted] }
+        cert_state: { type: string, enum: [none, pending, issued, renewing, failed] }
+        cert_not_after: { type: string, format: date-time }
+        cert_last_error: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        hostnames:
+          type: array
+          items: { $ref: '#/components/schemas/TenantHostnameResponse' }
+
+    TenantHostnameResponse:
+      description: "A hostname attached to a tenant surface (DNS-01 verified)."
+      type: object
+      required: [hostname, verified, txt_record]
+      properties:
+        hostname: { type: string, example: "api.customer-a.com" }
+        challenge_token: { type: [string, "null"] }
+        verified: { type: boolean }
+        verified_at: { type: [string, "null"], format: date-time }
+        last_error: { type: [string, "null"] }
+        txt_record: { type: string, description: "TXT record the customer must publish (_faas-verify.<hostname>)." }
+
+    CreateTenantSurfaceRequest:
+      description: "Create a tenant surface with a seed set of hostnames."
+      type: object
+      required: [app_id, name]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        name: { type: string, example: "customer-zones" }
+        cert_kind: { type: string, enum: [per_host_san] }
+        hostnames:
+          type: array
+          items: { type: string, example: "api.customer-a.com" }
+
+    ListTenantSurfacesResponse:
+      description: "Surfaces on the app (soft-deleted excluded server-side)."
+      type: object
+      required: [surfaces]
+      properties:
+        surfaces:
+          type: array
+          items: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+
+    AddTenantHostnameRequest:
+      description: "Append a hostname to an existing surface."
+      type: object
+      required: [hostname]
+      properties:
+        hostname: { type: string, example: "api.customer-c.com" }
 
     # ─── Crons ────────────────────────────────────────────────────────────
 
