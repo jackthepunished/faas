@@ -978,12 +978,21 @@ func NewMetrics() *Metrics {
 	}
 	// ADR-100 / issue #879 — pre-instantiate the closed
 	// (result, kind) cartesian product so the §12 panel
-	// surfaces from boot. Bounded (3 results × 2 kinds = 6
+	// surfaces from boot. Bounded (3 results × 3 kinds = 9
 	// series) so the time-series footprint is flat. An idle
-	// daemon shows all six counters at zero; a quiet one
-	// climbs only on real customer mutations.
+	// daemon shows all nine counters at zero; a quiet one
+	// climbs only on real customer mutations. kind="" is
+	// stamped because the "surface deleted between notify and
+	// lookup" path (cert_issuer_tenant_surface.go:180) emits
+	// under an empty kind label — the row is gone, so its
+	// CertKind is unrecoverable. Surfacing kind="" from boot
+	// keeps the dashboard chip visible without waiting for the
+	// first clean-up race; the kind={per_host_san,
+	// shared_wildcard} entries match CertKind constants and
+	// any future kind (ADR-114 deferred work) widens this
+	// slice.
 	for _, result := range []string{"issued", "failed", "skipped"} {
-		for _, kind := range []string{"per_host_san", "shared_wildcard"} {
+		for _, kind := range []string{"", "per_host_san", "shared_wildcard"} {
 			m.tenantSurfaceCert.WithLabelValues(result, kind)
 		}
 	}

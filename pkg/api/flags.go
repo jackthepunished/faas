@@ -31,3 +31,73 @@ func TenantSurfacesEnabled() bool {
 	}
 	return false
 }
+
+// CertEngineWired reports whether the per-host cert engine has
+// the env configuration it needs to mint. The engine needs:
+//
+//   - FAAS_TLS_STORAGE_DIR     — certmagic's leaf storage root
+//   - FAAS_TLS_CONTACT_EMAIL   — ACME registration contact
+//
+// Both are required. FAAS_TLS_DNS_PROVIDER + FAAS_TLS_DNS_TOKEN
+// are also required for the DNS-01 solver but those are looked
+// up via the DNSProviderFactory seam (per the wildcard TLS path
+// in tls_wire.go:138-143). The wrapper at
+// pkg/gateway/cert_issuer_tenant_surface.go degrades to
+// "cert engine unwired" when this returns false so the visible
+// deployment posture stays the same as the dark-launch shape
+// (PR-C) until the operator sets both env vars.
+func CertEngineWired() bool {
+	return strings.TrimSpace(os.Getenv("FAAS_TLS_STORAGE_DIR")) != "" &&
+		strings.TrimSpace(os.Getenv("FAAS_TLS_CONTACT_EMAIL")) != ""
+}
+
+// CertEngineStorageDir returns the certmagic leaf storage root.
+// Returns "" when unset; callers must check CertEngineWired
+// before reaching here.
+func CertEngineStorageDir() string {
+	return strings.TrimSpace(os.Getenv("FAAS_TLS_STORAGE_DIR"))
+}
+
+// CertEngineContactEmail returns the ACME account contact.
+// Returns "" when unset.
+func CertEngineContactEmail() string {
+	return strings.TrimSpace(os.Getenv("FAAS_TLS_CONTACT_EMAIL"))
+}
+
+// CertEngineStaging reports whether the cert engine should
+// drive LE staging instead of production. Staging is the
+// default for non-prod envs (the EX44 staging fleet, the
+// Lima-metal lab, and any developer box that doesn't have a
+// stale prod DNS delegation). Production clusters opt-in to
+// the prod CA via FAAS_TLS_STAGING=0 / false.
+func CertEngineStaging() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("FAAS_TLS_STAGING")))
+	switch v {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
+// DNS provider identifiers (PR-D cert engine). Constants are
+// package-scoped so pkg/api/flags_test.go can assert against
+// them by symbol — extracting also tames the golangci-lint
+// goconst check (the package-wide occurrence counter flags any
+// literal used 3+ times).
+const (
+	DNSProviderHetzner    = "hetzner"
+	DNSProviderCloudflare = "cloudflare"
+)
+
+// CertEngineDNSProvider returns the DNS provider name. Defaults
+// to cloudflare per ADR-024 §6. The token for the provider is
+// supplied separately via the operator-sealed DNS token
+// (FAAS_TLS_DNS_TOKEN — looked up through the DNSProviderFactory
+// seam, not here).
+func CertEngineDNSProvider() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FAAS_TLS_DNS_PROVIDER"))) {
+	case DNSProviderHetzner:
+		return DNSProviderHetzner
+	}
+	return DNSProviderCloudflare
+}
