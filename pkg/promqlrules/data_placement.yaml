@@ -81,5 +81,5 @@ groups:
           family: data_placement
         annotations:
           summary: "Data-placement probe p95 wall-clock > 1s for 10m"
-          description: "Per-probe TCP+TLS handshake exceeded 1s p95 for 10m. The handshake payload is bounded by the customer's CA chain, not our control — a slow probe is overwhelmingly a network condition, not a customer cert issue. If the ratio of tls_handshake outcomes also rises, treat it as a TLS regression and escalate."
+          description: "Aggregate per-probe wall-clock (TCP+TLS handshake) exceeded 1s p95 for 10m. GLOBAL signal — `meterd_data_upstream_probe_duration_seconds` is an unlabelled Histogram (pkg/wire/metrics.go:2349-2353), so the alert does not distinguish which region or kind is degraded. Cross-reference the per-(kind, region) `FaasUpstreamRttDegraded` alerts for the same window to localize; if those are quiet, the slowness is not connectivity-bound. The handshake payload is bounded by the customer's CA chain, not our control — a slow probe is overwhelmingly a network condition, not a customer cert issue. If the ratio of tls_handshake outcomes also rises, treat it as a TLS regression and escalate."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasUpstreamRttDegraded.md"
