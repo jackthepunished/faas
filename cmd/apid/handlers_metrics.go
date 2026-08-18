@@ -23,6 +23,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/throttlerec"
 )
+
+// truthyTrue is the string the dry_run query param matches.
+// Hoisted to a constant for goconst (the "true" literal would
+// otherwise duplicate the truthyFlagLiterals slice in
+// cmd/apid/deploy_inputs.go:511 + the rekeyTruthyLiterals slice
+// in rekey_runner.go:85, package-wide count crossing the
+// threshold). Used only by the dry_run parser; other "true"
+// comparisons in this file (none today) should reuse the same
+// constant.
+const truthyTrue = "true"
 
 // getAppMetrics serves GET /v1/apps/{slug}/metrics?range=.
 // Mirrors getApp's auth chain (without requireMFA — read-only,
@@ -91,11 +102,61 @@ func (s *server) getAppThrottleSuggestions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Dry-run preview (ADR-104 amendment 5, issue #881 Phase 4
+	// D2). Parse + validate BEFORE invoking throttlerec.Fetch so
+	// a malformed payload doesn't waste a Prometheus round-trip.
+	q := r.URL.Query()
+	dryRun := q.Get("dry_run") == truthyTrue
+	candidateRPS := 0.0
+	candidateBurst := 0
+	if dryRun {
+		// CandidateRPS is required when DryRun=true — the
+		// preview is meaningless without a probe value. We
+		// parse strictly; a non-numeric value is a 400.
+		rpsStr := q.Get("candidate_rps")
+		if rpsStr == "" {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"missing candidate_rps",
+				"candidate_rps is required when dry_run=true"))
+			return
+		}
+		var err error
+		candidateRPS, err = strconv.ParseFloat(rpsStr, 64)
+		if err != nil || candidateRPS <= 0 {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"invalid candidate_rps",
+				"candidate_rps must be a positive number"))
+			return
+		}
+		// candidate_burst is optional — defaults to 0 (the
+		// recommender surfaces it on the wire but doesn't gate
+		// on it). Must be a non-negative integer if provided.
+		burstStr := q.Get("candidate_burst")
+		if burstStr != "" {
+			candidateBurst, err = strconv.Atoi(burstStr)
+			if err != nil || candidateBurst < 0 {
+				api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+					"invalid candidate_burst",
+					"candidate_burst must be a non-negative integer"))
+				return
+			}
+		}
+	}
+
 	resp, src := throttlerec.Fetch(r.Context(), s.promqlClient, s.log, throttlerec.FetchOptions{
 		AppID:               app.ID,
 		Range:               rng,
 		Plan:                acct.Plan,
 		RouteMetricsEnabled: app.RouteMetricsEnabled,
+		// Dry-run preview (ADR-104 amendment 5, issue #881 Phase 4
+		// D2): all three query params are optional. DryRun=true
+		// without CandidateRPS is a wire-shape bug → 400 (the
+		// candidate is the probe value; "preview with no probe" is
+		// nonsensical). DryRun=false ignores the candidates
+		// regardless of value (back-compat for Phase 1+2+3 callers).
+		DryRun:         dryRun,
+		CandidateRPS:   candidateRPS,
+		CandidateBurst: candidateBurst,
 	})
 	resp.AppID = app.ID
 	resp.Range = rng

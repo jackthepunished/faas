@@ -12465,6 +12465,15 @@ components:
         or `degraded: <reason>` on Prometheus failure (response is
         still 200 with empty Suggestions — the dashboard's
         empty-state branch handles it).
+
+        Phase 4 D1/D2 (ADR-104 amendment 5): when the request
+        supplies `dry_run=true` + `candidate_rps` + (optional)
+        `candidate_burst`, the response ALSO carries a per-route
+        `would_have_rejected` array + the static
+        `per_consumer_limit_note` literal that names the
+        `gateway_requests_by_route_total` label gap. Dry-run is a
+        guard-rail for the customer's own probe value — not
+        auto-apply.
       type: object
       required: [app_id, range, source, route_metrics_disabled, routes_collapsed, plan_ceiling_rps, plan_ceiling_burst, multiplier, suggestions]
       properties:
@@ -12537,6 +12546,94 @@ components:
           items: { $ref: '#/components/schemas/ThrottleSuggestionRow' }
           x-since: "2026-08"
           x-issue: "881"
+        dry_run:
+          type: boolean
+          description: |
+            True iff the request supplied `dry_run=true`. The
+            `would_have_rejected` + `per_consumer_limit_note`
+            fields are only populated when this is true.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+        candidate_rps:
+          type: number
+          format: double
+          description: |
+            Echo of the customer's probe value (request
+            `candidate_rps`). Surfaced so a customer reading
+            the wire doesn't have to correlate the preview
+            rows with the request they sent.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+        candidate_burst:
+          type: integer
+          minimum: 0
+          description: |
+            Echo of the customer's probe burst (request
+            `candidate_burst`, optional).
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+        would_have_rejected:
+          type: array
+          items: { $ref: '#/components/schemas/ThrottlePreviewRow' }
+          description: |
+            One row per surviving route with the count of
+            sub-windows where observed rps exceeded
+            `candidate_rps` over the recommendation window.
+            The preview counts at rule scope — see
+            `per_consumer_limit_note` for the label-gap
+            caveat.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+        per_consumer_limit_note:
+          type: string
+          description: |
+            Static literal naming the
+            `gateway_requests_by_route_total` label gap (no
+            per-consumer labels today). Surfaced so dashboards
+            / CLIs reading the preview don't silently
+            mis-attribute a rule-scope count to a
+            per-consumer scope.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+    ThrottlePreviewRow:
+      description: |
+        One row of the dry-run preview (ADR-104 amendment 5,
+        issue #881 Phase 4 D1/D2). For each surviving route we
+        report the count of sub-windows where the observed rate
+        exceeded the candidate rps — a count of "would-have-
+        rejected" requests over the window.
+      type: object
+      required: [route, candidate_rps, over_cap_count, window_start, window_end]
+      properties:
+        route: { type: string, x-since: "2026-08", x-issue: "881-phase-4-d1" }
+        candidate_rps:
+          type: number
+          format: double
+          description: Echo of the candidate rps the preview evaluated against.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+        over_cap_count:
+          type: number
+          format: double
+          description: |
+            Count of sub-windows in the recommendation window
+            where observed rps exceeded the candidate. NaN/Inf
+            from Prometheus are coerced to 0 via
+            `pkg/appmetrics.SafeFloat`.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+        window_start:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC window-start the preview was evaluated against.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
+        window_end:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC window-end the preview was evaluated against.
+          x-since: "2026-08"
+          x-issue: "881-phase-4-d1"
 
     AppStreamingStatus:
       description: |

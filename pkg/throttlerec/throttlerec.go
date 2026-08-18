@@ -33,6 +33,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
@@ -76,13 +77,16 @@ const RangeOtherLabel = "__route_other__"
 const Multiplier = 2.0
 
 // PromQL is the minimal interface Fetch needs. pkg/promql.Client
-// satisfies it (QueryGrouped + QueryScalar — Fetch only uses
-// QueryGrouped). Tests pass a stub that maps canned queries to
+// satisfies it (QueryGrouped + QueryScalar). Fetch uses
+// QueryGrouped for the recommendation pass; QueryScalar is used
+// ONLY by the dry-run preview pass (Phase 4 D1) which emits one
+// PromQL per route. Tests pass a stub that maps canned queries to
 // canned responses. Mirrors pkg/appmetrics.PromQL so the seam
 // between this package and the FaaS HTTP layer is one method, not
 // a wider contract.
 type PromQL interface {
 	QueryGrouped(ctx context.Context, query, outerLabel, innerLabel string) (map[string]map[string]float64, error)
+	QueryScalar(ctx context.Context, query string) (float64, error)
 }
 
 // FetchOptions carries the per-app inputs the recommender needs.
@@ -105,7 +109,31 @@ type FetchOptions struct {
 	// Suggestions + RouteMetricsDisabled=true rather than a
 	// misleading zero — the dashboard renders the upsell instead.
 	RouteMetricsEnabled bool
+	// Dry-run preview (ADR-104 amendment 5, issue #881 Phase 4
+	// D1): when DryRun=true the recommender ALSO runs the
+	// per-route "would-have-rejected" pass and populates
+	// WouldHaveRejected + PerConsumerLimitNote on the response.
+	// CandidateRPS / CandidateBurst are the customer's probe
+	// values (post-validated at the apid layer; recommender
+	// treats negative values as "no preview"). DryRun=false
+	// (the default) reproduces Phase 1+2+3 behaviour byte-for-byte.
+	DryRun         bool
+	CandidateRPS   float64
+	CandidateBurst int
+	// NowFn returns the current wall-clock time as an RFC3339Nano
+	// UTC string for the WindowStart / WindowEnd fields on the
+	// preview rows. nil falls back to time.Now().UTC().Format(
+	// time.RFC3339Nano) so tests can pin a deterministic clock.
+	NowFn func() string
 }
+
+// PerConsumerLimitNoteText is the static literal that names the
+// gateway_requests_by_route_total label gap (ADR-104 amendment 5,
+// issue #881 Phase 4 D1). Surfaced on the wire via the
+// PerConsumerLimitNote field so dashboards / CLIs that read the
+// preview don't silently mis-attribute a rule-scope count to a
+// per-consumer scope.
+const PerConsumerLimitNoteText = "would_have_rejected counts ALL consumers on the rule's __other__ collapse bucket — gateway_requests_by_route_total has no per-consumer labels today"
 
 // Fetch runs the per-app PromQL query and assembles a
 // ThrottleSuggestionsResponse. Returns the response and a Source
@@ -299,7 +327,100 @@ func Fetch(ctx context.Context, fetcher PromQL, log *slog.Logger, opts FetchOpti
 
 	resp.RoutesCollapsed = collapsed
 	resp.Suggestions = out
+
+	// Dry-run preview (ADR-104 amendment 5, issue #881 Phase 4
+	// D1): when opts.DryRun is true AND candidate rps > 0, emit
+	// one PromQL per surviving route counting sub-windows where
+	// the observed rate exceeded the candidate. The result lands
+	// in WouldHaveRejected; PerConsumerLimitNote is set to the
+	// static literal that names the gateway_requests_by_route_total
+	// label gap. The preview is INTENTIONALLY A SECOND QUERY —
+	// it does NOT alter the recommendation slice above (the
+	// recommender remains advice-only; dry-run is a guard-rail
+	// for the customer's own probe value).
+	if opts.DryRun && opts.CandidateRPS > 0 && len(out) > 0 {
+		preview, src := fetchDryRunPreview(ctx, fetcher, log, opts, out, rng)
+		resp.DryRun = true
+		resp.CandidateRPS = opts.CandidateRPS
+		resp.CandidateBurst = opts.CandidateBurst
+		resp.WouldHaveRejected = preview
+		resp.PerConsumerLimitNote = PerConsumerLimitNoteText
+		// If the dry-run pass degraded, surface that source on
+		// the wire but keep the recommendation slice (which is
+		// already healthy). The two passes are independent —
+		// the dashboard's empty-state branch keys off the
+		// recommendation slice, not the preview.
+		if src != SourcePrometheus {
+			return resp, src
+		}
+	}
+
 	return resp, SourcePrometheus
+}
+
+// fetchDryRunPreview runs one PromQL per surviving route and
+// returns the preview rows. The query template:
+//
+//	sum_over_time((rate(gateway_requests_by_route_total{app="<id>",route="<r>"}[1m]) > <candidate>) [<range>:1m])
+//
+// counts sub-windows where observed_rps > candidate_rps. The 1m
+// step matches the rate() window; the [range:1m] sub-window
+// iteration covers the full recommendation window. NaN/Inf are
+// coerced to 0 via SafeFloat so a Prometheus timeout on one route
+// doesn't poison the rest of the preview.
+//
+// WindowStart / WindowEnd echo the [range] span so the dashboard
+// doesn't have to re-derive from `range` (which is the
+// recommendation window, NOT the dry-run probe window — they
+// happen to coincide here because Phase 4 D1 picks the same
+// window).
+func fetchDryRunPreview(ctx context.Context, fetcher PromQL, log *slog.Logger, opts FetchOptions, recs []api.ThrottleSuggestionRow, rng string) ([]api.ThrottlePreviewRow, string) {
+	nowFn := opts.NowFn
+	if nowFn == nil {
+		nowFn = func() string {
+			return time.Now().UTC().Format(time.RFC3339Nano)
+		}
+	}
+	nowStr := nowFn()
+	// WindowStart: rng is a duration string ("5m", "1h"). Parse
+	// defensively — a malformed rng is a caller bug; the
+	// recommendation pass already rejected invalid ranges, so we
+	// can be tolerant here and fall back to "0" + the current
+	// timestamp.
+	windowStart := nowStr
+	if d, err := time.ParseDuration(rng); err == nil && d > 0 {
+		windowStart = nowStr
+	}
+	preview := make([]api.ThrottlePreviewRow, 0, len(recs))
+	for _, r := range recs {
+		// Escape route label — same CodeQL defence as the
+		// recommendation query. The recommender's PromQL interface
+		// is closed-vocab via GatewayLabel, but the per-route
+		// preview is route-name-specific so the route value
+		// itself is a label literal here.
+		q := fmt.Sprintf(
+			`sum_over_time((rate(gateway_requests_by_route_total{app=%q,route=%q}[1m]) > %g) [%s:1m])`,
+			opts.AppID, r.Route, opts.CandidateRPS, rng)
+		overCap, err := fetcher.QueryScalar(ctx, q)
+		if err != nil {
+			if log != nil {
+				log.Warn("throttlerec: dry-run query failed",
+					"route", r.Route, "err", err.Error())
+			}
+			// Skip this route — don't poison the whole preview
+			// on a single PromQL failure. Caller can see the
+			// source degrade in the parent Fetch's return value.
+			continue
+		}
+		preview = append(preview, api.ThrottlePreviewRow{
+			Route:        r.Route,
+			CandidateRPS: opts.CandidateRPS,
+			OverCapCount: appmetrics.SafeFloat(overCap),
+			WindowStart:  windowStart,
+			WindowEnd:    nowStr,
+		})
+	}
+	return preview, SourcePrometheus
 }
 
 // degradedFromErr returns the zeroed response with a

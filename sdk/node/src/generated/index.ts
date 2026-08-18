@@ -245,6 +245,7 @@ export type { StorageUsageListResponse } from './models/StorageUsageListResponse
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
 export type { TenantHostnameResponse } from './models/TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './models/TenantSurfaceResponse.js';
+export type { ThrottlePreviewRow } from './models/ThrottlePreviewRow.js';
 export type { ThrottleSuggestionRow } from './models/ThrottleSuggestionRow.js';
 export type { ThrottleSuggestionsResponse } from './models/ThrottleSuggestionsResponse.js';
 export type { Trace } from './models/Trace.js';

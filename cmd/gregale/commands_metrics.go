@@ -164,3 +164,143 @@ func renderAppsMetrics(w io.Writer, m api.AppsMetricsResponse) {
 // line vs. the call site's naked sort.Strings(xs) which would scan
 // the diff for "why is sort imported here?"
 func sortStrings(xs []string) { sort.Strings(xs) }
+
+// throttleSuggestionsCmdUsage is the top-of-failure-line shown for
+// `gregale throttle-suggestions` errors. Mirrors the metricsCmdUsage
+// pattern (commands_metrics.go:39) so the help text is stable
+// across command additions.
+const throttleSuggestionsCmdUsage = "usage: gregale throttle-suggestions <slug> [--range 5m] [--dry-run --candidate-rps N --candidate-burst N]"
+
+// throttleSuggestionsCmdDocsTopic is the docs topic slug appended
+// to docsURLBase when PrintUsage emits the trailing "Docs:" row.
+const throttleSuggestionsCmdDocsTopic = "throttle-suggestions"
+
+// cmdThrottleSuggestions implements
+// `gregale throttle-suggestions <slug> [--range 5m]
+// [--dry-run --candidate-rps N --candidate-burst N]` (ADR-091
+// D20.5 amendment 5 inline + ADR-104 amendment 5, issue #881
+// Phase 4 D2). The base command is the read-only recommender
+// (Phase 1+2+3 behaviour, byte-identical to GET /v1/apps/{slug}/
+// throttle-suggestions). --dry-run flips the server into the
+// preview pass: one extra PromQL per route counts sub-windows
+// where observed rate exceeded the candidate. The customer uses
+// this as a guard-rail BEFORE committing a throttle rule — not
+// auto-apply (the recommender remains INTENTIONALLY ADVICE-ONLY).
+//
+// Validation mirrors cmd/apid/handlers_metrics.go: dry_run=true
+// requires a positive --candidate-rps; --candidate-burst is
+// optional (defaults to 0). The CLI rejects negative values
+// locally so a malformed command doesn't waste an HTTP round-trip.
+func cmdThrottleSuggestions(args []string) int {
+	fs := flag.NewFlagSet("throttle-suggestions", flag.ContinueOnError)
+	rng := fs.String("range", "5m", "time window (5m, 15m, 1h, 6h, 24h)")
+	dryRun := fs.Bool("dry-run", false, "preview pass: ask the server to count sub-windows where observed rps exceeds --candidate-rps")
+	candidateRPS := fs.Float64("candidate-rps", 0, "candidate rps (required when --dry-run; positive float)")
+	candidateBurst := fs.Int("candidate-burst", 0, "candidate burst (optional when --dry-run; non-negative int)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, throttleSuggestionsCmdUsage, throttleSuggestionsCmdDocsTopic)
+		return 1
+	}
+	// Local validation — fail fast before the HTTP round-trip so a
+	// malformed command doesn't burn an auth + Prometheus budget.
+	if *dryRun {
+		if *candidateRPS <= 0 {
+			PrintUsage(os.Stderr, throttleSuggestionsCmdUsage+"\nerror: --dry-run requires --candidate-rps > 0", throttleSuggestionsCmdDocsTopic)
+			return 1
+		}
+		if *candidateBurst < 0 {
+			PrintUsage(os.Stderr, throttleSuggestionsCmdUsage+"\nerror: --candidate-burst must be >= 0", throttleSuggestionsCmdDocsTopic)
+			return 1
+		}
+	} else {
+		// Without --dry-run the candidates are ignored; warn if
+		// the user set them anyway so they don't get silent
+		// acceptance of a probe that produced no preview.
+		if *candidateRPS > 0 || *candidateBurst > 0 {
+			_, _ = fmt.Fprintln(os.Stderr, "warning: --candidate-rps / --candidate-burst are ignored without --dry-run")
+		}
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	slug := fs.Arg(0)
+	resp, err := client.GetAppThrottleSuggestionsOpts(context.Background(), slug, *rng, api.ThrottleSuggestionsOpts{
+		DryRun:         *dryRun,
+		CandidateRPS:   *candidateRPS,
+		CandidateBurst: *candidateBurst,
+	})
+	if err != nil {
+		return printErr("Could not fetch throttle suggestions", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	renderThrottleSuggestions(osStdout, resp)
+	return 0
+}
+
+// renderThrottleSuggestions writes the human-mode labelled block
+// for a ThrottleSuggestionsResponse. The recommendation slice
+// mirrors the dashboard's suggestions card (route / observed /
+// suggested rps / suggested burst). When DryRun=true, a "Dry-run
+// preview" section follows with one line per route showing the
+// would-have-rejected count + the per-consumer limitation note
+// (gateway_requests_by_route_total has no per-consumer labels
+// today; see ADR-104 amendment 5). Empty suggestions / empty
+// preview render as "(none)" so a customer reading the output
+// doesn't mistake silence for a bug.
+func renderThrottleSuggestions(w io.Writer, r api.ThrottleSuggestionsResponse) {
+	if r.Source != "" && r.Source != "prometheus" {
+		_, _ = fmt.Fprintf(w, "Note: source=%s (values below may be zero — Prometheus is unavailable)\n", r.Source)
+	}
+	_, _ = fmt.Fprintf(w, "App:           %s\n", r.AppID)
+	_, _ = fmt.Fprintf(w, "Range:         %s\n", r.Range)
+	if r.AsOf != "" {
+		_, _ = fmt.Fprintf(w, "As of:         %s\n", r.AsOf)
+	}
+	if r.Source != "" {
+		_, _ = fmt.Fprintf(w, "Source:        %s\n", r.Source)
+	}
+	_, _ = fmt.Fprintf(w, "Plan ceiling:  rps=%d burst=%d\n", r.PlanCeilingRPS, r.PlanCeilingBurst)
+	_, _ = fmt.Fprintf(w, "Multiplier:    %.1fx\n", r.Multiplier)
+	if r.RouteMetricsDisabled {
+		_, _ = fmt.Fprintln(w, "(route metrics disabled on this app — Free plan)")
+		return
+	}
+	if r.RoutesCollapsed > 0 {
+		_, _ = fmt.Fprintf(w, "Collapsed:     %d routes beyond RouteMetricsPerAppCap (covered by __route_other__)\n", r.RoutesCollapsed)
+	}
+	if len(r.Suggestions) == 0 {
+		_, _ = fmt.Fprintln(w, "\nSuggestions:   (none)")
+	} else {
+		_, _ = fmt.Fprintln(w, "\nSuggestions:")
+		for _, s := range r.Suggestions {
+			_, _ = fmt.Fprintf(w, "  %-40s observed=%-6.2f rps  suggested=%-6.2f rps (burst=%d)\n",
+				s.Route, s.ObservedRPS, s.SuggestedRPS, s.SuggestedBurst)
+		}
+	}
+	if !r.DryRun {
+		return
+	}
+	// Dry-run preview section (ADR-104 amendment 5, issue #881
+	// Phase 4 D2). The candidate echo + per-consumer limitation
+	// note appear FIRST so a customer reading the dry-run output
+	// knows what the preview is and isn't before scanning the
+	// per-route counts.
+	_, _ = fmt.Fprintf(w, "\nDry-run preview (candidate rps=%.2f burst=%d):\n", r.CandidateRPS, r.CandidateBurst)
+	if r.PerConsumerLimitNote != "" {
+		_, _ = fmt.Fprintf(w, "  Note: %s\n", r.PerConsumerLimitNote)
+	}
+	if len(r.WouldHaveRejected) == 0 {
+		_, _ = fmt.Fprintln(w, "  Would have rejected: (no per-route over-cap counts — degraded source or empty window)")
+		return
+	}
+	_, _ = fmt.Fprintln(w, "  Would have rejected:")
+	for _, p := range r.WouldHaveRejected {
+		_, _ = fmt.Fprintf(w, "    %-40s over-cap count=%.2f\n", p.Route, p.OverCapCount)
+	}
+}

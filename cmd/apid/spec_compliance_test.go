@@ -44,7 +44,7 @@ const (
 	webhooksFile  = "webhooks.go"      // issue #476 / ADR-076
 	billingFile   = "billing.go"       // PR-P3 — admin reconcile + future billing DTOs
 	diffFile      = "diff.go"          // PR-1 of the deploy-diff cluster — DiffRequest / DiffResponse wire DTOs
-upstreamsFile = "upstreams.go"     // ADR-098 §9.A PR-B
+	upstreamsFile = "upstreams.go"     // ADR-098 §9.A PR-B
 	triggerFile   = "trigger.go"       // issue #757 / ADR-100 — trigger primitive wire DTOs
 	oidcFile      = "oidc.go"          // ADR-101 / PR-A — OIDC / keyless deploy auth DTOs
 )
@@ -617,7 +617,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", billingFile),
 		filepath.Join(root, "pkg", "api", diffFile),
 		filepath.Join(root, "pkg", "api", upstreamsFile),
-filepath.Join(root, "pkg", "api", triggerFile),
+		filepath.Join(root, "pkg", "api", triggerFile),
 		filepath.Join(root, "pkg", "api", oidcFile),
 	}
 	dtos, err := scanDTOs(files)

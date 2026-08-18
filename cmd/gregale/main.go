@@ -64,6 +64,7 @@ Commands:
   man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
   metrics      Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account)
+  throttle-suggestions  Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions <slug> [--range 5m] [--dry-run --candidate-rps N --candidate-burst N])
   mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
   open         Open the app's URL (or its dashboard page) in your browser
   orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|keys ...|transfer-ownership|seat-usage|invitations ...|me)
@@ -375,6 +376,13 @@ func run(args []string) int {
 		// Tier C: --account flips to GET /v1/account/metrics
 		// (account-wide aggregate).
 		return cmdMetrics(args[1:])
+	case "throttle-suggestions":
+		// Phase 4 D2: CLI twin for GET /v1/apps/{slug}/throttle-suggestions.
+		// Mirrors the read-only recommender + dry-run preview.
+		// --dry-run + --candidate-rps + --candidate-burst is the
+		// guard-rail for the customer's own probe value (not
+		// auto-apply). See ADR-104 amendment 5.
+		return cmdThrottleSuggestions(args[1:])
 	case "slo":
 		// Move 2 PR-A: CLI twin for GET /v1/apps/{slug}/slo
 		// (issue #696 / ADR-082). Closed-set windowed SLO

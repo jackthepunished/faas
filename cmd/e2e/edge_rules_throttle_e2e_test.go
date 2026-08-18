@@ -105,6 +105,17 @@ func TestEdgeRulesThrottle_E2E_429Contract(t *testing.T) {
 	if got := headers.Get("x-faas-rate-limit-scope"); got != "route" {
 		t.Errorf("x-faas-rate-limit-scope = %q, want %q", got, "route")
 	}
+	// ADR-104 amendment 5 (issue #881 Phase 4 H1): the throttle
+	// 429 path MUST emit X-RouteRateLimit-Policy. For a
+	// back-compat rule (KeyBy="" — the default for the seedEdgeRuleDirect
+	// action shape above) the value is the literal "route". The
+	// per-consumer collapse path is pinned by the pkg/gateway unit
+	// tests (TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse);
+	// e2e is intentionally limited to the contract surface the
+	// gatewayd process emits without an authn chain.
+	if got := headers.Get("X-RouteRateLimit-Policy"); got != "route" {
+		t.Errorf("X-RouteRateLimit-Policy = %q, want %q (back-compat default for KeyBy=\"\" rules)", got, "route")
+	}
 	if got := headers.Get("Retry-After"); got == "" {
 		t.Errorf("Retry-After header missing on 429")
 	}

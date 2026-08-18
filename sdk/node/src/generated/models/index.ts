@@ -239,6 +239,7 @@ export type { StorageUsageListResponse } from './StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './StorageUsageResponse.js';
 export type { TenantHostnameResponse } from './TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './TenantSurfaceResponse.js';
+export type { ThrottlePreviewRow } from './ThrottlePreviewRow.js';
 export type { ThrottleSuggestionRow } from './ThrottleSuggestionRow.js';
 export type { ThrottleSuggestionsResponse } from './ThrottleSuggestionsResponse.js';
 export type { Trace } from './Trace.js';

@@ -34,12 +34,23 @@ import (
 
 // stubPromQL is the test double for throttlerec.PromQL. The fn
 // callback returns the per-route map for each QueryGrouped call.
+// scalarFn handles QueryScalar (dry-run preview, Phase 4 D1);
+// when nil the stub returns 0 — dry-run is opt-in so tests that
+// don't request it don't have to wire scalarFn.
 type stubPromQL struct {
-	fn func(query, outer, inner string) (map[string]map[string]float64, error)
+	fn       func(query, outer, inner string) (map[string]map[string]float64, error)
+	scalarFn func(query string) (float64, error)
 }
 
 func (s *stubPromQL) QueryGrouped(_ context.Context, query, outer, inner string) (map[string]map[string]float64, error) {
 	return s.fn(query, outer, inner)
+}
+
+func (s *stubPromQL) QueryScalar(_ context.Context, query string) (float64, error) {
+	if s.scalarFn == nil {
+		return 0, nil
+	}
+	return s.scalarFn(query)
 }
 
 // captureLog returns a logger that writes JSON to the returned buffer.
@@ -542,5 +553,150 @@ func TestThrottleRec_LogInjectionGuard(t *testing.T) {
 	}
 	if !strings.Contains(logged, "evilINJECTED") {
 		t.Errorf("captured log = %q, want it to contain %q", logged, "evilINJECTED")
+	}
+}
+
+// TestThrottleRec_DryRunPreview_HappyPath — ADR-104 amendment 5
+// (issue #881 Phase 4 D1): when DryRun=true + CandidateRPS=5 +
+// CandidateBurst=10, the recommender runs the per-route
+// would-have-rejected pass in addition to the recommendation
+// pass. Each surviving route gets a ThrottlePreviewRow echoing
+// the candidate rps and the per-route over-cap count (the
+// number of sub-windows where observed rps exceeded the
+// candidate). PerConsumerLimitNote carries the static literal
+// that names the gateway_requests_by_route_total label gap.
+func TestThrottleRec_DryRunPreview_HappyPath(t *testing.T) {
+	log, _ := captureLog(t)
+	// Recommendation pass returns 2 surviving routes ("GET /a" at
+	// 4 rps, "POST /b" at 8 rps). Candidate=5 rps means route /a is
+	// under cap (no sub-windows over 5), route /b has 3 sub-windows
+	// over 5. We pin the values via scalarFn.
+	stub := &stubPromQL{
+		fn: func(_, _, _ string) (map[string]map[string]float64, error) {
+			return appRow("app-1", map[string]float64{
+				"GET /a":  4.0,
+				"POST /b": 8.0,
+			}), nil
+		},
+		scalarFn: func(query string) (float64, error) {
+			// Map per-route to its pinned over-cap count. The
+			// query embeds the route label, which is enough to
+			// disambiguate.
+			if strings.Contains(query, `route="GET /a"`) {
+				return 0, nil
+			}
+			if strings.Contains(query, `route="POST /b"`) {
+				return 3, nil
+			}
+			return 0, fmt.Errorf("unexpected query: %s", query)
+		},
+	}
+	resp, src := throttlerec.Fetch(context.Background(), stub, log, throttlerec.FetchOptions{
+		AppID:               "app-1",
+		Range:               "5m",
+		Plan:                api.PlanPro,
+		RouteMetricsEnabled: true,
+		DryRun:              true,
+		CandidateRPS:        5,
+		CandidateBurst:      10,
+		NowFn:               func() string { return "2026-08-18T12:00:00Z" },
+	})
+	if src != throttlerec.SourcePrometheus {
+		t.Fatalf("src = %q, want %q", src, throttlerec.SourcePrometheus)
+	}
+	if !resp.DryRun {
+		t.Errorf("DryRun = false, want true")
+	}
+	if resp.CandidateRPS != 5 || resp.CandidateBurst != 10 {
+		t.Errorf("CandidateRPS=%v CandidateBurst=%d, want 5/10", resp.CandidateRPS, resp.CandidateBurst)
+	}
+	if got := resp.PerConsumerLimitNote; got != throttlerec.PerConsumerLimitNoteText {
+		t.Errorf("PerConsumerLimitNote = %q, want %q", got, throttlerec.PerConsumerLimitNoteText)
+	}
+	if got := len(resp.WouldHaveRejected); got != 2 {
+		t.Fatalf("WouldHaveRejected count = %d, want 2", got)
+	}
+	byRoute := map[string]api.ThrottlePreviewRow{}
+	for _, p := range resp.WouldHaveRejected {
+		byRoute[p.Route] = p
+	}
+	if p := byRoute["GET /a"]; p.OverCapCount != 0 || p.CandidateRPS != 5 {
+		t.Errorf("GET /a preview = %+v, want OverCapCount=0 CandidateRPS=5", p)
+	}
+	if p := byRoute["POST /b"]; p.OverCapCount != 3 || p.CandidateRPS != 5 {
+		t.Errorf("POST /b preview = %+v, want OverCapCount=3 CandidateRPS=5", p)
+	}
+	if p := byRoute["GET /a"]; p.WindowStart != "2026-08-18T12:00:00Z" || p.WindowEnd != "2026-08-18T12:00:00Z" {
+		t.Errorf("GET /a window start/end = %q/%q, want 2026-08-18T12:00:00Z/2026-08-18T12:00:00Z (NowFn pin)",
+			p.WindowStart, p.WindowEnd)
+	}
+	// Recommendation slice must remain populated AND unchanged
+	// (dry-run is additive, never destructive).
+	if got := len(resp.Suggestions); got != 2 {
+		t.Errorf("Suggestions count = %d, want 2 (dry-run must not shrink recommendation)", got)
+	}
+}
+
+// TestThrottleRec_DryRunPreview_DisabledWhenCandidateZero — the
+// dry-run pass must short-circuit when CandidateRPS <= 0 (a
+// missing candidate is a wire-shape bug, not "preview with no
+// threshold"). The recommendation slice is still returned.
+func TestThrottleRec_DryRunPreview_DisabledWhenCandidateZero(t *testing.T) {
+	log, _ := captureLog(t)
+	stub := &stubPromQL{
+		fn: func(_, _, _ string) (map[string]map[string]float64, error) {
+			return appRow("app-1", map[string]float64{"GET /a": 4.0}), nil
+		},
+		scalarFn: func(_ string) (float64, error) {
+			t.Errorf("QueryScalar must NOT be called when CandidateRPS<=0 (dry-run disabled)")
+			return 0, nil
+		},
+	}
+	resp, src := throttlerec.Fetch(context.Background(), stub, log, throttlerec.FetchOptions{
+		AppID:               "app-1",
+		Range:               "5m",
+		Plan:                api.PlanPro,
+		RouteMetricsEnabled: true,
+		DryRun:              true,
+		CandidateRPS:        0, // missing → no preview
+	})
+	if src != throttlerec.SourcePrometheus {
+		t.Errorf("src = %q, want prometheus", src)
+	}
+	if resp.DryRun {
+		t.Errorf("DryRun = true, want false (CandidateRPS=0 should disable the preview)")
+	}
+	if len(resp.WouldHaveRejected) != 0 {
+		t.Errorf("WouldHaveRejected = %+v, want empty", resp.WouldHaveRejected)
+	}
+}
+
+// TestThrottleRec_DryRunPreview_OffByDefault — when DryRun=false
+// (the default for Phase 1+2+3 callers), the QueryScalar path is
+// NEVER taken. This pins the back-compat invariant: Phase 4 D1
+// must not change the wire shape for callers that don't opt in.
+func TestThrottleRec_DryRunPreview_OffByDefault(t *testing.T) {
+	log, _ := captureLog(t)
+	stub := &stubPromQL{
+		fn: func(_, _, _ string) (map[string]map[string]float64, error) {
+			return appRow("app-1", map[string]float64{"GET /a": 4.0}), nil
+		},
+		scalarFn: func(_ string) (float64, error) {
+			t.Errorf("QueryScalar must NOT be called when DryRun=false (back-compat)")
+			return 0, nil
+		},
+	}
+	resp, _ := throttlerec.Fetch(context.Background(), stub, log, throttlerec.FetchOptions{
+		AppID:               "app-1",
+		Range:               "5m",
+		Plan:                api.PlanPro,
+		RouteMetricsEnabled: true,
+		// DryRun=false (default)
+	})
+	if resp.DryRun {
+		t.Errorf("DryRun = true, want false (off-by-default)")
+	}
+	if len(resp.WouldHaveRejected) != 0 {
+		t.Errorf("WouldHaveRejected = %+v, want empty (off-by-default)", resp.WouldHaveRejected)
 	}
 }

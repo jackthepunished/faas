@@ -145,7 +145,7 @@ type Querier interface {
 	// the GDPR path (delete-account cascades through
 	// apps → data_upstreams).
 	DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error
-DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error
+	DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error
 	// Operator-driven revoke path (PR-C). Returns 0 rows on miss;
 	// the caller maps that to ErrNotFound. The 5-min TTL is the
 	// natural expiry path; Delete is the "kill this CI job's
@@ -273,33 +273,33 @@ DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error
 	// path; the partition creator (PR-C) drops old
 	// partitions wholesale.
 	InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg InsertDataUpstreamProbeParams) error
-// One row per dead-lettered record. The reason is the closed-vocab
-// failure mode (rate_limited, poison_record, max_attempts,
-// broker_error, plan_quota, payload_too_large, customer_disabled);
-// the routed_to is the closed-vocab terminal action (drop,
-// manual_retry, customer_dlq). detail carries any per-reason payload
-// (the broker error text, the payload size that tripped the 6MB
-// cap, etc.) for the dashboard read-back.
-InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg InsertTriggerDeadLetterParams) error
-// Review finding #1 (PR #910): the dispatcher MUST persist every
-// broker-delivered record into trigger_records BEFORE
-// ClaimTriggerRecords can find them. Without this insert the
-// entire dispatch tick is dead — ClaimTriggerRecords returns 0
-// rows, the broker messages accumulate forever in poller.inFlight,
-// and the unified Trigger primitive never fires a function.
-//
-// ON CONFLICT (trigger_id, item_identifier) DO NOTHING mirrors the
-// broker-side dedupe guarantee (kafka per-partition offset,
-// NATS stream sequence, Redis entry-id, SQS receipt handle,
-// in-platform invocation_id — all globally unique within their
-// own ledger). A re-poll after a partial commit + Ack timeout
-// therefore never inserts a duplicate row.
-//
-// Returning id gives the dispatcher the trigger_records.id that
-// ClaimTriggerRecords surfaces under FOR UPDATE SKIP LOCKED,
-// bridging the item_identifier → row_id namespace the
-// ReportBatchItemFailures handler needs.
-InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTriggerRecordParams) (pgtype.UUID, error)
+	// One row per dead-lettered record. The reason is the closed-vocab
+	// failure mode (rate_limited, poison_record, max_attempts,
+	// broker_error, plan_quota, payload_too_large, customer_disabled);
+	// the routed_to is the closed-vocab terminal action (drop,
+	// manual_retry, customer_dlq). detail carries any per-reason payload
+	// (the broker error text, the payload size that tripped the 6MB
+	// cap, etc.) for the dashboard read-back.
+	InsertTriggerDeadLetter(ctx context.Context, db DBTX, arg InsertTriggerDeadLetterParams) error
+	// Review finding #1 (PR #910): the dispatcher MUST persist every
+	// broker-delivered record into trigger_records BEFORE
+	// ClaimTriggerRecords can find them. Without this insert the
+	// entire dispatch tick is dead — ClaimTriggerRecords returns 0
+	// rows, the broker messages accumulate forever in poller.inFlight,
+	// and the unified Trigger primitive never fires a function.
+	//
+	// ON CONFLICT (trigger_id, item_identifier) DO NOTHING mirrors the
+	// broker-side dedupe guarantee (kafka per-partition offset,
+	// NATS stream sequence, Redis entry-id, SQS receipt handle,
+	// in-platform invocation_id — all globally unique within their
+	// own ledger). A re-poll after a partial commit + Ack timeout
+	// therefore never inserts a duplicate row.
+	//
+	// Returning id gives the dispatcher the trigger_records.id that
+	// ClaimTriggerRecords surfaces under FOR UPDATE SKIP LOCKED,
+	// bridging the item_identifier → row_id namespace the
+	// ReportBatchItemFailures handler needs.
+	InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTriggerRecordParams) (pgtype.UUID, error)
 	// Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
 	// Returns the full row (with created_at server-stamped).
 	InsertOIDCExchangedToken(ctx context.Context, db DBTX, arg InsertOIDCExchangedTokenParams) (InsertOIDCExchangedTokenRow, error)

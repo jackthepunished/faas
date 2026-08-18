@@ -175,7 +175,7 @@ const (
 	NotifyCronChanged       = "cron_changed"
 	NotifyTriggerChanged    = "trigger_changed"
 	// NotifyTriggerReady fires when a row is inserted into
-	// trigger_records (migrations/00281_triggers.sql). schedd's
+	// trigger_records (migrations/00290_triggers.sql). schedd's
 	// dispatch tick consumes via cmd/schedd/main.go's existing
 	// SubscribeWithReconnect block. Listeners:
 	//   - pkg/sched/dispatch_triggers.go (runTriggerTick fan-in
@@ -197,6 +197,17 @@ const (
 	NotifyBillingPastDue  = "billing_past_due"
 	NotifyQuotaWarning    = "quota_warning"
 	NotifyCronFired       = "cron_fired"
+	// NotifyRateLimitChanged fires on every INSERT / UPDATE of
+	// tokens/last_refill on pg_ratelimit_counters (migration
+	// 00126, the C4 trigger). Payload is JSON
+	// {scope, subject_id, plan} — the (scope, subject_id, plan)
+	// triple that uniquely identifies a counter row. Consumed
+	// by pkg/wire/pgratelimit_invalidator.go to invalidate the
+	// in-process LRU cache entries of every gatewayd-internal
+	// replica when a peer writes to the counter (Phase 4 of
+	// issue #881, ADR-104 amendment 5). Channel name is
+	// hard-coded in the SQL trigger — keep them in sync.
+	NotifyRateLimitChanged = "rate_limit_changed"
 	// NotifyCronRunNow fires when a row is inserted into
 	// cron_fire_now_requests (migrations/00193) — apid emits, schedd
 	// consumes via cmd/schedd/main.go's existing SubscribeWithReconnect

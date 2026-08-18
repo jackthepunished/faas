@@ -1,8 +1,8 @@
--- filename: 00282_triggers_payload_max.sql
+-- filename: 00291_triggers_payload_max.sql
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00282_triggers_payload_max.sql — per-trigger broker payload size cap
+-- 00291_triggers_payload_max.sql — per-trigger broker payload size cap
 -- (audit finding #7 from PR #910).
 --
 -- Before: the dispatch tick accepted every broker-delivered record's

@@ -55,6 +55,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -237,7 +238,7 @@ func TestRouteConsumerThrottle_NoBackCompatRegression(t *testing.T) {
 	l.now = clk.Now
 	// AllowWithParams is the PR #887 call shape — same key
 	// shape, no per-consumer accounting.
-	if !l.AllowWithParams("app-1\x00rule-1", 1.0, 1.0) {
+	if !l.AllowWithParams(context.Background(), "app-1\x00rule-1", 1.0, 1.0) {
 		t.Fatalf("AllowWithParams call should admit")
 	}
 	// AllowWithConsumerKey with the same key but a fresh

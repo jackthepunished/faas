@@ -962,6 +962,7 @@ type TriggerRecord struct {
 	LastError        pgtype.Text
 	LastDispatchedAt pgtype.Timestamptz
 }
+
 // Per-(account, app, day) materialised rollup of usage_minutes. Populated by the meterd cron tick FAAS_ROLLUP_INTERVAL (default 5 min) via INSERT ... SELECT ... GROUP BY with ON CONFLICT additive merge. Read by GET /v1/usage/daily. ADR-048. Informational — not billed.
 type UsageDaily struct {
 	AccountID  pgtype.UUID
