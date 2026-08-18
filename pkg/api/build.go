@@ -58,6 +58,16 @@ type BuildManifest struct {
 // writes after the build exits (success or failure). builderd reads this
 // off the drive1 export to classify the result and pick the produced OCI
 // tarball's host path.
+//
+// Error-explanations cluster (spec §6.4 amendment 1): FailureCode carries
+// the RFC 7807 stable code for the failure (app_arch_mismatch /
+// dep_install_failed) when guest-init could identify the root cause at
+// exit time. Empty when guest-init fell back to a coarse
+// FailureClass only (builds pre-cluster, or builds that died before
+// classification ran). builderd's classifyBuildFailure surfaces the
+// FailureCode through to pkg/state.SetDeploymentFailedEx so the
+// customer sees hint/why/fix from pkg/whycopy rather than the legacy
+// bare CodeDeployFailed.
 type BuildDone struct {
 	SchemaVersion int    `json:"schema_version"`
 	BuildID       string `json:"build_id"`
@@ -65,4 +75,14 @@ type BuildDone struct {
 	OCIImagePath  string `json:"oci_image_path"` // path on drive1, typically /build/out/image.tar
 	LogTail       string `json:"log_tail"`
 	FailureClass  string `json:"failure_class,omitempty"`
+	// FailureCode is the RFC 7807 code guest-init identified (e.g.
+	// "app_arch_mismatch" when the build VM's kernel returned
+	// ENOEXEC on the customer binary; "dep_install_failed" with a
+	// `pkg` discriminator via FailurePkg when the install step
+	// itself exited non-zero). Mirrors pkg/api.Code… constants.
+	FailureCode string `json:"failure_code,omitempty"`
+	// FailurePkg is the package manager discriminator for
+	// dep_install_failed (npm / pip / go / cargo / bundler).
+	// Empty for every other code.
+	FailurePkg string `json:"failure_pkg,omitempty"`
 }

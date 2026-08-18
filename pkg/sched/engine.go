@@ -37,6 +37,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"go.opentelemetry.io/otel/attribute"
@@ -4841,6 +4842,30 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 	e.transitionWithKind(ctx, instanceID, appID, terminal, "watchdog_timeout", string(reason))
 	if e.ops != nil {
 		e.ops.WatchdogKills(string(reason), string(terminal)).Inc()
+	}
+
+	// Error-explanations cluster (spec §6.4 amendment 1): a
+	// StuckColdBootTimeout marks the deployment row as failed with
+	// the app_startup_timeout code + prose so post-mortem retrieval
+	// via `gregale inspect <slug> --errors` surfaces the right
+	// hint/why/fix. The watchdog killed the instance because the
+	// cold boot exhausted the budget — that's distinct from the
+	// ECONNREFUSED (app_not_listening) case handled in pkg/fcvm.
+	// Best-effort: SetDeploymentFailedEx failure doesn't block the
+	// instance transition (the transition is the source of truth
+	// for the customer-facing timeline).
+	if reason == StuckColdBootTimeout && fresh.DeploymentID != "" {
+		p := api.NewProblem(422, api.CodeAppStartupTimeout,
+			"app did not become ready in time",
+			fmt.Sprintf("watchdog forced the instance to failed after the cold-boot budget elapsed (instance=%s, app=%s)", instanceID, appID))
+		whycopy.Decorate(p, api.CodeAppStartupTimeout, nil)
+		if _, err := e.store.SetDeploymentFailedEx(ctx, fresh.DeploymentID,
+			api.CodeAppStartupTimeout,
+			fmt.Sprintf("cold_boot_timeout: instance=%s", instanceID),
+			p.Hint, p.Why, p.Fix, nil,
+		); err != nil {
+			e.log.Warn("watchdog: stamp app_startup_timeout failed", "deployment", fresh.DeploymentID, "err", err)
+		}
 	}
 	return nil
 }
