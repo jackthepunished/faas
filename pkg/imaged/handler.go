@@ -1305,6 +1305,13 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 	if err := h.transition(ctx, dep.ID, state.DeployBuilding, ""); err != nil {
 		return err
 	}
+	// ADR-117 TODO: wire transitionWithStage at all 5 sites (1305,
+	// 1355, 1551, 1919, 2305, 2334) before this PR lands. Left
+	// unwired in this checkpoint to avoid shipping inconsistent
+	// stage_state between the two function-deploy paths and the
+	// image-deploy path. The AppendDeploymentStage call shape is
+	// proven in pgstore + memstore; the chokepoint helper is in
+	// pkg/imaged/handler.go above `transition`.
 	// Issue #195 B1.5: every error path from here forward MUST land
 	// the deployment row in a terminal-good state. The inner
 	// buildImageLayer/buildFunctionLayer paths call markDeployFailed
@@ -1355,6 +1362,8 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 	if err := h.transition(ctx, dep.ID, state.DeploySnapshotting, ""); err != nil {
 		return err
 	}
+	// ADR-117 TODO: see transition call at handler.go:1305 — wire
+	// transitionWithStage at all 5 sites before landing.
 	// Hand off to schedd: boot the freshly-built layer once, snapshot it, park
 	// it (spec §5 step 6). The deployment stays in `snapshotting` until
 	// snapshot_written comes back — imaged does not mark it live here.
@@ -2349,6 +2358,46 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 func (h *Handler) transition(ctx context.Context, depID string, status state.DeploymentStatus, errMsg string) error {
 	if err := h.store.UpdateDeploymentStatus(ctx, depID, status, errMsg); err != nil {
 		return fmt.Errorf("imaged: set %s: %w", status, err)
+	}
+	return nil
+}
+
+// transitionWithStage (ADR-117, migration 00288) is the single
+// chokepoint for status changes that ALSO advance the customer-UX
+// stage projection (deployments.stage_state). It maps the internal
+// state-machine status (pending/building/imaging/snapshotting/live)
+// onto the closed 6-stage StageName vocabulary and calls
+// Store.AppendDeploymentStage after the bare transition.
+//
+// Mapping (the closed StageName set lives at pkg/state/types.go:89):
+//
+//	DeployPending       → StageSourceDownload
+//	DeployBuilding      → StageDependencyRestore (cache hit) OR
+//	                      StageImageBuild (cold cache) — see callers
+//	DeployImaging       → StageImageBuild
+//	DeploySnapshotting  → StageSnapshotPrepare
+//	DeployLive          → StageReadiness
+//	DeployFailed        → from == to sentinel (active row marked failed)
+//	DeploySuperseded    → no-op (not a customer-visible stage event)
+//
+// The from→to pair is computed by the caller — this helper is the
+// seam, the policy lives at the call site so the future PR that
+// refines the cache-hit vs cold-cache boundary has a single place
+// to thread it. The bare `transition(...)` is preserved for the
+// failure paths that don't want a stage projection (e.g.
+// markDeployFailed's first flip before the active stage is known).
+func (h *Handler) transitionWithStage(ctx context.Context, depID string, from, to state.StageName, status state.DeploymentStatus, errMsg string) error {
+	if err := h.transition(ctx, depID, status, errMsg); err != nil {
+		return err
+	}
+	if _, err := h.store.AppendDeploymentStage(ctx, depID, from, to, time.Now(), ""); err != nil {
+		// Stage projection is best-effort: a failed append logs
+		// but does NOT roll back the status flip. The SSE consumer
+		// will simply miss one frame for this transition. The
+		// stage_state column is a customer-UX projection; the
+		// state machine on `status` is the source of truth.
+		h.log.Warn("transitionWithStage: append stage failed (status flip preserved)",
+			"deployment_id", depID, "from", from, "to", to, "err", err)
 	}
 	return nil
 }

@@ -4115,6 +4115,62 @@ func (m *MemStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return m.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
+// AppendDeploymentStage (ADR-117, migration 00288) — memstore
+// mirror of PgStore.AppendDeploymentStage. The in-memory shape
+// round-trips through JSON so the tests that exercise the SSE
+// consumer at handlers_ext_test.go and the deployment lifecycle
+// at imaged tests see the exact same wire bytes as production.
+// See pgstore.go::AppendDeploymentStage for the contract.
+func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to StageName, at time.Time, reason string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	var state StageState
+	if len(d.StageState) > 0 {
+		if err := json.Unmarshal(d.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("AppendDeploymentStage: decode stage_state for %s: %w", id, err)
+		}
+	}
+	if state.Current != from {
+		return Deployment{}, ErrNotFound
+	}
+	switch {
+	case from == to:
+		if n := len(state.History); n > 0 {
+			state.History[n-1].Status = "failed"
+			state.History[n-1].Reason = reason
+		}
+	default:
+		var durMs int64
+		if state.CurrentStartedAt != nil {
+			durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+			if durMs < 0 {
+				durMs = 0
+			}
+		}
+		startedAt := at
+		state.History = append(state.History, StageStateItem{
+			Name:       from,
+			StartedAt:  derefTime(state.CurrentStartedAt),
+			EndedAt:    at,
+			DurationMs: durMs,
+			Status:     "completed",
+		})
+		state.Current = to
+		state.CurrentStartedAt = &startedAt
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	d.StageState = encoded
+	m.deployments[id] = d
+	return d, nil
+}
+
 func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, bytes int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

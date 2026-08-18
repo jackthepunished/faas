@@ -5061,6 +5061,113 @@ func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return s.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
+// AppendDeploymentStage (ADR-117, migration 00288) atomically
+// appends a stage transition to deployments.stage_state.
+//
+// Shape:
+//   - On entry (from != to): close the previous `current` row into
+//     `history` with `ended_at = at`, `duration_ms = (at - current_started_at)`,
+//     and `status = "completed"`. Then set the new `current` to `to`
+//     with `current_started_at = at`.
+//   - On failure (from == to): overwrite the active `current` row's
+//     `status` to `"failed"` and stamp `reason`. `history` is
+//     untouched — the active row stays active until a future
+//     `from != to` call closes it.
+//
+// Implementation: read-modify-write at the Go layer. The existing
+// `UpdateDeploymentStatus` (and `transition` chokepoint at
+// pkg/imaged/handler.go:2349) is itself a bare UPDATE with no
+// per-deployment mutex — concurrent transitions are "last write
+// wins" by design, so this method preserves that same posture. A
+// future PR could move the merge into a single SQL expression
+// with `jsonb_set + jsonb_build_array`, but the Go-side shape is
+// easier to reason about and matches the codebase's existing
+// transition-write pattern.
+//
+// The from / to StageName vocabulary is enforced at the schema
+// layer via `deployments_stage_state_current_check`
+// (migrations/00288_deployments_stage_state.sql) so a typo from a
+// future contributor lands as SQLSTATE 23514 at the storage layer
+// before it can leak as a wire-frame typo on `event: stage {name}`.
+func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to StageName, at time.Time, reason string) (Deployment, error) {
+	existing, err := s.DeploymentByID(ctx, id)
+	if err != nil {
+		return Deployment{}, err
+	}
+	var state StageState
+	if len(existing.StageState) > 0 {
+		if err := json.Unmarshal(existing.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("AppendDeploymentStage: decode stage_state for %s: %w", id, err)
+		}
+	}
+	// Sanity: refuse if the row's `current` doesn't match `from`.
+	// The caller is the transition chokepoint — drift here means a
+	// future transition was queued behind a stale read and the
+	// active row has already moved. Bail with ErrNotFound rather
+	// than silently re-write history with a phantom entry.
+	if state.Current != from {
+		return Deployment{}, ErrNotFound
+	}
+	switch {
+	case from == to:
+		// Failure path: stamp the active row's history tail as
+		// failed with the caller-supplied reason. The active row
+		// stays active so the next `from != to` close can still
+		// move it to history.
+		if n := len(state.History); n > 0 {
+			state.History[n-1].Status = "failed"
+			state.History[n-1].Reason = reason
+		}
+	default:
+		// Normal transition: close the active row, advance.
+		var durMs int64
+		if state.CurrentStartedAt != nil {
+			durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+			if durMs < 0 {
+				durMs = 0
+			}
+		}
+		startedAt := at
+		state.History = append(state.History, StageStateItem{
+			Name:       from,
+			StartedAt:  derefTime(state.CurrentStartedAt),
+			EndedAt:    at,
+			DurationMs: durMs,
+			Status:     "completed",
+		})
+		state.Current = to
+		state.CurrentStartedAt = &startedAt
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx, `update deployments set stage_state = $2 where id = $1`, id, encoded)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return Deployment{}, ErrNotFound
+	}
+	return s.DeploymentByID(ctx, id)
+}
+
+// derefTime dereferences *time.Time to time.Time, returning the
+// zero value when the pointer is nil. Used by
+// AppendDeploymentStage to flatten the optional
+// current_started_at into the history entry's started_at — the
+// first transition writes `started_at` from the migration's seed
+// default (null → zero time, which renders as the JSON `null` via
+// the StageStateItem.StartedAt time.Time zero-value marshalling to
+// "0001-01-01T00:00:00Z"; the SSE handler tolerates that and emits
+// it verbatim as the wire-shape started_at).
+func derefTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
+}
+
 func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error {
 	// Issue #96 / ADR-025 axis 2 (PR #116): rootfs_key is the canonical
 	// StorageBackend key (e.g. "apps/<slug>/<depID>.ext4") schedd carries
@@ -12397,7 +12504,8 @@ const deploymentSelectColumnsWithRootfs = `
 	secret_findings, secret_scanned_at,
 	coalesce(parked_reason,''), parked_at,
 	traffic_percent,
-	scope`
+	scope,
+	stage_state`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -12428,7 +12536,8 @@ const deploymentSelectColumnsQualified = `
 	d.secret_findings, d.secret_scanned_at,
 	coalesce(d.parked_reason,''), d.parked_at,
 	d.traffic_percent,
-	d.scope`
+	d.scope,
+	d.stage_state`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -12490,7 +12599,8 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.ScanResult, &scanStatus, &scannedAt,
 		&d.SecretFindings, &d.SecretScannedAt,
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
-		&d.Scope); err != nil {
+		&d.Scope,
+		&d.StageState); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {

@@ -2941,6 +2941,31 @@ type Store interface {
 	// the read path without spinning Postgres.
 	InsertAuditLog(ctx context.Context, entry AuditLog) error
 
+	// AppendDeploymentStage (ADR-117, migration 00288) appends a
+	// closed stage transition to deployments.stage_state and returns
+	// the new row. The `from` and `to` parameters are the
+	// customer-visible `StageName` vocabulary (NOT `DeploymentStatus`
+	// — they collapse the imaging+snapshotting micro-states onto one
+	// `image_build` step); see pkg/state/types.go:89 for the closed
+	// set and migrations/00288_deployments_stage_state.sql for the
+	// schema CHECK that enforces it.
+	//
+	// When `from == to` the method stamps the active row as
+	// `status:"failed"` and carries `reason` through; this is the
+	// builderd failure path (pkg/builderd/builderd.go:653-655
+	// markFailed) and the customer-UX signal that the active stage
+	// died mid-flight.
+	//
+	// The stage_state jsonb is owned entirely by this method —
+	// callers MUST NOT write the column directly. The atomic
+	// JSONB merge is the load-bearing contract: the SSE handler's
+	// 2s polling tick (`statusTicker` at
+	// cmd/apid/handlers_ext.go:4156-4157) reads `stage_state`
+	// verbatim and emits `event: stage` frames per transition, so
+	// any drift between the in-Go state machine and the persisted
+	// jsonb would surface as a missing or duplicated frame.
+	AppendDeploymentStage(ctx context.Context, id string, from, to StageName, at time.Time, reason string) (Deployment, error)
+
 	// ListAuditLog (issue #755 / PR-6) is the dashboard read path
 	// for the audit_log table. The filter struct drives every
 	// WHERE clause; no string-built queries (matches the repo
