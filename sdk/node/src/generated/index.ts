@@ -238,6 +238,7 @@ export type { SourceRefDeployRequest } from './models/SourceRefDeployRequest.js'
 export type { SourceTarballDeployRequest } from './models/SourceTarballDeployRequest.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
+export type { TemplateView } from './models/TemplateView.js';
 export type { TenantHostnameResponse } from './models/TenantHostnameResponse.js';
 export type { TenantSurfaceResponse } from './models/TenantSurfaceResponse.js';
 export type { ThrottlePreviewRow } from './models/ThrottlePreviewRow.js';
@@ -289,6 +290,7 @@ export { QueuesService } from './services/QueuesService.js';
 export { RegistryService } from './services/RegistryService.js';
 export { SecretsService } from './services/SecretsService.js';
 export { SecurityService } from './services/SecurityService.js';
+export { TemplatesService } from './services/TemplatesService.js';
 export { TenantSurfacesService } from './services/TenantSurfacesService.js';
 export { UpstreamsService } from './services/UpstreamsService.js';
 export { UsageService } from './services/UsageService.js';

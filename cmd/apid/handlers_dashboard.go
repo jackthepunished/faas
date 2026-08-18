@@ -73,6 +73,13 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderIndex(w, r, log, acct)
 		case path == "/dashboard/apps":
 			s.renderAppsList(w, r, log, acct)
+		case path == "/dashboard/apps/new":
+			// Issue #961 / Mega-B PR-3 — thin dashboard deploy
+			// wizard. The CLI's `gregale connect repo <owner>/<name>`
+			// (PR-1) deep-links here with ?repo=…; the OAuth
+			// callback redirects here with ?install=…&branch=….
+			// ADR-116 documents the trust-root split.
+			s.renderAppNew(w, r, log, acct)
 		case len(path) > len("/dashboard/apps/") && path[:len("/dashboard/apps/")] == "/dashboard/apps/":
 			slug := path[len("/dashboard/apps/"):]
 			// Per-deploy drill-down (issue #464 / ADR-075):
@@ -1058,6 +1065,16 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 		renderProblem(w, log, err)
 		return
 	}
+	// Issue #961 / Mega-B PR-3 — the account page now ships a
+	// working "Connect GitHub" button (replaces the slice 8 stub).
+	// Mint the connect_github CSRF envelope here so the form's
+	// hidden input matches the cookie the POST handler reads.
+	connectGithubTok, err := middleware.IssueForAuthenticated(s.sessions, "connect_github", view.ID)
+	if err != nil {
+		log.Error("dashboard renderAccount: csrf issue connect_github", "err", err, "account_id", view.ID)
+		renderProblem(w, log, err)
+		return
+	}
 	csrfCookie := &http.Cookie{
 		Name:     middleware.CookieNameAuthenticated,
 		Value:    deleteTok,
@@ -1070,6 +1087,9 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 	http.SetCookie(w, csrfCookie)
 	data.DeleteConfirmToken = deleteTok
 	data.RestoreConfirmToken = restoreTok
+	// Wire to .Data.ConnectGithubConfirmToken in account.html; the
+	// form action is /dashboard/install/connect (handlers_oauth_code_callback.go).
+	data.ConnectGithubConfirmToken = connectGithubTok
 	if view.DeletionRequestedAt != nil {
 		restoreUntil := view.DeletionRequestedAt.Add(state.DeletionGraceDuration()).
 			UTC().Format(time.RFC3339)

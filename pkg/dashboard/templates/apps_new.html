@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} — onebox faas</title>
+  <style nonce="{{.Nonce}}">
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; color: #06c; text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+    .card { border: 1px solid #ddd; border-radius: 6px; padding: 1.5rem; margin: 1.5rem 0; }
+    .empty { padding: 1rem 0; color: #555; }
+    .btn, .btn-cta, .btn-danger { display: inline-block; padding: 0.5rem 1rem; border-radius: 4px; border: 1px solid #888; background: #f6f6f6; color: #111; text-decoration: none; cursor: pointer; font: inherit; }
+    .btn-cta { background: #06c; color: #fff; border-color: #06c; }
+    .btn-cta:hover { background: #058; border-color: #058; }
+    .btn-danger { background: #c33; color: #fff; border-color: #c33; }
+    label { display: block; margin: 0.75rem 0; }
+    label > select, label > input[type="text"] { display: block; min-width: 320px; padding: 0.4rem; margin-top: 0.25rem; border: 1px solid #888; border-radius: 4px; font: inherit; }
+    small.muted { color: #888; }
+    footer { border-top: 1px solid #ddd; padding: 1rem 0; color: #888; margin-top: 2rem; }
+    h1 { margin: 1rem 0; }
+    h2 { margin-top: 1.25rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    <h1>{{.Title}}</h1>
+    <section class="card">
+      <p>Walk through GitHub authorization, pick a repository, and pick a starting template. The dashboard handles the OAuth handshake server-side; the <code>install</code> and <code>production_branch</code> come back pre-filled from the GitHub App callback.</p>
+
+      {{if .Data.NeedsGithubConnect}}
+        <div class="empty">
+          <h2>1. Connect GitHub</h2>
+          <p>The dashboard is the install-token trust root (ADR-116); connecting is what proves you own the GitHub repos you'll bind. Until the GitHub OAuth dance is complete, the wizard can't list your installations.</p>
+          <form method="POST" action="/dashboard/install/connect">
+            <input type="hidden" name="csrf_token" value="{{.Data.ConnectGithubConfirmToken}}">
+            <button type="submit" class="btn-cta">Connect GitHub</button>
+          </form>
+        </div>
+      {{else if .Data.GitHubDegraded}}
+        <div class="empty">
+          <h2>GitHub is unreachable</h2>
+          <p>{{.Data.GitHubDegradedMessage}}</p>
+          <a class="btn" href="/dashboard/apps/new">Retry</a>
+        </div>
+      {{else}}
+        <h2>2. Pick installation, repo, template</h2>
+        <p>All three are pre-filled when you arrived from <code>gregale connect repo &lt;owner&gt;/&lt;name&gt;</code> or the GitHub App callback.</p>
+        <form method="POST" action="/v1/apps/new-app/install/bind">
+          <input type="hidden" name="csrf_token" value="{{.Data.BindAppConfirmToken}}">
+
+          <label>
+            Installation
+            <select name="installation_id">
+              {{range .Data.Installations}}
+                <option value="{{.ID}}" {{if eq (printf "%v" .ID) $.Data.PreFilledInstallID}}selected{{end}}>{{.AccountLogin}} ({{.RepoCount}} repo)</option>
+              {{end}}
+            </select>
+          </label>
+
+          <label>
+            Repository
+            <select name="repo_full_name">
+              {{range .Data.Repos}}
+                <option value="{{.RepoFullName}}" {{if eq .RepoFullName $.Data.PreFilledRepo}}selected{{end}}>{{.RepoFullName}}</option>
+              {{else}}
+                <option value="" disabled selected>No repos visible — install the GitHub App on at least one repo first</option>
+              {{end}}
+            </select>
+          </label>
+
+          <label>
+            Production branch
+            <input type="text" name="production_branch" value="{{.Data.PreFilledBranch}}" placeholder="main">
+          </label>
+
+          <label>
+            Starting template
+            <select name="template_name">
+              {{range .Data.Templates}}
+                <option value="{{.Name}}">{{.Name}} — {{.Description}}</option>
+              {{end}}
+            </select>
+            <small class="muted">Pick a starter; you can customise after the first deploy.</small>
+          </label>
+
+          <label>
+            App slug
+            <input type="text" name="slug" value="my-app" placeholder="my-app" pattern="[a-z0-9-]+" required>
+            <small class="muted">Lowercase letters, digits, and dashes only. The slug becomes the public hostname prefix.</small>
+          </label>
+
+          <button type="submit" class="btn-cta">Bind and create app</button>
+        </form>
+      {{end}}
+
+      <p class="muted" style="margin-top:1rem">
+        Or from a project directory:
+        <code>gregale deploy --template=hello-node</code>
+      </p>
+    </section>
+  </main>
+  <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>
+</body>
+</html>

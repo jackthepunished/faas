@@ -103,6 +103,27 @@ type cliFlag struct {
 	ClosedSet []string
 }
 
+// templateNames13 is the canonical 13-name template catalog. Mirrors
+// cmd/gregale/templates/embed.go::Names verbatim; the ClosedSet literals
+// in deploy/init reference this const so goconst stops flagging the
+// duplicated 13-name lists. Kept in sync with the embed FS by the
+// TestClosedSetTemplatesMatchEmbedFS pin test in commands_meta_test.go.
+var templateNames13 = []string{
+	"hello-node",
+	"hello-python",
+	"hello-go",
+	"cron-example",
+	"function-node",
+	"function-python",
+	"function-go",
+	"s3-uploader",
+	"slack-bot",
+	"rest-api-postgres",
+	"cron-worker",
+	"webhook-receiver",
+	"ai-chat",
+}
+
 // cliCommands is the manifest. One entry per top-level command in
 // main.go's run() switch. Order matches the dispatch table roughly
 // (operator-vs-customer split is intentional — operator commands sit
@@ -305,7 +326,7 @@ var cliCommands = []cliCommand{
 			// poyrazK/faas-deploy-action). No auth, no side effects.
 			// The snippet uses --name / cwd as the app slug.
 			{Name: "github", Short: "emit a GitHub Actions workflow snippet for faas-deploy-action"},
-			{Name: "template", Short: "scaffold from a built-in template", ClosedSet: []string{"node22-http", "python312-http"}},
+			{Name: "template", Short: "scaffold from a built-in template", ClosedSet: templateNames13},
 		},
 	},
 	{
@@ -359,7 +380,7 @@ var cliCommands = []cliCommand{
 		DocSlug: "init",
 		Short:   "Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])",
 		Flags: []cliFlag{
-			{Name: "template", Short: "template name", Req: true, ClosedSet: []string{"node22-http", "python312-http"}},
+			{Name: "template", Short: "template name", Req: true, ClosedSet: templateNames13},
 			{Name: "path", Short: "target directory", Req: true},
 			{Name: "deploy", Short: "deploy after scaffolding"},
 		},

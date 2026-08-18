@@ -114,6 +114,17 @@ var routeExclude = map[string]bool{
 	// exclusion above.
 	"POST /v1/install/repos/list":       true, // bind picker hydrates from this; browser-only
 	"POST /v1/apps/{slug}/install/bind": true, // bind picker writes through this; browser-only
+
+	// Issue #961 / Mega-B PR-3 / ADR-116. The dashboard's
+	// /dashboard/apps/new wizard renders GET /v1/templates as the
+	// "Starting template" dropdown. Cookie-session-authenticated
+	// (NOT API-key) — the dashboard is the install-token trust root
+	// per ADR-116. The Bearer-auth SDK does not model session-cookie
+	// GETs, and the response shape is the same embed.FS the CLI
+	// reads locally (cmd/gregale/templates.Names) so SDK consumers
+	// don't need a typed wrapper. Mirrors the dashboard-auth
+	// exclusion above.
+	"GET /v1/templates": true, // dashboard wizard hydrates from this; session-cookie-only
 }
 
 // sdkMethodExclude lists methods on *Client that aren't a 1:1 wire

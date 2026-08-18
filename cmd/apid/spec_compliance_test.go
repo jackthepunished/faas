@@ -106,6 +106,14 @@ var routeExclude = map[string]bool{
 	"GET /healthz":                                    true, // loopback infra probe
 	"GET /v1/orgs/me":                                 true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
 	"GET /v1/traces/{trace_id}":                       true, // issue #555: gatewayd-public trace endpoint (mounted via bare /v1/traces/ prefix; the scanner doesn't match it)
+	// Issue #961 / Mega-B PR-3 / ADR-116. The dashboard's
+	// /dashboard/apps/new wizard renders GET /v1/templates as the
+	// "Starting template" dropdown. Cookie-session-authenticated
+	// (NOT API-key) — the dashboard is the install-token trust root
+	// per ADR-116. Mirror the exclusion in
+	// cmd/sdk-coverage/main.go::routeExclude; the two lists must
+	// move together.
+	"GET /v1/templates": true, // dashboard wizard hydrates from this; session-cookie-only
 }
 
 // dtoExclude lists pkg/api exported DTOs that are intentionally not in the
@@ -181,6 +189,7 @@ var schemaSpecOnly = map[string]bool{
 	"Trace":                  true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
 	"TraceSpan":              true, // issue #555: subtree of Trace; gateway-internal type
 	"RaiseOverageCapRequest": true, // issue #561: inline {OverageCapCents *int64} in cmd/apid/handlers_ext.go
+	"TemplateView":           true, // issue #961 / Mega-B PR-3: inline {Name, Category, Description string} in cmd/apid/handlers_templates.go
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.

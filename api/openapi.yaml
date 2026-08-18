@@ -187,6 +187,15 @@ tags:
       The active-org hint is accepted via `X-Active-Org` / `?org=`
       on every org-scoped route (matches LoadOrg middleware precedence);
       path-scoped routes resolve via `{slug}` regardless.
+  - name: templates
+    description: |
+      Starter template catalog (issue #961 / Mega-B PR-3). The
+      dashboard's /dashboard/apps/new wizard renders the GET
+      /v1/templates response as the "Starting template" dropdown;
+      the CLI's `gregale deploy --template NAME` and `gregale init
+      --template NAME` validators reference the same source on the
+      CLI side. Cookie-session-authenticated (NOT API-key) per
+      ADR-116 — the dashboard is the install-token trust root.
 
 security:
   - bearerAuth: []
@@ -5859,6 +5868,36 @@ paths:
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/templates:
+    get:
+      tags: [templates]
+      operationId: listTemplates
+      summary: Catalog of starter templates the dashboard wizard renders.
+      description: |
+        Cookie-session-authenticated (NOT API-key). Mirrors the
+        embed.FS in cmd/gregale/templates/ via cmd/gregale/templates.Names
+        without importing the CLI's main package — the dashboard and
+        the CLI read the same 13-entry list through independent paths.
+        Adding a template means a new entry in cmd/gregale/templates/embed.go
+        + the same category + description wiring here.
+
+        Used by the dashboard's /dashboard/apps/new wizard to populate
+        the "Starting template" dropdown. The CLI's `gregale deploy
+        --template NAME` and `gregale init --template NAME` validators
+        reference the same source on the CLI side.
+      responses:
+        '200':
+          description: Every available template with category + description.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TemplateView' }
+              example:
+                - {"name":"hello-node","category":"hello","description":"minimal Node.js HTTP server — first-touch smoke test"}
+                - {"name":"cron-worker","category":"stateless-contract","description":"scheduled job worker with retries — bring your own schedule"}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   # ─── Usage ────────────────────────────────────────────────────────────────
 
   /v1/usage:
@@ -9561,6 +9600,24 @@ components:
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
 
     # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ──────────────────────
+
+    TemplateView:
+      description: "A starter template entry from GET /v1/templates (issue #961 / Mega-B PR-3)."
+      type: object
+      required: [name, category, description]
+      properties:
+        name:
+          type: string
+          description: "The template name — matches cmd/gregale/templates/embed.go::Names verbatim."
+          example: "hello-node"
+        category:
+          type: string
+          enum: [hello, function, stateless-contract, ai]
+          description: "Customer-facing group label (templates.CategoryFor)."
+        description:
+          type: string
+          description: "One-line customer-facing blurb."
+          example: "minimal Node.js HTTP server — first-touch smoke test"
 
     TenantSurfaceResponse:
       description: "A tenant surface: a multi-hostname SAN bundle attached to one app."
