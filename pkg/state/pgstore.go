@@ -60,6 +60,16 @@ var _ Store = (*PgStore)(nil)
 // will grow past it if a future change ever raises the cap).
 const heartbeatHistoryMaxRows = 2000
 
+// DefaultEnvScope is the package-local mirror of api.DefaultEnvScope.
+// ADR-092 PR-A deliberately duplicates the literal here rather than
+// importing pkg/api, because pkg/state → pkg/api would close a cycle
+// (every consumer of pkg/state can import pkg/api on its own, but
+// pkg/api must not import pkg/state — see pkg/api/dto.go for the
+// reverse direction's rules). Kept in sync via a unit test in
+// pkg/state/api_compat_test.go that asserts equality of the
+// string literals — not an import, just a runtime assertion.
+const DefaultEnvScope = "default"
+
 // --- accounts ---------------------------------------------------------------
 
 func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error) {
@@ -11191,7 +11201,8 @@ func (s *PgStore) PutIdempotent(ctx context.Context, accountID, key string, stat
 // We still pass accountID so the SQL is self-contained and the row's FK to
 // accounts(id) is honored (no FK on app_id today; see migration 00005).
 
-// UpsertAppSecret inserts or replaces the (app_id, key) ciphertext row.
+// UpsertAppSecret inserts or replaces the (app_id,
+// scope='default', key) ciphertext row (ADR-092 PR-A).
 // updated_at is bumped on conflict so schedd's "freshest per app" cache
 // can re-stage drive1 even if the value didn't change (matters for
 // rotation flows that re-seal with the same plaintext).
@@ -11202,23 +11213,17 @@ func (s *PgStore) PutIdempotent(ctx context.Context, accountID, key string, stat
 // alert-rule dispatcher, etc. New callers (the per-secret rotate
 // handler in PR-B, the rekey.Replayer in PR-A) use
 // UpsertAppSecretWithKid which stamps kid alongside the new
-// ciphertext.
+// ciphertext. Use UpsertAppSecretInScope for non-default scopes.
 func (s *PgStore) UpsertAppSecret(ctx context.Context, accountID, appID, key string, ciphertext []byte) error {
-	_, err := s.pool.Exec(ctx,
-		`insert into app_secrets (account_id, app_id, key, ciphertext)
-		 values ($1, $2, $3, $4)
-		 on conflict (app_id, key) do update
-		   set ciphertext = excluded.ciphertext,
-		       updated_at = now()`,
-		accountID, appID, key, ciphertext)
-	return err
+	return s.UpsertAppSecretInScope(ctx, accountID, appID, DefaultEnvScope, key, ciphertext)
 }
 
 // UpsertAppSecretWithKid is the kid-stamping sibling of
 // UpsertAppSecret (ADR-089 PR-A / migration 00166). The kid column
 // records which host identity sealed the row so operators can
 // answer "what key sealed this row?" without parsing the
-// ciphertext blob.
+// ciphertext blob. Hardcodes scope='default' (PR-A); use
+// UpsertAppSecretWithKidInScope for any other scope.
 //
 // ADR-089 D4: the kid is stamped at every Seal, both the user-
 // initiated rotate handler (PR-B) and the rekey.Replayer (PR-A).
@@ -11228,30 +11233,63 @@ func (s *PgStore) UpsertAppSecret(ctx context.Context, accountID, appID, key str
 // after Replayer.Run completes the entire app_secrets table has
 // kid = current.
 func (s *PgStore) UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+	return s.UpsertAppSecretWithKidInScope(ctx, accountID, appID, DefaultEnvScope, key, kid, ciphertext)
+}
+
+// GetAppSecret returns the (account_id, app_id, scope='default',
+// key) row including ciphertext, kid, and timestamps. Returns
+// ErrNotFound when no row matches. Used by the per-secret rotate
+// handler (PR-B) to distinguish first-time set (emits secret.set
+// audit kind) from rotation (emits secret.rotated). Use
+// GetAppSecretInScope for non-default scopes.
+func (s *PgStore) GetAppSecret(ctx context.Context, accountID, appID, key string) (*AppSecret, error) {
+	return s.GetAppSecretInScope(ctx, accountID, appID, DefaultEnvScope, key)
+}
+
+// UpsertAppSecretInScope is the scope-aware sibling of
+// UpsertAppSecret (ADR-092 PR-A / migration 00214). Writes-or-
+// replaces the (app_id, scope, key) row at the caller-supplied
+// scope. Mirrors UpsertAppSecret's ON CONFLICT shape — the PK
+// widening to (app_id, scope, key) means the conflict target is
+// now a 3-column tuple.
+func (s *PgStore) UpsertAppSecretInScope(ctx context.Context, accountID, appID, scope, key string, ciphertext []byte) error {
 	_, err := s.pool.Exec(ctx,
-		`insert into app_secrets (account_id, app_id, key, ciphertext, kid)
+		`insert into app_secrets (account_id, app_id, scope, key, ciphertext)
 		 values ($1, $2, $3, $4, $5)
-		 on conflict (app_id, key) do update
+		 on conflict (app_id, scope, key) do update
 		   set ciphertext = excluded.ciphertext,
-		       kid = excluded.kid,
 		       updated_at = now()`,
-		accountID, appID, key, ciphertext, kid)
+		accountID, appID, scope, key, ciphertext)
 	return err
 }
 
-// GetAppSecret returns the (account_id, app_id, key) row including
-// ciphertext, kid, and timestamps. Returns ErrNotFound when no
-// row matches the (account_id, app_id, key) triple. Used by the
-// per-secret rotate handler (PR-B) to distinguish first-time set
-// (emits secret.set audit kind) from rotation (emits secret.rotated).
-func (s *PgStore) GetAppSecret(ctx context.Context, accountID, appID, key string) (*AppSecret, error) {
+// UpsertAppSecretWithKidInScope is the kid-stamping scope-aware
+// sibling (ADR-092 PR-A). Mirrors UpsertAppSecretInScope but
+// stamps kid alongside ciphertext.
+func (s *PgStore) UpsertAppSecretWithKidInScope(ctx context.Context, accountID, appID, scope, key, kid string, ciphertext []byte) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into app_secrets (account_id, app_id, scope, key, ciphertext, kid)
+		 values ($1, $2, $3, $4, $5, $6)
+		 on conflict (app_id, scope, key) do update
+		   set ciphertext = excluded.ciphertext,
+		       kid = excluded.kid,
+		       updated_at = now()`,
+		accountID, appID, scope, key, ciphertext, kid)
+	return err
+}
+
+// GetAppSecretInScope is the scope-aware sibling of GetAppSecret
+// (ADR-092 PR-A). Returns the (account_id, app_id, scope, key) row
+// including ciphertext, kid, and timestamps. Returns ErrNotFound
+// when no row matches.
+func (s *PgStore) GetAppSecretInScope(ctx context.Context, accountID, appID, scope, key string) (*AppSecret, error) {
 	var out AppSecret
 	err := s.pool.QueryRow(ctx,
-		`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
+		`select account_id, app_id, scope, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 		 from app_secrets
-		 where account_id = $1 and app_id = $2 and key = $3`,
-		accountID, appID, key).Scan(
-		&out.AccountID, &out.AppID, &out.Key, &out.Ciphertext, &out.Kid, &out.CreatedAt, &out.UpdatedAt)
+		 where account_id = $1 and app_id = $2 and scope = $3 and key = $4`,
+		accountID, appID, scope, key).Scan(
+		&out.AccountID, &out.AppID, &out.Scope, &out.Key, &out.Ciphertext, &out.Kid, &out.CreatedAt, &out.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -11302,11 +11340,17 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	// non-empty cursor → composite >= with explicit uuid casts. The
 	// composite-uuid text ordering is what gives us a stable, restartable
 	// walk — see pkg/rekey/rekey.go for the cursor semantics.
+	//
+	// ADR-092 PR-A widened the cursor from 3-tuple to 4-tuple by adding
+	// `scope`. The 3-tuple form is still accepted for the lazy-fallback
+	// window so an in-flight Replayer that persisted a pre-PR LastID
+	// continues to work after the rollout — a 3-tuple cursor is treated
+	// as scope='default'.
 	if cursor == "" {
 		rows, err := s.pool.Query(ctx,
-			`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
+			`select account_id, app_id, scope, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 			 from app_secrets
-			 order by account_id asc, app_id asc, key asc
+			 order by account_id asc, app_id asc, scope asc, key asc
 			 limit $1`,
 			limit)
 		if err != nil {
@@ -11316,25 +11360,32 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 		var out []AppSecret
 		for rows.Next() {
 			var r AppSecret
-			if err := rows.Scan(&r.AccountID, &r.AppID, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			if err := rows.Scan(&r.AccountID, &r.AppID, &r.Scope, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
 				return nil, err
 			}
 			out = append(out, r)
 		}
 		return out, rows.Err()
 	}
-	parts := strings.SplitN(cursor, "|", 3)
-	if len(parts) != 3 {
+	parts := strings.SplitN(cursor, "|", 4)
+	var curAcct, curApp, curScope, curKey string
+	switch len(parts) {
+	case 4:
+		curAcct, curApp, curScope, curKey = parts[0], parts[1], parts[2], parts[3]
+	case 3:
+		// Pre-PR 3-tuple: scope collapses to DefaultEnvScope.
+		curAcct, curApp, curKey = parts[0], parts[1], parts[2]
+		curScope = DefaultEnvScope
+	default:
 		return nil, fmt.Errorf("pgstore: malformed rekey cursor %q", cursor)
 	}
-	curAcct, curApp, curKey := parts[0], parts[1], parts[2]
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
+		`select account_id, app_id, scope, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 		 from app_secrets
-		 where (account_id, app_id, key) >= ($1::uuid, $2::uuid, $3)
-		 order by account_id asc, app_id asc, key asc
-		 limit $4`,
-		curAcct, curApp, curKey, limit)
+		 where (account_id, app_id, scope, key) >= ($1::uuid, $2::uuid, $3, $4)
+		 order by account_id asc, app_id asc, scope asc, key asc
+		 limit $5`,
+		curAcct, curApp, curScope, curKey, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -11342,7 +11393,7 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	var out []AppSecret
 	for rows.Next() {
 		var r AppSecret
-		if err := rows.Scan(&r.AccountID, &r.AppID, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.Scope, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -11350,14 +11401,23 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	return out, rows.Err()
 }
 
-// DeleteAppSecret removes the (app_id, key) row scoped to accountID.
-// Returns ErrNotFound when no row matches the (account_id, app_id, key)
-// triple — the handler renders 400 CodeSecretNotFound (intentional: the
-// URL resource IS the secret name, by design).
+// DeleteAppSecret removes the (app_id, scope='default', key) row
+// scoped to accountID (ADR-092 PR-A). Returns ErrNotFound when no
+// row matches — the handler renders 400 CodeSecretNotFound
+// (intentional: the URL resource IS the secret name, by design).
+// Use DeleteAppSecretInScope for non-default scopes.
 func (s *PgStore) DeleteAppSecret(ctx context.Context, accountID, appID, key string) error {
+	return s.DeleteAppSecretInScope(ctx, accountID, appID, DefaultEnvScope, key)
+}
+
+// DeleteAppSecretInScope is the scope-aware sibling of
+// DeleteAppSecret (ADR-092 PR-A). The PK widening to
+// (app_id, scope, key) means the WHERE clause gains a `scope = $3`
+// predicate.
+func (s *PgStore) DeleteAppSecretInScope(ctx context.Context, accountID, appID, scope, key string) error {
 	tag, err := s.pool.Exec(ctx,
-		`delete from app_secrets where account_id = $1 and app_id = $2 and key = $3`,
-		accountID, appID, key)
+		`delete from app_secrets where account_id = $1 and app_id = $2 and scope = $3 and key = $4`,
+		accountID, appID, scope, key)
 	if err != nil {
 		return err
 	}
@@ -11367,25 +11427,53 @@ func (s *PgStore) DeleteAppSecret(ctx context.Context, accountID, appID, key str
 	return nil
 }
 
-// ListAppSecrets returns every (key, ciphertext) row on the app, scoped
-// to accountID. Order: by key ASC for deterministic wake staging (so a
-// rotated order of upserts doesn't shuffle the env map on every wake).
-// Returns nil slice (not error) when the app has no secrets — schedd
-// treats that as "no env file to write".
-//
-// ADR-089 PR-A: select list widened to include the new kid column
-// (migration 00166). schedd's wake-time reader (pkg/sched/engine.go
-// loadSealedEnvFor) does NOT consume kid — it only needs (key,
-// ciphertext) to hand to vmmd — but reading the column keeps the
-// AppSecret struct symmetric with UpsertAppSecretWithKid and avoids
-// the "kid missing on read but present on write" inconsistency
-// surfaced in PR review of issue #736.
-func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error) {
+// ListAppSecretsInScope is the scope-aware sibling of
+// ListAppSecrets (ADR-092 PR-A). Returns every (key, ciphertext,
+// kid, timestamps) row on the app where scope matches the
+// caller-supplied value, scoped to accountID. Order: by scope
+// ASC, key ASC for deterministic wake staging.
+func (s *PgStore) ListAppSecretsInScope(ctx context.Context, accountID, appID, scope string) ([]AppSecret, error) {
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, key, ciphertext, coalesce(kid, '') as kid, created_at, updated_at
+		`select account_id, app_id, scope, key, ciphertext, coalesce(kid, '') as kid, created_at, updated_at
+		 from app_secrets
+		 where account_id = $1 and app_id = $2 and scope = $3
+		 order by scope asc, key asc`,
+		accountID, appID, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppSecret
+	for rows.Next() {
+		var r AppSecret
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.Scope, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListAppSecrets returns every secret on the app where scope =
+// 'default', scoped to accountID (ADR-092 PR-A delegation). Use
+// ListAppSecretsInScope for the scope-aware path; use
+// ListAllAppSecrets for the cross-scope enumeration the GET
+// ?scope=__all__ handler renders (PR-B).
+func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error) {
+	return s.ListAppSecretsInScope(ctx, accountID, appID, DefaultEnvScope)
+}
+
+// ListAllAppSecrets is the cross-scope mirror of ListAppSecrets
+// (ADR-092 PR-A). Used by apid's GET
+// /v1/apps/{slug}/secrets?scope=__all__ arm (PR-B) to render the
+// nested secrets_by_scope response shape. Order: by scope ASC,
+// key ASC.
+func (s *PgStore) ListAllAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, scope, key, ciphertext, coalesce(kid, '') as kid, created_at, updated_at
 		 from app_secrets
 		 where account_id = $1 and app_id = $2
-		 order by key asc`,
+		 order by scope asc, key asc`,
 		accountID, appID)
 	if err != nil {
 		return nil, err
@@ -11393,11 +11481,11 @@ func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) (
 	defer rows.Close()
 	var out []AppSecret
 	for rows.Next() {
-		var s AppSecret
-		if err := rows.Scan(&s.AccountID, &s.AppID, &s.Key, &s.Ciphertext, &s.Kid, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		var r AppSecret
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.Scope, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
-		out = append(out, s)
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
@@ -11439,9 +11527,19 @@ func (s *PgStore) ListAppSecretsForAccount(ctx context.Context, accountID string
 	return out, rows.Err()
 }
 
-// CountAppSecrets is the quota helper. Used by apid's PUT handler to
-// enforce Limits.SecretCountMax BEFORE UpsertAppSecret so a quota-exceeded
-// request never overwrites an existing (app_id, key) row.
+// CountAppSecrets is the quota helper (ADR-092 PR-A). Used by
+// apid's PUT handler (PR-B widens it to scope-aware) to enforce
+// Limits.SecretCountMax BEFORE UpsertAppSecretInScope so a
+// quota-exceeded request never overwrites an existing
+// (app_id, scope, key) row.
+//
+// ADR-092 limits decision: SecretCountMax is GLOBAL across scopes
+// (parallel to ADR-090 D6 on env). A customer with 80 prod +
+// 80 staging secrets is 160 total — exceeds Scale cap of 100
+// and returns ErrPlanLimitSecrets. This is the right cap
+// because customers will assume "100 per scope" without
+// reading the docs. PR-A leaves the SQL predicate unchanged
+// (no scope filter); the count is across all scopes by design.
 func (s *PgStore) CountAppSecrets(ctx context.Context, accountID, appID string) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,

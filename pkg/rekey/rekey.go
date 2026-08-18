@@ -84,7 +84,7 @@ type RekeyProgress struct {
 	Rekeyed int    // rows successfully re-sealed under current
 	Skipped int    // rows whose kid already matched current (no-op)
 	Failed  int    // rows that errored (bad ciphertext, timeout, etc.)
-	LastID  string // last (account_id, app_id, key) tuple visited; for crash recovery
+	LastID  string // last (account_id, app_id, scope, key) tuple visited; for crash recovery
 }
 
 // Replayer walks app_secrets and re-seals rows under the current
@@ -248,7 +248,7 @@ func (r *Replayer) Run(
 		// terminates when the table has been fully visited.
 		var fresh []state.AppSecret
 		for _, row := range batch {
-			ck := encodeCursor(row.AccountID, row.AppID, row.Key)
+			ck := encodeCursor(row.AccountID, row.AppID, row.Scope, row.Key)
 			if _, ok := seen[ck]; ok {
 				continue
 			}
@@ -263,7 +263,7 @@ func (r *Replayer) Run(
 
 		for _, row := range fresh {
 			p.Total++
-			rowCursor := encodeCursor(row.AccountID, row.AppID, row.Key)
+			rowCursor := encodeCursor(row.AccountID, row.AppID, row.Scope, row.Key)
 			seen[rowCursor] = struct{}{}
 
 			if row.Kid == r.currentKid {
@@ -340,11 +340,28 @@ func (r *Replayer) Run(
 	}
 }
 
-// encodeCursor serialises the (account_id, app_id, key) tuple
-// into a LastID string. Uses '\x00' as a separator since it
-// cannot appear in a key (key shape is ^[A-Z][A-Z0-9_]*$) or a
-// UUID (hex chars only). Returns "<account_id>|<app_id>|<key>"
-// for readability in logs; tests can split on the same shape.
-func encodeCursor(accountID, appID, key string) string {
-	return accountID + "|" + appID + "|" + key
+// encodeCursor serialises the (account_id, app_id, scope, key)
+// tuple into a LastID string. Returns
+// "<account_id>|<app_id>|<scope>|<key>".
+//
+// ADR-092 PR-A: widened from 3-tuple to 4-tuple to thread scope
+// alongside the other PK columns of app_secrets. Crash-recovery
+// cursor pins for in-flight Replayer instances whose LastID was
+// previously persisted in the pre-PR form — the pgstore
+// ListAppSecretsForRekey cursor decoder (pkg/state/pgstore.go
+// :10220-10260) lazy-falls-back: a 3-segment cursor is treated
+// as scope='default' for the first batch of the resumed walk;
+// the operator's first post-rollout Run upgrades the cursor to
+// 4-segment form via encodeCursor and the fallback is no longer
+// reached. The on-disk shape of kid, ciphertext, and the secret
+// rows themselves is unchanged — only the cursor wire format
+// gains one more component.
+//
+// Note on the original doc: "Uses '\x00' as separator" was a
+// stale note — the actual implementation has always used '|'.
+// The literal value matters for backend-side split_part parsers
+// (the pgstore decoder is shared with the lazy-3→4 fallback
+// path), so '|' is preserved here.
+func encodeCursor(accountID, appID, scope, key string) string {
+	return accountID + "|" + appID + "|" + scope + "|" + key
 }

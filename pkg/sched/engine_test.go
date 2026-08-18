@@ -2937,7 +2937,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed OAUTH: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, nil)
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, nil)
 		if err != nil {
 			t.Fatalf("loadSealedEnvFor: %v", err)
 		}
@@ -2967,7 +2967,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed OAUTH: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"DB_URL": "secret:DB_URL",
 		})
 		if err != nil {
@@ -2988,7 +2988,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed DB_URL: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"NONEXISTENT": "secret:NONEXISTENT",
 		})
 		if err == nil {
@@ -3009,7 +3009,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed DB_URL: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"MISSING_A": "secret:MISSING_A",
 			"MISSING_B": "secret:MISSING_B",
 			"MISSING_C": "secret:MISSING_C",
@@ -3038,7 +3038,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed DB_URL: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"DB_URL": "plaintext-no-prefix", // malformed ref, but row exists
 		})
 		if err != nil {
@@ -3053,7 +3053,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 		s := state.NewMemStore()
 		_, app, _ := seedApp(t, s, api.PlanHobby, 256, 1)
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, nil)
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, nil)
 		if err != nil {
 			t.Fatalf("loadSealedEnvFor: %v", err)
 		}
@@ -3066,7 +3066,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 		s := state.NewMemStore()
 		_, app, _ := seedApp(t, s, api.PlanHobby, 256, 1)
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"DB_URL": "secret:DB_URL",
 		})
 		if err == nil {
