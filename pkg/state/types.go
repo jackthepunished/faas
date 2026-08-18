@@ -845,6 +845,16 @@ type App struct {
 	// customer so they can pin a preview they want to keep. NULL
 	// on production apps.
 	PreviewExpiresAt *time.Time
+	// PreviewDestroyCommentedAt is the dedupe carrier for the
+	// one-click PR comment destroy surface (Mega-C PR-1 / issue
+	// #961 leaf 3). githubd's previewCommentOnce writes now() to
+	// this column after a successful POST to
+	// api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments;
+	// subsequent events for the same (app, PR) tuple skip the
+	// post. NULL on rows where the dispatcher has never
+	// commented (the common case for production apps and for
+	// previews provisioned before this migration landed).
+	PreviewDestroyCommentedAt *time.Time
 	// CORSDefaultEnabled is the per-app default CORS opt-in
 	// (ADR-091 CORS improvements D1 / spec §4.1.2.6). When
 	// false (the default for every pre-PR app), the gateway

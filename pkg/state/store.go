@@ -1159,6 +1159,17 @@ type Store interface {
 	// Soft-deleted rows are filtered out — the teardown janitor's
 	// tombstone-aware sweep uses ListPreviewsForTeardown instead.
 	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
+	// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) lists
+	// every non-deleted preview row for the account, across all
+	// parents. Backs the new /dashboard/previews page (a global
+	// "all open PRs" view that complements the per-app preview
+	// panel). Ordered by created_at DESC so the dashboard's
+	// newest-first display is free.
+	//
+	// Returns an empty slice (not an error) when the account has
+	// no previews. Production apps (preview_of_slug IS NULL) are
+	// filtered out — this is a preview-only view.
+	ListPreviewsForAccount(ctx context.Context, accountID string) ([]App, error)
 	// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) returns
 	// preview rows the teardown janitor should consider this tick:
 	// every non-torn_down preview that is either in a terminal-ish
@@ -1190,6 +1201,18 @@ type Store interface {
 	// production app id is ErrNotFound, so a bug in the janitor's
 	// query can never relabel a customer's live app.
 	SetPreviewPrState(ctx context.Context, appID, prState string) (App, error)
+	// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961
+	// leaf 3) records that the one-click PR comment destroy hint
+	// was posted to GitHub for this preview row. githubd's
+	// previewCommentOnce helper calls this after a successful
+	// POST so a closed → reopen → closed cycle does not spam
+	// the customer with duplicate comments.
+	//
+	// Only preview rows (preview_of_slug <> '') are eligible; a
+	// production app id is ErrNotFound. The stamp is idempotent:
+	// re-stamping the same timestamp is a no-op (the column value
+	// is the dedupe key, not the row identity).
+	StampPreviewDestroyCommentedAt(ctx context.Context, appID string, when time.Time) (App, error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and

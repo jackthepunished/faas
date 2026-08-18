@@ -1859,8 +1859,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12::cidr[], $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, preview_destroy_commented_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12::cidr[], $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
 		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1897,6 +1897,12 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		// the canonical "all four columns are NULL" producer.
 		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
 		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// Mega-C PR-1 / issue #961 leaf 3: dedupe carrier.
+		// nullableTimestamptzPtr coerces a nil *time.Time to SQL
+		// NULL, which is the correct shape for both production
+		// rows (never commented) and freshly-provisioned
+		// preview rows (comment post happens AFTER CreateApp).
+		nullableTimestamptzPtr(app.PreviewDestroyCommentedAt),
 		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 		// maintenance flag (apps.maintenance_mode). Written
 		// explicitly so the App struct's value (default false)
@@ -2047,8 +2053,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, preview_destroy_commented_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
 		returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -2079,6 +2085,12 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		// this path) never carry preview metadata.
 		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
 		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// Mega-C PR-1 / issue #961 leaf 3: dedupe carrier.
+		// nullableTimestamptzPtr coerces a nil *time.Time to SQL
+		// NULL, which is the correct shape for both production
+		// rows (never commented) and freshly-provisioned
+		// preview rows (comment post happens AFTER CreateApp).
+		nullableTimestamptzPtr(app.PreviewDestroyCommentedAt),
 		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 		// maintenance flag. Same explicit-write posture as
 		// CreateApp above — the schema DEFAULT would yield
@@ -2129,6 +2141,31 @@ func (s *PgStore) PreviewAppsByParent(ctx context.Context, accountID, parentSlug
 	if err != nil {
 		return nil, fmt.Errorf("state: preview apps by parent %q/%q: %w", accountID, parentSlug, err)
 	}
+	defer rows.Close()
+	return scanApps(rows)
+}
+
+// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) is the
+// global "all my open PRs" view that backs the new
+// /dashboard/previews page. Same shape as PreviewAppsByParent but
+// no parent_slug filter — returns every non-deleted preview row
+// for the account. The query plan uses the same
+// apps_preview_of_slug_idx partial index because every row in the
+// result set satisfies preview_of_slug IS NOT NULL (production
+// apps are filtered out).
+//
+// Soft-deleted previews are excluded (matching the per-parent
+// pane's contract — "torn down" rows live in the janitor's
+// sweep, not the customer-facing list). The account_id predicate
+// is the same defence-in-depth as PreviewAppsByParent.
+func (s *PgStore) ListPreviewsForAccount(ctx context.Context, accountID string) ([]App, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+appsSelectColumns+` from apps where account_id = $1 and preview_of_slug is not null and status <> 'deleted' order by created_at desc`,
+		accountID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list previews for account %q: %w", accountID, err)
+	}
+	defer rows.Close()
 	return scanApps(rows)
 }
 
@@ -2195,6 +2232,35 @@ func (s *PgStore) SetPreviewPrState(ctx context.Context, appID, prState string) 
 		update apps set preview_pr_state = $2
 		where id = $1 and preview_of_slug is not null
 		returning `+appsSelectColumns, appID, prState)
+	if err := scanAppInto(&a, row); err != nil {
+		return App{}, mapErr(err)
+	}
+	return a, nil
+}
+
+// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961 leaf 3)
+// records that the one-click PR comment destroy hint was posted
+// to GitHub for this preview row. githubd's previewCommentOnce
+// helper calls this after every successful POST so a closed →
+// reopen → closed cycle does not spam the customer.
+//
+// The WHERE preview_of_slug IS NOT NULL guard mirrors
+// SetPreviewPrState above: a buggy caller cannot stamp a
+// production app's dedupe column. Returns ErrNotFound when the
+// row is missing OR when the row is a production app — same
+// code path because both are zero-rows-updated.
+//
+// Idempotent: re-stamping the column with the same timestamp is
+// a no-op (the column value is the dedupe key, not the row
+// identity). The githubd caller's invariant is "stamp exactly
+// once per (app, PR) tuple"; the column carries the audit row
+// for that single post.
+func (s *PgStore) StampPreviewDestroyCommentedAt(ctx context.Context, appID string, when time.Time) (App, error) {
+	var a App
+	row := s.pool.QueryRow(ctx, `
+		update apps set preview_destroy_commented_at = $2
+		where id = $1 and preview_of_slug is not null
+		returning `+appsSelectColumns, appID, when)
 	if err := scanAppInto(&a, row); err != nil {
 		return App{}, mapErr(err)
 	}
@@ -13114,6 +13180,12 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// EgressAllowlist handles the empty case). No helper
 		// normalisation needed.
 		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt,
+		// Mega-C PR-1 / issue #961 leaf 3: dedupe carrier for
+		// the one-click PR comment destroy surface. Nullable
+		// timestamptz scanned into *time.Time directly (pgx
+		// handles SQL NULL → Go nil natively — same shape as
+		// PreviewExpiresAt above).
+		&a.PreviewDestroyCommentedAt,
 		&corsDefaultEnabled, &a.CORSDefaultOrigins,
 		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
 		// maintenance flag (apps.maintenance_mode). NOT NULL
@@ -13246,6 +13318,13 @@ const appsSelectColumns = `
 	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
 	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
 	coalesce(preview_pr_state, ''), preview_expires_at,
+	-- Mega-C PR-1 / issue #961 leaf 3: dedupe carrier for the
+	-- one-click PR comment destroy surface. Nullable
+	-- timestamptz; preview_destroy_commented_at IS NULL means
+	-- "githubd has never posted a destroy hint comment for this
+	-- preview row". pgx scans nullable timestamptz → *time.Time
+	-- natively; no coalesce needed.
+	preview_destroy_commented_at,
 	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
 	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00224);
 	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the

@@ -2470,6 +2470,44 @@ func (m *MemStore) SetPreviewPrState(_ context.Context, appID, prState string) (
 	return a, nil
 }
 
+// StampPreviewDestroyCommentedAt (Mega-C PR-1 / issue #961 leaf 3)
+// is the MemStore mirror of PgStore.StampPreviewDestroyCommentedAt.
+// Preview-only by construction; production rows return
+// ErrNotFound. Idempotent: re-stamping the same timestamp is a
+// no-op (the column value is the dedupe key, not the row identity).
+func (m *MemStore) StampPreviewDestroyCommentedAt(_ context.Context, appID string, when time.Time) (App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok || a.PreviewOfSlug == "" {
+		return App{}, ErrNotFound
+	}
+	t := when
+	a.PreviewDestroyCommentedAt = &t
+	m.apps[appID] = a
+	return a, nil
+}
+
+// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) is the
+// MemStore mirror of PgStore.ListPreviewsForAccount. Returns every
+// non-deleted preview row for the account across all parents;
+// production apps (PreviewOfSlug == "") are filtered out.
+func (m *MemStore) ListPreviewsForAccount(_ context.Context, accountID string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.AccountID != accountID || a.PreviewOfSlug == "" || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 func (m *MemStore) ListApps(_ context.Context, accountID string) ([]App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
