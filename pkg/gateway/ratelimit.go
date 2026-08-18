@@ -62,6 +62,18 @@ type Limiter struct {
 	// elems maps bucket key → its element in ll. Kept in lockstep with
 	// buckets whenever ll is non-nil.
 	elems map[string]*list.Element
+	// ruleConsumers tracks the per-rule consumer set for Phase 3
+	// (ADR-104, issue #881 Phase 3). Keyed by rule key
+	// (appID+"\x00"+ruleID); values are the set of consumer IDs the
+	// limiter has allocated a bucket for. Used by
+	// AllowWithConsumerKey to decide whether a new consumer ID
+	// should get its own bucket (set has room) or collapse into the
+	// rule's __other__ bucket (set at cap). Lazy-initialised on
+	// first contact; only populated by AllowWithConsumerKey, so the
+	// Allow / AllowAccount / AllowWithParams paths pay no bookkeeping
+	// cost. The maps are dropped in forgetLocked / ForgetAll when
+	// the corresponding ruleKey bucket is forgotten.
+	ruleConsumers map[string]map[string]struct{}
 }
 
 type bucket struct {
@@ -72,11 +84,166 @@ type bucket struct {
 	// key is duplicated here so evictOneLocked can delete the map entry
 	// from a list element without a reverse scan.
 	key string
+	// pinned marks buckets that MUST NOT be evicted even when they refill
+	// to ceiling. Phase 3 (ADR-104) sets pinned=true on the per-rule
+	// __other__ collapse bucket so an attacker cannot weaponise the LRU
+	// discipline to bypass the throttle by minting many distinct
+	// consumer IDs and pushing the per-rule consumer-set past its
+	// cap — the __other__ bucket is the only bucket that stays live
+	// when the cap is exceeded, and dropping it would reset the
+	// collapse to a full bucket, letting the attacker drain it again.
+	pinned bool
+}
+
+// ConsumerKeySentinel is the suffix used for the per-rule __other__
+// collapse bucket (ADR-104, issue #881 Phase 3). It is reserved —
+// the limiter constructor rejects consumer IDs that exactly match
+// this sentinel so a customer cannot smuggle it through key_by
+// inputs and bypass the collapse.
+const ConsumerKeySentinel = "__other__"
+
+// AllowWithConsumerKey is the per-consumer variant of AllowWithParams
+// (ADR-091 D20.5 amendment 4, ADR-104, issue #881 Phase 3). Caller
+// (cmd-side applyEdgeRuleThrottle) supplies the rule's identity
+// (ruleKey — the convention `appID + "\x00" + ruleID`), the
+// consumer identity (consumerID — the API key id, JWT subject, or
+// JWT custom-claim value, sourced from the Authenticated struct on
+// the request context), the rule's per-rule rps and burst, and the
+// per-rule consumer-set cap (MaxKeysPerRule).
+//
+// Bounded design (the load-bearing safety property — see ADR-104
+// §Consequences): the limiter tracks the per-rule consumer set
+// (`ruleConsumers` map) and when a NEW consumer ID arrives for a
+// rule whose set is already at the cap, the limiter collapses that
+// consumer into the rule's __other__ bucket instead of allocating a
+// new consumer bucket. The __other__ bucket is pinned non-evictable
+// (bucket.pinned = true) so even when full it cannot be dropped
+// from the recency list — an attacker who pushed past the cap still
+// pays the parent rule's rps cost on every subsequent request,
+// because every over-cap consumer routes through the same pinned
+// bucket.
+//
+// Back-compat: callers that don't care about per-consumer keying
+// (KeyBy == "" or KeyBy == "none") should keep using AllowWithParams
+// — it produces the bit-identical bucket key
+// `appID + "\x00" + ruleID` and never touches the consumer-set map.
+// Mixing the two for the same rule across requests is safe; the
+// consumer-set map is only populated by AllowWithConsumerKey.
+//
+// rps, burst must be > 0 (cmd-side compileThrottleRules clamps to
+// {1, 1} as defence-in-depth against direct-DB writes that bypassed
+// apid-Validate). cap must be > 0; the validator rejects rules
+// whose plan doesn't expose per-consumer throttling, so reaching
+// this method with cap <= 0 is a wiring bug — fail closed.
+func (l *Limiter) AllowWithConsumerKey(ruleKey, consumerID string, rps, burst float64, cap int) bool {
+	if l.noop {
+		return true
+	}
+	if rps < 0 || burst < 0 {
+		return false
+	}
+	if cap <= 0 {
+		// Fail closed: a missing cap is a wiring bug, not a
+		// permissive default. A misconfigured caller cannot
+		// accidentally promote a rule to unbounded cardinality.
+		return false
+	}
+	if consumerID == ConsumerKeySentinel {
+		// Reserved sentinel — a customer who managed to inject
+		// "__other__" as a consumer ID is trying to share the
+		// pinned collapse bucket with legitimate traffic. Refuse.
+		return false
+	}
+	return l.allowWithConsumerKey(ruleKey, consumerID, rps, burst, cap)
+}
+
+// allowWithConsumerKey is the locked core of AllowWithConsumerKey.
+// It separates the public API (input validation) from the inner
+// locked method (which holds l.mu through the bucket lookup +
+// consumer-set bookkeeping).
+func (l *Limiter) allowWithConsumerKey(ruleKey, consumerID string, rps, burst float64, cap int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	otherKey := ruleKey + "\x00" + ConsumerKeySentinel
+	consumerKey := ruleKey + "\x00" + consumerID
+
+	// Look up the rule's consumer set. Lazy-init on first contact.
+	consumers, ok := l.ruleConsumers[ruleKey]
+	if !ok {
+		consumers = map[string]struct{}{}
+		l.ruleConsumers[ruleKey] = consumers
+	}
+
+	_, alreadyTracked := consumers[consumerID]
+	bucketKey := consumerKey
+	if !alreadyTracked && len(consumers) >= cap {
+		// Over-cap collapse: every new consumer routes through
+		// the __other__ bucket. The collapse bucket is pinned
+		// non-evictable — see bucket.pinned doc.
+		bucketKey = otherKey
+	} else if !alreadyTracked {
+		// First time we've seen this consumer for this rule;
+		// add it to the set so subsequent requests bucket
+		// per-consumer (not into __other__).
+		consumers[consumerID] = struct{}{}
+	}
+
+	return l.allowTokenKeyedLocked(bucketKey, rps, burst, otherKey, now)
+}
+
+// allowTokenKeyedLocked is the shared refill math used by
+// allowToken + allowWithConsumerKey. The pinnedKey parameter is the
+// rule's __other__ bucket key when this is a per-consumer call; the
+// empty string means "no pin" (the Allow / AllowAccount /
+// AllowWithParams path). A bucket whose key equals pinnedKey is
+// pinned non-evictable on creation and stay-pinned across
+// subsequent visits — so the __other__ collapse bucket survives
+// forever even when full, which is the load-bearing safety
+// property of the bounded design.
+func (l *Limiter) allowTokenKeyedLocked(id string, rps, burst float64, pinnedKey string, now time.Time) bool {
+	b := l.buckets[id]
+	if b == nil {
+		if l.cap > 0 && len(l.buckets) >= l.cap {
+			l.evictOneLocked(now)
+		}
+		b = &bucket{tokens: burst, rps: rps, burst: burst, last: now, key: id}
+		if pinnedKey != "" && id == pinnedKey {
+			b.pinned = true
+		}
+		l.buckets[id] = b
+		if l.ll != nil {
+			l.elems[id] = l.ll.PushFront(b)
+		}
+	} else {
+		b.rps, b.burst = rps, burst
+		b.tokens += now.Sub(b.last).Seconds() * b.rps
+		if b.tokens > b.burst {
+			b.tokens = b.burst
+		}
+		b.last = now
+		if l.ll != nil {
+			if el := l.elems[id]; el != nil {
+				l.ll.MoveToFront(el)
+			}
+		}
+	}
+
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
 }
 
 // NewLimiter returns a limiter using the wall clock.
 func NewLimiter() *Limiter {
-	return &Limiter{buckets: map[string]*bucket{}, now: time.Now}
+	return &Limiter{
+		buckets:       map[string]*bucket{},
+		now:           time.Now,
+		ruleConsumers: map[string]map[string]struct{}{},
+	}
 }
 
 // NewLimiterWithClock returns a limiter whose internal clock is the supplied
@@ -84,7 +251,11 @@ func NewLimiter() *Limiter {
 // acceptance (issue #292 / ADR-040) — frozen-clock tests cannot depend on
 // the package-private now field. Production code uses NewLimiter.
 func NewLimiterWithClock(now func() time.Time) *Limiter {
-	return &Limiter{buckets: map[string]*bucket{}, now: now}
+	return &Limiter{
+		buckets:       map[string]*bucket{},
+		now:           now,
+		ruleConsumers: map[string]map[string]struct{}{},
+	}
 }
 
 // NewLimiterWithLRU returns a limiter that retains at most cap buckets,
@@ -111,7 +282,11 @@ func NewLimiterWithLRUClock(cap int, now func() time.Time) *Limiter {
 }
 
 func newLimiterWithLRU(cap int, now func() time.Time) *Limiter {
-	l := &Limiter{buckets: map[string]*bucket{}, now: now}
+	l := &Limiter{
+		buckets:       map[string]*bucket{},
+		now:           now,
+		ruleConsumers: map[string]map[string]struct{}{},
+	}
 	if cap > 0 {
 		l.cap = cap
 		l.ll = list.New()
@@ -258,7 +433,13 @@ func (l *Limiter) evictOneLocked(now time.Time) {
 	for i := 0; el != nil && i < LimiterEvictScan; i++ {
 		prev := el.Prev()
 		b, _ := el.Value.(*bucket)
-		if b != nil && bucketFull(b, now) {
+		// Phase 3 (ADR-104): pinned buckets are NEVER evictable —
+		// they back the per-rule __other__ collapse and dropping
+		// them is a throttle bypass (a fresh full bucket is the
+		// attacker's full allowance). The full-bucket-only check
+		// remains for non-pinned buckets. Even when pinned AND
+		// full, the scan skips — pinned trumps full.
+		if b != nil && !b.pinned && bucketFull(b, now) {
 			l.removeElementLocked(el)
 			return
 		}
@@ -294,6 +475,17 @@ func (l *Limiter) removeElementLocked(el *list.Element) {
 
 // forgetLocked drops one key from the map and, when LRU discipline is on,
 // from the recency list too. Caller holds l.mu.
+//
+// Phase 3 (ADR-104): when the forgotten key matches a ruleKey (i.e.
+// begins with `appID+"\x00"+ruleID`), the per-rule consumer-set
+// entry is also dropped. The ruleKey forms the prefix of every
+// per-consumer bucket key (`ruleKey+"\x00"+consumerID`) so a stale
+// consumer-set entry would otherwise leave orphan tracking when the
+// rule itself is forgotten (e.g. via SIGHUP for that rule — though
+// today SIGHUP targets ForgetAll which also clears the map; this
+// branch handles the per-rule Forget path future-SIGHUP additions
+// might add). No-op when the key is not a known ruleKey (e.g. a
+// plain appID — Allow / AllowAccount paths).
 func (l *Limiter) forgetLocked(id string) {
 	delete(l.buckets, id)
 	if l.ll != nil {
@@ -302,6 +494,7 @@ func (l *Limiter) forgetLocked(id string) {
 			delete(l.elems, id)
 		}
 	}
+	delete(l.ruleConsumers, id)
 }
 
 // Forget drops an app's bucket (e.g. on delete) to bound memory.
@@ -519,6 +712,12 @@ func (l *Limiter) ForgetAccount(accountID string) {
 // ForgetAll drops every bucket and returns the count dropped. SIGHUP and the
 // apid-side "purge all" callback use this so an operator can recover memory
 // after a mass-delete without bouncing the daemon.
+//
+// Phase 3 (ADR-104): also clears the per-rule consumer-set map so
+// the consumer-set bookkeeping resets in lockstep with the bucket
+// map. Without this a forgotten rule's consumer set would linger
+// and the next request would rebuild a stale collapse bucket
+// against the wrong generation of the limiter.
 func (l *Limiter) ForgetAll() int {
 	l.mu.Lock()
 	n := len(l.buckets)
@@ -527,6 +726,7 @@ func (l *Limiter) ForgetAll() int {
 		l.ll.Init()
 		l.elems = map[string]*list.Element{}
 	}
+	l.ruleConsumers = map[string]map[string]struct{}{}
 	l.mu.Unlock()
 	return n
 }

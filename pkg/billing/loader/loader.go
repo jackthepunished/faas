@@ -301,19 +301,22 @@ func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(s
 	if cfg == nil {
 		cfg = &RootBillingConfig{}
 	}
-	name := cfg.Provider
-	if name == "" {
-		// TOML missing + env unset → default to Stripe (legacy).
-		name = providerStripe
-	}
+	// cfg.DefaultProvider() applies the implicit default (v2 = Paddle)
+	// when Provider is empty. The legacy Stripe opt-in
+	// (FAAS_BILLING_PROVIDER=stripe) is unaffected — an explicit value
+	// still wins. The default lives in exactly one place; both loader
+	// entry points and any future sibling go through
+	// RootBillingConfig.DefaultProvider() rather than carrying their
+	// own `if name == ""` literal.
+	name := cfg.DefaultProvider()
 	for _, m := range Providers() {
 		if m.Name != name {
 			continue
 		}
 		if m.BuildAPID == nil {
-			// Legacy apid surface (today: Stripe) — apid reads its
-			// env vars inline. Returning nil + name keeps the rest
-			// of the apid boot path unchanged.
+			// Legacy apid surface (Stripe) — apid reads its env vars
+			// inline. Returning nil + name keeps the rest of the apid
+			// boot path unchanged for the legacy opt-in.
 			return nil, m.Name, nil
 		}
 		p, err := m.BuildAPID(cfg, env, log)
@@ -380,10 +383,11 @@ func LoadProviderForMeterd(cfg *RootBillingConfig, env func(string) string, stor
 	if cfg == nil {
 		cfg = &RootBillingConfig{}
 	}
-	name := cfg.Provider
-	if name == "" {
-		name = providerStripe
-	}
+	// Mirror LoadProviderForAPID — go through DefaultProvider() so the
+	// implicit-default literal lives in exactly one place
+	// (RootBillingConfig.DefaultProvider, not two `if name == ""` checks
+	// in this file). See comment at DefaultProvider for the rationale.
+	name := cfg.DefaultProvider()
 	for _, m := range Providers() {
 		if m.Name != name {
 			continue

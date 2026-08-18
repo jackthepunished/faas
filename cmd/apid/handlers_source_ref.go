@@ -85,9 +85,9 @@ func (s *server) handleSourceRefDeploy(w http.ResponseWriter, r *http.Request, a
 	// Forward-compat: only "tarball" is wired in PR-A; any other
 	// value is a 400 so future readers don't silently drive a
 	// half-implemented format.
-	if req.Format != "" && req.Format != "tarball" {
+	if req.Format != "" && req.Format != fieldNameTarball {
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
-			"Unsupported format", "format must be 'tarball' (PR-A)"))
+			"Unsupported format", "format must be '"+fieldNameTarball+"' (PR-A)"))
 		return
 	}
 
@@ -152,7 +152,7 @@ func (s *server) handleSourceRefDeploy(w http.ResponseWriter, r *http.Request, a
 		api.WriteProblem(w, api.ErrCapacity("could not read deployment"))
 		return
 	}
-	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
+	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d, app))
 }
 
 // resolveInstallToken reads the durable install row from

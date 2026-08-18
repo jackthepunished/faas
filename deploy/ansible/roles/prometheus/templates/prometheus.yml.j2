@@ -16,6 +16,13 @@ global:
 # See docs/runbooks/<AlertName>.md for triage steps per alert.
 rule_files:
   - /etc/prometheus/faas.rules.yml
+  # ADR-098 §9.A meterd data-upstream alerts (issue #951). The
+  # prometheus role's tasks/main.yml drops this file from
+  # pkg/promqlrules/data_placement.yaml — single source of truth,
+  # colocated with the synthetic fixture + Go driver. If the file is
+  # absent the alert is simply skipped (Prometheus tolerates a
+  # missing rule_files entry).
+  - /etc/prometheus/data_placement.yaml
   # Issue #250 — off-host Postgres backup alert (PgBackupStale). The
   # postgres_backup role drops this file; if it's absent the alert
   # is simply skipped (Prometheus tolerates a missing rule_files entry).

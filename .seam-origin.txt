@@ -1,0 +1,3 @@
+func TestEdgeRuleBudgetAction_Validate_NilReceiver(t *testing.T) {
+	var a *EdgeRuleBudgetAction
+	p := a.Validate()

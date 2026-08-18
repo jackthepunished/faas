@@ -103,6 +103,12 @@ RUN ln -s /usr/bin/runc /usr/local/bin/runc
 RUN printf 'root:100000:65536\n' > /etc/subuid && \
     printf 'root:100000:65536\n' > /etc/subgid
 
+# Rootless BuildKit runs inside the builder microVM's user namespace. Give
+# the mapped root a bounded subordinate range so runc can materialise image
+# ownership (for example root:shadow) without falling back to host access.
+RUN printf 'root:100000:65536\n' > /etc/subuid && \
+    printf 'root:100000:65536\n' > /etc/subgid
+
 # BuildKit rootless. Two files: buildkitd (daemon) + buildctl (client). The
 # upstream tarball unpacks both into ./bin/.
 RUN mkdir -p /opt/buildkit && \

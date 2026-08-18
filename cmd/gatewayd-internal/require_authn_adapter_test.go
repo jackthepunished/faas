@@ -53,6 +53,17 @@ func (s *stubAuthn) TouchKeyLastUsed(_ context.Context, _ string) error {
 	return nil
 }
 
+// AuthenticateOIDCBearer is the ADR-101 / PR-A stub for the
+// new interface method. The require_authn_adapter test only
+// exercises the Authn field dispatches — it does not call
+// AuthenticateOIDCBearer — so a nil-error no-op is enough to
+// satisfy the interface. Production gatewayd-internal routes
+// (added in PR-B) will exercise this through the standard
+// bearer middleware path.
+func (s *stubAuthn) AuthenticateOIDCBearer(_ context.Context, _ []byte) (state.Account, state.APIKey, error) {
+	return state.Account{}, state.APIKey{}, nil
+}
+
 // stubOnlyAuthnField builds an *authmw.Middleware whose
 // exported Authn field points at the supplied stub. The
 // other Middleware fields (Sessions / Lookups / Audit /

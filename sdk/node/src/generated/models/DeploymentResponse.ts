@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { BuildPlan } from './BuildPlan.js';
 import type { DeploymentHealthcheck } from './DeploymentHealthcheck.js';
 import type { DeploymentLivenessProbe } from './DeploymentLivenessProbe.js';
 import type { ScanResult } from './ScanResult.js';
@@ -97,5 +98,9 @@ export type DeploymentResponse = {
    *
    */
   secret_scan?: (SecretScanResult | null);
+  /**
+   * Auto-detected build plan (issue #961 / Mega-A PR-2). One-line summary the CLI prints after `gregale deploy`. nil for image deploys.
+   */
+  build_plan?: (BuildPlan | null);
 };
 

@@ -1432,6 +1432,28 @@ type DeploymentResponse struct {
 	// ensures the value is a valid slug; the handler validates
 	// scopeFromBody before storing via api.ValidateScope.
 	Scope string `json:"scope,omitempty"`
+	// BuildPlan (issue #961 / Mega-A PR-2) carries the
+	// framework + runtime + version + entrypoint + port + class
+	// that the build pipeline detected or that the deployment
+	// was created with. nil when the deployment is an image
+	// deploy (no source tarball to detect from) — omitempty
+	// keeps the wire byte-identical for pre-PR-2 clients.
+	// String fields only because pkg/api cannot import pkg/state
+	// (the App.Type enum lives in pkg/state/types.go).
+	BuildPlan *BuildPlan `json:"build_plan,omitempty"`
+}
+
+// BuildPlan describes what the build pipeline did with the source
+// (issue #961 / Mega-A PR-2). Framework is required (so dashboards
+// can branch on "unknown" for monorepos); the rest are optional and
+// surface only when the build pipeline populated them.
+type BuildPlan struct {
+	Framework  string `json:"framework"` // node|python|go|docker|unknown
+	Runtime    string `json:"runtime,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Entrypoint string `json:"entrypoint,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Class      string `json:"class,omitempty"` // app|function
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
@@ -1622,13 +1644,36 @@ type RotateOrgAPIKeyResponse struct {
 // CustomDomainResponse is a custom domain's wire shape. VerifiedAt is the
 // zero time on unverified rows; the verifier goroutine polls DNS and updates
 // it (spec §7).
+//
+// Issue #961 / Mega-A PR-3 additions: `Default` (true when this domain is the
+// app's default), `CertNotAfter` (RFC3339 UTC string, populated on verified
+// domains with an issued cert), and `CertSANs` (the cert's DNSNames subject
+// alt names, useful for the `gregale domains show` listing). All three
+// fields are omitempty so pre-PR-3 clients see bit-identical payloads.
 type CustomDomainResponse struct {
-	Domain         string `json:"domain"`
-	AppID          string `json:"app_id"`
-	ChallengeToken string `json:"challenge_token,omitempty"`
-	Verified       bool   `json:"verified"`
-	VerifiedAt     string `json:"verified_at,omitempty"`
-	TXTRecord      string `json:"txt_record,omitempty"` // convenience for the customer
+	Domain         string   `json:"domain"`
+	AppID          string   `json:"app_id"`
+	ChallengeToken string   `json:"challenge_token,omitempty"`
+	Verified       bool     `json:"verified"`
+	VerifiedAt     string   `json:"verified_at,omitempty"`
+	TXTRecord      string   `json:"txt_record,omitempty"` // convenience for the customer
+	Default        bool     `json:"default,omitempty"`    // true when this domain is the app's default (issue #961 / Mega-A PR-3)
+	CertNotAfter   string   `json:"cert_not_after,omitempty"`
+	CertSANs       []string `json:"cert_sans,omitempty"`
+	// CertStatus summarises the live cert dial (issue #961 / Mega-A PR-3
+	// code-review round, MED-4). One of:
+	//   ""           — cert dial was not attempted (domain unverified, or
+	//                  dialCert not called because the cert is already known).
+	//   "issued"     — port-443 handshake succeeded and the leaf cert
+	//                  covers this domain (sanContains matched).
+	//   "pending"    — domain is verified but the cert dial has not yet
+	//                  succeeded (DNS propagated but cert not yet minted).
+	//   "dial_failed:<reason>" — TCP dial, TLS handshake, or cert parse
+	//                  failed. <reason> is one of: dial_refused,
+	//                  dial_timeout, handshake_failed, no_peer_certs,
+	//                  parse_failed. omitempty so legacy rows / pre-PR-3
+	//                  clients see bit-identical payloads.
+	CertStatus string `json:"cert_status,omitempty"`
 }
 
 // CreateCustomDomainRequest accepts a domain to bind.
@@ -3271,6 +3316,17 @@ type SourceRefDeployRequest struct {
 	Format string `json:"format,omitempty"`
 }
 
+// SourceTarballDeployRequest is the CLI-uploaded tarball sidecar for
+// POST /v1/apps/{slug}/deployments/source-tarball (issue #961 / Mega-A
+// PR-1). Repo + Ref are optional, informational, and recorded on the
+// build row verbatim; the build pipeline does NOT use them to fetch
+// upstream. The tarball itself is uploaded as the multipart `tarball`
+// field. See docs/adr/0XX-local-tarball-deploy-trust-root.md.
+type SourceTarballDeployRequest struct {
+	Repo string `json:"repo,omitempty"`
+	Ref  string `json:"ref,omitempty"`
+}
+
 // PlanWorkload mirrors reposcan.Workload (Phase 3 wire shape).
 // Field names match the OpenAPI schema verbatim — the spec-check
 // AST gate enforces the field-for-field mapping.
@@ -4470,9 +4526,80 @@ func (a *EdgeRuleMaintenanceAction) Validate() *Problem {
 //
 // Per-IP sub-keying is deliberately absent in v1 — see
 // pkg/state/types.go::EdgeRuleThrottleAction for the design rationale.
+//
+// Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881 Phase 3)
+// extends the wire shape with optional per-consumer keying. The new
+// fields default to zero-values that produce bit-identical behaviour
+// to PR #887's bucket key (appID+"\x00"+ruleID):
+//
+//   - KeyBy ∈ {"", "none", "api_key", "jwt_subject", "jwt_claim"}.
+//     Empty string and "none" are equivalent — the empty value is the
+//     pre-Phase-3 shape; "none" is the explicit Phase-3 opt-out. Both
+//     preserve back-compat (the bucket key is unchanged).
+//   - JWTClaimName is REQUIRED iff KeyBy == "jwt_claim"; the value
+//     names the JWT custom claim to extract (e.g., "tier", "org_id").
+//     Format constraint mirrors CodeQL `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`.
+//   - MaxKeysPerRule caps how many distinct consumers may own a
+//     bucket against this rule. Distinct consumers above the cap
+//     collapse into a single non-evicting "__other__" bucket that
+//     STILL consumes tokens (ADR-104 §"Consequences" load-bearing
+//     safety property). Defaults to 0 meaning "use plan default".
+//
+// The bounded design is enforced at the limiter layer
+// (pkg/gateway/ratelimit.go::AllowWithConsumerKey, Phase 3). The
+// apid validator only checks shape + plan ceiling; the limiter owns
+// the actual collapse semantics.
 type EdgeRuleThrottleAction struct {
 	RequestsPerSecond float64 `json:"requests_per_second"`
 	Burst             int     `json:"burst"`
+	KeyBy             string  `json:"key_by,omitempty"`
+	JWTClaimName      string  `json:"jwt_claim_name,omitempty"`
+	MaxKeysPerRule    int     `json:"max_keys_per_rule,omitempty"`
+}
+
+// ThrottleKeyByNone is the explicit Phase-3 opt-out value. The empty
+// string "" and "none" both preserve PR #887's behaviour — the
+// difference is that "none" makes the customer's intent visible in the
+// wire payload (debugging + audit). The validator treats "" and "none"
+// as equivalent; the limiter constructor never sees the empty value
+// because the wire→state mapping normalises "" → "none".
+const (
+	ThrottleKeyByNone       = "none"
+	ThrottleKeyByAPIKey     = "api_key"
+	ThrottleKeyByJWTSubject = "jwt_subject"
+	ThrottleKeyByJWTClaim   = "jwt_claim"
+)
+
+// ThrottleMaxKeysPerRuleDefault is the fallback MaxKeysPerRule the
+// gateway uses when the resolved rule carries a zero — defensive
+// against a direct-DB write that bypassed the apid-validator AND
+// cmd-side compileThrottleRules. Matches the Hobby plan ceiling
+// (pkg/api/limits.go::ThrottleMaxKeysPerRule) — middle of the
+// ladder, neither Free-tight (100) nor Scale-loose (10_000). The
+// cmd-side compile is the source of truth for the value the
+// limiter actually uses at runtime; this constant exists so a
+// misconfigured rule doesn't accidentally promote a per-consumer
+// rule to unbounded cardinality (the worst-case attack surface).
+const ThrottleMaxKeysPerRuleDefault = 1000
+
+// ThrottleKeyByIsPerConsumer reports whether the supplied KeyBy
+// value opts the rule into per-consumer bucket keying
+// (ADR-104, issue #881 Phase 3). Empty string is treated as
+// back-compat (PR #887's `appID+"\x00"+ruleID` shape) — only
+// the explicit "none" and the four other close-vocab values
+// trigger per-consumer routing. The single source of truth for
+// "is this a per-consumer KeyBy?" — pkg/gateway/handler.go and
+// cmd/gatewayd-internal/edge_rules.go both consult this rather
+// than duplicating the membership test, so adding a future
+// Phase 4 value (e.g. "ip") is a one-line constant + this helper
+// update.
+func ThrottleKeyByIsPerConsumer(keyBy string) bool {
+	switch keyBy {
+	case ThrottleKeyByAPIKey, ThrottleKeyByJWTSubject, ThrottleKeyByJWTClaim:
+		return true
+	default:
+		return false
+	}
 }
 
 // ThrottleValidationContext is the per-plan ceiling that
@@ -4480,10 +4607,23 @@ type EdgeRuleThrottleAction struct {
 // Keeping the boundary explicit (rather than reading limits globally)
 // makes the validator unit-testable without spinning up a plan row —
 // see pkg/api/dto_edge_rules_test.go for the test pattern.
+//
+// PlanMaxKeysPerRule is the Phase 3 ceiling on per-rule consumer
+// cardinality. 0 means the plan doesn't expose per-consumer throttling
+// (the validator rejects any rule that opts into a non-"none" KeyBy).
 type ThrottleValidationContext struct {
-	PlanMaxRPS   float64
-	PlanMaxBurst int
+	PlanMaxRPS         float64
+	PlanMaxBurst       int
+	PlanMaxKeysPerRule int
 }
+
+// jwtClaimNameRegex pins the JWTClaimName format. Anchored, allows a
+// leading letter or underscore, then [A-Za-z0-9_] up to 63 chars total.
+// Mirrors the CodeQL go-clear-text-logging precedent for untrusted
+// identifiers landing in metric labels and log fields — anything looser
+// risks a label-cardinality explosion or a CodeQL finding on a future
+// refactor.
+var jwtClaimNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
 
 func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Problem {
 	if a == nil {
@@ -4515,6 +4655,86 @@ func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Proble
 		return ErrValidation(fmt.Sprintf(
 			"throttle action: burst %d exceeds the plan ceiling %d — a throttle rule is strictly a tightening primitive",
 			a.Burst, ctx.PlanMaxBurst))
+	}
+	// Phase 3 (ADR-104): per-consumer keying validation. KeyBy is
+	// optional; the empty value preserves PR #887's behaviour and
+	// needs no further checks. Non-empty values must be in the closed
+	// vocab + require the right supporting field.
+	switch a.KeyBy {
+	case "", ThrottleKeyByNone:
+		// Pre-Phase-3 shape: bucket key is appID+"\x00"+ruleID.
+		// JWTClaimName and MaxKeysPerRule MUST be unset — a customer
+		// mixing "key_by=none" with non-zero MaxKeysPerRule would
+		// silently never trip the cap, which is a footgun.
+		if a.JWTClaimName != "" {
+			return ErrValidation("throttle action: jwt_claim_name requires key_by=\"jwt_claim\" (got key_by=\"\")")
+		}
+		if a.MaxKeysPerRule != 0 {
+			return ErrValidation("throttle action: max_keys_per_rule requires key_by != \"none\" (got key_by=\"\")")
+		}
+	case ThrottleKeyByAPIKey, ThrottleKeyByJWTSubject:
+		if a.JWTClaimName != "" {
+			return ErrValidation(fmt.Sprintf(
+				"throttle action: jwt_claim_name is only valid with key_by=\"jwt_claim\" (got key_by=%q)",
+				a.KeyBy))
+		}
+		if err := validateThrottleMaxKeys(a.MaxKeysPerRule, ctx.PlanMaxKeysPerRule); err != nil {
+			return err
+		}
+	case ThrottleKeyByJWTClaim:
+		if a.JWTClaimName == "" {
+			return ErrValidation("throttle action: jwt_claim_name is required when key_by=\"jwt_claim\"")
+		}
+		if !jwtClaimNameRegex.MatchString(a.JWTClaimName) {
+			return ErrValidation(fmt.Sprintf(
+				"throttle action: jwt_claim_name %q must match ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$ (CodeQL safe-identifier contract)",
+				a.JWTClaimName))
+		}
+		if err := validateThrottleMaxKeys(a.MaxKeysPerRule, ctx.PlanMaxKeysPerRule); err != nil {
+			return err
+		}
+	default:
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: key_by %q is not in the closed vocab (allowed: \"\", \"none\", \"api_key\", \"jwt_subject\", \"jwt_claim\")",
+			a.KeyBy))
+	}
+	return nil
+}
+
+// validateThrottleMaxKeys enforces the per-rule MaxKeysPerRule ceiling.
+//
+//   - MaxKeysPerRule < 0 is a shape error.
+//   - MaxKeysPerRule == 0 means "use plan default" — the limiter layer
+//     resolves the default at run time; the validator only rejects
+//     values above the plan ceiling when the plan has one.
+//   - planMax == 0 means the plan doesn't expose per-consumer throttling
+//     AND the customer is opting into per-consumer keying — that
+//     combination is rejected up front. Without this guard a customer
+//     could set key_by="api_key" with max_keys_per_rule=0 and silently
+//     get the plan-default behaviour, which on a plan with
+//     PlanMaxKeysPerRule=0 would mean "no consumers tracked" — a
+//     useless rule that wastes the throttle-quota slot. (See
+//     ADR-104 §"Rejected alternatives — Server-side consumer allowlist
+//     is deferred"; the closest analogous case is "rule whose runtime
+//     effect is zero".)
+func validateThrottleMaxKeys(maxKeys, planMax int) *Problem {
+	if maxKeys < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: max_keys_per_rule must be >= 0 (got %d)",
+			maxKeys))
+	}
+	if planMax == 0 {
+		// Plan doesn't expose per-consumer throttling. The caller in
+		// Validate() has already gated on key_by != "none", so reaching
+		// here means the customer is opting into a feature their plan
+		// doesn't support. Reject.
+		return ErrValidation(
+			"throttle action: this plan does not support per-consumer throttling — upgrade or set key_by=\"none\"")
+	}
+	if maxKeys > planMax {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: max_keys_per_rule %d exceeds the plan ceiling %d",
+			maxKeys, planMax))
 	}
 	return nil
 }

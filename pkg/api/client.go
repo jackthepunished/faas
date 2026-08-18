@@ -726,6 +726,64 @@ func (c *Client) DeployFromSourceRef(ctx context.Context, slug string, req Sourc
 		"/v1/apps/"+slug+"/deployments/source-ref", req, &out)
 }
 
+// DeployFromSourceTarball is the zero-config local-tarball deploy
+// path (issue #961 / Mega-A PR-1). The caller (CLI) uploads a tarball
+// it produced locally; apid does NOT consult github_installations
+// and does NOT attempt a server-side git fetch. The CLI is the trust
+// root for this path; see docs/adr/0XX-local-tarball-deploy-trust-
+// root.md.
+//
+// tarballName is the form filename apid sees in the multipart
+// "tarball" part (basename is fine). repo + ref are optional
+// informational fields shipped as the JSON `sidecar` part; the
+// build pipeline does NOT use them to fetch upstream.
+//
+// Idempotency-Key is auto-minted here so retries fold into one
+// build row, mirroring DeployFromSourceRef.
+func (c *Client) DeployFromSourceTarball(ctx context.Context, slug string, tarball io.Reader, tarballName string, sidecar SourceTarballDeployRequest) (DeploymentResponse, error) {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	// tarball: file part. The CLI side wraps `packDirToTarGz` so the
+	// shape is already §9-valid (≤10k files, no symlinks/.., absolute
+	// paths stripped); the server's validateAndSpool validates again
+	// before rename so the upload is defence-in-depth.
+	fw, err := w.CreateFormFile("tarball", tarballName)
+	if err != nil {
+		return DeploymentResponse{}, fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := io.Copy(fw, tarball); err != nil {
+		return DeploymentResponse{}, fmt.Errorf("copy tarball: %w", err)
+	}
+	// sidecar: optional JSON. Empty repo+ref → omit the part entirely
+	// (the server treats missing sidecar as zero provenance).
+	if sidecar.Repo != "" || sidecar.Ref != "" {
+		sidecarJSON, err := json.Marshal(sidecar)
+		if err != nil {
+			return DeploymentResponse{}, fmt.Errorf("marshal sidecar: %w", err)
+		}
+		if err := w.WriteField("sidecar", string(sidecarJSON)); err != nil {
+			return DeploymentResponse{}, fmt.Errorf("write sidecar: %w", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		return DeploymentResponse{}, fmt.Errorf("close multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/apps/"+slug+"/deployments/source-tarball", &b)
+	if err != nil {
+		return DeploymentResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	// Auto-mint Idempotency-Key (matches DeployFromSourceRef).
+	req.Header.Set("Idempotency-Key", newUUIDv4())
+
+	var out DeploymentResponse
+	return out, c.doReq(c.uploadHTTP(), req, &out)
+}
+
 // Diff returns a read-only preview of what a deploy would change
 // without writing. CI calls this in the same job that calls
 // Deploy; non-zero exit (or Blocking=true in the wire) means
@@ -984,6 +1042,82 @@ func (c *Client) CreateDomain(ctx context.Context, req CreateCustomDomainRequest
 }
 func (c *Client) DeleteDomain(ctx context.Context, domain string) error {
 	return c.do(ctx, "DELETE", "/v1/domains/"+domain, nil, nil)
+}
+
+// VerifyDomain (issue #961 / Mega-A PR-3) re-runs the DNS + cert
+// walk for a custom domain. Idempotent — POSTing twice does not
+// change the durable verification state. Backed by
+// POST /v1/domains/{domain}/verify; the SDK caller does not need to
+// pass an Idempotency-Key (auto-minted by the SDK roundtripper).
+func (c *Client) VerifyDomain(ctx context.Context, domain string) (CustomDomainResponse, error) {
+	var out CustomDomainResponse
+	return out, c.do(ctx, "POST", "/v1/domains/"+domain+"/verify", nil, &out)
+}
+
+// GetDomain (issue #961 / Mega-A PR-3) returns a domain's durable
+// row + the live cert chain (NotAfter, SANs). Backed by GET
+// /v1/domains/{domain}. The cert dial is on-demand; failures to
+// reach the cert surface as no cert metadata on the response (the
+// next show retry picks up the propagation).
+func (c *Client) GetDomain(ctx context.Context, domain string) (CustomDomainResponse, error) {
+	var out CustomDomainResponse
+	return out, c.do(ctx, "GET", "/v1/domains/"+domain, nil, &out)
+}
+
+// Tenant surfaces (issue #879 / ADR-100 PR-C). The CLI surface
+// (cmd/gregale/commands_tenant_surfaces.go) calls these; the
+// HTTP handlers they're backed by live in
+// cmd/apid/handlers_tenant_surfaces.go. The ListTenantSurfaces
+// path is /v1/apps/{slug}/tenant-surfaces and the SDK signature
+// takes the slug so the call site doesn't rebuild the URL.
+
+// ListTenantSurfaces returns every active tenant surface on the
+// app the slug belongs to. Soft-deleted surfaces are filtered
+// server-side, so the SDK returns the same set the dashboard sees.
+func (c *Client) ListTenantSurfaces(ctx context.Context, slug string) ([]TenantSurfaceResponse, error) {
+	var out ListTenantSurfacesResponse
+	if err := c.do(ctx, "GET", "/v1/apps/"+slug+"/tenant-surfaces", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Surfaces, nil
+}
+
+// CreateTenantSurface attaches a new surface to the app. The
+// hostnames list is the seed set the customer wants to certify
+// under one SAN bundle; further hostnames can be added via
+// AddTenantHostname.
+func (c *Client) CreateTenantSurface(ctx context.Context, slug string, req CreateTenantSurfaceRequest) (TenantSurfaceResponse, error) {
+	var out TenantSurfaceResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/tenant-surfaces", req, &out)
+}
+
+// GetTenantSurface returns one surface by id (UUID).
+func (c *Client) GetTenantSurface(ctx context.Context, slug, id string) (TenantSurfaceResponse, error) {
+	var out TenantSurfaceResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/tenant-surfaces/"+id, nil, &out)
+}
+
+// DeleteTenantSurface soft-deletes the surface and cascades the
+// hostnames (server-side). The next attempt to add the same
+// hostname to a new surface succeeds because the orphan rows
+// are hard-deleted.
+func (c *Client) DeleteTenantSurface(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/tenant-surfaces/"+id, nil, nil)
+}
+
+// AddTenantHostname appends a hostname to an existing surface.
+// The challenge token is returned in the response so the CLI
+// can print the TXT record the customer must publish.
+func (c *Client) AddTenantHostname(ctx context.Context, slug, surfaceID string, req AddTenantHostnameRequest) (TenantHostnameResponse, error) {
+	var out TenantHostnameResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/tenant-surfaces/"+surfaceID+"/hostnames", req, &out)
+}
+
+// RemoveTenantHostname deletes a hostname from a surface. The
+// hostname is the lowercased canonical form (the server
+// lowercases on the way in).
+func (c *Client) RemoveTenantHostname(ctx context.Context, slug, surfaceID, hostname string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/tenant-surfaces/"+surfaceID+"/hostnames/"+hostname, nil, nil)
 }
 
 // GetCron returns one cron by id (issue #791 PR-E / ADR-090 closure).
@@ -1724,6 +1858,21 @@ func (c *Client) PostAuthLogin(ctx context.Context, email, password string) (Pro
 	var out ProgrammaticAuthResponse
 	return out, c.do(ctx, "POST", "/v1/auth/login",
 		PasswordLoginRequest{Email: email, Password: password}, &out)
+}
+
+// PostAuthOidcExchange trades an IdP-issued JWT (e.g. the
+// ACTIONS_ID_TOKEN_REQUEST_TOKEN from GitHub Actions) for a
+// short-lived opaque bearer (5 min TTL, fp_oidc_ prefix). Used by
+// the CI deploy path so customers can swap the long-lived
+// FAAS_TOKEN secret for keyless OIDC. The wire contract is
+// PR-A (ADR-101 / issue #270); PR-B adds the CLI flag + Action
+// input that drives this call.
+//
+// Method name follows deriveMethodName — POST + auth/oidc/exchange →
+// PostAuthOidcExchange. Auto-derived; no pin needed.
+func (c *Client) PostAuthOidcExchange(ctx context.Context, req OIDCExchangeRequest) (OIDCExchangeResponse, error) {
+	var out OIDCExchangeResponse
+	return out, c.do(ctx, "POST", "/v1/auth/oidc/exchange", req, &out)
 }
 
 // PostAuthSignupMagicLink asks the server to email a one-time signup
@@ -2782,6 +2931,40 @@ func (c *Client) GetRekeyProgress(ctx context.Context) (RekeyProgress, error) {
 func (c *Client) ListAppDataUpstreams(ctx context.Context, slug string) ([]DataUpstreamResponse, error) {
 	var out []DataUpstreamResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams", nil, &out)
+}
+
+// ListAppDataUpstreamsWithQuota is the quota-aware sibling of
+// ListAppDataUpstreams (issue #952). Decodes the wrapped
+// DataUpstreamListResponse envelope so the CLI's
+// `gregale inspect <slug> --upstreams` command can render the
+// "N/M upstreams" stamp without a second request.
+//
+// The bare ListAppDataUpstreams is preserved for callers that
+// don't need quota (PR #894 e2e tests, future dashboard
+// hydration paths) — both methods live side by side and decode
+// the same wire surface, just into different shapes.
+//
+// scope is the optional filter forwarded as ?scope=<scope> in
+// the query string. Empty means "all scopes" (handlers_upstreams.go
+// treats empty as the all-scopes branch via scopeFromQuery); any
+// non-empty value is validated server-side. The CLI itself does
+// not impose a closed vocabulary on scope — the SDK mirrors what
+// the wire accepts.
+//
+// §11 invariant: the decoded shape NEVER carries plaintext host —
+// only HostRedactedHash + HostLast4 (handlers_upstreams.go:339).
+// The CLI renderer in commands_inspect_upstreams.go references
+// only those two fields.
+func (c *Client) ListAppDataUpstreamsWithQuota(ctx context.Context, slug, scope string) ([]DataUpstreamResponse, int, int, error) {
+	path := "/v1/apps/" + slug + "/upstreams"
+	if scope != "" {
+		path += "?scope=" + scope
+	}
+	var out DataUpstreamListResponse
+	if err := c.do(ctx, "GET", path, nil, &out); err != nil {
+		return nil, 0, 0, err
+	}
+	return out.Upstreams, out.Count, out.Quota, nil
 }
 func (c *Client) GetAppDataUpstream(ctx context.Context, slug, id string) (DataUpstreamResponse, error) {
 	var out DataUpstreamResponse

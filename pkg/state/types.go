@@ -3669,9 +3669,22 @@ type EdgeRuleBudgetAction struct {
 // later it gets its own bounded design (ADR-093-style cap + an
 // `__ip_other__` overflow that still consumes the parent rule's
 // bucket). Shipping the field now and bounding it later is not safe.
+//
+// Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881 Phase 3)
+// extends the wire shape with optional per-consumer keying. The new
+// fields are byte-identical to the DTO mirror at
+// pkg/api/dto.go::EdgeRuleThrottleAction — gatewayd reads them through
+// the limiter constructor (pkg/gateway/ratelimit.go::AllowWithConsumerKey,
+// Phase 3) which owns the __other__ collapse. See ADR-104 §"Consequences"
+// for the load-bearing safety property (the collapse bucket is
+// pinned non-evictable so an attacker can't bypass the throttle by
+// minting many keys).
 type EdgeRuleThrottleAction struct {
 	RequestsPerSecond float64 `json:"requests_per_second"`
 	Burst             int     `json:"burst"`
+	KeyBy             string  `json:"key_by,omitempty"`
+	JWTClaimName      string  `json:"jwt_claim_name,omitempty"`
+	MaxKeysPerRule    int     `json:"max_keys_per_rule,omitempty"`
 }
 
 // EdgeRuleAction is the kind-tagged union stored in edge_rules.action
@@ -3894,11 +3907,21 @@ func (k DataUpstreamKind) IsValid() bool {
 // sqlc read path projects pgtype.Int4.Valid) is distinguishable from
 // "measured at 0ms".
 type DataUpstream struct {
-	ID               uuid.UUID
-	AccountID        uuid.UUID
-	AppID            uuid.UUID
-	Source           DataUpstreamSource
-	Scope            string
+	ID        uuid.UUID
+	AccountID uuid.UUID
+	AppID     uuid.UUID
+	Source    DataUpstreamSource
+	Scope     string
+	// DeploymentScope is the deployment this upstream belongs to.
+	// ADR-098 amendment (issue #954, migration
+	// 00281_data_upstreams_deployment_scope.sql) widens the dedupe
+	// key to (app_id, scope, deployment_scope, kind, host, port);
+	// default 'default' matches every pre-#954 row + every single-
+	// deployment app. The apid env-classifier resolves the
+	// deployment from the env-scope at PUT time via
+	// pgstore.LiveDeploymentForScope (shim at pgstore.go:4111,
+	// ErrNotFound → defaultEnvScope="default" fallback).
+	DeploymentScope  string
 	Kind             DataUpstreamKind
 	Host             string
 	Port             int
@@ -3974,4 +3997,80 @@ type DataUpstreamTarget struct {
 	// the host from this struct, dials, then drops it
 	// on the floor.
 	Host string
+}
+
+// OIDCTrustPolicy is the per-(account, issuer) admission rule for
+// OIDC-derived bearer exchanges (issue #270 / ADR-101). Mirrors the
+// 1:N variant of github_installations (one account can trust many
+// issuers). SubjectPattern is a regex matched against the JWT
+// `sub` claim (compile-once at the edgejwks layer; this type
+// stays stringy for portability). RequiredClaims is the strict-
+// equality gate (e.g. {"actor":"poyrazk"}); the regex variant
+// lives on pkg/edgejwks.VerifierRule.RequiredClaimPatterns.
+//
+// audit_login='auto' marks a policy the system created on first use
+// (the dashboard "refine" CTA uses this to distinguish "you set
+// this" from "system defaulted this"). For an OIDC trust policy
+// the "login" is the customer's account_id rather than a real
+// login name — the column is reused for symmetry with the GitHub
+// install shape.
+type OIDCTrustPolicy struct {
+	AccountID      string
+	IssuerURL      string
+	JWKSURL        string
+	Audience       []string
+	SubjectPattern string
+	Algorithms     []string
+	RequiredClaims map[string]string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	AuditLogin     string
+}
+
+// OIDCExchangedToken is the persisted row behind an exchanged
+// short-lived bearer (fp_oidc_<48 hex>). The wire-side bearer is
+// hashed (TokenHash); the row carries the OIDC provenance so the
+// audit reader can answer "which CI job shipped this?" without
+// joining against the IdP. TTL bounds GDPR deletion; the
+// account_id FK CASCADE is the contractual guarantee.
+//
+// JTI is the optional JWT ID claim (empty if the IdP omits it).
+// Customer-side billing attribution excludes the JTI — it's the
+// audit-only key that lets a customer correlate a row to an IdP
+// log entry when investigating a deploy.
+type OIDCExchangedToken struct {
+	ID        string
+	AccountID string
+	TokenHash []byte
+	ExpiresAt time.Time
+	IssuerURL string
+	Subject   string
+	Audience  []string
+	JTI       string
+	CreatedAt time.Time
+}
+
+// ToAPIKey projects the OIDC-bearer row into a synthetic state.APIKey
+// for the principal stamp in pkg/auth/middleware. The struct is
+// reused (no new type) so the principalHasScope + requireScope chain
+// works unchanged. Status is fixed at APIKeyStatusActive — there is
+// no revoked state for 5-min TTL tokens; the row disappears via TTL
+// or FK CASCADE, both of which surface as ErrNotFound to the lookup.
+//
+// The method lives here (not on pkg/oidc.ExchangedToken) because Go
+// type aliases don't carry over method sets defined on the alias:
+//
+//	type A = B  // A has whatever methods B has
+//
+// Since the store layer needs to call row.ToAPIKey() on the
+// state-side value (the alias is the only public surface), the
+// method set must be on the canonical type. The pkg/oidc-side
+// alias gets the method for free.
+func (e OIDCExchangedToken) ToAPIKey() APIKey {
+	return APIKey{
+		ID:        e.ID,
+		AccountID: e.AccountID,
+		Scopes:    []string{"deploy:write"},
+		Status:    string(APIKeyStatusActive),
+	}
 }

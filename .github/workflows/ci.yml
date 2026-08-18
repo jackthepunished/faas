@@ -164,7 +164,10 @@ jobs:
       # (typo in metric label, bad histogram_quantile, dangling
       # matcher) breaks the alert at boot, so we lint at PR time
       # instead of letting the operator find out via a 5 a.m. page
-      # that never fires.
+      # that never fires. Two files are linted: the consolidated
+      # faas.rules.yml and the per-alert sibling
+      # pkg/promqlrules/data_placement.yaml (ADR-098 §9.A, issue
+      # #951).
       #
       # Note: production SHA-256 pin (prom_release_sha256) is enforced
       # by the role's assert at bootstrap (`make bootstrap`), NOT here.
@@ -180,7 +183,9 @@ jobs:
           echo "${PROM_TARBALL_SHA256_LINUX_AMD64}  /tmp/${PROM_TARBALL}" | sha256sum --check --strict
           tar -xzf "/tmp/${PROM_TARBALL}" -C /tmp "prometheus-${PROM_VERSION}.linux-amd64/promtool"
           sudo mv "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
-          promtool check rules deploy/ansible/roles/prometheus/files/faas.rules.yml
+          promtool check rules \
+            deploy/ansible/roles/prometheus/files/faas.rules.yml \
+            pkg/promqlrules/data_placement.yaml
 
       # ansible syntax gate. deploy/ansible/ is the source of truth for the
       # box's systemd units, sysctls and secret file modes, but nothing in

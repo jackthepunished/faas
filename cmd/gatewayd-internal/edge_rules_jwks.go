@@ -84,6 +84,11 @@ func (a *edgeJWKSAdapter) Verify(ctx context.Context, rawToken string, rule *gat
 		Issuer:  src.Issuer,
 		Aud:     src.Aud,
 		Exp:     src.Exp,
+		// Phase 3 (ADR-104, issue #881): thread the resolved
+		// custom-claim map through to the gateway-side struct so
+		// applyEdgeRuleThrottle can key on it. Nil when the rule
+		// did not require any custom claims.
+		Custom: src.Custom,
 	}, nil
 }
 

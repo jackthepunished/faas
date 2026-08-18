@@ -64,6 +64,7 @@ func preLoadedConfigForVerifierTest(t *testing.T) *Config {
 // pre-PR-B single-box back-compat shape).
 func TestRunWithDeps_PassesNodeVerifierToDialSites(t *testing.T) {
 	withTestHMACFiles(t)
+	withBillingKeysForTest(t)
 
 	stub := &captureTestVerifier{}
 
@@ -139,6 +140,7 @@ func TestRunWithDeps_PassesNodeVerifierToDialSites(t *testing.T) {
 // single-box back-compat path that PR-B is careful not to regress.
 func TestRunWithDeps_NilPreLoadedNodeVerifier_NoHookInstalled(t *testing.T) {
 	withTestHMACFiles(t)
+	withBillingKeysForTest(t)
 
 	var (
 		mu       sync.Mutex

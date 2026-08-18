@@ -1851,7 +1851,7 @@ func TestDeploymentResponse_RoundTrip(t *testing.T) {
 		Status: state.DeployLive, Error: "boom", ErrorCode: "image_not_found",
 		CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}
-	resp := srv.deploymentResponse(d)
+	resp := srv.deploymentResponse(d, state.App{})
 	if resp.ID != "d1" || resp.Status != "live" || resp.Error != "boom" ||
 		resp.ErrorCode != "image_not_found" || resp.CreatedAt != "2026-01-02T03:04:05Z" {
 		t.Errorf("got %+v", resp)

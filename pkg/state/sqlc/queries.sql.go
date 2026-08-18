@@ -129,6 +129,52 @@ func (q *Queries) AccountByKeyHash(ctx context.Context, db DBTX, keySha256 []byt
 	return i, err
 }
 
+const accountByOIDCIssuerSubject = `-- name: AccountByOIDCIssuerSubject :one
+select a.id, a.email, a.plan, a.status,
+       coalesce(a.provider_customer_id, ''), a.created_at
+from accounts a
+join oidc_trust_policies p on p.account_id = a.id
+where p.issuer_url = $1
+  and (p.subject_pattern is null or p.subject_pattern = ''
+       or $2 ~ p.subject_pattern)
+limit 1
+`
+
+type AccountByOIDCIssuerSubjectParams struct {
+	IssuerUrl      string
+	SubjectPattern pgtype.Text
+}
+
+type AccountByOIDCIssuerSubjectRow struct {
+	ID                 pgtype.UUID
+	Email              interface{}
+	Plan               string
+	Status             string
+	ProviderCustomerID string
+	CreatedAt          pgtype.Timestamptz
+}
+
+// Resolves an OIDC (issuer, subject) pair to the platform
+// account it's bound to. The binding is implicit: any trust
+// policy row with matching issuer_url + subject_pattern that
+// matches the subject claim. Empty subject_pattern = permissive
+// (accept any subject). PR-A matches on issuer_url only with
+// permissive subject semantics; PR-C will refine the per-issuer
+// subject index.
+func (q *Queries) AccountByOIDCIssuerSubject(ctx context.Context, db DBTX, arg AccountByOIDCIssuerSubjectParams) (AccountByOIDCIssuerSubjectRow, error) {
+	row := db.QueryRow(ctx, accountByOIDCIssuerSubject, arg.IssuerUrl, arg.SubjectPattern)
+	var i AccountByOIDCIssuerSubjectRow
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Plan,
+		&i.Status,
+		&i.ProviderCustomerID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const accountsByIDs = `-- name: AccountsByIDs :many
 select id, email, plan, status, coalesce(provider_customer_id, ''), coalesce(stripe_subscription_item, ''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
 from accounts where id = any($1::uuid[])
@@ -1129,6 +1175,19 @@ func (q *Queries) DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype
 	return err
 }
 
+const deleteOIDCExchangedToken = `-- name: DeleteOIDCExchangedToken :exec
+delete from oidc_exchanged_tokens where id = $1
+`
+
+// Operator-driven revoke path (PR-C). Returns 0 rows on miss;
+// the caller maps that to ErrNotFound. The 5-min TTL is the
+// natural expiry path; Delete is the "kill this CI job's
+// credential now" lever.
+func (q *Queries) DeleteOIDCExchangedToken(ctx context.Context, db DBTX, id pgtype.UUID) error {
+	_, err := db.Exec(ctx, deleteOIDCExchangedToken, id)
+	return err
+}
+
 const deploymentByID = `-- name: DeploymentByID :one
 select id, app_id, coalesce(build_id::text, ''), image_digest, kind,
        coalesce(source_path, ''), coalesce(source_bytes, 0),
@@ -1268,7 +1327,7 @@ func (q *Queries) GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErro
 
 const getDataUpstreamByID = `-- name: GetDataUpstreamByID :one
 SELECT
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, coalesce(declared_region, ''),
     last_rtt_ms, last_probed_at, last_seen_at, created_at
 FROM data_upstreams
@@ -1281,6 +1340,7 @@ type GetDataUpstreamByIDRow struct {
 	AppID            pgtype.UUID
 	Source           string
 	Scope            string
+	DeploymentScope  string
 	Kind             string
 	Host             string
 	Port             int32
@@ -1294,7 +1354,9 @@ type GetDataUpstreamByIDRow struct {
 
 // Single-row read for the dashboard's "edit upstream"
 // pane (PR-B). Cursor-safe: no pagination; the handler
-// reads the row directly.
+// reads the row directly. Projects the new deployment_scope
+// column (issue #954) so the typed DataUpstream.DeploymentScope
+// in pkg/state/types.go round-trips through sqlc.
 func (q *Queries) GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) (GetDataUpstreamByIDRow, error) {
 	row := db.QueryRow(ctx, getDataUpstreamByID, id)
 	var i GetDataUpstreamByIDRow
@@ -1304,6 +1366,7 @@ func (q *Queries) GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UU
 		&i.AppID,
 		&i.Source,
 		&i.Scope,
+		&i.DeploymentScope,
 		&i.Kind,
 		&i.Host,
 		&i.Port,
@@ -1346,6 +1409,102 @@ func (q *Queries) GetInstanceTailCount(ctx context.Context, db DBTX, id pgtype.U
 	var tail_count int32
 	err := row.Scan(&tail_count)
 	return tail_count, err
+}
+
+const getOIDCExchangedTokenByHash = `-- name: GetOIDCExchangedTokenByHash :one
+select id, account_id, token_hash, expires_at, issuer_url, subject,
+       audience, coalesce(jti, '') as jti, created_at
+from oidc_exchanged_tokens
+where token_hash = $1
+  and expires_at > now()
+`
+
+type GetOIDCExchangedTokenByHashRow struct {
+	ID        pgtype.UUID
+	AccountID pgtype.UUID
+	TokenHash []byte
+	ExpiresAt pgtype.Timestamptz
+	IssuerUrl string
+	Subject   string
+	Audience  []string
+	Jti       string
+	CreatedAt pgtype.Timestamptz
+}
+
+// Bearer hot-path lookup. Filters past-TTL rows out at the SQL
+// layer so the pg contract is "WHERE expires_at > NOW()". The
+// MemStore mirror in pkg/state/memstore.go lazy-deletes instead.
+func (q *Queries) GetOIDCExchangedTokenByHash(ctx context.Context, db DBTX, tokenHash []byte) (GetOIDCExchangedTokenByHashRow, error) {
+	row := db.QueryRow(ctx, getOIDCExchangedTokenByHash, tokenHash)
+	var i GetOIDCExchangedTokenByHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.IssuerUrl,
+		&i.Subject,
+		&i.Audience,
+		&i.Jti,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getOIDCTrustPolicy = `-- name: GetOIDCTrustPolicy :one
+
+select account_id, issuer_url, jwks_url, audience,
+       coalesce(subject_pattern, '') as subject_pattern,
+       algorithms, required_claims, created_at, updated_at,
+       audit_login
+from oidc_trust_policies
+where account_id = $1 and issuer_url = $2
+`
+
+type GetOIDCTrustPolicyParams struct {
+	AccountID pgtype.UUID
+	IssuerUrl string
+}
+
+type GetOIDCTrustPolicyRow struct {
+	AccountID      pgtype.UUID
+	IssuerUrl      string
+	JwksUrl        string
+	Audience       []string
+	SubjectPattern string
+	Algorithms     []string
+	RequiredClaims []byte
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	AuditLogin     string
+}
+
+// ─── OIDC / keyless deploy auth (ADR-101, issue #270) ───────────────────
+//
+// Per-(account_id, issuer_url) trust policy CRUD + exchanged-token
+// CRUD. PR-A scope. The composite PK on oidc_trust_policies is the
+// lookup key; the per-account dashboard list (PR-C) walks the
+// same index. token_hash UNIQUE on oidc_exchanged_tokens is the
+// bearer hot-path lookup.
+// Account-by-issuer lookup. Used by the OIDC exchange handler's
+// first-use auto-create path (PR-A) and the dashboard's Refine
+// form (PR-C).
+func (q *Queries) GetOIDCTrustPolicy(ctx context.Context, db DBTX, arg GetOIDCTrustPolicyParams) (GetOIDCTrustPolicyRow, error) {
+	row := db.QueryRow(ctx, getOIDCTrustPolicy, arg.AccountID, arg.IssuerUrl)
+	var i GetOIDCTrustPolicyRow
+	err := row.Scan(
+		&i.AccountID,
+		&i.IssuerUrl,
+		&i.JwksUrl,
+		&i.Audience,
+		&i.SubjectPattern,
+		&i.Algorithms,
+		&i.RequiredClaims,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AuditLogin,
+	)
+	return i, err
 }
 
 const getSession = `-- name: GetSession :one
@@ -1542,21 +1701,22 @@ func (q *Queries) InsertComputeNodeHeartbeat(ctx context.Context, db DBTX, arg I
 const insertDataUpstream = `-- name: InsertDataUpstream :one
 
 INSERT INTO data_upstreams (
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, declared_region,
     last_rtt_ms, last_probed_at,
     last_seen_at, created_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8,
-    $9, $10,
-    $11, $12,
+    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+    $10, $11,
+    $12, $13,
     now(), now()
 )
-ON CONFLICT (app_id, scope, kind, host, port) DO UPDATE SET
+ON CONFLICT (app_id, scope, deployment_scope, kind, host, port) DO UPDATE SET
     source          = EXCLUDED.source,
     declared_region = EXCLUDED.declared_region,
     last_rtt_ms     = EXCLUDED.last_rtt_ms,
     last_probed_at  = EXCLUDED.last_probed_at,
+    deployment_scope = EXCLUDED.deployment_scope,
     last_seen_at    = now()
 RETURNING id
 `
@@ -1567,6 +1727,7 @@ type InsertDataUpstreamParams struct {
 	AppID            pgtype.UUID
 	Source           string
 	Scope            string
+	DeploymentScope  string
 	Kind             string
 	Host             string
 	Port             int32
@@ -1597,12 +1758,15 @@ type InsertDataUpstreamParams struct {
 // Dedupe-merge INSERT for data_upstreams. Mirrors the
 // IncrementAppError ON CONFLICT pattern (queries.sql:906).
 // The handler (PR-B's cmd/apid/extract.go) targets
-// data_upstreams_dedupe_uniq on (app_id, scope, kind,
-// host, port). On conflict: bump last_seen_at; refresh
-// last_rtt_ms / last_probed_at / declared_region from
-// EXCLUDED so the freshest classifier observation wins.
-// id is caller-supplied (uuidv7) so the row identity is
-// stable across the dedupe-merge.
+// data_upstreams_dedupe_uniq on (app_id, scope,
+// deployment_scope, kind, host, port) per ADR-098 amendment
+// (issue #954 / 00281_data_upstreams_deployment_scope.sql).
+// On conflict: bump last_seen_at; refresh last_rtt_ms /
+// last_probed_at / declared_region / deployment_scope
+// from EXCLUDED so a re-classification re-stamps the
+// deployment overlay on the latest observation. id is
+// caller-supplied (uuidv7) so the row identity is stable
+// across the dedupe-merge.
 func (q *Queries) InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDataUpstreamParams) (pgtype.UUID, error) {
 	row := db.QueryRow(ctx, insertDataUpstream,
 		arg.ID,
@@ -1610,6 +1774,7 @@ func (q *Queries) InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDat
 		arg.AppID,
 		arg.Source,
 		arg.Scope,
+		arg.DeploymentScope,
 		arg.Kind,
 		arg.Host,
 		arg.Port,
@@ -1665,6 +1830,65 @@ func (q *Queries) InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg Inse
 		arg.ProbeNode,
 	)
 	return err
+}
+
+const insertOIDCExchangedToken = `-- name: InsertOIDCExchangedToken :one
+insert into oidc_exchanged_tokens
+    (account_id, token_hash, expires_at, issuer_url, subject,
+     audience, jti)
+values ($1, $2, $3, $4, $5, $6, $7)
+returning id, account_id, token_hash, expires_at, issuer_url,
+          subject, audience, coalesce(jti, '') as jti,
+          created_at
+`
+
+type InsertOIDCExchangedTokenParams struct {
+	AccountID pgtype.UUID
+	TokenHash []byte
+	ExpiresAt pgtype.Timestamptz
+	IssuerUrl string
+	Subject   string
+	Audience  []string
+	Jti       pgtype.Text
+}
+
+type InsertOIDCExchangedTokenRow struct {
+	ID        pgtype.UUID
+	AccountID pgtype.UUID
+	TokenHash []byte
+	ExpiresAt pgtype.Timestamptz
+	IssuerUrl string
+	Subject   string
+	Audience  []string
+	Jti       string
+	CreatedAt pgtype.Timestamptz
+}
+
+// Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
+// Returns the full row (with created_at server-stamped).
+func (q *Queries) InsertOIDCExchangedToken(ctx context.Context, db DBTX, arg InsertOIDCExchangedTokenParams) (InsertOIDCExchangedTokenRow, error) {
+	row := db.QueryRow(ctx, insertOIDCExchangedToken,
+		arg.AccountID,
+		arg.TokenHash,
+		arg.ExpiresAt,
+		arg.IssuerUrl,
+		arg.Subject,
+		arg.Audience,
+		arg.Jti,
+	)
+	var i InsertOIDCExchangedTokenRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.IssuerUrl,
+		&i.Subject,
+		&i.Audience,
+		&i.Jti,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const instanceByID = `-- name: InstanceByID :one
@@ -2367,23 +2591,26 @@ func (q *Queries) ListDataUpstreamProbesByHostRegion(ctx context.Context, db DBT
 
 const listDataUpstreamsByApp = `-- name: ListDataUpstreamsByApp :many
 SELECT
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, coalesce(declared_region, ''),
     last_rtt_ms, last_probed_at, last_seen_at, created_at
 FROM data_upstreams
 WHERE app_id = $1::uuid
-  AND ($2::timestamptz IS NULL
-       OR (created_at, id) < ($2::timestamptz,
-                              $3::uuid))
+  AND ($2::text IS NULL OR $2::text = ''
+       OR deployment_scope = $2::text)
+  AND ($3::timestamptz IS NULL
+       OR (created_at, id) < ($3::timestamptz,
+                              $4::uuid))
 ORDER BY created_at DESC, id DESC
-LIMIT $4::int
+LIMIT $5::int
 `
 
 type ListDataUpstreamsByAppParams struct {
-	AppID           pgtype.UUID
-	CursorCreatedAt pgtype.Timestamptz
-	CursorID        pgtype.UUID
-	PageLimit       int32
+	AppID                 pgtype.UUID
+	CursorDeploymentScope string
+	CursorCreatedAt       pgtype.Timestamptz
+	CursorID              pgtype.UUID
+	PageLimit             int32
 }
 
 type ListDataUpstreamsByAppRow struct {
@@ -2392,6 +2619,7 @@ type ListDataUpstreamsByAppRow struct {
 	AppID            pgtype.UUID
 	Source           string
 	Scope            string
+	DeploymentScope  string
 	Kind             string
 	Host             string
 	Port             int32
@@ -2409,17 +2637,23 @@ type ListDataUpstreamsByAppRow struct {
 // data_upstreams is a stable list, not a hot recency
 // list. Index path: data_upstreams_app_created_idx.
 //
-// sqlc.arg(...)::type casts disambiguate the two cursor
-// params — without them sqlc named both fields
-// `CreatedAt` (taken from the SELECT list) and the
-// generated Go wrapper bound a timestamptz to the $3
-// uuid slot, tripping a type error on every cursor page
-// past the first. See the cross-PR slot-fence
-// sqlc.arg-disambiguates-cursor memory; the same
+// Optional ?deployment_scope= server-side filter lands via
+// `cursor_deployment_scope` (issue #954 / ADR-098 amendment).
+// Empty string means "no filter; return all deployments"
+// — the wide-open default. Setting a non-empty value restricts
+// to one deployment. Mirrors the existing ?scope= discipline.
+//
+// sqlc.arg(...)::type casts disambiguate the cursor params
+// — without them sqlc named both fields `CreatedAt` (taken
+// from the SELECT list) and the generated Go wrapper bound a
+// timestamptz to the $3 uuid slot, tripping a type error on
+// every cursor page past the first. See the cross-PR slot-
+// fence sqlc.arg-disambiguates-cursor memory; the same
 // pattern pins ListAppErrorGroups.
 func (q *Queries) ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error) {
 	rows, err := db.Query(ctx, listDataUpstreamsByApp,
 		arg.AppID,
+		arg.CursorDeploymentScope,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.PageLimit,
@@ -2437,6 +2671,7 @@ func (q *Queries) ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListD
 			&i.AppID,
 			&i.Source,
 			&i.Scope,
+			&i.DeploymentScope,
 			&i.Kind,
 			&i.Host,
 			&i.Port,
@@ -2784,6 +3019,61 @@ func (q *Queries) ListInstancesForApp(ctx context.Context, db DBTX, appID pgtype
 			&i.StartedAt,
 			&i.LastRequestAt,
 			&i.ParkedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOIDCTrustPoliciesForAccount = `-- name: ListOIDCTrustPoliciesForAccount :many
+select account_id, issuer_url, jwks_url, audience,
+       coalesce(subject_pattern, '') as subject_pattern,
+       algorithms, required_claims, created_at, updated_at,
+       audit_login
+from oidc_trust_policies
+where account_id = $1
+order by created_at desc
+`
+
+type ListOIDCTrustPoliciesForAccountRow struct {
+	AccountID      pgtype.UUID
+	IssuerUrl      string
+	JwksUrl        string
+	Audience       []string
+	SubjectPattern string
+	Algorithms     []string
+	RequiredClaims []byte
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	AuditLogin     string
+}
+
+// Per-account dashboard list (PR-C). Empty slice on miss.
+func (q *Queries) ListOIDCTrustPoliciesForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOIDCTrustPoliciesForAccountRow, error) {
+	rows, err := db.Query(ctx, listOIDCTrustPoliciesForAccount, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOIDCTrustPoliciesForAccountRow{}
+	for rows.Next() {
+		var i ListOIDCTrustPoliciesForAccountRow
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.IssuerUrl,
+			&i.JwksUrl,
+			&i.Audience,
+			&i.SubjectPattern,
+			&i.Algorithms,
+			&i.RequiredClaims,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.AuditLogin,
 		); err != nil {
 			return nil, err
 		}
@@ -4133,6 +4423,79 @@ func (q *Queries) UpsertGithubWebhookSecret(ctx context.Context, db DBTX, arg Up
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const upsertOIDCTrustPolicy = `-- name: UpsertOIDCTrustPolicy :one
+insert into oidc_trust_policies
+    (account_id, issuer_url, jwks_url, audience, subject_pattern,
+     algorithms, required_claims, audit_login)
+values ($1, $2, $3, $4, $5, $6, $7, $8)
+on conflict (account_id, issuer_url) do update
+    set audience = excluded.audience,
+        subject_pattern = excluded.subject_pattern,
+        algorithms = excluded.algorithms,
+        required_claims = excluded.required_claims,
+        updated_at = now(),
+        audit_login = excluded.audit_login
+returning account_id, issuer_url, jwks_url, audience,
+          coalesce(subject_pattern, '') as subject_pattern,
+          algorithms, required_claims, created_at, updated_at,
+          audit_login
+`
+
+type UpsertOIDCTrustPolicyParams struct {
+	AccountID      pgtype.UUID
+	IssuerUrl      string
+	JwksUrl        string
+	Audience       []string
+	SubjectPattern pgtype.Text
+	Algorithms     []string
+	RequiredClaims []byte
+	AuditLogin     string
+}
+
+type UpsertOIDCTrustPolicyRow struct {
+	AccountID      pgtype.UUID
+	IssuerUrl      string
+	JwksUrl        string
+	Audience       []string
+	SubjectPattern string
+	Algorithms     []string
+	RequiredClaims []byte
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	AuditLogin     string
+}
+
+// PK conflict on (account_id, issuer_url) updates the mutable
+// columns (audience, subject_pattern, algorithms, required_claims,
+// updated_at, audit_login) and preserves created_at. Returns the
+// full row as stored.
+func (q *Queries) UpsertOIDCTrustPolicy(ctx context.Context, db DBTX, arg UpsertOIDCTrustPolicyParams) (UpsertOIDCTrustPolicyRow, error) {
+	row := db.QueryRow(ctx, upsertOIDCTrustPolicy,
+		arg.AccountID,
+		arg.IssuerUrl,
+		arg.JwksUrl,
+		arg.Audience,
+		arg.SubjectPattern,
+		arg.Algorithms,
+		arg.RequiredClaims,
+		arg.AuditLogin,
+	)
+	var i UpsertOIDCTrustPolicyRow
+	err := row.Scan(
+		&i.AccountID,
+		&i.IssuerUrl,
+		&i.JwksUrl,
+		&i.Audience,
+		&i.SubjectPattern,
+		&i.Algorithms,
+		&i.RequiredClaims,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AuditLogin,
+	)
+	return i, err
 }
 
 const usageByMonth = `-- name: UsageByMonth :many

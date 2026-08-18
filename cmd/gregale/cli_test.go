@@ -340,6 +340,20 @@ func TestCmdApps_Unauthenticated(t *testing.T) {
 // --- cmdDeploy --------------------------------------------------------------
 
 func TestCmdDeploy_NoImage(t *testing.T) {
+	// Issue #961 / Mega-A PR-1 added a zero-config branch that packs
+	// cwd when it's inside a git repo with a GitHub origin (issue
+	// #313 pre-existing). Run the test from a non-git tempdir so the
+	// zero-config branch doesn't fire and the "no source flag" path
+	// stays the assertion target.
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(origCwd) }()
+	nonGit := t.TempDir()
+	if err := os.Chdir(nonGit); err != nil {
+		t.Fatalf("Chdir %s: %v", nonGit, err)
+	}
 	if code := cmdDeployTarball(nil); code != 1 {
 		t.Errorf("cmdDeploy no image = %d, want 1", code)
 	}

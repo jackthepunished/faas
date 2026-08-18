@@ -1,22 +1,29 @@
-# Billing provider switch (Stripe ↔ Paddle)
+# Billing provider switch (Paddle → Stripe legacy opt-in)
 
-The platform can run on either Stripe (default) or Paddle Billing v2
-(opt-in) via a single env-var selector (`FAAS_BILLING_PROVIDER`). This
-runbook covers switching a deployment between the two without code
-changes, migrations, or per-handler branching.
+The launch production billing provider is **Paddle Billing v2** (ADR-032 v2,
+accepted 2026-08-18). The legacy Stripe surface is still bootable from
+`FAAS_BILLING_PROVIDER=stripe` for a node-level opt-out, but the
+deploy template is Paddle-only. This runbook covers:
 
-The decision that a deployment uses Paddle at all is operator-side —
-the financial model spreadsheet keeps Stripe as the production
-reference for fee math; Paddle is the secondary surface for customers
-whose card issuers don't process USD-denominated Stripe charges.
+- The selector semantics in both directions.
+- The cutover procedure for a node-level rollback to Stripe (the
+  on-launch option, intended for a single-node hot-fix while the
+  broader cluster rolls forward).
+- The four `launch-checklist` gates a maintainer must run before the
+  v1.0.0 tag.
+
+> **Operator reminder (v2):** at launch there are no production
+> customers on Stripe. The pinned `stripe-go v70.15.0+incompatible`
+> module is preserved for admin endpoints + tests; only the runtime
+> dispatch is unwired.
 
 ## Selector
 
 | `FAAS_BILLING_PROVIDER` | Behavior                                         |
 |-------------------------|--------------------------------------------------|
-| (empty) / unset         | Stripe (default — bit-for-bit unchanged).        |
-| `stripe`                | Stripe (explicit).                               |
-| `paddle`                | Paddle Billing v2. Requires `FAAS_PADDLE_*`.    |
+| (empty) / unset         | Paddle (default — production billing provider).  |
+| `paddle`                | Paddle (explicit). Requires `FAAS_PADDLE_*`.    |
+| `stripe`                | Stripe (legacy opt-in for a node-level rollback). Requires `STRIPE_*`. |
 | anything else           | Daemon fails to boot with a typed error.         |
 
 The selector is the canonical name for both `apid` and `meterd`; both
@@ -132,13 +139,17 @@ export DATABASE_URL=postgres:///faas?host=/run/postgresql&user=faas
 make e2e-sandbox
 ```
 
-The walk fires three sequential tests via a `/tmp/faas-paddle-sandbox-handoff.json` file:
+The walk fires five sequential tests via a `/tmp/faas-paddle-sandbox-handoff.json` file:
 
 1. `TestPaddleSandbox_ChangePlanReturnsCheckoutURL` — signup → `PATCH /v1/account/plan {plan: hobby}` → asserts 402 + `paddle_checkout_url` + `tx_id`. Writes the customer + transaction IDs to the handoff file.
 2. `TestPaddleSandbox_SubscriptionCreatedStampsCustomerID` — POSTs a signed `subscription.created` event with the handoff's `ctm_…` ID → asserts `accounts.provider_customer_id` is populated.
 3. `TestPaddleSandbox_TransactionCompletedIsNoop` — POSTs a signed `transaction.completed` event → asserts no state flip.
+4. `TestPaddleSandbox_PerWindowClaimRoundTrip` — runs the meterd production path (`NewProviderWithDedupe` → `EnsurePlanProducts` → `PushUsageRecord`) directly against the sandbox and asserts the `paddle_overage_dedupe` row is stamped with `state=completed`, `pushed_at` non-null, `claimed_by` non-null, `pushed_mb_seconds` = the integer the test pushed. Distinct from `pkg/billing/paddle/sandbox_test.go` (which exercises the Provider with `dedupe=nil`); this one wires the production constructor and asserts the dedupe row state after a real SDK POST.
+5. `TestPaddleSandbox_WebhookSignatureRoundTrip` — SDK-side pinning of the contract Tests 2/3 prove at the apid HTTP layer. Signs a real Paddle-shaped JSON body with the operator's webhook secret; asserts `VerifyWebhook` accepts it with canonical and lowercase header keys, and rejects a tampered body with `errors.Is(err, billing.ErrBadSignature)`.
 
-A passing run validates that the apid webhook handler, the catalog OpProvider, and the live Paddle sandbox all agree on the customer → account mapping. Re-run is idempotent (every test creates fresh state).
+A passing run validates that the apid webhook handler, the catalog OpProvider, the meterd pusher, and the live Paddle sandbox all agree on the customer → account mapping AND on the wire shape the SDK signs/verifies. Re-run is idempotent (every test creates fresh state).
+
+The B4 pre-flight has a separate pgstore-level pin in `pkg/state/pgstore_paddle_overage_schema_test.go` that runs in CI's pg shard (no sandbox credentials required). The two probes (`TestPgStorePaddleOverageDedupeSchema_PostApply` + `_PreApply_ReturnsTableMissing`) keep the to_regclass + information_schema probe honest — a future migration that drops a 00041 column or breaks the missing-table hint flips them red.
 
 ## Secret rotation
 

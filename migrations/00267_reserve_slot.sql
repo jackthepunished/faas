@@ -1,30 +1,32 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00267_reserve_slot.sql — slot reservation placeholder (ADR-041 / PR #391
--- migration gate carve-out).
+-- 00267_reserve_slot.sql — slot reservation placeholder
+-- (ADR-101 / issue #270 PR-A second-renumber carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
--- migrations/embed_test.go::TestMigrationsContiguous requirement that the
--- embedded migration set is exactly {1, 2, …, N} with no gaps. It carries
--- no schema change and does not appear in any apply path (the replay-safety
--- gate in ci.yml drops files whose basename matches the reservation regex
--- from its "added migration versions" computation).
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
 --
--- This reservation is for PR-3a of the issue #911 PR cluster (declarative
--- split-box deployment manifest + gregale doctor). The body lands in
--- migrations/00267_release_bundles.sql and creates the release_bundles
--- table that records every bundled release tuple (id, git_sha,
--- manifest_hash, daemon_hashes, created_at, applied_at). PR-3 itself
--- (release bundle + cross-box artifact sync) consumes this table.
+-- PR #906 (ADR-101 PR-A) renumbered the OIDC tables from 00267 →
+-- 00269 + 00268 → 00270 after PR #910 (worktree-feat-triggers-mega)
+-- claimed slot 00267 with `00267_triggers.sql`. This fence bridges
+-- the contiguity chain from 00266 to 00268 in both:
+--   * the branch-only tree (which lacks main's 265 + #910's 267)
+--   * the PR-merge tree (which has main's 265 but not #910's 267)
 --
--- If another PR lands first at slot 267, this reservation drops on rebase.
--- The renumber-helper chain (`scripts/ci/check_migration_slots.sh`) catches
--- any duplicate-prefix collision at merge time.
+-- Whichever PR merges first (906 or 910) must drop its 00267 fence
+-- in a follow-up commit — when #910 merges, drop ours; when ours
+-- merges first, drop #910's 00267_triggers.sql in favour of a
+-- renumber (the canonical ADR-041 carve-out is "drop the fence of
+-- the merged PR, force the still-open PR to renumber past it").
 --
--- Body: `select 1;` — executes against the live DB at apply time but
--- produces no schema change. Future-proof against upstream generator drift
--- without chasing each new template revision.
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
 --
 select 1;
 

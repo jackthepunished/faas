@@ -308,6 +308,22 @@ var cliCommands = []cliCommand{
 		Short:   "Manage custom domains",
 	},
 	{
+		Name:    "tenant-surfaces",
+		DocSlug: "tenant-surfaces",
+		Short:   "Manage tenant surfaces (multi-hostname SAN bundle per app)",
+		Subcommands: []cliSub{
+			{Name: subList, Short: "List tenant surfaces on an app", Flags: []cliFlag{
+				{Name: "app", Short: "app slug (required)"},
+			}},
+			{Name: subAdd, Short: "Add a tenant surface (with seed hostnames)"},
+			{Name: subRm, Short: "Remove a tenant surface (cascades hostnames)"},
+			{Name: "hostname", Short: "Manage hostnames on a surface (add|rm)"},
+		},
+		Flags: []cliFlag{
+			{Name: "app", Short: "app slug"},
+		},
+	},
+	{
 		Name:    "edge-rules",
 		DocSlug: "edge-rules",
 		Short:   "Per-app edge rules (edge-rules list|create|get|update|delete --app <slug>)",
@@ -340,6 +356,22 @@ var cliCommands = []cliCommand{
 			{Name: "template", Short: "template name", Req: true, ClosedSet: []string{"node22-http", "python312-http"}},
 			{Name: "path", Short: "target directory", Req: true},
 			{Name: "deploy", Short: "deploy after scaffolding"},
+		},
+	},
+	{
+		Name:        dispatchInspect,
+		DocSlug:     "inspect",
+		Short:       "Read-only operator surface (inspect <slug> --upstreams [--scope <scope>] [--json])",
+		Positionals: []string{"<slug>"},
+		// Leaf-selectors are flags on this verb, not positional
+		// sub-verbs (issue #952 UX: `gregale inspect <slug>
+		// --upstreams`). Future leaves (--env, --crons,
+		// --instances) add another `cliFlag` entry below. The
+		// completion backend and man-page renderer read this
+		// Flags block to surface the right verb shape.
+		Flags: []cliFlag{
+			{Name: "upstreams", Short: "List data upstreams captured for this app (ADR-098 §9.A)"},
+			{Name: "scope", Short: "filter by scope (forwarded as ?scope=, used with --upstreams)"},
 		},
 	},
 	{

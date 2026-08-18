@@ -14,7 +14,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// EgressAllowlistAllowed/MaxSize default to false/0 (Go zero), so
 		// Free/Hobby rows below omit them intentionally — mirrors the
 		// MinInstancesAllowed row shape.
-		PlanFree: {Plan: PlanFree, DeployedApps: 1, MaxConcurrency: 1, RAMMB: 128, AppLayerMaxMB: 256, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 30, IncludedGBHours: 5, PriceMillicents: 0, RateLimitRPS: 5, RateLimitBurst: 20, EgressMbit: 10, SecretCountMax: 3, SecretValueMaxBytes: 4096, MaxMinInstances: 0,
+		PlanFree: {Plan: PlanFree, DeployedApps: 1, MaxConcurrency: 1, RAMMB: 128, AppLayerMaxMB: 256, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 30, CertExpiryWarningDays: 30, IncludedGBHours: 5, PriceMillicents: 0, RateLimitRPS: 5, RateLimitBurst: 20, EgressMbit: 10, SecretCountMax: 3, SecretValueMaxBytes: 4096, MaxMinInstances: 0,
 			// Issue #559: Free = 1 (single-concurrency plan — one VM
 			// serves one request at a time; mirrors MaxConcurrency).
 			ConcurrencyPerVMBound: 1,
@@ -67,6 +67,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
+			// ADR-104: Free gets 100 — small slice of per-key
+			// cardinality, enough to size 1-2 per-key limits.
+			ThrottleMaxKeysPerRule: 100,
 			// ADR-099 PR-0: Free wake-admission throttle (1/1).
 			WakeBurstPerApp:     1,
 			WakeBurstPerAccount: 1,
@@ -116,7 +119,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			LogArchiveEnabled: false, LogArchiveRetentionDaysMax: 0,
 			// ADR-096: Free = 1 day retention, 50 fingerprints, 25 request rows.
 			AppErrorsRetentionDays: 1, AppErrorsMaxFingerprintsPerApp: 50, AppErrorsMaxRequestRowsPerFingerprint: 25},
-		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
+		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, CertExpiryWarningDays: 30, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
 			ConcurrencyPerVMBound: 5,
@@ -183,6 +186,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
 			RateLimitPerAccountRPM: 200,
+			// ADR-104: Hobby gets 1000 — meaningful per-key
+			// cardinality on a small/medium deployment.
+			ThrottleMaxKeysPerRule: 1000,
 			// ADR-099 PR-0: Hobby wake-admission throttle (5/10).
 			WakeBurstPerApp:     5,
 			WakeBurstPerAccount: 10,
@@ -234,7 +240,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-096: Hobby = 7 days, 200 fingerprints, 100 request rows.
 			AppErrorsRetentionDays: 7, AppErrorsMaxFingerprintsPerApp: 200, AppErrorsMaxRequestRowsPerFingerprint: 100},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
-		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
+		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, CertExpiryWarningDays: 30, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
 			// envelope — one Node/Python service handling fan-out).
 			ConcurrencyPerVMBound: 25,
@@ -286,6 +292,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			WebhookPerApp: 10, WebhookPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
+			// ADR-104: Pro gets 5000 — meaningful per-tenant
+			// cardinality on a multi-tenant deployment.
+			ThrottleMaxKeysPerRule: 5000,
 			// ADR-099 PR-0: Pro wake-admission throttle (20/30).
 			WakeBurstPerApp:     20,
 			WakeBurstPerAccount: 30,
@@ -342,7 +351,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			AppErrorsRetentionDays: 30, AppErrorsMaxFingerprintsPerApp: 1000, AppErrorsMaxRequestRowsPerFingerprint: 500},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
-		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
+		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, CertExpiryWarningDays: 30, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
 			// Issue #559: Scale = 80 (matches Cloud Run's
 			// `80 × vCPU` default per the issue body).
 			ConcurrencyPerVMBound: 80,
@@ -398,6 +407,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
 			RateLimitPerAccountRPM: 5000,
+			// ADR-104: Scale gets 10000 — full per-tenant
+			// cardinality on a multi-tenant SaaS deployment.
+			ThrottleMaxKeysPerRule: 10000,
 			// ADR-099 PR-0: Scale wake-admission throttle (100/150).
 			WakeBurstPerApp:     100,
 			WakeBurstPerAccount: 150,

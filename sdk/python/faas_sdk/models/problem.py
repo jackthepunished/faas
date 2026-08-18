@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.field_error import FieldError
+    from ..models.secret_finding import SecretFinding
 
 
 T = TypeVar("T", bound="Problem")
@@ -72,6 +73,23 @@ class Problem:
     + got) so an SDK can drive form-field UI without parsing
     prose.
     """
+    secret_findings: list[SecretFinding] | Unset = UNSET
+    """Per-line secret-scan detail. Populated by 422 sites with
+    `code: secret_scan_strict` (cmd/apid/secretscan.go
+    server-side scan rejection; cmd/gregale printErr
+    --secret-scan=strict client-side rejection). The shape
+    is shared with the on-disk `SecretScanResult` so a
+    programmatic consumer can render the same UI for both
+    rejection paths. Optional + omitempty.
+    """
+    secret_hint: str | Unset = UNSET
+    """Customer-facing remediation nudge attached to a
+    `code: secret_scan_strict` 422 envelope (e.g. "move
+    detected secrets to `gregale secrets set`"). Mirrors
+    the `FieldError` shape's prose pattern so the dashboard
+    / SDK can render the hint as a one-line footer without
+    parsing prose. Optional + omitempty.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,6 +130,15 @@ class Problem:
                 errors_item = errors_item_data.to_dict()
                 errors.append(errors_item)
 
+        secret_findings: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.secret_findings, Unset):
+            secret_findings = []
+            for secret_findings_item_data in self.secret_findings:
+                secret_findings_item = secret_findings_item_data.to_dict()
+                secret_findings.append(secret_findings_item)
+
+        secret_hint = self.secret_hint
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -139,12 +166,17 @@ class Problem:
             field_dict["tx_id"] = tx_id
         if errors is not UNSET:
             field_dict["errors"] = errors
+        if secret_findings is not UNSET:
+            field_dict["secret_findings"] = secret_findings
+        if secret_hint is not UNSET:
+            field_dict["secret_hint"] = secret_hint
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.field_error import FieldError
+        from ..models.secret_finding import SecretFinding
 
         d = dict(src_dict)
         title = d.pop("title")
@@ -192,6 +224,17 @@ class Problem:
 
                 errors.append(errors_item)
 
+        _secret_findings = d.pop("secret_findings", UNSET)
+        secret_findings: list[SecretFinding] | Unset = UNSET
+        if _secret_findings is not UNSET:
+            secret_findings = []
+            for secret_findings_item_data in _secret_findings:
+                secret_findings_item = SecretFinding.from_dict(secret_findings_item_data)
+
+                secret_findings.append(secret_findings_item)
+
+        secret_hint = d.pop("secret_hint", UNSET)
+
         problem = cls(
             title=title,
             status=status,
@@ -205,6 +248,8 @@ class Problem:
             paddle_checkout_url=paddle_checkout_url,
             tx_id=tx_id,
             errors=errors,
+            secret_findings=secret_findings,
+            secret_hint=secret_hint,
         )
 
         problem.additional_properties = d

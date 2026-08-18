@@ -454,7 +454,7 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// audit + log fan-out is in notifyAndAuditDeployment.
 	s.maybeFlipMFAOnDeploy(r.Context(), acct)
 	notifyAndAuditDeployment(r.Context(), s, acct, app, d, prev, &req)
-	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
+	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d, app))
 }
 
 // loadAppAndPreflight resolves the app from the URL slug, enforces

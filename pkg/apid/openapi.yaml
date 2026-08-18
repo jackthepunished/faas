@@ -117,6 +117,14 @@ tags:
       PATCH /v1/apps/{slug}/security (admin + MFA) flips the
       require_signed flag; trusted_signers CRUD manages the
       per-app cosign trusted-publisher list.
+  - name: tenant-surfaces
+    description: |
+      Tenant hostname groupings (issue #879 / ADR-100). One surface
+      holds N hostnames under one SAN bundle. Soft-deleted surfaces
+      are filtered out of list/get; the cert engine picks up
+      pending-state surfaces via pg_notify('tenant_surface_changed')
+      to mint the cert. Returns 402 when the
+      `FAAS_TENANT_SURFACES_ENABLED` flag is off.
   - name: usage
     description: Usage roll-up and metering.
   - name: upstreams
@@ -128,7 +136,9 @@ tags:
       `host:port` via `crypto/tls.Dial` (never `http.Get`) and
       records per-region samples in `data_upstream_probes`; the
       chooser in schedd reads them synchronously at wake via
-      `upstreamAffinity.Score(appID)`. Plaintext host is never
+      `upstreamAffinity.Score(appID, deploymentScope)` (ADR-098
+      amendment issue #954: each deployment reads its own probe
+      bias). Plaintext host is never
       emitted on the wire — only the sha256(salt||host) 8-hex
       prefix appears as a metric label.
   - name: billing
@@ -1223,6 +1233,51 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/auth/oidc/exchange:
+    post:
+      summary: Exchange an IdP-issued JWT for a short-lived deploy bearer
+      description: |
+        ADR-101 / issue #270. CI runners that have an IdP-issued OIDC
+        JWT (RFC 8414; e.g. GitHub Actions `ACTIONS_ID_TOKEN_REQUEST_TOKEN`,
+        GitLab CI, CircleCI) call this endpoint to exchange it for a
+        short-lived opaque bearer (5 min TTL, `fp_oidc_<48 hex>` prefix).
+        The bearer is then used in `Authorization: Bearer …` on the
+        existing deploy routes.
+
+        The endpoint is anonymous — the JWT is the auth — so it does
+        not require a session or a previous bearer. The first-use
+        auto-create flow bootstraps a permissive trust policy on the
+        `(account_id, issuer_url)` pair so customers do not have to
+        configure the dashboard before their first CI deploy.
+
+        The AuthLimit surface is the shared per-IP bucket (spec §11
+        10/min/IP) — high-volume CI runners may hit the cap; long-lived
+        deploy tokens remain the escape hatch.
+      operationId: oidcExchange
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OIDCExchangeRequest' }
+      responses:
+        '200':
+          description: Exchanged. The bearer is in the response body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OIDCExchangeResponse' }
+        '400':
+          description: Malformed request body or empty fields.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: JWT signature / issuer / audience / subject failed verification, OR no account is bound to the (issuer, subject) pair.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /dashboard/account/set-password:
     post:
       tags: [auth]
@@ -1809,6 +1864,71 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/apps/{slug}/deployments/source-tarball:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [deployments]
+      operationId: createDeploymentFromSourceTarball
+      summary: Create a deployment from a CLI-uploaded local tarball (zero-config).
+      description: |
+        Zero-config deploy path (issue #961 / Mega-A PR-1, ADR-115).
+        The CLI uploads a gzipped tar via the `tarball` form field and
+        an optional informational `{repo, ref}` JSON sidecar. The CLI
+        binary is the trust root: apid does NOT consult
+        `github_installations` and does NOT attempt a server-side git
+        fetch.
+
+        Distinct from the source-ref path
+        (`POST /v1/apps/{slug}/deployments/source-ref`, ADR-092) which
+        resolves the GitHub install and pins the tarball to a 40-char
+        SHA. The source-ref handler is unchanged; this is a parallel
+        trust path for first-deploy customers without the GitHub App
+        installed.
+
+        Wire shape:
+          multipart/form-data with two fields:
+            - `tarball` (required): the gzipped tar, capped at the
+              per-plan `SourceTarballMaxMB`.
+            - `sidecar` (optional): JSON `{repo, ref}` recorded on
+              the build row for provenance; the build pipeline does
+              NOT use it to fetch upstream.
+
+        Audit kind: `deploy.local_tarball` (distinct from
+        `deploy.source_ref`).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [tarball]
+              properties:
+                tarball:
+                  type: string
+                  format: binary
+                sidecar:
+                  $ref: '#/components/schemas/SourceTarballDeployRequest'
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The local-tarball deployment whose build has been accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentResponse'
+        '400':
+          description: |
+            code: validation_failed. Missing `tarball` field, malformed
+            sidecar JSON, or invalid tarball shape.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/SourceTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/apps/{slug}/diff:
     parameters:
@@ -2586,6 +2706,143 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '500': { $ref: '#/components/responses/ServerError' }
 
+  # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ────────────────────────
+  /v1/apps/{slug}/tenant-surfaces:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [tenant-surfaces]
+      operationId: listTenantSurfaces
+      summary: List tenant surfaces on an app.
+      description: |
+        Returns every active tenant surface on the app. Soft-deleted
+        surfaces are filtered out server-side. Returns 402 when the
+        `FAAS_TENANT_SURFACES_ENABLED` flag is off (the cluster ships
+        dark until the cert-engine real-mint ADR lands).
+      responses:
+        '200':
+          description: The active surfaces on the app.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListTenantSurfacesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [tenant-surfaces]
+      operationId: createTenantSurface
+      summary: Add a tenant surface with seed hostnames.
+      description: |
+        The customer-facing surface for issue #879 / ADR-100. One
+        surface holds N hostnames under one SAN bundle. Returns 202
+        (the cert engine has to mint; the surface is in pending/active
+        state).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTenantSurfaceRequest' }
+      responses:
+        '202':
+          description: The new surface (pending active).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id.
+    get:
+      tags: [tenant-surfaces]
+      operationId: getTenantSurface
+      summary: Get one tenant surface.
+      responses:
+        '200':
+          description: The surface + its hostnames.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [tenant-surfaces]
+      operationId: deleteTenantSurface
+      summary: Remove a tenant surface (soft-delete + cascade hostnames).
+      responses:
+        '204': { description: Surface and hostnames removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}/hostnames:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being added to.
+    post:
+      tags: [tenant-surfaces]
+      operationId: addTenantHostname
+      summary: Add a hostname to an existing surface.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddTenantHostnameRequest' }
+      responses:
+        '202':
+          description: The hostname (pending DNS-01 verification).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantHostnameResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being removed from.
+      - name: hostname
+        in: path
+        required: true
+        schema: { type: string }
+        description: The hostname (lowercased canonical form).
+    delete:
+      tags: [tenant-surfaces]
+      operationId: removeTenantHostname
+      summary: Remove a hostname from a surface.
+      responses:
+        '204': { description: Hostname removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/apps/{slug}/env:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -2694,6 +2951,18 @@ paths:
   /v1/apps/{slug}/upstreams:
     parameters:
       - $ref: '#/components/parameters/Slug'
+      - name: deployment_scope
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+        description: |
+          ADR-098 amendment (issue #954). Optional server-side filter
+          that narrows the list to one deployment. Omitted = return
+          all deployments for the app. Same shape as `scope` (3..40
+          chars, lowercase alnum + dash); empty string is treated as
+          "no filter".
     get:
       tags: [upstreams]
       operationId: listAppDataUpstreams
@@ -2707,6 +2976,10 @@ paths:
         quota (Free=0, Hobby=3, Pro=10, Scale=50). When FAAS_DATA_PLACEMENT
         is on the classifier derives entries on env mutation; when OFF
         the table stays empty and the response is `[]`.
+
+        ADR-098 amendment (issue #954): `?deployment_scope=` narrows
+        the list to one deployment so the dashboard can render
+        staging-vs-prod independently. Omitted = "all deployments".
       responses:
         '200':
           description: Captured upstreams on the app (plaintext never returned).
@@ -3374,6 +3647,24 @@ paths:
         required: true
         schema: { type: string, pattern: '^[a-z0-9.\-]+$' }
         description: The custom domain string (e.g. `app.example.com`).
+    get:
+      tags: [domains]
+      operationId: getDomain
+      summary: Show a custom domain's cert details (issue #961 / Mega-A PR-3).
+      description: |
+        Returns the durable domain row + the live cert chain
+        (NotAfter, SANs) by dialing port-443 and reading the leaf
+        cert. Used by `gregale domains show <domain>`.
+      responses:
+        '200':
+          description: The domain row + cert details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomDomainResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
     delete:
       tags: [domains]
       operationId: deleteDomain
@@ -3382,6 +3673,44 @@ paths:
         '204': { description: No body. The binding was removed. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/domains/{domain}/verify:
+    parameters:
+      - name: domain
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9.\-]+$' }
+        description: The custom domain to re-verify (e.g. `app.example.com`). The same shape as the GET path; verify walks DNS + cert while show returns the durable row.
+    post:
+      tags: [domains]
+      operationId: verifyDomain
+      summary: Re-verify a domain's DNS + cert (issue #961 / Mega-A PR-3).
+      description: |
+        Re-runs the DNS verifier + cert dial; returns the canonical
+        CustomDomainResponse. Used by `gregale domains verify
+        <domain>`. Idempotent: POSTing twice does not change the
+        durable verification state.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The row + cert details. `cert_not_after` / `cert_sans` populated when the cert dial succeeds.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomDomainResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            code: domain_verification_failed | domain_cert_not_issued.
+            DNS walk found a missing/mismatched TXT record, or the
+            port-443 cert is a CDN cert whose SANs do not include
+            the customer's domain.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ─── Crons ────────────────────────────────────────────────────────────────
@@ -8323,8 +8652,64 @@ components:
             (hit). The `image_digest` sub-field records which OCI
             digest the imaged walk ran against; null on legacy
             pre-PR-A rows. See `pkg/imaged/secretscan.go`.
+        # Issue #961 / Mega-A PR-2: auto-detected BuildPlan surfaced
+        # on the wire so the CLI prints a single "Detected:" line and
+        # the dashboard renders the same shape without a separate
+        # /build fetch. nil for image deploys (no SourcePath on disk);
+        # the wire's omitempty keeps the field off the response in
+        # that case. Source-ref and local-tarball deploys both carry
+        # the same shape — the apid handler reads the spooled tarball
+        # via pkg/markers.DetectFromTarball directly (NOT the
+        # builderd shim, which errors on FrameworkUnknown).
+        build_plan:
+          oneOf:
+            - $ref: '#/components/schemas/BuildPlan'
+            - type: 'null'
+          description: "Auto-detected build plan (issue #961 / Mega-A PR-2). One-line summary the CLI prints after `gregale deploy`. nil for image deploys."
+
+    BuildPlan:
+      description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
+      type: object
+      required: [framework]
+      properties:
+        framework:
+          type: string
+          enum: [node, python, go, docker, unknown]
+          description: "Framework detected from the source tarball's top-level markers. `unknown` means no marker was found (monorepo / custom build); the wire renders this as `Detected: …, framework=unknown` rather than dropping the response."
+        runtime:
+          type: [string, "null"]
+          description: "Runtime the app is pinned to (eg `node22`, `python312`). Echoed from app.Runtime. nil for apps without a runtime set (image deploys)."
+        version:
+          type: [string, "null"]
+          description: "Framework version extracted from the detected marker (eg `package.json` `engines.node`, `requirements.txt` head pin). nil when the marker has no version or framework is `unknown`."
+        entrypoint:
+          type: [string, "null"]
+          description: "Entrypoint override (create-time only). nil when the customer did not supply one."
+        port:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 65535
+          description: "Listen-port override (create-time only). nil when the customer did not supply one."
+        class:
+          type: [string, "null"]
+          enum: [null, app, function]
+          description: "App class from `app.Type` — `app` for plain apps, `function` for function rewrites (spec §4.2)."
+
+    SourceTarballDeployRequest:
+      description: "Body for the informational `sidecar` form field on POST /v1/apps/{slug}/deployments/source-tarball (issue #961 / Mega-A PR-1, ADR-115). The CLI is the trust root for this deploy path; apid does NOT consult `github_installations` and does NOT attempt a server-side git fetch. The sidecar fields are recorded on the build row for provenance only — the build pipeline does NOT use them to fetch upstream."
+      type: object
+      properties:
+        repo:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]/[a-z0-9._-]{1,100}$'
+          description: "`owner/repo` from the customer's git remote, parsed by `cmd/gregale/git_local.go::parseGitRemoteURL`. nil when the sidecar is omitted entirely."
+        ref:
+          type: [string, "null"]
+          pattern: '^[a-f0-9]{40}$'
+          description: "40-char lowercase SHA from `git rev-parse HEAD`. Informational only; the build pipeline does NOT pin to this SHA."
 
     UpdateDeploymentRequest:
+
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
       type: object
       required: [min_instances]
@@ -9152,7 +9537,7 @@ components:
     # ─── Domains ──────────────────────────────────────────────────────────
 
     CustomDomainResponse:
-      description: "A custom domain binding: domain string, target app, verification status, and TLS provisioning state."
+      description: "A custom domain binding: domain string, target app, verification status, and TLS provisioning state. Issue #961 / Mega-A PR-3 adds `default`, `cert_not_after`, and `cert_sans` for the `gregale domains set-default | verify | show` surface."
       type: object
       required: [domain, app_id, verified]
       properties:
@@ -9162,6 +9547,10 @@ components:
         verified: { type: boolean }
         verified_at: { type: [string, "null"], format: date-time }
         txt_record: { type: [string, "null"] }
+        default: { type: boolean, description: "True when this domain is the app's default (issue #961 / Mega-A PR-3). Set via `gregale domains set-default`." }
+        cert_not_after: { type: [string, "null"], format: date-time, description: "Issued cert NotAfter (RFC3339 UTC). Populated on verified domains; the `gregale domains show` line below the cert expiry renders against this field." }
+        cert_sans: { type: array, items: { type: string }, description: "Cert subject alt names (DNSNames). Useful for the `gregale domains show` listing — if the customer's CNAME points at a CDN, the SANs reveal which CDN." }
+        cert_status: { type: [string, "null"], description: "One of `issued` | `pending` | `dial_failed:<reason>`. The show endpoint surfaces this verbatim so the customer can distinguish DNS-not-propagated from cert-not-yet-issued from TLS-handshake-refused. Issue #961 / Mega-A PR-3 code-review round (MED-4)." }
 
     CreateCustomDomainRequest:
       description: "Bind a custom domain to an app."
@@ -9170,6 +9559,68 @@ components:
       properties:
         domain: { type: string , example: "app.example.com"}
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+
+    # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ──────────────────────
+
+    TenantSurfaceResponse:
+      description: "A tenant surface: a multi-hostname SAN bundle attached to one app."
+      type: object
+      required: [id, account_id, app_id, name, cert_kind, status, cert_state, hostnames]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        name: { type: string, example: "customer-zones" }
+        cert_kind: { type: string, enum: [per_host_san] }
+        status: { type: string, enum: [pending, active, suspended, deleted] }
+        cert_state: { type: string, enum: [none, pending, issued, renewing, failed] }
+        cert_not_after: { type: string, format: date-time }
+        cert_last_error: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        hostnames:
+          type: array
+          items: { $ref: '#/components/schemas/TenantHostnameResponse' }
+
+    TenantHostnameResponse:
+      description: "A hostname attached to a tenant surface (DNS-01 verified)."
+      type: object
+      required: [hostname, verified, txt_record]
+      properties:
+        hostname: { type: string, example: "api.customer-a.com" }
+        challenge_token: { type: [string, "null"] }
+        verified: { type: boolean }
+        verified_at: { type: [string, "null"], format: date-time }
+        last_error: { type: [string, "null"] }
+        txt_record: { type: string, description: "TXT record the customer must publish (_faas-verify.<hostname>)." }
+
+    CreateTenantSurfaceRequest:
+      description: "Create a tenant surface with a seed set of hostnames."
+      type: object
+      required: [app_id, name]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        name: { type: string, example: "customer-zones" }
+        cert_kind: { type: string, enum: [per_host_san] }
+        hostnames:
+          type: array
+          items: { type: string, example: "api.customer-a.com" }
+
+    ListTenantSurfacesResponse:
+      description: "Surfaces on the app (soft-deleted excluded server-side)."
+      type: object
+      required: [surfaces]
+      properties:
+        surfaces:
+          type: array
+          items: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+
+    AddTenantHostnameRequest:
+      description: "Append a hostname to an existing surface."
+      type: object
+      required: [hostname]
+      properties:
+        hostname: { type: string, example: "api.customer-c.com" }
 
     # ─── Crons ────────────────────────────────────────────────────────────
 
@@ -10280,6 +10731,14 @@ components:
         for the design rationale (memory-bounded limiter +
         attacker-controlled IP cardinality = unbounded bucket
         growth).
+
+        Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881
+        Phase 3) extends the wire shape with optional per-consumer
+        keying. Default values (`""` for key_by, omitted
+        jwt_claim_name, 0 for max_keys_per_rule) preserve PR
+        #887's behaviour bit-for-bit. See ADR-104 for the policy
+        and `pkg/gateway/ratelimit.go::AllowWithConsumerKey`
+        (Phase 3) for the run-time semantics.
       type: object
       required: [requests_per_second, burst]
       properties:
@@ -10301,6 +10760,51 @@ components:
             above `plan.RateLimitBurst` at create time and
             clamped at compile time.
           example: 200
+        key_by:
+          type: string
+          enum: ["", "none", "api_key", "jwt_subject", "jwt_claim"]
+          default: ""
+          description: |
+            Per-consumer keying dimension (ADR-104 / issue #881
+            Phase 3). When `""` or `"none"`, the bucket is shared
+            across every caller of the route (PR #887 shape).
+            When `"api_key"`, one bucket per authenticated API
+            key. When `"jwt_subject"`, one bucket per JWT `sub`.
+            When `"jwt_claim"`, one bucket per value of the
+            claim named by `jwt_claim_name`. Each non-empty
+            value activates the bounded design: when the
+            per-rule consumer set exceeds
+            `max_keys_per_rule`, all over-cap callers collapse
+            into a single non-evicting `__other__` bucket that
+            still consumes tokens (the load-bearing safety
+            property — see ADR-104 §"Consequences").
+          example: "api_key"
+        jwt_claim_name:
+          type: string
+          pattern: '^[a-zA-Z_][a-zA-Z0-9_]{0,63}$'
+          description: |
+            Required iff `key_by="jwt_claim"`. Names the JWT
+            custom claim to extract (e.g., `"tier"`,
+            `"org_id"`). Format is a CodeQL safe-identifier:
+            leading letter or underscore, then `[A-Za-z0-9_]`,
+            max 64 chars. Anything looser risks label-cardinality
+            explosion in metric series or a CodeQL go-clear-
+            text-logging finding on a future refactor.
+          example: "tier"
+        max_keys_per_rule:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          default: 0
+          description: |
+            Caps the cardinality of the per-consumer bucket map
+            for this rule. 0 means "use plan default"
+            (`Limits.ThrottleMaxKeysPerRule` per plan: Free 100
+            / Hobby 1000 / Pro 5000 / Scale 10000). The
+            validator rejects values above
+            `plan.ThrottleMaxKeysPerRule`. Must be 0 when
+            `key_by` is `""` or `"none"` — the cap is moot for
+            non-per-consumer rules.
 
     EdgeRuleBudgetAction:
       description: |
@@ -10900,11 +11404,11 @@ components:
       type: object
       required: [kind, host, port]
       description: |
-        Upsert payload for a customer data upstream. The (kind, host, port)
-        tuple is the deduplication key — repeating the PUT updates the
-        existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
-        inferred-source tag. Plaintext host is never persisted; the on-disk
-        column is `host_redacted_hash`.
+        Upsert payload for a customer data upstream. The (kind, host, port,
+        scope, deployment_scope) tuple is the deduplication key — repeating
+        the PUT updates the existing row's `last_seen_at` and (if
+        `FAAS_DATA_PLACEMENT=1`) the inferred-source tag. Plaintext host is
+        never persisted; the on-disk column is `host_redacted_hash`.
       properties:
         kind:
           type: string
@@ -10920,6 +11424,9 @@ components:
         scope:
           type: string
           description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Omitted = default scope."
+        deployment_scope:
+          type: string
+          description: "ADR-098 amendment (issue #954) widens the dedupe key to include `deployment_scope` so staging-vs-prod upstreams don't collide on the same app. Same shape as `scope` (3..40 chars, lowercase alnum + dash). Omitted = default scope, the migration's SQL DEFAULT stamp."
 
     DataUpstreamResponse:
       type: object
@@ -10951,6 +11458,9 @@ components:
         scope:
           type: string
           description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Echoes the value persisted on the row; absent when the default scope applies."
+        deployment_scope:
+          type: string
+          description: "ADR-098 amendment (issue #954) widens the dedupe key to include `deployment_scope` so staging-vs-prod upstreams don't collide on the same app. Echoes the value persisted on the row; absent when the default scope applies."
         declared_region:
           type: string
           description: "Region hint (nullable). Empty on capture; populated by the operator or the classify-flow follow-up."
@@ -12028,6 +12538,40 @@ components:
           type: integer
           minimum: 0
           description: "Number of sibling sessions revoked. The caller's session is NOT included in this count."
+
+    OIDCExchangeRequest:
+      description: "Body for `POST /v1/auth/oidc/exchange` (ADR-101)."
+      type: object
+      required: [provider, token, aud]
+      properties:
+        provider:
+          type: string
+          description: "IdP identifier (`github`, `gitlab`, `circleci`, or generic `oidc`). Used for audit attribution only — the issuer is pinned in the JWT `iss` claim."
+          example: github
+        token:
+          type: string
+          description: "Raw IdP-issued JWT (the IdP token from `ACTIONS_ID_TOKEN_REQUEST_TOKEN` etc.)."
+        aud:
+          type: string
+          description: "The `aud` claim the customer pinned in the action. Must match the trust policy's `audience` array verbatim."
+        app:
+          type: string
+          description: "Optional app slug for audit attribution. Empty skips the audit app attribution."
+    OIDCExchangeResponse:
+      description: "Body for `POST /v1/auth/oidc/exchange` success response."
+      type: object
+      required: [bearer, expires_in, token_id]
+      properties:
+        bearer:
+          type: string
+          description: "Opaque bearer, format `fp_oidc_<48 hex>`. Use in `Authorization: Bearer …` on the deploy routes."
+        expires_in:
+          type: integer
+          description: "Seconds until the bearer expires (300 today)."
+          example: 300
+        token_id:
+          type: string
+          description: "Opaque row id (UUID). Useful for log correlation / audit reads."
 
     # ─── Errors ───────────────────────────────────────────────────────────
 

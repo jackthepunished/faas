@@ -47,6 +47,21 @@ func (a authAdapter) TouchKeyLastUsed(ctx context.Context, keyID string) error {
 	return a.store.TouchKeyLastUsed(ctx, keyID)
 }
 
+// AuthenticateOIDCBearer resolves an OIDC-derived short-lived bearer
+// (issue #270 / ADR-101). The pkg/state.Store method is the same
+// primitive as AuthenticateKey but reads the
+// oidc_exchanged_tokens table; the adapter is a strict forward.
+//
+// gatewayd-internal is on the OIDC bearer path because any
+// downstream Algorithm Pseudonym (the wake path can be reached
+// via the same bearer as the deploy path) reads the same
+// principal at the gateway tier — the apid-side
+// /v1/auth/oidc/exchange is the only mint path, but every
+// authenticated route sees the OIDC bearer at this layer.
+func (a authAdapter) AuthenticateOIDCBearer(ctx context.Context, hash []byte) (state.Account, state.APIKey, error) {
+	return a.store.AuthenticateOIDCBearer(ctx, hash)
+}
+
 // storeAsSessionLookup returns middleware.SessionLookup as a view
 // over a *state.PgStore. The IAM-3 cross-check (issue #165 ADR-039)
 // requires the live-session-row read after the AEAD envelope

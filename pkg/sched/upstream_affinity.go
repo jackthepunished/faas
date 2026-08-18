@@ -1,5 +1,5 @@
 // upstream_affinity.go — schedd's connection-aware placement bias
-// (ADR-098 §9.A PR-D).
+// (ADR-098 §9.A PR-D + amendment issue #954).
 //
 // The meterd probe loop (pkg/meter/upstream_probe.go) writes one
 // data_upstream_probes row per (host_redacted_hash, kind, port,
@@ -7,6 +7,26 @@
 // recent probe row PER region for the app's captured upstreams,
 // picks the region with the lowest observed RTT, and biases the
 // chooser toward a node in that region.
+//
+// Per-deployment cache isolation (ADR-098 amendment issue #954):
+// the cache key widens to (appID, deploymentScope) so staging
+// and production deployments of the same app read independent
+// probe bias. The dedupe key on data_upstreams widens to
+// (app_id, scope, deployment_scope, kind, host, port) — see
+// migration 00281. pgstore.ListAppUpstreamProbeScopes (the JOIN-
+// collapsed read at refresh time) scopes its probe scan via the
+// deployment_scope predicate; the in-process map keys on
+// appDeploymentKeyOf(appID, deploymentScope) so a staging refresh
+// cannot shadow a production entry.
+//
+// Pipe-payload forward-compat: the data_upstreams_changed
+// notification now carries 7 fields (was 6) —
+// app_id|scope|deployment_scope|kind|host|port|op. schedd does
+// NOT currently LISTEN on data_upstreams_changed (per ADR §D2
+// the chooser reads synchronously at wake), so no parser lives
+// in this package today. A future LISTEN consumer must parse
+// the 7-field layout — splitting on "|" yields 7 tokens, the
+// 3rd being deployment_scope.
 //
 // Scoring contract:
 //   - scoreForUpstreams(rows) → (preferredRegion, meanMs)
@@ -88,9 +108,12 @@ type upstreamAffinityEntry struct {
 //     (data_upstreams.id, region) for the app, with the
 //     freshest probe's RTT. Single round-trip on the wake
 //     path (replaces the legacy N+1 design — see
-//     pkg/state/pgstore.go::ListAppUpstreamProbeScores).
+//     pkg/state/pgstore.go::ListAppUpstreamProbeScores). ADR-098
+//     amendment (issue #954) scopes the probe scan to one
+//     deployment_scope so staging-vs-prod bias doesn't bleed
+//     across deployments.
 type UpstreamAffinityStore interface {
-	ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]state.AppUpstreamProbeScore, error)
+	ListAppUpstreamProbeScores(ctx context.Context, accountID, appID, deploymentScope string) ([]state.AppUpstreamProbeScore, error)
 }
 
 // NewUpstreamAffinity returns a cache with the given TTL. A zero
@@ -110,31 +133,61 @@ func NewUpstreamAffinity(ttl time.Duration, store UpstreamAffinityStore) *Upstre
 }
 
 // Score returns the cached preferred region + score for the
-// app. ok=false ⇒ the cache is cold/stale/empty; the caller
-// (the wake path) must fail open and not bias the chooser.
+// (app, deployment) tuple. ok=false ⇒ the cache is cold/stale/
+// empty; the caller (the wake path) must fail open and not bias
+// the chooser.
 //
 // The read path takes the RLock; on a hit, the entry's
 // observedAt is compared against now — a stale entry returns
 // ok=false (and is evicted) so the next Score() triggers a
-// Refresh.
-func (u *UpstreamAffinity) Score(appID string) (region string, scoreMs int, ok bool) {
+// Refresh. ADR-098 amendment (issue #954) widens the cache key
+// to (appID, deploymentScope) so each deployment reads its own
+// probe bias — staging and prod stay independent.
+func (u *UpstreamAffinity) Score(appID, deploymentScope string) (region string, scoreMs int, ok bool) {
 	if u == nil {
 		return "", 0, false
 	}
+	key := appDeploymentKeyOf(appID, deploymentScope)
 	u.mu.RLock()
-	entry, found := u.m[appID]
+	entry, found := u.m[key]
 	u.mu.RUnlock()
 	if !found {
 		return "", 0, false
 	}
 	if u.now().Sub(entry.observedAt) > u.ttl {
 		u.mu.Lock()
-		delete(u.m, appID)
+		delete(u.m, key)
 		u.mu.Unlock()
 		return "", 0, false
 	}
 	return entry.preferredRegion, entry.scoreMs, true
 }
+
+// appDeploymentKeyOf is the composite cache key for
+// UpstreamAffinity. Matches the pkg/sched/admission.go:294
+// per-deployment ledger shape (single string concat with the
+// NUL separator so two appIDs cannot alias by substring).
+// ADR-098 amendment (issue #954) widens the key from appID
+// alone to (appID, deploymentScope).
+const appDeploymentKeySep = "\x00"
+
+func appDeploymentKeyOf(appID, deploymentScope string) string {
+	if deploymentScope == "" {
+		// defaultDeploymentScope is the cold-path fallback for
+		// legacy wake callers (pkg/sched/engine.go passes
+		// "default" when dep is nil). Mirror the SQL DEFAULT
+		// stamp on the deployment_scope column.
+		deploymentScope = defaultDeploymentScope
+	}
+	return appID + appDeploymentKeySep + deploymentScope
+}
+
+// defaultDeploymentScope is the deployment-scope stamp every pre-
+// #954 row + every single-deployment app carries. Mirrors the SQL
+// DEFAULT 'default' on data_upstreams.deployment_scope (migration
+// 00281) so a wake that hasn't threaded dep.ID lands on the same
+// key the apid writer used at INSERT time.
+const defaultDeploymentScope = "default"
 
 // Refresh reads the data_upstreams + data_upstream_probes rows
 // for the app, picks the region with the lowest mean RTT across
@@ -153,12 +206,16 @@ func (u *UpstreamAffinity) Score(appID string) (region string, scoreMs int, ok b
 // accountID is required because pgstore.ListAppUpstreamProbeScores
 // is keyed on (account_id, app_id). appID is the string form
 // passed at the wake call site (engine.app.id is already a
-// string at that point).
-func (u *UpstreamAffinity) Refresh(ctx context.Context, accountID, appID string) error {
+// string at that point). deploymentScope scopes the probe scan
+// to a single customer deployment (ADR-098 amendment issue
+// #954); empty string falls back to defaultDeploymentScope via
+// appDeploymentKeyOf so a cold-path wake without depID still
+// reads the existing default-scoped bias.
+func (u *UpstreamAffinity) Refresh(ctx context.Context, accountID, appID, deploymentScope string) error {
 	if u == nil || u.store == nil {
 		return nil
 	}
-	scores, err := u.store.ListAppUpstreamProbeScores(ctx, accountID, appID)
+	scores, err := u.store.ListAppUpstreamProbeScores(ctx, accountID, appID, deploymentScope)
 	if err != nil {
 		return err
 	}
@@ -186,7 +243,7 @@ func (u *UpstreamAffinity) Refresh(ctx context.Context, accountID, appID string)
 		return nil
 	}
 	u.mu.Lock()
-	u.m[appID] = upstreamAffinityEntry{
+	u.m[appDeploymentKeyOf(appID, deploymentScope)] = upstreamAffinityEntry{
 		preferredRegion: bestRegion,
 		scoreMs:         bestMean,
 		observedAt:      u.now(),

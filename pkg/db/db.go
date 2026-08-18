@@ -61,10 +61,8 @@ func open(ctx context.Context, dsnOverride, appName string) (*pgxpool.Pool, erro
 	// LISTEN subscribers (node keys, placement, migration, deployment
 	// lifecycle, and its dispatch loop), each of which holds a connection for
 	// the daemon lifetime. Keep enough headroom for the listener set plus
-	// ordinary queries and short transactions. The listener set can grow
-	// during reconnects and optional feature wiring, so leaving only a handful
-	// of spare connections can starve the primary lifecycle loop at boot.
-	cfg.MaxConns = 32
+	// ordinary queries and short transactions.
+	cfg.MaxConns = 16
 	cfg.MinConns = 1
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second

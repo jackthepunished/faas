@@ -20,22 +20,39 @@ export class UpstreamsService {
    * is on the classifier derives entries on env mutation; when OFF
    * the table stays empty and the response is `[]`.
    *
+   * ADR-098 amendment (issue #954): `?deployment_scope=` narrows
+   * the list to one deployment so the dashboard can render
+   * staging-vs-prod independently. Omitted = "all deployments".
+   *
    * @returns DataUpstreamListResponse Captured upstreams on the app (plaintext never returned).
    * @throws ApiError
    */
   public static listAppDataUpstreams({
     slug,
+    deploymentScope,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
      */
     slug: string,
+    /**
+     * ADR-098 amendment (issue #954). Optional server-side filter
+     * that narrows the list to one deployment. Omitted = return
+     * all deployments for the app. Same shape as `scope` (3..40
+     * chars, lowercase alnum + dash); empty string is treated as
+     * "no filter".
+     *
+     */
+    deploymentScope?: string,
   }): CancelablePromise<DataUpstreamListResponse> {
     return __request(OpenAPI, {
       method: 'GET',
       url: '/v1/apps/{slug}/upstreams',
       path: {
         'slug': slug,
+      },
+      query: {
+        'deployment_scope': deploymentScope,
       },
       errors: {
         401: `code: unauthorized`,
@@ -68,18 +85,31 @@ export class UpstreamsService {
   public static createAppDataUpstream({
     slug,
     requestBody,
+    deploymentScope,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
      */
     slug: string,
     requestBody: PutDataUpstreamRequest,
+    /**
+     * ADR-098 amendment (issue #954). Optional server-side filter
+     * that narrows the list to one deployment. Omitted = return
+     * all deployments for the app. Same shape as `scope` (3..40
+     * chars, lowercase alnum + dash); empty string is treated as
+     * "no filter".
+     *
+     */
+    deploymentScope?: string,
   }): CancelablePromise<DataUpstreamResponse> {
     return __request(OpenAPI, {
       method: 'PUT',
       url: '/v1/apps/{slug}/upstreams',
       path: {
         'slug': slug,
+      },
+      query: {
+        'deployment_scope': deploymentScope,
       },
       body: requestBody,
       mediaType: 'application/json',

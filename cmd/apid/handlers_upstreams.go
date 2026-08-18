@@ -66,6 +66,17 @@ func (s *server) listUpstreams(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, prob)
 		return
 	}
+	// ADR-098 amendment (issue #954): ?deployment_scope= is an
+	// optional server-side filter that widens the list endpoint
+	// so the dashboard can render staging-vs-prod independently.
+	// Empty string means "no filter; return all deployments".
+	// Invalid shapes (fail EnvScopePattern) reject as 400 — the
+	// same problem code as ?scope= for consistency.
+	deploymentScope, prob := deploymentScopeFromQuery(r)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
 	limits := api.MustLimitsFor(acct.Plan)
 
 	appUUID, err := uuid.Parse(app.ID)
@@ -84,10 +95,11 @@ func (s *server) listUpstreams(w http.ResponseWriter, r *http.Request, acct stat
 		rows = all
 	} else {
 		page, err := s.store.ListDataUpstreamsByApp(r.Context(), sqlc.ListDataUpstreamsByAppParams{
-			AppID:           state.NewPgtypeUUID(appUUID),
-			CursorCreatedAt: state.Timestamptz{}, // first page
-			CursorID:        state.NewPgtypeUUID(uuid.Nil),
-			PageLimit:       int32(dataUpstreamsListMaxLimit),
+			AppID:                 state.NewPgtypeUUID(appUUID),
+			CursorDeploymentScope: deploymentScope,
+			CursorCreatedAt:       state.Timestamptz{}, // first page
+			CursorID:              state.NewPgtypeUUID(uuid.Nil),
+			PageLimit:             int32(dataUpstreamsListMaxLimit),
 		})
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not list upstreams"))
@@ -204,6 +216,18 @@ func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct sta
 	if scope == "" {
 		scope = defaultEnvScope
 	}
+	// ADR-098 amendment (issue #954): explicit creates thread
+	// DeploymentScope from the request body. Empty string falls
+	// through to defaultEnvScope — the migration's SQL DEFAULT
+	// matches this fallback so a single-deployment app keeps
+	// the pre-#954 wire shape. The classifier path (cmd/apid/
+	// extract.go / handlers_env.go) uses a separate
+	// LiveDeploymentForScope resolver — see #954's writer-time
+	// contract doc on docs/adr/098-deployment-scope-overlay.md.
+	deploymentScope := req.DeploymentScope
+	if deploymentScope == "" {
+		deploymentScope = defaultEnvScope
+	}
 	acctUUID, err := uuid.Parse(acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not parse account id"))
@@ -235,6 +259,7 @@ func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct sta
 		AppID:            state.NewPgtypeUUID(appUUID),
 		Source:           string(api.DataUpstreamSourceExplicit),
 		Scope:            scope,
+		DeploymentScope:  deploymentScope,
 		Kind:             string(req.Kind),
 		Host:             req.Host, // plaintext at INSERT — the SQL column is bytea-shaped and not surfaced on the wire.
 		Port:             int32(req.Port),
@@ -265,6 +290,7 @@ func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct sta
 		"upstream_id", rowID,
 		"kind", logsanitize.Field(string(req.Kind)),
 		"scope", logsanitize.Field(scope),
+		"deployment_scope", logsanitize.Field(deploymentScope),
 		"host_redacted_hash", hash[:8],
 	)
 	s.audit.Emit(r.Context(), "data_upstream.created", &acct.ID, map[string]any{
@@ -272,6 +298,7 @@ func (s *server) createUpstream(w http.ResponseWriter, r *http.Request, acct sta
 		"upstream_id":        rowID,
 		"kind":               string(req.Kind),
 		"scope":              scope,
+		"deployment_scope":   deploymentScope,
 		"host_redacted_hash": hash[:8],
 		"port":               req.Port,
 		"source":             string(api.DataUpstreamSourceExplicit),
@@ -321,12 +348,14 @@ func (s *server) deleteUpstream(w http.ResponseWriter, r *http.Request, acct sta
 		"account", acct.ID,
 		"upstream_id", id,
 		"kind", string(row.Kind),
+		"deployment_scope", row.DeploymentScope,
 		"host_redacted_hash", row.HostRedactedHash[:8],
 	)
 	s.audit.Emit(r.Context(), "data_upstream.deleted", &acct.ID, map[string]any{
 		"app_id":             app.ID,
 		"upstream_id":        id,
 		"kind":               string(row.Kind),
+		"deployment_scope":   row.DeploymentScope,
 		"host_redacted_hash": row.HostRedactedHash[:8],
 	})
 	// 204 No Content — the canonical REST shape for a successful
@@ -357,11 +386,17 @@ func dataUpstreamResponseFromState(r state.DataUpstream) api.DataUpstreamRespons
 		HostLast4:        api.DataUpstreamHostLast4(deriveLast4FromHash(r.HostRedactedHash)),
 		Port:             r.Port,
 		Scope:            r.Scope,
-		DeclaredRegion:   r.DeclaredRegion,
-		LastRTTMs:        lastRTT,
-		LastProbedAt:     lastProbedAt,
-		CreatedAt:        r.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
-		LastSeenAt:       r.LastSeenAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		// DeploymentScope widens the dedupe key in ADR-098
+		// amendment (issue #954). Surfaces on the response so the
+		// dashboard / CLI can render staging-vs-prod. The SQL
+		// DEFAULT 'default' stamp on the column matches the
+		// pre-#954 wire shape for single-deployment apps.
+		DeploymentScope: r.DeploymentScope,
+		DeclaredRegion:  r.DeclaredRegion,
+		LastRTTMs:       lastRTT,
+		LastProbedAt:    lastProbedAt,
+		CreatedAt:       r.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		LastSeenAt:      r.LastSeenAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 	}
 }
 
