@@ -140,18 +140,28 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 		i.metrics.ObserveTenantSurfaceCert("skipped", string(surf.CertKind))
 		return nil
 	}
-	// CertKind dispatch. The schema accepts per_host_san +
-	// shared_wildcard today; per_host lands in commit 5.
-	// Only per_host_san is mintable today.
+	// CertKind dispatch. The schema accepts per_host_san,
+	// shared_wildcard, and (post commit 5) per_host. Only
+	// per_host_san is mintable today; the other two return a
+	// typed sentinel (state.ErrUnsupportedCertKind) so the
+	// apid handler can errors.As the value uniformly.
 	if surf.CertKind != state.CertKindPerHostSAN {
-		errMsg := fmt.Sprintf("cert_kind %q not minted in v1; the customer-zone DNS-01 solver ships in follow-up ADR-114", surf.CertKind)
+		var errMsg string
+		switch surf.CertKind {
+		case state.CertKindSharedWildcard:
+			errMsg = fmt.Sprintf("cert_kind %q not minted in v1; the customer-zone DNS-01 solver ships in follow-up ADR-114", surf.CertKind)
+		case state.CertKindPerHost:
+			errMsg = fmt.Sprintf("cert_kind %q not minted in v1; the >MaxSANPerCert per-host bundler ships in follow-up ADR-114", surf.CertKind)
+		default:
+			errMsg = fmt.Sprintf("cert_kind %q not recognised", surf.CertKind)
+		}
 		i.metrics.ObserveTenantSurfaceCert("skipped", string(surf.CertKind))
 		_ = i.store.UpdateTenantSurfaceCert(ctx, state.UpdateSurfaceCertParams{
 			SurfaceID: surf.ID,
 			CertState: state.CertStateFailed,
 			LastError: errMsg,
 		})
-		return nil
+		return state.ErrUnsupportedCertKind
 	}
 	verified, err := i.store.ListVerifiedTenantHostnamesForSurface(ctx, surfaceID)
 	if err != nil {

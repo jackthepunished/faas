@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -179,8 +180,8 @@ func TestTenantSurfaceCertIssuer_RejectsSharedWildcard(t *testing.T) {
 	if err := m.MarkTenantHostnameVerified(ctx, "w.example"); err != nil {
 		t.Fatal(err)
 	}
-	if err := issuer.RequestCertForSurface(ctx, wild.ID); err != nil {
-		t.Fatalf("RequestCertForSurface (shared_wildcard): %v", err)
+	if err := issuer.RequestCertForSurface(ctx, wild.ID); !errors.Is(err, state.ErrUnsupportedCertKind) {
+		t.Fatalf("RequestCertForSurface (shared_wildcard) = %v, want state.ErrUnsupportedCertKind", err)
 	}
 	got, _ := m.GetTenantSurfaceByID(ctx, wild.ID)
 	if got.CertState != state.CertStateFailed {

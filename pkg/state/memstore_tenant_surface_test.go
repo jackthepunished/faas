@@ -427,3 +427,69 @@ func TestMemStoreListPendingTenantHostnames(t *testing.T) {
 		t.Fatalf("pending (limit=1) = %+v, %v", pending, err)
 	}
 }
+
+// TestMemStoreListTenantSurfacesNearingExpiry — PR-D commit 3
+// renewer hot-path. Pins the predicate semantics:
+// status=active AND cert_state=issued AND
+// cert_not_after < cutoff; soft-deleted, non-issued, and
+// out-of-window rows are filtered out.
+func TestMemStoreListTenantSurfacesNearingExpiry(t *testing.T) {
+	m, ctx, acct, app, lim := tenantSurfaceFixture(t)
+	cutoff := time.Now().Add(30 * 24 * time.Hour)
+	mkSurf := func(name string, status SurfaceStatus, certState CertState, notAfter time.Time) TenantSurface {
+		s, err := m.CreateTenantSurfaceIfUnderQuota(ctx, CreateTenantSurfaceParams{
+			AccountID: acct.ID, AppID: app.ID, Name: name,
+		}, lim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.UpdateTenantSurfaceStatus(ctx, s.ID, status); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.UpdateTenantSurfaceCert(ctx, UpdateSurfaceCertParams{
+			SurfaceID: s.ID, CertState: certState, NotAfter: notAfter,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	due := mkSurf("due", SurfaceStatusActive, CertStateIssued, time.Now().Add(5*24*time.Hour))
+	// The other three are outside the predicate.
+	_ = mkSurf("not_active", SurfaceStatusSuspended, CertStateIssued, time.Now().Add(5*24*time.Hour))
+	_ = mkSurf("failed", SurfaceStatusActive, CertStateFailed, time.Now().Add(5*24*time.Hour))
+	_ = mkSurf("fresh", SurfaceStatusActive, CertStateIssued, time.Now().Add(90*24*time.Hour))
+	got, err := m.ListTenantSurfacesNearingExpiry(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d surfaces, want 1 (only 'due' matches)", len(got))
+	}
+	if got[0].ID != due.ID {
+		t.Errorf("got surface %s, want %s", got[0].ID, due.ID)
+	}
+}
+
+// TestMemStoreTouchTenantSurfaceForRenewal — PR-D commit 3
+// renewer hot-path. Asserts the bump + ErrNotFound on a
+// missing row.
+func TestMemStoreTouchTenantSurfaceForRenewal(t *testing.T) {
+	m, ctx, acct, app, lim := tenantSurfaceFixture(t)
+	s, err := m.CreateTenantSurfaceIfUnderQuota(ctx, CreateTenantSurfaceParams{
+		AccountID: acct.ID, AppID: app.ID, Name: "touch",
+	}, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := s.UpdatedAt
+	if err := m.TouchTenantSurfaceForRenewal(ctx, s.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.GetTenantSurfaceByID(ctx, s.ID)
+	if !got.UpdatedAt.After(before) {
+		t.Errorf("UpdatedAt = %v, want > %v (renewer touch should bump)", got.UpdatedAt, before)
+	}
+	if err := m.TouchTenantSurfaceForRenewal(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing = %v, want ErrNotFound", err)
+	}
+}
