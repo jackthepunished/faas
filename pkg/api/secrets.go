@@ -35,8 +35,17 @@ func (r PutAppSecretRequest) Validate(maxBytes int) *Problem {
 
 // AppSecretResponse is the GET / list shape. The value NEVER appears here —
 // only metadata about the secret.
+//
+// Scope is always populated (ADR-092 / Phase 4). On the flat-list path
+// (GET /v1/apps/{slug}/secrets without ?scope=__all__) every row echoes
+// scope="default" so a CLI / dashboard can render "scope: prod" without
+// a second lookup. Mirrors AppEnvResponse.Scope (pkg/api/env.go:68) —
+// the env wire shape is the precedent, and secrets deliberately re-use
+// the same JSON tag verbatim so SDK generators handle both surfaces
+// with one rule.
 type AppSecretResponse struct {
 	Key       string `json:"key"`
+	Scope     string `json:"scope"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 	// Kid is the age-1... recipient string of the host identity
@@ -49,13 +58,58 @@ type AppSecretResponse struct {
 	Kid string `json:"kid,omitempty"`
 }
 
+// ScopedAppSecretResponse is the per-row shape for the nested
+// `secrets_by_scope` response (ADR-092, mirror of ADR-090 D3's
+// env_by_scope). The flat AppSecretResponse shape above is
+// unchanged — the only new field is `scope`, which carries the
+// scope name on the wire so a CLI / dashboard can render
+// "scope: staging" without a second lookup. Kid echoes through
+// the same posture as AppSecretResponse.Kid (omitempty).
+//
+// Reserved for the GET ?scope=__all__ path. The flat
+// AppSecretListResponse with a single `secrets` array is the default
+// (and is what every existing SDK caller decodes today). The
+// discriminated-union shape is justified over a single flattened
+// response because a customer on the default scope doesn't need
+// scope metadata in every row — a one-off nested response is
+// cheaper to render than a per-row scope string.
+type ScopedAppSecretResponse struct {
+	Scope     string `json:"scope"`
+	Key       string `json:"key"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+	Kid       string `json:"kid,omitempty"`
+}
+
+// SecretByScope is the nested map shape returned under `secrets_by_scope`
+// when the GET carries `?scope=__all__`. Keys are scope names
+// (e.g. "default", "prod"); values are the rows for that scope,
+// ordered by key ASC to match the flat response. The map is nil
+// (omitted via omitempty) for the default-scope GET so SDK callers
+// that only care about the flat `secrets` array don't see a new
+// field they have to special-case.
+//
+// Mirror of api.EnvByScope (pkg/api/env.go:81) — the env route
+// already uses this discriminated-union shape (ADR-090 PR-B), and
+// secrets deliberately re-use the same JSON tag (secrets_by_scope)
+// for symmetry.
+type SecretByScope map[string][]ScopedAppSecretResponse
+
 // AppSecretListResponse is the wrapped GET response: the secrets slice plus
 // quota metadata so the CLI can render "3/25 secrets" without a second
 // request. Matches the anonymous struct apid emits.
+//
+// SecretsByScope is the discriminated-union arm for `?scope=__all__`
+// (ADR-092, mirror of ADR-090 D3). When present, the SDK decodes
+// secrets_by_scope and treats `secrets` as an empty array; when
+// absent, the SDK decodes `secrets` as the flat per-scope result.
+// Both arms are valid wire shapes for a GET /v1/apps/{slug}/secrets;
+// the `?scope=` query discriminates.
 type AppSecretListResponse struct {
-	Secrets []AppSecretResponse `json:"secrets"`
-	Quota   int                 `json:"quota_max"`
-	Count   int                 `json:"count"`
+	Secrets       []AppSecretResponse `json:"secrets"`
+	SecretsByScope SecretByScope      `json:"secrets_by_scope,omitempty"`
+	Quota         int                 `json:"quota_max"`
+	Count         int                 `json:"count"`
 }
 
 // AccountAppSecretResponse is one row in GET /v1/secrets — a sealed
@@ -70,10 +124,15 @@ type AppSecretListResponse struct {
 // and the mapping deliberately drops the per-row plaintext path:
 // only the host X25519 recipient key unwraps, and that key never
 // leaves the host.
+//
+// Scope is always populated (ADR-092) because the account-wide
+// list crosses scopes — a customer with prod + staging rows needs
+// to render "scope: prod" alongside the (app_slug, key) pair.
 type AccountAppSecretResponse struct {
 	AppID      string `json:"app_id"`
 	AppSlug    string `json:"app_slug"`
 	Key        string `json:"key"`
+	Scope      string `json:"scope"`
 	Ciphertext string `json:"ciphertext"`
 	CreatedAt  string `json:"created_at"`
 	UpdatedAt  string `json:"updated_at"`
