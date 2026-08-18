@@ -46,33 +46,42 @@ func discardLog() *slog.Logger {
 }
 
 // TestLoadProviderForAPID_Default confirms the empty-env case returns
-// (nil, "stripe", nil) — the apid Stripe path stays inline (cmd/apid
-// reads FAAS_BILLING_PORTAL_URL + STRIPE_WEBHOOK_SECRET directly).
+// (provider, "paddle", nil) — the production billing provider path is
+// the default at v2 (ADR-032 v2). The legacy Stripe surface is still
+// bootable from FAAS_BILLING_PROVIDER=stripe (see TestLoadProviderForAPID_Stripe).
 //
-// The provider must be nil so the apid changePlan 402 falls through to
-// the BillingPortalURL template branch — bit-for-bit unchanged from
-// pre-PR-#3 behaviour.
+// The Paddle constructor needs a non-empty apiKey + sandbox flag so we
+// seed the env map with the canonical test values; the loader passes
+// these through pkg/billing/paddle.NewProvider and the SDK constructor
+// only fails on programmer error (sandbox / live host differs by
+// env), so the loader never returns an error from this path.
 func TestLoadProviderForAPID_Default(t *testing.T) {
 	t.Parallel()
-	cfg := resolveCfg(t, mapEnv(nil))
-	p, name, err := LoadProviderForAPID(context.Background(), cfg, mapEnv(nil), discardLog())
+	env := mapEnv(map[string]string{
+		"FAAS_PADDLE_API_KEY":        "pdl_test_loader_default",
+		"FAAS_PADDLE_WEBHOOK_SECRET": "whk_test_loader_default",
+		"FAAS_PADDLE_SANDBOX":        "1",
+	})
+	cfg := resolveCfg(t, env)
+	p, name, err := LoadProviderForAPID(context.Background(), cfg, env, discardLog())
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	if name != "stripe" {
-		t.Errorf("name = %q, want %q", name, "stripe")
+	if name != "paddle" {
+		t.Errorf("name = %q, want %q", name, "paddle")
 	}
-	if p != nil {
-		t.Errorf("provider = %v, want nil", p)
+	if p == nil {
+		t.Errorf("provider = nil, want non-nil paddle.Provider")
 	}
 }
 
-// TestLoadProviderForAPID_StripeSameAsDefault asserts the explicit
-// "stripe" string is treated identically to the empty default — the
-// loader's switch covers both so a config with FAAS_BILLING_PROVIDER=
-// (explicit empty) and FAAS_BILLING_PROVIDER=stripe produce the same
-// wire shape.
-func TestLoadProviderForAPID_StripeSameAsDefault(t *testing.T) {
+// TestLoadProviderForAPID_Stripe asserts the legacy opt-in path: an
+// explicit FAAS_BILLING_PROVIDER=stripe returns (nil, "stripe", nil)
+// so the apid changePlan 402 falls through to the BillingPortalURL
+// template branch. The Stripe BuildAPID is nil (legacy apid surface)
+// and the loader returns nil + name to keep the apid boot path
+// unchanged from the pre-PR-#3 behaviour.
+func TestLoadProviderForAPID_Stripe(t *testing.T) {
 	t.Parallel()
 	env := mapEnv(map[string]string{"FAAS_BILLING_PROVIDER": "stripe"})
 	cfg := resolveCfg(t, env)
@@ -84,7 +93,7 @@ func TestLoadProviderForAPID_StripeSameAsDefault(t *testing.T) {
 		t.Errorf("name = %q, want %q", name, "stripe")
 	}
 	if p != nil {
-		t.Errorf("provider = %v, want nil", p)
+		t.Errorf("provider = %v, want nil (legacy apid Stripe surface)", p)
 	}
 }
 
@@ -142,31 +151,30 @@ func TestLoadProviderForAPID_Unknown(t *testing.T) {
 	}
 }
 
-// TestLoadProviderForMeterd_Default_BuildsStripe asserts the meterd
-// default path constructs a *stripe.Client (not nil). The meterd
-// pusher requires a non-nil provider — the legacy *stripe.Client is
-// folded into the Provider interface per PR #3.
+// TestLoadProviderForMeterd_Default_BuildsPaddle asserts the meterd
+// default path constructs a *paddle.Provider (not nil) — the production
+// billing provider at v2 (ADR-032 v2).
 //
 // We don't assert on the concrete type here (just non-nil) — the
-// compile-time conformance var in pkg/billing/stripe/client.go pins
+// compile-time conformance var in pkg/billing/paddle/provider.go pins
 // the shape.
-func TestLoadProviderForMeterd_Default_BuildsStripe(t *testing.T) {
+func TestLoadProviderForMeterd_Default_BuildsPaddle(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	env := mapEnv(map[string]string{
-		"STRIPE_API_KEY":        "sk_test_loader",
-		"STRIPE_WEBHOOK_SECRET": "whsec_test",
+		"FAAS_PADDLE_API_KEY": "pdl_test_meterd_default",
+		"FAAS_PADDLE_SANDBOX": "1",
 	})
 	cfg := resolveCfg(t, env)
 	p, name, err := LoadProviderForMeterd(cfg, env, store, discardLog())
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	if name != "stripe" {
-		t.Errorf("name = %q, want %q", name, "stripe")
+	if name != "paddle" {
+		t.Errorf("name = %q, want %q", name, "paddle")
 	}
 	if p == nil {
-		t.Errorf("provider = nil, want non-nil *stripe.Client")
+		t.Errorf("provider = nil, want non-nil *paddle.Provider")
 	}
 }
 

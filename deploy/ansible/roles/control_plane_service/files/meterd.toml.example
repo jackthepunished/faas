@@ -65,19 +65,22 @@ egress_tls_ca_path = ""
 # quota_interval = "60s"
 # stripe_interval = "60m"
 
-# [billing] block — provider config (PR-P2). meterd doesn't read
-# webhook_secret (no ingress) but the surface is kept for parity with
-# apid's [billing] block; the loader accepts both. Env wins over TOML.
+# [billing] block — provider config (PR-P2 + ADR-032 v2). meterd
+# doesn't read webhook_secret (no ingress) but the surface is kept
+# for parity with apid's [billing] block; the loader accepts both.
+# Env wins over TOML.
 #
 # [billing]
-# provider = "stripe"     # "" | "stripe" | "paddle"; default "" (legacy = Stripe)
+# provider = "paddle"     # "" | "stripe" | "paddle"; default "" (v2 = Paddle)
 #
-# [billing.stripe]
+# [billing.paddle]            # active at v2 (ADR-032 v2)
+# api_key        = ""    # pdl_live_… or pdl_sandbox_…; or FAAS_PADDLE_API_KEY env
+# webhook_secret = ""    # unused by meterd; or FAAS_PADDLE_WEBHOOK_SECRET env
+# tolerance_seconds = 300 # Paddle-Signature timestamp tolerance (default 5 min)
+#
+# [billing.stripe]            # legacy opt-in (FAAS_BILLING_PROVIDER=stripe)
 # api_key           = ""  # sk_test_… or sk_live_…; or STRIPE_API_KEY env
 # webhook_secret    = ""  # unused by meterd; or STRIPE_WEBHOOK_SECRET env
 # tolerance_seconds = 300 # Stripe-Signature timestamp tolerance (default 5 min)
-#
-# [billing.paddle]
-# api_key        = ""    # pdl_live_… or pdl_sandbox_…; or FAAS_PADDLE_API_KEY env
 # webhook_secret = ""    # unused by meterd   ; or FAAS_PADDLE_WEBHOOK_SECRET env
 # sandbox        = false # true → api.sandbox.paddle.com; or FAAS_PADDLE_SANDBOX=1

@@ -303,17 +303,20 @@ func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(s
 	}
 	name := cfg.Provider
 	if name == "" {
-		// TOML missing + env unset → default to Stripe (legacy).
-		name = providerStripe
+		// TOML missing + env unset → default to Paddle (production
+		// billing provider, ADR-032 v2). The legacy Stripe surface is
+		// still bootable from FAAS_BILLING_PROVIDER=stripe for a
+		// node-level rollback — see docs/ops/billing-provider-switch.md.
+		name = providerPaddle
 	}
 	for _, m := range Providers() {
 		if m.Name != name {
 			continue
 		}
 		if m.BuildAPID == nil {
-			// Legacy apid surface (today: Stripe) — apid reads its
-			// env vars inline. Returning nil + name keeps the rest
-			// of the apid boot path unchanged.
+			// Legacy apid surface (Stripe) — apid reads its env vars
+			// inline. Returning nil + name keeps the rest of the apid
+			// boot path unchanged for the legacy opt-in.
 			return nil, m.Name, nil
 		}
 		p, err := m.BuildAPID(cfg, env, log)
@@ -382,7 +385,7 @@ func LoadProviderForMeterd(cfg *RootBillingConfig, env func(string) string, stor
 	}
 	name := cfg.Provider
 	if name == "" {
-		name = providerStripe
+		name = providerPaddle
 	}
 	for _, m := range Providers() {
 		if m.Name != name {
