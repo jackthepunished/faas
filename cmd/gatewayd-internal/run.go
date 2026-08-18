@@ -1244,6 +1244,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			handler.WithCentralBackend(backend)
 			log.Info("gatewayd-internal: rate-limit central mode armed",
 				"rps_resolver", rpsKind(rps))
+			// ADR-104 amendment 5 / issue #881 Phase 4 C4:
+			// the LISTEN-side invalidator. Closes the cross-
+			// replica drift by dropping the local bucket when a
+			// peer writes to the central counter. Started as a
+			// long-lived goroutine; cancellation rides on the
+			// daemon's main ctx.
+			invalidator := wire.NewPGRateLimitInvalidator(deps.pool, handler, log)
+			go func() {
+				if err := invalidator.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					log.Warn("gatewayd-internal: rate-limit invalidator exited", "err", err)
+				}
+			}()
 		} else {
 			log.Warn("gatewayd-internal: [ratelimit] mode = \"central\" but Postgres pool unavailable; falling back to in-process buckets (degraded posture)")
 		}

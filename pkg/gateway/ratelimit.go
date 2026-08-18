@@ -920,6 +920,24 @@ func (l *Limiter) BucketCount() int {
 	return len(l.buckets)
 }
 
+// bucketKeys returns a snapshot of every key in the bucket map
+// (ADR-104 amendment 5, issue #881 Phase 4 C4). Used by the
+// 'rate_limit_changed' invalidator to scan for rule-scoped
+// buckets whose key ends with the rule ID. O(n) per call;
+// bounded by EdgeRuleCacheCap (10k) + EdgeRuleConsumerCacheCap
+// (100k) so acceptable as a degraded-mode invalidation. A
+// future PR can give the Limiter a per-suffix Forget helper
+// to skip the snapshot allocation.
+func (l *Limiter) bucketKeys() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, 0, len(l.buckets))
+	for k := range l.buckets {
+		out = append(out, k)
+	}
+	return out
+}
+
 // splitCentralKey parses the central-counter triple from the
 // colon-separated wire form
 //

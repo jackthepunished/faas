@@ -43,7 +43,7 @@
 -- IF NOT EXISTS via DO-block (same pattern as 00125).
 
 CREATE TABLE IF NOT EXISTS pg_ratelimit_counters (
-    scope        text             NOT NULL CHECK (scope IN ('app', 'account')),
+    scope        text             NOT NULL CHECK (scope IN ('app', 'account', 'rule')),
     subject_id   uuid             NOT NULL,
     plan         text             NOT NULL CHECK (plan IN ('free', 'hobby', 'pro', 'scale')),
     tokens       bigint           NOT NULL CHECK (tokens >= 0),
@@ -54,10 +54,47 @@ CREATE TABLE IF NOT EXISTS pg_ratelimit_counters (
 CREATE INDEX IF NOT EXISTS pg_ratelimit_counters_subject_id_app_idx
     ON pg_ratelimit_counters (subject_id)
     WHERE scope = 'app';
+
+-- Phase 4 C4 (ADR-104 amendment 5, issue #881 follow-up, 2026-08-18):
+-- rate_limit_changed pg_notify trigger. Fires on INSERT and UPDATE
+-- OF tokens/last_refill; payloads the (scope, subject_id, plan)
+-- triple as JSON for the LISTEN-side invalidator
+-- (pkg/wire/pgratelimit_invalidator.go). The trigger is the
+-- load-bearing piece that closes the cross-replica drift the 00126
+-- schema was created to solve: without invalidation, peer replicas'
+-- in-process caches stay stale until the next Allow call
+-- repopulates them, which can leak admits for up to one refill
+-- window.
+--
+-- Carve-out to ADR-041's "no new migration" rule: the trigger
+-- lives in this file because the table is in this file. Created
+-- with OR REPLACE + DROP TRIGGER IF EXISTS so re-applying this
+-- migration is idempotent (the column-level filter keeps the
+-- trigger from firing on no-op updates).
+CREATE OR REPLACE FUNCTION notify_pg_ratelimit_counters() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify(
+    'rate_limit_changed',
+    json_build_object(
+      'scope', NEW.scope,
+      'subject_id', NEW.subject_id,
+      'plan', NEW.plan
+    )::text
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS pg_ratelimit_counters_notify ON pg_ratelimit_counters;
+CREATE TRIGGER pg_ratelimit_counters_notify
+  AFTER INSERT OR UPDATE OF tokens, last_refill ON pg_ratelimit_counters
+  FOR EACH ROW EXECUTE FUNCTION notify_pg_ratelimit_counters();
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
+DROP TRIGGER IF EXISTS pg_ratelimit_counters_notify ON pg_ratelimit_counters;
+DROP FUNCTION IF EXISTS notify_pg_ratelimit_counters();
 DROP INDEX IF EXISTS pg_ratelimit_counters_subject_id_app_idx;
 DROP TABLE IF EXISTS pg_ratelimit_counters;
 -- +goose StatementEnd

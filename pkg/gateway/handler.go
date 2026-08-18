@@ -819,6 +819,88 @@ func (h *Handler) WithCentralBackend(central CentralBackend) *Handler {
 	return h
 }
 
+// InvalidateRateLimit (ADR-104 amendment 5, issue #881 Phase 4
+// C4) drops the in-process bucket for (scope, subjectID, plan)
+// on every Limiter the Handler owns. Called by the
+// LISTEN-side invalidator (pkg/wire/pgratelimit_invalidator.go)
+// on every 'rate_limit_changed' pg_notify tick. nil subjectID
+// is rejected (defence-in-depth — a malformed payload from an
+// adversarial daemon cannot wipe every bucket for the scope).
+//
+// Backward-compat note: the Limiter's existing Forget /
+// ForgetAccount API is keyed by appID / accountID, not by the
+// (scope, subject_id, plan) triple. We translate the triple
+// back into the matching key shape before calling Forget.
+// This is intentionally minimal — a future PR that gives the
+// Limiter a more granular Forget(scope, subjectID, plan)
+// signature can replace this shim without changing the wire.
+func (h *Handler) InvalidateRateLimit(scope, subjectID, plan string) {
+	if h == nil || subjectID == "" {
+		return
+	}
+	switch scope {
+	case "app":
+		for _, l := range h.limiters() {
+			l.Forget(subjectID)
+		}
+	case "account":
+		for _, l := range h.limiters() {
+			l.ForgetAccount(subjectID)
+		}
+	case "rule":
+		// Rule scope: per-rule bucket key is
+		// appID+"\x00"+ruleID. We don't have appID in the
+		// payload (subject_id IS the rule UUID), so we walk
+		// every bucket looking for a key that ends with the
+		// subject_id suffix. This is O(n) over the LRU map
+		// per notification — bounded by EdgeRuleCacheCap (10k)
+		// so acceptable as a degraded-mode invalidation.
+		// A future PR can add a per-rule Forget(scope, ruleID)
+		// to skip the scan.
+		h.invalidateRuleBySuffix(subjectID)
+	default:
+		// Unknown scope: drop the notification silently. The
+		// SQL CHECK would have rejected it before the trigger
+		// fired, so this branch only catches a future scope
+		// addition without a handler update.
+	}
+}
+
+// limiters returns the slice of *Limiter the Handler owns;
+// helper for InvalidateRateLimit so every scope walks the same
+// set without copy-pasting the four fields.
+func (h *Handler) limiters() []*Limiter {
+	out := make([]*Limiter, 0, 4)
+	if h.limiter != nil {
+		out = append(out, h.limiter)
+	}
+	if h.accountLimiter != nil {
+		out = append(out, h.accountLimiter)
+	}
+	if h.routeLimiter != nil {
+		out = append(out, h.routeLimiter)
+	}
+	if h.routeConsumerLimiter != nil {
+		out = append(out, h.routeConsumerLimiter)
+	}
+	return out
+}
+
+// invalidateRuleBySuffix scans the per-rule + per-consumer LRU
+// maps for any bucket whose key ends with "\x00"+ruleID and
+// drops it. O(n) per notification but bounded by
+// EdgeRuleCacheCap (10k) + EdgeRuleConsumerCacheCap (100k).
+func (h *Handler) invalidateRuleBySuffix(ruleID string) {
+	suffix := "\x00" + ruleID
+	for _, l := range h.limiters() {
+		for _, k := range l.bucketKeys() {
+			if strings.HasSuffix(k, suffix) {
+				l.Forget(k)
+			}
+		}
+	}
+}
+
 // WithRouteConsumerLimiter (ADR-104, issue #881 Phase 3) installs
 // the per-rule per-consumer token-bucket throttle. Production
 // wires NewLimiterWithLRU(EdgeRuleConsumerCacheCap) in NewHandlerWith
