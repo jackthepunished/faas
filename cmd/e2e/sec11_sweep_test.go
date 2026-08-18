@@ -226,6 +226,14 @@ func envForAPID(t *testing.T, dbURL string, extra ...string) []string {
 		"HOME=" + os.Getenv("HOME"),
 		"FAAS_APPS_DOMAIN=apps.test.example",
 		"FAAS_MFA_RECOVERY_HMAC_KEY=" + testRecoveryHMACKeyHex(t),
+		// PR #962 CRIT-2 — paddle.NewProvider rejects empty apiKey. Mirror
+		// of pkg/e2etest/harness.go:testEnvCommon so this file's parallel
+		// apid boot also gets the placeholder keys. The pdl_… shape with
+		// FAAS_PADDLE_SANDBOX=1 makes the SDK accept + only reject on auth
+		// at runtime, which sec11 tests never reach.
+		"FAAS_PADDLE_SANDBOX=1",
+		"FAAS_PADDLE_API_KEY=pdl_test_sec11_placeholder",
+		"FAAS_PADDLE_WEBHOOK_SECRET=whk_test_sec11_placeholder",
 	}
 	env = append(env, extra...)
 	return env
