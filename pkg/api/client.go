@@ -1926,9 +1926,25 @@ func (c *Client) Logout(ctx context.Context) error {
 
 // Secrets (spec §11/G2). Plaintext VALUE never leaves the caller
 // except via SetSecret's body.
+//
+// ADR-092 PR-B: every secrets helper gains an optional scope
+// argument. Pass "" to write to / read from the default scope
+// (same wire shape as pre-PR-B callers — pre-PR-B code paths
+// are preserved by the scope="" branch). Pass a scope name to
+// read or write a specific row; the client appends ?scope=<name>
+// to the path. The pre-PR-B ListSecrets / SetSecret / UnsetSecret /
+// RotateSecret stay as scope="" wrappers for backward-compat.
 func (c *Client) ListSecrets(ctx context.Context, slug string) (AppSecretListResponse, error) {
+	return c.ListSecretsWithScope(ctx, slug, "")
+}
+
+// ListSecretsWithScope is the scope-aware sibling of ListSecrets.
+// scope="" reads from the default scope (flat `secrets` array);
+// scope="__all__" returns the nested `secrets_by_scope` map
+// (ADR-092, mirror of ADR-090 D3's env_by_scope).
+func (c *Client) ListSecretsWithScope(ctx context.Context, slug, scope string) (AppSecretListResponse, error) {
 	var out AppSecretListResponse
-	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/secrets", nil, &out)
+	return out, c.do(ctx, "GET", c.scopeQuery("/v1/apps/"+slug+"/secrets", scope), nil, &out)
 }
 
 // GetSecrets returns every sealed secret across the caller's account
@@ -1957,11 +1973,25 @@ func (c *Client) GetSecrets(ctx context.Context, before string, limit int) (List
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 func (c *Client) SetSecret(ctx context.Context, slug, key, value string) error {
-	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/secrets/"+key,
+	return c.SetSecretWithScope(ctx, slug, key, value, "")
+}
+
+// SetSecretWithScope is the scope-aware sibling of SetSecret. The
+// reserved sentinel "__all__" is rejected by the server with 400
+// env_scope_reserved; the client doesn't pre-validate so the
+// error envelope reaches the caller verbatim.
+func (c *Client) SetSecretWithScope(ctx context.Context, slug, key, value, scope string) error {
+	return c.do(ctx, "PUT", c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key, scope),
 		PutAppSecretRequest{Value: value}, nil)
 }
 func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
-	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
+	return c.UnsetSecretWithScope(ctx, slug, key, "")
+}
+
+// UnsetSecretWithScope is the scope-aware sibling of UnsetSecret.
+// Same reserved-sentinel posture as SetSecretWithScope.
+func (c *Client) UnsetSecretWithScope(ctx context.Context, slug, key, scope string) error {
+	return c.do(ctx, "DELETE", c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key, scope), nil, nil)
 }
 
 // RotateSecret (ADR-089 PR-B) re-seals the (slug, key) row under
@@ -1970,9 +2000,31 @@ func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 // Returns the RotateAppSecretResponse so the CLI can render the
 // rotated_at timestamp and the kid.
 func (c *Client) RotateSecret(ctx context.Context, slug, key, value string) (RotateAppSecretResponse, error) {
+	return c.RotateSecretWithScope(ctx, slug, key, value, "")
+}
+
+// RotateSecretWithScope is the scope-aware sibling of RotateSecret.
+// Same reserved-sentinel posture as SetSecretWithScope.
+func (c *Client) RotateSecretWithScope(ctx context.Context, slug, key, value, scope string) (RotateAppSecretResponse, error) {
 	var out RotateAppSecretResponse
-	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/secrets/"+key+"/rotate",
+	return out, c.do(ctx, "POST",
+		c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key+"/rotate", scope),
 		RotateAppSecretRequest{Value: value}, &out)
+}
+
+// scopeQuery appends "?scope=<name>" to path when scope is
+// non-empty. Empty scope returns the path unchanged (pre-PR-B
+// callers see no behaviour change). url.Values.Encode handles
+// percent-encoding of edge cases (e.g. a future scope name with a
+// reserved char — not currently possible given the
+// api.EnvScopePattern regex, but defensive).
+func (c *Client) scopeQuery(path, scope string) string {
+	if scope == "" {
+		return path
+	}
+	v := url.Values{}
+	v.Set("scope", scope)
+	return path + "?" + v.Encode()
 }
 
 // Per-app private-registry Basic Auth (issue #461 / ADR-062). Password
