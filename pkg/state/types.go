@@ -1338,6 +1338,32 @@ type Deployment struct {
 	DeployedVia      string `json:"deployed_via,omitempty"`
 	DeployedFromIP   string `json:"deployed_from_ip,omitempty"`
 	PusherLogin      string `json:"pusher_login,omitempty"`
+
+	// Annotation columns (issue #977 / ADR-116). Free-form operator
+	// note + closed-set tag + auto-captured actor + PR number.
+	// Stamped at create time; not editable post-hoc (out of scope
+	// per ADR-116 D9). All nullable; pre-feature rows have all four
+	// NULL.
+	//
+	//   Reason     — free-form prose, ≤280 chars (CHECK enforces).
+	//                Example: "Emergency rollback after payment
+	//                provider incident" (issue body literal).
+	//   Tag        — closed-set enum: incident_recovery | hotfix |
+	//                scheduled_maintenance | compliance_hold |
+	//                partner_request (CHECK enforces).
+	//   DeployedBy — human-readable actor label. CLI auto-captures
+	//                `git config user.name`; githubd stamps
+	//                `push.pusher.name`; the Action defaults the
+	//                input to `${{ github.actor }}`. Operator can
+	//                override with `--deployed-by`.
+	//   PRNumber   — positive int when the wire offers it (githubd
+	//                pull_request.number; Action's `pr-number`
+	//                input). Push-to-main with no inferred PR
+	//                leaves this NULL (D5).
+	Reason     string `json:"reason,omitempty"`
+	Tag        string `json:"tag,omitempty"`
+	DeployedBy string `json:"deployed_by,omitempty"`
+	PRNumber   int    `json:"pr_number,omitempty"`
 }
 
 // StageState is the typed view of the
@@ -1386,6 +1412,31 @@ type StageStateItem struct {
 	DurationMs int64      `json:"duration_ms"`
 	Status     string     `json:"status"` // "completed" | "failed"
 	Reason     string     `json:"reason,omitempty"`
+	// Annotation columns (issue #977 / ADR-116). Free-form operator
+	// note + closed-set tag + auto-captured actor + PR number.
+	// Stamped at create time; not editable post-hoc (out of scope
+	// per ADR-116 D9). All nullable; pre-feature rows have all four
+	// NULL.
+	//
+	//   Reason     — free-form prose, ≤280 chars (CHECK enforces).
+	//                Example: "Emergency rollback after payment
+	//                provider incident" (issue body literal).
+	//   Tag        — closed-set enum: incident_recovery | hotfix |
+	//                scheduled_maintenance | compliance_hold |
+	//                partner_request (CHECK enforces).
+	//   DeployedBy — human-readable actor label. CLI auto-captures
+	//                `git config user.name`; githubd stamps
+	//                `push.pusher.name`; the Action defaults the
+	//                input to `${{ github.actor }}`. Operator can
+	//                override with `--deployed-by`.
+	//   PRNumber   — positive int when the wire offers it (githubd
+	//                pull_request.number; Action's `pr-number`
+	//                input). Push-to-main with no inferred PR
+	//                leaves this NULL (D5).
+	Reason     string `json:"reason,omitempty"`
+	Tag        string `json:"tag,omitempty"`
+	DeployedBy string `json:"deployed_by,omitempty"`
+	PRNumber   int    `json:"pr_number,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem

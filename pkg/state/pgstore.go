@@ -4302,9 +4302,11 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		                          min_instances,
 		                          traffic_percent,
 		                          scope,
-		                          deployed_by_user_id, deployed_via, deployed_from_ip, pusher_login)
+		                          deployed_by_user_id, deployed_via, deployed_from_ip, pusher_login,
+		                          reason, tag, deployed_by, pr_number)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19, coalesce(nullif($20, ''), 'default'),
-		         nullif($21, '')::uuid, coalesce(nullif($22, ''), 'api'), nullif($23, '')::inet, nullif($24, ''))
+		         nullif($21, '')::uuid, coalesce(nullif($22, ''), 'api'), nullif($23, '')::inet, nullif($24, ''),
+		         $25, $26, $27, nullif($28, 0))
 		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -4322,7 +4324,7 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		// scope-default collapse so pgstore never inserts a literal
 		// '' (which would fail the deployments_scope_shape CHECK).
 		d.Scope,
-		// Issue #606 — actor attribution columns (migration 00303).
+		// Issue #606 — actor attribution columns (migration 00305).
 		// Each of the four empty-string Go values collapses to NULL
 		// via nullif() so an "anonymous / pre-FK / GitHub-push"
 		// caller (or a Go-zero struct from a test) never inserts
@@ -4333,7 +4335,14 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		// DeployedVia entirely (empty string after the nullif)
 		// still gets 'api' rather than NULL, so pre-feature rows
 		// stay valid without a backfill.
-		d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin)
+		d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin,
+		// Issue #977 / ADR-116: annotation columns. reason / tag /
+		// deployed_by are nullable text; pr_number uses nullif($N, 0)
+		// so a Go-zero PRNumber (the wire-omitted case from a test
+		// or a future handler that forgets to set the field)
+		// collapses to NULL rather than tripping the
+		// deployments_pr_number_positive_chk CHECK (which rejects 0).
+		nullString(d.Reason), nullString(d.Tag), nullString(d.DeployedBy), d.PRNumber)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -13127,7 +13136,8 @@ const deploymentSelectColumnsWithRootfs = `
 	traffic_percent,
 	scope,
 	stage_state,
-	coalesce(deployed_by_user_id::text,''), deployed_via, coalesce(host(deployed_from_ip),''), coalesce(pusher_login,'')`
+	coalesce(deployed_by_user_id::text,''), deployed_via, coalesce(host(deployed_from_ip),''), coalesce(pusher_login,''),
+	coalesce(reason,''), coalesce(tag,''), coalesce(deployed_by,''), pr_number`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -13163,7 +13173,8 @@ const deploymentSelectColumnsQualified = `
 	d.traffic_percent,
 	d.scope,
 	d.stage_state,
-	coalesce(d.deployed_by_user_id::text,''), d.deployed_via, coalesce(host(d.deployed_from_ip),''), coalesce(d.pusher_login,'')`
+	coalesce(d.deployed_by_user_id::text,''), d.deployed_via, coalesce(host(d.deployed_from_ip),''), coalesce(d.pusher_login,''),
+	coalesce(d.reason,''), coalesce(d.tag,''), coalesce(d.deployed_by,''), d.pr_number`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -13188,6 +13199,13 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	var scanStatus *string
 	var scannedAt *time.Time
 	var parkedAt *time.Time
+	// Issue #977 / ADR-116: pr_number is scanned as *int so the
+	// NULL ("no PR") case reads cleanly. The text columns (reason,
+	// tag, deployed_by) are coalesced to '' in the SELECT projection
+	// so they read into the plain string fields of the struct; the
+	// closed-set vocabulary on `tag` is enforced at the schema layer
+	// via deployments_tag_set_chk, not on the scan side.
+	var prNumber *int
 	// Issue #460 / ADR-053: six override columns scanned here so
 	// the SELECT projections in DeploymentByID / LatestDeployment /
 	// etc. match. The scan order matches the column order in the
@@ -13244,8 +13262,14 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		// "number of field descriptions must equal number of
 		// destinations" panic fires immediately on the next read
 		// path if these two lists drift apart.
-		&d.DeployedByUserID, &d.DeployedVia, &d.DeployedFromIP, &d.PusherLogin); err != nil {
-
+		&d.DeployedByUserID, &d.DeployedVia, &d.DeployedFromIP, &d.PusherLogin,
+		// Issue #977 / ADR-116: annotation columns. reason / tag /
+		// deployed_by are coalesced to '' in the SELECT projection
+		// (nullable text NULL → ''), so the typed-string destinations
+		// stay plain string fields. pr_number is NULLIF($N, 0) on
+		// the INSERT side and a plain int column on the SELECT side,
+		// scanned via the *int local returned as nil for NULL.
+		&d.Reason, &d.Tag, &d.DeployedBy, &prNumber); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {
@@ -13266,6 +13290,9 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		d.ScannedAt = *scannedAt
 	}
 	d.ParkedAt = parkedAt // nil for "never parked"; non-nil for a stamped park
+	if prNumber != nil {
+		d.PRNumber = *prNumber
+	}
 	return nil
 }
 
