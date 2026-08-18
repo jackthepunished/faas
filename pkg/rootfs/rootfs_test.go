@@ -212,6 +212,21 @@ func TestBasePaddedSizeMB(t *testing.T) {
 	}
 }
 
+func TestCheckCapForStagingAccountsForSmallFiles(t *testing.T) {
+	limits, ok := api.LimitsFor(api.PlanFree)
+	if !ok {
+		t.Fatal("free limits missing")
+	}
+	stats := SmallFileStats{ContentBytes: 76 * mib, SmallRatio: 1}
+	sizeMB, err := CheckCapForStaging(limits, stats)
+	if err != nil {
+		t.Fatalf("CheckCapForStaging: %v", err)
+	}
+	if sizeMB <= PaddedSizeMB(stats.ContentBytes) {
+		t.Fatalf("small-file-aware size %d MB did not exceed legacy size %d MB", sizeMB, PaddedSizeMB(stats.ContentBytes))
+	}
+}
+
 func TestInspectStaging(t *testing.T) {
 	root := t.TempDir()
 	must := func(p string, body []byte) {
@@ -366,14 +381,14 @@ func TestBuildInjectsManifestAndInit(t *testing.T) {
 			}
 		}
 		// Read injected files before Build's deferred cleanup removes them.
-		manifest, err := os.ReadFile(filepath.Join(staging, "etc", "faas", "app.json"))
+		manifest, err := os.ReadFile(filepath.Join(staging, "upper", "etc", "faas", "app.json"))
 		if err != nil {
 			t.Errorf("app.json not injected: %v", err)
 		}
 		if !bytes.Contains(manifest, []byte(`"node"`)) {
 			t.Errorf("manifest missing entrypoint: %s", manifest)
 		}
-		init, err := os.ReadFile(filepath.Join(staging, "sbin", "init"))
+		init, err := os.ReadFile(filepath.Join(staging, "upper", "sbin", "init"))
 		if err != nil || string(init) != "INIT" {
 			t.Errorf("guest-init not injected as /sbin/init: %v", err)
 		}

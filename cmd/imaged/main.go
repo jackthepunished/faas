@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -206,7 +207,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	log.Info("imaged: oci puller ready", "timeout_s", int(ociPullTimeout().Seconds()))
 
 	notifier := dbNotifier{pool: pool}
-	guestInitPath := envOr("FAAS_GUEST_INIT", "./init")
+	guestInitPath := guestInitPathFromEnv()
 	appsRoot := envOr("FAAS_APPS_ROOT", "/var/lib/faas/apps")
 
 	// #96 / ADR-025 axis 2: build the StorageBackend the imaged Handler
@@ -276,8 +277,25 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	for _, lbl := range oci.OCIOnlyDenyCounterLabels() {
 		ops.OCIEgressDeny(lbl.CounterName, lbl.Family)
 	}
+	var artifactReplicator imaged.ArtifactReplicator
+	if helper := os.Getenv("FAAS_ARTIFACT_REPLICATOR"); helper != "" {
+		if !filepath.IsAbs(helper) {
+			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR=%q must be absolute", helper)
+		}
+		st, statErr := os.Stat(helper)
+		if statErr != nil {
+			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR=%q: %w", helper, statErr)
+		}
+		if st.IsDir() {
+			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR=%q is a directory", helper)
+		}
+		artifactReplicator = imaged.CommandArtifactReplicator{Path: helper}
+		log.Info("imaged: split-box artifact replicator enabled", "helper", helper)
+	}
+
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
 		WithStorage(storageBackend).
+		WithArtifactReplicator(artifactReplicator).
 		WithOpsMetrics(ops).
 		// Issue #472 / ADR-054: per-app cosign signature-enforcement
 		// at deploy time. Default off (the apps.require_signed=false
@@ -522,6 +540,30 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// guestInitPathFromEnv resolves the boot-critical PID 1 binary. Older
+// single-box units defaulted to ./init, which depends on an implicit working
+// directory and silently left a stale guest-init inside an already-published
+// runtime base when the checkout was not present there. Prefer the paths used
+// by release installs, then keep the local checkout path as a development
+// fallback. An explicit FAAS_GUEST_INIT always wins.
+func guestInitPathFromEnv() string {
+	if v := os.Getenv("FAAS_GUEST_INIT"); v != "" {
+		return v
+	}
+	for _, candidate := range []string{
+		"/opt/faas/current/bin/init",
+		"/usr/local/bin/faas-guest-init",
+		"./init",
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	// Return the release path even when the install is incomplete so the
+	// subsequent base-build error names the missing boot contract directly.
+	return "/opt/faas/current/bin/init"
 }
 
 // envDuration parses a duration env var, returning fallback on parse error

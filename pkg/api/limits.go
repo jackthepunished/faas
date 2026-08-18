@@ -1832,7 +1832,7 @@ const (
 	// tenant RAM.
 	BuildVMRAMMB           = 2_048
 	BuildVMVCPU            = 2
-	BuildTimeoutSeconds    = 600 // 10 min build
+	BuildTimeoutSeconds    = 900 // 15 min build; cold rootless Railpack export needs headroom
 	BuildE2ETimeoutSeconds = 900 // 15 min end-to-end
 
 	// Snapshots / disk (spec §1, §8).

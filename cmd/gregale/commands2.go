@@ -941,12 +941,14 @@ func cmdDeployTarball(args []string) int {
 		}
 		switch *templateName {
 		case "function-node":
+			*function = true
 			// Default Node runtime is node22 (per docs/runtimes/go124.md
 			// tier-1 stance: no default-flip in the same PR that adds a
 			// new runtime). Use function-node24 for the Node 24 variant.
 			*runtime = runtimeNode22
 			*handler = defaultTemplateHandler
 		case "function-node24":
+			*function = true
 			// Tier 1 PR 1 row: parallel to function-node, runtime is
 			// node24 (Node 24 LTS). The handler filename
 			// convention is the same; imaged's function-layer
@@ -954,17 +956,20 @@ func cmdDeployTarball(args []string) int {
 			*runtime = "node24"
 			*handler = defaultTemplateHandler
 		case "function-python":
+			*function = true
 			// Default Python runtime is python312 (no default-flip in
 			// Tier 1; python313 stays opt-in via function-python313).
 			*runtime = runtimePython312
 			*handler = defaultTemplateHandler
 		case "function-python313":
+			*function = true
 			// Tier 1 PR 1 row: parallel to function-python, runtime
 			// is python313. Handler filename is identical
 			// (/app/handler.py in the microVM, version-neutral).
 			*runtime = "python313"
 			*handler = defaultTemplateHandler
 		case "function-go":
+			*function = true
 			// The customer's handler is a static Go binary; the
 			// --handler wire field is vestigial for go124 (the imaged
 			// manifest locks the entrypoint to /app/handler). We set
@@ -2596,7 +2601,13 @@ streamLoop:
 	if b, ok := pollBuildStatus(c, dep, 60*time.Second); ok {
 		return terminalExitForBuild(b, dep.AppID)
 	}
-	if final, ok := pollDeploymentFinal(c, dep); ok {
+	// Tarball/function deployments created by older API paths may not carry
+	// BuildID.  In that case the build poll above is intentionally skipped,
+	// and a single deployment GET is too early: the build may have finished
+	// while the scheduler is still priming and parking the VM.  Keep polling
+	// the deployment row through that recovery window so a healthy deployment
+	// is not reported as exit 3 merely because the SSE stream ended first.
+	if final, ok := pollDeploymentFinalUntil(c, dep, 5*time.Minute); ok {
 		return terminalExitForDeployment(final)
 	}
 	PrintWarn(os.Stderr, "stream ended without a terminal frame; follow manually: gregale logs --deployment %s", dep.ID)
@@ -2622,6 +2633,36 @@ func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentR
 		return got, true
 	}
 	return api.DeploymentResponse{}, false
+}
+
+// pollDeploymentFinalUntil is the deployment-row counterpart to
+// pollBuildStatus. It is used when the create response has no BuildID, so the
+// deployment status is the only durable terminal signal available to the CLI.
+// The first GET is immediate; subsequent requests use a small capped backoff
+// and are bounded by deadline.
+func pollDeploymentFinalUntil(c *Client, dep api.DeploymentResponse, deadline time.Duration) (api.DeploymentResponse, bool) {
+	if deadline <= 0 {
+		return pollDeploymentFinal(c, dep)
+	}
+	end := time.Now().Add(deadline)
+	backoff := time.Second
+	for {
+		if final, ok := pollDeploymentFinal(c, dep); ok {
+			return final, true
+		}
+		remaining := time.Until(end)
+		if remaining <= 0 {
+			return api.DeploymentResponse{}, false
+		}
+		wait := backoff
+		if wait > remaining {
+			wait = remaining
+		}
+		time.Sleep(wait)
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 // pollBuildStatus polls GET /v1/builds/{id} until the build reaches

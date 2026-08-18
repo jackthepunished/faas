@@ -12,3 +12,10 @@
 # apps.route_metrics_enabled flag at create time. Operators
 # downgrade with -e gatewayd_route_metrics_enabled=false.
 route_metrics_enabled = {{ gatewayd_route_metrics_enabled | default(true) | string | lower }}
+
+# Schedd listens on TCP in the multi-box deployment. Keep the client
+# identity in the rendered config so gatewayd-internal cannot silently
+# downgrade a TCP control-plane connection to plaintext.
+schedd_tls_cert_path = "{{ gatewayd_schedd_tls_cert_path }}"
+schedd_tls_key_path = "{{ gatewayd_schedd_tls_key_path }}"
+schedd_tls_ca_path = "{{ gatewayd_schedd_tls_ca_path }}"

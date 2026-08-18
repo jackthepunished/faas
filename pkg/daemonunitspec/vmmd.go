@@ -10,19 +10,12 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 // Wipe-comments-load-bearing rationale that USED to live in the unit
 // file body, now preserved here:
 //
-//   - vmmd is the SOLE owner of /run/faas on disk
-//     (`RuntimeDirectory=faas` + `RuntimeDirectoryMode=0775`).
-//     Declaring RuntimeDirectory=faas on ANY other faas unit would
-//     create a SECOND per-unit tmpfs whose bind-mount does not
-//     propagate back to /run, and that daemon's .sock lands in the
-//     wrong filesystem layer (run 30841750214, post-#619). schedd +
-//     gatewayd-internal + imaged etc. write into the host /run/faas
-//     via ReadWritePaths=/run/faas alone.
-//   - RuntimeDirectory creates the dir as root:root. Mode 0775 gives
-//     the OWNER group (root, not faas) write+execute; schedd sits in
-//     the `faas` group but loses on the OWNER check. So the two
-//     ExecStartPre= lines chown the dir to root:faas 0775 right after
-//     systemd creates it. Idempotent (matching-ownership chown is a no-op).
+//   - /run/faas is a host-shared tmpfs directory provisioned by tmpfiles.d
+//     and reasserted by vmmd's host-side install/chown fixups. vmmd must
+//     not declare RuntimeDirectory=faas: systemd's per-unit runtime mount
+//     can remove or hide gatewayd/schedd sockets during a vmmd restart.
+//     schedd + gatewayd-internal + imaged write into the shared host path
+//     via ReadWritePaths=/run/faas.
 //   - PrivateTmp MUST be `=no` — `=yes` makes /run/faas land inside
 //     vmmd's per-mount-namespace tmpfs and become invisible from the
 //     host, breaking every other daemon's dial of /run/faas/vmmd.sock
@@ -42,6 +35,13 @@ func UnitVmmd() daemonunit.Unit {
 		// No User=/Group=: vmmd is root by design.
 		ExecStart: `/opt/faas/current/bin/vmmd --config /etc/faas/vmmd.toml`,
 		ExecStartPre: []string{
+			`/usr/bin/install -d -o root -g faas -m 0775 /run/faas`,
+			`/usr/bin/chmod 0775 /run/faas`,
+		},
+		// Re-assert the shared host-directory ownership after startup.
+		// This keeps a hand-edited or manually repaired /run tree safe for
+		// gatewayd and schedd after a vmmd restart.
+		ExecStartPost: []string{
 			`/usr/bin/chown root:faas /run/faas`,
 			`/usr/bin/chmod 0775 /run/faas`,
 		},
@@ -56,14 +56,12 @@ func UnitVmmd() daemonunit.Unit {
 		NoNewPrivileges:       true,
 		ProtectSystem:         "strict",
 		ProtectHome:           true,
-		PrivateTmp:            daemonunit.BoolPtr(false), // SOLE RuntimeDirectory owner; see struct godoc.
+		PrivateTmp:            daemonunit.BoolPtr(false), // /run/faas is host-shared.
 		ProtectKernelTunables: true,
 		ProtectKernelModules:  true,
 		ProtectControlGroups:  true,
 
-		RuntimeDirectory:     "faas",
-		RuntimeDirectoryMode: "0775",
-		ReadWritePaths:       []string{"/etc/faas/secrets", "/run/faas", "/srv/fc", "/var/log/faas"},
+		ReadWritePaths: []string{"/etc/faas/secrets", "/run/faas", "/srv/fc", "/var/log/faas"},
 
 		WantedBy: "multi-user.target",
 	}

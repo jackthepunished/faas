@@ -459,7 +459,6 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 
 	timeout := time.Duration(b.cfg.BuildTimeoutSeconds) * time.Second
 	vmCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	handle, err := b.vm.Spawn(vmCtx, VMRequest{
 		BuildID:      build.ID,
@@ -479,10 +478,16 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 			fc = state.FailureTimeout
 		}
 		b.markFailed(ctx, dep.ID, build.ID, fc, "vm spawn: "+err.Error(), buildStart)
+		cancel()
 		return BuildResult{}, err
 	}
+	// Spawn only needs the build-scoped deadline while vmmd accepts the cold
+	// boot. Do not carry that deadline into WaitForCompletion: Destroy must be
+	// allowed to use its export headroom to collect build-done.json and the OCI
+	// tarball after the in-guest build reaches its own timeout.
+	cancel()
 
-	out, err := b.vm.WaitForCompletion(vmCtx, handle)
+	out, err := b.vm.WaitForCompletion(ctx, handle)
 	if err != nil {
 		// Translate a context-deadline to timeout-class; everything else is infra.
 		fc := state.FailureInfra

@@ -79,6 +79,14 @@ type Config struct {
 	VMMDPingTLSKeyPath  string `toml:"vmmd_tls_key_path"`
 	VMMDPingTLSCAPath   string `toml:"vmmd_tls_ca_path"`
 
+	// ScheddTLS is the client mTLS material gatewayd uses for the
+	// scheduler control stream. Schedd is allowed to bind TCP in a
+	// multi-box deployment, so the unix-only default is not sufficient
+	// when FAAS_SCHEDD_SOCKET points at a tcp:// target.
+	ScheddTLSCertPath string `toml:"schedd_tls_cert_path"`
+	ScheddTLSKeyPath  string `toml:"schedd_tls_key_path"`
+	ScheddTLSCAPath   string `toml:"schedd_tls_ca_path"`
+
 	// EgressTLSCertPath / Key / CA configure the mTLS material the
 	// egress gRPC listener uses when meterd dials it from a remote
 	// compute node (ADR-052 / issue #95 slice 2). All three empty
@@ -258,6 +266,13 @@ func (c *Config) resolveTLSConfig(allowlist gateway.OnDemandAllowlist) gateway.T
 // is start-up fatal rather than a runtime fault (spec §11).
 func (c *Config) LoadVMMDPingTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("vmmd_", c.VMMDPingTLSCertPath, c.VMMDPingTLSKeyPath, c.VMMDPingTLSCAPath)
+}
+
+// LoadScheddTLS returns the client mTLS config for the schedd gRPC target.
+// Empty paths preserve the unix-socket/single-box posture; partial paths are
+// rejected so a TCP schedd target cannot silently fall back to plaintext.
+func (c *Config) LoadScheddTLS() (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefix("schedd_", c.ScheddTLSCertPath, c.ScheddTLSKeyPath, c.ScheddTLSCAPath)
 }
 
 // LoadEgressTLS returns the server mTLS config the egress gRPC

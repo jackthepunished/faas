@@ -30,8 +30,9 @@ import (
 // the per-call deadline doesn't (e.g. the vmmd call hangs but Wake
 // has since returned nil — the only way the row stays in WAKING).
 const (
-	// WakingSweepBudget is the spec §6.1 budget for WAKING: rows
-	// older than this when the watchdog ticks are killed.
+	// WakingSweepBudget is the spec §6.1 budget for WAKING rows without a
+	// usable snapshot. Snapshot-backed rows are exempted in runOne because the
+	// restore path is allowed the cold-boot fallback budget.
 	WakingSweepBudget = 5 * time.Second
 
 	// ColdBootSweepBudget is the spec §6.1 budget for COLD_BOOTING.
@@ -110,6 +111,16 @@ func (w *Watchdog) runOne(ctx context.Context, now time.Time, st state.State, bu
 		return
 	}
 	for _, ins := range rows {
+		// A snapshot-backed wake can spend the restore budget in vmmd and then
+		// fall back to a cold boot. Its engine context is bounded by
+		// ColdBootTimeout, so the 5-second WAKING backstop must not race it.
+		// The engine still owns the terminal transition if that RPC exceeds its
+		// deadline.
+		if st == state.StateWaking && ins.DeploymentID != "" {
+			if _, snapErr := w.store.LatestSnapshot(ctx, ins.DeploymentID); snapErr == nil {
+				continue
+			}
+		}
 		if err := w.engine.KillStuck(ctx, ins.ID, ins.AppID, reason); err != nil {
 			w.log.Warn("watchdog: kill stuck", "instance", ins.ID, "state", st, "reason", reason, "err", err)
 		}

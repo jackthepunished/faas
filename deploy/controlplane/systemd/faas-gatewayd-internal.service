@@ -1,8 +1,8 @@
 [Unit]
 Description=onebox-faas gatewayd-internal — routing + wake + proxy (Tier A7 split, ADR-070)
 Documentation=https://docs.gregale.dev/ops/gatewayd-internal
-After=faas-cp.slice network-online.target faas-apid.service faas-schedd.service
-Wants=faas-cp.slice faas-apid.service faas-schedd.service
+After=faas-cp.slice network-online.target faas-apid.service faas-schedd.service faas-vmmd.service
+Wants=faas-cp.slice faas-apid.service faas-schedd.service faas-vmmd.service
 
 [Service]
 Type=simple

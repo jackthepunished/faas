@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -47,6 +48,10 @@ type Config struct {
 	// writes <dir>/<build_id>/build-done.json + /build/out/* here during
 	// Destroy. /var/lib/faas/build-out (default).
 	BuildExportDir string `toml:"build_export_dir"`
+	// BuildTimeoutSeconds is the guest build wall-clock budget. Zero keeps
+	// the platform default from pkg/api/limits.go. The host-side export
+	// headroom is added separately by the metal VM driver.
+	BuildTimeoutSeconds int `toml:"build_timeout_seconds"`
 	// ScheddMetricsURL is where builderd polls schedd's /metrics
 	// endpoint for the fcvm_resident_ram_pct gauge (spec §4.5
 	// opportunistic-slot rule).
@@ -153,6 +158,20 @@ func (c *Config) LoadVMMTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfig(c.TLSCertPath, c.TLSKeyPath, c.TLSCAPath)
 }
 
+// normalizeConfig prevents the stuck-build reaper from racing a valid build.
+// A running row remains durable until the guest budget plus host teardown
+// margin has elapsed; the VM driver owns the more precise export deadline.
+func (c *Config) normalizeConfig() {
+	buildTimeout := c.BuildTimeoutSeconds
+	if buildTimeout <= 0 {
+		buildTimeout = api.BuildTimeoutSeconds
+	}
+	minimum := time.Duration(buildTimeout)*time.Second + 10*time.Minute
+	if c.StuckBuildThreshold < minimum {
+		c.StuckBuildThreshold = minimum
+	}
+}
+
 // LoadConfig reads a TOML file at path with defaults filled in. A missing
 // file is not an error — the defaults produce a working daemon.
 func LoadConfig(path string) (*Config, error) {
@@ -170,7 +189,7 @@ func LoadConfig(path string) (*Config, error) {
 		// next customer's queued build without an SLA-busting wait.
 		FairnessWindow:          30 * time.Second,
 		StuckBuildSweepInterval: 10 * time.Minute,
-		StuckBuildThreshold:     15 * time.Minute,
+		StuckBuildThreshold:     time.Duration(api.BuildTimeoutSeconds)*time.Second + 10*time.Minute,
 		// B2.1 (issue #196): cache GC. 50 GB cap matches the spec
 		// fleet budget. 30-day TTL matches the only other retention
 		// constant the platform has (api.DefaultInstanceRetention).
@@ -200,6 +219,7 @@ func LoadConfig(path string) (*Config, error) {
 					c.BuilderNodeID = v
 				}
 			}
+			c.normalizeConfig()
 			return c, nil
 		}
 		return nil, fmt.Errorf("builderd: read %q: %w", path, err)
@@ -207,6 +227,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("builderd: parse %q: %w", path, err)
 	}
+	c.normalizeConfig()
 	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
 	// c.Role is consulted against FAAS_BUILDERD_ROLE. Setting Role
 	// in the defaults-struct literal lets toml.Unmarshal overwrite

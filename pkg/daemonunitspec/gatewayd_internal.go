@@ -35,8 +35,8 @@ func UnitGatewaydInternal() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas gatewayd-internal — routing + wake + proxy (Tier A7 split, ADR-070)",
 		Documentation: "https://docs.gregale.dev/ops/gatewayd-internal",
-		After:         []string{"faas-cp.slice", "network-online.target", "faas-apid.service", "faas-schedd.service"},
-		Wants:         []string{"faas-cp.slice", "faas-apid.service", "faas-schedd.service"},
+		After:         []string{"faas-cp.slice", "network-online.target", "faas-apid.service", "faas-schedd.service", "faas-vmmd.service"},
+		Wants:         []string{"faas-cp.slice", "faas-apid.service", "faas-schedd.service", "faas-vmmd.service"},
 
 		Type:       "simple",
 		User:       "faas",

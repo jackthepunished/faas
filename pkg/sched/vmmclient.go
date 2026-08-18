@@ -307,11 +307,16 @@ type VMInstanceStat struct {
 // Empty slice = no allowlist rule emitted in the per-netns forward chain
 // (current behaviour preserved).
 type AppSpec struct {
-	BaseKey         string // drive0 base rootfs StorageBackend key (e.g. "base/runtime-node22.ext4")
-	LayerKey        string // drive1 per-app layer StorageBackend key (e.g. "apps/<slug>/<depID>.ext4")
-	VCPUCount       int32  // 2, or 4 for Scale
-	MemSizeMiB      int32  // plan RAM; the slice fences at +8 MiB (pkg/api/limits.go)
-	EgressMbit      int32  // per-plan tc cap (pkg/api/limits.EgressMbit); 0 = no cap
+	BaseKey    string // drive0 base rootfs StorageBackend key (e.g. "base/runtime-node22.ext4")
+	LayerKey   string // drive1 per-app layer StorageBackend key (e.g. "apps/<slug>/<depID>.ext4")
+	VCPUCount  int32  // 2, or 4 for Scale
+	MemSizeMiB int32  // plan RAM; the slice fences at +8 MiB (pkg/api/limits.go)
+	EgressMbit int32  // per-plan tc cap (pkg/api/limits.EgressMbit); 0 = no cap
+	// Plan and AccountID are request-level admission context. Keeping them
+	// with the flat spec makes deploy prime and ordinary wakes carry the same
+	// cgroup and metrics identity to vmmd.
+	Plan            api.Plan
+	AccountID       string
 	SealedEnv       []fcvm.SealedEnvEntry
 	APIEnv          []fcvm.APIEnvEntry // issue #395 / ADR-045: plaintext per-app env
 	EgressAllowlist []string           // ADR-031 + ADR-032; v4 or v6 CIDRs; empty = no allowlist rule. The renderer partitions by family.
@@ -476,9 +481,11 @@ func (c *VMMClient) CreateColdBoot(ctx context.Context, instance string, app App
 	fields, _ := wire.FromContext(ctx)
 	ctx = wire.WithCorrelationOutgoing(ctx, fields)
 	resp, err := c.cli.CreateColdBoot(ctx, &vmmdpb.CreateColdBootRequest{
-		Instance: instance,
-		App:      app.toProto(),
-		WakeId:   fields.WakeID,
+		Instance:  instance,
+		App:       app.toProto(),
+		Plan:      string(app.Plan),
+		AccountId: app.AccountID,
+		WakeId:    fields.WakeID,
 	})
 	if err != nil {
 		return nil, liftErr(err)
@@ -491,8 +498,10 @@ func (c *VMMClient) CreateFromSnapshot(ctx context.Context, instance string, app
 	fields, _ := wire.FromContext(ctx)
 	ctx = wire.WithCorrelationOutgoing(ctx, fields)
 	resp, err := c.cli.CreateFromSnapshot(ctx, &vmmdpb.CreateFromSnapshotRequest{
-		Instance: instance,
-		App:      app.toProto(),
+		Instance:  instance,
+		App:       app.toProto(),
+		Plan:      string(app.Plan),
+		AccountId: app.AccountID,
 		Snapshot: &vmmdpb.SnapshotRef{
 			DeploymentId:      snap.DeploymentID,
 			VmstatePath:       snap.VMStatePath,

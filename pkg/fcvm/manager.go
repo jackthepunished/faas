@@ -225,8 +225,9 @@ type AdvisoryForwarder interface {
 // bringUp returns so the vmmd WakeResponse can carry the typed
 // scalars. Stays on the stack — never crosses a goroutine boundary.
 type bringUpTimings struct {
-	restoreMs  int64
-	netnsTapMs int64
+	restoreMs    int64
+	netnsTapMs   int64
+	restoreError string
 }
 
 type Instance struct {
@@ -247,6 +248,12 @@ type Instance struct {
 	RestoreMs    int64
 	NetnsTapMs   int64
 	GuestReadyMs int64
+	// RestoreError is populated when a requested snapshot restore falls
+	// back to a successful cold boot. It is diagnostic-only: the fallback
+	// remains a successful wake, but vmmd must retain the reason so an
+	// operator can distinguish a stale snapshot from a guest resume-hook
+	// failure (including its ACK code).
+	RestoreError string
 	// AppID is the apps.id UUID the instance was woken for.
 	// UpdateEgressAllowlist (PR-B, ADR-031+033) uses it to walk
 	// the live map keyed by app instead of by instance, so a
@@ -2301,7 +2308,9 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// 0 (= not measured) and the wire emits it accordingly.
 	var report api.CharacterizationReport
 	var guestReadyMs int64
-	if method == WakeColdBoot {
+	// Builder VMs do not emit the app readiness/characterization signals;
+	// builderd owns completion by waiting for Destroy instead.
+	if method == WakeColdBoot && req.ExportDir == "" {
 		readyStart := time.Now()
 		report, _ = m.vmm.WaitCharacterizationReport(ctx, lease, m.characterizationWait)
 		guestReadyMs = time.Since(readyStart).Milliseconds()
@@ -2310,7 +2319,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"observed_port", report.ObservedPort, "exit", report.ExitCode,
 			"port_norm_mode", report.PortNormalizationMode)
 	}
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, DeploymentID: req.DeploymentID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report, Runtime: req.Runtime, RestoreMs: timings.restoreMs, NetnsTapMs: timings.netnsTapMs, GuestReadyMs: guestReadyMs}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, DeploymentID: req.DeploymentID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report, Runtime: req.Runtime, RestoreMs: timings.restoreMs, NetnsTapMs: timings.netnsTapMs, GuestReadyMs: guestReadyMs, RestoreError: timings.restoreError}
 	// ADR-098 C11: emit the three vmmd-side wake phases onto the
 	// dedicated histogram. nil-receiver safe. RestoreMs is 0 on
 	// cold boot (no /snapshot/load ran) — the histogram's
@@ -2470,6 +2479,9 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 				"slot", lease.Slot,
 				"desired_fc_version", m.fcVersion,
 				"snapshot_fc_version", req.Snapshot.FCVersion)
+			if timings != nil {
+				timings.restoreError = rErr.Error()
+			}
 			m.metrics.ObserveFallback()
 			_ = m.vmm.Kill(ctx, lease)
 		}
@@ -2496,6 +2508,7 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		// waitReady does HTTP GET <HealthcheckPath> against
 		// <HostIP>:8080 and accepts 2xx as ready.
 		HealthcheckPath: req.HealthcheckPath,
+		SkipReady:       req.ExportDir != "",
 		// Issue #463 / ADR-069 / PR-B: per-workload drives
 		// (main + sidecars). buildWorkloadsForColdBoot emits an
 		// empty slice on the legacy single-workload path so

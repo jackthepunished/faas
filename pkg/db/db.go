@@ -57,9 +57,12 @@ func open(ctx context.Context, dsnOverride, appName string) (*pgxpool.Pool, erro
 	if err != nil {
 		return nil, fmt.Errorf("db: parse config: %w", err)
 	}
-	// Sane defaults for a one-box daemon. schedd + imaged may subscribe via
-	// LISTEN which holds a connection for the lifetime of the daemon.
-	cfg.MaxConns = 8
+	// Sane defaults for a one-box daemon. schedd has several independent
+	// LISTEN subscribers (node keys, placement, migration, deployment
+	// lifecycle, and its dispatch loop), each of which holds a connection for
+	// the daemon lifetime. Keep enough headroom for the listener set plus
+	// ordinary queries and short transactions.
+	cfg.MaxConns = 16
 	cfg.MinConns = 1
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second

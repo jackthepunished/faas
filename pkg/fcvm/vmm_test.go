@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -55,11 +56,11 @@ func TestProvisionRewritesPathsIntoChroot(t *testing.T) {
 	if out.BootSource.KernelImagePath != "vmlinux-6.1" {
 		t.Errorf("kernel path = %q, want in-chroot basename", out.BootSource.KernelImagePath)
 	}
-	if out.Drives[0].PathOnHost != "runner-node22.ext4" || out.Drives[1].PathOnHost != "layer-1.ext4" {
+	if out.Drives[0].PathOnHost != "runner-node22.ext4" || out.Drives[1].PathOnHost != layerImageName {
 		t.Errorf("drive paths not rewritten: %q, %q", out.Drives[0].PathOnHost, out.Drives[1].PathOnHost)
 	}
 	// Files must actually exist in the chroot root now.
-	for _, name := range []string{"vmlinux-6.1", "runner-node22.ext4", "layer-1.ext4"} {
+	for _, name := range []string{"vmlinux-6.1", "runner-node22.ext4", layerImageName} {
 		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
 			t.Errorf("expected %s provisioned into chroot: %v", name, err)
 		}
@@ -128,6 +129,36 @@ func TestStageWritable_CopiesPrivateAndUnlinksFromSource(t *testing.T) {
 	}
 }
 
+func TestStageEphemeralWritableHardLinksSource(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "builder.ext4")
+	if err := os.WriteFile(src, []byte("builder scratch"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	name, err := stageEphemeralWritableAs(root, src, layerImageName, 20000, 20000)
+	if err != nil {
+		t.Fatalf("stageEphemeralWritableAs: %v", err)
+	}
+	srcStat := mustStatT(t, src).Sys().(*syscall.Stat_t)
+	dstStat := mustStatT(t, filepath.Join(root, name)).Sys().(*syscall.Stat_t)
+	if srcStat.Ino != dstStat.Ino {
+		t.Fatalf("ephemeral writable inode = %d, source inode = %d; want hard link", dstStat.Ino, srcStat.Ino)
+	}
+}
+
+func mustStatT(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
+}
+
 func TestStageWritable_ReplacesHardlinkedSibling(t *testing.T) {
 	// M0 points drive0 and drive1 at the same image: the read-only drive hardlinks
 	// it in first, then the writable drive must break that link and copy — not
@@ -153,7 +184,7 @@ func TestStageWritable_ReplacesHardlinkedSibling(t *testing.T) {
 		t.Fatalf("source corrupted after writable staging: got %q err=%v", got, err)
 	}
 	a, _ := os.Stat(src)
-	b, _ := os.Stat(filepath.Join(root, "busybox.ext4"))
+	b, _ := os.Stat(filepath.Join(root, layerImageName))
 	if os.SameFile(a, b) {
 		t.Error("writable staging left the chroot file aliased to the source inode")
 	}
@@ -175,6 +206,48 @@ func TestCopyFile(t *testing.T) {
 	got, err := os.ReadFile(dst)
 	if err != nil || string(got) != "hello" {
 		t.Fatalf("copied content = %q, err=%v", got, err)
+	}
+}
+
+func TestCopyTreePreservesDirectorySymlinks(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(filepath.Join(src, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "usr", "bin", "node"), []byte("node"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(src, "usr", "bin", "node"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("usr/bin", filepath.Join(src, "bin")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyTree(src, dst, 0); err != nil {
+		t.Fatalf("copyTree: %v", err)
+	}
+	link, err := os.Readlink(filepath.Join(dst, "bin"))
+	if err != nil {
+		t.Fatalf("read copied symlink: %v", err)
+	}
+	if link != "usr/bin" {
+		t.Fatalf("copied symlink = %q, want %q", link, "usr/bin")
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "bin", "node"))
+	if err != nil {
+		t.Fatalf("read through copied symlink: %v", err)
+	}
+	if string(got) != "node" {
+		t.Fatalf("copied node = %q, want node", got)
+	}
+	mode, err := os.Stat(filepath.Join(dst, "bin", "node"))
+	if err != nil {
+		t.Fatalf("stat copied node: %v", err)
+	}
+	if mode.Mode().Perm() != 0o755 {
+		t.Fatalf("copied node mode = %o, want 755", mode.Mode().Perm())
 	}
 }
 

@@ -32,5 +32,5 @@ drv = "vmmd"
 build_staging_root = "/srv/fc/builder"
 
 # MemoryMax=512M is enforced by the unit (above). The build VM
-# (spec §4.5) gets 2 vCPU / 2048 MB / 10 minutes — wired by
+# (spec §4.5) gets 2 vCPU / 2048 MB / 15 minutes — wired by
 # vmmd's Wake RPC, not by builderd's TOML.
