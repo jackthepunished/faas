@@ -70,6 +70,14 @@ var errorDocsURL = map[string]string{
 	api.CodeAppRenameFailed:            docsURLPrefix + "/apps/rename",
 	api.CodeCliAuthPending:             docsURLPrefix + "/cli-auth/pending",
 	api.CodeCliAuthUnavailable:         docsURLPrefix + "/cli-auth/unavailable",
+	api.CodeAppNotListening:            docsURLPrefix + "/errors/app-not-listening",
+	api.CodeAppLoopbackBound:           docsURLPrefix + "/errors/app-loopback-bound",
+	api.CodeAppArchMismatch:            docsURLPrefix + "/errors/app-arch-mismatch",
+	api.CodeEnvVarMissing:              docsURLPrefix + "/errors/env-var-missing",
+	api.CodeAppHealthzUnauthorized:     docsURLPrefix + "/errors/app-healthz-unauthorized",
+	api.CodeAppRuntimeOOM:              docsURLPrefix + "/errors/app-runtime-oom",
+	api.CodeDepInstallFailed:           docsURLPrefix + "/errors/dep-install-failed",
+	api.CodeAppStartupTimeout:          docsURLPrefix + "/errors/app-startup-timeout",
 }
 
 // docsURLForCode returns the per-code docs URL, falling back to the

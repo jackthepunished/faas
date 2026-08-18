@@ -21,6 +21,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/browser"
 	"github.com/onebox-faas/faas/pkg/gregalemanifest"
 	"github.com/onebox-faas/faas/pkg/secretscan"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 )
 
 // Subcommand names — lifted to constants so goconst stops flagging the
@@ -2870,6 +2871,14 @@ func renderDeployFailure(d api.DeploymentResponse) int {
 // mapFailureMessage returns the user-facing copy for one of the four
 // failure classes UX §2.4 enumerates. Anything else falls back to
 // "Build failed: <err>" so the customer sees the raw class at least.
+//
+// Error-explanations cluster (spec §6.4 amendment 1): when the
+// caller already has a *api.Problem, the whycopy catalog lookup
+// wins — the catalog carries the customer-facing hint/why/fix
+// prose and is the single source of truth for explanation copy.
+// The legacy 4-bucket switch stays as a fallback for when the
+// caller only has the raw failure_class string (pre-cluster paths:
+// legacy builds that never stamped the RFC 7807 code).
 func mapFailureMessage(err string) string {
 	switch err {
 	case "user_error":
@@ -2882,6 +2891,22 @@ func mapFailureMessage(err string) string {
 		return "Our build system hiccuped — we've been alerted and requeued your build automatically."
 	}
 	return "Build failed: " + err
+}
+
+// mapFailureProblem maps a deployment's *api.Problem to the
+// user-facing copy via the whycopy catalog. When the catalog has
+// no row for the code (codes the cluster did not catalog yet), it
+// returns "" so the caller falls back to the legacy
+// mapFailureMessage. This is the post-cluster entry point —
+// detection sites (commits 7-13) emit typed *api.Problem and the
+// CLI renderer calls mapFailureProblem to lift the hint/why/fix
+// without re-classifying the failure.
+func mapFailureProblem(p *api.Problem) string {
+	if p == nil || p.Code == "" {
+		return ""
+	}
+	whycopy.Decorate(p, p.Code, nil)
+	return p.Hint
 }
 
 // cmdUsageDaily: GET /v1/usage/daily?day=YYYY-MM-DD. Per-(app, day)
