@@ -1028,7 +1028,20 @@ type Deployment struct {
 	// other transition (and for deployments created before the
 	// migrations/00021 column add).
 	ErrorCode string
-	CreatedAt time.Time
+	// ErrorHint / ErrorWhy / ErrorFix / ErrorRelevantLogs are the
+	// customer-facing explanation prose stamped alongside ErrorCode
+	// (spec §6.4 amendment 1). Mirrors the wire-side Problem.Hint /
+	// Problem.Fix / Problem.RelevantLogs fields so post-mortem
+	// retrieval via `gregale deployment <id>` or
+	// `gregale inspect <slug> --errors` surfaces the same 3-5 line
+	// shape that the deploy-time Problem emits. All four are
+	// omitempty in the wire DTO; rows written before the column
+	// additions land leave them empty.
+	ErrorHint         string
+	ErrorWhy          string
+	ErrorFix          string
+	ErrorRelevantLogs []api.LogExcerpt
+	CreatedAt         time.Time
 	// Override columns (issue #460 / ADR-053). Six optional fields
 	// that layer on top of the OCI image config when the customer
 	// redeploys the same digest-pinned image with a different
