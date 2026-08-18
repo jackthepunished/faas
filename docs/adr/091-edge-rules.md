@@ -359,6 +359,56 @@ PR-A/B/C — keep their cite numbers untouched.)
         slot fence at `migrations/00267_reserve_slot.sql`
         (renumbered from 00266 after cross-PR precheck caught
         the ADR-101 OIDC cluster owning 00265/00266).
+      **Amendment 5 (issue #881 Phase 4, 2026-08-18):** Three
+        rate-limit improvements amend ADR-104 (not 091 — these are
+        rate-limit improvements, not edge-rule kind additions).
+        Mega-PR cluster; see ADR-104 amendment 5 for full detail:
+
+        1. **Central mode for `pg_ratelimit_counters`** (the table
+           that migration 00126 created with zero Go readers).
+           Originally a "Rejected alternative" in ADR-104;
+           amendment 5 FLIPS that bullet. The table is now read
+           by the gateway hot path under `[ratelimit] mode =
+           "central"` (TOML knob, default `"local"` for back-compat).
+           Fast-path-cache pattern: in-process bucket serves
+           hot-path Peek; central counter is consulted only when
+           the in-process bucket would reject (ADR-070 bench
+           P50 0.8ms / P99 3.2ms applies to the boundary case only).
+           Cross-replica invalidation via `pg_notify
+           'rate_limit_changed'`. The 00126 CHECK is widened
+           to `scope IN ('app','account','rule')` via migration
+           00281. Phase 3 scope is per-app + per-account + per-rule
+           only — per-consumer central mode is Phase 4 (the PK
+           does NOT include `consumer_id`; the `__other__`
+           collapse bucket stays in-process until then).
+        2. **`X-RouteRateLimit-Policy` per-consumer scope hint
+           on the 429 path (wire-only).** New sibling header of
+           `X-RouteRateLimit-{Limit,Remaining,Reset}`. Values:
+           `route` (back-compat default for `KeyBy ∈ {"", "none"}`)
+           or `per-consumer` (when the consumer collapsed into the
+           `__other__` bucket). The existing
+           `x-faas-rate-limit-scope` enum is untouched.
+        3. **Dry-run preview on
+           `GET /v1/apps/{slug}/throttle-suggestions`** (parameter
+           sweep, not auto-apply). New query params:
+           `dry_run=true&candidate_rps=N&candidate_burst=N`. Returns
+           the existing `suggestions` slice unchanged plus a new
+           `would_have_rejected` array (one row per route) with the
+           over-cap count + a per-consumer limitation note. The
+           recommender origin (D20.5 amendment 3, Phase 1) is
+           extended with this guard-rail; the recommender remains
+           INTENTIONALLY ADVICE-ONLY. Per-consumer limitation:
+           `gateway_requests_by_route_total` has no per-consumer
+           labels today, so the preview can only answer "would ANY
+           consumer on the rule's `__other__` collapse bucket have
+           been rejected?" — surfaced on the wire, in the CLI
+           (`gregale throttle-suggestions <slug> --dry-run …`),
+           and in the ADR-104 amendment.
+
+        Sequencing: lands as a single mega-PR cluster (4 atomic
+        + 2 review-fix commits; pattern after PR #924 Mega-PR-A).
+        Branch `feat-881-phase-3-per-consumer` carries the
+        work; PR opens as DRAFT per mega-PR house style.
     - **D20.6 — CORS non-preflight e2e path.** PR 6 covers CORS
       preflight e2e; non-preflight stamp-the-Origin flow is
       unit-tested at `pkg/gateway/handler.go:1175-1220` and the e2e
