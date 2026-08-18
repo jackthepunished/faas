@@ -34,6 +34,16 @@ var forbiddenBundlePaths = []string{"faas-tunnel"}
 // isForbiddenPath reports whether rel should be refused per the
 // PR-5 denylist. Match is case-insensitive substring.
 func isForbiddenPath(rel string) bool {
+	return IsForbiddenPath(rel)
+}
+
+// IsForbiddenPath is the exported form of the PR-5 denylist check.
+// pkg/releaseinstall/ (PR-3) calls this for daemon-name validation
+// at bundle-build time so a future re-introduction of faas-tunnel
+// is caught when the bundle is materialised, not when the box
+// installs it. The case-folded substring semantics are the same as
+// the unexported isForbiddenPath.
+func IsForbiddenPath(rel string) bool {
 	lower := strings.ToLower(rel)
 	for _, deny := range forbiddenBundlePaths {
 		if strings.Contains(lower, deny) {

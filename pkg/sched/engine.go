@@ -309,6 +309,16 @@ type Engine struct {
 	// missed wiring is a silent no-op rather than a nil-deref panic.
 	warmAffinity *WarmAffinity
 
+	// upstreamAffinity (ADR-098 PR-D) is the connection-aware
+	// placement bias. Defaults to nil (FAAS_UPSTREAM_AFFINITY=0
+	// branch) so pre-PR test fixtures keep their existing
+	// behaviour. Production wires a real cache via
+	// WithUpstreamAffinity. nil is tolerated by Score (returns
+	// ok=false → chooser falls back to legacy tie-break) so a
+	// missed wiring is a silent no-op rather than a nil-deref
+	// panic — parallel to warmAffinity's contract above.
+	upstreamAffinity *UpstreamAffinity
+
 	// overage is the spend-cap pause-workload seam (issue #561).
 	// Nil tolerates the gate branch as a no-op (pre-#561 fixtures
 	// keep their existing behaviour); production cmd/schedd wires
@@ -413,6 +423,21 @@ func (e *Engine) budgetFor(s state.State) time.Duration {
 	return bootTimeout(s)
 }
 
+// budgetForWake returns the deadline for the full vmmd operation. A snapshot
+// wake is allowed the cold-boot budget because vmmd may need to fall back to a
+// cold boot after a restore miss or a slow snapshot load. Reusing the 6-second
+// WAKING context for that fallback cancels the cold boot before it can start.
+// The test override remains authoritative so deadline tests stay fast.
+func (e *Engine) budgetForWake(in bootInput) time.Duration {
+	if e.bootBudget != nil {
+		return e.bootBudget(in.initState)
+	}
+	if in.haveSnap && in.snapKey != "" {
+		return ColdBootTimeout
+	}
+	return e.budgetFor(in.initState)
+}
+
 // NewEngine wires the engine. notif may be nil (notifications are best-effort in
 // tests); log may be nil (slog default); ops may be nil (tests don't assert on
 // metrics).
@@ -478,6 +503,18 @@ func (e *Engine) WithOpsMetrics(ops *wire.OpsMetrics) *Engine {
 // their existing single-box behaviour.
 func (e *Engine) WithWarmAffinity(w *WarmAffinity) *Engine {
 	e.warmAffinity = w
+	return e
+}
+
+// WithUpstreamAffinity attaches the connection-aware placement
+// bias (ADR-098 PR-D). The engine reads Score(appID) before
+// calling ChoosePlacement and stamps Request.PreferredRegion;
+// the chooser honors it via the upstream_fit tie-break in
+// betterCandidate. nil is tolerated (Score returns ok=false →
+// legacy tie-break) so legacy test fixtures that don't wire
+// this keep their existing single-box behaviour.
+func (e *Engine) WithUpstreamAffinity(u *UpstreamAffinity) *Engine {
+	e.upstreamAffinity = u
 	return e
 }
 
@@ -1578,10 +1615,28 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// (cold boot must always work) is preserved: an empty hint
 	// behaves identically to a fresh install.
 	warmHint, _ := e.warmAffinity.LastWarmNode(appID)
+	// ADR-098 PR-D: connection-aware placement bias. Score is
+	// the synchronous read (per ADR §D2 — schedd does NOT
+	// LISTEN on data_upstreams_changed). On cache miss, Refresh
+	// fires synchronously to populate the entry; on hit, the
+	// cached preferredRegion flows through. ok=false → empty
+	// PreferredRegion → legacy tie-break. The refresh error is
+	// logged + swallowed so a transient DB hiccup doesn't break
+	// the legacy chooser.
+	preferredRegion, _, _ := e.upstreamAffinity.Score(appID)
+	if preferredRegion == "" && e.upstreamAffinity != nil {
+		if rerr := e.upstreamAffinity.Refresh(ctx, acct.ID, appID); rerr == nil {
+			preferredRegion, _, _ = e.upstreamAffinity.Score(appID)
+		} else {
+			// best-effort: log at debug, fall through to legacy
+			e.log.Debug("upstream affinity refresh failed; using legacy chooser", "app", appID, "err", rerr)
+		}
+	}
 	placement, err := e.choosePlacementLocked(ctx, Request{
 		AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		PreferredNodeID: warmHint,
+		PreferredRegion: preferredRegion,
 	})
 	if err != nil {
 		release()
@@ -1740,7 +1795,8 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  sealedEnv,
+		Plan:       acct.Plan, AccountID: acct.ID,
+		SealedEnv: sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
@@ -1875,7 +1931,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	// ── Phase 3: drop the lock, do the slow vmmd RPC ──────────────
 	var out *WakeOutcome
-	bootCtx, cancel := context.WithTimeout(ctx, e.budgetFor(bootInput.initState))
+	bootCtx, cancel := context.WithTimeout(ctx, e.budgetForWake(bootInput))
 	defer cancel()
 	// Issue #555 PR-3: sched.wake span encloses the vmmd RPC. The
 	// span's trace_id is the wake_id (uuidv7 → 32-hex), so the
@@ -3139,6 +3195,8 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 		VCPUCount:  int32(limits.VCPU),
 		MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
+		Plan:       acct.Plan,
+		AccountID:  acct.ID,
 		SealedEnv:  sealedEnv,
 		// ADR-045: api_env plaintext layer; the loadAPIEnv
 		// helper already fail-softs on a lookup error and logs
@@ -3585,7 +3643,8 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  sealedEnv,
+		Plan:       acct.Plan, AccountID: acct.ID,
+		SealedEnv: sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >

@@ -139,7 +139,7 @@ As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-
 | `/auth/reset`, `/auth/reset/...`       | Password reset completion (issue #165 / PR #180)          | Auth flows                                       |
 | `/logout`, `/logout/`, `/logout/...`   | Session logout                                             | Auth flows                                       |
 | `/status`, `/status/`, `/status/...`   | Public status page (§12)                                   | Spec §12 panel surface                           |
-| `/healthz`                             | Loopback infra probe (CD health check)                     | Required by `deploy/digitalocean/bootstrap.sh` and `cd-digitalocean.yml` post-deploy smoke |
+| `/healthz`                             | Loopback infra probe (CD health check)                     | Required by `deploy/digitalocean/bootstrap.sh` (no longer in tree; canonical path was `deploy/controlplane/bootstrap.sh`, RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap` + `gregalectl manifest {validate,render}` + `gregalectl release install`) and `cd-digitalocean.yml` post-deploy smoke |
 | `/cli-auth`                            | Device-code approval page (§2.2)                           | CLI pairing                                      |
 | `/v1/apps/{slug}/logs`                 | Carve-out — `gatewayd-internal`'s own `AppLogsHandler` (issue #254 / Move 4 PR-2) | Customer log stream routed via gatewayd-internal→schedd  |
 
@@ -1031,6 +1031,8 @@ The §9.A payoff multiplies with each compute box added at M9. On a single-node 
 
 **Deploy-time signature enforcement (issue #472 / ADR-058):** for regulated workloads (healthcare / fintech / SOC 2 / ISO 27001 / PCI-DSS), "trust the developer's machine" is not an acceptable posture. The platform exposes a per-app `require_signed` flag (default false) plus a per-app trusted-publisher list. When an operator flips the flag on (admin scope + MFA, `PATCH /v1/apps/{slug}/security`), every OCI image deploy to that app must carry a valid cosign signature from a publisher in the list. The list lives at `/etc/faas/secrets/trusted-publishers/<signer_name>.pem` (mode 0444 per file, root:root); onboard via `gregale trusted-publishers add <slug> <name> <pub.pem>`. imaged verifies at deploy time (after `pg_notify` dispatch, before `PullDigest`); apid pre-flight gates reject the deploy with `403 deploy_signature_invalid` if the flag is on and the trust list is empty (operator-on / no-publishers footgun). Source-tarball deploys (Railpack path) bypass the gate by design — the tarball never asks the registry for a signature. Wire-shape parity with AWS Lambda's `CodeSigningConfig`.
 
+**Connection-aware execution host redaction (ADR-098 §11):** the `data_upstreams` + `data_upstream_probes` tables, the Prometheus metric labels, the pg_notify payload, and the schedd affinity map key all carry `host_redacted_hash` (64-hex `sha256(per-cluster-salt || plaintext-host)`) — the plaintext host NEVER leaves the apid handler. The salt is loaded from `/etc/faas/secrets/host_hash_salt` (32 raw bytes, 0o600 root:root) at boot; a missing or wrong-length salt file is a fatal boot-time error. The only permitted host-derived label on the metric surface is `host_redacted_hash`; a regression that introduces a `host` or `host_plaintext` label is tripwired by `pkg/data/quiescence_secret_rule_test.go` (C4) and the static-fail assertion in `cmd/e2e/connection_aware_e2e_test.go::TestConnectionAwareE2E_FlagsOn`. The env_values table itself stays plaintext (the user wrote the value; redacting it would break customer code that reads it back) — only the `data_upstreams` classifier-derived row is redacted.
+
 | Header | Value | Notes |
 |---|---|---|
 | `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | UAs ignore HSTS on plain HTTP per RFC 6797 §7.2 — cosmetic on dev plaintext listener. Disable via `FAAS_HSTS_ENABLED=false`. No `preload` until §11 policy review finalises. |
@@ -1043,6 +1045,17 @@ The §9.A payoff multiplies with each compute box added at M9. On a single-node 
 The CSP gate is `cmd/gatewayd-internal/proxy.go::isApidPath` for `gatewayd-internal` and an unconditional `func(*http.Request) bool { return true }` for apid (apid serves only dashboard + JSON). The platform never emits CSP on a customer-app response — those apps govern their own CSP.
 
 The inline `onclick="return confirm(…)"` in `pkg/dashboard/templates/account.html` was refactored to a per-page `<script nonce="…">` block using `addEventListener`. Browsers do not propagate `nonce` onto event-handler attributes, so leaving the inline handler in place would silently disable the delete-account confirm prompt the moment CSP ships.
+
+**Active-passive standby topology (ADR-083, accepted 2026-08-16):** every
+control-plane schedd cluster member carries a `StandbyState` gauge
+(`warming | warm | draining`) and the standby side redirects writes to the
+active leader. The redirection rate is exposed as
+`gatewayd_internal_write_redirect_total{outcome,auth_kind}` per ADR-083
+§"Open #2". Failure drill runbook at
+`docs/runbooks/active-passive-ha.md`; two-node Lima harness at
+`deploy/lima/faas-metal-2node-ha.yaml`. Probe timeout bounded by
+`HAFailoverProbeTimeoutMS = 500 ms` in `pkg/api/limits.go`; drain
+deadline bounded by `HADNSRecordStaleSeconds = 30`.
 
 ---
 
@@ -1076,6 +1089,9 @@ Prometheus (node_exporter + per-daemon `/metrics`) → self-hosted Grafana OSS o
 | `gateway_edge_rule_apply_total{kind,result}` rate | n/a (per-kind) | per-kind `result="error"` rate > 1 / min warn (runbook `FaasEdgeRuleApplyHigh.md`) |
 | `gateway_edge_rule_compile_error_total{kind}` rate | 0 | any non-zero page (runbook `FaasEdgeRuleCompileError.md`; ADR-091 Amendment 1: compile error = correctness signal, not headroom) |
 | `gateway_edge_rule_match_total{kind,outcome}` rate | n/a (per-kind) | per-kind `outcome="failed"` for kind=jwt > 5 / min warn (runbook `FaasEdgeRuleJWTFailures.md`; audit-grep `data.err` for `context deadline exceeded` separates timeout from verifier error; CORS preflight short-circuits IP+JWT gates — filter `method != "OPTIONS"` before counting) |
+| `meterd_data_upstream_rtt_ms_bucket{kind,region,le}` p95 | < 5 ms | > 200 ms page (runbook `FaasUpstreamRttDegraded.md`); info at < 5 ms (`FaasUpstreamRttHealthy`) — connection-aware placement health (ADR-098 §9.A) |
+| `meterd_data_upstream_probes_total{outcome}` rate | n/a (per-outcome) | `outcome="timeout"` / `outcome="refused"` > 5 % of `outcome="ok"` for 10 m warn (runbook `FaasUpstreamProbeHighFailureRate.md`); `outcome="tls_handshake"` > 0 page (cert validation is non-bypassable per ADR-098 §11) |
+| `meterd_data_upstream_probe_duration_seconds` p95 | < 0.5 s | > 1 s warn (runbook `FaasUpstreamProbeSlow.md`); interaction with `meterd_data_upstream_rtt_ms` — payload size of the TLS handshake is bounded by the customer's CA chain, not our control |
 
 The four `schedd_instance_*` gauges (ADR-036, issue #170) are the
 new per-`(app,node)` rolled-up surfaces — max CPU, sum RSS, sum
@@ -1086,6 +1102,16 @@ explicitly because per-instance Prometheus cardinality is
 unbounded under the §6.2 fan-out invariant. Future scale policy
 work (#171 reaper, #169 scale-up trigger) reads from the Reader
 directly, not from Prometheus.
+
+**Per-node wake-latency surfaces:** `gateway_wake_latency_seconds` is a
+single histogram (no `{node}` label). Adding `node` would blow
+cardinality under the §6.2 invariant and would not survive the 90 s
+two-node acceptance budget. Per-node wake attribution is achieved
+*via* `wake_id` `prometheus.Exemplar` (ADR-097 P1B) — operators join the
+histogram to `pkg/wire.OpsMetrics.WakeRPCDuration{phase,app}` and to the
+`events` table on `wake_id`. The `wake_locality_host_total` (ADR-028
+v1.1, line 793) already covers host-local vs. cross-node routing
+counts at a non-cardinality-blowing granularity.
 
 `gateway_request_duration_seconds{app,class}` (ADR-042, issue #273)
 is the per-app full-request-duration histogram exposed on the
@@ -1295,8 +1321,8 @@ Conventions for all milestones: Go ≥ 1.23; integration tests that need KVM are
 | **M6** | builderd + Railpack/Dockerfile in builder VMs | `faas deploy` a bare Node and Python repo (no config) → live; OOM bomb build kills only its VM (tenant latency unaffected — measured); cache makes 2nd build ≥ 2× faster |
 | **M7** | meterd + Stripe: usage, quotas, overage, dunning; functions runtime (runner-node22, runner-node24, runner-python312, runner-python313, runner-go124, runner-go124-alpine); cron | invoice shadow equals hand-computed GB-h for a scripted 24 h scenario (< 0.1 % delta); function hello-world p95 wake < 1 s; Free-tier hard stop verified; **egress metering (ADR-046):** scripted guest egress produces a `net_tx_bytes` row whose sum equals the kernel `vethHost.rx_bytes` delta within 0 bytes, `GET /v1/usage` reflects `tx_bytes` and `net_tx_bytes`, and `billing.Provider.PushUsageRecord` is **not** called for the new columns |
 | **M7.5** | Git-deploy + thin dashboard (see `ux_spec.md` §5, §4; ADR-011/012): `githubd`/module, GitHub App, OAuth + repo picker, apps/usage/billing dashboard | push to `main` auto-deploys via the normal pipeline; commit status written back; dashboard connect-repo → live URL end-to-end; least-privilege scopes verified |
-| **M8** | Hardening + ops: §11 checklist, backups + **timed restore drill**, status page, docs site, Gate-A runbook (2nd box active-passive); UX: cold-wake transparency surfaces (`ux_spec.md` §6), account export/delete (G6) | restore drill: PG + one app back serving on a clean VM < 30 min, documented as executed; security checklist signed off item-by-item; SLO dashboard live; first-time user reaches live URL < 5 min via CLI **and** GitHub connect |
-| **M9** | Multi-box scale (ADR-025 axis 3 + ADR-066): cross-node live-instance migration, `OCIRegistryStorageBackend` end-to-end (ADR-054), per-node schedd + per-node placement (PR #509, Tier A4), Tier A6 migrating-instance watchdog (ADR-067). Two-node Lima fleet target (`make metal-lima-2node`) exercises the full four-phase handoff end-to-end. ADR-066 flips `Proposed → Accepted`. | drain a node live (`UPDATE compute_nodes SET active=false`): within `MigrateLiveLeaseSeconds` (90s) + ~5s, every RUNNING instance lands on a live peer; `select node_id, state, migrated_from_node_id from instances` shows `state='running'` + `node_id` flipped; `schedd_live_migration_decisions_total{outcome="migrated"}` increments per successful handoff; `apps.migrated_at` stamped in the same transaction as `instances.migrated_at`; `make leakcheck` zero leaked netns/TAPs/cgroups; `make test-metal` exercises the full four-phase path against the §14 source-of-truth bare-metal x86_64 control-plane node |
+| **M8** | Hardening + ops: §11 checklist, backups + **timed restore drill**, status page, docs site, Gate-A runbook (2nd box active-passive; ADR-083 active-passive standby topology, accepted 2026-08-16); UX: cold-wake transparency surfaces (`ux_spec.md` §6), account export/delete (G6) | restore drill: PG + one app back serving on a clean VM < 30 min, documented as executed; security checklist signed off item-by-item; SLO dashboard live; first-time user reaches live URL < 5 min via CLI **and** GitHub connect |
+| **M9** | Multi-box scale (ADR-025 axis 3 + ADR-066): cross-node live-instance migration, `OCIRegistryStorageBackend` end-to-end (ADR-054), per-node schedd + per-node placement (PR #509, Tier A4), Tier A6 migrating-instance watchdog (ADR-067). Two-node Lima fleet target (`make metal-lima-2node`) exercises the full four-phase handoff end-to-end. ADR-066 flips `Proposed → Accepted`. ADR cross-refs: ADR-062 (per-node schedd, accepted 2026-08-16), ADR-063 (snapshot de-localization, accepted 2026-08-16), ADR-083 (active-passive standby, accepted 2026-08-16), ADR-110 (declarative split-box manifest, accepted 2026-08-16). | drain a node live (`UPDATE compute_nodes SET active=false`): within `MigrateLiveLeaseSeconds` (90s) + ~5s, every RUNNING instance lands on a live peer; `select node_id, state, migrated_from_node_id from instances` shows `state='running'` + `node_id` flipped; `schedd_live_migration_decisions_total{outcome="migrated"}` increments per successful handoff; `apps.migrated_at` stamped in the same transaction as `instances.migrated_at`; `make leakcheck` zero leaked netns/TAPs/cgroups; `make test-metal` exercises the full four-phase path against the §14 source-of-truth bare-metal x86_64 control-plane node |
 
 Post-M8 = private beta (founding doc roadmap M2–M3: hand-held first ten customers).
 

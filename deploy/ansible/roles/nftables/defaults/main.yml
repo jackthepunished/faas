@@ -9,12 +9,23 @@
 # eth0 + 10.100.0.0/16). A Hetzner compute node on a different NIC
 # name (e.g. `ens5`) overrides via `host_vars[<compute_node>].public_iface`
 # in the ansible inventory; the Jinja2 template at
-# `files/policy_nftables.conf.j2` substitutes these values site-for-
+# `templates/policy_nftables.conf.j2` substitutes these values site-for-
 # site. The Go render (`cmd/faas-nft-render` with the matching flags
 # or `FAAS_PUBLIC_IFACE` / `FAAS_MASQUERADE_CIDR` envs) is the
 # source of truth; `make egress-render-cross-check` byte-compares the
 # two for the default values.
+#
+# Mega-PR-C (issue #911 / ADR-110): overlay_cidrs +
+# masquerade_cidr_v6 wire-through. The Go renderer (pkg/netns)
+# accepts overlay_cidrs (slice) and masquerade_cidr_v6 (string) but
+# the Jinja2 template was missing both — so a multi-host fleet
+# using overlay / v6 ended up with the nftables ruleset missing
+# the overlay-cidr exclude + the v6 MASQUERADE. Default to empty
+# (single-box dev gets no overlay — the overlay role is responsible
+# for the per-host bridge).
 tenant_bridge: br-tenants
 bridge_cidr: 10.100.0.1/16
 public_iface: eth0
 masquerade_cidr: 10.100.0.0/16
+overlay_cidrs: []
+masquerade_cidr_v6: ''

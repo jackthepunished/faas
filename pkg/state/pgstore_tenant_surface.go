@@ -503,6 +503,24 @@ func (s *PgStore) DeleteTenantHostname(ctx context.Context, hostname string) err
 	return nil
 }
 
+// GetTenantHostnameByName — pgRouter.ResolveHost's tenant-surface
+// branch uses this to fail closed on hostname.Verified() == false.
+// Looked up by hostname alone (the citext column normalises the
+// caller-side lowercase); parent surface is reachable via
+// TenantSurfaceByHostname if the caller wants the row joined. The
+// lookup filters out deleted parent surfaces (status='deleted') so
+// a deleted surface never leaks a routable hostname — the soft
+// delete flips status, not the hostname row.
+func (s *PgStore) GetTenantHostnameByName(ctx context.Context, hostname string) (TenantHostname, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+tenantHostnameCols+` from tenant_hostnames h
+		    join tenant_surfaces s on s.id = h.surface_id
+		  where h.hostname = $1
+		    and s.status <> 'deleted'`,
+		hostname)
+	return scanTenantHostname(row)
+}
+
 // Compile-time guard. Add the tenant_surfaces CHECK constraints to
 // mapErr's named-mapping so apid-validate-time errors surface as
 // ErrInvalidArgument instead of bubbling the raw SQLSTATE. The

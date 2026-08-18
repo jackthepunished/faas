@@ -181,7 +181,9 @@ and the alert is silently skipped.
 - `deploy/ansible/site.yml` —
   MODIFY: load `group_vars/box/hetzner.yml`.
 - `deploy/controlplane/sealed.env.example` —
-  MODIFY: document `HETZNER_STORAGE_BOX_*` vars.
+  MODIFY: document `HETZNER_STORAGE_BOX_*` vars
+  (RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+  `gregalectl secrets init`).
 - `deploy/scripts/pg-restore-verify.sh` +
   `deploy/scripts/pg-restore-verify_test.sh` —
   NEW: T-7 throwaway verify + bash lint.

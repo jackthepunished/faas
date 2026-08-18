@@ -1,0 +1,13 @@
+[Service]
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to imaged so cmd/imaged/main.go::LoadConfig picks the
+# right role.FromConfig sentinel (FAAS_IMAGED_ROLE). Without
+# this drop-in imaged falls back to RoleSingleBox on the
+# compute-only box and the cosign sign-keypair path assumes
+# single-box assumptions (no per-box PKI subset).
+#
+# The drop-in wins over the unit's [Service] section
+# (systemd.unit(5) "later wins") and the unit has no
+# Environment= line on FAAS_IMAGED_ROLE, so the drop-in is the
+# only source of the env var. Idempotent.
+Environment=FAAS_IMAGED_ROLE={{ faas_box_role }}

@@ -4,12 +4,16 @@
 // Issue #911 invokes the failure mode where render-time keys landed
 // in the wrong TOML table (the operator reports `schedd_client_*`
 // inside `[compute_node]`; the actual on-disk bug is the duplicate
-// `tls_*_path` inside `[compute_node]` at
-// deploy/etc/vmmd.toml.example:96-103). Both shapes share the same
-// root cause: the renderer treats the wrong key as belonging to the
-// wrong table, and the TOML default-coercion paths silently fall
-// back to a no-op. The bug ships, the daemon refuses to start, and
-// the operator debugs at 02:00.
+// `tls_*_path` inside `[compute_node]` at the vmmd.toml.example
+// canonical copy under deploy/ansible/roles/vmmd_service/files/,
+// lines 33-40 — the top-level tls_*_path cluster). Both shapes share
+// the same root cause: the renderer
+// treats the wrong key as belonging to the wrong table, and the
+// TOML default-coercion paths silently fall back to a no-op.
+// Both shapes share the same root cause: the renderer treats the
+// wrong key as belonging to the wrong table, and the TOML default-
+// coercion paths silently fall back to a no-op. The bug ships, the
+// daemon refuses to start, and the operator debugs at 02:00.
 //
 // The fix is a structural check that runs during
 // `gregale manifest validate` and refuses any manifest whose daemon
@@ -33,7 +37,7 @@ import (
 	"strings"
 )
 
-// tableKey describes which TOML table a key belongs to, and whether
+// TableKey describes which TOML table a key belongs to, and whether
 // it is daemon-private (the daemon that produces the TOML owns the
 // key) or daemon-public (a remote daemon's identity lives on it).
 //
@@ -41,7 +45,7 @@ import (
 // `Scope` is "private" (vmmd-owned) or "public" (a remote daemon's
 // CN/SAN/data). The validator rejects a manifest whose declared
 // `tls` material's Owner doesn't match the table's expected owner.
-type tableKey struct {
+type TableKey struct {
 	// Table is the TOML table name (e.g. "compute_node"). Empty
 	// string means top-level (no `[...]` section).
 	Table string
@@ -59,7 +63,7 @@ type tableKey struct {
 
 // String renders the key as a TOML path for error messages
 // ("compute_node.tls_cert_path").
-func (k tableKey) String() string {
+func (k TableKey) String() string {
 	if k.Table == "" {
 		return k.Key
 	}
@@ -81,7 +85,10 @@ type HostBlock struct {
 	PrivateKeys []string
 	// ComputeNodeBlock is the [compute_node] table this daemon
 	// populates (the vmmd self-registration seam at
-	// deploy/etc/vmmd.toml.example:52-103). The `publicKeys` are
+	// deploy/ansible/roles/vmmd_service/files/vmmd.toml.example:
+	// 52-103 — the only canonical location; the legacy
+	// deploy/etc/vmmd.toml.example was git rm'd in PR-1 Phase 2).
+	// The `publicKeys` are
 	// keys that BELONG to this daemon's ComputeNode table — they
 	// are the remote-daemon identities the renderer writes to
 	// make the self-registration leg talk cross-box.
@@ -91,7 +98,7 @@ type HostBlock struct {
 	// (public), and vice versa. The descriptor below forces the
 	// renderer to consult the same descriptor the validator
 	// checks, so the two cannot drift.
-	ComputeNodeBlock []tableKey
+	ComputeNodeBlock []TableKey
 }
 
 // HostKeys is the per-daemon TOML key catalog. Use by the validator
@@ -100,7 +107,7 @@ type HostBlock struct {
 // at `gregale manifest validate` time, not at 02:00.
 //
 // The catalog covers every daemon the manifest schema knows about
-// (the daemons.go map at line 130 has the source-of-truth list).
+// (the Daemons struct at manifest.go has the source-of-truth list).
 // Adding a new daemon requires (a) a row in the manifest schema's
 // `daemons:` map, (b) a row in this catalog, (c) a test in
 // manifest_test.go pinning the catalog's invariant.
@@ -125,7 +132,7 @@ var HostKeys = map[string]HostBlock{
 			"tls_key_path",
 			"tls_ca_path",
 		},
-		ComputeNodeBlock: []tableKey{
+		ComputeNodeBlock: []TableKey{
 			// Self-registration identity — the vmmd box tells
 			// schedd who it is. These are the `[compute_node]`
 			// keys and they DO NOT belong at top level.
@@ -136,6 +143,19 @@ var HostKeys = map[string]HostBlock{
 			{Table: "compute_node", Key: "mem_mb", Owner: "vmmd", Scope: "public"},
 			{Table: "compute_node", Key: "max_concurrency", Owner: "vmmd", Scope: "public"},
 			{Table: "compute_node", Key: "admission_ceiling_mb", Owner: "vmmd", Scope: "public"},
+			// PR scale-out tier-1 residual (Gaps #3 + #5):
+			// per-host bridge CIDR override, per-host overlay
+			// CIDR override, and the NIC pin used by the
+			// overlay-IP auto-detector. All three flow from
+			// `daemons.vmmd.compute_node` in the manifest schema
+			// into the renderer's [compute_node] table; the
+			// catalog entry is what tells ValidateTOMLPlacement
+			// they belong here (and not at top level alongside
+			// the legacy `tls_*_path` cluster — which would be
+			// the bug class ADR-028 caught).
+			{Table: "compute_node", Key: "host_bridge_cidr", Owner: "vmmd", Scope: "public"},
+			{Table: "compute_node", Key: "overlay_cidr", Owner: "vmmd", Scope: "public"},
+			{Table: "compute_node", Key: "overlay_interface", Owner: "vmmd", Scope: "public"},
 		},
 	},
 	"schedd": {
@@ -229,7 +249,10 @@ var HostKeys = map[string]HostBlock{
 // The slice is sorted for stable error messages.
 var TombstoneKeys = []string{
 	// vmmd's [compute_node] must NOT re-declare the top-level
-	// cluster (the bug at deploy/etc/vmmd.toml.example:96-103).
+	// cluster. Canonical tls_*_path lives at the top of
+	// deploy/ansible/roles/vmmd_service/files/vmmd.toml.example
+	// (lines 33-40 — tls_cert_path / tls_key_path / tls_ca_path
+	// group, server-mTLS cluster).
 	"compute_node.tls_cert_path",
 	"compute_node.tls_key_path",
 	"compute_node.tls_ca_path",
@@ -303,7 +326,11 @@ func ValidateTOMLPlacement(daemon string, rendered map[string]string) Errors {
 		for _, ck := range host.ComputeNodeBlock {
 			if ck.Key == leaf && table != ck.Table {
 				errs = append(errs, Error{
-					fmt.Sprintf("daemons.%s.cn_block_key_at_top.level", daemon),
+					// Error code is a path token, not a dotted path
+					// (the typo `top.level` here once matched
+					// against a future alert's grep-regex, now fixed
+					// to the underscore form).
+					fmt.Sprintf("daemons.%s.cn_block_key_at_top_level", daemon),
 					fmt.Sprintf("key %q belongs under [%s] but rendered at top level", leaf, ck.Table),
 				})
 			}

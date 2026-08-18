@@ -27,6 +27,26 @@ daemon forwards plaintext requests to `gatewayd-internal` over
   `http://127.0.0.1:8080` (Caddy is provisioned by the operator or
   by a separate role; see `docs/ops/gatewayd-caddy-upstream.md`).
 
+## Drop-ins
+
+- `99-faas-node-name.conf.j2` (linked from `_shared/`) — exposes this box's
+  compute_node identity to gatewayd-public (env-only — no `config.go`).
+- `99-faas-role.conf.j2` — wires the per-box role gate through to
+  gatewayd-public via `FAAS_GATEWAYD_PUBLIC_ROLE` so
+  `cmd/gatewayd-public/config.go::LoadConfig` picks the right
+  `role.FromConfig` sentinel. Without this drop-in gatewayd-public falls
+  back to `RoleSingleBox` on a multi-host fleet and the per-daemon role
+  gate is unenforced.
+
+## Note on the public edge
+
+gatewayd-public is the ONLY public listener on a node (Tier A7 split,
+ADR-070). Cross-node HA is achieved by having N nodes each with one
+gatewayd-public in front of their local gatewayd-internal set — NOT by
+having multiple public listeners on one node. The role's per-box role
+drop-in is what makes the multi-host handshake layer know which box it
+sits on.
+
 ## See also
 
 - `docs/adr/068-tier-a7-edge-split.md`

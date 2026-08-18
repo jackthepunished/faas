@@ -30,20 +30,27 @@ func NewPGNodeLoader(pool *pgxpool.Pool) NodeLoader {
 	return pgNodeLoader{pool: pool}
 }
 
-// LoadNodes returns (name, id) tuples for every active compute_nodes
-// row. The CN lookup key is `name` (the operator-assigned friendly
-// label, e.g. "vmmd" or "schedd"), per ADR-056 §Locked decisions —
-// leaf-CN binds to compute_nodes.name, not compute_nodes.id.
+// LoadNodes returns (name, id, cert_fingerprint) tuples for every
+// active compute_nodes row. The CN lookup key is `name` (the
+// operator-assigned friendly label, e.g. "vmmd" or "schedd"), per
+// ADR-056 §Locked decisions — leaf-CN binds to compute_nodes.name,
+// not compute_nodes.id.
 //
 // `active = true` mirrors the gateway's PGBackend.targets filter
 // (cmd/gatewayd-internal/pgbackend.go); inactive rows are not eligible for
 // handshake binding.
+//
+// PR-3 widening: cert_fingerprint (added in migration 00271 by
+// PR-3a) is loaded alongside name+id. Empty values (NULL
+// fingerprint on pre-PR-X boxes) are returned as "" —
+// CertFingerprintByCN surfaces this as ErrCertFingerprintNotRegistered
+// so the doctor (PR-4) can flag it.
 func (l pgNodeLoader) LoadNodes(ctx context.Context) ([]NodeRow, error) {
 	if l.pool == nil {
 		return nil, fmt.Errorf("wire: pgNodeLoader has nil pool")
 	}
 	const q = `
-		select name, id::text
+		select name, id::text, cert_fingerprint
 		  from compute_nodes
 		 where active = true
 	`
@@ -56,8 +63,12 @@ func (l pgNodeLoader) LoadNodes(ctx context.Context) ([]NodeRow, error) {
 	var out []NodeRow
 	for rows.Next() {
 		var r NodeRow
-		if err := rows.Scan(&r.CN, &r.ID); err != nil {
+		var fingerprint *string
+		if err := rows.Scan(&r.CN, &r.ID, &fingerprint); err != nil {
 			return nil, fmt.Errorf("wire: scan compute_nodes row: %w", err)
+		}
+		if fingerprint != nil {
+			r.CertFingerprint = *fingerprint
 		}
 		out = append(out, r)
 	}

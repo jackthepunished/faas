@@ -250,8 +250,21 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/webhooks/{id}/rotate-secret":          "RotateAppWebhookSecret",
 	"GET /v1/apps/{slug}/webhooks/{id}/deliveries":              "ListAppWebhookDeliveries",
 	"POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry": "RetryAppWebhookDelivery",
-	"GET /v1/keys":  "ListKeys",
-	"POST /v1/keys": "CreateKey",
+
+	// ADR-098 §9.A — connection-aware data upstreams (PR-B hand-off).
+	// The auto-derivation would produce Swagger-style names
+	// ("GetAppsSlugUpstreams", "GetAppsSlugUpstreamsId", etc.) because
+	// the path uses the literal "upstreams" segment; the SDK names the
+	// methods after the resource noun (DataUpstream) — same convention
+	// as alerts/edge-rules/webhooks above. The PUT route is the
+	// upsert/create verb (the spec writes a single row per (kind, host,
+	// port) tuple, with the response carrying the persisted id).
+	"GET /v1/apps/{slug}/upstreams":         "ListAppDataUpstreams",
+	"GET /v1/apps/{slug}/upstreams/{id}":    "GetAppDataUpstream",
+	"PUT /v1/apps/{slug}/upstreams":         "CreateAppDataUpstream",
+	"DELETE /v1/apps/{slug}/upstreams/{id}": "DeleteAppDataUpstream",
+	"GET /v1/keys":                          "ListKeys",
+	"POST /v1/keys":                         "CreateKey",
 	// Move 2 routes — the auto-derivation produces names with literal
 	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
 	// the k8s-style hyphen; the explicit map below drops the hyphen and

@@ -3,21 +3,27 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"golang.org/x/sys/unix"
 )
 
 // Guest device layout (spec §4.6): drive0 (vda) is the shared read-only base and
@@ -28,6 +34,7 @@ const (
 	layerDevice = "/dev/vdb"
 	layerMount  = "/overlay"
 	newRoot     = "/overlay/merged"
+	builderPATH = "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
 // bootMode is which branch of the build (BuildManifest present) vs app
@@ -58,6 +65,20 @@ func boot() error {
 	}
 	if err := pivotInto(newRoot); err != nil {
 		return fmt.Errorf("pivot_root: %w", err)
+	}
+	mode, buildManifest, err := decideMode(os.DirFS("/"))
+	if err != nil {
+		return err
+	}
+	// Builder VMs run BuildKit/runc as their only workload. The daemon needs a
+	// cgroup mount, but its runc workers enter a user namespace so they do not
+	// require host-level device-BPF policy support. App VMs still mount cgroup2
+	// below and retain the per-workload partition.
+	if mode == modeBuild {
+		if err := mountCgroup2(); err != nil {
+			return writeAndPoweroff(buildManifest, fmt.Errorf("builder cgroup2 mount: %w", err), "")
+		}
+		return runBuild(buildManifest)
 	}
 
 	// Issue #463 / ADR-069 / PR-B AC #4: mount cgroup2
@@ -148,14 +169,6 @@ func boot() error {
 	sidecarProxy, sidecarErr := startSidecarEventsProxy(slog.Default())
 	if sidecarErr != nil {
 		slog.Default().Warn("sidecar events proxy unavailable", "err", sidecarErr)
-	}
-
-	mode, buildManifest, err := decideMode(os.DirFS("/"))
-	if err != nil {
-		return err
-	}
-	if mode == modeBuild {
-		return runBuild(buildManifest)
 	}
 
 	//nolint:forbidigo // api.AppManifestPath is a compile-time constant defined in pkg/api (/etc/faas/app.json) — the manifest is written into the guest's rootfs by the builder before boot, the customer never writes it. Inside the microVM, the path is not customer-spoofable.
@@ -379,15 +392,186 @@ func runBuild(m api.BuildManifest) error {
 	if err := os.MkdirAll(m.OutDir, 0o755); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("mkdir outdir: %w", err), "")
 	}
-
-	// 1. Extract source tarball.
-	if m.SourceTarPath != "" {
-		if out, err := exec.Command("tar", "-xaf", m.SourceTarPath, "-C", m.Workdir).CombinedOutput(); err != nil {
-			return writeAndPoweroff(m, fmt.Errorf("tar extract: %w (%s)", err, out), "")
+	if err := seedBuildEntropy(); err != nil {
+		return writeAndPoweroff(m, err, "")
+	}
+	isDockerfile := m.Framework == api.FrameworkDockerfile
+	if !isDockerfile {
+		if err := os.MkdirAll(filepath.Join(m.OutDir, "rootfs"), 0o755); err != nil {
+			return writeAndPoweroff(m, fmt.Errorf("mkdir railpack rootfs: %w", err), "")
 		}
 	}
 
-	// 2. Pick the build command.
+	// 1. Extract source tarball. guest-init has no login-shell PATH.
+	if m.SourceTarPath != "" {
+		if out, err := exec.Command("/bin/tar", "-xaf", m.SourceTarPath, "-C", m.Workdir).CombinedOutput(); err != nil {
+			return writeAndPoweroff(m, fmt.Errorf("tar extract: %w (%s)", err, out), "")
+		}
+		if err := flattenSingleSourceDir(m.Workdir); err != nil {
+			return writeAndPoweroff(m, fmt.Errorf("normalize source root: %w", err), "")
+		}
+	}
+
+	// 2. Start BuildKit inside the builder VM. Railpack is a BuildKit
+	// frontend, as is the Dockerfile path, so both build modes need the
+	// daemon. The VM is already the isolation boundary; keep the executor in
+	// the guest's network namespace because the minimal image has no CNI setup.
+	if err := os.MkdirAll("/run/buildkit", 0o755); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("mkdir buildkit run dir: %w", err), "")
+	}
+	if err := ensureFuseDevice(); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("fuse device: %w", err), "")
+	}
+	// Railpack resolves language toolchains and package registries from inside
+	// the builder VM. Fail fast when the guest's DNS path is broken instead of
+	// spending the whole build budget in a registry client retry loop.
+	dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	dnsCheck := exec.CommandContext(dnsCtx, "/usr/bin/getent", "hosts", "registry.npmjs.org")
+	dnsOut, dnsErr := dnsCheck.CombinedOutput()
+	dnsCancel()
+	if dnsErr != nil {
+		return writeAndPoweroff(m, fmt.Errorf("registry DNS preflight: %w", dnsErr), string(dnsOut))
+	}
+	if m.Framework == api.FrameworkRailpackNode || m.Framework == api.FrameworkAuto {
+		httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		req, reqErr := http.NewRequestWithContext(httpCtx, http.MethodGet, "https://nodejs.org/dist/index.json", nil)
+		var httpErr error
+		if reqErr == nil {
+			resp, doErr := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+			if doErr != nil {
+				httpErr = doErr
+			} else {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode >= http.StatusBadRequest {
+					httpErr = fmt.Errorf("status %s", resp.Status)
+				}
+			}
+		} else {
+			httpErr = reqErr
+		}
+		httpCancel()
+		if httpErr != nil {
+			return writeAndPoweroff(m, fmt.Errorf("node toolchain HTTPS preflight: %w", httpErr), "")
+		}
+	}
+	// Railpack's generated plan pulls its builder/runtime layers from GHCR;
+	// a registry challenge is healthy here and proves the guest can reach the
+	// endpoint that BuildKit will subsequently authenticate against.
+	ghcrCtx, ghcrCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ghcrReq, ghcrReqErr := http.NewRequestWithContext(ghcrCtx, http.MethodGet, "https://ghcr.io/v2/", nil)
+	var ghcrErr error
+	if ghcrReqErr == nil {
+		resp, doErr := (&http.Client{Timeout: 5 * time.Second}).Do(ghcrReq)
+		if doErr != nil {
+			ghcrErr = doErr
+		} else {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode >= http.StatusInternalServerError {
+				ghcrErr = fmt.Errorf("status %s", resp.Status)
+			}
+		}
+	} else {
+		ghcrErr = ghcrReqErr
+	}
+	ghcrCancel()
+	if ghcrErr != nil {
+		return writeAndPoweroff(m, fmt.Errorf("GHCR HTTPS preflight: %w", ghcrErr), "")
+	}
+	runcCheck := exec.Command("/usr/local/bin/runc", "--version")
+	runcCheck.Env = builderEnv()
+	if runcOut, runcErr := runcCheck.CombinedOutput(); runcErr != nil {
+		return writeAndPoweroff(m, fmt.Errorf("runc preflight: %w (%s)", runcErr, runcOut), string(runcOut))
+	}
+	if err := os.MkdirAll("/run/runc", 0o755); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("runc root: %w", err), "")
+	}
+	runcList := exec.Command("/usr/local/bin/runc", "--root", "/run/runc", "list")
+	runcList.Env = builderEnv()
+	if runcOut, runcErr := runcList.CombinedOutput(); runcErr != nil {
+		return writeAndPoweroff(m, fmt.Errorf("runc list preflight: %w (%s)", runcErr, runcOut), string(runcOut))
+	}
+
+	var buildkitLog bytes.Buffer
+	bk := exec.Command(
+		"/usr/bin/unshare",
+		"--user",
+		"--map-root-user",
+		"--map-users=auto",
+		"--map-groups=auto",
+		"--mount",
+		"--fork",
+		"/usr/local/bin/buildkitd",
+		"--debug",
+		"--rootless",
+		"--root", "/build/.buildkit",
+		"--addr", "unix:///run/buildkit/buildkitd.sock",
+		"--oci-worker-binary", "/usr/local/bin/runc",
+		// The builder drive is deliberately 24 GiB so rootless native snapshots
+		// can export Railpack's local rootfs without the extremely slow FUSE
+		// directory-copy path.
+		"--oci-worker-snapshotter", "native",
+		"--oci-worker-net", "host",
+	)
+	// Keep the daemon and its rootless worker tree in a private process group so
+	// the timeout path can terminate BuildKit descendants before powering off.
+	bk.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	bk.Env = builderEnv()
+	bk.Stdout = &buildkitLog
+	bk.Stderr = &buildkitLog
+	if err := bk.Start(); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("start buildkitd: %w", err), tailOf(buildkitLog.Bytes(), m.LogTailBytes))
+	}
+	defer func() {
+		if bk.Process == nil {
+			return
+		}
+		_ = syscall.Kill(-bk.Process.Pid, syscall.SIGKILL)
+		_ = bk.Process.Kill()
+	}()
+	for i := 0; i < 25; i++ {
+		if _, err := os.Stat("/run/buildkit/buildkitd.sock"); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if _, err := os.Stat("/run/buildkit/buildkitd.sock"); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("buildkitd socket never appeared: %w", err), tailOf(buildkitLog.Bytes(), m.LogTailBytes))
+	}
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	check := exec.CommandContext(checkCtx, "/usr/local/bin/buildctl", "debug", "workers")
+	check.Env = builderEnv("BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock")
+	workerOut, workerErr := check.CombinedOutput()
+	checkCancel()
+	if workerErr != nil {
+		diagnostic := append(append([]byte(nil), buildkitLog.Bytes()...), []byte(workerErr.Error()+"\n")...)
+		diagnostic = append(diagnostic, workerOut...)
+		// A worker can fail after the socket is created but before the gRPC
+		// readiness call observes it. Wait briefly so BuildKit's fatal exit
+		// status is included in the build marker instead of reporting only
+		// the client-side closed-socket error.
+		_ = bk.Process.Signal(syscall.SIGQUIT)
+		waitCh := make(chan error, 1)
+		go func() { waitCh <- bk.Wait() }()
+		select {
+		case waitErr := <-waitCh:
+			time.Sleep(100 * time.Millisecond)
+			diagnostic = append(diagnostic, buildkitLog.Bytes()...)
+			diagnostic = append(diagnostic, []byte(fmt.Sprintf("buildkitd exit: %v\n", waitErr))...)
+		case <-time.After(2 * time.Second):
+			_ = bk.Process.Kill()
+			select {
+			case waitErr := <-waitCh:
+				diagnostic = append(diagnostic, []byte(fmt.Sprintf("buildkitd exit after kill: %v\n", waitErr))...)
+			case <-time.After(1 * time.Second):
+				diagnostic = append(diagnostic, []byte("buildkitd exit: wait timeout\n")...)
+			}
+		}
+		return writeAndPoweroff(m, fmt.Errorf("buildkitd readiness: %w (%s)", workerErr, workerOut), tailOf(diagnostic, m.LogTailBytes))
+	}
+
+	// 3. Pick the build command.
 	argv := buildArgv(m)
 
 	// 3. Run with a wall-clock timeout (we already get OOM protection from
@@ -399,42 +583,382 @@ func runBuild(m api.BuildManifest) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	// Railpack/buildctl can leave descendants holding stdout/stderr or FUSE
+	// mounts after the context deadline. Kill the whole build process group and
+	// bound the wait so writeAndPoweroff always runs even if a descendant is
+	// stuck in an uninterruptible FUSE wait.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = m.Workdir
+	// Railpack is a BuildKit frontend too; both it and buildctl need the
+	// daemon address in their environment. Keeping this unconditional avoids
+	// the misleading success path where Railpack detects the app and only
+	// fails once it starts its install step.
+	cmd.Env = builderEnv("BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock")
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	err := cmd.Run()
-
+	if err := cmd.Start(); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("start build command: %w", err), "")
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	var err error
+	select {
+	case err = <-waitCh:
+	case <-ctx.Done():
+		killProcessGroup(cmd)
+		select {
+		case <-waitCh:
+		case <-time.After(2 * time.Second):
+		}
+		// Use exit 124 for the durable build marker even when the stuck
+		// descendant prevents exec.Cmd.Wait from returning.
+		err = context.DeadlineExceeded
+	}
 	return writeAndPoweroff(m, err, tailOf(buf.Bytes(), m.LogTailBytes))
 }
 
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		_ = cmd.Process.Kill()
+	}
+}
+
+// ensureFuseDevice creates the standard FUSE character device when devtmpfs
+// did not populate it. Firecracker does not emulate a PCI device for FUSE;
+// the guest kernel provides the driver directly, so this node is sufficient
+// when CONFIG_FUSE_FS is enabled. If the kernel lacks FUSE, return the exact
+// device error and let the build marker classify it instead of hiding the
+// rootless snapshotter failure.
+func ensureFuseDevice() error {
+	const fusePath = "/dev/fuse"
+	if _, err := os.Stat(fusePath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := syscall.Mknod(fusePath, syscall.S_IFCHR|0o600, int(unix.Mkdev(10, 229))); err != nil {
+		return err
+	}
+	return nil
+}
+
+// flattenSingleSourceDir normalizes the common archive shape produced by the
+// CLI, where every source entry is under one directory (for example
+// hello-node/package.json). The host detector accepts that shape as the
+// project root, so the guest must expose the same view to Railpack after
+// extraction. Archives that already contain root files are left unchanged.
+func flattenSingleSourceDir(workdir string) error {
+	entries, err := os.ReadDir(workdir)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 1 || !entries[0].IsDir() {
+		return nil
+	}
+	root := filepath.Join(workdir, entries[0].Name())
+	children, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		if err := os.Rename(filepath.Join(root, child.Name()), filepath.Join(workdir, child.Name())); err != nil {
+			return fmt.Errorf("move %s: %w", child.Name(), err)
+		}
+	}
+	if err := os.Remove(root); err != nil {
+		return fmt.Errorf("remove archive root: %w", err)
+	}
+	return nil
+}
+
+// seedBuildEntropy injects a fresh seed staged by builderd into the guest
+// kernel's entropy pool before BuildKit starts. BuildKit generates an RSA
+// proxy CA during startup; without this step a cold Firecracker guest can
+// block indefinitely in crypto/rand/getrandom despite having virtio-rng
+// attached.
+func seedBuildEntropy() error {
+	seed, err := os.ReadFile(api.BuildEntropyPath)
+	if err != nil {
+		return fmt.Errorf("read build entropy seed: %w", err)
+	}
+	if err := addHostEntropy(seed); err != nil {
+		return fmt.Errorf("seed build entropy: %w", err)
+	}
+	if err := os.Remove(api.BuildEntropyPath); err != nil {
+		return fmt.Errorf("remove build entropy seed: %w", err)
+	}
+	return nil
+}
+
 // buildArgv constructs the build-engine argv for one BuildManifest. The
-// Dockerfile framework uses buildctl; everything else is Railpack with an
-// explicit --plan. Extracted from runBuild so the table-driven
-// TestBuildArgv can pin the wire shape without spinning up a builder VM.
+// Dockerfile framework uses buildctl directly. Railpack first prepares its
+// BuildKit plan, then the Railpack frontend is invoked with buildctl and an
+// OCI exporter. Keeping the exporter in BuildKit avoids Railpack's local
+// filesystem exporter, which copies a complete runtime tree into a directory
+// before builderd can consume it.
+//
+// Extracted from runBuild so the table-driven TestBuildArgv can pin the wire
+// shape without spinning up a builder VM.
 func buildArgv(m api.BuildManifest) []string {
 	switch m.Framework {
 	case api.FrameworkDockerfile:
 		return []string{
-			"buildctl", "build",
+			"/usr/local/bin/buildctl", "build",
 			"--frontend", "dockerfile",
 			"--local", "context=" + m.Workdir,
 			"--local", "dockerfile=" + m.Workdir,
 			"--output", "type=oci,dest=" + m.OutDir + "/image.tar",
 		}
 	}
-	// railpack with --plan auto|node|python|go
-	plan := "auto"
-	switch m.Framework {
-	case api.FrameworkRailpackNode:
-		plan = "node"
-	case api.FrameworkRailpackPython:
-		plan = "python"
-	case api.FrameworkRailpackGo:
-		plan = "go"
+	planDir := filepath.Dir(m.OutDir)
+	planPath := filepath.Join(planDir, "railpack-plan.json")
+	infoPath := filepath.Join(planDir, "railpack-info.json")
+	prepare := strings.Join([]string{
+		"/usr/local/bin/railpack", "prepare", shellQuote(m.Workdir),
+		"--plan-out", shellQuote(planPath),
+		"--info-out", shellQuote(infoPath),
+		"--hide-pretty-plan",
+	}, " ")
+	build := strings.Join([]string{
+		"/usr/local/bin/buildctl", "build",
+		"--frontend", "gateway.v0",
+		"--opt", "source=ghcr.io/railwayapp/railpack-frontend:latest",
+		"--opt", "filename=railpack-plan.json",
+		"--local", "context=" + shellQuote(m.Workdir),
+		"--local", "dockerfile=" + shellQuote(planDir),
+		"--output", "type=oci,dest=" + shellQuote(filepath.Join(m.OutDir, "image.tar")),
+		"--progress", "plain",
+	}, " ")
+	return []string{"/bin/sh", "-c", prepare + " && exec " + build}
+}
+
+// shellQuote quotes a path embedded in the small prepare/build command above.
+// The paths are platform-generated today, but keeping this boundary explicit
+// prevents a future manifest field from becoming shell syntax accidentally.
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func builderEnv(extra ...string) []string {
+	env := make([]string, 0, len(os.Environ())+len(extra)+1)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "PATH=") {
+			continue
+		}
+		env = append(env, entry)
 	}
-	return []string{"railpack", "build", m.OutDir, "--plan", plan}
+	env = append(env, "PATH="+builderPATH)
+	return append(env, extra...)
+}
+
+// packageRailpackOCI converts Railpack's local rootfs exporter into the OCI
+// image-layout tarball consumed by builderd/imaged. Railpack intentionally
+// exports a directory, while the rest of the platform contract is an OCI
+// layout archive at /build/out/image.tar.
+//
+//nolint:unused // retained as a fallback for older Railpack exporters.
+func packageRailpackOCI(rootfsDir, imagePath string) error {
+	layerFile, err := os.CreateTemp(filepath.Dir(imagePath), ".railpack-layer-*.tar")
+	if err != nil {
+		return fmt.Errorf("create railpack layer: %w", err)
+	}
+	layerPath := layerFile.Name()
+	defer func() {
+		_ = layerFile.Close()
+		_ = os.Remove(layerPath)
+	}()
+
+	hash := sha256.New()
+	tw := tar.NewWriter(io.MultiWriter(layerFile, hash))
+	if err := filepath.Walk(rootfsDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == rootfsDir {
+			return nil
+		}
+		rel, err := filepath.Rel(rootfsDir, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		var linkName string
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkName, err = os.Readlink(path)
+			if err != nil {
+				return err
+			}
+		}
+		header, err := tar.FileInfoHeader(info, linkName)
+		if err != nil {
+			return err
+		}
+		header.Name = rel
+		header.ModTime = time.Unix(0, 0)
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		in, err := os.Open(path) //nolint:forbidigo // path is inside the guest build workspace.
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(tw, in)
+		closeErr := in.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}); err != nil {
+		_ = tw.Close()
+		return fmt.Errorf("walk railpack rootfs: %w", err)
+	}
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("close railpack layer: %w", err)
+	}
+	if err := layerFile.Sync(); err != nil {
+		return fmt.Errorf("sync railpack layer: %w", err)
+	}
+	if err := layerFile.Close(); err != nil {
+		return fmt.Errorf("close railpack layer file: %w", err)
+	}
+	layerInfo, err := os.Stat(layerPath)
+	if err != nil {
+		return fmt.Errorf("stat railpack layer: %w", err)
+	}
+	layerDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+
+	config := struct {
+		Architecture string   `json:"architecture"`
+		OS           string   `json:"os"`
+		Config       struct{} `json:"config"`
+		RootFS       struct {
+			Type    string   `json:"type"`
+			DiffIDs []string `json:"diff_ids"`
+		} `json:"rootfs"`
+	}{Architecture: "amd64", OS: "linux"}
+	config.RootFS.Type = "layers"
+	config.RootFS.DiffIDs = []string{layerDigest}
+	configBytes, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal railpack config: %w", err)
+	}
+	configDigest := digestBytes(configBytes)
+	configName := "blobs/sha256/" + strings.TrimPrefix(configDigest, "sha256:")
+
+	manifest := struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		MediaType     string `json:"mediaType"`
+		Config        struct {
+			MediaType string `json:"mediaType"`
+			Digest    string `json:"digest"`
+			Size      int64  `json:"size"`
+		} `json:"config"`
+		Layers []struct {
+			MediaType string `json:"mediaType"`
+			Digest    string `json:"digest"`
+			Size      int64  `json:"size"`
+		} `json:"layers"`
+	}{SchemaVersion: 2, MediaType: "application/vnd.oci.image.manifest.v1+json"}
+	manifest.Config.MediaType = "application/vnd.oci.image.config.v1+json"
+	manifest.Config.Digest = configDigest
+	manifest.Config.Size = int64(len(configBytes))
+	manifest.Layers = append(manifest.Layers, struct {
+		MediaType string `json:"mediaType"`
+		Digest    string `json:"digest"`
+		Size      int64  `json:"size"`
+	}{MediaType: "application/vnd.oci.image.layer.v1.tar", Digest: layerDigest, Size: layerInfo.Size()})
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("marshal railpack manifest: %w", err)
+	}
+	manifestDigest := digestBytes(manifestBytes)
+	manifestName := "blobs/sha256/" + strings.TrimPrefix(manifestDigest, "sha256:")
+	indexBytes, err := json.Marshal(struct {
+		SchemaVersion int `json:"schemaVersion"`
+		Manifests     []struct {
+			MediaType string `json:"mediaType"`
+			Digest    string `json:"digest"`
+			Size      int64  `json:"size"`
+		} `json:"manifests"`
+	}{SchemaVersion: 2, Manifests: []struct {
+		MediaType string `json:"mediaType"`
+		Digest    string `json:"digest"`
+		Size      int64  `json:"size"`
+	}{{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: manifestDigest, Size: int64(len(manifestBytes))}}})
+	if err != nil {
+		return fmt.Errorf("marshal railpack index: %w", err)
+	}
+
+	imageFile, err := os.Create(imagePath)
+	if err != nil {
+		return fmt.Errorf("create OCI image: %w", err)
+	}
+	closeImage := func() error { return imageFile.Close() }
+	imageTar := tar.NewWriter(imageFile)
+	writeBytes := func(name string, data []byte) error {
+		if err := imageTar.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(data))}); err != nil {
+			return err
+		}
+		_, err := imageTar.Write(data)
+		return err
+	}
+	if err := writeBytes("oci-layout", []byte(`{"imageLayoutVersion":"1.0.0"}`)); err != nil {
+		_ = closeImage()
+		return fmt.Errorf("write OCI layout: %w", err)
+	}
+	if err := writeBytes("index.json", indexBytes); err != nil {
+		_ = closeImage()
+		return fmt.Errorf("write OCI index: %w", err)
+	}
+	if err := writeBytes(configName, configBytes); err != nil {
+		_ = closeImage()
+		return fmt.Errorf("write OCI config: %w", err)
+	}
+	if err := writeBytes(manifestName, manifestBytes); err != nil {
+		_ = closeImage()
+		return fmt.Errorf("write OCI manifest: %w", err)
+	}
+	if err := imageTar.WriteHeader(&tar.Header{Name: "blobs/sha256/" + strings.TrimPrefix(layerDigest, "sha256:"), Mode: 0o644, Size: layerInfo.Size()}); err != nil {
+		_ = closeImage()
+		return fmt.Errorf("write OCI layer header: %w", err)
+	}
+	layerReader, err := os.Open(layerPath) //nolint:forbidigo // layerPath is a guest-local temporary artifact.
+	if err != nil {
+		_ = closeImage()
+		return fmt.Errorf("open OCI layer: %w", err)
+	}
+	_, copyErr := io.Copy(imageTar, layerReader)
+	closeLayerErr := layerReader.Close()
+	if copyErr != nil {
+		_ = closeImage()
+		return fmt.Errorf("copy OCI layer: %w", copyErr)
+	}
+	if closeLayerErr != nil {
+		_ = closeImage()
+		return fmt.Errorf("close OCI layer: %w", closeLayerErr)
+	}
+	if err := imageTar.Close(); err != nil {
+		_ = closeImage()
+		return fmt.Errorf("close OCI image tar: %w", err)
+	}
+	if err := closeImage(); err != nil {
+		return fmt.Errorf("close OCI image: %w", err)
+	}
+	return nil
+}
+
+//nolint:unused // used by the retained Railpack OCI fallback above.
+func digestBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // classify maps an in-VM exit code to a builderd FailureClass. The vocabulary
@@ -472,11 +996,16 @@ func writeAndPoweroff(m api.BuildManifest, runErr error, logTail string) error {
 		var ee *exec.ExitError
 		if errors.As(runErr, &ee) {
 			exitCode = ee.ExitCode()
+		} else if errors.Is(runErr, context.DeadlineExceeded) {
+			exitCode = 124
 		} else {
 			exitCode = 1
 		}
 	}
 	fc := classify(exitCode)
+	if logTail == "" && runErr != nil {
+		logTail = runErr.Error()
+	}
 	done := api.BuildDone{
 		SchemaVersion: 1,
 		BuildID:       m.BuildID,
@@ -486,17 +1015,34 @@ func writeAndPoweroff(m api.BuildManifest, runErr error, logTail string) error {
 		FailureClass:  fc,
 	}
 	if data, mErr := json.Marshal(done); mErr == nil {
-		_ = os.WriteFile(api.BuildDonePath, data, 0o644)
+		if f, openErr := os.OpenFile(api.BuildDonePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); openErr != nil {
+			fmt.Fprintf(os.Stderr, "guest-init: open build-done: %v\n", openErr)
+		} else {
+			if _, writeErr := f.Write(data); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "guest-init: write build-done: %v\n", writeErr)
+			}
+			if syncErr := f.Sync(); syncErr != nil {
+				fmt.Fprintf(os.Stderr, "guest-init: sync build-done: %v\n", syncErr)
+			}
+			if closeErr := f.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "guest-init: close build-done: %v\n", closeErr)
+			}
+		}
 	} else {
 		fmt.Fprintf(os.Stderr, "guest-init: marshal build-done: %v\n", mErr)
 	}
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "guest-init: build failed: %v\n", runErr)
 	}
+	// Flush all overlay upper metadata/data before the forced poweroff. The
+	// host exports the ext4 immediately after Firecracker exits; without an
+	// explicit sync, the manifest and image can still be only in guest page
+	// cache when the image is loop-mounted on the host.
+	_ = exec.Command("/bin/sync").Run()
 	// poweroff -f so vmmd's Destroy sees the exit code via firecracker's
 	// natural exit. exec.CommandContext's timeout doesn't trigger poweroff —
 	// we always get here.
-	if err := exec.Command("poweroff", "-f").Run(); err != nil {
+	if err := exec.Command("/sbin/poweroff", "-f").Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "guest-init: poweroff: %v\n", err)
 	}
 	// Surface as a guest-init error so the cmd survives long enough for

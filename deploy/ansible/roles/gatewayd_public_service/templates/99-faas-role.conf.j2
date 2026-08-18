@@ -1,0 +1,17 @@
+[Service]
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to gatewayd-public so cmd/gatewayd-public/main.go
+# ::role.Require picks the right role.FromConfig sentinel
+# (FAAS_GATEWAYD_PUBLIC_ROLE). gatewayd-public lives on fsn-1
+# (the control-plane box) and the role is RoleControlPlane.
+#
+# Distinct from FAAS_GATEWAYD_ROLE that gatewayd-internal reads
+# (see gatewayd_internal_service/templates/99-faas-role.conf.j2).
+# The two daemons share a binary-name namespace but differ on
+# the role env-var so the per-daemon sentinel line is load-bearing.
+#
+# The drop-in wins over the unit's [Service] section
+# (systemd.unit(5) "later wins") and the unit has no
+# Environment= line on FAAS_GATEWAYD_PUBLIC_ROLE, so the drop-in
+# is the only source of the env var. Idempotent.
+Environment=FAAS_GATEWAYD_PUBLIC_ROLE={{ faas_box_role }}

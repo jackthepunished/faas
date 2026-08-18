@@ -24,7 +24,7 @@
      The stdlib verifier performs SAN matching on every dial — a daemon
      dialling the wrong peer fails closed at the handshake.
 
-  2. **Operator-facing `gregale pki` subcommand.** `cmd/gregale/commands_pki.go`
+  2. **Operator-facing `gregalectl pki` subcommand.** `cmd/gregalectl/commands_pki.go`
      follows the existing `sign-keys init|rotate|status` pattern. It generates
      an ECDSA P-256 CA + one leaf per daemon under `/etc/faas/tls/{ca,<daemon>}/`,
      enforced at `0400` (private) / `0444` (public) by mirroring the
@@ -72,7 +72,7 @@
   - **Operator workflow.** A new compute node is brought up by:
     1. `ansible-playbook` lays down `/etc/faas/tls/ca/` from a vaulted
        source.
-    2. `gregale pki init` issues per-daemon leaves for that box.
+    2. `gregalectl pki init` issues per-daemon leaves for that box.
     3. Daemons start and refuse to come up if any expected cert is missing.
   - **Test surface.** Existing `pkg/wire/grpc_test.go` PKI helper
     (`newTestPKI`, lines 644-691) is reused for new round-trip tests in
@@ -108,7 +108,9 @@
 
 ## Config additions
 
-Per-daemon `*.toml.example` files gain three new fields per remote role:
+Per-daemon `*.toml.example` files gain three new fields per remote role
+(PR-1: the v1 deploy/etc/*.toml.example fixtures are a tombstone now;
+canonical is deploy/ansible/roles/*/files/*.toml.example):
 
 ```toml
 # vmmd.toml — new client cluster for schedd + apid-advisory
@@ -192,14 +194,14 @@ in two new test paths (`pkg/wire/grpc_test.go::TestMTLSRoundTripPeerCN`,
 `cmd/e2e/mtls_e2e_test.go`) to prove the binding works without depending
 on a future slice.
 
-## Operator CLI (`gregale pki`)
+## Operator CLI (`gregalectl pki`)
 
 ```
-gregale pki init      # generate CA + leaves for every daemon on this box
-gregale pki status    # print per-leaf: serial, expires_at, CN, SANs, mode
-gregale pki rotate    # re-issue leaves whose NotAfter is < 30d away
-gregale pki revoke    # write a CRL entry (out of scope for slice 2;
-                      # placeholder for the post-1.0 PKI replacement)
+gregalectl pki init      # generate CA + leaves for every daemon on this box
+gregalectl pki status    # print per-leaf: serial, expires_at, CN, SANs, mode
+gregalectl pki rotate    # re-issue leaves whose NotAfter is < 30d away
+gregalectl pki revoke    # write a CRL entry (out of scope for slice 2;
+                         # placeholder for the post-1.0 PKI replacement)
 ```
 
 `init` is idempotent: leaves whose NotAfter is ≥ 30 days from `now` are
@@ -214,7 +216,7 @@ root, leaves are cheap.)
 /etc/faas/tls/
 ├── ca/
 │   ├── ca.crt    (0444 root:root)        — root pool for every daemon
-│   └── ca.key    (0400 root:root)        — only `gregale pki` reads this
+│   └── ca.key    (0400 root:root)        — only `gregalectl pki` reads this
 ├── schedd/
 │   ├── server.crt (0444 root:root)       — schedd's server leaf
 │   └── server.key (0400 root:root)
@@ -238,7 +240,7 @@ dial to a remote role.
 
 ## Out of scope (later slices)
 
-- **CRL / OCSP.** `gregale pki revoke` is a stub that prints a TODO. A
+- **CRL / OCSP.** `gregalectl pki revoke` is a stub that prints a TODO. A
   real CRL/OCSP story requires either an internal step-ca or external
   ACME; defer until either becomes a hard requirement (likely post-1.0).
 - **Per-node `node_signature` on `CapacityReport`** (Phase 2 in the
@@ -275,7 +277,7 @@ dial to a remote role.
 
 - **External CA (step-ca, ACME, cert-manager).** Cleanest operationally
   but requires standing up infra that doesn't exist today. PR-B / post-1.0.
-  A future slice that wires `cmd/gregale pki init --external-ca` against
+  A future slice that wires `cmd/gregalectl pki init --external-ca` against
   an ACME server is the natural extension; this slice keeps the door open
   by making the `init` flow idempotent and the file layout CA-agnostic.
 
@@ -288,14 +290,14 @@ dial to a remote role.
 - **Per-daemon SAN drift.** If an operator issues a leaf with the wrong
   SAN (e.g. `vmmd.faas` on a schedd cert), the handshake silently fails
   with `tls: handshake failure` and the dial log is uninformative.
-  Mitigation: `gregale pki status` prints every leaf's CN + SAN list +
+  Mitigation: `gregalectl pki status` prints every leaf's CN + SAN list +
   mode, and the daemon refuses to start if its loaded leaf's CN does
   not match its expected role. `cmd/e2e/mtls_e2e_test.go` exercises the
   CN-mismatch path explicitly.
 - **CA rotation pain.** `init` reuses an existing CA key unless
   `--rotate-ca` is passed. Rotating the CA is a multi-host, simultaneous
   operation; if even one box is left behind, every gRPC leg from that
-  box fails. Mitigation: `gregale pki status` exits non-zero if any leaf
+  box fails. Mitigation: `gregalectl pki status` exits non-zero if any leaf
   expires within 30 days, and the operator runbook calls for rotating
   per-leaf first (cheap, no CA change), then scheduling a CA-rotation
   window. There is no automated CA rotation in this slice.
@@ -310,8 +312,8 @@ dial to a remote role.
 
 | Site | Change |
 |------|--------|
-| `cmd/gregale/commands_pki.go` (new) | `gregale pki init\|status\|rotate` |
-| `cmd/gregale/main.go` | register `pki` subcommand |
+| `cmd/gregalectl/commands_pki.go` (new) | `gregalectl pki init\|status\|rotate` |
+| `cmd/gregalectl/main.go` | register `pki` subcommand |
 | `pkg/wire/peer.go` (new) | `PeerCN(ctx) (string, error)` helper |
 | `pkg/wire/grpc_test.go` | new `TestMTLSRoundTripPeerCN` |
 | `cmd/e2e/mtls_e2e_test.go` (new) | real-TCP `127.0.0.1` round trip |
@@ -325,7 +327,7 @@ dial to a remote role.
 | `cmd/apid/config.go` | new `AdvisoryTLSCfg` + `GithubdTLSCfg` |
 | `cmd/apid/main.go` | thread TLS into advisory listener + githubd client |
 | `cmd/apid/githubd_client.go` | accept TLS config from caller |
-| `deploy/ansible/roles/*/files/*.toml.example` | new fields in 5 files |
+| `deploy/ansible/roles/*/files/*.toml.example` | new fields in 5 files (PR-1: canonical TOML fixtures) |
 | `deploy/ansible/roles/control_plane_service/tasks/main.yml` | new stat-assert task for `/etc/faas/tls/` |
 | `Makefile` | no change — CLI rides on `gregale` binary |
 | `docs/adr/025-decoupled-control-plane-and-compute.md` | update §1 to remove stale `credentials.NewTLS(creds)` snippet, reference `wire.LoadClientTLSConfig*` |
@@ -335,4 +337,4 @@ dial to a remote role.
 - `make test` — all wire + per-daemon config + new mTLS tests pass.
 - `make lint` — golangci-lint clean.
 - `make spec-check` — ADR-052 cross-linked from `docs/adr/025-decoupled-control-plane-and-compute.md`.
-- Live: stand up a two-VM fleet (default-local + compute-01), `gregale pki init` on each, deploy an app, observe schedd↔vmmd / gatewayd↔vmmd / meterd↔schedd all running over mTLS with no plaintext on the wire.
+- Live: stand up a two-VM fleet (default-local + compute-01), `gregalectl pki init` on each, deploy an app, observe schedd↔vmmd / gatewayd↔vmmd / meterd↔schedd all running over mTLS with no plaintext on the wire.

@@ -39,6 +39,36 @@ func TestLocalBackendPutGetRoundtrip(t *testing.T) {
 	}
 }
 
+func TestLocalBackendLocalPathResolvesSymlink(t *testing.T) {
+	root := t.TempDir()
+	be, err := NewLocalStorageBackend(root)
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	target := filepath.Join(root, "base", "runner.ext4")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("base"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(root, "base", "base-amd64.ext4")
+	if err := os.Symlink(filepath.Base(target), link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	got, ok, err := be.LocalPath("base/base-amd64.ext4")
+	if err != nil || !ok {
+		t.Fatalf("LocalPath: path=%q ok=%v err=%v", got, ok, err)
+	}
+	want, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	if got != want {
+		t.Fatalf("LocalPath = %q, want resolved target %q", got, want)
+	}
+}
+
 // TestLocalBackendPutOverwrite covers the overwrite path: a second
 // Put to the same key replaces the file. Atomicity is exercised here
 // (temp+rename) but the success assertion is content-equality.

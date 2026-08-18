@@ -181,6 +181,21 @@ func (r *PrefixRouter) dispatch(key string) (StorageBackend, string, string, err
 	return nil, "", "", fmt.Errorf("%w: no route for %q", ErrInvalidKey, key)
 }
 
+// LocalPath resolves a key through the same longest-prefix route used by Get.
+// It only succeeds when the selected backend can expose a local file; remote
+// routes deliberately return ok=false so callers fall back to Get.
+func (r *PrefixRouter) LocalPath(key string) (string, bool, error) {
+	b, rem, _, err := r.dispatch(key)
+	if err != nil {
+		return "", false, err
+	}
+	resolver, ok := b.(LocalPathResolver)
+	if !ok {
+		return "", false, nil
+	}
+	return resolver.LocalPath(rem)
+}
+
 // Put dispatches via dispatch and forwards to the matching backend.
 // ctx propagation: the per-call ctx is passed through verbatim so a
 // cancelled caller observes cancellation on every dispatched Put.

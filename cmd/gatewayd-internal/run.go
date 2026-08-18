@@ -563,6 +563,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := role.Require("gatewayd-internal", cfg.Role, role.RoleSingleBox, role.RoleComputeOnly); err != nil {
 		return err
 	}
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity. Mirrors schedd/apid/meterd/githubd/
+	// gatewayd-public so the playbook shape is identical across
+	// daemons.
+	if cfg.NodeName != "" {
+		log.Info("gatewayd-internal owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("gatewayd-internal: legacy single-box (cfg.NodeName empty)")
+	}
 
 	// Phase 2 / Gate A: per-node schedd client cache. Wires the
 	// production dial closure (cross-box via pkg/overlay for tcp
@@ -576,6 +585,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 	vmmdTLS, err := cfg.LoadVMMDPingTLS()
 	if err != nil {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
+	}
+	scheddTLS, err := cfg.LoadScheddTLS()
+	if err != nil {
+		return fmt.Errorf("gatewayd: load schedd TLS: %w", err)
 	}
 	deps := defaultDeps()
 	// Issue #477 / ADR-079: resolve the host key directory the
@@ -604,7 +617,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if hp := os.Getenv("FAAS_HOST_KEY_PATH"); hp != "" {
 		deps.hostKeyDir = filepath.Dir(hp)
 	}
-	deps.scheddRouter = newScheddRouter(pgStore, vmmdTLS, nil, log)
+	deps.scheddRouter = newScheddRouter(pgStore, scheddTLS, nil, log)
 	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
 	// Single-stream fallback: dial the legacy schedd socket once for
 	// the consumers that don't currently fan-in (warm hints, log
@@ -612,7 +625,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// same client the router would resolve; on a multi-box install
 	// the stream comes from one schedd only and is documented as
 	// such in cmd/gatewayd-internal/warmhints.go.
-	sched, err := scheddgrpc.DialContext(ctx, scheddSocket, nil)
+	sched, err := scheddgrpc.DialContext(ctx, scheddSocket, scheddTLS)
 	if err != nil {
 		return fmt.Errorf("gatewayd: dial schedd: %w", err)
 	}

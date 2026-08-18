@@ -404,3 +404,186 @@ func daemonInSchema(name string) bool {
 	}
 	return false
 }
+
+// TestValidateTOMLPlacement_ComputeNodeKeyAtTopLevel_ErrorCode
+// (Mega-PR-B Commit 4) pins the corrected error code for the
+// "compute_node key rendered at top level" failure mode. The
+// previous typo was `cn_block_key_at_top.level` (literal dot in the
+// path token); it is now `cn_block_key_at_top_level` (underscore).
+// An operator alert that grep-matches the error code MUST keep
+// using the underscore form.
+//
+// Reproduces the shape by feeding the validator a rendered map
+// with a ComputeNodeBlock key sitting at the top level — the only
+// branch that emits the corrected error code.
+func TestValidateTOMLPlacement_ComputeNodeKeyAtTopLevel_ErrorCode(t *testing.T) {
+	// Pull a real ComputeNodeBlock key from the catalog so the
+	// validator's `for _, ck := range host.ComputeNodeBlock` loop
+	// actually fires. vmmd is the only daemon that owns a
+	// ComputeNodeBlock per the catalog.
+	vmmd := HostKeys["vmmd"]
+	if len(vmmd.ComputeNodeBlock) == 0 {
+		t.Fatal("HostKeys[vmmd].ComputeNodeBlock empty — catalog regression")
+	}
+	ck := vmmd.ComputeNodeBlock[0]
+	rendered := map[string]string{ck.Key: "set"}
+	errs := ValidateTOMLPlacement("vmmd", rendered)
+	if len(errs) == 0 {
+		t.Fatal("ValidateTOMLPlacement: want top-level placement error, got nil")
+	}
+	const wantCode = "daemons.vmmd.cn_block_key_at_top_level"
+	found := false
+	var firstCode string
+	for _, e := range errs {
+		if firstCode == "" {
+			firstCode = e.Path
+		}
+		if e.Path == wantCode {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("ValidateTOMLPlacement emitted %q, want %q (typo at toml_check.go:319 fixed in Commit 4 — operators grepping for this error must use the underscore form)",
+			firstCode, wantCode)
+	}
+	// Anti-regression: the old typo must NEVER appear in the
+	// emitted error codes. A future drift that re-introduces the
+	// literal dot fails this build.
+	for _, e := range errs {
+		if strings.Contains(e.Path, "cn_block_key_at_top.level") {
+			t.Errorf("ValidateTOMLPlacement emitted the legacy typo %q — revert the underscore fix", e.Path)
+		}
+	}
+}
+
+// TestHostKeys_DaemonsStructReference (Mega-PR-B Commit 4) pins the
+// corrected doc comment at toml_check.go:106-110 that points
+// readers at the Daemons struct (not a non-existent `daemons.go`
+// map that the previous wording referenced). Asserts the actual
+// catalog is non-empty AND stays in sync with the schema — the
+// canonical invariant the doc comment promises.
+func TestHostKeys_DaemonsStructReference(t *testing.T) {
+	if len(HostKeys) == 0 {
+		t.Fatal("HostKeys catalog empty")
+	}
+	for name := range HostKeys {
+		if !daemonInSchema(name) {
+			t.Errorf("HostKeys[%q] not in the schema's `daemons:` map — "+
+				"the catalog and the schema must stay in lockstep (see daemonInSchema in this file). "+
+				"Update both at the same time.", name)
+		}
+	}
+}
+
+// TestSplitboxExample_ValidatesAndIllustratesOverlay (Mega-PR-B
+// Commit 5) loads the splitbox.example.yaml reference file and
+// pins two invariants:
+//
+//  1. The example file PARSES and VALIDATES without errors —
+//     future edits that drift away from the schema
+//     (e.g. remove a required field) fail here.
+//  2. The example file contains the ILLUSTRATIVE ONLY marker
+//     introduced in Mega-PR-B Commit 5 — future edits that drop
+//     the illustrative header fail here. An operator reading the
+//     file MUST be alerted that the addresses (10.42.0.1, 10.42.0.2,
+//     overlay.cidr 10.42.0.0/24) are PLACEHOLDERS, not real
+//     operator values, before they `gregalectl manifest apply`.
+//     The marker also cross-references the §11 deny-list trap
+//     RFC1918/CGNAT overlayers fall into (separate from the
+//     example-load assertion).
+func TestSplitboxExample_ValidatesAndIllustratesOverlay(t *testing.T) {
+	const examplePath = "../../deploy/manifest/examples/splitbox.example.yaml"
+	raw, err := os.ReadFile(examplePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", examplePath, err)
+	}
+	m, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if errs := m.Validate(); len(errs) > 0 {
+		t.Fatalf("Validate: %v", errs)
+	}
+	if !strings.Contains(string(raw), "ILLUSTRATIVE ONLY") {
+		t.Errorf("splitbox.example.yaml missing the ILLUSTRATIVE ONLY marker — operators will read the placeholder addresses (10.42.0.x) as a real deployable config. Add the marker before `schema_version: \"1.0.0\"`.")
+	}
+}
+
+// TestEgressValidate covers the Gap #4 pair-enforcement gate. The
+// manifest validator (Egress.validate) is the apply-time mirror of
+// the DB CHECK constraint (migration 00276); both reject the same
+// mismatched inputs.
+func TestEgressValidate(t *testing.T) {
+	cases := []struct {
+		name      string
+		egress    Egress
+		wantErr   bool
+		wantConta string // substring expected in the error message
+	}{
+		{
+			name:    "quiet default — no flag, no exceptions, no error",
+			egress:  Egress{},
+			wantErr: false,
+		},
+		{
+			name: "flag set without exceptions — pair rejected",
+			egress: Egress{
+				DangerAcceptRFC1918LateralMovement: true,
+			},
+			wantErr:   true,
+			wantConta: "requires at least one entry",
+		},
+		{
+			name: "exceptions without flag — pair rejected",
+			egress: Egress{
+				OverlayExceptions: []string{"10.42.0.0/24"},
+			},
+			wantErr:   true,
+			wantConta: "requires danger_accept_rfc1918_lateral_movement=true",
+		},
+		{
+			name: "flag + exception — accepted",
+			egress: Egress{
+				DangerAcceptRFC1918LateralMovement: true,
+				OverlayExceptions:                  []string{"10.42.0.0/24"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "flag + malformed exception — rejected",
+			egress: Egress{
+				DangerAcceptRFC1918LateralMovement: true,
+				OverlayExceptions:                  []string{"not-a-cidr"},
+			},
+			wantErr:   true,
+			wantConta: "invalid CIDR",
+		},
+		{
+			name: "flag + multiple valid exceptions — accepted",
+			egress: Egress{
+				DangerAcceptRFC1918LateralMovement: true,
+				OverlayExceptions:                  []string{"10.42.0.0/24", "10.43.0.0/24"},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := tc.egress.validate()
+			if tc.wantErr {
+				if len(errs) == 0 {
+					t.Fatalf("validate() = nil, want error containing %q", tc.wantConta)
+				}
+				joined := errs.Error()
+				if !strings.Contains(joined, tc.wantConta) {
+					t.Errorf("validate() error %q does not contain %q", joined, tc.wantConta)
+				}
+				return
+			}
+			if len(errs) > 0 {
+				t.Errorf("validate() = %v, want nil", errs)
+			}
+		})
+	}
+}

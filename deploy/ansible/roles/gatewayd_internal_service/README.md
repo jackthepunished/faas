@@ -32,6 +32,27 @@ IP. The only inbound traffic is from `gatewayd-public` over the
 unix socket; the only outbound traffic is gRPC to per-node
 schedd/vmmd via `pkg/wire.DialContext` (loopback mTLS).
 
+## Drop-ins
+
+- `99-faas-node-name.conf.j2` (linked from `_shared/`) — exposes this box's
+  compute_node identity to gatewayd-internal so the multi-box handshake
+  layer reads the right name without a TOML edit.
+- `99-faas-role.conf.j2` — wires the per-box role gate through to
+  gatewayd-internal via `FAAS_GATEWAYD_ROLE` (note: NOT `_INTERNAL` — the
+  env-var name matches the daemon's `pkg/role` lookup key) so
+  `cmd/gatewayd-internal/config.go::LoadConfig` picks the right
+  `role.FromConfig` sentinel. Without this drop-in gatewayd-internal falls
+  back to `RoleSingleBox` on a multi-host fleet and the per-daemon role
+  gate is unenforced.
+
+## Restart handler
+
+The role declares a `notify: restart faas-gatewayd-internal` handler on the
+FAAS_NODE_NAME drop-in install so a name change is picked up immediately
+on the next `ansible-playbook` run. Other daemons in this role cluster do
+NOT restart on drop-in change — the operator's `systemctl enable --now`
+loop is the contract there.
+
 ## See also
 
 - `docs/adr/068-tier-a7-edge-split.md`

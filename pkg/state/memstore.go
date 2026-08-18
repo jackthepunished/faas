@@ -5085,6 +5085,36 @@ func (m *MemStore) ClaimInvocation(_ context.Context, id, instanceID string, lea
 	return inv, nil
 }
 
+// RequeueExpiredInvocations returns dispatching rows whose lease has expired
+// to the pending queue. It mirrors the conditional UPDATE used by PgStore;
+// the scheduler calls it once per tick with a bounded limit so recovery work
+// cannot starve fresh traffic.
+func (m *MemStore) RequeueExpiredInvocations(_ context.Context, now time.Time, limit int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0)
+	for id, inv := range m.invocations {
+		if inv.State != InvocationDispatching || inv.LeaseExpiresAt == nil || inv.LeaseExpiresAt.After(now) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	for _, id := range ids {
+		inv := m.invocations[id]
+		inv.State = InvocationPending
+		inv.DueAt = now
+		inv.LeaseExpiresAt = nil
+		inv.InstanceID = ""
+		inv.LastError = "dispatch lease expired; requeued"
+		m.invocations[id] = inv
+	}
+	return len(ids), nil
+}
+
 // CompleteInvocation finalises a dispatching row with the optional
 // result blob. State must be dispatching; anything else returns
 // ErrNotFound so the drain doesn't double-complete a row that PG
@@ -6572,6 +6602,29 @@ func (m *MemStore) MarkComputeNodeInactive(_ context.Context, nodeID string) err
 		return ErrNotFound
 	}
 	n.Active = false
+	m.computeNodes[nodeID] = n
+	return nil
+}
+
+// SetComputeNodeRole overwrites the role column on a row by id
+// (ADR-112 PR-B). Mirrors PgStore.SetComputeNodeRole behavior:
+// same allow-list validation, same idempotent semantics, same
+// ErrNotFound on a missing row. MemStore holds role as a *string
+// (nullable, legacy "un-templated" sentinel); the setter accepts
+// only {control-plane, compute-only} and writes the pointer form
+// so the pointer-vs-value distinction survives a round-trip.
+func (m *MemStore) SetComputeNodeRole(_ context.Context, nodeID, role string) error {
+	if err := validateRoleForState(role); err != nil {
+		return fmt.Errorf("state: set role compute_node %s: %w", nodeID, err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.computeNodes[nodeID]
+	if !ok {
+		return ErrNotFound
+	}
+	r := role
+	n.Role = &r
 	m.computeNodes[nodeID] = n
 	return nil
 }

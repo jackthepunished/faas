@@ -161,8 +161,11 @@ provision:
       # same commit. Source: https://go.dev/dl/?mode=json&include=all
       # (filter os=linux, arch=arm64, kind=archive). The check fails loud;
       # metal-lima runs this on a dev Mac, but the same hardening that
-      # protects the production DO bootstrap (deploy/digitalocean/bootstrap.sh)
-      # applies here.
+      # protected the production DO bootstrap (deploy/digitalocean/bootstrap.sh,
+      # no longer in tree; superseded by deploy/controlplane/bootstrap.sh,
+      # RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap` +
+      # `gregale manifest {validate,render}` + `gregale release install`) applies
+      # here.
       GO_VER=go1.25.7
       GO_SHA256_LINUX_ARM64="ba611a53534135a81067240eff9508cd7e256c560edd5d8c2fef54f083c07129"
       if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "$GO_VER"; then

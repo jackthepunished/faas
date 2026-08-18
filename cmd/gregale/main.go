@@ -38,7 +38,6 @@ Commands:
   apps streaming-cap  Per-app streaming classification probe (ADR-102 D6)
   apps -q      Delete an app
   app          Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
-  backup       Operator rclone config unseal (backup unseal-rclone)
   billing      Manage billing (gregale billing portal)
   build        Build provenance + sbom (build provenance <id>|build sbom <id>)
   connect      Connect a third-party service (github)
@@ -52,7 +51,6 @@ Commands:
   domains      Manage custom domains
   edge-rules   Per-app edge rules (route|rewrite|redirect|headers|cors|jwt|ip; ADR-089)
   env          Pull/push .env <-> sealed secrets (--app <slug>)
-  host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
   invoke       Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])
   invocations  Per-account invocation ledger (invocations list|get <id> [--replay])
@@ -61,7 +59,6 @@ Commands:
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
-  manifest     Operator split-box deployment manifest (manifest validate --file PATH; issue #911 / ADR-110)
   signup       Create a new account (signup [--email-only EMAIL])
   man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
@@ -71,7 +68,6 @@ Commands:
   orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|keys ...|transfer-ownership|seat-usage|invitations ...|me)
   overage-cap  Set / clear the account's overage cap (--clear | <cents>)
   park         Park an app cold (kill all live instances)
-  pki          Operator local-dev PKI bootstrap (pki init|status|rotate)
   plan         Change plan (free|hobby|pro|scale)
   ps           Show live instances + state for an app
   queue        Inspect the wake-queue depth (queue tail|send|receive|state|peek|dead-letter|ack)
@@ -79,7 +75,6 @@ Commands:
   rollback     Re-promote the previous deployment
   scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
   secrets      Manage env secrets (secrets list|set|unset|list-all)
-  sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
   slo          Per-app SLO panel (gregale slo <slug> [--window 24h])
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
@@ -294,39 +289,16 @@ func run(args []string) int {
 		return cmdWebhooks(args[1:])
 	case "keys":
 		return cmdKeys(args[1:])
-	case dispatchSignKeys:
-		return cmdSignKeys(args[1:])
-	case dispatchNodeKey:
-		// ADR-053 — operator-side provisioning for the per-node
-		// CapacityReport signing keypair. Mirrors sign-keys shape
-		// (init|rotate|status) but writes /etc/faas/secrets/vmmd/
-		// {node.key (0400 root:root), node.pub (0444)} and prints
-		// the key_id (SHA-256 hex of the SPKI) at init time so an
-		// operator can confirm the same value schedd will register.
-		return cmdNodeKey(args[1:])
 	case dispatchTrustedPublishers:
 		// Issue #472 / ADR-054 — operator CLI for the per-app
 		// cosign trusted-publisher list. Admin API key required;
 		// every leaf calls authedClient() and hits apid. The
-		// sibling operator surface `sign-keys` (above) hits the
-		// local fs, never apid.
+		// operator-only surfaces (sign-keys, node-key, pki,
+		// host-age, manifest, release, backup) moved to
+		// `gregalectl` in PR-6.5 — this is the only operator verb
+		// that stayed in `gregale` because it's a customer/admin
+		// API surface.
 		return cmdTrustedPublishers(args[1:])
-	case dispatchHostAge:
-		// Operator-side host.age rotation (issue #316 / ADR-057).
-		// Same operator-only surface as sign-keys / pki: every
-		// leaf is a local fs operation against /etc/faas/secrets/.
-		// Sibling — never reuse the `keys` namespace (that's the
-		// customer API-key manager in commands2.go::cmdKeys which
-		// hits apid via authedClient()).
-		return cmdHostAge(args[1:])
-	case dispatchBackup:
-		return cmdBackup(args[1:])
-	case dispatchPKI:
-		// Operator-side local-dev PKI bootstrap (ADR-052). Issues
-		// /etc/faas/tls/{ca,<daemon>/} material for multi-box mTLS.
-		// Distinct from sign-keys because the trust root is the CA,
-		// not the per-box cosign keypair.
-		return cmdPKI(args[1:])
 	case "secrets":
 		return cmdSecrets(args[1:])
 	case "github-webhook-secret":
@@ -422,13 +394,6 @@ func run(args []string) int {
 		// above the plan's included GB-h). schedd refuses new wakes
 		// once the cap is hit.
 		return cmdOverageCap(args[1:])
-	case "manifest":
-		// Issue #911 / ADR-110: operator-side manifest loader.
-		// `gregale manifest validate --file=PATH` runs the
-		// canonical validator (pkg/manifest/Validate); PR-2 adds
-		// `manifest render`; PR-3 adds `manifest install`. The
-		// dispatcher is cmdManifestDispatch in commands_manifest.go.
-		return cmdManifestDispatch(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1

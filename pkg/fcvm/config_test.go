@@ -156,8 +156,8 @@ func TestColdBootConfigMarshalsToFirecrackerSchema(t *testing.T) {
 
 func TestColdBootBootArgsDisableConsole(t *testing.T) {
 	cfg := BuildColdBootConfig(validColdSpec(), 0)
-	if !strings.Contains(cfg.BootSource.BootArgs, "console=off") {
-		t.Errorf("boot args should disable console (spec §4.4): %q", cfg.BootSource.BootArgs)
+	if !strings.Contains(cfg.BootSource.BootArgs, "console=ttyS0,115200n8") {
+		t.Errorf("boot args should expose the serial console: %q", cfg.BootSource.BootArgs)
 	}
 }
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=onebox-faas Postgres base backup push (Hetzner Storage Box)
+Description=onebox-faas Postgres base backup push (off-host)
 Documentation=https://github.com/poyrazK/cloud-faas
 After=faas-pg-basebackup.service
 # Don't gate on faas-pg-basebackup.service — the timer fires at 03:30
@@ -9,17 +9,17 @@ After=faas-pg-basebackup.service
 # a healthy box, so the "wait" is bounded by the basebackup's own
 # 30 min TimeoutStartSec.
 
-# Spec §14 M8 + issue #250: ships /var/lib/pgsql/basebackup/ to a
-# Hetzner Storage Box via rclone so a host loss is recoverable from
-# off-host state. The Storage Box is the canonical S3-of-one-box
+# Spec §14 M8 + issue #250: ships /var/lib/pgsql/basebackup/ to the
+# off-host backup box via rclone so a host loss is recoverable from
+# off-host state. The off-host box is the canonical S3-of-one-box
 # replacement the spec explicitly forbids (no local-only backup).
 #
 # Why `rclone sync` (not `copy`): removes orphaned files on the
-# Storage Box so a failed intermediate push + basebackup prune
+# off-host box so a failed intermediate push + basebackup prune
 # doesn't accumulate stale tarballs. The local tree is the source of
 # truth; the box is a mirror.
 #
-# Why `--config=%d/faas_storage_box_rclone`: the rclone.conf is
+# Why `--config=%d/faas_off_host_backup_rclone`: the rclone.conf is
 # sealed-at-rest via host.age (PR #371 cosign precedent) and decrypted
 # into a tmpfs staging dir at ansible-run time. systemd `LoadCredential=`
 # surfaces the plaintext file inside the unit's $CREDENTIALS_DIRECTORY
@@ -28,13 +28,19 @@ After=faas-pg-basebackup.service
 # run → LoadCredential in unit → rclone reads plaintext at exec time
 # (the network channel is SSH-encrypted by rclone's sftp backend; the
 # file on disk is what we're protecting at rest).
+#
+# PR-8 (issue #911 / ADR-110 deferred): env var renamed from
+# HETZNER_STORAGE_BOX_BASEBACKUP_PATH → OFF_HOST_BACKUP_BASEBACKUP_PATH.
+# Off-host box is operator-agnostic; the rclone remote alias is
+# `offhostbox:` (was `hertznerbox:`). Match the ansible role's
+# vars_files rename + the `99-faas-off-host-backup.conf` drop-in.
 
 [Service]
 Type=oneshot
 User=root
 Group=root
 
-Environment=HETZNER_STORAGE_BOX_BASEBACKUP_PATH=faas-pg-basebackup
+Environment=OFF_HOST_BACKUP_BASEBACKUP_PATH=faas-pg-basebackup
 EnvironmentFile=/etc/faas/sealed.env
 
 ExecStart=/usr/bin/env bash -c '\
@@ -42,10 +48,10 @@ ExecStart=/usr/bin/env bash -c '\
   src=/var/lib/pgsql/basebackup; \
   [[ -d "$${src}" ]] || { echo "no $$src" >&2; exit 1; }; \
   [[ -n "$$(ls -1A "$${src}")" ]] || { echo "$$src empty — nothing to push" >&2; exit 1; }; \
-  rclone sync "$${src}" "hertznerbox:$${HETZNER_STORAGE_BOX_BASEBACKUP_PATH}" \
-    --config=%d/faas_storage_box_rclone \
+  rclone sync "$${src}" "offhostbox:$${OFF_HOST_BACKUP_BASEBACKUP_PATH}" \
+    --config=%d/faas_off_host_backup_rclone \
     --stats=0 --quiet; \
-  echo "pushed $$src → hertznerbox:$${HETZNER_STORAGE_BOX_BASEBACKUP_PATH}"'
+  echo "pushed $$src → offhostbox:$${OFF_HOST_BACKUP_BASEBACKUP_PATH}"'
 SuccessExitStatus=0
 TimeoutStartSec=2h
 

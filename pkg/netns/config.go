@@ -12,19 +12,46 @@ import (
 // per-instance uniqueness lives entirely on the host side (veth + host IP),
 // never inside the guest. Do not make these per-VM.
 const (
-	GuestIP        = "10.0.0.2"
-	GuestGateway   = "10.0.0.1"
-	GuestPrefix    = "10.0.0.2/30"
-	TapPrefix      = "10.0.0.1/30" // host (tap0) side of the /30 inside the netns
-	AppPort        = 8080          // the :8080 contract (spec §2)
-	TenantBridge   = "br-tenants"  // root-ns bridge the veth host-side enslaves to
-	HostBridgeCIDR = "10.100.0.1/16"
+	GuestIP      = "10.0.0.2"
+	GuestGateway = "10.0.0.1"
+	GuestPrefix  = "10.0.0.2/30"
+	TapPrefix    = "10.0.0.1/30" // host (tap0) side of the /30 inside the netns
+	AppPort      = 8080          // the :8080 contract (spec §2)
+	TenantBridge = "br-tenants"  // root-ns bridge the veth host-side enslaves to
 	// nft chain-policy words (ADR-031). Forwarded as the `policy`
 	// value in the per-netns forward-chain argv, so goconst demands
 	// the literals live in named constants.
 	nftPolicyAccept = "accept"
 	nftPolicyDrop   = "drop"
 )
+
+// DefaultHostBridgeIP is the per-host bridge IP (the .1 of the /16
+// the per-instance veth host-side addresses live in). Single-host dev
+// keeps the legacy 10.100.0.1; multi-host deployments override via
+// pkg/api.DefaultHostBridgeCIDR or — for direct callers — by setting
+// Config.HostBridgeIP at construction time. The bridge IP must NOT be
+// inside any host deny CIDR (see pkg/netns/policy.go::Render panic gate).
+//
+// PR scale-out tier-1 residual (Gap #3 wiring): the var stays
+// for legacy direct callers that don't go through
+// SetDefaultHostBridgeIP, but cmd/vmmd/main.go boot MUST call the
+// setter exactly once after loading cfg.ComputeNode.HostBridgeCIDR,
+// before any per-instance NewConfig/NewConfigWithBridge call — so
+// every per-VM default-route points at the right bridge IP on this
+// host (the .1 of the operator-supplied /16).
+var DefaultHostBridgeIP = netip.MustParseAddr("10.100.0.1")
+
+// SetDefaultHostBridgeIP is the boot-time setter for the per-host
+// bridge IP. Mirrors the pattern of pkg/fcvm.SetHostIPBase: callers
+// MUST invoke this exactly once at boot, before any NewConfig /
+// NewConfigWithBridge call, so every per-VM netns default-route
+// points at the right bridge. Idempotent under repeated calls with
+// the same value — that property lets vmmd's "config reload on
+// pg_notify EgressPolicyChanged" path call it again safely without
+// asserting a single-call contract at runtime.
+func SetDefaultHostBridgeIP(addr netip.Addr) {
+	DefaultHostBridgeIP = addr
+}
 
 // Config is the per-instance network plan. All uniqueness (Netns name, veth
 // names, HostIP) comes from the fcvm allocator; this package only turns it into
@@ -34,14 +61,15 @@ const (
 //	                                  │  (veth pair)
 //	netns fc-<instance>:  vethPeer(10.100.x.y/16) ── [route/DNAT] ── tap0(10.0.0.1) ── guest(10.0.0.2)
 type Config struct {
-	Instance   string     // instance id
-	Netns      string     // fc-<instance>
-	Tap        string     // tap0 (identical in every netns)
-	VethHost   string     // root-ns end, enslaved to br-tenants
-	VethPeer   string     // netns end, holds HostIP
-	HostIP     netip.Addr // routable identity, 10.100.x.y
-	HostBits   int        // prefix length for HostIP (16)
-	EgressMbit int        // per-plan egress cap via tc on VethHost; 0 = no cap (legacy / disabled)
+	Instance     string     // instance id
+	Netns        string     // fc-<instance>
+	Tap          string     // tap0 (identical in every netns)
+	VethHost     string     // root-ns end, enslaved to br-tenants
+	VethPeer     string     // netns end, holds HostIP
+	HostIP       netip.Addr // routable identity, 10.100.x.y
+	HostBridgeIP netip.Addr // root-ns bridge IP the netns default-routes through (HostBridgeCIDR/.1). Defaults to DefaultHostBridgeIP (10.100.0.1); multi-host deployments override per-host.
+	HostBits     int        // prefix length for HostIP (16)
+	EgressMbit   int        // per-plan egress cap via tc on VethHost; 0 = no cap (legacy / disabled)
 	// DenySet is the typed egress denylist applied at the per-netns
 	// forward chain. Defaults to NewDefaultDenySet() when zero
 	// (pkg/fcvm/manager.go::Wake does not set it; the renderer falls
@@ -83,19 +111,41 @@ type Config struct {
 	// is enforced by the DB trigger
 	// `apps_egress_allowlist_cidr` (migration 00033, ADR-032).
 	EgressAllowlist []netip.Prefix
+	// OperatorExceptions (PR scale-out tier-1 residual Gap #4):
+	// per-netns accept-before-deny list. Each entry is emitted
+	// as `iifname "tap0" ip saddr <ex> accept` in the per-netns
+	// forward chain, BEFORE the per-CIDR deny block. Operators
+	// set this when bridged tenant traffic over an RFC1918
+	// overlay (e.g. 10.42.0.0/24) would otherwise hit the §11
+	// deny — same semantic as the host-side HostPolicy.
+	// OperatorExceptions, gated behind the manifest flag
+	// `danger_accept_rfc1918_lateral_movement`. Empty by default —
+	// single-host dev keeps the legacy "deny wins on RFC1918"
+	// posture.
+	OperatorExceptions []netip.Prefix
 }
 
 // NewConfig fills the constant fields (tap name, /16) around the allocated names
-// and IP.
+// and IP. HostBridgeIP defaults to DefaultHostBridgeIP (legacy single-box
+// 10.100.0.1); multi-host callers must use NewConfigWithBridge.
 func NewConfig(instance, netnsName, vethHost, vethPeer string, hostIP netip.Addr) Config {
+	return NewConfigWithBridge(instance, netnsName, vethHost, vethPeer, hostIP, DefaultHostBridgeIP)
+}
+
+// NewConfigWithBridge is the multi-host-aware variant of NewConfig. The
+// bridgeIP argument is the root-ns IP the netns default-routes through
+// (the .1 of the per-host /16). It MUST NOT be zero — Render-equivalent
+// commands silently fail when the route points at an invalid gateway.
+func NewConfigWithBridge(instance, netnsName, vethHost, vethPeer string, hostIP, bridgeIP netip.Addr) Config {
 	return Config{
-		Instance: instance,
-		Netns:    netnsName,
-		Tap:      "tap0",
-		VethHost: vethHost,
-		VethPeer: vethPeer,
-		HostIP:   hostIP,
-		HostBits: 16,
+		Instance:     instance,
+		Netns:        netnsName,
+		Tap:          "tap0",
+		VethHost:     vethHost,
+		VethPeer:     vethPeer,
+		HostIP:       hostIP,
+		HostBridgeIP: bridgeIP,
+		HostBits:     16,
 	}
 }
 
@@ -145,7 +195,7 @@ func (c Config) SetupCommands() [][]string {
 		// Lima does not exercise this code path end to end. The bridge IP
 		// is reserved by pkg/fcvm/alloc.go (allocator hands out
 		// 10.100.0.2+, never .1), so no slot-0 collision is possible.
-		inNetns("ip", "route", "add", "default", "via", "10.100.0.1", "dev", c.VethPeer),
+		inNetns("ip", "route", "add", "default", "via", c.HostBridgeIP.String(), "dev", c.VethPeer),
 	}
 }
 
@@ -256,6 +306,20 @@ func (c Config) NftCommands() [][]string {
 	// ever complete. Guest-INITIATED (ct state new) traffic still falls through
 	// to the denies, so lateral movement stays blocked.
 	add("add", "rule", "ip", "faas", "forward", "ct", "state", "established,related", "accept")
+	// PR scale-out tier-1 residual (Gap #4): per-netns operator
+	// exception accept rules. Each entry emits
+	// `iifname tap0 ip saddr <ex> accept` BEFORE the lateral-
+	// movement deny (nftables is first-match, so an RFC1918
+	// exception inside 10/8 must take precedence over the matching
+	// `ip daddr 10.0.0.0/8 drop`). Gated behind the manifest flag
+	// `danger_accept_rfc1918_lateral_movement` — operators must
+	// explicitly authorize the lateral-movement consequence. Empty
+	// OperatorExceptions emits zero rules; per-netns bytes are
+	// byte-identical to the pre-Gap-4 output.
+	for _, ex := range c.OperatorExceptions {
+		add("add", "rule", "ip", "faas", "forward",
+			"iifname", c.Tap, "ip", "saddr", ex.String(), "accept")
+	}
 	// Spec §7 cap (only when ConntrackCap > 0): drop new forward flows whose
 	// origin conntrack table already holds > N entries, so one misbehaving
 	// tenant can't exhaust the host-wide conntrack table. Sits AFTER the

@@ -48,11 +48,12 @@ have, and where the local spool root sits.
   gatewayd-internal handler) and by the S3 lifecycle policy
   the operator attaches at bucket-provision time (see the
   runbook).
-- **No `gregale backup unseal-archive-creds` invocation.** That
+- **No `gregalectl backup unseal-archive-creds` invocation.** That
   CLI ships in PR-A and the operator runs it once during
-  `bootstrap.sh` step 11d (mirrors the `unseal-rclone` flow
-  at `deploy/ansible/roles/postgres/files/postgresql.service.d/
-  99-faas-storage-box.conf`). This role assumes the envelope
+  `bootstrap.sh` step 11d (RETIRED 2026-08-15 by issue #911 / PR-1;
+  v2 path is PR-X `gregalectl secrets init`) — mirrors the `unseal-rclone`
+  flow at `deploy/ansible/roles/postgres/files/postgresql.service.d/
+  99-faas-storage-box.conf`. This role assumes the envelope
   is already on disk; the assert catches any future perms
   drift.
 - **No daemon restart.** `daemon-reload` is fired so the new

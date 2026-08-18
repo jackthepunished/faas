@@ -12,7 +12,7 @@
 #   - sealed.env entries for GITHUB_WEBHOOK_SECRET + the GitHub App
 #     private key (PEM, base64-wrapped)
 #   - PKI leaves under /etc/faas/tls/githubd/ (laid out by
-#     `gregale pki init --box-role=control-plane` — PR-3)
+#     `gregalectl pki init --box-role=control-plane` — PR-3)
 #   - enable the unit (`systemctl enable --now faas-githubd`)
 #   - run the daemon (the apid-side bridged client is the trigger)
 
@@ -37,3 +37,28 @@
   ansible.builtin.systemd:
     daemon_reload: true
   when: githubd_unit.changed
+
+# Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
+# env line into the githubd unit. Drop-in mirrors deploy/ansible/
+# roles/control_plane_service/templates/99-faas-node-name.conf.j2
+# — body is identical across roles.
+- name: githubd_service — install FAAS_NODE_NAME drop-in (Mega-PR-A)
+  ansible.builtin.template:
+    src: ../../_shared/templates/99-faas-node-name.conf.j2
+    dest: /etc/systemd/system/faas-githubd.service.d/99-faas-node-name.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to githubd via FAAS_GITHUBD_ROLE so cmd/githubd/config.go
+# ::LoadConfig picks up faas_box_role (control-plane on fsn-1).
+# See roles/githubd_service/templates/99-faas-role.conf.j2 for
+# the full rationale.
+- name: githubd_service — install FAAS_GITHUBD_ROLE drop-in (Mega-PR-C)
+  ansible.builtin.template:
+    src: 99-faas-role.conf.j2
+    dest: /etc/systemd/system/faas-githubd.service.d/99-faas-role.conf
+    owner: root
+    group: root
+    mode: "0644"

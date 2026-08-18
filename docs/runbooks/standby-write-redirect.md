@@ -52,7 +52,7 @@ Before relying on the writeGate, verify:
    active node.** The 307-redirect's `Location:` header is
    built from this column; an empty `public_ip` would
    produce a malformed URL. Set via the
-   `gregale compute-nodes set-public-ip <name> <ip>` CLI.
+   `gregalectl compute-nodes set-public-ip <name> <ip>` CLI.
 6. **The four `StandbyWrite*` quotas are wired in
    `pkg/api/limits.go`** (they ship with Tier A9 — no action
    needed unless you've explicitly zeroed them):
@@ -173,7 +173,7 @@ required.
 - **Drill counter regression** (a row that previously
   asserted `≥ 1` now asserts `0`): check the mTLS material
   on the relay box (the egress-client cert may have
-  expired). The `gregale pki rotate` CLI handles renewal;
+  expired). The `gregalectl pki rotate` CLI handles renewal;
   the gate's `mTLS_failure` outcome + cross-link on
   `gateway_active_passive_failovers_total` surfaces this.
 - **Leader drift** (the standby is now being treated as the
@@ -183,7 +183,7 @@ required.
   drill's pre-flight will surface a `leader_unreachable`
   cell advancement.
 - **Cert expiry** (relay hops fail with TLS errors): renew
-  via the existing `gregale pki rotate` flow. The
+  via the existing `gregalectl pki rotate` flow. The
   `mTLS_failure` outcome is the dashboard signal; the
   runbook's matrix row documents the response.
 - **`loop_prevented` cell advances in production** (a 508

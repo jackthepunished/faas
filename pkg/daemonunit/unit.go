@@ -69,9 +69,9 @@ type LoadCred struct {
 // ambient caps elevated at fork; the unit runs with no extra caps).
 // Non-empty ⇒ space-separated names; `CAP_*` and `cap_*` are both valid.
 //
-// RuntimeDirectory + RuntimeDirectoryMode are emitted as a pair; an
-// empty RuntimeDirectory with a non-empty Mode is silently dropped by
-// Render() (systemd would warn, but we keep the surface flat).
+// RuntimeDirectory + RuntimeDirectoryMode are emitted as a pair for legacy
+// unit specs; an empty RuntimeDirectory with a non-empty Mode is silently
+// dropped by Render() (systemd would warn, but we keep the surface flat).
 type Unit struct {
 	// [Unit]
 	Description   string
@@ -86,6 +86,7 @@ type Unit struct {
 	Group                 string
 	ExecStart             string
 	ExecStartPre          []string // ordered (vmmd has 2; nobody else has any)
+	ExecStartPost         []string // ordered post-start fixups (vmmd runtime dir)
 	Restart               string
 	RestartSec            string
 	Slice                 string
@@ -118,7 +119,7 @@ type Unit struct {
 	// Filesystem
 	ReadOnlyPaths        []string
 	ReadWritePaths       []string
-	RuntimeDirectory     string // "faas" only on vmmd (SOLE invariant; see ADR-078)
+	RuntimeDirectory     string // legacy generic field; vmmd uses host tmpfiles instead
 	RuntimeDirectoryMode string
 
 	// [Install]
@@ -172,6 +173,11 @@ func (u Unit) Render() []byte {
 		buf.WriteByte('\n')
 	}
 	writeStringKV(&buf, "ExecStart", u.ExecStart)
+	for _, post := range u.ExecStartPost {
+		buf.WriteString("ExecStartPost=")
+		buf.WriteString(post)
+		buf.WriteByte('\n')
+	}
 	writeStringKV(&buf, "Restart", u.Restart)
 	writeStringKV(&buf, "RestartSec", u.RestartSec)
 	writeStringKV(&buf, "Slice", u.Slice)
@@ -298,6 +304,48 @@ func (u Unit) Render() []byte {
 	return buf.Bytes()
 }
 
+// RenderSlice emits the unit file as bytes for a [Slice] section unit
+// (the parent cgroup wrapper, e.g. faas-cp.slice). The unit file
+// shape is [Unit] + [Slice] + [Install] — NO [Service] section. Slice
+// units use a subset of the same Unit fields: Description, After, Wants,
+// Requires ([Unit]), Slice, MemoryMax, CPUWeight, IOWeight ([Slice]),
+// WantedBy ([Install]).
+//
+// MemoryMax belongs in [Slice] here, NOT [Service]; systemd silently
+// ignores MemoryMax in a [Service] section if the unit is a slice.
+// Putting it in [Service] (as Render() does) means the 3 GB ceiling
+// the operator declared in the manifest's faas-cp.slice never
+// applies, and tenants can OOM the box.
+//
+// The renderer is the only caller today; pkg/daemonunitspec.UnitSlice()
+// produces the Unit value. The Slice field on the Unit is unused for
+// the slice unit itself (it's the unit's own name, derivable from
+// the file path) — it's set to self-reference for symmetry with the
+// service-unit shape but RenderSlice ignores it.
+func (u Unit) RenderSlice() []byte {
+	var buf bytes.Buffer
+	buf.WriteString("[Unit]\n")
+	writeStringKV(&buf, "Description", u.Description)
+	if u.Documentation != "" {
+		buf.WriteString("Documentation=")
+		buf.WriteString(u.Documentation)
+		buf.WriteByte('\n')
+	}
+	writeStringList(&buf, "After", u.After)
+	writeStringList(&buf, "Wants", u.Wants)
+	writeStringList(&buf, "Requires", u.Requires)
+	buf.WriteByte('\n')
+
+	buf.WriteString("[Slice]\n")
+	writeStringKV(&buf, "MemoryMax", u.MemoryMax)
+
+	buf.WriteByte('\n')
+	buf.WriteString("[Install]\n")
+	writeStringKV(&buf, "WantedBy", u.WantedBy)
+
+	return buf.Bytes()
+}
+
 // writeStringKV appends `<key>=<value>\n` if value != "".
 func writeStringKV(buf *bytes.Buffer, key, value string) {
 	if value == "" {
@@ -408,6 +456,8 @@ func apply(u *Unit, section, key, val string) error {
 		u.ExecStart = val
 	case "[Service]/ExecStartPre":
 		u.ExecStartPre = append(u.ExecStartPre, val)
+	case "[Service]/ExecStartPost":
+		u.ExecStartPost = append(u.ExecStartPost, val)
 	case "[Service]/Restart":
 		u.Restart = val
 	case "[Service]/RestartSec":
@@ -578,6 +628,7 @@ func Diff(a, b Unit) []string {
 	add("[Service]", "Group", a.Group, b.Group)
 	add("[Service]", "ExecStart", a.ExecStart, b.ExecStart)
 	add("[Service]", "ExecStartPre", fmt.Sprintf("%v", a.ExecStartPre), fmt.Sprintf("%v", b.ExecStartPre))
+	add("[Service]", "ExecStartPost", fmt.Sprintf("%v", a.ExecStartPost), fmt.Sprintf("%v", b.ExecStartPost))
 	add("[Service]", "Restart", a.Restart, b.Restart)
 	add("[Service]", "RestartSec", a.RestartSec, b.RestartSec)
 	add("[Service]", "Slice", a.Slice, b.Slice)

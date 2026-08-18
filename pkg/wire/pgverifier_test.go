@@ -485,3 +485,80 @@ func TestPGNodeVerifier_PublishSnapshot_Empty(t *testing.T) {
 		t.Errorf("empty-snapshot PublishSnapshot len=%d; want 0", len(got))
 	}
 }
+
+// TestPGNodeVerifier_CertFingerprintByCN covers PR-3:
+//   - registered CN with a fingerprint returns the fingerprint
+//   - registered CN with an empty fingerprint returns ErrCertFingerprintNotRegistered
+//   - unknown CN returns ErrCertFingerprintNotRegistered
+//   - nil receiver returns ErrCertFingerprintNotRegistered
+//   - PublishSnapshot includes the fingerprint field (pre-PR-3
+//     boxes published only CN+ID — the doctor consumes the new
+//     field via PublishSnapshot too)
+func TestPGNodeVerifier_CertFingerprintByCN(t *testing.T) {
+	loader := &stubNodeLoader{rows: []NodeRow{
+		{CN: "vmmd", ID: "uuid-1", CertFingerprint: "sha256:" + repeat64("a")},
+		{CN: "schedd", ID: "uuid-2", CertFingerprint: "sha256:" + repeat64("b")},
+		{CN: "imaged", ID: "uuid-3", CertFingerprint: ""}, // pre-PR-X box
+	}}
+	v := NewPGNodeVerifier(loader, newSilentLogger())
+	if _, err := v.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// Registered CN with fingerprint.
+	if got, err := v.CertFingerprintByCN("vmmd"); err != nil {
+		t.Errorf("CertFingerprintByCN(vmmd) err=%v; want nil", err)
+	} else if got != "sha256:"+repeat64("a") {
+		t.Errorf("CertFingerprintByCN(vmmd) = %q; want %q", got, "sha256:"+repeat64("a"))
+	}
+
+	// Registered CN with empty fingerprint (pre-PR-X box).
+	if got, err := v.CertFingerprintByCN("imaged"); !errors.Is(err, ErrCertFingerprintNotRegistered) {
+		t.Errorf("CertFingerprintByCN(imaged) err=%v; want ErrCertFingerprintNotRegistered", err)
+	} else if got != "" {
+		t.Errorf("CertFingerprintByCN(imaged) = %q; want empty", got)
+	}
+
+	// Unknown CN.
+	if got, err := v.CertFingerprintByCN("unknown"); !errors.Is(err, ErrCertFingerprintNotRegistered) {
+		t.Errorf("CertFingerprintByCN(unknown) err=%v; want ErrCertFingerprintNotRegistered", err)
+	} else if got != "" {
+		t.Errorf("CertFingerprintByCN(unknown) = %q; want empty", got)
+	}
+
+	// nil receiver.
+	var nilV *PGNodeVerifier
+	if got, err := nilV.CertFingerprintByCN("vmmd"); !errors.Is(err, ErrCertFingerprintNotRegistered) {
+		t.Errorf("nil CertFingerprintByCN err=%v; want ErrCertFingerprintNotRegistered", err)
+	} else if got != "" {
+		t.Errorf("nil CertFingerprintByCN = %q; want empty", got)
+	}
+
+	// PublishSnapshot must include the fingerprint.
+	snap := v.PublishSnapshot()
+	if len(snap) != 3 {
+		t.Fatalf("PublishSnapshot len=%d; want 3", len(snap))
+	}
+	found := false
+	for _, r := range snap {
+		if r.CN == "vmmd" {
+			found = true
+			if r.CertFingerprint != "sha256:"+repeat64("a") {
+				t.Errorf("PublishSnapshot vmmd CertFingerprint = %q; want %q", r.CertFingerprint, "sha256:"+repeat64("a"))
+			}
+		}
+	}
+	if !found {
+		t.Errorf("PublishSnapshot missing vmmd row")
+	}
+}
+
+// repeat64 returns the same byte repeated 64 times — a small helper
+// to keep fingerprint literals readable.
+func repeat64(b string) string {
+	out := make([]byte, 0, 64)
+	for i := 0; i < 64; i++ {
+		out = append(out, b[0])
+	}
+	return string(out)
+}

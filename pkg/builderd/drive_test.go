@@ -86,6 +86,28 @@ func TestCopySourceTarball_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestWriteBuildEntropy(t *testing.T) {
+	mp := t.TempDir()
+	if err := writeBuildEntropy(mp); err != nil {
+		t.Fatalf("writeBuildEntropy: %v", err)
+	}
+	seedPath := filepath.Join(mp, "etc", "faas", "entropy.seed")
+	seed, err := os.ReadFile(seedPath)
+	if err != nil {
+		t.Fatalf("read seed: %v", err)
+	}
+	if len(seed) != 256 {
+		t.Fatalf("seed length = %d, want 256", len(seed))
+	}
+	info, err := os.Stat(seedPath)
+	if err != nil {
+		t.Fatalf("stat seed: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("seed mode = %o, want 600", got)
+	}
+}
+
 // TestCreateBuildDrive1_StagedTarballMatches is the end-to-end metal-side
 // check (issue #54 acceptance: ls /build/src/ is non-empty inside the VM).
 // It runs the real mkfs + loopback mount, copies the host tarball in, and
@@ -128,7 +150,7 @@ func TestCreateBuildDrive1_StagedTarballMatches(t *testing.T) {
 		t.Fatalf("CreateBuildDrive1: %v", err)
 	}
 
-	// Re-mount the produced drive1 and verify /build/src.tar matches the
+	// Re-mount the produced drive1 and verify /upper/build/src.tar matches the
 	// host source. This is what guest-init sees on first boot.
 	mp := t.TempDir()
 	if out, err := runMount(ctx, "-o", "loop,rw", drive1, mp); err != nil {
@@ -136,7 +158,7 @@ func TestCreateBuildDrive1_StagedTarballMatches(t *testing.T) {
 	}
 	defer func() { _, _ = runUmount(mp) }()
 
-	gotSum, err := fileSHA256(filepath.Join(mp, "build", "src.tar"))
+	gotSum, err := fileSHA256(filepath.Join(mp, "upper", "build", "src.tar"))
 	if err != nil {
 		t.Fatalf("re-stat staged: %v", err)
 	}

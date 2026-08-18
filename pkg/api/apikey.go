@@ -126,6 +126,15 @@ const (
 	// new scope, closing the quota-bypass path.
 	ScopeRegistryCredentialsRead  = "registry_credentials:read"
 	ScopeRegistryCredentialsWrite = "registry_credentials:write"
+	// ADR-098 §D4: upstreams:write scopes POST/DELETE on
+	// /v1/apps/{slug}/upstreams/{id}. Distinct from env:write
+	// because the resource is a (kind, host, port) tuple — adding
+	// or removing it doesn't touch the env surface. The Free-plan
+	// gate (CodePlanDataUpstreamsNotAllowed) is independent of this
+	// scope check (a Hobby customer without upstreams:write still
+	// can't POST, and a Scale customer with only env:write still
+	// can't POST upstreams).
+	ScopeUpstreamsWrite = "upstreams:write"
 )
 
 // validScopes is the closed set of scope strings the API accepts. The
@@ -141,6 +150,7 @@ var validScopes = map[string]struct{}{
 	ScopeEnvWrite:                 {},
 	ScopeRegistryCredentialsRead:  {},
 	ScopeRegistryCredentialsWrite: {},
+	ScopeUpstreamsWrite:           {},
 }
 
 // IsValidScope reports whether s is in the allowed scope vocabulary.
@@ -214,6 +224,16 @@ var (
 	// runtime config (see handlers_env.go file header for the
 	// trust-model rationale + ADR-045 §Decision).
 	ScopesEnvWriteSurface = []string{ScopeAdmin, ScopeEnvWrite}
+
+	// ScopesUpstreamWriteSurface: PUT/DELETE on
+	// /v1/apps/{slug}/upstreams/{id} (ADR-098 §D4). Granted by
+	// admin or upstreams:write. NOT MFA-gated because the explicit
+	// POST only adds a hint — it does NOT alter what data leaves
+	// the cluster (the env-classifier's inferred path is the
+	// authoritative source). The Free-plan gate (402
+	// CodePlanDataUpstreamsNotAllowed) is independent of this
+	// scope check.
+	ScopesUpstreamWriteSurface = []string{ScopeAdmin, ScopeUpstreamsWrite}
 
 	// ScopesRegistryCredentialsReadSurface: GET on
 	// /v1/apps/{slug}/registry-credentials (issue #461 / ADR-062).

@@ -109,6 +109,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err := role.Require("githubd", cfg.Role, role.RoleSingleBox, role.RoleControlPlane); err != nil {
 		return err
 	}
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity. Mirrors schedd/apid/meterd/gatewayd-public
+	// so the playbook shape is identical across daemons.
+	if cfg.NodeName != "" {
+		log.Info("githubd owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("githubd: legacy single-box (cfg.NodeName empty)")
+	}
 
 	pool, err := deps.openDB(ctx, "")
 	if err != nil {

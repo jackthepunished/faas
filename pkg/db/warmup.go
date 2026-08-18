@@ -28,7 +28,7 @@ var ErrWarmUpTimeout = errors.New("db: warm up timeout")
 // solving the post-bind "closed pool" failure mode that hit
 // cmd/apid's TestRekeyRunnerPg e2e across PR #823 (where 8+
 // bgBefore goroutines simultaneously called pool.Acquire on a
-// MaxConns=8 pool; the first-Subscribe errors in any one goroutine
+// MaxConns=16 pool; the first-Subscribe errors in any one goroutine
 // surfaced as "closed pool" inside the others).
 //
 //	acquired = 0
