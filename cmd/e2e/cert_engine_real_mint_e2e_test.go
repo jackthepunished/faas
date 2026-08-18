@@ -155,12 +155,12 @@ func TestE2E_CertEngine_RealMintEndToEnd(t *testing.T) {
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// Migration 00277 is the PR-D cert_kind CHECK widening that
+	// Migration 00284 is the PR-D cert_kind CHECK widening that
 	// admits the per_host value. The test doesn't write a
 	// per_host row today (only per_host_san is mintable per
 	// commit 6) but we pin the wait so a backport that lands
-	// 00277 later doesn't silently break the test.
-	pgtest.WaitForMigration(t, pool, 277, 10*time.Second)
+	// 00284 later doesn't silently break the test.
+	pgtest.WaitForMigration(t, pool, 284, 10*time.Second)
 
 	store := state.NewPgStore(pool)
 

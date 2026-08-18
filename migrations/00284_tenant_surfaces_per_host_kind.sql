@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00277_tenant_surfaces_per_host_kind.sql — PR-D
+-- 00284_tenant_surfaces_per_host_kind.sql — PR-D
 -- cert-engine-real-mint (issue #879 / ADR-100) commit 5.
 -- Widen the cert_kind closed-set on tenant_surfaces to include
 -- 'per_host'. The per_host value represents the >MaxSANPerCert

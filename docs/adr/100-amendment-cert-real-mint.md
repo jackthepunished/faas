@@ -41,7 +41,7 @@ ADR-100:
    deduplicates.
 3. Per-host cert shape: see "San-set semantics" below.
 4. `shared_wildcard` deferral: schema accepts the value
-   (`migrations/00277_tenant_surfaces_per_host_kind.sql`) but the
+   (`migrations/00284_tenant_surfaces_per_host_kind.sql`) but the
    issuer rejects with a typed sentinel
    (`state.ErrUnsupportedCertKind`) until the customer-zone
    DNS-01 solver lands.
@@ -131,7 +131,7 @@ pg_notify-touchable surfaces:
   renewer's predicate reader.
 - `state.Store.TouchTenantSurfaceForRenewal(ctx, id) error`
   (interface, PR-D commit 3): the renewer's pg_notify kick.
-- `migrations/00277_tenant_surfaces_per_host_kind.sql`
+- `migrations/00284_tenant_surfaces_per_host_kind.sql`
   (migration, PR-D commit 5): widens the `cert_kind` CHECK to
   admit `per_host` for the future ADR-114 bundler shape.
 - `state.ErrUnsupportedCertKind` (typed sentinel, PR-D commit 5):

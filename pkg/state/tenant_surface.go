@@ -44,7 +44,7 @@ const (
 	// rejects this value today with a clear
 	// "per-host bundler ships in follow-up ADR-114" last_error;
 	// the constant lands in PR-D commit 5 so the schema
-	// accepts it (migration 00277) and a follow-up ADR doesn't
+	// accepts it (migration 00284) and a follow-up ADR doesn't
 	// need a schema-touching migration.
 	CertKindPerHost CertKind = "per_host"
 )
