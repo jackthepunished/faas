@@ -71,6 +71,20 @@ func TestDetectFromTarball_Node(t *testing.T) {
 	}
 }
 
+func TestDetectFromTarball_PackedTopLevelDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.tar.gz")
+	makeTarball(t, path, []string{"app/package.json", "app/index.js"})
+
+	got, err := DetectFromTarball(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != FrameworkNode {
+		t.Errorf("framework = %s, want node for a single packed directory prefix", got)
+	}
+}
+
 func TestDetectFromTarball_Python(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "src.tar.gz")

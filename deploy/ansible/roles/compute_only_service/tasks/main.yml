@@ -42,6 +42,34 @@
     group: faas
     mode: "0640"
 
+# Split-box local-backend fallback. Public multi-node deployments should use
+# FAAS_STORAGE_BACKEND=oci; this helper exists for an installation that keeps
+# local storage while placing imaged on compute and schedd on control. It is
+# only invoked when FAAS_ARTIFACT_REPLICATOR is present in imaged.env.
+- name: compute_only_service — ensure artifact helper directory exists
+  ansible.builtin.file:
+    path: /usr/local/libexec
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: compute_only_service — install split-box artifact replicator
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/faas-artifact-replicator.sh"
+    dest: /usr/local/libexec/faas-artifact-replicator
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: compute_only_service — drop artifact sync example
+  ansible.builtin.copy:
+    src: artifact-sync.env.example
+    dest: /etc/faas/artifact-sync.env.example
+    owner: root
+    group: faas
+    mode: "0640"
+
 - name: compute_only_service — install systemd unit
   ansible.builtin.copy:
     src: faas-imaged.service
@@ -74,11 +102,9 @@
 
 # Mega-PR-C (issue #911 / ADR-110) — fix the reboot race. The
 # chown above only runs at provisioning time; on every reboot
-# of fsn-2, /run/faas is created by systemd's
-# RuntimeDirectory=faas as root:root 0755 first (systemd does
-# NOT honor RuntimeDirectoryGroup on a unit without User= and
-# vmmd has no User=). The chown above does NOT re-fire. Mirror
-# control_plane_service's PR-D pattern: ship a tmpfiles.d rule
+# of fsn-2, /run/faas is created on the host by tmpfiles.d before
+# services start. The chown above does NOT re-fire on a reboot;
+# mirror control_plane_service's PR-D pattern: ship a tmpfiles.d rule
 # + run systemd-tmpfiles --create during deploy so /run/faas
 # exists with the canonical root:faas 0775 ownership BEFORE
 # the first vmmd activation on a fresh box. The vmmd unit's

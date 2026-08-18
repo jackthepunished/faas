@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -288,6 +289,35 @@ func (v *JailerVMM) chrootRoot(instance string) string {
 	return filepath.Join(v.chrootBase, v.fcName, instance, "root")
 }
 
+// resolveDriveImage finds the writable drive inside Jailer’s chroot. The
+// canonical layer name is used when present; builderd and older callers may
+// preserve the source basename, so accept a single ext4 fallback as well.
+func (v *JailerVMM) resolveDriveImage(instance string) (string, error) {
+	root := v.chrootRoot(instance)
+	canonical := filepath.Join(root, layerImageName)
+	if _, err := os.Stat(canonical); err == nil {
+		return canonical, nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve drive1: read chroot root: %w", err)
+	}
+	var found string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".ext4") {
+			continue
+		}
+		if found != "" {
+			return "", fmt.Errorf("resolve drive1: multiple ext4 images in %s", root)
+		}
+		found = entry.Name()
+	}
+	if found == "" {
+		return "", fmt.Errorf("resolve drive1: no ext4 image in %s", root)
+	}
+	return filepath.Join(root, found), nil
+}
+
 func (v *JailerVMM) socketPath(instance string) string {
 	return filepath.Join(v.chrootRoot(instance), APISockName)
 }
@@ -308,11 +338,11 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 	if err := spec.Validate(); err != nil {
 		return fmt.Errorf("vmm: cold boot: %w", err)
 	}
-	kernelSrc, err := v.materializeFromStorage(ctx, l.Instance, spec.KernelKey)
+	kernelSrc, err := v.restoreSourceFromStorage(ctx, l.Instance, spec.KernelKey)
 	if err != nil {
 		return fmt.Errorf("vmm: stage kernel: %w", err)
 	}
-	baseSrc, err := v.materializeFromStorage(ctx, l.Instance, spec.BaseKey)
+	baseSrc, err := v.restoreSourceFromStorage(ctx, l.Instance, spec.BaseKey)
 	if err != nil {
 		return fmt.Errorf("vmm: stage base: %w", err)
 	}
@@ -323,14 +353,14 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 	// field with the staged tmp path so BuildColdBootConfig's
 	// PathOnHost reads point at the chroot-basename tmp files.
 	if len(spec.Workloads) == 0 {
-		layerSrc, mErr := v.materializeFromStorage(ctx, l.Instance, spec.LayerKey)
+		layerSrc, mErr := v.restoreSourceFromStorage(ctx, l.Instance, spec.LayerKey)
 		if mErr != nil {
 			return fmt.Errorf("vmm: stage layer: %w", mErr)
 		}
 		spec.LayerKey = layerSrc
 	} else {
 		for i := range spec.Workloads {
-			resolved, mErr := v.materializeFromStorage(ctx, l.Instance, spec.Workloads[i].StorageKey)
+			resolved, mErr := v.restoreSourceFromStorage(ctx, l.Instance, spec.Workloads[i].StorageKey)
 			if mErr != nil {
 				return fmt.Errorf("vmm: stage workload %d (%s): %w", i, spec.Workloads[i].Name, mErr)
 			}
@@ -347,7 +377,14 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 	// readiness probe path. Empty keeps the legacy TCP-accept on :8080
 	// (pre-PR-D default). Non-empty → waitReady does HTTP GET
 	// <HealthcheckPath> against <HostIP>:8080 and accepts 2xx as ready.
+	if spec.SkipReady {
+		return v.bootNoWait(ctx, l, BuildColdBootConfig(spec, l.Slot))
+	}
 	return v.Boot(ctx, l, BuildColdBootConfig(spec, l.Slot), spec.HealthcheckPath)
+}
+
+func (v *JailerVMM) bootNoWait(ctx context.Context, l Lease, cfg VMConfig) error {
+	return v.boot(ctx, l, cfg, true, "")
 }
 
 // Boot provisions the chroot, starts the jailed firecracker with a full config,
@@ -368,6 +405,10 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 // Move 4 (issue #254): registerRing is called BEFORE startJailer so
 // cmd.Stdout can be wired to the ring's writer in startJailer.
 func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig, healthcheckPath string) (err error) {
+	return v.boot(ctx, l, cfg, false, healthcheckPath)
+}
+
+func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady bool, healthcheckPath string) (err error) {
 	root, err := v.mkChroot(l.Instance)
 	if err != nil {
 		return err
@@ -406,8 +447,10 @@ func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig, healthcheck
 	// see VMConfig). Firecracker attaches it pre-start; the UDS at
 	// vsockUDSSock is created by the time startJailer returns. No
 	// post-start PUT needed.
-	if err = v.waitReady(ctx, l, healthcheckPath); err != nil {
-		return fmt.Errorf("vmm: readiness: %w", err)
+	if !skipReady {
+		if err = v.waitReady(ctx, l, healthcheckPath); err != nil {
+			return fmt.Errorf("vmm: readiness: %w", err)
+		}
 	}
 	return nil
 }
@@ -441,7 +484,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// deferred Kill (chroot lives on tmpfs and disappears with it).
 	memSrc := spec.VMStatePath
 	if spec.StorageKey != "" && v.storage != nil {
-		memTmp, gerr := v.materializeFromStorage(ctx, l.Instance, spec.StorageKey)
+		memTmp, gerr := v.restoreSourceFromStorage(ctx, l.Instance, spec.StorageKey)
 		if gerr != nil {
 			return gerr
 		}
@@ -467,7 +510,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// (the existing single-box behaviour).
 	stateSrc := spec.VMStatePath
 	if spec.VMStateStorageKey != "" && v.storage != nil {
-		stateTmp, gerr := v.materializeFromStorage(ctx, l.Instance, spec.VMStateStorageKey)
+		stateTmp, gerr := v.restoreSourceFromStorage(ctx, l.Instance, spec.VMStateStorageKey)
 		if gerr != nil {
 			return gerr
 		}
@@ -508,11 +551,11 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if len(spec.Workloads) == 0 && spec.LayerKey == "" {
 		return fmt.Errorf("vmm: restore spec missing layer: %+v", spec)
 	}
-	kernelSrc, err := v.materializeFromStorage(ctx, l.Instance, spec.KernelKey)
+	kernelSrc, err := v.restoreSourceFromStorage(ctx, l.Instance, spec.KernelKey)
 	if err != nil {
 		return fmt.Errorf("vmm: stage kernel: %w", err)
 	}
-	baseSrc, err := v.materializeFromStorage(ctx, l.Instance, spec.BaseKey)
+	baseSrc, err := v.restoreSourceFromStorage(ctx, l.Instance, spec.BaseKey)
 	if err != nil {
 		return fmt.Errorf("vmm: stage base: %w", err)
 	}
@@ -524,13 +567,13 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	var layerSrc string
 	resolvedWorkloads := make([]string, 0, len(spec.Workloads))
 	if len(spec.Workloads) == 0 {
-		layerSrc, err = v.materializeFromStorage(ctx, l.Instance, spec.LayerKey)
+		layerSrc, err = v.restoreSourceFromStorage(ctx, l.Instance, spec.LayerKey)
 		if err != nil {
 			return fmt.Errorf("vmm: stage layer: %w", err)
 		}
 	} else {
 		for i, w := range spec.Workloads {
-			resolved, mErr := v.materializeFromStorage(ctx, l.Instance, w.StorageKey)
+			resolved, mErr := v.restoreSourceFromStorage(ctx, l.Instance, w.StorageKey)
 			if mErr != nil {
 				return fmt.Errorf("vmm: stage workload %d (%s): %w", i, w.Name, mErr)
 			}
@@ -543,10 +586,10 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 			}
 		}
 	}
-	if _, err := stageReadOnly(root, kernelSrc); err != nil {
+	if _, err := stageReadOnlyAs(root, kernelSrc, stableReadOnlyName(kernelSrc, kernelImageName)); err != nil {
 		return fmt.Errorf("vmm: stage kernel: %w", err)
 	}
-	if _, err := stageReadOnly(root, baseSrc); err != nil {
+	if _, err := stageReadOnlyAs(root, baseSrc, stableReadOnlyName(baseSrc, baseImageName)); err != nil {
 		return fmt.Errorf("vmm: stage base: %w", err)
 	}
 	// layerSrc is empty when cold-booting without a layer (cold path, no snapshot yet).
@@ -570,11 +613,11 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// Snapshot files are read-only inputs shared across the N instances a single
 	// snapshot may restore (invariant §6.2-5): hardlink them in and widen for read
 	// rather than chown, which would rewrite the shared inode owner.
-	memName, err := stageReadOnly(root, memSrc)
+	memName, err := stageReadOnlyAs(root, memSrc, memSnapshotName)
 	if err != nil {
 		return fmt.Errorf("vmm: stage mem file: %w", err)
 	}
-	stateName, err := stageReadOnly(root, stateSrc)
+	stateName, err := stageReadOnlyAs(root, stateSrc, vmstateSnapshotName)
 	if err != nil {
 		return fmt.Errorf("vmm: stage vmstate: %w", err)
 	}
@@ -961,17 +1004,44 @@ func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec Snapsho
 	// unaffected. As with mem, Put failure is Warn-level (best-effort
 	// durability in this slice; later slices may tighten) so a
 	// transient backend hiccup doesn't fail a successful pause.
-	memTmp, err := os.CreateTemp("", "faas-snap-*.mem")
-	if err != nil {
-		return SnapshotInfo{}, fmt.Errorf("vmm: alloc snapshot mem tmp: %w", err)
+	// A local backend already owns the canonical destination on the same
+	// filesystem as the jail. Publish the Firecracker-produced mem file by
+	// rename instead of copying it through a private /tmp and then copying it
+	// back into storage. This matters for 1 GiB+ snapshots and also avoids a
+	// systemd PrivateTmp namespace making the intermediate file invisible to
+	// operators. Remote backends keep the streaming temp-file path below.
+	var memTmpPath string
+	var memBytes int64
+	var err error
+	memPublishedLocally := false
+	if spec.StorageKey != "" && v.storage != nil {
+		if resolver, ok := v.storage.(storage.LocalPathResolver); ok {
+			if localPath, pathOK, pathErr := resolver.LocalPath(spec.StorageKey); pathErr != nil {
+				return SnapshotInfo{}, fmt.Errorf("vmm: resolve snapshot mem path: %w", pathErr)
+			} else if pathOK {
+				var moveErr error
+				memBytes, moveErr = moveOut(filepath.Join(root, memName), localPath)
+				if moveErr != nil {
+					return SnapshotInfo{}, fmt.Errorf("vmm: publish local snapshot mem: %w", moveErr)
+				}
+				memPublishedLocally = true
+			}
+		}
 	}
-	memTmpPath := memTmp.Name()
-	_ = memTmp.Close()
-	defer func() { _ = os.Remove(memTmpPath) }()
 
-	memBytes, err := moveOut(filepath.Join(root, memName), memTmpPath)
-	if err != nil {
-		return SnapshotInfo{}, fmt.Errorf("vmm: export mem: %w", err)
+	if !memPublishedLocally {
+		memTmp, tmpErr := os.CreateTemp("", "faas-snap-*.mem")
+		if tmpErr != nil {
+			return SnapshotInfo{}, fmt.Errorf("vmm: alloc snapshot mem tmp: %w", tmpErr)
+		}
+		memTmpPath = memTmp.Name()
+		_ = memTmp.Close()
+		defer func() { _ = os.Remove(memTmpPath) }()
+
+		memBytes, err = moveOut(filepath.Join(root, memName), memTmpPath)
+		if err != nil {
+			return SnapshotInfo{}, fmt.Errorf("vmm: export mem: %w", err)
+		}
 	}
 	// Vmstate publication branches on VMStateStorageKey exactly like mem
 	// does on StorageKey. Same predicate shape (key + non-nil storage);
@@ -1010,7 +1080,7 @@ func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec Snapsho
 		}
 	}
 
-	if spec.StorageKey != "" && v.storage != nil {
+	if spec.StorageKey != "" && v.storage != nil && !memPublishedLocally {
 		// nolint:forbidigo // memTmpPath is a vmmd-allocated tmp under
 		// os.TempDir(); not a customer-supplied location, so the
 		// openCustomerFile guard does not apply.
@@ -1173,7 +1243,8 @@ func (v *JailerVMM) DestroyWithExport(ctx context.Context, l Lease, exportDir st
 	// 1. Wait for the firecracker child to exit. The watchdog goroutine started
 	//    by startJailer is the single point that calls cmd.Process.Wait;
 	//    DestroyWithExport just blocks on rec.done and reads rec.exitCode.
-	deadline := time.NewTimer(v.destroyWait)
+	destroyWait := v.destroyWaitFor(exportDir)
+	deadline := time.NewTimer(destroyWait)
 	defer deadline.Stop()
 	select {
 	case <-rec.done:
@@ -1189,7 +1260,7 @@ func (v *JailerVMM) DestroyWithExport(ctx context.Context, l Lease, exportDir st
 		select {
 		case <-rec.done:
 		case <-time.After(5 * time.Second):
-			return -1, fmt.Errorf("vmm: %s did not exit within %s", l.Instance, v.destroyWait)
+			return -1, fmt.Errorf("vmm: %s did not exit within %s", l.Instance, destroyWait)
 		}
 	}
 
@@ -1256,9 +1327,9 @@ func (v *JailerVMM) exportBuildArtifacts(instance, exportDir string) error {
 	if err := os.MkdirAll(exportDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir export: %w", err)
 	}
-	drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
-	if _, err := os.Stat(drive1); err != nil {
-		return fmt.Errorf("stat drive1: %w", err)
+	drive1, err := v.resolveDriveImage(instance)
+	if err != nil {
+		return err
 	}
 	mp, err := os.MkdirTemp("", "faas-vmm-export-")
 	if err != nil {
@@ -1266,14 +1337,20 @@ func (v *JailerVMM) exportBuildArtifacts(instance, exportDir string) error {
 	}
 	defer func() { _ = os.RemoveAll(mp) }()
 
-	// mount -o loop,ro — read-only is enough; the VM is dead by this point.
-	if out, err := exec.Command("mount", "-o", "loop,ro", drive1, mp).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
+	// Export is read-only: the guest has already synced the upperdir before
+	// powering off. Mount ro,noload first so a dirty ext4 journal cannot make
+	// the host block in rw journal replay while the builder queue is waiting.
+	// A plain read-only mount remains a compatibility fallback for images whose
+	// filesystem features reject noload.
+	if out, mountErr := exec.Command("mount", "-o", "loop,ro,noload", drive1, mp).CombinedOutput(); mountErr != nil {
+		if roOut, roErr := exec.Command("mount", "-o", "loop,ro", drive1, mp).CombinedOutput(); roErr != nil {
+			return fmt.Errorf("mount loop: ro,noload=%v (%s); ro=%v (%s)", mountErr, bytes.TrimSpace(out), roErr, bytes.TrimSpace(roOut))
+		}
 	}
 	defer func() { _ = exec.Command("umount", mp).Run() }()
 
 	// build-done.json is the canonical manifest builderd reads.
-	srcDone := filepath.Join(mp, "etc", "faas", "build-done.json")
+	srcDone := filepath.Join(mp, "upper", "etc", "faas", "build-done.json")
 	if data, err := os.ReadFile(srcDone); err == nil {
 		if err := os.WriteFile(filepath.Join(exportDir, "build-done.json"), data, 0o644); err != nil {
 			return fmt.Errorf("write build-done.json: %w", err)
@@ -1283,7 +1360,7 @@ func (v *JailerVMM) exportBuildArtifacts(instance, exportDir string) error {
 	// /build/out/ holds the produced OCI tarball. Walk + copy with the size
 	// cap enforced. A build that overruns the cap is logged as infra failure
 	// via the caller's classification (no error returned — best-effort).
-	srcOut := filepath.Join(mp, "build", "out")
+	srcOut := filepath.Join(mp, "upper", "build", "out")
 	if _, err := os.Stat(srcOut); err == nil {
 		dstOut := filepath.Join(exportDir, "build", "out")
 		if err := os.MkdirAll(dstOut, 0o755); err != nil {
@@ -1298,6 +1375,23 @@ func (v *JailerVMM) exportBuildArtifacts(instance, exportDir string) error {
 // provision / stageWritable — copy preserves basename, so the chroot always
 // sees "layer.ext4").
 const layerImageName = "layer.ext4"
+
+// Firecracker records chroot-relative backing-file names in vmstate. Keep
+// temporary storage materializations out of that snapshot contract.
+const (
+	kernelImageName     = "vmlinux"
+	baseImageName       = "base.ext4"
+	memSnapshotName     = "mem"
+	vmstateSnapshotName = "vmstate"
+)
+
+func stableReadOnlyName(src, fallback string) string {
+	name := filepath.Base(src)
+	if strings.HasPrefix(name, "faas-snap-") {
+		return fallback
+	}
+	return name
+}
 
 // sidecarDriveImageName returns the in-chroot basename for a sidecar
 // drive at the given index (issue #463 / ADR-069 / PR-B). Index 0
@@ -1327,20 +1421,20 @@ func sidecarDriveImageName(idx int) string {
 // by imaged (per PR-A's `app_secrets` + `app_envs` flow); the
 // wake-time env wire stays flat (no per-workload entries) so the
 // vmmd proto surface is unchanged.
-const workloadManifestPath = "etc/faas/workload.json"
+const workloadManifestPath = "upper/etc/faas/workload.json"
 
 // secretsEnvPath is the in-guest location guest-init reads after pivot_root
 // (spec §11/G2). JSON-encoded envelope shape is documented on secretbox.Open.
 // The same file is written once per wake — overwriting any prior content —
 // so a secret rotation propagates without re-provisioning the layer.
-const secretsEnvPath = "etc/faas/secrets.env"
+const secretsEnvPath = "upper/etc/faas/secrets.env"
 
 // apiEnvPath is the plaintext api-env file written by StageAPIEnv
 // (issue #395 / ADR-045). Sibling to secretsEnvPath — same drive1
 // location, different file. Guest-init reads BOTH files at boot and
 // merges into the process env with precedence "secrets > api_env >
 // manifest_env > os.environ".
-const apiEnvPath = "etc/faas/env.json"
+const apiEnvPath = "upper/etc/faas/env.json"
 
 // StageSecretsEnv loopback-mounts drive1 (the per-app layer, the only fs
 // the VM can write at runtime), writes /etc/faas/secrets.env with mode
@@ -1357,9 +1451,9 @@ func (v *JailerVMM) StageSecretsEnv(instance string, jsonBlob []byte) error {
 	if len(jsonBlob) == 0 {
 		return nil
 	}
-	drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
-	if _, err := os.Stat(drive1); err != nil {
-		return fmt.Errorf("stat drive1: %w", err)
+	drive1, err := v.resolveDriveImage(instance)
+	if err != nil {
+		return err
 	}
 	mp, err := os.MkdirTemp("", "faas-vmm-secrets-")
 	if err != nil {
@@ -1400,9 +1494,9 @@ func (v *JailerVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 	if len(jsonBlob) == 0 {
 		return nil
 	}
-	drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
-	if _, err := os.Stat(drive1); err != nil {
-		return fmt.Errorf("stat drive1: %w", err)
+	drive1, err := v.resolveDriveImage(instance)
+	if err != nil {
+		return err
 	}
 	mp, err := os.MkdirTemp("", "faas-vmm-apienv-")
 	if err != nil {
@@ -1451,10 +1545,13 @@ func (v *JailerVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 func (v *JailerVMM) StageWorkloadManifest(instance string, driveIdx int, w WorkloadSpec) error {
 	if driveIdx < 0 {
 		// Main workload: stamp on drive1 (the legacy path).
-		drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
+		drive1, err := v.resolveDriveImage(instance)
+		if err != nil {
+			return err
+		}
 		return v.writeWorkloadManifest(drive1, w)
 	}
-	drive := filepath.Join(v.chrootBase, v.fcName, instance, sidecarDriveImageName(driveIdx))
+	drive := filepath.Join(v.chrootRoot(instance), sidecarDriveImageName(driveIdx))
 	return v.writeWorkloadManifest(drive, w)
 }
 
@@ -1637,7 +1734,7 @@ type workloadManifest struct {
 // The orchestrator (guest/init/workload_linux.go) reads the roster,
 // not the per-drive manifest; the per-drive stamp remains as a
 // reverse-compat / operator-visibility affordance.
-const workloadRosterPath = "etc/faas/workloads.json"
+const workloadRosterPath = "upper/etc/faas/workloads.json"
 
 // workloadRoster is the on-disk shape of /etc/faas/workloads.json
 // (issue #463 / ADR-069 / PR-B). The Main field carries the main
@@ -1666,9 +1763,9 @@ type workloadRoster struct {
 // sidecars may be nil/empty — boot runs the legacy path. Caller
 // filters out the main workload before passing.
 func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, sidecars []WorkloadSpec) error {
-	drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
-	if _, err := os.Stat(drive1); err != nil {
-		return fmt.Errorf("stat drive1: %w", err)
+	drive1, err := v.resolveDriveImage(instance)
+	if err != nil {
+		return err
 	}
 	mp, err := os.MkdirTemp("", "faas-vmm-roster-")
 	if err != nil {
@@ -1731,6 +1828,24 @@ func (v *JailerVMM) exportMax() int64 {
 	return api.MaxExportedLayerBytes
 }
 
+func (v *JailerVMM) destroyWaitFor(exportDir string) time.Duration {
+	wait := v.destroyWait
+	if exportDir != "" {
+		// Builder guest-init starts its own BuildTimeoutSeconds clock after
+		// boot, source extraction, entropy seeding, and BuildKit readiness.
+		// Keep enough host-side headroom for that clock plus artifact export.
+		// The guest build timeout is intentionally distinct from this host
+		// budget. Export mounts the large scratch ext4 read-only after the
+		// guest powers off, and loopback setup can spend minutes flushing
+		// dirty backing-file pages before it can read build-done.json.
+		builderMinimum := time.Duration(api.BuildTimeoutSeconds+600) * time.Second
+		if wait < builderMinimum {
+			wait = builderMinimum
+		}
+	}
+	return wait
+}
+
 // copyTree copies a directory tree from src to dst, skipping any single file
 // whose size exceeds maxBytes. Best-effort by design — partial copies are OK
 // for a build that overshot the cap.
@@ -1745,7 +1860,21 @@ func copyTree(src, dst string, maxBytes int64) error {
 		}
 		target := filepath.Join(dst, rel)
 		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			return os.Chmod(target, info.Mode().Perm())
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			linkName, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(linkName, target)
 		}
 		info, err := d.Info()
 		if err != nil {
@@ -1754,7 +1883,10 @@ func copyTree(src, dst string, maxBytes int64) error {
 		if maxBytes > 0 && info.Size() > maxBytes {
 			return nil // skip the oversize file
 		}
-		return copyFile(path, target)
+		if err := copyFile(path, target); err != nil {
+			return err
+		}
+		return os.Chmod(target, info.Mode().Perm())
 	})
 }
 
@@ -1796,7 +1928,7 @@ func (v *JailerVMM) mkChroot(instance string) (string, error) {
 // this call so the lookup here is always non-nil. Firecracker writes its
 // own stderr only on configuration errors; that stream remains discarded
 // to avoid mixing error noise into the customer's log tail.
-func (v *JailerVMM) startJailer(ctx context.Context, l Lease, extraFCArgs ...string) error {
+func (v *JailerVMM) startJailer(_ context.Context, l Lease, extraFCArgs ...string) error {
 	execFile, err := exec.LookPath(FirecrackerBin)
 	if err != nil {
 		return fmt.Errorf("vmm: locate firecracker binary: %w", err)
@@ -1810,21 +1942,36 @@ func (v *JailerVMM) startJailer(ctx context.Context, l Lease, extraFCArgs ...str
 		Instance: l.Instance, UID: l.UID, GID: l.GID, Netns: l.Netns, ExecFile: execFile,
 		Plan: l.Plan,
 	}), extraFCArgs...)
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	// The caller's gRPC context often ends as soon as the boot RPC returns.
+	// Jailer/firecracker must remain alive until the explicit Destroy/Kill path
+	// tears it down, otherwise a successful builder boot is killed immediately.
+	cmd := exec.Command(argv[0], argv[1:]...)
 	ring := v.ringFor(l.Instance)
+	var consoleFile *os.File
+	if f, openErr := os.OpenFile(filepath.Join("/var/log/faas", "vm-"+l.Instance+".console"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640); openErr == nil {
+		consoleFile = f
+	}
+	var stdout io.Writer = io.Discard
 	if ring != nil {
 		// Stream FC's stdout (kernel printk + guest /dev/console writers)
 		// into the per-instance ring. stderr stays discarded — FC only
 		// writes there on configuration errors and operators inspect those
 		// via systemctl logs, not the per-app tail.
-		cmd.Stdout = &ringWriter{ring: ring, stream: "stdout"}
-	} else {
-		// Pre-Move-4 paths (legacy Boot callers, tests that bypass the
-		// ring registration) keep the previous behaviour.
-		cmd.Stdout = io.Discard
+		stdout = &ringWriter{ring: ring, stream: "stdout"}
 	}
-	cmd.Stderr = io.Discard
+	if consoleFile != nil {
+		stdout = io.MultiWriter(stdout, consoleFile)
+	}
+	cmd.Stdout = stdout
+	if consoleFile != nil {
+		cmd.Stderr = consoleFile
+	} else {
+		cmd.Stderr = io.Discard
+	}
 	if err := cmd.Start(); err != nil {
+		if consoleFile != nil {
+			_ = consoleFile.Close()
+		}
 		return fmt.Errorf("vmm: start jailer: %w", err)
 	}
 	v.mu.Lock()
@@ -1837,6 +1984,9 @@ func (v *JailerVMM) startJailer(ctx context.Context, l Lease, extraFCArgs ...str
 	// exit code without racing the actual process termination.
 	go func() {
 		state, _ := cmd.Process.Wait()
+		if consoleFile != nil {
+			_ = consoleFile.Close()
+		}
 		v.mu.Lock()
 		if state != nil {
 			rec.exitCode = state.ExitCode()
@@ -1855,7 +2005,8 @@ func (v *JailerVMM) startJailer(ctx context.Context, l Lease, extraFCArgs ...str
 // per-instance file owned by the uid — see stageReadOnly / stageWritable.
 func (v *JailerVMM) provision(root string, cfg VMConfig, uid, gid int) (VMConfig, error) {
 	out := cfg
-	kname, err := stageReadOnly(root, cfg.BootSource.KernelImagePath)
+	kname, err := stageReadOnlyAs(root, cfg.BootSource.KernelImagePath,
+		stableReadOnlyName(cfg.BootSource.KernelImagePath, kernelImageName))
 	if err != nil {
 		return out, err
 	}
@@ -1865,9 +2016,18 @@ func (v *JailerVMM) provision(root string, cfg VMConfig, uid, gid int) (VMConfig
 		var name string
 		var err error
 		if d.IsReadOnly {
-			name, err = stageReadOnly(root, d.PathOnHost)
+			name = filepath.Base(d.PathOnHost)
+			if i == 0 {
+				name = stableReadOnlyName(d.PathOnHost, baseImageName)
+			}
+			if i > 0 && strings.HasPrefix(d.DriveID, DriveSidecarPrefix) {
+				name = sidecarDriveImageName(i - 1)
+			}
+			name, err = stageReadOnlyAs(root, d.PathOnHost, name)
+		} else if cfg.EphemeralWritable {
+			name, err = stageEphemeralWritableAs(root, d.PathOnHost, layerImageName, uid, gid)
 		} else {
-			name, err = stageWritable(root, d.PathOnHost, uid, gid)
+			name, err = stageWritableAs(root, d.PathOnHost, layerImageName, uid, gid)
 		}
 		if err != nil {
 			return out, err
@@ -2318,7 +2478,11 @@ func (v *JailerVMM) apiCallWithClient(ctx context.Context, client *http.Client, 
 // owner and break every other instance holding the same link. They are non-secret,
 // read-only, and visible only inside this instance's chroot, so o+r is safe.
 func stageReadOnly(root, src string) (string, error) {
-	name, err := linkInto(root, src)
+	return stageReadOnlyAs(root, src, filepath.Base(src))
+}
+
+func stageReadOnlyAs(root, src, name string) (string, error) {
+	name, err := linkIntoAs(root, src, name)
 	if err != nil {
 		return "", err
 	}
@@ -2334,7 +2498,10 @@ func stageReadOnly(root, src string) (string, error) {
 // §6.2-5), so it is copied — never hard-linked — and chowned to the uid. A hardlink
 // would alias the shared source inode and corrupt it under concurrent writers.
 func stageWritable(root, src string, uid, gid int) (string, error) {
-	name := filepath.Base(src)
+	return stageWritableAs(root, src, layerImageName, uid, gid)
+}
+
+func stageWritableAs(root, src, name string, uid, gid int) (string, error) {
 	dst := filepath.Join(root, name)
 	// A read-only sibling drive may already have hard-linked this basename in (the
 	// M0 fixture points drive0 and drive1 at the same image); drop that link first
@@ -2349,6 +2516,33 @@ func stageWritable(root, src string, uid, gid int) (string, error) {
 		return "", fmt.Errorf("chmod writable %s: %w", dst, err)
 	}
 	if err := chownJail(dst, uid, gid); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// stageEphemeralWritableAs links a builder scratch image into the jail. The
+// source is unique to one build and is removed by builderd after
+// DestroyWithExport, so aliasing it is safe and avoids copying the full 24 GiB
+// scratch file. This helper is intentionally separate from stageWritableAs:
+// app VM layers are persistent/shared storage and must never alias their
+// writable source inode.
+func stageEphemeralWritableAs(root, src, name string, uid, gid int) (string, error) {
+	dst := filepath.Join(root, name)
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stage ephemeral writable %s: %w", src, err)
+	}
+	if err := os.Link(src, dst); err != nil {
+		// Remote storage or a different filesystem cannot be hard-linked;
+		// preserve functionality with the normal isolated copy path.
+		return stageWritableAs(root, src, name, uid, gid)
+	}
+	if err := os.Chmod(dst, 0o600); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("chmod ephemeral writable %s: %w", src, err)
+	}
+	if err := chownJail(dst, uid, gid); err != nil {
+		_ = os.Remove(dst)
 		return "", err
 	}
 	return name, nil
@@ -2390,6 +2584,10 @@ func chownJail(path string, uid, gid int) error {
 // returns its basename for chroot-relative reference.
 func linkInto(dir, src string) (string, error) {
 	name := filepath.Base(src)
+	return linkIntoAs(dir, src, name)
+}
+
+func linkIntoAs(dir, src, name string) (string, error) {
 	dst := filepath.Join(dir, name)
 	_ = os.Remove(dst)
 	if err := os.Link(src, dst); err != nil {
@@ -2466,6 +2664,26 @@ func (v *JailerVMM) materializeFromStorage(ctx context.Context, instanceID, key 
 	}
 	v.trackMaterialised(instanceID, tmpPath)
 	return tmpPath, nil
+}
+
+// restoreSourceFromStorage resolves a restore input without copying when the
+// configured backend already has a local path. Snapshot restore is latency
+// sensitive and local snapshots can be gigabytes; routing them through Get
+// would turn a hardlink into a full disk-to-disk copy. Remote/OCI backends do
+// not implement LocalPathResolver and retain the streaming materialization
+// path.
+func (v *JailerVMM) restoreSourceFromStorage(ctx context.Context, instanceID, key string) (string, error) {
+	if key == "" || filepath.IsAbs(key) || v.storage == nil {
+		return v.materializeFromStorage(ctx, instanceID, key)
+	}
+	if resolver, ok := v.storage.(storage.LocalPathResolver); ok {
+		if path, local, err := resolver.LocalPath(key); err != nil {
+			return "", err
+		} else if local {
+			return path, nil
+		}
+	}
+	return v.materializeFromStorage(ctx, instanceID, key)
 }
 
 // trackMaterialised records tmpPath against instanceID so Kill /

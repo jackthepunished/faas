@@ -30,6 +30,11 @@ type VMConfig struct {
 	// shape inside is identical to the Vsock type the PUT /vsock API
 	// endpoint accepts.
 	VsockDevice *VsockDevice `json:"vsock,omitempty"`
+	// EphemeralWritable is true only for builder VMs. Their drive1 is a
+	// unique scratch image deleted immediately after export, so provisioning
+	// may hard-link it instead of copying multi-gigabyte bytes. App VMs keep
+	// the default false and retain copy-on-write isolation.
+	EphemeralWritable bool `json:"-"`
 }
 
 // VsockDevice is the Firecracker vsock binding the host uses to dial the guest
@@ -104,13 +109,20 @@ const (
 	WorkloadNameMain = "main"
 )
 
-// coldBootArgs is the kernel command line for a cold boot (spec §4.4: console
-// off, quiet; guest-init is PID1 installed as /sbin/init). The identical inner
+// coldBootArgs is the kernel command line for a cold boot. Firecracker captures
+// the serial stream in the per-instance console log, so keep the guest console
+// enabled: guest-init reports early mount/pivot failures there before vmmd can
+// observe a readiness failure. The identical inner
 // world (ADR-009) is configured by the kernel's ip= autoconfig so guest-init
 // carries no networking code: guest 10.0.0.2, gateway 10.0.0.1, /30 mask. Every
 // VM boots with the same line — uniqueness lives entirely on the host side.
-const coldBootArgs = "console=off reboot=k panic=1 pci=off quiet " +
+const coldBootArgs = "console=ttyS0,115200n8 reboot=k panic=1 pci=off " +
 	"nmi_watchdog=0 hung_task_timeout_secs=0 " +
+	// BuildKit generates a per-VM proxy CA during worker startup. The
+	// Firecracker guest has no boot-time user input, so explicitly allow the
+	// kernel CPU RNG and give virtio-rng maximum credit; otherwise getrandom(2)
+	// can remain blocked indefinitely while BuildKit generates its RSA key.
+	"random.trust_cpu=on rng_core.default_quality=1000 " +
 	"root=/dev/vda ro " +
 	"ip=10.0.0.2::10.0.0.1:255.255.255.252::eth0:off init=/sbin/init"
 
@@ -141,6 +153,9 @@ type ColdBootSpec struct {
 	// accepts 2xx as ready. Forwarded from WakeRequest.HealthcheckPath
 	// by Manager.bringUp.
 	HealthcheckPath string
+	// SkipReady suppresses readiness probing for builder VMs. Builder guests
+	// run a finite build and power off instead of binding port 8080.
+	SkipReady bool
 	// Workloads (issue #463 / ADR-069 / PR-B) is the per-workload
 	// drive set. Non-empty → BootColdBoot emits one FC Drive per
 	// entry (in addition to the base drive); the manager threads
@@ -226,6 +241,7 @@ func BuildColdBootConfig(s ColdBootSpec, slot int) VMConfig {
 		NetworkInterfaces: []NetIface{{IfaceID: "eth0", HostDevName: s.Tap}},
 		Entropy:           &Entropy{},
 		VsockDevice:       NewVsockDevice(slot),
+		EphemeralWritable: s.SkipReady,
 	}
 }
 

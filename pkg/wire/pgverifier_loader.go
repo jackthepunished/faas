@@ -63,8 +63,12 @@ func (l pgNodeLoader) LoadNodes(ctx context.Context) ([]NodeRow, error) {
 	var out []NodeRow
 	for rows.Next() {
 		var r NodeRow
-		if err := rows.Scan(&r.CN, &r.ID, &r.CertFingerprint); err != nil {
+		var fingerprint *string
+		if err := rows.Scan(&r.CN, &r.ID, &fingerprint); err != nil {
 			return nil, fmt.Errorf("wire: scan compute_nodes row: %w", err)
+		}
+		if fingerprint != nil {
+			r.CertFingerprint = *fingerprint
 		}
 		out = append(out, r)
 	}

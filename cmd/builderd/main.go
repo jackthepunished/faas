@@ -175,9 +175,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the events row + bumps wake_phase_emitted_total.
 	eventsPlatform := events.NewPlatform("builderd", store, log, ops, nil)
 	b := builderdpkg.New(store, notif, driver, nil, nil, resid, builderdpkg.Config{
-		CacheDir:       cfg.CacheDir,
-		MetricsAddr:    cfg.MetricsAddr,
-		FairnessWindow: cfg.FairnessWindow,
+		CacheDir:            cfg.CacheDir,
+		MetricsAddr:         cfg.MetricsAddr,
+		BuildTimeoutSeconds: cfg.BuildTimeoutSeconds,
+		FairnessWindow:      cfg.FairnessWindow,
 		// ADR-038: BuilderNodeID is stamped onto every
 		// build_provenance row builderd writes. Defaulted to
 		// "default-local" in LoadConfig; multi-node deployments

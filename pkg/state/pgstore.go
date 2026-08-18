@@ -4193,7 +4193,7 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 // per the ListDeploymentsForApp comment) this stays sub-10ms.
 func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumnsWithRootfs+`
+		`select `+deploymentSelectColumnsQualified+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.status <> 'deleted'
@@ -4215,7 +4215,7 @@ func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) 
 // the plan stays a single index scan + nested loop, sub-5ms.
 func (s *PgStore) ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumnsWithRootfs+`
+		`select `+deploymentSelectColumnsQualified+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.node_id = $1
@@ -6832,6 +6832,39 @@ func (s *PgStore) ClaimInvocation(ctx context.Context, id, instanceID string, le
 	return inv, nil
 }
 
+// RequeueExpiredInvocations returns abandoned dispatches to pending. The
+// row-locking CTE makes the bounded sweep safe if more than one schedd-like
+// worker is ticking at once; only rows still carrying an expired lease can be
+// reclaimed.
+func (s *PgStore) RequeueExpiredInvocations(ctx context.Context, now time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	tag, err := s.pool.Exec(ctx, `
+		with expired as (
+			select id
+			  from invocations
+			 where state = 'dispatching'
+			   and lease_expires_at is not null
+			   and lease_expires_at <= $1
+			 order by lease_expires_at, id
+			 for update skip locked
+			 limit $2
+		)
+		update invocations as i
+		   set state = 'pending',
+		       due_at = $1,
+		       lease_expires_at = null,
+		       instance_id = null,
+		       last_error = 'dispatch lease expired; requeued'
+		  from expired
+		 where i.id = expired.id`, now.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("state: invocations reclaim expired: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json.RawMessage) error {
 	// outcome (issue #791) is stamped alongside state so the cron
 	// run-history read never has to infer success from state.
@@ -6842,7 +6875,7 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 		       completed_at = now(),
 		       received_at = coalesce(received_at, now()),
 		       result = coalesce($2, result)
-		 where id = $1 and state in ('dispatching','pending')`, id, nullableJSON(result))
+		 where id = $1 and state = 'dispatching'`, id, nullableJSON(result))
 	if err != nil {
 		return err
 	}

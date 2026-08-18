@@ -4,6 +4,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"testing/fstest"
 
@@ -129,6 +131,48 @@ func TestBuildDoneShape(t *testing.T) {
 	}
 }
 
+func TestFlattenSingleSourceDir(t *testing.T) {
+	workdir := t.TempDir()
+	root := filepath.Join(workdir, "hello-node")
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"hello"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "index.js"), []byte("console.log('ok')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := flattenSingleSourceDir(workdir); err != nil {
+		t.Fatalf("flattenSingleSourceDir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "package.json")); err != nil {
+		t.Fatalf("package.json not promoted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "src", "index.js")); err != nil {
+		t.Fatalf("nested source not promoted: %v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("archive root still exists: err=%v", err)
+	}
+}
+
+func TestFlattenSingleSourceDirLeavesRootFiles(t *testing.T) {
+	workdir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(workdir, "hello-node"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "package.json"), []byte(`{"name":"hello"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := flattenSingleSourceDir(workdir); err != nil {
+		t.Fatalf("flattenSingleSourceDir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "hello-node")); err != nil {
+		t.Fatalf("root directory unexpectedly changed: %v", err)
+	}
+}
+
 func mustMarshal(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)
@@ -157,7 +201,7 @@ func TestBuildArgv(t *testing.T) {
 			name: "dockerfile → buildctl",
 			fw:   api.FrameworkDockerfile,
 			want: []string{
-				"buildctl", "build",
+				"/usr/local/bin/buildctl", "build",
 				"--frontend", "dockerfile",
 				"--local", "context=" + workdir,
 				"--local", "dockerfile=" + workdir,
@@ -165,24 +209,24 @@ func TestBuildArgv(t *testing.T) {
 			},
 		},
 		{
-			name: "node → railpack --plan node",
+			name: "node → railpack",
 			fw:   api.FrameworkRailpackNode,
-			want: []string{"railpack", "build", outdir, "--plan", "node"},
+			want: []string{"/bin/sh", "-c", "/usr/local/bin/railpack prepare '/build/src' --plan-out '/build/railpack-plan.json' --info-out '/build/railpack-info.json' --hide-pretty-plan && exec /usr/local/bin/buildctl build --frontend gateway.v0 --opt source=ghcr.io/railwayapp/railpack-frontend:latest --opt filename=railpack-plan.json --local context='/build/src' --local dockerfile='/build' --output type=oci,dest='/build/out/image.tar' --progress plain"},
 		},
 		{
-			name: "python → railpack --plan python",
+			name: "python → railpack",
 			fw:   api.FrameworkRailpackPython,
-			want: []string{"railpack", "build", outdir, "--plan", "python"},
+			want: []string{"/bin/sh", "-c", "/usr/local/bin/railpack prepare '/build/src' --plan-out '/build/railpack-plan.json' --info-out '/build/railpack-info.json' --hide-pretty-plan && exec /usr/local/bin/buildctl build --frontend gateway.v0 --opt source=ghcr.io/railwayapp/railpack-frontend:latest --opt filename=railpack-plan.json --local context='/build/src' --local dockerfile='/build' --output type=oci,dest='/build/out/image.tar' --progress plain"},
 		},
 		{
-			name: "go → railpack --plan go",
+			name: "go → railpack",
 			fw:   api.FrameworkRailpackGo,
-			want: []string{"railpack", "build", outdir, "--plan", "go"},
+			want: []string{"/bin/sh", "-c", "/usr/local/bin/railpack prepare '/build/src' --plan-out '/build/railpack-plan.json' --info-out '/build/railpack-info.json' --hide-pretty-plan && exec /usr/local/bin/buildctl build --frontend gateway.v0 --opt source=ghcr.io/railwayapp/railpack-frontend:latest --opt filename=railpack-plan.json --local context='/build/src' --local dockerfile='/build' --output type=oci,dest='/build/out/image.tar' --progress plain"},
 		},
 		{
-			name: "auto → railpack --plan auto (default branch)",
+			name: "auto → railpack (default branch)",
 			fw:   api.FrameworkAuto,
-			want: []string{"railpack", "build", outdir, "--plan", "auto"},
+			want: []string{"/bin/sh", "-c", "/usr/local/bin/railpack prepare '/build/src' --plan-out '/build/railpack-plan.json' --info-out '/build/railpack-info.json' --hide-pretty-plan && exec /usr/local/bin/buildctl build --frontend gateway.v0 --opt source=ghcr.io/railwayapp/railpack-frontend:latest --opt filename=railpack-plan.json --local context='/build/src' --local dockerfile='/build' --output type=oci,dest='/build/out/image.tar' --progress plain"},
 		},
 	}
 	for _, tc := range cases {

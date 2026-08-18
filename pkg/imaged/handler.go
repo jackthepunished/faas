@@ -42,6 +42,16 @@ type Notifier interface {
 	Notify(ctx context.Context, channel, payload string) error
 }
 
+// ArtifactReplicator is an optional handoff for split-box deployments that
+// still use the local storage backend. It runs after imaged has published and
+// signed an app-layer ext4 and before snapshot_prime is emitted, so schedd can
+// verify the same layer on the control-plane host without racing an
+// eventually-consistent file copy. OCI-backed deployments do not need this
+// hook: the shared registry is already the authoritative artifact store.
+type ArtifactReplicator interface {
+	Replicate(ctx context.Context, layerKey string) error
+}
+
 // LayerBuilder is the slice of rootfs.Builder that imaged uses. Defining it
 // here keeps the production *rootfs.Builder seamless while letting tests
 // substitute a fake without dragging in a host mkfs binary.
@@ -140,6 +150,10 @@ type Handler struct {
 	// to a per-app LocalStorageBackend rooted at appsRoot so legacy
 	// callers keep working without rewiring New(...).
 	storage storage.StorageBackend
+	// replicator is the optional split-box local-artifact handoff. It is
+	// deliberately separate from StorageBackend: a local backend has no
+	// cross-host visibility, while an OCI backend already provides it.
+	replicator ArtifactReplicator
 	// ops holds the per-daemon Prometheus registry (this PR). Wired
 	// via WithOpsMetrics; nil = observation no-op (unit tests).
 	// Records imaged_op_duration_seconds / imaged_ops_total at the
@@ -492,6 +506,27 @@ func (h *Handler) WithDeployBaseRef(ref string) *Handler {
 func (h *Handler) WithStorage(s storage.StorageBackend) *Handler {
 	h.storage = s
 	return h
+}
+
+// WithArtifactReplicator installs the optional split-box local artifact
+// handoff. The hook is called only after the layer and its signature have
+// both been written, and before the scheduler notification is sent.
+func (h *Handler) WithArtifactReplicator(r ArtifactReplicator) *Handler {
+	h.replicator = r
+	return h
+}
+
+func (h *Handler) replicateLayer(ctx context.Context, layerKey string) error {
+	if h.replicator == nil {
+		return nil
+	}
+	if layerKey == "" {
+		return errors.New("imaged: artifact replication: empty layer key")
+	}
+	if err := h.replicator.Replicate(ctx, layerKey); err != nil {
+		return fmt.Errorf("imaged: replicate layer %q: %w", layerKey, err)
+	}
+	return nil
 }
 
 // WithOpsMetrics attaches the daemon-wide Prometheus registry. The
@@ -1613,6 +1648,10 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 			return fmt.Errorf("imaged: stamp rootfs: %w", err)
 		}
+		if err := h.replicateLayer(ctx, appsKey); err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, err.Error())
+			return err
+		}
 		h.log.Info("imaged: build app layer (two-drive)",
 			"app", app.Slug, "digest", digest, "key", result.ImageKey,
 			"bytes", result.ContentBytes, "above_diff_ids", len(diffs))
@@ -1658,6 +1697,10 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 			return fmt.Errorf("imaged: stamp rootfs: %w", err)
+		}
+		if err := h.replicateLayer(ctx, appsKey); err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, err.Error())
+			return err
 		}
 		h.log.Info("imaged: build app layer (m5 fallback)", "app", app.Slug, "digest", digest, "key", result.ImageKey, "bytes", result.ContentBytes)
 	}
@@ -1830,6 +1873,10 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 		}); err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q stamp: %s", sc.Name, err.Error()))
 			return findings, fmt.Errorf("imaged: sidecar %q stamp: %w", sc.Name, err)
+		}
+		if err := h.replicateLayer(ctx, layerKey); err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, err.Error())
+			return findings, err
 		}
 		// Per-sidecar secret-can-on-image scan (PR-A). Mirrors the
 		// main-image scan above — same engine, same loud-fail
@@ -2005,6 +2052,10 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		// source tarball into /app during layer assembly. Tests skip
 		// this by leaving TarballPath empty.
 		TarballPath: dep.SourcePath,
+		// The customer-facing Node convention is handler.js while the
+		// versioned runner executes /app/node22.js or /app/node24.js.
+		// rootfs creates that runtime alias during assembly.
+		FunctionHandlerPath: manifest.Entrypoint[len(manifest.Entrypoint)-1],
 		// FunctionRunnerPath is the static guest/runners/<rt>/faas-runner
 		// binary that lives at /usr/local/bin/faas-runner in the layer.
 		FunctionRunnerPath: runnerPath,
@@ -2024,6 +2075,10 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 	if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
 		return fmt.Errorf("imaged: stamp rootfs: %w", err)
+	}
+	if err := h.replicateLayer(ctx, appsKey); err != nil {
+		_ = h.transition(ctx, dep.ID, state.DeployFailed, err.Error())
+		return err
 	}
 	return nil
 }
@@ -2256,11 +2311,19 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 	// local file.
 	switch dep.Kind {
 	case state.DeploymentKindImage:
-		if err := h.buildImageLayer(ctx, app, dep, acct); err != nil {
+		if app.Type == state.AppTypeFunction || app.Runtime != "" {
+			if err := h.buildFunctionLayer(ctx, app, dep, acct); err != nil {
+				return err
+			}
+		} else if err := h.buildImageLayer(ctx, app, dep, acct); err != nil {
 			return err
 		}
 	case state.DeploymentKindTarball, state.DeploymentKindDockerfile:
-		if err := h.buildFunctionLayer(ctx, app, dep, acct); err != nil {
+		if app.Type == state.AppTypeFunction || app.Runtime != "" {
+			if err := h.buildFunctionLayer(ctx, app, dep, acct); err != nil {
+				return err
+			}
+		} else if err := h.buildLocalOCIAppLayer(ctx, app, dep, acct); err != nil {
 			return err
 		}
 	default:

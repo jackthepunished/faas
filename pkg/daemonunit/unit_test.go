@@ -175,6 +175,25 @@ func TestRender_ExecStartPreOrdering(t *testing.T) {
 	}
 }
 
+func TestRender_ExecStartPostRoundTrip(t *testing.T) {
+	u := Unit{
+		Type:          "simple",
+		ExecStart:     "/opt/faas/bin/vmmd",
+		ExecStartPost: []string{"/usr/bin/chown root:faas /run/faas", "/usr/bin/chmod 0775 /run/faas"},
+	}
+	rendered := string(u.Render())
+	if !strings.Contains(rendered, "ExecStart=/opt/faas/bin/vmmd\nExecStartPost=/usr/bin/chown root:faas /run/faas\n") {
+		t.Fatalf("ExecStartPost must follow ExecStart; got:\n%s", rendered)
+	}
+	decoded, err := Decode([]byte(rendered))
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got := strings.Join(decoded.ExecStartPost, "|"); got != strings.Join(u.ExecStartPost, "|") {
+		t.Fatalf("ExecStartPost round trip = %q, want %q", got, strings.Join(u.ExecStartPost, "|"))
+	}
+}
+
 // TestRender_RuntimeDirectoryPair pins that vmmd's RuntimeDirectory +
 // RuntimeDirectoryMode are emitted as a contiguous pair (systemd does
 // not require adjacency, but we emit them together so the unit file

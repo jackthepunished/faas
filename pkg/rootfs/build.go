@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/storage"
@@ -112,6 +113,12 @@ type BuildInput struct {
 	// into /app during layer assembly. Used by the function-deploy path
 	// (spec §4.9, M7). Empty skips the tarball application step.
 	TarballPath string
+	// FunctionHandlerPath, when set, is the handler path named by the
+	// injected function manifest (for example /app/node22.js). Function
+	// source archives conventionally contain handler.js at their project
+	// root; the builder creates the runtime-specific alias when needed.
+	// Empty preserves the plain tarball/image behavior.
+	FunctionHandlerPath string
 	// FunctionRunnerPath, when set, is copied into the layer at
 	// /usr/local/bin/faas-runner so the guest can exec it. Wired from
 	// cmd/imaged's config; empty skips the runner injection.
@@ -208,6 +215,11 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (BuildResult, error)
 			}
 			return BuildResult{}, err
 		}
+		if in.FunctionHandlerPath != "" {
+			if err := NormalizeFunctionHandler(staging, in.FunctionHandlerPath); err != nil {
+				return BuildResult{}, err
+			}
+		}
 	}
 	if in.FunctionRunnerPath != "" {
 		if err := InjectFunctionRunner(staging, in.FunctionRunnerPath); err != nil {
@@ -221,21 +233,17 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (BuildResult, error)
 		return BuildResult{}, err
 	}
 
-	content, err := DirSize(staging)
+	stats, err := InspectStaging(staging)
 	if err != nil {
 		return BuildResult{}, err
 	}
-	sizeMB, err := CheckCap(limits, content)
+	sizeMB, err := CheckCapForStaging(limits, stats)
 	if err != nil {
 		return BuildResult{}, err // *api.Problem naming cap + observed size
 	}
 
-	if err := b.publishExt4(ctx, in, staging, sizeMB); err != nil {
-		return BuildResult{}, err
-	}
-
 	// Issue #299 / ADR-038 Phase 3: SBOM emission runs on the staging
-	// dir BEFORE the cleanup defer fires (the staging dir is the only
+	// dir BEFORE the drive1 wrapper is added and the cleanup defer fires (the staging dir is the only
 	// artefact that contains the customer's source tree, and the user
 	// wants the SBOM to enumerate the actual files present in the
 	// produced layer). emitSBOM is best-effort: a syft error or
@@ -253,14 +261,60 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (BuildResult, error)
 		// imaged to populate the column for future builds.
 		_ = sbomErr
 	}
+	// drive1 is mounted at /overlay by guest-init and its /upper directory
+	// is used as overlayfs' writable layer. The ext4 artifact therefore must
+	// carry the assembled app tree under /upper; Linux cannot see drive1's
+	// files until guest-init mounts it, so a root-level app.json would be
+	// invisible after the overlay is assembled.
+	if err := stageAppUpper(staging); err != nil {
+		return BuildResult{}, err
+	}
 
-	res := BuildResult{SizeMB: sizeMB, ContentBytes: content, SBOMKey: sbomKey}
+	if err := b.publishExt4(ctx, in, staging, sizeMB); err != nil {
+		return BuildResult{}, err
+	}
+
+	res := BuildResult{SizeMB: sizeMB, ContentBytes: stats.ContentBytes, SBOMKey: sbomKey}
 	if in.OutImage != "" {
 		res.ImagePath = in.OutImage
 	} else {
 		res.ImageKey = in.StorageKey
 	}
 	return res, nil
+}
+
+// stageAppUpper moves the completed per-app tree below the /upper directory
+// consumed by guest-init's overlay assembly. It preserves a customer image's
+// own top-level "upper" path by treating it as normal app content at
+// /upper/upper inside the artifact.
+func stageAppUpper(staging string) error {
+	upper := filepath.Join(staging, "upper")
+	legacyUpper := filepath.Join(staging, ".faas-app-upper-source")
+	if _, err := os.Lstat(upper); err == nil {
+		if err := os.Rename(upper, legacyUpper); err != nil {
+			return fmt.Errorf("rootfs: preserve app upper path: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("rootfs: inspect app upper path: %w", err)
+	}
+	if err := os.Mkdir(upper, 0o755); err != nil {
+		return fmt.Errorf("rootfs: create app upper path: %w", err)
+	}
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		return fmt.Errorf("rootfs: read app staging: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "upper" {
+			continue
+		}
+		src := filepath.Join(staging, entry.Name())
+		dst := filepath.Join(upper, entry.Name())
+		if err := os.Rename(src, dst); err != nil {
+			return fmt.Errorf("rootfs: move %s into app upper: %w", entry.Name(), err)
+		}
+	}
+	return nil
 }
 
 // publishExt4 mkfs-es the staging tree into a temp file (or directly into
@@ -436,10 +490,12 @@ func InjectGuestInit(staging, guestInitPath string) error {
 	return nil
 }
 
-// ApplyTarball unpacks a customer source tarball at /app. Used by the
-// function-deploy path; the tarball is the customer's handler code
-// (handler.js / handler.py). Path-escape protection reuses the
-// ApplyLayerGz allowlist so a malicious tarball can't escape /app.
+// ApplyTarball unpacks a customer source tarball at /app. Archives produced
+// by the CLI contain one project-root directory (for example
+// function-node/handler.js); that transport wrapper is stripped so the guest
+// sees the source at /app/handler.js. A flat archive remains flat.
+// Path-escape protection reuses the ApplyLayerGz allowlist so a malicious
+// tarball can't escape /app.
 //
 // capBytes is the cumulative unpacked-size cap (issue #197 B3.7). The
 // apid-side upload cap (SourceTarballMaxMB) guards the ON-DISK tarball
@@ -462,6 +518,10 @@ func InjectGuestInit(staging, guestInitPath string) error {
 //
 //nolint:forbidigo // tarballPath is the apid-spooled path under spoolRoot() that already passed apid's validateTarballShape (in cmd/apid/deploy_inputs.go) — bytes are validated before builderd opens them; symlink-attack on the open itself is impossible because apid wrote the file via os.Create above with a fresh random id. The "customer" framing in the doc comment refers to the *contents* of the tarball (handler code), not the file path on disk.
 func ApplyTarball(staging, tarballPath string, capBytes int64) error {
+	prefix, err := tarballRootPrefix(tarballPath)
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(tarballPath)
 	if err != nil {
 		return fmt.Errorf("rootfs: open tarball: %w", err)
@@ -471,10 +531,54 @@ func ApplyTarball(staging, tarballPath string, capBytes int64) error {
 	if err := os.MkdirAll(appDir, 0o755); err != nil {
 		return err
 	}
-	if capBytes <= 0 {
-		return ApplyLayerGz(appDir, f)
+	return applyTarballWithCap(appDir, f, capBytes, prefix)
+}
+
+// tarballRootPrefix returns the single project-root directory to strip from a
+// source archive. The CLI's packers always emit this shape, but accepting a
+// flat archive keeps the API compatible with hand-built tarballs. Multiple
+// top-level entries mean there is no wrapper to remove.
+func tarballRootPrefix(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("rootfs: open tarball: %w", err)
 	}
-	return applyTarballWithCap(appDir, f, capBytes)
+	defer func() { _ = f.Close() }()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return "", fmt.Errorf("rootfs: gzip: %w", err)
+	}
+	defer func() { _ = zr.Close() }()
+	tr := tar.NewReader(zr)
+	var prefix string
+	var nested bool
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("rootfs: read tar: %w", err)
+		}
+		name := strings.TrimSuffix(hdr.Name, "/")
+		if name == "" {
+			continue
+		}
+		first := name
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			first = name[:i]
+			nested = true
+		}
+		if prefix == "" {
+			prefix = first
+		} else if prefix != first {
+			return "", nil
+		}
+	}
+	if nested {
+		return prefix, nil
+	}
+	return "", nil
 }
 
 // ErrTarballExceedsCap is the sentinel returned by ApplyTarball when a
@@ -509,7 +613,7 @@ func (e *ErrTarballExceedsCap) Is(target error) bool {
 // bytes (no file system allocation); the cap is on the on-disk size
 // post-unpack, which is what the AppLayerMaxMB limit already
 // constrains.
-func applyTarballWithCap(dst string, r io.Reader, capBytes int64) error {
+func applyTarballWithCap(dst string, r io.Reader, capBytes int64, prefix string) error {
 	zr, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("rootfs: gzip: %w", err)
@@ -529,7 +633,7 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64) error {
 		// on-disk bytes for the consumer's quota. Cap is on the
 		// post-unpack size, which is what AppLayerMaxMB enforces.
 		if hdr.Typeflag == tar.TypeReg {
-			if written+hdr.Size > capBytes {
+			if capBytes > 0 && written+hdr.Size > capBytes {
 				return &ErrTarballExceedsCap{
 					WrittenBytes: written,
 					EntryBytes:   hdr.Size,
@@ -537,6 +641,17 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64) error {
 				}
 			}
 			written += hdr.Size
+		}
+		if prefix != "" {
+			name := strings.TrimSuffix(hdr.Name, "/")
+			if name == prefix {
+				// The archive's wrapper directory is transport metadata,
+				// not customer content.
+				continue
+			}
+			if strings.HasPrefix(name, prefix+"/") {
+				hdr.Name = strings.TrimPrefix(name, prefix+"/")
+			}
 		}
 		// codeql[go/path-injection] false-positive: safeJoin rejects ".." and absolute paths at runtime.
 		target, err := safeJoin(dst, hdr.Name)
@@ -547,6 +662,44 @@ func applyTarballWithCap(dst string, r io.Reader, capBytes int64) error {
 			return err
 		}
 	}
+}
+
+// NormalizeFunctionHandler makes the source filename agree with the runtime
+// runner's manifest path. The public function contract asks customers for
+// handler.js, while the versioned Node runners deliberately execute
+// /app/node22.js or /app/node24.js. Keep the customer-facing convention and
+// create the internal alias during layer assembly.
+func NormalizeFunctionHandler(staging, handlerPath string) error {
+	clean := filepath.ToSlash(filepath.Clean(handlerPath))
+	if !strings.HasPrefix(clean, "/app/") || clean == "/app/" {
+		return fmt.Errorf("rootfs: invalid function handler path %q", handlerPath)
+	}
+	target := filepath.Join(staging, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
+	if info, err := os.Stat(target); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("rootfs: function handler path %q is a directory", handlerPath)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("rootfs: stat function handler %q: %w", handlerPath, err)
+	}
+	if filepath.Ext(target) != ".js" {
+		return fmt.Errorf("rootfs: function handler %q not found", handlerPath)
+	}
+	source := filepath.Join(filepath.Dir(target), "handler.js")
+	if source == target {
+		return fmt.Errorf("rootfs: function handler %q not found", handlerPath)
+	}
+	if _, err := os.Stat(source); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("rootfs: function handler %q not found", handlerPath)
+		}
+		return fmt.Errorf("rootfs: stat function source %q: %w", source, err)
+	}
+	if err := os.Rename(source, target); err != nil {
+		return fmt.Errorf("rootfs: alias function handler %s as %s: %w", source, target, err)
+	}
+	return nil
 }
 
 // InjectFunctionRunner copies the function runner binary at

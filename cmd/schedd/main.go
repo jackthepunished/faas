@@ -1216,7 +1216,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// retained only for the main_coverage_smoke_test defaultDeps
 	// assertion) and dispatched from loop.Run's existing LISTEN
 	// so we don't add a 7th long-term pool subscriber on top of
-	// pool.MaxConns=8 (which tips the async-invoke drain's
+	// pool.MaxConns=16 (which leaves the async-invoke drain's
 	// BeginTx into starvation under e2e query bursts).
 	appDeleteSub := sched.NewAppDeleteSubscriber(engine, log)
 	loop := sched.NewLoop(pool, engine, log).
@@ -1450,7 +1450,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// 60s safety ticker (fireNowT). Zero extra pool connections vs
 	// the pre-rebase PR-D posture; the standalone FireNowRun
 	// goroutine added a 7th long-term subscriber that tipped
-	// pool.MaxConns=8 over the edge and starved the async-invoke
+	// pool.MaxConns=16 over the edge and starved the async-invoke
 	// drain's BeginTx under e2e query bursts.
 
 	// Move 1 drain: a second goroutine inside schedd that drains the

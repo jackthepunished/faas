@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -100,19 +101,19 @@ func RunResumeHook(hostTimeUnixNano int64, hostEntropy []byte) error {
 	resumeDiag(fmt.Sprintf("resume: start hostEntropy=%dB nano=%d", len(hostEntropy), hostTimeUnixNano))
 	if err := addHostEntropy(hostEntropy); err != nil {
 		resumeDiag(fmt.Sprintf("resume: addHostEntropy err=%v", err))
-		return err
+		return fmt.Errorf("resume: add entropy: %w", err)
 	}
 	if err := reseedFromHWRNG(); err != nil {
 		resumeDiag(fmt.Sprintf("resume: reseedFromHWRNG err=%v", err))
-		return err
+		return fmt.Errorf("resume: reseed entropy: %w", err)
 	}
 	if err := stepClockTo(hostTimeUnixNano); err != nil {
 		resumeDiag(fmt.Sprintf("resume: stepClockTo err=%v", err))
-		return err
+		return fmt.Errorf("resume: step clock: %w", err)
 	}
 	if err := writeUUIDMarker(hostTimeUnixNano); err != nil {
 		resumeDiag(fmt.Sprintf("resume: writeUUIDMarker err=%v", err))
-		return err
+		return fmt.Errorf("resume: write uuid marker: %w", err)
 	}
 	resumeDiag("resume: ok")
 	return nil
@@ -158,6 +159,25 @@ func addHostEntropy(entropy []byte) error {
 	)
 	resumeDiag(fmt.Sprintf("addHostEntropy: ioctl r1=%d errno=%d", r1, errno))
 	if errno != 0 {
+		// Some Firecracker guest kernels expose /dev/urandom but reject
+		// RNDADDENTROPY for the guest's capability set. A host CSPRNG
+		// write still mixes unique bytes into the pool (it does not claim
+		// entropy credit), which is sufficient to prevent identical UUID
+		// streams across restores. Keep failing closed for actual device
+		// write failures rather than allowing a restore with no new input.
+		if errno == unix.EPERM || errno == unix.EINVAL {
+			fallback, openErr := os.OpenFile(urandomPath, os.O_WRONLY, 0)
+			if openErr != nil {
+				return fmt.Errorf("ioctl(RNDADDENTROPY): %w; fallback open %s: %v", errno, urandomPath, openErr)
+			}
+			_, writeErr := fallback.Write(entropy)
+			_ = fallback.Close()
+			if writeErr != nil {
+				return fmt.Errorf("ioctl(RNDADDENTROPY): %w; fallback write: %v", errno, writeErr)
+			}
+			resumeDiag("addHostEntropy: ioctl rejected; fallback urandom write succeeded")
+			return nil
+		}
 		return fmt.Errorf("ioctl(RNDADDENTROPY): %w", errno)
 	}
 	return nil
@@ -171,6 +191,17 @@ func reseedFromHWRNG() error {
 	//nolint:forbidigo // hwrngPath is the virtio-rng chardev (/dev/hwrng by default) exposed to the microVM. Kernel-internal device, the customer has no write surface to a chardev on the guest side; symlink-attack impossible.
 	src, err := os.Open(hwrngPath)
 	if err != nil {
+		// The host-supplied entropy is the authoritative uniqueness input.
+		// Some otherwise valid Firecracker kernels omit CONFIG_HW_RANDOM_VIRTIO,
+		// leaving /dev/hwrng absent even though the VM boots with virtio-rng
+		// configured. Do not turn that optional belt-and-suspenders mix into a
+		// restore outage; addHostEntropy has already re-keyed the pool before
+		// this function runs. Other errors still fail closed so a real device
+		// or filesystem problem is visible to the resume caller.
+		if errors.Is(err, os.ErrNotExist) {
+			resumeDiag("reseedFromHWRNG: skipped (device unavailable)")
+			return nil
+		}
 		return fmt.Errorf("open %s: %w", hwrngPath, err)
 	}
 	defer func() { _ = src.Close() }()

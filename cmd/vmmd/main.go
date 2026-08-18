@@ -908,7 +908,32 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}()
 	}
 
-	serverTLS, err := cfg.LoadServerTLSWithVerifier(nodeVerifier)
+	// The compute-node registry describes compute/service peers, but it does
+	// not contain the control-plane schedd leaf. vmmd has both directions on
+	// this boundary: its server accepts schedd, while its capacity publisher
+	// dials schedd and must validate schedd's server certificate. Keep those
+	// identities explicit instead of applying the compute registry to the
+	// control-plane certificate.
+	var serverVerifier wire.NodeVerifier = nodeVerifier
+	var scheddVerifier wire.NodeVerifier
+	if nodeVerifier != nil {
+		controlPlaneVerifier := wire.NewInmemNodeVerifier()
+		controlPlaneVerifier.Set([]string{"schedd.faas"})
+		// The compute_nodes registry contains vmmd identities, but local
+		// service clients use role-specific leaves and are intentionally not
+		// rows in that registry. Keep the server-side CN gate strict while
+		// allowing the three services that legitimately call vmmd directly.
+		serviceVerifier := wire.NewInmemNodeVerifier()
+		serviceVerifier.Set([]string{
+			"builderd.faas",
+			"gatewayd.faas",
+			"schedd.faas",
+		})
+		serverVerifier = wire.NewAnyNodeVerifier(nodeVerifier, controlPlaneVerifier, serviceVerifier)
+		scheddVerifier = controlPlaneVerifier
+	}
+
+	serverTLS, err := cfg.LoadServerTLSWithVerifier(serverVerifier)
 	if err != nil {
 		return fmt.Errorf("vmmd: load server TLS: %w", err)
 	}
@@ -922,7 +947,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// set (so auto-append will fire) AND serverTLS is non-nil
 	// (the verifier path is installed). Other paths are silent.
 	warnIfPkiCNMismatch(cfg.ComputeNode, serverTLS, log)
-	scheddClientTLS, err := cfg.LoadScheddClientTLSWithVerifier(nodeVerifier)
+	scheddClientTLS, err := cfg.LoadScheddClientTLSWithVerifier(scheddVerifier)
 	if err != nil {
 		return fmt.Errorf("vmmd: load schedd client TLS: %w", err)
 	}
@@ -943,12 +968,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// rotator's Reload path. Listen and the publisher dial cache
 	// *tls.Config pointers — the rotator's Get() is observed on
 	// subsequent operations after Set.
-	serverTLS, err = cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, serverRotator.Reload(serverTLS))
+	serverTLS, err = cfg.LoadServerTLSWithPrefixAndVerifierAndReload(serverVerifier, serverRotator.Reload(serverTLS))
 	if err != nil {
 		return fmt.Errorf("vmmd: load server TLS (reload): %w", err)
 	}
 	serverRotator.Set(serverTLS)
-	scheddClientTLS, err = cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(nodeVerifier, scheddClientRotator.Reload(scheddClientTLS))
+	scheddClientTLS, err = cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(scheddVerifier, scheddClientRotator.Reload(scheddClientTLS))
 	if err != nil {
 		return fmt.Errorf("vmmd: load schedd client TLS (reload): %w", err)
 	}
@@ -1225,10 +1250,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (matches watchEgressBundleReload's contract: a malformed
 	// cert file does NOT brick the daemon's mTLS leg).
 	serverReload := func() (*tls.Config, error) {
-		return cfg.LoadServerTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+		return cfg.LoadServerTLSWithPrefixAndVerifierAndReload(serverVerifier, nil)
 	}
 	scheddClientReload := func() (*tls.Config, error) {
-		return cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+		return cfg.LoadScheddClientTLSWithPrefixAndVerifierAndReload(scheddVerifier, nil)
 	}
 	// serverHupCh + scheddHupCh get every SIGHUP (signal.Notify
 	// fans the signal out to every registered channel). The

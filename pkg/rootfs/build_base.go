@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/onebox-faas/faas/pkg/storage"
 )
@@ -15,11 +16,11 @@ import (
 // imaged startup calls BuildBase once per box lifetime to convert
 // ghcr.io/poyrazK/builder-base:latest (or the configured override) into
 // /srv/fc/base/builder-base.ext4 — the read-only drive0 used by builder
-// microVMs (spec §4.6, two-drive scheme). The base image already contains
-// guest-init + /usr/local/bin/railpack + buildkit, baked into its own
-// layers; BuildBase must therefore NOT re-inject guest-init/app.json over
-// those layers. It's the inverse of Builder.Build: every layer pulled, no
-// contract injection, no plan cap.
+// microVMs (spec §4.6, two-drive scheme). The OCI image may contain
+// guest-init, but the produced drive0 must own the boot contract: Linux
+// executes /sbin/init from drive0 before the per-app drive1 overlay can be
+// mounted. BuildBase refreshes that binary when GuestInitPath is supplied.
+// It never injects app.json or a plan cap.
 //
 // Like BuildInput, the produced ext4 is published via Storage + StorageKey
 // (production) or OutImage (legacy / integration test). Exactly one must
@@ -42,6 +43,10 @@ type BaseBuildInput struct {
 	// "/srv/fc/base/builder-base.ext4". Kept for the integration test;
 	// production wiring uses Storage + StorageKey.
 	OutImage string
+	// GuestInitPath is the static PID-1 binary to install as /sbin/init in
+	// the produced base artifact. Optional for legacy callers and tests;
+	// production imaged supplies the arch-matched guest-init binary.
+	GuestInitPath string
 }
 
 // BaseBuildResult reports the produced base image.
@@ -97,7 +102,8 @@ func mkdirBaseTemp(envKey string) (string, error) {
 //   - ALL layers are applied (no LayersAboveBase filter). The base is the
 //     root, not a delta.
 //   - No /etc/faas/app.json is injected (a base has no app).
-//   - No guest-init is re-injected (the base image already has its own).
+//   - Guest-init is refreshed as /sbin/init when GuestInitPath is set. This
+//     is required because PID 1 executes from drive0 before drive1 mounts.
 //   - No plan / app-layer cap (the base is shared, not per-app).
 //
 // On error the staging dir is removed before returning. The caller owns
@@ -121,6 +127,12 @@ func (b *Builder) BuildBase(ctx context.Context, in BaseBuildInput) (BaseBuildRe
 		if err := ApplyLayerGz(staging, layer); err != nil {
 			return BaseBuildResult{}, fmt.Errorf("rootfs: apply base layer %d: %w", i, err)
 		}
+	}
+	if err := injectBaseGuestInit(staging, in.GuestInitPath); err != nil {
+		return BaseBuildResult{}, err
+	}
+	if err := ensureBaseMountpoints(staging); err != nil {
+		return BaseBuildResult{}, err
 	}
 
 	return b.buildBaseFromStaging(ctx, staging, in)
@@ -154,7 +166,36 @@ func (b *Builder) BuildBaseFromStaging(ctx context.Context, staging string, in B
 	if _, err := os.Stat(staging); err != nil {
 		return BaseBuildResult{}, fmt.Errorf("rootfs: BuildBaseFromStaging: stat staging: %w", err)
 	}
+	if err := injectBaseGuestInit(staging, in.GuestInitPath); err != nil {
+		return BaseBuildResult{}, err
+	}
+	if err := ensureBaseMountpoints(staging); err != nil {
+		return BaseBuildResult{}, err
+	}
 	return b.buildBaseFromStaging(ctx, staging, in)
+}
+
+// injectBaseGuestInit installs PID 1 in the boot root. It is optional so
+// low-level BuildBase tests and legacy callers remain independent of a guest
+// binary path.
+func injectBaseGuestInit(staging, guestInitPath string) error {
+	if guestInitPath == "" {
+		return nil
+	}
+	if err := InjectGuestInit(staging, guestInitPath); err != nil {
+		return fmt.Errorf("rootfs: inject base guest-init: %w", err)
+	}
+	return nil
+}
+
+// ensureBaseMountpoints creates directories that must exist on the read-only
+// boot root before guest-init can mount drive1. In particular, /overlay cannot
+// be created by guest-init after Linux mounts drive0 read-only.
+func ensureBaseMountpoints(staging string) error {
+	if err := os.MkdirAll(filepath.Join(staging, "overlay"), 0o755); err != nil {
+		return fmt.Errorf("rootfs: create base overlay mountpoint: %w", err)
+	}
+	return nil
 }
 
 // buildBaseFromStaging is the shared tail of BuildBase (apply-all

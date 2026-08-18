@@ -48,7 +48,7 @@ type VMResult struct {
 // (or recently-running) builder VM. Always pair with WaitForCompletion.
 type BuildHandle struct {
 	Instance   string    // "build-<BuildID>" — the vmmd instance name
-	HostDrive1 string    // host-side 8 GiB tmp file (cleaned up by WaitForCompletion)
+	HostDrive1 string    // host-side 24 GiB tmp file (cleaned up by WaitForCompletion)
 	ExportDir  string    // host dir vmmd copies build-done.json + /build/out/* into
 	BuildID    string    // echoes req.BuildID
 	TimeoutSec int       // wall-clock budget the caller selected
