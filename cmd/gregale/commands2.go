@@ -873,7 +873,7 @@ func cmdDeployTarball(args []string) int {
 	// doctor can scan); the server-side validators still run on
 	// upload.
 	doctorStrict := fs.Bool("doctor-strict", false, "run `gregale doctor` first; abort the deploy on any error-class finding (warnings are warn-only)")
-	// Issue #977 / ADR-116: deployment annotations surface. Three
+	// Issue #977 / ADR-116: deployment annotations surface. Four
 	// flags on the cmdDeployTarball path; the zero-config path
 	// auto-captures deployed_by from `git config user.name` and
 	// leaves reason/tag/PRNumber unset (no flags exposed there —
@@ -881,9 +881,13 @@ func cmdDeployTarball(args []string) int {
 	// map 1:1 to the api.DeployAnnotations struct that the multipart
 	// writer (pkg/api/multipart.go) emits as form fields. --tag is
 	// closed-set; the validator below rejects any other value.
+	// --pr-number is the GitHub Action path's escape hatch (CI
+	// knows the PR number from ${{ github.event.pull_request.number }});
+	// manual CLI users almost never set it.
 	reason := fs.String("reason", "", "free-text deploy reason recorded on the row (≤280 chars)")
 	tag := fs.String("tag", "", "annotation tag (incident_recovery|hotfix|scheduled_maintenance|compliance_hold|partner_request)")
 	deployedBy := fs.String("deployed-by", "", "operator label (auto-resolved from `git config user.name` when in a repo)")
+	prNumber := fs.Int("pr-number", 0, "PR number (positive int; 0 = absent). Default unset; CI paths stamp via the GitHub Action.")
 	if err := fs.Parse(args); err != nil {
 		PrintUsage(os.Stderr, "usage: gregale deploy [--doctor-strict] --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
@@ -1018,6 +1022,7 @@ func cmdDeployTarball(args []string) int {
 			Reason:     *reason,
 			Tag:        *tag,
 			DeployedBy: resolveDeployedBy(*deployedBy),
+			PRNumber:   *prNumber,
 		})
 	}
 
@@ -1393,6 +1398,7 @@ func cmdDeployTarball(args []string) int {
 			Reason:     *reason,
 			Tag:        *tag,
 			DeployedBy: resolveDeployedBy(*deployedBy),
+			PRNumber:   *prNumber,
 		}
 		dep, err := DeployTarball(client, ctx, slug, *tarball, *runtime, *handler, *dockerfile, ann)
 		if err != nil {
@@ -1412,12 +1418,19 @@ func cmdDeployTarball(args []string) int {
 		}
 		return &v
 	}
+	annIntPtr := func(v int) *int {
+		if v <= 0 {
+			return nil
+		}
+		return &v
+	}
 	dep, err := client.Deploy(ctx, slug, api.CreateDeploymentRequest{
 		Image:          *image,
 		TrafficPercent: optTrafficPercent(*trafficPercent),
 		Reason:         annPtr(*reason),
 		Tag:            annPtr(*tag),
 		DeployedBy:     annPtr(resolveDeployedBy(*deployedBy)),
+		PRNumber:       annIntPtr(*prNumber),
 	})
 	if err != nil {
 		return printErr("Deploy failed", err)

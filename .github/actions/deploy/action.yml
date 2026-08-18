@@ -45,6 +45,28 @@ inputs:
     description: "Maximum seconds to wait for the deployment to settle (only used when wait=true)"
     required: false
     default: "600"
+  # Issue #977 / ADR-116: deployment annotations surface. The CLI
+  # forwards --reason / --tag / --deployed-by / --pr-number to
+  # gregale deploy. Defaults mirror the GitHub Actions context
+  # (github.actor for the actor, the PR number for pull_request
+  # events) so most workflows can omit them and still get a
+  # useful stamp on the deployment row.
+  reason:
+    description: "Free-text deploy reason (≤280 chars). Recorded on the deployment row + dashboard + audit."
+    required: false
+    default: ""
+  tag:
+    description: "Annotation tag — one of: incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request."
+    required: false
+    default: ""
+  deployed-by:
+    description: "Operator label. Defaults to ${{ github.actor }} when unset."
+    required: false
+    default: "${{ github.actor }}"
+  pr-number:
+    description: "PR number (auto-default to ${{ github.event.pull_request.number }} for pull_request events)."
+    required: false
+    default: ""
 
 outputs:
   deployment-id:
@@ -87,6 +109,14 @@ runs:
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_WAIT: ${{ inputs.wait }}
         INPUT_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        # Issue #977 / ADR-116: forward the annotation surface to
+        # src/run.sh which appends the corresponding gregale
+        # deploy flags. Default values resolve at action-time
+        # (github.actor / github.event.pull_request.number).
+        INPUT_REASON: ${{ inputs.reason }}
+        INPUT_TAG: ${{ inputs.tag }}
+        INPUT_DEPLOYED_BY: ${{ inputs.deployed-by }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
       run: "$ACTION_PATH/src/run.sh deploy"
     - name: Annotate on failure
       if: failure()
