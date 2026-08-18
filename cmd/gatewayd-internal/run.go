@@ -242,7 +242,19 @@ func certIssuerFor(store state.Store, metrics *gateway.Metrics, enabled bool) ga
 	if !enabled {
 		return nil
 	}
-	return gateway.NewTenantSurfaceCertIssuer(store, metrics)
+	// PR-D cert-engine-real-mint: the LetsEncryptCertIssuer is
+	// nil here. Production wiring lands in commit 7 (the
+	// real-mint E2E) once a fake CA is wired into the
+	// gatewayd-internal startup path. Until then the
+	// wrapper's nil-issuer degradation keeps the state
+	// machine moving (cert_state → pending → failed with
+	// "cert engine unwired" last_error) so operator dashboards
+	// see the wiring without touching the CA.
+	//
+	// The E2E test wires a real LetsEncryptCertIssuer against
+	// LE staging with a stub DNS-01 provider so the production
+	// issuer code path is exercised end-to-end.
+	return gateway.NewTenantSurfaceCertIssuer(store, metrics, nil)
 }
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd

@@ -2524,6 +2524,33 @@ const (
 	WarmHintCacheSize               = 1000
 	CertSyncIntervalSeconds         = 30
 
+	// Tenant-surface cert engine constants (ADR-100 amendment,
+	// PR-D cert-engine-real-mint). The cap + renew-window + tick live
+	// here per CLAUDE.md "Hard limits policy" — no inline numbers in
+	// the issuer.
+	//
+	// MaxSANPerCert is LE's per-order SAN hard cap. Anything above this
+	// must be split across multiple orders; PR-D fails closed (the
+	// follow-up ADR-114 wires the split-aware `per_host` fallback).
+	//
+	// CertRenewBeforeNotAfterDays is the renew-window threshold: a
+	// surface with cert_not_after < now+window is queued for re-mint
+	// on the next renewer tick. LE's per-order rate limit exempts
+	// renewals of existing certs, so this is the same shape for
+	// fresh issuance and renewal — the renewer reuses the existing
+	// certmagic.Renew path through the same surface-remint pipeline.
+	// 30 days mirrors LE's expiry notification cadence (30/7/1 day
+	// emails) so an operator reading the alert sees the same window.
+	//
+	// CertRenewTickSeconds is the renewer goroutine cadence — every
+	// tick reads `tenant_surfaces_cert_expiry_idx` and re-mints
+	// surfaces inside the window. 5 min keeps file I/O negligible
+	// (one SELECT per tick) and the dashboard's "time-to-cert"
+	// panel has sub-minute resolution.
+	MaxSANPerCert                = 100
+	CertRenewBeforeNotAfterDays  = 30
+	CertRenewTickSeconds         = 300
+
 	// Tier A8 (active-passive HA topology, ADR-083 — closes the
 	// §14 M8 "Gate-A runbook (2nd box active-passive)" gap left
 	// by Tier A4 + A5 + A7). Lex-min leader election lives in

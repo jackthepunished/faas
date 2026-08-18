@@ -52,12 +52,17 @@ func tenantSurfaceIssuerFixture(t *testing.T) (*TenantSurfaceCertIssuer, *state.
 			t.Fatal(err)
 		}
 	}
-	issuer := NewTenantSurfaceCertIssuer(m, NewMetrics())
+	issuer := NewTenantSurfaceCertIssuer(m, NewMetrics(), nil)
 	return issuer, m, surf, ctx
 }
 
-func TestTenantSurfaceCertIssuer_SuccessStubPath(t *testing.T) {
+func TestTenantSurfaceCertIssuer_NilIssuerDegrades(t *testing.T) {
 	issuer, m, surf, ctx := tenantSurfaceIssuerFixture(t)
+	// nil issuer (the default for the test fixture) should
+	// transition cert_state pending → failed with a clear
+	// "cert engine unwired" last_error. The wrapper never
+	// touches the CA — production wires a real
+	// LetsEncryptCertIssuer in cmd/gatewayd-internal/run.go.
 	if err := issuer.RequestCertForSurface(ctx, surf.ID); err != nil {
 		t.Fatalf("RequestCertForSurface: %v", err)
 	}
@@ -65,17 +70,22 @@ func TestTenantSurfaceCertIssuer_SuccessStubPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// v1 stub: cert_state=failed with a clear last_error
-	// naming the verified count + primary hostname. The
-	// follow-up ADR swaps this for cert_state=issued.
+	// cert_state must end on failed (the pending transition
+	// is observable in the test only if we instrument the
+	// store; today we assert the post-call state).
 	if got.CertState != state.CertStateFailed {
 		t.Fatalf("cert_state = %q, want %q", got.CertState, state.CertStateFailed)
 	}
-	if !strings.Contains(got.CertLastError, "cert engine stub") {
-		t.Errorf("last_error = %q; want it to mention the cert engine stub", got.CertLastError)
+	if !strings.Contains(got.CertLastError, "cert engine unwired") {
+		t.Errorf("last_error = %q; want it to mention the cert engine unwired", got.CertLastError)
 	}
 	if !strings.Contains(got.CertLastError, "a.example") {
 		t.Errorf("last_error = %q; want it to name the primary hostname", got.CertLastError)
+	}
+	// NotAfter must NOT be set on the failed branch — the
+	// column stays zero until cert_state flips to issued.
+	if !got.CertNotAfter.IsZero() {
+		t.Errorf("cert_not_after = %v on failed; want zero", got.CertNotAfter)
 	}
 }
 
