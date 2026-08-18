@@ -539,6 +539,7 @@ func ApplyTarball(staging, tarballPath string, capBytes int64) error {
 // flat archive keeps the API compatible with hand-built tarballs. Multiple
 // top-level entries mean there is no wrapper to remove.
 func tarballRootPrefix(path string) (string, error) {
+	//nolint:forbidigo // path is the apid-spooled tarball already validated by ApplyTarball's caller.
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("rootfs: open tarball: %w", err)
