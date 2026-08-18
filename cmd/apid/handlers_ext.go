@@ -3205,17 +3205,21 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		d.OverridePort != 0 ||
 		len(d.OverrideHealthcheck) > 0
 	resp := api.DeploymentResponse{
-		ID:           d.ID,
-		AppID:        d.AppID,
-		BuildID:      d.BuildID,
-		ImageDigest:  d.ImageDigest,
-		Kind:         string(d.Kind),
-		Status:       string(d.Status),
-		Error:        d.Error,
-		ErrorCode:    d.ErrorCode,
-		CreatedAt:    d.CreatedAt.UTC().Format(time.RFC3339),
-		HasOverrides: hasOverrides,
-		MinInstances: d.MinInstances,
+		ID:                d.ID,
+		AppID:             d.AppID,
+		BuildID:           d.BuildID,
+		ImageDigest:       d.ImageDigest,
+		Kind:              string(d.Kind),
+		Status:            string(d.Status),
+		Error:             d.Error,
+		ErrorCode:         d.ErrorCode,
+		ErrorHint:         d.ErrorHint,
+		ErrorWhy:          d.ErrorWhy,
+		ErrorFix:          d.ErrorFix,
+		ErrorRelevantLogs: d.ErrorRelevantLogs,
+		CreatedAt:         d.CreatedAt.UTC().Format(time.RFC3339),
+		HasOverrides:      hasOverrides,
+		MinInstances:      d.MinInstances,
 		// Issue #556 PR-A: traffic_percent echoes the per-deployment
 		// split weight. Σ over live rows for the app is 100 by
 		// construction (CreateDeployment zeros the prior row in the
