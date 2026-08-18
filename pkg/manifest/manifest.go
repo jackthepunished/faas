@@ -24,10 +24,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -93,8 +95,9 @@ type Manifest struct {
 	Daemons Daemons `yaml:"daemons"`
 
 	// Overlay is the per-host overlay network (Wireguard/Tailscale)
-	// identity. The renderer uses Hostname + Address to populate
-	// /etc/hosts and the per-daemon target_url entries.
+	// identity. The manifest Ansible generator uses each host's Address
+	// to populate the private service aliases in /etc/hosts; the renderer
+	// uses the same endpoint port for per-daemon target_url entries.
 	Overlay Overlay `yaml:"overlay"`
 
 	// DNS is the public-facing hostname contract. apps_domain is the
@@ -592,6 +595,7 @@ func (m *Manifest) Validate() Errors {
 		})
 	}
 	errs = append(errs, m.Fleet.validate()...)
+	errs = append(errs, m.validateFleetEndpoints()...)
 	errs = append(errs, m.Daemons.validate()...)
 	errs = append(errs, m.Overlay.validate()...)
 	errs = append(errs, m.DNS.validate()...)
@@ -605,6 +609,111 @@ func (m *Manifest) Validate() Errors {
 		return errs
 	}
 	return nil
+}
+
+// ParseHostPort parses the manifest endpoint shape used by split-box
+// hosts. Unix endpoints remain valid for a single-box manifest, but a
+// multi-host fleet must expose a routable host:port endpoint so the
+// renderer and Ansible can derive the same dial target without an
+// operator-maintained IP copy.
+func ParseHostPort(raw string) (host string, port int, err error) {
+	if strings.HasPrefix(raw, "unix://") {
+		return "", 0, fmt.Errorf("unix endpoint is only valid for a single-box host")
+	}
+	if raw == "" {
+		return "", 0, fmt.Errorf("endpoint is empty")
+	}
+	host, portText, err := net.SplitHostPort(raw)
+	if err != nil {
+		return "", 0, fmt.Errorf("endpoint %q must be host:port: %w", raw, err)
+	}
+	if host == "" {
+		return "", 0, fmt.Errorf("endpoint %q has an empty host", raw)
+	}
+	if _, ipErr := netip.ParseAddr(host); ipErr != nil && !validNodeName(host) {
+		return "", 0, fmt.Errorf("endpoint %q has an invalid host %q", raw, host)
+	}
+	port, err = strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("endpoint %q has invalid port %q", raw, portText)
+	}
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil && ip.IsUnspecified() {
+		return "", 0, fmt.Errorf("endpoint %q uses an unspecified host address", raw)
+	}
+	return host, port, nil
+}
+
+// TCPURL converts a manifest host endpoint into the canonical dial URL
+// used by vmmd and compute_nodes.target_url. The bind address remains a
+// separate setting; this helper must never produce tcp://0.0.0.0.
+func TCPURL(raw string) (string, error) {
+	host, port, err := ParseHostPort(raw)
+	if err != nil {
+		return "", err
+	}
+	return "tcp://" + net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+// ServiceName returns the private mTLS DNS identity for a split-box role.
+// These names are intentionally independent of public Cloudflare DNS: the
+// internal PKI issues role certificates for them and the generated Ansible
+// inventory maps them to the manifest's overlay addresses.
+func ServiceName(role string) (string, error) {
+	switch role {
+	case "control-plane":
+		return "schedd.faas", nil
+	case "compute-only":
+		return "vmmd.faas", nil
+	default:
+		return "", fmt.Errorf("role %q has no split-box service identity", role)
+	}
+}
+
+// ServiceTCPURL returns the mTLS-verifiable target for a split-box host.
+// ParseHostPort supplies the port from the manifest endpoint, while the
+// service identity supplies the TLS ServerName used by grpc-go.
+func ServiceTCPURL(role, raw string) (string, error) {
+	_, port, err := ParseHostPort(raw)
+	if err != nil {
+		return "", err
+	}
+	name, err := ServiceName(role)
+	if err != nil {
+		return "", err
+	}
+	return "tcp://" + net.JoinHostPort(name, strconv.Itoa(port)), nil
+}
+
+func (m *Manifest) validateFleetEndpoints() Errors {
+	if len(m.Fleet.Hosts) <= 1 {
+		return nil
+	}
+	var errs Errors
+	for i, h := range m.Fleet.Hosts {
+		path := fmt.Sprintf("fleet.hosts[%d].address", i)
+		if h.Address == "" {
+			errs = append(errs, Error{path, "is required for a multi-host fleet"})
+			continue
+		}
+		host, _, err := ParseHostPort(h.Address)
+		if err != nil {
+			errs = append(errs, Error{path, err.Error()})
+			continue
+		}
+		// IP endpoints should be inside the declared mesh. Hostnames are
+		// intentionally allowed: they are resolved by the operator's
+		// private DNS or /etc/hosts contract and may not be statically
+		// checked here.
+		ip, parseErr := netip.ParseAddr(host)
+		if parseErr == nil && m.Overlay.CIDR != "" {
+			prefix, prefixErr := netip.ParsePrefix(m.Overlay.CIDR)
+			if prefixErr == nil && !prefix.Contains(ip) {
+				errs = append(errs, Error{path,
+					fmt.Sprintf("IP %q is outside overlay.cidr %q", host, m.Overlay.CIDR)})
+			}
+		}
+	}
+	return errs
 }
 
 // =====================================================================
@@ -622,6 +731,9 @@ func (f *Fleet) validate() Errors {
 		path := fmt.Sprintf("fleet.hosts[%d]", i)
 		if h.Name == "" {
 			errs = append(errs, Error{path + ".name", "is required"})
+		} else if !validNodeName(h.Name) {
+			errs = append(errs, Error{path + ".name",
+				fmt.Sprintf("invalid node name %q (use lowercase letters, digits, dots, or dashes)", h.Name)})
 		} else if seen[h.Name] {
 			errs = append(errs, Error{path + ".name",
 				fmt.Sprintf("duplicate host %q (host names must be unique)", h.Name)})
@@ -939,9 +1051,14 @@ func roleKnown(r string) bool {
 }
 
 var hostnameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+var nodeNameRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{0,61}[a-z0-9])?$`)
 
 func looksLikeHostname(s string) bool {
 	return hostnameRe.MatchString(s)
+}
+
+func validNodeName(s string) bool {
+	return nodeNameRe.MatchString(s) && !strings.Contains(s, "..")
 }
 
 func looksLikeHostPort(s string) bool {

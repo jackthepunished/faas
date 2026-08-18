@@ -81,6 +81,81 @@ func TestParse_Valid(t *testing.T) {
 	}
 }
 
+func TestParseHostPortAndTCPURL(t *testing.T) {
+	host, port, err := ParseHostPort("compute-1.faas:50051")
+	if err != nil {
+		t.Fatalf("ParseHostPort: %v", err)
+	}
+	if host != "compute-1.faas" || port != 50051 {
+		t.Fatalf("ParseHostPort = (%q, %d), want (compute-1.faas, 50051)", host, port)
+	}
+	got, err := TCPURL("[fd00::2]:50051")
+	if err != nil {
+		t.Fatalf("TCPURL: %v", err)
+	}
+	if got != "tcp://[fd00::2]:50051" {
+		t.Errorf("TCPURL = %q, want tcp://[fd00::2]:50051", got)
+	}
+}
+
+func TestServiceTCPURLUsesPrivatePKIIdentity(t *testing.T) {
+	got, err := ServiceTCPURL("compute-only", "10.42.0.2:50051")
+	if err != nil {
+		t.Fatalf("ServiceTCPURL: %v", err)
+	}
+	if got != "tcp://vmmd.faas:50051" {
+		t.Fatalf("ServiceTCPURL = %q, want tcp://vmmd.faas:50051", got)
+	}
+
+	got, err = ServiceTCPURL("control-plane", "10.42.0.1:7100")
+	if err != nil {
+		t.Fatalf("ServiceTCPURL control-plane: %v", err)
+	}
+	if got != "tcp://schedd.faas:7100" {
+		t.Fatalf("ServiceTCPURL control-plane = %q, want tcp://schedd.faas:7100", got)
+	}
+
+	if _, err := ServiceTCPURL("single-box", "unix:///run/faas/vmmd.sock"); err == nil {
+		t.Fatal("ServiceTCPURL(single-box) unexpectedly accepted a unix endpoint")
+	}
+}
+
+func TestValidate_MultiHostEndpointContract(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "missing endpoint",
+			body: strings.Replace(validManifest, "      address: 10.42.0.2:50051\n", "", 1),
+			want: "fleet.hosts[1].address: is required",
+		},
+		{
+			name: "wildcard endpoint",
+			body: strings.Replace(validManifest, "      address: 10.42.0.2:50051", "      address: 0.0.0.0:50051", 1),
+			want: "unspecified host address",
+		},
+		{
+			name: "endpoint outside overlay",
+			body: strings.Replace(validManifest, "      address: 10.42.0.2:50051", "      address: 10.43.0.2:50051", 1),
+			want: "outside overlay.cidr",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := Parse([]byte(tt.body))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			errs := m.Validate()
+			if errs == nil || !strings.Contains(errs.Error(), tt.want) {
+				t.Fatalf("Validate = %v, want substring %q", errs, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidate_Valid(t *testing.T) {
 	m, err := Parse([]byte(validManifest))
 	if err != nil {

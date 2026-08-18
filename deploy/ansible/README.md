@@ -48,10 +48,22 @@ plays (control_plane / compute_nodes / box) all match a host set. The
 legacy `make bootstrap` against 127.0.0.1 still works because
 `[box:children]` aggregates `[control_plane]` + `[compute_nodes]`.
 
-Per-box `faas_box_role` + `faas_node_name` + connection vars
-(`ansible_host`, `ansible_python_interpreter`) live in
-`host_vars/faas-fsn-{1,2}.yml`. Edit those, not `hosts.ini`, when the
-fleet layout changes.
+For a split-box fleet, derive the inventory and per-host variables from
+the manifest instead of editing committed IPs:
+
+```
+make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
+```
+
+The generated `host_vars` owns `faas_box_role`, `faas_node_name`,
+`ansible_host`, `faas_vmmd_target_url`, and the private service aliases
+written by the overlay role. `faas_vmmd_target_url` is
+`tcp://vmmd.faas:<port>` so the existing internal PKI hostname check
+remains enabled; `/etc/hosts` maps `vmmd.faas` and `schedd.faas` to the
+manifest overlay addresses. The committed
+`host_vars/faas-fsn-{1,2}.yml` files remain compatibility fixtures for
+the legacy inventory and one-box development path.
 
 ## Do NOT run this on a non-bare-metal host without reading this section
 

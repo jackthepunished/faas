@@ -27,39 +27,54 @@ artifact published by `cd-controlplane.yml` (PR-1 rewired CD). The
 artifact is bit-identical to the per-release `bin/gregalectl` under
 `/opt/faas/releases/<sha>/bin/`.
 
-## 2. Bootstrap the box
+## 2. Write and validate the manifest
 
-```
-# control-plane box (fsn-1)
-sudo make bootstrap-control-plane
-
-# compute-only box (fsn-2)
-sudo make bootstrap-compute
-```
-
-These targets run `deploy/ansible/bootstrap.yml` against the
-three-group inventory (`deploy/ansible/inventory/hosts.ini`). The
-legacy single-box target (`make bootstrap`) still works against
-127.0.0.1 for dev/lima — `[box:children]` aggregates the multi-box
-groups.
-
-Per-box role + node name + connection vars live in
-`host_vars/faas-fsn-{1,2}.yml`. Edit those, not the inventory.
-
-## 3. Write the manifest
-
-Copy the cluster-shipped example and edit `nodes.host` / `nodes.fleet`
-/ `release.git_sha`:
+Copy the cluster-shipped example and replace the illustrative host
+endpoints with the routable address of each box. The endpoint is the
+single source for SSH/Ansible reachability and the overlay address. The
+generated compute target keeps the private PKI identity (`vmmd.faas`) and
+uses the endpoint port; the generator maps literal mesh IPs to the
+`vmmd.faas` / `schedd.faas` aliases in `/etc/hosts`.
 
 ```
 cp deploy/manifest/examples/splitbox.example.yaml deploy/manifest/splitbox.yaml
 $EDITOR deploy/manifest/splitbox.yaml
+gregalectl manifest validate --file deploy/manifest/splitbox.yaml
 ```
+
+## 3. Generate the Ansible inventory and bootstrap the boxes
+
+```
+make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml
+```
+
+The generated inventory owns `ansible_host`, node identity, private
+service aliases, and `faas_vmmd_target_url`. A new bare-metal host
+therefore requires a manifest change and regeneration, not a hand-edited
+IP in the repository. Public Cloudflare DNS remains separate from this
+private mTLS path; hostname endpoints require an operator-managed private
+DNS entry for the role alias.
+
+## 4. Bootstrap the box
+
+```
+# control-plane box (fsn-1)
+sudo make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-control-plane
+
+# compute-only box (fsn-2)
+sudo make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
+```
+
+These targets run `deploy/ansible/bootstrap.yml` against the
+manifest-generated three-group inventory. The
+legacy single-box target (`make bootstrap`) still works against
+127.0.0.1 for dev/lima — `[box:children]` aggregates the multi-box
+groups.
 
 The schema docs are at
 [`docs/adr/110-declarative-split-box-manifest.md`](../adr/110-declarative-split-box-manifest.md).
 
-## 4. Validate + render
+## 5. Validate + render
 
 ```
 # Schema + cross-key validation
@@ -78,7 +93,7 @@ gregalectl manifest render \
     --host $(hostname)
 ```
 
-## 5. Install the release bundle
+## 6. Install the release bundle
 
 ```
 gregalectl release install --git-sha <git-sha>
@@ -88,7 +103,7 @@ Flips `/opt/faas/current` to the new SHA, lands the daemons under
 `/opt/faas/releases/<sha>/bin/`, writes the `release_bundles` row,
 and upsersts `compute_nodes.release_id` for the local box.
 
-## 6. Doctor
+## 7. Doctor
 
 ```
 gregalectl doctor

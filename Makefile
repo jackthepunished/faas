@@ -20,6 +20,7 @@ CLIS := gregale gregalectl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
+ANSIBLE_INVENTORY ?= deploy/ansible/inventory/hosts.ini
 
 .DEFAULT_GOAL := help
 
@@ -433,17 +434,23 @@ systemd-hardening-check: ## Static release gate for production systemd isolation
 .PHONY: bootstrap
 bootstrap: ## Idempotent single-box setup (ansible) — dev/lima. Back-compat for `make bootstrap` against 127.0.0.1.
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $$BOX -e faas_box_role=single-box
+	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $$BOX -e faas_box_role=single-box
+
+.PHONY: manifest-ansible
+manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars tree (MANIFEST + ANSIBLE_GENERATED_DIR required)
+	@test -n "$(MANIFEST)" || (echo "MANIFEST is required (example: MANIFEST=deploy/manifest/splitbox.yaml)" >&2; exit 2)
+	test -x ./bin/gregalectl || $(GO) build -o ./bin/gregalectl ./cmd/gregalectl
+	./bin/gregalectl manifest ansible --manifest-file "$(MANIFEST)" --output-dir "$${ANSIBLE_GENERATED_DIR:-$(CURDIR)/deploy/ansible/.generated}"
 
 .PHONY: bootstrap-control-plane
 bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane} -e faas_box_role=control-plane
+	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane} -e faas_box_role=control-plane
 
 .PHONY: bootstrap-compute
 bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes} -e faas_box_role=compute-only
+	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes} -e faas_box_role=compute-only
 
 .PHONY: tidy
 tidy: ## go mod tidy
