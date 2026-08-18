@@ -17,16 +17,17 @@ checklist signs each row with their handle and the date.
 
 ### 1. `make e2e-sandbox` — operator-only live walk
 
-- **What:** the four-test sandbox walk against `api.sandbox.paddle.com`
+- **What:** the five-test sandbox walk against `api.sandbox.paddle.com`
   from `cmd/e2e/billing_paddle_sandbox_test.go`.
 - **Why:** the machine-readable CI cannot prove the wire-up against a
-  real merchant. The four tests cover CheckoutURL creation,
+  real merchant. The five tests cover CheckoutURL creation,
   subscription.created-stamps-customer-id, transaction.completed-is-noop,
-  and per-window-claim round-trip (the meterd production path).
+  per-window-claim round-trip (the meterd production path), and
+  webhook-signature round-trip (the SDK pinning contract).
 - **How:** `make e2e-sandbox` against a fresh Lima box (the same
   provisioning `make metal-lima` uses) with `secrets/.env.sandbox`
   populated. Requires `DATABASE_URL` and `FAAS_PADDLE_SANDBOX_E2E=1`.
-- **Pass criterion:** all four tests pass with no `verify_failed`
+- **Pass criterion:** all five tests pass with no `verify_failed`
   lines in the test logs.
 - **Signed:** ____________________  date: _________
 
@@ -39,7 +40,7 @@ checklist signs each row with their handle and the date.
   the GitHub Actions logs.
 - **How:** with `PADDLE_SANDBOX_API_KEY` + `PADDLE_SANDBOX_WEBHOOK_SECRET`
   set as repository secrets, dispatch the workflow from the UI.
-- **Pass criterion:** the workflow runs to completion with all four
+- **Pass criterion:** the workflow runs to completion with all five
   tests `PASS`.
 - **Signed:** ____________________  date: _________
 

@@ -1,7 +1,7 @@
 name: paddle sandbox
 
 # Manual-only acceptance job for the Paddle Billing v2 sandbox live
-# walk (ADR-032 v2, PR-F of the launch cluster). Runs the four
+# walk (ADR-032 v2, PR-F of the launch cluster). Runs the five
 # cmd/e2e tests in billing_paddle_sandbox_test.go against a real
 # api.sandbox.paddle.com merchant:
 #
