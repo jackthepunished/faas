@@ -111,29 +111,54 @@ func secretsList(args []string) int {
 	// ADR-092 PR-B: nested secrets_by_scope vs flat secrets is the
 	// discriminated union — render whichever arm the server returned.
 	if len(resp.SecretsByScope) > 0 {
-		scopes := make([]string, 0, len(resp.SecretsByScope))
-		for s := range resp.SecretsByScope {
-			scopes = append(scopes, s)
-		}
-		sort.Strings(scopes)
-		_, _ = fmt.Fprintf(osStdout, "%s: %d/%d secrets (across %d scopes)\n",
-			*app, resp.Count, resp.Quota, len(scopes))
-		for _, s := range scopes {
-			for _, row := range resp.SecretsByScope[s] {
-				_, _ = fmt.Fprintf(os.Stdout, "  %s/%s\n", s, row.Key)
-			}
-		}
+		renderSecretsByScope(osStdout, *app, &resp)
 		return 0
 	}
-	_, _ = fmt.Fprintf(os.Stdout, "%s: %d/%d secrets\n", *app, resp.Count, resp.Quota)
+	renderFlatSecrets(osStdout, *app, &resp)
+	return 0
+}
+
+// renderSecretsByScope emits the `__all__` arm of the secrets-list
+// discriminated union: a header summarising the cross-scope total,
+// then one section per scope (sorted ASC) listing "<scope>/<key>"
+// rows. Extracted from secretsList (commands3.go:85) so the routing
+// function stays under the 50-line cap (CLAUDE.md).
+//
+// Mirror of the env route's nested-map renderer at
+// cmd/gregale/commands_inspect.go — same shape, secrets-flavored.
+func renderSecretsByScope(w io.Writer, app string, resp *api.AppSecretListResponse) {
+	scopes := make([]string, 0, len(resp.SecretsByScope))
+	for s := range resp.SecretsByScope {
+		scopes = append(scopes, s)
+	}
+	sort.Strings(scopes)
+	_, _ = fmt.Fprintf(w, "%s: %d/%d secrets (across %d scopes)\n",
+		app, resp.Count, resp.Quota, len(scopes))
+	for _, s := range scopes {
+		for _, row := range resp.SecretsByScope[s] {
+			_, _ = fmt.Fprintf(w, "  %s/%s\n", s, row.Key)
+		}
+	}
+}
+
+// renderFlatSecrets emits the per-scope arm of the secrets-list
+// discriminated union: a header, then one row per secret rendered
+// as "<scope>/<key>". An empty Scope (legacy pre-PR-B server rows
+// without the column populated) renders as "default" — the same
+// server-side collapse that cmd/apid/handlers_secrets.go::scopeFromQuery
+// applies, kept symmetric in the CLI for human-readable output.
+//
+// Extracted from secretsList (commands3.go:85) so the routing
+// function stays under the 50-line cap (CLAUDE.md).
+func renderFlatSecrets(w io.Writer, app string, resp *api.AppSecretListResponse) {
+	_, _ = fmt.Fprintf(w, "%s: %d/%d secrets\n", app, resp.Count, resp.Quota)
 	for _, s := range resp.Secrets {
 		scopeName := s.Scope
 		if scopeName == "" {
 			scopeName = "default"
 		}
-		_, _ = fmt.Fprintf(osStdout, "  %s/%s\n", scopeName, s.Key)
+		_, _ = fmt.Fprintf(w, "  %s/%s\n", scopeName, s.Key)
 	}
-	return 0
 }
 
 // --- set -------------------------------------------------------------------
@@ -264,6 +289,15 @@ func secretsSet(args []string) int {
 // ListSecretsWithScope with scope="" to get the cross-scope total
 // (the per-app SecretCountMax counts across all scopes — see
 // pkg/api/limits.go).
+//
+// ADR-092 PR-B: the cross-scope total is `list.Count`, NOT
+// `len(list.Secrets)`. The scope="" query collapses server-side to
+// "default" (handlers_secrets.go::scopeFromQuery), so `Secrets`
+// only contains the default-scope rows — the prod/staging rows
+// silently drop. `list.Count` is the server-side cross-scope total
+// (handlers_secrets.go::listSecrets calls CountAppSecrets across
+// every scope). Using `len(list.Secrets)` would under-report for
+// any customer with non-default-scope rows.
 func printSecretsQuotaStamp(client *api.Client, app, scope string) {
 	_ = scope // accepted for symmetry with secretsSet; the stamp itself
 	// always reads the cross-scope total.
@@ -271,7 +305,7 @@ func printSecretsQuotaStamp(client *api.Client, app, scope string) {
 	if err != nil {
 		return
 	}
-	used := len(list.Secrets)
+	used := list.Count
 	if acct, err := client.Whoami(context.Background()); err == nil {
 		if l, ok := api.LimitsFor(api.Plan(acct.Plan)); ok && l.SecretCountMax > 0 {
 			_, _ = fmt.Fprintf(osStdout, "%s: %d/%d secrets\n", app, used, l.SecretCountMax)

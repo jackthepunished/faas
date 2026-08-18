@@ -85,7 +85,17 @@ func (s *server) listSecrets(w http.ResponseWriter, r *http.Request, acct state.
 		writeSecretListAll(w, rows, limits.SecretCountMax)
 		return
 	}
+	s.listSecretsInScope(w, r, acct, app, scope, limits)
+}
 
+// listSecretsInScope renders the per-scope flat arm of the GET
+// response. Extracted from listSecrets (handlers_secrets.go:62) so
+// the routing handler stays under the 50-line cap (CLAUDE.md).
+// The cross-scope Count is queried explicitly so the CLI stamp and
+// dashboard render a single "N / SecretCountMax" bar regardless of
+// which scope the customer is currently inspecting (ADR-090 D6 /
+// ADR-092 D6 posture).
+func (s *server) listSecretsInScope(w http.ResponseWriter, r *http.Request, acct state.Account, app state.App, scope string, limits api.Limits) {
 	rows, err := s.store.ListAppSecretsInScope(r.Context(), acct.ID, app.ID, scope)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list secrets"))
@@ -101,12 +111,6 @@ func (s *server) listSecrets(w http.ResponseWriter, r *http.Request, acct state.
 			Kid:       row.Kid,
 		})
 	}
-	// Count across ALL scopes so the dashboard renders one unified
-	// "N / SecretCountMax" bar regardless of which scope the customer
-	// is currently inspecting. Per-ADR-090 D6 (and the parallel ADR-092
-	// posture in pkg/api/limits.go::SecretCountMax) the per-app quota is
-	// unchanged across scopes — a customer's "staging" rows count
-	// toward the same SecretCountMax as their "default" rows.
 	totalCount, err := s.store.CountAppSecrets(r.Context(), acct.ID, app.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not count secrets"))
