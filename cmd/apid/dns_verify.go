@@ -70,7 +70,7 @@ var errCertFailure = errors.New("cert dial failed")
 // stops tripping on the literal "pending" / "issued" used across
 // handlers_ext.go + the dialCert call sites.
 const (
-	certStatusIssued = "issued"
+	certStatusIssued  = "issued"
 	certStatusPending = "pending"
 )
 
@@ -185,7 +185,7 @@ func sanContains(sans []string, domain string) bool {
 // in the chain via a multi-errors.Unwrap shim.
 type wrappedPair struct{ a, b error }
 
-func (w *wrappedPair) Error() string { return w.a.Error() + ": " + w.b.Error() }
+func (w *wrappedPair) Error() string   { return w.a.Error() + ": " + w.b.Error() }
 func (w *wrappedPair) Unwrap() []error { return []error{w.a, w.b} }
 
 func joinErr(a, b error) error {
