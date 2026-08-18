@@ -67,11 +67,21 @@ flips to Paddle.
    cluster re-verifies the wiring with a focused test rather than
    re-introducing the classifier.
 
-4. **The Idempotency-Key SDK transport wrapper** (PR-E) wires the
-   existing `paddle.NewIdempotencyRT` RoundTripper into
-   `provider.go:NewProvider` so every Paddle write request carries
-   `Idempotency-Key: faas-overage-<acctID>-<YYYY-MM>`. Closes the v1 §4
-   "Negative/deferred" bullet.
+4. **The Idempotency-Key SDK transport wrapper** is wired. The
+   `paddle.NewIdempotencyRT` RoundTripper is composed into
+   `paddle/http.Client` and passed to `paddle.New(...)` via
+   `paddle.WithClient` at `provider.go:NewProvider` (line 199). Every
+   Paddle write request to `/transactions` carries
+   `Idempotency-Key: faas-overage-<acctID>-<YYYY-MM>` — the SDK's
+   `X-Transit-Id` header (set by `paddle.ContextWithTransitID`) is
+   copied as the canonical `Idempotency-Key` value, so the SDK's
+   idempotency plumbing and ours share a single source of truth.
+   Closes the v1 §4 "Negative/deferred" bullet; verified by the 11-test
+   `transport_test.go` suite (in particular
+   `TestIdempotencyRoundTripper_WiredIntoPaddleSDK`, which confirms
+   the SDK accepts the wrapped client via `paddle.WithClient`),
+   `TestIdempotencyRoundTripper_InjectsHeaderOnPOSTTransactions`, and
+   the live `cmd/e2e/billing_paddle_sandbox_test.go` walk.
 
 5. **`.github/workflows/paddle-sandbox.yml`** (PR-D) is the operator-only
    live CI sibling of `stripex-sandbox.yml`. It triggers on
