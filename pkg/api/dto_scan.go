@@ -95,6 +95,53 @@ type ScanResult struct {
 	Error string `json:"error,omitempty"`
 }
 
+// SecretScanResult is the customer-facing wire shape of one
+// deployment's secret-scan audit row (migrations/00221,
+// secret-scan v2). Mirrors the ScanResult shape above but for
+// the server-side secret pipeline (cmd/apid/secretscan.go) —
+// the two never overlap because they stamp different columns on
+// the deployments row (scan_result + scanned_at for grype;
+// secret_findings + secret_scanned_at for secrets).
+//
+// Status is the closed enum that mirrors deployments.scan_status
+// for the secret scan: the same five values (pending, complete,
+// failed, skipped, complete_with_redactions) but only the
+// last is set by the secret-scan pipeline — the secret-scan
+// either found redactions needed (complete_with_redactions) or
+// it didn't run yet (pending). The grype pipeline writes the
+// other three values; the two pipelines therefore touch the
+// same status column without colliding because they fire at
+// different lifecycle phases (secret scan: pre-apply, grype:
+// post-build).
+//
+// Findings is always non-nil (empty slice on a clean deploy) so
+// the wire JSON emits "findings":[] (never null). The
+// per-finding Snippet field is the pre-truncated safe
+// representation (first 6 + "…" + last 4) — never the raw
+// value, matching the snippet policy documented in
+// pkg/secretscan/scan.go.
+type SecretScanResult struct {
+	Status    string          `json:"status"`
+	ScannedAt string          `json:"scanned_at,omitempty"`
+	Findings  []SecretFinding `json:"findings"`
+	// ImageDigest is the OCI digest the layered scan was run
+	// against (PR-A). Mirrors ScanResult.ImageDigest (Grype
+	// path) so a customer comparing scan + secret-scan rows
+	// for the same deploy can see both scans ran against the
+	// same bytes. Omitted from the apid source-tree
+	// rejection payload (the cmd/apid 422 path doesn't have
+	// an image digest — the customer hasn't uploaded yet).
+	ImageDigest string `json:"image_digest,omitempty"`
+	// Error carries an in-band explanation when the audit
+	// row is unreadable (jsonb decode failed, server logs
+	// carry the detail). Mirrors ScanResult.Error so the
+	// dashboard's "scan summary unavailable" pill has
+	// something to render for a malformed row. Omitted on
+	// the success path (Status carries the closed-set
+	// signal: "complete" | "complete_with_redactions").
+	Error string `json:"error,omitempty"`
+}
+
 // SeverityCounts is the per-severity bucket count of CVEs
 // (issue #464 / ADR-075). The shape mirrors Grype's closed
 // vocabulary; the in-repo normalizeGrypeSeverity collapses

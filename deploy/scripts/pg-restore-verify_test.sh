@@ -9,9 +9,13 @@
 #      must remain present in the script body. The same tokens are
 #      pinned in the runbook (docs/runbooks/PostgresBackup.md) so a
 #      silent rename breaks the on-call playbook.
-#   3. hertznerbox remote name drift — the script (and the ansible
+#   3. offhostbox remote name drift — the script (and the ansible
 #      postgres role's archive_command) refer to a stable remote
 #      name; renaming breaks both at once.
+#
+# PR-8 (issue #911 / ADR-110 deferred): env vars renamed from
+# HETZNER_STORAGE_BOX_* → OFF_HOST_BACKUP_*. Rclone remote alias
+# hertznerbox: → offhostbox: (was misspelled before PR-8).
 #
 # Runs as part of `make lint-pg-restore-verify`. Exit 0 on success.
 
@@ -27,8 +31,8 @@ echo "OK: bash -n"
 for tok in "accounts" "apps" "instances" \
            "ROW_COUNT_THRESHOLD" "T_DAYS_BACK" \
            "RESTORE_TEST_ROOT" "RESTORE_PG_PORT" \
-           "HETZNER_STORAGE_BOX_BASEBACKUP_PATH" "HETZNER_STORAGE_BOX_WAL_PATH" \
-           "rclone" "hertznerbox" "pg_is_in_recovery"; do
+           "OFF_HOST_BACKUP_BASEBACKUP_PATH" "OFF_HOST_BACKUP_WAL_PATH" \
+           "rclone" "offhostbox" "pg_is_in_recovery"; do
   grep -q "$tok" "$SCRIPT" || { echo "FAIL: missing token '$tok' in $SCRIPT"; exit 1; }
 done
 echo "OK: required tokens present in verify script"

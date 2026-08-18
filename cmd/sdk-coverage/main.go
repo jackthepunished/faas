@@ -74,6 +74,10 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/anomalies":               true, // ADR-091 — operator-only (PR #2)
 	"GET /v1/admin/obs/rate-limits":             true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/audit-log/search":        true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/events":                  true, // ADR-091 — operator-only (PR #3)
+	"GET /v1/admin/obs/nodes/events":            true, // ADR-091 — operator-only SSE (PR #3; successor to /v1/compute-nodes/events)
+	"GET /v1/admin/obs/nodes/wake-latency":      true, // ADR-092 — operator-only per-node wake-latency quantiles (PR #4)
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie
@@ -117,17 +121,18 @@ var routeExclude = map[string]bool{
 // response-shape getters (HTTPClient/BaseURL/Token) belong here so
 // the gate doesn't false-positive on them.
 var sdkMethodExclude = map[string]bool{
-	"HTTPClient":          true,
-	"BaseURL":             true,
-	"Token":               true,
-	"ListDeploymentsAll":  true, // cursor walker; not a route
-	"DeployMultipart":     true, // open-ended reader-based upload; CLI's DeployTarball is the wired route
-	"MintCliAuthCode":     true, // anonymous device-code mint; route excluded above
-	"ExchangeCliAuthCode": true, // anonymous device-code poll; route excluded above
-	"GetStatusSLO":        true, // public status; route excluded above
-	"Logout":              true, // POST /logout is a browser-form post (excluded above); the SDK wraps the same handler as a convenience
-	"GetAccountDPA":       true, // public markdown; route excluded above (also reachable from /security)
-	"GetMyOrg":            true, // GET /v1/orgs/me was added in PR #722 before the OpenAPI spec tracked it; track both in lockstep on the next spec pass
+	"HTTPClient":              true,
+	"BaseURL":                 true,
+	"Token":                   true,
+	"ListDeploymentsAll":      true, // cursor walker; not a route
+	"ListAppErrorRequestsAll": true, // cursor walker; not a route (ADR-096 / PR-B)
+	"DeployMultipart":         true, // open-ended reader-based upload; CLI's DeployTarball is the wired route
+	"MintCliAuthCode":         true, // anonymous device-code mint; route excluded above
+	"ExchangeCliAuthCode":     true, // anonymous device-code poll; route excluded above
+	"GetStatusSLO":            true, // public status; route excluded above
+	"Logout":                  true, // POST /logout is a browser-form post (excluded above); the SDK wraps the same handler as a convenience
+	"GetAccountDPA":           true, // public markdown; route excluded above (also reachable from /security)
+	"GetMyOrg":                true, // GET /v1/orgs/me was added in PR #722 before the OpenAPI spec tracked it; track both in lockstep on the next spec pass
 }
 
 // methodRouteMap pins the routes whose natural SDK verb doesn't
@@ -156,6 +161,7 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/rollback":               "Rollback",
 	"POST /v1/apps/{slug}/deployments":            "Deploy",
 	"POST /v1/apps/{slug}/deployments/source-ref": "DeployFromSourceRef", // issue #739 / DEPLOY-PROV-4 / ADR-092; headless CI deploy
+	"POST /v1/apps/{slug}/diff":                   "Diff",                // PR-1 of deploy-diff cluster; CI gate input
 	"GET /v1/account/export":                      "ExportAccount",
 	"DELETE /v1/account":                          "DeleteAccount",
 	"PATCH /v1/account/plan":                      "ChangePlan",
@@ -172,7 +178,8 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/account/egress_allowlist_extra":    "SetEgressAllowlistExtra",
 	"GET /v1/apps/{slug}/logs":                    "StreamAppLogs",
 	"GET /v1/deployments/{id}/logs":               "StreamDeploymentLogs",
-	"GET /v1/deployments/{id}/scan":               "GetDeploymentScan", // issue #464 / ADR-055; per-deploy grype CVE drill-down
+	"GET /v1/deployments/{id}/scan":               "GetDeploymentScan",       // issue #464 / ADR-055; per-deploy grype CVE drill-down
+	"GET /v1/deployments/{id}/secret-scan":        "GetDeploymentSecretScan", // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
 	"GET /v1/deployments/{id}":                    "GetDeployment",
 	"PATCH /v1/deployments/{id}":                  "PatchDeployment", // ADR-072 / issue #557 closure; min_instances override
 	"GET /v1/deployments":                         "ListDeployments",
@@ -185,6 +192,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/crons/{id}/runs":                     "ListCronRuns",       // issue #791 — per-cron execution history
 	"POST /v1/crons/{id}/run":                     "FireCron",           // issue #791 — manual fire-now (PR-C)
 	"GET /v1/cron-fire-now-requests/{request_id}": "GetFireCronRequest", // issue #791 PR-D — poll fire-now terminal state (IDOR-safe byte-identical-404)
+	"GET /v1/crons/{id}":                          "GetCron",            // issue #791 PR-E / ADR-090 closure — backs `gregale crons info <id>`
 	"GET /v1/usage/summary":                       "UsageSummary",
 	"GET /v1/usage":                               "GetUsage",
 	"GET /v1/usage/daily":                         "UsageDaily",
@@ -221,6 +229,12 @@ var methodRouteMap = map[string]string{
 	"GET /v1/edge-rules/{id}":         "GetEdgeRule",
 	"PATCH /v1/edge-rules/{id}":       "UpdateEdgeRule",
 	"DELETE /v1/edge-rules/{id}":      "DeleteEdgeRule",
+	// ADR-091 D20.5 amendment / issue #881 — per-route throttle
+	// recommender. Auto-derivation would produce
+	// "GetAppsSlugThrottle-suggestions" (literal hyphen) due to the
+	// path's webhook-model naming; the SDK verb is the noun
+	// "ThrottleSuggestions" so the explicit map drops the hyphen.
+	"GET /v1/apps/{slug}/throttle-suggestions": "GetAppThrottleSuggestions",
 
 	// Issue #476 / ADR-076 — outbound webhook subscriptions. Same
 	// pattern as alerts: the SDK names the methods after the resource
@@ -236,8 +250,21 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/webhooks/{id}/rotate-secret":          "RotateAppWebhookSecret",
 	"GET /v1/apps/{slug}/webhooks/{id}/deliveries":              "ListAppWebhookDeliveries",
 	"POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry": "RetryAppWebhookDelivery",
-	"GET /v1/keys":  "ListKeys",
-	"POST /v1/keys": "CreateKey",
+
+	// ADR-098 §9.A — connection-aware data upstreams (PR-B hand-off).
+	// The auto-derivation would produce Swagger-style names
+	// ("GetAppsSlugUpstreams", "GetAppsSlugUpstreamsId", etc.) because
+	// the path uses the literal "upstreams" segment; the SDK names the
+	// methods after the resource noun (DataUpstream) — same convention
+	// as alerts/edge-rules/webhooks above. The PUT route is the
+	// upsert/create verb (the spec writes a single row per (kind, host,
+	// port) tuple, with the response carrying the persisted id).
+	"GET /v1/apps/{slug}/upstreams":         "ListAppDataUpstreams",
+	"GET /v1/apps/{slug}/upstreams/{id}":    "GetAppDataUpstream",
+	"PUT /v1/apps/{slug}/upstreams":         "CreateAppDataUpstream",
+	"DELETE /v1/apps/{slug}/upstreams/{id}": "DeleteAppDataUpstream",
+	"GET /v1/keys":                          "ListKeys",
+	"POST /v1/keys":                         "CreateKey",
 	// Move 2 routes — the auto-derivation produces names with literal
 	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
 	// the k8s-style hyphen; the explicit map below drops the hyphen and
@@ -260,6 +287,12 @@ var methodRouteMap = map[string]string{
 	// artifact; the SDK verb is "issue" (the operator's mental
 	// model) so the explicit map takes precedence.
 	"POST /v1/admin/accounts/{id}/credits": "IssueAccountCredit",
+	// PR-D / ADR-012 §7 amendment — per-tenant webhook secret
+	// rotation. Auto-derivation produces
+	// "PostAdminGithub-webhook-secrets" (literal hyphen); the SDK
+	// verb is "set" (operator's mental model) so the explicit map
+	// takes precedence.
+	"POST /v1/admin/github-webhook-secrets": "SetGithubWebhookSecret",
 	// Issue #279 PR-C — credit consumption reducer. Auto-derivation
 	// produces "PostInvoicesIdConsume-credits" (literal hyphen); the
 	// SDK verb is "ConsumeInvoiceCredits" so the explicit map drops
@@ -359,6 +392,31 @@ var methodRouteMap = map[string]string{
 	"GET /v1/apps/{slug}/slo": "GetAppSLO",
 	"GET /v1/account/slo":     "GetAccountSLO",
 
+	// ADR-093 — per-route observability inside an app. The
+	// auto-derivation would produce GetAppsSlugRoutes
+	// (Swagger-style); the SDK names it GetAppRoutes to match the
+	// sibling per-app family (GetAppMetrics, GetAppSLO, GetApp,
+	// ListApps) — drop the slug placeholder from the verb.
+	"GET /v1/apps/{slug}/routes": "GetAppRoutes",
+
+	// ADR-102 D6 — per-app streaming classification probe. The
+	// auto-derivation would produce GetAppsSlugStreaming-cap
+	// (Swagger-style with literal hyphen); the SDK names it
+	// GetAppStreamingStatus to match the sibling per-app family
+	// (GetAppRoutes, GetAppMetrics, GetAppSLO) — drop the slug
+	// placeholder from the verb and use the SDK type name
+	// (AppStreamingStatus) for the noun.
+	"GET /v1/apps/{slug}/streaming-cap": "GetAppStreamingStatus",
+
+	// ADR-096 / PR-B — customer-facing automatic error grouping.
+	// SDK names are pinned to the per-app family (GetAppErrorsSummary,
+	// ListAppErrorRequests, GetAppErrorSample) — auto-derivation would
+	// produce GetAppsSlugErrorsSummary / GetAppsSlugErrorsFingerprintFirst
+	// (Swagger-style) which breaks the navigability match.
+	"GET /v1/apps/{slug}/errors/summary":             "GetAppErrorsSummary",
+	"GET /v1/apps/{slug}/errors/{fingerprint}":       "ListAppErrorRequests",
+	"GET /v1/apps/{slug}/errors/{fingerprint}/first": "GetAppErrorSample",
+
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
 	// SDK named these methods deliberately after the user-facing action
@@ -454,6 +512,19 @@ var methodRouteMap = map[string]string{
 	"GET /v1/orgs/{slug}/keys/{id}":         "GetOrgAPIKey",
 	"DELETE /v1/orgs/{slug}/keys/{id}":      "RevokeOrgAPIKey",
 	"POST /v1/orgs/{slug}/keys/{id}/rotate": "RotateOrgAPIKey",
+
+	// Issue #879 / ADR-100 PR-C — tenant surfaces. The auto-derivation
+	// produces names with literal hyphens (the path carries the
+	// "tenant-surfaces" segment); the SDK verbs follow the operationId
+	// (ListTenantSurfaces, CreateTenantSurface, etc.) so the
+	// explicit map drops the path-separator noise and keeps the SDK
+	// surface cohesive with the CLI (`gregale tenant-surfaces ...`).
+	"GET /v1/apps/{slug}/tenant-surfaces":                              "ListTenantSurfaces",
+	"POST /v1/apps/{slug}/tenant-surfaces":                             "CreateTenantSurface",
+	"GET /v1/apps/{slug}/tenant-surfaces/{id}":                         "GetTenantSurface",
+	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}":                      "DeleteTenantSurface",
+	"POST /v1/apps/{slug}/tenant-surfaces/{id}/hostnames":              "AddTenantHostname",
+	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}": "RemoveTenantHostname",
 }
 
 func main() {

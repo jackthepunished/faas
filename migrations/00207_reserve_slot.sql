@@ -1,40 +1,33 @@
+-- filename: 00207_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
+-- Reserve slot 207 for PR #845 (edge_rules_kind_geo.sql, ADR-091
+-- D21/D22/D23). Same fence rationale as 00210; see
+-- cross-pr-slot-fence-pagination-gate for the pattern. This
+-- fence was what kept PR #845's local embed set contiguous while
+-- PR #845's real migration cycles through renumbers.
 --
--- 00207_reserve_slot.sql — slot reservation placeholder
--- (ADR-041 / cross-PR gate carve-out).
---
--- This file is a deliberate no-op kept only to satisfy the
--- migrations/embed_test.go::TestMigrationsContiguous requirement
--- that the embedded migration set is exactly {1, 2, …, N} with
--- no gaps. It carries no schema change and does not appear in any
--- apply path beyond goose writing a row to goose_db_version. The
--- replay-safety gate in ci.yml drops files whose basename matches
--- the reservation regex from its "added migration versions"
--- computation (see scripts/ci/check_migration_slots.sh ::
--- reserved_from_paths), so this file is carved out of the
--- cross-PR overlap check.
---
--- Context: PR #829 (paddle-overage dedupe pushed_mb_seconds) holds
--- slot 00209 (real migration). Slots 00207 + 00208 are claimed by
--- open PRs #826 (compute_node_heartbeats_stats at 00207) and #835
--- + #836 + #838 (three real migrations at 00208). The branch tip
--- carries this 00207 fence so TestMigrationsContiguous stays green
--- while those PRs are still open. When PR #826 lands first, this
--- fence becomes a duplicate-version collision against the real
--- migration at 00207 and must be removed in a follow-up commit on
--- PR #829. If PR #829 lands first (it must not — PR #826 is senior
--- on 00207), the fence survives on main as a no-op until someone
--- cleans it up.
---
--- Body: `select 1;` — executes against the live DB at apply time
--- but produces no schema change.
---
-select 1;
-
--- +goose StatementEnd
-
--- +goose Down
--- +goose StatementBegin
--- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- PR #845's kind=geo finally settled at slot 00229 after 10
+-- renumbers across the PR's lifetime (00207 → 215 → 216 → 217
+-- → 218 → 220 → 221 → 222 → 223 → 226 → 229). The 00221 hop
+-- was caused by PR #854 (ADR-095 scale-to-zero T1 single-flight
+-- + phase telemetry) claiming 00221_instances_request_count.sql
+-- on main while PR #845 was rebasing — PR #845 had to step one
+-- slot further to 00222. The 00222 → 00223 hop was caused by
+-- PR #863 (ADR-096 customer-facing error grouping PR-A) landing
+-- 00222_app_errors.sql on main — PR #845 had to step one slot
+-- further to 00223. The 00223 → 00226 hop was caused by PR #866
+-- (ADR-091 D20-D25 cors_defaults) landing at 00224 with a
+-- coexistence fence at 00223 aimed at PR #845 — rather than
+-- step on PR #866's coordination, PR #845 renumbered to 00226.
+-- The 00226 → 00229 hop was caused by open-PR stampede:
+-- PR #864 (reqbudget PR1) also claimed 00226 with a real
+-- schema, PR #867 (maintenance PR-A) claimed 00227
+-- (kind=maintenance) + 00228 (apps.maintenance_mode), and
+-- PR #873 (cli-secret-scan) fenced 223-227 with reservation
+-- markers — PR #845 stepped to the next truly free slot 00229.
+-- This 00207 fence stays as a historical marker; it's no longer
+-- adjacent to PR #845's slot but it preserves the test fixture
+-- for any reference that relied on it before the renumber chain.
+SELECT 1;
 -- +goose StatementEnd

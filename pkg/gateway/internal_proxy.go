@@ -45,6 +45,9 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
 // InternalDialer is the seam the public daemon wires to reach a
@@ -94,6 +97,22 @@ type InternalReverseProxy struct {
 	Transport   http.RoundTripper
 	Logger      *slog.Logger
 	DialTimeout time.Duration
+	// Drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker shared with Handler + TraceHandler + the
+	// control mux. nil = drain disabled. Wired via WithInFlightTracker
+	// from cmd/gatewayd-public/main.go so the same tracker the
+	// handler waits on covers the forwarder too — without this,
+	// a request that's already handed off to the proxy but is
+	// still piping bytes upstream would be invisible to the drain.
+	Drain *drain.Tracker
+}
+
+// WithInFlightTracker installs the per-request drain tracker (see
+// Handler.WithInFlightTracker for the full contract). Returns the
+// proxy for fluent chaining.
+func (p *InternalReverseProxy) WithInFlightTracker(tracker *drain.Tracker) *InternalReverseProxy {
+	p.Drain = tracker
+	return p
 }
 
 // NewInternalReverseProxy returns a wired InternalReverseProxy. The
@@ -237,7 +256,20 @@ func newInternalProxyH2CTransport(dialer InternalDialer, dialTimeout time.Durati
 // finding #4) and any future change to the timeout semantics
 // (e.g. a min-deadline with the inbound ctx) only needs to update
 // this function. Returns the dialer's net.Conn (or error).
+//
+// ADR-093 / PR-C: when the inbound ctx carries a Budget, the dial
+// step takes a reqbudget.WithOverhead reservation
+// (DefaultOverheadGRPC, 5 ms) so the next downstream hop starts
+// with less declared budget than the inbound dial had. The
+// reservation is only the budget's bookkeeping — it doesn't add
+// wall-clock latency. When no Budget is attached, the dial ctx is
+// the inbound ctx unchanged (no overhead).
 func dialWithTimeout(ctx context.Context, dialer InternalDialer, dialTimeout time.Duration) (net.Conn, error) {
+	if b, ok := reqbudget.FromContext(ctx); ok {
+		var cancel context.CancelFunc
+		ctx, cancel, _ = b.WithOverhead(ctx, "grpc-dial", reqbudget.DefaultOverheadGRPC)
+		defer cancel()
+	}
 	if dialTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, dialTimeout)
@@ -253,6 +285,32 @@ func dialWithTimeout(ctx context.Context, dialer InternalDialer, dialTimeout tim
 // On dial failure: 502 Bad Gateway. On upstream error: propagated
 // unchanged.
 func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Drain tracker (issue #587 / PR-A): a request that's
+	// handed off to the proxy is "in flight" from the daemon's
+	// perspective until this ServeHTTP returns.
+	//
+	// Correct shape is `defer tracker.Begin("http")()`:
+	// Begin runs IMMEDIATELY at the defer statement
+	// (increments the WaitGroup); the Done closure is what
+	// gets deferred.
+	//
+	// The WRONG shape `defer func(){ tracker.Begin(...)() }()`
+	// evaluates the entire closure body at function return —
+	// Begin and Done both fire then, so the tracker never sees
+	// a slot held during the proxy's RoundTrip. Under load,
+	// the gateway's drain then `OutcomeClean`s immediately and
+	// force-cuts in-flight requests — the exact regression
+	// PR-A's WaitGroup was meant to fix.
+	//
+	// Begin is NOT nil-safe (it's a method on *Tracker); guard
+	// explicitly when the drain is absent so the e2e harness
+	// and unit tests still compile.
+	done := func() {}
+	if p.Drain != nil {
+		done = p.Drain.Begin("http")
+	}
+	defer done()
+
 	if p.Dialer == nil || p.Target == nil {
 		// Wiring bug — log at ERROR because the customer sees the
 		// failure on the public listener.
@@ -265,7 +323,14 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	outReq := r.Clone(r.Context())
 	outReq.URL.Scheme = p.Target.Scheme
 	outReq.URL.Host = p.Target.Host
-	outReq.Host = p.Target.Host
+	// Keep the inbound Host as the routing key. gatewayd-internal
+	// resolves the app from r.Host (handler.go ServeHTTP → backend
+	// Lookup), so rewriting it to the internal target name makes
+	// every request 404 with "no app is routed to
+	// \"gatewayd-internal\"". The URL.Host above is what the
+	// transport dials (the unix-socket dialer ignores it anyway);
+	// the Host header must stay the customer-facing hostname.
+	outReq.Host = r.Host
 	outReq.RequestURI = "" // required for outgoing client requests
 	// Strip hop-by-hop in place (no second map alloc). The strip
 	// is correct for plain HTTP (RFC 7230 §6.1) — but it would

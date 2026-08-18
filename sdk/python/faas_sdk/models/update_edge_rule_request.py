@@ -9,13 +9,19 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
     from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+    from ..models.edge_rule_geo_action import EdgeRuleGeoAction
     from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
     from ..models.edge_rule_ip_action import EdgeRuleIPAction
     from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+    from ..models.edge_rule_limit_action import EdgeRuleLimitAction
+    from ..models.edge_rule_maintenance_action import EdgeRuleMaintenanceAction
     from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
     from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
     from ..models.edge_rule_route_action import EdgeRuleRouteAction
+    from ..models.edge_rule_throttle_action import EdgeRuleThrottleAction
+    from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
 
 T = TypeVar("T", bound="UpdateEdgeRuleRequest")
@@ -31,13 +37,19 @@ class UpdateEdgeRuleRequest:
     priority: int | Unset = UNSET
     enabled: bool | Unset = UNSET
     action: (
-        EdgeRuleCORSAction
+        EdgeRuleBudgetAction
+        | EdgeRuleCORSAction
+        | EdgeRuleGeoAction
         | EdgeRuleHeadersAction
         | EdgeRuleIPAction
         | EdgeRuleJWTAction
+        | EdgeRuleLimitAction
+        | EdgeRuleMaintenanceAction
         | EdgeRuleRedirectAction
         | EdgeRuleRewriteAction
         | EdgeRuleRouteAction
+        | EdgeRuleThrottleAction
+        | EdgeRuleValidateAction
         | Unset
     ) = UNSET
     """Replaces the jsonb column whole."""
@@ -45,11 +57,17 @@ class UpdateEdgeRuleRequest:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+        from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
+        from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+        from ..models.edge_rule_limit_action import EdgeRuleLimitAction
+        from ..models.edge_rule_maintenance_action import EdgeRuleMaintenanceAction
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
+        from ..models.edge_rule_throttle_action import EdgeRuleThrottleAction
+        from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
         match_host = self.match_host
 
@@ -78,6 +96,18 @@ class UpdateEdgeRuleRequest:
             action = self.action.to_dict()
         elif isinstance(self.action, EdgeRuleJWTAction):
             action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleIPAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleValidateAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleLimitAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleMaintenanceAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleGeoAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleThrottleAction):
+            action = self.action.to_dict()
         else:
             action = self.action.to_dict()
 
@@ -101,13 +131,19 @@ class UpdateEdgeRuleRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.edge_rule_budget_action import EdgeRuleBudgetAction
         from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+        from ..models.edge_rule_geo_action import EdgeRuleGeoAction
         from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
         from ..models.edge_rule_ip_action import EdgeRuleIPAction
         from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+        from ..models.edge_rule_limit_action import EdgeRuleLimitAction
+        from ..models.edge_rule_maintenance_action import EdgeRuleMaintenanceAction
         from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
         from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
         from ..models.edge_rule_route_action import EdgeRuleRouteAction
+        from ..models.edge_rule_throttle_action import EdgeRuleThrottleAction
+        from ..models.edge_rule_validate_action import EdgeRuleValidateAction
 
         d = dict(src_dict)
         match_host = d.pop("match_host", UNSET)
@@ -123,13 +159,19 @@ class UpdateEdgeRuleRequest:
         def _parse_action(
             data: object,
         ) -> (
-            EdgeRuleCORSAction
+            EdgeRuleBudgetAction
+            | EdgeRuleCORSAction
+            | EdgeRuleGeoAction
             | EdgeRuleHeadersAction
             | EdgeRuleIPAction
             | EdgeRuleJWTAction
+            | EdgeRuleLimitAction
+            | EdgeRuleMaintenanceAction
             | EdgeRuleRedirectAction
             | EdgeRuleRewriteAction
             | EdgeRuleRouteAction
+            | EdgeRuleThrottleAction
+            | EdgeRuleValidateAction
             | Unset
         ):
             if isinstance(data, Unset):
@@ -182,11 +224,59 @@ class UpdateEdgeRuleRequest:
                 return action_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_6 = EdgeRuleIPAction.from_dict(data)
+
+                return action_type_6
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_7 = EdgeRuleValidateAction.from_dict(data)
+
+                return action_type_7
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_8 = EdgeRuleLimitAction.from_dict(data)
+
+                return action_type_8
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_9 = EdgeRuleMaintenanceAction.from_dict(data)
+
+                return action_type_9
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_10 = EdgeRuleGeoAction.from_dict(data)
+
+                return action_type_10
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_11 = EdgeRuleThrottleAction.from_dict(data)
+
+                return action_type_11
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            action_type_6 = EdgeRuleIPAction.from_dict(data)
+            action_type_12 = EdgeRuleBudgetAction.from_dict(data)
 
-            return action_type_6
+            return action_type_12
 
         action = _parse_action(d.pop("action", UNSET))
 

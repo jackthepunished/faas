@@ -248,6 +248,57 @@ where data->>'wake_id' = $1
 order by at asc
 limit $3;
 
+-- name: ListAllEventsPaged :many
+-- ADR-091 §3.7 / PR #3 — operator-obs backend audit-reading surface.
+-- Reads the live events table (NOT audit_log — distinct source of
+-- truth per ADR-091 §3.7.4). Optional filters:
+--   * $1 actor    — exact match (handler passes "" to skip)
+--   * $2 kind_prefix — LIKE 'prefix%' (handler passes "" to skip)
+--   * $3 subject  — exact match (handler passes "" to skip)
+--   * $4 since    — RFC 3339 timestamptz (handler passes zero time to skip)
+--   * $5 limit    — top-N rows (handler default 200, cap 500;
+--                   cast to int8 so sqlc emits int64 Params and the
+--                   handler's int→int64 widening is safe)
+-- Order: at DESC, id DESC — the id tiebreaker keeps the planner on
+-- the (kind, at DESC) index added by 00190_admin_obs_index.sql for
+-- kind-prefix queries and avoids an unstable sort on the
+-- over-read window.
+-- Subject is uuid (nullable in the schema); the cast is left to
+-- the handler so the handler can pass an empty string for "no
+-- subject filter" without a NULL literal.
+select id, at, actor, kind, subject, data
+from events
+where ($1 = '' or actor = $1)
+  and ($2 = '' or kind like $2 || '%')
+  and ($3 = '' or subject = $3::uuid)
+  and ($4 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $4)
+order by at desc, id desc
+limit $5::int8;
+
+-- name: ListRecentEventsForAccount :many
+-- ADR-091 §3.7 / PR #3 — per-account events drill-down. Backed by
+-- the partial index events_actor_account_idx on
+-- (actor_account_id) WHERE actor_account_id IS NOT NULL
+-- (migrations/00099_orgs_memberships_invitations.sql). Filters:
+--   * $1 actor_account_id — uuid (the account the actor belonged to)
+--   * $2 since             — RFC 3339 timestamptz (handler passes
+--                            zero time to skip; the predicate is
+--                            uniform with ListAllEventsPaged)
+--   * $3 limit             — top-N rows (handler default 200, cap 500;
+--                            cast to int8 so sqlc emits int64 Params
+--                            and the handler's int→int64 widening is
+--                            safe)
+-- Order: at DESC, id DESC — same rationale as ListAllEventsPaged.
+-- PR #3 wires the per-account filter on the SSE mirror's
+-- per-account projections; the broader ?actor + ?subject filter
+-- shape lives on ListAllEventsPaged.
+select id, at, actor, kind, subject, data
+from events
+where actor_account_id = $1
+  and ($2 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $2)
+order by at desc, id desc
+limit $3::int8;
+
 -- name: AppendUsage :exec
 -- Idempotent on (instance_id, minute) for mb_seconds / requests
 -- (M7 hardening, PR feat/m7-beta-hardening): a redelivered
@@ -712,3 +763,430 @@ group by coalesce(subject, '00000000-0000-0000-0000-000000000000'::uuid)
 order by hits desc, last_event_at desc
 limit $2::int8;
 
+
+-- name: TrafficAnomalyAggregateByNode :many
+-- PR #4 (ADR-092 §3.4 amendment) — per-node variant of
+-- TrafficAnomalyAggregate. Joins usage_minutes to instances to
+-- recover the hosting node_id, then groups by
+-- (account_id, app_id, node_id, EXTRACT(HOUR FROM minute)) for
+-- the baseline. The current_pool also groups by node_id so the
+-- "today" anomaly is per-node, not per-app-wide.
+--
+-- Why a separate query and not a sqlc parameter on the existing
+-- one: the baseline math is identical, but the GROUP BY keys
+-- differ by one column, and trying to thread that through a
+-- nullable WHERE filter would either lose the per-node grain
+-- (NULL filter collapses the group) or return the wrong rollup
+-- (a per-node "current" against an app-wide baseline reports
+-- spurious anomalies when the fleet is unevenly loaded). A
+-- separate query keeps each path simple and self-contained.
+--
+-- Index path: same as TrafficAnomalyAggregate — usage_minutes
+-- primary key (instance_id, minute) is fine for the 24h current
+-- window in single-box posture. The instances.node_id lookup
+-- is by PK; the join is O(matches) on the PK.
+with baseline as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           extract(hour from um.minute) as hour_of_day,
+           avg(um.mb_seconds)::float8 as mean_mb_seconds,
+           coalesce(stddev_pop(um.mb_seconds), 0)::float8 as stddev_mb_seconds,
+           count(*)::int as sample_count
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $2
+      and um.minute <  $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, extract(hour from um.minute)
+),
+current_pool as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           um.minute,
+           sum(um.mb_seconds)::float8 as current_mb_seconds
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, um.minute
+),
+scored as (
+    select c.account_id,
+           c.app_id,
+           c.node_id,
+           c.minute,
+           c.current_mb_seconds,
+           b.mean_mb_seconds,
+           b.stddev_mb_seconds,
+           b.sample_count,
+           case
+               when b.sample_count < 3 then null
+               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+               when b.stddev_mb_seconds >= 1.0
+                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+               else null
+           end as z_score,
+           case
+               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+               else 'hour_of_day'
+           end as reason
+    from current_pool c
+    join baseline b
+      on c.account_id = b.account_id
+     and c.app_id    = b.app_id
+     and c.node_id   = b.node_id
+     and extract(hour from c.minute) = b.hour_of_day
+)
+select account_id,
+       app_id,
+       node_id,
+       minute,
+       current_mb_seconds,
+       mean_mb_seconds,
+       stddev_mb_seconds,
+       sample_count,
+       z_score,
+       reason
+from scored
+where z_score is not null
+order by z_score desc
+limit $3::int8;
+
+-- ---------------------------------------------------------------------------
+-- PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
+--
+-- The two queries below are exposed by pkg/state/pgstore.go as
+-- (s *PgStore).UpsertGithubWebhookSecret and
+-- (s *PgStore).GetGithubWebhookSecret. The body is hand-curated
+-- rather than sqlc-generated because the github_installations pair
+-- is also hand-curated (same precedent). The schema lives in
+-- migrations/00212_github_webhook_secrets.sql (renumbered from
+-- 00208 → 00209 → 00212 in the slot-collision cluster; see the
+-- migration's header for the cross-pr-slot-fence chain).
+-- ---------------------------------------------------------------------------
+
+-- name: UpsertGithubWebhookSecret :execrows
+-- Installs or rotates the per-tenant webhook secret for an
+-- installation_id. ON CONFLICT (installation_id) DO UPDATE so a
+-- rotation is one statement. upgradedAt + upgradedBy form a §11
+-- audit trail.
+INSERT INTO github_webhook_secrets (installation_id, secret_value, upgraded_by)
+VALUES ($1, $2, $3)
+ON CONFLICT (installation_id) DO UPDATE
+SET secret_value = EXCLUDED.secret_value,
+    upgraded_at  = now(),
+    upgraded_by  = EXCLUDED.upgraded_by;
+
+-- name: GetGithubWebhookSecret :one
+-- Returns the bytea secret for the given installation_id. The
+-- daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
+-- webhook is rejected rather than falling back to the platform-
+-- wide FAAS_GITHUB_WEBHOOK_SECRET).
+SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1;
+
+-- ---------------------------------------------------------------------------
+-- ADR-096 customer-facing automatic error grouping.
+-- Tables live in migrations/00222_app_errors.sql. gatewayd-internal
+-- writes via the apid gRPC IncrementAppError handler (pkg/apidgrpc/
+-- apperrors.proto); apid is the only direct writer to the table
+-- per the owner rules. The apid handlers in
+-- cmd/apid/handlers_app_errors.go (PR-B) and the nightly purge
+-- cron in cmd/apid/app_errors_purge.go (PR-A) read here.
+--
+-- Index paths pinned in the migration file (NOT regenerated here
+-- — sqlc doesn't manage indexes, only the typed query surface).
+-- ---------------------------------------------------------------------------
+
+-- name: IncrementAppError :one
+-- ADR-096 §3.5 dedupe-merge INSERT. The grpc_server_apperrors.go
+-- handler runs this inside a single pgx transaction per stream
+-- batch. ON CONFLICT target is app_errors_dedupe_uniq (the
+-- migration's UNIQUE on (account_id, app_id, fingerprint)).
+-- The dedupe window is enforced by the writer's LRU; this
+-- unique constraint is the last-resort tripwire.
+--
+-- Returns (inserted bool) via the canonical Postgres
+-- (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+-- on an UPDATE. This lets the handler distinguish
+-- outcomeInserted vs outcomeMerged on the wire — the gateway
+-- uses that signal to update its in-process LRU freshness.
+INSERT INTO app_errors (
+    id, account_id, app_id, deployment_id, fingerprint,
+    route, http_status, error_class, sample_message,
+    count, request_count, first_seen_at, last_seen_at
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8, $9,
+    1, 1, $10, $10
+)
+ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE SET
+    count         = app_errors.count + 1,
+    request_count = app_errors.request_count + 1,
+    last_seen_at  = greatest(app_errors.last_seen_at, $10)
+RETURNING (xmax = 0) AS inserted;
+
+-- name: InsertAppErrorRequest :exec
+-- One row per request that hit the grouped fingerprint. No
+-- ON CONFLICT — every request gets its own row. request_count
+-- on app_errors is bumped on the paired IncrementAppError
+-- call; the read path derives the joined total at query time.
+INSERT INTO app_error_requests (
+    id, account_id, app_id, fingerprint, request_id, received_at,
+    route, http_status, error_class, sample_message,
+    deployment_id, headers_sample, redactions
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9, $10,
+    $11, $12, $13
+);
+
+-- name: ListAppErrorGroups :many
+-- ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
+-- one (account_id, app_id) over a (since, until) window.
+-- Cursor pagination via the (count, last_seen_at, fingerprint)
+-- compound tuple (distinct from the operator's (created_at, id)
+-- cursor). All three columns are part of the ORDER BY so the
+-- cursor predicate must include all three — dropping `count`
+-- breaks pagination: rows with smaller count but newer
+-- last_seen_at are silently dropped across pages (the cursor
+-- predicate on (last_seen_at, fingerprint) only considers the
+-- inner order, missing the leading count-DESC boundary).
+-- Index path: app_errors_account_app_last_seen_idx covers the
+-- primary scan; the (count DESC) sort happens post-filter on the
+-- bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+--
+-- sqlc.arg(name) annotations disambiguate the cursor predicate
+-- types — without them sqlc infers the timestamps as timestamptz
+-- from the leading (count, last_seen_at) references and breaks
+-- pagination.
+SELECT
+    id, fingerprint, error_class, route, http_status,
+    count, request_count, first_seen_at, last_seen_at,
+    sample_message
+FROM app_errors
+WHERE account_id = sqlc.arg('account_id')
+  AND app_id     = sqlc.arg('app_id')
+  AND last_seen_at >= sqlc.arg('since')
+  AND last_seen_at <= sqlc.arg('until')
+  AND (sqlc.arg('cursor_count')::bigint IS NULL
+       OR count < sqlc.arg('cursor_count')
+       OR (count = sqlc.arg('cursor_count')
+           AND (last_seen_at, fingerprint) < (sqlc.arg('cursor_last_seen'), sqlc.arg('cursor_fingerprint')::text)))
+ORDER BY count DESC, last_seen_at DESC, fingerprint ASC
+LIMIT sqlc.arg('limit');
+
+-- name: ListAppErrorRequests :many
+-- Drill-down rows for one fingerprint. Cursor paginated via
+-- (received_at, request_id). Index path:
+-- app_error_requests_drill_idx. Does NOT include headers_sample
+-- or redactions — those are returned only by GetAppErrorSample.
+--
+-- sqlc.arg(name) annotations disambiguate the cursor predicate
+-- types — without them sqlc infers $5 as timestamptz from the
+-- leading (received_at) reference, breaking pagination.
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id
+FROM app_error_requests
+WHERE account_id  = sqlc.arg('account_id')
+  AND app_id      = sqlc.arg('app_id')
+  AND fingerprint = sqlc.arg('fingerprint')
+  AND (sqlc.arg('cursor_received_at')::timestamptz IS NULL
+       OR (received_at, request_id) < (sqlc.arg('cursor_received_at'), sqlc.arg('cursor_request_id')::uuid))
+ORDER BY received_at DESC, request_id DESC
+LIMIT sqlc.arg('limit');
+
+-- name: GetAppErrorSample :one
+-- Single oldest request row for one fingerprint, used by the
+-- UI's "what does this look like" preview. Returns
+-- headers_sample + redactions for the wire-side "we redacted
+-- X / Y / Z" badge.
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id,
+    headers_sample, redactions
+FROM app_error_requests
+WHERE account_id  = $1
+  AND app_id      = $2
+  AND fingerprint = $3
+ORDER BY received_at ASC, request_id ASC
+LIMIT 1;
+
+-- name: ListAppErrorFingerprintsForPurge :many
+-- Nightly retention purge read path (cmd/apid/app_errors_purge.go).
+-- Returns IDs of app_errors rows for an account older than
+-- `cutoff`. Capped at 10000 per call so the DELETE loop can
+-- iterate without blocking. Sorted by last_seen_at ASC so the
+-- oldest rows are deleted first (a future eviction policy
+-- could swap to "least recent activity" without touching this
+-- query).
+SELECT id FROM app_errors
+WHERE account_id = $1
+  AND last_seen_at < $2
+ORDER BY last_seen_at ASC
+LIMIT $3;
+
+-- name: DeleteAppErrorsByIDs :exec
+DELETE FROM app_errors WHERE id = ANY($1::uuid[]);
+
+-- name: DeleteAppErrorRequestsByIDs :exec
+DELETE FROM app_error_requests WHERE id = ANY($1::uuid[]);
+
+-- name: DeleteAppErrorRequestsOlderThan :exec
+-- The retention purge also runs on app_error_requests
+-- independently — a customer's drill-down can age out without
+-- the parent fingerprint row being removed (e.g. Hobby with
+-- 100 rows/fingerprint cap evicts oldest request rows first).
+DELETE FROM app_error_requests
+WHERE account_id = $1
+  AND received_at < $2;
+
+-- ---------------------------------------------------------------------------
+-- ADR-098 connection-aware execution (§9.A). Tables live in
+-- migrations/00226_data_upstreams.sql. apid is the only writer to
+-- data_upstreams (env-classifier side, PR-B); meterd is the only writer
+-- to data_upstream_probes (probe loop, PR-C). schedd reads
+-- data_upstream_probes via ListDataUpstreamProbesByHostRegion on wake
+-- (PR-B wires pkg/sched/upstream_affinity.go). The Store interface is
+-- extended in pkg/state/store.go; pgstore + memstore stubs added in
+-- PR-A so the surface compiles — production reads/writes land in PR-B.
+--
+-- Index paths pinned in the migration file (NOT regenerated here —
+-- sqlc doesn't manage indexes, only the typed query surface):
+--   - data_upstreams_app_created_idx
+--   - data_upstreams_host_redacted_idx
+--   - data_upstreams_dedupe_uniq (UNIQUE)
+--   - partitioned data_upstream_probes + default partition
+-- ---------------------------------------------------------------------------
+
+-- name: InsertDataUpstream :one
+-- Dedupe-merge INSERT for data_upstreams. Mirrors the
+-- IncrementAppError ON CONFLICT pattern (queries.sql:906).
+-- The handler (PR-B's cmd/apid/extract.go) targets
+-- data_upstreams_dedupe_uniq on (app_id, scope, kind,
+-- host, port). On conflict: bump last_seen_at; refresh
+-- last_rtt_ms / last_probed_at / declared_region from
+-- EXCLUDED so the freshest classifier observation wins.
+-- id is caller-supplied (uuidv7) so the row identity is
+-- stable across the dedupe-merge.
+INSERT INTO data_upstreams (
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, declared_region,
+    last_rtt_ms, last_probed_at,
+    last_seen_at, created_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8,
+    $9, $10,
+    $11, $12,
+    now(), now()
+)
+ON CONFLICT (app_id, scope, kind, host, port) DO UPDATE SET
+    source          = EXCLUDED.source,
+    declared_region = EXCLUDED.declared_region,
+    last_rtt_ms     = EXCLUDED.last_rtt_ms,
+    last_probed_at  = EXCLUDED.last_probed_at,
+    last_seen_at    = now()
+RETURNING id;
+
+-- name: ListDataUpstreamsByApp :many
+-- GET /v1/apps/{slug}/upstreams (PR-B). Cursor pagination
+-- via (created_at, id) — distinct from app_errors'
+-- (last_seen_at, fingerprint) cursor because
+-- data_upstreams is a stable list, not a hot recency
+-- list. Index path: data_upstreams_app_created_idx.
+--
+-- sqlc.arg(...)::type casts disambiguate the two cursor
+-- params — without them sqlc named both fields
+-- `CreatedAt` (taken from the SELECT list) and the
+-- generated Go wrapper bound a timestamptz to the $3
+-- uuid slot, tripping a type error on every cursor page
+-- past the first. See the cross-PR slot-fence
+-- sqlc.arg-disambiguates-cursor memory; the same
+-- pattern pins ListAppErrorGroups.
+SELECT
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, coalesce(declared_region, ''),
+    last_rtt_ms, last_probed_at, last_seen_at, created_at
+FROM data_upstreams
+WHERE app_id = sqlc.arg('app_id')::uuid
+  AND (sqlc.arg('cursor_created_at')::timestamptz IS NULL
+       OR (created_at, id) < (sqlc.arg('cursor_created_at')::timestamptz,
+                              sqlc.arg('cursor_id')::uuid))
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg('page_limit')::int;
+
+-- name: GetDataUpstreamByID :one
+-- Single-row read for the dashboard's "edit upstream"
+-- pane (PR-B). Cursor-safe: no pagination; the handler
+-- reads the row directly.
+SELECT
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, coalesce(declared_region, ''),
+    last_rtt_ms, last_probed_at, last_seen_at, created_at
+FROM data_upstreams
+WHERE id = $1;
+
+-- name: DeleteDataUpstreamByID :exec
+-- DELETE /v1/apps/{slug}/upstreams/{id} (PR-B). Soft-
+-- delete is rejected by ADR-098 (a soft-deleted row
+-- would still trigger pg_notify and confuse schedd);
+-- the handler is the only path and uses a hard
+-- DELETE. The CASCADE on account_id / app_id handles
+-- the GDPR path (delete-account cascades through
+-- apps → data_upstreams).
+DELETE FROM data_upstreams WHERE id = $1;
+
+-- name: InsertDataUpstreamProbe :exec
+-- meterd's probe loop writer (PR-C). One row per
+-- (host_redacted_hash, region) per 30s sample. The
+-- PK is (id, sampled_at) — id is a caller-supplied
+-- uuidv7 so dedupe on retry is trivial. Partitioning
+-- on sampled_at gives the meterd loop a hot-write
+-- path; the partition creator (PR-C) drops old
+-- partitions wholesale.
+INSERT INTO data_upstream_probes (
+    id, host_redacted_hash, region, kind, sampled_at, rtt_ms,
+    ok, error_class, probe_node
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9
+);
+
+-- name: ListDataUpstreamProbesByHostRegion :many
+-- schedd's wake-side read path (PR-B/C). Returns the
+-- N most recent probe samples for one (host, region)
+-- pair, time-windowed to the meterd sliding window
+-- (default: 30s × 5min). Index path: the
+-- partitioned table's PARTITION BY RANGE on
+-- sampled_at — partition pruning drops everything
+-- outside the window. The (kind) projection lets
+-- schedd key its upstream-affinity map on
+-- (kind, region) without joining data_upstreams.
+SELECT
+    id, host_redacted_hash, region, kind, sampled_at, rtt_ms,
+    ok, error_class, coalesce(probe_node, '')
+FROM data_upstream_probes
+WHERE host_redacted_hash = $1
+  AND region = $2
+  AND sampled_at >= $3
+ORDER BY sampled_at DESC
+LIMIT $4;
+
+-- name: PruneDataUpstreamProbesOlderThan :exec
+-- Retention purge. The meterd cron calls this
+-- hourly with `cutoff = now() - interval '30 days'`
+-- (matches the §12 prom_retention_days:15 floor +
+-- a 2× safety margin). The partition pruning on
+-- sampled_at makes this O(affected partitions),
+-- not O(table size). The PR-C partition creator
+-- DROPs whole partitions for ranges entirely older
+-- than cutoff; this query handles the partial-
+-- partition tail (rows in the default partition or
+-- the current month that are older than cutoff).
+DELETE FROM data_upstream_probes WHERE sampled_at < $1;

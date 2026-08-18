@@ -1,0 +1,213 @@
+# splitbox.example.yaml — reference split-box deployment manifest
+# (issue #911 / ADR-110).
+#
+# This file is the canonical example for a multi-box Fleet:
+# one control-plane host (fsn-1) and one compute-only host (fsn-2).
+# It is loaded by `gregalectl manifest validate` and by the `make
+# lint-manifest` CI gate. The same shape (minus the Fleet block)
+# works for a single-box install — replace the Fleet with a single
+# `single-box` host.
+#
+# Conventions:
+#   - Every required field is documented inline. Removing a value
+#     causes `gregalectl manifest validate` to fail with the
+#     `path: is required` message.
+#   - Every digest is sha256 (64 hex) except git_sha (40 hex).
+#     The validator rejects the wrong length.
+#   - The `cgroups.controllers` MUST include `memory` (issue #911
+#     calls out the cgroup memory controller as load-bearing for
+#     tenant admission).
+#   - Every host's `address` is `host:port` or `unix://path`.
+#   - The TLS material `mode` is an octal string ("0400", "0440",
+#     "0600"). Plain decimal or text is rejected.
+#
+# Editing tips:
+#   - Run `gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml`
+#     locally after every edit.
+#   - The TOML table-placement catalog (pkg/manifest/toml_check.go)
+#     is the source of truth for which table a daemon key belongs
+#     to. The renderer (PR-2) consumes the same catalog.
+#
+# ------------------------------------------------------------------------------
+# ILLUSTRATIVE ONLY — the addresses below are PLACEHOLDERS, not real operator
+# values. Replace with the actual CIDRs of your overlay before deploying:
+#
+#   fleet.hosts[].address (currently 10.42.0.1:7100, 10.42.0.2:50051):
+#     Replace each `host:port` with the routable dial address other daemons
+#     use to reach that host. This is NOT necessarily the public IP — it
+#     should be the overlay/mesh-routable address (Tailscale 100.64/10 exit
+#     node, WireGuard AllowedIPs, or the operator's VPC peer IP).
+#
+#   overlay.cidr (currently 10.42.0.0/24):
+#     The overlay subnet every host's address must fall inside. Pick a
+#     /16+ from your operator-owned range. RFC1918 (10/8, 172.16/12,
+#     192.168/16) and CGNAT (100.64/10) are valid for the overlay
+#     itself, but the runtime overlay-accept rules in
+#     pkg/netns/policy.go::HostPolicy.Render require the overlay CIDR
+#     to sit OUTSIDE the §11 deny list (RFC1918 / link-local / CGNAT
+#     are ALL denied — see OverlayCIDRs doc). Pick a public-range
+#     overlay for the mesh.
+#
+# See pkg/manifest/manifest.go for the overlay provider enum
+# (`provider: wireguard | tailscale | static`) and the per-host
+# overlay validation contract.
+# ------------------------------------------------------------------------------
+
+schema_version: "1.0.0"
+
+# Fleet — every host in the deployment. Names are unique. Roles
+# come from pkg/role.AllRoles (single-box | control-plane |
+# compute-only). A single-box install declares one host with
+# role: single-box; a split-box install declares at least one
+# control-plane and one compute-only host.
+fleet:
+  hosts:
+    - name: fsn-1
+      role: control-plane
+      address: 10.42.0.1:7100
+      tags: ["primary", "vpc-pub"]
+    - name: fsn-2
+      role: compute-only
+      address: 10.42.0.2:50051
+      tags: ["vpc-pub"]
+
+# Daemons — per-daemon configuration. The renderer (PR-2) writes
+# one TOML per host for the daemons that host runs. The `tls`
+# block is the on-disk material the daemon's listener uses; the
+# `outbound` block is the dial target the daemon uses to talk to
+# remote daemons.
+daemons:
+  schedd:
+    bind: tcp://0.0.0.0:7100
+    tls:
+      cert_path: /etc/faas/tls/schedd/server.crt
+      key_path: /etc/faas/tls/schedd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+  vmmd:
+    bind: tcp://0.0.0.0:50051
+    tls:
+      cert_path: /etc/faas/tls/vmmd/server.crt
+      key_path: /etc/faas/tls/vmmd/server.key
+      ca_path: /etc/faas/tls/ca/ca.crt
+      mode: "0400"
+    # PR scale-out tier-1 residual (PR #937 / Gaps #3 + #5):
+    # per-host compute_node overrides. The slot allocator
+    # (pkg/fcvm.SetHostIPBase) carves per-VM /30 leases from
+    # host_bridge_cidr's .2+ range. The overlay_cidr is what
+    # the vmmd overlay detector prefers when multiple NICs come
+    # back from `tailscale ip -4`. overlay_interface pins the
+    # detector to a specific NIC (e.g. tailscale0) on multi-NIC
+    # hosts. All three default to api.DefaultHostBridgeCIDR /
+    # api.DefaultOverlayCIDR / "auto-detect" when unset. Single-box
+    # dev leaves them commented out.
+    # compute_node:
+    #   host_bridge_cidr: 10.100.0.0/16   # per-host bridge /16 (.1 reserved)
+    #   overlay_cidr: 100.64.0.0/10       # overlay subnet the detector prefers
+    #   overlay_interface: tailscale0     # optional NIC pin (Gap #5)
+  apid:
+    bind: unix:///run/faas/apid.sock
+  meterd:
+    bind: unix:///run/faas/meterd.sock
+  gatewayd_public:
+    bind: tcp://0.0.0.0:443
+  gatewayd_internal:
+    bind: unix:///run/faas/gatewayd-internal.sock
+
+# Overlay — per-host overlay network identity. The renderer writes
+# /etc/hosts entries so the canonical DNS names (schedd.faas,
+# vmmd.faas) resolve to the control-plane VPC address. The CIDR
+# is the overlay subnet; each host's address must fall within it.
+overlay:
+  provider: wireguard
+  cidr: 10.42.0.0/24
+
+# Egress — top-level RFC1918 lateral-movement escape hatch
+# (PR scale-out tier-1 residual Gap #4). The flag's name is
+# load-bearing safety: anyone skimming this manifest sees the
+# consequence spelled out before they flip it. Pair this with at
+# least one entry in overlay_exceptions — the DB CHECK constraint
+# (migration 00276_egress_policy_exceptions.sql) enforces the
+# pair at the row level. Empty overlay_exceptions + the flag set
+# is rejected at apply time.
+#
+# Default: false. Set to true ONLY when your overlay CIDR lives
+# inside an RFC1918 range (the example's 10.42.0.0/24 sits in
+# 10/8, which is in the §11 deny catalog). Single-box dev keeps
+# the legacy "deny wins on RFC1918" posture byte-identical by
+# leaving this unset.
+egress:
+  danger_accept_rfc1918_lateral_movement: false
+  overlay_exceptions: []
+
+# DNS — public-facing hostname contract. apps_domain is the single
+# source of truth consumed by gatewayd-internal, apid, and the
+# CLI's PrintOK paths (PR-4 replaces the hard-coded
+# `apps.gregale.dev` literals in cmd/gregale/commands2.go and
+# cmd/gatewayd-internal/backend.go).
+dns:
+  apps_domain: apps.gregale.dev
+  mode: cloudflare
+
+# PostgreSQL — database cluster configuration. The renderer writes
+# the per-daemon db_url and the faas_map pg ident map. The
+# migration policy is on-boot for multi-box; on-boot-offline is
+# the single-box dev default.
+postgresql:
+  dsn: postgres://faas@127.0.0.1:5432/faas
+  database: faas
+  migration_max_slot: 265
+  policy: on-boot
+
+# Release — the immutable release-tuple anchor. PR-0 validates
+# the shape; PR-3 ships the bundle/install path that materialises
+# the tuple at /opt/faas/releases/<id>/. The doctor (PR-4)
+# asserts the running binary's SHA matches git_sha and the
+# per-host digests match the values below.
+#
+# The values below are placeholders — replace with the digests
+# you actually ship. The validator accepts any 64-char sha256 (or
+# 40-char sha1 for git_sha).
+release:
+  id: v1.4.0-12-gabc1234
+  git_sha: abc1234567890abcdef1234567890abcdef12345
+  architecture: x86_64
+  firecracker_version: 1.10.0
+  firecracker_digest: 0000000000000000000000000000000000000000000000000000000000000000
+  kernel_digest: 1111111111111111111111111111111111111111111111111111111111111111
+  builder_base_digest: 2222222222222222222222222222222222222222222222222222222222222222
+  runtime_base_digest: 3333333333333333333333333333333333333333333333333333333333333333
+
+# Storage — per-host filesystem layout. The renderer creates
+# these directories with the documented ownership/modes. The run
+# dir is the unix-socket directory; the renderer also creates
+# /run/faas/stream with mode 0770 root:faas (closes the vmmd
+# stream-bridge bind race that bit the GCP deploy).
+storage:
+  fast_root: /srv/fc
+  spool_root: /var/spool/faas
+  log_root: /var/log/faas
+  run_dir: /run/faas
+
+# Cgroups — cgroup v2 controller requirements. The renderer
+# writes +memory +cpu +io +pids to the per-host subtree_control
+# (the only place the production path lands this today — the
+# Lima metal shim at deploy/lima/run-metal.sh:84 + the renderer;
+# the v1 bootstrap.sh and ansible both skip it — RETIRED
+# 2026-08-15 by issue #911 / PR-1).
+cgroups:
+  slice: faas-cp.slice
+  controllers: "memory,cpu,io,pids"
+
+# PKI — certificate authority wiring. The renderer issues per-
+# daemon leaves via pkg/pki.RolesForBox(); the manifest declares
+# the CA cert fingerprint the doctor enforces on every box.
+pki:
+  root_dir: /etc/faas/tls
+  ca_fingerprint: 4444444444444444444444444444444444444444444444444444444444444444
+  allowed_sans:
+    - schedd.faas
+    - vmmd.faas
+    - apid.faas
+    - gatewayd-public.faas
+    - gatewayd-internal-public.faas

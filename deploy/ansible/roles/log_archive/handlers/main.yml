@@ -12,7 +12,7 @@
 # main.yml:13-22. The `failed_when: false` is a defensive
 # fallback for chroot/CI environments without systemd; the
 # main.yml daemon-reload task already runs the real reload
-# and surfaces a failure on a real EX44.
+# and surfaces a failure on a real production box.
 
 - name: detect systemd availability
   ansible.builtin.stat:

@@ -47,6 +47,20 @@ type Config struct {
 	// RoleComputeOnly. RoleSingleBox is the default and lets
 	// single-box dev boot unmoved.
 	Role role.Role `toml:"role"`
+
+	// NodeName is the multi-box identity for the githubd process
+	// (issue #678 / ADR-093 PR-0). When non-empty, githubd is in
+	// multi-box mode: PR-B constructs PGNodeVerifier and threads
+	// it through every Load*WithVerifier helper. When empty,
+	// the verifier stays nil and stdlib trust alone runs (the
+	// single-box dev back-compat path). Operator seeds the
+	// matching row in compute_nodes via the existing
+	// POST /v1/compute-nodes flow (no new apid handler — reuses
+	// UpsertComputeNodeFromOperator). Defaults to "".
+	//
+	// Also reused for the githubd → apid bridge dialer (PR-C1
+	// wires the bridge tlsCfg alongside the server-side verifier).
+	NodeName string `toml:"node_name"`
 }
 
 // ResolveListenTarget returns the gRPC target the server should bind.
@@ -97,5 +111,13 @@ func LoadConfig(path string) (*Config, error) {
 	// role gate at boot calls role.Require to refuse to start
 	// under the wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_GITHUBD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// NodeName so the systemd drop-in (deploy/ansible/roles/
+	// githubd_service/files/faas-githubd.service.d/
+	// 99-faas-node-name.conf) can override the TOML node_name on
+	// every box. Empty keeps the TOML value (single-box dev).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.NodeName = v
+	}
 	return c, nil
 }

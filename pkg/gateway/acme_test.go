@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -114,15 +115,15 @@ func TestACMEMux_RejectsMissingHost(t *testing.T) {
 // to certmagic's DecisionFunc (error) is the bridge between pkg/gateway and
 // certmagic. Verify it both denies (false → non-nil error) and allows (true → nil).
 func TestAllowlistToDecisionFunc(t *testing.T) {
-	deny := func(string) bool { return false }
+	deny := func(context.Context, string) (bool, error) { return false, nil }
 	df := allowlistToDecisionFunc(deny, nil, nil)
-	if err := df(nil, "attacker.example.com"); err == nil {
+	if err := df(context.Background(), "attacker.example.com"); err == nil {
 		t.Error("deny allowlist should produce non-nil error")
 	}
 
-	allow := func(string) bool { return true }
+	allow := func(context.Context, string) (bool, error) { return true, nil }
 	df = allowlistToDecisionFunc(allow, nil, nil)
-	if err := df(nil, "shop.example.com"); err != nil {
+	if err := df(context.Background(), "shop.example.com"); err != nil {
 		t.Errorf("allow allowlist should produce nil error, got %v", err)
 	}
 }
@@ -132,7 +133,7 @@ func TestAllowlistToDecisionFunc(t *testing.T) {
 // defense-in-depth for Validate()'s OnDemandHTTP01Allowlist == nil check.
 func TestAllowlistToDecisionFunc_NilAllowlist(t *testing.T) {
 	df := allowlistToDecisionFunc(nil, nil, nil)
-	if err := df(nil, "anything.example.com"); err == nil {
+	if err := df(context.Background(), "anything.example.com"); err == nil {
 		t.Error("nil allowlist must produce non-nil error")
 	}
 }
@@ -144,13 +145,13 @@ func TestAllowlistToDecisionFunc_NilAllowlist(t *testing.T) {
 // alert on a non-zero rate of denials without grepping slog). Verify by
 // reading the counter back via the Metrics registry.
 func TestAllowlistToDecisionFunc_IncrementsCounter(t *testing.T) {
-	deny := func(string) bool { return false }
+	deny := func(context.Context, string) (bool, error) { return false, nil }
 	m := NewMetrics()
 	df := allowlistToDecisionFunc(deny, nil, m)
-	if err := df(nil, "attacker.example.com"); err == nil {
+	if err := df(context.Background(), "attacker.example.com"); err == nil {
 		t.Fatal("deny branch should produce an error")
 	}
-	if err := df(nil, "another.example.com"); err == nil {
+	if err := df(context.Background(), "another.example.com"); err == nil {
 		t.Fatal("deny branch should produce an error (second call)")
 	}
 	got := readTLSOnDemandDenied(t, m, "allowlist")

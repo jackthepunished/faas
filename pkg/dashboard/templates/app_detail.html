@@ -42,6 +42,39 @@
     .sev-medium   { color: #f9a825; font-weight: 600; }
     .sev-low      { color: #1565c0; font-weight: 600; }
     .sev-unknown  { color: #888; }
+    /* Issue #791 PR-E / ADR-090 closure — cron runs panel.
+       Glyph palette mirrors .sev-* so a "×" reads as "failed"
+       wherever it appears. .enabled-true / .enabled-false
+       echoes the dashboard's existing state-badge vocabulary. */
+    .cron-run-row        { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.15rem 0; border-bottom: 1px dotted #eee; }
+    .cron-run-row .glyph { display: inline-block; width: 1.2em; font-weight: 600; }
+    .cron-run-row .glyph-ok      { color: #2e7d32; }
+    .cron-run-row .glyph-fail    { color: #c62828; }
+    .cron-run-row .glyph-running { color: #1e40af; }
+    .enabled-true  { color: #065f46; }
+    .enabled-false { color: #888; }
+    .cron-section       { margin: 0.4rem 0 0.6rem 0; padding: 0.4rem 0.6rem; background: #fafafa; border-radius: 4px; }
+    .cron-section header { font-weight: 600; }
+    .cron-flash-ok      { background: #d1fae5; color: #065f46; padding: 0.5rem 0.75rem; border-radius: 4px; margin: 0.5rem 0; }
+    .cron-flash-error   { background: #fee2e2; color: #991b1b; padding: 0.5rem 0.75rem; border-radius: 4px; margin: 0.5rem 0; }
+    /* Issue #272 / ADR-095 PR-C — preview environments panel.
+       Mirrors the cron-panel layout (chip + meta + action button)
+       so a preview row reads as a sibling of the cron rows. The
+       state chip palette echoes the existing .badge.* so an "open"
+       preview reads the same as an "active" app. */
+    .preview-section       { margin: 0.4rem 0 0.6rem 0; padding: 0.4rem 0.6rem; background: #fafafa; border-radius: 4px; }
+    .preview-section header { font-weight: 600; }
+    .preview-row           { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.3rem 0; border-bottom: 1px dotted #eee; }
+    .preview-row:last-child { border-bottom: 0; }
+    .preview-state-open      { color: #065f46; font-weight: 600; }
+    .preview-state-closed    { color: #6b7280; font-weight: 600; }
+    .preview-state-stale     { color: #c62828; font-weight: 600; }
+    .preview-state-torn_down { color: #888; font-style: italic; }
+    .preview-copy-btn {
+      padding: 0.1rem 0.5rem; font-size: 0.85rem; border: 1px solid #d1d5db; border-radius: 4px; background: #fff; cursor: pointer;
+    }
+    .preview-copy-btn:hover { background: #f3f4f6; }
+    .preview-copy-btn[data-copied="true"] { background: #d1fae5; border-color: #065f46; color: #065f46; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -58,7 +91,14 @@
       <a href="/dashboard/account">Account</a>
     </nav>
   </header>
-  <main hx-trigger="sse:app_changed, sse:deployment_changed, sse:instance_changed, sse:invocation_done, sse:stateless_advisory" hx-get="/dashboard/apps/{{.Data.App.Slug}}" hx-swap="innerHTML" hx-select="main" hx-push-url="false">
+  <main hx-trigger="sse:app_changed, sse:deployment_changed, sse:instance_changed, sse:invocation_done, sse:stateless_advisory, sse:cron_fired" hx-get="/dashboard/apps/{{.Data.App.Slug}}" hx-swap="innerHTML" hx-select="main" hx-push-url="false">
+    {{/* Issue #791 PR-E / ADR-090 closure — flash banner shown
+         after a dashboard fire-now POST. The handler redirects
+         with ?fired=1 (success) or ?fired=error (failure); the
+         banner reads the flag on next render. Closes the
+         "did the click do anything?" operator loop without a
+         full page reload. */}}
+    {{if .Data.FiredFlash}}{{if eq .Data.FiredFlash "ok"}}<div class="cron-flash-ok" role="status">Fire-now enqueued. The run will appear below within a few seconds.</div>{{else}}<div class="cron-flash-error" role="alert">Fire-now failed. Check the cron's path and try again, or use <code>gregale crons info &lt;id&gt;</code> for diagnostics.</div>{{end}}{{end}}
     {{if .Data}}
       <h1>App: <code>{{.Data.App.Slug}}</code></h1>
       <p>
@@ -140,7 +180,7 @@
         at request time can see why their state doesn't survive scale-to-zero.
       </p>
       <p>
-        <a href="/dashboard/audit-events?kind_prefix=stateless.advisory&app_id={{.Data.App.ID}}">Recent advisories →</a>
+        <a href="/dashboard/audit-events?kind_prefix=stateless.advisory&app_id={{.Data.App.AppID}}">Recent advisories →</a>
       </p>
 
       <h2>Recent wakes</h2>
@@ -264,21 +304,120 @@
         </section>
       {{end}}
 
+      {{/* Issue #272 / ADR-095 PR-C — preview environments panel.
+           Suppressed for a preview row itself (a preview cannot have
+           previews — the per-deployment scope gates dispatch) so the
+           panel only appears on production apps. The list is sorted
+           newest-first by the store (PreviewAppsByParent) and each row
+           renders a state chip plus a Copy URL button wired by an
+           inline <script> with the page nonce (mirrors the
+           delete-account pattern at account.html:118). */}}
+      {{if not .Data.App.IsPreview}}
+        <h2>Preview environments</h2>
+        {{if .Data.Previews}}
+          {{range .Data.Previews}}
+            <section class="preview-section" id="preview-{{.Slug}}" aria-label="preview PR #{{.PrNumber}}">
+              <header>
+                PR #{{.PrNumber}}
+                · <code>{{.Slug}}</code>
+                · <span class="preview-state-{{.PrState}}">{{.StateLabel}}</span>
+                {{if .ExpiresAt}}· expires {{.ExpiresAt}}{{end}}
+              </header>
+              <div style="margin-top:0.4rem">
+                <a href="{{.URL}}"><code>{{.URL}}</code></a>
+                <button type="button"
+                  class="preview-copy-btn"
+                  data-preview-url="{{.URL}}"
+                  data-preview-target="preview-copy-{{.Slug}}"
+                  id="preview-copy-btn-{{.Slug}}">Copy URL</button>
+                <span id="preview-copy-{{.Slug}}" aria-live="polite" style="margin-left:0.4rem;color:#888;font-size:0.85rem"></span>
+              </div>
+            </section>
+          {{end}}
+          {{/* Inline script is CSP-nonced — required because the
+               copy-to-clipboard button uses navigator.clipboard
+               which can't be invoked from inline event handlers
+               under a strict CSP. Mirrors account.html:118
+               (delete-account prompt pattern). The script is
+               page-scoped (data-attribute lookup) so multiple
+               preview rows on one page each get their own
+               listener without colliding. */}}
+          <script nonce="{{.Nonce}}">
+            (function() {
+              document.querySelectorAll('.preview-copy-btn').forEach(function(btn) {
+                btn.addEventListener('click', function() {
+                  var url = btn.getAttribute('data-preview-url');
+                  var targetId = btn.getAttribute('data-preview-target');
+                  var span = document.getElementById(targetId);
+                  if (!url) return;
+                  if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(url).then(function() {
+                      btn.setAttribute('data-copied', 'true');
+                      if (span) span.textContent = 'copied';
+                      setTimeout(function() {
+                        btn.removeAttribute('data-copied');
+                        if (span) span.textContent = '';
+                      }, 1500);
+                    }, function() {
+                      if (span) span.textContent = 'copy failed';
+                    });
+                  } else if (span) {
+                    span.textContent = 'clipboard not available';
+                  }
+                });
+              });
+            })();
+          </script>
+        {{else}}
+          <p>No preview environments yet. Connect a GitHub repo on the <a href="/dashboard/account">Account</a> page to provision preview apps from pull requests.</p>
+        {{end}}
+      {{end}}
+
       <h2>Crons</h2>
       {{if .Data.Crons}}
-        <table>
-          <thead><tr><th>Schedule</th><th>Path</th><th>Enabled</th><th>Last fired</th></tr></thead>
-          <tbody>
-            {{range .Data.Crons}}
-              <tr>
-                <td><code>{{.Schedule}}</code></td>
-                <td><code>{{.Path}}</code></td>
-                <td>{{.Enabled}}</td>
-                <td>{{.LastFiredAt}}</td>
-              </tr>
-            {{end}}
-          </tbody>
-        </table>
+        {{/* Issue #791 PR-E / ADR-090 closure — one section per
+             cron with: schedule/path/enabled/last-fired, a Fire
+             now form, an inline expandable "Last 10 runs"
+             <details>. Each cron row anchors on id="cron-{id}"
+             so the POST-redirect target hash (#cron-{id})
+             scrolls the operator to the cron they just fired.
+             The empty-state ("never fired", "no runs yet") pins
+             explicit hints so a single miss isn't a black hole. */}}
+        {{range .Data.Crons}}
+          <section class="cron-section" id="cron-{{.ID}}" aria-label="cron {{.Schedule}}">
+            <header>
+              <code>{{.Schedule}}</code>
+              · <code>{{.Path}}</code>
+              · {{if .Enabled}}<span class="enabled-true">enabled</span>{{else}}<span class="enabled-false">disabled</span>{{end}}
+              · last fired <strong>{{if .LastFiredAt}}{{.LastFiredAt}}{{else}}<span style="color:#888">never</span>{{end}}</strong>
+            </header>
+            <form method="POST" action="/dashboard/apps/{{$.Data.App.Slug}}/crons/{{.ID}}/fire-now" style="margin-top:0.4rem; display:inline-block">
+              <input type="hidden" name="csrf_token" value="{{.FireNowConfirmToken}}">
+              <button type="submit" {{if not .Enabled}}disabled title="cron is disabled"{{end}}>Fire now</button>
+            </form>
+            <details style="margin-top:0.4rem">
+              <summary>Last {{.RunsCount}} runs</summary>
+              {{if .Runs}}
+                <div style="margin-top:0.3rem">
+                  {{range .Runs}}
+                    <div class="cron-run-row">
+                      <span class="glyph
+                        {{if eq .Glyph "✓"}}glyph-ok
+                        {{else if eq .Glyph "✗"}}glyph-fail
+                        {{else}}glyph-running{{end}}"
+                        title="{{.Outcome}}">{{.Glyph}}</span>
+                      <span><code>{{.StartedAt}}</code></span>
+                      <span>{{.DurationMS}}</span>
+                      <span style="color:#888">{{.Outcome}}</span>
+                    </div>
+                  {{end}}
+                </div>
+              {{else}}
+                <p style="color:#888; margin:0.3rem 0">No runs yet.</p>
+              {{end}}
+            </details>
+          </section>
+        {{end}}
       {{else}}
         <p>No crons scheduled.</p>
       {{end}}

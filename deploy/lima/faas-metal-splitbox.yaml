@@ -1,0 +1,144 @@
+# faas-metal-splitbox — issue #911 / ADR-110 PR-7 two-role Lima harness.
+#
+# WHY: ADR-110 §81-85 commits to a two-role Lima fleet (control-plane +
+# compute-only) that runs the issue #911 acceptance chain end-to-end on a
+# developer Mac. The single-VM faas-metal.yaml and the symmetric two-node
+# faas-metal-2node-b.yaml (both run the full daemon set) are insufficient:
+# the role gate (pkg/role.Require) refuses daemons that don't match the
+# box's observed role, so a real PR-7 cutover test needs an asymmetric
+# fleet where the daemons that should be on fsn-1 (control-plane) are NOT
+# on fsn-2 (compute-only) and vice versa. This file provisions both roles
+# from one yaml so `make metal-lima-splitbox` boots the whole chain with
+# one command.
+#
+# The harness consumes deploy/manifest/splitbox.yaml to drive the
+# renderer (PR-2), the release installer (PR-3), and the doctor (PR-4).
+# Both boxes run `gregalectl manifest validate --file deploy/manifest/
+# splitbox.yaml`; the renderer writes per-host TOMLs; the installer
+# materialises the release bundle under /opt/faas/releases/<sha>/; the
+# doctor validates exit 0 on both.
+#
+# Usage:
+#   limactl start deploy/lima/faas-metal-splitbox.yaml
+#   limactl shell faas-metal-splitbox-cp   # control-plane
+#   limactl shell faas-metal-splitbox-cx   # compute-only
+#   # in each guest, from your repo checkout under $HOME:
+#   sudo -E env "PATH=$PATH" \
+#     ./deploy/lima/run-metal-splitbox.sh
+#
+# CAVEAT (same as faas-metal.yaml): arm64 Lima guests, NOT production
+# x86_64. Validates the asymmetric-role plumbing + the renderer + the
+# release installer + the doctor. Production acceptance lives on the
+# bare-metal x86_64 control-plane node (spec §14).
+
+vmType: vz
+arch: aarch64
+nestedVirtualization: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+
+cpus: 4
+memory: "6GiB"
+disk: "40GiB"
+
+mounts:
+  - location: "~"
+    writable: true
+
+probes:
+  - description: "nested KVM present (/dev/kvm)"
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if ! timeout 60s bash -c "until test -e /dev/kvm; do sleep 2; done"; then
+        echo >&2 "/dev/kvm never appeared — nested virtualization was not granted."
+        echo >&2 "Needs Apple Silicon M3+ and macOS 15+. Fall back to a bare-metal box."
+        exit 1
+      fi
+    hint: |
+      /dev/kvm is missing. Requires Apple Silicon M3+ / macOS 15+.
+
+# Minimal provisioner — installs Postgres locally, creates the per-daemon
+# service accounts (control-plane set + compute-only set, both), lays
+# out the /srv/fc tree, sets up /etc/faas paths. Same shape as
+# faas-metal-2node-b.yaml:67-128; the role asymmetry is enforced at
+# daemon-start time by pkg/role.Require, not at provisioning time, so
+# both boxes share the same provisioner body.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      apt_wait() {
+        local deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+              && ! fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+            return 0
+          fi
+          sleep 1
+        done
+        echo "apt_wait: dpkg lock still held after 60s" >&2
+        return 1
+      }
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt_wait
+      apt-get update -y
+      apt_wait
+      apt-get install -y --no-install-recommends \
+        build-essential e2fsprogs iproute2 iptables nftables git curl ca-certificates \
+        busybox-static jq postgresql
+
+      # Both role-sets' service accounts — pkg/role.Require enforces
+      # which subset actually starts at runtime, so the unselected
+      # accounts are inert but present (consistent with the production
+      # ansible split where compute_only_service does not ship apid's
+      # account and vice versa — here on a dev VM we keep both for
+      # parity with faas-metal-2node-b.yaml:93-101).
+      for u in faas faas-apid faas-schedd faas-vmmd faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-builderd faas-meterd faas-githubd; do
+        if ! id -u "$u" >/dev/null 2>&1; then
+          useradd -r -M -s /usr/sbin/nologin "$u"
+        fi
+      done
+      groupadd -f faas || true
+      for u in faas-apid faas-schedd faas-vmmd faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-builderd faas-meterd faas-githubd; do
+        usermod -aG faas "$u" 2>/dev/null || true
+      done
+      install -d -m 0755 -o root -g root /etc/faas
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/base
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/jail
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/snap
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/layers
+
+      install -d -m 0755 -o postgres -g postgres /var/run/postgresql
+      ln -sfn /var/run/postgresql /run/postgresql
+      cat >/etc/postgresql/16/main/pg_hba.conf <<EOF
+      local all all trust
+      host all all 127.0.0.1/32 trust
+      host all all ::1/128 trust
+      EOF
+      pg_ctlcluster 16 main start || true
+      sleep 1
+      pg_ctlcluster 16 main reload || true
+      sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='faas'" \
+        | grep -q 1 || sudo -u postgres psql -c "CREATE ROLE faas LOGIN SUPERUSER"
+      sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='faas'" \
+        | grep -q 1 || sudo -u postgres createdb faas
+      sudo -u postgres psql -c "GRANT ALL ON DATABASE faas TO faas" || true
+
+      # /opt/faas/releases — the cluster-shipped bundle root that
+      # `gregalectl release install --git-sha <sha>` materialises
+      # under (PR-3). Pre-create with the right ownership so the
+      # installer's per-bundle subdir write doesn't fail on a clean
+      # box.
+      install -d -m 0755 -o root -g root /opt/faas/releases
+
+      groupadd -f kvm || true
+      DEFAULT_USER="$(getent passwd | awk -F: '$3>=500 && $3<65000 && $7 ~ /(bash|zsh|sh)$/ {print $1; exit}')"
+      DEFAULT_USER="${DEFAULT_USER:-poyrazk}"
+      DEFAULT_USER="${DEFAULT_USER:-ubuntu}"
+      usermod -aG kvm "${DEFAULT_USER}" || true

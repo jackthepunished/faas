@@ -12,6 +12,7 @@ package state_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -23,16 +24,25 @@ import (
 // *state.CronQuotaError with Scope=App. The hand-written SQL in
 // pgstore.go is the only thing exercising this — losing the partial
 // index or the count predicate would silently raise the cap.
+//
+// Each seed cron uses a distinct path so the (app_id, schedule, path)
+// UNIQUE constraint added in migration 00208 does not short-circuit
+// the loop with pgx 23505 before the per-app count predicate fires.
+// The constraint is the source-of-truth gate for the manifest dedupe
+// primitive (pkg/gregalemanifest/manifest.go); the quota predicate
+// (per-app, per-account) is a separate concern enforced at the
+// CreateCron layer.
 func TestPgStore_CreateCronIfUnderQuota_PerAppCap(t *testing.T) {
 	s, ctx := pgStore(t)
 	limits := api.MustLimitsFor(api.PlanPro) // 20/app, 50/acct
 	acct, app, _ := seedLiveDeploy(t, s, ctx)
 	for i := 0; i < limits.CronLimitPerApp; i++ {
-		if _, err := s.CreateCron(ctx, app, "*/5 * * * *", "/x", true); err != nil {
+		path := fmt.Sprintf("/cron-%d", i)
+		if _, err := s.CreateCron(ctx, app, "*/5 * * * *", path, true); err != nil {
 			t.Fatalf("seed cron %d: %v", i, err)
 		}
 	}
-	_, err := s.CreateCronIfUnderQuota(ctx, app, "*/5 * * * *", "/x", true, limits)
+	_, err := s.CreateCronIfUnderQuota(ctx, app, "*/5 * * * *", "/beyond-cap", true, limits)
 	if err == nil {
 		t.Fatal("expected *CronQuotaError at per-app cap, got nil")
 	}
@@ -61,6 +71,12 @@ func TestPgStore_CreateCronIfUnderQuota_PerAppCap(t *testing.T) {
 // lands at the per-account cap (Pro: 50) with per-app still under.
 // Proves the join through apps and the FOR UPDATE on the apps row
 // together let the per-account count fire before the per-app cap.
+//
+// Each seed cron uses a distinct path (per-app) so the
+// (app_id, schedule, path) UNIQUE constraint added in migration 00208
+// does not short-circuit the loop with pgx 23505 before the per-account
+// count predicate fires. See TestPgStore_CreateCronIfUnderQuota_PerAppCap
+// for the rationale.
 func TestPgStore_CreateCronIfUnderQuota_PerAccountCap(t *testing.T) {
 	s, ctx := pgStore(t)
 	limits := api.MustLimitsFor(api.PlanPro) // 20/app, 50/acct
@@ -85,23 +101,28 @@ func TestPgStore_CreateCronIfUnderQuota_PerAccountCap(t *testing.T) {
 	}
 	appA, appB := appARec.ID, appBRec.ID
 	for i := 0; i < limits.CronLimitPerApp-1; i++ {
-		if _, err := s.CreateCron(ctx, appA, "*/5 * * * *", "/x", true); err != nil {
+		path := fmt.Sprintf("/a-%d", i)
+		if _, err := s.CreateCron(ctx, appA, "*/5 * * * *", path, true); err != nil {
 			t.Fatalf("seed appA %d: %v", i, err)
 		}
 	}
 	for i := 0; i < limits.CronLimitPerApp-1; i++ {
-		if _, err := s.CreateCron(ctx, appB, "*/5 * * * *", "/x", true); err != nil {
+		path := fmt.Sprintf("/b-%d", i)
+		if _, err := s.CreateCron(ctx, appB, "*/5 * * * *", path, true); err != nil {
 			t.Fatalf("seed appB %d: %v", i, err)
 		}
 	}
 	fillC := limits.CronLimitPerAccount - 2*(limits.CronLimitPerApp-1)
 	for i := 0; i < fillC; i++ {
-		if _, err := s.CreateCron(ctx, appB, "*/5 * * * *", "/x", true); err != nil {
+		path := fmt.Sprintf("/b-tail-%d", i)
+		if _, err := s.CreateCron(ctx, appB, "*/5 * * * *", path, true); err != nil {
 			t.Fatalf("seed appB tail %d: %v", i, err)
 		}
 	}
 	// Now per-account is at the cap. Next insert via the *quota*
-	// method on a third app must trip the account arm.
+	// method on a third app must trip the account arm. The path is
+	// distinct from anything seeded so a 23505 cannot mask the quota
+	// error if the per-account count regressed.
 	appCRec, err := s.CreateApp(ctx, state.App{
 		AccountID: acct, Slug: "cron-acct-c", Type: state.AppTypeFunction,
 		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
@@ -110,7 +131,7 @@ func TestPgStore_CreateCronIfUnderQuota_PerAccountCap(t *testing.T) {
 		t.Fatalf("CreateApp C: %v", err)
 	}
 	appC := appCRec.ID
-	_, err = s.CreateCronIfUnderQuota(ctx, appC, "*/5 * * * *", "/x", true, limits)
+	_, err = s.CreateCronIfUnderQuota(ctx, appC, "*/5 * * * *", "/c-trigger", true, limits)
 	if err == nil {
 		t.Fatal("expected *CronQuotaError at per-account cap, got nil")
 	}
@@ -127,6 +148,7 @@ func TestPgStore_CreateCronIfUnderQuota_PerAccountCap(t *testing.T) {
 	if qe.Observed != limits.CronLimitPerAccount {
 		t.Errorf("observed = %d, want %d", qe.Observed, limits.CronLimitPerAccount)
 	}
+	_ = appC // suppress unused
 }
 
 // TestPgStore_CreateCronIfUnderQuota_AppDeletedReturnsNotFound guards

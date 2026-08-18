@@ -84,6 +84,18 @@ type Config struct {
 	// (1 day). The DELETE is idempotent — a second run on the
 	// same day finds nothing to delete.
 	RetentionInterval time.Duration
+	// UpstreamProbeInterval (ADR-098 PR-C) is how often the
+	// meterd probe loop walks the dedup'd (host_redacted_hash,
+	// kind, port) target set and dials every entry via
+	// crypto/tls.Dial. Zero means the production default
+	// (30 s). The probe writes one row per
+	// (host_redacted_hash, region) per tick.
+	UpstreamProbeInterval time.Duration
+	// UpstreamPartitionCreateInterval (ADR-098 PR-C) is how
+	// often the partition-create cron ensures a forward-
+	// rolling window of pre-created data_upstream_probes
+	// partitions. Zero means the production default (1 h).
+	UpstreamPartitionCreateInterval time.Duration
 	// ScheddSocket is the unix socket meterd dials for ParkInstance.
 	ScheddSocket string
 	// NotifyBackend is the db.Notify implementation; defaults to the
@@ -123,5 +135,11 @@ func (c *Config) Defaults() {
 	}
 	if c.RetentionInterval == 0 {
 		c.RetentionInterval = DefaultRetentionInterval
+	}
+	if c.UpstreamProbeInterval == 0 {
+		c.UpstreamProbeInterval = DefaultUpstreamProbeInterval
+	}
+	if c.UpstreamPartitionCreateInterval == 0 {
+		c.UpstreamPartitionCreateInterval = DefaultUpstreamPartitionCreateInterval
 	}
 }

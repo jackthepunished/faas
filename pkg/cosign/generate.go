@@ -18,8 +18,10 @@ import (
 // WriteKeyPairForGroup with the canonical modes (0440 root:faas
 // for the private side, 0444 root:root for the public side) and
 // the canonical paths (/etc/faas/secrets/). The chown step is
-// the installer's responsibility — bootstrap.sh and the ansible
-// role set ownership; this package only enforces file mode.
+// the installer's responsibility — the v1 bootstrap.sh and the
+// ansible role set ownership (bootstrap.sh RETIRED 2026-08-15 by
+// issue #911 / PR-1; v2 path is PR-X `gregale secrets init`);
+// this package only enforces file mode.
 func GenerateKeyPair() (privPEM, pubPEM []byte, err error) {
 	priv, err := ecdsa.GenerateKey(ecdsaP256(), rand.Reader)
 	if err != nil {
@@ -77,12 +79,14 @@ func WriteKeyPair(privPath string, privPEM []byte, pubPath string, pubPEM []byte
 // mode 0444 (world-read), unchanged from WriteKeyPair. Refuses
 // to overwrite existing files unless force is true. Ownership
 // (root:faas vs root:root) is the installer's responsibility —
-// bootstrap.sh and the ansible role chown after this call; the
-// cosign package does NOT chown because the install context may
-// vary (root in bootstrap, the faas user in ansible, the test
-// process in `go test`, and only the install caller knows the
-// target user). LoadPrivateKeyFile already accepts 0440, so the
-// verifier at schedd startup is unaffected.
+// the v1 bootstrap.sh and the ansible role chown after this call
+// (bootstrap.sh RETIRED 2026-08-15 by issue #911 / PR-1; v2 path
+// is PR-X `gregale secrets init`); the cosign package does NOT
+// chown because the install context may vary (root in bootstrap,
+// the faas user in ansible, the test process in `go test`, and
+// only the install caller knows the target user). LoadPrivateKeyFile
+// already accepts 0440, so the verifier at schedd startup is
+// unaffected.
 func WriteKeyPairForGroup(privPath string, privPEM []byte, pubPath string, pubPEM []byte, force bool) error {
 	if privPath == "" || pubPath == "" {
 		return errors.New("cosign: WriteKeyPairForGroup: empty path")

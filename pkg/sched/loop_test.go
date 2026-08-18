@@ -29,7 +29,7 @@ func TestLoopReaperParksIdleInstance(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID, "")
+	res, err := engine.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestRunReaperPopulatesOpenConns(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID, "")
+	res, err := engine.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestRunReaperFlowCounterErrorFailsOpen(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID, "")
+	res, err := engine.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestRunReaperConsultsRealFlowcountReader(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID, "")
+	res, err := engine.Wake(context.Background(), app.ID, "", "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -346,7 +346,7 @@ func wakeN(t *testing.T, engine *Engine, appID string, n int) {
 	t.Helper()
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
-		ins, err := engine.AdmitInstance(ctx, appID, "")
+		ins, err := engine.AdmitInstance(ctx, appID, "", "")
 		if err != nil {
 			t.Fatalf("AdmitInstance[%d]: %v", i, err)
 		}
@@ -559,6 +559,176 @@ func TestLoopReaperAggressiveMetricIncrements(t *testing.T) {
 // calls. MemStore.UpdateApp takes pointer fields; the literal
 // helper keeps the test bodies readable.
 func intPtr(i int) *int { return &i }
+
+// TestLoopReaperAggressiveEmitsCooldownHeld (P1C) pins that when
+// the per-app scale-in cooldown consult in ReapAggressive fires,
+// schedd_scale_down_decisions_total{outcome="cooldown_held"} is
+// emitted exactly once per app per tick, AND that the app does
+// NOT appear in the park slice (so the existing `park` outcome
+// does not fire for the same app in the same tick).
+//
+// Test setup mirrors TestLoopReaperAggressiveMetricIncrements but
+// primes apps.last_scale_in_at within the cooldown window. The
+// aggressive reaper would otherwise park 4 instances (floor=0,
+// desired=0, running=5, limit=1, extra=4) — under the cooldown
+// window the entire app is skipped and the metric flips to
+// `cooldown_held` with `park` = 0.
+func TestLoopReaperAggressiveEmitsCooldownHeld(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	// ScaleInCooldownS = 60s + autoscale target so the aggressive
+	// path considers this app. ScaleInCooldownS > 0 is required to
+	// activate the cooldown consult at reaper.go:331.
+	scaleInCooldown := 60
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetScalingPolicy: true,
+		ScalingPolicy: &state.ScalingPolicy{
+			ScaleInCooldownS: scaleInCooldown,
+		},
+		SetAutoscaleTargetRPS: true,
+		AutoscaleTargetRPS:    intPtr(10),
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	wakeN(t, engine, app.ID, 5)
+
+	scraper := &fakeScaleUpScraper{}
+	clock := func() time.Time { return time.Now().Add(35 * time.Second) }
+	mirror := recentload.New(scraper, 5, 5*time.Minute)
+	scraper.set(map[string]int64{app.ID: 1})
+	mirror.Touch(context.Background(), clock())
+	scraper.set(map[string]int64{app.ID: 0})
+	mirror.Touch(context.Background(), clock().Add(time.Minute))
+
+	// Stamp last_scale_in_at within the cooldown window. The
+	// aggressive reaper consults it via the InstanceInfo carrier
+	// (loop.go:1130-1135 mirrors LastScaleInAt + ScaleInCooldownS).
+	// StampAppScaleIn stamps now() — the reaper consults now vs
+	// LastScaleInAt, so a stamp right before the runReaper call
+	// lands inside the 60s window.
+	if err := store.StampAppScaleIn(context.Background(), app.ID); err != nil {
+		t.Fatalf("StampAppScaleIn: %v", err)
+	}
+
+	ops := wire.NewOpsMetrics("schedd")
+	loop := NewLoop(nil, engine, testLog()).
+		WithClock(clock).
+		WithRecentLoad(mirror).
+		WithReaperAggressive(true).
+		WithOpsMetrics(ops)
+	loop.runReaper(context.Background())
+
+	body := wireRenderMetrics(t, ops)
+	wantLines := []string{
+		`schedd_scale_down_decisions_total{app="` + app.ID + `",outcome="cooldown_held"} 1`,
+		// Empty-app placeholder rows must still surface from boot —
+		// this is the §12 panel contract.
+		`schedd_scale_down_decisions_total{app="",outcome="cooldown_held"} 0`,
+	}
+	for _, want := range wantLines {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+	// And no `park` observation fired for this app — a successful
+	// park would have appeared as
+	// schedd_scale_down_decisions_total{app=app.ID,outcome="park"} 1.
+	// The cooldown_held emission proves the consult fired before any
+	// park; if the park had happened we'd see both. Asserting on
+	// the absence of the park line keeps the test independent of
+	// Prometheus's row-creation-on-first-increment semantics.
+	notWant := `schedd_scale_down_decisions_total{app="` + app.ID + `",outcome="park"}`
+	if bytes.Contains(body, []byte(notWant)) {
+		t.Errorf("unexpected line %q in:\n%s", notWant, body)
+	}
+
+	// And the running count is unchanged — the cooldown skipped the
+	// whole app, so the reaper did not park any instance.
+	running := liveCount(t, store, app.ID)
+	if running != 5 {
+		t.Errorf("running = %d, want 5 (cooldown skipped whole app, no parks)", running)
+	}
+}
+
+// TestLoopReaperIdleEmitsCooldownHeld (P1D) pins that the idle
+// reaper branch emits schedd_scale_down_decisions_total{outcome=
+// "cooldown_held"} exactly once per app per tick when its per-app
+// scale-in cooldown consult fires. Mirror of
+// TestLoopReaperAggressiveEmitsCooldownHeld above but WITHOUT
+// WithReaperAggressive(true) — the aggressive branch is gated off
+// so the cooldown_held emission is unambiguously attributable to
+// the idle branch. This is the load-bearing integration pin for
+// the P1D metric symmetry fix.
+func TestLoopReaperIdleEmitsCooldownHeld(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	// ScaleInCooldownS = 60s. No AutoscaleTargetRPS, so the app
+	// does NOT appear in the aggressive branch's desiredByApp map
+	// — but the aggressive branch is gated off anyway. With
+	// WithReaperAggressive(false) the aggressive branch is fully
+	// skipped (l.recentLoad nil check at loop.go:1278).
+	scaleInCooldown := 60
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetScalingPolicy: true,
+		ScalingPolicy: &state.ScalingPolicy{
+			ScaleInCooldownS: scaleInCooldown,
+		},
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	wakeN(t, engine, app.ID, 5)
+
+	// Stamp last_scale_in_at within the cooldown window. The idle
+	// reaper consults it via the InstanceInfo carrier (mirror of the
+	// aggressive branch test at loop_test.go:612).
+	if err := store.StampAppScaleIn(context.Background(), app.ID); err != nil {
+		t.Fatalf("StampAppScaleIn: %v", err)
+	}
+
+	ops := wire.NewOpsMetrics("schedd")
+	// WithReaperAggressive omitted → defaults to false; the aggressive
+	// branch is fully gated off.
+	loop := NewLoop(nil, engine, testLog()).
+		WithOpsMetrics(ops)
+	loop.runReaper(context.Background())
+
+	body := wireRenderMetrics(t, ops)
+	wantLines := []string{
+		`schedd_scale_down_decisions_total{app="` + app.ID + `",outcome="cooldown_held"} 1`,
+		// Empty-app placeholder rows must still surface from boot —
+		// this is the §12 panel contract.
+		`schedd_scale_down_decisions_total{app="",outcome="cooldown_held"} 0`,
+	}
+	for _, want := range wantLines {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+	// And no `park` observation fired for this app — a successful
+	// park would have appeared as
+	// schedd_scale_down_decisions_total{app=app.ID,outcome="park"} 1.
+	// The cooldown_held emission proves the consult fired before any
+	// park; if the park had happened we'd see both. Asserting on
+	// the absence of the park line keeps the test independent of
+	// Prometheus's row-creation-on-first-increment semantics.
+	notWant := `schedd_scale_down_decisions_total{app="` + app.ID + `",outcome="park"}`
+	if bytes.Contains(body, []byte(notWant)) {
+		t.Errorf("unexpected line %q in:\n%s", notWant, body)
+	}
+
+	// And the running count is unchanged — the cooldown skipped the
+	// whole app, so the reaper did not park any instance.
+	running := liveCount(t, store, app.ID)
+	if running != 5 {
+		t.Errorf("running = %d, want 5 (idle cooldown skipped whole app, no parks)", running)
+	}
+}
 
 // liveCount returns the number of RUNNING instances of an app.
 // Pulled out as a helper so the test bodies above stay focused.

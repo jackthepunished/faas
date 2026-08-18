@@ -34,7 +34,7 @@ type rotatingScheduler struct {
 	method     int32         // raw wake method for Admit
 }
 
-func (r *rotatingScheduler) AdmitInstance(context.Context, string, string) (string, string, string, string, int32, bool, int, error) {
+func (r *rotatingScheduler) AdmitInstance(context.Context, string, string, string) (string, string, string, string, int32, bool, int, error) {
 	idx := r.calls.Add(1)
 	nodeID := r.nextNodeID()
 	// Scheduler signature (issue #460 / ADR-053 PR-C + issue #556 PR-B):
@@ -43,6 +43,16 @@ func (r *rotatingScheduler) AdmitInstance(context.Context, string, string) (stri
 	// deploymentID="" → legacy single-deployment mode (picker collapses
 	// to today's single-targetSet behaviour).
 	return "i-" + strconv.FormatInt(idx, 10), nodeID, "", "wake-" + strconv.FormatInt(idx, 10), r.method, false, 0, nil
+}
+
+// EnsureWake (ADR-098) mirrors AdmitInstance. The FakeScheduler-style
+// "fresh identity per call" is exactly what per-node multi-box tests
+// want — the schedd-side leader/follower contract is pinned by the
+// property-based test on the Engine side, not here.
+func (r *rotatingScheduler) EnsureWake(context.Context, string) (string, string, string, string, int32, int, error) {
+	idx := r.calls.Add(1)
+	nodeID := r.nextNodeID()
+	return "i-" + strconv.FormatInt(idx, 10), nodeID, "", "wake-" + strconv.FormatInt(idx, 10), r.method, 0, nil
 }
 
 // TestPGBackend_PickRotatesWithinWinningNode seeds two nodes with
@@ -67,7 +77,7 @@ func TestPGBackend_PickRotatesWithinWinningNode(t *testing.T) {
 
 	// Seed 4 admits (3 on A, 1 on B). HealthyCount is total.
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -122,7 +132,7 @@ func TestPGBackend_PickPrefersWarmAffinityNode(t *testing.T) {
 	})
 
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -162,7 +172,7 @@ func TestPGBackend_PickColdPathHonorsLexOrder(t *testing.T) {
 	// No WithWarmHint set → picker uses healthyCount + lex tie-break.
 
 	for i := 0; i < 2; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -189,7 +199,7 @@ func TestPGBackend_PickSingleNodeFastPath(t *testing.T) {
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -232,7 +242,7 @@ func TestPGBackend_PickAfterEvictNodeEntry(t *testing.T) {
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -285,7 +295,7 @@ func TestPGBackend_PickFollowsWarmHintCache(t *testing.T) {
 
 	// Seed: 2 admits on each node (A, B, A, B → 2/2 split).
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app", "", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app", "", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}

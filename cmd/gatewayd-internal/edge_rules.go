@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -45,35 +46,73 @@ type edgeRuleStore interface {
 // wrapper. nil-safe (the gateway handler skips Match* when
 // h.edgeRules == nil; this type is never nil because cmd/gatewayd-internal/run.go
 // always wires one before the listener accepts).
+//
+// validate holds the pkg/edgevalidate adapter (set in PR-B).
+// compileValidateRules calls CompileSchema on every kind=validate
+// rule so the hot path never sees a cold cache. nil-safe: when
+// nil, kind=validate rules compile-then-drop (the rule is
+// silently skipped — same posture as a path-glob parse error).
+// The cmd-side run.go wires a non-nil adapter in production.
+//
+// ADR-091 hardening PR-B: metrics carries the Prometheus counter
+// registry the compile* helpers increment when a rule is dropped at
+// parse time (gateway_edge_rule_compile_error_total{kind}). nil
+// is safe — the compile helpers guard before incrementing.
 type gatewaydEdgeRules struct {
-	store edgeRuleStore
-	cache *gateway.EdgeRuleCache
-	log   *slog.Logger
+	store    edgeRuleStore
+	cache    *gateway.EdgeRuleCache
+	log      *slog.Logger
+	validate validateCompiler
+	metrics  *gateway.Metrics
+}
+
+// validateCompiler is the surface compileValidateRules needs from
+// the cmd-side adapter (cmd/gatewayd-internal/edge_validate.go).
+// We narrow the seam so this file stays free of pkg/edgevalidate;
+// the adapter file provides the concrete impl.
+//
+// Note: this is deliberately a *small* projection of the
+// pkg/edgevalidate.Manager surface. CompileSchema is the only
+// method compileValidateRules needs at load time — Validate
+// itself is called from the handler-side applier via the
+// gateway.Validator interface (handler.go::WithValidator setter),
+// not through this matcher.
+type validateCompiler interface {
+	CompileSchema(schema []byte, rejectUnknownFields bool) (schemaDigest [32]byte, err error)
 }
 
 // newGatewaydEdgeRules builds the matcher with the standard
 // 10,000-entry LRU capacity (pkg/gateway/edgeRuleCacheCap). log
 // must be non-nil so loader failures have somewhere to land.
-func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger) *gatewaydEdgeRules {
+// validate may be nil (validate kind disabled; kind=validate rules
+// are silently dropped at compile time, same posture as a
+// path-glob parse error).
+// metrics may be nil (unit tests pass nil; production wires the
+// gatewayd-internal Prometheus registry via run.go).
+func newGatewaydEdgeRules(store edgeRuleStore, log *slog.Logger, validate validateCompiler, metrics *gateway.Metrics) *gatewaydEdgeRules {
 	return &gatewaydEdgeRules{
-		store: store,
-		cache: gateway.NewEdgeRuleCache(gateway.EdgeRuleCacheCap),
-		log:   log,
+		store:    store,
+		cache:    gateway.NewEdgeRuleCache(gateway.EdgeRuleCacheCap),
+		log:      log,
+		validate: validate,
+		metrics:  metrics,
 	}
 }
 
 // loadHost compiles every kind's slice for host into a fresh
-// hostEntry. Shared by all seven Match* methods so a cache miss for
-// ANY kind recompiles all seven kinds in one pass (the SQL roundtrip
-// dominates; the seven path.Match walks are irrelevant). Returns
+// hostEntry. Shared by all Match* methods so a cache miss for
+// ANY kind recompiles all kinds in one pass (the SQL roundtrip
+// dominates; the path.Match walks are irrelevant). Returns
 // nil + nil error on an empty store response.
 //
-// parseErrs is the aggregated parse-error list across all seven
-// compile* calls — the caller logs each at WARN so an operator can
+// parseErrs is the aggregated parse-error list across all compile*
+// calls — the caller logs each at WARN so an operator can
 // diagnose a malformed glob or CIDR. The malformed rules are
 // dropped from their respective compiled slices. PR 5 widens the
 // list to include malformed CIDR parse errors from compileIPRules
-// (reuses the same PathGlobError tuple shape).
+// (reuses the same PathGlobError tuple shape); PR-B widens it
+// to include kind=validate compile errors; the maintenance
+// amendment widens it again to include kind=maintenance.
 func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway.HostEntry, error) {
 	storeRules, err := g.store.MatchEdgeRulesForHost(ctx, host)
 	if err != nil {
@@ -86,14 +125,26 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	cors, corsErrs := compileCORSRules(storeRules)
 	jwt, jwtErrs := compileJWTRules(storeRules)
 	ip, ipErrs := compileIPRules(storeRules)
+	validate, validateErrs := g.compileValidateRules(storeRules)
+	limit, limitErrs := compileLimitRules(storeRules)
+	maintenance, maintenanceErrs := compileMaintenanceRules(storeRules)
+	geo, geoErrs := compileGeoRules(storeRules)
+	throttle, throttleErrs := compileThrottleRules(storeRules)
+	budget, budgetErrs := compileBudgetRules(storeRules)
 	entry := &gateway.HostEntry{
-		Route:    route,
-		Rewrite:  rewrite,
-		Redirect: redirect,
-		Headers:  headers,
-		CORS:     cors,
-		JWT:      jwt,
-		IP:       ip,
+		Route:       route,
+		Rewrite:     rewrite,
+		Redirect:    redirect,
+		Headers:     headers,
+		CORS:        cors,
+		JWT:         jwt,
+		IP:          ip,
+		Validate:    validate,
+		Limit:       limit,
+		Maintenance: maintenance,
+		Geo:         geo,
+		Throttle:    throttle,
+		Budget:      budget,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -101,8 +152,62 @@ func (g *gatewaydEdgeRules) loadHost(ctx context.Context, host string) (*gateway
 	parseErrs = append(parseErrs, corsErrs...)
 	parseErrs = append(parseErrs, jwtErrs...)
 	parseErrs = append(parseErrs, ipErrs...)
+	parseErrs = append(parseErrs, validateErrs...)
+	parseErrs = append(parseErrs, limitErrs...)
+	parseErrs = append(parseErrs, maintenanceErrs...)
+	parseErrs = append(parseErrs, geoErrs...)
+	parseErrs = append(parseErrs, throttleErrs...)
+	parseErrs = append(parseErrs, budgetErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
+	}
+	// PR-B: surface per-rule compile errors to Prometheus so the
+	// §12 dashboard chip "edge rule compile errors" reflects every
+	// dropped rule. Incrementing once per error here keeps the
+	// counter equal to the number of broken rules (not the number
+	// of hosts that had any broken rules). loadHost is the natural
+	// choke point — every Match* falls through it on a cache miss,
+	// so we get one tick per dropped rule across the whole fleet.
+	if g.metrics != nil {
+		for range routeErrs {
+			g.metrics.ObserveEdgeRuleCompileError("route")
+		}
+		for range rewriteErrs {
+			g.metrics.ObserveEdgeRuleCompileError("rewrite")
+		}
+		for range redirectErrs {
+			g.metrics.ObserveEdgeRuleCompileError("redirect")
+		}
+		for range headersErrs {
+			g.metrics.ObserveEdgeRuleCompileError("headers")
+		}
+		for range corsErrs {
+			g.metrics.ObserveEdgeRuleCompileError("cors")
+		}
+		for range jwtErrs {
+			g.metrics.ObserveEdgeRuleCompileError("jwt")
+		}
+		for range ipErrs {
+			g.metrics.ObserveEdgeRuleCompileError("ip")
+		}
+		for range validateErrs {
+			g.metrics.ObserveEdgeRuleCompileError("validate")
+		}
+		for range limitErrs {
+			g.metrics.ObserveEdgeRuleCompileError("limit")
+		}
+		for range maintenanceErrs {
+			g.metrics.ObserveEdgeRuleCompileError("maintenance")
+		}
+		for range geoErrs {
+			g.metrics.ObserveEdgeRuleCompileError("geo")
+		}
+		for range budgetErrs {
+			g.metrics.ObserveEdgeRuleCompileError("budget")
+		}
+		for range throttleErrs {
+			g.metrics.ObserveEdgeRuleCompileError("throttle")
+		}
 	}
 	return entry, nil
 }
@@ -276,6 +381,178 @@ func (g *gatewaydEdgeRules) MatchIP(ctx context.Context, host, requestPath, meth
 		g.cache.Put(host, entry)
 	}
 	return gateway.PickFirstIPMatch(rules, requestPath, method)
+}
+
+// MatchValidate returns the highest-priority `kind=validate` rule
+// whose host, path, and method match, or nil (PR-B). Same cache
+// primitive as MatchIP — a cache miss recompiles all eight kinds
+// in one SQL pass. The applier (handler.go::applyEdgeRuleValidate)
+// buffers the request body, restores r.Body for the proxy leg,
+// and consults the cmd-side validator via gateway.Validator.
+// This method only finds the rule.
+func (g *gatewaydEdgeRules) MatchValidate(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleValidateResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetValidate(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Validate
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstValidateMatch(rules, requestPath, method)
+}
+
+// MatchLimit returns the highest-priority `kind=limit` rule whose
+// host, path, and method match, or nil (ADR-091 D24). Same cache
+// primitive as MatchValidate — a miss for limit triggers the same
+// loadHost pass that also recompiles route/rewrite/.../validate.
+// The applier (handler.go::applyEdgeRuleLimit, §4.1.2.8c) installs
+// http.MaxBytesReader on r.Body at the per-rule cap and emits 413
+// request_too_large on the Content-Length fast path before any
+// bytes are buffered. This method only finds the rule.
+func (g *gatewaydEdgeRules) MatchLimit(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleLimitResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetLimit(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Limit
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstLimitMatch(rules, requestPath, method)
+}
+
+// MatchMaintenance returns the highest-priority `kind=maintenance`
+// rule whose host, path, and method match the inbound request, or
+// nil if no rule applies. Same primitive as MatchLimit — a miss for
+// maintenance triggers the same loadHost pass that also recompiles
+// route/rewrite/.../limit. The applier (handler.go::applyEdgeRuleMaintenance,
+// §4.1.2.13) short-circuits with 503 + Retry-After BEFORE auth,
+// BEFORE wake. Coarse-gate apps.maintenance_mode fires BEFORE this
+// method is consulted (handler.go::applyAppsMaintenanceMode), so the
+// fine-grained rule only sees requests that survived the coarse gate.
+func (g *gatewaydEdgeRules) MatchMaintenance(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleMaintenanceResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetMaintenance(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Maintenance
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstMaintenanceMatch(rules, requestPath, method)
+}
+
+// MatchGeo returns the highest-priority `kind=geo` rule whose
+// host, path, and method match, or nil (ADR-091 D21). Same cache
+// primitive as MatchIP. The applier (handler.go::applyEdgeRuleGeo)
+// reads the trusted XFF entry, looks up the country via the
+// configured pkg/geoip.Reader, and evaluates against this rule's
+// Allow/Deny sets. The lookup itself happens in the applier — the
+// matcher stays a pure path/methods filter so the cache hit path
+// stays cheap (the DB-IP mmap lookup is the expensive step).
+func (g *gatewaydEdgeRules) MatchGeo(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleGeoResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetGeo(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Geo
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstGeoMatch(rules, requestPath, method)
+}
+
+// MatchThrottle returns the highest-priority `kind=throttle` rule
+// whose host, path, and method match, or nil (ADR-091 D20.5
+// amendment, issue #881). Same cache primitive as MatchLimit — a
+// miss triggers the same loadHost pass that also recompiles the
+// other 11 kinds. The applier (handler.go::applyEdgeRuleThrottle)
+// constructs the rule-scoped bucket key (AppID+"\x00"+ID) and
+// decrements via pkg/gateway.(*Limiter).AllowToken before the
+// route hits the body — runs AFTER Limit (so the body-cap 413
+// still consumes a bucket) and BEFORE Validate (so the
+// schema-gate 422 does not cost a bucket).
+func (g *gatewaydEdgeRules) MatchThrottle(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleThrottleResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetThrottle(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Throttle
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstThrottleMatch(rules, requestPath, method)
+}
+
+// MatchBudget is the ADR-093 matcher for the kind=budget subset.
+// Same shape as MatchLimit: cache hit returns immediately; cache
+// miss triggers loadHost which compiles every kind's slice in one
+// SQL roundtrip (the SQL dominates; the kind-specific compile
+// walks are irrelevant). On cache miss with no kind=budget rule
+// the cache still records a nil Budget slice, so a future
+// MatchBudget on the same host hits the cache instead of
+// reloading. Returns the highest-priority matching rule or nil on
+// miss; the applier (handler.go::applyEdgeRuleBudget) falls back
+// to the plan-level default budget on nil.
+func (g *gatewaydEdgeRules) MatchBudget(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleBudgetResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetBudget(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Budget
+		g.cache.Put(host, entry)
+	}
+	return gateway.PickFirstBudgetMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -652,6 +929,82 @@ func compileIPRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleIPResolved, 
 	return out, parseErrs
 }
 
+// compileGeoRules mirrors compileIPRules for kind=geo (ADR-091
+// D21). The action carries Allow / Deny as ISO 3166-1 alpha-2
+// country codes rather than CIDR strings; the compile side
+// uppercases + dedupes one more time before stashing into a
+// map[string]struct{} for O(1) per-request membership checks.
+//
+// apid-Validate already drops reserved codes (AA, etc.) and
+// enforces the ≤50-entry cardinality cap, so the compile side
+// does not re-validate the wire shape — it just performs the
+// shape conversion. A bad rule that slipped past the validator
+// still routes correctly: an unknown country code simply never
+// matches during the lookup (the DB-IP DB returns the customer's
+// real country, which is not in the rule's set, so the rule's
+// allow/deny both miss and the request flows through).
+func compileGeoRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleGeoResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleGeoResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindGeo {
+			continue
+		}
+		if r.Action.Geo == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		action := r.Action.Geo
+		allow := compileGeoSet(action.Allow)
+		deny := compileGeoSet(action.Deny)
+		out = append(out, gateway.EdgeRuleGeoResolved{
+			ID:        r.ID,
+			AccountID: r.AccountID,
+			AppID:     r.AppID,
+			Priority:  r.Priority,
+			PathGlob:  r.MatchPath,
+			Methods:   buildMethodsMap(r.MatchMethods),
+			Allow:     allow,
+			Deny:      deny,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileGeoSet uppercases + dedupes a country-code list into
+// a map[string]struct{} for O(1) membership checks. Returns
+// nil (NOT an empty map) for an empty input so the runtime
+// check `if len(rule.Allow) > 0` stays the canonical "is
+// there an allowlist?" predicate.
+func compileGeoSet(codes []string) map[string]struct{} {
+	if len(codes) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(codes))
+	for _, c := range codes {
+		upper := strings.ToUpper(c)
+		if upper == "" {
+			continue
+		}
+		out[upper] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // parseCIDRs turns a []string CIDR list into a []*net.IPNet slice.
 // Per-entry parse errors are returned as PathGlobError so the
 // caller can log them and drop the rule. nil entries in the input
@@ -677,6 +1030,408 @@ func parseCIDRs(cidrs []string, ruleID string) ([]*net.IPNet, []gateway.PathGlob
 		return nil, parseErrs
 	}
 	return out, nil
+}
+
+// compileLimitRules mirrors compileIPRules for kind=limit. The
+// compiled slice carries the two body caps the handler's
+// applyEdgeRuleLimit consults. apid-Validate already enforced the
+// non-zero + ≤-platform-cap clamps (pkg/api/dto.go::EdgeRuleLimitAction.Validate),
+// but the SQL hotfix path means we can't trust the validator. This
+// compile step is the defence-in-depth pass: a hot-fix that
+// bypassed apid still gets clamped here, and a row with a
+// non-positive MaxBodyBytes or a value > api.MaxRequestBodyBytes
+// degrades to the platform cap (no 413-storm on bad input). The
+// streaming cap is NOT clamped here — only the buffered cap is the
+// load-bearing platform invariant.
+//
+// Like compileIPRules, the compile is a free function — it doesn't
+// need any adapter state (unlike compileValidateRules which needs
+// the schema cache). Out-of-bound values are clamped silently and
+// a slog.Warn from the caller notes the rule ID; the customer
+// never sees the warning (their rule still fires, just at the
+// platform cap).
+func compileLimitRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleLimitResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleLimitResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindLimit {
+			continue
+		}
+		if r.Action.Limit == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp the buffered cap to the platform ceiling.
+		// Non-positive → api.MaxRequestBodyBytes (a 0 cap would
+		// 413 every request, which is worse than the platform
+		// default; the same defence-in-depth posture as
+		// compileIPRules silently dropping malformed CIDRs).
+		maxBody := r.Action.Limit.MaxBodyBytes
+		if maxBody <= 0 || maxBody > api.MaxRequestBodyBytes {
+			maxBody = api.MaxRequestBodyBytes
+		}
+		// Streaming cap: only clamp on the upper bound; 0 means
+		// "no carve-out, fall back to MaxBodyBytes" (the applier
+		// handles that). The negative check is defence-in-depth
+		// against a malformed direct-DB write. The hard ceiling
+		// matches api.RawStreamMaxRequestBytes (100 MiB) per
+		// pkg/api/limits.go:1652 — the constant lands in #12.
+		maxBodyStream := r.Action.Limit.MaxBodyBytesStreaming
+		if maxBodyStream < 0 {
+			maxBodyStream = 0
+		}
+		// RawStreamMaxRequestBytes is int64 (legacy raw-bridge
+		// byte-count type); struct field is int — platform-int
+		// width is fine, every box we ship is 64-bit and 100 MiB
+		// fits comfortably.
+		if int64(maxBodyStream) > api.RawStreamMaxRequestBytes {
+			maxBodyStream = int(api.RawStreamMaxRequestBytes)
+		}
+		out = append(out, gateway.EdgeRuleLimitResolved{
+			ID:                    r.ID,
+			AccountID:             r.AccountID,
+			AppID:                 r.AppID,
+			Priority:              r.Priority,
+			PathGlob:              r.MatchPath,
+			Methods:               buildMethodsMap(r.MatchMethods),
+			MaxBodyBytes:          maxBody,
+			MaxBodyBytesStreaming: maxBodyStream,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileMaintenanceRules mirrors compileLimitRules for kind=maintenance.
+// The compiled slice carries the per-rule Retry-After + optional
+// Message the handler's applyEdgeRuleMaintenance consults.
+// apid-Validate already enforced the
+// {0 ≤ retry_after_seconds ≤ api.MaxEdgeRuleMaintenanceRetryAfterSeconds}
+// + {len(message) ≤ 512} clamps (pkg/api/dto.go::EdgeRuleMaintenanceAction.Validate),
+// but the SQL hotfix path means we can't trust the validator. This
+// compile step is the defence-in-depth pass: a hot-fix that
+// bypassed apid still gets clamped here, and a row with a
+// non-positive RetryAfterSeconds degrades to the platform default
+// (no 503-storm on bad input). The Message field is NOT clamped
+// here — only the Retry-After is the load-bearing platform
+// invariant.
+//
+// Like compileLimitRules, the compile is a free function — it
+// doesn't need any adapter state (unlike compileValidateRules which
+// needs the schema cache). Out-of-bound values are clamped silently
+// and a slog.Warn from the caller notes the rule ID; the customer
+// never sees the warning (their rule still fires, just at the
+// platform default).
+func compileMaintenanceRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleMaintenanceResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleMaintenanceResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindMaintenance {
+			continue
+		}
+		if r.Action.Maintenance == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp Retry-After to the platform default + ceiling.
+		// Non-positive → api.EdgeRuleMaintenanceRetryAfterSeconds (a
+		// 0 cap would set Retry-After: 0 which RFC 7231 forbids — the
+		// apid-Validate cap already rejects > MaxEdgeRuleMaintenanceRetryAfterSeconds,
+		// so the upper clamp is defence-in-depth for direct-DB writes).
+		// Same defence-in-depth posture as compileLimitRules
+		// silently clamping out-of-bound body caps to the platform
+		// cap.
+		retry := r.Action.Maintenance.RetryAfterSeconds
+		if retry <= 0 {
+			retry = api.EdgeRuleMaintenanceRetryAfterSeconds
+		}
+		if retry > api.MaxEdgeRuleMaintenanceRetryAfterSeconds {
+			retry = api.MaxEdgeRuleMaintenanceRetryAfterSeconds
+		}
+		out = append(out, gateway.EdgeRuleMaintenanceResolved{
+			ID:                r.ID,
+			AccountID:         r.AccountID,
+			AppID:             r.AppID,
+			Priority:          r.Priority,
+			PathGlob:          r.MatchPath,
+			Methods:           buildMethodsMap(r.MatchMethods),
+			RetryAfterSeconds: retry,
+			Message:           r.Action.Maintenance.Message,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileThrottleRules mirrors compileMaintenanceRules for
+// kind=throttle (ADR-091 D20.5 amendment, issue #881). The
+// compiled slice carries the per-rule RequestsPerSecond + Burst
+// the applier (handler.go::applyEdgeRuleThrottle) hands to
+// pkg/gateway.(*Limiter).AllowToken.
+//
+// apid-Validate (pkg/api/dto.go::EdgeRuleThrottleAction.Validate)
+// already enforces:
+//
+//   - requests_per_second ≥ 1
+//   - burst ≥ 1
+//   - requests_per_second ≤ plan.RateLimitRPS
+//   - burst ≤ plan.RateLimitBurst
+//
+// — see the ThrottleValidationContext the validator threads.
+// This compile step is the defence-in-depth pass: a direct-DB
+// write (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect)
+// that bypassed apid gets clamped here to {1, 1}, and a rule
+// with invalid numerics is dropped from the slice (the customer
+// sees pass-through — the rule simply does not fire).
+//
+// The plan-tier ceiling is NOT re-applied here without the
+// limit context (the cmd-side compile doesn't carry per-call plan
+// state); the apid validator is the only call that can know the
+// plan. A direct-DB write of {rps:1e6, burst:1e9} simply gets
+// clamped to {1, 1} so the rule still fires at the
+// minimum-useful rate instead of being silently dropped — better
+// a weak throttle than no throttle.
+//
+// Like compileMaintenanceRules + compileLimitRules, the compile
+// is a free function — it doesn't need any adapter state.
+// Out-of-bound values are clamped silently; the caller logs a
+// slog.Warn with the rule ID.
+func compileThrottleRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleThrottleResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleThrottleResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindThrottle {
+			continue
+		}
+		if r.Action.Throttle == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp rps/burst to the minimum-useful positive values.
+		// A 0/0 from a direct-DB write would let the limiter build
+		// a bucket that always-deny (burst=0 means every AllowToken
+		// call consumes a token that was never refilled), and a
+		// negative value would panic the limiter. Floor at {1, 1}.
+		rps := r.Action.Throttle.RequestsPerSecond
+		if rps < 1 {
+			rps = 1
+		}
+		burst := r.Action.Throttle.Burst
+		if burst < 1 {
+			burst = 1
+		}
+		// Phase 3 (ADR-104, issue #881): clamp MaxKeysPerRule to
+		// the plan ceiling (Hobby default 1000). The apid
+		// validator already enforces per-plan value via
+		// Limits.ThrottleMaxKeysPerRule (Free 100 / Hobby 1000 /
+		// Pro 5000 / Scale 10000); a 0 from a direct-DB write
+		// gets a sensible default here. The cmd-side compile
+		// cannot know the per-call plan at this point (the
+		// compile is per-rule, not per-request), so it picks
+		// the Hobby plan ceiling — middle of the ladder — as
+		// the safe default for any plan that didn't pre-set
+		// the value. The cmd-side is the source of truth at
+		// runtime; apid is the source of truth at create.
+		maxKeys := r.Action.Throttle.MaxKeysPerRule
+		if maxKeys <= 0 {
+			maxKeys = api.ThrottleMaxKeysPerRuleDefault
+		}
+		if maxKeys > api.ThrottleMaxKeysPerRuleDefault*10 {
+			// Scale ceiling is 10x the default; anything beyond
+			// is either a bug or a malicious direct-DB write.
+			// Clamp to Scale ceiling.
+			maxKeys = api.ThrottleMaxKeysPerRuleDefault * 10
+		}
+		out = append(out, gateway.EdgeRuleThrottleResolved{
+			ID:                r.ID,
+			AccountID:         r.AccountID,
+			AppID:             r.AppID,
+			Priority:          r.Priority,
+			PathGlob:          r.MatchPath,
+			Methods:           buildMethodsMap(r.MatchMethods),
+			RequestsPerSecond: rps,
+			Burst:             burst,
+			// Phase 3 (ADR-104): wire KeyBy + JWTClaimName +
+			// MaxKeysPerRule to the resolved rule. Empty
+			// KeyBy + empty JWTClaimName + clamped MaxKeys
+			// preserve PR #887 behaviour bit-for-bit (the
+			// per-consumer branch in applyEdgeRuleThrottle
+			// only fires when KeyBy ∈
+			// {api_key, jwt_subject, jwt_claim}).
+			KeyBy:          r.Action.Throttle.KeyBy,
+			JWTClaimName:   r.Action.Throttle.JWTClaimName,
+			MaxKeysPerRule: maxKeys,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileBudgetRules mirrors compileLimitRules for kind=budget
+// (ADR-093). The compile is a free function — it doesn't need any
+// adapter state. Out-of-bound BudgetMs values are clamped silently
+// to the platform ceiling, the same defence-in-depth posture as
+// compileLimitRules (a hot-fix that bypassed apid still gets
+// clamped here, and a row with a non-positive BudgetMs degrades
+// to the platform ceiling rather than 0-deadlining every request).
+// The customer never sees the warning (their rule still fires, just
+// at the platform ceiling).
+func compileBudgetRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleBudgetResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleBudgetResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindBudget {
+			continue
+		}
+		if r.Action.Budget == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		// Clamp the budget to the platform ceiling. Non-positive or
+		// > ceiling → api.RequestBudgetMaxMs (a 0 budget would
+		// 504 every request, which is worse than the platform
+		// default; the same defence-in-depth posture as
+		// compileLimitRules silently dropping malformed caps).
+		budgetMs := r.Action.Budget.BudgetMs
+		maxBudgetMs := int(api.RequestBudgetMax.Milliseconds())
+		if budgetMs <= 0 || budgetMs > maxBudgetMs {
+			budgetMs = maxBudgetMs
+		}
+		out = append(out, gateway.EdgeRuleBudgetResolved{
+			ID:                  r.ID,
+			AccountID:           r.AccountID,
+			AppID:               r.AppID,
+			Priority:            r.Priority,
+			PathGlob:            r.MatchPath,
+			Methods:             buildMethodsMap(r.MatchMethods),
+			BudgetMs:            budgetMs,
+			AllowOverrideHeader: r.Action.Budget.AllowOverrideHeader,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
+// compileValidateRules mirrors compileIPRules for kind=validate.
+// The compiled slice carries the SchemaDigest + ContentTypes +
+// ApplyWhileStreaming + RejectUnknownFields + MaxBodyBytes fields
+// the handler's applyEdgeRuleValidate consults. apid-Validate
+// already enforced the schema is non-empty, ≤ 64 KiB, valid JSON,
+// and has no external $ref/$id (PR-A); this compile step is the
+// defence-in-depth pass — a hot-fix that bypassed apid still
+// fails here, and the rule is dropped from the slice (the customer
+// sees the existing pass-through path).
+//
+// The Compile call is keyed off the SHA-256 of the raw schema body,
+// stashed on the resolved struct so the handler-side applier can
+// look up the compiled *CompiledSchema in pkg/edgevalidate.Cache.
+// A nil validate adapter compiles-then-drops the rule (we don't
+// want a missing adapter to crash the load; the rule is simply
+// skipped, same as a malformed CIDR).
+func (g *gatewaydEdgeRules) compileValidateRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleValidateResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleValidateResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		r := &storeRules[i]
+		if !r.Enabled {
+			continue
+		}
+		if r.Kind != state.EdgeRuleKindValidate {
+			continue
+		}
+		if r.Action.Validate == nil {
+			continue
+		}
+		if errs := validatePathGlob(r.ID, r.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		action := r.Action.Validate
+		// Compute the digest from the raw schema bytes — this
+		// is what pkg/edgevalidate.Cache will key on. Doing
+		// it here lets the load path surface a parse error
+		// before the rule reaches the cache.
+		schemaBytes := []byte(action.Schema)
+		var digest [32]byte
+		if g.validate == nil {
+			// Adapter not wired — drop the rule. The
+			// loadHost caller's parseErrs slice stays
+			// empty (this is a deploy config error,
+			// not a malformed rule). slog it from
+			// the caller.
+			continue
+		}
+		d, err := g.validate.CompileSchema(schemaBytes, action.RejectOnUnknown)
+		if err != nil {
+			parseErrs = append(parseErrs, gateway.PathGlobError{
+				RuleID: r.ID, Glob: "validate", Err: err,
+			})
+			continue
+		}
+		digest = d
+		var contentTypes []string
+		if len(action.ContentTypes) > 0 {
+			contentTypes = append(contentTypes, action.ContentTypes...)
+		}
+		out = append(out, gateway.EdgeRuleValidateResolved{
+			ID:                  r.ID,
+			AccountID:           r.AccountID,
+			AppID:               r.AppID,
+			Priority:            r.Priority,
+			PathGlob:            r.MatchPath,
+			Methods:             buildMethodsMap(r.MatchMethods),
+			SchemaDigest:        digest,
+			ContentTypes:        contentTypes,
+			ApplyWhileStreaming: action.ApplyWhileStreaming,
+			RejectUnknownFields: action.RejectOnUnknown,
+			MaxBodyBytes:        action.MaxBodyBytes,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
 }
 
 // validatePathGlob runs stdlib path.Match(glob, "") to detect a

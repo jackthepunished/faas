@@ -106,7 +106,7 @@ func (d *VMMDriver) Close() error {
 
 // Spawn materialises the per-VM drive1, cold-boots the VM, and returns a
 // BuildHandle the caller can pass to WaitForCompletion. The VM base is
-// d.builderBase; drive1 is a throwaway 8 GiB ext4 that carries BuildManifest
+// d.builderBase; drive1 is a throwaway 24 GiB ext4 that carries BuildManifest
 // at /etc/faas/build.json; the produced OCI tarball comes back through
 // ExportDir during Destroy.
 //
@@ -179,6 +179,11 @@ func (d *VMMDriver) Spawn(ctx context.Context, req VMRequest) (BuildHandle, erro
 			MemSizeMib: int32(api.BuildVMRAMMB),
 		},
 		Build: &vmmdpb.BuildSpec{ExportDir: buildExportDir},
+		// Issue #301 / ADR-043: vmmd validates Plan on every cold
+		// boot and routes the VM into the per-plan cgroup slice.
+		// The legacy empty value is rejected.
+		Plan:      req.Plan,
+		AccountId: req.TenantID,
 	})
 	if err != nil {
 		os.Remove(drive1Path)
@@ -224,8 +229,15 @@ func (d *VMMDriver) WaitForCompletion(ctx context.Context, h BuildHandle) (Build
 	// vmmd's Destroy blocks until firecracker exits AND has exported drive1
 	// (the proto contract — see pkg/vmmdgrpc/server.go::Destroy). The
 	// deadline covers the build's wall-clock budget plus headroom for the
-	// snapshot_prime handshake the caller may run after us.
-	deadline := time.Duration(h.TimeoutSec+60) * time.Second
+	// host-side export. A builder drive is a large ext4 scratch image; after
+	// guest poweroff, loopback setup may have to flush several GiB before the
+	// read-only mount can complete. Keep that export headroom separate from
+	// the guest's own build timeout so a timed-out build still reaches a
+	// durable build-done marker instead of becoming an infra error.
+	// The guest starts its build clock after VM boot and BuildKit readiness;
+	// leave enough time for that deadline plus vmmd's artifact export. The VMM
+	// also enforces the same builder-only headroom in DestroyWithExport.
+	deadline := time.Duration(h.TimeoutSec+600) * time.Second
 	dctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	resp, err := d.cli.Destroy(dctx, &vmmdpb.DestroyRequest{Instance: h.Instance})
@@ -258,7 +270,7 @@ func (d *VMMDriver) WaitForCompletion(ctx context.Context, h BuildHandle) (Build
 
 // runJanitor scans d.driveDir for *.ext4 older than 1h and removes them.
 // Best-effort: no error returned. Per the plan's Risks, vmmd crashes
-// between boot and destroy would otherwise leak 8 GiB scratch files; this
+// between boot and destroy would otherwise leak 24 GiB scratch files; this
 // is the cheap, conservative cleanup.
 func (d *VMMDriver) runJanitor() {
 	cutoff := time.Now().Add(-1 * time.Hour)

@@ -84,6 +84,37 @@ func TestConfig_ResolveListenTarget(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_NodeNameDefaultsEmpty pins the issue #678 / ADR-093
+// PR-0 surface for githubd. Empty default = single-box dev back-compat.
+// PR-B reads this field at startup and constructs PGNodeVerifier when
+// non-empty.
+func TestLoadConfig_NodeNameDefaultsEmpty(t *testing.T) {
+	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatalf("missing file: %v", err)
+	}
+	if cfg.NodeName != "" {
+		t.Errorf("NodeName = %q, want empty (single-box default)", cfg.NodeName)
+	}
+}
+
+// TestLoadConfig_NodeNameRoundTrip pins the toml round-trip for the
+// githubd node_name field (also reused for the bridge dialer in PR-C1).
+func TestLoadConfig_NodeNameRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "githubd.toml")
+	body := `node_name = "fsn-1-githubd"` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.NodeName != "fsn-1-githubd" {
+		t.Errorf("NodeName = %q, want %q", cfg.NodeName, "fsn-1-githubd")
+	}
+}
+
 func TestConfig_LoadServerTLS(t *testing.T) {
 	c := &Config{}
 	tls, err := c.LoadServerTLS()

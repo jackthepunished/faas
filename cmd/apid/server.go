@@ -53,6 +53,17 @@ type server struct {
 	// githubd is apid's handle to the githubd daemon (ADR-012). Never nil:
 	// slice 1 default is stubGithubdClient; slice 7 swaps for a live dial.
 	githubd GithubdClient
+	// gatewaydControlURL (ADR-093) is the loopback URL apid uses
+	// to reach gatewayd-internal's control listener
+	// (default http://127.0.0.1:9090). Only the /v1/internal/apps/{slug}/routes
+	// endpoint is dialled today; the quota endpoint at
+	// /v1/internal/quota has no apid-side caller yet so it's
+	// still operator-curl-only. Empty disables the reverse-
+	// proxy path; getAppRoutes surfaces
+	// X-Faas-Routes-State: unavailable so the dashboard
+	// distinguishes "gatewayd not reachable" from "no traffic
+	// yet". Set via env FAAS_GATEWAYD_CONTROL_URL at boot.
+	gatewaydControlURL string
 	// events is the in-process broadcaster the SSE handlers read from
 	// (slice 5/6). nil falls back to a fresh one so callers can defer
 	// initialization in unit tests.
@@ -191,6 +202,15 @@ type server struct {
 	// sees rekey_no_identities instead of the misleading
 	// "set FAAS_REKEY_ENABLED and restart" detail.
 	rekeyRunnerOptedIn bool
+	// dataPlacementEnabled (ADR-098 PR-B / C4) is the per-PR
+	// feature flag (FAAS_DATA_PLACEMENT=1) that gates the
+	// data-upstream handler family
+	// (GET/PUT/DELETE /v1/apps/{slug}/upstreams[...]).
+	// Default false keeps the v1 byte-for-byte posture — the
+	// PR-A pg_notify trigger still fires but no handler reads
+	// from it. Wired via WithDataPlacement from
+	// cmd/apid/main.go::dataPlacementEnabledFromEnv.
+	dataPlacementEnabled bool
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -407,6 +427,33 @@ func (s *server) WithOAuthConfig(cfg auth.SignInConfig) *server {
 // pkg/builderd.Builderd.
 func (s *server) WithEventsPlatform(p *events.Platform) *server {
 	s.eventsPlatform = p
+	return s
+}
+
+// WithDataPlacement (ADR-098 PR-B / C4) attaches the per-PR
+// feature flag (FAAS_DATA_PLACEMENT=1) that gates the
+// data-upstream handler family. Default false preserves the
+// pre-PR-B byte-for-byte posture. Wired once at boot from
+// cmd/apid/main.go::dataPlacementEnabledFromEnv. Mirrors the
+// WithBillingProvider / WithOpsMetrics chain-method style so
+// existing positional call sites in tests don't need editing.
+func (s *server) WithDataPlacement(enabled bool) *server {
+	s.dataPlacementEnabled = enabled
+	return s
+}
+
+// WithGatewaydControlURL (ADR-093) attaches the loopback URL
+// apid uses to reach gatewayd-internal's control listener
+// (/v1/internal/apps/{slug}/routes). Default
+// http://127.0.0.1:9090 matches gatewayd-internal's default
+// control bind (see pkg/gateway/control.go ControlAddr);
+// production overrides via FAAS_GATEWAYD_CONTROL_URL when the
+// daemons are split across nodes (cross-box deployments will
+// need the public-facing reverse-proxy to terminate mTLS before
+// reaching gatewayd-internal's control mux — out of scope for
+// this PR; same-box is the only supported posture today).
+func (s *server) WithGatewaydControlURL(url string) *server {
+	s.gatewaydControlURL = url
 	return s
 }
 
@@ -783,6 +830,32 @@ func (s *server) handler() http.Handler {
 	// cross-account slug is a 404, not a 200 with another tenant's
 	// data.
 	mux.HandleFunc("GET /v1/apps/{slug}/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppMetrics)))
+	// ADR-093: per-route observability reader. Same auth chain
+	// as /v1/apps/{slug}/metrics (read-only, no MFA, primary
+	// caller is an API key with ScopesReadSurface). The handler
+	// reverse-proxies to gatewayd-internal's control listener
+	// /v1/internal/apps/{slug}/routes via the existing
+	// apidProxy hop. IDOR-safe via loadApp — cross-account slug
+	// is a 404, not a 200 with another tenant's route labels
+	// (a customer who shouldn't see a route set on app X
+	// cannot enumerate it through this endpoint).
+	mux.HandleFunc("GET /v1/apps/{slug}/routes", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppRoutes)))
+	// ADR-091 D20.5 amendment / issue #881 — per-route throttle
+	// recommender (Phase 1). Read-only, no MFA, primary caller is
+	// an API key with ScopesReadSurface. IDOR-safe via loadApp —
+	// cross-account slug is a 404, not a 200 with another tenant's
+	// per-route observations. The recommender is ADVICE-ONLY — it
+	// never auto-applies; customers confirm via POST
+	// /v1/apps/{slug}/edge-rules.
+	mux.HandleFunc("GET /v1/apps/{slug}/throttle-suggestions", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppThrottleSuggestions)))
+	// ADR-102 D6 — per-app streaming-cap probe. Read-only, no MFA,
+	// primary caller is an API key with ScopesReadSurface. IDOR-safe
+	// via loadApp (cross-account slug → 404, not 200 with another
+	// tenant's streaming-cap data — leaking cap data lets a
+	// customer probe another tenant's plan tier). See
+	// handlers_streaming_cap.go for the full decision tree and the
+	// deliberate non-dial to gatewayd-internal.
+	mux.HandleFunc("GET /v1/apps/{slug}/streaming-cap", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppStreamingCap)))
 	// Account-scoped metrics rollup (issue #393). One call replaces
 	// N per-app /v1/apps/{slug}/metrics calls. Same auth chain as
 	// the per-app endpoint (read-only, no MFA). Cross-account
@@ -796,6 +869,15 @@ func (s *server) handler() http.Handler {
 	// caller is an API key with ScopesReadSurface. IDOR-safe
 	// via loadApp (cross-account slug → 404).
 	mux.HandleFunc("GET /v1/apps/{slug}/slo", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppSLO)))
+	// ADR-096 / PR-B — customer-facing automatic error
+	// grouping. Read-only, no MFA, primary caller is an API key
+	// with ScopesReadSurface. IDOR-safe via loadApp
+	// (cross-account slug → 404, byte-identical to a real 404).
+	// The three handlers delegate sqlc → wire DTO conversion to
+	// handlers_app_errors_projection.go.
+	mux.HandleFunc("GET /v1/apps/{slug}/errors/summary", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppErrorsSummary)))
+	mux.HandleFunc("GET /v1/apps/{slug}/errors/{fingerprint}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listAppErrorRequests)))
+	mux.HandleFunc("GET /v1/apps/{slug}/errors/{fingerprint}/first", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppErrorSample)))
 	// Issue #696 / ADR-082 — account-scoped SLO rollup. Flat
 	// scalar responses (Billing-derivable instance_hours /
 	// gb_hours), so the auth chain matches /v1/usage (MFA +
@@ -821,6 +903,21 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PUT /v1/apps/{slug}/trusted_signers/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.upsertTrustedSigner))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/trusted_signers/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.deleteTrustedSigner))))
 
+	// Issue #879 / ADR-100 PR-C — tenant surfaces (customer-facing
+	// hostname routing primitive). Feature-flagged via
+	// api.TenantSurfacesEnabled(); the flag check runs inside each
+	// handler so the routes 402 (not 404) when the operator has
+	// not yet enabled the cluster-side surface. Auth chain mirrors
+	// the closest precedent (custom_domains at server.go:986):
+	// authLimited → requireMFA → requireScope(deploy:write) for
+	// mutators, requireScope(read) for the list/get.
+	mux.HandleFunc("GET /v1/apps/{slug}/tenant-surfaces", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTenantSurfaces))))
+	mux.HandleFunc("POST /v1/apps/{slug}/tenant-surfaces", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createTenantSurface)))))
+	mux.HandleFunc("GET /v1/apps/{slug}/tenant-surfaces/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getTenantSurface))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/tenant-surfaces/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteTenantSurface))))
+	mux.HandleFunc("POST /v1/apps/{slug}/tenant-surfaces/{id}/hostnames", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.addTenantHostname)))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.removeTenantHostname))))
+
 	// Deployments.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))
 	// DEPLOY-PROV-4 / ADR-092 / issue #739 — headless source-ref
@@ -831,6 +928,15 @@ func (s *server) handler() http.Handler {
 	// githubd gRPC bridge (cmd/apid/githubd_client.go) and streams
 	// the upstream tarball straight into validateAndSpool.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments/source-ref", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.handleSourceRefDeploy)))))
+	// PR-1 of the deploy-diff cluster — server-side pre-deploy
+	// preview. Read-only (no DB writes, no audit row, no deployment
+	// row), so the auth chain matches GET /v1/apps/{slug}/metrics
+	// (server.go:785): authLimited → requireScope(ScopesReadSurface)
+	// with NO requireMFA. A CI key with `apps:read` is sufficient;
+	// typical deploy-write keys also pass (ScopeAdmin covers the
+	// read surface). Cross-account isolation is via loadApp at
+	// handlers_diff.go:diffApp.
+	mux.HandleFunc("POST /v1/apps/{slug}/diff", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.diffApp)))
 	mux.HandleFunc("GET /v1/deployments/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeployment))))
 	// Per-deploy grype scan drill-down (issue #464 / ADR-055).
 	// Returns the typed api.ScanResult envelope (status,
@@ -838,6 +944,11 @@ func (s *server) handler() http.Handler {
 	// not-yet-scanned or cross-account; IDOR posture
 	// identical to getDeployment above.
 	mux.HandleFunc("GET /v1/deployments/{id}/scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentScan))))
+	// PR-A: per-deploy image-layer secret-scan audit surface.
+	// Mirrors /scan — same auth chain (authLimited + requireMFA +
+	// read scope), same IDOR posture (cross-account → 404), same
+	// 404-on-pending drilldown shape.
+	mux.HandleFunc("GET /v1/deployments/{id}/secret-scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentSecretScan))))
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamDeploymentLogs))))
 	// Issue #557 closure / ADR-072 — PATCH the per-deployment floor
 	// (MinInstances). Reuses the deploy-write scope (the only mutable
@@ -917,6 +1028,13 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/crons", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createCron)))))
 	mux.HandleFunc("PATCH /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateCron))))
 	mux.HandleFunc("DELETE /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteCron))))
+	// Single-cron read (issue #791 PR-E / ADR-090 closure). Backs
+	// `gregale crons info <id>` and any dashboard drill-down. Read
+	// surface plus requireMFA — keeps the crons family consistent:
+	// listCrons, listCronRuns, fireCronNow, createCron, updateCron,
+	// deleteCron all use requireMFA, so getCron is the lone exception
+	// if we skip it. code-review finding A4.
+	mux.HandleFunc("GET /v1/crons/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getCron))))
 	// Per-cron execution history (issue #791). Read surface, so
 	// ScopesReadSurface and no idempotency wrapper.
 	mux.HandleFunc("GET /v1/crons/{id}/runs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCronRuns))))
@@ -1061,6 +1179,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/accounts/{id}/credits",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.issueCredit))))
 
+	// PR-D / ADR-012 §7 amendment: per-tenant GitHub App webhook
+	// secret rotation. Same two-layer gate as issueCredit (scope +
+	// email allowlist inside the handler) so a leaked admin key
+	// from a non-operator account cannot rotate another tenant's
+	// webhook secret.
+	mux.HandleFunc("POST /v1/admin/github-webhook-secrets",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.handleSetGithubWebhookSecret)))
+
 	// PR-P3: operator-facing billing surface. Same two-layer gate as
 	// issueCredit above (scope + email allowlist inside the handler).
 	// The Paddle catalog handlers type-assert to paddle.OpProvider; on
@@ -1100,11 +1226,28 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListNodes))))
 	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/heartbeats",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeHeartbeats))))
+	// PR #4 (ADR-092 §3.6) — per-node wake-latency quantiles.
+	// Literal path /wake-latency sits before the SSE /events
+	// route; Go 1.22+ mux disambiguates by exact match.
+	mux.HandleFunc("GET /v1/admin/obs/nodes/wake-latency",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeWakeLatency))))
 	// PR #2 endpoints (ADR-091 §3.5 + §3.6). Same two-layer gate +
 	// MFA as PR #1. Anomalies reads usage_minutes only; rate-limits
 	// reads events + the in-process s.apiAuthLimiter snapshot.
 	mux.HandleFunc("GET /v1/admin/obs/anomalies",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsAnomalies))))
+	// PR #3 endpoints (ADR-091 §3.7). audit-log/search reads the
+	// FK-free audit_log table (the regulator-grade evidence path);
+	// events reads the live events table (the live diagnostic path);
+	// nodes/events is the SSE mirror of the (deprecated) old
+	// /v1/compute-nodes/events path. All three routes inherit the
+	// same two-layer gate + MFA chain as PR #1 + PR #2.
+	mux.HandleFunc("GET /v1/admin/obs/audit-log/search",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsAuditLogSearch))))
+	mux.HandleFunc("GET /v1/admin/obs/events",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsEvents))))
+	mux.HandleFunc("GET /v1/admin/obs/nodes/events",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodesEventsSSE))))
 	mux.HandleFunc("GET /v1/admin/obs/rate-limits",
 		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsRateLimits))))
 
@@ -1196,6 +1339,18 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps/{slug}/env", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listEnv)))
 	mux.HandleFunc("PUT /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.setEnv)))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/env/{key}", s.authLimited(s.requireScope(api.ScopesEnvWriteSurface...)(s.deleteEnv)))
+
+	// Data upstreams (ADR-098 §D4 / PR-B). The full handler family is
+	// gated on s.dataPlacementEnabled (FAAS_DATA_PLACEMENT=1); when
+	// the flag is off, each handler returns 402 plan_feature_gated so
+	// pre-PR-B callers see the exact same wire shape as before. The
+	// read endpoints (GET) use the read scope; the write endpoints
+	// (PUT/DELETE) use ScopesUpstreamWriteSurface, mirroring the env
+	// surface's split.
+	mux.HandleFunc("GET /v1/apps/{slug}/upstreams", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listUpstreams)))
+	mux.HandleFunc("GET /v1/apps/{slug}/upstreams/{id}", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getUpstream)))
+	mux.HandleFunc("PUT /v1/apps/{slug}/upstreams", s.authLimited(s.requireScope(api.ScopesUpstreamWriteSurface...)(s.createUpstream)))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/upstreams/{id}", s.authLimited(s.requireScope(api.ScopesUpstreamWriteSurface...)(s.deleteUpstream)))
 
 	// Usage.
 	// Usage endpoints are narrower than the read surface — a deploy-write
@@ -1293,7 +1448,7 @@ func (s *server) handler() http.Handler {
 	// CP-1: SSE stream on compute_node_changed. Operator-only,
 	// unfiltered (no per-account scoping — operators want raw
 	// fleet upserts, not the dashboard's mixed-workload feed).
-	mux.HandleFunc("GET /v1/compute-nodes/events", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.computeNodeEventsHandler))))
+	mux.HandleFunc("GET /v1/compute-nodes/events", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.withDeprecation(s.computeNodeEventsHandler)))))
 
 	// M7.5 SSE live-update (ADR-011). Handles session-cookie OR
 	// API-key auth itself — the cookie path is for the dashboard,
@@ -1453,6 +1608,17 @@ func (s *server) handler() http.Handler {
 	// ADR-077) cannot silently disable the customer's cap. The 5-minute
 	// TTL is the standard sensitive-op window (review finding #10).
 	mux.Handle("POST /dashboard/raise-overage-cap", s.dashboardChain(s.sessionAuth(s.requireStepUpHandler(5*time.Minute)(http.HandlerFunc(s.dashboardRaiseOverageCap)))))
+	// Issue #791 PR-E / ADR-090 closure — fire-now from the
+	// dashboard's cron section. Same CSRF-envelope shape as the
+	// form POSTs above (the form-render path in renderAppDetail
+	// mints the token via IssueForAuthenticated; the handler
+	// verifies via VerifyAuthenticated). No requireStepUp — a
+	// fire-now is the same intent as a cron firing on schedule,
+	// so the MFA-then-fire posture is correct, not step-up.
+	// Parses the cron id out of the URL slug inside the handler
+	// (Go 1.22+ mux needs concrete segment counts; the
+	// /crons/{id}/fire-now suffix is the path tail).
+	mux.Handle("POST /dashboard/apps/{slug}/crons/{id}/fire-now", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardFireCron))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires
@@ -1508,9 +1674,11 @@ func (s *server) handler() http.Handler {
 
 	// Loopback infra probe (issue #85). gatewayd-internal forwards /healthz to
 	// apid through the apidProxy chain, so this is what the
-	// deploy/digitalocean CD smoke test and deploy/digitalocean/
-	// bootstrap.sh health check actually hit on the public listener.
-	// No auth, no DB call — the daemon process being up is what we're
+	// deploy/digitalocean CD smoke test and the v1
+	// deploy/digitalocean/bootstrap.sh health check (RETIRED
+	// 2026-08-15 by issue #911 / PR-1; v2 path is PR-X `gregale
+	// secrets init`) actually hit on the public listener. No auth,
+	// no DB call — the daemon process being up is what we're
 	// asserting; richer readiness semantics (DB ping, etc.) belong
 	// in /readyz later. Mirrors pkg/gateway/control.go::ControlMux.
 	mux.HandleFunc("GET /healthz", s.healthz)

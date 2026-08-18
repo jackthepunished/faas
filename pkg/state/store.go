@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
@@ -26,6 +27,15 @@ var ErrNotFound = errors.New("state: not found")
 // handler boundary to api.ErrInvalidTrafficPercent (422) so the
 // HTTP response uses the canonical RFC 7807 code.
 var ErrInvalidTrafficPercent = errors.New("state: invalid traffic_percent")
+
+// ErrInvalidPreviewPrState is returned by SetPreviewPrState when the
+// requested state is outside the closed set
+// {open,closed,stale,torn_down}. The CHECK constraint
+// apps_preview_pr_state_chk (migration 00220) is the authoritative
+// gate, but the Go-side check lets the offending value ride in the
+// error message so an operator typo is diagnosable without a
+// Postgres round-trip. ADR-095 PR-C.
+var ErrInvalidPreviewPrState = errors.New("state: invalid preview_pr_state")
 
 // ErrTrafficPercentSumInvalid is the defensive backstop returned by
 // UpdateDeploymentTraffic when the post-write Σ invariant check
@@ -258,6 +268,45 @@ type PaddleOverageDedupeSchemaResult struct {
 	// `select count(*) filter (where state = …)` query.
 	PendingRows   int64
 	CompletedRows int64
+}
+
+// AppErrorGroup is the typed row produced by the
+// /v1/apps/{slug}/errors/summary endpoint (ADR-096). It mirrors
+// sqlc.ListAppErrorGroupsRow but uses stdlib uuid.UUID + time.Time
+// so handlers don't have to thread pgtype values through the
+// wire layer. PgStore converts at the boundary.
+type AppErrorGroup struct {
+	ID            uuid.UUID
+	Fingerprint   string
+	ErrorClass    string
+	Route         string
+	HTTPStatus    int32
+	Count         int64
+	RequestCount  int64
+	FirstSeenAt   time.Time
+	LastSeenAt    time.Time
+	SampleMessage string
+}
+
+// AppErrorRequestRow is the typed drill-down row for
+// /v1/apps/{slug}/errors/{fingerprint}.
+type AppErrorRequestRow struct {
+	ID            uuid.UUID
+	RequestID     uuid.UUID
+	ReceivedAt    time.Time
+	Route         string
+	HTTPStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  *uuid.UUID
+}
+
+// AppErrorSampleRow is the typed single-sample row for
+// /v1/apps/{slug}/errors/{fingerprint}/first.
+type AppErrorSampleRow struct {
+	AppErrorRequestRow
+	HeadersSample []byte // jsonb raw; handler parses to map[string]string
+	Redactions    []string
 }
 
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
@@ -936,6 +985,47 @@ type Store interface {
 	// call CountDeployedApps before this method (that's the bug).
 	CreateAppIfUnderQuota(ctx context.Context, app App, limits api.Limits) (App, error)
 	AppByID(ctx context.Context, id string) (App, error)
+	// PreviewAppsByParent (ADR-095 / issue #272) lists every
+	// preview app whose preview_of_slug matches the parent. Used
+	// by the dashboard's "preview environments" pane. Results are
+	// ordered by created_at DESC so the dashboard's newest-first
+	// display is free. Returns an empty slice (not an error) when
+	// the parent has no previews.
+	//
+	// Soft-deleted rows are filtered out — the teardown janitor's
+	// tombstone-aware sweep uses ListPreviewsForTeardown instead.
+	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
+	// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) returns
+	// preview rows the teardown janitor should consider this tick:
+	// every non-torn_down preview that is either in a terminal-ish
+	// PR state (closed / stale) or past its preview_expires_at TTL.
+	//
+	// Deliberately NOT filtered on status <> 'deleted': the janitor
+	// is the component that sets status='deleted', and it must be
+	// able to observe rows it has already tombstoned so a crash
+	// between the tombstone write and the preview_pr_state write
+	// is recoverable on the next tick. Callers that want the live
+	// customer-facing view want PreviewAppsByParent instead.
+	//
+	// `now` is passed rather than read from the DB clock so the
+	// janitor's test seam (and the e2e TTL case) can drive expiry
+	// without waiting 7 real days. maxPerTick bounds the sweep;
+	// <1 returns nil so a misconfigured caller is a no-op rather
+	// than a full-table scan. Ordered by preview_expires_at ASC
+	// (nulls last) so the most overdue rows are reaped first.
+	ListPreviewsForTeardown(ctx context.Context, now time.Time, maxPerTick int) ([]App, error)
+	// SetPreviewPrState (ADR-095 PR-C / issue #272) advances one
+	// preview row's lifecycle label. Returns the updated row, or
+	// ErrNotFound when no row matches the id.
+	//
+	// The value MUST satisfy PreviewPrStateIsValid — the SQL CHECK
+	// apps_preview_pr_state_chk is the authoritative gate, but
+	// implementations reject invalid values before touching the DB
+	// so a typo surfaces as a Go error rather than SQLSTATE 23514.
+	// Only preview rows (preview_of_slug <> '') are eligible; a
+	// production app id is ErrNotFound, so a bug in the janitor's
+	// query can never relabel a customer's live app.
+	SetPreviewPrState(ctx context.Context, appID, prState string) (App, error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and
@@ -1387,6 +1477,26 @@ type Store interface {
 	// whether to render the "Connect GitHub" button vs the bind list.
 	GitHubInstallForAccount(ctx context.Context, accountID string) (GitHubInstall, error)
 
+	// UpsertGithubWebhookSecret installs or rotates the per-tenant
+	// webhook secret for one GitHub App installation (PR-D / ADR-012
+	// §7 amendment). Idempotent on (installation_id): a fresh
+	// install INSERTs, a rotation ON CONFLICT DO UPDATE-set's
+	// secret_value + now() + upgraded_by. The PlatformSecret
+	// fallback at pkg/githubd/webhook_secret.go is unchanged — the
+	// row's absence means "use the platform secret" so this is the
+	// always-write path, never a delete.
+	//
+	// Returns the (upgraded_at, upgraded_by) stamp so the apid
+	// admin route can echo the row back without a follow-up
+	// SELECT.
+	UpsertGithubWebhookSecret(ctx context.Context, installationID int64, secret []byte, upgradedBy string) (time.Time, string, error)
+	// GetGithubWebhookSecret returns the raw bytes for the per-tenant
+	// row, or ErrNotFound if the install hasn't been migrated off the
+	// platform secret yet. Used by pkg/githubd's resolver cache;
+	// the resolver treats ErrNotFound as a fall-through to
+	// FAAS_GITHUB_WEBHOOK_SECRET rather than as an error.
+	GetGithubWebhookSecret(ctx context.Context, installationID int64) ([]byte, error)
+
 	// Deployments.
 	// CreateDeployment atomically inserts a new pending deployment row
 	// for the given app. When the app already has a pending or live
@@ -1426,6 +1536,19 @@ type Store interface {
 	// deployments_live_traffic_idx (migration 00162); MemStore
 	// iterates m.deployments filtered by status='live'.
 	LiveDeployments(ctx context.Context, appID string) ([]Deployment, error)
+	// LiveDeploymentForScope (ADR-091 / PR-D) returns the unique
+	// live deployment for (appID, scope). Backed by the partial
+	// UNIQUE index deployments_app_scope_live_uniq that PR-D
+	// adds in migration 00213 — at most one live row per
+	// (app_id, scope), so the read is deterministic. Returns
+	// ErrNotFound when no live deployment exists for the scope
+	// (the wake path should fall back to ErrNoDeployment, surfacing
+	// 404 from the gateway). Used by schedd Phase 1 wake when the
+	// caller passed an explicit deploymentID: read `dep.Scope`
+	// from the resolved deployment, then re-resolve the live
+	// row for that scope so the env overlay only contains that
+	// scope's rows.
+	LiveDeploymentForScope(ctx context.Context, appID, scope string) (Deployment, error)
 	// CountLiveInstancesByDeployment returns the number of instances
 	// currently in {WAKING, COLD_BOOTING, RUNNING} for the given
 	// deployment_id (issue #555 PR-6). The DeploymentCounterWatcher
@@ -1526,6 +1649,26 @@ type Store interface {
 	// 00135 makes this unreachable in practice, but the explicit
 	// error lets a misuse at the call site fail closed).
 	UpsertDeploymentScanResult(ctx context.Context, deploymentID string, scanResult []byte, status string) error
+
+	// UpsertDeploymentSecretFindings records the per-deploy secret-
+	// scan audit row (migrations/00221, secret-scan v2). Written by
+	// cmd/apid/secretscan.go when the server-side tree scan finds
+	// redactions needed (a 422 rejection). Mirror
+	// UpsertDeploymentScanResult's IDOR + idempotency contract:
+	// scoped to one deployment row, overwrites (not creates a second),
+	// and returns ErrNotFound when the row is missing so a misroute
+	// fails closed.
+	//
+	// findings is the marshalled JSON for the
+	// deployments.secret_findings jsonb column (the typed
+	// []api.SecretFinding list, including safe-snippet policy).
+	// scannedAt is set on every call so a future query "show me the
+	// deploys scanned in the last hour" has a typed timestamp. The
+	// scan_status on the deployment row is updated to
+	// 'complete_with_redactions' on a non-empty findings list — the
+	// apid-side caller passes that status so the pgstore stays
+	// schema-agnostic.
+	UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error
 
 	// Per-workload filesystem handles for sidecars (issue #463 /
 	// ADR-069 / PR-B). The PR-A surface (Deployment.Sidecars
@@ -1668,6 +1811,67 @@ type Store interface {
 	ListDomainsForAccount(ctx context.Context, accountID string) ([]CustomDomain, error)
 	MarkDomainVerified(ctx context.Context, domain string) error
 	DeleteCustomDomain(ctx context.Context, domain string) error
+
+	// Tenant surfaces (ADR-100; apid is sole writer to tenant_surfaces
+	// and tenant_hostnames). The pg_notify trigger
+	// (migrations/00243_tenant_surfaces.sql) bubbles mutations to
+	// gatewayd-internal's cert-remint subscriber; the store itself is
+	// pure SQL. Create*IfUnderQuota return:
+	//   - (TenantSurface{}, *TenantSurfaceQuotaError) when limit trips
+	//   - (TenantSurface{}, ErrTenantSurfacesNotAllowed) when the plan
+	//     gate is off (Free today)
+	//   - (TenantSurface{}, ErrNotFound) when the parent row is gone
+	//   - (TenantSurface{}, ErrConflict) on FK + UQ violations
+	// The TOCTOU defence is a BeginTx + FOR UPDATE on the accounts row
+	// (surfaces) or tenant_surfaces row (hostnames), mirroring
+	// CreateEdgeRuleIfUnderQuota at pgstore.go:5951.
+	CreateTenantSurfaceIfUnderQuota(ctx context.Context, in CreateTenantSurfaceParams, limits api.Limits) (TenantSurface, error)
+	GetTenantSurfaceByID(ctx context.Context, id string) (TenantSurface, error)
+	GetTenantSurfaceByName(ctx context.Context, accountID, name string) (TenantSurface, error)
+	ListTenantSurfacesForAccount(ctx context.Context, accountID string) ([]TenantSurface, error)
+	ListTenantSurfacesForApp(ctx context.Context, appID string) ([]TenantSurface, error)
+	CountTenantSurfacesForAccount(ctx context.Context, accountID string) (int, error)
+	UpdateTenantSurfaceStatus(ctx context.Context, id string, status SurfaceStatus) error
+	UpdateTenantSurfaceCert(ctx context.Context, in UpdateSurfaceCertParams) error
+	// DeleteTenantSurface soft-deletes: status flips to 'deleted',
+	// the row stays for audit / cert_history. Hard DELETE cascades
+	// hostnames via the FK ON DELETE CASCADE.
+	DeleteTenantSurface(ctx context.Context, id string) error
+	// TenantSurfaceByHostname — hot-path lookup from pgRouter.ResolveHost.
+	// Falls through to ErrNotFound when the hostname is not claimed
+	// by any surface (the caller then consults DomainByName). Joins
+	// tenant_hostnames → tenant_surfaces in SQL.
+	TenantSurfaceByHostname(ctx context.Context, hostname string) (TenantSurface, error)
+
+	// Hostname CRUD under per-surface quota. CreateTenantHostnameIfUnderQuota
+	// takes a FOR UPDATE lock on the parent tenant_surfaces row before
+	// counting. The global (per-hostname) UQ on tenant_hostnames.hostname
+	// surfaces as ErrConflict when a hostname is already claimed by a
+	// different surface (the apid handler maps this to
+	// CodeTenantHostnameAlreadyClaimed in PR-C).
+	CreateTenantHostnameIfUnderQuota(ctx context.Context, in CreateTenantHostnameParams, limits api.Limits) (TenantHostname, error)
+	ListTenantHostnamesForSurface(ctx context.Context, surfaceID string) ([]TenantHostname, error)
+	// ListVerifiedTenantHostnamesForSurface is the SAN-assembly hot path
+	// used by CertIssuer.RequestCertForSurface; returns sorted by hostname
+	// for deterministic primary/SAN assignment.
+	ListVerifiedTenantHostnamesForSurface(ctx context.Context, surfaceID string) ([]TenantHostname, error)
+	CountTenantHostnamesForSurface(ctx context.Context, surfaceID string) (int, error)
+	MarkTenantHostnameVerified(ctx context.Context, hostname string) error
+	MarkTenantHostnameCheckFailed(ctx context.Context, hostname, reason string) error
+	// ListPendingTenantHostnames — dns_poller queue. Returns the
+	// `limit` oldest unverified rows whose last_check_at is older than
+	// `olderThan` (the poller sleeps batch+1 interval seconds between
+	// passes, so a row re-enters the queue roughly every batch-time).
+	ListPendingTenantHostnames(ctx context.Context, olderThan time.Time, limit int) ([]TenantHostname, error)
+	DeleteTenantHostname(ctx context.Context, hostname string) error
+	// GetTenantHostnameByName — pgRouter.ResolveHost's tenant-surface
+	// branch needs the hostname row alongside the surface so it can
+	// fail closed on hostname.Verified() == false (a pre-challenge
+	// TXT record must not be routable; the legacy custom_domains
+	// path's parallel contract is dom.Verified()). ErrNotFound when
+	// the hostname is unclaimed. The hostname column is citext so
+	// callers pass the canonical lowercase form.
+	GetTenantHostnameByName(ctx context.Context, hostname string) (TenantHostname, error)
 
 	// Crons (apid CRUDs; schedd fires).
 	CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error)
@@ -1834,6 +2038,14 @@ type Store interface {
 	// handler before the insert; the insert itself runs the same
 	// count inside the FOR UPDATE on the apps row).
 	CountEdgeRulesForApp(ctx context.Context, appID string) (int, error)
+	// CountEdgeRulesByKindForApp is the per-kind quota check
+	// (ADR-091 D22 — kind=geo has a tighter per-app cap than the
+	// general EdgeRulesPerApp; Free=1 vs 5). Called by the apid
+	// handler to surface the specific kind + cap to the customer
+	// (e.g. "kind=geo: 1/1 rules used on Free"). The store
+	// implementations run the count inside the same apps-row FOR
+	// UPDATE lock for race-freedom against parallel inserts.
+	CountEdgeRulesByKindForApp(ctx context.Context, appID string, kind EdgeRuleKind) (int, error)
 	// MatchEdgeRulesForHost is the gateway hot-path read. Returns
 	// every enabled rule whose match_host matches `host` (or "*"),
 	// ordered by priority ASC. The gatewayd matcher iterates in
@@ -2069,6 +2281,23 @@ type Store interface {
 	// entered current state"), so the engine must stamp it on entry.
 	// Non-SNAPSHOTTING transitions should still use UpdateInstanceState.
 	UpdateInstanceStateWithTimestamp(ctx context.Context, id, state string, parkedAt time.Time) error
+	// IncInstanceRequestCount bumps the per-instance request_count
+	// column by delta (ADR-098 C8). The writer is additive
+	// ("request_count = request_count + delta") so a Phase-4-loser
+	// re-apply is idempotent. Returns the post-increment total, or
+	// -1 when the row is gone (Phase-4 loser landed after the
+	// instance was evicted). The batched flush path (C9) is the only
+	// caller; the writer is deliberately not used at single-request
+	// granularity.
+	IncInstanceRequestCount(ctx context.Context, id string, delta int64) (int64, error)
+	// TouchInstancesWithRequestDelta (ADR-098 C9) is the batched
+	// version of IncInstanceRequestCount: same per-instance delta
+	// increment, but applied across a whole touch batch in one
+	// round-trip via unnest. Mirrors TouchInstancesLastSeen — the
+	// gateway's ReportActivity batch carries both last_request_at
+	// AND the per-instance request_count delta, and the engine
+	// stamps both atomically. Returns the number of rows updated.
+	TouchInstancesWithRequestDelta(ctx context.Context, touches []InstanceTouch) (int, error)
 	// UpdateInstanceStateToTerminal writes state AND stamps terminal_at
 	// on the same UPDATE (PR #74, spec §17 follow-up). terminal_at is
 	// the dedicated retention anchor the daily sweep (pkg/sched.Retention)
@@ -2379,6 +2608,21 @@ type Store interface {
 	// gatewayd-internal can add or drop its per-node client without a
 	// restart. ErrNotFound when the id has no row.
 	SetComputeNodeActive(ctx context.Context, id string, active bool) error
+	// SetComputeNodeRole overwrites the role column on a row by id
+	// (ADR-112 PR-B). PR-A's first-boot path populates the column via
+	// UpsertComputeNodeFromOperator (keyed by name); PR-B's in-place
+	// mutation needs a dedicated setter because the runtime identity
+	// is the box's node-id, not the manifest name. The role value is
+	// validated against the {empty, control-plane, compute-only}
+	// allow-list at the Go boundary (matches pkg/roleTemplating.Validate)
+	// so a SQL injection via an operator-supplied role is impossible —
+	// the parameter is length-capped at 32 chars and member-tested.
+	// Idempotent: writing the same role twice is a no-op UPDATE. Returns
+	// ErrNotFound if the row is gone. Emits compute_node_changed via
+	// the pg_notify trigger so gatewayd-internal's per-node cache and
+	// schedd's chooser re-rank immediately (the chooser currently
+	// ignores role, but the family is wired for ADR-110 follow-ons).
+	SetComputeNodeRole(ctx context.Context, id string, role string) error
 	// ListComputeNodes returns every compute_node in name order.
 	// includeInactive=false (default) returns only active rows
 	// (placement-equivalent); apid's GET /v1/compute-nodes handler
@@ -2425,6 +2669,43 @@ type Store interface {
 	// compute_node by name first; a "no such node" path is the
 	// store's ComputeNodeByName, not this call.
 	ListComputeNodeHeartbeats(ctx context.Context, nodeID string, since time.Time, limit int) ([]ComputeNodeHeartbeat, error)
+
+	// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+	// amendment) extends AppendComputeNodeHeartbeat with the two new
+	// stats columns added in migrations/00199. vmmd is the only caller
+	// on the routine path; the existing AppendComputeNodeHeartbeat
+	// (without stats) stays so schedd's deactivation/reactivation
+	// stampers don't need to know about CPU/disk. cpuPct60s is the
+	// 60-second sliding-window CPU utilization as a percentage of
+	// vpcpus × 100 (range [0.00, 100.00] for sane values). The
+	// memstore mirrors the nullable semantics: existing callers
+	// without the stats columns pass 0 / 0 and the column defaults
+	// to NULL on the postgres side via the IF NOT EXISTS migration.
+	AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error
+
+	// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+	// row per node, with the CPU%/disk fields populated. Used by the
+	// obs surface to fold onto the /v1/admin/obs/nodes row projection.
+	// Returns one row per node — even nodes with no stats yet (the
+	// CPU/disk fields are nil). The LEFT JOIN onto compute_nodes is
+	// done in the handler; this query is just the latest-row-per-node.
+	LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error)
+
+	// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+	// new per-node utilization fields on /v1/admin/obs/nodes. One row
+	// per compute_node that has at least one live instance.
+	//
+	// The aggregate joins on instances.node_id (the existing NOT NULL
+	// FK from migration 00024, backfilled to the default-local node on
+	// pre-existing rows) — NOT a separate binding table. ADR-092 §2.1
+	// was rewritten during PR #4 prep after this discovery; see the
+	// §8 amendment in docs/adr/092-per-node-utilization-obs.md.
+	//
+	// The +8 on ram_mb mirrors §6.2 invariant #2 — Σ(ram_mb + 8) ≤
+	// 47,600 MB. The aggregate is per-node; the fleet Σ is computed
+	// by the caller if it wants the global number (the existing
+	// fleet Σ lives in the schedd engine, not on this wire).
+	PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error)
 
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
@@ -2474,6 +2755,33 @@ type Store interface {
 	// account's ID; the operator endpoint leaves AccountID nil and
 	// passes IncludeAnonymous=true when ?include_anonymous=true.
 	ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]AuditLog, error)
+
+	// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator
+	// observability backend's read-side query for the live events
+	// table. Distinct from ListAuditLog (audit_log table) — the
+	// two surfaces do NOT overlap per ADR-091 §3.7.4.
+	//
+	// Filter shape: actor ("" / exact match), kind_prefix ("" /
+	// LIKE 'prefix%'), subject ("" / UUID), since (zero time / since
+	// floor), limit (top-N; bounded by handler to
+	// ObsAdminEventsLimitMax). The "" / zero literals are the
+	// "no filter" sentinel — sqlc binds them as interface{} because
+	// the SQL uses the ($1 = '' OR ...) predicate shape.
+	//
+	// Order is (at DESC, id DESC) — the id tiebreaker keeps the
+	// over-read stable across (kind, at DESC) index hits and
+	// avoids an unstable sort.
+	ListAllEventsPaged(ctx context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error)
+
+	// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+	// per-account events drill-down. Backed by the events_actor_account_idx
+	// partial index on (actor_account_id) WHERE actor_account_id IS NOT NULL
+	// (migrations/00099_orgs_memberships_invitations.sql).
+	//
+	// since is the inclusive lower bound on at; limit is the top-N
+	// bounded by the caller's ObsAdminEventsLimitMax. Order is
+	// (at DESC, id DESC) — same rationale as ListAllEventsPaged.
+	ListRecentEventsForAccount(ctx context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error)
 	// DeploymentSidecarRAMs (issue #463 / ADR-070 / PR-C) returns
 	// the per-deployment sidecar RAM slice from the jsonb column.
 	// Empty/nil when the deployment has no sidecars — matching the
@@ -2534,6 +2842,15 @@ type Store interface {
 	// see the sqlc query in pkg/state/queries.sql for the scoring
 	// formula and reason taxonomy.
 	TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error)
+	// TrafficAnomalyAggregateByNode (PR #4 / ADR-092 §3.4
+	// amendment) is the per-(account, app, node, minute) variant
+	// of TrafficAnomalyAggregate. Same scoring formula and
+	// reason taxonomy; different GROUP BY keys (joins through
+	// instances.node_id → compute_nodes.id). Powers
+	// GET /v1/admin/obs/anomalies?group_by=node. The handler
+	// resolves node_id → node_name via ListComputeNodes before
+	// returning the wire shape.
+	TrafficAnomalyAggregateByNode(ctx context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error)
 	// PerAccountRateLimitAggregate is the durable view of
 	// auth.rate_limited events grouped by account_id (subject)
 	// over a rolling window. Powers GET /v1/admin/obs/rate-limits
@@ -2760,7 +3077,7 @@ type Store interface {
 	// allowed to complete; a foreign caller sees 0 rows updated
 	// and gets ErrClaimLost so the meterd can decide whether to
 	// alert or silently drop. mb_seconds is stamped on the row
-	// (column pushed_mb_seconds, added in migration 00209) so ops
+	// (column pushed_mb_seconds, added in migration 00280) so ops
 	// can read the wire value directly; the Paddle merchant
 	// dashboard's line item Quantity + CustomData["mb_seconds"]
 	// carry the same value at the merchant side.
@@ -3263,4 +3580,156 @@ type Store interface {
 	// /deliveries/{id}/retry) and the dispatcher-side audit
 	// emission that needs to read the row's account_id + app_id.
 	AppWebhookDeliveryByID(ctx context.Context, id string) (AppWebhookDelivery, error)
+
+	// --- ADR-096 customer-facing automatic error grouping ---
+	//
+	// The writer methods (IncrementAppError / InsertAppErrorRequest)
+	// are called by the apid gRPC server-side handler in
+	// cmd/apid/grpc_server_apperrors.go; gatewayd-internal dials
+	// apid over a unix socket and never touches the Store
+	// directly. The reader methods back the
+	// /v1/apps/{slug}/errors/* handlers in PR-B.
+
+	// IncrementAppError is the dedupe-merge INSERT called by
+	// grpc_server_apperrors.go. Runs ON CONFLICT (account_id,
+	// app_id, fingerprint) DO UPDATE so a fresh row with an
+	// existing fingerprint bumps count + request_count + bumps
+	// last_seen_at. The handler wraps N calls in a single pgx
+	// transaction (one per gRPC stream batch). params use sqlc
+	// types to match the generated query method (ADR-006 +
+	// TrafficAnomalyAggregate precedent at pkg/state/store.go
+	// line 2611 — sqlc types leak through the Store interface
+	// for the queries that sqlc owns; readers convert to typed
+	// AppErrorGroup/Row/Row at the boundary).
+	IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error)
+
+	// InsertAppErrorRequest writes one drill-down row per request
+	// that hit the fingerprint. No ON CONFLICT — every request
+	// gets its own row. Paired with IncrementAppError on the same
+	// gRPC stream batch.
+	InsertAppErrorRequest(ctx context.Context, arg sqlc.InsertAppErrorRequestParams) error
+
+	// ListAppErrorGroups backs GET /v1/apps/{slug}/errors/summary
+	// (PR-B). Cursor-paginated via (last_seen_at, fingerprint)
+	// when cursor != ""; otherwise first page. limit MUST be
+	// pre-clamped to api.AppErrorsSummaryMaxLimit by the handler.
+	ListAppErrorGroups(ctx context.Context, arg sqlc.ListAppErrorGroupsParams) ([]AppErrorGroup, error)
+
+	// ListAppErrorRequests backs GET /v1/apps/{slug}/errors/{fp}
+	// (PR-B). Cursor-paginated via (received_at, request_id).
+	// limit MUST be pre-clamped by the handler.
+	ListAppErrorRequests(ctx context.Context, arg sqlc.ListAppErrorRequestsParams) ([]AppErrorRequestRow, error)
+
+	// GetAppErrorSample backs GET /v1/apps/{slug}/errors/{fp}/first
+	// (PR-B). Returns the OLDEST request row for one fingerprint.
+	// headers_sample + redactions are populated for the
+	// wire-side "we redacted X / Y / Z" badge.
+	GetAppErrorSample(ctx context.Context, arg sqlc.GetAppErrorSampleParams) (AppErrorSampleRow, error)
+
+	// ListAppErrorFingerprintsForPurge is the read-side of the
+	// nightly retention purge (cmd/apid/app_errors_purge.go).
+	// Returns IDs of app_errors rows for an account older than
+	// cutoff, capped at 10000 per call. DeleteAppErrorsByIDs +
+	// DeleteAppErrorRequestsByIDs follow.
+	ListAppErrorFingerprintsForPurge(ctx context.Context, arg sqlc.ListAppErrorFingerprintsForPurgeParams) ([]uuid.UUID, error)
+
+	// DeleteAppErrorsByIDs removes app_errors rows by ID array.
+	// Used by the nightly retention purge.
+	DeleteAppErrorsByIDs(ctx context.Context, ids []uuid.UUID) error
+
+	// DeleteAppErrorRequestsByIDs removes app_error_requests rows
+	// by ID array. Used by the nightly retention purge.
+	DeleteAppErrorRequestsByIDs(ctx context.Context, ids []uuid.UUID) error
+
+	// DeleteAppErrorRequestsOlderThan removes ALL
+	// app_error_requests rows for one account older than the
+	// cutoff timestamp. Used by the nightly retention purge to
+	// age out orphaned request rows.
+	DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error
+
+	// --- ADR-098 connection-aware execution (§9.A) ---
+	//
+	// Writer methods (InsertDataUpstream / DeleteDataUpstreamByID
+	// / InsertDataUpstreamProbe / PruneDataUpstreamProbesOlderThan)
+	// are wired by PR-B/C:
+	//   - apid's env-classifier (cmd/apid/extract.go) calls
+	//     InsertDataUpstream / DeleteDataUpstreamByID
+	//   - meterd's probe loop (cmd/meterd/probe_loop.go) calls
+	//     InsertDataUpstreamProbe every 30s per
+	//     (host_redacted_hash, region)
+	//   - meterd's hourly retention cron calls
+	//     PruneDataUpstreamProbesOlderThan
+	//
+	// Reader methods (ListDataUpstreamsByApp /
+	// GetDataUpstreamByID / ListDataUpstreamProbesByHostRegion)
+	// back:
+	//   - GET /v1/apps/{slug}/upstreams (PR-B;
+	//     ListDataUpstreamsByApp)
+	//   - GET /v1/apps/{slug}/upstreams/{id} (PR-B;
+	//     GetDataUpstreamByID)
+	//   - schedd's wake-side affinity read (PR-B/C;
+	//     ListDataUpstreamProbesByHostRegion)
+	//
+	// PR-A ships these on the interface with Postgres + MemStore
+	// stubs so the package compiles and unit tests don't regress.
+	// PR-B replaces the apid / meterd / schedd call sites with
+	// the production wiring.
+
+	// InsertDataUpstream writes one data_upstreams row via the
+	// dedupe-merge ON CONFLICT tripwire on
+	// data_upstreams_dedupe_uniq (PR-B env-classifier).
+	InsertDataUpstream(ctx context.Context, arg sqlc.InsertDataUpstreamParams) (uuid.UUID, error)
+
+	// ListDataUpstreamsByApp backs
+	// GET /v1/apps/{slug}/upstreams (PR-B). Cursor-paginated via
+	// (created_at, id); limit MUST be pre-clamped to
+	// api.DataUpstreamsListMaxLimit by the handler.
+	ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error)
+
+	// ListAllAppDataUpstreams backs
+	// GET /v1/apps/{slug}/upstreams?scope=__all__ (PR-B).
+	// Returns every data_upstreams row on the app across all
+	// scopes — the count is bounded by
+	// DataPlacementHintsPerApp (per ADR-098 §D5) so the scan
+	// is cheap.
+	ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error)
+
+	// CountDataUpstreamsByApp backs the per-plan
+	// DataPlacementHintsPerApp quota in createUpstream
+	// (PR-B). Counts across ALL scopes per §D5.
+	CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error)
+
+	// GetDataUpstreamByID backs
+	// GET /v1/apps/{slug}/upstreams/{id} (PR-B).
+	GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUpstream, error)
+
+	// DeleteDataUpstreamByID backs
+	// DELETE /v1/apps/{slug}/upstreams/{id} (PR-B).
+	DeleteDataUpstreamByID(ctx context.Context, id uuid.UUID) error
+
+	// InsertDataUpstreamProbe is meterd's probe-loop writer. One
+	// row per (host_redacted_hash, region) per 30s sample.
+	// Partitioning on sampled_at gives the hot-write path; the
+	// partition creator (PR-C) drops old partitions wholesale.
+	InsertDataUpstreamProbe(ctx context.Context, arg sqlc.InsertDataUpstreamProbeParams) error
+
+	// ListDataUpstreamProbesByHostRegion is schedd's wake-side
+	// read path (PR-B/C). Returns the N most recent samples for
+	// one (host_redacted_hash, region) pair within a time window.
+	// Partition pruning on sampled_at drops everything outside
+	// the window.
+	ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error)
+
+	// ListDistinctUpstreamHostHashes (PR-C / meterd probe
+	// loop) walks data_upstreams and returns the
+	// deduplicated set of (host_redacted_hash, kind, port)
+	// tuples — the probe iterates this set on every tick.
+	// The plaintext host is NEVER returned; the §11 secret
+	// rule is the reason.
+	ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error)
+
+	// PruneDataUpstreamProbesOlderThan is the hourly retention
+	// purge. cutoff is typically now() - 30 days (matches the
+	// §12 prom_retention_days:15 floor × 2 safety margin).
+	PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error
 }

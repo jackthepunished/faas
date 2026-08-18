@@ -1,15 +1,35 @@
 from typing import Literal
 
-CreateEdgeRuleRequestKind = Literal["cors", "headers", "ip", "jwt", "redirect", "rewrite", "route"]
-
-CREATE_EDGE_RULE_REQUEST_KIND_VALUES: set[CreateEdgeRuleRequestKind] = {
+CreateEdgeRuleRequestKind = Literal[
+    "budget",
     "cors",
+    "geo",
     "headers",
     "ip",
     "jwt",
+    "limit",
+    "maintenance",
     "redirect",
     "rewrite",
     "route",
+    "throttle",
+    "validate",
+]
+
+CREATE_EDGE_RULE_REQUEST_KIND_VALUES: set[CreateEdgeRuleRequestKind] = {
+    "budget",
+    "cors",
+    "geo",
+    "headers",
+    "ip",
+    "jwt",
+    "limit",
+    "maintenance",
+    "redirect",
+    "rewrite",
+    "route",
+    "throttle",
+    "validate",
 }
 
 

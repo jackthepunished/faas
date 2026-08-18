@@ -319,6 +319,65 @@ func (c *Client) QueryBuckets(ctx context.Context, query string) (map[string]map
 	return out, nil
 }
 
+// QueryGrouped (issue #881 / ADR-091 D20.5 amendment) mirrors
+// QueryBuckets but with a caller-supplied inner label instead of
+// the hardcoded `le`. Returned shape:
+//
+//	map[outerLabel]map[innerLabel]float64
+//
+// Used by pkg/throttlerec to pull per-route observed_rps values:
+// the query is `sum by (app, route) (rate(...))` and the outer
+// label is `app`, the inner label is `route`. The returned
+// `app → route → rps` shape matches the ADT the recommender
+// walks (one suggestion per (appID, route) pair, plus a
+// `__route_other__` overflow bucket per the ADR-093 cap pattern).
+//
+// Routes where the inner label is missing (Prometheus carries
+// no series without the by-clause's full label set) are dropped
+// silently — the caller's expectation is that some routes will
+// have zero observations for a given range, and that's normal.
+//
+// The metric label hardcoding stays in QueryMap + QueryBuckets
+// (`app`) — these are existing call sites that depend on the
+// shape and don't need widening. QueryGrouped is the new seam
+// for queries that group by something other than the standard
+// `app` label, and takes the label name explicitly so a future
+// `pkg/something/fetcher` doesn't have to redefine the signature.
+func (c *Client) QueryGrouped(ctx context.Context, query, outerLabel, innerLabel string) (map[string]map[string]float64, error) {
+	if c == nil || c.baseURL == "" {
+		return nil, fmt.Errorf("promql: client not configured")
+	}
+	if outerLabel == "" || innerLabel == "" {
+		return nil, fmt.Errorf("promql: QueryGrouped requires non-empty outer/inner labels")
+	}
+	rows, err := c.doVector(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[string]float64, len(rows))
+	for _, row := range rows {
+		outer, ok := row.Metric[outerLabel]
+		if !ok || outer == "" {
+			continue
+		}
+		inner, ok := row.Metric[innerLabel]
+		if !ok || inner == "" {
+			continue
+		}
+		f, err := parseSampleValue(row.Value, query)
+		if err != nil {
+			return nil, err
+		}
+		bucket, exists := out[outer]
+		if !exists {
+			bucket = make(map[string]float64, 4)
+			out[outer] = bucket
+		}
+		bucket[inner] = f
+	}
+	return out, nil
+}
+
 // doVector runs query and decodes a vector response into the shared
 // queryResponse shape. Shared by QueryMap and QueryBuckets so the
 // transport / parsing / error mapping is one tested path.

@@ -44,7 +44,7 @@ func TestMetricsWakeQueueWaitNilSafe(t *testing.T) {
 func TestMetricsIssue273Exposition(t *testing.T) {
 	m := NewMetrics()
 	m.PreInstantiateApp("app-1")
-	m.ObserveColdBoot("app-1", 250*time.Millisecond)
+	m.ObserveColdBoot("app-1", 250*time.Millisecond, "node-1")
 	m.ObserveRequestDuration("app-1", "2xx", 12*time.Millisecond)
 	m.ObserveRequestDuration("app-1", "5xx", 500*time.Millisecond)
 
@@ -148,7 +148,7 @@ func TestWakeGateObservesWaitDuration(t *testing.T) {
 			func(ctx context.Context) error {
 				<-release
 				return nil
-			})
+			}, nil, nil)
 	}()
 	// Yield so the leader is committed before the follower joins.
 	time.Sleep(20 * time.Millisecond)
@@ -156,7 +156,7 @@ func TestWakeGateObservesWaitDuration(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(context.Background(), "appA",
 			func() bool { return false }, // would-wake check is leader-only; follower ignores it
-			func(ctx context.Context) error { return nil })
+			func(ctx context.Context) error { return nil }, nil, nil)
 	}()
 
 	// Hold the leader parked so the follower accumulates wait.
@@ -201,14 +201,14 @@ func TestWakeGateSkipsObservationOnErrQueueFull(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(context.Background(), "appB",
 			func() bool { return true },
-			func(ctx context.Context) error { <-release; return nil })
+			func(ctx context.Context) error { <-release; return nil }, nil, nil)
 	}()
 	time.Sleep(20 * time.Millisecond) // leader commits first
 
 	// Synchronous next caller — gate rejects with ErrQueueFull.
 	err := g.Wait(context.Background(), "appB",
 		func() bool { return false },
-		func(ctx context.Context) error { return nil })
+		func(ctx context.Context) error { return nil }, nil, nil)
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("err = %v, want ErrQueueFull", err)
 	}
@@ -252,7 +252,7 @@ func TestWakeGateSkipsObservationOnCtxCancel(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(context.Background(), "appC",
 			func() bool { return true },
-			func(ctx context.Context) error { <-release; return nil })
+			func(ctx context.Context) error { <-release; return nil }, nil, nil)
 	}()
 
 	// Follower with a cancelled context — must be queued behind the
@@ -265,7 +265,7 @@ func TestWakeGateSkipsObservationOnCtxCancel(t *testing.T) {
 		defer done.Done()
 		_ = g.Wait(cancelledCtx, "appC",
 			func() bool { return false },
-			func(ctx context.Context) error { return nil })
+			func(ctx context.Context) error { return nil }, nil, nil)
 		// Tell the test driver we've entered Wait (even if it returned
 		// immediately — the gate has serialized us).
 		close(followerCommitted)
@@ -409,6 +409,73 @@ func TestMetricsTLSOnDemandDeniedRegistersAndPreInstantiates(t *testing.T) {
 func TestMetricsTLSOnDemandDeniedNilSafe(t *testing.T) {
 	var m *Metrics
 	m.ObserveTLSOnDemandDenied("allowlist") // must not panic
+}
+
+// TestMetricsEdgeRuleApplyRegistersAndPreInstantiates — ADR-091
+// hardening PR-A: the apply-path counter must surface every (kind,
+// result) tuple at 0 from the moment the daemon binds (so the §12
+// dashboard chip "edge rule apply rate" never shows "no data" and
+// so the frozen-zero state for every kind is observable as the
+// "rule compile/apply never fired" tripwire). Increment one
+// (kind=jwt, result=success) and assert it surfaces at 1 while the
+// rest of the cross product stays at 0.
+func TestMetricsEdgeRuleApplyRegistersAndPreInstantiates(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveEdgeRuleApply("jwt", "success")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+		for _, result := range []string{"success", "error"} {
+			line := "gateway_edge_rule_apply_total{kind=\"" + kind + "\",result=\"" + result + "\"}"
+			if !strings.Contains(body, line) {
+				t.Errorf("missing exposition line for %q in body:\n%s", line, body)
+			}
+		}
+	}
+	if !strings.Contains(body, `gateway_edge_rule_apply_total{kind="jwt",result="success"} 1`) {
+		t.Errorf("jwt+success should surface at 1, body:\n%s", body)
+	}
+}
+
+// TestMetricsEdgeRuleApplyNilSafe — the counter must not panic when
+// called on a nil receiver (parallels TestMetricsTLSOnDemandDeniedNilSafe).
+func TestMetricsEdgeRuleApplyNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveEdgeRuleApply("cors", "error") // must not panic
+}
+
+// TestMetricsEdgeRuleCompileErrorRegistersAndPreInstantiates —
+// ADR-091 hardening PR-A: the compile-error counter must surface
+// every kind at 0 from boot. Non-zero values page the operator
+// (a rule shipped broken); the frozen-zero state for every kind
+// is observable as the "no compile errors fired" tripwire.
+func TestMetricsEdgeRuleCompileErrorRegistersAndPreInstantiates(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveEdgeRuleCompileError("ip")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+		line := "gateway_edge_rule_compile_error_total{kind=\"" + kind + "\"}"
+		if !strings.Contains(body, line) {
+			t.Errorf("missing exposition line for %q in body:\n%s", line, body)
+		}
+	}
+	if !strings.Contains(body, `gateway_edge_rule_compile_error_total{kind="ip"} 1`) {
+		t.Errorf("ip compile-error should surface at 1, body:\n%s", body)
+	}
+}
+
+// TestMetricsEdgeRuleCompileErrorNilSafe — the counter must not
+// panic when called on a nil receiver (parallels the apply test).
+func TestMetricsEdgeRuleCompileErrorNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveEdgeRuleCompileError("rewrite") // must not panic
 }
 
 // TestMetricsAccountRateLimitedRegistersAndPreInstantiates — ADR-040
@@ -573,6 +640,59 @@ func TestMetricsWakeSnapshotTierPreinstantiated(t *testing.T) {
 		want := fmt.Sprintf(`gateway_wake_snapshot_tier_total{tier=%q} 0`, tier)
 		if !strings.Contains(body, want) {
 			t.Errorf("pre-instantiated %s missing from /metrics body:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsWakePhaseDurationPreinstantiated (ADR-098 C11) pins the
+// closed phase set on the new phase-decomposed wake histogram at
+// zero from the moment the daemon binds, so the §12 panel surfaces
+// from boot. Catches a future change that drops the pre-instantiation
+// loop or renames a phase value. The aggregate
+// gateway_wake_latency_seconds histogram is NOT changed here — that
+// series stays byte-identical (tested in pkg/gateway/testhist/...).
+func TestMetricsWakePhaseDurationPreinstantiated(t *testing.T) {
+	m := NewMetrics()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, phase := range []string{
+		"queue_wait", "coordinator_wait", "schedd_admit",
+		"vmmd_wake", "guest_ready", "cold_fallback_reason",
+	} {
+		want := fmt.Sprintf(`gateway_wake_phase_duration_seconds_count{phase=%q} 0`, phase)
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated %s missing from /metrics body:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsObserveWakePhaseRoundTrip (ADR-098 C11) asserts that
+// ObserveWakePhase increments the labelled histogram and that the
+// scalar (legacy) ObserveWakeQueueWait dual-writes into the
+// phase="queue_wait" series. Pinning both halves of the dual-write
+// here keeps the §12 panel honest through a future refactor that
+// drops either the scalar or the vector.
+func TestMetricsObserveWakePhaseRoundTrip(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveWakePhase("vmmd_wake", 250*time.Millisecond)
+	m.ObserveWakeQueueWait(120 * time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`gateway_wake_phase_duration_seconds_count{phase="vmmd_wake"} 1`,
+		`gateway_wake_phase_duration_seconds_count{phase="queue_wait"} 1`,
+		// Legacy scalar stays byte-identical for one release.
+		// ObserveWakeQueueWait dual-writes into the vector AND
+		// into the scalar; only the queue_wait call counts here.
+		`gateway_wake_queue_wait_seconds_count 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing exposition line %q in body:\n%s", want, body)
 		}
 	}
 }
@@ -883,4 +1003,117 @@ func TestObserveStreamStartEndNilSafe(t *testing.T) {
 	var m *Metrics
 	m.ObserveStreamStart("app-A", "hobby") // must not panic
 	m.ObserveStreamEnd("app-A", "hobby")   // must not panic
+}
+
+// TestMetricsWSCountersRegistered (issue #676 / ADR-080
+// follow-up, PR-B) confirms all four gateway_ws_* Prometheus
+// series + their pre-instantiated closed label cells appear in
+// the /metrics output from boot. Catches a typo in the metric
+// names (which the §12 dashboards depend on) AND a regression
+// in the constructor's pre-instantiate loop (a missing label
+// cell would surface as "no data" on the panel until the first
+// production WS hit).
+func TestMetricsWSCountersRegistered(t *testing.T) {
+	m := NewMetrics()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+
+	// Series name contract — pin the exact names the
+	// deploy/grafana/ panels query (dashes between segments;
+	// "_total" suffix on counters; "_seconds" on the histogram
+	// + "_count" / "_sum" auto-emitted siblings).
+	wantSeries := []string{
+		"gateway_ws_upgrade_total",
+		"gateway_ws_active_sessions",
+		"gateway_ws_session_duration_seconds",
+		"gateway_ws_session_bytes_total",
+	}
+	for _, name := range wantSeries {
+		if !strings.Contains(body, name) {
+			t.Errorf("series %q not in registry output", name)
+		}
+	}
+
+	// Pre-instantiated label cells. The constructor loops over
+	// (api.Plans × wsOutcomes / wsSessionOutcomes / wsDirections)
+	// and stamps every cell. Asserting one cell per series
+	// catches a missing-loop regression; the package-level
+	// construction test below covers the full cross-product.
+	wantCells := []string{
+		`gateway_ws_upgrade_total{outcome="accepted",plan="hobby"}`,
+		`gateway_ws_upgrade_total{outcome="plan_denied",plan="free"}`,
+		`gateway_ws_upgrade_total{outcome="bridge_disabled",plan="pro"}`,
+		`gateway_ws_active_sessions{plan="scale"}`,
+		`gateway_ws_session_duration_seconds_count{outcome="client_disconnect",plan="hobby"}`,
+		`gateway_ws_session_bytes_total{direction="tx",plan="pro"}`,
+		`gateway_ws_session_bytes_total{direction="rx",plan="scale"}`,
+	}
+	for _, cell := range wantCells {
+		if !strings.Contains(body, cell) {
+			t.Errorf("pre-instantiated cell %q missing from output", cell)
+		}
+	}
+}
+
+// TestMetricsWSHelpersIncDecSymmetric (issue #676 / ADR-080
+// follow-up, PR-B) confirms the gauge Inc/Dec helpers balance
+// and the counter helpers track the byte volume. The symmetric
+// Inc/Dec pair is the load-bearing property: a forwarder that
+// Inc's without matching Dec (or vice versa) silently breaks
+// the ws_active_sessions{plan} panel rate. The counter Add
+// helper must accept n>0 (zero or negative is a no-op, not an
+// underflow).
+func TestMetricsWSHelpersIncDecSymmetric(t *testing.T) {
+	m := NewMetrics()
+
+	// Three sessions open, three close — gauge returns to zero.
+	for range []int{0, 1, 2} {
+		m.IncWSSessionStart("hobby")
+	}
+	m.DecWSSessionEnd("hobby")
+	m.DecWSSessionEnd("hobby")
+	m.DecWSSessionEnd("hobby")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	want := `gateway_ws_active_sessions{plan="hobby"} 0`
+	if !strings.Contains(body, want) {
+		t.Errorf("symmetric Inc/Dec didn't restore gauge to zero; want %q in body", want)
+	}
+
+	// Add bytes — counter increments by the exact delta.
+	m.AddWSSessionBytes("hobby", WSDirectionTx, 1024)
+	m.AddWSSessionBytes("hobby", WSDirectionTx, 4096)
+	m.AddWSSessionBytes("hobby", WSDirectionRx, 512)
+	m.AddWSSessionBytes("hobby", WSDirectionRx, 0)   // no-op
+	m.AddWSSessionBytes("hobby", WSDirectionRx, -10) // no-op (negative guard)
+
+	rec = httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body = rec.Body.String()
+	if !strings.Contains(body, `gateway_ws_session_bytes_total{direction="tx",plan="hobby"} 5120`) {
+		t.Errorf("tx counter mismatch; want 5120 in body")
+	}
+	if !strings.Contains(body, `gateway_ws_session_bytes_total{direction="rx",plan="hobby"} 512`) {
+		t.Errorf("rx counter mismatch; want 512 in body (negative/zero must be no-op)")
+	}
+}
+
+// TestMetricsWSNilSafe (issue #676 / ADR-080 follow-up, PR-B)
+// keeps the helper methods nil-safe so the pre-PR-B test corpus
+// (where Metrics may be nil) keeps building without per-test
+// boilerplate. Mirrors the existing TestObserveStreamStartEndNilSafe
+// precedent at the top of this file.
+func TestMetricsWSNilSafe(t *testing.T) {
+	var m *Metrics
+	m.IncWSUpgrade("hobby", WSOutcomeAccepted)
+	m.IncWSSessionStart("hobby")
+	m.DecWSSessionEnd("hobby")
+	m.ObserveWSSessionDuration("hobby", WSOutcomeAccepted, time.Second)
+	m.AddWSSessionBytes("hobby", WSDirectionTx, 1024)
 }

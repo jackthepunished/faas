@@ -80,11 +80,70 @@ type Problem struct {
 	// Stripe: empty). The dashboard renders this as a confirmation id
 	// after the customer completes checkout. Empty on the Stripe path.
 	TxID string `json:"tx_id,omitempty"`
+	// Errors carries per-field validation detail (Cloudflare / Stripe
+	// shape). Populated by 422 sites that emit a list of field-level
+	// failures — used today by the kind=validate edge rule so a
+	// customer's JSON Schema rejection renders as a form-field list
+	// the dashboard can iterate without parsing prose. Optional +
+	// omitempty so every other problem+json site keeps its existing
+	// flat shape unchanged.
+	Errors []FieldError `json:"errors,omitempty"`
+	// SecretFindings carries per-line secret-scan detail for the
+	// 422 secret_scan_strict path. Populated by cmd/apid/secretscan.go
+	// when the server-side scan rejects an upload and by
+	// cmd/gregale/printErr when --secret-scan=strict fires locally. The
+	// shape is shared with the on-disk Deployment.SecretScan response
+	// (cmd/apid/handlers_ext.go::secretScanResponse) so a programmatic
+	// consumer can render the same UI for either rejection path.
+	// Optional + omitempty so every other problem+json site keeps its
+	// existing flat shape unchanged.
+	SecretFindings []SecretFinding `json:"secret_findings,omitempty"`
+	// SecretHint is the customer-facing remediation nudge attached to
+	// a strict-mode 422 envelope (e.g. "move detected secrets to
+	// `gregale secrets set`"). Mirrors FieldError-shaped metadata so
+	// the dashboard / SDK can render the hint as a one-line footer
+	// without parsing prose. Optional + omitempty.
+	SecretHint string `json:"secret_hint,omitempty"`
 	// extraHeaders are non-JSON response headers attached via WithHeader.
 	// Kept unexported so the wire body (RFC 7807 problem+json) is
 	// exactly the spec; WriteProblem flushes these onto the wire
 	// before WriteHeader. nil = no extras.
 	extraHeaders map[string][]string `json:"-"`
+}
+
+// FieldError is one per-field entry of Problem.Errors. The shape mirrors
+// Cloudflare's API Shield 422 + Stripe's card_errors family so an SDK can
+// iterate `errors[]` to drive form-field UI without parsing prose. Field
+// uses dotted-path JSON Pointer notation ("address.zip"), expected / got
+// are short stable strings; consumers should not depend on the prose.
+type FieldError struct {
+	Field    string `json:"field"`
+	Expected string `json:"expected"`
+	Got      string `json:"got,omitempty"`
+}
+
+// SecretFinding is one per-line entry of Problem.SecretFindings. The
+// shape mirrors pkg/secretscan.Finding but is decoupled so the wire
+// schema can evolve independently of the scanner's internal fields
+// (which carry Line + Severity as unexported-int enums). Snippet is the
+// pre-truncated safe representation (first 6 chars + "…" + last 4) —
+// never the raw value, matching the snippet policy documented in
+// pkg/secretscan/scan.go.
+type SecretFinding struct {
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Key      string `json:"key,omitempty"`
+	Provider string `json:"provider"`
+	Severity string `json:"severity"`
+	Snippet  string `json:"snippet"`
+	// Layer is the per-walk source label ("app" for the main
+	// image, "sidecar-<slug>" for each sidecar, "" for the apid
+	// source-tree scanner). Added in PR-A so the dashboard can
+	// attribute findings to the right image segment. The
+	// omitempty keeps the apid source-tree rejections at
+	// /v1/projects[/scan] from picking up an empty layer field
+	// (the cmd/apid 422 path doesn't know about image layers).
+	Layer string `json:"layer,omitempty"`
 }
 
 // Error implements the error interface so a Problem can flow through %w chains.
@@ -108,6 +167,21 @@ func WriteProblem(w http.ResponseWriter, p *Problem) {
 	_ = json.NewEncoder(w).Encode(p)
 }
 
+// WriteProblemWithErrors is the kind=validate-shaped variant: the
+// same problem+json envelope but with a populated Errors []FieldError
+// so a customer's JSON-Schema rejection renders as a structured
+// per-field list (Cloudflare API Shield 422 + Stripe card_errors
+// shape). The Errors slice is assigned to p before the encode so the
+// wire body matches the in-memory struct; nil errs produces an
+// empty-array (no `errors` key, since FieldError.Errors is omitempty).
+//
+// Used by pkg/gateway/handler.go::applyEdgeRuleValidate only; all
+// other error sites keep the flat WriteProblem shape.
+func WriteProblemWithErrors(w http.ResponseWriter, p *Problem, errs []FieldError) {
+	p.Errors = errs
+	WriteProblem(w, p)
+}
+
 // NewProblem builds a Problem with the common fields set.
 func NewProblem(status int, code, title, detail string) *Problem {
 	return &Problem{Status: status, Code: code, Title: title, Detail: detail}
@@ -124,6 +198,18 @@ func (p *Problem) WithLimit(limit, observed int64) *Problem {
 // WithDocs sets the docs URL and returns the same pointer for chaining.
 func (p *Problem) WithDocs(url string) *Problem {
 	p.DocsURL = url
+	return p
+}
+
+// WithSecretScan attaches the per-line findings + customer-facing
+// hint that the cmd/apid server-side secret-scan rejection (and the
+// CLI's --secret-scan=strict mode) emit. The fields are flat on the
+// RFC 7807 problem body so a programmatic consumer can render the
+// same one-line-per-finding UI for both rejection paths. Returns the
+// same pointer for chaining.
+func (p *Problem) WithSecretScan(findings []SecretFinding, hint string) *Problem {
+	p.SecretFindings = findings
+	p.SecretHint = hint
 	return p
 }
 
@@ -159,6 +245,27 @@ const (
 	CodePlanLimitConcur = "plan_limit_concurrency"
 	CodeSourceTooLarge  = "source_too_large"
 	CodeSourceInvalid   = "source_invalid"
+	// CodeSecretScanStrict is the 422 sentinel returned by both
+	//   - cmd/apid/scan_service.go (server-side tree scan rejected)
+	//   - cmd/gregale/printErr (--secret-scan=strict client-side rejected)
+	// The Problem body carries SecretFindings []SecretFinding +
+	// SecretHint string so the SDK can render the same UI for either
+	// rejection path. Distinct from CodeSourceInvalid (tarball shape
+	// is fine — the SECRET inside is the problem).
+	CodeSecretScanStrict = "secret_scan_strict"
+	// CodeImageSecretDetected is the wire-stable 422 sentinel
+	// for imaged-side secret findings in the assembled image
+	// (PR-A). Distinct from CodeSecretScanStrict (the
+	// cmd/apid source-tree upload path) because the scan
+	// source is different: CodeSecretScanStrict fires on the
+	// customer's source-tree bytes; CodeImageSecretDetected
+	// fires on the post-build OCI image bytes (Dockerfile
+	// ENV, --build-arg, COPY'd .env files). Both surface as
+	// 422 envelopes with `extra.secret_findings`, but the
+	// dashboard renders the image-layer case separately so
+	// the customer knows to look at the build path rather
+	// than the source tree.
+	CodeImageSecretDetected = "image_secret_detected"
 	// CodeInvalidRef is the DEPLOY-PROV-4 / ADR-092 (issue #739)
 	// 400 sentinel for POST /v1/apps/{slug}/deployments/source-ref
 	// when the supplied ref is not a valid commit SHA / branch /
@@ -209,6 +316,28 @@ const (
 	// bounds it at 1 second so the wire always emits a non-zero
 	// hint.
 	CodeWaitForWarm = "wait_for_warm"
+	// CodeEdgeRuleMaintenance marks a kind=maintenance edge-rule
+	// hit on the gatewayd hot path (ADR-091 amendment, PR-A
+	// #???). The customer configured an (host, path, http_method)
+	// tuple to return 503 + Retry-After; the gate fires BEFORE
+	// auth and BEFORE wake so a maintenance 503 never pays a
+	// cold-boot cost. Distinct from CodeCapacity / CodeWaitForWarm
+	// (transient platform-state 503s) — this is a deliberate,
+	// long-lived customer off-switch. 503 status via StatusForCode.
+	// The Retry-After header is the canonical UX; the builder
+	// below bounds it at 1 second so the wire always emits a
+	// non-zero hint. Distinct from CodeAppMaintenance (the
+	// per-app coarse sibling on apps.maintenance_mode) so the two
+	// primitives are differentiable on dashboards.
+	CodeEdgeRuleMaintenance = "edge_rule_maintenance"
+	// CodeAppMaintenance marks an apps.maintenance_mode coarse-gate
+	// hit on the gatewayd hot path (ADR-091 amendment). The
+	// customer pinned the whole app via PATCH /v1/apps/{slug};
+	// the gatewayd applier (applyAppsMaintenanceMode, §4.1.2.0)
+	// short-circuits every request to this app with 503 +
+	// Retry-After BEFORE auth, BEFORE wake. Distinct from
+	// CodeEdgeRuleMaintenance (the per-route fine-grained kind).
+	CodeAppMaintenance = "app_maintenance_mode"
 	// CodeAdmissionRefused marks a wake that schedd refused because
 	// the account's current-month overage cents met/exceeded
 	// accounts.overage_cap_cents (issue #561 / PR-XXX). Distinct
@@ -247,6 +376,31 @@ const (
 	// than "we deliberately refused". Use this for any 500 where the
 	// handler can't recover; pair with api.ErrInternal for a one-liner.
 	CodeInternal = "internal_error"
+	// CodeBadRequest is returned by handlers for a 400 on a
+	// malformed inbound body that isn't covered by a more specific
+	// code (e.g. the validate rule's body-read failure). Distinct
+	// from CodeValidation (422, schema-level rejection) so the
+	// dashboard pivots the message from "fix the format" to
+	// "the schema is wrong".
+	CodeBadRequest = "bad_request"
+	// CodeBadGateway is returned by the gateway when an upstream
+	// dependency (the validate-rule compile-time defense, a JWKS
+	// fetch, etc.) fails in a way that's clearly the gateway's
+	// fault rather than the customer's. 502 + this code = the
+	// operator's on-call should look at the daemon.
+	CodeBadGateway = "bad_gateway"
+	// CodeUnsupportedMediaType is returned when a kind=validate
+	// rule's ContentTypes gate rejects the inbound request.
+	// Distinct from CodeBadRequest so the dashboard pivots the
+	// message to "send a different Content-Type".
+	CodeUnsupportedMediaType = "unsupported_media_type"
+	// CodeRequestTooLarge is returned when the inbound body
+	// exceeds the per-rule cap (kind=validate MaxBodyBytes) or
+	// the plan's outer cap (api.MaxRequestBodyBytes). Distinct
+	// from CodeBadRequest so the dashboard pivots the message
+	// to "send a smaller body" — the customer's app's UI can
+	// chunk on receipt.
+	CodeRequestTooLarge = "request_too_large"
 	// CodeMFARequired is returned by requireMFA when a session-cookie
 	// principal is mfa_pending and the route is not on the MFA
 	// allowlist (IAM-2 / issue #186). Distinct from CodeForbidden so
@@ -404,6 +558,49 @@ const (
 	// retry-guidance branch.
 	CodeEnvScopeInvalid  = "env_scope_invalid"
 	CodeEnvScopeReserved = "env_scope_reserved"
+
+	// ADR-098 §D5: data-placement hints quota (Free customer + 0 cap
+	// gates the capture path; Hobby+ customers can hold up to their
+	// per-plan DataPlacementHintsPerApp). Distinct codes so a
+	// dashboard can render "your plan doesn't include data
+	// placement" (402 plan_limit_data_upstreams) apart from
+	// "delete one to add another" (403 plan_limit_data_upstreams —
+	// same code, different defaultStatus; the StateError wrapper
+	// lifts the right one).
+	//
+	// Wait — the two are distinct codes below:
+	//   * CodePlanDataUpstreamsNotAllowed = 402, plan doesn't
+	//     unlock the surface (Free today).
+	//   * CodePlanLimitDataUpstreams = 403, the per-plan cap is
+	//     reached.
+	// Mirrors the CodePlanWebhooksNotAllowed vs CodePlanWebhookQuota
+	// split at line 533/534.
+	CodePlanDataUpstreamsNotAllowed = "plan_data_upstreams_not_allowed" // 402, Free
+	CodePlanLimitDataUpstreams      = "plan_limit_data_upstreams"       // 403, per-app cap reached
+
+	// ADR-098 §D4 + §11: explicit-upstream write surface validation.
+	// Distinct codes from CodeEnvVarInvalidKey / CodeEnvVarValueTooLarge
+	// because the lifecycle and quota shape differ: a data upstream is
+	// keyed by (scope, kind, host, port) and the value is the host
+	// (not a connection string), and the §11 barrier requires the
+	// plaintext host never reaches the response body or the audit
+	// surface. Mirrors the CodePlanRegistryCredentialNotAllowed /
+	// CodeInvalidRegistryHost split at line 533/535.
+	CodeUpstreamInvalidKind = "upstream_invalid_kind" // 400, closed-vocab check
+	CodeUpstreamInvalidHost = "upstream_invalid_host" // 400, RFC-952/1123 hostname check
+	CodeUpstreamInvalidPort = "upstream_invalid_port" // 400, 1..65535 range check
+	CodeUpstreamNotFound    = "upstream_not_found"    // 404, DELETE/GET absent
+
+	// ADR-091 / PR-D: per-deployment env scope collision. The
+	// partial unique index `deployments_app_scope_live_uniq`
+	// (migration 00213) makes two live rows on the same
+	// (app_id, scope) impossible — the second create returns
+	// state.ErrConflict wrapping the constraint name. The handler
+	// decodes the wrapped error to surface this code (409) so a
+	// customer can branch on "supersede the prior prod deployment
+	// first" rather than retry blindly. Renders 409 Conflict,
+	// matching the rest of state.ErrConflict's 4xx family.
+	CodeDeploymentScopeCollision = "deployment_scope_collision"
 
 	// Trusted cosign signers (issue #472 / ADR-054). Same shape as
 	// the env-var quota — config cap, not a credential one — but a
@@ -636,6 +833,18 @@ const (
 	// wake_idle_timeout, so the gate is fail-closed at create time
 	// AND at PATCH time (no override path).
 	CodePlanWebSocketNotAllowed = "plan_websocket_not_allowed"
+
+	// ADR-093: customer attempted PATCH-true on Free for
+	// apps.route_metrics_enabled. Same gate shape as
+	// CodePlanWebSocketNotAllowed above; distinct code so the
+	// CLI can render "per-route metrics is a paid feature"
+	// alongside the streaming + warm-snapshot copy without
+	// conflating them in telemetry. The Free plan is the
+	// abuse-floor tier where per-route cardinality would not
+	// have a budget alongside the per-app rollups, so the gate
+	// is fail-closed at create time AND at PATCH time (no
+	// override path).
+	CodePlanRouteMetricsNotAllowed = "plan_route_metrics_not_allowed"
 
 	// Issue #470 / ADR-055: out-of-range warm-snapshot threshold
 	// values from a PATCH (warm_snapshot_min_requests outside [1,
@@ -888,6 +1097,36 @@ const (
 	CodeOrgLastOwner             = "org_last_owner"
 	CodeOrgPersonalImmutable     = "org_personal_immutable"
 	CodeOrgAPIKeyRequiresOrg     = "org_api_key_requires_org"
+	// CodeTenantSurfacesNotAllowed marks POST /v1/apps/{slug}/tenant-surfaces
+	// when the account's plan does not enable surfaces (Free today, ADR-100
+	// / issue #879). Distinct from CodeTenantSurfaceQuota (the surface
+	// cap is met) so the customer sees "upgrade your plan" vs "delete a
+	// surface" — the next action is different. 402 mirrors the
+	// *NotAllowed siblings (CodePlanCronsNotAllowed, etc.).
+	CodeTenantSurfacesNotAllowed = "tenant_surfaces_not_allowed"
+	// CodeTenantSurfaceQuota marks the per-account tenant_surfaces cap
+	// (Hobby 1 / Pro 5 / Scale 25). The Problem carries Limit +
+	// Observed (the observed count is the cap) so the dashboard can
+	// show "you have N surfaces, the cap is M". 429.
+	CodeTenantSurfaceQuota = "tenant_surface_quota"
+	// CodeTenantHostnameQuota marks the per-surface tenant_hostnames
+	// cap (Hobby 10 / Pro 50 / Scale 250). The Problem carries Limit
+	// + Observed + SurfaceID so the customer can name the overflowing
+	// surface in the support ticket. 429.
+	CodeTenantHostnameQuota = "tenant_hostname_quota"
+	// CodeTenantHostnameAlreadyClaimed marks POST
+	// /v1/apps/{slug}/tenant-surfaces/{id}/hostnames when the
+	// hostname is already attached to another surface on any account
+	// (the UQ on tenant_hostnames.hostname is global, not
+	// account-scoped). 409.
+	CodeTenantHostnameAlreadyClaimed = "tenant_hostname_already_claimed"
+	// CodeTenantSurfaceCertKindInvalid marks a surface create / update
+	// with cert_kind not in the closed set (per_host_san only today;
+	// shared_wildcard is schema-accepted but issuer-rejected per
+	// ADR-100 D4). Distinct from CodeValidation because the wire
+	// contract for the customer surface is "the cert engine can't
+	// mint this kind yet". 400.
+	CodeTenantSurfaceCertKindInvalid = "tenant_surface_cert_kind_invalid"
 )
 
 // SecretKeyPattern is the regex enforced by the app_secrets.key CHECK constraint
@@ -933,7 +1172,8 @@ func StatusForCode(code string) int {
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
 		CodeAlertRuleInvalid, CodeAppWebhookInvalid, CodeHandlerMissing, CodeImageRequired:
 		return http.StatusBadRequest
-	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm:
+	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm,
+		CodeEdgeRuleMaintenance, CodeAppMaintenance:
 		return http.StatusServiceUnavailable
 	case CodeScanCritical:
 		// 503 — the base ext4 has a CRITICAL Grype finding
@@ -1003,6 +1243,14 @@ func StatusForCode(code string) int {
 		// the GET /v1/deployments/{id} response and the CLI's
 		// `faas deployment <id>` render it identically.
 		return http.StatusUnprocessableEntity
+	case CodeRequestValidationFailed:
+		// 422 — kind=validate edge rule rejected the request body.
+		// Sits next to CodeStatelessOnlyViolation / CodeDeployFailed
+		// in the 422 family: well-formed request, content policy
+		// refuses. The detail body carries Problem.Errors; an SDK
+		// distinguishes this from CodeValidation by the `code`
+		// (gate lives on the gateway hot path, not the apid layer).
+		return http.StatusUnprocessableEntity
 	case CodePayment:
 		return http.StatusPaymentRequired
 	case CodePlanLimitSecrets:
@@ -1026,6 +1274,18 @@ func StatusForCode(code string) int {
 		return http.StatusRequestEntityTooLarge
 	case CodeInvalidRegistryHost, CodeRegistryCredentialNotFound:
 		return http.StatusBadRequest
+	// ADR-098: data-placement hints (issue #395 mirror + Free gate).
+	// CodePlanDataUpstreamsNotAllowed = 402 (plan doesn't unlock the
+	// surface, like CodePlanWebhooksNotAllowed). CodePlanLimitDataUpstreams
+	// = 403 (per-plan cap reached, like CodePlanWebhookQuota).
+	case CodePlanDataUpstreamsNotAllowed:
+		return http.StatusPaymentRequired
+	case CodePlanLimitDataUpstreams:
+		return http.StatusForbidden
+	case CodeUpstreamInvalidKind, CodeUpstreamInvalidHost, CodeUpstreamInvalidPort:
+		return http.StatusBadRequest
+	case CodeUpstreamNotFound:
+		return http.StatusNotFound
 	// Env vars (issue #395 / ADR-045): mirror the secrets status shape
 	// so SDK callers can reuse the same error-decoding pattern. Plan
 	// quota is 403, value size is 413, key regex + not-found are 400.
@@ -1160,6 +1420,14 @@ func StatusForCode(code string) int {
 		return http.StatusGone
 	case CodeOrgRoleForbidden, CodeOrgMemberCapExceeded, CodeOrgInvitationCapExceeded:
 		return http.StatusForbidden
+	case CodeBadRequest:
+		return http.StatusBadRequest
+	case CodeBadGateway:
+		return http.StatusBadGateway
+	case CodeUnsupportedMediaType:
+		return http.StatusUnsupportedMediaType
+	case CodeRequestTooLarge:
+		return http.StatusRequestEntityTooLarge
 	default:
 		return http.StatusInternalServerError
 	}
@@ -1255,6 +1523,52 @@ func ErrWaitForWarm(cooldownS int, l Limits, observed int) *Problem {
 		WithLimit(int64(cooldownS), int64(observed)).
 		WithDocs(docsBase+"/scaling-policy#cooldown").
 		WithHeader("Retry-After", strconv.Itoa(cooldownS))
+}
+
+// ErrEdgeRuleMaintenance is returned by the gatewayd hot-path
+// applier (pkg/gateway.(*Handler).applyEdgeRuleMaintenance,
+// §4.1.2.13) when a kind=maintenance edge-rule matches the inbound
+// (host, path, http_method). The Retry-After header is always a
+// positive integer; per-rule retryAfterSeconds (from the rule's
+// EdgeRuleMaintenanceAction) overrides the platform default
+// (EdgeRuleMaintenanceRetryAfterSeconds, 60 s) when > 0. msg is
+// the customer-facing detail string from the rule's action body
+// (≤ 512 B; same payload-size budget as
+// EdgeRuleValidateAction.Schema), surfaced as Problem.detail so
+// monitoring / curl users see why the endpoint is dark without
+// scraping the rule row. The builder clamps retryAfterS at 1 s on
+// the floor so the wire always emits a non-zero hint, matching
+// the ErrWaitForWarm convention.
+func ErrEdgeRuleMaintenance(retryAfterS int, msg string) *Problem {
+	if retryAfterS <= 0 {
+		retryAfterS = EdgeRuleMaintenanceRetryAfterSeconds
+	}
+	detail := "This endpoint is in maintenance mode"
+	if msg != "" {
+		detail = "Maintenance: " + msg
+	}
+	return NewProblem(http.StatusServiceUnavailable, CodeEdgeRuleMaintenance,
+		"Endpoint in maintenance", detail).
+		WithHeader("Retry-After", strconv.Itoa(retryAfterS))
+}
+
+// ErrAppMaintenanceMode is the coarse-gate sibling of
+// ErrEdgeRuleMaintenance — returned by the gatewayd hot-path
+// applier (pkg/gateway.(*Handler).applyAppsMaintenanceMode,
+// §4.1.2.0) when the matched app's apps.maintenance_mode boolean
+// is true. retryAfterS is the platform default
+// (EdgeRuleMaintenanceRetryAfterSeconds, 60 s) today; a future
+// per-app retry_after_seconds column is D20.X. appSlug is surfaced
+// in the Problem.detail so monitoring / curl users see which app
+// is in maintenance. The builder clamps retryAfterS at 1 s on the
+// floor so the wire always emits a non-zero hint.
+func ErrAppMaintenanceMode(retryAfterS int, appSlug string) *Problem {
+	if retryAfterS <= 0 {
+		retryAfterS = EdgeRuleMaintenanceRetryAfterSeconds
+	}
+	return NewProblem(http.StatusServiceUnavailable, CodeAppMaintenance,
+		"App in maintenance", fmt.Sprintf("App %q is in maintenance mode", appSlug)).
+		WithHeader("Retry-After", strconv.Itoa(retryAfterS))
 }
 
 // ErrAdmissionRefused is the typed Problem builder for the issue #561
@@ -1506,13 +1820,45 @@ const (
 	CodeEdgeRuleConflict           = "edge_rule_conflict"
 	CodePlanLimitEdgeRules         = "plan_limit_edge_rules"
 	CodePlanEdgeRuleKindNotAllowed = "plan_edge_rule_kind_not_allowed"
-	CodeCORSOriginNotAllowed       = "cors_origin_not_allowed"
-	CodeJWTMissingToken            = "jwt_missing_token"
-	CodeJWTMissingIssuer           = "jwt_missing_issuer"
-	CodeJWTAudienceMismatch        = "jwt_audience_mismatch"
-	CodeJWTSignatureInvalid        = "jwt_signature_invalid"
-	CodeIPDenied                   = "ip_denied"
-	CodeHeaderMutationForbidden    = "header_mutation_forbidden"
+	// CodePlanEdgeRuleKindQuotaReached is the per-kind quota error
+	// (ADR-091 D22). Distinct from CodePlanLimitEdgeRules so the
+	// customer sees the specific kind that tripped ("1/1 geo rules
+	// on Free; upgrade to Hobby for 5") rather than the generic
+	// "edge rules cap reached" message. The href in the problem
+	// payload points to the per-kind paragraphs in the docs.
+	CodePlanEdgeRuleKindQuotaReached = "plan_edge_rule_kind_quota_reached"
+	CodeCORSOriginNotAllowed         = "cors_origin_not_allowed"
+	CodeJWTMissingToken              = "jwt_missing_token"
+	CodeJWTMissingIssuer             = "jwt_missing_issuer"
+	CodeJWTAudienceMismatch          = "jwt_audience_mismatch"
+	CodeJWTSignatureInvalid          = "jwt_signature_invalid"
+	CodeIPDenied                     = "ip_denied"
+	// CodeGeoDenied mirrors CodeIPDenied for the kind=geo primitive
+	// (ADR-091 D21). Distinct so dashboards / metrics can
+	// disambiguate a geo deny from any other 403 on the wire — a
+	// geo deny is policy-driven (ISO 3166-1 allow/deny), not an
+	// auth failure or scope check, and the stable code lets
+	// customers write runbooks that key on code !=
+	// insufficient_scope without parsing titles.
+	CodeGeoDenied = "geo_denied"
+	// CodeRequestValidationFailed is the 422 a kind=validate edge
+	// rule emits when the inbound request body fails the customer's
+	// JSON Schema. Carries Problem.Errors (Cloudflare / Stripe shape)
+	// with one FieldError per mismatch (field + expected + got) so an
+	// SDK can drive form-field UI without parsing prose. Distinct
+	// from CodeValidation (the apid body-shape guard) because the
+	// gating policy and the actor are different.
+	CodeRequestValidationFailed = "request_validation_failed"
+	CodeHeaderMutationForbidden = "header_mutation_forbidden"
+	// CodeRequestBudgetExceeded is the 504 a kind=budget edge rule
+	// (or its plan-level default) emits when the per-request
+	// wall-clock budget fires before the handler can write a
+	// response. The platform-enforced budget — the load-bearing
+	// contract is "deadline fires from any hop, not just the
+	// handler body" — surfaces this single stable code on every
+	// outbound problem envelope so an SDK can branch on it
+	// without parsing prose. ADR-093 §Decision.
+	CodeRequestBudgetExceeded = "request_budget_exceeded"
 )
 
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
@@ -1679,6 +2025,140 @@ func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem 
 func ErrAppWebhookInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeAppWebhookInvalid,
 		"Invalid webhook", reason)
+}
+
+// ErrTenantSurfacesNotAllowed is returned by apid's createTenantSurface
+// handler when the account's plan does not enable surfaces (Free today,
+// ADR-100 / issue #879). Fires BEFORE the store is touched so a Free
+// customer gets a clean 402 instead of a quota round-trip. Mirrors the
+// ErrPlanCronsNotAllowed shape.
+func ErrTenantSurfacesNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodeTenantSurfacesNotAllowed,
+		"Tenant surfaces unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include tenant surfaces; upgrade to Hobby or above to expose one app to many customer hostnames under a single cert.", p)).
+		WithDocs(docsBase + "/plans#tenant-surfaces")
+}
+
+// ErrTenantSurfaceQuota is returned when
+// CreateTenantSurfaceIfUnderQuota surfaces a *state.TenantSurfaceQuotaError.
+// 403 (not 402) because the plan DOES unlock surfaces — the right copy
+// is "delete a surface to add another", not "upgrade to Hobby". The
+// Problem's Limit/Observed carry the cap values so the dashboard can
+// render the count.
+func ErrTenantSurfaceQuota(p Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTenantSurfaceQuota,
+		"Tenant surface limit reached",
+		fmt.Sprintf("%s plan caps tenant surfaces at %d per account; you have %d. Delete one to add another.",
+			p, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#tenant-surfaces")
+}
+
+// ErrTenantHostnameQuota is returned when
+// CreateTenantHostnameIfUnderQuota surfaces a *state.TenantHostnameQuotaError.
+// The Problem's Limit/Observed/SurfaceID together name the overflowing
+// surface in the support ticket. 403 mirrors the sibling per-scope
+// quota factories.
+func ErrTenantHostnameQuota(p Plan, surfaceID string, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodeTenantHostnameQuota,
+		"Tenant hostname limit reached",
+		fmt.Sprintf("%s plan caps tenant hostnames at %d per surface; you have %d on surface %s. Remove one to add another.",
+			p, limit, observed, surfaceID)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#tenant-surfaces")
+}
+
+// ErrTenantHostnameAlreadyClaimed is returned when the global UQ on
+// tenant_hostnames.hostname trips (the same hostname is already
+// attached to another surface on any account). 409 surfaces the
+// ownership invariant — the customer must pick a unique hostname.
+func ErrTenantHostnameAlreadyClaimed(hostname string) *Problem {
+	return NewProblem(http.StatusConflict, CodeTenantHostnameAlreadyClaimed,
+		"Tenant hostname already claimed",
+		fmt.Sprintf("hostname %q is already attached to another tenant surface; pick a unique hostname.", hostname))
+}
+
+// ErrTenantSurfaceCertKindInvalid is returned when the apid validator
+// rejects an unsupported cert_kind at create / update time. The
+// schema accepts (per_host_san, shared_wildcard) for forward
+// compatibility, but the issuer rejects shared_wildcard today (the
+// customer-zone DNS-01 solver ships in a follow-up ADR per ADR-100
+// D4). 400 mirrors the other *Invalid code family.
+func ErrTenantSurfaceCertKindInvalid(kind string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeTenantSurfaceCertKindInvalid,
+		"Unsupported cert kind",
+		fmt.Sprintf("cert kind %q is not supported in v1; use per_host_san.", kind))
+}
+
+// ErrPlanDataUpstreamsNotAllowed (ADR-098 §D5) is the 402 returned
+// by apid's createUpstream handler when the customer's plan has
+// DataPlacementHintsPerApp == 0 (Free today). Mirrors
+// ErrPlanWebhooksNotAllowed at line 1883: fires BEFORE loadApp so a
+// Free customer posting to a non-existent slug gets a clean 402
+// instead of a 404. The 402 (PaymentRequired) shape signals
+// "upgrade-required" rather than "forbidden".
+func ErrPlanDataUpstreamsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanDataUpstreamsNotAllowed,
+		"Data-placement hints unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include data-placement hints; upgrade to Hobby or above to capture upstreams.", p)).
+		WithDocs(docsBase + "/plans#data-placement")
+}
+
+// ErrPlanLimitDataUpstreams (ADR-098 §D5) is the 403 returned when
+// CreateDataUpstreamIfUnderQuota surfaces a state-layer quota
+// error. Mirrors ErrPlanWebhookQuota at line 1900 — the plan DOES
+// unlock the surface, the right copy is "delete one to add another",
+// not "upgrade". The handler renders the (limit, observed) pair via
+// WithLimit so the dashboard can show "3/3 — at the cap".
+func ErrPlanLimitDataUpstreams(plan Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanLimitDataUpstreams,
+		"Data-upstream limit reached",
+		fmt.Sprintf("%s plan caps data upstreams at %d per app; you have %d. Delete one to add another.",
+			plan, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#data-placement")
+}
+
+// ErrUpstreamInvalidKind (ADR-098 §D4) is the 400 returned when
+// the customer's PUT body names a kind that's not in the 14-value
+// closed vocabulary (postgres, redis, mongo, ...). Distinct from
+// CodeEnvVarInvalidKey because the surface is a typed DTO, not a
+// free-form string. The handler reads DataUpstreamKindIsValid
+// (PR-B) to surface this code.
+func ErrUpstreamInvalidKind(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeUpstreamInvalidKind,
+		"Invalid data-upstream kind", reason)
+}
+
+// ErrUpstreamInvalidHost (ADR-098 §D4) is the 400 returned when
+// the host fails the RFC-952/1123 regex (with the IPv4 backstop
+// that PR-A added at migration 00226's
+// `data_upstreams_host_check` CHECK constraint). Mirrors
+// CodeInvalidRegistryHost at line 535.
+func ErrUpstreamInvalidHost(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeUpstreamInvalidHost,
+		"Invalid data-upstream host", reason)
+}
+
+// ErrUpstreamInvalidPort (ADR-098 §D4) is the 400 returned when
+// the port is outside [1, 65535] (matching the migration CHECK).
+// Distinct from CodeUpstreamInvalidHost so a customer with a
+// valid host + invalid port gets a precise error code rather than
+// a generic "invalid host".
+func ErrUpstreamInvalidPort(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeUpstreamInvalidPort,
+		"Invalid data-upstream port", reason)
+}
+
+// ErrUpstreamNotFound (ADR-098 §D4) is the 404 returned when a
+// DELETE or GET targets an upstream_id that doesn't exist on this
+// app. Mirrors CodeRegistryCredentialNotFound at line 568 — the
+// 404 vs 400 distinction is what lets the SDK distinguish "delete
+// a row that's already gone" (idempotent) from "fix the URL".
+func ErrUpstreamNotFound(upstreamID string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeUpstreamNotFound,
+		"Data upstream not found",
+		fmt.Sprintf("no data upstream with id %q on this app.", upstreamID))
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't
@@ -2759,8 +3239,32 @@ func ErrPlanEdgeRuleKindNotAllowed(plan Plan, kind string) *Problem {
 		WithDocs(docsBase + "/plans#edge-rules")
 }
 
+// ErrPlanEdgeRuleKindQuotaReached is the 403 returned when the
+// per-kind edge-rule quota is reached (ADR-091 D22 — currently only
+// kind=geo has a separate per-kind cap; future paid-kind additions
+// can reuse the same RFC 7807 code with their own kind arg). distinct
+// from ErrPlanEdgeRulesQuotaReached which is the GENERAL cap trip
+// (no kind-specific signal). Surfacing the kind lets the customer see
+// "kind=geo: 1/1 rules used on Free; upgrade to Hobby for 5".
+func ErrPlanEdgeRuleKindQuotaReached(plan Plan, kind string, observed, limit int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanEdgeRuleKindQuotaReached,
+		"Edge rule kind quota reached",
+		fmt.Sprintf("the %s plan allows %d %s edge rule(s) per app; you have used %d. Upgrade to a higher tier for a larger quota.",
+			plan, limit, kind, observed)).
+		WithDocs(docsBase + "/plans#edge-rules")
+}
+
 // ErrCORSOriginNotAllowed is the 403 returned when a CORS rule's
 // allow_origins list rejects the request's Origin header.
+//
+// Exported for apid test fixtures and future per-app audit emit
+// (CORS improvements D1); not consumed on the gateway hot path
+// today, where origin rejection is silent — the gateway stamps
+// no Access-Control-Allow-Origin and the browser drops the
+// response client-side. A future ADR can switch the gateway to
+// emit this Problem on a per-deployment "fail-closed" opt-in;
+// today the failure mode matches the pre-PR-#841 contract
+// documented in spec §4.1.2.6.
 func ErrCORSOriginNotAllowed(origin string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeCORSOriginNotAllowed,
 		"CORS origin not allowed",
@@ -2814,6 +3318,25 @@ func ErrIPDenied(ip string) *Problem {
 		fmt.Sprintf("client IP %s is not in the allowlist and matched the deny list for this route.", ip))
 }
 
+// ErrGeoDenied is the 403 returned when a kind=geo rule's allow/deny
+// evaluator rejects the client country. The country is the ISO 3166-1
+// alpha-2 code resolved by the pkg/geoip.Reader lookup; decision is
+// either "deny" (rule.Deny matched) or "implicit_deny" (Allow was
+// non-empty and the country was not on it).
+func ErrGeoDenied(country, decision string) *Problem {
+	var detail string
+	switch decision {
+	case "deny":
+		detail = fmt.Sprintf("client country %s is on the deny list for this route.", country)
+	case "implicit_deny":
+		detail = fmt.Sprintf("client country %s is not on the allow list for this route.", country)
+	default:
+		detail = fmt.Sprintf("client country %s is not allowed for this route.", country)
+	}
+	return NewProblem(http.StatusForbidden, CodeGeoDenied,
+		"Country not allowed", detail)
+}
+
 // ErrHeaderMutationForbidden is the 422 returned when a kind=headers
 // rule tries to mutate a forbidden header (Host, Content-Length,
 // Transfer-Encoding, Connection, or any x-faas-*). Per-app
@@ -2822,4 +3345,23 @@ func ErrHeaderMutationForbidden(name string) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeHeaderMutationForbidden,
 		"Header mutation forbidden",
 		fmt.Sprintf("the header %q is reserved and cannot be mutated by edge rules.", name))
+}
+
+// ErrRequestValidationFailed is the 422 returned by the gateway hot path
+// when a kind=validate edge rule rejects the inbound request body. errs
+// carries one FieldError per JSON Schema mismatch (Cloudflare / Stripe
+// shape: field + expected + got). Title + detail stay stable so SDKs
+// that don't yet iterate `errors[]` can render the prose.
+func ErrRequestValidationFailed(ruleID string, errs []FieldError) *Problem {
+	p := NewProblem(http.StatusUnprocessableEntity, CodeRequestValidationFailed,
+		"Invalid request",
+		"the request body does not match the validate-edge-rule schema")
+	if ruleID != "" {
+		// Surface the rule id on the wire so a customer support agent
+		// can locate which rule fired without re-reading the audit
+		// log. Detail stays unchanged for SDK prose paths.
+		p.Detail = fmt.Sprintf("the request body does not match the validate-edge-rule schema (rule %s)", ruleID)
+	}
+	p.Errors = errs
+	return p
 }

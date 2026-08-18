@@ -52,13 +52,27 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (route|rewrite|redirect|headers|cors) but jwt/ip stay
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
-			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false,
+			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1,
+			// ADR-099 (#879): tenant surfaces — Free is the abuse-floor
+			// tier. The `tenant_surfaces` feature is the upsell; Free
+			// customers carry the single-tenant case via the legacy
+			// `custom_domains` path. Allowed=false means the create
+			// handler returns 402 CodeTenantSurfaceQuotaReached before
+			// the store is touched.
+			TenantSurfacesPerAccount: 0, TenantHostnamesPerSurface: 0, TenantSurfacesAllowed: false,
+			DataPlacementHintsPerApp: 0,
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
 			WebhookPerApp: 0, WebhookPerAccount: 0,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
+			// ADR-104: Free gets 100 — small slice of per-key
+			// cardinality, enough to size 1-2 per-key limits.
+			ThrottleMaxKeysPerRule: 100,
+			// ADR-099 PR-0: Free wake-admission throttle (1/1).
+			WakeBurstPerApp:     1,
+			WakeBurstPerAccount: 1,
 			// Issue #471 / ADR-047 (PR-A): Free is gated out of streaming
 			// entirely. The 25 MiB / 300 s caps are the legacy pre-#471
 			// defaults — kept here so a Free customer that PATCHes
@@ -73,6 +87,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// plan_websocket_not_allowed (mirrors Free's
 			// StreamingEnabled=false envelope above).
 			WebSocketEnabled: false,
+			// ADR-093: per-route metrics surface is a paid-tier
+			// feature — Free gated off (the abuse-floor tier's
+			// blast radius is small enough that route-level
+			// breakdown doesn't justify the per-app cap plumbing).
+			RouteMetricsEnabled: false,
 			// Issue #461 / ADR-062: Free has no private-registry
 			// credential surface (handler returns 403
 			// plan_registry_credentials_not_allowed).
@@ -97,7 +116,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #667 / ADR-078: tail primitive on with floor timeout.
 			TailEnabled: true, TailTimeoutS: 5, TailCapMax: 16, ConcurrentTailsPerInstance: 4,
 			// Issue #562: Free has no archive surface.
-			LogArchiveEnabled: false, LogArchiveRetentionDaysMax: 0},
+			LogArchiveEnabled: false, LogArchiveRetentionDaysMax: 0,
+			// ADR-096: Free = 1 day retention, 50 fingerprints, 25 request rows.
+			AppErrorsRetentionDays: 1, AppErrorsMaxFingerprintsPerApp: 50, AppErrorsMaxRequestRowsPerFingerprint: 25},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -145,7 +166,13 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND the jwt|ip kinds. The plan-kind gate surface
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
-			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
+			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5,
+			// ADR-099 (#879): tenant surfaces — Hobby is the entry
+			// paid tier. 1 surface with up to 10 verified hostnames.
+			// The "single SaaS customer, handful of end-customer
+			// subdomains" use case is the Hobby use case.
+			TenantSurfacesPerAccount: 1, TenantHostnamesPerSurface: 10, TenantSurfacesAllowed: true,
+			DataPlacementHintsPerApp: 3,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
 			// (10) one-to-one. Pending invitations = members/2
 			// because the default 7d TTL keeps the live set small.
@@ -159,6 +186,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
 			RateLimitPerAccountRPM: 200,
+			// ADR-104: Hobby gets 1000 — meaningful per-key
+			// cardinality on a small/medium deployment.
+			ThrottleMaxKeysPerRule: 1000,
+			// ADR-099 PR-0: Hobby wake-admission throttle (5/10).
+			WakeBurstPerApp:     5,
+			WakeBurstPerAccount: 10,
 			// Issue #471 / ADR-047 (PR-A): Hobby unlocks streaming
 			// (100 MiB / 900 s) — the first paid tier. PR-A wires
 			// the flag + accessor; PR-B activates the Flusher path.
@@ -168,6 +201,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// thin HTTP boundary, and Hobby is the tier where those
 			// workloads land first.
 			WebSocketEnabled: true,
+			// ADR-093: Hobby unlocks per-route observability as
+			// the first paid tier. The bounded cap (50 distinct
+			// real routes + __route_other__ overflow per app)
+			// is what makes this safe to enable across the
+			// paid tiers without per-tenant cardinality risk.
+			RouteMetricsEnabled: true,
 			// Issue #517 / PR-B: Hobby unlocks the `?deployment=`
 			// filter for the typical one-staging-deployment workload.
 			LogDeploymentFilterMax: 1,
@@ -197,7 +236,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #667 / ADR-078: tail primitive on at 15 s.
 			TailEnabled: true, TailTimeoutS: 15, TailCapMax: 16, ConcurrentTailsPerInstance: 16,
 			// Issue #562: Hobby unlocks log archive with 7-day retention.
-			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 7},
+			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 7,
+			// ADR-096: Hobby = 7 days, 200 fingerprints, 100 request rows.
+			AppErrorsRetentionDays: 7, AppErrorsMaxFingerprintsPerApp: 200, AppErrorsMaxRequestRowsPerFingerprint: 100},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
@@ -234,7 +275,13 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-089 (planned): edge rules — Pro unlocks 100 rules
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
-			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
+			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25,
+			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
+			// with up to 50 verified hostnames each. Each surface
+			// still binds to one app (the multi-app variant is the
+			// deferred footgun).
+			TenantSurfacesPerAccount: 5, TenantHostnamesPerSurface: 50, TenantSurfacesAllowed: true,
+			DataPlacementHintsPerApp: 10,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
 			// (50) one-to-one — every team member can hold a key
 			// for their own deploy target. Financial model is
@@ -245,6 +292,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			WebhookPerApp: 10, WebhookPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
+			// ADR-104: Pro gets 5000 — meaningful per-tenant
+			// cardinality on a multi-tenant deployment.
+			ThrottleMaxKeysPerRule: 5000,
+			// ADR-099 PR-0: Pro wake-admission throttle (20/30).
+			WakeBurstPerApp:     20,
+			WakeBurstPerAccount: 30,
 			// Issue #471 / ADR-047 (PR-A): Pro keeps the same streaming
 			// envelope as Hobby. The cap is the same; the per-app
 			// streaming path is gatewayd-internal-edged, not per-tier.
@@ -253,6 +306,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Upgrade bridge for the same reason as Hobby — production
 			// workloads at this tier run agent / WS-backed services.
 			WebSocketEnabled: true,
+			// ADR-093: Pro mirrors Hobby — per-route observability
+			// on by default; same bounded cap (50 + overflow).
+			RouteMetricsEnabled: true,
 			// Issue #517 / PR-B: Pro gets 10 — covers the typical
 			// multi-staging fan-out (prod + 3-5 staging + a few
 			// preview slots) without monopolising the schedd's
@@ -290,7 +346,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #667 / ADR-078: tail primitive on at 30 s.
 			TailEnabled: true, TailTimeoutS: 30, TailCapMax: 16, ConcurrentTailsPerInstance: 64,
 			// Issue #562: Pro extends retention to 30 days.
-			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 30},
+			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 30,
+			// ADR-096: Pro = 30 days, 1000 fingerprints, 500 request rows.
+			AppErrorsRetentionDays: 30, AppErrorsMaxFingerprintsPerApp: 1000, AppErrorsMaxRequestRowsPerFingerprint: 500},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
@@ -329,7 +387,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (5× Pro) AND jwt|ip. The 500 cap is the practical upper
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
-			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
+			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100,
+			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
+			// with up to 250 verified hostnames each. The 250 cap is
+			// bounded by LE's 100-SAN-per-cert limit (per_host_san
+			// falls back to per_host above ~100, surfaced via the
+			// cert engine, not quota).
+			TenantSurfacesPerAccount: 25, TenantHostnamesPerSurface: 250, TenantSurfacesAllowed: true,
+			DataPlacementHintsPerApp: 50,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
 			// (200) one-to-one — SaaS-scale multi-team + rotating-CI.
 			// Financial model is authoritative — derived value,
@@ -342,6 +407,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
 			RateLimitPerAccountRPM: 5000,
+			// ADR-104: Scale gets 10000 — full per-tenant
+			// cardinality on a multi-tenant SaaS deployment.
+			ThrottleMaxKeysPerRule: 10000,
+			// ADR-099 PR-0: Scale wake-admission throttle (100/150).
+			WakeBurstPerApp:     100,
+			WakeBurstPerAccount: 150,
 			// Issue #471 / ADR-047 (PR-A): Scale keeps the same envelope
 			// as Hobby/Pro. The streaming cap is uniform across paid
 			// tiers — the spec's paid-only unlock is the boolean, not
@@ -351,6 +422,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Upgrade bridge — production WS-backed services sit at
 			// this tier.
 			WebSocketEnabled: true,
+			// ADR-093: Scale mirrors Hobby/Pro — per-route
+			// observability on by default. The 50-cap is per-app;
+			// Scale customers can run more apps, not more routes
+			// per app, so the cap stays the same across plans.
+			RouteMetricsEnabled: true,
 			// Issue #517 / PR-B: Scale gets 50 — 5× Pro, tracks the
 			// larger app budget (100 vs 25) and multi-region staging
 			// fan-out SaaS-scale customers typically run.
@@ -384,7 +460,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #667 / ADR-078: tail primitive on at 60 s.
 			TailEnabled: true, TailTimeoutS: 60, TailCapMax: 16, ConcurrentTailsPerInstance: 256,
 			// Issue #562: Scale extends retention to 90 days.
-			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 90},
+			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 90,
+			// ADR-096: Scale = 90 days, 5000 fingerprints, 1000 request rows.
+			AppErrorsRetentionDays: 90, AppErrorsMaxFingerprintsPerApp: 5000, AppErrorsMaxRequestRowsPerFingerprint: 1000},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -1822,6 +1900,158 @@ func TestHAConstantsStable(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v (ADR-083/084 design value)",
 				c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestEdgeRulesGeoPerApp_PerPlanMatrix pins the per-plan matrix for the
+// new EdgeRulesGeoPerApp quota (ADR-091 D22). Free customers get 1
+// geo rule (the "block everything except DE" abuse-block use case),
+// Hobby=5, Pro=25, Scale=100. This is the FAIL-CLOSED shape that the
+// apid handler dispatches on ErrPlanEdgeRuleKindQuotaReached.
+//
+// Distinct from EdgeRulesPerApp (the general per-app cap), which is
+// 5/25/100/500 — geo is a high-touch abuse primitive so the per-kind
+// cap is intentionally tighter than the general cap on Free.
+func TestEdgeRulesGeoPerApp_PerPlanMatrix(t *testing.T) {
+	want := map[Plan]int{
+		PlanFree:  1,
+		PlanHobby: 5,
+		PlanPro:   25,
+		PlanScale: 100,
+	}
+	for plan, expected := range want {
+		l, ok := LimitsFor(plan)
+		if !ok {
+			t.Fatalf("LimitsFor(%s) returned !ok", plan)
+		}
+		if l.EdgeRulesGeoPerApp != expected {
+			t.Errorf("%s: EdgeRulesGeoPerApp = %d, want %d", plan, l.EdgeRulesGeoPerApp, expected)
+		}
+	}
+	// Sanity: at every plan tier, EdgeRulesGeoPerApp ≤ EdgeRulesPerApp
+	// (the per-kind cap must never exceed the general cap). A
+	// regression that swaps the two values breaks the fail-closed
+	// quota gate — Free customers could create more geo rules than
+	// total rules, which is impossible to enforce.
+	for _, plan := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale} {
+		l, _ := LimitsFor(plan)
+		if l.EdgeRulesGeoPerApp > l.EdgeRulesPerApp {
+			t.Errorf("%s: per-kind cap %d > general cap %d (per-kind must ≤ general)",
+				plan, l.EdgeRulesGeoPerApp, l.EdgeRulesPerApp)
+		}
+	}
+}
+
+// TestEdgeRulesGeoPerApp_MonotonicLadder pins that the per-plan
+// geo-cap ladder is non-decreasing. A regression where Pro < Hobby
+// or Scale < Pro breaks the upgrade story (a Pro customer
+// downgrading-from-Scale would gain geo capacity, which is an
+// invariant the billing model depends on).
+func TestEdgeRulesGeoPerApp_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.EdgeRulesGeoPerApp < prevL.EdgeRulesGeoPerApp {
+			t.Errorf("%s.EdgeRulesGeoPerApp (%d) < %s.EdgeRulesGeoPerApp (%d)",
+				ladder[i], currL.EdgeRulesGeoPerApp, ladder[i-1], prevL.EdgeRulesGeoPerApp)
+		}
+	}
+}
+
+// TestEdgeRulesThrottlePerApp_PerPlanMatrix pins the per-plan matrix
+// for EdgeRulesThrottlePerApp (ADR-091 D20.5 amendment, issue #881).
+// Free 1, Hobby 5, Pro 25, Scale 100 — mirrors EdgeRulesGeoPerApp
+// so the upgrade curve is predictable.
+func TestEdgeRulesThrottlePerApp_PerPlanMatrix(t *testing.T) {
+	want := map[Plan]int{
+		PlanFree:  1,
+		PlanHobby: 5,
+		PlanPro:   25,
+		PlanScale: 100,
+	}
+	for plan, expected := range want {
+		l, ok := LimitsFor(plan)
+		if !ok {
+			t.Errorf("plan %s: missing from LimitsFor", plan)
+			continue
+		}
+		if l.EdgeRulesThrottlePerApp != expected {
+			t.Errorf("%s: EdgeRulesThrottlePerApp = %d, want %d", plan, l.EdgeRulesThrottlePerApp, expected)
+		}
+		// Sanity: throttle cap is bounded by total EdgeRulesPerApp.
+		if l.EdgeRulesThrottlePerApp > l.EdgeRulesPerApp {
+			t.Errorf("%s: EdgeRulesThrottlePerApp (%d) > EdgeRulesPerApp (%d); per-kind cap cannot exceed the per-app total",
+				plan, l.EdgeRulesThrottlePerApp, l.EdgeRulesPerApp)
+		}
+	}
+}
+
+// TestEdgeRulesThrottlePerApp_MonotonicLadder pins that the per-plan
+// throttle-cap ladder is non-decreasing. Same load-bearing reasoning
+// as the geo ladder — the upgrade story and the billing model both
+// depend on Free ≤ Hobby ≤ Pro ≤ Scale.
+func TestEdgeRulesThrottlePerApp_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.EdgeRulesThrottlePerApp < prevL.EdgeRulesThrottlePerApp {
+			t.Errorf("%s.EdgeRulesThrottlePerApp (%d) < %s.EdgeRulesThrottlePerApp (%d)",
+				ladder[i], currL.EdgeRulesThrottlePerApp, ladder[i-1], prevL.EdgeRulesThrottlePerApp)
+		}
+	}
+}
+
+// TestDataPlacementHintsPerApp_PerPlanMatrix pins the per-plan
+// matrix for the ADR-098 §D5 data-placement cap. A regression that
+// swaps the per-plan values breaks the customer quota dashboard
+// ("you have N/M data upstreams").
+func TestDataPlacementHintsPerApp_PerPlanMatrix(t *testing.T) {
+	want := map[Plan]int{
+		PlanFree:  0,
+		PlanHobby: 3,
+		PlanPro:   10,
+		PlanScale: 50,
+	}
+	for plan, expected := range want {
+		l, ok := LimitsFor(plan)
+		if !ok {
+			t.Fatalf("LimitsFor(%s) returned !ok", plan)
+		}
+		if l.DataPlacementHintsPerApp != expected {
+			t.Errorf("%s: DataPlacementHintsPerApp = %d, want %d",
+				plan, l.DataPlacementHintsPerApp, expected)
+		}
+	}
+	// Sanity: the global UpstreamProbeMaxConcurrent and
+	// UpstreamFitMinDeltaMs constants live on the api package (not
+	// per-plan). A regression that moves them onto the Limits
+	// struct would break the meterd boot-time read path
+	// (cmd/meterd/main.go) which dereferences them as api.X, not
+	// planLimits[plan].X.
+	if UpstreamProbeMaxConcurrent <= 0 {
+		t.Errorf("UpstreamProbeMaxConcurrent must be positive, got %d", UpstreamProbeMaxConcurrent)
+	}
+	if UpstreamFitMinDeltaMs <= 0 {
+		t.Errorf("UpstreamFitMinDeltaMs must be positive, got %d", UpstreamFitMinDeltaMs)
+	}
+}
+
+// TestDataPlacementHintsPerApp_MonotonicLadder pins that the
+// per-plan data-placement-cap ladder is non-decreasing. Mirrors the
+// EdgeRulesGeoPerApp ladder — a regression where Pro < Hobby or
+// Scale < Pro breaks the upgrade story.
+func TestDataPlacementHintsPerApp_MonotonicLadder(t *testing.T) {
+	ladder := []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
+	for i := 1; i < len(ladder); i++ {
+		prevL, _ := LimitsFor(ladder[i-1])
+		currL, _ := LimitsFor(ladder[i])
+		if currL.DataPlacementHintsPerApp < prevL.DataPlacementHintsPerApp {
+			t.Errorf("%s.DataPlacementHintsPerApp (%d) < %s.DataPlacementHintsPerApp (%d)",
+				ladder[i], currL.DataPlacementHintsPerApp,
+				ladder[i-1], prevL.DataPlacementHintsPerApp)
 		}
 	}
 }

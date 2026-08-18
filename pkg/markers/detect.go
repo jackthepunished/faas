@@ -58,6 +58,13 @@ func DetectFromFS(fsys fs.FS) (Framework, error) {
 // when no marker is found at the root; a non-nil error is
 // reserved for IO failures (open, gzip, tar read).
 //
+// gregale pack archives one directory level (for example
+// app/package.json) because it preserves the packed source
+// directory's basename. Such an archive is treated as a project
+// root only when all regular entries share one common top-level
+// prefix and there are no regular files at the archive root. This
+// keeps an ordinary nested package.json from changing detection.
+//
 //nolint:forbidigo // path is the apid-spooled tarball that already passed apid's validateTarballShape (in cmd/apid/deploy_inputs.go) before builderd received the build notification. Symlink-attack impossible because apid wrote the file with a fresh random id. Direct unit-test callers construct the path themselves; rationale holds. The original comment lived at pkg/builderd/detect.go:40 and applies unchanged here.
 func DetectFromTarball(path string) (Framework, error) {
 	f, err := os.Open(path)
@@ -74,6 +81,9 @@ func DetectFromTarball(path string) (Framework, error) {
 
 	tr := tar.NewReader(gz)
 	present := map[string]bool{}
+	prefixed := map[string]map[string]bool{}
+	prefixes := map[string]bool{}
+	hasRootFile := false
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -81,12 +91,6 @@ func DetectFromTarball(path string) (Framework, error) {
 		}
 		if err != nil {
 			return FrameworkUnknown, fmt.Errorf("markers: read tar: %w", err)
-		}
-		// Top-level only — a nested package.json under apps/web is
-		// not the project's package.json. Mirrors the original
-		// pkg/builderd/detect.go:67-72 rule.
-		if strings.Contains(hdr.Name, "/") {
-			continue
 		}
 		// Skip directory entries — parity with DetectFromFS which
 		// drops IsDir() entries. Without this, a project with a
@@ -96,7 +100,27 @@ func DetectFromTarball(path string) (Framework, error) {
 		if hdr.Typeflag == tar.TypeDir {
 			continue
 		}
-		present[strings.ToLower(hdr.Name)] = true
+		name := strings.TrimPrefix(hdr.Name, "./")
+		parts := strings.Split(name, "/")
+		if len(parts) == 1 {
+			hasRootFile = true
+			present[strings.ToLower(parts[0])] = true
+			continue
+		}
+		prefixes[parts[0]] = true
+		if len(parts) == 2 && parts[0] != "" {
+			if prefixed[parts[0]] == nil {
+				prefixed[parts[0]] = map[string]bool{}
+			}
+			prefixed[parts[0]][strings.ToLower(parts[1])] = true
+		}
+	}
+	if !hasRootFile && len(prefixes) == 1 {
+		for _, files := range prefixed {
+			for name := range files {
+				present[name] = true
+			}
+		}
 	}
 	for _, m := range appMarkers {
 		if present[strings.ToLower(m.filename)] {

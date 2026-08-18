@@ -9,6 +9,7 @@ import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
 import type { ScanResult } from '../models/ScanResult.js';
+import type { SecretScanResult } from '../models/SecretScanResult.js';
 import type { SourceRefDeployRequest } from '../models/SourceRefDeployRequest.js';
 import type { UpdateDeploymentTrafficRequest } from '../models/UpdateDeploymentTrafficRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
@@ -451,6 +452,66 @@ export class DeploymentsService {
       errors: {
         401: `code: unauthorized`,
         404: `Deployment row missing, cross-account probe, or scan has not run yet.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Get per-deploy image-layer secret scan.
+   * Returns the per-deploy secret-scan audit row (PR-A /
+   * ADR-101). The scan runs on the per-app ext4 in imaged's
+   * deploy-complete path (after `SetDeploymentRootfs`, before
+   * the pending→snapshotting transition) using the same
+   * `pkg/secretscan` engine the apid source-tree rejection
+   * path uses — same patterns, same providers, same Severity
+   * table, same snippet policy.
+   *
+   * Status field is the closed enum:
+   * - `complete` — image layer walked clean; `findings=[]`.
+   * Stamped on every scan (clean OR hit) so the dashboard
+   * renders the audit row immediately after the build.
+   * - `complete_with_redactions` — at least one finding
+   * landed in the audit row; `error_code =
+   * 'image_secret_detected'` on the deployment. The
+   * deploy's pending→snapshotting transition does NOT
+   * fire.
+   *
+   * A 404 is returned when:
+   * - the deployment row does not exist,
+   * - the deployment belongs to a different account
+   * (IDOR-safe; no account-existence leak),
+   * - no scan has run yet (the deploy is still
+   * mid-pipeline or the row predates PR-A entirely).
+   *
+   * Each finding carries a `layer` label that attributes the
+   * finding to the per-walk source (`app` for the main image,
+   * `sidecar-<slug>` for each sidecar). Pre-PR-A rows
+   * (rejected source-tree bytes via the v2 422 path) carry
+   * `layer` empty or absent.
+   *
+   * @returns SecretScanResult The typed secret-scan payload. Shape mirrors the `deployments.secret_findings` jsonb column.
+   * @throws ApiError
+   */
+  public static getDeploymentSecretScan({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<SecretScanResult> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/deployments/{id}/secret-scan',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `Deployment row missing, cross-account probe, or secret scan has not been stamped for this deploy yet (pre-PR-A rows return 404 because the \`secret_findings\` jsonb has never been written).`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

@@ -2,10 +2,15 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AppErrorRequestsResponse } from '../models/AppErrorRequestsResponse.js';
+import type { AppErrorSampleResponse } from '../models/AppErrorSampleResponse.js';
+import type { AppErrorsSummaryResponse } from '../models/AppErrorsSummaryResponse.js';
 import type { AppMetricsResponse } from '../models/AppMetricsResponse.js';
 import type { AppResponse } from '../models/AppResponse.js';
+import type { AppRoutesResponse } from '../models/AppRoutesResponse.js';
 import type { AppSLOResponse } from '../models/AppSLOResponse.js';
 import type { AppsMetricsResponse } from '../models/AppsMetricsResponse.js';
+import type { AppStreamingStatus } from '../models/AppStreamingStatus.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
 import type { UpdateAppRequest } from '../models/UpdateAppRequest.js';
@@ -220,6 +225,101 @@ export class AppsService {
     });
   }
   /**
+   * Per-route breakdown for opt-in apps (ADR-093).
+   * Returns the `routes` array of the per-app metrics surface
+   * directly. Reverse-proxies the gatewayd-internal loopback
+   * control listener at `GET /v1/internal/apps/{slug}/routes`.
+   * The array is empty when `route_metrics_enabled` is false
+   * on the app (the gatewayd handler returns 200 + empty
+   * rows rather than 404 — the customer-facing "feature off"
+   * state is not a 404). The route label is method + raw
+   * path (pre-rewrite, ADR-093 D6); the `__route_other__`
+   * bucket surfaces the wildcard-path signal.
+   *
+   * @returns AppRoutesResponse The per-route rows for the app.
+   * @throws ApiError
+   */
+  public static getAppRoutes({
+    slug,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+  }): CancelablePromise<AppRoutesResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/routes',
+      path: {
+        'slug': slug,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app streaming classification probe (ADR-102 D6).
+   * Returns the streaming-status enum (one of `streaming`,
+   * `accept-json-downgrade`, `flag-disabled`, `plan-disallows`,
+   * `operator-disabled`, `upgrade-bypass`) the gatewayd handler
+   * would stamp on the `Streaming-Status` response header for a
+   * representative request to this app, plus the effective
+   * response-body cap (in bytes) and the per-gate flags.
+   *
+   * The probe is a pure read against the apid cache (the
+   * per-account `Plan` and the per-app `streaming_enabled`
+   * flag). It does NOT dial gatewayd-internal — the operator
+   * opt-in (`FAAS_GATEWAY_STREAMING` env) and per-edge-rule
+   * cap override are gatewayd-side state, so `effective_cap_bytes`
+   * reflects the plan cap (`cap_kind="plan"`) on every probe.
+   * A customer evaluating "will my next request stream?" must
+   * consider the operator-side flag separately; the canonical
+   * signal is the `Streaming-Status` response header on a real
+   * request, not this probe.
+   *
+   * `status=plan-disallows` means the customer's plan tier
+   * forbids `streaming_enabled=true`; the CreateApp gate (D5)
+   * already returns 403 `CodePlanStreamingNotAllowed` so this
+   * row should be unreachable from a properly-validated app,
+   * but the probe still reflects the persisted state for
+   * audits and pinned-SDK migrations.
+   *
+   * @returns AppStreamingStatus The streaming classification for the app.
+   * @throws ApiError
+   */
+  public static getAppStreamingCap({
+    slug,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+  }): CancelablePromise<AppStreamingStatus> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/streaming-cap',
+      path: {
+        'slug': slug,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
    * Per-app customer-facing SLO panel (issue
    * Closed-set windowed SLO panel for one app — the
    * customer-facing equivalent of AWS CloudWatch
@@ -271,6 +371,183 @@ export class AppsService {
       },
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app customer-facing automatic error grouping summary (ADR-096 / PR-B).
+   * Sentry-style grouped error view scoped to a customer's
+   * app. One row per `(account_id, app_id, fingerprint)` over
+   * the requested `[since, until]` window, sorted by `count
+   * DESC, last_seen_at DESC, fingerprint ASC`. Distinct from
+   * `GET /v1/apps/{slug}/slo` (issue #696 / ADR-082) which is
+   * the closed-set SLO summary (`1h` / `24h` / `7d`) — the
+   * errors summary uses a continuous `[since, until]` window
+   * with an explicit RFC3339Nano stamp instead.
+   *
+   * The window is clamped to `AppErrorsWindowMaxHours` (168h).
+   * When the clamp fires, `window_clamped` is true so the
+   * dashboard can render a "you widened the window past the
+   * cap" tile. The endpoint returns 200 with `items: []`
+   * when no fingerprints are present in the window — never
+   * 404. Cross-account slug is a 404 (IDOR-safe; the error
+   * is byte-identical to a real "no such app" 404).
+   *
+   * Fingerprints are derived at write time as
+   * `sha256(route_template || "\x1f" || http_status ||
+   * "\x1f" || error_class)`. The route is the matched
+   * template (e.g. `/users/{id}`), NEVER the expanded URL —
+   * this is the load-bearing cardinality fix that keeps the
+   * top-N bounded.
+   *
+   * @returns AppErrorsSummaryResponse The grouped error summary.
+   * @throws ApiError
+   */
+  public static getAppErrorsSummary({
+    slug,
+    since,
+    until,
+    cursor,
+    limit = 20,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * RFC3339Nano UTC window start. Defaults to `until - 24h`.
+     */
+    since?: string | null,
+    /**
+     * RFC3339Nano UTC window end. Defaults to `now()`.
+     */
+    until?: string | null,
+    /**
+     * Opaque pagination cursor from the previous response's `next_cursor`. Empty for the first page.
+     */
+    cursor?: string | null,
+    /**
+     * Page size. Default `AppErrorsSummaryDefaultLimit=20`, capped at `AppErrorsSummaryMaxLimit=100`.
+     */
+    limit?: number,
+  }): CancelablePromise<AppErrorsSummaryResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/errors/summary',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'since': since,
+        'until': until,
+        'cursor': cursor,
+        'limit': limit,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-fingerprint drill-down rows (ADR-096 / PR-B).
+   * Cursor-paginated drill-down over the request rows that
+   * landed on this fingerprint. Returns 404 when the
+   * fingerprint has been purged by the retention cron or
+   * never existed; the cross-account slug case is also 404
+   * (IDOR-safe byte-identical to a real "no such app" 404).
+   *
+   * @returns AppErrorRequestsResponse The drill-down rows (newest-first).
+   * @throws ApiError
+   */
+  public static listAppErrorRequests({
+    slug,
+    fingerprint,
+    cursor,
+    limit = 20,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 64-hex-char SHA-256 fingerprint of the error group; sha256(route_template || 0x1f || status || 0x1f || error_class).
+     */
+    fingerprint: string,
+    /**
+     * Opaque pagination cursor (received_at, request_id compound). Empty for the first page.
+     */
+    cursor?: string | null,
+    /**
+     * Page size. Default `AppErrorsSummaryDefaultLimit=20`.
+     */
+    limit?: number,
+  }): CancelablePromise<AppErrorRequestsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/errors/{fingerprint}',
+      path: {
+        'slug': slug,
+        'fingerprint': fingerprint,
+      },
+      query: {
+        'cursor': cursor,
+        'limit': limit,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Single oldest sample row + redacted headers (ADR-096 / PR-B).
+   * Returns the OLDEST request row for the fingerprint plus
+   * the redacted `headers_sample` (jsonb-decoded) and the
+   * list of `redactions_applied` pattern names so the
+   * dashboard can render a "we redacted X / Y / Z" badge.
+   * Returns 404 when the fingerprint has been purged.
+   *
+   * @returns AppErrorSampleResponse The sample row.
+   * @throws ApiError
+   */
+  public static getAppErrorSample({
+    slug,
+    fingerprint,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 64-hex-char SHA-256 fingerprint to inspect; the oldest request row for this group is returned with its redacted headers.
+     */
+    fingerprint: string,
+  }): CancelablePromise<AppErrorSampleResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/errors/{fingerprint}/first',
+      path: {
+        'slug': slug,
+        'fingerprint': fingerprint,
+      },
+      errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
         429: `429. Two response shapes:

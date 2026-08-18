@@ -122,7 +122,12 @@ type SchedAPI interface {
 	// passed through to the engine; empty falls through to the
 	// newest live deployment (Phase-1 fast path). Additive per
 	// ADR-016.
-	Wake(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error)
+	//
+	// scope (PR-B / issue #272): the preview scope (`pr-{N}`)
+	// the gateway parsed from the inbound Host header. Empty =
+	// prod (legacy single-deployment behaviour). Threaded through
+	// WithScope into the engine's resolveApp / loadAPIEnv.
+	Wake(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error)
 	// AdmitInstance is the schedule scale-out primitive (issue #168).
 	// Bypasses the Phase-1 fast-path so a gateway can demand a new
 	// instance even when others are already RUNNING. Returns a typed
@@ -139,7 +144,20 @@ type SchedAPI interface {
 	// the engine's default (newest live deployment) — the legacy
 	// single-deployment path. Non-empty asks the engine to admit on
 	// that specific live deployment. Additive per ADR-016.
-	AdmitInstance(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error)
+	//
+	// scope (PR-B / issue #272): the preview scope (`pr-{N}`).
+	AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (sched.WakeResult, error)
+	// EnsureWake (ADR-098) is the single-flight-safe wake RPC. The engine
+	// coalesces every concurrent EnsureWake call for the same app into one
+	// virtual boot; followers see the leader's outcome. The leader runs
+	// on a detached ctx (context.Background + WakeQueueTTLSeconds); only
+	// followers see the caller's ctx.
+	//
+	// Returns sched.ErrQueueFull when the per-app follower cap is exceeded
+	// (handlers map to ResourceExhausted / wake_queue_full) and
+	// sched.ErrAppDeleted when the app was deleted while a wake was in
+	// flight (Forget route; C6 wires the pg-notify channel).
+	EnsureWake(ctx context.Context, appID string) (sched.CoordOutcome, error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	// ParkWithReason is the meterd-triggered variant (M7, spec §4.7).
 	// The reason string is for the audit log; the park semantics are
@@ -303,7 +321,11 @@ func (s *Server) Wake(ctx context.Context, req *scheddpb.WakeRequest) (*scheddpb
 		return nil, err
 	}
 	start := time.Now()
-	res, err := s.engine.Wake(ctx, req.GetAppId(), req.GetDeploymentId())
+	// PR-B (issue #272 / ADR-095): scope is read from the wire
+	// request — the gateway sets it from the parsed
+	// `pr-{N}.{slug}.apps.<zone>` Host header. Empty scope = legacy
+	// prod behaviour, threaded via WithScope at the engine entry.
+	res, err := s.engine.Wake(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))
@@ -340,7 +362,10 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 		return nil, err
 	}
 	start := time.Now()
-	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId())
+	// PR-B (issue #272): scope threaded through AdmitInstance the
+	// same way as Wake. Empty scope = legacy prod; the engine's
+	// resolveApp then reads the LiveDeployment row by appID only.
+	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))
@@ -357,7 +382,72 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 		// see empty and the gateway treats that as "single-deployment
 		// legacy mode" (Target.DeploymentID empty, picker collapses).
 		DeploymentId: res.DeploymentID,
+		// request_count (ADR-098 C9) — populated by the batched
+		// writer (request_count column added by 00216). 0 on
+		// at-capacity paths; the engine's WakeResult.RequestCount
+		// is read after the Ledger admit and stamped on the
+		// wire for the gateway's per-instance cache.
+		RequestCount: int32(res.RequestCount),
 	}, nil
+}
+
+// EnsureWake (ADR-098) is the single-flight-safe wake RPC. The engine
+// coalesces every concurrent EnsureWake call for the same app into one
+// virtual boot; followers see the leader's outcome.
+//
+// Pre-ADR-098 callers continue to use Wake / AdmitInstance on the
+// legacy wire — this method is additive per ADR-016.
+func (s *Server) EnsureWake(ctx context.Context, req *scheddpb.EnsureWakeRequest) (*scheddpb.EnsureWakeResponse, error) {
+	const op = "EnsureWake"
+	if _, err := authorizeApp(ctx, s.owner, s.resolver, req.GetAppId()); err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	out, err := s.engine.EnsureWake(ctx, req.GetAppId())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		// Per-app queue-full is a 503; the engine returns the typed
+		// sentinel. Other failures (ErrAppDeleted, ledger, chooser,
+		// store) are forwarded as RFC 7807 problems via toProblem.
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	// CoordOutcome can carry a non-nil Err even when the engine's
+	// direct return is nil — the leader's ensure path encodes
+	// wake-level failures (ErrAppDeleted, ErrQueueFull, ledger
+	// errors set by Forget) onto out.Err so followers inherit
+	// them. Otherwise the gateway would observe a phantom 200
+	// with empty Instance fields.
+	if out.Err != nil {
+		return nil, grpcerr.ToStatus(toProblem(out.Err))
+	}
+	if out.Instance == nil {
+		// Defensive: a successful EnsureWake with nil instance is a
+		// bug — surface it as an internal problem so the gateway
+		// sees a 500 rather than a phantom 200.
+		return nil, grpcerr.ToStatus(api.NewProblem(int(codes.Internal), "ensure_wake_nil_instance",
+			"engine EnsureWake returned nil instance without error", ""))
+	}
+	return &scheddpb.EnsureWakeResponse{
+		InstanceId:   out.Instance.InstanceID,
+		NodeId:       out.Instance.NodeID,
+		Method:       coordMethodToWakeMethod(out.Instance),
+		WakeId:       out.Instance.WakeID,
+		Port:         out.Instance.Port,
+		DeploymentId: out.Instance.DeploymentID,
+	}, nil
+}
+
+// coordMethodToWakeMethod maps the coordinator's ColdBoot bool to the
+// WakeMethod enum. The legacy Wake / AdmitInstance paths go through
+// mapMethod (see below) which copies the vmmdpb.WakeMethod verbatim;
+// the coordinator collapses to a bool because the per-caller awaiting
+// approach doesn't need to round-trip the original WakeMethod through
+// the vmmd RPC layer.
+func coordMethodToWakeMethod(ci *sched.CoordInstance) scheddpb.WakeMethod {
+	if ci.ColdBoot {
+		return scheddpb.WakeMethod_WAKE_COLD_BOOT
+	}
+	return scheddpb.WakeMethod_WAKE_RESTORE
 }
 
 // ReportActivity persists a last_request_at batch from the gateway.
@@ -381,8 +471,9 @@ func (s *Server) ReportActivity(ctx context.Context, req *scheddpb.ReportActivit
 			continue
 		}
 		touches = append(touches, state.InstanceTouch{
-			InstanceID:  t.GetInstanceId(),
-			LastRequest: time.UnixMilli(t.GetUnixMs()),
+			InstanceID:   t.GetInstanceId(),
+			LastRequest:  time.UnixMilli(t.GetUnixMs()),
+			RequestDelta: t.GetRequestDelta(),
 		})
 	}
 	start := time.Now()
@@ -586,9 +677,6 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	// arm; the line-frame fields stay zero (matches the wire
 	// shape mirrors the vmmd proto).
 	sink := func(f sched.LogFrame) error {
-		if stream.Context().Err() != nil {
-			return stream.Context().Err()
-		}
 		// Filter (issue #309 / tier-2 DX). Apply BEFORE building
 		// the proto response so a filtered line costs us only
 		// the MatchLine check, not the proto marshal + Send.
@@ -599,6 +687,18 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 		// "show me when logs stopped" guarantee). The counter
 		// increments only on line-frame drops so the dashboard
 		// panel surfaces a real rate.
+		//
+		// The stream-context check is intentionally BELOW the
+		// filter branch so a drop the engine has already decided
+		// still increments apid_logs_dropped_total. Without that
+		// ordering, a consumer that cancels right after the last
+		// delivered frame would race the engine's next sink()
+		// call: the engine sees the cancel and returns without
+		// crediting the drop, the metric undercounts, and the
+		// FilterLevelDropsAndCounts / FilterGrepDropsAndCounts
+		// tests flake (see memory `scheddgrpc-filterleveldropsflake`).
+		// The drop decision is local + atomic; the increment is
+		// safe to honour regardless of stream-side state.
 		if !f.IsGap && !filter.NoFilter() && !filter.MatchLine(f.Line) {
 			// MatchLine already returned false — the line
 			// failed at least one active filter. Recompute
@@ -943,6 +1043,14 @@ func mapMethod(m vmmdpb.WakeMethod) scheddpb.WakeMethod {
 func toProblem(err error) *api.Problem {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, sched.ErrQueueFull) {
+		return api.NewProblem(int(codes.ResourceExhausted), "wake_queue_full",
+			"schedd per-app wake queue is full", err.Error())
+	}
+	if errors.Is(err, sched.ErrAppDeleted) {
+		return api.NewProblem(int(codes.FailedPrecondition), "app_deleted",
+			"app was deleted while wake was in flight", err.Error())
 	}
 	if p := api.AsProblem(err); p != nil {
 		return p

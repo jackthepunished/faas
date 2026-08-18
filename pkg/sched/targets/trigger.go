@@ -22,6 +22,15 @@ type AdmitResult struct {
 	AtCapacity bool
 }
 
+// WakeOutcome (ADR-098): trigger-local projection of sched.CoordOutcome.
+// The leader's ledger enforces max_concurrency; the trigger observes the
+// at-capacity path via the bus, not the return value.
+type WakeOutcome struct {
+	InstanceID string
+	WakeID     string
+	ColdBoot   bool
+}
+
 // Outcome is the closed set of concurrent_requests scale-up
 // decision outcomes. Pre-instantiated in pkg/wire.NewOpsMetrics
 // alongside the scaleup package outcomes so the counter rows
@@ -67,7 +76,15 @@ type Ledger interface {
 // performs the admission; the typed AdmitResult.AtCapacity=true signals
 // the cap rejection path.
 type Engine interface {
-	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
+	// AdmitInstance (PR-B / issue #272): scope is the preview scope
+	// (`pr-{N}`) forwarded to the underlying sched.Engine.
+	// Empty = prod (legacy single-deployment behaviour).
+	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
+	// EnsureWake (ADR-098): the single-flight wake entry. Routes
+	// through this so a targets tick racing the gateway, cron, floor,
+	// or scaleup triggers on the same parked app coalesces into one
+	// virtual boot.
+	EnsureWake(ctx context.Context, appID string) (WakeOutcome, error)
 }
 
 // InstatsReader is the per-instance in-flight signal source (PR-C,
@@ -125,6 +142,21 @@ type Decision struct {
 //   - Per-instance inflight > target (strict >) → admit when
 //     headroom > 0, else reject_at_cap.
 //   - Otherwise → no_signal.
+//
+// P1A asymmetry note: the cooldown consult above is a fast-bail
+// predicate, NOT an emission of schedd_scale_up_decisions_total{
+// outcome="cooldown_held"}. The trigger's job is to fire
+// Engine.AdmitInstance when over target; if Engine.admitGate
+// subsequently rejects via the same cooldown consult, it emits
+// `cooldown_held` once at engine.go:4862-4867. Routing the
+// emission through the trigger too would double-count and would
+// also break the scale-up metric semantics (`cooldown_held` is
+// the wake-gate path; the scale-up trigger's cooldown is its own
+// gate, not the metric source). The trigger returns
+// Decision{Outcome: OutcomeCooldownHeld} but the OutcomeCooldownHeld
+// is mapped to a no-op in the trigger-side caller
+// (Tick at trigger.go:279) rather than to ObserveScaleUp, so the
+// closed-set metric never sees it.
 func decide(s Stats) Decision {
 	if s.TargetValue == 0 {
 		return Decision{Outcome: OutcomeNoSignal}
@@ -290,14 +322,21 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
-		result, err := t.engine.AdmitInstance(ctx, app.ID)
+		// ADR-098: route through EnsureWake so a targets tick racing the
+		// gateway, cron, floor, or scaleup triggers on the same parked
+		// app coalesces into one virtual boot.
+		result, err := t.engine.EnsureWake(ctx, app.ID)
 		if err != nil {
 			t.log.Warn("targets: admit failed", "app_id", app.ID, "err", err)
 			continue
 		}
-		if result.AtCapacity && t.metrics != nil {
-			t.metrics.ObserveScaleUp(app.ID, string(OutcomeRejectAtCap))
-		}
+		// EnsureWake's leader runs Engine.Wake which honours the
+		// per-app max_concurrency ledger; a follower that arrives
+		// after the leader fills the last slot still sees a
+		// successful boot pointing at that slot. The leader's
+		// ledger closes the at-cap loop — we no longer need a
+		// reject_at_cap branch here.
+		_ = result
 	}
 	return nil
 }

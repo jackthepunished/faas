@@ -108,6 +108,13 @@ type Drain struct {
 	accts *acctCache
 }
 
+// expiredInvocationReclaimer is implemented by the durable stores. Keeping
+// this as a narrow optional interface preserves the broad state.Store test
+// seam while making lease recovery part of the production drain contract.
+type expiredInvocationReclaimer interface {
+	RequeueExpiredInvocations(context.Context, time.Time, int) (int, error)
+}
+
 // acctCache is a tiny TTL map. Move 2 hardware-plan: the suspended-account
 // check needs to avoid 64 AccountByID round-trips per batch under steady
 // load. Five seconds is the natural window — same order as the per-app
@@ -212,6 +219,19 @@ func (d *Drain) Run(ctx context.Context, notif <-chan db.Notification) error {
 // Tick is the per-cycle drain walk. Public so tests can drive it
 // without spinning Run().
 func (d *Drain) Tick(ctx context.Context) {
+	// A crashed schedd/gateway can leave a row in dispatching after its
+	// wake/invoke lease expires. Requeue those rows before reading pending
+	// work so the next scheduler tick can make progress. The store update is
+	// conditional on the expired lease and bounded to the same batch size as
+	// the hot queue walk.
+	if reclaimer, ok := d.store.(expiredInvocationReclaimer); ok {
+		reclaimed, err := reclaimer.RequeueExpiredInvocations(ctx, d.now(), d.batchSize)
+		if err != nil {
+			d.log.Warn("drain: reclaim expired invocations", "err", err)
+		} else if reclaimed > 0 {
+			d.log.Warn("drain: reclaimed expired invocations", "count", reclaimed)
+		}
+	}
 	for {
 		rows, err := d.store.ListDueInvocations(ctx, d.now(), d.batchSize)
 		if err != nil {
@@ -299,7 +319,7 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 	// 3. Wake (Always-Wake = idempotent). Returns the live instance
 	// handle on success; the drain stamps it onto the row so the
 	// meter's per-instance count is non-zero for this minute.
-	wakeRes, err := d.engine.Wake(ctx, inv.AppID, "")
+	wakeRes, err := d.engine.Wake(ctx, inv.AppID, "", "")
 	if err != nil {
 		retryAfter := time.Duration(d.retryAfterSeconds) * time.Second
 		// Permanent wake errors short-circuit to state='failed' — a

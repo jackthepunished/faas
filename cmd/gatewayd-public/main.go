@@ -51,13 +51,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -143,6 +146,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): capture FAAS_NODE_NAME
+	// before any control-plane handshake so the boot log carries the
+	// identity. gatewayd-public has no config.go today (env-only);
+	// the systemd drop-in (deploy/ansible/roles/gatewayd_public_service/
+	// files/faas-gatewayd-public.service.d/99-faas-node-name.conf) is
+	// the only source. Empty + log.Info("legacy single-box") mirrors
+	// the schedd owner-node line so an operator reading either journal
+	// gets the same diagnostic shape.
+	if nodeName := os.Getenv("FAAS_NODE_NAME"); nodeName != "" {
+		log.Info("gatewayd-public owner node", "node_name", nodeName)
+	} else {
+		log.Info("gatewayd-public: legacy single-box (FAAS_NODE_NAME unset)")
+	}
+
 	log.Info("gatewayd-public: starting", "pid", os.Getpid())
 
 	// Postgres — required for the readiness ping (no other PG
@@ -223,12 +240,56 @@ func run(ctx context.Context, log *slog.Logger) error {
 		log,
 		h2cEnabled,
 	)
+	// Issue #587 / PR-A: per-request drain tracker shared between
+	// the InternalReverseProxy and the control mux so every
+	// ServeHTTP surface contributes to the same in-flight count.
+	// gatewayd-public has no Handler (the public listener is just
+	// a TLS-terminating reverse proxy) so the proxy is the
+	// load-bearing entry point here. runDrain below consumes the
+	// tracker to bound shutdown by known in-flight requests
+	// instead of a hard wall-clock.
+	drainTracker := drain.NewTracker()
+	proxy.WithInFlightTracker(drainTracker)
+	// gatewayMetrics is a gateway.Metrics bundle local to the
+	// public daemon; the public doesn't expose wire.OpsMetrics
+	// (the wire.Daemon harness owns those), so the drain
+	// histogram + inflight gauge live here and surface via
+	// /metrics on the control mux (ControlMux mounts
+	// metrics.Handler() automatically).
+	gatewayMetrics := gateway.NewMetrics()
 	// Issue #555 PR-3: mount otelhttp.NewTransport so the outbound
 	// request to gatewayd-internal carries the same trace context
 	// (gateway.route span). The wrapper sits UNDER the proxy's
 	// RoundTripper so the inbound span context is propagated on the
 	// outbound hop.
 	proxy.Transport = otelhttp.NewTransport(proxy.Transport)
+
+	// ADR-093 / PR-B: end-to-end request budgets. The BudgetMiddleware
+	// stamps a per-request deadline onto r.Context() before the proxy
+	// forwards to gatewayd-internal, and writes a 504 RFC 7807
+	// problem envelope if the budget fires. Budgets come from the
+	// edge-rule kind=budget match (resolved deeper in the chain) or
+	// fall back to api.RequestBudgetDefault. The metrics registry is
+	// a fresh one (gatewayd-public's ControlMux today exposes no
+	// default metrics — /metrics is empty unless we wire a
+	// registry), and is plumbed into the control mux below so
+	// /metrics scrapes both the budget histogram and the
+	// exceeded-counter families alongside any future series.
+	budgetReg := prometheus.NewRegistry()
+	budgetMetrics, err := reqbudget.NewMetrics(budgetReg, "gateway")
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: reqbudget metrics: %w", err)
+	}
+	budgetCfg, err := reqbudget.NewMiddlewareConfig(reqbudget.MiddlewareConfig{
+		Default: api.RequestBudgetDefault,
+		Max:     api.RequestBudgetMax,
+		Route:   "forward",
+		Metrics: budgetMetrics,
+		Log:     log,
+	})
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: reqbudget middleware config: %w", err)
+	}
 
 	// Trace pipeline (issue #555 PR-2). Builds the in-memory ring,
 	// wires the OTLP/HTTP exporter when OTEL_EXPORTER_OTLP_ENDPOINT
@@ -248,7 +309,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 	traceMux.Handle("/v1/traces/", traceSetup.Handler)
 	traceMux.Handle("/", proxy)
 
-	// Public-facing handler: httpsec outer wrapper → trace mux → internal proxy.
+	// Public-facing handler: httpsec outer wrapper → budget middleware →
+	// trace mux → internal proxy.
 	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(hstsEnabledFromEnv))
 	// Issue #555 PR-3: otelhttp.NewHandler extracts W3C traceparent
 	// from inbound headers and starts a server span per request; the
@@ -256,10 +318,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// This wrap sits INSIDE httpsec.Security so the response headers
 	// (HSTS, CSP nonce, etc.) don't show up as span attributes (the
 	// OTel view is the request itself, not the security headers).
-	publicHandler := httpsec.Static(otelhttp.NewHandler(traceMux, "gatewayd-public.handler"))
+	//
+	// ADR-093 / PR-B: budget middleware wraps the otel handler so the
+	// budget deadline lands on the same ctx the OTel span reads. The
+	// budget middleware writes the 504 problem when the inner chain
+	// (proxy → gatewayd-internal) doesn't return in time, regardless
+	// of where the slowness lives.
+	publicHandler := budgetCfg.Middleware(otelhttp.NewHandler(traceMux, "gatewayd-public.handler"))
+	publicHandler = httpsec.Static(publicHandler)
 
-	// Control mux + listeners.
-	controlMux := gateway.ControlMux(nil, probe.ReadyFunc())
+	// Control mux + listeners. Pass budgetReg as the extraGatherer so
+	// /metrics exposes the budget histogram + exceeded-counter
+	// alongside the default gateway series, and pass drainTracker so
+	// every control request is counted during graceful shutdown.
+	controlMux := gateway.ControlMuxWithExtra(gatewayMetrics, budgetReg, probe.ReadyFunc(), drainTracker)
 	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
 	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
 	publicSrv, controlSrv := buildServers(listenAddr, controlAddr, publicHandler, controlMux)
@@ -281,7 +353,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 
 	// Drain orchestration.
-	if err := runDrain(ctx, log, publicSrv, controlSrv, pgProbeSig, pgStop, traceSetup); err != nil {
+	if err := runDrain(ctx, log, publicSrv, controlSrv, pgProbeSig, pgStop, traceSetup, drainTracker, gatewayMetrics); err != nil {
 		return err
 	}
 	return nil
@@ -368,7 +440,7 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 //     1s ticker to make the sleep effectively cancellable).
 //  4. Shutdown both servers with a 5 s grace.
 //  5. pgStop() (already done above; kept here as a no-op safety net).
-func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http.Server, pgProbeSig *gateway.ReadySignal, pgStop func(), traceSetup *gateway.TraceSetup) error {
+func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http.Server, pgProbeSig *gateway.ReadySignal, pgStop func(), traceSetup *gateway.TraceSetup, drainTracker *drain.Tracker, gMetrics *gateway.Metrics) error {
 	drainCtx, cancelDrain := context.WithCancel(context.Background())
 	defer cancelDrain()
 	sigCh := make(chan os.Signal, 1)
@@ -423,6 +495,45 @@ func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http
 		log.Info("gatewayd-public: shutting down")
 	case err := <-errc:
 		return err
+	}
+	// Issue #587 / PR-A: wait for the per-request drain tracker
+	// to flush BEFORE Shutdown closes the listeners. Done first
+	// so we never race a Begin against srv.Shutdown's refusal to
+	// accept new connections. Shutdown itself has a 5s grace
+	// (next block) which is bounded by drain.DrainGrace
+	// below — the two together stay inside systemd's
+	// TimeoutStopSec=30s with 5s of headroom for the kernel.
+	//
+	// Exit-code discipline (systemd Restart=on-failure contract,
+	// pkg/deploycontroller/controller.go:43-115):
+	//   clean drain → return nil (no restart)
+	//   deadline_exceeded / ctx_cancelled → return ctx.Err()
+	//     so systemd restarts the daemon
+	// Pre-PR-A this path returned nil unconditionally, which hid
+	// second-SIGTERM force-exit bugs from operators.
+	if drainTracker != nil {
+		drainStart := time.Now()
+		drainCtxInner, cancelDrainInner := context.WithTimeout(context.WithoutCancel(ctx), drain.DrainGrace)
+		outcome, drainErr := drainTracker.Drain(drainCtxInner, drain.DrainGrace)
+		cancelDrainInner()
+		drainElapsed := time.Since(drainStart).Seconds()
+		// Issue #587 / PR-A: record the per-daemon drain
+		// histogram on every shutdown so the operator
+		// dashboard can spot a pattern of forced exits.
+		gMetrics.ObserveDrainWait("gatewayd-public", string(outcome), drainElapsed)
+		if drainErr != nil {
+			log.Warn("gatewayd-public: drain exited non-clean",
+				"outcome", string(outcome),
+				"max_inflight", drainTracker.MaxInflight(),
+				"err", drainErr)
+			return drainErr
+		}
+		if outcome != drain.OutcomeClean {
+			log.Warn("gatewayd-public: drain exited non-clean",
+				"outcome", string(outcome),
+				"max_inflight", drainTracker.MaxInflight())
+			return ctx.Err()
+		}
 	}
 	// Shutdown both servers gracefully. 5 s grace.
 	// context.WithoutCancel detaches from the parent's cancellation

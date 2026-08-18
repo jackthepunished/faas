@@ -198,6 +198,7 @@ message ExchangeOAuthCodeRequest {
 }
 message ExchangeOAuthCodeResponse {
   string installation_id = 1;
+  string default_branch  = 2; // empty when unavailable; bind picker pre-fills from this
 }
 
 message Repo {
@@ -325,6 +326,25 @@ message EnqueueBuildRequest {
   // pusher is the GitHub login that triggered the push. Stored on
   // the deployment row's `pusher` column for the §11 audit trail.
   string pusher         = 10;
+  // event_kind is the githubd-side event source for this build.
+  // apid maps it onto the deployments.kind stamp:
+  //   - EVENT_KIND_UNSPECIFIED → DeploymentKindGitHub (legacy wire)
+  //   - EVENT_KIND_PUSH        → DeploymentKindGitHub
+  //   - EVENT_KIND_PULL_REQUEST→ DeploymentKindPreview (issue #272 / ADR-094)
+  // Empty / unspecified preserves the pre-PR-A wire shape so an
+  // older githubd (or the existing slice-7 tests) keeps stamping
+  // DeploymentKindGitHub without a behaviour change.
+  EnqueueBuildEventKind event_kind = 11;
+}
+
+// EnqueueBuildEventKind is the githubd-side event taxonomy for
+// the EnqueueBuild RPC. Carried on the wire so a single bridge
+// can stamp different deployments.kind values without
+// multiplying RPCs (issue #272 / ADR-094).
+enum EnqueueBuildEventKind {
+  EVENT_KIND_UNSPECIFIED = 0; // legacy: pre-issue-#272 push → DeploymentKindGitHub
+  EVENT_KIND_PUSH        = 1; // refs/heads/* push → DeploymentKindGitHub
+  EVENT_KIND_PULL_REQUEST= 2; // pull_request webhook → DeploymentKindPreview
 }
 message EnqueueBuildResponse {
   // build_id is the durable builds.id UUID apid created. Empty

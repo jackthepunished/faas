@@ -51,6 +51,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
 // cookieOnlyPathRE matches API routes that are gated server-side to
@@ -220,6 +222,27 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 // recipe; methods that need a custom header set it on req before
 // calling doReq.
 func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
+	// ADR-093 / PR-E: outbound SDK call becomes a child of the
+	// inbound budget when one is attached. The CLI / SDK never
+	// receives a Budget from the user today — but apid's
+	// gatewayd-internal handlers do call into the SDK to issue
+	// outbound HTTP (issue #739 / ADR-092 source-ref refresh), so
+	// the SDK honours any budget that's on the inbound ctx.
+	// childDeadline = min(parentRemaining, cli.Timeout) — the
+	// client's Timeout stays as the absolute ceiling; the budget
+	// can only tighten it. cli.Timeout == 0 is treated as "no
+	// ceiling configured" by WithCeiling (it inherits the
+	// parent's remaining time) so a default-constructed
+	// http.Client{} doesn't immediately expire; cli.Do then
+	// applies no Timeout of its own — the SDK no longer enforces
+	// a wall-clock cap on those calls, same as pre-PR-E. When
+	// no Budget is on the inbound ctx, cli.Timeout alone bounds
+	// the request (the legacy contract).
+	if b, ok := reqbudget.FromContext(req.Context()); ok {
+		newCtx, cancel, _ := b.WithCeiling(req.Context(), cli.Timeout)
+		defer cancel()
+		req = req.Clone(newCtx)
+	}
 	resp, err := cli.Do(req)
 	if err != nil {
 		return fmt.Errorf("could not reach the API: %w", err)
@@ -497,6 +520,23 @@ func (c *Client) GetDeploymentScan(ctx context.Context, id string) (ScanResult, 
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/scan", nil, &out)
 }
 
+// GetDeploymentSecretScan returns the per-deploy image-layer
+// secret-scan payload (PR-A). Same IDOR posture as
+// GetDeploymentScan (404 on missing-deployment OR cross-account
+// OR scan-pending). The wire shape is SecretScanResult — a
+// closed-form {status, scanned_at, findings[], image_digest}
+// envelope where the findings carry the per-finding layer
+// label ("app" | "sidecar-<slug>") so the CLI / dashboard can
+// attribute findings to the right image segment.
+//
+// Status is the closed enum (complete | complete_with_redactions)
+// — distinct from the grype-side Status field on ScanResult
+// because the two pipelines stamp separate audit rows.
+func (c *Client) GetDeploymentSecretScan(ctx context.Context, id string) (SecretScanResult, error) {
+	var out SecretScanResult
+	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/secret-scan", nil, &out)
+}
+
 // PatchDeployment sets the per-deployment cold-wake floor override
 // (issue #557 closure / ADR-072). MinInstances is the only mutable
 // field on a deployment post-create — image / digest / overrides /
@@ -684,6 +724,21 @@ func (c *Client) DeployFromSourceRef(ctx context.Context, slug string, req Sourc
 	var out DeploymentResponse
 	return out, c.do(ctx, "POST",
 		"/v1/apps/"+slug+"/deployments/source-ref", req, &out)
+}
+
+// Diff returns a read-only preview of what a deploy would change
+// without writing. CI calls this in the same job that calls
+// Deploy; non-zero exit (or Blocking=true in the wire) means
+// "don't deploy". Mirrors the CLI's `gregale deploy --diff --json`
+// output byte-for-byte — a CI consumer parsing either path
+// agrees.
+//
+// Read-only: auth chain on the server is apps:read (no MFA, no
+// deploy:write required). The handler does not call CreateApp /
+// CreateDeployment / anything in the write path.
+func (c *Client) Diff(ctx context.Context, slug string, req DiffRequest) (DiffResponse, error) {
+	var out DiffResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/diff", req, &out)
 }
 
 // GetApp returns the app metadata for a slug.
@@ -931,6 +986,72 @@ func (c *Client) DeleteDomain(ctx context.Context, domain string) error {
 	return c.do(ctx, "DELETE", "/v1/domains/"+domain, nil, nil)
 }
 
+// Tenant surfaces (issue #879 / ADR-100 PR-C). The CLI surface
+// (cmd/gregale/commands_tenant_surfaces.go) calls these; the
+// HTTP handlers they're backed by live in
+// cmd/apid/handlers_tenant_surfaces.go. The ListTenantSurfaces
+// path is /v1/apps/{slug}/tenant-surfaces and the SDK signature
+// takes the slug so the call site doesn't rebuild the URL.
+
+// ListTenantSurfaces returns every active tenant surface on the
+// app the slug belongs to. Soft-deleted surfaces are filtered
+// server-side, so the SDK returns the same set the dashboard sees.
+func (c *Client) ListTenantSurfaces(ctx context.Context, slug string) ([]TenantSurfaceResponse, error) {
+	var out ListTenantSurfacesResponse
+	if err := c.do(ctx, "GET", "/v1/apps/"+slug+"/tenant-surfaces", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Surfaces, nil
+}
+
+// CreateTenantSurface attaches a new surface to the app. The
+// hostnames list is the seed set the customer wants to certify
+// under one SAN bundle; further hostnames can be added via
+// AddTenantHostname.
+func (c *Client) CreateTenantSurface(ctx context.Context, slug string, req CreateTenantSurfaceRequest) (TenantSurfaceResponse, error) {
+	var out TenantSurfaceResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/tenant-surfaces", req, &out)
+}
+
+// GetTenantSurface returns one surface by id (UUID).
+func (c *Client) GetTenantSurface(ctx context.Context, slug, id string) (TenantSurfaceResponse, error) {
+	var out TenantSurfaceResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/tenant-surfaces/"+id, nil, &out)
+}
+
+// DeleteTenantSurface soft-deletes the surface and cascades the
+// hostnames (server-side). The next attempt to add the same
+// hostname to a new surface succeeds because the orphan rows
+// are hard-deleted.
+func (c *Client) DeleteTenantSurface(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/tenant-surfaces/"+id, nil, nil)
+}
+
+// AddTenantHostname appends a hostname to an existing surface.
+// The challenge token is returned in the response so the CLI
+// can print the TXT record the customer must publish.
+func (c *Client) AddTenantHostname(ctx context.Context, slug, surfaceID string, req AddTenantHostnameRequest) (TenantHostnameResponse, error) {
+	var out TenantHostnameResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/tenant-surfaces/"+surfaceID+"/hostnames", req, &out)
+}
+
+// RemoveTenantHostname deletes a hostname from a surface. The
+// hostname is the lowercased canonical form (the server
+// lowercases on the way in).
+func (c *Client) RemoveTenantHostname(ctx context.Context, slug, surfaceID, hostname string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/tenant-surfaces/"+surfaceID+"/hostnames/"+hostname, nil, nil)
+}
+
+// GetCron returns one cron by id (issue #791 PR-E / ADR-090 closure).
+// Backs `gregale crons info <id>`. Wire shape matches CronResponse
+// (same projection as ListCrons' per-row). The server returns a
+// byte-identical 404 on missing or cross-account so the SDK does not
+// invent a local branch that could leak existence.
+func (c *Client) GetCron(ctx context.Context, id string) (CronResponse, error) {
+	var out CronResponse
+	return out, c.do(ctx, "GET", "/v1/crons/"+id, nil, &out)
+}
+
 // ListCrons returns every cron on the account when slug is empty,
 // or every cron for the given app when slug is non-empty. The slug
 // filter is added to the wire only when non-empty so the request
@@ -1119,6 +1240,79 @@ func (c *Client) UpdateEdgeRule(ctx context.Context, id string, req UpdateEdgeRu
 // DeleteEdgeRule removes the rule and returns nil on 204.
 func (c *Client) DeleteEdgeRule(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/edge-rules/"+id, nil, nil)
+}
+
+// CreateCORSEdgeRuleOpts is the typed CORS convenience shape used by
+// CreateCORSEdgeRule (CORS improvements D5). Every field maps 1:1 to
+// an EdgeRuleCORSAction field; the helper below packs them into a
+// CreateEdgeRuleRequest with Kind="cors" so the customer-side SDK
+// surface doesn't expose the kind/action union. Node + Python SDKs
+// get the same shape via `make sdk-gen` (they read the kebab-style
+// POST directly from OpenAPI — no parallel typed helper there).
+//
+// Priority defaults to 100 when zero (the gateway's middle bucket,
+// matching the validator-side default on CreateEdgeRuleRequest).
+// MaxAgeSeconds defaults to 600 (10 min — within the 24h cap
+// EdgeRuleCORSAction.Validate enforces server-side). AllowOrigins
+// must be non-empty; passing an empty slice returns an error before
+// the HTTP round-trip so the customer gets a synchronous signal
+// rather than a 422.
+type CreateCORSEdgeRuleOpts struct {
+	MatchHost        string
+	MatchPath        string
+	MatchMethods     []string
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
+	AllowCredentials bool
+	MaxAgeSeconds    int
+}
+
+// CreateCORSEdgeRule attaches a CORS-kind edge rule to the slug's
+// app (CORS improvements D5). It is a thin wrapper around
+// CreateEdgeRule that builds the EdgeRuleCORSAction JSON payload
+// and pins the kind to "cors" so callers don't have to assemble
+// the action blob themselves. Plan gate (402 plan_edge_rule_kind_not_allowed)
+// and per-app quota (402 plan_limit_edge_rules) still surface
+// from the underlying CreateEdgeRule — the helper adds zero
+// behaviour beyond action-blob construction.
+func (c *Client) CreateCORSEdgeRule(ctx context.Context, slug string, opts CreateCORSEdgeRuleOpts) (EdgeRuleResponse, error) {
+	if len(opts.AllowOrigins) == 0 {
+		var zero EdgeRuleResponse
+		return zero, errors.New("CreateCORSEdgeRule: AllowOrigins must be non-empty")
+	}
+	if opts.MatchHost == "" {
+		var zero EdgeRuleResponse
+		return zero, errors.New("CreateCORSEdgeRule: MatchHost is required (use the app's primary domain)")
+	}
+	priority := 100
+	action := EdgeRuleCORSAction{
+		AllowOrigins:     opts.AllowOrigins,
+		AllowMethods:     opts.AllowMethods,
+		AllowHeaders:     opts.AllowHeaders,
+		ExposeHeaders:    opts.ExposeHeaders,
+		AllowCredentials: opts.AllowCredentials,
+		MaxAgeSeconds:    opts.MaxAgeSeconds,
+	}
+	if action.MaxAgeSeconds == 0 {
+		action.MaxAgeSeconds = 600
+	}
+	raw, err := json.Marshal(action)
+	if err != nil {
+		var zero EdgeRuleResponse
+		return zero, fmt.Errorf("CreateCORSEdgeRule: marshal action: %w", err)
+	}
+	req := CreateEdgeRuleRequest{
+		MatchHost:    opts.MatchHost,
+		MatchPath:    opts.MatchPath,
+		MatchMethods: opts.MatchMethods,
+		Priority:     &priority,
+		Kind:         "cors",
+		Action:       raw,
+	}
+	var out EdgeRuleResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/edge-rules", req, &out)
 }
 
 // --- Event-driven surface (Move 2) -----------------------------------------
@@ -1759,6 +1953,69 @@ func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetric
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// GetAppThrottleSuggestions returns the per-route throttle
+// recommendation payload for slug over the named range window
+// (ADR-091 D20.5 amendment, issue #881). The recommender is
+// read-only — it never auto-applies — and the suggestion is
+// always ≤ the customer's plan ceiling so the customer can act
+// on it without a 422 from apid's sub-plan validator.
+//
+// rng is the same closed vocabulary as GetAppMetrics; empty
+// falls back to the server's default (5m). The response is
+// HTTP 200 with empty Suggestions on Prometheus failure (the
+// dashboard's empty-state branch handles it). RouteMetricsDisabled
+// is true when apps.route_metrics_enabled=false (Free plan).
+func (c *Client) GetAppThrottleSuggestions(ctx context.Context, slug, rng string) (ThrottleSuggestionsResponse, error) {
+	var out ThrottleSuggestionsResponse
+	path := "/v1/apps/" + slug + "/throttle-suggestions"
+	if rng != "" {
+		path += "?range=" + rng
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetAppRoutes returns the per-route label snapshot for the named
+// app (ADR-093). The bounded label set is served by the
+// gatewayd-internal control listener and reverse-proxied by apid;
+// each entry is "METHOD /raw/path" with overflow collapsed to
+// "__route_other__" when the per-app cap (50) is exceeded. Source
+// is "live" on success and "unavailable" when the control
+// listener dial failed — callers should render both branches the
+// same way (empty list, distinct chip).
+//
+// CapHit (ADR-093 Tier B item #1) is true iff the app's route
+// label set reached RouteMetricsPerAppCap (50) and additional
+// routes are collapsing into the reserved __route_other__ bucket.
+// When true, len(Routes) == 52 (50 real + reserved empty +
+// __route_other__). When false, the dashboard can render "you have
+// N admitted routes" without counting. CapHit is the zero value
+// (false) on the source: unavailable path — the cap state is
+// unknown when the gatewayd-internal dial fails, so the field is
+// not part of the unreliable wire.
+func (c *Client) GetAppRoutes(ctx context.Context, slug string) (AppRoutesResponse, error) {
+	var out AppRoutesResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/routes", nil, &out)
+}
+
+// GetAppStreamingStatus returns the per-request streaming
+// classification for the named app (ADR-102 D6). The endpoint is
+// the SDK-side mirror of pkg/gateway.(*Handler).decideStreaming —
+// a customer hitting this endpoint sees exactly what the gateway's
+// gate machine would resolve for the next inbound request, with the
+// same status enum (api.StreamingStatus*) and the same effective
+// cap (plan cap by default; endpoint-rule MaxBodyBytesStreaming if
+// a kind=limit edge rule matched).
+//
+// Use case: a customer evaluating "will my next request stream?"
+// fires this endpoint pre-flight instead of probing with a real
+// request and reading the Streaming-Status response header. The
+// probe does NOT mutate state and does NOT warm a wake — it's a
+// pure read against the per-app cache.
+func (c *Client) GetAppStreamingStatus(ctx context.Context, slug string) (AppStreamingStatus, error) {
+	var out AppStreamingStatus
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/streaming-cap", nil, &out)
+}
+
 // GetAppsMetrics returns the account-wide per-app metrics rollup
 // (issue #393). One call replaces N per-app GetAppMetrics calls;
 // the response is keyed by app_slug so the dashboard renders rows
@@ -1800,6 +2057,122 @@ func (c *Client) GetAccountSLO(ctx context.Context, window string) (AccountSLORe
 	if window != "" {
 		path += "?window=" + window
 	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// AppErrorsSummaryOptions controls the query for GetAppErrorsSummary.
+// Both Since and Until are RFC3339Nano strings (NOT time.Time — the
+// wire form is the canonical string so caller-side parse failures
+// surface at the SDK boundary, not inside the transport). When Since
+// or Until is empty, the server applies its own defaults
+// (until=now(), since=until-24h) and may clamp the span to
+// AppErrorsWindowMaxHours (168h). Cursor is an opaque base64 token
+// from a previous response's NextCursor; empty starts a fresh scan.
+// Limit defaults to AppErrorsSummaryDefaultLimit (20) and is capped
+// at AppErrorsSummaryMaxLimit (100) by the server. ADR-096 / PR-B.
+type AppErrorsSummaryOptions struct {
+	Since  string
+	Until  string
+	Cursor string
+	Limit  int
+}
+
+// appendAppErrorsSummaryQuery joins since/until/cursor/limit onto a
+// path with the right separator. Shared by GetAppErrorsSummary so
+// the query-string shape stays consistent regardless of which subset
+// of fields the caller populates.
+func appendAppErrorsSummaryQuery(path string, opts AppErrorsSummaryOptions) string {
+	q := url.Values{}
+	if opts.Since != "" {
+		q.Set("since", opts.Since)
+	}
+	if opts.Until != "" {
+		q.Set("until", opts.Until)
+	}
+	if opts.Cursor != "" {
+		q.Set("cursor", opts.Cursor)
+	}
+	if opts.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", opts.Limit))
+	}
+	if len(q) == 0 {
+		return path
+	}
+	return path + "?" + q.Encode()
+}
+
+// GetAppErrorsSummary returns the per-app top-N grouped error
+// fingerprints for slug over the [since, until] window (Sentry-style
+// continuous window, NOT the SLO closed-set ?window= vocabulary). One
+// row per (account_id, app_id, fingerprint), sorted by count DESC,
+// then last_seen_at DESC, then fingerprint ASC. The server clamps the
+// span to AppErrorsWindowMaxHours (168h) and reports
+// WindowClamped=true on the response when it does so. ADR-096 /
+// PR-B. Sibling surface: GetAppSLO is the latency/error-rate panel
+// (ADR-082); GetAppRoutes is the per-route panel (ADR-093).
+func (c *Client) GetAppErrorsSummary(ctx context.Context, slug string, opts AppErrorsSummaryOptions) (AppErrorsSummaryResponse, error) {
+	var out AppErrorsSummaryResponse
+	path := appendAppErrorsSummaryQuery("/v1/apps/"+slug+"/errors/summary", opts)
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// ListAppErrorRequests paginates the drill-down rows for one
+// fingerprint under GET /v1/apps/{slug}/errors/{fingerprint}. The
+// response's NextCursor (when non-empty) feeds the next call's
+// cursor arg. limit defaults to AppErrorsSummaryDefaultLimit on the
+// server when zero; passing 0 from the SDK hits the same default.
+// Returns 404 when the fingerprint has been purged by the retention
+// cron or never existed (cross-account slug returns 404 too — the
+// IDOR posture is byte-identical). ADR-096 / PR-B.
+func (c *Client) ListAppErrorRequests(ctx context.Context, slug, fingerprint, cursor string, limit int) (AppErrorRequestsResponse, error) {
+	var out AppErrorRequestsResponse
+	path := "/v1/apps/" + slug + "/errors/" + fingerprint
+	q := url.Values{}
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// ListAppErrorRequestsAll is the cursor walker; NOT a route — the
+// route returns a single page, this method pages through to the
+// end. Mirrors the ListOrgInvitationsAll / ListAuditLogAll walker
+// shape. Returns the accumulated []AppErrorRequestItem slice;
+// terminates cleanly when NextCursor is empty. ADR-096 / PR-B.
+func (c *Client) ListAppErrorRequestsAll(ctx context.Context, slug, fingerprint string) ([]AppErrorRequestItem, error) {
+	var out []AppErrorRequestItem
+	cursor := ""
+	for {
+		page, err := c.ListAppErrorRequests(ctx, slug, fingerprint, cursor, 100)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, page.Requests...)
+		if page.NextCursor == "" {
+			return out, nil
+		}
+		cursor = page.NextCursor
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+	}
+}
+
+// GetAppErrorSample returns the single sample row for fingerprint
+// under GET /v1/apps/{slug}/errors/{fingerprint}/first — the row that
+// surfaces the redacted headers_sample + the list of redaction
+// pattern names applied (so the dashboard can render "we redacted X
+// / Y / Z"). When the fingerprint has been purged the server returns
+// 404 (same posture as ListAppErrorRequests). ADR-096 / PR-B.
+func (c *Client) GetAppErrorSample(ctx context.Context, slug, fingerprint string) (AppErrorSampleResponse, error) {
+	var out AppErrorSampleResponse
+	path := "/v1/apps/" + slug + "/errors/" + fingerprint + "/first"
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
@@ -2050,6 +2423,23 @@ func (c *Client) DeleteAppTrustedSigner(ctx context.Context, slug, name string) 
 func (c *Client) UpdateAppSecurity(ctx context.Context, slug string, req AppSecurityRequest) (AppSecurityResponse, error) {
 	var out AppSecurityResponse
 	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/security", req, &out)
+}
+
+// SetGithubWebhookSecret sets the per-tenant webhook secret for
+// the given installation_id (PR-D / ADR-012 §7 amendment). The
+// server hex-decodes SecretHex and writes the raw bytes to
+// github_webhook_secrets. ON CONFLICT DO UPDATE so a rotation
+// is a single idempotent call — every successful call bumps
+// upgraded_at (the audit trail; an operator re-running with
+// the same secret is itself a rotation event worth recording).
+//
+// Auth: admin-scoped API key (ScopesAdminOnly +
+// adminAllows email allowlist). The handler also emits
+// githubd_webhook_secret_total{status="set"} so a Prometheus
+// alert can fire if a tenant rotates unexpectedly often.
+func (c *Client) SetGithubWebhookSecret(ctx context.Context, req AdminSetGithubWebhookSecretRequest) (AdminSetGithubWebhookSecretResponse, error) {
+	var out AdminSetGithubWebhookSecretResponse
+	return out, c.do(ctx, "POST", "/v1/admin/github-webhook-secrets", req, &out)
 }
 
 // Org surface (issue #190 / IAM-6 / ADR-061, PR 5). The 11 methods
@@ -2432,4 +2822,31 @@ func (c *Client) GetBillingPaddleOveragePreflight(ctx context.Context) (BillingP
 func (c *Client) GetRekeyProgress(ctx context.Context) (RekeyProgress, error) {
 	var out RekeyProgress
 	return out, c.do(ctx, "GET", "/v1/admin/secrets/rekey-progress", nil, &out)
+}
+
+// Data upstreams (ADR-098 §9.A PR-B). The 4 endpoints back
+// `gregale upstreams list/get/create/delete`. The wire routes
+// are owned by cmd/apid/handlers_upstreams.go; the typed DTOs
+// live next to this method in pkg/api/upstreams.go (closed-vocab
+// DataUpstreamKind, RFC 952/1123 host regex, port range).
+//
+// §11 invariant: the DTO surface NEVER includes the plaintext
+// host — only host_redacted_hash (sha256(salt||host)) surfaces
+// to the caller. A custom POST that includes `host` is rejected
+// server-side; the SDK does not special-case that 400 — the
+// *Problem's Code field is `upstream_invalid_host`.
+func (c *Client) ListAppDataUpstreams(ctx context.Context, slug string) ([]DataUpstreamResponse, error) {
+	var out []DataUpstreamResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams", nil, &out)
+}
+func (c *Client) GetAppDataUpstream(ctx context.Context, slug, id string) (DataUpstreamResponse, error) {
+	var out DataUpstreamResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams/"+id, nil, &out)
+}
+func (c *Client) CreateAppDataUpstream(ctx context.Context, slug string, req PutDataUpstreamRequest) (DataUpstreamResponse, error) {
+	var out DataUpstreamResponse
+	return out, c.do(ctx, "PUT", "/v1/apps/"+slug+"/upstreams", req, &out)
+}
+func (c *Client) DeleteAppDataUpstream(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/upstreams/"+id, nil, nil)
 }

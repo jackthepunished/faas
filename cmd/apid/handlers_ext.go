@@ -266,6 +266,24 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				"Free tier does not support per-app WebSocket; upgrade to Hobby or higher.")
 		}
 	}
+	// ADR-093: per-route observability opt-in. Same plan-gate
+	// shape as WebSocket above — Free + true = 403
+	// plan_route_metrics_not_allowed. The per-app route cap (50)
+	// + __route_other__ overflow bounds the cardinality regardless
+	// of the customer's traffic shape, but Free is the abuse-floor
+	// tier where per-route rollups would not have a budget
+	// alongside the per-app rollups. Hobby+ customers may PATCH
+	// true → false to opt out (a small app that does not want
+	// per-route cardinality on the box); the false direction
+	// needs no gate.
+	if req.RouteMetricsEnabled != nil && *req.RouteMetricsEnabled {
+		if !acct.Plan.RouteMetricsResponseAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanRouteMetricsNotAllowed,
+				"Per-route metrics are not allowed on this plan",
+				"Free tier does not support per-route observability; upgrade to Hobby or higher.")
+		}
+	}
 	// Issue #470 / ADR-055: per-app two-tier-snapshot flag. Same
 	// plan-gate shape as streaming — Free/Hobby + true = 403
 	// plan_warm_snapshot_not_allowed. Out-of-range thresholds =
@@ -360,6 +378,35 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			// PATCH is a no-op and the cap is unchanged.
 			// app is loaded later (loadApp); we read it once
 			// here and pass it through to the audit-block.
+		}
+	}
+	// CORS improvements D1: per-app default CORS opt-in.
+	// Same grammar as EdgeRuleCORSAction.AllowOrigins
+	// (literal origin, https://*.example.com subdomain
+	// wildcard, https://host:* port wildcard, or '*' —
+	// the latter rejected when AllowCredentials would be
+	// true, which doesn't apply on the default path because
+	// credentials are never set there). The validator
+	// re-uses CorsOriginPattern so a PATCH can never land
+	// a value that the gateway hot path would silently
+	// reject on miss. Opting in with an empty / nil
+	// origins list is a 422 — the customer's stated
+	// intent (default-on) contradicts the empty allowlist
+	// and a 200 there would be a confusing silent no-op.
+	if req.CORSDefaultEnabled != nil && *req.CORSDefaultEnabled {
+		if req.CORSDefaultOrigins == nil || len(*req.CORSDefaultOrigins) == 0 {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeValidation,
+				"Invalid cors_default_origins",
+				"cors_default_origins must be a non-empty list when cors_default_enabled is true")
+		}
+		for _, o := range *req.CORSDefaultOrigins {
+			if !api.CorsOriginPattern.MatchString(o) {
+				return api.NewProblem(http.StatusUnprocessableEntity,
+					api.CodeValidation,
+					"Invalid cors_default_origins",
+					fmt.Sprintf("cors_default_origins entry %q does not match the origin grammar (scheme://host[:port], '*', or 'scheme://*.host[:port]' / 'scheme://host:*')", o))
+			}
 		}
 	}
 	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
@@ -686,6 +733,27 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// gated the plan; the store is a plain column write.
 		WebSocketEnabled:    req.WebSocketEnabled,
 		SetWebSocketEnabled: req.WebSocketEnabled != nil,
+		// ADR-093: per-route observability opt-in. Same Set-bit
+		// convention as WebSocketEnabled above; apid validation
+		// already gated the plan (CodePlanRouteMetricsNotAllowed
+		// for Free customers PATCHing true), so the store is a
+		// plain column write.
+		RouteMetricsEnabled:    req.RouteMetricsEnabled,
+		SetRouteMetricsEnabled: req.RouteMetricsEnabled != nil,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag (apps.maintenance_mode). Same Set-bit
+		// convention as RouteMetricsEnabled above — nil pointer
+		// means "don't touch the column"; non-nil pointer writes
+		// the boolean verbatim. No plan gate (Free and above
+		// may opt in). The pg_notify trigger
+		// apps_maintenance_mode_notify (migrations/00225) fires
+		// pg_notify('app_changed', NEW.id::text) ONLY when this
+		// column IS DISTINCT FROM old; the cmd-side listener
+		// (cmd/gatewayd-internal/backend.go) calls
+		// PGBackend.ResetApp(appID) so the apps LRU drops the
+		// stale MaintenanceMode before the next request lands.
+		MaintenanceMode:    req.MaintenanceMode,
+		SetMaintenanceMode: req.MaintenanceMode != nil,
 		// Issue #462 / ADR-058: per-app scaling policy. The
 		// setter bit on UpdateAppParams distinguishes "don't
 		// touch" (nil pointer) from "explicit zero policy"
@@ -770,6 +838,23 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// wire-format name.
 		OverflowNode:    nilStringPtr(overflowUUID),
 		SetOverflowNode: req.OverflowNode != nil,
+		// CORS improvements D1: per-app default CORS opt-in.
+		// The opt-out contract is asymmetric on purpose:
+		// a customer who flips the flag to false (or
+		// doesn't touch the flag) does NOT carry a
+		// brand-new origins list — the "flip to off"
+		// PATCH must never wipe a previously configured
+		// allowlist as a side effect. So
+		// SetCORSDefaultOrigins is true ONLY when the
+		// customer is enabling (or staying enabled);
+		// the validator already 422'd the
+		// (enabled=true + nil/empty origins) case so
+		// reaching this branch with enabled=true means
+		// a valid non-empty list is in hand.
+		CORSDefaultEnabled:    req.CORSDefaultEnabled,
+		SetCORSDefaultEnabled: req.CORSDefaultEnabled != nil,
+		CORSDefaultOrigins:    req.CORSDefaultOrigins,
+		SetCORSDefaultOrigins: req.CORSDefaultEnabled != nil && *req.CORSDefaultEnabled,
 	}
 	if req.PublicAuth != nil {
 		// params.PublicAuth is unset when req.PublicAuth is
@@ -1745,6 +1830,34 @@ func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.A
 		"app_id":  c.AppID,
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// getCron reads a single cron by id (issue #791 PR-E / ADR-090 closure).
+//
+// GET /v1/crons/{id}. Same IDOR-safe two-step as updateCron/deleteCron:
+// resolve the cron, then resolve its app and compare account ids. Both
+// failure branches emit the identical "no such cron" 404 so a probe
+// cannot distinguish missing from cross-account.
+//
+// Distinct from listCrons: listCrons returns every cron owned by the
+// account (or filtered by ?app_slug), while getCron answers the
+// `gregale crons info <id>` question — what is this specific rule —
+// with one row. The wire shape matches api.CronResponse (same
+// projection as listCrons' per-row), so SDK clients can decode it
+// with the existing CronResponse struct.
+func (s *server) getCron(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	c, err := s.store.CronByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such cron")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), c.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such cron")
+		return
+	}
+	writeJSON(w, http.StatusOK, cronResponse(c))
 }
 
 // listCronRuns is the per-cron execution history (issue #791):
@@ -2959,6 +3072,13 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 		// tx). For the single-live-deployment case (the most common
 		// shape today), Σ = 100 is trivially this one field.
 		TrafficPercent: d.TrafficPercent,
+		// ADR-091 / PR-D: per-deployment env scope echo. Always
+		// written — even when scope == "default" — so dashboards
+		// can branch on the literal value rather than treating
+		// absent == "default" (the migration backfills the
+		// column on every pre-PR-D deployment, so the field is
+		// never empty in practice).
+		Scope: d.Scope,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint
@@ -3029,6 +3149,23 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 	// tag then drops the field from the wire response. The
 	// dashboard renders "scan pending" on the absence.
 	resp.Scan = s.scanResponse(d)
+	// PR-A: per-deploy secret-scan audit row. Mirrors the
+	// Scan field above — same single-source-of-truth pattern
+	// (s.secretScanResponse is also used by
+	// /v1/deployments/{id}/secret-scan). The handler-side
+	// conversion from the on-disk jsonb shape
+	// (state.Deployment.SecretFindings []byte) into the wire
+	// DTO (api.SecretScanResult) happens here so this
+	// endpoint and the /secret-scan drill-down route emit
+	// IDENTICAL typed payloads for a given row.
+	//
+	// Returns nil when the row has SecretScannedAt == nil
+	// (mid-pipeline / pre-PR-A row); the SecretScan field's
+	// omitempty tag then drops the field from the wire
+	// response. The dashboard renders "secret scan pending"
+	// on the absence. A present-but-clean row has
+	// SecretScan != nil with Findings = [].
+	resp.SecretScan = s.secretScanResponse(d)
 	// Issue #554 / ADR-079 follow-up (AC #3 wire): surface the
 	// per-deployment parked_reason + parked_at columns from
 	// migration 00157. omitempty on the DTO handles the "never

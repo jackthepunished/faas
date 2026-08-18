@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.app_metrics_response_range import AppMetricsResponseRange, check_app_metrics_response_range
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.route_row import RouteRow
+
 
 T = TypeVar("T", bound="AppMetricsResponse")
 
@@ -53,6 +57,22 @@ class AppMetricsResponse:
     """Per-app egress byte delta over the window (informational; not billed). ADR-046. Source:
     schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until
     then this field stays 0)."""
+    tx_bytes: int | Unset = UNSET
+    """Per-app egress byte delta over the window, gateway-side mirror (informational; not billed). ADR-046 PR-2 /
+    issue #415 PR-2. Source: gateway_egress_tx_bytes_total{app} (Prom rollup; the gatewayd-internal-local per-
+    instance egress ring populates the counter on each raw-stream chunk). Distinct from `egress_bytes` (the schedd-
+    side mirror) so a divergence between the two surfaces immediately on the dashboard. Best-effort: query failure
+    does NOT flip the response to degraded — matches the `egress_bytes` semantics."""
+    routes: list[RouteRow] | Unset = UNSET
+    """Per-route breakdown for opt-in apps (ADR-093). Absent when
+    `route_metrics_enabled` is false on the app — the dashboard
+    distinguishes "feature off" (field absent) from "feature
+    on, no traffic" (empty array). Each row is the bounded
+    detail from the gatewayd-internal in-memory reader: max
+    50 distinct routes + the `__route_other__` wildcard-path
+    overflow bucket. The route label is method + raw path
+    (pre-rewrite, ADR-093 D6).
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +100,15 @@ class AppMetricsResponse:
 
         egress_bytes = self.egress_bytes
 
+        tx_bytes = self.tx_bytes
+
+        routes: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.routes, Unset):
+            routes = []
+            for routes_item_data in self.routes:
+                routes_item = routes_item_data.to_dict()
+                routes.append(routes_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -99,11 +128,17 @@ class AppMetricsResponse:
         )
         if egress_bytes is not UNSET:
             field_dict["egress_bytes"] = egress_bytes
+        if tx_bytes is not UNSET:
+            field_dict["tx_bytes"] = tx_bytes
+        if routes is not UNSET:
+            field_dict["routes"] = routes
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.route_row import RouteRow
+
         d = dict(src_dict)
         app_id = d.pop("app_id")
 
@@ -129,6 +164,17 @@ class AppMetricsResponse:
 
         egress_bytes = d.pop("egress_bytes", UNSET)
 
+        tx_bytes = d.pop("tx_bytes", UNSET)
+
+        _routes = d.pop("routes", UNSET)
+        routes: list[RouteRow] | Unset = UNSET
+        if _routes is not UNSET:
+            routes = []
+            for routes_item_data in _routes:
+                routes_item = RouteRow.from_dict(routes_item_data)
+
+                routes.append(routes_item)
+
         app_metrics_response = cls(
             app_id=app_id,
             range_=range_,
@@ -142,6 +188,8 @@ class AppMetricsResponse:
             cold_start_pct=cold_start_pct,
             wake_p95_ms=wake_p95_ms,
             egress_bytes=egress_bytes,
+            tx_bytes=tx_bytes,
+            routes=routes,
         )
 
         app_metrics_response.additional_properties = d

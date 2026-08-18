@@ -46,6 +46,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/overlay"
 	"github.com/onebox-faas/faas/pkg/state"
 	"google.golang.org/grpc"
@@ -102,6 +104,38 @@ type nodeCache struct {
 	subscribe subscribeFunc
 	// heartbeatStopped is described on the type doc above.
 	heartbeatStopped func()
+	// egressSink (issue #676 / ADR-080 PR-C) is the per-instance
+	// egress ring (pkg/gateway/egresssink) that raw-stream
+	// bytes flow into via ForwardingRawReverseProxyWithEvents's
+	// RecordResponseBytes hook. nil opts out (legacy test
+	// fixtures; pre-PR-C wiring); the sink's nil-safe guards
+	// at the boundary make the call site a no-op. Production
+	// wires the same *egresssink.EgressSink that run.go:1026
+	// installs on the Handler via WithEgressSink — they share
+	// the underlying ring buffer, so a raw-stream chunk written
+	// by the forwarder and a plain HTTP chunk written by the
+	// streaming wrap contribute to the same per-instance
+	// usage_minutes.tx_bytes bucket.
+	egressSink *egresssink.EgressSink
+	// drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker shared with the Handler / InternalReverseProxy /
+	// TraceHandler. The raw-stream pump holds a Begin slot for the
+	// lifetime of the hijacked conn so the graceful-shutdown drain
+	// waits for in-flight raw pumps instead of force-closing the
+	// conn on TimeoutStopSec=30s. nil = drain disabled (tests +
+	// pre-PR-A behaviour).
+	drain *drain.Tracker
+}
+
+// WithDrainTracker (issue #587 / PR-A) installs the per-request
+// drain tracker the raw-stream factory captures in its closure.
+// nil clears the tracker (returns the receiver for fluent
+// chaining). Wired from cmd/gatewayd-internal/main.go alongside
+// the Handler.WithInFlightTracker call so production has ONE
+// tracker per daemon shared by every ServeHTTP surface.
+func (n *nodeCache) WithDrainTracker(tracker *drain.Tracker) *nodeCache {
+	n.drain = tracker
+	return n
 }
 
 // WithEvents (issue #517 / PR-C / ADR-064) installs the events
@@ -115,6 +149,22 @@ type nodeCache struct {
 // forwarder that the test suite still drives).
 func (n *nodeCache) WithEvents(p *events.Platform) *nodeCache {
 	n.events = p
+	return n
+}
+
+// WithEgressSink (issue #676 / ADR-080 PR-C) installs the
+// per-instance egress ring that raw-stream bytes flow into via
+// rawStreamOnceWithEvents's RecordResponseBytes hook. Production
+// passes the same *egresssink.EgressSink that run.go:1026 installs
+// on the Handler via WithEgressSink — they share the underlying
+// ring so a raw-stream chunk and a plain HTTP chunk contribute to
+// the same usage_minutes.tx_bytes bucket. nil opts out (legacy
+// fixtures). The wiring order in runWithDeps is
+// WithEgressSink(egressSink) → deps.nodeCache.WithEgressSink(egressSink),
+// keeping the second call's pointer identical so no copy of the
+// ring buffer is needed.
+func (n *nodeCache) WithEgressSink(sink *egresssink.EgressSink) *nodeCache {
+	n.egressSink = sink
 	return n
 }
 
@@ -182,7 +232,7 @@ func (n *nodeCache) Forwarding() func(gateway.Target) http.Handler {
 // handler's three-input gate routes Connection: Upgrade requests
 // here BEFORE falling through to Forwarding.
 func (n *nodeCache) RawForwarding() func(gateway.Target) http.Handler {
-	return gateway.ForwardingRawReverseProxyWithEvents(n.cache, n.log, n.events)
+	return gateway.ForwardingRawReverseProxyWithEventsAndDrain(n.cache, n.log, n.events, n.egressSink, n.drain)
 }
 
 // Close shuts down every cached *grpc.ClientConn. Called once at

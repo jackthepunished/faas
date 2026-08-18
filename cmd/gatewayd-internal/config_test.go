@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -31,6 +32,42 @@ storage_dir = "/var/lib/faas/certs"
 contact_email = "ops@gregale.dev"
 use_staging_ca = true
 `
+
+// TestLoadConfig_NodeNameDefaultsEmpty pins the issue #678 / ADR-093
+// PR-0 surface: NodeName is the multi-box identity for the daemon.
+// Empty default = single-box dev back-compat (PR-B's verifier gate
+// stays closed; stdlib trust alone runs on every dial/listen). PR-B
+// reads this field at startup and constructs PGNodeVerifier when
+// non-empty.
+func TestLoadConfig_NodeNameDefaultsEmpty(t *testing.T) {
+	c, err := LoadConfig("/no/such/path")
+	if err != nil {
+		t.Fatalf("missing file: %v", err)
+	}
+	if c.NodeName != "" {
+		t.Errorf("NodeName = %q, want empty (single-box default)", c.NodeName)
+	}
+}
+
+// TestLoadConfig_NodeNameRoundTrip pins the toml round-trip: the
+// [node_name] field reads verbatim back from LoadConfig. A future
+// refactor that renames the field or drops the toml tag would
+// silently break PR-B's wiring.
+func TestLoadConfig_NodeNameRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gatewayd.toml")
+	body := `node_name = "fsn-2-gatewayd-internal"` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.NodeName != "fsn-2-gatewayd-internal" {
+		t.Errorf("NodeName = %q, want %q", c.NodeName, "fsn-2-gatewayd-internal")
+	}
+}
 
 func TestLoadConfig_DefaultsWhenMissing(t *testing.T) {
 	c, err := LoadConfig("/no/such/path")
@@ -82,7 +119,7 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 	if !c.TLS.UseStagingCA {
 		t.Error("UseStagingCA should be true from the fixture")
 	}
-	if got := c.resolveTLSConfig(func(string) bool { return true }); !got.UseStagingCA || got.ContactEmail != "ops@gregale.dev" {
+	if got := c.resolveTLSConfig(func(context.Context, string) (bool, error) { return true, nil }); !got.UseStagingCA || got.ContactEmail != "ops@gregale.dev" {
 		t.Errorf("resolveTLSConfig lost TLS fields: %+v", got)
 	}
 }
@@ -101,7 +138,7 @@ func TestConfig_ResolveTLSConfig(t *testing.T) {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	called := false
-	allowlist := func(string) bool { called = true; return true }
+	allowlist := func(_ context.Context, _ string) (bool, error) { called = true; return true, nil }
 	got := c.resolveTLSConfig(allowlist)
 	if got.Disabled {
 		t.Error("resolved TLS.Disabled = true, want false")
@@ -109,7 +146,11 @@ func TestConfig_ResolveTLSConfig(t *testing.T) {
 	if got.OnDemandHTTP01Allowlist == nil {
 		t.Fatal("resolved allowlist is nil")
 	}
-	if !got.OnDemandHTTP01Allowlist("any.gregale.dev") {
+	ok, err := got.OnDemandHTTP01Allowlist(context.Background(), "any.gregale.dev")
+	if err != nil {
+		t.Fatalf("allowlist err = %v, want nil", err)
+	}
+	if !ok {
 		t.Error("allowlist returned false on a permissive closure")
 	}
 	if !called {

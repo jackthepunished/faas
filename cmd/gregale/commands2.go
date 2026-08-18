@@ -20,6 +20,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
 	"github.com/onebox-faas/faas/pkg/gregalemanifest"
+	"github.com/onebox-faas/faas/pkg/secretscan"
 )
 
 // Subcommand names — lifted to constants so goconst stops flagging the
@@ -121,10 +122,6 @@ const (
 	// appSlugFallback — the dispatch table places it before the
 	// "app" case so `gregale deployment <id>` is never read as an app slug.
 	dispatchDeployment = "deployment"
-
-	// Plural orgs list. Mirrors dispatchApps shape; user runs
-	// `gregale orgs` to list accounts they belong to.
-	dispatchOrgs = "orgs"
 )
 
 // cmdApp implements `gregale app <slug>` (GET /v1/apps/{slug}), `gregale app <slug>
@@ -733,6 +730,11 @@ func cmdDeployTarball(args []string) int {
 	// explicit 1-exit error.
 	repo := fs.String("repo", "", "GitHub repo to deploy from (owner/name)")
 	ref := fs.String("ref", "", "git ref for --repo (branch, tag, or 40-char SHA)")
+	// Issue #270: --github emits a copy-paste-ready GitHub Actions
+	// workflow snippet to stdout and exits 0. No auth, no side effects,
+	// mirrors `cmdBillingPortal --print` (commands_billing.go:104-157).
+	// See cmd_deploy_github.go for the snippet body.
+	githubSnippet := fs.Bool("github", false, "emit a GitHub Actions workflow snippet for the faas-deploy-action")
 	templateName := fs.String("template", "", "start from an embedded template (run with a bad value to see available names)")
 	dockerfile := fs.Bool("dockerfile", false, "build with the supplied Dockerfile inside --tarball")
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine|node24|python313)")
@@ -781,9 +783,41 @@ func cmdDeployTarball(args []string) int {
 	// gregale.yaml with a `triggers:` block is applied AFTER CreateApp
 	// (and BEFORE the deploy body ships) — see deployManifestTriggers.
 	noTriggers := fs.Bool("no-triggers", false, "skip the `gregale.yaml` triggers fan-out (issue #791 PR-C)")
+	// --secret-scan toggles the pkg/secretscan pre-pack pass that
+	// drops credential-shaped lines (Stripe live keys, GitHub PATs, AWS
+	// access keys, OpenAI, Anthropic, Google API, PEM private keys, and
+	// Shannon-entropy-flagged unknowns) from .env* files before they are
+	// sealed into the upload tarball. Default ON because the failure mode
+	// (a Stripe key committed to .env.production by accident) ships a
+	// secret to the customer's running microVM where it's far harder to
+	// detect. Override with `--secret-scan=off` for local dev sandboxes
+	// that genuinely need to pass a Stripe test key at boot — the server
+	// still receives whatever the CLI ships.
+	secretScan := fs.String("secret-scan", "on", "scan .env* files for known credential patterns before packing (on|off; default on)")
+	// PR-0 of the deploy-diff cluster (see docs/adr/ draft):
+	// gregale deploy --diff renders what the deploy would change
+	// against the live state and exits per the gate. --json emits
+	// the stable wire shape; --strict (default) blocks on schema
+	// break / quota violation / missing required env; --lenient
+	// exits 0 even on breaks (still renders them). --server-diff
+	// routes the baseline + projection through apid's
+	// POST /v1/apps/{slug}/diff (PR-1), not the SDK client
+	// locally. The flag pair --strict / --lenient mirrors the
+	// existing --require-authn / --no-require-authn mutex shape
+	// at commands2.go:791-799.
+	diff := fs.Bool("diff", false, "preview what would change without deploying")
+	diffJSON := fs.Bool("json", false, "emit JSON output (only with --diff)")
+	diffStrict := fs.Bool("strict", false, "exit non-zero on schema/quota/env breaks (default with --diff)")
+	diffLenient := fs.Bool("lenient", false, "exit zero even on breaks; --diff still renders them")
+	serverDiff := fs.Bool("server-diff", false, "compute the diff on apid via POST /v1/apps/{slug}/diff (PR-1) instead of locally")
 	if err := fs.Parse(args); err != nil {
 		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME", "deploy")
 		return 1
+	}
+	// --strict / --lenient mutex. Same rationale as
+	// --require-authn / --no-require-authn above.
+	if *diffStrict && *diffLenient {
+		return printErr("Invalid flags", fmt.Errorf("--strict and --lenient are mutually exclusive"))
 	}
 	// Issue #560: flag-pair mutex check (mirrors cmdApp /
 	// cmdAppScale --warm-snapshot/--no-warm-snapshot). Setting
@@ -797,6 +831,15 @@ func cmdDeployTarball(args []string) int {
 	// pick. Mirrors the --require-authn/--no-require-authn check above.
 	if *function && *app {
 		return printErr("Invalid flags", fmt.Errorf("--function and --app are mutually exclusive"))
+	}
+	// --secret-scan=off is the documented escape hatch for customers who
+	// genuinely need to ship a Stripe test key at boot (local dev
+	// sandboxes). Validate the value eagerly so a typo (--secret-scan=0,
+	// --secret-scan=false) fails fast with a clear message rather than
+	// silently being treated as "on".
+	secretScanMode, secretScanErr := parseSecretScanFlag(*secretScan)
+	if secretScanErr != nil {
+		return printErr("Invalid flags", secretScanErr)
 	}
 	// --app clears any --runtime/--handler the customer also set. The
 	// customer intended an app deploy; passing function fields is
@@ -847,6 +890,19 @@ func cmdDeployTarball(args []string) int {
 		slug = deriveName()
 	}
 
+	// --github emits a copy-paste GitHub Actions workflow snippet to
+	// stdout and exits 0 (issue #270). No auth, no side effects — this
+	// is a documentation-generation path, not a deploy path. The snippet
+	// uses the resolved slug from --name / cwd (slug variable above)
+	// and emits ${{ github.* }} placeholders by default, or concrete
+	// values when running inside a Actions runner (GITHUB_REPOSITORY +
+	// GITHUB_SHA env vars). Slots above the --repo short-circuit so a
+	// customer can run `gregale deploy --github --name my-app` without
+	// a --ref. The slug is the only required input.
+	if *githubSnippet {
+		return cmdDeployGithubSnippet([]string{"--app", slug})
+	}
+
 	// --repo is the headless source-ref deploy path (issue #739 /
 	// ADR-092). The previous M7.5 dashboard browser flow was deleted
 	// in PR-B; the server resolves the install token from
@@ -885,12 +941,14 @@ func cmdDeployTarball(args []string) int {
 		}
 		switch *templateName {
 		case "function-node":
+			*function = true
 			// Default Node runtime is node22 (per docs/runtimes/go124.md
 			// tier-1 stance: no default-flip in the same PR that adds a
 			// new runtime). Use function-node24 for the Node 24 variant.
 			*runtime = runtimeNode22
 			*handler = defaultTemplateHandler
 		case "function-node24":
+			*function = true
 			// Tier 1 PR 1 row: parallel to function-node, runtime is
 			// node24 (Node 24 LTS). The handler filename
 			// convention is the same; imaged's function-layer
@@ -898,17 +956,20 @@ func cmdDeployTarball(args []string) int {
 			*runtime = "node24"
 			*handler = defaultTemplateHandler
 		case "function-python":
+			*function = true
 			// Default Python runtime is python312 (no default-flip in
 			// Tier 1; python313 stays opt-in via function-python313).
 			*runtime = runtimePython312
 			*handler = defaultTemplateHandler
 		case "function-python313":
+			*function = true
 			// Tier 1 PR 1 row: parallel to function-python, runtime
 			// is python313. Handler filename is identical
 			// (/app/handler.py in the microVM, version-neutral).
 			*runtime = "python313"
 			*handler = defaultTemplateHandler
 		case "function-go":
+			*function = true
 			// The customer's handler is a static Go binary; the
 			// --handler wire field is vestigial for go124 (the imaged
 			// manifest locks the entrypoint to /app/handler). We set
@@ -1014,21 +1075,34 @@ func cmdDeployTarball(args []string) int {
 			}
 			// Pack the cwd so the multipart upload has a tarball —
 			// the function convention needs the file on the wire for
-			// imaged to stage it.
-			path, _, n, err := autoPackCwd(cwd)
+			// imaged to stage it. The secret-scan pass runs before the
+			// tarball is sealed so a Stripe key committed to
+			// .env.production by accident is dropped before it leaves
+			// the workstation; --secret-scan=off disables it.
+			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
+			if scanErr != nil {
+				return printErr("Secret scan failed", scanErr)
+			}
+			path, _, n, err := autoPackCwd(cwd, overrides)
 			if err != nil {
 				return printErr("Could not pack current directory", err)
 			}
 			defer func() { _ = os.Remove(path) }()
+			renderSecretScanWarnings(scanFindings, osStderr)
 			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
 			*tarball = path
 			resolvedShape = shapeFunction
 		case shapeApp:
-			path, fw, n, err := autoPackCwd(cwd)
+			overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, secretScanMode)
+			if scanErr != nil {
+				return printErr("Secret scan failed", scanErr)
+			}
+			path, fw, n, err := autoPackCwd(cwd, overrides)
 			if err != nil {
 				return printErr("Could not pack current directory", err)
 			}
 			defer func() { _ = os.Remove(path) }()
+			renderSecretScanWarnings(scanFindings, osStderr)
 			if fw == fwDocker {
 				*dockerfile = true
 			}
@@ -1043,6 +1117,20 @@ func cmdDeployTarball(args []string) int {
 		return printErr("Not logged in", err)
 	}
 	ctx := context.Background()
+
+	// Deploy-diff short-circuit (PR-0 of the deploy-diff cluster).
+	// Runs AFTER authedClient so the SDK reads can resolve, and
+	// BEFORE the Phase 3 / CreateApp / Deploy body so no writes
+	// happen. --diff never ships a deploy.
+	if *diff {
+		opts := buildDiffOptions(slug, resolvedShape, *runtime, *handler, *image, cwd, requireAuthnPtr)
+		opts.JSON = *diffJSON
+		// --strict is the default; --lenient opts out.
+		opts.Strict = !*diffLenient
+		opts.Lenient = *diffLenient
+		opts.ServerDiff = *serverDiff
+		return runDiff(ctx, client, opts)
+	}
 
 	// Phase 3 (repo decomposition) one-key provision path. Triggered
 	// by --only or --project-slug on a --tarball / --template / zero-config
@@ -1329,7 +1417,7 @@ func cmdDomains(args []string) int {
 			return printErr("Could not add domain", err)
 		}
 		fmt.Printf("Add this TXT record to your DNS:\n\n")
-		fmt.Printf("  _gregale-verify.%s  TXT  %s\n\n", d.Domain, d.ChallengeToken)
+		fmt.Printf("  _faas-verify.%s  TXT  %s\n\n", d.Domain, d.ChallengeToken)
 		fmt.Printf("Then run 'gregale domains list' to see when verification completes.\n")
 		return 0
 	case subRm:
@@ -1416,6 +1504,8 @@ func cmdCrons(args []string) int {
 		return 0
 	case subUpdate:
 		return cmdCronsUpdate(args[1:])
+	case subInfo:
+		return cmdCronsInfo(args[1:])
 	case subRuns:
 		return cmdCronsRuns(args[1:])
 	case subRm:
@@ -2511,7 +2601,13 @@ streamLoop:
 	if b, ok := pollBuildStatus(c, dep, 60*time.Second); ok {
 		return terminalExitForBuild(b, dep.AppID)
 	}
-	if final, ok := pollDeploymentFinal(c, dep); ok {
+	// Tarball/function deployments created by older API paths may not carry
+	// BuildID.  In that case the build poll above is intentionally skipped,
+	// and a single deployment GET is too early: the build may have finished
+	// while the scheduler is still priming and parking the VM.  Keep polling
+	// the deployment row through that recovery window so a healthy deployment
+	// is not reported as exit 3 merely because the SSE stream ended first.
+	if final, ok := pollDeploymentFinalUntil(c, dep, 5*time.Minute); ok {
 		return terminalExitForDeployment(final)
 	}
 	PrintWarn(os.Stderr, "stream ended without a terminal frame; follow manually: gregale logs --deployment %s", dep.ID)
@@ -2537,6 +2633,36 @@ func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentR
 		return got, true
 	}
 	return api.DeploymentResponse{}, false
+}
+
+// pollDeploymentFinalUntil is the deployment-row counterpart to
+// pollBuildStatus. It is used when the create response has no BuildID, so the
+// deployment status is the only durable terminal signal available to the CLI.
+// The first GET is immediate; subsequent requests use a small capped backoff
+// and are bounded by deadline.
+func pollDeploymentFinalUntil(c *Client, dep api.DeploymentResponse, deadline time.Duration) (api.DeploymentResponse, bool) {
+	if deadline <= 0 {
+		return pollDeploymentFinal(c, dep)
+	}
+	end := time.Now().Add(deadline)
+	backoff := time.Second
+	for {
+		if final, ok := pollDeploymentFinal(c, dep); ok {
+			return final, true
+		}
+		remaining := time.Until(end)
+		if remaining <= 0 {
+			return api.DeploymentResponse{}, false
+		}
+		wait := backoff
+		if wait > remaining {
+			wait = remaining
+		}
+		time.Sleep(wait)
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 // pollBuildStatus polls GET /v1/builds/{id} until the build reaches
@@ -2764,4 +2890,40 @@ func cmdUsageStorage(args []string) int {
 			(u.SnapshotBytes+u.LayerBytes)/(1024*1024))
 	}
 	return 0
+}
+
+// renderSecretScanWarnings prints one two-line stderr block per finding
+// emitted by pkg/secretscan, followed by a single summary line.
+// Lives here (not in the scan package) because the message format is
+// CLI-specific UX and the renderer needs access to the CLI's PrintWarn
+// + osStderr. Findings are written to stderr specifically so a customer
+// running `gregale deploy --json | jq .build_id` sees no warning noise
+// on stdout — the JSON contract is preserved.
+//
+// Two-line shape per finding:
+//
+//	! Secret detected in .env.production:12 (STRIPE_SECRET_KEY → stripe_live, high)
+//	  ↳ sk_liv…p7dc
+//
+// Then a single summary line if any findings fired:
+//
+//	! 1 secret line(s) skipped from the upload. Move to: gregale secrets set
+//
+// The summary is suppressed when no findings fired, so a clean deploy
+// prints nothing from this function.
+func renderSecretScanWarnings(findings []secretscan.Finding, w io.Writer) {
+	if len(findings) == 0 {
+		return
+	}
+	for _, f := range findings {
+		PrintWarn(w, "Secret detected in %s:%d (%s → %s, %s)",
+			f.File, f.Line, f.Key, f.Provider, f.Severity)
+		// The snippet line uses no glyph — it's a continuation of the
+		// warning above, not a new event. Indented two spaces to read as
+		// a sub-line in the terminal. Fprintf errors are intentionally
+		// discarded (same convention as writeStatus — see output.go).
+		_, _ = fmt.Fprintf(w, "  ↳ %s\n", f.Snippet)
+	}
+	PrintWarn(w, "%d secret line(s) skipped from the upload. Move to: gregale secrets set",
+		len(findings))
 }

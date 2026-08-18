@@ -1052,6 +1052,44 @@ func (q *Queries) DeleteApp(ctx context.Context, db DBTX, id pgtype.UUID) error 
 	return err
 }
 
+const deleteAppErrorRequestsByIDs = `-- name: DeleteAppErrorRequestsByIDs :exec
+DELETE FROM app_error_requests WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) DeleteAppErrorRequestsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error {
+	_, err := db.Exec(ctx, deleteAppErrorRequestsByIDs, dollar_1)
+	return err
+}
+
+const deleteAppErrorRequestsOlderThan = `-- name: DeleteAppErrorRequestsOlderThan :exec
+DELETE FROM app_error_requests
+WHERE account_id = $1
+  AND received_at < $2
+`
+
+type DeleteAppErrorRequestsOlderThanParams struct {
+	AccountID  pgtype.UUID
+	ReceivedAt pgtype.Timestamptz
+}
+
+// The retention purge also runs on app_error_requests
+// independently — a customer's drill-down can age out without
+// the parent fingerprint row being removed (e.g. Hobby with
+// 100 rows/fingerprint cap evicts oldest request rows first).
+func (q *Queries) DeleteAppErrorRequestsOlderThan(ctx context.Context, db DBTX, arg DeleteAppErrorRequestsOlderThanParams) error {
+	_, err := db.Exec(ctx, deleteAppErrorRequestsOlderThan, arg.AccountID, arg.ReceivedAt)
+	return err
+}
+
+const deleteAppErrorsByIDs = `-- name: DeleteAppErrorsByIDs :exec
+DELETE FROM app_errors WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) DeleteAppErrorsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error {
+	_, err := db.Exec(ctx, deleteAppErrorsByIDs, dollar_1)
+	return err
+}
+
 const deleteCron = `-- name: DeleteCron :exec
 delete from crons where id = $1 and app_id = $2
 `
@@ -1072,6 +1110,22 @@ delete from custom_domains where domain = $1
 
 func (q *Queries) DeleteCustomDomain(ctx context.Context, db DBTX, domain interface{}) error {
 	_, err := db.Exec(ctx, deleteCustomDomain, domain)
+	return err
+}
+
+const deleteDataUpstreamByID = `-- name: DeleteDataUpstreamByID :exec
+DELETE FROM data_upstreams WHERE id = $1
+`
+
+// DELETE /v1/apps/{slug}/upstreams/{id} (PR-B). Soft-
+// delete is rejected by ADR-098 (a soft-deleted row
+// would still trigger pg_notify and confuse schedd);
+// the handler is the only path and uses a hard
+// DELETE. The CASCADE on account_id / app_id handles
+// the GDPR path (delete-account cascades through
+// apps → data_upstreams).
+func (q *Queries) DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error {
+	_, err := db.Exec(ctx, deleteDataUpstreamByID, id)
 	return err
 }
 
@@ -1158,6 +1212,126 @@ func (q *Queries) ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt p
 	return result.RowsAffected(), nil
 }
 
+const getAppErrorSample = `-- name: GetAppErrorSample :one
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id,
+    headers_sample, redactions
+FROM app_error_requests
+WHERE account_id  = $1
+  AND app_id      = $2
+  AND fingerprint = $3
+ORDER BY received_at ASC, request_id ASC
+LIMIT 1
+`
+
+type GetAppErrorSampleParams struct {
+	AccountID   pgtype.UUID
+	AppID       pgtype.UUID
+	Fingerprint string
+}
+
+type GetAppErrorSampleRow struct {
+	ID            pgtype.UUID
+	RequestID     pgtype.UUID
+	ReceivedAt    pgtype.Timestamptz
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  pgtype.UUID
+	HeadersSample []byte
+	Redactions    []string
+}
+
+// Single oldest request row for one fingerprint, used by the
+// UI's "what does this look like" preview. Returns
+// headers_sample + redactions for the wire-side "we redacted
+// X / Y / Z" badge.
+func (q *Queries) GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErrorSampleParams) (GetAppErrorSampleRow, error) {
+	row := db.QueryRow(ctx, getAppErrorSample, arg.AccountID, arg.AppID, arg.Fingerprint)
+	var i GetAppErrorSampleRow
+	err := row.Scan(
+		&i.ID,
+		&i.RequestID,
+		&i.ReceivedAt,
+		&i.Route,
+		&i.HttpStatus,
+		&i.ErrorClass,
+		&i.SampleMessage,
+		&i.DeploymentID,
+		&i.HeadersSample,
+		&i.Redactions,
+	)
+	return i, err
+}
+
+const getDataUpstreamByID = `-- name: GetDataUpstreamByID :one
+SELECT
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, coalesce(declared_region, ''),
+    last_rtt_ms, last_probed_at, last_seen_at, created_at
+FROM data_upstreams
+WHERE id = $1
+`
+
+type GetDataUpstreamByIDRow struct {
+	ID               pgtype.UUID
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	Source           string
+	Scope            string
+	Kind             string
+	Host             string
+	Port             int32
+	HostRedactedHash string
+	DeclaredRegion   string
+	LastRttMs        pgtype.Int4
+	LastProbedAt     pgtype.Timestamptz
+	LastSeenAt       pgtype.Timestamptz
+	CreatedAt        pgtype.Timestamptz
+}
+
+// Single-row read for the dashboard's "edit upstream"
+// pane (PR-B). Cursor-safe: no pagination; the handler
+// reads the row directly.
+func (q *Queries) GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) (GetDataUpstreamByIDRow, error) {
+	row := db.QueryRow(ctx, getDataUpstreamByID, id)
+	var i GetDataUpstreamByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AppID,
+		&i.Source,
+		&i.Scope,
+		&i.Kind,
+		&i.Host,
+		&i.Port,
+		&i.HostRedactedHash,
+		&i.DeclaredRegion,
+		&i.LastRttMs,
+		&i.LastProbedAt,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getGithubWebhookSecret = `-- name: GetGithubWebhookSecret :one
+SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1
+`
+
+// Returns the bytea secret for the given installation_id. The
+// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
+// webhook is rejected rather than falling back to the platform-
+// wide FAAS_GITHUB_WEBHOOK_SECRET).
+func (q *Queries) GetGithubWebhookSecret(ctx context.Context, db DBTX, installationID int64) ([]byte, error) {
+	row := db.QueryRow(ctx, getGithubWebhookSecret, installationID)
+	var secret_value []byte
+	err := row.Scan(&secret_value)
+	return secret_value, err
+}
+
 const getInstanceTailCount = `-- name: GetInstanceTailCount :one
 select tail_count from instances where id = $1
 `
@@ -1209,6 +1383,130 @@ func (q *Queries) GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetS
 	return i, err
 }
 
+const incrementAppError = `-- name: IncrementAppError :one
+
+INSERT INTO app_errors (
+    id, account_id, app_id, deployment_id, fingerprint,
+    route, http_status, error_class, sample_message,
+    count, request_count, first_seen_at, last_seen_at
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8, $9,
+    1, 1, $10, $10
+)
+ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE SET
+    count         = app_errors.count + 1,
+    request_count = app_errors.request_count + 1,
+    last_seen_at  = greatest(app_errors.last_seen_at, $10)
+RETURNING (xmax = 0) AS inserted
+`
+
+type IncrementAppErrorParams struct {
+	ID            pgtype.UUID
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	DeploymentID  pgtype.UUID
+	Fingerprint   string
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	FirstSeenAt   pgtype.Timestamptz
+}
+
+// ---------------------------------------------------------------------------
+// ADR-096 customer-facing automatic error grouping.
+// Tables live in migrations/00222_app_errors.sql. gatewayd-internal
+// writes via the apid gRPC IncrementAppError handler (pkg/apidgrpc/
+// apperrors.proto); apid is the only direct writer to the table
+// per the owner rules. The apid handlers in
+// cmd/apid/handlers_app_errors.go (PR-B) and the nightly purge
+// cron in cmd/apid/app_errors_purge.go (PR-A) read here.
+//
+// Index paths pinned in the migration file (NOT regenerated here
+// — sqlc doesn't manage indexes, only the typed query surface).
+// ---------------------------------------------------------------------------
+// ADR-096 §3.5 dedupe-merge INSERT. The grpc_server_apperrors.go
+// handler runs this inside a single pgx transaction per stream
+// batch. ON CONFLICT target is app_errors_dedupe_uniq (the
+// migration's UNIQUE on (account_id, app_id, fingerprint)).
+// The dedupe window is enforced by the writer's LRU; this
+// unique constraint is the last-resort tripwire.
+//
+// Returns (inserted bool) via the canonical Postgres
+// (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+// on an UPDATE. This lets the handler distinguish
+// outcomeInserted vs outcomeMerged on the wire — the gateway
+// uses that signal to update its in-process LRU freshness.
+func (q *Queries) IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) (bool, error) {
+	row := db.QueryRow(ctx, incrementAppError,
+		arg.ID,
+		arg.AccountID,
+		arg.AppID,
+		arg.DeploymentID,
+		arg.Fingerprint,
+		arg.Route,
+		arg.HttpStatus,
+		arg.ErrorClass,
+		arg.SampleMessage,
+		arg.FirstSeenAt,
+	)
+	var inserted bool
+	err := row.Scan(&inserted)
+	return inserted, err
+}
+
+const insertAppErrorRequest = `-- name: InsertAppErrorRequest :exec
+INSERT INTO app_error_requests (
+    id, account_id, app_id, fingerprint, request_id, received_at,
+    route, http_status, error_class, sample_message,
+    deployment_id, headers_sample, redactions
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9, $10,
+    $11, $12, $13
+)
+`
+
+type InsertAppErrorRequestParams struct {
+	ID            pgtype.UUID
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	Fingerprint   string
+	RequestID     pgtype.UUID
+	ReceivedAt    pgtype.Timestamptz
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  pgtype.UUID
+	HeadersSample []byte
+	Redactions    []string
+}
+
+// One row per request that hit the grouped fingerprint. No
+// ON CONFLICT — every request gets its own row. request_count
+// on app_errors is bumped on the paired IncrementAppError
+// call; the read path derives the joined total at query time.
+func (q *Queries) InsertAppErrorRequest(ctx context.Context, db DBTX, arg InsertAppErrorRequestParams) error {
+	_, err := db.Exec(ctx, insertAppErrorRequest,
+		arg.ID,
+		arg.AccountID,
+		arg.AppID,
+		arg.Fingerprint,
+		arg.RequestID,
+		arg.ReceivedAt,
+		arg.Route,
+		arg.HttpStatus,
+		arg.ErrorClass,
+		arg.SampleMessage,
+		arg.DeploymentID,
+		arg.HeadersSample,
+		arg.Redactions,
+	)
+	return err
+}
+
 const insertComputeNodeHeartbeat = `-- name: InsertComputeNodeHeartbeat :exec
 insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source)
 values ($1, $2, $3, $4)
@@ -1237,6 +1535,134 @@ func (q *Queries) InsertComputeNodeHeartbeat(ctx context.Context, db DBTX, arg I
 		arg.ReceivedAt,
 		arg.LastHeartbeatAt,
 		arg.Source,
+	)
+	return err
+}
+
+const insertDataUpstream = `-- name: InsertDataUpstream :one
+
+INSERT INTO data_upstreams (
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, declared_region,
+    last_rtt_ms, last_probed_at,
+    last_seen_at, created_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8,
+    $9, $10,
+    $11, $12,
+    now(), now()
+)
+ON CONFLICT (app_id, scope, kind, host, port) DO UPDATE SET
+    source          = EXCLUDED.source,
+    declared_region = EXCLUDED.declared_region,
+    last_rtt_ms     = EXCLUDED.last_rtt_ms,
+    last_probed_at  = EXCLUDED.last_probed_at,
+    last_seen_at    = now()
+RETURNING id
+`
+
+type InsertDataUpstreamParams struct {
+	ID               pgtype.UUID
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	Source           string
+	Scope            string
+	Kind             string
+	Host             string
+	Port             int32
+	HostRedactedHash string
+	DeclaredRegion   pgtype.Text
+	LastRttMs        pgtype.Int4
+	LastProbedAt     pgtype.Timestamptz
+}
+
+// ---------------------------------------------------------------------------
+// ADR-098 connection-aware execution (§9.A). Tables live in
+// migrations/00226_data_upstreams.sql. apid is the only writer to
+// data_upstreams (env-classifier side, PR-B); meterd is the only writer
+// to data_upstream_probes (probe loop, PR-C). schedd reads
+// data_upstream_probes via ListDataUpstreamProbesByHostRegion on wake
+// (PR-B wires pkg/sched/upstream_affinity.go). The Store interface is
+// extended in pkg/state/store.go; pgstore + memstore stubs added in
+// PR-A so the surface compiles — production reads/writes land in PR-B.
+//
+// Index paths pinned in the migration file (NOT regenerated here —
+// sqlc doesn't manage indexes, only the typed query surface):
+//   - data_upstreams_app_created_idx
+//   - data_upstreams_host_redacted_idx
+//   - data_upstreams_dedupe_uniq (UNIQUE)
+//   - partitioned data_upstream_probes + default partition
+//
+// ---------------------------------------------------------------------------
+// Dedupe-merge INSERT for data_upstreams. Mirrors the
+// IncrementAppError ON CONFLICT pattern (queries.sql:906).
+// The handler (PR-B's cmd/apid/extract.go) targets
+// data_upstreams_dedupe_uniq on (app_id, scope, kind,
+// host, port). On conflict: bump last_seen_at; refresh
+// last_rtt_ms / last_probed_at / declared_region from
+// EXCLUDED so the freshest classifier observation wins.
+// id is caller-supplied (uuidv7) so the row identity is
+// stable across the dedupe-merge.
+func (q *Queries) InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDataUpstreamParams) (pgtype.UUID, error) {
+	row := db.QueryRow(ctx, insertDataUpstream,
+		arg.ID,
+		arg.AccountID,
+		arg.AppID,
+		arg.Source,
+		arg.Scope,
+		arg.Kind,
+		arg.Host,
+		arg.Port,
+		arg.HostRedactedHash,
+		arg.DeclaredRegion,
+		arg.LastRttMs,
+		arg.LastProbedAt,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const insertDataUpstreamProbe = `-- name: InsertDataUpstreamProbe :exec
+INSERT INTO data_upstream_probes (
+    id, host_redacted_hash, region, kind, sampled_at, rtt_ms,
+    ok, error_class, probe_node
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9
+)
+`
+
+type InsertDataUpstreamProbeParams struct {
+	ID               pgtype.UUID
+	HostRedactedHash string
+	Region           string
+	Kind             string
+	SampledAt        pgtype.Timestamptz
+	RttMs            pgtype.Int4
+	Ok               bool
+	ErrorClass       pgtype.Text
+	ProbeNode        pgtype.Text
+}
+
+// meterd's probe loop writer (PR-C). One row per
+// (host_redacted_hash, region) per 30s sample. The
+// PK is (id, sampled_at) — id is a caller-supplied
+// uuidv7 so dedupe on retry is trivial. Partitioning
+// on sampled_at gives the meterd loop a hot-write
+// path; the partition creator (PR-C) drops old
+// partitions wholesale.
+func (q *Queries) InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg InsertDataUpstreamProbeParams) error {
+	_, err := db.Exec(ctx, insertDataUpstreamProbe,
+		arg.ID,
+		arg.HostRedactedHash,
+		arg.Region,
+		arg.Kind,
+		arg.SampledAt,
+		arg.RttMs,
+		arg.Ok,
+		arg.ErrorClass,
+		arg.ProbeNode,
 	)
 	return err
 }
@@ -1413,6 +1839,304 @@ func (q *Queries) ListAPIKeys(ctx context.Context, db DBTX, accountID pgtype.UUI
 	return items, nil
 }
 
+const listAllEventsPaged = `-- name: ListAllEventsPaged :many
+select id, at, actor, kind, subject, data
+from events
+where ($1 = '' or actor = $1)
+  and ($2 = '' or kind like $2 || '%')
+  and ($3 = '' or subject = $3::uuid)
+  and ($4 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $4)
+order by at desc, id desc
+limit $5::int8
+`
+
+type ListAllEventsPagedParams struct {
+	Column1 interface{}
+	Column2 interface{}
+	Column3 interface{}
+	Column4 interface{}
+	Column5 int64
+}
+
+type ListAllEventsPagedRow struct {
+	ID      int64
+	At      pgtype.Timestamptz
+	Actor   string
+	Kind    string
+	Subject pgtype.UUID
+	Data    []byte
+}
+
+// ADR-091 §3.7 / PR #3 — operator-obs backend audit-reading surface.
+// Reads the live events table (NOT audit_log — distinct source of
+// truth per ADR-091 §3.7.4). Optional filters:
+//   - $1 actor    — exact match (handler passes "" to skip)
+//   - $2 kind_prefix — LIKE 'prefix%' (handler passes "" to skip)
+//   - $3 subject  — exact match (handler passes "" to skip)
+//   - $4 since    — RFC 3339 timestamptz (handler passes zero time to skip)
+//   - $5 limit    — top-N rows (handler default 200, cap 500;
+//     cast to int8 so sqlc emits int64 Params and the
+//     handler's int→int64 widening is safe)
+//
+// Order: at DESC, id DESC — the id tiebreaker keeps the planner on
+// the (kind, at DESC) index added by 00190_admin_obs_index.sql for
+// kind-prefix queries and avoids an unstable sort on the
+// over-read window.
+// Subject is uuid (nullable in the schema); the cast is left to
+// the handler so the handler can pass an empty string for "no
+// subject filter" without a NULL literal.
+func (q *Queries) ListAllEventsPaged(ctx context.Context, db DBTX, arg ListAllEventsPagedParams) ([]ListAllEventsPagedRow, error) {
+	rows, err := db.Query(ctx, listAllEventsPaged,
+		arg.Column1,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllEventsPagedRow{}
+	for rows.Next() {
+		var i ListAllEventsPagedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.At,
+			&i.Actor,
+			&i.Kind,
+			&i.Subject,
+			&i.Data,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAppErrorFingerprintsForPurge = `-- name: ListAppErrorFingerprintsForPurge :many
+SELECT id FROM app_errors
+WHERE account_id = $1
+  AND last_seen_at < $2
+ORDER BY last_seen_at ASC
+LIMIT $3
+`
+
+type ListAppErrorFingerprintsForPurgeParams struct {
+	AccountID  pgtype.UUID
+	LastSeenAt pgtype.Timestamptz
+	Limit      int32
+}
+
+// Nightly retention purge read path (cmd/apid/app_errors_purge.go).
+// Returns IDs of app_errors rows for an account older than
+// `cutoff`. Capped at 10000 per call so the DELETE loop can
+// iterate without blocking. Sorted by last_seen_at ASC so the
+// oldest rows are deleted first (a future eviction policy
+// could swap to "least recent activity" without touching this
+// query).
+func (q *Queries) ListAppErrorFingerprintsForPurge(ctx context.Context, db DBTX, arg ListAppErrorFingerprintsForPurgeParams) ([]pgtype.UUID, error) {
+	rows, err := db.Query(ctx, listAppErrorFingerprintsForPurge, arg.AccountID, arg.LastSeenAt, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAppErrorGroups = `-- name: ListAppErrorGroups :many
+SELECT
+    id, fingerprint, error_class, route, http_status,
+    count, request_count, first_seen_at, last_seen_at,
+    sample_message
+FROM app_errors
+WHERE account_id = $1
+  AND app_id     = $2
+  AND last_seen_at >= $3
+  AND last_seen_at <= $4
+  AND ($5::bigint IS NULL
+       OR count < $5
+       OR (count = $5
+           AND (last_seen_at, fingerprint) < ($6, $7::text)))
+ORDER BY count DESC, last_seen_at DESC, fingerprint ASC
+LIMIT $8
+`
+
+type ListAppErrorGroupsParams struct {
+	AccountID         pgtype.UUID
+	AppID             pgtype.UUID
+	Since             pgtype.Timestamptz
+	Until             pgtype.Timestamptz
+	CursorCount       int64
+	CursorLastSeen    pgtype.Timestamptz
+	CursorFingerprint string
+	Limit             int32
+}
+
+type ListAppErrorGroupsRow struct {
+	ID            pgtype.UUID
+	Fingerprint   string
+	ErrorClass    string
+	Route         string
+	HttpStatus    int32
+	Count         int64
+	RequestCount  int64
+	FirstSeenAt   pgtype.Timestamptz
+	LastSeenAt    pgtype.Timestamptz
+	SampleMessage string
+}
+
+// ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
+// one (account_id, app_id) over a (since, until) window.
+// Cursor pagination via the (count, last_seen_at, fingerprint)
+// compound tuple (distinct from the operator's (created_at, id)
+// cursor). All three columns are part of the ORDER BY so the
+// cursor predicate must include all three — dropping `count`
+// breaks pagination: rows with smaller count but newer
+// last_seen_at are silently dropped across pages (the cursor
+// predicate on (last_seen_at, fingerprint) only considers the
+// inner order, missing the leading count-DESC boundary).
+// Index path: app_errors_account_app_last_seen_idx covers the
+// primary scan; the (count DESC) sort happens post-filter on the
+// bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+//
+// sqlc.arg(name) annotations disambiguate the cursor predicate
+// types — without them sqlc infers the timestamps as timestamptz
+// from the leading (count, last_seen_at) references and breaks
+// pagination.
+func (q *Queries) ListAppErrorGroups(ctx context.Context, db DBTX, arg ListAppErrorGroupsParams) ([]ListAppErrorGroupsRow, error) {
+	rows, err := db.Query(ctx, listAppErrorGroups,
+		arg.AccountID,
+		arg.AppID,
+		arg.Since,
+		arg.Until,
+		arg.CursorCount,
+		arg.CursorLastSeen,
+		arg.CursorFingerprint,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAppErrorGroupsRow{}
+	for rows.Next() {
+		var i ListAppErrorGroupsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Fingerprint,
+			&i.ErrorClass,
+			&i.Route,
+			&i.HttpStatus,
+			&i.Count,
+			&i.RequestCount,
+			&i.FirstSeenAt,
+			&i.LastSeenAt,
+			&i.SampleMessage,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAppErrorRequests = `-- name: ListAppErrorRequests :many
+SELECT
+    id, request_id, received_at, route, http_status,
+    error_class, sample_message, deployment_id
+FROM app_error_requests
+WHERE account_id  = $1
+  AND app_id      = $2
+  AND fingerprint = $3
+  AND ($4::timestamptz IS NULL
+       OR (received_at, request_id) < ($4, $5::uuid))
+ORDER BY received_at DESC, request_id DESC
+LIMIT $6
+`
+
+type ListAppErrorRequestsParams struct {
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	Fingerprint      string
+	CursorReceivedAt pgtype.Timestamptz
+	CursorRequestID  pgtype.UUID
+	Limit            int32
+}
+
+type ListAppErrorRequestsRow struct {
+	ID            pgtype.UUID
+	RequestID     pgtype.UUID
+	ReceivedAt    pgtype.Timestamptz
+	Route         string
+	HttpStatus    int32
+	ErrorClass    string
+	SampleMessage string
+	DeploymentID  pgtype.UUID
+}
+
+// Drill-down rows for one fingerprint. Cursor paginated via
+// (received_at, request_id). Index path:
+// app_error_requests_drill_idx. Does NOT include headers_sample
+// or redactions — those are returned only by GetAppErrorSample.
+//
+// sqlc.arg(name) annotations disambiguate the cursor predicate
+// types — without them sqlc infers $5 as timestamptz from the
+// leading (received_at) reference, breaking pagination.
+func (q *Queries) ListAppErrorRequests(ctx context.Context, db DBTX, arg ListAppErrorRequestsParams) ([]ListAppErrorRequestsRow, error) {
+	rows, err := db.Query(ctx, listAppErrorRequests,
+		arg.AccountID,
+		arg.AppID,
+		arg.Fingerprint,
+		arg.CursorReceivedAt,
+		arg.CursorRequestID,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAppErrorRequestsRow{}
+	for rows.Next() {
+		var i ListAppErrorRequestsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RequestID,
+			&i.ReceivedAt,
+			&i.Route,
+			&i.HttpStatus,
+			&i.ErrorClass,
+			&i.SampleMessage,
+			&i.DeploymentID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listApps = `-- name: ListApps :many
 select id, account_id, slug, type, coalesce(runtime, ''), ram_mb, coalesce(idle_timeout_s, 0),
        max_concurrency, status, manifest, created_at
@@ -1480,6 +2204,14 @@ type ListComputeNodeHeartbeatsParams struct {
 	Limit   int32
 }
 
+type ListComputeNodeHeartbeatsRow struct {
+	ID              int64
+	NodeID          pgtype.UUID
+	ReceivedAt      pgtype.Timestamptz
+	LastHeartbeatAt pgtype.Timestamptz
+	Source          string
+}
+
 // CP-1: read heartbeat history for one node, newest first. The
 // $2 parameter is nullable: passing pgtype.Timestamptz{} (the Go
 // zero value, mapped to SQL NULL by sqlc) means "no lower bound,
@@ -1491,15 +2223,15 @@ type ListComputeNodeHeartbeatsParams struct {
 // The endpoint passes a hard-cap limit (default 200, max 2000). The
 // composite index is enough for the routine 30s × 60 nodes × 24h
 // steady-state workload; a 7-day retention sweep is a follow-on.
-func (q *Queries) ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ComputeNodeHeartbeat, error) {
+func (q *Queries) ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ListComputeNodeHeartbeatsRow, error) {
 	rows, err := db.Query(ctx, listComputeNodeHeartbeats, arg.NodeID, arg.Column2, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ComputeNodeHeartbeat{}
+	items := []ListComputeNodeHeartbeatsRow{}
 	for rows.Next() {
-		var i ComputeNodeHeartbeat
+		var i ListComputeNodeHeartbeatsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.NodeID,
@@ -1546,6 +2278,173 @@ func (q *Queries) ListCronsForApp(ctx context.Context, db DBTX, appID pgtype.UUI
 			&i.Schedule,
 			&i.Path,
 			&i.Enabled,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDataUpstreamProbesByHostRegion = `-- name: ListDataUpstreamProbesByHostRegion :many
+SELECT
+    id, host_redacted_hash, region, kind, sampled_at, rtt_ms,
+    ok, error_class, coalesce(probe_node, '')
+FROM data_upstream_probes
+WHERE host_redacted_hash = $1
+  AND region = $2
+  AND sampled_at >= $3
+ORDER BY sampled_at DESC
+LIMIT $4
+`
+
+type ListDataUpstreamProbesByHostRegionParams struct {
+	HostRedactedHash string
+	Region           string
+	SampledAt        pgtype.Timestamptz
+	Limit            int32
+}
+
+type ListDataUpstreamProbesByHostRegionRow struct {
+	ID               pgtype.UUID
+	HostRedactedHash string
+	Region           string
+	Kind             string
+	SampledAt        pgtype.Timestamptz
+	RttMs            pgtype.Int4
+	Ok               bool
+	ErrorClass       pgtype.Text
+	ProbeNode        string
+}
+
+// schedd's wake-side read path (PR-B/C). Returns the
+// N most recent probe samples for one (host, region)
+// pair, time-windowed to the meterd sliding window
+// (default: 30s × 5min). Index path: the
+// partitioned table's PARTITION BY RANGE on
+// sampled_at — partition pruning drops everything
+// outside the window. The (kind) projection lets
+// schedd key its upstream-affinity map on
+// (kind, region) without joining data_upstreams.
+func (q *Queries) ListDataUpstreamProbesByHostRegion(ctx context.Context, db DBTX, arg ListDataUpstreamProbesByHostRegionParams) ([]ListDataUpstreamProbesByHostRegionRow, error) {
+	rows, err := db.Query(ctx, listDataUpstreamProbesByHostRegion,
+		arg.HostRedactedHash,
+		arg.Region,
+		arg.SampledAt,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDataUpstreamProbesByHostRegionRow{}
+	for rows.Next() {
+		var i ListDataUpstreamProbesByHostRegionRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.HostRedactedHash,
+			&i.Region,
+			&i.Kind,
+			&i.SampledAt,
+			&i.RttMs,
+			&i.Ok,
+			&i.ErrorClass,
+			&i.ProbeNode,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDataUpstreamsByApp = `-- name: ListDataUpstreamsByApp :many
+SELECT
+    id, account_id, app_id, source, scope, kind, host, port,
+    host_redacted_hash, coalesce(declared_region, ''),
+    last_rtt_ms, last_probed_at, last_seen_at, created_at
+FROM data_upstreams
+WHERE app_id = $1::uuid
+  AND ($2::timestamptz IS NULL
+       OR (created_at, id) < ($2::timestamptz,
+                              $3::uuid))
+ORDER BY created_at DESC, id DESC
+LIMIT $4::int
+`
+
+type ListDataUpstreamsByAppParams struct {
+	AppID           pgtype.UUID
+	CursorCreatedAt pgtype.Timestamptz
+	CursorID        pgtype.UUID
+	PageLimit       int32
+}
+
+type ListDataUpstreamsByAppRow struct {
+	ID               pgtype.UUID
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	Source           string
+	Scope            string
+	Kind             string
+	Host             string
+	Port             int32
+	HostRedactedHash string
+	DeclaredRegion   string
+	LastRttMs        pgtype.Int4
+	LastProbedAt     pgtype.Timestamptz
+	LastSeenAt       pgtype.Timestamptz
+	CreatedAt        pgtype.Timestamptz
+}
+
+// GET /v1/apps/{slug}/upstreams (PR-B). Cursor pagination
+// via (created_at, id) — distinct from app_errors'
+// (last_seen_at, fingerprint) cursor because
+// data_upstreams is a stable list, not a hot recency
+// list. Index path: data_upstreams_app_created_idx.
+//
+// sqlc.arg(...)::type casts disambiguate the two cursor
+// params — without them sqlc named both fields
+// `CreatedAt` (taken from the SELECT list) and the
+// generated Go wrapper bound a timestamptz to the $3
+// uuid slot, tripping a type error on every cursor page
+// past the first. See the cross-PR slot-fence
+// sqlc.arg-disambiguates-cursor memory; the same
+// pattern pins ListAppErrorGroups.
+func (q *Queries) ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error) {
+	rows, err := db.Query(ctx, listDataUpstreamsByApp,
+		arg.AppID,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDataUpstreamsByAppRow{}
+	for rows.Next() {
+		var i ListDataUpstreamsByAppRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.AppID,
+			&i.Source,
+			&i.Scope,
+			&i.Kind,
+			&i.Host,
+			&i.Port,
+			&i.HostRedactedHash,
+			&i.DeclaredRegion,
+			&i.LastRttMs,
+			&i.LastProbedAt,
+			&i.LastSeenAt,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -2070,6 +2969,74 @@ func (q *Queries) ListOrgsForAccount(ctx context.Context, db DBTX, accountID pgt
 	return items, nil
 }
 
+const listRecentEventsForAccount = `-- name: ListRecentEventsForAccount :many
+select id, at, actor, kind, subject, data
+from events
+where actor_account_id = $1
+  and ($2 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $2)
+order by at desc, id desc
+limit $3::int8
+`
+
+type ListRecentEventsForAccountParams struct {
+	ActorAccountID pgtype.UUID
+	Column2        interface{}
+	Column3        int64
+}
+
+type ListRecentEventsForAccountRow struct {
+	ID      int64
+	At      pgtype.Timestamptz
+	Actor   string
+	Kind    string
+	Subject pgtype.UUID
+	Data    []byte
+}
+
+// ADR-091 §3.7 / PR #3 — per-account events drill-down. Backed by
+// the partial index events_actor_account_idx on
+// (actor_account_id) WHERE actor_account_id IS NOT NULL
+// (migrations/00099_orgs_memberships_invitations.sql). Filters:
+//   - $1 actor_account_id — uuid (the account the actor belonged to)
+//   - $2 since             — RFC 3339 timestamptz (handler passes
+//     zero time to skip; the predicate is
+//     uniform with ListAllEventsPaged)
+//   - $3 limit             — top-N rows (handler default 200, cap 500;
+//     cast to int8 so sqlc emits int64 Params
+//     and the handler's int→int64 widening is
+//     safe)
+//
+// Order: at DESC, id DESC — same rationale as ListAllEventsPaged.
+// PR #3 wires the per-account filter on the SSE mirror's
+// per-account projections; the broader ?actor + ?subject filter
+// shape lives on ListAllEventsPaged.
+func (q *Queries) ListRecentEventsForAccount(ctx context.Context, db DBTX, arg ListRecentEventsForAccountParams) ([]ListRecentEventsForAccountRow, error) {
+	rows, err := db.Query(ctx, listRecentEventsForAccount, arg.ActorAccountID, arg.Column2, arg.Column3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRecentEventsForAccountRow{}
+	for rows.Next() {
+		var i ListRecentEventsForAccountRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.At,
+			&i.Actor,
+			&i.Kind,
+			&i.Subject,
+			&i.Data,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSessions = `-- name: ListSessions :many
 select id, account_id,
        coalesce(host(issued_ip), '') as issued_ip,
@@ -2435,6 +3402,25 @@ func (q *Queries) PerAccountRateLimitAggregate(ctx context.Context, db DBTX, arg
 	return items, nil
 }
 
+const pruneDataUpstreamProbesOlderThan = `-- name: PruneDataUpstreamProbesOlderThan :exec
+DELETE FROM data_upstream_probes WHERE sampled_at < $1
+`
+
+// Retention purge. The meterd cron calls this
+// hourly with `cutoff = now() - interval '30 days'`
+// (matches the §12 prom_retention_days:15 floor +
+// a 2× safety margin). The partition pruning on
+// sampled_at makes this O(affected partitions),
+// not O(table size). The PR-C partition creator
+// DROPs whole partitions for ranges entirely older
+// than cutoff; this query handles the partial-
+// partition tail (rows in the default partition or
+// the current month that are older than cutoff).
+func (q *Queries) PruneDataUpstreamProbesOlderThan(ctx context.Context, db DBTX, sampledAt pgtype.Timestamptz) error {
+	_, err := db.Exec(ctx, pruneDataUpstreamProbesOlderThan, sampledAt)
+	return err
+}
+
 const revokeAllSessions = `-- name: RevokeAllSessions :many
 update sessions set revoked_at = now()
 where account_id = $1 and id <> $2 and revoked_at is null
@@ -2747,6 +3733,151 @@ func (q *Queries) TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg Traf
 	return items, nil
 }
 
+const trafficAnomalyAggregateByNode = `-- name: TrafficAnomalyAggregateByNode :many
+with baseline as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           extract(hour from um.minute) as hour_of_day,
+           avg(um.mb_seconds)::float8 as mean_mb_seconds,
+           coalesce(stddev_pop(um.mb_seconds), 0)::float8 as stddev_mb_seconds,
+           count(*)::int as sample_count
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $2
+      and um.minute <  $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, extract(hour from um.minute)
+),
+current_pool as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           um.minute,
+           sum(um.mb_seconds)::float8 as current_mb_seconds
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, um.minute
+),
+scored as (
+    select c.account_id,
+           c.app_id,
+           c.node_id,
+           c.minute,
+           c.current_mb_seconds,
+           b.mean_mb_seconds,
+           b.stddev_mb_seconds,
+           b.sample_count,
+           case
+               when b.sample_count < 3 then null
+               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+               when b.stddev_mb_seconds >= 1.0
+                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+               else null
+           end as z_score,
+           case
+               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+               else 'hour_of_day'
+           end as reason
+    from current_pool c
+    join baseline b
+      on c.account_id = b.account_id
+     and c.app_id    = b.app_id
+     and c.node_id   = b.node_id
+     and extract(hour from c.minute) = b.hour_of_day
+)
+select account_id,
+       app_id,
+       node_id,
+       minute,
+       current_mb_seconds,
+       mean_mb_seconds,
+       stddev_mb_seconds,
+       sample_count,
+       z_score,
+       reason
+from scored
+where z_score is not null
+order by z_score desc
+limit $3::int8
+`
+
+type TrafficAnomalyAggregateByNodeParams struct {
+	Minute   pgtype.Timestamptz
+	Minute_2 pgtype.Timestamptz
+	Column3  int64
+}
+
+type TrafficAnomalyAggregateByNodeRow struct {
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	NodeID           pgtype.UUID
+	Minute           pgtype.Timestamptz
+	CurrentMbSeconds float64
+	MeanMbSeconds    float64
+	StddevMbSeconds  float64
+	SampleCount      int32
+	ZScore           interface{}
+	Reason           string
+}
+
+// PR #4 (ADR-092 §3.4 amendment) — per-node variant of
+// TrafficAnomalyAggregate. Joins usage_minutes to instances to
+// recover the hosting node_id, then groups by
+// (account_id, app_id, node_id, EXTRACT(HOUR FROM minute)) for
+// the baseline. The current_pool also groups by node_id so the
+// "today" anomaly is per-node, not per-app-wide.
+//
+// Why a separate query and not a sqlc parameter on the existing
+// one: the baseline math is identical, but the GROUP BY keys
+// differ by one column, and trying to thread that through a
+// nullable WHERE filter would either lose the per-node grain
+// (NULL filter collapses the group) or return the wrong rollup
+// (a per-node "current" against an app-wide baseline reports
+// spurious anomalies when the fleet is unevenly loaded). A
+// separate query keeps each path simple and self-contained.
+//
+// Index path: same as TrafficAnomalyAggregate — usage_minutes
+// primary key (instance_id, minute) is fine for the 24h current
+// window in single-box posture. The instances.node_id lookup
+// is by PK; the join is O(matches) on the PK.
+func (q *Queries) TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error) {
+	rows, err := db.Query(ctx, trafficAnomalyAggregateByNode, arg.Minute, arg.Minute_2, arg.Column3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TrafficAnomalyAggregateByNodeRow{}
+	for rows.Next() {
+		var i TrafficAnomalyAggregateByNodeRow
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.AppID,
+			&i.NodeID,
+			&i.Minute,
+			&i.CurrentMbSeconds,
+			&i.MeanMbSeconds,
+			&i.StddevMbSeconds,
+			&i.SampleCount,
+			&i.ZScore,
+			&i.Reason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateAccountPlan = `-- name: UpdateAccountPlan :exec
 update accounts set plan = $2 where id = $1
 `
@@ -2962,6 +4093,46 @@ type UpdateOrgStatusParams struct {
 func (q *Queries) UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error {
 	_, err := db.Exec(ctx, updateOrgStatus, arg.ID, arg.Status)
 	return err
+}
+
+const upsertGithubWebhookSecret = `-- name: UpsertGithubWebhookSecret :execrows
+
+INSERT INTO github_webhook_secrets (installation_id, secret_value, upgraded_by)
+VALUES ($1, $2, $3)
+ON CONFLICT (installation_id) DO UPDATE
+SET secret_value = EXCLUDED.secret_value,
+    upgraded_at  = now(),
+    upgraded_by  = EXCLUDED.upgraded_by
+`
+
+type UpsertGithubWebhookSecretParams struct {
+	InstallationID int64
+	SecretValue    []byte
+	UpgradedBy     string
+}
+
+// ---------------------------------------------------------------------------
+// PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
+//
+// The two queries below are exposed by pkg/state/pgstore.go as
+// (s *PgStore).UpsertGithubWebhookSecret and
+// (s *PgStore).GetGithubWebhookSecret. The body is hand-curated
+// rather than sqlc-generated because the github_installations pair
+// is also hand-curated (same precedent). The schema lives in
+// migrations/00212_github_webhook_secrets.sql (renumbered from
+// 00208 → 00209 → 00212 in the slot-collision cluster; see the
+// migration's header for the cross-pr-slot-fence chain).
+// ---------------------------------------------------------------------------
+// Installs or rotates the per-tenant webhook secret for an
+// installation_id. ON CONFLICT (installation_id) DO UPDATE so a
+// rotation is one statement. upgradedAt + upgradedBy form a §11
+// audit trail.
+func (q *Queries) UpsertGithubWebhookSecret(ctx context.Context, db DBTX, arg UpsertGithubWebhookSecretParams) (int64, error) {
+	result, err := db.Exec(ctx, upsertGithubWebhookSecret, arg.InstallationID, arg.SecretValue, arg.UpgradedBy)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const usageByMonth = `-- name: UsageByMonth :many

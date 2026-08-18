@@ -12,6 +12,7 @@ package api
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"testing"
@@ -28,6 +29,20 @@ const (
 	PlanPro   Plan = "pro"
 	PlanScale Plan = "scale"
 )
+
+// StreamingStatus is the per-request classification emitted via the
+// Streaming-Status response header (ADR-102 D1/D2). String alias so
+// the JSON encoder marshals the wire value verbatim and HTTP header
+// Set/Get round-trips losslessly. The canonical wire values are the
+// lower-case string forms of the StreamingStatus* constants declared
+// in the streaming constants block below; see that block for per-value
+// semantics.
+//
+// All non-streaming variants carry the plan-level buffered cap
+// (MaxResponseBodyBytes); only the streaming variant can carry an
+// endpoint-rule cap (max_body_bytes_streaming from a matched edge
+// rule).
+type StreamingStatus string
 
 // Plans lists every plan low-to-high. Order matters for upgrade/downgrade logic
 // and for deterministic tests — do not reorder.
@@ -87,6 +102,15 @@ type Limits struct {
 	VCPU         int // firecracker vcpu_count (spec §4.4)
 	IdleTimeoutS int // default idle-reaper timeout (spec §4.3)
 
+	// End-to-end request budget (ADR-093). Per-plan overrides for
+	// the platform's wall-clock deadline on every customer-facing
+	// request. 0 falls back to RequestBudgetDefault /
+	// RequestBudgetMax in the limits.go const block. Per-route
+	// overrides via edge-rule kind=budget take precedence at
+	// request time.
+	RequestBudgetMs    int // 0 → RequestBudgetDefault; non-zero clamped to [1, RequestBudgetMaxMs]
+	RequestBudgetMaxMs int // 0 → RequestBudgetMax; non-zero must be ≥ RequestBudgetMs
+
 	// CPU fairness (issue #301 / ADR-044). The 3-level cgroup hierarchy
 	// (faas-tenant.slice/tenant-<plan>.slice/<instance>) enforces these
 	// per-plan via two complementary channels:
@@ -121,6 +145,47 @@ type Limits struct {
 	// many apps stays under per-app rps individually but cannot exceed
 	// the per-minute sum across all their apps.
 	RateLimitPerAccountRPM int
+
+	// ThrottleMaxKeysPerRule (ADR-104 / issue #881 Phase 3) caps the
+	// cardinality of the per-consumer bucket map for a single
+	// kind=throttle rule. Distinct from EdgeRulesThrottlePerApp (the
+	// per-app quota on how many throttle rules an app may hold) and
+	// from RateLimitRPS/Burst (the per-rule rps/burst ceiling). The
+	// value bounds the consumer-set size: when the set exceeds this
+	// number, all over-cap callers collapse into a single
+	// non-evicting __other__ bucket that still consumes tokens
+	// (ADR-104 §"Consequences"). 0 means the plan does NOT expose
+	// per-consumer throttling — the apid validator rejects any rule
+	// that opts into a non-"none" KeyBy when this is 0.
+	//
+	// Per-plan: Free 100, Hobby 1000, Pro 5000, Scale 10000. The
+	// doubling shape (100 → 1000 → 5000 → 10000) tracks plan headroom:
+	// a Hobby customer can size per-key limits on a meaningful
+	// fraction of their app's key space; a Scale customer can size
+	// per-tenant limits in a multi-tenant deployment. Plans below
+	// 100 (none today) would be trivially bypassable.
+	ThrottleMaxKeysPerRule int
+
+	// Wake-side admission (schedd layer). Throttles the rate at which
+	// schedd will admit a *new* wake operation for an app or account.
+	// Distinct from RateLimitRPS/Burst which throttle inbound HTTP
+	// requests at the gateway edge — these cap the downstream
+	// consequence (one wake per cold-boot, one wake per warm fan-out,
+	// N wakes per cron tick). Consumed by
+	// pkg/sched.WakeRateLimiter (ADR-099 PR-0 / ADR-080 Risk #1).
+	//
+	// Units: per-minute refill, with `WakeBurstPerApp` as the bucket
+	// ceiling. The minute-scale (vs second-scale at the gateway) is
+	// deliberate: wake admissions are burstier than HTTP requests (a
+	// cron tick legitimately fires N wakes in the same second) and
+	// the per-minute budget still bounds a runaway dispatch fan-out.
+	//
+	// WakeBurstPerAccount caps the per-account sum so a customer
+	// fanning out across many apps in the same account cannot evade
+	// the per-app ceiling by keeping each app under its own cap. Same
+	// evasion shape as pkg/gateway.Limiter.AllowAccount.
+	WakeBurstPerApp     int
+	WakeBurstPerAccount int
 
 	// Networking (spec §7).
 	EgressMbit int // per-instance egress bandwidth cap via tc
@@ -419,6 +484,89 @@ type Limits struct {
 	// EdgeRulesIPAllowed gates kind='ip' rules on the plan. Same
 	// Hobby+ opt-in shape as EdgeRulesJWTAllowed.
 	EdgeRulesIPAllowed bool
+	// EdgeRulesGeoPerApp caps how many kind='geo' rules one app may
+	// hold. Stricter than EdgeRulesPerApp because geo is a high-touch
+	// abuse primitive — a customer with 10 geo rules on a Free app is
+	// doing something exotic. The Free-tier guardrail (1 rule) covers
+	// the abuse-desk customer persona ("block everything except DE")
+	// before they have to upgrade. Enforced inside the per-app FOR
+	// UPDATE lock in CreateEdgeRuleIfUnderQuota.
+	//
+	// Per-plan: Free 1, Hobby 5, Pro 25, Scale 100. Geo is available
+	// on ALL plans including Free (ADR-091 D21 sub-decision hop —
+	// the abuse-desk customer can't convert if they can't size geo
+	// first). Plan gate is enforced via the EdgeRulesQuotaError.Kind
+	// field; apid-Validate throws CodePlanEdgeRuleKindQuotaReached
+	// when this trips.
+	EdgeRulesGeoPerApp int
+	// EdgeRulesThrottlePerApp caps how many kind='throttle' rules
+	// one app may hold. ADR-091 D20.5 amendment (issue #881):
+	// per-route per-method token-bucket rate limiting customers
+	// attach to one (host, path, http_method) triple. Cardinality
+	// is bounded by configured rules (bucket key is appID+"\x00"+
+	// ruleID), so the per-app quota mirrors EdgeRulesGeoPerApp:
+	// the same Free-allowed posture keeps the abuse-desk path open
+	// and the same per-tier doubling shape (1/5/25/100) keeps the
+	// upgrade curve predictable.
+	//
+	// The finer-grained sub-plan ceiling on the action itself
+	// (rps ≤ plan.RateLimitRPS, burst ≤ plan.RateLimitBurst) is
+	// enforced twice: at apid create/update by
+	// api.EdgeRuleThrottleAction.Validate, and again at gateway
+	// compile time by cmd/gatewayd-internal/edge_rules.go::
+	// compileThrottleRules (defence-in-depth against a direct-DB
+	// write that bypassed apid).
+	//
+	// Per-plan: Free 1, Hobby 5, Pro 25, Scale 100. Throttle is
+	// available on ALL plans including Free (ADR-091 D20.5
+	// sub-decision — same posture as Geo: a customer can size a
+	// throttle on Free before upgrading). Plan gate is enforced
+	// via the EdgeRulesQuotaError.Kind field; apid-Validate
+	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
+	EdgeRulesThrottlePerApp int
+
+	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
+	// (ADR-099 / issue #879) a single account may own. The cap
+	// defends against a SaaS customer pinning one surface per
+	// end-customer and inflating the per-account cert inventory.
+	// Per-plan: Free 0, Hobby 1, Pro 5, Scale 25. Surfacing tenant
+	// hostnames beyond the cap returns 402
+	// CodeTenantSurfaceQuotaReached; verified out-of-band (apid
+	// doesn't dispatch cert mint). Plan gate is enforced via the
+	// TenantSurfaceQuotaError.PerPlan field (TBD PR-A), apid-Validate
+	// throws CodeTenantSurfaceQuotaReached when this trips.
+	TenantSurfacesPerAccount int
+	// TenantHostnamesPerSurface caps how many verified hostnames one
+	// surface may hold. Independent of TenantSurfacesPerAccount — the
+	// per-surface cap defends against the 1-surface-times-N-hostnames
+	// bypass. Per-plan: Free 0 (irrelevant because Free cannot create
+	// surfaces), Hobby 10, Pro 50, Scale 250. The cap is enforced in
+	// pkg/state.AddTenantHostnameIfUnderQuota (TBD PR-A) under a
+	// tenant_surfaces-row FOR UPDATE lock — same TOCTOU-defence
+	// pattern as CreateEdgeRuleIfUnderQuota (pgstore.go:5914-5974).
+	// 0 with TenantSurfacesAllowed=false (Free); non-zero with
+	// TenantSurfacesAllowed=true (Hobby/Pro/Scale).
+	TenantHostnamesPerSurface int
+	// TenantSurfacesAllowed toggles the `tenant_surfaces` feature
+	// (ADR-099 / issue #879) on the plan. Free stays off — the
+	// legacy `custom_domains` path (one FQDN, one cert) carries the
+	// single-tenant use case; the surface route is the upsell.
+	// Hobby/Pro/Scale = true. apid's createTenantSurface handler
+	// rejects a POST with 402 CodeTenantSurfaceQuotaReached when this
+	// is false (a Free customer's POST hits the gate before the store
+	// is touched).
+	TenantSurfacesAllowed bool
+
+	// DataPlacementHintsPerApp (ADR-098 §D5) caps how many
+	// inferred/explicit data_upstreams rows one app may hold. The
+	// per-app cap defends against a noisy customer pinning hundreds
+	// of DB/cache hints on a hot app (the schedd wake-time chooser
+	// iterates the per-app scores at placement time). Free = 0
+	// (the customer can only see metadata via the dashboard; the
+	// capture path is fail-closed at the handler level via
+	// CodePlanLimitDataUpstreams). Per-plan: Free 0, Hobby 3, Pro
+	// 10, Scale 50.
+	DataPlacementHintsPerApp int
 
 	// WebhookPerApp caps how many outbound webhook subscriptions a
 	// single app may register (issue #476 / ADR-076). The plan gate
@@ -534,6 +682,19 @@ type Limits struct {
 	// flag via PATCH (gated by Plan.WebSocketResponseAllowed so
 	// Free stays off even when an admin backfills the column).
 	WebSocketEnabled bool
+	// RouteMetricsEnabled (ADR-093) gates the per-app per-route
+	// observability surface: when true, gatewayd-internal emits three
+	// additional Prometheus series keyed by an enumerated `route`
+	// label (method + raw path, bounded per-app at 50 distinct entries
+	// with __route_other__ as the non-evicting overflow bucket) and
+	// serves the per-app reader at GET /v1/internal/apps/{slug}/routes.
+	// Hobby/Pro/Scale default on; Free stays off (the abuse-floor tier
+	// where per-route cardinality would not have a budget). The
+	// plan-level default is applied at CreateApp time via buildApp
+	// using Plan.RouteMetricsEnabled(); an existing app may still flip
+	// the flag via PATCH (gated by Plan.RouteMetricsResponseAllowed
+	// so Free stays off even when an admin backfills the column).
+	RouteMetricsEnabled bool
 	// MaxResponseBodyBytes is the per-response body cap (spec §4.1
 	// for the legacy 25 MB bound; issue #471 raises the cap for
 	// Hobby+ to 100 MB so LLM-style streams have headroom). 0 means
@@ -652,7 +813,59 @@ type Limits struct {
 	// per tier (Hobby's "last week", Pro's "this month", Scale's
 	// "this quarter"). 0 means "no archive on this plan" (Free).
 	LogArchiveRetentionDaysMax int
+
+	// AppErrorsRetentionDays (ADR-096 / customer-facing automatic
+	// error grouping) is the per-plan retention cap on
+	// app_errors / app_error_requests rows. The nightly purge
+	// cron in cmd/apid/app_errors_purge.go deletes rows older
+	// than this bound. MUST be <= LogArchiveRetentionDaysMax
+	// for the same plan — the errors view is a stricter subset
+	// of the log archive; if the archive retention widens in a
+	// future release, the errors retention widens with it but
+	// not faster. Free=1, Hobby=7, Pro=30, Scale=90.
+	AppErrorsRetentionDays int
+	// AppErrorsMaxFingerprintsPerApp (ADR-096) is the per-plan
+	// ceiling on the number of distinct fingerprints the
+	// gatewayd-internal recorder retains in its LRU for one
+	// (account_id, app_id). Past the cap the recorder silently
+	// drops + bumps faas_gateway_app_errors_recorded_total{
+	// outcome="rate_limited"}. Free=50, Hobby=200, Pro=1000,
+	// Scale=5000.
+	AppErrorsMaxFingerprintsPerApp int
+	// AppErrorsMaxRequestRowsPerFingerprint (ADR-096) is the
+	// per-plan ceiling on the number of app_error_requests rows
+	// retained per fingerprint for the drill-down view. Older
+	// rows beyond the cap are deleted first on the retention
+	// purge. Free=25, Hobby=100, Pro=500, Scale=1000.
+	AppErrorsMaxRequestRowsPerFingerprint int
 }
+
+// UpstreamProbeMaxConcurrent (ADR-098 §D2) is the global worker-pool
+// cap on meterd's upstream-probe loop. Read by cmd/meterd at boot
+// time and by pkg/meter/upstream_probe.go on each loop tick. NOT a
+// per-plan field — the probe runs on the meterd daemon, not on the
+// customer app, and the global cap defends the meterd node's fd /
+// goroutine budget under burst. Lives as a top-level constant (not
+// on the Limits struct) per ADR-098 §263.
+const UpstreamProbeMaxConcurrent = 64
+
+// UpstreamFitMinDeltaMs (ADR-098 §D3) is the global threshold below
+// which schedd's chooser bias is suppressed (the legacy
+// RAM/vCPU/region tie-break wins). Defends against flapping: a
+// probe-sample delta of <5 ms is noise, not a signal. Lives as a
+// top-level constant (not on the Limits struct) per ADR-098 §263.
+const UpstreamFitMinDeltaMs = 5
+
+// UpstreamAffinityTTL (ADR-098 §D2) is the staleness budget on
+// schedd's in-process upstream-affinity cache. Matches the
+// meterd probe cadence (pkg/meter/upstream_probe.go
+// DefaultUpstreamProbeInterval = 30 s) so the cached preferred
+// region is never more than one probe-cycle stale. Overridable
+// via FAAS_UPSTREAM_AFFINITY_TTL on schedd startup; the engine
+// constructor takes a duration so callers can stub it in tests.
+// Lives as a top-level constant (not on the Limits struct) per
+// ADR-098 §263.
+const UpstreamAffinityTTL = 30 * time.Second
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
 // limits, §4.3 idle timeouts, §4.6 app-layer caps, §7 egress, §10 prices.
@@ -765,6 +978,35 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     5,
 		EdgeRulesJWTAllowed: false,
 		EdgeRulesIPAllowed:  false,
+		// Per-kind geo quota (ADR-091 D21/D22). Free gets exactly 1
+		// geo rule — the abuse-desk customer ("block everything
+		// except DE") is one rule. The upgrade path raises the cap
+		// to 5/25/100.
+		EdgeRulesGeoPerApp: 1,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp so the
+		// upgrade curve from Free → Scale is a single double/triple
+		// progression a customer can predict.
+		EdgeRulesThrottlePerApp: 1,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		// Free customers can size per-key throttles on a small slice
+		// of their key space; large-cardinality per-key limits
+		// require a paid plan.
+		ThrottleMaxKeysPerRule: 100,
+		// Tenant surfaces (ADR-099 / issue #879): Free is the
+		// abuse-floor tier. The `tenant_surfaces` feature is the
+		// upsell — Free customers carry the single-tenant case via
+		// the legacy `custom_domains` path. apid's createTenantSurface
+		// handler rejects 402 CodeTenantSurfaceQuotaReached before
+		// the store is touched.
+		TenantSurfacesPerAccount:  0,
+		TenantHostnamesPerSurface: 0,
+		TenantSurfacesAllowed:     false,
+		// Data-placement hints (ADR-098 §D5): Free is gated off —
+		// the handler returns 402 CodePlanLimitDataUpstreams before
+		// any regex match. The 0 here is a defence-in-depth value
+		// the handler still reads.
+		DataPlacementHintsPerApp: 0,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
@@ -773,6 +1015,13 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
+		// Wake-side admission throttle (ADR-099 PR-0). Free caps
+		// wake admissions at 1/min per app + 1/min per account — the
+		// abuse-floor tier should never burst-wake. The apid-side
+		// Free-plan gate is the primary block; this is the schedd
+		// backstop for the path that bypasses apid (cron, jobs).
+		WakeBurstPerApp:     1,
+		WakeBurstPerAccount: 1,
 		// Log deployment filter (issue #517 / PR-B): Free is the
 		// abuse-floor tier — the filter is a paid feature.
 		// Handler returns WritePlanDeploymentFilterNotAllowedError
@@ -799,6 +1048,12 @@ var planLimits = map[Plan]Limits{
 		// Default off; apid PATCH rejects with 403
 		// plan_websocket_not_allowed.
 		WebSocketEnabled: false,
+		// Per-route metrics (ADR-093): Free is the abuse-floor tier
+		// — per-route cardinality would not have a budget (Free
+		// apps share the §12 dashboard series set with paid apps).
+		// Default off; apid PATCH rejects with 403
+		// plan_route_metrics_not_allowed. Hobby+ customers opt in.
+		RouteMetricsEnabled: false,
 		// Warm-snapshot (issue #470 / ADR-055): Free is off by
 		// plan. Warm-tier apps keep warm.snap + init.snap on the
 		// parked disk budget; doubling the per-app snapshot
@@ -847,6 +1102,14 @@ var planLimits = map[Plan]Limits{
 		// (returns immediately on ctx.Done()).
 		LogArchiveEnabled:          false,
 		LogArchiveRetentionDaysMax: 0,
+		// ADR-096 error grouping. Free = 1-day retention, 50
+		// fingerprints, 25 request rows per fingerprint — the
+		// abuse-floor tier. Retention MUST be <= the log-archive
+		// retention above (which is 0 for Free; "no archive, no
+		// grouped errors either" is the consistent posture).
+		AppErrorsRetentionDays:                1,
+		AppErrorsMaxFingerprintsPerApp:        50,
+		AppErrorsMaxRequestRowsPerFingerprint: 25,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -971,6 +1234,22 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     25,
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
+		EdgeRulesGeoPerApp:  5,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 5,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		ThrottleMaxKeysPerRule: 1000,
+		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
+		// entry paid tier — 1 surface with up to 10 verified
+		// hostnames. The "single SaaS customer, a handful of
+		// end-customer subdomains" use case is the hobby use case.
+		TenantSurfacesPerAccount:  1,
+		TenantHostnamesPerSurface: 10,
+		TenantSurfacesAllowed:     true,
+		// Data-placement hints (ADR-098 §D5): Hobby unlocks the
+		// capture path with a 3-hint cap per app.
+		DataPlacementHintsPerApp: 3,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
@@ -979,6 +1258,13 @@ var planLimits = map[Plan]Limits{
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
 		RateLimitPerAccountRPM: 200,
+		// Wake-side admission throttle (ADR-099 PR-0). Hobby
+		// permits a small wake burst — a cron tick on a Hobby
+		// customer's job can legitimately want 5 wakes/min across
+		// their apps. The per-account cap (10/min) is the ceiling
+		// for a fan-out across many apps in the same account.
+		WakeBurstPerApp:     5,
+		WakeBurstPerAccount: 10,
 		// Log deployment filter (issue #517 / PR-B): Hobby gets
 		// 1 — the typical Hobby customer runs one staging
 		// deployment alongside their prod slot, and the filter
@@ -1005,6 +1291,12 @@ var planLimits = map[Plan]Limits{
 		// 100 MB / 900 s caps above cover a long-poll or chat WS
 		// session comfortably.
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Hobby is the first paid tier
+		// — opt-in by default (Hobby customers hosting APIs are the
+		// core "which endpoint is slow?" use case). The per-app
+		// route cap (50) + __route_other__ overflow bound the
+		// cardinality regardless of the customer's traffic shape.
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Hobby is gated off
 		// for the same cost-shape reason as Free — doubling the
 		// parked per-app snapshot footprint doesn't fit the
@@ -1062,6 +1354,12 @@ var planLimits = map[Plan]Limits{
 		// S3 within the spec §4.1 latency budget.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 7,
+		// ADR-096 — Hobby = "last week" retention, 200 fingerprints,
+		// 100 request rows per fingerprint. Retention equals the
+		// log-archive retention.
+		AppErrorsRetentionDays:                7,
+		AppErrorsMaxFingerprintsPerApp:        200,
+		AppErrorsMaxRequestRowsPerFingerprint: 100,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -1168,6 +1466,23 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     100,
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
+		EdgeRulesGeoPerApp:  25,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 25,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		ThrottleMaxKeysPerRule: 5000,
+		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
+		// with up to 50 verified hostnames each — the growing-SaaS
+		// tier. Each surface still binds to one app, so 5 surfaces
+		// means 5 distinct customer-facing apps behind the same
+		// account (the multi-app variant is the deferred footgun).
+		TenantSurfacesPerAccount:  5,
+		TenantHostnamesPerSurface: 50,
+		TenantSurfacesAllowed:     true,
+		// Data-placement hints (ADR-098 §D5): Pro unlocks the
+		// capture path with a 10-hint cap per app.
+		DataPlacementHintsPerApp: 10,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
@@ -1175,6 +1490,14 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
+		// Wake-side admission throttle (ADR-099 PR-0). Pro is the
+		// production tier — the per-app burst ceiling of 20/min is
+		// calibrated against a customer running a cron fleet
+		// (~1 cron tick per minute per app, plus a burst on
+		// deploy-driven cold starts). The per-account ceiling of
+		// 30/min bounds cross-app fan-out.
+		WakeBurstPerApp:     20,
+		WakeBurstPerAccount: 30,
 		// Log deployment filter (issue #517 / PR-B): Pro gets 10
 		// — covers the typical multi-staging fan-out (prod + 3-5
 		// staging branches + a few ephemeral preview slots) without
@@ -1200,6 +1523,11 @@ var planLimits = map[Plan]Limits{
 		// the first tier where production workloads sit — opt-in by
 		// default for the same reason as Hobby (LLM / agent SDKs).
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Pro is the first tier where
+		// production workloads sit — opt-in by default for the same
+		// reason as Hobby (production APIs want the per-route
+		// breakdown by default).
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Pro is the first
 		// tier where warm-snapshot is on by default. Per the issue
 		// body's acceptance: "for a Pro+ app that has served ≥5
@@ -1248,6 +1576,11 @@ var planLimits = map[Plan]Limits{
 		// rather than being a single shared cap.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 30,
+		// ADR-096 — Pro = "this month" retention, 1000 fingerprints,
+		// 500 request rows per fingerprint.
+		AppErrorsRetentionDays:                30,
+		AppErrorsMaxFingerprintsPerApp:        1000,
+		AppErrorsMaxRequestRowsPerFingerprint: 500,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1360,6 +1693,26 @@ var planLimits = map[Plan]Limits{
 		EdgeRulesPerApp:     500,
 		EdgeRulesJWTAllowed: true,
 		EdgeRulesIPAllowed:  true,
+		EdgeRulesGeoPerApp:  100,
+		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
+		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
+		EdgeRulesThrottlePerApp: 100,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		ThrottleMaxKeysPerRule: 10000,
+		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
+		// surfaces with up to 250 verified hostnames each — the
+		// established-SaaS tier. The 250 cap is bounded by LE's
+		// 100-SAN-per-cert limit (`per_host_san` falls back to
+		// `per_host` above ~100 — surfaced via the cert engine, not
+		// quota).
+		TenantSurfacesPerAccount:  25,
+		TenantHostnamesPerSurface: 250,
+		TenantSurfacesAllowed:     true,
+		// Data-placement hints (ADR-098 §D5): Scale unlocks the
+		// capture path with a 50-hint cap per app — large enough
+		// for a multi-DB SaaS (primary + replicas + read-only +
+		// analytics + cache + queue).
+		DataPlacementHintsPerApp: 50,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
@@ -1370,6 +1723,14 @@ var planLimits = map[Plan]Limits{
 		// paid customer's bucket fills, which is the intended signal:
 		// coordinated abuse, not baseline load.
 		RateLimitPerAccountRPM: 5000,
+		// Wake-side admission throttle (ADR-099 PR-0). Scale is
+		// the upper tier — 100 wakes/min per app is enough to drain
+		// a 1000-task parallel job run in 10 min wall-clock, which
+		// matches ADR-099 §Acceptance. The per-account cap of
+		// 150/min allows a customer to fan out across several apps
+		// without exhausting the throttle.
+		WakeBurstPerApp:     100,
+		WakeBurstPerAccount: 150,
 		// Log deployment filter (issue #517 / PR-B): Scale gets 50
 		// — 5× Pro (10→50), tracks Scale's larger app budget
 		// (100 apps vs Pro's 25) and the multi-region staging fan-out
@@ -1398,6 +1759,10 @@ var planLimits = map[Plan]Limits{
 		// stays on by default — production workloads at this tier
 		// are expected to run agent / WS-backed services.
 		WebSocketEnabled: true,
+		// Per-route metrics (ADR-093): Scale stays on by default
+		// for the same reason as Pro — production workloads want
+		// the per-route breakdown without a PATCH round-trip.
+		RouteMetricsEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Scale stays on
 		// by default — the per-app parked footprint cost fits
 		// inside the 452 GB budget, and the customer's wake-p50
@@ -1449,6 +1814,11 @@ var planLimits = map[Plan]Limits{
 		// generous at the top tier.
 		LogArchiveEnabled:          true,
 		LogArchiveRetentionDaysMax: 90,
+		// ADR-096 — Scale = "this quarter" retention, 5000
+		// fingerprints, 1000 request rows per fingerprint.
+		AppErrorsRetentionDays:                90,
+		AppErrorsMaxFingerprintsPerApp:        5000,
+		AppErrorsMaxRequestRowsPerFingerprint: 1000,
 	},
 }
 
@@ -1493,7 +1863,7 @@ const (
 	// tenant RAM.
 	BuildVMRAMMB           = 2_048
 	BuildVMVCPU            = 2
-	BuildTimeoutSeconds    = 600 // 10 min build
+	BuildTimeoutSeconds    = 900 // 15 min build; cold rootless Railpack export needs headroom
 	BuildE2ETimeoutSeconds = 900 // 15 min end-to-end
 
 	// Snapshots / disk (spec §1, §8).
@@ -1566,6 +1936,61 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// MaxEdgeRuleLimitBodyBytesStreaming (ADR-091 D24 / kind=limit
+	// streaming carve-out) is the upper bound on the optional
+	// `max_body_bytes_streaming` field of a kind=limit edge rule.
+	// The buffered-path field (`max_body_bytes`) is capped by
+	// MaxRequestBodyBytes (25 MiB) above; the streaming opt-in
+	// raises the cap to RawStreamMaxRequestBytes (100 MiB, ADR-080
+	// raw-bridge parity) so an LLM-style streaming POST against a
+	// /v1/chat/completions endpoint has the same headroom the
+	// raw-bridge ForwardStream has. Runtime enforcement ships
+	// alongside the field (D24 §6 amendment). The cap-selection
+	// algorithm at pkg/gateway/handler.go::applyEdgeRuleLimit
+	// consults this field only when the request is on the
+	// streaming opt-in path (4-conjunct detection: h.streamingEnabled
+	// && app.StreamingEnabled && !isAcceptJSON(Accept) && !isUpgradeRequest).
+	// The DTO's `s ≥ b` invariant (pkg/api/dto.go) is the single
+	// source of truth — the runtime trusts it without re-check.
+	// Matches RawStreamMaxRequestBytes byte-for-byte so a
+	// customer can set `max_body_bytes_streaming` = RawStreamMaxRequestBytes
+	// and the value survives the apid-Validate round-trip without
+	// surprise trimming.
+	MaxEdgeRuleLimitBodyBytesStreaming int64 = 100 * 1024 * 1024
+
+	// MaxEdgeRuleValidateSchemaBytes bounds the JSON Schema body of a
+	// kind=validate edge rule at apid-create time (Cloudflare-style
+	// 64 KiB). Mirrors the §11 JWKS-URL defence-in-depth posture on
+	// pkg/api/dto.go::EdgeRuleValidateAction.Validate: a customer
+	// cannot ship a schema so large that compiling + caching pushes
+	// per-host memory through the roof, and the gateway never has
+	// to defend against a multi-MiB document. Independent of
+	// MaxRequestBodyBytes (which bounds inbound request bodies, not
+	// schema documents).
+	MaxEdgeRuleValidateSchemaBytes = 64 * 1024 // 64 KiB
+
+	// EdgeRuleMaintenanceRetryAfterSeconds (ADR-091 amendment,
+	// PR-A #??? / kind=maintenance) is the platform default
+	// Retry-After for both the kind=maintenance edge rule and the
+	// apps.maintenance_mode coarse gate. Override via
+	// FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS env var (parsed
+	// at boot — see pkg/api/env.go for the env-loading helpers;
+	// the constant here is the default when the env var is unset).
+	// Applied in pkg/gateway.(*Handler).applyEdgeRuleMaintenance and
+	// pkg/gateway.(*Handler).applyAppsMaintenanceMode via
+	// api.WriteProblem + WithHeader, mirroring the existing
+	// StandbyWriteRetryAfterSeconds pattern at line 2171.
+	EdgeRuleMaintenanceRetryAfterSeconds = 60
+
+	// MaxEdgeRuleMaintenanceRetryAfterSeconds caps the per-rule
+	// RetryAfterSeconds field on a kind=maintenance edge rule at
+	// 24 h. EdgeRuleMaintenanceAction.Validate rejects larger
+	// values with 422 so a customer cannot ship a rule that asks
+	// a client to back off for a week. Independent of
+	// EdgeRuleMaintenanceRetryAfterSeconds (which is the default,
+	// not the cap).
+	MaxEdgeRuleMaintenanceRetryAfterSeconds = 24 * 60 * 60 // 86400 (24h)
+
 	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
 	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
 	// 365 days is the issue-189 spec: long enough to be
@@ -1599,6 +2024,18 @@ const (
 	// demand — the constant is the single source of truth.
 	SidecarCapMax = 2
 
+	// Edge-rule JWT verify deadline (ADR-091 hardening PR-A). Caps
+	// the wall-clock spent inside pkg/gateway.(*Handler).applyEdgeRuleJWT
+	// on a single request — signature verify + claim parse + any
+	// JWKS refresh that the verifier triggers mid-call. Sizing
+	// matches pkg/edgejwks.DefaultFetchTimeout (5 s for the network
+	// leg) so a hung IdP surfaces as a 401 inside the same window
+	// the rest of the gateway considers a stalled upstream. The
+	// deadline fires on top of r.Context(); if r.Context() already
+	// carries a tighter cap (e.g. an upstream HTTP/1.1 server
+	// ReadTimeout), the tighter deadline wins.
+	EdgeRuleJWTVerifyTimeoutDefault = 5 * time.Second
+
 	// Streaming response caps (issue #471 / ADR-047). Free stays on the
 	// 25 MB / 300 s envelope (spec §4.1 baseline) so the abuse-floor
 	// tier can't pin a long stream against the box. Hobby/Pro/Scale
@@ -1614,6 +2051,69 @@ const (
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
 	StreamingFlushIntervalDefault       = 200 * time.Millisecond
 
+	// StreamingStatus is the per-request classification emitted via
+	// the Streaming-Status response header (ADR-102 D1/D2). The
+	// canonical wire values are the lower-case string forms of the
+	// constants below; the Go type is a string alias so the JSON
+	// encoder marshals the wire value verbatim and HTTP header
+	// Set/Get round-trips losslessly. Six states, six wire values,
+	// no aliases.
+	//
+	// StreamingStatusStreaming is the happy path — the platform's
+	// four-conjunct streaming gate (operator opt-in + per-app flag
+	// + non-JSON Accept + non-Upgrade request) all hold and the
+	// capWriter / per-flush metering wrap is installed.
+	//
+	// StreamingStatusAcceptJSONDowngrade is the post-D3 advisory
+	// variant: the request set Accept: application/json which
+	// would have downgraded the gate pre-ADR-102 but no longer
+	// does. Status is informational for one release cycle so
+	// pinned-SDK customers (whose Accept defaults to JSON) can
+	// self-diagnose via the header. The variant is deleted in
+	// ADR-102-followup ~30 days post-merge.
+	//
+	// StreamingStatusFlagDisabled means apps.streaming_enabled=false.
+	// StreamingStatusOperatorDisabled means FAAS_GATEWAY_STREAMING
+	// env was not set on the gatewayd-internal process.
+	// StreamingStatusPlanDisallows means the plan is Free (legacy
+	// pre-D5 rows only — D5 closes CreateApp at apid).
+	// StreamingStatusUpgradeBypass means Connection: Upgrade is
+	// set — the raw-bytes bridge handles this path, not the
+	// streaming path.
+	//
+	// All non-streaming variants carry the plan-level buffered cap
+	// (MaxResponseBodyBytes); only the streaming variant can carry
+	// an endpoint-rule cap (max_body_bytes_streaming from a
+	// matched edge rule).
+	StreamingStatusStreaming           StreamingStatus = "streaming"
+	StreamingStatusAcceptJSONDowngrade StreamingStatus = "accept-json-downgrade"
+	StreamingStatusFlagDisabled        StreamingStatus = "flag-disabled"
+	StreamingStatusOperatorDisabled    StreamingStatus = "operator-disabled"
+	StreamingStatusPlanDisallows       StreamingStatus = "plan-disallows"
+	StreamingStatusUpgradeBypass       StreamingStatus = "upgrade-bypass"
+
+	// StreamingStatusHeader is the canonical response header name
+	// carrying the StreamingStatus enum (ADR-102 D2). Title-Case
+	// per the IETF visible-header convention (Retry-After,
+	// X-RateLimit-*); not the x-faas-* internal prefix because
+	// this is customer-visible (and surfaceable to browser JS
+	// via CORS Expose-Headers per ADR-102 D8).
+	StreamingStatusHeader = "Streaming-Status"
+
+	// StreamingStatusAcceptHintHeader is the one-cycle advisory
+	// header (ADR-102 D3) stamped on the FIRST response after
+	// upgrade when the request would have downgraded pre-D3
+	// (i.e. Accept: application/json was set). Pinned-SDK
+	// customers whose SDK defaults Accept to JSON see this
+	// header and self-diagnose. Deleted in ADR-102-followup
+	// when the accept-json-downgrade enum variant is retired.
+	StreamingStatusAcceptHintHeader = "Streaming-Status-Accept-Hint"
+
+	// StreamingStatusAcceptHintValue is the wire value of the
+	// advisory header. Constant so a customer grepping for
+	// "would-buffer-pre-D3" finds exactly the call site.
+	StreamingStatusAcceptHintValue = "would-buffer-pre-D3"
+
 	// Raw-bridge (issue #676 / ADR-080) inbound cap. The raw-bytes
 	// bridge carries Upgrade / WebSocket / long-poll traffic from
 	// gatewayd-internal into the guest's netns TCP socket. The cap
@@ -1627,6 +2127,22 @@ const (
 	// the same Hobby+ plans) so an LLM-style upgrade stream has
 	// the same headroom.
 	RawStreamMaxRequestBytes int64 = 100 * 1024 * 1024
+
+	// RawStreamMaxResponseBytes (issue #676 / ADR-080 follow-up,
+	// PR-C) bounds the per-session egress bytes on the raw-bytes
+	// Upgrade bridge. Mirrors RawStreamMaxRequestBytes in shape
+	// but is sized for a long-lived WS session — a 100 MiB cap on
+	// a 24-h session would be pathologically tight for any chat /
+	// agent workload. 1 GiB lets a 100 KB/s stream run for ~3 h
+	// cleanly; above that, rawBridgePumpBody surfaces
+	// ResourceExhausted so the gateway-side forwarder emits 502
+	// to the customer (mirrors the inbound cap's behaviour at
+	// rawBridgeBodyLoop). This is memory-safety, NOT billing —
+	// the (plan_ram + 8) per-running-second cost already pays for
+	// WS residency. The cap prevents a runaway guest from
+	// ballooning the gateway's bidi goroutine pair past the
+	// gateway process's RSS budget.
+	RawStreamMaxResponseBytes int64 = 1 * 1024 * 1024 * 1024
 
 	// Post-response tail (issue #667 / ADR-078).
 	//
@@ -2170,6 +2686,36 @@ func DefaultComputeNodeCeilingMB() int {
 	return RAMAdmissionCeilingMB
 }
 
+// DefaultHostBridgeCIDR is the per-host bridge CIDR the vmmd tenant
+// netns' veth host-side addresses live in (Mega-PR-B Commit 1;
+// supersedes the former pkg/netns Go const HostBridgeCIDR). The /16
+// default keeps single-host dev identical to the v1 behaviour; multi-
+// host deployments override via ComputeNodeConfig.HostBridgeCIDR
+// (cmd/vmmd/config.go) — the bridge IP is the .1 of whatever CIDR the
+// operator ships. The MasqueradeCIDR default mirrors this value so the
+// host forward chain's `ip saddr ... oifname ... masquerade` rule still
+// covers the per-instance bridge.
+func DefaultHostBridgeCIDR() netip.Prefix {
+	return netip.MustParsePrefix("10.100.0.0/16")
+}
+
+// DefaultMasqueradeCIDR is the host postrouting nat chain MASQUERADE
+// source CIDR (must equal the NETWORK form of DefaultHostBridgeCIDR —
+// see pkg/netns/policy.go::Render panic gate). Exposed as a string
+// for renderer/tests that don't need the netip.Prefix.
+var DefaultMasqueradeCIDR = DefaultHostBridgeCIDR().String()
+
+// DefaultOverlayCIDR is the per-host overlay subnet the vmmd overlay
+// detector prefers when multiple IPv4 candidates come back from
+// `tailscale ip -4` (Mega-PR-B Commit 3). The default matches the
+// Tailscale CGNAT range (100.64.0.0/10); WireGuard deployments override
+// via ComputeNodeConfig.OverlayCIDR. Mesh traffic between compute nodes
+// lands here; the host forward chain's overlay-accept rules (Commit 2)
+// unblock it past the §11 RFC1918 deny.
+func DefaultOverlayCIDR() netip.Prefix {
+	return netip.MustParsePrefix("100.64.0.0/10")
+}
+
 // ConntrackCapProbe returns the effective per-instance conntrack cap.
 const (
 	probeNS        = "faas-ct-probe"
@@ -2444,6 +2990,46 @@ func (p Plan) LogArchiveRetentionDaysMax() int {
 	return l.LogArchiveRetentionDaysMax
 }
 
+// AppErrorsRetentionDays (ADR-096) returns the per-plan
+// retention cap on app_errors / app_error_requests rows. The
+// nightly purge cron in cmd/apid/app_errors_purge.go reads this
+// to decide which rows to DELETE. Returns 1 on unknown plans
+// (fail-closed minimum) so a missing plan row never silently
+// keeps errors forever.
+func (p Plan) AppErrorsRetentionDays() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 1
+	}
+	return l.AppErrorsRetentionDays
+}
+
+// AppErrorsMaxFingerprintsPerApp (ADR-096) returns the per-plan
+// ceiling on distinct fingerprints the gatewayd-internal recorder
+// retains in its LRU. The recorder uses this as the
+// CardinalityLimit backstop; past the cap, new fingerprints are
+// silently dropped (outcome="rate_limited"). Returns 50 on
+// unknown plans (Free-tier floor).
+func (p Plan) AppErrorsMaxFingerprintsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 50
+	}
+	return l.AppErrorsMaxFingerprintsPerApp
+}
+
+// AppErrorsMaxRequestRowsPerFingerprint (ADR-096) returns the
+// per-plan ceiling on app_error_requests rows retained per
+// fingerprint. The retention purge deletes oldest rows beyond
+// the cap first. Returns 25 on unknown plans (Free-tier floor).
+func (p Plan) AppErrorsMaxRequestRowsPerFingerprint() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 25
+	}
+	return l.AppErrorsMaxRequestRowsPerFingerprint
+}
+
 // LivenessPeriodSeconds returns the per-plan default poll cadence
 // for the liveness probe (issue #554). 0 for Free — coupled to
 // LivenessAllowed() above; if the customer is on a plan where
@@ -2581,6 +3167,45 @@ func (p Plan) WebSocketResponseAllowed() bool {
 	}
 	return l.WebSocketEnabled
 }
+
+// RouteMetricsEnabled reports whether the plan defaults the per-app
+// apps.route_metrics_enabled column to true (ADR-093). Hobby/Pro/Scale
+// opt in; Free stays off (the abuse-floor tier where per-route
+// cardinality would not have a budget). The plan-level default is
+// applied at CreateApp time in cmd/apid/handlers.go::buildApp using
+// the RouteMetricsEnabled() accessor. Unknown plans fail closed
+// (return false) — same contract as WebSocketEnabled / StreamingEnabled.
+func (p Plan) RouteMetricsEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.RouteMetricsEnabled
+}
+
+// RouteMetricsResponseAllowed reports whether the plan permits a customer
+// to set apps.route_metrics_enabled=true via PATCH. Hobby+ opt in; Free
+// returns false so apid's updateApp handler can surface 403
+// plan_route_metrics_not_allowed (ADR-093 AC #2). Same fail-closed
+// contract as RouteMetricsEnabled above.
+func (p Plan) RouteMetricsResponseAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.RouteMetricsEnabled
+}
+
+// RouteMetricsPerAppCap is the per-app hard cap on the number of
+// distinct routes admitted into the routeLabelSet (ADR-093 D2). When
+// exceeded, all new routes collapse into the reserved __route_other__
+// bucket. The cap is a constant — not per-plan — because the
+// cardinality bound is the same regardless of plan: any single app
+// exceeding 50 distinct routes is a wildcard-shape pattern that the
+// __route_other__ signal was designed to surface. Halo constant: do
+// not make this per-plan without a separate ADR (the §12 budget math
+// is global, not per-tenant).
+const RouteMetricsPerAppCap = 50
 
 // WarmSnapshotEnabled reports whether the plan's default for the
 // per-app two-tier snapshot flag is on. Pro/Scale return true; Free /
@@ -3253,4 +3878,176 @@ const (
 	// of the operator surface.
 	ObsAdminRateLimitLimitDefault = 100
 	ObsAdminRateLimitLimitMax     = ObsAdminPaginationMax
+
+	// AppErrorsWindowMaxHours (ADR-096) bounds the ?since= window
+	// on /v1/apps/{slug}/errors/summary. Mirrors ObsAdminWindowMaxHours
+	// (168h = 7d) — the customer view is narrower in the dashboard
+	// UI but the storage backend can serve the same window. The
+	// summary endpoint clamps ?since=/?until= to this bound; longer
+	// windows are silently clamped and the response sets
+	// window_clamped=true.
+	AppErrorsWindowMaxHours = 168
+
+	// AppErrorsSummaryDefaultLimit / AppErrorsSummaryMaxLimit bound
+	// ?limit= on GET /v1/apps/{slug}/errors/summary. 20 default =
+	// "show me the top 20 errors" (matches the Sentry-default
+	// grouping view the customer-facing dashboard renders); 100
+	// max caps the scan so a misconfigured caller cannot blow the
+	// row-budget. Past 100 the caller pages via ?cursor.
+	AppErrorsSummaryDefaultLimit = 20
+	AppErrorsSummaryMaxLimit     = 100
+
+	// AppErrorsDedupeWindowSeconds (ADR-096) is the platform-wide
+	// dedupe window for the IncrementAppError INSERT. NOT a
+	// per-plan constant — it is a system-wide setting
+	// (FAAS_APP_ERRORS_DEDUPE_WINDOW_SECONDS env var). 3600s = 1h
+	// default; raising it inflates the on-disk row count per
+	// fingerprint; lowering it increases the dedupe rate. Pinned
+	// here so the limits-lint gate accepts the constant.
+	AppErrorsDedupeWindowSeconds = 3600
+
+	// AppErrorsSampleMessageCapBytes (ADR-096) is the hard cap on
+	// the sample_message column at the writer. The
+	// redact.Redactor truncates at this bound BEFORE INSERT; the
+	// pg_column_size CHECK on the column is the backstop. 512 bytes
+	// matches the existing app_log archive precedent — half a KiB
+	// is enough to carry a 1-2 sentence error description with a
+	// stack-trace snippet, and small enough to keep the index
+	// narrow.
+	AppErrorsSampleMessageCapBytes = 512
+
+	// AppErrorsCardinalityBackstopMultiplier (ADR-096) is the
+	// multiplier applied to AppErrorsMaxFingerprintsPerApp() when
+	// computing the recorder's LRU cache cap. The recorder uses
+	// this so the cache can absorb a brief burst above the plan
+	// cap before the drop kicks in. 2x = the cache holds up to
+	// 2x the steady-state cap; the cache evicts oldest entries
+	// beyond that.
+	AppErrorsCardinalityBackstopMultiplier = 2
+
+	// ObsAdminAuditLogLimitDefault / ObsAdminAuditLogLimitMax bound
+	// the top-N size of /v1/admin/obs/audit-log/search (ADR-091 §3.7 /
+	// PR #3). Default 200 covers the operator's "what happened in
+	// the last hour" drill-down; cap 500 = ObsAdminPaginationMax
+	// for parity with the rest of the operator surface. The underlying
+	// store is bounded by an over-read on the same idiom as
+	// listAuditLogOverRead (cmd/apid/handlers_audit_log.go:67).
+	ObsAdminAuditLogLimitDefault = 200
+	ObsAdminAuditLogLimitMax     = ObsAdminPaginationMax
+
+	// ObsAdminEventsLimitDefault / ObsAdminEventsLimitMax bound the
+	// top-N size of /v1/admin/obs/events (ADR-091 §3.7 / PR #3).
+	// Same shape as the audit-log search: default 200, cap 500. The
+	// events table is append-only with no retention pruning today
+	// so the over-read budget is also bounded by the
+	// (kind, at DESC) index added by 00190_admin_obs_index.sql.
+	ObsAdminEventsLimitDefault = 200
+	ObsAdminEventsLimitMax     = ObsAdminPaginationMax
 )
+
+// End-to-end request budgets (ADR-093). The platform enforces a
+// wall-clock budget on every customer-facing request and propagates
+// the remaining time to every downstream call (DB, gRPC, outbound
+// HTTP). The values here are the *defaults* — per-route overrides
+// live on the edge-rule kind=budget JSON document, and per-plan
+// overrides live on Limits.RequestBudgetMs (added below).
+//
+// Source of truth: pkg/reqbudget re-exports these as reqbudget.*
+// so call-sites can use one import.
+const (
+	// RequestBudgetDefault is the per-request wall-clock budget the
+	// gatewayd-public BudgetMiddleware installs when no edge-rule
+	// kind=budget matches. 3 s matches the example in the user's
+	// feature ask ("POST /payment → 3 s"). A misconfigured
+	// deployment that wants a tighter or looser default can override
+	// per-route via kind=budget, or per-plan via the
+	// Limits.RequestBudgetMs accessor.
+	RequestBudgetDefault = 3 * time.Second
+	// RequestBudgetMax is the absolute upper bound on any per-request
+	// budget. Defends against a misconfiguration that would re-pin a
+	// 300 s stdlib WriteTimeout as the request budget. Per-plan max
+	// lives on Limits.RequestBudgetMaxMs; 0 falls back here.
+	RequestBudgetMax = 30 * time.Second
+	// RequestBudgetApidDefault is the apid-side default budget.
+	// apid serves dashboards + admin + sync-invoke long-polls that
+	// are already capped at 910 s upstream (fwdStream) so 5 s is
+	// the floor, not the ceiling; per-call context.WithTimeout calls
+	// in handlers continue to enforce their own sub-ceilings
+	// (EdgeRuleJWTVerifyTimeoutDefault, dashboard 3s, billing 30s,
+	// sync-invoke 5-30s).
+	RequestBudgetApidDefault = 5 * time.Second
+	// RequestBudgetDefaultOverrideHeader is the platform-wide
+	// default header name a kind=budget rule's AllowOverrideHeader
+	// resolves to when the rule leaves the field empty. Customers
+	// can override per-request by sending
+	// `x-faas-budget-ms: 3000` on the inbound request — the value
+	// is parsed as a positive integer milliseconds and replaces
+	// the static rule's BudgetMs for that single request, subject
+	// to the per-plan RequestBudgetMaxDuration ceiling. A
+	// per-rule AllowOverrideHeader takes precedence over this
+	// default when set.
+	RequestBudgetDefaultOverrideHeader = "x-faas-budget-ms"
+
+	// DefaultOverheadDB is the per-hop reservation for a local PG
+	// round-trip. Reservation, not measurement — it ensures a
+	// downstream call starts with at most (parentRemaining - 10 ms)
+	// even before its own work begins. Sized for local control
+	// plane; cross-region deployments may need larger reservations
+	// in a follow-up.
+	DefaultOverheadDB = 10 * time.Millisecond
+	// DefaultOverheadGRPC is the per-hop reservation for a local
+	// vmmd gRPC call. Same shape as DefaultOverheadDB — reservation,
+	// not measurement.
+	DefaultOverheadGRPC = 5 * time.Millisecond
+	// DefaultOverheadHTTP is the per-hop reservation for an outbound
+	// HTTP call (e.g. the public→internal RoundTrip).
+	DefaultOverheadHTTP = 20 * time.Millisecond
+	// DefaultOverheadStream is the per-hop reservation for a
+	// streaming first-byte ack. Larger than DB/gRPC because the
+	// first-byte acknowledgment involves one extra round-trip vs
+	// the unary case.
+	DefaultOverheadStream = 50 * time.Millisecond
+	// DefaultOverheadQueue is the per-hop reservation for a wake /
+	// enqueue / poll call. Small because these are local ops.
+	DefaultOverheadQueue = 5 * time.Millisecond
+)
+
+// RequestBudget returns the wall-clock deadline the platform
+// installs on customer-facing requests for this plan, falling back
+// to RequestBudgetDefault when the per-plan field is unset. The
+// returned duration is clamped to [1, RequestBudgetMax] so a
+// misconfigured Limits row cannot pin the budget to zero or to a
+// value larger than RequestBudgetMax. Per-route edge-rule
+// kind=budget overrides still take precedence at request time —
+// this accessor is the *baseline* the middleware starts from.
+//
+// ADR-093.
+func (l Limits) RequestBudget() time.Duration {
+	d := time.Duration(l.RequestBudgetMs) * time.Millisecond
+	if d <= 0 {
+		d = RequestBudgetDefault
+	}
+	if d > RequestBudgetMax {
+		d = RequestBudgetMax
+	}
+	return d
+}
+
+// RequestBudgetMaxDuration returns the absolute upper bound for any
+// per-request budget on this plan. 0 falls back to
+// RequestBudgetMax. Per-plan override clamps to [RequestBudget(),
+// 5 * RequestBudgetMax] so a customer with a 5 s plan default
+// cannot accidentally configure a 100 ms max (which would force the
+// default down to 100 ms).
+//
+// ADR-093.
+func (l Limits) RequestBudgetMaxDuration() time.Duration {
+	d := time.Duration(l.RequestBudgetMaxMs) * time.Millisecond
+	if d <= 0 {
+		d = RequestBudgetMax
+	}
+	if d < l.RequestBudget() {
+		d = l.RequestBudget()
+	}
+	return d
+}

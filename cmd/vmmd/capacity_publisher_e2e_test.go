@@ -100,11 +100,17 @@ func (f *fakeSinkSchedAPI) CapacitySink() scheddgrpc.CapacitySink {
 // Wake + AdmitInstance take a deploymentID (issue #556 / PR-C):
 // the per-deployment wake hint for the picker / wake-fan-out
 // path. Empty preserves the legacy single-deployment behaviour.
-func (f *fakeSinkSchedAPI) Wake(context.Context, string, string) (sched.WakeResult, error) {
+// PR-B (issue #272 / ADR-095): Wake + AdmitInstance also take a
+// scope string ("" = legacy prod). The publisher never wakes, so
+// the scope is unused.
+func (f *fakeSinkSchedAPI) Wake(context.Context, string, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
-func (f *fakeSinkSchedAPI) AdmitInstance(context.Context, string, string) (sched.WakeResult, error) {
+func (f *fakeSinkSchedAPI) AdmitInstance(context.Context, string, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
+}
+func (f *fakeSinkSchedAPI) EnsureWake(context.Context, string) (sched.CoordOutcome, error) {
+	return sched.CoordOutcome{}, nil
 }
 func (f *fakeSinkSchedAPI) ReportActivity(context.Context, []state.InstanceTouch) (int, error) {
 	return 0, nil

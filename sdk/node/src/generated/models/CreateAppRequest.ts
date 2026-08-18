@@ -21,6 +21,14 @@ export type CreateAppRequest = {
    */
   websocket_enabled?: boolean;
   /**
+   * Per-app per-route observability flag (ADR-093). Omitted → apid applies the plan default (Free = false; Hobby/Pro/Scale = true). PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed.
+   */
+  route_metrics_enabled?: boolean;
+  /**
+   * Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → apid applies the default (false). Free-tier allowed; no plan gate. Flipping this on at create time pins the app for maintenance from the first request.
+   */
+  maintenance_mode?: boolean;
+  /**
    * Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan default. Free/Hobby PATCH-true is rejected.
    */
   warm_snapshot_enabled?: boolean;

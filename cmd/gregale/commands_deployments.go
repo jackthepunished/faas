@@ -149,30 +149,40 @@ func cmdDeployment(args []string) int {
 	return cmdDeploymentGet(args)
 }
 
-// cmdDeploymentGet implements `gregale deployment <id> [--show-scan]`
-// (GET /v1/deployments/{id}, plus GET /v1/deployments/{id}/scan
-// when --show-scan is set). Mirrors the read branch of cmdApp
-// (commands2.go:69) — single positional id, JSON single record,
-// human multi-line detail block.
+// cmdDeploymentGet implements
+// `gregale deployment <id> [--show-scan] [--show-secret-scan]`
+// (GET /v1/deployments/{id}, plus the per-deploy drill-down
+// surfaces when their flags are set). Mirrors the read branch
+// of cmdApp (commands2.go:69) — single positional id, JSON
+// single record, human multi-line detail block.
 //
 // --show-scan is a flag (not a separate `gregale scan <id>`
 // subcommand) because `gregale scan` is already taken by the
 // Phase 3 repo-decomposition dry-run surface at
 // cmd/gregale/commands_decompose.go:49. The flag-vs-subcommand
 // split is the smallest-mess resolution of the name collision.
+//
+// --show-secret-scan mirrors --show-scan for the PR-A
+// image-layer secret scan drill-down
+// (`GET /v1/deployments/{id}/secret-scan`). Both flags may be
+// passed together; the JSON output struct gains a
+// `secret_scan` field, the text rendering prints both blocks
+// in order.
 func cmdDeploymentGet(args []string) int {
 	fs := flag.NewFlagSet("deployment", flag.ContinueOnError)
 	showScan := fs.Bool("show-scan", false, "fetch + print the per-deploy grype scan payload (GET /v1/deployments/{id}/scan)")
+	showSecretScan := fs.Bool("show-secret-scan", false,
+		"fetch + print the per-deploy image-layer secret-scan payload (GET /v1/deployments/{id}/secret-scan)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 1 {
-		PrintUsage(os.Stderr, "usage: gregale deployment <id> [--show-scan]", "deployment")
+		PrintUsage(os.Stderr, "usage: gregale deployment <id> [--show-scan] [--show-secret-scan]", "deployment")
 		return 1
 	}
 	id := fs.Arg(0)
 	if !deploymentIDPattern.MatchString(id) {
-		PrintUsage(os.Stderr, "usage: gregale deployment <id> [--show-scan]   (id is 32 hex chars)", "deployment")
+		PrintUsage(os.Stderr, "usage: gregale deployment <id> [--show-scan] [--show-secret-scan]   (id is 32 hex chars)", "deployment")
 		return 1
 	}
 	client, err := authedClient()
@@ -184,22 +194,37 @@ func cmdDeploymentGet(args []string) int {
 		return printErr("Could not fetch deployment", err)
 	}
 	if jsonOutput {
-		if !*showScan {
+		if !*showScan && !*showSecretScan {
 			return jsonOut(writeJSON(d))
 		}
-		sc, scanErr := client.GetDeploymentScan(context.Background(), id)
-		if scanErr != nil {
-			// Non-fatal in JSON mode: return the deployment as-is so
-			// an operator script never silently drops the payload.
-			// The CLI exit code still carries the error.
-			_ = scanErr
-			return jsonOut(writeJSON(d))
-		}
-		type deploymentWithScan struct {
+		// Build the JSON envelope with only the surfaces the
+		// caller asked for. A missing drill-down is
+		// non-fatal in JSON mode (the deployment row is
+		// always emitted so a script never silently loses
+		// data); the fetch error is logged at WARN.
+		type envelope struct {
 			Deployment any `json:"deployment"`
-			Scan       any `json:"scan"`
+			Scan       any `json:"scan,omitempty"`
+			SecretScan any `json:"secret_scan,omitempty"`
 		}
-		return jsonOut(writeJSON(deploymentWithScan{Deployment: d, Scan: sc}))
+		env := envelope{Deployment: d}
+		if *showScan {
+			sc, scanErr := client.GetDeploymentScan(context.Background(), id)
+			if scanErr != nil {
+				_, _ = fmt.Fprintf(osStderr, "warning: scan unavailable: %v\n", scanErr)
+			} else {
+				env.Scan = sc
+			}
+		}
+		if *showSecretScan {
+			ssc, secErr := client.GetDeploymentSecretScan(context.Background(), id)
+			if secErr != nil {
+				_, _ = fmt.Fprintf(osStderr, "warning: secret-scan unavailable: %v\n", secErr)
+			} else {
+				env.SecretScan = ssc
+			}
+		}
+		return jsonOut(writeJSON(env))
 	}
 	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "id:", d.ID)
 	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "app_id:", d.AppID)
@@ -236,9 +261,39 @@ func cmdDeploymentGet(args []string) int {
 				_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "scan_error:", sc.Error)
 			}
 			if len(sc.Vulnerabilities) > 0 {
-				_, _ = fmt.Fprintf(osStdout, "%-14s %d\n", "vulnerabilities:", len(sc.Vulnerabilities))
+				_, _ = fmt.Fprintf(os.Stdout, "%-14s %d\n", "vulnerabilities:", len(sc.Vulnerabilities))
 				for _, v := range sc.Vulnerabilities {
-					_, _ = fmt.Fprintf(osStdout, "  - %s [%s] %s %s (fixed in %s)\n", v.ID, v.Severity, v.Package, v.Version, v.FixedIn)
+					_, _ = fmt.Fprintf(os.Stdout, "  - %s [%s] %s %s (fixed in %s)\n", v.ID, v.Severity, v.Package, v.Version, v.FixedIn)
+				}
+			}
+		}
+	}
+	if *showSecretScan {
+		ssc, secErr := client.GetDeploymentSecretScan(context.Background(), id)
+		if secErr != nil {
+			_, _ = fmt.Fprintf(os.Stdout, "%-14s (secret scan unavailable: %v)\n", "secret_scan:", secErr)
+		} else {
+			_, _ = fmt.Fprintf(os.Stdout, "\n%-14s %s\n", "secret_scan_status:", ssc.Status)
+			if ssc.ScannedAt != "" {
+				_, _ = fmt.Fprintf(os.Stdout, "%-14s %s\n", "secret_scanned_at:", ssc.ScannedAt)
+			}
+			if ssc.ImageDigest != "" {
+				_, _ = fmt.Fprintf(os.Stdout, "%-14s %s\n", "secret_scan_image_digest:", ssc.ImageDigest)
+			}
+			_, _ = fmt.Fprintf(os.Stdout, "%-14s %d\n", "secret_findings:", len(ssc.Findings))
+			for _, f := range ssc.Findings {
+				layer := f.Layer
+				if layer == "" {
+					// Older rows (pre-PR-A, apid source-tree
+					// stamped) carry no layer label — render as
+					// "source" so the operator knows which
+					// pipeline produced the finding.
+					layer = "source"
+				}
+				_, _ = fmt.Fprintf(os.Stdout, "  - [%s] %s in %s:%d (provider=%s layer=%s)\n",
+					f.Severity, f.Key, f.File, f.Line, f.Provider, layer)
+				if f.Snippet != "" {
+					_, _ = fmt.Fprintf(os.Stdout, "      snippet: %s\n", f.Snippet)
 				}
 			}
 		}

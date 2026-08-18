@@ -44,9 +44,11 @@ func loadSessionManager(getenv func(string) string, log *slog.Logger) *session.M
 	if err != nil {
 		// Not hex (or odd length). Distinct from a wrong-byte-length
 		// failure so the operator can tell from the log line which
-		// axis is broken — the bootstrap.sh script emits the canonical
-		// 64-hex string, but a hand-edited secrets file could easily
-		// truncate or paste non-hex bytes.
+		// axis is broken — the v1 bootstrap.sh script emitted the
+		// canonical 64-hex string (RETIRED 2026-08-15 by issue #911 /
+		// PR-1; v2 path is PR-X `gregale secrets init`), but a
+		// hand-edited secrets file could easily truncate or paste
+		// non-hex bytes.
 		log.Error("FAAS_SESSION_KEY is not valid hex", "got_len", len(raw), "err", err)
 		return nil
 	}

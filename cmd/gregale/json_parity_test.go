@@ -34,20 +34,20 @@ import (
 //
 // Keep entries in alphabetical order for review diff readability.
 var nonJSONAllowList = map[string]string{
-	"cmdAccount":           "delegate leaves; cmdAccountStatus is the only JSON leaf (covered)",
-	"cmdBackup":            "operator fs writes",
-	"cmdHostAge":           "operator fs writes",
-	"cmdInit":              "file writes + human template table",
-	"cmdLogin":             "interactive paste-code flow",
-	"cmdLogout":            "side-effect only; no body",
-	"cmdMfa":               "enroll is the only JSON leaf (covered); others are write-only",
-	"cmdOverageCap":        "side-effect (set/clear both write-only)",
-	"cmdPKI":               "operator fs writes",
-	"cmdRestore":           "side-effect only; no body",
-	"cmdSignKeys":          "operator fs writes",
-	"cmdTrustedPublishers": "operator fs writes",
-	"cmdWhoami":            "shell-sourceable plaintext exports",
+	"cmdAccount":    "delegate leaves; cmdAccountStatus is the only JSON leaf (covered)",
+	"cmdInit":       "file writes + human template table",
+	"cmdLogin":      "interactive paste-code flow",
+	"cmdLogout":     "side-effect only; no body",
+	"cmdMfa":        "enroll is the only JSON leaf (covered); others are write-only",
+	"cmdOverageCap": "side-effect (set/clear both write-only)",
+	"cmdRestore":    "side-effect only; no body",
+	"cmdWhoami":     "shell-sourceable plaintext exports",
 }
+
+// cmdTrustedPublishers and other operator-side verbs (cmdBackup,
+// cmdHostAge, cmdPKI, cmdSignKeys, cmdManifestDispatch,
+// cmdReleaseDispatch) moved to cmd/gregalectl/ in PR-6.5 — their
+// nonJSONAllowList entries live in cmd/gregalectl/json_parity_test.go.
 
 // TestJSONOutputHonored is the parity gate. Fails loudly when a
 // top-level cmdXxx references jsonOutput (or any of its leaves

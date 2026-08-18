@@ -343,3 +343,89 @@ The four PR-D-territory questions resolved in the PR-D commit:
   ForwardHTTP removal, dashboard panel updates, the
   `gateway_stream_active` gauge, the unified `reg.MustRegister`
   fix, the narrower `streamingFallbackLog` gate)
+
+## PR-E amendment — discoverability (ADR-102)
+
+PR-D closed the wire-correctness gaps (Flusher path, bidi RPC,
+per-flush accounting, residual capture). The infrastructure
+streams; the response is wire-correct; the customer-facing
+discoverability is missing. Five customer-facing gaps remained:
+
+- **G1.** No discoverability — no spec section titled "Gregale
+  streams responses"; no SDK signal of streaming state.
+- **G2.** Silent buffered fallback — the legacy `streamingFor`
+  returned `bool`, so a customer who pays for `streaming_enabled=true`
+  but sets `Accept: application/json`, runs on Free, or hits a
+  request with streaming operator-disabled gets buffered behavior
+  with no error.
+- **G3.** Undocumented `Accept: application/json` opt-out — the
+  legacy down-convert was implicit; the customer-facing docs
+  never mentioned it.
+- **G5.** Per-endpoint streaming cap — the REQUEST side was wired
+  via ADR-091 D24 §6; the RESPONSE side at handler.go:3227 was
+  not yet extended to honor endpoint rules.
+- **G7.** Free + `streaming_enabled=true` falls back silently via
+  `streamingFallbackLog`.
+
+ADR-102 closes all five in one branch (mega-PR per user
+direction; accepted on the basis of BLOCKER count justifying
+the CI-chase risk).
+
+### What this amendment adds
+
+- **`Streaming-Status` response header** — unconditional stamp at
+  handler.go:~4026 on every response. Closed enum (6 variants).
+  Load-bearing property: the customer can self-diagnose ANY
+  streaming outcome by reading the response header. Closes G1.
+- **`decideStreaming` helper** — replaces the legacy `streamingFor`
+  bool. Returns `(streamingDecision, isStreaming, _)` where the
+  decision carries Status + Cap + CapKind. Five-conjunct
+  precedence-ordered decision tree. Preserves the legacy
+  `streamingFor` wrapper for `applyEdgeRuleLimit`'s bool
+  signature.
+- **`accept-json-downgrade` enum variant + advisory header**
+  — D3 hard-flip removes the legacy down-convert; the variant
+  survives one release cycle + a `Streaming-Status-Accept-Hint:
+  would-buffer-pre-D3` advisory header for pinned-SDK
+  customers. Both retire in ADR-102-followup ~30 days post-merge.
+  Closes G3.
+- **Per-endpoint RESPONSE cap** — D4 mirrors the REQUEST-side
+  cap (ADR-091 D24 §6) on the response side. `CapKind="plan"`
+  or `"endpoint-rule"`. Closes G5.
+- **apid CreateApp 403** — D5 mirrors the existing UpdateApp gate
+  at handlers_ext.go:245-252. Defense-in-depth mirror in
+  `decideStreaming` (plan-disallows branch) catches any pre-D5
+  row that survives. Closes G7.
+- **SDK + CLI probe** — D6 `GET /v1/apps/{slug}/streaming-cap`
+  + `gregale apps streaming-cap <slug>` + the Go/Node/Python
+  SDK methods. IDOR-safe via loadApp.
+- **CORS expose-headers** — D7 adds `Streaming-Status,
+  Streaming-Status-Accept-Hint` to `corsDefaultOps` so
+  uncredentialed CORS clients see the custom headers.
+
+### What this amendment does NOT change
+
+- The Flusher path (PR-D's load-bearing primitive) is unchanged.
+- The bidi gRPC bridge is unchanged.
+- The per-plan MaxResponseBodyBytes cap is unchanged.
+- No new edge-rule kind; no new migration in this PR (the
+  Postgres CHECK constraint ships in the follow-up per
+  deferred-work).
+- The `gateway_stream_active` gauge + `gateway_stream_flushes_total`
+  counter are unchanged.
+
+### Deferred work (out of scope for this PR)
+
+- **Postgres CHECK constraint** (`apps_streaming_enabled_plan_check`)
+  — ships in ADR-102-followup after telemetry confirms zero Free
+  + flag rows in production. Uses the NOT VALID + VALIDATE idiom
+  per migration 00155 precedent.
+- **Retirement of `accept-json-downgrade` enum variant + advisory
+  header** — ~30 days post-merge. The advisory header becomes
+  redundant once the variant is gone.
+- **Per-endpoint response cap at apid-side probe** — the SDK
+  probe returns `EffectiveCap = PlanCap` this PR; the live
+  endpoint-rule override is gatewayd-side state and is not part
+  of the apid cache. Future ADR may wire the apid→gatewayd-internal
+  control-listener hop for live cap resolution.
+

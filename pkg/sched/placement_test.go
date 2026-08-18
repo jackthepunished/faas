@@ -247,6 +247,78 @@ func TestChoosePlacement_Table(t *testing.T) {
 			r:      Request{RAMMB: req},
 			wantID: "a-id",
 		},
+		// ADR-098 PR-D: connection-aware upstream fit.
+		// The four scenarios below pin the upstream_fit
+		// tie-break ordering. The load-bearing claim is:
+		// PreferredRegion == "" MUST fall through to the
+		// legacy tie-break (fail-open); PreferredRegion != ""
+		// MUST prefer the candidate whose compute_node.region
+		// matches.
+		{
+			// Scenario A: nil scores → legacy. Both nodes
+			// fit with equal headroom; PreferredRegion="".
+			// The legacy region ASC tie-break wins (eu-fra
+			// sorts before us-east).
+			name: "nil preferred region fails open to legacy",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "aardvark", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("eu-fra")},
+				{ID: "b-id", Name: "bison", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("us-east")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req, PreferredRegion: ""}, // upstream affinity cache cold
+			wantID: "a-id",                                   // legacy: "eu-fra" < "us-east"
+		},
+		{
+			// Scenario B: bias wins above delta. Both nodes
+			// fit with equal headroom + vCPU; PreferredRegion
+			// = "us-east" overrides the legacy region ASC
+			// tie-break. The upstream_fit INSERT beats the
+			// region tie-break (cluster outline §D3 — placed
+			// BETWEEN vCPU and region).
+			name: "preferred region beats legacy tie-break",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "aardvark", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("eu-fra")},
+				{ID: "b-id", Name: "bison", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("us-east")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req, PreferredRegion: "us-east"},
+			wantID: "b-id", // upstream_fit: b's region matches
+		},
+		{
+			// Scenario C: bias breaks tie when only one
+			// candidate matches. a and b have identical
+			// (region="us-east"); PreferredRegion matches
+			// both. The legacy name ASC tie-break decides
+			// (a < b). This pins that upstream_fit does
+			// NOT invent a false preference when both
+			// candidates already match.
+			name: "preferred region matching both falls through to name",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "aardvark", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("us-east")},
+				{ID: "b-id", Name: "bison", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("us-east")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req, PreferredRegion: "us-east"},
+			wantID: "a-id", // both match → name tie-break
+		},
+		{
+			// Scenario D: bias is skipped when the
+			// PreferredRegion doesn't match either
+			// candidate. Both regions are eu-fra and
+			// us-east; PreferredRegion="ap-tokyo" matches
+			// neither. The legacy region ASC tie-break
+			// wins (eu-fra < us-east) — the bias is
+			// strictly opt-in and does NOT promote a
+			// "fallback" preference.
+			name: "non-matching preferred region falls through to legacy",
+			nodes: []state.ComputeNode{
+				{ID: "a-id", Name: "aardvark", TargetURL: "unix:///a", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("eu-fra")},
+				{ID: "b-id", Name: "bison", TargetURL: "unix:///b", AdmissionCeilingMB: 100, VCPUBudget: 160, Active: true, Region: strPtr("us-east")},
+			},
+			usedMB: map[string]int64{"a-id": 0, "b-id": 0},
+			r:      Request{RAMMB: req, PreferredRegion: "ap-tokyo"},
+			wantID: "a-id", // neither matches → legacy "eu-fra" < "us-east"
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

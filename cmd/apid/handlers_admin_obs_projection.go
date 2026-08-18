@@ -247,7 +247,7 @@ func buildTenantDetail(ctx context.Context, st state.Store, a state.Account, inc
 		deps, _ := st.ListDeploymentsForApp(ctx, app.ID, 1000, 0)
 		live := 0
 		for _, d := range deps {
-			if d.Status == "live" {
+			if d.Status == state.DeployLive {
 				live++
 			}
 		}
@@ -304,7 +304,14 @@ func buildTenantDetail(ctx context.Context, st state.Store, a state.Account, inc
 // cursor is the empty string when end == len. The shape stays
 // consistent with the rest of the obs surface so the frontend
 // has one cursor contract.
-func paginateNodes(rows []state.ComputeNode, limit int) ([]api.ObsNodeRow, string) {
+//
+// PR #4 (ADR-092) adds the per-node live-utilization fold:
+// liveStats is the PerNodeLiveStats aggregate (one row per node
+// that has at least one live instance) and hbStats is the
+// LatestHeartbeatStats aggregate (one row per node that has
+// heartbeated). Both are keyed by compute_nodes.name so the
+// fold is a map lookup, not a nested loop.
+func paginateNodes(rows []state.ComputeNode, limit int, liveStats []state.PerNodeStats, hbStats []state.ComputeNodeHeartbeatStats) ([]api.ObsNodeRow, string) {
 	sort.Slice(rows, func(i, j int) bool {
 		// active first, then name asc
 		if rows[i].Active != rows[j].Active {
@@ -312,6 +319,34 @@ func paginateNodes(rows []state.ComputeNode, limit int) ([]api.ObsNodeRow, strin
 		}
 		return rows[i].Name < rows[j].Name
 	})
+	// Index the aggregates by node name for O(1) fold. The list
+	// is small (tens of nodes in the multi-host story) so the
+	// map allocation is bounded.
+	liveByName := make(map[string]state.PerNodeStats, len(liveStats))
+	for _, l := range liveStats {
+		liveByName[l.NodeName] = l
+	}
+	hbByName := make(map[string]state.ComputeNodeHeartbeatStats, len(hbStats))
+	for _, h := range hbStats {
+		hbByName[h.NodeID] = h
+	}
+	// Mirror of hbByName keyed by node name (instead of node id).
+	// The hbStats carries the node uuid because that's what
+	// LatestHeartbeatStats' DISTINCT ON (node_id) returns; the
+	// liveStats carries the node name because that's what
+	// PerNodeLiveStats' GROUP BY n.name returns. We resolve
+	// node-id → node-name via the rows slice so the fold stays
+	// a single map lookup per row.
+	idToName := make(map[string]string, len(rows))
+	for _, n := range rows {
+		idToName[n.ID] = n.Name
+	}
+	hbByNameResolved := make(map[string]state.ComputeNodeHeartbeatStats, len(hbStats))
+	for _, h := range hbStats {
+		if name, ok := idToName[h.NodeID]; ok {
+			hbByNameResolved[name] = h
+		}
+	}
 	end := limit
 	next := ""
 	if end > len(rows) {
@@ -320,7 +355,7 @@ func paginateNodes(rows []state.ComputeNode, limit int) ([]api.ObsNodeRow, strin
 	out := make([]api.ObsNodeRow, 0, end)
 	for i := 0; i < end; i++ {
 		n := rows[i]
-		out = append(out, api.ObsNodeRow{
+		row := api.ObsNodeRow{
 			ID:                 n.ID,
 			Name:               n.Name,
 			Active:             n.Active,
@@ -330,7 +365,29 @@ func paginateNodes(rows []state.ComputeNode, limit int) ([]api.ObsNodeRow, strin
 			AdmissionCeilingMB: n.AdmissionCeilingMB,
 			LastHeartbeatAt:    n.LastHeartbeatAt,
 			CreatedAt:          n.CreatedAt,
-		})
+		}
+		// Fold the live stats if any. Nodes with no live
+		// instances get a zero-valued fold (no per-state
+		// counters) — the operator UI renders "0 live" rather
+		// than hiding the tile.
+		if l, ok := liveByName[n.Name]; ok {
+			row.InstancesLive = l.InstancesLive
+			row.InstancesRunning = l.InstancesRunning
+			row.InstancesWaking = l.InstancesWaking
+			row.InstancesColdBooting = l.InstancesColdBooting
+			row.RAMUsedMB = l.RAMUsedMB
+			// §6.2 invariant #2 derivative: headroom until
+			// the per-node admission ceiling fires.
+			row.AdmissionMarginMB = int64(n.AdmissionCeilingMB) - l.RAMUsedMB
+		}
+		// Fold the latest heartbeat's CPU%/disk if any.
+		// nil pointers → omitempty in the JSON tag renders
+		// as "—" on the operator UI.
+		if h, ok := hbByNameResolved[n.Name]; ok {
+			row.CPUPct60s = h.CPUPct60s
+			row.DiskUsedBytes = h.DiskUsedBytes
+		}
+		out = append(out, row)
 	}
 	if end < len(rows) {
 		next = strconv.Itoa(end)

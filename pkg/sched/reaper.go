@@ -6,6 +6,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // Idle reaper + eviction selection (spec §4.3). Both are pure functions over a
@@ -176,7 +177,32 @@ func EffectiveIdleTimeoutS(plan api.Plan, configured int) int {
 // floor's purpose. RAM-pressure eviction (SelectEvictions) intentionally
 // ignores the floor; spec invariant §6.2-2 puts the ceiling before the
 // floor.
-func ReapIdle(now time.Time, instances []InstanceInfo) []string {
+//
+// Metrics (P1D): emits schedd_scale_down_decisions_total{outcome ∈
+// {cooldown_held, park, min_floor_already}} via the supplied *OpsMetrics.
+// One observation per app per tick per outcome (idempotent via per-app
+// emitted-once flags). `keep` is intentionally NOT emitted — ReapIdle
+// has no traffic-signal consult (no desiredByApp), so the "we
+// decided to hold the line" semantics are not applicable. The
+// metrics parameter is nil-safe; tests and the no-metrics fixture
+// default both pass nil and the emission block no-ops.
+//
+// cooldownHeldByApp (P1D): per-tick shared set the loop wrapper
+// passes to both reapers so the metric is incremented at most ONCE
+// per app per tick even when both reaper branches consult the same
+// cooldown window. ReapIdle runs first in runReaper and is the
+// canonical emitter for `cooldown_held`; when its emission fires,
+// it records the app into the set. ReapAggressive runs second and
+// consults the set before its own emission — if the app is already
+// in the set (idle already emitted), the aggressive emission is
+// suppressed. The set is keyed on "this app emitted
+// `cooldown_held` in this tick" (not "this app was skipped in this
+// tick") so that a nil-metrics ReapIdle (no emission) does not
+// poison the aggressive branch's emission. nil-safe: nil means
+// "don't share state across reapers" and the per-reaper emission
+// runs independently — ReapAggressive will still emit when its
+// own metrics is non-nil even if idle didn't.
+func ReapIdle(now time.Time, instances []InstanceInfo, metrics *wire.OpsMetrics, cooldownHeldByApp map[string]struct{}) []string {
 	// appGroup counts RUNNING instances per app and gathers idle
 	// candidates separately so we can trim the candidate list against
 	// the floor AFTER the G7 / idle-timeout filter has run.
@@ -186,6 +212,16 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 		cands           []InstanceInfo // idle-eligible (RUNNING, no flows, stale)
 		lastScaleInAt   *time.Time     // carrier (PR-C): from first row seen
 		scaleInCooldown time.Duration  // carrier (PR-C): zero disables
+		// P1D: per-app emitted-once flags. The cooldown consult runs
+		// for every row of the app; emitting from inside the per-row
+		// loop would multi-count. Same precedent as ReapAggressive's
+		// cooldownEmitted flag (reaper.go:365).
+		cooldownEmitted bool
+		parkEmitted     bool
+		floorEmitted    bool
+		// appID is the AppID stamp for metric emissions (only set on
+		// the first row seen; carrier semantics like LastScaleInAt).
+		appID string
 	}
 	byApp := map[string]*appGroup{}
 	for _, in := range instances {
@@ -198,6 +234,7 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 				floor:           in.MinInstances,
 				lastScaleInAt:   in.LastScaleInAt,
 				scaleInCooldown: time.Duration(in.ScaleInCooldownS) * time.Second,
+				appID:           in.AppID,
 			}
 			byApp[in.AppID] = g
 		}
@@ -207,7 +244,27 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 		// LastScaleInAt → bypass → normal reaping. Carrier semantics:
 		// the first row's values are read once per app, so callers
 		// MUST stamp the same value across all rows of one app.
+		//
+		// P1D: ReapIdle is the canonical emitter for
+		// schedd_scale_down_decisions_total{outcome="cooldown_held"}
+		// (runs first in runReaper). The shared cooldownHeldByApp
+		// set is keyed on "emitted", not "skipped" — when the
+		// emission fires, the app is recorded so ReapAggressive
+		// can suppress its own emission. When ReapIdle is called
+		// with nil metrics, the consult fires but no record is
+		// written; ReapAggressive (if called with non-nil metrics
+		// in the same tick) still emits. Gating the set record on
+		// `metrics != nil` is load-bearing — a naive "always
+		// record" approach would let ReapIdle poison the set
+		// without emitting, silently dropping the observation.
 		if g.lastScaleInAt != nil && g.scaleInCooldown > 0 && now.Sub(*g.lastScaleInAt) < g.scaleInCooldown {
+			if metrics != nil && !g.cooldownEmitted {
+				metrics.ObserveScaleDown(g.appID, "cooldown_held")
+				g.cooldownEmitted = true
+				if cooldownHeldByApp != nil {
+					cooldownHeldByApp[g.appID] = struct{}{}
+				}
+			}
 			continue
 		}
 		// ADR-051 PR-D: workers are reaper-exempt. They have no
@@ -258,8 +315,39 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 		if allowed < 0 {
 			allowed = 0
 		}
+		// preTrimCands (P1D) records the candidate count BEFORE the
+		// floor trim so the `min_floor_already` emission below can
+		// distinguish "candidates existed but the floor kept them" from
+		// "no candidates existed at all" — the latter should emit
+		// nothing (the idle branch had nothing to decide on).
+		preTrimCands := len(g.cands)
 		if len(g.cands) > allowed {
 			g.cands = g.cands[:allowed]
+		}
+		// P1D: emit per-app decision metrics for the idle branch.
+		// Two outcomes cover the idle-branch decision space:
+		//   - `park`: we parked ≥1 instance (post-trim).
+		//   - `min_floor_already`: pre-trim candidates existed but the
+		//     floor kept them all (allowed == 0 with floor > 0).
+		// `cooldown_held` is emitted from the per-row consult above
+		// (ReapIdle is the canonical emitter for this outcome; runs
+		// before ReapAggressive in runReaper, which consults the
+		// shared cooldownHeldByApp set and skips its own emission
+		// when ReapIdle already recorded the app). Idempotent
+		// per-app flags keep the emission exactly-once.
+		if metrics != nil {
+			switch {
+			case len(g.cands) > 0:
+				if !g.parkEmitted {
+					metrics.ObserveScaleDown(g.appID, "park")
+					g.parkEmitted = true
+				}
+			case preTrimCands > 0 && allowed == 0 && g.floor > 0:
+				if !g.floorEmitted {
+					metrics.ObserveScaleDown(g.appID, "min_floor_already")
+					g.floorEmitted = true
+				}
+			}
 		}
 		for _, c := range g.cands {
 			park = append(park, c.Instance)
@@ -290,7 +378,23 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 //
 // Returns instance IDs in deterministic order (oldest-LastRequest
 // first; ties broken by instance ID, matching ReapIdle).
-func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[string]int) []string {
+//
+// The metrics parameter is the wire OpsMetrics for emitting
+// schedd_scale_down_decisions_total{outcome="cooldown_held"} when
+// the per-app scale-in cooldown consult skips an app. nil-safe —
+// nil and the test/fixture default of (*OpsMetrics)(nil) both
+// skip the emission, matching the nil-safety convention of the
+// rest of the wire package.
+//
+// cooldownHeldByApp (P1D): per-tick shared set populated by
+// ReapIdle (which runs BEFORE ReapAggressive in runReaper). When
+// an app appears here, the cooldown consult has already been
+// observed for the same app in the same tick and the emission
+// would double-count — ReapAggressive skips its emission in
+// that case. The set is also populated by ReapAggressive's own
+// consult (so the loop can hand a non-empty set to a future
+// per-tick post-aggregator if one is needed). nil-safe.
+func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[string]int, metrics *wire.OpsMetrics, cooldownHeldByApp map[string]struct{}) []string {
 	type appGroup struct {
 		running         int
 		floor           int
@@ -298,6 +402,7 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		candidates      []InstanceInfo // RUNNING, !young, !busy
 		lastScaleInAt   *time.Time
 		scaleInCooldown time.Duration
+		cooldownEmitted bool // P1C: at most one cooldown_held observation per app
 	}
 	byApp := map[string]*appGroup{}
 	for _, in := range snapshot {
@@ -328,7 +433,26 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		}
 		// PR-C (issue #462): per-app scale-in cooldown consult (mirror
 		// ReapIdle). Skip the entire app when within the cooldown window.
+		// P1C: emit schedd_scale_down_decisions_total{outcome="cooldown_held"}
+		// exactly once per app — the per-instance loop body otherwise fires
+		// for every RUNNING instance in the app. Same precedent as
+		// Engine.admitGate's one-shot emission per call.
+		// P1D: ReapIdle runs first in runReaper and is the canonical
+		// emitter for this outcome. ReapAggressive consults the shared
+		// cooldownHeldByApp set; if the idle branch already recorded
+		// the app in the same tick, the aggressive emission is
+		// suppressed (avoids double-count). The set is still
+		// populated here as a safety net so the loop wrapper can
+		// inspect it after both branches have run.
 		if g.lastScaleInAt != nil && g.scaleInCooldown > 0 && now.Sub(*g.lastScaleInAt) < g.scaleInCooldown {
+			_, alreadySeen := cooldownHeldByApp[in.AppID]
+			if metrics != nil && !g.cooldownEmitted && !alreadySeen {
+				metrics.ObserveScaleDown(in.AppID, "cooldown_held")
+				g.cooldownEmitted = true
+			}
+			if cooldownHeldByApp != nil {
+				cooldownHeldByApp[in.AppID] = struct{}{}
+			}
 			continue
 		}
 		g.running++

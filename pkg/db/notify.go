@@ -143,6 +143,14 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         Anything that kept an in-memory cache (the
 //	                         gateway's route table, meterd's per-account
 //	                         usage map) re-reads on this signal.
+//	NotifyAppDelete         {"app_id":uuid}
+//	                         apid → schedd: an app was deleted (spec
+//	                         §6.2 / ADR-098). schedd's app-delete
+//	                         subscriber (pkg/sched/app_delete_subscriber.go)
+//	                         calls Engine.wakeCoord.Forget(appID) so any
+//	                         in-flight wake on the deleted app unwinds
+//	                         with ErrAppDeleted instead of waiting for
+//	                         the wake-coord TTL.
 //	NotifySnapshotBoot      {"app_id":uuid, "deployment_id":uuid}
 //	                         builderd → imaged: a build VM has produced an
 //	                         OCI image tarball and stamped it on
@@ -177,6 +185,12 @@ const (
 	NotifyCronRunNow             = "cron_run_now"
 	NotifyAccountDeletionPending = "account_deletion_pending"
 	NotifyAccountDeleted         = "account_deleted"
+	// NotifyAppDelete is emitted by apid on app deletion (spec §6.2
+	// / ADR-098). schedd's app-delete subscriber consumes it and
+	// evicts any in-flight wake for the deleted app via
+	// Engine.wakeCoord.Forget so followers unwind promptly
+	// instead of waiting for the wake-coord TTL.
+	NotifyAppDelete = "app_delete"
 	// NotifyCliAuthCodeActivated fires when a dashboard /cli-auth
 	// POST successfully claims a pending code (binds it to an
 	// account_id). Reserved for a follow-up SSE push from apid to
@@ -264,6 +278,21 @@ const (
 	//   is informational — consumers can re-read the row to defend
 	//   against notify loss.
 	NotifyWarmHintPublished = "warm_hint_published"
+	// NotifyDataUpstreamChanged {app_id, scope, kind, host, port, op}
+	//   apid env-classifier + customer-facing
+	//   POST/DELETE /v1/apps/{slug}/upstreams (PR-B) →
+	//   schedd's pkg/sched/upstream_affinity.go subscriber
+	//   (PR-B/C): a row in data_upstreams was written, updated,
+	//   or deleted. The payload is pipe-delimited (rather than
+	//   JSONB like github_webhook_secrets_changed) to keep the
+	//   string under the 8000-byte pg_notify limit even on a
+	//   worst-case 253-char host. Trigger definition:
+	//   migrations/00226_data_upstreams.sql's
+	//   data_upstreams_notify_trg. Reserved for PR-B; PR-A ships
+	//   the trigger but no LISTEN subscriber — pg_notify drops
+	//   unlistened payloads, so no backlog accumulates. ADR-098
+	//   §D2.
+	NotifyDataUpstreamChanged = "data_upstreams_changed"
 	// NotifyEdgeRuleChanged {"app_id":uuid, "rule_id":uuid,
 	//                        "op":"created|updated|deleted"}
 	//   apid → gatewayd-internal: the per-host LRU mirroring the
@@ -275,6 +304,41 @@ const (
 	//   against notify loss. Consumed by cmd/gatewayd-internal/
 	//   backend.go (PR 8).
 	NotifyEdgeRuleChanged = "edge_rule_changed"
+	// ADR-091 amendment (PR-A #??? / apps.maintenance_mode):
+	// the existing NotifyAppChanged channel (declared in the const
+	// block above; payload contract at line 73) is reused for
+	// maintenance_mode flips. The maintenance trigger (migrations
+	// /00221_apps_maintenance_mode.sql) fires ONLY when
+	// maintenance_mode IS DISTINCT FROM OLD.maintenance_mode, so
+	// the channel stays low-volume (per-app flips, not every app
+	// UPDATE). The gatewayd-internal listener (cmd/gatewayd-
+	// internal/run.go) calls Backend.ResetApp(appID) which
+	// `delete`s the entry from the per-host apps LRU so the next
+	// Backend.Lookup repopulates the row from PG and picks up the
+	// new MaintenanceMode value. Without this notification the
+	// apps LRU (no TTL) keeps the stale MaintenanceMode for the
+	// lifetime of the cache entry — the first node to see the app
+	// returns 503 forever, every subsequent node returns 200.
+	// NotifyGithubWebhookSecretChanged {"installation_id":bigint}
+	//   apid → githubd (PR-D / ADR-012 §7 amendment): a row in
+	//   github_webhook_secrets was rotated via the admin endpoint.
+	//   The githubd resolver listens and drops its cached entry so
+	//   the next webhook for that install rebuilds from the DB
+	//   (avoiding the 60s TTL fail-closed window). The payload is
+	//   informational — the consumer re-reads the row to defend
+	//   against notify loss. Consumed by cmd/githubd/main.go.
+	NotifyGithubWebhookSecretChanged = "github_webhook_secret_changed"
+	// NotifyTenantSurfaceChanged {"surface_id":uuid}
+	//   any tenant_surfaces / tenant_hostnames mutation →
+	//   cmd/gatewayd-internal: the cert-remint goroutine
+	//   re-assembles the SAN set for the surface and asks the
+	//   issuer (pkg/gateway/cert_issuer.go) for a fresh cert.
+	//   ADR-100 D3 (issue #879). Payload is the bare surface
+	//   uuid — the consumer re-reads the row + hostnames
+	//   (defence against notify loss; the trigger at
+	//   migrations/00243 fires on every INSERT/UPDATE/DELETE of
+	//   either table, including verified flips).
+	NotifyTenantSurfaceChanged = "tenant_surface_changed"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

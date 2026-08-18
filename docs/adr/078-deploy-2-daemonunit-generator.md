@@ -21,7 +21,11 @@ different trees, all hand-edited and all drifted:
   (10 services, 2 timers, README). Skips `githubd` and `meterd`
   (cp-cp only).
 - `deploy/controlplane/systemd/` — what `cd-controlplane.yml`
-  actually installs on the box (8 services + `faas-cp.slice`).
+  used to install on the box (8 services + `faas-cp.slice`). PR-1
+  (issue #911 / ADR-110) rewire: `cd-controlplane.yml` now reads
+  systemd units + slice + tmpfiles.d from the per-role ansible
+  `files/` tree; this cp-cp tree is a tombstone now, scheduled for
+  deletion in PR-1 Phase 2 after PR-X `gregalectl secrets init`.
 - `deploy/ansible/roles/control_plane_service/files/` — what the
   ansible `control_plane_service` role drops in (4 services: apid,
   imaged, meterd, schedd). Doesn't ship vmmd, gatewayd-internal,
@@ -89,6 +93,8 @@ Subcommands:
   default trees (`deploy/controlplane/systemd/`,
   `deploy/systemd/`,
   `deploy/ansible/roles/control_plane_service/files/`).
+  PR-1: index 0 still targets the v1 cp-cp tree (now a tombstone)
+  so `make generate-check` keeps working; Phase 2 rebinds.
 - `deployctl check` — regenerate to a tempdir, byte-compare
   against committed; exit 1 on drift. CI gate.
 - `deployctl diff` — like `check` but prints the diff to stdout.
@@ -96,6 +102,8 @@ Subcommands:
 Per-tree skip sets:
 
 - cp-cp: ship all 8 daemons + `faas-cp.slice` + `daemons.json`.
+  PR-1: cp-cp is the v1 deploy/controlplane/systemd tree (tombstone);
+  the CD pipeline now reads from per-role ansible files/.
 - cp-sys: ship 6 (no githubd, no meterd) + legacy artefacts
   preserved (`faas-gatewayd.service`, `pg-basebackup-*`, README.md).
 - cp-ans: ship 4 (apid, imaged, meterd, schedd). Widening to 8
@@ -113,7 +121,11 @@ Per-tree skip sets:
 
 `cd-controlplane.yml` reads the two arrays via
 `jq -r '.critical | join(" ")' deploy/etc/daemons.json` and the
-analogous `best_effort` query.
+analogous `best_effort` query. PR-1 (issue #911 / ADR-110):
+`cd-controlplane.yml` is not yet wired to read this — the current
+implementation hardcodes the two arrays in the workflow (the ADR
+text describes the planned reading path, which Phase 2 can wire
+when `deploy/etc/daemons.json` lands in the post-retire path).
 
 ### Wipe comments; move rationale to godoc + this ADR
 
@@ -182,7 +194,10 @@ small.
 - **DEPLOY-3 (issue #650)** — Go state-machine deploy replaces
   the bash workflow.
 - **`deploy/controlplane/deploy.sh:32`** pre-A7 manual-deploy
-  list — pre-existing drift.
+  list — pre-existing drift. PR-1 (issue #911 / ADR-110): the v1
+  `deploy/controlplane/` tree is a tombstone now (Phase 2 deletion
+  after PR-X); the v2 path is direct
+  `/opt/faas/current/bin/deployctl deploy <id>`.
 - **`pg-basebackup-push.service` / timer** in `deploy/systemd/`
   — not daemons; stay hand-written.
 - **Legacy `faas-gatewayd.service`** in both cp-cp and cp-sys —

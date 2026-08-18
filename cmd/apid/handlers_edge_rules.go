@@ -66,7 +66,12 @@ func edgeRuleResponse(r state.EdgeRule) api.EdgeRuleResponse {
 // match the action shape surfaces here as 422 before the store
 // sees it. Returns the *Problem so the handler can pass it
 // straight to api.WriteProblem.
-func validateEdgeRuleAction(kind string, raw json.RawMessage) *api.Problem {
+//
+// plan carries the per-plan ceiling context that kind=throttle
+// requires (sub-plan ceiling enforcement). Other kinds ignore it;
+// the explicit ThrottleValidationContext keeps the boundary clear
+// without forcing a global lookup.
+func validateEdgeRuleAction(kind string, raw json.RawMessage, plan api.Plan) *api.Problem {
 	k := state.EdgeRuleKind(kind)
 	if !k.IsValid() {
 		return api.ErrValidation(fmt.Sprintf("edge rule kind %q is not in the closed vocabulary", kind))
@@ -112,6 +117,54 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage) *api.Problem {
 		var a api.EdgeRuleIPAction
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return api.ErrValidation(fmt.Sprintf("ip action: %v", err))
+		}
+		return a.Validate()
+	case state.EdgeRuleKindValidate:
+		var a api.EdgeRuleValidateAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("validate action: %v", err))
+		}
+		return a.Validate()
+	case state.EdgeRuleKindLimit:
+		var a api.EdgeRuleLimitAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("limit action: %v", err))
+		}
+		return a.Validate()
+	case state.EdgeRuleKindMaintenance:
+		var a api.EdgeRuleMaintenanceAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("maintenance action: %v", err))
+		}
+		return a.Validate()
+	case state.EdgeRuleKindThrottle:
+		var a api.EdgeRuleThrottleAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("throttle action: %v", err))
+		}
+		// Build the per-plan ceiling context. An unknown plan
+		// (cap=0) is fail-open at the validator and fail-closed
+		// at the gateway compile step — that double-check is the
+		// defence-in-depth pattern from compileLimitRules.
+		limits, ok := api.LimitsFor(plan)
+		if !ok {
+			return api.ErrValidation(fmt.Sprintf("throttle action: plan %q has no limits table entry", plan))
+		}
+		return a.Validate(api.ThrottleValidationContext{
+			PlanMaxRPS:         float64(limits.RateLimitRPS),
+			PlanMaxBurst:       limits.RateLimitBurst,
+			PlanMaxKeysPerRule: limits.ThrottleMaxKeysPerRule,
+		})
+	case state.EdgeRuleKindGeo:
+		var a api.EdgeRuleGeoAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("geo action: %v", err))
+		}
+		return a.Validate()
+	case state.EdgeRuleKindBudget:
+		var a api.EdgeRuleBudgetAction
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return api.ErrValidation(fmt.Sprintf("budget action: %v", err))
 		}
 		return a.Validate()
 	}
@@ -184,6 +237,12 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 	// Plan-kind gate. Hobby+ unlocks jwt and ip; Free customers get
 	// a clean 402 BEFORE loadApp (mirrors ErrPlanAlertRulesNotAllowed)
 	// so a Free customer doesn't get a 404 leak.
+	//
+	// EdgeRuleKindGeo is NOT paid-only (ADR-091 D21 sub-decision
+	// hop) — Free customers can post a single geo rule (cap=1).
+	// The per-kind cap is enforced inside the store's
+	// CreateEdgeRuleIfUnderQuota FOR UPDATE lock and surfaced
+	// below via qe.PerKind / ErrPlanEdgeRuleKindQuotaReached.
 	if state.EdgeRuleKind(req.Kind).IsPaidOnly() {
 		limits, ok := api.LimitsFor(acct.Plan)
 		if !ok {
@@ -203,7 +262,7 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 	if !ok {
 		return
 	}
-	if prob := validateEdgeRuleBody(&req); prob != nil {
+	if prob := validateEdgeRuleBody(&req, acct.Plan); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -240,7 +299,11 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		var qe *state.EdgeRuleQuotaError
 		switch {
 		case errors.As(err, &qe):
-			api.WriteProblem(w, api.ErrPlanLimitEdgeRules(acct.Plan, qe.Limit, qe.Observed))
+			if qe.PerKind {
+				api.WriteProblem(w, api.ErrPlanEdgeRuleKindQuotaReached(acct.Plan, qe.Kind, qe.Limit, qe.Observed))
+			} else {
+				api.WriteProblem(w, api.ErrPlanLimitEdgeRules(acct.Plan, qe.Limit, qe.Observed))
+			}
 		case errors.Is(err, state.ErrNotFound):
 			s.notFound(w, "no such app")
 		case errors.Is(err, state.ErrConflict):
@@ -277,8 +340,11 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 
 // validateEdgeRuleBody checks the non-action fields (match_host /
 // match_path / match_methods / priority) and dispatches the
-// per-kind action Validate(). Returns the first *Problem it finds.
-func validateEdgeRuleBody(req *api.CreateEdgeRuleRequest) *api.Problem {
+// per-kind action Validate(). plan is the account's billing plan;
+// kind=throttle needs it to enforce the sub-plan ceiling
+// (rps ≤ plan.RateLimitRPS, burst ≤ plan.RateLimitBurst). Returns
+// the first *Problem it finds.
+func validateEdgeRuleBody(req *api.CreateEdgeRuleRequest, plan api.Plan) *api.Problem {
 	if req.MatchHost == "" {
 		return api.ErrValidation("match_host is required")
 	}
@@ -299,7 +365,7 @@ func validateEdgeRuleBody(req *api.CreateEdgeRuleRequest) *api.Problem {
 	if len(req.Action) == 0 {
 		return api.ErrValidation("action is required")
 	}
-	prob := validateEdgeRuleAction(req.Kind, req.Action)
+	prob := validateEdgeRuleAction(req.Kind, req.Action, plan)
 	return prob
 }
 
@@ -361,6 +427,83 @@ func actionFromBody(kind string, raw json.RawMessage) state.EdgeRuleAction {
 		var a api.EdgeRuleIPAction
 		if err := json.Unmarshal(raw, &a); err == nil {
 			out.IP = &state.EdgeRuleIPAction{Allow: a.Allow, Deny: a.Deny}
+		}
+	case state.EdgeRuleKindValidate:
+		var a api.EdgeRuleValidateAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Schema is preserved byte-exact (json.RawMessage round-trip).
+			// pkg/edgevalidate re-validates at compile time on the
+			// gateway hot path; this decoder is the structural
+			// decode pass only.
+			out.Validate = &state.EdgeRuleValidateAction{
+				Schema:              append([]byte(nil), a.Schema...),
+				ContentTypes:        a.ContentTypes,
+				ApplyWhileStreaming: a.ApplyWhileStreaming,
+				RejectOnUnknown:     a.RejectOnUnknownFields,
+				MaxBodyBytes:        a.MaxBodyBytes,
+			}
+		}
+	case state.EdgeRuleKindLimit:
+		var a api.EdgeRuleLimitAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Mirror the validate path's pattern: structural decode
+			// only, no schema here. The gateway re-compiles the
+			// cap (cmd-side compileLimitRules, cmd/gatewayd-internal/
+			// edge_rules.go) and clamps out-of-range values as
+			// defence-in-depth against a direct-DB row that
+			// bypassed apid-Validate.
+			out.Limit = &state.EdgeRuleLimitAction{
+				MaxBodyBytes:          a.MaxBodyBytes,
+				MaxBodyBytesStreaming: a.MaxBodyBytesStreaming,
+			}
+		}
+	case state.EdgeRuleKindMaintenance:
+		var a api.EdgeRuleMaintenanceAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Same mirror pattern as kind=limit: structural decode,
+			// no payload validation here (validateEdgeRuleAction
+			// already ran). The gateway re-compiles the action body
+			// (cmd-side compileMaintenanceRules, PR-B) and clamps
+			// out-of-range values as defence-in-depth against a
+			// direct-DB row that bypassed apid-Validate
+			// (cmd/e2e/edge_rules_common_test.go::seedEdgeRuleDirect).
+			out.Maintenance = &state.EdgeRuleMaintenanceAction{
+				RetryAfterSeconds: a.RetryAfterSeconds,
+				Message:           a.Message,
+			}
+		}
+	case state.EdgeRuleKindThrottle:
+		var a api.EdgeRuleThrottleAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Same pattern as Limit/Maintenance: structural decode
+			// only, no schema here. The gateway re-compiles the cap
+			// (cmd-side compileThrottleRules, cmd/gatewayd-internal/
+			// edge_rules.go) and clamps out-of-range values as
+			// defence-in-depth against a direct-DB row that
+			// bypassed apid-Validate.
+			out.Throttle = &state.EdgeRuleThrottleAction{
+				RequestsPerSecond: a.RequestsPerSecond,
+				Burst:             a.Burst,
+			}
+		}
+	case state.EdgeRuleKindGeo:
+		var a api.EdgeRuleGeoAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			out.Geo = &state.EdgeRuleGeoAction{Allow: a.Allow, Deny: a.Deny}
+		}
+	case state.EdgeRuleKindBudget:
+		var a api.EdgeRuleBudgetAction
+		if err := json.Unmarshal(raw, &a); err == nil {
+			// Mirror the validate / limit path's pattern: structural
+			// decode only. The gateway re-compiles the budget
+			// (cmd-side compileBudgetRules, cmd/gatewayd-internal/
+			// edge_rules.go) and clamps out-of-range values as
+			// defence-in-depth against a direct-DB row that bypassed
+			// apid-Validate.
+			out.Budget = &state.EdgeRuleBudgetAction{
+				BudgetMs:            a.BudgetMs,
+				AllowOverrideHeader: a.AllowOverrideHeader,
+			}
 		}
 	}
 	return out
@@ -430,7 +573,7 @@ func (s *server) updateEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		}
 	}
 	if req.Action != nil {
-		prob := validateEdgeRuleAction(string(row.Kind), *req.Action)
+		prob := validateEdgeRuleAction(string(row.Kind), *req.Action, acct.Plan)
 		if prob != nil {
 			api.WriteProblem(w, prob)
 			return

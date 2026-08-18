@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"slices"
 	"sort"
@@ -95,8 +96,18 @@ type MemStore struct {
 	// account (PR-C). Keyed by accountID so the cold-start rehydrate
 	// path in pkg/githubd/realservice.go can look up by account.
 	githubInstalls map[string]GitHubInstall
-	deployments    map[string]Deployment
-	builds         map[string]Build
+	// githubWebhookSecrets is the per-tenant webhook secret
+	// store (PR-D / ADR-012 §7 amendment). Keyed by
+	// installation_id so the resolver cache at
+	// pkg/githubd/webhook_secret.go can match the prod
+	// ON CONFLICT (installation_id) DO UPDATE shape.
+	githubWebhookSecrets map[int64][]byte
+	// githubWebhookSecretMeta stamps (upgraded_at, upgraded_by)
+	// for each per-tenant row so the apid admin route can echo
+	// the row back without a second query.
+	githubWebhookSecretMeta map[int64]webhookSecretMeta
+	deployments             map[string]Deployment
+	builds                  map[string]Build
 	// buildProvenance is the ADR-038 "what ran?" record keyed by
 	// build_id (mirrors build_provenance.build_id UNIQUE). MemStore
 	// holds the same idempotent-replace semantics as PgStore's
@@ -142,6 +153,20 @@ type MemStore struct {
 	// is needed. Soft-delete semantics (apps.status='deleted') are
 	// mirrored by the per-app lookup in the quota-check branch.
 	edgeRules map[string]EdgeRule
+	// tenantSurfaces is keyed by TenantSurface.ID (uuid); the
+	// account-keyed lookup GetTenantSurfaceByName and the host-keyed
+	// TenantSurfaceByHostname linear-scan on demand. MemStore holds
+	// the entire dataset under m.mu so per-table indexes are
+	// unnecessary — every method synchronises against m.mu.
+	//
+	// tenantHostnames is keyed by hostname (citext storage in
+	// tenant_hostnames.hostname); the unique-across-surfaces invariant
+	// is enforced by scanning and rejecting duplicates in
+	// CreateTenantHostnameIfUnderQuota.
+	//
+	// ADR-100 / issue #879.
+	tenantSurfaces  map[string]TenantSurface
+	tenantHostnames map[string]TenantHostname
 	// invocations is the Move 1 event-shaped queue (async_invoke,
 	// queue, delayed_task, cron). MemStore mirrors PgStore's `select
 	// ... for update skip locked` semantics by serialising every access
@@ -489,8 +514,12 @@ func NewMemStore() *MemStore {
 		apps:           map[string]App{},
 		githubBindings: map[string]GitHubBinding{},
 		githubInstalls: map[string]GitHubInstall{},
-		deployments:    map[string]Deployment{},
-		builds:         map[string]Build{},
+		// PR-D / ADR-012 §7 amendment: per-tenant webhook secret
+		// store (mirror of github_webhook_secrets).
+		githubWebhookSecrets:    map[int64][]byte{},
+		githubWebhookSecretMeta: map[int64]webhookSecretMeta{},
+		deployments:             map[string]Deployment{},
+		builds:                  map[string]Build{},
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
 		// build_id (mirrors the build_provenance.build_id UNIQUE).
 		// Starts empty; CreateBuildProvenance fills it.
@@ -504,14 +533,17 @@ func NewMemStore() *MemStore {
 		appWebhookDeliveries: map[string]AppWebhookDelivery{},
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
-		invocations:          map[string]Invocation{},
-		instances:            map[string]Instance{},
-		loginTokens:          map[string]LoginToken{},
-		cliAuthCodes:         map[string]CliAuthCode{},
-		accountPasswords:     map[string]AccountPassword{},
-		oauthLinks:           map[string]OAuthLink{},
-		deploymentLogs:       map[string][]LogEntry{},
-		deploymentSeq:        map[string]int64{},
+		// ADR-100 / tenant surfaces — see memstore_tenant_surface.go.
+		tenantSurfaces:   map[string]TenantSurface{},
+		tenantHostnames:  map[string]TenantHostname{},
+		invocations:      map[string]Invocation{},
+		instances:        map[string]Instance{},
+		loginTokens:      map[string]LoginToken{},
+		cliAuthCodes:     map[string]CliAuthCode{},
+		accountPasswords: map[string]AccountPassword{},
+		oauthLinks:       map[string]OAuthLink{},
+		deploymentLogs:   map[string][]LogEntry{},
+		deploymentSeq:    map[string]int64{},
 		// Issue #463 / ADR-069 / PR-B — per-workload filesystem
 		// handles (mirrors migration 00119's PK + ON CONFLICT
 		// semantics).
@@ -2077,6 +2109,100 @@ func (m *MemStore) AppBySlug(_ context.Context, slug string) (App, error) {
 	return App{}, ErrNotFound
 }
 
+// PreviewAppsByParent (ADR-095 / issue #272) is the MemStore mirror
+// of PgStore.PreviewAppsByParent. Walks the in-memory map under the
+// same lock as CreateApp / AppByID / ListApps. Returns an empty slice
+// (not an error) when no previews exist for the parent — the
+// dashboard's preview pane projects the empty list as "no previews
+// yet", matching the MemStore zero-value convention everywhere else.
+func (m *MemStore) PreviewAppsByParent(_ context.Context, accountID, parentSlug string) ([]App, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.AccountID != accountID || a.PreviewOfSlug != parentSlug || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, a)
+	}
+	// Stable sort: newest first. matches the pgstore ORDER BY
+	// created_at DESC. Tests that assert on row order should not
+	// depend on map iteration randomness.
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) is the MemStore
+// mirror of PgStore.ListPreviewsForTeardown. Same contract: return
+// every non-torn_down preview row that is either in a terminal-ish
+// PR state (closed / stale) or past its preview_expires_at TTL.
+// Deliberately does NOT filter on Status == AppDeleted — see the
+// Store-interface docstring for why the janitor needs to observe
+// tombstoned rows on subsequent ticks.
+func (m *MemStore) ListPreviewsForTeardown(_ context.Context, now time.Time, maxPerTick int) ([]App, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []App
+	for _, a := range m.apps {
+		if a.PreviewOfSlug == "" {
+			continue
+		}
+		if a.PreviewPrState == PreviewPrStateTornDown {
+			continue
+		}
+		if a.PreviewPrState == PreviewPrStateClosed || a.PreviewPrState == PreviewPrStateStale {
+			out = append(out, a)
+			continue
+		}
+		if a.PreviewExpiresAt != nil && a.PreviewExpiresAt.Before(now) {
+			out = append(out, a)
+		}
+	}
+	// pgstore orders preview_expires_at ASC NULLS LAST + a per-tick
+	// cap. Mirror that here so the janitor's logic is identical on
+	// both backends; tests that pin a deterministic order need it.
+	sort.Slice(out, func(i, j int) bool {
+		oi, oj := out[i].PreviewExpiresAt, out[j].PreviewExpiresAt
+		switch {
+		case oi == nil && oj == nil:
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		case oi == nil:
+			return false
+		case oj == nil:
+			return true
+		}
+		return oi.Before(*oj)
+	})
+	if len(out) > maxPerTick {
+		out = out[:maxPerTick]
+	}
+	return out, nil
+}
+
+// SetPreviewPrState (ADR-095 PR-C / issue #272) is the MemStore
+// mirror of PgStore.SetPreviewPrState. Preview-only by construction:
+// a row with empty PreviewOfSlug returns ErrNotFound so a bug in the
+// janitor cannot relabel a production app.
+func (m *MemStore) SetPreviewPrState(_ context.Context, appID, prState string) (App, error) {
+	if !PreviewPrStateIsValid(prState) {
+		return App{}, fmt.Errorf("state: set preview pr_state %q for app %q: %w", prState, appID, ErrInvalidPreviewPrState)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[appID]
+	if !ok || a.PreviewOfSlug == "" {
+		return App{}, ErrNotFound
+	}
+	a.PreviewPrState = prState
+	m.apps[appID] = a
+	return a, nil
+}
+
 func (m *MemStore) ListApps(_ context.Context, accountID string) ([]App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2156,6 +2282,38 @@ func (m *MemStore) ListDeploymentsByNodeID(_ context.Context, nodeID string) ([]
 	return out, nil
 }
 
+// isInstanceStateLive reports whether the given instance state is
+// in the §6.2 invariant #1 set — {WAKING, COLD_BOOTING, RUNNING}.
+// The bash triple appears in:
+//   - pgstore.go (the predicate is a SQL IN clause)
+//   - memstore.go's ConcurrencyForDeployment (this file)
+//   - memstore.go's PerNodeLiveStats (PR #4)
+//
+// Extracted so the goconst lint rule (3+ literals) and the
+// state-machine spec (§6.1) share a single source of truth in the
+// in-memory twin. The Postgres CHECK constraint is the canonical
+// enforcement for the persistent table; this helper is the
+// in-memory twin's mirror.
+func isInstanceStateLive(state string) bool {
+	switch state {
+	case instanceStateRunning, instanceStateWaking, instanceStateColdBooting:
+		return true
+	}
+	return false
+}
+
+// instanceStateRunning / instanceStateWaking / instanceStateColdBooting
+// are the live-state literals from the spec §6.1 state machine.
+// Mirrored here only to feed isInstanceStateLive — the rest of
+// the codebase continues to use the bare string literals because
+// the SQL CHECK constraint is the load-bearing enforcement and
+// any wider refactor is out of scope.
+const (
+	instanceStateRunning     = "RUNNING"
+	instanceStateWaking      = "WAKING"
+	instanceStateColdBooting = "COLD_BOOTING"
+)
+
 // ConcurrencyForDeployment mirrors PgStore.ConcurrencyForDeployment.
 // Reads the in-memory instances slice with the same predicate the
 // SQL uses (state IN {'RUNNING','WAKING','COLD_BOOTING'}).
@@ -2167,8 +2325,7 @@ func (m *MemStore) ConcurrencyForDeployment(_ context.Context, appID, deployment
 		if inst.AppID != appID || inst.DeploymentID != deploymentID {
 			continue
 		}
-		switch inst.State {
-		case "RUNNING", "WAKING", "COLD_BOOTING":
+		if isInstanceStateLive(inst.State) {
 			n++
 		}
 	}
@@ -2885,6 +3042,14 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetWebSocketEnabled {
 		a.WebSocketEnabled = boolOrFalse(p.WebSocketEnabled)
 	}
+	// ADR-093: per-route observability opt-in. Same Set-bit
+	// convention as WebSocketEnabled above — the Set bit
+	// distinguishes "don't touch" from "explicit false" (opt out
+	// of per-route metrics). Apid already gated the plan; the
+	// store is a plain column write.
+	if p.SetRouteMetricsEnabled {
+		a.RouteMetricsEnabled = boolOrFalse(p.RouteMetricsEnabled)
+	}
 	// Issue #462 / ADR-058 / PR-A: per-app scaling policy. The
 	// Set bit is the canonical "unset vs explicit zero" signal;
 	// when Set is true the jsonb column is overwritten (deep-copied
@@ -3002,6 +3167,32 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 		} else {
 			s := *p.OverflowNode
 			a.OverflowNode = &s
+		}
+	}
+	// CORS improvements D1: per-app default CORS opt-in +
+	// allowlist. Same Set-bit convention as the other partial
+	// PATCH fields. SetCORSDefaultEnabled distinguishes "don't
+	// touch" from "explicit false" (opt out of an enabled
+	// fallback). SetCORSDefaultOrigins distinguishes "don't
+	// touch" from "explicit empty list" (clear an enabled
+	// fallback). The validator runs above the store layer so
+	// we never see (enabled=true, origins=nil) here.
+	if p.SetCORSDefaultEnabled {
+		// Lifts nullable wire shape into the
+		// store-layer pointer field. nil → nil
+		// (legacy row, opt-out triple collapse),
+		// *v → *v (no copy needed; the apid
+		// caller already handed off ownership).
+		a.CORSDefaultEnabled = p.CORSDefaultEnabled
+	}
+	if p.SetCORSDefaultOrigins {
+		if p.CORSDefaultOrigins == nil {
+			a.CORSDefaultOrigins = nil
+		} else {
+			src := *p.CORSDefaultOrigins
+			dst := make([]string, len(src))
+			copy(dst, src)
+			a.CORSDefaultOrigins = dst
 		}
 	}
 	m.apps[id] = a
@@ -3271,6 +3462,55 @@ func (m *MemStore) GitHubInstallForAccount(_ context.Context, accountID string) 
 	return inst, nil
 }
 
+// UpsertGithubWebhookSecret mirrors PgStore (PR-D / ADR-012 §7
+// amendment). The MemStore is the unit-test stand-in for the
+// resolver; the bytea is held in an in-memory map keyed by
+// installation_id.
+func (m *MemStore) UpsertGithubWebhookSecret(_ context.Context, installationID int64, secret []byte, upgradedBy string) (time.Time, string, error) {
+	if installationID == 0 {
+		return time.Time{}, "", fmt.Errorf("memstore: UpsertGithubWebhookSecret: installation_id must be non-zero")
+	}
+	if len(secret) == 0 {
+		return time.Time{}, "", fmt.Errorf("memstore: UpsertGithubWebhookSecret: secret must be non-empty")
+	}
+	if upgradedBy == "" {
+		upgradedBy = "platform"
+	}
+	now := time.Now().UTC()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.githubWebhookSecrets == nil {
+		m.githubWebhookSecrets = map[int64][]byte{}
+	}
+	cp := make([]byte, len(secret))
+	copy(cp, secret)
+	m.githubWebhookSecrets[installationID] = cp
+	if m.githubWebhookSecretMeta == nil {
+		m.githubWebhookSecretMeta = map[int64]webhookSecretMeta{}
+	}
+	m.githubWebhookSecretMeta[installationID] = webhookSecretMeta{
+		UpgradedAt: now,
+		UpgradedBy: upgradedBy,
+	}
+	return now, upgradedBy, nil
+}
+
+// GetGithubWebhookSecret mirrors PgStore. ErrNotFound on miss.
+func (m *MemStore) GetGithubWebhookSecret(_ context.Context, installationID int64) ([]byte, error) {
+	if installationID == 0 {
+		return nil, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	secret, ok := m.githubWebhookSecrets[installationID]
+	if !ok || len(secret) == 0 {
+		return nil, ErrNotFound
+	}
+	cp := make([]byte, len(secret))
+	copy(cp, secret)
+	return cp, nil
+}
+
 // GetGithubInstallBindingForApp mirrors PgStore. accountID scopes
 // the lookup so a forged session can't read another tenant's binding:
 // if the row exists but is bound to a different account, returns
@@ -3419,6 +3659,30 @@ func (m *MemStore) LiveDeployment(_ context.Context, appID string) (Deployment, 
 	found := false
 	for _, d := range m.deployments {
 		if d.AppID == appID && d.Status == DeployLive && (!found || d.CreatedAt.After(latest.CreatedAt)) {
+			latest, found = d, true
+		}
+	}
+	if !found {
+		return Deployment{}, ErrNotFound
+	}
+	return latest, nil
+}
+
+// LiveDeploymentForScope (ADR-091 / PR-D) mirrors PgStore — iterates
+// m.deployments filtering on (app_id, scope, status='live') and
+// keeps the most-recent row. The MemStore has no uniqueness
+// constraint that mirrors deployments_app_scope_live_uniq; if a
+// test setup inserts two live rows with the same (app, scope), the
+// most-recent one wins (same behaviour as LiveDeployment). The
+// partial unique index only enforces the invariant in production
+// Postgres.
+func (m *MemStore) LiveDeploymentForScope(_ context.Context, appID, scope string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var latest Deployment
+	found := false
+	for _, d := range m.deployments {
+		if d.AppID == appID && d.Scope == scope && d.Status == DeployLive && (!found || d.CreatedAt.After(latest.CreatedAt)) {
 			latest, found = d, true
 		}
 	}
@@ -3608,6 +3872,27 @@ func (m *MemStore) UpsertDeploymentScanResult(_ context.Context, id string, scan
 	d.ScanResult = append([]byte(nil), scanResult...) // defensive copy
 	d.ScanStatus = status
 	d.ScannedAt = time.Now()
+	m.deployments[id] = d
+	return nil
+}
+
+// UpsertDeploymentSecretFindings mirrors
+// PgStore.UpsertDeploymentSecretFindings (migrations/00221,
+// secret-scan v2). Stamps the per-deploy secret-scan audit row
+// (findings + status + scannedAt) on the in-memory deployments
+// row. The Deployment struct's SecretFindings + SecretScannedAt
+// fields were added in this PR — the in-memory mirror needed its
+// own counterpart.
+func (m *MemStore) UpsertDeploymentSecretFindings(_ context.Context, id string, findings []byte, status string, scannedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.SecretFindings = append([]byte(nil), findings...) // defensive copy
+	d.ScanStatus = status
+	d.SecretScannedAt = &scannedAt
 	m.deployments[id] = d
 	return nil
 }
@@ -4526,6 +4811,36 @@ func (m *MemStore) ClaimInvocation(_ context.Context, id, instanceID string, lea
 	return inv, nil
 }
 
+// RequeueExpiredInvocations returns dispatching rows whose lease has expired
+// to the pending queue. It mirrors the conditional UPDATE used by PgStore;
+// the scheduler calls it once per tick with a bounded limit so recovery work
+// cannot starve fresh traffic.
+func (m *MemStore) RequeueExpiredInvocations(_ context.Context, now time.Time, limit int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0)
+	for id, inv := range m.invocations {
+		if inv.State != InvocationDispatching || inv.LeaseExpiresAt == nil || inv.LeaseExpiresAt.After(now) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	for _, id := range ids {
+		inv := m.invocations[id]
+		inv.State = InvocationPending
+		inv.DueAt = now
+		inv.LeaseExpiresAt = nil
+		inv.InstanceID = ""
+		inv.LastError = "dispatch lease expired; requeued"
+		m.invocations[id] = inv
+	}
+	return len(ids), nil
+}
+
 // CompleteInvocation finalises a dispatching row with the optional
 // result blob. State must be dispatching; anything else returns
 // ErrNotFound so the drain doesn't double-complete a row that PG
@@ -5267,6 +5582,24 @@ func (m *MemStore) UpdateInstanceState(_ context.Context, id, state string) erro
 	return nil
 }
 
+// IncInstanceRequestCount (ADR-098 C8) bumps the per-instance
+// request_count column by delta. Mirrors PgStore's behaviour:
+// idempotent on Phase-4-loser re-applies (the writer is additive),
+// returns -1 when the row is gone. The memstore mirrors the column
+// on the Instance struct so the gate can read the value without
+// a SQL hop; C10 wires the gate-side reader.
+func (m *MemStore) IncInstanceRequestCount(_ context.Context, id string, delta int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return -1, nil
+	}
+	ins.RequestCount += delta
+	m.instances[id] = ins
+	return ins.RequestCount, nil
+}
+
 // UpdateInstanceStateWithTimestamp mirrors PgStore's variant. Mirrors
 // the §6.1 watchdog's need to know "time of entry into current
 // state" for SNAPSHOTTING rows; parked_at is the column the watchdog
@@ -5520,6 +5853,29 @@ func (m *MemStore) TouchInstancesLastSeen(_ context.Context, touches []InstanceT
 			continue
 		}
 		ins.LastRequestAt = t.LastRequest
+		m.instances[t.InstanceID] = ins
+		applied++
+	}
+	return applied, nil
+}
+
+// TouchInstancesWithRequestDelta (ADR-098 C9) applies both
+// last_request_at and the per-instance request_count delta. The
+// memstore mirrors the writer contract: additive
+// (`request_count = request_count + delta`), idempotent on
+// Phase-4-loser re-applies, and rows that no longer exist are
+// silently dropped (the touch is a no-op).
+func (m *MemStore) TouchInstancesWithRequestDelta(_ context.Context, touches []InstanceTouch) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	applied := 0
+	for _, t := range touches {
+		ins, ok := m.instances[t.InstanceID]
+		if !ok {
+			continue
+		}
+		ins.LastRequestAt = t.LastRequest
+		ins.RequestCount += t.RequestDelta
 		m.instances[t.InstanceID] = ins
 		applied++
 	}
@@ -5976,6 +6332,29 @@ func (m *MemStore) MarkComputeNodeInactive(_ context.Context, nodeID string) err
 	return nil
 }
 
+// SetComputeNodeRole overwrites the role column on a row by id
+// (ADR-112 PR-B). Mirrors PgStore.SetComputeNodeRole behavior:
+// same allow-list validation, same idempotent semantics, same
+// ErrNotFound on a missing row. MemStore holds role as a *string
+// (nullable, legacy "un-templated" sentinel); the setter accepts
+// only {control-plane, compute-only} and writes the pointer form
+// so the pointer-vs-value distinction survives a round-trip.
+func (m *MemStore) SetComputeNodeRole(_ context.Context, nodeID, role string) error {
+	if err := validateRoleForState(role); err != nil {
+		return fmt.Errorf("state: set role compute_node %s: %w", nodeID, err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.computeNodes[nodeID]
+	if !ok {
+		return ErrNotFound
+	}
+	r := role
+	n.Role = &r
+	m.computeNodes[nodeID] = n
+	return nil
+}
+
 func (m *MemStore) CreateComputeNode(_ context.Context, node ComputeNode) (ComputeNode, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -6256,6 +6635,139 @@ func (m *MemStore) ListComputeNodeHeartbeats(_ context.Context, nodeID string, s
 	return out, nil
 }
 
+// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+// amendment) is the v2 of AppendComputeNodeHeartbeat that also
+// carries the per-node CPU and disk pressure at heartbeat-mint
+// time. The PgStore impl is the load-bearing one — MemStore mirrors
+// it for handler tests that don't stand up Postgres. The duplicate
+// guard mirrors AppendComputeNodeHeartbeat's (node_id, received_at)
+// check so the test code path sees the same ErrConflict surface.
+// The CPUPct60s and DiskUsedBytes pointers are stored verbatim so
+// a handler can distinguish "absent" (nil → pre-PR #4 row) from
+// "explicit zero" (a fresh node with empty /srv/fc/snapshots).
+func (m *MemStore) AppendComputeNodeHeartbeatWithStats(_ context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.computeNodes[nodeID]; !ok {
+		return ErrNotFound
+	}
+	for _, prev := range m.computeNodeHeartbeats[nodeID] {
+		if prev.ReceivedAt.Equal(receivedAt) {
+			return fmt.Errorf("%w: compute_node_heartbeats (node_id, received_at) duplicate", ErrConflict)
+		}
+	}
+	cpu := cpuPct60s
+	disk := diskUsedBytes
+	row := ComputeNodeHeartbeat{
+		ID:              int64(len(m.computeNodeHeartbeats[nodeID]) + 1),
+		NodeID:          nodeID,
+		ReceivedAt:      receivedAt,
+		LastHeartbeatAt: lastHeartbeatAt,
+		Source:          source,
+		CPUPct60s:       &cpu,
+		DiskUsedBytes:   &disk,
+	}
+	m.computeNodeHeartbeats[nodeID] = append(m.computeNodeHeartbeats[nodeID], row)
+	return nil
+}
+
+// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+// per compute node, projected to the read shape (just NodeID +
+// ReceivedAt + the two stat pointers). Used by the obsListNodes
+// handler to fold CPU + disk pressure onto the per-node row. The
+// loop iterates the per-node slice in insertion order (last row
+// = newest, matching the SQL ORDER BY received_at DESC LIMIT 1
+// pattern). Missing or pre-PR #4 nodes return nil for the stat
+// pointers — the handler renders "—" for those.
+func (m *MemStore) LatestHeartbeatStats(_ context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]ComputeNodeHeartbeatStats, 0, len(m.computeNodes))
+	for nodeID := range m.computeNodes {
+		rows := m.computeNodeHeartbeats[nodeID]
+		if len(rows) == 0 {
+			// No heartbeats yet. Still project the node so the
+			// handler can render "no data" rather than dropping
+			// it from the list entirely — the operator needs to
+			// see "node registered but silent" as a signal.
+			out = append(out, ComputeNodeHeartbeatStats{NodeID: nodeID})
+			continue
+		}
+		latest := rows[len(rows)-1]
+		out = append(out, ComputeNodeHeartbeatStats{
+			NodeID:        nodeID,
+			ReceivedAt:    latest.ReceivedAt,
+			CPUPct60s:     latest.CPUPct60s,
+			DiskUsedBytes: latest.DiskUsedBytes,
+		})
+	}
+	return out, nil
+}
+
+// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+// /v1/admin/obs/nodes handler. Walks instances in {WAKING,
+// COLD_BOOTING, RUNNING} state (the §6.2 invariant #1 set),
+// groups by instances.node_id, and projects to compute_nodes.name
+// for the human-friendly node label. The +8 on ram_mb mirrors
+// §6.2 invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so the
+// per-node RAMUsedMB sums to the fleet ceiling.
+//
+// Revision 2 (PR #4 prep): the original draft joined on a separate
+// instance_node_bindings table; after re-reading migration 00024
+// during implementation we discovered instances.node_id is already
+// a NOT NULL FK to compute_nodes(id), backfilled on pre-existing
+// rows. ADR-092 §8 amends §2.1 to drop the binding-table design.
+// This implementation mirrors the SQL GROUP BY directly: the
+// memstore's m.instances is the rows, the lookup onto
+// m.computeNodes is the JOIN, and only the live states count.
+func (m *MemStore) PerNodeLiveStats(_ context.Context) ([]PerNodeStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// node-id → *PerNodeStats. Walk every instance once; credit
+	// counts and RAM to the per-node bucket keyed by node_id.
+	// The handler LEFT JOINs onto compute_nodes by name; here we
+	// just project the raw uuid-aggregated buckets and let the
+	// handler map uuid → name via the existing
+	// ListComputeNodes call. Keeping the memstore uuid-shaped
+	// matches the SQL GROUP BY node_id.
+	agg := map[string]*PerNodeStats{}
+	for _, inst := range m.instances {
+		if !isInstanceStateLive(inst.State) {
+			continue
+		}
+		if inst.NodeID == "" {
+			// Defensive: migration 00024 enforces NOT NULL, but
+			// a hand-crafted memstore test fixture could trip
+			// the invariant. Skip rather than panic.
+			continue
+		}
+		row, ok := agg[inst.NodeID]
+		if !ok {
+			row = &PerNodeStats{NodeName: inst.NodeID}
+			agg[inst.NodeID] = row
+		}
+		row.InstancesLive++
+		switch inst.State {
+		case instanceStateRunning:
+			row.InstancesRunning++
+		case instanceStateWaking:
+			row.InstancesWaking++
+		case instanceStateColdBooting:
+			row.InstancesColdBooting++
+		}
+		// §6.2 invariant #2: ram_mb + 8 per live instance. Cast
+		// to int64 because PerNodeStats.RAMUsedMB is int64
+		// (matching the SQL SUM on bigint); Instance.RAMMB is
+		// plain int.
+		row.RAMUsedMB += int64(inst.RAMMB) + 8
+	}
+	out := make([]PerNodeStats, 0, len(agg))
+	for _, row := range agg {
+		out = append(out, *row)
+	}
+	return out, nil
+}
+
 // AppendEvent (commit 4) fixes two pre-existing bugs that the audit-log
 // PR surfaced. Before: the row's Subject pointer was dropped on the
 // floor (line 1226-1227 had a dead type-assertion placeholder and
@@ -6435,6 +6947,120 @@ func (m *MemStore) ListEventsByWakeID(_ context.Context, wakeID string, since ti
 		return out[i].At.Before(out[j].At)
 	})
 	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the in-memory twin
+// of PgStore.ListAllEventsPaged. Applies the same filter
+// semantics (actor / kind_prefix / subject / since) with the same
+// "empty string / zero time = no filter" sentinel used by the SQL
+// side. Order is (at DESC, id DESC) — same as the pgstore.
+// The cap to limit is applied AFTER the sort so the most-recent
+// rows are the ones that survive when the filter window is
+// larger than the limit.
+func (m *MemStore) ListAllEventsPaged(_ context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	var subjectFilter *uuid.UUID
+	if subject != "" {
+		parsed, err := uuid.Parse(subject)
+		if err != nil {
+			// Unparseable subject filter — no row would match it,
+			// so return empty rather than silently matching
+			// everything. Mirrors the pgstore contract: the SQL
+			// `$3 = '' OR subject = $3::uuid` clause fails the
+			// cast on a non-UUID string (Postgres returns 22P02
+			// invalid_text_representation); returning empty here
+			// keeps the two stores in lockstep on this edge.
+			return nil, nil
+		}
+		subjectFilter = &parsed
+	}
+	var out []Event
+	for _, e := range m.events {
+		if actor != "" && e.Actor != actor {
+			continue
+		}
+		if kindPrefix != "" && !strings.HasPrefix(e.Kind, kindPrefix) {
+			continue
+		}
+		if subjectFilter != nil {
+			if e.Subject == nil || *e.Subject != *subjectFilter {
+				continue
+			}
+		}
+		if !since.IsZero() && e.At.Before(since) {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].At.Equal(out[j].At) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].At.After(out[j].At)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+// per-account events drill-down. Same filter contract as the
+// pgstore version. Backed by the in-memory append order so the
+// partial-index shape (migrations/00099) is mirrored by the
+// iteration: every event matches the actor_account_id predicate
+// first, then the since floor, then the limit cap.
+func (m *MemStore) ListRecentEventsForAccount(_ context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	parsed, err := uuid.Parse(actorAccountID)
+	if err != nil {
+		// Unparseable actor_account_id — match the pgstore
+		// behaviour (empty result, no error).
+		return nil, nil
+	}
+	var out []Event
+	for _, e := range m.events {
+		// Memstore's Event struct does not have actor_account_id
+		// as a typed field (it lives in the jsonb data blob on
+		// the pgstore side; the in-memory type carries only the
+		// fields PR-3 surfaces). Decode the data payload lazily
+		// to find the actor_account_id, mirroring the wake-id
+		// pattern used by ListEventsByWakeID.
+		var payload struct {
+			ActorAccountID string `json:"actor_account_id"`
+		}
+		if len(e.Data) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		if payload.ActorAccountID != parsed.String() {
+			continue
+		}
+		if !since.IsZero() && e.At.Before(since) {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].At.Equal(out[j].At) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].At.After(out[j].At)
+	})
+	if len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil
@@ -7382,8 +8008,8 @@ func (m *MemStore) ClaimPaddleOverageWindow(_ context.Context, accountID string,
 // completed).
 //
 // Field-name note: `mbSecondsSum` here mirrors the production
-// column `pushed_mb_seconds` (migration 00209). The Sum suffix
-// predates the 00209 rename and is kept for backwards compatibility
+// column `pushed_mb_seconds` (migration 00280). The Sum suffix
+// predates the 00280 rename and is kept for backwards compatibility
 // with the existing memstore test fixtures; the value is the
 // last-completed window's integer stamp, not a cumulative sum.
 func (m *MemStore) CompletePaddleOverageWindow(_ context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
@@ -9177,6 +9803,47 @@ func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRu
 			Observed: appCount,
 		}
 	}
+	// Per-kind quota (ADR-091 D22). Same shape as the pgstore
+	// branch. The memstore holds the entire edgeRules slice under
+	// m.mu so the per-kind count is trivially race-free.
+	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
+		kindCount := 0
+		for _, r := range m.edgeRules {
+			if r.AppID == in.AppID && r.Kind == EdgeRuleKindGeo {
+				kindCount++
+			}
+		}
+		if kindCount >= limits.EdgeRulesGeoPerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesGeoPerApp,
+				Observed:   kindCount,
+				Kind:       string(EdgeRuleKindGeo),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
+	// kind='throttle' per-app quota (ADR-091 D20.5 amendment, issue
+	// #881). Mirror of the pgstore branch: race-free under the
+	// memstore's own m.mu (pgstore needs the explicit FOR UPDATE
+	// on apps for race-freedom that the local slice doesn't).
+	if in.Kind == EdgeRuleKindThrottle && limits.EdgeRulesThrottlePerApp > 0 {
+		kindCount := 0
+		for _, r := range m.edgeRules {
+			if r.AppID == in.AppID && r.Kind == EdgeRuleKindThrottle {
+				kindCount++
+			}
+		}
+		if kindCount >= limits.EdgeRulesThrottlePerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesThrottlePerApp,
+				Observed:   kindCount,
+				Kind:       string(EdgeRuleKindThrottle),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 	if in.MatchMethods == nil {
 		in.MatchMethods = []string{}
 	}
@@ -9295,6 +9962,26 @@ func (m *MemStore) CountEdgeRulesForApp(_ context.Context, appID string) (int, e
 	n := 0
 	for _, r := range m.edgeRules {
 		if r.AppID == appID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// CountEdgeRulesByKindForApp mirrors pgstore. The memstore doesn't
+// enforce the per-kind cap in CreateEdgeRuleIfUnderQuota today
+// (the FOR UPDATE lock pattern is strictly a Postgres race-defence
+// — the test-only insert path on MemStore runs under the same
+// m.mu lock, so a per-kind check is also straightforward if
+// callers need it). The count is here so the Store interface
+// stays single-shape and the apid handler's surface is identical
+// across backends.
+func (m *MemStore) CountEdgeRulesByKindForApp(_ context.Context, appID string, kind EdgeRuleKind) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.edgeRules {
+		if r.AppID == appID && r.Kind == kind {
 			n++
 		}
 	}
@@ -10008,6 +10695,16 @@ func (m *MemStore) TouchSessionLastSeen(_ context.Context, id string) error {
 
 // compile-time check that MemStore satisfies Store.
 var _ Store = (*MemStore)(nil)
+
+// webhookSecretMeta is the per-tenant meta stamped alongside
+// the secret (PR-D / ADR-012 §7 amendment). The shape mirrors
+// github_webhook_secrets.upgraded_at + upgraded_by so the apid
+// admin handler can echo the row back without a second
+// round-trip.
+type webhookSecretMeta struct {
+	UpgradedAt time.Time
+	UpgradedBy string
+}
 
 // BackdateForTest rewinds the row's started_at to the supplied
 // absolute timestamp. Used by the §6.1 watchdog tests in pkg/sched
@@ -10767,6 +11464,185 @@ func (m *MemStore) TrafficAnomalyAggregate(_ context.Context, arg sqlc.TrafficAn
 		out = append(out, s.r)
 	}
 	return out, nil
+}
+
+// PerAccountRateLimitAggregate is the in-memory mirror of
+// (PgStore).TrafficAnomalyAggregateByNode. Walks m.usage to build
+// per-(account, app, node, hour) buckets; the memstore's
+// usage entries don't carry node_id (they're per-instance), so
+// the resolution joins to m.instances[instance_id].node_id.
+// Computing a full per-node baseline is more expensive than the
+// per-app path (one extra GROUP BY column), so the memstore
+// shares the same baseline math via the existing bucket walker
+// with an additional key dimension.
+//
+// Why mirror the per-app impl rather than just return empty: the
+// obs handler tests for `?group_by=node` need to assert the wire
+// shape from a memstore-backed store. An empty result would
+// pass a "no rows" test but fail a "score threshold" test.
+func (m *MemStore) TrafficAnomalyAggregateByNode(_ context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error) {
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
+	}
+	since := arg.Minute.Time
+	baselineCutoff := arg.Minute_2.Time
+	limit := int(arg.Column3)
+	type bucket struct {
+		sum, sumSq float64
+		n          int
+	}
+	bl := map[string]*bucket{} // key = accountID|appID|nodeID|hour
+	keyOf := func(a, b, n string, h int) string {
+		return a + "|" + b + "|" + n + "|" + fmt.Sprint(h)
+	}
+	m.mu.Lock()
+	for _, u := range m.usage {
+		if u.Minute.Before(baselineCutoff) || !u.Minute.Before(since) {
+			continue
+		}
+		if u.MBSeconds <= 0 {
+			continue
+		}
+		nodeID := ""
+		if inst, ok := m.instances[u.InstanceID]; ok && inst.NodeID != "" {
+			nodeID = inst.NodeID
+		} else {
+			continue // no node resolution → skip (cannot credit a node)
+		}
+		k := keyOf(u.AccountID, u.AppID, nodeID, u.Minute.UTC().Hour())
+		bk := bl[k]
+		if bk == nil {
+			bk = &bucket{}
+			bl[k] = bk
+		}
+		bk.sum += float64(u.MBSeconds)
+		bk.sumSq += float64(u.MBSeconds) * float64(u.MBSeconds)
+		bk.n++
+	}
+	// current_pool: same shape, different time window.
+	cur := map[string]map[int]float64{} // (account|app|node) → hour → sum
+	curKey := func(a, b, n string) string {
+		return a + "|" + b + "|" + n
+	}
+	for _, u := range m.usage {
+		if u.Minute.Before(since) {
+			continue
+		}
+		if u.MBSeconds <= 0 {
+			continue
+		}
+		nodeID := ""
+		if inst, ok := m.instances[u.InstanceID]; ok && inst.NodeID != "" {
+			nodeID = inst.NodeID
+		} else {
+			continue
+		}
+		h := u.Minute.UTC().Hour()
+		ck := curKey(u.AccountID, u.AppID, nodeID)
+		cm := cur[ck]
+		if cm == nil {
+			cm = map[int]float64{}
+			cur[ck] = cm
+		}
+		cm[h] += float64(u.MBSeconds)
+	}
+	m.mu.Unlock()
+	type scored struct {
+		accountID, appID, nodeID string
+		minute                   time.Time
+		current                  float64
+		mean, stddev             float64
+		n                        int
+		z                        *float64
+		reason                   string
+	}
+	out := []scored{}
+	for ck, hours := range cur {
+		// ck = "account|app|node"
+		var accID, appID, nodeID string
+		for i, c := range []byte(ck) {
+			_ = i
+			_ = c
+		}
+		// Split ck — three segments separated by '|'.
+		// Avoid pulling strings.Split into hot path; use a tiny
+		// manual scan.
+		parts := [3]string{}
+		pi := 0
+		start := 0
+		for i := 0; i < len(ck); i++ {
+			if ck[i] == '|' && pi < 2 {
+				parts[pi] = ck[start:i]
+				pi++
+				start = i + 1
+			}
+		}
+		parts[pi] = ck[start:]
+		accID, appID, nodeID = parts[0], parts[1], parts[2]
+		for h, curSum := range hours {
+			bk := bl[keyOf(accID, appID, nodeID, h)]
+			if bk == nil {
+				continue
+			}
+			mean := bk.sum / float64(bk.n)
+			variance := (bk.sumSq / float64(bk.n)) - mean*mean
+			if variance < 0 {
+				variance = 0
+			}
+			stddev := math.Sqrt(variance)
+			var z *float64
+			var reason string
+			if bk.n < 3 {
+				continue
+			}
+			if stddev < 1.0 && curSum >= 5.0*mean && mean > 0 {
+				zv := (curSum - mean) / 5.0
+				z = &zv
+				reason = "raw_z"
+			} else if stddev >= 1.0 && curSum >= mean+3.0*stddev {
+				zv := (curSum - mean) / stddev
+				z = &zv
+				reason = "hour_of_day"
+			} else {
+				continue
+			}
+			out = append(out, scored{
+				accountID: accID, appID: appID, nodeID: nodeID,
+				minute:  time.Date(since.Year(), since.Month(), since.Day(), h, 0, 0, 0, time.UTC),
+				current: curSum, mean: mean, stddev: stddev, n: bk.n,
+				z: z, reason: reason,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].z == nil || out[j].z == nil {
+			return false
+		}
+		return *out[i].z > *out[j].z
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	rows := make([]sqlc.TrafficAnomalyAggregateByNodeRow, 0, len(out))
+	for _, s := range out {
+		var aid, bid, nid pgtype.UUID
+		_ = aid.Scan(s.accountID)
+		_ = bid.Scan(s.appID)
+		_ = nid.Scan(s.nodeID)
+		rows = append(rows, sqlc.TrafficAnomalyAggregateByNodeRow{
+			AccountID:        aid,
+			AppID:            bid,
+			NodeID:           nid,
+			Minute:           pgtypeTimestamptzFromTime(s.minute),
+			CurrentMbSeconds: s.current,
+			MeanMbSeconds:    s.mean,
+			StddevMbSeconds:  s.stddev,
+			SampleCount:      int32(s.n),
+			ZScore:           s.z,
+			Reason:           s.reason,
+		})
+	}
+	return rows, nil
 }
 
 // PerAccountRateLimitAggregate is the in-memory mirror of

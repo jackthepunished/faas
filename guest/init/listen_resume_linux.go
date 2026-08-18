@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -35,12 +36,26 @@ const (
 	// after the resume hook returns. 0 = ok, anything else = nack.
 	VsockResumeAckOK   = 0
 	VsockResumeAckNack = 1
+	// The remaining values keep the wire fail-closed while making a metal
+	// failure diagnosable. Older hosts treat every non-zero value as a NACK;
+	// current vmmd includes the value in its error.
+	VsockResumeAckHeader        = 6
+	VsockResumeAckMessageType   = 7
+	VsockResumeAckBodyLength    = 8
+	VsockResumeAckBodyRead      = 9
+	VsockResumeAckJSON          = 10
+	VsockResumeAckEntropyBase64 = 11
+	VsockResumeAckEntropyLength = 12
 	// VsockResumeMaxEntropyBytes is the upper bound on the entropy payload
 	// the guest will accept. Mirrors pkg/fcvm/vmm.go::resumeHookEntropyBytes
 	// (256); we keep the host's constant in sync via the V6 metal test. If
 	// the host ever ships more than this, we treat it as a wire error and
 	// nack — never inject untrusted bytes into the entropy pool.
 	VsockResumeMaxEntropyBytes = 256
+	// VsockResumeMaxBodyBytes mirrors vmmd's resumeHookMaxBodyBytes. The
+	// envelope includes the base64 entropy plus host time and traceparent;
+	// capping it at encoded entropy + 64 rejected valid packets.
+	VsockResumeMaxBodyBytes = 8 * 1024
 )
 
 // VsockResumeBindCID is the CID the guest's listener binds on. We use
@@ -114,30 +129,32 @@ func handleResumeConn(f *os.File, log *slog.Logger) {
 	var hdr [8]byte
 	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		log.Warn("vsock read header", "err", err)
+		resumeDiag(fmt.Sprintf("resume: read header err=%v", err))
 		return
 	}
 	msgType := binary.BigEndian.Uint32(hdr[:4])
 	if msgType != VsockResumeMsgType {
 		log.Warn("vsock unknown msg type", "type", msgType)
-		_, _ = f.Write([]byte{VsockResumeAckNack})
+		resumeDiag(fmt.Sprintf("resume: unknown message type=%d", msgType))
+		_, _ = f.Write([]byte{VsockResumeAckMessageType})
 		return
 	}
 	bodyLen := binary.BigEndian.Uint32(hdr[4:8])
 	// Guard against a malicious peer pinning the guest on a giant body.
-	// maxBody is derived from VsockResumeMaxEntropyBytes (NOT a hard-coded
-	// 1024) so a future bump of the entropy cap on either side fails the
-	// wire fast, not silently. base64 expands bytes by ~4/3; JSON envelope
-	// + ~30 B safety for keys/punctuation.
-	maxBody := base64.StdEncoding.EncodedLen(VsockResumeMaxEntropyBytes) + 64
-	if bodyLen == 0 || bodyLen > uint32(maxBody) {
-		log.Warn("vsock resume body length out of range", "len", bodyLen, "max", maxBody)
-		_, _ = f.Write([]byte{VsockResumeAckNack})
+	// The cap mirrors vmmd's 8 KiB resumeHookMaxBodyBytes and is deliberately
+	// independent of the entropy cap because the JSON envelope carries host
+	// time and traceparent in addition to base64 entropy.
+	if bodyLen == 0 || bodyLen > uint32(VsockResumeMaxBodyBytes) {
+		log.Warn("vsock resume body length out of range", "len", bodyLen, "max", VsockResumeMaxBodyBytes)
+		resumeDiag(fmt.Sprintf("resume: body length out of range=%d max=%d", bodyLen, VsockResumeMaxBodyBytes))
+		_, _ = f.Write([]byte{VsockResumeAckBodyLength})
 		return
 	}
 	body := make([]byte, bodyLen)
 	if _, err := io.ReadFull(f, body); err != nil {
 		log.Warn("vsock read body", "err", err)
-		_, _ = f.Write([]byte{VsockResumeAckNack})
+		resumeDiag(fmt.Sprintf("resume: read body len=%d err=%v", bodyLen, err))
+		_, _ = f.Write([]byte{VsockResumeAckBodyRead})
 		return
 	}
 	var req struct {
@@ -147,7 +164,8 @@ func handleResumeConn(f *os.File, log *slog.Logger) {
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		log.Warn("vsock resume body parse", "err", err)
-		_, _ = f.Write([]byte{VsockResumeAckNack})
+		resumeDiag(fmt.Sprintf("resume: body json err=%v", err))
+		_, _ = f.Write([]byte{VsockResumeAckJSON})
 		return
 	}
 	var entropy []byte
@@ -155,20 +173,36 @@ func handleResumeConn(f *os.File, log *slog.Logger) {
 		decoded, decErr := base64.StdEncoding.DecodeString(req.Entropy)
 		if decErr != nil {
 			log.Warn("vsock resume entropy base64", "err", decErr)
-			_, _ = f.Write([]byte{VsockResumeAckNack})
+			resumeDiag(fmt.Sprintf("resume: entropy base64 err=%v", decErr))
+			_, _ = f.Write([]byte{VsockResumeAckEntropyBase64})
 			return
 		}
 		if len(decoded) == 0 || len(decoded) > VsockResumeMaxEntropyBytes {
 			log.Warn("vsock resume entropy length out of range", "len", len(decoded), "max", VsockResumeMaxEntropyBytes)
-			_, _ = f.Write([]byte{VsockResumeAckNack})
+			resumeDiag(fmt.Sprintf("resume: entropy length out of range=%d max=%d", len(decoded), VsockResumeMaxEntropyBytes))
+			_, _ = f.Write([]byte{VsockResumeAckEntropyLength})
 			return
 		}
 		entropy = decoded
 	}
 
 	if err := RunResumeHook(req.HostTimeUnixNano, entropy); err != nil {
-		log.Error("vsock resume hook failed", "err", err)
-		_, _ = f.Write([]byte{VsockResumeAckNack})
+		// Keep ACK=1 as the generic NACK for malformed/unknown failures, but
+		// preserve the failing stage on the wire for vmmd diagnostics. Every
+		// non-zero value remains a fail-closed NACK to older hosts.
+		ack := byte(VsockResumeAckNack)
+		switch {
+		case strings.Contains(err.Error(), "resume: add entropy:"):
+			ack = 2
+		case strings.Contains(err.Error(), "resume: reseed entropy:"):
+			ack = 3
+		case strings.Contains(err.Error(), "resume: step clock:"):
+			ack = 4
+		case strings.Contains(err.Error(), "resume: write uuid marker:"):
+			ack = 5
+		}
+		log.Error("vsock resume hook failed", "err", err, "ack", ack)
+		_, _ = f.Write([]byte{ack})
 		return
 	}
 	// Issue #555 PR-4: stash the W3C traceparent for the supervisor

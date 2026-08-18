@@ -5,6 +5,12 @@ package api
 // "build mode" vs "app mode" (M6 / spec §4.5).
 const BuildManifestPath = "/etc/faas/build.json"
 
+// BuildEntropyPath is a per-build seed staged by builderd and consumed by
+// guest-init before starting BuildKit. A fresh microVM can otherwise block in
+// crypto/rand while BuildKit generates its proxy CA before virtio-rng has
+// initialized the guest entropy pool.
+const BuildEntropyPath = "/etc/faas/entropy.seed"
+
 // BuildDonePath is where guest-init writes the build result before exiting,
 // and where vmmd's Destroy copies it into <export_dir>/build-done.json before
 // removing the chroot.

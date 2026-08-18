@@ -53,6 +53,15 @@ type StorageBackend interface {
 	Delete(ctx context.Context, key string) error
 }
 
+// LocalPathResolver is an optional capability for storage backends whose
+// object is already present as a local file. Callers may use the returned
+// path to avoid copying a large blob into a temporary staging file. A false
+// result means the backend can serve the key, but only through Get (for
+// example an OCI registry or a cache miss).
+type LocalPathResolver interface {
+	LocalPath(key string) (path string, ok bool, err error)
+}
+
 // LocalArtifactLister is an OPTIONAL capability LocalStorageBackend
 // implements. Remote drivers (future) are NOT required to implement it.
 // Callers that need list semantics (e.g. imaged's nightly GC) type-

@@ -37,6 +37,14 @@ import (
 // on the listener side.
 var ErrNodeVerifierCNMismatch = errors.New("wire: peer CN not in compute_node registry")
 
+// ErrCertFingerprintNotRegistered is returned by
+// PGNodeVerifier.CertFingerprintByCN (PR-3) when the CN is unknown
+// or the cert_fingerprint column is empty (pre-PR-X box). The
+// doctor (PR-4) uses this as a sentinel to surface
+// `Boot/<n>× CertFingerprintNotRegistered` as a single failure
+// mode; consumers must errors.Is this sentinel.
+var ErrCertFingerprintNotRegistered = errors.New("wire: cert fingerprint not registered for CN")
+
 // NodeVerifier is the handshake-layer CN-binding seam. The stdlib TLS
 // verifier (chain/SAN/EKU) runs first in the same pass; this hook is
 // invoked AFTER stdlib trust succeeds, so the verifier augments
@@ -113,6 +121,49 @@ func (*AllowAllNodeVerifier) LookupCN(string) error { return nil }
 // Ensure AllowAllNodeVerifier satisfies NodeVerifier at compile time.
 // A forgotten method would fail here, not at the first dial.
 var _ NodeVerifier = (*AllowAllNodeVerifier)(nil)
+
+// AnyNodeVerifier accepts a peer when at least one of its child verifiers
+// accepts it.  Multi-box daemons sometimes have more than one peer class:
+// vmmd accepts registered compute/service peers on its server surface, while
+// its outbound capacity stream must validate the control-plane schedd leaf.
+// A single compute_nodes-backed verifier cannot represent both classes.
+type AnyNodeVerifier struct {
+	verifiers []NodeVerifier
+}
+
+// NewAnyNodeVerifier composes the supplied verifiers. Nil entries are ignored
+// so callers can build a direction-specific verifier without special cases.
+func NewAnyNodeVerifier(verifiers ...NodeVerifier) *AnyNodeVerifier {
+	filtered := make([]NodeVerifier, 0, len(verifiers))
+	for _, verifier := range verifiers {
+		if verifier != nil {
+			filtered = append(filtered, verifier)
+		}
+	}
+	return &AnyNodeVerifier{verifiers: filtered}
+}
+
+// LookupCN implements NodeVerifier. It returns the last rejection when every
+// child rejects the peer so diagnostics retain the canonical CN-bearing error.
+func (v *AnyNodeVerifier) LookupCN(cn string) error {
+	if v == nil {
+		return nodeVerifierWithCN(ErrNodeVerifierCNMismatch, cn)
+	}
+	var last error
+	for _, verifier := range v.verifiers {
+		if err := verifier.LookupCN(cn); err == nil {
+			return nil
+		} else {
+			last = err
+		}
+	}
+	if last != nil {
+		return last
+	}
+	return nodeVerifierWithCN(ErrNodeVerifierCNMismatch, cn)
+}
+
+var _ NodeVerifier = (*AnyNodeVerifier)(nil)
 
 // nodeVerifierWithCN wraps an error with the rejected CN for
 // diagnostics. Wrapping is via %w so errors.Is matches

@@ -97,11 +97,40 @@ type Querier interface {
 	// dismissed scopes. list_secrets-shaped variant of DeleteAPIKey.
 	DeleteAPIKeyReturning(ctx context.Context, db DBTX, arg DeleteAPIKeyReturningParams) (DeleteAPIKeyReturningRow, error)
 	DeleteApp(ctx context.Context, db DBTX, id pgtype.UUID) error
+	DeleteAppErrorRequestsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error
+	// The retention purge also runs on app_error_requests
+	// independently — a customer's drill-down can age out without
+	// the parent fingerprint row being removed (e.g. Hobby with
+	// 100 rows/fingerprint cap evicts oldest request rows first).
+	DeleteAppErrorRequestsOlderThan(ctx context.Context, db DBTX, arg DeleteAppErrorRequestsOlderThanParams) error
+	DeleteAppErrorsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) error
 	DeleteCron(ctx context.Context, db DBTX, arg DeleteCronParams) error
 	DeleteCustomDomain(ctx context.Context, db DBTX, domain interface{}) error
+	// DELETE /v1/apps/{slug}/upstreams/{id} (PR-B). Soft-
+	// delete is rejected by ADR-098 (a soft-deleted row
+	// would still trigger pg_notify and confuse schedd);
+	// the handler is the only path and uses a hard
+	// DELETE. The CASCADE on account_id / app_id handles
+	// the GDPR path (delete-account cascades through
+	// apps → data_upstreams).
+	DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
+	// Single oldest request row for one fingerprint, used by the
+	// UI's "what does this look like" preview. Returns
+	// headers_sample + redactions for the wire-side "we redacted
+	// X / Y / Z" badge.
+	GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErrorSampleParams) (GetAppErrorSampleRow, error)
+	// Single-row read for the dashboard's "edit upstream"
+	// pane (PR-B). Cursor-safe: no pagination; the handler
+	// reads the row directly.
+	GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) (GetDataUpstreamByIDRow, error)
+	// Returns the bytea secret for the given installation_id. The
+	// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
+	// webhook is rejected rather than falling back to the platform-
+	// wide FAAS_GITHUB_WEBHOOK_SECRET).
+	GetGithubWebhookSecret(ctx context.Context, db DBTX, installationID int64) ([]byte, error)
 	// issue #667 / ADR-078 — read-only probe for the snapshotAndPark
 	// 5s watchdog's poll loop. Single SELECT … FROM instances WHERE
 	// id = $1; the column is on the hot path so the row is already in
@@ -111,6 +140,36 @@ type Querier interface {
 	// Primary-key lookup; called on every authenticated dashboard request.
 	// sql.ErrNoRows from pgx maps to state.ErrNotFound in pgstore.
 	GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetSessionRow, error)
+	// ---------------------------------------------------------------------------
+	// ADR-096 customer-facing automatic error grouping.
+	// Tables live in migrations/00222_app_errors.sql. gatewayd-internal
+	// writes via the apid gRPC IncrementAppError handler (pkg/apidgrpc/
+	// apperrors.proto); apid is the only direct writer to the table
+	// per the owner rules. The apid handlers in
+	// cmd/apid/handlers_app_errors.go (PR-B) and the nightly purge
+	// cron in cmd/apid/app_errors_purge.go (PR-A) read here.
+	//
+	// Index paths pinned in the migration file (NOT regenerated here
+	// — sqlc doesn't manage indexes, only the typed query surface).
+	// ---------------------------------------------------------------------------
+	// ADR-096 §3.5 dedupe-merge INSERT. The grpc_server_apperrors.go
+	// handler runs this inside a single pgx transaction per stream
+	// batch. ON CONFLICT target is app_errors_dedupe_uniq (the
+	// migration's UNIQUE on (account_id, app_id, fingerprint)).
+	// The dedupe window is enforced by the writer's LRU; this
+	// unique constraint is the last-resort tripwire.
+	//
+	// Returns (inserted bool) via the canonical Postgres
+	// (xmax = 0) trick: xmax is 0 on a fresh INSERT and non-zero
+	// on an UPDATE. This lets the handler distinguish
+	// outcomeInserted vs outcomeMerged on the wire — the gateway
+	// uses that signal to update its in-process LRU freshness.
+	IncrementAppError(ctx context.Context, db DBTX, arg IncrementAppErrorParams) (bool, error)
+	// One row per request that hit the grouped fingerprint. No
+	// ON CONFLICT — every request gets its own row. request_count
+	// on app_errors is bumped on the paired IncrementAppError
+	// call; the read path derives the joined total at query time.
+	InsertAppErrorRequest(ctx context.Context, db DBTX, arg InsertAppErrorRequestParams) error
 	// CP-1 (operator observability): append one row to the heartbeat
 	// history. The schedd Heartbeat.Tick goroutine is the only writer.
 	// We deliberately do NOT use ON CONFLICT DO NOTHING — a duplicate
@@ -122,12 +181,101 @@ type Querier interface {
 	// controls the wall-clock pair (the property test depends on
 	// caller-supplied timestamps for deterministic gap classification).
 	InsertComputeNodeHeartbeat(ctx context.Context, db DBTX, arg InsertComputeNodeHeartbeatParams) error
+	// ---------------------------------------------------------------------------
+	// ADR-098 connection-aware execution (§9.A). Tables live in
+	// migrations/00226_data_upstreams.sql. apid is the only writer to
+	// data_upstreams (env-classifier side, PR-B); meterd is the only writer
+	// to data_upstream_probes (probe loop, PR-C). schedd reads
+	// data_upstream_probes via ListDataUpstreamProbesByHostRegion on wake
+	// (PR-B wires pkg/sched/upstream_affinity.go). The Store interface is
+	// extended in pkg/state/store.go; pgstore + memstore stubs added in
+	// PR-A so the surface compiles — production reads/writes land in PR-B.
+	//
+	// Index paths pinned in the migration file (NOT regenerated here —
+	// sqlc doesn't manage indexes, only the typed query surface):
+	//   - data_upstreams_app_created_idx
+	//   - data_upstreams_host_redacted_idx
+	//   - data_upstreams_dedupe_uniq (UNIQUE)
+	//   - partitioned data_upstream_probes + default partition
+	// ---------------------------------------------------------------------------
+	// Dedupe-merge INSERT for data_upstreams. Mirrors the
+	// IncrementAppError ON CONFLICT pattern (queries.sql:906).
+	// The handler (PR-B's cmd/apid/extract.go) targets
+	// data_upstreams_dedupe_uniq on (app_id, scope, kind,
+	// host, port). On conflict: bump last_seen_at; refresh
+	// last_rtt_ms / last_probed_at / declared_region from
+	// EXCLUDED so the freshest classifier observation wins.
+	// id is caller-supplied (uuidv7) so the row identity is
+	// stable across the dedupe-merge.
+	InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDataUpstreamParams) (pgtype.UUID, error)
+	// meterd's probe loop writer (PR-C). One row per
+	// (host_redacted_hash, region) per 30s sample. The
+	// PK is (id, sampled_at) — id is a caller-supplied
+	// uuidv7 so dedupe on retry is trivial. Partitioning
+	// on sampled_at gives the meterd loop a hot-write
+	// path; the partition creator (PR-C) drops old
+	// partitions wholesale.
+	InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg InsertDataUpstreamProbeParams) error
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)
 	// scopes is the auth permission set surfaced to the dashboard and the
 	// /v1/keys listing. See ADR-034 rev2.
 	ListAPIKeys(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAPIKeysRow, error)
+	// ADR-091 §3.7 / PR #3 — operator-obs backend audit-reading surface.
+	// Reads the live events table (NOT audit_log — distinct source of
+	// truth per ADR-091 §3.7.4). Optional filters:
+	//   * $1 actor    — exact match (handler passes "" to skip)
+	//   * $2 kind_prefix — LIKE 'prefix%' (handler passes "" to skip)
+	//   * $3 subject  — exact match (handler passes "" to skip)
+	//   * $4 since    — RFC 3339 timestamptz (handler passes zero time to skip)
+	//   * $5 limit    — top-N rows (handler default 200, cap 500;
+	//                   cast to int8 so sqlc emits int64 Params and the
+	//                   handler's int→int64 widening is safe)
+	// Order: at DESC, id DESC — the id tiebreaker keeps the planner on
+	// the (kind, at DESC) index added by 00190_admin_obs_index.sql for
+	// kind-prefix queries and avoids an unstable sort on the
+	// over-read window.
+	// Subject is uuid (nullable in the schema); the cast is left to
+	// the handler so the handler can pass an empty string for "no
+	// subject filter" without a NULL literal.
+	ListAllEventsPaged(ctx context.Context, db DBTX, arg ListAllEventsPagedParams) ([]ListAllEventsPagedRow, error)
+	// Nightly retention purge read path (cmd/apid/app_errors_purge.go).
+	// Returns IDs of app_errors rows for an account older than
+	// `cutoff`. Capped at 10000 per call so the DELETE loop can
+	// iterate without blocking. Sorted by last_seen_at ASC so the
+	// oldest rows are deleted first (a future eviction policy
+	// could swap to "least recent activity" without touching this
+	// query).
+	ListAppErrorFingerprintsForPurge(ctx context.Context, db DBTX, arg ListAppErrorFingerprintsForPurgeParams) ([]pgtype.UUID, error)
+	// ADR-096 §4.3 summary endpoint. Top-N grouped fingerprints for
+	// one (account_id, app_id) over a (since, until) window.
+	// Cursor pagination via the (count, last_seen_at, fingerprint)
+	// compound tuple (distinct from the operator's (created_at, id)
+	// cursor). All three columns are part of the ORDER BY so the
+	// cursor predicate must include all three — dropping `count`
+	// breaks pagination: rows with smaller count but newer
+	// last_seen_at are silently dropped across pages (the cursor
+	// predicate on (last_seen_at, fingerprint) only considers the
+	// inner order, missing the leading count-DESC boundary).
+	// Index path: app_errors_account_app_last_seen_idx covers the
+	// primary scan; the (count DESC) sort happens post-filter on the
+	// bounded set (limit ≤ AppErrorsSummaryMaxLimit = 100).
+	//
+	// sqlc.arg(name) annotations disambiguate the cursor predicate
+	// types — without them sqlc infers the timestamps as timestamptz
+	// from the leading (count, last_seen_at) references and breaks
+	// pagination.
+	ListAppErrorGroups(ctx context.Context, db DBTX, arg ListAppErrorGroupsParams) ([]ListAppErrorGroupsRow, error)
+	// Drill-down rows for one fingerprint. Cursor paginated via
+	// (received_at, request_id). Index path:
+	// app_error_requests_drill_idx. Does NOT include headers_sample
+	// or redactions — those are returned only by GetAppErrorSample.
+	//
+	// sqlc.arg(name) annotations disambiguate the cursor predicate
+	// types — without them sqlc infers $5 as timestamptz from the
+	// leading (received_at) reference, breaking pagination.
+	ListAppErrorRequests(ctx context.Context, db DBTX, arg ListAppErrorRequestsParams) ([]ListAppErrorRequestsRow, error)
 	ListApps(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListAppsRow, error)
 	// CP-1: read heartbeat history for one node, newest first. The
 	// $2 parameter is nullable: passing pgtype.Timestamptz{} (the Go
@@ -140,8 +288,33 @@ type Querier interface {
 	// The endpoint passes a hard-cap limit (default 200, max 2000). The
 	// composite index is enough for the routine 30s × 60 nodes × 24h
 	// steady-state workload; a 7-day retention sweep is a follow-on.
-	ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ComputeNodeHeartbeat, error)
+	ListComputeNodeHeartbeats(ctx context.Context, db DBTX, arg ListComputeNodeHeartbeatsParams) ([]ListComputeNodeHeartbeatsRow, error)
 	ListCronsForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListCronsForAppRow, error)
+	// schedd's wake-side read path (PR-B/C). Returns the
+	// N most recent probe samples for one (host, region)
+	// pair, time-windowed to the meterd sliding window
+	// (default: 30s × 5min). Index path: the
+	// partitioned table's PARTITION BY RANGE on
+	// sampled_at — partition pruning drops everything
+	// outside the window. The (kind) projection lets
+	// schedd key its upstream-affinity map on
+	// (kind, region) without joining data_upstreams.
+	ListDataUpstreamProbesByHostRegion(ctx context.Context, db DBTX, arg ListDataUpstreamProbesByHostRegionParams) ([]ListDataUpstreamProbesByHostRegionRow, error)
+	// GET /v1/apps/{slug}/upstreams (PR-B). Cursor pagination
+	// via (created_at, id) — distinct from app_errors'
+	// (last_seen_at, fingerprint) cursor because
+	// data_upstreams is a stable list, not a hot recency
+	// list. Index path: data_upstreams_app_created_idx.
+	//
+	// sqlc.arg(...)::type casts disambiguate the two cursor
+	// params — without them sqlc named both fields
+	// `CreatedAt` (taken from the SELECT list) and the
+	// generated Go wrapper bound a timestamptz to the $3
+	// uuid slot, tripping a type error on every cursor page
+	// past the first. See the cross-PR slot-fence
+	// sqlc.arg-disambiguates-cursor memory; the same
+	// pattern pins ListAppErrorGroups.
+	ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error)
 	ListDeploymentsForApp(ctx context.Context, db DBTX, arg ListDeploymentsForAppParams) ([]ListDeploymentsForAppRow, error)
 	ListDomainsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListDomainsForAccountRow, error)
 	ListDomainsForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListDomainsForAppRow, error)
@@ -163,6 +336,23 @@ type Querier interface {
 	ListOrgInvitationsForOrg(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgInvitationsForOrgRow, error)
 	ListOrgMembers(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgMembersRow, error)
 	ListOrgsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOrgsForAccountRow, error)
+	// ADR-091 §3.7 / PR #3 — per-account events drill-down. Backed by
+	// the partial index events_actor_account_idx on
+	// (actor_account_id) WHERE actor_account_id IS NOT NULL
+	// (migrations/00099_orgs_memberships_invitations.sql). Filters:
+	//   * $1 actor_account_id — uuid (the account the actor belonged to)
+	//   * $2 since             — RFC 3339 timestamptz (handler passes
+	//                            zero time to skip; the predicate is
+	//                            uniform with ListAllEventsPaged)
+	//   * $3 limit             — top-N rows (handler default 200, cap 500;
+	//                            cast to int8 so sqlc emits int64 Params
+	//                            and the handler's int→int64 widening is
+	//                            safe)
+	// Order: at DESC, id DESC — same rationale as ListAllEventsPaged.
+	// PR #3 wires the per-account filter on the SSE mirror's
+	// per-account projections; the broader ?actor + ?subject filter
+	// shape lives on ListAllEventsPaged.
+	ListRecentEventsForAccount(ctx context.Context, db DBTX, arg ListRecentEventsForAccountParams) ([]ListRecentEventsForAccountRow, error)
 	// Active rows only, newest first. Partial index keeps the scan tight.
 	ListSessions(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListSessionsRow, error)
 	MarkDeploymentLive(ctx context.Context, db DBTX, id pgtype.UUID) error
@@ -188,6 +378,17 @@ type Querier interface {
 	// the kind + at DESC predicate. The subject grouping is in-memory
 	// after the index scan.
 	PerAccountRateLimitAggregate(ctx context.Context, db DBTX, arg PerAccountRateLimitAggregateParams) ([]PerAccountRateLimitAggregateRow, error)
+	// Retention purge. The meterd cron calls this
+	// hourly with `cutoff = now() - interval '30 days'`
+	// (matches the §12 prom_retention_days:15 floor +
+	// a 2× safety margin). The partition pruning on
+	// sampled_at makes this O(affected partitions),
+	// not O(table size). The PR-C partition creator
+	// DROPs whole partitions for ranges entirely older
+	// than cutoff; this query handles the partial-
+	// partition tail (rows in the default partition or
+	// the current month that are older than cutoff).
+	PruneDataUpstreamProbesOlderThan(ctx context.Context, db DBTX, sampledAt pgtype.Timestamptz) error
 	// Revokes every active row for accountID except the supplied sid
 	// (the calling session). Returns the revoked ids for audit.
 	RevokeAllSessions(ctx context.Context, db DBTX, arg RevokeAllSessionsParams) ([]pgtype.UUID, error)
@@ -242,6 +443,27 @@ type Querier interface {
 	// PR #2 does NOT add it (single-box posture; multi-host moves to
 	// PromQL per ADR-091 §3.6).
 	TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateParams) ([]TrafficAnomalyAggregateRow, error)
+	// PR #4 (ADR-092 §3.4 amendment) — per-node variant of
+	// TrafficAnomalyAggregate. Joins usage_minutes to instances to
+	// recover the hosting node_id, then groups by
+	// (account_id, app_id, node_id, EXTRACT(HOUR FROM minute)) for
+	// the baseline. The current_pool also groups by node_id so the
+	// "today" anomaly is per-node, not per-app-wide.
+	//
+	// Why a separate query and not a sqlc parameter on the existing
+	// one: the baseline math is identical, but the GROUP BY keys
+	// differ by one column, and trying to thread that through a
+	// nullable WHERE filter would either lose the per-node grain
+	// (NULL filter collapses the group) or return the wrong rollup
+	// (a per-node "current" against an app-wide baseline reports
+	// spurious anomalies when the fleet is unevenly loaded). A
+	// separate query keeps each path simple and self-contained.
+	//
+	// Index path: same as TrafficAnomalyAggregate — usage_minutes
+	// primary key (instance_id, minute) is fine for the 24h current
+	// window in single-box posture. The instances.node_id lookup
+	// is by PK; the join is O(matches) on the PK.
+	TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error)
 	UpdateAccountPlan(ctx context.Context, db DBTX, arg UpdateAccountPlanParams) error
 	UpdateAccountStatus(ctx context.Context, db DBTX, arg UpdateAccountStatusParams) error
 	UpdateApp(ctx context.Context, db DBTX, arg UpdateAppParams) (UpdateAppRow, error)
@@ -251,6 +473,23 @@ type Querier interface {
 	UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateInstanceStateParams) error
 	UpdateOrgPlan(ctx context.Context, db DBTX, arg UpdateOrgPlanParams) error
 	UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error
+	// ---------------------------------------------------------------------------
+	// PR-D / ADR-012 §7 amendment — per-tenant GitHub App webhook secret.
+	//
+	// The two queries below are exposed by pkg/state/pgstore.go as
+	// (s *PgStore).UpsertGithubWebhookSecret and
+	// (s *PgStore).GetGithubWebhookSecret. The body is hand-curated
+	// rather than sqlc-generated because the github_installations pair
+	// is also hand-curated (same precedent). The schema lives in
+	// migrations/00212_github_webhook_secrets.sql (renumbered from
+	// 00208 → 00209 → 00212 in the slot-collision cluster; see the
+	// migration's header for the cross-pr-slot-fence chain).
+	// ---------------------------------------------------------------------------
+	// Installs or rotates the per-tenant webhook secret for an
+	// installation_id. ON CONFLICT (installation_id) DO UPDATE so a
+	// rotation is one statement. upgradedAt + upgradedBy form a §11
+	// audit trail.
+	UpsertGithubWebhookSecret(ctx context.Context, db DBTX, arg UpsertGithubWebhookSecretParams) (int64, error)
 	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error)
 }
 

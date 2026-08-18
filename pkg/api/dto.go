@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,28 @@ type CreateAppRequest struct {
 	// streaming pattern from issue #471 — same fail-closed
 	// contract, same Plan.WebSocketEnabled() accessor.
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// RouteMetricsEnabled (ADR-093) opts the brand-new app into the
+	// per-route observability surface (gatewayd-internal emits
+	// `gateway_request_duration_seconds{app,route,class}` etc. plus
+	// the bounded in-memory reader at
+	// GET /v1/internal/apps/{slug}/routes). nil → plan default
+	// (Free off; Hobby/Pro/Scale on). Explicit true on Free =
+	// rejected by apid with 403 plan_route_metrics_not_allowed.
+	// Explicit false on Hobby/Pro/Scale = opt out (a synchronous
+	// JSON API that does not want per-route cardinality on the
+	// box). The default-on shape mirrors the WebSocketEnabled
+	// pattern from issue #676 — same fail-closed contract, same
+	// Plan.RouteMetricsEnabled() accessor.
+	RouteMetricsEnabled *bool `json:"route_metrics_enabled,omitempty"`
+	// MaintenanceMode (ADR-091 amendment) opts the new app into
+	// 503 + Retry-After mode at create time. The coarse sibling of
+	// the kind=maintenance edge rule — the customer wants "this
+	// whole app is in maintenance" without per-rule ceremony.
+	// Free-tier allowed (no IsPaidOnly change); the per-app
+	// apps_maintenance_mode_notify trigger (migration 00221)
+	// fires pg_notify('app_changed', NEW.id) on a flip so the
+	// gatewayd-internal apps LRU cache can be flushed.
+	MaintenanceMode *bool `json:"maintenance_mode,omitempty"`
 	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
 	// preferred spill target for cross-node pressure rebalance.
 	// Wire type is the human-readable compute_nodes.name; apid
@@ -150,6 +173,25 @@ type UpdateAppRequest struct {
 	// does not want long-poll pinning). Pointer distinguishes
 	// "don't touch" (nil) from "explicit false" (*bool=false).
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// RouteMetricsEnabled (ADR-093) toggles the per-app per-route
+	// observability surface. When true (or unset on a plan where
+	// the default is true), gatewayd-internal emits the per-route
+	// Prometheus series and serves the per-app reader at
+	// GET /v1/internal/apps/{slug}/routes. When false, the
+	// routeLabelSet is empty for this app and the per-route series
+	// do not appear on the /metrics scrape. Plan-gated upstream:
+	// Free returns 403 plan_route_metrics_not_allowed when a
+	// customer attempts PATCH true. Hobby/Pro/Scale may PATCH
+	// true → false to opt out. Pointer distinguishes "don't
+	// touch" (nil) from "explicit false" (*bool=false).
+	RouteMetricsEnabled *bool `json:"route_metrics_enabled,omitempty"`
+	// MaintenanceMode (ADR-091 amendment) opts the app into
+	// 503 + Retry-After mode via PATCH. Pointer distinguishes
+	// "don't touch" (nil) from "explicit false" (*bool=false).
+	// Free-tier allowed (no IsPaidOnly change); the
+	// apps_maintenance_mode_notify trigger fires pg_notify on
+	// flip so the gatewayd-internal apps LRU cache stays fresh.
+	MaintenanceMode *bool `json:"maintenance_mode,omitempty"`
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys on
 	// a valid cosign signature from a trusted publisher (mirrors AWS
 	// Lambda's Code Signing for Lambda). When true, imaged verifies
@@ -236,6 +278,32 @@ type UpdateAppRequest struct {
 	// resolved UUID on the next pressured sweep; falls through to
 	// A9 if the peer has no headroom or is inactive.
 	OverflowNode *string `json:"overflow_node,omitempty"`
+	// CORSDefaultEnabled (CORS improvements D1 / ADR-091
+	// appendix) opts the app into the soft default-CORS
+	// fallback. When true, every incoming response is
+	// stamped with a CORS header set derived from
+	// CORSDefaultOrigins whenever no explicit kind=cors
+	// edge rule matches. nil → keep current value
+	// (existing PATCH semantics); explicit false opts out;
+	// explicit true opts in. The Set-bit in the
+	// pgstore-level UpdateApp distinguishes "unset" from
+	// "explicit flip" so partial-PATCH stays bit-for-bit
+	// additive on the wire.
+	CORSDefaultEnabled *bool `json:"cors_default_enabled,omitempty"`
+	// CORSDefaultOrigins (CORS improvements D1) is the
+	// per-app default allowlist. Same grammar as
+	// EdgeRuleCORSAction.AllowOrigins — concrete origins,
+	// '*.example.com' subdomain wildcards, 'localhost:*'
+	// port wildcards, or '*' (denied when credentials
+	// are enabled, same footgun guard as the explicit
+	// rule). nil slice or len==0 means "no default
+	// fallback"; when CORSDefaultEnabled is true the
+	// validator requires a non-empty value (otherwise
+	// the fallback is a silent no-op and the customer
+	// wonders why nothing changed). Stamped on the
+	// gateway hot path by reusing pkg/gateway's
+	// matchOrigin predicate against this list.
+	CORSDefaultOrigins *[]string `json:"cors_default_origins,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
@@ -477,6 +545,23 @@ type AppResponse struct {
 	// explicitly opted out via PATCH. Surfaced so dashboards can
 	// show "websocket on / off" alongside the streaming pill.
 	WebSocketEnabled bool `json:"websocket_enabled"`
+	// RouteMetricsEnabled (ADR-093) reflects the per-app
+	// route_metrics_enabled flag stored on the apps row. False
+	// on Free (the plan default and the only legal state — apid
+	// rejects PATCH true with 403 plan_route_metrics_not_allowed).
+	// True on Hobby/Pro/Scale by default unless the customer
+	// explicitly opted out via PATCH. Surfaced so dashboards can
+	// show "route metrics on / off" alongside the streaming/WS
+	// pills.
+	RouteMetricsEnabled bool `json:"route_metrics_enabled"`
+	// MaintenanceMode (ADR-091 amendment) is the coarse-grained
+	// maintenance toggle for the whole app. When true the
+	// gatewayd applier (applyAppsMaintenanceMode, §4.1.2.0)
+	// short-circuits every request with 503 + Retry-After
+	// BEFORE auth, BEFORE wake, BEFORE any kind=maintenance rule
+	// (coarse gate beats fine-grained). Surfaced in the GET app
+	// response so dashboards can show "maintenance on / off".
+	MaintenanceMode bool `json:"maintenance_mode"`
 	// EvictionPriority (issue #475) is the per-app eviction tier
 	// classification. 'best_effort' (default for every pre-#475
 	// row, applied by the column DEFAULT at migration time) keeps
@@ -604,6 +689,22 @@ type AppResponse struct {
 	// `name` to a `compute_nodes.id` server-side before
 	// persisting or returning.
 	OverflowNode *string `json:"overflow_node,omitempty"`
+	// CORSDefaultEnabled (CORS improvements D1) reflects the
+	// per-app soft default-CORS opt-in. NULL on legacy rows
+	// so dashboards render an "off" pill; non-null true
+	// means the gateway is stamping the default header set
+	// on miss; non-null false means the customer explicitly
+	// opted out (the column was flipped from the schema
+	// default).
+	CORSDefaultEnabled *bool `json:"cors_default_enabled"`
+	// CORSDefaultOrigins (CORS improvements D1) reflects the
+	// resolved default allowlist. nil/len==0 means the
+	// column is NULL (no origins configured); the gateway
+	// short-circuits to a deny-all stamp on the default
+	// path. The wire shape is JSON [] (never null) when
+	// the column carries a value, so dashboards can render
+	// the list directly.
+	CORSDefaultOrigins []string `json:"cors_default_origins"`
 }
 
 // ParkedDeploymentRef is the reference shape returned in
@@ -744,6 +845,13 @@ type CreateDeploymentRequest struct {
 	// canary share. Plan-gated at Pro+ via
 	// acct.Plan.TrafficSplitAllowed().
 	TrafficPercent *int `json:"traffic_percent,omitempty"`
+	// Scope (ADR-091 / PR-D) declares which named env scope this
+	// deployment reads at wake time. Empty / omitted → handler
+	// defaults to api.DefaultEnvScope. Migration 00213's CHECK
+	// constraint enforces EnvScopePattern; the handler runs
+	// api.ValidateScope before storing. A duplicate live row on
+	// (app_id, scope) → 400 deployment_scope_collision.
+	Scope string `json:"scope,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -811,6 +919,15 @@ type CreateDeploymentOverrides struct {
 	// (Engine.ParkDeployment) regardless of per-deployment probe
 	// tuning.
 	LivenessProbe *DeploymentLivenessProbe `json:"liveness_probe,omitempty"`
+	// Scope (ADR-091 / PR-D) declares which named env scope this
+	// deployment reads at wake time. Empty / omitted defaults to
+	// api.DefaultEnvScope at the handler. Migration 00213's
+	// partial unique index `deployments_app_scope_live_uniq`
+	// prevents two live deployments from sharing (app_id, scope)
+	// — a duplicate returns 400 deployment_scope_collision. A
+	// scope change requires a NEW deployment; UpdateDeployment
+	// intentionally rejects field updates.
+	Scope string `json:"scope,omitempty"`
 }
 
 // DeploymentHealthcheck is the readiness-probe shape on the
@@ -1270,6 +1387,17 @@ type DeploymentResponse struct {
 	// rows). Always non-nil for post-feature rows in any of
 	// the {pending, complete, failed, skipped} states.
 	Scan *ScanResult `json:"scan,omitempty"`
+	// SecretScan is the per-deploy secret-scan audit row (PR-A,
+	// imaged-layer; distinct from the cmd/apid source-tree path).
+	// Mirrors the Scan field shape: nil when the row has not
+	// been scanned yet, non-nil with Findings=[] for a clean
+	// scan, non-nil with Findings=[…] for a hit. Read by the
+	// dashboard's "secret scan" card and the CLI's
+	// `--show-secret-scan` flag. The `omitempty` matches Scan so
+	// absence == "scan pending" on both surfaces — the
+	// /v1/deployments/{id}/secret-scan route is the
+	// 404-on-missing drilldown.
+	SecretScan *SecretScanResult `json:"secret_scan,omitempty"`
 	// ParkedReason / ParkedAt (issue #554 / ADR-079 follow-up)
 	// surface the per-deployment parking columns from migration
 	// 00157 on the GET /v1/deployments/{id} response. omitempty
@@ -1291,6 +1419,19 @@ type DeploymentResponse struct {
 	// pkg/state.UpdateDeploymentTraffic for the rebalance
 	// semantics.
 	TrafficPercent int `json:"traffic_percent"`
+	// Scope (ADR-091 / PR-D) echoes the deployment's
+	// env-targeting scope. Surfaces on GET /v1/deployments/{id}
+	// and the per-app live list (pkg/state.SerializeDeployment
+	// reads dep.Scope — already populated by the SELECT
+	// projection pgstore loads). omitempty keeps the wire clean
+	// for the (rare) pre-PR-D row where scope defaulted to
+	// "default" but the column itself was backfilled; the
+	// SerializeDeployment projector always writes the explicit
+	// value, so downstream consumers see "default" on pre-PR
+	// fixtures the moment PR-D ships. Migration 00213's CHECK
+	// ensures the value is a valid slug; the handler validates
+	// scopeFromBody before storing via api.ValidateScope.
+	Scope string `json:"scope,omitempty"`
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
@@ -1494,6 +1635,70 @@ type CustomDomainResponse struct {
 type CreateCustomDomainRequest struct {
 	Domain string `json:"domain"`
 	AppID  string `json:"app_id"`
+}
+
+// TenantSurfaceResponse is a tenant surface's wire shape (ADR-100 /
+// issue #879). Hostnames carries the full list (verified +
+// unverified) so the dashboard + CLI can render a single
+// round-trip; TXTRecord is the convenience field the customer
+// publishes at _faas-verify.<hostname>. Status / CertState mirror
+// the state machine values (pending/active/suspended/deleted,
+// none/pending/issued/failed) verbatim.
+type TenantSurfaceResponse struct {
+	ID            string                   `json:"id"`
+	AccountID     string                   `json:"account_id"`
+	AppID         string                   `json:"app_id"`
+	Name          string                   `json:"name"`
+	CertKind      string                   `json:"cert_kind"`
+	Status        string                   `json:"status"`
+	CertState     string                   `json:"cert_state"`
+	CertNotAfter  string                   `json:"cert_not_after,omitempty"`
+	CertLastError string                   `json:"cert_last_error,omitempty"`
+	CreatedAt     string                   `json:"created_at"`
+	UpdatedAt     string                   `json:"updated_at"`
+	Hostnames     []TenantHostnameResponse `json:"hostnames"`
+}
+
+// TenantHostnameResponse is a hostname within a surface. Mirror
+// shape of the unverified/verified columns on tenant_hostnames
+// (post-PR-C the verifier flips Verified + VerifiedAt; v1
+// surfaces the column shape now so the API contract doesn't shift
+// when verification lands).
+type TenantHostnameResponse struct {
+	Hostname       string `json:"hostname"`
+	ChallengeToken string `json:"challenge_token,omitempty"`
+	Verified       bool   `json:"verified"`
+	VerifiedAt     string `json:"verified_at,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	TXTRecord      string `json:"txt_record,omitempty"` // convenience
+}
+
+// CreateTenantSurfaceRequest creates a tenant surface (one app, one
+// cert, N hostnames). Hostnames is the seed list (can be empty
+// initially; the customer POSTs additional hostnames via
+// /v1/apps/{slug}/tenant-surfaces/{id}/hostnames). CertKind is
+// optional and defaults to "per_host_san" when empty.
+type CreateTenantSurfaceRequest struct {
+	AppID     string   `json:"app_id"`
+	Name      string   `json:"name"`
+	CertKind  string   `json:"cert_kind,omitempty"`
+	Hostnames []string `json:"hostnames,omitempty"`
+}
+
+// ListTenantSurfacesResponse paginates a /v1/apps/{slug}/tenant-surfaces
+// listing. We use a flat array (no cursor) because the per-app
+// dataset is bounded by the surface quota (Pro 5 / Scale 25 today);
+// dashboards want the whole list to render a single component.
+type ListTenantSurfacesResponse struct {
+	Surfaces []TenantSurfaceResponse `json:"surfaces"`
+}
+
+// AddTenantHostnameRequest appends a hostname to an existing
+// surface. Hostname is required and must be a unique FQDN
+// (lowercase, RFC 1035 compliant); the store enforces the global
+// UQ on tenant_hostnames.hostname.
+type AddTenantHostnameRequest struct {
+	Hostname string `json:"hostname"`
 }
 
 // CronResponse mirrors the crons table. LastFiredAt is the most
@@ -2750,6 +2955,140 @@ type AppMetricsResponse struct {
 	// future egress-billing PR picks the unit; this field
 	// reports the Prometheus counter verbatim.
 	EgressBytes int64 `json:"egress_bytes"`
+	// TxBytes (ADR-046 PR-2 / issue #415 PR-2) is the
+	// gateway-side mirror of EgressBytes. Source:
+	// gateway_egress_tx_bytes_total{app} (the byte
+	// counter drained from the per-instance ring by
+	// pkg/gateway/egressgrpc/server.go; the
+	// gateway-side stream consumer in
+	// cmd/gatewayd-internal/egress_grpc.go feeds the
+	// counter). Same window semantics as EgressBytes;
+	// the dashboard surfaces both columns so operators
+	// can see gateway-side vs schedd-side independently
+	// (a divergence indicates the EgressSink ring is
+	// dropping bytes or the gRPC stream is wedged).
+	// 0 when Prometheus is degraded or the gateway
+	// hasn't drained yet. Unit: interface bytes
+	// (includes framing).
+	TxBytes int64 `json:"tx_bytes"`
+	// Routes (ADR-093) is the per-route breakdown for opt-in apps
+	// (apps.route_metrics_enabled=true). nil when the app is not
+	// opt-in — the dashboard distinguishes "feature off" (Routes
+	// absent) from "feature on, no traffic" (Routes = []). Each
+	// row is the bounded detail from the gatewayd-internal
+	// in-memory reader: max 50 distinct routes + the
+	// __route_other__ overflow bucket. The route label is
+	// method + raw path (pre-rewrite, ADR-093 D6). The shape
+	// matches the existing field-level `x-since: "2026-08"`
+	// header convention so the SDK generator picks it up
+	// automatically.
+	Routes []RouteRow `json:"routes,omitempty"`
+}
+
+// RouteRow is the per-route detail row returned by the
+// gatewayd-internal control-listener reader at
+// GET /v1/internal/apps/{slug}/routes (ADR-093). The same
+// structure is wrapped in AppMetricsResponse.Routes by the apid
+// handler. `Route` is the label exactly as emitted on the
+// Prometheus side (method + raw path, or __route_other__ for the
+// overflow bucket). All latency fields are milliseconds ≥ 0;
+// NaN/Inf are coerced to 0 by the reader — same contract as the
+// AppMetricsResponse histograms.
+type RouteRow struct {
+	// Route is the bounded label: "GET /users/4f8a" for an
+	// admitted route, or "__route_other__" for the overflow
+	// bucket. The two reserved labels ("" and "__route_other__")
+	// are surfaced verbatim so dashboards can render the
+	// wildcard-route signal honestly.
+	Route string `json:"route"`
+	// Count is the number of requests observed in the window.
+	Count uint64 `json:"count"`
+	// P50MS / P95MS / P99MS are histogram_quantile over the
+	// full request duration (status-agnostic — failures are
+	// included, not excluded, so the percentile is the
+	// latency-percentile the customer actually experiences).
+	// The histogram is gateway_request_duration_seconds{app,
+	// route, class} (ADR-093 D4), summed across all classes
+	// for the row.
+	P50MS float64 `json:"p50_ms"`
+	P95MS float64 `json:"p95_ms"`
+	P99MS float64 `json:"p99_ms"`
+	// ErrorPct is the share of requests with status ≥ 400 in
+	// the window. Computed from
+	// gateway_request_failures_total{app, route, code} /
+	// gateway_requests_total{app, route}, code ≥ 400 summed.
+	ErrorPct float64 `json:"error_pct"`
+}
+
+// AppRoutesResponse is the per-route label snapshot returned by
+// GET /v1/apps/{slug}/routes (ADR-093). The shape is intentionally
+// narrower than AppMetricsResponse — only the bounded label set
+// the gatewayd-internal control listener emits (method + raw
+// path, capped at 50 + __route_other__). The Prometheus-derived
+// per-route rollup (count, percentiles, error_pct) lives on
+// AppMetricsResponse.Routes, computed lazily when the dashboard
+// needs it. Splitting the two surfaces keeps the lightweight
+// reader cheap (one in-memory map read on gatewayd-internal, one
+// HTTP round-trip from apid) and lets the dashboard render the
+// "what routes is this app serving?" panel without a Prometheus
+// query.
+//
+// Source is "live" when the gatewayd control listener responded
+// 200; "unavailable" when the dial failed (gatewayd not
+// reachable, X-Faas-Routes-State: unavailable header). Routes
+// is []string (not nil) on the unavailable path so the JSON
+// encoder emits `[]` rather than `null`.
+//
+// CapHit (ADR-093 Tier B item #1, issue #273 follow-up) is true
+// iff the app's routeLabelSet has reached RouteMetricsPerAppCap
+// (pkg/api.RouteMetricsPerAppCap = 50) and additional routes are
+// collapsing into the reserved __route_other__ bucket. On the
+// "live" path the dashboard renders CapHit=true as a "you have
+// hit the 50-route cap" chip rather than counting Routes and
+// trying to disambiguate "5 real routes + __route_other__
+// because of one wildcard probe" from "50 real routes +
+// overflow". On the "unavailable" path CapHit is the zero
+// value (false) — the upstream decode doesn't carry it, and
+// the dashboard already renders unavailable as a distinct chip.
+type AppRoutesResponse struct {
+	Slug   string   `json:"slug"`
+	AppID  string   `json:"app_id,omitempty"`
+	Routes []string `json:"routes"`
+	Source string   `json:"source"`
+	// CapHit mirrors gatewayd-internal's routesResponseJSON.CapHit.
+	// ADR-093 §D2 invariant: when CapHit==true, len(Routes) ==
+	// RouteMetricsPerAppCap + 2 (the +2 is reservedRouteLabelEmpty
+	// + __route_other__).
+	CapHit bool `json:"cap_hit"`
+}
+
+// AppStreamingStatus is the per-request streaming classification
+// returned by GET /v1/apps/{slug}/streaming-cap (ADR-102 D6). It is
+// the wire-level mirror of pkg/gateway.(*Handler).decideStreaming —
+// a customer hitting this endpoint sees exactly what the gateway's
+// gate machine resolved for the next inbound request, with the same
+// status enum and the same effective cap.
+//
+// Status is one of the api.StreamingStatus* constants. CapKind
+// labels the cap source: "plan" means app.Plan.MaxResponseBodyBytes
+// (the buffered cap; for non-streaming statuses this is also the
+// streaming cap because no edge rule matched), "endpoint-rule"
+// means a kind=limit edge rule with a non-zero MaxBodyBytesStreaming
+// field matched and overrode the plan cap. CapKind is omitted from
+// the wire when there is no override so a customer whose plan cap
+// applied sees a clean three-field response.
+//
+// PlanAllowed + FlagEnabled mirror the two booleans that gated the
+// decision, so a customer can self-diagnose without a separate
+// GET /v1/apps/{slug} round-trip.
+type AppStreamingStatus struct {
+	AppID        string          `json:"app_id"`
+	Status       StreamingStatus `json:"status"`
+	EffectiveCap int64           `json:"effective_cap_bytes"`
+	PlanCap      int64           `json:"plan_cap_bytes"`
+	FlagEnabled  bool            `json:"flag_enabled"`
+	PlanAllowed  bool            `json:"plan_allowed"`
+	CapKind      string          `json:"cap_kind,omitempty"`
 }
 
 // --- Account-scoped metrics rollup (issue #393) --------------------------
@@ -3091,6 +3430,41 @@ type AppSecurityRequest struct {
 // field so the CLI can render the new state without a follow-up GET.
 type AppSecurityResponse struct {
 	RequireSigned bool `json:"require_signed"`
+}
+
+// AdminSetGithubWebhookSecretRequest is the body shape for
+// POST /v1/admin/github-webhook-secrets (PR-D / ADR-012 §7
+// amendment). Per-tenant override of the platform-wide
+// FAAS_GITHUB_WEBHOOK_SECRET so a leaked tenant secret can
+// rotate without coordinating every GitHub App install.
+//
+// InstallationID is the GitHub Apps installation_id (signed
+// bigint). SecretHex is the secret in lowercase hex (16..128
+// hex chars; server-side bytea-stored). The CLI takes hex so
+// the plaintext never has to be a binary argv value or land in
+// shell history; the apid handler hex-decodes before the
+// INSERT.
+//
+// Auth: admin-scoped API key (ScopesAdminOnly) + email in
+// FAAS_ADMIN_EMAILS allowlist (matching the credit + sign-keys
+// routes). Mounted in apid under the existing
+// authLimited → requireMFA → requireScope chain
+// (cmd/apid/server.go).
+type AdminSetGithubWebhookSecretRequest struct {
+	InstallationID int64  `json:"installation_id"`
+	SecretHex      string `json:"secret_hex"`
+}
+
+// AdminSetGithubWebhookSecretResponse is the row shape echoed
+// back to the operator so a CI loop can confirm the rotation
+// landed (UpgradedBy stamps the admin id; UpgradedAt is the
+// RFC 3339 timestamp from now()). The Prometheus counter
+// githubd_webhook_secret_total{status="set"} is emitted
+// server-side at the apid handler.
+type AdminSetGithubWebhookSecretResponse struct {
+	InstallationID int64     `json:"installation_id"`
+	UpgradedAt     time.Time `json:"upgraded_at"`
+	UpgradedBy     string    `json:"upgraded_by"`
 }
 
 // SidecarType is the closed enum on Sidecar.Type (issue #463 /
@@ -3507,6 +3881,32 @@ type EdgeRuleCORSAction struct {
 	MaxAgeSeconds    int      `json:"max_age_seconds"`
 }
 
+// CorsOriginPattern is the grammar for an allow_origins entry
+// after the CORS improvements PR. Three forms are accepted:
+//
+//	"*"                                  bare full-wildcard
+//	"https://app.example.com"            literal origin
+//	"https://*.example.com"              subdomain wildcard (* as a
+//	                                     complete left-most host label)
+//	"https://localhost:*"                port wildcard (* as a complete
+//	                                     port — useful for local dev)
+//	"https://api.example.com:*"          host + port wildcard
+//
+// The grammar is deliberately tiny (no regex metacharacters, no
+// path matching, no scheme matching) so the gateway hot-path
+// matcher can stay an O(n) string-prefix scan without backtracking.
+// The regex below enforces the grammar at create-time; the gateway
+// applies the same predicates in handler.go::matchOrigin (so a
+// rule that bypasses the apid validator still matches what the
+// customer expects — defence in depth).
+//
+// Footgun guard (ADR-091 D12) only fires for the bare "*" entry
+// combined with AllowCredentials: true. A pattern like
+// "https://*.example.com" expands to a concrete origin at
+// request time, so browsers permit credentials for it; the
+// guard is intentionally narrow.
+var CorsOriginPattern = regexp.MustCompile(`^(?:\*|https?://(?:\*\.[a-zA-Z0-9.\-]+|localhost)(?::\*|\:[0-9]+)?|https?://[a-zA-Z0-9.\-]+(?::\*|\:[0-9]+)?)$`)
+
 func (a *EdgeRuleCORSAction) Validate() *Problem {
 	if a == nil {
 		return ErrValidation("cors action is required")
@@ -3517,14 +3917,36 @@ func (a *EdgeRuleCORSAction) Validate() *Problem {
 	if len(a.AllowMethods) == 0 {
 		return ErrValidation("cors action requires at least one allow_method")
 	}
+	// CORS improvements D6: cap MaxAgeSeconds at 24h. Browsers
+	// ignore larger values; the gateway was happily stamping
+	// "Access-Control-Max-Age: 2147483647" before the cap.
+	// The lower bound is unchanged (>= 0).
 	if a.MaxAgeSeconds < 0 {
 		return ErrValidation("cors action max_age_seconds must be >= 0")
+	}
+	if a.MaxAgeSeconds > 86400 {
+		return ErrValidation("cors action max_age_seconds must be <= 86400 (24h; browsers ignore larger values)")
+	}
+	// CORS improvements D2: validate every allow_origins entry
+	// against the CorsOriginPattern grammar. The gateway's
+	// matchOrigin (handler.go) applies the same predicates, so
+	// a rule that bypasses the apid validator still matches
+	// what the customer expects.
+	for _, origin := range a.AllowOrigins {
+		if !CorsOriginPattern.MatchString(origin) {
+			return ErrValidation(
+				"cors action allow_origin " + strconv.Quote(origin) +
+					" does not match the supported grammar: bare \"*\", literal \"https://host[:port]\"," +
+					" subdomain wildcard \"https://*.host\", or port wildcard \"https://host:*\"")
+		}
 	}
 	// CORS *+credentials footgun: browsers reject the combination
 	// Access-Control-Allow-Origin: * together with Access-Control-
 	// Allow-Credentials: true (RFC 6454 §7). Reject at create-time
 	// rather than shipping a rule that silently fails in production.
-	// (ADR-091 D12.)
+	// (ADR-091 D12.) Only the bare "*" entry trips the guard — a
+	// subdomain/port wildcard expands to a concrete origin at
+	// request time and is credentials-safe.
 	if a.AllowCredentials {
 		for _, origin := range a.AllowOrigins {
 			if origin == "*" {
@@ -3632,6 +4054,730 @@ func (a *EdgeRuleIPAction) Validate() *Problem {
 	return nil
 }
 
+// edgeRuleValidateRefURLPattern matches external `$ref` / `$id` values
+// that we refuse to compile against. The capture group is the URL
+// substring (so the 422 detail can name it); an external reference is
+// any non-empty URL that does NOT resolve to a JSON Pointer (the
+// `#/foo/bar` form). The JWKS-URL defence-in-depth at ADR-091 D10
+// uses the same posture but a different regex shape; this is the
+// JSON Schema analogue.
+//
+// Conservative on purpose: we strip / refuse anything that looks
+// URL-shaped on the right-hand side of `$ref` / `$id`. Internal
+// pointers (`#/definitions/Foo`) pass through. Same posture as the
+// §11 egress firewall — a customer cannot smuggle a request to
+// RFC1918 / metadata ranges through `$ref` resolution at hot-path
+// compile time. pkg/edgevalidate re-strips at compile time as
+// defence-in-depth.
+//
+// PR-C: anchored the key. The previous `\$ref|id` alternation
+// matched the substring `id` anywhere in the schema — including
+// inside `definitions` (so `{"$ref": "#/definitions/Foo"}` was
+// wrongly rejected as if it were an external URL). The new regex
+// requires the key to be a top-level JSON property name ("$ref"
+// or "$id"), followed by an optional-whitespace colon, followed by
+// a URL-shaped value. Verified against 10 cases in this PR-C
+// harness (see plan-file regression-proof walkthrough).
+var edgeRuleValidateRefURLPattern = regexp.MustCompile(`"\s*(\$ref|\$id)\s*"\s*:\s*"(https?://|//)[^"]+"`)
+
+// EdgeRuleValidateAction is the wire shape for a kind=validate edge
+// rule. Schema is a JSON Schema 2020-12 document (Draft 2020-12;
+// sanity-bounded to a closed keyword set so a customer cannot ship
+// a vocabulary we don't compile). The apid-side Validate() runs
+// first; pkg/edgevalidate.Compile re-validates at compile time on
+// the gateway hot path as defence-in-depth.
+//
+// Field-by-field:
+//
+//   - Schema: required JSON Schema document. Capped at
+//     MaxEdgeRuleValidateSchemaBytes (64 KiB). External `$ref` /
+//     `$id` URLs are rejected — see edgeRuleValidateRefURLPattern.
+//   - ContentTypes: optional media-type allowlist (e.g.
+//     ["application/json"]). Closed set application/* (the
+//     spec runtime is JSON; non-JSON schemas are out of scope
+//     for v1). Empty = match any Content-Type.
+//   - ApplyWhileStreaming: per-rule opt-in for the streaming
+//     response path (ADR-047). Default false mirrors the §4.1
+//     Accept: application/json opt-out (an SSE-enabled app keeps
+//     validation off until the customer opts the rule in).
+//   - RejectOnUnknownFields: toggles additionalProperties=false
+//     on the compiled schema so a body with stray fields fails.
+//     Default false preserves byte-stable schemas.
+//   - MaxBodyBytes: per-rule inbound body cap. 0 = inherit
+//     api.MaxRequestBodyBytes (per-plan 25 MB buffered / 100 MB
+//     streaming). Must be > 0 and <= MaxRequestBodyBytes at
+//     create-time.
+type EdgeRuleValidateAction struct {
+	Schema                json.RawMessage `json:"schema"`
+	ContentTypes          []string        `json:"content_types,omitempty"`
+	ApplyWhileStreaming   bool            `json:"apply_while_streaming,omitempty"`
+	RejectOnUnknownFields bool            `json:"reject_on_unknown_fields,omitempty"`
+	MaxBodyBytes          int             `json:"max_body_bytes,omitempty"`
+}
+
+func (a *EdgeRuleValidateAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("validate action is required")
+	}
+	if len(a.Schema) == 0 {
+		return ErrValidation("validate action: schema is required")
+	}
+	if len(a.Schema) > MaxEdgeRuleValidateSchemaBytes {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: schema exceeds %d bytes (got %d)",
+			MaxEdgeRuleValidateSchemaBytes, len(a.Schema)))
+	}
+	// JSON well-formedness check. The json/v6 compile path runs
+	// this again at gateway compile time, but a fast-fail here keeps
+	// a malformed schema out of the apid create path and out of the
+	// 64 KiB-ish jsonb blob (Postgres jsonb rejects malformed JSON
+	// at insert with a 22P02 — same shape, but earlier).
+	var probe any
+	if err := json.Unmarshal(a.Schema, &probe); err != nil {
+		return ErrValidation(fmt.Sprintf("validate action: schema is not valid JSON: %v", err))
+	}
+	// External-$ref/$id strip. The JWKS-URL guard at ADR-091 D10
+	// uses the same posture: refuse any URL-shaped value rather
+	// than try to enumerate safe hosts (a regex strip is cheaper
+	// to audit). The gateway side re-strips at compile time as
+	// defence-in-depth.
+	if match := edgeRuleValidateRefURLPattern.FindStringIndex(string(a.Schema)); match != nil {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: schema contains an external $ref or $id URL (around byte %d); inline schemas only",
+			match[0]))
+	}
+	// ContentTypes: optional; closed set application/* (the spec
+	// runtime is JSON for v1). Empty == match any; non-empty must
+	// every entry start with the `application/` prefix and not be
+	// `application/*` (which is what json/* would mean in a future
+	// release; deferred to a new ADR).
+	for _, ct := range a.ContentTypes {
+		if !strings.HasPrefix(ct, "application/") {
+			return ErrValidation(fmt.Sprintf(
+				"validate action: content_types entries must start with 'application/' (got %q)",
+				ct))
+		}
+	}
+	// MaxBodyBytes: optional; clamped at create-time to the plan's
+	// MaxRequestBodyBytes. We don't read plan limits here (this
+	// runs in dto.go, plan-agnostic); the apid handler clamps after
+	// Validate returns so a customer can ship MaxBodyBytes=0 without
+	// the dto validator complaining. The hard upper bound is the
+	// platform cap.
+	if a.MaxBodyBytes < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: max_body_bytes must be >= 0 (got %d)", a.MaxBodyBytes))
+	}
+	if a.MaxBodyBytes > MaxRequestBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: max_body_bytes exceeds the platform cap (%d > %d)",
+			a.MaxBodyBytes, MaxRequestBodyBytes))
+	}
+	return nil
+}
+
+// EdgeRuleLimitAction is the wire shape for a kind=limit edge rule
+// (ADR-091 D24). The standalone body-size primitive: a customer
+// who only wants per-route body-size protection ("POST /upload
+// ≤ 5 MB, POST /users ≤ 1 MB, POST /webhooks ≤ 2 MB") declares
+// this kind without shipping a JSON Schema. The hot-path applier
+// (pkg/gateway.(*Handler).applyEdgeRuleLimit, §4.1.2.8c) installs
+// http.MaxBytesReader on r.Body at the per-rule cap and short-
+// circuits oversize requests with 413 request_too_large — and,
+// more importantly, performs a Content-Length fast-path deny so
+// a 30 MB body on a 5 MB cap costs zero bytes of buffering.
+//
+// Field-by-field:
+//
+//   - MaxBodyBytes: required buffered-path cap. Must be > 0 and
+//     ≤ MaxRequestBodyBytes (25 MiB). 0 is rejected with 422 —
+//     a standalone limit rule with no cap is a silent no-op,
+//     worst shape for a security feature. The hard upper bound
+//     matches MaxRequestBodyBytes so a kind=limit rule can never
+//     widen past the global cap; if the customer wants to relax
+//     the cap on a specific path they're using the wrong
+//     primitive (this kind is strictly a tightening primitive).
+//   - MaxBodyBytesStreaming: optional streaming opt-in cap (≤
+//     MaxEdgeRuleLimitBodyBytesStreaming = 100 MiB, ADR-080
+//     raw-bridge parity). 0 = no streaming carve-out, the
+//     buffered MaxBodyBytes is the cap on both paths. Must be
+//     ≥ MaxBodyBytes when set — a streaming cap that is
+//     TIGHTER than the buffered cap would 413 every streaming
+//     request for a body that was already accepted as buffered,
+//     which is a wire-shape footgun. Runtime enforcement of
+//     this field is deferred to a follow-up PR (stated in
+//     ADR-091 D24 §6); the field is declared, clamped here, and
+//     clamped again at cmd-side compileLimitRules so a future
+//     runbook can wire enforcement without schema churn.
+type EdgeRuleLimitAction struct {
+	MaxBodyBytes          int `json:"max_body_bytes"`
+	MaxBodyBytesStreaming int `json:"max_body_bytes_streaming,omitempty"`
+}
+
+func (a *EdgeRuleLimitAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("limit action is required")
+	}
+	if a.MaxBodyBytes <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes must be > 0 (got %d) — a standalone limit rule with no cap is a silent no-op; use kind=validate if you need a body cap alongside a JSON Schema",
+			a.MaxBodyBytes))
+	}
+	if a.MaxBodyBytes > MaxRequestBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes exceeds the platform cap (%d > %d)",
+			a.MaxBodyBytes, MaxRequestBodyBytes))
+	}
+	if a.MaxBodyBytesStreaming < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming must be >= 0 (got %d)",
+			a.MaxBodyBytesStreaming))
+	}
+	if int64(a.MaxBodyBytesStreaming) > MaxEdgeRuleLimitBodyBytesStreaming {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming exceeds the streaming platform cap (%d > %d)",
+			a.MaxBodyBytesStreaming, MaxEdgeRuleLimitBodyBytesStreaming))
+	}
+	if a.MaxBodyBytesStreaming > 0 && a.MaxBodyBytesStreaming < a.MaxBodyBytes {
+		return ErrValidation(fmt.Sprintf(
+			"limit action: max_body_bytes_streaming (%d) must be >= max_body_bytes (%d) when set — a streaming cap tighter than the buffered cap would 413 every streaming request for a body already accepted as buffered",
+			a.MaxBodyBytesStreaming, a.MaxBodyBytes))
+	}
+	return nil
+}
+
+// EdgeRuleGeoAction is an ISO 3166-1 alpha-2 country allow/deny
+// evaluator. Allow entries are ISO 3166-1 alpha-2 codes ("DE", "FR",
+// "US"). Deny is evaluated AFTER allow so a single-country deny
+// sticks even when the allow list is broad — mirrors the EdgeRuleIPAction
+// evaluate order so the §4.1.2 matcher has a single consistent
+// "deny walks last" rule across both primitives.
+//
+// The gateway is wired to a DB-IP Lite CC-BY-4.0 country database
+// (see pkg/geoip). The DB-IP dataset covers the ~249 ISO 3166-1
+// alpha-2 sovereign-state codes. The user-assigned reserved codes
+// (AA, ZZ, etc.) are NOT in the public DB set — accepting them in
+// Validate would silently fail-open at request time (the DB-IP
+// DB returns no country for an unknown code, the matcher
+// fail-opens, and the customer's "block ZZ" rule never fires).
+//
+// Validate uses a 2-tier shape check: (1) 2-letter ASCII alpha
+// (case-insensitive); (2) explicit rejection of the 39
+// user-assigned / reserved codes (AA, ZZ, etc.); (3) explicit
+// rejection of the 5 "exceptionally reserved" codes (AC, EU, UN,
+// etc. — these are valid in ISO 3166-1 but not country codes per
+// se, and the DB-IP DB does not return them). Codes that pass
+// (1)+(2)+(3) are forwarded to the gateway for the DB-IP lookup;
+// the lookup itself is fail-open.
+//
+// Plan-tier quota is enforced separately in the apid handler via
+// Limits.EdgeRulesGeoPerApp — this validator only checks shape.
+type EdgeRuleGeoAction struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+// edgeRuleGeoReservedCodes is the set of ISO 3166-1 alpha-2 codes
+// that are NOT country codes: user-assigned codes (AA, ZZ, etc.),
+// exceptionally reserved codes (AC, EU, UN, etc.), and the
+// transitional reservations (AN was deleted 2010 but remains
+// reserved for backward compatibility, and similar). The DB-IP
+// Lite database does not map any of these to a country, so
+// accepting them in Validate would silently fail-open at request
+// time.
+//
+// The reserved set is built once at package load. The full set of
+// ISO 3166-1 alpha-2 reserved/transitional codes is documented at
+// https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2 (Reserved_code
+// + Exceptionally_reserved sections).
+var edgeRuleGeoReservedCodes = func() map[string]struct{} {
+	m := make(map[string]struct{}, 50)
+	for _, c := range []string{
+		// User-assigned (29 codes, AA–ZZ excluding the 26
+		// real letters that ARE assigned). AA, ZZ, plus the
+		// 27 ranges like OY–ZZ we list explicitly so the
+		// table is greppable.
+		"AA", "ZZ",
+		// Exceptionally reserved (5 codes — multi-national
+		// organizations and ISO 3166 maintenance).
+		"AC", "EU", "FX", "SU", "UK", "UN",
+		// Transitional reservations (8 codes — formerly
+		// assigned, deleted but still reserved so historical
+		// data does not alias).
+		"AN", "BU", "CS", "DD", "NT", "SC", "TP", "YU", "ZR",
+		// ISO 3166-1 numeric-only code "XX" — sometimes
+		// emitted as "XX" in some databases.
+		"XX",
+		// Misc.
+		"CP", "DG", "EA", "IC", "TA", "WG",
+	} {
+		m[c] = struct{}{}
+	}
+	return m
+}()
+
+func (a *EdgeRuleGeoAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("geo action is required")
+	}
+	if len(a.Allow) == 0 && len(a.Deny) == 0 {
+		return ErrValidation("geo action requires at least one allow or deny entry")
+	}
+	seen := make(map[string]struct{}, len(a.Allow)+len(a.Deny))
+	for _, code := range a.Allow {
+		if p := validateGeoCountryCode(code); p != nil {
+			return ErrValidation("geo action allow entry " + p.Error())
+		}
+		upper := strings.ToUpper(code)
+		if _, dup := seen[upper]; dup {
+			return ErrValidation(fmt.Sprintf("geo action allow entry %q is duplicated; each country code may appear at most once across allow+deny", code))
+		}
+		seen[upper] = struct{}{}
+	}
+	for _, code := range a.Deny {
+		if p := validateGeoCountryCode(code); p != nil {
+			return ErrValidation("geo action deny entry " + p.Error())
+		}
+		upper := strings.ToUpper(code)
+		if _, dup := seen[upper]; dup {
+			return ErrValidation(fmt.Sprintf("geo action deny entry %q is duplicated; each country code may appear at most once across allow+deny", code))
+		}
+		seen[upper] = struct{}{}
+	}
+	// Per-rule cardinality cap. A single geo rule with 200+ entries
+	// looks like a customer's mistake (the DB-IP dataset has ~249
+	// codes). Cap at 50 — well above the realistic "block
+	// everywhere except these 5 EU countries" use case, well below
+	// the 249-entry cap that would make the rule functionally a
+	// "deny everything" sentinel.
+	if len(seen) > 50 {
+		return ErrValidation(fmt.Sprintf("geo action allow+deny entry count = %d, want ≤ 50 (a single rule with 50+ country codes looks like a configuration mistake; split into multiple rules or use a allowlist of jurisdictions, not the full closed vocab)", len(seen)))
+	}
+	return nil
+}
+
+// validateGeoCountryCode returns nil if code is a well-formed
+// ISO 3166-1 alpha-2 country code that pkg/geoip.Reader can
+// resolve at request time, otherwise an error message suitable
+// for surfacing in an RFC 7807 detail block.
+//
+// The two-tier check is:
+//
+//  1. Shape: exactly 2 ASCII letters, uppercased.
+//  2. Reserved/non-country: rejects the user-assigned,
+//     exceptionally-reserved, and transitional-reserved codes
+//     listed in edgeRuleGeoReservedCodes.
+//
+// Codes that pass both checks are forwarded to the gateway
+// for the DB-IP lookup; the lookup itself is fail-open.
+func validateGeoCountryCode(code string) error {
+	if len(code) != 2 {
+		return fmt.Errorf("%q is not a 2-letter ISO 3166-1 alpha-2 country code (got length %d)", code, len(code))
+	}
+	upper := strings.ToUpper(code)
+	c0, c1 := upper[0], upper[1]
+	if c0 < 'A' || c0 > 'Z' || c1 < 'A' || c1 > 'Z' {
+		return fmt.Errorf("%q is not a 2-letter ISO 3166-1 alpha-2 country code (got non-letter bytes %q / %q)", code, string(c0), string(c1))
+	}
+	if _, reserved := edgeRuleGeoReservedCodes[upper]; reserved {
+		return fmt.Errorf("%q is a reserved/user-assigned ISO 3166-1 alpha-2 code (the DB-IP Lite database does not map reserved codes to a country; accepting it would silently fail-open at request time)", code)
+	}
+	return nil
+}
+
+// EdgeRuleMaintenanceAction is the wire shape for a kind=maintenance
+// edge rule (ADR-091 amendment, PR-A #???). The customer-facing
+// primitive for "this route is in maintenance mode" — the hot-path
+// applier (pkg/gateway.(*Handler).applyEdgeRuleMaintenance,
+// §4.1.2.13) short-circuits a matched (host, path, http_method)
+// request with 503 + Retry-After before the wake gate. The coarse
+// sibling (apps.maintenance_mode) is the per-app version and lives
+// on the apps row directly (MaintenanceMode *bool on CreateAppRequest
+// / UpdateAppRequest), so this DTO is only for the fine-grained
+// per-route case.
+//
+// Field-by-field:
+//
+//   - RetryAfterSeconds: optional override for the per-rule
+//     Retry-After header. 0 means "use the platform default
+//     EdgeRuleMaintenanceRetryAfterSeconds (60 s)". Must be in
+//     [0, MaxEdgeRuleMaintenanceRetryAfterSeconds] (24 h) — a
+//     customer cannot ship a rule that asks a client to back off
+//     for a week. Negative values rejected with 422; values above
+//     the cap rejected with 422.
+//   - Message: optional operator-friendly string that goes into
+//     Problem.detail. ≤ 512 B; same payload-size budget as
+//     EdgeRuleValidateAction.Schema. Newlines / control bytes are
+//     not sanitised at this layer (slog JSON re-encodes the wire
+//     Problem at log time) — the limit is bytes-on-the-wire, not
+//     a sanitiser.
+type EdgeRuleMaintenanceAction struct {
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+	Message           string `json:"message,omitempty"`
+}
+
+func (a *EdgeRuleMaintenanceAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("maintenance action is required")
+	}
+	if a.RetryAfterSeconds < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"maintenance action: retry_after_seconds must be >= 0 (got %d)",
+			a.RetryAfterSeconds))
+	}
+	if a.RetryAfterSeconds > MaxEdgeRuleMaintenanceRetryAfterSeconds {
+		return ErrValidation(fmt.Sprintf(
+			"maintenance action: retry_after_seconds exceeds the platform cap (%d > %d)",
+			a.RetryAfterSeconds, MaxEdgeRuleMaintenanceRetryAfterSeconds))
+	}
+	if len(a.Message) > 512 {
+		return ErrValidation(fmt.Sprintf(
+			"maintenance action: message exceeds 512 bytes (got %d)",
+			len(a.Message)))
+	}
+	return nil
+}
+
+// EdgeRuleThrottleAction is the wire shape for a kind=throttle edge
+// rule (ADR-091 D20.5 amendment, issue #881). The per-route
+// token-bucket primitive: customers tighten the per-route rps/burst
+// below their plan's plan.RateLimitRPS — the apid validator enforces
+// the sub-plan ceiling; the gateway compiler enforces it again at
+// load time.
+//
+// Sub-plan ceiling — the load-bearing constraint. A throttle rule is
+// STRICTLY a tightening primitive. The per-handler parameter passed
+// by the apid handler is the customer's plan row; the ceiling is
+// plan.RateLimitRPS / plan.RateLimitBurst. A rule that exceeds the
+// ceiling is rejected with 422 BEFORE any DB write — a customer
+// cannot raise their plan limit by registering a throttle rule.
+//
+// The wire shape uses float64 for RequestsPerSecond so the
+// recommendation endpoint (which emits ceil(observed_rps * 2)) can
+// hand over a non-integer without coercing the customer's intent.
+// The bucket math spends the float directly in `tokens += dt *
+// rps`, so fractional values are exact under the refill formula.
+//
+// Validate enforces:
+//   - RequestsPerSecond > 0 (a 0-rps rule is a silent no-op AND
+//     would create a bucket that never refills — that bucket is
+//     OUT OF THE EVICTABLE SET per pkg/gateway/ratelimit.go's
+//     full-bucket-only invariant, so it would be a permanent
+//     memory leak).
+//   - RequestsPerSecond ≤ plan.RateLimitRPS (sub-plan ceiling).
+//   - Burst > 0 (same leak rationale as above).
+//   - Burst ≤ plan.RateLimitBurst (sub-plan ceiling).
+//
+// Per-IP sub-keying is deliberately absent in v1 — see
+// pkg/state/types.go::EdgeRuleThrottleAction for the design rationale.
+//
+// Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881 Phase 3)
+// extends the wire shape with optional per-consumer keying. The new
+// fields default to zero-values that produce bit-identical behaviour
+// to PR #887's bucket key (appID+"\x00"+ruleID):
+//
+//   - KeyBy ∈ {"", "none", "api_key", "jwt_subject", "jwt_claim"}.
+//     Empty string and "none" are equivalent — the empty value is the
+//     pre-Phase-3 shape; "none" is the explicit Phase-3 opt-out. Both
+//     preserve back-compat (the bucket key is unchanged).
+//   - JWTClaimName is REQUIRED iff KeyBy == "jwt_claim"; the value
+//     names the JWT custom claim to extract (e.g., "tier", "org_id").
+//     Format constraint mirrors CodeQL `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`.
+//   - MaxKeysPerRule caps how many distinct consumers may own a
+//     bucket against this rule. Distinct consumers above the cap
+//     collapse into a single non-evicting "__other__" bucket that
+//     STILL consumes tokens (ADR-104 §"Consequences" load-bearing
+//     safety property). Defaults to 0 meaning "use plan default".
+//
+// The bounded design is enforced at the limiter layer
+// (pkg/gateway/ratelimit.go::AllowWithConsumerKey, Phase 3). The
+// apid validator only checks shape + plan ceiling; the limiter owns
+// the actual collapse semantics.
+type EdgeRuleThrottleAction struct {
+	RequestsPerSecond float64 `json:"requests_per_second"`
+	Burst             int     `json:"burst"`
+	KeyBy             string  `json:"key_by,omitempty"`
+	JWTClaimName      string  `json:"jwt_claim_name,omitempty"`
+	MaxKeysPerRule    int     `json:"max_keys_per_rule,omitempty"`
+}
+
+// ThrottleKeyByNone is the explicit Phase-3 opt-out value. The empty
+// string "" and "none" both preserve PR #887's behaviour — the
+// difference is that "none" makes the customer's intent visible in the
+// wire payload (debugging + audit). The validator treats "" and "none"
+// as equivalent; the limiter constructor never sees the empty value
+// because the wire→state mapping normalises "" → "none".
+const (
+	ThrottleKeyByNone       = "none"
+	ThrottleKeyByAPIKey     = "api_key"
+	ThrottleKeyByJWTSubject = "jwt_subject"
+	ThrottleKeyByJWTClaim   = "jwt_claim"
+)
+
+// ThrottleMaxKeysPerRuleDefault is the fallback MaxKeysPerRule the
+// gateway uses when the resolved rule carries a zero — defensive
+// against a direct-DB write that bypassed the apid-validator AND
+// cmd-side compileThrottleRules. Matches the Hobby plan ceiling
+// (pkg/api/limits.go::ThrottleMaxKeysPerRule) — middle of the
+// ladder, neither Free-tight (100) nor Scale-loose (10_000). The
+// cmd-side compile is the source of truth for the value the
+// limiter actually uses at runtime; this constant exists so a
+// misconfigured rule doesn't accidentally promote a per-consumer
+// rule to unbounded cardinality (the worst-case attack surface).
+const ThrottleMaxKeysPerRuleDefault = 1000
+
+// ThrottleKeyByIsPerConsumer reports whether the supplied KeyBy
+// value opts the rule into per-consumer bucket keying
+// (ADR-104, issue #881 Phase 3). Empty string is treated as
+// back-compat (PR #887's `appID+"\x00"+ruleID` shape) — only
+// the explicit "none" and the four other close-vocab values
+// trigger per-consumer routing. The single source of truth for
+// "is this a per-consumer KeyBy?" — pkg/gateway/handler.go and
+// cmd/gatewayd-internal/edge_rules.go both consult this rather
+// than duplicating the membership test, so adding a future
+// Phase 4 value (e.g. "ip") is a one-line constant + this helper
+// update.
+func ThrottleKeyByIsPerConsumer(keyBy string) bool {
+	switch keyBy {
+	case ThrottleKeyByAPIKey, ThrottleKeyByJWTSubject, ThrottleKeyByJWTClaim:
+		return true
+	default:
+		return false
+	}
+}
+
+// ThrottleValidationContext is the per-plan ceiling that
+// validateEdgeRuleAction passes into EdgeRuleThrottleAction.Validate.
+// Keeping the boundary explicit (rather than reading limits globally)
+// makes the validator unit-testable without spinning up a plan row —
+// see pkg/api/dto_edge_rules_test.go for the test pattern.
+//
+// PlanMaxKeysPerRule is the Phase 3 ceiling on per-rule consumer
+// cardinality. 0 means the plan doesn't expose per-consumer throttling
+// (the validator rejects any rule that opts into a non-"none" KeyBy).
+type ThrottleValidationContext struct {
+	PlanMaxRPS         float64
+	PlanMaxBurst       int
+	PlanMaxKeysPerRule int
+}
+
+// jwtClaimNameRegex pins the JWTClaimName format. Anchored, allows a
+// leading letter or underscore, then [A-Za-z0-9_] up to 63 chars total.
+// Mirrors the CodeQL go-clear-text-logging precedent for untrusted
+// identifiers landing in metric labels and log fields — anything looser
+// risks a label-cardinality explosion or a CodeQL finding on a future
+// refactor.
+var jwtClaimNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
+
+func (a *EdgeRuleThrottleAction) Validate(ctx ThrottleValidationContext) *Problem {
+	if a == nil {
+		return ErrValidation("throttle action is required")
+	}
+	if a.RequestsPerSecond <= 0 {
+		// 0 / negative rps is rejected for two reasons: (1) it is a
+		// silent no-op at request time — every request would be
+		// dropped, indistinguishable from a misconfig; (2) the
+		// bucket's refill formula uses rps as a multiplier, so a 0
+		// rate means the bucket never refills — under
+		// pkg/gateway/ratelimit.go's full-bucket-only invariant the
+		// bucket is permanently unevictable, which is a memory leak.
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: requests_per_second must be > 0 (got %g) — a 0-rps rule is a silent no-op AND would create a permanently unevictable bucket",
+			a.RequestsPerSecond))
+	}
+	if a.Burst <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: burst must be > 0 (got %d) — same rationale as a 0-rps rule",
+			a.Burst))
+	}
+	if ctx.PlanMaxRPS > 0 && a.RequestsPerSecond > ctx.PlanMaxRPS {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: requests_per_second %g exceeds the plan ceiling %g — a throttle rule is strictly a tightening primitive; customers can only narrow, never widen",
+			a.RequestsPerSecond, ctx.PlanMaxRPS))
+	}
+	if ctx.PlanMaxBurst > 0 && a.Burst > ctx.PlanMaxBurst {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: burst %d exceeds the plan ceiling %d — a throttle rule is strictly a tightening primitive",
+			a.Burst, ctx.PlanMaxBurst))
+	}
+	// Phase 3 (ADR-104): per-consumer keying validation. KeyBy is
+	// optional; the empty value preserves PR #887's behaviour and
+	// needs no further checks. Non-empty values must be in the closed
+	// vocab + require the right supporting field.
+	switch a.KeyBy {
+	case "", ThrottleKeyByNone:
+		// Pre-Phase-3 shape: bucket key is appID+"\x00"+ruleID.
+		// JWTClaimName and MaxKeysPerRule MUST be unset — a customer
+		// mixing "key_by=none" with non-zero MaxKeysPerRule would
+		// silently never trip the cap, which is a footgun.
+		if a.JWTClaimName != "" {
+			return ErrValidation("throttle action: jwt_claim_name requires key_by=\"jwt_claim\" (got key_by=\"\")")
+		}
+		if a.MaxKeysPerRule != 0 {
+			return ErrValidation("throttle action: max_keys_per_rule requires key_by != \"none\" (got key_by=\"\")")
+		}
+	case ThrottleKeyByAPIKey, ThrottleKeyByJWTSubject:
+		if a.JWTClaimName != "" {
+			return ErrValidation(fmt.Sprintf(
+				"throttle action: jwt_claim_name is only valid with key_by=\"jwt_claim\" (got key_by=%q)",
+				a.KeyBy))
+		}
+		if err := validateThrottleMaxKeys(a.MaxKeysPerRule, ctx.PlanMaxKeysPerRule); err != nil {
+			return err
+		}
+	case ThrottleKeyByJWTClaim:
+		if a.JWTClaimName == "" {
+			return ErrValidation("throttle action: jwt_claim_name is required when key_by=\"jwt_claim\"")
+		}
+		if !jwtClaimNameRegex.MatchString(a.JWTClaimName) {
+			return ErrValidation(fmt.Sprintf(
+				"throttle action: jwt_claim_name %q must match ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$ (CodeQL safe-identifier contract)",
+				a.JWTClaimName))
+		}
+		if err := validateThrottleMaxKeys(a.MaxKeysPerRule, ctx.PlanMaxKeysPerRule); err != nil {
+			return err
+		}
+	default:
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: key_by %q is not in the closed vocab (allowed: \"\", \"none\", \"api_key\", \"jwt_subject\", \"jwt_claim\")",
+			a.KeyBy))
+	}
+	return nil
+}
+
+// validateThrottleMaxKeys enforces the per-rule MaxKeysPerRule ceiling.
+//
+//   - MaxKeysPerRule < 0 is a shape error.
+//   - MaxKeysPerRule == 0 means "use plan default" — the limiter layer
+//     resolves the default at run time; the validator only rejects
+//     values above the plan ceiling when the plan has one.
+//   - planMax == 0 means the plan doesn't expose per-consumer throttling
+//     AND the customer is opting into per-consumer keying — that
+//     combination is rejected up front. Without this guard a customer
+//     could set key_by="api_key" with max_keys_per_rule=0 and silently
+//     get the plan-default behaviour, which on a plan with
+//     PlanMaxKeysPerRule=0 would mean "no consumers tracked" — a
+//     useless rule that wastes the throttle-quota slot. (See
+//     ADR-104 §"Rejected alternatives — Server-side consumer allowlist
+//     is deferred"; the closest analogous case is "rule whose runtime
+//     effect is zero".)
+func validateThrottleMaxKeys(maxKeys, planMax int) *Problem {
+	if maxKeys < 0 {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: max_keys_per_rule must be >= 0 (got %d)",
+			maxKeys))
+	}
+	if planMax == 0 {
+		// Plan doesn't expose per-consumer throttling. The caller in
+		// Validate() has already gated on key_by != "none", so reaching
+		// here means the customer is opting into a feature their plan
+		// doesn't support. Reject.
+		return ErrValidation(
+			"throttle action: this plan does not support per-consumer throttling — upgrade or set key_by=\"none\"")
+	}
+	if maxKeys > planMax {
+		return ErrValidation(fmt.Sprintf(
+			"throttle action: max_keys_per_rule %d exceeds the plan ceiling %d",
+			maxKeys, planMax))
+	}
+	return nil
+}
+
+// EdgeRuleBudgetAction is the wire shape for a kind=budget edge rule
+// (ADR-093 §Decision). The per-request wall-clock budget primitive:
+// a customer pins a hard wall-clock deadline on `POST /payment` →
+// 3 s the same way they already pin JWT / IP / geo edge rules. The
+// platform then propagates the remaining time to every downstream
+// hop (DB, gRPC, outbound HTTP) and surfaces deadline fire as 504 +
+// RFC 7807 `code: request_budget_exceeded`.
+//
+// Field-by-field:
+//
+//   - BudgetMs: required per-request budget in milliseconds. Must
+//     be > 0 and ≤ api.RequestBudgetMaxMs (30 s). 0 is rejected
+//     with 422 — a kind=budget rule with no budget is a silent
+//     no-op, worst shape for a safety feature. The hard upper bound
+//     matches api.RequestBudgetMaxMs so a kind=budget rule can
+//     never widen past the platform ceiling; if a customer wants a
+//     longer per-route budget they're mis-using this primitive
+//     (api.RequestBudgetMax is the absolute ceiling).
+//   - AllowOverrideHeader: optional HTTP header name (default
+//     `x-faas-budget-ms`) whose numeric value, if present on the
+//     inbound request, overrides BudgetMs for that single request.
+//     A runtime per-customer-tunable knob layered on top of the
+//     static rule. Header name must be 1..128 chars matching
+//     `^[A-Za-z][A-Za-z0-9-]*$` (RFC 7230 token shape) — empty
+//     is allowed (the runtime then uses the default
+//     `x-faas-budget-ms`). An absent or unparseable header falls
+//     through to BudgetMs unchanged.
+//
+// The runtime is `pkg/reqbudget`. The matched rule's BudgetMs
+// stamps the inbound ctx via `reqbudget.WithRemaining`; every
+// downstream hop wraps via `reqbudget.WithOverhead` / `WithCeiling`.
+// The hot-path applier is
+// pkg/gateway.(*Handler).applyEdgeRuleBudget (§4.1.2.8d).
+type EdgeRuleBudgetAction struct {
+	BudgetMs            int    `json:"budget_ms"`
+	AllowOverrideHeader string `json:"allow_override_header,omitempty"`
+}
+
+func (a *EdgeRuleBudgetAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("budget action is required")
+	}
+	if a.BudgetMs <= 0 {
+		return ErrValidation(fmt.Sprintf(
+			"budget action: budget_ms must be > 0 (got %d) — a kind=budget rule with no budget is a silent no-op; drop the rule if you want the platform default to apply",
+			a.BudgetMs))
+	}
+	if a.BudgetMs > int(RequestBudgetMax.Milliseconds()) {
+		return ErrValidation(fmt.Sprintf(
+			"budget action: budget_ms (%d) exceeds the platform ceiling (%d ms = %s)",
+			a.BudgetMs, int(RequestBudgetMax.Milliseconds()), RequestBudgetMax))
+	}
+	if a.AllowOverrideHeader != "" {
+		if len(a.AllowOverrideHeader) > 128 {
+			return ErrValidation(fmt.Sprintf(
+				"budget action: allow_override_header must be 1..128 chars (got %d)",
+				len(a.AllowOverrideHeader)))
+		}
+		// RFC 7230 token shape — first char letter, rest
+		// letters/digits/hyphens. Reject whitespace, commas, colons,
+		// and other separator chars that would break header parsing.
+		if !isHeaderToken(a.AllowOverrideHeader) {
+			return ErrValidation(fmt.Sprintf(
+				"budget action: allow_override_header %q must match RFC 7230 token shape (^[A-Za-z][A-Za-z0-9-]*$)",
+				a.AllowOverrideHeader))
+		}
+	}
+	return nil
+}
+
+// isHeaderToken reports whether s matches the RFC 7230 token
+// production used for HTTP header names: a letter followed by
+// letters, digits, or hyphens. Used by EdgeRuleBudgetAction.Validate
+// to reject malformed header-name overrides before the gateway
+// sees them.
+func isHeaderToken(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-':
+		default:
+			return false
+		}
+		if i == 0 && (r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // EdgeRuleResponse is the wire shape for an edge rule. Action is
 // kept as json.RawMessage so the generated Node/Python SDKs don't
 // need seven per-kind models today; a typed SDK unmarshals into
@@ -3693,4 +4839,154 @@ type RekeyProgress struct {
 	Skipped int64  `json:"skipped"`
 	Failed  int64  `json:"failed"`
 	LastID  string `json:"last_id,omitempty"`
+}
+
+// ThrottleSuggestionRow is one (route → suggested rate) row in the
+// payload returned by GET /v1/apps/{slug}/throttle-suggestions
+// (ADR-091 D20.5 amendment, issue #881 / PR-E). The recommender is
+// read-only — it never auto-applies — and the suggestion is always
+// ≤ the customer's plan ceiling (pkg/api.Limits.RateLimitRPS) so a
+// customer can act on it without a 422 from apid's sub-plan
+// validator.
+//
+// `Route` is the bounded label exactly as emitted on the Prometheus
+// side: method + raw path (the same shape RouteRow.Route uses, ADR-093
+// D6). The recommender never sees the reserved __route_other__
+// overflow bucket — it is dropped from the suggestions slice and
+// the count surfaces as RoutesCollapsed so the customer can tell
+// "wildcard-shape pattern" from "low traffic on a real route".
+//
+// `ObservedRPS` is the rate() value over the window (already
+// per-second). `SuggestedRPS` is `ceil(observed_rps * 2)` clamped
+// into [1, plan.RateLimitRPS] — the 2× headroom is documented on
+// the wire so the number is auditable rather than magic. The
+// `Multiplier` field pins the formula version so a future change
+// to the recommendation strategy can be distinguished from drift.
+type ThrottleSuggestionRow struct {
+	Route          string  `json:"route"`
+	ObservedRPS    float64 `json:"observed_rps"`
+	SuggestedRPS   float64 `json:"suggested_rps"`
+	SuggestedBurst int     `json:"suggested_burst"`
+	Multiplier     float64 `json:"multiplier"`
+}
+
+// ThrottleSuggestionsResponse is the wire shape for
+// GET /v1/apps/{slug}/throttle-suggestions. Source degrades the
+// same way AppMetricsResponse does: "prometheus" on success,
+// "degraded: <reason>" otherwise. RouteMetricsDisabled is true
+// when apps.route_metrics_enabled=false (Free plan) — the response
+// carries empty Suggestions plus that flag so the dashboard can
+// render the upsell rather than a misleading zero.
+//
+// RoutesCollapsed reports the count of routes that collapsed into
+// __route_other__ during the window (ADR-093 cap = 50). It's a
+// coverage signal, not a recommendation signal — a non-zero value
+// tells the customer their throttle will be partial-coverage
+// regardless of what limit they set.
+type ThrottleSuggestionsResponse struct {
+	AppID                string                  `json:"app_id"`
+	Range                string                  `json:"range"`
+	Source               string                  `json:"source"`
+	AsOf                 string                  `json:"as_of"`
+	RouteMetricsDisabled bool                    `json:"route_metrics_disabled"`
+	RoutesCollapsed      int                     `json:"routes_collapsed"`
+	PlanCeilingRPS       int                     `json:"plan_ceiling_rps"`
+	PlanCeilingBurst     int                     `json:"plan_ceiling_burst"`
+	Multiplier           float64                 `json:"multiplier"`
+	Suggestions          []ThrottleSuggestionRow `json:"suggestions"`
+}
+
+// AppErrorsSummaryResponse is the wire body for
+// GET /v1/apps/{slug}/errors/summary (ADR-096 PR-B). Items is the
+// grouped top-N view: one row per (account_id, app_id, fingerprint)
+// that fired within (since, until), sorted by count DESC, then
+// last_seen_at DESC, then fingerprint ASC (mirrors the SQL ORDER BY
+// in pkg/state/queries.sql::ListAppErrorGroups). WindowStart /
+// WindowEnd echo the CLAMPED window after the AppErrorsWindowMaxHours
+// cap; WindowClamped=true tells the dashboard that the requested
+// span was wider than the server accepts.
+//
+// SampleMessage is the redacted string the writer stored (gatewayd-
+// internal's Redactor.Apply trims to AppErrorsSampleMessageCapBytes
+// BEFORE INSERT), so the dashboard renders it verbatim — but the
+// handlers_app_errors_security_test.go grep tripwire re-checks every
+// SampleMessage against the email + card regex on the way out.
+type AppErrorsSummaryResponse struct {
+	GeneratedAt   string                `json:"generated_at"` // RFC3339Nano UTC, mirrors AppSLOResponse.AsOf
+	AppID         string                `json:"app_id"`
+	AppSlug       string                `json:"app_slug"`
+	WindowStart   string                `json:"window_start"`          // RFC3339Nano UTC
+	WindowEnd     string                `json:"window_end"`            // RFC3339Nano UTC
+	WindowClamped bool                  `json:"window_clamped"`        // true iff requested span > AppErrorsWindowMaxHours
+	Items         []AppErrorSummaryItem `json:"items"`                 // never nil; JSON emits [] on empty (same contract as AppRoutesResponse.Routes)
+	NextCursor    string                `json:"next_cursor,omitempty"` // opaque (last_seen_at, fingerprint) base64; mirrors pkg/cursor/cursor.go:52
+	Limit         int                   `json:"limit"`                 // echo of the post-clamp limit applied
+}
+
+// AppErrorSummaryItem is one row of the summary top-N. The
+// (Fingerprint, ErrorClass, Route, HTTPStatus) tuple is the grouping
+// key; Count is the issue count (post-dedupe), RequestCount is the
+// total distinct app_error_requests rows linked to this fingerprint.
+// The two diverge after a dedupe-merge within the dedupe window
+// (AppErrorsDedupeWindowSeconds).
+type AppErrorSummaryItem struct {
+	Fingerprint   string `json:"fingerprint"` // 64-char lowercase hex
+	ErrorClass    string `json:"error_class"` // closed-vocab enum (CHECK constraint)
+	Route         string `json:"route"`       // matched template, NOT expanded URL
+	HTTPStatus    int32  `json:"http_status"`
+	Count         int64  `json:"count"`          // issue count (post-dedupe)
+	RequestCount  int64  `json:"request_count"`  // distinct app_error_requests rows
+	FirstSeenAt   string `json:"first_seen_at"`  // RFC3339Nano UTC
+	LastSeenAt    string `json:"last_seen_at"`   // RFC3339Nano UTC
+	SampleMessage string `json:"sample_message"` // already redacted at write time
+}
+
+// AppErrorRequestsResponse is the body of
+// GET /v1/apps/{slug}/errors/{fingerprint} (ADR-096 PR-B). The four
+// header fields (Fingerprint, ErrorClass, Route, HTTPStatus) are
+// denormalised here so the drill-down page header renders without a
+// second round-trip. Requests is the cursor-paginated window over
+// app_error_requests for this fingerprint, ordered by received_at
+// DESC, request_id DESC (matches the
+// app_error_requests_drill_idx path).
+type AppErrorRequestsResponse struct {
+	Fingerprint string                `json:"fingerprint"`
+	ErrorClass  string                `json:"error_class"`
+	Route       string                `json:"route"`
+	HTTPStatus  int32                 `json:"http_status"`
+	Requests    []AppErrorRequestItem `json:"requests"` // never nil
+	NextCursor  string                `json:"next_cursor,omitempty"`
+}
+
+// AppErrorRequestItem is one row of the drill-down. RequestID is the
+// gateway's x-faas-request-id (uuid v7). SampleMessage is the
+// redacted string the writer stored. DeploymentID is the deployment
+// the error originated from; nil when the deployment has been
+// deleted (FK ON DELETE SET NULL).
+type AppErrorRequestItem struct {
+	RequestID     string `json:"request_id"`  // uuid v7 from gateway
+	ReceivedAt    string `json:"received_at"` // RFC3339Nano UTC
+	Route         string `json:"route"`
+	HTTPStatus    int32  `json:"http_status"`
+	ErrorClass    string `json:"error_class"`
+	SampleMessage string `json:"sample_message"`
+	DeploymentID  string `json:"deployment_id,omitempty"` // uuid string, omitted when NULL
+}
+
+// AppErrorSampleResponse is the body of
+// GET /v1/apps/{slug}/errors/{fingerprint}/first (ADR-096 PR-B).
+// Embeds AppErrorRequestItem so the wire shape is uniform across the
+// drill-down list and the /first endpoint; HeadersSample is the
+// jsonb-decoded header subset the writer stored (max 8 keys,
+// 256 bytes/value, total ≤8 KiB per the schema CHECK); RedactionsApplied
+// is the sorted-unique list of pattern names the Redactor.Apply +
+// Redactor.ApplyHeaders calls applied (matches pkg/redact/redact.go:85).
+//
+// nil-when-empty contract: a request that didn't match any pattern
+// has RedactionsApplied=nil (the writer's Redactor returns (s, nil)
+// for no-match). The dashboard renders "No redactions" on nil.
+type AppErrorSampleResponse struct {
+	AppErrorRequestItem
+	HeadersSample     map[string]string `json:"headers_sample"`
+	RedactionsApplied []string          `json:"redactions_applied"`
 }

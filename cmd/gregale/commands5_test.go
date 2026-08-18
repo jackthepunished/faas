@@ -617,6 +617,81 @@ func TestCmdEnvPush_RejectsDirectory(t *testing.T) {
 	}
 }
 
+// TestCmdEnvPush_StrictMode_PropagatesLine is the regression pin for
+// the review finding that envPush's strict-mode path was rewriting
+// every synthesised Finding to Line=0, breaking the 1-indexed Line
+// contract that pkg/secretscan/scan.go documents for env-pairs
+// ("the 1-indexed position in the pairs slice"). A programmatic
+// consumer running `gregale env push --secret-scan=strict --json`
+// would see `"line": 0` in every secret_findings[] entry, and the
+// text-mode :N renderer would print `:0`.
+//
+// The test seeds a .env file with a poisoned pair at line 4 (after
+// three clean lines) and a Stripe key. It then runs envPush with
+// --secret-scan=strict and asserts:
+//
+//  1. exit code == 1 (strict-mode rejected)
+//  2. no PUT request was sent (server-side can't accept poisoned
+//     pairs)
+//  3. the stderr rendering shows the poisoned pair at line 4 (the
+//     `:4` part) — pinning the wire contract end-to-end through
+//     renderStrictSecretScanError.
+//
+// The fakeStripeLiveKey constant is declared in pack_test.go
+// (whitebox); we re-declare the safe-construction form here to
+// keep the secret-scanner happy on push.
+func TestCmdEnvPush_StrictMode_PropagatesLine(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, ".env")
+	body := "PORT=8080\nDATABASE_URL=postgres://u:p@h:5432/d\nGREETING=hello\n" +
+		"STRIPE_SECRET_KEY=" + "sk_live_" + "aBcDeFgHiJkLmNoPqRsTuVwXyZ" + "_XXXX" + "\n"
+	if err := os.WriteFile(envFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var puts []string
+	sink := &multiSink{onSecrets: func(method, path string) (int, any) {
+		if method == "GET" {
+			return http.StatusOK, api.AppSecretListResponse{Quota: 25}
+		}
+		if method == "PUT" {
+			parts := strings.Split(path, "/")
+			puts = append(puts, parts[len(parts)-1])
+			return http.StatusOK, nil
+		}
+		return http.StatusBadRequest, nil
+	}}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	var stderr bytes.Buffer
+	origStderr := osStderr
+	osStderr = &stderr
+	defer func() { osStderr = origStderr }()
+
+	// Restore the strict-mode flag parse path. envPush's flag
+	// string is "--secret-scan" with the closed enum values
+	// off|on|strict|source-tree.
+	code := envPush([]string{"--app", "hello", "--secret-scan", "strict", "-f", envFile})
+	if code != 1 {
+		t.Errorf("envPush --secret-scan=strict = %d, want 1 (strict mode should reject)", code)
+	}
+	if len(puts) != 0 {
+		t.Errorf("strict mode must NOT PUT to server; got %d puts: %v", len(puts), puts)
+	}
+	// Pin the wire contract: the stderr rendering must include
+	// `:4` (the line number of the poisoned pair in the seeded
+	// .env) so a CI script can grep for the offending line. The
+	// review finding was that this used to render `:0`.
+	if !strings.Contains(stderr.String(), ":4 [stripe_live]") {
+		t.Errorf("stderr should render the poisoned pair at line 4; got: %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), ":0 [") {
+		t.Errorf("stderr rendered Line=0 (review-finding #2 regression): %q", stderr.String())
+	}
+}
+
 // --- app scale / rename ---------------------------------------------------
 
 // TestCmdAppScale_RequiresLogin pins the no-token exit code (#72).
@@ -1293,6 +1368,226 @@ func TestCmdAppsDispatch_LsAlias(t *testing.T) {
 	}
 	if !hit {
 		t.Errorf("apps ls did not hit /v1/apps")
+	}
+}
+
+// --- apps routes <slug> dispatch (ADR-093 Tier B item #2) ---
+
+// TestCmdAppsDispatch_RoutesSubcommand exercises the
+// `gregale apps routes <slug>` arm added in PR-B1. Drives through
+// run() end-to-end so the dispatcher + leaf are both exercised,
+// and asserts the hit-path is /v1/apps/<slug>/routes — same as
+// `gregale app <slug> routes` (the singular form) so the two
+// dispatch arms converge on the same SDK call.
+func TestCmdAppsDispatch_RoutesSubcommand(t *testing.T) {
+	resetJSONOut(t)
+	var hit string
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.Path
+		writeJSONTest(w, api.AppRoutesResponse{
+			Slug:   "demo",
+			AppID:  "app-uuid-1",
+			Routes: []string{"GET /users"},
+			Source: "live",
+			CapHit: false,
+		})
+	}))
+	defer sink.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", sink.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := run([]string{"apps", "routes", "demo"}); code != 0 {
+		t.Errorf("run(apps routes demo) = %d, want 0", code)
+	}
+	if hit != "/v1/apps/demo/routes" {
+		t.Errorf("apps routes demo hit %q, want /v1/apps/demo/routes", hit)
+	}
+}
+
+// TestCmdAppDispatch_RoutesSubcommandSingular exercises the
+// `gregale app <slug> routes` arm added in PR-B1. Same wire
+// path as the plural form; the two should converge on the same
+// SDK call so a dashboard-redirect or alias wouldn't drift the
+// wire surface.
+func TestCmdAppDispatch_RoutesSubcommandSingular(t *testing.T) {
+	resetJSONOut(t)
+	var hit string
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.Path
+		writeJSONTest(w, api.AppRoutesResponse{
+			Slug:   "demo",
+			AppID:  "app-uuid-1",
+			Routes: []string{"GET /users"},
+			Source: "live",
+			CapHit: false,
+		})
+	}))
+	defer sink.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", sink.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := run([]string{"app", "demo", "routes"}); code != 0 {
+		t.Errorf("run(app demo routes) = %d, want 0", code)
+	}
+	if hit != "/v1/apps/demo/routes" {
+		t.Errorf("app demo routes hit %q, want /v1/apps/demo/routes", hit)
+	}
+}
+
+// --- apps streaming-cap <slug> dispatch (ADR-102 D6) ---
+
+// TestCmdAppsDispatch_StreamingCapSubcommand exercises the
+// `gregale apps streaming-cap <slug>` arm added in ADR-102 D6.
+// Drives through run() end-to-end so the dispatcher + leaf are
+// both exercised, and asserts the hit-path is
+// /v1/apps/<slug>/streaming-cap — same as the singular form
+// `gregale app <slug> streaming-cap` so the two dispatch arms
+// converge on the same SDK call.
+//
+// Mirrors TestCmdAppsDispatch_RoutesSubcommand verbatim so a
+// reviewer can compare the two side-by-side. The fixture response
+// exercises the streaming / plan-cap / flag-enabled portion of
+// the DTO; the no-flag, no-edge-rule path covers all the fields
+// the SDK currently exposes.
+func TestCmdAppsDispatch_StreamingCapSubcommand(t *testing.T) {
+	resetJSONOut(t)
+	var hit string
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.Path
+		writeJSONTest(w, api.AppStreamingStatus{
+			AppID:        "app-uuid-1",
+			Status:       api.StreamingStatusStreaming,
+			EffectiveCap: 104857600,
+			PlanCap:      104857600,
+			FlagEnabled:  true,
+			PlanAllowed:  true,
+			CapKind:      "plan",
+		})
+	}))
+	defer sink.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", sink.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := run([]string{"apps", "streaming-cap", "demo"}); code != 0 {
+		t.Errorf("run(apps streaming-cap demo) = %d, want 0", code)
+	}
+	if hit != "/v1/apps/demo/streaming-cap" {
+		t.Errorf("apps streaming-cap demo hit %q, want /v1/apps/demo/streaming-cap", hit)
+	}
+}
+
+// TestCmdAppDispatch_StreamingCapSubcommandSingular exercises
+// the `gregale app <slug> streaming-cap` arm added in ADR-102 D6.
+// Same wire path as the plural form; the two should converge on
+// the same SDK call so a dashboard-redirect or alias wouldn't
+// drift the wire surface.
+func TestCmdAppDispatch_StreamingCapSubcommandSingular(t *testing.T) {
+	resetJSONOut(t)
+	var hit string
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.Path
+		writeJSONTest(w, api.AppStreamingStatus{
+			AppID:        "app-uuid-1",
+			Status:       api.StreamingStatusFlagDisabled,
+			EffectiveCap: 104857600,
+			PlanCap:      104857600,
+			FlagEnabled:  false,
+			PlanAllowed:  true,
+			CapKind:      "plan",
+		})
+	}))
+	defer sink.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", sink.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := run([]string{"app", "demo", "streaming-cap"}); code != 0 {
+		t.Errorf("run(app demo streaming-cap) = %d, want 0", code)
+	}
+	if hit != "/v1/apps/demo/streaming-cap" {
+		t.Errorf("app demo streaming-cap hit %q, want /v1/apps/demo/streaming-cap", hit)
+	}
+}
+
+// TestCmdAppsDispatch_StreamingCapNoSlugDoesNotPanic is the
+// no-slug-fallthrough regression test for the streaming-cap arm.
+// Mirrors TestCmdAppsDispatch_RoutesNoSlugDoesNotPanic — the
+// streaming-cap dispatcher arm must bounds-check args[2] the same
+// way so a `gregale apps streaming-cap` invocation falls through
+// to the default cmdApps() path WITHOUT panicking on args[2].
+//
+// Same accept-any-non-panic shape as the routes counterpart: the
+// load-bearing invariant is "no panic" because the dispatcher has
+// both fall-through paths (cmdApps default, or leaf's slug==""
+// usage hint) available after the fix, and pinning a specific exit
+// code would over-specify.
+func TestCmdAppsDispatch_StreamingCapNoSlugDoesNotPanic(t *testing.T) {
+	resetJSONOut(t)
+	// Panic guard is the load-bearing assertion. If the bounds
+	// check regresses and args[2] is read on an empty slice, this
+	// defer catches it.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("run(apps streaming-cap no-slug) panicked: %v", r)
+		}
+	}()
+	// Wire a fake API so cmdApps() fallback (if it lands there)
+	// has a 200 path and exits 0. Empty body simulates the
+	// "no apps yet" list response.
+	f := newFakeAPI(t, `[]`, http.StatusOK)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", f.srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	code := run([]string{"apps", "streaming-cap"})
+	if code == 0 {
+		t.Logf("got exit 0 (dispatcher fell through to cmdApps on no-slug); acceptable")
+	}
+}
+
+// TestCmdAppsDispatch_RoutesNoSlugDoesNotPanic is the
+// regression test for the CodeQL off-by-one finding (alerts
+// #208 + #209 at cmd/gregale/main.go:187, PR-B1). Before
+// the fix, `gregale apps routes` (no slug) hit `args[2]` on
+// an empty slice and panicked with an out-of-bounds read.
+// After the fix, the dispatch falls through to the default
+// cmdApps() path and the leaf's slug=="" guard prints the
+// usage hint + exits 1. The intent is NOT a no-op — the
+// caller must see a usage error so they fix the command
+// before sending.
+func TestCmdAppsDispatch_RoutesNoSlugDoesNotPanic(t *testing.T) {
+	resetJSONOut(t)
+	// Capture stdout + stderr because cmdApps() prints the
+	// `No apps yet.` hint on the empty path, and the leaf's
+	// PrintUsage writes to stderr if the dispatcher forwarded
+	// us to the leaf (it doesn't anymore — but the panicking
+	// path is what we're guarding, so the test passes either
+	// way as long as we don't crash).
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("run(apps routes no-slug) panicked: %v", r)
+		}
+	}()
+	// List-apps 200 path: cmdApps() prints the empty list +
+	// the deploy hint. Either outcome (cmdApps fallback, or
+	// leaf with usage error) is fine — the panic guard is the
+	// load-bearing assertion.
+	f := newFakeAPI(t, `[]`, http.StatusOK)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_API", f.srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	code := run([]string{"apps", "routes"})
+	if code == 0 {
+		// cmdApps() returns 0 on the empty list. The leaf's
+		// PrintUsage path would return 1; we don't pin which
+		// because the dispatcher has both fall-through paths
+		// available after the fix and the load-bearing
+		// invariant is "no panic", not "specific exit code".
+		t.Logf("got exit 0 (dispatcher fell through to cmdApps on no-slug); acceptable")
 	}
 }
 

@@ -139,6 +139,37 @@ type OpsMetrics struct {
 	// 0.3/0.35 pair is intentional (the 350 ms warm-wake budget needs
 	// tight resolution near 0.35).
 	guestInitDuration *prometheus.HistogramVec
+	// wakeRPCDuration (ADR-097, P1B) measures schedd-side wall-clock
+	// for each wake phase: admit_to_rpc (gRPC handler → vmmd RPC
+	// start), rpc_call (vmmd Create{FromSnapshot,ColdBoot} round
+	// trip), rpc_to_running (RPC return → WAKING/COLD_BOOTING → RUNNING
+	// transition). Labelled by {app, phase} — phase is closed-set
+	// {admit_to_rpc, rpc_call, rpc_to_running}. The empty-app
+	// sentinel is pre-instantiated for every phase value so the §12
+	// wake-latency decomposition dashboard panel surfaces a zero row
+	// from boot. Bucket set reuses the spec §6.3 wake-latency budget
+	// with one extra low-end bucket (0.01) for admit_to_rpc, which
+	// is dominated by in-process lock + ledger consult and rarely
+	// exceeds a few ms — without it the phase would collapse to the
+	// 0.05 bucket and lose observability on the lock/ledger path.
+	// wake_id is attached as a prometheus.Exemplar on each observation
+	// so operators can join to gateway_wake_latency_seconds on the
+	// gateway side and to the events table (BootStarted / BootCompleted
+	// rows in pkg/sched/events.go) — exemplar attachment does NOT
+	// add a wake_id label, so cardinality stays O(autoscale-enabled
+	// apps × 3 phase values).
+	wakeRPCDuration *prometheus.HistogramVec
+	// gatewayDrainWaitSeconds (issue #587 / PR-A) — histogram
+	// for the per-daemon graceful-shutdown drain. Closed label
+	// set {daemon, outcome} pre-instantiated in NewOpsMetrics so
+	// /metrics surfaces the closed cross-product from boot.
+	gatewayDrainWaitSeconds *prometheus.HistogramVec
+	// gatewayInflightRequests (issue #587 / PR-A) — gauge for
+	// the per-daemon drain.Tracker in-flight count. Closed
+	// label set {daemon, op}; no plan or app label per the
+	// cluster plan's "Decisions baked in" §2 (Prometheus
+	// cardinality discipline).
+	gatewayInflightRequests *prometheus.GaugeVec
 	// wakeSnapshotTier (issue #470 / PR C / ADR-074) — closed-set
 	// counter for the warm-vs-init-vs-cold-boot choice Engine.usableSnapshotForWake
 	// makes on every wake. Labels ∈ {warm, init, cold_boot_fallback}.
@@ -278,6 +309,96 @@ type OpsMetrics struct {
 	// faas_apid_error_rate_5m, _3d_baseline, _ratio) read from
 	// one counter.
 	requestTotal *prometheus.CounterVec
+	// appErrorsRecorded (ADR-096) — counter the gatewayd-internal
+	// recorder (cmd/gatewayd-internal/app_errors_recorder.go) and
+	// the apid gRPC handler (cmd/apid/grpc_server_apperrors.go)
+	// increment per outcome. outcome ∈ {ok, redaction_failed,
+	// rate_limited, db_error}. `ok` is the §12 customer-error-
+	// ingest panel (rate over 5m); `redaction_failed` is the
+	// tripwire for pkg/redact panicking (must stay at 0); the
+	// closed label set keeps cardinality bounded. Single-registry:
+	// registered on every daemon; only gatewayd-internal +
+	// apid increment via ObserveAppErrorsRecorded.
+	//
+	// NOTE (post-review): `db_error` increments per-row on EVERY
+	// failure — not just the 5th-consecutive. A batch is drained
+	// from the ringbuffer in tryFlush BEFORE flushBatch is called,
+	// so a failure means those rows are already lost; suppressing
+	// the per-row observe until the tripwire fires would let the
+	// first four failures of every outage disappear from the
+	// dashboard.
+	appErrorsRecorded *prometheus.CounterVec
+	// appErrorsFingerprintCacheHits (ADR-096) — counter for the
+	// gatewayd-internal recorder's in-process LRU fingerprint
+	// cache. Every hit is a record() that did NOT need to call
+	// the regex / dedupe logic; every miss did. The hit rate
+	// (over 5m, divided by requestFailures) is the §12
+	// fingerprint-cache-effectiveness panel; a sustained <80%
+	// rate means the LRU is too small for the customer's traffic
+	// shape. Unlabelled — no cardinality risk. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFingerprintCacheHit.
+	appErrorsFingerprintCacheHits prometheus.Counter
+	// appErrorsDedupeMerges (ADR-096) — counter for server-side
+	// dedupe-merge hits in the apid gRPC handler. Increments
+	// once per ON CONFLICT (account_id, app_id, fingerprint) DO
+	// UPDATE that bumps the existing row's count + last_seen_at
+	// (within AppErrorsDedupeWindowSeconds). The dedupe-merge
+	// rate vs the new-fingerprint insert rate is the §12
+	// dedupe-effectiveness panel; if 100% of inserts are merges,
+	// the LRU backstop in the recorder is effectively never
+	// firing. Unlabelled. Single-registry: registered on every
+	// daemon; only apid increments via ObserveAppErrorsDedupeMerge.
+	appErrorsDedupeMerges prometheus.Counter
+	// appErrorsFlushDuration (ADR-096) — histogram of the
+	// gatewayd-internal publisher's per-flush wall-clock
+	// duration (FlushInterval or FlushBatchSize, whichever
+	// first). Bucket set {0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
+	// 1, 5}: the 1ms bucket catches the empty-drain case
+	// (FlushInterval fires with nothing to do); the 5s bucket
+	// catches a stuck DB connection (alertable via
+	// FlushDurationP99Slo). Unlabelled. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFlushDuration.
+	appErrorsFlushDuration prometheus.Histogram
+	// appErrorsPurges (ADR-096) — counter for the apid retention
+	// cron (cmd/apid/app_errors_purge.go). outcome ∈
+	// {ok, no_accounts, failed}. `ok` is the §12 retention-
+	// enforcement panel (rate over 24h, MUST be >0 once an
+	// account iterator lands); `no_accounts` is the signal that
+	// the cron ran but had no accounts to walk (PR-A ships with
+	// no iterator wired, so this fires every 24h until PR-B);
+	// `failed` is the tripwire for a SQL-level failure (alertable).
+	// Single-registry: registered on every daemon; only apid
+	// increments via ObserveAppErrorsPurge.
+	appErrorsPurges *prometheus.CounterVec
+	// previewJanitorOutcomes (ADR-095 PR-C) — counter for the
+	// preview teardown cron (cmd/apid/preview_janitor.go).
+	// outcome ∈ {ok, failed, torn_down}. `ok` fires every tick
+	// the sweep ran cleanly (whether or not it tombstoned a
+	// row); `torn_down` fires per-row when a preview app
+	// reaches the torn_down state and is soft-deleted (the
+	// §12 teardown-rate panel sums this over 1h to chart PR-
+	// close cadence); `failed` is the tripwire for a SQL-level
+	// failure (alertable). Single-registry: registered on every
+	// daemon; only apid increments via ObservePreviewJanitor.
+	previewJanitorOutcomes *prometheus.CounterVec
+	// dataUpstreamRTT (ADR-098 PR-C) — observed RTT bucketed
+	// per (kind, host_redacted_hash, region). The label set is
+	// closed: kind ∈ closed-vocab; host_redacted_hash is the
+	// 8-hex prefix of sha256(salt||host); region is the meterd
+	// node's compute_nodes.region. §11: the plaintext host NEVER
+	// appears in any label. Histogram (not Gauge) — the alert
+	// rules at faas.rules.yml:1062-1087 read p95 RTT via
+	// histogram_quantile() over the `_bucket` series.
+	dataUpstreamRTT *prometheus.HistogramVec
+	// dataUpstreamProbes (ADR-098 PR-C) — counter for the
+	// probe outcome class. outcome ∈ {ok, timeout, refused,
+	// tls_handshake, dns, unreachable}.
+	dataUpstreamProbes *prometheus.CounterVec
+	// dataUpstreamProbeDuration (ADR-098 PR-C) — wall-clock
+	// duration of each probe (TCP+TLS handshake).
+	dataUpstreamProbeDuration prometheus.Histogram
 	// accountLabels: the bounded admission set shared by the
 	// account_id-labelled metrics above. See accountLabelSet docs
 	// for the fixed-capacity, non-evicting contract — an evicting
@@ -315,6 +436,33 @@ type OpsMetrics struct {
 	// baseline is enough to drive a "the flusher can talk to
 	// Postgres?" question.
 	failedLoginAuditWriteFailures prometheus.Counter
+	// auditEventsDeletedTotal: rows pruned by the daily event-
+	// retention cleanup loop (pkg/eventretention.Cleanup, ADR-075).
+	// Unlabelled — the loop has one outcome (rows deleted) and the
+	// per-kind breakdown lives on auditEventsVolumeTotal{kind_prefix}
+	// instead. Backs the "is the prune loop keeping up?" runbook
+	// question (docs/runbooks/FaasAuditRetentionExhaustion.md).
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsDeletedTotal prometheus.Counter
+	// auditEventsRetentionLagSeconds: gauge of (now − cutoff) at the
+	// moment each retention pass runs. A positive value means the
+	// loop is keeping up; a value pinned at 0 means the loop is
+	// running but never deleting anything (operator action needed
+	// if the events table is growing). Backs the same runbook as
+	// auditEventsDeletedTotal. The gauge is set (not Inc) so the
+	// value reflects the LATEST pass, not a cumulative sum.
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsRetentionLagSeconds prometheus.Gauge
+	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
+	// events table by kind prefix (auth.*, key.*, secret.*,
+	// account.*, stateless.*, webhook.*, edge_rule.*, cron.*,
+	// "" / unmatched). kind_prefix is the bounded-admission label
+	// — overflow collapses to "__other__" via the wire admission
+	// helper so Prometheus series stay bounded even if a future
+	// kind namespace blows up. Backs the "is the audit write rate
+	// healthy per kind?" dashboard panel. ADR-091 D20.3 / PR-B
+	// residual.
+	auditEventsVolumeTotal *prometheus.CounterVec
 	// alertEvalSkippedDegradedTotal — counts alert-rule evaluation
 	// ticks skipped because pkg/appmetrics returned a degraded source
 	// string ("degraded: <reason>"). Unlabelled. The dashboard's
@@ -868,7 +1016,7 @@ type OpsMetrics struct {
 	deployScanVulns *prometheus.CounterVec
 	// imageScanVulns: issue #299 / supply-chain scan observability.
 	// Counter labelled by image (the OCI ref of the staged base
-	// ext4, e.g. "ghcr.io/onebox-faas/builder-base:latest" or
+	// ext4, e.g. "ghcr.io/poyrazk/builder-base:latest" or
 	// "ghcr.io/onebox-faas/runner-node22:v1.2.3") and severity ∈
 	// {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN}. Closed `severity`
 	// set pre-instantiated at boot below — `image` is bounded by
@@ -1048,8 +1196,9 @@ type OpsMetrics struct {
 	// registered on every daemon so the struct stays a single
 	// registry — only schedd / vmmd / gatewayd-internal / builderd / apid
 	// increment via Platform.Emit in production; other daemons
-	// sit at zero. Closed set is the 13 phases from
-	// pkg/events/wake.go.
+	// sit at zero. Closed set is the 15 phases from
+	// pkg/events/wake.go (extended by ADR-098 C11 to surface
+	// the three vmmd-side phase-decomposed wake timings).
 	wakePhaseEmitted *prometheus.CounterVec
 	// wakePhaseDur: lifecycle histogram for wake phases. Same
 	// (phase, result) tuple as wakePhaseEmitted. Buckets sized
@@ -1175,6 +1324,31 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
 	}, []string{"app", "runner"})
 	guestInitDuration.WithLabelValues("", "")
+	// ADR-097 (P1B): schedd-side wake RPC duration histogram. Phase
+	// ∈ {admit_to_rpc, rpc_call, rpc_to_running}. Bucket set is spec
+	// §6.3 verbatim plus a 0.01 low-end bucket for admit_to_rpc.
+	// Empty-app sentinel rows are pre-instantiated for every phase
+	// value so the wake-latency decomposition dashboard surfaces a
+	// zero row from boot (the §12 panel-at-day-1 contract that bit
+	// PR #826). Engine.Wake attaches wake_id as a prometheus.Exemplar
+	// on each observation; the observer returns a prometheus.Observer
+	// that callers Observe(d) on — the wire.OpsMetrics.WakeRPCDuration
+	// accessor below mirrors GuestInitDuration's nil-safe shape.
+	//
+	// Note: name is *_wake_rpc_duration_seconds, not the existing
+	// *_wake_phase_duration_seconds (events platform, ADR-064 at
+	// metrics.go:1951 — {phase, result} labels, covers the full
+	// wake envelope). The two are correlated by wake_id exemplar
+	// but cover different windows; renaming the existing one would
+	// break the wake-latency panel that ships to day-1.
+	wakeRPCDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_wake_rpc_duration_seconds",
+		Help:    "Wall-clock seconds for each schedd-side wake RPC phase (ADR-097). phase ∈ {admit_to_rpc, rpc_call, rpc_to_running}; app label is apps.id. admit_to_rpc covers the gRPC handler → vmmd RPC start window (lock + admitGate + ledger + placement). rpc_call covers the vmmd Create{FromSnapshot,ColdBoot} round trip. rpc_to_running covers the RPC return → WAKING/COLD_BOOTING → RUNNING transition. wake_id is attached as a prometheus.Exemplar on each observation so operators can join to gateway_wake_latency_seconds and to the events table. Bucket set reuses spec §6.3 verbatim with a 0.01 low-end bucket for admit_to_rpc.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.2, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
+	}, []string{"app", "phase"})
+	wakeRPCDuration.WithLabelValues("", "admit_to_rpc")
+	wakeRPCDuration.WithLabelValues("", "rpc_call")
+	wakeRPCDuration.WithLabelValues("", "rpc_to_running")
 	// Issue #470 / PR C / ADR-074: wake tier mix counter.
 	wakeSnapshotTier := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_snapshot_tier_total",
@@ -1351,6 +1525,54 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_failed_login_audit_write_failures_total",
 		Help: "Failed-login audit rows whose AppendEvent could not be written (cmd/apid/audit.go::flushOne). Unlabelled — distinct from apid_audit_write_failures_total{account_id} because the failed-login row's subject is always nil, which would collapse to account_id=\"anonymous\" in the success-path counter and conflate the two surfaces (issue #286).",
 	})
+	// auditEventsDeletedTotal: rows pruned by the daily event-
+	// retention cleanup loop (pkg/eventretention.Cleanup, ADR-075).
+	// Unlabelled — the loop has one outcome (rows deleted) and the
+	// per-kind breakdown lives on auditEventsVolumeTotal{kind_prefix}
+	// instead. Backs the "is the prune loop keeping up?" runbook
+	// question (docs/runbooks/FaasAuditRetentionExhaustion.md).
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsDeletedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_audit_events_deleted_total",
+		Help: "Audit-event rows pruned by the daily cleanup loop (pkg/eventretention, ADR-075). Unlabelled — the loop has one outcome (rows deleted) and the per-kind breakdown lives on apid_audit_events_volume_total{kind_prefix}. ADR-091 D20.3 / PR-B residual.",
+	})
+	// auditEventsRetentionLagSeconds: gauge of (now − cutoff) at the
+	// moment each retention pass runs. A positive value means the
+	// loop is keeping up; a value pinned at 0 means the loop is
+	// running but never deleting anything (operator action needed
+	// if the events table is growing). Backs the same runbook as
+	// auditEventsDeletedTotal. The gauge is set (not Inc) so the
+	// value reflects the LATEST pass, not a cumulative sum.
+	// ADR-091 D20.3 / PR-B residual.
+	auditEventsRetentionLagSeconds := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_audit_events_retention_lag_seconds",
+		Help: "Seconds elapsed between the most recent retention pass and the cutoff it used (pkg/eventretention, ADR-075). Zero means the loop is running but no rows are being deleted. ADR-091 D20.3 / PR-B residual.",
+	})
+	// auditEventsVolumeTotal{kind_prefix}: counts emit calls to the
+	// events table by kind prefix (auth.*, key.*, secret.*,
+	// account.*, stateless.*, webhook.*, edge_rule.*, cron.*,
+	// "" / unmatched). kind_prefix is the bounded-admission label
+	// — overflow collapses to "__other__" via the wire admission
+	// helper so Prometheus series stay bounded even if a future
+	// kind namespace blows up. Backs the "is the audit write rate
+	// healthy per kind?" dashboard panel. ADR-091 D20.3 / PR-B
+	// residual.
+	auditEventsVolumeTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_audit_events_volume_total",
+		Help: "Audit-event emit calls by kind prefix (auth.*, key.*, secret.*, account.*, stateless.*, webhook.*, edge_rule.*, cron.*, other). Overflow collapses to __other__ via the bounded admission helper so Prometheus series stay bounded. ADR-091 D20.3 / PR-B residual.",
+	}, []string{"kind_prefix"})
+	// Pre-instantiate the closed kind_prefix label set so the
+	// counter's HELP/TYPE and zero-valued series surface in /metrics
+	// from boot (same precedent as auditWriteDur's result label set).
+	// The empty string is the "unmatched prefix" bucket — kept so a
+	// future emit site that bypasses the prefix matcher still has a
+	// zero series rather than a missing one.
+	for _, kp := range []string{
+		"auth", "key", "secret", "account", "stateless",
+		"webhook", "edge_rule", "cron", "other",
+	} {
+		auditEventsVolumeTotal.WithLabelValues(kp)
+	}
 	auditWriteDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_audit_write_failures_duration_seconds",
 		Help: "Latency of state.Store.AppendEvent on the apid audit seam, labelled by terminal result {ok, failed}. Sized for the single-row INSERT round-trip (issue #278).",
@@ -1666,16 +1888,35 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"slice"})
 	// Issue #169 / #172: scale-up trigger observability. Outcome
 	// label set is closed ({admit, reject_at_cap, no_signal,
-	// cooldown_held}); pre-instantiated below so the rows surface
-	// in /metrics from boot. App label is per-app (bounded by apps
-	// with autoscale configured) — the closed outcome set means
-	// the total series cardinality is O(autoscale-enabled apps × 4).
-	// cooldown_held (PR-C, issue #462) lands on the wake-gate
-	// path when Concurrency(appID) > 0 AND
-	// time.Since(apps.last_scale_out_at) < ScaleOutCooldownS.
+	// cooldown_held, min_floor_already, overage_cap_reached});
+	// pre-instantiated below so the rows surface in /metrics from
+	// boot. App label is per-app (bounded by apps with autoscale
+	// configured) — the closed outcome set means the total series
+	// cardinality is O(autoscale-enabled apps × 6) (P1A: × 4 → × 6
+	// after adding min_floor_already and overage_cap_reached).
+	//   - admit (Engine.admitGate wakeAdmit, pkg/sched/engine.go:4890).
+	//   - reject_at_cap (admitGate wakeRejectAtCap, :4856-4860).
+	//   - no_signal (scaleup/trigger.go:decide short-circuit on no
+	//     RPS/CPU signal yet).
+	//   - cooldown_held (admitGate wakeCooldownHeld, :4862-4867;
+	//     PR-C issue #462 wake-gate path when Concurrency(appID) > 0
+	//     AND time.Since(apps.last_scale_out_at) < ScaleOutCooldownS).
+	//   - min_floor_already (admitGate wakeMinFloorAlready, :4868-4873;
+	//     ScalingPolicy.MinInstances already met, no traffic signal).
+	//   - overage_cap_reached (admitGate wakeOverageCapReached,
+	//     :4876-4888; issue #561 OverageChecker reports OverageReached).
+	//
+	// P1A: only the first four are emitted by the scaleup/trigger.go
+	// `decide` function; the last three (cooldown_held,
+	// min_floor_already, overage_cap_reached) are emitted by
+	// Engine.admitGate when called via the Wake / AdmitInstance path
+	// through admitAndDispatch (engine.go:1238). The
+	// `admitAndDispatchForDeployment` (engine.go:1085) path bypasses
+	// admitGate by design — see that function's doc comment for the
+	// asymmetry rationale (PR-C invariant: ledger caps, not lock caps).
 	scaleUpDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_up_decisions_total",
-		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, cooldown_held}; app label is the apps.id.",
+		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, cooldown_held, min_floor_already, overage_cap_reached}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
 	scaleUpAdmitRPS := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: prefix + "_scale_up_admit_rps",
@@ -1696,9 +1937,17 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// upgrade over "keep" emitted by the reaper when
 	// Concurrency(appID) >= ScalingPolicy.MinInstances AND the
 	// aggressive path would otherwise have parked an instance.
+	// cooldown_held (P1C) fires when the per-app scale-in cooldown
+	// consult in ReapAggressive (pkg/sched/reaper.go) skipped the
+	// entire app — the app is absent from the park slice and the
+	// caller never iterates over it. Idle branch (ReapIdle) emits
+	// the same three of the four outcomes (cooldown_held, park,
+	// min_floor_already) since P1D; `keep` is intentionally omitted
+	// because ReapIdle has no traffic-signal consult (no
+	// desiredByApp).
 	scaleDownDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_scale_down_decisions_total",
-		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already}; app label is the apps.id.",
+		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already, cooldown_held}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
 	// Issue #557 / ADR-071 §Decision 1: proactive min-instances
 	// floor reconciler observability. Closed outcome set
@@ -1915,6 +2164,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		egressDeny,
 		failedLoginTotal, failedLoginDropped,
 		failedLoginAuditWriteFailures,
+		auditEventsDeletedTotal,
+		auditEventsRetentionLagSeconds,
+		auditEventsVolumeTotal,
 		topTenantRPS,
 		apidLogsEmittedTotal,
 		apidLogsDroppedTotal,
@@ -2015,6 +2267,114 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Cross-node LIVE-instance migration decisions (Tier A5 / ADR-066), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, lease_expired, peer_failure}. `migrated` is the §12 dashboard panel. `lease_expired` is the tripwire for the four-phase handoff timing out; `peer_failure` is the tripwire for the new-owner vmmd failing the AdoptMigratedInstance RPC. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveLiveMigration.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, liveMigrationDecisions)
+	// ADR-096: customer-facing automatic error grouping ingest
+	// counter. Labelled by outcome ∈ {ok, redaction_failed,
+	// rate_limited, db_error}. `ok` is the §12 customer-error-
+	// ingest panel (rate over 5m); `redaction_failed` is the
+	// tripwire for pkg/redact panicking — must stay at 0.
+	// `rate_limited` is the LRU-cardinality backstop firing
+	// (CardinalityLimit hit). `db_error` is the publisher's
+	// 5th-consecutive-failure drop. Single-registry: registered
+	// on every daemon (mirrors liveMigrationDecisions); only
+	// gatewayd-internal + apid increment via
+	// ObserveAppErrorsRecorded.
+	appErrorsRecorded := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_recorded_total",
+		Help: "Customer-facing automatic error grouping ingest outcomes (ADR-096), labelled by outcome ∈ {ok, redaction_failed, rate_limited, db_error}. `ok` is the §12 customer-error-ingest panel (rate over 5m). `redaction_failed` is the tripwire for pkg/redact panicking — MUST stay at 0. `rate_limited` is the LRU-cardinality backstop firing when an app exceeds CardinalityLimit fingerprints. `db_error` is the publisher's per-row drop signal — incremented for EVERY row of a failed flush batch (the batch is drained before flushBatch is called, so failures always lose data; per-row observe gives the §12 panel an accurate outage timeline rather than only the 5th-consecutive-failure tripwire). Single-registry: registered on every daemon; only gatewayd-internal + apid increment via ObserveAppErrorsRecorded.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, appErrorsRecorded)
+	// ADR-096: in-process LRU fingerprint cache hit counter.
+	// Unlabelled (no cardinality risk). Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFingerprintCacheHit.
+	appErrorsFingerprintCacheHits := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_fingerprint_cache_hits_total",
+		Help: "In-process LRU fingerprint cache hits in the gatewayd-internal error recorder (ADR-096). Hit rate over 5m divided by requestFailures is the §12 fingerprint-cache-effectiveness panel; sustained <80% means the LRU is too small for the customer's traffic shape. No labels; no cardinality risk. Single-registry: registered on every daemon; only gatewayd-internal increments via ObserveAppErrorsFingerprintCacheHit.",
+	})
+	commonCollectors = append(commonCollectors, appErrorsFingerprintCacheHits)
+	// ADR-096: server-side dedupe-merge counter. Fires once per
+	// ON CONFLICT DO UPDATE that bumps an existing row's count
+	// + last_seen_at within AppErrorsDedupeWindowSeconds.
+	// Unlabelled. Single-registry: registered on every daemon;
+	// only apid increments via ObserveAppErrorsDedupeMerge.
+	appErrorsDedupeMerges := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_dedupe_merges_total",
+		Help: "Server-side dedupe-merge hits in the apid gRPC handler (ADR-096). Increments once per ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE that bumps an existing row's count + last_seen_at within AppErrorsDedupeWindowSeconds. Merge rate vs new-fingerprint insert rate is the §12 dedupe-effectiveness panel. No labels. Single-registry: registered on every daemon; only apid increments via ObserveAppErrorsDedupeMerge.",
+	})
+	commonCollectors = append(commonCollectors, appErrorsDedupeMerges)
+	// ADR-096: per-flush wall-clock duration histogram for the
+	// gatewayd-internal publisher. Unlabelled. Single-registry:
+	// registered on every daemon; only gatewayd-internal
+	// increments via ObserveAppErrorsFlushDuration.
+	appErrorsFlushDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    prefix + "_app_errors_flush_duration_seconds",
+		Help:    "Per-flush wall-clock duration in the gatewayd-internal app_errors publisher (ADR-096). One observation per drain of the ringbuffer (FlushInterval or FlushBatchSize, whichever first). Bucket set {0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5}: the 1ms bucket catches the empty-drain case (FlushInterval fires with nothing to do); the 5s bucket catches a stuck DB connection (alertable via FlushDurationP99Slo). No labels. Single-registry: registered on every daemon; only gatewayd-internal increments via ObserveAppErrorsFlushDuration.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
+	})
+	commonCollectors = append(commonCollectors, appErrorsFlushDuration)
+	// ADR-096: retention cron outcome counter (apid-side).
+	// Labelled by outcome ∈ {ok, no_accounts, failed}. `ok` is
+	// the §12 retention-enforcement panel (rate over 24h, MUST
+	// be >0 once an account iterator lands); `no_accounts` is
+	// the signal that the cron ran but had no accounts to walk
+	// (PR-A ships with no iterator wired, so this fires every
+	// 24h until PR-B); `failed` is the tripwire for a SQL-level
+	// failure (alertable). Pre-instantiated at boot so the row
+	// surfaces in /metrics from the moment apid starts (single-
+	// registry rule).
+	appErrorsPurges := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_errors_purges_total",
+		Help: "Retention cron outcomes for the customer-facing error grouping store (ADR-096), labelled by outcome ∈ {ok, no_accounts, failed}. `ok` is the §12 retention-enforcement panel (rate over 24h, MUST be >0 once an account iterator lands — Free 1d / Hobby 7d / Pro 30d / Scale 90d ceiling). `no_accounts` is the signal that the cron ran but had no accounts to walk (PR-A ships with no iterator wired, so this fires every 24h until PR-B lands the account iterator alongside the reader-path handlers). `failed` is the tripwire for a SQL-level failure (alertable). Single-registry: registered on every daemon; only apid increments via ObserveAppErrorsPurge.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, appErrorsPurges)
+
+	// --- ADR-098 connection-aware execution (PR-C) -----------
+	//
+	// Three new metrics for the meterd probe loop. Labels
+	// carry ONLY the host_redacted_hash (8-char prefix from
+	// logsanitize.HashShort) — the plaintext host NEVER
+	// appears in any label. The metric set is the §12
+	// "data placement" panel; schedd's chooser bias (PR-D)
+	// also reads from the same data_upstream_probes table
+	// rather than scraping these metrics.
+	dataUpstreamRTT := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_data_upstream_rtt_ms",
+		Help:    "Observed RTT (ms) bucketed per (kind, host_redacted_hash, region). Buckets cover 1ms..3s — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. The label set is closed: kind ∈ {postgres, redis, mongo, ...}; host_redacted_hash is the 8-hex-char prefix of sha256(salt||host); region is the meterd node's compute_nodes.region. The plaintext host is NEVER in the labels (ADR-098 §11). §12 data-placement dashboard panel.",
+		Buckets: []float64{1, 5, 10, 50, 100, 500, 1000, 3000},
+	}, []string{"kind", "host_redacted_hash", "region"})
+	dataUpstreamProbes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_data_upstream_probes_total",
+		Help: "Probe outcomes (TCP+TLS via crypto/tls.Dial). Closed-set labels: outcome ∈ {ok, timeout, refused, tls_handshake, dns, unreachable}. §12 data-placement panel; pre-instantiated so the rows surface from a fresh process.",
+	}, []string{"outcome"})
+	dataUpstreamProbeDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    prefix + "_data_upstream_probe_duration_seconds",
+		Help:    "Per-probe wall-clock duration (TCP+TLS handshake). Buckets cover the 1ms..3s range — a healthy TLS handshake completes in <100ms; the 1s+ tail catches TCP retries. §12 data-placement panel.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 3},
+	})
+	commonCollectors = append(commonCollectors, dataUpstreamRTT, dataUpstreamProbes, dataUpstreamProbeDuration)
+	for _, o := range []string{"ok", "timeout", "refused", "tls_handshake", "dns", "unreachable"} {
+		dataUpstreamProbes.WithLabelValues(o)
+	}
+	// Pre-instantiate the outcome set so /metrics surfaces the
+	// rows from a fresh process (Prometheus skips zero-valued
+	// CounterVec series by default). Extending the outcome
+	// vocabulary requires extending this loop in lock-step with
+	// the cmd/apid/app_errors_purge.go::Run dispatch.
+	for _, outcome := range []string{"ok", "no_accounts", "failed"} {
+		appErrorsPurges.WithLabelValues(outcome)
+	}
+	// ADR-095 PR-C: preview teardown janitor outcomes. Mirror of
+	// appErrorsPurges for the preview-row sweep. The closed-set
+	// outcome vocabulary keeps cardinality bounded per
+	// ObserveAppErrorsPurge convention.
+	previewJanitorOutcomes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_preview_janitor_outcomes_total",
+		Help: "Preview teardown cron outcomes (ADR-095 PR-C, issue #272), labelled by outcome ∈ {ok, failed, torn_down}. `ok` fires every tick the sweep ran cleanly (whether or not it tombstoned a row); `torn_down` fires per-row when a preview app reaches torn_down and is soft-deleted (the §12 teardown-rate panel sums this over 1h to chart PR-close cadence); `failed` is the tripwire for a SQL-level failure (alertable). Single-registry: registered on every daemon; only apid increments via ObservePreviewJanitor.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, previewJanitorOutcomes)
+	for _, outcome := range []string{"ok", "failed", "torn_down"} {
+		previewJanitorOutcomes.WithLabelValues(outcome)
+	}
 	// ADR-067 / Tier A6: migrating-instance watchdog reconcile counter.
 	// Labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}.
 	// The reinvited label is the §12 dashboard panel (sum over 5m for
@@ -2106,6 +2466,57 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Count of LocalCacheBackend stale-cache fallback serves (ADR-054 acceptance). Fires once per Get that returned a last-known-good cached blob because the parent backend failed AND FAAS_STORAGE_CACHE_SERVE_STALE=true. No labels (deployment-level policy; per-key labels would explode cardinality). A non-zero rate means 'registry is down' — alertable via the §12 storage panel.",
 	})
 	commonCollectors = append(commonCollectors, storageCacheStaleFallback)
+	// ADR-097 (P1B): schedd-side wake RPC duration histogram. Same
+	// MustRegister pattern as the legacy wakePhaseDur at line 1998
+	// (events-platform ADR-064) but a distinct metric name and label
+	// set — see metrics.go:1208-1227 for the naming rationale.
+	commonCollectors = append(commonCollectors, wakeRPCDuration)
+	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
+	// observability. Two series with a closed label set:
+	//
+	//   * gatewayDrainWaitSeconds histogram {daemon, outcome} —
+	//     wall-clock seconds the drain waited before every
+	//     in-flight request goroutine finished (or the deadline
+	//     fired). outcome ∈ {clean, deadline_exceeded, ctx_cancelled}
+	//     so an operator can tell "drained fast" from "we
+	//     force-cut requests" without re-reading the daemon log.
+	//     Bucket set covers <100ms (idle) up to the full
+	//     DrainGrace=25s ceiling.
+	//
+	//   * gatewayInflightRequests gauge {daemon, op} — current
+	//     in-flight Begin() count. op ∈ {http, upgrade, control}
+	//     (NO plan or app label — Prometheus cardinality
+	//     discipline per the cluster plan's "Decisions baked in"
+	//     §2). Operators who want per-plan or per-app in-flight
+	//     counts can add them later if a real incident needs them.
+	//
+	// Both metrics are pre-instantiated for the closed label
+	// cross-product so /metrics surfaces rows from boot —
+	// matches the pre-instantiation pattern used by every other
+	// per-daemon collector (see e.g. writeRedirectTotal at
+	// metrics.go:1136-1142).
+	gatewayDrainWaitSeconds := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_drain_wait_seconds",
+		Help:    "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGrace=25s ceiling.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 25},
+	}, []string{"daemon", "outcome"})
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-internal", "clean")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-internal", "deadline_exceeded")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-internal", "ctx_cancelled")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-public", "clean")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-public", "deadline_exceeded")
+	gatewayDrainWaitSeconds.WithLabelValues("gatewayd-public", "ctx_cancelled")
+	gatewayInflightRequests := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_inflight_requests",
+		Help: "Current in-flight request count tracked by the per-daemon drain.Tracker (issue #587 / PR-A / pkg/gateway/drain). Labelled by {daemon, op}; op ∈ {http, upgrade, control}. NO plan or app label — Prometheus cardinality discipline (per the cluster plan's 'Decisions baked in' §2).",
+	}, []string{"daemon", "op"})
+	gatewayInflightRequests.WithLabelValues("gatewayd-internal", "http")
+	gatewayInflightRequests.WithLabelValues("gatewayd-internal", "upgrade")
+	gatewayInflightRequests.WithLabelValues("gatewayd-internal", "control")
+	gatewayInflightRequests.WithLabelValues("gatewayd-public", "http")
+	gatewayInflightRequests.WithLabelValues("gatewayd-public", "upgrade")
+	gatewayInflightRequests.WithLabelValues("gatewayd-public", "control")
+	commonCollectors = append(commonCollectors, gatewayDrainWaitSeconds, gatewayInflightRequests)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -2152,12 +2563,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		apidStatelessAdvisoryEventsTotal.WithLabelValues(sev)
 	}
 	// issue #432 phase 5: pre-instantiate the githubd bridge
-	// `kind` label set ({github} — the only kind the bridge
-	// produces today; the loop is forward-compat for future
-	// daemon-to-daemon build sources). Same pattern as the
-	// pre-instantiations above so the row surfaces in /metrics
-	// from boot.
-	for _, kind := range []string{"github"} {
+	// `kind` label set ({github, preview} — push → github,
+	// pull_request → preview, issue #272 / ADR-094). Same pattern
+	// as the pre-instantiations above so the row surfaces in
+	// /metrics from boot. Mirrors the constants in this file
+	// (GithubdBridgeKind* below).
+	for _, kind := range []string{"github", "preview"} {
 		apidGithubdBridgeEnqueuedTotal.WithLabelValues(kind)
 	}
 	// issue #432 phase 5 / ADR-050 §109: pre-instantiate the
@@ -2237,7 +2648,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		deadNodeReconcileDecisions.WithLabelValues(outcome)
 	}
 	// Issue #517 / PR-C / ADR-064: pre-instantiate the closed
-	// 13-phase × 2-result label set for wakePhaseEmitted and
+	// 15-phase × 2-result label set for wakePhaseEmitted and
 	// wakePhaseDur so the §12 wake-latency panel surfaces zero
 	// on an idle daemon (mirrors the buildDuration / stripePush
 	// pre-instantiation precedents above). The phase list mirrors
@@ -2249,6 +2660,16 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"boot_failed", "readiness_200", "proxy_first_byte",
 		"park_started", "park_completed", "stalled",
 		"build_succeeded", "build_failed", "deploy_failed",
+		// ADR-098 C11: vmmd-side phase-decomposed wake timings
+		// (mirrors the three typed scalars on
+		// api/proto/onebox/faas/vmmd/v1/vmmd.proto WakeResponse).
+		// result=ok on measurement, result=failed on the boundary
+		// exception path. result=failed on `restore_ms` is a
+		// separate signal from result=failed on `boot_failed` —
+		// restore_ms surfaces the /snapshot/load sub-window so
+		// the §12 panel can split "restore slow" from "guest
+		// init slow" without collapsing them.
+		"restore_ms", "netns_tap_ms", "guest_ready_ms",
 	} {
 		for _, result := range []string{"ok", "failed"} {
 			wakePhaseEmitted.WithLabelValues(phase, result)
@@ -2356,7 +2777,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// is a placeholder so the help/TYPE surfaces in /metrics before
 	// the first decision fires. Real per-app rows are added by
 	// ObserveScaleUp below.
-	for _, outcome := range []string{"admit", "reject_at_cap", "no_signal", "cooldown_held"} {
+	//
+	// P1A: include `min_floor_already` and `overage_cap_reached` in
+	// the closed set. Both are written by Engine.admitGate at
+	// pkg/sched/engine.go:4868-4873 (min_floor_already, when
+	// ScalingPolicy.MinInstances is already met and no traffic
+	// signal) and pkg/sched/engine.go:4876-4888 (overage_cap_reached,
+	// issue #561, when OverageChecker reports OverageReached). The
+	// closed-set loop previously omitted these two — they were still
+	// emitted by admitGate, but only surfaced in /metrics after the
+	// first gate fire per app, breaking the §12 panel-at-day-1 contract
+	// (PR #826 precedent: pre-instantiation required).
+	for _, outcome := range []string{
+		"admit", "reject_at_cap", "no_signal",
+		"cooldown_held", "min_floor_already", "overage_cap_reached",
+	} {
 		scaleUpDecisions.WithLabelValues("", outcome)
 	}
 	// Issue #300: pre-instantiate the ("other",) row of the per-tenant
@@ -2385,13 +2820,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// ReplaceInstanceStats) which routes through topAppSet and
 	// demotes past top-100 into this bucket.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
-	// issue #171: pre-instantiate the {park, keep, min_floor_already}
-	// outcome rows for the empty-app label so the help/TYPE surfaces
-	// in /metrics from boot, mirroring the scale-up pattern above.
-	// min_floor_already (PR-C, issue #462) is the per-app "would
-	// have parked, but min_instances is reached" outcome the
-	// aggressive reaper emits.
-	for _, outcome := range []string{"park", "keep", "min_floor_already"} {
+	// issue #171: pre-instantiate the {park, keep, min_floor_already,
+	// cooldown_held} outcome rows for the empty-app label so the
+	// help/TYPE surfaces in /metrics from boot, mirroring the scale-up
+	// pattern above.
+	//   - min_floor_already (PR-C, issue #462): per-app "would have
+	//     parked, but min_instances is reached".
+	//   - cooldown_held (P1C): per-app scale-in cooldown consult in
+	//     ReapAggressive (pkg/sched/reaper.go) skipped the entire app;
+	//     the app is absent from the park slice. Idle branch
+	//     (ReapIdle) emits no decision metrics today — adding a
+	//     parallel emission there is a separate change.
+	for _, outcome := range []string{"park", "keep", "min_floor_already", "cooldown_held"} {
 		scaleDownDecisions.WithLabelValues("", outcome)
 	}
 	// Issue #557 / ADR-071 §Decision 1: pre-instantiate the eight
@@ -2442,6 +2882,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		writeRedirectLatency:               writeRedirectLatency,
 		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
+		wakeRPCDuration:                    wakeRPCDuration,
+		gatewayDrainWaitSeconds:            gatewayDrainWaitSeconds,
+		gatewayInflightRequests:            gatewayInflightRequests,
 		wakeSnapshotTier:                   wakeSnapshotTier,
 		guestTailSeconds:                   guestTailSeconds,
 		guestTailFailedTotal:               guestTailFailedTotal,
@@ -2453,10 +2896,22 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		accountOrgMismatch:                 accountOrgMismatch,
 		requestFailures:                    requestFailures,
 		requestTotal:                       requestTotal,
+		appErrorsRecorded:                  appErrorsRecorded,
+		appErrorsFingerprintCacheHits:      appErrorsFingerprintCacheHits,
+		appErrorsDedupeMerges:              appErrorsDedupeMerges,
+		appErrorsFlushDuration:             appErrorsFlushDuration,
+		appErrorsPurges:                    appErrorsPurges,
+		previewJanitorOutcomes:             previewJanitorOutcomes,
+		dataUpstreamRTT:                    dataUpstreamRTT,
+		dataUpstreamProbes:                 dataUpstreamProbes,
+		dataUpstreamProbeDuration:          dataUpstreamProbeDuration,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
 		failedLoginTotal:                   failedLoginTotal,
 		failedLoginDropped:                 failedLoginDropped,
 		failedLoginAuditWriteFailures:      failedLoginAuditWriteFailures,
+		auditEventsDeletedTotal:            auditEventsDeletedTotal,
+		auditEventsRetentionLagSeconds:     auditEventsRetentionLagSeconds,
+		auditEventsVolumeTotal:             auditEventsVolumeTotal,
 		alertEvalSkippedDegradedTotal:      alertEvalSkippedDegradedTotal,
 		alertEvalFiredTotal:                alertEvalFiredTotal,
 		alertDeliveryAttemptsTotal:         alertDeliveryAttemptsTotal,
@@ -2540,6 +2995,35 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 // CounterVec is shared with other label tuples.
 func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter {
 	return m.watchdogKills.WithLabelValues(fromState, toState)
+}
+
+// ObserveDrainWait (issue #587 / PR-A) records the wall-clock
+// duration of a drain.Tracker.Drain call. outcome is one of
+// drain.Outcome{Clean,DeadlineExceeded,Cancelled} — the caller
+// passes the string it got back from Drain. daemon ∈ {gatewayd-public,
+// gatewayd-internal} — the prefix is the per-daemon scope, not
+// the metric name (the metric is `gatewayd_drain_wait_seconds`
+// in production with the gatewayd prefix; the prefix is already
+// applied by NewOpsMetrics). Nil-safe: nil receiver is a no-op
+// so unit tests don't have to wire metrics.
+func (m *OpsMetrics) ObserveDrainWait(daemon, outcome string, seconds float64) {
+	if m == nil || m.gatewayDrainWaitSeconds == nil {
+		return
+	}
+	m.gatewayDrainWaitSeconds.WithLabelValues(daemon, outcome).Observe(seconds)
+}
+
+// SetInflightRequests (issue #587 / PR-A) sets the per-daemon
+// per-op in-flight gauge. op ∈ {http, upgrade, control}. Called
+// by the daemon at boot (zero) and after every drain.Tracker
+// state change (the tracker exposes Inflight() and
+// MaxInflight()). daemon follows the same convention as
+// ObserveDrainWait. Nil-safe.
+func (m *OpsMetrics) SetInflightRequests(daemon, op string, count float64) {
+	if m == nil || m.gatewayInflightRequests == nil {
+		return
+	}
+	m.gatewayInflightRequests.WithLabelValues(daemon, op).Set(count)
 }
 
 // LivenessRestarts returns the per-(app, deployment) counter the
@@ -2637,6 +3121,75 @@ func (m *OpsMetrics) WriteRedirectLatency() prometheus.Observer {
 	return m.writeRedirectLatency
 }
 
+// ObserveAppErrorsRecorded increments the customer-facing
+// automatic error grouping ingest counter (ADR-096). outcome
+// MUST be one of {ok, redaction_failed, rate_limited, db_error};
+// the closed set is enforced by the canonical ADR-096 spec
+// (the apid gRPC handler + gatewayd-internal recorder share
+// this contract). nil-safe — no-op if m is nil.
+func (m *OpsMetrics) ObserveAppErrorsRecorded(outcome string) {
+	if m == nil || m.appErrorsRecorded == nil {
+		return
+	}
+	m.appErrorsRecorded.WithLabelValues(outcome).Inc()
+}
+
+// ObserveAppErrorsFingerprintCacheHit increments the in-process
+// LRU fingerprint cache hit counter (ADR-096). nil-safe.
+func (m *OpsMetrics) ObserveAppErrorsFingerprintCacheHit() {
+	if m == nil || m.appErrorsFingerprintCacheHits == nil {
+		return
+	}
+	m.appErrorsFingerprintCacheHits.Inc()
+}
+
+// ObserveAppErrorsDedupeMerge increments the server-side
+// dedupe-merge counter (ADR-096). Fires once per ON CONFLICT
+// DO UPDATE that bumps an existing row's count + last_seen_at.
+// nil-safe.
+func (m *OpsMetrics) ObserveAppErrorsDedupeMerge() {
+	if m == nil || m.appErrorsDedupeMerges == nil {
+		return
+	}
+	m.appErrorsDedupeMerges.Inc()
+}
+
+// ObserveAppErrorsFlushDuration records one sample of the
+// gatewayd-internal publisher's per-flush wall-clock duration
+// (ADR-096). Callers should pass seconds. nil-safe — no-op if
+// m is nil.
+func (m *OpsMetrics) ObserveAppErrorsFlushDuration(seconds float64) {
+	if m == nil || m.appErrorsFlushDuration == nil {
+		return
+	}
+	m.appErrorsFlushDuration.Observe(seconds)
+}
+
+// ObserveAppErrorsPurge records one observation of the apid
+// retention cron (ADR-096). outcome ∈ {ok, no_accounts,
+// failed}. nil-safe — no-op if m is nil or the metric was
+// pre-instantiated without labels. The closed outcome set keeps
+// cardinality bounded.
+func (m *OpsMetrics) ObserveAppErrorsPurge(outcome string) {
+	if m == nil || m.appErrorsPurges == nil {
+		return
+	}
+	m.appErrorsPurges.WithLabelValues(outcome).Inc()
+}
+
+// ObservePreviewJanitor records one observation of the apid
+// preview teardown cron (ADR-095 PR-C / issue #272). outcome ∈
+// {ok, failed, torn_down}. nil-safe — no-op if m is nil or the
+// metric was pre-instantiated without labels. The closed outcome
+// set keeps cardinality bounded per the ObserveAppErrorsPurge
+// convention (ADR-096 retention cron shares the same pattern).
+func (m *OpsMetrics) ObservePreviewJanitor(outcome string) {
+	if m == nil || m.previewJanitorOutcomes == nil {
+		return
+	}
+	m.previewJanitorOutcomes.WithLabelValues(outcome).Inc()
+}
+
 // GuestInitDuration returns the {(app, runner)}-labeled histogram
 // observer for guest-init boot duration (issue #470 / PR C / ADR-074).
 // The empty-tuple sentinel ("", "") is pre-instantiated at boot so
@@ -2648,6 +3201,33 @@ func (m *OpsMetrics) GuestInitDuration(app, runner string) prometheus.Observer {
 		return nil
 	}
 	return m.guestInitDuration.WithLabelValues(app, runner)
+}
+
+// WakeRPCDuration (ADR-097, P1B) returns the {(app, phase)}-labeled
+// histogram observer for schedd-side wake-phase duration. phase is
+// the closed set {admit_to_rpc, rpc_call, rpc_to_running}; callers
+// attach wake_id as a prometheus.Exemplar via ObserveWithExemplar
+// on the returned observer. The accessor is nil-safe — returns nil
+// on a nil receiver so Engine unit tests that construct the engine
+// without metrics keep working (mirrors GuestInitDuration above).
+//
+// Distinct from the legacy WakePhaseDuration(phase, result string)
+// at metrics.go:3783 (events platform, ADR-064, {phase, result}
+// labels, full wake envelope). The two metrics cover different
+// windows: wake_rpc_duration_seconds is the schedd-side RPC path
+// only; wake_phase_duration_seconds covers every wake phase from
+// queue→admit through proxy first byte. They are correlated by
+// wake_id exemplar on the schedd-side observations.
+//
+// Naming the new accessor WakeRPCDuration avoids the collision
+// with the legacy WakePhaseDuration accessor — both surface
+// prometheus.Observer, but the new one carries a wake_id exemplar
+// obligation that the legacy one does not.
+func (m *OpsMetrics) WakeRPCDuration(app, phase string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.wakeRPCDuration.WithLabelValues(app, phase)
 }
 
 // WakeSnapshotTier returns the per-tier counter the engine increments
@@ -3023,6 +3603,53 @@ func (m *OpsMetrics) FailedLoginAuditWriteFailures() prometheus.Counter {
 		return nil
 	}
 	return m.failedLoginAuditWriteFailures
+}
+
+// AuditEventsDeleted returns the unlabelled counter for audit-
+// event rows pruned by the daily retention pass (pkg/eventretention,
+// ADR-075). Distinct from the per-kind volume counter so an operator
+// can see "is the prune loop running AND is it making progress"
+// without conflating emit rate with delete rate. Backs the
+// docs/runbooks/FaasAuditRetentionExhaustion.md runbook alongside
+// AuditEventsRetentionLag. ADR-091 D20.3 / PR-B residual.
+//
+// Also satisfies eventretention.Ops — the cleanup loop calls
+// .Add(float64(n)) on the returned counter (only when n > 0 so
+// idle passes don't tick up).
+func (m *OpsMetrics) AuditEventsDeleted() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.auditEventsDeletedTotal
+}
+
+// AuditEventsRetentionLag returns the gauge of seconds since
+// the most recent retention cutoff was computed. Set (not Inc) —
+// the value reflects the LATEST pass. A pinned-zero value is the
+// canary for "the loop is running but never deleting anything"
+// (events table growing). ADR-091 D20.3 / PR-B residual.
+//
+// Also satisfies eventretention.Ops — the cleanup loop calls
+// .Set(seconds) on the returned gauge on every successful pass
+// (so pinned-zero on an idle pass is a red flag).
+func (m *OpsMetrics) AuditEventsRetentionLag() prometheus.Gauge {
+	if m == nil {
+		return nil
+	}
+	return m.auditEventsRetentionLagSeconds
+}
+
+// AuditEventsVolumeTotal returns the per-kind-prefix counter for
+// audit-event emit calls. kind_prefix is the bounded-admission
+// label — overflow collapses to "__other__" via the wire admission
+// helper so Prometheus series stay bounded. Safe to call from the
+// emit hot path; the underlying CounterVec is shared and pre-
+// instantiated at boot. ADR-091 D20.3 / PR-B residual.
+func (m *OpsMetrics) AuditEventsVolumeTotal(kindPrefix string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.auditEventsVolumeTotal.WithLabelValues(kindPrefix)
 }
 
 // RequestFailure is the primitive counter accessor for
@@ -4157,11 +4784,12 @@ func (m *OpsMetrics) ObserveScaleUp(app, outcome string) {
 	m.scaleUpDecisions.WithLabelValues(app, outcome).Inc()
 }
 
-// ObserveScaleDown records one aggressive-reaper scale-down decision
-// (issue #171). One observation per app per 10 s reaper tick that ran
-// the new code path. outcome ∈ {park, keep}; "park" is emitted once
-// per app per tick even when multiple instances are parked. Safe on
-// a nil receiver so schedd unit tests without metrics keep working.
+// ObserveScaleDown records one reaper scale-down decision per app
+// per 10 s reaper tick that ran the new code path. outcome ∈
+// {park, keep, min_floor_already, cooldown_held}; emitted by both
+// ReapIdle (P1D) and ReapAggressive (P1C), one observation per
+// app per reaper branch per tick. Safe on a nil receiver so schedd
+// unit tests without metrics keep working.
 func (m *OpsMetrics) ObserveScaleDown(app, outcome string) {
 	if m == nil {
 		return
@@ -4322,15 +4950,21 @@ const (
 	AdvisorySeverityInfo = "info"
 )
 
-// GithubdBridgeKindGitHub is the only value the `kind` label
-// takes on the githubd → apid build enqueue counter (issue #432
-// phase 5). Mirrored as the constant the apid-side bridge
-// increments via IncGithubdBridgeEnqueued. The loop in
-// NewOpsMetrics pre-instantiates this value so the row surfaces
-// in /metrics from boot — same precedent as the advisorySeverity
-// closed-set above.
+// GithubdBridgeKind* are the closed-set values for the `kind`
+// label on githubd_bridge_enqueued_total (issue #432 phase 5;
+// extended for issue #272 / ADR-094 PR-preview environments).
+// The bridge stamps DeploymentKindGitHub for push events and
+// DeploymentKindPreview for pull_request events — the metric
+// label mirrors the resolved deployment kind so dashboards
+// can split preview traffic from production-push traffic.
+//
+// The closed-set switch in IncGithubdBridgeEnqueued drops
+// unknown values silently (CardinalityGuard). The pre-
+// instantiation loop in NewOpsMetrics pre-fills both values
+// so the rows surface in /metrics from boot.
 const (
-	GithubdBridgeKindGitHub = "github"
+	GithubdBridgeKindGitHub  = "github"
+	GithubdBridgeKindPreview = "preview"
 )
 
 // PathFilterMode* are the closed-set values for the `mode`
@@ -4418,14 +5052,15 @@ func (m *OpsMetrics) ObserveStatelessAdvisory(severity string) {
 }
 
 // IncGithubdBridgeEnqueued increments
-// githubd_bridge_enqueued_total{kind} (issue #432 phase 5). Called
-// from cmd/apid/githubd_bridge.go's EnqueueBuild handler on each
-// landed build row. kind is GithubdBridgeKindGitHub — the only
-// value the githubd bridge produces today; the switch is
-// forward-compat for future daemon-to-daemon build sources. Unknown
-// values produce no increment (closed-set guard). Nil receiver is
-// allowed for parity with the other Observe* accessors — apid
-// unit tests that don't wire metrics keep working.
+// githubd_bridge_enqueued_total{kind} (issue #432 phase 5;
+// extended for issue #272 / ADR-094 PR-preview environments).
+// Called from cmd/apid/githubd_bridge.go's EnqueueBuild handler
+// on each landed build row. kind is one of GithubdBridgeKindGitHub
+// (production push) or GithubdBridgeKindPreview (pull_request
+// preview). Unknown values produce no increment (closed-set
+// guard). Nil receiver is allowed for parity with the other
+// Observe* accessors — apid unit tests that don't wire metrics
+// keep working.
 //
 // The function name uses the Inc* prefix (not Observe*) because
 // it accepts a state.DeploymentKind-shaped enum value, not a
@@ -4438,7 +5073,7 @@ func (m *OpsMetrics) IncGithubdBridgeEnqueued(kind string) {
 		return
 	}
 	switch kind {
-	case GithubdBridgeKindGitHub:
+	case GithubdBridgeKindGitHub, GithubdBridgeKindPreview:
 		m.apidGithubdBridgeEnqueuedTotal.WithLabelValues(kind).Inc()
 	}
 }

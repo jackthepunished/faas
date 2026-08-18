@@ -103,6 +103,50 @@ groups:
             0.001
           )
 
+      # ─────────────────────────────────────────────────────────────────
+      # ADR-093 — per-route observability (gatewayd-internal)
+      # ─────────────────────────────────────────────────────────────────
+      #
+      # Mirror of the apid per-route pattern above. The bounded
+      # admission set behind gateway_request_*{route,…} bounds the
+      # series fan-out to O(50 routes × N apps), not O(paths). The
+      # recording rules here ride the same machinery the apid-side
+      # rules use so the dashboard panels can join on (app, route)
+      # uniformly. Clamp_min(...) guards /0 on quiet routes.
+      #
+      # Why this is opt-in only at the metric level: the
+      # gateway_request_*_total{route=…} series are emitted
+      # unconditionally on every request that lands on an
+      # opted-in app. Off-apps still emit the pre-ADR-042
+      # {app, code} / {app, class} series; the recording
+      # rules below simply have zero data points to aggregate.
+      - record: faas_gateway_request_rate_3d_baseline:by_route
+        expr: |
+          avg_over_time(
+            sum by (app, route) (rate(gateway_requests_by_route_total[5m]))[3d:5m]
+          )
+      - record: faas_gateway_request_rate_5m:by_route
+        expr: sum by (app, route) (rate(gateway_requests_by_route_total[5m]))
+      - record: faas_gateway_request_rate_ratio:by_route
+        expr: |
+          faas_gateway_request_rate_5m:by_route
+          /
+          clamp_min(faas_gateway_request_rate_3d_baseline:by_route, 0.001)
+      - record: faas_gateway_error_rate_5m:by_route
+        expr: |
+          sum by (app, route) (rate(gateway_request_failures_by_route_total[5m]))
+          /
+          clamp_min(
+            sum by (app, route) (rate(gateway_requests_by_route_total[5m])),
+            0.001
+          )
+      - record: faas_gateway_p95_seconds:by_route
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (app, route, le) (rate(gateway_request_duration_by_route_seconds_bucket[5m]))
+          )
+
   - name: faas_slo
     interval: 30s
     rules:
@@ -334,6 +378,104 @@ groups:
           summary: "apid audit writes failing above 5/min"
           description: "The apid audit event append failure rate has exceeded 5 failures per minute over the rolling 5-minute window for 5m. Audit rows may be missing even though customer actions continue to succeed (best-effort per ADR-035). Drill down per-account via the runbook; sustained failures point at the events table, Postgres WAL, or the connection pool."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasApidAuditWriteFailures.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # apid audit-event retention (ADR-091 D20.4 / PR-D20.4, ADR-075).
+      #
+      # PR-B (PR #857) shipped the three prerequisite metrics in
+      # pkg/wire/metrics.go (apid_audit_events_deleted_total,
+      # apid_audit_events_retention_lag_seconds, apid_audit_events_volume_total{kind_prefix}).
+      # This group closes the operator surface: three alerts that map
+      # directly onto docs/runbooks/FaasAuditRetentionExhaustion.md's
+      # three-signal triage.
+      #
+      # Metric-semantics notes (PR-D20.4 review caught three bugs that
+      # would have shipped broken alerts — kept here as the tripwire):
+      #
+      #   1. apid_audit_events_retention_lag_seconds is `Set`, not
+      #      `Accumulate`. The gauge reads ~7,776,000 seconds (90d) on
+      #      every healthy pass (pkg/eventretention/cleanup.go:211-213)
+      #      because cutoff = now - 90d (line 198-199). Between passes
+      #      Prometheus's stale-marker keeps the last value — the
+      #      gauge does NOT grow over time. We alert on staleness
+      #      (`time() - timestamp(...)`) instead of value thresholds.
+      #
+      #   2. apid_audit_events_deleted_total is only incremented when
+      #      deleted > 0 (cleanup.go:205-210). On a healthy fleet with
+      #      rows already trimmed, the counter is idle for stretches.
+      #      The growth-vs-pruned alert ANDs in `volume_rate > 0` so
+      #      it doesn't fire on idle days.
+      #
+      #   3. The production Interval is the default 24h
+      #      (cmd/apid/main.go:604-617 — no Interval override). All
+      #      staleness thresholds below scale off this cadence.
+      # ─────────────────────────────────────────────────────────────────
+      - alert: FaasAuditRetentionLoopStalled
+        # The cleanup loop hasn't completed a pass in >26h. Loop
+        # cadence is 24h; the 2h slack covers the first-pass grace
+        # window (cleanup.go:223-227 — Run's first pass is immediate
+        # but a transient Postgres error delays the next good pass
+        # by one full interval). `for: 30m` debounces a single
+        # missed pass. SOC 2 CC6.2 retention obligation at risk —
+        # page.
+        expr: time() - timestamp(apid_audit_events_retention_lag_seconds) > 93600
+        for: 30m
+        labels:
+          severity: page
+          component: apid
+          family: audit_retention
+        annotations:
+          summary: "apid audit-event retention loop stalled >26h"
+          description: "The daily audit-event retention cleanup loop (pkg/eventretention, ADR-075) has not completed a successful pass in >26h. The gauge apid_audit_events_retention_lag_seconds stops updating when the loop stalls; Prometheus scrapes see a stale value. SOC 2 CC6.2 evidence-retention obligation is at risk. Drill down per the runbook: check apid logs for `eventretention.first_pass_failed` and `eventretention.delete` error paths."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasAuditRetentionExhaustion.md"
+
+      - alert: FaasAuditRetentionLoopStretched
+        # The loop ran but hasn't run again in >2x cadence (50h vs
+        # 24h + 2h slack). Either CutoffDays was misconfigured, the
+        # ticker died, or the cleanup goroutine crashed. The gauge
+        # IS updating (so loop is alive per the stalled rule's
+        # semantics) but the cadence is broken — ticket-tier
+        # operational signal, not page-tier.
+        expr: time() - timestamp(apid_audit_events_retention_lag_seconds) > 180000
+        for: 30m
+        labels:
+          severity: warn
+          component: apid
+          family: audit_retention
+        annotations:
+          summary: "apid audit-event retention loop stretched >50h"
+          description: "The audit-event retention loop is alive (gauge IS updating) but the cadence has stretched past 2x the 24h interval (50h with 2h slack). Either eventretention.CutoffDays was bumped without authorisation, the ticker goroutine died, or a Postgres connection-pool stall is blocking the next pass. The loop is still pruning rows — but the next scheduled pass is overdue."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasAuditRetentionExhaustion.md"
+
+      - alert: FaasAuditRetentionTableGrowingFasterThanPruned
+        # The events table is growing faster than the loop prunes.
+        # The volume counter claims N inserts/day, but the delete
+        # counter is lagging by >100 rows/day over a 24h window.
+        # The `> 0` precondition prevents the alert from firing on
+        # idle days when deleted_total is flat (the counter is only
+        # bumped when deleted > 0 per cleanup.go:205-210). 100
+        # rows/day absolute threshold tolerates small fleet
+        # variance. Real-world failure modes: long-running
+        # transaction pinning row visibility, or events_at_idx
+        # bloat making the DELETE slow enough to drift past the
+        # 24h interval.
+        expr: |
+          sum(rate(apid_audit_events_volume_total[24h])) > 0
+          and
+          (
+            sum(rate(apid_audit_events_volume_total[24h]))
+            - sum(rate(apid_audit_events_deleted_total[24h]))
+            > 100
+          )
+        for: 6h
+        labels:
+          severity: warn
+          component: apid
+          family: audit_retention
+        annotations:
+          summary: "apid audit-event table growing faster than pruned"
+          description: "The events table insert rate (sum across all kind_prefix labels) exceeds the delete rate by >100 rows/day over the rolling 24h window for 6h. The volume counter is updating (loop alive per FaasAuditRetentionLoopStalled); the delete counter is lagging. Drill down via the runbook — two likely causes: long-running transaction on the events table pinning DELETE row visibility, or events_at_idx bloat making the DELETE slow enough to drift past the 24h cadence."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasAuditRetentionExhaustion.md"
 
       # ─────────────────────────────────────────────────────────────────
       # Per-tenant noisy-customer detection (issue #300).
@@ -825,6 +967,36 @@ groups:
           summary: "githubd path-filter degraded — credentials missing or compare API unreachable"
           description: "githubd_path_filter_total{mode=error|breaker_open} has been ticking for 10m. mode=error fires when the GitHub App credentials are not provisioned (cmd/githubd wires NewUnavailableChangedFiles as the stub) or when the GitHub compare API returned a transport / non-2xx error. mode=breaker_open fires after 3 consecutive errors trip the breaker (pkg/githubd/changedfiles.go). Either way every push rebuilds every touched app — the conservative posture defeats the path-filter efficiency win. Verify: 1) FAAS_GITHUB_APP_ID + FAAS_GITHUB_APP_KEY_PATH point at a valid App + key; 2) outbound api.github.com is reachable; 3) the App installation hasn't been revoked. Runbook: docs/runbooks/FaasGithubdPathFilterDegraded.md."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasGithubdPathFilterDegraded.md"
+
+      # ─────────────────────────────────────────────────────────────────
+      # ADR-093 — wildcard-route detector
+      # ─────────────────────────────────────────────────────────────────
+      #
+      # The per-route observability surface bounds each app at 50
+      # distinct real routes; further routes collapse to the
+      # __route_other__ overflow bucket (ADR-093 D2). A sustained
+      # spike on __route_other__ for a single (app, route) tuple is
+      # the canonical "this app is now serving a wildcard path
+      # pattern (e.g. /users/{uuid}) — the per-route series is
+      # collapsing because distinct path count > 50" signal.
+      #
+      # Severity is info (not warn/page) — the customer app still
+      # serves correctly; we just stopped distinguishing routes
+      # for them. Operators should treat a sustained spike as
+      # "either the customer added a wildcard route OR something
+      # is path-fuzzing their app".
+      - alert: GatewayWildcardRoute
+        expr: |
+          sum by (app, route) (rate(gateway_requests_by_route_total{route="__route_other__"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: info
+          component: gatewayd-internal
+          family: route_metrics
+        annotations:
+          summary: "App {{ $labels.app }} sustained in __route_other__ overflow for 10m"
+          description: "gateway_requests_by_route_total{route=__route_other__, app={{ $labels.app }}} has been above 1 reqps for 10m. The bounded admission set (50 routes + the __route_other__ bucket, ADR-093 D2) is collapsing distinct paths because the app is generating more than 50 distinct routes. Two interpretations: (1) the customer deployed a wildcard route pattern (/users/{uuid}) and the per-route breakdown is intentionally collapsing; (2) the app is being path-fuzzed. Runbook: docs/runbooks/GatewayWildcardRoute.md."
+          runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/GatewayWildcardRoute.md"
 
       - alert: FaasGithubdPathFilterDegradedWarn
         expr: sum(rate(githubd_path_filter_total{mode=~"error|breaker_open"}[5m])) > 0

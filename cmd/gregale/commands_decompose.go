@@ -122,7 +122,18 @@ func resolveScanSource(
 		return tarball, filepath.Base(tarball), func() {}, nil
 	}
 	if pathFlag != "" {
-		path, _, n, err := autoPackCwd(pathFlag)
+		// Secret-scan runs on the explicit path the same way it does for
+		// the cwd path below — any source tree the customer packs goes
+		// through the same pre-upload credential check. We use
+		// modeSourceTree here because plan-time resolution walks the
+		// whole tree (the per-file body scan is cheaper than re-walking
+		// once for .env and once for everything else).
+		overrides, scanFindings, scanErr := scanAndRedactEnvFiles(pathFlag, modeSourceTree)
+		if scanErr != nil {
+			return "", "", func() {}, fmt.Errorf("secret scan failed: %w", scanErr)
+		}
+		renderSecretScanWarnings(scanFindings, osStderr)
+		path, _, n, err := autoPackCwd(pathFlag, overrides)
 		if err != nil {
 			return "", "", func() {}, err
 		}
@@ -146,7 +157,12 @@ func resolveScanSource(
 		if err != nil {
 			return "", "", func() {}, err
 		}
-		path, _, n, err := autoPackCwd(cwd)
+		overrides, scanFindings, scanErr := scanAndRedactEnvFiles(cwd, modeSourceTree)
+		if scanErr != nil {
+			return "", "", func() {}, fmt.Errorf("secret scan failed: %w", scanErr)
+		}
+		renderSecretScanWarnings(scanFindings, osStderr)
+		path, _, n, err := autoPackCwd(cwd, overrides)
 		if err != nil {
 			return "", "", func() {}, err
 		}

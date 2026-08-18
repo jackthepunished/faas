@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from ..models.deployment_liveness_probe import DeploymentLivenessProbe
     from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
     from ..models.scan_result import ScanResult
+    from ..models.secret_scan_result import SecretScanResult
 
 
 T = TypeVar("T", bound="DeploymentResponse")
@@ -100,12 +101,32 @@ class DeploymentResponse:
     traffic_percent: int | Unset = UNSET
     """Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by
     construction."""
+    scope: None | str | Unset = UNSET
+    """Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash.
+    nil/omitted = `default`."""
+    secret_scan: None | SecretScanResult | Unset = UNSET
+    """Per-deploy secret-scan audit row (PR-A / ADR-101). Mirrors
+    the `scan` field shape — absent when the row has not been
+    scanned yet (deploy mid-pipeline or pre-PR-A), present
+    with `findings=[]` for a clean walk, present with
+    one-or-more entries for a hit. Read by the dashboard's
+    "secret scan" card and the CLI's `--show-secret-scan`
+    flag. Stamped both for the imaged-side layer walk (main
+    image + each sidecar; post-build, loud-fail on any
+    finding) and — forward-compat — for the apid-side
+    source-tree 422 path. Status closed-set the writer
+    stamps: "complete" (clean) | "complete_with_redactions"
+    (hit). The `image_digest` sub-field records which OCI
+    digest the imaged walk ran against; null on legacy
+    pre-PR-A rows. See `pkg/imaged/secretscan.go`.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.deployment_healthcheck import DeploymentHealthcheck
         from ..models.deployment_liveness_probe import DeploymentLivenessProbe
         from ..models.scan_result import ScanResult
+        from ..models.secret_scan_result import SecretScanResult
 
         id = self.id
 
@@ -209,6 +230,20 @@ class DeploymentResponse:
 
         traffic_percent = self.traffic_percent
 
+        scope: None | str | Unset
+        if isinstance(self.scope, Unset):
+            scope = UNSET
+        else:
+            scope = self.scope
+
+        secret_scan: dict[str, Any] | None | Unset
+        if isinstance(self.secret_scan, Unset):
+            secret_scan = UNSET
+        elif isinstance(self.secret_scan, SecretScanResult):
+            secret_scan = self.secret_scan.to_dict()
+        else:
+            secret_scan = self.secret_scan
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -255,6 +290,10 @@ class DeploymentResponse:
             field_dict["parked_at"] = parked_at
         if traffic_percent is not UNSET:
             field_dict["traffic_percent"] = traffic_percent
+        if scope is not UNSET:
+            field_dict["scope"] = scope
+        if secret_scan is not UNSET:
+            field_dict["secret_scan"] = secret_scan
 
         return field_dict
 
@@ -264,6 +303,7 @@ class DeploymentResponse:
         from ..models.deployment_liveness_probe import DeploymentLivenessProbe
         from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
         from ..models.scan_result import ScanResult
+        from ..models.secret_scan_result import SecretScanResult
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -444,6 +484,32 @@ class DeploymentResponse:
 
         traffic_percent = d.pop("traffic_percent", UNSET)
 
+        def _parse_scope(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        scope = _parse_scope(d.pop("scope", UNSET))
+
+        def _parse_secret_scan(data: object) -> None | SecretScanResult | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                secret_scan_type_0 = SecretScanResult.from_dict(data)
+
+                return secret_scan_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | SecretScanResult | Unset, data)
+
+        secret_scan = _parse_secret_scan(d.pop("secret_scan", UNSET))
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -468,6 +534,8 @@ class DeploymentResponse:
             parked_reason=parked_reason,
             parked_at=parked_at,
             traffic_percent=traffic_percent,
+            scope=scope,
+            secret_scan=secret_scan,
         )
 
         deployment_response.additional_properties = d

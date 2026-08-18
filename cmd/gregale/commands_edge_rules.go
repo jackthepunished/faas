@@ -30,11 +30,17 @@ import (
 )
 
 // edgeRuleKindVocab mirrors the closed `kind` set in
-// migrations/00192_edge_rules.sql's CHECK constraint. Surfacing a
-// typo locally avoids a 400 round-trip on every `edge-rules create`
-// call (same posture as webhookClosedVocab in commands_webhooks.go).
+// migrations/00192_edge_rules.sql's CHECK constraint (extended by
+// migrations/00214 for validate, 00219 for limit, 00229 for geo,
+// 00236 for maintenance, 00244 for throttle, and 00244 for budget
+// (post-merge the budget migration renumbered to the same slot as
+// the throttle migration — see ADR-091 D20.5 amendment, issue #881
+// + ADR-093). Surfacing a typo locally avoids a 400 round-trip on
+// every `edge-rules create` call (same posture as webhookClosedVocab
+// in commands_webhooks.go).
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
+	"validate", "limit", "geo", "maintenance", "throttle", "budget",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
@@ -96,7 +102,7 @@ func cmdEdgeRules(args []string) int {
 func cmdEdgeRulesList(args []string) int {
 	fs := flag.NewFlagSet("edge-rules list", flag.ContinueOnError)
 	slug := fs.String("app", "", "filter to a single app slug")
-	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip)")
+	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -134,9 +140,9 @@ func cmdEdgeRulesList(args []string) int {
 	}
 	_, _ = fmt.Fprintf(osStdout, "%-36s %-12s %-9s %-32s %s\n", "ID", "KIND", "PRIORITY", "MATCH HOST", "MATCH PATH")
 	for _, it := range items {
-		enabled := "on"
+		enabled := secretScanOn
 		if !it.Enabled {
-			enabled = "off"
+			enabled = secretScanOff
 		}
 		_, _ = fmt.Fprintf(osStdout, "%-36s %-12s %-9d %-32s %s  [%s]\n",
 			it.ID, it.Kind, it.Priority, truncate(it.MatchHost, 32), it.MatchPath, enabled)
@@ -154,7 +160,7 @@ func cmdEdgeRulesList(args []string) int {
 func cmdEdgeRulesCreate(args []string) int {
 	fs := flag.NewFlagSet("edge-rules create", flag.ContinueOnError)
 	slug := fs.String("app", "", "app slug (required)")
-	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip (required)")
+	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle (required)")
 	matchHost := fs.String("match-host", "", "host to match (required)")
 	matchPath := fs.String("match-path", "/", "path to match")
 	var matchMethods multiFlag
@@ -210,6 +216,34 @@ func cmdEdgeRulesCreate(args []string) int {
 	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR (repeat)")
 	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR (repeat)")
 
+	// limit (ADR-091 D24). Standalone per-route body cap — the
+	// primitive for "POST /upload ≤ 5 MB" without a JSON Schema.
+	// Both flags are required-as-a-pair at the action-struct
+	// level: --limit-max-body-bytes must be > 0 (otherwise
+	// apid-Validate returns 422). --limit-max-body-bytes-streaming
+	// is optional (0 = no streaming carve-out, falls back to the
+	// buffered cap). Clamps are enforced server-side by
+	// pkg/api.EdgeRuleLimitAction.Validate().
+	limitMaxBodyBytes := fs.Int("limit-max-body-bytes", 0, "kind=limit: required buffered body cap in bytes (>0, <=25MiB)")
+	limitMaxBodyBytesStreaming := fs.Int("limit-max-body-bytes-streaming", 0, "kind=limit: optional streaming body cap in bytes (0=inherit buffered; <=100MiB)")
+	// geo (ADR-091 D21). ISO 3166-1 alpha-2 country codes; the
+	// validator in pkg/api/dto.go enforces the closed vocab.
+	var geoAllow, geoDeny multiFlag
+	fs.Var(&geoAllow, "geo-allow", "kind=geo: allow country code (ISO 3166-1 alpha-2; repeat)")
+	fs.Var(&geoDeny, "geo-deny", "kind=geo: deny country code (ISO 3166-1 alpha-2; repeat)")
+
+	// throttle (ADR-091 D20.5 amendment, issue #881). Per-route
+	// token-bucket cap. rps is required-as-positive (the apid
+	// validator rejects 0 / negative with 422 to prevent a
+	// permanently unevictable bucket under the LRU invariant —
+	// see pkg/gateway/ratelimit.go::NewLimiterWithLRU). burst is
+	// required-as-positive for the same reason. Sub-plan ceiling
+	// check happens server-side (the CLI is HTTP-only and doesn't
+	// have the plan row; the apid sub-plan validator against
+	// acct.Plan is the authoritative gate).
+	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: refill rate (req/s; >0; <=plan.RateLimitRPS)")
+	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: token-bucket burst (>0; <=plan.RateLimitBurst)")
+
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -221,31 +255,37 @@ func cmdEdgeRulesCreate(args []string) int {
 		return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
 	}
 	actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
-		RouteTarget:     *routeTarget,
-		RewriteFrom:     *rewriteFrom,
-		RewriteTo:       *rewriteTo,
-		RedirectStatus:  *redirectStatus,
-		RedirectTo:      *redirectTo,
-		RedirectHeaders: redirectHeaders,
-		HeadersReqAdd:   headersReqAdd,
-		HeadersReqSet:   headersReqSet,
-		HeadersReqRm:    headersReqRm,
-		HeadersResAdd:   headersResAdd,
-		HeadersResSet:   headersResSet,
-		HeadersResRm:    headersResRm,
-		CORSOrigins:     corsOrigins,
-		CORSMethods:     corsMethods,
-		CORSHeaders:     corsHeaders,
-		CORSExpose:      corsExpose,
-		CORSCreds:       *corsCreds,
-		CORSMaxAge:      *corsMaxAge,
-		JWTIssuer:       *jwtIssuer,
-		JWTJWKS:         *jwtJWKS,
-		JWTAudience:     jwtAudience,
-		JWTAlgorithms:   jwtAlgorithms,
-		JWTClaims:       jwtClaims,
-		IPAllow:         ipAllow,
-		IPDeny:          ipDeny,
+		RouteTarget:                *routeTarget,
+		RewriteFrom:                *rewriteFrom,
+		RewriteTo:                  *rewriteTo,
+		RedirectStatus:             *redirectStatus,
+		RedirectTo:                 *redirectTo,
+		RedirectHeaders:            redirectHeaders,
+		HeadersReqAdd:              headersReqAdd,
+		HeadersReqSet:              headersReqSet,
+		HeadersReqRm:               headersReqRm,
+		HeadersResAdd:              headersResAdd,
+		HeadersResSet:              headersResSet,
+		HeadersResRm:               headersResRm,
+		CORSOrigins:                corsOrigins,
+		CORSMethods:                corsMethods,
+		CORSHeaders:                corsHeaders,
+		CORSExpose:                 corsExpose,
+		CORSCreds:                  *corsCreds,
+		CORSMaxAge:                 *corsMaxAge,
+		JWTIssuer:                  *jwtIssuer,
+		JWTJWKS:                    *jwtJWKS,
+		JWTAudience:                jwtAudience,
+		JWTAlgorithms:              jwtAlgorithms,
+		JWTClaims:                  jwtClaims,
+		IPAllow:                    ipAllow,
+		IPDeny:                     ipDeny,
+		LimitMaxBodyBytes:          *limitMaxBodyBytes,
+		LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
+		GeoAllow:                   geoAllow,
+		GeoDeny:                    geoDeny,
+		ThrottleRPS:                *throttleRPS,
+		ThrottleBurst:              *throttleBurst,
 	})
 	if err != nil {
 		return printErr("Invalid flags for --kind="+*kind, err)
@@ -361,6 +401,24 @@ func cmdEdgeRulesUpdate(args []string) int {
 	var ipAllow, ipDeny multiFlag
 	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR")
 	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR")
+	var geoAllow, geoDeny multiFlag
+	fs.Var(&geoAllow, "geo-allow", "kind=geo: allow country code (ISO 3166-1 alpha-2)")
+	fs.Var(&geoDeny, "geo-deny", "kind=geo: deny country code (ISO 3166-1 alpha-2)")
+
+	// limit (ADR-091 D24). Same flags as Create; either flag
+	// present flips anyKindFlagVisited() true so the action jsonb
+	// gets re-marshaled and shipped in the PATCH body.
+	limitMaxBodyBytes := fs.Int("limit-max-body-bytes", 0, "kind=limit: buffered body cap in bytes")
+	limitMaxBodyBytesStreaming := fs.Int("limit-max-body-bytes-streaming", 0, "kind=limit: streaming body cap in bytes (0=inherit buffered)")
+
+	// throttle (ADR-091 D20.5 amendment, issue #881). Mirror of
+	// the create-side flags. Both flags carry a "0 means save-as-
+	// is platform default" semantics — but for throttle, 0 is a
+	// 422 from the apid validator (a 0-rps rule is a leak under
+	// the LRU invariant), so the CLI explicitly rejects 0/negative
+	// here AND the validator rejects it server-side.
+	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: new refill rate (req/s; >0; <=plan.RateLimitRPS)")
+	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: new token-bucket burst (>0; <=plan.RateLimitBurst)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -418,31 +476,37 @@ func cmdEdgeRulesUpdate(args []string) int {
 			return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
 		}
 		actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
-			RouteTarget:     *routeTarget,
-			RewriteFrom:     *rewriteFrom,
-			RewriteTo:       *rewriteTo,
-			RedirectStatus:  *redirectStatus,
-			RedirectTo:      *redirectTo,
-			RedirectHeaders: redirectHeaders,
-			HeadersReqAdd:   headersReqAdd,
-			HeadersReqSet:   headersReqSet,
-			HeadersReqRm:    headersReqRm,
-			HeadersResAdd:   headersResAdd,
-			HeadersResSet:   headersResSet,
-			HeadersResRm:    headersResRm,
-			CORSOrigins:     corsOrigins,
-			CORSMethods:     corsMethods,
-			CORSHeaders:     corsHeaders,
-			CORSExpose:      corsExpose,
-			CORSCreds:       *corsCreds,
-			CORSMaxAge:      *corsMaxAge,
-			JWTIssuer:       *jwtIssuer,
-			JWTJWKS:         *jwtJWKS,
-			JWTAudience:     jwtAudience,
-			JWTAlgorithms:   jwtAlgorithms,
-			JWTClaims:       jwtClaims,
-			IPAllow:         ipAllow,
-			IPDeny:          ipDeny,
+			RouteTarget:                *routeTarget,
+			RewriteFrom:                *rewriteFrom,
+			RewriteTo:                  *rewriteTo,
+			RedirectStatus:             *redirectStatus,
+			RedirectTo:                 *redirectTo,
+			RedirectHeaders:            redirectHeaders,
+			HeadersReqAdd:              headersReqAdd,
+			HeadersReqSet:              headersReqSet,
+			HeadersReqRm:               headersReqRm,
+			HeadersResAdd:              headersResAdd,
+			HeadersResSet:              headersResSet,
+			HeadersResRm:               headersResRm,
+			CORSOrigins:                corsOrigins,
+			CORSMethods:                corsMethods,
+			CORSHeaders:                corsHeaders,
+			CORSExpose:                 corsExpose,
+			CORSCreds:                  *corsCreds,
+			CORSMaxAge:                 *corsMaxAge,
+			JWTIssuer:                  *jwtIssuer,
+			JWTJWKS:                    *jwtJWKS,
+			JWTAudience:                jwtAudience,
+			JWTAlgorithms:              jwtAlgorithms,
+			JWTClaims:                  jwtClaims,
+			IPAllow:                    ipAllow,
+			IPDeny:                     ipDeny,
+			LimitMaxBodyBytes:          *limitMaxBodyBytes,
+			LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
+			GeoAllow:                   geoAllow,
+			GeoDeny:                    geoDeny,
+			ThrottleRPS:                *throttleRPS,
+			ThrottleBurst:              *throttleBurst,
 		})
 		if err != nil {
 			return printErr("Invalid flags for --kind="+*kind, err)
@@ -530,6 +594,27 @@ type edgeRuleActionInputs struct {
 	JWTClaims                  []string
 	// ip
 	IPAllow, IPDeny []string
+	// limit (ADR-091 D24). Both fields are int — pointer types
+	// would force a "was-it-passed" triple-state distinction
+	// that's already handled by anyKindFlagVisited(). A literal
+	// 0 from a missed flag is harmless because kind=limit without
+	// a buffered cap is rejected by apid-Validate (422), so the
+	// server-side guard catches the omission cleanly.
+	LimitMaxBodyBytes          int
+	LimitMaxBodyBytesStreaming int
+	// geo (ADR-091 D21). ISO 3166-1 alpha-2 country codes;
+	// uppercased + space-stripped before the validator runs.
+	GeoAllow, GeoDeny []string
+	// throttle (ADR-091 D20.5 amendment, issue #881). Per-route
+	// token-bucket. Float64 for rps so the recommendation
+	// endpoint's ceil(observed_rps * 2) hands over a non-integer
+	// without coercing the customer's intent. The apid sub-plan
+	// validator (PlanMaxRPS / PlanMaxBurst) is the authoritative
+	// ceiling check — the CLI does the structural checks only
+	// (positive rps, positive burst) so the local error mirrors
+	// the server's "0-rps is a leak" message.
+	ThrottleRPS   float64
+	ThrottleBurst int
 }
 
 // buildEdgeRuleAction marshals the per-kind inputs into the matching
@@ -626,6 +711,70 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			return nil, errToError(err)
 		}
 		return marshalAction(a)
+	case "limit":
+		// Standalone per-route body cap. The Validate() call runs
+		// the same closed-set predicates as the apid-side action
+		// (0 → 422, negative streaming → 422, streaming-tighter-
+		// than-buffered → 422, over-cap → 422) so a CLI user gets
+		// the same error message they'd get over the wire. No
+		// regex/CIDR parse here; the only check is the cap range.
+		a := api.EdgeRuleLimitAction{
+			MaxBodyBytes:          in.LimitMaxBodyBytes,
+			MaxBodyBytesStreaming: in.LimitMaxBodyBytesStreaming,
+		}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "geo":
+		// ISO 3166-1 alpha-2 country codes. The validator in
+		// pkg/api/dto.go enforces the closed vocab + the 50-entry
+		// cardinality cap + the no-dupes invariant; the CLI just
+		// uppercases here so the wire shape is consistent regardless
+		// of how the customer typed the flag.
+		allow := upperCountryCodes(in.GeoAllow)
+		deny := upperCountryCodes(in.GeoDeny)
+		a := api.EdgeRuleGeoAction{Allow: allow, Deny: deny}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "throttle":
+		// ADR-091 D20.5 amendment / issue #881. Per-route
+		// token-bucket cap. The CLI does the structural checks
+		// (positive rps, positive burst) so the user gets the
+		// same error locally as the server would return.
+		//
+		// The CLI does NOT take a plan row (HTTP-only per
+		// memory/cli-is-http-only-not-direct-db) so the
+		// sub-plan ceiling check is performed server-side by the
+		// apid validator against acct.Plan. A "0" or "negative"
+		// rps is rejected here because the server would 422 with
+		// the same rationale — surfacing it locally saves a
+		// round-trip.
+		if in.ThrottleRPS <= 0 {
+			return nil, fmt.Errorf("throttle action: requests_per_second must be > 0 (got %g) — a 0-rps rule is a silent no-op AND would create a permanently unevictable bucket", in.ThrottleRPS)
+		}
+		if in.ThrottleBurst <= 0 {
+			return nil, fmt.Errorf("throttle action: burst must be > 0 (got %d) — same rationale as a 0-rps rule", in.ThrottleBurst)
+		}
+		a := api.EdgeRuleThrottleAction{
+			RequestsPerSecond: in.ThrottleRPS,
+			Burst:             in.ThrottleBurst,
+		}
+		// The server's EdgeRuleThrottleAction.Validate takes a
+		// ThrottleValidationContext (per-plan ceiling). The CLI
+		// calls Validate with a zero context so the structural
+		// checks fire (ctx.PlanMaxRPS / ctx.PlanMaxBurst are 0,
+		// which the validator treats as "no ceiling", so the
+		// sub-plan check is skipped at the CLI and left to the
+		// server). This matches the "fail OPEN on unknown /
+		// unavailable context" posture documented on the
+		// Validate() method.
+		if err := a.Validate(api.ThrottleValidationContext{}); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
 	}
 	return nil, fmt.Errorf("unknown kind %q", kind)
 }
@@ -651,6 +800,30 @@ func errToError(p *api.Problem) error {
 		return nil
 	}
 	return fmt.Errorf("%s", p.Detail)
+}
+
+// upperCountryCodes (ADR-091 D21) uppercases + trims each
+// ISO 3166-1 alpha-2 country code so the wire shape is consistent
+// regardless of how the customer typed the flag ("de" → "DE").
+// Empty / whitespace-only entries are dropped. The closed-vocab
+// check lives in pkg/api.EdgeRuleGeoAction.Validate (the
+// 2-letter rule + the reserved-code set).
+func upperCountryCodes(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, c := range in {
+		trimmed := strings.TrimSpace(c)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, strings.ToUpper(trimmed))
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // parseKVList splits each entry on the first `:` into Name/Value.
@@ -750,6 +923,8 @@ func anyKindFlagVisited(visited map[string]bool) bool {
 		"cors-allow-credentials", "cors-max-age-seconds",
 		"jwt-issuer", "jwt-jwks-url", "jwt-audience", "jwt-algorithm", "jwt-required-claim",
 		"ip-allow", "ip-deny",
+		"limit-max-body-bytes", "limit-max-body-bytes-streaming",
+		"throttle-requests-per-second", "throttle-burst",
 	}
 	for _, name := range kindFlagNames {
 		if visited[name] {

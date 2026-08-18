@@ -207,6 +207,19 @@ func CheckCap(l api.Limits, contentBytes int64) (sizeMB int, err error) {
 	return sizeMB, nil
 }
 
+// CheckCapForStaging is the app-layer cap check for a fully materialized
+// staging tree. Unlike CheckCap, it accounts for ext4's per-file block
+// allocation when the tree contains many small runtime files (for example,
+// Node's CA bundle and npm metadata). Using only apparent byte size can make
+// mkfs.ext4 -d run out of blocks even though the nominal 10% app slack fits.
+func CheckCapForStaging(l api.Limits, stats SmallFileStats) (sizeMB int, err error) {
+	sizeMB = BasePaddedSizeMB(stats.ContentBytes, stats.SmallRatio)
+	if sizeMB > l.AppLayerMaxMB {
+		return sizeMB, api.ErrAppLayerTooLarge(l, int64(sizeMB)*mib)
+	}
+	return sizeMB, nil
+}
+
 // MkfsCommand builds the argv that creates a populated ext4 image from a staging
 // directory WITHOUT mounting it — mke2fs's `-d` feature, so no root/loop device
 // is needed (spec §4.6). `-F` forces creation over a non-block-device file.

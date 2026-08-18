@@ -80,7 +80,7 @@ type fakeEngine struct {
 	errs    map[string]error
 }
 
-func (e *fakeEngine) AdmitInstance(_ context.Context, appID string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID)
@@ -93,12 +93,31 @@ func (e *fakeEngine) AdmitInstance(_ context.Context, appID string) (AdmitResult
 	return AdmitResult{InstanceID: "ins-" + appID}, nil
 }
 
+// EnsureWake (ADR-098): floor's trigger-local WakeOutcome mirrors
+// the canned AdmitResult. The fake records a parallel call so tests
+// that need to count EnsureWake vs AdmitInstance calls can do so.
+// Honours canned results (instance_id echo) so tests that pre-load
+// a specific InstanceID — e.g. TestTick_AuditorEmitsFloorWake
+// pinning "iid-xyz" — keep working unchanged.
+func (e *fakeEngine) EnsureWake(_ context.Context, appID string) (WakeOutcome, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, appID)
+	if err, ok := e.errs[appID]; ok {
+		return WakeOutcome{}, err
+	}
+	if r, ok := e.results[appID]; ok {
+		return WakeOutcome{InstanceID: r.InstanceID}, nil
+	}
+	return WakeOutcome{InstanceID: "ins-" + appID}, nil
+}
+
 // AdmitInstanceForDeployment mirrors AdmitInstance on the
 // per-deployment entry point (issue #557 closure / ADR-072). The
 // trigger's per-deployment walk calls this; the per-app walk still
 // calls AdmitInstance. The fake records both with the same
 // `appID|deploymentID` shape so the tests can assert either path.
-func (e *fakeEngine) AdmitInstanceForDeployment(_ context.Context, appID, deploymentID string) (AdmitResult, error) {
+func (e *fakeEngine) AdmitInstanceForDeployment(_ context.Context, appID, deploymentID, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, appID+"|"+deploymentID)

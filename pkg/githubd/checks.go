@@ -29,7 +29,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 )
@@ -99,6 +102,186 @@ type checkRunResponse struct {
 	ID int64 `json:"id"`
 }
 
+// prodCheckName is the Check Run name stamped by the production
+// push path (issue #432 phase 5, issue #739 push-to-deploy).
+// Hoisted to a constant so the preview wrapper can reference
+// the same name when overriding it for fork-refusal / preview
+// status checks (issue #272 / ADR-094).
+const prodCheckName = "faas / build"
+
+// previewCheckName is the Check Run name stamped for every
+// PR-preview event (issue #272 / ADR-094). GitHub uses the
+// (owner, repo, name) tuple as the dedup key for the Checks
+// API, so N pushes to the same PR collide on the same Check
+// Run rather than spawning N parallel rows in the PR UI.
+//
+// The name is distinct from the production-push check name
+// ("faas / build") so a commit that's both a production push
+// AND a PR preview shows up as two separate rows — the
+// production row follows the live deploy, the preview row
+// follows the preview app's deploy.
+const previewCheckName = "gregale-preview"
+
+// previewCheckConclusionNeutral is the Conclusion value
+// stamped when the preview path short-circuits without
+// success or failure — currently only the D3 fork-PR refusal.
+// GitHub renders neutral checks with a grey "—" icon and a
+// click-through to the summary, which is what we want: the
+// PR author sees "skipped for security" without an alarming
+// red ✗.
+const previewCheckConclusionNeutral = "neutral"
+
+// WritePreviewCheck posts a Check Run for the PR-preview
+// pipeline (issue #272 / ADR-094). The shape mirrors the
+// production WriteCheck HTTP call:
+//
+//   - Same endpoint, headers, token resolver.
+//   - Name is pinned to "gregale-preview" so the PR UI groups
+//     successive pushes (opened → synchronize → synchronize → …)
+//     into one Check Run rather than spawning N parallel rows.
+//   - (status, conclusion) follows the phase-derived mapping
+//     (WriteCheck handles this), identical to production.
+//   - Optional previewURL is appended to the summary as a
+//     Markdown link so the PR author can click through.
+//
+// We hand-roll the request (rather than reuse WriteCheck)
+// because WriteCheck hard-codes the production name
+// ("faas / build"); threading a name parameter through would
+// leak the preview-only concept into the production code path.
+func (c *ChecksAPI) WritePreviewCheck(ctx context.Context, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase, previewURL, summary string) error {
+	if repoFullName == "" || commitSHA == "" {
+		return fmt.Errorf("githubd: repo and sha required for preview check-run")
+	}
+	tokens, err := c.tokensForRepo(ctx, repoFullName)
+	if err != nil {
+		return err
+	}
+	fullSummary := summary
+	if previewURL != "" {
+		// Markdown link shape — GitHub's Check Run summary
+		// field is plain text but renders URLs as links when
+		// wrapped in Markdown link syntax. Keep the URL
+		// outside the link text so a long hostname doesn't
+		// blow up the PR UI's summary panel width.
+		fullSummary = summary + "\n\nPreview URL: <" + previewURL + ">"
+	}
+	body, err := json.Marshal(checkRunRequest{
+		Name:       previewCheckName,
+		HeadSHA:    commitSHA,
+		Status:     phaseToStatus(phase),
+		Conclusion: phaseToConclusion(phase),
+		Output: &checkRunOutput{
+			Title:   previewPhaseTitle(phase),
+			Summary: fullSummary,
+		},
+		ExternalID: fmt.Sprintf("faas/%s/%s", repoFullName, commitSHA),
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/check-runs", GitHubAPI, repoFullName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tokens)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "faas-githubd/1.0")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubd: write preview check-run: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return fmt.Errorf("githubd: write preview check-run: status=%d body=%s",
+			resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+// previewPhaseTitle maps a CheckPhase to a preview-specific
+// title. Mirrors phaseTitle but uses preview-friendly copy so
+// the PR UI distinguishes the "Preview queued / building / live"
+// lifecycle from the production push pipeline.
+func previewPhaseTitle(p githubdgrpc.CheckPhase) string {
+	switch p {
+	case githubdgrpc.CheckPhaseQueued:
+		return "Preview queued"
+	case githubdgrpc.CheckPhaseBuilding:
+		return "Preview building"
+	case githubdgrpc.CheckPhaseLive:
+		return "Preview live"
+	case githubdgrpc.CheckPhaseFailed:
+		return "Preview failed"
+	default:
+		return "Preview"
+	}
+}
+
+// WritePreviewCheckForkRefused posts the neutral Check Run
+// that announces a fork-PR refusal (ADR-094 D3). It does NOT
+// reuse WriteCheck directly because the (status, conclusion)
+// pair is (completed, neutral) — the production phase-derived
+// mapping only emits success/failure, never neutral. We
+// hand-roll a single POST here so the check-run writer can
+// stay generic.
+//
+// The shape mirrors the production WriteCheck HTTP call:
+// same endpoint, same headers, same token resolver. The only
+// difference is the request body.
+//
+// summary is the human-readable reason (e.g. "Fork PR
+// refused — head repo differs from base repo").
+func (c *ChecksAPI) WritePreviewCheckForkRefused(ctx context.Context, repoFullName, commitSHA, summary string) error {
+	if repoFullName == "" || commitSHA == "" {
+		return fmt.Errorf("githubd: repo and sha required for preview check-run")
+	}
+	tokens, err := c.tokensForRepo(ctx, repoFullName)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(checkRunRequest{
+		Name:       previewCheckName,
+		HeadSHA:    commitSHA,
+		Status:     statusCompleted,
+		Conclusion: previewCheckConclusionNeutral,
+		Output: &checkRunOutput{
+			Title:   "Preview skipped (security policy)",
+			Summary: summary,
+		},
+		ExternalID: fmt.Sprintf("faas/%s/%s", repoFullName, commitSHA),
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/check-runs", GitHubAPI, repoFullName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tokens)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "faas-githubd/1.0")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubd: write preview check-run: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return fmt.Errorf("githubd: write preview check-run: status=%d body=%s",
+			resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
 // WriteCheck posts a check-run for (repo, sha, phase). Idempotency
 // is the caller's responsibility — this method always creates a
 // new check-run; the StateStore-wrapped variant (NewStatefulChecks)
@@ -112,7 +295,7 @@ func (c *ChecksAPI) WriteCheck(ctx context.Context, repoFullName, commitSHA stri
 		return err
 	}
 	body, err := json.Marshal(checkRunRequest{
-		Name:       "faas / build",
+		Name:       prodCheckName,
 		HeadSHA:    commitSHA,
 		Status:     phaseToStatus(phase),
 		Conclusion: phaseToConclusion(phase),
@@ -236,3 +419,119 @@ func phaseTitle(p githubdgrpc.CheckPhase) string {
 // _ pins time so a future refactor that drops the import on
 // unused-token usage doesn't drop it prematurely.
 var _ = time.Time{}
+
+// WriteCheckCoalesced is the rate-limit defensive wrapper around
+// ChecksAPI.WriteCheck (PR-D / ADR-012 §6 closure). GitHub's
+// Checks API caps each install at 1000 calls/hour (100 req/min
+// burst); without coalescing, a noisy push loop could trip the
+// cap and starve the operator's other PRs of check-runs.
+//
+// Coalescing rule: per (repo, sha), only POST when the incoming
+// phase differs from the last-reported phase. The wrapper holds
+// the last phase in an in-memory map keyed by (repo, sha) with
+// a janitor that evicts entries older than 1h. The map is
+// process-local (a daemon restart resets the state, which is
+// safe — the worst case is one extra POST per active (repo,
+// sha) at restart, not a rate-limit trip).
+//
+// Phase transitions that are valid:
+//
+//	Unspecified → Queued    (first call after enqueue)
+//	Queued      → Building  (build started)
+//	Building    → Live      (deploy succeeded)
+//	Building    → Failed    (deploy failed)
+//
+// Same-phase re-posts (e.g. retry storms, idempotency replays)
+// are silently dropped and the
+// `githubd_checks_call_total{status="skipped_coalesced"}` counter
+// is incremented so the on-call can see the dedup rate.
+//
+// Failure semantics: when the underlying WriteCheck returns an
+// error, the cache entry is NOT updated so the next call retries
+// the same phase. The Prometheus counter
+// `githubd_checks_call_total{status="http_error"}` is bumped on
+// each error.
+var (
+	checksCoalesceMu      sync.Mutex
+	checksCoalesceCache   = map[string]checksCoalesceEntry{}
+	checksCoalesceMinAge  = 1 * time.Hour
+	checksCoalesceJanitor = 1 * time.Minute
+)
+
+// checksCoalesceEntry tracks the last-reported phase per (repo,
+// sha) plus the wall-clock instant of the last successful POST.
+// The cachedAt timestamp is what the janitor keys on to evict
+// stale entries — without it, the map grows unboundedly across
+// hot repos (a single GitHub App install can have thousands of
+// active (repo, sha) tuples over its lifetime).
+type checksCoalesceEntry struct {
+	phase    githubdgrpc.CheckPhase
+	cachedAt time.Time
+}
+
+// WriteCheckCoalesced wraps ChecksAPI.WriteCheck with per-(repo, sha)
+// phase coalescing. Returns nil on a same-phase replay; otherwise
+// delegates and caches the new phase on success.
+func WriteCheckCoalesced(ctx context.Context, c ChecksWriter, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase, logsURL, summary string) error {
+	if c == nil {
+		return nil
+	}
+	key := repoFullName + "@" + commitSHA
+	checksCoalesceMu.Lock()
+	last, seen := checksCoalesceCache[key]
+	checksCoalesceMu.Unlock()
+	if seen && last.phase == phase {
+		checksCallCounter.WithLabelValues("skipped_coalesced").Inc()
+		return nil
+	}
+	err := c.WriteCheck(ctx, repoFullName, commitSHA, phase, logsURL, summary)
+	if err != nil {
+		checksCallCounter.WithLabelValues("http_error").Inc()
+		return err
+	}
+	checksCoalesceMu.Lock()
+	checksCoalesceCache[key] = checksCoalesceEntry{phase: phase, cachedAt: time.Now()}
+	checksCoalesceMu.Unlock()
+	checksCallCounter.WithLabelValues("posted").Inc()
+	return nil
+}
+
+// checksCoalesceJanitorLoop evicts entries older than
+// checksCoalesceMinAge. Without a janitor the map grows
+// unboundedly across a daemon's lifetime (test finding #4).
+// The loop runs forever; the daemon is the only process that owns
+// the package, so the goroutine exits with the process.
+func checksCoalesceJanitorLoop() {
+	t := time.NewTicker(checksCoalesceJanitor)
+	defer t.Stop()
+	for range t.C {
+		cutoff := time.Now().Add(-checksCoalesceMinAge)
+		checksCoalesceMu.Lock()
+		for k, v := range checksCoalesceCache {
+			if v.cachedAt.Before(cutoff) {
+				delete(checksCoalesceCache, k)
+			}
+		}
+		checksCoalesceMu.Unlock()
+	}
+}
+
+// checksCallCounter is the Prometheus counter exposed by
+// WriteCheckCoalesced. Defined as a package-level var so a test
+// can swap it for a recording fake without rewiring the
+// production wiring. Registration is wrapped in sync.Once so a
+// second package init (e.g. when cmd/githubd imports pkg/githubd
+// twice for whitebox tests) is a no-op rather than a panic.
+var checksCallCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "githubd_checks_call_total",
+	Help: "Outcome of each WriteCheck call after the coalescing wrapper. status=posted|skipped_coalesced|http_error.",
+}, []string{"status"})
+
+var checksCallCounterOnce sync.Once
+
+func init() {
+	checksCallCounterOnce.Do(func() {
+		prometheus.MustRegister(checksCallCounter)
+	})
+	go checksCoalesceJanitorLoop()
+}

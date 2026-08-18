@@ -140,3 +140,35 @@ func TestDefaultVMMSock_IsProductionSocket(t *testing.T) {
 		t.Errorf("DefaultVMMSock = %q, must reference vmmd.sock (ADR-015)", DefaultVMMSock)
 	}
 }
+
+// TestNewVMMClient_NodeNameEnvRead pins the issue #678 / ADR-093
+// PR-0 surface: NewVMMClient reads FAAS_IMAGED_NODE_NAME at
+// construction time so cmd/imaged doesn't have to thread the
+// env-read through its main wiring. Empty env → empty nodeName
+// (single-box dev back-compat; PR-B's scheme gate stays closed).
+// Non-empty env → nodeName pinned for the verifier's allowed-CN
+// list. PR-B's verifier (pkg/wire.InmemNodeVerifier for tests,
+// PGNodeVerifier for production) reads c.nodeName to populate
+// its allow-list at TCP/DNS scheme boundaries.
+func TestNewVMMClient_NodeNameEnvRead(t *testing.T) {
+	const want = "fsn-2-imaged"
+	t.Setenv("FAAS_IMAGED_NODE_NAME", want)
+	c := NewVMMClient(DefaultVMMSock, nil)
+	if c.nodeName != want {
+		t.Errorf("nodeName = %q, want %q (env read failed)", c.nodeName, want)
+	}
+}
+
+// TestNewVMMClient_NodeNameEmptyByDefault — back-compat: missing
+// or empty FAAS_IMAGED_NODE_NAME → nodeName stays empty so the
+// PR-B scheme gate (TCP/DNS = verifier on; unix = verifier off)
+// defaults to the single-box unix path. A production deployment
+// without the env var would never construct a verifier, which is
+// the intended shape for single-box dev.
+func TestNewVMMClient_NodeNameEmptyByDefault(t *testing.T) {
+	t.Setenv("FAAS_IMAGED_NODE_NAME", "")
+	c := NewVMMClient(DefaultVMMSock, nil)
+	if c.nodeName != "" {
+		t.Errorf("nodeName = %q, want empty (single-box default)", c.nodeName)
+	}
+}

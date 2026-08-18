@@ -109,8 +109,8 @@ gate fails.
 | Modified | `docs/adr/README.md` | Add ADR-089 row to the index. |
 
 **Why this is PR-C:** everything in PR-C is the operational close. The
-core feature ships without PR-C (operator can run `gregale secrets set`
-to manually re-seal; or run `gregale host-age rotate` and let the
+core feature ships without PR-C (operator can run `gregalectl secrets set`
+to manually re-seal; or run `gregalectl host-age rotate` and let the
 overlap window work). PR-C adds the automated background job that
 makes the rotation complete in the background.
 

@@ -187,6 +187,51 @@ func TestToColdBootRequest_MissingApp(t *testing.T) {
 	}
 }
 
+// TestToColdBootRequest_BuildSpecExportDir pins the builder-VM
+// contract (spec §4.5, ADR-003): a non-nil BuildSpec with an
+// ExportDir must land in fcvm.WakeRequest.ExportDir so the Manager
+// records it and Destroy runs the build-aware teardown. A nil Build
+// or empty ExportDir must map to "" (plain-Destroy contract).
+func TestToColdBootRequest_BuildSpecExportDir(t *testing.T) {
+	newReq := func() *vmmdpb.CreateColdBootRequest {
+		return &vmmdpb.CreateColdBootRequest{
+			Instance: "inst-build",
+			App:      &vmmdpb.AppSpec{BaseKey: "/b", LayerKey: "/l"},
+		}
+	}
+	t.Run("builder export dir", func(t *testing.T) {
+		req := newReq()
+		req.Build = &vmmdpb.BuildSpec{ExportDir: "/var/lib/faas/build-out/b1"}
+		wr, err := toColdBootRequest(context.Background(), req)
+		if err != nil {
+			t.Fatalf("toColdBootRequest: %v", err)
+		}
+		if wr.ExportDir != "/var/lib/faas/build-out/b1" {
+			t.Errorf("ExportDir = %q, want /var/lib/faas/build-out/b1", wr.ExportDir)
+		}
+	})
+	t.Run("nil build", func(t *testing.T) {
+		wr, err := toColdBootRequest(context.Background(), newReq())
+		if err != nil {
+			t.Fatalf("toColdBootRequest: %v", err)
+		}
+		if wr.ExportDir != "" {
+			t.Errorf("ExportDir = %q, want empty for app VM", wr.ExportDir)
+		}
+	})
+	t.Run("empty export dir", func(t *testing.T) {
+		req := newReq()
+		req.Build = &vmmdpb.BuildSpec{}
+		wr, err := toColdBootRequest(context.Background(), req)
+		if err != nil {
+			t.Fatalf("toColdBootRequest: %v", err)
+		}
+		if wr.ExportDir != "" {
+			t.Errorf("ExportDir = %q, want empty", wr.ExportDir)
+		}
+	})
+}
+
 func TestWakeResponseFromInstance(t *testing.T) {
 	ip := netip.MustParseAddr("10.0.0.1")
 	inst := &fcvm.Instance{

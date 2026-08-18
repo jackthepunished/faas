@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -129,6 +130,10 @@ func TestAppsSuffix(t *testing.T) {
 // RefreshDeploymentWeights calls (issue #556 / PR-B).
 // ResetEdgeRules (ADR-089 PR 3) is a no-op here — the test
 // is about the switch-arm dispatch, not the matcher itself.
+// ResetApp (ADR-091 amendment) is a no-op here for the same
+// reason — the test asserts the dispatch arm is taken, not
+// the per-app cache delete semantics (those live in
+// pkg/gateway's pgbackend_test.go).
 type fakeInvalidator struct {
 	mu            sync.Mutex
 	evicted       map[string]string // instance_id -> app_id
@@ -136,6 +141,13 @@ type fakeInvalidator struct {
 	publicAuthCnt int
 	refreshed     []string // app_ids that received RefreshDeploymentWeights
 	resetCnt      int      // ResetEdgeRules call count (ADR-089 PR 3)
+	resetApps     []string // app_ids that received ResetApp (ADR-091 amendment)
+	// remintSurfaces records the surface_ids that received
+	// RequestCertForSurface (ADR-100 / issue #879). remintErr
+	// makes the call return that error so the test can assert
+	// the log-and-swallow path.
+	remintSurfaces []string
+	remintErr      error
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -161,11 +173,23 @@ func (f *fakeInvalidator) ResetEdgeRules() {
 	f.resetCnt++
 	f.mu.Unlock()
 }
+func (f *fakeInvalidator) ResetApp(appID string) {
+	f.mu.Lock()
+	f.resetApps = append(f.resetApps, appID)
+	f.mu.Unlock()
+}
 func (f *fakeInvalidator) RefreshDeploymentWeights(_ context.Context, appID string) error {
 	f.mu.Lock()
 	f.refreshed = append(f.refreshed, appID)
 	f.mu.Unlock()
 	return nil
+}
+func (f *fakeInvalidator) RequestCertForSurface(_ context.Context, surfaceID string) error {
+	f.mu.Lock()
+	f.remintSurfaces = append(f.remintSurfaces, surfaceID)
+	err := f.remintErr
+	f.mu.Unlock()
+	return err
 }
 
 func TestHandleInvalidation(t *testing.T) {
@@ -173,7 +197,14 @@ func TestHandleInvalidation(t *testing.T) {
 	log := testLogger()
 
 	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `{"instance_id":"i-1","app_id":"app-7","state":"parked"}`}, log)
-	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyAppChanged, Payload: `{"app_id":"app-7"}`}, log)
+	// ADR-091 amendment: NotifyAppChanged payload is the app_id verbatim
+	// (apps_maintenance_mode_notify emits NEW.id::text — see
+	// migrations/00221_apps_maintenance_mode.sql). The handler drops
+	// only that app from the apps LRU (ResetApp), not wholesale
+	// FlushRoutes. Old {"app_id":...} payload also still works
+	// through the same arm (see TestHandleInvalidation_LegacyAppChangedPayload
+	// below for the wholesale fallback).
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyAppChanged, Payload: "app-7"}, log)
 	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyDomainChanged, Payload: `{"domain":"x.io"}`}, log)
 	// Malformed instance payload → no evict, no panic.
 	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `not json`}, log)
@@ -190,8 +221,15 @@ func TestHandleInvalidation(t *testing.T) {
 	if len(f.evicted) != 1 {
 		t.Errorf("evicted map = %v, want 1 entry", f.evicted)
 	}
-	if f.flushCnt != 2 {
-		t.Errorf("flush count = %d, want 2 (app + domain)", f.flushCnt)
+	// FlushRoutes fires only for NotifyDomainChanged (1x) — the
+	// ADR-091 amendment moved the NotifyAppChanged arm off the
+	// wholesale path so a maintenance_mode flip on a single app
+	// doesn't evict every other app's cache entry.
+	if f.flushCnt != 1 {
+		t.Errorf("flush count = %d, want 1 (domain only; NotifyAppChanged uses ResetApp)", f.flushCnt)
+	}
+	if len(f.resetApps) != 1 || f.resetApps[0] != "app-7" {
+		t.Errorf("resetApps = %v, want [app-7]", f.resetApps)
 	}
 }
 
@@ -272,6 +310,41 @@ func TestHandleInvalidation_LifecycleStatesDoNotEvict(t *testing.T) {
 			t.Errorf("state=%q: evicted %d entries, want 0 (cache-self-destruct guard)", state, evicted)
 		}
 	}
+}
+
+// TestHandleInvalidation_TenantSurfaceChanged (ADR-100 / issue
+// #879) pins the cert-remint dispatch: a db.NotifyTenantSurfaceChanged
+// event must trigger RequestCertForSurface with the bare surface
+// uuid as the argument. Errors are logged-and-swallowed so a
+// transient CA failure can't block the notify loop. The test
+// exercises both the success path and a remintErr return.
+func TestHandleInvalidation_TenantSurfaceChanged(t *testing.T) {
+	log := testLogger()
+
+	// Success: the bare surface uuid is forwarded verbatim.
+	f := &fakeInvalidator{}
+	handleInvalidation(context.Background(), f, db.Notification{
+		Channel: db.NotifyTenantSurfaceChanged,
+		Payload: "srf-abc-123",
+	}, log)
+	f.mu.Lock()
+	if len(f.remintSurfaces) != 1 || f.remintSurfaces[0] != "srf-abc-123" {
+		t.Errorf("remintSurfaces = %v, want [srf-abc-123]", f.remintSurfaces)
+	}
+	f.mu.Unlock()
+
+	// remintErr is non-nil → handler logs and swallows; the next
+	// event in the queue still dispatches.
+	f = &fakeInvalidator{remintErr: errors.New("ca outage")}
+	handleInvalidation(context.Background(), f, db.Notification{
+		Channel: db.NotifyTenantSurfaceChanged,
+		Payload: "srf-second",
+	}, log)
+	f.mu.Lock()
+	if len(f.remintSurfaces) != 1 || f.remintSurfaces[0] != "srf-second" {
+		t.Errorf("remintSurfaces (err path) = %v, want [srf-second]", f.remintSurfaces)
+	}
+	f.mu.Unlock()
 }
 
 // TestHandleInvalidation_TerminalStatesEvict (issue #168 + Tier A5 /

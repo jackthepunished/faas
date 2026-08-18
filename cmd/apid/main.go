@@ -23,12 +23,17 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -45,6 +50,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -119,6 +125,22 @@ func rekeyEnabledFromEnv(getenv func(string) string) bool {
 	return false
 }
 
+// dataPlacementEnabledFromEnv reads FAAS_DATA_PLACEMENT via the
+// test seam (deps.getenv) and parses the canonical truthy
+// spellings. Default false preserves the v1 no-op posture —
+// pre-PR-B operators see exactly zero data-upstream handler
+// activity (no row INSERT, no audit kind, no pg_notify trigger
+// trip). Mirrors rekeyEnabledFromEnv's shape.
+func dataPlacementEnabledFromEnv(getenv func(string) string) bool {
+	v := strings.ToLower(strings.TrimSpace(getenv("FAAS_DATA_PLACEMENT")))
+	for _, lit := range rekeyTruthyLiterals {
+		if v == lit {
+			return true
+		}
+	}
+	return false
+}
+
 // firstNonEmpty returns the first non-empty string among the
 // args. Used by the log archive wire-up so an explicit env
 // var (FAAS_LOG_ARCHIVE_*) wins over a value in the sealed
@@ -170,40 +192,91 @@ func readArchiveCreds(path string) (archiveCreds, error) {
 	return c, nil
 }
 
-// listenAddr is the bind address for apid. Behind gatewayd-internal; not a public
-// listener. Overridable via FAAS_APID_LISTEN so the e2e harness can pick a
-// free port without colliding with a dev daemon on 8081.
-var listenAddr = envOr("FAAS_APID_LISTEN", "127.0.0.1:8081")
-
-// metricsAddr is the bind address for the apid /metrics listener
-// (separate from the main listener so a port collision can't take the
-// daemon down). Defaults to 127.0.0.1:9101 so an operator typo (or
-// a missing env var in prod) can't accidentally expose the internal
+// resolveMetricsAddr reads FAAS_APID_METRICS_ADDR via the test seam
+// (deps.getenv). Empty string disables the listener (this is the
+// deliberately-distinct envOr path: envOr() collapses empty→unset→
+// fallback, which is right for FAAS_APID_LISTEN but wrong here,
+// where empty means "skip the listener entirely"). The test
+// seam + the explicit-empty-disable semantic are the reasons this
+// helper exists as a package-level function (vs a Config.Get
+// metricsAddrDefault is the loopback bind address for the /metrics
+// listener. The default is loopback so an operator typo (or a
+// missing env var in prod) can't accidentally expose the internal
 // registry to the public network — series like apid_ops_total{op,code}
 // leak auth-rejection rates and per-route traffic shape (review
 // finding #1 on PR #132). Loopback bind is safe because the local
-// Prometheus scrapes from the box itself.
-//
-// Empty FAAS_APID_METRICS_ADDR disables the listener. This is the
-// deliberately-distinct envOr path: envOr() collapses empty→unset→
-// fallback (line 63), which is right for FAAS_APID_LISTEN (where
-// empty means "no override, use the default port") but wrong here
-// (where empty means "skip the listener entirely"). os.LookupEnv
-// distinguishes "unset" (fall through to the default) from
-// "explicitly empty" (skip), so the e2e harness can stamp
-// `FAAS_APID_METRICS_ADDR=` and avoid the 127.0.0.1:9101 bind race
-// against a sibling or zombie apid run. Mirrors cmd/builderd/main.go's
+// Prometheus scrapes from the box itself. Mirrors cmd/builderd/main.go's
 // MetricsAddr pattern (PR #124).
-var metricsAddr = func() string {
-	v, ok := os.LookupEnv("FAAS_APID_METRICS_ADDR")
-	if ok && v == "" {
-		return "" // explicit-empty = disable
+//
+// PR-0 (issue #678): the literal was repeated 3+ times across the
+// pre-PR-0 inline env reads, the post-PR-0 resolveMetricsAddr helper,
+// and the package-level default. Extracted to a const for goconst
+// (golangci-lint v2.4.0 fires at 3 occurrences).
+const metricsAddrDefault = "127.0.0.1:9101"
+
+// resolveMetricsAddr reads FAAS_APID_METRICS_ADDR via the test
+// seam (deps.getenv). Empty string disables the listener (the
+// deliberately-distinct envOr path: envOr() collapses empty→unset→
+// fallback, which is right for FAAS_APID_LISTEN but wrong here,
+// where empty means "skip the listener entirely"). The test
+// seam + the explicit-empty-disable semantic are the reasons this
+// helper exists as a package-level function (vs a Config.Get
+// method). Defaults to metricsAddrDefault so an operator typo (or
+// a missing env var in prod) can't accidentally expose the
+// internal registry to the public network.
+//
+// The e2e harness stamps `FAAS_APID_METRICS_ADDR=` to avoid the
+// metricsAddrDefault bind race against a sibling or zombie apid
+// run.
+//
+// PR-0 (issue #678): the tomlDefault argument pulls the default
+// from cfg.GetMetricsAddr so a TOML-configured metrics_addr is
+// respected (issue #678 PR-0 — apid's first ever TOML config).
+// When tomlDefault is non-empty, it wins over the package-level
+// of metricsAddrDefault.
+func resolveMetricsAddr(getenv func(string) string, tomlDefault string) string {
+	v := getenv("FAAS_APID_METRICS_ADDR")
+	if v == "" && tomlDefault == "" {
+		return metricsAddrDefault
 	}
-	if !ok || v == "" {
-		return "127.0.0.1:9101"
+	if v == "" {
+		return tomlDefault
 	}
 	return v
-}()
+}
+
+// gatewaydControlURLDefault is the loopback URL apid dials when
+// FAAS_GATEWAYD_CONTROL_URL is unset. Mirrors gatewayd-internal's
+// default ControlAddr (cmd/gatewayd-internal/config.go:181
+// 127.0.0.1:9090, scheme added). Same-box is the only supported
+// posture today; cross-box deployments override via the env
+// var. Extracted to a const so goconst pins it to one occurrence
+// (the helpers below + the server field comment at
+// cmd/apid/server.go:58 cite the same literal).
+const gatewaydControlURLDefault = "http://127.0.0.1:9090"
+
+// resolveGatewaydControlURL reads FAAS_GATEWAYD_CONTROL_URL via
+// the test seam (deps.getenv) and applies the loopback default
+// when the env value is empty. Same shape as resolveMetricsAddr
+// — the test seam keeps macOS-dev + CI from trying to dial a
+// real gatewayd unless the test opted in via WithGatewaydControlURL,
+// and the default keeps a same-box prod install from bricking
+// the per-route surface just because the operator never exported
+// the env var.
+//
+// Distinction from resolveMetricsAddr: there is no explicit-empty
+// "disable" semantic for FAAS_GATEWAYD_CONTROL_URL. The dial
+// surface either works (operator wired it OR default loopback
+// reachable) or the upstream dial fails and getAppRoutes renders
+// the unavailable state — there is no third "operator opted out
+// of the surface entirely" position.
+func resolveGatewaydControlURL(getenv func(string) string) string {
+	v := getenv("FAAS_GATEWAYD_CONTROL_URL")
+	if v == "" {
+		return gatewaydControlURLDefault
+	}
+	return v
+}
 
 // resolveAdvisorySock reads FAAS_APID_ADVISORY_SOCK via the test
 // seam (deps.getenv). Empty string disables the listener. Tests
@@ -214,7 +287,17 @@ var metricsAddr = func() string {
 // /run/faas/apid.sock explicitly so the default doesn't matter
 // in prod — the explicit assignment is what enables the
 // listener there.
-func resolveAdvisorySock(getenv func(string) string) string {
+//
+// PR-0 (issue #678): Config.GetAdvisorySock (cmd/apid/config.go)
+// is the TOML-aware version. main.go calls the helper directly
+// when a Config is in scope; this env-only helper stays for the
+// test seam that doesn't yet thread a Config (the existing
+// tests pass nil cfg → this branch). Tests that build a real
+// Config use Config.GetAdvisorySock directly.
+func resolveAdvisorySock(getenv func(string) string, cfg *Config) string {
+	if cfg != nil {
+		return cfg.GetAdvisorySock(getenv)
+	}
 	return getenv("FAAS_APID_ADVISORY_SOCK")
 }
 
@@ -227,7 +310,12 @@ func resolveAdvisorySock(getenv func(string) string) string {
 // the bridge socket has a separate path because the consumer
 // (githubd) dials it, not vmmd, and the 0660 DAC group is shared
 // between the githubd user and apid user.
-func resolveGithubdBridgeSock(getenv func(string) string) string {
+//
+// PR-0 (issue #678): same thin-wrapper pattern as resolveAdvisorySock.
+func resolveGithubdBridgeSock(getenv func(string) string, cfg *Config) string {
+	if cfg != nil {
+		return cfg.GetGithubdBridgeSock(getenv)
+	}
 	return getenv("FAAS_APID_GITHUBD_BRIDGE_SOCK")
 }
 
@@ -279,6 +367,65 @@ type runDeps struct {
 	// nil in production (defaultDeps wires billingloader.LoadBillingConfigFromPath);
 	// tests stub to return a hand-rolled *RootBillingConfig.
 	loadBillingConfig func(path string) (*billingloader.RootBillingConfig, error)
+	// PR-0 (issue #678): loadConfig reads the apid config (the
+	// non-billing surface: ListenAddr, MetricsAddr, AdvisorySock,
+	// GithubdBridgeSock, GithubdSocket, AppsDomain, the three TLS
+	// clusters, NodeName). nil in production (defaultDeps wires
+	// LoadConfig); tests stub to return a hand-rolled *Config.
+	// Same file as loadBillingConfig consumes — the two readers
+	// share /etc/faas/apid.toml.
+	loadConfig func(path string) (*Config, error)
+	// PR-0 (issue #678): preLoadedConfig, when non-nil, skips the
+	// LoadConfig call inside run() and uses this Config directly.
+	// Tests inject a hand-rolled *Config to assert behaviour
+	// without round-tripping a TOML file through LoadConfig. nil
+	// in production.
+	preLoadedConfig *Config
+	// PR-0 (issue #678): config carries the loaded *Config into
+	// runWithDeps so the listener / dial / TLS helpers can read
+	// cfg.Load* / cfg.Get* directly. Set by run() immediately after
+	// LoadConfig returns; nil in the test seam that constructs
+	// runDeps directly (those tests should set preLoadedConfig
+	// instead).
+	config *Config
+	// ADR-094: closePool is the pool-cleanup hook run() wires after
+	// db.Open succeeds. runWithDeps calls it on every early-return
+	// between db.Open and the post-bind defer-install (so an error
+	// anywhere in the bind path closes the pool out, not the
+	// in-flight bgBefore goroutines). Tests can inject a no-op
+	// (`func() {}`) so the existing TestRunWithDeps_ListenErrorReturns
+	// shape — which never sets up a real pool — keeps working.
+	// nil in production before run() sets it.
+	closePool func()
+	// PR-B (issue #678 / ADR-056): pool is the *pgxpool.Pool run() opens
+	// via db.Open. runWithDeps needs it to construct the handshake-
+	// layer PGNodeVerifier (wire.NewPGNodeLoader(pool)) and to wire
+	// its notification drain (db.SubscribeWithReconnect(ctx, pool,
+	// [db.NotifyComputeNodeChanged], log)). Mirrors the existing
+	// deps.store / deps.notif pattern: production wires it from run();
+	// tests that build runDeps directly without a real pool leave it
+	// nil — the verifier block below short-circuits to nil when pool
+	// is nil (the cfg.NodeName == "" production path AND the
+	// pre-PR-B test paths). nil in production before run() sets it.
+	pool *pgxpool.Pool
+	// PR-B (issue #678 / ADR-056): preLoadedNodeVerifier lets tests
+	// inject a stub wire.NodeVerifier without booting Postgres or
+	// wiring a real PGNodeLoader. nil in production (the
+	// cfg.NodeName != "" block in runWithDeps owns the
+	// wire.NewPGNodeVerifier(wire.NewPGNodeLoader(pool), log) path);
+	// nil-tolerant — the cfg.NodeName gate still runs, so a test
+	// that sets only preLoadedConfig and preLoadedNodeVerifier == nil
+	// keeps the single-box wire behaviour.
+	preLoadedNodeVerifier wire.NodeVerifier
+	// PR-B (issue #678 / ADR-056): captureDialTLS is a test-side hook
+	// invoked at every Load*TLSWithVerifier dial site with (name,
+	// *tls.Config). name is "githubd", "advisory", or "bridge".
+	// nil in production; nil-tolerant (runWithDeps no-ops on nil).
+	// Lets the TestRunWithDeps_PassesNodeVerifierToDialSites pin test
+	// assert that a non-nil preLoadedNodeVerifier propagates into
+	// all three tls.Cfg.VerifyPeerCertificate hooks without booting
+	// a real Postgres pool.
+	captureDialTLS func(name string, cfg *tls.Config)
 }
 
 func defaultDeps() runDeps {
@@ -293,6 +440,7 @@ func defaultDeps() runDeps {
 		loginTTL:          15 * time.Minute,
 		configPath:        "/etc/faas/apid.toml",
 		loadBillingConfig: billingloader.LoadBillingConfigFromPath,
+		loadConfig:        LoadConfig,
 	}
 }
 
@@ -330,8 +478,45 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("apid: open db: %w", err)
 	}
-	defer pool.Close()
+	// ADR-094: the pool's lifetime is no longer bound to run()'s
+	// defer. The pre-bind goroutines in bgBefore (rekey walker,
+	// sseFanIn, audit subscriber, grace sweep, etc.) each call
+	// pool.Acquire(); an early-return anywhere between here and
+	// the listener bind used to close the pool out from under
+	// those goroutines — they returned "closed pool" and main
+	// never reached the listener-bind log line. The fix is the
+	// closePool helper + the explicit closePool() call before
+	// every early-return in this range, with a single
+	// defer closePool() at the post-bind site (below the metrics
+	// / advisory / bridge listener sections, just before
+	// srv.Serve).
+	//
+	// ADR-094 pins this shape via pkg/db/warmup_architecture_test.go
+	// so a future refactor that drops closePool() at an early-return
+	// site fails the test instead of silently reintroducing the
+	// race.
+	closePool := func() {
+		if pool != nil {
+			pool.Close()
+		}
+	}
+	// Warm-up barrier: acquire (and release) 4 connections before
+	// bgBefore launches its goroutines. This is the belt-and-braces
+	// defence — proves the pool can serve N parallel connections
+	// before any one of them races another for the same slot. The
+	// "N=4" default matches apid's expected boot fan-out (audit
+	// subscriber Subscribe + rekey first-walk + sseFanIn Subscribe +
+	// grace/login/eventretention first-pass DELETE each grab one
+	// connection at startup; 4 is the upper bound for any single
+	// tick). If a future daemon picks up a fifth concurrent
+	// goroutine at boot, bump the constant here + update the
+	// architecture test's expected ordering.
+	if err := db.WarmUp(ctx, pool, 4, 5*time.Second); err != nil {
+		closePool()
+		return fmt.Errorf("apid: pool warm-up: %w", err)
+	}
 	if err := db.MigrateUp(ctx, pool); err != nil {
+		closePool()
 		return fmt.Errorf("apid: migrate: %w", err)
 	}
 
@@ -344,7 +529,44 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 	deps := defaultDeps()
 	deps.store = func() state.Store { return state.NewPgStore(pool) }
+	// PR-0 (issue #678): load the apid Config from the same
+	// /etc/faas/apid.toml file the [billing] loader already reads.
+	// Behaviour-preserving: every legacy FAAS_APID_* / FAAS_GITHUBD_*
+	// env var continues to win over TOML because Get* helpers are
+	// called from main.go after this LoadConfig, and the env-overlay
+	// pattern (env first, TOML fallback) is preserved verbatim.
+	cfg := deps.preLoadedConfig
+	if cfg == nil {
+		cfg, err = deps.loadConfig(deps.configPath)
+		if err != nil {
+			closePool()
+			return fmt.Errorf("apid: load config: %w", err)
+		}
+	}
+	deps.config = cfg
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity so an operator reading the systemd journal
+	// can map the daemon to the right compute_node row. Mirrors the
+	// schedd owner-node line so the playbook shape is identical
+	// across daemons.
+	if cfg.NodeName != "" {
+		log.Info("apid owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("apid: legacy single-box (cfg.NodeName empty)")
+	}
 	deps.notif = func() Notifier { return pgNotifier{pool: pool} }
+	// ADR-094: hand runWithDeps the same closePool helper so the
+	// post-bind defer (installed just before srv.Serve) and every
+	// pre-bind early-return close the pool consistently. Tests that
+	// build runDeps directly without a pool pass a no-op closure.
+	deps.closePool = closePool
+	// PR-B (issue #678 / ADR-056): hand runWithDeps the same
+	// *pgxpool.Pool so the handshake-layer PGNodeVerifier
+	// construction block can use wire.NewPGNodeLoader(pool) and
+	// db.SubscribeWithReconnect(ctx, pool, ...). nil in tests that
+	// build runDeps directly without a real pool — the verifier
+	// block short-circuits to nil when pool is nil.
+	deps.pool = pool
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
 		// ADR-089 PR-C — background re-seal runner. The runner is
 		// nil when FAAS_REKEY_ENABLED is unset (or when identities
@@ -412,6 +634,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 			Store: srv.store,
 			Log:   log,
 		})
+		// ADR-091 D20.3 / PR-B residual: thread the Ops into the
+		// audit-event retention cleanup loop. srv.ops is populated
+		// by srv.WithOpsMetrics(ctx, ops) on line ~1027 BEFORE
+		// deps.bgBefore is invoked (line 1248), so reading srv.ops
+		// here is safe; the closure's goroutine launch proceeds
+		// regardless of whether ops is nil (the loop runs and
+		// logs but does not increment — same trade-off the apid
+		// audit auditor makes with pkg/audit.Auditor.SetOps).
+		eventRetentionCleanup.SetOps(srv.ops)
 		go func() { _ = eventRetentionCleanup.Run(ctx) }()
 		// Issue #562 / PR-A: log archive shipper. Walks the local
 		// spool dir every cfg.FlushInterval (5 min default) and
@@ -616,6 +847,100 @@ func dpaPathFromEnv(getenv func(string) string) string {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// ADR-094: pool-close gate. closePool closes the pool; the
+	// Once guards against double-close when an early-return path
+	// closes the pool explicitly and the deferred fallback also
+	// runs. Production wires deps.closePool to the helper built
+	// in run() right after db.Open; tests that pass a no-op
+	// closure (defaultDeps.zeroClosePool) keep the existing
+	// behaviour. The Once-fallback ensures any pre-bind path
+	// that forgets to call closePoolOnce explicitly still closes
+	// the pool on return — defence-in-depth on top of the
+	// explicit calls below.
+	closePool := deps.closePool
+	closePoolOnce := sync.OnceFunc(func() {
+		if closePool != nil {
+			closePool()
+		}
+	})
+	defer closePoolOnce()
+
+	// PR-0 (issue #678): cfg carries the issue-#678 surface
+	// (Load*TLS, Get*) into every helper that used to read FAAS_APID_*
+	// inline. deps.config is set by run() after LoadConfig returns;
+	// the test seam can set it directly via runDeps.config. When
+	// nil (the pre-PR-#678 test path that calls runWithDeps
+	// directly without threading a Config), fall back to a
+	// defaults-only Config — the helpers tolerate nil-receiver,
+	// but the cfg.Get* calls don't, so an empty Config is the
+	// safe shape.
+	cfg := deps.config
+	if cfg == nil {
+		cfg = &Config{}
+	}
+
+	// PR-B (issue #678 / ADR-056): handshake-layer NodeVerifier. The
+	// verifier sits in front of every mTLS leg on this daemon
+	// (githubd client dial, advisory server listener, githubd-bridge
+	// server listener) so leaf-CNs from peers not in the registered
+	// compute_nodes set are rejected before stdlib trust returns
+	// success. Stdlib chain/SAN/EKU still runs first — the verifier
+	// augments (never replaces) the stdlib trust path.
+	//
+	// Single-box apid (cfg.NodeName == "") does NOT construct a
+	// verifier — stdlib trust alone runs. Multi-box apid constructs
+	// a PG-backed verifier, refreshes once at startup (so the first
+	// handshake after listen sees a populated snapshot), and pumps
+	// compute_node_changed notifications into a drain goroutine for
+	// the lifetime of the daemon.
+	//
+	// Last-known-good posture: PGNodeVerifier.Refresh keeps the
+	// previous snapshot on loader failure (per pkg/wire/pgverifier.go
+	// the snapshot is locked behind an RWMutex and Refresh only
+	// swaps on success). A de-sync to "allow nothing" would brick
+	// the cluster's mTLS legs (every handshake would fail), so the
+	// contract is "best effort refresh on every notify; never brick".
+	//
+	// The preLoadedNodeVerifier test seam lets tests inject a stub
+	// wire.NodeVerifier without booting Postgres. When both deps.pool
+	// is nil (test shape that builds runDeps directly) and
+	// preLoadedNodeVerifier is nil, the block short-circuits to nil —
+	// identical to the pre-PR-B single-box behaviour. The dial sites
+	// consume the wire.NodeVerifier interface, so production
+	// (*wire.PGNodeVerifier) and test stubs (a hand-rolled NodeVerifier)
+	// flow through the same Load*TLSWithVerifier(nodeVerifier) call
+	// sites.
+	var nodeVerifier wire.NodeVerifier
+	if deps.preLoadedNodeVerifier != nil {
+		// Test seam: use the stub verifier directly. Construction
+		// is intentionally lazy — Refresh is NOT called because the
+		// stub doesn't carry a snapshot; tests assert the verifier
+		// reaches the dial sites, not the Refresh contract.
+		nodeVerifier = deps.preLoadedNodeVerifier
+	} else if cfg.NodeName != "" && deps.pool != nil {
+		pgv := wire.NewPGNodeVerifier(wire.NewPGNodeLoader(deps.pool), log)
+		// Drive a synchronous startup Refresh so the first
+		// handshake after listen sees a populated snapshot. The
+		// existing defer closePoolOnce() at the top of runWithDeps
+		// closes the pool on this early-return — matches the
+		// schedd/vmmd pattern (cmd/schedd/main.go:295-297,
+		// cmd/vmmd/main.go:839-841).
+		if _, err := pgv.Refresh(ctx); err != nil {
+			return fmt.Errorf("apid: node verifier startup refresh: %w", err)
+		}
+		go func() {
+			ch, err := db.SubscribeWithReconnect(ctx, deps.pool, []string{db.NotifyComputeNodeChanged}, log)
+			if err != nil {
+				log.Error("apid: node verifier LISTEN failed", "err", err)
+				return
+			}
+			if rerr := pgv.Run(ctx, ch); rerr != nil && !errors.Is(rerr, context.Canceled) {
+				log.Error("apid: node verifier exited", "err", rerr)
+			}
+		}()
+		nodeVerifier = pgv
+	}
+
 	store := deps.store()
 
 	// Dev-only: seed a Free account bound to $FAAS_DEV_TOKEN so the CLI can be
@@ -646,20 +971,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// fine until githubd is actually deployed on this host.
 	//
 	// ADR-052: multi-box deployments dial githubd over tcp:// +
-	// mTLS. Load the client TLS config from env so the same
-	// per-daemon TOML surface (or env-var analogue) works whether
-	// the githubd lives on the same host (unix socket) or a
-	// remote box (tcp/dns + leaf cert). Empty TLS cluster returns
-	// (nil, nil) and the unix path keeps working.
-	githubdTLS, err := wire.LoadClientTLSConfig(
-		deps.getenv("FAAS_GITHUBD_TLS_CERT_PATH"),
-		deps.getenv("FAAS_GITHUBD_TLS_KEY_PATH"),
-		deps.getenv("FAAS_GITHUBD_TLS_CA_PATH"),
-	)
+	// mTLS. cfg.LoadGithubdTLS reads the githubd_tls_* cluster
+	// from apid.toml (issue #678 PR-0); the env-var analogue
+	// FAAS_GITHUBD_TLS_* was the pre-PR-#678 path. Empty TLS
+	// cluster returns (nil, nil) and the unix path keeps working.
+	// PR-0 is behaviour-preserving — see cmd/apid/config.go for
+	// the env-overlay contract.
+	//
+	// PR-B (issue #678 / ADR-056): the WithVerifier variant threads
+	// the handshake-layer NodeVerifier through LoadClientTLSConfig
+	// → SetVerifyPeerCertificate → crypto/tls. cfg.NodeName == ""
+	// (single-box dev) leaves nodeVerifier nil; the wire helper's
+	// setVerifyHook no-ops on a nil verifier and the stdlib trust
+	// path runs unchanged.
+	//
+	// ADR-052 §5 / PR-E: route the load through the WithReload
+	// factory so a SIGHUP-driven reload swaps the client leaf on
+	// the next outbound githubd handshake. githubdRotator holds
+	// the live *tls.Config; newGithubdClient captures the rotator's
+	// initial material at construction but stdlib's
+	// GetClientCertificate callback consults the rotator at every
+	// handshake.
+	githubdRotator := wire.NewTLSRotator(nil)
+	githubdTLS, err := cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, githubdRotator.Reload(nil))
 	if err != nil {
 		return fmt.Errorf("apid: githubd TLS: %w", err)
 	}
-	githubd := newGithubdClient(ctx, deps.getenv("FAAS_GITHUBD_SOCKET"), githubdTLS, log)
+	githubdRotator.Set(githubdTLS)
+	if deps.captureDialTLS != nil {
+		deps.captureDialTLS("githubd", githubdTLS)
+	}
+	githubd := newGithubdClient(ctx, cfg.GetGithubdSocket(deps.getenv), githubdTLS, log)
 	// M7.5: dashboard session manager. Loads the 32-byte key from
 	// FAAS_SESSION_KEY (hex-encoded); empty in dev = ephemeral key +
 	// warning so the daemon still boots for local testing. Production
@@ -692,7 +1034,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"google_enabled", oauthCfg.Google.Enabled(),
 			"github_enabled", oauthCfg.GitHub.Enabled())
 	}
-	srv := newServerWithDeps(store, log, deps.getenv("FAAS_APPS_DOMAIN"), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
+	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv))
 	srv.WithOAuthConfig(oauthCfg)
 
 	// Issue #142: Stripe billing portal URL template for the changePlan
@@ -766,6 +1108,39 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
 	srv.WithOpsMetrics(ctx, ops)
+
+	// ADR-093 / PR-D: end-to-end request budgets on the apid
+	// listener. Same shape as gatewayd-public PR-B: a fresh
+	// prometheus registry holds the budget histogram + counter,
+	// the middleware stamps a per-request Budget onto r.Context(),
+	// and the /metrics handler combines ops + budget gatherers
+	// into a single scrape. Default is api.RequestBudgetApidDefault
+	// (5 s); Max is api.RequestBudgetMax (30 s); apid handlers
+	// that have an existing per-call WithTimeout (PromQL 3 s,
+	// billingOps 30 s, sync-invoke 5 s / 30 s) tighten themselves
+	// against the budget via reqbudget.WithCeiling (PR-D §3).
+	budgetReg := prometheus.NewRegistry()
+	budgetMetrics, err := reqbudget.NewMetrics(budgetReg, "apid")
+	if err != nil {
+		return fmt.Errorf("apid: reqbudget metrics: %w", err)
+	}
+	budgetCfg, err := reqbudget.NewMiddlewareConfig(reqbudget.MiddlewareConfig{
+		Default: api.RequestBudgetApidDefault,
+		Max:     api.RequestBudgetMax,
+		Route:   "admin",
+		Metrics: budgetMetrics,
+		Log:     log,
+	})
+	if err != nil {
+		return fmt.Errorf("apid: reqbudget middleware config: %w", err)
+	}
+
+	// ADR-098 PR-B / C4 — per-PR feature flag
+	// (FAAS_DATA_PLACEMENT=1). Default OFF preserves the
+	// pre-PR-B byte-for-byte posture. Ops flips the flag
+	// per-node after the cluster-outline's "Rollout gate"
+	// one-month soak.
+	srv.WithDataPlacement(dataPlacementEnabledFromEnv(deps.getenv))
 	// issue #517 / PR-C / ADR-064: thread the events Platform
 	// into the server so the audit subscriber (which receives
 	// the signature-rejection kinds from imaged's verify hook)
@@ -774,6 +1149,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// events row + bumps wake_phase_emitted_total.
 	eventsPlatform := events.NewPlatform("apid", store, log, ops, nil)
 	srv.WithEventsPlatform(eventsPlatform)
+
+	// ADR-093: gatewayd-internal control-listener URL for the
+	// per-route observability reader. Default
+	// http://127.0.0.1:9090 matches gatewayd-internal's default
+	// control bind (cmd/gatewayd-internal/config.go ControlAddr,
+	// default 127.0.0.1:9090). Production overrides via
+	// FAAS_GATEWAYD_CONTROL_URL when the daemons are split across
+	// nodes; same-box is the only supported posture today
+	// (cross-box will need an mTLS-terminating reverse-proxy —
+	// out of scope for this PR). Empty string disables the
+	// /v1/apps/{slug}/routes surface; getAppRoutes renders the
+	// unavailable state so the dashboard can distinguish
+	// "operator hasn't wired it" from "no traffic yet". The
+	// unresolved env value is what the test seam surfaces
+	// (TestAppRoutes_MissingURLRendersUnavailable pins the empty
+	// contract); main() always applies the default at boot so a
+	// same-box install doesn't brick the per-route surface just
+	// because the operator never exported the env var.
+	srv.WithGatewaydControlURL(resolveGatewaydControlURL(deps.getenv))
 
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
@@ -989,9 +1383,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		deps.bgBefore(ctx, log, srv)
 	}
 
-	httpSrv := deps.newSrv(listenAddr, srv.handler())
+	listenBind := cfg.GetListenAddr(deps.getenv)
+	// ADR-093 / PR-D: wrap srv.handler() with the BudgetMiddleware
+	// so every apid request runs under a Budget-decorated ctx.
+	// Per-handler WithTimeout ceilings (PromQL 3 s, billingOps 30 s,
+	// sync-invoke 5 s / 30 s) become children of the budget via
+	// reqbudget.WithCeiling — the budget tightens the cap, never
+	// loosens it.
+	httpSrv := deps.newSrv(listenBind, budgetCfg.Middleware(srv.handler()))
 
-	l, err := deps.listen("tcp", listenAddr)
+	l, err := deps.listen("tcp", listenBind)
 	if err != nil {
 		return err
 	}
@@ -1001,11 +1402,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// FAAS_APID_METRICS_ADDR = no listener (the scrape observer is
 	// still wired into the main mux via observeWrap; only the
 	// listener is skipped). Mirrors cmd/builderd/main.go:146-157.
+	//
+	// PR-0 (issue #678): resolveMetricsAddr honours the explicit-
+	// empty-disable semantic by reading FAAS_APID_METRICS_ADDR via
+	// the test seam (deps.getenv), then falls back to cfg.GetMetricsAddr
+	// (TOML), then to metricsAddrDefault.
+	//
+	// ADR-093 / PR-D: combine ops + budgetReg into a single
+	// prometheus.Gatherers so /metrics scrapes both the standard
+	// apid_* ops metrics AND the budget histogram + counter
+	// families in one round-trip.
 	var metricsSrv *http.Server
-	if metricsAddr != "" {
+	if metricsAddr := resolveMetricsAddr(deps.getenv, cfg.GetMetricsAddr(deps.getenv)); metricsAddr != "" {
 		metricsSrv = &http.Server{
-			Addr:              metricsAddr,
-			Handler:           ops.Handler(),
+			Addr: metricsAddr,
+			// promhttp.HandlerFor over a Gatherers chain serves
+			// both registries on a single scrape; the
+			// HandlerOpts.Registry is the writer for the `go_*`
+			// runtime collectors (registered against ops').
+			Handler: promhttp.HandlerFor(
+				prometheus.Gatherers{ops.Registry(), budgetReg},
+				promhttp.HandlerOpts{Registry: ops.Registry()},
+			),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		mLis, err := net.Listen("tcp", metricsAddr)
@@ -1028,22 +1446,35 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// empty and avoid the bind race).
 	//
 	// ADR-052: when the target is tcp:// or dns:// (multi-box path),
-	// the operator must also set FAAS_APID_ADVISORY_TLS_{CERT,KEY,CA}_PATH
-	// to a per-daemon leaf. Single-box deployments leave the TLS
-	// cluster unset and continue to use the unix socket; the
-	// LoadServerTLSConfig helper returns (nil, nil) when all three
-	// paths are empty.
+	// the operator must also set advisory_tls_* in apid.toml to a
+	// per-daemon leaf. Single-box deployments leave the TLS cluster
+	// unset and continue to use the unix socket; cfg.LoadAdvisoryTLS
+	// returns (nil, nil) when all three paths are empty.
+	//
+	// PR-0 (issue #678): cfg.LoadAdvisoryTLS is the issue-#678 surface
+	// that replaces the inline env reads. The behaviour is identical
+	// (env-overlay path is preserved via the Get helpers).
+	//
+	// PR-B (issue #678 / ADR-056): the WithVerifier variant installs
+	// the handshake-layer NodeVerifier hook on the server-side
+	// tls.Config. vmmd dials in here; the hook rejects any peer
+	// whose leaf-CN is not in compute_nodes.name.
+	//
+	// ADR-052 §5 / PR-E: route through the WithReload factory so a
+	// SIGHUP-driven reload swaps the server's leaf via stdlib's
+	// per-handshake GetConfigForClient callback.
 	var advisorySrv *grpc.Server
 	var advisoryLis net.Listener
-	if sock := resolveAdvisorySock(deps.getenv); sock != "" {
-		advisoryTLS, tlsErr := wire.LoadServerTLSConfig(
-			deps.getenv("FAAS_APID_ADVISORY_TLS_CERT_PATH"),
-			deps.getenv("FAAS_APID_ADVISORY_TLS_KEY_PATH"),
-			deps.getenv("FAAS_APID_ADVISORY_TLS_CA_PATH"),
-		)
+	advisoryRotator := wire.NewTLSRotator(nil)
+	if sock := resolveAdvisorySock(deps.getenv, cfg); sock != "" {
+		advisoryTLS, tlsErr := cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, advisoryRotator.Reload(nil))
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: advisory TLS: %w", tlsErr)
+		}
+		advisoryRotator.Set(advisoryTLS)
+		if deps.captureDialTLS != nil {
+			deps.captureDialTLS("advisory", advisoryTLS)
 		}
 		advisorySrv, advisoryLis, err = runAdvisoryServer(ctx, sock, advisoryTLS, srv.store, srv.audit, srv.notif, log, srv.ops)
 		if err != nil {
@@ -1065,17 +1496,29 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// The bridge receiver implementation is in githubd_bridge.go;
 	// it implements the githubdpb.GithubdServer interface (only
 	// EnqueueBuild is wired; the rest is UnimplementedGithubdServer).
+	//
+	// PR-0 (issue #678): cfg.LoadGithubdBridgeTLS is the issue-#678
+	// surface that replaces the inline env reads.
+	//
+	// PR-B (issue #678 / ADR-056): the WithVerifier variant installs
+	// the handshake-layer NodeVerifier hook on the server-side
+	// tls.Config. githubd dials in here; the hook rejects any peer
+	// whose leaf-CN is not in compute_nodes.name.
+	//
+	// ADR-052 §5 / PR-E: route through the WithReload factory for
+	// SIGHUP-driven leaf rotation.
 	var bridgeSrv *grpc.Server
 	var bridgeLis net.Listener
-	if sock := resolveGithubdBridgeSock(deps.getenv); sock != "" {
-		bridgeTLS, tlsErr := wire.LoadServerTLSConfig(
-			deps.getenv("FAAS_APID_GITHUBD_BRIDGE_TLS_CERT_PATH"),
-			deps.getenv("FAAS_APID_GITHUBD_BRIDGE_TLS_KEY_PATH"),
-			deps.getenv("FAAS_APID_GITHUBD_BRIDGE_TLS_CA_PATH"),
-		)
+	bridgeRotator := wire.NewTLSRotator(nil)
+	if sock := resolveGithubdBridgeSock(deps.getenv, cfg); sock != "" {
+		bridgeTLS, tlsErr := cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, bridgeRotator.Reload(nil))
 		if tlsErr != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: githubd bridge TLS: %w", tlsErr)
+		}
+		bridgeRotator.Set(bridgeTLS)
+		if deps.captureDialTLS != nil {
+			deps.captureDialTLS("bridge", bridgeTLS)
 		}
 		bridgeSrv, bridgeLis, err = runGithubdBridgeServer(ctx, sock, bridgeTLS, srv.store, srv.notif, log, srv.ops, spoolRoot(), resolveGithubdStagingRoot(deps.getenv))
 		if err != nil {
@@ -1090,9 +1533,76 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}()
 	}
 
+	// ADR-096 PR-A: customer-facing automatic error grouping.
+	// The IncrementAppError gRPC server lives behind
+	// FAAS_APP_ERRORS_ENABLED. PR-A shipped the kill-switch OFF
+	// so the schema populated only by hand; PR-B ships the
+	// customer-facing surface (handlers + SDK + OpenAPI) and
+	// flips the kill-switch to default-on. Set
+	// FAAS_APP_ERRORS_ENABLED=false to cleanly disable both
+	// the writer (apid gRPC) and the gateway-side recorder.
+	if deps.getenv("FAAS_APP_ERRORS_ENABLED") != "false" { //nolint:goconst // kill-switch sentinel; the canonical "true" env literal.
+		appErrSrv, appErrLis, err := runAppErrorsServer(ctx, srv.store, srv.ops, log)
+		if err != nil {
+			_ = l.Close()
+			return fmt.Errorf("apid: app errors server: %w", err)
+		}
+		go func() {
+			log.Info("apid app errors server listening")
+			if err := appErrSrv.Serve(appErrLis); err != nil {
+				log.Error("apid app errors serve", "err", err)
+			}
+		}()
+		go newAppErrorsPurger(srv.store, nil, srv.ops, log, true).Run(ctx)
+
+		// ADR-095 PR-C: preview teardown janitor. Lives in apid
+		// (the sole writer to customer-intent tables per CLAUDE.md
+		// line 71) and drives preview rows through the
+		// closed → stale → torn_down state machine. Emits
+		// db.NotifyAppDelete so schedd reaps in-flight instances
+		// for tombstoned apps via its existing app_delete
+		// subscriber (pkg/sched/app_delete_subscriber.go).
+		go newPreviewJanitor(srv.store, srv.notif, srv.ops, log, true).Run(ctx)
+
+		// ADR-052 §5 / PR-E: SIGHUP-driven TLS cert rotation. Apid
+		// doesn't yet have its own hupCh (pkg/wire.Daemon's is consumed
+		// by watchLogLevelReload). Install three parallel ones — each
+		// gets every SIGHUP (signal.Notify fans the signal out to every
+		// registered channel). Best-effort failure posture (matches
+		// egress bundle): a failed reload keeps prior material live,
+		// never bricks. WatchTLSReload returns immediately on ctx cancel.
+		if cfg != nil && cfg.GithubdClientTLSCAPath != "" {
+			githubdHupCh := make(chan os.Signal, 1)
+			signal.Notify(githubdHupCh, syscall.SIGHUP)
+			defer signal.Stop(githubdHupCh)
+			githubdReload := func() (*tls.Config, error) {
+				return cfg.LoadGithubdTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, githubdHupCh, githubdRotator, githubdReload)
+		}
+		if cfg != nil && cfg.AdvisoryTLSCAPath != "" {
+			advisoryHupCh := make(chan os.Signal, 1)
+			signal.Notify(advisoryHupCh, syscall.SIGHUP)
+			defer signal.Stop(advisoryHupCh)
+			advisoryReload := func() (*tls.Config, error) {
+				return cfg.LoadAdvisoryTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, advisoryHupCh, advisoryRotator, advisoryReload)
+		}
+		if cfg != nil && cfg.GithubdBridgeTLSCAPath != "" {
+			bridgeHupCh := make(chan os.Signal, 1)
+			signal.Notify(bridgeHupCh, syscall.SIGHUP)
+			defer signal.Stop(bridgeHupCh)
+			bridgeReload := func() (*tls.Config, error) {
+				return cfg.LoadGithubdBridgeTLSWithPrefixAndVerifierAndReload(nodeVerifier, nil)
+			}
+			go wire.WatchTLSReload(ctx, log, bridgeHupCh, bridgeRotator, bridgeReload)
+		}
+	}
+
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("apid listening", "addr", listenAddr)
+		log.Info("apid listening", "addr", listenBind)
 		if err := httpSrv.Serve(l); err != nil && err != http.ErrServerClosed {
 			errc <- err
 		}
@@ -1472,4 +1982,28 @@ func isUnixSocketPath(target string) bool {
 		return true
 	}
 	return false
+}
+
+// runAppErrorsServer brings up the AppErrors gRPC server
+// (ADR-096 §3.5: gatewayd-internal → apid IncrementAppError
+// streaming RPC). Listens on a unix socket under /run/faas so
+// the gateway-side dial is loopback-only and TLS-free (single-box
+// mode). The socket path is hard-coded to /run/faas/app_errors.sock
+// — gatewayd-internal dials it via FAAS_APID_APP_ERRORS_SOCK env
+// (defaulting to the same path). PR-A wires this server behind
+// FAAS_APP_ERRORS_ENABLED so the surface exists but is dormant
+// until PR-B flips the flag.
+//
+// Returns the server (caller calls Serve) and the listener. Errors
+// here are non-fatal: the caller logs and continues without the
+// app_errors gRPC server (the apid HTTP listener still serves).
+func runAppErrorsServer(ctx context.Context, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+	const sock = "/run/faas/app_errors.sock"
+	lis, err := wire.ListenOrRecreateByName(sock, "faas-apid")
+	if err != nil {
+		return nil, nil, fmt.Errorf("app errors listen: %w", err)
+	}
+	srv := grpc.NewServer()
+	registerAppErrorsReceiver(srv, store, ops, true)
+	return srv, lis, nil
 }

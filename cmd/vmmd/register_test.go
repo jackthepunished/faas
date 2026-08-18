@@ -16,8 +16,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
+	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -38,8 +41,14 @@ func TestRegisterComputeNode_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registerComputeNode: %v", err)
 	}
-	if got.Name != "box-east-1" {
-		t.Errorf("name = %q", got.Name)
+	if got.Name != "box-east-1.faas" {
+		// Issue #900: vmmd auto-appends `.faas` to the
+		// registered name so the TLS CN verifier (which only
+		// accepts `*.faas` CMs) finds a match. The row's Name
+		// column is the rewritten form; the operator's TOML
+		// value is preserved on the config side (cfg.NodeName
+		// is not mutated).
+		t.Errorf("name = %q, want %q (auto-append .faas)", got.Name, "box-east-1.faas")
 	}
 	if got.ID == "" {
 		t.Error("id empty")
@@ -112,6 +121,77 @@ func TestRegisterComputeNode_RejectsZeroFields(t *testing.T) {
 	}
 }
 
+// TestRegisterComputeNode_RejectsNegativeVCPUBudget: issue #938 / PR-A.
+// The migration 00123 CHECK (vcpu_budget > 0) trips the upsert, so
+// LoadConfig also rejects it via FAAS_VCPU_BUDGET. A negative value at
+// the register boundary must surface as a startup error rather than
+// reaching the upsert.
+func TestRegisterComputeNode_RejectsNegativeVCPUBudget(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		VCPUBudget:         -1,
+	}
+	_, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err == nil {
+		t.Fatal("expected negative VCPUBudget to be rejected")
+	}
+	if !strings.Contains(err.Error(), "vcpu_budget") {
+		t.Errorf("error %q does not name vcpu_budget", err.Error())
+	}
+}
+
+// TestRegisterComputeNode_DefaultsVCPUBudgetFromAPI: issue #938 / PR-A.
+// When the operator leaves VCPUBudget at the struct-default zero value,
+// the upsert falls back to api.VCPUSlots so the migration 00123 CHECK
+// never trips on single-box dev. Pins the fallback to a single source
+// of truth (pkg/api.VCPUSlots).
+func TestRegisterComputeNode_DefaultsVCPUBudgetFromAPI(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		// VCPUBudget omitted → fallback to api.VCPUSlots
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.VCPUBudget != api.VCPUSlots {
+		t.Errorf("VCPUBudget = %d, want %d (api.VCPUSlots fallback)", got.VCPUBudget, api.VCPUSlots)
+	}
+}
+
+// TestRegisterComputeNode_HonorsExplicitVCPUBudget: issue #938 / PR-A.
+// Heterogeneous fleets override the per-host vCPU ceiling via
+// [compute_node].vcpu_budget; the value flows through verbatim to the
+// compute_nodes row.
+func TestRegisterComputeNode_HonorsExplicitVCPUBudget(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+		VCPUBudget:         40, // smaller box, narrower ceiling
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.VCPUBudget != 40 {
+		t.Errorf("VCPUBudget = %d, want 40 (operator override)", got.VCPUBudget)
+	}
+}
+
 // TestRegisterComputeNode_OverlayDetectionErrorContinues: a tailscale
 // detection failure logs a warning and proceeds without the IP
 // rather than failing vmmd startup. This matters for single-box dev
@@ -130,8 +210,14 @@ func TestRegisterComputeNode_OverlayDetectionErrorContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("overlay failure should not block registration: %v", err)
 	}
-	if got.Name != "box-east-1" {
-		t.Errorf("name = %q", got.Name)
+	if got.Name != "box-east-1.faas" {
+		// Issue #900: vmmd auto-appends `.faas` to the
+		// registered name so the TLS CN verifier (which only
+		// accepts `*.faas` CMs) finds a match. The row's Name
+		// column is the rewritten form; the operator's TOML
+		// value is preserved on the config side (cfg.NodeName
+		// is not mutated).
+		t.Errorf("name = %q, want %q (auto-append .faas)", got.Name, "box-east-1.faas")
 	}
 }
 
@@ -156,9 +242,17 @@ func TestRegisterComputeNode_TargetURLPreservesOperatorValue(t *testing.T) {
 	st := state.NewMemStore()
 	ctx := context.Background()
 
-	// Step 1: operator POST (apid path).
+	// Step 1: operator POST (apid path). The operator's contract
+	// is to supply the FINAL row name (the rewritten form the
+	// vmmd self-registration will write). Pre-issue #900, the
+	// operator could supply `fsn-2` and vmmd would store
+	// `fsn-2`; the contract is now "supply the post-rewrite
+	// name" so the re-register's lookup by name finds the row.
+	// A pre-rewrite operator row would now be a no-op (vmmd
+	// inserts a NEW row with the appended suffix) — that's
+	// the breaking change tracked in the PR description.
 	operator, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
-		Name:      "fsn-2",
+		Name:      "fsn-2.faas",
 		TargetURL: "tcp://vmmd-2.faas:50051",
 		VPCPUs:    160, MemMB: 56000,
 		MaxConcurrency: 200, AdmissionCeilingMB: 47600,
@@ -168,7 +262,10 @@ func TestRegisterComputeNode_TargetURLPreservesOperatorValue(t *testing.T) {
 	}
 	operatorID := operator.ID
 
-	// Step 2: vmmd restart with a wrong target_url.
+	// Step 2: vmmd restart with a wrong target_url. The
+	// [compute_node].name "fsn-2" gets auto-rewritten to
+	// "fsn-2.faas" inside registerComputeNode (issue #900), so
+	// the upsert finds the operator's row by name.
 	got, err := registerComputeNode(ctx, st,
 		ComputeNodeConfig{
 			NodeName: "fsn-2", VPCPUs: 160, MemMB: 56000,
@@ -185,6 +282,14 @@ func TestRegisterComputeNode_TargetURLPreservesOperatorValue(t *testing.T) {
 	}
 	if got.ID != operatorID {
 		t.Errorf("id changed across re-register: %q -> %q", operatorID, got.ID)
+	}
+	// Issue #900: the row's Name column carries the rewritten
+	// form (auto-appended .faas), not the operator's TOML
+	// value. The TLS CN verifier (pkg/wire/node_verifier.go)
+	// consults the row's Name as the CN, so the rewritten form
+	// is what makes the handshake succeed.
+	if got.Name != "fsn-2.faas" {
+		t.Errorf("Name = %q, want %q (auto-append .faas)", got.Name, "fsn-2.faas")
 	}
 }
 
@@ -207,6 +312,90 @@ func TestRegisterComputeNode_TargetURLFromConfig(t *testing.T) {
 	}
 	if got.TargetURL != "tcp://100.64.0.1:50051" {
 		t.Errorf("target_url = %q, want tcp://100.64.0.1:50051", got.TargetURL)
+	}
+}
+
+// TestRegisterComputeNode_AppendsFaasSuffix pins the issue #900
+// auto-append behavior: when the operator's [compute_node].name
+// lacks the `.faas` suffix, the upsert row carries the rewritten
+// name with the suffix appended. The TLS CN verifier
+// (pkg/wire/node_verifier.go) only accepts `*.faas` CMs; without
+// the rewrite, the operator's name would never match a registered
+// CN and the handshake would abort with ErrNodeVerifierCNMismatch
+// (the gating symptom behind the ErrEmptySignature drop at
+// pkg/sched/capacity.go:99).
+func TestRegisterComputeNode_AppendsFaasSuffix(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "gcp-faas-node-1",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.Name != "gcp-faas-node-1.faas" {
+		t.Errorf("Name = %q, want %q (auto-append .faas)", got.Name, "gcp-faas-node-1.faas")
+	}
+	// Verify the row is actually stored under the rewritten name
+	// (MemStore exposes the projection; the upsert wrote the
+	// rewritten name, not the original).
+	row, err := st.ComputeNodeByName(context.Background(), "gcp-faas-node-1.faas")
+	if err != nil {
+		t.Fatalf("ComputeNodeByName: %v", err)
+	}
+	if row.Name != "gcp-faas-node-1.faas" {
+		t.Errorf("stored row Name = %q, want %q", row.Name, "gcp-faas-node-1.faas")
+	}
+}
+
+// TestRegisterComputeNode_PreservesExistingFaasSuffix pins the
+// idempotency contract: a name that already ends in `.faas` is
+// written verbatim — no double-append, no normalization. The
+// rewrite is a one-way trip from "no suffix" to "with suffix".
+func TestRegisterComputeNode_PreservesExistingFaasSuffix(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "box-east-1.faas",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.Name != "box-east-1.faas" {
+		t.Errorf("Name = %q, want %q (no double-append)", got.Name, "box-east-1.faas")
+	}
+}
+
+// TestRegisterComputeNode_TrimmedNameAppendsSuffix pins the
+// ordering: the local TrimSpace before the suffix check means the
+// suffix is appended to the trimmed value, not the raw operator
+// input. A name like "  box-east-1  " becomes "box-east-1.faas".
+// Without the TrimSpace-before-suffix ordering, the rewrite would
+// land on "  box-east-1  .faas" (with embedded spaces) and the
+// verifier would never match — silent failure.
+func TestRegisterComputeNode_TrimmedNameAppendsSuffix(t *testing.T) {
+	st := state.NewMemStore()
+	cfg := ComputeNodeConfig{
+		NodeName:           "  box-east-1  ",
+		VPCPUs:             160,
+		MemMB:              56000,
+		MaxConcurrency:     200,
+		AdmissionCeilingMB: 47600,
+	}
+	got, err := registerComputeNode(context.Background(), st, cfg, "unix:///x", nil, testLogger())
+	if err != nil {
+		t.Fatalf("registerComputeNode: %v", err)
+	}
+	if got.Name != "box-east-1.faas" {
+		t.Errorf("Name = %q, want %q (TrimSpace before suffix check)", got.Name, "box-east-1.faas")
 	}
 }
 
@@ -419,4 +608,180 @@ func mustPEMBlock(t *testing.T, b *pem.Block, msg string) *pem.Block {
 		t.Fatal(msg)
 	}
 	return b
+}
+
+// ----------------------------------------------------------------------------
+// Mega-PR-B Commit 3 — overlay IP detection scoring
+//
+// Pure helpers + a no-exec stub-detector path, so the tests don't
+// need a tailscale binary on PATH. Each case pins one branch of
+// detectOverlayIP / parseTailscaleIPLines / scoreByCIDR; the
+// production defaultDetectOverlayIP is exercised through the
+// cfg-bearing entry point at the bottom.
+// ----------------------------------------------------------------------------
+
+// TestDetectOverlayIP_PrefersCIDRMatch exercises the load-bearing
+// branch: when tailscale prints multiple IPv4 lines, the candidate
+// that lives in PreferCIDR wins. Anti-regression for the Tier-1
+// BLOCKING tail-1 NIC ambiguity where a multi-NIC host's first
+// `tailscale ip -4` line was a non-overlay secondary IP.
+func TestDetectOverlayIP_PrefersCIDRMatch(t *testing.T) {
+	stub := []byte("100.64.0.5\n192.168.1.10\n100.100.100.1\n")
+	got, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/nonexistent-but-not-looked-up",
+		PreferCIDR:          netip.MustParsePrefix("100.64.0.0/10"),
+		Run:                 func(_ context.Context) ([]byte, error) { return stub, nil },
+	})
+	if err != nil {
+		t.Fatalf("detectOverlayIP: %v", err)
+	}
+	if got != "100.64.0.5" {
+		t.Errorf("overlay IP = %q, want 100.64.0.5 (Tailscale CGNAT in PreferCIDR/10)", got)
+	}
+}
+
+// TestDetectOverlayIP_FirstLineWhenNoCIDRMatch asserts the v1
+// fall-through: when no candidate matches PreferCIDR, the first
+// line wins (legacy first-line behavior preserved). An operator
+// who set PreferCIDR too narrow still gets an answer.
+func TestDetectOverlayIP_FirstLineWhenNoCIDRMatch(t *testing.T) {
+	stub := []byte("192.168.1.10\n100.64.0.5\n")
+	got, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/not-used",
+		PreferCIDR:          netip.MustParsePrefix("203.0.113.0/24"), // no candidate in this /24
+		Run:                 func(_ context.Context) ([]byte, error) { return stub, nil },
+	})
+	if err != nil {
+		t.Fatalf("detectOverlayIP: %v", err)
+	}
+	if got != "192.168.1.10" {
+		t.Errorf("overlay IP = %q, want 192.168.1.10 (first-line fall-through)", got)
+	}
+}
+
+// TestDetectOverlayIP_FirstLineWhenNoPreferCIDR is the explicit
+// v1 contract: zero-value PreferCIDR (no manifest overlay.cidr)
+// returns the first IP line. The Mega-PR-A config that omitted
+// overlay_cidr must not break.
+func TestDetectOverlayIP_FirstLineWhenNoPreferCIDR(t *testing.T) {
+	stub := []byte("100.64.0.5\n192.168.1.10\n")
+	got, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/not-used",
+		Run:                 func(_ context.Context) ([]byte, error) { return stub, nil },
+	})
+	if err != nil {
+		t.Fatalf("detectOverlayIP: %v", err)
+	}
+	if got != "100.64.0.5" {
+		t.Errorf("overlay IP = %q, want 100.64.0.5 (zero-PreferCIDR v1 behavior)", got)
+	}
+}
+
+// TestDetectOverlayIP_ErrorsOnEmptyOutput pins the malformed-binary
+// path: tailscale exists but produces no output. Must error (not
+// silently return ""), so the caller logs and continues rather
+// than accidentally skipping overlay detection.
+func TestDetectOverlayIP_ErrorsOnEmptyOutput(t *testing.T) {
+	_, err := detectOverlayIP(context.Background(), OverlayDetector{
+		TailscaleBinaryPath: "/not-used",
+		Run:                 func(_ context.Context) ([]byte, error) { return nil, nil },
+	})
+	if err == nil {
+		t.Fatal("detectOverlayIP: want error on empty output, got nil")
+	}
+}
+
+// TestParseTailscaleIPLines covers the pure parser. Filters IPv6,
+// trims whitespace, rejects garbage lines, skips blanks. Pinned so
+// a future edit that accidentally accepts `fe80::1` (or returns
+// silently on garbage) fails here.
+func TestParseTailscaleIPLines(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string // stringified netip.Addr for equality
+		err  bool
+	}{
+		{"ipv4-only", "100.64.0.5\n", []string{"100.64.0.5"}, false},
+		{"ipv4-with-ipv6", "100.64.0.5\nfe80::1\n", []string{"100.64.0.5"}, false},
+		{"trailing-whitespace", "100.64.0.5   \n", []string{"100.64.0.5"}, false},
+		{"blank-lines", "100.64.0.5\n\n100.64.0.6\n", []string{"100.64.0.5", "100.64.0.6"}, false},
+		{"garbage-line", "100.64.0.5\nnot-an-ip\n", nil, true},
+		{"empty-after-trim", " \n \n", []string{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addrs, err := parseTailscaleIPLines([]byte(tc.in))
+			if tc.err {
+				if err == nil {
+					t.Fatalf("parseTailscaleIPLines: want error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseTailscaleIPLines: %v", err)
+			}
+			if len(addrs) != len(tc.want) {
+				t.Fatalf("parseTailscaleIPLines: got %d addrs, want %d (%v vs %v)",
+					len(addrs), len(tc.want), addrs, tc.want)
+			}
+			for i, a := range addrs {
+				if a.String() != tc.want[i] {
+					t.Errorf("parseTailscaleIPLines[%d] = %s, want %s", i, a, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestScoreByCIDR pins the scoring priority order:
+//
+//   - empty PreferCIDR → first element
+//   - PreferCIDR with match → first match (stable order)
+//   - PreferCIDR with no match → first element (fall-through)
+//
+// The stable-order-on-tie clause is load-bearing: when two
+// candidates both live in PreferCIDR, the earlier one wins
+// (the legacy first-line contract is preserved on ties).
+func TestScoreByCIDR(t *testing.T) {
+	mkAddrs := func(s ...string) []netip.Addr {
+		out := make([]netip.Addr, 0, len(s))
+		for _, v := range s {
+			out = append(out, netip.MustParseAddr(v))
+		}
+		return out
+	}
+	t.Run("empty-prefer", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("100.64.0.5", "192.168.1.10"), netip.Prefix{})
+		if got.String() != "100.64.0.5" {
+			t.Errorf("got %s, want 100.64.0.5", got)
+		}
+	})
+	t.Run("single-match", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("192.168.1.10", "100.64.0.5", "100.100.100.1"),
+			netip.MustParsePrefix("100.64.0.0/10"))
+		if got.String() != "100.64.0.5" {
+			t.Errorf("got %s, want 100.64.0.5", got)
+		}
+	})
+	t.Run("tie-stable-order", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("100.64.0.5", "100.64.0.6"),
+			netip.MustParsePrefix("100.64.0.0/10"))
+		if got.String() != "100.64.0.5" {
+			t.Errorf("got %s, want 100.64.0.5 (first tie wins)", got)
+		}
+	})
+	t.Run("no-match", func(t *testing.T) {
+		got := scoreByCIDR(mkAddrs("192.168.1.10", "100.64.0.5"),
+			netip.MustParsePrefix("203.0.113.0/24"))
+		if got.String() != "192.168.1.10" {
+			t.Errorf("got %s, want 192.168.1.10 (no-match fall-through)", got)
+		}
+	})
+	t.Run("empty-list", func(t *testing.T) {
+		got := scoreByCIDR(nil, netip.MustParsePrefix("100.64.0.0/10"))
+		if got.IsValid() {
+			t.Errorf("got %s, want zero Addr for empty list", got)
+		}
+	})
 }

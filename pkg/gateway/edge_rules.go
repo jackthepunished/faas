@@ -23,6 +23,14 @@ package gateway
 // EdgeRuleMatcher adds MatchCORS / MatchJWT / MatchIP. The cache +
 // invalidation plumbing stays unchanged.
 //
+// PR-B (issue #678, ADR follow-on) widens with an 8th kind, `validate`:
+// a JSON-Schema body gate that runs BEFORE the wake gate fires. The
+// 7-slot HostEntry widens to 8; the matcher widens with MatchValidate.
+// The compiled-schema cache lives in pkg/edgevalidate (separate
+// LRU keyed by SHA-256 of the raw schema bytes); this file only
+// carries the resolver subset (SchemaDigest) and delegates Validate
+// to pkg/edgevalidate.Validator via the cmd-side adapter.
+//
 // Why a subset type (not `state.EdgeRule`): pkg/gateway has no
 // `pkg/state` import today and adding one would be a reverse dep
 // (mirrors the existing `RequireAuthnAuthenticator` interface
@@ -33,6 +41,7 @@ package gateway
 import (
 	"container/list"
 	"context"
+	"errors"
 	"net"
 	"path"
 	"sync"
@@ -77,6 +86,19 @@ type PathGlobError = pathGlobError
 // per-host tracking; gatewayd-internal calls Reset() on
 // `db.NotifyEdgeRuleChanged`.
 const EdgeRuleCacheCap = 10_000
+
+// EdgeRuleConsumerCacheCap (ADR-104, issue #881 Phase 3) is the
+// maximum number of per-rule per-consumer buckets the
+// routeConsumerLimiter retains. Sized 10x the per-rule cap because
+// each per-rule scope can carry up to MaxKeysPerRule (plan ceiling
+// Scale 10_000) consumer buckets plus one pinned __other__ collapse
+// bucket per rule. The full-bucket-only invariant from
+// pkg/gateway/ratelimit.go:234-267 means the map may overshoot
+// under sustained pressure; BucketCount surfaces the overshoot to
+// /metrics. The default 100_000 covers the worst-case legit
+// traffic (10k rules × 10 keys + 10k collapse buckets) with headroom
+// for the LRU scan to actually find an evictable bucket.
+const EdgeRuleConsumerCacheCap = 100_000
 
 // EdgeRuleResolved is the gateway-side subset of `state.EdgeRule`
 // the matcher reads on every request. Fields are the minimum needed
@@ -227,13 +249,81 @@ type EdgeRuleIPResolved struct {
 	Deny      []*net.IPNet // nil = no denylist
 }
 
+// EdgeRuleValidateResolved is the kind=validate subset (PR-B).
+// The applier (handler.go::applyEdgeRuleValidate) buffers the
+// inbound request body up to MaxBodyBytes (or api.MaxRequestBodyBytes
+// if MaxBodyBytes ≤ 0), restores r.Body so the proxy leg still
+// reads it, and consults pkg/edgevalidate.Validator with the
+// resolved SchemaDigest. The compiled *CompiledSchema lives in
+// pkg/edgevalidate.Cache keyed by SHA-256 — pkg/gateway doesn't
+// import pkg/edgevalidate, mirroring the JWT seam at line 528.
+//
+// ContentTypes gates the request's Content-Type against a closed
+// vocabulary (apid-Validate enforces "must start with application/"
+// upstream). When nil/empty, any Content-Type passes (back-compat
+// with rules that pre-date the field).
+//
+// ApplyWhileStreaming mirrors the per-rule apply_while_streaming
+// knob: when the inbound request is part of a streaming response
+// (the upgrade check at handler.go), the applier short-circuits
+// to pass-through unless this is true. Body validation needs the
+// full body, which streaming doesn't have.
+type EdgeRuleValidateResolved struct {
+	ID                  string
+	AccountID           string
+	AppID               string
+	Priority            int
+	PathGlob            string
+	Methods             map[string]bool
+	SchemaDigest        [32]byte // SHA-256 of the raw schema body
+	ContentTypes        []string // nil/empty = any Content-Type
+	ApplyWhileStreaming bool     // default false
+	RejectUnknownFields bool     // audit-tag-only; schema-side authoritative
+	MaxBodyBytes        int      // 0 = use api.MaxRequestBodyBytes
+}
+
+// EdgeRuleGeoResolved is the kind=geo subset (ADR-091 D21/D22).
+// Mirrors EdgeRuleIPResolved's shape exactly so the §4.1.2.8b
+// matcher can share the same compile-side + path/methods filter
+// helpers. The difference isAllow / Deny carry ISO 3166-1 alpha-2
+// country codes as a string-keyed set, not CIDR networks.
+//
+// apid-Validate already drops reserved codes (AA, ZZ, etc.) before
+// the row lands in PG, so the gateway can trust the wire shape
+// here. The compile side uppercases and dedupes one more time
+// for defense-in-depth (the §11 spirit — abuse gates must not
+// hinge on a single validator's correctness).
+type EdgeRuleGeoResolved struct {
+	ID        string
+	AccountID string
+	AppID     string
+	Priority  int
+	PathGlob  string
+	Methods   map[string]bool
+	Allow     map[string]struct{} // ISO 3166-1 alpha-2 country codes; nil = no allowlist
+	Deny      map[string]struct{} // ISO 3166-1 alpha-2 country codes; nil = no denylist
+}
+
 // EdgeRuleCache is the in-memory per-host LRU (PR 3 shape; PR 4
 // widens the entry to a HostEntry carrying four compiled slices —
 // one per kind). Wholesale `Reset()` on `db.NotifyEdgeRuleChanged`
 // is the only invalidation — single-box scale assumption per
 // spec §4.3. Mirrors `RouteCache` at `pkg/gateway/routes.go:11-96`.
 type EdgeRuleCache struct {
-	mu   sync.Mutex
+	// mu (ADR-091 hardening PR-A) is a sync.RWMutex rather than the
+	// previous sync.Mutex. The hot path is read-dominant (every
+	// cache hit + every cache miss walks the map under at least an
+	// RLock), and Reset / Put are infrequent (Reset fires only on
+	// db.NotifyEdgeRuleChanged; Put fires only on a loader's
+	// compile-and-fill). Widening to RWMutex lets concurrent hits
+	// proceed without serialising on a write lock; misses that
+	// trigger a Put wait until the loader releases the write lock,
+	// which is the established semantic for the structural twin
+	// pkg/gateway/public_auth_cache.go:46-162. MoveToFront under
+	// write-lock is a container/list O(1) op that holds the
+	// critical section for nanoseconds; the value-copy before
+	// re-acquiring the write lock keeps the RLock phase short.
+	mu   sync.RWMutex
 	cap  int
 	ll   *list.List               // front = most recently used
 	byID map[string]*list.Element // host → element (element.Value is *HostEntry)
@@ -244,7 +334,7 @@ type EdgeRuleCache struct {
 // cmd/gatewayd-internal/edge_rules.go::loadHost, which runs every
 // compile* over the same []state.EdgeRule slice and stitches the
 // results into a single HostEntry. PathGlobErrs aggregates the
-// path-glob parse errors from all seven compileXxx calls so the
+// path-glob parse errors from all compileXxx calls so the
 // loader can re-emit them at WARN on subsequent reads without
 // re-running path.Match. (PR 5 widened the slice count from 4 to
 // 7; the audit tuple is reused verbatim — malformed CIDRs flow
@@ -254,14 +344,61 @@ type EdgeRuleCache struct {
 // `cache.Put(host, &gateway.HostEntry{...})` — see how the cmd-side
 // loadHost builds the entry. PR 5 widens with CORS / JWT / IP slots.
 type HostEntry struct {
-	Host         string
-	Route        []EdgeRuleResolved
-	Rewrite      []EdgeRuleRewriteResolved
-	Redirect     []EdgeRuleRedirectResolved
-	Headers      []EdgeRuleHeadersResolved
-	CORS         []EdgeRuleCORSResolved
-	JWT          []EdgeRuleJWTResolved
-	IP           []EdgeRuleIPResolved
+	Host     string
+	Route    []EdgeRuleResolved
+	Rewrite  []EdgeRuleRewriteResolved
+	Redirect []EdgeRuleRedirectResolved
+	Headers  []EdgeRuleHeadersResolved
+	CORS     []EdgeRuleCORSResolved
+	JWT      []EdgeRuleJWTResolved
+	IP       []EdgeRuleIPResolved
+	Validate []EdgeRuleValidateResolved
+	// Limit carries the kind=limit subset (ADR-091 D24). Same
+	// shape as Validate above; the applier
+	// (handler.go::applyEdgeRuleLimit) installs MaxBytesReader on
+	// r.Body at the per-rule cap. Stored as a plain slice to match
+	// the surrounding fields — the cache primitive is
+	// kind-agnostic and the cmd-side loader threads one slice per
+	// kind into the HostEntry.
+	Limit []EdgeRuleLimitResolved
+	// Maintenance carries the kind=maintenance subset (ADR-091
+	// amendment). Same shape as Limit / Validate above; the applier
+	// (handler.go::applyEdgeRuleMaintenance, §4.1.2.13) short-circuits
+	// a matched (host, path, method) request with 503 + Retry-After
+	// BEFORE auth, BEFORE wake. Stored as a plain slice to match the
+	// surrounding fields — the cache primitive is kind-agnostic and
+	// the cmd-side loader threads one slice per kind into the
+	// HostEntry. The struct itself lives in edge_rules_maintenance.go
+	// (file-level split mirroring edge_rules_limit.go).
+	Maintenance []EdgeRuleMaintenanceResolved
+	// Geo carries the kind=geo subset (ADR-091 D21). Same shape
+	// as IP / Limit above; the applier
+	// (handler.go::applyEdgeRuleGeo) reads the trusted XFF entry,
+	// consults the pkg/geoip.Reader for the country code, and
+	// evaluates against this rule's Allow/Deny sets. Stored as a
+	// plain slice to match the surrounding fields — the cache
+	// primitive is kind-agnostic and the cmd-side loader threads
+	// one slice per kind into the HostEntry.
+	Geo []EdgeRuleGeoResolved
+	// Throttle carries the kind=throttle subset (ADR-091 D20.5
+	// amendment, issue #881). Same shape as Limit / Maintenance
+	// above; the applier (handler.go::applyEdgeRuleThrottle) reads
+	// the resolved rule's RequestsPerSecond + Burst, constructs a
+	// rule-scoped bucket key (AppID + "\x00" + ID), and decrements
+	// it on every passing request. The bucket is held in the shared
+	// limiter built with NewLimiterWithLRU (#887) so the wake path
+	// never exceeds the configured cardinality. Stored as a plain
+	// slice to match the surrounding fields — the cache primitive
+	// is kind-agnostic and the cmd-side loader threads one slice
+	// per kind into the HostEntry.
+	Throttle []EdgeRuleThrottleResolved
+	// Budget carries the kind=budget subset (ADR-093). The applier
+	// (handler.go::applyEdgeRuleBudget) stamps the per-rule
+	// BudgetMs onto r.Context() via reqbudget.WithRemaining. Stored
+	// as a plain slice to match the surrounding fields; the cache
+	// primitive is kind-agnostic and the cmd-side loader threads
+	// one slice per kind into the HostEntry.
+	Budget       []EdgeRuleBudgetResolved
 	PathGlobErrs []PathGlobError
 }
 
@@ -386,11 +523,178 @@ func (c *EdgeRuleCache) GetIP(host string) ([]EdgeRuleIPResolved, bool) {
 	return out, true
 }
 
+// GetValidate is the PR-B accessor for the kind=validate slice.
+// Same shape as GetIP: returns a value-copy of the underlying slice
+// and a hit bool; nil slice with ok=true means "entry exists but
+// no validate rule for this host".
+func (c *EdgeRuleCache) GetValidate(host string) ([]EdgeRuleValidateResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Validate == nil {
+		return nil, true
+	}
+	src := entry.Validate
+	out := make([]EdgeRuleValidateResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
+// GetLimit is the D24 accessor for the kind=limit slice. Same shape
+// as GetValidate: returns a value-copy of the underlying slice and
+// a hit bool; nil slice with ok=true means "entry exists but no
+// limit rule for this host".
+func (c *EdgeRuleCache) GetLimit(host string) ([]EdgeRuleLimitResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Limit == nil {
+		return nil, true
+	}
+	src := entry.Limit
+	out := make([]EdgeRuleLimitResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
+// GetMaintenance is the kind=maintenance accessor. Same shape as
+// GetLimit: returns a value-copy of the underlying slice and a hit
+// bool; nil slice with ok=true means "entry exists but no
+// maintenance rule for this host". Coarse-gate apps.maintenance_mode
+// fires before this method is called (handler.go::applyAppsMaintenanceMode),
+// so a hit on the coarse gate short-circuits without consulting
+// this slice.
+func (c *EdgeRuleCache) GetMaintenance(host string) ([]EdgeRuleMaintenanceResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Maintenance == nil {
+		return nil, true
+	}
+	src := entry.Maintenance
+	out := make([]EdgeRuleMaintenanceResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
+// GetGeo mirrors GetIP for the kind=geo subset (ADR-091 D21).
+// The Geo slice is a value-copy of the underlying cache entry,
+// AND each per-entry map (Methods/Allow/Deny) is deep-copied —
+// the unique inner-map-mutation test (edge_rules_geo_test.go
+// TestCache_GetGeo_DeepCopiesInnerMaps) pins the contract that
+// a caller mutating the returned Allow/Deny/Methods for any
+// reason (e.g. a "consume" pattern that removes a matched
+// country to short-circuit subsequent walks) MUST NOT poison
+// the cache. The other Get* family members only copy the
+// outer slice — their maps are not mutated by callers — so
+// this is the only accessor that pays the inner-map copy cost.
+func (c *EdgeRuleCache) GetGeo(host string) ([]EdgeRuleGeoResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Geo == nil {
+		return nil, true
+	}
+	src := entry.Geo
+	out := make([]EdgeRuleGeoResolved, len(src))
+	for i, r := range src {
+		out[i] = r
+		if r.Methods != nil {
+			m := make(map[string]bool, len(r.Methods))
+			for k, v := range r.Methods {
+				m[k] = v
+			}
+			out[i].Methods = m
+		}
+		if r.Allow != nil {
+			a := make(map[string]struct{}, len(r.Allow))
+			for k := range r.Allow {
+				a[k] = struct{}{}
+			}
+			out[i].Allow = a
+		}
+		if r.Deny != nil {
+			d := make(map[string]struct{}, len(r.Deny))
+			for k := range r.Deny {
+				d[k] = struct{}{}
+			}
+			out[i].Deny = d
+		}
+	}
+	return out, true
+}
+
+// GetThrottle is the kind=throttle accessor (ADR-091 D20.5
+// amendment, issue #881). Same shape as GetLimit: returns a
+// value-copy of the underlying slice and a hit bool; nil slice
+// with ok=true means "entry exists but no throttle rule for this
+// host". The applier (handler.go::applyEdgeRuleThrottle) consults
+// the priority-ordered slice via PickFirstThrottleMatch.
+func (c *EdgeRuleCache) GetThrottle(host string) ([]EdgeRuleThrottleResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Throttle == nil {
+		return nil, true
+	}
+	src := entry.Throttle
+	out := make([]EdgeRuleThrottleResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
+// GetBudget is the kind=budget accessor (ADR-093). Same shape as
+// GetLimit: returns a value-copy of the underlying slice and a hit
+// bool; nil slice with ok=true means "entry exists but no budget
+// rule for this host" — applyEdgeRuleBudget falls back to the
+// plan-level default budget on nil.
+func (c *EdgeRuleCache) GetBudget(host string) ([]EdgeRuleBudgetResolved, bool) {
+	entry, ok := c.getEntry(host)
+	if !ok {
+		return nil, false
+	}
+	if entry.Budget == nil {
+		return nil, true
+	}
+	src := entry.Budget
+	out := make([]EdgeRuleBudgetResolved, len(src))
+	copy(out, src)
+	return out, true
+}
+
 // getEntry promotes the entry on hit and returns it. Internal —
 // the Get* family wraps this so each returns a typed slice.
+//
+// Lock discipline (ADR-091 hardening PR-A): RLock for the entry
+// fetch + value-copy, Lock only for the MoveToFront (a
+// container/list O(1) mutation that must be exclusive). The pattern
+// mirrors pkg/gateway/public_auth_cache.go:130-147 (fast-path
+// RLock + slow-path Lock-on-evict with double-checked re-acquire).
+// A racing Put between the RUnlock and the Lock may have replaced
+// the entry (or evicted it); the post-re-acquire `el, ok := …`
+// re-check handles that case — if the host is gone, the caller
+// sees a clean miss and the loader re-hits PG on the next Get.
 func (c *EdgeRuleCache) getEntry(host string) (*HostEntry, bool) {
+	c.mu.RLock()
+	_, ok := c.byID[host]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Re-check under the write lock: a concurrent Reset / Put may
+	// have evicted or replaced the entry between RUnlock and Lock.
+	// container/list addresses are stable across Reset (we re-init
+	// ll but the old elements are unreachable), so it's enough to
+	// look the element up by the host key again and discard the
+	// pre-Lock value. The discard is intentional — staticcheck
+	// (SA4006) flags the pre-Lock `el` as unused otherwise.
 	el, ok := c.byID[host]
 	if !ok {
 		return nil, false
@@ -407,21 +711,24 @@ func (c *EdgeRuleCache) getEntry(host string) (*HostEntry, bool) {
 // the cache is advisory and a missing entry costs one indexed
 // PG read (~0.5ms warm).
 //
-// All seven slices are populated from the SAME PG read (a miss for
+// All slices are populated from the SAME PG read (a miss for
 // any kind re-runs the SQL query and recompiles every kind); this
 // is the loader's contract (cmd/gatewayd-internal/edge_rules.go).
 func (c *EdgeRuleCache) Put(host string, e *HostEntry) {
 	if e == nil {
 		return
 	}
-	// PR 5 contract (widened from PR 4): a Put whose HostEntry has
-	// empty/nil slices for every kind is a no-op (the loader re-hits
-	// PG on the next Get). Pinning this so a future test or refactor
-	// can't silently start caching "no rules" entries (which would
-	// mask a loader bug).
+	// PR 5 contract (widened from PR 4, then again by PR-B for
+	// kind=validate and by ADR-091 D21 for kind=geo): a Put whose
+	// HostEntry has empty/nil slices for every kind is a no-op (the
+	// loader re-hits PG on the next Get). Pinning this so a future
+	// test or refactor can't silently start caching "no rules"
+	// entries (which would mask a loader bug).
 	if len(e.Route) == 0 && len(e.Rewrite) == 0 &&
 		len(e.Redirect) == 0 && len(e.Headers) == 0 &&
-		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 {
+		len(e.CORS) == 0 && len(e.JWT) == 0 && len(e.IP) == 0 &&
+		len(e.Validate) == 0 && len(e.Limit) == 0 &&
+		len(e.Maintenance) == 0 && len(e.Geo) == 0 {
 		return
 	}
 	e.Host = host
@@ -487,6 +794,12 @@ func (c *EdgeRuleCache) removeElement(el *list.Element) {
 // appliers (handler.go) decide whether to short-circuit, stamp
 // headers, or write 401/403 on a hit.
 //
+// MatchValidate is the PR-B matcher for the kind=validate subset.
+// The applier buffers r.Body and consults pkg/edgevalidate.Validator
+// via the cmd-side adapter; the matcher itself only resolves the
+// highest-priority matching rule (no body read here — that lives
+// in handler.go to keep pkg/gateway free of io.Reader juggling).
+//
 // Reset drops every cached entry. Called by the gatewayd notify
 // loop on `db.NotifyEdgeRuleChanged`.
 type EdgeRuleMatcher interface {
@@ -497,6 +810,19 @@ type EdgeRuleMatcher interface {
 	MatchCORS(ctx context.Context, host, path, method string) *EdgeRuleCORSResolved
 	MatchJWT(ctx context.Context, host, path, method string) *EdgeRuleJWTResolved
 	MatchIP(ctx context.Context, host, path, method string) *EdgeRuleIPResolved
+	MatchValidate(ctx context.Context, host, path, method string) *EdgeRuleValidateResolved
+	MatchLimit(ctx context.Context, host, path, method string) *EdgeRuleLimitResolved
+	MatchMaintenance(ctx context.Context, host, path, method string) *EdgeRuleMaintenanceResolved
+	MatchGeo(ctx context.Context, host, path, method string) *EdgeRuleGeoResolved
+	MatchThrottle(ctx context.Context, host, path, method string) *EdgeRuleThrottleResolved
+	// MatchBudget is the ADR-093 matcher for the kind=budget
+	// subset. The applier stamps the per-rule BudgetMs onto the
+	// inbound ctx via reqbudget.WithRemaining; the matcher itself
+	// only resolves the highest-priority matching rule (no budget
+	// math here — that lives in handler.go's applyEdgeRuleBudget
+	// + reqbudget.WithRemaining so the per-hop remaining-time
+	// propagation logic stays in one place).
+	MatchBudget(ctx context.Context, host, path, method string) *EdgeRuleBudgetResolved
 	Reset()
 }
 
@@ -534,18 +860,101 @@ type JWTVerifier interface {
 // pkg/edgejwks so the struct is duplicated here — drift would
 // surface as a mismatch when the cmd-side adapter copies the
 // fields over, which is intentional).
+//
+// Custom is the string→string subset of additional claims the rule
+// required (pkg/edgejwks.Claims.Custom). Phase 3 (ADR-104, issue
+// #881 Phase 3) threads this through to applyEdgeRuleThrottle so a
+// rule with key_by="jwt_claim" can look up the named claim value
+// for bucket-key construction. Pre-Phase-3 code never read Custom
+// — adding the field is a non-breaking widening; zero-value (nil)
+// is the prior behaviour.
 type JWTClaims struct {
 	Subject string
 	Issuer  string
 	Aud     []string
 	Exp     time.Time
+	Custom  map[string]string
 }
+
+// EdgeValidateIn is the per-call input the Validator consults. The
+// applier (handler.go) buffers r.Body into Body (preserving the
+// body for the proxy leg via r.Body = io.NopCloser(bytes.NewReader))
+// before calling. ContentType is r.Header.Get("Content-Type") at
+// the time of the call.
+//
+// The shape mirrors pkg/edgevalidate.In exactly. pkg/gateway keeps
+// its own copy because pkg/gateway has no dep on pkg/edgevalidate
+// (mirrors the JWTClaims discipline above); drift would surface
+// at the cmd-side adapter when it copies fields.
+type EdgeValidateIn struct {
+	Body        []byte
+	ContentType string
+}
+
+// EdgeValidateFieldError is one per-field entry of a validation
+// failure. Mirrors pkg/edgevalidate.FieldError exactly. The handler
+// lifts it into api.FieldError on the 422 problem+json; pkg/api
+// owns the wire-shape definition so customers see one shape across
+// rules.
+type EdgeValidateFieldError struct {
+	Field    string
+	Expected string
+	Got      string
+}
+
+// EdgeValidateResult is the per-call outcome of Validator.Validate.
+// OK is true on match; FirstError is non-nil only on mismatch.
+// SchemaDigest is always populated so the handler can tag
+// audit/metric events without re-hashing.
+type EdgeValidateResult struct {
+	OK           bool
+	SchemaDigest [32]byte
+	FirstError   *EdgeValidateFieldError
+}
+
+// Validator (PR-B) is the narrow surface pkg/gateway uses for
+// kind=validate validation. The cmd-side wires the
+// pkg/edgevalidate.Manager via a thin adapter that conforms to this
+// interface; pkg/gateway itself never imports pkg/edgevalidate, so
+// the dep direction stays one-way (gateway is a leaf, like with
+// pkg/edgejwks).
+//
+// The validator is consulted AFTER the body has been buffered
+// (handler.go is responsible for the read). Errors are package
+// sentinels (ErrSchemaInvalid / ErrSchemaExternalRef /
+// ErrSchemaEmpty / ErrSchemaTooLarge); the handler maps them to
+// distinct audit + metric outcomes.
+//
+// nil-safe: the Handler field is nil in dev mode and applyEdgeRuleValidate
+// short-circuits when nil.
+type Validator interface {
+	Validate(ctx context.Context, req *EdgeValidateIn, rule *EdgeRuleValidateResolved) (*EdgeValidateResult, error)
+}
+
+// Edge-validate sentinels, declared in pkg/gateway so the handler
+// can errors.Is them without importing pkg/edgevalidate. The
+// cmd-side adapter (cmd/gatewayd-internal/edge_validate.go)
+// wraps pkg/edgevalidate.Err* sentinels into these when
+// forwarding errors up through Validator.Validate.
+//
+// Why duplicate rather than re-export: pkg/edgevalidate is the
+// canonical source of truth for the underlying library; pkg/gateway
+// owns the applier-side error vocabulary. Drift would surface as
+// a missing sentinel when the adapter forgets to wrap, which is
+// intentional (the applier would see the literal error message
+// in the 500 audit row).
+var (
+	ErrValidateSchemaInvalid     = errors.New("edgevalidate: schema is invalid")
+	ErrValidateSchemaEmpty       = errors.New("edgevalidate: schema is empty")
+	ErrValidateSchemaTooLarge    = errors.New("edgevalidate: schema exceeds MaxSchemaBytes")
+	ErrValidateSchemaExternalRef = errors.New("edgevalidate: schema contains an external $ref or $id")
+)
 
 // noOpEdgeRuleMatcher is the default Embedding target the matcher
 // implementations use to inherit default no-op behavior for the
 // kinds they don't ship. Today's production impl
 // `cmd/gatewayd-internal.edgeRules` doesn't embed it (PR 5 ships
-// all seven Match* methods); the type exists for the
+// all Match* methods); the type exists for the
 // forward-compatible interface shape so a future kind's impl can
 // embed it and only override the kinds it ships.
 type noOpEdgeRuleMatcher struct{}
@@ -569,6 +978,24 @@ func (noOpEdgeRuleMatcher) MatchJWT(context.Context, string, string, string) *Ed
 	return nil
 }
 func (noOpEdgeRuleMatcher) MatchIP(context.Context, string, string, string) *EdgeRuleIPResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchValidate(context.Context, string, string, string) *EdgeRuleValidateResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchLimit(context.Context, string, string, string) *EdgeRuleLimitResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchMaintenance(context.Context, string, string, string) *EdgeRuleMaintenanceResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchGeo(context.Context, string, string, string) *EdgeRuleGeoResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchThrottle(context.Context, string, string, string) *EdgeRuleThrottleResolved {
+	return nil
+}
+func (noOpEdgeRuleMatcher) MatchBudget(context.Context, string, string, string) *EdgeRuleBudgetResolved {
 	return nil
 }
 func (noOpEdgeRuleMatcher) Reset() {}
@@ -714,6 +1141,51 @@ func PickFirstJWTMatch(rules []EdgeRuleJWTResolved, path, method string) *EdgeRu
 }
 
 func PickFirstIPMatch(rules []EdgeRuleIPResolved, path, method string) *EdgeRuleIPResolved {
+	for i := range rules {
+		r := &rules[i]
+		if r.Methods != nil && !r.Methods[method] {
+			continue
+		}
+		if r.PathGlob != "" {
+			ok, _ := pathGlobMatch(r.PathGlob, path)
+			if !ok {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+// PickFirstValidateMatch is the PR-B mirror of PickFirstIPMatch.
+// Same priority-ASC + methods + path-glob filter shape; returns
+// the highest-priority matching validate rule, or nil on miss.
+// The body read + schema lookup happens in handler.go.
+func PickFirstValidateMatch(rules []EdgeRuleValidateResolved, path, method string) *EdgeRuleValidateResolved {
+	for i := range rules {
+		r := &rules[i]
+		if r.Methods != nil && !r.Methods[method] {
+			continue
+		}
+		if r.PathGlob != "" {
+			ok, _ := pathGlobMatch(r.PathGlob, path)
+			if !ok {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+// PickFirstGeoMatch is the §4.1.2.8b matcher for kind=geo
+// (ADR-091 D21). Mirrors PickFirstIPMatch's priority-ASC +
+// path/methods filter; the actual country-code lookup against
+// the inbound client IP happens in applyEdgeRuleGeo (handler.go)
+// AFTER path/methods match — the lookup is the gate's expensive
+// step, so we short-circuit on a non-matching path-glob before
+// paying it.
+func PickFirstGeoMatch(rules []EdgeRuleGeoResolved, path, method string) *EdgeRuleGeoResolved {
 	for i := range rules {
 		r := &rules[i]
 		if r.Methods != nil && !r.Methods[method] {

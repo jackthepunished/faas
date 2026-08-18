@@ -50,6 +50,13 @@ class UpdateAppRequest:
     websocket_enabled: bool | None | Unset = UNSET
     """Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → no change. Free PATCHing true is 403
     plan_websocket_not_allowed."""
+    route_metrics_enabled: bool | None | Unset = UNSET
+    """Per-app per-route observability flag (ADR-093). Omitted → no change. Free PATCHing true is 403
+    plan_route_metrics_not_allowed."""
+    maintenance_mode: bool | None | Unset = UNSET
+    """Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → no change. PATCH true pins the app for
+    maintenance (every request 503 + Retry-After); PATCH false restores normal handling. Free-tier allowed; no plan
+    gate. The apps_maintenance_mode_notify trigger (migration 00237) fires pg_notify on flip."""
     scaling_policy: None | ScalingPolicy | Unset = UNSET
     """Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column."""
     require_signed: bool | None | Unset = UNSET
@@ -89,6 +96,8 @@ class UpdateAppRequest:
     human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty
     string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist
     the UUID. 404 on unknown name; 422 on inactive node."""
+    cors_default_enabled: bool | None | Unset = UNSET
+    cors_default_origins: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -146,6 +155,18 @@ class UpdateAppRequest:
             websocket_enabled = UNSET
         else:
             websocket_enabled = self.websocket_enabled
+
+        route_metrics_enabled: bool | None | Unset
+        if isinstance(self.route_metrics_enabled, Unset):
+            route_metrics_enabled = UNSET
+        else:
+            route_metrics_enabled = self.route_metrics_enabled
+
+        maintenance_mode: bool | None | Unset
+        if isinstance(self.maintenance_mode, Unset):
+            maintenance_mode = UNSET
+        else:
+            maintenance_mode = self.maintenance_mode
 
         scaling_policy: dict[str, Any] | None | Unset
         if isinstance(self.scaling_policy, Unset):
@@ -211,6 +232,16 @@ class UpdateAppRequest:
         else:
             overflow_node = self.overflow_node
 
+        cors_default_enabled: bool | None | Unset
+        if isinstance(self.cors_default_enabled, Unset):
+            cors_default_enabled = UNSET
+        else:
+            cors_default_enabled = self.cors_default_enabled
+
+        cors_default_origins: list[str] | Unset = UNSET
+        if not isinstance(self.cors_default_origins, Unset):
+            cors_default_origins = self.cors_default_origins
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -232,6 +263,10 @@ class UpdateAppRequest:
             field_dict["streaming_enabled"] = streaming_enabled
         if websocket_enabled is not UNSET:
             field_dict["websocket_enabled"] = websocket_enabled
+        if route_metrics_enabled is not UNSET:
+            field_dict["route_metrics_enabled"] = route_metrics_enabled
+        if maintenance_mode is not UNSET:
+            field_dict["maintenance_mode"] = maintenance_mode
         if scaling_policy is not UNSET:
             field_dict["scaling_policy"] = scaling_policy
         if require_signed is not UNSET:
@@ -250,6 +285,10 @@ class UpdateAppRequest:
             field_dict["public_auth"] = public_auth
         if overflow_node is not UNSET:
             field_dict["overflow_node"] = overflow_node
+        if cors_default_enabled is not UNSET:
+            field_dict["cors_default_enabled"] = cors_default_enabled
+        if cors_default_origins is not UNSET:
+            field_dict["cors_default_origins"] = cors_default_origins
 
         return field_dict
 
@@ -333,6 +372,24 @@ class UpdateAppRequest:
             return cast(bool | None | Unset, data)
 
         websocket_enabled = _parse_websocket_enabled(d.pop("websocket_enabled", UNSET))
+
+        def _parse_route_metrics_enabled(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        route_metrics_enabled = _parse_route_metrics_enabled(d.pop("route_metrics_enabled", UNSET))
+
+        def _parse_maintenance_mode(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        maintenance_mode = _parse_maintenance_mode(d.pop("maintenance_mode", UNSET))
 
         def _parse_scaling_policy(data: object) -> None | ScalingPolicy | Unset:
             if data is None:
@@ -470,6 +527,17 @@ class UpdateAppRequest:
 
         overflow_node = _parse_overflow_node(d.pop("overflow_node", UNSET))
 
+        def _parse_cors_default_enabled(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        cors_default_enabled = _parse_cors_default_enabled(d.pop("cors_default_enabled", UNSET))
+
+        cors_default_origins = cast(list[str], d.pop("cors_default_origins", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -480,6 +548,8 @@ class UpdateAppRequest:
             autoscale_target_cpu_pct=autoscale_target_cpu_pct,
             streaming_enabled=streaming_enabled,
             websocket_enabled=websocket_enabled,
+            route_metrics_enabled=route_metrics_enabled,
+            maintenance_mode=maintenance_mode,
             scaling_policy=scaling_policy,
             require_signed=require_signed,
             warm_snapshot_enabled=warm_snapshot_enabled,
@@ -489,6 +559,8 @@ class UpdateAppRequest:
             require_authn=require_authn,
             public_auth=public_auth,
             overflow_node=overflow_node,
+            cors_default_enabled=cors_default_enabled,
+            cors_default_origins=cors_default_origins,
         )
 
         update_app_request.additional_properties = d

@@ -32,6 +32,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
+// reaperParkTimeout bounds the synchronous Engine.Park call made by the
+// scheduler loop. Firecracker snapshot creation is normally fast, but a
+// saturated disk can take considerably longer; without a bound, one stalled
+// park blocks the loop and prevents the state watchdog from reclaiming the
+// row. Deployment priming is intentionally separate and keeps its existing
+// build/snapshot budget.
+const reaperParkTimeout = 2 * time.Minute
+
 // Loop subscribes to the pg_notify channels schedd cares about and reacts. It
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
@@ -56,6 +64,7 @@ type Loop struct {
 	floor              *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
 	recentLoad         *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
 	livenessWindow     *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
+	appDelete          *AppDeleteSubscriber   // ADR-098 app_delete handler; nil = no-op dispatch (tests / opt-out)
 	reaperAggressive   bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
 	reaperParkCap      int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 	// lastFloorByApp (issue #557 closure / ADR-072): per-app
@@ -106,6 +115,23 @@ func (l *Loop) WithWatchdog(w *Watchdog) *Loop {
 // window + interval live in pkg/api/limits.
 func (l *Loop) WithRetention(r *Retention) *Loop {
 	l.retention = r
+	return l
+}
+
+// WithAppDeleteSubscriber attaches the ADR-098 app_delete handler
+// that evicts any in-flight wake for a deleted app via the wake
+// coordinator (Engine.wakeCoord.Forget). The notification is
+// consumed off the loop's existing LISTEN (db.NotifyAppDelete is
+// added to the channel list below), so this option costs zero
+// additional pgxpool connections — the same zero-cost pattern used
+// for NotifyCronRunNow above (PR-D / issue #791).
+//
+// nil = no dispatch (tests / opt-out). nil is safe because the
+// notify channel is still LISTENed (Postgres accepts unknown
+// channels silently); handleNotification just no-ops on
+// NotifyAppDelete when the field is nil.
+func (l *Loop) WithAppDeleteSubscriber(d *AppDeleteSubscriber) *Loop {
+	l.appDelete = d
 	return l
 }
 
@@ -350,6 +376,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		db.NotifyDeploymentChanged,
 		db.NotifySnapshotPrime,
 		db.NotifyCronRunNow, // PR-D / issue #791: multiplexed on the cron loop's existing LISTEN; zero extra pool connections.
+		db.NotifyAppDelete,  // ADR-098: multiplexed on the cron loop's existing LISTEN; same zero-cost pattern as NotifyCronRunNow. Saves a 7th long-term pool subscriber (the standalone one tipped pool.MaxConns=8 over the edge and starved the async-invoke drain's BeginTx under e2e query bursts).
 	}, l.log)
 	if err != nil {
 		return err
@@ -976,6 +1003,28 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 		// matches the build_queued notify-loss defense pattern
 		// (cmd/imaged consumer: subscriber re-reads the row).
 		l.drainPendingFireNowRequests(ctx)
+	case db.NotifyAppDelete:
+		// ADR-098: app was deleted. Evict any in-flight wake for
+		// the deleted app via the wake coordinator's Forget so
+		// followers unwind with ErrAppDeleted instead of waiting
+		// for the wake-coord TTL. Multiplexed onto this loop's
+		// existing LISTEN (see the SubscribeWithReconnect call
+		// above); nil appDelete is a no-op for tests / opt-out.
+		if l.appDelete == nil {
+			return
+		}
+		var p struct {
+			AppID string `json:"app_id"`
+		}
+		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
+			l.log.Warn("sched: bad app_delete payload", "err", err)
+			return
+		}
+		if p.AppID == "" {
+			l.log.Warn("sched: app_delete missing app_id", "payload", n.Payload)
+			return
+		}
+		l.appDelete.evictApp(ctx, p.AppID)
 	}
 }
 
@@ -1074,6 +1123,16 @@ func (l *Loop) runReaper(ctx context.Context) {
 			continue
 		}
 		for _, ins := range instances {
+			// ListInstancesForApp is also used by dashboard and audit
+			// surfaces, so it intentionally returns terminal rows. The
+			// reaper must apply the same live-state filter as
+			// ListAllInstances before warming conntrack or asking for a
+			// flow count; terminal rows have no veth and can otherwise
+			// flood the log and monopolise this synchronous loop, starving
+			// snapshot_prime notifications.
+			if !reaperInstanceState(state.State(ins.State)) {
+				continue
+			}
 			// G7 flow count (spec §17): the conntrack reader is the
 			// production source; nil/error falls back to 0 so a flow-source
 			// glitch fails open (LastRequest-only path; safe default).
@@ -1207,9 +1266,16 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// enough to drive the cooldown consult on the next tick). The
 	// "stamp missed" direction is safe — the consult bypasses
 	// cooldown on a NIL stamp.
+	// cooldownHeldByApp (P1D): per-tick shared set for the
+	// cooldown_held metric emission. ReapIdle (run first) populates
+	// this with apps it skipped due to cooldown; ReapAggressive
+	// (run second) consults the set before its own emission so the
+	// same app in the same tick is counted once. See reaper.go for
+	// the load-bearing contract.
 	idleParkByApp := map[string]struct{}{}
-	for _, id := range ReapIdle(now, snapshot) {
-		if err := l.engine.Park(ctx, id); err != nil {
+	cooldownHeldByApp := map[string]struct{}{}
+	for _, id := range ReapIdle(now, snapshot, l.ops, cooldownHeldByApp) {
+		if err := l.parkFromReaper(ctx, id); err != nil {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
 			continue
 		}
@@ -1276,7 +1342,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// tick from blocking the reaper for `cap × ~150 ms` during a
 	// sudden-scale-down storm.
 	if l.recentLoad != nil && l.reaperAggressive {
-		l.runReaperAggressive(ctx, apps, snapshot, instanceToApp, now)
+		l.runReaperAggressive(ctx, apps, snapshot, instanceToApp, cooldownHeldByApp, now)
 	}
 
 	for _, id := range SelectEvictions(resident, now, snapshot) {
@@ -1297,6 +1363,28 @@ func (l *Loop) runReaper(ctx context.Context) {
 				counter.Inc()
 			}
 		}
+	}
+}
+
+// parkFromReaper keeps a slow or wedged snapshot from monopolising Loop.Run.
+// Engine.Park remains the single lifecycle owner; this wrapper only supplies
+// the reaper-specific deadline so the existing STOPPED/error transition runs
+// through the normal Engine path when the deadline expires.
+func (l *Loop) parkFromReaper(ctx context.Context, instanceID string) error {
+	parkCtx, cancel := context.WithTimeout(ctx, reaperParkTimeout)
+	defer cancel()
+	return l.engine.Park(parkCtx, instanceID)
+}
+
+// reaperInstanceState mirrors the SQL partial-index predicate used by
+// ListAllInstances. Keeping the filter at the per-app expansion site is
+// necessary because ListInstancesForApp deliberately has a broader contract.
+func reaperInstanceState(s state.State) bool {
+	switch s {
+	case state.StateRunning, state.StateWaking, state.StateColdBooting, state.StateSnapshotting:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1327,7 +1415,7 @@ func resolvePriority(snapshot []InstanceInfo, instanceID string) (string, bool) 
 // observation per app per tick. Carved out of runReaper so the
 // behaviour is unit-testable without a clock / DB round-trip on
 // the full reaper body.
-func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, instanceToApp map[string]string, now time.Time) {
+func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapshot []InstanceInfo, instanceToApp map[string]string, cooldownHeldByApp map[string]struct{}, now time.Time) {
 	// PR-C review fix: instanceToApp is built once in runReaper
 	// (O(N)) and threaded through here. Previously this function
 	// built its own copy — cheap but a second O(N) walk on every
@@ -1372,7 +1460,7 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 	// app_id so the per-tick cap applies per-app, not globally.
 	parkByApp := map[string][]string{}
 	if len(desiredByApp) > 0 {
-		for _, id := range ReapAggressive(now, snapshot, desiredByApp) {
+		for _, id := range ReapAggressive(now, snapshot, desiredByApp, l.ops, cooldownHeldByApp) {
 			appID := instanceToApp[id]
 			if appID == "" {
 				continue
@@ -1465,7 +1553,7 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		// post-enrichment app-wide max floor.
 		aggressiveParkOK := false
 		for _, id := range ids {
-			if err := l.engine.Park(ctx, id); err != nil {
+			if err := l.parkFromReaper(ctx, id); err != nil {
 				l.log.Warn("reaper: aggressive park", "instance", id, "err", err)
 				continue
 			}
@@ -1966,7 +2054,12 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 		}
 		l.audit.Emit(ctx, eventName, &acct.ID, payload)
 	}()
-	if _, err := l.engine.Wake(ctx, c.AppID, ""); err != nil {
+	// ADR-098: cron now goes through EnsureWake so a cron tick racing
+	// a gateway burst (or a floor / scaleup / targets trigger on the
+	// same parked app) coalesces into one virtual boot. The detached
+	// leader ctx means a cancelled triggering cron doesn't kill the
+	// boot the next follow-on caller still needs.
+	if _, err := l.engine.EnsureWake(ctx, c.AppID); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return CronRun{}, true
 	}

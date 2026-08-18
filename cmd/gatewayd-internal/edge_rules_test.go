@@ -17,11 +17,18 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -248,7 +255,7 @@ func TestGatewaydEdgeRules_MatchRoute_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	if got == nil {
 		t.Fatalf("MatchRoute = nil, want rule")
@@ -276,7 +283,7 @@ func TestGatewaydEdgeRules_MatchRoute_CacheHitSkipsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	for i := 0; i < 5; i++ {
 		_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	}
@@ -291,7 +298,7 @@ func TestGatewaydEdgeRules_MatchRoute_StoreErrorIsMiss(t *testing.T) {
 	// the customer sees a 404, not a 500. (A future PR could
 	// add a last-error gauge; PR 3 stays silent.)
 	store := &fakeEdgeRuleStore{err: errors.New("pg unreachable")}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	if got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET"); got != nil {
 		t.Errorf("MatchRoute on store error = %v, want nil", got)
 	}
@@ -305,7 +312,7 @@ func TestGatewaydEdgeRules_ResetDropsCache(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	if g.cache.Len() != 1 {
 		t.Fatalf("len before Reset = %d, want 1", g.cache.Len())
@@ -404,7 +411,7 @@ func TestGatewaydEdgeRules_ResetForwardsToCache_AcrossAllSevenKinds(t *testing.T
 			"a.example.com": sampleAllSevenKindsRules("a.example.com"),
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 
 	// Prime the cache via MatchRoute (one loadHost compiles all 7
 	// kinds together into one HostEntry).
@@ -641,7 +648,7 @@ func TestGatewaydEdgeRules_MatchRewrite_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	got := g.MatchRewrite(context.Background(), "a.example.com", "/api/x", "GET")
 	if got == nil {
 		t.Fatalf("MatchRewrite = nil, want rule")
@@ -662,7 +669,7 @@ func TestGatewaydEdgeRules_MatchRedirect_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	got := g.MatchRedirect(context.Background(), "a.example.com", "/", "GET")
 	if got == nil {
 		t.Fatalf("MatchRedirect = nil, want rule")
@@ -683,7 +690,7 @@ func TestGatewaydEdgeRules_MatchHeaders_CacheMissHitsStore(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	got := g.MatchHeaders(context.Background(), "a.example.com", "/", "GET")
 	if got == nil {
 		t.Fatalf("MatchHeaders = nil, want rule")
@@ -706,10 +713,328 @@ func TestGatewaydEdgeRules_SharedCacheAcrossKinds(t *testing.T) {
 			},
 		},
 	}
-	g := newGatewaydEdgeRules(store, newQuietLogger())
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil)
 	_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
 	_ = g.MatchRewrite(context.Background(), "a.example.com", "/", "GET")
 	if store.calls["a.example.com"] != 1 {
 		t.Errorf("store calls = %d, want 1 (shared cache recompiles all kinds)", store.calls["a.example.com"])
+	}
+}
+
+// counterBody scrapes the Prometheus /metrics endpoint of m and returns
+// the body as a string. Mirrors pkg/gateway/handler_test.go::bodyForCounter
+// but lives cmd-side so the cmd-side compile-error tests don't have to
+// import httptest from the handler test package.
+func counterBody(t *testing.T, m *gateway.Metrics) string {
+	t.Helper()
+	if m == nil {
+		t.Fatalf("counterBody: nil metrics")
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics returned %d", rec.Code)
+	}
+	return rec.Body.String()
+}
+
+// TestLoadHost_EmitsCompileErrorCounter is the load-bearing pin for the
+// PR-B observability surface. PR-A registered and pre-instantiated
+// gateway_edge_rule_compile_error_total{kind} but did not wire call sites;
+// PR-B's contract is "one tick per dropped rule, not per host". Drive the
+// loader with a malformed-glob route rule and assert the counter shows 1
+// for kind=route (and 0 for the other six kinds — pre-instantiated rows
+// must always be present in the scrape).
+func TestLoadHost_EmitsCompileErrorCounter(t *testing.T) {
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": {
+				// Malformed path glob (unmatched bracket). compileRouteRules
+				// drops this rule and appends one PathGlobError to routeErrs.
+				sampleRouteRule("route-bad", 100, "a.example.com", "[unmatched", nil, "demo"),
+			},
+		},
+	}
+	metrics := gateway.NewMetrics()
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, metrics)
+
+	// Cache miss → MatchRoute calls loadHost → compileRouteRules drops
+	// route-bad → ObserveEdgeRuleCompileError("route") fires once.
+	if got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET"); got != nil {
+		t.Fatalf("MatchRoute = %v, want nil (the only route rule was malformed and dropped)", got)
+	}
+
+	body := counterBody(t, metrics)
+	want := `gateway_edge_rule_compile_error_total{kind="route"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("/metrics body missing %q\n--- body ---\n%s", want, body)
+	}
+	// Spot-check the other six pre-instantiated rows are at 0 (PR-A
+	// pre-instantiates all seven; PR-B only ticked one).
+	for _, kind := range []string{"rewrite", "redirect", "headers", "cors", "jwt", "ip"} {
+		row := fmt.Sprintf(`gateway_edge_rule_compile_error_total{kind=%q} 0`, kind)
+		if !strings.Contains(body, row) {
+			t.Errorf("/metrics body missing pre-instantiated row %q\n--- body ---\n%s", row, body)
+		}
+	}
+}
+
+// TestLoadHost_NilMetrics_DoesNotPanic is the nil-safety tripwire. The
+// production daemon always wires metrics via run.go; cmd-side tests
+// historically pass nil. PR-B's emit must guard before touching the
+// registry — a nil *gateway.Metrics deref would crash the loader and
+// take every cache miss with it.
+func TestLoadHost_NilMetrics_DoesNotPanic(t *testing.T) {
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": {
+				sampleRouteRule("route-bad", 100, "a.example.com", "[unmatched", nil, "demo"),
+			},
+		},
+	}
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, nil) // nil metrics
+	// Must NOT panic. The matcher returns nil because the only rule was dropped.
+	if got := g.MatchRoute(context.Background(), "a.example.com", "/", "GET"); got != nil {
+		t.Errorf("MatchRoute = %v, want nil", got)
+	}
+}
+
+// TestLoadHost_EmitsOncePerRuleNotOncePerHost pins the cardinality
+// contract. Two malformed route rules under one host must tick the
+// counter twice (one per rule), not once (one per host). A bug that
+// incremented at the host level would under-report fleet breakage.
+func TestLoadHost_EmitsOncePerRuleNotOncePerHost(t *testing.T) {
+	store := &fakeEdgeRuleStore{
+		rules: map[string][]state.EdgeRule{
+			"a.example.com": {
+				sampleRouteRule("route-bad-1", 100, "a.example.com", "[unmatched", nil, "demo"),
+				sampleRouteRule("route-bad-2", 200, "a.example.com", "[also-bad", nil, "demo"),
+			},
+		},
+	}
+	metrics := gateway.NewMetrics()
+	g := newGatewaydEdgeRules(store, newQuietLogger(), nil, metrics)
+	_ = g.MatchRoute(context.Background(), "a.example.com", "/", "GET")
+
+	body := counterBody(t, metrics)
+	want := `gateway_edge_rule_compile_error_total{kind="route"} 2`
+	if !strings.Contains(body, want) {
+		t.Errorf("/metrics body missing %q (want one tick per dropped rule, not per host)\n--- body ---\n%s", want, body)
+	}
+}
+
+// TestLoadHost_AllKindsCovered pins the kind-switch. If a future
+// PR adds a new kind but forgets to add the counter loop, this
+// test (extended with the new kind) fails. Today it pins the ten:
+// route, rewrite, redirect, headers, cors, jwt, ip, validate,
+// limit, budget (the validate widening was PR-B, the limit
+// widening was PR-D24, the budget widening is ADR-093).
+func TestLoadHost_AllKindsCovered(t *testing.T) {
+	// We only need the counter contract; the actual malformed-glob /
+	// malformed-CIDR trigger lives in compile* helpers, which already
+	// have their own tests. Here we drive loadHost with a malformed
+	// route rule to prove the loop for kind="route" fires; the other
+	// nine loops are byte-identical (range over each err slice; kind
+	// string literal differs) so we verify the ten kind literals
+	// are present in the source rather than re-driving nine malformed
+	// fixtures (which would couple this test to compileIPRules et al).
+	srcBytes, err := os.ReadFile("edge_rules.go")
+	if err != nil {
+		// Tests run from cmd/gatewayd-internal/ — try the package dir.
+		// Fall back is best-effort; the test is a lint guard, not a
+		// behavioural pin.
+		t.Skipf("could not read edge_rules.go: %v", err)
+	}
+	src := string(srcBytes)
+	for _, kind := range []string{
+		`"route"`, `"rewrite"`, `"redirect"`, `"headers"`,
+		`"cors"`, `"jwt"`, `"ip"`,
+		`"validate"`, `"limit"`, `"budget"`,
+	} {
+		pattern := fmt.Sprintf(`ObserveEdgeRuleCompileError(%s)`, kind)
+		if !strings.Contains(src, pattern) {
+			t.Errorf("edge_rules.go missing compile-error loop for kind=%s (pattern %q)", kind, pattern)
+		}
+	}
+}
+
+// TestCompileBudgetRules_ClampsOutOfRangeValues pins the
+// defence-in-depth posture of compileBudgetRules (ADR-093). The
+// cmd-side compile step is the second line of defence against a
+// direct-DB write that bypassed apid-Validate; a non-positive or
+// >-ceiling BudgetMs must NOT 504 every request, but degrade to
+// the platform ceiling. Mirrors the compileLimitRules clamping
+// posture.
+func TestCompileBudgetRules_ClampsOutOfRangeValues(t *testing.T) {
+	maxMs := int(api.RequestBudgetMax.Milliseconds())
+	cases := []struct {
+		name     string
+		budgetMs int
+		want     int
+	}{
+		{"zero_clamps_to_ceiling", 0, maxMs},
+		{"negative_clamps_to_ceiling", -1, maxMs},
+		{"over_ceiling_clamps_to_ceiling", maxMs + 1, maxMs},
+		{"in_range_passes_through", 3000, 3000},
+		{"at_ceiling_passes_through", maxMs, maxMs},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rules := []state.EdgeRule{{
+				ID:        "rule_" + tc.name,
+				AccountID: "acc_test",
+				AppID:     "app_test",
+				MatchHost: "a.example.com",
+				MatchPath: "/v1/payment",
+				Priority:  0,
+				Enabled:   true,
+				Kind:      state.EdgeRuleKindBudget,
+				Action: state.EdgeRuleAction{
+					Kind: state.EdgeRuleKindBudget,
+					Budget: &state.EdgeRuleBudgetAction{
+						BudgetMs: tc.budgetMs,
+					},
+				},
+			}}
+			out, errs := compileBudgetRules(rules)
+			if len(errs) != 0 {
+				t.Fatalf("compileBudgetRules returned errs: %v", errs)
+			}
+			if len(out) != 1 {
+				t.Fatalf("compileBudgetRules returned %d rules, want 1", len(out))
+			}
+			if out[0].BudgetMs != tc.want {
+				t.Errorf("BudgetMs = %d, want %d", out[0].BudgetMs, tc.want)
+			}
+		})
+	}
+}
+
+// TestCompileBudgetRules_OnlyKindBudget pins the kind-filter arm.
+// Non-budget kinds must be dropped silently (no rule, no error).
+func TestCompileBudgetRules_OnlyKindBudget(t *testing.T) {
+	rules := []state.EdgeRule{
+		sampleRouteRule("route", 0, "a.example.com", "/", nil, "demo"),
+	}
+	out, errs := compileBudgetRules(rules)
+	if len(errs) != 0 {
+		t.Fatalf("compileBudgetRules returned errs: %v", errs)
+	}
+	if len(out) != 0 {
+		t.Fatalf("compileBudgetRules returned %d rules, want 0 (only kind=budget should compile)", len(out))
+	}
+}
+
+// TestCompileBudgetRules_SkipsDisabled pins the enabled-flag filter.
+// A disabled budget rule must not be in the compiled slice — the
+// apid-side create/update guards this, but the compile step is the
+// second line of defence (defence-in-depth posture mirrors
+// compileLimitRules).
+func TestCompileBudgetRules_SkipsDisabled(t *testing.T) {
+	rules := []state.EdgeRule{
+		{
+			ID:        "budget_off",
+			AccountID: "acc_test",
+			AppID:     "app_test",
+			MatchHost: "a.example.com",
+			MatchPath: "/v1/payment",
+			Priority:  0,
+			Enabled:   false,
+			Kind:      state.EdgeRuleKindBudget,
+			Action: state.EdgeRuleAction{
+				Kind:   state.EdgeRuleKindBudget,
+				Budget: &state.EdgeRuleBudgetAction{BudgetMs: 3000},
+			},
+		},
+	}
+	out, errs := compileBudgetRules(rules)
+	if len(errs) != 0 {
+		t.Fatalf("compileBudgetRules returned errs: %v", errs)
+	}
+	if len(out) != 0 {
+		t.Fatalf("compileBudgetRules returned %d rules, want 0 (disabled rule must be skipped)", len(out))
+	}
+}
+
+// TestCompileBudgetRules_CopiesAllowOverrideHeader pins the
+// per-customer-tunable knob plumbing. The compiled slice must
+// carry AllowOverrideHeader verbatim so the runtime can read the
+// per-request header (default api.RequestBudgetDefaultOverrideHeader).
+func TestCompileBudgetRules_CopiesAllowOverrideHeader(t *testing.T) {
+	rules := []state.EdgeRule{
+		{
+			ID:        "budget_hdr",
+			AccountID: "acc_test",
+			AppID:     "app_test",
+			MatchHost: "a.example.com",
+			MatchPath: "/v1/payment",
+			Priority:  0,
+			Enabled:   true,
+			Kind:      state.EdgeRuleKindBudget,
+			Action: state.EdgeRuleAction{
+				Kind: state.EdgeRuleKindBudget,
+				Budget: &state.EdgeRuleBudgetAction{
+					BudgetMs:            3000,
+					AllowOverrideHeader: "x-custom-budget-ms",
+				},
+			},
+		},
+	}
+	out, errs := compileBudgetRules(rules)
+	if len(errs) != 0 {
+		t.Fatalf("compileBudgetRules returned errs: %v", errs)
+	}
+	if len(out) != 1 {
+		t.Fatalf("compileBudgetRules returned %d rules, want 1", len(out))
+	}
+	if out[0].AllowOverrideHeader != "x-custom-budget-ms" {
+		t.Errorf("AllowOverrideHeader = %q, want x-custom-budget-ms", out[0].AllowOverrideHeader)
+	}
+}
+
+// TestCompileBudgetRules_SortsPriorityAscending pins the
+// priority-ASC + first-match-wins contract. The compiled slice's
+// order is what PickFirstBudgetMatch iterates over; a regression
+// in the sort would silently change which rule fires.
+func TestCompileBudgetRules_SortsPriorityAscending(t *testing.T) {
+	budgetAction := func(ms int) state.EdgeRuleAction {
+		return state.EdgeRuleAction{
+			Kind:   state.EdgeRuleKindBudget,
+			Budget: &state.EdgeRuleBudgetAction{BudgetMs: ms},
+		}
+	}
+	rules := []state.EdgeRule{
+		{
+			ID: "low", AccountID: "acc", AppID: "app",
+			MatchHost: "a.example.com", MatchPath: "/",
+			Priority: 100, Enabled: true, Kind: state.EdgeRuleKindBudget,
+			Action: budgetAction(5000),
+		},
+		{
+			ID: "high", AccountID: "acc", AppID: "app",
+			MatchHost: "a.example.com", MatchPath: "/",
+			Priority: 0, Enabled: true, Kind: state.EdgeRuleKindBudget,
+			Action: budgetAction(3000),
+		},
+		{
+			ID: "mid", AccountID: "acc", AppID: "app",
+			MatchHost: "a.example.com", MatchPath: "/",
+			Priority: 50, Enabled: true, Kind: state.EdgeRuleKindBudget,
+			Action: budgetAction(7000),
+		},
+	}
+	out, errs := compileBudgetRules(rules)
+	if len(errs) != 0 {
+		t.Fatalf("compileBudgetRules returned errs: %v", errs)
+	}
+	if len(out) != 3 {
+		t.Fatalf("compileBudgetRules returned %d rules, want 3", len(out))
+	}
+	wantOrder := []string{"high", "mid", "low"}
+	for i, want := range wantOrder {
+		if out[i].ID != want {
+			t.Errorf("out[%d].ID = %q, want %q (compileBudgetRules must sort priority-ASC + first-match-wins)", i, out[i].ID, want)
+		}
 	}
 }

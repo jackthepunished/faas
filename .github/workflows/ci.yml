@@ -34,7 +34,13 @@ permissions:
   security-events: write
 
 env:
-  GO_VERSION: "1.25"
+  # Pinned to a patch (not a minor) so the govulncheck image-scan gate
+  # and the go.mod `go 1.25.7` directive resolve to the same Go runtime.
+  # go1.25.12 carries 7 stdlib vulnerabilities (GO-2026-5026/5972/6088/
+  # 6089/6090/6091/6218) fixed in go1.25.13 — the image-scan gate fails
+  # closed when the runner resolves "1.25" to a vulnerable patch. Bump
+  # in lock-step with the go.mod `go` directive.
+  GO_VERSION: "1.25.13"
   # vacuum is the OpenAPI ruleset linter used by `make spec-check`.
   # Both the version and the SHA-256 pin are mirrored from the upstream
   # checksum file at https://github.com/daveshanley/vacuum/releases — never
@@ -51,11 +57,47 @@ env:
   # because the `go install` path cross-compiles sqlc (with its cgo
   # pganalyze/pg_query_go tree) from source on every cold runner (~30 s)
   # and v1.31.1's go.mod requires Go >= 1.26, which the ubuntu-latest
-  # runner (Go 1.25.12) cannot satisfy under GOTOOLCHAIN=local.
+  # runner (Go 1.25.13) cannot satisfy under GOTOOLCHAIN=local.
   # Same supply-chain pin pattern as vacuum above and every binary in the
   # EX44 ansible roles.
   SQLC_VERSION: "1.31.1"
   SQLC_SHA256_LINUX_AMD64: "497ae4fcdfa64c5b0c311ffe4c2bd991e43991e82e5367792ed78bc2dca27354"
+  # protoc is the wire-codegen tool used by `make proto-check`. We pin it
+  # to the same source-of-truth release that arduino/setup-protoc@v3
+  # resolves '33.x' to (v33.6, the latest 33.x line) and download the
+  # zip directly from the protocolbuffers/protobuf GitHub release. The
+  # SHA-256 mirrors the supply-chain pin pattern used by vacuum + sqlc
+  # above and every binary in the EX44 ansible roles (cd-2 daemonunit
+  # generator convention). Bumping requires editing both lines in lock-
+  # step.
+  #
+  # Why not arduino/setup-protoc@v3: that action hits GitHub's release-
+  # resolution REST API for binary lookup and is subject to the per-IP
+  # unauthenticated rate limit (60/hr) — concurrent jobs across the
+  # shared GH runner fleet trip it at peak load and the step flakes
+  # with `API rate limit exceeded for <runner-IP>`. This direct download
+  # uses `curl --fail` against the static release-asset URL (which is
+  # subject only to the per-asset 5000/hr authenticated limit when
+  # GITHUB_TOKEN is forwarded) and the same --check --strict sha256
+  # posture the vacuum / sqlc pins use. Memory:
+  # ci-arduino-protoc-rate-limit-flake.md.
+  PROTOC_VERSION: "33.6"
+  PROTOC_SHA256_LINUX_AMD64: "9c49962391ff8b5754342509efc3885db91dfe11a358e1e98c9a71518f0ad199"
+  # promtool is downloaded from the Prometheus release tarball to lint the
+  # spec §12 alert rules. Both the version and the SHA-256 pin mirror the
+  # same `curl+sha256sum+tar` posture as vacuum + sqlc + protoc above and
+  # the EX44 ansible roles' `prom_release_sha256` (asserted at bootstrap
+  # via `make bootstrap`). The unpinned download was the source of a
+  # `curl: (35) Recv failure: Connection reset by peer` flake on two
+  # consecutive main-CI runs in 2026-08-14 — curl exits 35 on a torn
+  # TCP connection and `tar` never runs, leaving us with a half-written
+  # tarball on `/tmp` and no idea whether the bytes we got are the bytes
+  # we asked for. The SHA-256 pin catches both the silent-truncation case
+  # (curl returned 0 but the stream was cut short) and any future tamper
+  # with a one-line `sha256sum --check --strict` mismatch. Bumping
+  # requires editing both lines in lock-step.
+  PROM_VERSION: "2.54.1"
+  PROM_TARBALL_SHA256_LINUX_AMD64: "31715ef65e8a898d0f97c8c08c03b6b9afe485ac84e1698bcfec90fc6e62924f"
 
 jobs:
   # Three parallel jobs (PR #167) so the long poles — unit tests (~4:20)
@@ -122,7 +164,10 @@ jobs:
       # (typo in metric label, bad histogram_quantile, dangling
       # matcher) breaks the alert at boot, so we lint at PR time
       # instead of letting the operator find out via a 5 a.m. page
-      # that never fires.
+      # that never fires. Two files are linted: the consolidated
+      # faas.rules.yml and the per-alert sibling
+      # pkg/promqlrules/data_placement.yaml (ADR-098 §9.A, issue
+      # #951).
       #
       # Note: production SHA-256 pin (prom_release_sha256) is enforced
       # by the role's assert at bootstrap (`make bootstrap`), NOT here.
@@ -131,13 +176,16 @@ jobs:
       - name: promtool check rules
         run: |
           set -euo pipefail
-          PROM_VERSION="2.54.1"
           PROM_TARBALL="prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
-          curl -fsSL -o "/tmp/${PROM_TARBALL}" \
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            -o "/tmp/${PROM_TARBALL}" \
             "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${PROM_TARBALL}"
+          echo "${PROM_TARBALL_SHA256_LINUX_AMD64}  /tmp/${PROM_TARBALL}" | sha256sum --check --strict
           tar -xzf "/tmp/${PROM_TARBALL}" -C /tmp "prometheus-${PROM_VERSION}.linux-amd64/promtool"
           sudo mv "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
-          promtool check rules deploy/ansible/roles/prometheus/files/faas.rules.yml
+          promtool check rules \
+            deploy/ansible/roles/prometheus/files/faas.rules.yml \
+            pkg/promqlrules/data_placement.yaml
 
       # ansible syntax gate. deploy/ansible/ is the source of truth for the
       # box's systemd units, sysctls and secret file modes, but nothing in
@@ -200,23 +248,65 @@ jobs:
           done
 
       # M1+ (ADR-013): *.pb.go is checked in; this step verifies it's in sync
-      # with the .proto sources. arduino/setup-protoc pins a modern protoc
-      # matching what 'go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11'
-      # expects. Drift on the 'protoc v X.Y.Z' header comment is filtered by
-      # Makefile's proto-normalize so toolchain patch bumps don't break CI.
+      # with the .proto sources. The Makefile's proto-normalize target
+      # strips the 'protoc v X.Y.Z' header comment so toolchain patch
+      # bumps don't break CI; the wire bytes protoc produces are
+      # unaffected. The pin stays on the 33.x line that the previous
+      # arduino/setup-protoc@v3 '33.x' selection resolved to (v33.6).
       #
-      # Pass `GITHUB_TOKEN` so the action's release-resolution API calls
-      # authenticate; without it the runner IP is subject to GitHub's
-      # 60/hr per-IP unauthenticated rate limit and the step flakes when
-      # many jobs land simultaneously. Authenticated requests get
-      # 5000/hr per-token, which is plenty. See memory
-      # `ci-arduino-protoc-rate-limit-flake.md`.
+      # Replaces arduino/setup-protoc@v3 (memory
+      # ci-arduino-protoc-rate-limit-flake.md): that action hit GitHub's
+      # release-resolution REST API and flaked on per-IP rate limits at
+      # peak load. The direct curl+sha256 download matches the vacuum +
+      # sqlc + grype install precedent (ci.yml:469-500 / 948-973 /
+      # 686-696) and is gated by `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION`
+      # not being needed. `GITHUB_TOKEN` raises the asset-fetch quota
+      # from 60/hr unauth to 5000/hr authenticated.
       - name: install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: '33.x'
+        # Forward GITHUB_TOKEN explicitly into the step env. The runner
+        # auto-injects it as a workflow-level var, but `set -u` requires
+        # the variable to be referenced from inside an `env:` block —
+        # otherwise `${GITHUB_TOKEN}` is unbound and the script fails
+        # before the curl call lands. arduino/setup-protoc@v3 hid this
+        # because it read the token via the GitHub Action runtime API.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" != "x86_64" ]; then
+            echo "::error::protoc install assumes x86_64; runner is $(uname -m)"
+            exit 1
+          fi
+          PROTOC_TARBALL="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_TARBALL}"
+          ZIP="$RUNNER_TEMP/${PROTOC_TARBALL}"
+          echo "→ downloading $PROTOC_URL"
+          # Authenticated release-asset fetch: 5000/hr per-token
+          # (vs 60/hr per-IP unauthenticated) so the download can't
+          # be tripped by the same fleet-wide rate limit the arduino
+          # action used to hit. SHA-256 below is the supply-chain
+          # anchor — a malicious or substituted tarball would change
+          # the digest and fail the `--check --strict` step.
+          curl --fail --silent --show-error --location \
+            --output "$ZIP" --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "$PROTOC_URL"
+          echo "→ verifying SHA-256"
+          echo "${PROTOC_SHA256_LINUX_AMD64}  $ZIP" | sha256sum --check --strict
+          echo "→ extracting"
+          # The zip lays out bin/protoc + include/google/protobuf/*.proto
+          # (e.g. timestamp.proto, any.proto — every well-known type the
+          # repo's .proto files import). We install BOTH into
+          # /usr/local: the binary lands on PATH automatically, and the
+          # include dir lands at protoc's default search path
+          # (/usr/local/include/google/protobuf/...). No Makefile change
+          # needed — the local-dev recipe (brew install protobuf)
+          # produces the same /usr/local/include layout.
+          (cd "$RUNNER_TEMP" && unzip -q "$ZIP")
+          sudo install -m 0755 "$RUNNER_TEMP/bin/protoc" /usr/local/bin/protoc
+          sudo cp -r "$RUNNER_TEMP/include/google" /usr/local/include/
+          echo "→ installed: $(protoc --version)"
+          echo "→ includes:"
+          ls /usr/local/include/google/protobuf/ | head -5
       - name: install protoc plugins
         run: |
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
@@ -789,9 +879,11 @@ jobs:
     # exceeded`) on the Azure centralus runner. Switch the image to
     # mirror.gcr.io (Google's transparent mirror of Docker Hub, no auth,
     # no per-IP rate limit) — same pattern as FAAS_BUILDER_BASE_REF on
-    # the prod box (deploy/controlplane/sealed.env.example:22). A
-    # pre-step `docker pull` with retry covers the case where the service
-    # container's own pull path flakes before the retry.
+    # the prod box (deploy/controlplane/sealed.env.example:22 —
+    # RETIRED 2026-08-15 by issue #911 / PR-1; v2 path is PR-X
+    # `gregale secrets init`). A pre-step `docker pull` with retry
+    # covers the case where the service container's own pull path
+    # flakes before the retry.
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -982,9 +1074,14 @@ jobs:
     # pkg/daemonunitspec. Asserts that the systemd unit files in the
     # three deploy trees (cp-cp, cp-sys, cp-ans) + daemons.json are
     # byte-equal to what `make generate` would emit from the current
-    # spec files. Pattern matches proto-check / sqlc-check / egress-
-    # check (regenerate-to-tmpdir + git diff --exit-code). PR authors
-    # who edit a UnitXxx() must run `make generate` locally and
+    # spec files. PR-1: cp-cp is the v1 deploy/controlplane/systemd
+    # tree (tombstone now; deletion in PR-1 Phase 2 after PR-X); the
+    # CD pipeline rewired in PR-1 reads units from per-role ansible
+    # files/ instead. cp-cp stays in the gate until Phase 2 lands so
+    # a daemonunitspec change cannot silently drift. Pattern matches
+    # proto-check / sqlc-check / egress-check (regenerate-to-tmpdir
+    # + git diff --exit-code). PR authors who edit a UnitXxx() must
+    # run `make generate` locally and
     # commit the regenerated trees.
     name: daemonunit-check (generated drift)
     runs-on: ubuntu-latest
@@ -998,6 +1095,29 @@ jobs:
           cache-dependency-path: go.sum
       - name: generate-check
         run: make generate-check
+
+  packer-validate:
+    # ADR-111: Packer-builder syntax gate. PR #928 lands
+    # deploy/packer/{common,ubuntu-2404,role-overlay}.pkr.hcl + the
+    # per-cloud builders in PR #929 (hcloud + amazon-ebs). PR #927's ADR
+    # decides that production host provisioning flows through a Packer-
+    # built image; this CI job is the tripwire that fails PRs with a
+    # syntactically broken .pkr.hcl before any builder creds would have
+    # to be touched.
+    #
+    # `packer validate -syntax-only` works without cloud creds because
+    # the source blocks don't actually resolve until a real builder runs.
+    # Mirrors daemonunit-check / sqlc-check / egress-check: stateless,
+    # fast, runs on every PR.
+    name: packer-validate (ADR-111)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: install-packer (pinned)
+        run: scripts/install-packer.sh
+      - name: packer validate -syntax-only
+        run: make image-validate
 
   e2e-shard1:
     name: e2e (shard 1 — 18 tests)
@@ -1194,3 +1314,71 @@ jobs:
         run: python3 -m pip install --quiet jinja2
       - name: e2e tests (shard 4 — 22 tests)
         run: go test -race -count=1 -timeout=15m -run '^Test(Scan|Sec|Secrets)' ./cmd/e2e/...
+
+  image-build-canary:
+    # ADR-111 image-build canary. PR #929 lands the per-cloud builders
+    # + build scripts; this job exercises the hcloud canary build on
+    # every PR. The canary uses `git_sha=canary-<unix-ts>` so the
+    # snapshot tag is unique-per-run and doesn't collide with
+    # production tags.
+    #
+    # PR visibility: continue-on-error: true so PR authors SEE the
+    # canary status (a red x means the builders broke), but the
+    # job doesn't block the PR. On merge to main, the rule is
+    # required green (enforced via branch protection, NOT this file).
+    #
+    # Required secrets (hcloud steps only): HCLOUD_TOKEN. PRs from forks
+    # don't get repo-scoped secrets, so the canary build only runs on
+    # PRs whose head repo IS poyrazK/faas (i.e. internal contributors).
+    # External PRs gate on `image-validate` (no creds) instead.
+    name: image-build-canary (hcloud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: install-packer (pinned)
+        run: scripts/install-packer.sh
+      - name: install hcloud CLI
+        run: |
+          set -euo pipefail
+          # Asset name + SHA-256 from
+          # https://github.com/hetznercloud/cli/releases/tag/v1.45.0 —
+          # the actual asset is hcloud-linux-amd64.tar.gz (no version
+          # segment embedded in the filename). SHA mirrors the supply-
+          # chain pin pattern used by vacuum / sqlc / protoc / promtool
+          # higher in this file (per codeql-go-clear-text-logging-
+          # obfuscator-barrier lesson; no curl | tar -xz without verify).
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            -o /tmp/hcloud.tar.gz \
+            https://github.com/hetznercloud/cli/releases/download/v1.45.0/hcloud-linux-amd64.tar.gz
+          echo "7918b2058eaf2df180caef34e4db1c7bcf5a6004ef6fd136402ebb7acb25d0eb  /tmp/hcloud.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf /tmp/hcloud.tar.gz -C /tmp hcloud
+          sudo mv /tmp/hcloud /usr/local/bin/
+          hcloud version
+      # Syntactic gate, runs on every PR regardless of secret wiring.
+      # Uses VALIDATE_FLAGS (-syntax-only) which works against any
+      # HCL without cloud creds. Replaces `image-build-hcloud-canary`
+      # as the no-creds gate; the build step below runs only when
+      # HCLOUD_TOKEN is wired (merge to main, internal PRs).
+      - name: validate every builder
+        run: make -C deploy/packer image-validate
+      - name: build canary snapshot
+        if: ${{ env.HCLOUD_TOKEN != '' }}
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: make -C deploy/packer image-build-hcloud-canary
+      - name: "smoke: list canary snapshot"
+        if: ${{ env.HCLOUD_TOKEN != '' }}
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          # image-build-hcloud-canary synthesises the tag with
+          # `git_sha=canary-$(date +%s)` (deploy/packer/Makefile).
+          # Match the canary-* prefix on the snapshot name; if the
+          # canary didn't upload, the grep returns empty and we fail.
+          hcloud image list -o columns=name,labels \
+            | grep -F 'gregale-compute-' -F 'canary-' \
+            | (read -r line && [ -n "${line}" ] && echo "canary snapshot present: ${line}") \
+            || (echo "canary snapshot not found" >&2; exit 1)

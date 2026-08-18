@@ -168,6 +168,8 @@ var cliCommands = []cliCommand{
 		Short:   "List your apps",
 		Subcommands: []cliSub{
 			{Name: "ls", Short: "Alias for the default list action"},
+			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
+			{Name: "streaming-cap", Short: "Per-app streaming classification probe (ADR-102 D6)"},
 			{Name: "-q", Short: "Delete one app (positional: <slug>)"},
 			{Name: "--quiet", Short: "Delete one app (positional: <slug>)"},
 		},
@@ -181,6 +183,7 @@ var cliCommands = []cliCommand{
 			{Name: "scale", Short: "Set max_concurrency / ram_mb"},
 			{Name: "rename", Short: "Rename an app"},
 			{Name: "security", Short: "Toggle require_signed on deploys"},
+			{Name: "routes", Short: "List admitted per-route labels for one app (ADR-093)"},
 		},
 		Positionals: []string{"<slug>"},
 		Flags: []cliFlag{
@@ -189,14 +192,8 @@ var cliCommands = []cliCommand{
 			{Name: "require-signed", Short: "toggle require_signed", ClosedSet: []string{"true", "false"}},
 		},
 	},
-	{
-		Name:    "backup",
-		DocSlug: "backup",
-		Short:   "Operator rclone config unseal (backup unseal-rclone)",
-		Subcommands: []cliSub{
-			{Name: "unseal-rclone", Short: "Unseal the rclone config"},
-		},
-	},
+	// operator-side "backup" verb moved to gregalectl in PR-6.5
+	// (sealed-cred rotation is an operator concern; see plan §Scope).
 	{
 		Name:    "billing",
 		DocSlug: "billing",
@@ -220,6 +217,17 @@ var cliCommands = []cliCommand{
 		Short:   "Connect a third-party service (github)",
 		Subcommands: []cliSub{
 			{Name: "github", Short: "Connect a GitHub account for repo deploys"},
+		},
+	},
+	{
+		Name:    "cors",
+		DocSlug: "cors",
+		Short:   "Configure CORS for an app (allow|ls|rm|show)",
+		Subcommands: []cliSub{
+			{Name: "allow", Short: "Attach a CORS rule to <slug>"},
+			{Name: "ls", Short: "List CORS rules bound to <slug>"},
+			{Name: "rm", Short: "Delete a CORS rule by id"},
+			{Name: "show", Short: "Show per-app default CORS + active rules"},
 		},
 	},
 	{
@@ -277,7 +285,7 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "deploy",
 		DocSlug: "deploy",
-		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --template NAME)",
+		Short:   "Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | --template NAME)",
 		Flags: []cliFlag{
 			{Name: "image", Short: "deploy from a container image reference"},
 			{Name: "tarball", Short: "deploy from a source tarball"},
@@ -286,6 +294,11 @@ var cliCommands = []cliCommand{
 			// drive the headless source-ref deploy (CI-friendly,
 			// no install-token env). Required when --repo is set.
 			{Name: "ref", Short: "git ref for --repo (branch, tag, or 40-char SHA)"},
+			// Issue #270: --github emits a copy-paste Actions workflow
+			// snippet for the faas-deploy-action (companion repo
+			// poyrazK/faas-deploy-action). No auth, no side effects.
+			// The snippet uses --name / cwd as the app slug.
+			{Name: "github", Short: "emit a GitHub Actions workflow snippet for faas-deploy-action"},
 			{Name: "template", Short: "scaffold from a built-in template", ClosedSet: []string{"node22-http", "python312-http"}},
 		},
 	},
@@ -293,6 +306,22 @@ var cliCommands = []cliCommand{
 		Name:    "domains",
 		DocSlug: "domains",
 		Short:   "Manage custom domains",
+	},
+	{
+		Name:    "tenant-surfaces",
+		DocSlug: "tenant-surfaces",
+		Short:   "Manage tenant surfaces (multi-hostname SAN bundle per app)",
+		Subcommands: []cliSub{
+			{Name: subList, Short: "List tenant surfaces on an app", Flags: []cliFlag{
+				{Name: "app", Short: "app slug (required)"},
+			}},
+			{Name: subAdd, Short: "Add a tenant surface (with seed hostnames)"},
+			{Name: subRm, Short: "Remove a tenant surface (cascades hostnames)"},
+			{Name: "hostname", Short: "Manage hostnames on a surface (add|rm)"},
+		},
+		Flags: []cliFlag{
+			{Name: "app", Short: "app slug"},
+		},
 	},
 	{
 		Name:    "edge-rules",
@@ -318,17 +347,6 @@ var cliCommands = []cliCommand{
 		DocSlug: "env",
 		Short:   "Pull/push .env <-> sealed secrets (--app <slug>)",
 		Flags:   []cliFlag{{Name: "app", Short: "app slug", Req: true}},
-	},
-	{
-		Name:    dispatchHostAge,
-		DocSlug: "host-age",
-		Short:   "Operator host.age rotation (host-age init|rotate|status|prune-previous)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise host.age"},
-			{Name: subRotate, Short: "Rotate host.age"},
-			{Name: "status", Short: "Show host.age status"},
-			{Name: "prune-previous", Short: "Prune the previous host.age key"},
-		},
 	},
 	{
 		Name:    "init",
@@ -474,16 +492,6 @@ var cliCommands = []cliCommand{
 		Short:   "Park an app cold (kill all live instances)",
 	},
 	{
-		Name:    dispatchPKI,
-		DocSlug: "pki",
-		Short:   "Operator local-dev PKI bootstrap (pki init|status|rotate)",
-		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise the local PKI"},
-			{Name: statusLiteral, Short: "Show PKI status"},
-			{Name: subRotate, Short: "Rotate the PKI"},
-		},
-	},
-	{
 		Name:      "plan",
 		DocSlug:   "plan",
 		Short:     "Change plan (free|hobby|pro|scale)",
@@ -547,33 +555,21 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
-		Name:    dispatchSignKeys,
-		DocSlug: "sign-keys",
-		Short:   "Provision the cosign sign keypair (operator; --sign-key / --verify-key)",
+		// PR-D / ADR-012 §7 amendment. Per-tenant GitHub App
+		// webhook secret rotation (admin-scoped). Distinct from
+		// `secrets` because the trust boundary is the GitHub
+		// App install, not the Faas app — the resolver in
+		// pkg/githubd/webhook_secret.go reads this row first
+		// before falling back to the platform secret.
+		Name:    "github-webhook-secret",
+		DocSlug: "github-webhook-secret",
+		Short:   "Manage per-tenant GitHub App webhook secrets (admin)",
 		Subcommands: []cliSub{
-			{Name: "init", Short: "Initialise the cosign keypair"},
-			{Name: subRotate, Short: "Rotate the cosign keypair"},
-			{Name: statusLiteral, Short: "Show keypair status"},
-		},
-		Flags: []cliFlag{
-			{Name: "sign-key", Short: "path to the sign key"},
-			{Name: "verify-key", Short: "path to the verify key"},
+			{Name: "set", Short: "Rotate the secret for one installation_id"},
 		},
 	},
-	{
-		Name:    dispatchNodeKey,
-		DocSlug: "node-key",
-		Short:   "Provision the per-node CapacityReport signing keypair (operator; ADR-053)",
-		Subcommands: []cliSub{
-			{Name: subNodeInit, Short: "Initialise the node signing keypair"},
-			{Name: subNodeRotate, Short: "Rotate the node signing keypair"},
-			{Name: subNodeStatus, Short: "Show node keypair status"},
-		},
-		Flags: []cliFlag{
-			{Name: "node-key", Short: "path to the node signing private key"},
-			{Name: "node-key-pub", Short: "path to the node signing public key"},
-		},
-	},
+	// operator-side verbs (sign-keys, node-key) moved to gregalectl
+	// in PR-6.5; see cmd/gregale/constants.go for the dispatch consts.
 	{
 		Name:    "slo",
 		DocSlug: "slo",

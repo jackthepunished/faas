@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { FieldError } from './FieldError.js';
+import type { SecretFinding } from './SecretFinding.js';
 /**
  * RFC 7807 problem+json envelope. The `code` field is the stable
  * machine-readable identifier; clients branch on it. `limit` and
@@ -16,6 +18,13 @@
  * dashboard renders the transaction handle as a confirmation id.
  * Exactly one of `billing_portal_url` or `paddle_checkout_url` is
  * populated on a given 402 — never both.
+ *
+ * `errors` carries per-field detail (Cloudflare / Stripe shape)
+ * for 422 sites that emit a list of field-level failures — used
+ * today by the kind=validate edge rule so a JSON Schema
+ * rejection renders as a form-field list the dashboard can
+ * iterate without parsing prose. Optional + omitempty so every
+ * other problem+json site keeps its existing flat shape unchanged.
  *
  */
 export type Problem = {
@@ -45,5 +54,35 @@ export type Problem = {
    *
    */
   tx_id?: string;
+  /**
+   * Per-field validation detail. Populated by 422 sites that
+   * emit a list of field-level failures. Each entry is a
+   * `FieldError` (Cloudflare / Stripe shape: field + expected
+   * + got) so an SDK can drive form-field UI without parsing
+   * prose.
+   *
+   */
+  errors?: Array<FieldError>;
+  /**
+   * Per-line secret-scan detail. Populated by 422 sites with
+   * `code: secret_scan_strict` (cmd/apid/secretscan.go
+   * server-side scan rejection; cmd/gregale printErr
+   * --secret-scan=strict client-side rejection). The shape
+   * is shared with the on-disk `SecretScanResult` so a
+   * programmatic consumer can render the same UI for both
+   * rejection paths. Optional + omitempty.
+   *
+   */
+  secret_findings?: Array<SecretFinding>;
+  /**
+   * Customer-facing remediation nudge attached to a
+   * `code: secret_scan_strict` 422 envelope (e.g. "move
+   * detected secrets to `gregale secrets set`"). Mirrors
+   * the `FieldError` shape's prose pattern so the dashboard
+   * / SDK can render the hint as a one-line footer without
+   * parsing prose. Optional + omitempty.
+   *
+   */
+  secret_hint?: string;
 };
 

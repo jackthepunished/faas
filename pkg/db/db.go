@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
 
 // Open dials Postgres and returns a connection pool. DSN precedence:
@@ -55,9 +57,12 @@ func open(ctx context.Context, dsnOverride, appName string) (*pgxpool.Pool, erro
 	if err != nil {
 		return nil, fmt.Errorf("db: parse config: %w", err)
 	}
-	// Sane defaults for a one-box daemon. schedd + imaged may subscribe via
-	// LISTEN which holds a connection for the lifetime of the daemon.
-	cfg.MaxConns = 8
+	// Sane defaults for a one-box daemon. schedd has several independent
+	// LISTEN subscribers (node keys, placement, migration, deployment
+	// lifecycle, and its dispatch loop), each of which holds a connection for
+	// the daemon lifetime. Keep enough headroom for the listener set plus
+	// ordinary queries and short transactions.
+	cfg.MaxConns = 16
 	cfg.MinConns = 1
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
@@ -76,4 +81,31 @@ func open(ctx context.Context, dsnOverride, appName string) (*pgxpool.Pool, erro
 		return nil, fmt.Errorf("db: ping: %w", err)
 	}
 	return pool, nil
+}
+
+// WithBudget wraps a per-DB-call context with a reqbudget.WithOverhead
+// reservation against the inbound request's end-to-end budget. When
+// the inbound ctx carries a Budget, the next DB hop starts with
+// less declared budget than its parent had. When no Budget is
+// attached (a CLI / background path), the helper is the identity
+// no-op.
+//
+// ADR-093 / PR-E: the canonical place to wrap each SQL call. Callers
+// can either use it inline (preferred for hot paths) or trust the
+// ctx that's already on r.Context() (the inbound budget already
+// propagates via pgxpool — the overhead reservation is the
+// bookkeeping for the audit trail + per-hop metric label, not a
+// wall-clock extension). Production daemons (apid, schedd, vmmd,
+// imaged) are expected to call this once per hot-path Store method.
+//
+// The cost is reqbudget.DefaultOverheadDB (10 ms — a local PG
+// round-trip reservation). It is a DECLARED budget reduction, not
+// measured — the actual DB round-trip is whatever it is.
+func WithBudget(parent context.Context) context.Context {
+	b, ok := reqbudget.FromContext(parent)
+	if !ok {
+		return parent
+	}
+	newCtx, _, _ := b.WithOverhead(parent, "db", reqbudget.DefaultOverheadDB)
+	return newCtx
 }

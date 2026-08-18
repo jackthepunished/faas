@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -36,11 +37,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/imaged"
+	"github.com/onebox-faas/faas/pkg/manifest"
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/rootfs"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/secretscan"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -115,6 +118,32 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): capture FAAS_NODE_NAME
+	// before any control-plane handshake so the boot log carries the
+	// identity. imaged has no config.go today (env-only); the systemd
+	// drop-in (deploy/ansible/roles/compute_only_service/files/
+	// faas-imaged.service.d/99-faas-node-name.conf) is the only
+	// source. Empty + log.Info("legacy single-box") mirrors the schedd
+	// owner-node line.
+	if nodeName := os.Getenv("FAAS_NODE_NAME"); nodeName != "" {
+		log.Info("imaged owner node", "node_name", nodeName)
+	} else {
+		log.Info("imaged: legacy single-box (FAAS_NODE_NAME unset)")
+	}
+
+	// PR-5 / issue #911 — manifest reconcile against FAAS_BUILDER_BASE_REF.
+	// When FAAS_MANIFEST_PATH is set, load the split-box deployment
+	// manifest and assert the manifest's release.builder_base_digest
+	// (a sha256 digest from PR-0's schema) matches the resolved
+	// FAAS_BUILDER_BASE_REF. A drift between what the manifest
+	// promises and what imaged actually loads is silent today; PR-5
+	// makes it fatal at boot, pointing the operator at
+	// `gregale manifest validate`. Single-box installs that don't
+	// carry a manifest are unaffected (env-only behaviour).
+	if err := reconcileManifestBuilderBase(); err != nil {
+		return err
+	}
+
 	pool, err := d.openDB(ctx, "")
 	if err != nil {
 		return err
@@ -178,7 +207,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	log.Info("imaged: oci puller ready", "timeout_s", int(ociPullTimeout().Seconds()))
 
 	notifier := dbNotifier{pool: pool}
-	guestInitPath := envOr("FAAS_GUEST_INIT", "./init")
+	guestInitPath := guestInitPathFromEnv()
 	appsRoot := envOr("FAAS_APPS_ROOT", "/var/lib/faas/apps")
 
 	// #96 / ADR-025 axis 2: build the StorageBackend the imaged Handler
@@ -248,8 +277,25 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	for _, lbl := range oci.OCIOnlyDenyCounterLabels() {
 		ops.OCIEgressDeny(lbl.CounterName, lbl.Family)
 	}
+	var artifactReplicator imaged.ArtifactReplicator
+	if helper := os.Getenv("FAAS_ARTIFACT_REPLICATOR"); helper != "" {
+		if !filepath.IsAbs(helper) {
+			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR=%q must be absolute", helper)
+		}
+		st, statErr := os.Stat(helper)
+		if statErr != nil {
+			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR=%q: %w", helper, statErr)
+		}
+		if st.IsDir() {
+			return fmt.Errorf("imaged: FAAS_ARTIFACT_REPLICATOR=%q is a directory", helper)
+		}
+		artifactReplicator = imaged.CommandArtifactReplicator{Path: helper}
+		log.Info("imaged: split-box artifact replicator enabled", "helper", helper)
+	}
+
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
 		WithStorage(storageBackend).
+		WithArtifactReplicator(artifactReplicator).
 		WithOpsMetrics(ops).
 		// Issue #472 / ADR-054: per-app cosign signature-enforcement
 		// at deploy time. Default off (the apps.require_signed=false
@@ -272,6 +318,15 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// installation gap it actually is.
 		WithGrypeRun(makeGrypeRunner(os.Getenv("FAAS_GRYPE_BIN"))).
 		WithSyftRun(makeSyftRunner(os.Getenv("FAAS_SYFT_BIN"))).
+		// PR-A: layer-side secret-scan walker. Wired
+		// unconditionally so the default in
+		// pkg/imaged/secretscan.go::runDeployLayerSecretScan
+		// fires — the same engine cmd/apid
+		// (cmd/apid/secretscan.go::scanExtractedTreeSecrets)
+		// uses, so the apid source-tree path and the imaged
+		// image-layer path agree on patterns + severities.
+		// Loud-fail on findings — see handler.go runDeployLayerSecretScan.
+		WithSecretScanRun(makeSecretScanRunner()).
 		// ADR-053: imaged asks vmmd to loopback-mount the parent
 		// ext4 read-only for the parent-ref staging path. The
 		// client is constructed eagerly but the gRPC conn is lazy
@@ -487,6 +542,30 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// guestInitPathFromEnv resolves the boot-critical PID 1 binary. Older
+// single-box units defaulted to ./init, which depends on an implicit working
+// directory and silently left a stale guest-init inside an already-published
+// runtime base when the checkout was not present there. Prefer the paths used
+// by release installs, then keep the local checkout path as a development
+// fallback. An explicit FAAS_GUEST_INIT always wins.
+func guestInitPathFromEnv() string {
+	if v := os.Getenv("FAAS_GUEST_INIT"); v != "" {
+		return v
+	}
+	for _, candidate := range []string{
+		"/opt/faas/current/bin/init",
+		"/usr/local/bin/faas-guest-init",
+		"./init",
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	// Return the release path even when the install is incomplete so the
+	// subsequent base-build error names the missing boot contract directly.
+	return "/opt/faas/current/bin/init"
+}
+
 // envDuration parses a duration env var, returning fallback on parse error
 // or empty string. Used for the GC tick override (FAAS_GC_INTERVAL).
 func envDuration(key string, fallback time.Duration) time.Duration {
@@ -553,4 +632,73 @@ func makeSyftRunner(bin string) func(ctx context.Context, dir string) ([]byte, e
 		}
 		return imaged.RunSyft(ctx, dir)
 	}
+}
+
+// makeSecretScanRunner wires the package-level default walker
+// (PR-A, imaged-layer secret scan). No subprocess binary to
+// configure — the walker is a pure-Go filepath.WalkDir + secretscan.ScanFile
+// caller (mirrors cmd/apid::scanExtractedTreeSecrets). The harness
+// exists for symmetry with makeGrypeRunner / makeSyftRunner so a
+// future operator override (e.g. a `FAAS_SECRETSCAN_BIN` shim
+// against a custom scanner) can land here without churning the
+// WithSecretScanRun wiring in main().
+func makeSecretScanRunner() func(ctx context.Context, dir, layer string) ([]secretscan.Finding, error) {
+	return imaged.RunDeployLayerSecretScan
+}
+
+// reconcileManifestBuilderBase is the PR-5 / issue #911 manifest
+// reconcile step. It runs before the openDB call so a manifest
+// mismatch fails the boot BEFORE we spend a Postgres connection.
+//
+// Behaviour:
+//   - FAAS_MANIFEST_PATH unset (single-box dev today): no-op.
+//   - FAAS_MANIFEST_PATH set but file unreadable / invalid: fatal
+//     (load-failure surfaces the same `gregale manifest validate`
+//     path operators already use).
+//   - manifest.release.builder_base_digest empty: no-op (the
+//     manifest does not pin a builder base — env-only mode).
+//   - FAAS_BUILDER_BASE_REF resolves to a digest that does NOT
+//     match the manifest's pinned digest: fatal with a message
+//     pointing at `gregale manifest validate`.
+//
+// Single-box installs without a manifest keep today's env-only
+// behaviour; split-box installs (post PR-2 renderer + PR-X secrets
+// init) carry the manifest and benefit from the gate.
+func reconcileManifestBuilderBase() error {
+	manifestPath := os.Getenv("FAAS_MANIFEST_PATH")
+	if manifestPath == "" {
+		return nil
+	}
+	m, err := manifest.Load(manifestPath)
+	if err != nil {
+		return fmt.Errorf("imaged: reconcile manifest %s: %w (run `gregale manifest validate --file=%s` to inspect)",
+			manifestPath, err, manifestPath)
+	}
+	pinned := m.Release.BuilderBaseDigest
+	if pinned == "" {
+		// Manifest does not pin a builder base digest — operator
+		// opted out of the contract. Env-only behaviour applies.
+		return nil
+	}
+	envRef := os.Getenv("FAAS_BUILDER_BASE_REF")
+	if envRef == "" {
+		// No env override — imaged will fall through to
+		// imaged.BaseRefBuilder (the package default). The
+		// reconcile still pins the manifest's digest; the gate
+		// below fires only when an operator overrode the env.
+		return nil
+	}
+	parsed, err := oci.ParseReference(envRef)
+	if err != nil {
+		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF %q: %w", envRef, err)
+	}
+	if parsed.Digest == "" {
+		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (manifest pins %s)",
+			envRef, pinned)
+	}
+	if parsed.Digest != pinned {
+		return fmt.Errorf("imaged: reconcile manifest: FAAS_BUILDER_BASE_REF digest %q does not match manifest release.builder_base_digest %q (run `gregale manifest validate --file=%s` to inspect)",
+			parsed.Digest, pinned, manifestPath)
+	}
+	return nil
 }

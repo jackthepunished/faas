@@ -252,7 +252,7 @@ kernel_path = %q
 		)
 		// Optional builder-base override (Lima / CI without ghcr creds). When
 		// FAAS_TEST_BUILDER_BASE_REF is set, imaged pulls the base from there
-		// instead of the production ghcr.io/onebox-faas/builder-base:latest
+		// instead of the production ghcr.io/poyrazk/builder-base:latest
 		// (which 403s anonymously). FAAS_TEST_DEPLOY_BASE_REF, if set,
 		// overrides the per-runtime base ref used by aboveBaseLayers at
 		// deploy time so it also dials the stub registry. Default behavior
@@ -487,7 +487,120 @@ const testDomain = "apps.test.example"
 //     main-landed migration and PR #697 picks 157 as the next free
 //     slot above main's head. The renumber chain is the standard
 //     PR-#697 follow-up to the PR-#653 145 chain.
-const e2eMigrationTarget = 157
+//
+// PR-C: bumped 216 → 237 for the maintenance cluster
+// (00236_edge_rules_kind_maintenance.sql +
+// 00237_apps_maintenance_mode.sql). The previous target (228)
+// made `pgtest.WaitForMigration` return early because the
+// schema head was already past 228 — every `cmd/e2e` test would
+// silently skip for the entire maintenance cluster. 237 is
+// chosen as "next free integer above main's real head" so a
+// future migration merely bumps this constant again. The
+// discipline (memory: cross-pr-slot-gate-fence-pattern) is that
+// the only line a migration land touches in this file is this
+// constant + the doc-comment history above.
+//
+// PR #882 ADR-098 §9.A connection-aware execution PR-A re-bumped
+// 226 → 229 — slot 226 is the data_upstreams + data_upstream_probes
+// schema (real DDL, landed via PR-A's `feat(migration): ADR-098
+// §9.A`); the run-up from 226 to 229 happened because main absorbed
+// PR #845's 00229_edge_rules_kind_geo.sql + sibling PRs #864/#867
+// in the interim (see the chain below). PR-A's own renumber story
+// was the reverse: PR-0 fenced 226 from PR-0 (issue # PR #858,
+// ADR-098 §renumber) and PR-A replaced the fence with the real DDL
+// on top of (still 00221 → 00226) renumbers.
+//
+// PR #845 (kind=geo, ADR-091 D21) + PR #863 (ADR-096 PR-A
+// app_errors) + PR #866 (ADR-091 D20-D25 cors_defaults) + PR #864
+// (reqbudget PR1, ADR-093) + PR #867 (maintenance PR-A, ADR-091
+// amendment): all five bumped 215/216 → 229 in flight. The renumber
+// chain tracks the gate's "next free slot past the live head AND
+// past open-PR claims" rule when sibling PRs race for the same N.
+//
+//   - 215 → 229 after PR #844 (ADR-093 per-route app metrics)
+//     landed 00216_apps_route_metrics_enabled.sql, after
+//     PR #855 (ADR-091 D24 kind=limit) landed
+//     00219_edge_rules_kind_limit.sql, after PR #851
+//     (issue-272 PR-preview environments) landed
+//     00220_preview_app_columns.sql, after PR #854
+//     (ADR-095 scale-to-zero T1 single-flight + phase
+//     telemetry) claimed 00221_instances_request_count.sql,
+//     after PR #863 (ADR-096 PR-A app_errors) landed
+//     00222_app_errors.sql, after PR #866 (ADR-091
+//     D20-D25 cors_defaults) landed 00224_apps_cors_defaults.sql,
+//     and after open-PR stampede with PR #864 (reqbudget PR1
+//     claiming 00226), PR #867 (maintenance PR-A claiming 00227
+//     kind=maintenance + 00228 apps.maintenance_mode), and PR
+//     #873 (cli-secret-scan fencing 223-227) — which pushed
+//     PR #845's kind=geo from 00220 → 00221 → 00222 → 00223 →
+//     00226 → 00229.
+//   - 215/216 → 229 by ADR-096 PR-A + ADR-091 D20-D25
+//   - open-PR stampede (app_errors schema at 00222, leaving
+//     00223 free for PR #845; PR #866's CORS team then placed a
+//     coexistence fence at 00223 alongside their own real
+//     migration at 00224, so PR #845 renumbered to 00226 — but
+//     PR #864 (reqbudget PR1) ALSO claimed 00226 with a real
+//     schema, so PR #845 stepped past PR #864 + PR #867's
+//     00227/00228 to the next free slot 00229). The in-flight
+//     cross-PR fences at 215..228 sit between main's 214
+//     (edge-rules-kind=validate) and 229 (kind=geo): 215
+//     compute_node_heartbeats_stats (PR #851), 216
+//     apps_route_metrics_enabled (PR #860), 217 ADR-092
+//     app_secrets_scope (PR #849), 218 preview-envs (PR
+//     preview-envs ADR-098 per PR #876), 219 edge_rules_kind_limit (PR
+//     kind=validate PR-C), 220 preview_app_columns (PR preview
+//     envs), 221 ADR-096 reserve fence for slot 222 itself, 222
+//     app_errors (PR #863), 223 PR #866 coexistence fence
+//     (passed-through by PR #845, now historical), 224
+//     apps_cors_defaults (PR #866), 225 PR #866 reserve fence,
+//     226 PR #864 real (reqbudget) + PR #858 fence, 227
+//     PR #867 real (kind=maintenance) + PR #873 fence, and
+//     228 PR #867 real (apps.maintenance_mode).
+//
+// PR-C renumber history (8 cycles) on top of main's
+// 00220_preview_app_columns + 00221_instances_request_count
+// (PR #851 + PR #854 wake single-flight) + 00222_app_errors
+// (PR #863 ADR-096 PR-A) + 00223..00226 fences (PR #866 CORS
+// cluster + ADR-098 PR-0) + 00227..00228/00229..00230 fences
+// (PR #845 kind=geo added 00229 + 00230 fence during the
+// kind=geo/maintenance cross-PR stampede):
+//
+//	00220/00221 → 00222/00223 → 00224/00225 → 00227/00228 →
+//	00231/00232 → 00234/00235 → 00236/00237 (final; main absorbed
+//	00220..00226, then PR #845 added 00227/00228/00229/00230
+//	(00229 real kind=geo, rest fences), and after the renumber
+//	to 00231/00232 the cross-PR slot precheck on push caught a
+//	collision with open PR #864 (ADR-093 request budgets claims
+//	00232) and PR #873 (secretscan v2 fences 00231/00232/00233),
+//	stepping to 00234/00235; then after PR #872 landed (and
+//	PR #882 data_upstreams opened), PR #864 reshuffled to 00234
+//	re-claiming our slot — cross-PR slot precheck tripped again,
+//	kind=maintenance cluster stepped to 00236/00237 to dodge the
+//	reshuffle).
+//
+// The 00217 + 00218 slots carry `*_reserve_slot.sql` fences
+// for PR #849 (ADR-092 PR-A app_secrets.scope) and PR #845's
+// own fence respectively; the 00221 fence is PR #863's
+// ADR-096 reservation; the 00223 fence is PR #866's
+// coexistence marker (passed-through by PR #845's renumber,
+// kept as a no-op so the contiguity gate doesn't trip on the
+// renumber chain).
+//
+// PR-B (this PR, #875, ADR-096 handlers + SDK + OpenAPI) adds
+// NO migration; the head stays at 237 against main at merge.
+// PR-C (e2e + ADR-096 docs) will need its own slot fence —
+// pre-check via `gh api .../contents/migrations?ref=main`
+// before opening the PR per the cross-PR slot precheck pattern.
+//
+// Triggers-mega audit #10: bumped 237 → 275 for the
+// BrokerPoisonStrategy migration (00275_triggers_poison_strategy.sql).
+// 275 is the next free integer above the live head (00274
+// payload_max, also in this branch) so a future migration merely
+// bumps this constant again. The discipline (memory:
+// cross-pr-slot-gate-fence-pattern) is that the only line a
+// migration land touches in this file is this constant + the
+// doc-comment history above.
+const e2eMigrationTarget = 275
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
@@ -741,6 +854,19 @@ func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []strin
 //     the daemon's wire.ListenOrRecreateByName errors on a host without
 //     the `faas` group, which is every CI runner and dev Mac. Production
 //     deploys have the group; the ansible role creates it at bootstrap.
+//   - FAAS_APP_ERRORS_ENABLED=false — ADR-096 / PR-B flipped the
+//     kill-switch to default-on in cmd/apid/main.go, which now tries
+//     to bind /run/faas/app_errors.sock in runAppErrorsServer on every
+//     apid boot. The CI runner / dev Mac lacks the `faas-apid` user
+//     that the listener boot probes (config.go:144-149); the lookup
+//     returns an error and the apid never reaches the main HTTP
+//     listener, so e2e `waitTCP(t, addr, 10s)` exhausts and every
+//     test reports "did not accept within 10s". Production deploys
+//     have the user (the systemd unit runs as `faas-apid`); the e2e
+//     harness sets this off so the apid skips the new gRPC listener
+//     and the main HTTP path boots cleanly. The reader-path handlers
+//     (cmd/apid/handlers_app_errors.go) are not affected — they read
+//     from the SQL store regardless of the gRPC listener state.
 //   - FAAS_MFA_RECOVERY_HMAC_KEY=<per-test hex> — see Harness
 //     .RecoveryHMACKeyHex. apid refuses to boot without a recovery
 //     HMAC key (cmd/apid/main.go:loadOrGenerateRecoveryHMACKey); the
@@ -760,6 +886,7 @@ func testEnvCommon(dbURL string) []string {
 	env := []string{
 		"DATABASE_URL=" + dbURL,
 		"FAAS_SKIP_SOCKET_GROUP=1",
+		"FAAS_APP_ERRORS_ENABLED=false",
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 	}
@@ -872,6 +999,33 @@ func (h *Harness) stop() {
 				filepath.Base(proc.Path), proc.ProcessState, buf.String())
 		}
 	}
+}
+
+// Stop terminates every daemon subprocess owned by this Harness
+// immediately, without waiting for the test's t.Cleanup. Used by
+// e2e tests that need to release shared resources (Postgres
+// connections held by an apid pool, in-flight LISTEN goroutines,
+// etc.) between two boot phases — see
+// cmd/e2e/secrets_rotate_box_e2e_test.go::TestRekeyRunnerPg.
+//
+// Calls unexported stop() once. Idempotent: a second call after
+// the daemons are already reaped is a no-op (the inner loop
+// short-circuits on p.ProcessState != nil). The shared test pool
+// (h.Pool) is NOT closed here — that's owned by pgtest.Open's
+// t.Cleanup. Closing the pool mid-test would deadlock the next
+// StartWithEnv call.
+//
+// ADR-094: the L2 fix for PR-823's TestRekeyRunnerPg flake. The
+// listener-bind timeout (`127.0.0.1:<port> did not accept within
+// 10s`) was caused by phase 2's apid racing phase 1's
+// already-running bgBefore goroutines for the shared Postgres
+// max_connections=100 budget. Calling Stop between phases
+// removes phase 1 from contention so phase 2 boots cleanly.
+func (h *Harness) Stop() {
+	if h == nil {
+		return
+	}
+	h.stop()
 }
 
 // buildBinaries runs `go build` for each daemon listed in whichDaeamons into

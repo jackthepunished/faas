@@ -1,15 +1,35 @@
 from typing import Literal
 
-EdgeRuleResponseKind = Literal["cors", "headers", "ip", "jwt", "redirect", "rewrite", "route"]
-
-EDGE_RULE_RESPONSE_KIND_VALUES: set[EdgeRuleResponseKind] = {
+EdgeRuleResponseKind = Literal[
+    "budget",
     "cors",
+    "geo",
     "headers",
     "ip",
     "jwt",
+    "limit",
+    "maintenance",
     "redirect",
     "rewrite",
     "route",
+    "throttle",
+    "validate",
+]
+
+EDGE_RULE_RESPONSE_KIND_VALUES: set[EdgeRuleResponseKind] = {
+    "budget",
+    "cors",
+    "geo",
+    "headers",
+    "ip",
+    "jwt",
+    "limit",
+    "maintenance",
+    "redirect",
+    "rewrite",
+    "route",
+    "throttle",
+    "validate",
 }
 
 

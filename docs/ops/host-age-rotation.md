@@ -108,7 +108,7 @@ under 5 minutes plus the four-daemon bounce.
 ### 1. Generate the new key + pre-flight check
 
 ```sh
-sudo gregale host-age status
+sudo gregalectl host-age status
 ```
 
 Confirm both `host.age` and `host.age.pub` exist with mode
@@ -127,7 +127,7 @@ sudo ls -la /etc/faas/secrets/
 ### 2. Rotate (atomically swap)
 
 ```sh
-sudo gregale host-age rotate --commit
+sudo gregalectl host-age rotate --commit
 ```
 
 This performs three operations in one shell:
@@ -147,8 +147,8 @@ The output is the new recipient string:
   Previous (now .previous):     age1abc...
   Next: chown root:root /etc/faas/secrets/host.age /etc/faas/secrets/host.age.previous && chmod 0400 both
   Next: systemctl restart faas-vmmd first (it owns host.age.pub), then faas-apid faas-meterd faas-githubd
-  Next: gregale host-age status (verify all daemons on the new fingerprint after restart)
-  Next: 30-day overlap window starts now; run 'gregale host-age prune-previous' after that
+  Next: gregalectl host-age status (verify all daemons on the new fingerprint after restart)
+  Next: 30-day overlap window starts now; run 'gregalectl host-age prune-previous' after that
 ```
 
 **The new recipient is what every NEW envelope will be sealed
@@ -167,7 +167,7 @@ sudo ls -la /etc/faas/secrets/
 ```
 
 ```sh
-sudo gregale host-age status
+sudo gregalectl host-age status
 ```
 
 Output should show two fingerprints (current + previous), their
@@ -254,7 +254,7 @@ A rotation is healthy when ALL of the following are true:
 
 | Signal | Source | Healthy value |
 |---|---|---|
-| `gregale host-age status` shows both fingerprints | operator CLI | current + previous visible |
+| `gregalectl host-age status` shows both fingerprints | operator CLI | current + previous visible |
 | All four daemon status lines green | `systemctl is-active` | active (running) |
 | `apid_open_failed_total` (Prometheus) | `/metrics` on apid:9090 | 0 |
 | `vmmd_unseal_failed_total` | `/metrics` on vmmd:9090 | 0 |
@@ -271,7 +271,7 @@ the pre-rotation and post-rotation unseal paths.
 
 ## Rollback
 
-Up until `gregale host-age prune-previous`, the previous key is
+Up until `gregalectl host-age prune-previous`, the previous key is
 still on disk as `host.age.previous`. Rollback is:
 
 ```sh
@@ -300,7 +300,7 @@ that's effectively zero. **Do not roll back after
 is irreversible until you re-provision a fresh host.age from
 backup.
 
-The `gregale host-age rotate --abort` flag (proposed, not yet
+The `gregalectl host-age rotate --abort` flag (proposed, not yet
 shipped) takes an internal snapshot at rotate-time and restores
 from it without the manual steps above. Filed as a follow-up
 for v2.
@@ -332,13 +332,13 @@ A rotation is considered "complete" when:
 
 1. All entries in the validation matrix are green for 30
    consecutive days after step 4 of the procedure.
-2. `gregale host-age prune-previous` runs cleanly (defaults:
+2. `gregalectl host-age prune-previous` runs cleanly (defaults:
    refuses if the previous file is <30 days old).
 3. The runbook log (`/var/log/faas/rotation.log`) carries the
    timestamp, operator, and recipient prefix.
 
 Only after step 1 has held for 30 days should the operator run
-`gregale host-age prune-previous`. The default 30-day overlap is
+`gregalectl host-age prune-previous`. The default 30-day overlap is
 the actual security primitive — shortening it requires
 operator sign-off and a written justification in
 `/var/log/faas/rotation.log`.
@@ -346,9 +346,9 @@ operator sign-off and a written justification in
 ## Pruning the previous key (30+ days post-rotation)
 
 ```sh
-sudo gregale host-age status
+sudo gregalectl host-age status
 # confirm: host.age.previous age = 30+ days
-sudo gregale host-age prune-previous
+sudo gregalectl host-age prune-previous
 # default: refuses if previous <30 days
 # --force: skip the age check
 # --promote: rename previous → current instead of removing
@@ -393,7 +393,7 @@ Response:
 ```
 
 The `kid` is the recipient fingerprint of the current host
-identity (matches what `gregale host-age status` prints as
+identity (matches what `gregalectl host-age status` prints as
 the current key). After rotate, GET against the row returns
 the new ciphertext (still opaque to the customer); the
 plaintext is held by vmmd's per-wake secret injection.
@@ -436,7 +436,7 @@ call — and is crash-safe across daemon restarts.
 1. Confirm the new identity is in production:
 
    ```sh
-   sudo gregale host-age status
+   sudo gregalectl host-age status
    # confirm: host.age exists, host.age.previous either does
    # not exist (clean state) OR is <30 days old (overlap
    # still active).
@@ -509,7 +509,7 @@ crash-safe model retries these on the next daemon restart; the
 operator's recovery procedure is:
 
 1. Stop apid.
-2. Restore the missing identity: `gregale host-age rotate
+2. Restore the missing identity: `gregalectl host-age rotate
    --previous <path-to-backup>` re-installs the previous key
    under `/etc/faas/secrets/host.age.previous`, restoring the
    OpenMulti overlap window.
@@ -536,7 +536,7 @@ store — the walker has nothing to unseal with.
   independently generated and stable across host.age rotation
   (spec §11).
 - It does not change `host.age` or `host.age.previous`. The
-  operator rotates the key file via `gregale host-age rotate`;
+  operator rotates the key file via `gregalectl host-age rotate`;
   the walker only re-seals `app_secrets` rows under the
   already-promoted new identity.
 - It does not retry a row whose kid already matched the

@@ -18,7 +18,60 @@
     mode: "0644"
   register: gatewayd_internal_unit
 
+# ADR-093 — drop the per-cluster operator kill-switch. Mirrors the
+# alertmanager role's `alertmanager.yml.j2` template drop (tasks/
+# main.yml:126-134). A toml key change restarts the daemon so the
+# new value lands in cmd/gatewayd-internal/config.go:178-216's
+# startup-time LoadConfig. The env-override path
+# (FAAS_GATEWAY_ROUTE_METRICS) is the live-reload escape hatch and
+# does not require this file to change.
+- name: gatewayd_internal_service — ensure /etc/faas exists
+  ansible.builtin.file:
+    path: /etc/faas
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+
+- name: gatewayd_internal_service — render gatewayd.toml
+  ansible.builtin.template:
+    src: gatewayd.toml.j2
+    dest: "{{ gatewayd_config_path }}"
+    owner: root
+    group: faas
+    mode: "0640"
+  notify: restart faas-gatewayd-internal
+
 - name: gatewayd_internal_service — systemctl daemon-reload (idempotent, after new unit file)
   ansible.builtin.systemd:
     daemon_reload: true
   when: gatewayd_internal_unit.changed
+
+# Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
+# env line into the gatewayd-internal unit. Drop-in mirrors
+# deploy/ansible/roles/control_plane_service/templates/
+# 99-faas-node-name.conf.j2 — body is identical across roles.
+- name: gatewayd_internal_service — install FAAS_NODE_NAME drop-in (Mega-PR-A)
+  ansible.builtin.template:
+    src: ../../_shared/templates/99-faas-node-name.conf.j2
+    dest: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-node-name.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart faas-gatewayd-internal
+
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to gatewayd-internal via FAAS_GATEWAYD_ROLE so
+# cmd/gatewayd-internal/config.go::LoadConfig picks up
+# faas_box_role (compute-only on fsn-2). Note: gatewayd-internal
+# reads FAAS_GATEWAYD_ROLE, NOT FAAS_GATEWAYD_INTERNAL_ROLE.
+# See roles/gatewayd_internal_service/templates/99-faas-role.conf.j2
+# for the full rationale.
+- name: gatewayd_internal_service — install FAAS_GATEWAYD_ROLE drop-in (Mega-PR-C)
+  ansible.builtin.template:
+    src: 99-faas-role.conf.j2
+    dest: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-role.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart faas-gatewayd-internal

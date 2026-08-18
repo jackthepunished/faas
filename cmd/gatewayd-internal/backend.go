@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -31,17 +32,42 @@ var _ gateway.Router = pgRouter{}
 // clean ok=false (404); only an actual store failure returns a non-nil error.
 func (r pgRouter) ResolveHost(ctx context.Context, host string) (gateway.App, bool, error) {
 	if slug, ok := r.slugFor(host); ok {
-		app, err := r.store.AppBySlug(ctx, slug)
-		if errors.Is(err, state.ErrNotFound) {
-			return gateway.App{}, false, nil
-		}
+		return r.appBySlug(ctx, slug)
+	}
+	// Tenant surface (issue #879 / ADR-100 PR-B). Dark behind
+	// FAAS_TENANT_SURFACES_ENABLED; a non-surface host or a
+	// surface miss falls through to the legacy custom_domains
+	// path. resolveTenantSurface owns the parser check + the
+	// routing so ResolveHost stays ≤ 50 lines.
+	if api.TenantSurfacesEnabled() {
+		app, ok, err := r.resolveTenantSurface(ctx, host)
 		if err != nil {
 			return gateway.App{}, false, err
 		}
-		return r.toApp(ctx, app)
+		if ok {
+			return app, true, nil
+		}
 	}
+	return r.customDomain(ctx, host)
+}
 
-	// Custom domain: must exist AND be verified before we route to it (spec §7).
+// appBySlug — slugFor hit branch. Extracted to keep ResolveHost
+// ≤ 50 lines (CLAUDE.md convention).
+func (r pgRouter) appBySlug(ctx context.Context, slug string) (gateway.App, bool, error) {
+	app, err := r.store.AppBySlug(ctx, slug)
+	if errors.Is(err, state.ErrNotFound) {
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	return r.toApp(ctx, app)
+}
+
+// customDomain — the legacy custom_domains branch (spec §7).
+// Must exist AND be verified before we route to it; a deleted
+// parent app falls through to a clean 404.
+func (r pgRouter) customDomain(ctx context.Context, host string) (gateway.App, bool, error) {
 	dom, err := r.store.DomainByName(ctx, host)
 	if errors.Is(err, state.ErrNotFound) {
 		return gateway.App{}, false, nil
@@ -62,6 +88,70 @@ func (r pgRouter) ResolveHost(ctx context.Context, host string) (gateway.App, bo
 	return r.toApp(ctx, app)
 }
 
+// resolveTenantSurface — pgRouter.ResolveHost's tenant-surface branch.
+// Pulled out to keep ResolveHost ≤ 50 lines (CLAUDE.md convention).
+// Returns (app, true, nil) on a routable, verified hostname on an
+// active surface; ({}, false, nil) on a miss, suspended surface,
+// unverified hostname, deleted parent app, or cross-account
+// mismatch (caller falls through to legacy custom_domains); or
+// (zero, false, err) on a store error.
+//
+// Two security gates the legacy custom_domains path already has
+// and this branch must mirror:
+//   - hostname.Verified() == true (pre-challenge TXT records
+//     must not route; the apid verify handler flips this)
+//   - surface.AccountID == app.AccountID (defends against a
+//     hypothetical appID re-use race during a soft-delete window:
+//     the surface is keyed to an account, the app is keyed to an
+//     account, and they must agree before we route)
+func (r pgRouter) resolveTenantSurface(ctx context.Context, host string) (gateway.App, bool, error) {
+	surface, err := r.store.TenantSurfaceByHostname(ctx, host)
+	if errors.Is(err, state.ErrNotFound) {
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	if !surface.Active() {
+		// Soft-deleted / suspended surface: route-around, not 404.
+		// A suspended surface is a customer-visible state change;
+		// the legacy custom_domains path may still own a domain
+		// row that pre-dates the surface — fall through to honour it.
+		return gateway.App{}, false, nil
+	}
+	hostname, err := r.store.GetTenantHostnameByName(ctx, host)
+	if errors.Is(err, state.ErrNotFound) {
+		// Surface row exists but the hostname row was deleted
+		// between the two lookups (dns_poller GC; rare). Fall
+		// through to legacy; the next request re-joins cleanly.
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	if !hostname.Verified() {
+		// Pre-challenge hostname must not route. Mirror the
+		// dom.Verified() gate at the custom_domains branch below.
+		return gateway.App{}, false, nil
+	}
+	app, err := r.store.AppByID(ctx, surface.AppID)
+	if errors.Is(err, state.ErrNotFound) {
+		// App deleted while surface still active — route-around.
+		return gateway.App{}, false, nil
+	}
+	if err != nil {
+		return gateway.App{}, false, err
+	}
+	if surface.AccountID != app.AccountID {
+		// Defence in depth: surface→account and app→account must
+		// agree. A drift here would be an invariant violation
+		// (every surface is created against an app owned by the
+		// same account), but we fail closed rather than route.
+		return gateway.App{}, false, nil
+	}
+	return r.toApp(ctx, app)
+}
+
 // slugFor returns the app slug for a platform-subdomain host, or ok=false when
 // the host is a custom domain (or the suffix is unconfigured). It rejects
 // multi-label prefixes (only "slug.apps.gregale.dev" routes, not "x.slug.apps.…").
@@ -74,6 +164,16 @@ func (r pgRouter) slugFor(host string) (string, bool) {
 		return "", false
 	}
 	return label, true
+}
+
+// previewScopeFromHost (issue #272 / ADR-095 PR-B) peels a preview-hostname
+// shape `pr-{N}.{parent-slug}.apps.<zone>` into `(number, parent-slug)` so
+// the routing layer can resolve it to the preview app row whose slug is
+// `pr-{N}-{parent-slug}` (the convention the webhook provisioner uses per
+// ADR-094). The parser is shared with pkg/gateway's on-demand cert
+// allowlist so the two paths can't drift on what counts as a preview host.
+func (r pgRouter) previewScopeFromHost(host string) (number int, slug string, ok bool) {
+	return gateway.PreviewScopeFromHost(r.appsSuffix, host)
 }
 
 // toApp joins the app to its account's plan (the plan lives on the account, not
@@ -106,6 +206,7 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		ID:               app.ID,
 		AccountID:        acct.ID,
 		Plan:             acct.Plan,
+		Slug:             app.Slug,
 		StreamingEnabled: app.StreamingEnabled,
 		// Issue #676 / ADR-080: per-app raw-bytes Upgrade
 		// bridge flag. Plumbed from apps.websocket_enabled
@@ -116,7 +217,34 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		// raw forwarder. Default false on the App struct
 		// matches the apps.websocket_enabled column DEFAULT.
 		WebSocketEnabled: app.WebSocketEnabled,
-		RequireAuthn:     app.RequireAuthn,
+		// ADR-093: per-route observability opt-in. Plumbed
+		// from apps.route_metrics_enabled through pgRouter.toApp
+		// so Handler.ServeHTTP's routeSetFor (gated on
+		// app.RouteMetricsEnabled && h.routeMetricsEnabled) can
+		// lazily create the per-app routeLabelSet. Default false
+		// on the App struct matches the apps.route_metrics_enabled
+		// column DEFAULT (migration 00212).
+		RouteMetricsEnabled: app.RouteMetricsEnabled,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. Plumbed from apps.maintenance_mode so
+		// Handler.ServeHTTP's applyAppsMaintenanceMode can
+		// short-circuit WITHOUT re-reading the database. Default
+		// false on the App struct matches the apps.maintenance_mode
+		// column DEFAULT (migration 00237).
+		MaintenanceMode: app.MaintenanceMode,
+		RequireAuthn:    app.RequireAuthn,
+		// CORS improvements D1: per-app default CORS
+		// plumbed through pgRouter.toApp from the apps
+		// row. CORSDefaultEnabled is *bool (tri-state:
+		// nil = legacy never-PATCHed, *false = explicit
+		// opt-out, *true = opt-in). The pgstore Scan
+		// target is always a non-nil pointer on hydrated
+		// rows, so the gateway sees false on legacy
+		// apps (the opt-in check uses `*a.CORSDefaultEnabled`)
+		// and never consults the origins list — making
+		// the legacy wake path bit-for-bit unchanged.
+		CORSDefaultEnabled: app.CORSDefaultEnabled,
+		CORSDefaultOrigins: app.CORSDefaultOrigins,
 		PublicAuth: gateway.PublicAuthConfig{
 			Mode:        app.PublicAuthMode,
 			BasicSealed: app.PublicAuthBasicSealed,
@@ -178,6 +306,28 @@ type invalidator interface {
 	// key, which it doesn't. The cache is advisory so a
 	// brief staleness window is fine.
 	ResetEdgeRules()
+	// ResetApp (ADR-091 amendment / §4.1.2.0) drops a single app
+	// from the apps LRU when its apps.maintenance_mode (or any
+	// other customer-visible column) flips. The companion trigger
+	// apps_maintenance_mode_notify (migrations/00225) fires
+	// pg_notify('app_changed', NEW.id::text) ONLY when
+	// maintenance_mode IS DISTINCT FROM old, so this method is
+	// low-volume — it's not on the hot request path. Per-app
+	// drop (not wholesale FlushRoutes) because maintenance_mode
+	// flips are usually isolated to one app; wholesale FlushRoutes
+	// would also evict every other app's entry on every flip.
+	ResetApp(appID string)
+	// RequestCertForSurface (ADR-100 / issue #879) is the
+	// cert-remint goroutine's entry point. A
+	// tenant_surface_changed notification (any insert / update /
+	// delete on tenant_surfaces OR tenant_hostnames) re-assembles
+	// the SAN set and asks the issuer for a fresh cert. The
+	// payload is the bare surface uuid; the consumer re-reads
+	// the surface + hostnames (defence against notify loss).
+	// Errors are logged-and-swallowed: a failed mint re-tries on
+	// the next mutation; we never block the notify path on a
+	// transient CA failure.
+	RequestCertForSurface(ctx context.Context, surfaceID string) error
 }
 
 // watchInvalidations subscribes to the pg_notify channels that affect routing
@@ -208,6 +358,7 @@ func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator
 		db.NotifyKeyChanged,
 		db.NotifyDeploymentChanged,
 		db.NotifyEdgeRuleChanged,
+		db.NotifyTenantSurfaceChanged,
 	}
 	notif, err := db.SubscribeWithReconnect(ctx, pool, channels, log)
 	if err != nil {
@@ -287,7 +438,31 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		case "stopped", "failed", "parked", "snapshotting", "migrating":
 			inv.EvictInstance(p.AppID, p.InstanceID)
 		}
-	case db.NotifyAppChanged, db.NotifyDomainChanged:
+	case db.NotifyAppChanged:
+		// ADR-091 amendment / §4.1.2.0: a per-app column flip
+		// (e.g. apps.maintenance_mode) fires apps_maintenance_mode_notify
+		// which emits 'app_changed' with NEW.id as the payload.
+		// Drop ONLY that app from the apps LRU — not the route
+		// cache — because the next Backend.Lookup will re-read
+		// the apps row and pick up the new column value. This
+		// arm is also the load-bearing destination of any future
+		// per-app column triggers (e.g. apps.streaming_enabled
+		// flips, apps.public_auth_mode rotations). Until those
+		// land, the only fired trigger is apps_maintenance_mode_notify.
+		// Wholesale FlushRoutes() used to be the only behaviour;
+		// we keep that for NotifyDomainChanged because a custom
+		// domain's host→app mapping change affects the route
+		// resolver wholesale, not per-app.
+		if n.Payload != "" {
+			inv.ResetApp(n.Payload)
+		} else {
+			// Defensive: a missing payload on the existing
+			// channel (e.g. a row delete or a future trigger
+			// without a NEW.id payload) falls back to wholesale
+			// FlushRoutes — same posture as the legacy arm.
+			inv.FlushRoutes()
+		}
+	case db.NotifyDomainChanged:
 		inv.FlushRoutes()
 	case db.NotifyKeyChanged:
 		// Issue #477 / ADR-079. A key rotation across the
@@ -347,5 +522,25 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		// surgical-evict. Wholesale flush is cheaper and
 		// correct.
 		inv.ResetEdgeRules()
+	case db.NotifyTenantSurfaceChanged:
+		// ADR-100 / issue #879: any mutation on
+		// tenant_surfaces or tenant_hostnames (insert /
+		// update / delete) emits this notification with the
+		// bare surface uuid as payload. The cert-remint
+		// goroutine re-reads the surface + verified hostnames
+		// (defence against notify loss — the trigger at
+		// migrations/00243 fires on every relevant row
+		// change, including the verified_at flip), then asks
+		// the issuer for a fresh cert. The SAN set is
+		// deterministic (sort-by-hostname) so re-mints
+		// against the same verified set produce identical
+		// (primary, sans) tuples.
+		//
+		// Errors are logged-and-swallowed: a failed mint
+		// re-tries on the next mutation; we never block the
+		// notify path on a transient CA failure.
+		if err := inv.RequestCertForSurface(ctx, n.Payload); err != nil {
+			log.Warn("gatewayd: cert remint failed", "surface", n.Payload, "err", err)
+		}
 	}
 }

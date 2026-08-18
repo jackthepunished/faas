@@ -19,7 +19,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -70,6 +72,24 @@ type InstallsLookup interface {
 // so the smoke test can assert on the order.
 type WriteCheck func(ctx context.Context, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase) error
 
+// WritePreviewCheck is the seam githubd uses to push PR-preview
+// Check Run updates back to GitHub (issue #272 / ADR-094). Wired
+// by cmd/githubd/main.go to ChecksAPI.WritePreviewCheck; nil-safe
+// (handlePullRequest logs + proceeds when nil, mirroring the
+// production WriteCheck seam).
+//
+// The phase + previewURL pair mirrors the production Check Run
+// shape: phase drives the GitHub (status, conclusion) tuple via
+// phaseToStatus/Conclusion; previewURL is appended to the
+// summary as a Markdown link so the PR author can click through.
+type WritePreviewCheck = WritePreviewCheckFunc
+
+// WritePreviewCheckForkRefused is the seam githubd uses to push
+// the D3 fork-refused neutral Check Run. Wired by
+// cmd/githubd/main.go to ChecksAPI.WritePreviewCheckForkRefused.
+// nil-safe.
+type WritePreviewCheckForkRefused = WritePreviewCheckForkRefusedFunc
+
 // Service is the business-logic object shared across the HTTP
 // webhook handler and the gRPC server. nil fields fall back to
 // safe no-ops (so partial deployments degrade gracefully until
@@ -110,6 +130,15 @@ type Service struct {
 	// unchanged. Production wiring in cmd/githubd/main.go
 	// sets this from wire.NewOpsMetrics("githubd").
 	Ops *wire.OpsMetrics
+	// WritePreviewCheck is the PR-preview Check Run writer
+	// (issue #272 / ADR-094). Wired to ChecksAPI.WritePreviewCheck
+	// in cmd/githubd/main.go; nil-safe (handlePullRequest logs
+	// + proceeds when nil).
+	WritePreviewCheck WritePreviewCheck
+	// WritePreviewCheckForkRefused is the D3 fork-refused
+	// neutral Check Run writer. Same nil-safe posture as
+	// WritePreviewCheck.
+	WritePreviewCheckForkRefused WritePreviewCheckForkRefused
 	// WorkDir is the root directory under which githubd
 	// stages the per-app source tarballs that the apid
 	// bridge passes to builderd. Defaults to /var/lib/faas/
@@ -586,6 +615,377 @@ func (errNoBinding) Error() string { return "githubd: no binding for push" }
 // IsNoBinding reports whether err is the no-binding sentinel.
 func IsNoBinding(err error) bool {
 	return errors.As(err, new(errNoBinding))
+}
+
+// previewDefaultTTL is the wall-clock duration a preview app
+// stays alive after provision time, regardless of GitHub state.
+// Mirrors the customer-facing docstring on
+// state.App.PreviewExpiresAt — the teardown janitor (PR-C)
+// reaps after this deadline. The 7-day default matches ADR-094
+// §3.4; per-account overrides arrive in a follow-up ADR.
+const previewDefaultTTL = 7 * 24 * time.Hour
+
+// previewHostnameForSlug derives the customer-facing preview URL
+// from the preview app slug. Shape:
+//
+//	pr-{N}-{parent_slug}  →  pr-{N}-{parent_slug}.apps.gregale.dev
+//
+// The wildcard DNS record *.apps.gregale.dev + the wildcard TLS
+// cert already cover this hostname (deploy/terraform/wildcard_*);
+// PR-B wires the gateway-internal parser that peels the
+// pr-{N}- prefix back off the slug. Returns "" for empty slugs
+// so the caller can pass the slug through without a guard.
+func previewHostnameForSlug(slug string) string {
+	if slug == "" {
+		return ""
+	}
+	return slug + ".apps.gregale.dev"
+}
+
+// previewSlug derives the slug githubd uses for a preview app
+// row from the parent app's slug + the PR number (issue #272 /
+// ADR-094 D2). The shape is `pr-{N}-{parent_slug}`, e.g. a
+// PR #42 against the `hello-world` app lands at
+// `pr-42-hello-world`. Stable across synchronize / reopened
+// events so a 2nd push to PR #42 reuses the same row.
+//
+// Returns an error when parentSlug is empty (the binding
+// resolution must have surfaced a non-empty parent — an empty
+// parent indicates a githubd-side bug, not a customer-facing
+// failure mode).
+func previewSlug(parentSlug string, prNumber int) (string, error) {
+	if parentSlug == "" {
+		return "", fmt.Errorf("githubd: previewSlug: parent_slug is empty (binding resolution bug)")
+	}
+	if prNumber <= 0 {
+		return "", fmt.Errorf("githubd: previewSlug: pr_number must be > 0 (got %d)", prNumber)
+	}
+	return fmt.Sprintf("pr-%d-%s", prNumber, parentSlug), nil
+}
+
+// stampPreviewPrState (ADR-095 PR-C) advances one preview row's
+// lifecycle label via SetPreviewPrState. It exists as a Service
+// method so the dispatcher's helper stays above the
+// Handler ≤ 50-line cap and the test rig (newPreviewService) can
+// stub it when an action's handler should not exercise the store.
+//
+// The implementation is a thin delegate — the closed-set
+// validator and the preview-only enforcement live inside
+// SetPreviewPrState, so a bug here can never relabel a
+// production app or trip the CHECK constraint. Returns nil when
+// the store declines (production row, ErrNotFound) — the
+// dispatcher has already passed the preview-path gate, so
+// ErrNotFound means a concurrent delete raced us; in that case
+// the row is gone and there's nothing to stamp.
+func (s *Service) stampPreviewPrState(ctx context.Context, appID, prState string) error {
+	if s.Reconcile == nil || s.Reconcile.Store == nil {
+		return nil
+	}
+	updated, err := s.Reconcile.Store.SetPreviewPrState(ctx, appID, prState)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	_ = updated
+	return nil
+}
+
+// WritePreviewCheck is the seam HandlePullRequest uses for the
+// queued / building / live preview Check Run. Wired by
+// cmd/githubd/main.go to a *ChecksAPI.WritePreviewCheck;
+// nil-safe (the dispatcher logs + proceeds when nil,
+// mirroring the production WriteCheck seam on Service).
+//
+// The func-typed shape (rather than a method on Service)
+// matches the existing WriteCheck seam on line 71 and lets
+// the test path inject a recording func without constructing
+// a full ChecksAPI.
+type WritePreviewCheckFunc func(ctx context.Context, repoFullName, commitSHA string, phase githubdgrpc.CheckPhase, previewURL, summary string) error
+
+// WritePreviewCheckForkRefusedFunc is the seam HandlePullRequest
+// uses for the D3 fork-refused neutral Check Run. Same func-
+// typed shape as WritePreviewCheckFunc.
+type WritePreviewCheckForkRefusedFunc func(ctx context.Context, repoFullName, commitSHA, summary string) error
+
+// handlePullRequest is the HTTP webhook entry point for the
+// pull_request event family (issue #272 / ADR-094). It provisions
+// a preview apps row and posts a `gregale-preview` Check Run.
+// The actual source-ref build enqueue is staged in a follow-up
+// PR — PR-A's spine focuses on app creation + Checks + fork
+// refusal + quota-exhausted paths so each PR in the cluster
+// stays reviewable in ~10 min.
+//
+// Differences from HandlePushRequest:
+//
+//   - No reconcile / scan / build-fan-out: PR previews deploy
+//     exactly one app (the preview itself) per event.
+//   - D3 fork refusal short-circuits BEFORE any app creation —
+//     the policy is uniform-refuse and the neutral Check Run is
+//     the only outbound signal.
+//   - The action whitelist (opened/synchronize/reopened/closed)
+//     is enforced by DecodePullRequest; an unknown action
+//     surfaces as a parse error here.
+//   - The (repo, branch) binding resolution used by the push
+//     path is replaced by a (repo) lookup — PRs land on the
+//     binding's parent app regardless of which branch the PR
+//     targets.
+//
+// Returns:
+//
+//   - reconcile.Result on success (Added carries the preview
+//     app row when one was provisioned).
+//   - ErrNoBinding when the base repo isn't bound (mirrors
+//     HandlePushRequest — the HTTP handler renders the same
+//     200-ignored body so GitHub doesn't retry).
+//   - ErrIgnored when the PR is a fork (D3) or when the
+//     account's quota is exhausted. The HTTP handler renders
+//     the same 200-ignored body.
+//   - any other error → 500 (logged with op context).
+func (s *Service) handlePullRequest(ctx context.Context, body []byte) (reconcile.Result, error) {
+	ev, err := DecodePullRequest(body)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// D3 fork refusal: short-circuit BEFORE any app creation.
+	// The neutral Check Run is the only outbound signal — no
+	// apps row, no deployment row, no Slack/audit notifications.
+	if ev.IsFork() {
+		if s.WritePreviewCheckForkRefused != nil {
+			if werr := s.WritePreviewCheckForkRefused(ctx,
+				ev.Repository.FullName, ev.PullRequest.HeadSHA,
+				"Fork PR refused — head repo differs from base repo "+
+					"(security policy; ADR-094 D3)"); werr != nil {
+				s.Log.Warn("githubd: write fork-refused preview check", "err", werr,
+					"repo", ev.Repository.FullName, "sha", ev.PullRequest.HeadSHA)
+			}
+		}
+		s.Log.Info("githubd pull_request: fork refused",
+			"repo", ev.Repository.FullName,
+			"head_repo", ev.HeadRepoFullName(),
+			"pr_number", ev.Number, "action", string(ev.Action),
+			"sender", ev.Sender.Login)
+		result := reconcile.Result{}
+		result.WasIgnored = true
+		return result, ErrIgnored
+	}
+
+	// 1. Resolve the (repo) binding. PR previews don't branch-
+	//    filter: any PR opened against a bound repo triggers
+	//    preview provisioning for the parent app. The empty-
+	//    branch argument is the canonical "match any branch"
+	//    shape for AppBindingStore.GetAppBinding.
+	binding, err := s.Bindings.GetAppBinding(ctx, ev.Repository.FullName, "")
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) || IsNoBinding(err) {
+			return reconcile.Result{}, ErrNoBinding
+		}
+		return reconcile.Result{}, fmt.Errorf("githubd: resolve binding for PR: %w", err)
+	}
+	if binding.BindingID == "" || binding.AccountID == "" || binding.AppID == "" {
+		// Defensive: the bind row exists but is incomplete.
+		// The OAuth handshake should never write a partial row,
+		// but a manual SQL edit could.
+		return reconcile.Result{}, ErrNoBinding
+	}
+
+	// 2. Resolve the install row (same shape as HandlePushRequest).
+	install, err := s.Installs.ForAccount(ctx, binding.AccountID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return reconcile.Result{}, ErrNoBinding
+		}
+		return reconcile.Result{}, fmt.Errorf("githubd: resolve install for PR: %w", err)
+	}
+	if install.AccountID == "" || install.InstallationID == 0 {
+		return reconcile.Result{}, ErrNoBinding
+	}
+
+	// 3. Takeover guard: the bind row's InstallID must match
+	//    the install row's InstallationID. Same §11 fail-closed
+	//    posture as HandlePushRequest.
+	if binding.InstallID != install.InstallationID {
+		s.Log.Warn("githubd: PR binding install_id mismatch",
+			"binding_id", binding.BindingID,
+			"binding_install_id", binding.InstallID,
+			"install_installation_id", install.InstallationID,
+			"repo", ev.Repository.FullName, "pr_number", ev.Number)
+		return reconcile.Result{}, ErrNoBinding
+	}
+
+	// 4. Load the parent app. The binding's AppID is the parent;
+	//    the preview row's slug is `pr-{N}-{parent_slug}` and its
+	//    preview_of_slug column carries the parent's slug verbatim.
+	parentApp, err := s.Reconcile.Store.AppByID(ctx, binding.AppID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			// Bind row points at a deleted parent — treat as
+			// unbound. The dashboard's "orphaned bindings"
+			// pane surfaces this case to operators.
+			return reconcile.Result{}, ErrNoBinding
+		}
+		return reconcile.Result{}, fmt.Errorf("githubd: resolve parent app: %w", err)
+	}
+	if parentApp.Status != state.AppActive {
+		// The parent isn't active (soft-deleted, suspended, etc.).
+		// Provisioning a preview on top of an inactive parent is
+		// nonsensical — refuse silently so GitHub doesn't retry.
+		return reconcile.Result{}, ErrNoBinding
+	}
+
+	// 5. Derive the preview slug + provision the preview apps row.
+	//    Idempotent on (account_id, slug) — a 2nd synchronize
+	//    event for the same PR reuses the row, updates the
+	//    preview_pr_state / preview_expires_at, and re-stamps
+	//    the Check Run.
+	previewSlugVal, err := previewSlug(parentApp.Slug, ev.Number)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("githubd: derive preview slug: %w", err)
+	}
+
+	// Closed-event teardown is dispatched to PR-C's janitor —
+	// the dispatcher just stamps preview_pr_state='closed' on
+	// the row and the janitor does the rest (24h grace + final
+	// torn_down). Opening this up to the dispatcher would
+	// duplicate the janitor's state machine.
+	previewState := state.PreviewPrStateOpen
+	if ev.Action == PullRequestActionClosed {
+		previewState = state.PreviewPrStateClosed
+	}
+
+	expiresAt := time.Now().Add(previewDefaultTTL)
+	previewApp := state.App{
+		// ID is left blank — pgstore.CreateAppIfUnderQuota mints a
+		// UUIDv7 when App.ID is empty. The preview app is a fresh
+		// row; reusing the parent's ID would collide on the PK.
+		AccountID:        parentApp.AccountID,
+		Slug:             previewSlugVal,
+		Type:             parentApp.Type,
+		RAMMB:            parentApp.RAMMB,
+		MaxConcurrency:   parentApp.MaxConcurrency,
+		IdleTimeoutS:     parentApp.IdleTimeoutS,
+		Status:           state.AppActive,
+		PreviewOfSlug:    parentApp.Slug,
+		PreviewPrNumber:  ev.Number,
+		PreviewPrState:   previewState,
+		PreviewExpiresAt: &expiresAt,
+	}
+	// ADR-094 D4: previews count against DeployedAppMax but
+	// the dispatcher doesn't have an apid-side session to
+	// resolve a Plan at webhook time. Pass a generous limit
+	// here so the per-account quota check never trips in the
+	// dispatcher; the dashboard's onboarding flow + the
+	// applier-side cap reader are the real enforcement point.
+	// (Future PR: thread the resolved plan through so the
+	// webhook path enforces the same cap as the dashboard.)
+	previewLimits := api.Limits{DeployedApps: 10000}
+	created, err := s.Reconcile.Store.CreateAppIfUnderQuota(ctx, previewApp, previewLimits)
+	if err != nil {
+		// Quota exhausted is the customer-visible failure mode:
+		// post a Check Run that announces the limit + an upgrade
+		// hint, then return ErrIgnored so the HTTP handler
+		// renders 200-ignored (no GitHub retry).
+		var qe *state.QuotaError
+		if errors.As(err, &qe) {
+			if s.WritePreviewCheck != nil {
+				previewURL := previewHostnameForSlug(previewSlugVal)
+				if werr := s.WritePreviewCheck(ctx,
+					ev.Repository.FullName, ev.PullRequest.HeadSHA,
+					githubdgrpc.CheckPhaseFailed,
+					previewURL,
+					"Preview skipped: account has reached its deployed app limit. "+
+						"Close an existing app or upgrade your plan."); werr != nil {
+					s.Log.Warn("githubd: write quota preview check", "err", werr,
+						"repo", ev.Repository.FullName, "sha", ev.PullRequest.HeadSHA)
+				}
+			}
+			s.Log.Info("githubd pull_request: quota exhausted",
+				"repo", ev.Repository.FullName, "pr_number", ev.Number,
+				"sender", ev.Sender.Login)
+			result := reconcile.Result{}
+			result.WasIgnored = true
+			return result, ErrIgnored
+		}
+		// Pre-existing row on (account_id, slug) → ErrConflict.
+		// That's the idempotent path: a 2nd synchronize /
+		// reopened / closed event for the same PR. We treat it as
+		// success — the row is already provisioned. The state
+		// machine still has to advance, though, so the dispatcher
+		// looks the existing row up by slug (the freshly-failed
+		// INSERT didn't mint an ID) and stamps preview_pr_state
+		// on it. Before PR-C this branch swallowed ErrConflict
+		// silently, which meant a `closed` event never actually
+		// mutated the row's preview_pr_state — the janitor's
+		// only signal was preview_expires_at, so PRs that were
+		// reopened-then-closed stayed open forever.
+		// ADR-095 PR-C.1.
+		if !errors.Is(err, state.ErrConflict) {
+			return reconcile.Result{}, fmt.Errorf("githubd: create preview app: %w", err)
+		}
+		existing, lookupErr := s.Reconcile.Store.AppBySlug(ctx, previewSlugVal)
+		if lookupErr != nil {
+			// The row vanished between the ErrConflict and the
+			// lookup — treat it as a teardown race: the row is
+			// already gone, so there's nothing to stamp and
+			// nothing for the janitor to reap. Return success
+			// so GitHub doesn't retry; the Check Run we'll
+			// write below reflects the live preview URL, which
+			// is fine because the row's deletion makes it 410.
+			s.Log.Info("githubd pull_request: conflict path lost row to concurrent delete",
+				"err", lookupErr, "preview_slug", previewSlugVal)
+			return reconcile.Result{}, nil
+		}
+		created = existing
+	}
+
+	// 5b. Stamp preview_pr_state on the existing row. This covers
+	//     two paths the INSERT above can't: (a) the
+	//     opened-on-already-existing-row case (ErrConflict from
+	//     step 5), and (b) the explicit closed-action teardown
+	//     arm — even when the row was first provisioned earlier
+	//     in the PR's lifetime, we now flip the label so the
+	//     janitor's 24h grace clock starts. SetPreviewPrState
+	//     refuses production rows and out-of-vocabulary values,
+	//     so this UPDATE cannot relabel a customer's live app
+	//     or trip the CHECK constraint.
+	if err := s.stampPreviewPrState(ctx, created.ID, previewState); err != nil {
+		s.Log.Warn("githubd: stamp preview_pr_state",
+			"err", err, "app_id", created.ID, "state", previewState)
+	}
+
+	// 6. Write the queued Check Run with the preview URL. The
+	//    URL is derived from the preview slug; routing (PR-B)
+	//    peels the prefix back off. Posting `status=queued` so
+	//    the PR UI shows the spinner; the subsequent build
+	//    pipeline (a follow-up PR-A.1) will transition it to
+	//    `in_progress` / `completed`.
+	previewURL := previewHostnameForSlug(previewSlugVal)
+	if s.WritePreviewCheck != nil {
+		if werr := s.WritePreviewCheck(ctx,
+			ev.Repository.FullName, ev.PullRequest.HeadSHA,
+			githubdgrpc.CheckPhaseQueued,
+			previewURL,
+			fmt.Sprintf("Preview provisioned for PR #%d against %q",
+				ev.Number, parentApp.Slug)); werr != nil {
+			s.Log.Warn("githubd: write queued preview check", "err", werr,
+				"repo", ev.Repository.FullName, "sha", ev.PullRequest.HeadSHA,
+				"preview_slug", previewSlugVal)
+		}
+	}
+
+	s.Log.Info("githubd pull_request → preview",
+		"repo", ev.Repository.FullName,
+		"pr_number", ev.Number, "action", string(ev.Action),
+		"preview_slug", previewSlugVal,
+		"parent_slug", parentApp.Slug,
+		"sender", ev.Sender.Login,
+		"sha", ev.PullRequest.HeadSHA)
+
+	result := reconcile.Result{}
+	result.Added = []state.App{created}
+	return result, nil
 }
 
 // ErrIgnored is returned by HandlePushRequest when the pushed

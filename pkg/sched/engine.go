@@ -29,6 +29,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
@@ -135,6 +136,15 @@ type Engine struct {
 	fcVer  string // running Firecracker version — snapshots load only on a match (ADR-005)
 	log    *slog.Logger
 	ops    *wire.OpsMetrics // nil is tolerated by KillStuck (skip the counter increment)
+
+	// wakeLimiter is the per-app + per-account admission-rate
+	// throttle (ADR-099 PR-0 / ADR-080 Risk #1). nil is a no-op —
+	// Allow* returns true — so unit tests that don't exercise the
+	// rate-limit branch can skip the wire-up. Production
+	// cmd/schedd wires NewWakeRateLimiter() so a runaway dispatch
+	// fan-out (cron storm, jobs burst) cannot OOM the control
+	// plane on cold-boot.
+	wakeLimiter *WakeRateLimiter
 	// verifier is the build-attestation verifier (ADR-038 / Tier 3
 	// phase 3). Wired via WithVerifier after NewEngine returns;
 	// nil means "skip verification" — kept for the unit tests
@@ -286,6 +296,10 @@ type Engine struct {
 
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
+	// wakeCoord is the per-app single-flight coordinator (ADR-098).
+	// Lazily initialised in NewEngine. Lock discipline is a LEAF:
+	// wakeCoord.mu is taken and released BEFORE e.lockApp(appID).
+	wakeCoord *wakeCoord
 
 	// warmAffinity is the sticky-warm cache (placement scheduler PR,
 	// ADR-025). Defaults to a zero-TTL cache that always returns "no
@@ -294,6 +308,16 @@ type Engine struct {
 	// main.go). nil is tolerated by RecordWake / LastWarmNode so a
 	// missed wiring is a silent no-op rather than a nil-deref panic.
 	warmAffinity *WarmAffinity
+
+	// upstreamAffinity (ADR-098 PR-D) is the connection-aware
+	// placement bias. Defaults to nil (FAAS_UPSTREAM_AFFINITY=0
+	// branch) so pre-PR test fixtures keep their existing
+	// behaviour. Production wires a real cache via
+	// WithUpstreamAffinity. nil is tolerated by Score (returns
+	// ok=false → chooser falls back to legacy tie-break) so a
+	// missed wiring is a silent no-op rather than a nil-deref
+	// panic — parallel to warmAffinity's contract above.
+	upstreamAffinity *UpstreamAffinity
 
 	// overage is the spend-cap pause-workload seam (issue #561).
 	// Nil tolerates the gate branch as a no-op (pre-#561 fixtures
@@ -399,6 +423,21 @@ func (e *Engine) budgetFor(s state.State) time.Duration {
 	return bootTimeout(s)
 }
 
+// budgetForWake returns the deadline for the full vmmd operation. A snapshot
+// wake is allowed the cold-boot budget because vmmd may need to fall back to a
+// cold boot after a restore miss or a slow snapshot load. Reusing the 6-second
+// WAKING context for that fallback cancels the cold boot before it can start.
+// The test override remains authoritative so deadline tests stay fast.
+func (e *Engine) budgetForWake(in bootInput) time.Duration {
+	if e.bootBudget != nil {
+		return e.bootBudget(in.initState)
+	}
+	if in.haveSnap && in.snapKey != "" {
+		return ColdBootTimeout
+	}
+	return e.budgetFor(in.initState)
+}
+
 // NewEngine wires the engine. notif may be nil (notifications are best-effort in
 // tests); log may be nil (slog default); ops may be nil (tests don't assert on
 // metrics).
@@ -427,6 +466,7 @@ func NewEngine(ctx context.Context, store state.Store, ledger *NodeLedger, vmm R
 		fcVer:           fcVer,
 		log:             log,
 		appMu:           map[string]*sync.Mutex{},
+		wakeCoord:       newWakeCoord(),
 		warmBroadcaster: newWarmHintBroadcaster(),
 		capacityTable:   newNodeCapacityTable(),
 		now:             time.Now, // tests override post-construction
@@ -463,6 +503,18 @@ func (e *Engine) WithOpsMetrics(ops *wire.OpsMetrics) *Engine {
 // their existing single-box behaviour.
 func (e *Engine) WithWarmAffinity(w *WarmAffinity) *Engine {
 	e.warmAffinity = w
+	return e
+}
+
+// WithUpstreamAffinity attaches the connection-aware placement
+// bias (ADR-098 PR-D). The engine reads Score(appID) before
+// calling ChoosePlacement and stamps Request.PreferredRegion;
+// the chooser honors it via the upstream_fit tie-break in
+// betterCandidate. nil is tolerated (Score returns ok=false →
+// legacy tie-break) so legacy test fixtures that don't wire
+// this keep their existing single-box behaviour.
+func (e *Engine) WithUpstreamAffinity(u *UpstreamAffinity) *Engine {
+	e.upstreamAffinity = u
 	return e
 }
 
@@ -597,6 +649,24 @@ func (e *Engine) WithMigratingWatchdogIntervalSeconds(seconds int) *Engine {
 		panic(fmt.Sprintf("sched: WithMigratingWatchdogIntervalSeconds: seconds must be > 0, got %d", seconds))
 	}
 	e.migratingWatchdogIntervalSeconds = seconds
+	return e
+}
+
+// WithWakeRateLimiter wires the per-app + per-account wake-admission
+// rate-limit primitive (ADR-099 PR-0 / ADR-080 Risk #1). A nil value
+// is allowed — the rate-limit check then short-circuits to "allow",
+// preserving the pre-PR-0 behaviour for unit tests that don't exercise
+// the throttle. Production cmd/schedd wires NewWakeRateLimiter() so a
+// runaway dispatch fan-out (cron storm, jobs burst) cannot OOM the
+// control plane on cold-boot.
+//
+// Pass the same *WakeRateLimiter to WithRateLimiterForgetting on
+// account / app delete events so the buckets don't leak. (Not wired
+// in PR-0 — the apid-side Forget hook lands with the delete handlers
+// in PR-D; the in-memory bucket leak is bounded by the per-process
+// lifetime and surfaced via WakeRateLimiter.BucketCount() in /metrics.)
+func (e *Engine) WithWakeRateLimiter(l *WakeRateLimiter) *Engine {
+	e.wakeLimiter = l
 	return e
 }
 
@@ -900,6 +970,20 @@ type WakeResult struct {
 	// (Target.DeploymentID empty, picker collapses to today's
 	// behaviour).
 	DeploymentID string
+	// RequestCount (ADR-098 C9) is the per-instance request counter
+	// schedd has observed via the batched ReportActivity path. The
+	// engine stamps it on the admitted path so the gateway's
+	// per-instance cache can show "warming up" vs "warmed" without
+	// a second round-trip onto the ledger. Read on the warm-snapshot
+	// 5th promotion gate (C10) which gates promotion to the warm
+	// tier until the instance has served a meaningful number of
+	// requests. 0 on the at-capacity path (no instance was admitted)
+	// and on freshly-cold-booted instances (the writer hasn't yet
+	// flushed the first batch).
+	//
+	// Mirrors AdmitInstanceResponse.request_count (tag 9) on the
+	// wire — additive per ADR-016, pre-PR callers see 0.
+	RequestCount int64
 }
 
 // Wake ensures a running instance for appID and returns its address (spec §4.3
@@ -944,7 +1028,14 @@ type WakeResult struct {
 // shared admitAndDispatch runs Phase 2-4. AdmitInstance (issue #168)
 // skips Phase 1 explicitly so a gateway can demand a new instance
 // even when others are already RUNNING.
-func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+func (e *Engine) Wake(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+	// PR-B (issue #272 / ADR-095): scope-aware Wake. Stamp the
+	// scope on the ctx so every downstream helper (resolveApp,
+	// loadAPIEnv, LiveDeployment lookup, ledger admit) threads the
+	// same value. Empty scope is a no-op for WithScope — the ctx
+	// is returned unchanged, so pre-PR-B callers (cron, meterd,
+	// e2e) keep byte-identical behaviour.
+	ctx = WithScope(ctx, scope)
 	// ── Phase 1: fast path under appMu ─────────────────────────────
 	release := e.lockApp(appID)
 	if ins, err := e.store.RunningInstanceForApp(ctx, appID); err == nil {
@@ -993,15 +1084,29 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 		// need the lookup unless port defaults are acceptable. vmmd
 		// defaults to 8080 when port=0, so a transient lookup failure
 		// here is benign; we surface it via slog and carry on.
+		//
+		// PR-B (issue #272): the LiveDeployment read is scope-aware.
+		// A preview wake (scope="pr-{N}") MUST NOT route to the
+		// parent's live deployment; it must consult
+		// LiveDeploymentForScope so the preview gets the preview's
+		// own deployment row. Empty scope falls through to the
+		// legacy LiveDeployment (single-deployment app).
 		resolvedDeploymentID := deploymentID
-		if dep, depErr := e.store.LiveDeployment(ctx, appID); depErr == nil {
+		var depErr error
+		var dep state.Deployment
+		if scope == "" {
+			dep, depErr = e.store.LiveDeployment(ctx, appID)
+		} else {
+			dep, depErr = e.store.LiveDeploymentForScope(ctx, appID, scope)
+		}
+		if depErr == nil {
 			port = dep.OverridePort
 			if resolvedDeploymentID == "" {
 				resolvedDeploymentID = dep.ID
 			}
 		} else {
 			e.log.Warn("sched: wake: live deployment lookup for port/deployment_id failed; falling through with caller hint (or empty)",
-				"app", appID, "caller_deployment_id", deploymentID, "err", depErr)
+				"app", appID, "caller_deployment_id", deploymentID, "scope", scope, "err", depErr)
 		}
 		release()
 		// Surface the existing row's wake_id so a Phase-1 fast-path
@@ -1010,7 +1115,7 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 		// brought the instance up; an operator tailing a warm request
 		// can still pin it back to the schedd slog line that stamped
 		// it (gaps analysis 2026-07-23 review finding #1).
-		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port, DeploymentID: resolvedDeploymentID}, nil
+		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port, DeploymentID: resolvedDeploymentID, RequestCount: ins.RequestCount}, nil
 	} else if !errors.Is(err, state.ErrNotFound) {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: running lookup: %w", err)
@@ -1021,6 +1126,102 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 	// capacity refusal happens INSIDE admitAndDispatch; we forward
 	// rather than lift into the typed AtCapacity result.
 	return e.admitAndDispatch(ctx, appID, false)
+}
+
+// EnsureWake (ADR-098) is the single-flight-safe wake entry point.
+// Every wake producer (gateway, cron, floor, scaleup, targets) routes
+// through this method so a concurrent burst coalesces into one virtual
+// boot per parked app.
+//
+// Three phases for the leader:
+//
+//  1. Reserve a slot in the wake coordinator (under wakeCoord.mu only).
+//  2. Defer Complete() so all five completion paths in e.Wake
+//     (engine.go:1435 ledger refusal, :1818 re-read failure, :1823
+//     state-stolen, :1830-1831 record-runtime, :1892 commit) hand
+//     their outcome to followers via one source of truth.
+//  3. Run e.Wake. The deferred Complete fires when the function
+//     returns, regardless of which path it took.
+//
+// Followers block on the leader's Complete and inherit the outcome.
+//
+// Lock discipline: wakeCoord.mu is acquired and released BEFORE
+// e.lockApp(appID) is touched. The defer-close pattern keeps the
+// decrement site count at one — no hand-placed release at any of the
+// five completion paths.
+//
+// Errors that surface to the caller:
+//
+//   - ErrQueueFull: per-app follower cap exceeded.
+//   - ErrAppDeleted: the app was deleted while we were waiting.
+//   - ctx.Err(): the caller's ctx was cancelled before the leader finished.
+//   - leader's *api.Problem: ledger / chooser / store error.
+//   - nil: the wake succeeded; Outcome.Instance is populated.
+func (e *Engine) EnsureWake(ctx context.Context, appID string) (CoordOutcome, error) {
+	if e == nil || e.wakeCoord == nil {
+		return CoordOutcome{}, fmt.Errorf("sched: EnsureWake: engine not fully constructed")
+	}
+	call, isLeader, err := e.wakeCoord.Enter(appID)
+	if err != nil {
+		return CoordOutcome{}, err
+	}
+	// Follower path: block on the leader's outcome. The leader's
+	// Complete() is the single source of truth.
+	if !isLeader {
+		out := call.Await(ctx)
+		e.wakeCoord.Release(appID, call)
+		return out, nil
+	}
+	// Leader path: run e.Wake on a detached ctx bounded by the
+	// coordinator's TTL so a cancelled triggering request cannot kill
+	// the in-flight boot. The deferred Complete is the single
+	// decrement site for all five completion paths inside e.Wake.
+	//
+	//nolint:contextcheck // leader's ensure deliberately detaches from the
+	// caller's ctx via context.Background() + TTL — the wake must outlive
+	// the triggering request so other queued waiters get the same instance.
+	// This is the load-bearing single-flight coalescing invariant (spec
+	// §4.1, ADR-098 §Decision). Mirror of pkg/gateway/gate.go Wait
+	// goroutine detach.
+	leaderCtx, cancel := context.WithTimeout(context.Background(), e.wakeCoord.TTL())
+	defer cancel()
+	out := CoordOutcome{}
+	defer func() {
+		call.Complete(out)
+		e.wakeCoord.Release(appID, call)
+	}()
+	//nolint:contextcheck // leader's ensure deliberately detaches from the
+	// caller's ctx via context.Background() + TTL — the wake must outlive
+	// the triggering request so other queued waiters get the same instance.
+	// This is the load-bearing single-flight coalescing invariant (spec
+	// §4.1, ADR-098 §Decision). Mirror of pkg/gateway/gate.go Wait
+	// goroutine detach.
+	res, err := e.Wake(leaderCtx, appID, "", "")
+	if err != nil {
+		out.Err = err
+		return out, err
+	}
+	// AtCapacity (issue #168) — the engine admits benignly (no error)
+	// but no instance was created. Returning an empty-but-non-nil
+	// Instance would have the gRPC server emit a phantom 200 with
+	// zero-valued fields; the gateway fast-path would treat that as
+	// "wake succeeded with empty IDs" and re-attempt the same backend
+	// query. Forward the typed sentinel so the gateway retries
+	// against the existing live targets (per the AdmitInstance
+	// AtCapacity contract).
+	if res.AtCapacity {
+		out.Err = ErrAtCapacity
+		return out, ErrAtCapacity
+	}
+	out.Instance = &CoordInstance{
+		InstanceID:   res.InstanceID,
+		NodeID:       res.NodeID,
+		DeploymentID: res.DeploymentID,
+		WakeID:       res.WakeID,
+		Port:         int32(res.Port),
+		ColdBoot:     res.Method == vmmdpb.WakeMethod_WAKE_COLD_BOOT,
+	}
+	return out, nil
 }
 
 // AdmitInstance attempts to admit one additional instance for appID,
@@ -1047,7 +1248,13 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 // the newest live deployment — the legacy single-deployment
 // behaviour. Non-empty asks the engine to admit on that specific
 // live deployment. Additive per ADR-016.
-func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+//
+// scope (PR-B / issue #272): the preview scope ("pr-{N}") the
+// gateway derived from the inbound Host header. Empty = prod
+// (legacy single-deployment behaviour). Stamped on the ctx via
+// WithScope so resolveApp / loadAPIEnv read the same value.
+func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+	ctx = WithScope(ctx, scope)
 	if deploymentID == "" {
 		return e.admitAndDispatch(ctx, appID, true)
 	}
@@ -1069,9 +1276,15 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID string) 
 // deployment internally). Pass empty rather than resolving to
 // LatestDeployment — the trigger must NOT silently wake a
 // superseded deployment.
-func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+//
+// scope (PR-B / issue #272): threaded through the same way as
+// AdmitInstance; the floor trigger's scope is derived from the
+// app it's reconciling and must match the per-app scope ledger so
+// an over-cap prod app cannot drain a preview (or vice versa).
+func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID, scope string) (WakeResult, error) {
+	ctx = WithScope(ctx, scope)
 	if deploymentID == "" {
-		return e.AdmitInstance(ctx, appID, "")
+		return e.AdmitInstance(ctx, appID, "", scope)
 	}
 	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
 }
@@ -1082,6 +1295,25 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 // deployment is overridden. If the override deployment is no longer
 // live (a newer deploy happened mid-tick), the call returns
 // {AtCapacity: true} — the trigger's next sweep re-evaluates.
+//
+// P1A asymmetry note: this path (the floor trigger / fan-out /
+// per-deployment wake) bypasses Engine.admitGate by design. The
+// canonical per-app cap enforcement is NodeLedger.Admit
+// (pkg/sched/admission.go:225-228), which fires inside
+// ledger.Admit below. The PR-C invariant pinned at
+// pkg/sched/invariants_property_test.go:68
+// (TestProperty_EngineWake_RespectsMaxConcurrency) requires
+// "ledger caps, not lock caps" — both admitAndDispatch (wake path,
+// :1191) and admitAndDispatchForDeployment (this function) feed
+// into the same ledger write. As a consequence, the per-deployment
+// path cannot emit schedd_scale_up_decisions_total{outcome ∈
+// {cooldown_held, min_floor_already, overage_cap_reached}} from
+// the gate — only reject_at_cap surfaces, via the ledger's
+// *api.Problem{Code: CodePlanLimitConcur} return. Documenting this
+// here so a future reviewer doesn't try to "fix" it by routing the
+// deployment path through the gate (which would require either
+// collapsing the two cap-enforcement layers or duplicating the
+// ledger write).
 func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID string, liftCapacityToResult bool) (WakeResult, error) {
 	// ── Phase 2: admit window, under appMu ──────────────────
 	release := e.lockApp(appID)
@@ -1163,7 +1395,7 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 	}
 
 	release()
-	return WakeResult{InstanceID: ins.ID}, nil
+	return WakeResult{InstanceID: ins.ID, RequestCount: ins.RequestCount}, nil
 }
 
 // admitAndDispatch is the shared Phase 2–4 body used by both Wake and
@@ -1212,6 +1444,35 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		release()
 		e.IncAtCapacity(appID, "wake")
 		return WakeResult{AtCapacity: true}, nil
+	}
+
+	// PR-0 (ADR-099): wake-rate-limit consult. The throttle lives at
+	// the admission layer (here) rather than at the gateway edge
+	// (pkg/gateway.Limiter) because the wake path also fires from
+	// cron ticks and (post-PR-C) jobs dispatch — neither of which
+	// crosses gatewayd-internal. Without this gate, a Scale customer
+	// firing `--tasks 1000 --parallelism 100` on a parked app could
+	// trigger 100 cold-boots in a single 1 s tick and OOM the control
+	// plane (ADR-099 Risk #1; same primitive serves ADR-080 Risk #1).
+	//
+	// The check fires AFTER the worker-class short-circuit so a
+	// worker app's wake budget is not consumed by a request the
+	// engine would have rejected anyway, and BEFORE admitGate so a
+	// throttled wake neither burns the cooldown clock nor writes an
+	// unattached instance row. Branch shape: lifts to
+	// WakeResult{AtCapacity: true} so the gateway treats it as a
+	// no-op when it already has ≥1 cached target (the existing
+	// AdmitInstance typed-capacity path).
+	//
+	// Per-plan ceiling: api.Limits.WakeBurstPerApp / WakeBurstPerAccount
+	// (Free 1/1, Hobby 5/10, Pro 20/30, Scale 100/150 per minute).
+	// Fail-closed on unknown plan — mirrors pkg/gateway.Limiter.Allow.
+	if e.wakeLimiter != nil {
+		if !e.wakeLimiter.AllowWakeApp(appID, acct.Plan) || !e.wakeLimiter.AllowWakeAccount(string(acct.ID), acct.Plan) {
+			release()
+			e.IncAtCapacity(appID, "rate_limit")
+			return WakeResult{AtCapacity: true}, nil
+		}
 	}
 
 	// PR-C (issue #462): wake-gate consult. Three short-circuit
@@ -1354,10 +1615,28 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// (cold boot must always work) is preserved: an empty hint
 	// behaves identically to a fresh install.
 	warmHint, _ := e.warmAffinity.LastWarmNode(appID)
+	// ADR-098 PR-D: connection-aware placement bias. Score is
+	// the synchronous read (per ADR §D2 — schedd does NOT
+	// LISTEN on data_upstreams_changed). On cache miss, Refresh
+	// fires synchronously to populate the entry; on hit, the
+	// cached preferredRegion flows through. ok=false → empty
+	// PreferredRegion → legacy tie-break. The refresh error is
+	// logged + swallowed so a transient DB hiccup doesn't break
+	// the legacy chooser.
+	preferredRegion, _, _ := e.upstreamAffinity.Score(appID)
+	if preferredRegion == "" && e.upstreamAffinity != nil {
+		if rerr := e.upstreamAffinity.Refresh(ctx, acct.ID, appID); rerr == nil {
+			preferredRegion, _, _ = e.upstreamAffinity.Score(appID)
+		} else {
+			// best-effort: log at debug, fall through to legacy
+			e.log.Debug("upstream affinity refresh failed; using legacy chooser", "app", appID, "err", rerr)
+		}
+	}
 	placement, err := e.choosePlacementLocked(ctx, Request{
 		AppID: appID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		PreferredNodeID: warmHint,
+		PreferredRegion: preferredRegion,
 	})
 	if err != nil {
 		release()
@@ -1516,12 +1795,13 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  sealedEnv,
+		Plan:       acct.Plan, AccountID: acct.ID,
+		SealedEnv: sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
 		// api_env > manifest_env > os.environ".
-		APIEnv: e.loadAPIEnv(ctx, acct.ID, appID),
+		APIEnv: e.loadAPIEnv(ctx, acct.ID, appID, dep.Scope),
 		// ADR-031: surface the per-app egress allowlist on the
 		// wake wire. vmmd translates the CIDRs into the per-netns
 		// forward chain. Empty slice = no allowlist rule (current
@@ -1651,7 +1931,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	// ── Phase 3: drop the lock, do the slow vmmd RPC ──────────────
 	var out *WakeOutcome
-	bootCtx, cancel := context.WithTimeout(ctx, e.budgetFor(bootInput.initState))
+	bootCtx, cancel := context.WithTimeout(ctx, e.budgetForWake(bootInput))
 	defer cancel()
 	// Issue #555 PR-3: sched.wake span encloses the vmmd RPC. The
 	// span's trace_id is the wake_id (uuidv7 → 32-hex), so the
@@ -1707,6 +1987,20 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			RequestedAt: bootInput.startedAt, // best-effort stamp
 		})
 	}
+	// ADR-097 (P1B): capture the schedd-side wake-phase boundaries.
+	//   - rpcStartedAt: the moment just before the vmmd
+	//     CreateFromSnapshot / CreateColdBoot RPC fires. Used to
+	//     observe admit_to_rpc (gap from bootInput.startedAt) and
+	//     rpc_call (gap from rpcStartedAt to RPC return).
+	//   - rpcEndedAt: the moment the vmmd RPC returns nil on the
+	//     success path. Used to observe rpc_to_running (gap from
+	//     rpcEndedAt to the WAKING/COLD_BOOTING → RUNNING
+	//     transition below at engine.go:1892).
+	// Both captures are wall-clock time.Now() — negligible overhead,
+	// <1µs each. The error path at :1781-1790 does not capture
+	// rpcEndedAt; the error duration is already surfaced via the
+	// events.BootFailed - events.BootStarted math.
+	rpcStartedAt := time.Now().UTC()
 	if bootInput.haveSnap && bootInput.snapKey != "" {
 		// #96 / ADR-025 axis 2: read the storage key the snap row
 		// carries (imaged stamps it from the snapshot_written
@@ -1805,6 +2099,13 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	release2 := e.lockApp(bootInput.appID)
 	defer release2()
 
+	// ADR-097 (P1B): success-path RPC end capture. The error branch
+	// above does NOT capture rpcEndedAt — error duration is already
+	// surfaced via the events.BootFailed - events.BootStarted math
+	// (see engine.go:1810-1817). We only need the success-path
+	// capture to scope rpc_to_running.
+	rpcEndedAt := time.Now().UTC()
+
 	// Re-read the row. If a watchdog (commit 3) or a Park or another
 	// Wake moved it out of initState during Phase 3, abort: this Wake
 	// is no longer the canonical owner. Free the reservation and
@@ -1891,6 +2192,57 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
+	// ADR-097 (P1B): observe the three schedd-side wake phases.
+	//   - admit_to_rpc = rpcStartedAt - bootInput.startedAt.
+	//     Covers the gRPC handler → admitGate → ledger → placement
+	//     → bootInput construction window. bootInput.startedAt is
+	//     the existing bootInput capture at :1589 — the bootInput
+	//     stamp and the events.Platform BootStarted.RequestedAt are
+	//     the same moment, so the histogram joins cleanly to the
+	//     events table on wake_id.
+	//   - rpc_call = rpcEndedAt - rpcStartedAt.
+	//     Wall-clock time inside the vmmd Create{FromSnapshot,ColdBoot}
+	//     RPC. Cross-process boundary; the only phase that crosses
+	//     a node-local socket.
+	//   - rpc_to_running = time.Since(rpcEndedAt).
+	//     Covers the bootInput re-read + SetInstanceRuntime +
+	//     audit emit + e.transition work.
+	//
+	// All three are observed on the success path only — the error
+	// branches above (engine.go:1795-1838) do not produce a
+	// successful RUNNING transition and would skew the histogram
+	// with failure latencies that the events.BootFailed row already
+	// captures. The wake_id is attached as a prometheus.Exemplar on
+	// each observation (the third ObserveWithExemplar arg below)
+	// so operators can join to gateway_wake_latency_seconds on the
+	// gateway side and to the events table.
+	if e.ops != nil {
+		// wake_id is the per-wake-attempt correlation handle emitted
+		// on the events table and on the boot_started / boot_completed
+		// SSE channel. Attach it as a prometheus.Exemplar on each
+		// phase observation so operators can join metrics to events
+		// on the wake_id key without paying the label cardinality cost.
+		exemplar := prometheus.Labels{"wake_id": bootInput.wakeID}
+		if obs, ok := e.ops.WakeRPCDuration(bootInput.appID, "admit_to_rpc").(prometheus.ExemplarObserver); ok {
+			obs.ObserveWithExemplar(
+				rpcStartedAt.Sub(bootInput.startedAt).Seconds(),
+				exemplar,
+			)
+		}
+		if obs, ok := e.ops.WakeRPCDuration(bootInput.appID, "rpc_call").(prometheus.ExemplarObserver); ok {
+			obs.ObserveWithExemplar(
+				rpcEndedAt.Sub(rpcStartedAt).Seconds(),
+				exemplar,
+			)
+		}
+		if obs, ok := e.ops.WakeRPCDuration(bootInput.appID, "rpc_to_running").(prometheus.ExemplarObserver); ok {
+			obs.ObserveWithExemplar(
+				time.Since(rpcEndedAt).Seconds(),
+				exemplar,
+			)
+		}
+	}
+
 	// issue #517 / PR-C / ADR-064 — emit wake.boot_completed. The
 	// three sibling emits (wake.boot_started, wake.boot_completed,
 	// wake.readiness_200 from vmmd) give the customer-facing
@@ -1920,7 +2272,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		})
 	}
 
-	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port, DeploymentID: bootInput.depID}, nil
+	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port, DeploymentID: bootInput.depID, RequestCount: fresh.RequestCount}, nil
 }
 
 // bootInput is the immutable bundle of values needed across the
@@ -2843,6 +3195,8 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 		VCPUCount:  int32(limits.VCPU),
 		MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
+		Plan:       acct.Plan,
+		AccountID:  acct.ID,
 		SealedEnv:  sealedEnv,
 		// ADR-045: api_env plaintext layer; the loadAPIEnv
 		// helper already fail-softs on a lookup error and logs
@@ -2851,7 +3205,7 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 		// overlayfs upper layers carry the same precedence
 		// rules as Wake time and the customer's runtime config
 		// (most of it) lives in sealedEnv + manifest_env.
-		APIEnv: e.loadAPIEnv(ctx, app.AccountID, app.ID),
+		APIEnv: e.loadAPIEnv(ctx, app.AccountID, app.ID, dep.Scope),
 		// ADR-031: per-app egress allowlist; same CIDR-string
 		// flattening as the Wake path.
 		EgressAllowlist: prefixesToCIDRStrings(app.EgressAllowlist),
@@ -3289,12 +3643,13 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
-		SealedEnv:  sealedEnv,
+		Plan:       acct.Plan, AccountID: acct.ID,
+		SealedEnv: sealedEnv,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
 		// api_env > manifest_env > os.environ".
-		APIEnv: e.loadAPIEnv(ctx, acct.ID, appID),
+		APIEnv: e.loadAPIEnv(ctx, acct.ID, appID, dep.Scope),
 		// ADR-031: see the Wake builder above. Prime is the
 		// deploy-pipeline first boot — same wire shape, same
 		// per-netns ruleset; a freshly-deployed app starts under
@@ -3446,8 +3801,48 @@ func (e *Engine) lockedRunning(ctx context.Context, instanceID string) (*state.I
 // ReportActivity persists a batch of last_request_at touches from the gateway
 // (spec §4.1, ADR-018). schedd is the sole writer to instances, so the gateway
 // hands it the batch instead of writing directly.
+//
+// ADR-098 C9: the gateway's per-instance cache (Target.RequestCount)
+// ships the per-instance request_count delta on the same touch
+// batch. The engine flushes both last_request_at and the delta
+// atomically via TouchInstancesWithRequestDelta. The delta is
+// additive ("request_count = request_count + delta") so a
+// re-delivered batch is idempotent on Phase-4-loser re-applies.
+//
+// Why piggyback on ReportActivity rather than spin a separate
+// 250ms goroutine:
+//   - The gateway already batches touches every 1–2s (per
+//     gateway's own batched timer); a per-instance delta on the
+//     same touch turns the writer into a one-round-trip UPDATE
+//     instead of N per-instance ORMs.
+//   - The "batched on the gateway" cadence is the load-bearing
+//     amortization: the same gateway-side timer that absorbs
+//     last_request_at noise also absorbs request_count noise.
+//   - Production test (issue #543, framework_ready_at) uses the
+//     same pattern: stateful stamp piggybacked on a batched RW
+//     rather than a hot-loop per-instance ORM.
+//
+// Metric: schedd_instance_request_count_flushed_delta_total is
+// bumped with the post-flush delta count, tagged by outcome
+// (success / dropped-or-error). Dropped flushes are visible on
+// the §12 dashboard.
 func (e *Engine) ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error) {
-	return e.store.TouchInstancesLastSeen(ctx, touches)
+	// Pre-filter: touches with RequestDelta == 0 fall back to the
+	// legacy last_request_at-only path. The split keeps the
+	// existing ORM narrow for the case where the gateway's
+	// per-instance cache is fresh (no incremental delta yet).
+	needDelta := false
+	for _, t := range touches {
+		if t.RequestDelta != 0 {
+			needDelta = true
+			break
+		}
+	}
+	if !needDelta {
+		return e.store.TouchInstancesLastSeen(ctx, touches)
+	}
+	n, err := e.store.TouchInstancesWithRequestDelta(ctx, touches)
+	return n, err
 }
 
 // SeedLedger rebuilds the admission ledger from live instance rows at startup so
@@ -3811,7 +4206,7 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 // captureWarmSnapshotLocked (issue #470 / PR A / ADR-070) is the
 // warm-tier counterpart to snapshotAndPark's init-tier capture. It
 // runs under appMu inside the Park site — caller already holds the
-// lock. The four gates (any one fails → no warm capture) are:
+// lock. The five gates (any one fails → no warm capture) are:
 //  1. app.WarmSnapshotEnabled (the operator-opt-in flag — sticky on
 //     plan downgrade per ADR-070 §Plan gate)
 //  2. acct.Plan.WarmSnapshotAllowed() (the plan-gate that rejects
@@ -3822,7 +4217,13 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 //     between the manual Prime path and the reaper-driven Park path)
 //  4. now - FrameworkReadyAt >= app.WarmSnapshotMinMs (the
 //     time-since-first-ready floor; A.3 covers the time half of
-//     the gate, the request-count half is PR C's audit work)
+//     the gate)
+//  5. ins.RequestCount >= app.WarmSnapshotMinRequests (ADR-098
+//     C10, supersedes ADR-071 PR-C). The per-instance request-
+//     count half of the gate. min == 0 is the "disabled" label
+//     case (Free/Hobby default) — the gate never opens. The
+//     comparison is `count < min` (threshold), not
+//     `count % min == 0` (multiple-of-5 regression).
 //
 // On success: returns (nil, info) after emitting snapshot_written
 // {tier:warm}. imaged's snapshot_written subscriber (PR #525) is
@@ -3872,6 +4273,36 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 		if time.Since(*ins.FrameworkReadyAt) < minAge {
 			return SnapshotBytes{}, nil
 		}
+	}
+
+	// Gate 5 (ADR-098 C10, supersedes ADR-071 PR-C): per-instance
+	// request-count floor. The plan is the load-bearing knob: with
+	// min > 0 the promotion only fires once the instance has served
+	// at least `min` requests. min == 0 is the "disabled" label
+	// case (Free/Hobby default) — the gate never opens, AND the
+	// engine does NOT spin a warm snapshot, so a Free app with
+	// min=0 never sees a warm tier (per ADR-071 §Plan gate, the
+	// plan forbids it anyway, but the explicit zero guard is
+	// belt-and-braces against a Free app that somehow reaches
+	// here).
+	//
+	// The comparison is `count < min` not `count % min == 0`. The
+	// latter is the multiple-of-5 regression (issue #675 review
+	// finding): a cold app requests_count=3 with min=5 would
+	// never promote (3 % 5 = 3, not 0), and the warm tier would
+	// stay cold indefinitely. The threshold is a "have we
+	// crossed the threshold?" comparison, not a "is this a
+	// multiple?" one.
+	//
+	// Why mirror on the instance row (not an engine cache):
+	//   The column is the authoritative counter; the engine
+	//   reads ins.RequestCount (mirror on the Instance struct)
+	//   on every park site. The batched writer flushes
+	//   gateway-side per-instance counts every 1–2s (C9), and
+	//   the engine reads the latest value at gate time. There
+	//   is no in-process cache to drift.
+	if app.WarmSnapshotMinRequests > 0 && ins.RequestCount < int64(app.WarmSnapshotMinRequests) {
+		return SnapshotBytes{}, nil
 	}
 
 	// Compute the per-tier storage keys. The /warm/ segment keeps
@@ -3934,6 +4365,7 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 			"deployment_id":              ins.DeploymentID,
 			"warm_min_requests":          app.WarmSnapshotMinRequests,
 			"warm_min_ms":                app.WarmSnapshotMinMs,
+			"request_count":              ins.RequestCount,
 			"mem_bytes":                  b.MemBytes,
 			"tier":                       state.SnapshotTierWarm,
 			"framework_ready_to_park_ms": readyToParkMs,
@@ -3974,12 +4406,25 @@ func (e *Engine) warmKeysFor(nodeID, depID string) (memKey, vmstateKey string) {
 // resolveApp loads the app, account, plan limits, and current live deployment a
 // wake needs. A missing live deployment is a *api.Problem (an app should always
 // have one, invariant §6.2-3).
+//
+// PR-B (issue #272): the LiveDeployment lookup is scope-aware —
+// a non-empty scope reads the scope's live deployment row via
+// LiveDeploymentForScope. Empty scope falls through to the legacy
+// single-deployment LiveDeployment. The scope is read from the
+// ctx stamped by WithScope at Wake / AdmitInstance /
+// AdmitInstanceForDeployment entry points — see engine_scope.go.
 func (e *Engine) resolveApp(ctx context.Context, appID string) (state.App, state.Account, api.Limits, state.Deployment, error) {
 	app, acct, limits, err := e.resolveAppForDeploy(ctx, appID)
 	if err != nil {
 		return state.App{}, state.Account{}, api.Limits{}, state.Deployment{}, err
 	}
-	dep, err := e.store.LiveDeployment(ctx, appID)
+	scope := ScopeFrom(ctx)
+	var dep state.Deployment
+	if scope == "" {
+		dep, err = e.store.LiveDeployment(ctx, appID)
+	} else {
+		dep, err = e.store.LiveDeploymentForScope(ctx, appID, scope)
+	}
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return state.App{}, state.Account{}, api.Limits{}, state.Deployment{},
@@ -4140,18 +4585,29 @@ func healthcheckPathFromDep(dep state.Deployment) string {
 }
 
 // loadAPIEnv is the plaintext sibling of loadSealedEnv (issue #395 /
-// ADR-045). Reads the per-app app_envs rows and flattens them into
-// the fcvm shape Manager.Wake consumes. Same non-fatal read-failure
-// posture as loadSealedEnv — a transient PG hiccup drops the env
-// layer (the next wake retries) rather than failing the wake itself.
-// Plaintext by contract so there's nothing to leak; the worst case
-// is a missing env var, which customer support can spot from the
-// "API env X missing" log line.
+// ADR-045). Reads the per-app app_envs rows for the given scope and
+// flattens them into the fcvm shape Manager.Wake consumes. Same
+// non-fatal read-failure posture as loadSealedEnv — a transient PG
+// hiccup drops the env layer (the next wake retries) rather than
+// failing the wake itself. Plaintext by contract so there's nothing
+// to leak; the worst case is a missing env var, which customer
+// support can spot from the "API env X missing" log line.
+//
+// ADR-091 / PR-D: scope is threaded through here. Pre-PR callers pass
+// api.DefaultEnvScope (`"default"`) and the legacy behaviour is
+// preserved. Scope-aware callers pass the deployment's declared scope
+// (read via store.LiveDeploymentForScope or by reading `dep.Scope`
+// after DeploymentByID). The scope's row-set is read via
+// ListAppEnvInScope (the scope-aware sibling of the legacy flat
+// ListAppEnv).
 //
 // Carries AccountID explicitly so a cross-account (accountID, appID)
 // pair returns ErrNotFound (consistent with apid's 404 contract).
-func (e *Engine) loadAPIEnv(ctx context.Context, accountID, appID string) []fcvm.APIEnvEntry {
-	rows, err := e.store.ListAppEnv(ctx, accountID, appID)
+func (e *Engine) loadAPIEnv(ctx context.Context, accountID, appID, scope string) []fcvm.APIEnvEntry {
+	if scope == "" {
+		scope = api.DefaultEnvScope
+	}
+	rows, err := e.store.ListAppEnvInScope(ctx, accountID, appID, scope)
 	if err != nil {
 		e.log.Warn("load api env", "app", appID, "err", err)
 		return nil

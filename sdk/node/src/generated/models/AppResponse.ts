@@ -46,6 +46,14 @@ export type AppResponse = {
    */
   websocket_enabled?: boolean;
   /**
+   * Per-app per-route observability flag (ADR-093). When true, gatewayd-internal emits gateway_request_duration_seconds{app,route,class} and serves the bounded reader at GET /v1/apps/{slug}/routes. Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed.
+   */
+  route_metrics_enabled?: boolean;
+  /**
+   * Coarse per-app maintenance toggle (ADR-091 amendment). When true the gatewayd-internal hot-path short-circuits every request to this app with 503 + Retry-After (default 60 s) BEFORE auth, BEFORE wake, BEFORE any kind=maintenance edge rule. Free-tier allowed. Surfaced in the GET /v1/apps/{slug} response so dashboards can show 'maintenance on / off' alongside the streaming/WS pills.
+   */
+  maintenance_mode?: boolean;
+  /**
    * Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column `apps.scaling_policy`.
    */
   scaling_policy?: (null | ScalingPolicy);
@@ -89,6 +97,8 @@ export type AppResponse = {
    * Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps before the A9 fallback; falls through to A9 when the target is inactive or full.
    */
   overflow_node?: string | null;
+  cors_default_enabled?: boolean | null;
+  cors_default_origins?: Array<string>;
   public_auth?: PublicAuthStatus;
   auth_default_flipped_at?: string | null;
 };

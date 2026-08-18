@@ -14,6 +14,8 @@ from .account_response_status import AccountResponseStatus
 from .account_slo_response import AccountSLOResponse
 from .account_slo_response_window import AccountSLOResponseWindow
 from .add_trusted_signer_request import AddTrustedSignerRequest
+from .admin_set_github_webhook_secret_request import AdminSetGithubWebhookSecretRequest
+from .admin_set_github_webhook_secret_response import AdminSetGithubWebhookSecretResponse
 from .alert_rule_response import AlertRuleResponse
 from .alert_rule_response_comparison import AlertRuleResponseComparison
 from .alert_rule_response_failure_source import AlertRuleResponseFailureSource
@@ -28,6 +30,13 @@ from .api_key_response_status import APIKeyResponseStatus
 from .app_env_list_response import AppEnvListResponse
 from .app_env_list_response_env_by_scope import AppEnvListResponseEnvByScope
 from .app_env_response import AppEnvResponse
+from .app_error_request_item import AppErrorRequestItem
+from .app_error_requests_response import AppErrorRequestsResponse
+from .app_error_sample_response import AppErrorSampleResponse
+from .app_error_sample_response_headers_sample import AppErrorSampleResponseHeadersSample
+from .app_error_summary_item import AppErrorSummaryItem
+from .app_error_summary_item_error_class import AppErrorSummaryItemErrorClass
+from .app_errors_summary_response import AppErrorsSummaryResponse
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
 from .app_manifest_env_secrets import AppManifestEnvSecrets
@@ -39,6 +48,8 @@ from .app_response import AppResponse
 from .app_response_eviction_priority import AppResponseEvictionPriority
 from .app_response_runtime import AppResponseRuntime
 from .app_response_type import AppResponseType
+from .app_routes_response import AppRoutesResponse
+from .app_routes_response_source import AppRoutesResponseSource
 from .app_secret_export_response import AppSecretExportResponse
 from .app_secret_list_response import AppSecretListResponse
 from .app_secret_response import AppSecretResponse
@@ -46,6 +57,9 @@ from .app_security_request import AppSecurityRequest
 from .app_security_response import AppSecurityResponse
 from .app_slo_response import AppSLOResponse
 from .app_slo_response_window import AppSLOResponseWindow
+from .app_streaming_status import AppStreamingStatus
+from .app_streaming_status_cap_kind import AppStreamingStatusCapKind
+from .app_streaming_status_status import AppStreamingStatusStatus
 from .app_trusted_signer_list_response import AppTrustedSignerListResponse
 from .app_webhook_delivery_list_response import AppWebhookDeliveryListResponse
 from .app_webhook_delivery_response import AppWebhookDeliveryResponse
@@ -125,6 +139,10 @@ from .cron_run_outcome import CronRunOutcome
 from .custom_domain_response import CustomDomainResponse
 from .daily_usage_list_response import DailyUsageListResponse
 from .daily_usage_response import DailyUsageResponse
+from .data_upstream_list_response import DataUpstreamListResponse
+from .data_upstream_response import DataUpstreamResponse
+from .data_upstream_response_kind import DataUpstreamResponseKind
+from .data_upstream_response_source import DataUpstreamResponseSource
 from .delayed_task_request import DelayedTaskRequest
 from .delayed_task_request_payload import DelayedTaskRequestPayload
 from .delayed_task_response import DelayedTaskResponse
@@ -138,7 +156,22 @@ from .deployment_response_override_env_secret_refs import DeploymentResponseOver
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
 from .deployment_response_parked_reason_type_3_type_1 import DeploymentResponseParkedReasonType3Type1
+from .diff_app_config_patch import DiffAppConfigPatch
+from .diff_app_config_patch_eviction_priority import DiffAppConfigPatchEvictionPriority
+from .diff_break import DiffBreak
+from .diff_break_severity import DiffBreakSeverity
+from .diff_change import DiffChange
+from .diff_change_kind import DiffChangeKind
+from .diff_env_row import DiffEnvRow
+from .diff_payload import DiffPayload
+from .diff_payload_plan import DiffPayloadPlan
+from .diff_request import DiffRequest
+from .diff_request_env_by_scope import DiffRequestEnvByScope
+from .diff_response import DiffResponse
+from .diff_response_plan import DiffResponsePlan
+from .edge_rule_budget_action import EdgeRuleBudgetAction
 from .edge_rule_cors_action import EdgeRuleCORSAction
+from .edge_rule_geo_action import EdgeRuleGeoAction
 from .edge_rule_header_op import EdgeRuleHeaderOp
 from .edge_rule_header_op_action import EdgeRuleHeaderOpAction
 from .edge_rule_headers_action import EdgeRuleHeadersAction
@@ -146,6 +179,8 @@ from .edge_rule_ip_action import EdgeRuleIPAction
 from .edge_rule_jwt_action import EdgeRuleJWTAction
 from .edge_rule_jwt_action_algorithms_item import EdgeRuleJWTActionAlgorithmsItem
 from .edge_rule_jwt_action_required_claims import EdgeRuleJWTActionRequiredClaims
+from .edge_rule_limit_action import EdgeRuleLimitAction
+from .edge_rule_maintenance_action import EdgeRuleMaintenanceAction
 from .edge_rule_redirect_action import EdgeRuleRedirectAction
 from .edge_rule_redirect_action_headers import EdgeRuleRedirectActionHeaders
 from .edge_rule_redirect_action_status_code import EdgeRuleRedirectActionStatusCode
@@ -153,6 +188,11 @@ from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
+from .edge_rule_throttle_action import EdgeRuleThrottleAction
+from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
+from .edge_rule_validate_action import EdgeRuleValidateAction
+from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
+from .field_error import FieldError
 from .fire_cron_request_response import FireCronRequestResponse
 from .fire_cron_request_response_status import FireCronRequestResponseStatus
 from .fire_cron_response import FireCronResponse
@@ -262,6 +302,8 @@ from .public_auth_status_mode import PublicAuthStatusMode
 from .put_app_env_request import PutAppEnvRequest
 from .put_app_registry_credential_request import PutAppRegistryCredentialRequest
 from .put_app_secret_request import PutAppSecretRequest
+from .put_data_upstream_request import PutDataUpstreamRequest
+from .put_data_upstream_request_kind import PutDataUpstreamRequestKind
 from .queue_dead_letter_message import QueueDeadLetterMessage
 from .queue_dead_letter_response import QueueDeadLetterResponse
 from .queue_peek_message import QueuePeekMessage
@@ -289,6 +331,7 @@ from .rotate_app_webhook_secret_response_webhook_secret_sealed_masked import (
 from .rotate_key_response import RotateKeyResponse
 from .rotate_org_api_key_request import RotateOrgAPIKeyRequest
 from .rotate_org_api_key_response import RotateOrgAPIKeyResponse
+from .route_row import RouteRow
 from .scaling_policy import ScalingPolicy
 from .scaling_target import ScalingTarget
 from .scaling_target_metric import ScalingTargetMetric
@@ -297,6 +340,9 @@ from .scan_result_status import ScanResultStatus
 from .scoped_app_env_response import ScopedAppEnvResponse
 from .seat_usage_response import SeatUsageResponse
 from .seat_usage_response_plan import SeatUsageResponsePlan
+from .secret_finding import SecretFinding
+from .secret_finding_severity import SecretFindingSeverity
+from .secret_scan_result import SecretScanResult
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -316,6 +362,8 @@ from .stream_app_logs_archive import StreamAppLogsArchive
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .throttle_suggestion_row import ThrottleSuggestionRow
+from .throttle_suggestions_response import ThrottleSuggestionsResponse
 from .trace import Trace
 from .trace_span import TraceSpan
 from .trace_span_attributes import TraceSpanAttributes
@@ -362,6 +410,8 @@ __all__ = (
     "AccountSLOResponse",
     "AccountSLOResponseWindow",
     "AddTrustedSignerRequest",
+    "AdminSetGithubWebhookSecretRequest",
+    "AdminSetGithubWebhookSecretResponse",
     "AlertRuleResponse",
     "AlertRuleResponseComparison",
     "AlertRuleResponseFailureSource",
@@ -376,6 +426,13 @@ __all__ = (
     "AppEnvListResponse",
     "AppEnvListResponseEnvByScope",
     "AppEnvResponse",
+    "AppErrorRequestItem",
+    "AppErrorRequestsResponse",
+    "AppErrorSampleResponse",
+    "AppErrorSampleResponseHeadersSample",
+    "AppErrorsSummaryResponse",
+    "AppErrorSummaryItem",
+    "AppErrorSummaryItemErrorClass",
     "AppliedBuild",
     "ApplyResponse",
     "ApplyResponseAppsItem",
@@ -390,6 +447,8 @@ __all__ = (
     "AppResponseEvictionPriority",
     "AppResponseRuntime",
     "AppResponseType",
+    "AppRoutesResponse",
+    "AppRoutesResponseSource",
     "AppSecretExportResponse",
     "AppSecretListResponse",
     "AppSecretResponse",
@@ -400,6 +459,9 @@ __all__ = (
     "AppsMetricsResponse",
     "AppsMetricsResponseAppsType0",
     "AppsMetricsResponseRange",
+    "AppStreamingStatus",
+    "AppStreamingStatusCapKind",
+    "AppStreamingStatusStatus",
     "AppTrustedSignerListResponse",
     "AppWebhookDeliveryListResponse",
     "AppWebhookDeliveryResponse",
@@ -473,6 +535,10 @@ __all__ = (
     "CustomDomainResponse",
     "DailyUsageListResponse",
     "DailyUsageResponse",
+    "DataUpstreamListResponse",
+    "DataUpstreamResponse",
+    "DataUpstreamResponseKind",
+    "DataUpstreamResponseSource",
     "DelayedTaskRequest",
     "DelayedTaskRequestPayload",
     "DelayedTaskResponse",
@@ -486,7 +552,22 @@ __all__ = (
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",
     "DeploymentResponseParkedReasonType3Type1",
+    "DiffAppConfigPatch",
+    "DiffAppConfigPatchEvictionPriority",
+    "DiffBreak",
+    "DiffBreakSeverity",
+    "DiffChange",
+    "DiffChangeKind",
+    "DiffEnvRow",
+    "DiffPayload",
+    "DiffPayloadPlan",
+    "DiffRequest",
+    "DiffRequestEnvByScope",
+    "DiffResponse",
+    "DiffResponsePlan",
+    "EdgeRuleBudgetAction",
     "EdgeRuleCORSAction",
+    "EdgeRuleGeoAction",
     "EdgeRuleHeaderOp",
     "EdgeRuleHeaderOpAction",
     "EdgeRuleHeadersAction",
@@ -494,6 +575,8 @@ __all__ = (
     "EdgeRuleJWTAction",
     "EdgeRuleJWTActionAlgorithmsItem",
     "EdgeRuleJWTActionRequiredClaims",
+    "EdgeRuleLimitAction",
+    "EdgeRuleMaintenanceAction",
     "EdgeRuleRedirectAction",
     "EdgeRuleRedirectActionHeaders",
     "EdgeRuleRedirectActionStatusCode",
@@ -501,6 +584,11 @@ __all__ = (
     "EdgeRuleResponseKind",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
+    "EdgeRuleThrottleAction",
+    "EdgeRuleThrottleActionKeyBy",
+    "EdgeRuleValidateAction",
+    "EdgeRuleValidateActionSchema",
+    "FieldError",
     "FireCronRequestResponse",
     "FireCronRequestResponseStatus",
     "FireCronResponse",
@@ -610,6 +698,8 @@ __all__ = (
     "PutAppEnvRequest",
     "PutAppRegistryCredentialRequest",
     "PutAppSecretRequest",
+    "PutDataUpstreamRequest",
+    "PutDataUpstreamRequestKind",
     "QueueDeadLetterMessage",
     "QueueDeadLetterResponse",
     "QueuePeekMessage",
@@ -635,6 +725,7 @@ __all__ = (
     "RotateKeyResponse",
     "RotateOrgAPIKeyRequest",
     "RotateOrgAPIKeyResponse",
+    "RouteRow",
     "ScalingPolicy",
     "ScalingTarget",
     "ScalingTargetMetric",
@@ -643,6 +734,9 @@ __all__ = (
     "ScopedAppEnvResponse",
     "SeatUsageResponse",
     "SeatUsageResponsePlan",
+    "SecretFinding",
+    "SecretFindingSeverity",
+    "SecretScanResult",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",
@@ -662,6 +756,8 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "ThrottleSuggestionRow",
+    "ThrottleSuggestionsResponse",
     "Trace",
     "TraceSpan",
     "TraceSpanAttributes",

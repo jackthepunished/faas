@@ -40,8 +40,10 @@ tags:
     description: Account & billing (self-service, GDPR, plan).
   - name: apps
     description: App lifecycle (create, update, delete, wake, park).
+  - name: deploydiff
+    description: Read-only pre-deploy preview (PR-1 of the deploy-diff cluster).
   - name: edge_rules
-    description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip) per app.
+    description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip, validate, geo) per app.
   - name: deployments
     description: Deployments & build status.
   - name: instances
@@ -115,8 +117,28 @@ tags:
       PATCH /v1/apps/{slug}/security (admin + MFA) flips the
       require_signed flag; trusted_signers CRUD manages the
       per-app cosign trusted-publisher list.
+  - name: tenant-surfaces
+    description: |
+      Tenant hostname groupings (issue #879 / ADR-100). One surface
+      holds N hostnames under one SAN bundle. Soft-deleted surfaces
+      are filtered out of list/get; the cert engine picks up
+      pending-state surfaces via pg_notify('tenant_surface_changed')
+      to mint the cert. Returns 402 when the
+      `FAAS_TENANT_SURFACES_ENABLED` flag is off.
   - name: usage
     description: Usage roll-up and metering.
+  - name: upstreams
+    description: |
+      Customer-managed data upstreams (ADR-098 §9.A / PR-A + B).
+      Each row is an outbound connection the platform probes for
+      RTT before biasing wake-time placement toward the region with
+      the lowest observed latency. The probe loop in meterd dials
+      `host:port` via `crypto/tls.Dial` (never `http.Get`) and
+      records per-region samples in `data_upstream_probes`; the
+      chooser in schedd reads them synchronously at wake via
+      `upstreamAffinity.Score(appID)`. Plaintext host is never
+      emitted on the wire — only the sha256(salt||host) 8-hex
+      prefix appears as a metric label.
   - name: billing
     description: |
       Billing surface (issue #253 / #259). Today: the operator-
@@ -1391,6 +1413,93 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/apps/{slug}/routes:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppRoutes
+      summary: Per-route breakdown for opt-in apps (ADR-093).
+      description: |
+        Returns the `routes` array of the per-app metrics surface
+        directly. Reverse-proxies the gatewayd-internal loopback
+        control listener at `GET /v1/internal/apps/{slug}/routes`.
+        The array is empty when `route_metrics_enabled` is false
+        on the app (the gatewayd handler returns 200 + empty
+        rows rather than 404 — the customer-facing "feature off"
+        state is not a 404). The route label is method + raw
+        path (pre-rewrite, ADR-093 D6); the `__route_other__`
+        bucket surfaces the wildcard-path signal.
+      responses:
+        '200':
+          description: The per-route rows for the app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppRoutesResponse'
+              example:
+                slug: my-api
+                app_id: 11111111-1111-1111-1111-111111111111
+                routes: ["GET /users", "POST /orders", "__route_other__"]
+                source: live
+                cap_hit: true
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/streaming-cap:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppStreamingCap
+      summary: Per-app streaming classification probe (ADR-102 D6).
+      description: |
+        Returns the streaming-status enum (one of `streaming`,
+        `accept-json-downgrade`, `flag-disabled`, `plan-disallows`,
+        `operator-disabled`, `upgrade-bypass`) the gatewayd handler
+        would stamp on the `Streaming-Status` response header for a
+        representative request to this app, plus the effective
+        response-body cap (in bytes) and the per-gate flags.
+
+        The probe is a pure read against the apid cache (the
+        per-account `Plan` and the per-app `streaming_enabled`
+        flag). It does NOT dial gatewayd-internal — the operator
+        opt-in (`FAAS_GATEWAY_STREAMING` env) and per-edge-rule
+        cap override are gatewayd-side state, so `effective_cap_bytes`
+        reflects the plan cap (`cap_kind="plan"`) on every probe.
+        A customer evaluating "will my next request stream?" must
+        consider the operator-side flag separately; the canonical
+        signal is the `Streaming-Status` response header on a real
+        request, not this probe.
+
+        `status=plan-disallows` means the customer's plan tier
+        forbids `streaming_enabled=true`; the CreateApp gate (D5)
+        already returns 403 `CodePlanStreamingNotAllowed` so this
+        row should be unreachable from a properly-validated app,
+        but the probe still reflects the persisted state for
+        audits and pinned-SDK migrations.
+      responses:
+        '200':
+          description: The streaming classification for the app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppStreamingStatus'
+              example:
+                app_id: 11111111-1111-1111-1111-111111111111
+                status: streaming
+                effective_cap_bytes: 104857600
+                plan_cap_bytes: 104857600
+                flag_enabled: true
+                plan_allowed: true
+                cap_kind: plan
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/slo:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -1454,6 +1563,140 @@ paths:
                 requests_total: 4321
                 throttled_total: 0
         '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/errors/summary:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppErrorsSummary
+      summary: Per-app customer-facing automatic error grouping summary (ADR-096 / PR-B).
+      description: |
+        Sentry-style grouped error view scoped to a customer's
+        app. One row per `(account_id, app_id, fingerprint)` over
+        the requested `[since, until]` window, sorted by `count
+        DESC, last_seen_at DESC, fingerprint ASC`. Distinct from
+        `GET /v1/apps/{slug}/slo` (issue #696 / ADR-082) which is
+        the closed-set SLO summary (`1h` / `24h` / `7d`) — the
+        errors summary uses a continuous `[since, until]` window
+        with an explicit RFC3339Nano stamp instead.
+
+        The window is clamped to `AppErrorsWindowMaxHours` (168h).
+        When the clamp fires, `window_clamped` is true so the
+        dashboard can render a "you widened the window past the
+        cap" tile. The endpoint returns 200 with `items: []`
+        when no fingerprints are present in the window — never
+        404. Cross-account slug is a 404 (IDOR-safe; the error
+        is byte-identical to a real "no such app" 404).
+
+        Fingerprints are derived at write time as
+        `sha256(route_template || "\x1f" || http_status ||
+        "\x1f" || error_class)`. The route is the matched
+        template (e.g. `/users/{id}`), NEVER the expanded URL —
+        this is the load-bearing cardinality fix that keeps the
+        top-N bounded.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date-time }
+          description: "RFC3339Nano UTC window start. Defaults to `until - 24h`."
+        - name: until
+          in: query
+          required: false
+          schema: { type: [string, 'null'], format: date-time }
+          description: "RFC3339Nano UTC window end. Defaults to `now()`."
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: "Opaque pagination cursor from the previous response's `next_cursor`. Empty for the first page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+          description: "Page size. Default `AppErrorsSummaryDefaultLimit=20`, capped at `AppErrorsSummaryMaxLimit=100`."
+      responses:
+        '200':
+          description: The grouped error summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppErrorsSummaryResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/errors/{fingerprint}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: fingerprint
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+        description: "64-hex-char SHA-256 fingerprint of the error group; sha256(route_template || 0x1f || status || 0x1f || error_class)."
+    get:
+      tags: [apps]
+      operationId: listAppErrorRequests
+      summary: Per-fingerprint drill-down rows (ADR-096 / PR-B).
+      description: |
+        Cursor-paginated drill-down over the request rows that
+        landed on this fingerprint. Returns 404 when the
+        fingerprint has been purged by the retention cron or
+        never existed; the cross-account slug case is also 404
+        (IDOR-safe byte-identical to a real "no such app" 404).
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: [string, 'null'] }
+          description: "Opaque pagination cursor (received_at, request_id compound). Empty for the first page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+          description: "Page size. Default `AppErrorsSummaryDefaultLimit=20`."
+      responses:
+        '200':
+          description: The drill-down rows (newest-first).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppErrorRequestsResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/errors/{fingerprint}/first:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: fingerprint
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+        description: "64-hex-char SHA-256 fingerprint to inspect; the oldest request row for this group is returned with its redacted headers."
+    get:
+      tags: [apps]
+      operationId: getAppErrorSample
+      summary: Single oldest sample row + redacted headers (ADR-096 / PR-B).
+      description: |
+        Returns the OLDEST request row for the fingerprint plus
+        the redacted `headers_sample` (jsonb-decoded) and the
+        list of `redactions_applied` pattern names so the
+        dashboard can render a "we redacted X / Y / Z" badge.
+        Returns 404 when the fingerprint has been purged.
+      responses:
+        '200':
+          description: The sample row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppErrorSampleResponse'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -1571,6 +1814,90 @@ paths:
           description: |
             githubd unreachable or source-ref tarball fetch failed
             (code: source_ref_unavailable). Retry in ~30s.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/apps/{slug}/diff:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [deploydiff]
+      operationId: diffApp
+      summary: Read-only preview of what a deploy would change.
+      description: |
+        PR-1 of the deploy-diff cluster. Server-side equivalent of
+        `gregale deploy --diff` — runs the same engine (pkg/deploydiff)
+        and returns the same wire shape (DiffResponse).
+
+        Read-only: no DB writes, no audit row, no deployment row. The
+        app-not-found case is 200 with `diff.changes[]` containing a
+        `would_create_app` row + the quota gate firing against the
+        customer's plan — a CI consumer can preview a fresh deploy the
+        same way the CLI does.
+
+        Auth: bearer-key with `apps:read` (or admin). NO MFA on this
+        endpoint, mirroring GET /v1/apps/{slug}/metrics.
+
+        Schema-break detection is text-only in PR-1 (handler / entrypoint
+        / env-key changes → warn-severity Breaks). Structural OpenAPI
+        response-schema diff lands in PR-2.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiffRequest'
+            example:
+              image: ghcr.io/me/api@sha256:abc
+              app_config:
+                ram_mb: 512
+                max_concurrency: 30
+      responses:
+        '200':
+          description: |
+            DiffResponse with `blocking: true` if any break has
+            `severity: "error"`. CI gate input — `jq '.blocking'`
+            collapses to a single bool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiffResponse'
+              example:
+                diff:
+                  slug: api
+                  plan: hobby
+                  changes:
+                    - { field: memory, kind: modify, before: 256, after: 512 }
+                  breaks:
+                    - code: plan_limit_concurrency
+                      severity: error
+                      reason: max_concurrency exceeds plan cap
+                      field: concurrency
+                      observed: 30
+                      limit: 20
+                blocking: true
+                slug: api
+                plan: hobby
+        '400':
+          description: |
+            code: validation_failed. Body is malformed JSON, fails
+            strict-decode, or has a plan lookup error.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            code: forbidden. Caller's bearer key lacks both
+            `apps:read` and admin scope.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: |
+            code: capacity. pkg/state read failed for the baseline
+            builder (deployment / env / crons / edge rules).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -2267,6 +2594,143 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '500': { $ref: '#/components/responses/ServerError' }
 
+  # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ────────────────────────
+  /v1/apps/{slug}/tenant-surfaces:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [tenant-surfaces]
+      operationId: listTenantSurfaces
+      summary: List tenant surfaces on an app.
+      description: |
+        Returns every active tenant surface on the app. Soft-deleted
+        surfaces are filtered out server-side. Returns 402 when the
+        `FAAS_TENANT_SURFACES_ENABLED` flag is off (the cluster ships
+        dark until the cert-engine real-mint ADR lands).
+      responses:
+        '200':
+          description: The active surfaces on the app.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListTenantSurfacesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [tenant-surfaces]
+      operationId: createTenantSurface
+      summary: Add a tenant surface with seed hostnames.
+      description: |
+        The customer-facing surface for issue #879 / ADR-100. One
+        surface holds N hostnames under one SAN bundle. Returns 202
+        (the cert engine has to mint; the surface is in pending/active
+        state).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTenantSurfaceRequest' }
+      responses:
+        '202':
+          description: The new surface (pending active).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id.
+    get:
+      tags: [tenant-surfaces]
+      operationId: getTenantSurface
+      summary: Get one tenant surface.
+      responses:
+        '200':
+          description: The surface + its hostnames.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [tenant-surfaces]
+      operationId: deleteTenantSurface
+      summary: Remove a tenant surface (soft-delete + cascade hostnames).
+      responses:
+        '204': { description: Surface and hostnames removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}/hostnames:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being added to.
+    post:
+      tags: [tenant-surfaces]
+      operationId: addTenantHostname
+      summary: Add a hostname to an existing surface.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddTenantHostnameRequest' }
+      responses:
+        '202':
+          description: The hostname (pending DNS-01 verification).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantHostnameResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: The tenant surface id this hostname is being removed from.
+      - name: hostname
+        in: path
+        required: true
+        schema: { type: string }
+        description: The hostname (lowercased canonical form).
+    delete:
+      tags: [tenant-surfaces]
+      operationId: removeTenantHostname
+      summary: Remove a hostname from a surface.
+      responses:
+        '204': { description: Hostname removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/apps/{slug}/env:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -2369,6 +2833,123 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Data upstreams (ADR-098 §9.A PR-B) ───────────────────────────────────
+
+  /v1/apps/{slug}/upstreams:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [upstreams]
+      operationId: listAppDataUpstreams
+      summary: List data upstreams on an app.
+      description: |
+        Returns every captured (host_redacted_hash, kind, port) tuple
+        on the app. The plaintext host NEVER appears in the response —
+        only the SHA-256 hash of (salt||host). See spec §11.
+
+        The list is bounded by the per-plan `api.DataPlacementHintsPerApp`
+        quota (Free=0, Hobby=3, Pro=10, Scale=50). When FAAS_DATA_PLACEMENT
+        is on the classifier derives entries on env mutation; when OFF
+        the table stays empty and the response is `[]`.
+      responses:
+        '200':
+          description: Captured upstreams on the app (plaintext never returned).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataUpstreamListResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [upstreams]
+      operationId: createAppDataUpstream
+      summary: Add a data upstream to an app.
+      description: |
+        Captures a (host, kind, port) tuple so the meterd probe loop
+        can dial it (PR-C) and schedd can bias wake placement by the
+        probed RTT (PR-D). Plaintext host is hashed via
+        `sha256(HostHashSalt||host)` before insert; the response
+        returns the hashed form only (§11 invariant).
+
+        **Plan limits.** Free plan returns 402
+        `plan_data_upstreams_not_allowed`. Hobby/Pro/Scale hit their
+        per-app cap (3/10/50) before the request body is parsed —
+        server returns 403 `plan_limit_data_upstreams` with the
+        observed count. Invalid inputs return 400
+        `upstream_invalid_{kind,host,port}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutDataUpstreamRequest'
+      responses:
+        '200':
+          description: The stored upstream envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataUpstreamResponse'
+        '400':
+          description: '400 — any of {upstream_invalid_kind, upstream_invalid_host, upstream_invalid_port}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: '402 — plan_data_upstreams_not_allowed (Free plan).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: '403 — plan_limit_data_upstreams (per-app cap exceeded).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/upstreams/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Upstream id (UUID).
+    get:
+      tags: [upstreams]
+      operationId: getAppDataUpstream
+      summary: Get one data upstream.
+      description: |
+        Returns the single upstream row by id. Plaintext host NEVER
+        appears in the response (§11 invariant).
+      responses:
+        '200':
+          description: The upstream envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataUpstreamResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [upstreams]
+      operationId: deleteAppDataUpstream
+      summary: Delete a data upstream.
+      description: |
+        Removes one row by id. Cascades into the probe set
+        (next probe tick no longer dials the host).
+      responses:
+        '204': { description: No body. The upstream was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '404 — upstream_not_found.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   # ─── Deployments ──────────────────────────────────────────────────────────
 
@@ -2603,6 +3184,60 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: Deployment row missing, cross-account probe, or scan has not run yet.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/deployments/{id}/secret-scan:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getDeploymentSecretScan
+      summary: Get per-deploy image-layer secret scan.
+      description: |
+        Returns the per-deploy secret-scan audit row (PR-A /
+        ADR-101). The scan runs on the per-app ext4 in imaged's
+        deploy-complete path (after `SetDeploymentRootfs`, before
+        the pending→snapshotting transition) using the same
+        `pkg/secretscan` engine the apid source-tree rejection
+        path uses — same patterns, same providers, same Severity
+        table, same snippet policy.
+
+        Status field is the closed enum:
+          - `complete` — image layer walked clean; `findings=[]`.
+            Stamped on every scan (clean OR hit) so the dashboard
+            renders the audit row immediately after the build.
+          - `complete_with_redactions` — at least one finding
+            landed in the audit row; `error_code =
+            'image_secret_detected'` on the deployment. The
+            deploy's pending→snapshotting transition does NOT
+            fire.
+
+        A 404 is returned when:
+          - the deployment row does not exist,
+          - the deployment belongs to a different account
+            (IDOR-safe; no account-existence leak),
+          - no scan has run yet (the deploy is still
+            mid-pipeline or the row predates PR-A entirely).
+
+        Each finding carries a `layer` label that attributes the
+        finding to the per-walk source (`app` for the main image,
+        `sidecar-<slug>` for each sidecar). Pre-PR-A rows
+        (rejected source-tree bytes via the v2 422 path) carry
+        `layer` empty or absent.
+      responses:
+        '200':
+          description: The typed secret-scan payload. Shape mirrors the `deployments.secret_findings` jsonb column.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretScanResult'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Deployment row missing, cross-account probe, or secret scan has not been stamped for this deploy yet (pre-PR-A rows return 404 because the `secret_findings` jsonb has never been written).
           content:
             application/problem+json:
               schema:
@@ -2944,6 +3579,26 @@ paths:
   /v1/crons/{id}:
     parameters:
       - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [crons]
+      operationId: getCron
+      summary: Get one cron trigger.
+      description: |
+        Single-row read for one cron (issue #791 PR-E / ADR-090
+        closure). Backs `gregale crons info <id>` and any dashboard
+        drill-down. The wire shape matches `CronResponse` so SDK
+        clients decode it with the existing struct.
+      responses:
+        '200':
+          description: The cron trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CronResponse'
+                example: {"id":"0123456789abcdef0123456789abcdef","app_id":"0123456789abcdef0123456789abcde0","schedule":"*/5 * * * *","path":"/cleanup","enabled":true,"last_fired_at":"2026-08-10T09:00:00Z","created_at":"2026-08-01T12:00:00Z"}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
     patch:
       tags: [crons]
       operationId: updateCron
@@ -3426,10 +4081,11 @@ paths:
       operationId: createEdgeRule
       summary: Create an edge rule on an app.
       description: |
-        Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip}.
-        `action` is a kind-tagged jsonb body — the per-kind shape is
-        documented under components/schemas. Plan-kind gate: jwt/ip
-        return 402 plan_edge_rule_kind_not_allowed on Free. Per-app
+        Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip,
+        validate, geo}. `action` is a kind-tagged jsonb body — the per-kind
+        shape is documented under components/schemas. Plan-kind gate:
+        jwt/ip return 402 plan_edge_rule_kind_not_allowed on Free; geo
+        is allowed on Free with a tighter per-app quota. Per-app
         quota returns 402 plan_limit_edge_rules once EdgeRulesPerApp
         is reached.
       requestBody:
@@ -3512,6 +4168,48 @@ paths:
       responses:
         '204':
           description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/throttle-suggestions:
+    get:
+      tags: [edge_rules]
+      operationId: getAppThrottleSuggestions
+      summary: |
+        Per-route throttle recommender (ADR-091 D20.5 amendment,
+        issue #881). Read-only: returns a suggested rps/burst per
+        route over the window, clamped to the customer's plan
+        ceiling so the suggestion is always settable.
+
+        The recommender is ADVICE-ONLY — it never auto-applies.
+        Customers confirm via POST /v1/apps/{slug}/edge-rules.
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string, maxLength: 40 }
+          description: "App slug (lowercase, kebab-case; per-account unique). The recommender walks the per-route rate() for this app's gatewayd-internal reader."
+        - name: range
+          in: query
+          description: |
+            Prometheus window. Closed vocabulary (see
+            `pkg/appmetrics.Ranges`). Defaults to 5m.
+          schema: { type: string, default: "5m" }
+      security:
+        - bearerAuth: [admin]
+        - bearerAuth: [apps:read]
+      responses:
+        '200':
+          description: |
+            Suggestion payload. Source is `prometheus` on success
+            or `degraded: <reason>` on Prometheus failure
+            (response is still 200 with empty Suggestions — the
+            dashboard's empty-state branch handles it).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ThrottleSuggestionsResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -5344,6 +6042,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Per-tenant GitHub webhook secret rotation (PR-D) ────────────────
+  # Sets the per-tenant override of the platform-wide
+  # FAAS_GITHUB_WEBHOOK_SECRET so a leaked tenant secret can rotate
+  # without coordinating every GitHub App install. The daemon
+  # resolver at pkg/githubd/webhook_secret.go reads the per-tenant
+  # row first and falls back to the platform secret only on a
+  # missing row. Two-layer auth: admin scope + FAAS_ADMIN_EMAILS
+  # email allowlist (same gate as /v1/admin/accounts/{id}/credits).
+  /v1/admin/github-webhook-secrets:
+    post:
+      tags: [admin]
+      operationId: setGithubWebhookSecret
+      summary: Set the per-tenant GitHub App webhook secret (admin-only).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminSetGithubWebhookSecretRequest' }
+      responses:
+        '201':
+          description: Secret persisted. The new upgraded_at/upgraded_by are returned for the audit trail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminSetGithubWebhookSecretResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Code admin_required — admin-scoped Bearer + email in FAAS_ADMIN_EMAILS allowlist. PR-D widens the scope to cover per-tenant webhook secret rotation; the table-level pg_notify side-effect (installation_id) is intentional and consumed by githubd.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Operator credit consumption (issue #279 PR-C) ─────────────────────
   # Admin-only + MFA-gated. Triggers the FIFO credit consumption
   # reducer against an invoice's overage in integer cents (CLAUDE.md).
@@ -6990,6 +7721,27 @@ components:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."
           type: boolean
           example: false
+        # ADR-093: per-route observability opt-in. Default-on for
+        # Hobby/Pro/Scale; Free customers always see this as false.
+        # PATCH-true on Free is rejected with 403
+        # plan_route_metrics_not_allowed.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). When true, gatewayd-internal emits gateway_request_duration_seconds{app,route,class} and serves the bounded reader at GET /v1/apps/{slug}/routes. Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
+          type: boolean
+          example: false
+        # ADR-091 amendment: apps.maintenance_mode is the
+        # coarse-grained "whole app in maintenance" toggle. When
+        # true the gatewayd-internal hot-path short-circuits
+        # every request to this app with 503 + Retry-After BEFORE
+        # auth, BEFORE wake (the coarse gate beats per-route
+        # kind=maintenance rules). Free-tier allowed (no
+        # IsPaidOnly change). The apps_maintenance_mode_notify
+        # trigger (migration 00237) fires pg_notify on flip so
+        # the gatewayd apps LRU cache stays fresh.
+        maintenance_mode:
+          description: "Coarse per-app maintenance toggle (ADR-091 amendment). When true the gatewayd-internal hot-path short-circuits every request to this app with 503 + Retry-After (default 60 s) BEFORE auth, BEFORE wake, BEFORE any kind=maintenance edge rule. Free-tier allowed. Surfaced in the GET /v1/apps/{slug} response so dashboards can show 'maintenance on / off' alongside the streaming/WS pills."
+          type: boolean
+          example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
         # Nullable: legacy rows project as `null` (the empty
         # policy falls back to the legacy min_instances /
@@ -7111,6 +7863,25 @@ components:
           format: uuid
           example: "00000000-0000-0000-0000-000000000000"
 
+        # CORS improvements D1: per-app default CORS opt-in.
+        # NULL on legacy rows (the customer's apps predated
+        # migration 00223). Non-null true means the gateway is
+        # stamping the default header set on miss; non-null
+        # false means the customer explicitly opted out (the
+        # column was flipped from the schema default).
+        cors_default_enabled:
+          type: [boolean, "null"]
+          example: true
+
+        # CORS improvements D1: per-app default CORS allowlist.
+        # NULL/empty on legacy rows. Wire shape is JSON `[]`
+        # (never null) when the column carries a value so
+        # dashboards can render the list directly.
+        cors_default_origins:
+          type: array
+          items: { type: string }
+          example: ["https://*.example.com"]
+
         # Issue #477 / ADR-077: per-app public-URL auth
         # configuration. Mirrors the read-side
         # PublicAuthStatus shape — `has_basic_creds` is true
@@ -7156,6 +7927,22 @@ components:
         # rejected with 403 plan_websocket_not_allowed.
         websocket_enabled:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → apid applies the plan default; PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."
+          type: boolean
+          example: false
+        # ADR-093: optional at create-time. Omitted → apid applies
+        # the plan default (Free = false; Hobby/Pro/Scale = true).
+        # PATCH-true on Free is rejected with 403
+        # plan_route_metrics_not_allowed.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). Omitted → apid applies the plan default (Free = false; Hobby/Pro/Scale = true). PATCH-true on Free is rejected by apid with 403 plan_route_metrics_not_allowed."
+          type: boolean
+          example: false
+        # ADR-091 amendment: optional at create-time. Omitted →
+        # apid applies the default (false). Free-tier allowed; no
+        # plan gate. Flipping this on a Hobby/Pro/Scale app flips
+        # every request to 503 + Retry-After (60 s).
+        maintenance_mode:
+          description: "Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → apid applies the default (false). Free-tier allowed; no plan gate. Flipping this on at create time pins the app for maintenance from the first request."
           type: boolean
           example: false
         # Issue #470 / ADR-055: optional at create-time. Omitted
@@ -7274,6 +8061,24 @@ components:
           description: "Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → no change. Free PATCHing true is 403 plan_websocket_not_allowed."
           type: [boolean, "null"]
           example: false
+        # ADR-093: partial-update nullable boolean. Omitted → no
+        # change. Plan gate runs first (403
+        # plan_route_metrics_not_allowed) so a Free PATCHing true
+        # surfaces the gate.
+        route_metrics_enabled:
+          description: "Per-app per-route observability flag (ADR-093). Omitted → no change. Free PATCHing true is 403 plan_route_metrics_not_allowed."
+          type: [boolean, "null"]
+          example: false
+        # ADR-091 amendment: partial-update nullable boolean.
+        # Omitted → no change. Free-tier allowed; no plan gate.
+        # PATCH true → every request to this app 503 + Retry-After.
+        # PATCH false → app returns to normal request handling.
+        # The apps_maintenance_mode_notify trigger fires pg_notify
+        # on flip so the gatewayd apps LRU cache stays fresh.
+        maintenance_mode:
+          description: "Coarse per-app maintenance toggle (ADR-091 amendment). Omitted → no change. PATCH true pins the app for maintenance (every request 503 + Retry-After); PATCH false restores normal handling. Free-tier allowed; no plan gate. The apps_maintenance_mode_notify trigger (migration 00237) fires pg_notify on flip."
+          type: [boolean, "null"]
+          example: false
         # Issue #462 / ADR-058 (PR-A): per-app scaling policy.
         # Omitted → no change. Non-null → atomic full-overwrite
         # of the jsonb column `apps.scaling_policy` (the
@@ -7382,6 +8187,31 @@ components:
           description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist the UUID. 404 on unknown name; 422 on inactive node."
           type: [string, "null"]
           example: "box-eu-1"
+
+        # CORS improvements D1: per-app default CORS opt-in. When
+        # true, every response is stamped with a CORS header set
+        # derived from cors_default_origins whenever no explicit
+        # kind=cors edge rule matches. nil = no change (existing
+        # PATCH semantics); explicit true opts in; explicit false
+        # opts out. The Set-bit in UpdateAppParams distinguishes
+        # "unset" from "explicit flip" so partial-PATCH stays
+        # bit-for-bit additive on the wire.
+        cors_default_enabled:
+          type: [boolean, "null"]
+          example: true
+
+        # CORS improvements D1: per-app default CORS allowlist.
+        # Same grammar as EdgeRuleCORSAction.allow_origins
+        # (literal origin, https://*.host subdomain wildcard,
+        # https://host:* port wildcard, or '*'). When
+        # cors_default_enabled is true the validator requires a
+        # non-empty value (a 422 fires otherwise - silently
+        # accepting an empty allowlist would leave the customer
+        # with an opt-in flag that stamps nothing).
+        cors_default_origins:
+          type: array
+          items: { type: string }
+          example: ["https://*.example.com"]
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -7607,6 +8437,37 @@ components:
           maximum: 100
           description: "Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by construction."
           example: 100
+        # ADR-091 / PR-D: per-deployment env scope. The deployment
+        # declares which named env scope its wake reads (default
+        # / staging / prod / ...). Empty or omitted → handler
+        # defaults to `default`. Pattern matches the schema-layer
+        # CHECK (deployments_scope_shape) at migration 00213. Two
+        # live deployments on the same (app_id, scope) → 409
+        # deployment_scope_collision.
+        scope:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          description: "Per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`."
+          example: "staging"
+        secret_scan:
+          oneOf:
+            - $ref: '#/components/schemas/SecretScanResult'
+            - type: 'null'
+          description: |
+            Per-deploy secret-scan audit row (PR-A / ADR-101). Mirrors
+            the `scan` field shape — absent when the row has not been
+            scanned yet (deploy mid-pipeline or pre-PR-A), present
+            with `findings=[]` for a clean walk, present with
+            one-or-more entries for a hit. Read by the dashboard's
+            "secret scan" card and the CLI's `--show-secret-scan`
+            flag. Stamped both for the imaged-side layer walk (main
+            image + each sidecar; post-build, loud-fail on any
+            finding) and — forward-compat — for the apid-side
+            source-tree 422 path. Status closed-set the writer
+            stamps: "complete" (clean) | "complete_with_redactions"
+            (hit). The `image_digest` sub-field records which OCI
+            digest the imaged walk ran against; null on legacy
+            pre-PR-A rows. See `pkg/imaged/secretscan.go`.
 
     UpdateDeploymentRequest:
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
@@ -7994,6 +8855,33 @@ components:
         created_at:     { type: string, format: date-time }
         expires_at:     { type: [string, "null"], format: date-time }
 
+    AdminSetGithubWebhookSecretResponse:
+      description: |
+        Response shape for POST /v1/admin/github-webhook-secrets
+        (PR-D / ADR-012 §7 amendment). upgraded_at is the
+        post-upsert stamp — every successful call bumps it
+        (the audit trail; an operator re-running with the same
+        secret is itself a rotation event worth recording).
+      type: object
+      required: [installation_id, upgraded_at, upgraded_by]
+      properties:
+        installation_id: { type: integer, format: int64, minimum: 1 }
+        upgraded_at:     { type: string,  format: date-time }
+        upgraded_by:     { type: string,  description: 'admin:<account_id> or platform' }
+
+    AdminSetGithubWebhookSecretRequest:
+      description: |
+        Body shape for POST /v1/admin/github-webhook-secrets
+        (PR-D / ADR-012 §7 amendment). The CLI takes hex so the
+        plaintext never has to be a binary argv value; the apid
+        handler hex-decodes before the INSERT.
+      type: object
+      required: [installation_id, secret_hex]
+      properties:
+        installation_id: { type: integer, format: int64, minimum: 1, description: 'GitHub App installation_id (positive bigint).' }
+        secret_hex:      { type: string,  minLength: 32, maxLength: 128, description: 'Hex-encoded secret (16..64 bytes; 32..128 hex chars).' }
+
+
     ConsumeInvoiceResponse:
       description: |
         Returned by POST /v1/invoices/{id}/consume-credits (issue
@@ -8075,6 +8963,17 @@ components:
           maximum: 100
           description: "Per-deployment traffic-split weight (issue #556 PR-A). nil = server default 100; explicit 0..100 = opt into canary (Pro/Scale only)."
           example: 10
+        # ADR-091 / PR-D: per-deployment env scope. The deployment
+        # declares which named env scope its wake reads. Empty
+        # / omitted → `default` (handler seam). The schema-layer
+        # CHECK (deployments_scope_shape) at migration 00213
+        # enforces the slug regex; duplicate live rows on the
+        # same (app_id, scope) → 409 deployment_scope_collision.
+        scope:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          description: "Top-level per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = `default`."
+          example: "prod"
 
     CreateDeploymentOverrides:
       description: |
@@ -8144,6 +9043,16 @@ components:
             `plan_liveness_probe_not_allowed` BEFORE the DB is touched); Hobby,
             Pro, Scale inherit the 5 s / 3 consecutive / 60 s cooldown / 3 in 300 s
             defaults. v1 is HTTP-only; gRPC health checks are deferred to v2.
+        # ADR-091 / PR-D: per-deployment env scope on the override
+        # object (alternative to the top-level `scope` field). Same
+        # regex + behaviour as the top-level CreateDeploymentRequest.
+        # nil/omitted → inherits the top-level scope or `default`
+        # if both are absent.
+        scope:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+          description: "Override-object per-deployment env scope (ADR-091 / PR-D). Lowercase alnum + dash, 3..40 chars, no leading/trailing dash. nil/omitted = inherit top-level scope or `default`."
+          example: "staging"
 
     DeploymentHealthcheck:
       description: |
@@ -8407,6 +9316,68 @@ components:
         domain: { type: string , example: "app.example.com"}
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
 
+    # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ──────────────────────
+
+    TenantSurfaceResponse:
+      description: "A tenant surface: a multi-hostname SAN bundle attached to one app."
+      type: object
+      required: [id, account_id, app_id, name, cert_kind, status, cert_state, hostnames]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        name: { type: string, example: "customer-zones" }
+        cert_kind: { type: string, enum: [per_host_san] }
+        status: { type: string, enum: [pending, active, suspended, deleted] }
+        cert_state: { type: string, enum: [none, pending, issued, renewing, failed] }
+        cert_not_after: { type: string, format: date-time }
+        cert_last_error: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        hostnames:
+          type: array
+          items: { $ref: '#/components/schemas/TenantHostnameResponse' }
+
+    TenantHostnameResponse:
+      description: "A hostname attached to a tenant surface (DNS-01 verified)."
+      type: object
+      required: [hostname, verified, txt_record]
+      properties:
+        hostname: { type: string, example: "api.customer-a.com" }
+        challenge_token: { type: [string, "null"] }
+        verified: { type: boolean }
+        verified_at: { type: [string, "null"], format: date-time }
+        last_error: { type: [string, "null"] }
+        txt_record: { type: string, description: "TXT record the customer must publish (_faas-verify.<hostname>)." }
+
+    CreateTenantSurfaceRequest:
+      description: "Create a tenant surface with a seed set of hostnames."
+      type: object
+      required: [app_id, name]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        name: { type: string, example: "customer-zones" }
+        cert_kind: { type: string, enum: [per_host_san] }
+        hostnames:
+          type: array
+          items: { type: string, example: "api.customer-a.com" }
+
+    ListTenantSurfacesResponse:
+      description: "Surfaces on the app (soft-deleted excluded server-side)."
+      type: object
+      required: [surfaces]
+      properties:
+        surfaces:
+          type: array
+          items: { $ref: '#/components/schemas/TenantSurfaceResponse' }
+
+    AddTenantHostnameRequest:
+      description: "Append a hostname to an existing surface."
+      type: object
+      required: [hostname]
+      properties:
+        hostname: { type: string, example: "api.customer-c.com" }
+
     # ─── Crons ────────────────────────────────────────────────────────────
 
     CronResponse:
@@ -8567,6 +9538,151 @@ components:
           enum: [tarball]
           default: tarball
           description: "Forward-compat field. PR-A only supports `tarball`."
+
+    DiffRequest:
+      description: |
+        JSON body for POST /v1/apps/{slug}/diff (PR-1). Slim
+        purpose-built DTO — every field maps 1:1 to a
+        [deploydiff.Pending] entry via the apid handler's adapter.
+        Empty / absent fields mean "no change proposed" (matches
+        the engine's pointer semantics: every nested field is
+        optional; null = "don't touch").
+      type: object
+      properties:
+        app_config:
+          $ref: '#/components/schemas/DiffAppConfigPatch'
+        image:
+          type: string
+          description: |
+            Would-write image reference. Empty = no image deploy
+            proposed. Compared against the baseline's
+            DeploymentResponse.ImageDigest for the immutable-diff
+            check.
+          example: ghcr.io/me/api@sha256:abc
+        manifest:
+          $ref: '#/components/schemas/AppManifest'
+        env_by_scope:
+          type: object
+          description: |
+            Per-scope env write. Full-replacement semantics per
+            scope (ADR-090 D3). Keys are scope names ("default",
+            "staging", ...); values are DiffEnvRow arrays.
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/DiffEnvRow' }
+        crons:
+          type: array
+          items: { $ref: '#/components/schemas/CreateCronRequest' }
+        edge_rules:
+          type: array
+          items: { $ref: '#/components/schemas/CreateEdgeRuleRequest' }
+
+    DiffAppConfigPatch:
+      description: |
+        Per-app scalar patch. Pointer-aware: nil = "don't touch";
+        explicit zero / explicit value = "set to this". Matches
+        [UpdateAppRequest] semantics but exposes only the fields
+        the engine computes against (no ScalingPolicy /
+        PublicAuth / OverflowNode).
+      type: object
+      properties:
+        ram_mb: { type: integer, minimum: 128, maximum: 10240 }
+        idle_timeout_s: { type: integer, minimum: 30, maximum: 600 }
+        max_concurrency: { type: integer, minimum: 1, maximum: 200 }
+        min_instances: { type: integer, minimum: 0, maximum: 10 }
+        egress_allowlist:
+          type: array
+          items: { type: string }
+        autoscale_target_rps: { type: integer, minimum: 1, maximum: 10000 }
+        autoscale_target_cpu_pct: { type: integer, minimum: 1, maximum: 100 }
+        streaming_enabled: { type: boolean }
+        websocket_enabled: { type: boolean }
+        require_signed: { type: boolean }
+        warm_snapshot_enabled: { type: boolean }
+        require_authn: { type: boolean }
+        eviction_priority: { type: string, enum: [normal, batch, latency] }
+
+    DiffEnvRow:
+      description: |
+        One would-write env var. Value carries plaintext so the
+        quota gate's per-value byte cap can fire (the wire's list
+        path never echoes values per ADR-053 §Decision 4).
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 64 }
+        value: { type: string, maxLength: 8192 }
+
+    DiffChange:
+      description: |
+        One diff row. Polymorphic values (Before / After) re-emitted
+        as JSON objects — the engine emits primitives, slices, or
+        structs depending on the field.
+      type: object
+      required: [field, kind]
+      properties:
+        field: { type: string, description: "Human path: 'memory', 'concurrency', 'environment.<scope>.<key>', 'cron[<schedule> <path>]', 'edge_rule[<kind> <host><path>]'" }
+        kind: { type: string, enum: [add, remove, modify] }
+        before: { description: "Primitive value (int / string / bool / []string) — JSON-encoded. Omitted on Add." }
+        after:  { description: "Primitive value — JSON-encoded. Omitted on Remove." }
+
+    DiffBreak:
+      description: |
+        One would-ship-a-problem row. Stable RFC 7807 code
+        (matches [api.Code*] constants) so the CLI error renders
+        identically to what a real deploy would say.
+      type: object
+      required: [code, severity, reason]
+      properties:
+        code: { type: string, description: "Stable RFC 7807 code; matches api.Code* constants" }
+        severity: { type: string, enum: [error, warn] }
+        reason: { type: string }
+        field: { type: string, description: "Optional scope-wide ('memory') or per-row ('environment.<scope>.<key>')." }
+        observed: { description: "JSON-encoded observed value (int / string / []string / …)." }
+        limit:    { description: "JSON-encoded limit value." }
+
+    DiffPayload:
+      description: |
+        Inner diff object the engine produces. Slug + Plan +
+        Changes + Breaks. Wrapped by [DiffResponse] so a CI
+        consumer reading `.diff.changes` and a CLI consumer
+        reading the top-level keys agree.
+      type: object
+      required: [slug, changes, breaks]
+      properties:
+        slug: { type: string }
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
+          description: "Customer's subscription tier (echoed from acct.Plan)."
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/DiffChange' }
+        breaks:
+          type: array
+          items: { $ref: '#/components/schemas/DiffBreak' }
+
+    DiffResponse:
+      description: |
+        Wire envelope for POST /v1/apps/{slug}/diff and
+        `gregale deploy --diff --json`. Wraps the [DiffPayload]
+        plus the Blocking bit so a CI consumer doesn't have to
+        re-scan Breaks and pick the max severity.
+      type: object
+      required: [diff, blocking, slug]
+      properties:
+        diff: { $ref: '#/components/schemas/DiffPayload' }
+        blocking:
+          type: boolean
+          description: |
+            True if any break has severity "error". Mirrors
+            [pkg/deploydiff.Diff.HasBlockingBreaks]. The exit-1
+            input for CI gates.
+        slug: { type: string }
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
+          description: "Echoed at top level too — kept in sync with diff.plan."
 
     ProjectApplyRequest:
       description: |
@@ -8936,7 +10052,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged union — shape varies by `kind`.'
           oneOf:
@@ -8947,6 +10063,12 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+            - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
+            - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -8964,7 +10086,7 @@ components:
         enabled: { type: boolean, default: true }
         kind:
           type: string
-          enum: [route, rewrite, redirect, headers, cors, jwt, ip]
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance, geo, throttle, budget]
         action:
           description: 'Kind-tagged action body — shape depends on `kind`.'
           oneOf:
@@ -8975,6 +10097,12 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+            - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
+            - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
 
     UpdateEdgeRuleRequest:
       description: 'Partial update — every field optional. Kind is not patchable.'
@@ -8997,6 +10125,12 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
             - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
             - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+            - { $ref: '#/components/schemas/EdgeRuleValidateAction' }
+            - { $ref: '#/components/schemas/EdgeRuleLimitAction' }
+            - { $ref: '#/components/schemas/EdgeRuleMaintenanceAction' }
+            - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
+            - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
+            - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
 
     EdgeRuleRouteAction:
       description: 'Re-targets the matched request to another app owned by the same account.'
@@ -9054,10 +10188,22 @@ components:
       type: object
       required: [allow_origins, allow_methods]
       properties:
+        # CORS improvements D2/D6: allow_origins accepts the
+        # wildcard grammar documented on CorsOriginPattern
+        # in pkg/api/dto.go. Bare '*', literal origin
+        # 'https://host[:port]', subdomain wildcard
+        # 'https://*.host[:port]', and port wildcard
+        # 'https://host:*'. The pattern is the create-time
+        # gate; the gateway hot path runs the same predicates
+        # in matchOrigin so a rule that bypasses apid-Validate
+        # still matches what the customer expects (defence in
+        # depth).
         allow_origins:
           type: array
           minItems: 1
-          items: { type: string }
+          items:
+            type: string
+            pattern: '^(\\*|https?://(?:\\*\\.[a-zA-Z0-9.\\-]+|localhost)(?::\\*|\\:[0-9]+)?|https?://[a-zA-Z0-9.\\-]+(?::\\*|\\:[0-9]+)?)$'
         allow_methods:
           type: array
           minItems: 1
@@ -9069,7 +10215,11 @@ components:
           type: array
           items: { type: string }
         allow_credentials: { type: boolean, default: false }
-        max_age_seconds: { type: integer, minimum: 0 }
+        # CORS improvements D6: capped at 86400 (24h).
+        # Browsers ignore larger values; the gateway was
+        # happily stamping Access-Control-Max-Age: 2147483647
+        # before the cap. The lower bound is unchanged (>= 0).
+        max_age_seconds: { type: integer, minimum: 0, maximum: 86400 }
 
     EdgeRuleJWTAction:
       description: 'Validates an inbound Bearer JWT against a JWKS endpoint.'
@@ -9105,6 +10255,364 @@ components:
         deny:
           type: array
           items: { type: string, format: cidr }
+
+    EdgeRuleValidateAction:
+      description: |
+        Customer-supplied JSON Schema (Draft 2020-12) evaluated against
+        the inbound request body BEFORE the wake gate fires. The
+        kind=validate rule is the platform's API-native request-
+        validation surface: rejections return 422
+        `request_validation_failed` with `Problem.errors` carrying
+        per-field detail, never pay a cold-boot cost, never consume
+        the rate-limit / wake-quota budget on malformed traffic.
+
+        Free-and-above (no plan gate). Schema lives inline in the
+        `action` jsonb blob (single-table flow), capped at the
+        platform's `MaxEdgeRuleValidateSchemaBytes` (64 KiB). The
+        gateway re-validates at compile time as defence-in-depth so
+        the SQL hotfix path that bypasses apid-Validate still cannot
+        ship an external `$ref`.
+
+        Field-by-field:
+          * `schema` — required JSON Schema document (Draft 2020-12).
+            Capped at 64 KiB. External `$ref` / `$id` URLs are
+            rejected at create-time; internal pointers (`#/definitions/Foo`)
+            pass through.
+          * `content_types` — optional media-type allowlist.
+            Closed set `application/*`. Empty = match any.
+          * `apply_while_streaming` — per-rule opt-in for the
+            streaming response path (ADR-047). Default false mirrors
+            the §4.1 `Accept: application/json` opt-out.
+          * `reject_on_unknown_fields` — toggles
+            `additionalProperties: false` on the compiled schema.
+            Default false preserves byte-stable schemas.
+          * `max_body_bytes` — per-rule inbound body cap. 0 =
+            inherit `MaxRequestBodyBytes` (per-plan 25 MB buffered /
+            100 MB streaming). Must be > 0 and <= `MaxRequestBodyBytes`.
+      type: object
+      required: [schema]
+      properties:
+        schema:
+          type: object
+          description: |
+            Inline JSON Schema document (Draft 2020-12). The schema
+            is preserved byte-exact across apid↔gatewayd round-trips
+            so the SHA-256 cache key in `pkg/edgevalidate` is stable.
+          additionalProperties: true
+        content_types:
+          type: array
+          description: |
+            Optional media-type allowlist. Every entry must start
+            with `application/`. Empty array = match any Content-Type.
+          items: { type: string }
+        apply_while_streaming:
+          type: boolean
+          description: |
+            Whether validation fires on the streaming response path
+            (ADR-047). Default false; set true per-rule to opt the
+            SSE / chunked response path into body validation.
+        reject_on_unknown_fields:
+          type: boolean
+          description: |
+            Toggles `additionalProperties: false` on the compiled
+            schema. Default false so a body with stray fields does
+            not silently fail; opt in per-rule for strict schemas.
+        max_body_bytes:
+          type: integer
+          minimum: 0
+          description: |
+            Per-rule inbound body cap. 0 (default) inherits the
+            platform cap (`api.MaxRequestBodyBytes`). When set, must
+            be > 0 and <= the platform cap.
+
+    EdgeRuleLimitAction:
+      description: |
+        Standalone per-route body-size cap (ADR-091 D24 / §4.1.2.13).
+        The primitive for "POST /upload ≤ 5 MB, POST /users ≤ 1 MB,
+        POST /webhooks ≤ 2 MB" without shipping a JSON Schema. The
+        hot-path applier (§4.1.2.8c) installs `http.MaxBytesReader`
+        on the inbound body and short-circuits oversize requests
+        with 413 `request_too_large` — and, more importantly,
+        performs a Content-Length fast-path deny so a 30 MB body on
+        a 5 MB cap costs zero bytes of buffering (a `MaxBytesReader`
+        alone only trips when something reads the body, and on this
+        hot path nothing reads it until the proxy leg).
+
+        Rejections never reach the wake gate, the auth chain, or the
+        rate limiter — same posture as kind=validate. Free-and-above
+        (no plan gate).
+
+        Field-by-field:
+          * `max_body_bytes` — required buffered-path cap. Must be
+            > 0 and ≤ `MaxRequestBodyBytes` (25 MiB). A standalone
+            limit rule with no cap is a silent no-op and is
+            rejected at create-time with 422 — use `kind=validate`
+            if you need a body cap alongside a JSON Schema.
+          * `max_body_bytes_streaming` — optional streaming opt-in
+            cap (≤ `MaxEdgeRuleLimitBodyBytesStreaming` = 100 MiB).
+            0 (default) = no streaming carve-out; the buffered
+            `max_body_bytes` is the cap on both paths. When set,
+            must be ≥ `max_body_bytes` — a streaming cap tighter
+            than the buffered cap would 413 every streaming request
+            for a body already accepted as buffered. Runtime
+            enforcement of this field is declared + clamped at
+            create-time but deferred at the §4.1.2.8c slot to a
+            follow-up PR (stated in ADR-091 D24 §6).
+      type: object
+      required: [max_body_bytes]
+      properties:
+        max_body_bytes:
+          type: integer
+          minimum: 1
+          maximum: 26214400  # 25 MiB = MaxRequestBodyBytes
+          description: |
+            Required per-rule buffered-path body cap. Must be > 0
+            and ≤ `api.MaxRequestBodyBytes` (25 MiB). A standalone
+            limit rule with no cap is rejected at create-time with
+            422 — use `kind=validate` if you need a body cap
+            alongside a JSON Schema.
+        max_body_bytes_streaming:
+          type: integer
+          minimum: 1
+          maximum: 104857600  # 100 MiB = RawStreamMaxRequestBytes
+          description: |
+            Optional streaming opt-in cap. 0 (default) = no
+            streaming carve-out; the buffered `max_body_bytes` is
+            the cap on both paths. Must be ≥ `max_body_bytes` when
+            set. Runtime enforcement deferred to follow-up PR
+            (ADR-091 D24 §6).
+
+    EdgeRuleMaintenanceAction:
+      description: |
+        Per-route maintenance toggle (ADR-091 amendment, §4.1.2.13).
+        The fine-grained primitive for "this endpoint is in
+        maintenance mode" — the hot-path applier
+        (pkg/gateway.(*Handler).applyEdgeRuleMaintenance) short-
+        circuits a matched (host, path, http_method) request with
+        503 + Retry-After BEFORE auth, BEFORE wake. The coarse
+        sibling (`apps.maintenance_mode`, PATCH /v1/apps/{slug})
+        covers the "whole app in maintenance" case; use this kind
+        when only specific routes need to be pinned.
+
+        Field-by-field:
+          * `retry_after_seconds` — optional per-rule override for
+            the `Retry-After` header. 0 (default) = use the
+            platform default
+            `api.EdgeRuleMaintenanceRetryAfterSeconds` (60 s).
+            Must be in `[0, 86400]` (24 h, enforced by
+            `api.MaxEdgeRuleMaintenanceRetryAfterSeconds`); a
+            customer cannot ship a rule that asks a client to
+            back off for a week.
+          * `message` — optional operator-friendly string that
+            goes into `Problem.detail`. ≤ 512 B (same payload-
+            size budget as `EdgeRuleValidateAction.schema`).
+            Surface this on the customer's status page or in a
+            dashboard alert so operators see why the endpoint is
+            dark without scraping the rule row.
+
+        Free-and-above (no plan gate). Mirror the validate /
+        limit posture: rejection never reaches the wake gate, the
+        auth chain, or the rate limiter.
+      type: object
+      properties:
+        retry_after_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400  # 24h = MaxEdgeRuleMaintenanceRetryAfterSeconds
+          description: |
+            Optional per-rule Retry-After override in seconds.
+            0 (default) = use the platform default
+            `api.EdgeRuleMaintenanceRetryAfterSeconds` (60 s).
+            Must be in `[0, 86400]` (24 h); values above 86400 are
+            rejected at create-time with 422.
+          example: 0
+        message:
+          type: string
+          maxLength: 512
+          description: |
+            Optional operator-friendly detail string that goes into
+            `Problem.detail`. ≤ 512 B. Surface this on the
+            customer's status page so monitoring / curl users see
+            why the endpoint is dark.
+          example: "Rolling out v2; back at 14:00 UTC."
+
+    EdgeRuleGeoAction:
+      description: |
+        ISO 3166-1 alpha-2 country allow/deny evaluator (ADR-091
+        D21 / §4.1.2.8b). Mirrors `EdgeRuleIPAction` exactly: `allow`
+        and `deny` are parallel ISO 3166-1 alpha-2 country-code
+        lists; the matcher walks deny AFTER allow so a single-country
+        deny wins even when the allow list is broad.
+
+        The match port is `gatewayd-internal` which consults a
+        DB-IP Lite `.mmdb` file at request time to translate the
+        trusted XFF client IP into a country code. Plan-tier quota
+        is enforced at apid-create time via `Limits.EdgeRulesGeoPerApp`
+        (Free=1, Hobby=5, Pro=25, Scale=100) inside the same apps-row
+        FOR UPDATE lock as the general edge-rule cap. Geo is NOT in
+        IsPaidOnly — Free customers get one rule before they upgrade.
+
+        Failure posture is fail-open: missing `.mmdb`, IP not in
+        any country, RFC1918/bogon, or corrupt file → the rule does
+        not fire → the request flows through. The
+        `gateway_edge_rule_match_total{kind="geo",result="failed"}`
+        counter increments and an `edge_rule.geo_failed` audit event
+        emits.
+      type: object
+      properties:
+        allow:
+          type: array
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the allowlist." }
+          description: "ISO 3166-1 alpha-2 country allowlist. Empty + deny non-empty = deny-only. Empty + deny empty = no-op (create-time 422)."
+        deny:
+          type: array
+          items: { type: string, pattern: '^[A-Z]{2}$', description: "ISO 3166-1 alpha-2 country code for the denylist." }
+          description: "ISO 3166-1 alpha-2 country denylist. Evaluated AFTER allow; single-country deny wins."
+    EdgeRuleThrottleAction:
+      description: |
+        Per-route token-bucket cap (ADR-091 D20.5 amendment,
+        issue #881). Customers tighten the per-route rps/burst
+        below their plan's `plan.RateLimitRPS` — the apid
+        validator enforces the sub-plan ceiling; the gateway
+        compiler enforces it again at load time.
+
+        Sub-plan ceiling — the load-bearing constraint. A
+        throttle rule is STRICTLY a tightening primitive. A
+        rule that exceeds the ceiling is rejected with 422
+        BEFORE any DB write — a customer cannot raise their
+        plan limit by registering a throttle rule.
+
+        Per-IP sub-keying is deliberately absent in v1 — see
+        the package doc on `pkg/state.EdgeRuleThrottleAction`
+        for the design rationale (memory-bounded limiter +
+        attacker-controlled IP cardinality = unbounded bucket
+        growth).
+
+        Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881
+        Phase 3) extends the wire shape with optional per-consumer
+        keying. Default values (`""` for key_by, omitted
+        jwt_claim_name, 0 for max_keys_per_rule) preserve PR
+        #887's behaviour bit-for-bit. See ADR-104 for the policy
+        and `pkg/gateway/ratelimit.go::AllowWithConsumerKey`
+        (Phase 3) for the run-time semantics.
+      type: object
+      required: [requests_per_second, burst]
+      properties:
+        requests_per_second:
+          type: number
+          format: double
+          minimum: 0.01
+          description: |
+            Token-bucket refill rate per route. The apid
+            validator rejects rps > plan.RateLimitRPS with a
+            422. The gateway compiler clamps + warns on the
+            same bound at load time.
+          example: 50
+        burst:
+          type: integer
+          minimum: 1
+          description: |
+            Token-bucket burst per route. Mirrors rps: rejected
+            above `plan.RateLimitBurst` at create time and
+            clamped at compile time.
+          example: 200
+        key_by:
+          type: string
+          enum: ["", "none", "api_key", "jwt_subject", "jwt_claim"]
+          default: ""
+          description: |
+            Per-consumer keying dimension (ADR-104 / issue #881
+            Phase 3). When `""` or `"none"`, the bucket is shared
+            across every caller of the route (PR #887 shape).
+            When `"api_key"`, one bucket per authenticated API
+            key. When `"jwt_subject"`, one bucket per JWT `sub`.
+            When `"jwt_claim"`, one bucket per value of the
+            claim named by `jwt_claim_name`. Each non-empty
+            value activates the bounded design: when the
+            per-rule consumer set exceeds
+            `max_keys_per_rule`, all over-cap callers collapse
+            into a single non-evicting `__other__` bucket that
+            still consumes tokens (the load-bearing safety
+            property — see ADR-104 §"Consequences").
+          example: "api_key"
+        jwt_claim_name:
+          type: string
+          pattern: '^[a-zA-Z_][a-zA-Z0-9_]{0,63}$'
+          description: |
+            Required iff `key_by="jwt_claim"`. Names the JWT
+            custom claim to extract (e.g., `"tier"`,
+            `"org_id"`). Format is a CodeQL safe-identifier:
+            leading letter or underscore, then `[A-Za-z0-9_]`,
+            max 64 chars. Anything looser risks label-cardinality
+            explosion in metric series or a CodeQL go-clear-
+            text-logging finding on a future refactor.
+          example: "tier"
+        max_keys_per_rule:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          default: 0
+          description: |
+            Caps the cardinality of the per-consumer bucket map
+            for this rule. 0 means "use plan default"
+            (`Limits.ThrottleMaxKeysPerRule` per plan: Free 100
+            / Hobby 1000 / Pro 5000 / Scale 10000). The
+            validator rejects values above
+            `plan.ThrottleMaxKeysPerRule`. Must be 0 when
+            `key_by` is `""` or `"none"` — the cap is moot for
+            non-per-consumer rules.
+
+    EdgeRuleBudgetAction:
+      description: |
+        Per-route end-to-end request budget (ADR-093 / §4.1.2.16).
+        The primitive for "POST /payment → 3 s, POST /signup → 10 s"
+        without writing timeout-propagation code in the customer's
+        app. The hot-path applier (cmd/gatewayd-public/main.go:PR-B
+        + pkg/gateway/handler_apply_edge_rule_budget.go) installs a
+        per-request `Budget` onto `r.Context()` via
+        `reqbudget.WithRemaining`; every downstream hop (DB, gRPC,
+        HTTP) tightens itself against the budget via
+        `reqbudget.WithOverhead` / `WithCeiling`.
+
+        On expiry the platform returns 504 + RFC 7807 problem
+        envelope (`code: request_budget_exceeded`) BEFORE the
+        customer's handler runs — the goal is bounded resource
+        pin per request, not customer-visible timer logic. Customer
+        code can read `reqbudget.FromContext(r.Context()).Remaining`
+        if it wants to short-circuit its own work early.
+
+        Field-by-field:
+          * `budget_ms` — required wall-clock budget. Must be > 0
+            and ≤ the per-plan max (`Plan.RequestBudgetMaxMs`, default
+            `RequestBudgetMax = 30 s`). A 0 or negative value is
+            rejected at create-time with 422.
+          * `allow_override_header` — optional HTTP request header
+            that lets a customer set a per-request override
+            (default `x-faas-budget-ms`). Empty (default) =
+            no override accepted; the edge-rule value is the
+            authoritative budget. The header is parsed as a
+            decimal integer in `[1, math.MaxInt32]`; out-of-range
+            values are ignored and the edge-rule value wins
+            (silent clamp, no 400 — the budget is a quality
+            primitive, not a security gate).
+
+        Rejections never reach the wake gate, the auth chain, or
+        the rate limiter — same posture as the other kind=budget
+        edge-rule appliers. Free-and-above (no plan gate).
+      type: object
+      required: [budget_ms]
+      properties:
+        budget_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 30000
+          description: "Per-request wall-clock budget in milliseconds (1 ms – 30 s)."
+        allow_override_header:
+          type: string
+          maxLength: 128
+          pattern: '^[A-Za-z][A-Za-z0-9-]*$'
+          description: "Optional RFC 7230 token header name for per-request override (default `x-faas-budget-ms`). Empty = no override."
 
     # ─── API keys ─────────────────────────────────────────────────────────
 
@@ -9642,7 +11150,93 @@ components:
         quota_max: { type: integer }
         count: { type: integer }
 
-    # ─── Usage ────────────────────────────────────────────────────────────
+    # ─── Data upstreams (ADR-098 §9.A PR-B) ──────────────────────────────
+    # §11 invariant: the response shape NEVER carries the plaintext
+    # host. Only host_redacted_hash (sha256(salt||host)) is on the
+    # wire. Servers reject POST bodies that include `host` with
+    # 400 `upstream_invalid_host`.
+
+    PutDataUpstreamRequest:
+      type: object
+      required: [kind, host, port]
+      description: |
+        Upsert payload for a customer data upstream. The (kind, host, port)
+        tuple is the deduplication key — repeating the PUT updates the
+        existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
+        inferred-source tag. Plaintext host is never persisted; the on-disk
+        column is `host_redacted_hash`.
+      properties:
+        kind:
+          type: string
+          enum: [postgres, redis, mongo, cassandra, clickhouse, elasticsearch, opensearch, rabbitmq, kafka, nats, minio, memcached, etcd, s3, https_api]
+          description: "Closed vocabulary (ADR-098 §D1). Adding a new kind requires an ADR."
+        host:
+          type: string
+          description: "RFC 952/1123 hostname (no IPv4). Hashed server-side; the hashed form is what's persisted."
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        scope:
+          type: string
+          description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Omitted = default scope."
+
+    DataUpstreamResponse:
+      type: object
+      required: [id, source, kind, host_redacted_hash, port, created_at, last_seen_at]
+      description: |
+        A single customer data upstream. The plaintext host is replaced by
+        `host_redacted_hash` (sha256(salt||host) 8-hex prefix); the §11
+        barrier means the wire format never carries the customer's DSN.
+      properties:
+        id: { type: string, format: uuid }
+        source:
+          type: string
+          enum: [inferred, explicit]
+          description: "Whether the row was captured by the classifier (FAAS_DATA_PLACEMENT=1) or added via PUT (explicit)."
+        kind:
+          type: string
+          enum: [postgres, redis, mongo, cassandra, clickhouse, elasticsearch, opensearch, rabbitmq, kafka, nats, minio, memcached, etcd, s3, https_api]
+        host_redacted_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: "SHA-256 hex of (HostHashSalt||host). 64 lowercase hex chars, matching the schema CHECK constraint."
+        host_last4:
+          type: string
+          description: "First 8 hex chars of host_redacted_hash; safe for log/scrape correlation (8 chars = ~4B capacity)."
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        scope:
+          type: string
+          description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Echoes the value persisted on the row; absent when the default scope applies."
+        declared_region:
+          type: string
+          description: "Region hint (nullable). Empty on capture; populated by the operator or the classify-flow follow-up."
+        last_rtt_ms:
+          type: integer
+          description: "Most recent probe RTT (ms). Omitted when no probe yet."
+        last_probed_at:
+          type: string
+          format: date-time
+          description: "Timestamp of the most recent probe. Omitted when no probe yet."
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+
+    DataUpstreamListResponse:
+      type: object
+      required: [upstreams, quota_max, count]
+      description: |
+        List response wrapper. `quota_max` is the per-plan cap from
+        `pkg/api/limits.go::DataPlacementHintsPerApp`; `count` is the
+        number of rows in `upstreams` (may be less than `quota_max`).
+      properties:
+        upstreams:
+          type: array
+          items: { $ref: '#/components/schemas/DataUpstreamResponse' }
+        quota_max: { type: integer }
+        count: { type: integer }
     # Fields tagged with `x-since: "YYYY-MM"` (issue #NNN) were added after
     # the public launch. OpenAPI consumers (the Go SDK, the Node SDK) read
     # the extension and surface "this field was added in YYYY-MM" so
@@ -9784,6 +11378,340 @@ components:
           description: "Per-app egress byte delta over the window (informational; not billed). ADR-046. Source: schedd_egress_net_tx_bytes_total{app} (Prom rollup of usage_minutes.net_tx_bytes — PR-2 wires the rollup; until then this field stays 0)."
           x-since: "2026-08"
           x-issue: "415"
+        tx_bytes:
+          type: integer
+          format: int64
+          description: "Per-app egress byte delta over the window, gateway-side mirror (informational; not billed). ADR-046 PR-2 / issue #415 PR-2. Source: gateway_egress_tx_bytes_total{app} (Prom rollup; the gatewayd-internal-local per-instance egress ring populates the counter on each raw-stream chunk). Distinct from `egress_bytes` (the schedd-side mirror) so a divergence between the two surfaces immediately on the dashboard. Best-effort: query failure does NOT flip the response to degraded — matches the `egress_bytes` semantics."
+          x-since: "2026-08"
+          x-issue: "415"
+        routes:
+          type: array
+          description: |
+            Per-route breakdown for opt-in apps (ADR-093). Absent when
+            `route_metrics_enabled` is false on the app — the dashboard
+            distinguishes "feature off" (field absent) from "feature
+            on, no traffic" (empty array). Each row is the bounded
+            detail from the gatewayd-internal in-memory reader: max
+            50 distinct routes + the `__route_other__` wildcard-path
+            overflow bucket. The route label is method + raw path
+            (pre-rewrite, ADR-093 D6).
+          items:
+            $ref: '#/components/schemas/RouteRow'
+          x-since: "2026-08"
+          x-issue: "273"
+
+    RouteRow:
+      description: |
+        Per-route detail row (ADR-093). The `route` field is the
+        bounded label: `"GET /users/4f8a"` for an admitted route, or
+        `"__route_other__"` for the overflow bucket. Latency fields
+        are milliseconds over the full request duration (status-
+        agnostic — failures included). Same zero-on-degraded
+        contract as `AppMetricsResponse`.
+      type: object
+      required:
+        - route
+        - count
+        - p50_ms
+        - p95_ms
+        - p99_ms
+        - error_pct
+      properties:
+        route:
+          type: string
+          description: "Bounded route label (method + raw path, or `__route_other__`)."
+          x-since: "2026-08"
+          x-issue: "273"
+        count:
+          type: integer
+          format: int64
+          description: "Number of requests with this route in the window."
+          x-since: "2026-08"
+          x-issue: "273"
+        p50_ms:
+          type: number
+          description: "p50 of `gateway_request_duration_seconds_bucket{app, route, class}` over the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        p95_ms:
+          type: number
+          description: "p95 over all classes in the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        p99_ms:
+          type: number
+          description: "p99 over all classes in the window, in ms."
+          x-since: "2026-08"
+          x-issue: "273"
+        error_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: "Share of [45]xx requests with this route in the window."
+          x-since: "2026-08"
+          x-issue: "273"
+
+    AppRoutesResponse:
+      description: |
+        Per-route label snapshot (ADR-093). The bounded route label
+        set the gatewayd-internal control listener emits for the app.
+        Each item is `"<METHOD> <PATH>"` (pre-edge-rule-rewrite) for
+        an admitted route, or the reserved `"__route_other__"` overflow
+        bucket label. Bounded at 50 distinct real routes + the reserved
+        overflow per app (ADR-093 D2).
+
+        `cap_hit` (ADR-093 Tier B item #1) is true iff the app's
+        route label set has reached `RouteMetricsPerAppCap` (50) and
+        additional routes are collapsing into the reserved
+        `__route_other__` overflow bucket. When `cap_hit` is true,
+        `len(routes) == RouteMetricsPerAppCap + 2` (50 real + the
+        reserved empty label + `__route_other__`). When false, the
+        dashboard can render "you have N admitted routes" without
+        having to count the array (which is ambiguous: 5 real routes
+        + `__route_other__` is indistinguishable from 50 real routes
+        + overflow). Omitted on the `source: unavailable` path —
+        the gatewayd-internal dial failed, the cap state is unknown.
+      type: object
+      required: [slug, routes, source]
+      properties:
+        slug: {type: string, x-since: "2026-08", x-issue: "273"}
+        app_id: {type: string, x-since: "2026-08", x-issue: "273"}
+        routes:
+          type: array
+          items: {type: string}
+          x-since: "2026-08"
+          x-issue: "273"
+        source:
+          type: string
+          enum: ["live", "unavailable"]
+          x-since: "2026-08"
+          x-issue: "273"
+        cap_hit:
+          type: boolean
+          default: false
+          x-since: "2026-08"
+          x-issue: "273"
+          description: |
+            True iff the route label set has hit `RouteMetricsPerAppCap`
+            (50) and additional routes are collapsing into
+            `__route_other__`. Omitted on `source: unavailable` paths
+            (cap state is unknown when the gatewayd-internal dial
+            fails).
+
+    ThrottleSuggestionRow:
+      description: |
+        One (route → suggested rate) row in the payload returned by
+        `GET /v1/apps/{slug}/throttle-suggestions` (ADR-091 D20.5
+        amendment, issue #881). The recommender is read-only — it
+        never auto-applies — and the suggestion is always ≤ the
+        customer's plan ceiling so a customer can act on it
+        without a 422 from apid's sub-plan validator.
+      type: object
+      required: [route, observed_rps, suggested_rps, suggested_burst, multiplier]
+      properties:
+        route:
+          type: string
+          description: |
+            The bounded label exactly as emitted on the Prometheus
+            side: `<METHOD> <PATH>` (pre-edge-rule-rewrite), or
+            the reserved `__route_other__` overflow bucket label.
+          example: "GET /users/4f8a"
+          x-since: "2026-08"
+          x-issue: "881"
+        observed_rps:
+          type: number
+          format: double
+          minimum: 0
+          description: |
+            The `rate()` value over the window (already per-second).
+          example: 1.5
+          x-since: "2026-08"
+          x-issue: "881"
+        suggested_rps:
+          type: number
+          format: double
+          minimum: 1
+          description: |
+            `ceil(observed_rps * multiplier)` clamped into
+            `[1, plan.RateLimitRPS]`. The 2× headroom is echoed
+            on the wire so the value is auditable rather than
+            magic.
+          example: 3
+          x-since: "2026-08"
+          x-issue: "881"
+        suggested_burst:
+          type: integer
+          minimum: 1
+          description: |
+            `ceil(suggested_rps * 1.5)` clamped into
+            `[1, plan.RateLimitBurst]`. The 1.5× factor is a
+            softer version of the rate headroom — burst oversize
+            is the most common cause of customer-flapping 429s.
+          example: 5
+          x-since: "2026-08"
+          x-issue: "881"
+        multiplier:
+          type: number
+          format: double
+          description: |
+            The headroom factor the recommender applied to
+            `observed_rps`. Pinned on the wire so a future
+            strategy change is distinguishable from drift.
+          example: 2.0
+          x-since: "2026-08"
+          x-issue: "881"
+
+    ThrottleSuggestionsResponse:
+      description: |
+        Per-route throttle recommendation payload (ADR-091 D20.5
+        amendment, issue #881). Source is `prometheus` on success
+        or `degraded: <reason>` on Prometheus failure (response is
+        still 200 with empty Suggestions — the dashboard's
+        empty-state branch handles it).
+      type: object
+      required: [app_id, range, source, route_metrics_disabled, routes_collapsed, plan_ceiling_rps, plan_ceiling_burst, multiplier, suggestions]
+      properties:
+        app_id: { type: string, x-since: "2026-08", x-issue: "881" }
+        range: { type: string, x-since: "2026-08", x-issue: "881" }
+        source:
+          type: string
+          description: |
+            `prometheus` on success, `degraded: <reason>` on
+            PromQL failure.
+          x-since: "2026-08"
+          x-issue: "881"
+        as_of:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp the response was assembled.
+          x-since: "2026-08"
+          x-issue: "881"
+        route_metrics_disabled:
+          type: boolean
+          default: false
+          description: |
+            True when `apps.route_metrics_enabled=false` (Free
+            plan). The response carries empty Suggestions plus
+            this flag so the dashboard can render the upsell
+            rather than a misleading zero.
+          x-since: "2026-08"
+          x-issue: "881"
+        routes_collapsed:
+          type: integer
+          minimum: 0
+          description: |
+            Count of routes that collapsed into the reserved
+            `__route_other__` overflow bucket during the window
+            (ADR-093 cap = 50). A non-zero value indicates the
+            throttle is partial-coverage regardless of the
+            configured limit.
+          x-since: "2026-08"
+          x-issue: "881"
+        plan_ceiling_rps:
+          type: integer
+          minimum: 0
+          description: |
+            `plan.RateLimitRPS` — the sub-plan ceiling the
+            suggestion is clamped to. 0 on unknown plans (fail
+            OPEN — the apid sub-plan validator is the
+            authoritative gate).
+          x-since: "2026-08"
+          x-issue: "881"
+        plan_ceiling_burst:
+          type: integer
+          minimum: 0
+          description: |
+            `plan.RateLimitBurst` — the sub-plan ceiling for
+            burst. 0 on unknown plans.
+          x-since: "2026-08"
+          x-issue: "881"
+        multiplier:
+          type: number
+          format: double
+          description: |
+            The headroom factor the recommender applied to every
+            route (`Multiplier` constant). Echoed on the wire
+            so the strategy is auditable.
+          example: 2.0
+          x-since: "2026-08"
+          x-issue: "881"
+        suggestions:
+          type: array
+          items: { $ref: '#/components/schemas/ThrottleSuggestionRow' }
+          x-since: "2026-08"
+          x-issue: "881"
+
+    AppStreamingStatus:
+      description: |
+        Per-app streaming classification (ADR-102 D6). The probe
+        returns the same `Streaming-Status` enum value the
+        gatewayd handler would stamp on the response header for a
+        representative request to this app, plus the effective
+        response-body cap and the per-gate flags that produced it.
+
+        `status` values (closed enum, see `pkg/api/limits.go`):
+
+          - `streaming` — request will stream. `effective_cap_bytes`
+            is the cap `capWriter` will enforce.
+          - `accept-json-downgrade` — pre-D3 customers with
+            `Accept: application/json` would have been buffered.
+            Post-D3 (this PR), the request streams regardless of
+            Accept; the enum variant survives one cycle so pinned
+            SDKs can grep for it.
+          - `flag-disabled` — `streaming_enabled=false` on the app.
+          - `plan-disallows` — plan tier forbids `streaming_enabled=true`;
+            CreateApp (D5) already returns 403 on this combination,
+            so this value should be unreachable on a properly-validated
+            app.
+          - `operator-disabled` — operator opt-in env is off; visible
+            only on the gatewayd side, not this probe.
+          - `upgrade-bypass` — request is an HTTP/1.1 Upgrade (e.g.
+            WebSocket) and bypasses the streaming path.
+
+        `effective_cap_bytes` is the plan cap (`cap_kind="plan"`)
+        on every probe in this PR. The per-edge-rule override lives
+        in gatewayd state and is not part of the apid cache; a
+        customer who needs the live cap fires a real request and
+        reads the `Streaming-Status` response header.
+      type: object
+      required: [app_id, status, effective_cap_bytes, plan_cap_bytes, flag_enabled, plan_allowed]
+      properties:
+        app_id: {type: string, x-since: "2026-08", x_issue: "102"}
+        status:
+          type: string
+          enum: [streaming, accept-json-downgrade, flag-disabled, plan-disallows, operator-disabled, upgrade-bypass]
+          x-since: "2026-08"
+          x_issue: "102"
+        effective_cap_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-since: "2026-08"
+          x_issue: "102"
+        plan_cap_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-since: "2026-08"
+          x_issue: "102"
+        flag_enabled:
+          type: boolean
+          x-since: "2026-08"
+          x_issue: "102"
+        plan_allowed:
+          type: boolean
+          x-since: "2026-08"
+          x_issue: "102"
+        cap_kind:
+          type: string
+          enum: [plan, endpoint-rule, none]
+          x-since: "2026-08"
+          x_issue: "102"
+          description: |
+            `plan` is the only value this probe ever returns in
+            this PR. The endpoint-rule and none values are reserved
+            for the future gatewayd-side dial path described in
+            `cmd/apid/handlers_streaming_cap.go`.
 
     ListInstancesResponse:
       description: |
@@ -9961,6 +11889,123 @@ components:
         throttled_total: { type: integer, format: int64, description: "Per-app rate-limit count over the window." }
       x-since: "2026-08"
       x-issue: "696"
+
+    AppErrorsSummaryResponse:
+      description: |
+        Grouped error summary returned by `GET /v1/apps/{slug}/errors/summary`
+        (ADR-096 / PR-B). One row per fingerprint over the
+        requested `[since, until]` window. Distinct from
+        `AppSLOResponse` (ADR-082) which is the closed-set SLO
+        summary — the errors summary uses a continuous window
+        with explicit RFC3339Nano stamps.
+
+        Empty result returns 200 with `items: []` and the
+        window echo set. `window_clamped` is true when the
+        requested span was clamped to `AppErrorsWindowMaxHours`
+        (168h). `next_cursor` is empty when the page is the
+        last one.
+      type: object
+      required: [generated_at, app_id, app_slug, window_start, window_end, window_clamped, items, limit]
+      properties:
+        generated_at: { type: string, format: date-time, description: "RFC3339Nano UTC stamp at which the summary was assembled." }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        app_slug: { type: string }
+        window_start: { type: string, format: date-time, description: "Echoed (clamped) window start, RFC3339Nano UTC." }
+        window_end: { type: string, format: date-time, description: "Echoed (clamped) window end, RFC3339Nano UTC." }
+        window_clamped: { type: boolean, description: "True when the requested span was clamped to AppErrorsWindowMaxHours (168h)." }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AppErrorSummaryItem' }
+        next_cursor: { type: [string, 'null'], description: "Opaque base64 cursor for the next page. Empty when the current page is the last." }
+        limit: { type: integer, description: "Echoed limit applied (post-clamp to AppErrorsSummaryMaxLimit=100)." }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorSummaryItem:
+      description: One row of the errors summary (ADR-096 / PR-B).
+      type: object
+      required: [fingerprint, error_class, route, http_status, count, request_count, first_seen_at, last_seen_at, sample_message]
+      properties:
+        fingerprint: { type: string, pattern: '^[a-f0-9]{64}$', description: "64-hex-char SHA-256 fingerprint identifying this error group; stable across requests with the same (route, status, error_class)." }
+        error_class:
+          type: string
+          enum: [db_timeout, stripe_timeout, null_pointer, invalid_json, wake_failed, upstream_5xx, unhandled, client_error]
+          description: "Closed-vocabulary error class. 'unhandled' is collapsed under 'Other' in the UI; the DB stores the precise class."
+        route: { type: string, description: "Matched route template (e.g. `/users/{id}`), NEVER the expanded URL." }
+        http_status: { type: integer, format: int32, minimum: 400, maximum: 599 }
+        count: { type: integer, format: int64, description: "Issue count (deduped within AppErrorsDedupeWindowSeconds=3600)." }
+        request_count: { type: integer, format: int64, description: "Total distinct request rows for this fingerprint." }
+        first_seen_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        sample_message: { type: string, description: "PII-redacted sample message (already-redacted at write time; ≤AppErrorsSampleMessageCapBytes=512 bytes)." }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorRequestsResponse:
+      description: |
+        Drill-down page returned by `GET /v1/apps/{slug}/errors/{fingerprint}`
+        (ADR-096 / PR-B). The header fields (fingerprint,
+        error_class, route, http_status) are denormalised from the
+        parent summary row so the dashboard renders the page header
+        without a second round-trip. Does NOT include
+        `headers_sample` or `redactions` — those are on the
+        `/first` endpoint only.
+      type: object
+      required: [fingerprint, error_class, route, http_status, requests]
+      properties:
+        fingerprint: { type: string, pattern: '^[a-f0-9]{64}$' }
+        error_class: { type: string }
+        route: { type: string }
+        http_status: { type: integer, format: int32 }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/AppErrorRequestItem' }
+        next_cursor: { type: [string, 'null'] }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorRequestItem:
+      description: One row of the drill-down page (ADR-096 / PR-B).
+      type: object
+      required: [request_id, received_at, route, http_status, error_class, sample_message]
+      properties:
+        request_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        received_at: { type: string, format: date-time }
+        route: { type: string }
+        http_status: { type: integer, format: int32 }
+        error_class: { type: string }
+        sample_message: { type: string }
+        deployment_id: { type: [string, 'null'], pattern: '^[a-f0-9]{32}$', description: "Nullable — the FK is ON DELETE SET NULL so an evicted deployment leaves the drill-down row intact." }
+      x-since: "2026-08"
+      x-issue: "ADR-096"
+
+    AppErrorSampleResponse:
+      description: |
+        Single sample row returned by `GET /v1/apps/{slug}/errors/{fingerprint}/first`
+        (ADR-096 / PR-B). Embeds `AppErrorRequestItem` plus the
+        redacted `headers_sample` (jsonb-decoded to map) and the
+        `redactions_applied` pattern names so the dashboard can
+        render a "we redacted X / Y / Z" badge.
+      type: object
+      required: [request_id, received_at, route, http_status, error_class, sample_message, headers_sample, redactions_applied]
+      properties:
+        request_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        received_at: { type: string, format: date-time }
+        route: { type: string }
+        http_status: { type: integer, format: int32 }
+        error_class: { type: string }
+        sample_message: { type: string }
+        deployment_id: { type: [string, 'null'], pattern: '^[a-f0-9]{32}$' }
+        headers_sample:
+          type: object
+          additionalProperties: { type: string }
+          description: "PII-redacted request headers (≤8 keys)."
+        redactions_applied:
+          type: array
+          items: { type: string }
+          description: "Names of the redactor patterns that fired (e.g. `email`, `card`, `bearer`)."
+      x-since: "2026-08"
+      x-issue: "ADR-096"
 
     AccountSLOResponse:
       description: |
@@ -10246,6 +12291,102 @@ components:
 
     # ─── Errors ───────────────────────────────────────────────────────────
 
+    FieldError:
+      type: object
+      description: |
+        Per-field entry of `Problem.errors`. The shape mirrors
+        Cloudflare's API Shield 422 / Stripe's `card_errors` family so
+        an SDK can iterate `errors[]` to drive form-field UI without
+        parsing prose. `field` uses JSON Pointer notation for nested
+        keys (`address.zip`). `expected` and `got` are short stable
+        strings; consumers should not depend on the prose.
+      required: [field, expected]
+      properties:
+        field: { type: string, example: "name" }
+        expected: { type: string, example: "string" }
+        got: { type: string, example: "integer" }
+
+    SecretFinding:
+      type: object
+      description: |
+        Per-line entry of `Problem.secret_findings` AND
+        `SecretScanResult.findings` (issue #862 + secret-scan v2,
+        PR #873; PR-A 101 extends the surfaced shape via the new
+        `layer` field). The shape mirrors `pkg/secretscan.Finding`
+        but is decoupled so the wire schema can evolve
+        independently of the scanner's internal fields. `snippet`
+        is the pre-truncated safe representation (first 6 chars +
+        "…" + last 4) — never the raw value, matching the snippet
+        policy documented in `pkg/secretscan/scan.go`. Closed-set
+        `provider` keys: stripe_live, stripe_test, github_pat,
+        aws_access, openai, anthropic, private_key_block. The
+        optional `layer` field (PR-A) names the per-walk source
+        label — "app" for the main image, "sidecar-<slug>" for
+        each sidecar, or absent for the apid source-tree
+        rejection path (legacy).
+      required: [file, line, provider, severity, snippet]
+      properties:
+        file: { type: string, example: ".env.production" }
+        line: { type: integer, example: 2 }
+        key: { type: string, example: "STRIPE_SECRET_KEY" }
+        provider: { type: string, example: "stripe_live" }
+        severity:
+          type: string
+          enum: [high, medium]
+          example: high
+        snippet: { type: string, example: "sk_liv…XXXX" }
+        layer:
+          type: string
+          description: |
+            Per-walk source label (PR-A). "app" for findings in
+            the main image; "sidecar-<slug>" for findings in a
+            sidecar (e.g. "sidecar-redis"); absent or "" for
+            findings from the legacy apid source-tree rejection
+            path (cmd/apid/secretscan.go).
+          example: app
+
+    SecretScanResult:
+      type: object
+      description: |
+        Customer-facing wire shape of one deployment's secret-scan
+        audit row. Mirrors the `ScanResult` shape but for the
+        secret-scan pipeline. The `status` enum is the closed set
+        the imaged-side writer (PR-A) stamps: `complete` for a
+        clean walk, `complete_with_redactions` for a hit (mirrors
+        the v2 widening on `deployments_scan_status_chk` from
+        migration 00264). `image_digest` is the OCI digest the
+        scan ran against (PR-A) — mirrors
+        `ScanResult.image_digest` so a side-by-side compare
+        renders both scans against the same bytes. `findings[]`
+        may be empty (clean walk); the field is always present
+        for round-trip JSON stability.
+      required: [status, findings]
+      properties:
+        status: { type: string, example: "complete" }
+        scanned_at:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 UTC. Empty when the deployment hasn't been
+            secret-scanned yet.
+        image_digest:
+          type: string
+          description: |
+            OCI digest the scan ran against (PR-A). Mirrors
+            `ScanResult.image_digest` for cross-pipeline
+            comparison. Empty for pre-PR-A rows.
+          example: sha256:abc...
+        findings:
+          type: array
+          items: { $ref: '#/components/schemas/SecretFinding' }
+        error:
+          type: string
+          description: |
+            In-band explanation when the audit row is unreadable
+            (jsonb decode failed). Mirrors `ScanResult.error`.
+            Empty on the success path — `status` carries the
+            closed-set signal there.
+
     Problem:
       type: object
       required: [title, status, code]
@@ -10263,6 +12404,13 @@ components:
         dashboard renders the transaction handle as a confirmation id.
         Exactly one of `billing_portal_url` or `paddle_checkout_url` is
         populated on a given 402 — never both.
+
+        `errors` carries per-field detail (Cloudflare / Stripe shape)
+        for 422 sites that emit a list of field-level failures — used
+        today by the kind=validate edge rule so a JSON Schema
+        rejection renders as a form-field list the dashboard can
+        iterate without parsing prose. Optional + omitempty so every
+        other problem+json site keeps its existing flat shape unchanged.
       example:
         type: "https://docs.gregale.dev/errors/validation_failed"
         title: Validation failed
@@ -10295,6 +12443,36 @@ components:
             Paddle transaction handle (`txn_…`) on a `payment_required`
             402. Empty on the Stripe path. The dashboard renders this as
             a confirmation id after the customer completes checkout.
+        errors:
+          type: array
+          description: |
+            Per-field validation detail. Populated by 422 sites that
+            emit a list of field-level failures. Each entry is a
+            `FieldError` (Cloudflare / Stripe shape: field + expected
+            + got) so an SDK can drive form-field UI without parsing
+            prose.
+          items: { $ref: '#/components/schemas/FieldError' }
+        secret_findings:
+          type: array
+          description: |
+            Per-line secret-scan detail. Populated by 422 sites with
+            `code: secret_scan_strict` (cmd/apid/secretscan.go
+            server-side scan rejection; cmd/gregale printErr
+            --secret-scan=strict client-side rejection). The shape
+            is shared with the on-disk `SecretScanResult` so a
+            programmatic consumer can render the same UI for both
+            rejection paths. Optional + omitempty.
+          items: { $ref: '#/components/schemas/SecretFinding' }
+        secret_hint:
+          type: string
+          description: |
+            Customer-facing remediation nudge attached to a
+            `code: secret_scan_strict` 422 envelope (e.g. "move
+            detected secrets to `gregale secrets set`"). Mirrors
+            the `FieldError` shape's prose pattern so the dashboard
+            / SDK can render the hint as a one-line footer without
+            parsing prose. Optional + omitempty.
+          example: "move detected secrets to `gregale secrets set` (see https://docs.gregale.dev/cli/secrets)"
 
     RateLimitPlain:
       type: string

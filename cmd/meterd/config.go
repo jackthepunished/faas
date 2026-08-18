@@ -61,15 +61,27 @@ type Config struct {
 	// resolver in pkg/gateway/egresssocket gives EgressSocket
 	// (egress_socket) precedence, then falls back to this legacy
 	// field. PR-E + a follow-up PR removes this field.
+	//
+	// PR-0 (issue #678): the corresponding GatewayEgressTLS* field
+	// set was deprecated in PR-C+D but never used (the alias
+	// served an operator-side migration path for single-box
+	// deployments that hadn't migrated egress_socket yet; the TLS
+	// side never carried any traffic). Removing the field set
+	// and its LoadGatewayEgressTLS helper is safe — see the
+	// grep-pinned `GatewayEgressTLS` audit (cmd/meterd/config.go
+	// had no callers). The PR-0 scope closes this dead surface.
 	GatewayEgressSocket string `toml:"gateway_egress_socket"`
 
-	// GatewayEgressTLSCertPath / Key / CA are the deprecated (PR-C+D)
-	// aliases for EgressTLS*. Supported for one release cycle so
-	// single-box deployments that haven't updated /etc/faas/meterd.toml
-	// keep working. PR-E + a follow-up PR removes these fields.
-	GatewayEgressTLSCertPath string `toml:"gateway_egress_tls_cert_path"`
-	GatewayEgressTLSKeyPath  string `toml:"gateway_egress_tls_key_path"`
-	GatewayEgressTLSCAPath   string `toml:"gateway_egress_tls_ca_path"`
+	// NodeName is the multi-box identity for the meterd process
+	// (issue #678 / ADR-093 PR-0). When non-empty, meterd is in
+	// multi-box mode: PR-B constructs PGNodeVerifier and threads
+	// it through every Load*WithVerifier helper. When empty,
+	// the verifier stays nil and stdlib trust alone runs (the
+	// single-box dev back-compat path). Operator seeds the
+	// matching row in compute_nodes via the existing
+	// POST /v1/compute-nodes flow (no new apid handler — reuses
+	// UpsertComputeNodeFromOperator). Defaults to "".
+	NodeName string `toml:"node_name"`
 
 	// Role is the box shape this meterd inhabits (Gate-B; env
 	// override FAAS_METERD_ROLE wins when set). meterd is a
@@ -90,16 +102,6 @@ func (c *Config) LoadScheddTLS() (*tls.Config, error) {
 // partial cluster is rejected.
 func (c *Config) LoadEgressTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("egress_", c.EgressTLSCertPath, c.EgressTLSKeyPath, c.EgressTLSCAPath)
-}
-
-// LoadGatewayEgressTLS returns the client mTLS config meterd uses to
-// dial the egress listener through the deprecated gateway_egress_*
-// field set. Empty cluster returns (nil, nil); partial cluster is
-// rejected. Deprecated: use LoadEgressTLS. Supported for one release
-// cycle so single-box deployments that haven't updated
-// /etc/faas/meterd.toml keep working.
-func (c *Config) LoadGatewayEgressTLS() (*tls.Config, error) {
-	return wire.LoadClientTLSConfigWithPrefix("gateway_egress_", c.GatewayEgressTLSCertPath, c.GatewayEgressTLSKeyPath, c.GatewayEgressTLSCAPath)
 }
 
 // LoadConfig reads a TOML file at path with defaults filled in. A missing
@@ -138,5 +140,13 @@ func LoadConfig(path string) (*Config, error) {
 	// role gate at boot calls role.Require to refuse to start
 	// under the wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_METERD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// NodeName so the systemd drop-in (deploy/ansible/roles/
+	// control_plane_service/templates/99-faas-node-name.conf.j2)
+	// can override the TOML node_name on every control-plane box.
+	// Empty keeps the TOML value (single-box dev back-compat).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.NodeName = v
+	}
 	return c, nil
 }

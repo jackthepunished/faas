@@ -120,6 +120,19 @@ type AppListItem struct {
 	// Glyph ("ok" / "warn" / "down") inside the row's
 	// "SLO" cell.
 	SLO *views.SLOBadge
+	// IsPreview (ADR-095 PR-C / issue #272) is true when this row
+	// is a preview-app entry (apps.preview_of_slug != ''). The
+	// dashboard's apps list uses it to add a "preview" badge and
+	// indent the row so production apps and their previews read
+	// as a hierarchy. Mirrors state.App.PreviewOfSlug but lives
+	// here so pkg/dashboard stays free of pkg/state imports.
+	IsPreview bool
+	// Scope is the canonical preview subdomain ("pr-42.acme" for a
+	// PR #42 preview of the acme app) used as the copy target for
+	// the dashboard's preview-panel "Copy URL" button. Empty when
+	// IsPreview is false. Pre-formatted at the handler edge so
+	// the template stays a pure renderer.
+	Scope string
 }
 
 // ManifestView is the runner-scaffold snapshot shown on the app detail
@@ -168,13 +181,80 @@ type ScanSummary struct {
 	Unknown   int
 }
 
-// CronItem is one row on the app detail page's crons tab.
+// PreviewItem (ADR-095 PR-C / issue #272) is one row on the
+// app detail page's preview-environments panel. The panel
+// surfaces every preview app whose preview_of_slug matches the
+// parent (apps.preview_of_slug), with status, the full preview
+// URL ("https://pr-42.acme.apps.gregale.dev"), the underlying
+// PR number, and the current PR state (open / closed / stale /
+// torn_down). Pre-format all labels at the handler edge so the
+// template stays a pure renderer.
+//
+// Branch / HeadSHA are intentionally absent: the preview-app
+// schema (migrations/00220_preview_app_columns.sql) only carries
+// preview_of_slug / preview_pr_number / preview_pr_state /
+// preview_expires_at; per-deploy source-ref details are out of
+// scope for PR-C and arrive with the preview-deploy webhook
+// follow-up tracked separately.
+//
+// URL is the FULL https form (matching apps-list appListItem.URL)
+// so the rendered <a href> and the Copy URL button both hand the
+// user a clickable absolute URL. A bare host label here would
+// emit a relative href and a non-clickable clipboard copy.
+type PreviewItem struct {
+	Slug       string // preview app slug (e.g. "demo-pr-42")
+	URL        string // full preview URL (e.g. "https://pr-42.demo.apps.gregale.dev")
+	PrNumber   int
+	PrState    string // closed vocab: open / closed / stale / torn_down
+	CreatedAt  string // RFC 3339 UTC
+	ExpiresAt  string // RFC 3339 UTC; empty when no TTL
+	StateLabel string // pre-formatted chip label ("open", "closed", etc.)
+	StateClass string // CSS class matching PrState for the chip
+}
+
+// CronItem is one row on the app detail page's crons tab
+// (issue #791 PR-E / ADR-090 §"Sub-decision 7"). The inline runs
+// panel + fire-now form are projected into the same struct so the
+// template is a pure renderer — handler does the formatting.
 type CronItem struct {
 	ID          string
 	Schedule    string
 	Path        string
 	Enabled     bool
 	LastFiredAt string // empty until first fire
+
+	// Runs is the bounded last-N invocations for this cron
+	// (default 10). Rendered inside a server-rendered <details> on
+	// the app detail page so the customer can scan "Last 10 runs"
+	// without leaving the page. Empty slice → template renders an
+	// empty-state hint rather than zero rows.
+	Runs []CronRunRow
+	// RunsCount is len(Runs), exposed as a sibling field so the
+	// Go html/template parser can render "Last N runs" in the
+	// <details> summary without needing a FuncMap. The template
+	// can't call `len` on a slice directly (no FuncMap wired),
+	// so the handler computes it once and stores the integer.
+	RunsCount int
+	// FireNowConfirmToken is the per-request CSRF envelope for the
+	// "Fire now" POST form. Mandated by handlers_dashboard.go's
+	// CSRF middleware (delete-account uses the same shape, see
+	// handlers_dashboard.go:915). Always set when the cron is
+	// enabled; empty (zero) when disabled → template suppresses
+	// the form.
+	FireNowConfirmToken string
+}
+
+// CronRunRow is one projected row inside CronItem.Runs. Pre-formatted
+// at the handler edge so the template is a pure renderer (same
+// pattern as RecentInstanceItem and InstanceChipDurationMS). The
+// closed-vocabulary Outcome string matches api.CronRunOutcome — the
+// handler projects both fields so the template never invents its own
+// outcome label.
+type CronRunRow struct {
+	Glyph      string // "✓" | "✗" | "⟳" (running)
+	StartedAt  string // pre-formatted HH:MM (relative-day suppressed for density)
+	DurationMS string // "1.2s" | "980ms" | "timeout" | "—" — pre-formatted at handler
+	Outcome    string // closed vocab matching api.CronRunOutcome
 }
 
 // AppDetailData combines the bits the app detail page renders.
@@ -183,6 +263,23 @@ type AppDetailData struct {
 	Manifest    ManifestView
 	Deployments []DeploymentItem
 	Crons       []CronItem
+	// Previews (ADR-095 PR-C / issue #272) lists every preview app
+	// whose preview_of_slug matches this app's slug. Empty when
+	// this app is itself a preview (or a production app with no
+	// previews); the template renders a single "no preview
+	// environments yet" hint in the empty case. The panel is
+	// suppressed entirely for a preview row (the parent already
+	// surfaces its previews) so a preview-of-preview loop can't
+	// occur.
+	Previews []PreviewItem
+	// FiredFlash is the post-redirect banner surfaced after a
+	// dashboard cron fire-now POST. Values:
+	//   "ok"    — handler redirected with ?fired=1
+	//   "error" — handler redirected with ?fired=error
+	// Empty string → no banner. The template's empty-state branch
+	// suppresses the banner entirely so a fresh page load renders
+	// the section without any success/error chrome.
+	FiredFlash string
 	// RecentInstances is the most recent N wake rows for this app
 	// (parked → waking → running → …). Each carries its WakeID so
 	// operators can paste the ID from a gateway response header

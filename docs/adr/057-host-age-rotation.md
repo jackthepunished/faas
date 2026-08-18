@@ -66,7 +66,7 @@ ADR-057 ships the **v1 partial-deliverable**:
    tried until one decrypts" gives the overlap window without
    schema migration.
 
-3. **Operator CLI** — `gregale host-age {init,rotate,status,prune-previous}`,
+3. **Operator CLI** — `gregalectl host-age {init,rotate,status,prune-previous}`,
    mirroring the `sign-keys` shape. Mode 0400 on every file
    the CLI writes; no logging of secret material.
 
@@ -107,7 +107,7 @@ ADR-057 ships the **v1 partial-deliverable**:
   operator who only touches `app_secrets` once per
   deployment, the entire box transitions to the new key
   within the first refresh after rotate.
-- The `gregale host-age status` command gives operators a
+- The `gregalectl host-age status` command gives operators a
   single view of "current fingerprint, previous fingerprint,
   overlap age, daemons on current vs stale fingerprint"
   without inspecting logs.

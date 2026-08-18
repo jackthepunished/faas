@@ -81,6 +81,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 )
 
@@ -89,11 +90,40 @@ import (
 type Metrics struct {
 	registry *prometheus.Registry
 
-	requests      *prometheus.CounterVec
-	wakeLatency   prometheus.Histogram
-	wakeQueueWait prometheus.Histogram
-	queueDepth    *prometheus.GaugeVec
-	rateLimited   *prometheus.CounterVec
+	requests    *prometheus.CounterVec
+	wakeLatency prometheus.Histogram
+	// drainWaitSeconds (issue #587 / PR-A) is the per-daemon
+	// graceful-shutdown drain histogram (see ObserveDrainWait).
+	drainWaitSeconds *prometheus.HistogramVec
+	// inflightRequests (issue #587 / PR-A) is the per-daemon
+	// drain.Tracker in-flight gauge (see SetInflightRequests).
+	inflightRequests *prometheus.GaugeVec
+	// wakeLatencyByNode (PR #4 / ADR-092 §3.5) is the per-node
+	// labelled twin of wakeLatency. The unlabeled histogram stays
+	// untouched — it's the §12 SLA contract and is consumed by
+	// pkg/appmetrics/appmetrics.go:175 for the fleet p95. The new
+	// histogram is operator-side only; the obsNodeWakeLatency
+	// handler in cmd/apid PromQL-evals it for per-node quantiles.
+	// The label is the compute_node.id (UUID) rather than the
+	// human-readable name because gatewayd-internal has no
+	// node-id → node-name cache on the wake path; the obs handler
+	// resolves id → name via the existing ListComputeNodes call
+	// before returning. Label cardinality is bounded by
+	// compute_nodes count (today: 1, tomorrow: tens). ADR-091
+	// §3.6 documents the label cardinality constraint.
+	wakeLatencyByNode *prometheus.HistogramVec
+	wakeQueueWait     prometheus.Histogram
+	// wakePhaseDuration (ADR-098 C11): phase-decomposed wake
+	// latency vector. Closed phase set pre-instantiated below so
+	// the §12 panel surfaces zero on an idle gateway.
+	wakePhaseDuration *prometheus.HistogramVec
+	queueDepth        *prometheus.GaugeVec
+	rateLimited       *prometheus.CounterVec
+	// leaderBootstrapAborts (ADR-098 C7): counter labelled by
+	// reason — closed set {queue_empty_no_instance, ttl_expired,
+	// app_deleted}. Pre-instantiated in NewMetrics so the §12
+	// dashboard chip surfaces from first scrape.
+	leaderBootstrapAborts *prometheus.CounterVec
 	// edgeRuleMatch: ADR-089 PR 3. Counter labelled by
 	// (kind, outcome) — `kind` is the EdgeRuleKind
 	// (route|rewrite|redirect|headers|cors|jwt|ip; closed set
@@ -105,6 +135,50 @@ type Metrics struct {
 	// at boot below. PR 4-7 extend kind; the outcome set is
 	// stable across all kinds.
 	edgeRuleMatch *prometheus.CounterVec
+	// edgeRuleApply (ADR-091 hardening PR-A): counter of apply-path
+	// outcomes, distinct from edgeRuleMatch (which counts the
+	// matcher's pick). A rule can MATCH the matcher but FAIL at apply
+	// time (e.g. JWT verify returns ErrJWKSNotRegistered, or an IP
+	// rule's CIDR list is empty after redaction). The {kind, result}
+	// labels partition success / error so the §12 dashboard chip
+	// "edge rule apply rate" surfaces from first scrape. result is
+	// one of {success, error} — a 2-element closed set; expanding it
+	// requires a new metric (the apply-error mix is its own surface).
+	edgeRuleApply *prometheus.CounterVec
+	// routeConsumerThrottleDecisions (ADR-104, issue #881 Phase 3):
+	// counter of per-consumer throttle decisions, labelled by
+	// {kind, outcome}. `kind` is the KeyBy dimension
+	// (none | api_key | jwt_subject | jwt_claim — closed set per
+	// pkg/api.ThrottleKeyBy* constants). `outcome` is the
+	// decision (admit | throttle | anonymous — the third covers
+	// anonymous traffic on a per-consumer rule, which the limiter
+	// passes through to the rule-only bucket). Distinct from
+	// edgeRuleApply (which tracks the per-rule throttle path
+	// separately) so a §12 dashboard panel can read both:
+	// edgeRuleApply tracks per-rule bucket denies, this counter
+	// tracks per-consumer denies within the per-rule scope.
+	routeConsumerThrottleDecisions *prometheus.CounterVec
+	// edgeRuleCompileError (ADR-091 hardening PR-A): counter of
+	// compile-time failures inside the cmd-side loader
+	// (cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs). A
+	// non-zero value here means a rule shipped broken — the loader
+	// silently dropped the offending rule and is serving traffic
+	// without it. The {kind} label is one of the seven shipped
+	// kinds; the counter surfaces the signal even when the
+	// loader's WARN log is drowned by other gatewayd-internal noise.
+	edgeRuleCompileError *prometheus.CounterVec
+	// appMaintenance (ADR-091 amendment / §4.1.2.0): counter of
+	// apps.maintenance_mode coarse-gate matches. Distinct from the
+	// edgeRule* family because the coarse gate is not an edge
+	// rule — there's no matcher, no audit row beyond the
+	// app.maintenance_mode_match emit, no per-rule cap, no
+	// cross-account defense. The {plan} label is the closed
+	// {Free, Hobby, Pro, Scale} set so the §12 dashboard panel
+	// "apps in maintenance by plan" surfaces from first scrape.
+	// Pre-instantiated at boot in NewMetrics via the closed plan
+	// loop below (mirrors streamActive / accountRateLimited
+	// pre-instantiation pattern).
+	appMaintenance *prometheus.CounterVec
 	// responseBytes: ADR-046 PR-2 producer observability.
 	// Counter labelled by app (UUID, bounded by per-plan app
 	// quotas) and plan (Free|Hobby|Pro|Scale — closed set). The
@@ -129,6 +203,14 @@ type Metrics struct {
 	// "no data" for a quiet daemon). See ObserveStreamStart /
 	// ObserveStreamEnd below.
 	streamActive *prometheus.GaugeVec
+	// geoipDBAgeSeconds: ADR-091 D21. Gauge labelled by the
+	// geoip.Source (dbip | maxmind). The reader's pkg/geoip
+	// BootAt() is read at scrape time; the gauge is the
+	// operator's "is the DB stale?" tripwire. A scrape value
+	// > 30 days = the auto-refresh is failing AND the operator
+	// hasn't replaced the file manually; the dashboard panel
+	// flags red.
+	geoipDBAgeSeconds *prometheus.GaugeVec
 	// accountRateLimited backs the per-account throttling introduced by
 	// ADR-040 (issue #292). Labels: account_id, plan. Pre-instantiates
 	// the four plan rows under the `__other__` placeholder so the §12
@@ -180,6 +262,39 @@ type Metrics struct {
 	// SLO-clustered buckets (0.35/0.8s): this histogram must resolve
 	// sub-100ms warm responses AND multi-second slow ones.
 	requestDuration *prometheus.HistogramVec
+	// requestsByRoute backs the per-route observability counter
+	// (ADR-093 / issue #273 — opt-in follow-up to ADR-042 §1).
+	// Labels: app, plan, route, code. The `route` label admits
+	// through the bounded routeLabelSet per app (cap = 50 + the
+	// reserved __route_other__ overflow bucket); the cap is
+	// app.RouteMetricsEnabled AND the operator kill-switch
+	// (cmd/gatewayd-internal/config.go [route_metrics] enabled).
+	// When the cap is disabled, all admission collapses to the
+	// reserved empty-string "no appID" sentinel so the column
+	// never appears on /metrics — same shape as the existing
+	// `gateway_requests_total{app="-"}` series. The
+	// pre-instantiation loop in NewMetrics below must come AFTER
+	// the operator kill-switch is read — the daemon reads the
+	// config before NewMetrics returns, so the loop only emits
+	// the closed (plan) set under the empty-row placeholder when
+	// the operator has the feature disabled.
+	requestsByRoute *prometheus.CounterVec
+	// durationByRoute backs the per-route histogram
+	// (ADR-093 D4). Labels: app, route, class. Same bucket
+	// choice as the per-app requestDuration above (warm-friendly
+	// 0.005s..10s spread). The per-app per-route closed `class`
+	// set is pre-instantiated by PreInstantiateAppRoute after
+	// the route is admitted through routeLabelSet.
+	durationByRoute *prometheus.HistogramVec
+	// failuresByRoute backs the per-route failures counter
+	// (ADR-093 D4). Labels: app, plan, route, code. Mirrors
+	// the existing gateway_requests_total shape but adds
+	// `route`; the counter is incremented only when status
+	// ≥ 400 so the dashboard can compute error_rate_pct directly
+	// from the ratio without a separate error-rate histogram.
+	// Same operator kill-switch + customer-opt-in gate as
+	// requestsByRoute.
+	failuresByRoute *prometheus.CounterVec
 	// coldBoot backs the renamed gateway_cold_boot_total counter
 	// (issue #273 / ADR-042). Renamed outright from coldWake —
 	// gateway_cold_wake_total had zero external consumers (no
@@ -239,6 +354,16 @@ type Metrics struct {
 	// "no certs" (the rule's `result="partial"` filter excludes them).
 	tlsCertExpiryRefresherWalkComplete *prometheus.CounterVec
 	tlsOnDemandDenied                  *prometheus.CounterVec
+	// tenantSurfaceCert (ADR-100 / issue #879) counts every cert
+	// remint driven by a tenant_surface_changed pg_notify.
+	// Labels: result ∈ {issued, failed, skipped} and kind ∈
+	// {per_host_san, shared_wildcard}. Pre-instantiated at boot
+	// so the §12 panel surfaces from first scrape; an idle
+	// daemon shows zeros, a quiet one shows counts climbing
+	// only on real customer mutations. Bounded label sets
+	// (no per-surface cardinality) keep the time-series
+	// footprint flat.
+	tenantSurfaceCert *prometheus.CounterVec
 	// wakeLocality is the increment-only wake-outcome classifier that
 	// backs the multiplex scale-out decision (PR scale-out readiness,
 	// ADRs 025/028). Outcome ∈ {local_snapshot, local_coldboot} today;
@@ -255,6 +380,58 @@ type Metrics struct {
 	// histogram (the histogram stays unlabeled by tier to keep
 	// cardinality bounded; the counter is the join key).
 	wakeSnapshotTier *prometheus.CounterVec
+	// wsUpgradeTotal (issue #676 / ADR-080 follow-up, PR-B) counts
+	// every Connection: Upgrade + Upgrade: <token> request that
+	// crosses the cmd/gatewayd-internal three-input gate
+	// (pkg/gateway/handler.go:2899). Labels {plan, outcome}:
+	//   plan     ∈ api.Plans (Free/Hobby/Pro/Scale)
+	//   outcome  ∈ {accepted, plan_denied, bridge_disabled}
+	// "plan_denied" surfaces from both the request-time 501
+	// (writeWebSocketNotAllowed) and the PATCH-time 403
+	// (cmd/apid/handlers_ext.go:261-268). "bridge_disabled" is
+	// the FAAS_GATEWAY_RAW_STREAM_ENABLED=false / h.rawByNode==nil
+	// branch (PR-A follow-up). The closed label cross-product is
+	// pre-instantiated at boot so dashboards render with zero
+	// rows from idle fleet, non-zero as soon as production WS
+	// traffic arrives.
+	wsUpgradeTotal *prometheus.CounterVec
+	// wsActiveSessions (issue #676 / ADR-080 follow-up, PR-B) is
+	// the in-flight raw-bytes Upgrade session gauge, labelled by
+	// plan. Inc/Dec happens via IncWSSessionStart /
+	// DecWSSessionEnd inside rawStreamOnceWithEvents; the defer
+	// pair keeps Inc/Dec symmetric across every return branch
+	// (init_failed / upstream_unavailable / client_disconnect /
+	// accepted).
+	wsActiveSessions *prometheus.GaugeVec
+	// wsSessionDuration (issue #676 / ADR-080 follow-up, PR-B) is
+	// the histogram of wall-clock seconds per session. Buckets
+	// span 50 ms (one TCP round-trip) to 24 h (the
+	// rawStreamSessionDeadline ceiling at
+	// pkg/gateway/forwardproxy.go:464); intermediate buckets
+	// align with the plan wake_idle_timeout matrix so a panel
+	// can read "how long past the per-plan idle timeout did
+	// this session hold" without a custom
+	// histogram_quantile interpolation. Labels {plan, outcome}:
+	//   outcome ∈ {accepted, init_failed, upstream_unavailable,
+	//              client_disconnect} (no plan_denied /
+	//              bridge_disabled — those never open a
+	//              session)
+	wsSessionDuration *prometheus.HistogramVec
+	// wsSessionBytes (issue #676 / ADR-080 follow-up, PR-B) is
+	// the counter of bytes that traverse the raw-bytes bridge,
+	// labelled by {plan, direction}. direction ∈ {tx, rx}:
+	//   tx — bytes flowing customer → guest (request body + raw
+	//        HTTP request line + headers that the bridge carries
+	//        verbatim); incremented in the body-copy goroutine
+	//        at pkg/gateway/forwardproxy.go:~558
+	//   rx — bytes flowing guest → customer (response body + raw
+	//        HTTP status line + headers); incremented in the
+	//        receiver loop at pkg/gateway/forwardproxy.go:~651
+	// Raw-stream egress bytes ALSO flow through the
+	// per-instance egress ring via egressSink.RecordResponseBytes
+	// (PR-C follow-up) so usage_minutes.tx_bytes reflects WS
+	// workloads without a separate meterd surface.
+	wsSessionBytes *prometheus.CounterVec
 	// computeNodeChangedSubscriberAlive is the per-process liveness
 	// gauge for the LISTEN compute_node_changed subscriber loop
 	// (cmd/gatewayd-internal/nodecache.go:102-141). PR scale-out readiness:
@@ -299,6 +476,84 @@ func NewMetrics() *Metrics {
 			Name: "gateway_edge_rule_match_total",
 			Help: "Edge-rule matcher outcomes, labelled by kind and outcome (match|miss|blocked). ADR-089 PR 3.",
 		}, []string{"kind", "outcome"}),
+		// ADR-091 hardening PR-A — apply-path counter (distinct from
+		// match). A rule can match the matcher but fail at apply time
+		// (e.g. JWKS lookup returns ErrJWKSNotRegistered, or an IP
+		// rule's CIDR list is empty after redaction). The {kind, result}
+		// partition powers the §12 dashboard chip "edge rule apply rate".
+		edgeRuleApply: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_edge_rule_apply_total",
+			Help: "Edge-rule apply-path outcomes (success|error), labelled by kind. ADR-091 hardening PR-A.",
+		}, []string{"kind", "result"}),
+		// ADR-104 (issue #881 Phase 3) — per-consumer throttle
+		// decisions, distinct from the per-rule edgeRuleApply path.
+		// `kind` ∈ {none, api_key, jwt_subject, jwt_claim} tracks the
+		// KeyBy dimension; `outcome` ∈ {admit, throttle, anonymous}
+		// tracks the per-consumer admit/deny split. The anonymous
+		// outcome covers anonymous traffic on a per-consumer rule —
+		// the limiter passes through to the per-rule bucket, but the
+		// dashboard surfaces this so an operator can see when an
+		// authn-gated app is seeing unauthenticated traffic on a
+		// per-consumer rule (which is a misconfiguration).
+		routeConsumerThrottleDecisions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "route_consumer_throttle_decisions_total",
+			Help: "Per-consumer throttle decisions, labelled by KeyBy kind (none|api_key|jwt_subject|jwt_claim) and outcome (admit|throttle|anonymous). ADR-104, issue #881 Phase 3.",
+		}, []string{"kind", "outcome"}),
+		// ADR-091 hardening PR-A — compile-time errors caught by
+		// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs. A
+		// non-zero value here means a rule shipped broken and was
+		// silently dropped by the loader; the dashboard chip surfaces
+		// it even when the loader's WARN log is drowned in noise.
+		edgeRuleCompileError: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_edge_rule_compile_error_total",
+			Help: "Edge-rule compile-time errors caught by the cmd-side loader, labelled by kind. ADR-091 hardening PR-A.",
+		}, []string{"kind"}),
+		// ADR-091 amendment — coarse-gate apps.maintenance_mode
+		// short-circuit counter. Distinct from edgeRule* family
+		// because the coarse gate is per-app, not per-rule. Plan
+		// label is the closed Free|Hobby|Pro|Scale set, pre-
+		// instantiated at boot below.
+		appMaintenance: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_app_maintenance_total",
+			Help: "Apps.maintenance_mode coarse-gate short-circuits, labelled by plan. ADR-091 amendment / §4.1.2.0.",
+		}, []string{"plan"}),
+		// ADR-093 / issue #273 follow-up: per-route observability
+		// counters. The `route` label is admitted through the
+		// per-app routeLabelSet (cap = 50 + __route_other__
+		// overflow). The constructor does NOT pre-instantiate
+		// every (app, route, code) combo because the route label
+		// is unbounded — the routeLabelSet is the cap. The
+		// closed (plan, code) set is pre-instantiated below
+		// under the empty placeholder so the §12 dashboard panel
+		// for opt-in apps surfaces from the first scrape.
+		//
+		// The metric names carry the `_by_route` suffix to keep
+		// them disjoint from the pre-existing {app, plan, code}
+		// `gateway_requests_total` series — Prometheus rejects two
+		// CounterVecs with the same name but different label sets
+		// at registration time. Dashboards consuming
+		// `gateway_requests_by_route_total` etc. read the opt-in
+		// apps' per-route rows; the existing fleet-level
+		// `gateway_requests_total{app, plan, code}` is unchanged.
+		requestsByRoute: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_requests_by_route_total",
+			Help: "Per-route counter (ADR-093). Adds {route} as a 4th label when the app has apps.route_metrics_enabled=true; the per-app ADR-042 view is the same series with route omitted. route is method + raw path (pre-rewrite); admit() collapses wildcard-path overflow into the reserved __route_other__ bucket (cap = 50 per app).",
+		}, []string{"app", "plan", "route", "code"}),
+		durationByRoute: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_request_duration_by_route_seconds",
+			Help: "Per-route duration histogram (ADR-093). Adds {route} as a 3rd label when the app has apps.route_metrics_enabled=true; the per-app ADR-042 view is the same histogram with route omitted. The closed `class` set is pre-instantiated per app per admitted route via PreInstantiateAppRoute.",
+			Buckets: []float64{
+				0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10,
+			},
+		}, []string{"app", "route", "class"}),
+		failuresByRoute: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_request_failures_by_route_total",
+			Help: "Per-route failures counter (ADR-093). Increments on status ≥ 400; the dashboard computes error_rate_pct directly from the ratio to gateway_requests_total. Same route admission as gateway_requests_by_route_total above.",
+		}, []string{"app", "plan", "route", "code"}),
+		geoipDBAgeSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "geoip_db_age_seconds",
+			Help: "Seconds since the geoip DB was last (re)loaded. ADR-091 D21; the operator's 'is the DB stale?' tripwire.",
+		}, []string{"source"}),
 		wakeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "gateway_wake_latency_seconds",
 			Help: "End-to-end latency from request received to first upstream byte after a cold wake.",
@@ -307,6 +562,19 @@ func NewMetrics() *Metrics {
 				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
 			},
 		}),
+		// PR #4 / ADR-092 §3.5. Same bucket layout as wakeLatency
+		// — same distribution, same SLO targets — just labelled
+		// by node_id so the per-node p95/p99 surfaces. Do NOT
+		// change the existing unlabeled histogram's buckets
+		// without re-running the §12 fleet p95 calibration; the
+		// new histogram is opt-in and not part of any SLO.
+		wakeLatencyByNode: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_wake_latency_seconds_by_node",
+			Help: "Per-node wake latency (operator-side only; the unlabeled gateway_wake_latency_seconds remains the §12 fleet p95 source). ADR-092 §3.5. node_id is the compute_nodes.id UUID; the obs handler resolves id to name via ListComputeNodes.",
+			Buckets: []float64{
+				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
+			},
+		}, []string{"node_id"}),
 		// Spec §12 row "wake queue wait p95". Observed by WakeGate.Wait
 		// on every caller that joins a single-flight coalescing wake. The
 		// leader (the request that actually triggers the wake) reads near
@@ -324,10 +592,42 @@ func NewMetrics() *Metrics {
 				0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
 			},
 		}),
+		// ADR-098 C11: phase-decomposed wake telemetry. Sibling of
+		// wakeLatency (gateway_wake_latency_seconds). The aggregate
+		// histogram stays byte-identical to pre-C11 buckets — that
+		// series is the §12 SLO source-of-truth (p50 ≤ 0.35 s,
+		// p95 ≤ 0.8 s). This vector adds the recovery dimension
+		// when a regression fires: phase ∈ {"queue_wait",
+		// "coordinator_wait", "schedd_admit", "vmmd_wake",
+		// "guest_ready", "cold_fallback_reason"}. Phases are
+		// labelled by the emit site, not the boundary, so a stalled
+		// coordinator shows up as coordinator_wait tail, not as a
+		// generic wake latency regression.
+		//
+		// Pre-instantiated below with the closed phase set so the
+		// §12 panel surfaces zero on an idle gateway.
+		wakePhaseDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "gateway_wake_phase_duration_seconds",
+			Help: "Phase-decomposed wake latency (ADR-098 C11). Each phase is observed once per request at the boundary it measures. The aggregate gateway_wake_latency_seconds is unchanged.",
+			// Same bucket envelope as wakeLatency so the dashboards
+			// can compare phase histograms to the aggregate without
+			// re-bucketing.
+			Buckets: []float64{
+				0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0,
+			},
+		}, []string{"phase"}),
 		queueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "gateway_queue_depth",
 			Help: "Current number of waiters per app's wake queue (sampled).",
 		}, []string{"app"}),
+		// ADR-098 C7: closed-set reasons pre-instantiated so the
+		// §12 dashboard chip "leader bootstrap aborts" surfaces
+		// zero rows from boot. Adding a new reason is a code +
+		// dashboard change.
+		leaderBootstrapAborts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_leader_bootstrap_aborts_total",
+			Help: "Detached leader goroutine aborts on the bootstrap cap, labelled by reason (queue_empty_no_instance|ttl_expired|app_deleted). ADR-098 C7.",
+		}, []string{"reason"}),
 		rateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_rate_limited_total",
 			Help: "Requests rejected by the per-app rate limiter.",
@@ -456,6 +756,18 @@ func NewMetrics() *Metrics {
 			Name: "gateway_tls_on_demand_denied_total",
 			Help: "On-demand cert mint denials, labelled by reason. ADR-024 H3 (closed in PR #345); H3.b is the still-open follow-up. reason=allowlist is incremented from pkg/gateway/tls_wire.go's allowlistToDecisionFunc today. reason=dns01 and reason=token are reserved for the H3.b follow-up that bridges the certmagic ACME-issuer logger through this counter; the series are pre-instantiated at 0 so the dashboard panel surfaces from boot and a missing wire-incrementation is visible as a frozen zero.",
 		}, []string{"reason"}),
+		// ADR-100 / issue #879 — per-surface cert-remint
+		// counter. result ∈ {issued, failed, skipped} (skipped
+		// is the "no verified hostnames" / "soft-deleted
+		// surface" / "unsupported cert_kind" path that never
+		// reaches the CA). kind ∈ {per_host_san,
+		// shared_wildcard} (per_host_san is the only kind the
+		// v1 issuer mints; shared_wildcard counts surface so
+		// the dashboard surfaces the deferred-ADR backlog).
+		tenantSurfaceCert: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_tenant_surface_cert_total",
+			Help: "Tenant surface cert remint outcomes, labelled by result and kind. ADR-100 / issue #879. result ∈ {issued, failed, skipped}; kind ∈ {per_host_san, shared_wildcard}.",
+		}, []string{"result", "kind"}),
 		// PR scale-out readiness — wake-locality counter. The closed
 		// (outcome) set is pre-instantiated below so the panel surfaces
 		// from boot. New outcomes (remote_*) join by widening the
@@ -488,6 +800,81 @@ func NewMetrics() *Metrics {
 			Name: "gateway_compute_node_changed_subscriber_alive",
 			Help: "Liveness gauge for the LISTEN compute_node_changed subscriber loop in cmd/gatewayd-internal/nodecache.go. Bumped every subscriberHeartbeatInterval (30s) while the subscriber is alive. A frozen or zero gauge means the NodeClientCache is silently out of date and the next compute_nodes UPSERT is invisible to placement. The hook is the observability point; the alert rule + window choice live in ops wiring, out of scope for this PR.",
 		}),
+		// Issue #676 / ADR-080 follow-up, PR-B: raw-bytes
+		// Upgrade / WebSocket observability surface. Four series
+		// registered against the per-Handler registry (matching
+		// the rest of pkg/gateway/metrics.go — gateway_wake_*
+		// / gateway_cold_boot_* / gateway_request_*, all
+		// per-Handler). The dashboard panels "ws: upgrades by
+		// plan (5m)", "ws: active sessions by plan",
+		// "ws: session duration p50/p95/p99 by plan", and
+		// "ws: session bytes (rx/tx) by plan" depend on these
+		// existing from boot.
+		//
+		// Plan / outcome / direction closed sets are declared
+		// alongside the helper methods below
+		// (WSOutcome / WSDirection constants) so the constructor
+		// pre-instantiate loop and the runtime helpers share one
+		// source of truth.
+		wsUpgradeTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "gateway_ws_upgrade_total",
+				Help: "Count of Connection: Upgrade + Upgrade: <token> requests crossing the cmd/gatewayd-internal three-input gate (issue #676 / ADR-080). Labelled by {plan, outcome}: plan ∈ api.Plans (Free/Hobby/Pro/Scale), outcome ∈ {accepted, plan_denied, bridge_disabled}. 'plan_denied' is the WebSocketResponseAllowed()=false branch; 'bridge_disabled' is FAAS_GATEWAY_RAW_STREAM_ENABLED=false / h.rawByNode==nil. 12 series total.",
+			},
+			[]string{"plan", "outcome"},
+		),
+		wsActiveSessions: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "gateway_ws_active_sessions",
+				Help: "In-flight raw-bytes Upgrade sessions (issue #676 / ADR-080), labelled by plan. Inc/Dec via IncWSSessionStart / DecWSSessionEnd inside pkg/gateway/forwardproxy.go's rawStreamOnceWithEvents (the defer pair keeps symmetry across every return branch). 4 series total.",
+			},
+			[]string{"plan"},
+		),
+		// Buckets span 50 ms (one TCP round-trip) to 24 h (the
+		// rawStreamSessionDeadline ceiling at
+		// pkg/gateway/forwardproxy.go:464). Intermediate buckets
+		// align with the plan wake_idle_timeout matrix (Hobby
+		// 60 s, Pro 300 s, Scale 600 s).
+		wsSessionDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name: "gateway_ws_session_duration_seconds",
+				Help: "Wall-clock seconds per raw-bytes Upgrade session (issue #676 / ADR-080). Labelled by {plan, outcome}: plan ∈ api.Plans, outcome ∈ {accepted, init_failed, upstream_unavailable, client_disconnect}. Buckets span 50 ms (one TCP round-trip) to 24 h (the rawStreamSessionDeadline); intermediate buckets align with the plan wake_idle_timeout matrix.",
+				Buckets: []float64{
+					0.05, 0.25, 1, 5, 30, 60, 300, 600, 1800, 7200, 21600, 86400,
+				},
+			},
+			[]string{"plan", "outcome"},
+		),
+		wsSessionBytes: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "gateway_ws_session_bytes_total",
+				Help: "Bytes that traverse the raw-bytes bridge (issue #676 / ADR-080), labelled by {plan, direction}: plan ∈ api.Plans, direction ∈ {tx, rx}. tx = customer→guest request body+headers; rx = guest→customer response body+headers. 8 series total.",
+			},
+			[]string{"plan", "direction"},
+		),
+	}
+	// Pre-instantiate the WS closed label cross-product (issue
+	// #676 / ADR-080 follow-up, PR-B). Same precedent as
+	// tlsOnDemandDenied / accountRateLimited above. The
+	// ws_session_duration_seconds histogram excludes plan_denied
+	// / bridge_disided because those never open a session — the
+	// counter is sufficient for the rejected-at-gate outcomes.
+	wsOutcomes := []WSOutcome{WSOutcomeAccepted, WSOutcomePlanDenied, WSOutcomeBridgeDisabled}
+	wsSessionOutcomes := []WSOutcome{WSOutcomeAccepted, WSOutcomeInitFailed, WSOutcomeUpstreamUnavailable, WSOutcomeClientDisconnect}
+	wsDirections := []WSDirection{WSDirectionTx, WSDirectionRx}
+	wsPlans := []api.Plan{api.PlanFree, api.PlanHobby, api.PlanPro, api.PlanScale}
+	for _, plan := range wsPlans {
+		planStr := string(plan)
+		m.wsActiveSessions.WithLabelValues(planStr)
+		for _, outcome := range wsOutcomes {
+			m.wsUpgradeTotal.WithLabelValues(planStr, string(outcome))
+		}
+		for _, outcome := range wsSessionOutcomes {
+			m.wsSessionDuration.WithLabelValues(planStr, string(outcome))
+		}
+		for _, direction := range wsDirections {
+			m.wsSessionBytes.WithLabelValues(planStr, string(direction))
+		}
 	}
 	// Pre-instantiate the ("other",) row on gateway_top_tenant_rps so
 	// the gauge surfaces from boot, mirroring the apid precedent
@@ -527,17 +914,35 @@ func NewMetrics() *Metrics {
 	// extend this slice; the metric name stays stable.
 	// ADR-089 PR 3 + PR 4 — pre-instantiate the closed (kind, outcome)
 	// cross product for every shipped kind. PR 5-7 add kinds to
-	// the outer loop (cors / jwt / ip). JWT additionally has
-	// "failed" + "missing" outcomes (the verifier path emits those
-	// — kind=jwt has more distinct failure modes than the other
-	// kinds because every sentinel error in pkg/edgejwks maps to
-	// a separate outcome for the dashboard). CORS + IP keep the
-	// closed {match, miss, blocked} triple. The closed set
-	// guarantees the §12 dashboard panel "edge rule match rate"
-	// surfaces every (kind, outcome) tuple from first scrape.
-	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip"} {
-		for _, outcome := range []string{"match", "miss", "blocked"} {
+	// the outer loop (cors / jwt / ip). PR-B (kind=validate)
+	// widens the outer loop with the "failed" outcome (broken
+	// schema compile + 415 + 413 audit rows all land here). JWT
+	// additionally has "failed" + "missing" outcomes (the
+	// verifier path emits those — kind=jwt has more distinct
+	// failure modes than the other kinds because every sentinel
+	// error in pkg/edgejwks maps to a separate outcome for the
+	// dashboard). CORS + IP keep the closed {match, miss, blocked}
+	// triple. The D20.5 amendment (issue #881) widens the loop
+	// with `throttle` so the §12 dashboard panel surfaces
+	// per-rule throttle match/deny rates from first scrape. The
+	// closed set guarantees the §12 dashboard panel "edge rule
+	// match rate" surfaces every (kind, outcome) tuple from
+	// first scrape.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
+		for _, outcome := range []string{"match", "miss", "blocked", "failed"} {
 			m.edgeRuleMatch.WithLabelValues(kind, outcome)
+		}
+	}
+	// Phase 3 (ADR-104, issue #881): pre-instantiate the closed
+	// (kind, outcome) cross product for the per-consumer throttle
+	// decision counter. `kind` matches the KeyBy dimension
+	// (api.ThrottleKeyBy* constants); `outcome` is the per-request
+	// admit/deny split. The "anonymous" outcome covers
+	// unauthenticated traffic on a per-consumer rule — a
+	// misconfiguration signal for the dashboard.
+	for _, kind := range []string{"none", "api_key", "jwt_subject", "jwt_claim"} {
+		for _, outcome := range []string{"admit", "throttle", "anonymous"} {
+			m.routeConsumerThrottleDecisions.WithLabelValues(kind, outcome)
 		}
 	}
 	for _, outcome := range []string{"match", "miss", "blocked", "failed", "missing"} {
@@ -556,6 +961,13 @@ func NewMetrics() *Metrics {
 	for _, tier := range []string{tierWarm, tierInit, tierCold} {
 		m.wakeSnapshotTier.WithLabelValues(tier)
 	}
+	// ADR-098 C7: pre-instantiate the closed (reason) set on the
+	// leader-bootstrap-aborts counter so the §12 dashboard chip
+	// "leader bootstrap aborts" surfaces every reason from boot.
+	// Adding a new reason is a code + dashboard change.
+	for _, reason := range []string{"queue_empty_no_instance", "ttl_expired", "app_deleted"} {
+		m.leaderBootstrapAborts.WithLabelValues(reason)
+	}
 	// ADR-024 H3 follow-up (Finding 2): pre-instantiate the closed
 	// (result) set on the walk-completeness counter so the §12
 	// dashboard panel surfaces from boot. result="partial" is the
@@ -563,6 +975,17 @@ func NewMetrics() *Metrics {
 	// increase without waiting for a first partial event.
 	for _, result := range []string{"complete", "partial", "empty"} {
 		m.tlsCertExpiryRefresherWalkComplete.WithLabelValues(result)
+	}
+	// ADR-100 / issue #879 — pre-instantiate the closed
+	// (result, kind) cartesian product so the §12 panel
+	// surfaces from boot. Bounded (3 results × 2 kinds = 6
+	// series) so the time-series footprint is flat. An idle
+	// daemon shows all six counters at zero; a quiet one
+	// climbs only on real customer mutations.
+	for _, result := range []string{"issued", "failed", "skipped"} {
+		for _, kind := range []string{"per_host_san", "shared_wildcard"} {
+			m.tenantSurfaceCert.WithLabelValues(result, kind)
+		}
 	}
 	// ADR-047 PR-D: pre-instantiate the closed (plan) set on
 	// gateway_stream_active under the "__other__" placeholder so the
@@ -575,8 +998,110 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.streamActive.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch)
+	// PR #4 doesn't touch the edge-rule label set, but the
+	// ADR-091 hardening PR-A pre-instantiation must remain present
+	// so the §12 dashboard chip "edge rule apply rate" + "edge rule
+	// compile errors" surface every tuple from first scrape. Closed
+	// set: {route, rewrite, redirect, headers, cors, jwt, ip, validate,
+	// limit, maintenance, geo, throttle}. Adding a new kind requires
+	// extending this slice — the metric name is stable.
+	for _, kind := range []string{"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip", "validate", "limit", "maintenance", "geo", "throttle"} {
+		for _, result := range []string{"success", "error"} {
+			m.edgeRuleApply.WithLabelValues(kind, result)
+		}
+		m.edgeRuleCompileError.WithLabelValues(kind)
+	}
+	// ADR-091 amendment — pre-instantiate the closed (plan) set on
+	// the coarse-gate counter so the §12 dashboard panel "apps in
+	// maintenance by plan" surfaces from boot. Closed set mirrors
+	// streamActive / accountRateLimited pre-instantiation above.
+	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
+		m.appMaintenance.WithLabelValues(plan)
+	}
+	// ADR-098 C11: pre-instantiate the closed phase set so the §12
+	// panel reads zero on an idle gateway. queue_wait is the
+	// legacy scalar (gateway_wake_queue_wait_seconds) folded into
+	// a labelled histogram here; the scalar stays for one release
+	// per the dual-write plan. coordinator_wait is the per-app
+	// wake-coordinator spin-up at schedd. schedd_admit is the
+	// schedd.EnsureWake RPC. vmmd_wake is the vmmd.Wake RPC
+	// latency. guest_ready is the framework-ready handshake
+	// stamp propagation. cold_fallback_reason is the wake that
+	// fell through to cold boot — labelled to match the vmmd
+	// result enum (closed set).
+	for _, phase := range []string{
+		"queue_wait", "coordinator_wait", "schedd_admit",
+		"vmmd_wake", "guest_ready", "cold_fallback_reason",
+	} {
+		m.wakePhaseDuration.WithLabelValues(phase)
+	}
+	// ADR-091 D21 (kind=geo) + issue #676 / ADR-080 follow-up,
+	// PR-B (raw-bytes Upgrade / WebSocket observability). Registered
+	// alongside the rest of the gateway_* series so the §12 dashboard
+	// panels (ws_upgrade / ws_active / ws_duration / ws_bytes /
+	// geoip_db_age_seconds) surface from boot. The pre-instantiate
+	// loops above stamp every closed label cell — a missing
+	// registration here would cause /metrics to omit the series
+	// entirely even with the WithLabelValues calls in place.
+	//
+	// ADR-100 / issue #879 PR-A: also register m.tenantSurfaceCert
+	// (the per-surface cert-remint outcome counter) so the
+	// gateway_tenant_surface_cert_total{result,kind} series
+	// surfaces from boot. The pre-instantiate loop above (where
+	// tenantSurfaceCert is stamped across the closed (result, kind)
+	// cartesian) is the same pattern as the rest of the family.
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeLatencyByNode, m.wakeQueueWait, m.wakePhaseDuration, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.tenantSurfaceCert, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch, m.edgeRuleApply, m.edgeRuleCompileError, m.appMaintenance, m.requestsByRoute, m.durationByRoute, m.failuresByRoute, m.leaderBootstrapAborts, m.wsUpgradeTotal, m.wsActiveSessions, m.wsSessionDuration, m.wsSessionBytes, m.geoipDBAgeSeconds, m.routeConsumerThrottleDecisions)
+	// Issue #587 / PR-A: per-daemon graceful-shutdown drain
+	// observability. Same shape as the wire.OpsMetrics series,
+	// registered on the gateway.Metrics registry so it surfaces
+	// in the existing /metrics scrape (gatewayd-internal uses
+	// gateway.Metrics; gatewayd-public uses wire.OpsMetrics).
+	// Both daemons see the same metric NAME; only the registry
+	// differs. The {daemon, op} labels are pre-instantiated
+	// here so the dashboard surfaces rows from boot.
+	m.drainWaitSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gateway_drain_wait_seconds",
+		Help:    "Wall-clock seconds the graceful-shutdown drain (issue #587 / PR-A / pkg/gateway/drain) waited before every in-flight request goroutine finished. Labelled by {daemon, outcome}; outcome ∈ {clean, deadline_exceeded, ctx_cancelled} so an operator can tell a fast clean drain from a forced one without re-reading the daemon log. Bucket set covers <100ms idle drain up to the full DrainGrace=25s ceiling.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 25},
+	}, []string{"daemon", "outcome"})
+	m.drainWaitSeconds.WithLabelValues("gatewayd-internal", "clean")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-internal", "deadline_exceeded")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-internal", "ctx_cancelled")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-public", "clean")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-public", "deadline_exceeded")
+	m.drainWaitSeconds.WithLabelValues("gatewayd-public", "ctx_cancelled")
+	m.inflightRequests = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gateway_inflight_requests",
+		Help: "Current in-flight request count tracked by the per-daemon drain.Tracker (issue #587 / PR-A / pkg/gateway/drain). Labelled by {daemon, op}; op ∈ {http, upgrade, control}. NO plan or app label — Prometheus cardinality discipline (per the cluster plan's 'Decisions baked in' §2).",
+	}, []string{"daemon", "op"})
+	m.inflightRequests.WithLabelValues("gatewayd-internal", "http")
+	m.inflightRequests.WithLabelValues("gatewayd-internal", "upgrade")
+	m.inflightRequests.WithLabelValues("gatewayd-internal", "control")
+	m.inflightRequests.WithLabelValues("gatewayd-public", "http")
+	m.inflightRequests.WithLabelValues("gatewayd-public", "upgrade")
+	m.inflightRequests.WithLabelValues("gatewayd-public", "control")
+	reg.MustRegister(m.drainWaitSeconds, m.inflightRequests)
 	return m
+}
+
+// ObserveDrainWait (issue #587 / PR-A) records the wall-clock
+// duration of a drain.Tracker.Drain call. outcome is one of
+// drain.Outcome{Clean,DeadlineExceeded,Cancelled}; daemon ∈
+// {gatewayd-public, gatewayd-internal}. Nil-safe.
+func (m *Metrics) ObserveDrainWait(daemon, outcome string, seconds float64) {
+	if m == nil || m.drainWaitSeconds == nil {
+		return
+	}
+	m.drainWaitSeconds.WithLabelValues(daemon, outcome).Observe(seconds)
+}
+
+// SetInflightRequests (issue #587 / PR-A) sets the per-daemon
+// per-op in-flight gauge. Nil-safe.
+func (m *Metrics) SetInflightRequests(daemon, op string, count float64) {
+	if m == nil || m.inflightRequests == nil {
+		return
+	}
+	m.inflightRequests.WithLabelValues(daemon, op).Set(count)
 }
 
 // Registry returns the underlying *prometheus.Registry — pass to promhttp.
@@ -687,6 +1212,63 @@ func (m *Metrics) PreInstantiateApp(appID string) {
 	}
 }
 
+// ObserveRequestRoute records one per-route counter increment for
+// opt-in apps (ADR-093 / issue #273 follow-up to ADR-042 §1). The
+// caller (Handler.observe) is responsible for routing the call
+// here only when the app's RouteMetricsEnabled flag is true AND
+// the operator kill-switch is enabled — the metrics graph
+// itself is shared and accepts every label. nil-receiver safe
+// (mirrors ObserveRequestDuration). The route argument is the
+// post-admit value (caller routed through routeLabelSet so the
+// caller has already paid the cap check); passing the pre-admit
+// string would create a way to bypass the cap.
+func (m *Metrics) ObserveRequestRoute(appID, plan, route, code string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.requestsByRoute.WithLabelValues(appID, plan, route, code).Inc()
+}
+
+// ObserveRequestDurationRoute records the per-route histogram
+// observation. Caller-routed through routeLabelSet on the
+// routeLabelSet side (same module-private pointer); nil-receiver
+// safe.
+func (m *Metrics) ObserveRequestDurationRoute(appID, route, class string, d time.Duration) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.durationByRoute.WithLabelValues(appID, route, class).Observe(d.Seconds())
+}
+
+// RequestFailureRoute records one per-route failure counter
+// increment for opt-in apps. Mirrors the existing per-app
+// gateway_requests_total{code} reader pattern; the dashboard
+// computes error_rate_pct as the ratio of this counter to
+// ObserveRequestRoute for the same (app, route). Caller-routed
+// through routeLabelSet. nil-receiver safe.
+func (m *Metrics) RequestFailureRoute(appID, plan, route, code string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	m.failuresByRoute.WithLabelValues(appID, plan, route, code).Inc()
+}
+
+// PreInstantiateAppRoute writes zero-valued series for the
+// closed (class) set under (appID, route) so dashboards surface
+// from the first request rather than after the first observation
+// (ADR-093 D4). The closed class set is the same as
+// PreInstantiateApp above (2xx/3xx/4xx/5xx). Caller-routed
+// through routeLabelSet — the route argument is post-admit, so
+// the cap is enforced before this is called. nil-receiver safe.
+func (m *Metrics) PreInstantiateAppRoute(appID, route string) {
+	if m == nil || appID == "" || route == "" {
+		return
+	}
+	for _, class := range []string{"2xx", "3xx", "4xx", "5xx"} {
+		m.durationByRoute.WithLabelValues(appID, route, class)
+	}
+}
+
 // ObserveRateLimit records a 429 outcome.
 func (m *Metrics) ObserveRateLimit(appID, plan string) {
 	m.rateLimited.WithLabelValues(appID, plan).Inc()
@@ -719,19 +1301,67 @@ func (m *Metrics) ObserveAccountRateLimit(accountID, plan string) {
 // the wake latency (request-received to first upstream byte). Issue #273 /
 // ADR-042 renamed from ObserveColdWake; the gateway_cold_wake_total →
 // gateway_cold_boot_total rename is intentional and not dual-emitted.
-func (m *Metrics) ObserveColdBoot(appID string, latency time.Duration) {
+//
+// PR #4 (ADR-092 §3.5) also observes the labelled per-node histogram
+// `gateway_wake_latency_seconds_by_node`. The label value is the
+// compute_node.id (UUID) — gatewayd-internal has no name cache on
+// the wake path, and id is the durable shard key. nodeID=="" is
+// possible only on a wake that lost its target (parked mid-wake);
+// the labelled bucket "__unknown" preserves the observation
+// without polluting the per-node quantiles — the unknown bucket
+// is excluded from per-node PromQL by the obsNodeWakeLatency
+// handler's matcher.
+
+// ObserveLeaderBootstrapAbort (ADR-098 C7) records a detached-leader
+// goroutine abort under the bootstrap cap. Closed (reason) set
+// pre-instantiated in NewMetrics; nil-safe on the receiver.
+func (m *Metrics) ObserveLeaderBootstrapAbort(reason string) {
+	if m == nil {
+		return
+	}
+	m.leaderBootstrapAborts.WithLabelValues(reason).Inc()
+}
+
+func (m *Metrics) ObserveColdBoot(appID string, latency time.Duration, nodeID string) {
 	m.coldBoot.WithLabelValues(appID).Inc()
 	m.wakeLatency.Observe(latency.Seconds())
+	if m.wakeLatencyByNode == nil {
+		return
+	}
+	label := nodeID
+	if label == "" {
+		label = "__unknown"
+	}
+	m.wakeLatencyByNode.WithLabelValues(label).Observe(latency.Seconds())
 }
 
 // ObserveWakeQueueWait records how long a request waited in the
 // per-app wake queue before the gate released it (single-flight
 // coalescing). Nil-safe so WakeGate can call it without branching.
+//
+// Deprecated: also observed via gateway_wake_phase_duration_seconds{phase="queue_wait"}.
+// The scalar here stays for one release — dashboards migrate in
+// the follow-up. ADR-098 C11.
 func (m *Metrics) ObserveWakeQueueWait(d time.Duration) {
 	if m == nil {
 		return
 	}
 	m.wakeQueueWait.Observe(d.Seconds())
+	// ADR-098 C11: dual-write into the labelled phase histogram so
+	// dashboards querying the new name see the same series shape.
+	m.wakePhaseDuration.WithLabelValues("queue_wait").Observe(d.Seconds())
+}
+
+// ObserveWakePhase records a single phase-decomposed wake boundary
+// measurement (ADR-098 C11). phase ∈ {"queue_wait", "coordinator_wait",
+// "schedd_admit", "vmmd_wake", "guest_ready", "cold_fallback_reason"}.
+// Closed set is pre-instantiated in NewMetrics. Nil-safe so the
+// gateway hot path doesn't branch.
+func (m *Metrics) ObserveWakePhase(phase string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.wakePhaseDuration.WithLabelValues(phase).Observe(d.Seconds())
 }
 
 // ObserveWakeLocality increments the wake-locality counter for the
@@ -770,6 +1400,69 @@ func (m *Metrics) ObserveEdgeRuleMatch(kind, outcome string) {
 		return
 	}
 	m.edgeRuleMatch.WithLabelValues(kind, outcome).Inc()
+}
+
+// ObserveEdgeRuleApply (ADR-091 hardening PR-A) increments the
+// apply-path counter. kind is the EdgeRuleKind; result is one of
+// {success, error}. Distinct from ObserveEdgeRuleMatch, which counts
+// the matcher's pick — a rule can match and still fail at apply time.
+// Nil-safe so the Handler hot path doesn't need a nil guard. PR #4
+// does not extend the result set; future error subclasses (e.g.
+// "jwks_expired", "ip_empty") require a new metric to keep cardinality
+// bounded (the §12 panel queries on {result=success}/{result=error}).
+func (m *Metrics) ObserveEdgeRuleApply(kind, result string) {
+	if m == nil {
+		return
+	}
+	m.edgeRuleApply.WithLabelValues(kind, result).Inc()
+}
+
+// ObserveRouteConsumerThrottleDecision (ADR-104, issue #881 Phase 3)
+// increments the per-consumer throttle decision counter. Called
+// from applyEdgeRuleThrottle after the AllowWithConsumerKey result
+// is in. kind is the resolved KeyBy dimension
+// (pkg/api.ThrottleKeyByNone | ...APIKey | ...JWTSubject | ...JWTClaim)
+// — normalised to the closed set, with "" coerced to "none" so an
+// empty wire payload doesn't add a new label tuple. outcome is
+// one of {admit, throttle, anonymous} — anonymous is the
+// authn-missing path on a per-consumer rule, a misconfiguration
+// signal for the dashboard. Nil-safe.
+func (m *Metrics) ObserveRouteConsumerThrottleDecision(kind, outcome string) {
+	if m == nil {
+		return
+	}
+	if kind == "" {
+		kind = "none"
+	}
+	m.routeConsumerThrottleDecisions.WithLabelValues(kind, outcome).Inc()
+}
+
+// ObserveEdgeRuleCompileError (ADR-091 hardening PR-A) increments the
+// compile-time error counter. Called from
+// cmd/gatewayd-internal/edge_rules.go::warnPathGlobErrs when a rule's
+// glob/path/CIDR failed to parse at boot. kind is one of the seven
+// shipped kinds; the loader dropped the offending rule and is serving
+// traffic without it. Nil-safe so the loader doesn't need a nil guard.
+func (m *Metrics) ObserveEdgeRuleCompileError(kind string) {
+	if m == nil {
+		return
+	}
+	m.edgeRuleCompileError.WithLabelValues(kind).Inc()
+}
+
+// ObserveAppMaintenance (ADR-091 amendment / §4.1.2.0) increments
+// the coarse-gate apps.maintenance_mode short-circuit counter.
+// plan is the matched app's plan (Free|Hobby|Pro|Scale). The
+// counter is closed-set bounded by the pre-instantiation loop
+// above; an unknown plan still emits (the metric accepts any label
+// value) but only the four canonical plans surface in the §12
+// dashboard panel. Nil-safe so the Handler hot path doesn't need
+// a nil guard.
+func (m *Metrics) ObserveAppMaintenance(plan string) {
+	if m == nil {
+		return
+	}
+	m.appMaintenance.WithLabelValues(plan).Inc()
 }
 
 // ObserveWakeSnapshotTier (issue #470 / PR #470-FU-B) increments
@@ -874,6 +1567,21 @@ func (m *Metrics) ObserveTLSOnDemandDenied(reason string) {
 		return
 	}
 	m.tlsOnDemandDenied.WithLabelValues(reason).Inc()
+}
+
+// ObserveTenantSurfaceCert (ADR-100 / issue #879) increments the
+// per-surface cert-remint counter. result ∈ {issued, failed,
+// skipped} (skipped = no verified hostnames / soft-deleted
+// surface / unsupported cert_kind — paths that never reach the
+// CA). kind ∈ {per_host_san, shared_wildcard}. nil-safe so the
+// pkg/gateway cert-issuer path can be exercised by tests that
+// don't wire a full Metrics — same pattern as
+// ObserveTLSOnDemandDenied above.
+func (m *Metrics) ObserveTenantSurfaceCert(result, kind string) {
+	if m == nil {
+		return
+	}
+	m.tenantSurfaceCert.WithLabelValues(result, kind).Inc()
 }
 
 // SetTLSCertExpiry writes the smallest remaining lifetime across cached
@@ -984,4 +1692,162 @@ func (l *requestLogger) Log(appID, code string, latency time.Duration, cold bool
 		"cold", cold,
 		"request_id", logsanitize.Field(requestID),
 	)
+}
+
+// Issue #676 / ADR-080 follow-up, PR-B: closed-set label constants
+// for the gateway_ws_* Prometheus surface. Defining the sets here
+// — alongside the per-Handler Metrics type — means the constructor
+// pre-instantiate loop and the runtime helper methods share the
+// same source of truth. Adding a fourth outcome or a third
+// direction requires a deliberate constant edit; the alternative
+// (string literals scattered across pkg/gateway + handler.go) is
+// how §12 dashboard naming conventions get silently out of sync
+// with the metric names.
+type WSOutcome string
+
+const (
+	// WSOutcomeAccepted — request cleared the three-input gate
+	// (isUpgradeRequest + plan allowed + h.rawByNode wired) and
+	// the raw forwarder accepted the stream. The session
+	// duration histogram and the byte counters both fire on
+	// this outcome.
+	WSOutcomeAccepted WSOutcome = "accepted"
+	// WSOutcomePlanDenied — Plan.WebSocketResponseAllowed()
+	// returned false (Free plan). Surfaced by both the request-
+	// time 501 (pkg/gateway/handler.go writeWebSocketNotAllowed)
+	// and the PATCH-time 403
+	// (cmd/apid/handlers_ext.go:261-268).
+	WSOutcomePlanDenied WSOutcome = "plan_denied"
+	// WSOutcomeBridgeDisabled — either the
+	// FAAS_GATEWAY_RAW_STREAM_ENABLED=false kill switch
+	// (cmd/gatewayd-internal/run.go: PR-A) or h.rawByNode==nil
+	// in tests. Surfaced as the forwarderMissing=true branch of
+	// writeWebSocketNotAllowed with the same 501 +
+	// x-faas-error-reason: websocket_not_on_plan response shape.
+	WSOutcomeBridgeDisabled WSOutcome = "bridge_disabled"
+	// WSOutcomeInitFailed — rawStreamOnceWithEvents failed to
+	// open the bidi ForwardRawStream or send the init frame
+	// (the gRPC dial refused, the box lost its mTLS cert, or
+	// the bridge binary is missing). Distinct from
+	// client_disconnect because the failure happens BEFORE
+	// any bytes flow; the byte counters stay at zero.
+	WSOutcomeInitFailed WSOutcome = "init_failed"
+	// WSOutcomeUpstreamUnavailable — vmmd returned
+	// codes.Unavailable mid-session (the box crashed, the
+	// bridge binary lost its netns handle, etc.). Surfaced
+	// as 503 + body="upstream unavailable" from the
+	// receiver loop.
+	WSOutcomeUpstreamUnavailable WSOutcome = "upstream_unavailable"
+	// WSOutcomeClientDisconnect — the customer closed the
+	// connection mid-stream (TCP FIN before EOF on the
+	// body-copy goroutine). This is the normal-session-end
+	// case for WS clients; the panel
+	// rate(gateway_ws_session_duration_seconds{outcome=
+	// "client_disconnect"}) is the customer-side churn signal.
+	WSOutcomeClientDisconnect WSOutcome = "client_disconnect"
+)
+
+type WSDirection string
+
+const (
+	// WSDirectionTx — bytes flowing customer → guest
+	// (request body + the raw HTTP request line + headers
+	// that the raw bridge carries verbatim). Incremented in
+	// the body-copy goroutine at
+	// pkg/gateway/forwardproxy.go:~558.
+	WSDirectionTx WSDirection = "tx"
+	// WSDirectionRx — bytes flowing guest → customer
+	// (response body + the raw HTTP status line + headers
+	// that the bridge pipes back). Incremented in the
+	// receiver loop at pkg/gateway/forwardproxy.go:~651.
+	// Raw-stream egress bytes ALSO flow through the
+	// per-instance egress ring via
+	// egressSink.RecordResponseBytes (PR-C follow-up) so
+	// usage_minutes.tx_bytes reflects WS workloads without a
+	// separate meterd surface.
+	WSDirectionRx WSDirection = "rx"
+)
+
+// IncWSUpgrade (issue #676 / ADR-080 follow-up, PR-B) bumps the
+// {plan, outcome}-labeled gateway_ws_upgrade_total counter at the
+// cmd/gatewayd-internal three-input gate
+// (pkg/gateway/handler.go:2899). Caller passes the resolved plan
+// (Free/Hobby/Pro/Scale from api.Plans) and one of the WSOutcome
+// constants. The closed label set is pre-instantiated at boot
+// (see NewMetrics) so this call always returns a real counter;
+// nil only if m itself is nil (callers in the pre-metrics test
+// corpus use nil-safe wrap patterns).
+func (m *Metrics) IncWSUpgrade(plan string, outcome WSOutcome) {
+	if m == nil {
+		return
+	}
+	m.wsUpgradeTotal.WithLabelValues(plan, string(outcome)).Inc()
+}
+
+// IncWSSessionStart (issue #676 / ADR-080 follow-up, PR-B)
+// increments the {plan}-labeled gateway_ws_active_sessions
+// gauge when a raw-bytes Upgrade session opens. MUST be paired
+// with DecWSSessionEnd on every return path;
+// pkg/gateway/forwardproxy.go's rawStreamOnceWithEvents uses a
+// `IncWSSessionStart + defer DecWSSessionEnd` pair at the top of
+// the function so symmetry is automatic across init_failed /
+// upstream_unavailable / client_disconnect / accepted.
+func (m *Metrics) IncWSSessionStart(plan string) {
+	if m == nil {
+		return
+	}
+	m.wsActiveSessions.WithLabelValues(plan).Inc()
+}
+
+// DecWSSessionEnd (issue #676 / ADR-080 follow-up, PR-B)
+// decrements the {plan}-labeled gateway_ws_active_sessions
+// gauge when a raw-bytes Upgrade session closes. MUST be paired
+// with IncWSSessionStart; the defer-pair at
+// rawStreamOnceWithEvents guarantees symmetry. Calling
+// DecWSSessionEnd without a matching Inc is a programmer error
+// and will produce negative gauge values.
+func (m *Metrics) DecWSSessionEnd(plan string) {
+	if m == nil {
+		return
+	}
+	m.wsActiveSessions.WithLabelValues(plan).Dec()
+}
+
+// ObserveWSSessionDuration (issue #676 / ADR-080 follow-up, PR-B)
+// records one wall-clock seconds sample in the
+// {plan, outcome}-labeled gateway_ws_session_duration_seconds
+// histogram. Buckets span 50 ms to 24 h; a session hitting the
+// rawStreamSessionDeadline ceiling
+// (pkg/gateway/forwardproxy.go:464) emits the top bucket
+// cleanly. Outcome distinguishes the closed-session paths
+// (accepted / client_disconnect) from the failure paths
+// (init_failed / upstream_unavailable) so a Grafana panel can
+// split "WS churn" (client_disconnect rate) from "WS
+// availability" (accepted / (accepted + init_failed +
+// upstream_unavailable) ratio).
+func (m *Metrics) ObserveWSSessionDuration(plan string, outcome WSOutcome, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.wsSessionDuration.WithLabelValues(plan, string(outcome)).Observe(d.Seconds())
+}
+
+// AddWSSessionBytes (issue #676 / ADR-080 follow-up, PR-B) adds
+// n bytes to the {plan, direction}-labeled
+// gateway_ws_session_bytes_total counter. Use Add (not Inc)
+// because a single Write or Read can carry more than 1 byte —
+// e.g. a 16 KiB gorilla/websocket frame in the round-trip e2e
+// (pkg/gateway/forwardproxy_handler_test.go). Counter math is
+// identical to a per-byte Inc but the API surface documents the
+// byte-volume intent. n<=0 is a no-op (handles short-reads where
+// the body goroutine returned 0 bytes before EOF without
+// double-counting).
+func (m *Metrics) AddWSSessionBytes(plan string, direction WSDirection, n int64) {
+	if m == nil {
+		return
+	}
+	if n <= 0 {
+		return
+	}
+	m.wsSessionBytes.WithLabelValues(plan, string(direction)).Add(float64(n))
 }

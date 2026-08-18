@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { CreateEdgeRuleRequest } from '../models/CreateEdgeRuleRequest.js';
 import type { EdgeRuleResponse } from '../models/EdgeRuleResponse.js';
+import type { ThrottleSuggestionsResponse } from '../models/ThrottleSuggestionsResponse.js';
 import type { UpdateEdgeRuleRequest } from '../models/UpdateEdgeRuleRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
@@ -63,10 +64,11 @@ export class EdgeRulesService {
   }
   /**
    * Create an edge rule on an app.
-   * Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip}.
-   * `action` is a kind-tagged jsonb body — the per-kind shape is
-   * documented under components/schemas. Plan-kind gate: jwt/ip
-   * return 402 plan_edge_rule_kind_not_allowed on Free. Per-app
+   * Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip,
+   * validate, geo}. `action` is a kind-tagged jsonb body — the per-kind
+   * shape is documented under components/schemas. Plan-kind gate:
+   * jwt/ip return 402 plan_edge_rule_kind_not_allowed on Free; geo
+   * is allowed on Free with a tighter per-app quota. Per-app
    * quota returns 402 plan_limit_edge_rules once EdgeRulesPerApp
    * is reached.
    *
@@ -194,6 +196,57 @@ export class EdgeRulesService {
         'id': id,
       },
       errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-route throttle recommender (ADR-091 D20.5 amendment,
+   * issue #881). Read-only: returns a suggested rps/burst per
+   * route over the window, clamped to the customer's plan
+   * ceiling so the suggestion is always settable.
+   *
+   * The recommender is ADVICE-ONLY — it never auto-applies.
+   * Customers confirm via POST /v1/apps/{slug}/edge-rules.
+   *
+   * @returns ThrottleSuggestionsResponse Suggestion payload. Source is `prometheus` on success
+   * or `degraded: <reason>` on Prometheus failure
+   * (response is still 200 with empty Suggestions — the
+   * dashboard's empty-state branch handles it).
+   *
+   * @throws ApiError
+   */
+  public static getAppThrottleSuggestions({
+    slug,
+    range = '5m',
+  }: {
+    /**
+     * App slug (lowercase, kebab-case; per-account unique). The recommender walks the per-route rate() for this app's gatewayd-internal reader.
+     */
+    slug: string,
+    /**
+     * Prometheus window. Closed vocabulary (see
+     * `pkg/appmetrics.Ranges`). Defaults to 5m.
+     *
+     */
+    range?: string,
+  }): CancelablePromise<ThrottleSuggestionsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/throttle-suggestions',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'range': range,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
         404: `code: not_found`,
         429: `429. Two response shapes:

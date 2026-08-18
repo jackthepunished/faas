@@ -1,0 +1,16 @@
+[Service]
+# Mega-PR-C (issue #911 / ADR-110): wire the per-box role gate
+# through to the control-plane daemons (apid, schedd, meterd) so
+# cmd/<daemon>/config.go::LoadConfig picks the right
+# role.FromConfig sentinel (FAAS_<DAEMON>_ROLE). Without this
+# drop-in the daemons fall back to RoleSingleBox on a multi-box
+# fleet and the per-daemon role gate is unenforced.
+#
+# The drop-in wins over the unit's [Service] section
+# (systemd.unit(5) "later wins") and the units have no
+# Environment= line on FAAS_<DAEMON>_ROLE, so the drop-in is the
+# only source of the env var. Idempotent — `ansible.builtin.template`
+# is no-op when the rendered file is byte-identical.
+Environment=FAAS_APID_ROLE={{ faas_box_role }}
+Environment=FAAS_SCHEDD_ROLE={{ faas_box_role }}
+Environment=FAAS_METERD_ROLE={{ faas_box_role }}

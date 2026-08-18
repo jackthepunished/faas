@@ -54,6 +54,27 @@ func okStub(v float64) *stubPromQL {
 	return &stubPromQL{fn: func(_ string) (float64, error) { return v, nil }}
 }
 
+// queryDiscriminatorStub returns one scalar for the
+// schedd_egress_net_tx_bytes_total query and another for the
+// gateway_egress_tx_bytes_total query, so the test can assert
+// the two fields are populated independently. Any other query
+// returns 0 + nil (the test does not assert on the other fields).
+type queryDiscriminatorStub struct {
+	scheddEgress  float64
+	gatewayEgress float64
+}
+
+func (s *queryDiscriminatorStub) QueryScalar(_ context.Context, query string) (float64, error) {
+	switch {
+	case strings.Contains(query, "schedd_egress_net_tx_bytes_total"):
+		return s.scheddEgress, nil
+	case strings.Contains(query, "gateway_egress_tx_bytes_total"):
+		return s.gatewayEgress, nil
+	default:
+		return 0, nil
+	}
+}
+
 // TestAppMetrics_Fetch_HappyPath stubs every query to return 42 and
 // asserts every field landed in the response and Source == "prometheus".
 func TestAppMetrics_Fetch_HappyPath(t *testing.T) {
@@ -440,3 +461,93 @@ func TestFetch_NilLogger(t *testing.T) {
 // we expect. A future pkg/api change that splits the struct would
 // surface here.
 var _ = func() bool { var x api.AppMetricsResponse; return x.AppID == "" }()
+
+// TestFetch_PR2_TxBytesPopulatedIndependently is the PR-C.2 / issue
+// #415 PR-2 close-out: the gateway-side tx_bytes mirror is populated
+// by appmetrics.Fetch from gateway_egress_tx_bytes_total{app}, and
+// the field is independent of the schedd-side EgressBytes (the
+// schedd-side query targets schedd_egress_net_tx_bytes_total{app}).
+//
+// The discriminator stub returns different scalars for the two
+// queries so the test can assert: (a) each field is populated
+// from its own query, (b) a divergence between the two fields
+// surfaces in the response (i.e. the gateway-side tx_bytes does
+// NOT silently shadow the schedd-side EgressBytes).
+func TestFetch_PR2_TxBytesPopulatedIndependently(t *testing.T) {
+	stub := &queryDiscriminatorStub{
+		scheddEgress:  1024, // 1 KiB
+		gatewayEgress: 4096, // 4 KiB — divergence is the test condition
+	}
+	logger, _ := captureLog(t)
+
+	resp, src := appmetrics.Fetch(context.Background(), stub, logger, "app-pr2", "5m")
+	if src != appmetrics.SourcePrometheus {
+		t.Errorf("src = %q, want %q (tx_bytes query failure must NOT flip the response to degraded — both fields are best-effort)", src, appmetrics.SourcePrometheus)
+	}
+	if resp.EgressBytes != 1024 {
+		t.Errorf("EgressBytes = %d, want 1024 (schedd-side mirror should populate from schedd_egress_net_tx_bytes_total)", resp.EgressBytes)
+	}
+	if resp.TxBytes != 4096 {
+		t.Errorf("TxBytes = %d, want 4096 (gateway-side mirror should populate from gateway_egress_tx_bytes_total independently of EgressBytes)", resp.TxBytes)
+	}
+}
+
+// TestFetch_PR2_TxBytesQueryFailureDoesNotDegrade asserts that a
+// failure on the gateway-side tx_bytes query does NOT flip the
+// response to "degraded: ..." — the dispatch contract is the same
+// as the schedd-side EgressBytes: best-effort, log-and-continue.
+// The dashboard's tx_bytes field is allowed to be 0 (which is
+// indistinguishable from "no data").
+func TestFetch_PR2_TxBytesQueryFailureDoesNotDegrade(t *testing.T) {
+	// failingTxBytesStub is a per-field-error stub: returns the
+	// schedd-side EgressBytes scalar, errors on the gateway-side
+	// tx_bytes query. The tx_bytes failure path is the test
+	// condition; the schedd-side success path is the control.
+	gatewayErr := errors.New("simulated gateway_egress_tx_bytes_total query failure")
+
+	failingStub := &failingTxBytesStub{
+		scheddEgress: 512,
+		gatewayErr:   gatewayErr,
+	}
+	logger, logBuf := captureLog(t)
+
+	resp, src := appmetrics.Fetch(context.Background(), failingStub, logger, "app-pr2", "5m")
+	if src != appmetrics.SourcePrometheus {
+		t.Errorf("src = %q, want %q (tx_bytes query failure must NOT flip the response to degraded)", src, appmetrics.SourcePrometheus)
+	}
+	if resp.EgressBytes != 512 {
+		t.Errorf("EgressBytes = %d, want 512 (schedd-side mirror should still populate when tx_bytes fails)", resp.EgressBytes)
+	}
+	if resp.TxBytes != 0 {
+		t.Errorf("TxBytes = %d, want 0 (the failing query should leave the field at zero)", resp.TxBytes)
+	}
+	// Verify the failure was logged with the right app_id so an
+	// operator eyeballing the log can localise the gap.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "tx_bytes query failed") {
+		t.Errorf("expected log to contain 'tx_bytes query failed', got: %s", logged)
+	}
+	if !strings.Contains(logged, "app-pr2") {
+		t.Errorf("expected log to contain app_id; got: %s", logged)
+	}
+}
+
+// failingTxBytesStub is the per-field-error test double for the
+// tx_bytes best-effort path. Returns nil for the schedd-side
+// EgressBytes query and a configured error for the gateway-side
+// tx_bytes query.
+type failingTxBytesStub struct {
+	scheddEgress float64
+	gatewayErr   error
+}
+
+func (s *failingTxBytesStub) QueryScalar(_ context.Context, query string) (float64, error) {
+	switch {
+	case strings.Contains(query, "schedd_egress_net_tx_bytes_total"):
+		return s.scheddEgress, nil
+	case strings.Contains(query, "gateway_egress_tx_bytes_total"):
+		return 0, s.gatewayErr
+	default:
+		return 0, nil
+	}
+}

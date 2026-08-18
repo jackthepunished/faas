@@ -1,6 +1,6 @@
 # ADR-083 · Active-passive HA topology (Tier A8 / issue #297 slice 6)
 
-- **Status:** proposed
+- **Status:** **Accepted** (revised 2026-08-16)
 - **Superseded (in part, PR-E):** prose referred to the monolithic
   `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
   edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
@@ -556,5 +556,8 @@ Closes the §14 M8 "Gate-A runbook (2nd box active-passive)" row:
   + A5 sections that this builds on)
 - `docs/runbooks/multi-host-rollout.md` (mirror of the §14 M5
   / M8 / M9 rows)
+- `docs/runbooks/manifest-renderer-cutover.md` (PR-7): the
+  canonical cutover narrative from a legacy single-box installation
+  to the split-box world this ADR's HA topology sits on top of.
 - Issue #297 (umbrella), issue #681 (snapshot de-localization,
   unrelated but listed for completeness)

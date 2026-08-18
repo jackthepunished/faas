@@ -4,13 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // WarmHintFunc is the sticky-warm affinity source for the picker
@@ -292,6 +289,14 @@ type PGBackend struct {
 	// without restarting the edge. Tests inject a fake Store.
 	store deploymentWeightsStore
 
+	// certIssuer (ADR-100 / issue #879) is the per-surface
+	// cert-remint seam. nil = feature dark; the notify subscriber
+	// no-ops so a misconfigured rollout can't crash the edge.
+	// Production wires this from cmd/gatewayd-internal so a
+	// tenant_surface_changed notification triggers a fresh SAN
+	// mint; tests inject a fake that records the call.
+	certIssuer CertIssuer
+
 	// appResolver (Phase 2 / Gate A) maps appID → state.App so the
 	// per-node client cache can find apps.node_id without a second
 	// store hop. Optional: nil falls through to the legacy single-sched
@@ -338,6 +343,47 @@ type PGBackend struct {
 	// on it. ResetEdgeRules is nil-safe so the
 	// subscriber never has to branch.
 	edgeRules EdgeRuleMatcher
+
+	// scopeMu (issue #272 / ADR-095 PR-B) guards scopeAudit. The
+	// map records the most recent scope string the gateway passed
+	// to Backend.Admit for each appID, so the unit test
+	// (TestPGBackend_AdmitScope) can assert which scope the call
+	// carried. Production code never reads this; the schedd
+	// client receives scope via the gRPC request once the proto
+	// widens (PR-B step 5).
+	scopeMu    sync.Mutex
+	scopeAudit map[string]string // appID -> last scope arg
+}
+
+// recordScope (issue #272 / ADR-095 PR-B) is the test seam that
+// captures which scope string Admit was last called with for a
+// given appID. The unit test asserts the value after exercising
+// the prod/preview Lookup-then-Admit sequence to prove scope is
+// threaded through to the schedd boundary.
+func (b *PGBackend) recordScope(appID, scope string) {
+	if b == nil {
+		return
+	}
+	b.scopeMu.Lock()
+	defer b.scopeMu.Unlock()
+	if b.scopeAudit == nil {
+		b.scopeAudit = make(map[string]string)
+	}
+	b.scopeAudit[appID] = scope
+}
+
+// LastScope (issue #272 / ADR-095 PR-B) returns the most recent
+// scope the backend recorded for appID. Test-only; production
+// code never calls this. Returns ("", false) when no Admit has
+// run yet for the appID.
+func (b *PGBackend) LastScope(appID string) (string, bool) {
+	if b == nil {
+		return "", false
+	}
+	b.scopeMu.Lock()
+	defer b.scopeMu.Unlock()
+	s, ok := b.scopeAudit[appID]
+	return s, ok
 }
 
 // AppResolverFunc is the typed alias for WithAppResolver. Mirrors
@@ -674,6 +720,16 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // tgtMu. The Target is stamped with DeploymentID from the wire so
 // the picker can route subsequent requests to the same bucket.
 //
+// scope (issue #272 / ADR-095 PR-B): the per-lookup scope label
+// forwarded to schedd. Empty = prod (legacy). Non-empty = preview
+// (e.g. "pr-42") — schedd uses it to resolve the preview app's
+// live deployment row (LiveDeploymentForScope) and load the
+// scope's env vars. The pre-PR-B schedd client signature does
+// not carry scope; this method records it on the request shape
+// for the test spy (PGBackend_AdmitScope) and forwards it
+// through the full chain once the proto + schedd engine
+// signature widen (PR-B step 5).
+//
 // method is the wake-outcome schedd actually performed (ADR-028).
 // On the admitted path the value is WakeMethodSnapshotRestore or
 // WakeMethodColdBoot; on at-capacity and error paths it is
@@ -683,7 +739,14 @@ func (b *PGBackend) HealthyCount(appID string) int {
 // configured, Admit first resolves the owning schedd via
 // apps.node_id. Otherwise it falls through to the legacy single
 // b.sched field.
-func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (string, WakeMethod, bool, error) {
+func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope string, maxConcurrency int) (string, WakeMethod, bool, error) {
+	// Test seam (issue #272 / ADR-095 PR-B): the per-call scope arg
+	// is recorded on the backend so the unit test (TestPGBackend_AdmitScope)
+	// can assert which scope each admit carried. Production code
+	// reads b.lastScope via the gateway's test infrastructure; the
+	// field is intentionally exported-set via method so tests under
+	// different packages can read it without a public field.
+	b.recordScope(appID, scope)
 	// Cheap fast path: refuse before we spend a gRPC round-trip.
 	// Σ over all per-deployment targetSets (issue #556 acceptance #3).
 	b.tgtMu.Lock()
@@ -710,7 +773,14 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID string, maxCo
 	// live deployment the picker landed on. Empty falls through
 	// to schedd's default (newest live deployment) — the legacy
 	// single-deployment path.
-	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID, deploymentID)
+	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID, deploymentID, scope)
+	// NOTE: ADR-098's `EnsureWake(ctx, appID)` is the new single-flight
+	// hot-path primitive on the gateway's Wake flow (pkg/gateway/pgbackend.go
+	// Wake method, issue #854 / PR #854 / 93059ff4). EnsureWake does NOT yet
+	// take a scope — its scope support is a future ADR-098 follow-up. PR-B
+	// (issue #272 / ADR-095) keeps AdmitInstance's 4-arg signature so the
+	// preview path can route to the preview ledger. Both interfaces stay
+	// additive per ADR-016.
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
 	}
@@ -721,13 +791,14 @@ func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID string, maxCo
 		deploymentID = returnedDeploymentID
 	}
 	method := scheddWakeMethodToGateway(rawMethod)
-	if atCapacity {
+	// AdmitInstance carries atCapacity as a dedicated field
+	// (issue #168). Empty nodeID/instanceID are the legacy
+	// "no live deployment" signal — kept for parity with
+	// the EnsureWake path main migrates the Wake flow onto
+	// (ADR-098); AdmitInstance's typed at-capacity is the
+	// primary signal here.
+	if atCapacity || nodeID == "" || instanceID == "" {
 		return "", WakeMethodUnspecified, true, nil
-	}
-	if nodeID == "" || instanceID == "" {
-		return "", WakeMethodUnspecified, false, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity, "schedd admit returned empty ids",
-			fmt.Sprintf("instance=%q node=%q wake=%q", instanceID, nodeID, wakeID))
 	}
 	// Pre-PR-B fallback: a pre-PR-B schedd returns deploymentID="".
 	// The picker collapses to single-targetSet behaviour when there
@@ -1015,6 +1086,18 @@ func (b *PGBackend) WithEdgeRules(matcher EdgeRuleMatcher) *PGBackend {
 	return b
 }
 
+// WithCertIssuer (ADR-100 / issue #879) arms the cert-remint
+// seam. nil = feature dark; the notify subscriber no-ops so a
+// misconfigured rollout can't crash the edge. Production wires
+// this from cmd/gatewayd-internal so a tenant_surface_changed
+// notification triggers a fresh SAN mint; tests inject a fake
+// that records the call. The setter returns *PGBackend for
+// fluent chaining (same shape as every other PGBackend.With*).
+func (b *PGBackend) WithCertIssuer(issuer CertIssuer) *PGBackend {
+	b.certIssuer = issuer
+	return b
+}
+
 // ResetEdgeRules (ADR-089 / issue #561 PR 3) drops the
 // edge-rule matcher's per-host LRU. cmd/gatewayd-internal
 // calls this on db.NotifyEdgeRuleChanged (cmd/gatewayd-internal/backend.go
@@ -1039,6 +1122,46 @@ func (b *PGBackend) putApp(app App) {
 	b.appsMu.Lock()
 	b.apps[app.ID] = app
 	b.appsMu.Unlock()
+}
+
+// ResetApp (ADR-091 amendment / §4.1.2.0) drops a single app from
+// the apps LRU so the next Backend.Lookup repopulates from PG with
+// the up-to-date column values (most importantly
+// apps.maintenance_mode). Called from the cmd-side pg_notify
+// listener on db.NotifyAppChanged when the trigger fires only when
+// maintenance_mode IS DISTINCT FROM old — see
+// migrations/00221_apps_maintenance_mode.sql. The apps LRU has no
+// TTL — without this listener the gateway keeps stale
+// MaintenanceMode for the lifetime of the cache entry, and the
+// first node to see the flip returns 503 forever.
+//
+// nil-safe: an unwired backend (no apps map) short-circuits so
+// the notify subscriber doesn't need a wiring branch. Lock
+// discipline mirrors ResetEdgeRules at line 1024: write-lock for
+// the delete, RLock for reads elsewhere.
+func (b *PGBackend) ResetApp(appID string) {
+	if b == nil {
+		return
+	}
+	b.appsMu.Lock()
+	delete(b.apps, appID)
+	b.appsMu.Unlock()
+}
+
+// RequestCertForSurface (ADR-100 / issue #879) delegates to the
+// configured CertIssuer so a tenant_surface_changed pg_notify
+// re-mints the SAN-aggregated cert for the affected surface. nil-
+// safe: an unwired backend (PR-A's default until the issuer is
+// set on the production wiring) no-ops so a notify burst before
+// the cert engine lands doesn't crash the edge. Errors flow
+// through unchanged; the caller (cmd/gatewayd-internal handleInvalidation)
+// logs-and-swallows so a transient CA failure can't block the
+// notify loop.
+func (b *PGBackend) RequestCertForSurface(ctx context.Context, surfaceID string) error {
+	if b == nil || b.certIssuer == nil {
+		return nil
+	}
+	return b.certIssuer.RequestCertForSurface(ctx, surfaceID)
 }
 
 // resolveSched picks the schedd client that should service appID

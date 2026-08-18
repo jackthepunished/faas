@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 )
 
@@ -61,6 +62,76 @@ func (s *server) runVerifyOnce(ctx context.Context, log *slog.Logger) {
 			log.Info("domain verified", "domain", d.Domain)
 		}
 	}
+	// ADR-100 / issue #879: poll tenant hostnames alongside
+	// custom domains. Both use the same _faas-verify.<hostname>
+	// TXT record format, so checkTXT is shared. The poller is
+	// gated on api.TenantSurfacesEnabled() so a feature-flag
+	// disable suppresses the LISTEN load on the poller goroutine
+	// even when the table is empty.
+	if !api.TenantSurfacesEnabled() {
+		return
+	}
+	pendingHostnames, err := s.pendingUnverifiedHostnames(ctx)
+	if err != nil {
+		log.Warn("dns_poller: list tenant hostnames failed", "err", err)
+		return
+	}
+	for _, h := range pendingHostnames {
+		if checkTXT(ctx, h.Hostname, h.ChallengeToken) {
+			if err := s.store.MarkTenantHostnameVerified(ctx, h.Hostname); err != nil {
+				log.Warn("dns_poller: mark tenant hostname verified failed", "hostname", h.Hostname, "err", err)
+				continue
+			}
+			// tenant_surface_changed fires on the tenant_hostnames
+			// UPDATE (the trigger at migrations/00243 fires on
+			// every relevant column change including verified_at).
+			// The gatewayd cert-remint subscriber picks it up and
+			// asks the issuer for a fresh SAN-aggregated cert.
+			//
+			// Audit row: tenant_hostname.verified is the third
+			// event of the surface lifecycle (added / removed /
+			// verified). The data carries the surface_id so the
+			// dashboard "verified at" timeline keys off it.
+			if s.audit != nil {
+				s.audit.Emit(ctx, "tenant_hostname.verified", nil, map[string]any{
+					"hostname":   h.Hostname,
+					"surface_id": h.SurfaceID,
+				})
+			}
+			log.Info("tenant hostname verified", "hostname", h.Hostname, "surface", h.SurfaceID)
+		}
+	}
+}
+
+// pendingUnverifiedHostnames (ADR-100 / issue #879) returns the
+// batch of unverified tenant hostnames due for a TXT poll. The
+// batcher is ListPendingTenantHostnames — bounded by the poller
+// limit (50 per pass) so a single batch doesn't dominate the
+// goroutine.
+func (s *server) pendingUnverifiedHostnames(ctx context.Context) ([]pendingHostnameRow, error) {
+	rows, err := s.store.ListPendingTenantHostnames(ctx, time.Now(), 50)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]pendingHostnameRow, len(rows))
+	for i, h := range rows {
+		out[i] = pendingHostnameRow{
+			Hostname:       h.Hostname,
+			ChallengeToken: h.ChallengeToken,
+			SurfaceID:      h.SurfaceID,
+		}
+	}
+	return out, nil
+}
+
+// pendingHostnameRow is the poller's view of an unverified
+// tenant hostname. SurfaceID is logged for operator triage so a
+// failed poll maps back to the customer surface without a
+// second store hop.
+type pendingHostnameRow struct {
+	Hostname       string
+	ChallengeToken string
+	SurfaceID      string
 }
 
 // pendingUnverifiedDomains reads the unverified index directly. Implemented
@@ -94,8 +165,7 @@ type pendingDomainRow struct {
 // any returned record equals the expected token.
 func checkTXT(ctx context.Context, domain, expected string) bool {
 	target := "_faas-verify." + domain
-	resolver := &net.Resolver{}
-	records, err := resolver.LookupTXT(ctx, target)
+	records, err := txtLookupFunc(ctx, target)
 	if err != nil {
 		return false
 	}
@@ -105,4 +175,12 @@ func checkTXT(ctx context.Context, domain, expected string) bool {
 		}
 	}
 	return false
+}
+
+// txtLookupFunc is the test seam for the TXT verifier. Production
+// uses the real net.Resolver; tests inject a fake that returns
+// canned records. ADR-100 / issue #879: the same seam covers
+// the custom-domain and tenant-hostname verification paths.
+var txtLookupFunc = func(ctx context.Context, target string) ([]string, error) {
+	return (&net.Resolver{}).LookupTXT(ctx, target)
 }

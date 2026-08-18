@@ -630,6 +630,12 @@ func buildDeploymentsForExport(rows []state.Deployment) ([]api.DeploymentRespons
 			Status: string(d.Status), Error: sanitizeExportString(d.Error),
 			ErrorCode: d.ErrorCode,
 			CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
+			// ADR-091 / PR-D: scope echo on export fixtures so the
+			// GDPR export carries the per-deployment env-targeting
+			// context. Stamped from dep.Scope (already populated by
+			// the SELECT projection in pgstore.DeploymentByID /
+			// ListDeployments*).
+			Scope: d.Scope,
 		})
 	}
 	return out, nil

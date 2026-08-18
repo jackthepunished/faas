@@ -4,6 +4,7 @@
 package githubd
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -95,5 +96,222 @@ func TestDecodePush_EmptyBeforeIsAccepted(t *testing.T) {
 	}
 	if ev.Before != "" {
 		t.Errorf("Before = %q, want empty", ev.Before)
+	}
+}
+
+// validPRBody is a complete pull_request body the happy-path tests
+// reuse. The head SHA is the standard 40-char hex form; the head
+// repo's full_name matches the base repo's full_name (i.e. NOT a
+// fork). Action is "opened".
+const validPRBody = `{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "state": "open",
+    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    "head_ref": "feat/foo",
+    "head": {"ref": "feat/foo", "sha": "0123456789abcdef0123456789abcdef01234567", "repo": {"full_name": "octo/api"}}
+  },
+  "repository": {"full_name": "octo/api", "name": "api", "html_url": "https://github.com/octo/api"},
+  "installation": {"id": 99},
+  "sender": {"login": "octocat"}
+}`
+
+func TestDecodePullRequest_HappyPath(t *testing.T) {
+	t.Parallel()
+	ev, err := DecodePullRequest([]byte(validPRBody))
+	if err != nil {
+		t.Fatalf("DecodePullRequest() err = %v", err)
+	}
+	if ev.Action != PullRequestActionOpened {
+		t.Errorf("Action = %q, want opened", ev.Action)
+	}
+	if ev.Number != 42 {
+		t.Errorf("Number = %d, want 42", ev.Number)
+	}
+	if ev.PullRequest.HeadSHA != "0123456789abcdef0123456789abcdef01234567" {
+		t.Errorf("HeadSHA = %q, want 40-char hex", ev.PullRequest.HeadSHA)
+	}
+	if ev.PullRequest.State != "open" {
+		t.Errorf("State = %q, want open", ev.PullRequest.State)
+	}
+	if ev.Repository.FullName != "octo/api" {
+		t.Errorf("Repository.FullName = %q, want octo/api", ev.Repository.FullName)
+	}
+	if ev.Installation.ID != 99 {
+		t.Errorf("Installation.ID = %d, want 99", ev.Installation.ID)
+	}
+	if ev.Sender.Login != "octocat" {
+		t.Errorf("Sender.Login = %q, want octocat", ev.Sender.Login)
+	}
+	if ev.IsFork() {
+		t.Errorf("IsFork() = true, want false (head and base are the same repo)")
+	}
+}
+
+func TestDecodePullRequest_ActionsAccepted(t *testing.T) {
+	t.Parallel()
+	cases := []PullRequestAction{
+		PullRequestActionOpened,
+		PullRequestActionSynchronize,
+		PullRequestActionReopened,
+		PullRequestActionClosed,
+	}
+	for _, a := range cases {
+		a := a
+		t.Run(string(a), func(t *testing.T) {
+			t.Parallel()
+			body := strings.Replace(validPRBody, `"action": "opened"`, `"action": "`+string(a)+`"`, 1)
+			if _, err := DecodePullRequest([]byte(body)); err != nil {
+				t.Fatalf("DecodePullRequest(%s) err = %v", a, err)
+			}
+		})
+	}
+}
+
+func TestDecodePullRequest_RejectsUnknownAction(t *testing.T) {
+	t.Parallel()
+	cases := []string{"assigned", "labeled", "review_requested", "edited", "ready_for_review"}
+	for _, a := range cases {
+		a := a
+		t.Run(a, func(t *testing.T) {
+			t.Parallel()
+			body := strings.Replace(validPRBody, `"action": "opened"`, `"action": "`+a+`"`, 1)
+			_, err := DecodePullRequest([]byte(body))
+			if err == nil {
+				t.Fatalf("DecodePullRequest(%s) err = nil, want rejection", a)
+			}
+			if !strings.Contains(err.Error(), "action not in") {
+				t.Errorf("err = %v, want error mentioning 'action not in'", err)
+			}
+		})
+	}
+}
+
+func TestDecodePullRequest_RejectsMissingFields(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		mutate   func(string) string
+		wantFrag string
+	}{
+		{
+			name:     "empty body",
+			mutate:   func(b string) string { return "" },
+			wantFrag: "empty",
+		},
+		{
+			name:     "missing number (zero)",
+			mutate:   func(b string) string { return strings.Replace(b, `"number": 42,`, `"number": 0,`, 1) },
+			wantFrag: "number must be > 0",
+		},
+		{
+			name: "short head SHA",
+			mutate: func(b string) string {
+				return strings.Replace(b, "0123456789abcdef0123456789abcdef01234567", "abc123", 1)
+			},
+			wantFrag: "40-char SHA",
+		},
+		{
+			name:     "missing state",
+			mutate:   func(b string) string { return strings.Replace(b, `"state": "open",`, `"state": "",`, 1) },
+			wantFrag: "state must be",
+		},
+		{
+			name: "missing base repo",
+			mutate: func(b string) string {
+				return strings.Replace(b, `"repository": {"full_name": "octo/api"`, `"repository": {"full_name": ""`, 1)
+			},
+			wantFrag: "missing repository.full_name",
+		},
+		{
+			name: "missing installation.id",
+			mutate: func(b string) string {
+				return strings.Replace(b, `"installation": {"id": 99}`, `"installation": {"id": 0}`, 1)
+			},
+			wantFrag: "installation.id",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := tc.mutate(validPRBody)
+			_, err := DecodePullRequest([]byte(body))
+			if err == nil {
+				t.Fatalf("DecodePullRequest() err = nil, want rejection containing %q", tc.wantFrag)
+			}
+			if !strings.Contains(err.Error(), tc.wantFrag) {
+				t.Errorf("err = %v, want fragment %q", err, tc.wantFrag)
+			}
+		})
+	}
+}
+
+func TestDecodePullRequest_ForkDetected(t *testing.T) {
+	t.Parallel()
+	// Same body, but head.repo.full_name differs from
+	// repository.full_name — a fork PR.
+	body := strings.Replace(validPRBody,
+		`"head": {"ref": "feat/foo", "sha": "0123456789abcdef0123456789abcdef01234567", "repo": {"full_name": "octo/api"}}`,
+		`"head": {"ref": "feat/foo", "sha": "0123456789abcdef0123456789abcdef01234567", "repo": {"full_name": "contributor/api"}}`,
+		1,
+	)
+	ev, err := DecodePullRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("DecodePullRequest() err = %v", err)
+	}
+	if !ev.IsFork() {
+		t.Errorf("IsFork() = false, want true (head and base full_names differ)")
+	}
+	if ev.HeadRepoFullName() != "contributor/api" {
+		t.Errorf("HeadRepoFullName() = %q, want contributor/api", ev.HeadRepoFullName())
+	}
+}
+
+func TestDecodePullRequest_MissingHeadRepoIsNotFork(t *testing.T) {
+	t.Parallel()
+	// Drop the head.repo.full_name — a malformed payload. The
+	// decoder must still parse the rest, and IsFork() must
+	// return false (conservative: we cannot prove it's a fork).
+	body := strings.Replace(validPRBody,
+		`"head": {"ref": "feat/foo", "sha": "0123456789abcdef0123456789abcdef01234567", "repo": {"full_name": "octo/api"}}`,
+		`"head": {"ref": "feat/foo", "sha": "0123456789abcdef0123456789abcdef01234567", "repo": {}}`,
+		1,
+	)
+	ev, err := DecodePullRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("DecodePullRequest() err = %v", err)
+	}
+	if ev.IsFork() {
+		t.Errorf("IsFork() = true, want false (head.repo missing → conservative not-fork)")
+	}
+	if ev.HeadRepoFullName() != "" {
+		t.Errorf("HeadRepoFullName() = %q, want empty", ev.HeadRepoFullName())
+	}
+}
+
+func TestPullRequestAction_IsPreviewAction(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		action PullRequestAction
+		want   bool
+	}{
+		{PullRequestActionOpened, true},
+		{PullRequestActionSynchronize, true},
+		{PullRequestActionReopened, true},
+		{PullRequestActionClosed, true},
+		{PullRequestAction("assigned"), false},
+		{PullRequestAction(""), false},
+		{PullRequestAction("OPENED"), false}, // case-sensitive — webhook bodies use lowercase
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(string(tc.action), func(t *testing.T) {
+			t.Parallel()
+			if got := tc.action.IsPreviewAction(); got != tc.want {
+				t.Errorf("IsPreviewAction(%q) = %v, want %v", tc.action, got, tc.want)
+			}
+		})
 	}
 }

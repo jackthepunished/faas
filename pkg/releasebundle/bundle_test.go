@@ -146,3 +146,57 @@ func writeFile(t *testing.T, path, body string, mode os.FileMode) {
 		t.Fatal(err)
 	}
 }
+
+// PR-5 / issue #911 — defensive no-faas-tunnel bundle guard.
+//
+// The split-box bundle does not include faas-tunnel.service (issue #911
+// records zero grep hits for that name across the repo today). Pin the
+// invariant: Build must not surface any file path containing
+// "faas-tunnel" — neither a unit file nor an artefact name. A future
+// PR that re-introduces the name must update this test alongside.
+//
+// The check exercises Build against a fixture tree that mirrors a real
+// bundle layout. It is not a no-op `strings.Contains(someconst)` — the
+// bundle is materialised, hashed, written, and re-read, so a regression
+// in Build/Verify that dropped a path containing the substring would
+// surface here even if ValidateManifest stayed green.
+func TestBuild_RejectsFaasTunnelReference(t *testing.T) {
+	// Positive case: a clean tree builds without surfacing faas-tunnel
+	// in any file path (issue #911 invariant).
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "bin", "apid"), "apid", 0o755)
+	writeFile(t, filepath.Join(root, "systemd", "faas-apid.service"), "[Service]\n", 0o644)
+
+	manifest, err := Build(root, "release-1", "abc123", "linux/amd64", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if err := Write(root, manifest); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	for _, f := range manifest.Files {
+		if strings.Contains(strings.ToLower(f.Path), "faas-tunnel") {
+			t.Errorf("bundle contains faas-tunnel reference at %q (issue #911 invariant)", f.Path)
+		}
+	}
+
+	// Negative case: Build refuses a tree that smuggles faas-tunnel
+	// into the file list. Substring-match (case-insensitive) covers
+	// future variants like faas-tunnel-client or FAAS-TUNNEL.service.
+	for _, denom := range []string{
+		"faas-tunnel.service",
+		"faas-tunnel",
+		"FAAS-TUNNEL.service",
+	} {
+		bad := t.TempDir()
+		writeFile(t, filepath.Join(bad, "systemd", denom), "[Service]\n", 0o644)
+		_, err := Build(bad, "release-1", "abc123", "linux/amd64", time.Now().UTC())
+		if err == nil {
+			t.Errorf("Build(%q) = nil; want forbidden-path error (issue #911 denylist)", denom)
+			continue
+		}
+		if !strings.Contains(err.Error(), "forbidden path") {
+			t.Errorf("Build(%q) err = %q; want forbidden-path message", denom, err.Error())
+		}
+	}
+}

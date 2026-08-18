@@ -489,6 +489,28 @@ spinner) and PR #51 (the closeout batch):
 
 The §14 M8 gates still on the board are listed in [What's next](#whats-next).
 
+- **Active-passive standby topology (ADR-083, accepted 2026-08-16):**
+  lex-min leader election over `compute_nodes.name WHERE active=true`; `pkg/gateway/leader`
+  package (`ElectLeader`, `Leader`, `LeaderStore`); `StandbyState` gauge
+  (`<prefix>_gateway_standby_state`, enum warming/warm/draining) +
+  `ActivePassiveFailoversTotal` counter (`<prefix>_gateway_active_passive_failovers_total{outcome}`,
+  outcomes: `dns_flipped` | `dns_stale` | `peer_unreachable` | `manual_drain`); probe
+  timeout bounded by `HAFailoverProbeTimeoutMS = 500` (in `pkg/api/limits.go`); drain
+  deadline bounded by `HADNSRecordStaleSeconds = 30`. Failure drill: `make ha-failover-drill`
+  on two-node Lima fleet (`deploy/lima/faas-metal-2node-ha.yaml`); standalone runbook at
+  `docs/runbooks/active-passive-ha.md`. Closes the Gate-A row "2nd box active-passive" in
+  spec §14 M8.
+
+## M9 — multi-box scale. 🚧
+
+- **ADR-066** (Tier A5 cross-node live-instance migration, accepted 2026-08-07): four-phase handoff (Park → mint lease → `MigrateInstanceOwner` → ack), `schedd_live_migration_decisions_total{outcome}` counter, `apps.migrated_at` + `instances.migrated_at` stamped in the same transaction. Bundled with PR #509 (Tier A4 per-node schedd), PRs in the ADR-066 → 067 → 068 cluster.
+- **ADR-062** (per-node schedd + async placement claim, accepted 2026-08-16): single-writer-per-host invariant survives multi-host deploys; `apid_control_plane_only` depguard in `.golangci.yml` prevents a control-plane path from calling a compute-only peer.
+- **ADR-063** (snapshot de-localization, accepted 2026-08-16): snapshots are per-schedd-local caches; authoritative blob lives in the shared OCI registry (ADR-054). Cross-node wake pulls on demand; acceptable for v1.0 because the cold-boot path (ADR-005) is the slow path.
+- **ADR-067** (migrating-instance watchdog, accepted 2026-08-16): 1 s ticker self-heals stuck `state='migrating'` rows that never committed (peer died mid-handoff, gRPC dropped, operator killed the new owner). The watchdog is the only writer that can move a row out of `migrating` without a peer commit.
+- **ADR-110** (declarative split-box manifest, accepted 2026-08-16): versioned YAML + typed schema at `deploy/manifest/splitbox.yaml` + `pkg/manifest/`; SemVer `schema_version (1.0.0)`; canonical validation through `gregalectl manifest validate` + the renderer + the release bundle installer + the doctor + the metal harness. PR-cluster shipped (PRs #912 #913 #914 #915 #917 #918 #919 #920 #921 #922 #923 #924).
+
+End-to-end smoke: `make metal-lima-2node` exercises the full four-phase handoff against a two-node Lima fleet. The acceptance row in spec §14 M9 is the gating test for the cluster.
+
 ### M8 — alert pipeline. ✅ (this PR)
 
 The §12 dashboard pipeline is wired end-to-end:
@@ -658,6 +680,103 @@ ADR-075 / issue #475 / migration 00138.
 
 ADR-076 / issue #476 / migrations 00140 + 00141.
 
+## M8 — API maintenance mode (ADR-091 amendment). 🚧
+
+Two complementary customer-facing primitives that ship together as one feature cluster:
+
+1. **`apps.maintenance_mode` bool** — coarse per-app gate; one PATCH flips the whole app into maintenance, every request returns 503 + `Retry-After: 60` + `Problem.code = "app_maintenance_mode"`.
+2. **`kind=maintenance` edge rule** — fine-grained per-route gate; a `(match_host, match_path, match_methods)` tuple returns 503 + `Retry-After` (per-rule, default 60 s, hard cap 24 h) + `Problem.code = "edge_rule_maintenance"`. Optional `message` (≤512 B) goes into `Problem.detail`.
+
+The coarse gate runs BEFORE the fine-grained rule, so when both fire on the same request the customer sees `app_maintenance_mode`, not `edge_rule_maintenance` — the load-bearing customer-facing guarantee is "an app I put into maintenance is in maintenance; the per-rule contract is a no-op in that case". Both primitives fire BEFORE auth, BEFORE wake, so a maintenance 503 never pays a cold-boot cost.
+
+- **Schema** — migrations `00222_edge_rules_kind_maintenance.sql` (DROP+ADD on `edge_rules_kind_check`, widening to `{route, rewrite, redirect, headers, cors, jwt, ip, validate, limit, maintenance}`) and `00223_apps_maintenance_mode.sql` (`ADD COLUMN IF NOT EXISTS maintenance_mode boolean NOT NULL DEFAULT false` + partial index `WHERE maintenance_mode = true` + `apps_maintenance_mode_notify` AFTER UPDATE trigger that emits `pg_notify('app_changed', NEW.id::text)` ONLY when `maintenance_mode IS DISTINCT FROM old.maintenance_mode`).
+- **Cluster shape** — three-PR cluster (PR-A control-plane widening + fence, PR-B runtime surface + gateway hot-path, PR-C rollout-closer + e2e + spec backfill). Mirrors the kind=validate cluster (PR #840 / #841 / #848). PR-A consumed slots 220 + 221 via fences; PR-B consumed both slots and removed the fences.
+- **Hot-path slot** — `pkg/gateway/handler.go:2943` inserts `applyAppsMaintenanceMode` (coarse gate on the substituted app) + `applyEdgeRuleMaintenance` (fine-grained rule) at the TOP of the `haveApp` chain (§4.1.2.0 + §4.1.2.14), BEFORE redirect/rewrite/headers/CORS/JWT/IP/limit/validate/auth/wake. Same deny-before-cost posture as ADR-091 D4 codifies for every other cost-control kind.
+- **Cache invalidation** — new `db.NotifyAppChanged = "app_changed"` pg_notify channel; gatewayd listener drops only that app's entry from the apps LRU (`Backend.ResetApp(appID)` at `pkg/gateway/pgbackend.go:1025`), not wholesale `FlushRoutes`. A maintenance flip on one app doesn't evict every other app's cache entry — `TestHandleInvalidation` pins the differential.
+- **Per-rule quota** — counts against the existing `EdgeRulesPerApp` quota (5/25/100/500 by plan). No new per-rule counter for v1 (D20.10 if customers ask).
+- **Defaults** — `api.EdgeRuleMaintenanceRetryAfterSeconds = 60` (env-overridable via `FAAS_EDGE_RULE_MAINTENANCE_RETRY_AFTER_SECONDS`). Cap: `api.MaxEdgeRuleMaintenanceRetryAfterSeconds = 86400` (24 h, hard, enforced at apid Validate).
+- **Free-tier-allowed.** No `IsPaidOnly()` on either primitive.
+- **Metrics** — new `gateway_app_maintenance_total{plan}` (pre-instantiated at the closed `{free, hobby, pro, scale}` set, plan=string(app.Plan)) + new `gateway_edge_rule_match_total{kind="maintenance", outcome=match|miss|blocked}` pre-instantiation loop (mirrors the 9 prior kinds). No existing metric names changed.
+- **Audit** — `app.maintenance_mode_match`, `edge_rule.maintenance_matched`, `edge_rule.maintenance_blocked`. Cross-account rules silently fall through (`outcome=blocked` + audit `maintenance_blocked`, same posture as every other kind, ADR-091 D5).
+- **E2E** — `cmd/e2e/edge_rules_maintenance_e2e_test.go` (3 tests: match-returns-503, default-retry-after, cross-account-falls-through) + `cmd/e2e/apps_maintenance_mode_e2e_test.go` (2 tests: patch-true-returns-503, coarse-gate-beats-edge-rule).
+- **TTL / auto-disable** — out of scope for v1; deferred to D20.7.
+
+ADR-091 amendment. No new ADR slot.
+
+## M8 — Per-route observability (ADR-093). 🚧
+
+Opt-in per-app route breakdown on the gatewayd-internal hot path,
+surfaced as Prometheus `_by_route` series and a control-listener
+reader at `GET /v1/apps/{slug}/routes`. Bounded by a 50-route cap
+with a non-evicting `__route_other__` overflow bucket (ADR-093 D2).
+
+- **Schema / State** — `apps.route_metrics_enabled boolean` (migration
+  00216). Partial index `WHERE route_metrics_enabled = true` keeps
+  the col-store cheap on Free-tier (where the column is always false).
+- **Plan gate** — Hobby/Pro/Scale default-on; Free stays off. Two
+  accessors at `pkg/api/limits.go:2649` `RouteMetricsEnabled()`
+  (create-time default) and `:2662` `RouteMetricsResponseAllowed()`
+  (PATCH-time gate) so a Free PATCHing true surfaces
+  `plan_route_metrics_not_allowed` (403, `pkg/api/errors.go:720`).
+- **Metric primitives** — `pkg/gateway/metrics.go:404-417`
+  `requestsByRoute`, `durationByRoute`, `failuresByRoute`. The
+  `_by_route` suffix is required so the new `{route}` label set
+  doesn't collide with the pre-existing `{app, code}` CounterVec
+  (Prometheus rejects two CounterVecs with the same name but
+  different label sets at registration time).
+- **API** — `GET /v1/apps/{slug}/routes` (apid reverse-proxy to
+  gatewayd-internal `GET /v1/internal/apps/{slug}/routes`).
+  OperationId `getAppRoutes` (api/openapi.yaml:1394-1427, `x-issue: 273`).
+- **Operator kill-switch** — `route_metrics_enabled` toml + env
+  `FAAS_GATEWAY_ROUTE_METRICS` (`cmd/gatewayd-internal/config.go:107-121`).
+  Cluster default wired by commit 5 of this PR
+  (`deploy/ansible/roles/gatewayd_internal_service/templates/gatewayd.toml.j2`).
+- **Alert** — `GatewayWildcardRoute` — sustained
+  `__route_other__` overflow > 1 reqps for 10m. Runbook
+  `docs/runbooks/GatewayWildcardRoute.md`. Recording rules + the
+  alert land on the box via
+  `deploy/ansible/roles/prometheus/tasks/main.yml` (commit 1 of
+  this PR — G1+G2 closure).
+
+### Tier A — observation period
+
+Operational follow-up (no code change). 2-week observation window
+after PR #856 lands. Empirical answer to "does the 50-cap actually
+bound cardinality or do apps collapse into `__route_other__`?" feeds
+either Tier B hardening (per-method cap, post-rewrite route label,
+`AppRoutesResponse` cap-visibility) or Tier C bigger ADRs (per-route
+SLI, per-plan budget).
+
+- **Alert surface** — `GatewayWildcardRoute` is `severity: info`
+  and routes to the EMPTY `faas-silent` receiver
+  (`alertmanager.yml.j2:53-56`). No page, no email, no Slack. Visible
+  in Prometheus `/alerts` and Grafana only. The status-page degraded
+  pill filters `severity=~"page|warn"` (line 519-541), so this alert
+  does **not** move the pill by design.
+- **Weekly review** — pull firing alerts directly:
+
+  ```sh
+  curl -s http://127.0.0.1:9090/api/v1/alerts \
+    | jq '.data.alerts[] | select(.labels.alertname=="GatewayWildcardRoute")'
+  ```
+
+- **Mid-sprint Hobby-tier audit** — run
+  `make hobby-route-audit` (uses `deploy/scripts/adr093-hobby-audit.sh`)
+  against the control plane. Counts `__route_other__` vs real-route
+  entries per Hobby-tier app. Read-only.
+- **Post-deploy smoke** — operator-side runbook at
+  `docs/runbooks/PostDeployAdr093.md`. Four artefact checks (rule
+  file, systemd unit, toml, Grafana panels 103/104) + a rule-load
+  check + an end-state snapshot. Read-only.
+- **Decision at end-of-sprint**:
+  - *Cap sufficient* (no Hobby-tier app saturated) → Tier B polish;
+    Tier C (per-route SLI + per-plan budget) becomes the next major ADR.
+  - *Cap partial* (some Hobby apps saturated, most didn't) → Tier B
+    per-method cap.
+  - *Cap insufficient* (most Hobby apps immediately saturated) →
+    ADR-093 needs re-scoping (lower default cap, revert Hobby's
+    default-on, or move to a customer-driven enable per plan).
+
 ## Auth default flip — issue #695 / ADR-080
 
 Closes spec §17 G15. Cloud Run's analogue is IAM-authenticated by
@@ -812,7 +931,10 @@ sometimes implied they were closed; they aren't.
   validate `Plan` via `api.Plan.Valid()`.
 - **#148** — `bootstrap.sh` should pin the Go toolchain via
   SHA-256 (closes a toolchain-supply-chain gap; sister to #143,
-  which is closed).
+  which is closed). RETIRED 2026-08-15 by issue #911 / PR-1:
+  the v1 bootstrap.sh is a tombstone now; the v2 path is the
+  renderer + release install (PR-2 + PR-3). The toolchain-pinning
+  gap lives on in the cd-controlplane.yml / `make build` paths.
 - **#145** — streamed OCI blob SHA-256 verification against the
   URL-path digest (spec's digest-pinned immutability).
 - **#125** — `sqlc-check` in the CI bundle to prevent sqlc source

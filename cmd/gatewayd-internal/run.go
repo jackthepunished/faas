@@ -42,15 +42,18 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid"
+	"github.com/onebox-faas/faas/pkg/apidgrpc"
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/gateway/writegate"
+	"github.com/onebox-faas/faas/pkg/geoip"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -108,6 +111,20 @@ var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", defaultPublicListenAddr)
 // for non-standard deployments; production uses /etc/faas/gatewayd.toml.
 var configPath = envOrGateway("FAAS_GATEWAYD_CONFIG", "/etc/faas/gatewayd.toml")
 
+// geoipDBPath is the on-disk MaxMind-compatible .mmdb file consulted
+// by applyEdgeRuleGeo (ADR-091 D21). Override via FAAS_GEOIP_DB_PATH
+// for non-standard deployments; production uses /var/lib/faas/geoip/
+// dbip-country-lite.mmdb. Empty string = geo kind disabled (the
+// reader stays nil and the gate fail-opens).
+var geoipDBPath = envOrGateway("FAAS_GEOIP_DB_PATH", "/var/lib/faas/geoip/dbip-country-lite.mmdb")
+
+// geoipAutoRefresh, when "1", spawns the periodic DB-IP download
+// goroutine (cadence: 168h/weekly). Default "0" — the operator
+// owns the file (rsync'd from a control-plane mirror, mounted via
+// ConfigMap, etc.). The auto-refresh path is for environments
+// where the daemon is the canonical source of the DB.
+var geoipAutoRefresh = envOrGateway("FAAS_GEOIP_AUTO_REFRESH", "0")
+
 // controlAddr is the private control-plane listener — never reachable from
 // the internet; bound to the loopback interface by default so an
 // operator-prometheus scrape is the only thing that can reach it.
@@ -157,6 +174,77 @@ func streamingEnabledFromEnv() bool {
 	return false
 }
 
+// rawStreamEnabledFromEnv (issue #676 / ADR-080 follow-up) resolves the
+// FAAS_GATEWAY_RAW_STREAM_ENABLED operator kill switch. Default is true
+// — production already runs the raw-bytes Upgrade bridge; defaulting
+// to false would silently regress every deployment until operators
+// set the env. Accepted truthy values mirror FAAS_GATEWAY_STREAMING
+// (1/true/yes, case-insensitive); anything else falls through to
+// false (operator must opt out explicitly) and is logged via slog
+// at startup so a typo is visible.
+//
+// When the env resolves to false the handler.WithRawForwarding call
+// is skipped below (run.go: ~line 1090), leaving h.rawByNode nil. The
+// three-input gate at pkg/gateway/handler.go:2899
+// (isUpgradeRequest(r) && app.WebSocketEnabled && h.rawByNode != nil)
+// falls through to writeWebSocketNotAllowed with the
+// forwarderMissing=true detail — a deterministic 501 with
+// x-faas-error-reason: websocket_not_on_plan. The kill switch is
+// therefore load-bearing: it is the first operator control to reach
+// for when the raw forwarder itself is misbehaving (per-app PATCH
+// only helps if the bridge is healthy for OTHER apps on the box).
+func rawStreamEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_RAW_STREAM_ENABLED", streamingFlagTrue)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+// routeMetricsEnabledFromEnv (ADR-093) is the per-process
+// opt-in for the per-route observability surface. Mirrors
+// streamingEnabledFromEnv above: env (FAAS_GATEWAY_ROUTE_METRICS)
+// OR TOML ([route_metrics].enabled) flips the bit, either is
+// sufficient. The closed truthy set reuses the streamingFlag*
+// constants — same convention, same linter-friendly shape —
+// because the four-way {1, true, yes, false} mapping is platform
+// convention rather than per-feature. The runtime default is
+// false; operators opt in per-cluster after the envelope is
+// comfortable. cmd/e2e/per_route_metrics_e2e_test.go flips this
+// on via the harness's extraEnv parameter; the metal build tag
+// keeps the per-route test off the default unit/e2e lane.
+func routeMetricsEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_ROUTE_METRICS", streamingFlagFalse)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+// certIssuerFor (ADR-100 / issue #879) constructs the per-surface
+// cert-remint engine wired to PGBackend. Returns nil when the
+// feature flag is off so the pg_notify subscriber no-ops (a
+// tenant_surface_changed event still arrives but
+// PGBackend.RequestCertForSurface short-circuits on a nil issuer).
+// The flag is the same dark-launch switch as the apid HTTP
+// surface (PR-C) so a single env var controls the entire
+// surface stack — operator sets it on the apid + gatewayd box
+// pair when PR-C is ready, unsets it to roll back without
+// bouncing any daemon.
+//
+// metrics may be nil (tests + the pre-construction window before
+// deps.metrics is built); ObserveTenantSurfaceCert guards.
+func certIssuerFor(store state.Store, metrics *gateway.Metrics, enabled bool) gateway.CertIssuer {
+	if !enabled {
+		return nil
+	}
+	return gateway.NewTenantSurfaceCertIssuer(store, metrics)
+}
+
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
 // gRPC client + the in-process gateway handler. Move 1 widens the
 // surface from Wake-only to two methods so the synthetic HTTP envelope
@@ -190,12 +278,33 @@ type runDeps struct {
 	listen  func(network, addr string) (net.Listener, error)
 	newSrv  func(addr string, handler http.Handler) *http.Server
 	backend gateway.Backend
+	// drain (issue #587 / PR-A) is the per-request WaitGroup-backed
+	// drain tracker the graceful-shutdown path waits on. ONE
+	// tracker per daemon, shared by Handler + InternalReverseProxy +
+	// TraceHandler + control mux + raw-stream forwarder so every
+	// ServeHTTP surface contributes to the same in-flight count.
+	// Set in runWithDeps after construction; nil in unit tests
+	// that don't exercise the shutdown path.
+	drain *drain.Tracker
 	// streamingEnabled (issue #471 / ADR-047) is the per-process
 	// opt-in for the streaming response path. Production passes
 	// envOr(TOML) || env("FAAS_GATEWAY_STREAMING"); tests leave it
 	// false. The flag also drives the buffered-fallback deprecation
 	// log when an SSE-emitting app lands on the legacy buffered path.
 	streamingEnabled bool
+	// routeMetricsEnabled (ADR-093) is the per-process operator
+	// kill-switch for the per-route observability surface. When
+	// false (the production default), every Handler.routeSetFor
+	// lookup returns nil regardless of the per-app
+	// app.RouteMetricsEnabled flag — the customer's per-app flag
+	// is inert. The two flags are AND-gated in Handler.ServeHTTP.
+	// Production passes env(TOML) || env("FAAS_GATEWAY_ROUTE_METRICS");
+	// tests leave it false. Together with the per-app flag this
+	// is the two-level opt-in the ADR promises: an operator can
+	// disable wholesale on a hot day without a Postgres round-trip,
+	// and a customer has to opt in per-app to use any of the
+	// surface.
+	routeMetricsEnabled bool
 	// synth is the internal unix-socket RPC server schedd dials for cron
 	// dispatch (spec §4.4, M7). nil in tests; production wires it after
 	// the schedd client is dialed.
@@ -323,11 +432,32 @@ type runDeps struct {
 	// allowance). Production wires a real adapter backed by
 	// pkg/edgejwks.NewCache + pkg/edgejwks.NewVerifier.
 	edgeJWKSAdapter *edgeJWKSAdapter
+	// edgeValidateAdapter (PR-B) is the validate handle consulted
+	// by applyEdgeRuleValidate. nil = validate kind disabled
+	// (pre-PR-B + dev posture; mirrors edgeJWKSAdapter's
+	// nil-allowance). Production wires a real adapter backed by
+	// pkg/edgevalidate.NewManager; the loader calls CompileSchema
+	// through this adapter on every kind=validate rule at
+	// loadHost time, and the applier calls Validate through it
+	// on every matched rule.
+	edgeValidateAdapter *edgeValidateAdapter
 	// edgeRulesAudit (ADR-089 PR 3) is the audit thin wrapper
 	// the handler's edge_rule.route_matched / edge_rule.route_blocked
 	// rows go through. nil = audit-disabled (matches the
 	// WithRequireAuthn audit nil-allowance).
 	edgeRulesAudit *gatewaydEdgeRulesAud
+	// geoReader (ADR-091 D21) is the pkg/geoip.Reader consulted
+	// by applyEdgeRuleGeo. nil = geo kind disabled (pre-PR-7 +
+	// file-missing posture; matches the WithEdgeRules nil-allowance).
+	// Production wires a real reader backed by the DB-IP Lite
+	// .mmdb file at FAAS_GEOIP_DB_PATH; a missing file logs a
+	// WARN and the reader stays nil so the daemon boots cleanly.
+	geoReader *geoip.Reader
+	// geoWatcher (ADR-091 D21) is the periodic refresh goroutine.
+	// nil = no auto-refresh (the file is sourced from the operator,
+	// not auto-downloaded). Production wires a Watcher with a
+	// 168h (weekly) cadence if FAAS_GEOIP_AUTO_REFRESH=1.
+	geoWatcher *geoip.Watcher
 	// publicAuthCache (issue #477 / ADR-079) is the unsealed
 	// basic-auth credential cache shared between the Handler
 	// (enforcePublicAuthBasic reads through it) and the
@@ -433,6 +563,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := role.Require("gatewayd-internal", cfg.Role, role.RoleSingleBox, role.RoleComputeOnly); err != nil {
 		return err
 	}
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): boot log carrying the
+	// multi-box identity. Mirrors schedd/apid/meterd/githubd/
+	// gatewayd-public so the playbook shape is identical across
+	// daemons.
+	if cfg.NodeName != "" {
+		log.Info("gatewayd-internal owner node", "node_name", cfg.NodeName)
+	} else {
+		log.Info("gatewayd-internal: legacy single-box (cfg.NodeName empty)")
+	}
 
 	// Phase 2 / Gate A: per-node schedd client cache. Wires the
 	// production dial closure (cross-box via pkg/overlay for tcp
@@ -446,6 +585,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 	vmmdTLS, err := cfg.LoadVMMDPingTLS()
 	if err != nil {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
+	}
+	scheddTLS, err := cfg.LoadScheddTLS()
+	if err != nil {
+		return fmt.Errorf("gatewayd: load schedd TLS: %w", err)
 	}
 	deps := defaultDeps()
 	// Issue #477 / ADR-079: resolve the host key directory the
@@ -474,7 +617,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if hp := os.Getenv("FAAS_HOST_KEY_PATH"); hp != "" {
 		deps.hostKeyDir = filepath.Dir(hp)
 	}
-	deps.scheddRouter = newScheddRouter(pgStore, vmmdTLS, nil, log)
+	deps.scheddRouter = newScheddRouter(pgStore, scheddTLS, nil, log)
 	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
 	// Single-stream fallback: dial the legacy schedd socket once for
 	// the consumers that don't currently fan-in (warm hints, log
@@ -482,7 +625,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// same client the router would resolve; on a multi-box install
 	// the stream comes from one schedd only and is documented as
 	// such in cmd/gatewayd-internal/warmhints.go.
-	sched, err := scheddgrpc.DialContext(ctx, scheddSocket, nil)
+	sched, err := scheddgrpc.DialContext(ctx, scheddSocket, scheddTLS)
 	if err != nil {
 		return fmt.Errorf("gatewayd: dial schedd: %w", err)
 	}
@@ -518,7 +661,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
 		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)
@@ -542,7 +685,20 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// picker's weight table. The adapter translates
 		// state.Deployment to gateway.DeploymentWeightsRow
 		// (the gateway package does not import pkg/state).
-		WithStore(weightsStoreAdapter{store: pgStore})
+		WithStore(weightsStoreAdapter{store: pgStore}).
+		// ADR-100 / issue #879: arm the per-surface cert-remint
+		// engine so a tenant_surface_changed notification
+		// re-mints the SAN-aggregated cert for the affected
+		// surface. The engine is gated on
+		// FAAS_TENANT_SURFACES_ENABLED (same dark-launch
+		// switch as the apid HTTP surface, PR-C) so a
+		// misconfigured rollout can be reverted by unsetting
+		// the env var without bouncing the daemon. The
+		// issuer is re-armed via WithCertIssuer below
+		// (after deps.metrics is built) so the
+		// gateway_tenant_surface_cert_total counter ticks
+		// from boot.
+		WithCertIssuer(certIssuerFor(pgStore, nil, api.TenantSurfacesEnabled()))
 
 	// Phase 2 / Gate A: gate the resolveSched legacy fallback on the
 	// active fleet. Single-box posture (only default-local active)
@@ -621,7 +777,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "")
+			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "", "")
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -643,7 +799,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke resolve schedd %s: %w", appID, err)
 			}
-			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "")
+			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "", "")
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}
@@ -662,6 +818,17 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// (certmagic, httpsec, :443/:80 ACME mux). This daemon stays
 	// plain HTTP on :8080; the resolved-TLS branch was removed in PR-A.
 	deps.metrics = gateway.NewMetrics()
+
+	// ADR-100 / issue #879: re-arm the per-surface cert-remint
+	// engine with the now-built metrics registry so
+	// gateway_tenant_surface_cert_total{result,kind} ticks from
+	// boot. The earlier WithCertIssuer call (in the chained
+	// builder above) ran with a nil metrics pointer because
+	// deps.metrics didn't exist yet; ObserveTenantSurfaceCert
+	// guards on nil but skipping the increment in production
+	// made the dashboard panel observability-dead. The feature
+	// flag is the same env var (PR-C dark-launch switch).
+	backend.WithCertIssuer(certIssuerFor(pgStore, deps.metrics, api.TenantSurfacesEnabled()))
 
 	// Forward the operator-configured apid loopback URL through the
 	// test seam so runWithDeps can stay TOML-free (issue #85).
@@ -701,6 +868,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
+	// Issue #587 / PR-A: the raw-stream forwarder needs the drain
+	// tracker so the hijacked Upgrade pump is held in the in-flight
+	// count. Wired BEFORE the handler sets up WithRawForwarding
+	// below so the factory closure captures the tracker.
+	// nodeCache.WithDrainTracker is a no-op when deps.drain is
+	// nil; see cmd/gatewayd-internal/nodecache.go for the seam.
 	deps.pgStore = pgStore
 	// Tier A9 / ADR-084 (PR-B sub-task B7): expose the
 	// daemon-wide *wire.OpsMetrics to runWithDeps so the
@@ -716,6 +889,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// default is false (no streaming — the legacy buffered path).
 	// Tests override by setting one of the two knobs.
 	deps.streamingEnabled = cfg.StreamingEnabled || streamingEnabledFromEnv()
+	// ADR-093: operator kill-switch for the per-route observability
+	// surface. Mirrors the streamingEnabled merge above — TOML or
+	// FAAS_GATEWAY_ROUTE_METRICS flips the bit, either is sufficient.
+	// The per-app flag (apps.route_metrics_enabled) is AND-gated against
+	// this in Handler.routeSetFor, so flipping the kill-switch at process
+	// level (via env or systemd drop-in) takes the surface offline
+	// without a Postgres round-trip or a pg_notify fan-out — the
+	// "operator can disable wholesale on a hot day" property the
+	// two-level design promises.
+	deps.routeMetricsEnabled = cfg.RouteMetricsEnabled || routeMetricsEnabledFromEnv()
 	// Issue #471 / ADR-047 (PR-A): resolve the http.Server.WriteTimeout.
 	// Spec §4.1 baseline is 300 s; the TOML [response_write_timeout]
 	// key overrides per-cluster. PR-B lifts the per-plan cap on
@@ -775,14 +958,64 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// reads state.EdgeRule via the store; reset on
 	// db.NotifyEdgeRuleChanged is wired via PGBackend.WithEdgeRules
 	// below.
-	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log)
+	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log, deps.edgeValidateAdapter, deps.metrics)
 	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
+	// ADR-091 D21 — build the pkg/geoip.Reader backed by the
+	// DB-IP Lite .mmdb file at FAAS_GEOIP_DB_PATH. The Reader
+	// is nil-safe: a missing file logs a WARN and the reader
+	// stays nil so the daemon boots cleanly (the gate fail-opens
+	// at request time). The watcher is optional and only
+	// spawned when FAAS_GEOIP_AUTO_REFRESH=1 — the default is
+	// operator-owned file (rsync / ConfigMap / volume mount).
+	if geoipDBPath != "" {
+		reader, gerr := geoip.Open(geoipDBPath, geoip.SourceDBIP, geoip.DBIPAttribution, log)
+		if gerr != nil {
+			log.Warn("geoip: open failed; geo kind disabled (fail-open)",
+				"path", geoipDBPath,
+				"err", gerr)
+		} else {
+			deps.geoReader = reader
+			log.Info("geoip: loaded",
+				"path", geoipDBPath,
+				"source", string(geoip.SourceDBIP),
+				"attribution", geoip.DBIPAttribution,
+			)
+			if geoipAutoRefresh == "1" {
+				// 168h = 7 days. DB-IP publishes a monthly
+				// snapshot; the weekly cadence is a safety
+				// margin and tolerates a few days of drift.
+				watcher, werr := geoip.NewWatcher(reader, 168*time.Hour, log)
+				if werr != nil {
+					log.Warn("geoip: watcher init failed; continuing without auto-refresh",
+						"err", werr)
+				} else {
+					deps.geoWatcher = watcher
+					// Best-effort fetch on boot so the
+					// first request doesn't hit a stale
+					// DB. Cancellable via the daemon's
+					// shutdown context.
+					if berr := watcher.WatcherOnce(ctx); berr != nil {
+						log.Warn("geoip: boot refresh failed; continuing with the on-disk file",
+							"err", berr)
+					}
+					watcher.Start(ctx)
+				}
+			}
+		}
+	}
 	// Issue #561 / ADR-091 PR 5 — build the per-URL JWKS cache
 	// + JWT verifier that applyEdgeRuleJWT consults. Lazy
 	// registration on first match; the cache uses an HTTP client
 	// with a 5s fetch timeout so an IdP outage can't block the
 	// gateway hot path.
 	deps.edgeJWKSAdapter = newEdgeJWKSAdapter(log)
+	// PR-B — build the kind=validate adapter backed by
+	// pkg/edgevalidate.NewManager (sha256-keyed LRU + Draft
+	// 2020-12 compile + JSON-Schema validate). The loader
+	// (loadHost) calls CompileSchema through this adapter for
+	// every kind=validate rule; the applier (handler.go) calls
+	// Validate through it on every matched rule.
+	deps.edgeValidateAdapter = newEdgeValidateAdapter(log)
 	// Issue #477 / ADR-079: build the unsealed basic-auth
 	// credential cache + the secretbox unsealer closure.
 	// The cache is shared between the Handler (read path)
@@ -853,7 +1086,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// (Phase 3 review policy). nil in tests (the e2e harness
 	// doesn't drive the stream; the picker falls through to
 	// per-node healthyCount as it always did).
-	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log)
+	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log, nil)
 	go deps.warmHints.Run(ctx)
 	return runWithDeps(ctx, log, deps)
 }
@@ -891,6 +1124,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// and proxies to the unix socket bound in cmd/gatewayd-internal/.
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
+	// Issue #587 / PR-A: construct the per-request drain tracker
+	// the graceful-shutdown path waits on. ONE tracker per daemon
+	// shared with the nodeCache raw forwarder + the control mux.
+	// See pkg/gateway/drain for the WaitGroup/atomic contract.
+	deps.drain = drain.NewTracker()
+	handler.WithInFlightTracker(deps.drain)
 	handler.SetWakeGateHook()
 	// Issue #471 / ADR-047: per-process streaming opt-in. The Handler
 	// buffers every response unless the flag is on; when off, a
@@ -900,6 +1139,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// — run()
 	// populates deps.streamingEnabled; tests inject the bit directly.
 	handler.WithStreamingEnabled(deps.streamingEnabled)
+	// ADR-093: arm the per-process routeMetricsEnabled kill-switch on
+	// the Handler so routeSetFor can AND the operator flag against the
+	// per-app flag (apps.route_metrics_enabled). Same merge point as
+	// WithStreamingEnabled above; both flags ride the same plumbing.
+	handler.WithRouteMetricsEnabled(deps.routeMetricsEnabled)
 	// Issue #560: per-deployment require_authn. The adapter
 	// + auditor are nil-safe; the pre-issue public-by-default
 	// behaviour is preserved for unit tests + dev boxes that
@@ -966,11 +1210,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return gateway.App{
 			ID:               app.ID,
 			AccountID:        app.AccountID,
+			Slug:             app.Slug,
 			RequireAuthn:     app.RequireAuthn,
 			PublicAuth:       gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed},
 			StreamingEnabled: app.StreamingEnabled,
 			WebSocketEnabled: app.WebSocketEnabled,
-			NodeID:           app.NodeID,
+			// ADR-093: per-route observability opt-in. Mirrors
+			// the WebSocketEnabled plumbing above — the same
+			// routeSetFor gate in Handler.ServeHTTP reads this
+			// alongside the operator kill-switch.
+			RouteMetricsEnabled: app.RouteMetricsEnabled,
+			// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+			// maintenance flag (apps.maintenance_mode).
+			MaintenanceMode: app.MaintenanceMode,
+			NodeID:          app.NodeID,
 		}, true
 	}, deps.edgeRulesAudit)
 	// Issue #561 / ADR-091 PR 5 — arm the per-rule JWT verifier.
@@ -980,6 +1233,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// pkg/edgejwks.NewCache + pkg/edgejwks.NewVerifier.
 	if deps.edgeJWKSAdapter != nil {
 		handler.WithJWTVerifier(deps.edgeJWKSAdapter)
+	}
+	// ADR-091 D21 — arm the geoip reader that applyEdgeRuleGeo
+	// consults. nil-safe: deps.geoReader nil (file missing or
+	// FAAS_GEOIP_DB_PATH empty) keeps the gate disabled; the
+	// matcher still surfaces a geo rule, but the lookup is a
+	// no-op and the gate fail-opens.
+	if deps.geoReader != nil {
+		handler.WithGeoReader(deps.geoReader)
+	}
+	// PR-B — arm the per-rule JSON-Schema validator that
+	// applyEdgeRuleValidate consults. nil-safe:
+	// deps.edgeValidateAdapter nil falls through
+	// (applyEdgeRuleValidate short-circuits, matching pre-PR-B +
+	// dev posture). Production wires a real adapter backed by
+	// pkg/edgevalidate.NewManager.
+	if deps.edgeValidateAdapter != nil {
+		handler.WithValidator(deps.edgeValidateAdapter)
 	}
 	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
 	// The 60s cache lives on the Handler (production wires
@@ -1000,6 +1270,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unchanged.
 	egressSink := egresssink.NewEgressSink()
 	handler.WithEgressSink(egressSink)
+	// Issue #676 / ADR-080 PR-C: the raw-stream forwarder writes
+	// raw-bytes Upgrade chunks into the same per-instance egress
+	// ring as the plain HTTP forwarder. They share the *EgressSink
+	// pointer so both paths land in the same usage_minutes.tx_bytes
+	// bucket — see cmd/gatewayd-internal/nodecache.go:WithEgressSink.
+	if deps.nodeCache != nil {
+		deps.nodeCache.WithEgressSink(egressSink)
+		// Issue #587 / PR-A: raw-stream Upgrade pump drain tracking.
+		// Captured by the ForwardingRawReverseProxyWithEventsAndDrain
+		// closure in nodeCache.RawForwarding() — every hijacked
+		// raw-stream conn holds a Begin("upgrade") slot for its
+		// pump's lifetime, so the graceful-shutdown drain sees it
+		// in-flight instead of force-closing on TimeoutStopSec=30s.
+		deps.nodeCache.WithDrainTracker(deps.drain)
+	}
 	egressGRPCSocket := egressGRPCSocketPath()
 	// Reject the silent-no-TLS path: a non-unix target without TLS
 	// would build an insecure server (ADR-052). deps.egressTLS is
@@ -1060,7 +1345,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// three-input gate routes Connection: Upgrade requests
 		// here BEFORE falling through to WithForwarding's
 		// ForwardHTTPStream bridge.
-		handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		//
+		// Operator kill switch (issue #676 follow-up): when
+		// FAAS_GATEWAY_RAW_STREAM_ENABLED=false, the call is
+		// skipped — h.rawByNode stays nil, and the three-input
+		// gate at pkg/gateway/handler.go:2899 falls through to
+		// writeWebSocketNotAllowed(forwarderMissing=true),
+		// returning a deterministic 501 + x-faas-error-reason:
+		// websocket_not_on_plan. Default is true; see
+		// rawStreamEnabledFromEnv above.
+		if rawStreamEnabledFromEnv() {
+			handler.WithRawForwarding(deps.nodeCache.RawForwarding())
+		} else {
+			slog.Info("gatewayd-internal: raw-bytes Upgrade bridge disabled by FAAS_GATEWAY_RAW_STREAM_ENABLED=false",
+				"fallthrough", "writeWebSocketNotAllowed(forwarderMissing=true)")
+		}
 	}
 
 	// Per-instance last_request_at flush loop (spec §4.1). Present in production;
@@ -1253,6 +1552,56 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// pre-#294 behaviour.
 	publicHandler := newGithubdProxy(githubdTarget, githubdSecret, apidHandler, log, newGatewaydAuditor(deps.pgStore, log))
 
+	// ADR-096: customer-facing automatic error grouping writer
+	// path. gatewayd-internal records every 4xx/5xx response on
+	// the public edge and ships batches to apid via the
+	// unix-socket gRPC IncrementAppError streaming RPC. apid is
+	// the sole writer to app_errors / app_error_requests
+	// (CLAUDE.md ownership); the gateway never opens a direct
+	// Postgres connection for this store.
+	//
+	// Kill-switch: FAAS_APP_ERRORS_ENABLED defaults to true
+	// (PR-B's stable point — PR-A shipped it OFF so the schema
+	// populated only by hand; PR-B flips the default to ON now
+	// that the customer-facing surface is in place). When false,
+	// the recorder middleware is a pass-through (no per-request
+	// cost beyond a single int compare) and the publisher
+	// goroutine is NOT started.
+	//
+	// apid socket: defaults to /run/faas/apid.sock (the
+	// ADR-015 unix-socket DAC convention shared with schedd +
+	// vmmd). Operators override via FAAS_APID_SOCKET when the
+	// socket path diverges (containerised deployments, etc).
+	appErrorsEnabled := osGetenv("FAAS_APP_ERRORS_ENABLED") != "false"
+	apidAppErrorsSock := osGetenv("FAAS_APID_APP_ERRORS_SOCKET")
+	if apidAppErrorsSock == "" {
+		apidAppErrorsSock = "/run/faas/app_errors.sock"
+	}
+	if appErrorsEnabled && deps.opsMetrics != nil {
+		// Build the recorder + publisher; wire the publisher
+		// goroutine; wrap the public handler with the
+		// recorder's middleware.
+		cli, dialErr := apidgrpc.DialContext(ctx, apidAppErrorsSock, nil)
+		if dialErr != nil {
+			log.Warn("app_errors: apid socket dial failed; recorder disabled", "err", dialErr)
+		} else {
+			recorder := newAppErrorsRecorder(appErrorsRecorderConfig{
+				Enabled:               true,
+				DedupeWindowSeconds:   3600,
+				CardinalityLimit:      10000,
+				SampleMessageCapBytes: 512,
+				HeadersSampleMaxKeys:  8,
+			}, nil, deps.opsMetrics, log)
+			publisher := newAppErrorsPublisher(recorder, cli, deps.opsMetrics, log)
+			recorder.pub = publisher
+			go publisher.Run(ctx)
+			publicHandler = recorder.Middleware(publicHandler)
+			log.Info("app_errors recorder enabled", "apid_socket", apidAppErrorsSock)
+		}
+	} else {
+		log.Info("app_errors recorder disabled (FAAS_APP_ERRORS_ENABLED == \"false\")")
+	}
+
 	// Issue #249 / spec §11: mount security response headers at the
 	// outermost wrapper of the public listener.
 	//
@@ -1300,14 +1649,73 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// that intentionally skips one". The split daemons (tasks #17,
 	// #18) wire the full ReadyzProbe from pkg/gateway/readiness.go
 	// with hydration tracking, schedd-router readiness, and PG ping.
-	// Here we wire the legacy one — "deps.pgStore != nil" — which is
-	// the strongest signal the pre-split daemon can honestly assert
-	// (the route cache is lazy-fill; the only "I cannot serve" state
-	// the legacy code has is "PG connection missing").
-	legacyReady := gateway.ReadyFunc(func() bool {
-		return deps.pgStore != nil
-	})
-	controlMux := gateway.ControlMux(handler.Metrics(), legacyReady)
+	//
+	// PR-B1 (issue #250 tier-1 ship-blocker): the gatewayd-internal
+	// split daemon flips from legacyReady (only "pgStore != nil") to
+	// the full ReadyzProbe. The tighter contract surfaces a partial-
+	// boot daemon to the LB drain instead of letting it accept traffic
+	// with a half-hydrated cache.
+	//
+	// Wiring strategy: each component-driven signal is constructed
+	// via the appropriate helper (PG ping, staleness) or Register()
+	// (manual), and is either Set(true, "") immediately (its
+	// component is non-nil → already wired above) or left Set(false)
+	// (nil → a test/dev path that intentionally skips the component).
+	// Production paths with deps.pool != nil, deps.scheddRouter != nil,
+	// deps.warmHints != nil, deps.nodeCache != nil flip true here.
+	readyProbe := &gateway.ReadyzProbe{}
+	// PG ping — only constructed if a pool is wired. The helper
+	// goroutine pings every 5s and flips true on success; it also
+	// kicks one ping immediately so the bit flips to ready as fast
+	// as Postgres can answer. The 5s cadence matches
+	// api.ReplicaHeartbeatIntervalSeconds so a /readyz scrape
+	// observes a coherent "all-replicas-healthy" surface.
+	if deps.pool != nil {
+		pgSig, _ := gateway.NewPGPingSignal(ctx, deps.pool, 5*time.Second)
+		readyProbe.RegisterSignal(pgSig)
+	}
+	// Schedd-router readiness: a manual signal flipped true the
+	// moment WatchNodeChanges has been started (called at runDeps
+	// init time around deps.scheddRouter construction above).
+	if deps.scheddRouter != nil {
+		s := readyProbe.Register()
+		s.Set(true, "")
+	}
+	// Per-node schedd dial cache (nodeCache) readiness: a manual
+	// signal flipped true after nodeCache construction above. The
+	// first dial lazy-fills; today the first dial happens on the
+	// first /v1/apps/{slug} request, so this signal is "we've
+	// constructed the cache and at least the first ClientFor can
+	// proceed" — not "we've already dialed". The lazy semantic is
+	// load-bearing for cold-boot latency; a stricter "cache primed"
+	// signal would force a synchronous Dial on every boot, which is
+	// what the legacy daemon deliberately avoided.
+	if deps.nodeCache != nil {
+		s := readyProbe.Register()
+		s.Set(true, "")
+	}
+	// Warm-hint subscriber freshness: a staleness signal Touched by
+	// warmHints on each delivery. 2-minute staleness catches "the
+	// daemon thinks it's subscribed but actually the goroutine
+	// exited" rather than "the stream is momentarily idle" (the
+	// schedd stream cadence under steady-state is sub-second).
+	// Skipped when deps.warmHints is nil so a test that doesn't
+	// construct the consumer doesn't fail /readyz permanently.
+	//
+	// FIX-4 (PR #880 code review): the touch callback returned
+	// by NewStalenessSignal MUST be wired back to the consumer,
+	// otherwise the helper goroutine observes lastTouch == 0 on
+	// every tick and flips the signal false with reason "no
+	// touch yet" — /readyz would be 503 forever and the LB
+	// would never route traffic to this daemon. SetOnTouch
+	// invokes touch() once immediately so the signal's first
+	// goroutine tick already sees touched > 0.
+	if deps.warmHints != nil {
+		signal, touch, _ := gateway.NewStalenessSignal(2 * time.Minute)
+		readyProbe.RegisterSignal(signal)
+		deps.warmHints.SetOnTouch(touch)
+	}
+	controlMux := gateway.ControlMux(handler.Metrics(), readyProbe.ReadyFunc(), deps.drain)
 	// Finding 6 (issue #314): mount the dashboard quota endpoint on the
 	// control mux so an in-box caller (operator's curl today, future
 	// apid-side dial) can read per-app bucket state without going through
@@ -1315,6 +1723,36 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// reads from the same *Limiter the public edge uses (handler.Limiter()
 	// is the seam) so the snapshot agrees with what Allow consumed.
 	controlMux.HandleFunc("/v1/internal/quota", internalQuotaHandler(handler, log))
+	// ADR-093: mount the per-route observability reader on the
+	// control mux so apid can reverse-proxy
+	// /v1/apps/{slug}/routes → /v1/internal/apps/{slug}/routes
+	// without going through the public :443 listener (which would
+	// self-rate-limit and expose the internal route-label state
+	// to a customer-scoped probe). The handler resolves slug via
+	// pgStore.AppBySlug — the control listener does NOT open its
+	// own Postgres connection (ADR-070 single-purpose control
+	// mux), so the closure shares the daemon's existing pool.
+	// nil pgStore (tests / single-box dev without a DB) renders
+	// the lookup_unavailable problem so the dashboard can
+	// distinguish "DB missing" from "unknown slug".
+	if deps.pgStore != nil {
+		pgStore := deps.pgStore
+		controlMux.HandleFunc("/v1/internal/apps/", func(w http.ResponseWriter, r *http.Request) {
+			// Path-keyed: ServeMux's HandleFunc uses prefix
+			// match, so /v1/internal/apps/foo/routes and
+			// /v1/internal/apps/bar/routes both reach here.
+			// The handler itself trims the prefix and reads
+			// the slug from r.URL.Path.
+			resolve := gateway.ResolveSlugFn(func(slug string) (string, bool) { //nolint:contextcheck // ADR-093 ResolveSlugFn signature is fixed; ctx captured from per-request r.Context().
+				a, err := pgStore.AppBySlug(r.Context(), slug)
+				if err != nil || a.ID == "" {
+					return "", false
+				}
+				return string(a.ID), true
+			})
+			internalRoutesHandler(handler, resolve, log).ServeHTTP(w, r)
+		})
+	}
 
 	// Track every *http.Server we spin up so the shutdown path can drain
 	// them in parallel. sslib guidance is "call Shutdown on each" rather
@@ -1456,7 +1894,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), drain.DrainGrace)
 		defer cancel()
 		//nolint:contextcheck // shutdown ctx must outlive the cancelled caller ctx (net/http contract).
 		// Best-effort shutdown of every listener we may have started.
@@ -1482,6 +1920,58 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			// land.
 			_ = deps.nodeCache.Close()
 		}
+		// Issue #587 / PR-A: wait for the per-request drain
+		// tracker to flush before exiting. shutdownCtx has
+		// already been wired to drain.DrainGrace (25s) — that
+		// sits inside systemd's TimeoutStopSec=30s with 5s
+		// headroom. The drain sets its own internal `draining`
+		// flag so any post-Shutdown stragglers become no-op
+		// Begin closures (pkg/gateway/drain.Drain doc).
+		//
+		// Exit-code discipline (systemd Restart=on-failure
+		// contract, pkg/deploycontroller/controller.go:43-115):
+		//   clean drain → return nil (no restart)
+		//   deadline_exceeded / ctx_cancelled → return ctx.Err()
+		//     so systemd restarts the daemon
+		// Pre-PR-A this branch returned nil unconditionally,
+		// which hid ctx-cancellation bugs from operators. The
+		// PR-A fix surfaces them so a hung drain doesn't quietly
+		// recycle on the next deploy.
+		if deps.drain != nil {
+			drainStart := time.Now()
+			//nolint:contextcheck // shutdownCtx is intentionally
+			// derived from context.Background() (line 1834)
+			// because it must outlive the cancelled caller
+			// ctx — the deadline budget for the drain comes
+			// from drain.DrainGrace, not from the caller's
+			// already-cancelled ctx. The Drain contract is to
+			// honour shutdownCtx's deadline + cancellation;
+			// the `deadline` param on Drain is the
+			// upper-bound knob.
+			outcome, drainErr := deps.drain.Drain(shutdownCtx, drain.DrainGrace)
+			drainElapsed := time.Since(drainStart).Seconds()
+			// Issue #587 / PR-A: record the drain histogram on
+			// every shutdown so an operator can spot a
+			// pattern of forced exits from the dashboard
+			// without re-reading the daemon log. Recorded
+			// against deps.metrics (gateway.Metrics) so the
+			// existing /metrics scrape picks it up alongside
+			// the rest of the gateway_* series.
+			deps.metrics.ObserveDrainWait("gatewayd-internal", string(outcome), drainElapsed)
+			if drainErr != nil {
+				log.Warn("gatewayd-internal drain exited non-clean",
+					"outcome", string(outcome),
+					"max_inflight", deps.drain.MaxInflight(),
+					"err", drainErr)
+				return drainErr
+			}
+			if outcome != drain.OutcomeClean {
+				log.Warn("gatewayd-internal drain exited non-clean",
+					"outcome", string(outcome),
+					"max_inflight", deps.drain.MaxInflight())
+				return ctx.Err()
+			}
+		}
 		return nil
 	}
 }
@@ -1495,7 +1985,7 @@ func (unwiredBackend) Lookup(context.Context, string) (gateway.App, bool) {
 }
 func (unwiredBackend) Pick(string) gateway.PickResult { return gateway.PickResult{} }
 func (unwiredBackend) HealthyCount(string) int        { return 0 }
-func (unwiredBackend) Admit(context.Context, string, string, int) (string, gateway.WakeMethod, bool, error) {
+func (unwiredBackend) Admit(context.Context, string, string, string, int) (string, gateway.WakeMethod, bool, error) {
 	return "", gateway.WakeMethodUnspecified, false, nil
 }
 

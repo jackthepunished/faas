@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/cursor"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
@@ -1487,6 +1488,11 @@ func (s *PgStore) RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldK
 // --- apps --------------------------------------------------------------------
 
 func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
+	// ADR-093 / PR-E: DB call seam — propagate the inbound budget
+	// with a 10 ms overhead reservation. Hot-path Store methods
+	// follow this pattern; the wrapper is a no-op when no Budget
+	// is attached.
+	ctx = db.WithBudget(ctx)
 	manifest := app.Manifest
 	if manifest.Entrypoint == nil && manifest.Env == nil {
 		manifest = AppManifest{}
@@ -1588,6 +1594,14 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// (same Set-bit-aware shape) so the per-plan default doesn't get
 	// shadowed by the schema DEFAULT.
 	//
+	// ADR-093: route_metrics_enabled is written explicitly (same
+	// shape) so the per-plan default doesn't get shadowed by the
+	// schema DEFAULT. The CreateApp site is the only place the
+	// column is written at create time — there's no separate
+	// CreateAppIfUnderQuota path to keep in sync because the
+	// explicit per-plan default is applied by apid before
+	// reaching this path.
+	//
 	// Tier A10 / ADR-088: overflow_node preference is in the
 	// column list so the App struct's value is written verbatim
 	// at create time. apid resolved the wire name → UUID
@@ -1597,9 +1611,9 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
-		 returning ` + appsSelectColumns
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
 	// create path keeps the schema DEFAULT behaviour. The column is NOT
@@ -1621,12 +1635,30 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
 		// from the column, same as NodeID above.
-		nullString(derefString(app.OverflowNode)))
+		nullString(derefString(app.OverflowNode)),
+		// Issue #272 / ADR-094: per-app preview metadata. Empty
+		// strings + zero ints + nil time all land as SQL NULL
+		// via the existing nullString / nullable helpers — the
+		// create path is the production path, and production
+		// apps never carry preview metadata. The bind site is
+		// the canonical "all four columns are NULL" producer.
+		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag (apps.maintenance_mode). Written
+		// explicitly so the App struct's value (default false)
+		// round-trips through CREATE — the schema DEFAULT also
+		// evaluates to false, but the explicit write is the
+		// established convention (websocket_enabled,
+		// route_metrics_enabled) and matches the column-list
+		// shape above. Mirrors the Set-bit-aware contract used
+		// in the PATCH path (handler_ext.go).
+		app.MaintenanceMode)
 	return scanApp(row)
 }
 
@@ -1754,6 +1786,10 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	//
 	// Issue #676 / PR-3: websocket_enabled follows the same shape.
 	//
+	// ADR-093: route_metrics_enabled follows the same shape; the
+	// per-plan default is applied by apid before reaching this
+	// path so the App struct's value is authoritative.
+	//
 	// Tier A10 / ADR-088: overflow_node preference is in the
 	// column list so the App struct's value is written verbatim
 	// at create time. apid resolved the wire name → UUID
@@ -1763,9 +1799,9 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-		 returning ` + appsSelectColumns
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+		returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
 	// column DEFAULT is documented as 'active' but the explicit INSERT
@@ -1783,12 +1819,25 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
 		// string to SQL NULL; Postgres infers the UUID type
 		// from the column, same as NodeID above.
-		nullString(derefString(app.OverflowNode)))
+		nullString(derefString(app.OverflowNode)),
+		// Issue #272 / ADR-094: per-app preview metadata. Same
+		// NULL-all shape as CreateApp above — production apps
+		// (and quota-counted inserts that happen to land via
+		// this path) never carry preview metadata.
+		nullString(app.PreviewOfSlug), app.PreviewPrNumber,
+		nullString(app.PreviewPrState), nullableTimestamptzPtr(app.PreviewExpiresAt),
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. Same explicit-write posture as
+		// CreateApp above — the schema DEFAULT would yield
+		// false but the explicit write matches the
+		// websocket_enabled / route_metrics_enabled column-list
+		// discipline and the Set-bit-aware PATCH contract.
+		app.MaintenanceMode)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -1809,6 +1858,99 @@ func (s *PgStore) AppBySlug(ctx context.Context, slug string) (App, error) {
 	sel := `select ` + appsSelectColumns + ` from apps where slug = $1 and status <> 'deleted'`
 	row := s.pool.QueryRow(ctx, sel, slug)
 	return scanApp(row)
+}
+
+// PreviewAppsByParent (ADR-095 / issue #272) returns every preview
+// app whose preview_of_slug = parentSlug, scoped to accountID. The
+// query plan uses the partial index apps_preview_of_slug_idx
+// (migration 00220), which carries the same WHERE preview_of_slug IS
+// NOT NULL predicate. Soft-deleted previews (apps.status = 'deleted')
+// are filtered out so the dashboard doesn't render "torn down" rows
+// in the live pane — they remain queryable via the janitor's
+// tombstone-aware ListPreviewsForTeardown sweep.
+//
+// The account_id predicate is non-negotiable: a customer should
+// never see another customer's preview rows even if the
+// preview_of_slug happened to collide (it can't today — slugs are
+// globally unique — but defence-in-depth matches the pattern every
+// other apps query uses).
+func (s *PgStore) PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+appsSelectColumns+` from apps where account_id = $1 and preview_of_slug = $2 and status <> 'deleted' order by created_at desc`,
+		accountID, parentSlug)
+	if err != nil {
+		return nil, fmt.Errorf("state: preview apps by parent %q/%q: %w", accountID, parentSlug, err)
+	}
+	return scanApps(rows)
+}
+
+// ListPreviewsForTeardown (ADR-095 PR-C / issue #272) returns the
+// preview rows the teardown janitor should consider on this tick.
+// See the Store interface docstring for the full contract; the
+// load-bearing points restated here because they look like bugs:
+//
+//  1. No `status <> 'deleted'` filter. The janitor sets that status
+//     itself; excluding tombstoned rows would strand any row whose
+//     tombstone write landed but whose preview_pr_state write did
+//     not (apid crash between the two). The torn_down predicate
+//     below is what actually bounds the result set — once a row
+//     reaches torn_down it never comes back.
+//
+//  2. `now` is a parameter, not now(). The janitor owns its clock
+//     so tests (and the e2e TTL case) can drive a 7-day expiry
+//     without sleeping. Passing the Go-side clock also keeps the
+//     sweep deterministic when apid and Postgres disagree by a few
+//     hundred ms.
+//
+// The predicate is an OR of "PR is in a terminal-ish state" and
+// "TTL elapsed", which lets the partial index
+// apps_preview_expires_at_idx serve the second arm. preview_of_slug
+// is not null is what keeps production rows out entirely.
+func (s *PgStore) ListPreviewsForTeardown(ctx context.Context, now time.Time, maxPerTick int) ([]App, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	sel := `select ` + appsSelectColumns + `
+	          from apps
+	         where preview_of_slug is not null
+	           and coalesce(preview_pr_state, '') <> $1
+	           and (coalesce(preview_pr_state, '') in ($2, $3)
+	                or (preview_expires_at is not null and preview_expires_at < $4))
+	         order by preview_expires_at asc nulls last
+	         limit $5`
+	rows, err := s.pool.Query(ctx, sel,
+		PreviewPrStateTornDown, PreviewPrStateClosed, PreviewPrStateStale,
+		now.UTC(), maxPerTick)
+	if err != nil {
+		return nil, fmt.Errorf("state: list previews for teardown: %w", err)
+	}
+	return scanApps(rows)
+}
+
+// SetPreviewPrState (ADR-095 PR-C / issue #272) advances one preview
+// row's lifecycle label. The `preview_of_slug is not null` predicate
+// is a safety interlock, not an optimisation: it means a bug in the
+// janitor's sweep can never relabel a customer's production app —
+// the UPDATE simply matches zero rows and returns ErrNotFound.
+//
+// The Go-side PreviewPrStateIsValid check runs first so an invalid
+// value surfaces as a wrapped Go error with the offending string,
+// rather than as SQLSTATE 23514 from apps_preview_pr_state_chk.
+// Both gates are kept: the CHECK is authoritative for any writer,
+// this one is for a legible error message.
+func (s *PgStore) SetPreviewPrState(ctx context.Context, appID, prState string) (App, error) {
+	if !PreviewPrStateIsValid(prState) {
+		return App{}, fmt.Errorf("state: set preview pr_state %q for app %q: %w", prState, appID, ErrInvalidPreviewPrState)
+	}
+	var a App
+	row := s.pool.QueryRow(ctx, `
+		update apps set preview_pr_state = $2
+		where id = $1 and preview_of_slug is not null
+		returning `+appsSelectColumns, appID, prState)
+	if err := scanAppInto(&a, row); err != nil {
+		return App{}, mapErr(err)
+	}
+	return a, nil
 }
 
 func (s *PgStore) ListApps(ctx context.Context, accountID string) ([]App, error) {
@@ -2624,6 +2766,15 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- Plan.WebSocketResponseAllowed() (Free → 403
 			   -- plan_websocket_not_allowed).
 			   websocket_enabled = case when $45 then $46 else websocket_enabled end,
+			   -- ADR-093: per-route observability opt-in.
+			   -- Same Set-bit convention as websocket_enabled
+			   -- above; apid gates PATCH-true through
+			   -- Plan.RouteMetricsResponseAllowed() (Free →
+			   -- 403 plan_route_metrics_not_allowed). The
+			   -- companion SetRouteMetricsEnabled flag
+			   -- distinguishes "don't touch" (default) from
+			   -- "explicit false" (opt out).
+			   route_metrics_enabled = case when $47 then $48 else route_metrics_enabled end,
 			   -- Tier A10 / ADR-088: per-app overflow_node
 			   -- preference. Same Set-bit convention as the
 			   -- surrounding fields — SetOverflowNode
@@ -2633,7 +2784,41 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- with ON DELETE SET NULL (migration 00167)
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
-			   overflow_node = case when $47 then $48 else overflow_node end
+			   overflow_node = case when $49 then $50 else overflow_node end,
+				   -- ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+				   -- maintenance flag. Same Set-bit convention as the
+				   -- surrounding fields — SetMaintenanceMode
+				   -- distinguishes "don't touch" (default) from
+				   -- "explicit false" (opt out). No plan gate
+				   -- (Free+ may opt in). The companion
+				   -- apps_maintenance_mode_notify trigger fires
+				   -- pg_notify('app_changed', NEW.id::text) ONLY
+				   -- when maintenance_mode IS DISTINCT FROM old, so
+				   -- the cmd-side listener
+				   -- (cmd/gatewayd-internal/backend.go) sees one
+				   -- event per flip, not one per app UPDATE.
+				   maintenance_mode = case when $51 then $52 else maintenance_mode end,
+			   -- ADR-091 CORS improvements D1: per-app
+			   -- default CORS opt-in. SetCORSDefaultEnabled
+			   -- distinguishes "don't touch" from
+			   -- "explicit false" (opt out); apid gates
+			   -- the request shape so the SQL never sees
+			   -- an illegal value. Plan-tier agnostic -
+			   -- the fallback is the "just allow my
+			   -- origin" surface customers expect from
+			   -- any FaaS, so no plan gate.
+				   cors_default_enabled = case when $53 then $54 else cors_default_enabled end,
+			   -- ADR-091 CORS improvements D1:
+			   -- per-app default CORS allowlist. Set bit
+			   -- gates the ARRAY write; nil + Set=true
+			   -- is rejected upstream by apid (the
+			   -- validator requires a value when the
+			   -- Set bit is true, same convention as
+			   -- EgressAllowlist). The array shape
+			   -- matches edge_rules_cors.allow_origins
+			   -- so the gateway reuses the matchOrigin
+			   -- matcher verbatim.
+				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2702,6 +2887,11 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// Issue #676 / PR-3: per-app raw-bytes Upgrade bridge.
 		// Same Set*/optional-pointer pattern as streaming_enabled.
 		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled),
+		// ADR-093: per-route observability opt-in. Same Set*/optional-
+		// pointer pattern as websocket_enabled above. The per-plan
+		// gate runs upstream in apid (Plan.RouteMetricsResponseAllowed)
+		// so by the time this UPDATE runs, the value is authoritative.
+		p.SetRouteMetricsEnabled, boolOrFalse(p.RouteMetricsEnabled),
 		// Tier A10 / ADR-088: overflow_node preference. The
 		// Set bit controls the CASE; the value slot is a
 		// nullable UUID — nullString coerces nil/empty to
@@ -2709,7 +2899,24 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// the column. The Set bit distinguishes "don't
 		// touch" (don't run the SET clause) from "explicit
 		// NULL" (clear — back to A9 fallback).
-		p.SetOverflowNode, nullString(derefString(p.OverflowNode)))
+		p.SetOverflowNode, nullString(derefString(p.OverflowNode)),
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. The Set bit distinguishes "don't
+		// touch" (default) from "explicit false" (opt out); the
+		// companion trigger fires pg_notify ONLY on the flip
+		// (migration 00237) so the cmd-side listener sees one
+		// event per flip rather than one per app UPDATE.
+		p.SetMaintenanceMode, boolOrFalse(p.MaintenanceMode),
+		// ADR-091 CORS improvements D1: per-app default CORS
+		// opt-in + allowlist. Same Set*/optional-pointer
+		// pattern as overflow_node / streaming_enabled.
+		// The validator on the apid side rejects
+		// CORSDefaultEnabled = true with an empty
+		// CORSDefaultOrigins (applies the same
+		// explicit-empty-must-mean-something rule as
+		// EgressAllowlist).
+		p.SetCORSDefaultEnabled, boolOrFalse(p.CORSDefaultEnabled),
+		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins))
 	return scanApp(row)
 }
 
@@ -2744,6 +2951,20 @@ func ptrOrEmpty(p *AppPublicAuthUpdate) *string {
 func derefString(s *string) string {
 	if s == nil {
 		return ""
+	}
+	return *s
+}
+
+// derefStrings returns the dereferenced value of a *[]string, or nil if
+// the pointer is nil. Mirrors derefString above for the string case.
+// Used by the UpdateApp SQL wrapper for the CORS_DEFAULT_ORIGINS arg;
+// the CASE in the SQL guards the nil so a missing pointer never
+// touches the wire (Set bit is false in that case). When the Set bit
+// is true, the apid validator guarantees a non-nil pointer, so the
+// dereference is safe.
+func derefStrings(s *[]string) []string {
+	if s == nil {
+		return nil
 	}
 	return *s
 }
@@ -3246,15 +3467,23 @@ func (s *PgStore) ApplyProjectPlan(
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
 		     status, manifest, min_instances, egress_allowlist,
-		     project_id, root_dir, workload_name, workload_class, start_command)
+		     project_id, root_dir, workload_name, workload_class, start_command,
+			     preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
 		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
-		        $11, $12, $13, $14, $15)
+		        $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
 			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
 			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
+			// Issue #272 / ADR-094: preview columns default to
+			// NULL on ApplyProjectPlan — repo-decomposed
+			// projects never carry preview metadata at create
+			// time. The preview path provisions rows via
+			// CreateApp / CreateAppIfUnderQuota directly.
+			nullString(a.PreviewOfSlug), a.PreviewPrNumber,
+			nullString(a.PreviewPrState), nullableTimestamptzPtr(a.PreviewExpiresAt),
 		)
 		app, err := scanApp(row)
 		if err != nil {
@@ -3818,8 +4047,9 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		                          sidecars,
 		                          status,
 		                          min_instances,
-		                          traffic_percent)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19)
+		                          traffic_percent,
+		                          scope)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19, coalesce(nullif($20, ''), 'default'))
 		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -3830,7 +4060,13 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		nullJSONRaw(d.OverrideLivenessProbe),
 		notNullEmptyJSONRaw(d.Sidecars),
 		d.MinInstances,
-		d.TrafficPercent)
+		d.TrafficPercent,
+		// ADR-091 / PR-D: empty caller Scope collapses to the
+		// literal 'default' (matches the schema DEFAULT). A non-empty
+		// Scope is passed through verbatim. Mirrors the handler's
+		// scope-default collapse so pgstore never inserts a literal
+		// '' (which would fail the deployments_scope_shape CHECK).
+		d.Scope)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -3859,6 +4095,24 @@ func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment,
 	row := s.pool.QueryRow(ctx,
 		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where app_id = $1 and status = 'live' order by created_at desc limit 1`, appID)
+	return scanDeploymentWithRootfs(row)
+}
+
+// LiveDeploymentForScope (ADR-091 / PR-D) returns the unique live
+// deployment for the (app_id, scope) pair. Backed by the partial
+// UNIQUE index deployments_app_scope_live_uniq added in migration
+// 00213: at most one live row per (app_id, scope), so the LIMIT 1
+// is belt-and-suspenders and the result is deterministic. Returns
+// ErrNotFound when no live row exists for the scope — the wake
+// path converts that into a 404 via the ErrNoDeployment sentinel
+// already used by LiveDeployment. The query plan uses the partial
+// index (index-only on app_id, scope via INCLUDE-less btree; the
+// rootfs columns are heap-fetched, identical to LiveDeployment).
+func (s *PgStore) LiveDeploymentForScope(ctx context.Context, appID, scope string) (Deployment, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments where app_id = $1 and scope = $2 and status = 'live'
+		 order by created_at desc limit 1`, appID, scope)
 	return scanDeploymentWithRootfs(row)
 }
 
@@ -3939,7 +4193,7 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 // per the ListDeploymentsForApp comment) this stays sub-10ms.
 func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumnsWithRootfs+`
+		`select `+deploymentSelectColumnsQualified+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.status <> 'deleted'
@@ -3961,7 +4215,7 @@ func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) 
 // the plan stays a single index scan + nested loop, sub-5ms.
 func (s *PgStore) ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumnsWithRootfs+`
+		`select `+deploymentSelectColumnsQualified+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.node_id = $1
@@ -4548,6 +4802,37 @@ func (s *PgStore) UpsertDeploymentScanResult(ctx context.Context, deploymentID s
 		    set scan_result = $2, scan_status = $3, scanned_at = now()
 		  where id = $1`,
 		deploymentID, scanResult, nullString(status))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpsertDeploymentSecretFindings writes the secret-scan audit row
+// (migrations/00221, secret-scan v2). Mirrors UpsertDeploymentScanResult:
+// scopes to one deployment row, overwrites (not creates a second),
+// and returns ErrNotFound on a missing row so a misuse at the call
+// site fails closed. The scan_status on the deployment row is
+// updated to the closed-set value the caller passes
+// ('complete_with_redactions' on a non-empty findings list) so the
+// dashboard pill reflects what the customer actually uploaded.
+//
+// We update scan_status in the SAME statement (rather than two
+// round-trips) so the audit row + dashboard pill can never disagree:
+// a future reader either sees both updated or neither. The
+// `complete_with_redactions` value is enforced by the
+// migrations/00221 CHECK widening.
+func (s *PgStore) UpsertDeploymentSecretFindings(ctx context.Context, deploymentID string, findings []byte, status string, scannedAt time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set secret_findings = $2,
+		        scan_status = $3,
+		        secret_scanned_at = $4
+		  where id = $1`,
+		deploymentID, findings, nullString(status), scannedAt)
 	if err != nil {
 		return err
 	}
@@ -5807,6 +6092,52 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 			Observed: appCount,
 		}
 	}
+	// Per-kind quota (ADR-091 D22). The general EdgeRulesPerApp
+	// count above covers the cheap-tier guardrail; geo gets its own
+	// tighter cap (Free=1, Hobby=5, Pro=25, Scale=100) so the
+	// abuse-desk customer persona ("block everything except DE")
+	// has one rule before the upgrade path kicks in. Both branches
+	// share the same FOR UPDATE lock on apps for race-freedom.
+	if in.Kind == EdgeRuleKindGeo && limits.EdgeRulesGeoPerApp > 0 {
+		var geoPerApp int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from edge_rules where app_id = $1 and kind = 'geo'`, in.AppID,
+		).Scan(&geoPerApp); err != nil {
+			return EdgeRule{}, fmt.Errorf("state: count edge_rules by kind=geo for app %s: %w", in.AppID, err)
+		}
+		if geoPerApp >= limits.EdgeRulesGeoPerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesGeoPerApp,
+				Observed:   geoPerApp,
+				Kind:       string(EdgeRuleKindGeo),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
+	// kind='throttle' per-app quota (ADR-091 D20.5 amendment, issue
+	// #881). Mirrors the geo shape: tighter cap than
+	// EdgeRulesPerApp because per-route throttles are a
+	// higher-touch cardinality lever. Free customers get 1 rule
+	// under EdgeRulesThrottlePerApp; Hobby 5; Pro 25; Scale 100.
+	// Same FOR UPDATE lock on apps carried by the count above.
+	if in.Kind == EdgeRuleKindThrottle && limits.EdgeRulesThrottlePerApp > 0 {
+		var throttlePerApp int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from edge_rules where app_id = $1 and kind = 'throttle'`, in.AppID,
+		).Scan(&throttlePerApp); err != nil {
+			return EdgeRule{}, fmt.Errorf("state: count edge_rules by kind=throttle for app %s: %w", in.AppID, err)
+		}
+		if throttlePerApp >= limits.EdgeRulesThrottlePerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesThrottlePerApp,
+				Observed:   throttlePerApp,
+				Kind:       string(EdgeRuleKindThrottle),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 
 	actionBytes, err := json.Marshal(in.Action)
 	if err != nil {
@@ -5931,6 +6262,24 @@ func (s *PgStore) CountEdgeRulesForApp(ctx context.Context, appID string) (int, 
 	var n int
 	if err := s.pool.QueryRow(ctx,
 		`select count(*) from edge_rules where app_id = $1`, appID,
+	).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountEdgeRulesByKindForApp is the per-kind quota reader
+// (ADR-091 D22). Same shape as CountEdgeRulesForApp but filtered
+// by kind. The Postgres runtime index edge_rules_app_kind_idx
+// (composite on (app_id, kind)) makes this O(log n) without
+// needing a sequence scan. The check that's load-bearing for race
+// freedom lives inside CreateEdgeRuleIfUnderQuoTa (FOR UPDATE on
+// the apps row) — this public method is the apid handler's
+// read-side probe to surface "X/Y used" in 200 responses.
+func (s *PgStore) CountEdgeRulesByKindForApp(ctx context.Context, appID string, kind EdgeRuleKind) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*) from edge_rules where app_id = $1 and kind = $2`, appID, string(kind),
 	).Scan(&n); err != nil {
 		return 0, err
 	}
@@ -6483,6 +6832,39 @@ func (s *PgStore) ClaimInvocation(ctx context.Context, id, instanceID string, le
 	return inv, nil
 }
 
+// RequeueExpiredInvocations returns abandoned dispatches to pending. The
+// row-locking CTE makes the bounded sweep safe if more than one schedd-like
+// worker is ticking at once; only rows still carrying an expired lease can be
+// reclaimed.
+func (s *PgStore) RequeueExpiredInvocations(ctx context.Context, now time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	tag, err := s.pool.Exec(ctx, `
+		with expired as (
+			select id
+			  from invocations
+			 where state = 'dispatching'
+			   and lease_expires_at is not null
+			   and lease_expires_at <= $1
+			 order by lease_expires_at, id
+			 for update skip locked
+			 limit $2
+		)
+		update invocations as i
+		   set state = 'pending',
+		       due_at = $1,
+		       lease_expires_at = null,
+		       instance_id = null,
+		       last_error = 'dispatch lease expired; requeued'
+		  from expired
+		 where i.id = expired.id`, now.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("state: invocations reclaim expired: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json.RawMessage) error {
 	// outcome (issue #791) is stamped alongside state so the cron
 	// run-history read never has to infer success from state.
@@ -6493,7 +6875,7 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 		       completed_at = now(),
 		       received_at = coalesce(received_at, now()),
 		       result = coalesce($2, result)
-		 where id = $1 and state in ('dispatching','pending')`, id, nullableJSON(result))
+		 where id = $1 and state = 'dispatching'`, id, nullableJSON(result))
 	if err != nil {
 		return err
 	}
@@ -7304,6 +7686,53 @@ func (s *PgStore) UpdateInstanceStateToTerminal(ctx context.Context, id, state s
 	return nil
 }
 
+// IncInstanceRequestCount (ADR-098 C8) bumps the per-instance
+// request_count column by the supplied delta. The writer is
+// additive ("request_count = request_count + delta") on purpose:
+// schedd batches 250ms of per-instance request events into a
+// single UPDATE, and a Phase-4-loser re-apply (the same delta
+// computed twice) must be idempotent on the row. The batched
+// flush path (C9) is the only caller; the writer is deliberately
+// not used at single-request granularity because that would
+// re-create the per-request UPDATE hot-path the gate's
+// amortization is closing.
+//
+// The writer returns the post-increment total so the caller can
+// spot instances that have crossed the per-app WarmSnapshotMinRequests
+// threshold without a separate SELECT — the gate's
+// "count >= min" comparison is a single conditional on the
+// returned value. Returns int64(-1) when the row is gone (Phase-4
+// loser landed after the instance was evicted); the caller
+// treats this as a no-op (the gate falls through to the cold-boot
+// path and the next instance will start fresh at request_count=0).
+func (s *PgStore) IncInstanceRequestCount(ctx context.Context, id string, delta int64) (int64, error) {
+	if delta == 0 {
+		// The writer is additive; a zero delta is a spare round-trip
+		// we can skip. But callers may still want the post-increment
+		// value, so we read it.
+		var cur int64
+		err := s.pool.QueryRow(ctx, `select request_count from instances where id = $1`, id).Scan(&cur)
+		if err != nil {
+			return -1, err
+		}
+		return cur, nil
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances set request_count = request_count + $2 where id = $1`,
+		id, delta)
+	if err != nil {
+		return -1, err
+	}
+	if tag.RowsAffected() == 0 {
+		return -1, nil //nolint:nilerr // row gone; not a hard error
+	}
+	var cur int64
+	if err := s.pool.QueryRow(ctx, `select request_count from instances where id = $1`, id).Scan(&cur); err != nil {
+		return -1, err
+	}
+	return cur, nil
+}
+
 // SetInstanceFrameworkReadyAt stamps `framework_ready_at` on the
 // instances row for the vmmd gRPC `FrameworkReady` handler
 // (PR #470-FU-B). Mirrors the no-op-on-missing-row convention of
@@ -7616,6 +8045,49 @@ func (s *PgStore) TouchInstancesLastSeen(ctx context.Context, touches []Instance
 	return int(tag.RowsAffected()), nil
 }
 
+// TouchInstancesWithRequestDelta (ADR-098 C9) is the batched
+// request_count writer. Same shape as TouchInstancesLastSeen
+// (unnest, single round-trip) but additionally bumps
+// request_count by the supplied delta on each row. The delta is
+// additive ("request_count = request_count + delta") so a
+// re-delivered batch is idempotent on Phase-4-loser re-applies.
+//
+// Mirrors IncInstanceRequestCount's writer contract — the engine
+// prefers this batched path because ReportActivity already carries
+// a per-instance touch batch; piggybacking avoids a separate
+// per-instance UPDATE round-trip.
+//
+// Returns the number of rows updated. Rows whose instance_id is
+// gone (a reaped instance) are silently dropped — the SQL filter
+// `i.id = b.id` does not match deleted rows, so a re-delivered
+// batch loses that delta. Same shape as TouchInstancesLastSeen.
+func (s *PgStore) TouchInstancesWithRequestDelta(ctx context.Context, touches []InstanceTouch) (int, error) {
+	if len(touches) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(touches))
+	ts := make([]time.Time, len(touches))
+	deltas := make([]int64, len(touches))
+	for i, t := range touches {
+		ids[i] = t.InstanceID
+		ts[i] = t.LastRequest
+		deltas[i] = t.RequestDelta
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances i
+			set last_request_at = b.ts,
+			    request_count   = coalesce(i.request_count, 0) + b.delta
+		 from (select unnest($1::uuid[]) as id,
+		              unnest($2::timestamptz[]) as ts,
+		              unnest($3::bigint[]) as delta) b
+		 where i.id = b.id`,
+		ids, ts, deltas)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // --- snapshots --------------------------------------------------------------
 
 // CreateSnapshot writes the immutable snapshot row imaged produces after the
@@ -7879,12 +8351,39 @@ type SnapshotSize struct {
 // for the per-vm fixed cost (spec §4.7 / §6.2-2). Importing pkg/api here
 // is safe: pkg/api has no outbound dependency on pkg/state, so no cycle.
 
+// scanComputeNode reads a single compute_nodes row, projecting the
+// canonical 22-column layout (matches the SELECT / RETURNING lists
+// in ActiveComputeNodes, ListAllComputeNodes, ComputeNodeByID,
+// ComputeNodeByName, CreateComputeNode, UpsertComputeNode,
+// UpsertComputeNodeFromOperator, UpsertComputeNodeFromVmmd).
+//
+// Column order (must stay locked against the SQL projections):
+//
+//	id, name, target_url, vpcpus, mem_mb, max_concurrency,
+//	admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
+//	region, zone, schedd_target_url,
+//	public_ip, public_ip_set_at,
+//	release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
+//
+// A mismatch between this Scan arg list and any of the SQL projections
+// fails at runtime with pgx's column count error — the wire-level
+// contract every helper above enforces.
+//
+// PR-3a (issue #911 / ADR-110) widened the projection from 14 to 22
+// columns: public_ip / public_ip_set_at (migration 00174 closure)
+// + release_id / manifest_hash / host_certificate / cert_fingerprint /
+// role / generation (migration 00266). Pre-PR-3a callers that hand-rolled
+// SQL against the 14-column layout must be updated together; the only
+// readers of the wider shape are the 8 helpers listed in the comment
+// above (4 SELECTs + 4 INSERT/UPSERTs).
 func scanComputeNode(row pgx.Row) (ComputeNode, error) {
 	var n ComputeNode
 	if err := row.Scan(&n.ID, &n.Name, &n.TargetURL, &n.VPCPUs, &n.MemMB,
 		&n.MaxConcurrency, &n.AdmissionCeilingMB, &n.VCPUBudget, &n.Active,
 		&n.LastHeartbeatAt, &n.CreatedAt, &n.Region, &n.Zone,
-		&n.ScheddTargetURL); err != nil {
+		&n.ScheddTargetURL, &n.PublicIp, &n.PublicIpSetAt,
+		&n.ReleaseID, &n.ManifestHash, &n.HostCertificate, &n.CertFingerprint,
+		&n.Role, &n.Generation); err != nil {
 		return ComputeNode{}, mapErr(err)
 	}
 	return n, nil
@@ -7894,7 +8393,9 @@ func (s *PgStore) ActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 where active = true
 		 order by name
@@ -7923,7 +8424,9 @@ func (s *PgStore) ListAllComputeNodes(ctx context.Context) ([]ComputeNode, error
 	rows, err := s.pool.Query(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 order by name
 	`)
@@ -7946,7 +8449,9 @@ func (s *PgStore) ComputeNodeByID(ctx context.Context, id string) (ComputeNode, 
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 where id = $1
 	`, id)
@@ -7961,7 +8466,9 @@ func (s *PgStore) ComputeNodeByName(ctx context.Context, name string) (ComputeNo
 	row := s.pool.QueryRow(ctx, `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 where name = $1
 	`, name)
@@ -8100,6 +8607,144 @@ func (s *PgStore) ListComputeNodeHeartbeats(ctx context.Context, nodeID string, 
 	return out, nil
 }
 
+// AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
+// amendment) extends AppendComputeNodeHeartbeat with the cpu_pct_60s
+// and disk_used_bytes columns added by migration 00199. The two new
+// columns are nullable (pre-PR #4 rows keep NULL — see migration
+// 00199's comment) and default to NULL on INSERT so an un-upgraded
+// vmmd writer hitting a post-PR #4 schema still works. The
+// (node_id, received_at) unique constraint and parent-exists check
+// mirror AppendComputeNodeHeartbeat verbatim — the test code path
+// must see the same ErrConflict surface.
+func (s *PgStore) AppendComputeNodeHeartbeatWithStats(ctx context.Context, nodeID string, receivedAt, lastHeartbeatAt time.Time, source string, cpuPct60s float64, diskUsedBytes int64) error {
+	// Parent existence check first (same rationale as
+	// AppendComputeNodeHeartbeat: avoid racing the FK insert).
+	var parentExists bool
+	if err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from compute_nodes where id = $1)`, nodeID,
+	).Scan(&parentExists); err != nil {
+		return fmt.Errorf("state: append compute_node_heartbeat_with_stats: parent check: %w", err)
+	}
+	if !parentExists {
+		return ErrNotFound
+	}
+	if _, err := s.pool.Exec(ctx, `
+		insert into compute_node_heartbeats (node_id, received_at, last_heartbeat_at, source, cpu_pct_60s, disk_used_bytes)
+		values ($1, $2, $3, $4, $5, $6)
+	`, nodeID, receivedAt, lastHeartbeatAt, source, cpuPct60s, diskUsedBytes); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return fmt.Errorf("%w: compute_node_heartbeats (node_id, received_at) duplicate", ErrConflict)
+		}
+		return fmt.Errorf("state: append compute_node_heartbeat_with_stats: %w", err)
+	}
+	return nil
+}
+
+// LatestHeartbeatStats (PR #4) returns the most-recent heartbeat
+// per compute node. DISTINCT ON (node_id) collapses the per-node
+// rows to the latest received_at in one pass — Postgres-only
+// idiom, the MemStore mirrors it in Go. The obsListNodes handler
+// folds this onto the per-node projection; a node with no
+// heartbeats yet is NOT returned here (the LEFT JOIN in the
+// handler renders it as "no data" with the rest of the
+// compute_nodes row intact).
+func (s *PgStore) LatestHeartbeatStats(ctx context.Context) ([]ComputeNodeHeartbeatStats, error) {
+	rows, err := s.pool.Query(ctx, `
+		select distinct on (node_id)
+		       node_id, received_at, cpu_pct_60s, disk_used_bytes
+		from compute_node_heartbeats
+		order by node_id, received_at desc
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list latest heartbeat stats: %w", err)
+	}
+	defer rows.Close()
+	// Pre-size to a reasonable upper bound; the cluster won't have
+	// more than a few hundred nodes in the multi-host story, so
+	// 512 is generous headroom without bloating the slice.
+	out := make([]ComputeNodeHeartbeatStats, 0, 64)
+	for rows.Next() {
+		var h ComputeNodeHeartbeatStats
+		var nodeUUID string
+		var cpu *float64
+		var disk *int64
+		if err := rows.Scan(&nodeUUID, &h.ReceivedAt, &cpu, &disk); err != nil {
+			return nil, fmt.Errorf("state: scan latest heartbeat stats: %w", err)
+		}
+		h.NodeID = nodeUUID
+		h.CPUPct60s = cpu
+		h.DiskUsedBytes = disk
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate latest heartbeat stats: %w", err)
+	}
+	return out, nil
+}
+
+// PerNodeLiveStats (PR #4) is the read-side aggregate for the
+// /v1/admin/obs/nodes handler. Groups live instances (state in
+// {RUNNING, WAKING, COLD_BOOTING}, the §6.2 invariant #1 set) by
+// instances.node_id and joins onto compute_nodes for the human-
+// friendly node name.
+//
+// Revision 2 (PR #4 prep): the original draft joined on a separate
+// instance_node_bindings table; after re-reading migration 00024
+// during implementation we discovered instances.node_id is already
+// a NOT NULL FK to compute_nodes(id), backfilled on pre-existing
+// rows. ADR-092 §8 amends §2.1 to drop the binding-table design.
+// This query mirrors the corrected design: the inner GROUP BY
+// walks the instances table directly. The +8 on ram_mb mirrors
+// §6.2 invariant #2 — Σ(ram_mb + 8) ≤ 47,600 MB — so per-node
+// RAMUsedMB sums to the fleet ceiling. COUNT(*) FILTER (WHERE
+// state = ...) projects each state bucket without four separate
+// scans. The JOIN onto compute_nodes is INNER today because the
+// obs handler only wants useful per-node aggregates; a node with
+// no instances simply doesn't appear in this result and the
+// handler surfaces "no live instances" via the dedicated empty
+// state in the response.
+func (s *PgStore) PerNodeLiveStats(ctx context.Context) ([]PerNodeStats, error) {
+	rows, err := s.pool.Query(ctx, `
+		select n.name                                           as node_name,
+		       count(*)                                         as instances_live,
+		       count(*) filter (where i.state = 'RUNNING')     as instances_running,
+		       count(*) filter (where i.state = 'WAKING')      as instances_waking,
+		       count(*) filter (where i.state = 'COLD_BOOTING') as instances_cold_booting,
+		       coalesce(sum(i.ram_mb + 8), 0)                    as ram_used_mb
+		from instances i
+		join compute_nodes n on n.id = i.node_id
+		where i.state in ('RUNNING', 'WAKING', 'COLD_BOOTING')
+		group by n.name
+		order by n.name
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: per-node live stats: %w", err)
+	}
+	defer rows.Close()
+	// Pre-size to a reasonable upper bound; the cluster won't have
+	// more than a few hundred nodes in the multi-host story.
+	out := make([]PerNodeStats, 0, 64)
+	for rows.Next() {
+		var s PerNodeStats
+		if err := rows.Scan(
+			&s.NodeName,
+			&s.InstancesLive,
+			&s.InstancesRunning,
+			&s.InstancesWaking,
+			&s.InstancesColdBooting,
+			&s.RAMUsedMB,
+		); err != nil {
+			return nil, fmt.Errorf("state: scan per-node live stats: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate per-node live stats: %w", err)
+	}
+	return out, nil
+}
+
 // MarkComputeNodeInactive flips active=false on the row (PR #114,
 // schedd heartbeat path). Idempotent: the UPDATE matches regardless
 // of current value, so re-flipping an inactive row is a no-op. We
@@ -8126,18 +8771,32 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 	// region/zone (issue #254 / PR #429) are nullable and default to
 	// NULL on INSERT — schedd's placement chooser doesn't yet surface
 	// them at register time, so we explicitly project NULL when the
-	// caller leaves the pointer nil. RETURNING projects all 13 columns
-	// to match scanComputeNode's scan width.
+	// caller leaves the pointer nil. The PR-3a release-bundle columns
+	// (release_id, manifest_hash, host_certificate, cert_fingerprint,
+	// role, generation) are also nullable on INSERT — operator-added
+	// pre-PR-3a rows accept the schema without a backfill. RETURNING
+	// projects all 22 columns to match scanComputeNode's scan width.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, $8,
+		        $9, $10,
+		        $11, $12,
+		        $13, $14, $15, $16, $17, $18)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Active, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Active,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	return scanComputeNode(row)
 }
 
@@ -8158,16 +8817,30 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // rows to api.VCPUSlots (160); pre-migration rows see the same
 // default via the column DEFAULT clause.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {
-	// region/zone are projected to match scanComputeNode's 14-column
+	// region/zone are projected to match scanComputeNode's 22-column
 	// scan. On conflict the existing region/zone values are preserved
 	// (operator-driven locality label, not a vmmd-side knob); see
 	// migrations/00069_compute_nodes_region_zone.sql for the
-	// default-local backfill. RETURNING projects all 14 columns.
+	// default-local backfill. The PR-3a release-bundle columns
+	// (release_id, manifest_hash, host_certificate, cert_fingerprint,
+	// role, generation) mirror the existing owner-driven split:
+	// release_id / manifest_hash / role are operator-tunable (bundle
+	// install + renderer stamp them) and re-apply on conflict;
+	// host_certificate / cert_fingerprint are secrets-init-driven and
+	// use COALESCE to preserve any value PR-X wrote first; generation
+	// is doctor-driven and uses COALESCE so the doctor's bump is
+	// monotonic (a later UPSERT with nil generation must not lower the
+	// counter). RETURNING projects all 22 columns.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, true,
+		        $8, $9,
+		        $10, $11,
+		        $12, $13, $14, $15, $16, $17)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
@@ -8175,12 +8848,27 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
-		      active              = true
+		      active              = true,
+		      region              = excluded.region,
+		      zone                = excluded.zone,
+		      schedd_target_url   = excluded.schedd_target_url,
+		      release_id          = excluded.release_id,
+		      manifest_hash       = excluded.manifest_hash,
+		      role                = excluded.role,
+		      host_certificate    = coalesce(compute_nodes.host_certificate, excluded.host_certificate),
+		      cert_fingerprint    = coalesce(compute_nodes.cert_fingerprint, excluded.cert_fingerprint),
+		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node %q: %w", node.Name, err)
@@ -8198,11 +8886,23 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 // an operator-side COALESCE for region/zone that vmmd shouldn't
 // touch) has exactly one place to land.
 func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node ComputeNode) (ComputeNode, error) {
+	// Operator owns the release-bundle metadata too: PR-X secrets init
+	// stamps host_certificate / cert_fingerprint at first contact, the
+	// renderer (PR-2) stamps manifest_hash + role, release install
+	// (PR-3) stamps release_id. Every PR-3a column re-applies on
+	// conflict so the operator's POST wins across the board. The
+	// generation counter still uses COALESCE because the doctor's bump
+	// must be monotonic — a subsequent operator POST must not lower it.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, true,
+		        $8, $9,
+		        $10, $11,
+		        $12, $13, $14, $15, $16, $17)
 		on conflict (name) do update
 		  set target_url          = excluded.target_url,
 		      vpcpus              = excluded.vpcpus,
@@ -8210,12 +8910,27 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 		      max_concurrency     = excluded.max_concurrency,
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
-		      active              = true
+		      active              = true,
+		      region              = excluded.region,
+		      zone                = excluded.zone,
+		      schedd_target_url   = excluded.schedd_target_url,
+		      release_id          = excluded.release_id,
+		      manifest_hash       = excluded.manifest_hash,
+		      host_certificate    = excluded.host_certificate,
+		      cert_fingerprint    = excluded.cert_fingerprint,
+		      role                = excluded.role,
+		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node (operator) %q: %w", node.Name, err)
@@ -8242,11 +8957,26 @@ func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node Comput
 // instead of the second box. See
 // docs/runbooks/multi-host-rollout.md §3.5 + §4.5.
 func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNode) (ComputeNode, error) {
+	// vmmd self-registration — the vmmd-owned resource numbers win on
+	// conflict, while operator-POSTed values are PRESERVED via COALESCE
+	// (the load-bearing fix for the second-box cutover, see the prose
+	// comment on this method). The PR-3a release-bundle columns follow
+	// the same shape: release_id / manifest_hash / role are operator-
+	// POSTed and use COALESCE (vmmd must not overwrite them), and
+	// host_certificate / cert_fingerprint are secrets-init-driven and
+	// use COALESCE on the existing value too (vmmd doesn't write cert
+	// material; only PR-X secrets init does). generation uses
+	// COALESCE so the doctor's monotonic counter survives.
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone)
-		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		     region, zone,
+		     public_ip, public_ip_set_at,
+		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
+		values ($1, $2, $3, $4, $5, $6, $7, true,
+		        $8, $9,
+		        $10, $11,
+		        $12, $13, $14, $15, $16, $17)
 		on conflict (name) do update
 		  set vpcpus              = excluded.vpcpus,
 		      mem_mb              = excluded.mem_mb,
@@ -8254,12 +8984,29 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		      admission_ceiling_mb = excluded.admission_ceiling_mb,
 		      vcpu_budget         = excluded.vcpu_budget,
 		      active              = true,
-		      target_url          = coalesce(compute_nodes.target_url, excluded.target_url)
+		      target_url          = coalesce(compute_nodes.target_url, excluded.target_url),
+		      region              = coalesce(compute_nodes.region, excluded.region),
+		      zone                = coalesce(compute_nodes.zone, excluded.zone),
+		      schedd_target_url   = coalesce(compute_nodes.schedd_target_url, excluded.schedd_target_url),
+		      public_ip           = coalesce(compute_nodes.public_ip, excluded.public_ip),
+		      public_ip_set_at    = coalesce(compute_nodes.public_ip_set_at, excluded.public_ip_set_at),
+		      release_id          = coalesce(compute_nodes.release_id, excluded.release_id),
+		      manifest_hash       = coalesce(compute_nodes.manifest_hash, excluded.manifest_hash),
+		      host_certificate    = coalesce(compute_nodes.host_certificate, excluded.host_certificate),
+		      cert_fingerprint    = coalesce(compute_nodes.cert_fingerprint, excluded.cert_fingerprint),
+		      role                = coalesce(compute_nodes.role, excluded.role),
+		      generation          = coalesce(compute_nodes.generation, excluded.generation)
 		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		          region, zone, schedd_target_url
+		          region, zone, schedd_target_url,
+		          public_ip, public_ip_set_at,
+		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
-		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+		node.AdmissionCeilingMB, node.VCPUBudget,
+		node.Region, node.Zone,
+		node.PublicIp, node.PublicIpSetAt,
+		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
+		node.Role, node.Generation)
 	n, err := scanComputeNode(row)
 	if err != nil {
 		return ComputeNode{}, fmt.Errorf("state: upsert compute_node (vmmd) %q: %w", node.Name, err)
@@ -8318,6 +9065,91 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 	return nil
 }
 
+// SetComputeNodeRole overwrites the role column on a row by id
+// (ADR-112 PR-B). The role value is validated against the
+// {control-plane, compute-only} allow-list at the Go boundary
+// (empty role is rejected with a loud error — use
+// UpsertComputeNodeFromOperator with role=NULL if the un-templated
+// sentinel is ever needed). The migration 00271 column is nullable
+// text (no CHECK constraint); the Go-side validation is the
+// effective constraint.
+//
+// Allow-list divergence vs pkg/releaseinstall: the manifest
+// renderer's SetComputeNodeRole (pkg/releaseinstall.store.go:131,
+// name-keyed, manifest-time) accepts {empty, single-box,
+// control-plane, compute-only}; this runtime path
+// (id-keyed, PR-B) accepts only {control-plane, compute-only}.
+// The asymmetry is intentional and load-bearing:
+//
+//   - `single-box` is the legacy single-box dev posture
+//     (pkg/roleTemplating/role.go:64-69). The renderer allows it
+//     because pre-PR-A manifests still pass it through for
+//     backwards compat with v1 bootstrap.sh.
+//   - PR-B is the runtime re-role contract; "re-role a box to
+//     single-box" is not a thing the architecture supports after
+//     the ADR-112 collapse. A box that was first-boot templated as
+//     single-box CANNOT be re-rolled via this path; the operator
+//     must image-rebuild if they need to leave single-box.
+//
+// Future "re-role to single-box" support, if ever needed, is a
+// separate ADR — bumping the allow-list here without one would
+// re-introduce the per-role-image pathology ADR-112 fixed.
+//
+// The pg_notify trigger on compute_nodes (PR-3a) fires on every UPDATE
+// regardless of which column changed, so gatewayd-internal's per-node
+// cache and the schedd chooser re-rank immediately. The chooser
+// currently treats role as a tie-break only (ADR-110 PR-2), but the
+// load-bearing invariant is that the cluster-wide view in
+// compute_nodes.role matches the box's on-disk FAAS_BOX_ROLE (read
+// from the per-daemon drop-in); a drift is loud via doctor --deep.
+//
+// Callers MUST short-circuit when current == target — every
+// unconditional UPDATE here fires the trigger + notify storm. The
+// cmd/gregalectl role-branch does this idempotency short-circuit
+// at the caller side; this method itself stays unconditional.
+func (s *PgStore) SetComputeNodeRole(ctx context.Context, id string, role string) error {
+	if err := validateRoleForState(role); err != nil {
+		return fmt.Errorf("state: set role compute_node %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update compute_nodes set role = $2 where id = $1`, id, role)
+	if err != nil {
+		return fmt.Errorf("state: set role compute_node %s = %q: %w", id, role, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// validateRoleForState enforces the {empty, control-plane,
+// compute-only} allow-list at the Go boundary. Lives next to the
+// implementation (not in pkg/roleTemplating) because pkg/state must
+// not import pkg/roleTemplating — the chain is pkg/state → pkg/role
+// (the type layer), and pkg/roleTemplating sits on top of both.
+//
+// Empty role is rejected (the legacy un-templated sentinel is gone
+// post-PR-A; UpsertComputeNodeFromOperator writes NULL on insert and
+// preserves it on conflict via COALESCE, which is the canonical
+// "un-templated" path).
+var allowedRolesForState = map[string]struct{}{
+	"control-plane": {},
+	"compute-only":  {},
+}
+
+func validateRoleForState(role string) error {
+	if role == "" {
+		return fmt.Errorf("role cannot be empty; use UpsertComputeNodeFromOperator for un-templated rows")
+	}
+	if len(role) > 32 {
+		return fmt.Errorf("role %q exceeds 32-char column limit", role)
+	}
+	if _, ok := allowedRolesForState[role]; !ok {
+		return fmt.Errorf("role %q not in {control-plane, compute-only}", role)
+	}
+	return nil
+}
+
 // ListComputeNodes returns every compute_node in name order. The
 // optional includeInactive flag controls whether drained rows are
 // visible; apid's GET /v1/compute-nodes passes true so operators can
@@ -8325,10 +9157,20 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 // index on active=true used by placement; this method is admin-only
 // and so pays the full-table scan cost only on operator dashboards).
 func (s *PgStore) ListComputeNodes(ctx context.Context, includeInactive bool) ([]ComputeNode, error) {
+	// Column order is locked to scanComputeNode's 22-arg projection
+	// (pgstore.go:8346). PR-3a (issue #911 / ADR-110) widened it
+	// from 14 to 22 by adding public_ip / public_ip_set_at (migration
+	// 00174 closure) + release_id / manifest_hash / host_certificate
+	// / cert_fingerprint / role / generation (migration 00266).
+	// Drift here surfaces as pgx's "number of field descriptions
+	// must equal number of destinations, got 14 and 22" — the same
+	// class of failure TestPg_CoverageInstanceLists pins.
 	q := `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
 		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
-		       region, zone, schedd_target_url
+		       region, zone, schedd_target_url,
+		       public_ip, public_ip_set_at,
+		       release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 	`
 	if !includeInactive {
@@ -8479,6 +9321,95 @@ func (s *PgStore) ListEventsByWakeID(ctx context.Context, wakeID string, since t
 		var rawData []byte
 		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
 			return nil, err
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListAllEventsPaged (ADR-091 §3.7 / PR #3) is the operator-obs
+// backend's read-side query for the live events table. Mirrors the
+// SQL in pkg/state/queries.sql::ListAllEventsPaged; the raw-SQL
+// fallback here keeps the param semantics identical to the sqlc
+// version (no string-built queries, all parameters bound).
+//
+// Bounded by the handler to api.ObsAdminEventsLimitMax (500). The
+// interface{} params for the discriminator columns (actor, kind_prefix,
+// subject, since) match the sqlc-emitted shape — the SQL uses the
+// ($1 = ” OR ...) predicate so the column type cannot be inferred.
+// Bound as string / time.Time at the call site.
+func (s *PgStore) ListAllEventsPaged(ctx context.Context, actor, kindPrefix, subject string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if !since.IsZero() {
+		since = since.UTC()
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, at, actor, kind, subject, data from events
+		 where ($1 = '' or actor = $1)
+		   and ($2 = '' or kind like $2 || '%')
+		   and ($3 = '' or subject = $3::uuid)
+		   and ($4 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $4)
+		 order by at desc, id desc
+		 limit $5`,
+		actor, kindPrefix, subject, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list_all_events_paged: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, fmt.Errorf("state: list_all_events_paged: %w", err)
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListRecentEventsForAccount (ADR-091 §3.7 / PR #3) is the
+// per-account events drill-down. Backed by the partial
+// events_actor_account_idx on (actor_account_id) WHERE actor_account_id IS NOT NULL
+// (migrations/00099_orgs_memberships_invitations.sql). Same raw-SQL
+// shape as ListAllEventsPaged; the actor_account_id is the indexed
+// column so the planner picks the partial index on the per-account
+// filter regardless of the since filter.
+func (s *PgStore) ListRecentEventsForAccount(ctx context.Context, actorAccountID string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if !since.IsZero() {
+		since = since.UTC()
+	}
+	parsedUUID, err := uuid.Parse(actorAccountID)
+	if err != nil {
+		// Unparseable actor_account_id — match the existing
+		// ListEvents behaviour where a malformed filter returns
+		// an empty slice rather than a SQL error.
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, at, actor, kind, subject, data from events
+		 where actor_account_id = $1
+		   and ($2 = '0001-01-01 00:00:00+00:00'::timestamptz or at >= $2)
+		 order by at desc, id desc
+		 limit $3`,
+		parsedUUID, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list_recent_events_for_account: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, fmt.Errorf("state: list_recent_events_for_account: %w", err)
 		}
 		e.Data = json.RawMessage(rawData)
 		out = append(out, e)
@@ -9915,7 +10846,7 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 // foreign caller (or one whose lease expired and the row was
 // reaped+re-claimed) sees 0 rows updated and gets ErrClaimLost so
 // the caller can decide how to react. mb_seconds is stamped on the
-// row (column added in migration 00209) so ops reconciliation can
+// row (column added in migration 00280) so ops reconciliation can
 // read the integer wire value directly without joining against
 // usage_minutes; the Paddle merchant dashboard's line item
 // Quantity + CustomData["mb_seconds"] carry the same value at the
@@ -10775,6 +11706,12 @@ func scanAppInto(a *App, row pgx.Row) error {
 	// '' for the NULL-preference case, which we promote to
 	// App.OverflowNode == nil below.
 	var overflowNodeStr string
+	// ADR-091 CORS improvements D1: scratch sink for the
+	// cors_default_enabled scan target. The schema's NOT
+	// NULL DEFAULT false makes the bool value always present
+	// at scan time; the *bool field is built by lifting
+	// this local below.
+	var corsDefaultEnabled bool
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
@@ -10807,6 +11744,11 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// NOT NULL DEFAULT false (migration 00155); plain bool
 		// scan is safe.
 		&a.WebSocketEnabled,
+		// ADR-093: per-route observability opt-in. NOT NULL
+		// DEFAULT false (migration 00212); plain bool scan is
+		// safe. Order is positional and must match
+		// appsSelectColumns.
+		&a.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: per-app overflow_node preference.
 		// Scanned into a scratch string then conditionally
 		// promoted to *string so NULL round-trips as Go-nil —
@@ -10815,13 +11757,59 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// column-list normalisation handles other nullable
 		// string-shaped values like RootDir / WorkloadName
 		// (see below).
-		&overflowNodeStr); err != nil {
+		&overflowNodeStr,
+		// Issue #272 / ADR-094: per-app preview metadata. The
+		// column projection wraps preview_of_slug and
+		// preview_pr_state in coalesce(..., '') so the scan
+		// targets can be plain strings (NULL → '' round-trips
+		// through). preview_pr_number is wrapped in
+		// coalesce(..., 0) so the scan can use a plain *int
+		// target — pgx rejects SQL NULL into *int with
+		// "cannot scan NULL into *int" (the strict default
+		// for the int4 → Go int mapping). The 0 sentinel is
+		// distinguishable from "preview with pr_number=0" via
+		// the preview_of_slug discriminator (prod apps have
+		// preview_of_slug=NULL → ''). preview_expires_at is
+		// nullable timestamptz scanned into *time.Time
+		// directly (pgx handles SQL NULL → Go nil natively).
+		//
+		// ADR-091 CORS improvements D1: per-app default CORS
+		// opt-in + allowlist. cors_default_enabled is NOT
+		// NULL DEFAULT false in the schema so the scan lands
+		// a plain bool; we lift it into *bool below so the
+		// wire projection surfaces the legacy-row nil vs.
+		// explicit opt-out *false distinction. The three-state
+		// collapse (nil = never touched, *false = PATCHed-to-
+		// false, *true = opted in) lives on the write path;
+		// the read path always returns a non-nil pointer.
+		// cors_default_origins is text[] — pgx maps a NULL
+		// array to a nil Go slice, which is exactly the
+		// "deny all" sentinel the gateway uses (mirrors how
+		// EgressAllowlist handles the empty case). No helper
+		// normalisation needed.
+		&a.PreviewOfSlug, &a.PreviewPrNumber, &a.PreviewPrState, &a.PreviewExpiresAt,
+		&corsDefaultEnabled, &a.CORSDefaultOrigins,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag (apps.maintenance_mode). NOT NULL
+		// DEFAULT false (migration 00237); plain bool scan is
+		// safe. Order is positional and must match
+		// appsSelectColumns above.
+		&a.MaintenanceMode); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
 		s := overflowNodeStr
 		a.OverflowNode = &s
 	}
+	// Lift hydrated cors_default_enabled into the
+	// store-layer pointer field. The schema's NOT
+	// NULL DEFAULT false makes the bool value always
+	// present at scan time; the *bool shape exists
+	// because the wire projection needs the nil vs
+	// *false distinction (legacy rows vs explicit
+	// opt-out hydrates identically to *false — the
+	// three-state lives on the write path only).
+	a.CORSDefaultEnabled = &corsDefaultEnabled
 	a.Type = AppType(typeStr)
 	a.Status = AppStatus(statusStr)
 	a.WorkloadClass = WorkloadClass(workloadClassStr)
@@ -10894,6 +11882,12 @@ const appsSelectColumns = `
 	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
 	-- writes through Plan.WebSocketResponseAllowed().
 	websocket_enabled,
+	-- ADR-093: per-route observability opt-in. Boolean NOT NULL
+	-- DEFAULT false (migration 00212); apid applies
+	-- Plan.RouteMetricsEnabled() at CreateApp time and gates PATCH
+	-- writes through Plan.RouteMetricsResponseAllowed() (Free →
+	-- 403 plan_route_metrics_not_allowed).
+	route_metrics_enabled,
 	-- Tier A10 / ADR-088: per-app overflow_node preference.
 	-- Nullable UUID; FK to compute_nodes(id) with ON DELETE SET
 	-- NULL cascades the preference to NULL on operator-side
@@ -10902,7 +11896,33 @@ const appsSelectColumns = `
 	-- coerces to the empty string via coalesce so the pgx
 	-- scan sees a string target — the App.OverflowNode field
 	-- is *string (nil = no preference = default A9 fallback).
-	coalesce(overflow_node::text, '')`
+	coalesce(overflow_node::text, ''),
+	-- Issue #272 / ADR-094: per-app preview metadata. NULL on
+	-- production apps. preview_of_slug carries the parent app's
+	-- slug (no FK — parent may be deleted while previews are
+	-- still open). preview_pr_state is the closed-set label
+	-- enforced by apps_preview_pr_state_chk (migration 00218);
+	-- the coalesce() wraps NULL → '' so the pgx scan into a
+	-- plain string is safe. preview_pr_number is wrapped in
+	-- coalesce(..., 0) so the scan can target *int directly
+	-- (pgx rejects SQL NULL into *int with "cannot scan NULL
+	-- into *int"; the 0 sentinel is distinguishable from a real
+	-- PR-number-0 preview via the preview_of_slug discriminator).
+	-- preview_expires_at is nullable timestamptz scanned into
+	-- *time.Time directly (pgx handles SQL NULL → Go nil natively).
+	coalesce(preview_of_slug, ''), coalesce(preview_pr_number, 0),
+	coalesce(preview_pr_state, ''), preview_expires_at,
+	-- CORS improvements D1: per-app default CORS opt-in + allowlist.
+	-- cors_default_enabled is NOT NULL DEFAULT false (migration 00224);
+	-- cors_default_origins is a nullable text[]; coalesce to '{}' so the
+	-- pgx scan sees a non-nil slice on legacy rows (the gateway treats
+	-- len==0 as "deny all" — same contract as EgressAllowlist).
+	cors_default_enabled, coalesce(cors_default_origins, '{}'::text[]),
+	-- ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+	-- maintenance flag. Boolean NOT NULL DEFAULT false
+	-- (migration 00237); plain bool scan is safe. Order is
+	-- positional and must match scanApp below.
+	maintenance_mode`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
@@ -10966,8 +11986,10 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at,
+	secret_findings, secret_scanned_at,
 	coalesce(parked_reason,''), parked_at,
-	traffic_percent`
+	traffic_percent,
+	scope`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -10995,8 +12017,10 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.sidecars, '[]'::jsonb),
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
+	d.secret_findings, d.secret_scanned_at,
 	coalesce(d.parked_reason,''), d.parked_at,
-	d.traffic_percent`
+	d.traffic_percent,
+	d.scope`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -11056,7 +12080,9 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
-		&d.ParkedReason, &parkedAt, &d.TrafficPercent); err != nil {
+		&d.SecretFindings, &d.SecretScannedAt,
+		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
+		&d.Scope); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {
@@ -14147,6 +15173,121 @@ func (s *PgStore) TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficA
 	return out, rows.Err()
 }
 
+// TrafficAnomalyAggregateByNode is the pgstore wrapper around
+// the sqlc-generated TrafficAnomalyAggregateByNode query
+// (PR #4 / ADR-092 §3.4 amendment). The raw SQL mirrors the
+// sqlc-emitted string verbatim so the generated code can stay
+// the source of truth for the column shapes. Same scoring
+// formula as TrafficAnomalyAggregate; one extra GROUP BY key
+// (node_id) threads the result through instances →
+// compute_nodes. The handler resolves node_id → node_name via
+// ListComputeNodes before returning the wire shape.
+func (s *PgStore) TrafficAnomalyAggregateByNode(ctx context.Context, arg sqlc.TrafficAnomalyAggregateByNodeParams) ([]sqlc.TrafficAnomalyAggregateByNodeRow, error) {
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
+	}
+	rows, err := s.pool.Query(ctx, `
+		with baseline as (
+		    select um.account_id,
+		           um.app_id,
+		           n.id as node_id,
+		           extract(hour from um.minute) as hour_of_day,
+		           avg(um.mb_seconds)::float8 as mean_mb_seconds,
+		           coalesce(stddev_pop(um.mb_seconds), 0)::float8 as stddev_mb_seconds,
+		           count(*)::int as sample_count
+		    from usage_minutes um
+		    join instances i on i.id = um.instance_id
+		    join compute_nodes n on n.id = i.node_id
+		    where um.minute >= $2
+		      and um.minute <  $1
+		      and um.mb_seconds > 0
+		    group by um.account_id, um.app_id, n.id, extract(hour from um.minute)
+		),
+		current_pool as (
+		    select um.account_id,
+		           um.app_id,
+		           n.id as node_id,
+		           um.minute,
+		           sum(um.mb_seconds)::float8 as current_mb_seconds
+		    from usage_minutes um
+		    join instances i on i.id = um.instance_id
+		    join compute_nodes n on n.id = i.node_id
+		    where um.minute >= $1
+		      and um.mb_seconds > 0
+		    group by um.account_id, um.app_id, n.id, um.minute
+		),
+		scored as (
+		    select c.account_id,
+		           c.app_id,
+		           c.node_id,
+		           c.minute,
+		           c.current_mb_seconds,
+		           b.mean_mb_seconds,
+		           b.stddev_mb_seconds,
+		           b.sample_count,
+		           case
+		               when b.sample_count < 3 then null
+		               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+		                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+		               when b.stddev_mb_seconds >= 1.0
+		                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+		                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+		               else null
+		           end as z_score,
+		           case
+		               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+		               else 'hour_of_day'
+		           end as reason
+		    from current_pool c
+		    join baseline b
+		      on c.account_id = b.account_id
+		     and c.app_id    = b.app_id
+		     and c.node_id   = b.node_id
+		     and extract(hour from c.minute) = b.hour_of_day
+		)
+		select account_id,
+		       app_id,
+		       node_id,
+		       minute,
+		       current_mb_seconds,
+		       mean_mb_seconds,
+		       stddev_mb_seconds,
+		       sample_count,
+		       z_score,
+		       reason
+		from scored
+		where z_score is not null
+		order by z_score desc
+		limit $3::int8
+	`, arg.Minute.Time.UTC(), arg.Minute_2.Time.UTC(), arg.Column3)
+	if err != nil {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node: %w", err)
+	}
+	defer rows.Close()
+	out := []sqlc.TrafficAnomalyAggregateByNodeRow{}
+	for rows.Next() {
+		var r sqlc.TrafficAnomalyAggregateByNodeRow
+		var zScore *float64
+		if err := rows.Scan(
+			&r.AccountID,
+			&r.AppID,
+			&r.NodeID,
+			&r.Minute,
+			&r.CurrentMbSeconds,
+			&r.MeanMbSeconds,
+			&r.StddevMbSeconds,
+			&r.SampleCount,
+			&zScore,
+			&r.Reason,
+		); err != nil {
+			return nil, fmt.Errorf("state: traffic_anomaly_aggregate_by_node scan: %w", err)
+		}
+		r.ZScore = zScore
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // PerAccountRateLimitAggregate is the pgstore-side hand-rolled
 // mirror of the sqlc query PerAccountRateLimitAggregate
 // (queries.sql). See ADR-091 §3.5 / PR #2 for the model. The
@@ -14182,6 +15323,647 @@ func (s *PgStore) PerAccountRateLimitAggregate(ctx context.Context, arg sqlc.Per
 			r.LastEventAt = lastAt
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UpsertGithubWebhookSecret installs or rotates the per-tenant
+// GitHub App webhook secret for the given installation_id. PR-D /
+// ADR-012 §7 amendment: replaces the platform-wide
+// FAAS_GITHUB_WEBHOOK_SECRET with a row-per-install lookup so a
+// leaked tenant secret can rotate without coordinating every
+// GitHub install. upgradedAt + upgradedBy form a §11 audit trail
+// for the rotation.
+//
+// The secret is stored as raw bytes (bytea) — NOT hex-encoded
+// text — because the daemon-side verifier at
+// pkg/githubd/webhook.go::VerifyPushSignature reads the wire body
+// raw. A hex-decode on every webhook would be wasted CPU at the
+// gatewayd-internal proxy hot path.
+//
+// On conflict the existing row's secret_value + audit fields are
+// overwritten; the test at
+// migrations/00208_github_webhook_secrets_test.go pins the
+// round-trip.
+func (s *PgStore) UpsertGithubWebhookSecret(ctx context.Context, installationID int64, secret []byte, upgradedBy string) (time.Time, string, error) {
+	if installationID == 0 {
+		return time.Time{}, "", fmt.Errorf("state: UpsertGithubWebhookSecret: installation_id must be non-zero")
+	}
+	if len(secret) == 0 {
+		return time.Time{}, "", fmt.Errorf("state: UpsertGithubWebhookSecret: secret must be non-empty (use a 32-byte random value per GitHub's recommendation)")
+	}
+	if upgradedBy == "" {
+		upgradedBy = "platform"
+	}
+	var upgradedAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO github_webhook_secrets (installation_id, secret_value, upgraded_by)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (installation_id) DO UPDATE
+		SET secret_value = EXCLUDED.secret_value,
+		    upgraded_at  = now(),
+		    upgraded_by  = EXCLUDED.upgraded_by
+		RETURNING upgraded_at, upgraded_by
+	`, installationID, secret, upgradedBy).Scan(&upgradedAt, &upgradedBy)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("state: UpsertGithubWebhookSecret: %w", err)
+	}
+	return upgradedAt, upgradedBy, nil
+}
+
+// GetGithubWebhookSecret returns the per-tenant secret for the
+// given installation_id. Returns ErrNotFound when no row exists
+// (the daemon-side resolver treats this as fail-closed — the
+// webhook is rejected rather than falling back to the platform-
+// wide FAAS_GITHUB_WEBHOOK_SECRET, per PR-D's adoption posture).
+//
+// The bytea is returned as a raw byte slice; the caller
+// (pkg/githubd/webhook_secret.go::PGWebhookSecretResolver)
+// passes the bytes directly to VerifyPushSignature.
+func (s *PgStore) GetGithubWebhookSecret(ctx context.Context, installationID int64) ([]byte, error) {
+	if installationID == 0 {
+		return nil, ErrNotFound
+	}
+	var secret []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1`,
+		installationID,
+	).Scan(&secret)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("state: GetGithubWebhookSecret: %w", err)
+	}
+	return secret, nil
+}
+
+// --- ADR-096 customer-facing automatic error grouping ---
+//
+// The sqlc-generated methods (pkg/state/sqlc/queries.sql.go) own
+// the canonical SQL text. PgStore delegates to them via a
+// per-call sqlc.New() Queries instance + s.pool as the DBTX —
+// the pool's pgx connection handles satisfy the sqlc.DBTX
+// interface (pgxpool.Pool.Exec / Query / QueryRow match the
+// generated signature). The conversion from sqlc row types
+// (pgtype.UUID, pgtype.Timestamptz) to the domain types
+// (uuid.UUID, time.Time) happens here so callers (handlers in
+// PR-B + the nightly purge cron) don't have to thread pgtype
+// values through their own code. This matches the precedent
+// for TrafficAnomalyAggregate / PerAccountRateLimitAggregate
+// which the Store interface exposes at sqlc types directly.
+
+// appErrorsQueries is a per-call helper that returns a fresh
+// Queries instance. The Queries struct carries no state (see
+// pkg/state/sqlc/db.go) so there's no need to cache it on
+// PgStore. Allocating per call is cheap.
+func (s *PgStore) appErrorsQueries() *sqlc.Queries { return sqlc.New() }
+
+// uuidFromPgtype converts a sqlc/pgtype.UUID to google/uuid.UUID.
+// Returns uuid.Nil if the input is invalid (the migration's id
+// columns are NOT NULL uuid, so this is a defensive guard).
+func uuidFromPgtype(id pgtype.UUID) uuid.UUID {
+	if !id.Valid {
+		return uuid.Nil
+	}
+	return uuid.UUID(id.Bytes)
+}
+
+// timeFromPgtype converts a sqlc/pgtype.Timestamptz to time.Time.
+// Returns time.Time{} if the input is invalid.
+func timeFromPgtype(t pgtype.Timestamptz) time.Time {
+	if !t.Valid {
+		return time.Time{}
+	}
+	return t.Time
+}
+
+// pgtypeFromUUID wraps google/uuid.UUID into pgtype.UUID with
+// Valid=true. Used by the writer methods to map domain types
+// to sqlc params.
+func pgtypeFromUUID(id uuid.UUID) pgtype.UUID {
+	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+// pgtypeFromTime wraps time.Time into pgtype.Timestamptz.
+func pgtypeFromTime(t time.Time) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: t, Valid: !t.IsZero()}
+}
+
+// IncrementAppError is the dedupe-merge INSERT called by the
+// apid gRPC server-side handler. The handler wraps N calls in
+// a single pgx transaction; this method runs ONE call at a
+// time — the caller is responsible for the tx (via
+// pgxpool.Pool's BeginTx in the grpc handler).
+func (s *PgStore) IncrementAppError(ctx context.Context, arg sqlc.IncrementAppErrorParams) (bool, error) {
+	return s.appErrorsQueries().IncrementAppError(ctx, s.pool, arg)
+}
+
+// InsertAppErrorRequest writes one drill-down row per request.
+// Paired with IncrementAppError on the same gRPC stream batch.
+func (s *PgStore) InsertAppErrorRequest(ctx context.Context, arg sqlc.InsertAppErrorRequestParams) error {
+	return s.appErrorsQueries().InsertAppErrorRequest(ctx, s.pool, arg)
+}
+
+// ListAppErrorGroups converts sqlc.ListAppErrorGroupsRow to
+// the domain AppErrorGroup at the boundary so handlers don't
+// touch pgtype.
+func (s *PgStore) ListAppErrorGroups(ctx context.Context, arg sqlc.ListAppErrorGroupsParams) ([]AppErrorGroup, error) {
+	rows, err := s.appErrorsQueries().ListAppErrorGroups(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppErrorGroup, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, AppErrorGroup{
+			ID:            uuidFromPgtype(r.ID),
+			Fingerprint:   r.Fingerprint,
+			ErrorClass:    r.ErrorClass,
+			Route:         r.Route,
+			HTTPStatus:    r.HttpStatus,
+			Count:         r.Count,
+			RequestCount:  r.RequestCount,
+			FirstSeenAt:   timeFromPgtype(r.FirstSeenAt),
+			LastSeenAt:    timeFromPgtype(r.LastSeenAt),
+			SampleMessage: r.SampleMessage,
+		})
+	}
+	return out, nil
+}
+
+// ListAppErrorRequests converts sqlc.ListAppErrorRequestsRow to
+// the domain AppErrorRequestRow.
+func (s *PgStore) ListAppErrorRequests(ctx context.Context, arg sqlc.ListAppErrorRequestsParams) ([]AppErrorRequestRow, error) {
+	rows, err := s.appErrorsQueries().ListAppErrorRequests(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppErrorRequestRow, 0, len(rows))
+	for _, r := range rows {
+		var depID *uuid.UUID
+		if r.DeploymentID.Valid {
+			d := uuidFromPgtype(r.DeploymentID)
+			depID = &d
+		}
+		out = append(out, AppErrorRequestRow{
+			ID:            uuidFromPgtype(r.ID),
+			RequestID:     uuidFromPgtype(r.RequestID),
+			ReceivedAt:    timeFromPgtype(r.ReceivedAt),
+			Route:         r.Route,
+			HTTPStatus:    r.HttpStatus,
+			ErrorClass:    r.ErrorClass,
+			SampleMessage: r.SampleMessage,
+			DeploymentID:  depID,
+		})
+	}
+	return out, nil
+}
+
+// GetAppErrorSample returns the single oldest request row for
+// one fingerprint, with headers_sample + redactions populated
+// for the wire-side "we redacted X / Y / Z" badge.
+func (s *PgStore) GetAppErrorSample(ctx context.Context, arg sqlc.GetAppErrorSampleParams) (AppErrorSampleRow, error) {
+	row, err := s.appErrorsQueries().GetAppErrorSample(ctx, s.pool, arg)
+	if err != nil {
+		return AppErrorSampleRow{}, err
+	}
+	var depID *uuid.UUID
+	if row.DeploymentID.Valid {
+		d := uuidFromPgtype(row.DeploymentID)
+		depID = &d
+	}
+	headers := []byte(nil)
+	if row.HeadersSample != nil {
+		headers = row.HeadersSample
+	}
+	return AppErrorSampleRow{
+		AppErrorRequestRow: AppErrorRequestRow{
+			ID:            uuidFromPgtype(row.ID),
+			RequestID:     uuidFromPgtype(row.RequestID),
+			ReceivedAt:    timeFromPgtype(row.ReceivedAt),
+			Route:         row.Route,
+			HTTPStatus:    row.HttpStatus,
+			ErrorClass:    row.ErrorClass,
+			SampleMessage: row.SampleMessage,
+			DeploymentID:  depID,
+		},
+		HeadersSample: headers,
+		Redactions:    row.Redactions,
+	}, nil
+}
+
+// ListAppErrorFingerprintsForPurge is the read-side of the
+// nightly retention purge (cmd/apid/app_errors_purge.go).
+func (s *PgStore) ListAppErrorFingerprintsForPurge(ctx context.Context, arg sqlc.ListAppErrorFingerprintsForPurgeParams) ([]uuid.UUID, error) {
+	rows, err := s.appErrorsQueries().ListAppErrorFingerprintsForPurge(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, uuidFromPgtype(r))
+	}
+	return out, nil
+}
+
+// DeleteAppErrorsByIDs removes app_errors rows by ID array.
+// The sqlc-generated method takes []pgtype.UUID; we convert
+// here.
+func (s *PgStore) DeleteAppErrorsByIDs(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	pgIDs := make([]pgtype.UUID, len(ids))
+	for i, id := range ids {
+		pgIDs[i] = pgtypeFromUUID(id)
+	}
+	return s.appErrorsQueries().DeleteAppErrorsByIDs(ctx, s.pool, pgIDs)
+}
+
+// DeleteAppErrorRequestsByIDs removes app_error_requests rows
+// by ID array.
+func (s *PgStore) DeleteAppErrorRequestsByIDs(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	pgIDs := make([]pgtype.UUID, len(ids))
+	for i, id := range ids {
+		pgIDs[i] = pgtypeFromUUID(id)
+	}
+	return s.appErrorsQueries().DeleteAppErrorRequestsByIDs(ctx, s.pool, pgIDs)
+}
+
+// DeleteAppErrorRequestsOlderThan removes ALL app_error_requests
+// rows for one account older than cutoff. Used by the nightly
+// retention purge to age out orphaned request rows.
+func (s *PgStore) DeleteAppErrorRequestsOlderThan(ctx context.Context, accountID uuid.UUID, cutoff time.Time) error {
+	return s.appErrorsQueries().DeleteAppErrorRequestsOlderThan(ctx, s.pool, sqlc.DeleteAppErrorRequestsOlderThanParams{
+		AccountID:  pgtypeFromUUID(accountID),
+		ReceivedAt: pgtypeFromTime(cutoff),
+	})
+}
+
+// ----------------------------------------------------------------------------
+// ADR-098 connection-aware execution (§9.A). pgstore wrappers for the
+// sqlc-generated data_upstreams + data_upstream_probes query surface
+// (queries.sql ADR-098 block). Per-call helper mirrors
+// appErrorsQueries() at pgstore.go:14924. The typed DataUpstream /
+// DataUpstreamProbe structs (types.go ADR-098 block) are the handler
+// boundary; pgtype-flavored rows stay inside this adapter.
+//
+// PR-A: thin wrappers over sqlc. The call sites are PR-B (apid
+// env-classifier), PR-C (meterd probe loop), and PR-D (schedd wake-
+// side read). Until PR-B lands, no production code path calls these —
+// the surface compiles so the Store interface extension doesn't break
+// the rest of the package.
+// ----------------------------------------------------------------------------
+
+// dataUpstreamsQueries is the per-call helper for the ADR-098 §9.A
+// typed query surface. Mirrors appErrorsQueries() at pgstore.go:14924
+// — no state, no caching, allocated per call.
+func (s *PgStore) dataUpstreamsQueries() *sqlc.Queries { return sqlc.New() }
+
+// InsertDataUpstream writes one data_upstreams row via the dedupe-
+// merge ON CONFLICT tripwire on data_upstreams_dedupe_uniq. PR-B's
+// apid env-classifier (cmd/apid/extract.go) calls this on every
+// observed (app_id, scope, kind, host, port) tuple. The returned
+// uuid.UUID is the row's id (the same caller-supplied id on insert;
+// the existing row's id on conflict).
+func (s *PgStore) InsertDataUpstream(ctx context.Context, arg sqlc.InsertDataUpstreamParams) (uuid.UUID, error) {
+	id, err := s.dataUpstreamsQueries().InsertDataUpstream(ctx, s.pool, arg)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return uuidFromPgtype(id), nil
+}
+
+// ListDataUpstreamsByApp converts sqlc.ListDataUpstreamsByAppRow to
+// the typed DataUpstream at the boundary so handlers don't touch
+// pgtype. Cursor-paginated via (created_at, id); the handler MUST
+// pre-clamp limit to api.DataUpstreamsListMaxLimit (PR-B).
+func (s *PgStore) ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error) {
+	rows, err := s.dataUpstreamsQueries().ListDataUpstreamsByApp(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DataUpstream, 0, len(rows))
+	for _, r := range rows {
+		var rtt *int
+		if r.LastRttMs.Valid {
+			v := int(r.LastRttMs.Int32)
+			rtt = &v
+		}
+		var probedAt *time.Time
+		if r.LastProbedAt.Valid {
+			t := timeFromPgtype(r.LastProbedAt)
+			probedAt = &t
+		}
+		out = append(out, DataUpstream{
+			ID:               uuidFromPgtype(r.ID),
+			AccountID:        uuidFromPgtype(r.AccountID),
+			AppID:            uuidFromPgtype(r.AppID),
+			Source:           DataUpstreamSource(r.Source),
+			Scope:            r.Scope,
+			Kind:             DataUpstreamKind(r.Kind),
+			Host:             r.Host,
+			Port:             int(r.Port),
+			HostRedactedHash: r.HostRedactedHash,
+			DeclaredRegion:   r.DeclaredRegion,
+			LastRTTMs:        rtt,
+			LastProbedAt:     probedAt,
+			LastSeenAt:       timeFromPgtype(r.LastSeenAt),
+			CreatedAt:        timeFromPgtype(r.CreatedAt),
+		})
+	}
+	return out, nil
+}
+
+// GetDataUpstreamByID is the single-row read for the dashboard's
+// "edit upstream" pane (PR-B).
+func (s *PgStore) GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUpstream, error) {
+	row, err := s.dataUpstreamsQueries().GetDataUpstreamByID(ctx, s.pool, pgtypeFromUUID(id))
+	if err != nil {
+		return DataUpstream{}, err
+	}
+	var rtt *int
+	if row.LastRttMs.Valid {
+		v := int(row.LastRttMs.Int32)
+		rtt = &v
+	}
+	var probedAt *time.Time
+	if row.LastProbedAt.Valid {
+		t := timeFromPgtype(row.LastProbedAt)
+		probedAt = &t
+	}
+	return DataUpstream{
+		ID:               uuidFromPgtype(row.ID),
+		AccountID:        uuidFromPgtype(row.AccountID),
+		AppID:            uuidFromPgtype(row.AppID),
+		Source:           DataUpstreamSource(row.Source),
+		Scope:            row.Scope,
+		Kind:             DataUpstreamKind(row.Kind),
+		Host:             row.Host,
+		Port:             int(row.Port),
+		HostRedactedHash: row.HostRedactedHash,
+		DeclaredRegion:   row.DeclaredRegion,
+		LastRTTMs:        rtt,
+		LastProbedAt:     probedAt,
+		LastSeenAt:       timeFromPgtype(row.LastSeenAt),
+		CreatedAt:        timeFromPgtype(row.CreatedAt),
+	}, nil
+}
+
+// DeleteDataUpstreamByID removes one data_upstreams row by ID.
+// PR-B wires DELETE /v1/apps/{slug}/upstreams/{id} to this method.
+// FK CASCADE on account_id / app_id handles the GDPR path; the
+// handler is the only direct DELETE caller.
+func (s *PgStore) DeleteDataUpstreamByID(ctx context.Context, id uuid.UUID) error {
+	return s.dataUpstreamsQueries().DeleteDataUpstreamByID(ctx, s.pool, pgtypeFromUUID(id))
+}
+
+// InsertDataUpstreamProbe writes one probe sample. meterd's probe
+// loop calls this every 30s per (host_redacted_hash, region).
+// Partitioning on sampled_at gives the hot-write path; the partition
+// creator (PR-C) drops old partitions wholesale.
+func (s *PgStore) InsertDataUpstreamProbe(ctx context.Context, arg sqlc.InsertDataUpstreamProbeParams) error {
+	return s.dataUpstreamsQueries().InsertDataUpstreamProbe(ctx, s.pool, arg)
+}
+
+// ListDataUpstreamProbesByHostRegion is schedd's wake-side read path.
+// Returns the N most recent samples for one (host_redacted_hash,
+// region) pair within a time window. Partition pruning on sampled_at
+// drops everything outside the window.
+func (s *PgStore) ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error) {
+	rows, err := s.dataUpstreamsQueries().ListDataUpstreamProbesByHostRegion(ctx, s.pool, arg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DataUpstreamProbe, 0, len(rows))
+	for _, r := range rows {
+		var rtt *int
+		if r.RttMs.Valid {
+			v := int(r.RttMs.Int32)
+			rtt = &v
+		}
+		var errClass *string
+		if r.ErrorClass.Valid {
+			s := r.ErrorClass.String
+			errClass = &s
+		}
+		out = append(out, DataUpstreamProbe{
+			ID:               uuidFromPgtype(r.ID),
+			HostRedactedHash: r.HostRedactedHash,
+			Region:           r.Region,
+			Kind:             DataUpstreamKind(r.Kind),
+			SampledAt:        timeFromPgtype(r.SampledAt),
+			RTTMs:            rtt,
+			OK:               r.Ok,
+			ErrorClass:       errClass,
+			ProbeNode:        r.ProbeNode,
+		})
+	}
+	return out, nil
+}
+
+// PruneDataUpstreamProbesOlderThan is the retention purge. meterd
+// calls this hourly with cutoff = now() - 30 days. The partition
+// pruning on sampled_at makes the partial-partition tail O(affected
+// partitions); PR-C's partition creator handles whole-partition drops.
+func (s *PgStore) PruneDataUpstreamProbesOlderThan(ctx context.Context, cutoff time.Time) error {
+	return s.dataUpstreamsQueries().PruneDataUpstreamProbesOlderThan(ctx, s.pool, pgtypeFromTime(cutoff))
+}
+
+// AppUpstreamProbeScore is the JOIN-collapsed per-upstream
+// probe summary. One row per (data_upstreams.id, region) with
+// the freshest probe's RTT. Old name: aggregate per
+// (host_redacted_hash, region) — the new per-app-scoped
+// reader returns one row per inferred upstream + region.
+//
+// The schedd chooser (PR-D) reads this in a single round-trip
+// on the wake path. The previous N+1 design (1 ListAllAppDataUpstreams
+// + N ListDataUpstreamProbesByHostRegion) cost N+1 PG round-trips
+// per wake; for a Scale plan app with DataPlacementHintsPerApp=50,
+// that's 51 round-trips on the wake goroutine under appMu —
+// far past the < 1 ms wake-budget claim. The JOIN collapses
+// the read to a single round-trip.
+type AppUpstreamProbeScore struct {
+	HostRedactedHash string
+	Region           string
+	Kind             DataUpstreamKind
+	Port             int
+	RTTMs            *int
+	OK               bool
+}
+
+// ListAppUpstreamProbeScores (ADR-098 PR-D) returns the freshest
+// probe per (data_upstreams.id, region) for the given app.
+//
+// SQL shape (hand-rolled, not sqlc — the JOIN with DISTINCT ON
+// is a single statement and adding it via sqlc would require a
+// schema-bound regeneration):
+//
+//	SELECT DISTINCT ON (u.id, p.region)
+//	       u.host_redacted_hash, p.region, u.kind, u.port,
+//	       p.rtt_ms, p.ok
+//	FROM data_upstreams u
+//	LEFT JOIN LATERAL (
+//	  SELECT region, rtt_ms, ok
+//	  FROM data_upstream_probes
+//	  WHERE host_redacted_hash = u.host_redacted_hash
+//	  ORDER BY sampled_at DESC
+//	  LIMIT 1
+//	) p ON true
+//	WHERE u.account_id = $1 AND u.app_id = $2
+//	  AND u.declared_region IS NOT NULL
+//
+// The LATERAL subquery keeps the index-driven lookup hot
+// (data_upstream_probes partitioned by sampled_at, the
+// (host_redacted_hash, sampled_at) index is the probe-loop's
+// hot path). One round-trip per wake.
+func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]AppUpstreamProbeScore, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (u.id, p.region)
+		       u.host_redacted_hash, p.region, u.kind, u.port,
+		       p.rtt_ms, p.ok
+		FROM data_upstreams u
+		LEFT JOIN LATERAL (
+			SELECT region, rtt_ms, ok
+			FROM data_upstream_probes
+			WHERE host_redacted_hash = u.host_redacted_hash
+			ORDER BY sampled_at DESC
+			LIMIT 1
+		) p ON true
+		WHERE u.account_id = $1 AND u.app_id = $2
+		  AND u.declared_region IS NOT NULL
+	`, accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppUpstreamProbeScore
+	for rows.Next() {
+		var s AppUpstreamProbeScore
+		var kind string
+		var rtt *int32
+		if err := rows.Scan(&s.HostRedactedHash, &s.Region, &kind, &s.Port, &rtt, &s.OK); err != nil {
+			return nil, err
+		}
+		if rtt != nil {
+			v := int(*rtt)
+			s.RTTMs = &v
+		}
+		s.Kind = DataUpstreamKind(kind)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListAllAppDataUpstreams returns every data_upstreams row on the
+// app across all scopes, scoped to accountID. Used by apid's
+// GET /v1/apps/{slug}/upstreams?scope=__all__ arm to render the
+// full list without a cursor. The row count is bounded by
+// DataPlacementHintsPerApp (0/3/10/50 by plan per ADR-098 §D5)
+// so the scan is cheap.
+func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, account_id, app_id, source, scope, kind, host, port,
+		        host_redacted_hash, coalesce(declared_region, ''),
+		        last_rtt_ms, last_probed_at, last_seen_at, created_at
+		 from data_upstreams
+		 where account_id = $1 and app_id = $2
+		 order by created_at desc, id desc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstream
+	for rows.Next() {
+		var (
+			id, accountIDpg, appIDpg                                    pgtype.UUID
+			source, scope, kind, host, hostRedactedHash, declaredRegion string
+			port                                                        int32
+			lastRTT                                                     pgtype.Int4
+			lastProbedAt                                                pgtype.Timestamptz
+			lastSeenAt, createdAt                                       pgtype.Timestamptz
+		)
+		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
+			&hostRedactedHash, &declaredRegion,
+			&lastRTT, &lastProbedAt, &lastSeenAt, &createdAt); err != nil {
+			return nil, err
+		}
+		var rttPtr *int
+		if lastRTT.Valid {
+			v := int(lastRTT.Int32)
+			rttPtr = &v
+		}
+		var probedPtr *time.Time
+		if lastProbedAt.Valid {
+			t := timeFromPgtype(lastProbedAt)
+			probedPtr = &t
+		}
+		out = append(out, DataUpstream{
+			ID:               uuidFromPgtype(id),
+			AccountID:        uuidFromPgtype(accountIDpg),
+			AppID:            uuidFromPgtype(appIDpg),
+			Source:           DataUpstreamSource(source),
+			Scope:            scope,
+			Kind:             DataUpstreamKind(kind),
+			Host:             host,
+			Port:             int(port),
+			HostRedactedHash: hostRedactedHash,
+			DeclaredRegion:   declaredRegion,
+			LastRTTMs:        rttPtr,
+			LastProbedAt:     probedPtr,
+			LastSeenAt:       timeFromPgtype(lastSeenAt),
+			CreatedAt:        timeFromPgtype(createdAt),
+		})
+	}
+	return out, rows.Err()
+}
+
+// CountDataUpstreamsByApp is the per-plan quota helper. Counts
+// ALL scope values for the app per ADR-098 §D5
+// (DataPlacementHintsPerApp is per-app, not per-scope). Mirrors
+// CountAppEnv's posture.
+func (s *PgStore) CountDataUpstreamsByApp(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from data_upstreams where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
+// ListDistinctUpstreamHostHashes walks data_upstreams and
+// returns the deduplicated set of
+// (host_redacted_hash, kind, port, host) tuples. Used by the
+// meterd probe loop (PR-C).
+//
+// The plaintext host is included in the row so the probe can
+// resolve the dial address. §11 invariant scope: the host
+// NEVER reaches the Prom metric labels, the audit emit, the
+// pg_notify payload, or any log line. The probe carries the
+// plaintext in-process ONLY for the duration of the dial,
+// then drops it. The customer-facing list/get endpoints
+// return host_redacted_hash + host_last4 — NEVER plaintext.
+func (s *PgStore) ListDistinctUpstreamHostHashes(ctx context.Context) ([]DataUpstreamTarget, error) {
+	rows, err := s.pool.Query(ctx,
+		`select host_redacted_hash, kind, port, host
+		 from data_upstreams
+		 group by host_redacted_hash, kind, port, host`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DataUpstreamTarget
+	for rows.Next() {
+		var t DataUpstreamTarget
+		var kind string
+		if err := rows.Scan(&t.HostRedactedHash, &kind, &t.Port, &t.Host); err != nil {
+			return nil, err
+		}
+		t.Kind = DataUpstreamKind(kind)
+		out = append(out, t)
 	}
 	return out, rows.Err()
 }

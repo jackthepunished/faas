@@ -12,7 +12,11 @@ GOARCH  ?= $(shell $(GO) env GOARCH)
 export GOOS GOARCH
 PKGS    := ./...
 COVERAGE_DIR := coverage
-DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge vmmd-stream-bridge builderd imaged meterd gregale githubd hostage-gen
+DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge vmmd-stream-bridge builderd imaged meterd githubd hostage-gen
+# gregale is the customer-facing CLI; gregalectl is the
+# operator-only companion CLI (issue #911 / ADR-110 PR-6.5).
+# Both are built into ./bin by `make build`.
+CLIS := gregale gregalectl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
@@ -25,11 +29,15 @@ help: ## List targets
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: guest-runners ## Build every daemon + function runners into ./bin
+build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
 	@mkdir -p $(BINDIR)
 	@for d in $(DAEMONS); do \
 	  echo "building $$d"; \
 	  $(GO) build -ldflags '$(LDFLAGS)' -o $(BINDIR)/$$d ./cmd/$$d || exit 1; \
+	done
+	@for c in $(CLIS); do \
+	  echo "building $$c (CLI)"; \
+	  $(GO) build -ldflags '$(LDFLAGS)' -o $(BINDIR)/$$c ./cmd/$$c || exit 1; \
 	done
 
 # Function-runner shims live in the guest at /usr/local/bin/faas-runner and
@@ -133,7 +141,7 @@ generate-diff: ## Print drift between generated and committed (no exit 1)
 	$(GO) run ./cmd/deployctl/ diff
 
 .PHONY: test
-test: ## Unit tests — must pass on any machine, no KVM needed.
+test: grafana-mirror-check ## Unit tests — must pass on any machine, no KVM needed.
 	# -timeout=18m: ./cmd/e2e under -race walks pkg/e2etest.buildApid
 	# per test (unique -o path → cache miss). PR #541 (apply-time build
 	# enqueue, ADR-068) added ~50 themed apply e2e tests, pushing the
@@ -169,10 +177,35 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 migrations-check: ## Static migration-contiguity check (no Postgres needed) — PR #93 follow-up
 	$(GO) test -tags no_pg -race -count=1 -run 'TestMigrations' ./migrations/...
 
+.PHONY: grafana-jq-check
+grafana-jq-check: ## Validate every Grafana dashboard JSON parses cleanly (jq -e .). PR #837 (ADR-091 Amendment 1, issue #561) wired this into `test`.
+	@for f in deploy/grafana/*.json deploy/ansible/roles/grafana/files/*.json; do \
+	  if [ -f "$$f" ]; then \
+	    jq -e . "$$f" > /dev/null || (echo "grafana-jq-check: parse failed $$f"; exit 1); \
+	  fi; \
+	done
+
+.PHONY: grafana-mirror-check
+grafana-mirror-check: ## SHA-256 byte-identity check for deploy/grafana/ → deploy/ansible/roles/grafana/files/ mirror. PR #837 (ADR-091 Amendment 1, issue #561) wired this into `test`.
+	@for f in faas-fleet.json top-tenants.json top-throttled-apps.json edge-rules.json; do \
+	  if [ -f "deploy/grafana/$$f" ] && [ -f "deploy/ansible/roles/grafana/files/$$f" ]; then \
+	    a=$$(shasum -a 256 "deploy/grafana/$$f" | awk '{print $$1}'); \
+	    b=$$(shasum -a 256 "deploy/ansible/roles/grafana/files/$$f" | awk '{print $$1}'); \
+	    if [ "$$a" != "$$b" ]; then \
+	      echo "grafana-mirror-check: $$f mismatch (deploy/grafana/ vs deploy/ansible/roles/grafana/files/)"; exit 1; \
+	    fi; \
+	  fi; \
+	done
+
 .PHONY: verify-secrets
 verify-secrets: ## PR-P4: assert /etc/faas/sealed.env (or the file passed via SECRETS_FILE) is shaped correctly. CI runs this on every PR.
 	@test -x deploy/scripts/verify-secrets.sh || (echo "deploy/scripts/verify-secrets.sh missing or not executable" ; exit 1)
 	@SECRETS_FILE=$${SECRETS_FILE:-/etc/faas/sealed.env} bash deploy/scripts/verify-secrets.sh
+
+.PHONY: hobby-route-audit
+hobby-route-audit: ## Tier A (ADR-093): Hobby-tier app audit. Read-only harness that lists Hobby tenants, pulls /v1/apps/{slug}/routes, counts __route_other__ vs real-route entries. Exit 1 if any app is saturated. Needs FAAS_API_BASE + FAAS_TOKEN.
+	@test -x deploy/scripts/adr093-hobby-audit.sh || (echo "deploy/scripts/adr093-hobby-audit.sh missing or not executable" ; exit 1)
+	@bash deploy/scripts/adr093-hobby-audit.sh
 
 .PHONY: test-load
 test-load: ## Hot-path load test (1k rps, //go:build load) — spec §14 M4 row 2. Needs ≥ 2 vCPU.
@@ -257,12 +290,24 @@ metal-lima-m5: ## Run the M5 §14 deploy-to-park cold-boot acceptance on Lima (s
 	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false
 	limactl shell --workdir "$(CURDIR)" faas-metal sudo env RUN_TARGET=./cmd/e2e/ ./deploy/lima/run-metal.sh -run 'TestDeployWakeMetal/deploy-then-parked'
 
+.PHONY: metal-soak
+metal-soak: ## Issue #587 PR-A.8: 30-min mixed WS/HTTP/Upgrade drain soak on Lima (1-node). Verifies gateway_drain_wait_seconds histogram + gateway_inflight_requests gauge end-to-end. Pre-req: make metal-lima green.
+	@limactl list -q 2>/dev/null | grep -qx faas-metal || { echo "faas-metal not started — run 'make metal-lima' first" >&2; exit 1; }
+	limactl shell --workdir "$(CURDIR)" faas-metal sudo ./deploy/lima/run-metal-soak.sh
+
 .PHONY: metal-lima-2node
 metal-lima-2node: ## Tier A5 / ADR-066: two-node Lima fleet for the cross-node live-instance migration acceptance (§14 M9)
 	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false
 	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || limactl start deploy/lima/faas-metal-2node-b.yaml --tty=false
 	limactl shell --workdir "$(CURDIR)" faas-metal sudo env FAAS_NODE_NAME=node-a ./deploy/lima/run-metal.sh
 	limactl shell --workdir "$(CURDIR)" faas-metal-2b sudo env FAAS_NODE_NAME=node-b ./deploy/lima/run-metal.sh
+
+.PHONY: metal-lima-splitbox
+metal-lima-splitbox: ## Issue #911 / ADR-110 PR-7: two-role Lima harness (control-plane + compute-only) — drives gregalectl manifest validate + render + release install + doctor end-to-end
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-splitbox-cp || limactl start --name faas-metal-splitbox-cp deploy/lima/faas-metal-splitbox.yaml --tty=false
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-splitbox-cx || limactl start --name faas-metal-splitbox-cx deploy/lima/faas-metal-splitbox.yaml --tty=false
+	limactl shell --workdir "$(CURDIR)" faas-metal-splitbox-cp sudo env FAAS_BOX_ROLE=control-plane FAAS_HOST_NAME=fsn-1 ./deploy/lima/run-metal-splitbox.sh
+	limactl shell --workdir "$(CURDIR)" faas-metal-splitbox-cx sudo env FAAS_BOX_ROLE=compute-only  FAAS_HOST_NAME=fsn-2 ./deploy/lima/run-metal-splitbox.sh
 
 .PHONY: ha-failover-drill
 ha-failover-drill: ## Tier A8 / ADR-083: active-passive HA fail-over drill on the two-node Lima fleet (§14 M8)
@@ -348,8 +393,23 @@ ha-write-redirect-drill: ## Tier A9 / ADR-089: standby write-redirect drill on t
 	  exit 0'
 
 .PHONY: lint
-lint: egress-check lint-incompatible-mods ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate
+lint: egress-check lint-incompatible-mods image-validate ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate + packer-builder syntax (ADR-111)
 	@$(GO) tool golangci-lint run
+
+# ADR-111: packer-builder syntax gate. Delegates to deploy/packer/Makefile:image-validate,
+# which loops `packer validate -syntax-only` over every *.pkr.hcl. Works
+# without cloud creds; gates PR #928. install-packer.sh is the deterministic
+# installer. The outer target SKIPS when packer isn't on PATH (CI installs it
+# via scripts/install-packer.sh in the packer-validate job before invoking
+# `make image-validate`); a dev box without packer isn't broken — install via
+# `scripts/install-packer.sh` and rerun.
+.PHONY: image-validate
+image-validate: ## ADR-111 Packer-builder syntax gate (skips when packer not on PATH; CI installs)
+	@if command -v packer >/dev/null 2>&1; then \
+	  $(MAKE) -C deploy/packer image-validate; \
+	else \
+	  echo "image-validate: SKIP (packer not on PATH — install via scripts/install-packer.sh)"; \
+	fi
 
 .PHONY: scan
 scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (issue #299)
@@ -363,18 +423,18 @@ scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (
 
 .PHONY: bootstrap
 bootstrap: ## Idempotent single-box setup (ansible) — dev/lima. Back-compat for `make bootstrap` against 127.0.0.1.
-	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml not present yet (Gate-B PR-2)"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit box -e faas_box_role=single-box
+	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $$BOX -e faas_box_role=single-box
 
 .PHONY: bootstrap-control-plane
-bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Gate-B PR-2
-	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml not present yet (Gate-B PR-2)"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit control_plane -e faas_box_role=control-plane
+bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
+	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane} -e faas_box_role=control-plane
 
 .PHONY: bootstrap-compute
-bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Gate-B PR-2
-	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml not present yet (Gate-B PR-2)"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit compute_nodes -e faas_box_role=compute-only
+bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
+	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes} -e faas_box_role=compute-only
 
 .PHONY: tidy
 tidy: ## go mod tidy
@@ -396,8 +456,16 @@ tidy: ## go mod tidy
 # the package defaults (eth0 + 10.100.0.0/16); a Hetzner compute
 # node invokes the binary with the env overrides, captures the
 # output, and the ansible template ships THAT to the host.
+#
+# Commit 2 (Mega-PR-C) moved the Jinja2 template from
+# roles/nftables/files/ to roles/nftables/templates/ so ansible's
+# `template:` module resolves at deploy time. The artifact path
+# stays at the legacy files/ location — the committed static is
+# a fallback for operators running `make egress-render` to
+# refresh the canonical-default ruleset; ansible renders the
+# per-host file at bootstrap directly from templates/.
 EGRESS_ARTIFACT := deploy/ansible/roles/nftables/files/policy_nftables.conf
-EGRESS_JINJA2 := deploy/ansible/roles/nftables/files/policy_nftables.conf.j2
+EGRESS_JINJA2 := deploy/ansible/roles/nftables/templates/policy_nftables.conf.j2
 
 .PHONY: egress-render
 egress-render: ## (re)generate the host nft ruleset artifact from pkg/netns/policy.go
@@ -420,41 +488,27 @@ egress-render: ## (re)generate the host nft ruleset artifact from pkg/netns/poli
 # This mirrors what cmd/e2e/sec11_sweep_test.go's
 # TestSec11_PerHostEgressTemplating does.
 .PHONY: egress-render-cross-check
-egress-render-cross-check: ## Diff the Go render against the Jinja2 template render for default values
-	@bash -c 'set -e; status=0; \
-	  go_out=$$(go run ./cmd/faas-nft-render | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	  jinja_out=$$(python3 -c "from jinja2 import Template; print(Template(open(\"$(EGRESS_JINJA2)\").read()).render(public_iface=\"eth0\", masquerade_cidr=\"10.100.0.0/16\"), end=\"\")" | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	  if [ "$$go_out" != "$$jinja_out" ]; then \
-	    echo "egress-render-cross-check: Go render and Jinja2 render DIVERGE for default values"; \
-	    diff <(echo "$$go_out") <(echo "$$jinja_out") || true; \
-	    status=1; \
-	  else \
-	    echo "egress-render-cross-check: Go render and Jinja2 render byte-identical for eth0/10.100.0.0/16"; \
-	  fi; \
-	  exit $$status'
+egress-render-cross-check: ## Cheap Go ↔ Jinja2 byte-equality smoke for the canonical default-local input (CI per-push gate)
+	@FAAS_EGRESS_ROW_SELECTOR=default-local bash scripts/egress-render-cross-check.sh $(CURDIR)
 
 # CI matrix (ADR-055): exercise the renderer for a non-default
 # public_iface to confirm the substitution path works under the
 # test rig. The Jinja2 template is rendered with the same value
 # and the two MUST match. This is the load-bearing contract for
 # a Hetzner compute node on `ens5`.
+#
+# Mega-PR-C: the matrix now exercises the overlay + v6 branches
+# too. The 5-row shape (default-local, mesh-overlay, mesh-overlay-v6,
+# hetzner-ens5, multi-overlay) is the canonical input space the
+# Ansible host_vars can carry; a future Hetzner multi-host fleet
+# populates overlay_cidrs with the per-box /14 slices and
+# masquerade_cidr_v6 with the ULA pool. The script
+# `scripts/egress-render-cross-check.sh` is the shared body —
+# keeping the row table in one place avoids the cross-check and
+# matrix diverging over time.
 .PHONY: egress-render-matrix
-egress-render-matrix: ## Render + cross-check for {eth0, ens5} public_iface variants
-	@bash -c 'set -e; status=0; \
-	  for iface in eth0 ens5; do \
-	    for cidr in 10.100.0.0/16 10.101.0.0/16; do \
-	      go_out=$$(FAAS_PUBLIC_IFACE=$$iface FAAS_MASQUERADE_CIDR=$$cidr go run ./cmd/faas-nft-render | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	      jinja_out=$$(python3 -c "from jinja2 import Template; print(Template(open(\"$(EGRESS_JINJA2)\").read()).render(public_iface=\"$$iface\", masquerade_cidr=\"$$cidr\"), end=\"\")" | python3 -c "import sys; sys.stdout.write(sys.stdin.read().rstrip(chr(10)) + chr(10))"); \
-	      if [ "$$go_out" != "$$jinja_out" ]; then \
-	        echo "egress-render-matrix: DIVERGE for iface=$$iface cidr=$$cidr"; \
-	        diff <(echo "$$go_out") <(echo "$$jinja_out") || true; \
-	        status=1; \
-	      else \
-	        echo "egress-render-matrix: OK iface=$$iface cidr=$$cidr"; \
-	      fi; \
-	    done; \
-	  done; \
-	  exit $$status'
+egress-render-matrix: ## Render + cross-check the full 5-row matrix (default-local, mesh-overlay, mesh-overlay-v6, hetzner-ens5, multi-overlay)
+	@bash scripts/egress-render-cross-check.sh $(CURDIR)
 
 .PHONY: egress-check
 egress-check: egress-render-cross-check ## Cross-check the Go render against the Jinja2 template + nft -c -f if available + bridge-name guard test

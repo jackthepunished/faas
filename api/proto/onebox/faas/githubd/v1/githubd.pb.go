@@ -148,6 +148,59 @@ func (CheckPhase) EnumDescriptor() ([]byte, []int) {
 	return file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP(), []int{1}
 }
 
+// EnqueueBuildEventKind is the githubd-side event taxonomy for
+// the EnqueueBuild RPC. Carried on the wire so a single bridge
+// can stamp different deployments.kind values without
+// multiplying RPCs (issue #272 / ADR-094).
+type EnqueueBuildEventKind int32
+
+const (
+	EnqueueBuildEventKind_EVENT_KIND_UNSPECIFIED  EnqueueBuildEventKind = 0 // legacy: pre-issue-#272 push → DeploymentKindGitHub
+	EnqueueBuildEventKind_EVENT_KIND_PUSH         EnqueueBuildEventKind = 1 // refs/heads/* push → DeploymentKindGitHub
+	EnqueueBuildEventKind_EVENT_KIND_PULL_REQUEST EnqueueBuildEventKind = 2 // pull_request webhook → DeploymentKindPreview
+)
+
+// Enum value maps for EnqueueBuildEventKind.
+var (
+	EnqueueBuildEventKind_name = map[int32]string{
+		0: "EVENT_KIND_UNSPECIFIED",
+		1: "EVENT_KIND_PUSH",
+		2: "EVENT_KIND_PULL_REQUEST",
+	}
+	EnqueueBuildEventKind_value = map[string]int32{
+		"EVENT_KIND_UNSPECIFIED":  0,
+		"EVENT_KIND_PUSH":         1,
+		"EVENT_KIND_PULL_REQUEST": 2,
+	}
+)
+
+func (x EnqueueBuildEventKind) Enum() *EnqueueBuildEventKind {
+	p := new(EnqueueBuildEventKind)
+	*p = x
+	return p
+}
+
+func (x EnqueueBuildEventKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (EnqueueBuildEventKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_onebox_faas_githubd_v1_githubd_proto_enumTypes[2].Descriptor()
+}
+
+func (EnqueueBuildEventKind) Type() protoreflect.EnumType {
+	return &file_onebox_faas_githubd_v1_githubd_proto_enumTypes[2]
+}
+
+func (x EnqueueBuildEventKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use EnqueueBuildEventKind.Descriptor instead.
+func (EnqueueBuildEventKind) EnumDescriptor() ([]byte, []int) {
+	return file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP(), []int{2}
+}
+
 type VerifyInstallationRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	InstallationId int64                  `protobuf:"varint,1,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
@@ -435,6 +488,7 @@ func (x *ExchangeOAuthCodeRequest) GetState() string {
 type ExchangeOAuthCodeResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	InstallationId string                 `protobuf:"bytes,1,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
+	DefaultBranch  string                 `protobuf:"bytes,2,opt,name=default_branch,json=defaultBranch,proto3" json:"default_branch,omitempty"` // empty when unavailable; bind picker pre-fills from this
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -472,6 +526,13 @@ func (*ExchangeOAuthCodeResponse) Descriptor() ([]byte, []int) {
 func (x *ExchangeOAuthCodeResponse) GetInstallationId() string {
 	if x != nil {
 		return x.InstallationId
+	}
+	return ""
+}
+
+func (x *ExchangeOAuthCodeResponse) GetDefaultBranch() string {
+	if x != nil {
+		return x.DefaultBranch
 	}
 	return ""
 }
@@ -1229,7 +1290,17 @@ type EnqueueBuildRequest struct {
 	Branch string `protobuf:"bytes,9,opt,name=branch,proto3" json:"branch,omitempty"`
 	// pusher is the GitHub login that triggered the push. Stored on
 	// the deployment row's `pusher` column for the §11 audit trail.
-	Pusher        string `protobuf:"bytes,10,opt,name=pusher,proto3" json:"pusher,omitempty"`
+	Pusher string `protobuf:"bytes,10,opt,name=pusher,proto3" json:"pusher,omitempty"`
+	// event_kind is the githubd-side event source for this build.
+	// apid maps it onto the deployments.kind stamp:
+	//   - EVENT_KIND_UNSPECIFIED → DeploymentKindGitHub (legacy wire)
+	//   - EVENT_KIND_PUSH        → DeploymentKindGitHub
+	//   - EVENT_KIND_PULL_REQUEST→ DeploymentKindPreview (issue #272 / ADR-094)
+	//
+	// Empty / unspecified preserves the pre-PR-A wire shape so an
+	// older githubd (or the existing slice-7 tests) keeps stamping
+	// DeploymentKindGitHub without a behaviour change.
+	EventKind     EnqueueBuildEventKind `protobuf:"varint,11,opt,name=event_kind,json=eventKind,proto3,enum=onebox.faas.githubd.v1.EnqueueBuildEventKind" json:"event_kind,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1332,6 +1403,13 @@ func (x *EnqueueBuildRequest) GetPusher() string {
 		return x.Pusher
 	}
 	return ""
+}
+
+func (x *EnqueueBuildRequest) GetEventKind() EnqueueBuildEventKind {
+	if x != nil {
+		return x.EventKind
+	}
+	return EnqueueBuildEventKind_EVENT_KIND_UNSPECIFIED
 }
 
 type EnqueueBuildResponse struct {
@@ -1710,9 +1788,10 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x14\n" +
-	"\x05state\x18\x03 \x01(\tR\x05state\"D\n" +
+	"\x05state\x18\x03 \x01(\tR\x05state\"k\n" +
 	"\x19ExchangeOAuthCodeResponse\x12'\n" +
-	"\x0finstallation_id\x18\x01 \x01(\tR\x0einstallationId\"d\n" +
+	"\x0finstallation_id\x18\x01 \x01(\tR\x0einstallationId\x12%\n" +
+	"\x0edefault_branch\x18\x02 \x01(\tR\rdefaultBranch\"d\n" +
 	"\x04Repo\x12\x1b\n" +
 	"\tfull_name\x18\x01 \x01(\tR\bfullName\x12%\n" +
 	"\x0edefault_branch\x18\x02 \x01(\tR\rdefaultBranch\x12\x18\n" +
@@ -1761,7 +1840,7 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\x05phase\x18\x03 \x01(\x0e2\".onebox.faas.githubd.v1.CheckPhaseR\x05phase\x12\x19\n" +
 	"\blogs_url\x18\x04 \x01(\tR\alogsUrl\x12\x18\n" +
 	"\asummary\x18\x05 \x01(\tR\asummary\"\x14\n" +
-	"\x12WriteCheckResponse\"\xb5\x02\n" +
+	"\x12WriteCheckResponse\"\x83\x03\n" +
 	"\x13EnqueueBuildRequest\x12\x1d\n" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x15\n" +
@@ -1777,7 +1856,9 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\x03ref\x18\b \x01(\tR\x03ref\x12\x16\n" +
 	"\x06branch\x18\t \x01(\tR\x06branch\x12\x16\n" +
 	"\x06pusher\x18\n" +
-	" \x01(\tR\x06pusher\"m\n" +
+	" \x01(\tR\x06pusher\x12L\n" +
+	"\n" +
+	"event_kind\x18\v \x01(\x0e2-.onebox.faas.githubd.v1.EnqueueBuildEventKindR\teventKind\"m\n" +
 	"\x14EnqueueBuildResponse\x12\x19\n" +
 	"\bbuild_id\x18\x01 \x01(\tR\abuildId\x12#\n" +
 	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\x12\x15\n" +
@@ -1816,7 +1897,11 @@ const file_onebox_faas_githubd_v1_githubd_proto_rawDesc = "" +
 	"\bBUILDING\x10\x02\x12\b\n" +
 	"\x04LIVE\x10\x03\x12\n" +
 	"\n" +
-	"\x06FAILED\x10\x042\x96\v\n" +
+	"\x06FAILED\x10\x04*e\n" +
+	"\x15EnqueueBuildEventKind\x12\x1a\n" +
+	"\x16EVENT_KIND_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fEVENT_KIND_PUSH\x10\x01\x12\x1b\n" +
+	"\x17EVENT_KIND_PULL_REQUEST\x10\x022\x96\v\n" +
 	"\aGithubd\x12r\n" +
 	"\x0fGetInstallState\x12..onebox.faas.githubd.v1.GetInstallStateRequest\x1a/.onebox.faas.githubd.v1.GetInstallStateResponse\x12x\n" +
 	"\x11ExchangeOAuthCode\x120.onebox.faas.githubd.v1.ExchangeOAuthCodeRequest\x1a1.onebox.faas.githubd.v1.ExchangeOAuthCodeResponse\x12\x81\x01\n" +
@@ -1844,70 +1929,72 @@ func file_onebox_faas_githubd_v1_githubd_proto_rawDescGZIP() []byte {
 	return file_onebox_faas_githubd_v1_githubd_proto_rawDescData
 }
 
-var file_onebox_faas_githubd_v1_githubd_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_onebox_faas_githubd_v1_githubd_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_onebox_faas_githubd_v1_githubd_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_onebox_faas_githubd_v1_githubd_proto_goTypes = []any{
 	(InstallState)(0),                        // 0: onebox.faas.githubd.v1.InstallState
 	(CheckPhase)(0),                          // 1: onebox.faas.githubd.v1.CheckPhase
-	(*VerifyInstallationRequest)(nil),        // 2: onebox.faas.githubd.v1.VerifyInstallationRequest
-	(*VerifyInstallationResponse)(nil),       // 3: onebox.faas.githubd.v1.VerifyInstallationResponse
-	(*GetInstallStateRequest)(nil),           // 4: onebox.faas.githubd.v1.GetInstallStateRequest
-	(*GetInstallStateResponse)(nil),          // 5: onebox.faas.githubd.v1.GetInstallStateResponse
-	(*ExchangeOAuthCodeRequest)(nil),         // 6: onebox.faas.githubd.v1.ExchangeOAuthCodeRequest
-	(*ExchangeOAuthCodeResponse)(nil),        // 7: onebox.faas.githubd.v1.ExchangeOAuthCodeResponse
-	(*Repo)(nil),                             // 8: onebox.faas.githubd.v1.Repo
-	(*ListInstallableReposRequest)(nil),      // 9: onebox.faas.githubd.v1.ListInstallableReposRequest
-	(*ListInstallableReposResponse)(nil),     // 10: onebox.faas.githubd.v1.ListInstallableReposResponse
-	(*BindAppRepoRequest)(nil),               // 11: onebox.faas.githubd.v1.BindAppRepoRequest
-	(*BindAppRepoResponse)(nil),              // 12: onebox.faas.githubd.v1.BindAppRepoResponse
-	(*UnbindAppRepoRequest)(nil),             // 13: onebox.faas.githubd.v1.UnbindAppRepoRequest
-	(*UnbindAppRepoResponse)(nil),            // 14: onebox.faas.githubd.v1.UnbindAppRepoResponse
-	(*GetAppBindingRequest)(nil),             // 15: onebox.faas.githubd.v1.GetAppBindingRequest
-	(*GetAppBindingResponse)(nil),            // 16: onebox.faas.githubd.v1.GetAppBindingResponse
-	(*CreateDeploymentFromPushRequest)(nil),  // 17: onebox.faas.githubd.v1.CreateDeploymentFromPushRequest
-	(*CreateDeploymentFromPushResponse)(nil), // 18: onebox.faas.githubd.v1.CreateDeploymentFromPushResponse
-	(*WriteCheckRequest)(nil),                // 19: onebox.faas.githubd.v1.WriteCheckRequest
-	(*WriteCheckResponse)(nil),               // 20: onebox.faas.githubd.v1.WriteCheckResponse
-	(*EnqueueBuildRequest)(nil),              // 21: onebox.faas.githubd.v1.EnqueueBuildRequest
-	(*EnqueueBuildResponse)(nil),             // 22: onebox.faas.githubd.v1.EnqueueBuildResponse
-	(*MintInstallationTokenRequest)(nil),     // 23: onebox.faas.githubd.v1.MintInstallationTokenRequest
-	(*MintInstallationTokenResponse)(nil),    // 24: onebox.faas.githubd.v1.MintInstallationTokenResponse
-	(*StreamSourceRefRequest)(nil),           // 25: onebox.faas.githubd.v1.StreamSourceRefRequest
-	(*StreamSourceRefChunk)(nil),             // 26: onebox.faas.githubd.v1.StreamSourceRefChunk
+	(EnqueueBuildEventKind)(0),               // 2: onebox.faas.githubd.v1.EnqueueBuildEventKind
+	(*VerifyInstallationRequest)(nil),        // 3: onebox.faas.githubd.v1.VerifyInstallationRequest
+	(*VerifyInstallationResponse)(nil),       // 4: onebox.faas.githubd.v1.VerifyInstallationResponse
+	(*GetInstallStateRequest)(nil),           // 5: onebox.faas.githubd.v1.GetInstallStateRequest
+	(*GetInstallStateResponse)(nil),          // 6: onebox.faas.githubd.v1.GetInstallStateResponse
+	(*ExchangeOAuthCodeRequest)(nil),         // 7: onebox.faas.githubd.v1.ExchangeOAuthCodeRequest
+	(*ExchangeOAuthCodeResponse)(nil),        // 8: onebox.faas.githubd.v1.ExchangeOAuthCodeResponse
+	(*Repo)(nil),                             // 9: onebox.faas.githubd.v1.Repo
+	(*ListInstallableReposRequest)(nil),      // 10: onebox.faas.githubd.v1.ListInstallableReposRequest
+	(*ListInstallableReposResponse)(nil),     // 11: onebox.faas.githubd.v1.ListInstallableReposResponse
+	(*BindAppRepoRequest)(nil),               // 12: onebox.faas.githubd.v1.BindAppRepoRequest
+	(*BindAppRepoResponse)(nil),              // 13: onebox.faas.githubd.v1.BindAppRepoResponse
+	(*UnbindAppRepoRequest)(nil),             // 14: onebox.faas.githubd.v1.UnbindAppRepoRequest
+	(*UnbindAppRepoResponse)(nil),            // 15: onebox.faas.githubd.v1.UnbindAppRepoResponse
+	(*GetAppBindingRequest)(nil),             // 16: onebox.faas.githubd.v1.GetAppBindingRequest
+	(*GetAppBindingResponse)(nil),            // 17: onebox.faas.githubd.v1.GetAppBindingResponse
+	(*CreateDeploymentFromPushRequest)(nil),  // 18: onebox.faas.githubd.v1.CreateDeploymentFromPushRequest
+	(*CreateDeploymentFromPushResponse)(nil), // 19: onebox.faas.githubd.v1.CreateDeploymentFromPushResponse
+	(*WriteCheckRequest)(nil),                // 20: onebox.faas.githubd.v1.WriteCheckRequest
+	(*WriteCheckResponse)(nil),               // 21: onebox.faas.githubd.v1.WriteCheckResponse
+	(*EnqueueBuildRequest)(nil),              // 22: onebox.faas.githubd.v1.EnqueueBuildRequest
+	(*EnqueueBuildResponse)(nil),             // 23: onebox.faas.githubd.v1.EnqueueBuildResponse
+	(*MintInstallationTokenRequest)(nil),     // 24: onebox.faas.githubd.v1.MintInstallationTokenRequest
+	(*MintInstallationTokenResponse)(nil),    // 25: onebox.faas.githubd.v1.MintInstallationTokenResponse
+	(*StreamSourceRefRequest)(nil),           // 26: onebox.faas.githubd.v1.StreamSourceRefRequest
+	(*StreamSourceRefChunk)(nil),             // 27: onebox.faas.githubd.v1.StreamSourceRefChunk
 }
 var file_onebox_faas_githubd_v1_githubd_proto_depIdxs = []int32{
 	0,  // 0: onebox.faas.githubd.v1.GetInstallStateResponse.state:type_name -> onebox.faas.githubd.v1.InstallState
-	8,  // 1: onebox.faas.githubd.v1.ListInstallableReposResponse.repos:type_name -> onebox.faas.githubd.v1.Repo
+	9,  // 1: onebox.faas.githubd.v1.ListInstallableReposResponse.repos:type_name -> onebox.faas.githubd.v1.Repo
 	1,  // 2: onebox.faas.githubd.v1.WriteCheckRequest.phase:type_name -> onebox.faas.githubd.v1.CheckPhase
-	4,  // 3: onebox.faas.githubd.v1.Githubd.GetInstallState:input_type -> onebox.faas.githubd.v1.GetInstallStateRequest
-	6,  // 4: onebox.faas.githubd.v1.Githubd.ExchangeOAuthCode:input_type -> onebox.faas.githubd.v1.ExchangeOAuthCodeRequest
-	9,  // 5: onebox.faas.githubd.v1.Githubd.ListInstallableRepos:input_type -> onebox.faas.githubd.v1.ListInstallableReposRequest
-	11, // 6: onebox.faas.githubd.v1.Githubd.BindAppRepo:input_type -> onebox.faas.githubd.v1.BindAppRepoRequest
-	13, // 7: onebox.faas.githubd.v1.Githubd.UnbindAppRepo:input_type -> onebox.faas.githubd.v1.UnbindAppRepoRequest
-	15, // 8: onebox.faas.githubd.v1.Githubd.GetAppBinding:input_type -> onebox.faas.githubd.v1.GetAppBindingRequest
-	17, // 9: onebox.faas.githubd.v1.Githubd.CreateDeploymentFromPush:input_type -> onebox.faas.githubd.v1.CreateDeploymentFromPushRequest
-	21, // 10: onebox.faas.githubd.v1.Githubd.EnqueueBuild:input_type -> onebox.faas.githubd.v1.EnqueueBuildRequest
-	19, // 11: onebox.faas.githubd.v1.Githubd.WriteCheck:input_type -> onebox.faas.githubd.v1.WriteCheckRequest
-	2,  // 12: onebox.faas.githubd.v1.Githubd.VerifyInstallation:input_type -> onebox.faas.githubd.v1.VerifyInstallationRequest
-	23, // 13: onebox.faas.githubd.v1.Githubd.MintInstallationToken:input_type -> onebox.faas.githubd.v1.MintInstallationTokenRequest
-	25, // 14: onebox.faas.githubd.v1.Githubd.StreamSourceRef:input_type -> onebox.faas.githubd.v1.StreamSourceRefRequest
-	5,  // 15: onebox.faas.githubd.v1.Githubd.GetInstallState:output_type -> onebox.faas.githubd.v1.GetInstallStateResponse
-	7,  // 16: onebox.faas.githubd.v1.Githubd.ExchangeOAuthCode:output_type -> onebox.faas.githubd.v1.ExchangeOAuthCodeResponse
-	10, // 17: onebox.faas.githubd.v1.Githubd.ListInstallableRepos:output_type -> onebox.faas.githubd.v1.ListInstallableReposResponse
-	12, // 18: onebox.faas.githubd.v1.Githubd.BindAppRepo:output_type -> onebox.faas.githubd.v1.BindAppRepoResponse
-	14, // 19: onebox.faas.githubd.v1.Githubd.UnbindAppRepo:output_type -> onebox.faas.githubd.v1.UnbindAppRepoResponse
-	16, // 20: onebox.faas.githubd.v1.Githubd.GetAppBinding:output_type -> onebox.faas.githubd.v1.GetAppBindingResponse
-	18, // 21: onebox.faas.githubd.v1.Githubd.CreateDeploymentFromPush:output_type -> onebox.faas.githubd.v1.CreateDeploymentFromPushResponse
-	22, // 22: onebox.faas.githubd.v1.Githubd.EnqueueBuild:output_type -> onebox.faas.githubd.v1.EnqueueBuildResponse
-	20, // 23: onebox.faas.githubd.v1.Githubd.WriteCheck:output_type -> onebox.faas.githubd.v1.WriteCheckResponse
-	3,  // 24: onebox.faas.githubd.v1.Githubd.VerifyInstallation:output_type -> onebox.faas.githubd.v1.VerifyInstallationResponse
-	24, // 25: onebox.faas.githubd.v1.Githubd.MintInstallationToken:output_type -> onebox.faas.githubd.v1.MintInstallationTokenResponse
-	26, // 26: onebox.faas.githubd.v1.Githubd.StreamSourceRef:output_type -> onebox.faas.githubd.v1.StreamSourceRefChunk
-	15, // [15:27] is the sub-list for method output_type
-	3,  // [3:15] is the sub-list for method input_type
-	3,  // [3:3] is the sub-list for extension type_name
-	3,  // [3:3] is the sub-list for extension extendee
-	0,  // [0:3] is the sub-list for field type_name
+	2,  // 3: onebox.faas.githubd.v1.EnqueueBuildRequest.event_kind:type_name -> onebox.faas.githubd.v1.EnqueueBuildEventKind
+	5,  // 4: onebox.faas.githubd.v1.Githubd.GetInstallState:input_type -> onebox.faas.githubd.v1.GetInstallStateRequest
+	7,  // 5: onebox.faas.githubd.v1.Githubd.ExchangeOAuthCode:input_type -> onebox.faas.githubd.v1.ExchangeOAuthCodeRequest
+	10, // 6: onebox.faas.githubd.v1.Githubd.ListInstallableRepos:input_type -> onebox.faas.githubd.v1.ListInstallableReposRequest
+	12, // 7: onebox.faas.githubd.v1.Githubd.BindAppRepo:input_type -> onebox.faas.githubd.v1.BindAppRepoRequest
+	14, // 8: onebox.faas.githubd.v1.Githubd.UnbindAppRepo:input_type -> onebox.faas.githubd.v1.UnbindAppRepoRequest
+	16, // 9: onebox.faas.githubd.v1.Githubd.GetAppBinding:input_type -> onebox.faas.githubd.v1.GetAppBindingRequest
+	18, // 10: onebox.faas.githubd.v1.Githubd.CreateDeploymentFromPush:input_type -> onebox.faas.githubd.v1.CreateDeploymentFromPushRequest
+	22, // 11: onebox.faas.githubd.v1.Githubd.EnqueueBuild:input_type -> onebox.faas.githubd.v1.EnqueueBuildRequest
+	20, // 12: onebox.faas.githubd.v1.Githubd.WriteCheck:input_type -> onebox.faas.githubd.v1.WriteCheckRequest
+	3,  // 13: onebox.faas.githubd.v1.Githubd.VerifyInstallation:input_type -> onebox.faas.githubd.v1.VerifyInstallationRequest
+	24, // 14: onebox.faas.githubd.v1.Githubd.MintInstallationToken:input_type -> onebox.faas.githubd.v1.MintInstallationTokenRequest
+	26, // 15: onebox.faas.githubd.v1.Githubd.StreamSourceRef:input_type -> onebox.faas.githubd.v1.StreamSourceRefRequest
+	6,  // 16: onebox.faas.githubd.v1.Githubd.GetInstallState:output_type -> onebox.faas.githubd.v1.GetInstallStateResponse
+	8,  // 17: onebox.faas.githubd.v1.Githubd.ExchangeOAuthCode:output_type -> onebox.faas.githubd.v1.ExchangeOAuthCodeResponse
+	11, // 18: onebox.faas.githubd.v1.Githubd.ListInstallableRepos:output_type -> onebox.faas.githubd.v1.ListInstallableReposResponse
+	13, // 19: onebox.faas.githubd.v1.Githubd.BindAppRepo:output_type -> onebox.faas.githubd.v1.BindAppRepoResponse
+	15, // 20: onebox.faas.githubd.v1.Githubd.UnbindAppRepo:output_type -> onebox.faas.githubd.v1.UnbindAppRepoResponse
+	17, // 21: onebox.faas.githubd.v1.Githubd.GetAppBinding:output_type -> onebox.faas.githubd.v1.GetAppBindingResponse
+	19, // 22: onebox.faas.githubd.v1.Githubd.CreateDeploymentFromPush:output_type -> onebox.faas.githubd.v1.CreateDeploymentFromPushResponse
+	23, // 23: onebox.faas.githubd.v1.Githubd.EnqueueBuild:output_type -> onebox.faas.githubd.v1.EnqueueBuildResponse
+	21, // 24: onebox.faas.githubd.v1.Githubd.WriteCheck:output_type -> onebox.faas.githubd.v1.WriteCheckResponse
+	4,  // 25: onebox.faas.githubd.v1.Githubd.VerifyInstallation:output_type -> onebox.faas.githubd.v1.VerifyInstallationResponse
+	25, // 26: onebox.faas.githubd.v1.Githubd.MintInstallationToken:output_type -> onebox.faas.githubd.v1.MintInstallationTokenResponse
+	27, // 27: onebox.faas.githubd.v1.Githubd.StreamSourceRef:output_type -> onebox.faas.githubd.v1.StreamSourceRefChunk
+	16, // [16:28] is the sub-list for method output_type
+	4,  // [4:16] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_onebox_faas_githubd_v1_githubd_proto_init() }
@@ -1920,7 +2007,7 @@ func file_onebox_faas_githubd_v1_githubd_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_onebox_faas_githubd_v1_githubd_proto_rawDesc), len(file_onebox_faas_githubd_v1_githubd_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,

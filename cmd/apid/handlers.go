@@ -197,6 +197,31 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	// plan_streaming_not_allowed). The Plan accessor keeps the
 	// fail-closed contract (pkg/api/limits.go) — Free's accessor
 	// returns false just like LimitsFor(false) would.
+	//
+	// ADR-102 D5: plan-gate at create-time. A Free customer
+	// POSTing streaming_enabled=true gets 403
+	// plan_streaming_not_allowed BEFORE the App is built — same
+	// shape as the PATCH-time gate (cmd/apid/handlers_ext.go:245).
+	// Without this gate a Free customer's create request would
+	// silently land as true (bypassing the Free-tier contract that
+	// StreamingResponseAllowed is supposed to enforce). The
+	// status code 403 mirrors UpdateApp exactly so the same
+	// CodePlanStreamingNotAllowed returns the same status on
+	// POST vs PATCH — telemetry collapsing on `code` is uniform.
+	//
+	// TODO(ADR-102-followup): add apps_streaming_enabled_plan_check
+	// Postgres CHECK constraint via NOT VALID + VALIDATE
+	// migrations once production telemetry confirms zero Free+
+	// streaming_enabled=true rows. Until then this runtime gate is
+	// the only enforcement; a direct-DB write or backup-restore
+	// can still violate the invariant. The follow-up ships a
+	// 1-cycle telemetry window after this PR lands.
+	if req.StreamingEnabled != nil && *req.StreamingEnabled && !acct.Plan.StreamingResponseAllowed() {
+		return state.App{}, api.NewProblem(http.StatusForbidden,
+			api.CodePlanStreamingNotAllowed,
+			"Streaming responses are not allowed on this plan",
+			"Free tier does not support per-app streaming; upgrade to Hobby or higher.")
+	}
 	streaming := acct.Plan.StreamingEnabled()
 	if req.StreamingEnabled != nil {
 		streaming = *req.StreamingEnabled
@@ -211,6 +236,21 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	ws := acct.Plan.WebSocketEnabled()
 	if req.WebSocketEnabled != nil {
 		ws = *req.WebSocketEnabled
+	}
+	// ADR-093: per-route observability opt-in. Mirrors the
+	// WebSocketEnabled shape above — plan-level default applied
+	// when the request didn't carry one, request override
+	// otherwise. Free stays off (per-route cardinality would not
+	// have a budget alongside the per-app rollups); Hobby/Pro/
+	// Scale default on. The Plan.RouteMetricsEnabled() accessor
+	// is fail-closed — Free's accessor returns false. The PATCH
+	// upstream gate (CodePlanRouteMetricsNotAllowed) has already
+	// rejected a Free customer trying to override the default to
+	// true on a PATCH round-trip; create-time goes through the
+	// same gate in handlers_ext.go.
+	rm := acct.Plan.RouteMetricsEnabled()
+	if req.RouteMetricsEnabled != nil {
+		rm = *req.RouteMetricsEnabled
 	}
 	// Issue #470 / ADR-055: per-app two-tier snapshot flag. Apply
 	// the plan-level default when the request didn't carry one —
@@ -280,8 +320,22 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	return state.App{
 		AccountID: acct.ID, Slug: req.Slug, Type: typ, Runtime: req.Runtime,
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
-		StreamingEnabled:    streaming,
-		WebSocketEnabled:    ws,
+		StreamingEnabled: streaming,
+		WebSocketEnabled: ws,
+		// ADR-093: per-route observability opt-in (plan-level
+		// default applied via the block above). Mirrors the
+		// WebSocketEnabled shape — the per-plan default is
+		// applied here at create time so the row round-trips
+		// the same value a future PATCH would land on.
+		RouteMetricsEnabled: rm,
+		// ADR-091 amendment / §4.1.2.0: coarse-gate per-app
+		// maintenance flag. Default false (mirrors the
+		// apps.maintenance_mode column DEFAULT). Customers may
+		// PATCH true to put the whole app into 503 maintenance;
+		// there's no plan gate (Free and above may opt in) —
+		// coarse maintenance is a customer-experience feature,
+		// not an abuse vector.
+		MaintenanceMode:     req.MaintenanceMode != nil && *req.MaintenanceMode,
 		WarmSnapshotEnabled: warmEnabled,
 		// Issue #560 + issue #695 / ADR-080: see the
 		// plan-default block above. Default is per-plan
@@ -353,6 +407,20 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, p)
 		return
 	}
+	// ADR-091 / PR-D: per-deployment env scope validation. The
+	// schema CHECK (deployments_scope_shape) would reject on the
+	// INSERT — surfacing the violation here gives the customer a
+	// clean 400 with the right RFC 7807 code instead of letting
+	// the SQLSTATE 23514 bubble up to a generic 500. Empty
+	// request scope is fine (handled: defaulted to
+	// api.DefaultEnvScope in buildDeploymentForInsert), so we
+	// only validate when the field is present.
+	if req.Scope != "" {
+		if p := api.ValidateScope(req.Scope); p != nil {
+			api.WriteProblem(w, p)
+			return
+		}
+	}
 	// PR-B: prior-deployment supersede is in store.CreateDeployment's tx;
 	// we read prev BEFORE the call so the supersede-notify can carry
 	// its id (LatestDeployment returns the post-supersede row).
@@ -364,6 +432,20 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	}
 	d, err := s.store.CreateDeployment(r.Context(), dep)
 	if err != nil {
+		// ADR-091 / PR-D: per-deployment scope collision. mapErr
+		// wraps state.ErrConflict with the constraint name —
+		// detect deployments_app_scope_live_uniq here and surface a
+		// dedicated 409 deployment_scope_collision code instead of
+		// the generic 503/500 path. The substring match is
+		// defensive: mapErr's format is "ErrConflict: constraint"
+		// and ErrConflict may wrap a chain of similar errors on
+		// multi-statement tx failure paths.
+		if errors.Is(err, state.ErrConflict) && strings.Contains(err.Error(), "deployments_app_scope_live_uniq") {
+			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeDeploymentScopeCollision,
+				"Scope already live",
+				"a live deployment already targets this scope on this app; supersede it before creating another"))
+			return
+		}
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
 	}
@@ -444,6 +526,12 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// flag. Surfaced so dashboards can show "websocket on / off"
 		// alongside the streaming pill.
 		WebSocketEnabled: a.WebSocketEnabled,
+		// ADR-093: per-route observability opt-in (DB round-trip).
+		// Surfaced so dashboards can show "per-route metrics on /
+		// off" alongside the streaming + websocket pills and so a
+		// customer can verify their PATCH landed without a second
+		// round-trip.
+		RouteMetricsEnabled: a.RouteMetricsEnabled,
 		// Issue #560: per-app require_authn flag. Surfaced so
 		// dashboards can show "auth required on / off" alongside
 		// the streaming + require_signed pills, and so a customer
@@ -500,7 +588,30 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// handlers_ext.go, so the value is always UUID-shaped
 		// (never the operator-readable name).
 		OverflowNode: a.OverflowNode,
+		// CORS improvements D1: per-app default CORS opt-in +
+		// allowlist. Projected from the apps row so a customer
+		// can verify their PATCH landed without a second
+		// round-trip. The store-layer field is already *bool
+		// so the three-state shape (nil = schema default,
+		// *false = explicit opt-out, *true = opt-in)
+		// flows through unchanged. CORSDefaultOrigins is
+		// materialised as a non-nil slice so the JSON shape
+		// is `[]` (never `null`) for the same ergonomic
+		// reasons as EgressAllowlist above.
+		CORSDefaultEnabled: a.CORSDefaultEnabled,
+		CORSDefaultOrigins: cORSOriginsList(a.CORSDefaultOrigins),
 	}
+}
+
+// cORSOriginsList materialises the text[] column as a non-nil slice.
+// A nil column (legacy row, never configured) projects as an empty
+// slice on the wire so dashboards can render an empty origin list
+// without a special-case for null.
+func cORSOriginsList(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
 }
 
 // withParkedDeploymentRef (issue #554 / ADR-079 follow-up, AC #3

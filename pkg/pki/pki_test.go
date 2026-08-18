@@ -474,6 +474,9 @@ func keys(m map[string]bool) []string {
 
 // Sanity check the path layout matches what the per-daemon TOML
 // references — if this drifts, every *.toml.example file needs updating.
+// PR-1: the v1 *.toml.example files in deploy/etc/ are a tombstone now
+// (scheduled for deletion in PR-1 Phase 2 after PR-X); the canonical
+// fixtures are the ansible role files/*.toml.example copies.
 func TestCARootPathStable(t *testing.T) {
 	certPath, keyPath := CARoot("/etc/faas/tls")
 	if got, want := certPath, filepath.Join("/etc/faas/tls", "ca", "ca.crt"); got != want {

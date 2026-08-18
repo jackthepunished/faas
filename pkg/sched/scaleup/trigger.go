@@ -24,6 +24,15 @@ type AdmitResult struct {
 	AtCapacity bool
 }
 
+// WakeOutcome (ADR-098): trigger-local projection of sched.CoordOutcome.
+// The leader's ledger enforces max_concurrency; the trigger observes the
+// at-capacity path via the bus, not the return value.
+type WakeOutcome struct {
+	InstanceID string
+	WakeID     string
+	ColdBoot   bool
+}
+
 // Outcome is the closed set of scale-up decision outcomes. Pre-instantiated
 // in pkg/wire.NewOpsMetrics so the counter rows surface in /metrics from
 // boot. Adding a new outcome requires extending that loop too.
@@ -69,7 +78,15 @@ type Ledger interface {
 // the cap rejection path. The signature intentionally avoids importing
 // sched (see AdmitResult's doc comment for the cycle rationale).
 type Engine interface {
-	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
+	// AdmitInstance (PR-B / issue #272): scope is the preview
+	// scope (`pr-{N}`) forwarded to the underlying sched.Engine.
+	// Empty = prod (legacy).
+	AdmitInstance(ctx context.Context, appID, scope string) (AdmitResult, error)
+	// EnsureWake (ADR-098): the single-flight wake entry. Routes
+	// through this so a scaleup tick racing the gateway, cron, floor,
+	// or targets triggers on the same parked app coalesces into one
+	// virtual boot.
+	EnsureWake(ctx context.Context, appID string) (WakeOutcome, error)
 }
 
 // PromScraper is the per-app RPS signal source. Production impl
@@ -381,7 +398,12 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
-		result, err := t.engine.AdmitInstance(ctx, app.ID)
+		// ADR-098: route through EnsureWake so a scaleup tick racing the
+		// gateway, cron, floor, or targets triggers on the same parked
+		// app coalesces into one virtual boot. The detached leader ctx
+		// means a cancelled triggering tick doesn't kill an in-flight
+		// boot other callers still need.
+		result, err := t.engine.EnsureWake(ctx, app.ID)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -392,13 +414,16 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			t.log.Warn("scaleup: admit failed", "app", app.ID, "err", err)
 			continue
 		}
-		if result.AtCapacity {
-			t.metrics.ObserveScaleUp(app.ID, string(OutcomeRejectAtCap))
-			continue
-		}
+		// EnsureWake's leader runs Engine.Wake which honours the
+		// per-app max_concurrency ledger; a follower that arrives
+		// after the leader fills the last slot still sees a
+		// successful boot pointing at that slot. The leader's
+		// ledger closes the at-cap loop — we no longer need a
+		// reject_at_cap branch here.
 		// Successful admit: observe the per-instance RPS at
 		// decision time so the §12 dashboard can p95/p99 the
 		// "aggressiveness" of the trigger.
+		_ = result
 		t.metrics.ObserveScaleUpAdmitRPS(dec.ObservedRPS)
 	}
 	return nil

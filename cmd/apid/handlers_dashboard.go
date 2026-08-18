@@ -31,6 +31,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/reqbudget"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -178,7 +179,7 @@ func (s *server) appListItem(ctx context.Context, app state.App, latest map[stri
 	if !lastDeployed.IsZero() {
 		lastStr = lastDeployed.UTC().Format("2006-01-02 15:04 MST")
 	}
-	return dashboard.AppListItem{
+	item := dashboard.AppListItem{
 		Slug:            app.Slug,
 		Status:          string(app.Status),
 		URL:             "https://" + app.Slug + ".apps." + s.domain,
@@ -192,7 +193,21 @@ func (s *server) appListItem(ctx context.Context, app state.App, latest map[stri
 		// empty here so a partial migration doesn't render a
 		// confusing cell.
 		AppID: app.ID,
+		// ADR-095 PR-C / issue #272: stamp preview metadata at
+		// the same edge as the production URL so the apps list
+		// can render the "preview" chip without re-querying.
+		// Scope is the canonical preview subdomain label
+		// ("pr-{N}.{parent}"); the apps list template renders it
+		// as the URL on a preview row so a customer can copy /
+		// click straight to the preview host without re-deriving
+		// the shape.
+		IsPreview: app.PreviewOfSlug != "",
 	}
+	if app.PreviewOfSlug != "" && app.PreviewPrNumber > 0 {
+		item.Scope = fmt.Sprintf("pr-%d.%s", app.PreviewPrNumber, app.PreviewOfSlug)
+		item.URL = "https://" + item.Scope + ".apps." + s.domain
+	}
+	return item
 }
 
 // renderAppsList renders /dashboard/apps — every deployed app + a
@@ -328,13 +343,53 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		renderProblem(w, log, err)
 		return
 	}
+	// Per-row CSRF envelope (issue #791 PR-E / ADR-090 §"Sub-decision
+	// 7") shared by every cron on the page. Minted once, reused —
+	// the per-row <input name="csrf_token" value="{{$.Foo}}"> is the
+	// form-hidden sibling that pairs with the faas_csrf cookie.
+	// The bound action is page-scoped ("fire_cron_{id}") so a token
+	// for cron A cannot be replayed against cron B; the same value
+	// is reused across renders as long as the cookie's MaxAge holds.
+	fireCSRFToken, err := middleware.IssueForAuthenticated(s.sessions, "fire_cron", acct.ID)
+	if err != nil {
+		log.Error("dashboard renderAppDetail: csrf issue fire_cron", "app_id", app.ID, "err", err)
+		fireCSRFToken = ""
+	} else {
+		http.SetCookie(w, &http.Cookie{
+			Name:     middleware.CookieNameAuthenticated,
+			Value:    fireCSRFToken,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   s.domain != "",
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
+		})
+	}
 	cronItems := make([]dashboard.CronItem, 0, len(crons))
 	for _, c := range crons {
 		item := dashboard.CronItem{
-			ID: c.ID, Schedule: c.Schedule, Path: c.Path, Enabled: c.Enabled,
+			ID:                  c.ID,
+			Schedule:            c.Schedule,
+			Path:                c.Path,
+			Enabled:             c.Enabled,
+			FireNowConfirmToken: fireCSRFToken,
 		}
 		if !c.LastFiredAt.IsZero() {
 			item.LastFiredAt = c.LastFiredAt.UTC().Format(time.RFC3339)
+		}
+		// Last 10 runs (issue #791 PR-E / ADR-090). Failure
+		// non-fatal — a transient Postgres blip on the runs read
+		// shouldn't kill the dashboard. handler pre-formats so
+		// the template stays a pure renderer.
+		if rows, rerr := s.store.ListCronRunsForCron(ctx, c.ID, 10, ""); rerr == nil {
+			proj := make([]dashboard.CronRunRow, 0, len(rows))
+			for _, inv := range rows {
+				proj = append(proj, projectCronRunRow(inv))
+			}
+			item.Runs = proj
+			item.RunsCount = len(proj)
+		} else {
+			log.Warn("dashboard renderAppDetail: list cron runs", "account_id", acct.ID, "app_id", app.ID, "cron_id", c.ID, "err", rerr)
 		}
 		cronItems = append(cronItems, item)
 	}
@@ -383,12 +438,37 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 	appRow := s.appListItem(ctx, app, latest, time.Time{})
 	appRow.Plan = string(acct.Plan)
 	appRow.QuotaLabel = dashboardEmDash
+	// ADR-095 PR-C / issue #272 — preview environments panel. Fetched
+	// only when the page is a production app (a preview row never has
+	// its own previews) and only when the store is in a state where
+	// a failure is non-fatal. PreviewAppsByParent filters tombed rows
+	// so the live pane never surfaces a deleted preview.
+	var previews []dashboard.PreviewItem
+	if appRow.IsPreview {
+		previews = nil
+	} else {
+		previewRows, perr := s.store.PreviewAppsByParent(ctx, acct.ID, app.Slug)
+		if perr != nil {
+			log.Warn("dashboard renderAppDetail: list previews",
+				"account_id", acct.ID, "app_slug", app.Slug, "err", perr)
+			previews = nil
+		} else {
+			previews = projectPreviewItems(previewRows, app.Slug, s.domain)
+		}
+	}
 	page := dashboard.Page{Title: app.Slug, Body: "app_detail", Account: dashboardAccountView(view, appCount), Data: dashboard.AppDetailData{
 		App:             appRow,
 		Manifest:        dashboardManifestView(app),
 		Deployments:     deps,
 		Crons:           cronItems,
+		Previews:        previews,
 		RecentInstances: recentItems,
+		// Issue #791 PR-E / ADR-090 closure — cron fire-now
+		// post-redirect banner. Reads ?fired=1 / ?fired=error and
+		// forwards through to the template's flash block.
+		// Anything other than the canonical values collapses to
+		// empty so a stale "?fired=" doesn't render an empty banner.
+		FiredFlash: firedFlash(r),
 		// Issue #273 / ADR-042 — best-effort metrics snapshot.
 		// Failure is non-fatal: Prometheus being down renders the
 		// "degraded" empty state rather than blocking the whole
@@ -417,6 +497,28 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 	}
 }
 
+// firedFlash translates the dashboard cron fire-now POST-redirect
+// `?fired=…` query flag into the closed vocab the template
+// understands. Values:
+//
+//	?fired=1       → "ok"     (green banner: "Fire-now enqueued…")
+//	?fired=error   → "error"  (red banner: "Fire-now failed…")
+//	?fired= (any other) → ""  (no banner — future variants can grow here)
+//
+// Empty output is the conservative default: a stale "?fired="
+// rendering no banner is preferable to one rendering an empty one.
+// Issue #791 PR-E / ADR-090.
+func firedFlash(r *http.Request) string {
+	switch r.URL.Query().Get("fired") {
+	case "1":
+		return "ok"
+	case "error":
+		return "error"
+	default:
+		return ""
+	}
+}
+
 // fetchDashboardMetrics wraps the Prometheus fetch in a 3s budget
 // so a slow Prometheus can't stall the dashboard render. nil return
 // means "skip the section entirely" (Prometheus not configured, or
@@ -424,11 +526,37 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 // non-nil pointer so the template can render the "degraded" label
 // rather than disappear silently — that's the same shape the
 // public /status/slo.json uses.
+// budgetCtx is the ADR-093 / PR-D helper for the apid-side per-call
+// ceilings (PromQL 3s, billingOps 30s, sync-invoke 5s / 30s). When
+// the inbound ctx carries a Budget (the gatewayd-public → apid
+// round-trip), the per-call ceiling becomes a child of the budget:
+// childDeadline = min(parentRemaining, ceiling). The absolute
+// ceiling is unchanged — the budget can only tighten the cap. When
+// no Budget is attached (a direct apid call from the dashboard SPA
+// without going through gatewayd-public), the per-call
+// context.WithTimeout ceiling is preserved so the per-handler
+// safety cap cannot regress on the direct-call path.
+//
+// Returns the ctx + cancel. Callers must `defer cancel()` so the
+// context isn't leaked.
+func budgetCtx(parent context.Context, ceiling time.Duration) (context.Context, context.CancelFunc) {
+	if b, ok := reqbudget.FromContext(parent); ok {
+		newCtx, cancel, _ := b.WithCeiling(parent, ceiling)
+		return newCtx, cancel
+	}
+	return context.WithTimeout(parent, ceiling)
+}
+
 func (s *server) fetchDashboardMetrics(ctx context.Context, log *slog.Logger, appID string) *dashboard.AppMetricsView {
 	if s.promqlClient == nil {
 		return nil
 	}
-	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	// ADR-093 / PR-D: the 3s Prometheus ceiling becomes a child of
+	// the inbound budget when one is attached (gatewayd-public's
+	// BudgetMiddleware stamped it on r.Context()). childDeadline
+	// = min(parentRemaining, 3s). When no budget is on ctx the
+	// legacy 3s WithTimeout ceiling is preserved.
+	dctx, cancel := budgetCtx(ctx, 3*time.Second)
 	defer cancel()
 	resp, src := appmetrics.Fetch(dctx, s.promqlClient, log, appID, appmetrics.DefaultRange)
 	view := &dashboard.AppMetricsView{
@@ -1718,4 +1846,56 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 		CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 		Error:     d.Error,
 	}
+}
+
+// projectPreviewItems (ADR-095 PR-C / issue #272) materialises a
+// dashboard.PreviewItem slice from the raw state.App preview rows.
+// The preview-host label ("pr-{N}.{parent-slug}") is derived from
+// PreviewOfSlug + PreviewPrNumber rather than parsed from any
+// stored field because the column is the canonical input — the
+// dashboard never round-trips a host header to mint URLs.
+//
+// URL is the FULL https form (e.g.
+// "https://pr-42.myapp.apps.gregale.dev") matching the apps-list
+// convention in appListItem above — both the visible link and the
+// Copy-URL button read .URL, and a relative host label would hand
+// the user a non-clickable string.
+//
+// parentSlug is the slug of the page being rendered (used to
+// resolve the preview-app slug back to its host label); domain
+// is the apps-zone ("apps.gregale.dev"). When domain is empty
+// (local dev), the URL falls back to the bare host label so
+// dev-environment renders don't render a broken link to
+// "https://...apps.".
+//
+// The result is sorted newest-first because PreviewAppsByParent
+// already orders that way (preview apps are not frequently re-
+// ordered), and the dashboard template iterates in slice order.
+func projectPreviewItems(rows []state.App, parentSlug, domain string) []dashboard.PreviewItem {
+	out := make([]dashboard.PreviewItem, 0, len(rows))
+	for _, a := range rows {
+		scope := fmt.Sprintf("pr-%d.%s", a.PreviewPrNumber, parentSlug)
+		var url string
+		if domain != "" {
+			url = "https://" + scope + ".apps." + domain
+		} else {
+			url = scope
+		}
+		item := dashboard.PreviewItem{
+			Slug:       a.Slug,
+			URL:        url,
+			PrNumber:   a.PreviewPrNumber,
+			PrState:    a.PreviewPrState,
+			StateLabel: a.PreviewPrState,
+			StateClass: "preview-state-" + a.PreviewPrState,
+		}
+		if !a.CreatedAt.IsZero() {
+			item.CreatedAt = a.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		if a.PreviewExpiresAt != nil && !a.PreviewExpiresAt.IsZero() {
+			item.ExpiresAt = a.PreviewExpiresAt.UTC().Format(time.RFC3339)
+		}
+		out = append(out, item)
+	}
+	return out
 }

@@ -220,7 +220,25 @@ func toColdBootRequest(ctx context.Context, req *vmmdpb.CreateColdBootRequest) (
 		// deploy's first boot stages the same drives +
 		// cgroups as every subsequent wake.
 		Sidecars: sidecarsFromProto(app.GetSidecars()),
+		// BuildSpec (spec §4.5, ADR-003) marks the cold-boot as a
+		// builder VM. vmmd remembers the export dir and its Destroy
+		// runs the build-aware teardown (wait for exit, capture
+		// exit code, copy /build/out/* + build-done.json). Without
+		// this mapping the Manager records no export dir, builderd's
+		// WaitForCompletion finds no artifacts, and every build fails
+		// after the VM exits.
+		ExportDir: buildSpecExportDir(req.GetBuild()),
 	}, nil
+}
+
+// buildSpecExportDir extracts the export dir from an optional
+// BuildSpec. Nil Build (app VMs) or an empty ExportDir both map to ""
+// so the Manager keeps the plain-Destroy contract.
+func buildSpecExportDir(b *vmmdpb.BuildSpec) string {
+	if b == nil {
+		return ""
+	}
+	return b.GetExportDir()
 }
 
 // sealedFromProto converts a slice of vmmdpb.SealedSecret into the fcvm
@@ -317,6 +335,19 @@ func wakeResponseFromInstance(instance string, req fcvm.WakeRequest, inst *fcvm.
 		VethPeer:        inst.Net.VethPeer,
 		Method:          wakeMethodFrom(inst.Method),
 		RequestedMethod: requestMethod,
+		// ADR-098 C11: phase-decomposed wake timings. RestoreMs is
+		// 0 on cold boot (no /snapshot/load ran) and on any restore
+		// that errored before /snapshot/load returned. NetnsTapMs
+		// is stamped for both methods; the netns+TAP setup runs
+		// every wake. GuestReadyMs is 0 on restore (the framework-
+		// ready stamp is inherited from the original cold-boot's
+		// row) and on cold-boot deadline-elapsed (guest never
+		// reached ready). Schedd threads these onto the per-phase
+		// wakePhaseDur histogram on the schedd side (issue #517 /
+		// PR-C / ADR-064).
+		RestoreMs:    inst.RestoreMs,
+		NetnsTapMs:   inst.NetnsTapMs,
+		GuestReadyMs: inst.GuestReadyMs,
 	}
 	if inst.Method == fcvm.WakeColdBoot {
 		if structVal, ok := characterizationToStruct(inst.Characterization); ok {

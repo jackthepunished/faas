@@ -79,6 +79,14 @@ type Config struct {
 	VMMDPingTLSKeyPath  string `toml:"vmmd_tls_key_path"`
 	VMMDPingTLSCAPath   string `toml:"vmmd_tls_ca_path"`
 
+	// ScheddTLS is the client mTLS material gatewayd uses for the
+	// scheduler control stream. Schedd is allowed to bind TCP in a
+	// multi-box deployment, so the unix-only default is not sufficient
+	// when FAAS_SCHEDD_SOCKET points at a tcp:// target.
+	ScheddTLSCertPath string `toml:"schedd_tls_cert_path"`
+	ScheddTLSKeyPath  string `toml:"schedd_tls_key_path"`
+	ScheddTLSCAPath   string `toml:"schedd_tls_ca_path"`
+
 	// EgressTLSCertPath / Key / CA configure the mTLS material the
 	// egress gRPC listener uses when meterd dials it from a remote
 	// compute node (ADR-052 / issue #95 slice 2). All three empty
@@ -103,6 +111,22 @@ type Config struct {
 	// round-trip. Production default is false — operators opt in
 	// per-cluster after PR-B ships.
 	StreamingEnabled bool `toml:"streaming_enabled"`
+
+	// RouteMetricsEnabled (ADR-093) is the operator kill-switch
+	// for the per-route observability surface. When false (the
+	// default), every per-app routeSetFor lookup in Handler.ServeHTTP
+	// returns nil regardless of app.RouteMetricsEnabled — the
+	// customer's per-app flag is inert. The two flags are AND-gated
+	// in the Handler. The two-level shape mirrors the
+	// streaming_enabled / app.StreamingEnabled pair (issue #471
+	// / ADR-047) so an operator can disable the per-route surface
+	// wholesale on a hot day without a database round-trip.
+	//
+	// Overridable via FAAS_GATEWAY_ROUTE_METRICS so the e2e
+	// harness and metal tests can flip it without a TOML
+	// round-trip. Production default is false — operators opt in
+	// per-cluster after the envelope is comfortable.
+	RouteMetricsEnabled bool `toml:"route_metrics_enabled"`
 	// ResponseWriteTimeout is the http.Server.WriteTimeout override
 	// (spec §4.1: 300 s; issue #471 raises it to 900 s for paid
 	// plans). When 0, gatewayd uses api.ResponseWriteTimeout() which
@@ -121,6 +145,17 @@ type Config struct {
 	// start under RoleControlPlane. RoleSingleBox is the default
 	// and lets single-box dev boot unmoved.
 	Role role.Role `toml:"role"`
+
+	// NodeName is the multi-box identity for the gatewayd-internal
+	// process (issue #678 / ADR-093 PR-0). When non-empty,
+	// gatewayd-internal is in multi-box mode: PR-B constructs
+	// PGNodeVerifier and threads it through every Load*WithVerifier
+	// helper. When empty, the verifier stays nil and stdlib trust
+	// alone runs (the single-box dev back-compat path). Operator
+	// seeds the matching row in compute_nodes via the existing
+	// POST /v1/compute-nodes flow (no new apid handler — reuses
+	// UpsertComputeNodeFromOperator). Defaults to "".
+	NodeName string `toml:"node_name"`
 }
 
 // TOMLTLSConfig is the on-disk TLS subset. Function pointers and derived
@@ -185,6 +220,15 @@ func LoadConfig(path string) (*Config, error) {
 	// role gate at boot calls role.Require to refuse to start
 	// under the wrong box shape.
 	c.Role = role.FromConfig(string(c.Role), "FAAS_GATEWAYD_ROLE")
+	// Mega-PR-A (issue #911 / ADR-110 PR-1): env-var overlay for
+	// NodeName so the systemd drop-in (deploy/ansible/roles/
+	// gatewayd_internal_service/files/faas-gatewayd-internal.
+	// service.d/99-faas-node-name.conf) can override the TOML
+	// node_name on every box. Empty keeps the TOML value (single-
+	// box dev).
+	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
+		c.NodeName = v
+	}
 	return c, nil
 }
 
@@ -222,6 +266,13 @@ func (c *Config) resolveTLSConfig(allowlist gateway.OnDemandAllowlist) gateway.T
 // is start-up fatal rather than a runtime fault (spec §11).
 func (c *Config) LoadVMMDPingTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("vmmd_", c.VMMDPingTLSCertPath, c.VMMDPingTLSKeyPath, c.VMMDPingTLSCAPath)
+}
+
+// LoadScheddTLS returns the client mTLS config for the schedd gRPC target.
+// Empty paths preserve the unix-socket/single-box posture; partial paths are
+// rejected so a TCP schedd target cannot silently fall back to plaintext.
+func (c *Config) LoadScheddTLS() (*tls.Config, error) {
+	return wire.LoadClientTLSConfigWithPrefix("schedd_", c.ScheddTLSCertPath, c.ScheddTLSKeyPath, c.ScheddTLSCAPath)
 }
 
 // LoadEgressTLS returns the server mTLS config the egress gRPC

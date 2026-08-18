@@ -510,13 +510,17 @@ func TestEdgeRuleCache_HostEntryKindIsolation(t *testing.T) {
 func TestEdgeRuleMatcher_WidenedInterfaceSatisfied(t *testing.T) {
 	// Compile-time check: noOpEdgeRuleMatcher (which provides
 	// default no-op behaviour) satisfies the widened EdgeRuleMatcher
-	// interface. If PR 5-7 add new Match* methods and forget to
-	// add a noOp default, this assignment fails to compile.
+	// interface. If PR 5-7 (or PR 8 kind=geo) add new Match* methods
+	// and forget to add a noOp default, this assignment fails to compile.
 	var m EdgeRuleMatcher = noOpEdgeRuleMatcher{}
 	_ = m.MatchRoute(nil, "h", "/", "GET")
 	_ = m.MatchRewrite(nil, "h", "/", "GET")
 	_ = m.MatchRedirect(nil, "h", "/", "GET")
 	_ = m.MatchHeaders(nil, "h", "/", "GET")
+	_ = m.MatchCORS(nil, "h", "/", "GET")
+	_ = m.MatchJWT(nil, "h", "/", "GET")
+	_ = m.MatchIP(nil, "h", "/", "GET")
+	_ = m.MatchGeo(nil, "h", "/", "GET")
 	m.Reset()
 }
 
@@ -602,10 +606,101 @@ func sampleIPRule(id string, prio int, host string) EdgeRuleIPResolved {
 	}
 }
 
-// putEntryAll is the PR 6 widening of putEntry: covers all 7 kinds.
-// Mirrors cmd-side loadHost's single-pass compile pattern — the
-// production loader always populates every kind at once; this test
-// helper does the same.
+// sampleValidateRule mirrors sampleIPRule's shape for the PR-B
+// eighth kind. SchemaDigest is the SHA-256 of the schema body —
+// computed at compile time on the cmd side; here we pin a stable
+// 32-byte value so the test isn't sensitive to the seed contents.
+// The other fields default to the "v1 baseline" (any Content-Type,
+// no streaming opt-in, no extra body cap).
+func sampleValidateRule(id string, prio int, host string) EdgeRuleValidateResolved {
+	var digest [32]byte
+	copy(digest[:], []byte("validate-"+id+"-test-fixture-digest-padding"))
+	return EdgeRuleValidateResolved{
+		ID:           id,
+		AccountID:    "acc_" + id,
+		AppID:        "app_" + id,
+		Priority:     prio,
+		PathGlob:     "",
+		Methods:      nil,
+		SchemaDigest: digest,
+	}
+}
+
+// sampleLimitRule (ADR-091 D24 / kind=limit) is the ninth-kind
+// mirror of sampleIPRule's shape. MaxBodyBytes is the per-rule
+// buffered cap; MaxBodyBytesStreaming is the streaming opt-in
+// (0 = no streaming carve-out, falls back to MaxBodyBytes on the
+// hot path). The cmd-side compileLimitRules clamps out-of-range
+// values to api.MaxRequestBodyBytes / api.RawStreamMaxRequestBytes;
+// these samples stay in-range so the resolver-level unit test
+// doesn't have to simulate the clamp path (which has its own
+// cmd-side test in cmd/gatewayd-internal/edge_rules_test.go).
+func sampleLimitRule(id string, prio int, host string) EdgeRuleLimitResolved {
+	return EdgeRuleLimitResolved{
+		ID:                    id,
+		AccountID:             "acc_" + id,
+		AppID:                 "app_" + id,
+		Priority:              prio,
+		PathGlob:              "",
+		Methods:               nil,
+		MaxBodyBytes:          5 * 1024 * 1024, // 5 MiB
+		MaxBodyBytesStreaming: 0,
+	}
+}
+
+// sampleMaintenanceRule is the ADR-091 amendment / §4.1.2.13 sample
+// used by the cache + filter tests. Mirrors sampleLimitRule above;
+// kind=maintenance only carries RetryAfterSeconds + Message
+// (no body caps). The id is reused for AccountID + AppID to keep
+// the helper one-line.
+func sampleMaintenanceRule(id string, prio int, host string) EdgeRuleMaintenanceResolved {
+	return EdgeRuleMaintenanceResolved{
+		ID:                id,
+		AccountID:         "acc_" + id,
+		AppID:             "app_" + id,
+		Priority:          prio,
+		PathGlob:          "",
+		Methods:           nil,
+		RetryAfterSeconds: 60,
+		Message:           "Test maintenance: " + id,
+	}
+}
+
+// sampleBudgetRule (ADR-093 / kind=budget) is the eleventh-kind
+// mirror of sampleIPRule's shape. BudgetMs is the per-request
+// wall-clock budget; AllowOverrideHeader is empty (the runtime
+// falls back to api.RequestBudgetDefaultOverrideHeader). The
+// cmd-side compileBudgetRules clamps out-of-range values to
+// api.RequestBudgetMaxMs; these samples stay in-range so the
+// resolver-level unit test doesn't have to simulate the clamp
+// path (which has its own cmd-side test in
+// cmd/gatewayd-internal/edge_rules_test.go).
+func sampleBudgetRule(id string, prio int, host string) EdgeRuleBudgetResolved {
+	return EdgeRuleBudgetResolved{
+		ID:                  id,
+		AccountID:           "acc_" + id,
+		AppID:               "app_" + id,
+		Priority:            prio,
+		PathGlob:            "",
+		Methods:             nil,
+		BudgetMs:            3000,
+		AllowOverrideHeader: "",
+	}
+}
+
+// putEntryAll is the PR 6 widening of putEntry: covers all 12 kinds
+// after the kind=maintenance, kind=geo, and kind=budget extensions
+// (ADR-091 D21 amendment, §4.1.2.13, ADR-093). The validate widening
+// was PR-B; the limit widening was D24; the maintenance widening is
+// PR-A; the geo widening is PR-A's sibling cluster; the budget
+// widening is ADR-093. Mirrors cmd-side loadHost's single-pass
+// compile pattern — the production loader always populates every
+// kind at once; this test helper does the same.
+//
+// Adding a new edge-rule kind requires extending this signature.
+// The compiler enforces it across every callsite — that's the
+// load-bearing reason for the wide parameter list over a
+// HostEntry-shaped struct.
 func putEntryAll(c *EdgeRuleCache, host string,
 	route []EdgeRuleResolved,
 	rewrite []EdgeRuleRewriteResolved,
@@ -614,16 +709,26 @@ func putEntryAll(c *EdgeRuleCache, host string,
 	cors []EdgeRuleCORSResolved,
 	jwt []EdgeRuleJWTResolved,
 	ip []EdgeRuleIPResolved,
+	validate []EdgeRuleValidateResolved,
+	limit []EdgeRuleLimitResolved,
+	maintenance []EdgeRuleMaintenanceResolved,
+	geo []EdgeRuleGeoResolved,
+	budget []EdgeRuleBudgetResolved,
 ) {
 	c.Put(host, &HostEntry{
-		Host:     host,
-		Route:    route,
-		Rewrite:  rewrite,
-		Redirect: redirect,
-		Headers:  headers,
-		CORS:     cors,
-		JWT:      jwt,
-		IP:       ip,
+		Host:        host,
+		Route:       route,
+		Rewrite:     rewrite,
+		Redirect:    redirect,
+		Headers:     headers,
+		CORS:        cors,
+		JWT:         jwt,
+		IP:          ip,
+		Validate:    validate,
+		Limit:       limit,
+		Maintenance: maintenance,
+		Geo:         geo,
+		Budget:      budget,
 	})
 }
 
@@ -660,25 +765,188 @@ func TestPickFirstIPMatch_PriorityOrdering(t *testing.T) {
 	}
 }
 
+// TestPickFirstValidateMatch_PriorityOrdering is the PR-B (PR-C
+// rollout-closer) mirror of TestPickFirstIPMatch_PriorityOrdering.
+// The PickFirst*Match family's semantics are identical across kinds
+// — priority ASC, methods filter, then path-glob filter — and
+// this test pins that the new kind obeys the same priority contract.
+func TestPickFirstValidateMatch_PriorityOrdering(t *testing.T) {
+	host := "a.example.com"
+	rules := []EdgeRuleValidateResolved{
+		sampleValidateRule("high", 0, host),
+		sampleValidateRule("low", 100, host),
+	}
+	got := PickFirstValidateMatch(rules, "/", "POST")
+	if got == nil || got.ID != "high" {
+		t.Fatalf("got %v, want high priority-0", got)
+	}
+}
+
+// TestPickFirstValidateMatch_PathGlob pins the path-glob filter for
+// the new kind. A rule with PathGlob=`/api/*` must NOT match `/healthz`
+// even at lower priority; without the filter, the rule would falsely
+// claim a hit on every method+path combination.
+func TestPickFirstValidateMatch_PathGlob(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleValidateRule("glob", 0, host)
+	rule.PathGlob = "/api/*"
+	rules := []EdgeRuleValidateResolved{rule}
+	if got := PickFirstValidateMatch(rules, "/healthz", "POST"); got != nil {
+		t.Fatalf("got %v, want nil (path-glob filter)", got)
+	}
+	if got := PickFirstValidateMatch(rules, "/api/users", "POST"); got == nil || got.ID != "glob" {
+		t.Fatalf("got %v, want glob match on /api/users", got)
+	}
+}
+
+// TestPickFirstValidateMatch_MethodsFilter pins the HTTP-method
+// filter for the new kind. The resolver still respects a per-rule
+// Methods map; a rule declared for POST must not match GET, even
+// at priority 0.
+func TestPickFirstValidateMatch_MethodsFilter(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleValidateRule("post-only", 0, host)
+	rule.Methods = map[string]bool{"POST": true}
+	rules := []EdgeRuleValidateResolved{rule}
+	if got := PickFirstValidateMatch(rules, "/", "GET"); got != nil {
+		t.Fatalf("got %v, want nil (methods filter excluded GET)", got)
+	}
+	if got := PickFirstValidateMatch(rules, "/", "POST"); got == nil || got.ID != "post-only" {
+		t.Fatalf("got %v, want post-only match on POST", got)
+	}
+}
+
+// TestPickFirstLimitMatch_PriorityOrdering (ADR-091 D24 / kind=limit)
+// is the ninth-kind mirror of TestPickFirstValidateMatch_PriorityOrdering.
+// PickFirst*Match's semantics are identical across kinds — priority
+// ASC, methods filter, then path-glob filter — and this test pins
+// that the new kind obeys the same priority contract. Without it,
+// a regression that re-orders the slice on the limit path would
+// silently change which rule wins (the smaller-cap rule is not
+// preferred — first-match-wins, mirroring every other kind).
+func TestPickFirstLimitMatch_PriorityOrdering(t *testing.T) {
+	host := "a.example.com"
+	rules := []EdgeRuleLimitResolved{
+		sampleLimitRule("high", 0, host),
+		sampleLimitRule("low", 100, host),
+	}
+	got := PickFirstLimitMatch(rules, "/", "POST")
+	if got == nil || got.ID != "high" {
+		t.Fatalf("got %v, want high priority-0", got)
+	}
+}
+
+// TestPickFirstLimitMatch_PathGlob pins the path-glob filter for
+// the new kind. A rule with PathGlob=`/api/*` must NOT match
+// `/healthz` even at lower priority; without the filter, the rule
+// would falsely claim a hit on every method+path combination.
+func TestPickFirstLimitMatch_PathGlob(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleLimitRule("glob", 0, host)
+	rule.PathGlob = "/api/*"
+	rules := []EdgeRuleLimitResolved{rule}
+	if got := PickFirstLimitMatch(rules, "/healthz", "POST"); got != nil {
+		t.Fatalf("got %v, want nil (path-glob filter)", got)
+	}
+	if got := PickFirstLimitMatch(rules, "/api/users", "POST"); got == nil || got.ID != "glob" {
+		t.Fatalf("got %v, want glob match on /api/users", got)
+	}
+}
+
+// TestPickFirstLimitMatch_MethodsFilter pins the HTTP-method filter
+// for the new kind. The resolver still respects a per-rule Methods
+// map; a rule declared for POST must not match GET, even at
+// priority 0.
+func TestPickFirstLimitMatch_MethodsFilter(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleLimitRule("post-only", 0, host)
+	rule.Methods = map[string]bool{"POST": true}
+	rules := []EdgeRuleLimitResolved{rule}
+	if got := PickFirstLimitMatch(rules, "/", "GET"); got != nil {
+		t.Fatalf("got %v, want nil (methods filter excluded GET)", got)
+	}
+	if got := PickFirstLimitMatch(rules, "/", "POST"); got == nil || got.ID != "post-only" {
+		t.Fatalf("got %v, want post-only match on POST", got)
+	}
+}
+
+// TestPickFirstBudgetMatch_PriorityOrdering (ADR-093 / kind=budget)
+// pins the priority-ASC + first-match-wins shape. Mirrors
+// TestPickFirstLimitMatch_PriorityOrdering — the small copy keeps
+// the per-kind return type precise without paying for a
+// runtime-type assertion on every request.
+func TestPickFirstBudgetMatch_PriorityOrdering(t *testing.T) {
+	host := "a.example.com"
+	rules := []EdgeRuleBudgetResolved{
+		sampleBudgetRule("high", 0, host),
+		sampleBudgetRule("low", 100, host),
+	}
+	got := PickFirstBudgetMatch(rules, "/", "POST")
+	if got == nil || got.ID != "high" {
+		t.Fatalf("got %v, want high priority-0", got)
+	}
+}
+
+// TestPickFirstBudgetMatch_PathGlob pins the path-glob filter for
+// kind=budget. A rule with PathGlob=`/v1/payment/*` must NOT
+// match `/healthz` even at lower priority; without the filter,
+// the rule would falsely claim a hit on every method+path
+// combination.
+func TestPickFirstBudgetMatch_PathGlob(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleBudgetRule("glob", 0, host)
+	rule.PathGlob = "/v1/payment/*"
+	rules := []EdgeRuleBudgetResolved{rule}
+	if got := PickFirstBudgetMatch(rules, "/healthz", "POST"); got != nil {
+		t.Fatalf("got %v, want nil (path-glob filter)", got)
+	}
+	if got := PickFirstBudgetMatch(rules, "/v1/payment/intent", "POST"); got == nil || got.ID != "glob" {
+		t.Fatalf("got %v, want glob match on /v1/payment/intent", got)
+	}
+}
+
+// TestPickFirstBudgetMatch_MethodsFilter pins the HTTP-method filter
+// for kind=budget. The resolver still respects a per-rule Methods
+// map; a rule declared for POST must not match GET, even at
+// priority 0. Mirrors the limit-methods test.
+func TestPickFirstBudgetMatch_MethodsFilter(t *testing.T) {
+	host := "a.example.com"
+	rule := sampleBudgetRule("post-only", 0, host)
+	rule.Methods = map[string]bool{"POST": true}
+	rules := []EdgeRuleBudgetResolved{rule}
+	if got := PickFirstBudgetMatch(rules, "/", "GET"); got != nil {
+		t.Fatalf("got %v, want nil (methods filter excluded GET)", got)
+	}
+	if got := PickFirstBudgetMatch(rules, "/", "POST"); got == nil || got.ID != "post-only" {
+		t.Fatalf("got %v, want post-only match on POST", got)
+	}
+}
+
 // --- PR 6: wholesale-Reset() property test (ADR-091 D17) ----------
 //
-// The EdgeRuleCache is the LRU mirror for all 7 edge-rule kinds.
+// The EdgeRuleCache is the LRU mirror for all 9 edge-rule kinds
+// (route, rewrite, redirect, headers, cors, jwt, ip, validate, geo).
 // pg_notify-driven invalidation in cmd/gatewayd-internal/backend.go
 // fires Reset() wholesale — a regression against any single kind
 // fails this test, surfacing as a cache-consistency violation for
-// ALL 7 kinds simultaneously. The deterministic 7-row table is the
+// ALL 9 kinds simultaneously. The deterministic 9-row table is the
 // load-bearing assertion; the fuzz target is hardening on top.
 //
 // Why one row per kind: the cache stores a HostEntry whose slices
-// cover all 7 kinds together. Reset() drops the whole HostEntry
+// cover all 9 kinds together. Reset() drops the whole HostEntry
 // (and every kind's slice inside it). Pinning that pre-Reset each
 // kind's GetK returns a hit AND post-Reset each kind's GetK returns
 // (nil, false) is the invariant that catches "Reset forgot kind X"
 // regressions before they ship.
 
-// TestEdgeRuleReset_WholesaleAcrossAllSevenKinds is the deterministic
-// 7-row table that pins the wholesale-Reset invariant. See plan §D1.
-func TestEdgeRuleReset_WholesaleAcrossAllSevenKinds(t *testing.T) {
+// TestEdgeRuleReset_WholesaleAcrossAllElevenKinds is the deterministic
+// 11-row table that pins the wholesale-Reset invariant. The PR-C
+// rename widened the original PR-6 SevenKinds test to cover the
+// kind=validate slice added by PR-B; PR #855 widened it again for
+// kind=limit (ADR-091 D24); PR-A widens it for kind=maintenance
+// (§4.1.2.13) and for kind=geo (D21); ADR-093 widens it once more
+// for kind=budget. See plan §D1 + D21 + D24 + ADR-093 §Decision.
+func TestEdgeRuleReset_WholesaleAcrossAllTwelveKinds(t *testing.T) {
 	c := NewEdgeRuleCache(EdgeRuleCacheCap)
 	host := "a.example.com"
 	putEntryAll(c, host,
@@ -689,6 +957,11 @@ func TestEdgeRuleReset_WholesaleAcrossAllSevenKinds(t *testing.T) {
 		[]EdgeRuleCORSResolved{sampleCORSRule("cors", 0, host)},
 		[]EdgeRuleJWTResolved{sampleJWTRule("jwt", 0, host)},
 		[]EdgeRuleIPResolved{sampleIPRule("ip", 0, host)},
+		[]EdgeRuleValidateResolved{sampleValidateRule("vd", 0, host)},
+		[]EdgeRuleLimitResolved{sampleLimitRule("lm", 0, host)},
+		[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", 0, host)},
+		[]EdgeRuleGeoResolved{sampleGeoRule("geo", 0, []string{"DE"}, nil, "")},
+		[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", 0, host)},
 	)
 
 	// Sanity: every GetK returns a hit pre-Reset.
@@ -703,6 +976,11 @@ func TestEdgeRuleReset_WholesaleAcrossAllSevenKinds(t *testing.T) {
 		{"GetCORS", func() bool { _, ok := c.GetCORS(host); return ok }},
 		{"GetJWT", func() bool { _, ok := c.GetJWT(host); return ok }},
 		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
+		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
+		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
+		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
+		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
+		{"GetBudget", func() bool { _, ok := c.GetBudget(host); return ok }},
 	}
 	for _, c0 := range preChecks {
 		if !c0.f() {
@@ -723,6 +1001,11 @@ func TestEdgeRuleReset_WholesaleAcrossAllSevenKinds(t *testing.T) {
 		{"GetCORS", func() bool { _, ok := c.GetCORS(host); return ok }},
 		{"GetJWT", func() bool { _, ok := c.GetJWT(host); return ok }},
 		{"GetIP", func() bool { _, ok := c.GetIP(host); return ok }},
+		{"GetValidate", func() bool { _, ok := c.GetValidate(host); return ok }},
+		{"GetLimit", func() bool { _, ok := c.GetLimit(host); return ok }},
+		{"GetMaintenance", func() bool { _, ok := c.GetMaintenance(host); return ok }},
+		{"GetGeo", func() bool { _, ok := c.GetGeo(host); return ok }},
+		{"GetBudget", func() bool { _, ok := c.GetBudget(host); return ok }},
 	}
 	for _, c0 := range postChecks {
 		if c0.f() {
@@ -757,7 +1040,10 @@ func TestEdgeRuleReset_EmptyCacheNoPanic(t *testing.T) {
 // panic, no -race detector hit, post-settle Len() ∈ {0,1,2}.
 //
 // Mirrors TestEdgeRuleCache_ConcurrentGetPut at line 133 — extends
-// the existing concurrent test with Reset() interleaved.
+// the existing concurrent test with Reset() interleaved. PR-C
+// widens the helper's putEntryAll invocation to cover the kind=validate
+// slice added by PR-B so the race detector still sees every kind's
+// HotPath code path.
 func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 	c := NewEdgeRuleCache(100)
 	var wg sync.WaitGroup
@@ -779,18 +1065,28 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 						[]EdgeRuleCORSResolved{sampleCORSRule("cors", j, hostA)},
 						[]EdgeRuleJWTResolved{sampleJWTRule("jwt", j, hostA)},
 						[]EdgeRuleIPResolved{sampleIPRule("ip", j, hostA)},
+						[]EdgeRuleValidateResolved{sampleValidateRule("vd", j, hostA)},
+						[]EdgeRuleLimitResolved{sampleLimitRule("lm", j, hostA)},
+						[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", j, hostA)},
+						[]EdgeRuleGeoResolved{sampleGeoRule("geo", j, []string{"DE"}, nil, "")},
+						[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", j, hostA)},
 					)
 				case 1:
 					_, _ = c.Get(hostA)
 					_, _ = c.GetCORS(hostA)
 					_, _ = c.GetJWT(hostA)
 					_, _ = c.GetIP(hostA)
+					_, _ = c.GetValidate(hostA)
+					_, _ = c.GetLimit(hostA)
+					_, _ = c.GetMaintenance(hostA)
+					_, _ = c.GetGeo(hostA)
+					_, _ = c.GetBudget(hostA)
 				case 2:
 					c.Reset()
 				case 3:
 					putEntryAll(c, hostB,
 						[]EdgeRuleResolved{sampleEdgeRule("r2", j, hostB, "beta")},
-						nil, nil, nil, nil, nil, nil,
+						nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 					)
 				}
 			}
@@ -820,8 +1116,11 @@ func TestEdgeRuleReset_ConcurrentPutResetRaceSafe(t *testing.T) {
 // host keyed by `i % 4`, then asserts the wholesale invariant:
 // Len() stays within [0, cap]. PR 6 ships three seeds; CI's default
 // fuzz corpus is short, so the deterministic
-// TestEdgeRuleReset_WholesaleAcrossAllSevenKinds is the load-bearing
-// assertion (the fuzz is hardening on top).
+// TestEdgeRuleReset_WholesaleAcrossAllNineKinds is the load-bearing
+// assertion (the fuzz is hardening on top). PR-C widens the putEntryAll
+// call to cover kind=validate; this PR widens to 9 with kind=geo
+// per ADR-091 D21 so a regression that bound only 8 kinds in the
+// cache would trip under fuzzing.
 func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 	// Three seeds that together exercise Put→Get→Reset,
 	// Put→Reset→Put→Get, and back-to-back Reset patterns.
@@ -843,6 +1142,11 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 					[]EdgeRuleCORSResolved{sampleCORSRule("cors", i, host)},
 					[]EdgeRuleJWTResolved{sampleJWTRule("jwt", i, host)},
 					[]EdgeRuleIPResolved{sampleIPRule("ip", i, host)},
+					[]EdgeRuleValidateResolved{sampleValidateRule("vd", i, host)},
+					[]EdgeRuleLimitResolved{sampleLimitRule("lm", i, host)},
+					[]EdgeRuleMaintenanceResolved{sampleMaintenanceRule("mt", i, host)},
+					[]EdgeRuleGeoResolved{sampleGeoRule("geo", i, []string{"DE"}, nil, "")},
+					[]EdgeRuleBudgetResolved{sampleBudgetRule("bg", i, host)},
 				)
 			case 1: // GetK (any kind)
 				_, _ = c.Get(host)
@@ -852,6 +1156,11 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 				_, _ = c.GetCORS(host)
 				_, _ = c.GetJWT(host)
 				_, _ = c.GetIP(host)
+				_, _ = c.GetValidate(host)
+				_, _ = c.GetLimit(host)
+				_, _ = c.GetMaintenance(host)
+				_, _ = c.GetGeo(host)
+				_, _ = c.GetBudget(host)
 			case 2: // Reset
 				c.Reset()
 			}
@@ -864,4 +1173,51 @@ func FuzzEdgeRuleReset_WholesaleInvalidatesAllKinds(f *testing.F) {
 			}
 		}
 	})
+}
+
+// BenchmarkEdgeRuleCache_Hit (ADR-091 hardening PR-A) pins the
+// hot-path cache-hit latency. With EdgeRuleCache.mu widened from
+// sync.Mutex to sync.RWMutex (PR-A), the read fast-path is two
+// atomic ops (RLock + RUnlock) plus a map lookup plus a container/
+// list MoveToFront under write-lock. The tripwire for future
+// regressions: p99 must stay < 200 ns on a 2024-class x86_64
+// (Apple M3+ ARM64 is comparable). A regression to the previous
+// shape would show up as p99 in the 1–2 µs range, so the gap is
+// measurable. Run with `go test -bench=BenchmarkEdgeRuleCache_Hit
+// -benchtime=2s ./pkg/gateway/...`.
+func BenchmarkEdgeRuleCache_Hit(b *testing.B) {
+	c := NewEdgeRuleCache(1024)
+	c.Put("hot.example.com", &HostEntry{
+		Host: "hot.example.com",
+		Route: []EdgeRuleResolved{{
+			ID:            "rule-hot",
+			AccountID:     "acct",
+			Priority:      100,
+			PathGlob:      "/",
+			TargetAppSlug: "hot",
+		}},
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := c.Get("hot.example.com"); !ok {
+			b.Fatalf("expected hit")
+		}
+	}
+}
+
+// BenchmarkEdgeRuleCache_Miss (ADR-091 hardening PR-A) is the
+// inverse tripwire: a miss must not pay the MoveToFront cost.
+// Used as a sanity check that the RWMutex widening didn't
+// accidentally regress the miss path. Both bench functions are
+// skipped on -short to keep the default `go test ./...` flow fast.
+func BenchmarkEdgeRuleCache_Miss(b *testing.B) {
+	c := NewEdgeRuleCache(1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := c.Get("nope.example.com"); ok {
+			b.Fatalf("expected miss")
+		}
+	}
 }

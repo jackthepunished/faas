@@ -51,6 +51,31 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// archiveTestDate returns a YYYY-MM-DD string 1 day ago (UTC).
+//
+// The archive handler's withinRetention gate is
+//
+//	cutoff := today.AddDate(0, 0, -maxDays+1)   // Hobby cap = 7
+//
+// so Hobby customers see day ∈ [today-6, today] inclusive.
+// Hardcoding "2026-08-07" (the original fixture) was correct
+// at the time of writing, but a static date silently walks out
+// of the Hobby window 7 days after writing — and the hardcoded
+// date sits exactly on the +1 inclusive boundary today, so a
+// pin the boundary either way fails. Use a relative date so the
+// tests stay valid as the calendar advances; the +5-day margin
+// also covers a slow CI runner whose clock might be a few hours
+// ahead of the wall clock at midnight UTC.
+//
+// `ts:` fields INSIDE each gzip line are left as the literal
+// 2026-08-07 fixture — the retention check is only on the
+// `?date=` query param, not the per-line `ts` field, so the
+// line payload can carry any historical timestamp without
+// affecting the gate.
+func archiveTestDate() string {
+	return time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+}
+
 // gzipJSONL is the test helper that produces the bytes the
 // fake S3 server hands to GetObject. Each line is one
 // spoolLine JSON blob with a unique seq so the assertions can
@@ -152,10 +177,16 @@ func driveStream(t *testing.T, h *ArchiveLogsHandler, account state.Account, que
 // server's request log so a future drift in
 // archiveObjectKey's layout fails loud.
 func TestArchiveStream_HappyPath(t *testing.T) {
+	// Use a relative date (yesterday) so the test stays inside the
+	// Hobby 7-day retention cap forever — calendar drift can't expire
+	// it. The bucket-key assertion pins YYYY/MM/DD derived from the
+	// same `now` so a future drift in archiveObjectKey fails loud.
+	day := archiveTestDate()
+	stamp := "2026-08-07T12:00:00Z"
 	lines := []string{
-		`{"seq":1,"stream":"stdout","ts":"2026-08-07T12:00:00Z","msg":"hello"}`,
-		`{"seq":2,"stream":"stdout","ts":"2026-08-07T12:00:01Z","msg":"world"}`,
-		`{"seq":3,"stream":"stderr","ts":"2026-08-07T12:00:02Z","msg":"boom"}`,
+		`{"seq":1,"stream":"stdout","ts":"` + stamp + `","msg":"hello"}`,
+		`{"seq":2,"stream":"stdout","ts":"` + stamp + `","msg":"world"}`,
+		`{"seq":3,"stream":"stderr","ts":"` + stamp + `","msg":"boom"}`,
 	}
 	body := gzipJSONL(t, lines)
 
@@ -174,10 +205,10 @@ func TestArchiveStream_HappyPath(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-		"archive=1&instance=inst-abc&date=2026-08-07")
+		"archive=1&instance=inst-abc&date="+day)
 
 	// The key shape is {prefix}/{instance}/{YYYY}/{MM}/{DD}.jsonl.gz.
-	wantPath := "/test-bucket/faas-logs/inst-abc/2026/08/2026-08-07.jsonl.gz"
+	wantPath := "/test-bucket/faas-logs/inst-abc/" + day[:4] + "/" + day[5:7] + "/" + day + ".jsonl.gz"
 	if gotPath != wantPath {
 		t.Errorf("S3 key: got %q, want %q", gotPath, wantPath)
 	}
@@ -213,7 +244,7 @@ func TestArchiveStream_FreePlan_Returns402(t *testing.T) {
 	}
 	rec := newFlusherRecorder()
 	r := httptest.NewRequest(http.MethodGet,
-		"/v1/apps/test-app/logs?archive=1&instance=inst-abc&date=2026-08-07", nil)
+		"/v1/apps/test-app/logs?archive=1&instance=inst-abc&date="+time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02"), nil)
 	h.streamUnauth(rec, r, state.Account{ID: "acct-1", Plan: api.PlanFree}, "test-app-id")
 
 	if rec.h.Get("Content-Type") != "application/problem+json" {
@@ -243,7 +274,7 @@ func TestArchiveStream_S3NotFound_ArchiveMissing(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-		"archive=1&instance=inst-abc&date=2026-08-07")
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	if !strings.Contains(body_out, `"reason":"archive_missing"`) {
 		t.Errorf("body missing archive_missing: %s", body_out)
@@ -263,7 +294,7 @@ func TestArchiveStream_S3ServerError_ArchiveDegraded(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-		"archive=1&instance=inst-abc&date=2026-08-07")
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	if !strings.Contains(body_out, `"reason":"archive_degraded"`) {
 		t.Errorf("body missing archive_degraded: %s", body_out)
@@ -301,7 +332,7 @@ func TestArchiveStream_InvalidInstance(t *testing.T) {
 	}
 	rec := newFlusherRecorder()
 	r := httptest.NewRequest(http.MethodGet,
-		"/v1/apps/test-app/logs?archive=1&instance=../etc/passwd&date=2026-08-07", nil)
+		"/v1/apps/test-app/logs?archive=1&instance=../etc/passwd&date="+time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02"), nil)
 	h.streamUnauth(rec, r, state.Account{ID: "acct-1", Plan: api.PlanHobby}, "test-app-id")
 
 	if !strings.Contains(rec.body.String(), "log_archive_invalid_query") {
@@ -315,7 +346,8 @@ func TestArchiveStream_InvalidInstance(t *testing.T) {
 // passes through. The boundary is +1 inclusive: Hobby
 // customers see days [today-6, today].
 func TestArchiveStream_RetentionCap_HobbyBoundary(t *testing.T) {
-	srv := newFakeS3(t, http.StatusOK, gzipJSONL(t, []string{`{"seq":1,"stream":"stdout","ts":"2026-08-07T12:00:00Z","msg":"x"}`}))
+	withinStamp := time.Now().UTC().AddDate(0, 0, -6).Format("2006-01-02") + "T12:00:00Z"
+	srv := newFakeS3(t, http.StatusOK, gzipJSONL(t, []string{`{"seq":1,"stream":"stdout","ts":"` + withinStamp + `","msg":"x"}`}))
 	h := &ArchiveLogsHandler{
 		S3:       newArchiveTestClient(t, srv),
 		Bucket:   "test-bucket",
@@ -379,7 +411,7 @@ func TestArchiveStream_MissingQueryParams(t *testing.T) {
 	cases := []string{
 		"archive=1",
 		"archive=1&instance=inst-abc",
-		"archive=1&date=2026-08-07",
+		"archive=1&date=" + time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02"),
 	}
 	for _, q := range cases {
 		t.Run(q, func(t *testing.T) {
@@ -401,8 +433,9 @@ func TestArchiveStream_MissingQueryParams(t *testing.T) {
 // handler emits whatever lines it can parse, then the
 // terminal carries the degraded reason.
 func TestArchiveStream_MalformedJSONLine(t *testing.T) {
+	stamp := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02") + "T12:00:00Z"
 	lines := []string{
-		`{"seq":1,"stream":"stdout","ts":"2026-08-07T12:00:00Z","msg":"ok"}`,
+		`{"seq":1,"stream":"stdout","ts":"` + stamp + `","msg":"ok"}`,
 		`{not json`,
 	}
 	body := gzipJSONL(t, lines)
@@ -419,7 +452,7 @@ func TestArchiveStream_MalformedJSONLine(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-		"archive=1&instance=inst-abc&date=2026-08-07")
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	if !strings.Contains(body_out, `"reason":"archive_degraded"`) {
 		t.Errorf("malformed JSON should degrade: %s", body_out)
@@ -440,7 +473,7 @@ func TestArchiveStream_NilS3AndBucket_ServiceUnavailable(t *testing.T) {
 	}
 	rec := newFlusherRecorder()
 	r := httptest.NewRequest(http.MethodGet,
-		"/v1/apps/test-app/logs?archive=1&instance=inst-abc&date=2026-08-07", nil)
+		"/v1/apps/test-app/logs?archive=1&instance=inst-abc&date="+time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02"), nil)
 	h.streamUnauth(rec, r, state.Account{ID: "acct-1", Plan: api.PlanHobby}, "test-app-id")
 
 	if !strings.Contains(rec.body.String(), "log_archive_unconfigured") {
@@ -499,8 +532,9 @@ func TestArchiveTerminalForError(t *testing.T) {
 // breaks every customer who reads archive streams; this
 // pin makes the contract loud.
 func TestArchiveStream_FramePayloadShape(t *testing.T) {
+	stamp := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02") + "T12:00:00Z"
 	lines := []string{
-		`{"seq":42,"stream":"stdout","ts":"2026-08-07T12:00:00Z","msg":"hello"}`,
+		`{"seq":42,"stream":"stdout","ts":"` + stamp + `","msg":"hello"}`,
 	}
 	body := gzipJSONL(t, lines)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -516,7 +550,7 @@ func TestArchiveStream_FramePayloadShape(t *testing.T) {
 		Backstop: 5 * time.Second,
 	}
 	body_out := driveStream(t, h, state.Account{ID: "acct-1", Plan: api.PlanHobby},
-		"archive=1&instance=inst-abc&date=2026-08-07")
+		"archive=1&instance=inst-abc&date="+archiveTestDate())
 
 	// Extract the first event: log payload to inspect the keys.
 	i := strings.Index(body_out, "data: {")
