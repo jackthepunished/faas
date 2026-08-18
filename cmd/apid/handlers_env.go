@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/data"
@@ -634,13 +635,25 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 //
 // Uses the existing pgstore.LiveDeploymentForScope shim
 // (pkg/state/pgstore.go:4111, backed by partial UNIQUE index
-// deployments_app_scope_live_uniq from migration 00213). On
-// ErrNotFound (no live deployment targets the env-scope, e.g.
-// the customer has not yet created a deployment for that scope)
-// falls back to defaultEnvScope="default" — the migration's SQL
-// DEFAULT 'default' stamp on data_upstreams.deployment_scope
-// matches this fallback. Returns the resolved scope as a string
-// (the shim's dep.Scope is a string already).
+// deployments_app_scope_live_uniq from migration 00213).
+//
+// Contract:
+//   - Empty envScope → (defaultEnvScope, nil): no resolver needed;
+//     migration DEFAULT handles this case identically.
+//   - ErrNotFound → (defaultEnvScope, nil): no live deployment
+//     targets the env-scope (e.g. customer has not yet created
+//     a deployment for that scope). This is the normal
+//     single-deployment case and the writer-time contract on
+//     docs/adr/098-deployment-scope-overlay.md §D3 demands
+//     non-error fallback.
+//   - LiveDeploymentForScope returns a row with empty scope
+//     → (defaultEnvScope, nil): same shape as ErrNotFound.
+//   - Any other error → ("", err): caller logs + degrades.
+//
+// The caller (runEnvClassifier) is best-effort and fails open
+// on the wrapped err: it logs + falls back to defaultEnvScope
+// itself. The split here is what lets that caller treat the
+// two cases symmetrically without a separate log line.
 func (s *server) deploymentScopeForEnvRow(ctx context.Context, appUUID uuid.UUID, envScope string) (string, error) {
 	if envScope == "" {
 		// No env-scope → no deployment resolver needed; the
@@ -649,12 +662,15 @@ func (s *server) deploymentScopeForEnvRow(ctx context.Context, appUUID uuid.UUID
 	}
 	dep, err := s.store.LiveDeploymentForScope(ctx, appUUID.String(), envScope)
 	if err != nil {
-		// ErrNotFound → fall back to defaultEnvScope (NOT an
-		// error per the writer-time contract on
-		// docs/adr/098-deployment-scope-overlay.md §D3).
-		// Any other error propagates so the caller can
-		// log + degrade (the classifier is best-effort).
-		return defaultEnvScope, err
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Expected path: no live deployment targets the
+			// env-scope yet. Stamp the migration's DEFAULT
+			// rather than failing the env mutation.
+			return defaultEnvScope, nil
+		}
+		// Real DB error (timeout, conn-reset, etc.) — propagate
+		// so the caller can log + degrade.
+		return "", err
 	}
 	if dep.Scope == "" {
 		return defaultEnvScope, nil

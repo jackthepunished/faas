@@ -16175,7 +16175,7 @@ func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, app
 // so the scan is cheap.
 func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, app_id, source, scope, kind, host, port,
+		`select id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
 		        host_redacted_hash, coalesce(declared_region, ''),
 		        last_rtt_ms, last_probed_at, last_seen_at, created_at
 		 from data_upstreams
@@ -16190,13 +16190,13 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 	for rows.Next() {
 		var (
 			id, accountIDpg, appIDpg                                    pgtype.UUID
-			source, scope, kind, host, hostRedactedHash, declaredRegion string
+			source, scope, deploymentScope, kind, host, hostRedactedHash, declaredRegion string
 			port                                                        int32
 			lastRTT                                                     pgtype.Int4
 			lastProbedAt                                                pgtype.Timestamptz
 			lastSeenAt, createdAt                                       pgtype.Timestamptz
 		)
-		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
+		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &deploymentScope, &kind, &host, &port,
 			&hostRedactedHash, &declaredRegion,
 			&lastRTT, &lastProbedAt, &lastSeenAt, &createdAt); err != nil {
 			return nil, err
@@ -16217,6 +16217,11 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 			AppID:            uuidFromPgtype(appIDpg),
 			Source:           DataUpstreamSource(source),
 			Scope:            scope,
+			// DeploymentScope (ADR-098 amendment issue #954) — the
+			// ?scope=__all__ arm of listUpstreams must surface the
+			// same deployment overlay the per-page arm does;
+			// otherwise the staging-vs-prod view regresses here.
+			DeploymentScope:  deploymentScope,
 			Kind:             DataUpstreamKind(kind),
 			Host:             host,
 			Port:             int(port),
