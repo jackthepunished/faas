@@ -23,6 +23,16 @@ name: paddle sandbox
 # must not block merges. Mirrors the gating pattern the metallima
 # and stripex-sandbox jobs use.
 #
+# Hardening (PR #962 MED-2 review fix): bring this in line with
+# ci.yml conventions — pin setup-go to v7 (the v5 it inherited from
+# stripex-sandbox.yml is older than ci.yml's pin), pin the Go version
+# to the same 1.25.13 ci.yml uses (so the sandbox CI never runs
+# against a drift-patched toolchain — gofmt differs between 1.25.0
+# and 1.25.13), enable Go module/build cache, set timeout-minutes,
+# and add a concurrency cancel-in-progress group (the metal/stripex
+# siblings also lack these but are out of scope here; their hardening
+# is a follow-up PR).
+#
 # Required repo secrets:
 #   - PADDLE_SANDBOX_API_KEY        (pdl_sandbox_… from api.sandbox.paddle.com)
 #   - PADDLE_SANDBOX_WEBHOOK_SECRET (whk_… from the sandbox Webhook endpoint)
@@ -30,20 +40,31 @@ name: paddle sandbox
 on:
   workflow_dispatch:
 
+# Cancel in-progress dispatches when the same workflow re-runs on
+# the same ref. Mirrors ci.yml:25-27. The metal/stripex-sandbox
+# siblings don't have this block (pre-existing drift; not in scope
+# for PR #962 — track in a follow-up).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   sandbox:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       PADDLE_SANDBOX_API_KEY: ${{ secrets.PADDLE_SANDBOX_API_KEY }}
       PADDLE_SANDBOX_WEBHOOK_SECRET: ${{ secrets.PADDLE_SANDBOX_WEBHOOK_SECRET }}
+      GO_VERSION: "1.25.13"
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
       - name: paddle sandbox live walk
         run: |
           set -euo pipefail
