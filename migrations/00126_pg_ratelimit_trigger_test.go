@@ -5,10 +5,10 @@
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00282 (which widens
+//  1. Migration set applies cleanly through 00285 (which widens
 //     scope to include 'rule'; the trigger doesn't depend on the
 //     widening but lives in the same migration file via the
-//     ADR-041 carve-out).
+//     ADR-017 carve-out).
 //  2. The pg_notify trigger pg_ratelimit_counters_notify exists on
 //     pg_ratelimit_counters, fires on INSERT and UPDATE OF
 //     tokens/last_refill, and emits JSON payloads on the

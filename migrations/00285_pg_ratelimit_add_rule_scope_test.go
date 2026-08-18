@@ -7,10 +7,12 @@
 //
 //  1. Migration set applies cleanly through 00285 (no goose
 //     duplicate-version panic). Slot 00285 was picked as the next
-//     safe claim band after PR #958 (issue #951 data_placement
-//     merged at 00271-00276 on main 2026-08-18) and PR #910's
-//     trigger cluster at 00277-00279. Re-verify against open PRs
-//     immediately before push via
+//     free slot on origin/main (which ends at 00280) past the
+//     open-PR reservations on PR #910 (00281-00283 trigger cluster),
+//     PR #916 (00268-00272 jobs PR-B), PR #939 (00269-00272 +
+//     00276 gap-12), PR #962 (00276-00280 paddle default), and
+//     PR #964 (00277-00281 data-upstreams). Re-verify against
+//     open PRs immediately before push via
 //     scripts/ci/check_migration_slots.sh.
 //  2. The pg_ratelimit_counters CHECK accepts the new value
 //     `scope='rule'` (positive round-trip — the rule-scoped
@@ -60,7 +62,7 @@ func TestMigrations_00285_PgRateLimitAddRuleScope(t *testing.T) {
 
 	// (1) Apply through 00285.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00276 egress_policy and 00285 pg_ratelimit widen)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00280 paddle billing and 00285 pg_ratelimit widen)", err)
 	}
 
 	// (2) + (5) CHECK constraint shape + constraint name pin.
@@ -91,7 +93,7 @@ func TestMigrations_00285_PgRateLimitAddRuleScope(t *testing.T) {
 	// is not written by this test — Phase 3 + Phase 4 do not
 	// require per-rule rows today; the test merely confirms the
 	// CHECK admits the value.
-	var dummyRuleID = "00000000-0000-0000-0000-000000002281a"
+	var dummyRuleID = "00000000-0000-0000-0000-000000002285a"
 	if _, err := pool.Exec(ctx, `
 		insert into pg_ratelimit_counters (scope, subject_id, plan, tokens, last_refill)
 		values ('rule', $1, 'scale', 100, now())
@@ -109,7 +111,7 @@ func TestMigrations_00285_PgRateLimitAddRuleScope(t *testing.T) {
 	// Defends against the easy confusion where a developer adds
 	// 'route' to a new migration's IN list thinking they mean
 	// `kind=route` on edge_rules.
-	var accountID = "00000000-0000-0000-0000-000000002281b"
+	var accountID = "00000000-0000-0000-0000-000000002285b"
 	var dummyRouteScopeErr error
 	if _, err := pool.Exec(ctx, `
 		insert into pg_ratelimit_counters (scope, subject_id, plan, tokens, last_refill)
