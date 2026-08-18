@@ -136,7 +136,9 @@ tags:
       `host:port` via `crypto/tls.Dial` (never `http.Get`) and
       records per-region samples in `data_upstream_probes`; the
       chooser in schedd reads them synchronously at wake via
-      `upstreamAffinity.Score(appID)`. Plaintext host is never
+      `upstreamAffinity.Score(appID, deploymentScope)` (ADR-098
+      amendment issue #954: each deployment reads its own probe
+      bias). Plaintext host is never
       emitted on the wire — only the sha256(salt||host) 8-hex
       prefix appears as a metric label.
   - name: billing
@@ -2884,6 +2886,18 @@ paths:
   /v1/apps/{slug}/upstreams:
     parameters:
       - $ref: '#/components/parameters/Slug'
+      - name: deployment_scope
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'
+        description: |
+          ADR-098 amendment (issue #954). Optional server-side filter
+          that narrows the list to one deployment. Omitted = return
+          all deployments for the app. Same shape as `scope` (3..40
+          chars, lowercase alnum + dash); empty string is treated as
+          "no filter".
     get:
       tags: [upstreams]
       operationId: listAppDataUpstreams
@@ -2897,6 +2911,10 @@ paths:
         quota (Free=0, Hobby=3, Pro=10, Scale=50). When FAAS_DATA_PLACEMENT
         is on the classifier derives entries on env mutation; when OFF
         the table stays empty and the response is `[]`.
+
+        ADR-098 amendment (issue #954): `?deployment_scope=` narrows
+        the list to one deployment so the dashboard can render
+        staging-vs-prod independently. Omitted = "all deployments".
       responses:
         '200':
           description: Captured upstreams on the app (plaintext never returned).
@@ -11205,11 +11223,11 @@ components:
       type: object
       required: [kind, host, port]
       description: |
-        Upsert payload for a customer data upstream. The (kind, host, port)
-        tuple is the deduplication key — repeating the PUT updates the
-        existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
-        inferred-source tag. Plaintext host is never persisted; the on-disk
-        column is `host_redacted_hash`.
+        Upsert payload for a customer data upstream. The (kind, host, port,
+        scope, deployment_scope) tuple is the deduplication key — repeating
+        the PUT updates the existing row's `last_seen_at` and (if
+        `FAAS_DATA_PLACEMENT=1`) the inferred-source tag. Plaintext host is
+        never persisted; the on-disk column is `host_redacted_hash`.
       properties:
         kind:
           type: string
@@ -11225,6 +11243,9 @@ components:
         scope:
           type: string
           description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Omitted = default scope."
+        deployment_scope:
+          type: string
+          description: "ADR-098 amendment (issue #954) widens the dedupe key to include `deployment_scope` so staging-vs-prod upstreams don't collide on the same app. Same shape as `scope` (3..40 chars, lowercase alnum + dash). Omitted = default scope, the migration's SQL DEFAULT stamp."
 
     DataUpstreamResponse:
       type: object
@@ -11256,6 +11277,9 @@ components:
         scope:
           type: string
           description: "ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Echoes the value persisted on the row; absent when the default scope applies."
+        deployment_scope:
+          type: string
+          description: "ADR-098 amendment (issue #954) widens the dedupe key to include `deployment_scope` so staging-vs-prod upstreams don't collide on the same app. Echoes the value persisted on the row; absent when the default scope applies."
         declared_region:
           type: string
           description: "Region hint (nullable). Empty on capture; populated by the operator or the classify-flow follow-up."
