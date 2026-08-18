@@ -11,10 +11,11 @@
 # from one yaml so `make metal-lima-splitbox` boots the whole chain with
 # one command.
 #
-# The harness consumes deploy/manifest/splitbox.yaml to drive the
-# renderer (PR-2), the release installer (PR-3), and the doctor (PR-4).
-# Both boxes run `gregalectl manifest validate --file deploy/manifest/
-# splitbox.yaml`; the renderer writes per-host TOMLs; the installer
+# The harness consumes deploy/manifest/examples/splitbox.example.yaml by
+# default (or FAAS_MANIFEST when supplied) to drive the renderer (PR-2),
+# the release installer (PR-3), and the doctor (PR-4). Both boxes run
+# `gregalectl manifest validate --file deploy/manifest/examples/
+# splitbox.example.yaml`; the renderer writes per-host TOMLs; the installer
 # materialises the release bundle under /opt/faas/releases/<sha>/; the
 # doctor validates exit 0 on both.
 #
