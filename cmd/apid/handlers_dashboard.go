@@ -1984,6 +1984,14 @@ func severityOrdinal(s string) int {
 // flow through verbatim. The deployment_detail template gates the
 // error-explanation section on ErrorCode != "" so pre-cluster rows
 // (and non-failure rows) render unchanged.
+//
+// Issue #977 / ADR-116: stamps the four deploy-annotation fields
+// (Reason / Tag / DeployedBy / PRNumber) so the dashboard list and
+// detail pages render them uniformly from the same projection. The
+// handler edge is the single seam — every code path that produces a
+// DeploymentItem (list view, detail view, JSON drill-down) flows
+// through here, so the annotation fields stay consistent without
+// per-page duplication.
 func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 	return dashboard.DeploymentItem{
 		ID:                d.ID,
@@ -1996,7 +2004,7 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 		ErrorWhy:          d.ErrorWhy,
 		ErrorFix:          d.ErrorFix,
 		ErrorRelevantLogs: d.ErrorRelevantLogs,
-		// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+// Issue #606 / SAFE-RELEASES-E.1: structured deployer
 		// attribution surfaced on the dashboard deploy detail
 		// page. Server-stamped from the HTTP request context
 		// (cmd/apid/handlers.go::createDeployment / handlers_source_*.go
@@ -2008,6 +2016,14 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 		DeployedVia:      d.DeployedVia,
 		DeployedFromIP:   d.DeployedFromIP,
 		PusherLogin:      d.PusherLogin,
+		// Issue #977 / ADR-116: deployment annotations rendered on
+		// the dashboard deploy detail page. nil/zero values drop
+		// out at the template layer (annotation-chip conditional)
+		// so pre-feature rows stay visually identical.
+		Reason:     d.Reason,
+		Tag:        d.Tag,
+		DeployedBy: d.DeployedBy,
+		PRNumber:   d.PRNumber,
 	}
 }
 
