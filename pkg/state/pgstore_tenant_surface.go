@@ -302,6 +302,51 @@ func (s *PgStore) DeleteTenantSurface(ctx context.Context, id string) error {
 	return s.UpdateTenantSurfaceStatus(ctx, id, SurfaceStatusDeleted)
 }
 
+// ListTenantSurfacesNearingExpiry — renewer hot-path (PR-D
+// commit 3). Returns active surfaces whose cert_not_after
+// < cutoff AND cert_state='issued'. Reads the partial index
+// tenant_surfaces_cert_expiry_idx so the query stays bounded
+// regardless of fleet size. The renewer goroutine polls every
+// CertRenewTickSeconds (api.CertRenewTickSeconds).
+//
+// cutoff is in UTC; the cert_not_after column is timestamptz so
+// the comparison is timezone-correct.
+func (s *PgStore) ListTenantSurfacesNearingExpiry(ctx context.Context, cutoff time.Time) ([]TenantSurface, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+tenantSurfaceColsQ+` from tenant_surfaces s
+		  where s.status = 'active'
+		    and s.cert_state = 'issued'
+		    and s.cert_not_after < $1
+		  order by s.cert_not_after asc`,
+		cutoff)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	return scanTenantSurfaces(rows)
+}
+
+// TouchTenantSurfaceForRenewal bumps updated_at on the surface
+// row so the tenant_surface_changed notify trigger fires. The
+// pg_notify subscriber routes the bare surface UUID back through
+// CertIssuer.RequestCertForSurface which re-runs the full
+// state machine. The renewer doesn't need its own write path
+// to the cert columns — it rides the existing pipeline so the
+// in-flight state machine (issued → pending → issued) stays
+// the source of truth.
+func (s *PgStore) TouchTenantSurfaceForRenewal(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update tenant_surfaces set updated_at = now() where id = $1`,
+		id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // TenantSurfaceByHostname — pgRouter.ResolveHost hot path; joins
 // tenant_hostnames to tenant_surfaces via the UQ on hostname alone.
 // Returns ErrNotFound when no surface claims the hostname (the

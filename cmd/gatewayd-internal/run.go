@@ -842,6 +842,22 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// flag is the same env var (PR-C dark-launch switch).
 	backend.WithCertIssuer(certIssuerFor(pgStore, deps.metrics, api.TenantSurfacesEnabled()))
 
+	// PR-D commit 3: cert-renewer goroutine. Periodically
+	// re-mints tenant surfaces whose cert_not_after < now +
+	// CertRenewBeforeNotAfterDays. The renewer rides the
+	// existing pg_notify pipeline (TouchTenantSurfaceForRenewal
+	// bumps updated_at → trigger fires → subscriber dispatches
+	// to CertIssuer.RequestCertForSurface), so the state
+	// machine stays single-writer.
+	//
+	// Skipped when the tenant-surfaces feature flag is off —
+	// the renewer would loop on a closed cartesian and emit
+	// noisy "0 due" log lines every tick.
+	if api.TenantSurfacesEnabled() {
+		renewer := gateway.NewSurfaceCertRenewer(pgStore, log)
+		go renewer.Run(ctx)
+	}
+
 	// Forward the operator-configured apid loopback URL through the
 	// test seam so runWithDeps can stay TOML-free (issue #85).
 	deps.apidLoopback = cfg.APIDLoopback

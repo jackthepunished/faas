@@ -193,6 +193,53 @@ func (m *MemStore) DeleteTenantSurface(ctx context.Context, id string) error {
 	return m.UpdateTenantSurfaceStatus(ctx, id, SurfaceStatusDeleted)
 }
 
+// ListTenantSurfacesNearingExpiry — renewer hot-path (PR-D
+// commit 3). Mirrors the pgstore predicate
+// (status='active' AND cert_state='issued' AND
+// cert_not_after < cutoff); sort-by-cert-not-after ascending so
+// the renewer hits the most-overdue surface first. Returns an
+// empty slice when the dataset has no renewals due.
+func (m *MemStore) ListTenantSurfacesNearingExpiry(_ context.Context, cutoff time.Time) ([]TenantSurface, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]TenantSurface, 0)
+	for _, s := range m.tenantSurfaces {
+		if s.Status != SurfaceStatusActive {
+			continue
+		}
+		if s.CertState != CertStateIssued {
+			continue
+		}
+		if !s.CertNotAfter.Before(cutoff) {
+			continue
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CertNotAfter.Equal(out[j].CertNotAfter) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CertNotAfter.Before(out[j].CertNotAfter)
+	})
+	return out, nil
+}
+
+// TouchTenantSurfaceForRenewal — bumps updated_at so the
+// tenant_surface_changed notify trigger fires; the renewer
+// rides the existing pipeline instead of duplicating it.
+// Mirrors pgstore's pgxpool.Exec.
+func (m *MemStore) TouchTenantSurfaceForRenewal(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.tenantSurfaces[id]
+	if !ok {
+		return ErrNotFound
+	}
+	s.UpdatedAt = time.Now().UTC()
+	m.tenantSurfaces[id] = s
+	return nil
+}
+
 // TenantSurfaceByHostname — pgRouter.ResolveHost hot path; linear
 // scan over hostnames. Dataset is bounded by (surfaces per acct) ×
 // (hostnames per surface) = 25*250 = 6250 worst case, well under the

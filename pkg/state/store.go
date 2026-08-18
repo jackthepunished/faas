@@ -1885,6 +1885,24 @@ type Store interface {
 	ListTenantSurfacesForAccount(ctx context.Context, accountID string) ([]TenantSurface, error)
 	ListTenantSurfacesForApp(ctx context.Context, appID string) ([]TenantSurface, error)
 	CountTenantSurfacesForAccount(ctx context.Context, accountID string) (int, error)
+	// ListTenantSurfacesNearingExpiry is the renewer hot-path
+	// (PR-D cert-engine-real-mint commit 3). Returns every
+	// active surface with cert_state='issued' AND
+	// cert_not_after < cutoff. The renewer iterates the
+	// returned slice and triggers a re-mint through the
+	// existing pg_notify pipeline (via TouchTenantSurfaceForRenewal
+	// bumping updated_at, which fires the
+	// tenant_surface_changed notify trigger).
+	ListTenantSurfacesNearingExpiry(ctx context.Context, cutoff time.Time) ([]TenantSurface, error)
+	// TouchTenantSurfaceForRenewal bumps updated_at on the
+	// surface row so the tenant_surface_changed notify trigger
+	// fires; the pg_notify subscriber routes the bare surface
+	// UUID back through CertIssuer.RequestCertForSurface which
+	// re-runs the full state machine. The renewer doesn't need
+	// its own write path — it rides the existing pipeline so
+	// the in-flight state machine (none → pending → issued)
+	// stays the source of truth.
+	TouchTenantSurfaceForRenewal(ctx context.Context, id string) error
 	UpdateTenantSurfaceStatus(ctx context.Context, id string, status SurfaceStatus) error
 	UpdateTenantSurfaceCert(ctx context.Context, in UpdateSurfaceCertParams) error
 	// DeleteTenantSurface soft-deletes: status flips to 'deleted',
