@@ -330,28 +330,31 @@ func TestLoadProviderForMeterd_TOMLStripeBlock(t *testing.T) {
 	}
 }
 
-// TestLoadProviderForMeterd_EmptyTOMLFallsThroughToStripe asserts an
-// empty cfg.Provider (no TOML header, no env override) → Stripe (the
-// legacy default). Mirrors the pre-PR-P2 behaviour.
-func TestLoadProviderForMeterd_EmptyTOMLFallsThroughToStripe(t *testing.T) {
+// TestLoadProviderForMeterd_EmptyTOMLFallsThroughToPaddle asserts an
+// empty cfg.Provider (no TOML header, no env override) → Paddle (the
+// production default at v2, ADR-032 v2). The legacy Stripe opt-in is
+// still bootable from FAAS_BILLING_PROVIDER=stripe (see
+// TestLoadProviderForMeterd_Stripe).
+func TestLoadProviderForMeterd_EmptyTOMLFallsThroughToPaddle(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
 	env := mapEnv(map[string]string{
-		"STRIPE_API_KEY": "sk_x",
+		"FAAS_PADDLE_API_KEY": "pdl_x",
+		"FAAS_PADDLE_SANDBOX": "1",
 	})
 	cfg := resolveCfg(t, env)
 	if cfg.Provider != "" {
-		t.Fatalf("cfg.Provider = %q, want empty (legacy default)", cfg.Provider)
+		t.Fatalf("cfg.Provider = %q, want empty (default falls through to paddle)", cfg.Provider)
 	}
 	p, name, err := LoadProviderForMeterd(cfg, env, store, discardLog())
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	if name != "stripe" {
-		t.Errorf("name = %q, want %q (empty cfg.Provider falls through to stripe)", name, "stripe")
+	if name != "paddle" {
+		t.Errorf("name = %q, want %q (empty cfg.Provider falls through to paddle)", name, "paddle")
 	}
 	if p == nil {
-		t.Error("provider = nil, want non-nil *stripe.Client")
+		t.Error("provider = nil, want non-nil *paddle.Provider")
 	}
 }
 
