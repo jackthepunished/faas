@@ -14,7 +14,7 @@
 #   make image-build-iso    — build bare-metal autoinstall ISO (no creds)
 #   make image-build-canary GIT_SHA=<sha> — publish canonical triple
 #                             (release.tar.gz + cosign bundle + SBoM) to
-#                             oci://ghcr.io/poyrazK/faas/release:v<sha> via
+#                             oci://ghcr.io/poyrazk/faas/release:v<sha> via
 #                             oras (ADR-113 PR-B). Requires cosign + syft +
 #                             oras on PATH; the existing `image-validate`
 #                             glob already syntax-validates this file.
@@ -100,7 +100,7 @@ image-build-iso: ## Build bare-metal autoinstall ISO (no cloud creds; output is 
 # Distinct from the per-cloud image builds above: image-build-canary
 # is an *artifact* builder (it uses the null builder + shell) that
 # publishes the canonical triple (release.tar.gz + cosign bundle +
-# SBoM) to oci://ghcr.io/poyrazK/faas/release:v<git_sha>@sha256:<digest>.
+# SBoM) to oci://ghcr.io/poyrazk/faas/release:v<git_sha>@sha256:<digest>.
 # Run from a host with cosign, syft, and oras on PATH.
 # ---------------------------------------------------------------------------
 .PHONY: image-build-canary
