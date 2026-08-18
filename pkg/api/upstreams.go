@@ -200,23 +200,32 @@ func DataUpstreamHostLast4(host string) string {
 }
 
 // PutDataUpstreamRequest is the POST /v1/apps/{slug}/upstreams
-// body. The customer-facing surface is (kind, host, port, scope)
-// — the host is plaintext at this point because the customer is
-// the one supplying it. The apid handler (C4) hashes via
-// pkg/secretbox.HashHost BEFORE INSERT; the plaintext is dropped
-// on the floor after the hash returns. The response carries
-// ONLY the hash + the host_last4 fragment.
+// body. The customer-facing surface is (kind, host, port, scope,
+// deployment_scope) — the host is plaintext at this point
+// because the customer is the one supplying it. The apid
+// handler (C4) hashes via pkg/secretbox.HashHost BEFORE INSERT;
+// the plaintext is dropped on the floor after the hash returns.
+// The response carries ONLY the hash + the host_last4 fragment.
 //
 // Scope mirrors the env-var scope shape (ADR-090 D3) — 3..40
 // chars, lowercase alnum + dash. The handler reads it from the
 // query param ?scope= on the GET, but the POST body carries it
 // explicitly so the customer can pin a hint to a non-default
 // scope.
+//
+// DeploymentScope (ADR-098 amendment issue #954) widens the
+// dedupe key so staging-vs-prod upstreams don't collide on the
+// same app. Same shape as Scope (3..40 chars, lowercase alnum
+// + dash — matches the migration 00281 CHECK constraint via
+// EnvScopePattern). Optional on the wire — the apid writer
+// defaults to "default" when omitted so single-deployment
+// apps keep the pre-#954 wire shape.
 type PutDataUpstreamRequest struct {
-	Kind  DataUpstreamKind `json:"kind"`
-	Host  string           `json:"host"`
-	Port  int              `json:"port"`
-	Scope string           `json:"scope,omitempty"`
+	Kind            DataUpstreamKind `json:"kind"`
+	Host            string           `json:"host"`
+	Port            int              `json:"port"`
+	Scope           string           `json:"scope,omitempty"`
+	DeploymentScope string           `json:"deployment_scope,omitempty"`
 }
 
 // Validate enforces the closed-vocab kind check, the RFC-952/1123
@@ -240,6 +249,18 @@ func (r PutDataUpstreamRequest) Validate() *Problem {
 			return ErrUpstreamInvalidKind("scope must be 3..40 chars, lowercase alnum + dash")
 		}
 	}
+	if r.DeploymentScope != "" {
+		// DeploymentScope shares the env-scope regex shape
+		// (EnvScopePattern = data_upstreams_deployment_scope_shape
+		// regex from migration 00281). ValidateScope rejects the
+		// empty string with "scope is required", which is wrong
+		// for an optional field — use the regex directly so the
+		// empty-string defaulting at the handler side keeps
+		// working.
+		if len(r.DeploymentScope) > MaxEnvScopeLen || !envScopeRe.MatchString(r.DeploymentScope) {
+			return ErrUpstreamInvalidKind("deployment_scope must be 3..40 chars, lowercase alnum + dash")
+		}
+	}
 	return nil
 }
 
@@ -255,6 +276,11 @@ func (r PutDataUpstreamRequest) Validate() *Problem {
 // DataUpstreamHostLast4; not stored on the row (the storage
 // is the hash, not the fragment — the fragment is the response
 // surface, not a database field).
+//
+// DeploymentScope (ADR-098 amendment issue #954) surfaces on
+// the response so the dashboard / CLI can render the staging
+// vs prod distinction the chooser now uses to scope its
+// probe bias.
 type DataUpstreamResponse struct {
 	ID               string             `json:"id"`
 	Source           DataUpstreamSource `json:"source"`
@@ -263,6 +289,7 @@ type DataUpstreamResponse struct {
 	HostLast4        string             `json:"host_last4,omitempty"`
 	Port             int                `json:"port"`
 	Scope            string             `json:"scope,omitempty"`
+	DeploymentScope  string             `json:"deployment_scope,omitempty"`
 	DeclaredRegion   string             `json:"declared_region,omitempty"`
 	LastRTTMs        *int               `json:"last_rtt_ms,omitempty"`
 	LastProbedAt     string             `json:"last_probed_at,omitempty"`

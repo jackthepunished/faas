@@ -29,6 +29,10 @@ export type DataUpstreamResponse = {
    */
   scope?: string;
   /**
+   * ADR-098 amendment (issue #954) widens the dedupe key to include `deployment_scope` so staging-vs-prod upstreams don't collide on the same app. Echoes the value persisted on the row; absent when the default scope applies.
+   */
+  deployment_scope?: string;
+  /**
    * Region hint (nullable). Empty on capture; populated by the operator or the classify-flow follow-up.
    */
   declared_region?: string;

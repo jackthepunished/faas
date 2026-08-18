@@ -3759,13 +3759,19 @@ type Store interface {
 
 	// InsertDataUpstream writes one data_upstreams row via the
 	// dedupe-merge ON CONFLICT tripwire on
-	// data_upstreams_dedupe_uniq (PR-B env-classifier).
+	// data_upstreams_dedupe_uniq (PR-B env-classifier). ADR-098
+	// amendment (issue #954) widens the dedupe key to include
+	// deployment_scope; the caller threads
+	// arg.DeploymentScope alongside scope, kind, host, port.
 	InsertDataUpstream(ctx context.Context, arg sqlc.InsertDataUpstreamParams) (uuid.UUID, error)
 
 	// ListDataUpstreamsByApp backs
 	// GET /v1/apps/{slug}/upstreams (PR-B). Cursor-paginated via
 	// (created_at, id); limit MUST be pre-clamped to
-	// api.DataUpstreamsListMaxLimit by the handler.
+	// api.DataUpstreamsListMaxLimit by the handler. ADR-098
+	// amendment (issue #954) adds an optional
+	// arg.CursorDeploymentScope server-side filter (empty =
+	// "return all deployments"; non-empty = "one deployment").
 	ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataUpstreamsByAppParams) ([]DataUpstream, error)
 
 	// ListAllAppDataUpstreams backs

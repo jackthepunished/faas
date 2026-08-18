@@ -15946,11 +15946,16 @@ func (s *PgStore) ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataU
 			probedAt = &t
 		}
 		out = append(out, DataUpstream{
-			ID:               uuidFromPgtype(r.ID),
-			AccountID:        uuidFromPgtype(r.AccountID),
-			AppID:            uuidFromPgtype(r.AppID),
-			Source:           DataUpstreamSource(r.Source),
-			Scope:            r.Scope,
+			ID:        uuidFromPgtype(r.ID),
+			AccountID: uuidFromPgtype(r.AccountID),
+			AppID:     uuidFromPgtype(r.AppID),
+			Source:    DataUpstreamSource(r.Source),
+			Scope:     r.Scope,
+			// DeploymentScope widens the dedupe key in ADR-098
+			// amendment (issue #954). Read-through; the column is
+			// NOT NULL DEFAULT 'default' on the SQL side so the
+			// empty-string default stamp is what backfills land as.
+			DeploymentScope:  r.DeploymentScope,
 			Kind:             DataUpstreamKind(r.Kind),
 			Host:             r.Host,
 			Port:             int(r.Port),
@@ -15983,11 +15988,16 @@ func (s *PgStore) GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUp
 		probedAt = &t
 	}
 	return DataUpstream{
-		ID:               uuidFromPgtype(row.ID),
-		AccountID:        uuidFromPgtype(row.AccountID),
-		AppID:            uuidFromPgtype(row.AppID),
-		Source:           DataUpstreamSource(row.Source),
-		Scope:            row.Scope,
+		ID:        uuidFromPgtype(row.ID),
+		AccountID: uuidFromPgtype(row.AccountID),
+		AppID:     uuidFromPgtype(row.AppID),
+		Source:    DataUpstreamSource(row.Source),
+		Scope:     row.Scope,
+		// DeploymentScope widens the dedupe key in ADR-098
+		// amendment (issue #954). Single-row read so the
+		// DELETE-handler audit site can round-trip the value
+		// into the data_upstream.deleted payload.
+		DeploymentScope:  row.DeploymentScope,
 		Kind:             DataUpstreamKind(row.Kind),
 		Host:             row.Host,
 		Port:             int(row.Port),
@@ -16083,7 +16093,12 @@ type AppUpstreamProbeScore struct {
 }
 
 // ListAppUpstreamProbeScores (ADR-098 PR-D) returns the freshest
-// probe per (data_upstreams.id, region) for the given app.
+// probe per (data_upstreams.id, region) for the given app, scoped
+// to a single deployment. ADR-098 amendment (issue #954) widens
+// the dedupe key to (app_id, scope, deployment_scope, ...); the
+// chooser must therefore scope its probe scan to the deployment
+// the wake targets — a staging deployment should bias on staging
+// probes, not production.
 //
 // SQL shape (hand-rolled, not sqlc — the JOIN with DISTINCT ON
 // is a single statement and adding it via sqlc would require a
@@ -16101,13 +16116,19 @@ type AppUpstreamProbeScore struct {
 //	  LIMIT 1
 //	) p ON true
 //	WHERE u.account_id = $1 AND u.app_id = $2
+//	  AND u.deployment_scope = $3
 //	  AND u.declared_region IS NOT NULL
 //
 // The LATERAL subquery keeps the index-driven lookup hot
 // (data_upstream_probes partitioned by sampled_at, the
 // (host_redacted_hash, sampled_at) index is the probe-loop's
 // hot path). One round-trip per wake.
-func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]AppUpstreamProbeScore, error) {
+//
+// deploymentScope is required (no fallback defaulting here —
+// the caller threads dep.ID from engine.go; pkg/sched/engine.go
+// applies defaultDeploymentScope="default" for the cold-path
+// branch where dep is nil).
+func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID, deploymentScope string) ([]AppUpstreamProbeScore, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT ON (u.id, p.region)
 		       u.host_redacted_hash, p.region, u.kind, u.port,
@@ -16121,8 +16142,9 @@ func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, app
 			LIMIT 1
 		) p ON true
 		WHERE u.account_id = $1 AND u.app_id = $2
+		  AND u.deployment_scope = $3
 		  AND u.declared_region IS NOT NULL
-	`, accountID, appID)
+	`, accountID, appID, deploymentScope)
 	if err != nil {
 		return nil, err
 	}
@@ -16153,7 +16175,7 @@ func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, app
 // so the scan is cheap.
 func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID string) ([]DataUpstream, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, app_id, source, scope, kind, host, port,
+		`select id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
 		        host_redacted_hash, coalesce(declared_region, ''),
 		        last_rtt_ms, last_probed_at, last_seen_at, created_at
 		 from data_upstreams
@@ -16167,14 +16189,14 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 	var out []DataUpstream
 	for rows.Next() {
 		var (
-			id, accountIDpg, appIDpg                                    pgtype.UUID
-			source, scope, kind, host, hostRedactedHash, declaredRegion string
-			port                                                        int32
-			lastRTT                                                     pgtype.Int4
-			lastProbedAt                                                pgtype.Timestamptz
-			lastSeenAt, createdAt                                       pgtype.Timestamptz
+			id, accountIDpg, appIDpg                                                     pgtype.UUID
+			source, scope, deploymentScope, kind, host, hostRedactedHash, declaredRegion string
+			port                                                                         int32
+			lastRTT                                                                      pgtype.Int4
+			lastProbedAt                                                                 pgtype.Timestamptz
+			lastSeenAt, createdAt                                                        pgtype.Timestamptz
 		)
-		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &kind, &host, &port,
+		if err := rows.Scan(&id, &accountIDpg, &appIDpg, &source, &scope, &deploymentScope, &kind, &host, &port,
 			&hostRedactedHash, &declaredRegion,
 			&lastRTT, &lastProbedAt, &lastSeenAt, &createdAt); err != nil {
 			return nil, err
@@ -16190,11 +16212,16 @@ func (s *PgStore) ListAllAppDataUpstreams(ctx context.Context, accountID, appID 
 			probedPtr = &t
 		}
 		out = append(out, DataUpstream{
-			ID:               uuidFromPgtype(id),
-			AccountID:        uuidFromPgtype(accountIDpg),
-			AppID:            uuidFromPgtype(appIDpg),
-			Source:           DataUpstreamSource(source),
-			Scope:            scope,
+			ID:        uuidFromPgtype(id),
+			AccountID: uuidFromPgtype(accountIDpg),
+			AppID:     uuidFromPgtype(appIDpg),
+			Source:    DataUpstreamSource(source),
+			Scope:     scope,
+			// DeploymentScope (ADR-098 amendment issue #954) — the
+			// ?scope=__all__ arm of listUpstreams must surface the
+			// same deployment overlay the per-page arm does;
+			// otherwise the staging-vs-prod view regresses here.
+			DeploymentScope:  deploymentScope,
 			Kind:             DataUpstreamKind(kind),
 			Host:             host,
 			Port:             int(port),

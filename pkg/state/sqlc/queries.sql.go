@@ -1327,7 +1327,7 @@ func (q *Queries) GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErro
 
 const getDataUpstreamByID = `-- name: GetDataUpstreamByID :one
 SELECT
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, coalesce(declared_region, ''),
     last_rtt_ms, last_probed_at, last_seen_at, created_at
 FROM data_upstreams
@@ -1340,6 +1340,7 @@ type GetDataUpstreamByIDRow struct {
 	AppID            pgtype.UUID
 	Source           string
 	Scope            string
+	DeploymentScope  string
 	Kind             string
 	Host             string
 	Port             int32
@@ -1353,7 +1354,9 @@ type GetDataUpstreamByIDRow struct {
 
 // Single-row read for the dashboard's "edit upstream"
 // pane (PR-B). Cursor-safe: no pagination; the handler
-// reads the row directly.
+// reads the row directly. Projects the new deployment_scope
+// column (issue #954) so the typed DataUpstream.DeploymentScope
+// in pkg/state/types.go round-trips through sqlc.
 func (q *Queries) GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) (GetDataUpstreamByIDRow, error) {
 	row := db.QueryRow(ctx, getDataUpstreamByID, id)
 	var i GetDataUpstreamByIDRow
@@ -1363,6 +1366,7 @@ func (q *Queries) GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UU
 		&i.AppID,
 		&i.Source,
 		&i.Scope,
+		&i.DeploymentScope,
 		&i.Kind,
 		&i.Host,
 		&i.Port,
@@ -1697,21 +1701,22 @@ func (q *Queries) InsertComputeNodeHeartbeat(ctx context.Context, db DBTX, arg I
 const insertDataUpstream = `-- name: InsertDataUpstream :one
 
 INSERT INTO data_upstreams (
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, declared_region,
     last_rtt_ms, last_probed_at,
     last_seen_at, created_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8,
-    $9, $10,
-    $11, $12,
+    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+    $10, $11,
+    $12, $13,
     now(), now()
 )
-ON CONFLICT (app_id, scope, kind, host, port) DO UPDATE SET
+ON CONFLICT (app_id, scope, deployment_scope, kind, host, port) DO UPDATE SET
     source          = EXCLUDED.source,
     declared_region = EXCLUDED.declared_region,
     last_rtt_ms     = EXCLUDED.last_rtt_ms,
     last_probed_at  = EXCLUDED.last_probed_at,
+    deployment_scope = EXCLUDED.deployment_scope,
     last_seen_at    = now()
 RETURNING id
 `
@@ -1722,6 +1727,7 @@ type InsertDataUpstreamParams struct {
 	AppID            pgtype.UUID
 	Source           string
 	Scope            string
+	DeploymentScope  string
 	Kind             string
 	Host             string
 	Port             int32
@@ -1752,12 +1758,15 @@ type InsertDataUpstreamParams struct {
 // Dedupe-merge INSERT for data_upstreams. Mirrors the
 // IncrementAppError ON CONFLICT pattern (queries.sql:906).
 // The handler (PR-B's cmd/apid/extract.go) targets
-// data_upstreams_dedupe_uniq on (app_id, scope, kind,
-// host, port). On conflict: bump last_seen_at; refresh
-// last_rtt_ms / last_probed_at / declared_region from
-// EXCLUDED so the freshest classifier observation wins.
-// id is caller-supplied (uuidv7) so the row identity is
-// stable across the dedupe-merge.
+// data_upstreams_dedupe_uniq on (app_id, scope,
+// deployment_scope, kind, host, port) per ADR-098 amendment
+// (issue #954 / 00281_data_upstreams_deployment_scope.sql).
+// On conflict: bump last_seen_at; refresh last_rtt_ms /
+// last_probed_at / declared_region / deployment_scope
+// from EXCLUDED so a re-classification re-stamps the
+// deployment overlay on the latest observation. id is
+// caller-supplied (uuidv7) so the row identity is stable
+// across the dedupe-merge.
 func (q *Queries) InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDataUpstreamParams) (pgtype.UUID, error) {
 	row := db.QueryRow(ctx, insertDataUpstream,
 		arg.ID,
@@ -1765,6 +1774,7 @@ func (q *Queries) InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDat
 		arg.AppID,
 		arg.Source,
 		arg.Scope,
+		arg.DeploymentScope,
 		arg.Kind,
 		arg.Host,
 		arg.Port,
@@ -2581,23 +2591,26 @@ func (q *Queries) ListDataUpstreamProbesByHostRegion(ctx context.Context, db DBT
 
 const listDataUpstreamsByApp = `-- name: ListDataUpstreamsByApp :many
 SELECT
-    id, account_id, app_id, source, scope, kind, host, port,
+    id, account_id, app_id, source, scope, deployment_scope, kind, host, port,
     host_redacted_hash, coalesce(declared_region, ''),
     last_rtt_ms, last_probed_at, last_seen_at, created_at
 FROM data_upstreams
 WHERE app_id = $1::uuid
-  AND ($2::timestamptz IS NULL
-       OR (created_at, id) < ($2::timestamptz,
-                              $3::uuid))
+  AND ($2::text IS NULL OR $2::text = ''
+       OR deployment_scope = $2::text)
+  AND ($3::timestamptz IS NULL
+       OR (created_at, id) < ($3::timestamptz,
+                              $4::uuid))
 ORDER BY created_at DESC, id DESC
-LIMIT $4::int
+LIMIT $5::int
 `
 
 type ListDataUpstreamsByAppParams struct {
-	AppID           pgtype.UUID
-	CursorCreatedAt pgtype.Timestamptz
-	CursorID        pgtype.UUID
-	PageLimit       int32
+	AppID                 pgtype.UUID
+	CursorDeploymentScope string
+	CursorCreatedAt       pgtype.Timestamptz
+	CursorID              pgtype.UUID
+	PageLimit             int32
 }
 
 type ListDataUpstreamsByAppRow struct {
@@ -2606,6 +2619,7 @@ type ListDataUpstreamsByAppRow struct {
 	AppID            pgtype.UUID
 	Source           string
 	Scope            string
+	DeploymentScope  string
 	Kind             string
 	Host             string
 	Port             int32
@@ -2623,17 +2637,23 @@ type ListDataUpstreamsByAppRow struct {
 // data_upstreams is a stable list, not a hot recency
 // list. Index path: data_upstreams_app_created_idx.
 //
-// sqlc.arg(...)::type casts disambiguate the two cursor
-// params — without them sqlc named both fields
-// `CreatedAt` (taken from the SELECT list) and the
-// generated Go wrapper bound a timestamptz to the $3
-// uuid slot, tripping a type error on every cursor page
-// past the first. See the cross-PR slot-fence
-// sqlc.arg-disambiguates-cursor memory; the same
+// Optional ?deployment_scope= server-side filter lands via
+// `cursor_deployment_scope` (issue #954 / ADR-098 amendment).
+// Empty string means "no filter; return all deployments"
+// — the wide-open default. Setting a non-empty value restricts
+// to one deployment. Mirrors the existing ?scope= discipline.
+//
+// sqlc.arg(...)::type casts disambiguate the cursor params
+// — without them sqlc named both fields `CreatedAt` (taken
+// from the SELECT list) and the generated Go wrapper bound a
+// timestamptz to the $3 uuid slot, tripping a type error on
+// every cursor page past the first. See the cross-PR slot-
+// fence sqlc.arg-disambiguates-cursor memory; the same
 // pattern pins ListAppErrorGroups.
 func (q *Queries) ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error) {
 	rows, err := db.Query(ctx, listDataUpstreamsByApp,
 		arg.AppID,
+		arg.CursorDeploymentScope,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.PageLimit,
@@ -2651,6 +2671,7 @@ func (q *Queries) ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListD
 			&i.AppID,
 			&i.Source,
 			&i.Scope,
+			&i.DeploymentScope,
 			&i.Kind,
 			&i.Host,
 			&i.Port,

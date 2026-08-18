@@ -1623,10 +1623,17 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// PreferredRegion → legacy tie-break. The refresh error is
 	// logged + swallowed so a transient DB hiccup doesn't break
 	// the legacy chooser.
-	preferredRegion, _, _ := e.upstreamAffinity.Score(appID)
+	//
+	// ADR-098 amendment (issue #954): the cache key widens to
+	// (appID, deploymentScope) so each deployment reads its own
+	// probe bias — staging and prod stay independent. dep.ID
+	// is already in scope here; the empty-string fallback at
+	// appDeploymentKeyOf covers the cold-path branch where dep
+	// is nil (legacy callers).
+	preferredRegion, _, _ := e.upstreamAffinity.Score(appID, dep.ID)
 	if preferredRegion == "" && e.upstreamAffinity != nil {
-		if rerr := e.upstreamAffinity.Refresh(ctx, acct.ID, appID); rerr == nil {
-			preferredRegion, _, _ = e.upstreamAffinity.Score(appID)
+		if rerr := e.upstreamAffinity.Refresh(ctx, acct.ID, appID, dep.ID); rerr == nil {
+			preferredRegion, _, _ = e.upstreamAffinity.Score(appID, dep.ID)
 		} else {
 			// best-effort: log at debug, fall through to legacy
 			e.log.Debug("upstream affinity refresh failed; using legacy chooser", "app", appID, "err", rerr)

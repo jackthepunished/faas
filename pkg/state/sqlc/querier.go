@@ -137,7 +137,9 @@ type Querier interface {
 	GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErrorSampleParams) (GetAppErrorSampleRow, error)
 	// Single-row read for the dashboard's "edit upstream"
 	// pane (PR-B). Cursor-safe: no pagination; the handler
-	// reads the row directly.
+	// reads the row directly. Projects the new deployment_scope
+	// column (issue #954) so the typed DataUpstream.DeploymentScope
+	// in pkg/state/types.go round-trips through sqlc.
 	GetDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) (GetDataUpstreamByIDRow, error)
 	// Returns the bytea secret for the given installation_id. The
 	// daemon-side resolver treats pgx.ErrNoRows as fail-closed (the
@@ -229,12 +231,15 @@ type Querier interface {
 	// Dedupe-merge INSERT for data_upstreams. Mirrors the
 	// IncrementAppError ON CONFLICT pattern (queries.sql:906).
 	// The handler (PR-B's cmd/apid/extract.go) targets
-	// data_upstreams_dedupe_uniq on (app_id, scope, kind,
-	// host, port). On conflict: bump last_seen_at; refresh
-	// last_rtt_ms / last_probed_at / declared_region from
-	// EXCLUDED so the freshest classifier observation wins.
-	// id is caller-supplied (uuidv7) so the row identity is
-	// stable across the dedupe-merge.
+	// data_upstreams_dedupe_uniq on (app_id, scope,
+	// deployment_scope, kind, host, port) per ADR-098 amendment
+	// (issue #954 / 00281_data_upstreams_deployment_scope.sql).
+	// On conflict: bump last_seen_at; refresh last_rtt_ms /
+	// last_probed_at / declared_region / deployment_scope
+	// from EXCLUDED so a re-classification re-stamps the
+	// deployment overlay on the latest observation. id is
+	// caller-supplied (uuidv7) so the row identity is stable
+	// across the dedupe-merge.
 	InsertDataUpstream(ctx context.Context, db DBTX, arg InsertDataUpstreamParams) (pgtype.UUID, error)
 	// meterd's probe loop writer (PR-C). One row per
 	// (host_redacted_hash, region) per 30s sample. The
@@ -337,13 +342,18 @@ type Querier interface {
 	// data_upstreams is a stable list, not a hot recency
 	// list. Index path: data_upstreams_app_created_idx.
 	//
-	// sqlc.arg(...)::type casts disambiguate the two cursor
-	// params — without them sqlc named both fields
-	// `CreatedAt` (taken from the SELECT list) and the
-	// generated Go wrapper bound a timestamptz to the $3
-	// uuid slot, tripping a type error on every cursor page
-	// past the first. See the cross-PR slot-fence
-	// sqlc.arg-disambiguates-cursor memory; the same
+	// Optional ?deployment_scope= server-side filter lands via
+	// `cursor_deployment_scope` (issue #954 / ADR-098 amendment).
+	// Empty string means "no filter; return all deployments"
+	// — the wide-open default. Setting a non-empty value restricts
+	// to one deployment. Mirrors the existing ?scope= discipline.
+	//
+	// sqlc.arg(...)::type casts disambiguate the cursor params
+	// — without them sqlc named both fields `CreatedAt` (taken
+	// from the SELECT list) and the generated Go wrapper bound a
+	// timestamptz to the $3 uuid slot, tripping a type error on
+	// every cursor page past the first. See the cross-PR slot-
+	// fence sqlc.arg-disambiguates-cursor memory; the same
 	// pattern pins ListAppErrorGroups.
 	ListDataUpstreamsByApp(ctx context.Context, db DBTX, arg ListDataUpstreamsByAppParams) ([]ListDataUpstreamsByAppRow, error)
 	ListDeploymentsForApp(ctx context.Context, db DBTX, arg ListDeploymentsForAppParams) ([]ListDeploymentsForAppRow, error)
