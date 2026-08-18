@@ -53,7 +53,7 @@ func tenantSurfaceIssuerFixture(t *testing.T) (*TenantSurfaceCertIssuer, *state.
 			t.Fatal(err)
 		}
 	}
-	issuer := NewTenantSurfaceCertIssuer(m, NewMetrics(), nil)
+	issuer := NewTenantSurfaceCertIssuer(m, NewMetrics(), nil, nil)
 	return issuer, m, surf, ctx
 }
 

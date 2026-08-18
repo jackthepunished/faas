@@ -254,7 +254,16 @@ func certIssuerFor(store state.Store, metrics *gateway.Metrics, enabled bool) ga
 	// The E2E test wires a real LetsEncryptCertIssuer against
 	// LE staging with a stub DNS-01 provider so the production
 	// issuer code path is exercised end-to-end.
-	return gateway.NewTenantSurfaceCertIssuer(store, metrics, nil)
+	//
+	// The auditor param is nil today (PR-D commit 6): wiring
+	// a real *audit.Auditor requires the gatewayd-internal
+	// audit seam that lives outside the scope of this PR
+	// (cmd/apid/audit_subscriber.go handles apid-side audit;
+	// gatewayd-internal has no equivalent writer yet). The
+	// wrapper's emitCertTransition helper is nil-safe so the
+	// state-machine audit calls degrade cleanly until the
+	// gatewayd-internal audit seam lands.
+	return gateway.NewTenantSurfaceCertIssuer(store, metrics, nil, nil)
 }
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd

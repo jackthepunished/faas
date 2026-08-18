@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -73,6 +74,13 @@ type TenantSurfaceCertIssuer struct {
 	// that don't wire a real CA can still exercise the state
 	// machine.
 	le *LetsEncryptCertIssuer
+	// auditor is the per-daemon *audit.Auditor (PR-D commit 6).
+	// Each cert_state transition emits a
+	// tenant_surface.cert_state_changed audit row carrying
+	// {surface_id, from, to, last_error}. nil-safe: a nil
+	// auditor skips the emit (the wrapper still writes the
+	// state transition; only the audit row is skipped).
+	auditor *audit.Auditor
 	// now is the wall-clock source for the cert_not_after
 	// stamp. Tests override to a fixed time.
 	now func() time.Time
@@ -80,12 +88,15 @@ type TenantSurfaceCertIssuer struct {
 
 // NewTenantSurfaceCertIssuer constructs a production issuer. store
 // and metrics may both be nil at test sites; the engine guards on
-// each. now defaults to time.Now UTC when nil.
-func NewTenantSurfaceCertIssuer(store state.Store, metrics *Metrics, le *LetsEncryptCertIssuer) *TenantSurfaceCertIssuer {
+// each. now defaults to time.Now UTC when nil. auditor may be nil
+// — the wrapper skips the audit emit (a unit test that doesn't
+// wire a full auditor can still exercise the state machine).
+func NewTenantSurfaceCertIssuer(store state.Store, metrics *Metrics, le *LetsEncryptCertIssuer, auditor *audit.Auditor) *TenantSurfaceCertIssuer {
 	return &TenantSurfaceCertIssuer{
 		store:   store,
 		metrics: metrics,
 		le:      le,
+		auditor: auditor,
 		now:     func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -104,6 +115,39 @@ func (i *TenantSurfaceCertIssuer) SetNow(now func() time.Time) *TenantSurfaceCer
 func (i *TenantSurfaceCertIssuer) SetLetsEncryptIssuer(le *LetsEncryptCertIssuer) *TenantSurfaceCertIssuer {
 	i.le = le
 	return i
+}
+
+// SetAuditor is the test seam for swapping in a recording
+// auditor that captures emit calls without writing to the
+// audit_events table. Production wires a real *audit.Auditor
+// in cmd/gatewayd-internal/run.go.
+func (i *TenantSurfaceCertIssuer) SetAuditor(a *audit.Auditor) *TenantSurfaceCertIssuer {
+	i.auditor = a
+	return i
+}
+
+// emitCertTransition stamps a tenant_surface.cert_state_changed
+// audit row carrying {surface_id, account_id, from, to,
+// last_error}. nil-safe (a nil auditor is the unit-test path).
+// result carries "success" / "error" so the audit log joins the
+// pkg/audit OTel trace ring on the same key. The wrapper calls
+// this on every transition (none → pending, pending → issued,
+// pending → failed, issued → pending for renewal, etc.) so the
+// dashboard's "Cert health" timeline is the union of the audit
+// rows + the surface row's cert_state column.
+func (i *TenantSurfaceCertIssuer) emitCertTransition(ctx context.Context, surfaceID, accountID string, from, to state.CertState, lastError, result string) {
+	if i.auditor == nil {
+		return
+	}
+	acct := accountID
+	data := map[string]any{
+		"surface_id": surfaceID,
+		"account_id": accountID,
+		"from":       string(from),
+		"to":         string(to),
+		"last_error": lastError,
+	}
+	i.auditor.EmitResult(ctx, "tenant_surface.cert_state_changed", &acct, data, result)
 }
 
 // RequestCertForSurface (CertIssuer contract) re-mints the cert
@@ -161,6 +205,7 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 			CertState: state.CertStateFailed,
 			LastError: errMsg,
 		})
+		i.emitCertTransition(ctx, surf.ID, surf.AccountID, surf.CertState, state.CertStateFailed, errMsg, "error")
 		return state.ErrUnsupportedCertKind
 	}
 	verified, err := i.store.ListVerifiedTenantHostnamesForSurface(ctx, surfaceID)
@@ -174,12 +219,14 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 		// dns_poller will flip at least one hostname to
 		// verified soon and the next pg_notify triggers
 		// another remint.
+		errMsg := "no verified hostnames; publish the _faas-verify TXT record and wait for the poller to flip verified_at"
 		_ = i.store.UpdateTenantSurfaceCert(ctx, state.UpdateSurfaceCertParams{
 			SurfaceID: surf.ID,
 			CertState: state.CertStateFailed,
-			LastError: "no verified hostnames; publish the _faas-verify TXT record and wait for the poller to flip verified_at",
+			LastError: errMsg,
 		})
 		i.metrics.ObserveTenantSurfaceCert("skipped", string(surf.CertKind))
+		i.emitCertTransition(ctx, surf.ID, surf.AccountID, surf.CertState, state.CertStateFailed, errMsg, "error")
 		return nil
 	}
 	// Sort-by-hostname for SAN-set determinism: re-mints
@@ -208,6 +255,7 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 			LastError: errMsg,
 		})
 		i.metrics.ObserveTenantSurfaceCert("skipped", string(surf.CertKind))
+		i.emitCertTransition(ctx, surf.ID, surf.AccountID, surf.CertState, state.CertStateFailed, errMsg, "error")
 		return nil
 	}
 	// Flip cert_state=pending BEFORE the certmagic call so the
@@ -225,6 +273,7 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 	}); err != nil {
 		return fmt.Errorf("gateway: flip to pending for surface %s: %w", surf.ID, err)
 	}
+	i.emitCertTransition(ctx, surf.ID, surf.AccountID, surf.CertState, state.CertStatePending, "", "success")
 	// Nil-safe degradation: if le is nil (the test-only path
 	// or a misconfigured boot), we still flip to failed with
 	// a clear last_error so the wiring is visible without
@@ -237,6 +286,7 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 			LastError: errMsg,
 		})
 		i.metrics.ObserveTenantSurfaceCert("failed", string(surf.CertKind))
+		i.emitCertTransition(ctx, surf.ID, surf.AccountID, state.CertStatePending, state.CertStateFailed, errMsg, "error")
 		return nil
 	}
 	// CA call. IssueSet mints per-host certs and returns the
@@ -244,12 +294,14 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 	// value stamped on the surface's cert_not_after column.
 	notAfter, err := i.le.IssueSet(ctx, hostnames)
 	if err != nil {
+		errMsg := fmt.Sprintf("certmagic IssueSet: %v", err)
 		_ = i.store.UpdateTenantSurfaceCert(ctx, state.UpdateSurfaceCertParams{
 			SurfaceID: surf.ID,
 			CertState: state.CertStateFailed,
-			LastError: fmt.Sprintf("certmagic IssueSet: %v", err),
+			LastError: errMsg,
 		})
 		i.metrics.ObserveTenantSurfaceCert("failed", string(surf.CertKind))
+		i.emitCertTransition(ctx, surf.ID, surf.AccountID, state.CertStatePending, state.CertStateFailed, errMsg, "error")
 		return fmt.Errorf("gateway: IssueSet for surface %s: %w", surf.ID, err)
 	}
 	if err := i.store.UpdateTenantSurfaceCert(ctx, state.UpdateSurfaceCertParams{
@@ -261,5 +313,6 @@ func (i *TenantSurfaceCertIssuer) RequestCertForSurface(ctx context.Context, sur
 		return fmt.Errorf("gateway: flip to issued for surface %s: %w", surf.ID, err)
 	}
 	i.metrics.ObserveTenantSurfaceCert("issued", string(surf.CertKind))
+	i.emitCertTransition(ctx, surf.ID, surf.AccountID, state.CertStatePending, state.CertStateIssued, "", "success")
 	return nil
 }
