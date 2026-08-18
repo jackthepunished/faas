@@ -121,7 +121,16 @@ func TestSetComputeNodeRole_PgStore_AllowList(t *testing.T) {
 	}
 	s := state.NewPgStore(pool)
 
-	node, err := s.CreateComputeNode(ctx, state.ComputeNode{Name: "role-pg-" + uuid.NewString()[:8], TargetURL: "unix:///run/vmmd.sock", Active: true})
+	node, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name:               "role-pg-" + uuid.NewString()[:8],
+		TargetURL:          "unix:///run/vmmd.sock",
+		VPCPUs:             1,
+		MemMB:              1024,
+		MaxConcurrency:     1,
+		AdmissionCeilingMB: 512,
+		VCPUBudget:         1,
+		Active:             true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +195,7 @@ func TestSetComputeNodeRole_PgStore_RowMissing(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	s := state.NewPgStore(pool)
-	if err := s.SetComputeNodeRole(ctx, "deadbeef-no-such-row", "control-plane"); !errors.Is(err, state.ErrNotFound) {
+	if err := s.SetComputeNodeRole(ctx, uuid.NewString(), "control-plane"); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("missing row: got %v, want ErrNotFound", err)
 	}
 }
