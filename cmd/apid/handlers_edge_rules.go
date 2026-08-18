@@ -30,14 +30,20 @@ import (
 // keeps goconst quiet without sacrificing readability of the
 // audit map literal.
 const (
-	auditKeyRuleID       = "rule_id"
-	auditKeyAppID        = "app_id"
-	auditKeyMatchHost    = "match_host"
-	auditKeyMatchPath    = "match_path"
-	auditKeyMatchMethods = "match_methods"
-	auditKeyPriority     = "priority"
-	auditKeyEnabled      = "enabled"
-	auditKeyKind         = "kind"
+	auditKeyRuleID         = "rule_id"
+	auditKeyAppID          = "app_id"
+	auditKeyMatchHost      = "match_host"
+	auditKeyMatchPath      = "match_path"
+	auditKeyMatchMethods   = "match_methods"
+	auditKeyPriority       = "priority"
+	auditKeyEnabled        = "enabled"
+	auditKeyKind           = "kind"
+	auditKeyDeploymentID   = "deployment_id"
+	auditKeyBuildID        = "build_id"
+	auditKeyRepo           = "repo"
+	auditKeyRef            = "ref"
+	auditKeySourceBytes    = "source_bytes"
+	auditKeyTrustRoot      = "trust_root"
 )
 
 // edgeRuleResponse builds the wire shape. Action is re-marshalled

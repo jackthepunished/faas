@@ -1746,7 +1746,7 @@ func (s *server) loadDomain(w http.ResponseWriter, r *http.Request, acct state.A
 func (s *server) domainResponseWithCert(ctx context.Context, d state.CustomDomain) (api.CustomDomainResponse, error) {
 	resp := domainResponse(d)
 	if !d.Verified() {
-		resp.CertStatus = "pending"
+		resp.CertStatus = certStatusPending
 		return resp, nil
 	}
 	cert, err := dialCert(ctx, d.Domain)
@@ -1756,7 +1756,7 @@ func (s *server) domainResponseWithCert(ctx context.Context, d state.CustomDomai
 	}
 	resp.CertNotAfter = cert.NotAfter.UTC().Format(time.RFC3339)
 	resp.CertSANs = cert.DNSNames
-	resp.CertStatus = "issued"
+	resp.CertStatus = certStatusIssued
 	return resp, nil
 }
 

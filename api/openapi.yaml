@@ -3663,7 +3663,7 @@ paths:
         in: path
         required: true
         schema: { type: string, pattern: '^[a-z0-9.\-]+$' }
-        description: The custom domain string (e.g. `app.example.com`).
+        description: The custom domain to re-verify (e.g. `app.example.com`). The same shape as the GET path; verify walks DNS + cert while show returns the durable row.
     post:
       tags: [domains]
       operationId: verifyDomain

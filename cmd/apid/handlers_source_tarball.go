@@ -70,9 +70,18 @@ func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Reques
 
 	// ParseMultipartForm returns the whole body into memory up to
 	// maxMemory; beyond that the rest spills to disk under
-	// os.TempDir(). The actual size gate is the post-decode
-	// SourceTarballMaxMB check inside validateAndSpool.
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// os.TempDir(). The actual size gate is the upstream
+	// http.MaxBytesReader (line above) + the Content-Length pre-
+	// check, both of which trip CodeSourceTooLarge before this
+	// call. The 32 MiB in-memory budget here is the multipart
+	// parser's "spill to disk after this many bytes" cap, not the
+	// request-body cap.
+	//
+	// gosec G120 flags this as "unbounded form parsing" — false
+	// positive: the upstream MaxBytesReader bound is the request-
+	// body cap. The //nolint:gosec directive documents the
+	// reasoning; remove only if the upstream cap is removed.
+	if err := r.ParseMultipartForm(32 << 20); err != nil { //nolint:gosec // see comment above
 		// MaxBytesReader surfaces an oversize body as
 		// *http.MaxBytesError on the multipart parser.
 		var mbErr *http.MaxBytesError
@@ -157,12 +166,12 @@ func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account
 		"source_bytes", sourceBytes,
 	)
 	s.audit.Emit(ctx, "deploy.local_tarball", &acct.ID, map[string]any{
-		"app_id":        app.ID,
-		"deployment_id": res.DeploymentID,
-		"build_id":      res.BuildID,
-		"repo":          sidecar.Repo,
-		"ref":           sidecar.Ref,
-		"source_bytes":  sourceBytes,
-		"trust_root":    "cli",
+		auditKeyAppID:        app.ID,
+		auditKeyDeploymentID: res.DeploymentID,
+		auditKeyBuildID:      res.BuildID,
+		auditKeyRepo:         sidecar.Repo,
+		auditKeyRef:          sidecar.Ref,
+		auditKeySourceBytes:  sourceBytes,
+		auditKeyTrustRoot:    "cli",
 	})
 }

@@ -65,6 +65,15 @@ var errCDNCert = errors.New("port-443 cert does not include target domain")
 // refused by upstream CDN".
 var errCertFailure = errors.New("cert dial failed")
 
+// CertStatus tokens rendered on the CustomDomainResponse.CertStatus
+// wire field. Pulled into named consts so goconst (package-wide)
+// stops tripping on the literal "pending" / "issued" used across
+// handlers_ext.go + the dialCert call sites.
+const (
+	certStatusIssued = "issued"
+	certStatusPending = "pending"
+)
+
 // dialCertTimeout is the upper bound on dialCert. Matches the
 // DNSVerifier timeout (5s) so the verify endpoint never blocks past
 // the request budget. A misconfigured DNS server (the most common
@@ -83,9 +92,12 @@ var dialCertFunc = func(ctx context.Context, domain string) (*x509.Certificate, 
 	dialer := &net.Dialer{Timeout: dialCertTimeout}
 	rawConn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(domain, "443"))
 	if err != nil {
-		return nil, fmt.Errorf("%w: dial %s:443: %v", errCertFailure, domain, err)
+		return nil, fmt.Errorf("dial %s:443: %w", domain, joinErr(errCertFailure, err))
 	}
-	conn := tls.Client(rawConn, &tls.Config{ServerName: domain})
+	conn := tls.Client(rawConn, &tls.Config{
+		ServerName: domain,
+		MinVersion: tls.VersionTLS12, // gosec G402 — refuse TLS 1.0/1.1 handshakes.
+	})
 	// Bound the handshake too — a peer that accepts TCP but never
 	// completes the TLS handshake would otherwise hold the
 	// goroutine until the request budget kicks in elsewhere.
@@ -93,12 +105,12 @@ var dialCertFunc = func(ctx context.Context, domain string) (*x509.Certificate, 
 	defer hsCancel()
 	if err := conn.HandshakeContext(hsCtx); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("%w: tls handshake %s: %v", errCertFailure, domain, err)
+		return nil, fmt.Errorf("tls handshake %s: %w", domain, joinErr(errCertFailure, err))
 	}
 	defer func() { _ = conn.Close() }()
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		return nil, fmt.Errorf("%w: no peer certs for %s", errCertFailure, domain)
+		return nil, fmt.Errorf("no peer certs for %s: %w", domain, errCertFailure)
 	}
 	leaf := state.PeerCertificates[0]
 	// CDN detection: if the leaf cert doesn't include the target
@@ -163,4 +175,25 @@ func sanContains(sans []string, domain string) bool {
 		}
 	}
 	return false
+}
+
+// joinErr composes two errors into a single wrapped error that
+// satisfies errors.Is/As for either operand. Required by the
+// errorlint lint rule, which forbids `fmt.Errorf("%w ... %v", a, b)`
+// where `b` is also an error (only the LAST %w wraps; anything else
+// in the chain silently disappears). joinErr keeps both errors
+// in the chain via a multi-errors.Unwrap shim.
+type wrappedPair struct{ a, b error }
+
+func (w *wrappedPair) Error() string { return w.a.Error() + ": " + w.b.Error() }
+func (w *wrappedPair) Unwrap() []error { return []error{w.a, w.b} }
+
+func joinErr(a, b error) error {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return &wrappedPair{a: a, b: b}
 }

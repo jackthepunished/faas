@@ -64,6 +64,7 @@ export type { BillingReconcileResponse } from './models/BillingReconcileResponse
 export type { BillingRetryResponse } from './models/BillingRetryResponse.js';
 export type { BuildExportResponse } from './models/BuildExportResponse.js';
 export type { BuildListResponse } from './models/BuildListResponse.js';
+export type { BuildPlan } from './models/BuildPlan.js';
 export type { BuildProvenanceResponse } from './models/BuildProvenanceResponse.js';
 export type { BuildResponse } from './models/BuildResponse.js';
 export type { ChangeMemberRoleRequest } from './models/ChangeMemberRoleRequest.js';
@@ -234,6 +235,7 @@ export type { Sidecar } from './models/Sidecar.js';
 export type { SLODuration } from './models/SLODuration.js';
 export type { Slug } from './models/Slug.js';
 export type { SourceRefDeployRequest } from './models/SourceRefDeployRequest.js';
+export type { SourceTarballDeployRequest } from './models/SourceTarballDeployRequest.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
 export type { TenantHostnameResponse } from './models/TenantHostnameResponse.js';
