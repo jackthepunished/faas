@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00279_triggers_poison_strategy.sql
+// Migration-apply test for 00283_triggers_poison_strategy.sql
 // (per-trigger Kafka poison-record handling, audit #10 from PR #910).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00279 (no goose
+//  1. Migration set applies cleanly through 00283 (no goose
 //     duplicate-version panic).
 //
 //  2. The triggers.broker_poison_strategy column exists with TEXT
@@ -31,13 +31,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00279_TriggersPoisonStrategy(t *testing.T) {
+func TestMigrations_00283_TriggersPoisonStrategy(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
 	// (1) Apply cleanly.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00278 payload_max and 00279 poison_strategy)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00282 payload_max and 00283 poison_strategy)", err)
 	}
 
 	// (2) Column shape.

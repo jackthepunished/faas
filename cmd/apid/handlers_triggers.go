@@ -1027,7 +1027,7 @@ func (s *server) aggregateTriggerMetrics(ctx context.Context, id string) (api.Tr
 var _ = time.Now
 
 // trigger_records state-machine constants (match the CHECK on
-// trigger_records.state in migrations/00277_triggers.sql). CI
+// trigger_records.state in migrations/00281_triggers.sql). CI
 // lint rule goconst would otherwise flag the per-record status
 // comparisons in aggregateTriggerMetrics as duplicates.
 const (

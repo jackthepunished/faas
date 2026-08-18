@@ -513,7 +513,7 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/orgs/{slug}/keys/{id}":      "RevokeOrgAPIKey",
 	"POST /v1/orgs/{slug}/keys/{id}/rotate": "RotateOrgAPIKey",
 
-// Issue #757 / ADR-100 — unified Trigger primitive. Pin every
+	// Issue #757 / ADR-100 — unified Trigger primitive. Pin every
 	// trigger route; auto-derivation reads either "Triggers" or
 	// "TriggersId<Segment>" depending on whether the path carries
 	// hyphens, and we want the SDK verb surface to be uniform.

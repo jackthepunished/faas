@@ -69,7 +69,7 @@ const (
 )
 
 // BrokerPoisonStrategy is the closed-vocabulary carrier for the
-// audit #10 column added in migration 00279_triggers_poison_strategy.sql.
+// audit #10 column added in migration 00283_triggers_poison_strategy.sql.
 // Pinned by the SQL CHECK on triggers.broker_poison_strategy.
 //
 // Literal-string constants (NOT a Go enum) because pkg/api cannot

@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00278_triggers_payload_max.sql (per-trigger
+// Migration-apply test for 00282_triggers_payload_max.sql (per-trigger
 // payload size cap, audit #7 from PR #910).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00278 (no goose
+//  1. Migration set applies cleanly through 00282 (no goose
 //     duplicate-version panic).
 //
 //  2. The triggers.payload_max_bytes column exists with INT NOT NULL
@@ -30,13 +30,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00278_TriggersPayloadMax(t *testing.T) {
+func TestMigrations_00282_TriggersPayloadMax(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
 	// (1) Apply cleanly.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00277 triggers and 00278 payload_max)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00281 triggers and 00282 payload_max)", err)
 	}
 
 	// (2) Column shape.

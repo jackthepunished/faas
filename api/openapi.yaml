@@ -127,7 +127,7 @@ tags:
       PATCH /v1/apps/{slug}/security (admin + MFA) flips the
       require_signed flag; trusted_signers CRUD manages the
       per-app cosign trusted-publisher list.
-- name: internal
+  - name: internal
     description: |
       Inter-daemon RPC surface (schedd ↔ gatewayd-internal). The
       `invocations:dispatch_batch` endpoint under this tag is
