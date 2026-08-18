@@ -34,12 +34,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
-// inspectUpstreamsUsage is the usage line emitted by the leaf's
-// bad-argv paths. Kept as a const so the test file pins the
-// exact string (a future edit that drifts the wording trips the
-// bad-args test).
-const inspectUpstreamsUsage = "usage: gregale inspect <slug> --upstreams [--scope <scope>] [--json]"
-
 // cmdInspectUpstreams implements `gregale inspect <slug>
 // --upstreams [--scope <scope>] [--json]`. The slug and scope
 // are pre-validated by cmdInspect (the verb-level dispatcher);

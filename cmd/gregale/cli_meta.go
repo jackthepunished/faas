@@ -347,16 +347,15 @@ var cliCommands = []cliCommand{
 		DocSlug:     "inspect",
 		Short:       "Read-only operator surface (inspect <slug> --upstreams [--scope <scope>] [--json])",
 		Positionals: []string{"<slug>"},
-		// The leaf-set today is just --upstreams (ADR-098 §9.A);
-		// future leaves (--env, --crons, --instances) add a
-		// cliSub entry here. The completion backend renders each
-		// cliSub as a verb choice on the inspect verb's own
-		// completion script — `--upstreams` is shown alongside
-		// the future `--env` / `--crons` etc.
-		Subcommands: []cliSub{
-			{Name: "upstreams", Short: "List data upstreams captured for this app (ADR-098 §9.A)", Flags: []cliFlag{
-				{Name: "scope", Short: "filter by scope (forwarded as ?scope=)"},
-			}},
+		// Leaf-selectors are flags on this verb, not positional
+		// sub-verbs (issue #952 UX: `gregale inspect <slug>
+		// --upstreams`). Future leaves (--env, --crons,
+		// --instances) add another `cliFlag` entry below. The
+		// completion backend and man-page renderer read this
+		// Flags block to surface the right verb shape.
+		Flags: []cliFlag{
+			{Name: "upstreams", Short: "List data upstreams captured for this app (ADR-098 §9.A)"},
+			{Name: "scope", Short: "filter by scope (forwarded as ?scope=, used with --upstreams)"},
 		},
 	},
 	{

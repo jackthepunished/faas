@@ -40,9 +40,17 @@ import (
 // upcoming `gregale inspect <slug> --env` / `--crons` /
 // `--instances` leaves (each one is a switch on the leaf set
 // the customer wants to see).
+//
+// inspectUsage is the single source of truth for the verb's
+// usage line. The dispatcher prints it on every bad-args path
+// (missing slug, trailing positional, missing leaf flag) so
+// drift across the three call sites is impossible — the test
+// file pins this exact wording.
+const inspectUsage = "usage: gregale inspect <slug> [--upstreams] [--scope <scope>] [--json]"
+
 func cmdInspect(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale inspect <slug> [--upstreams] [--scope <scope>] [--json]", "inspect")
+		PrintUsage(os.Stderr, inspectUsage, "inspect")
 		return 1
 	}
 	// The slug is always args[0]; flags follow. Mirrors the
@@ -63,7 +71,7 @@ func cmdInspect(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale inspect <slug> [--upstreams] [--scope <scope>] [--json]", "inspect")
+		PrintUsage(os.Stderr, inspectUsage, "inspect")
 		return 1
 	}
 	// At least one leaf flag is required for v1 — the verb without
@@ -71,7 +79,7 @@ func cmdInspect(args []string) int {
 	// own gates). A bare `gregale inspect myapp` exits 1 with
 	// the same usage line, no server call.
 	if !*upstreams {
-		PrintUsage(os.Stderr, "usage: gregale inspect <slug> [--upstreams] [--scope <scope>] [--json]", "inspect")
+		PrintUsage(os.Stderr, inspectUsage, "inspect")
 		return 1
 	}
 	return cmdInspectUpstreams(slug, *scope)
