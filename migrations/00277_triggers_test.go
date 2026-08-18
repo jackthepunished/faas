@@ -1,15 +1,17 @@
 //go:build !no_pg
 
-// Migration-apply test for 00267_triggers.sql (unified Trigger primitive,
+// Migration-apply test for 00277_triggers.sql (unified Trigger primitive,
 // closes #757).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00267 (no goose
-//     duplicate-version panic). Slot 00267 is the next free real
-//     after 00264_deployments_secret_findings (PR #864 closed) —
-//     00265/00266 don't exist on main or any open PR at the time
-//     of this commit. Future renumbering must re-verify
+//  1. Migration set applies cleanly through 00277 (no goose
+//     duplicate-version panic). Slot 00277 is the next free real
+//     after 00276_egress_policy_exceptions (landed on main while
+//     PR #910 was open). PR #910 originally used 00273 (collision
+//     with main's 00273_reserve_slot.sql fence), then 00274 / 00275
+//     collided too — final renumber to 00277/00278/00279 happened
+//     in the post-merge rebase. Future renumbering must re-verify
 //     `git ls-tree origin/main migrations/` after every rebase per
 //     migration-gates-collision-and-replay.md.
 //
@@ -123,19 +125,19 @@ func pinTableExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, table
 	return exists
 }
 
-func TestMigrations_00267_Triggers(t *testing.T) {
+func TestMigrations_00277_Triggers(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00267 should land last.
+	// (1) Run the full migration set. 00277 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00264 secret-findings and 00267 triggers)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00276 egress_policy_exceptions and 00277 triggers)", err)
 	}
 
 	// (2) Tables exist.
 	for _, table := range []string{"triggers", "trigger_records", "trigger_dead_letter"} {
 		if !pinTableExists(t, ctx, pool, table) {
-			t.Errorf("table %q does not exist after migration 00267", table)
+			t.Errorf("table %q does not exist after migration 00277", table)
 		}
 	}
 
@@ -280,8 +282,8 @@ func TestMigrations_00267_Triggers(t *testing.T) {
 // across consecutive runs in the same pgtest schema.
 func pinFixtures(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (accountID, appID string) {
 	t.Helper()
-	accountID = "00000000-0000-0000-0000-000000002267"
-	appID = "00000000-0000-0000-0000-000000012267"
+	accountID = "00000000-0000-0000-0000-000000002277"
+	appID = "00000000-0000-0000-0000-000000012277"
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
 		values ($1, 'scale', 'trigger-pin@example.com')

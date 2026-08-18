@@ -175,7 +175,7 @@ const (
 	NotifyCronChanged       = "cron_changed"
 	NotifyTriggerChanged    = "trigger_changed"
 	// NotifyTriggerReady fires when a row is inserted into
-	// trigger_records (migrations/00273_triggers.sql). schedd's
+	// trigger_records (migrations/00277_triggers.sql). schedd's
 	// dispatch tick consumes via cmd/schedd/main.go's existing
 	// SubscribeWithReconnect block. Listeners:
 	//   - pkg/sched/dispatch_triggers.go (runTriggerTick fan-in

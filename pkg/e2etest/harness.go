@@ -593,7 +593,7 @@ const testDomain = "apps.test.example"
 // before opening the PR per the cross-PR slot precheck pattern.
 //
 // Triggers-mega audit #10: bumped 237 → 275 for the
-// BrokerPoisonStrategy migration (00275_triggers_poison_strategy.sql).
+// BrokerPoisonStrategy migration (00279_triggers_poison_strategy.sql).
 // 275 is the next free integer above the live head (00274
 // payload_max, also in this branch) so a future migration merely
 // bumps this constant again. The discipline (memory:

@@ -256,7 +256,7 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "max_attempts", limits.TriggerMaxAttemptsMax, int(maxAttempts)))
 		return
 	}
-	// Audit finding #7 (migration 00274): per-trigger broker payload
+	// Audit finding #7 (migration 00278): per-trigger broker payload
 	// size cap. Default 6 MiB when the request omits the field.
 	// Surface a plan-level 403 (rather than letting the SQL CHECK
 	// 422 the request) so the response carries the plan cap + the
@@ -270,7 +270,7 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		api.WriteProblem(w, api.ErrPlanTriggerQuota(acct.Plan, "payload_max_bytes", limits.TriggerPayloadMaxBytes, int(payloadMaxBytes)))
 		return
 	}
-	// Audit #10 (migration 00275): kafka-only broker-poison
+	// Audit #10 (migration 00279): kafka-only broker-poison
 	// handling strategy. nil → "commit" default (the previous
 	// hardcoded behaviour; broker offset advances on poison).
 	// The apid handler does not gate this on kind yet — non-kafka
@@ -441,7 +441,7 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		v := int32(*req.PayloadMaxBytes)
 		payloadMaxBytes = &v
 	}
-	// Audit #10 (migration 00275): the apid handler passes the
+	// Audit #10 (migration 00279): the apid handler passes the
 	// pointer straight through; nil = "leave unchanged" via the
 	// SQL coalesce() in the pgstore UpdateTrigger path. Empty
 	// string would be coerced to "commit" but is rejected at the
@@ -802,7 +802,7 @@ func (s *server) batchCreateTrigger(w http.ResponseWriter, r *http.Request, acct
 		if t.PayloadMaxBytes > 0 {
 			pmb = int32(t.PayloadMaxBytes)
 		}
-		// Audit #10 (migration 00275): kafka-only broker-poison
+		// Audit #10 (migration 00279): kafka-only broker-poison
 		// handling strategy. The YAML validator at
 		// pkg/gregalemanifest/manifest.go:Validate rejects
 		// anything outside the closed vocab; an empty string
@@ -1027,7 +1027,7 @@ func (s *server) aggregateTriggerMetrics(ctx context.Context, id string) (api.Tr
 var _ = time.Now
 
 // trigger_records state-machine constants (match the CHECK on
-// trigger_records.state in migrations/00273_triggers.sql). CI
+// trigger_records.state in migrations/00277_triggers.sql). CI
 // lint rule goconst would otherwise flag the per-record status
 // comparisons in aggregateTriggerMetrics as duplicates.
 const (

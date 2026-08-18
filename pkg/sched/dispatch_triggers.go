@@ -45,7 +45,7 @@ import (
 )
 
 // trigger DLQ reason constants (match the CHECK on
-// trigger_dead_letter.reason in migrations/00273_triggers.sql).
+// trigger_dead_letter.reason in migrations/00277_triggers.sql).
 // CI lint rule goconst would otherwise flag the per-reason
 // comparisons in classifyDLQReason() + the path-through call
 // sites as duplicates.
@@ -766,7 +766,7 @@ var _ = slog.Default
 
 // classifyDLQReason maps the gateway's per-record outcome onto
 // one of trigger_dead_letter.reason's CHECK values
-// (migrations/00273_triggers.sql::trigger_dead_letter.reason_check).
+// (migrations/00277_triggers.sql::trigger_dead_letter.reason_check).
 //
 // Audit finding #8: the prior code hardcoded 'max_attempts' for
 // every Status='dead_letter' record AND substring-matched the
