@@ -1,8 +1,8 @@
--- filename: 00285_data_upstreams_deployment_scope.sql
+-- filename: 00286_data_upstreams_deployment_scope.sql
 -- +goose Up
 -- +goose StatementBegin
 
--- 00285_data_upstreams_deployment_scope.sql — ADR-098 amendment
+-- 00286_data_upstreams_deployment_scope.sql — ADR-098 amendment
 -- (issue #954, ADR-098-deployment-scope-overlay). Widen the
 -- data_upstreams dedupe key from (app_id, scope, kind, host, port)
 -- to (app_id, scope, deployment_scope, kind, host, port). Each
@@ -73,7 +73,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS data_upstreams_dedupe_uniq
 -- the chooser reads synchronously at wake, not via pg_notify),
 -- so this widening is dormant today; the down-migration
 -- recreates the 6-field function so a replay still produces
--- the pre-00285 shape on the rollback path.
+-- the pre-00286 shape on the rollback path.
 DROP TRIGGER IF EXISTS data_upstreams_notify_trg ON data_upstreams;
 DROP FUNCTION IF EXISTS data_upstreams_notify();
 
@@ -109,9 +109,9 @@ CREATE TRIGGER data_upstreams_notify_trg
 -- +goose StatementBegin
 
 -- The DOWN reverses the widening in reverse order so a replay-
--- safety second pass yields the original (pre-00285) shape:
+-- safety second pass yields the original (pre-00286) shape:
 --   1. Re-create the 6-field pg_notify function so schedd's
---      pre-00285 parser still works on a downgrade.
+--      pre-00286 parser still works on a downgrade.
 --   2. Re-create the pre-widening unique index on
 --      (app_id, scope, kind, host, port).
 --   3. Drop the column (CASCADE drops the CHECK constraint).
