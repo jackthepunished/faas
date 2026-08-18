@@ -3907,11 +3907,21 @@ func (k DataUpstreamKind) IsValid() bool {
 // sqlc read path projects pgtype.Int4.Valid) is distinguishable from
 // "measured at 0ms".
 type DataUpstream struct {
-	ID               uuid.UUID
-	AccountID        uuid.UUID
-	AppID            uuid.UUID
-	Source           DataUpstreamSource
-	Scope            string
+	ID        uuid.UUID
+	AccountID uuid.UUID
+	AppID     uuid.UUID
+	Source    DataUpstreamSource
+	Scope     string
+	// DeploymentScope is the deployment this upstream belongs to.
+	// ADR-098 amendment (issue #954, migration
+	// 00281_data_upstreams_deployment_scope.sql) widens the dedupe
+	// key to (app_id, scope, deployment_scope, kind, host, port);
+	// default 'default' matches every pre-#954 row + every single-
+	// deployment app. The apid env-classifier resolves the
+	// deployment from the env-scope at PUT time via
+	// pgstore.LiveDeploymentForScope (shim at pgstore.go:4111,
+	// ErrNotFound → defaultEnvScope="default" fallback).
+	DeploymentScope  string
 	Kind             DataUpstreamKind
 	Host             string
 	Port             int

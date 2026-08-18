@@ -15946,11 +15946,16 @@ func (s *PgStore) ListDataUpstreamsByApp(ctx context.Context, arg sqlc.ListDataU
 			probedAt = &t
 		}
 		out = append(out, DataUpstream{
-			ID:               uuidFromPgtype(r.ID),
-			AccountID:        uuidFromPgtype(r.AccountID),
-			AppID:            uuidFromPgtype(r.AppID),
-			Source:           DataUpstreamSource(r.Source),
-			Scope:            r.Scope,
+			ID:        uuidFromPgtype(r.ID),
+			AccountID: uuidFromPgtype(r.AccountID),
+			AppID:     uuidFromPgtype(r.AppID),
+			Source:    DataUpstreamSource(r.Source),
+			Scope:     r.Scope,
+			// DeploymentScope widens the dedupe key in ADR-098
+			// amendment (issue #954). Read-through; the column is
+			// NOT NULL DEFAULT 'default' on the SQL side so the
+			// empty-string default stamp is what backfills land as.
+			DeploymentScope:  r.DeploymentScope,
 			Kind:             DataUpstreamKind(r.Kind),
 			Host:             r.Host,
 			Port:             int(r.Port),
@@ -15983,11 +15988,16 @@ func (s *PgStore) GetDataUpstreamByID(ctx context.Context, id uuid.UUID) (DataUp
 		probedAt = &t
 	}
 	return DataUpstream{
-		ID:               uuidFromPgtype(row.ID),
-		AccountID:        uuidFromPgtype(row.AccountID),
-		AppID:            uuidFromPgtype(row.AppID),
-		Source:           DataUpstreamSource(row.Source),
-		Scope:            row.Scope,
+		ID:        uuidFromPgtype(row.ID),
+		AccountID: uuidFromPgtype(row.AccountID),
+		AppID:     uuidFromPgtype(row.AppID),
+		Source:    DataUpstreamSource(row.Source),
+		Scope:     row.Scope,
+		// DeploymentScope widens the dedupe key in ADR-098
+		// amendment (issue #954). Single-row read so the
+		// DELETE-handler audit site can round-trip the value
+		// into the data_upstream.deleted payload.
+		DeploymentScope:  row.DeploymentScope,
 		Kind:             DataUpstreamKind(row.Kind),
 		Host:             row.Host,
 		Port:             int(row.Port),
@@ -16083,7 +16093,12 @@ type AppUpstreamProbeScore struct {
 }
 
 // ListAppUpstreamProbeScores (ADR-098 PR-D) returns the freshest
-// probe per (data_upstreams.id, region) for the given app.
+// probe per (data_upstreams.id, region) for the given app, scoped
+// to a single deployment. ADR-098 amendment (issue #954) widens
+// the dedupe key to (app_id, scope, deployment_scope, ...); the
+// chooser must therefore scope its probe scan to the deployment
+// the wake targets — a staging deployment should bias on staging
+// probes, not production.
 //
 // SQL shape (hand-rolled, not sqlc — the JOIN with DISTINCT ON
 // is a single statement and adding it via sqlc would require a
@@ -16101,13 +16116,19 @@ type AppUpstreamProbeScore struct {
 //	  LIMIT 1
 //	) p ON true
 //	WHERE u.account_id = $1 AND u.app_id = $2
+//	  AND u.deployment_scope = $3
 //	  AND u.declared_region IS NOT NULL
 //
 // The LATERAL subquery keeps the index-driven lookup hot
 // (data_upstream_probes partitioned by sampled_at, the
 // (host_redacted_hash, sampled_at) index is the probe-loop's
 // hot path). One round-trip per wake.
-func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID string) ([]AppUpstreamProbeScore, error) {
+//
+// deploymentScope is required (no fallback defaulting here —
+// the caller threads dep.ID from engine.go; pkg/sched/engine.go
+// applies defaultDeploymentScope="default" for the cold-path
+// branch where dep is nil).
+func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, appID, deploymentScope string) ([]AppUpstreamProbeScore, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT ON (u.id, p.region)
 		       u.host_redacted_hash, p.region, u.kind, u.port,
@@ -16121,8 +16142,9 @@ func (s *PgStore) ListAppUpstreamProbeScores(ctx context.Context, accountID, app
 			LIMIT 1
 		) p ON true
 		WHERE u.account_id = $1 AND u.app_id = $2
+		  AND u.deployment_scope = $3
 		  AND u.declared_region IS NOT NULL
-	`, accountID, appID)
+	`, accountID, appID, deploymentScope)
 	if err != nil {
 		return nil, err
 	}
