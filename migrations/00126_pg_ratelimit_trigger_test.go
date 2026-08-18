@@ -5,7 +5,7 @@
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00281 (which widens
+//  1. Migration set applies cleanly through 00282 (which widens
 //     scope to include 'rule'; the trigger doesn't depend on the
 //     widening but lives in the same migration file via the
 //     ADR-041 carve-out).

@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00281_pg_ratelimit_add_rule_scope.sql
+// Migration-apply test for 00285_pg_ratelimit_add_rule_scope.sql
 // (ADR-104 amendment 5, issue #881 Phase 4 follow-up).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00281 (no goose
-//     duplicate-version panic). Slot 00281 was picked as the next
+//  1. Migration set applies cleanly through 00285 (no goose
+//     duplicate-version panic). Slot 00285 was picked as the next
 //     safe claim band after PR #958 (issue #951 data_placement
 //     merged at 00271-00276 on main 2026-08-18) and PR #910's
 //     trigger cluster at 00277-00279. Re-verify against open PRs
@@ -27,8 +27,8 @@
 //  5. The CHECK is named `pg_ratelimit_counters_scope_check` —
 //     the auto-name Postgres picks for the inline column CHECK
 //     in 00126. If a future 00126 patch renames the inline
-//     CHECK, this pin + the DROP+ADD in 00281 must update
-//     together (silent breakage here means 00281 becomes a
+//     CHECK, this pin + the DROP+ADD in 00285 must update
+//     together (silent breakage here means 00285 becomes a
 //     no-op — exactly the bug this test exists to catch).
 //  6. Replay safety: re-running db.MigrateUp is a no-op (the
 //     migration is replay-safe via `IF EXISTS` + the plain
@@ -54,13 +54,13 @@ import (
 // migration's IN list is a load-bearing failure mode.
 var ratelimitScopeVocab = []string{"app", "account", "rule"}
 
-func TestMigrations_00281_PgRateLimitAddRuleScope(t *testing.T) {
+func TestMigrations_00285_PgRateLimitAddRuleScope(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00281.
+	// (1) Apply through 00285.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00276 egress_policy and 00281 pg_ratelimit widen)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 00276 egress_policy and 00285 pg_ratelimit widen)", err)
 	}
 
 	// (2) + (5) CHECK constraint shape + constraint name pin.
@@ -97,7 +97,7 @@ func TestMigrations_00281_PgRateLimitAddRuleScope(t *testing.T) {
 		values ('rule', $1, 'scale', 100, now())
 		on conflict (scope, subject_id, plan) do nothing
 	`, dummyRuleID); err != nil {
-		t.Errorf("insert scope='rule': %v (CHECK must accept rule scope after 00281)", err)
+		t.Errorf("insert scope='rule': %v (CHECK must accept rule scope after 00285)", err)
 	}
 	// Clean up so the test is idempotent under pgtest.Open reuse.
 	if _, err := pool.Exec(ctx, `delete from pg_ratelimit_counters where scope = 'rule'`); err != nil {
@@ -131,7 +131,7 @@ func TestMigrations_00281_PgRateLimitAddRuleScope(t *testing.T) {
 	// (6) Replay safety: re-running db.MigrateUp is a no-op.
 	// pgtest.Open drops the schema between tests; on a live
 	// schema goose's StrictMode would skip a no-op migration
-	// that has no real change. The 00281 migration is replay-
+	// that has no real change. The 00285 migration is replay-
 	// safe via `IF EXISTS` on the DROP, so a re-apply on an
 	// already-widened schema must not fail.
 	if err := db.MigrateUp(ctx, pool); err != nil {
