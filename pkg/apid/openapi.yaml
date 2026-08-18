@@ -2425,11 +2425,16 @@ paths:
                 $ref: '#/components/schemas/AppSecretResponse'
                 example: {"key":"DATABASE_URL","sealed_ciphertext":"<base64 x25519+xsalsa20-poly1305 ciphertext>","version":1,"created_at":"2026-07-23T11:25:00Z"}
         # ADR-092 PR-B: 400 carries one of {secret_invalid_key,
-        # env_scope_invalid, env_scope_reserved}.
+        # env_scope_invalid, env_scope_reserved}. Mirrors the env
+        # PUT 400 shape at /v1/apps/{slug}/env/{key} (literal
+        # description + Problem content) — the Python SDK
+        # generator rejects `oneOf: [$ref]` at this level because
+        # the response object needs an explicit description string.
         '400':
-          oneOf:
-            - { $ref: '#/components/responses/ValidationFailed' }
-            - { $ref: '#/components/responses/EnvScopeInvalid' }
+          description: '400 on PUT /v1/apps/{slug}/secrets/{key}?scope=... — any of {secret_invalid_key, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/PlanLimitSecrets' }
         '413': { $ref: '#/components/responses/SecretValueTooLarge' }
@@ -2445,10 +2450,13 @@ paths:
         # secret_not_found uses its own envelope (legacy 400 on
         # "key isn't set"); EnvScopeInvalid is the discriminated
         # shape (400) when the scope query itself is malformed.
+        # Mirror env's DELETE 400 shape (literal description +
+        # Problem content).
         '400':
-          oneOf:
-            - { $ref: '#/components/responses/ValidationFailed' }
-            - { $ref: '#/components/responses/EnvScopeInvalid' }
+          description: '400 on DELETE /v1/apps/{slug}/secrets/{key}?scope=... — any of {secret_invalid_key, secret_not_found, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -2497,11 +2505,15 @@ paths:
                 $ref: '#/components/schemas/RotateAppSecretResponse'
                 example: {"key":"STRIPE_KEY","rotated_at":"2026-08-10T11:37:52.123Z","kid":"age1q..."}
         # ADR-092 PR-B: 400 carries one of {secret_invalid_key,
-        # env_scope_invalid, env_scope_reserved}.
+        # env_scope_invalid, env_scope_reserved}. Mirror env's
+        # POST 400 shape (literal description + Problem content)
+        # — the Python SDK generator rejects `oneOf: [$ref]` at
+        # this level.
         '400':
-          oneOf:
-            - { $ref: '#/components/responses/ValidationFailed' }
-            - { $ref: '#/components/responses/EnvScopeInvalid' }
+          description: '400 on POST /v1/apps/{slug}/secrets/{key}/rotate?scope=... — any of {secret_invalid_key, secret_not_found, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '413': { $ref: '#/components/responses/SecretValueTooLarge' }

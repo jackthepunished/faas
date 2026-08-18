@@ -7,91 +7,81 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="AccountAppSecretResponse")
+from ..types import UNSET, Unset
+
+T = TypeVar("T", bound="ScopedAppSecretResponse")
 
 
 @_attrs_define
-class AccountAppSecretResponse:
-    """One row in `GET /v1/secrets` — a sealed envelope on a specific
-    app (issue #393). Plaintext NEVER appears here: only the
-    age-sealed envelope (base64). `app_id` and `app_slug` let the
-    dashboard render "foo-app / DATABASE_URL" without a parallel
-    `/v1/apps` round-trip. `scope` (ADR-092 PR-B) carries the
-    env-scope the row belongs to; the account-wide list
-    crosses scopes.
+class ScopedAppSecretResponse:
+    """Per-row shape for the nested `secrets_by_scope` response
+    (ADR-092 PR-B, mirror of ADR-090 D3's env_by_scope).
+    Same posture as AppSecretResponse but with an explicit
+    `scope` field that carries the scope name on the wire
+    so a CLI / dashboard can render "scope: staging" without
+    a second lookup. Value is NEVER echoed (same posture as
+    AppSecretResponse).
 
     """
 
-    app_id: str
-    app_slug: str
-    key: str
     scope: str
-    ciphertext: str
-    """base64 age-sealed envelope. Plaintext NEVER appears on this wire."""
+    key: str
     created_at: datetime.datetime
     updated_at: datetime.datetime
+    kid: str | Unset = UNSET
+    """age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before
+    migration 00166."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        app_id = self.app_id
-
-        app_slug = self.app_slug
-
-        key = self.key
-
         scope = self.scope
 
-        ciphertext = self.ciphertext
+        key = self.key
 
         created_at = self.created_at.isoformat()
 
         updated_at = self.updated_at.isoformat()
 
+        kid = self.kid
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "app_id": app_id,
-                "app_slug": app_slug,
-                "key": key,
                 "scope": scope,
-                "ciphertext": ciphertext,
+                "key": key,
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
         )
+        if kid is not UNSET:
+            field_dict["kid"] = kid
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        app_id = d.pop("app_id")
-
-        app_slug = d.pop("app_slug")
-
-        key = d.pop("key")
-
         scope = d.pop("scope")
 
-        ciphertext = d.pop("ciphertext")
+        key = d.pop("key")
 
         created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
 
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
 
-        account_app_secret_response = cls(
-            app_id=app_id,
-            app_slug=app_slug,
-            key=key,
+        kid = d.pop("kid", UNSET)
+
+        scoped_app_secret_response = cls(
             scope=scope,
-            ciphertext=ciphertext,
+            key=key,
             created_at=created_at,
             updated_at=updated_at,
+            kid=kid,
         )
 
-        account_app_secret_response.additional_properties = d
-        return account_app_secret_response
+        scoped_app_secret_response.additional_properties = d
+        return scoped_app_secret_response
 
     @property
     def additional_keys(self) -> list[str]:

@@ -56,7 +56,7 @@ export class EnvService {
         'scope': scope,
       },
       errors: {
-        400: `code: env_scope_invalid — ?scope= failed the EnvScopePattern check (empty, too long, or out-of-shape slug).`,
+        400: `code: env_scope_invalid — ?scope= failed the EnvScopePattern check (empty, too long, or out-of-shape slug). Applies to both env and secrets surfaces (ADR-090 PR-B, ADR-092 PR-B).`,
         401: `code: unauthorized`,
         404: `code: not_found`,
         429: `429. Two response shapes:

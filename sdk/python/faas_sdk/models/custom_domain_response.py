@@ -14,7 +14,11 @@ T = TypeVar("T", bound="CustomDomainResponse")
 
 @_attrs_define
 class CustomDomainResponse:
-    """A custom domain binding: domain string, target app, verification status, and TLS provisioning state."""
+    """A custom domain binding: domain string, target app, verification status, and TLS provisioning state. Issue #961 /
+    Mega-A PR-3 adds `default`, `cert_not_after`, and `cert_sans` for the `gregale domains set-default | verify | show`
+    surface.
+
+    """
 
     domain: str
     app_id: str
@@ -22,6 +26,19 @@ class CustomDomainResponse:
     challenge_token: None | str | Unset = UNSET
     verified_at: datetime.datetime | None | Unset = UNSET
     txt_record: None | str | Unset = UNSET
+    default: bool | Unset = UNSET
+    """True when this domain is the app's default (issue #961 / Mega-A PR-3). Set via `gregale domains set-
+    default`."""
+    cert_not_after: datetime.datetime | None | Unset = UNSET
+    """Issued cert NotAfter (RFC3339 UTC). Populated on verified domains; the `gregale domains show` line below the
+    cert expiry renders against this field."""
+    cert_sans: list[str] | Unset = UNSET
+    """Cert subject alt names (DNSNames). Useful for the `gregale domains show` listing — if the customer's CNAME
+    points at a CDN, the SANs reveal which CDN."""
+    cert_status: None | str | Unset = UNSET
+    """One of `issued` | `pending` | `dial_failed:<reason>`. The show endpoint surfaces this verbatim so the
+    customer can distinguish DNS-not-propagated from cert-not-yet-issued from TLS-handshake-refused. Issue #961 /
+    Mega-A PR-3 code-review round (MED-4)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,6 +68,26 @@ class CustomDomainResponse:
         else:
             txt_record = self.txt_record
 
+        default = self.default
+
+        cert_not_after: None | str | Unset
+        if isinstance(self.cert_not_after, Unset):
+            cert_not_after = UNSET
+        elif isinstance(self.cert_not_after, datetime.datetime):
+            cert_not_after = self.cert_not_after.isoformat()
+        else:
+            cert_not_after = self.cert_not_after
+
+        cert_sans: list[str] | Unset = UNSET
+        if not isinstance(self.cert_sans, Unset):
+            cert_sans = self.cert_sans
+
+        cert_status: None | str | Unset
+        if isinstance(self.cert_status, Unset):
+            cert_status = UNSET
+        else:
+            cert_status = self.cert_status
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -66,6 +103,14 @@ class CustomDomainResponse:
             field_dict["verified_at"] = verified_at
         if txt_record is not UNSET:
             field_dict["txt_record"] = txt_record
+        if default is not UNSET:
+            field_dict["default"] = default
+        if cert_not_after is not UNSET:
+            field_dict["cert_not_after"] = cert_not_after
+        if cert_sans is not UNSET:
+            field_dict["cert_sans"] = cert_sans
+        if cert_status is not UNSET:
+            field_dict["cert_status"] = cert_status
 
         return field_dict
 
@@ -113,6 +158,36 @@ class CustomDomainResponse:
 
         txt_record = _parse_txt_record(d.pop("txt_record", UNSET))
 
+        default = d.pop("default", UNSET)
+
+        def _parse_cert_not_after(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                cert_not_after_type_0 = datetime.datetime.fromisoformat(data)
+
+                return cert_not_after_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        cert_not_after = _parse_cert_not_after(d.pop("cert_not_after", UNSET))
+
+        cert_sans = cast(list[str], d.pop("cert_sans", UNSET))
+
+        def _parse_cert_status(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        cert_status = _parse_cert_status(d.pop("cert_status", UNSET))
+
         custom_domain_response = cls(
             domain=domain,
             app_id=app_id,
@@ -120,6 +195,10 @@ class CustomDomainResponse:
             challenge_token=challenge_token,
             verified_at=verified_at,
             txt_record=txt_record,
+            default=default,
+            cert_not_after=cert_not_after,
+            cert_sans=cert_sans,
+            cert_status=cert_status,
         )
 
         custom_domain_response.additional_properties = d

@@ -8,18 +8,27 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.data_upstream_list_response import DataUpstreamListResponse
 from ...models.problem import Problem
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     slug: str,
+    *,
+    deployment_scope: str | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["deployment_scope"] = deployment_scope
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/v1/apps/{slug}/upstreams".format(
             slug=quote(str(slug), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -69,8 +78,9 @@ def sync_detailed(
     slug: str,
     *,
     client: AuthenticatedClient | Client,
+    deployment_scope: str | Unset = UNSET,
 ) -> Response[DataUpstreamListResponse | Problem]:
-    """List data upstreams on an app.
+    r"""List data upstreams on an app.
 
      Returns every captured (host_redacted_hash, kind, port) tuple
     on the app. The plaintext host NEVER appears in the response —
@@ -81,8 +91,13 @@ def sync_detailed(
     is on the classifier derives entries on env mutation; when OFF
     the table stays empty and the response is `[]`.
 
+    ADR-098 amendment (issue #954): `?deployment_scope=` narrows
+    the list to one deployment so the dashboard can render
+    staging-vs-prod independently. Omitted = \"all deployments\".
+
     Args:
         slug (str):
+        deployment_scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -94,6 +109,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         slug=slug,
+        deployment_scope=deployment_scope,
     )
 
     response = client.get_httpx_client().request(
@@ -107,8 +123,9 @@ def sync(
     slug: str,
     *,
     client: AuthenticatedClient | Client,
+    deployment_scope: str | Unset = UNSET,
 ) -> DataUpstreamListResponse | Problem | None:
-    """List data upstreams on an app.
+    r"""List data upstreams on an app.
 
      Returns every captured (host_redacted_hash, kind, port) tuple
     on the app. The plaintext host NEVER appears in the response —
@@ -119,8 +136,13 @@ def sync(
     is on the classifier derives entries on env mutation; when OFF
     the table stays empty and the response is `[]`.
 
+    ADR-098 amendment (issue #954): `?deployment_scope=` narrows
+    the list to one deployment so the dashboard can render
+    staging-vs-prod independently. Omitted = \"all deployments\".
+
     Args:
         slug (str):
+        deployment_scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -133,6 +155,7 @@ def sync(
     return sync_detailed(
         slug=slug,
         client=client,
+        deployment_scope=deployment_scope,
     ).parsed
 
 
@@ -140,8 +163,9 @@ async def asyncio_detailed(
     slug: str,
     *,
     client: AuthenticatedClient | Client,
+    deployment_scope: str | Unset = UNSET,
 ) -> Response[DataUpstreamListResponse | Problem]:
-    """List data upstreams on an app.
+    r"""List data upstreams on an app.
 
      Returns every captured (host_redacted_hash, kind, port) tuple
     on the app. The plaintext host NEVER appears in the response —
@@ -152,8 +176,13 @@ async def asyncio_detailed(
     is on the classifier derives entries on env mutation; when OFF
     the table stays empty and the response is `[]`.
 
+    ADR-098 amendment (issue #954): `?deployment_scope=` narrows
+    the list to one deployment so the dashboard can render
+    staging-vs-prod independently. Omitted = \"all deployments\".
+
     Args:
         slug (str):
+        deployment_scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -165,6 +194,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         slug=slug,
+        deployment_scope=deployment_scope,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -176,8 +206,9 @@ async def asyncio(
     slug: str,
     *,
     client: AuthenticatedClient | Client,
+    deployment_scope: str | Unset = UNSET,
 ) -> DataUpstreamListResponse | Problem | None:
-    """List data upstreams on an app.
+    r"""List data upstreams on an app.
 
      Returns every captured (host_redacted_hash, kind, port) tuple
     on the app. The plaintext host NEVER appears in the response —
@@ -188,8 +219,13 @@ async def asyncio(
     is on the classifier derives entries on env mutation; when OFF
     the table stays empty and the response is `[]`.
 
+    ADR-098 amendment (issue #954): `?deployment_scope=` narrows
+    the list to one deployment so the dashboard can render
+    staging-vs-prod independently. Omitted = \"all deployments\".
+
     Args:
         slug (str):
+        deployment_scope (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -203,5 +239,6 @@ async def asyncio(
         await asyncio_detailed(
             slug=slug,
             client=client,
+            deployment_scope=deployment_scope,
         )
     ).parsed

@@ -220,6 +220,7 @@ export type { ScalingPolicy } from './models/ScalingPolicy.js';
 export type { ScalingTarget } from './models/ScalingTarget.js';
 export type { ScanResult } from './models/ScanResult.js';
 export type { ScopedAppEnvResponse } from './models/ScopedAppEnvResponse.js';
+export type { ScopedAppSecretResponse } from './models/ScopedAppSecretResponse.js';
 export type { SeatUsageResponse } from './models/SeatUsageResponse.js';
 export type { SecretFinding } from './models/SecretFinding.js';
 export type { SecretKey } from './models/SecretKey.js';
