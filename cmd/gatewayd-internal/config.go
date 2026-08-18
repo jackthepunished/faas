@@ -156,6 +156,34 @@ type Config struct {
 	// POST /v1/compute-nodes flow (no new apid handler — reuses
 	// UpsertComputeNodeFromOperator). Defaults to "".
 	NodeName string `toml:"node_name"`
+
+	// RateLimit configures the opt-in central mode for
+	// pg_ratelimit_counters (ADR-104 amendment 5, issue #881
+	// Phase 4). When Mode = "local" (the default), each
+	// gatewayd-internal serves the rate limit from its
+	// in-process Limiter (the pre-Phase-4 behaviour, unchanged
+	// for back-compat). When Mode = "central", the hot path
+	// consults Postgres on the local-would-reject boundary
+	// case via the CentralBackend interface (see
+	// pkg/gateway/ratelimit_central.go). Multi-replica
+	// clusters SHOULD run Mode = "central" to avoid the
+	// sticky-by-warm-node drift the 00126 schema was created
+	// to solve (ADR-070 bench follow-up). Single-box dev
+	// deployments keep the default and incur no PG round-trips.
+	RateLimit TOMLRateLimitConfig `toml:"ratelimit"`
+}
+
+// TOMLRateLimitConfig is the on-disk shape of the [ratelimit] table.
+// The default Mode is "local" so a missing table reproduces today's
+// byte-for-byte behaviour.
+type TOMLRateLimitConfig struct {
+	// Mode selects the rate-limit counter backend. Accepted values:
+	//   "local"   — in-process Limiter only (default, back-compat)
+	//   "central" — pg-backed counters via CentralBackend (Phase 4)
+	// Any other value is rejected at startup with the
+	// ratelimit.mode field name so an operator can map the
+	// error straight to the TOML key.
+	Mode string `toml:"mode"`
 }
 
 // TOMLTLSConfig is the on-disk TLS subset. Function pointers and derived

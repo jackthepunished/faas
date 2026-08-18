@@ -74,6 +74,15 @@ type Limiter struct {
 	// cost. The maps are dropped in forgetLocked / ForgetAll when
 	// the corresponding ruleKey bucket is forgotten.
 	ruleConsumers map[string]map[string]struct{}
+	// central is the cross-replica counter seam (ADR-104
+	// amendment 5, issue #881 Phase 4). Defaults to
+	// noopCentralBackend{} — every existing constructor sets it,
+	// so behaviour is unchanged for callers that don't thread the
+	// new NewLimiterWithCentral constructor. The hot path
+	// consults central only on the local-would-reject boundary
+	// case (see pkg/gateway/ratelimit_central.go for the
+	// fast-path-cache pattern).
+	central CentralBackend
 }
 
 type bucket struct {
@@ -243,6 +252,7 @@ func NewLimiter() *Limiter {
 		buckets:       map[string]*bucket{},
 		now:           time.Now,
 		ruleConsumers: map[string]map[string]struct{}{},
+		central:       noopCentralBackend{},
 	}
 }
 
@@ -255,7 +265,39 @@ func NewLimiterWithClock(now func() time.Time) *Limiter {
 		buckets:       map[string]*bucket{},
 		now:           now,
 		ruleConsumers: map[string]map[string]struct{}{},
+		central:       noopCentralBackend{},
 	}
+}
+
+// NewLimiterWithCentral returns a Limiter that consults a CentralBackend
+// on the local-would-reject boundary case (ADR-104 amendment 5, issue
+// #881 Phase 4). Pass nil to reproduce the noopCentralBackend default —
+// callers that don't yet thread the [ratelimit] mode TOML knob
+// (cmd/gatewayd-internal/config.go) keep today's byte-for-byte
+// behaviour. Production wiring lives in cmd/gatewayd-internal/run.go.
+//
+// The central field is consulted AFTER the in-process allowToken returns
+// false; the caller must implement the fast-path-cache pattern (see
+// pkg/gateway/ratelimit_central.go for the contract). Setting central
+// alone does NOT change Allow's reject/admit behaviour today — that
+// lands in C3 of the Phase 4 mega-PR cluster.
+func NewLimiterWithCentral(central CentralBackend) *Limiter {
+	l := NewLimiter()
+	if central != nil {
+		l.central = central
+	}
+	return l
+}
+
+// NewLimiterWithCentralAndClock is NewLimiterWithCentral with an
+// injectable clock. Frozen-clock tests that exercise central-mode
+// paths use this constructor (mirrors NewLimiterWithClock).
+func NewLimiterWithCentralAndClock(central CentralBackend, now func() time.Time) *Limiter {
+	l := NewLimiterWithClock(now)
+	if central != nil {
+		l.central = central
+	}
+	return l
 }
 
 // NewLimiterWithLRU returns a limiter that retains at most cap buckets,
@@ -286,11 +328,28 @@ func newLimiterWithLRU(cap int, now func() time.Time) *Limiter {
 		buckets:       map[string]*bucket{},
 		now:           now,
 		ruleConsumers: map[string]map[string]struct{}{},
+		central:       noopCentralBackend{},
 	}
 	if cap > 0 {
 		l.cap = cap
 		l.ll = list.New()
 		l.elems = map[string]*list.Element{}
+	}
+	return l
+}
+
+// NewLimiterWithCentralLRU combines the LRU discipline (Phase 2 cap
+// on the bucket map) with the central-mode backend (Phase 4 cross-
+// replica serialisation). Used by the per-consumer LRU limiter that
+// the rule-scope throttle carries (pkg/gateway/handler.go). The
+// central field can be nil to fall back to the noop backend.
+func NewLimiterWithCentralLRU(cap int, central CentralBackend, now func() time.Time) *Limiter {
+	if now == nil {
+		now = time.Now
+	}
+	l := newLimiterWithLRU(cap, now)
+	if central != nil {
+		l.central = central
 	}
 	return l
 }
