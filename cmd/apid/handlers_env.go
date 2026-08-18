@@ -35,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"time"
 
@@ -91,6 +92,44 @@ func scopeFromQuery(r *http.Request, allowAll bool) (scope string, isAll bool, p
 	}
 	return raw, false, nil
 }
+
+// deploymentScopeFromQuery resolves the optional `?deployment_scope=`
+// query param (ADR-098 amendment, issue #954). Empty string is the
+// "no filter; return all deployments" form — same wire shape as the
+// pre-#954 list endpoint. Any non-empty value must match
+// api.EnvScopePattern (the regex mirrors migration 00281's CHECK
+// data_upstreams_deployment_scope_shape). Malformed values reject
+// as ErrEnvScopeInvalid so the dashboard renders one consistent
+// problem card with the env-scope 400 path.
+//
+// Unlike scopeFromQuery, there is no "__all__" sentinel — the
+// deployment-scope filter is opt-in only; the default empty form
+// already covers the "all deployments" case via the SQL filter
+// (sqlc.arg cursor_deployment_scope IS NULL OR =” → no filter).
+//
+// deploymentScopeQueryParam is the wire-level query-string key
+// for the deployment scope. The gregale CLI / SDK generator
+// hard-code the `deployment_scope` literal — rename carefully.
+const deploymentScopeQueryParam = "deployment_scope"
+
+func deploymentScopeFromQuery(r *http.Request) (string, *api.Problem) {
+	raw := r.URL.Query().Get(deploymentScopeQueryParam)
+	if raw == "" {
+		return "", nil
+	}
+	if len(raw) > api.MaxEnvScopeLen || !envScopeReForDeployment.MatchString(raw) {
+		return "", api.ErrEnvScopeInvalid("deployment_scope must be 3..40 chars, lowercase alnum + dash")
+	}
+	return raw, nil
+}
+
+// envScopeReForDeployment is the compiled EnvScopePattern regex,
+// pre-compiled once for the deployment-scope query param. Uses
+// the same shape as envScopeRe (env-scope validator); kept as a
+// distinct symbol so the deployment-scope path stays
+// independently audited (the validator's "scope is required"
+// rejection would otherwise bleed into the optional filter).
+var envScopeReForDeployment = regexp.MustCompile(api.EnvScopePattern)
 
 // listEnv returns every env var on the app in the requested scope.
 // The VALUE never appears in the GET response (guest-init reads the
@@ -428,19 +467,27 @@ func (s *server) envExistsInScope(c stdctxEnv, accountID, appID, scope, key stri
 	return false, nil
 }
 
-// runEnvClassifier (ADR-098 PR-B / C4) ingests one env mutation
-// through the env-classifier and upserts the resulting rows into
-// data_upstreams. The classifier (pkg/data/infer.go) walks the
-// env row, extracts host + port from the value, hashes the host
-// via pkg/secretbox.HashHost, and shapes the InferredUpstream
-// rows. The insert uses the InsertDataUpstream path (dedupe-
-// merge on (account_id, app_id, scope, kind, host_redacted_hash,
+// runEnvClassifier (ADR-098 PR-B / C4 + amendment issue #954) ingests
+// one env mutation through the env-classifier and upserts the resulting
+// rows into data_upstreams. The classifier (pkg/data/infer.go) walks
+// the env row, extracts host + port from the value, hashes the host
+// via pkg/secretbox.HashHost, and shapes the InferredUpstream rows.
+// The insert uses the InsertDataUpstream path (dedupe-merge on
+// (account_id, app_id, scope, deployment_scope, kind, host_redacted_hash,
 // port)) so a re-PUT of the same DSN is idempotent.
 //
 // §11 invariant: the env plaintext reaches the helper ONLY via
 // the value arg; the classifier hashes the host, the helper
 // inserts only the hash, the plaintext host is dropped on the
 // floor before this function returns.
+//
+// ADR-098 amendment (issue #954): every inferred row stamps
+// DeploymentScope via s.deploymentScopeForEnvRow (resolves the
+// live deployment targeting the env-scope via the existing
+// pgstore.LiveDeploymentForScope shim; falls back to
+// defaultEnvScope="default" on ErrNotFound or empty scope).
+// This is the writer-time contract from
+// docs/adr/098-deployment-scope-overlay.md §D3.
 //
 // Returns the classifier error verbatim — the caller (setEnv)
 // logs + continues (the env row is already persisted; the
@@ -453,6 +500,22 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 	appUUID, err := uuid.Parse(app.ID)
 	if err != nil {
 		return fmt.Errorf("parse app uuid: %w", err)
+	}
+	// Resolve the deployment ONCE per classifier run. The env-
+	// scope is fixed for the whole run (one mutation, one scope),
+	// so a single resolver call covers every inferred row.
+	deploymentScope, err := s.deploymentScopeForEnvRow(ctx, appUUID, scope)
+	if err != nil {
+		// Fail-open on resolver errors: log + fall back to the
+		// migration's DEFAULT 'default' stamp. The classifier
+		// is a best-effort data-plane concern; a transient
+		// LiveDeploymentForScope hiccup must not break env
+		// mutations.
+		s.log.Warn("deploymentScopeForEnvRow resolver failed; falling back to default scope",
+			"app_id", app.ID,
+			"env_scope", logsanitize.Field(scope),
+			"err", err)
+		deploymentScope = defaultEnvScope
 	}
 	classifier := data.NewClassifier(s.log, app.ID)
 	classifier.HashHost = secretbox.HashHost
@@ -520,11 +583,17 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 		// codeql[go/incorrect-integer-conversion]
 		port32 = int32(row.Port)
 		_, err = s.store.InsertDataUpstream(ctx, sqlc.InsertDataUpstreamParams{
-			ID:               state.NewPgtypeUUID(uuid.New()),
-			AccountID:        state.NewPgtypeUUID(acctUUID),
-			AppID:            state.NewPgtypeUUID(appUUID),
-			Source:           string(api.DataUpstreamSourceInferred),
-			Scope:            scope,
+			ID:        state.NewPgtypeUUID(uuid.New()),
+			AccountID: state.NewPgtypeUUID(acctUUID),
+			AppID:     state.NewPgtypeUUID(appUUID),
+			Source:    string(api.DataUpstreamSourceInferred),
+			Scope:     scope,
+			// DeploymentScope widens the dedupe key in ADR-098
+			// amendment (issue #954). Resolved once per run via
+			// s.deploymentScopeForEnvRow; on ErrNotFound falls
+			// back to defaultEnvScope (the migration's SQL
+			// DEFAULT matches this fallback).
+			DeploymentScope:  deploymentScope,
 			Kind:             row.Kind,
 			Host:             row.Host,
 			Port:             port32,
@@ -541,6 +610,7 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 			"account", acct.ID,
 			"kind", row.Kind,
 			"scope", logsanitize.Field(scope),
+			"deployment_scope", logsanitize.Field(deploymentScope),
 			"env_key", logsanitize.Field(key),
 			"host_redacted_hash", hash[:8],
 		)
@@ -548,9 +618,46 @@ func (s *server) runEnvClassifier(ctx context.Context, acct state.Account, app s
 			"app_id":             app.ID,
 			"kind":               row.Kind,
 			"scope":              scope,
+			"deployment_scope":   deploymentScope,
 			"env_key":            key,
 			"host_redacted_hash": hash[:8],
 		})
 	}
 	return nil
+}
+
+// deploymentScopeForEnvRow resolves the deployment-scope stamp for
+// an env-classifier row (ADR-098 amendment, issue #954). The
+// classifier writes data_upstreams rows with a per-deployment
+// dedupe key, and the deployment the env-scope targets is the
+// deployment the captured upstream belongs to.
+//
+// Uses the existing pgstore.LiveDeploymentForScope shim
+// (pkg/state/pgstore.go:4111, backed by partial UNIQUE index
+// deployments_app_scope_live_uniq from migration 00213). On
+// ErrNotFound (no live deployment targets the env-scope, e.g.
+// the customer has not yet created a deployment for that scope)
+// falls back to defaultEnvScope="default" — the migration's SQL
+// DEFAULT 'default' stamp on data_upstreams.deployment_scope
+// matches this fallback. Returns the resolved scope as a string
+// (the shim's dep.Scope is a string already).
+func (s *server) deploymentScopeForEnvRow(ctx context.Context, appUUID uuid.UUID, envScope string) (string, error) {
+	if envScope == "" {
+		// No env-scope → no deployment resolver needed; the
+		// migration DEFAULT handles this case identically.
+		return defaultEnvScope, nil
+	}
+	dep, err := s.store.LiveDeploymentForScope(ctx, appUUID.String(), envScope)
+	if err != nil {
+		// ErrNotFound → fall back to defaultEnvScope (NOT an
+		// error per the writer-time contract on
+		// docs/adr/098-deployment-scope-overlay.md §D3).
+		// Any other error propagates so the caller can
+		// log + degrade (the classifier is best-effort).
+		return defaultEnvScope, err
+	}
+	if dep.Scope == "" {
+		return defaultEnvScope, nil
+	}
+	return dep.Scope, nil
 }
