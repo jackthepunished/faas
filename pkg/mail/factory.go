@@ -45,13 +45,16 @@ const (
 // asked for a live transport.
 var ErrMailerMisconfigured = errors.New("mail: transport misconfigured")
 
-// ErrResendMissingAPIKey / ErrPostmarkMissingToken document the two
+// ErrResendMissingAPIKey / ErrResendMissingFrom /
+// ErrPostmarkMissingToken / ErrPostmarkMissingFrom document the four
 // concrete credential-shape errors NewResendSender / NewPostmarkSender
 // return. They are wrapped by ErrMailerMisconfigured at the factory
 // layer so callers can errors.Is against either shape.
 var (
-	ErrResendMissingAPIKey  = fmt.Errorf("mail: Resend APIKey required")
-	ErrPostmarkMissingToken = fmt.Errorf("mail: Postmark ServerToken required")
+	ErrResendMissingAPIKey  = errors.New("mail: Resend APIKey required")
+	ErrResendMissingFrom    = errors.New("mail: Resend From address required")
+	ErrPostmarkMissingToken = errors.New("mail: Postmark ServerToken required")
+	ErrPostmarkMissingFrom  = errors.New("mail: Postmark From address required")
 )
 
 // SenderFromEnv picks a Sender based on the FAAS_MAIL_TRANSPORT env

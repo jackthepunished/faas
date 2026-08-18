@@ -194,7 +194,17 @@ func TestSecretLeakGuard_FAAS_EnvToLog(t *testing.T) {
 		"FAAS_BUILDER_BASE_PATH":      "path",
 		"FAAS_DEPLOY_BASE_REF":        "identifier",
 		"FAAS_TRUSTED_PUBLISHERS_DIR": "path",
-		"FAAS_MAIL_TRANSPORT":         "enum-shaped transport identifier; see pkg/mail/factory.go:75 (logs the value when unknown — operator-supplied, not a credential)",
+		"FAAS_MAIL_TRANSPORT":         "enum-shaped transport identifier; see pkg/mail/factory.go (logs the value when unknown — operator-supplied, not a credential)",
+		// ADR-115 §D4: the Resend API key + Postmark token are the
+		// load-bearing mail credentials. The Resend key MUST be scoped
+		// to "Sending access" only (not "Full access") in the Resend
+		// dashboard; the tripwire description captures the constraint
+		// so it surfaces in the operator-facing secrets audit. The
+		// From address is on a verified domain (SPF/DKIM records at
+		// the DNS provider; Resend rejects with 403 if unverified).
+		"FAAS_MAIL_RESEND_API_KEY": "secret (Resend API key); ADR-115 §D4 — 'Sending access' scope only in the Resend dashboard",
+		"FAAS_MAIL_POSTMARK_TOKEN": "secret (Postmark server token); mirror of FAAS_MAIL_RESEND_API_KEY for the Postmark fallback transport",
+		"FAAS_MAIL_FROM":           "RFC 5322 sender address; ADR-115 §D3 — domain MUST have SPF + DKIM records at the DNS provider (Resend rejects with 403 on unverified domain)",
 	}
 
 	for _, f := range files {

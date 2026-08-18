@@ -69,7 +69,7 @@ func NewResendSender(cfg ResendConfig) (Sender, error) {
 		return nil, ErrResendMissingAPIKey
 	}
 	if strings.TrimSpace(cfg.From) == "" {
-		return nil, errors.New("mail: Resend From is required")
+		return nil, ErrResendMissingFrom
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.resend.com"

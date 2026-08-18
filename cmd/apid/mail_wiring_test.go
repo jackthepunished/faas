@@ -59,10 +59,10 @@ func (r *recordingSender) snapshot() []mail.Message {
 // and refuse to start (ADR-115 §D5).
 func TestMailFactory_PicksCorrectTransport(t *testing.T) {
 	cases := []struct {
-		name        string
-		env         map[string]string
-		wantType    string // empty = expect nil sender (fail-closed)
-		wantFailIs  error  // non-nil = expect errors.Is(err, sentinel)
+		name       string
+		env        map[string]string
+		wantType   string // empty = expect nil sender (fail-closed)
+		wantFailIs error  // non-nil = expect errors.Is(err, sentinel)
 	}{
 		{
 			name:     "unset-transport-defaults-to-log",

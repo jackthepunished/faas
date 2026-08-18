@@ -27,8 +27,8 @@ func TestSenderFromEnv_FactoryContract(t *testing.T) {
 		name        string
 		env         map[string]string
 		wantType    string // empty = expect nil sender
-		wantErrIs   error   // expected sentinel via errors.Is; nil = no error
-		wantErrWrap error   // expected wrapped sentinel via errors.Is; nil = any
+		wantErrIs   error  // expected sentinel via errors.Is; nil = no error
+		wantErrWrap error  // expected wrapped sentinel via errors.Is; nil = any
 	}{
 		{
 			name:     "unset-defaults-to-log",
@@ -85,6 +85,30 @@ func TestSenderFromEnv_FactoryContract(t *testing.T) {
 			},
 			wantErrIs:   mail.ErrMailerMisconfigured,
 			wantErrWrap: mail.ErrPostmarkMissingToken,
+		},
+		{
+			// ADR-115 §D5: Resend selected with valid APIKey but
+			// empty From also fails closed; the wrapped sentinel
+			// is ErrResendMissingFrom (code-review finding — the
+			// pre-#115 code returned a literal error string that
+			// broke the errors.Is chain).
+			name: "resend-without-from-fails-closed",
+			env: map[string]string{
+				"FAAS_MAIL_TRANSPORT":      "resend",
+				"FAAS_MAIL_RESEND_API_KEY": "re_test_key",
+			},
+			wantErrIs:   mail.ErrMailerMisconfigured,
+			wantErrWrap: mail.ErrResendMissingFrom,
+		},
+		{
+			// ADR-115 §D5: Postmark mirror of the From-branch.
+			name: "postmark-without-from-fails-closed",
+			env: map[string]string{
+				"FAAS_MAIL_TRANSPORT":      "postmark",
+				"FAAS_MAIL_POSTMARK_TOKEN": "pm_test_token",
+			},
+			wantErrIs:   mail.ErrMailerMisconfigured,
+			wantErrWrap: mail.ErrPostmarkMissingFrom,
 		},
 		{
 			// Resend selected, both key + from missing: the key

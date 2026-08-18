@@ -71,7 +71,7 @@ func NewPostmarkSender(cfg PostmarkConfig) (Sender, error) {
 		return nil, ErrPostmarkMissingToken
 	}
 	if strings.TrimSpace(cfg.From) == "" {
-		return nil, errors.New("mail: Postmark From is required")
+		return nil, ErrPostmarkMissingFrom
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.postmarkapp.com"
