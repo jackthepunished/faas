@@ -1029,6 +1029,42 @@ func TestEngineWake_ColdBoot(t *testing.T) {
 	}
 }
 
+// TestEngineWake_EvictedColdIsPermanent pins the lifecycle gate used by the
+// invocation drain. A parked app must be explicitly woken before traffic can
+// create another instance; otherwise a pending invocation can create an
+// unbounded stream of FAILED rows while the app is known to be unavailable.
+func TestEngineWake_EvictedColdIsPermanent(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	parked := state.AppEvictedCold
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &parked}); err != nil {
+		t.Fatalf("park app: %v", err)
+	}
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	_, err := e.Wake(context.Background(), app.ID, "", "")
+	if err == nil {
+		t.Fatal("Wake returned nil for evicted_cold app")
+	}
+	if !errors.Is(err, ErrPermanentWake) {
+		t.Fatalf("Wake error = %v, want ErrPermanentWake", err)
+	}
+	if p := api.AsProblem(err); p == nil || p.Code != api.CodeConflict {
+		t.Fatalf("Wake problem = %v, want conflict problem", p)
+	}
+	if vmm.coldBoots != 0 || vmm.restores != 0 {
+		t.Fatalf("vmmd calls = cold=%d restore=%d, want 0/0", vmm.coldBoots, vmm.restores)
+	}
+	instances, err := store.ListInstancesForApp(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("ListInstancesForApp: %v", err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("instance rows = %d, want 0", len(instances))
+	}
+}
+
 // TestEngineWake_PhaseHistograms_Recorded (ADR-097, P1B) — pinning the
 // schedd-side wake-phase decomposition. A cold-boot wake that takes
 // 50ms inside the fakeVMM RPC must produce a non-zero observation

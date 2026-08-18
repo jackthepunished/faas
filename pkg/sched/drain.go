@@ -21,9 +21,9 @@ import (
 var ErrPermanentInvoke = errors.New("sched: permanent invoke error")
 
 // ErrPermanentWake is the sentinel for wake errors that the drain
-// will never recover from (no such app, app PARKED with no live
-// deployment, account deleted). Surfaced by the engine's Wake
-// implementation; the drain short-circuits to state='failed'.
+// will never recover from (no such app, app PARKED, account deleted).
+// Surfaced by the engine's Wake implementation; the drain short-circuits
+// to state='failed'.
 var ErrPermanentWake = errors.New("sched: permanent wake error")
 
 // ErrDispatchTimeout is the sentinel a wake or invoke path wraps when
@@ -323,8 +323,8 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 	if err != nil {
 		retryAfter := time.Duration(d.retryAfterSeconds) * time.Second
 		// Permanent wake errors short-circuit to state='failed' — a
-		// missing app, a deleted account, or a PARKED app with no
-		// live deployment will not recover by waiting 5s. The engine
+		// missing app, a deleted account, or a PARKED app will not
+		// recover by waiting 5s. The engine
 		// wraps the cause; we use errors.Is so the sentinels survive
 		// any future fmt.Errorf wrapping.
 		if errors.Is(err, ErrPermanentWake) {

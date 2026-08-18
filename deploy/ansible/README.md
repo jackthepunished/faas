@@ -58,8 +58,12 @@ fleet layout changes.
 The XFS `prjquota` requirement and the LVM `lv-system`/`lv-fc`
 naming come from the reference host's `installimage` recipe (the
 financial model ties the snapshot budget to a 2×512 GB RAID-1 layout).
-On hosts without compatible storage the `lvm` and `xfs` roles will
-`fail` with explicit remediation steps — that's intentional.
+The `lvm` role defaults to `faas_storage_layout=auto`: hosts with the
+reference LVM volumes are validated, while provider-native disks such as
+GCP persistent disks use their filesystem directly. Set
+`faas_storage_layout=reference-lvm` when a fleet requires the reference
+layout. The `xfs` role similarly enforces `prjquota` only when `/srv/fc`
+is mounted as a real filesystem.
 
 ## After the reference node hosts the executor
 
