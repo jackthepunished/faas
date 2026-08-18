@@ -63,6 +63,12 @@ const (
 	// service names reused across cmdConnect + the usage hint
 	// (commands2.go) so goconst stops flagging them.
 	svcGithub = "github"
+	// svcRepo is the new Mega-B PR-1 `connect repo` subcommand
+	// selector. Lives alongside svcGithub so the dispatcher's
+	// error message can list both options, and so goconst stops
+	// flagging the "repo" string at the dispatch + the new
+	// commands_connect_repo.go handler.
+	svcRepo = "repo"
 
 	// defaultTemplateHandler is the `handler.handler` value the
 	// function-* templates force into `--handler` (the wire field
@@ -2067,23 +2073,37 @@ func renderUsageSummary(w io.Writer, s api.UsageSummaryResponse) {
 
 func boolPtr(b bool) *bool { return &b }
 
-// cmdConnect implements `gregale connect <service>`. Today only
-// "github" is supported; the flow opens the dashboard's account
-// page where the customer finishes the OAuth + install steps via
-// the slice-8 GitHub App flow.
+// cmdConnect implements `gregale connect <service>`. Two surfaces:
+//
+//   - github: opens the dashboard's account page where the customer
+//     finishes the OAuth + install steps via the slice-8 GitHub App flow.
+//   - repo <owner>/<name>: opens the dashboard's /dashboard/apps/new
+//     wizard pre-filled with the repo. The dashboard handles the
+//     install + bind (PR-3). The CLI never leaves the repo string as
+//     a query parameter unvalidated.
 //
 // We deliberately don't perform the OAuth dance from the CLI:
 // the GitHub App install + bind requires the customer's browser
 // session (GitHub OAuth + repo permissions), and the only state
 // the platform needs (install_id, install_token) belongs in the
 // server, not the CLI's token file.
+//
+// Issue #961 / Mega-B PR-1: `connect repo` widens the trust-root
+// decision. The dashboard is the install-token trust root; the CLI
+// is the source-of-truth root for the deploy input. See
+// docs/adr/0XX-megab-trust-root.md.
 func cmdConnect(args []string) int {
-	if len(args) != 1 {
-		PrintUsage(os.Stderr, "usage: gregale connect github", "connect")
+	if len(args) < 1 {
+		PrintUsage(os.Stderr, "usage: gregale connect {github|repo <owner>/<name>}", "connect")
 		return 1
 	}
 	switch args[0] {
 	case svcGithub:
+		// `connect github` takes no positional args.
+		if len(args) != 1 {
+			PrintUsage(os.Stderr, "usage: gregale connect github", "connect")
+			return 1
+		}
 		if _, err := authedClient(); err != nil {
 			return printErr("Not logged in", err)
 		}
@@ -2101,8 +2121,17 @@ func cmdConnect(args []string) int {
 			return 0
 		}
 		return 0
+	case svcRepo:
+		// The repo subcommand takes a positional <owner>/<name> after
+		// the verb. We invoke the dispatcher with the remaining args
+		// so the subcommand handler can run its own validation +
+		// usage error. The CLI surfaces the URL even when the
+		// customer is not logged in (the dashboard will redirect
+		// them to the login page followed by the wizard — the bind
+		// flow is server-side, no API key required).
+		return cmdConnectRepo(args[1:])
 	default:
-		PrintFail(os.Stderr, "unknown service %q (supported: %s)", args[0], svcGithub)
+		PrintFail(os.Stderr, "unknown service %q (supported: %s, %s)", args[0], svcGithub, svcRepo)
 		return 1
 	}
 }
@@ -2283,6 +2312,23 @@ func dashboardBaseURL(api string) string {
 // dashboardAccountURL is the canonical "connect GitHub" entry point.
 func dashboardAccountURL(api string) string {
 	return dashboardBaseURL(api) + "/dashboard/account"
+}
+
+// dashboardAppsNewURL is the canonical "connect <repo>" entry point.
+// Issue #961 / Mega-B PR-1: the CLI opens the dashboard's new-app
+// wizard pre-filled with the repo's owner/name. The wizard renders
+// the GitHub install + bind flows in the browser so the cookie
+// session stays the install-token trust root.
+//
+// The query parameter is the GitHub-style "owner/name" string the
+// customer already knows. The dashboard wizard decodes it (after
+// sessionAuth) and lists the customer's installable repos for the
+// selected installation. We deliberately do NOT url-encode here:
+// validateRepoSlug already constrained the input to [A-Za-z0-9._-],
+// so any '/' is the inseparable owner/name separator and '-_.'
+// are reserved per RFC 3986 unreserved set.
+func dashboardAppsNewURL(api, ownerRepo string) string {
+	return dashboardBaseURL(api) + "/dashboard/apps/new?repo=" + ownerRepo
 }
 
 // dashboardStatelessURL is the customer-facing landing page for the
