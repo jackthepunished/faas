@@ -29,5 +29,9 @@ export type SourceRefDeployRequest = {
    * Forward-compat field. PR-A only supports `tarball`.
    */
   format?: 'tarball';
+  reason?: string | null;
+  tag?: 'incident_recovery' | 'hotfix' | 'scheduled_maintenance' | 'compliance_hold' | 'partner_request';
+  deployed_by?: string | null;
+  pr_number?: number | null;
 };
 
