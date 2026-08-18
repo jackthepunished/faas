@@ -329,13 +329,7 @@ func TestCmdInspectUpstreams_NoLeafFlag(t *testing.T) {
 // falling through to the default branch. The CLI is the operator's
 // first stop for "why is schedd placing my app there?" — a
 // miss-routed dispatch would silently no-op with no diagnostic.
-//
-// Skipped until the `case "inspect":` arm is added to main.go
-// (commit 3 of this PR); the run() switch is the load-bearing
-// route, and running this test before main.go is wired produces
-// a misleading `unknown command "inspect"` failure.
 func TestRun_DispatchInspectUpstreams(t *testing.T) {
-	t.Skip("dispatch from main.go is wired in commit 3 of issue #952")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/apps/"+inspectSlug+"/upstreams" {
 			http.Error(w, "no", 404)

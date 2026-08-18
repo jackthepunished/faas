@@ -52,6 +52,7 @@ Commands:
   edge-rules   Per-app edge rules (route|rewrite|redirect|headers|cors|jwt|ip; ADR-089)
   env          Pull/push .env <-> sealed secrets (--app <slug>)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
+  inspect      Read-only operator surface (inspect <slug> --upstreams [--scope <scope>] [--json])
   invoke       Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])
   invocations  Per-account invocation ledger (invocations list|get <id> [--replay])
   invitations  Standalone invitation actions (invitations peek <token>|accept <token>)
@@ -226,6 +227,15 @@ func run(args []string) int {
 		// subcommands (`logs`, `sbom`) land there without
 		// touching this switch.
 		return cmdBuild(args[1:])
+	case dispatchInspect:
+		// Issue #952 — `gregale inspect <slug> --upstreams`
+		// (ADR-098 §9.A cluster follow-up). Read-only operator
+		// surface for diagnosing why schedd places a given app
+		// where it does. The verb-level dispatcher lives in
+		// commands_inspect.go; future leaves (--env, --crons)
+		// add their own flag to cmdInspect and a sibling
+		// commands_inspect_<noun>.go file.
+		return cmdInspect(args[1:])
 	case appSlugFallback:
 		// Routes to cmdAppDispatch which knows the new scale/rename
 		// subcommand form and falls back to the legacy flag-form
