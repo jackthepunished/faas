@@ -8006,6 +8006,12 @@ func (m *MemStore) ClaimPaddleOverageWindow(_ context.Context, accountID string,
 // longer in 'pending' under its claimed_by — but we don't error
 // because the terminal state is already correct (someone else
 // completed).
+//
+// Field-name note: `mbSecondsSum` here mirrors the production
+// column `pushed_mb_seconds` (migration 00280). The Sum suffix
+// predates the 00280 rename and is kept for backwards compatibility
+// with the existing memstore test fixtures; the value is the
+// last-completed window's integer stamp, not a cumulative sum.
 func (m *MemStore) CompletePaddleOverageWindow(_ context.Context, accountID string, windowStart time.Time, mbSeconds int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

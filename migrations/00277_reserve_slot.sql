@@ -1,0 +1,36 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00277_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / cross-PR gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path beyond goose writing a row to goose_db_version.
+--
+-- Context: PR #829 (paddle-overage dedupe pushed_mb_seconds)
+-- bumped to slot 00280 because slot 00209 already had a fence
+-- from main after the August 11 main-movement rebase. Slots
+-- 00277/00278/00279 are claimed by open PR #910
+-- (triggers_multi_strategy: 00277_triggers, 00278_triggers_payload_max,
+-- 00279_triggers_poison_strategy). Slot 00277 is also claimed by
+-- open PR #959 (tenant_surfaces_per_host_kind) — a sibling race
+-- against #910. PR #829 is junior on all three. The branch tip
+-- carries these 277/278/279 fences so TestMigrationsContiguous
+-- stays green until the seniors land. When the senior PRs land,
+-- the fences become duplicate-version collisions and the merger
+-- rebases + drops them.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

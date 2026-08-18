@@ -3076,9 +3076,11 @@ type Store interface {
 	// holds the claim (state='pending' with matching claimed_by) is
 	// allowed to complete; a foreign caller sees 0 rows updated
 	// and gets ErrClaimLost so the meterd can decide whether to
-	// alert or silently drop. mb_seconds is stamped on the row for
-	// ops debugging (the merchant dashboard already has the value
-	// in CustomData).
+	// alert or silently drop. mb_seconds is stamped on the row
+	// (column pushed_mb_seconds, added in migration 00280) so ops
+	// can read the wire value directly; the Paddle merchant
+	// dashboard's line item Quantity + CustomData["mb_seconds"]
+	// carry the same value at the merchant side.
 	CompletePaddleOverageWindow(ctx context.Context, accountID string, windowStart time.Time, mbSeconds int64) error
 	// ReapStalePaddleOverageClaims resets pending rows whose
 	// claimed_at is older than olderThan so the next push tick can

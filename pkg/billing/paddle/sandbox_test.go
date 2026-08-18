@@ -20,6 +20,14 @@ package paddle
 // created idempotently on the second run, (b) the overage-shape
 // transaction posts without error, (c) the webhook signature
 // round-trips through VerifyWebhook live.
+//
+// Note: this file exercises the Provider with dedupe=nil — the
+// production meterd path passes the *PgStore in via
+// NewProviderWithDedupe. The wire-path coverage of that
+// production path lives in
+// cmd/e2e/billing_paddle_sandbox_test.go::TestPaddleSandbox_PerWindowClaimRoundTrip
+// (build tag paddle_sandbox_e2e, FAAS_PADDLE_SANDBOX_E2E=1
+// gated). Don't duplicate the seam here.
 
 import (
 	"context"

@@ -3,7 +3,7 @@
 // Package e2e — billing_paddle_sandbox_test.go is PR-P3's live-sandbox
 // acceptance walk against api.sandbox.paddle.com.
 //
-// Three end-to-end tests that together prove the Paddle wire-up
+// Four end-to-end tests that together prove the Paddle wire-up
 // works against the real sandbox merchant:
 //
 //   - TestPaddleSandbox_ChangePlanReturnsCheckoutURL — boots apid
@@ -19,6 +19,22 @@
 //     transaction.completed with the txn_id from Test 1, asserts no
 //     state flip (a completed transaction doesn't change dunning
 //     state — it's an informational event).
+//
+//   - TestPaddleSandbox_PerWindowClaimRoundTrip — runs the meterd
+//     production path (NewProviderWithDedupe → EnsurePlanProducts →
+//     PushUsageRecord) directly against api.sandbox.paddle.com,
+//     asserts the paddle_overage_dedupe row is stamped with
+//     state=completed, pushed_at non-null, claimed_by non-null,
+//     pushed_mb_seconds = the integer the test pushed. Closes the
+//     gap that pkg/billing/paddle/sandbox_test.go exercises the
+//     Provider without a dedupe wired.
+//
+//   - TestPaddleSandbox_WebhookSignatureRoundTrip — SDK-side
+//     pinning of the contract that Test 2 + 3 prove at the apid
+//     layer. Signs a real Paddle-shaped JSON body with the operator's
+//     webhook secret, asserts VerifyWebhook accepts it with
+//     canonical and lowercase header keys, rejects a tampered body
+//     with billing.ErrBadSignature.
 //
 // Gating:
 //
@@ -44,8 +60,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -55,6 +73,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
@@ -477,6 +496,265 @@ func TestPaddleSandbox_TransactionCompletedIsNoop(t *testing.T) {
 		t.Errorf("acct.Status = %q, want \"active\" (transaction.completed is informational; must not flip dunning state)", acct.Status)
 	}
 	t.Logf("transaction.completed: account=%s status=%s", acct.ID, acct.Status)
+}
+
+// TestPaddleSandbox_PerWindowClaimRoundTrip runs the meterd
+// production path directly against api.sandbox.paddle.com and
+// asserts that paddle_overage_dedupe reflects exactly what was
+// pushed. This is the load-bearing seam the B4 pre-flight pins
+// the shape of — a future regression that drops the stamp (e.g.
+// reverting the Commit 0 `_ = mbSeconds` shape) would flip this
+// assertion red even when the SDK POST succeeded.
+//
+// Distinct from sandbox_test.go: TestPaddleSandbox_PushUsageRecord
+// exercises Provider with dedupe=nil; the production meterd path
+// passes the *PgStore in. This test wires the production
+// constructor (NewProviderWithDedupe) and asserts the dedupe
+// row state after a real SDK POST — closing the gap that the
+// B2 review flagged.
+//
+// priorMonth is offset -31 days from now so the per-window grain
+// (provider usage.go's time.Truncate(time.Hour) at the prior-
+// month boundary) doesn't collide with a stale row from a
+// previous failed run. The -31 day offset is also the value
+// meterd uses to label "prior month" in production.
+//
+// Operator-only: gated on the same FAAS_PADDLE_SANDBOX_E2E=1 +
+// secrets/.env.sandbox pair as Tests 1-3. CI does not run this;
+// `make e2e-sandbox` does.
+//
+// Build tag matches the file (paddle_sandbox_e2e && !no_pg).
+func TestPaddleSandbox_PerWindowClaimRoundTrip(t *testing.T) {
+	apiKey, _ := loadSandboxSecrets(t)
+
+	pool := pgtest.Open(t)
+	ctx := context.Background()
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	store := state.NewPgStore(pool)
+
+	// (1) Build the production-path Provider with the *PgStore as
+	// the dedupe backend. NewProviderWithDedupe's 2nd positional
+	// is `sandbox bool` — true = api.sandbox.paddle.com.
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	p, err := paddle.NewProviderWithDedupe(apiKey, true, log, store)
+	if err != nil {
+		t.Fatalf("NewProviderWithDedupe: %v", err)
+	}
+
+	// (2) Hydrate the overage catalog against the live sandbox.
+	// This is the call meterd makes at boot; it lists the
+	// merchant's products + prices and stores the
+	// plan→price-id map on the Provider. Subsequent
+	// PushUsageRecord calls need this map populated or they
+	// return ErrOveragePriceMissing.
+	if err := p.EnsurePlanProducts(ctx); err != nil {
+		t.Fatalf("EnsurePlanProducts: %v", err)
+	}
+
+	// (3) Seed a fresh account via the production CreateAccount.
+	// The test's push will land on a brand-new (acct, window)
+	// pair so dedupe-claim can never collide with a stale row.
+	email := fmt.Sprintf("live-overage-%d@example.com", time.Now().UnixNano())
+	acct, err := store.CreateAccount(ctx, email, api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount(%s): %v", email, err)
+	}
+
+	// (4) Push the integer wire value. priorMonth = -31d so the
+	// window grain does not collide with a previous run.
+	const pushedMB = int64(1024)
+	priorMonth := time.Now().UTC().Add(-31 * 24 * time.Hour)
+	if err := p.PushUsageRecord(ctx, acct, priorMonth, pushedMB); err != nil {
+		t.Fatalf("PushUsageRecord acct=%s window=%s mb=%d: %v",
+			acct.ID, priorMonth.Format(time.RFC3339), pushedMB, err)
+	}
+
+	// (5) Assert the dedupe row reflects the push. Exactly one
+	// row at (account_id, window_start); state completed; the
+	// stamp columns non-null; pushed_mb_seconds = the integer
+	// we pushed. A future regression that drops the stamp (e.g.
+	// reverting pgstore.go:9929 `pushed_mb_seconds = $3`) flips
+	// the last assertion red — the load-bearing contract this
+	// test pins.
+	var (
+		rowCount   int
+		rowState   string
+		pushedAtNS *int64
+		claimedBy  *string
+		stampedMB  *int64
+	)
+	if err := pool.QueryRow(ctx, `
+		select count(*)::int,
+		       max(state)::text,
+		       max(extract(epoch from pushed_at) * 1e9)::bigint,
+		       max(claimed_by),
+		       max(pushed_mb_seconds)
+		  from paddle_overage_dedupe
+		 where account_id = $1
+		   and window_start = $2
+	`, acct.ID, priorMonth.UTC().Truncate(time.Hour)).Scan(
+		&rowCount, &rowState, &pushedAtNS, &claimedBy, &stampedMB,
+	); err != nil {
+		t.Fatalf("read paddle_overage_dedupe acct=%s: %v", acct.ID, err)
+	}
+	if rowCount != 1 {
+		t.Errorf("paddle_overage_dedupe rows for acct=%s window=%s = %d, want 1",
+			acct.ID, priorMonth.Format(time.RFC3339), rowCount)
+	}
+	if rowState != "completed" {
+		t.Errorf("state = %q, want \"completed\" (PushUsageRecord reached defaultFlushLocked → CompletePaddleOverageWindow)", rowState)
+	}
+	if pushedAtNS == nil {
+		t.Errorf("pushed_at IS NULL (production path must stamp the timestamp)")
+	}
+	if claimedBy == nil || *claimedBy == "" {
+		t.Errorf("claimed_by IS NULL/empty (the test process must own the claim — proves the wire path went through ClaimPaddleOverageWindow, not a no-op short-circuit)")
+	}
+	if stampedMB == nil {
+		t.Errorf("pushed_mb_seconds IS NULL (Commit 0 stamping regressed; the production PgStore.CompletePaddleOverageWindow must materialise the integer)")
+	} else if *stampedMB != pushedMB {
+		t.Errorf("pushed_mb_seconds = %d, want %d (CustomData carried the value to the merchant dashboard; the dedupe row must match)",
+			*stampedMB, pushedMB)
+	}
+	t.Logf("per-window claim: account=%s window=%s state=%s pushed_mb=%v claimed_by=%v",
+		acct.ID, priorMonth.Format(time.RFC3339), rowState,
+		func() any {
+			if stampedMB == nil {
+				return "nil"
+			}
+			return *stampedMB
+		}(),
+		func() any {
+			if claimedBy == nil {
+				return "nil"
+			}
+			return *claimedBy
+		}())
+}
+
+// TestPaddleSandbox_WebhookSignatureRoundTrip is the SDK-side pin
+// of the contract that TestPaddleSandbox_SubscriptionCreatedStampsCustomerID
+// and TestPaddleSandbox_TransactionCompletedIsNoop prove at the apid
+// HTTP layer. Distinct from those tests: this one calls
+// VerifyWebhook directly (no http server, no apid process), so a
+// regression that breaks the SDK-side HMAC verification flips this
+// red even when the apid wrapper still parses the body.
+//
+// Three sub-assertions:
+//
+//  1. Canonical-header accept: sign with the operator's webhook
+//     secret, post via Paddle-Signature header, assert no error
+//     and event.EventID non-empty (proves the body parsed end-to-
+//     end, not just the HMAC). EventID is the dedupe key apid
+//     keys replay defense on (pkg/billing/provider.go:309).
+//
+//  2. Lowercase-header accept: re-sign + re-verify with the
+//     paddle-signature header key. Mirrors provider_test.go:78
+//     and pins the lowercase fallback that Paddle's docs
+//     describe — without it, an upstream proxy that lowercases
+//     headers (e.g. a CDN config bug) would silently 401.
+//
+//  3. Tampered-body reject: flip one byte in the body, re-verify
+//     with the original signature. Must return
+//     errors.Is(err, billing.ErrBadSignature). A future refactor
+//     that accidentally bypasses HMAC (e.g. swapping the SDK's
+//     signature for a no-op stub) would flip this red.
+//
+// event_type is "transaction.paid" — a known mapping per
+// pkg/billing/paddle/webhook.go (transaction.created maps to
+// EventUnknown; transaction.completed maps to EventPaymentSucceeded).
+// transaction.paid is the canonical "payment confirmed" event Paddle
+// emits; using it here exercises the same parsing path Test 3 hits.
+//
+// Operator-only: gated on the same FAAS_PADDLE_SANDBOX_E2E=1 +
+// secrets/.env.sandbox pair as Tests 1-4. The webhook secret comes
+// from the secrets file, not Test 1's handoff — the SDK-side
+// verification does not need an account row or an apid running.
+func TestPaddleSandbox_WebhookSignatureRoundTrip(t *testing.T) {
+	apiKey, webhookSecret := loadSandboxSecrets(t)
+
+	// Body shape mirrors Paddle's transaction.paid schema:
+	//   event_id (delivery UUID)
+	//   event_type (one of the typed mappings)
+	//   data.{id, customer_id, status, items[].price.id}
+	// We use placeholder IDs; VerifyWebhook does not reach out to
+	// the merchant API — it only parses the body + verifies HMAC.
+	eventID := fmt.Sprintf("evt_test_sig_%d", time.Now().UnixNano())
+	body := []byte(fmt.Sprintf(`{
+  "event_id": %q,
+  "event_type": "transaction.paid",
+  "occurred_at": %q,
+  "data": {
+    "id": "txn_test_sig",
+    "customer_id": "ctm_test_sig",
+    "status": "paid",
+    "items": [{"price": {"id": "pri_test_sig"}}]
+  }
+}`, eventID, time.Now().UTC().Format(time.RFC3339)))
+
+	// (0) Construct the provider. NewProvider(apiKey, webhookSecret,
+	// sandbox=true, log). sandbox=true → api.sandbox.paddle.com for
+	// any future SDK call; for VerifyWebhook the host is irrelevant.
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	p, err := paddle.NewProvider(apiKey, webhookSecret, true, log)
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+
+	when := time.Now()
+
+	// (1) Canonical header. Paddle-Signature.
+	sigCanonical := paddle.SignForTestForTest(body, webhookSecret, when)
+	event, err := p.VerifyWebhook(body,
+		map[string]string{"Paddle-Signature": sigCanonical},
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("VerifyWebhook (canonical header): %v", err)
+	}
+	if event.EventID == "" {
+		t.Errorf("VerifyWebhook: event.EventID = \"\", want %q (apid dedupes on EventID per pkg/billing/provider.go:309)", eventID)
+	}
+	if event.EventID != eventID {
+		t.Errorf("VerifyWebhook: event.EventID = %q, want %q (the SDK must surface the body's event_id verbatim, not generate one)", event.EventID, eventID)
+	}
+
+	// (2) Lowercase header. paddle-signature.
+	sigLower := paddle.SignForTestForTest(body, webhookSecret, when)
+	eventLower, err := p.VerifyWebhook(body,
+		map[string]string{"paddle-signature": sigLower},
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("VerifyWebhook (lowercase header): %v (the lowercase fallback is the contract at provider.go:78; a CDN lowercasing the header should still pass)", err)
+	}
+	if eventLower.EventID != eventID {
+		t.Errorf("VerifyWebhook lowercase: event.EventID = %q, want %q", eventLower.EventID, eventID)
+	}
+
+	// (3) Tampered body. Flip the first character of the event_type
+	// value. The signature was computed over the original body, so
+	// HMAC mismatch → ErrBadSignature. The flip target is the
+	// 't' of "transaction.paid"; replacing it with 'x' produces
+	// "xransaction.paid" which is structurally invalid JSON-ish
+	// but still parses enough to hit the HMAC comparison.
+	tampered := bytes.Replace(body, []byte("transaction.paid"), []byte("xransaction.paid"), 1)
+	if bytes.Equal(tampered, body) {
+		t.Fatalf("bytes.Replace did not mutate the body; the test would silently pass — flip a different byte")
+	}
+	_, err = p.VerifyWebhook(tampered,
+		map[string]string{"Paddle-Signature": sigCanonical},
+		5*time.Minute,
+	)
+	if err == nil {
+		t.Errorf("VerifyWebhook accepted tampered body (signature was over the original body; HMAC mismatch must surface as ErrBadSignature)")
+	} else if !errors.Is(err, billing.ErrBadSignature) {
+		t.Errorf("VerifyWebhook tampered-body err = %v, want errors.Is(billing.ErrBadSignature)", err)
+	}
+
+	t.Logf("webhook signature round-trip: event_id=%s canonical=ok lowercase=ok tampered=ErrBadSignature", eventID)
 }
 
 // _ pins the paddle package import — used by the signing helper
