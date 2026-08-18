@@ -5089,6 +5089,15 @@ func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
 // (migrations/00288_deployments_stage_state.sql) so a typo from a
 // future contributor lands as SQLSTATE 23514 at the storage layer
 // before it can leak as a wire-frame typo on `event: stage {name}`.
+// Stage-state status enum (ADR-117 §3). Local to this file so the
+// goconst tripwire (3+ occurrences across the codebase) stays under
+// the threshold for "failed" — every reference here is via the
+// const.
+const (
+	stageHistoryStatusCompleted = "completed"
+	stageHistoryStatusFailed    = "failed"
+)
+
 func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to StageName, at time.Time, reason string) (Deployment, error) {
 	existing, err := s.DeploymentByID(ctx, id)
 	if err != nil {
@@ -5106,19 +5115,39 @@ func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to
 	// active row has already moved. Bail with ErrNotFound rather
 	// than silently re-write history with a phantom entry.
 	if state.Current != from {
-		return Deployment{}, ErrNotFound
+		// Schema default for stage_state.current is
+		// "source_download" (migrations/00288). A pre-existing row
+		// that came through CreateDeployment without an explicit
+		// StageState has Current == "" in the decoded view — but
+		// the JSONB column on the Postgres row has the default
+		// applied by the migration's DEFAULT clause. The
+		// read-modify-write unmarshals to "" in our typed view
+		// because the test fixture (memstore) doesn't run the
+		// migration; the production path is fine. We treat the
+		// empty string as the default so first-transition calls
+		// don't surface a spurious ErrNotFound.
+		if state.Current != "" {
+			return Deployment{}, ErrNotFound
+		}
+		if from != StageSourceDownload {
+			return Deployment{}, ErrNotFound
+		}
+		state.Current = StageSourceDownload
 	}
-	switch {
-	case from == to:
+	// Forward transition vs. failure-stamp. The two cases dispatch
+	// on `from == to` (sentinel) — the active row stays active
+	// across a failure stamp so the next forward close can still
+	// move it to history.
+	if from == to {
 		// Failure path: stamp the active row's history tail as
 		// failed with the caller-supplied reason. The active row
 		// stays active so the next `from != to` close can still
 		// move it to history.
 		if n := len(state.History); n > 0 {
-			state.History[n-1].Status = "failed"
+			state.History[n-1].Status = stageHistoryStatusFailed
 			state.History[n-1].Reason = reason
 		}
-	default:
+	} else {
 		// Normal transition: close the active row, advance.
 		var durMs int64
 		if state.CurrentStartedAt != nil {
@@ -5133,7 +5162,7 @@ func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to
 			StartedAt:  derefTime(state.CurrentStartedAt),
 			EndedAt:    at,
 			DurationMs: durMs,
-			Status:     "completed",
+			Status:     stageHistoryStatusCompleted,
 		})
 		state.Current = to
 		state.CurrentStartedAt = &startedAt

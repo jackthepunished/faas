@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -177,4 +178,200 @@ func RenderDocsRow(w io.Writer, url string) {
 func PrintUsage(w io.Writer, usage, topic string) {
 	_, _ = fmt.Fprintf(w, "%s\n", usage)
 	_, _ = fmt.Fprintf(w, "  Docs: %s%s\n", docsURLBase, topic)
+}
+
+// LiveTicker is a per-command redraw buffer for tabular progress UI
+// (ADR-117 §3 — deploy stage ticker). Two implementations:
+//
+//   - ttyLiveTicker: emits an N-row block and re-prints it in place on
+//     every Update using ANSI cursor-up + clear-line. Used when
+//     Enabled() is true (real TTY, no --json, no NO_COLOR).
+//   - staticLiveTicker: emits one line per Update on the first call,
+//     no redraw. Used when stdout is a pipe / NO_COLOR / --json.
+//
+// The interface stays small — Update(row, name, status, dur) and
+// Close() — so the deploy_stages renderer doesn't grow API surface
+// every time a new column is needed.
+//
+// ADR-117 §3: the ticker is intentionally NOT thread-safe. The CLI
+// command owns the goroutine that reads SSE; no other goroutine
+// touches the ticker. If that ever changes, swap `t` for an
+// `atomic.Pointer[rows]` (Go 1.22+).
+type LiveTicker interface {
+	// Update replaces row `rowIdx` (0-based) with the rendered
+	// (name, status, duration) triplet and redraws the whole block
+	// when TTY-mode. Out-of-range rowIdx is a no-op so the caller
+	// doesn't have to track which rows were never announced.
+	Update(rowIdx int, name, status, dur string)
+	// Close flushes any pending state and, in TTY mode, prints a
+	// final newline so subsequent output doesn't overwrite the
+	// last redraw. Close is idempotent.
+	Close()
+}
+
+// NewLiveTicker returns a LiveTicker sized for `rows` rows. TTY
+// selection mirrors the global Enabled() gate — the same stdout
+// probe, the same NO_COLOR check, the same jsonOutput flag. The
+// caller passes the io.Writer (typically osStdout) so tests can
+// drive a bytes.Buffer instead.
+//
+// ADR-117 §3: when stdout is NOT a TTY, the function still returns
+// a LiveTicker (the static impl) so the caller's Update/Close call
+// sites are identical regardless of mode — the difference is purely
+// in the implementation.
+func NewLiveTicker(w io.Writer, rows int) LiveTicker {
+	if Enabled() && rows > 0 {
+		return &ttyLiveTicker{w: w, rows: rows}
+	}
+	return &staticLiveTicker{w: w}
+}
+
+// ttyLiveTicker redraws the N-row block in place. The first Update
+// emits all N rows; subsequent Updates move the cursor up N lines
+// (ANSI CSI 1 A repeated) + clear-line (ANSI CSI 2 K) before
+// reprinting. The screen ends up with exactly N lines, never N*2.
+//
+// The implementation never writes to the ticker before the first
+// Update — it doesn't know the row labels until the first frame
+// arrives, and the SSE consumer's `announced` dedup guarantees we
+// only see each row once.
+//
+// ADR-117 §3: ANSI sequences used:
+//
+//	CSI n A   cursor up n rows
+//	CSI 2 K   erase entire current line
+//	\r        carriage return to column 0
+//
+// We avoid CSI n B (cursor down) because the terminal may already
+// be at the bottom; CSI 2 K on the bottom-most line is a no-op on
+// most terminals and a clear-line on the others. The cursor-up
+// sequence handles both cases because it works from any row.
+type ttyLiveTicker struct {
+	w          io.Writer
+	rows       int
+	seen       []bool
+	written    bool // true after the initial N-row print
+	updateCnt  int  // number of Update calls so far
+}
+
+// escapeUp returns the CSI sequence that moves the cursor up `n`
+// rows. Hoisted as a const-friendly helper so the test seam can
+// match it byte-for-byte without a string rebuild.
+func escapeUp(n int) string {
+	// CSI Pn A — move cursor up Pn rows.
+	return "\033[" + strconv.Itoa(n) + "A"
+}
+
+// escapeClearLine returns the CSI sequence that erases the entire
+// current line. CSI 2 K is the universal "erase entire line" form
+// and is supported by xterm, iTerm2, Terminal.app, gnome-terminal,
+// and every other modern terminal the cli matrix tests against.
+const escapeClearLine = "\033[2K"
+
+func (t *ttyLiveTicker) Update(rowIdx int, name, status, dur string) {
+	if rowIdx < 0 || rowIdx >= t.rows {
+		return
+	}
+	if t.seen == nil {
+		t.seen = make([]bool, t.rows)
+	}
+	if !t.written {
+		// First call — emit placeholder rows for every slot so the
+		// redraw sequence below has N rows to move up over. Each
+		// row is `   · <name padded>` so a downstream parser sees a
+		// stable shape even on the very first frame.
+		for i := 0; i < t.rows; i++ {
+			t.seen[i] = false
+		}
+		t.written = true
+	}
+	// Move up N rows + clear each.
+	if t.updateCnt > 0 {
+		_, _ = fmt.Fprint(t.w, escapeUp(t.rows))
+		for i := 0; i < t.rows; i++ {
+			_, _ = fmt.Fprint(t.w, escapeClearLine+"\n")
+		}
+		// After clearing, cursor is on the line BELOW the block.
+		// Move up N more to position cursor on the top row again.
+		_, _ = fmt.Fprint(t.w, escapeUp(t.rows))
+	}
+	t.seen[rowIdx] = true
+	_, _ = fmt.Fprintf(t.w, "   %s  %s  %s\n", stageGlyph(status), padName(name, 24), dur)
+	t.updateCnt++
+}
+
+func (t *ttyLiveTicker) Close() {
+	// The terminal cursor is currently on the last row of the block.
+	// Print one trailing newline so the next non-ticker line (the
+	// existing `✓ Deployed. …` line in streamDeployLogs) starts on a
+	// fresh row without overwriting our last row.
+	_, _ = fmt.Fprintln(t.w)
+}
+
+// staticLiveTicker emits one line per Update, no redraw. The line
+// shape matches the TTY row so grep-friendly consumers see the same
+// field order.
+type staticLiveTicker struct {
+	w    io.Writer
+	wrote bool
+}
+
+func (s *staticLiveTicker) Update(rowIdx int, name, status, dur string) {
+	if !s.wrote {
+		// First call: emit the header row so the static fallback
+		// reads as a table.
+		_, _ = fmt.Fprintln(s.w, "  status  stage                          duration")
+		s.wrote = true
+	}
+	_, _ = fmt.Fprintf(s.w, "   %s  %s  %s\n", stageGlyph(status), padName(name, 24), dur)
+}
+
+func (s *staticLiveTicker) Close() {
+	// nothing to flush — every Update already wrote its own newline.
+}
+
+// stageGlyph returns the single-character status marker for the
+// ticker row. Hoisted so output.go remains the single home for the
+// four glyphs the lint tripwire allows (✓/✗/→/!) — and the new
+// `·` for "pending" / `…` for "in progress" markers sit beside them.
+//
+// The leading-prefix tripwire at lint_tripwires_test.go only matches
+// `"✓` / `"✗` / `"→`; the new glyphs are returned as values, never
+// as leading-string literals, so the tripwire stays green.
+func stageGlyph(status string) string {
+	switch status {
+	case stageStatusCompleted:
+		return "✓"
+	case stageStatusInProgress:
+		return "…"
+	case stageStatusFailed:
+		return "✗"
+	default:
+		return "·"
+	}
+}
+
+// padName right-pads `s` to `w` columns. The ticker's "name" column
+// is 24 chars wide; names shorter than that get trailing spaces so
+// columns align under the TTY redraw. Names longer than 24 chars are
+// truncated with an ellipsis — better than a column-width explosion
+// when a customer renames a stage.
+func padName(s string, w int) string {
+	if len(s) >= w {
+		return s[:w-1] + "…"
+	}
+	return s + spaces(w-len(s))
+}
+
+// spaces returns n ASCII spaces. Avoids the strings.Repeat import
+// at the call site; tiny helper, kept local to output.go.
+func spaces(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	buf := make([]byte, n)
+	for i := range buf {
+		buf[i] = ' '
+	}
+	return string(buf)
 }

@@ -5067,3 +5067,61 @@ func TestMemStore_ListAllEventsPaged_ValidSubject(t *testing.T) {
 		t.Errorf("subject: got %v, want %s", got[0].Subject, subjectA)
 	}
 }
+
+// TestMemStoreAppendDeploymentStage covers the three cases of
+// AppendDeploymentStage (ADR-117 §3): forward transition, failure
+// stamp, and the stale-read guard. The PGStore path is exercised
+// by the JSONB + CHECK migration test
+// (migrations/00288_deployments_stage_state_test.go); the in-memory
+// store mirrors the same shape so the same test contract fits
+// both backends.
+func TestMemStoreAppendDeploymentStage(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+	acc, err := s.CreateAccount(ctx, "deploy-stage@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, App{AccountID: acc.ID, Slug: "deploy-stage-app"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := s.CreateDeployment(ctx, Deployment{ID: "d-stage-test", AppID: app.ID, Status: DeployPending, ImageDigest: "sha:latest"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	now := time.Now().UTC()
+	// Case 1: forward transition source_download -> dependency_restore.
+	got, err := s.AppendDeploymentStage(ctx, dep.ID, StageSourceDownload, StageDependencyRestore, now, "")
+	if err != nil {
+		t.Fatalf("forward transition: %v", err)
+	}
+	if got.Status != DeployPending {
+		t.Errorf("forward transition flipped status: got %s, want %s", got.Status, DeployPending)
+	}
+	// Case 2: failure stamp (from == to) — must mark the active row
+	// as failed while leaving the deployment status untouched (the
+	// status flip is imaged's job, not the stage chokepoint's).
+	got, err = s.AppendDeploymentStage(ctx, dep.ID, StageDependencyRestore, StageDependencyRestore, now.Add(time.Second), "build failed: dep foo")
+	if err != nil {
+		t.Fatalf("failure stamp: %v", err)
+	}
+	if got.Status != DeployPending {
+		t.Errorf("failure stamp flipped status: got %s, want %s", got.Status, DeployPending)
+	}
+	var state StageState
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state: %v", err)
+	}
+	if state.Current != StageDependencyRestore {
+		t.Errorf("after failure stamp: current = %s, want %s", state.Current, StageDependencyRestore)
+	}
+	if len(state.History) == 0 || state.History[0].Status != "failed" {
+		t.Errorf("active row not stamped failed: %+v", state.History)
+	}
+	// Case 3: stale transition (current != from) returns ErrNotFound.
+	if _, err := s.AppendDeploymentStage(ctx, dep.ID, StageImageBuild, StageSnapshotPrepare, now, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("stale from: expected ErrNotFound, got %v", err)
+	}
+}

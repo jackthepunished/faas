@@ -17,6 +17,7 @@ package builderd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -652,6 +653,23 @@ func (b *Builderd) markFailed(ctx context.Context, depID, buildID string, fc sta
 	// account-DR sweep.
 	if err := b.store.UpdateDeploymentStatus(ctx, depID, state.DeployFailed, msg); err != nil {
 		b.log.Warn("builderd: mark deployment failed", "deployment", depID, "build", buildID, "err", err)
+	}
+	// ADR-117 §3: stamp the active stage as failed so the SSE
+	// `event: stage` consumer on /v1/deployments/{id}/logs emits
+	// `status:"failed"` for the row that was in flight when the
+	// build blew up. Best-effort: stage appends are idempotent on
+	// (current) and never roll back the deployment status flip.
+	// The deployment lookup matches the one in emitBuildSucceeded
+	// (line 619) so we don't have a second store reader.
+	if dep, derr := b.store.DeploymentByID(ctx, depID); derr == nil && len(dep.StageState) > 0 {
+		var ss state.StageState
+		if uerr := json.Unmarshal(dep.StageState, &ss); uerr == nil && ss.Current != "" {
+			if _, serr := b.store.AppendDeploymentStage(ctx, depID, ss.Current, ss.Current, time.Now(), msg); serr != nil {
+				b.log.Warn("builderd: append failed stage", "deployment", depID, "stage", ss.Current, "err", serr)
+			}
+		}
+	} else if derr != nil {
+		b.log.Warn("builderd: stage lookup for failure stamp", "deployment", depID, "err", derr)
 	}
 	// ADR-048 §4: builder-time metering on terminal build
 	// events, success or failure — the box burned cycles

@@ -60,6 +60,137 @@ func TestDeploymentLogsSSE_Pagination(t *testing.T) {
 	}
 }
 
+// TestEmitStageDiff_AllSixStages drives emitStageDiff through the
+// full 6-stage progression the customer sees on a cold-cache deploy.
+// Each tick advances the jsonb stage_state one step; we assert:
+//   - tick 1: `event: stage` for source_download, status=in_progress
+//   - tick 2..6: each tick emits BOTH a completed frame for the prior
+//     stage AND an in_progress frame for the new one
+//   - the announced map dedupes a no-op tick (same raw bytes)
+//   - the active row's failure stamp emits status=failed + reason
+//
+// ADR-117 §3.
+func TestEmitStageDiff_AllSixStages(t *testing.T) {
+	order := []state.StageName{
+		state.StageSourceDownload,
+		state.StageDependencyRestore,
+		state.StageImageBuild,
+		state.StageSecurityScan,
+		state.StageSnapshotPrepare,
+		state.StageReadiness,
+	}
+	announced := make(map[state.StageName]string)
+	var lastRaw []byte
+
+	for i, stage := range order {
+		// Build the jsonb row as imaged would: completed row for
+		// every prior stage + current = `stage`, started_at = now.
+		now := time.Now().UTC()
+		history := make([]state.StageStateItem, 0, i)
+		for j := 0; j < i; j++ {
+			history = append(history, state.StageStateItem{
+				Name:       order[j],
+				StartedAt:  now.Add(-time.Duration(i-j) * time.Second),
+				EndedAt:    now.Add(-time.Duration(i-j-1) * time.Second),
+				DurationMs: 1000,
+				Status:     "completed",
+			})
+		}
+		raw, err := json.Marshal(state.StageState{
+			Current:          stage,
+			CurrentStartedAt: &now,
+			History:          history,
+		})
+		if err != nil {
+			t.Fatalf("tick %d marshal: %v", i, err)
+		}
+
+		buf := httptest.NewRecorder()
+		emitStageDiff(buf, nil, raw, announced, &lastRaw)
+
+		frames := strings.Split(buf.Body.String(), "\n\n")
+		// First tick: 1 in_progress frame. Ticks 2..6: 1 completed
+		// (for prior) + 1 in_progress (for current) = 2 frames. The
+		// trailing empty element from Split is ignored.
+		wantFrames := 1
+		if i > 0 {
+			wantFrames = 2
+		}
+		if got := len(frames) - 1; got != wantFrames {
+			t.Fatalf("tick %d (%s): got %d frames, want %d: %q", i, stage, got, wantFrames, buf.Body.String())
+		}
+
+		// Every frame must be `event: stage\ndata: {...}`.
+		for k, frame := range frames {
+			if frame == "" {
+				continue
+			}
+			if !strings.HasPrefix(frame, "event: stage\ndata: ") {
+				t.Fatalf("tick %d frame %d: bad prefix %q", i, k, frame)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(frame, "event: stage\ndata: ")), &payload); err != nil {
+				t.Fatalf("tick %d frame %d: bad JSON: %v", i, k, err)
+			}
+			if payload["status"] != "in_progress" && payload["status"] != "completed" {
+				t.Fatalf("tick %d frame %d: bad status %v", i, k, payload["status"])
+			}
+		}
+
+		// Idempotent re-poll with same raw bytes must NOT re-emit.
+		buf2 := httptest.NewRecorder()
+		emitStageDiff(buf2, nil, raw, announced, &lastRaw)
+		if buf2.Body.Len() != 0 {
+			t.Fatalf("tick %d idempotent re-poll: expected zero frames, got %q", i, buf2.Body.String())
+		}
+	}
+
+	// Tick 7: flip to failed via builderd path — same from/to.
+		// AppendDeploymentStage stamps the active row with
+		// status=failed + reason; emitStageDiff picks it up on the
+		// next poll and emits one event: stage frame with reason.
+	now := time.Now().UTC()
+	failed := state.StageState{
+		Current:          state.StageReadiness,
+		CurrentStartedAt: &now,
+		History: []state.StageStateItem{
+			{
+				Name: state.StageReadiness, StartedAt: now,
+				EndedAt: now, DurationMs: 0, Status: "failed",
+				Reason: "build failed: image_scan 1 error",
+			},
+		},
+	}
+	failedRaw, _ := json.Marshal(failed)
+	announcedFail := make(map[state.StageName]string)
+	// Pre-seed prior stages so only the failed entry for
+	// StageReadiness emits. StageReadiness itself was never
+	// announced — it failed before its in_progress frame was
+	// observed, so the walk must emit exactly one failed frame.
+	for _, s := range order {
+		if s == state.StageReadiness {
+			continue
+		}
+		announcedFail[s] = "completed"
+	}
+	var lastRawFail []byte
+	buf := httptest.NewRecorder()
+	emitStageDiff(buf, nil, failedRaw, announcedFail, &lastRawFail)
+	out := buf.Body.String()
+	if !strings.Contains(out, `"status":"failed"`) {
+		t.Fatalf("failed frame missing status=failed: %q", out)
+	}
+	if !strings.Contains(out, `"reason":"build failed: image_scan 1 error"`) {
+		t.Fatalf("failed frame missing reason: %q", out)
+	}
+	// And a subsequent tick with the same row must be idempotent.
+	buf2 := httptest.NewRecorder()
+	emitStageDiff(buf2, nil, failedRaw, announcedFail, &lastRawFail)
+	if buf2.Body.Len() != 0 {
+		t.Fatalf("failed idempotent re-poll: expected zero frames, got %q", buf2.Body.String())
+	}
+}
+
 // itoa turns small ints into strings without strconv dependency so
 // the test stays self-contained.
 func itoa(n int) string {

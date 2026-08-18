@@ -4135,15 +4135,28 @@ func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to 
 		}
 	}
 	if state.Current != from {
-		return Deployment{}, ErrNotFound
+		// Schema default for stage_state.current is
+		// "source_download" (migrations/00288). A freshly inserted
+		// row that came through CreateDeployment without an
+		// explicit StageState has Current == "" — treat that as
+		// the default so the first forward transition doesn't
+		// surface a spurious ErrNotFound.
+		if state.Current != "" {
+			return Deployment{}, ErrNotFound
+		}
+		if from != StageSourceDownload {
+			return Deployment{}, ErrNotFound
+		}
+		state.Current = StageSourceDownload
 	}
-	switch {
-	case from == to:
+	// Forward transition vs. failure-stamp. Same shape as
+	// pgstore.AppendDeploymentStage — see the docblock there.
+	if from == to {
 		if n := len(state.History); n > 0 {
-			state.History[n-1].Status = "failed"
+			state.History[n-1].Status = stageHistoryStatusFailed
 			state.History[n-1].Reason = reason
 		}
-	default:
+	} else {
 		var durMs int64
 		if state.CurrentStartedAt != nil {
 			durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
@@ -4157,7 +4170,7 @@ func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to 
 			StartedAt:  derefTime(state.CurrentStartedAt),
 			EndedAt:    at,
 			DurationMs: durMs,
-			Status:     "completed",
+			Status:     stageHistoryStatusCompleted,
 		})
 		state.Current = to
 		state.CurrentStartedAt = &startedAt

@@ -3332,6 +3332,23 @@ paths:
       description: |
         Server-Sent Events stream of build logs. `follow=1` holds the
         connection open until the build completes.
+
+        ADR-117: the stream also publishes one `event: stage` frame
+        per named pipeline stage the customer's deploy passes
+        through. The frame shape is:
+
+            event: stage
+            data: {"name":"<StageName>","started_at":"<RFC3339Nano>","duration_ms":<int64>,"status":"in_progress"|"completed"|"failed"[,"reason":"<string>"]}
+
+        `name` is one of the closed 6-stage vocabulary:
+        `source_download`, `dependency_restore`, `image_build`,
+        `security_scan`, `snapshot_prepare`, `readiness`. The CLI
+        renders the stream as a live ticker on a TTY (ANSI cursor-up
+        redraw) with a static one-line-per-frame fallback when
+        stdout is not a TTY / `--json` is set / `NO_COLOR` is
+        non-empty. Customers wiring their own consumer should treat
+        the frame as additive — the existing `event: log` /
+        `event: status` / `event: end` shapes are unchanged.
       parameters:
         - name: before_seq
           in: query

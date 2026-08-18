@@ -869,8 +869,33 @@ var errBoom = errors.New("simulated opener failure")
 // no-flag deploy path: CreateApp → POST deployment → SSE log stream with a
 // terminal `live` frame so streamDeployLogs exits 0. It records the multipart
 // form fields it saw on the deployment POST via the returned pointers.
+//
+// ADR-117 §3: when the `wantStages` flag is true (the test opted in
+// via a wrapper — see zeroConfigDeployServerWithStages below), the
+// fixture emits one `event: stage` frame per stage before the
+// terminal `event: status {live}`. Each frame is a complete
+// in_progress + completed pair so the CLI ticker has data to render
+// end-to-end. The default `wantStages=false` preserves the prior
+// behaviour for tests that don't care about the ticker (none of the
+// pre-ADR-117 tests break because they don't assert on stage frames).
 func zeroConfigDeployServer(t *testing.T, slug string, gotDockerfile, gotSource *int32, gotRuntime *string) *httptest.Server {
+	return zeroConfigDeployServerWithStages(t, slug, gotDockerfile, gotSource, gotRuntime, false)
+}
+
+// zeroConfigDeployServerWithStages is the variant of
+// zeroConfigDeployServer that also emits the 6-frame ADR-117 stage
+// sequence before the terminal `live`. Used by tests that need to
+// assert the ticker rendered the full block end-to-end.
+func zeroConfigDeployServerWithStages(t *testing.T, slug string, gotDockerfile, gotSource *int32, gotRuntime *string, wantStages bool) *httptest.Server {
 	t.Helper()
+	stages := []string{
+		"source_download",
+		"dependency_restore",
+		"image_build",
+		"security_scan",
+		"snapshot_prepare",
+		"readiness",
+	}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
@@ -895,6 +920,22 @@ func zeroConfigDeployServer(t *testing.T, slug string, gotDockerfile, gotSource 
 		case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
 			w.Header().Set("Content-Type", "text/event-stream")
 			flusher, _ := w.(http.Flusher)
+			if wantStages {
+				// Emit one in_progress + one completed frame per
+				// stage so the CLI ticker has data to render. The
+				// format mirrors the wire shape at
+				// cmd/apid/handlers_ext.go::emitStageFrame.
+				for i, s := range stages {
+					_, _ = fmt.Fprintf(w, "event: stage\ndata: {\"name\":%q,\"started_at\":\"2026-08-18T19:00:00Z\",\"duration_ms\":%d,\"status\":\"in_progress\"}\n\n", s, i*1000)
+					if flusher != nil {
+						flusher.Flush()
+					}
+					_, _ = fmt.Fprintf(w, "event: stage\ndata: {\"name\":%q,\"started_at\":\"2026-08-18T19:00:00Z\",\"duration_ms\":%d,\"status\":\"completed\"}\n\n", s, (i+1)*1000)
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+			}
 			_, _ = fmt.Fprint(w, "event: status\ndata: {\"status\":\"live\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
@@ -1827,4 +1868,75 @@ func TestCmdDeployTarball_GithubFlag(t *testing.T) {
 	// auth or call the API (authedClient would return an error and
 	// printErr would write to stderr). The empty stderr is the
 	// contract.
+}
+
+// TestStreamDeployLogs_DrivesStageTicker pins ADR-117 §3 end-to-end
+// at the CLI layer: a `gregale deploy` run that hits a fake apid
+// emitting 6 stage frames + a terminal `live` status. The test
+// forces the static (non-TTY) ticker so the assertion is grep-
+// friendly and doesn't depend on ANSI cursor positioning.
+//
+// The captured stdout must contain the human-readable label of
+// every stage at least once. The block header row ("status /
+// stage / duration") is the static fallback's leading row, also
+// asserted so a future ticker refactor that drops the header is
+// caught here. The terminal `Deployed.` line is the regression
+// guard for the existing UX.
+func TestStreamDeployLogs_DrivesStageTicker(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("seed package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "index.js"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed index.js: %v", err)
+	}
+	t.Chdir(cwd)
+	slug := deriveName()
+
+	var gotDockerfile, gotSource int32
+	var gotRuntime string
+	srv := zeroConfigDeployServerWithStages(t, slug, &gotDockerfile, &gotSource, &gotRuntime, true)
+	defer srv.Close()
+
+	// Force the static fallback so stdout is grep-friendly.
+	// We flip testOnlyTTY directly and restore it to &true (NOT
+	// to nil) so subsequent tests in the package — including the
+	// ones in commands5_test.go that rely on the TestMain default
+	// — keep seeing the default-on state. The `withTTYForTest`
+	// helper wipes back to nil which is wrong for a test that
+	// runs mid-suite; the explicit flip is the correct shape
+	// here.
+	origTTY := testOnlyTTY
+	t.Cleanup(func() { testOnlyTTY = origTTY })
+	falseVal := false
+	testOnlyTTY = &falseVal
+	resetStdoutTTYCache()
+
+	// Capture stdout for assertions.
+	origStdout := osStdout
+	r, w, _ := os.Pipe()
+	osStdout = w
+	t.Cleanup(func() {
+		osStdout = origStdout
+	})
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdDeployTarball(nil); code != 0 {
+		_ = w.Close()
+		out, _ := io.ReadAll(r)
+		t.Fatalf("cmdDeployTarball(nil) = %d, want 0. stdout:\n%s", code, out)
+	}
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+
+	for _, label := range stageLabels {
+		if !strings.Contains(string(out), label) {
+			t.Errorf("stdout missing stage label %q: %s", label, out)
+		}
+	}
+	if !strings.Contains(string(out), "Deployed.") {
+		t.Errorf("stdout missing terminal 'Deployed.' line: %s", out)
+	}
 }
