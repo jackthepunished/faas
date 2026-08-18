@@ -144,9 +144,11 @@ type Request struct {
 	// the preferred node still has headroom — affinity is bias, never
 	// a gate (ADR-005: cold boot must always work).
 	PreferredNodeID string
-	// PreferredRegion (ADR-098 PR-D) is the connection-aware
-	// placement bias. The Engine populates this from
-	// pkg/sched.UpstreamAffinity.Score(AppID) before calling the
+	// PreferredRegion (ADR-098 PR-D + amendment issue #954) is
+	// the connection-aware placement bias, scoped to a single
+	// deployment. The Engine populates this from
+	// pkg/sched.UpstreamAffinity.Score(appID, deploymentScope)
+	// before calling the
 	// chooser; the chooser honors it via the upstream_fit
 	// tie-break in betterCandidate. Empty value means "no
 	// score, fall through to legacy tie-break" — the cache
