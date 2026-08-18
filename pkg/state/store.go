@@ -1886,14 +1886,24 @@ type Store interface {
 	ListTenantSurfacesForApp(ctx context.Context, appID string) ([]TenantSurface, error)
 	CountTenantSurfacesForAccount(ctx context.Context, accountID string) (int, error)
 	// ListTenantSurfacesNearingExpiry is the renewer hot-path
-	// (PR-D cert-engine-real-mint commit 3). Returns every
-	// active surface with cert_state='issued' AND
-	// cert_not_after < cutoff. The renewer iterates the
-	// returned slice and triggers a re-mint through the
-	// existing pg_notify pipeline (via TouchTenantSurfaceForRenewal
-	// bumping updated_at, which fires the
-	// tenant_surface_changed notify trigger).
-	ListTenantSurfacesNearingExpiry(ctx context.Context, cutoff time.Time) ([]TenantSurface, error)
+	// (PR-D cert-engine-real-mint commit 3). Returns up to
+	// `limit` active surfaces with cert_state='issued' AND
+	// cert_not_after < cutoff, using a keyset cursor on
+	// (cert_not_after, id) for stable pagination. The renewer
+	// iterates the returned slice and triggers a re-mint
+	// through the existing pg_notify pipeline (via
+	// TouchTenantSurfaceForRenewal bumping updated_at, which
+	// fires the tenant_surface_changed notify trigger).
+	//
+	// PR-D code review (PR #959 candidate 6): the v1 unbounded
+	// shape would issue N UPDATEs per tick after a CA outage
+	// landed N>1000 surfaces in the renewal window. The
+	// limit-and-cursor shape bounds each tick to a hard
+	// cap (api.CertRenewTickBatchLimit, 1k) and the renewer
+	// keeps calling until fewer than `limit` rows return.
+	// afterCertNotAfter + afterID are the cursor (pass zero
+	// values on the first page).
+	ListTenantSurfacesNearingExpiry(ctx context.Context, cutoff time.Time, limit int, afterCertNotAfter time.Time, afterID string) ([]TenantSurface, error)
 	// TouchTenantSurfaceForRenewal bumps updated_at on the
 	// surface row so the tenant_surface_changed notify trigger
 	// fires; the pg_notify subscriber routes the bare surface

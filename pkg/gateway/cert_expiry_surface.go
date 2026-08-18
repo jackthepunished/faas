@@ -13,15 +13,15 @@
 // future HealthCheck endpoint uses).
 //
 // Lookup algorithm:
-//   1. Read the surface row.
-//   2. Look up the verified hostnames for the surface.
-//   3. Pick the lexicographically smallest hostname as the
-//      primary (the wrapper at cert_issuer_tenant_surface.go
-//      sorts the same way so the on-disk leaf path is
-//      deterministic).
-//   4. Read <storageDir>/certificates/<issuerKey>/<primary>/<primary>.crt
-//      via parseCertNotAfter.
-//   5. Return the parsed NotAfter.
+//  1. Read the surface row.
+//  2. Look up the verified hostnames for the surface.
+//  3. Pick the lexicographically smallest hostname as the
+//     primary (the wrapper at cert_issuer_tenant_surface.go
+//     sorts the same way so the on-disk leaf path is
+//     deterministic).
+//  4. Read <storageDir>/certificates/<issuerKey>/<primary>/<primary>.crt
+//     via parseCertNotAfter.
+//  5. Return the parsed NotAfter.
 //
 // Returns a zero time + nil error when the surface has no
 // verified hostnames yet (the dashboard renders "no cert yet"

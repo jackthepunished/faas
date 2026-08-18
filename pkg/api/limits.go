@@ -2547,9 +2547,18 @@ const (
 	// surfaces inside the window. 5 min keeps file I/O negligible
 	// (one SELECT per tick) and the dashboard's "time-to-cert"
 	// panel has sub-minute resolution.
-	MaxSANPerCert                = 100
-	CertRenewBeforeNotAfterDays  = 30
-	CertRenewTickSeconds         = 300
+	MaxSANPerCert               = 100
+	CertRenewBeforeNotAfterDays = 30
+	CertRenewTickSeconds        = 300
+	// CertRenewTickBatchLimit bounds the renewer's per-tick
+	// page size (PR-D code review Candidate 6). One SQL
+	// query per tick returns up to this many due surfaces;
+	// the next tick continues from the keyset cursor. The
+	// 1k cap keeps a single tick's UPDATE + notify fan-out
+	// bounded so a CA outage that lands N>1000 surfaces in
+	// the renewal window does NOT spike IOPS into the
+	// quadratic region.
+	CertRenewTickBatchLimit = 1000
 
 	// Tier A8 (active-passive HA topology, ADR-083 — closes the
 	// §14 M8 "Gate-A runbook (2nd box active-passive)" gap left

@@ -50,8 +50,19 @@ type OnDemandSurfaceLookup func(ctx context.Context, host string) (any, error)
 
 // tenantSurfaceVerified is the shape NewPGAllowlist needs
 // from the surface-lookup result. The concrete state.TenantHostname
-// satisfies it; tests use a local fake. Mirrors the verified
-// interface for custom domains.
+// satisfies it (state.TenantHostname.Verified() returns
+// !VerifiedAt.IsZero()); tests use a local fake. Mirrors the
+// verified interface for custom domains.
+//
+// Why TenantHostname and not TenantSurface: the lookup path
+// (state.PgStore.GetTenantHostnameByName) returns the
+// hostname row, not the parent surface. The hostname row's
+// Verified() is the load-bearing predicate — the parent
+// surface's Status is filtered upstream by the store's
+// SELECT (soft-deleted surfaces never surface). PR-D code
+// review Candidate 4's "natural caller returns TenantSurface"
+// claim is wrong: the natural caller returns TenantHostname,
+// which DOES satisfy this interface.
 type tenantSurfaceVerified interface {
 	Verified() bool
 }
@@ -229,6 +240,47 @@ func StaticAllowlist(hosts ...string) OnDemandAllowlist {
 	return func(_ context.Context, host string) (bool, error) {
 		_, ok := set[host]
 		return ok, nil
+	}
+}
+
+// TenantHostnameLookup is the narrow read seam the production
+// surface-lookup closure needs. The interface returns (any,
+// error) so pkg/gateway stays free of pkg/state (the wildcard
+// TLS path lives in gatewayd-public, pkg/gateway cannot import
+// the state package). The concrete value inside the any is
+// state.TenantHostname, which satisfies tenantSurfaceVerified
+// via its Verified() method.
+//
+// The single method name tracks state.PgStore.GetTenantHostnameByName
+// so production can pass the store directly through this
+// adapter, and tests can build a fake without a struct.
+type TenantHostnameLookup interface {
+	GetTenantHostnameByName(ctx context.Context, hostname string) (any, error)
+}
+
+// NewSurfaceLookupByHostname is the production OnDemandSurfaceLookup
+// factory. It closes over a TenantHostnameLookup (the read
+// seam) and returns a closure that matches the OnDemandSurfaceLookup
+// signature. The closure maps ErrNotFound to itself so the
+// tenant-surface branch's "missing row" path is the
+// steady-state denial rather than a Warn-logged failure.
+//
+// The factory MUST be constructed at the gatewayd-public
+// startup path (the wildcard TLS consumer that consults the
+// OnDemandHTTP01Allowlist) — the per-host engine in
+// gatewayd-internal doesn't drive this branch (it uses
+// cfg.ObtainCertSync directly, not certmagic's on-demand
+// TLS handshake code path).
+func NewSurfaceLookupByHostname(loader TenantHostnameLookup) OnDemandSurfaceLookup {
+	if loader == nil {
+		return nil
+	}
+	return func(ctx context.Context, host string) (any, error) {
+		row, err := loader.GetTenantHostnameByName(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		return row, nil
 	}
 }
 

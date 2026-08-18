@@ -274,6 +274,21 @@ func (s *PgStore) UpdateTenantSurfaceStatus(ctx context.Context, id string, stat
 // columns. The trigger on tenant_surfaces emits tenant_surface_changed
 // regardless of which column we touch; the cert-remint goroutine
 // coalesces.
+//
+// PR-D code review (PR #959 candidate 5): the wrapper previously
+// called UpdateTenantSurfaceCert on every transition, which
+// bumped updated_at and fired the tenant_surface_changed
+// trigger — creating a self-recursive notify storm: each
+// pg_notify → wrapper re-entry → another flip → another notify
+// (3 notifies per surface, M replicas amplifying). The fix is
+// to write only when the row's cert_state does NOT match the
+// new value via the WHERE clause — when the predicate doesn't
+// match, the UPDATE is a no-op and the trigger doesn't fire.
+//
+// The renewer tick path (TouchTenantSurfaceForRenewal) is
+// unaffected: that method updates updated_at directly via
+// the dedicated UPDATE and the trigger fires (one notify per
+// due surface, the load-bearing renewer kick).
 func (s *PgStore) UpdateTenantSurfaceCert(ctx context.Context, in UpdateSurfaceCertParams) error {
 	var notAfter any
 	if !in.NotAfter.IsZero() {
@@ -285,13 +300,31 @@ func (s *PgStore) UpdateTenantSurfaceCert(ctx context.Context, in UpdateSurfaceC
 		        cert_not_after = $2,
 		        cert_last_error = $3,
 		        updated_at = now()
-		  where id = $4`,
+		  where id = $4
+		    and cert_state is distinct from $1`,
 		string(in.CertState), notAfter, in.LastError, in.SurfaceID)
 	if err != nil {
 		return mapErr(err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		// Two reasons for 0 rows: (a) the surface id doesn't
+		// exist (the wrapper already checked via GetTenantSurfaceByID
+		// so this is rare), or (b) the row's cert_state already
+		// matches the new value (the load-bearing no-op path
+		// that suppresses the re-entry notify storm). We
+		// disambiguate via a follow-up existence check so the
+		// wrapper can still distinguish missing-row from
+		// idempotent flip.
+		var exists bool
+		err := s.pool.QueryRow(ctx,
+			`select exists (select 1 from tenant_surfaces where id = $1)`, in.SurfaceID).Scan(&exists)
+		if err != nil {
+			return mapErr(err)
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		return nil
 	}
 	return nil
 }
@@ -311,14 +344,45 @@ func (s *PgStore) DeleteTenantSurface(ctx context.Context, id string) error {
 //
 // cutoff is in UTC; the cert_not_after column is timestamptz so
 // the comparison is timezone-correct.
-func (s *PgStore) ListTenantSurfacesNearingExpiry(ctx context.Context, cutoff time.Time) ([]TenantSurface, error) {
-	rows, err := s.pool.Query(ctx,
-		`select `+tenantSurfaceColsQ+` from tenant_surfaces s
-		  where s.status = 'active'
-		    and s.cert_state = 'issued'
-		    and s.cert_not_after < $1
-		  order by s.cert_not_after asc`,
-		cutoff)
+//
+// PR-D code review (PR #959 candidate 6): the v1 shape issued
+// an unbounded UPDATE per due row when a CA outage landed
+// N>1000 surfaces in the renewal window. The renewer now
+// bounds each tick to a hard limit (api.CertRenewTickBatchLimit,
+// 1k) and uses (cert_not_after, id) as a stable composite
+// cursor for next-tick continuation. The keyset cursor avoids
+// the OFFSET-counter trap that would let new rows being
+// touched mid-batch silently skip pages.
+func (s *PgStore) ListTenantSurfacesNearingExpiry(ctx context.Context, cutoff time.Time, limit int, afterCertNotAfter time.Time, afterID string) ([]TenantSurface, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	var rows pgx.Rows
+	var err error
+	if afterID == "" {
+		// First page: no cursor.
+		rows, err = s.pool.Query(ctx,
+			`select `+tenantSurfaceColsQ+` from tenant_surfaces s
+			  where s.status = 'active'
+			    and s.cert_state = 'issued'
+			    and s.cert_not_after < $1
+			  order by s.cert_not_after asc, s.id asc
+			  limit $2`,
+			cutoff, limit)
+	} else {
+		// Keyset pagination: (cert_not_after, id) > (cursor, cursorid)
+		// in the order-by sense. The row constructor compares
+		// lexicographically against the cursor.
+		rows, err = s.pool.Query(ctx,
+			`select `+tenantSurfaceColsQ+` from tenant_surfaces s
+			  where s.status = 'active'
+			    and s.cert_state = 'issued'
+			    and s.cert_not_after < $1
+			    and (s.cert_not_after, s.id) > ($2, $3)
+			  order by s.cert_not_after asc, s.id asc
+			  limit $4`,
+			cutoff, afterCertNotAfter, afterID, limit)
+	}
 	if err != nil {
 		return nil, mapErr(err)
 	}

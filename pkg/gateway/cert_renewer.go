@@ -5,9 +5,12 @@
 // cert_not_after < now + CertRenewBeforeNotAfterDays. Each tick
 // it:
 //
-//  1. Calls Store.ListTenantSurfacesNearingExpiry(ctx, cutoff)
-//     — reads the partial index tenant_surfaces_cert_expiry_idx
-//     so the query stays bounded regardless of fleet size.
+//  1. Pages through Store.ListTenantSurfacesNearingExpiry
+//     (ctx, cutoff, limit, afterCertNotAfter, afterID) — reads
+//     the partial index tenant_surfaces_cert_expiry_idx so the
+//     query stays bounded regardless of fleet size. The page
+//     size is api.CertRenewTickBatchLimit (1k); the renewer
+//     keeps paging until fewer than `limit` rows return.
 //  2. For each due surface, calls Store.TouchTenantSurfaceForRenewal
 //     — bumping updated_at which fires the tenant_surface_changed
 //     notify trigger.
@@ -15,6 +18,11 @@
 //     back through CertIssuer.RequestCertForSurface, which
 //     re-runs the full state machine (issued → pending →
 //     issued).
+//
+// PR-D code review (PR #959 candidate 6): the v1
+// unbounded-fetch shape would issue N>1000 UPDATEs after
+// a CA outage landed many surfaces in the renewal window.
+// The page-and-cursor shape bounds each tick's IOPS.
 //
 // Why the renewer rides the existing notify pipeline instead
 // of calling RequestCertForSurface directly:
@@ -161,26 +169,55 @@ func (r *SurfaceCertRenewer) Run(ctx context.Context) {
 // Returns a non-nil error only when ListTenantSurfacesNearingExpiry
 // fails; per-surface Touch failures are logged + skipped
 // inside the loop so one bad row doesn't poison the tick.
+//
+// PR-D code review (PR #959 candidate 6): the renewer pages
+// through the result set instead of issuing one unbounded
+// fetch. The page size is api.CertRenewTickBatchLimit (1k);
+// the loop continues until fewer than `limit` rows return.
+// The keyset cursor is (cert_not_after, id) so rows being
+// touched mid-batch by the renewer itself don't cause
+// duplicate fires.
 func (r *SurfaceCertRenewer) tickOnce(ctx context.Context) error {
 	if r.store == nil {
 		return errors.New("gateway: renewer nil store")
 	}
 	cutoff := r.clock().Add(r.renewBefore)
-	due, err := r.store.ListTenantSurfacesNearingExpiry(ctx, cutoff)
-	if err != nil {
-		return fmt.Errorf("gateway: list tenant surfaces nearing expiry: %w", err)
+	limit := api.CertRenewTickBatchLimit
+	if limit <= 0 {
+		limit = 1000
 	}
-	for _, s := range due {
-		if err := r.store.TouchTenantSurfaceForRenewal(ctx, s.ID); err != nil {
-			r.log.Warn("cert: renewer touch surface",
-				"surface", s.ID,
-				"account", s.AccountID,
-				"err", err)
-			continue
+	totalTouched := 0
+	var afterCertNotAfter time.Time
+	afterID := ""
+	for {
+		page, err := r.store.ListTenantSurfacesNearingExpiry(ctx, cutoff, limit, afterCertNotAfter, afterID)
+		if err != nil {
+			return fmt.Errorf("gateway: list tenant surfaces nearing expiry: %w", err)
+		}
+		for _, s := range page {
+			if err := r.store.TouchTenantSurfaceForRenewal(ctx, s.ID); err != nil {
+				r.log.Warn("cert: renewer touch surface",
+					"surface", s.ID,
+					"account", s.AccountID,
+					"err", err)
+				continue
+			}
+			afterCertNotAfter = s.CertNotAfter
+			afterID = s.ID
+			totalTouched++
+		}
+		if len(page) < limit {
+			// Last page: fewer rows than the limit means
+			// the dataset is exhausted. The renewer exits
+			// the loop and waits for the next tick.
+			break
+		}
+		if len(page) == 0 {
+			break
 		}
 	}
-	if len(due) > 0 {
-		r.log.Info("cert: renewer tick", "due", len(due), "cutoff", cutoff)
+	if totalTouched > 0 {
+		r.log.Info("cert: renewer tick", "touched", totalTouched, "cutoff", cutoff)
 	}
 	return nil
 }

@@ -169,12 +169,28 @@ func (m *MemStore) UpdateTenantSurfaceStatus(_ context.Context, id string, statu
 }
 
 // UpdateTenantSurfaceCert — the in-memory cert state transition.
+//
+// PR-D code review (PR #959 candidate 5): the in-memory twin
+// mirrors the PgStore's "no-op when cert_state already matches"
+// invariant so unit tests that exercise the wrapper's
+// self-recursive-notify-storm suppression see the same shape
+// as production. The notify storm is a Postgres-specific
+// concern (the trigger fires on actual UPDATE) but the
+// semantic — don't write when the state already matches — is
+// universally correct and keeps the test fixtures honest.
 func (m *MemStore) UpdateTenantSurfaceCert(_ context.Context, in UpdateSurfaceCertParams) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.tenantSurfaces[in.SurfaceID]
 	if !ok {
 		return ErrNotFound
+	}
+	if s.CertState == in.CertState {
+		// No-op: the row's cert_state already matches the
+		// requested value. Writes are skipped so the
+		// production pg_notify trigger doesn't fire on
+		// idempotent re-entries.
+		return nil
 	}
 	s.CertState = in.CertState
 	s.CertNotAfter = in.NotAfter
@@ -199,7 +215,17 @@ func (m *MemStore) DeleteTenantSurface(ctx context.Context, id string) error {
 // cert_not_after < cutoff); sort-by-cert-not-after ascending so
 // the renewer hits the most-overdue surface first. Returns an
 // empty slice when the dataset has no renewals due.
-func (m *MemStore) ListTenantSurfacesNearingExpiry(_ context.Context, cutoff time.Time) ([]TenantSurface, error) {
+//
+// PR-D code review (PR #959 candidate 6): the renewer now
+// pages through the result set with limit + keyset cursor
+// (cert_not_after, id) so a single tick can't enqueue
+// unbounded UPDATEs after a CA outage. The in-memory twin
+// matches the same predicate + secondary sort so unit tests
+// that exercise the renewer's pagination see the same shape.
+func (m *MemStore) ListTenantSurfacesNearingExpiry(_ context.Context, cutoff time.Time, limit int, afterCertNotAfter time.Time, afterID string) ([]TenantSurface, error) {
+	if limit <= 0 {
+		limit = 1
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]TenantSurface, 0)
@@ -213,6 +239,17 @@ func (m *MemStore) ListTenantSurfacesNearingExpiry(_ context.Context, cutoff tim
 		if !s.CertNotAfter.Before(cutoff) {
 			continue
 		}
+		// Keyset cursor: skip rows whose (cert_not_after, id)
+		// is at-or-before the cursor. The strict > mirrors
+		// the pgstore predicate.
+		if afterID != "" {
+			if s.CertNotAfter.Before(afterCertNotAfter) {
+				continue
+			}
+			if s.CertNotAfter.Equal(afterCertNotAfter) && s.ID <= afterID {
+				continue
+			}
+		}
 		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -221,6 +258,9 @@ func (m *MemStore) ListTenantSurfacesNearingExpiry(_ context.Context, cutoff tim
 		}
 		return out[i].CertNotAfter.Before(out[j].CertNotAfter)
 	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 

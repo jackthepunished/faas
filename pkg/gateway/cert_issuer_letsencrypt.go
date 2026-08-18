@@ -127,31 +127,43 @@ func NewLetsEncryptCertIssuer(storageDir, contactEmail string, staging bool, dns
 }
 
 // initConfig lazily builds the certmagic Config on first Issue.
-// The chicken-and-egg dance: certmagic.NewACMEIssuer wants
-// `am.config = magic` set, but Go evaluates the slice literal
-// before `magic = ...` completes. The standard fix is a
-// pointer-to-pointer (mirrors tls_wire.go's NewCertMagicConfig
-// pattern at tls_wire.go:138-143).
+//
+// Chicken-and-egg dance (load-bearing — code review caught a
+// nil-cfg panic in the v1 version): certmagic.NewACMEIssuer
+// takes a non-nil *Config (acmeissuer.go:188 panics on nil)
+// AND the Config struct itself holds the Issuer list. The
+// accepted seam is to build the Config in two passes:
+//
+//  1. Build the *Config with Issuers set to nil so the
+//     d := &cfg in NewACMEIssuer sees a populated magic.
+//  2. NewACMEIssuer(&cfg, template) — magic is now a real
+//     *Config, not nil.
+//  3. Assign magic.Issuers = []Issuer{issuer} post-construction.
+//
+// This is the same pattern certmagic uses internally at
+// config.go:250-256 (Default.Issuers fallback). The TLS wildcard
+// path uses certmagic.NewCache with a GetConfigForCert closure
+// (tls_wire.go:138-143) — a heavier indirection that the
+// per-host issuer does not need because each cert has its own
+// (issuer-key, primary-host) storage path.
 func (l *LetsEncryptCertIssuer) initConfig() error {
 	l.initOnce.Do(func() {
-		var magic *certmagic.Config
 		storage := &certmagic.FileStorage{Path: filepath.Join(l.storageDir, "certificates")}
 		ca := certmagic.LetsEncryptProductionCA
 		if l.staging {
 			ca = certmagic.LetsEncryptStagingCA
 		}
-		magic = certmagic.New(nil, certmagic.Config{
+		magic := certmagic.New(nil, certmagic.Config{
 			Storage: storage,
-			Issuers: []certmagic.Issuer{
-				certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
-					Email:       l.contactEmail,
-					CA:          ca,
-					Agreed:      true,
-					Logger:      silentZap,
-					DNS01Solver: &certmagic.DNS01Solver{DNSManager: certmagic.DNSManager{DNSProvider: l.dnsProvider}},
-				}),
-			},
 		})
+		issuer := certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
+			Email:       l.contactEmail,
+			CA:          ca,
+			Agreed:      true,
+			Logger:      silentZap,
+			DNS01Solver: &certmagic.DNS01Solver{DNSManager: certmagic.DNSManager{DNSProvider: l.dnsProvider}},
+		})
+		magic.Issuers = []certmagic.Issuer{issuer}
 		l.cfg = magic
 	})
 	return l.initErr

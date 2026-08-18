@@ -76,9 +76,9 @@ type dns01Stub struct {
 // prove the certmagic DNS-01 plumbing actually fired against
 // our surface's verified hostname.
 type dns01StubCall struct {
-	op    string // "append" | "delete"
-	zone  string
-	recs  []libdns.Record
+	op   string // "append" | "delete"
+	zone string
+	recs []libdns.Record
 }
 
 // AppendRecords records the call. It returns the input records

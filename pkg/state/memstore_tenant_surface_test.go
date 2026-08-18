@@ -458,7 +458,7 @@ func TestMemStoreListTenantSurfacesNearingExpiry(t *testing.T) {
 	_ = mkSurf("not_active", SurfaceStatusSuspended, CertStateIssued, time.Now().Add(5*24*time.Hour))
 	_ = mkSurf("failed", SurfaceStatusActive, CertStateFailed, time.Now().Add(5*24*time.Hour))
 	_ = mkSurf("fresh", SurfaceStatusActive, CertStateIssued, time.Now().Add(90*24*time.Hour))
-	got, err := m.ListTenantSurfacesNearingExpiry(ctx, cutoff)
+	got, err := m.ListTenantSurfacesNearingExpiry(ctx, cutoff, 1000, time.Time{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

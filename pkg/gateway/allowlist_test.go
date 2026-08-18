@@ -504,3 +504,72 @@ func TestPGAllowlist_TenantSurfaceFailsClosedOnDBError(t *testing.T) {
 		t.Errorf("allowlist = true on DB error; want false (fail closed)")
 	}
 }
+
+// fakeTenantHostnameLoader is the TenantHostnameLookup test fake
+// (PR-D code review Candidate 3 follow-up). Mirrors the
+// fakeSurfaceLookup above but exposes the TenantHostnameLookup
+// interface that NewSurfaceLookupByHostname consumes.
+type fakeTenantHostnameLoader struct {
+	mu   sync.Mutex
+	rows map[string]fakeTenantHostnameRow
+	err  error
+}
+
+func (f *fakeTenantHostnameLoader) GetTenantHostnameByName(_ context.Context, host string) (any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	r, ok := f.rows[host]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return r, nil
+}
+
+// TestNewSurfaceLookupByHostname_NilLoaderReturnsNil pins the
+// safe-default: the factory MUST produce a nil closure when the
+// loader is nil, so the consumer's nil-check (NewPGAllowlist
+// `if surfaceLookup != nil`) cleanly disables the branch.
+func TestNewSurfaceLookupByHostname_NilLoaderReturnsNil(t *testing.T) {
+	if got := NewSurfaceLookupByHostname(nil); got != nil {
+		t.Errorf("NewSurfaceLookupByHostname(nil) = %v; want nil", got)
+	}
+}
+
+// TestNewSurfaceLookupByHostname_PassesThroughVerified pins
+// the production wiring: the factory's closure returns the
+// loader's value verbatim so the OnDemandSurfaceLookup caller
+// type-asserts tenantSurfaceVerified.
+func TestNewSurfaceLookupByHostname_PassesThroughVerified(t *testing.T) {
+	loader := &fakeTenantHostnameLoader{rows: map[string]fakeTenantHostnameRow{
+		"a.example": {verifiedAt: time.Now()},
+	}}
+	lookup := NewSurfaceLookupByHostname(loader)
+	raw, err := lookup(context.Background(), "a.example")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	v, ok := raw.(tenantSurfaceVerified)
+	if !ok {
+		t.Fatalf("returned value type %T does not satisfy tenantSurfaceVerified", raw)
+	}
+	if !v.Verified() {
+		t.Errorf("lookup returned unverified row; want verified")
+	}
+}
+
+// TestNewSurfaceLookupByHostname_PropagatesNotFound pins the
+// fail-closed contract: the factory's closure propagates the
+// loader's ErrNotFound so the production wiring at the
+// gatewayd-public wildcard-TLS consumer sees the steady-state
+// denial path (logged at Info, not Warn).
+func TestNewSurfaceLookupByHostname_PropagatesNotFound(t *testing.T) {
+	loader := &fakeTenantHostnameLoader{rows: map[string]fakeTenantHostnameRow{}}
+	lookup := NewSurfaceLookupByHostname(loader)
+	_, err := lookup(context.Background(), "missing.example")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("lookup(missing) = %v; want ErrNotFound", err)
+	}
+}

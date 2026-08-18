@@ -94,3 +94,77 @@ func TestCreateTenantSurfaceRequestDefaultsCertKind(t *testing.T) {
 		t.Fatalf("hostnames = %+v", req.Hostnames)
 	}
 }
+
+// TestCertEngineWiredDefaultsOff pins the dark-launch posture:
+// the cert engine is unwired until the operator sets BOTH
+// FAAS_TLS_STORAGE_DIR and FAAS_TLS_CONTACT_EMAIL. A misconfigured
+// rollout that flips FAAS_TENANT_SURFACES_ENABLED on but leaves
+// the cert-engine env blank must NOT crash the daemon; the
+// wrapper's nil-issuer degradation surfaces a clear
+// "cert engine unwired" last_error.
+func TestCertEngineWiredDefaultsOff(t *testing.T) {
+	t.Setenv("FAAS_TLS_STORAGE_DIR", "")
+	t.Setenv("FAAS_TLS_CONTACT_EMAIL", "")
+	if CertEngineWired() {
+		t.Fatal("CertEngineWired = true with both env unset; want false")
+	}
+}
+
+// TestCertEngineWiredRequiresBoth pins the AND-of-two contract:
+// setting just one of the two env vars is NOT enough. The
+// fail-closed contract from PR-D commit 1 spec demands both.
+func TestCertEngineWiredRequiresBoth(t *testing.T) {
+	t.Setenv("FAAS_TLS_STORAGE_DIR", "/var/lib/faas/certs")
+	t.Setenv("FAAS_TLS_CONTACT_EMAIL", "")
+	if CertEngineWired() {
+		t.Fatal("CertEngineWired = true with only STORAGE_DIR set; want false")
+	}
+	t.Setenv("FAAS_TLS_STORAGE_DIR", "")
+	t.Setenv("FAAS_TLS_CONTACT_EMAIL", "ops@example.com")
+	if CertEngineWired() {
+		t.Fatal("CertEngineWired = true with only CONTACT_EMAIL set; want false")
+	}
+	t.Setenv("FAAS_TLS_STORAGE_DIR", "/var/lib/faas/certs")
+	t.Setenv("FAAS_TLS_CONTACT_EMAIL", "ops@example.com")
+	if !CertEngineWired() {
+		t.Fatal("CertEngineWired = false with both set; want true")
+	}
+}
+
+// TestCertEngineStagingDefaultsOn pins the safe-default: a
+// fresh dev box defaults to LE staging so a misconfigured DNS
+// delegation can't burn the production rate limit. Production
+// operators opt-in to the prod CA via FAAS_TLS_STAGING=0.
+func TestCertEngineStagingDefaultsOn(t *testing.T) {
+	t.Setenv("FAAS_TLS_STAGING", "")
+	if !CertEngineStaging() {
+		t.Fatal("CertEngineStaging default = false; want true (staging is the safe default)")
+	}
+	for _, v := range []string{"0", "false", "FALSE", "no", "off"} {
+		t.Setenv("FAAS_TLS_STAGING", v)
+		if CertEngineStaging() {
+			t.Errorf("CertEngineStaging(%q) = true; want false", v)
+		}
+	}
+}
+
+// TestCertEngineDNSProviderDefaultsCloudflare pins the default
+// per ADR-024 §6.
+func TestCertEngineDNSProviderDefaultsCloudflare(t *testing.T) {
+	t.Setenv("FAAS_TLS_DNS_PROVIDER", "")
+	if got := CertEngineDNSProvider(); got != "cloudflare" {
+		t.Errorf("CertEngineDNSProvider default = %q; want cloudflare", got)
+	}
+	t.Setenv("FAAS_TLS_DNS_PROVIDER", "hetzner")
+	if got := CertEngineDNSProvider(); got != "hetzner" {
+		t.Errorf("CertEngineDNSProvider(hetzner) = %q; want hetzner", got)
+	}
+	// Unknown provider falls back to cloudflare (the documented
+	// default) rather than erroring — the cert engine will then
+	// fail to construct a DNS provider and the wrapper's
+	// nil-issuer degradation handles the visible failure.
+	t.Setenv("FAAS_TLS_DNS_PROVIDER", "route53-unimpl")
+	if got := CertEngineDNSProvider(); got != "cloudflare" {
+		t.Errorf("CertEngineDNSProvider(unknown) = %q; want cloudflare (safe default)", got)
+	}
+}
