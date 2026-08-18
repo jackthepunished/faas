@@ -535,8 +535,8 @@ var methodRouteMap = map[string]string{
 	// placeholder noise); the SDK verb drops it, matching the per-app
 	// family (GetApp, GetDeployment, GetUsage).
 	"POST /v1/apps/{slug}/deployments/source-tarball": "DeployFromSourceTarball",
-	"GET /v1/domains/{domain}":                       "GetDomain",
-	"POST /v1/domains/{domain}/verify":               "VerifyDomain",
+	"GET /v1/domains/{domain}":                        "GetDomain",
+	"POST /v1/domains/{domain}/verify":                "VerifyDomain",
 }
 
 func main() {
