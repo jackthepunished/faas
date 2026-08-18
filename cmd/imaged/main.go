@@ -425,16 +425,9 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// M8 loop which drives the LISTEN subscriber + nightly GC + one-shot FC
 	// sweep. The stage is still required for cold-boot of builder microVMs
 	// (see spec §4.6 two-drive scheme).
-	baseRef := envOr("FAAS_BUILDER_BASE_REF", imaged.BaseRefBuilder)
-	if v := os.Getenv("FAAS_BUILDER_BASE_REF"); v != "" {
-		// Same digest-pinned gate as the deploy base ref above. The
-		// builder base ext4 is shared across every cold-boot and
-		// snapshot-prime — flipping it without a digest would corrupt
-		// every parked app's restore path.
-		ref, err := oci.ParseReference(v)
-		if err != nil || ref.Digest == "" {
-			return fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", v)
-		}
+	baseRef, err := builderBaseRefFromEnv()
+	if err != nil {
+		return err
 	}
 	basePath := envOr("FAAS_BUILDER_BASE_PATH", "/srv/fc/base/builder-base.ext4")
 	// #96 / ADR-025 axis 2: EnsureBaseExt4 publishes via the StorageBackend
@@ -558,6 +551,26 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// builderBaseRefFromEnv resolves the builder image reference. Single-box
+// development keeps the historical latest default; a named multi-box host
+// must receive an explicit digest-pinned ref from deployment configuration.
+// This prevents a public compute node from silently changing its builder
+// rootfs when GHCR's mutable latest tag advances.
+func builderBaseRefFromEnv() (string, error) {
+	v := os.Getenv("FAAS_BUILDER_BASE_REF")
+	if v == "" {
+		if os.Getenv("FAAS_NODE_NAME") != "" {
+			return "", errors.New("imaged: FAAS_BUILDER_BASE_REF is required and must be digest-pinned on a named multi-box host")
+		}
+		return imaged.BaseRefBuilder, nil
+	}
+	ref, err := oci.ParseReference(v)
+	if err != nil || ref.Digest == "" {
+		return "", fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", v)
+	}
+	return v, nil
 }
 
 // guestInitPathFromEnv resolves the boot-critical PID 1 binary. Older

@@ -45,6 +45,7 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ReadOnlyPaths=/etc/faas
 # Unix-only (no AF_INET/AF_INET6 — we never dial external IPs from
 # here; all forwarding is via the unix socket to the public daemon
 # and gRPC to per-node schedd/vmmd over loopback mTLS).

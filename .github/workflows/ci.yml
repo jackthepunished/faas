@@ -146,6 +146,9 @@ jobs:
       - name: build
         run: make build
 
+      - name: systemd hardening gate
+        run: make systemd-hardening-check
+
       # +incompatible direct-dep gate (release blocker B1). Today this
       # flags github.com/stripe/stripe-go v70.15.0+incompatible (go.mod:25)
       # — v70 pre-dates the modern lookup_key primitive on PlanParams

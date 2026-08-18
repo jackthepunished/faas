@@ -173,8 +173,10 @@ jobs:
             --platform linux/amd64,linux/arm64 \
             --build-arg BUILDKIT_VERSION \
             --build-arg RAILPACK_VERSION \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             --tag "${IMAGE_NAME}:latest" \
-            --tag "${IMAGE_NAME}:${GITHUB_SHA::12}" \
+            --tag "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
             --push \
             -f images/builder-base.Dockerfile .
 
@@ -232,7 +234,10 @@ jobs:
           rm /tmp/crane.tgz
           if [ "${GITHUB_REF_NAME:-}" = "main" ] && \
              [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            REF="${IMAGE_NAME}:latest"
+            # Verify the immutable full-SHA tag, not only the convenience
+            # latest tag. Deployments must be able to reproduce this exact
+            # image even after latest advances.
+            REF="${IMAGE_NAME}:sha-${GITHUB_SHA}"
           else
             # Verify step runs from the runner namespace; the
             # published port is reachable via the bridge

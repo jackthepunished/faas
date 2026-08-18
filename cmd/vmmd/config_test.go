@@ -92,6 +92,29 @@ kernel_path = "/srv/fc/alt/vmlinux"
 	}
 }
 
+// TestLoadConfig_RoutingEnvironmentOverlay pins the deployment-owned
+// systemd drop-in path used by multi-box hosts. This keeps the routable
+// target in Ansible configuration and removes the need for a post-boot DB
+// patch, while preserving the separate wildcard bind address.
+func TestLoadConfig_RoutingEnvironmentOverlay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmmd.toml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAAS_VMMD_LISTEN_ADDR", "tcp://0.0.0.0:50051")
+	t.Setenv("FAAS_VMMD_TARGET_URL", "tcp://fsn-2.internal:50051")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.ListenAddr != "tcp://0.0.0.0:50051" {
+		t.Errorf("ListenAddr = %q, want tcp bind target", cfg.ListenAddr)
+	}
+	if cfg.ComputeNode.TargetURL != "tcp://fsn-2.internal:50051" {
+		t.Errorf("ComputeNode.TargetURL = %q, want routable dial target", cfg.ComputeNode.TargetURL)
+	}
+}
+
 // TestLoadConfig_NodeKeyPathOverride pins the wiring between
 // vmmd.toml and loadNodeSigningKey (ADR-053). Without this seam,
 // operators using a non-canonical install path (air-gapped fleet,

@@ -210,7 +210,7 @@ func cmdDeployAddNode(args []string) int {
 	// matches what we'd write, no-op. If it differs, refuse — the
 	// operator must git revert or delete the file first.
 	hostVarsPath := filepath.Join(rr, "deploy/ansible/host_vars", fqdn+".yml")
-	desiredHostVars := renderHostVarsYAML(fqdn, *role, *ansibleHost, *publicIface, *masqCIDR, *masqCIDRv6, *overlayCIDRs)
+	desiredHostVars := renderHostVarsYAMLWithTargetURL(fqdn, *role, *ansibleHost, *publicIface, *masqCIDR, *masqCIDRv6, *overlayCIDRs, *targetURL)
 	if existing, err := os.ReadFile(hostVarsPath); err == nil {
 		if !bytes.Equal(existing, []byte(desiredHostVars)) {
 			fmt.Fprintf(os.Stderr, "gregalectl deploy add-node: host_vars/%s.yml already exists with different content; refusing to overwrite (git revert <commit> or delete the file first)\n", fqdn)
