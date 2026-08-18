@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -88,7 +89,7 @@ func TestInternalQuotaHandler_FreshBucket_Noop(t *testing.T) {
 // load-bearing wire shape.
 func TestInternalQuotaHandler_AfterAllow(t *testing.T) {
 	h := gateway.NewHandlerWith(unwiredBackend{}, nil, nil)
-	if !h.Limiter().Allow("app-1", api.PlanHobby) {
+	if !h.Limiter().Allow(context.Background(), "app-1", api.PlanHobby) {
 		t.Fatal("Allow returned false; want true")
 	}
 	rec := httptest.NewRecorder()

@@ -11818,6 +11818,15 @@ components:
         or `degraded: <reason>` on Prometheus failure (response is
         still 200 with empty Suggestions — the dashboard's
         empty-state branch handles it).
+
+        Phase 4 D1/D2 (ADR-104 amendment 5): when the request
+        supplies `dry_run=true` + `candidate_rps` + (optional)
+        `candidate_burst`, the response ALSO carries a per-route
+        `would_have_rejected` array + the static
+        `per_consumer_limit_note` literal that names the
+        `gateway_requests_by_route_total` label gap. Dry-run is a
+        guard-rail for the customer's own probe value — not
+        auto-apply.
       type: object
       required: [app_id, range, source, route_metrics_disabled, routes_collapsed, plan_ceiling_rps, plan_ceiling_burst, multiplier, suggestions]
       properties:
