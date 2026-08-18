@@ -4023,6 +4023,16 @@ func (m *MemStore) GetDeploymentByIDScopedToSuperseded(_ context.Context, appID,
 	return d, nil
 }
 
+// HasSnapshotHistory always returns (false, nil) for the in-process
+// MemStore — the store doesn't model snapshot retention, so the
+// snapshot-GC race check is a no-op against MemStore. This preserves
+// the legacy happy-path test semantics (no seeded snapshot = check
+// skipped) without leaking test-only affordances into the production
+// PgStore path. SAFE-RELEASES-G.
+func (m *MemStore) HasSnapshotHistory(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
 // ListDeploymentsForApp mirrors PgStore.ListDeploymentsForApp: `limit <= 0`
 // means "no row cap" (every remaining row after offset). F-10: see PgStore
 // doc for the asymmetry that this version already conformed to.

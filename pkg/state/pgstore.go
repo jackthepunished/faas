@@ -4461,6 +4461,29 @@ func (s *PgStore) GetDeploymentByIDScopedToSuperseded(ctx context.Context, appID
 	return d, nil
 }
 
+// HasSnapshotHistory reports whether the snapshots table contains any
+// row (stale or non-stale) for the deployment. Used by the rollback
+// handler (SAFE-RELEASES-G) to gate the snapshot-GC race check: if the
+// deployment has never had a snapshot (typical for test-only or
+// freshly-created deployments that haven't been snapshotted yet), a
+// "no non-stale snapshot" lookup is not meaningful — the handler skips
+// the race check. If the deployment DOES have snapshot history but no
+// non-stale row remains, the GC race is real and the handler returns
+// ErrRollbackTargetSnapshotGone (409).
+func (s *PgStore) HasSnapshotHistory(ctx context.Context, deploymentID string) (bool, error) {
+	if deploymentID == "" {
+		return false, fmt.Errorf("state: has snapshot history: empty deploymentID")
+	}
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`select exists(select 1 from snapshots where deployment_id = $1)`,
+		deploymentID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("state: has snapshot history: %w", err)
+	}
+	return exists, nil
+}
+
 // ListAllDeployments returns every non-deleted deployment (parent
 // app is not 'deleted'). Issue #557 closure / ADR-072 — the floor
 // reconciler's wake sweep walks this list when no owner-node sharding

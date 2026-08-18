@@ -976,6 +976,27 @@ func (c *Client) Rollback(ctx context.Context, slug string) (DeploymentResponse,
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", nil, &out)
 }
 
+// RollbackTo is the SAFE-RELEASES-G (issue #976) variant of Rollback.
+// When targetDeploymentID is empty it degrades to the legacy
+// "rollback to most-recent superseded" path (same as Rollback) and
+// sends no body. When non-empty, the handler validates that the id
+// (a) belongs to the app and (b) has status='superseded', and
+// returns a typed error otherwise. Prefer this over Rollback in any
+// new code so the future-safe shape is the default; Rollback is
+// kept for SDK back-compat (generated SDK consumers don't break).
+func (c *Client) RollbackTo(ctx context.Context, slug, targetDeploymentID string) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	if targetDeploymentID == "" {
+		// Match Rollback: no body for the legacy "most-recent
+		// superseded" path. Avoids wire noise and keeps the
+		// DisallowUnknownFields handler happy when fields are added
+		// to RollbackRequest later.
+		return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", nil, &out)
+	}
+	body := RollbackRequest{TargetDeploymentID: &targetDeploymentID}
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", body, &out)
+}
+
 // UpdateDeploymentTraffic stamps the per-deployment traffic-split
 // weight (issue #556 PR-A). percent must be in [0, 100]; the
 // handler enforces the range (422) and the plan gate (403,

@@ -1659,6 +1659,16 @@ type Store interface {
 	// if the row exists but its status is not 'superseded'. Both backends
 	// (PgStore + MemStore) must honour this contract.
 	GetDeploymentByIDScopedToSuperseded(ctx context.Context, appID, deploymentID string) (Deployment, error)
+	// HasSnapshotHistory reports whether the deployment ever had a
+	// snapshot row (stale or not) in the snapshots table. Used by the
+	// rollback handler (SAFE-RELEASES-G) to gate the snapshot-GC race
+	// check: a missing non-stale snapshot is meaningful ONLY if the
+	// deployment had a snapshot row at some point. PgStore queries the
+	// table; MemStore returns (false, nil) because the in-process store
+	// doesn't model snapshot retention — the check is a no-op against
+	// MemStore, which preserves the legacy happy-path semantics in
+	// handler tests.
+	HasSnapshotHistory(ctx context.Context, deploymentID string) (bool, error)
 	// ListDeploymentsForApp returns deployments for an app, ordered DESC by
 	// created_at. limit <= 0 means "no row cap" (return every remaining row
 	// after offset). MemStore and PgStore both honour this contract — F-10

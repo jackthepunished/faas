@@ -1477,6 +1477,28 @@ type UpdateDeploymentTrafficRequest struct {
 	TrafficPercent int `json:"traffic_percent"`
 }
 
+// RollbackRequest is the body for POST /v1/apps/{slug}/rollback.
+//
+// All fields are optional. With an empty body the handler falls back to
+// "rollback to the most recent superseded deployment" (the pre-G
+// behaviour). With TargetDeploymentID set, the handler validates that the
+// deployment belongs to this app AND has status='superseded' — both are
+// hard requirements; rolling back to a deployment that is already live, or
+// that belongs to a different app, is rejected with a typed error rather
+// than silently no-op'd.
+//
+// SAFE-RELEASES-G (issue #976). Forward-compatible with SAFE-RELEASES-C
+// (per-deployment URL): the response carries the same deployment_id so
+// -C can build a hostname off it without a wire-shape change.
+type RollbackRequest struct {
+	// TargetDeploymentID is the UUID of the deployment to promote back
+	// to 'live'. Must belong to the same app as the URL slug, and must
+	// have status='superseded' (rolling back to the already-current
+	// deployment is rejected explicitly). Nil/empty falls back to the
+	// most-recent superseded deployment (legacy behaviour).
+	TargetDeploymentID *string `json:"target_deployment_id,omitempty"`
+}
+
 // AccountResponse is the whoami payload. Limits is the plan's
 // quota/limit table (RAM MB, max concurrency, included GB-h,
 // deployed-app cap) so the dashboard /account page can show

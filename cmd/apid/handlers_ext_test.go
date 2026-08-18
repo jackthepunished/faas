@@ -1251,6 +1251,145 @@ func TestRollbackApp_NoTarget(t *testing.T) {
 	assertProblem(t, rec, 409, api.CodeNoRollbackTarget)
 }
 
+// TestRollbackApp_ExplicitTarget_Specific (SAFE-RELEASES-G, issue #976).
+// With three deployments (v1 superseded, v2 superseded, v3 live),
+// rolling back to v1 promotes v1 to live, supersedes v3, and leaves
+// v2 untouched. Regression test for the headline use case: "skip the
+// intermediate".
+func TestRollbackApp_ExplicitTarget_Specific(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep1 := mustSeedDeployment(t, e, "rb-specific")
+	app, _ := e.store.AppBySlug(context.Background(), "rb-specific")
+	dep2, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:" + repeat("b", 64),
+		Kind:        state.DeploymentKindImage,
+		Status:      state.DeployBuilding,
+		CreatedAt:   time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep3, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:" + repeat("c", 64),
+		Kind:        state.DeploymentKindImage,
+		Status:      state.DeployBuilding,
+		CreatedAt:   time.Now().UTC().Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// dep1 live, dep2 live (supersedes dep1), dep3 live (supersedes dep2).
+	if err := e.store.MarkDeploymentLive(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentLive(context.Background(), dep2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentSuperseded(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentLive(context.Background(), dep3.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentSuperseded(context.Background(), dep2.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	body := api.RollbackRequest{TargetDeploymentID: &dep1.ID}
+	rec := e.do(t, "POST", "/v1/apps/rb-specific/rollback", body, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ID != dep1.ID {
+		t.Errorf("rollback returned id=%s, want %s (explicit target, skipped intermediate)", out.ID, dep1.ID)
+	}
+	if out.Status != string(state.DeployLive) {
+		t.Errorf("post-rollback status = %q, want %q", out.Status, state.DeployLive)
+	}
+	// dep3 must be superseded (was the current live one).
+	fresh, _ := e.store.DeploymentByID(context.Background(), dep3.ID)
+	if fresh.Status != state.DeploySuperseded {
+		t.Errorf("dep3 status = %q, want %q (the previously-live row was not retired)", fresh.Status, state.DeploySuperseded)
+	}
+}
+
+// TestRollbackApp_ExplicitTarget_NotFound confirms the 404 path when
+// the caller names a deployment_id that doesn't exist (or belongs to
+// a different app).
+func TestRollbackApp_ExplicitTarget_NotFound(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "rb-404")
+	if err := e.store.MarkDeploymentLive(context.Background(), dep.ID); err != nil {
+		t.Fatal(err)
+	}
+	bogus := "00000000-0000-0000-0000-000000000000"
+	body := api.RollbackRequest{TargetDeploymentID: &bogus}
+	rec := e.do(t, "POST", "/v1/apps/rb-404/rollback", body, nil)
+	assertProblem(t, rec, http.StatusNotFound, api.CodeRollbackTargetNotFound)
+}
+
+// TestRollbackApp_ExplicitTarget_AlreadyLive confirms the 409 path
+// when the caller names a deployment that is currently live (i.e.
+// asking to "rollback" to the already-current deployment is rejected
+// rather than silently no-op'd).
+func TestRollbackApp_ExplicitTarget_AlreadyLive(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "rb-live-target")
+	if err := e.store.MarkDeploymentLive(context.Background(), dep.ID); err != nil {
+		t.Fatal(err)
+	}
+	body := api.RollbackRequest{TargetDeploymentID: &dep.ID}
+	rec := e.do(t, "POST", "/v1/apps/rb-live-target/rollback", body, nil)
+	assertProblem(t, rec, http.StatusConflict, api.CodeRollbackTargetAlreadyLive)
+}
+
+// TestRollbackApp_LegacyEmptyBodyUnchanged confirms the back-compat
+// path: POST without a body falls through to "rollback to most-recent
+// superseded deployment". Equivalent to the pre-G behaviour.
+func TestRollbackApp_LegacyEmptyBodyUnchanged(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep1 := mustSeedDeployment(t, e, "rb-legacy")
+	if err := e.store.MarkDeploymentLive(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+	app, _ := e.store.AppBySlug(context.Background(), "rb-legacy")
+	dep2, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:" + repeat("b", 64),
+		Kind:        state.DeploymentKindImage,
+		Status:      state.DeployBuilding,
+		CreatedAt:   time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentLive(context.Background(), dep2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.MarkDeploymentSuperseded(context.Background(), dep1.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// No body. Legacy path: rollback to most-recent superseded = dep1.
+	rec := e.do(t, "POST", "/v1/apps/rb-legacy/rollback", nil, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ID != dep1.ID {
+		t.Errorf("legacy path returned id=%s, want %s (most-recent superseded)", out.ID, dep1.ID)
+	}
+}
+
 // TestParkApp_HappyPath confirms the app flips to AppEvictedCold.
 func TestParkApp_HappyPath(t *testing.T) {
 	e := setup(t, api.PlanPro)
