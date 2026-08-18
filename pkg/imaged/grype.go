@@ -172,7 +172,13 @@ func prepareGrypeSource(ctx context.Context, source string) (string, func(), err
 	if info.IsDir() {
 		candidate := filepath.Join(source, "rootfs.ext4")
 		candidateInfo, statErr := os.Stat(candidate)
-		if statErr != nil || candidateInfo.IsDir() {
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return source, func() {}, nil
+			}
+			return "", func() {}, fmt.Errorf("stat rootfs image: %w", statErr)
+		}
+		if candidateInfo.IsDir() {
 			return source, func() {}, nil
 		}
 		image = candidate

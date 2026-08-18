@@ -496,7 +496,7 @@ func (c *LocalCacheBackend) openCache(key string) (io.ReadCloser, bool) {
 	if _, err := os.Stat(metaPath); err != nil {
 		return nil, false
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:forbidigo // path is derived from the validated cache key under the backend root.
 	if err != nil {
 		return nil, false
 	}
@@ -549,7 +549,7 @@ func (c *LocalCacheBackend) materializeCache(ctx context.Context, key string, sr
 	// caller, but is not retained as a cache entry. Keep the temporary file
 	// open through a cleanup wrapper for that case.
 	if n > c.maxBytes {
-		f, err := os.Open(tmpPath)
+		f, err := os.Open(tmpPath) //nolint:forbidigo // tmpPath was created by os.CreateTemp in this cache directory.
 		if err != nil {
 			return nil, fmt.Errorf("cache reopen %q: %w", tmpPath, err)
 		}
@@ -571,7 +571,7 @@ func (c *LocalCacheBackend) materializeCache(ctx context.Context, key string, sr
 	if err := c.enforceBudgetLocked(); err != nil {
 		_ = err
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:forbidigo // path is derived from the validated cache key under the backend root.
 	if err != nil {
 		return nil, fmt.Errorf("cache open %q: %w", path, err)
 	}

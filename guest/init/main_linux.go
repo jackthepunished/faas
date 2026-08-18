@@ -420,11 +420,11 @@ func ensureRailpackMise() error {
 }
 
 func stageExecutable(source, target string) error {
-	in, err := os.Open(source)
+	in, err := os.Open(source) //nolint:forbidigo // source is the builder image's vetted mise path.
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return fmt.Errorf("create target directory: %w", err)
 	}
