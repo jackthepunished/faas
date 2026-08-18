@@ -147,3 +147,44 @@ func TestPushUsageRecord_NilClient_WrapsErrNoAPIKey(t *testing.T) {
 		t.Errorf("err = %v; want errors.Is(err, ErrNoAPIKey)", err)
 	}
 }
+
+// TestNewProvider_RejectsEmptyAPIKey pins the B2-load-bearing invariant
+// added in PR #962 review CRIT-2: NewProvider must refuse to construct a
+// *Provider with an empty apiKey. Pre-PR-#962 the SDK silently accepted
+// "" and EnsurePlanProducts then dialed api.paddle.com with no auth,
+// which the loader warn-logged once and the boot-path silently degraded
+// to a 401 on every changePlan/402 path. Every fresh dev box or CI
+// runner that hadn't onboarded Paddle yet hit that cycle silently —
+// the launch cluster removed the on-by-default silent-skip path.
+//
+// Whitespace-only keys are treated as empty (heredoc typos in
+// sealed.env). The test pins errors.Is(err, ErrNoAPIKey) so the
+// loader can map the error onto its operator-friendly fail-loud
+// message without sniffing strings.
+func TestNewProvider_RejectsEmptyAPIKey(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		apiKey string
+	}{
+		{name: "empty", apiKey: ""},
+		{name: "whitespace_only", apiKey: "   "},
+		{name: "tab_only", apiKey: "\t"},
+		{name: "newline_only", apiKey: "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := NewProvider(tc.apiKey, "whk_test", true, discardLogForTest(t))
+			if err == nil {
+				t.Fatalf("NewProvider(%q) = (%v, nil); want (nil, error)", tc.apiKey, p)
+			}
+			if !errors.Is(err, ErrNoAPIKey) {
+				t.Errorf("err = %v; want errors.Is(err, ErrNoAPIKey)", err)
+			}
+			if p != nil {
+				t.Errorf("provider = %v; want nil on rejection", p)
+			}
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -195,6 +196,24 @@ func PaddleCapabilities() billing.CapabilitySet {
 func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) (*Provider, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	// ADR-032 v2: Paddle is the production default (FAAS_BILLING_PROVIDER=""
+	// → Paddle). Refuse to construct a *Provider with an empty apiKey —
+	// the SDK accepts empty keys silently, EnsurePlanProducts then dials
+	// api.paddle.com (or api.sandbox.paddle.com) with no auth, and the
+	// whole boot-time catalog hydration degrades to a per-call 401 that
+	// the loader warn-logs once. Every fresh CI runner + dev box that
+	// hasn't onboarded Paddle yet would silently hit that path. The B2
+	// invariant is "daemon refuses to start without a valid key, not
+	// boots and emits 401s at runtime". Fail loud at constructor time so
+	// the loader's existing error path returns the operator to a
+	// clear "set FAAS_PADDLE_API_KEY" message.
+	//
+	// Whitespace-only keys are treated as empty (vet-against-env typos
+	// like a missed unquoted space from a heredoc). The webhookSecret
+	// stays optional for the meterd path (no ingress).
+	if strings.TrimSpace(apiKey) == "" {
+		return nil, fmt.Errorf("paddle: %w (set FAAS_PADDLE_API_KEY=… in sealed.env; the loader will not default a missing key at v2)", ErrNoAPIKey)
 	}
 	httpClient := &http.Client{Transport: NewIdempotencyRT(http.DefaultTransport)}
 	var client *paddle.SDK
