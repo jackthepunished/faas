@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,10 @@ import (
 type localOCIIndex struct {
 	Manifests []oci.Descriptor `json:"manifests"`
 }
+
+// Bound local layer extraction so a malformed archive cannot consume an
+// unbounded amount of disk while imaged copies a builderd artifact.
+const maxLocalOCILayerBytes = 16 << 30
 
 // loadLocalOCIArchive opens a builderd-produced OCI layout tarball, extracts
 // its gzip-compressed layer blobs to temporary files, and parses the image
@@ -109,6 +114,9 @@ func loadLocalOCIArchive(archivePath string) (oci.Config, []io.ReadCloser, func(
 }
 
 func readLocalOCIEntry(archivePath, name string, maxBytes int64) ([]byte, error) {
+	// archivePath is an internal builderd output selected from the deployment
+	// row, not a customer-supplied path crossing the host boundary.
+	//nolint:forbidigo // the local OCI reader must open this vetted artifact.
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return nil, err
@@ -117,7 +125,7 @@ func readLocalOCIEntry(archivePath, name string, maxBytes int64) ([]byte, error)
 	tr := tar.NewReader(f)
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -140,6 +148,9 @@ func readLocalOCIEntry(archivePath, name string, maxBytes int64) ([]byte, error)
 }
 
 func extractLocalOCIBlobs(archivePath, configName string, layerNames map[string]int, layerFiles []*os.File) ([]byte, error) {
+	// archivePath is an internal builderd output selected from the deployment
+	// row, not a customer-supplied path crossing the host boundary.
+	//nolint:forbidigo // the local OCI reader must open this vetted artifact.
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return nil, err
@@ -150,7 +161,7 @@ func extractLocalOCIBlobs(archivePath, configName string, layerNames map[string]
 	seenLayers := make([]bool, len(layerFiles))
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -162,7 +173,11 @@ func extractLocalOCIBlobs(archivePath, configName string, layerNames map[string]
 			if seenLayers[i] {
 				return nil, fmt.Errorf("duplicate OCI layer entry %q", hdr.Name)
 			}
-			_, err = io.Copy(layerFiles[i], tr)
+			var copied int64
+			copied, err = io.Copy(layerFiles[i], io.LimitReader(tr, maxLocalOCILayerBytes+1))
+			if err == nil && copied > maxLocalOCILayerBytes {
+				err = fmt.Errorf("OCI layer %q exceeds %d bytes", hdr.Name, maxLocalOCILayerBytes)
+			}
 			seenLayers[i] = true
 		}
 		if err != nil {
@@ -214,7 +229,7 @@ func (h *Handler) buildLocalOCIAppLayer(ctx context.Context, app state.App, dep 
 		return fmt.Errorf("imaged: built OCI manifest: %w", err)
 	}
 	if manifest.Healthz == "" {
-		manifest.Healthz = "/healthz"
+		manifest.Healthz = defaultHealthzPath
 	}
 	if manifest.Env == nil {
 		manifest.Env = make(map[string]string, 1)

@@ -1344,7 +1344,7 @@ func (v *JailerVMM) exportBuildArtifacts(instance, exportDir string) error {
 	// filesystem features reject noload.
 	if out, mountErr := exec.Command("mount", "-o", "loop,ro,noload", drive1, mp).CombinedOutput(); mountErr != nil {
 		if roOut, roErr := exec.Command("mount", "-o", "loop,ro", drive1, mp).CombinedOutput(); roErr != nil {
-			return fmt.Errorf("mount loop: ro,noload=%v (%s); ro=%v (%s)", mountErr, bytes.TrimSpace(out), roErr, bytes.TrimSpace(roOut))
+			return fmt.Errorf("mount loop: ro,noload=%w (%s); ro=%w (%s)", mountErr, bytes.TrimSpace(out), roErr, bytes.TrimSpace(roOut))
 		}
 	}
 	defer func() { _ = exec.Command("umount", mp).Run() }()
@@ -1951,7 +1951,7 @@ func (v *JailerVMM) startJailer(_ context.Context, l Lease, extraFCArgs ...strin
 	if f, openErr := os.OpenFile(filepath.Join("/var/log/faas", "vm-"+l.Instance+".console"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640); openErr == nil {
 		consoleFile = f
 	}
-	var stdout io.Writer = io.Discard
+	stdout := io.Discard
 	if ring != nil {
 		// Stream FC's stdout (kernel printk + guest /dev/console writers)
 		// into the per-instance ring. stderr stays discarded — FC only

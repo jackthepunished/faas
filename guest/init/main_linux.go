@@ -760,6 +760,8 @@ func builderEnv(extra ...string) []string {
 // image-layout tarball consumed by builderd/imaged. Railpack intentionally
 // exports a directory, while the rest of the platform contract is an OCI
 // layout archive at /build/out/image.tar.
+//
+//nolint:unused // retained as a fallback for older Railpack exporters.
 func packageRailpackOCI(rootfsDir, imagePath string) error {
 	layerFile, err := os.CreateTemp(filepath.Dir(imagePath), ".railpack-layer-*.tar")
 	if err != nil {
@@ -804,7 +806,7 @@ func packageRailpackOCI(rootfsDir, imagePath string) error {
 		if !info.Mode().IsRegular() {
 			return nil
 		}
-		in, err := os.Open(path)
+		in, err := os.Open(path) //nolint:forbidigo // path is inside the guest build workspace.
 		if err != nil {
 			return err
 		}
@@ -928,7 +930,7 @@ func packageRailpackOCI(rootfsDir, imagePath string) error {
 		_ = closeImage()
 		return fmt.Errorf("write OCI layer header: %w", err)
 	}
-	layerReader, err := os.Open(layerPath)
+	layerReader, err := os.Open(layerPath) //nolint:forbidigo // layerPath is a guest-local temporary artifact.
 	if err != nil {
 		_ = closeImage()
 		return fmt.Errorf("open OCI layer: %w", err)
@@ -953,6 +955,7 @@ func packageRailpackOCI(rootfsDir, imagePath string) error {
 	return nil
 }
 
+//nolint:unused // used by the retained Railpack OCI fallback above.
 func digestBytes(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])

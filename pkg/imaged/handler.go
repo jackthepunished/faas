@@ -36,6 +36,8 @@ import (
 	"filippo.io/age"
 )
 
+const defaultHealthzPath = "/healthz"
+
 // Notifier is the minimal interface imaged needs from pkg/db. The real
 // implementation is db.Notify (postgres LISTEN/NOTIFY); tests inject a fake.
 type Notifier interface {
@@ -1951,7 +1953,7 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 	// handler_test.go asserts every runtime's argv verbatim.
 	manifest := api.AppManifest{
 		Port:    api.DefaultAppPort,
-		Healthz: "/healthz",
+		Healthz: defaultHealthzPath,
 		Entrypoint: []string{
 			"/usr/local/bin/faas-runner",
 			"--runtime", runtime,
@@ -2165,7 +2167,7 @@ func manifestFromImageConfig(cfg oci.ImageConfig) api.AppManifest {
 	// who intentionally sets Healthz="" to opt out of the readiness
 	// probe would be silently overridden.
 	if manifest.Healthz == "" {
-		manifest.Healthz = "/healthz"
+		manifest.Healthz = defaultHealthzPath
 	}
 	if manifest.Env == nil {
 		manifest.Env = make(map[string]string, 1)

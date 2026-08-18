@@ -168,12 +168,12 @@ func addHostEntropy(entropy []byte) error {
 		if errno == unix.EPERM || errno == unix.EINVAL {
 			fallback, openErr := os.OpenFile(urandomPath, os.O_WRONLY, 0)
 			if openErr != nil {
-				return fmt.Errorf("ioctl(RNDADDENTROPY): %w; fallback open %s: %v", errno, urandomPath, openErr)
+				return fmt.Errorf("ioctl(RNDADDENTROPY): %w; fallback open %s: %w", errno, urandomPath, openErr)
 			}
 			_, writeErr := fallback.Write(entropy)
 			_ = fallback.Close()
 			if writeErr != nil {
-				return fmt.Errorf("ioctl(RNDADDENTROPY): %w; fallback write: %v", errno, writeErr)
+				return fmt.Errorf("ioctl(RNDADDENTROPY): %w; fallback write: %w", errno, writeErr)
 			}
 			resumeDiag("addHostEntropy: ioctl rejected; fallback urandom write succeeded")
 			return nil
