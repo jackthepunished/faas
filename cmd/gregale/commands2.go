@@ -122,6 +122,12 @@ const (
 	// appSlugFallback — the dispatch table places it before the
 	// "app" case so `gregale deployment <id>` is never read as an app slug.
 	dispatchDeployment = "deployment"
+
+	// Read-only operator verb (issue #952). Routes to cmdInspect
+	// (commands_inspect.go), which owns the verb-level FlagSet +
+	// slug validation and dispatches to the per-leaf file
+	// (commands_inspect_upstreams.go for v1).
+	dispatchInspect = "inspect"
 )
 
 // cmdApp implements `gregale app <slug>` (GET /v1/apps/{slug}), `gregale app <slug>

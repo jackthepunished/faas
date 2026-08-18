@@ -343,6 +343,23 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:        dispatchInspect,
+		DocSlug:     "inspect",
+		Short:       "Read-only operator surface (inspect <slug> --upstreams [--scope <scope>] [--json])",
+		Positionals: []string{"<slug>"},
+		// The leaf-set today is just --upstreams (ADR-098 §9.A);
+		// future leaves (--env, --crons, --instances) add a
+		// cliSub entry here. The completion backend renders each
+		// cliSub as a verb choice on the inspect verb's own
+		// completion script — `--upstreams` is shown alongside
+		// the future `--env` / `--crons` etc.
+		Subcommands: []cliSub{
+			{Name: "upstreams", Short: "List data upstreams captured for this app (ADR-098 §9.A)", Flags: []cliFlag{
+				{Name: "scope", Short: "filter by scope (forwarded as ?scope=)"},
+			}},
+		},
+	},
+	{
 		Name:    "invoke",
 		DocSlug: "invoke",
 		Short:   "Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])",
