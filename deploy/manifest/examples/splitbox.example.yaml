@@ -114,10 +114,10 @@ daemons:
   gatewayd_internal:
     bind: unix:///run/faas/gatewayd-internal.sock
 
-# Overlay — per-host overlay network identity. The renderer writes
-# /etc/hosts entries so the canonical DNS names (schedd.faas,
-# vmmd.faas) resolve to the control-plane VPC address. The CIDR
-# is the overlay subnet; each host's address must fall within it.
+# Overlay — per-host overlay network identity. The generated Ansible
+# inventory writes /etc/hosts entries so the private PKI names
+# (schedd.faas, vmmd.faas) resolve to the manifest overlay addresses.
+# The CIDR is the overlay subnet; each host's address must fall within it.
 overlay:
   provider: wireguard
   cidr: 10.42.0.0/24
