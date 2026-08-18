@@ -1,0 +1,16 @@
+^I^Ip := a.Validate(ctx)$
+^I^Iif p == nil {$
+^I^I^It.Fatal("Validate() = nil, want rejection")$
+^I^I}$
+^I^Iif !strings.Contains(p.Detail, "does not support per-consumer throttling") {$
+^I^I^It.Errorf("expected plan-doesn't-support rejection; got %q", p.Detail)$
+^I^I}$
+^I})$
+}$
+$
+// ADR-093 / kind=budget DTO tests. The kind=budget validator$
+// pins the apid-side wire contract for the per-request wall-clock$
+// budget primitive. Mirrors the kind=limit shape (two simple$
+// fields, table-driven negative arms) ‚M-^@M-^T the action shape is$
+// intentionally tiny so the apid-side predicate is the entire$
+// wire contract and the gateway compile step$

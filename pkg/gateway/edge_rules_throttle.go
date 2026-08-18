@@ -56,6 +56,24 @@ package gateway
 // ceiling (plan.RateLimitRPS, plan.RateLimitBurst) never reaches
 // this struct because compileThrottleRules log-warns + clamps — the
 // same posture compileLimitRules takes for kind=limit.
+//
+// Phase 3 (ADR-091 D20.5 amendment 4, ADR-104, issue #881 Phase 3)
+// extends the resolved shape with three per-consumer keying fields.
+// The applier (handler.go::applyEdgeRuleThrottle) reads these and
+// routes the bucket-key construction through Limiter.AllowWithParams
+// (back-compat, KeyBy == "" or "none") or Limiter.AllowWithConsumerKey
+// (per-consumer, KeyBy ∈ {"api_key","jwt_subject","jwt_claim"}):
+//
+//   - KeyBy           closed vocab from api.ThrottleKeyBy*.
+//     Empty / "none" preserves PR #887 behaviour.
+//   - JWTClaimName    required iff KeyBy == "jwt_claim"; named JWT
+//     custom claim to extract from the request.
+//   - MaxKeysPerRule  caps the per-rule consumer-set cardinality;
+//     over-cap consumers collapse into a single
+//     non-evicting __other__ bucket that still
+//     consumes tokens (ADR-104 §Consequences).
+//     0 = use plan default at apply time (resolver
+//     in cmd-side compileThrottleRules).
 type EdgeRuleThrottleResolved struct {
 	ID                string
 	AccountID         string
@@ -65,6 +83,10 @@ type EdgeRuleThrottleResolved struct {
 	Methods           map[string]bool // nil = any method
 	RequestsPerSecond float64         // > 0 post-compile
 	Burst             int             // > 0 post-compile
+	// Phase 3 (ADR-104):
+	KeyBy          string // "" | "none" | "api_key" | "jwt_subject" | "jwt_claim"
+	JWTClaimName   string // required iff KeyBy == "jwt_claim"
+	MaxKeysPerRule int    // 0 = plan default; capped at compileThrottleRules
 }
 
 // PickFirstThrottleMatch is the priority-ASC + methods +

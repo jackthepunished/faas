@@ -146,6 +146,26 @@ type Limits struct {
 	// the per-minute sum across all their apps.
 	RateLimitPerAccountRPM int
 
+	// ThrottleMaxKeysPerRule (ADR-104 / issue #881 Phase 3) caps the
+	// cardinality of the per-consumer bucket map for a single
+	// kind=throttle rule. Distinct from EdgeRulesThrottlePerApp (the
+	// per-app quota on how many throttle rules an app may hold) and
+	// from RateLimitRPS/Burst (the per-rule rps/burst ceiling). The
+	// value bounds the consumer-set size: when the set exceeds this
+	// number, all over-cap callers collapse into a single
+	// non-evicting __other__ bucket that still consumes tokens
+	// (ADR-104 §"Consequences"). 0 means the plan does NOT expose
+	// per-consumer throttling — the apid validator rejects any rule
+	// that opts into a non-"none" KeyBy when this is 0.
+	//
+	// Per-plan: Free 100, Hobby 1000, Pro 5000, Scale 10000. The
+	// doubling shape (100 → 1000 → 5000 → 10000) tracks plan headroom:
+	// a Hobby customer can size per-key limits on a meaningful
+	// fraction of their app's key space; a Scale customer can size
+	// per-tenant limits in a multi-tenant deployment. Plans below
+	// 100 (none today) would be trivially bypassable.
+	ThrottleMaxKeysPerRule int
+
 	// Wake-side admission (schedd layer). Throttles the rate at which
 	// schedd will admit a *new* wake operation for an app or account.
 	// Distinct from RateLimitRPS/Burst which throttle inbound HTTP
@@ -968,6 +988,11 @@ var planLimits = map[Plan]Limits{
 		// upgrade curve from Free → Scale is a single double/triple
 		// progression a customer can predict.
 		EdgeRulesThrottlePerApp: 1,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		// Free customers can size per-key throttles on a small slice
+		// of their key space; large-cardinality per-key limits
+		// require a paid plan.
+		ThrottleMaxKeysPerRule: 100,
 		// Tenant surfaces (ADR-099 / issue #879): Free is the
 		// abuse-floor tier. The `tenant_surfaces` feature is the
 		// upsell — Free customers carry the single-tenant case via
@@ -1213,6 +1238,8 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 5,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
 		// entry paid tier — 1 surface with up to 10 verified
 		// hostnames. The "single SaaS customer, a handful of
@@ -1443,6 +1470,8 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 25,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
 		// with up to 50 verified hostnames each — the growing-SaaS
 		// tier. Each surface still binds to one app, so 5 surfaces
@@ -1668,6 +1697,8 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 100,
+		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
+		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
 		// surfaces with up to 250 verified hostnames each — the
 		// established-SaaS tier. The 250 cap is bounded by LE's

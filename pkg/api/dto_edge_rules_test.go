@@ -560,7 +560,183 @@ func TestEdgeRuleLimitAction_Validate_Accepts(t *testing.T) {
 	}
 }
 
-// ----------------------------------------------------------------------------
+// TestEdgeRuleThrottleAction_Validate_PinBackCompat pins the
+// PR #887 → ADR-104 back-compat contract: a rule with all Phase-3
+// fields at their zero-values must continue to Validate() exactly
+// as it did before Phase 3 landed. The plan §"Verification"
+// calls this out as TestEdgeRuleThrottle_NoBackCompatRegression;
+// this test is the apid-side counterpart (the limiter-side
+// counterpart lives in pkg/gateway/ratelimit_test.go::TestLimiter_
+// ThrottleRule_NoBackCompatRegression, written in PR-2).
+func TestEdgeRuleThrottleAction_Validate_PinBackCompat(t *testing.T) {
+	cases := []struct {
+		name string
+		a    EdgeRuleThrottleAction
+	}{
+		{
+			name: "all Phase-3 fields zero (PR #887 shape)",
+			a:    EdgeRuleThrottleAction{RequestsPerSecond: 10, Burst: 20},
+		},
+		{
+			name: "explicit key_by=none mirrors zero-value",
+			a:    EdgeRuleThrottleAction{RequestsPerSecond: 10, Burst: 20, KeyBy: ThrottleKeyByNone},
+		},
+		{
+			name: "key_by=api_key with no other Phase-3 fields",
+			a:    EdgeRuleThrottleAction{RequestsPerSecond: 10, Burst: 20, KeyBy: ThrottleKeyByAPIKey},
+		},
+		{
+			name: "key_by=jwt_subject with no other Phase-3 fields",
+			a:    EdgeRuleThrottleAction{RequestsPerSecond: 10, Burst: 20, KeyBy: ThrottleKeyByJWTSubject},
+		},
+	}
+	ctx := ThrottleValidationContext{
+		PlanMaxRPS: 100, PlanMaxBurst: 500,
+		PlanMaxKeysPerRule: 1000, // Hobby default (ADR-104 ladder).
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if p := tc.a.Validate(ctx); p != nil {
+				t.Errorf("Validate() = %v, want nil (back-compat regression)", p)
+			}
+		})
+	}
+}
+
+// TestEdgeRuleThrottleAction_Validate_Rejects pins every Phase-3
+// rejection arm. The Phase-3 surface is small (3 new fields) but
+// each rejection is load-bearing:
+//
+//   - jwt_claim_name without key_by="jwt_claim" — silently wrong,
+//     the limiter would never extract a claim → no bucket key
+//     → no per-consumer limit. The validator catches it before
+//     the rule ships.
+//   - jwt_claim_name with key_by="jwt_claim" but invalid format —
+//     risks metric-label cardinality explosion (CodeQL precedent).
+//   - max_keys_per_rule above plan ceiling — direct bypass of
+//     the bounded design (ADR-104 §"Consequences" load-bearing
+//     property).
+//   - max_keys_per_rule set when key_by=none — moot value, footgun.
+//   - unknown key_by value — closed-vocab contract.
+func TestEdgeRuleThrottleAction_Validate_Rejects(t *testing.T) {
+	ctx := ThrottleValidationContext{
+		PlanMaxRPS: 100, PlanMaxBurst: 500,
+		PlanMaxKeysPerRule: 1000,
+	}
+	cases := []struct {
+		name   string
+		mutate func(a *EdgeRuleThrottleAction)
+		want   string // expected substring in Problem.Detail
+	}{
+		{
+			name:   "jwt_claim_name without key_by=jwt_claim",
+			mutate: func(a *EdgeRuleThrottleAction) { a.JWTClaimName = "tier" },
+			want:   `jwt_claim_name requires key_by="jwt_claim"`,
+		},
+		{
+			name: "jwt_claim_name with key_by=api_key",
+			mutate: func(a *EdgeRuleThrottleAction) {
+				a.KeyBy = ThrottleKeyByAPIKey
+				a.JWTClaimName = "tier"
+			},
+			want: `jwt_claim_name is only valid with key_by="jwt_claim"`,
+		},
+		{
+			name: "jwt_claim_name invalid format (leading digit)",
+			mutate: func(a *EdgeRuleThrottleAction) {
+				a.KeyBy = ThrottleKeyByJWTClaim
+				a.JWTClaimName = "1tier"
+			},
+			want: `must match ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`,
+		},
+		{
+			name: "jwt_claim_name too long",
+			mutate: func(a *EdgeRuleThrottleAction) {
+				a.KeyBy = ThrottleKeyByJWTClaim
+				a.JWTClaimName = strings.Repeat("a", 65) // 65 chars; regex caps at 64 (1 + 63)
+			},
+			want: `must match ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`,
+		},
+		{
+			name: "max_keys_per_rule above plan ceiling",
+			mutate: func(a *EdgeRuleThrottleAction) {
+				a.KeyBy = ThrottleKeyByAPIKey
+				a.MaxKeysPerRule = 5000
+			},
+			want: `max_keys_per_rule 5000 exceeds the plan ceiling 1000`,
+		},
+		{
+			name: "max_keys_per_rule negative",
+			mutate: func(a *EdgeRuleThrottleAction) {
+				a.KeyBy = ThrottleKeyByAPIKey
+				a.MaxKeysPerRule = -1
+			},
+			want: `max_keys_per_rule must be >= 0`,
+		},
+		{
+			name: "max_keys_per_rule with key_by=none (footgun)",
+			mutate: func(a *EdgeRuleThrottleAction) {
+				a.KeyBy = ThrottleKeyByNone
+				a.MaxKeysPerRule = 500
+			},
+			want: `max_keys_per_rule requires key_by != "none"`,
+		},
+		{
+			name:   "unknown key_by value",
+			mutate: func(a *EdgeRuleThrottleAction) { a.KeyBy = "ip_address" },
+			want:   `key_by "ip_address" is not in the closed vocab`,
+		},
+		{
+			name: "key_by=jwt_claim without jwt_claim_name",
+			mutate: func(a *EdgeRuleThrottleAction) {
+				a.KeyBy = ThrottleKeyByJWTClaim
+			},
+			want: `jwt_claim_name is required when key_by="jwt_claim"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := EdgeRuleThrottleAction{RequestsPerSecond: 10, Burst: 20}
+			tc.mutate(&a)
+			p := a.Validate(ctx)
+			if p == nil {
+				t.Fatalf("Validate() = nil, want Problem containing %q", tc.want)
+			}
+			if !strings.Contains(p.Detail, tc.want) {
+				t.Errorf("Validate() Detail = %q, want substring %q", p.Detail, tc.want)
+			}
+		})
+	}
+}
+
+// TestEdgeRuleThrottleAction_Validate_AcceptsPlanZero pins the
+// "plan doesn't expose per-consumer throttling" posture: a plan
+// with PlanMaxKeysPerRule=0 must reject any non-"none" key_by,
+// but accept the zero-value shape (the abuse-desk / free-tier
+// defaults stay usable).
+func TestEdgeRuleThrottleAction_Validate_AcceptsPlanZero(t *testing.T) {
+	ctx := ThrottleValidationContext{
+		PlanMaxRPS: 100, PlanMaxBurst: 500,
+		PlanMaxKeysPerRule: 0, // plan doesn't expose per-consumer
+	}
+	t.Run("zero-value shape accepted", func(t *testing.T) {
+		a := EdgeRuleThrottleAction{RequestsPerSecond: 10, Burst: 20}
+		if p := a.Validate(ctx); p != nil {
+			t.Errorf("Validate() = %v, want nil", p)
+		}
+	})
+	t.Run("key_by=api_key rejected", func(t *testing.T) {
+		a := EdgeRuleThrottleAction{RequestsPerSecond: 10, Burst: 20, KeyBy: ThrottleKeyByAPIKey}
+		p := a.Validate(ctx)
+		if p == nil {
+			t.Fatal("Validate() = nil, want rejection")
+		}
+		if !strings.Contains(p.Detail, "does not support per-consumer throttling") {
+			t.Errorf("expected plan-doesn't-support rejection; got %q", p.Detail)
+		}
+	})
+}
+
 // ADR-093 / kind=budget DTO tests. The kind=budget validator
 // pins the apid-side wire contract for the per-request wall-clock
 // budget primitive. Mirrors the kind=limit shape (two simple
