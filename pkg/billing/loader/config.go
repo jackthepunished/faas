@@ -43,8 +43,9 @@ const (
 // loader doesn't import pkg/billing.
 type RootBillingConfig struct {
 	// Provider selects the active provider. Empty defaults to
-	// "stripe" so pre-PR-P2 behaviour (env-only with Stripe
-	// fallback) is preserved. Valid values: "stripe", "paddle".
+	// "paddle" (the production billing provider at v2 per
+	// ADR-032 v2). Use cfg.DefaultProvider() to read with the
+	// implicit default applied. Valid values: "stripe", "paddle".
 	// Unknown values fail the daemon boot with the same error
 	// message the loader would have raised on a typo'd env var.
 	Provider string `toml:"provider"`
@@ -58,6 +59,24 @@ type RootBillingConfig struct {
 	// Paddle is the [billing.paddle] block. Same nil semantics
 	// as Stripe.
 	Paddle *paddle.Config `toml:"paddle"`
+}
+
+// DefaultProvider returns the active provider literal with the
+// implicit-default applied (v2 = "paddle"). LoadProviderForAPID
+// and LoadProviderForMeterd both go through this method so the
+// default lives in exactly one place. A future ADR that flips the
+// default (e.g. LemonSqueezy) updates this method + the test pin
+// at TestRootBillingConfig_DefaultProvider_PaddleAtV2, and the two
+// loader sites change mechanically.
+//
+// The legacy "stripe" opt-in (FAAS_BILLING_PROVIDER=stripe) is
+// unaffected: an explicit value still wins; this method only fires
+// when Provider == "".
+func (c *RootBillingConfig) DefaultProvider() string {
+	if c == nil || c.Provider == "" {
+		return providerPaddle
+	}
+	return c.Provider
 }
 
 // BillingFile wraps the [billing] sub-block. Used by the daemon's

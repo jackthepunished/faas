@@ -486,3 +486,58 @@ func TestLoadProviderForMeterd_TOMLPaddleKeyUsedWhenEnvEmpty(t *testing.T) {
 		t.Fatal("provider = nil, want non-nil *paddle.Provider (TOML key should have been used)")
 	}
 }
+
+// TestRootBillingConfig_DefaultProvider_PaddleAtV2 pins the implicit
+// default hoisted into RootBillingConfig.DefaultProvider() (PR #962
+// MED-1 fix). The single seam means a future default flip is a
+// one-edit change rather than a three-edit change. Both the legacy
+// "stripe" opt-in and an empty cfg must produce the right answer.
+func TestRootBillingConfig_DefaultProvider_PaddleAtV2(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		cfg    *RootBillingConfig
+		expose func(*RootBillingConfig) string
+		want   string
+	}{
+		{
+			name:   "empty provider field → paddle (v2 default)",
+			cfg:    &RootBillingConfig{Provider: ""},
+			expose: func(c *RootBillingConfig) string { return c.DefaultProvider() },
+			want:   "paddle",
+		},
+		{
+			name:   "explicit stripe is honoured",
+			cfg:    &RootBillingConfig{Provider: "stripe"},
+			expose: func(c *RootBillingConfig) string { return c.DefaultProvider() },
+			want:   "stripe",
+		},
+		{
+			name:   "explicit paddle is honoured",
+			cfg:    &RootBillingConfig{Provider: "paddle"},
+			expose: func(c *RootBillingConfig) string { return c.DefaultProvider() },
+			want:   "paddle",
+		},
+		{
+			name:   "nil receiver returns the default (graceful)",
+			cfg:    nil,
+			expose: func(c *RootBillingConfig) string { return c.DefaultProvider() },
+			want:   "paddle",
+		},
+		{
+			name:   "explicit unknown value is passed through (loader surfaces the 'unknown' error)",
+			cfg:    &RootBillingConfig{Provider: "braintree"},
+			expose: func(c *RootBillingConfig) string { return c.DefaultProvider() },
+			want:   "braintree",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.expose(tc.cfg)
+			if got != tc.want {
+				t.Errorf("DefaultProvider() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
