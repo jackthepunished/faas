@@ -199,20 +199,25 @@ type Limits struct {
 	EgressMbit int // per-instance egress bandwidth cap via tc
 
 	// Secrets (spec §11/G2). Ciphertext quota per app; per-value byte cap.
-	// SecretCountMax bounds the (app_id, key) row count. SecretValueMaxBytes
-	// bounds the plaintext value the customer may PUT — apid rejects larger
-	// values with 413 CodeSecretValueTooLarge before sealing.
-	SecretCountMax      int // max secrets per app (Free 3, Hobby 25, Pro 50, Scale 100)
+	// SecretCountMax bounds the (app_id, scope, key) row count across every
+	// scope the customer has minted — ADR-090 D6 parallel posture for the
+	// secret surface (ADR-092). A Free-tier customer with 2 prod secrets +
+	// 2 staging secrets = 4 total exceeds the cap of 3 and gets 403
+	// CodePlanLimitSecrets on the next PUT. SecretValueMaxBytes bounds the
+	// plaintext value the customer may PUT — apid rejects larger values
+	// with 413 CodeSecretValueTooLarge before sealing.
+	SecretCountMax      int // max secrets per app across all scopes (Free 3, Hobby 25, Pro 50, Scale 100)
 	SecretValueMaxBytes int // per-secret value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
 	// Customer env vars (issue #395 / ADR-045). Plaintext per-app store
 	// for non-sensitive runtime config (LOG_LEVEL, FEATURE_X, etc.). The
 	// quota shape mirrors secrets minus the per-secret seal cost — values
 	// are stored as-is, no ciphertext. EnvVarsMax bounds the (app_id,
-	// key) row count. EnvValueMaxBytes bounds the per-value byte cap.
+	// scope, key) row count across every scope the customer has minted
+	// (ADR-090 D6). EnvValueMaxBytes bounds the per-value byte cap.
 	// Per-plan values are tuned to cover typical 12-factor config
 	// surface without letting one app monopolise the table.
-	EnvVarsMax       int // max env vars per app (Free 8, Hobby 32, Pro 64, Scale 256)
+	EnvVarsMax       int // max env vars per app across all scopes (Free 8, Hobby 32, Pro 64, Scale 256)
 	EnvValueMaxBytes int // per-value byte cap (Free 4K, Hobby 8K, Pro 16K, Scale 32K)
 
 	// TrustedSignerCountMax bounds the (app_id, signer_name) row count
