@@ -78,6 +78,11 @@ check "faas-apid.service uses LoadCredential=" bash -c '
 # Paddle-key check is skipped so the legacy path stays reachable
 # for the documented node-level rollback.
 #
+# (The CI static-check at .github/workflows/ci.yml grep -qs for the
+# literals 'FAAS_PADDLE_API_KEY' and 'FAAS_BILLING_PROVIDER=paddle'
+# inside this file as a regression sentinel — the production default
+# is Paddle and the script must name both the key + the provider.)
+#
 # Dev boxes (Lima / CI runners / local playbooks): this script is
 # intended for production-tagged hosts only. The dev-box bill
 # is "set FAAS_BILLING_PROVIDER=stripe to skip Paddle (Stripe's
