@@ -1,22 +1,29 @@
-# Billing provider switch (Stripe ↔ Paddle)
+# Billing provider switch (Paddle → Stripe legacy opt-in)
 
-The platform can run on either Stripe (default) or Paddle Billing v2
-(opt-in) via a single env-var selector (`FAAS_BILLING_PROVIDER`). This
-runbook covers switching a deployment between the two without code
-changes, migrations, or per-handler branching.
+The launch production billing provider is **Paddle Billing v2** (ADR-032 v2,
+accepted 2026-08-18). The legacy Stripe surface is still bootable from
+`FAAS_BILLING_PROVIDER=stripe` for a node-level opt-out, but the
+deploy template is Paddle-only. This runbook covers:
 
-The decision that a deployment uses Paddle at all is operator-side —
-the financial model spreadsheet keeps Stripe as the production
-reference for fee math; Paddle is the secondary surface for customers
-whose card issuers don't process USD-denominated Stripe charges.
+- The selector semantics in both directions.
+- The cutover procedure for a node-level rollback to Stripe (the
+  on-launch option, intended for a single-node hot-fix while the
+  broader cluster rolls forward).
+- The four `launch-checklist` gates a maintainer must run before the
+  v1.0.0 tag.
+
+> **Operator reminder (v2):** at launch there are no production
+> customers on Stripe. The pinned `stripe-go v70.15.0+incompatible`
+> module is preserved for admin endpoints + tests; only the runtime
+> dispatch is unwired.
 
 ## Selector
 
 | `FAAS_BILLING_PROVIDER` | Behavior                                         |
 |-------------------------|--------------------------------------------------|
-| (empty) / unset         | Stripe (default — bit-for-bit unchanged).        |
-| `stripe`                | Stripe (explicit).                               |
-| `paddle`                | Paddle Billing v2. Requires `FAAS_PADDLE_*`.    |
+| (empty) / unset         | Paddle (default — production billing provider).  |
+| `paddle`                | Paddle (explicit). Requires `FAAS_PADDLE_*`.    |
+| `stripe`                | Stripe (legacy opt-in for a node-level rollback). Requires `STRIPE_*`. |
 | anything else           | Daemon fails to boot with a typed error.         |
 
 The selector is the canonical name for both `apid` and `meterd`; both

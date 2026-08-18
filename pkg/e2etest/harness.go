@@ -889,6 +889,22 @@ func testEnvCommon(dbURL string) []string {
 		"FAAS_APP_ERRORS_ENABLED=false",
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
+		// PR #962 CRIT-2: paddle.NewProvider rejects empty / whitespace
+		// apiKey at construction. The e2e harness boots apid + meterd
+		// via startProc; the boot path is daemon-real (exec.Cmd, not
+		// deps injection). Without a sandbox-shaped key here, every
+		// boot fatals with "cannot push usage without apiKey" and
+		// every test that waits for a listener bound reports a
+		// misleading "port not bound" timeout. The pdl_* placeholder
+		// is what FAAS_PADDLE_SANDBOX=1 expects; the SDK accepts it
+		// and only rejects on auth at runtime, which is fine because
+		// no e2e test reaches a real Paddle call. The dedicated
+		// paddle_sandbox_e2e tests under cmd/e2e/billing_paddle_sandbox
+		// override these via secrets/.env.sandbox (PR-D workflow +
+		// `make e2e-sandbox`) and are unaffected.
+		"FAAS_PADDLE_SANDBOX=1",
+		"FAAS_PADDLE_API_KEY=pdl_test_e2e_placeholder",
+		"FAAS_PADDLE_WEBHOOK_SECRET=whk_test_e2e_placeholder",
 	}
 	if currentHarness != nil && currentHarness.RecoveryHMACKeyHex != "" {
 		env = append(env, "FAAS_MFA_RECOVERY_HMAC_KEY="+currentHarness.RecoveryHMACKeyHex)

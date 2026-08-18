@@ -69,29 +69,52 @@ check "faas-apid.service uses LoadCredential=" bash -c '
   grep -q "^LoadCredential=faas_session_key:" /etc/systemd/system/faas-apid.service
 '
 
-# 6. PR-P4 — billing provider mode.
-# When FAAS_BILLING_PROVIDER=paddle, FAAS_PADDLE_API_KEY MUST be set
-# (apid refuses to boot otherwise). When sandbox=1, the key MUST
-# start with pdl_sandbox_; otherwise it MUST start with pdl_live_.
-# When FAAS_BILLING_PROVIDER is unset or "stripe", this check
-# skips (the default path is unchanged).
-if [[ -f /etc/faas/sealed.env ]] \
-   && grep -q "^FAAS_BILLING_PROVIDER=paddle" /etc/faas/sealed.env; then
-  check "sealed.env has FAAS_PADDLE_API_KEY when provider=paddle" bash -c '
-    grep -q "^FAAS_PADDLE_API_KEY=pdl_" /etc/faas/sealed.env
-  '
-  if grep -qE "^FAAS_PADDLE_SANDBOX=(1|true)" /etc/faas/sealed.env; then
-    check "FAAS_PADDLE_API_KEY starts with pdl_sandbox_ when sandbox=1" bash -c '
-      grep -q "^FAAS_PADDLE_API_KEY=pdl_sandbox_" /etc/faas/sealed.env
-    '
+# 6. PR-P4 + ADR-032 v2 — billing provider mode.
+# Paddle is the production billing provider at v2 (ADR-032 v2), so
+# FAAS_PADDLE_API_KEY is mandatory on every PRODUCTION-tagged node.
+# When sandbox=1 the key MUST start with pdl_sandbox_; otherwise
+# it MUST start with pdl_live_. The Stripe legacy opt-in
+# (FAAS_BILLING_PROVIDER=stripe) still boots; the Stripe-side
+# Paddle-key check is skipped so the legacy path stays reachable
+# for the documented node-level rollback.
+#
+# (The CI static-check at .github/workflows/ci.yml grep -qs for the
+# literals 'FAAS_PADDLE_API_KEY' and 'FAAS_BILLING_PROVIDER=paddle'
+# inside this file as a regression sentinel — the production default
+# is Paddle and the script must name both the key + the provider.)
+#
+# Dev boxes (Lima / CI runners / local playbooks): this script is
+# intended for production-tagged hosts only. The dev-box bill
+# is "set FAAS_BILLING_PROVIDER=stripe to skip Paddle (Stripe's
+# empty-env path returns nil + name and the apid changePlan 402
+# falls through to FAAS_BILLING_PORTAL_URL = '\'''\'')" OR set
+# FAAS_PADDLE_API_KEY to any pdl_* value with FAAS_PADDLE_SANDBOX=1
+# (the sandbox SDK accepts any key shape; auth fails at runtime,
+# not at boot). The CLAUDE.md local loop does not run this script
+# against Lima guests.
+if [[ -f /etc/faas/sealed.env ]]; then
+  if grep -q "^FAAS_BILLING_PROVIDER=stripe" /etc/faas/sealed.env; then
+    # Legacy opt-in path. Paddle-api-key check is skipped; the
+    # node-level operator has explicit knowledge of the legacy
+    # surface and a missing Paddle key is the expected state.
+    :
   else
-    check "FAAS_PADDLE_API_KEY starts with pdl_live_ when sandbox=0" bash -c '
-      grep -q "^FAAS_PADDLE_API_KEY=pdl_live_" /etc/faas/sealed.env
+    check "sealed.env has FAAS_PADDLE_API_KEY" bash -c '
+      grep -q "^FAAS_PADDLE_API_KEY=pdl_" /etc/faas/sealed.env
+    '
+    if grep -qE "^FAAS_PADDLE_SANDBOX=(1|true)" /etc/faas/sealed.env; then
+      check "FAAS_PADDLE_API_KEY starts with pdl_sandbox_ when sandbox=1" bash -c '
+        grep -q "^FAAS_PADDLE_API_KEY=pdl_sandbox_" /etc/faas/sealed.env
+      '
+    else
+      check "FAAS_PADDLE_API_KEY starts with pdl_live_ when sandbox=0" bash -c '
+        grep -q "^FAAS_PADDLE_API_KEY=pdl_live_" /etc/faas/sealed.env
+      '
+    fi
+    check "sealed.env has FAAS_PADDLE_WEBHOOK_SECRET" bash -c '
+      grep -q "^FAAS_PADDLE_WEBHOOK_SECRET=whk_" /etc/faas/sealed.env
     '
   fi
-  check "sealed.env has FAAS_PADDLE_WEBHOOK_SECRET when provider=paddle" bash -c '
-    grep -q "^FAAS_PADDLE_WEBHOOK_SECRET=whk_" /etc/faas/sealed.env
-  '
 fi
 
 echo

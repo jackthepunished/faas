@@ -1,130 +1,195 @@
-# ADR-032 · Paddle as an opt-in billing provider (post-Stripe)
+# ADR-032 · Paddle Billing v2 as the production billing provider (v2)
 
 - **Status:** accepted
-- **Date:** 2026-07-24
-- **Supersedes:** none
-- **Related:** ADR-025 (provider-pluggable billing layer), §14 M7 acceptance,
-  the financial model spreadsheet (operator standing decision — Stripe
-  pricing remains the production reference).
+- **Date:** 2026-08-18
+- **Supersedes:** [ADR-032 v1](032-paddle-billing-provider-v1.md) (the
+  opt-in posture, kept as historical reference).
+- **Related:** ADR-025 (provider-pluggable billing layer), §14 M7 acceptance.
+  The financial-model re-validation against Paddle's MoR fee shape is
+  operator-owned and deferred (decision recorded here so the deviation is
+  traceable).
 
 ## Context
 
-ADR-025 added `pkg/billing.Provider` and PR #1+#2 extracted the Stripe
-facade and added a Paddle Billing v2 implementation. PR #3 (this ADR's
-landing PR) wires the platform end-to-end on either Stripe (default) or
-Paddle (opt-in via `FAAS_BILLING_PROVIDER=paddle`) with a single env-var
-selector, no per-handler branching, and bit-for-bit identical dunning
-state machine + customer-facing email flows.
+The v1 ADR (2026-07-24) added Paddle as an **opt-in** secondary surface
+behind `FAAS_BILLING_PROVIDER=paddle`, with the standing decision that
+Stripe remained the production default. PR-P3 / PR-P4 closed the four
+M7 dunning transitions, the cross-process overage dedupe, the per-account
+catalog hydration, and the operator runbook. The Paddle provider shipped
+at ≈5,000 LOC with ≈3,500 LOC of tests (50-iteration property test for the
+catalog invariant, the four-test live sandbox walk, the three webhook
+e2e cases) — feature-complete at the §14 M7 acceptance surface.
 
-The operator's standing decision (per the financial model spreadsheet
-review) is to keep Stripe as the production default. Paddle is a
-secondary surface for customers whose card issuers won't process
-USD-denominated Stripe charges (the operator's home country is one of
-those).
+The launch customer base is geographically mixed (per the founding
+whitepaper) and the operator's home-country card issuers don't always
+process USD-denominated Stripe charges. Paddle's MoR model absorbs VAT
+globally, which collapses a class of failure modes that would otherwise
+be a manual ops cost per region. The financial model spreadsheet
+(operator-owned) is the source of truth for unit-economics math; the
+re-validation against Paddle's fee shape is in flight and tracked
+outside this ADR.
+
+**There are no existing customers on Stripe at the time of this ADR.**
+A `cus_…` to `ctm_…` migration is therefore not in scope. The legacy
+Stripe module stays in the workspace (admin endpoints + tests still
+reference it) and the apid Stripe surface is still bootable from
+`FAAS_BILLING_PROVIDER=stripe` for a node-level opt-out, but the default
+flips to Paddle.
 
 ## Decision
 
-1. **`FAAS_BILLING_PROVIDER`** selects the provider at daemon boot.
-   Empty / unset / `"stripe"` → Stripe (default, bit-for-bit unchanged
-   from pre-PR-#3). `"paddle"` → Paddle Billing v2 (sandbox or
-   production gated by `FAAS_PADDLE_SANDBOX=1`). Any other value →
-   the daemon fails to boot with a typed error.
+1. **`FAAS_BILLING_PROVIDER`** defaults to `paddle` at the daemon boot
+   loader (`pkg/billing/loader/loader.go`). Empty / unset → Paddle. The
+   apid inverse-fallback path (`loader.go:313-318`, which returns
+   `nil, m.Name, nil` for the legacy Stripe surface) is **not** the
+   default; it remains operational for a node-level rollback.
 
-2. **`pkg/billing.Provider` gains a 5th method,
-   `CreateUpgradeTransaction(ctx, acct, plan) (txID, checkoutURL, err)`.**
-   Stripe returns `("", "", nil)` — the apid handler reads `txID == ""`
-   to fall back to the precomputed `FAAS_BILLING_PORTAL_URL` template.
-   Paddle implements it for real via `paddle.Client.CreateTransaction`
-   against the per-plan monthly price; returns
-   `(txn_…, https://paddle.checkout/…, nil)`. The two paths are
-   mutually exclusive on a single 402 — exactly one of
-   `billing_portal_url` or `paddle_checkout_url`+`tx_id` is set on the
-   RFC 7807 Problem extensions.
+2. **The deploy template is Paddle-only.** `deploy/controlplane/sealed.env.example`
+   no longer ships the `STRIPE_API_KEY` / `STRIPE_WEBHOOK_SECRET` /
+   `FAAS_BILLING_PORTAL_URL` rows. `deploy/ansible/roles/control_plane_service/files/{apid,meterd}.toml.example`
+   document `[billing.paddle]` as the active block and comment out
+   `[billing.stripe]`. `deploy/scripts/verify-secrets.sh` drops the
+   Stripe-side grep checks and keeps the Paddle row + the
+   `FAAS_BILLING_PROVIDER=paddle` assertion.
 
-3. **`accounts.provider_customer_id` is reused for the Paddle
-   `ctm_…` customer id.** A column rename
-   (`provider_customer_id` → `provider_customer_id`) is a separate, smaller
-   migration PR — out of scope here to keep this PR reviewable in
-   ~10 minutes. The state.Store mirror methods
-   `AccountByPaddleCustomerID` + `UpdateAccountPaddleCustomerID` are
-   1-line pass-throughs to the existing Stripe methods; their existence
-   is documentation, not a different column.
+3. **`pkg/billing/paddle/errors.go::ClassifyPushError`** (verified —
+   no code change required for v2). The Paddle classifier was landed
+   in a follow-up to PR-P3 on main (the `paddle-full-enable` cluster,
+   PR #204 follow-up). The classifier maps a Paddle push failure to a
+   closed 13-label set covering pre-SDK sentinels, transport errors,
+   and `*paddleerr.Error` Status codes. The meterd pusher
+   (`pkg/meter/pusher.go:208`) dispatches on the concrete provider type
+   and emits the label into `meterd_ops_total{op="paddle",code=…}`;
+   `pkg/wire/metrics.go:2725` pre-instantiates the histogram labels
+   from `paddle.PushResultLabels()` at registry init so the dashboard
+   panel renders even before the first push. The v1 "Negative/deferred"
+   bullet for the classifier is therefore closed at v2; the launch
+   cluster re-verifies the wiring with a focused test rather than
+   re-introducing the classifier.
 
-4. **No HTTP-transport `Idempotency-Key` injection for Paddle today.**
-   `paddle-go-sdk/v5@v5.2.0` has no request option for the header;
-   idempotency is recorded in `CustomData["faas_paddle_idem_key"]`. A
-   transport-level wrapper is the durable fix and lands in a follow-up
-   PR (the dedupe behavior is correct under CustomData tagging; this
-   is a hardening, not a correctness, gap).
+4. **The Idempotency-Key SDK transport wrapper** is wired. The
+   `paddle.NewIdempotencyRT` RoundTripper is composed into
+   `paddle/http.Client` and passed to `paddle.New(...)` via
+   `paddle.WithClient` at `provider.go:NewProvider` (line 199). Every
+   Paddle write request to `/transactions` carries
+   `Idempotency-Key: faas-overage-<acctID>-<YYYY-MM>` — the SDK's
+   `X-Transit-Id` header (set by `paddle.ContextWithTransitID`) is
+   copied as the canonical `Idempotency-Key` value, so the SDK's
+   idempotency plumbing and ours share a single source of truth.
+   Closes the v1 §4 "Negative/deferred" bullet; verified by the 11-test
+   `transport_test.go` suite (in particular
+   `TestIdempotencyRoundTripper_WiredIntoPaddleSDK`, which confirms
+   the SDK accepts the wrapped client via `paddle.WithClient`),
+   `TestIdempotencyRoundTripper_InjectsHeaderOnPOSTTransactions`, and
+   the live `cmd/e2e/billing_paddle_sandbox_test.go` walk.
 
-5. **The dunning state machine is provider-neutral.** Both webhooks
-   (Stripe + Paddle) dispatch into a single `handleBillingEvent(ctx,
-   ev, acct)` helper that emits the same status transitions (active /
-   past_due / suspended / plan-change) and the same email surface
-   (PR #133's `mail.PaymentFailedBody` + `mail.AccountRestoredBody`).
-   The four M7 dunning transitions are unchanged on the wire.
+5. **`.github/workflows/paddle-sandbox.yml`** (PR-D) is the operator-only
+   live CI sibling of `stripex-sandbox.yml`. It triggers on
+   `workflow_dispatch` and runs the four `paddle_sandbox_e2e` tests
+   against `api.sandbox.paddle.com` using the `PADDLE_SANDBOX_API_KEY`
+   + `PADDLE_SANDBOX_WEBHOOK_SECRET` repository secrets.
+
+6. **The §14 M7 acceptance gate** is provider-agnostic (invoice shadow
+   math < 0.1 % delta, function hello-world p95 wake < 1 s, Free-tier hard
+   stop). The Paddle implementation satisfies all three. The sandbox
+   walk is the launch gate, not the M7 gate.
+
+7. **`meterd_push_duration_seconds`** keeps the histogram with the
+   `provider` label; the `result` label stays `success | failure`.
+   `meterd_ops_total{op,code}` is the per-error-class counter, with
+   `code` populated by the Paddle classifier for symmetry with Stripe.
 
 ## Consequences
 
 ### Positive
 
-- Operators can move a deployment to Paddle by setting two env vars
-  (`FAAS_BILLING_PROVIDER=paddle` + `FAAS_PADDLE_API_KEY` +
-  `FAAS_PADDLE_WEBHOOK_SECRET` + `FAAS_PADDLE_SANDBOX=1` for the
-  sandbox) — no code changes, no migrations, no provider-shaped
-  branching in the daemons.
-- The dunning state machine stays in one place (`handleBillingEvent`)
-  so a future third provider (Braintree, Lemon Squeezy, etc.) only
-  needs to implement the 5-method Provider interface — same shape as
-  PR #1's Stripe extraction, validated by the two compile-time
-  conformance assertions
-  (`var _ billing.Provider = (*stripe.Client)(nil)` and
-  `var _ billing.Provider = (*paddle.Provider)(nil)`).
+- Launch customer base is not gated on a single EU entity or a single
+  USD card-issuer path. VAT is handled by Paddle's MoR.
+- The `pkg/billing.Provider` interface (ADR-025) is the single seam; a
+  future Stripe / LemonSqueezy / Braintree plugin is additive — no
+  per-handler branching, no migration path through the daemons.
+- The two v1 "Negative/deferred" bullets (Paddle error classifier +
+  Idempotency-Key transport) close in this cluster, so the operator
+  dashboard has Stripe-equivalent label fidelity on day one.
 
 ### Negative / deferred
 
-- The column-rename is a follow-up. Until then, the
-  `accounts.provider_customer_id` column carries the Paddle `ctm_…` value,
-  and any grep against the column name produces false positives. The
-  dedicated `AccountByPaddleCustomerID` / `UpdateAccountPaddleCustomerID`
-  methods keep the call sites self-documenting.
-- The Stripe stub returns `("", "", nil)` for `CreateUpgradeTransaction`
-  — a deliberate empty-string dispatch signal. The apid handler reads
-  `txID == ""` to branch on the template path. A future Provider that
-  also uses a template URL must match this contract (or the dispatch
-  in `handlers_ext.go::changePlan` grows a per-provider type assertion,
-  which ADR-025 explicitly forbids).
-- The Paddle error classifier (a stable label per failure mode,
-  matching `stripe.ClassifyPushError`) is not shipped today. Paddle
-  push errors collapse to "other" in the meterd `_ops_total` label set.
-  A separate slice follow-up lands the classifier.
+- The Stripe module stays in the workspace. The `stripe-go v70.15.0+incompatible`
+  pin in `go.mod:28` is unchanged; the `+incompatible` direct-dep
+  lint gate in `.github/workflows/ci.yml:149-156` (release blocker
+  B1) is intentionally **not** relaxed by this ADR. The Stripe
+  SDK is still loaded by the admin endpoints + tests, and removing
+  the gate would silently allow future `+incompatible` direct deps.
+  The Stripe upgrade is a separate workstream. The launch cluster
+  ships with the lint gate in its current state; the B1 gate forces
+  the Stripe upgrade to land as part of the v1.0 release rather than
+  getting backburnered.
+- The financial-model re-validation is operator-owned and out of scope
+  for this PR cluster. The model is the source of truth for unit
+  economics; if it disagrees with Paddle's fee shape, the deviation is
+  resolved outside this ADR.
+- PR-5 (Paddle dashboard surface for `paddle_checkout_url` rendering)
+  is deferred to a post-launch PR. The dashboard currently redirects
+  customers to `paddle_checkout_url` via the apid 402 response.
+- The `stripe-go` Stripe-side telemetry counter parities
+  (`<daemon>_stripe_webhook_verify_failed_total`) are intentionally not
+  added: Stripe is no longer on the runtime path and a parity counter
+  with no metric source is dead weight.
 
 ### Rollback
 
-Unset `FAAS_BILLING_PROVIDER` (Stripe default returns) and redeploy.
-The Provider interface additions are additive; the existing Stripe
-code path is unchanged. Paddle webhook entries (`/v1/webhooks/paddle`)
-fall through to a 503 with no provider configured, so a partially
-rolled-back deployment does not process Paddle events without
-verification.
+A node-level rollback is intentional and trivial:
 
-## PR split (re-record from PR #3 plan)
+1. Set `FAAS_BILLING_PROVIDER=stripe` in `sealed.env` on the affected node.
+2. Restart `apid` + `meterd`.
+3. The legacy apid Stripe surface boots (`loader.go:313-318` returns
+   `nil, m.Name, nil` for the legacy surface; the apid reads
+   `STRIPE_*` env vars inline at `cmd/apid/main.go:959`).
+4. No schema migration is required. `accounts.provider_customer_id`
+   carries both `cus_…` (Stripe) and `ctm_…` (Paddle) values
+   (migration 00040 already renamed `stripe_customer_id`).
 
-- PR #1 — extracted `pkg/stripex` → `pkg/billing/stripe`, defined
-  `pkg/billing.Provider`, added the `Event` + `EventType` envelope.
-- PR #2 — added `pkg/billing/paddle` (HMAC-SHA256 verify, calendar-
-  month overage, 11 unit tests + sandbox tests).
-- PR #3 (this ADR's landing PR) — rewires apid + meterd to dispatch
-  through the same Provider interface, adds the 5th method
-  (`CreateUpgradeTransaction`), and ships the operator runbook.
-- PR #4 (operator runbook + secrets + webhook hardening) — does NOT
-  rename the column; the rename `accounts.stripe_customer_id → accounts.provider_customer_id`
-  shipped in migration **00040**, well before this PR. PR #4 adds the
-  operator runbook, sealed.env fix, `FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS`,
-  the verify-fail + replay-suppressed log/counter pair, and un-skips
-  tests 2 + 3 of the sandbox walk. The dashboard + CLI surface for
-  `paddle_checkout_url` rendering remains deferred and is re-numbered
-  to **PR #5** below.
-- PR #5 (deferred, post-PR-4) — dashboard + CLI surface for
-  `paddle_checkout_url` rendering. Independent of PR #4 (no shared
-  code paths).
+Existing Paddle customers' `ctm_…` IDs are **not** migrated on rollback;
+the Stripe side will create fresh `cus_…` IDs on next checkout. The
+customer's billing dashboard will show two records until the operator
+backfills manually. There are no existing customers at launch, so this
+is a documented failure mode, not a launch blocker.
+
+## PR split (the launch cluster)
+
+The cluster ships as one mega-PR (`release/paddle-default-mega`) with six
+atomic commits, mirroring the PR-924 / PR-926 / PR-929 / PR-936 mega-PR
+pattern the repo has been using for the recent Tier A cluster work:
+
+- **PR-A (this ADR + spec + ops docs)** — no code changes. The four
+  doc edits land first because they are the dry-run precondition for
+  everything else.
+- **PR-B (provider default flip)** — two-line change in
+  `pkg/billing/loader/loader.go`, the loader test, the sealed.env
+  template scrub, the TOML example flip, the `verify-secrets.sh`
+  Stripe-row removal, and the ansible operator assert.
+- **PR-C (Paddle error classifier)** — `pkg/billing/paddle/errors.go`
+  `ClassifyPushError` + tests; the `ClassifyError` interface method on
+  `billing.Provider`; the meter pusher wiring.
+- **PR-D (`paddle-sandbox.yml` CI workflow)** — mirrors
+  `stripex-sandbox.yml` with Paddle secrets + the `paddle_sandbox_e2e`
+  build-tag gate.
+- **PR-E (Idempotency-Key SDK transport wrapper)** — wires
+  `paddle.NewIdempotencyRT` into `provider.go:NewProvider`; tests assert
+  the header stamp on writes.
+- **PR-F (launch gate + checklist)** — `docs/ops/launch-checklist.md`
+  with the four manual checks; the operator runs them and signs the
+  checklist before the v1.0.0 tag.
+
+## Verification
+
+- `make test` (all packages green, including
+  `pkg/billing/loader/loader_test.go`, `pkg/billing/paddle/errors_test.go`,
+  `pkg/billing/paddle/transport_test.go`, `pkg/meter/pusher_test.go`).
+- `make e2e` (the `paddle_e2e_test.go` signed-webhook ingress, three cases).
+- `make e2e-sandbox` (the four `paddle_sandbox_e2e` tests against
+  `api.sandbox.paddle.com` with `secrets/.env.sandbox` populated from
+  the sandbox merchant dashboard).
+- `.github/workflows/paddle-sandbox.yml` triggered from the GitHub UI.
+- `make doctor-paddle` against a fresh Lima box.
+- `docs/ops/launch-checklist.md` signed by the maintainer.
