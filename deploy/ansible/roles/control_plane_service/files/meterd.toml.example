@@ -82,5 +82,3 @@ egress_tls_ca_path = ""
 # api_key           = ""  # sk_test_… or sk_live_…; or STRIPE_API_KEY env
 # webhook_secret    = ""  # unused by meterd; or STRIPE_WEBHOOK_SECRET env
 # tolerance_seconds = 300 # Stripe-Signature timestamp tolerance (default 5 min)
-# webhook_secret = ""    # unused by meterd   ; or FAAS_PADDLE_WEBHOOK_SECRET env
-# sandbox        = false # true → api.sandbox.paddle.com; or FAAS_PADDLE_SANDBOX=1
