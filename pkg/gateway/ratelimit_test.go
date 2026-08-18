@@ -12,6 +12,7 @@
 package gateway
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestLimiterPeek_FreshBucket(t *testing.T) {
 	}
 	// Allow consumes 1, but bucket is now non-nil and has burst-1
 	// tokens left. Peek should report ok=true and remaining = burst-1.
-	if !l.Allow("app-a", api.PlanHobby) {
+	if !l.Allow(context.Background(), "app-a", api.PlanHobby) {
 		t.Fatal("first Allow returned false; want true")
 	}
 	limit, remaining, _, ok := l.Peek("app-a", api.PlanHobby)
@@ -54,12 +55,12 @@ func TestLimiterPeek_ExhaustedBucketSetsReset(t *testing.T) {
 	l := NewLimiterWithClock(frozenClock(now))
 	// Hobby: rps=20, burst=100. Drain via Allow down to 0.
 	for i := 0; i < 100; i++ {
-		if !l.Allow("app-a", api.PlanHobby) {
+		if !l.Allow(context.Background(), "app-a", api.PlanHobby) {
 			t.Fatalf("Allow #%d returned false; want true", i)
 		}
 	}
 	// 101st Allow returns false — bucket is exhausted.
-	if l.Allow("app-a", api.PlanHobby) {
+	if l.Allow(context.Background(), "app-a", api.PlanHobby) {
 		t.Fatal("101st Allow returned true; want false (exhausted)")
 	}
 	// Peek should report remaining=0 and reset_seconds >= 1 (ceil of
@@ -81,7 +82,7 @@ func TestLimiterPeek_FullBucketNoReset(t *testing.T) {
 	// advancing the clock, Peek must report remaining=99 AND reset=0
 	// (bucket is full enough for the next request; no wait needed).
 	l := NewLimiterWithClock(frozenClock(time.Unix(1_700_000_000, 0)))
-	if !l.Allow("app-a", api.PlanHobby) {
+	if !l.Allow(context.Background(), "app-a", api.PlanHobby) {
 		t.Fatal("Allow returned false; want true")
 	}
 	_, remaining, reset, ok := l.Peek("app-a", api.PlanHobby)
@@ -103,13 +104,13 @@ func TestLimiterPeek_RefillAfterClockAdvance(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	l := NewLimiterWithClock(frozenClock(now))
 	for i := 0; i < 100; i++ {
-		l.Allow("app-a", api.PlanHobby)
+		l.Allow(context.Background(), "app-a", api.PlanHobby)
 	}
 	// Refill window: 100 tokens at 20 rps = 5 seconds. Advance 5.5s.
 	clock := now
 	l.now = func() time.Time { return clock }
 	for i := 0; i < 100; i++ {
-		l.Allow("app-a", api.PlanHobby)
+		l.Allow(context.Background(), "app-a", api.PlanHobby)
 	}
 	clock = clock.Add(5500 * time.Millisecond)
 	_, remaining, reset, ok := l.Peek("app-a", api.PlanHobby)
@@ -151,7 +152,7 @@ func TestLimiterPeek_UnknownPlanReturnsFalse(t *testing.T) {
 
 func TestLimiterPeek_ForgetClearsBucket(t *testing.T) {
 	l := NewLimiterWithClock(frozenClock(time.Unix(1_700_000_000, 0)))
-	if !l.Allow("app-a", api.PlanHobby) {
+	if !l.Allow(context.Background(), "app-a", api.PlanHobby) {
 		t.Fatal("Allow returned false; want true")
 	}
 	// Forget drops the bucket — subsequent Peek should return ok=false.
@@ -168,7 +169,7 @@ func TestLimiterPeek_NonMutating(t *testing.T) {
 	// token (Peek does NOT).
 	now := time.Unix(1_700_000_000, 0)
 	l := NewLimiterWithClock(frozenClock(now))
-	if !l.Allow("app-a", api.PlanHobby) {
+	if !l.Allow(context.Background(), "app-a", api.PlanHobby) {
 		t.Fatal("Allow returned false; want true")
 	}
 	_, r1, _, _ := l.Peek("app-a", api.PlanHobby)
@@ -191,7 +192,7 @@ func TestLimiterPeekAccount_BasicShape(t *testing.T) {
 	if ok {
 		t.Fatal("PeekAccount on fresh bucket returned ok=true; want false")
 	}
-	if !l.AllowAccount("acct-1", api.PlanPro) {
+	if !l.AllowAccount(context.Background(), "acct-1", api.PlanPro) {
 		t.Fatal("AllowAccount returned false; want true")
 	}
 	limit, remaining, _, ok := l.PeekAccount("acct-1", api.PlanPro)

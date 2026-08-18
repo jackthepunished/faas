@@ -30,6 +30,7 @@
 package gateway
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -45,7 +46,7 @@ func drainBucket(t *testing.T, l *Limiter, id string, rps, burst float64) {
 	for i := 0; i < int(burst)+1; i++ {
 		// AllowToken returns false past exhaustion; that is fine — we
 		// are just driving the bucket to tokens=0.
-		l.allowToken(id, rps, burst)
+		l.allowToken(context.Background(), id, rps, burst)
 	}
 }
 
@@ -72,11 +73,11 @@ func TestLimiterLRU_EvictsFullBucketOnly(t *testing.T) {
 	l := NewLimiterWithLRUClock(2, clk.Now)
 
 	// Insert A and refill so it is at full burst.
-	l.allowToken("a", 1, 5)
+	l.allowToken(context.Background(), "a", 1, 5)
 	clk.Advance(time.Second) // +1 token at rps=1 → tokens capped at burst=5
 
 	// Insert B and drain it.
-	l.allowToken("b", 1, 5)
+	l.allowToken(context.Background(), "b", 1, 5)
 	drainBucket(t, l, "b", 1, 5)
 
 	// Both buckets exist; A is full, B is mid-drain.
@@ -86,7 +87,7 @@ func TestLimiterLRU_EvictsFullBucketOnly(t *testing.T) {
 
 	// Inserting C must run evictOneLocked: A is full (B is mid-drain),
 	// so A is the only safe candidate and the one that should disappear.
-	l.allowToken("c", 1, 5)
+	l.allowToken(context.Background(), "c", 1, 5)
 
 	// B must still be present — draining it must not have made it
 	// evictable. C is the new bucket. A was dropped.
@@ -111,8 +112,8 @@ func TestLimiterLRU_RefilledBucketBecomesEvictable(t *testing.T) {
 	l := NewLimiterWithLRUClock(2, clk.Now)
 
 	// Two buckets; drain one.
-	l.allowToken("a", 1, 5) // A full after one consume
-	l.allowToken("b", 1, 5)
+	l.allowToken(context.Background(), "a", 1, 5) // A full after one consume
+	l.allowToken(context.Background(), "b", 1, 5)
 	drainBucket(t, l, "b", 1, 5)
 
 	// Advance the clock so B refills past burst. rps=1, burst=5, so
@@ -123,7 +124,7 @@ func TestLimiterLRU_RefilledBucketBecomesEvictable(t *testing.T) {
 	// under the new clock). evictOneLocked walks back-to-front, so the
 	// LEAST-recently-used of the two is evicted — A, since B was
 	// last touched (the drain call moved B to the front).
-	l.allowToken("c", 1, 5)
+	l.allowToken(context.Background(), "c", 1, 5)
 
 	if got := l.buckets["b"]; got == nil {
 		t.Fatal("refilled bucket B was evicted; expected A (the older LRU entry)")
@@ -144,7 +145,7 @@ func TestLimiterLRU_BypassAttemptBlocked(t *testing.T) {
 	l := NewLimiterWithLRUClock(1, clk.Now)
 
 	// Only one slot. Insert attacker, drain it.
-	l.allowToken("attacker", 1, 5)
+	l.allowToken(context.Background(), "attacker", 1, 5)
 	drainBucket(t, l, "attacker", 1, 5)
 
 	// Hammer with fresh keys. Each insert asks the LRU to evict, but
@@ -153,7 +154,7 @@ func TestLimiterLRU_BypassAttemptBlocked(t *testing.T) {
 	// must persist.
 	for i := 0; i < 50; i++ {
 		key := []string{"noise-a", "noise-b", "noise-c"}[i%3]
-		l.allowToken(key, 1, 5)
+		l.allowToken(context.Background(), key, 1, 5)
 		if l.buckets["attacker"] == nil {
 			t.Fatalf("attacker bucket evicted after %d noise inserts; bypass window opened", i)
 		}
@@ -163,7 +164,7 @@ func TestLimiterLRU_BypassAttemptBlocked(t *testing.T) {
 	// some accidental allowToken path): tokens should be 0 because
 	// every drain call and the refill formula combined should leave it
 	// at floor(0). Allow one more call and assert it returns false.
-	if l.allowToken("attacker", 1, 5) {
+	if l.allowToken(context.Background(), "attacker", 1, 5) {
 		t.Fatal("attacker bucket allowed a token while still drained; the throttle should reject")
 	}
 }
@@ -195,7 +196,7 @@ func TestLimiterLRU_ChurnConvergesBackUnderCap(t *testing.T) {
 	// one consume), so eviction has no safe candidate and the map
 	// overshoots — this is the documented memory-correctness tradeoff.
 	for _, k := range keys {
-		l.allowToken(k, rps, burst)
+		l.allowToken(context.Background(), k, rps, burst)
 	}
 	overshoot := l.BucketCount()
 	if overshoot <= 3 {
@@ -208,7 +209,7 @@ func TestLimiterLRU_ChurnConvergesBackUnderCap(t *testing.T) {
 	// candidate and the next insert must drop at least one of them.
 	clk.Advance(10 * time.Second)
 	beforeEvict := l.BucketCount()
-	l.allowToken("churn-driver", rps, burst)
+	l.allowToken(context.Background(), "churn-driver", rps, burst)
 	afterEvict := l.BucketCount()
 
 	// One insert → one eviction (the full candidate) + one new entry.
@@ -240,10 +241,10 @@ func TestLimiterLRU_MoveToFrontOnHit(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0))
 	l := NewLimiterWithLRUClock(2, clk.Now)
 
-	l.allowToken("old", 1, 5)
-	l.allowToken("newer", 1, 5)
+	l.allowToken(context.Background(), "old", 1, 5)
+	l.allowToken(context.Background(), "newer", 1, 5)
 	// Touch "old" so it is more recently used than "newer".
-	l.allowToken("old", 1, 5)
+	l.allowToken(context.Background(), "old", 1, 5)
 
 	// Both still in the map (cap=2, no eviction yet).
 	if l.BucketCount() != 2 {
@@ -256,7 +257,7 @@ func TestLimiterLRU_MoveToFrontOnHit(t *testing.T) {
 	// Insert a third; evictOneLocked walks back-to-front, picks the
 	// LRU. "newer" is the LRU now (last touched before "old"'s
 	// re-touch), so "newer" is the one that should be evicted.
-	l.allowToken("newest", 1, 5)
+	l.allowToken(context.Background(), "newest", 1, 5)
 
 	if l.buckets["old"] == nil {
 		t.Fatal("old bucket was evicted despite being most-recently-used")
@@ -290,7 +291,7 @@ func TestLimiterLRU_EvictionScanBound(t *testing.T) {
 	const n = LimiterEvictScan + 2
 	for i := 0; i < n; i++ {
 		key := string(rune('a' + i))
-		l.allowToken(key, 1, 5)
+		l.allowToken(context.Background(), key, 1, 5)
 		drainBucket(t, l, key, 1, 5)
 	}
 
@@ -315,9 +316,9 @@ func TestLimiterLRU_ForgetClearsList(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0))
 	l := NewLimiterWithLRUClock(10, clk.Now)
 
-	l.allowToken("a", 1, 5)
-	l.allowToken("b", 1, 5)
-	l.allowToken("c", 1, 5)
+	l.allowToken(context.Background(), "a", 1, 5)
+	l.allowToken(context.Background(), "b", 1, 5)
+	l.allowToken(context.Background(), "c", 1, 5)
 
 	l.Forget("b")
 
@@ -340,9 +341,9 @@ func TestLimiterLRU_ForgetAllResetsList(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0))
 	l := NewLimiterWithLRUClock(10, clk.Now)
 
-	l.allowToken("a", 1, 5)
-	l.allowToken("b", 1, 5)
-	l.allowToken("c", 1, 5)
+	l.allowToken(context.Background(), "a", 1, 5)
+	l.allowToken(context.Background(), "b", 1, 5)
+	l.allowToken(context.Background(), "c", 1, 5)
 
 	dropped := l.ForgetAll()
 	if dropped != 3 {
@@ -367,7 +368,7 @@ func TestLimiterLRU_ForgetAllResetsList(t *testing.T) {
 func TestLimiterLRU_NoopDoesNotTouchList(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0))
 	l := NewLimiterWithLRUClock(10, clk.Now)
-	l.allowToken("a", 1, 5)
+	l.allowToken(context.Background(), "a", 1, 5)
 
 	noop := l.WithNoop()
 	if noop.ll != nil {
@@ -397,7 +398,7 @@ func TestLimiterLRU_NonPositiveCapIsUnbounded(t *testing.T) {
 			t.Fatalf("cap=%d produced a non-nil elems map; want nil", cap)
 		}
 		// Verify the Allow path still works without LRU.
-		if !l.allowToken("k", 1, 5) {
+		if !l.allowToken(context.Background(), "k", 1, 5) {
 			t.Fatalf("cap=%d: allowToken returned false on a fresh full bucket", cap)
 		}
 	}
@@ -416,7 +417,7 @@ func TestLimiterLRU_AllowAccountUnchanged(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0))
 	l := NewLimiterWithLRUClock(10, clk.Now)
 
-	if !l.AllowAccount("acct", api.PlanHobby) {
+	if !l.AllowAccount(context.Background(), "acct", api.PlanHobby) {
 		t.Fatal("first AllowAccount returned false; want true")
 	}
 	if l.BucketCount() != 1 {

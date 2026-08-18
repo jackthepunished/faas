@@ -694,14 +694,15 @@ type printUsageSite struct {
 // as the dispatchConsts map in TestCompletion_ManifestDrift.
 func extractPrintUsageTopics() ([]printUsageSite, error) {
 	topicConsts := map[string]string{
-		"initCmdDocsTopic":       "init",
-		"metricsCmdDocsTopic":    "metrics",
-		"sloCmdDocsTopic":        "slo",
-		"sloAccountCmdDocsTopic": "account-slo",
-		"invocationCmdDocsTopic": "invocations",
-		"completionDocsTopic":    "completion",
-		"manDocsTopic":           "man",
-		"docsOpenTopic":          "open",
+		"initCmdDocsTopic":                "init",
+		"metricsCmdDocsTopic":             "metrics",
+		"sloCmdDocsTopic":                 "slo",
+		"sloAccountCmdDocsTopic":          "account-slo",
+		"invocationCmdDocsTopic":          "invocations",
+		"completionDocsTopic":             "completion",
+		"manDocsTopic":                    "man",
+		"docsOpenTopic":                   "open",
+		"throttleSuggestionsCmdDocsTopic": "throttle-suggestions",
 	}
 
 	entries, err := os.ReadDir(".")

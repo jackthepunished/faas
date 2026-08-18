@@ -148,6 +148,89 @@
 - Per-country / per-user-ID limits.
 - Auto-applying recommendations.
 
+## Amendment 5 (issue #881 Phase 4, 2026-08-18)
+
+Three additions land as a single mega-PR cluster. The cluster
+opens as DRAFT per the mega-PR house style (matches the
+`pr-924-mega-pr-a-opened-2026-08-15` PR-A / Mega-PR-A pattern).
+
+### A. Central mode for `pg_ratelimit_counters`
+
+The "Central mode (`pg_ratelimit_counters`) — rejected" bullet under
+**Rejected alternatives** is FLIPPED. The table (migration 00126,
+CHECK widened by migration 00281 to include `scope='rule'`) is now
+read by the gateway hot path under `[ratelimit] mode = "central"`
+(TOML knob, default `"local"` for back-compat).
+
+The fast-path pattern: in-process bucket continues to serve the
+hot-path Peek (the response-header writer); the central counter is
+consulted only when the in-process bucket would reject. Two
+replicas contending on the same row serialise via
+`pg_advisory_xact_lock(hashtext((scope, subject_id, plan)::record))`
+in a single SQL statement (no separate round-trip, no `SELECT FOR
+UPDATE` row lock that blocks vacuum).
+
+`pg_notify 'rate_limit_changed'` (trigger appended to 00126 — same
+file, no new migration per the ADR-041 carve-out for trigger-on-
+table) invalidates peer replicas' in-process caches via
+`pkg/wire/pgratelimit_invalidator.go` (mirrors the
+`pkg/wire/pgverifier.go` PGNodeVerifier ADR-056 drain loop).
+
+Phase 3 scope is per-app + per-account + per-rule only.
+Per-consumer central mode is Phase 4 (the PK does NOT include
+`consumer_id`; the `__other__` collapse bucket stays in-process
+until then).
+
+Latency: in-process bucket serves the hot-path Peek; the ADR-070
+bench's P50 0.8ms / P99 3.2ms applies to the boundary case only.
+The gateway wake P95 800ms budget is preserved with ~250×
+headroom.
+
+Degraded posture: if Postgres is unreachable,
+`central.ConsumeToken` returns `(0, false, err)`. The limiter
+falls back to the in-process bucket only — admits proceed
+without central synchronisation. A `ratelimit_degraded`
+Prometheus counter + audit row documents the degraded window.
+
+### B. `X-RouteRateLimit-Policy` header on 429
+
+New sibling header of `X-RouteRateLimit-{Limit,Remaining,Reset}`,
+emitted on the per-rule 429 path. Values: literal `route` (default
+— preserved back-compat for rules with `KeyBy ∈ {"", "none"}`) or
+`per-consumer` (when `api.ThrottleKeyByIsPerConsumer(rule.KeyBy)`
+AND the consumer collapses to the `__other__` bucket). The
+existing `x-faas-rate-limit-scope` enum is untouched.
+
+The applier consults `Limiter.ConsumerIsTracked(ruleKey,
+consumerID)` after the per-consumer bucket consume (a new
+accessor at `pkg/gateway/ratelimit.go::ConsumerIsTracked`). When
+the consumer has collapsed to `__other__`, the accessor returns
+false and the policy header is set to `per-consumer`.
+
+### C. Dry-run preview on throttle-suggestions
+
+New query params on the existing endpoint `GET /v1/apps/{slug}/
+throttle-suggestions`: `?dry_run=true&candidate_rps=N&candidate_burst=N`.
+Returns the existing `suggestions` slice unchanged plus a new
+`would_have_rejected` array (one row per route) with the over-cap
+count and a per-consumer limitation note. Window start / end
+echo the window edges so dashboards can render "N of M
+sub-windows" without re-deriving from `range`.
+
+The preview is a parameter sweep, not a recommendation — the
+recommender remains INTENTIONALLY ADVICE-ONLY.
+
+**Per-consumer limitation:** `gateway_requests_by_route_total`
+does not carry per-consumer labels today. The preview can only
+answer "would ANY consumer on the rule's `__other__` collapse
+bucket have been rejected?" — surfaced on the wire (the static
+`per_consumer_limit_note` literal), in the CLI human output, and
+in this amendment. Phase 4 per-consumer central mode (the
+eventual fix) widens the PK + carries consumer_id on the series.
+
+CLI twin: `gregale throttle-suggestions <slug> [--range 5m]
+[--dry-run --candidate-rps N --candidate-burst N]`.
+
 ## References
 
 - ADR-040 (per-account rate limit, wake-path policy)

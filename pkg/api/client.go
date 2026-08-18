@@ -2058,11 +2058,49 @@ func (c *Client) GetAppMetrics(ctx context.Context, slug, rng string) (AppMetric
 // HTTP 200 with empty Suggestions on Prometheus failure (the
 // dashboard's empty-state branch handles it). RouteMetricsDisabled
 // is true when apps.route_metrics_enabled=false (Free plan).
+//
+// Back-compat shim for callers that don't supply dry-run opts.
 func (c *Client) GetAppThrottleSuggestions(ctx context.Context, slug, rng string) (ThrottleSuggestionsResponse, error) {
+	return c.GetAppThrottleSuggestionsOpts(ctx, slug, rng, ThrottleSuggestionsOpts{})
+}
+
+// ThrottleSuggestionsOpts carries the dry-run preview knobs
+// (ADR-104 amendment 5, issue #881 Phase 4 D2). Zero-value (the
+// default) reproduces the Phase 1+2+3 wire shape — the server
+// treats DryRun=false identically whether CandidateRPS/CandidateBurst
+// are set or not.
+type ThrottleSuggestionsOpts struct {
+	DryRun         bool
+	CandidateRPS   float64
+	CandidateBurst int
+}
+
+// GetAppThrottleSuggestionsOpts returns the per-route throttle
+// recommendation payload for slug over the named range window
+// with dry-run preview support. When opts.DryRun is true and
+// opts.CandidateRPS > 0 the server runs the per-route
+// would-have-rejected pass and returns WouldHaveRejected +
+// PerConsumerLimitNote on the response (per-Phase 4 D1 wire
+// shape). When opts.DryRun is false the function is byte-identical
+// to GetAppThrottleSuggestions (no extra query params emitted).
+func (c *Client) GetAppThrottleSuggestionsOpts(ctx context.Context, slug, rng string, opts ThrottleSuggestionsOpts) (ThrottleSuggestionsResponse, error) {
 	var out ThrottleSuggestionsResponse
 	path := "/v1/apps/" + slug + "/throttle-suggestions"
+	q := url.Values{}
 	if rng != "" {
-		path += "?range=" + rng
+		q.Set("range", rng)
+	}
+	if opts.DryRun {
+		q.Set("dry_run", "true")
+		if opts.CandidateRPS > 0 {
+			q.Set("candidate_rps", strconv.FormatFloat(opts.CandidateRPS, 'f', -1, 64))
+		}
+		if opts.CandidateBurst > 0 {
+			q.Set("candidate_burst", strconv.Itoa(opts.CandidateBurst))
+		}
+	}
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
 	}
 	return out, c.do(ctx, "GET", path, nil, &out)
 }

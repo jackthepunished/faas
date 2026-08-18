@@ -4950,6 +4950,43 @@ type ThrottleSuggestionsResponse struct {
 	PlanCeilingBurst     int                     `json:"plan_ceiling_burst"`
 	Multiplier           float64                 `json:"multiplier"`
 	Suggestions          []ThrottleSuggestionRow `json:"suggestions"`
+	// Dry-run preview (ADR-104 amendment 5, issue #881 Phase 4
+	// D1): when DryRun=true the request also supplied
+	// CandidateRPS + CandidateBurst; WouldHaveRejected is one row
+	// per route reporting the count of sub-windows where observed
+	// rps exceeded the candidate (the customer can see "would
+	// this have rejected N requests over the window?" before
+	// committing). PerConsumerLimitNote is a static literal that
+	// names the gateway_requests_by_route_total label gap so
+	// customers reading the wire know the preview is rule-scope,
+	// not consumer-scope.
+	DryRun               bool                 `json:"dry_run,omitempty"`
+	CandidateRPS         float64              `json:"candidate_rps,omitempty"`
+	CandidateBurst       int                  `json:"candidate_burst,omitempty"`
+	WouldHaveRejected    []ThrottlePreviewRow `json:"would_have_rejected,omitempty"`
+	PerConsumerLimitNote string               `json:"per_consumer_limit_note,omitempty"`
+}
+
+// ThrottlePreviewRow is one row of the dry-run preview
+// (ADR-104 amendment 5, issue #881 Phase 4 D1). For each
+// non-collapsed route we report the count of sub-windows where the
+// observed rate exceeded the candidate rps — a count of "would-have-
+// rejected" requests over the window. WindowStart / WindowEnd echo
+// the window edges so dashboards can render "N of M sub-windows" /
+// "X of Y minutes" without re-deriving from Range.
+//
+// Per-consumer limitation: gateway_requests_by_route_total has no
+// per-consumer labels today (Phase 3 per-consumer counts are
+// scoped to the per-consumer limiter, not the Prometheus series).
+// The preview therefore counts at the rule scope — the
+// PerConsumerLimitNote field on ThrottleSuggestionsResponse
+// surfaces this gap on the wire.
+type ThrottlePreviewRow struct {
+	Route        string  `json:"route"`
+	CandidateRPS float64 `json:"candidate_rps"`
+	OverCapCount float64 `json:"over_cap_count"`
+	WindowStart  string  `json:"window_start"` // RFC3339Nano UTC
+	WindowEnd    string  `json:"window_end"`   // RFC3339Nano UTC
 }
 
 // AppErrorsSummaryResponse is the wire body for
