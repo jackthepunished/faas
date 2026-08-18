@@ -15,8 +15,6 @@ Slice=faas-cp.slice
 MemoryMax=1G
 CapabilityBoundingSet=cap_chown cap_dac_override cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_net_bind_service cap_sys_chroot
 EnvironmentFile=/etc/faas/sealed.env
-# OCI layer verification and upload scratch must avoid the read-only
-# host /tmp namespace created by ProtectSystem=strict.
 Environment=TMPDIR=/srv/fc/base
 Environment=FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging
 Environment=FAAS_BASE_EXTRACT_ROOT=/srv/fc/base-staging

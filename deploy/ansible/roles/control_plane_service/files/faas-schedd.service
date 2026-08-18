@@ -14,10 +14,6 @@ RestartSec=2s
 Slice=faas-cp.slice
 MemoryMax=256M
 EnvironmentFile=/etc/faas/sealed.env
-# ProtectSystem=strict makes the host /tmp read-only. Keep OCI blob
-# verification scratch in the already-writable faas runtime directory.
-# /run is tmpfs; large OCI layers would count against this unit's 256M
-# cgroup limit and can trigger an OOM kill. Keep verifier scratch on disk.
 Environment=TMPDIR=/var/lib/faas/oci-tmp
 NoNewPrivileges=yes
 ProtectSystem=strict
