@@ -25,6 +25,8 @@ type manifestInternalHost struct {
 	Name    string
 }
 
+const roleSingleBox = "single-box"
+
 // cmdManifestAnsible materialises the Ansible inventory shape from the same
 // manifest that drives the on-host renderer. The generated inventory is
 // intentionally separate from deploy/ansible/inventory/ so a fleet can use
@@ -83,7 +85,7 @@ func cmdManifestAnsible(args []string) int {
 		return 0
 	}
 	for _, path := range written {
-		fmt.Fprintln(os.Stdout, path)
+		_, _ = fmt.Fprintln(os.Stdout, path)
 	}
 	return 0
 }
@@ -105,7 +107,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 	for _, host := range m.Fleet.Hosts {
 		ansibleHost := "127.0.0.1"
 		targetURL := ""
-		if host.Role != "single-box" {
+		if host.Role != roleSingleBox {
 			var parseErr error
 			ansibleHost, _, parseErr = manifest.ParseHostPort(host.Address)
 			if parseErr != nil {
@@ -123,7 +125,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			controlPlane = append(controlPlane, host.Name)
 		case roleComputeOnly:
 			computeOnly = append(computeOnly, host.Name)
-		case "single-box":
+		case roleSingleBox:
 			// The legacy local host is represented in [box] below.
 		default:
 			return nil, fmt.Errorf("host %s has unsupported role %q", host.Name, host.Role)
@@ -152,7 +154,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, error) {
 	internalHosts := make([]manifestInternalHost, 0, len(m.Fleet.Hosts))
 	for _, host := range m.Fleet.Hosts {
-		if host.Role == "single-box" {
+		if host.Role == roleSingleBox {
 			continue
 		}
 		serviceName, err := manifest.ServiceName(host.Role)
