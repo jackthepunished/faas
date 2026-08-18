@@ -33,6 +33,36 @@ func (r PutAppSecretRequest) Validate(maxBytes int) *Problem {
 	return nil
 }
 
+// RotateAppSecretRequest is the body for POST
+// /v1/apps/{slug}/secrets/{key}/rotate. Same wire shape as
+// PutAppSecretRequest; the rotate verb is distinct so the server
+// can emit the `secret.rotated` audit kind (vs `secret.set` on
+// PUT). Byte cap is the per-plan `SecretValueMaxBytes`.
+//
+// ADR-092 PR-B: scope is selected via ?scope= on the URL path,
+// NOT in the body — the body stays byte-equivalent to pre-PR-B
+// callers. Mirrors Python sdk/python/faas_sdk/models/rotate_app_secret_request.py
+// and Node sdk/node/src/generated/models/RotateAppSecretRequest.ts.
+type RotateAppSecretRequest struct {
+	Value string `json:"value"`
+}
+
+// RotateAppSecretResponse is the 200 body from
+// POST /v1/apps/{slug}/secrets/{key}/rotate. The kid is the age-1...
+// recipient string of the host identity that sealed the new envelope
+// (ADR-089 D4); rotated_at is RFC3339Nano so two rotates in the same
+// second produce distinct timestamps. Empty kid means the row was
+// rotated but the kid was not stampable (rare — happens only if apid
+// started without host.age.pub, which the handler 503s for instead).
+//
+// Mirrors Python sdk/python/faas_sdk/models/rotate_app_secret_response.py
+// and Node sdk/node/src/generated/models/RotateAppSecretResponse.ts.
+type RotateAppSecretResponse struct {
+	Key       string `json:"key"`
+	RotatedAt string `json:"rotated_at"`
+	Kid       string `json:"kid,omitempty"`
+}
+
 // AppSecretResponse is the GET / list shape. The value NEVER appears here —
 // only metadata about the secret.
 //
