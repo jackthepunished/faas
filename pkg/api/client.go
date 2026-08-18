@@ -2783,6 +2783,40 @@ func (c *Client) ListAppDataUpstreams(ctx context.Context, slug string) ([]DataU
 	var out []DataUpstreamResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams", nil, &out)
 }
+
+// ListAppDataUpstreamsWithQuota is the quota-aware sibling of
+// ListAppDataUpstreams (issue #952). Decodes the wrapped
+// DataUpstreamListResponse envelope so the CLI's
+// `gregale inspect <slug> --upstreams` command can render the
+// "N/M upstreams" stamp without a second request.
+//
+// The bare ListAppDataUpstreams is preserved for callers that
+// don't need quota (PR #894 e2e tests, future dashboard
+// hydration paths) — both methods live side by side and decode
+// the same wire surface, just into different shapes.
+//
+// scope is the optional filter forwarded as ?scope=<scope> in
+// the query string. Empty means "all scopes" (handlers_upstreams.go
+// treats empty as the all-scopes branch via scopeFromQuery); any
+// non-empty value is validated server-side. The CLI itself does
+// not impose a closed vocabulary on scope — the SDK mirrors what
+// the wire accepts.
+//
+// §11 invariant: the decoded shape NEVER carries plaintext host —
+// only HostRedactedHash + HostLast4 (handlers_upstreams.go:339).
+// The CLI renderer in commands_inspect_upstreams.go references
+// only those two fields.
+func (c *Client) ListAppDataUpstreamsWithQuota(ctx context.Context, slug, scope string) ([]DataUpstreamResponse, int, int, error) {
+	path := "/v1/apps/" + slug + "/upstreams"
+	if scope != "" {
+		path += "?scope=" + scope
+	}
+	var out DataUpstreamListResponse
+	if err := c.do(ctx, "GET", path, nil, &out); err != nil {
+		return nil, 0, 0, err
+	}
+	return out.Upstreams, out.Count, out.Quota, nil
+}
 func (c *Client) GetAppDataUpstream(ctx context.Context, slug, id string) (DataUpstreamResponse, error) {
 	var out DataUpstreamResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams/"+id, nil, &out)
