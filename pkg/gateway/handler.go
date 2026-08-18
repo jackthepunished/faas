@@ -3059,9 +3059,17 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 	// untouched. Phase 1+2 rules never enter the per-consumer branch.
 	bucketKey := app.ID + "\x00" + rule.ID
 	allowed := h.routeLimiter.AllowWithParams(bucketKey, rule.RequestsPerSecond, float64(rule.Burst))
+	// consumerID is hoisted out of the per-consumer branch so the
+	// 429 path (below) can read it for the X-RouteRateLimit-Policy
+	// collapse detection (ADR-104 amendment 5, issue #881 Phase 4
+	// H1). Empty string means "anonymous / not resolved" — the
+	// policy-header computation treats that as "route" (no
+	// collapse to advertise).
+	var consumerID string
 	if allowed && api.ThrottleKeyByIsPerConsumer(rule.KeyBy) {
 		authed := authenticatedFrom(r.Context())
-		consumerID, ok := resolveConsumerKey(rule.KeyBy, rule.JWTClaimName, authed)
+		var ok bool
+		consumerID, ok = resolveConsumerKey(rule.KeyBy, rule.JWTClaimName, authed)
 		if ok {
 			// The consumer bucket key is the same
 			// `appID+"\x00"+ruleID` prefix used by the per-rule
@@ -3112,7 +3120,34 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 		// (established by per-account / per-app 429 paths
 		// respectively) — see writeRouteRateLimitHeaders comment.
 		w.Header().Set("x-faas-rate-limit-scope", "route")
-		h.writeRouteRateLimitHeaders(w, bucketKey, rule.RequestsPerSecond, rule.Burst)
+		// ADR-104 amendment 5 (issue #881 Phase 4 H1): emit
+		// X-RouteRateLimit-Policy so operators can read the
+		// per-consumer collapse state without parsing the
+		// X-RouteRateLimit-* numerics. `route` is the
+		// back-compat default (Phase 1+2 rules); `per-consumer`
+		// fires when the request hit a Phase 3 per-consumer rule
+		// AND the consumer collapsed into the __other__ bucket
+		// (the collapse-bucket invariant from
+		// pkg/gateway/ratelimit.go:119-124).
+		policy := "route"
+		// Per-consumer collapse detection (ADR-104 amendment 5,
+		// issue #881 Phase 4 H1): the 429 path's bucketKey is the
+		// RULE-level key (app.ID+"\x00"+rule.ID); the per-consumer
+		// bucket is a sub-bucket on routeConsumerLimiter that the
+		// applier already consulted above. We can't read the
+		// sub-bucket key from the wire here, so we ask the limiter
+		// directly: ConsumerIsTracked returns false iff the
+		// consumer has collapsed to the __other__ bucket (which is
+		// exactly the "per-consumer" policy-header value). Rules
+		// with KeyBy ∈ {"", "none"} never enter this branch
+		// (ThrottleKeyByIsPerConsumer is false) so the
+		// back-compat "route" default is preserved.
+		if api.ThrottleKeyByIsPerConsumer(rule.KeyBy) {
+			if !h.routeConsumerLimiter.ConsumerIsTracked(bucketKey, consumerID) {
+				policy = "per-consumer"
+			}
+		}
+		h.writeRouteRateLimitHeaders(w, bucketKey, rule.RequestsPerSecond, rule.Burst, policy)
 		api.WriteProblem(w, api.NewProblem(http.StatusTooManyRequests, "rate_limited",
 			"Rate limit exceeded", "slow down and retry"))
 		if h.edgeRuleAudit != nil {
@@ -4964,7 +4999,17 @@ func (h *Handler) writeAccountRateLimitHeaders(w http.ResponseWriter, accountID 
 // the same rps/burst so the visible reset time uses the same
 // denominator the rule actually refills at — mirroring the
 // per-app + per-account paths.
-func (h *Handler) writeRouteRateLimitHeaders(w http.ResponseWriter, bucketKey string, rps float64, burst int) {
+//
+// policy is the X-RouteRateLimit-Policy value (ADR-104 amendment
+// 5, issue #881 Phase 4 H1): "route" for rules where KeyBy ∈
+// {"", "none"} (back-compat default — the value pre-Phase 4
+// callers expect to read), or "per-consumer" when the consumer
+// collapsed into the __other__ bucket on a per-consumer rule.
+// The header is emitted on EVERY call site (never silently
+// omitted) so dashboards that key off its presence don't break;
+// pre-Phase 4 callers observed only the trio and the new header
+// is additive.
+func (h *Handler) writeRouteRateLimitHeaders(w http.ResponseWriter, bucketKey string, rps float64, burst int, policy string) {
 	if h == nil || h.routeLimiter == nil || bucketKey == "" {
 		return
 	}
@@ -4975,6 +5020,15 @@ func (h *Handler) writeRouteRateLimitHeaders(w http.ResponseWriter, bucketKey st
 	w.Header().Set("X-RouteRateLimit-Limit", intToString(limit))
 	w.Header().Set("X-RouteRateLimit-Remaining", intToString(remaining))
 	w.Header().Set("X-RouteRateLimit-Reset", intToString(reset))
+	// ADR-104 amendment 5 (issue #881 Phase 4 H1): the policy
+	// hint is emitted unconditionally so dashboards that key off
+	// its presence don't break; the value distinguishes the
+	// route vs per-consumer collapse scope without polluting
+	// the existing x-faas-rate-limit-scope enum.
+	if policy == "" {
+		policy = "route"
+	}
+	w.Header().Set("X-RouteRateLimit-Policy", policy)
 }
 
 // intToString is a tiny strconv.Itoa shim so handler.go doesn't grow

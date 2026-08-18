@@ -236,6 +236,42 @@ func (l *Limiter) allowWithConsumerKey(ruleKey, consumerID string, rps, burst fl
 	return l.allowTokenKeyedLocked(bucketKey, rps, burst, otherKey, now)
 }
 
+// ConsumerIsTracked reports whether consumerID has its own bucket
+// under ruleKey (i.e. is in the per-rule consumer set, NOT
+// collapsed into the __other__ bucket). Phase 4 H1's applier
+// (handler.go::applyEdgeRuleThrottle) uses this to decide whether
+// to emit X-RouteRateLimit-Policy=per-consumer on the 429 path:
+// the value is set when the per-consumer rule's consumer has
+// collapsed to __other__ (i.e. NOT tracked). False is the
+// back-compat answer for rules where KeyBy ∈ {"", "none"} — the
+// rule-only bucket key path never reaches here.
+//
+// Lock-safe (mu is a sync.Mutex today; locking is cheap — the map
+// is small and the lookup is a constant-time hash read); safe to
+// call from the hot path. noop limiters return true (defensive —
+// applier still emits the header; the noop rule-level
+// AllowWithParams also returns true).
+func (l *Limiter) ConsumerIsTracked(ruleKey, consumerID string) bool {
+	if l == nil || l.noop {
+		return true
+	}
+	if consumerID == "" || consumerID == ConsumerKeySentinel {
+		// Reserved sentinel is never tracked — appliers should
+		// never pass it, and the limiter's AllowWithConsumerKey
+		// rejects it. Treating "not tracked" as the answer is
+		// the conservative policy-header reading.
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	consumers, ok := l.ruleConsumers[ruleKey]
+	if !ok {
+		return false
+	}
+	_, tracked := consumers[consumerID]
+	return tracked
+}
+
 // allowTokenKeyedLocked is the shared refill math used by
 // allowToken + allowWithConsumerKey. The pinnedKey parameter is the
 // rule's __other__ bucket key when this is a per-consumer call; the
