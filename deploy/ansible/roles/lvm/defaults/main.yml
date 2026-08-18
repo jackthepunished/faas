@@ -1,0 +1,4 @@
+# `auto` accepts a provider-native filesystem when no LVM volumes are
+# present, while still validating the reference lv-system/lv-fc layout when
+# a host exposes LVM. Set `reference-lvm` to require that layout explicitly.
+faas_storage_layout: auto

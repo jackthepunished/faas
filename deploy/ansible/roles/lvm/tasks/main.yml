@@ -6,8 +6,18 @@
 # live box is out of scope for ansible and a one-time op; we just
 # assert they exist + have the right size envelope.
 #
-# If this role fails: re-image the box with the project's installimage
-# config and re-run `make bootstrap`.
+# Provider-native disks (for example a GCP persistent disk) can use the
+# filesystem layout directly. In `auto` mode the reference LVM layout is
+# validated whenever LVs are detected; `reference-lvm` makes it mandatory.
+
+- name: lvm — validate storage layout selector
+  ansible.builtin.assert:
+    that:
+      - faas_storage_layout in ['auto', 'reference-lvm']
+    fail_msg: >-
+      faas_storage_layout must be `auto` or `reference-lvm`, got
+      `{{ faas_storage_layout | default('unset') }}`.
+  changed_when: false
 
 - name: lvm — list LVs
   ansible.builtin.command: lvs --noheadings -o lv_name,lv_size --units g
@@ -27,4 +37,16 @@
       (see `docs/faas_implementation_spec.md` §8). ansible will not
       create these — re-provisioning is a one-time op.
     success_msg: "lv-system + lv-fc present"
-  when: lvs_out.rc == 0
+  when:
+    - lvs_out.rc == 0
+    - faas_storage_layout == 'reference-lvm' or (lvs_out.stdout | trim) != ''
+
+- name: lvm — use provider-native filesystem layout
+  ansible.builtin.debug:
+    msg: >-
+      No LVM volumes detected; continuing with the provider-native filesystem
+      layout. Set faas_storage_layout=reference-lvm to require lv-system/lv-fc.
+  when:
+    - faas_storage_layout == 'auto'
+    - lvs_out.rc == 0
+    - (lvs_out.stdout | trim) == ''
