@@ -315,6 +315,9 @@ before any scheduling behavior changes.
 - `cmd/e2e/upstreams_e2e_test.go`, `cmd/e2e/upstream_probe_e2e_test.go`
 - `docs/adr/098-pr-cluster-outline.md`
 - `pkg/promqlrules/data_placement.yaml` (PR-C)
+- `cmd/gregale/commands_inspect.go`,
+  `cmd/gregale/commands_inspect_upstreams.go`,
+  `cmd/gregale/commands_inspect_upstreams_test.go` (issue #952)
 
 ### Modified
 
@@ -337,9 +340,14 @@ before any scheduling behavior changes.
 - **Stateless story gets a placement story.** Customers bring their
   own data, the platform brings the proximity. The asymmetry closes.
 - **Trust surface is visible.** A customer running
-  `gregale inspect <slug>` (future CLI follow-up) can see the
+  `gregale inspect <slug> --upstreams` (issue #952) can see the
   platform's view of their upstreams — and complain when an inference
-  is wrong, instead of having no signal at all.
+  is wrong, instead of having no signal at all. The CLI is read-only
+  and lives in `cmd/gregale/commands_inspect.go` (verb dispatcher)
+  + `commands_inspect_upstreams.go` (leaf); the §11 invariant is
+  enforced end-to-end (wire DTO carries only `host_redacted_hash`
+  + `host_last4`, the CLI renderer references only those two
+  fields).
 - **Multi-node payoff.** On a fleet with two regions and an app
   whose `DATABASE_URL` points to one of them, the wake picks the
   local-region node. Snapshot reuse keeps the same warm-affinity
