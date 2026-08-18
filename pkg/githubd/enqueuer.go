@@ -45,6 +45,7 @@ import (
 
 	"github.com/google/uuid"
 
+	githubdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/githubd/v1"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -73,6 +74,23 @@ type BuildSpec struct {
 	SourcePath   string
 	SourceURL    string
 	SourceBytes  int64
+	// Issue #977 / ADR-116: the proto3 EnqueueBuildRequest grew
+	// two new fields (pull_request_number + sender_login) on the
+	// wire; the bridge uses them to stamp the annotation surface
+	// onto the deployment row. The dispatcher fills these per
+	// event type: push events leave both zero (Pusher already
+	// covers deployed_by), pull_request events stamp ev.Number +
+	// ev.Sender.Login. Zero values on push events map to NULL on
+	// the deployment row via the pgstore nullif(0) collapse +
+	// the bridge's "fall back to Pusher" rule.
+	PRNumber     int32
+	SenderLogin  string
+	// EventKind carries the proto3 EnqueueBuildEventKind enum
+	// (issue #272 / ADR-094) so the bridge can stamp the right
+	// deployments.kind (push → github, pull_request → preview).
+	// Dispatchers set it explicitly per call site; zero ==
+	// EVENT_KIND_UNSPECIFIED == legacy wire == DeploymentKindGitHub.
+	EventKind    githubdpb.EnqueueBuildEventKind
 }
 
 // BuildEnqueuer is the seam githubd uses to schedule a build

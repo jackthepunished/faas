@@ -335,6 +335,18 @@ message EnqueueBuildRequest {
   // older githubd (or the existing slice-7 tests) keeps stamping
   // DeploymentKindGitHub without a behaviour change.
   EnqueueBuildEventKind event_kind = 11;
+  // Issue #977 / ADR-116: pull_request_number carries the GitHub
+  // PR number for pull_request events. apid stamps it onto
+  // deployments.pr_number (NULL for push events). 0 = absent.
+  // Reserved range is positive int32; pre-feature rows / push
+  // events always pass 0.
+  int32  pull_request_number = 12;
+  // Issue #977 / ADR-116: sender_login is the GitHub login that
+  // triggered the webhook (vs. pusher, which is the commit author
+  // on push events). For pull_request events sender_login is the
+  // PR opener; apid prefers it over pusher as deployed_by. Empty
+  // when the githubd dispatcher doesn't have it.
+  string sender_login     = 13;
 }
 
 // EnqueueBuildEventKind is the githubd-side event taxonomy for

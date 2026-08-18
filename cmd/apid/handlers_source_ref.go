@@ -128,6 +128,18 @@ func (s *server) handleSourceRefDeploy(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 
+	// Issue #977 / ADR-116: validate annotation fields carried on
+	// the JSON body. The source-ref path uses the JSON wire (vs the
+	// tarball path's multipart), so the values arrive on req.Reason /
+	// req.Tag / req.DeployedBy / req.PRNumber directly. Same DB CHECK
+	// mirrors as the tarball path; nil/zero values pass through to NULL
+	// on the row.
+	ann := annotationFromRequest(req)
+	if prob := validateAnnotationForm(ann); prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+
 	prev, _ := s.store.LatestDeployment(r.Context(), app.ID)
 	res, err := apidsource.Enqueue(r.Context(), s.store, s.notif, apidsource.EnqueueParams{
 		AppID:       app.ID,
@@ -150,13 +162,20 @@ func (s *server) handleSourceRefDeploy(w http.ResponseWriter, r *http.Request, a
 		ActorUserID: acct.ID,
 		ActorVia:    routeKindForRequest(r),
 		ActorFromIP: middleware.ClientIP(r),
+		// Issue #977 / ADR-116: annotation surface forwarded onto
+		// the deployment row from the request's annotationForm.
+		// nil/zero values are dropped by EnqueueParams handling.
+		Reason:     ann.Reason,
+		Tag:        ann.Tag,
+		DeployedBy: ann.DeployedBy,
+		PRNumber:   ann.PRNumber,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
 	}
 	s.maybeFlipMFAOnDeploy(r.Context(), acct)
-	s.auditSourceRefDeploy(r.Context(), acct, app, res, prev, req, resolvedSHA, installID)
+	s.auditSourceRefDeploy(r.Context(), acct, app, res, prev, req, resolvedSHA, installID, ann)
 	// Reload the deployment row so the response carries the
 	// canonical wire shape (mirrors createDeployment's
 	// LatestDeployment re-read).
@@ -239,13 +258,22 @@ func (s *server) streamSourceTarball(ctx context.Context, acct state.Account, in
 // columns by apidsource.Enqueue — we re-read it here so the
 // audit row carries the resolved "<via>:<id>" actor on
 // events.actor AND the actor_* payload keys (via mergeActorAudit).
-func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, prev state.Deployment, req api.SourceRefDeployRequest, resolvedSHA string, installID int64) {
+// Issue #977 / ADR-116: the audit data{} map gains 4 keys
+// (reason / tag / deployed_by / pr_number) when present via
+// mergeAnnotationAudit (see handlers_source_tarball.go). nil/zero
+// values are omitted so pre-feature rows stay byte-identical at
+// the JSON layer.
+func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, prev state.Deployment, req api.SourceRefDeployRequest, resolvedSHA string, installID int64, ann annotationForm) {
+
 	s.log.Info("source-ref deployment enqueued",
 		"deployment", res.DeploymentID,
 		"app", app.ID,
 		"repo", req.Repo,
 		"ref", req.Ref,
 		"source_sha", resolvedSHA,
+		"deployed_by", ann.DeployedBy,
+		"pr_number", ann.PRNumber,
+		"tag", ann.Tag,
 	)
 	// Re-read the just-written deployment row to pick up the
 	// actor columns (apidsource.Enqueue stamped them in its tx).
@@ -271,7 +299,7 @@ func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, a
 		return
 	}
 	resolvedActor := resolvedActorString(d.DeployedVia, d.DeployedByUserID, d.PusherLogin)
-	s.audit.EmitAs(ctx, resolvedActor, "deploy.source_ref", &acct.ID, mergeActorAudit(map[string]any{
+	data := map[string]any{
 		"app_id":        app.ID,
 		"deployment_id": res.DeploymentID,
 		"build_id":      res.BuildID,
@@ -280,7 +308,13 @@ func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, a
 		"source_sha":    resolvedSHA,
 		"install_id":    installID,
 		"supersedes":    prev.ID,
-	}, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
+	}
+	// Issue #977 / ADR-116: mirror the annotation surface into
+	// the deploy.source_ref audit row. mergeAnnotationAudit is
+	// "omit when zero" so pre-feature rows stay byte-identical
+	// at the JSON layer.
+	mergeAnnotationAudit(data, ann)
+	s.audit.EmitAs(ctx, resolvedActor, "deploy.source_ref", &acct.ID, mergeActorAudit(data, d.DeployedByUserID, d.DeployedVia, d.DeployedFromIP, d.PusherLogin))
 }
 
 // isValidRef is the cheap pre-flight ref-shape guard. Anything

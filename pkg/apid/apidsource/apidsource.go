@@ -139,20 +139,35 @@ type Notifier interface {
 // bridge stamps it from req.Pusher.Login; the apid paths leave
 // it empty.
 type EnqueueParams struct {
-	AppID            string
-	Kind             state.DeploymentKind
-	SourcePath       string
-	SourceBytes      int64
-	SourceURL        string
-	CommitSHA        string
-	Handler          string
-	Source           string
-	LogSpool         string
-	Log              *slog.Logger
+	AppID       string
+	Kind        state.DeploymentKind
+	SourcePath  string
+	SourceBytes int64
+	SourceURL   string
+	CommitSHA   string
+	Handler     string
+	Source      string
+	LogSpool    string
+	Log         *slog.Logger
+	// Issue #606 / SAFE-RELEASES-E.1 actor columns. ActorVia
+	// must be one of the closed-set values enforced by the
+	// deployments.deployed_via CHECK constraint; ActorUserID
+	// is the local-account FK (the app's owning account for
+	// the githubd bridge path); ActorFromIP is the trusted
+	// remote IP captured at handler entry; ActorPusherLogin
+	// is the raw GitHub login when DeployedVia == "github".
 	ActorUserID      string
 	ActorVia         string
 	ActorFromIP      string
 	ActorPusherLogin string
+	// Annotation fields (issue #977 / ADR-116). Optional;
+	// empty/zero values mean "no annotation" and the pgstore
+	// collapses them to NULL on the row. PRNumber=0 → NULL via
+	// nullif(0) at the INSERT.
+	Reason     string
+	Tag        string
+	DeployedBy string
+	PRNumber   int
 }
 
 // EnqueueResult is the durable artifact the caller writes back to
@@ -252,18 +267,30 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 	// chain, so pre-#606 callers that don't pass actor fields render
 	// identical wire shapes.
 	d, err := store.CreateDeployment(ctx, state.Deployment{
-		AppID:            p.AppID,
-		Kind:             p.Kind,
-		SourcePath:       p.SourcePath,
-		SourceBytes:      p.SourceBytes,
-		SourceURL:        p.SourceURL,
-		CommitSHA:        p.CommitSHA,
-		Handler:          p.Handler,
-		Status:           state.DeployPending,
+		AppID:       p.AppID,
+		Kind:        p.Kind,
+		SourcePath:  p.SourcePath,
+		SourceBytes: p.SourceBytes,
+		SourceURL:   p.SourceURL,
+		CommitSHA:   p.CommitSHA,
+		Handler:     p.Handler,
+		Status:      state.DeployPending,
+		// Issue #606 / SAFE-RELEASES-E.1: actor columns propagated
+		// onto the deployment row at INSERT time. The pgstore
+		// nullString helper collapses "" → NULL for the nullable
+		// text/INET columns.
 		DeployedByUserID: p.ActorUserID,
 		DeployedVia:      p.ActorVia,
 		DeployedFromIP:   p.ActorFromIP,
 		PusherLogin:      p.ActorPusherLogin,
+		// Issue #977 / ADR-116: stamp the annotation surface from
+		// the upstream caller (CLI multipart, JSON body, githubd
+		// bridge). pgstore.CreateDeployment collapses "" to NULL
+		// via nullString and PRNumber=0 to NULL via nullif(0).
+		Reason:     p.Reason,
+		Tag:        p.Tag,
+		DeployedBy: p.DeployedBy,
+		PRNumber:   p.PRNumber,
 	})
 	if err != nil {
 		return EnqueueResult{}, fmt.Errorf("apidsource.Enqueue: create deployment: %w", err)

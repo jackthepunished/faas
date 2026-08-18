@@ -421,6 +421,22 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 			return
 		}
 	}
+	// Issue #977 / ADR-116: validate the annotation surface from
+	// the JSON wire. The same helper covers all three deploy paths
+	// (image JSON here, source-tarball multipart, source-ref
+	// JSON). Pointer fields map to zero (no annotation) when
+	// absent; a present-but-empty string is accepted (the column
+	// is nullable and "no annotation" == "").
+	jsonAnn := annotationForm{
+		Reason:     strFromPtr(req.Reason),
+		Tag:        strFromPtr(req.Tag),
+		DeployedBy: strFromPtr(req.DeployedBy),
+		PRNumber:   intFromPtr(req.PRNumber),
+	}
+	if p := validateAnnotationForm(jsonAnn); p != nil {
+		api.WriteProblem(w, p)
+		return
+	}
 	// PR-B: prior-deployment supersede is in store.CreateDeployment's tx;
 	// we read prev BEFORE the call so the supersede-notify can carry
 	// its id (LatestDeployment returns the post-supersede row).

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	githubdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/githubd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/githubdgrpc"
 	"github.com/onebox-faas/faas/pkg/reconcile"
@@ -381,6 +382,11 @@ func (s *Service) HandlePushRequest(ctx context.Context, body []byte) (reconcile
 			SourcePath:   sourcePath,
 			SourceURL:    sourceURL,
 			SourceBytes:  sourceBytes,
+			// Issue #977 / ADR-116: explicit push event kind so the
+			// bridge stamps DeploymentKindGitHub (legacy push path).
+			// PRNumber + SenderLogin stay zero — push events don't
+			// carry a pull_request webhook payload.
+			EventKind: githubdpb.EnqueueBuildEventKind_EVENT_KIND_PUSH,
 		})
 		if err != nil {
 			// Best-effort: log + continue. The webhook
