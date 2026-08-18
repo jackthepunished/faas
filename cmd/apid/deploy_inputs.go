@@ -207,7 +207,7 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 			api.WriteProblem(w, api.ErrCapacity("could not read deployment"))
 			return
 		}
-		writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
+		writeJSON(w, http.StatusAccepted, s.deploymentResponse(d, app))
 		return
 	}
 }

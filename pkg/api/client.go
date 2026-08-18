@@ -726,6 +726,64 @@ func (c *Client) DeployFromSourceRef(ctx context.Context, slug string, req Sourc
 		"/v1/apps/"+slug+"/deployments/source-ref", req, &out)
 }
 
+// DeployFromSourceTarball is the zero-config local-tarball deploy
+// path (issue #961 / Mega-A PR-1). The caller (CLI) uploads a tarball
+// it produced locally; apid does NOT consult github_installations
+// and does NOT attempt a server-side git fetch. The CLI is the trust
+// root for this path; see docs/adr/0XX-local-tarball-deploy-trust-
+// root.md.
+//
+// tarballName is the form filename apid sees in the multipart
+// "tarball" part (basename is fine). repo + ref are optional
+// informational fields shipped as the JSON `sidecar` part; the
+// build pipeline does NOT use them to fetch upstream.
+//
+// Idempotency-Key is auto-minted here so retries fold into one
+// build row, mirroring DeployFromSourceRef.
+func (c *Client) DeployFromSourceTarball(ctx context.Context, slug string, tarball io.Reader, tarballName string, sidecar SourceTarballDeployRequest) (DeploymentResponse, error) {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	// tarball: file part. The CLI side wraps `packDirToTarGz` so the
+	// shape is already §9-valid (≤10k files, no symlinks/.., absolute
+	// paths stripped); the server's validateAndSpool validates again
+	// before rename so the upload is defence-in-depth.
+	fw, err := w.CreateFormFile("tarball", tarballName)
+	if err != nil {
+		return DeploymentResponse{}, fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := io.Copy(fw, tarball); err != nil {
+		return DeploymentResponse{}, fmt.Errorf("copy tarball: %w", err)
+	}
+	// sidecar: optional JSON. Empty repo+ref → omit the part entirely
+	// (the server treats missing sidecar as zero provenance).
+	if sidecar.Repo != "" || sidecar.Ref != "" {
+		sidecarJSON, err := json.Marshal(sidecar)
+		if err != nil {
+			return DeploymentResponse{}, fmt.Errorf("marshal sidecar: %w", err)
+		}
+		if err := w.WriteField("sidecar", string(sidecarJSON)); err != nil {
+			return DeploymentResponse{}, fmt.Errorf("write sidecar: %w", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		return DeploymentResponse{}, fmt.Errorf("close multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/apps/"+slug+"/deployments/source-tarball", &b)
+	if err != nil {
+		return DeploymentResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	// Auto-mint Idempotency-Key (matches DeployFromSourceRef).
+	req.Header.Set("Idempotency-Key", newUUIDv4())
+
+	var out DeploymentResponse
+	return out, c.doReq(c.uploadHTTP(), req, &out)
+}
+
 // Diff returns a read-only preview of what a deploy would change
 // without writing. CI calls this in the same job that calls
 // Deploy; non-zero exit (or Blocking=true in the wire) means
@@ -984,6 +1042,26 @@ func (c *Client) CreateDomain(ctx context.Context, req CreateCustomDomainRequest
 }
 func (c *Client) DeleteDomain(ctx context.Context, domain string) error {
 	return c.do(ctx, "DELETE", "/v1/domains/"+domain, nil, nil)
+}
+
+// VerifyDomain (issue #961 / Mega-A PR-3) re-runs the DNS + cert
+// walk for a custom domain. Idempotent — POSTing twice does not
+// change the durable verification state. Backed by
+// POST /v1/domains/{domain}/verify; the SDK caller does not need to
+// pass an Idempotency-Key (auto-minted by the SDK roundtripper).
+func (c *Client) VerifyDomain(ctx context.Context, domain string) (CustomDomainResponse, error) {
+	var out CustomDomainResponse
+	return out, c.do(ctx, "POST", "/v1/domains/"+domain+"/verify", nil, &out)
+}
+
+// GetDomain (issue #961 / Mega-A PR-3) returns a domain's durable
+// row + the live cert chain (NotAfter, SANs). Backed by GET
+// /v1/domains/{domain}. The cert dial is on-demand; failures to
+// reach the cert surface as no cert metadata on the response (the
+// next show retry picks up the propagation).
+func (c *Client) GetDomain(ctx context.Context, domain string) (CustomDomainResponse, error) {
+	var out CustomDomainResponse
+	return out, c.do(ctx, "GET", "/v1/domains/"+domain, nil, &out)
 }
 
 // Tenant surfaces (issue #879 / ADR-100 PR-C). The CLI surface

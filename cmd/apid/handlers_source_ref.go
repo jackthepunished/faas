@@ -152,7 +152,7 @@ func (s *server) handleSourceRefDeploy(w http.ResponseWriter, r *http.Request, a
 		api.WriteProblem(w, api.ErrCapacity("could not read deployment"))
 		return
 	}
-	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
+	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d, app))
 }
 
 // resolveInstallToken reads the durable install row from

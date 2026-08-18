@@ -445,11 +445,23 @@ const (
 	// pkg/api/lint_tripwires_test.go.
 	CodeUnsupportedByCLI  = "unsupported_by_cli"
 	CodeDomainNotVerified = "domain_not_verified"
-	CodeCronInvalid       = "cron_invalid"
-	CodeAlertRuleInvalid  = "alert_rule_invalid"
-	CodeHandlerMissing    = "handler_missing"
-	CodeImageRequired     = "image_required"
-	CodeDeployFailed      = "deploy_failed"
+	// CodeDomainVerificationFailed (issue #961 / Mega-A PR-3) is
+	// returned by `gregale domains verify` when the DNS + cert walk
+	// finds a missing/mismatched TXT record, a CNAME loop, or a
+	// reachability failure. Distinct from CodeDomainNotVerified
+	// (which is the SHAPE-mismatch case from create-time binding).
+	CodeDomainVerificationFailed = "domain_verification_failed"
+	// CodeDomainCertNotIssued (issue #961 / Mega-A PR-3) is returned
+	// by `gregale domains verify` when the port-443 cert is a CDN
+	// cert whose SANs do not include the customer's domain. The
+	// customer needs to either wait for Gregale cert propagation
+	// or point the edge at a Gregale-issued cert.
+	CodeDomainCertNotIssued = "domain_cert_not_issued"
+	CodeCronInvalid         = "cron_invalid"
+	CodeAlertRuleInvalid    = "alert_rule_invalid"
+	CodeHandlerMissing      = "handler_missing"
+	CodeImageRequired       = "image_required"
+	CodeDeployFailed        = "deploy_failed"
 	// CodeSigInvalid is returned by schedd when the layer's
 	// signature fails verification (or is missing) on cold-boot.
 	// The deployment transitions to DeployFailed with this code;
@@ -1705,6 +1717,31 @@ func ErrDomainNotVerified(domain string) *Problem {
 	return NewProblem(http.StatusConflict, CodeDomainNotVerified,
 		"Domain not verified",
 		fmt.Sprintf("TXT challenge for %q not yet satisfied; publish the required TXT record and retry.", domain)).
+		WithDocs(docsBase + "/domains/verify")
+}
+
+// ErrDomainVerificationFailed (issue #961 / Mega-A PR-3) is the 422
+// returned by `gregale domains verify` when the DNS + cert walk
+// finds a missing/mismatched TXT record, a CNAME loop, or a
+// reachability failure. The CLI prints the problem code verbatim so
+// the customer can grep their dashboard for the exact failure mode.
+func ErrDomainVerificationFailed(domain, reason string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeDomainVerificationFailed,
+		"Domain verification failed",
+		fmt.Sprintf("%s: %s — fix the DNS record and retry.", domain, reason)).
+		WithDocs(docsBase + "/domains/verify")
+}
+
+// ErrDomainCertNotIssued (issue #961 / Mega-A PR-3) is the 422
+// returned by `gregale domains verify` when the port-443 cert is a
+// CDN cert whose SANs do not include the customer's domain. The
+// hint names the failure mode so the customer knows to either wait
+// for Gregale cert propagation or rebuild the edge against a
+// Gregale-issued cert.
+func ErrDomainCertNotIssued(domain, reason string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeDomainCertNotIssued,
+		"Domain cert not issued",
+		fmt.Sprintf("port-443 cert for %q is not Gregale-issued: %s", domain, reason)).
 		WithDocs(docsBase + "/domains/verify")
 }
 

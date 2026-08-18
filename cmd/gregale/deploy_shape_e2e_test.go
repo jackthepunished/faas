@@ -50,7 +50,7 @@ func TestResolveDeployShape_Function(t *testing.T) {
 		t.Errorf("handler = %q, want %q", hnd, "handler.handler")
 	}
 	got := buf.String()
-	wantLine := "Detected: function, runtime=node22, handler=handler.handler"
+	wantLine := "Detected: function, runtime=node22, handler=handler.handler, class=function"
 	if !strings.Contains(got, wantLine) {
 		t.Errorf("stdout missing %q; got %q", wantLine, got)
 	}
@@ -124,7 +124,7 @@ func TestResolveDeployShape_App(t *testing.T) {
 		t.Errorf("shape = %d, want %d (shapeApp)", sh, shapeApp)
 	}
 	got := buf.String()
-	wantLine := "Detected: app, framework=node"
+	wantLine := "Detected: app, framework=node, class=app"
 	if !strings.Contains(got, wantLine) {
 		t.Errorf("stdout missing %q; got %q", wantLine, got)
 	}
@@ -157,7 +157,7 @@ func TestResolveDeployShape_AppWithVersion(t *testing.T) {
 		t.Errorf("shape = %d, want shapeApp", sh)
 	}
 	got := buf.String()
-	wantLine := "Detected: app, framework=node, version=22.11.0"
+	wantLine := "Detected: app, framework=node, version=22.11.0, class=app"
 	if !strings.Contains(got, wantLine) {
 		t.Errorf("stdout missing %q; got %q", wantLine, got)
 	}
@@ -338,7 +338,7 @@ func TestResolveDeployShape_FunctionRuntimes(t *testing.T) {
 			if hnd != "handler.handler" {
 				t.Errorf("handler = %q, want %q", hnd, "handler.handler")
 			}
-			wantSub := "Detected: function, runtime=" + tc.wantRt + ", handler=handler.handler"
+			wantSub := "Detected: function, runtime=" + tc.wantRt + ", handler=handler.handler, class=function"
 			if !strings.Contains(buf.String(), wantSub) {
 				t.Errorf("stdout missing %q; got %q", wantSub, buf.String())
 			}

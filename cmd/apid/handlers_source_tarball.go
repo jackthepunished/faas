@@ -1,0 +1,168 @@
+// cmd/apid/handlers_source_tarball.go — the local-tarball deploy
+// path (issue #961 / Mega-A PR-1). The CLI is the trust root for
+// this path; apid does NOT consult github_installations and does NOT
+// attempt a server-side git fetch. See docs/adr/0XX-local-tarball-
+// deploy-trust-root.md for the full trust model.
+//
+// Wire shape:
+//
+//	POST /v1/apps/{slug}/deployments/source-tarball
+//	Content-Type: multipart/form-data
+//	Fields:
+//	  - tarball: gzipped tar archive (required)
+//	  - sidecar: JSON {"repo": "owner/name", "ref": "<optional>"}
+//
+// Auth chain (cmd/apid/server.go):
+//
+//	authLimited → requireMFA → requireScope(ScopesDeployWriteSurface) → idempotent → handleSourceTarballDeploy
+//
+// Why a separate file from handlers_source_ref.go: the trust gates
+// diverge. handleSourceRefDeploy requires a durable install row + a
+// 40-char SHA + a server-side fetch through githubd. This handler
+// accepts whatever the CLI produced, validates tarball shape, spools
+// it, and enqueues a DeploymentKindTarball build row. The two paths
+// share only validateAndSpool + apidsource.Enqueue + the final audit
+// + the wire response.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apid/apidsource"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// sidecarPayload is the JSON sidecar the CLI uploads next to the
+// tarball. repo + ref are both optional — the handler records them
+// on the build row for audit/provenance, but the build pipeline does
+// NOT use them to fetch upstream.
+type sidecarPayload struct {
+	Repo string `json:"repo,omitempty"`
+	Ref  string `json:"ref,omitempty"`
+}
+
+func (s *server) handleSourceTarballDeploy(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok, limits := s.loadAppAndPreflight(w, r, acct)
+	if !ok {
+		return
+	}
+
+	// MED-2 fix: cap the request body BEFORE multipart parsing so a
+	// malicious oversize body trips http.MaxBytesError on the first
+	// read rather than spooling the whole thing to os.TempDir() and
+	// OOMing the daemon. The cap is a hard ceiling — we use
+	// (max + 1 MiB headroom) so the multipart boundary + headers
+	// don't push a legitimate upload over the line. Content-Length
+	// short-circuits chunked / unknown-length attacks at the
+	// header layer.
+	maxBytes := int64(limits.SourceTarballMaxMB) * 1024 * 1024
+	maxBody := maxBytes + (1 << 20)
+	if r.ContentLength > maxBody {
+		api.WriteProblem(w, api.ErrSourceTooLarge(limits, r.ContentLength))
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+
+	// ParseMultipartForm returns the whole body into memory up to
+	// maxMemory; beyond that the rest spills to disk under
+	// os.TempDir(). The actual size gate is the post-decode
+	// SourceTarballMaxMB check inside validateAndSpool.
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		// MaxBytesReader surfaces an oversize body as
+		// *http.MaxBytesError on the multipart parser.
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			api.WriteProblem(w, api.ErrSourceTooLarge(limits, -1))
+			return
+		}
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad multipart", err.Error()))
+		return
+	}
+
+	tarballFile, _, err := r.FormFile("tarball")
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Missing tarball", "tarball field is required"))
+		return
+	}
+	defer func() { _ = tarballFile.Close() }()
+
+	// Sidecar is optional. Missing sidecar → empty provenance
+	// fields on the build row; the deploy still works.
+	var sidecar sidecarPayload
+	if raw := r.FormValue("sidecar"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &sidecar); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Bad sidecar", err.Error()))
+			return
+		}
+	}
+
+	// Cap the read at the plan limit so a malicious oversize body
+	// trips CodeSourceTooLarge before we spool it to disk. The
+	// outer http.MaxBytesReader above already bounded the request
+	// body; this io.LimitReader is the second-line belt-and-braces
+	// check inside validateAndSpool.
+	spoolPath, spoolBytes, prob := validateAndSpool(io.LimitReader(tarballFile, maxBytes+1), limits)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+
+	sourceURL := "local-tar://" + sidecar.Repo
+	commitSHA := sidecar.Ref // informational only; not used by the build pipeline
+
+	res, err := apidsource.Enqueue(r.Context(), s.store, s.notif, apidsource.EnqueueParams{
+		AppID:       app.ID,
+		Kind:        state.DeploymentKindTarball,
+		SourcePath:  spoolPath,
+		SourceBytes: spoolBytes,
+		SourceURL:   sourceURL,
+		CommitSHA:   commitSHA,
+		LogSpool:    spoolRoot(),
+		Log:         s.log,
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
+		return
+	}
+
+	s.maybeFlipMFAOnDeploy(r.Context(), acct)
+	s.auditLocalTarballDeploy(r.Context(), acct, app, res, sidecar, spoolBytes)
+
+	d, err := s.store.LatestDeployment(r.Context(), app.ID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not read deployment"))
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d, app))
+}
+
+// auditLocalTarballDeploy emits the `deploy.local_tarball` audit row
+// with the canonical {repo, ref, source_bytes} payload. Distinct
+// from `deploy.source_ref` so the audit log can branch on wire shape
+// without inspecting source URLs.
+func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, sidecar sidecarPayload, sourceBytes int64) {
+	s.log.Info("local-tarball deployment enqueued",
+		"deployment", res.DeploymentID,
+		"app", app.ID,
+		"repo", sidecar.Repo,
+		"ref", sidecar.Ref,
+		"source_bytes", sourceBytes,
+	)
+	s.audit.Emit(ctx, "deploy.local_tarball", &acct.ID, map[string]any{
+		"app_id":        app.ID,
+		"deployment_id": res.DeploymentID,
+		"build_id":      res.BuildID,
+		"repo":          sidecar.Repo,
+		"ref":           sidecar.Ref,
+		"source_bytes":  sourceBytes,
+		"trust_root":    "cli",
+	})
+}
