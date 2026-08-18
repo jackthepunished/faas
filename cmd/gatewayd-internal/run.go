@@ -419,6 +419,13 @@ type runDeps struct {
 	// compute_node_changed via db.SubscribeWithReconnect.
 	// nil in tests.
 	pool *pgxpool.Pool
+	// config (ADR-104 amendment 5, issue #881 Phase 4 C3) is
+	// the parsed TOML config — needed by runWithDeps to read
+	// the [ratelimit] mode knob and wire the production
+	// CentralBackend iff cfg.RateLimit.Mode = "central".
+	// nil in tests; defaultDeps leaves it nil so unit tests
+	// don't need a config.
+	config *Config
 	// controlAddr is the loopback control-plane bind (default
 	// 127.0.0.1:9090). Tests inject a free-port value via "127.0.0.1:0"
 	// + the resolved listener so two tests in the same package don't race
@@ -980,6 +987,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// (B4) — subscribe to compute_node_changed.
 	deps.opsMetrics = gatewayOps
 	deps.pool = pool
+	// ADR-104 amendment 5 / issue #881 Phase 4 C3: hand the
+	// parsed TOML config to runDeps so runWithDeps can read
+	// the [ratelimit] mode knob and wire the production
+	// CentralBackend iff cfg.RateLimit.Mode = "central".
+	deps.config = cfg
 	// Issue #471 / ADR-047 (PR-A): merge the per-process streaming
 	// opt-in from TOML + env. Either source flips the bit. Production
 	// default is false (no streaming — the legacy buffered path).
@@ -1220,6 +1232,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// and proxies to the unix socket bound in cmd/gatewayd-internal/.
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
+	// ADR-104 amendment 5 / issue #881 Phase 4 C3: opt-in
+	// central-mode rate-limit counter (the [ratelimit] mode TOML
+	// knob added in C2). mode = "local" (default) leaves every
+	// Limiter on its noop backend — behaviour unchanged from
+	// pre-Phase-4. mode = "central" wires the production
+	// PGRateLimitBackend + the LISTEN-side invalidator (C4).
+	if deps.config != nil && deps.config.RateLimit.Mode == "central" {
+		backend, rps := buildCentralRateLimitBackend(deps.pool, log)
+		if backend != nil {
+			handler.WithCentralBackend(backend)
+			log.Info("gatewayd-internal: rate-limit central mode armed",
+				"rps_resolver", rpsKind(rps))
+		} else {
+			log.Warn("gatewayd-internal: [ratelimit] mode = \"central\" but Postgres pool unavailable; falling back to in-process buckets (degraded posture)")
+		}
+	}
 	// Issue #587 / PR-A: construct the per-request drain tracker
 	// the graceful-shutdown path waits on. ONE tracker per daemon
 	// shared with the nodeCache raw forwarder + the control mux.
@@ -2161,4 +2189,47 @@ func (a weightsStoreAdapter) LiveDeployments(ctx context.Context, appID string) 
 		})
 	}
 	return out, nil
+}
+
+// buildCentralRateLimitBackend wires the production
+// CentralBackend iff deps.pool is non-nil (Postgres reachable)
+// (ADR-104 amendment 5, issue #881 Phase 4 C3). Returns
+// (nil, nil) when the pool is missing — runWithDeps logs a
+// warning and falls back to the noop backend (degraded posture,
+// single-box dev with no Postgres still works).
+//
+// The rps closure looks up the per-plan refill rate via
+// api.LimitsFor; an unknown plan (defensive — e.g. a future
+// plan addition that hasn't shipped everywhere) degrades to
+// (0, false) which the backend treats as "infinite tokens"
+// (admit-soft). The closure avoids an explicit pkg/api import
+// in this file (state.PGRateLimitBackend accepts the closure
+// directly).
+func buildCentralRateLimitBackend(pool *pgxpool.Pool, log *slog.Logger) (*state.PGRateLimitBackend, func(plan string) (float64, bool)) {
+	if pool == nil {
+		return nil, nil
+	}
+	rps := func(plan string) (float64, bool) {
+		p := api.Plan(plan)
+		if !p.Valid() {
+			return 0, false
+		}
+		limits, ok := api.LimitsFor(p)
+		if !ok {
+			return 0, false
+		}
+		return float64(limits.RateLimitRPS), true
+	}
+	return state.NewPGRateLimitBackend(pool, rps), rps
+}
+
+// rpsKind is a tiny stringifier for the rps closure kind. Used
+// in the "rate-limit central mode armed" log line so an
+// operator can confirm the closure compiled to the api.LimitsFor
+// lookup at boot. Purely cosmetic.
+func rpsKind(fn func(plan string) (float64, bool)) string {
+	if fn == nil {
+		return "noop"
+	}
+	return "api.LimitsFor"
 }

@@ -788,6 +788,37 @@ func (h *Handler) WithLimiter(l *Limiter) *Handler {
 	return h
 }
 
+// WithCentralBackend (ADR-104 amendment 5, issue #881 Phase 4 C3)
+// installs the production CentralBackend on every per-process
+// Limiter the Handler owns (per-app, per-account, per-rule,
+// per-consumer). nil is accepted — the call sites fall back to
+// the noopCentralBackend default. Production wiring lives in
+// cmd/gatewayd-internal/run.go's centralBackendFromConfig helper
+// and is conditioned on cfg.RateLimit.Mode == "central".
+//
+// Single-threaded wire-time invariant: this MUST be called
+// before ServeHTTP starts accepting requests. Mutating the
+// backend mid-flight would race with the boundary-case consult
+// (Limiter.central is read without holding the limiter mutex).
+func (h *Handler) WithCentralBackend(central CentralBackend) *Handler {
+	if central == nil {
+		return h
+	}
+	if h.limiter != nil {
+		h.limiter.central = central
+	}
+	if h.accountLimiter != nil {
+		h.accountLimiter.central = central
+	}
+	if h.routeLimiter != nil {
+		h.routeLimiter.central = central
+	}
+	if h.routeConsumerLimiter != nil {
+		h.routeConsumerLimiter.central = central
+	}
+	return h
+}
+
 // WithRouteConsumerLimiter (ADR-104, issue #881 Phase 3) installs
 // the per-rule per-consumer token-bucket throttle. Production
 // wires NewLimiterWithLRU(EdgeRuleConsumerCacheCap) in NewHandlerWith

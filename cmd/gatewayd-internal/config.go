@@ -218,6 +218,12 @@ func LoadConfig(path string) (*Config, error) {
 		APIDLoopback:    "http://127.0.0.1:8081",
 		GithubdLoopback: "http://127.0.0.1:8083",
 		TLS:             TOMLTLSConfig{Disabled: true}, // e2e harness default
+		// ADR-104 amendment 5 / issue #881 Phase 4 C2: default
+		// RateLimit.Mode = "local" so single-box dev reproduces
+		// the pre-Phase-4 in-process bucket byte-for-byte. The
+		// opt-in to "central" requires an explicit TOML entry
+		// (or future env override; not implemented in C2).
+		RateLimit: TOMLRateLimitConfig{Mode: "local"},
 	}
 	if path == "" {
 		// Gate-B: resolve Role from FAAS_GATEWAYD_ROLE even on the
