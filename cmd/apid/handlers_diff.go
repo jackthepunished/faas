@@ -181,7 +181,7 @@ func (s *server) buildDiffBaseline(ctx context.Context, app state.App, acct stat
 		// pin it on the baseline. Conversion helper exists at
 		// s.deploymentResponse; reused so we don't drift from
 		// the wire shape the CLI sees.
-		dresp := s.deploymentResponse(dep)
+		dresp := s.deploymentResponse(dep, app)
 		out.LatestDeployment = &dresp
 	} else if !errors.Is(err, state.ErrNotFound) {
 		// Hard error — surface to the caller.

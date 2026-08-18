@@ -49,6 +49,13 @@ const (
 	subInfo     = "info"
 	subGet      = "get"
 	subCreate   = "create"
+	// Issue #961 / Mega-A PR-3: domains surface verbs. Lifted from
+	// inline literals so goconst stops flagging the "verify" /
+	// "show" / "set-default" strings in cli_meta.go + the dispatch
+	// switch in commands2.go:cmdDomains.
+	subDomainsSetDefault = "set-default"
+	subDomainsVerify     = "verify"
+	subDomainsShow       = "show"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -1054,6 +1061,19 @@ func cmdDeployTarball(args []string) int {
 		if cwdErr != nil {
 			return printErr("Could not read current directory", cwdErr)
 		}
+		// Issue #961 / Mega-A PR-1: zero-config `gregale deploy` (no
+		// flags). If cwd is inside a git repo with an `origin` remote
+		// pointing at GitHub, route through cmdDeployZeroConfig —
+		// the CLI packs + uploads the local tarball via the new
+		// /source-tarball endpoint, sidestepping the
+		// github_installations gate. Non-git or non-GitHub origins
+		// fall through to the existing cwd-auto-pack branch
+		// below (issue #313).
+		if root, gerr := gitRootFromCwd(cwd); gerr == nil {
+			if _, rerr := gitRemoteOrigin(root); rerr == nil {
+				return cmdDeployZeroConfig(slug, cwd)
+			}
+		}
 		// Issue #737 / ADR-083: resolveDeployShape does detect +
 		// infer + print in one seam so the unit test can drive the
 		// "Detected:" line without bringing up apid. The print goes
@@ -1440,6 +1460,10 @@ func cmdDomains(args []string) int {
 		}
 		PrintOK(osStdout, "Removed")
 		return 0
+	case subDomainsVerify:
+		return cmdDomainsVerify(args[1:])
+	case subDomainsShow:
+		return cmdDomainsShow(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown domains subcommand %q\n", args[0])
 	sug, _ := suggestSubcommand(args[0], parent)

@@ -1865,6 +1865,71 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  /v1/apps/{slug}/deployments/source-tarball:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [deployments]
+      operationId: createDeploymentFromSourceTarball
+      summary: Create a deployment from a CLI-uploaded local tarball (zero-config).
+      description: |
+        Zero-config deploy path (issue #961 / Mega-A PR-1, ADR-115).
+        The CLI uploads a gzipped tar via the `tarball` form field and
+        an optional informational `{repo, ref}` JSON sidecar. The CLI
+        binary is the trust root: apid does NOT consult
+        `github_installations` and does NOT attempt a server-side git
+        fetch.
+
+        Distinct from the source-ref path
+        (`POST /v1/apps/{slug}/deployments/source-ref`, ADR-092) which
+        resolves the GitHub install and pins the tarball to a 40-char
+        SHA. The source-ref handler is unchanged; this is a parallel
+        trust path for first-deploy customers without the GitHub App
+        installed.
+
+        Wire shape:
+          multipart/form-data with two fields:
+            - `tarball` (required): the gzipped tar, capped at the
+              per-plan `SourceTarballMaxMB`.
+            - `sidecar` (optional): JSON `{repo, ref}` recorded on
+              the build row for provenance; the build pipeline does
+              NOT use it to fetch upstream.
+
+        Audit kind: `deploy.local_tarball` (distinct from
+        `deploy.source_ref`).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [tarball]
+              properties:
+                tarball:
+                  type: string
+                  format: binary
+                sidecar:
+                  $ref: '#/components/schemas/SourceTarballDeployRequest'
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The local-tarball deployment whose build has been accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentResponse'
+        '400':
+          description: |
+            code: validation_failed. Missing `tarball` field, malformed
+            sidecar JSON, or invalid tarball shape.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/SourceTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/diff:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -3582,6 +3647,24 @@ paths:
         required: true
         schema: { type: string, pattern: '^[a-z0-9.\-]+$' }
         description: The custom domain string (e.g. `app.example.com`).
+    get:
+      tags: [domains]
+      operationId: getDomain
+      summary: Show a custom domain's cert details (issue #961 / Mega-A PR-3).
+      description: |
+        Returns the durable domain row + the live cert chain
+        (NotAfter, SANs) by dialing port-443 and reading the leaf
+        cert. Used by `gregale domains show <domain>`.
+      responses:
+        '200':
+          description: The domain row + cert details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomDomainResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
     delete:
       tags: [domains]
       operationId: deleteDomain
@@ -3590,6 +3673,44 @@ paths:
         '204': { description: No body. The binding was removed. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/domains/{domain}/verify:
+    parameters:
+      - name: domain
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9.\-]+$' }
+        description: The custom domain to re-verify (e.g. `app.example.com`). The same shape as the GET path; verify walks DNS + cert while show returns the durable row.
+    post:
+      tags: [domains]
+      operationId: verifyDomain
+      summary: Re-verify a domain's DNS + cert (issue #961 / Mega-A PR-3).
+      description: |
+        Re-runs the DNS verifier + cert dial; returns the canonical
+        CustomDomainResponse. Used by `gregale domains verify
+        <domain>`. Idempotent: POSTing twice does not change the
+        durable verification state.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The row + cert details. `cert_not_after` / `cert_sans` populated when the cert dial succeeds.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomDomainResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            code: domain_verification_failed | domain_cert_not_issued.
+            DNS walk found a missing/mismatched TXT record, or the
+            port-443 cert is a CDN cert whose SANs do not include
+            the customer's domain.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ─── Crons ────────────────────────────────────────────────────────────────
@@ -8531,8 +8652,64 @@ components:
             (hit). The `image_digest` sub-field records which OCI
             digest the imaged walk ran against; null on legacy
             pre-PR-A rows. See `pkg/imaged/secretscan.go`.
+        # Issue #961 / Mega-A PR-2: auto-detected BuildPlan surfaced
+        # on the wire so the CLI prints a single "Detected:" line and
+        # the dashboard renders the same shape without a separate
+        # /build fetch. nil for image deploys (no SourcePath on disk);
+        # the wire's omitempty keeps the field off the response in
+        # that case. Source-ref and local-tarball deploys both carry
+        # the same shape — the apid handler reads the spooled tarball
+        # via pkg/markers.DetectFromTarball directly (NOT the
+        # builderd shim, which errors on FrameworkUnknown).
+        build_plan:
+          oneOf:
+            - $ref: '#/components/schemas/BuildPlan'
+            - type: 'null'
+          description: "Auto-detected build plan (issue #961 / Mega-A PR-2). One-line summary the CLI prints after `gregale deploy`. nil for image deploys."
+
+    BuildPlan:
+      description: "Auto-detected build plan surfaced on DeploymentResponse (issue #961 / Mega-A PR-2). Same shape the CLI's pre-ship `Detected:` line prints; populated by apid via `pkg/markers.DetectFromTarball` against the spooled source tarball. Embedded on DeploymentResponse; never returned by a dedicated route."
+      type: object
+      required: [framework]
+      properties:
+        framework:
+          type: string
+          enum: [node, python, go, docker, unknown]
+          description: "Framework detected from the source tarball's top-level markers. `unknown` means no marker was found (monorepo / custom build); the wire renders this as `Detected: …, framework=unknown` rather than dropping the response."
+        runtime:
+          type: [string, "null"]
+          description: "Runtime the app is pinned to (eg `node22`, `python312`). Echoed from app.Runtime. nil for apps without a runtime set (image deploys)."
+        version:
+          type: [string, "null"]
+          description: "Framework version extracted from the detected marker (eg `package.json` `engines.node`, `requirements.txt` head pin). nil when the marker has no version or framework is `unknown`."
+        entrypoint:
+          type: [string, "null"]
+          description: "Entrypoint override (create-time only). nil when the customer did not supply one."
+        port:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 65535
+          description: "Listen-port override (create-time only). nil when the customer did not supply one."
+        class:
+          type: [string, "null"]
+          enum: [null, app, function]
+          description: "App class from `app.Type` — `app` for plain apps, `function` for function rewrites (spec §4.2)."
+
+    SourceTarballDeployRequest:
+      description: "Body for the informational `sidecar` form field on POST /v1/apps/{slug}/deployments/source-tarball (issue #961 / Mega-A PR-1, ADR-115). The CLI is the trust root for this deploy path; apid does NOT consult `github_installations` and does NOT attempt a server-side git fetch. The sidecar fields are recorded on the build row for provenance only — the build pipeline does NOT use them to fetch upstream."
+      type: object
+      properties:
+        repo:
+          type: [string, "null"]
+          pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]/[a-z0-9._-]{1,100}$'
+          description: "`owner/repo` from the customer's git remote, parsed by `cmd/gregale/git_local.go::parseGitRemoteURL`. nil when the sidecar is omitted entirely."
+        ref:
+          type: [string, "null"]
+          pattern: '^[a-f0-9]{40}$'
+          description: "40-char lowercase SHA from `git rev-parse HEAD`. Informational only; the build pipeline does NOT pin to this SHA."
 
     UpdateDeploymentRequest:
+
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
       type: object
       required: [min_instances]
@@ -9360,7 +9537,7 @@ components:
     # ─── Domains ──────────────────────────────────────────────────────────
 
     CustomDomainResponse:
-      description: "A custom domain binding: domain string, target app, verification status, and TLS provisioning state."
+      description: "A custom domain binding: domain string, target app, verification status, and TLS provisioning state. Issue #961 / Mega-A PR-3 adds `default`, `cert_not_after`, and `cert_sans` for the `gregale domains set-default | verify | show` surface."
       type: object
       required: [domain, app_id, verified]
       properties:
@@ -9370,6 +9547,10 @@ components:
         verified: { type: boolean }
         verified_at: { type: [string, "null"], format: date-time }
         txt_record: { type: [string, "null"] }
+        default: { type: boolean, description: "True when this domain is the app's default (issue #961 / Mega-A PR-3). Set via `gregale domains set-default`." }
+        cert_not_after: { type: [string, "null"], format: date-time, description: "Issued cert NotAfter (RFC3339 UTC). Populated on verified domains; the `gregale domains show` line below the cert expiry renders against this field." }
+        cert_sans: { type: array, items: { type: string }, description: "Cert subject alt names (DNSNames). Useful for the `gregale domains show` listing — if the customer's CNAME points at a CDN, the SANs reveal which CDN." }
+        cert_status: { type: [string, "null"], description: "One of `issued` | `pending` | `dial_failed:<reason>`. The show endpoint surfaces this verbatim so the customer can distinguish DNS-not-propagated from cert-not-yet-issued from TLS-handshake-refused. Issue #961 / Mega-A PR-3 code-review round (MED-4)." }
 
     CreateCustomDomainRequest:
       description: "Bind a custom domain to an app."

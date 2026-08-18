@@ -1432,6 +1432,28 @@ type DeploymentResponse struct {
 	// ensures the value is a valid slug; the handler validates
 	// scopeFromBody before storing via api.ValidateScope.
 	Scope string `json:"scope,omitempty"`
+	// BuildPlan (issue #961 / Mega-A PR-2) carries the
+	// framework + runtime + version + entrypoint + port + class
+	// that the build pipeline detected or that the deployment
+	// was created with. nil when the deployment is an image
+	// deploy (no source tarball to detect from) — omitempty
+	// keeps the wire byte-identical for pre-PR-2 clients.
+	// String fields only because pkg/api cannot import pkg/state
+	// (the App.Type enum lives in pkg/state/types.go).
+	BuildPlan *BuildPlan `json:"build_plan,omitempty"`
+}
+
+// BuildPlan describes what the build pipeline did with the source
+// (issue #961 / Mega-A PR-2). Framework is required (so dashboards
+// can branch on "unknown" for monorepos); the rest are optional and
+// surface only when the build pipeline populated them.
+type BuildPlan struct {
+	Framework  string `json:"framework"` // node|python|go|docker|unknown
+	Runtime    string `json:"runtime,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Entrypoint string `json:"entrypoint,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Class      string `json:"class,omitempty"` // app|function
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
@@ -1622,13 +1644,36 @@ type RotateOrgAPIKeyResponse struct {
 // CustomDomainResponse is a custom domain's wire shape. VerifiedAt is the
 // zero time on unverified rows; the verifier goroutine polls DNS and updates
 // it (spec §7).
+//
+// Issue #961 / Mega-A PR-3 additions: `Default` (true when this domain is the
+// app's default), `CertNotAfter` (RFC3339 UTC string, populated on verified
+// domains with an issued cert), and `CertSANs` (the cert's DNSNames subject
+// alt names, useful for the `gregale domains show` listing). All three
+// fields are omitempty so pre-PR-3 clients see bit-identical payloads.
 type CustomDomainResponse struct {
-	Domain         string `json:"domain"`
-	AppID          string `json:"app_id"`
-	ChallengeToken string `json:"challenge_token,omitempty"`
-	Verified       bool   `json:"verified"`
-	VerifiedAt     string `json:"verified_at,omitempty"`
-	TXTRecord      string `json:"txt_record,omitempty"` // convenience for the customer
+	Domain         string   `json:"domain"`
+	AppID          string   `json:"app_id"`
+	ChallengeToken string   `json:"challenge_token,omitempty"`
+	Verified       bool     `json:"verified"`
+	VerifiedAt     string   `json:"verified_at,omitempty"`
+	TXTRecord      string   `json:"txt_record,omitempty"` // convenience for the customer
+	Default        bool     `json:"default,omitempty"`    // true when this domain is the app's default (issue #961 / Mega-A PR-3)
+	CertNotAfter   string   `json:"cert_not_after,omitempty"`
+	CertSANs       []string `json:"cert_sans,omitempty"`
+	// CertStatus summarises the live cert dial (issue #961 / Mega-A PR-3
+	// code-review round, MED-4). One of:
+	//   ""           — cert dial was not attempted (domain unverified, or
+	//                  dialCert not called because the cert is already known).
+	//   "issued"     — port-443 handshake succeeded and the leaf cert
+	//                  covers this domain (sanContains matched).
+	//   "pending"    — domain is verified but the cert dial has not yet
+	//                  succeeded (DNS propagated but cert not yet minted).
+	//   "dial_failed:<reason>" — TCP dial, TLS handshake, or cert parse
+	//                  failed. <reason> is one of: dial_refused,
+	//                  dial_timeout, handshake_failed, no_peer_certs,
+	//                  parse_failed. omitempty so legacy rows / pre-PR-3
+	//                  clients see bit-identical payloads.
+	CertStatus string `json:"cert_status,omitempty"`
 }
 
 // CreateCustomDomainRequest accepts a domain to bind.
@@ -3269,6 +3314,17 @@ type SourceRefDeployRequest struct {
 	Repo   string `json:"repo"`
 	Ref    string `json:"ref"`
 	Format string `json:"format,omitempty"`
+}
+
+// SourceTarballDeployRequest is the CLI-uploaded tarball sidecar for
+// POST /v1/apps/{slug}/deployments/source-tarball (issue #961 / Mega-A
+// PR-1). Repo + Ref are optional, informational, and recorded on the
+// build row verbatim; the build pipeline does NOT use them to fetch
+// upstream. The tarball itself is uploaded as the multipart `tarball`
+// field. See docs/adr/0XX-local-tarball-deploy-trust-root.md.
+type SourceTarballDeployRequest struct {
+	Repo string `json:"repo,omitempty"`
+	Ref  string `json:"ref,omitempty"`
 }
 
 // PlanWorkload mirrors reposcan.Workload (Phase 3 wire shape).

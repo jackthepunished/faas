@@ -525,6 +525,18 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}":                      "DeleteTenantSurface",
 	"POST /v1/apps/{slug}/tenant-surfaces/{id}/hostnames":              "AddTenantHostname",
 	"DELETE /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}": "RemoveTenantHostname",
+
+	// Issue #961 / Mega-A PR-A — zero-config deploy + domains surface.
+	// The auto-derivation produces names with literal hyphens for the
+	// source-tarball route ("PostAppsSlugDeploymentsSource-tarball")
+	// because the path segment carries a hyphen; the SDK verb is
+	// "DeployFromSourceTarball" to mirror DeployFromSourceRef (PR #937).
+	// GET /v1/domains/{domain} auto-derives to "GetDomainsDomain" (Swagger
+	// placeholder noise); the SDK verb drops it, matching the per-app
+	// family (GetApp, GetDeployment, GetUsage).
+	"POST /v1/apps/{slug}/deployments/source-tarball": "DeployFromSourceTarball",
+	"GET /v1/domains/{domain}":                        "GetDomain",
+	"POST /v1/domains/{domain}/verify":                "VerifyDomain",
 }
 
 func main() {

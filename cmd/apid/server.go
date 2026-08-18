@@ -963,6 +963,13 @@ func (s *server) handler() http.Handler {
 	// githubd gRPC bridge (cmd/apid/githubd_client.go) and streams
 	// the upstream tarball straight into validateAndSpool.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments/source-ref", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.handleSourceRefDeploy)))))
+	// Issue #961 / Mega-A PR-1 — zero-config local-tarball deploy.
+	// The CLI is the trust root on this path; apid does NOT consult
+	// github_installations and does NOT attempt a server-side git
+	// fetch. See docs/adr/0XX-local-tarball-deploy-trust-root.md.
+	// Parallel to source-ref, not a replacement — that gate stays
+	// load-bearing for `--repo X --ref SHA` semantics.
+	mux.HandleFunc("POST /v1/apps/{slug}/deployments/source-tarball", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.handleSourceTarballDeploy)))))
 	// PR-1 of the deploy-diff cluster — server-side pre-deploy
 	// preview. Read-only (no DB writes, no audit row, no deployment
 	// row), so the auth chain matches GET /v1/apps/{slug}/metrics
@@ -1057,6 +1064,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/domains", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listDomains))))
 	mux.HandleFunc("POST /v1/domains", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDomain)))))
 	mux.HandleFunc("DELETE /v1/domains/{domain}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteDomain))))
+	// Issue #961 / Mega-A PR-3: per-domain verify + show surfaces for
+	// `gregale domains verify | show`. GET /v1/domains/{domain} returns
+	// the row + cert (NotAfter, SANs); POST /v1/domains/{domain}/verify
+	// re-runs the DNS + cert walk and returns the result. Both mirror
+	// the existing custom-domains auth gates (write for verify, read for
+	// show).
+	mux.HandleFunc("POST /v1/domains/{domain}/verify", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.verifyDomain)))))
+	mux.HandleFunc("GET /v1/domains/{domain}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDomain))))
 
 	// Crons.
 	mux.HandleFunc("GET /v1/crons", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listCrons))))

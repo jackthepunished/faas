@@ -38,6 +38,12 @@ const (
 	auditKeyPriority     = "priority"
 	auditKeyEnabled      = "enabled"
 	auditKeyKind         = "kind"
+	auditKeyDeploymentID = "deployment_id"
+	auditKeyBuildID      = "build_id"
+	auditKeyRepo         = "repo"
+	auditKeyRef          = "ref"
+	auditKeySourceBytes  = "source_bytes"
+	auditKeyTrustRoot    = "trust_root"
 )
 
 // edgeRuleResponse builds the wire shape. Action is re-marshalled
