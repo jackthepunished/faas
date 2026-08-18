@@ -186,16 +186,10 @@ func TestSetComputeNodeRole_PgStore_AllowList(t *testing.T) {
 			}
 		})
 	}
-}
 
-func TestSetComputeNodeRole_PgStore_RowMissing(t *testing.T) {
-	pool := pgtest.Open(t)
-	ctx := context.Background()
-	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	s := state.NewPgStore(pool)
-	if err := s.SetComputeNodeRole(ctx, uuid.NewString(), "control-plane"); !errors.Is(err, state.ErrNotFound) {
-		t.Fatalf("missing row: got %v, want ErrNotFound", err)
-	}
+	t.Run("row missing", func(t *testing.T) {
+		if err := s.SetComputeNodeRole(ctx, uuid.NewString(), "control-plane"); !errors.Is(err, state.ErrNotFound) {
+			t.Fatalf("missing row: got %v, want ErrNotFound", err)
+		}
+	})
 }
