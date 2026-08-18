@@ -15,6 +15,11 @@ import (
 const (
 	// APIKeyPrefix marks live keys. A test/sandbox prefix can be added later.
 	APIKeyPrefix = "fp_live_"
+	// APIKeyOIDCKeyPrefix marks short-lived OIDC-derived bearer tokens
+	// (issue #270 / ADR-101). Same entropy as APIKeyPrefix (24 bytes)
+	// but prefix-disjoint so the two validators don't cross-match.
+	// The middleware dispatches on prefix in pkg/auth/middleware.
+	APIKeyOIDCKeyPrefix = "fp_oidc_"
 	// apiKeyRandomBytes is the entropy behind each key.
 	apiKeyRandomBytes = 24
 )
@@ -27,6 +32,22 @@ func GenerateAPIKey() (plaintext string, hash []byte, err error) {
 		return "", nil, fmt.Errorf("api: generate key: %w", err)
 	}
 	plaintext = APIKeyPrefix + hex.EncodeToString(buf)
+	sum := sha256.Sum256([]byte(plaintext))
+	return plaintext, sum[:], nil
+}
+
+// GenerateOIDCKey mints a short-lived OIDC-derived bearer (ADR-101).
+// Same entropy policy as GenerateAPIKey (apiKeyRandomBytes) but
+// prefixed APIKeyOIDCKeyPrefix so the wire format is greppable
+// separately from long-lived api_keys. Returned plaintext is shown
+// to the caller once; the hash is what the store persists on
+// oidc_exchanged_tokens.token_hash.
+func GenerateOIDCKey() (plaintext string, hash []byte, err error) {
+	buf := make([]byte, apiKeyRandomBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", nil, fmt.Errorf("api: generate OIDC key: %w", err)
+	}
+	plaintext = APIKeyOIDCKeyPrefix + hex.EncodeToString(buf)
 	sum := sha256.Sum256([]byte(plaintext))
 	return plaintext, sum[:], nil
 }
@@ -45,13 +66,29 @@ func HashToken(raw []byte) []byte {
 	return sum[:]
 }
 
-// ValidAPIKeyFormat reports whether s looks like one of our keys (cheap pre-check
-// before hitting the database).
+// ValidAPIKeyFormat reports whether s looks like one of our long-lived
+// keys (cheap pre-check before hitting the database).
 func ValidAPIKeyFormat(s string) bool {
 	if !strings.HasPrefix(s, APIKeyPrefix) {
 		return false
 	}
 	body := strings.TrimPrefix(s, APIKeyPrefix)
+	if len(body) != apiKeyRandomBytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(body)
+	return err == nil
+}
+
+// ValidOIDCKeyFormat reports whether s looks like an OIDC-derived
+// short-lived bearer (ADR-101). Prefix-disjoint from ValidAPIKeyFormat
+// so the two checks never cross-match. The middleware dispatches on
+// this branch after ValidAPIKeyFormat returns false.
+func ValidOIDCKeyFormat(s string) bool {
+	if !strings.HasPrefix(s, APIKeyOIDCKeyPrefix) {
+		return false
+	}
+	body := strings.TrimPrefix(s, APIKeyOIDCKeyPrefix)
 	if len(body) != apiKeyRandomBytes*2 {
 		return false
 	}

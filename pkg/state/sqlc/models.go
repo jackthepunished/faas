@@ -1901,6 +1901,31 @@ type OauthLink struct {
 	CreatedAt       pgtype.Timestamptz
 }
 
+type OidcExchangedToken struct {
+	ID        pgtype.UUID
+	AccountID pgtype.UUID
+	TokenHash []byte
+	ExpiresAt pgtype.Timestamptz
+	IssuerUrl string
+	Subject   string
+	Audience  []string
+	Jti       pgtype.Text
+	CreatedAt pgtype.Timestamptz
+}
+
+type OidcTrustPolicy struct {
+	AccountID      pgtype.UUID
+	IssuerUrl      string
+	JwksUrl        string
+	Audience       []string
+	SubjectPattern pgtype.Text
+	Algorithms     []string
+	RequiredClaims []byte
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	AuditLogin     string
+}
+
 type Org struct {
 	ID                     pgtype.UUID
 	Slug                   string

@@ -1,30 +1,29 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00266_reserve_slot.sql — slot reservation placeholder (ADR-041 / PR #391
--- migration gate carve-out).
+-- 00266_reserve_slot.sql — slot reservation placeholder
+-- (ADR-101 / issue #270 PR-A slot collision carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
--- migrations/embed_test.go::TestMigrationsContiguous requirement that the
--- embedded migration set is exactly {1, 2, …, N} with no gaps. It carries
--- no schema change and does not appear in any apply path (the replay-safety
--- gate in ci.yml drops files whose basename matches the reservation regex
--- from its "added migration versions" computation).
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
 --
--- This reservation is for PR-3a of the issue #911 PR cluster (declarative
--- split-box deployment manifest + gregale doctor). The body lands in
--- migrations/00266_compute_nodes_release.sql and adds release_id /
--- manifest_hash / host_certificate / cert_fingerprint / role / generation
--- columns to the compute_nodes table. PR-3a is the canonical schema
--- migration; this file is the slot reservation only.
+-- PR #906 (ADR-101 PR-A) renumbered the OIDC tables from 00265 to
+-- 00267 + 00266 → 00268 after the cross-PR collision detector
+-- rejected 00265 (claimed by PR #887, merged as commit 5ba460ab
+-- with `00265_edge_rules_kind_throttle.sql`). Slot 00266 is empty
+-- on main, so this fence bridges the contiguity chain from
+-- 00265_edge_rules_kind_throttle.sql (which the PR merge brings
+-- in from main) to the OIDC tables on this branch. Without the
+-- reservation, the embedded FS would have a gap at 266 and
+-- TestMigrationsContiguous would fail at PR time.
 --
--- If another PR lands first at slot 266, this reservation drops on rebase.
--- The renumber-helper chain (`scripts/ci/check_migration_slots.sh`) catches
--- any duplicate-prefix collision at merge time.
---
--- Body: `select 1;` — executes against the live DB at apply time but
--- produces no schema change. Future-proof against upstream generator drift
--- without chasing each new template revision.
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
 --
 select 1;
 

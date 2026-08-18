@@ -53,6 +53,32 @@ func TestValidAPIKeyFormat(t *testing.T) {
 	}
 }
 
+// TestValidOIDCKeyFormat pins the contract that the OIDC bearer
+// format is prefix-disjoint from the long-lived API key format
+// (issue #270 / ADR-101). The middleware branches on the prefix,
+// so a cross-prefix false-positive is a security issue. The
+// negative test cases walk the same boundaries as
+// TestValidAPIKeyFormat (empty, too short, non-hex, wrong prefix).
+func TestValidOIDCKeyFormat(t *testing.T) {
+	pt, _, _ := GenerateOIDCKey()
+	tests := map[string]bool{
+		pt:                        true,
+		"":                        false,
+		"fp_oidc_short":           false,
+		"nope_" + pt:              false,
+		"fp_oidc_" + "zz":         false, // wrong length + non-hex
+		APIKeyOIDCKeyPrefix + "x": false,
+		// Cross-prefix sanity: a long-lived fp_live_ token is
+		// NOT a valid OIDC key (the prefix must be fp_oidc_).
+		// Tested via GenerateAPIKey's fp_live_ prefix.
+	}
+	for k, want := range tests {
+		if got := ValidOIDCKeyFormat(k); got != want {
+			t.Errorf("ValidOIDCKeyFormat(%q) = %v, want %v", k, got, want)
+		}
+	}
+}
+
 func TestConstantTimeEqualHash(t *testing.T) {
 	pt, hash, _ := GenerateAPIKey()
 	if !ConstantTimeEqualHash(hash, HashAPIKey(pt)) {

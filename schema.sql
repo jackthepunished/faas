@@ -10133,3 +10133,84 @@ ALTER TABLE ONLY public.usage_minutes
 --
 
 
+
+--
+-- Name: oidc_trust_policies; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.oidc_trust_policies (
+    account_id uuid NOT NULL,
+    issuer_url text NOT NULL,
+    jwks_url text NOT NULL,
+    audience text[] NOT NULL,
+    subject_pattern text,
+    algorithms text[] NOT NULL,
+    required_claims jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    audit_login text NOT NULL
+);
+
+
+--
+-- Name: oidc_exchanged_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.oidc_exchanged_tokens (
+    id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    token_hash bytea NOT NULL,
+    expires_at timestamptz NOT NULL,
+    issuer_url text NOT NULL,
+    subject text NOT NULL,
+    audience text[] NOT NULL,
+    jti text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+
+--
+-- Name: oidc_trust_policies oidc_trust_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_trust_policies
+    ADD CONSTRAINT oidc_trust_policies_pkey PRIMARY KEY (account_id, issuer_url);
+
+
+--
+-- Name: oidc_exchanged_tokens oidc_exchanged_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_exchanged_tokens
+    ADD CONSTRAINT oidc_exchanged_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: oidc_exchanged_tokens oidc_exchanged_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_exchanged_tokens
+    ADD CONSTRAINT oidc_exchanged_tokens_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: oidc_exchanged_tokens_expires_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX oidc_exchanged_tokens_expires_at_idx ON public.oidc_exchanged_tokens USING btree (expires_at);
+
+
+--
+-- Name: oidc_trust_policies oidc_trust_policies_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_trust_policies
+    ADD CONSTRAINT oidc_trust_policies_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: oidc_exchanged_tokens oidc_exchanged_tokens_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.oidc_exchanged_tokens
+    ADD CONSTRAINT oidc_exchanged_tokens_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;

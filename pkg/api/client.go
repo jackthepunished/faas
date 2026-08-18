@@ -1782,6 +1782,21 @@ func (c *Client) PostAuthLogin(ctx context.Context, email, password string) (Pro
 		PasswordLoginRequest{Email: email, Password: password}, &out)
 }
 
+// PostAuthOidcExchange trades an IdP-issued JWT (e.g. the
+// ACTIONS_ID_TOKEN_REQUEST_TOKEN from GitHub Actions) for a
+// short-lived opaque bearer (5 min TTL, fp_oidc_ prefix). Used by
+// the CI deploy path so customers can swap the long-lived
+// FAAS_TOKEN secret for keyless OIDC. The wire contract is
+// PR-A (ADR-101 / issue #270); PR-B adds the CLI flag + Action
+// input that drives this call.
+//
+// Method name follows deriveMethodName — POST + auth/oidc/exchange →
+// PostAuthOidcExchange. Auto-derived; no pin needed.
+func (c *Client) PostAuthOidcExchange(ctx context.Context, req OIDCExchangeRequest) (OIDCExchangeResponse, error) {
+	var out OIDCExchangeResponse
+	return out, c.do(ctx, "POST", "/v1/auth/oidc/exchange", req, &out)
+}
+
 // PostAuthSignupMagicLink asks the server to email a one-time signup
 // link. Always returns 200 with an identical body — the response is
 // not a promise of email; the CLI prints "Check your email" and

@@ -17,6 +17,14 @@ type Querier interface {
 	AccountByEmail(ctx context.Context, db DBTX, email interface{}) (AccountByEmailRow, error)
 	AccountByID(ctx context.Context, db DBTX, id pgtype.UUID) (AccountByIDRow, error)
 	AccountByKeyHash(ctx context.Context, db DBTX, keySha256 []byte) (AccountByKeyHashRow, error)
+	// Resolves an OIDC (issuer, subject) pair to the platform
+	// account it's bound to. The binding is implicit: any trust
+	// policy row with matching issuer_url + subject_pattern that
+	// matches the subject claim. Empty subject_pattern = permissive
+	// (accept any subject). PR-A matches on issuer_url only with
+	// permissive subject semantics; PR-C will refine the per-issuer
+	// subject index.
+	AccountByOIDCIssuerSubject(ctx context.Context, db DBTX, arg AccountByOIDCIssuerSubjectParams) (AccountByOIDCIssuerSubjectRow, error)
 	AccountsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) ([]AccountsByIDsRow, error)
 	AppByID(ctx context.Context, db DBTX, id pgtype.UUID) (AppByIDRow, error)
 	AppBySlug(ctx context.Context, db DBTX, slug string) (AppBySlugRow, error)
@@ -114,6 +122,11 @@ type Querier interface {
 	// the GDPR path (delete-account cascades through
 	// apps → data_upstreams).
 	DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype.UUID) error
+	// Operator-driven revoke path (PR-C). Returns 0 rows on miss;
+	// the caller maps that to ErrNotFound. The 5-min TTL is the
+	// natural expiry path; Delete is the "kill this CI job's
+	// credential now" lever.
+	DeleteOIDCExchangedToken(ctx context.Context, db DBTX, id pgtype.UUID) error
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
@@ -137,6 +150,21 @@ type Querier interface {
 	// shared_buffers under normal load. Returns ErrNotFound when the
 	// instance row is missing.
 	GetInstanceTailCount(ctx context.Context, db DBTX, id pgtype.UUID) (int32, error)
+	// Bearer hot-path lookup. Filters past-TTL rows out at the SQL
+	// layer so the pg contract is "WHERE expires_at > NOW()". The
+	// MemStore mirror in pkg/state/memstore.go lazy-deletes instead.
+	GetOIDCExchangedTokenByHash(ctx context.Context, db DBTX, tokenHash []byte) (GetOIDCExchangedTokenByHashRow, error)
+	// ─── OIDC / keyless deploy auth (ADR-101, issue #270) ───────────────────
+	//
+	// Per-(account_id, issuer_url) trust policy CRUD + exchanged-token
+	// CRUD. PR-A scope. The composite PK on oidc_trust_policies is the
+	// lookup key; the per-account dashboard list (PR-C) walks the
+	// same index. token_hash UNIQUE on oidc_exchanged_tokens is the
+	// bearer hot-path lookup.
+	// Account-by-issuer lookup. Used by the OIDC exchange handler's
+	// first-use auto-create path (PR-A) and the dashboard's Refine
+	// form (PR-C).
+	GetOIDCTrustPolicy(ctx context.Context, db DBTX, arg GetOIDCTrustPolicyParams) (GetOIDCTrustPolicyRow, error)
 	// Primary-key lookup; called on every authenticated dashboard request.
 	// sql.ErrNoRows from pgx maps to state.ErrNotFound in pgstore.
 	GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetSessionRow, error)
@@ -216,6 +244,9 @@ type Querier interface {
 	// path; the partition creator (PR-C) drops old
 	// partitions wholesale.
 	InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg InsertDataUpstreamProbeParams) error
+	// Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
+	// Returns the full row (with created_at server-stamped).
+	InsertOIDCExchangedToken(ctx context.Context, db DBTX, arg InsertOIDCExchangedTokenParams) (InsertOIDCExchangedTokenRow, error)
 	InstanceByID(ctx context.Context, db DBTX, id pgtype.UUID) (InstanceByIDRow, error)
 	LatestDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestDeploymentRow, error)
 	LatestSupersededDeployment(ctx context.Context, db DBTX, appID pgtype.UUID) (LatestSupersededDeploymentRow, error)
@@ -333,6 +364,8 @@ type Querier interface {
 	// ADR-064 §"Compatibility".
 	ListEventsByWakeID(ctx context.Context, db DBTX, arg ListEventsByWakeIDParams) ([]ListEventsByWakeIDRow, error)
 	ListInstancesForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListInstancesForAppRow, error)
+	// Per-account dashboard list (PR-C). Empty slice on miss.
+	ListOIDCTrustPoliciesForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOIDCTrustPoliciesForAccountRow, error)
 	ListOrgInvitationsForOrg(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgInvitationsForOrgRow, error)
 	ListOrgMembers(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgMembersRow, error)
 	ListOrgsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOrgsForAccountRow, error)
@@ -490,6 +523,11 @@ type Querier interface {
 	// rotation is one statement. upgradedAt + upgradedBy form a §11
 	// audit trail.
 	UpsertGithubWebhookSecret(ctx context.Context, db DBTX, arg UpsertGithubWebhookSecretParams) (int64, error)
+	// PK conflict on (account_id, issuer_url) updates the mutable
+	// columns (audience, subject_pattern, algorithms, required_claims,
+	// updated_at, audit_login) and preserves created_at. Returns the
+	// full row as stored.
+	UpsertOIDCTrustPolicy(ctx context.Context, db DBTX, arg UpsertOIDCTrustPolicyParams) (UpsertOIDCTrustPolicyRow, error)
 	UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error)
 }
 

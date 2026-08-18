@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -61,12 +62,21 @@ type Verifier interface {
 // the verifier needs. Defining it here (instead of importing pkg/gateway)
 // keeps the dep direction one-way: pkg/edgejwks → pkg/gateway would be
 // wrong (it's a leaf package, same posture as pkg/edgejwks → pkg/state).
+//
+// RequiredClaims does strict equality (got.(string) == want); good for
+// stable, fully-spelled-out claims like `aud=foo`. RequiredClaimPatterns
+// does regex matching against string claim values; used for `sub` glob
+// shapes like `repo:OWNER/NAME:ref:refs/heads/.*` where the branch varies
+// (issue #270 / ADR-101). The two maps coexist — a claim key can appear
+// in both, in which case BOTH checks must pass. A nil/empty map on either
+// skips that check entirely (backwards-compatible with pre-PR-101 callers).
 type VerifierRule struct {
-	JWKSURL        string
-	Issuer         string
-	Audience       []string
-	Algorithms     []string
-	RequiredClaims map[string]string
+	JWKSURL               string
+	Issuer                string
+	Audience              []string
+	Algorithms            []string
+	RequiredClaims        map[string]string
+	RequiredClaimPatterns map[string]string
 }
 
 // joseVerifier is the production impl.
@@ -190,7 +200,7 @@ func (v *joseVerifier) Verify(ctx context.Context, rawToken string, rule Verifie
 			return nil, mapParseError(err)
 		}
 		// RequiredClaims — read raw claim map.
-		if len(rule.RequiredClaims) > 0 {
+		if len(rule.RequiredClaims) > 0 || len(rule.RequiredClaimPatterns) > 0 {
 			generic := map[string]any{}
 			if err := decodeJSON(payload, &generic); err != nil {
 				return nil, fmt.Errorf("%w: decode claims: %w", ErrJWTMissingClaim, err)
@@ -203,6 +213,33 @@ func (v *joseVerifier) Verify(ctx context.Context, rawToken string, rule Verifie
 				s, ok := got.(string)
 				if !ok || s != want {
 					return nil, fmt.Errorf("%w: %s", ErrJWTMissingClaim, k)
+				}
+			}
+			// RequiredClaimPatterns — regex match against string claim
+			// values. Compiled once per Verify call (rare path; the
+			// JIT cost is dwarfed by the JWKS fetch); a future ADR
+			// can promote this to a per-rule cache if the pattern
+			// count grows past ~16. Same missing/wrong-value sentinels
+			// as RequiredClaims so the gateway audit row reason is
+			// stable across both checks.
+			if len(rule.RequiredClaimPatterns) > 0 {
+				for k, pat := range rule.RequiredClaimPatterns {
+					got, present := generic[k]
+					if !present {
+						return nil, fmt.Errorf("%w: %s", ErrJWTMissingClaim, k)
+					}
+					s, ok := got.(string)
+					if !ok {
+						return nil, fmt.Errorf("%w: %s", ErrJWTMissingClaim, k)
+					}
+					re, err := regexp.Compile(pat)
+					if err != nil {
+						// A bad pattern is a server-side bug; fail closed.
+						return nil, fmt.Errorf("%w: %s pattern invalid: %w", ErrJWTMissingClaim, k, err)
+					}
+					if !re.MatchString(s) {
+						return nil, fmt.Errorf("%w: %s", ErrJWTMissingClaim, k)
+					}
 				}
 			}
 		}

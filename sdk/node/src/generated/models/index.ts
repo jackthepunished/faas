@@ -152,6 +152,8 @@ export type { MFAVerifyResponse } from './MFAVerifyResponse.js';
 export type { MagicLinkSignupRequest } from './MagicLinkSignupRequest.js';
 export type { MemberListResponse } from './MemberListResponse.js';
 export type { OAuthProviderCapability } from './OAuthProviderCapability.js';
+export type { OIDCExchangeRequest } from './OIDCExchangeRequest.js';
+export type { OIDCExchangeResponse } from './OIDCExchangeResponse.js';
 export type { OrgAccountID } from './OrgAccountID.js';
 export type { OrgInvitationResponse } from './OrgInvitationResponse.js';
 export type { OrgListResponse } from './OrgListResponse.js';

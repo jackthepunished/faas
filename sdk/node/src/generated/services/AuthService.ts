@@ -4,6 +4,8 @@
 /* eslint-disable */
 import type { AuthCapabilities } from '../models/AuthCapabilities.js';
 import type { MagicLinkSignupRequest } from '../models/MagicLinkSignupRequest.js';
+import type { OIDCExchangeRequest } from '../models/OIDCExchangeRequest.js';
+import type { OIDCExchangeResponse } from '../models/OIDCExchangeResponse.js';
 import type { PasswordLoginRequest } from '../models/PasswordLoginRequest.js';
 import type { PasswordLoginResponse } from '../models/PasswordLoginResponse.js';
 import type { PasswordResetConfirm } from '../models/PasswordResetConfirm.js';
@@ -733,6 +735,48 @@ export class AuthService {
       errors: {
         400: `CSRF check failed on the bulk-revoke request.`,
         401: `Cookie missing, expired, tampered, or its \`sid\` is not backed by an active sessions row. Same 401 surface as \`/v1/auth/logout\`.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Exchange an IdP-issued JWT for a short-lived deploy bearer
+   * ADR-101 / issue #270. CI runners that have an IdP-issued OIDC
+   * JWT (RFC 8414; e.g. GitHub Actions `ACTIONS_ID_TOKEN_REQUEST_TOKEN`,
+   * GitLab CI, CircleCI) call this endpoint to exchange it for a
+   * short-lived opaque bearer (5 min TTL, `fp_oidc_<48 hex>` prefix).
+   * The bearer is then used in `Authorization: Bearer …` on the
+   * existing deploy routes.
+   *
+   * The endpoint is anonymous — the JWT is the auth — so it does
+   * not require a session or a previous bearer. The first-use
+   * auto-create flow bootstraps a permissive trust policy on the
+   * `(account_id, issuer_url)` pair so customers do not have to
+   * configure the dashboard before their first CI deploy.
+   *
+   * The AuthLimit surface is the shared per-IP bucket (spec §11
+   * 10/min/IP) — high-volume CI runners may hit the cap; long-lived
+   * deploy tokens remain the escape hatch.
+   *
+   * @returns OIDCExchangeResponse Exchanged. The bearer is in the response body.
+   * @throws ApiError
+   */
+  public static oidcExchange({
+    requestBody,
+  }: {
+    requestBody: OIDCExchangeRequest,
+  }): CancelablePromise<OIDCExchangeResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/auth/oidc/exchange',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `Malformed request body or empty fields.`,
+        401: `JWT signature / issuer / audience / subject failed verification, OR no account is bound to the (issuer, subject) pair.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
