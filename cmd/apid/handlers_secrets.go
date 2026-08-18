@@ -380,20 +380,6 @@ func (s *server) deleteSecret(w http.ResponseWriter, r *http.Request, acct state
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// secretExists checks if a (app_id, key) row exists for the account.
-// Used by setSecret to subtract 1 from the quota count when an upsert is
-// replacing an existing row.
-//
-// Deprecated: replaced by secretExistsInScope (ADR-092 PR-B). The
-// flat (app_id, key) shape is gone — every read now goes through
-// the InScope sibling that carries the env-scope. Kept on the
-// receiver so tests that exercise a path which has not yet migrated
-// (e.g. legacy memstore fixtures) still link; production callers
-// MUST use secretExistsInScope.
-func (s *server) secretExists(c stdctx, accountID, appID, key string) (bool, error) {
-	return s.secretExistsInScope(c, accountID, appID, defaultEnvScope, key)
-}
-
 // secretExistsInScope checks if a (app_id, scope, key) row exists for
 // the account. Used by setSecret to subtract 1 from the quota count
 // when an upsert is replacing an existing row.

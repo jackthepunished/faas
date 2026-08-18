@@ -7848,10 +7848,20 @@ components:
     AppSecretExportResponse:
       description: "One sealed secret in export form: key name, sealed ciphertext (sealed at rest per §11), version, and timestamps. Plaintext is never exported."
       type: object
-      required: [app_id, key, ciphertext, created_at, updated_at]
+      required: [app_id, key, scope, ciphertext, created_at, updated_at]
       properties:
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128 , example: "DATABASE_URL"}
+        # ADR-092 PR-B: scope echoes the env-scope the row was
+        # written to. The GDPR export crosses scopes (operator
+        # compliance flow needs every row to be exportable,
+        # regardless of scope), so the field is always populated.
+        scope:
+          type: string
+          pattern: '^([a-z0-9]([a-z0-9-]{1,38})[a-z0-9]|__all__)$'
+          maxLength: 40
+          x-since: "2026-08"
+          x-issue: "adr-092"
         ciphertext: { type: string, description: 'base64-encoded age-sealed envelope' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }

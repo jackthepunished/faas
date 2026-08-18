@@ -153,11 +153,7 @@ func renderSecretsByScope(w io.Writer, app string, resp *api.AppSecretListRespon
 func renderFlatSecrets(w io.Writer, app string, resp *api.AppSecretListResponse) {
 	_, _ = fmt.Fprintf(w, "%s: %d/%d secrets\n", app, resp.Count, resp.Quota)
 	for _, s := range resp.Secrets {
-		scopeName := s.Scope
-		if scopeName == "" {
-			scopeName = "default"
-		}
-		_, _ = fmt.Fprintf(w, "  %s/%s\n", scopeName, s.Key)
+		_, _ = fmt.Fprintf(w, "  %s/%s\n", scopeOrDefault(s.Scope), s.Key)
 	}
 }
 
