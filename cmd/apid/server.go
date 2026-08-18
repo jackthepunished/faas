@@ -903,6 +903,21 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PUT /v1/apps/{slug}/trusted_signers/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.upsertTrustedSigner))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/trusted_signers/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.deleteTrustedSigner))))
 
+	// Issue #879 / ADR-100 PR-C — tenant surfaces (customer-facing
+	// hostname routing primitive). Feature-flagged via
+	// api.TenantSurfacesEnabled(); the flag check runs inside each
+	// handler so the routes 402 (not 404) when the operator has
+	// not yet enabled the cluster-side surface. Auth chain mirrors
+	// the closest precedent (custom_domains at server.go:986):
+	// authLimited → requireMFA → requireScope(deploy:write) for
+	// mutators, requireScope(read) for the list/get.
+	mux.HandleFunc("GET /v1/apps/{slug}/tenant-surfaces", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTenantSurfaces))))
+	mux.HandleFunc("POST /v1/apps/{slug}/tenant-surfaces", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createTenantSurface)))))
+	mux.HandleFunc("GET /v1/apps/{slug}/tenant-surfaces/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getTenantSurface))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/tenant-surfaces/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteTenantSurface))))
+	mux.HandleFunc("POST /v1/apps/{slug}/tenant-surfaces/{id}/hostnames", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.addTenantHostname)))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/tenant-surfaces/{id}/hostnames/{hostname}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.removeTenantHostname))))
+
 	// Deployments.
 	mux.HandleFunc("POST /v1/apps/{slug}/deployments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createDeployment)))))
 	// DEPLOY-PROV-4 / ADR-092 / issue #739 — headless source-ref

@@ -343,6 +343,22 @@ PR-A/B/C — keep their cite numbers untouched.)
       - **Per-consumer/API-key keying remains OUT of scope**
         (Phase 3 — needs the ADR-040 policy question settled:
         opaque X-API-Key header vs JWT claim). D20.5 closed.
+      **Amendment 4 (issue #881 Phase 3, ADR-104, 2026-08-14):**
+        Per-consumer keying lands as a *further* amendment to D20.5,
+        not a new ADR. ADR-104 picks the policy: per-rule opt-in
+        (`key_by ∈ {"none","api_key","jwt_subject","jwt_claim"}`),
+        bounded by `max_keys_per_rule` (Free 100 / Hobby 1000 /
+        Pro 5000 / Scale 10000) with a `__other__` collapse when
+        the cap is exceeded. The `__other__` bucket is pinned
+        non-evictable to prevent an attacker from weaponising
+        key-space growth to bypass the throttle. Phase 3 is the
+        *edge-rule path* — a separate code path from ADR-040's
+        wake-path policy, which is preserved verbatim. Mega-PR
+        cluster outlined in
+        `/Users/poyrazk/.claude/plans/serialized-greeting-fairy.md`;
+        slot fence at `migrations/00267_reserve_slot.sql`
+        (renumbered from 00266 after cross-PR precheck caught
+        the ADR-101 OIDC cluster owning 00265/00266).
     - **D20.6 — CORS non-preflight e2e path.** PR 6 covers CORS
       preflight e2e; non-preflight stamp-the-Origin flow is
       unit-tested at `pkg/gateway/handler.go:1175-1220` and the e2e

@@ -153,6 +153,27 @@
     mode: "0644"
   notify: reload prometheus
 
+# ADR-098 §9.A meterd data-upstream alerts (issue #951). Source lives
+# at pkg/promqlrules/data_placement.yaml (canonical, per the C8 plan
+# from ADR-098's PR-cluster outline — colocated with the fixture +
+# driver). The src path is 5-up from the role's `files/` dir
+# (deploy/ansible/roles/prometheus/files/), which lands at the repo
+# root — sibling files in this role (pg_backup.rules.yml,
+# faas.rules.yml) are bare names that resolve to this directory;
+# data_placement.yaml deliberately lives outside it to stay
+# colocated with the synthetic fixture + Go driver. Prometheus
+# tolerates a missing rule_files entry, so on a fresh checkout
+# before this task runs the alert is silently skipped — wired
+# into the rule_files: block at prometheus.yml.j2:17-22.
+- name: prometheus — drop data_placement.yaml (ADR-098 §9.A, issue #951)
+  ansible.builtin.copy:
+    src: ../../../../../pkg/promqlrules/data_placement.yaml
+    dest: /etc/prometheus/data_placement.yaml
+    owner: prometheus
+    group: prometheus
+    mode: "0644"
+  notify: reload prometheus
+
 - name: prometheus — install systemd unit
   ansible.builtin.copy:
     src: prometheus.service

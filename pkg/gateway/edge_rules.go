@@ -87,6 +87,19 @@ type PathGlobError = pathGlobError
 // `db.NotifyEdgeRuleChanged`.
 const EdgeRuleCacheCap = 10_000
 
+// EdgeRuleConsumerCacheCap (ADR-104, issue #881 Phase 3) is the
+// maximum number of per-rule per-consumer buckets the
+// routeConsumerLimiter retains. Sized 10x the per-rule cap because
+// each per-rule scope can carry up to MaxKeysPerRule (plan ceiling
+// Scale 10_000) consumer buckets plus one pinned __other__ collapse
+// bucket per rule. The full-bucket-only invariant from
+// pkg/gateway/ratelimit.go:234-267 means the map may overshoot
+// under sustained pressure; BucketCount surfaces the overshoot to
+// /metrics. The default 100_000 covers the worst-case legit
+// traffic (10k rules × 10 keys + 10k collapse buckets) with headroom
+// for the LRU scan to actually find an evictable bucket.
+const EdgeRuleConsumerCacheCap = 100_000
+
 // EdgeRuleResolved is the gateway-side subset of `state.EdgeRule`
 // the matcher reads on every request. Fields are the minimum needed
 // to (a) find a rule whose host matches, (b) apply the path/methods
@@ -847,11 +860,20 @@ type JWTVerifier interface {
 // pkg/edgejwks so the struct is duplicated here — drift would
 // surface as a mismatch when the cmd-side adapter copies the
 // fields over, which is intentional).
+//
+// Custom is the string→string subset of additional claims the rule
+// required (pkg/edgejwks.Claims.Custom). Phase 3 (ADR-104, issue
+// #881 Phase 3) threads this through to applyEdgeRuleThrottle so a
+// rule with key_by="jwt_claim" can look up the named claim value
+// for bucket-key construction. Pre-Phase-3 code never read Custom
+// — adding the field is a non-breaking widening; zero-value (nil)
+// is the prior behaviour.
 type JWTClaims struct {
 	Subject string
 	Issuer  string
 	Aud     []string
 	Exp     time.Time
+	Custom  map[string]string
 }
 
 // EdgeValidateIn is the per-call input the Validator consults. The

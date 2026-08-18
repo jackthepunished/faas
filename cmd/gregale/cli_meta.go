@@ -308,6 +308,22 @@ var cliCommands = []cliCommand{
 		Short:   "Manage custom domains",
 	},
 	{
+		Name:    "tenant-surfaces",
+		DocSlug: "tenant-surfaces",
+		Short:   "Manage tenant surfaces (multi-hostname SAN bundle per app)",
+		Subcommands: []cliSub{
+			{Name: subList, Short: "List tenant surfaces on an app", Flags: []cliFlag{
+				{Name: "app", Short: "app slug (required)"},
+			}},
+			{Name: subAdd, Short: "Add a tenant surface (with seed hostnames)"},
+			{Name: subRm, Short: "Remove a tenant surface (cascades hostnames)"},
+			{Name: "hostname", Short: "Manage hostnames on a surface (add|rm)"},
+		},
+		Flags: []cliFlag{
+			{Name: "app", Short: "app slug"},
+		},
+	},
+	{
 		Name:    "edge-rules",
 		DocSlug: "edge-rules",
 		Short:   "Per-app edge rules (edge-rules list|create|get|update|delete --app <slug>)",

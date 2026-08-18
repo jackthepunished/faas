@@ -151,8 +151,9 @@ func validateEdgeRuleAction(kind string, raw json.RawMessage, plan api.Plan) *ap
 			return api.ErrValidation(fmt.Sprintf("throttle action: plan %q has no limits table entry", plan))
 		}
 		return a.Validate(api.ThrottleValidationContext{
-			PlanMaxRPS:   float64(limits.RateLimitRPS),
-			PlanMaxBurst: limits.RateLimitBurst,
+			PlanMaxRPS:         float64(limits.RateLimitRPS),
+			PlanMaxBurst:       limits.RateLimitBurst,
+			PlanMaxKeysPerRule: limits.ThrottleMaxKeysPerRule,
 		})
 	case state.EdgeRuleKindGeo:
 		var a api.EdgeRuleGeoAction

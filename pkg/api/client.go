@@ -986,6 +986,62 @@ func (c *Client) DeleteDomain(ctx context.Context, domain string) error {
 	return c.do(ctx, "DELETE", "/v1/domains/"+domain, nil, nil)
 }
 
+// Tenant surfaces (issue #879 / ADR-100 PR-C). The CLI surface
+// (cmd/gregale/commands_tenant_surfaces.go) calls these; the
+// HTTP handlers they're backed by live in
+// cmd/apid/handlers_tenant_surfaces.go. The ListTenantSurfaces
+// path is /v1/apps/{slug}/tenant-surfaces and the SDK signature
+// takes the slug so the call site doesn't rebuild the URL.
+
+// ListTenantSurfaces returns every active tenant surface on the
+// app the slug belongs to. Soft-deleted surfaces are filtered
+// server-side, so the SDK returns the same set the dashboard sees.
+func (c *Client) ListTenantSurfaces(ctx context.Context, slug string) ([]TenantSurfaceResponse, error) {
+	var out ListTenantSurfacesResponse
+	if err := c.do(ctx, "GET", "/v1/apps/"+slug+"/tenant-surfaces", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Surfaces, nil
+}
+
+// CreateTenantSurface attaches a new surface to the app. The
+// hostnames list is the seed set the customer wants to certify
+// under one SAN bundle; further hostnames can be added via
+// AddTenantHostname.
+func (c *Client) CreateTenantSurface(ctx context.Context, slug string, req CreateTenantSurfaceRequest) (TenantSurfaceResponse, error) {
+	var out TenantSurfaceResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/tenant-surfaces", req, &out)
+}
+
+// GetTenantSurface returns one surface by id (UUID).
+func (c *Client) GetTenantSurface(ctx context.Context, slug, id string) (TenantSurfaceResponse, error) {
+	var out TenantSurfaceResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/tenant-surfaces/"+id, nil, &out)
+}
+
+// DeleteTenantSurface soft-deletes the surface and cascades the
+// hostnames (server-side). The next attempt to add the same
+// hostname to a new surface succeeds because the orphan rows
+// are hard-deleted.
+func (c *Client) DeleteTenantSurface(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/tenant-surfaces/"+id, nil, nil)
+}
+
+// AddTenantHostname appends a hostname to an existing surface.
+// The challenge token is returned in the response so the CLI
+// can print the TXT record the customer must publish.
+func (c *Client) AddTenantHostname(ctx context.Context, slug, surfaceID string, req AddTenantHostnameRequest) (TenantHostnameResponse, error) {
+	var out TenantHostnameResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/tenant-surfaces/"+surfaceID+"/hostnames", req, &out)
+}
+
+// RemoveTenantHostname deletes a hostname from a surface. The
+// hostname is the lowercased canonical form (the server
+// lowercases on the way in).
+func (c *Client) RemoveTenantHostname(ctx context.Context, slug, surfaceID, hostname string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/tenant-surfaces/"+surfaceID+"/hostnames/"+hostname, nil, nil)
+}
+
 // GetCron returns one cron by id (issue #791 PR-E / ADR-090 closure).
 // Backs `gregale crons info <id>`. Wire shape matches CronResponse
 // (same projection as ListCrons' per-row). The server returns a
