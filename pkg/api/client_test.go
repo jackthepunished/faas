@@ -527,7 +527,7 @@ func TestDeployMultipart_FieldsAndIdempotencyKey(t *testing.T) {
 	defer srv.Close()
 	c := NewClientWithDeployTimeout(srv.URL, "fp_test", 30*time.Second)
 	src := bytes.NewReader([]byte("tarball bytes"))
-	_, err := c.DeployMultipart(context.Background(), "x", src, "src.tar.gz", "", "", false)
+	_, err := c.DeployMultipart(context.Background(), "x", src, "src.tar.gz", "", "", false, DeployAnnotations{})
 	if err != nil {
 		t.Fatalf("DeployMultipart: %v", err)
 	}
@@ -554,7 +554,7 @@ func TestDeployMultipart_ProblemError(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewClient(srv.URL, "fp_test")
-	_, err := c.DeployMultipart(context.Background(), "x", bytes.NewReader([]byte("x")), "src.tar.gz", "", "", false)
+	_, err := c.DeployMultipart(context.Background(), "x", bytes.NewReader([]byte("x")), "src.tar.gz", "", "", false, DeployAnnotations{})
 	var ae *APIError
 	if !errors.As(err, &ae) || ae.Problem.Code != CodeSourceTooLarge {
 		t.Errorf("want APIError{Code: source_too_large}, got %v", err)
