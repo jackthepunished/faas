@@ -34,13 +34,16 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apid"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -330,5 +333,78 @@ func (a *apidProxy) proxyToApid(w http.ResponseWriter, r *http.Request) {
 		rw.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = rw.Write([]byte(`{"type":"about:blank","title":"apid_unavailable","status":503,"detail":"apid is not reachable on the loopback listener"}`))
 	}
-	pxy.ServeHTTP(w, r)
+	// Issue #995 Phase 2 / ADR-121: wrap w with the buffered
+	// capWriter so the apid loopback surface honours a generous
+	// response body cap (api.MaxResponseBodyBytesDefault — Free
+	// tier baseline; the apid control plane returns small JSON
+	// so this is defence-in-depth, not the active cap). Mirrors
+	// the capWriter pattern in pkg/gateway/handler.go without
+	// importing pkg/gateway (which would cycle through
+	// pkg/internal). The atomic.Bool guards the once-per-request
+	// onCap so a runaway apid response can't double-write the
+	// problem+json.
+	cap := api.MaxResponseBodyBytesDefault
+	var disabled atomic.Bool
+	capped := &capWriter{
+		ResponseWriter: w,
+		cap:            cap,
+		disabled:       &disabled,
+		onCap: func() {
+			api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, api.CodeResponseTooLarge,
+				"apid loopback response exceeded cap",
+				fmt.Sprintf("apid loopback is capped at %d bytes per response", cap)))
+		},
+	}
+	pxy.ServeHTTP(capped, r)
+}
+
+// capWriter mirrors pkg/gateway/handler.go::capWriter for the apid
+// loopback proxy. Kept local to avoid an import cycle through
+// pkg/gateway. Issue #995 Phase 2 / ADR-121.
+type capWriter struct {
+	http.ResponseWriter
+	cap      int64
+	written  int64
+	onCap    func()
+	disabled *atomic.Bool
+	// near80 / near95 / exceeded are the once-per-request
+	// warn-on-approach guards (issue #995 Phase 4 / ADR-121),
+	// mirroring pkg/gateway/handler.go::capWriter. The bucket
+	// label passed to onWarn is the closed-set value
+	// {near_threshold, exceeded} matching the apid
+	// gateway_response_body_warn_total metric family.
+	near80   atomic.Bool
+	near95   atomic.Bool
+	exceeded atomic.Bool
+	onWarn   func(bucket string)
+}
+
+func (c *capWriter) Write(b []byte) (int, error) {
+	if c.disabled.Load() {
+		return 0, http.ErrHandlerTimeout
+	}
+	if c.written+int64(len(b)) > c.cap {
+		if c.disabled.CompareAndSwap(false, true) && c.onCap != nil {
+			c.onCap()
+		}
+		if c.exceeded.CompareAndSwap(false, true) && c.onWarn != nil {
+			c.onWarn("exceeded")
+		}
+		return 0, http.ErrHandlerTimeout
+	}
+	// Issue #995 Phase 4 / ADR-121 — pre-Write warn-on-approach
+	// hook. 95% wins over 80% if the same Write crosses both.
+	if c.onWarn != nil && c.cap > 0 {
+		wouldWrite := c.written + int64(len(b))
+		if wouldWrite >= c.cap*95/100 && c.near95.CompareAndSwap(false, true) {
+			c.onWarn("near_threshold")
+		} else if wouldWrite >= c.cap*80/100 && c.near80.CompareAndSwap(false, true) {
+			c.onWarn("near_threshold")
+		}
+	}
+	n, err := c.ResponseWriter.Write(b)
+	if n > 0 {
+		c.written += int64(n)
+	}
+	return n, err
 }

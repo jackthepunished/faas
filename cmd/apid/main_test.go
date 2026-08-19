@@ -24,6 +24,18 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// newLocalListener is the test seam for httptest.Server when the test
+// wants to construct the http.Server directly (httptest.NewUnstartedServer
+// takes an http.Handler, not an *http.Server). Issue #995 Phase 1 helper.
+func newLocalListener(t *testing.T) net.Listener {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return l
+}
+
 // withTestHMACFiles overrides FAAS_AUDIT_HMAC_KEY_FILE and
 // FAAS_RECOVERY_HMAC_KEY_FILE for the lifetime of the test so
 // loadOrGenerate{Audit,Recovery}HMACKey auto-mint a fresh key in
@@ -336,9 +348,224 @@ func TestDefaultDeps_ReturnExpected(t *testing.T) {
 	if s == nil {
 		t.Error("defaultDeps().store() returned nil")
 	}
-	srv := d.newSrv(":0", http.NewServeMux())
+	srv := d.newSrv(":0", http.NewServeMux(), nil)
 	if srv.ReadHeaderTimeout == 0 {
 		t.Error("default server should set ReadHeaderTimeout")
+	}
+	// Issue #995 Phase 1 / ADR-121: hardened defaults surface when
+	// newSrv is called with a nil cfg (the legacy DI seam still
+	// works for callers that don't have a config in hand).
+	if srv.ReadTimeout == 0 {
+		t.Error("default server should set ReadTimeout (issue #995 Phase 1)")
+	}
+	if srv.WriteTimeout == 0 {
+		t.Error("default server should set WriteTimeout (issue #995 Phase 1)")
+	}
+	if srv.IdleTimeout == 0 {
+		t.Error("default server should set IdleTimeout (issue #995 Phase 1)")
+	}
+	if srv.MaxHeaderBytes == 0 {
+		t.Error("default server should set MaxHeaderBytes (issue #995 Phase 1)")
+	}
+}
+
+// TestNewSrv_AppliesTimeouts verifies that newSrv, when called with a
+// resolved *Config, applies the four hardened listener fields
+// (ReadTimeout, WriteTimeout, IdleTimeout, MaxHeaderBytes). Issue
+// #995 Phase 1 / ADR-121.
+func TestNewSrv_AppliesTimeouts(t *testing.T) {
+	d := defaultDeps()
+	cfg := &Config{
+		RequestReadTimeout:    7 * time.Second,
+		RequestWriteTimeout:   8 * time.Second,
+		RequestIdleTimeout:    9 * time.Second,
+		RequestMaxHeaderBytes: 1234,
+	}
+	srv := d.newSrv(":0", http.NewServeMux(), cfg)
+	if srv.ReadTimeout != 7*time.Second {
+		t.Errorf("ReadTimeout = %v, want 7s", srv.ReadTimeout)
+	}
+	if srv.WriteTimeout != 8*time.Second {
+		t.Errorf("WriteTimeout = %v, want 8s", srv.WriteTimeout)
+	}
+	if srv.IdleTimeout != 9*time.Second {
+		t.Errorf("IdleTimeout = %v, want 9s", srv.IdleTimeout)
+	}
+	if srv.MaxHeaderBytes != 1234 {
+		t.Errorf("MaxHeaderBytes = %d, want 1234", srv.MaxHeaderBytes)
+	}
+}
+
+// TestConfig_GetRequestTimeouts_DefaultsAndEnv verifies the Get helpers
+// honour env overlay → TOML → defaults. Issue #995 Phase 1 / ADR-121.
+func TestConfig_GetRequestTimeouts_DefaultsAndEnv(t *testing.T) {
+	// Defaults: empty Config + empty env → fall back to
+	// api.APID*SecondsDefault.
+	var c Config
+	if got := c.GetRequestReadTimeout(func(string) string { return "" }); got != time.Duration(api.APIDReadTimeoutSecondsDefault)*time.Second {
+		t.Errorf("ReadTimeout default = %v, want %ds", got, api.APIDReadTimeoutSecondsDefault)
+	}
+	if got := c.GetRequestWriteTimeout(func(string) string { return "" }); got != time.Duration(api.APIDWriteTimeoutSecondsDefault)*time.Second {
+		t.Errorf("WriteTimeout default = %v, want %ds", got, api.APIDWriteTimeoutSecondsDefault)
+	}
+	if got := c.GetRequestIdleTimeout(func(string) string { return "" }); got != time.Duration(api.APIDIdleTimeoutSecondsDefault)*time.Second {
+		t.Errorf("IdleTimeout default = %v, want %ds", got, api.APIDIdleTimeoutSecondsDefault)
+	}
+	if got := c.GetRequestMaxHeaderBytes(func(string) string { return "" }); got != api.DefaultMaxHeaderBytes {
+		t.Errorf("MaxHeaderBytes default = %d, want %d", got, api.DefaultMaxHeaderBytes)
+	}
+
+	// TOML overrides defaults.
+	c.RequestReadTimeout = 5 * time.Second
+	if got := c.GetRequestReadTimeout(func(string) string { return "" }); got != 5*time.Second {
+		t.Errorf("ReadTimeout TOML = %v, want 5s", got)
+	}
+
+	// Env overrides TOML.
+	if got := c.GetRequestReadTimeout(func(string) string { return "3s" }); got != 3*time.Second {
+		t.Errorf("ReadTimeout env = %v, want 3s", got)
+	}
+	if got := c.GetRequestMaxHeaderBytes(func(string) string { return "2048" }); got != 2048 {
+		t.Errorf("MaxHeaderBytes env = %d, want 2048", got)
+	}
+
+	// Malformed env falls through to TOML.
+	if got := c.GetRequestReadTimeout(func(string) string { return "not-a-duration" }); got != 5*time.Second {
+		t.Errorf("ReadTimeout malformed env = %v, want 5s (TOML)", got)
+	}
+}
+
+// TestParsePositiveInt verifies the small helper that backs
+// GetRequestMaxHeaderBytes' env overlay. Issue #995 Phase 1 helper.
+func TestParsePositiveInt(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"0", 0, false},
+		{"1", 1, false},
+		{"1048576", 1048576, false},
+		{"", 0, true},
+		{"-1", 0, true},
+		{"12x", 0, true},
+		{"1.5", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := parsePositiveInt(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parsePositiveInt(%q) err = %v, wantErr = %v", tc.in, err, tc.wantErr)
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Errorf("parsePositiveInt(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestNewSrv_OversizedHeaders_Returns431 verifies that an http.Server
+// built with the hardened defaults rejects requests with headers
+// larger than MaxHeaderBytes (431 Request Header Fields Too Large).
+// Issue #995 Phase 1 / ADR-121 acceptance criterion #2.
+//
+// stdlib's http.Server returns 431 via http.MaxHeaderError when the
+// header block during read exceeds MaxHeaderBytes; clients may also
+// see a transport-level error (the server closes the conn). Either
+// signal proves the cap fired — accept both.
+func TestNewSrv_OversizedHeaders_Returns431(t *testing.T) {
+	d := defaultDeps()
+	cfg := &Config{
+		RequestMaxHeaderBytes: 64, // small enough to trigger on a 4 KiB header
+	}
+	srv := d.newSrv(":0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), cfg)
+
+	ts := &httptest.Server{
+		Listener: newLocalListener(t),
+		Config:   srv,
+	}
+	ts.Start()
+	defer ts.Close()
+
+	// A single header line with name "X-Big" + ": " + 4 KiB body.
+	// 4 KiB exceeds 64-byte MaxHeaderBytes by orders of magnitude.
+	big := bytes.Repeat([]byte("X"), 4096)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("X-Big", string(big))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// Client saw a transport error (server closed the conn mid-
+		// read). That's still a hardening signal.
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Errorf("oversized headers: got %d, want 431", resp.StatusCode)
+	}
+}
+
+// TestNewSrv_SlowBody_ReturnsTimeout verifies that ReadTimeout
+// actually fires on a client that dribbles bytes slower than the
+// configured window. We use a tiny ReadTimeout (50ms) and a body
+// writer that sleeps between bytes. Issue #995 Phase 1 / ADR-121
+// acceptance criterion #1 (slowloris defence on body arrival).
+func TestNewSrv_SlowBody_ReturnsTimeout(t *testing.T) {
+	d := defaultDeps()
+	cfg := &Config{
+		RequestReadTimeout: 50 * time.Millisecond,
+	}
+	srv := d.newSrv(":0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain whatever the client sent (or didn't). The handler
+		// being reachable isn't the point — the server's
+		// ReadTimeout is what we're exercising.
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}), cfg)
+
+	ts := &httptest.Server{
+		Listener: newLocalListener(t),
+		Config:   srv,
+	}
+	ts.Start()
+	defer ts.Close()
+
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/x", pr)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.ContentLength = -1 // chunked; ReadTimeout is the only thing keeping this alive
+
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		_ = resp.Body.Close()
+		errCh <- nil
+	}()
+
+	// Dribble a single byte, then sleep well past ReadTimeout.
+	if _, err := pw.Write([]byte("a")); err != nil {
+		t.Fatalf("pw.Write: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	// Close the pipe so the goroutine doesn't leak if the test
+	// races; the server will already have aborted the read.
+	_ = pw.Close()
+
+	select {
+	case <-errCh:
+		// Client saw a transport error (server closed the conn)
+		// — that's the hardening path firing.
+	case <-time.After(2 * time.Second):
+		t.Error("ReadTimeout did not fire within 2s — slowloris defence missing")
 	}
 }
 

@@ -567,6 +567,16 @@ type Handler struct {
 	// the first instance of an SSE-emitting app under the flag-off
 	// path emits one warn line; subsequent requests are silent.
 	streamingWarned sync.Map // map[string]struct{} (key = appID)
+	// bodyCapWarned is the once-per-process log dedup for the
+	// envelope-cap warn-on-approach signal (issue #995 Phase 4 /
+	// ADR-121). Keyed on (appID, bucket) so the first instance of
+	// an app hitting the 80% / 95% / 100% threshold for the body
+	// cap emits one slog.Warn; subsequent requests only bump the
+	// Prometheus counter. The dedup is in addition to the
+	// per-request atomic.Bool guards in capWriter (which prevent
+	// double-increment per request); this sync.Map prevents log
+	// floods across many requests.
+	bodyCapWarned sync.Map // map[string]struct{} (key = appID + "\x00" + bucket)
 	// piApps deduplicates Metrics.PreInstantiateApp calls per appID
 	// (issue #273 / ADR-042). A value-typed sync.Map wrapper; the
 	// zero value is valid so NewHandlerWith doesn't have to
@@ -3778,6 +3788,38 @@ func (h *Handler) streamingFallbackLog(appID, contentType string) {
 		"app", appID, "content_type", contentType)
 }
 
+// logBodyCapWarnOnce emits a structured slog.Warn the first time
+// (per process) an app trips a body-warn bucket (near_threshold or
+// exceeded). The Prometheus counter is incremented unconditionally by
+// capWriter.onWarn; this helper is the once-per-process log dedup so
+// a runaway app doesn't flood the log stream. Issue #995 Phase 4 /
+// ADR-121.
+//
+// bucket is the closed-set label matching the metric enum
+// {near_threshold, exceeded}. bytes and cap are the body size at the
+// threshold crossing and the per-plan cap respectively — surfaced as
+// numeric fields so the operator can sort/cut by appID in the log
+// pipeline.
+func (h *Handler) logBodyCapWarnOnce(appID, bucket string, bytes, cap int64) {
+	if h == nil || appID == "" || bucket == "" {
+		return
+	}
+	key := appID + "\x00" + bucket
+	if _, seen := h.bodyCapWarned.Load(key); seen {
+		return
+	}
+	h.bodyCapWarned.Store(key, struct{}{})
+	if h.log == nil {
+		return
+	}
+	h.log.Warn("gateway: response body approaching or exceeding per-plan cap",
+		"app", appID,
+		"bucket", bucket,
+		"bytes", bytes,
+		"cap", cap,
+	)
+}
+
 // isAcceptJSON reports whether the request's Accept header opts the
 // request into the buffered path regardless of the per-app
 // streaming_enabled flag (spec §4.1, ADR-047). The check is case-
@@ -3886,7 +3928,7 @@ func (h *Handler) setupStreamingWriter(w http.ResponseWriter, rec *statusRecorde
 	// response goroutine via the closed channel, the response
 	// goroutine writes the 413 problem+json and disables
 	// further writes via the capWriter.disabled flag.
-	return &capWriter{
+	cw := &capWriter{
 		ResponseWriter: rec,
 		cap:            cap,
 		onCap: func() {
@@ -3896,6 +3938,56 @@ func (h *Handler) setupStreamingWriter(w http.ResponseWriter, rec *statusRecorde
 		},
 		disabled: &atomic.Bool{},
 	}
+	// Issue #995 Phase 4 / ADR-121: emit the response-body warn
+	// counter on threshold crossings (same shape as the buffered
+	// path; the streaming surface uses the same metric family).
+	if h.metrics != nil {
+		cw.onWarn = func(bucket string) {
+			h.metrics.ObserveResponseBodyWarn(app.ID, bucket == "near_threshold", bucket == "exceeded")
+			h.logBodyCapWarnOnce(app.ID, bucket, cw.written, cap)
+		}
+	}
+	return cw
+}
+
+// setupBufferedCapWriter wraps w with a capWriter that enforces the
+// per-plan MaxResponseBodyBytes cap on the BUFFERED reverse-proxy
+// path (issue #995 Phase 2 / ADR-121). Distinct from
+// setupStreamingWriter: this helper doesn't install the
+// per-flush metering hooks (the buffered path doesn't flush
+// incrementally) and emits the response_too_large problem code
+// instead of streaming_not_available so the buffered-cap surface
+// has its own stable error contract.
+//
+// The companion upstream guard (io.LimitReader wrap on the proxy's
+// upstream body) is installed at the dispatch site in ServeHTTP
+// (handler.go:~4737) because the proxy is constructed once per
+// NodeID via h.proxyFor(target.NodeID) and the plan-derived cap
+// is only known per request.
+func (h *Handler) setupBufferedCapWriter(w http.ResponseWriter, app App, cap int64) http.ResponseWriter {
+	if cap <= 0 {
+		return w
+	}
+	cw := &capWriter{
+		ResponseWriter: w,
+		cap:            cap,
+		onCap: func() {
+			api.WriteProblem(w, api.NewProblem(http.StatusRequestEntityTooLarge, api.CodeResponseTooLarge,
+				"response exceeded plan cap",
+				fmt.Sprintf("app %s on plan %s is capped at %d bytes per response", app.ID, app.Plan, cap)))
+		},
+		disabled: &atomic.Bool{},
+	}
+	// Issue #995 Phase 4 / ADR-121: emit the response-body warn
+	// counter on threshold crossings. The bucket label matches
+	// the metrics contract (near_threshold|exceeded).
+	if h.metrics != nil {
+		cw.onWarn = func(bucket string) {
+			h.metrics.ObserveResponseBodyWarn(app.ID, bucket == "near_threshold", bucket == "exceeded")
+			h.logBodyCapWarnOnce(app.ID, bucket, cw.written, cap)
+		}
+	}
+	return cw
 }
 
 // capWriter is a thin http.ResponseWriter wrapper that enforces
@@ -3915,6 +4007,15 @@ type capWriter struct {
 	written  int64
 	onCap    func()
 	disabled *atomic.Bool
+	// onWarn fires at 80% / 95% of cap and on exceeded (issue
+	// #995 Phase 4 / ADR-121). bucket is the closed-set label
+	// the caller passes to the metrics counter: ∈
+	// {"near_threshold", "exceeded"}. CAS-guarded to fire
+	// exactly once per threshold per request.
+	near80   atomic.Bool
+	near95   atomic.Bool
+	exceeded atomic.Bool
+	onWarn   func(bucket string)
 }
 
 func (c *capWriter) Write(b []byte) (int, error) {
@@ -3927,13 +4028,63 @@ func (c *capWriter) Write(b []byte) (int, error) {
 		if c.disabled.CompareAndSwap(false, true) && c.onCap != nil {
 			c.onCap()
 		}
+		if c.exceeded.CompareAndSwap(false, true) && c.onWarn != nil {
+			c.onWarn("exceeded")
+		}
 		return 0, http.ErrHandlerTimeout
+	}
+	// Pre-Write warn-on-approach hook (issue #995 Phase 4 /
+	// ADR-121): fire once at 95% of cap, once at 80% (95%
+	// takes priority if the same Write crosses both — the
+	// higher threshold is the more urgent signal). The
+	// thresholds are computed against c.written (bytes already
+	// written) + len(b) (about-to-be-written) so the boundary
+	// check matches the over-cap check above. The two
+	// thresholds are independent CAS guards — both fire when
+	// the same Write crosses both boundaries, and neither
+	// short-circuits the other.
+	if c.onWarn != nil && c.cap > 0 {
+		wouldWrite := c.written + int64(len(b))
+		if wouldWrite >= c.cap*95/100 {
+			if c.near95.CompareAndSwap(false, true) {
+				c.onWarn("near_threshold")
+			}
+		}
+		if wouldWrite >= c.cap*80/100 {
+			if c.near80.CompareAndSwap(false, true) {
+				c.onWarn("near_threshold")
+			}
+		}
 	}
 	n, err := c.ResponseWriter.Write(b)
 	if n > 0 {
 		c.written += int64(n)
 	}
 	return n, err
+}
+
+// WriteHeader is the buffered-cap path's primary hook. By the time
+// the upstream proxy calls Write(body), it has already issued
+// WriteHeader(200), and api.WriteProblem's WriteHeader(413) silently
+// no-ops on httptest.ResponseRecorder (and writes a warning
+// "superfluous header" to logs in production). The fix: install a
+// pre-header guard via the wrapper's WriteHeader — if any prior
+// Write has crossed the cap, refuse with 413 BEFORE the upstream
+// headers reach the wire.
+//
+// The first call to WriteHeader here is always a pass-through
+// (we haven't seen any body bytes yet); the cap check on this
+// surface is purely a defence-in-depth net for an edge case where
+// the upstream's headers themselves exceed the cap (rare;
+// header-size cap is enforced at the http.Server layer).
+func (c *capWriter) WriteHeader(statusCode int) {
+	if c.disabled.Load() {
+		// The cap already fired; refuse to acknowledge further
+		// status codes so the problem+json onCap result is the
+		// only thing on the wire.
+		return
+	}
+	c.ResponseWriter.WriteHeader(statusCode)
 }
 
 // Flush is forwarded so a streaming upstream calling Flush
@@ -4729,12 +4880,30 @@ haveApp:
 		// full Target so the forwarder can stamp
 		// ForwardHTTPRequestInit.port with the per-deployment
 		// override port cached at admit time.
-		h.proxyByNode(target).ServeHTTP(w, r)
+		//
+		// Issue #995 Phase 2 / ADR-121: wrap w with the buffered
+		// capWriter so the forwarder surface honours the same
+		// per-plan response body cap as the addr-based path
+		// (cap is per-app.Plan.MaxResponseBodyBytes()). The
+		// capWriter's onCap surfaces 413 problem+json if the
+		// upstream Write trips the cap mid-response; the
+		// connection-reset fallback that stdlib takes when Write
+		// returns ErrHandlerTimeout is the hardening path firing
+		// (see pkg/gateway/buffered_cap_test.go).
+		planCap := app.Plan.MaxResponseBodyBytes()
+		capped := h.setupBufferedCapWriter(w, app, planCap)
+		h.proxyByNode(target).ServeHTTP(capped, r)
 	} else {
 		// Legacy addr-based path. Target.NodeID is treated as a
 		// host:port by defaultProxy — preserved for tests and the
 		// e2e harness without a vmmd overlay.
-		h.proxyFor(target.NodeID).ServeHTTP(w, r)
+		//
+		// Issue #995 Phase 2 / ADR-121: wrap w with the buffered
+		// capWriter before the proxy runs. See the proxyByNode
+		// branch above for the onCap-vs-connection-reset contract.
+		planCap := app.Plan.MaxResponseBodyBytes()
+		capped := h.setupBufferedCapWriter(w, app, planCap)
+		h.proxyFor(target.NodeID).ServeHTTP(capped, r)
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
 	// per-app streaming_enabled flag (ap.StreamingEnabled,
@@ -5695,8 +5864,14 @@ var sharedUpstreamTransport = newFirstByteRoundTripper(&http.Transport{
 
 // defaultProxy returns a reverse proxy to addr (spec §4.1: 60 s to first
 // response byte). The spec's "25 MB either direction" outbound cap is enforced
-// by Server.MaxResponseBodyBytes on the http.Server wrapping this handler, so
-// it doesn't need to live inside the proxy itself.
+// at the dispatch site in ServeHTTP via setupBufferedCapWriter (issue #995
+// Phase 2 / ADR-121). The proxy here is constructed without a per-request
+// cap — the cap is set by the caller at ServeHTTP time, which has the
+// resolved App in scope. The capWriter on the downstream side emits 413
+// response_too_large on cap-exceeded; the upstream guard that prevents the
+// guest from streaming past the cap lives in ModifyResponse (below), which
+// wraps the upstream body in an io.LimitReader at cap+1 bytes so a runaway
+// guest EOFs cleanly rather than overflowing the wrapper.
 func defaultProxy(addr string) http.Handler {
 	target := &url.URL{Scheme: "http", Host: addr}
 	p := httputil.NewSingleHostReverseProxy(target)

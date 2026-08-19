@@ -2087,6 +2087,31 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// Apid http.Server defaults (issue #995 Phase 1, ADR-121
+	// companion). The customer-facing control plane binds loopback
+	// (gatewayd-public reverse-proxies in front) so the same
+	// shape gatewayd-internal uses (ResponseWriteTimeoutDefault =
+	// 300s) carries over. ReadHeaderTimeout lives separately
+	// (already 10s in cmd/apid/main.go) — slowloris defence is
+	// split between ReadHeaderTimeout (header arrival) and
+	// ReadTimeout (body arrival). IdleTimeout bounds the
+	// keep-alive pool so a half-open client can't park a goroutine.
+	// Values are int seconds to match ResponseWriteTimeoutDefault's
+	// existing precedent at line 2201 — no `time` import added.
+	APIDReadTimeoutSecondsDefault     = 60  // slowloris defence (body arrival)
+	APIDWriteTimeoutSecondsDefault    = 300 // matches gatewayd-internal
+	APIDIdleTimeoutSecondsDefault     = 120 // keep-alive cap
+
+	// Gatewayd-internal defaults (issue #995 Phase 3, ADR-121
+	// companion). The public listener carries 60 s ReadTimeout
+	// (matches the legacy default set at run.go:1989-1991), with
+	// tighter caps on the control / unix-socket listener where
+	// requests are smaller and shorter-lived.
+	GatewaydInternalReadTimeoutSecondsDefault    = 60 // public listener slowloris defence
+	GatewaydInternalControlReadTimeoutSecondsDefault  = 30 // control + unix-socket
+	GatewaydInternalControlWriteTimeoutSecondsDefault = 30 // control + unix-socket
+	GatewaydInternalControlIdleTimeoutSecondsDefault  = 60 // control + unix-socket keep-alive
+
 	// MaxEdgeRuleLimitBodyBytesStreaming (ADR-091 D24 / kind=limit
 	// streaming carve-out) is the upper bound on the optional
 	// `max_body_bytes_streaming` field of a kind=limit edge rule.
@@ -2197,6 +2222,15 @@ const (
 	// plan; 0 in those fields falls back to the *Default constants
 	// below so a missing plan row fails closed to the spec baseline
 	// rather than inheriting a paid tier's relaxed cap.
+	//
+	// Enforced at two sites (issue #995 / ADR-121):
+	//   - pkg/gateway/handler.go::setupStreamingWriter (streaming path)
+	//     — 413 streaming_not_available on over-cap.
+	//   - pkg/gateway/handler.go::setupBufferedCapWriter (buffered path)
+	//     — 413 response_too_large on over-cap (or hardened connection
+	//     reset if the upstream's headers already reached the wire).
+	// Inbound body caps are enforced by http.MaxBytesReader at the
+	// ServeHTTP entry (separate from the response cap).
 	MaxResponseBodyBytesDefault   int64 = 25 * 1024 * 1024 // 25 MB (spec §4.1)
 	ResponseWriteTimeoutDefault         = 300              // 300 s (spec §4.1)
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
