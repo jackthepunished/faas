@@ -753,6 +753,23 @@ type Limits struct {
 	// egress_allowlist_too_long when the PATCH body has more entries.
 	EgressAllowlistMaxSize int
 
+	// StaticEgressIPAllowed (ADR-119) toggles the per-app static
+	// outbound IP feature. Customer BYOIPs an IPv4 from their own
+	// range; the host bridge aliases it and a per-host postrouting
+	// MASQUERADE sibling rewrites matching tenant source traffic to
+	// the customer's IP. Free/Hobby/Pro keep this off — the B2B
+	// allowlist use case is a paid Scale concern, mirroring how
+	// EgressAllowlistAllowed gates Pro+. apid's updateApp handler
+	// rejects a PATCH with 402 plan_static_egress_ip_not_allowed
+	// when this is false.
+	StaticEgressIPAllowed bool
+	// StaticEgressIPsPerApp is the per-app count cap on pinned
+	// static egress IPs. v1 ships with 1 for Scale (the column is
+	// a single inet, not a child table — see ADR-119 "Storage").
+	// Bumping to N later is a per-plan int change with no schema
+	// impact. 0 with Allowed=false (Free/Hobby/Pro).
+	StaticEgressIPsPerApp int
+
 	// WarmSnapshotEnabled (issue #470 / ADR-055) is the plan-gated
 	// default for the per-app two-tier snapshot flag. Free/Hobby =
 	// false (warm-tier apps keep both warm.snap + init.snap, which
@@ -1639,6 +1656,11 @@ var planLimits = map[Plan]Limits{
 		// is the typical Pro-tier reachability graph.
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 16,
+		// ADR-119: Pro does NOT unlock static egress IP in v1 —
+		// this is a Scale-only feature. The Go zero values
+		// (false/0) apply; no explicit assignment needed. The
+		// accessor `Plan.StaticEgressIPAllowed()` fail-closes on
+		// PlanPro, returning false.
 		// Autoscale: Pro gets both RPS and CPU targets. The CPU target
 		// is gated on Pro+ to bound the "scale on CPU without a
 		// min_instances floor" cost shape.
@@ -1900,6 +1922,14 @@ var planLimits = map[Plan]Limits{
 		// the Pro budget tracks the doubling in DeployedApps (25 -> 100).
 		EgressAllowlistAllowed: true,
 		EgressAllowlistMaxSize: 64,
+		// ADR-119: Scale unlocks the per-app static egress IP
+		// surface — the B2B allowlist use case (Neon / Supabase /
+		// partner APIs that whitelist source IPs). Per-app quota
+		// of 1 in v1 — the column is a single inet, not a child
+		// table. Bumping to N later is a per-plan int change with
+		// no schema impact. IPv4-only in v1.
+		StaticEgressIPAllowed: true,
+		StaticEgressIPsPerApp: 1,
 		// Autoscale: Scale gets both targets; same rationale as Pro.
 		ScaleUpTargetRPSAllowed: true,
 		// Cron: Scale gets 100 per-app and 500 per-account. 5× Pro's
@@ -3271,6 +3301,39 @@ func (p Plan) EgressAllowlistMaxSize() int {
 		return 0
 	}
 	return l.EgressAllowlistMaxSize
+}
+
+// StaticEgressIPAllowed (ADR-119) reports whether the plan may pin
+// a static egress IP to an app. Scale-only in v1 — the B2B
+// allowlist use case is a paid Scale concern, mirroring how
+// EgressAllowlistAllowed gates Pro+. apid's updateApp handler
+// gates `req.StaticEgressIP` on this; the CLI surfaces the
+// rejection with CodePlanStaticEgressIPNotAllowed. Unknown plans
+// fail closed (return false) so a missing row never silently
+// unlocks a premium feature — same contract as
+// EgressAllowlistAllowed above.
+func (p Plan) StaticEgressIPAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.StaticEgressIPAllowed
+}
+
+// StaticEgressIPsPerApp returns the per-plan count cap on pinned
+// static egress IPs (ADR-119). 0 for Free/Hobby/Pro (the gate
+// above rejects before this matters); 1 for Scale in v1. apid
+// rejects a PATCH whose `req.StaticEgressIP` is non-null on an
+// account that already pins the same IP on a different app with
+// 403 plan_static_egress_ip_quota (defends against alias-IP
+// collision on br-tenants). Returning 0 on unknown plans makes a
+// missing plan row a fail-closed denial, not a silent default.
+func (p Plan) StaticEgressIPsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.StaticEgressIPsPerApp
 }
 
 // LivenessAllowed (issue #554 / ADR-078) reports whether the plan

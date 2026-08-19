@@ -895,6 +895,20 @@ const (
 	// without conflating them in telemetry.
 	CodePlanStreamingNotAllowed = "plan_streaming_not_allowed"
 
+	// ADR-119 — per-app static egress IP. Two error codes split
+	// the gate (402: plan doesn't unlock the surface) from the
+	// quota trip (403: per-app quota reached, or alias-IP collision
+	// on br-tenants — a different app on the same account has the
+	// same IP pinned). 402 mirrors the existing CodePlanXxxNotAllowed
+	// family so the CLI's "your plan does not unlock X" template
+	// renders uniformly. The shape error (malformed IP, IPv6, IP
+	// inside the egress denylist) is 400 — distinct from the
+	// gate/quota codes so the SDK can branch on actionable retry
+	// guidance ("upgrade plan" vs "fix IP" vs "use a different IP").
+	CodePlanStaticEgressIPNotAllowed = "plan_static_egress_ip_not_allowed"
+	CodePlanStaticEgressIPQuota      = "plan_static_egress_ip_quota"
+	CodeAppStaticEgressIPInvalid     = "app_static_egress_ip_invalid"
+
 	// Issue #470 / ADR-055: per-app two-tier-snapshot flag (warm.snap
 	// on top of init.snap). Pro/Scale opt in by default; Free/Hobby
 	// reject PATCH-true with 403 plan_warm_snapshot_not_allowed so
@@ -1427,6 +1441,18 @@ func StatusForCode(code string) int {
 		return http.StatusPaymentRequired
 	case CodePlanLimitDataUpstreams:
 		return http.StatusForbidden
+	// ADR-119 — per-app static egress IP. Gate (402) mirrors
+	// CodePlanDataUpstreamsNotAllowed; quota (403) mirrors
+	// CodePlanWebhookQuota; shape error (400) sits next to
+	// CodeUpstreamInvalidHost / CodeEnvVarInvalidKey. Same family
+	// pattern so the CLI's "your plan does not unlock X" / "fix
+	// the IP shape" templates render uniformly.
+	case CodePlanStaticEgressIPNotAllowed:
+		return http.StatusPaymentRequired
+	case CodePlanStaticEgressIPQuota:
+		return http.StatusForbidden
+	case CodeAppStaticEgressIPInvalid:
+		return http.StatusBadRequest
 	case CodeUpstreamInvalidKind, CodeUpstreamInvalidHost, CodeUpstreamInvalidPort:
 		return http.StatusBadRequest
 	case CodeUpstreamNotFound:
@@ -3226,6 +3252,56 @@ func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 		"Invalid egress allowlist entry",
 		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
 		WithDocs(docsBase + "/apps#egress-allowlist")
+}
+
+// ErrPlanStaticEgressIPNotAllowed (ADR-119) is returned when a
+// Free/Hobby/Pro customer tries to PUT
+// /v1/apps/{slug}/static-egress-ip. 402 mirrors the existing
+// CodePlanDataUpstreamsNotAllowed / CodePlanWebhooksNotAllowed
+// family so the CLI's "your plan does not unlock X" template
+// renders uniformly. The dashboard's upgrade CTA surfaces this
+// from `Limits.StaticEgressIPAllowed == false`.
+func ErrPlanStaticEgressIPNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanStaticEgressIPNotAllowed,
+		"Plan does not unlock static egress IP",
+		fmt.Sprintf("plan %q does not unlock static egress IP; upgrade to Scale.", p)).
+		WithLimit(int64(0), int64(0)).
+		WithDocs(docsBase + "/apps#static-egress-ip")
+}
+
+// ErrPlanStaticEgressIPQuota (ADR-119) is the 403 returned by
+// the apid handler when the PATCH would either (a) exceed the
+// per-app quota (currently 1 for Scale — bumping is a per-plan
+// int change with no schema impact), or (b) alias-IP-collide
+// with another app on the same account (defended at the DB
+// layer by `apps_static_egress_ip_key` partial unique index;
+// this surfaces the SQLSTATE 23505 in plan-uniform wording).
+// The limit + observed pair rides on the Problem so the CLI
+// can branch on its own copy of the cap.
+func ErrPlanStaticEgressIPQuota(p Plan, limit int, observed int, detail string) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanStaticEgressIPQuota,
+		"Static egress IP quota reached",
+		fmt.Sprintf("plan %q caps static egress IP at %d per app (observed=%d): %s.", p, limit, observed, detail)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/apps#static-egress-ip")
+}
+
+// ErrAppStaticEgressIPInvalid (ADR-119) is a 400 for shape
+// failures on the static egress IP value: malformed IP string,
+// IPv6 family (deferred to follow-up ADR), or the IP falling
+// inside one of the egress denylist ranges (RFC1918,
+// link-local, multicast, CGN 100.64/10, loopback). The detail
+// names the failure mode so the CLI's `gregale app security
+// static-egress-ip set` rejection renders actionable guidance
+// ("use a public IPv4 outside 10/8, 172.16/12, 192.168/16,
+// 169.254/16, 224/4, 100.64/10, 127/8"). Mirrors
+// ErrInvalidEgressAllowlist's "name the offending entry"
+// contract.
+func ErrAppStaticEgressIPInvalid(ip string, reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAppStaticEgressIPInvalid,
+		"Invalid static egress IP",
+		fmt.Sprintf("static_egress_ip=%q is not accepted: %s.", ip, reason)).
+		WithDocs(docsBase + "/apps#static-egress-ip")
 }
 
 // ErrValidation is a 400 fallback for malformed request bodies. Used by
