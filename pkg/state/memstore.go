@@ -3453,6 +3453,24 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 			a.CORSDefaultOrigins = dst
 		}
 	}
+	// ADR-119: per-app static egress IP. SetStaticEgressIP
+	// distinguishes "don't touch" (false) from "explicit set or
+	// clear" (true). Apid gates the plan and the IPv4-only
+	// shape; the store is a plain column write. nil pointer with
+	// Set=true means "clear" (DELETE wire shape), copying the
+	// pgstore's CASE-based $57+$58 shape so an in-memory test
+	// sees the same persistence surface as a real DB call.
+	if p.SetStaticEgressIP {
+		if p.StaticEgressIP == nil {
+			a.StaticEgressIP = nil
+			a.StaticEgressIPSetAt = nil
+		} else {
+			cp := *p.StaticEgressIP
+			a.StaticEgressIP = &cp
+			now := time.Now().UTC()
+			a.StaticEgressIPSetAt = &now
+		}
+	}
 	m.apps[id] = a
 	return a, nil
 }

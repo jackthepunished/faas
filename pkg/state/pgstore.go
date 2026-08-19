@@ -3058,7 +3058,22 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- matches edge_rules_cors.allow_origins
 			   -- so the gateway reuses the matchOrigin
 			   -- matcher verbatim.
-				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end
+				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end,
+				   -- ADR-119: per-app static egress IP
+				   -- (customer BYOIP). SetStaticEgressIP
+				   -- distinguishes "don't touch" (don't run
+				   -- the SET clause) from "explicit IP"
+				   -- (write the IP + stamp the audit
+				   -- timestamp atomically). NULL with
+				   -- SetStaticEgressIP=true clears the
+				   -- pin (DELETE wire shape). The inet
+				   -- text-encoding is the canonical pgx
+				   -- representation; family=4 CHECK + the
+				   -- partial unique index enforce the v1
+				   -- contract (IPv4 only, no two apps on
+				   -- the same account pin the same IP).
+				   static_egress_ip = case when $57 then $58::inet else static_egress_ip end,
+				   static_egress_ip_set_at = case when $57 and $58 is not null then NOW() when $57 and $58 is null then NULL else static_egress_ip_set_at end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -3156,7 +3171,16 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// explicit-empty-must-mean-something rule as
 		// EgressAllowlist).
 		p.SetCORSDefaultEnabled, boolOrFalse(p.CORSDefaultEnabled),
-		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins))
+		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins),
+		// ADR-119: per-app static egress IP. SetStaticEgressIP
+		// is the "don't touch" sentinel; StaticEgressIP is the
+		// value (nil = clear). derefAddr lifts the *netip.Addr
+		// into a string-encodable shape — pgx accepts the inet
+		// text representation. The CASE in the SET clause
+		// above stamps NOW() on every non-null write so the
+		// audit timestamp is always current when the customer
+		// re-pins.
+		p.SetStaticEgressIP, derefAddr(p.StaticEgressIP))
 	return scanApp(row)
 }
 
@@ -3193,6 +3217,21 @@ func derefString(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// derefAddr returns the string-encoded form of a *netip.Addr, or
+// nil if the pointer is nil. Used by the UpdateApp SQL wrapper for
+// the STATIC_EGRESS_IP arg (ADR-119); the CASE in the SQL guards
+// the nil so a missing pointer never touches the wire (Set bit is
+// false in that case). When the Set bit is true with a nil pointer,
+// the customer is clearing the pin (DELETE wire shape) — the CASE
+// writes NULL atomically. pgx accepts the inet text representation
+// directly; the family=4 CHECK at the DB layer enforces IPv4-only.
+func derefAddr(a *netip.Addr) any {
+	if a == nil {
+		return nil
+	}
+	return a.String()
 }
 
 // derefStrings returns the dereferenced value of a *[]string, or nil if
@@ -12857,7 +12896,15 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// DEFAULT false (migration 00237); plain bool scan is
 		// safe. Order is positional and must match
 		// appsSelectColumns above.
-		&a.MaintenanceMode); err != nil {
+		&a.MaintenanceMode,
+		// ADR-119: per-app static egress IP + audit stamp.
+		// static_egress_ip is nullable inet — pgx scans it into
+		// *netip.Addr (Go nil when SQL NULL). static_egress_ip_
+		// set_at is nullable timestamptz — pgx scans it into
+		// *time.Time (Go nil when SQL NULL). Both pointer
+		// targets are populated by the Set*/CASE branch on the
+		// write side.
+		&a.StaticEgressIP, &a.StaticEgressIPSetAt); err != nil {
 		return mapErr(err)
 	}
 	if overflowNodeStr != "" {
@@ -12985,7 +13032,17 @@ const appsSelectColumns = `
 	-- maintenance flag. Boolean NOT NULL DEFAULT false
 	-- (migration 00237); plain bool scan is safe. Order is
 	-- positional and must match scanApp below.
-	maintenance_mode`
+	maintenance_mode,
+	-- ADR-119: per-app static egress IP (customer BYOIP). Nullable
+	-- inet (NULL = no pin); family=4 CHECK enforced at the DB
+	-- layer. Scanned into *netip.Addr directly — pgx maps SQL
+	-- inet to Go's netip.Addr natively for non-NULL rows, and a
+	-- SQL NULL maps to a Go nil pointer when the scan target is
+	-- a pointer to a value type. The companion timestamp column
+	-- (static_egress_ip_set_at) is nullable timestamptz scanned
+	-- into *time.Time (pgx handles SQL NULL → Go nil natively —
+	-- same shape as ReassignedAt / MigratedAt above).
+	static_egress_ip, static_egress_ip_set_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
