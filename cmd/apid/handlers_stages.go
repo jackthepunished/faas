@@ -59,7 +59,16 @@ func (s *server) getDeploymentStages(w http.ResponseWriter, r *http.Request, acc
 		return
 	}
 	app, err := s.store.AppByID(r.Context(), d.AppID)
-	if err != nil || app.AccountID != acct.ID {
+	if err != nil {
+		// Real DB failure (timeout, conn lost, etc.) — surface
+		// as 500 so the operator can distinguish from a missing
+		// row. Collapsing this into the IDOR 404 path would
+		// mask outages as "no such deployment".
+		api.WriteProblem(w, api.ErrInternal(
+			fmt.Sprintf("load app: %v", err)))
+		return
+	}
+	if app.AccountID != acct.ID {
 		// Cross-account probes get 404, not 403 — never reveal
 		// whether the deployment_id exists in another account.
 		// Same posture as getDeployment / getDeploymentScan.
