@@ -51,7 +51,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00296_DomainDoctorObservations(t *testing.T) {
+func TestMigrations_00309_DomainDoctorObservations(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -71,7 +71,7 @@ func TestMigrations_00296_DomainDoctorObservations(t *testing.T) {
 		t.Fatalf("query domain_doctor_observations existence: %v", err)
 	}
 	if !tableExists {
-		t.Fatalf("domain_doctor_observations missing (00296 must create it)")
+		t.Fatalf("domain_doctor_observations missing (00309 must create it)")
 	}
 
 	// PK is on `domain` (citext) — confirm via

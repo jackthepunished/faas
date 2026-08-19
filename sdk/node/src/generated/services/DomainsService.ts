@@ -178,25 +178,36 @@ export class DomainsService {
     });
   }
   /**
-   * Doctor a domain (ADR-120).
-   * Returns the 5-check doctor report (DNS record found /
-   * points to Gregale / TLS certificate / CAA permits / IPv6
-   * conflict) with a human-readable remediation line per failing
-   * check. Backed by GET /v1/domains/{domain}/doctor. The
-   * handler reads the latest observation row from
-   * domain_doctor_observations; on a stale or missing row it
-   * triggers a synchronous re-probe with a 5s budget. `stale`
-   * on the response is true when the cached row was older than
-   * FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300).
+   * Run the 5-check domain doctor (ADR-120).
+   * Returns the per-domain doctor report. The five checks map
+   * 1:1 to the Render-style custom-domain check: dns_record,
+   * points_to_gregale, tls_certificate, caa_permits,
+   * ipv6_conflict. Each check carries a Status (ok / fail /
+   * pending / na), Detail, Observed, Remediation, and a
+   * per-probe CheckedAt. Used by `gregale domains doctor
+   * <domain>`.
    *
-   * @returns DomainDoctorReport The 5-check report.
+   * The handler reads the latest observation row from
+   * `domain_doctor_observations` (the dns_poller writes a
+   * row every 30s). When the row is older than
+   * FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) or missing,
+   * the handler triggers a synchronous re-probe with a 5s
+   * budget. Stale=true is the visible degradation; the
+   * response is still 200 with the per-check Status.
+   *
+   * 503 CodeDoctorDisabled is returned when the operator
+   * hasn't set FAAS_DOMAIN_DOCTOR_ENABLED. The route stays
+   * registered so the CLI gets a deterministic error code
+   * (matches the pre-#911 pattern in `api/flags.go`).
+   *
+   * @returns DomainDoctorReport The doctor report. `stale:true` means the cached row was older than the TTL when the handler ran a synchronous re-probe.
    * @throws ApiError
    */
-  public static domainDoctor({
+  public static getDomainDoctor({
     domain,
   }: {
     /**
-     * The custom domain to doctor (e.g. `app.example.com`).
+     * The custom domain to diagnose (e.g. `app.example.com`).
      */
     domain: string,
   }): CancelablePromise<DomainDoctorReport> {
@@ -213,7 +224,7 @@ export class DomainsService {
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
-        503: `code: doctor_unavailable`,
+        503: `Doctor is dark-launched (CodeDoctorDisabled) or the probe pass failed (CodeDoctorUnavailable).`,
       },
     });
   }

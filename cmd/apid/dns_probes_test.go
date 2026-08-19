@@ -47,7 +47,7 @@ func withSeams(t *testing.T, a, aaaa, caa func(ctx context.Context, domain strin
 func TestCheckApexA_AAAA_OK(t *testing.T) {
 	withSeams(t,
 		func(_ context.Context, _ string) ([]string, error) { return []string{"1.2.3.4"}, nil },
-		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host"}},
+		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host"} },
 		nil, "")
 	res := checkApexA_AAAA(context.Background(), "api.example.com")
 	if res.Status != probeOK {
@@ -74,8 +74,12 @@ func TestCheckApexA_AAAA_BothPresent(t *testing.T) {
 
 func TestCheckApexA_AAAA_NXDOMAIN(t *testing.T) {
 	withSeams(t,
-		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} },
-		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} },
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
 		nil, "")
 	res := checkApexA_AAAA(context.Background(), "api.example.com")
 	if res.Status != probeFail {
@@ -149,7 +153,9 @@ func TestCheckPointsToGregale_AppsDomainUnset(t *testing.T) {
 
 func TestCheckCAA_NoCAA(t *testing.T) {
 	withSeams(t, nil, nil,
-		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} },
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
 		"")
 	res := checkCAA(context.Background(), "api.example.com")
 	if res.Status != probeOK {
@@ -185,7 +191,9 @@ func TestCheckCAA_DenyAll(t *testing.T) {
 
 func TestCheckAAAAConflict_OK(t *testing.T) {
 	withSeams(t, nil,
-		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} },
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
 		nil, "")
 	res := checkAAAAConflict(context.Background(), "api.example.com")
 	if res.Status != probeOK {
@@ -249,8 +257,12 @@ func TestParseCAARecords(t *testing.T) {
 func TestRunProbesParallel_FanOut(t *testing.T) {
 	withSeams(t,
 		func(_ context.Context, _ string) ([]string, error) { return []string{"1.2.3.4"}, nil },
-		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} },
-		func(_ context.Context, _ string) ([]string, error) { return nil, &net.DNSError{Err: "no such host", IsNotFound: true} },
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
+		func(_ context.Context, _ string) ([]string, error) {
+			return nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+		},
 		"edge.gregale.dev")
 	prevCNAME := cnameLookupFunc
 	t.Cleanup(func() { cnameLookupFunc = prevCNAME })

@@ -14,3 +14,4 @@ export type DomainDoctorReport = {
   healthy: boolean;
   checks: Array<DomainDoctorCheck>;
 };
+

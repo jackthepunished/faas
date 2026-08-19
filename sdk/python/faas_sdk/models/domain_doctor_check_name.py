@@ -1,19 +1,13 @@
 from typing import Literal
 
-DomainDoctorCheckName = Literal[
-    "dns_record",
-    "points_to_gregale",
-    "tls_certificate",
-    "caa_permits",
-    "ipv6_conflict",
-]
+DomainDoctorCheckName = Literal["caa_permits", "dns_record", "ipv6_conflict", "points_to_gregale", "tls_certificate"]
 
 DOMAIN_DOCTOR_CHECK_NAME_VALUES: set[DomainDoctorCheckName] = {
+    "caa_permits",
     "dns_record",
+    "ipv6_conflict",
     "points_to_gregale",
     "tls_certificate",
-    "caa_permits",
-    "ipv6_conflict",
 }
 
 

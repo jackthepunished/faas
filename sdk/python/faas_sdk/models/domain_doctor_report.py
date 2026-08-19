@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -18,10 +18,10 @@ T = TypeVar("T", bound="DomainDoctorReport")
 
 @_attrs_define
 class DomainDoctorReport:
-    """Per-domain doctor report (ADR-120). Carries 5 Render-style checks (dns_record, points_to_gregale,
-    tls_certificate, caa_permits, ipv6_conflict) plus the durable row's app_id and observed_at.
-    `stale:true` means the cached observation row was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS
-    (default 300) when the handler ran a synchronous re-probe.
+    """Per-domain doctor report (ADR-120). Carries 5 Render-style checks (dns_record, points_to_gregale, tls_certificate,
+    caa_permits, ipv6_conflict) plus the durable row's app_id and observed_at. `stale:true` means the cached observation
+    row was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) when the handler ran a synchronous re-probe.
+
     """
 
     domain: str
@@ -29,7 +29,7 @@ class DomainDoctorReport:
     observed_at: datetime.datetime
     healthy: bool
     checks: list[DomainDoctorCheck]
-    stale: bool | Unset = UNSET
+    stale: bool | Unset = False
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,7 +44,6 @@ class DomainDoctorReport:
         checks = []
         for checks_item_data in self.checks:
             checks_item = checks_item_data.to_dict()
-
             checks.append(checks_item)
 
         stale = self.stale

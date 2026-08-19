@@ -1,12 +1,12 @@
 from typing import Literal
 
-DomainDoctorCheckStatus = Literal["ok", "fail", "pending", "na"]
+DomainDoctorCheckStatus = Literal["fail", "na", "ok", "pending"]
 
 DOMAIN_DOCTOR_CHECK_STATUS_VALUES: set[DomainDoctorCheckStatus] = {
-    "ok",
     "fail",
-    "pending",
     "na",
+    "ok",
+    "pending",
 }
 
 

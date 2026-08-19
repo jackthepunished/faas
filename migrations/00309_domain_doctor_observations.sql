@@ -59,15 +59,20 @@
 -- Replay-safety: replay_safety_test.go (the
 -- TestNewMigrationsAreReplaySafe harness) applies each
 -- migration twice in a single tx and pins the second
--- pass as a no-op. CREATE TABLE without IF NOT EXISTS
--- would fail on the second pass with SQLSTATE 42P07;
--- the harness allows CREATE TABLE only when the
--- migration is the table's first introducer (which
--- this one is). The Down migration is forward-only
--- (SELECT 1) because the table is purely additive
--- telemetry — no data loss on rollback.
+-- pass as a no-op. CREATE TABLE IF NOT EXISTS / CREATE
+-- INDEX IF NOT EXISTS (the canonical pattern from
+-- migrations/00053 + 00287) makes the second pass a
+-- no-op without losing the failure mode for typos
+-- (SQLSTATE 42P07 on the very first apply would still
+-- fire if the table genuinely existed for unrelated
+-- reasons). IF NOT EXISTS is the established pattern
+-- for additive tables per migrations/00053 and
+-- 00287's pg_ratelimit follow-up. The Down migration
+-- is forward-only (SELECT 1) because the table is
+-- purely additive telemetry — no data loss on
+-- rollback.
 
-CREATE TABLE domain_doctor_observations (
+CREATE TABLE IF NOT EXISTS domain_doctor_observations (
     domain              citext PRIMARY KEY
                         REFERENCES custom_domains(domain) ON DELETE CASCADE,
     surface_id          uuid NULL
@@ -88,7 +93,7 @@ CREATE TABLE domain_doctor_observations (
     cert_checked_at     timestamptz
 );
 
-CREATE INDEX domain_doctor_observations_stale_idx
+CREATE INDEX IF NOT EXISTS domain_doctor_observations_stale_idx
     ON domain_doctor_observations (observed_at);
 
 -- +goose StatementEnd
