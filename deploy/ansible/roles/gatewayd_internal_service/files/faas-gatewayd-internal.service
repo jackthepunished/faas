@@ -10,11 +10,11 @@ Wants=faas-cp.slice faas-apid.service faas-schedd.service faas-vmmd.service
 
 [Service]
 Type=simple
-# Binary is shipped by the ansible bootstrap step (this role's
-# `tasks/main.yml` invokes `install -m 0755 ... /opt/faas/bin/<bin>`
-# from the builder tarball; cd-controlplane.yml line 278 does the
-# same on the cd path).
-ExecStart=/opt/faas/bin/gatewayd-internal --config /etc/faas/gatewayd-internal.toml
+# Binary is selected by the active release bundle. The release
+# installer atomically flips /opt/faas/current, so every daemon on
+# the box runs the same verified release and rollback remains one
+# symlink operation.
+ExecStart=/opt/faas/current/bin/gatewayd-internal --config /etc/faas/gatewayd-internal.toml
 Restart=on-failure
 RestartSec=2s
 

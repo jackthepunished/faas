@@ -7,6 +7,22 @@ import (
 	"github.com/onebox-faas/faas/pkg/manifest"
 )
 
+// supportBinaryNames are executable files that are not daemons but are
+// required by a running host. They travel with the atomic release because
+// vmmd starts the bridge helpers and the upgrade path invokes gregalectl from
+// the active release tree.
+var supportBinaryNames = []string{
+	"gregale",
+	"gregalectl",
+	"vmmd-raw-bridge",
+	"vmmd-stream-bridge",
+}
+
+// SupportBinaryNames returns the fixed support-binary catalog in stable order.
+func SupportBinaryNames() []string {
+	return append([]string(nil), supportBinaryNames...)
+}
+
 // executableName translates the manifest's logical daemon key to the
 // filename emitted by the Go build and consumed by systemd. The manifest
 // uses underscores for YAML/TOML map keys, while the two gateway binaries
@@ -29,6 +45,20 @@ func executableName(logical string) string {
 func IsCatalogBinaryName(name string) bool {
 	for _, logical := range manifest.SortedHostKeys() {
 		if name == logical || name == executableName(logical) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsReleaseBinaryName reports whether name is a daemon or a required support
+// executable in the immutable release bundle.
+func IsReleaseBinaryName(name string) bool {
+	if IsCatalogBinaryName(name) {
+		return true
+	}
+	for _, support := range supportBinaryNames {
+		if name == support {
 			return true
 		}
 	}

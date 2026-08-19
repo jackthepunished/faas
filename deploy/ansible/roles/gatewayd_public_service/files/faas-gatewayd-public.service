@@ -10,11 +10,10 @@ Wants=faas-cp.slice faas-apid.service faas-gatewayd-internal.service
 
 [Service]
 Type=simple
-# Tier A7 / PR-D (2026-08-04): cd-controlplane.yml's "Install binaries"
-# step writes binaries to /opt/faas/bin/. The legacy
-# /usr/local/bin/gatewayd-public path was the pre-PR-D ship path;
-# this unit aligns with the rest of the deploy tree.
-ExecStart=/opt/faas/bin/gatewayd-public
+# Select the gateway binary from the active verified release bundle.
+# /opt/faas/current is atomically flipped by the release installer,
+# keeping the public and internal gateways on one release identity.
+ExecStart=/opt/faas/current/bin/gatewayd-public
 Restart=on-failure
 RestartSec=2s
 

@@ -17,6 +17,7 @@ type Bundle struct {
 	GitSHA        string            `json:"git_sha"`
 	ManifestHash  string            `json:"manifest_hash"`
 	DaemonHashes  map[string]string `json:"daemon_hashes"`
+	ToolHashes    map[string]string `json:"tool_hashes,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
 	Signature     string            `json:"signature,omitempty"`
 }

@@ -12,7 +12,7 @@
 #
 # The role does NOT enable or start imaged: the operator does that
 # once /srv/fc/base is populated (firecracker role) and the binary
-# is at /opt/faas/bin/imaged. Idempotency: each copy uses `mode:` and
+# is at /opt/faas/current/bin/imaged. Idempotency: each copy uses `mode:` and
 # the user-create is `state: present` no-op when the uid exists.
 
 - name: compute_only_service — assert role is invoked on a compute-only box (Gate-B)
@@ -287,6 +287,6 @@
       imaged installed but NOT enabled. Operator runs:
         systemctl enable --now faas-imaged
       once /srv/fc/base is populated and the binary is at
-      /opt/faas/bin/imaged. The role does not enable imaged
+      /opt/faas/current/bin/imaged. The role does not enable imaged
       because it cannot assume the firecracker role ran first on
       the same host.

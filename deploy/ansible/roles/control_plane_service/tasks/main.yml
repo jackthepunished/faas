@@ -192,7 +192,7 @@
       FAAS_SCHEDD_ADDR=/run/faas/schedd.sock for meterd — meterd refuses to
       start without FAAS_SCHEDD_ADDR per issue #52's strict-exit rule) and
       the binaries are installed at
-      /opt/faas/bin/{apid,schedd,meterd}.
+      /opt/faas/current/bin/{apid,schedd,meterd}.
       imaged is no longer installed by this role — see
       compute_only_service (Gate-B, issue #297 / ADR-025 §Tier 2).
 

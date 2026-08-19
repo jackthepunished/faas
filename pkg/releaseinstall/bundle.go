@@ -49,7 +49,8 @@ type Manifest struct {
 	FormatVersion int               `json:"format_version"`
 	GitSHA        string            `json:"git_sha"`
 	ManifestHash  string            `json:"manifest_hash"`
-	DaemonHashes  map[string]string `json:"daemon_hashes"` // daemon name -> "sha256:<64hex>"
+	DaemonHashes  map[string]string `json:"daemon_hashes"`         // daemon name -> "sha256:<64hex>"
+	ToolHashes    map[string]string `json:"tool_hashes,omitempty"` // required host support executable -> "sha256:<64hex>"
 	CreatedAt     time.Time         `json:"created_at"`
 	// Signature is reserved for a future PR-3.5 cosign verification
 	// pass. Always empty for PR-3. Kept on the struct so the JSON
@@ -120,12 +121,35 @@ func Build(root, gitSHA, manifestHash string, now time.Time) (Manifest, error) {
 		}
 		hashes[name] = "sha256:" + hash
 	}
+	tools := make(map[string]string)
+	for _, name := range SupportBinaryNames() {
+		binPath := filepath.Join(bin, name)
+		info, statErr := os.Stat(binPath)
+		if errors.Is(statErr, os.ErrNotExist) {
+			// Older producers did not ship support executables. Keep
+			// Build backwards-compatible; new bundles include and
+			// Verify gates every support file they are given.
+			continue
+		}
+		if statErr != nil {
+			return Manifest{}, fmt.Errorf("releaseinstall: stat tool %s: %w", binPath, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			return Manifest{}, fmt.Errorf("releaseinstall: tool %s is not a regular file", binPath)
+		}
+		hash, hashErr := hashFile(binPath)
+		if hashErr != nil {
+			return Manifest{}, fmt.Errorf("releaseinstall: hash tool %s: %w", binPath, hashErr)
+		}
+		tools[name] = "sha256:" + hash
+	}
 
 	return Manifest{
 		FormatVersion: FormatVersion,
 		GitSHA:        gitSHA,
 		ManifestHash:  manifestHash,
 		DaemonHashes:  hashes,
+		ToolHashes:    tools,
 		CreatedAt:     now.UTC(),
 	}, nil
 }
@@ -242,6 +266,18 @@ func Verify(root string, m Manifest) error {
 			return fmt.Errorf("releaseinstall: daemon %s sha256 %s, want %s", name, "sha256:"+got, want)
 		}
 	}
+	for name, want := range m.ToolHashes {
+		if !IsReleaseBinaryName(name) || IsCatalogBinaryName(name) {
+			return fmt.Errorf("releaseinstall: manifest contains unknown tool %s", name)
+		}
+		got, err := hashFile(filepath.Join(bin, name))
+		if err != nil {
+			return fmt.Errorf("releaseinstall: hash tool %s: %w", name, err)
+		}
+		if "sha256:"+got != want {
+			return fmt.Errorf("releaseinstall: tool %s sha256 %s, want %s", name, "sha256:"+got, want)
+		}
+	}
 	// Walk the bin directory and reject any file that isn't a
 	// catalog daemon (names from manifest.SortedHostKeys()).
 	// Mirrors pkg/releasebundle.Verify's "unexpected files" check.
@@ -251,6 +287,9 @@ func Verify(root string, m Manifest) error {
 		if canonical := executableName(name); canonical != name {
 			catalog[canonical] = struct{}{}
 		}
+	}
+	for name := range m.ToolHashes {
+		catalog[name] = struct{}{}
 	}
 	walkRoot := bin
 	if info, err := os.Lstat(bin); err == nil && info.Mode()&os.ModeSymlink != 0 {
@@ -316,6 +355,14 @@ func ValidateManifest(m Manifest) error {
 		}
 		if !validDaemonHash(v) {
 			return fmt.Errorf("releaseinstall: daemon %s hash %q is not sha256:<64hex>", name, v)
+		}
+	}
+	for name, value := range m.ToolHashes {
+		if !IsReleaseBinaryName(name) || IsCatalogBinaryName(name) {
+			return fmt.Errorf("releaseinstall: tool_hashes contains unknown tool %s", name)
+		}
+		if !validDaemonHash(value) {
+			return fmt.Errorf("releaseinstall: tool %s hash %q is not sha256:<64hex>", name, value)
 		}
 	}
 	return nil

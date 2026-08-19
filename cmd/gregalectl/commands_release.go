@@ -217,9 +217,9 @@ func cmdReleaseBundle(args []string) int {
 	return 0
 }
 
-// copyBinIntoRelease copies every regular file in srcDir into
-// <releasesRoot>/<gitSHA>/bin/<basename>. Symlinks and directories
-// are skipped — the bundle is a flat list of daemon binaries.
+// copyBinIntoRelease copies release-catalog regular files in srcDir into
+// <releasesRoot>/<gitSHA>/bin/<basename>. Symlinks and directories are
+// skipped — the current release catalog is flat.
 func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 	bin := releaseinstall.BinDir(releasesRoot, gitSHA)
 	if err := os.MkdirAll(bin, 0o755); err != nil {
@@ -233,11 +233,10 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 		if e.IsDir() {
 			continue
 		}
-		// The normal daemon build directory also contains the customer
-		// and operator CLIs. A cluster release bundle is the nine-daemon
-		// artifact, so ignore those non-daemon files here; Build will still
-		// fail closed if any catalog daemon is missing.
-		if !releaseinstall.IsCatalogBinaryName(e.Name()) {
+		// The normal build directory also contains CLIs and vmmd support
+		// helpers. Keep only the release catalog; Build will still fail
+		// closed if any daemon is missing.
+		if !releaseinstall.IsReleaseBinaryName(e.Name()) {
 			continue
 		}
 		src := filepath.Join(srcDir, e.Name())
@@ -697,11 +696,13 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 		return fmt.Errorf("manifest git_sha=%s does not match --git-sha=%s", m.GitSHA, gitSHA)
 	}
 	tb := &releaseinstall.Tarball{
-		GitSHA:   gitSHA,
-		Manifest: m,
-		Packed:   tbBody,
-		Sig:      sigBody,
-		SBOM:     sbomBody,
+		GitSHA:     gitSHA,
+		Manifest:   m,
+		Packed:     tbBody,
+		Sig:        sigBody,
+		SBOM:       sbomBody,
+		BinSHA256:  manifestHashMap(m.DaemonHashes),
+		ToolSHA256: manifestHashMap(m.ToolHashes),
 	}
 
 	// 3. Cosign verify-blob. THIS is the load-bearing trust bit
@@ -739,6 +740,18 @@ func installViaTarball(releasesRoot, gitSHA, tarballPath string) error {
 		return fmt.Errorf("flip symlink: %w", err)
 	}
 	return nil
+}
+
+// manifestHashMap converts manifest values from "sha256:<hex>" to the
+// hashWalk representation used by Tarball. The shape was deliberately kept
+// separate from the on-disk manifest so the verifier never has to infer a
+// digest format from a tar entry.
+func manifestHashMap(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for name, value := range values {
+		out[name] = strings.TrimPrefix(value, "sha256:")
+	}
+	return out
 }
 
 // extractTarballMember pulls one regular-file member out of a

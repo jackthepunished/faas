@@ -53,12 +53,13 @@ import (
 // existing Build() — the same bytes that would live in
 // release-manifest.json under the per-release directory.
 type Tarball struct {
-	GitSHA    string
-	Manifest  Manifest
-	Packed    []byte // tar+gzip bytes
-	Sig       []byte // cosign bundle; populated by PR-A commit 2
-	SBOM      []byte // SPDX-2.3 JSON; populated by PR-A commit 3
-	BinSHA256 map[string]string
+	GitSHA     string
+	Manifest   Manifest
+	Packed     []byte // tar+gzip bytes
+	Sig        []byte // cosign bundle; populated by PR-A commit 2
+	SBOM       []byte // SPDX-2.3 JSON; populated by PR-A commit 3
+	BinSHA256  map[string]string
+	ToolSHA256 map[string]string
 }
 
 // ErrTarballTampered is the verifier's fail-closed signal: the
@@ -104,17 +105,30 @@ func BuildTarball(root, gitSHA, manifestHash string, now time.Time) (*Tarball, e
 		}
 		binHashes[name] = hex
 	}
+	toolHashes := make(map[string]string, len(m.ToolHashes))
+	toolNames := make([]string, 0, len(m.ToolHashes))
+	for name, value := range m.ToolHashes {
+		hex, ok := strings.CutPrefix(value, "sha256:")
+		if !ok || len(hex) != 64 {
+			return nil, fmt.Errorf("releaseinstall: tarball tool hash for %s missing/wrong shape", name)
+		}
+		toolHashes[name] = hex
+		toolNames = append(toolNames, name)
+	}
+	sort.Strings(toolNames)
+	allNames := append(append([]string(nil), daemonNames...), toolNames...)
 
-	packed, err := tarGzBin(bin, daemonNames)
+	packed, err := tarGzBin(bin, allNames)
 	if err != nil {
 		return nil, fmt.Errorf("releaseinstall: tarball pack: %w", err)
 	}
 
 	return &Tarball{
-		GitSHA:    gitSHA,
-		Manifest:  m,
-		Packed:    packed,
-		BinSHA256: binHashes,
+		GitSHA:     gitSHA,
+		Manifest:   m,
+		Packed:     packed,
+		BinSHA256:  binHashes,
+		ToolSHA256: toolHashes,
 	}, nil
 }
 
@@ -459,13 +473,28 @@ func (t *Tarball) hashWalk() error {
 			return fmt.Errorf("%w: %s sha256=%s want %s", ErrTarballTampered, name, gotHex, wantHex)
 		}
 	}
-	roster := make(map[string]struct{}, len(daemonNames))
+	for name, wantHex := range t.ToolSHA256 {
+		gotHex, ok := entryHashes[name]
+		if !ok {
+			return fmt.Errorf("%w: tarball missing tool %s", ErrTarballTampered, name)
+		}
+		if gotHex != wantHex {
+			return fmt.Errorf("%w: %s sha256=%s want %s", ErrTarballTampered, name, gotHex, wantHex)
+		}
+	}
+	roster := make(map[string]struct{}, len(daemonNames)+len(t.ToolSHA256))
 	for _, n := range daemonNames {
 		roster[n] = struct{}{}
+		if canonical := executableName(n); canonical != n {
+			roster[canonical] = struct{}{}
+		}
+	}
+	for name := range t.ToolSHA256 {
+		roster[name] = struct{}{}
 	}
 	var unknown []string
 	for name := range entryHashes {
-		if _, ok := roster[name]; !ok && !IsCatalogBinaryName(name) {
+		if _, ok := roster[name]; !ok {
 			unknown = append(unknown, name)
 		}
 	}
