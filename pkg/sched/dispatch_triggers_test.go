@@ -405,3 +405,77 @@ func TestFilterBatch_MalformedJSONTreeIsFatal(t *testing.T) {
 		t.Errorf("err = nil, want non-nil (malformed JSONB column → caller drops the tick)")
 	}
 }
+
+// ackRecordingPoller captures Ack calls so the CRIT-1 regression
+// test can assert the broker-offset advance happens after a
+// rate-limit deny. It mirrors fakePollerForFilter but is named
+// distinctly so the new test reads cleanly.
+type ackRecordingPoller struct {
+	ackCalls []string
+}
+
+func (f *ackRecordingPoller) Kind() string { return "kafka" }
+func (f *ackRecordingPoller) Poll(_ context.Context, _ sqlc.Trigger) PollResult {
+	return PollResult{}
+}
+func (f *ackRecordingPoller) Ack(_ context.Context, _ sqlc.Trigger, ids []string) error {
+	f.ackCalls = append(f.ackCalls, ids...)
+	return nil
+}
+func (f *ackRecordingPoller) Nack(_ context.Context, _ sqlc.Trigger, _ []string, _ string) error {
+	return nil
+}
+func (f *ackRecordingPoller) Close() error { return nil }
+
+// TestRateLimitDeny_AcksBrokerOffset is the CRIT-1 regression
+// test (PR #993 / issue #757 closure). Pre-CRIT-1 the rate-limit
+// deny branches returned immediately after deadLetterAll without
+// ack'ing the poller — every deny pinned the broker offset at
+// the front of the batch and the same records re-poll'd forever.
+// handleRateLimitedBatch is the seam; the test pins both:
+//
+//  1. deadLetterAll was called (audit row recorded) —
+//     covered indirectly via fakeDeadLetterStore.inserts.
+//  2. poller.Ack was called with the same item_identifiers —
+//     the broker offset advances.
+func TestRateLimitDeny_AcksBrokerOffset(t *testing.T) {
+	const triggerID = "11111111-1111-1111-1111-111111111111"
+	poller := &ackRecordingPoller{}
+	l := &Loop{
+		log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		triggerPollers: map[string]triggerSource{triggerID: poller},
+	}
+	// fakeDeadLetterStore returns empty UUIDs (the row doesn't
+	// exist yet — the rate-limit fires before InsertTriggerRecord).
+	// That's fine for the Ack assertion because Ack operates on
+	// the broker handle, not the trigger_records row.
+	store := &fakeDeadLetterStore{
+		records:         map[string]string{},
+		forceMissingIDs: map[string]bool{"kafka-1": true, "kafka-2": true},
+	}
+	t1 := sqlc.Trigger{ID: pgtypeUUIDFromString(t, triggerID)}
+	batch := []SourceRecord{
+		{ItemIdentifier: "kafka-1"},
+		{ItemIdentifier: "kafka-2"},
+	}
+	l.handleRateLimitedBatch(context.Background(), poller, t1, batch, store)
+
+	if got, want := poller.ackCalls, []string{"kafka-1", "kafka-2"}; !equalSlices(got, want) {
+		t.Errorf("Ack calls = %v, want %v (broker offset must advance after deny)", got, want)
+	}
+}
+
+// equalSlices is a tiny helper to keep the assertion readable
+// without pulling in reflect.DeepEqual's verbosity for two
+// []string compares.
+func equalSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

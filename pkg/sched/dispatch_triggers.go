@@ -392,8 +392,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		appPlan = planFor(t.AppID.String())
 	}
 	if l.rateLimiter != nil && !l.rateLimiter.AllowWakeApp(t.AppID.String(), appPlan) {
-		items := batchItemIDs(batch)
-		l.deadLetterAll(ctx, t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
+		l.handleRateLimitedBatch(ctx, poller, t, batch, store)
 		return nil
 	}
 	// Review finding #8: also consult the per-account bucket so a
@@ -408,8 +407,7 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		app, appErr := l.engine.Store().AppByID(ctx, t.AppID.String())
 		if appErr == nil {
 			if !l.rateLimiter.AllowWakeAccount(app.AccountID, appPlan) {
-				items := batchItemIDs(batch)
-				l.deadLetterAll(ctx, t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
+				l.handleRateLimitedBatch(ctx, poller, t, batch, store)
 				return nil
 			}
 		}
@@ -790,15 +788,38 @@ func (l *Loop) postBatch(ctx context.Context, env triggerDispatchRequest) ([]byt
 // If the row hasn't been inserted yet (rate-limit fires before
 // the InsertTriggerRecord loop on the next dispatch step), the
 // lookup returns an empty UUID — we skip the DLQ insert + skip
-// the MarkTriggerRecordDeadLetter call and leave the record in
-// poller.inFlight for the next tick to retry. Rate-limited records
-// MUST come back, not be silently lost.
+// the MarkTriggerRecordDeadLetter call. The caller (the
+// rate-limit-deny branch above) MUST then ack the broker offset
+// so the records don't re-poll forever. Pre-CRIT-1 the deny
+// branches returned without ack'ing; CRIT-1 closes that hole
+// — see dispatch_triggers.go:394-419.
 //
 // The poisoned-response path at dispatch_triggers.go:354 calls
 // this helper with row UUIDs already (it walks the `claimed`
 // result-set and reads c.ID.String()). That works because the
 // UUID lookup self-resolves: the row is by construction present,
 // so the lookup returns the same UUID we passed in.
+// handleRateLimitedBatch is the CRIT-1 (PR #993 / issue #757
+// closure) seam for the rate-limit-deny branches. Pre-CRIT-1 each
+// deny branch returned immediately after deadLetterAll WITHOUT
+// ack'ing the broker, which pinned the broker offset at the front
+// of the rate-limited batch and re-delivered the same records on
+// every subsequent tick. The new semantic is:
+//
+//  1. deadLetterAll inserts the trigger_dead_letter audit row
+//     (the disposition is preserved).
+//  2. poller.Ack advances the broker offset so the records don't
+//     re-poll.
+//
+// Extracted so the test surface (TestRateLimitDeny_AcksBrokerOffset)
+// can pin the dual-call sequence without driving the full dispatch
+// tick.
+func (l *Loop) handleRateLimitedBatch(ctx context.Context, poller triggerSource, t sqlc.Trigger, batch []SourceRecord, store storeLike) {
+	items := batchItemIDs(batch)
+	l.deadLetterAll(ctx, t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
+	_ = poller.Ack(ctx, t, items)
+}
+
 func (l *Loop) deadLetterAll(ctx context.Context, triggerID string, ids []string, reason, detail string, store storeLike) {
 	if store == nil || len(ids) == 0 {
 		return
