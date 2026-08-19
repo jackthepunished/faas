@@ -4411,7 +4411,6 @@ func emitStageFrame(w http.ResponseWriter, flusher http.Flusher, item state.Stag
 	}
 }
 
-
 // writeLogEvent formats one LogEntry as a single SSE event. Used by
 // both the initial-page path and the live tail.
 func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry) {

@@ -1262,12 +1262,12 @@ type StageState struct {
 // "uninitialized = null" contract the SSE consumer expects. The
 // pointer nil-vs-set distinction preserves that contract.
 type StageStateItem struct {
-	Name       StageName `json:"name"`
+	Name       StageName  `json:"name"`
 	StartedAt  *time.Time `json:"started_at"`
 	EndedAt    *time.Time `json:"ended_at"`
-	DurationMs int64     `json:"duration_ms"`
-	Status     string    `json:"status"` // "completed" | "failed"
-	Reason     string    `json:"reason,omitempty"`
+	DurationMs int64      `json:"duration_ms"`
+	Status     string     `json:"status"` // "completed" | "failed"
+	Reason     string     `json:"reason,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem
