@@ -185,3 +185,84 @@ func TestMergeCorsPresetIntoRule_RuleDefensiveCopyOfSlices(t *testing.T) {
 		t.Errorf("preset input slice mutated")
 	}
 }
+
+// TestMergeCorsPresetIntoRule_D12WildcardWithCredentialsRejects
+// pins the ADR-091 D12 footgun re-validation added after the
+// medium code review. EdgeRuleCORSAction.Validate (pkg/api/dto.go)
+// rejects the dangerous AllowOrigins:["*"] + AllowCredentials:true
+// at create-time, but the merge can construct the same dangerous
+// combination from a rule-with-false + preset-with-true. Without
+// re-validation the gateway would emit Access-Control-Allow-Origin:
+// * with Allow-Credentials: true — browsers reject the response
+// and the gateway's origin-echoing fallback becomes a cross-origin
+// credential leak.
+func TestMergeCorsPresetIntoRule_D12WildcardWithCredentialsRejects(t *testing.T) {
+	// Case A: rule ships *, preset flips credentials to true.
+	rule := CorsRuleOverride{
+		AllowOrigins:     []string{"*"},
+		AllowCredentials: false,
+	}
+	preset := samplePreset("acct-1")
+	preset.AllowCredentials = true
+	_, err := MergeCorsPresetIntoRule("acct-1", "app-1", preset.ID, rule, preset)
+	if !errors.Is(err, ErrCorsWildcardWithCredentials) {
+		t.Errorf("rule=*+false, preset=true: err = %v, want ErrCorsWildcardWithCredentials", err)
+	}
+
+	// Case B: preset ships *, rule flips credentials to true.
+	ruleB := CorsRuleOverride{
+		AllowCredentials: true,
+	}
+	presetB := samplePreset("acct-1")
+	presetB.AllowOrigins = []string{"*"}
+	presetB.AllowCredentials = false
+	_, err = MergeCorsPresetIntoRule("acct-1", "app-1", presetB.ID, ruleB, presetB)
+	if !errors.Is(err, ErrCorsWildcardWithCredentials) {
+		t.Errorf("preset=*+false, rule=true: err = %v, want ErrCorsWildcardWithCredentials", err)
+	}
+
+	// Case C: both rule and preset ship the dangerous combination.
+	ruleC := CorsRuleOverride{
+		AllowOrigins:     []string{"*"},
+		AllowCredentials: true,
+	}
+	presetC := samplePreset("acct-1")
+	presetC.AllowOrigins = []string{"*"}
+	presetC.AllowCredentials = true
+	_, err = MergeCorsPresetIntoRule("acct-1", "app-1", presetC.ID, ruleC, presetC)
+	if !errors.Is(err, ErrCorsWildcardWithCredentials) {
+		t.Errorf("both sides dangerous: err = %v, want ErrCorsWildcardWithCredentials", err)
+	}
+
+	// Negative control: subdomain wildcard + credentials is
+	// credentials-safe per the D12 comment in pkg/api/dto.go.
+	ruleD := CorsRuleOverride{
+		AllowOrigins:     []string{"https://*.example.com"},
+		AllowCredentials: true,
+	}
+	presetD := samplePreset("acct-1")
+	presetD.AllowOrigins = []string{"https://*.example.com"}
+	presetD.AllowCredentials = true
+	if _, err := MergeCorsPresetIntoRule("acct-1", "app-1", presetD.ID, ruleD, presetD); err != nil {
+		t.Errorf("subdomain wildcard + credentials must be allowed: %v", err)
+	}
+}
+
+// TestMergeCorsPresetIntoRule_NoPresetID_DoesNotValidate verifies
+// the re-validation guard runs only when a preset is attached.
+// The rule alone is the apid-Validate gate's responsibility
+// (PR-B), so this helper must not double-check an unattached
+// rule that already passed the create-time gate.
+func TestMergeCorsPresetIntoRule_NoPresetID_DoesNotValidate(t *testing.T) {
+	rule := CorsRuleOverride{
+		AllowOrigins:     []string{"*"},
+		AllowCredentials: true,
+	}
+	got, err := MergeCorsPresetIntoRule("acct-1", "app-1", "", rule, CorsPreset{})
+	if err != nil {
+		t.Errorf("no-preset merge with dangerous rule must be a no-op pass-through (the create-time gate is the canonical guard): %v", err)
+	}
+	if !got.AllowCredentials || len(got.AllowOrigins) != 1 || got.AllowOrigins[0] != "*" {
+		t.Errorf("rule values not preserved: %+v", got)
+	}
+}

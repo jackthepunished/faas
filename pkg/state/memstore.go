@@ -10789,15 +10789,27 @@ func (m *MemStore) ListCorsPresetsForAccount(_ context.Context, accountID string
 	return out, nil
 }
 
-// ListCorsPresetsForApp returns the app-scoped presets only. The
-// compile path unions this with the account-wide result from
-// ListCorsPresetsForAccount.
-func (m *MemStore) ListCorsPresetsForApp(_ context.Context, appID string) ([]CorsPreset, error) {
+// ListCorsPresetsForApp returns the app-scoped presets only,
+// scoped to the caller's account. The compile path unions this
+// with the account-wide result from ListCorsPresetsForAccount.
+// accountID is defense-in-depth (the apps row is FK-scoped to
+// one account, so the appID match alone is sufficient); the
+// Store boundary enforces tenancy at the API surface so a future
+// caller can't probe by appID without knowing the account.
+// Empty appID is rejected so the strict-scope contract cannot
+// be subverted by a caller passing "" (which would otherwise
+// match the AppID="" of every account-wide preset — see the
+// medium-code-review IDOR finding for the historical pg/memstore
+// divergence).
+func (m *MemStore) ListCorsPresetsForApp(_ context.Context, accountID, appID string) ([]CorsPreset, error) {
+	if appID == "" {
+		return nil, nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []CorsPreset
 	for _, p := range m.corsPresets {
-		if p.AppID == appID {
+		if p.AccountID == accountID && p.AppID == appID {
 			out = append(out, p)
 		}
 	}
@@ -10807,12 +10819,22 @@ func (m *MemStore) ListCorsPresetsForApp(_ context.Context, appID string) ([]Cor
 	return out, nil
 }
 
-// GetCorsPresetByID returns the preset or ErrNotFound.
-func (m *MemStore) GetCorsPresetByID(_ context.Context, id string) (CorsPreset, error) {
+// GetCorsPresetByID returns the preset scoped to the caller's
+// account or ErrNotFound. accountID is required so the Store
+// boundary enforces tenancy — the pgstore equivalent pins
+// account_id in the WHERE clause, this mirror keeps the two
+// stores behaviorally aligned.
+func (m *MemStore) GetCorsPresetByID(_ context.Context, accountID, id string) (CorsPreset, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.corsPresets[id]
 	if !ok {
+		return CorsPreset{}, ErrNotFound
+	}
+	if p.AccountID != accountID {
+		// Cross-tenant probe: surface as ErrNotFound so the
+		// wire-side message is stable (matches the pgstore
+		// behavior where a WHERE on account_id returns no rows).
 		return CorsPreset{}, ErrNotFound
 	}
 	return p, nil

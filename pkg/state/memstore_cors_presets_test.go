@@ -79,7 +79,7 @@ func TestMemStore_CorsPreset_AccountWideRead(t *testing.T) {
 	seed := memSampleCorsPreset(acct, "", "shared")
 	memSeedCorsPreset(m, seed)
 
-	got, err := m.GetCorsPresetByID(ctx, seed.ID)
+	got, err := m.GetCorsPresetByID(ctx, acct, seed.ID)
 	if err != nil {
 		t.Fatalf("GetCorsPresetByID: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestMemStore_CorsPreset_AppScopedRead(t *testing.T) {
 	seed := memSampleCorsPreset(acct, app, "scoped")
 	memSeedCorsPreset(m, seed)
 
-	got, err := m.GetCorsPresetByID(ctx, seed.ID)
+	got, err := m.GetCorsPresetByID(ctx, acct, seed.ID)
 	if err != nil {
 		t.Fatalf("GetCorsPresetByID: %v", err)
 	}
@@ -115,10 +115,26 @@ func TestMemStore_CorsPreset_AppScopedRead(t *testing.T) {
 // path. The apid boundary maps this to 422 ("preset has been
 // deleted; re-save the rule").
 func TestMemStore_CorsPreset_GetByID_NotFound(t *testing.T) {
-	m, ctx, _, _ := corsFixture(t)
-	_, err := m.GetCorsPresetByID(ctx, uuid.NewString())
+	m, ctx, acct, _ := corsFixture(t)
+	_, err := m.GetCorsPresetByID(ctx, acct, uuid.NewString())
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetCorsPresetByID(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemStore_CorsPreset_GetByID_CrossTenantRejects pins the
+// tenancy-at-the-boundary guard. A preset created under account
+// A must not be readable by account B even with the right id.
+func TestMemStore_CorsPreset_GetByID_CrossTenantRejects(t *testing.T) {
+	m, ctx, acctA, _ := corsFixture(t)
+	_, _, acctB, _ := corsFixture(t)
+
+	seed := memSampleCorsPreset(acctA, "", "isolated")
+	memSeedCorsPreset(m, seed)
+
+	_, err := m.GetCorsPresetByID(ctx, acctB, seed.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetCorsPresetByID(cross-tenant) = %v, want ErrNotFound", err)
 	}
 }
 
@@ -188,7 +204,7 @@ func TestMemStore_CorsPreset_ListForApp_ExcludesAccountWide(t *testing.T) {
 	memSeedCorsPreset(m, memSampleCorsPreset(acct, "", "wide"))
 	memSeedCorsPreset(m, memSampleCorsPreset(acct, app, "scoped"))
 
-	list, err := m.ListCorsPresetsForApp(ctx, app)
+	list, err := m.ListCorsPresetsForApp(ctx, acct, app)
 	if err != nil {
 		t.Fatalf("ListCorsPresetsForApp: %v", err)
 	}
@@ -197,5 +213,48 @@ func TestMemStore_CorsPreset_ListForApp_ExcludesAccountWide(t *testing.T) {
 	}
 	if list[0].AppID != app {
 		t.Errorf("AppID = %q, want %q", list[0].AppID, app)
+	}
+}
+
+// TestMemStore_CorsPreset_ListForApp_RejectsCrossAccount pins
+// the account filter added after the medium code review. The
+// memstore path previously matched p.AppID == appID, which leaked
+// account-wide presets when appID was empty AND leaked rows
+// across accounts when a caller probed by appID without an
+// account filter. The Store boundary now requires accountID so
+// both stores are behaviorally aligned.
+func TestMemStore_CorsPreset_ListForApp_RejectsCrossAccount(t *testing.T) {
+	m, ctx, acctA, appA := corsFixture(t)
+	_, _, acctB, _ := corsFixture(t)
+
+	memSeedCorsPreset(m, memSampleCorsPreset(acctA, appA, "isolated"))
+
+	list, err := m.ListCorsPresetsForApp(ctx, acctB, appA)
+	if err != nil {
+		t.Fatalf("ListCorsPresetsForApp(cross-tenant): %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("len = %d, want 0 (cross-tenant probe rejected)", len(list))
+	}
+}
+
+// TestMemStore_CorsPreset_ListForApp_RejectsEmptyAppID pins the
+// complement: a caller probing with appID == "" must get an empty
+// list, not every account-wide preset of every account. The pg
+// path errors on the empty uuid; the memstore path silently
+// returned matches. The Store boundary now rejects on both
+// sides — empty appID is a programming error at the apid
+// boundary, not a meaningful query.
+func TestMemStore_CorsPreset_ListForApp_RejectsEmptyAppID(t *testing.T) {
+	m, ctx, acct, _ := corsFixture(t)
+
+	memSeedCorsPreset(m, memSampleCorsPreset(acct, "", "wide"))
+
+	list, err := m.ListCorsPresetsForApp(ctx, acct, "")
+	if err != nil {
+		t.Fatalf("ListCorsPresetsForApp(empty appID): %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("len = %d, want 0 (account-wide presets not surfaced by the app-scoped query)", len(list))
 	}
 }

@@ -1,5 +1,7 @@
 package state
 
+import "slices"
+
 // Compile-side merge helper for cors_presets (issue #975 item #4
 // / Mega-Foundation #979-b, slot 00294). PR-A ships the data
 // model and the read path; PR-B (#979-c, slot 00295) adds the
@@ -27,6 +29,12 @@ package state
 // INSERT). The same goes for the integer zero on
 // max_age_seconds: a rule without a max-age override means
 // "use the preset's value (default 600)".
+//
+// Defensive slice copies use slices.Clone (Go 1.21+) so the
+// returned action is independent of both the rule's input
+// slices and the preset's. The compile path caches the rule
+// action union in memory; a cross-slice mutation through the
+// helper would silently corrupt the cache.
 
 // CorsRuleOverride is the input bundle for MergeCorsPresetIntoRule
 // — the per-rule fields the customer stamped on a kind=cors rule
@@ -72,6 +80,14 @@ type MergedCorsRuleAction struct {
 //     boundary ("preset has been deleted; re-save the rule") and
 //     as a 5xx at the gateway compile path (the rule is
 //     misconfigured; the customer must intervene).
+//   - ErrCorsWildcardWithCredentials: the merged action combines
+//     AllowOrigins: ["*"] with AllowCredentials: true. This is
+//     the same footgun EdgeRuleCORSAction.Validate rejects at
+//     create-time (ADR-091 D12); the merge helper re-runs the
+//     guard because the merge can construct the dangerous
+//     combination from a rule with one value and a preset with
+//     the other. The apid boundary maps this to 422 with the
+//     same wire message as the create-time gate.
 //
 // IDOR guard: the caller's accountID is matched against the
 // preset's AccountID. A preset stamped by one tenant cannot
@@ -84,10 +100,10 @@ type MergedCorsRuleAction struct {
 func MergeCorsPresetIntoRule(accountID, appID, presetID string, rule CorsRuleOverride, preset CorsPreset) (MergedCorsRuleAction, error) {
 	_ = appID // reserved for future "app-scoped lookup first" override resolution
 	out := MergedCorsRuleAction{
-		AllowOrigins:     append([]string(nil), rule.AllowOrigins...),
-		AllowMethods:     append([]string(nil), rule.AllowMethods...),
-		AllowHeaders:     append([]string(nil), rule.AllowHeaders...),
-		ExposeHeaders:    append([]string(nil), rule.ExposeHeaders...),
+		AllowOrigins:     slices.Clone(rule.AllowOrigins),
+		AllowMethods:     slices.Clone(rule.AllowMethods),
+		AllowHeaders:     slices.Clone(rule.AllowHeaders),
+		ExposeHeaders:    slices.Clone(rule.ExposeHeaders),
 		AllowCredentials: rule.AllowCredentials,
 		MaxAgeSeconds:    rule.MaxAgeSeconds,
 	}
@@ -117,16 +133,16 @@ func MergeCorsPresetIntoRule(accountID, appID, presetID string, rule CorsRuleOve
 	// allow_credentials should not blank the rest of the
 	// preset's fields).
 	if len(out.AllowOrigins) == 0 {
-		out.AllowOrigins = append([]string(nil), preset.AllowOrigins...)
+		out.AllowOrigins = slices.Clone(preset.AllowOrigins)
 	}
 	if len(out.AllowMethods) == 0 {
-		out.AllowMethods = append([]string(nil), preset.AllowMethods...)
+		out.AllowMethods = slices.Clone(preset.AllowMethods)
 	}
 	if len(out.AllowHeaders) == 0 {
-		out.AllowHeaders = append([]string(nil), preset.AllowHeaders...)
+		out.AllowHeaders = slices.Clone(preset.AllowHeaders)
 	}
 	if len(out.ExposeHeaders) == 0 {
-		out.ExposeHeaders = append([]string(nil), preset.ExposeHeaders...)
+		out.ExposeHeaders = slices.Clone(preset.ExposeHeaders)
 	}
 	// AllowCredentials is a bool; "zero" = false. The wire-
 	// level omitempty on the rule field means an absent field
@@ -141,6 +157,24 @@ func MergeCorsPresetIntoRule(accountID, appID, presetID string, rule CorsRuleOve
 	}
 	if out.MaxAgeSeconds == 0 {
 		out.MaxAgeSeconds = preset.MaxAgeSeconds
+	}
+	// Re-validate against the ADR-091 D12 CORS *+credentials
+	// footgun guard. EdgeRuleCORSAction.Validate (pkg/api/dto.go)
+	// rejects the dangerous combination at create-time, but the
+	// merge can produce the same dangerous combination from a
+	// rule-with-false + preset-with-true. Without re-validation
+	// the gateway would emit Access-Control-Allow-Origin: *
+	// with Allow-Credentials: true — browsers reject the
+	// response and the gateway's origin-echoing fallback becomes
+	// a cross-origin credential leak. We use a typed error so
+	// the apid surface can return 422 with the same wire shape
+	// as the create-time gate.
+	if out.AllowCredentials {
+		for _, origin := range out.AllowOrigins {
+			if origin == "*" {
+				return MergedCorsRuleAction{}, ErrCorsWildcardWithCredentials
+			}
+		}
 	}
 	return out, nil
 }

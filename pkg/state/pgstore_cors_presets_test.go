@@ -85,6 +85,23 @@ func pgInsertCorsPreset(t *testing.T, ctx context.Context, pool *pgxpool.Pool, p
 	if p.Description != "" {
 		desc = &p.Description
 	}
+	// The allow_* columns are NOT NULL text[] with DEFAULT '{}'.
+	// pgx encodes a Go nil []string as SQL NULL, which then trips
+	// the NOT NULL constraint because the INSERT lists the columns
+	// explicitly (so the DEFAULT doesn't apply). Coalesce nil to an
+	// empty array so the explicit INSERT sends '{}' instead of NULL.
+	if p.AllowOrigins == nil {
+		p.AllowOrigins = []string{}
+	}
+	if p.AllowMethods == nil {
+		p.AllowMethods = []string{}
+	}
+	if p.AllowHeaders == nil {
+		p.AllowHeaders = []string{}
+	}
+	if p.ExposeHeaders == nil {
+		p.ExposeHeaders = []string{}
+	}
 	_, err := pool.Exec(ctx, `
 		insert into cors_presets (
 			id, account_id, app_id, name, description,
@@ -150,9 +167,11 @@ func TestPgStore_CorsPreset_AccountWideRoundTrip(t *testing.T) {
 	seed.AllowHeaders = nil
 	seed.AllowCredentials = true
 	seed.MaxAgeSeconds = 3600
-	pgInsertCorsPreset(t, ctx, pool, seed)
+	// Capture the return value so the auto-generated ID is
+	// surfaced on the local seed (the helper mutates a copy).
+	seed = pgInsertCorsPreset(t, ctx, pool, seed)
 
-	got, err := s.GetCorsPresetByID(ctx, seed.ID)
+	got, err := s.GetCorsPresetByID(ctx, acct, seed.ID)
 	if err != nil {
 		t.Fatalf("GetCorsPresetByID: %v", err)
 	}
@@ -182,9 +201,12 @@ func TestPgStore_CorsPreset_AccountWideRoundTrip(t *testing.T) {
 	}
 	// AllowHeaders was nil on insert but the column has DEFAULT '{}'
 	// so the round-trip should reflect that (an empty array, not
-	// nil). The compile-side merge treats both as "no header
-	// allowlist" so this is a no-op for the customer but a
-	// non-empty allowlist cannot be nil in the row shape.
+	// nil). The scanCorsPresetCols helper coalesces nil → {}
+	// so the round-trip is identity: a customer saving an empty
+	// allowlist reads back an empty allowlist, never nil. Without
+	// the coalesce the merge helper's len==0 detector would treat
+	// the empty array as "take the other side" and silently
+	// inherit a rule's value.
 	if got.AllowHeaders == nil {
 		t.Errorf("AllowHeaders = nil, want empty array (DB default)")
 	}
@@ -198,9 +220,9 @@ func TestPgStore_CorsPreset_AppScopedRoundTrip(t *testing.T) {
 	acct, app, _ := seedLiveDeploy(t, s, ctx, "cors-app-"+strconv.Itoa(int(time.Now().UnixNano())))
 
 	seed := pgSampleCorsPresetAppScoped(acct, app)
-	pgInsertCorsPreset(t, ctx, pool, seed)
+	seed = pgInsertCorsPreset(t, ctx, pool, seed)
 
-	got, err := s.GetCorsPresetByID(ctx, seed.ID)
+	got, err := s.GetCorsPresetByID(ctx, acct, seed.ID)
 	if err != nil {
 		t.Fatalf("GetCorsPresetByID: %v", err)
 	}
@@ -220,7 +242,7 @@ func TestPgStore_CorsPreset_AppScopedRoundTrip(t *testing.T) {
 // surfaces as 422 at the apid boundary, not a 500.
 func TestPgStore_CorsPreset_GetByID_UnknownReturnsErrNotFound(t *testing.T) {
 	s, _, ctx := pgStoreWithPool(t)
-	_, err := s.GetCorsPresetByID(ctx, uuid.NewString())
+	_, err := s.GetCorsPresetByID(ctx, uuid.NewString(), uuid.NewString())
 	if !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("GetCorsPresetByID(unknown) = %v, want ErrNotFound", err)
 	}
@@ -266,8 +288,12 @@ func TestPgStore_CorsPreset_ListForAccount_OrdersByAppIDNullsFirst(t *testing.T)
 // preset names to another tenant's UI.
 func TestPgStore_CorsPreset_ListForAccount_ScopesByAccount(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
-	acctA, _, _ := seedLiveDeploy(t, s, ctx, "cors-idorA-"+strconv.Itoa(int(time.Now().UnixNano())))
-	acctB, _, _ := seedLiveDeploy(t, s, ctx, "cors-idorB-"+strconv.Itoa(int(time.Now().UnixNano())))
+	// seedLiveDeploy uses the suffix only for the email; the slug
+	// defaults to "pg-app" unless we pass a second arg. Two calls
+	// without a unique slug would collide on apps_slug_key, so we
+	// pin the slug explicitly to keep the second account independent.
+	acctA, _, _ := seedLiveDeploy(t, s, ctx, "cors-idorA-"+strconv.Itoa(int(time.Now().UnixNano())), "cors-idorA")
+	acctB, _, _ := seedLiveDeploy(t, s, ctx, "cors-idorB-"+strconv.Itoa(int(time.Now().UnixNano())), "cors-idorB")
 
 	pgInsertCorsPreset(t, ctx, pool, pgSampleCorsPreset(acctA))
 	pgInsertCorsPreset(t, ctx, pool, pgSampleCorsPreset(acctB))
@@ -296,7 +322,7 @@ func TestPgStore_CorsPreset_ListForApp_ExcludesAccountWide(t *testing.T) {
 	pgInsertCorsPreset(t, ctx, pool, pgSampleCorsPreset(acct))               // account-wide
 	pgInsertCorsPreset(t, ctx, pool, pgSampleCorsPresetAppScoped(acct, app)) // app-scoped
 
-	list, err := s.ListCorsPresetsForApp(ctx, app)
+	list, err := s.ListCorsPresetsForApp(ctx, acct, app)
 	if err != nil {
 		t.Fatalf("ListCorsPresetsForApp: %v", err)
 	}
@@ -331,5 +357,49 @@ func TestPgStore_CorsPreset_UniqueNameSameAccountBothScopes(t *testing.T) {
 	dup.Name = sharedName
 	if _, err := pgInsertCorsPresetRaw(ctx, pool, dup); err == nil {
 		t.Errorf("duplicate name within (acct, app) bucket was accepted; want 23505")
+	}
+}
+
+// TestPgStore_CorsPreset_GetByID_CrossTenantRejects pins the
+// tenancy-at-the-boundary guard added after the medium code
+// review. A preset created under account A must not be readable
+// by account B via GetCorsPresetByID, even with the right id —
+// the apid CRUD surface depends on this so PR-B cannot ship a
+// cross-tenant leak by forgetting the AccountID compare.
+func TestPgStore_CorsPreset_GetByID_CrossTenantRejects(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+	acctA, _, _ := seedLiveDeploy(t, s, ctx, "cors-xtnt-A-"+strconv.Itoa(int(time.Now().UnixNano())), "cors-xtnt-A")
+	acctB, _, _ := seedLiveDeploy(t, s, ctx, "cors-xtnt-B-"+strconv.Itoa(int(time.Now().UnixNano())), "cors-xtnt-B")
+
+	seed := pgSampleCorsPreset(acctA)
+	seed = pgInsertCorsPreset(t, ctx, pool, seed)
+
+	// Right id, wrong account → ErrNotFound, never the row.
+	_, err := s.GetCorsPresetByID(ctx, acctB, seed.ID)
+	if !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("GetCorsPresetByID(cross-tenant) = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPgStore_CorsPreset_ListForApp_RejectsCrossAccount pins
+// the account filter added to ListCorsPresetsForApp. The pg
+// path had a single-column WHERE on app_id, which already
+// FK-scoped to one account, but the Store boundary now takes
+// accountID explicitly so a future caller cannot probe by
+// appID alone — this test pins that contract for both stores.
+func TestPgStore_CorsPreset_ListForApp_RejectsCrossAccount(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+	acctA, appA, _ := seedLiveDeploy(t, s, ctx, "cors-xtntL-A-"+strconv.Itoa(int(time.Now().UnixNano())), "cors-xtntL-A")
+	acctB, _, _ := seedLiveDeploy(t, s, ctx, "cors-xtntL-B-"+strconv.Itoa(int(time.Now().UnixNano())), "cors-xtntL-B")
+
+	pgInsertCorsPreset(t, ctx, pool, pgSampleCorsPresetAppScoped(acctA, appA))
+
+	// Right appID, wrong account → empty list, never the row.
+	list, err := s.ListCorsPresetsForApp(ctx, acctB, appA)
+	if err != nil {
+		t.Fatalf("ListCorsPresetsForApp(cross-tenant): %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("len = %d, want 0 (cross-tenant probe rejected)", len(list))
 	}
 }

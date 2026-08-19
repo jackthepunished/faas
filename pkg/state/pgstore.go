@@ -6885,11 +6885,27 @@ func scanCorsPresetCols(scan func(...any) error) (CorsPreset, error) {
 	if description != nil {
 		r.Description = *description
 	}
-	r.AllowOrigins = allowOrigins
-	r.AllowMethods = allowMethods
-	r.AllowHeaders = allowHeaders
-	r.ExposeHeaders = exposeHeaders
+	// pgx decodes a DB empty text[] as a Go nil []string. The
+	// merge helper treats len==0 as "take the other side", so a
+	// round-trip of a preset that deliberately shipped no
+	// headers would silently inherit the rule's value. Coalesce
+	// nil to an empty slice so the round-trip is identity.
+	r.AllowOrigins = nilToEmpty(allowOrigins)
+	r.AllowMethods = nilToEmpty(allowMethods)
+	r.AllowHeaders = nilToEmpty(allowHeaders)
+	r.ExposeHeaders = nilToEmpty(exposeHeaders)
 	return r, nil
+}
+
+// nilToEmpty coalesces a Go nil []string to an empty slice. Used
+// at the pgx scan boundary so the round-trip of an empty text[]
+// column is identity (the DB default '{}' reads back as a Go nil
+// slice; callers cannot distinguish nil from [] otherwise).
+func nilToEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // ListCorsPresetsForAccount returns every preset the account owns.
@@ -6912,13 +6928,17 @@ func (s *PgStore) ListCorsPresetsForAccount(ctx context.Context, accountID strin
 }
 
 // ListCorsPresetsForApp returns the app-scoped presets for one
-// app. (account-wide presets — app_id IS NULL — are not returned
-// here; the compile path merges them via ListCorsPresetsForAccount
-// + ListCorsPresetsForApp.)
-func (s *PgStore) ListCorsPresetsForApp(ctx context.Context, appID string) ([]CorsPreset, error) {
+// app, scoped to the caller's account. (account-wide presets —
+// app_id IS NULL — are not returned here; the compile path merges
+// them via ListCorsPresetsForAccount + ListCorsPresetsForApp.)
+// accountID is defense-in-depth: the apps row is already FK-scoped
+// to one account so a WHERE on app_id alone is sufficient, but the
+// Store boundary enforces tenancy at the API surface so a future
+// caller can't probe by appID without knowing the account.
+func (s *PgStore) ListCorsPresetsForApp(ctx context.Context, accountID, appID string) ([]CorsPreset, error) {
 	rows, err := s.pool.Query(ctx,
 		`select `+corsPresetSelectCols+` from cors_presets
-		 where app_id = $1 order by name asc`, appID)
+		 where account_id = $1 and app_id = $2 order by name asc`, accountID, appID)
 	if err != nil {
 		return nil, err
 	}
@@ -6926,12 +6946,18 @@ func (s *PgStore) ListCorsPresetsForApp(ctx context.Context, appID string) ([]Co
 	return scanCorsPresets(rows)
 }
 
-// GetCorsPresetByID returns one preset by primary key or
-// ErrNotFound. The compile path uses this to resolve the
-// preset_id stamped on a kind=cors rule.
-func (s *PgStore) GetCorsPresetByID(ctx context.Context, id string) (CorsPreset, error) {
+// GetCorsPresetByID returns one preset scoped to the caller's
+// account or ErrNotFound. The account_id predicate is in the WHERE
+// clause so a cross-tenant lookup returns ErrNotFound (the
+// pgx row.Scan errors on no rows), never a row from another
+// tenant. The compile path uses this to resolve the preset_id
+// stamped on a kind=cors rule; PR-B's apid CRUD surface also
+// calls this and benefits from the same tenancy-at-the-boundary
+// guarantee.
+func (s *PgStore) GetCorsPresetByID(ctx context.Context, accountID, id string) (CorsPreset, error) {
 	row := s.pool.QueryRow(ctx,
-		`select `+corsPresetSelectCols+` from cors_presets where id = $1`, id)
+		`select `+corsPresetSelectCols+` from cors_presets
+		 where account_id = $1 and id = $2`, accountID, id)
 	return scanCorsPreset(row)
 }
 
