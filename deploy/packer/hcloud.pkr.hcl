@@ -67,8 +67,8 @@ source "hcloud" "compute" {
 //   3. compile-runners.sh  — 6 function-runners (linux/amd64)
 //   4. prebuild-kernel.sh  — vmlinux-6.1.134 + sha256 pin
 //   5. bake-fc.sh          — firecracker-v1.7.0 + jailer + sha256
-//   6. build-base.sh       — runs deploy/ansible/site.yml against the
-//                            in-build VM (same roles as make bootstrap)
+//   6. build-base.sh       — runs the explicit image-seed inventory through
+//                            deploy/ansible/bootstrap.yml
 //   7. verify-no-secrets.sh — fail-closed if any forbidden path present
 //
 // The build host is destroyed by Packer after the snapshot is taken.

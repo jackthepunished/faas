@@ -11,7 +11,7 @@
 # on any machine that hadn't installed the collection out of band. The
 # ansible-syntax-check CI job installs from this file, so a role that
 # adopts a new collection without pinning it here now fails in CI rather
-# than at `make bootstrap` time on a fresh box.
+# than at a role-specific bootstrap time on a fresh box.
 #
 # Install with:
 #   ansible-galaxy collection install -r requirements.yml

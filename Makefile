@@ -1,4 +1,4 @@
-# One-box FaaS — build & ops entrypoints (spec §Commands).
+# Gregale FaaS — build & ops entrypoints (spec §Commands).
 # Go >= 1.24. One binary per cmd/ dir.
 # (Bumped from 1.23: cmd/vmmd-stream-bridge uses the Go 1.24+
 # http.Protocols API for H2C — srv.Protocols.SetUnencryptedHTTP2(true).
@@ -431,11 +431,6 @@ public-endpoint-check: ## Validate the public HTTPS/Caddy endpoint (PUBLIC_ENDPO
 systemd-hardening-check: ## Static release gate for production systemd isolation directives
 	bash scripts/ci/check_systemd_hardening.sh $(CURDIR)
 
-.PHONY: bootstrap
-bootstrap: ## Idempotent single-box setup (ansible) — dev/lima. Back-compat for `make bootstrap` against 127.0.0.1.
-	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $$BOX -e faas_box_role=single-box
-
 .PHONY: manifest-ansible
 manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars tree (MANIFEST + ANSIBLE_GENERATED_DIR required)
 	@test -n "$(MANIFEST)" || (echo "MANIFEST is required (example: MANIFEST=deploy/manifest/splitbox.yaml)" >&2; exit 2)
@@ -445,12 +440,12 @@ manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars t
 .PHONY: bootstrap-control-plane
 bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane} -e faas_box_role=control-plane
+	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane}
 
 .PHONY: bootstrap-compute
 bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes} -e faas_box_role=compute-only
+	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes}
 
 .PHONY: tidy
 tidy: ## go mod tidy
@@ -459,7 +454,8 @@ tidy: ## go mod tidy
 # Egress policy (spec §11). Source of truth is pkg/netns/policy.go's
 # HostPolicy.Render(). The Go-rendered artifact under
 # deploy/ansible/roles/nftables/files/policy_nftables.conf is what
-# `make bootstrap` ships to the host at /etc/nftables.conf when
+# the role-specific bootstrap target ships to the host at
+# /etc/nftables.conf when
 # ansible_render=true (the default). With the ADR-055 Jinja2
 # template active, ansible now DOES render the per-host file
 # at bootstrap time, so the committed artifact is the canonical

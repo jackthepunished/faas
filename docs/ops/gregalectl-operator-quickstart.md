@@ -66,10 +66,8 @@ sudo make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootst
 ```
 
 These targets run `deploy/ansible/bootstrap.yml` against the
-manifest-generated three-group inventory. The
-legacy single-box target (`make bootstrap`) still works against
-127.0.0.1 for dev/lima — `[box:children]` aggregates the multi-box
-groups.
+manifest-generated split-box inventory. There is no combined `[box]`
+target: production hosts must be assigned exactly one role.
 
 The schema docs are at
 [`docs/adr/110-declarative-split-box-manifest.md`](../adr/110-declarative-split-box-manifest.md).

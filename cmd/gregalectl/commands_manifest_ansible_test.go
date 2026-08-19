@@ -40,6 +40,9 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(inventory, "[compute_nodes]\nfsn-2\n") {
 		t.Errorf("inventory missing compute node:\n%s", inventory)
 	}
+	if strings.Contains(inventory, "[box]") || strings.Contains(inventory, "box:children") {
+		t.Errorf("generated production inventory contains retired combined box group:\n%s", inventory)
+	}
 	if !strings.Contains(computeVars, `ansible_host: "10.42.0.2"`) {
 		t.Errorf("compute host vars missing host address:\n%s", computeVars)
 	}
@@ -51,6 +54,22 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	}
 	if !strings.Contains(computeVars, `10.42.0.2"`) || !strings.Contains(computeVars, `vmmd.faas`) {
 		t.Errorf("compute host vars missing compute private alias:\n%s", computeVars)
+	}
+}
+
+func TestRenderManifestAnsibleFiles_RejectsSingleBox(t *testing.T) {
+	yaml := strings.Replace(validManifestYAML,
+		"    - name: fsn-1\n      role: control-plane",
+		"    - name: fsn-1\n      role: single-box\n      address: 127.0.0.1:7100", 1)
+	m, err := manifest.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("manifest.Parse: %v", err)
+	}
+	if errs := m.Validate(); errs != nil {
+		t.Fatalf("manifest.Validate: %v", errs)
+	}
+	if _, err := renderManifestAnsibleFiles(m, t.TempDir()); err == nil || !strings.Contains(err.Error(), "unsupported production role") {
+		t.Fatalf("single-box manifest error = %v, want unsupported production role", err)
 	}
 }
 
