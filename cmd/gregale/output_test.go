@@ -255,3 +255,121 @@ func TestPrintUsage_EmitsTwoLinesWithTopic(t *testing.T) {
 		t.Errorf("usage line should be glyph-free, got %q", got)
 	}
 }
+
+// TestLiveTicker_TTY_RedrawsInPlace pins ADR-117 §3 + PR-A
+// review fix (F2): when stdout IS a TTY the ticker emits the
+// N-row block on first Update (6 placeholders so the cursor
+// sits on row N+1 — not row 1 — and subsequent escapeUp(N)
+// sequences land cleanly on the top of the block), and on
+// every subsequent Update the cursor jumps to the top of the
+// block, clears all 6 lines, then writes the single updated
+// row at rowIdx. The terminal sees exactly N lines after each
+// Update — not 2N — so the customer's screen doesn't scroll.
+//
+// The test forces TTY via testOnlyTTY, drives 6 Updates (one
+// per stage), and asserts:
+//   - 12 row lines total (6 placeholders + 1 real row in
+//     Update 0; then 1 row line each in Updates 1..5 = 5)
+//   - 10 cursor-up sequences (2 per Update × 5 redraws;
+//     Update 0 emits 0 cursor-ups because it places the
+//     initial block)
+//   - 30 clear-line sequences (6 per Update × 5 redraws)
+//   - 1 trailing newline from Close
+func TestLiveTicker_TTY_RedrawsInPlace(t *testing.T) {
+	defer withTTYForTest(true)()
+	resetStdoutTTYCache()
+	buf := &bytes.Buffer{}
+	tk := NewLiveTicker(buf, 6)
+	for i, name := range stageOrder {
+		tk.Update(i, stageLabels[name], "completed", "1.2s")
+	}
+	tk.Close()
+
+	out := buf.String()
+	// Count row lines (anything that ends with \n and is NOT an
+	// ANSI escape sequence or empty).
+	lines := strings.Split(out, "\n")
+	rowLines := 0
+	for _, l := range lines {
+		if strings.Contains(l, escapeClearLine) || strings.TrimSpace(l) == "" {
+			continue
+		}
+		rowLines++
+	}
+	want := 6 + 6 // 6 placeholders + 6 Update rows (1 per Update)
+	if rowLines != want {
+		t.Fatalf("got %d row lines, want %d: %q", rowLines, want, out)
+	}
+	// Cursor-up count = 2 per redraw × 5 redraws = 10. Update 0
+	// emits 0 cursor-ups because it places the initial N-row
+	// block (no redraw needed). The PR-A review fix changed
+	// the placeholder emission: previously the first Update
+	// printed only 1 row, which left the cursor 1 row below
+	// the top of the block — the next Update's escapeUp(6)
+	// then moved the cursor 5 rows into stdout lines written
+	// before the ticker started. Now Update 0 prints 6
+	// placeholders so the cursor lands on row N+1, which is
+	// the correct anchor for subsequent escapeUp(N) sequences.
+	upCount := strings.Count(out, escapeUp(6))
+	if upCount != 10 {
+		t.Errorf("got %d cursor-up escapes, want 10: %q", upCount, out)
+	}
+	// Clear-line count = 6 per Update × 5 redraws = 30.
+	clearCount := strings.Count(out, escapeClearLine)
+	if clearCount != 30 {
+		t.Errorf("got %d clear-line escapes, want 30: %q", clearCount, out)
+	}
+	// Close flushes one trailing newline so subsequent output
+	// doesn't overwrite the last row.
+	if !strings.HasSuffix(out, "\n") {
+		t.Errorf("Close should terminate with newline, got %q", out)
+	}
+}
+
+// TestLiveTicker_Static_OneLinePerUpdate pins the static-fallback
+// path: when stdout is NOT a TTY (pipe, --json, NO_COLOR), the
+// ticker emits one line per Update with no ANSI escapes. This is
+// the grep-friendly mode for CI scripts that capture
+// `gregale deploy … | tee /tmp/log`.
+func TestLiveTicker_Static_OneLinePerUpdate(t *testing.T) {
+	defer withTTYForTest(false)()
+	resetStdoutTTYCache()
+	buf := &bytes.Buffer{}
+	tk := NewLiveTicker(buf, 6)
+	for _, name := range stageOrder {
+		tk.Update(0, stageLabels[name], "completed", "1.2s")
+	}
+	tk.Close()
+
+	out := buf.String()
+	// Static fallback must NOT carry ANSI cursor escapes — a
+	// pipe-friendly form is the whole point.
+	if strings.Contains(out, "\033[") {
+		t.Errorf("static ticker must not emit ANSI escapes, got %q", out)
+	}
+	// Header + 6 rows = 7 lines (the trailing newline from the
+	// last Update). Close is a no-op in static mode (every
+	// Update already wrote its own newline).
+	if got := strings.Count(out, "\n"); got < 7 {
+		t.Errorf("expected ≥ 7 newlines in static ticker, got %d: %q", got, out)
+	}
+}
+
+// TestStageGlyph_Mapping pins the per-status glyph table. The
+// glyph is what the customer sees on the ticker row — a regression
+// here is a UX regression, not a logic bug, so it's pinned
+// explicitly.
+func TestStageGlyph_Mapping(t *testing.T) {
+	cases := map[string]string{
+		"completed":   "✓",
+		"in_progress": "…",
+		"failed":      "✗",
+		"pending":     "·",
+		"":            "·",
+	}
+	for status, want := range cases {
+		if got := stageGlyph(status); got != want {
+			t.Errorf("stageGlyph(%q) = %q, want %q", status, got, want)
+		}
+	}
+}

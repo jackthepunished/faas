@@ -85,6 +85,73 @@ const (
 	DeploySuperseded   DeploymentStatus = "superseded"
 )
 
+// StageName is the closed set of customer-visible named stages
+// surfaced in the SSE `event: stage` frame and in the CLI's
+// post-stream summary (ADR-117, migration 00302). Distinct from
+// `DeploymentStatus` — the latter drives the state machine
+// (`pending → building → imaging → snapshotting → live | failed |
+// superseded`); the former is the customer-UX projection that maps
+// multiple internal status flips onto one named step.
+//
+// Schema CHECK constraint `deployments_stage_state_current_check`
+// (migrations/00302_deployments_stage_state.sql) enforces the same
+// vocabulary at the storage layer so a typo from a future
+// contributor lands as SQLSTATE 23514 check_violation at write time
+// rather than leaking as a wire-frame typo on `event: stage {name}`.
+type StageName string
+
+const (
+	// StageSourceDownload is entered when the deployment row leaves
+	// DeployPending (the source fetch from the customer tarball /
+	// GitHub ref / registry image). First visible stage.
+	StageSourceDownload StageName = "source_download"
+	// StageDependencyRestore is entered after the cached
+	// dependency layer is restored (cache hit path on
+	// pkg/builderd/builderd.go:394) or, on a cold cache, the
+	// dependency install completes inside the builder VM.
+	StageDependencyRestore StageName = "dependency_restore"
+	// StageImageBuild is entered when builderd/imaged begin the
+	// per-app layer construction (buildImageLayer /
+	// buildFunctionLayer / buildLocalOCIAppLayer). Covers both
+	// `imaging` and `snapshotting` micro-states of the state
+	// machine; the customer sees one step, not two.
+	StageImageBuild StageName = "image_build"
+	// StageSecurityScan is entered when grype + secret-scan run
+	// over the layer (`runDeployScan` at
+	// pkg/imaged/handler.go:797-906). The scan completion stamp
+	// on deployments.scan_status='complete' is the boundary.
+	StageSecurityScan StageName = "security_scan"
+	// StageSnapshotPrepare is entered when imaged posts the
+	// per-app snapshot to the schedd / vmmd side
+	// (`NotifySnapshotPrime` at pkg/imaged/handler.go:2341) and
+	// schedd primes the Firecracker microVM for cold-boot.
+	StageSnapshotPrepare StageName = "snapshot_prepare"
+	// StageReadiness is the final visible stage — entered when
+	// vmmd's first cold-boot returns 2xx at the readiness probe
+	// (cmd/gatewayd-internal/run.go:967 wake.proxy_first_byte +
+	// framework readiness stamp at
+	// instances.framework_ready_at, migration 00122). Closes on
+	// MarkDeploymentLive (pkg/imaged/handler.go:2240); the
+	// `✓ Deployed.` line is owned by the existing terminal-status
+	// branch in streamDeployLogs and is NOT a stage row.
+	StageReadiness StageName = "readiness"
+)
+
+// AllStageNames is the closed vocabulary used by both the
+// migrations/00302 jsonb CHECK constraint AND the wire-shape test
+// in cmd/gregale/commands2_test.go. Adding a new value here
+// without also widening the migration's IN list is a load-bearing
+// failure mode — the wire vocabulary on `event: stage {name}` would
+// silently drift out of step with the schema CHECK.
+var AllStageNames = []StageName{
+	StageSourceDownload,
+	StageDependencyRestore,
+	StageImageBuild,
+	StageSecurityScan,
+	StageSnapshotPrepare,
+	StageReadiness,
+}
+
 // ParkReason is the closed-set label on deployments.parked_reason
 // (issue #554 / ADR-079 follow-up, migration 00157). The schema
 // CHECK constraint deployments_parked_reason_check enforces the
@@ -1151,6 +1218,69 @@ type Deployment struct {
 	// live row per (app_id, scope)). A scope change requires a
 	// NEW deployment — there is no update-time scope change.
 	Scope string `json:"scope,omitempty"`
+	// StageState (ADR-117, migration 00302) — per-deployment
+	// customer-UX stage projection. Owned entirely by
+	// Store.AppendDeploymentStage — handlers MUST NOT write the
+	// column directly. The 2s SSE polling tick at
+	// cmd/apid/handlers_ext.go:4156-4157 diffs this struct
+	// against a per-connection `announced map` and emits one
+	// `event: stage {name, started_at, duration_ms, status}`
+	// frame per transition. See pkg/state/types.go:89 for the
+	// closed StageName vocabulary.
+	//
+	// Stored as json.RawMessage (NOT a typed StageState struct)
+	// so the pgstore scan path mirrors ScanResult / SecretFindings
+	// — the typed shape is unmarshalled lazily by the SSE
+	// handler that needs it, exactly once per connection.
+	StageState json.RawMessage `json:"stage_state,omitempty"`
+}
+
+// StageState is the typed view of the
+// `deployments.stage_state` jsonb column (ADR-117,
+// migration 00302). Shape:
+//
+//	{
+//	  "current": "<StageName>",
+//	  "current_started_at": "<RFC3339Nano>" | null,
+//	  "history": [
+//	    {"name":"source_download","started_at":"...",
+//	     "ended_at":"...","duration_ms":1203,"status":"completed"},
+//	    ...
+//	  ]
+//	}
+//
+// `Current` lives outside `History` until it closes. The atomic
+// JSONB merge is implemented by `appendDeploymentStage` in
+// pkg/state/queries.sql — read-modify-write at the Go layer is
+// NOT safe (two transitions from concurrent goroutines would race).
+// The pgstore implementation is the only writer; memstore mirrors
+// the shape so unit tests can exercise the read path without
+// spinning Postgres.
+type StageState struct {
+	Current          StageName        `json:"current"`
+	CurrentStartedAt *time.Time       `json:"current_started_at,omitempty"`
+	History          []StageStateItem `json:"history"`
+}
+
+// StageStateItem is one closed stage transition in the
+// `stage_state.history` array. `DurationMs` is measured server-side
+// by `appendDeploymentStage` (now - current_started_at) so the SSE
+// consumer doesn't have to trust a 2s-tick-derived `time.Now()`
+// reconstruction.
+//
+// `StartedAt` is a *time.Time (NOT time.Time) so the JSON wire shape
+// is `null` when the migration seed left it unset — time.Time zero
+// value marshals to the literal string "0001-01-01T00:00:00Z" which
+// is indistinguishable from a real epoch and contradicts the
+// "uninitialized = null" contract the SSE consumer expects. The
+// pointer nil-vs-set distinction preserves that contract.
+type StageStateItem struct {
+	Name       StageName  `json:"name"`
+	StartedAt  *time.Time `json:"started_at"`
+	EndedAt    *time.Time `json:"ended_at"`
+	DurationMs int64      `json:"duration_ms"`
+	Status     string     `json:"status"` // "completed" | "failed"
+	Reason     string     `json:"reason,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem

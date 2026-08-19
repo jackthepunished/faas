@@ -667,6 +667,20 @@ func (b *Builderd) markFailed(ctx context.Context, depID, buildID string, fc sta
 	if err := b.store.UpdateDeploymentStatus(ctx, depID, state.DeployFailed, msg); err != nil {
 		b.log.Warn("builderd: mark deployment failed", "deployment", depID, "build", buildID, "err", err)
 	}
+	// ADR-117 §3: stamp the active stage as failed so the SSE
+	// `event: stage` consumer on /v1/deployments/{id}/logs emits
+	// `status:"failed"` for the row that was in flight when the
+	// build blew up. MarkDeploymentStageFailed (PR-A review fix)
+	// moves the active stage into history with the failed stamp
+	// rather than overwriting `history[len-1]` (which would have
+	// been the previously-closed stage, not the one in flight).
+	// Best-effort: stage stamps never roll back the deployment
+	// status flip above. The deployment lookup matches the one
+	// in emitBuildSucceeded (line 619) so we don't have a second
+	// store reader.
+	if _, serr := b.store.MarkDeploymentStageFailed(ctx, depID, time.Now(), msg); serr != nil {
+		b.log.Warn("builderd: stamp failed stage", "deployment", depID, "err", serr)
+	}
 	// ADR-048 §4: builder-time metering on terminal build
 	// events, success or failure — the box burned cycles
 	// either way. The AppendBuilderUsage call is idempotent on

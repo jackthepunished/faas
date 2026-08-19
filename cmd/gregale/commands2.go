@@ -2797,6 +2797,14 @@ func topPatterns(patterns map[string]int, n int) []string {
 // tell the customer how to follow manually.
 //
 // Issue #64 D4 — replaces the old "✓ Queued build …" and exit.
+//
+// ADR-117 §3: also drives the 6-row deploy progress ticker via
+// `event: stage` frames. The ticker is constructed before the SSE
+// decoder loop and `Close()`d on every exit path so the customer's
+// terminal never shows a half-drawn block. The `enabled` flag
+// short-circuits the constructor when the customer piped the
+// output (`gregale deploy … | tee /tmp/log`) — the static fallback
+// in renderStageSummary is the path that fires instead.
 func streamDeployLogs(c *Client, dep api.DeploymentResponse) int {
 	PrintProgress(osStdout, "build queued for %s (deployment %s)", dep.AppID, dep.ID)
 	ctx := context.Background()
@@ -2822,6 +2830,10 @@ func streamDeployLogs(c *Client, dep api.DeploymentResponse) int {
 	dec := api.NewDecoder(body)
 	dec.SetCloseFn(body.Close)
 	defer func() { _ = dec.Close() }()
+	// ADR-117 §3: ticker construction happens AFTER the decoder so
+	// a decoder init failure doesn't draw a half-rendered block.
+	ticker := renderStageTicker(osStdout)
+	defer ticker.Close()
 streamLoop:
 	for {
 		select {
@@ -2842,6 +2854,26 @@ streamLoop:
 				}
 				if json.Unmarshal([]byte(e.Data), &entry) == nil && entry.Line != "" {
 					fmt.Println(entry.Line)
+				}
+			case "stage":
+				// ADR-117 §3: server-side stage diff — drive the
+				// ticker's per-row state. The decoder's `e.Data`
+				// is the verbatim JSON line so the struct
+				// shape mirrors what the server emits at
+				// cmd/apid/handlers_ext.go::emitStageFrame:
+				// {"name", "started_at", "duration_ms",
+				//  "status", "reason"?}. Unknown statuses
+				// pass through unchanged — the ticker treats
+				// them as "pending" so a future server-side
+				// status string renders without a CLI update.
+				var stage struct {
+					Name       string `json:"name"`
+					Status     string `json:"status"`
+					DurationMs int64  `json:"duration_ms"`
+					Reason     string `json:"reason"`
+				}
+				if json.Unmarshal([]byte(e.Data), &stage) == nil && stage.Name != "" {
+					ticker.HandleStageFrame(stage.Name, stage.Status, stage.DurationMs, stage.Reason)
 				}
 			case statusLiteral:
 				var status struct {
