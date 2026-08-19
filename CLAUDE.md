@@ -19,7 +19,9 @@ silently "improve" the architecture — several designs below look simplifiable 
 ## Commands
 
 ```
-make bootstrap      # idempotent host setup (ansible) — control-plane node setup
+make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-control-plane
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
 make test           # unit tests, must pass on any machine, no KVM needed
 make test-metal     # integration tests tagged //go:build metal — needs KVM + root
 make leakcheck      # asserts zero leaked netns/TAPs/jail uids/cgroups after tests

@@ -203,6 +203,61 @@ func TestDrain_PermanentInvokeTerminates(t *testing.T) {
 	}
 }
 
+// TestDrain_EvictedColdInvocationTerminates pins the retry boundary for a
+// parked app. The invocation must become terminal without calling the
+// gateway or creating another instance row.
+func TestDrain_EvictedColdInvocationTerminates(t *testing.T) {
+	store := state.NewMemStore()
+	ctx := context.Background()
+	_, app, _ := seedApp(t, store, api.PlanHobby, 256, 5)
+	parked := state.AppEvictedCold
+	if _, err := store.UpdateApp(ctx, app.ID, state.UpdateAppParams{Status: &parked}); err != nil {
+		t.Fatalf("park app: %v", err)
+	}
+	vmm := &fakeVMM{}
+	ds := &drainSynth{}
+	eng := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	d := NewDrain(store, eng,
+		WithDrainGatewaySynth(ds),
+		WithDrainLogger(slog.New(slog.NewTextHandler(discardWriter{}, nil))),
+		WithDrainNow(func() time.Time { return time.Now().UTC() }),
+	)
+	inv, err := store.EnqueueInvocation(ctx, state.Invocation{
+		AppID: app.ID, AccountID: app.AccountID, Source: state.InvocationAsyncInvoke,
+		Method: "POST", Path: "/x", DueAt: time.Now().Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueInvocation: %v", err)
+	}
+
+	d.Tick(ctx)
+	got, err := store.InvocationByID(ctx, inv.ID)
+	if err != nil {
+		t.Fatalf("InvocationByID: %v", err)
+	}
+	if got.State != state.InvocationFailed {
+		t.Fatalf("invocation state = %q, want failed", got.State)
+	}
+	if got.CompletedAt == nil || got.LastError == "" {
+		t.Fatalf("terminal invocation metadata incomplete: completed_at=%v last_error=%q", got.CompletedAt, got.LastError)
+	}
+	if ds.calls.Load() != 0 {
+		t.Fatalf("gateway calls = %d, want 0", ds.calls.Load())
+	}
+	instances, err := store.ListInstancesForApp(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("ListInstancesForApp: %v", err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("instance rows = %d, want 0", len(instances))
+	}
+
+	d.Tick(ctx)
+	if ds.calls.Load() != 0 {
+		t.Fatalf("post-terminal gateway calls = %d, want 0", ds.calls.Load())
+	}
+}
+
 // TestDrain_NotYetDueSkipped pins the (state='pending' AND due_at <= now)
 // predicate. A future-dated row must NOT be picked up.
 func TestDrain_NotYetDueSkipped(t *testing.T) {

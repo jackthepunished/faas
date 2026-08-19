@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/build-base.sh — run the canonical 23 ansible roles against the
-# in-build VM. Same shape as `make bootstrap*`; image build freezes the
+# scripts/build-base.sh — run the canonical Ansible roles against the
+# in-build VM. Same shape as the split-box bootstrap; image build freezes the
 # output of those roles into the image.
 #
 # Per ADR-112: image and bootstrap share the same ansible tree. Image
@@ -29,8 +29,9 @@ cd "${SRC_ROOT}"
 # iso.pkr.hcl builder installs them explicitly. Verify:
 command -v ansible-playbook >/dev/null 2>&1 || apt-get install -y --no-install-recommends ansible git
 
-# Pin the inventory to the in-build VM. bootstrap.yml expects a host
-# inventory; we point at localhost.
+# Pin the inventory to the in-build VM. The image-seed inventory places
+# localhost in both explicit production groups so bootstrap.yml installs the
+# maximal role-agnostic image without exposing a combined production group.
 #
 # ADR-112: the image is role-agnostic; first-boot sets FAAS_BOX_ROLE
 # via cloud-init user-data and `gregalectl release install --role`
@@ -41,10 +42,12 @@ command -v ansible-playbook >/dev/null 2>&1 || apt-get install -y --no-install-r
 # Use "single-box" — every daemon allows it (pkg/role/role.go), so
 # the in-build VM runs the maximal daemon set in dev posture. The
 # image bakes as full; first-boot re-templates for the actual role.
-ansible-playbook -i "localhost," -c local \
+ansible-playbook -i deploy/packer/inventory/image-seed.ini \
     deploy/ansible/bootstrap.yml \
     -e "faas_git_sha=${FAAS_GIT_SHA}" \
     -e "faas_box_role=single-box" \
+    -e "faas_node_name=image-seed" \
+    -e "faas_image_seed=true" \
     --diff
 
 # /etc/profile.d/go.sh so the runtime PATH picks up /usr/local/go/bin.

@@ -1095,6 +1095,31 @@ func (s *server) handler() http.Handler {
 	// returns the stored 202 without inserting a second row.
 	mux.HandleFunc("POST /v1/crons/{id}/run", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.fireCronNow)))))
 
+	// Triggers (issue #757 / ADR-0NN; commit #6). Same authLimited +
+	// requireMFA + requireScope shape as the cron family. POST routes
+	// are idempotent-wrapped so retries are safe (the createTrigger
+	// handler is the only state-mutating POST that needs the wrap;
+	// pause/resume/records/{rid}/{retry,drop} are operator verbs and
+	// run without idempotency — they are tuned for human action, not
+	// at-least-once delivery).
+	mux.HandleFunc("GET /v1/triggers", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTriggers))))
+	mux.HandleFunc("POST /v1/triggers", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createTrigger)))))
+	mux.HandleFunc("GET /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getTrigger))))
+	mux.HandleFunc("PATCH /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateTrigger))))
+	mux.HandleFunc("DELETE /v1/triggers/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteTrigger))))
+	mux.HandleFunc("POST /v1/triggers/{id}/pause", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.pauseTrigger))))
+	mux.HandleFunc("POST /v1/triggers/{id}/resume", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.resumeTrigger))))
+	mux.HandleFunc("GET /v1/triggers/{id}/records", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTriggerRecords))))
+	mux.HandleFunc("POST /v1/triggers/{id}/records/{rid}/retry", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.retryTriggerRecord))))
+	mux.HandleFunc("POST /v1/triggers/{id}/records/{rid}/drop", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.dropTriggerRecord))))
+	mux.HandleFunc("GET /v1/triggers/{id}/dlq", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listTriggerDeadLetter))))
+	mux.HandleFunc("GET /v1/triggers/{id}/metrics", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getTriggerMetrics))))
+	// Batch-create (POST /v1/triggers:batch_create) accepts an inline
+	// gregale.yaml blob. Distinct route path (":batch_create" suffix,
+	// not /v1/triggers/{id} with wildcard id) so the mux pattern
+	// matcher doesn't conflict with the {id} getTrigger route.
+	mux.HandleFunc("POST /v1/triggers:batch_create", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.batchCreateTrigger)))))
+
 	// Projects (ADR-050, Phase 3). Two routes — /scan is dry-run
 	// (no writes), / is the transactional apply. Both are deploy-
 	// write scoped; / is wrapped in s.idempotent so retries are
@@ -1628,6 +1653,12 @@ func (s *server) handler() http.Handler {
 	// == install.account.login) is enforced in the handlers.
 	mux.Handle("POST /v1/install/repos/list", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listInstallableRepos))))
 	mux.Handle("POST /v1/apps/{slug}/install/bind", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.bindAppToRepo))))
+	// Issue #961 / Mega-B PR-3 — GET /v1/templates is the dashboard's
+	// source of truth for the template catalog (handlers_templates.go).
+	// Mirrors cmd/gregale/templates.Names without importing the CLI's
+	// main package; the dashboard and the CLI read the same
+	// 13-entry list through independent paths.
+	mux.Handle("GET /v1/templates", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listTemplates))))
 
 	// PR-C: /oauth/code-callback is the user-to-server OAuth callback
 	// (the "Connect GitHub" button flow). Sibling of /oauth/callback

@@ -1494,6 +1494,28 @@ type UpdateDeploymentTrafficRequest struct {
 	TrafficPercent int `json:"traffic_percent"`
 }
 
+// RollbackRequest is the body for POST /v1/apps/{slug}/rollback.
+//
+// All fields are optional. With an empty body the handler falls back to
+// "rollback to the most recent superseded deployment" (the pre-G
+// behaviour). With TargetDeploymentID set, the handler validates that the
+// deployment belongs to this app AND has status='superseded' — both are
+// hard requirements; rolling back to a deployment that is already live, or
+// that belongs to a different app, is rejected with a typed error rather
+// than silently no-op'd.
+//
+// SAFE-RELEASES-G (issue #976). Forward-compatible with SAFE-RELEASES-C
+// (per-deployment URL): the response carries the same deployment_id so
+// -C can build a hostname off it without a wire-shape change.
+type RollbackRequest struct {
+	// TargetDeploymentID is the UUID of the deployment to promote back
+	// to 'live'. Must belong to the same app as the URL slug, and must
+	// have status='superseded' (rolling back to the already-current
+	// deployment is rejected explicitly). Nil/empty falls back to the
+	// most-recent superseded deployment (legacy behaviour).
+	TargetDeploymentID *string `json:"target_deployment_id,omitempty"`
+}
+
 // AccountResponse is the whoami payload. Limits is the plan's
 // quota/limit table (RAM MB, max concurrency, included GB-h,
 // deployed-app cap) so the dashboard /account page can show
@@ -2470,8 +2492,16 @@ type GdprAuditExportResponse struct {
 // Ciphertext is the age-sealed envelope (base64). Plaintext never
 // lands here — the customer imports the envelope into another faas
 // install (or their own age tool) to unseal.
+//
+// ADR-092 PR-B: the export lists every scope per app (not just
+// default-scope). Scope is required so a customer's import into a
+// fresh install lands each row at the same scope it was sealed at;
+// pre-PR-B this field was missing and on import the row would have
+// collapsed to default scope, silently overwriting any prod/staging
+// rows on the destination.
 type AppSecretExportResponse struct {
 	AppID      string `json:"app_id"`
+	Scope      string `json:"scope"` // ADR-092 PR-B
 	Key        string `json:"key"`
 	Ciphertext string `json:"ciphertext"` // base64
 	CreatedAt  string `json:"created_at"`
@@ -4180,13 +4210,33 @@ var edgeRuleValidateRefURLPattern = regexp.MustCompile(`"\s*(\$ref|\$id)\s*"\s*:
 //     api.MaxRequestBodyBytes (per-plan 25 MB buffered / 100 MB
 //     streaming). Must be > 0 and <= MaxRequestBodyBytes at
 //     create-time.
+//   - ValidateMode: select how the gateway handles a failing body
+//     (issue #975 item #3 / Mega-Foundation #979-a). 'block' (the
+//     default) preserves the v1 behavior — reject with 422.
+//     'observe' counts failures via the gateway_validate_failures_total
+//     metric and never rejects, so an operator can spot noisy
+//     endpoints without breaking their customers. 'warn' also
+//     stamps `X-Validation-Warning: <rule_id>` on the proxied
+//     response (warning only; status still 200/whatever the app
+//     returned). Closed enum; unknown values reject at
+//     create-time.
 type EdgeRuleValidateAction struct {
 	Schema                json.RawMessage `json:"schema"`
 	ContentTypes          []string        `json:"content_types,omitempty"`
 	ApplyWhileStreaming   bool            `json:"apply_while_streaming,omitempty"`
 	RejectOnUnknownFields bool            `json:"reject_on_unknown_fields,omitempty"`
 	MaxBodyBytes          int             `json:"max_body_bytes,omitempty"`
+	ValidateMode          string          `json:"validate_mode,omitempty"`
 }
+
+// ValidateMode values (issue #975 #3 / Mega-Foundation #979-a).
+// The set is small and closed; the gateway defaults to 'block'
+// when the rule row predates the column migration.
+const (
+	ValidateModeBlock   = "block"
+	ValidateModeObserve = "observe"
+	ValidateModeWarn    = "warn"
+)
 
 func (a *EdgeRuleValidateAction) Validate() *Problem {
 	if a == nil {
@@ -4245,6 +4295,19 @@ func (a *EdgeRuleValidateAction) Validate() *Problem {
 		return ErrValidation(fmt.Sprintf(
 			"validate action: max_body_bytes exceeds the platform cap (%d > %d)",
 			a.MaxBodyBytes, MaxRequestBodyBytes))
+	}
+	// ValidateMode: optional; empty == 'block' (the strictest mode,
+	// matches the NOT NULL DEFAULT 'block' the migration adds at
+	// 00293). Any non-empty value must be one of the three closed
+	// strings; an unknown value gets a 422 with the allowed list,
+	// not a 500.
+	if a.ValidateMode != "" &&
+		a.ValidateMode != ValidateModeBlock &&
+		a.ValidateMode != ValidateModeObserve &&
+		a.ValidateMode != ValidateModeWarn {
+		return ErrValidation(fmt.Sprintf(
+			"validate action: validate_mode must be one of %q, %q, %q (got %q)",
+			ValidateModeBlock, ValidateModeObserve, ValidateModeWarn, a.ValidateMode))
 	}
 	return nil
 }

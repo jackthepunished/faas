@@ -114,6 +114,17 @@ var routeExclude = map[string]bool{
 	// exclusion above.
 	"POST /v1/install/repos/list":       true, // bind picker hydrates from this; browser-only
 	"POST /v1/apps/{slug}/install/bind": true, // bind picker writes through this; browser-only
+
+	// Issue #961 / Mega-B PR-3 / ADR-116. The dashboard's
+	// /dashboard/apps/new wizard renders GET /v1/templates as the
+	// "Starting template" dropdown. Cookie-session-authenticated
+	// (NOT API-key) — the dashboard is the install-token trust root
+	// per ADR-116. The Bearer-auth SDK does not model session-cookie
+	// GETs, and the response shape is the same embed.FS the CLI
+	// reads locally (cmd/gregale/templates.Names) so SDK consumers
+	// don't need a typed wrapper. Mirrors the dashboard-auth
+	// exclusion above.
+	"GET /v1/templates": true, // dashboard wizard hydrates from this; session-cookie-only
 }
 
 // sdkMethodExclude lists methods on *Client that aren't a 1:1 wire
@@ -513,6 +524,30 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/orgs/{slug}/keys/{id}":      "RevokeOrgAPIKey",
 	"POST /v1/orgs/{slug}/keys/{id}/rotate": "RotateOrgAPIKey",
 
+	// Issue #757 / ADR-100 — unified Trigger primitive. Pin every
+	// trigger route; auto-derivation reads either "Triggers" or
+	// "TriggersId<Segment>" depending on whether the path carries
+	// hyphens, and we want the SDK verb surface to be uniform.
+	// The two colon-suffixed routes use the colon-stripped Go name
+	// (Go identifiers can't carry `:` so the SDK normalises the
+	// path component to the next segment word).
+	"POST /v1/triggers":                          "PostTriggers",
+	"GET /v1/triggers":                           "GetTriggers",
+	"POST /v1/triggers:batch_create":             "PostTriggersBatchCreate",
+	"GET /v1/triggers/{id}":                      "GetTriggersId",
+	"PATCH /v1/triggers/{id}":                    "PatchTriggersId",
+	"DELETE /v1/triggers/{id}":                   "DeleteTriggersId",
+	"POST /v1/triggers/{id}/pause":               "PostTriggersIdPause",
+	"POST /v1/triggers/{id}/resume":              "PostTriggersIdResume",
+	"GET /v1/triggers/{id}/records":              "GetTriggersIdRecords",
+	"POST /v1/triggers/{id}/records/{rid}/retry": "PostTriggersIdRecordsRidRetry",
+	"POST /v1/triggers/{id}/records/{rid}/drop":  "PostTriggersIdRecordsRidDrop",
+	"GET /v1/triggers/{id}/dlq":                  "GetTriggersIdDlq",
+	"GET /v1/triggers/{id}/metrics":              "GetTriggersIdMetrics",
+	// Internal — schedd posts the batch envelope to the gateway.
+	// The SDK surface is optional; the handler is registered on
+	// the gateway synth plane.
+	"POST /v1/invocations:dispatch_batch": "PostInvocationsDispatchBatch",
 	// Issue #879 / ADR-100 PR-C — tenant surfaces. The auto-derivation
 	// produces names with literal hyphens (the path carries the
 	// "tenant-surfaces" segment); the SDK verbs follow the operationId

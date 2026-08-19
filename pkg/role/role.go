@@ -31,9 +31,9 @@
 // fails fast and visibly rather than silently masking the
 // misconfiguration with a default-local row.
 //
-// Single-box dev (make bootstrap against 127.0.0.1) keeps working
-// because every daemon's allow-list includes RoleSingleBox and the
-// default resolves to RoleSingleBox.
+// Single-box image-seed and local test paths keep working because every
+// daemon's allow-list includes RoleSingleBox. Production deployment must
+// provide an explicit control-plane or compute-only role.
 //
 // Resolution order (FromConfig):
 //

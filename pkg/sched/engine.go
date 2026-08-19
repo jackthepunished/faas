@@ -4426,6 +4426,19 @@ func (e *Engine) resolveApp(ctx context.Context, appID string) (state.App, state
 	if err != nil {
 		return state.App{}, state.Account{}, api.Limits{}, state.Deployment{}, err
 	}
+	// A liveness-exhausted app is deliberately parked until an explicit
+	// unpark operation changes its lifecycle back to active. Treating the
+	// parked app as wakeable lets a pending async invocation retry forever:
+	// every retry creates a fresh FAILED instance row before the same
+	// underlying artifact error is observed. Join the scheduler sentinel
+	// with the public problem so the drain can terminally fail the row while
+	// the RPC surface still carries an actionable error.
+	if app.Status == state.AppEvictedCold {
+		return state.App{}, state.Account{}, api.Limits{}, state.Deployment{}, errors.Join(
+			ErrPermanentWake,
+			api.NewProblem(409, api.CodeConflict, "App is parked", "the app is evicted_cold; wake the app before invoking"),
+		)
+	}
 	scope := ScopeFrom(ctx)
 	var dep state.Deployment
 	if scope == "" {

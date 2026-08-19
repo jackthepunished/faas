@@ -1440,8 +1440,123 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			loop.WithGatewaySynth(synth)
 		}
 	}
+
+	// Issue #757 / ADR-100 (commits #13/#14): wire the HTTP transport
+	// the trigger dispatch tick uses to post batch envelopes to
+	// /v1/invocations:dispatch_batch. The gateway side serves that
+	// route on the same unix socket as the cron dispatch path
+	// (cmd/gatewayd-internal/run.go::gatewaydInternalSocket);
+	// postBatch() strips the unix:// scheme and dials that path
+	// directly. We keep a separate http.Client (rather than sharing
+	// the synth RPC) because the cron surface uses gRPC semantics
+	// over a unix socket transport, while the batch endpoint is
+	// plain HTTP/1.1 JSON — different idle-pool shapes, different
+	// request timeouts.
+	//
+	// Mirror the cron path above: a failed dial is warn-and-skip,
+	// not boot-fatal. Otherwise a schedd-only e2e (no gatewayd-internal
+	// in the harness, so cfg.GatewaySynthSocket="") crashes schedd on
+	// PR #910 even when the test never exercises the trigger batch
+	// path. The trigger tick's `WithGatewayHTTPClient(nil, "")` shape
+	// makes `l.runTriggerTick` short-circuit on every tick (it returns
+	// at the top when the http client is nil; see runTriggerTick at
+	// pkg/sched/dispatch_triggers.go). Production schedd whose
+	// gatewayd-internal is genuinely down still gets caught by the
+	// systemd unit restart loop — the cron dial failure above is
+	// already a journal signal in that case.
+	//
+	// Audit finding #5 (PR #910 boot-fatal stance): the rationale was
+	// "every trigger wake funnels through dispatch_batch, so a missed
+	// dial silently loses wakes". The mitigation here preserves that
+	// visibility (a `trigger batch dispatch dial failed` warn line
+	// appears at every boot) without bricking the daemon when the
+	// trigger primitive isn't being exercised. Future work (PR-B):
+	// schedule a 30s reconnect ticker that retries the dial so a
+	// transient gatewayd-internal outage self-heals.
+	if synthTarget != "" {
+		triggerClient, triggerBase, triggerDialErr := sched.HTTPClientForGatewaySynthTarget(synthTarget)
+		if triggerDialErr != nil {
+			log.Warn("trigger batch dispatch dial: trigger tick will idle until gatewayd-internal is up",
+				"target", synthTarget, "err", triggerDialErr)
+		} else {
+			loop.WithGatewayHTTPClient(triggerClient, triggerBase)
+		}
+	} else {
+		log.Warn("trigger batch dispatch dial skipped: synthTarget empty (gatewayd-internal not wired in this schedd)")
+	}
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- loop.Run(ctx) }()
+
+	// Issue #757 / ADR-0NN (commit #16): trigger dispatch
+	// wakeups. Subscribe to the trigger_ready + trigger_changed
+	// channels and forward every payload as a single
+	// Loop.WakeupTriggers() nudge so an idle broker doesn't sit
+	// for a full 1s tick before the first batch. The 1s ticker
+	// remains the safety net (PR-C pattern).
+	//
+	// Audit finding #9: a failed first Subscribe was previously
+	// logged and the daemon kept running — the 1s ticker caught
+	// every trigger_ready notify that arrived during the outage,
+	// but a missed delivery on a stream-of-record entry stays
+	// missed until the trigger re-fires. Pair the boot-fatal
+	// (sibling to the dial above) with a 5s retry ticker so a
+	// transient Postgres blip recovers without a daemon restart.
+	triggerNotifC, triggerSubErr := db.SubscribeWithReconnect(ctx, pool,
+		[]string{db.NotifyTriggerReady, db.NotifyTriggerChanged}, log)
+	if triggerSubErr != nil {
+		log.Error("schedd: trigger notify first-subscribe failed; safety ticker + retry-loop running",
+			"err", triggerSubErr)
+		// Pair #5 + #9: spawn a retry loop so a transient blip
+		// doesn't strand the dispatch tick until next restart.
+		// 5s cadence balances (operator wants visibility) vs
+		// (Postgres LISTEN recovery is usually < 1s). On
+		// success we install the notifier exactly like the
+		// happy path.
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					ch, sErr := db.SubscribeWithReconnect(ctx, pool,
+						[]string{db.NotifyTriggerReady, db.NotifyTriggerChanged}, log)
+					if sErr != nil {
+						log.Warn("schedd: trigger notify subscribe retry failed",
+							"err", sErr)
+						continue
+					}
+					log.Info("schedd: trigger notify subscribe recovered")
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case _, ok := <-ch:
+							if !ok {
+								break
+							}
+							loop.WakeupTriggers()
+						}
+					}
+				}
+			}
+		}()
+	} else {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case _, ok := <-triggerNotifC:
+					if !ok {
+						return
+					}
+					loop.WakeupTriggers()
+				}
+			}
+		}()
+	}
 
 	// Issue #791 PR-D: fire-now is folded into loop.Run's existing
 	// LISTEN (db.NotifyCronRunNow is multiplexed onto the same

@@ -35,7 +35,21 @@ go run ./cmd/gregalectl manifest validate \
 
 # Validate your own manifest.
 go run ./cmd/gregalectl manifest validate --file=/path/to/splitbox.yaml
+
+# Generate the Ansible inventory and host_vars from the same manifest.
+go run ./cmd/gregalectl manifest ansible \
+    --manifest-file=/path/to/splitbox.yaml \
+    --output-dir=/tmp/faas-ansible
 ```
+
+Use `/tmp/faas-ansible/inventory/hosts.ini` with the bootstrap playbook
+or `make ANSIBLE_INVENTORY=/tmp/faas-ansible/inventory/hosts.ini
+bootstrap-compute`. The generated `ansible_host` and overlay addresses
+come from `fleet.hosts[].address`. The vmmd target keeps the private mTLS
+identity (`vmmd.faas`) and the manifest port; the generated
+`faas_internal_hosts` entries map that identity to the overlay address in
+`/etc/hosts`. Do not copy an IP into the committed
+`deploy/ansible/host_vars` files.
 
 The validator fails closed on every missing field, every
 malformed CIDR, every non-octal mode, every non-hex digest, and

@@ -6,13 +6,20 @@
 // re-enters the CLI.
 //
 // Operations:
-//   gregale secrets list   --app <slug>
-//   gregale secrets set    --app <slug> KEY=VALUE [--from-stdin]
-//   gregale secrets unset  --app <slug> KEY
+//   gregale secrets list   --app <slug> [--scope <name>]
+//   gregale secrets set    --app <slug> KEY=VALUE [--from-stdin] [--scope <name>]
+//   gregale secrets unset  --app <slug> KEY [--scope <name>]
 //
 // `--from-stdin` reads the value from stdin (one pair per line, KEY=VALUE)
 // for pipelines that need to avoid putting the plaintext in shell
 // history. Most usage is the inline form.
+//
+// `--scope` (ADR-092 PR-B) selects which env-scope the call targets;
+// the reserved sentinel `__all__` is rejected server-side as
+// env_scope_reserved on PUT/DELETE/POST (single-row writes) but is
+// accepted on GET (where it returns the nested `secrets_by_scope`
+// map). Omitted scope defaults to `default` server-side, so
+// pre-PR-B callers see no behaviour change.
 
 package main
 
@@ -24,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -41,6 +49,12 @@ var (
 	// line without a subprocess. Production wiring points at os.Stderr.
 	osStderr io.Writer = os.Stderr
 )
+
+// secretsCmdScopeFlag is the CLI flag name. Mirrors the
+// cmd/apid/handlers_env.go::scopeQueryParam literal — kept as a
+// distinct constant so a future rename is a one-line change here
+// and one-line change in the handler.
+const secretsCmdScopeFlag = "scope"
 
 func cmdSecrets(args []string) int {
 	parent, _ := lookupCliCommand("secrets")
@@ -71,18 +85,19 @@ func cmdSecrets(args []string) int {
 func secretsList(args []string) int {
 	fs := flag.NewFlagSet("secrets list", flag.ContinueOnError)
 	app := fs.String("app", "", "app slug")
+	scope := fs.String(secretsCmdScopeFlag, "", "env scope filter (omit for default; '__all__' returns nested secrets_by_scope)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *app == "" {
-		PrintUsage(os.Stderr, "usage: gregale secrets list --app <slug>", "secrets")
+		PrintUsage(os.Stderr, "usage: gregale secrets list --app <slug> [--scope <name>|__all__]", "secrets")
 		return 1
 	}
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	resp, err := client.ListSecrets(context.Background(), *app)
+	resp, err := client.ListSecretsWithScope(context.Background(), *app, *scope)
 	if err != nil {
 		return printErr("List failed", err)
 	}
@@ -93,11 +108,53 @@ func secretsList(args []string) int {
 		_, _ = fmt.Fprintf(osStdout, "%s: no secrets (0/%d)\n", *app, resp.Quota)
 		return 0
 	}
-	_, _ = fmt.Fprintf(osStdout, "%s: %d/%d secrets\n", *app, resp.Count, resp.Quota)
-	for _, s := range resp.Secrets {
-		_, _ = fmt.Fprintf(osStdout, "  %s\n", s.Key)
+	// ADR-092 PR-B: nested secrets_by_scope vs flat secrets is the
+	// discriminated union — render whichever arm the server returned.
+	if len(resp.SecretsByScope) > 0 {
+		renderSecretsByScope(osStdout, *app, &resp)
+		return 0
 	}
+	renderFlatSecrets(osStdout, *app, &resp)
 	return 0
+}
+
+// renderSecretsByScope emits the `__all__` arm of the secrets-list
+// discriminated union: a header summarising the cross-scope total,
+// then one section per scope (sorted ASC) listing "<scope>/<key>"
+// rows. Extracted from secretsList (commands3.go:85) so the routing
+// function stays under the 50-line cap (CLAUDE.md).
+//
+// Mirror of the env route's nested-map renderer at
+// cmd/gregale/commands_inspect.go — same shape, secrets-flavored.
+func renderSecretsByScope(w io.Writer, app string, resp *api.AppSecretListResponse) {
+	scopes := make([]string, 0, len(resp.SecretsByScope))
+	for s := range resp.SecretsByScope {
+		scopes = append(scopes, s)
+	}
+	sort.Strings(scopes)
+	_, _ = fmt.Fprintf(w, "%s: %d/%d secrets (across %d scopes)\n",
+		app, resp.Count, resp.Quota, len(scopes))
+	for _, s := range scopes {
+		for _, row := range resp.SecretsByScope[s] {
+			_, _ = fmt.Fprintf(w, "  %s/%s\n", s, row.Key)
+		}
+	}
+}
+
+// renderFlatSecrets emits the per-scope arm of the secrets-list
+// discriminated union: a header, then one row per secret rendered
+// as "<scope>/<key>". An empty Scope (legacy pre-PR-B server rows
+// without the column populated) renders as "default" — the same
+// server-side collapse that cmd/apid/handlers_secrets.go::scopeFromQuery
+// applies, kept symmetric in the CLI for human-readable output.
+//
+// Extracted from secretsList (commands3.go:85) so the routing
+// function stays under the 50-line cap (CLAUDE.md).
+func renderFlatSecrets(w io.Writer, app string, resp *api.AppSecretListResponse) {
+	_, _ = fmt.Fprintf(w, "%s: %d/%d secrets\n", app, resp.Count, resp.Quota)
+	for _, s := range resp.Secrets {
+		_, _ = fmt.Fprintf(w, "  %s/%s\n", scopeOrDefault(s.Scope), s.Key)
+	}
 }
 
 // --- set -------------------------------------------------------------------
@@ -106,11 +163,12 @@ func secretsSet(args []string) int {
 	fs := flag.NewFlagSet("secrets set", flag.ContinueOnError)
 	app := fs.String("app", "", "app slug")
 	fromStdin := fs.Bool("from-stdin", false, "read KEY=VALUE pairs from stdin (one per line)")
+	scope := fs.String(secretsCmdScopeFlag, "", "env scope to write into (omit for default)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *app == "" {
-		PrintUsage(os.Stderr, "usage: gregale secrets set --app <slug> KEY=VALUE [...] [--from-stdin]", "secrets")
+		PrintUsage(os.Stderr, "usage: gregale secrets set --app <slug> KEY=VALUE [...] [--from-stdin] [--scope <name>]", "secrets")
 		return 1
 	}
 
@@ -169,7 +227,7 @@ func secretsSet(args []string) int {
 	// so a hasty rotation doesn't leave the customer thinking the
 	// new value is live everywhere.
 	existing := map[string]bool{}
-	if list, err := client.ListSecrets(context.Background(), *app); err == nil {
+	if list, err := client.ListSecretsWithScope(context.Background(), *app, *scope); err == nil {
 		for _, s := range list.Secrets {
 			existing[s.Key] = true
 		}
@@ -182,17 +240,17 @@ func secretsSet(args []string) int {
 	}
 	if rotated > 0 {
 		_, _ = fmt.Fprintf(osStdout,
-			"note: %d secret(s) already existed and are being rotated.\n"+
+			"note: %d secret(s) already existed in scope=%q and are being rotated.\n"+
 				"  Any parked snapshots still hold the previous plaintext until the next wake.\n"+
 				"  Deploy, or call `gregale wake %s`, to force an overstamp.\n",
-			rotated, *app)
+			rotated, scopeOrDefault(*scope), *app)
 	}
 
 	for _, p := range pairs {
-		if err := client.SetSecret(context.Background(), *app, p.Key, p.Value); err != nil {
+		if err := client.SetSecretWithScope(context.Background(), *app, p.Key, p.Value, *scope); err != nil {
 			return printErr("Set "+p.Key+" failed", err)
 		}
-		PrintOK(osStdout, "%s set", p.Key)
+		PrintOK(osStdout, "%s set (scope=%s)", p.Key, scopeOrDefault(*scope))
 	}
 	// Move 1 PR-A: post-write quota stamp. After every successful
 	// set, follow up with a ListSecrets and print "<slug>: N/M
@@ -210,7 +268,11 @@ func secretsSet(args []string) int {
 	//   - both succeed   → "<slug>: N/M secrets"
 	//   - ListSecrets OK, plan unknown → "<slug>: N secrets" (no cap)
 	//   - ListSecrets fails → no stamp (can't compute N without it)
-	printSecretsQuotaStamp(client, *app)
+	//
+	// ADR-092 PR-B: stamp counts across all scopes (per-app-across
+	// scopes posture — pkg/api/limits.go::SecretCountMax doc). Pass
+	// scope="" to ListSecretsWithScope for the cross-scope total.
+	printSecretsQuotaStamp(client, *app, *scope)
 	return 0
 }
 
@@ -218,12 +280,28 @@ func secretsSet(args []string) int {
 // successful secrets set. Both inputs come from cheap GET endpoints;
 // failure is silent. Pulled out so the failure-mode logic stays out
 // of secretsSet's body.
-func printSecretsQuotaStamp(client *api.Client, app string) {
-	list, err := client.ListSecrets(context.Background(), app)
+//
+// scope is the customer's --scope flag value; the stamp calls
+// ListSecretsWithScope with scope="" to get the cross-scope total
+// (the per-app SecretCountMax counts across all scopes — see
+// pkg/api/limits.go).
+//
+// ADR-092 PR-B: the cross-scope total is `list.Count`, NOT
+// `len(list.Secrets)`. The scope="" query collapses server-side to
+// "default" (handlers_secrets.go::scopeFromQuery), so `Secrets`
+// only contains the default-scope rows — the prod/staging rows
+// silently drop. `list.Count` is the server-side cross-scope total
+// (handlers_secrets.go::listSecrets calls CountAppSecrets across
+// every scope). Using `len(list.Secrets)` would under-report for
+// any customer with non-default-scope rows.
+func printSecretsQuotaStamp(client *api.Client, app, scope string) {
+	_ = scope // accepted for symmetry with secretsSet; the stamp itself
+	// always reads the cross-scope total.
+	list, err := client.ListSecretsWithScope(context.Background(), app, "")
 	if err != nil {
 		return
 	}
-	used := len(list.Secrets)
+	used := list.Count
 	if acct, err := client.Whoami(context.Background()); err == nil {
 		if l, ok := api.LimitsFor(api.Plan(acct.Plan)); ok && l.SecretCountMax > 0 {
 			_, _ = fmt.Fprintf(osStdout, "%s: %d/%d secrets\n", app, used, l.SecretCountMax)
@@ -258,11 +336,12 @@ func parseSecretsPair(s string) (secretsPair, error) {
 func secretsUnset(args []string) int {
 	fs := flag.NewFlagSet("secrets unset", flag.ContinueOnError)
 	app := fs.String("app", "", "app slug")
+	scope := fs.String(secretsCmdScopeFlag, "", "env scope to delete from (omit for default)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *app == "" || fs.NArg() != 1 {
-		PrintUsage(os.Stderr, "usage: gregale secrets unset --app <slug> KEY", "secrets")
+		PrintUsage(os.Stderr, "usage: gregale secrets unset --app <slug> KEY [--scope <name>]", "secrets")
 		return 1
 	}
 	key := fs.Arg(0)
@@ -270,11 +349,24 @@ func secretsUnset(args []string) int {
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	if err := client.UnsetSecret(context.Background(), *app, key); err != nil {
+	if err := client.UnsetSecretWithScope(context.Background(), *app, key, *scope); err != nil {
 		return printErr("Unset failed", err)
 	}
-	PrintOK(osStdout, "%s unset", key)
+	PrintOK(osStdout, "%s unset (scope=%s)", key, scopeOrDefault(*scope))
 	return 0
+}
+
+// scopeOrDefault returns "default" for empty scope, else scope
+// itself. Used for human-facing messages (PrintOK / hint lines)
+// where an empty scope would render as "" and confuse the
+// customer — server-side, empty scope also collapses to "default"
+// via cmd/apid/handlers_env.go::scopeFromQuery, so the two
+// stay byte-equivalent.
+func scopeOrDefault(scope string) string {
+	if scope == "" {
+		return "default"
+	}
+	return scope
 }
 
 // --- list-all (account-wide) ----------------------------------------------

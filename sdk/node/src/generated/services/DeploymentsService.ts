@@ -8,6 +8,7 @@ import type { BuildResponse } from '../models/BuildResponse.js';
 import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.js';
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
+import type { RollbackRequest } from '../models/RollbackRequest.js';
 import type { ScanResult } from '../models/ScanResult.js';
 import type { SecretScanResult } from '../models/SecretScanResult.js';
 import type { SourceRefDeployRequest } from '../models/SourceRefDeployRequest.js';
@@ -213,13 +214,25 @@ export class DeploymentsService {
     });
   }
   /**
-   * Roll back to the previous deployment.
+   * Roll back to the previous deployment, or to a specific historical deployment.
+   * Without a request body, rolls back to the most-recent superseded
+   * deployment (the pre-#976 behaviour).
+   *
+   * With `target_deployment_id` in the body, rolls back to the
+   * named deployment. The id must belong to this app and the row
+   * must have `status='superseded'`. Rolling back to the
+   * already-current live deployment is rejected (409
+   * `rollback_target_already_live`). A target whose snapshot has
+   * been garbage-collected is rejected (409
+   * `rollback_target_snapshot_expired`).
+   *
    * @returns DeploymentResponse The deployment that was created by rolling back to the previous version.
    * @throws ApiError
    */
   public static rollbackApp({
     slug,
     idempotencyKey,
+    requestBody,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
@@ -231,6 +244,7 @@ export class DeploymentsService {
      *
      */
     idempotencyKey?: string,
+    requestBody?: RollbackRequest,
   }): CancelablePromise<DeploymentResponse> {
     return __request(OpenAPI, {
       method: 'POST',
@@ -241,9 +255,13 @@ export class DeploymentsService {
       headers: {
         'Idempotency-Key': idempotencyKey,
       },
+      body: requestBody,
+      mediaType: 'application/json',
       errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
-        409: `code: no_rollback_target — there is no superseded deployment to roll back to.`,
+        404: `code: rollback_target_not_found — the named target_deployment_id does not match any deployment of this app (or does not exist).`,
+        409: `code: no_rollback_target | rollback_target_already_live | rollback_target_snapshot_expired — rollback was rejected; see the response body for the specific code and detail.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

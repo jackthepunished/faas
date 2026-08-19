@@ -1243,3 +1243,125 @@ type AccountEgressAllowlistExtraResponse struct {
 	PlanCap  int `json:"plan_cap"`
 	MaxExtra int `json:"max_extra"`
 }
+
+// --- Triggers (issue #757 / ADR-100) ----------------------------------------
+// Wire shape for the unified event-source-mapping primitive. The
+// discriminator is TriggerKind. Five non-cron kinds share the same
+// batch/filter/retry/ReportBatchItemFailures machinery; cron keeps
+// (schedule, path) for backward compat with the robfig schedule
+// parser.
+
+// TriggerKind is the closed-vocabulary discriminator.
+type TriggerKind string
+
+const (
+	TriggerKindCron         TriggerKind = "cron"
+	TriggerKindKafka        TriggerKind = "kafka"
+	TriggerKindNATS         TriggerKind = "nats"
+	TriggerKindRedisStreams TriggerKind = "redis_streams"
+	TriggerKindSQSCompat    TriggerKind = "sqs_compat"
+	TriggerKindQueue        TriggerKind = "queue"
+)
+
+// Trigger is the wire shape returned by GET/POST/PATCH /v1/triggers.
+type Trigger struct {
+	ID            string          `json:"id"`
+	AccountID     string          `json:"account_id"`
+	AppID         string          `json:"app_id"`
+	Kind          TriggerKind     `json:"kind"`
+	Slug          string          `json:"slug,omitempty"`
+	Enabled       bool            `json:"enabled"`
+	Config        json.RawMessage `json:"config"`
+	BatchSizeMax  int             `json:"batch_size_max"`
+	BatchWindowMs int             `json:"batch_window_ms"`
+	MaxAttempts   int             `json:"max_attempts"`
+	Schedule      string          `json:"schedule,omitempty"`
+	Path          string          `json:"path,omitempty"`
+	CronID        string          `json:"cron_id,omitempty"`
+	Source        *string         `json:"source,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+}
+
+// CreateTriggerRequest creates a new trigger. Kind is immutable.
+type CreateTriggerRequest struct {
+	AppID         string          `json:"app_id"`
+	Kind          TriggerKind     `json:"kind"`
+	Slug          string          `json:"slug,omitempty"`
+	Enabled       *bool           `json:"enabled,omitempty"`
+	Config        json.RawMessage `json:"config,omitempty"`
+	BatchSizeMax  *int            `json:"batch_size_max,omitempty"`
+	BatchWindowMs *int            `json:"batch_window_ms,omitempty"`
+	MaxAttempts   *int            `json:"max_attempts,omitempty"`
+	Schedule      string          `json:"schedule,omitempty"`
+	Path          string          `json:"path,omitempty"`
+}
+
+// UpdateTriggerRequest is a partial update.
+type UpdateTriggerRequest struct {
+	Enabled       *bool           `json:"enabled,omitempty"`
+	Config        json.RawMessage `json:"config,omitempty"`
+	BatchSizeMax  *int            `json:"batch_size_max,omitempty"`
+	BatchWindowMs *int            `json:"batch_window_ms,omitempty"`
+	MaxAttempts   *int            `json:"max_attempts,omitempty"`
+	Schedule      *string         `json:"schedule,omitempty"`
+	Path          *string         `json:"path,omitempty"`
+}
+
+// TriggerRecord is the per-record audit row surfaced via GET
+// /v1/triggers/{id}/records.
+type TriggerRecord struct {
+	ID               string     `json:"id"`
+	TriggerID        string     `json:"trigger_id"`
+	ItemIdentifier   string     `json:"item_identifier"`
+	Payload          string     `json:"payload"`
+	Headers          string     `json:"headers"`
+	Metadata         string     `json:"metadata"`
+	State            string     `json:"state"`
+	Attempts         int        `json:"attempts"`
+	NextFireAt       time.Time  `json:"next_fire_at"`
+	ReceivedAt       time.Time  `json:"received_at"`
+	LastError        *string    `json:"last_error,omitempty"`
+	LastDispatchedAt *time.Time `json:"last_dispatched_at,omitempty"`
+}
+
+// TriggerRecordRetryRequest is the body of POST
+// /v1/triggers/{id}/records/{rid}/retry.
+type TriggerRecordRetryRequest struct{}
+
+// TriggerDeadLetter is the wire shape for one trigger_dead_letter row.
+type TriggerDeadLetter struct {
+	RecordID  string    `json:"record_id"`
+	TriggerID string    `json:"trigger_id"`
+	Reason    string    `json:"reason"`
+	RoutedTo  string    `json:"routed_to"`
+	Detail    string    `json:"detail"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ListTriggerRecordsResponse answers GET /v1/triggers/{id}/records.
+type ListTriggerRecordsResponse struct {
+	Records []TriggerRecord `json:"records"`
+}
+
+// ListTriggerDeadLetterResponse answers GET /v1/triggers/{id}/dlq.
+type ListTriggerDeadLetterResponse struct {
+	Records []TriggerDeadLetter `json:"records"`
+}
+
+// CreateTriggerBatchRequest is the body of POST
+// /v1/triggers:batch_create.
+type CreateTriggerBatchRequest struct {
+	AppID        string `json:"app_id"`
+	ManifestYAML string `json:"manifest_yaml"`
+}
+
+// TriggerMetricsResponse is the body of GET /v1/triggers/{id}/metrics.
+type TriggerMetricsResponse struct {
+	TriggerID       string `json:"trigger_id"`
+	PendingCount    int    `json:"pending_count"`
+	ClaimedCount    int    `json:"claimed_count"`
+	SucceededCount  int    `json:"succeeded_count"`
+	RetryCount      int    `json:"retry_count"`
+	DeadLetterCount int    `json:"dead_letter_count"`
+}

@@ -33,11 +33,10 @@
         create: false
         backrefs: false
       register: grub_rewrite
-      # Only rewrite when (a) the karg isn't already there AND
-      # (b) `GRUB_CMDLINE_LINUX=` line exists to rewrite.
+      # Rewrite when either required karg is absent. A conjunction here
+      # would skip repair when only one of the two is missing.
       when:
-        - "'cgroup_no_v1=0' not in grub_default.content | b64decode"
-        - "'systemd.unified_cgroup_hierarchy=1' not in grub_default.content | b64decode"
+        - "'cgroup_no_v1=0' not in grub_default.content | b64decode or 'systemd.unified_cgroup_hierarchy=1' not in grub_default.content | b64decode"
       notify: grub rebuild
 
   vars:

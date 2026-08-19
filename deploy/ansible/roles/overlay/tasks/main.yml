@@ -28,6 +28,25 @@
   ansible.builtin.include_tasks: wireguard.yml
   when: faas_overlay_provider == "wireguard"
 
+# The internal PKI is role-based (schedd.faas / vmmd.faas), while the
+# manifest carries the actual overlay address. Keep those concerns
+# separate: the generated inventory supplies this list and every box
+# receives the same deterministic aliases. Public Cloudflare DNS is not
+# involved in this private mTLS path.
+- name: overlay — install manifest private service aliases
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+    marker: "# {mark} FAAS MANIFEST PRIVATE SERVICES"
+    block: |
+      {% for entry in faas_internal_hosts | default([]) %}
+      {{ entry.address }} {{ entry.names | join(' ') }}
+      {% endfor %}
+  when: (faas_internal_hosts | default([]) | length) > 0
+
 # Cross-provider firewall rule: open the vmmd gRPC port on the
 # overlay interface only. Tailscale ACLs handle auth; this rule
 # is the kernel-level allow-list so the daemon port never binds on

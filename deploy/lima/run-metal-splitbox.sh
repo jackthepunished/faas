@@ -15,10 +15,12 @@
 #     FAAS_BOX_ROLE=compute-only  ./deploy/lima/run-metal-splitbox.sh
 #
 # What it does:
-#   1. gregalectl manifest validate --file deploy/manifest/splitbox.yaml
-#      (PR-7 §5 path; confirms the splitbox manifest shape is parseable
-#      and every required field is present on every host).
-#   2. gregalectl manifest render --manifest-file splitbox.yaml
+#   1. gregalectl manifest validate --file \
+#      deploy/manifest/examples/splitbox.example.yaml
+#      (PR-7 §5 path; confirms the checked-in splitbox example is parseable
+#      and every required field is present on every host). Set FAAS_MANIFEST
+#      to an operator-owned manifest for a real fleet.
+#   2. gregalectl manifest render --manifest-file "$MANIFEST"
 #      --host <this-host> --dry-run (PR-2; the renderer produces the
 #      per-host TOML tree without writing it).
 #   3. gregalectl release bundle --bin-dir <bin> --git-sha <sha>
@@ -56,13 +58,13 @@ set -euo pipefail
 # non-blocking.
 export FAAS_PG_DSN="${FAAS_PG_DSN:-postgres://faas@127.0.0.1:5432/faas?sslmode=disable}"
 
-# The manifest the harness validates and renders. splitbox.yaml is
-# the canonical two-host shape (PR-7 ships this alongside the existing
-# splitbox.example.yaml).
-MANIFEST="${FAAS_MANIFEST:-deploy/manifest/splitbox.yaml}"
+# The manifest the harness validates and renders. The checked-in example is
+# the clean-checkout default; a real fleet should pass its operator-owned
+# manifest through FAAS_MANIFEST.
+MANIFEST="${FAAS_MANIFEST:-deploy/manifest/examples/splitbox.example.yaml}"
 if [ ! -f "$MANIFEST" ]; then
   echo "ERROR: manifest $MANIFEST not found" >&2
-  echo "  Run from the repo checkout; splitbox.yaml is the canonical PR-7 example." >&2
+  echo "  Run from the repo checkout or set FAAS_MANIFEST to a valid manifest." >&2
   exit 1
 fi
 

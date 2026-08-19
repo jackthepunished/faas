@@ -549,6 +549,19 @@ const (
 	// with the same code. ADR-038 §Consequences Compatibility.
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"
+	// CodeRollbackTargetNotFound is returned when the caller passes an
+	// explicit target_deployment_id that doesn't match any deployment of
+	// this app (or doesn't exist at all). Distinct from
+	// CodeNoRollbackTarget (no superseded deployment exists at all) so
+	// the CLI can render different remediation: "wrong id" vs "deploy
+	// twice first". SAFE-RELEASES-G (issue #976).
+	CodeRollbackTargetNotFound = "rollback_target_not_found"
+	// CodeRollbackTargetAlreadyLive is returned when the caller passes
+	// an explicit target_deployment_id that exists but has status !=
+	// 'superseded' (e.g. status='live' — caller is asking to rollback
+	// to the already-current deployment). Rejected explicitly rather
+	// than silently no-op'd. SAFE-RELEASES-G.
+	CodeRollbackTargetAlreadyLive = "rollback_target_already_live"
 	// CodeDeploySignatureInvalid is returned by apid when the
 	// customer's OCI image deploy is rejected at the accept-time
 	// signature-enforcement gate (issue #472 / ADR-054). Three
@@ -2058,6 +2071,22 @@ const CodePlanWebhooksNotAllowed = "plan_webhooks_not_allowed"
 // can branch on upsell-vs-delete copy without parsing the body.
 const CodePlanWebhookQuota = "plan_webhook_quota"
 
+// CodePlanTriggersNotAllowed is the 402 the customer sees when
+// the plan doesn't unlock the unified Trigger primitive at all
+// (Free today, issue #757 / ADR-0NN). Mirrors CodePlanCronsNotAllowed
+// and CodePlanWebhooksNotAllowed. The handler rejects BEFORE loadApp
+// so a Free customer posting to a non-existent slug gets the upsell
+// instead of a 404 that would leak the slug's existence (PR review
+// finding F4 mirrored from createAlertRule / createAppWebhook).
+const CodePlanTriggersNotAllowed = "plan_triggers_not_allowed"
+
+// CodePlanTriggerQuota is the 403 the customer sees when the plan
+// DOES unlock triggers but the per-app or per-account cap was
+// reached. Distinct from CodePlanTriggersNotAllowed so the CLI
+// can branch on upsell-vs-delete copy without parsing the body.
+// Mirrors CodePlanCronQuota / CodePlanWebhookQuota.
+const CodePlanTriggerQuota = "plan_trigger_quota"
+
 // CodePlanLogArchiveNotAllowed is the 402 the customer sees when
 // they request ?archive=1 against an app on a plan whose
 // LogArchiveEnabled() returns false (Free today, issue #562).
@@ -2296,6 +2325,37 @@ func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem 
 		WithDocs(docsBase + "/plans#webhooks")
 }
 
+// ErrPlanTriggersNotAllowed is returned by apid's createTrigger /
+// listTriggers handlers when the customer's plan has
+// TriggerLimitPerApp == 0 (Free today, issue #757 / ADR-0NN).
+// Fires BEFORE loadApp so a Free customer posting to a non-existent
+// slug gets a clean 402 instead of a 404 (and the reverse — a
+// Free customer on a real slug gets 402, not a 404 masquerading as
+// plan-gating). PR review finding F4 mirrored from createAlertRule
+// and createAppWebhook.
+func ErrPlanTriggersNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanTriggersNotAllowed,
+		"Triggers unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include event-source mappings (Kafka, NATS, Redis Streams, SQS-compatible, in-platform queue); upgrade to Hobby or above to subscribe.", p)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
+// ErrPlanTriggerQuota is returned when CreateTriggerIfUnderQuota
+// surfaces a *state.TriggerQuotaError. Scope "app" or "account"
+// tells the handler which cap fired so the body can name it. 403
+// (not 402) because the plan DOES unlock triggers — the right
+// copy is "delete a trigger to add another", not "upgrade to
+// Hobby". Mirrors ErrPlanCronQuota / ErrPlanWebhookQuota.
+func ErrPlanTriggerQuota(plan Plan, scope string, limit, observed int) *Problem {
+	scopeName := PlanQuotaScopeDisplayName(scope)
+	return NewProblem(http.StatusForbidden, CodePlanTriggerQuota,
+		"Trigger limit reached",
+		fmt.Sprintf("%s plan caps triggers at %d for %s; you have %d. Delete one to add another.",
+			plan, limit, scopeName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
 // ErrAppWebhookInvalid is returned for malformed webhook bodies:
 // missing target_url, invalid retry_policy, out-of-vocabulary event,
 // oversize webhook_secret, etc. Mirrors ErrAlertRuleInvalid.
@@ -2496,6 +2556,32 @@ func ErrNoRollbackTarget() *Problem {
 	return NewProblem(http.StatusConflict, CodeNoRollbackTarget,
 		"No previous deployment",
 		"there's no superseded deployment to roll back to; deploy at least twice.").
+		WithDocs(docsBase + "/deploys#rollback")
+}
+
+// ErrRollbackTargetNotFound is returned by POST /v1/apps/{slug}/rollback when
+// the caller passes an explicit target_deployment_id (SAFE-RELEASES-G) that
+// does not match any deployment of this app, or does not exist. The detail
+// names the bad id so the CLI can echo it back. 404 (not 409) because the
+// resource the caller asked for genuinely doesn't exist — distinct from
+// CodeNoRollbackTarget (409: "no superseded deployment exists at all").
+func ErrRollbackTargetNotFound(detail string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeRollbackTargetNotFound,
+		"Rollback target not found",
+		detail).
+		WithDocs(docsBase + "/deploys#rollback")
+}
+
+// ErrRollbackTargetAlreadyLive is returned when the caller passes an
+// explicit target_deployment_id that exists but has status != 'superseded'
+// (most commonly status='live'). Caller asked to "rollback" to the
+// already-current deployment. Rejected explicitly rather than silently
+// no-op'd per the SAFE-RELEASES-G plan. 409 because the request is
+// well-formed but cannot proceed in current state.
+func ErrRollbackTargetAlreadyLive(detail string) *Problem {
+	return NewProblem(http.StatusConflict, CodeRollbackTargetAlreadyLive,
+		"Rollback target is already live",
+		detail).
 		WithDocs(docsBase + "/deploys#rollback")
 }
 

@@ -235,10 +235,12 @@ func render(opts RenderOptions) (RenderReport, error) {
 		// is the bridge the renderer owns. renderTOML accepts
 		// either form via registryToHostKey.
 		tomlBody, _, err := renderTOML(tomlRenderCtx{
-			Daemon:     d,
-			DC:         dc,
-			AppsDomain: m.DNS.AppsDomain,
-			HostSANs:   hostSANs,
+			Daemon:      d,
+			DC:          dc,
+			AppsDomain:  m.DNS.AppsDomain,
+			HostSANs:    hostSANs,
+			HostName:    host.Name,
+			HostAddress: host.Address,
 		})
 		if err != nil {
 			return report, err

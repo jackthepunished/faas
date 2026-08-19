@@ -146,6 +146,9 @@ jobs:
       - name: build
         run: make build
 
+      - name: systemd hardening gate
+        run: make systemd-hardening-check
+
       # +incompatible direct-dep gate (release blocker B1). Today this
       # flags github.com/stripe/stripe-go v70.15.0+incompatible (go.mod:25)
       # — v70 pre-dates the modern lookup_key primitive on PlanParams
@@ -217,12 +220,8 @@ jobs:
           pip install --quiet 'ansible-core==2.21.2'
           cd deploy/ansible
           ansible-galaxy collection install -r requirements.yml
-          ansible-playbook --syntax-check site.yml
-          # Gate-B PR-2: also syntax-check the new per-box bootstrap
-          # playbook so the three plays (control_plane, compute_nodes,
-          # box) parse before any operator can `make bootstrap-control-plane`
-          # against a half-baked inventory. site.yml stays as the legacy
-          # single-box shape pinned for the existing daemons.
+          # Gate-B: syntax-check the only production bootstrap playbook
+          # before an operator can run either role-specific target.
           ansible-playbook --syntax-check bootstrap.yml
 
       # Daemon smoke: every cmd/<daemon>/main.go is a one-box binary that wires
@@ -1122,7 +1121,10 @@ jobs:
   e2e-shard1:
     name: e2e (shard 1 — 18 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The test command has a 15m package timeout; leave runner cleanup
+    # headroom so slow shared runners fail with the test result instead of
+    # being cancelled by the job budget first.
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1171,7 +1173,7 @@ jobs:
   e2e-shard2:
     name: e2e (shard 2 — 15 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1220,7 +1222,7 @@ jobs:
   e2e-shard3:
     name: e2e (shard 3 — 24 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -1269,7 +1271,7 @@ jobs:
   e2e-shard4:
     name: e2e (shard 4 — 22 tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15

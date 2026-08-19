@@ -2921,11 +2921,19 @@ type AppSecret struct {
 // Ciphertext is the same age-sealed Envelope that AppSecret carries;
 // the handler emits it base64-encoded on the wire (paginated walk
 // orders by (app_slug ASC, key ASC), so the cursor is the pair).
+//
+// Scope is the env-scope identifier attached at write time
+// (ADR-092 PR-B). Always 'default' for legacy rows backfilled via
+// the column DEFAULT (migration 00217, PR-A). The account-wide
+// list crosses scopes — a customer with prod + staging rows
+// needs the scope echoed alongside (app_slug, key) so the
+// dashboard can group by scope without a second GET.
 type AccountAppSecret struct {
 	AccountID  string
 	AppID      string
 	AppSlug    string
 	Key        string
+	Scope      string
 	Ciphertext []byte
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
@@ -3585,6 +3593,12 @@ type EdgeRuleValidateAction struct {
 	ApplyWhileStreaming bool            `json:"apply_while_streaming,omitempty"`
 	RejectOnUnknown     bool            `json:"reject_on_unknown_fields,omitempty"`
 	MaxBodyBytes        int             `json:"max_body_bytes,omitempty"`
+	// ValidateMode (issue #975 #3 / Mega-Foundation #979-a)
+	// mirrors the wire-side field. Default empty == 'block' to
+	// match the schema-side default at 00293. The state mirror
+	// is intentionally permissive — the closed-set enforcement
+	// lives at the apid write boundary (pkg/api.Validate).
+	ValidateMode string `json:"validate_mode,omitempty"`
 }
 
 // EdgeRuleLimitAction carries the per-rule body caps for kind=limit.

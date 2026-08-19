@@ -88,8 +88,14 @@
       </form>
 
       <h2>GitHub</h2>
-      <p>Connect a GitHub App to enable push-to-deploy. Slice 8 wires this button; today it's a stub.</p>
-      <button type="button" disabled>Connect GitHub (coming in M7.5 slice 8)</button>
+      <p>Connect a GitHub App to enable push-to-deploy and the dashboard's deploy wizard (issue #961 / Mega-B PR-3). The dashboard handles the OAuth handshake server-side; the install token never crosses an API key.</p>
+      <form method="POST" action="/dashboard/install/connect">
+        <input type="hidden" name="csrf_token" value="{{.Data.ConnectGithubConfirmToken}}">
+        <button type="submit" class="btn-cta">Connect GitHub</button>
+      </form>
+      <p class="muted" style="margin-top:0.5rem">
+        Or from the dashboard: <a href="/dashboard/apps/new">Deploy from the dashboard →</a>
+      </p>
 
       {{if .Data.FlashSurface}}
         <p class="flash" style="background:#fffbe6;border:1px solid #f0c000;padding:0.5rem 0.75rem;margin:1rem 0;border-radius:4px;">{{.Data.FlashSurface}}</p>

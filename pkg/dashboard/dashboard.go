@@ -682,6 +682,12 @@ type AccountData struct {
 	ShowRestore         bool
 	RestoreUntil        string
 	RestoreConfirmToken string
+	// ConnectGithubConfirmToken (issue #961 / Mega-B PR-3) backs the
+	// dashboard's "Connect GitHub" button. The form posts to
+	// /dashboard/install/connect with this token + the matching
+	// faas_csrf sidecar cookie. Same envelope shape as the delete /
+	// restore tokens above — sealed by (action, account_id).
+	ConnectGithubConfirmToken string
 	// FlashSurface holds "scheduled for deletion" / "restored" banners
 	// the dashboard reads from ?deleted=1 / ?restored=1 in the URL.
 	// Kept here (not Page.Flash) so the danger-zone partial stays a

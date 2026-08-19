@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,10 +45,31 @@ const reaperParkTimeout = 2 * time.Minute
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-	pool               *pgxpool.Pool
-	engine             *Engine
-	log                *slog.Logger
-	gateway            GatewaySynth
+	pool    *pgxpool.Pool
+	engine  *Engine
+	log     *slog.Logger
+	gateway GatewaySynth
+	// Issue #757 / ADR-0NN (commit #14): the trigger dispatch tick
+	// posts batch envelopes to the gateway's batch endpoint.
+	// gatewayHTTPClient + gatewayBaseURL carry the http.Client +
+	// base URL so dispatch_triggers.go doesn't have to reach
+	// through the GatewaySynth interface.
+	gatewayHTTPClient *http.Client
+	gatewayBaseURL    string
+	// triggerPollers caches one triggerSource per trigger id. The
+	// cache is invalidated by NotifyTriggerChanged (commit #16);
+	// for now we never rebuild within a process lifetime.
+	triggerPollers map[string]triggerSource
+	// rateLimiter is the per-app wake rate limiter (shared with
+	// cron dispatch via pkg/sched/rate_limit.go).
+	rateLimiter *WakeRateLimiter
+	// triggerWakeup is the channel-side wakeup signal the schedd's
+	// pg_notify subscriber delivers on every NotifyTriggerReady +
+	// NotifyTriggerChanged payload (commit #16). The Loop's run
+	// selects on it alongside the 1s ticker so an idle broker
+	// doesn't sit for a full 1s tick before the first batch.
+	triggerWakeup      chan struct{}
+	triggerWakeupOnce  sync.Once
 	now                func() time.Time
 	flowCounts         FlowCounter
 	ops                *wire.OpsMetrics       // issue #171 shared registry; nil safe
@@ -191,6 +213,23 @@ func (l *Loop) WithInstanceStats(p InstanceStatsPoller) *Loop {
 // dialing the gateway socket; tests inject a recording stub.
 func (l *Loop) WithGatewaySynth(g GatewaySynth) *Loop {
 	l.gateway = g
+	return l
+}
+
+// WithGatewayHTTPClient wires the HTTP transport used by the ESM
+// batch dispatcher (issue #757 / ADR-100, commit #14). The cron
+// path uses WithGatewaySynth above (RPC over unix socket); the
+// trigger dispatch path posts JSON envelopes to the gateway's
+// /v1/invocations:dispatch_batch endpoint over plain HTTP. The
+// reason for the split is that the batch endpoint reuses the
+// existing gateway HTTP server's mux (no separate dial needed).
+//
+// baseURL must include scheme + host + port but NOT a trailing
+// slash (postBatch concatenates "/v1/invocations:dispatch_batch").
+// nil opts out (tests that don't exercise the dispatch tick).
+func (l *Loop) WithGatewayHTTPClient(client *http.Client, baseURL string) *Loop {
+	l.gatewayHTTPClient = client
+	l.gatewayBaseURL = baseURL
 	return l
 }
 
@@ -577,6 +616,25 @@ func (l *Loop) Run(ctx context.Context) error {
 		deadNodeReconcilerT = time.NewTicker(l.deadNodeReconciler.interval)
 		defer deadNodeReconcilerT.Stop()
 	}
+	// Trigger dispatch ticker (issue #757 / ADR-100, commit #14).
+	// 1 s cadence matches runCronTick and the §6.1 watchdog — a
+	// trigger record sitting in `pending` for >1 tick before
+	// dispatch is acceptable because broker pullers fill the
+	// pending bucket from a side channel (commits #9-12). The
+	// wakeup channel WakeupTriggers() drops into selects the
+	// next-tick latency for batches that land mid-cycle.
+	triggerT := time.NewTicker(time.Second)
+	defer triggerT.Stop()
+
+	// Make sure the triggerWakeup channel exists before any
+	// wakeup can race the first select iteration. WakeupTriggers
+	// uses sync.Once internally too — this is the belt-and-braces
+	// pre-create so a goroutine that calls WakeupTriggers from
+	// the subscrib-er ring before run() reaches the select never
+	// deadlocks on a nil channel.
+	l.triggerWakeupOnce.Do(func() {
+		l.triggerWakeup = make(chan struct{}, 1)
+	})
 
 	for {
 		select {
@@ -627,6 +685,17 @@ func (l *Loop) Run(ctx context.Context) error {
 			// drainPendingFireNowRequests is the single owner of the
 			// claim + dispatch loop.
 			l.drainPendingFireNowRequests(ctx)
+		case <-triggerT.C:
+			// Issue #757 / ADR-100: trigger dispatch tick. 1s
+			// safety cadence; WakeupTriggers advances the
+			// effective interval when a broker ack/nack wakes the
+			// schedd mid-cycle (commits #16).
+			l.runTriggerTick(ctx)
+		case <-l.triggerWakeup:
+			// Same arm as the 1s ticker. The wake channel is
+			// buffered-size-1 so a burst of broker deliveries
+			// coalesces to a single tick.
+			l.runTriggerTick(ctx)
 		}
 	}
 }
@@ -712,6 +781,26 @@ func floorTick(t *time.Ticker) <-chan time.Time {
 	}
 	return t.C
 }
+
+// httpUnixBasePrefix is the synthesized URL prefix for
+// gatewayd-internal when dialed over a unix socket. The dialer
+// writes bytes directly to the socket, so the request line carries
+// "http://<path>" — this constant is shared by DialGatewaySynth,
+// DialGatewaySynthTarget, and HTTPClientForGatewaySynthTarget so
+// goconst doesn't flag the string literal three times across the
+// three sibling functions.
+const httpUnixBasePrefix = "http://unix"
+
+// httpScheme + httpsScheme are the URL schemes for the gatewayd-internal
+// synth dial when the dial is TCP or DNS. httpScheme is the TLS-off
+// fallback; httpsScheme is used when tlsCfg is non-nil. Two
+// sibling functions (DialGatewaySynthTarget + HTTPClientForGatewaySynthTarget)
+// each reference both — collapse into constants so goconst doesn't flag
+// the literal three times across the package.
+const (
+	httpScheme  = "http"
+	httpsScheme = "https"
+)
 
 // MaxParksPerTickPerApp bounds the aggressive-reaper (issue #171)
 // per-app per-tick park count. Without a cap, a single tick could
@@ -1693,7 +1782,7 @@ func DialGatewaySynth(socketPath string, log *slog.Logger) (GatewaySynth, error)
 	c := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 	return &httpGatewaySynth{
 		client:     c,
-		basePrefix: "http://unix",
+		basePrefix: httpUnixBasePrefix,
 		log:        log,
 	}, nil
 }
@@ -1733,13 +1822,13 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 		}
 		return &httpGatewaySynth{
 			client:     &http.Client{Transport: tr, Timeout: 30 * time.Second},
-			basePrefix: "http://unix",
+			basePrefix: httpUnixBasePrefix,
 			log:        log,
 		}, nil
 	case wire.SchemeTCP, wire.SchemeDNS:
-		scheme := "http"
+		scheme := httpScheme
 		if tlsCfg != nil {
-			scheme = "https"
+			scheme = httpsScheme
 		}
 		tr := &http.Transport{
 			TLSClientConfig:       tlsCfg,
@@ -1752,6 +1841,56 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 		}, nil
 	default:
 		return nil, fmt.Errorf("sched: gateway synth target scheme %q not supported", t.Scheme)
+	}
+}
+
+// HTTPClientForGatewaySynthTarget (issue #757 / ADR-100, commit #14)
+// returns the http.Client + base URL the trigger dispatch tick uses
+// to POST batch envelopes at the gateway's
+// /v1/invocations:dispatch_batch endpoint.
+//
+// The cron path uses DialGatewaySynthTarget above (it wraps the
+// transport in a GatewaySynth interface and ships cron through the
+// legacy handlers). The trigger batch path uses raw http.Client
+// because the batch endpoint's contract is plain JSON request /
+// per-record JSON response (commits #13); wrapping that in a
+// GatewaySynth-shaped interface would force a new method on the
+// interface and invalidate every test stub that implements the
+// surface (cron_loop_test.go in particular).
+//
+// target is the same wire.ParseTarget-style URL the cron path uses
+// — "unix:///run/faas/gatewayd-internal.sock" for one-box,
+// "tcp://host:port" or "dns://gatewayd-internal.service" for
+// multi-box (placement scheduler PR / ADR-025 axis 3 Q8). The
+// returned baseURL is what dispatch_triggers.go::postBatch
+// concatenates with "/v1/invocations:dispatch_batch".
+//
+// TLS is not supported here (the batch endpoint inherits the
+// gateway's own TLS posture — if the unix socket is the dial the
+// socket IS the auth; if tcp is the dial the cluster operator
+// wires a sidecar). If a future change adds TLS to the batch
+// endpoint, thread a *tls.Config through this signature.
+func HTTPClientForGatewaySynthTarget(target string) (*http.Client, string, error) {
+	if target == "" {
+		return nil, "", errors.New("sched: gateway synth target is empty")
+	}
+	t, err := wire.ParseTarget(target)
+	if err != nil {
+		return nil, "", fmt.Errorf("sched: gateway synth parse %q: %w", target, err)
+	}
+	switch t.Scheme {
+	case wire.SchemeUnix:
+		tr := &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", t.Address)
+			},
+		}
+		return &http.Client{Transport: tr, Timeout: 60 * time.Second}, httpUnixBasePrefix, nil
+	case wire.SchemeTCP, wire.SchemeDNS:
+		scheme := httpScheme
+		return &http.Client{Timeout: 60 * time.Second}, scheme + "://" + t.Address, nil
+	default:
+		return nil, "", fmt.Errorf("sched: gateway synth target scheme %q not supported", t.Scheme)
 	}
 }
 

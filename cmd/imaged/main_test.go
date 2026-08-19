@@ -91,6 +91,26 @@ func TestOverrideGate_BareTagRejected(t *testing.T) {
 	}
 }
 
+func TestBuilderBaseRef_MultiBoxRequiresDigest(t *testing.T) {
+	t.Setenv("FAAS_NODE_NAME", "fsn-2")
+	t.Setenv("FAAS_BUILDER_BASE_REF", "")
+	if _, err := builderBaseRefFromEnv(); err == nil {
+		t.Fatal("builderBaseRefFromEnv() accepted an unset ref on a named host")
+	}
+}
+
+func TestBuilderBaseRef_SingleBoxKeepsDevelopmentDefault(t *testing.T) {
+	t.Setenv("FAAS_NODE_NAME", "")
+	t.Setenv("FAAS_BUILDER_BASE_REF", "")
+	got, err := builderBaseRefFromEnv()
+	if err != nil {
+		t.Fatalf("builderBaseRefFromEnv() = error %v", err)
+	}
+	if got != "ghcr.io/poyrazk/builder-base:latest" {
+		t.Fatalf("builderBaseRefFromEnv() = %q, want development builder default", got)
+	}
+}
+
 // sha256hex64 returns a 64-hex-char fake sha256 digest. Used only to
 // satisfy the `sha256:<64 hex>` shape that oci.ParseReference requires;
 // the bytes themselves are not cryptographically meaningful.

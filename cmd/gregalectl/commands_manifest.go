@@ -39,6 +39,7 @@ import (
 const (
 	subValidate = "validate"
 	subRender   = "render"
+	subAnsible  = "ansible"
 )
 
 // cmdManifestDispatch is the parent dispatcher. With zero args it
@@ -54,11 +55,13 @@ func cmdManifestDispatch(args []string) int {
 		return cmdManifestValidate(args[1:])
 	case subRender:
 		return cmdManifestRender(args[1:])
+	case subAnsible:
+		return cmdManifestAnsible(args[1:])
 	case flagHelpShort, flagHelpLong:
 		printManifestUsage(os.Stderr)
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "gregalectl manifest: unknown subcommand %q (expected: validate, render)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregalectl manifest: unknown subcommand %q (expected: validate, render, ansible)\n", args[0])
 		return 1
 	}
 }
@@ -71,6 +74,8 @@ Subcommands:
   render      Render a validated manifest to /etc/faas/*.toml +
               systemd units + cgroup subtree_control + PKI leaves
               (canonical path: pkg/renderer.Render)
+  ansible     Generate an inventory + host_vars tree from the same
+              manifest (use it as the Ansible inventory source)
 
 Flags (validate):
   --file PATH   Path to the manifest YAML file (required).
@@ -89,6 +94,13 @@ Flags (render):
   --dry-run                Compute all outputs but do not write.
   --json                   Emit JSON output instead of human-readable text.
 
+Flags (ansible):
+  --manifest-file PATH     Path to the manifest YAML file (required).
+  --output-dir DIR         Generated Ansible root (required).
+  --force                  Replace differing generated files.
+  --dry-run                Print planned files without writing.
+  --json                   Emit JSON output instead of human-readable text.
+
 Exit codes:
   0  Manifest is valid / render succeeded (or short-circuited).
   1  Manifest is invalid (one or more validation errors) / render
@@ -100,6 +112,7 @@ Examples:
   gregalectl manifest validate --file=deploy/manifest/examples/splitbox.example.yaml
   gregalectl manifest validate --file=splitbox.yaml --json
   gregalectl manifest render --manifest-file=splitbox.yaml --host=fsn-1 --dry-run --json
+  gregalectl manifest ansible --manifest-file=splitbox.yaml --output-dir=/tmp/faas-ansible
 `)
 }
 

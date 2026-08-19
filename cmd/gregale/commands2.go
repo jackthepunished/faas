@@ -1306,18 +1306,51 @@ func cmdDeployTarball(args []string) int {
 }
 
 // cmdRollback, cmdPark, cmdWake implement their eponymous routes.
+//
+// SAFE-RELEASES-G (issue #976, PR-G): cmdRollback now honours an
+// optional `--to <deployment_id>` flag. When set, the handler validates
+// that the named deployment (a) belongs to this app and (b) has
+// status='superseded', and returns a typed error otherwise. When
+// omitted, behaviour is unchanged — rollback to the most-recent
+// superseded deployment. --json (top-level) emits the
+// DeploymentResponse on stdout for SDK / e2e consumers.
 func cmdRollback(args []string) int {
-	if len(args) != 1 {
-		PrintUsage(os.Stderr, "usage: gregale rollback <slug>", "rollback")
+	if len(args) < 1 {
+		PrintUsage(os.Stderr, "usage: gregale rollback <slug> [--to <deployment_id>] [--json]", "rollback")
 		return 1
+	}
+	slug := args[0]
+	var to string
+	rest := args[1:]
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		switch {
+		case a == "--to":
+			if i+1 >= len(rest) {
+				return printErr("Missing value", fmt.Errorf("--to requires a deployment_id"))
+			}
+			to = rest[i+1]
+			i++ // consume the value
+		case strings.HasPrefix(a, "--to="):
+			to = a[len("--to="):]
+		default:
+			return printErr("Unknown flag", fmt.Errorf("%q (rollback accepts no positional after <slug>)", a))
+		}
 	}
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	dep, err := client.Rollback(context.Background(), args[0])
+	dep, err := client.RollbackTo(context.Background(), slug, to)
 	if err != nil {
 		return printErr("Rollback failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(dep))
+	}
+	if to != "" {
+		PrintOK(osStdout, "Rolled back to %s (%s) via explicit target %s", dep.ID, dep.Status, to)
+		return 0
 	}
 	PrintOK(osStdout, "Rolled back to %s (%s)", dep.ID, dep.Status)
 	return 0

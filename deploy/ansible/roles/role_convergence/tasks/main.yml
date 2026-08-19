@@ -1,0 +1,122 @@
+---
+# role_convergence is the subtractive half of the deployment contract.
+# The daemon roles install the units they own; this role removes the
+# dangerous residue left by an older one-box or manually reconfigured host.
+
+- name: role_convergence — require an explicit production role
+  ansible.builtin.assert:
+    that:
+      - faas_box_role in ['control-plane', 'compute-only']
+      - faas_node_name is defined
+      - faas_node_name | length > 0
+      - >-
+        (faas_box_role == 'control-plane' and 'control_plane' in group_names)
+        or
+        (faas_box_role == 'compute-only' and 'compute_nodes' in group_names)
+    fail_msg: >-
+      role/inventory mismatch: faas_box_role={{ faas_box_role | default('unset') }},
+      faas_node_name={{ faas_node_name | default('unset') }},
+      groups={{ group_names | join(',') }}. Use the manifest-generated
+      control_plane or compute_nodes inventory; the legacy single-box path
+      is not supported for production hosts.
+
+- name: role_convergence — select the allowed daemon set
+  ansible.builtin.set_fact:
+    faas_role_allowed_units: >-
+      {{ faas_control_plane_units if faas_box_role == 'control-plane'
+         else faas_compute_only_units }}
+
+- name: role_convergence — select the forbidden daemon set
+  ansible.builtin.set_fact:
+    faas_role_forbidden_units: >-
+      {{ (faas_compute_only_units + faas_legacy_units)
+         if faas_box_role == 'control-plane'
+         else (faas_control_plane_units + faas_legacy_units) }}
+
+- name: role_convergence — stop and disable opposite-role services when present
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop: "{{ faas_role_forbidden_units }}"
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
+
+- name: role_convergence — mask opposite-role services even when absent
+  ansible.builtin.file:
+    src: /dev/null
+    dest: "/etc/systemd/system/{{ item }}"
+    state: link
+    force: true
+  loop: "{{ faas_role_forbidden_units }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: role_convergence — inspect opposite-role masks
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ item }}"
+    follow: false
+  loop: "{{ faas_role_forbidden_units }}"
+  loop_control:
+    label: "{{ item }}"
+  register: faas_forbidden_mask_stats
+
+- name: role_convergence — verify opposite-role masks exist
+  ansible.builtin.assert:
+    that:
+      - item.stat.islnk | default(false)
+      - item.stat.lnk_source | default('') == '/dev/null'
+    fail_msg: "failed to mask forbidden service {{ item.item }}"
+  loop: "{{ faas_forbidden_mask_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: role_convergence — reload systemd after topology cleanup
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: role_convergence — unmask allowed services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    masked: false
+    daemon_reload: true
+  loop: "{{ faas_role_allowed_units }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: role_convergence — verify role drop-ins exist for allowed services
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ item }}.d/99-faas-role.conf"
+  loop: "{{ faas_role_allowed_units }}"
+  loop_control:
+    label: "{{ item }}"
+  register: faas_role_dropins
+
+- name: role_convergence — fail if an allowed service lacks its role drop-in
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: >-
+      {{ item.item }} is allowed for {{ faas_box_role }} but its
+      99-faas-role.conf drop-in is missing. Refusing to leave a service
+      dependent on the single-box default.
+  loop: "{{ faas_role_dropins.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: role_convergence — verify forbidden services are inactive
+  ansible.builtin.command: "systemctl is-active {{ item }}"
+  register: faas_forbidden_states
+  changed_when: false
+  failed_when: false
+  loop: "{{ faas_role_forbidden_units }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: role_convergence — fail if a forbidden service remains active
+  ansible.builtin.assert:
+    that: item.rc != 0
+    fail_msg: "{{ item.item }} remains active on {{ faas_box_role }} {{ faas_node_name }}"
+  loop: "{{ faas_forbidden_states.results }}"
+  loop_control:
+    label: "{{ item.item }}"

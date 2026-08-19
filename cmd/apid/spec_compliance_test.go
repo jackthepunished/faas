@@ -44,7 +44,8 @@ const (
 	webhooksFile  = "webhooks.go"      // issue #476 / ADR-076
 	billingFile   = "billing.go"       // PR-P3 — admin reconcile + future billing DTOs
 	diffFile      = "diff.go"          // PR-1 of the deploy-diff cluster — DiffRequest / DiffResponse wire DTOs
-	upstreamsFile = "upstreams.go"     // ADR-098 §9.A PR-B — upstreams wire DTOs
+	upstreamsFile = "upstreams.go"     // ADR-098 §9.A PR-B
+	triggerFile   = "trigger.go"       // issue #757 / ADR-100 — trigger primitive wire DTOs
 	oidcFile      = "oidc.go"          // ADR-101 / PR-A — OIDC / keyless deploy auth DTOs
 )
 
@@ -106,6 +107,14 @@ var routeExclude = map[string]bool{
 	"GET /healthz":                                    true, // loopback infra probe
 	"GET /v1/orgs/me":                                 true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
 	"GET /v1/traces/{trace_id}":                       true, // issue #555: gatewayd-public trace endpoint (mounted via bare /v1/traces/ prefix; the scanner doesn't match it)
+	// Issue #961 / Mega-B PR-3 / ADR-116. The dashboard's
+	// /dashboard/apps/new wizard renders GET /v1/templates as the
+	// "Starting template" dropdown. Cookie-session-authenticated
+	// (NOT API-key) — the dashboard is the install-token trust root
+	// per ADR-116. Mirror the exclusion in
+	// cmd/sdk-coverage/main.go::routeExclude; the two lists must
+	// move together.
+	"GET /v1/templates": true, // dashboard wizard hydrates from this; session-cookie-only
 }
 
 // dtoExclude lists pkg/api exported DTOs that are intentionally not in the
@@ -160,6 +169,21 @@ var dtoExclude = map[string]bool{
 	"CreateTenantSurfaceRequest": true,
 	"ListTenantSurfacesResponse": true,
 	"AddTenantHostnameRequest":   true,
+	// Issue #757 / ADR-100 — typed empty placeholder for
+	// POST /v1/triggers/{id}/records/{rid}/{retry,drop}. The route
+	// takes no body, but the handler signature prefers a typed
+	// request struct over `any` for spec-check parity. The spec
+	// documents the 204 response only; this struct does not
+	// traverse the wire.
+	"TriggerRecordRetryRequest": true,
+	// CreateTriggerBatchResult is the per-row shape inside the
+	// CreateTriggerBatchResponse.Created array. Defined as a
+	// distinct Go struct so the JSON tag layout reads cleanly,
+	// but the spec describes it inline (api/openapi.yaml:9567-9576
+	// uses `items: { type: object, ... }` rather than a $ref).
+	// Single-use inline shape — no SDK callers reference it by
+	// name, so no standalone schema.
+	"CreateTriggerBatchResult": true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -181,6 +205,19 @@ var schemaSpecOnly = map[string]bool{
 	"Trace":                  true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
 	"TraceSpan":              true, // issue #555: subtree of Trace; gateway-internal type
 	"RaiseOverageCapRequest": true, // issue #561: inline {OverageCapCents *int64} in cmd/apid/handlers_ext.go
+	// Issue #757 / ADR-100 — trigger-enum schemas. Each is the
+	// typed string from pkg/api/trigger.go (TriggerKind,
+	// TriggerRecordState, TriggerRoutedTo, TriggerDeadLetterReason).
+	// The DTO scanner walks struct types only; a `type X string`
+	// definition isn't a struct, so it doesn't surface as a
+	// scanner name. The spec lists each as a standalone schema
+	// so SDK callers can `$ref` it from elsewhere; the runtime
+	// value is the constant set in pkg/api/trigger.go itself.
+	"TriggerKind":             true,
+	"TriggerRecordState":      true,
+	"TriggerRoutedTo":         true,
+	"TriggerDeadLetterReason": true,
+	"TemplateView":            true, // issue #961 / Mega-B PR-3: inline {Name, Category, Description string} in cmd/apid/handlers_templates.go
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.
@@ -589,6 +626,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", billingFile),
 		filepath.Join(root, "pkg", "api", diffFile),
 		filepath.Join(root, "pkg", "api", upstreamsFile),
+		filepath.Join(root, "pkg", "api", triggerFile),
 		filepath.Join(root, "pkg", "api", oidcFile),
 	}
 	dtos, err := scanDTOs(files)

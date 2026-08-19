@@ -23,11 +23,10 @@ Two hosts:
 | `fsn-1` | control-plane | apid, schedd, meterd, gatewayd-public, githubd, postgres, postgres_backup |
 | `fsn-2` | compute-only | vmmd, gatewayd-internal, builderd, imaged |
 
-The cross-box mesh is the per-box `ansible_host` value living in
-`deploy/ansible/host_vars/faas-fsn-{1,2}.yml` (Tailscale / Wireguard /
-internal LAN — operator choice per fleet). `[box:children]` in
-`deploy/ansible/inventory/hosts.ini` aggregates both groups so the
-legacy `make bootstrap` shape still works against 127.0.0.1.
+The cross-box mesh is the per-box `ansible_host` value living in the
+manifest-generated host vars (Tailscale / Wireguard / internal LAN —
+operator choice per fleet). The production inventory has no combined
+`[box]` group; every host is assigned exactly one role.
 
 ## Pre-conditions
 
