@@ -150,7 +150,7 @@
                        list uses. */}}
                   {{if .Tag}}<span class="badge {{.Tag}}">{{.Tag}}</span>{{end}}
                   {{if .Reason}} <code title="{{.Reason}}">{{.Reason}}</code>{{end}}
-                  {{if .PRNumber}} <a href="https://github.com/{{$.Data.App.Slug}}/pull/{{.PRNumber}}" target="_blank" rel="noopener">#{{.PRNumber}}</a>{{end}}
+                  {{if and .PRNumber .RepoFullName}} <a href="https://github.com/{{.RepoFullName}}/pull/{{.PRNumber}}" target="_blank" rel="noopener">#{{.PRNumber}}</a>{{end}}
                   {{if and (not .Tag) (not .Reason) (not .PRNumber)}}<span style="color:#888">—</span>{{end}}
                 </td>
                 <td>

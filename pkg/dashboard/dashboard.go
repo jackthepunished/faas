@@ -154,7 +154,7 @@ type DeploymentItem struct {
 	Kind      string
 	CreatedAt string
 	Error     string
-// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+	// Issue #606 / SAFE-RELEASES-E.1: structured deployer
 	// attribution. All four fields are server-stamped from the
 	// HTTP request context (never client-supplied) and rendered
 	// by deployment_detail.html as a chip row. The dashboard
@@ -185,6 +185,15 @@ type DeploymentItem struct {
 	Tag        string
 	DeployedBy string
 	PRNumber   int
+	// RepoFullName (issue #977 / ADR-116 review fix) is the
+	// "owner/name" string parsed off the deployment's SourceURL
+	// (which carries the github:// scheme for githubd deploys).
+	// Empty when the deploy didn't come through GitHub (local
+	// tarball, image-deploy). The list-view template uses it to
+	// build the PR link target instead of App.Slug (which is the
+	// app slug, not the repo owner/name) so a clickable `#4242`
+	// chip actually lands on GitHub.
+	RepoFullName string
 	// ScanSummary is the per-deploy grype scan chip rendered
 	// in the deploy list (issue #464 / ADR-055). Nil when no
 	// scan has run yet (the deploy is mid-pipeline or predates

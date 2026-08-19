@@ -1132,3 +1132,72 @@ func TestDashboardStagePayload(t *testing.T) {
 // (Named to avoid colliding with the existing helpers.go::ptrTime
 // which has the inverse signature.)
 func tPtr(t time.Time) *time.Time { return &t }
+
+// TestRepoFullNameFromSourceURL (issue #977 / ADR-116 review fix
+// CRIT-1) pins the SourceURL → RepoFullName parsing. The list-view
+// template uses RepoFullName to build the PR link target so a
+// clickable #N chip lands on GitHub. A regression that drops the
+// owner/name extraction (or accepts a malformed URL) would render
+// 404 links on every PR-annotated deployment row.
+func TestRepoFullNameFromSourceURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"typical githubd embed", "github://onebox-faas/hello@0123456789abcdef0123456789abcdef01234567", "onebox-faas/hello"},
+		{"single-char owner", "github://a/b@deadbeef", "a/b"},
+		{"image-deploy (oci://)", "oci://registry.example.com/foo@sha256:abc", ""},
+		{"local tarball (empty)", "", ""},
+		{"local tarball (tarball://)", "tarball://local", ""},
+		{"truncated github:// no @", "github://onebox-faas/hello", ""},
+		{"github:// with empty owner", "github:///hello@abc", ""},
+		{"github:// with empty repo", "github://hello/@abc", ""},
+		{"unknown scheme", "gitlab://owner/repo@abc", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := repoFullNameFromSourceURL(tc.in)
+			if got != tc.want {
+				t.Errorf("repoFullNameFromSourceURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDashboardDeploymentItem_PopulatesRepoFullName verifies the
+// projection thread through dashboardDeploymentItem (issue #977 /
+// ADR-116 review fix CRIT-1). The handler edge is the single seam
+// — every DeploymentItem flows through it. A regression that
+// forgot to populate RepoFullName would surface here as a missing
+// PR link on the dashboard list view.
+func TestDashboardDeploymentItem_PopulatesRepoFullName(t *testing.T) {
+	dep := state.Deployment{
+		ID:        "d-1",
+		Status:    state.DeployLive,
+		Kind:      state.DeploymentKindGitHub,
+		SourceURL: "github://acme-co/payments@0123456789abcdef0123456789abcdef01234567",
+		PRNumber:  4242,
+	}
+	item := dashboardDeploymentItem(dep)
+	if item.RepoFullName != "acme-co/payments" {
+		t.Errorf("RepoFullName = %q, want %q", item.RepoFullName, "acme-co/payments")
+	}
+	if item.PRNumber != 4242 {
+		t.Errorf("PRNumber = %d, want 4242", item.PRNumber)
+	}
+
+	// Image-deploy: empty SourceURL → empty RepoFullName (template
+	// drops the PR link rather than rendering a 404).
+	imgDep := state.Deployment{
+		ID:        "d-2",
+		Status:    state.DeployLive,
+		Kind:      state.DeploymentKindImage,
+		SourceURL: "oci://registry.example.com/foo@sha256:abc",
+		PRNumber:  0,
+	}
+	imgItem := dashboardDeploymentItem(imgDep)
+	if imgItem.RepoFullName != "" {
+		t.Errorf("image-deploy RepoFullName = %q, want empty", imgItem.RepoFullName)
+	}
+}

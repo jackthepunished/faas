@@ -1992,9 +1992,17 @@ func severityOrdinal(s string) int {
 // DeploymentItem (list view, detail view, JSON drill-down) flows
 // through here, so the annotation fields stay consistent without
 // per-page duplication.
+//
+// Review fix CRIT-1 (issue #977 / ADR-116): also stamps RepoFullName
+// parsed off the deployment's SourceURL (the github://<owner>/<repo>@<sha>
+// scheme stamped by handlers_source_ref.go:148). The list-view
+// template uses it to build the PR link target so a clickable #N
+// chip lands on GitHub rather than on
+// https://github.com/<app-slug>/pull/N (which 404s — App.Slug is the
+// app slug, not the GitHub owner/name).
 func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 	return dashboard.DeploymentItem{
-		ID:                d.ID,
+ID:                d.ID,
 		Status:            string(d.Status),
 		Kind:              string(d.Kind),
 		CreatedAt:         d.CreatedAt.UTC().Format(time.RFC3339),
@@ -2024,7 +2032,46 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 		Tag:        d.Tag,
 		DeployedBy: d.DeployedBy,
 		PRNumber:   d.PRNumber,
+		RepoFullName:       repoFullNameFromSourceURL(d.SourceURL),
 	}
+}
+
+// repoFullNameFromSourceURL extracts the "owner/name" string from a
+// github://<owner>/<repo>@<sha> SourceURL. Returns "" for the
+// non-github-deployed rows (image-deploy, local tarball) so the
+// template quietly drops the PR link instead of rendering a 404.
+//
+// The parsing is intentionally tight: the githubd bridge always
+// formats the URL as exactly `github://<owner>/<repo>@<sha>` (no
+// trailing slash, no port, no scheme variant). A regression that
+// introduced a different shape would surface here as a missing
+// PR link rather than a panic — the template treats the empty
+// string as "no PR link".
+//
+// The strings.Cut at "@" splits the owner/repo prefix from the SHA
+// suffix; the strings.Cut at "/" splits owner from repo. Both
+// return ok=false on a malformed URL, which we map to "".
+func repoFullNameFromSourceURL(sourceURL string) string {
+	const prefix = "github://"
+	if !strings.HasPrefix(sourceURL, prefix) {
+		return ""
+	}
+	body := sourceURL[len(prefix):]
+	at := strings.IndexByte(body, '@')
+	if at < 0 {
+		return ""
+	}
+	ownerRepo := body[:at]
+	slash := strings.IndexByte(ownerRepo, '/')
+	if slash < 0 {
+		return ""
+	}
+	owner := ownerRepo[:slash]
+	repo := ownerRepo[slash+1:]
+	if owner == "" || repo == "" {
+		return ""
+	}
+	return owner + "/" + repo
 }
 
 // projectPreviewItems (ADR-095 PR-C / issue #272) materialises a

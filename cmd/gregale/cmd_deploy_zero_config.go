@@ -66,10 +66,25 @@ func cmdDeployZeroConfig(slug, cwd string) int {
 	// configured. gitUserName swallows ErrNoGitConfigKey to ""
 	// (the "operator never configured git" path) — empty is a
 	// valid deployed_by, the column is nullable.
-	deployedBy, err := gitUserName(root)
+	//
+	// Review fix CRIT-2 (issue #977 / ADR-116): non-ErrNoGitConfigKey
+	// errors (config-file parse, permission denied, transient git
+	// hiccup) are also silently swallowed to "" — mirrors the
+	// policy in cmd_deploy_annotations.go:resolveDeployedBy, so a
+	// customer who deploys the same project via either path gets
+	// the same stamp. The audit row simply lacks a deployed_by and
+	// the dashboard renders nothing. Promoting these to a fatal
+	// would break §11 cross-path symmetry: a parse-corrupt
+	// ~/.gitconfig would block the zero-config path but not the
+	// flag path.
+	name, err := gitUserName(root)
 	if err != nil {
-		return printErr("Could not read git config user.name", err)
+		// log-and-continue: the deployment is still valid, just
+		// unannotated. The slug is the audit anchor.
+		PrintOK(osStdout, fmt.Sprintf("Note: could not read git config user.name (%v); proceeding without deployed_by", err))
+		name = ""
 	}
+	deployedBy := name
 
 	// Pack cwd. We intentionally reuse autoPackCwd (the same helper
 	// the cwd auto-detection branch uses) so the §9 shape invariants
