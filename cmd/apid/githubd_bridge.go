@@ -269,10 +269,24 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 	// builderd reads source_path, not source_url — see
 	// pkg/builderd/builderd.go:644). CommitSHA is the upstream
 	// commit (deployments_commit_sha_len_chk, migrations/00047).
-	// The Pusher / Ref / Branch / RepoFullName fields are
-	// intentionally NOT in pkg/state.Deployment yet — they're
-	// carried in the proto for forward-compat and stashed in
-	// SourceURL if/when a future migration adds columns.
+	//
+	// Issue #606 / SAFE-RELEASES-E.1: the Pusher field is now
+	// threaded through apidsource.EnqueueParams →
+	// store.CreateDeployment onto the deployments.pusher_login +
+	// deployed_via="github" + deployed_by_user_id columns. The FK
+	// on deployed_by_user_id points at the app's owning account
+	// (req.AccountId) — we deliberately do NOT resolve
+	// Pusher.Login → a local account here, because a single GH
+	// org install can map to many local accounts (PR #291 mirror
+	// surface) and the resolution is eventually-consistent on the
+	// GH side. The pusher's identity stays attributable via the
+	// pusher_login column, distinct from the local-account FK.
+	//
+	// Ref / Branch / RepoFullName remain intentionally NOT in
+	// pkg/state.Deployment — the proto carries them for forward-
+	// compat and the audit log (g.log.Info below) carries them
+	// on the build_enqueued line.
+	//
 	// Kind dispatch (issue #272 / ADR-094): the proto3 EnqueueBuild
 	// carries an event_kind enum (push vs pull_request). Push events
 	// keep stamping DeploymentKindGitHub (ADR-048 metering keys on
@@ -292,6 +306,23 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 		CommitSHA:   req.CommitSha,
 		LogSpool:    g.spool,
 		Log:         g.log,
+		// Issue #606 / SAFE-RELEASES-E.1: bridge-side actor
+		// attribution. ActorVia is hard-coded to "github"
+		// (the closed-set CHECK on deployments.deployed_via
+		// enforces this); ActorUserID points at the app's
+		// owning local account (req.AccountId — already
+		// validated against app.AccountID at line 199 above,
+		// so the FK insertion cannot fail on a missing
+		// account row); ActorFromIP is the bridge daemon's
+		// listen socket — unix-socket, loopback by
+		// construction (the proto carries no per-request
+		// IP); ActorPusherLogin is the raw GH login from
+		// req.Pusher, suitable for downstream GitHub-API
+		// correlation.
+		ActorUserID:      req.AccountId,
+		ActorVia:         "github",
+		ActorFromIP:      "127.0.0.1",
+		ActorPusherLogin: req.Pusher,
 	})
 	if err != nil {
 		return nil, g.asGRPC("enqueue", err)

@@ -107,17 +107,51 @@ type Notifier interface {
 //	              value as cmd/apid.deployInputs.spoolRoot() and
 //	              cmd/apid/githubdBridge.spool.
 //	Log         — slog.Logger. Required (must not be nil).
+//
+// The four `Actor*` fields are the issue #606 / SAFE-RELEASES-E.1
+// server-stamped attribution columns (deployed_by_user_id,
+// deployed_via, deployed_from_ip, pusher_login). The closed-set
+// vocabulary for DeployedVia is enforced at the schema layer via
+// the migrations/00303_deployments_actor.sql CHECK constraint;
+// pgstore.CreateDeployment's INSERT path coalesces empty strings
+// to NULL/” via the nullif()+coalesce() chain. Empty actor fields
+// on EnqueueParams render pre-#606 rows unchanged.
+//
+// DeployedByUserID is the deploying account's UUID (FK →
+// accounts.id, ON DELETE SET NULL). The apid tarball / dockerfile
+// paths populate it from session-resolved acct.ID; the githubd
+// bridge path resolves it from req.Pusher → local account via the
+// existing GH install→account helper (cmd/apid/handlers_github.go).
+//
+// DeployedVia is the closed-set classifier of how this deployment
+// was submitted. The apid paths compute it from the HTTP request
+// shape via cmd/apid.deploy_actor.routeKindForRequest; the bridge
+// stamps "github" directly.
+//
+// DeployedFromIP is the trusted remote IP captured by
+// pkg/middleware.ClientIP at handler entry (the githubd bridge
+// path stamps the daemon's local IP since the proto carries no
+// per-request IP).
+//
+// PusherLogin is the raw GitHub login of the pusher when
+// DeployedVia == "github". Empty for all other via values. The
+// bridge stamps it from req.Pusher.Login; the apid paths leave
+// it empty.
 type EnqueueParams struct {
-	AppID       string
-	Kind        state.DeploymentKind
-	SourcePath  string
-	SourceBytes int64
-	SourceURL   string
-	CommitSHA   string
-	Handler     string
-	Source      string
-	LogSpool    string
-	Log         *slog.Logger
+	AppID            string
+	Kind             state.DeploymentKind
+	SourcePath       string
+	SourceBytes      int64
+	SourceURL        string
+	CommitSHA        string
+	Handler          string
+	Source           string
+	LogSpool         string
+	Log              *slog.Logger
+	ActorUserID      string
+	ActorVia         string
+	ActorFromIP      string
+	ActorPusherLogin string
 }
 
 // EnqueueResult is the durable artifact the caller writes back to
@@ -174,15 +208,24 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 
 	// Step 2: create the deployment row. SourceURL + CommitSHA are
 	// provenance-only on the apid tarball path; the bridge sets them.
+	// The four Actor* fields (issue #606 / SAFE-RELEASES-E.1) are
+	// server-stamped here — the pgstore INSERT path coalesces empty
+	// strings to NULL/'' via the migrations/00303 nullif()+coalesce()
+	// chain, so pre-#606 callers that don't pass actor fields render
+	// identical wire shapes.
 	d, err := store.CreateDeployment(ctx, state.Deployment{
-		AppID:       p.AppID,
-		Kind:        p.Kind,
-		SourcePath:  p.SourcePath,
-		SourceBytes: p.SourceBytes,
-		SourceURL:   p.SourceURL,
-		CommitSHA:   p.CommitSHA,
-		Handler:     p.Handler,
-		Status:      state.DeployPending,
+		AppID:            p.AppID,
+		Kind:             p.Kind,
+		SourcePath:       p.SourcePath,
+		SourceBytes:      p.SourceBytes,
+		SourceURL:        p.SourceURL,
+		CommitSHA:        p.CommitSHA,
+		Handler:          p.Handler,
+		Status:           state.DeployPending,
+		DeployedByUserID: p.ActorUserID,
+		DeployedVia:      p.ActorVia,
+		DeployedFromIP:   p.ActorFromIP,
+		PusherLogin:      p.ActorPusherLogin,
 	})
 	if err != nil {
 		return EnqueueResult{}, fmt.Errorf("apidsource.Enqueue: create deployment: %w", err)
