@@ -169,6 +169,167 @@ var (
 	_ WakeEvent = TriggerDLQEvent{}
 )
 
+// ESM vocabulary (ADR-118 / issue #757 closure, commit 4 of 11).
+//
+// The four esm.* kinds below are the OPERATOR-FACING ALIASES of
+// the four trigger.* kinds above. They are dual-emitted from the
+// same call sites (commit 6 wires the dual-emit into
+// pkg/sched/dispatch_triggers.go and the apid createTrigger /
+// deleteTrigger handlers) so a Grafana panel selector
+// (`kind_prefix=esm.`) and a customer dashboard selector
+// (`kind_prefix=trigger.`) both see the lifecycle.
+//
+// Per ADR-118 §"Audit vocabulary bridging":
+//   - trigger.* is canonical (the wire shape + spec §5.1).
+//   - esm.* is the operator alias (issue #757's original
+//     wording; preserves the "ESM" vocabulary operators were
+//     used to during the PR #910 planning phase).
+//   - Both kinds land in the events table; consumers that want
+//     to deduplicate can join on (trigger_id, record_id, At).
+//
+// Adding a new esm.* kind requires (a) a constant here, (b) a
+// matching constant in the trigger.* set above (the pair
+// should be 1:1 — never an esm.* without a trigger.* mirror),
+// and (c) a unit test asserting the Kind() string matches
+// exactly.
+const (
+	// ESMSourceCreated — mirrors TriggerFired (creation-side
+	// event). Emitted on apid's createTrigger handler after the
+	// `triggers` row commits, BEFORE the poller goroutine takes
+	// over. The Pair field carries the canonical
+	// trigger.source.created constant so a JOIN can collapse
+	// the two rows to one timeline entry.
+	ESMSourceCreated = "esm.source.created"
+
+	// ESMSourceDeleted — emitted on apid's deleteTrigger
+	// handler after the `triggers` row commits. The trigger.*
+	// counterpart ("trigger.source.deleted") does not exist —
+	// the source-deleted vocabulary is ESM-specific (PR #910
+	// used trigger.disabled for the soft-delete path; the
+	// hard-delete path lands here). Pinning the asymmetry in
+	// ADR-118 §"Asymmetric kind mapping".
+	ESMSourceDeleted = "esm.source.deleted"
+
+	// ESMPollFailed — mirrors TriggerRetry (failure-side
+	// event). Emitted from pkg/sched/dispatch_triggers.go on
+	// the per-tick error branch (network failure, broker
+	// timeout, group rebalance). Distinct from TriggerDLQ —
+	// this is "the poll loop could not run"; DLQ is "a
+	// record was dead-lettered".
+	ESMPollFailed = "esm.poll.failed"
+
+	// ESMDrainDLQ — mirrors TriggerDLQ. Emitted when a record
+	// transitions to state='dead_letter' (poison_record,
+	// max_attempts, rate_limited, broker_error, plan_quota,
+	// payload_too_large, customer_disabled per the
+	// trigger_dead_letter CHECK). The dual-emit lets a
+	// dashboard selector `kind_prefix=esm.` filter
+	// ESM-specific DLQs without losing cross-source aggregates.
+	ESMDrainDLQ = "esm.drain.dlq"
+)
+
+// ESMSourceCreatedEvent is the typed payload for ESMSourceCreated.
+// Emitted by the apid createTrigger handler (commit 6 wiring).
+// Pair=TriggerFired-ish "source.created" is the canonical
+// counterpart (no trigger.source.created kind exists today —
+// the creation-side is ESM-only per the asymmetric mapping
+// above; the trigger.fired lifecycle begins on the first
+// broker delivery, NOT on creation).
+//
+// Naming note: SourceKind (not Kind) avoids shadowing the
+// WakeEvent.Kind() method, and EmitAt (not At) matches the
+// wake.go convention. The JSON tag stays `kind` / `at` so
+// the wire shape is unchanged for SDK consumers.
+type ESMSourceCreatedEvent struct {
+	TriggerID  string    `json:"trigger_id"`
+	AccountID  string    `json:"account_id"`
+	AppID      string    `json:"app_id"`
+	SourceKind string    `json:"kind"` // TriggerKind string (kafka/nats/...)
+	EmitAt     time.Time `json:"at"`
+}
+
+// Kind returns the audit kind for ESMSourceCreatedEvent.
+func (ESMSourceCreatedEvent) Kind() string { return ESMSourceCreated }
+
+// At returns the event timestamp for ESMSourceCreatedEvent.
+func (e ESMSourceCreatedEvent) At() time.Time {
+	if e.EmitAt.IsZero() {
+		return time.Now()
+	}
+	return e.EmitAt
+}
+
+// Subject returns nil — the trigger_id is in the payload.
+func (ESMSourceCreatedEvent) Subject() *string { return nil }
+
+// Payload returns the typed struct for ESMSourceCreatedEvent.
+func (e ESMSourceCreatedEvent) Payload() map[string]any { return eventPayload(e) }
+
+// ESMSourceDeletedEvent is the typed payload for ESMSourceDeleted.
+type ESMSourceDeletedEvent struct {
+	TriggerID  string    `json:"trigger_id"`
+	AccountID  string    `json:"account_id"`
+	AppID      string    `json:"app_id"`
+	SourceKind string    `json:"kind"`
+	EmitAt     time.Time `json:"at"`
+}
+
+func (ESMSourceDeletedEvent) Kind() string { return ESMSourceDeleted }
+func (e ESMSourceDeletedEvent) At() time.Time {
+	if e.EmitAt.IsZero() {
+		return time.Now()
+	}
+	return e.EmitAt
+}
+func (ESMSourceDeletedEvent) Subject() *string          { return nil }
+func (e ESMSourceDeletedEvent) Payload() map[string]any { return eventPayload(e) }
+
+// ESMPollFailedEvent is the typed payload for ESMPollFailed.
+type ESMPollFailedEvent struct {
+	TriggerID  string    `json:"trigger_id"`
+	AppID      string    `json:"app_id"`
+	SourceKind string    `json:"kind"`
+	Error      string    `json:"error"`
+	EmitAt     time.Time `json:"at"`
+}
+
+func (ESMPollFailedEvent) Kind() string { return ESMPollFailed }
+func (e ESMPollFailedEvent) At() time.Time {
+	if e.EmitAt.IsZero() {
+		return time.Now()
+	}
+	return e.EmitAt
+}
+func (ESMPollFailedEvent) Subject() *string          { return nil }
+func (e ESMPollFailedEvent) Payload() map[string]any { return eventPayload(e) }
+
+// ESMDrainDLQEvent is the typed payload for ESMDrainDLQ.
+type ESMDrainDLQEvent struct {
+	TriggerID string    `json:"trigger_id"`
+	RecordID  string    `json:"record_id"`
+	AppID     string    `json:"app_id"`
+	Reason    string    `json:"reason"` // poison_record | max_attempts | rate_limited | ...
+	EmitAt    time.Time `json:"at"`
+}
+
+func (ESMDrainDLQEvent) Kind() string { return ESMDrainDLQ }
+func (e ESMDrainDLQEvent) At() time.Time {
+	if e.EmitAt.IsZero() {
+		return time.Now()
+	}
+	return e.EmitAt
+}
+func (ESMDrainDLQEvent) Subject() *string          { return nil }
+func (e ESMDrainDLQEvent) Payload() map[string]any { return eventPayload(e) }
+
+// ESM (compile-time) — every ESM event satisfies WakeEvent.
+var (
+	_ WakeEvent = ESMSourceCreatedEvent{}
+	_ WakeEvent = ESMSourceDeletedEvent{}
+	_ WakeEvent = ESMPollFailedEvent{}
+	_ WakeEvent = ESMDrainDLQEvent{}
+)
+
 // eventPayload marshals the typed struct into map[string]any so
 // the WakeEvent.Payload contract is satisfied without each event
 // re-implementing the marshal step.
