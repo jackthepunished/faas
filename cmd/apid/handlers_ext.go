@@ -1874,6 +1874,255 @@ func dialFailureReason(err error) string {
 	return msg
 }
 
+// --- domain doctor (ADR-120) --------------------------------------------
+
+// getDomainDoctor is the GET /v1/domains/{domain}/doctor handler.
+// Reuses loadDomain for the IDOR-safe load. The handler reads
+// the latest observation row from domain_doctor_observations;
+// if the row is older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS or
+// missing, it triggers a synchronous re-probe with a 5s budget.
+// The re-probe path is the only place a live probe runs on a
+// request — the dns_poller does the work for the 99% case.
+//
+// 503 CodeDoctorDisabled is returned when the operator hasn't
+// set FAAS_DOMAIN_DOCTOR_ENABLED; the route stays registered
+// so the CLI gets a deterministic error code (per the
+// pre-#911 pattern in api/flags.go).
+func (s *server) getDomainDoctor(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if !api.DomainDoctorEnabled() {
+		api.WriteProblem(w, api.ErrDoctorDisabled())
+		return
+	}
+	domain := strings.ToLower(r.PathValue("domain"))
+	d, ok := s.loadDomain(w, r, acct, domain)
+	if !ok {
+		return
+	}
+	report, err := s.buildDoctorReport(r.Context(), d)
+	if err != nil {
+		api.WriteProblem(w, api.ErrDoctorUnavailable(d.Domain, err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// doctorTTL returns the FAAS_DOMAIN_DOCTOR_TTL_SECONDS value
+// (default 300s). Read at request time so an operator can
+// tighten / loosen the cache without bouncing apid.
+func doctorTTL() time.Duration {
+	v := strings.TrimSpace(os.Getenv("FAAS_DOMAIN_DOCTOR_TTL_SECONDS"))
+	if v == "" {
+		return 5 * time.Minute
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(n) * time.Second
+}
+
+// buildDoctorReport reads the cached observation row and
+// decides whether to trigger a synchronous re-probe. The
+// report is always rendered from the observation row (not
+// the live re-probe) so the response shape is stable — the
+// re-probe's only job is to refresh the row.
+func (s *server) buildDoctorReport(ctx context.Context, d state.CustomDomain) (api.DomainDoctorReport, error) {
+	obs, err := s.store.GetDoctorObservation(ctx, d.Domain)
+	if err == nil {
+		if time.Since(obs.ObservedAt) < doctorTTL() {
+			return doctorReportFromObs(d, obs, false), nil
+		}
+		// Stale: fall through to a synchronous re-probe so
+		// the next reader gets fresh data. The re-probe
+		// shares the dns_poller's helper path (runDoctorForDomain
+		// is the load-bearing engine).
+		if refreshErr := s.refreshDoctorObservation(ctx, d.Domain); refreshErr == nil {
+			obs, _ = s.store.GetDoctorObservation(ctx, d.Domain)
+		}
+		return doctorReportFromObs(d, obs, true), nil
+	}
+	// ErrNotFound: poller hasn't written yet. Trigger a
+	// synchronous re-probe (bounded by the request ctx so
+	// a slow upstream doesn't blow past the request budget).
+	if refreshErr := s.refreshDoctorObservation(ctx, d.Domain); refreshErr != nil {
+		return api.DomainDoctorReport{}, refreshErr
+	}
+	obs, err = s.store.GetDoctorObservation(ctx, d.Domain)
+	if err != nil {
+		return api.DomainDoctorReport{}, err
+	}
+	return doctorReportFromObs(d, obs, true), nil
+}
+
+// refreshDoctorObservation is the synchronous re-probe
+// path. Calls runProbesParallel + dialCertForDoctor
+// (the same helpers the poller uses) and upserts the
+// result. Errors are returned to the caller; the caller
+// decides whether to fall through (the report's Stale
+// flag is the visible degradation).
+func (s *server) refreshDoctorObservation(ctx context.Context, domain string) error {
+	rctx, cancel := context.WithTimeout(ctx, probeTimeout+2*time.Second)
+	defer cancel()
+	dnsFound, pointsToG, caa, aaaa := runProbesParallel(rctx, domain)
+	obs := state.DomainDoctorObservation{
+		Domain:          domain,
+		ObservedAt:      time.Now().UTC(),
+		DNSRecordFound:  probeToBool(dnsFound.Status, true),
+		PointsToGregale: probeToBool(pointsToG.Status, false),
+		IPv6Conflict:    probeToBool(aaaa.Status, false),
+		ObservedTarget:  pointsToG.Observed,
+		ObservedAAAA:    aaaa.Observed,
+		CAAObserved:     caa.Observed,
+		DNSCheckedAt:    earliest(dnsFound.ObservedAt, pointsToG.ObservedAt, caa.ObservedAt, aaaa.ObservedAt),
+	}
+	switch caa.Status {
+	case probeOK:
+		v := true
+		obs.CAAPermits = &v
+	case probeFail:
+		v := false
+		obs.CAAPermits = &v
+	}
+	if s.store != nil {
+		if surface, sErr := s.store.TenantSurfaceByHostname(rctx, domain); sErr == nil {
+			obs.SurfaceID = surface.ID
+			obs.CertState = string(surface.CertState)
+			obs.CertNotAfter = surface.CertNotAfter
+		}
+	}
+	if obs.CertState == "" {
+		obs.CertState, obs.LastError, obs.CertNotAfter = dialCertForDoctor(rctx, domain)
+		obs.CertCheckedAt = time.Now().UTC()
+	}
+	return s.store.UpsertDoctorObservation(rctx, obs)
+}
+
+// doctorReportFromObs translates the persistence struct
+// into the wire shape. The translation is mechanical
+// (5 checks, each with a stable name + status + detail +
+// observed + remediation + checked_at) so the helper
+// stays small and is exercised by the e2e suite.
+func doctorReportFromObs(d state.CustomDomain, obs state.DomainDoctorObservation, stale bool) api.DomainDoctorReport {
+	report := api.DomainDoctorReport{
+		Domain:     d.Domain,
+		AppID:      d.AppID,
+		Stale:      stale,
+		ObservedAt: obs.ObservedAt.UTC().Format(time.RFC3339),
+		Checks:     []api.DomainDoctorCheck{},
+		Healthy:    true,
+	}
+	// 1. DNS record found.
+	dnsStatus, dnsDetail, dnsRem := probeOK, "A or AAAA records present", ""
+	if !obs.DNSRecordFound {
+		dnsStatus, dnsRem = probeFail, "Publish an A or AAAA record at "+d.Domain
+		report.Healthy = false
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "dns_record", Status: string(dnsStatus), Detail: dnsDetail,
+		Remediation: dnsRem, CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 2. Points to Gregale.
+	ptsStatus, ptsDetail, ptsRem, ptsObs := probeOK, "CNAME → Gregale", "", obs.ObservedTarget
+	if !obs.PointsToGregale {
+		ptsStatus = probeFail
+		report.Healthy = false
+		if ptsObs != "" {
+			ptsDetail = "CNAME does not point at Gregale (observed: " + ptsObs + ")"
+			ptsRem = "Set CNAME " + d.Domain + " → " + ptsObs
+		} else {
+			ptsDetail = "no CNAME at apex; using A/AAAA record instead"
+		}
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "points_to_gregale", Status: string(ptsStatus), Detail: ptsDetail,
+		Observed: ptsObs, Remediation: ptsRem,
+		CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 3. TLS certificate.
+	tlsStatus, tlsDetail, tlsRem := probeOK, "certificate issued", ""
+	switch obs.CertState {
+	case certStatusIssued:
+		if !obs.CertNotAfter.IsZero() {
+			tlsDetail = "certificate issued, expires " + obs.CertNotAfter.UTC().Format(time.RFC3339)
+		}
+	case certStatusPending:
+		tlsStatus = probePending
+		report.Healthy = false
+		tlsDetail = "cert engine has not yet issued"
+		tlsRem = "Wait for cert engine to mint (retry in 30s). If persistent, run `gregale domains show " + d.Domain + "` for cert_not_after + SANs."
+	case certStatusFailed:
+		tlsStatus = probeFail
+		report.Healthy = false
+		tlsDetail = "cert engine reported failure: " + obs.LastError
+		tlsRem = "Check the cert engine logs; the renewal loop will retry automatically."
+	case certStatusDialFailed:
+		tlsStatus = probeFail
+		report.Healthy = false
+		tlsDetail = "port-443 cert dial failed: " + obs.LastError
+	case certStatusCDN:
+		tlsStatus = probeFail
+		report.Healthy = false
+		tlsDetail = "port-443 cert is a CDN cert whose SANs do not include " + d.Domain
+		tlsRem = "Update the edge to use the Gregale-issued cert, or wait for Gregale cert propagation."
+	default:
+		// "none" or empty — unverified.
+		tlsStatus = probePending
+		report.Healthy = false
+		tlsDetail = "domain not yet verified; cert not yet issued"
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "tls_certificate", Status: string(tlsStatus), Detail: tlsDetail,
+		Remediation: tlsRem, CheckedAt: obs.CertCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 4. CAA permits. caaStatus starts as ok with the
+	// "no CAA published" detail, then each branch overrides
+	// only when a CAA record is present OR a transient
+	// failure was observed. The non-CAA-published case
+	// (obs.CAAPermits == nil and no transient error) keeps
+	// the initial ok assignment.
+	caaStatus := probeOK
+	caaDetail := "no CAA published (allowed by default)"
+	caaRem := ""
+	caaObs := obs.CAAObserved
+	if obs.CAAPermits != nil {
+		if *obs.CAAPermits {
+			caaDetail = "CAA permits certificate issuance"
+		} else {
+			caaStatus = probeFail
+			report.Healthy = false
+			caaDetail = "CAA denies certificate issuance for this CA"
+			caaRem = "Update CAA record at " + d.Domain + " to permit letsencrypt.org (e.g. '0 issue \"letsencrypt.org\"')"
+		}
+	} else if obs.CAAObserved != "" {
+		// nil permits + observed CAA recordset = the resolver
+		// returned a CAA recordset but the parser couldn't
+		// decide issue vs issuewild. Surface as pending so
+		// the customer sees a transient signal.
+		caaStatus = probePending
+		report.Healthy = false
+		caaDetail = "CAA lookup returned a transient error; re-poll"
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "caa_permits", Status: string(caaStatus), Detail: caaDetail,
+		Observed: caaObs, Remediation: caaRem,
+		CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	// 5. IPv6 conflict.
+	ipStatus, ipDetail, ipRem, ipObs := probeOK, "no stray AAAA at apex", "", obs.ObservedAAAA
+	if obs.IPv6Conflict {
+		ipStatus = probeFail
+		report.Healthy = false
+		ipDetail = "AAAA record at apex conflicts with CNAME"
+		ipRem = "Remove AAAA record at " + d.Domain
+	}
+	report.Checks = append(report.Checks, api.DomainDoctorCheck{
+		Name: "ipv6_conflict", Status: string(ipStatus), Detail: ipDetail,
+		Observed: ipObs, Remediation: ipRem,
+		CheckedAt: obs.DNSCheckedAt.UTC().Format(time.RFC3339),
+	})
+	return report
+}
+
 // --- crons -----------------------------------------------------------------
 
 func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.Account) {
