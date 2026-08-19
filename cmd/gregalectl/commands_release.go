@@ -145,11 +145,7 @@ func cmdReleaseBundle(args []string) int {
 	// Validate git_sha / manifest_hash shape BEFORE touching the
 	// filesystem so a malformed CLI argument surfaces as a usage
 	// error (exit 1), not as a platform/infra error (exit 3).
-	if err := releaseinstall.ValidateManifest(releaseinstall.Manifest{
-		FormatVersion: releaseinstall.FormatVersion,
-		GitSHA:        *gitSHA,
-		ManifestHash:  *manifestHash,
-	}); err != nil {
+	if err := releaseinstall.ValidateBundleInputs(*gitSHA, *manifestHash); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "gregalectl release bundle: %v\n", err)
 		return 1
 	}

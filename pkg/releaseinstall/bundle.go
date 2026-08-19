@@ -97,17 +97,8 @@ func Build(root, gitSHA, manifestHash string, now time.Time) (Manifest, error) {
 	if root == "" {
 		return Manifest{}, errors.New("releaseinstall: empty root")
 	}
-	if gitSHA == "" {
-		return Manifest{}, errors.New("releaseinstall: empty git_sha")
-	}
-	if manifestHash == "" {
-		return Manifest{}, errors.New("releaseinstall: empty manifest_hash")
-	}
-	if !validGitSHA(gitSHA) {
-		return Manifest{}, fmt.Errorf("releaseinstall: git_sha %q is not a 40-char lowercase hex", gitSHA)
-	}
-	if !validManifestHash(manifestHash) {
-		return Manifest{}, fmt.Errorf("releaseinstall: manifest_hash %q is not sha256:<64hex>", manifestHash)
+	if err := ValidateBundleInputs(gitSHA, manifestHash); err != nil {
+		return Manifest{}, err
 	}
 
 	bin := BinDir(root, gitSHA)
@@ -137,6 +128,26 @@ func Build(root, gitSHA, manifestHash string, now time.Time) (Manifest, error) {
 		DaemonHashes:  hashes,
 		CreatedAt:     now.UTC(),
 	}, nil
+}
+
+// ValidateBundleInputs validates the two operator-supplied identity fields
+// before a bundle command touches the filesystem. It intentionally does not
+// call ValidateManifest: created_at and daemon_hashes do not exist until the
+// binaries have been staged and hashed.
+func ValidateBundleInputs(gitSHA, manifestHash string) error {
+	if gitSHA == "" {
+		return errors.New("releaseinstall: empty git_sha")
+	}
+	if manifestHash == "" {
+		return errors.New("releaseinstall: empty manifest_hash")
+	}
+	if !validGitSHA(gitSHA) {
+		return fmt.Errorf("releaseinstall: git_sha %q is not a 40-char lowercase hex", gitSHA)
+	}
+	if !validManifestHash(manifestHash) {
+		return fmt.Errorf("releaseinstall: manifest_hash %q is not sha256:<64hex>", manifestHash)
+	}
+	return nil
 }
 
 // Write atomically writes the manifest to <root>/<git-sha>/release-manifest.json
