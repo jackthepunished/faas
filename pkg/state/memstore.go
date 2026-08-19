@@ -5253,7 +5253,7 @@ func (m *MemStore) TriggerByID(_ context.Context, id string) (sqlc.Trigger, erro
 	return t, nil
 }
 
-func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ []byte, _, _, _, payloadMaxBytes *int32, brokerPoisonStrategy *string) (sqlc.Trigger, error) {
+func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ []byte, _, _, _, payloadMaxBytes *int32, brokerPoisonStrategy *string, filterCriteria *[]byte) (sqlc.Trigger, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t, ok := m.triggers[id]
@@ -5268,6 +5268,13 @@ func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ 
 	}
 	if brokerPoisonStrategy != nil {
 		t.BrokerPoisonStrategy = *brokerPoisonStrategy
+	}
+	if filterCriteria != nil {
+		// REVIEW-FIX MED-1: nil = "leave unchanged" (mirrors
+		// pgstore coalesce()); non-nil = "replace the JSONB
+		// column". Memstore treats the byte slice as opaque.
+		fc := *filterCriteria
+		t.FilterCriteria = fc
 	}
 	t.UpdatedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	m.triggers[id] = t

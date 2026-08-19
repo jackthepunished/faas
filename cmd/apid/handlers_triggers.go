@@ -456,6 +456,19 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	if req.Config != nil {
 		configBytes = []byte(req.Config)
 	}
+	// REVIEW-FIX MED-1 (PR #993 / issue #757 closure):
+	// marshal filter_criteria to JSONB bytes if the customer is
+	// patching it. nil req.FilterCriteria → leave the column
+	// unchanged via the coalesce() in pgstore.UpdateTrigger.
+	var filterCriteriaBytes *[]byte
+	if req.FilterCriteria != nil {
+		b, err := json.Marshal(req.FilterCriteria)
+		if err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+			return
+		}
+		filterCriteriaBytes = &b
+	}
 	// Review finding #4 (PR #910): for kind=cron rows the
 	// schedule/path columns live on the `crons` table (the
 	// triggers.cron_id FK points at it). The old code accepted
@@ -475,13 +488,13 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 			return
 		}
 		// Update the non-cron fields on the triggers row.
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy, filterCriteriaBytes)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
 		}
 	} else {
-		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy)
+		updated, err = s.store.UpdateTrigger(r.Context(), id, req.Enabled, configBytes, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes, brokerPoisonStrategy, filterCriteriaBytes)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 			return
@@ -574,7 +587,7 @@ func (s *server) setTriggerEnabled(w http.ResponseWriter, r *http.Request, acct 
 		s.notFound(w, "no such trigger")
 		return
 	}
-	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil, nil, nil)
+	updated, err := s.store.UpdateTrigger(r.Context(), id, &enabled, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update trigger"))
 		return

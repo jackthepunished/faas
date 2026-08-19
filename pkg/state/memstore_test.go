@@ -5285,5 +5285,81 @@ func TestMemStoreAppendDeploymentStage(t *testing.T) {
 	// returns ErrNotFound (programming-error guard).
 	if _, err := s.CloseDeploymentStage(ctx, dep2.ID, StageSourceDownload, now); !errors.Is(err, ErrNotFound) {
 		t.Errorf("CloseDeploymentStage with wrong name: expected ErrNotFound, got %v", err)
+// TestMemStoreUpdateTrigger_FilterCriteriaPersists is the regression
+// test for REVIEW-FIX MED-1 (PR #993 / issue #757 closure): the
+// UpdateTrigger signature gained a filterCriteria *[]byte argument
+// and the inline SQL grew a coalesce($9::jsonb, filter_criteria)
+// branch. Pre-fix, a PATCH that flipped filter_criteria was
+// silently dropped on the floor; post-fix, the JSONB column is
+// replaced and TriggerByID reads it back.
+//
+// The memstore path mirrors the pgstore coalesce() semantics:
+// nil pointer → leave column unchanged; non-nil byte slice →
+// replace.
+func TestMemStoreUpdateTrigger_FilterCriteriaPersists(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	// Seed an account + app so the trigger can be created.
+	acct, err := m.CreateAccount(ctx, "alice@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acct.ID,
+		Slug:      "smoke",
+		Runtime:   "node22",
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	// CreateTriggerIfUnderQuota doesn't accept filter_criteria in
+	// the memstore path (the column starts at nil); use the pgtest
+	// path for the seeded filter check, then UpdateTrigger to
+	// install one.
+	trig, err := m.CreateTriggerIfUnderQuota(ctx, app.ID, "kafka", "orders", true, []byte(`{"brokers":["localhost:9092"]}`), 100, 1000, 3, 1024, "commit", api.Limits{})
+	if err != nil {
+		t.Fatalf("CreateTriggerIfUnderQuota: %v", err)
+	}
+	triggerID := uuidFromPgtype(trig.ID).String()
+
+	// Round 1: nil pointer → filter_criteria stays nil.
+	if _, err := m.UpdateTrigger(ctx, triggerID, nil, nil, nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatalf("UpdateTrigger nil filterCriteria: %v", err)
+	}
+	got, err := m.TriggerByID(ctx, triggerID)
+	if err != nil {
+		t.Fatalf("TriggerByID after nil patch: %v", err)
+	}
+	if got.FilterCriteria != nil {
+		t.Errorf("after nil filterCriteria patch, got %q, want nil", got.FilterCriteria)
+	}
+
+	// Round 2: non-nil → filter_criteria is replaced.
+	payload := []byte(`{"payload":[{"op":"eq","path":"$.event.type","value":"order.created"}]}`)
+	if _, err := m.UpdateTrigger(ctx, triggerID, nil, nil, nil, nil, nil, nil, nil, &payload); err != nil {
+		t.Fatalf("UpdateTrigger with filterCriteria: %v", err)
+	}
+	got, err = m.TriggerByID(ctx, triggerID)
+	if err != nil {
+		t.Fatalf("TriggerByID after set patch: %v", err)
+	}
+	if string(got.FilterCriteria) != string(payload) {
+		t.Errorf("after set filterCriteria patch, got %q, want %q", got.FilterCriteria, payload)
+	}
+
+	// Round 3: a second patch with a different payload replaces
+	// again (not coalesced to the previous one) — proves the
+	// replacement semantics.
+	replacement := []byte(`{"$or":[{"payload":[{"op":"neq","path":"$.x","value":1}]}]}`)
+	if _, err := m.UpdateTrigger(ctx, triggerID, nil, nil, nil, nil, nil, nil, nil, &replacement); err != nil {
+		t.Fatalf("UpdateTrigger replacement: %v", err)
+	}
+	got, err = m.TriggerByID(ctx, triggerID)
+	if err != nil {
+		t.Fatalf("TriggerByID after replacement: %v", err)
+	}
+	if string(got.FilterCriteria) != string(replacement) {
+		t.Errorf("after replacement patch, got %q, want %q", got.FilterCriteria, replacement)
 	}
 }
