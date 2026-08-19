@@ -247,11 +247,11 @@ func NewLiveTicker(w io.Writer, rows int) LiveTicker {
 // most terminals and a clear-line on the others. The cursor-up
 // sequence handles both cases because it works from any row.
 type ttyLiveTicker struct {
-	w          io.Writer
-	rows       int
-	seen       []bool
-	written    bool // true after the initial N-row print
-	updateCnt  int  // number of Update calls so far
+	w         io.Writer
+	rows      int
+	seen      []bool
+	written   bool // true after the initial N-row print
+	updateCnt int  // number of Update calls so far
 }
 
 // escapeUp returns the CSI sequence that moves the cursor up `n`
@@ -338,7 +338,7 @@ func (t *ttyLiveTicker) Close() {
 // shape matches the TTY row so grep-friendly consumers see the same
 // field order.
 type staticLiveTicker struct {
-	w    io.Writer
+	w     io.Writer
 	wrote bool
 }
 

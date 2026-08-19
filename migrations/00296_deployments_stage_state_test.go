@@ -1,14 +1,14 @@
 //go:build !no_pg
 
-// Migration-apply test for 00288_deployments_stage_state.sql
+// Migration-apply test for 00296_deployments_stage_state.sql
 // (ADR-117 — deploy-stage-progress).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00288 (no goose
-//     duplicate-version panic). Slot 00288 was picked as the next
+//  1. Migration set applies cleanly through 00296 (no goose
+//     duplicate-version panic). Slot 00296 was picked as the next
 //     free slot on origin/main past the open-PR reservations
-//     (00281–00287 all merged; cross-PR precheck verified against
+//     (00281–00295 all merged; cross-PR precheck verified against
 //     refs/pull/<N>/head before push per
 //     scripts/ci/check_migration_slots.sh).
 //  2. The new `deployments.stage_state` column carries the expected
@@ -26,7 +26,7 @@
 //     `deployments_stage_state_current_check` — the auto-name
 //     Postgres picks for the inline jsonb expression CHECK. If a
 //     future migration renames the inline CHECK this pin must update
-//     together (silent breakage here means 00288 becomes a no-op —
+//     together (silent breakage here means 00296 becomes a no-op —
 //     exactly the bug this test exists to catch).
 //  6. Replay safety: re-running db.MigrateUp is a no-op (the
 //     migration is replay-safe via `IF NOT EXISTS` + the DO-block
@@ -60,13 +60,13 @@ var stageStateVocab = []string{
 	"readiness",
 }
 
-func TestMigrations_00288_DeploymentsStageState(t *testing.T) {
+func TestMigrations_00296_DeploymentsStageState(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00288.
+	// (1) Apply through 00296.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot — 00287 pg_ratelimit_add_rule_scope landed; 00288 must be the next)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot — 00295 reserve_slot fence on main must not collide)", err)
 	}
 
 	// (2) Default shape + NOT NULL.
@@ -84,15 +84,15 @@ func TestMigrations_00288_DeploymentsStageState(t *testing.T) {
 		// schema is empty, so we always land here.
 		if _, ierr := pool.Exec(ctx, `
 			insert into deployments (id, app_id, status)
-			values ('00000000-0000-0000-0000-000000002288a',
-			        '00000000-0000-0000-0000-000000002288a',
+			values ('00000000-0000-0000-0000-000000002296a',
+			        '00000000-0000-0000-0000-000000002296a',
 			        'pending')`); ierr != nil {
 			t.Fatalf("insert sentinel deployment row: %v", ierr)
 		}
 		err = pool.QueryRow(ctx, `
 			select stage_state, stage_state IS NULL
 			  from deployments
-			 where id = '00000000-0000-0000-0000-000000002288a'`).Scan(&stageState, &isNull)
+			 where id = '00000000-0000-0000-0000-000000002296a'`).Scan(&stageState, &isNull)
 		if err != nil {
 			t.Fatalf("select stage_state default: %v", err)
 		}
@@ -131,7 +131,7 @@ func TestMigrations_00288_DeploymentsStageState(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update deployments
 		   set stage_state = jsonb_set(stage_state, '{current}', '"imagee_build"')
-		 where id = '00000000-0000-0000-0000-000000002288a'`); err != nil {
+		 where id = '00000000-0000-0000-0000-000000002296a'`); err != nil {
 		stageStateTypoErr = err
 	}
 	if stageStateTypoErr == nil {

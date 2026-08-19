@@ -1,27 +1,23 @@
 -- filename: 00296_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
-
--- 00296_reserve_slot.sql — cross-PR slot reservation fence.
 --
--- This slot is claimed by PR #986 (ADR-120 domain doctor,
--- 00296_domain_doctor_observations.sql). PR #910 (feat(triggers):
--- unified event-source-mapping primitive, issue #757 / ADR-100)
--- renumbered its 296/297/298 chain upward to 297/298/299 to
--- dodge this slot. The fence stays a no-op so
--- TestMigrationsContiguous sees a gap-free 1..N sequence on the
--- triggers-mega branch and the merge of #910 doesn't introduce a
--- slot gap that goose's strict findMissingMigrations would refuse
--- to apply. When PR #986 lands first, this fence should be
--- dropped (per cross-pr-slot-gate-fence-pattern); when PR #910
--- lands first, the fence stays as a held slot and PR #986's
--- chain renumbers past it on its next rebase.
+-- 00296_reserve_slot.sql — reservation fence.
+--
+-- Claimed by the deploy-stage-progress PR (branch
+-- worktree-feat-deploy-stage-progress, ADR-117). The real migration
+-- migrations/00296_deployments_stage_state.sql lands on this branch
+-- in the same PR. This file is a no-op; the test
+-- migrations/00296_deployments_stage_state_test.go applies through
+-- 00296 on the branch tip.
 
-SELECT 1;
+select 1;
 
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-SELECT 1;
+
+select 1;
+
 -- +goose StatementEnd

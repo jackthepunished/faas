@@ -4115,7 +4115,7 @@ func (m *MemStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return m.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
-// AppendDeploymentStage (ADR-117, migration 00288) — memstore
+// AppendDeploymentStage (ADR-117, migration 00296) — memstore
 // mirror of PgStore.AppendDeploymentStage. The in-memory shape
 // round-trips through JSON so the tests that exercise the SSE
 // consumer at handlers_ext_test.go and the deployment lifecycle
@@ -4136,7 +4136,7 @@ func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to 
 	}
 	if state.Current != from {
 		// Schema default for stage_state.current is
-		// "source_download" (migrations/00288). A freshly inserted
+		// "source_download" (migrations/00296). A freshly inserted
 		// row that came through CreateDeployment without an
 		// explicit StageState has Current == "" — treat that as
 		// the default so the first forward transition doesn't

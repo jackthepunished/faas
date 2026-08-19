@@ -148,9 +148,9 @@ func TestEmitStageDiff_AllSixStages(t *testing.T) {
 	}
 
 	// Tick 7: flip to failed via builderd path — same from/to.
-		// AppendDeploymentStage stamps the active row with
-		// status=failed + reason; emitStageDiff picks it up on the
-		// next poll and emits one event: stage frame with reason.
+	// AppendDeploymentStage stamps the active row with
+	// status=failed + reason; emitStageDiff picks it up on the
+	// next poll and emits one event: stage frame with reason.
 	now := time.Now().UTC()
 	failed := state.StageState{
 		Current:          state.StageReadiness,

@@ -111,7 +111,7 @@ type stageTicker struct {
 
 // stageOrderClosedSet is the canonical length of the deploy-stage
 // ticker. MUST equal the closed set in pkg/state.AllStageNames AND
-// the SCHEMA CHECK in migrations/00288. A divergence here is a
+// the SCHEMA CHECK in migrations/00296. A divergence here is a
 // customer-visible bug (the ticker silently renders the wrong
 // number of rows); renderStageTicker panics if it sees a mismatch
 // so the bug surfaces at the first `gregale deploy` invocation
@@ -132,7 +132,7 @@ const stageOrderClosedSet = 6
 // without re-allocating.
 func renderStageTicker(w io.Writer) *stageTicker {
 	if len(stageOrder) != stageOrderClosedSet {
-		panic(fmt.Sprintf("renderStageTicker: stageOrder has %d entries, want %d (closed set in pkg/state.AllStageNames + migrations/00288)", len(stageOrder), stageOrderClosedSet))
+		panic(fmt.Sprintf("renderStageTicker: stageOrder has %d entries, want %d (closed set in pkg/state.AllStageNames + migrations/00296)", len(stageOrder), stageOrderClosedSet))
 	}
 	if len(stageLabels) != stageOrderClosedSet {
 		panic(fmt.Sprintf("renderStageTicker: stageLabels has %d entries, want %d", len(stageLabels), stageOrderClosedSet))
