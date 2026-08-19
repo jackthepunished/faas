@@ -587,3 +587,80 @@ func TestFilterCriteriaJSONRoundTrip(t *testing.T) {
 		t.Errorf("round-trip drift:\n in = %+v\nout = %+v", *in, out)
 	}
 }
+
+// TestFilterMatch_JsonPathNeq_MissingKey pins the CRIT-3 (PR #993
+// / issue #757 closure) fix for the jsonpath neq missing-key
+// asymmetry. Pre-CRIT-3 the jsonpath branch unconditionally
+// returned false on got == nil (the jsonScalarEqualJSON helper
+// short-circuited), collapsing eq / neq / exists missing-key
+// cases onto a single "no match" semantic. CRIT-3 dispatches on
+// c.Op before consulting the helper:
+//
+//	- neq on missing key  → true  (Lambda ESM documented
+//	                                 behaviour; a missing key
+//	                                 trivially satisfies the
+//	                                 inequality)
+//
+// The test mirrors the header-slot path: FilterOpNeq on an
+// absent header returns true.
+func TestFilterMatch_JsonPathNeq_MissingKey(t *testing.T) {
+	filter := &FilterCriteria{
+		Payload: []FilterClause{
+			{Op: FilterOpNeq, Path: "$.missing", Value: raw("42")},
+		},
+	}
+	matched, clauseErrors := filter.MatchCount([]byte(`{"foo": 1}`), nil)
+	if !matched {
+		t.Errorf("matched = false, want true (neq on missing jsonpath key trivially matches)")
+	}
+	if clauseErrors != 0 {
+		t.Errorf("clauseErrors = %d, want 0 (no clause errored)", clauseErrors)
+	}
+}
+
+// TestFilterMatch_JsonPathEq_MissingKey pins the eq-side of
+// CRIT-3. eq on a missing jsonpath key is a no-match (the key
+// isn't there, equality fails). Pre-CRIT-3 this case was
+// silently correct (the helper returned false on got == nil)
+// but for the wrong reason — the dispatch was unconditional.
+// CRIT-3 makes the per-op dispatch explicit.
+func TestFilterMatch_JsonPathEq_MissingKey(t *testing.T) {
+	filter := &FilterCriteria{
+		Payload: []FilterClause{
+			{Op: FilterOpEq, Path: "$.missing", Value: raw("42")},
+		},
+	}
+	matched, clauseErrors := filter.MatchCount([]byte(`{"foo": 1}`), nil)
+	if matched {
+		t.Errorf("matched = true, want false (eq on missing jsonpath key does not match)")
+	}
+	if clauseErrors != 0 {
+		t.Errorf("clauseErrors = %d, want 0", clauseErrors)
+	}
+}
+
+// TestFilterMatch_JsonPathExists_MissingKey pins the exists-side
+// of CRIT-3. exists on a missing jsonpath key returns false.
+// Pre-CRIT-3 exists on missing key returned false via the
+// helper's nil short-circuit (correct, but for the wrong
+// reason); CRIT-3 makes it explicit.
+//
+// The Op is FilterOpJsonPath (not FilterOpExists) because
+// matchPayloadClauseCached routes jsonpath clauses through the
+// jsonpath branch. The clause-level op decides what we DO
+// with the resolved value; the jsonpath-vs-payload-root
+// distinction is the top-level switch.
+func TestFilterMatch_JsonPathExists_MissingKey(t *testing.T) {
+	filter := &FilterCriteria{
+		Payload: []FilterClause{
+			{Op: FilterOpExists, Path: "$.missing"},
+		},
+	}
+	matched, clauseErrors := filter.MatchCount([]byte(`{"foo": 1}`), nil)
+	if matched {
+		t.Errorf("matched = true, want false (exists on missing jsonpath key does not match)")
+	}
+	if clauseErrors != 0 {
+		t.Errorf("clauseErrors = %d, want 0", clauseErrors)
+	}
+}

@@ -388,11 +388,20 @@ func matchPayloadClauseCached(c FilterClause, payload []byte, parsed any, parsed
 	if len(payload) == 0 {
 		return false, nil
 	}
-	switch c.Op {
-	case FilterOpJsonPath:
-		if c.Path == "" {
-			return false, errors.New("jsonpath clause with empty path")
-		}
+	switch {
+	case c.Path != "":
+		// Jsonpath predicate. CRIT-3 (PR #993 / issue #757
+		// closure): the leaf semantic is taken from c.Op
+		// (eq / neq / exists), and the missing-key dispatch
+		// is explicit. Pre-CRIT-3 this branch only supported
+		// eq (jsonScalarEqualJSON returned false on got ==
+		// nil regardless of op) and neq was unreachable.
+		//
+		// FilterOpJsonPath as the leaf op (legacy marker)
+		// aliases to FilterOpEq — preserving wire-shape
+		// compatibility with pre-CRIT-3 fixtures that authored
+		// {Op: FilterOpJsonPath, Path: ..., Value: ...} for
+		// the jsonpath eq case.
 		if parsedErr != nil {
 			return false, parsedErr
 		}
@@ -400,17 +409,31 @@ func matchPayloadClauseCached(c FilterClause, payload []byte, parsed any, parsed
 		if err != nil {
 			return false, err
 		}
-		// "Path not found" (got == nil) is treated as no-match
-		// for eq; the path is meaningful even if the key is
-		// absent in this particular record.
-		return jsonScalarEqualJSON(got, c.Value), nil
-	case FilterOpEq, FilterOpNeq, FilterOpExists:
-		// A non-jsonpath payload clause is unusual but
-		// supported: treat as a payload-root eq / neq / exists
-		// (Field is ignored — payload is the implicit subject).
-		// The validator at commit 2 requires Field for non-
-		// jsonpath ops, so a hand-rolled call site is the only
-		// way to land here.
+		// Missing-key dispatch — mirrors the header-slot path
+		// (matchClause FilterOpEq / FilterOpNeq / FilterOpExists).
+		if got == nil {
+			switch c.Op {
+			case FilterOpEq, FilterOpExists, FilterOpJsonPath:
+				return false, nil
+			case FilterOpNeq:
+				return true, nil
+			}
+			return false, nil
+		}
+		switch c.Op {
+		case FilterOpEq, FilterOpJsonPath:
+			return jsonScalarEqualJSON(got, c.Value), nil
+		case FilterOpNeq:
+			return !jsonScalarEqualJSON(got, c.Value), nil
+		case FilterOpExists:
+			return true, nil
+		}
+		return false, fmt.Errorf("payload clause op %q not supported", c.Op)
+	case c.Op == FilterOpEq, c.Op == FilterOpNeq, c.Op == FilterOpExists:
+		// Payload-root predicate (no Path). Treat the parsed
+		// root as the subject. The validator at commit 2
+		// requires Field for non-jsonpath ops, so a hand-rolled
+		// call site is the only way to land here.
 		if parsedErr != nil {
 			return false, parsedErr
 		}
@@ -464,10 +487,16 @@ func jsonScalarEqual(got string, want json.RawMessage) bool {
 // (which is the JSON-decoded value at the path, or nil if the
 // path was not found) to a json.RawMessage expected value.
 //
-// The "path not found" case (got == nil) is treated as a no-
-// match for eq; for neq, it IS a match (a missing key
-// trivially satisfies the inequality). For jsonpath this
-// matches Lambda's documented behaviour.
+// CRIT-3 (PR #993 / issue #757 closure): the missing-key
+// (got == nil) case is now dispatched at the call site
+// (matchPayloadClauseCached's jsonpath branch) BEFORE this
+// helper runs. This helper is therefore invoked only with
+// non-nil got values; the got == nil short-circuit at the
+// top of this function is defensive and unreachable from the
+// production call path. The pre-CRIT-3 semantic —
+// "got == nil is always no-match regardless of op" — was the
+// bug CRIT-3 fixed: it collapsed eq / neq / exists missing-key
+// cases onto a single semantic.
 func jsonScalarEqualJSON(got any, want json.RawMessage) bool {
 	if got == nil {
 		return false
