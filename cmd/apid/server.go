@@ -913,6 +913,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/account/slo", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getAccountSLO))))
 	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateApp))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteApp))))
+	// Mega-C PR-1 / issue #961 leaf 3: one-click preview destroy
+	// from a PR comment. Distinct URL from DELETE /v1/apps/{slug}
+	// so production apps do not collide with the preview-specific
+	// path. Same auth chain (authLimited → requireMFA →
+	// requireScope(DeployWriteSurface)) as the production delete
+	// — destroying a preview is just as destructive as destroying
+	// a production app from the customer's POV.
+	mux.HandleFunc("POST /v1/preview/{slug}/destroy", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.destroyPreview))))
 	// Issue #472 / ADR-054 — admin-only signature-enforcement toggle.
 	// Mounted with the admin+MFA chain (mirrors PATCH /v1/account/plan
 	// at server.go:516) so a customer cannot self-onboard signature

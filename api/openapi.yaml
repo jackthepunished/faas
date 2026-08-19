@@ -1435,6 +1435,34 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/preview/{slug}/destroy:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    post:
+      tags: [previews]
+      operationId: destroyPreview
+      summary: Tear down a preview app.
+      description: |
+        One-click destroy of a preview app row (issue #961 Mega-C PR-1,
+        leaf 3). Typically fired from a "Tear down this preview" link
+        posted to the GitHub PR by `pkg/githubd`. Distinct from
+        `DELETE /v1/apps/{slug}` because the preview teardown also
+        stamps `apps.preview_pr_state='torn_down'` so the janitor
+        doesn't re-process the row on a subsequent tick, and emits a
+        distinct audit kind (`preview.destroyed_by_customer` vs
+        `app.deleted`).
+      responses:
+        '204': { description: No body. The preview was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '404 — slug does not identify a preview app. Use DELETE /v1/apps/{slug} to destroy a production app.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+                example: {"type":"https://docs.gregale.dev/errors/preview-not-found","code":"preview_not_found","title":"Preview not found","detail":"the slug does not identify a preview app; use DELETE /v1/apps/{slug} to destroy a production app","status":404}
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/apps/{slug}/metrics:
     parameters:
       - $ref: '#/components/parameters/Slug'
