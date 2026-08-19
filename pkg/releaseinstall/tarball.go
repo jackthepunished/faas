@@ -142,13 +142,19 @@ func tarGzBin(bin string, daemonNames []string) ([]byte, error) {
 	tw := tar.NewWriter(gz)
 
 	for _, name := range daemonNames {
-		binPath := filepath.Join(bin, name)
+		binPath, resolveErr := resolveBinary(bin, name)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve %s: %w", name, resolveErr)
+		}
 		body, err := os.ReadFile(binPath)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", binPath, err)
 		}
 		hdr := &tar.Header{
-			Name:     name,
+			// Preserve the actual executable filename in the canonical
+			// tarball. The manifest key remains the logical name; the
+			// extracted tree must be runnable by the systemd units.
+			Name:     filepath.Base(binPath),
 			Mode:     0o755,
 			Uid:      0,
 			Gid:      0,
@@ -444,6 +450,9 @@ func (t *Tarball) hashWalk() error {
 		}
 		gotHex, ok := entryHashes[name]
 		if !ok {
+			gotHex, ok = entryHashes[executableName(name)]
+		}
+		if !ok {
 			return fmt.Errorf("%w: tarball missing daemon %s", ErrTarballTampered, name)
 		}
 		if gotHex != wantHex {
@@ -456,7 +465,7 @@ func (t *Tarball) hashWalk() error {
 	}
 	var unknown []string
 	for name := range entryHashes {
-		if _, ok := roster[name]; !ok {
+		if _, ok := roster[name]; !ok && !IsCatalogBinaryName(name) {
 			unknown = append(unknown, name)
 		}
 	}

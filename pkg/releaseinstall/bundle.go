@@ -119,7 +119,10 @@ func Build(root, gitSHA, manifestHash string, now time.Time) (Manifest, error) {
 			// PR-5's denylist applies to binaries too.
 			return Manifest{}, fmt.Errorf("releaseinstall: forbidden daemon name %q (issue #911 denylist: faas-tunnel)", name)
 		}
-		binPath := filepath.Join(bin, name)
+		binPath, resolveErr := resolveBinary(bin, name)
+		if resolveErr != nil {
+			return Manifest{}, fmt.Errorf("releaseinstall: resolve %s: %w", name, resolveErr)
+		}
 		hash, err := hashFile(binPath)
 		if err != nil {
 			return Manifest{}, fmt.Errorf("releaseinstall: hash %s: %w", binPath, err)
@@ -216,7 +219,10 @@ func Verify(root string, m Manifest) error {
 		if !ok {
 			return fmt.Errorf("releaseinstall: manifest missing daemon %s", name)
 		}
-		binPath := filepath.Join(bin, name)
+		binPath, resolveErr := resolveBinary(bin, name)
+		if resolveErr != nil {
+			return fmt.Errorf("releaseinstall: resolve %s: %w", name, resolveErr)
+		}
 		got, err := hashFile(binPath)
 		if err != nil {
 			return fmt.Errorf("releaseinstall: hash %s: %w", binPath, err)
@@ -228,9 +234,12 @@ func Verify(root string, m Manifest) error {
 	// Walk the bin directory and reject any file that isn't a
 	// catalog daemon (names from manifest.SortedHostKeys()).
 	// Mirrors pkg/releasebundle.Verify's "unexpected files" check.
-	catalog := make(map[string]struct{}, len(daemonNames))
+	catalog := make(map[string]struct{}, len(daemonNames)*2)
 	for _, name := range daemonNames {
 		catalog[name] = struct{}{}
+		if canonical := executableName(name); canonical != name {
+			catalog[canonical] = struct{}{}
+		}
 	}
 	walkRoot := bin
 	if info, err := os.Lstat(bin); err == nil && info.Mode()&os.ModeSymlink != 0 {

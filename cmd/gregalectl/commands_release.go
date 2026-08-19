@@ -237,6 +237,13 @@ func copyBinIntoRelease(releasesRoot, gitSHA, srcDir string) error {
 		if e.IsDir() {
 			continue
 		}
+		// The normal daemon build directory also contains the customer
+		// and operator CLIs. A cluster release bundle is the nine-daemon
+		// artifact, so ignore those non-daemon files here; Build will still
+		// fail closed if any catalog daemon is missing.
+		if !releaseinstall.IsCatalogBinaryName(e.Name()) {
+			continue
+		}
 		src := filepath.Join(srcDir, e.Name())
 		dst := filepath.Join(bin, e.Name())
 		body, err := os.ReadFile(src)
