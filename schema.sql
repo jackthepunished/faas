@@ -192,6 +192,20 @@ $$;
 
 
 --
+-- Name: cors_presets_set_updated_at(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.cors_presets_set_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: edge_rules_set_updated_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1051,6 +1065,29 @@ COMMENT ON COLUMN public.compute_nodes.role IS 'per-node role label: control-pla
 --
 
 COMMENT ON COLUMN public.compute_nodes.generation IS 'monotonic counter bumped by PR-4 doctor on per-node inconsistency detection (PR-3a). Default 0; never decreases.';
+
+
+--
+-- Name: cors_presets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.cors_presets (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid,
+    name text NOT NULL,
+    description text,
+    allow_origins text[] NOT NULL,
+    allow_methods text[] NOT NULL,
+    allow_headers text[] DEFAULT '{}'::text[] NOT NULL,
+    expose_headers text[] DEFAULT '{}'::text[] NOT NULL,
+    allow_credentials boolean DEFAULT false NOT NULL,
+    max_age_seconds integer DEFAULT 600 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT cors_presets_name_check CHECK (((length(name) >= 1) AND (length(name) <= 64))),
+    CONSTRAINT cors_presets_max_age_check CHECK (((max_age_seconds >= 0) AND (max_age_seconds <= 86400)))
+);
 
 
 --
@@ -2481,6 +2518,22 @@ ALTER TABLE ONLY public.compute_nodes
 
 
 --
+-- Name: cors_presets cors_presets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cors_presets
+    ADD CONSTRAINT cors_presets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: cors_presets cors_presets_unique_name; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cors_presets
+    ADD CONSTRAINT cors_presets_unique_name UNIQUE (account_id, COALESCE(app_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+
+
+--
 -- Name: credit_ledger credit_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3370,6 +3423,13 @@ CREATE INDEX compute_nodes_region_zone_idx ON public.compute_nodes USING btree (
 
 
 --
+-- Name: cors_presets_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cors_presets_account_idx ON public.cors_presets USING btree (account_id);
+
+
+--
 -- Name: credit_ledger_account_created_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4189,6 +4249,13 @@ CREATE TRIGGER compute_node_keys_changed_trg AFTER INSERT OR DELETE OR UPDATE ON
 
 
 --
+-- Name: cors_presets cors_presets_set_updated_at_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER cors_presets_set_updated_at_trg BEFORE UPDATE ON public.cors_presets FOR EACH ROW EXECUTE FUNCTION public.cors_presets_set_updated_at();
+
+
+--
 -- Name: data_upstreams data_upstreams_notify_trg; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -4598,6 +4665,22 @@ ALTER TABLE ONLY public.compute_node_heartbeats
 
 ALTER TABLE ONLY public.compute_node_keys
     ADD CONSTRAINT compute_node_keys_compute_node_id_fkey FOREIGN KEY (compute_node_id) REFERENCES public.compute_nodes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: cors_presets cors_presets_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cors_presets
+    ADD CONSTRAINT cors_presets_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: cors_presets cors_presets_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cors_presets
+    ADD CONSTRAINT cors_presets_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
 
 
 --
