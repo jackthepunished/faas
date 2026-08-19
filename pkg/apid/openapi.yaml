@@ -3524,9 +3524,8 @@ paths:
                     type: string
                     enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
                   current_started_at:
-                    type: string
+                    type: [string, "null"]
                     format: date-time
-                    nullable: true
                   history:
                     type: array
                     items:
@@ -3536,13 +3535,11 @@ paths:
                           type: string
                           enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
                         started_at:
-                          type: string
+                          type: [string, "null"]
                           format: date-time
-                          nullable: true
                         ended_at:
-                          type: string
+                          type: [string, "null"]
                           format: date-time
-                          nullable: true
                         duration_ms:
                           type: integer
                           format: int64

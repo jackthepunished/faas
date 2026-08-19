@@ -243,14 +243,14 @@ func formatStageDuration(durationMs int64, status, reason string) string {
 //
 // Layout:
 //
-//	  ✓  Source downloaded         1.2s
-//	  ✓  Dependencies restored     4.8s
-//	  ✓  Image built               8.1s
-//	  ✓  Security scan             2.1s
-//	  ✓  Snapshot prepared        12.6s
-//	  ✓  Readiness passed          0.4s
+//	✓  Source downloaded         1.2s
+//	✓  Dependencies restored     4.8s
+//	✓  Image built               8.1s
+//	✓  Security scan             2.1s
+//	✓  Snapshot prepared        12.6s
+//	✓  Readiness passed          0.4s
 //
-//	  Total: 29.1s · live since 2026-08-19 18:42 UTC
+//	Total: 29.1s · live since 2026-08-19 18:42 UTC
 //
 // The "live since" footer is only emitted for terminal-live
 // deployments (status: "live" on deployments.status); terminal-failed
@@ -281,9 +281,9 @@ func renderDeploySummary(w io.Writer, ss state.StageState, status string, termin
 	for _, name := range stageOrder {
 		item, ok := byName[name]
 		var (
-			status  string
-			durMs   int64
-			reason  string
+			status string
+			durMs  int64
+			reason string
 		)
 		switch {
 		case !ok && ss.Current == name:
@@ -327,11 +327,11 @@ func renderDeploySummary(w io.Writer, ss state.StageState, status string, termin
 	}
 	if !terminalAt.IsZero() {
 		switch status {
-		case "live":
+		case statusLive:
 			if _, err := fmt.Fprintf(w, " · live since %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
 				return fmt.Errorf("renderDeploySummary: write live since: %w", err)
 			}
-		case "failed":
+		case stageStatusFailed:
 			if _, err := fmt.Fprintf(w, " · failed at %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
 				return fmt.Errorf("renderDeploySummary: write failed at: %w", err)
 			}
