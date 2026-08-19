@@ -5067,3 +5067,118 @@ func TestMemStore_ListAllEventsPaged_ValidSubject(t *testing.T) {
 		t.Errorf("subject: got %v, want %s", got[0].Subject, subjectA)
 	}
 }
+
+// TestMemStoreAppendDeploymentStage covers the four cases of
+// AppendDeploymentStage + MarkDeploymentStageFailed + CloseDeploymentStage
+// (ADR-117 §3 + PR-A review fixes): forward transition, failure
+// stamp on the in-flight stage, terminal close, and the stale-read
+// guard. The PGStore path is exercised by the JSONB + CHECK migration
+// test (migrations/00302_deployments_stage_state_test.go); the
+// in-memory store mirrors the same shape so the same test contract
+// fits both backends.
+func TestMemStoreAppendDeploymentStage(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+	acc, err := s.CreateAccount(ctx, "deploy-stage@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, App{AccountID: acc.ID, Slug: "deploy-stage-app"})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := s.CreateDeployment(ctx, Deployment{ID: "d-stage-test", AppID: app.ID, Status: DeployPending, ImageDigest: "sha:latest"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	now := time.Now().UTC()
+	// Case 1: forward transition source_download -> dependency_restore.
+	got, err := s.AppendDeploymentStage(ctx, dep.ID, StageSourceDownload, StageDependencyRestore, now, "")
+	if err != nil {
+		t.Fatalf("forward transition: %v", err)
+	}
+	if got.Status != DeployPending {
+		t.Errorf("forward transition flipped status: got %s, want %s", got.Status, DeployPending)
+	}
+	// Case 2: from==to is now an error (PR-A review fix F3: the
+	// previous failure-stamp overload mutated history[len-1] which
+	// was the wrong stage). Failure stamps must go through
+	// MarkDeploymentStageFailed.
+	if _, err := s.AppendDeploymentStage(ctx, dep.ID, StageDependencyRestore, StageDependencyRestore, now.Add(time.Second), ""); err == nil {
+		t.Errorf("from==to AppendDeploymentStage should error, got nil")
+	}
+	// Case 3: MarkDeploymentStageFailed stamps the in-flight stage
+	// (dependency_restore) and moves it into history with status
+	// "failed". The customer's ticker sees the actual failing
+	// stage, not the previously-closed one.
+	got, err = s.MarkDeploymentStageFailed(ctx, dep.ID, now.Add(time.Second), "build failed: dep foo")
+	if err != nil {
+		t.Fatalf("MarkDeploymentStageFailed: %v", err)
+	}
+	if got.Status != DeployPending {
+		t.Errorf("failure stamp flipped status: got %s, want %s", got.Status, DeployPending)
+	}
+	var state StageState
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state: %v", err)
+	}
+	if state.Current != "" {
+		t.Errorf("after failure stamp: current = %q, want \"\" (cleared)", state.Current)
+	}
+	// History must contain dependency_restore as the failing stage
+	// (PR-A review fix F3: the previous version stamped history[0]
+	// which was source_download — the previously-closed stage —
+	// instead of the in-flight dependency_restore).
+	if len(state.History) != 2 {
+		t.Fatalf("history length after failure: got %d, want 2: %+v", len(state.History), state.History)
+	}
+	if state.History[1].Name != StageDependencyRestore {
+		t.Errorf("history[1].Name = %q, want %q (the in-flight stage)", state.History[1].Name, StageDependencyRestore)
+	}
+	if state.History[1].Status != "failed" {
+		t.Errorf("history[1].Status = %q, want failed", state.History[1].Status)
+	}
+	if state.History[1].Reason != "build failed: dep foo" {
+		t.Errorf("history[1].Reason = %q, want %q", state.History[1].Reason, "build failed: dep foo")
+	}
+	// Case 4: stale transition (current != from) returns ErrNotFound.
+	if _, err := s.AppendDeploymentStage(ctx, dep.ID, StageImageBuild, StageSnapshotPrepare, now, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("stale from: expected ErrNotFound, got %v", err)
+	}
+	// Case 5: CloseDeploymentStage on a fresh row stamps the
+	// in-flight stage as completed and clears Current. Used by
+	// imaged.MarkDeploymentLive to close the readiness stage so
+	// the customer's ticker carries a duration_ms.
+	dep2, err := s.CreateDeployment(ctx, Deployment{ID: "d-stage-test-2", AppID: app.ID, Status: DeployPending, ImageDigest: "sha:latest2"})
+	if err != nil {
+		t.Fatalf("CreateDeployment #2: %v", err)
+	}
+	if _, err := s.AppendDeploymentStage(ctx, dep2.ID, StageSourceDownload, StageReadiness, now, ""); err != nil {
+		t.Fatalf("AppendDeploymentStage readiness: %v", err)
+	}
+	got, err = s.CloseDeploymentStage(ctx, dep2.ID, StageReadiness, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("CloseDeploymentStage: %v", err)
+	}
+	if err := json.Unmarshal(got.StageState, &state); err != nil {
+		t.Fatalf("decode stage_state #2: %v", err)
+	}
+	if state.Current != "" {
+		t.Errorf("after CloseDeploymentStage: current = %q, want \"\"", state.Current)
+	}
+	if len(state.History) != 2 {
+		t.Fatalf("history length after close: got %d, want 2: %+v", len(state.History), state.History)
+	}
+	if state.History[1].Name != StageReadiness {
+		t.Errorf("history[1].Name = %q, want %q", state.History[1].Name, StageReadiness)
+	}
+	if state.History[1].Status != "completed" {
+		t.Errorf("history[1].Status = %q, want completed", state.History[1].Status)
+	}
+	// Case 6: CloseDeploymentStage on a row whose Current != name
+	// returns ErrNotFound (programming-error guard).
+	if _, err := s.CloseDeploymentStage(ctx, dep2.ID, StageSourceDownload, now); !errors.Is(err, ErrNotFound) {
+		t.Errorf("CloseDeploymentStage with wrong name: expected ErrNotFound, got %v", err)
+	}
+}

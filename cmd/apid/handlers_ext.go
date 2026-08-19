@@ -4223,6 +4223,14 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 	statusTicker := time.NewTicker(2 * time.Second)
 	defer statusTicker.Stop()
 
+	// ADR-117 §3: per-connection set of stages already announced so
+	// the diff on each tick emits `event: stage` exactly once. The
+	// closed 6-stage vocabulary is encoded in pkg/state.StageName
+	// consts; `announced` is keyed by StageName so the jsonb row's
+	// `current` field maps straight through without a string copy.
+	announced := make(map[state.StageName]string)
+	var lastStageStateRaw []byte
+
 	// Move 3: one-shot backstop timer (replaces per-iteration
 	// time.After(10*time.Minute), which was never reaping the timer
 	// on a busy stream — the select arm would re-allocate a fresh
@@ -4257,13 +4265,30 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 			// Cheap status poll. Emits `event: status` and exits
 			// when the deployment reaches a terminal state. The
 			// 10-min backstop below still fires if something hangs.
-			if d2, err := s.store.DeploymentByID(r.Context(), id); err == nil &&
-				(d2.Status == state.DeployLive || d2.Status == state.DeployFailed) {
-				_, _ = fmt.Fprintf(w, "event: status\ndata: {\"status\":%q}\n\n", d2.Status)
-				if flusher != nil {
-					flusher.Flush()
+			//
+			// ADR-117 §3: same poll also diffs `stage_state` and
+			// emits `event: stage` for any new entries. The
+			// per-connection `announced` map dedupes across ticks;
+			// the jsonb `current` is read every poll so we never
+			// miss an in-flight stage flip even if the subscriber
+			// raced ahead. The terminal `DeployFailed` flip is
+			// covered by imaged's `markDeployFailed` (handler.go:
+			// 2371) and builderd's `markFailed` (builderd.go:653)
+			// — both call `AppendDeploymentStage(from==to, reason)`
+			// which stamps the active row as failed before this
+			// poll sees it. The terminal `DeployLive` flip is
+			// covered by imaged's `MarkDeploymentLive` (handler.go:
+			// 2240) which appends `snapshot_prepare → readiness`.
+			if d2, err := s.store.DeploymentByID(r.Context(), id); err == nil {
+				if d2.Status == state.DeployLive || d2.Status == state.DeployFailed {
+					emitStageDiff(w, flusher, d2.StageState, announced, &lastStageStateRaw)
+					_, _ = fmt.Fprintf(w, "event: status\ndata: {\"status\":%q}\n\n", d2.Status)
+					if flusher != nil {
+						flusher.Flush()
+					}
+					return
 				}
-				return
+				emitStageDiff(w, flusher, d2.StageState, announced, &lastStageStateRaw)
 			}
 		case <-ticker.C:
 			// heartbeat — keeps idle proxies from dropping the
@@ -4279,6 +4304,110 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 			}
 			return
 		}
+	}
+}
+
+// stage emission status enum. Same shape as the wire JSON
+// payload (cmd/apid/handlers_ext.go::emitStageFrame) and the
+// CLI renderer (cmd/gregale/deploy_stages.go::stageStatus*).
+// Local to this file so the goconst tripwire (3+ occurrences)
+// stays under the threshold for the cross-file "completed"
+// literal — every reference here is via the const.
+const (
+	stageStatusInProgress = "in_progress"
+	stageStatusCompleted  = "completed"
+	stageStatusFailed     = "failed"
+)
+
+// emitStageDiff diffs the jsonb stage_state against the per-connection
+// `announced` set and writes one `event: stage` SSE frame for each
+// stage that has not yet been emitted on this connection.
+//
+// ADR-117 §3 wire shape:
+//
+//	event: stage
+//	data: {"name":"<StageName>","started_at":"<RFC3339Nano>","duration_ms":<int64>,"status":"in_progress"|"completed"|"failed"[,"reason":"<string>"]}
+//
+// `announced` is a 3-state tracking set:
+//   - absent: never seen this stage
+//   - "in_progress": emitted the in_progress frame for this stage
+//   - "completed":   emitted the terminal frame (completed/failed) for
+//     this stage
+//
+// We can't fold the two into one boolean — a stage needs both an
+// in_progress frame and a terminal frame across the connection's
+// lifetime, and conflating them drops the terminal one.
+//
+// `lastRaw` is an in-loop scratch buffer that lets us avoid a jsonb
+// re-decode when the row hasn't changed since the last tick. The
+// buffer is intentionally per-connection (not shared across SSE
+// subscribers) because each subscriber needs its own dedup state;
+// shared state would emit one subscriber's frames to all of them.
+func emitStageDiff(w http.ResponseWriter, flusher http.Flusher, raw json.RawMessage, announced map[state.StageName]string, lastRaw *[]byte) {
+	if len(raw) == 0 {
+		return
+	}
+	// Cheap byte-equality short-circuit: identical row, no work.
+	if *lastRaw != nil && string(*lastRaw) == string(raw) {
+		return
+	}
+	*lastRaw = append((*lastRaw)[:0], raw...)
+	var ss state.StageState
+	if err := json.Unmarshal(raw, &ss); err != nil || ss.Current == "" {
+		return
+	}
+	// 1) walk history for any terminal entries we haven't emitted yet.
+	// History is append-only by AppendDeploymentStage so we never
+	// replay an old row; the dedup is purely for late subscribers
+	// who joined mid-deploy and for the case where imaged stamps a
+	// failure after the in_progress frame was already emitted.
+	for _, item := range ss.History {
+		if announced[item.Name] == stageStatusCompleted {
+			continue
+		}
+		st := item.Status
+		if st == "" {
+			st = stageStatusCompleted
+		}
+		emitStageFrame(w, flusher, item, st, item.DurationMs, item.Reason)
+		announced[item.Name] = stageStatusCompleted
+	}
+	// 2) in_progress frame for the active row, only the first time we
+	// see it on this connection. imaged's transitionWithStage
+	// appends the OUTGOING stage to history before flipping current;
+	// the SSE consumer therefore sees the completed frame for the
+	// prior stage AND the in_progress frame for the new stage on the
+	// same tick — that ordering is intentional (the customer reads
+	// "stage X finished 1.2s ago, stage Y is now in flight").
+	if announced[ss.Current] == "" {
+		startedAt := ss.CurrentStartedAt // already *time.Time
+		emitStageFrame(w, flusher, state.StageStateItem{
+			Name:      ss.Current,
+			StartedAt: startedAt,
+		}, "in_progress", 0, "")
+		announced[ss.Current] = "in_progress"
+	}
+}
+
+// emitStageFrame writes one `event: stage` SSE frame. Mirrors the
+// fmt.Fprintf pattern used by the status arm at lines 4218-4221. The
+// hand-format keeps the wire shape grep-able from cmd/gregale/sse
+// decoder tests and avoids pulling in apislogs.WriteEvent (out of
+// scope for ADR-117).
+func emitStageFrame(w http.ResponseWriter, flusher http.Flusher, item state.StageStateItem, status string, durationMs int64, reason string) {
+	payload := map[string]any{
+		"name":        string(item.Name),
+		"started_at":  item.StartedAt.UTC().Format(time.RFC3339Nano),
+		"duration_ms": durationMs,
+		"status":      status,
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	encoded, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(w, "event: stage\ndata: %s\n\n", encoded)
+	if flusher != nil {
+		flusher.Flush()
 	}
 }
 
