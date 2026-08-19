@@ -720,7 +720,7 @@ func (b *Builderd) markFailedEx(ctx context.Context, depID, buildID string, fc s
 	if pkg != "" {
 		observed = pkg
 	}
-	whycopy.Decorate(problem, code, observed)
+	_ = whycopy.Decorate(problem, code, observed)
 	// 3. Persist the prose on the deployment row. Best-effort: a
 	// failure here is logged but does not block the legacy
 	// markFailed counters / metering / events — the deployment row

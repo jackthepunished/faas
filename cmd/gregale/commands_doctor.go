@@ -432,8 +432,17 @@ func scanEnvRefs(root string, re *regexp.Regexp) []string {
 func loadDeclaredEnv(path string) map[string]bool {
 	declared := map[string]bool{}
 	// 1. Modern path: `.env` (the customer-authored file).
+	// Route through openCustomerFile (cmd/gregale/commands5.go:493)
+	// so the pre-open + post-open Lstat discipline fires — a
+	// customer could `ln -sf` the .env to /etc/passwd between our
+	// scan and the read, and openCustomerFile is the boundary
+	// that catches it. The bare os.Open in the legacy fallback
+	// below is on the apid-persistence path and is the documented
+	// exception (commands_doctor.go is in the lint-tripwire
+	// exceptions list alongside commands_doctor.go's own
+	// filepath.Walk callbacks).
 	envPath := filepath.Join(path, ".env")
-	if f, err := os.Open(envPath); err == nil {
+	if f, err := openCustomerFile(envPath); err == nil {
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
