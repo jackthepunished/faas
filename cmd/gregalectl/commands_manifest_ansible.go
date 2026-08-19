@@ -110,10 +110,8 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 	var controlPlane, computeOnly []string
 	var hostVars []manifestAnsibleFile
 	for _, host := range m.Fleet.Hosts {
-		ansibleHost := "127.0.0.1"
 		targetURL := ""
-		var parseErr error
-		ansibleHost, _, parseErr = manifest.ParseHostPort(host.Address)
+		ansibleHost, _, parseErr := manifest.ParseHostPort(host.Address)
 		if parseErr != nil {
 			return nil, fmt.Errorf("host %s: %w", host.Name, parseErr)
 		}
