@@ -71,7 +71,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// entirely. Handler returns 402 CodePlanTriggersNotAllowed
 			// before the store is touched; the 0/0/0/0/0/0/0 tuple
 			// here is the defence-in-depth value the store still reads.
-			TriggersAllowed: false, TriggerLimitPerApp: 0, TriggerLimitPerAccount: 0, TriggerBatchSizeMax: 0, TriggerBatchWindowMaxSec: 0, TriggerMaxAttemptsMax: 0, TriggerRecordsPerSecondPerApp: 0, TriggerPayloadMaxBytes: 0,
+			TriggersAllowed: false, TriggerLimitPerApp: 0, TriggerLimitPerAccount: 0, TriggerBatchSizeMax: 0, TriggerBatchWindowMaxSec: 0, TriggerMaxAttemptsMax: 0, TriggerRecordsPerSecondPerApp: 0, TriggerPayloadMaxBytes: 0, MaxESMSourcesPerApp: 0, MaxESMRecordsPerSecond: 0, BrokerEgressMbit: 0, TLSSkipVerifyAllowed: false,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
@@ -196,7 +196,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// sqs_compat kinds. Tight caps (50/30s/3) so a Hobby
 			// customer's fan-out can't saturate schedd's per-app
 			// WakeRateLimiter bucket.
-			TriggersAllowed: true, TriggerLimitPerApp: 2, TriggerLimitPerAccount: 10, TriggerBatchSizeMax: 50, TriggerBatchWindowMaxSec: 30, TriggerMaxAttemptsMax: 3, TriggerRecordsPerSecondPerApp: 100, TriggerPayloadMaxBytes: 1048576,
+			TriggersAllowed: true, TriggerLimitPerApp: 2, TriggerLimitPerAccount: 10, TriggerBatchSizeMax: 50, TriggerBatchWindowMaxSec: 30, TriggerMaxAttemptsMax: 3, TriggerRecordsPerSecondPerApp: 100, TriggerPayloadMaxBytes: 1048576, MaxESMSourcesPerApp: 2, MaxESMRecordsPerSecond: 100, BrokerEgressMbit: 10, TLSSkipVerifyAllowed: false,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
@@ -311,7 +311,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// broker kinds unlock (Kafka/NATS/Redis-streams). Caps jump
 			// to 10/50 + 500/5min/10 attempts so a Pro customer's
 			// 1k-msg/s Kafka consumer can be drained with one trigger.
-			TriggersAllowed: true, TriggerLimitPerApp: 10, TriggerLimitPerAccount: 50, TriggerBatchSizeMax: 500, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 10, TriggerRecordsPerSecondPerApp: 1000, TriggerPayloadMaxBytes: 6291456,
+			TriggersAllowed: true, TriggerLimitPerApp: 10, TriggerLimitPerAccount: 50, TriggerBatchSizeMax: 500, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 10, TriggerRecordsPerSecondPerApp: 1000, TriggerPayloadMaxBytes: 6291456, MaxESMSourcesPerApp: 10, MaxESMRecordsPerSecond: 1000, BrokerEgressMbit: 50, TLSSkipVerifyAllowed: true,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
 			// ADR-104: Pro gets 5000 — meaningful per-tenant
@@ -431,7 +431,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the SQL CHECK ceilings (5000 records / 5 min window /
 			// 25 attempts) so a Scale customer's SQS-compatible or
 			// Kafka consumer can be drained at full throughput.
-			TriggersAllowed: true, TriggerLimitPerApp: 50, TriggerLimitPerAccount: 200, TriggerBatchSizeMax: 5000, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 25, TriggerRecordsPerSecondPerApp: 10000, TriggerPayloadMaxBytes: 16777216,
+			TriggersAllowed: true, TriggerLimitPerApp: 50, TriggerLimitPerAccount: 200, TriggerBatchSizeMax: 5000, TriggerBatchWindowMaxSec: 300, TriggerMaxAttemptsMax: 25, TriggerRecordsPerSecondPerApp: 10000, TriggerPayloadMaxBytes: 16777216, MaxESMSourcesPerApp: 50, MaxESMRecordsPerSecond: 10000, BrokerEgressMbit: 200, TLSSkipVerifyAllowed: true,
 			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
@@ -1197,6 +1197,112 @@ func TestPlanTriggerAccessorsMatchTable(t *testing.T) {
 		}
 		if got, want := p.TriggerRecordsPerSecondPerApp(), l.TriggerRecordsPerSecondPerApp; got != want {
 			t.Errorf("Plan(%s).TriggerRecordsPerSecondPerApp() = %d, table = %d", p, got, want)
+		}
+		// ADR-118 / issue #757 closure (commit 3 of 11) — the
+		// ESM-alias + broker-egress + TLS-skip-verify fields.
+		// Pin the accessor↔struct match so a future contributor
+		// can't drift them apart.
+		if got, want := p.MaxESMSourcesPerApp(), l.MaxESMSourcesPerApp; got != want {
+			t.Errorf("Plan(%s).MaxESMSourcesPerApp() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.MaxESMRecordsPerSecond(), l.MaxESMRecordsPerSecond; got != want {
+			t.Errorf("Plan(%s).MaxESMRecordsPerSecond() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.BrokerEgressMbit(), l.BrokerEgressMbit; got != want {
+			t.Errorf("Plan(%s).BrokerEgressMbit() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.TLSSkipVerifyAllowed(), l.TLSSkipVerifyAllowed; got != want {
+			t.Errorf("Plan(%s).TLSSkipVerifyAllowed() = %v, table = %v", p, got, want)
+		}
+	}
+}
+
+// TestPlanMaxESMSourcesPerApp pins the operator-facing alias
+// for TriggerLimitPerApp (ADR-118 / issue #757 closure).
+// Mirrors TriggerLimitPerApp exactly: 0 / 2 / 10 / 50.
+// Unknown plans fail closed (return 0).
+func TestPlanMaxESMSourcesPerApp(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 2},
+		{PlanPro, 10},
+		{PlanScale, 50},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.MaxESMSourcesPerApp(); got != c.want {
+			t.Errorf("%s.MaxESMSourcesPerApp() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanMaxESMRecordsPerSecond pins the operator-facing alias
+// for TriggerRecordsPerSecondPerApp. Mirrors exactly:
+// 0 / 100 / 1000 / 10000. Unknown plans fail closed.
+func TestPlanMaxESMRecordsPerSecond(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 100},
+		{PlanPro, 1000},
+		{PlanScale, 10000},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.MaxESMRecordsPerSecond(); got != c.want {
+			t.Errorf("%s.MaxESMRecordsPerSecond() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanBrokerEgressMbit pins the per-app broker-egress cap
+// (ADR-118 / commit 8 of 11). Hobby 10 / Pro 50 / Scale 200.
+// 0 for Free (gated off via TriggersAllowed=false). The cap is
+// enforced via the faas-brokerq.slice cgroup + tc commands.
+// Unknown plans fail closed (return 0).
+func TestPlanBrokerEgressMbit(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 10},
+		{PlanPro, 50},
+		{PlanScale, 200},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.BrokerEgressMbit(); got != c.want {
+			t.Errorf("%s.BrokerEgressMbit() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanTLSSkipVerifyAllowed pins the per-plan feature gate
+// for `tls.skip_verify=true` on KafkaConfig (ADR-118 / commit
+// 2 of 11). Hobby=false (a Hobby customer's plaintext-TLS path
+// doesn't justify the weakened-verification posture). Pro /
+// Scale = true. Free = false (gated off). Unknown plans fail
+// closed (return false) — same contract as TriggersAllowed().
+func TestPlanTLSSkipVerifyAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.TLSSkipVerifyAllowed(); got != c.want {
+			t.Errorf("%s.TLSSkipVerifyAllowed() = %v, want %v", c.plan, got, c.want)
 		}
 	}
 }

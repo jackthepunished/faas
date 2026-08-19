@@ -701,6 +701,39 @@ type Limits struct {
 	// Hobby 1 MiB / Pro 6 MiB / Scale 16 MiB. apid's createTrigger
 	// handler rejects a value above the plan cap with
 	// trigger_payload_too_large before the SQL CHECK fires.
+	// MaxESMSourcesPerApp (ADR-118 / issue #757 closure, commit 3
+	// of 11) is the operator-facing ALIAS for TriggerLimitPerApp
+	// surfaced on GET /v1/plans/{slug}/limits under the
+	// "max_esm_sources_per_app" key. Dual-emit per ADR-118
+	// §"Audit vocabulary bridging": trigger.* is canonical,
+	// esm.* is the operator alias. Values mirror
+	// TriggerLimitPerApp exactly (0 / 2 / 10 / 50). The runtime
+	// admission path reads TriggerLimitPerApp — MaxESMSourcesPerApp
+	// exists only so the dashboard can render both labels without
+	// a wire-shape diff.
+	MaxESMSourcesPerApp int
+	// MaxESMRecordsPerSecond (ADR-118) is the operator-facing
+	// alias for TriggerRecordsPerSecondPerApp. Same dual-emit
+	// rationale as MaxESMSourcesPerApp. Values mirror exactly
+	// (0 / 100 / 1000 / 10000).
+	MaxESMRecordsPerSecond int
+	// BrokerEgressMbit (ADR-118 / commit 8 of 11) caps the
+	// per-app broker egress bandwidth in megabits per second
+	// the broker poll goroutines (pkg/sched/broker_egress.go)
+	// may sustain. Enforced via the faas-brokerq.slice cgroup
+	// + tc commands. Hobby 10 / Pro 50 / Scale 200. 0 for Free
+	// (gated off via TriggersAllowed=false). Above the cap,
+	// broker traffic is rate-limited at the host cgroup
+	// boundary — the per-VM cgroup is unaffected.
+	BrokerEgressMbit int
+	// TLSSkipVerifyAllowed (ADR-118 / commit 2 of 11) gates the
+	// `tls.skip_verify=true` flag on KafkaConfig. Hobby=false
+	// (a Hobby customer's plaintext-TLS path doesn't justify
+	// the weakened-verification posture). Pro / Scale = true.
+	// 0 for Free (gated off). The apid createTrigger handler
+	// rejects skip_verify=true on Hobby with
+	// trigger_tls_skip_verify_not_allowed.
+	TLSSkipVerifyAllowed   bool
 	TriggerPayloadMaxBytes int
 
 	// EgressAllowlistAllowed toggles the per-app outbound IP allowlist
@@ -1158,6 +1191,13 @@ var planLimits = map[Plan]Limits{
 		TriggerMaxAttemptsMax:         0,
 		TriggerRecordsPerSecondPerApp: 0,
 		TriggerPayloadMaxBytes:        0,
+		// ADR-118 / issue #757 closure: ESM-alias caps + broker
+		// egress + TLS skip-verify gate. Free is the abuse-floor
+		// tier — every value is 0 / false to fail-closed.
+		MaxESMSourcesPerApp:    0,
+		MaxESMRecordsPerSecond: 0,
+		BrokerEgressMbit:       0,
+		TLSSkipVerifyAllowed:   false,
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
@@ -1426,6 +1466,14 @@ var planLimits = map[Plan]Limits{
 		TriggerBatchWindowMaxSec:      30,
 		TriggerMaxAttemptsMax:         3,
 		TriggerRecordsPerSecondPerApp: 100,
+		// Hobby: 10 Mbit broker egress is enough for a 2-source
+		// Hobby fan-out without saturating the shared NIC.
+		// Skip-verify disallowed: Hobby customers don't get a
+		// weakened-TLS posture. ESM aliases mirror the trigger.* caps.
+		MaxESMSourcesPerApp:    2,
+		MaxESMRecordsPerSecond: 100,
+		BrokerEgressMbit:       10,
+		TLSSkipVerifyAllowed:   false,
 		// Hobby payload cap: 1 MiB — keeps trigger_records rows
 		// small enough that Hobby fan-out doesn't bloat Postgres.
 		// The migration-00274 SQL ceiling is 64 MiB so there's
@@ -1686,6 +1734,11 @@ var planLimits = map[Plan]Limits{
 		TriggerBatchWindowMaxSec:      300,
 		TriggerMaxAttemptsMax:         10,
 		TriggerRecordsPerSecondPerApp: 1000,
+		// Pro: 50 Mbit broker egress + ESM aliases + skip-verify OK.
+		MaxESMSourcesPerApp:    10,
+		MaxESMRecordsPerSecond: 1000,
+		BrokerEgressMbit:       50,
+		TLSSkipVerifyAllowed:   true,
 		// Pro payload cap: 6 MiB — matches the previous
 		// hardcoded closeBatch byte cap so Pro customers behave
 		// identically pre/post migration 00274.
@@ -1945,6 +1998,13 @@ var planLimits = map[Plan]Limits{
 		TriggerBatchWindowMaxSec:      300,
 		TriggerMaxAttemptsMax:         25,
 		TriggerRecordsPerSecondPerApp: 10000,
+		// Scale: 200 Mbit broker egress (the cap is host-NIC-shaped;
+		// Scale customers run the largest fan-outs). ESM aliases
+		// mirror the trigger.* caps; skip-verify OK (paid tier).
+		MaxESMSourcesPerApp:    50,
+		MaxESMRecordsPerSecond: 10000,
+		BrokerEgressMbit:       200,
+		TLSSkipVerifyAllowed:   true,
 		// Scale payload cap: 16 MiB — covers the largest
 		// realistic per-record broker payloads (SQS max 256 KiB,
 		// Kafka default 1 MiB, NATS typically < 8 MiB). Below
@@ -4033,6 +4093,67 @@ func (p Plan) TriggerRecordsPerSecondPerApp() int {
 		return 0
 	}
 	return l.TriggerRecordsPerSecondPerApp
+}
+
+// MaxESMSourcesPerApp returns the per-app cap on EventSourceMapping
+// sources, surfaced under the operator-facing `max_esm_sources_per_app`
+// alias on GET /v1/plans/{slug}/limits (ADR-118 / issue #757
+// closure, commit 3 of 11). Mirrors TriggerLimitPerApp exactly
+// (Free 0 / Hobby 2 / Pro 10 / Scale 50). The runtime admission
+// path reads TriggerLimitPerApp — this getter exists for the
+// dashboard's dual-emit label only. Unknown plans fail closed
+// (return 0) — same contract as TriggerLimitPerApp above.
+func (p Plan) MaxESMSourcesPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.MaxESMSourcesPerApp
+}
+
+// MaxESMRecordsPerSecond returns the per-app steady-state ESM
+// dispatch rate, surfaced under the operator-facing
+// `max_esm_records_per_second` alias (ADR-118). Mirrors
+// TriggerRecordsPerSecondPerApp exactly (0 / 100 / 1000 / 10000).
+// Unknown plans fail closed (return 0).
+func (p Plan) MaxESMRecordsPerSecond() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.MaxESMRecordsPerSecond
+}
+
+// BrokerEgressMbit returns the per-app broker-egress cap in
+// megabits per second (ADR-118 / commit 8 of 11). The cap is
+// enforced via the faas-brokerq.slice cgroup + tc commands
+// (pkg/sched/broker_egress.go + pkg/sched/broker_egress_linux.go).
+// Hobby 10 / Pro 50 / Scale 200. 0 for Free (gated off via
+// TriggersAllowed=false). Unknown plans fail closed (return 0).
+func (p Plan) BrokerEgressMbit() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.BrokerEgressMbit
+}
+
+// TLSSkipVerifyAllowed reports whether the customer's plan
+// permits the `tls.skip_verify=true` flag on KafkaConfig
+// (ADR-118 / commit 2 of 11). Hobby=false (a Hobby customer's
+// plaintext-TLS path doesn't justify the weakened-verification
+// posture). Pro / Scale = true. Free = false (gated off).
+// The apid createTrigger handler reads this via
+// Plan.TLSSkipVerifyAllowed() and rejects skip_verify=true on
+// Hobby with 403 trigger_tls_skip_verify_not_allowed. Unknown
+// plans fail closed (return false) — same contract as
+// TriggersAllowed().
+func (p Plan) TLSSkipVerifyAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.TLSSkipVerifyAllowed
 }
 
 // TrustedSignerCountMax returns the per-app cosign trusted-publisher
