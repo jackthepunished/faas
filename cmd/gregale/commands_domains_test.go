@@ -80,3 +80,35 @@ func TestDomainsDispatch_VerifyAndShowRegistered(t *testing.T) {
 		t.Errorf("verify dispatch method = %s, want POST", f.sawMethod)
 	}
 }
+
+// TestDomainsDispatch_DoctorRegistered: the cmdDomains dispatch
+// switch (commands2.go:cmdDomains) must route "doctor" to
+// cmdDomainsDoctor (ADR-120). Without this guard, a typo like
+// "case subDomainsDoctor" being renamed would silently fall
+// through to the "unknown subcommand" branch.
+func TestDomainsDispatch_DoctorRegistered(t *testing.T) {
+	resetJSONOut(t)
+	healthyReport := `{"domain":"x","app_id":"y","observed_at":"2026-08-18T14:23:11Z","healthy":true,"checks":[]}`
+	f := authedFakeAPI(t, healthyReport, http.StatusOK)
+	if code := cmdDomains([]string{"doctor", "app.example.com"}); code != 0 {
+		t.Fatalf("cmdDomains doctor exit = %d, want 0", code)
+	}
+	if f.sawMethod != "GET" {
+		t.Errorf("doctor dispatch method = %s, want GET", f.sawMethod)
+	}
+	if f.sawPath != "/v1/domains/app.example.com/doctor" {
+		t.Errorf("doctor dispatch path = %q, want /v1/domains/app.example.com/doctor", f.sawPath)
+	}
+}
+
+// TestDomainsDispatch_DoctorReportsFail: the cmdDomainsDoctor
+// handler must return exit 1 when the report is not healthy so
+// the customer (and CI) can branch on it.
+func TestDomainsDispatch_DoctorReportsFail(t *testing.T) {
+	resetJSONOut(t)
+	badReport := `{"domain":"x","app_id":"y","observed_at":"2026-08-18T14:23:11Z","healthy":false,"checks":[]}`
+	authedFakeAPI(t, badReport, http.StatusOK)
+	if code := cmdDomains([]string{"doctor", "app.example.com"}); code != 1 {
+		t.Fatalf("cmdDomains doctor exit = %d, want 1 (unhealthy)", code)
+	}
+}
