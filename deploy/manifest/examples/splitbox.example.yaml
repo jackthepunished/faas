@@ -154,7 +154,9 @@ dns:
 # migration policy is on-boot for multi-box; on-boot-offline is
 # the single-box dev default.
 postgresql:
-  dsn: postgres://faas@127.0.0.1:5432/faas
+  # Use the control-plane mesh address, not 127.0.0.1: compute daemons
+  # consume this same DSN after manifest rendering.
+  dsn: postgres://faas@10.42.0.1:5432/faas?sslmode=disable
   database: faas
   migration_max_slot: 265
   policy: on-boot

@@ -244,6 +244,26 @@ func TestRenderTOML_AppsDomainFlowsThrough(t *testing.T) {
 	}
 }
 
+func TestRenderTOML_DBURLFlowsThrough(t *testing.T) {
+	const dsn = "postgres://faas@10.156.0.3:5432/faas?sslmode=disable"
+	for _, d := range []string{"apid", "schedd", "vmmd", "imaged"} {
+		body, flat, err := renderTOML(tomlRenderCtx{
+			Daemon: d,
+			DC:     fixtureTOML(d),
+			DBURL:  dsn,
+		})
+		if err != nil {
+			t.Fatalf("%s: renderTOML: %v", d, err)
+		}
+		if got := flat["db_url"]; got != dsn {
+			t.Errorf("%s flat db_url = %q, want %q", d, got, dsn)
+		}
+		if !strings.Contains(string(body), `db_url = "`+dsn+`"`) {
+			t.Errorf("%s body missing db_url\nbody:\n%s", d, body)
+		}
+	}
+}
+
 func TestValidateTOMLPlacement_CatchesTombstone(t *testing.T) {
 	// Synthetic flatMap: top-level + a tombstone hit on the
 	// "compute_node.tls_cert_path" tombstone. The validator must

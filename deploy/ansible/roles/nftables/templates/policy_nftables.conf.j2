@@ -24,6 +24,11 @@ table inet faas {
     iif lo accept
     iifname "br-tenants" accept
     tcp dport { 22,80,443 } accept     # sshd + gatewayd-public public listener
+{% if faas_postgres_allowed_cidrs is defined and faas_postgres_allowed_cidrs -%}
+{% for cidr in faas_postgres_allowed_cidrs -%}
+    ip saddr {{ cidr }} tcp dport 5432 accept comment "faas postgres from compute"
+{% endfor -%}
+{% endif -%}
   }
 
   chain forward {

@@ -101,7 +101,10 @@
 - name: control_plane_service — systemctl daemon-reload (only when unit files changed)
   ansible.builtin.systemd:
     daemon_reload: true
-  when: cp_units.changed
+  when: >-
+    cp_units.changed
+    or (faas_log_archive_dropin.changed | default(false))
+    or (faas_log_archive_dropin_removed.changed | default(false))
 
 - name: control_plane_service — create systemd drop-in directories
   ansible.builtin.file:
@@ -324,6 +327,14 @@
     group: root
     mode: "0644"
   register: faas_log_archive_dropin
+  when: faas_archive_creds_stat.stat.exists
+
+- name: control_plane_service — remove apid archive drop-in when creds are absent
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-apid.service.d/99-faas-log-archive.conf
+    state: absent
+  register: faas_log_archive_dropin_removed
+  when: not faas_archive_creds_stat.stat.exists
 
 # Issue #472 / ADR-058 — per-app cosign trusted-publisher directory.
 # imaged reads /etc/faas/secrets/trusted-publishers/ at startup and

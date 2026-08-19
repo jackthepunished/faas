@@ -109,6 +109,28 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 
 	var controlPlane, computeOnly []string
 	var hostVars []manifestAnsibleFile
+	var postgresListenAddress string
+	var postgresAllowedCIDRs []string
+	for _, fleetHost := range m.Fleet.Hosts {
+		if fleetHost.Role == roleControlPlane {
+			address, _, parseErr := manifest.ParseHostPort(fleetHost.Address)
+			if parseErr != nil {
+				return nil, fmt.Errorf("host %s postgres address: %w", fleetHost.Name, parseErr)
+			}
+			if _, err := netip.ParseAddr(address); err == nil {
+				postgresListenAddress = address
+			}
+		}
+		if fleetHost.Role == roleComputeOnly {
+			address, _, parseErr := manifest.ParseHostPort(fleetHost.Address)
+			if parseErr != nil {
+				return nil, fmt.Errorf("host %s postgres allow address: %w", fleetHost.Name, parseErr)
+			}
+			if _, err := netip.ParseAddr(address); err == nil {
+				postgresAllowedCIDRs = append(postgresAllowedCIDRs, address+"/32")
+			}
+		}
+	}
 	for _, host := range m.Fleet.Hosts {
 		targetURL := ""
 		ansibleHost, _, parseErr := manifest.ParseHostPort(host.Address)
@@ -136,7 +158,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			// the control plane keeps the canonical empty list.
 			overlayCIDRs = m.Overlay.CIDR
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, internalHosts, overlayCIDRs, m.Overlay.Provider)
+		body := renderManifestHostVars(host, ansibleHost, targetURL, internalHosts, overlayCIDRs, m.Overlay.Provider, postgresListenAddress, postgresAllowedCIDRs)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -190,7 +212,7 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 	out.WriteByte('\n')
 }
 
-func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider string) string {
+func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, postgresListenAddress string, postgresAllowedCIDRs []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
 	fmt.Fprintf(&b, "faas_box_role: %s\n", host.Role)
@@ -221,7 +243,23 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, i
 		b.WriteString("faas_vmmd_listen_addr: \"tcp://0.0.0.0:50051\"\n")
 		fmt.Fprintf(&b, "faas_vmmd_target_url: %q\n", targetURL)
 	}
+	if host.Role == roleControlPlane && postgresListenAddress != "" {
+		fmt.Fprintf(&b, "faas_postgres_listen_addresses: %q\n", postgresListenAddress)
+		if len(postgresAllowedCIDRs) == 0 {
+			b.WriteString("faas_postgres_allowed_cidrs: []\n")
+		} else {
+			fmt.Fprintf(&b, "faas_postgres_allowed_cidrs: [%s]\n", quotedYAMLList(postgresAllowedCIDRs))
+		}
+	}
 	return b.String()
+}
+
+func quotedYAMLList(values []string) string {
+	quoted := make([]string, len(values))
+	for i, value := range values {
+		quoted[i] = fmt.Sprintf("%q", value)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func writeGeneratedAnsibleFile(path string, body []byte, force bool) error {

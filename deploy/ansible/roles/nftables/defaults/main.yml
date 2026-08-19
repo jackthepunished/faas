@@ -29,3 +29,6 @@ public_iface: "{{ ansible_default_ipv4.interface | default('eth0') }}"
 masquerade_cidr: 10.100.0.0/16
 overlay_cidrs: []
 masquerade_cidr_v6: ''
+# Split-box PostgreSQL ingress. The manifest generator sets these only on
+# the control-plane host; an empty list preserves the single-box firewall.
+faas_postgres_allowed_cidrs: []

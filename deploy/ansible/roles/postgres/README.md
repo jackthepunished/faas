@@ -2,8 +2,10 @@
 
 Installs the distro-supported PostgreSQL major, creates the `faas` system user / role /
 database, and (spec §11) hardens the cluster to unix-socket-only
-listening: `listen_addresses=''` plus a `pg_hba.conf` that peer-auths
-local connections and `reject`s every TCP source.
+listening by default. A generated split-box inventory may set
+`faas_postgres_listen_addresses` and `faas_postgres_allowed_cidrs` on the
+control-plane host; that narrow mesh exception enables compute daemons to
+share the database without opening it to the public interface.
 
 ## What this role does
 
@@ -16,8 +18,10 @@ local connections and `reject`s every TCP source.
    fallback for hosts missing the `community.postgresql` collection.
 5. Fixes `/run/postgresql` ownership to `postgres:postgres` so peer
    auth works for the `faas` user.
-6. **§11 hardening**: `listen_addresses=''` (restart), then a 4-line
-   `pg_hba.conf` (reload) that rejects all TCP auth.
+6. **§11 hardening**: `listen_addresses=''` (restart), then a local-peer
+   `pg_hba.conf` (reload) that rejects all TCP auth. In split-box mode the
+   generated compute `/32` entries use `scram-sha-256`; the role requires
+   `faas_postgres_password` from Ansible Vault before enabling that path.
 7. **§14 M8 restore-drill wiring**:
    - `wal_level = replica` (restart-needed)
    - `archive_mode = on` (reload)
@@ -62,8 +66,10 @@ chroot bootstrap) without halting. On a real control-plane node the handlers in
 - `community.postgresql.postgresql_user` may fail silently on hosts
   without the collection — the role has an explicit `psql` fallback.
 - `listen_addresses=''` is **destructive**: any client currently
-  connected via TCP will drop. Spec §11 forbids TCP listeners; on a
-  fresh node this is a no-op.
+  connected via TCP will drop. Split-box operators must deliberately
+  opt into the mesh listener and provide the database password through
+  a secret source; the generated firewall only permits the declared
+  compute CIDRs.
 
 ## Refs
 

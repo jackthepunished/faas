@@ -138,6 +138,20 @@
     group: root
     mode: "0644"
   notify: daemon-reload log_archive
+  when: log_archive_creds_stat.stat.exists
+
+# A compute image is intentionally shipped without customer storage
+# credentials. Do not leave a LoadCredential= directive pointing at a
+# missing file: systemd treats that as a credentials activation failure and
+# the otherwise healthy gateway daemon enters a restart loop. The archive
+# feature becomes active automatically on the next bootstrap after the
+# operator provisions the envelope and the role installs the drop-in.
+- name: log_archive — remove archive drop-in when creds are absent
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-log-archive.conf
+    state: absent
+  notify: daemon-reload log_archive
+  when: not log_archive_creds_stat.stat.exists
 
 # Spec §11 mode check on the gatewayd-internal drop-in itself.
 # A future edit that flips this to 0644 root:faas (so the faas

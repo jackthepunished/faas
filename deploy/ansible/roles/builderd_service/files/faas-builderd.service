@@ -31,7 +31,11 @@ MemoryMax=512M
 # whitelists exactly the paths the daemon writes to.
 # FAAS_BUILDERD_CONFIG set via EnvironmentFile=/etc/faas/sealed.env;
 # FAAS_BUILDERD_ROLE set via the 99-faas-role.conf drop-in (Mega-PR-C).
-EnvironmentFile=/etc/faas/sealed.env
+# Sealed env is the production source for optional overrides; the TOML
+# config remains sufficient for an image-seeded compute node. A missing
+# sealed file must not turn the role-correct builder daemon into a systemd
+# 203/resources loop during first boot.
+EnvironmentFile=-/etc/faas/sealed.env
 
 NoNewPrivileges=yes
 ProtectSystem=strict

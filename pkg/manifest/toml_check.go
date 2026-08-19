@@ -121,6 +121,7 @@ var HostKeys = map[string]HostBlock{
 		PrivateKeys: []string{
 			"socket_path",
 			"metrics_addr",
+			"db_url",
 			"owner_user",
 			"kernel_path",
 			"listen_addr",

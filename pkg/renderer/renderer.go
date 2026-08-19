@@ -237,6 +237,7 @@ func render(opts RenderOptions) (RenderReport, error) {
 		tomlBody, _, err := renderTOML(tomlRenderCtx{
 			Daemon:      d,
 			DC:          dc,
+			DBURL:       m.PostgreSQL.DSN,
 			AppsDomain:  m.DNS.AppsDomain,
 			HostSANs:    hostSANs,
 			HostName:    host.Name,

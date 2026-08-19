@@ -96,8 +96,9 @@ func TestAtomicFlip_CreatesSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readlink: %v", err)
 	}
-	if target != gitSHA {
-		t.Errorf("symlink target = %q, want %q", target, gitSHA)
+	wantTarget := filepath.Join(filepath.Base(releasesRoot), gitSHA)
+	if target != wantTarget {
+		t.Errorf("symlink target = %q, want %q", target, wantTarget)
 	}
 	// CurrentGitSHA now round-trips.
 	got, err := CurrentGitSHA(releasesRoot)

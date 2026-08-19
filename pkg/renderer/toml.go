@@ -46,8 +46,12 @@ import (
 // fine (writeTOMLKV omits empty values; the daemon's loader uses
 // its built-in default).
 type tomlRenderCtx struct {
-	Daemon      string
-	DC          *manifest.DaemonConfig
+	Daemon string
+	DC     *manifest.DaemonConfig
+	// DBURL is the fleet PostgreSQL endpoint from manifest.postgresql.dsn.
+	// It is rendered into every daemon TOML that declares db_url so a
+	// compute-only host does not silently fall back to its local Unix socket.
+	DBURL       string
 	AppsDomain  string
 	HostSANs    []string
 	HostName    string
@@ -78,7 +82,7 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 	// by name. The renderer uses the canonical schema names from
 	// HostKeys.PrivateKeys; unknown keys (a renderer bug) are caught
 	// by the validator at the "key not in catalog" check.
-	if err := emitPrivateKeys(ctx.Daemon, ctx.DC, ctx.AppsDomain, host.PrivateKeys, flat); err != nil {
+	if err := emitPrivateKeys(ctx.Daemon, ctx.DC, ctx.DBURL, ctx.AppsDomain, host.PrivateKeys, flat); err != nil {
 		return nil, nil, err
 	}
 
@@ -106,9 +110,9 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 // flatMap under their leaf names. Missing manifest values (e.g. a
 // schedd with no apps_domain) yield an empty value; the validator +
 // daemon-load path handle the absent-key shape.
-func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, appsDomain string, keys []string, flat map[string]string) error {
+func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain string, keys []string, flat map[string]string) error {
 	for _, k := range keys {
-		v, err := privateKeyValue(daemon, dc, appsDomain, k)
+		v, err := privateKeyValue(daemon, dc, dbURL, appsDomain, k)
 		if err != nil {
 			return fmt.Errorf("renderer: %s: %s: %w", daemon, k, err)
 		}
@@ -132,7 +136,7 @@ func emitPrivateKeys(daemon string, dc *manifest.DaemonConfig, appsDomain string
 // into their TOML so the daemons can serve tenant requests with
 // the canonical apps_domain. Empty appsDomain is acceptable (the
 // daemon falls back to FAAS_APPS_DOMAIN env var).
-func privateKeyValue(daemon string, dc *manifest.DaemonConfig, appsDomain, key string) (string, error) {
+func privateKeyValue(daemon string, dc *manifest.DaemonConfig, dbURL, appsDomain, key string) (string, error) {
 	switch key {
 	case "socket_path":
 		// unix:///run/faas/<daemon>.sock → /run/faas/<daemon>.sock
@@ -158,12 +162,11 @@ func privateKeyValue(daemon string, dc *manifest.DaemonConfig, appsDomain, key s
 		}
 		return defaultMetricsAddrForDaemon(daemon), nil
 	case "db_url":
-		// The renderer's only consumer of the PostgreSQL block is
-		// db_url. The schema pins it; the renderer emits it as-is.
-		// A more ambitious refactor would thread pgsql.DSN through
-		// the manifest's DaemonConfig, but that's PR-X / secrets-init
-		// territory.
-		return "", nil
+		// The manifest is the source of truth for the shared database
+		// endpoint. Leaving this empty makes db.Open fall back to the
+		// local Unix socket, which is correct only for a one-box host
+		// and causes split-box compute daemons to crash-loop.
+		return dbURL, nil
 	case "apps_domain":
 		// schedd + apid + gatewayd-internal carry this. The daemon
 		// loader uses the empty value as a "use the env var" signal
