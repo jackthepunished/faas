@@ -29,11 +29,19 @@
 //	  - OR  list: a record passes if ANY clause matches.
 //	  - AND list: a record passes if ALL clauses match.
 //	  - Payload list: jsonpath predicates against rec.Payload.
-//	  - Match error: returns (false, err). The caller (commit 6's
-//	    dispatch tick) treats the error as "not matched, skipped
-//	    silently" — the record is NOT dispatched, no DLQ row is
-//	    written, and the audit row is "trigger.filter_error"
-//	    (operator-debug, not customer-facing).
+//
+// Clause-error semantics (CRIT-2, PR #993 / issue #757 closure):
+//
+//	A clause that fails to evaluate (malformed jsonpath, unknown
+//	op, payload parse error) is treated as "no match" AND surfaced
+//	as a per-clause error count via MatchCount. The legacy Match()
+//	signature is preserved as a thin wrapper around MatchCount()
+//	for the handful of callers that don't need the count.
+//
+// The dispatch layer (pkg/sched/dispatch_triggers.go::filterBatch)
+// uses MatchCount so it can emit a single "trigger.filter_error"
+// audit row when clauseErrors > 0 — the audit is operator-debug,
+// not customer-facing, and the records are dropped (not DLQ'd).
 //
 // Jsonpath support (intentionally minimal in this commit):
 //
@@ -137,32 +145,73 @@ type FilterCriteria struct {
 	Payload []FilterClause `json:"payload,omitempty"`
 }
 
-// Match evaluates the filter against one polled record. Returns
-// (true, nil) for nil-or-zero FilterCriteria (match-anything).
-// Returns (false, err) on a parse or shape error; the caller
-// (commit 6) treats the error as "not-matched, skipped silently".
+// Match is the legacy single-return API. It is a thin wrapper
+// around MatchCount that discards the clause-error count.
+//
+// For new callers prefer MatchCount — the dispatch layer
+// (pkg/sched/dispatch_triggers.go::filterBatch) needs the count to
+// emit the "trigger.filter_error" audit row when clauseErrors > 0.
+//
+// Pre-CRIT-2 (PR #993 / issue #757 closure) Match returned
+// (false, err) on any clause error, which forced the caller to
+// abort the entire per-record match on the first broken clause.
+// CRIT-2 flips the semantic: a clause error counts toward the
+// returned clauseErrors total but does not abort evaluation of
+// the remaining clauses.
 func (f *FilterCriteria) Match(payload []byte, headers map[string]string) (bool, error) {
+	matched, _ := f.MatchCount(payload, headers)
+	return matched, nil
+}
+
+// MatchCount evaluates the filter against one polled record and
+// returns both the match outcome and the count of clauses that
+// errored during evaluation.
+//
+//	- matched == true,  clauseErrors == 0  → record passes the
+//	                                       filter cleanly.
+//	- matched == false, clauseErrors == 0  → no clause matched,
+//	                                       but every clause ran
+//	                                       without error.
+//	- matched == false, clauseErrors > 0   → at least one clause
+//	                                       errored; the record is
+//	                                       dropped and the
+//	                                       dispatcher audits as
+//	                                       trigger.filter_error.
+//	- matched == true,  clauseErrors > 0   → OR-with-fallback:
+//	                                       some clauses errored
+//	                                       but a later clause
+//	                                       matched. Still audited
+//	                                       (the operator wants
+//	                                       visibility into clauses
+//	                                       that failed in case the
+//	                                       matched clause was the
+//	                                       fallback).
+//
+// The dispatcher calls MatchCount (not Match) so it can audit the
+// per-record error count. See filterBatch in dispatch_triggers.go.
+func (f *FilterCriteria) MatchCount(payload []byte, headers map[string]string) (matched bool, clauseErrors int) {
 	if f == nil {
-		return true, nil
+		return true, 0
 	}
 	// Empty tree is match-anything (the manifest validator at
 	// commit 2 rejects the empty tree, but a defensive runtime
 	// short-circuit protects against a hand-rolled FilterCriteria
 	// that bypassed validation).
 	if len(f.OR) == 0 && len(f.AND) == 0 && len(f.Payload) == 0 {
-		return true, nil
+		return true, 0
 	}
-	// OR: a record passes if ANY clause matches. A clause is a
-	// match if it returns (true, nil). A clause error is treated
-	// as "no match" so one bad clause doesn't poison the OR
-	// (per the plan: "match error → not-matched, skipped silently,
-	// audited as trigger.filter_error").
+	// OR: a record passes if ANY clause matches. CRIT-2: a clause
+	// error counts toward clauseErrors and continues to the next
+	// clause instead of aborting evaluation. A match-anything
+	// fallback (e.g. a downstream "neq" clause that would
+	// trivially match) still gets evaluated.
 	if len(f.OR) > 0 {
 		anyMatched := false
-		for i, c := range f.OR {
+		for _, c := range f.OR {
 			ok, err := matchClause(c, payload, headers)
 			if err != nil {
-				return false, fmt.Errorf("filter_criteria.$or[%d]: %w", i, err)
+				clauseErrors++
+				continue
 			}
 			if ok {
 				anyMatched = true
@@ -170,27 +219,42 @@ func (f *FilterCriteria) Match(payload []byte, headers map[string]string) (bool,
 			}
 		}
 		if !anyMatched {
-			return false, nil
+			return false, clauseErrors
 		}
+		return true, clauseErrors
 	}
-	// AND: a record passes if ALL clauses match. Same error
-	// semantics as OR.
+	// AND: a record passes if ALL clauses match. CRIT-2: clause
+	// errors increment clauseErrors and continue; the AND is
+	// satisfied only when every non-errored clause matched.
+	// If every clause errored (or the only clause errored), the
+	// AND is "no clause passed" → matched=false.
 	if len(f.AND) > 0 {
-		for i, c := range f.AND {
+		allNonErroredMatched := true
+		nonErroredCount := 0
+		for _, c := range f.AND {
 			ok, err := matchClause(c, payload, headers)
 			if err != nil {
-				return false, fmt.Errorf("filter_criteria.$and[%d]: %w", i, err)
+				clauseErrors++
+				continue
 			}
+			nonErroredCount++
 			if !ok {
-				return false, nil
+				allNonErroredMatched = false
+				break
 			}
+		}
+		// AND passes iff at least one non-errored clause ran AND
+		// every non-errored clause matched.
+		if nonErroredCount == 0 || !allNonErroredMatched {
+			return false, clauseErrors
 		}
 	}
 	// Payload: a list of JSONPath predicates. ALL must match.
-	// A predicate match is `jsonpath(path) == Value`. The Value
-	// is a json.RawMessage; the comparison is JSON-encoded so
-	// numeric literals compare as numbers, string literals as
-	// strings, etc.
+	// CRIT-2: clause errors increment clauseErrors and continue;
+	// a clause that didn't match (no error, ok=false) returns
+	// (false, nil) and aborts the loop — that's the normal
+	// short-circuit. As with AND: if every clause errored (or
+	// the only clause errored), matched is false.
 	if len(f.Payload) > 0 {
 		// Parse the payload once and cache it across all
 		// payload clauses. Without this, a filter with N
@@ -198,21 +262,29 @@ func (f *FilterCriteria) Match(payload []byte, headers map[string]string) (bool,
 		// 10k-record dispatch tick with 4 payload clauses,
 		// that's 40k json.Unmarshal calls and the SLO budget
 		// blows. The cache lives only for the duration of one
-		// Match() call (per-record scope), so the memory
+		// MatchCount() call (per-record scope), so the memory
 		// pressure is bounded to one record's worth of
 		// parsed JSON at a time.
 		parsed, parsedErr := parsePayloadOnce(payload)
-		for i, c := range f.Payload {
+		allNonErroredMatched := true
+		nonErroredCount := 0
+		for _, c := range f.Payload {
 			ok, err := matchPayloadClauseCached(c, payload, parsed, parsedErr)
 			if err != nil {
-				return false, fmt.Errorf("filter_criteria.payload[%d]: %w", i, err)
+				clauseErrors++
+				continue
 			}
+			nonErroredCount++
 			if !ok {
-				return false, nil
+				allNonErroredMatched = false
+				break
 			}
 		}
+		if nonErroredCount == 0 || !allNonErroredMatched {
+			return false, clauseErrors
+		}
 	}
-	return true, nil
+	return true, clauseErrors
 }
 
 // matchClause evaluates one leaf or branch. A clause with

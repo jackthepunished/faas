@@ -1129,16 +1129,19 @@ func (l *Loop) filterBatch(
 	out := make([]SourceRecord, 0, len(batch))
 	errCount := 0
 	for _, rec := range batch {
-		ok, err := fc.Match(rec.Payload, rec.Headers)
-		if err != nil {
-			// Per-record parse error (e.g. an unsupported
-			// JSONPath form). Ack the record so the broker
-			// doesn't replay it; count for the audit row.
-			errCount++
+		matched, ce := fc.MatchCount(rec.Payload, rec.Headers)
+		// CRIT-2 (PR #993 / issue #757 closure): MatchCount
+		// surfaces the per-clause error count so the dispatcher
+		// can audit per-record. A clause error no longer aborts
+		// the match — the record is dropped (Ack'd, no DLQ) and
+		// counted toward the trigger.filter_error audit row
+		// emitted at the call site.
+		if ce > 0 {
+			errCount += ce
 			_ = ackSingle(ctx, t, rec, l)
 			continue
 		}
-		if !ok {
+		if !matched {
 			// Filter rejected the record. Ack so the
 			// broker doesn't replay it; no audit row
 			// (the skip is silent by design — ADR-118

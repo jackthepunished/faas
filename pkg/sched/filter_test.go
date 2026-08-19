@@ -15,7 +15,6 @@ package sched
 import (
 	"encoding/json"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 )
@@ -267,15 +266,30 @@ func TestFilterMatch_AllCases(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := c.filter.Match(c.payload, c.headers)
+			// CRIT-2 (PR #993 / issue #757 closure): Match
+			// returns (matched, nil) on clause errors; the
+			// dispatcher audits via MatchCount. The
+			// table-driven contract pin changes:
+			//
+			//   - wantErr: the legacy "Match returns error"
+			//     expectation is now "Match returns matched
+			//     = false, clauseErrors > 0".
+			got, clauseErrors := c.filter.MatchCount(c.payload, c.headers)
 			if c.wantErr {
-				if err == nil {
-					t.Fatalf("err = nil, want non-nil (filter error contract: caller treats as not-matched, audits as trigger.filter_error)")
+				if clauseErrors == 0 {
+					t.Fatalf("clauseErrors = 0, want > 0 (filter error contract: caller audits via MatchCount)")
+				}
+				if got {
+					t.Errorf("MatchCount = true, want false on clause error")
+				}
+				// Legacy Match wrapper: returns (false, nil).
+				if mOK, mErr := c.filter.Match(c.payload, c.headers); mErr != nil || mOK {
+					t.Errorf("Match wrapper = (%v, %v), want (false, nil) under CRIT-2", mOK, mErr)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("err = %v, want nil", err)
+			if clauseErrors != 0 {
+				t.Fatalf("clauseErrors = %d, want 0", clauseErrors)
 			}
 			if got != c.want {
 				t.Errorf("Match = %v, want %v", got, c.want)
@@ -417,38 +431,129 @@ func TestFilterMatch_JsonPathUnsupportedFormErrors(t *testing.T) {
 					{Op: FilterOpJsonPath, Path: p, Value: raw(`"x"`)},
 				},
 			}
-			_, err := filter.Match([]byte(`{"foo": "x"}`), nil)
-			if err == nil {
-				t.Fatalf("path %q: err = nil, want non-nil (unsupported form per ADR-118 §Jsonpath superset)", p)
+			// CRIT-2 (PR #993 / issue #757 closure): Match
+			// swallows clause errors and reports them via
+			// MatchCount. The dispatcher audits via MatchCount.
+			// We assert via MatchCount here to lock the new
+			// contract.
+			matched, clauseErrors := filter.MatchCount([]byte(`{"foo": "x"}`), nil)
+			if matched {
+				t.Fatalf("path %q: matched = true, want false (unsupported form must not match)", p)
 			}
-			if !strings.Contains(err.Error(), "unsupported") &&
-				!strings.Contains(err.Error(), "non-numeric") &&
-				!strings.Contains(err.Error(), "cannot") {
-				t.Logf("path %q: err = %v (acceptable; any error is treated as not-matched by the dispatch tick)", p, err)
+			if clauseErrors != 1 {
+				t.Fatalf("path %q: clauseErrors = %d, want 1 (the unsupported clause must be counted)", p, clauseErrors)
+			}
+			// Legacy Match returns (false, nil) under CRIT-2 —
+			// the count is the audit surface.
+			ok, err := filter.Match([]byte(`{"foo": "x"}`), nil)
+			if err != nil {
+				t.Fatalf("path %q: Match err = %v, want nil (CRIT-2 swallows clause errors; use MatchCount for audit)", p, err)
+			}
+			if ok {
+				t.Fatalf("path %q: Match ok = true, want false", p)
 			}
 		})
 	}
 }
 
-// TestFilterMatch_OrErrorIsFailure pins the contract that an
-// error in any $or clause is propagated (NOT swallowed). The
-// dispatch tick (commit 6) catches the error and audits as
-// trigger.filter_error rather than treating the record as
-// matched. This is the inverse of the AND-error contract (an
-// error in $and is also propagated).
-func TestFilterMatch_OrErrorIsFailure(t *testing.T) {
+// TestFilterMatch_OrErrorIsSkipped pins the CRIT-2 (PR #993 /
+// issue #757 closure) contract: an $or clause that errors is
+// counted toward clauseErrors via MatchCount, NOT propagated
+// from Match. Pre-CRIT-2 the legacy Match() returned
+// (false, "$or[0]: ...") on the first error and aborted the rest
+// of the OR list; post-CRIT-2 the dispatcher uses MatchCount so
+// it can audit per-record (trigger.filter_error) and the record
+// is dropped without aborting the batch.
+//
+// Match (the legacy API) now returns (false, nil) for clause
+// errors because Match is implemented as MatchCount with the
+// count discarded.
+func TestFilterMatch_OrErrorIsSkipped(t *testing.T) {
 	filter := &FilterCriteria{
 		OR: []FilterClause{
 			{Op: FilterOpJsonPath, Path: "$.foo[?(@.x>1)]"}, // unsupported form
+		},
+	}
+	matched, clauseErrors := filter.MatchCount([]byte(`{"foo": {"x": 2}}`), nil)
+	if matched {
+		t.Errorf("matched = true, want false (the clause errored, OR should not match)")
+	}
+	if clauseErrors != 1 {
+		t.Errorf("clauseErrors = %d, want 1", clauseErrors)
+	}
+	// Legacy Match wraps MatchCount and discards the count.
+	ok, err := filter.Match([]byte(`{"foo": {"x": 2}}`), nil)
+	if err != nil {
+		t.Errorf("Match err = %v, want nil (CRIT-2 swallows clause errors; dispatcher audits via MatchCount)", err)
+	}
+	if ok {
+		t.Errorf("Match ok = true, want false")
+	}
+}
+
+// TestFilterMatch_OrSecondClauseMatches pins the OR-fallback
+// case: the first clause errors, the second clause matches.
+// CRIT-2 must still evaluate the second clause; the result is
+// (true, 1) — matched because the OR found a match, clauseErrors
+// > 0 because the operator wants visibility into the failed
+// first clause.
+func TestFilterMatch_OrSecondClauseMatches(t *testing.T) {
+	filter := &FilterCriteria{
+		OR: []FilterClause{
+			{Op: FilterOpJsonPath, Path: "$.foo[?(@.x>1)]"}, // errors
 			{Op: FilterOpEq, Field: "x-tenant", Value: raw(`"acme"`)},
 		},
 	}
-	_, err := filter.Match([]byte(`{"foo": {"x": 2}}`), map[string]string{"x-tenant": "acme"})
-	if err == nil {
-		t.Errorf("err = nil, want non-nil (an $or clause with a jsonpath parse error must surface, not silently match)")
+	matched, clauseErrors := filter.MatchCount(
+		[]byte(`{"foo": {"x": 2}}`),
+		map[string]string{"x-tenant": "acme"},
+	)
+	if !matched {
+		t.Errorf("matched = false, want true (second OR clause matched)")
 	}
-	if !strings.Contains(err.Error(), "$or[0]") {
-		t.Errorf("err = %v, want error path-tagged with $or[0]", err)
+	if clauseErrors != 1 {
+		t.Errorf("clauseErrors = %d, want 1 (operator still wants to see the first clause's error)", clauseErrors)
+	}
+}
+
+// TestFilterMatch_AndErrorIsSkipped pins the AND-side of CRIT-2.
+// An error in an $and clause increments clauseErrors and
+// continues; the matched/allMatched tally is unaffected by an
+// errored clause (the contract is "all NON-errored clauses must
+// match"). Here the single $and clause errors so matched is
+// false, clauseErrors is 1.
+func TestFilterMatch_AndErrorIsSkipped(t *testing.T) {
+	filter := &FilterCriteria{
+		AND: []FilterClause{
+			{Op: FilterOpJsonPath, Path: "$.foo[?(@.x>1)]"}, // unsupported form
+		},
+	}
+	matched, clauseErrors := filter.MatchCount([]byte(`{"foo": {"x": 2}}`), nil)
+	if matched {
+		t.Errorf("matched = true, want false")
+	}
+	if clauseErrors != 1 {
+		t.Errorf("clauseErrors = %d, want 1", clauseErrors)
+	}
+}
+
+// TestFilterMatch_PayloadErrorIsSkipped pins the payload-list
+// side of CRIT-2. A payload clause that errors (unsupported
+// jsonpath form) is counted via MatchCount and skipped; the
+// other payload clauses are still evaluated.
+func TestFilterMatch_PayloadErrorIsSkipped(t *testing.T) {
+	filter := &FilterCriteria{
+		Payload: []FilterClause{
+			{Op: FilterOpJsonPath, Path: "$.foo[?(@.x>1)]"}, // errors
+			{Op: FilterOpJsonPath, Path: "$.foo.x", Value: raw("2")},
+		},
+	}
+	matched, clauseErrors := filter.MatchCount([]byte(`{"foo": {"x": 2}}`), nil)
+	if !matched {
+		t.Errorf("matched = false, want true (second payload clause matched; the first errored)")
+	}
+	if clauseErrors != 1 {
+		t.Errorf("clauseErrors = %d, want 1", clauseErrors)
 	}
 }
 
