@@ -2667,10 +2667,22 @@ func (c *explainCollector) observe(line string) {
 		c.lastError = msg
 		// Pattern bucket: first 64 bytes of the message. Enough
 		// to coalesce the same error fired 100x into one bucket,
-		// small enough to keep the map bounded.
+		// small enough to keep the map bounded. UTF-8 safe: a
+		// naive byte-slice on a multi-byte rune (e.g. an emoji
+		// or CJK character) would split the rune and produce an
+		// invalid prefix that flush() can't render. Back off to
+		// the last rune boundary when the 64th byte lands in the
+		// middle of a sequence.
 		prefix := msg
 		if len(prefix) > 64 {
 			prefix = prefix[:64]
+			for len(prefix) > 0 {
+				if r, size := utf8.DecodeLastRuneInString(prefix); r == utf8.RuneError && size == 1 {
+					prefix = prefix[:len(prefix)-1]
+				} else {
+					break
+				}
+			}
 		}
 		c.patterns[prefix]++
 	case "warn":
@@ -3027,7 +3039,32 @@ func printDeployColdWakeSentence() {
 
 // renderDeployFailure maps the deployment's Error string to one of the
 // four UX §2.4 copy blocks and exits 3 for infra, 1 for the rest.
+//
+// Error-explanations cluster (spec §6.4 amendment 1): when the
+// deployment row carries a typed ErrorCode (one of the 9 cluster
+// codes), prefer the whycopy catalog prose via mapFailureProblem
+// so the customer sees the full Hint/Why/Fix shape rather than
+// the legacy 4-class copy. Falls back to mapFailureMessage for
+// pre-cluster rows that only have the raw failure_class string.
 func renderDeployFailure(d api.DeploymentResponse) int {
+	if d.ErrorCode != "" {
+		problem := &api.Problem{
+			Code:   d.ErrorCode,
+			Status: 422,
+			Title:  d.ErrorCode,
+			Detail: d.Error,
+			Hint:   d.ErrorHint,
+			Why:    d.ErrorWhy,
+			Fix:    d.ErrorFix,
+		}
+		if lifted := mapFailureProblem(problem); lifted != "" {
+			PrintFail(os.Stderr, "%s", lifted)
+			if d.Error == "infra" {
+				return 3
+			}
+			return 1
+		}
+	}
 	PrintFail(os.Stderr, "%s", mapFailureMessage(d.Error))
 	if d.Error == "infra" {
 		return 3

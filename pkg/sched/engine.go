@@ -5013,6 +5013,32 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 		e.ops.LivenessRestarts(appID, deploymentID).Inc()
 	}
 
+	// Error-explanations cluster (spec §6.4 amendment 1): stamp
+	// the deployment as failed with the matching cluster code so
+	// `gregale inspect <slug> --errors` can lift the whycopy prose
+	// post-mortem. The reason→code mapping is closed-set:
+	// liveness_unauthorized → app_healthz_unauthorized (the only
+	// cluster code the liveness path emits); the other liveness
+	// outcomes stay un-coded (legacy path). Best-effort — a
+	// SetDeploymentFailedEx failure is logged but doesn't block
+	// the destroy+transition path.
+	if deploymentID != "" && reason == "liveness_unauthorized" {
+		problem := &api.Problem{
+			Code:   api.CodeAppHealthzUnauthorized,
+			Status: 422,
+			Title:  api.CodeAppHealthzUnauthorized,
+		}
+		_ = whycopy.Decorate(problem, api.CodeAppHealthzUnauthorized, nil)
+		if _, terr := e.store.SetDeploymentFailedEx(ctx,
+			deploymentID,
+			api.CodeAppHealthzUnauthorized,
+			"healthz returned 401 after 3 consecutive probes",
+			problem.Hint, problem.Why, problem.Fix, nil); terr != nil {
+			e.log.Warn("liveness: stamp deployment failed",
+				"instance", instanceID, "deployment_id", deploymentID, "err", terr)
+		}
+	}
+
 	// Sliding-window check: N restarts in the window parks the
 	// parent app so further traffic is rejected at the wake gate.
 	// shouldPark=true flips apps.status='evicted_cold' + emits

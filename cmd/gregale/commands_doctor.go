@@ -318,12 +318,25 @@ func doctorCheckStartupTimeout() doctorCheck {
 func scanSource(root string, re *regexp.Regexp, maxHits int) []string {
 	out := []string{}
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		// filepath.Walk delivers (path, nil, err) when it can't even
+		// stat the entry (permission-denied, broken symlink, mid-walk
+		// delete). Skip without reading info when it's nil — the
+		// regular path-resumption logic still calls us on the next
+		// entry, so the scan continues past the unreadable node.
+		if info == nil {
+			return nil
+		}
 		if err != nil || info.IsDir() {
 			// Skip vendor/, .git/, node_modules/ — they're noise.
 			base := info.Name()
 			if info.IsDir() && (base == "vendor" || base == ".git" || base == "node_modules" || base == ".gregale") {
 				return filepath.SkipDir
 			}
+			// (err != nil with info != nil is rare — it means the
+			// entry exists but a child walk failed. Returning nil
+			// matches the original behaviour: a per-entry error
+			// doesn't abort the scan, the walk continues past the
+			// unreadable node.)
 			return nil
 		}
 		if len(out) >= maxHits {
@@ -357,6 +370,13 @@ func scanSource(root string, re *regexp.Regexp, maxHits int) []string {
 func scanEnvRefs(root string, re *regexp.Regexp) []string {
 	seen := map[string]bool{}
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		// Mirror scanSource's nil-info guard: filepath.Walk delivers
+		// (path, nil, err) for unreadable nodes (permission-denied,
+		// broken symlink, mid-walk delete). Skip without reading
+		// info so the scan continues past the unreadable entry.
+		if info == nil {
+			return nil
+		}
 		if err != nil || info.IsDir() {
 			base := info.Name()
 			if info.IsDir() && (base == "vendor" || base == ".git" || base == "node_modules" || base == ".gregale") {
@@ -390,22 +410,88 @@ func scanEnvRefs(root string, re *regexp.Regexp) []string {
 	return out
 }
 
-// loadDeclaredEnv reads .gregale/env.json (the apid persistence
-// shape) and returns the set of declared env-var names. Cross-
-// referencing with a running app's declared env is a future
-// addition (TODO — needs pkg/client.ListEnv sibling).
+// loadDeclaredEnv reads the local `.env` file (the shape `gregale
+// env push` consumes) and returns the set of declared env-var
+// names. The customer maintains `.env` by hand and pipes it into
+// `gregale env push`; the doctor runs the same read so an
+// undeclared `process.env.STRIPE_KEY` in the source shows up as
+// missing from the customer-authored file.
+//
+// The parser is intentionally minimal: KEY=VALUE lines, leading
+// whitespace tolerated, `export ` prefix tolerated, full-line
+// comments (`#`) and blank lines skipped. Quote characters on the
+// value are not stripped (the doctor only needs the key set, not
+// the value). Lines that don't match the [A-Z_][A-Z0-9_]* key
+// shape are skipped — those are usually a stray literal at the
+// top of the file (e.g. "# Stripe dev keys" before the first
+// assignment).
+//
+// The legacy `.gregale/env.json` path is read as a fallback for
+// projects that pre-date the `env push` flow (the apid persistence
+// shape). Both paths union into the returned set.
 func loadDeclaredEnv(path string) map[string]bool {
 	declared := map[string]bool{}
+	// 1. Modern path: `.env` (the customer-authored file).
+	envPath := filepath.Join(path, ".env")
+	if f, err := os.Open(envPath); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			line = strings.TrimPrefix(line, "export ")
+			eq := strings.IndexByte(line, '=')
+			if eq <= 0 {
+				continue
+			}
+			key := strings.TrimSpace(line[:eq])
+			if !isDeclaredEnvKey(key) {
+				continue
+			}
+			declared[strings.ToUpper(key)] = true
+		}
+		_ = f.Close()
+	}
+	// 2. Legacy path: `.gregale/env.json` (apid persistence shape).
 	cfgPath := filepath.Join(path, ".gregale", "env.json")
 	if data, err := os.ReadFile(cfgPath); err == nil {
 		var parsed map[string]any
 		if err := json.Unmarshal(data, &parsed); err == nil {
 			for k := range parsed {
+				if !isDeclaredEnvKey(k) {
+					continue
+				}
 				declared[strings.ToUpper(k)] = true
 			}
 		}
 	}
 	return declared
+}
+
+// isDeclaredEnvKey accepts the canonical env-var name shape
+// (uppercase letters, digits, underscores; starts with a letter
+// or underscore, ≥2 chars). Mirrors the envVarRefRegex capture
+// group so the set is comparable to the refs scan.
+func isDeclaredEnvKey(k string) bool {
+	if len(k) < 2 {
+		return false
+	}
+	for i, r := range k {
+		if r == '_' {
+			continue
+		}
+		if i == 0 && (r >= 'a' && r <= 'z') {
+			// tolerate lowercase first char; we upper-case
+			// before the map lookup
+			continue
+		}
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // scanStatelessShape scans for Dockerfile VOLUME lines, data/ or
