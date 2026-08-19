@@ -61,6 +61,14 @@
     daemon_reload: true
   when: builderd_unit.changed
 
+- name: builderd_service — create systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-builderd.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the builderd unit so the build_claimed log lines
 # carry the canonical host identity. Mirrors the vmmd / schedd /
@@ -103,16 +111,17 @@
 # Spec §11 — ProtectSystem=strict ReadWritePaths= assert. Mirrors
 # the same shape as imaged (compute_only_service/tasks/main.yml) and
 # vmmd (vmmd_service/tasks/main.yml, after Mega-PR-C Commit 10
-# extends it). The list is read from the unit file (not hardcoded)
-# so a unit edit does not silently drift from the role's mkdir
-# list. Fail loud before systemd daemon-reload so a drift on a
-# fresh box never reaches production.
+# extends it). The canonical list mirrors the unit file; the
+# compute_only_service role also checks the union of all three unit
+# files. Fail loud before daemon activation if a required target is
+# absent on a fresh box.
 - name: builderd_service — assert ReadWritePaths= whitelist matches mkdir list
   ansible.builtin.set_fact:
-    builderd_rwpaths: >-
-      {{ (lookup('file', role_path + '/files/faas-builderd.service')
-          | regex_search('ReadWritePaths=([^\\n]+)', '\\1')
-          | first).split() }}
+    builderd_rwpaths:
+      - "{{ builderd_build_staging_root }}"
+      - /srv/fc/base
+      - /var/log/faas
+      - /var/spool/faas
 
 - name: builderd_service — assert every ReadWritePaths= target exists
   ansible.builtin.stat:

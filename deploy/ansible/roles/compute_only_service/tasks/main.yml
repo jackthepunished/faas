@@ -122,6 +122,14 @@
   ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf
   changed_when: false
 
+- name: compute_only_service — create imaged systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-imaged.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into the imaged unit so the boot log carries the right
 # identity without a TOML edit (imaged has no config.go). The

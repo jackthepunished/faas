@@ -103,6 +103,18 @@
     daemon_reload: true
   when: cp_units.changed
 
+- name: control_plane_service — create systemd drop-in directories
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - faas-schedd
+    - faas-apid
+    - faas-meterd
+
 # Mega-PR-A (issue #911 / ADR-110 PR-1): drop the FAAS_NODE_NAME
 # env line into every control-plane unit so the multi-box identity
 # travels from host_vars to the daemons without a TOML edit on every
