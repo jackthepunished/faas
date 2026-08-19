@@ -58,6 +58,16 @@
     .error-explanation .fix   { color: #047857; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; margin: 0.25rem 0; }
     .error-explanation .logs  { margin-top: 0.5rem; }
     .error-explanation .docs  { display: inline-block; margin-top: 0.5rem; }
+    /* Issue #606 / SAFE-RELEASES-E.1: deployer attribution chips.
+       The .badge.deployer-via reuses the badge palette with a
+       neutral violet accent so the chip reads as metadata, not
+       status. The .deployer-field is a lightweight text row for
+       the by/pusher/from bits; .muted fades the IP since it's
+       the least-actionable of the four. */
+    .badge.deployer-via  { background: #ede9fe; color: #5b21b6; text-transform: uppercase; letter-spacing: 0.05em; }
+    .deployer-field      { display: inline-block; margin-right: 0.75rem; font-size: 0.9rem; }
+    .deployer-field.muted { color: #888; }
+    p.deployer           { margin-top: 0.25rem; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -111,6 +121,21 @@
         <a class="docs" href="https://docs.gregale.dev/errors/{{ .Data.Deployment.ErrorCode }}" target="_blank" rel="noopener">docs →</a>
       </section>
       {{ end }}
+      {{/* Issue #606 / SAFE-RELEASES-E.1: structured deployer
+          attribution. The four fields are server-stamped from
+          the HTTP request context (never client-supplied) and
+          surface here so the SOC 2 CC7.2 / GDPR audit-trail
+          question "who deployed v3 at 14:32?" has a one-click
+          answer. Each chip is conditional on the field being
+          non-empty — pre-#606 rows render bit-identical. */}}
+        {{if or .Data.Deployment.DeployedVia .Data.Deployment.DeployedByUserID .Data.Deployment.DeployedFromIP .Data.Deployment.PusherLogin}}
+        <p class="deployer">
+          {{if .Data.Deployment.DeployedVia}}<span class="badge deployer-via">{{.Data.Deployment.DeployedVia}}</span>{{end}}
+          {{if .Data.Deployment.DeployedByUserID}}<span class="deployer-field">by <code>{{.Data.Deployment.DeployedByUserID}}</code></span>{{end}}
+          {{if .Data.Deployment.PusherLogin}}<span class="deployer-field">pusher <code>{{.Data.Deployment.PusherLogin}}</code></span>{{end}}
+          {{if .Data.Deployment.DeployedFromIP}}<span class="deployer-field muted">from <code>{{.Data.Deployment.DeployedFromIP}}</code></span>{{end}}
+        </p>
+        {{end}}
 
       <h2>Scan</h2>
       {{if .Data.Scan}}

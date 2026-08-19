@@ -316,6 +316,15 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 			Kind:      string(d.Kind),
 			CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 			Error:     d.Error,
+			// Issue #606 / SAFE-RELEASES-E.1: deploy list rows
+			// get a compact via-only chip rendered via the
+			// existing app_detail.html badge palette. The full
+			// triple (user / pusher / IP) is reserved for the
+			// drill-down page (deployment_detail.html).
+			DeployedByUserID: d.DeployedByUserID,
+			DeployedVia:      d.DeployedVia,
+			DeployedFromIP:   d.DeployedFromIP,
+			PusherLogin:      d.PusherLogin,
 		}
 		// Per-deploy grype scan summary (issue #464 / ADR-075).
 		// Populate ScanSummary only when the row carries a
@@ -1876,6 +1885,18 @@ func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 		ErrorWhy:          d.ErrorWhy,
 		ErrorFix:          d.ErrorFix,
 		ErrorRelevantLogs: d.ErrorRelevantLogs,
+		// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+		// attribution surfaced on the dashboard deploy detail
+		// page. Server-stamped from the HTTP request context
+		// (cmd/apid/handlers.go::createDeployment / handlers_source_*.go
+		// / githubd_bridge.go) — never client-supplied. Pre-#606
+		// rows carry empty strings; the via-chip conditional
+		// render in deployment_detail.html keeps the wire + UI
+		// byte-identical for those rows.
+		DeployedByUserID: d.DeployedByUserID,
+		DeployedVia:      d.DeployedVia,
+		DeployedFromIP:   d.DeployedFromIP,
+		PusherLogin:      d.PusherLogin,
 	}
 }
 

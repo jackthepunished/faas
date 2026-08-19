@@ -143,7 +143,7 @@ func isTypedNilAuditOps(v any) bool {
 // silent wire-format change. Legacy emit sites without a meaningful
 // outcome stay on Emit unchanged.
 func (a *Auditor) Emit(ctx context.Context, kind string, accountID *string, data map[string]any) {
-	a.emit(ctx, kind, accountID, data, "")
+	a.emit(ctx, a.actor, kind, accountID, data, "")
 }
 
 // EmitResult is the result-bearing twin of [Emit]. result is the
@@ -153,14 +153,67 @@ func (a *Auditor) Emit(ctx context.Context, kind string, accountID *string, data
 // stamp goes through [auditutil.WithResult] so a caller's explicit
 // value on data["result"] always wins over the supplied result.
 func (a *Auditor) EmitResult(ctx context.Context, kind string, accountID *string, data map[string]any, result string) {
-	a.emit(ctx, kind, accountID, data, result)
+	a.emit(ctx, a.actor, kind, accountID, data, result)
+}
+
+// EmitAs is the per-call-actor twin of [Emit] (issue #606 /
+// SAFE-RELEASES-E.1). Most emit sites don't know who the actor is
+// at the package level — they stamp the daemon-level actor that
+// the constructor baked in ("apid", "schedd", …) and call it a
+// day. A handful of emit sites (currently: the four deployment
+// event types — app.deployed, app.signed_image_accepted,
+// deployment.traffic_percent_set_on_create, deploy.local_tarball,
+// deploy.source_ref) DO know who the actor is — they resolved
+// the actor at request entry (cmd/apid/deploy_actor.go) and want
+// to stamp it onto the audit row's actor column for SOC 2 / GDPR
+// attribution. EmitAs is the explicit override for that case.
+//
+// actor is the literal value written to events.actor — the
+// canonical shape is "<via>:<id>" (e.g. "dashboard:8a2...",
+// "github:poyrazK"). See cmd/apid/deploy_actor.resolvedActorString
+// for the convention. Passing actor == "" falls through to the
+// constructor-baked a.actor — preserves the safe-default
+// behaviour for any future emit site that wants to "use the
+// baked actor explicitly" rather than implicitly. Emit sites
+// that want to stamp a sentinel "unknown" should use the
+// literal "<via>:unknown" form rather than relying on this
+// fallback.
+//
+// Why a separate method rather than widening Emit: keeping the
+// constructor-baked behaviour for the ~85 unchanged emit sites
+// is the comment at lines 65-70 ("forget to pass an actor
+// fails to compile rather than silently writing an empty
+// string"). EmitAs is the explicit, opt-in escape hatch — its
+// existence documents that this site has decided to attribute
+// the row rather than leave it as the daemon's blanket name.
+func (a *Auditor) EmitAs(ctx context.Context, actor, kind string, accountID *string, data map[string]any) {
+	if actor == "" {
+		actor = a.actor
+	}
+	a.emit(ctx, actor, kind, accountID, data, "")
+}
+
+// EmitAsResult is the result-bearing twin of [EmitAs]. Same
+// per-call-actor semantics; result is forwarded to the shared
+// emit body just like EmitResult's. Mirroring the Emit /
+// EmitResult split keeps the trace-lift + marshal + metric-
+// observation code paths in lock-step across the four entry
+// points (Emit / EmitResult / EmitAs / EmitAsResult).
+func (a *Auditor) EmitAsResult(ctx context.Context, actor, kind string, accountID *string, data map[string]any, result string) {
+	if actor == "" {
+		actor = a.actor
+	}
+	a.emit(ctx, actor, kind, accountID, data, result)
 }
 
 // emit is the shared body. result == "" is the legacy Emit path;
 // result != "" is the EmitResult path. Single source of truth for
 // the trace lift, marshal, store call, and metric observation —
-// keeping the two entry points in lock-step.
-func (a *Auditor) emit(ctx context.Context, kind string, accountID *string, data map[string]any, result string) {
+// keeping the entry points in lock-step. actor is the literal
+// value to stamp onto events.actor; callers pre-resolve it (Emit /
+// EmitResult pass a.actor; EmitAs / EmitAsResult pass the
+// per-call override).
+func (a *Auditor) emit(ctx context.Context, actor, kind string, accountID *string, data map[string]any, result string) {
 	data = auditutil.WithResult(data, result)
 	if data == nil {
 		data = map[string]any{}
@@ -197,7 +250,7 @@ func (a *Auditor) emit(ctx context.Context, kind string, accountID *string, data
 		subject = accountID
 	}
 	start := time.Now()
-	err = a.store.AppendEvent(ctx, a.actor, kind, subject, payload)
+	err = a.store.AppendEvent(ctx, actor, kind, subject, payload)
 	dur := time.Since(start)
 	if a.ops != nil {
 		if err != nil {
@@ -208,7 +261,7 @@ func (a *Auditor) emit(ctx context.Context, kind string, accountID *string, data
 	}
 	if err != nil {
 		a.log.Warn("audit: append event",
-			"actor", a.actor, "kind", kind, "subject", subject, "err", err)
+			"actor", actor, "kind", kind, "subject", subject, "err", err)
 		if a.ops != nil {
 			a.ops.AuditWriteFailures(subjectStr).Inc()
 		}
