@@ -248,6 +248,46 @@ func (s *server) createTrigger(w http.ResponseWriter, r *http.Request, acct stat
 	if v := intFrom(req.BatchWindowMs); v > 0 {
 		batchWindowMs = int32(v)
 	}
+	// PR #993 / issue #757 review MED-4: enforce the per-plan
+	// batch_window cap (limits.TriggerBatchWindowMaxSec — Hobby
+	// 30s, Pro/Scale 300s). Pre-MED-4 the field went straight
+	// through to the SQL CHECK (10ms–600s) — a Hobby customer
+	// could legally request 600s and pin 10× the broker dwell
+	// window the per-app rate-limit is sized for. Surface a
+	// 403 with plan-cap + observed so the CLI / SDK can print a
+	// useful message; mirrors the batch_size_max + max_attempts
+	// gates above. Zero / unset cap = plan does not unlock
+	// triggers (Free), already short-circuited earlier in the
+	// handler.
+	if limits.TriggerBatchWindowMaxSec > 0 {
+		observedSec := int(batchWindowMs / 1000)
+		if observedSec > limits.TriggerBatchWindowMaxSec {
+			api.WriteProblem(w, api.ErrTriggerBatchWindowTooLarge(acct.Plan, limits.TriggerBatchWindowMaxSec, observedSec))
+			return
+		}
+	}
+	// PR #993 / issue #757 review MED-4: tls.skip_verify=true on a
+	// Kafka trigger is gated by the plan's TLSSkipVerifyAllowed flag
+	// (Hobby=false, Pro=true, Scale=true). Pre-MED-4 the field went
+	// straight to the broker — a Hobby customer could silently
+	// weaken hostname + cert verification on the production broker
+	// and nobody would notice until a TLS-MITM incident. Decode
+	// just enough of the Config blob to read the bool; surface a
+	// 403 with plan context so the CLI can branch on the plan vs
+	// drop-the-flag advice. The validator above
+	// (validateTriggerConfig) already shape-checks the field; this
+	// is the plan-cap overlay.
+	if !acct.Plan.TLSSkipVerifyAllowed() {
+		skip, err := kafkaSkipVerifyRequested(req.Kind, req.Config)
+		if err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "invalid trigger config: "+err.Error()))
+			return
+		}
+		if skip {
+			api.WriteProblem(w, api.ErrTriggerTLSSkipVerifyNotAllowed(acct.Plan))
+			return
+		}
+	}
 	maxAttempts := int32(5)
 	if v := intFrom(req.MaxAttempts); v > 0 {
 		maxAttempts = int32(v)
@@ -421,6 +461,36 @@ func (s *server) updateTrigger(w http.ResponseWriter, r *http.Request, acct stat
 		// next poll.
 		if err := validateTriggerConfig(api.TriggerKind(t.Kind), req.Config); err != nil {
 			api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, "trigger_invalid_config", "Invalid trigger config", err.Error()))
+			return
+		}
+	}
+	// PR #993 / issue #757 review MED-4: mirror createTrigger's
+	// plan gates for PATCH. A Hobby customer upgrading their
+	// batch_window from 5s to 600s after the fact, or flipping
+	// tls.skip_verify=true on an existing trigger, are the two
+	// holes the create-time gate leaves open. LimitsFor returns
+	// the (plan) entry; the unknown-plan fallback is Free which
+	// short-circuits via TriggersAllowed (already enforced on
+	// the lookup above when we AppByIDed).
+	limits, ok := api.LimitsFor(acct.Plan)
+	if !ok {
+		limits, _ = api.LimitsFor(api.PlanFree)
+	}
+	if req.BatchWindowMs != nil && limits.TriggerBatchWindowMaxSec > 0 {
+		observedSec := int(*req.BatchWindowMs / 1000)
+		if observedSec > limits.TriggerBatchWindowMaxSec {
+			api.WriteProblem(w, api.ErrTriggerBatchWindowTooLarge(acct.Plan, limits.TriggerBatchWindowMaxSec, observedSec))
+			return
+		}
+	}
+	if req.Config != nil && !acct.Plan.TLSSkipVerifyAllowed() {
+		skip, err := kafkaSkipVerifyRequested(api.TriggerKind(t.Kind), req.Config)
+		if err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", "invalid trigger config: "+err.Error()))
+			return
+		}
+		if skip {
+			api.WriteProblem(w, api.ErrTriggerTLSSkipVerifyNotAllowed(acct.Plan))
 			return
 		}
 	}
@@ -1007,6 +1077,44 @@ func validateTriggerConfig(kind api.TriggerKind, raw json.RawMessage) error {
 		probe.Triggers[0].Config = anyMap
 	}
 	return probe.Validate()
+}
+
+// kafkaSkipVerifyRequested returns true iff the trigger Config
+// blob carries a kafka.tls.skip_verify=true leaf. Used by
+// createTrigger + updateTrigger to gate the TLSSkipVerifyAllowed
+// plan flag (PR #993 / issue #757 review MED-4). Non-kafka kinds
+// always return false (the field is meaningless for them). A
+// malformed Config blob returns (false, err) so the caller can
+// surface the validator's error rather than silently allowing the
+// gate to fall through.
+//
+// Mirrors validateTriggerConfig's permissive decode (the same
+// json.Unmarshal into map[string]any), but extracts the single
+// bool we care about. Re-decode rather than re-using
+// gregalemanifest's typed KafkaConfig because we don't want the
+// createTrigger handler to take on a hard dependency on the
+// manifest package's exact field shape — the validator owns the
+// shape contract, this helper just reads one leaf.
+func kafkaSkipVerifyRequested(kind api.TriggerKind, raw json.RawMessage) (bool, error) {
+	if kind != api.TriggerKindKafka {
+		return false, nil
+	}
+	if len(raw) == 0 {
+		return false, nil
+	}
+	var cfg struct {
+		Brokers []string `json:"brokers"`
+		TLS     *struct {
+			SkipVerify bool `json:"skip_verify"`
+		} `json:"tls"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return false, err
+	}
+	if cfg.TLS == nil {
+		return false, nil
+	}
+	return cfg.TLS.SkipVerify, nil
 }
 
 // aggregateTriggerMetrics walks trigger_records for the trigger
