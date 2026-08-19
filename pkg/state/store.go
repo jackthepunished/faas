@@ -1213,6 +1213,39 @@ type Store interface {
 	// re-stamping the same timestamp is a no-op (the column value
 	// is the dedupe key, not the row identity).
 	StampPreviewDestroyCommentedAt(ctx context.Context, appID string, when time.Time) (App, error)
+	// StampFirstWake (Mega-C PR-2 / issue #961 leaf 8) sets
+	// first_wake_at + first_5xx_window_ends_at on the
+	// deployment iff both are NULL. The window ends_at is
+	// derived as now + windowMinutes (constant
+	// pkg/api.RollbackOn5xxWindowMinutes). Idempotent: a
+	// second call within the window leaves the values
+	// unchanged. Returns ErrNotFound when the deployment does
+	// not exist.
+	StampFirstWake(ctx context.Context, deploymentID string, windowMinutes int) (Deployment, error)
+	// BumpFirst5xxCount atomically increments the per-deploy
+	// first_5xx_count and returns the new value. Atomic via
+	// UPDATE ... RETURNING first_5xx_count (PG) / mutex-guarded
+	// map mutation (MemStore). schedd's threshold check is
+	// post-increment: caller compares the returned count to
+	// plan.RollbackOn5xxThreshold().
+	BumpFirst5xxCount(ctx context.Context, deploymentID string) (int, error)
+	// MarkAutoRollback stamps last_auto_rollback_at + the
+	// closed-set reason (see deployments_last_auto_rollback_reason_check
+	// from migration 00297). Called by the apid-internal
+	// auto-rollback handler after the deployments status swap
+	// commits. The two writes (status swap + this stamp) live
+	// in the same transaction; the audit row that carries
+	// trigger="auto_5xx" is the customer-visible signal.
+	MarkAutoRollback(ctx context.Context, deploymentID, reason string, when time.Time) (Deployment, error)
+	// AutoRollbackDeploymentsTx wraps the deployments status
+	// swap in a tx: (a) current live → superseded, (b) most
+	// recent superseded → live, (c) markAutoRollback on the
+	// rolled-back id. Returns the new live deployment id (the
+	// one schedd needs to park instances for). The instances
+	// mutation belongs to schedd per CLAUDE.md — this tx
+	// does NOT touch instances; schedd does that in a
+	// sibling call after this returns.
+	AutoRollbackDeploymentsTx(ctx context.Context, appID, currentDeploymentID string) (newLiveDeploymentID string, err error)
 	AppBySlug(ctx context.Context, slug string) (App, error)
 	ListApps(ctx context.Context, accountID string) ([]App, error)
 	// ListAllApps returns every non-deleted app on the box. schedd's reaper and

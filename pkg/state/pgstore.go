@@ -5578,7 +5578,172 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 	if err != nil {
 		return Deployment{}, err
 	}
-	return created, nil
+// StampFirstWake sets first_wake_at + first_5xx_window_ends_at if
+// both are NULL. Idempotent: a second wake (the dashboard healthz
+// probe waking the same deploy) is a no-op; only the first wake
+// opens the 5xx window. Returns the post-stamp Deployment so the
+// caller can decide whether to subscribe wake.response_5xx for
+// this deployment. The window is anchored at first_wake_at +
+// windowMinutes (default 5; RollbackOn5xxWindowMinutes).
+//
+// If the deploy has rollback_on_5xx=false (default), we still
+// stamp the columns — schedd might query them later when the
+// customer flips the flag (mid-window upgrades Hobby → Pro, see
+// ADR-118 risk (g)).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) StampFirstWake(ctx context.Context, deploymentID string, windowMinutes int) (Deployment, error) {
+	if windowMinutes <= 0 {
+		windowMinutes = 5
+	}
+	row := s.pool.QueryRow(ctx, `
+		update deployments
+		   set first_wake_at = coalesce(first_wake_at, now()),
+		       first_5xx_window_ends_at = coalesce(first_5xx_window_ends_at, now() + ($2::text || ' minutes')::interval)
+		 where id = $1
+		 returning `+deploymentSelectColumnsWithRootfs, deploymentID, windowMinutes)
+	d, err := scanDeploymentWithRootfs(row)
+	if err != nil {
+		return Deployment{}, mapErr(err)
+	}
+	return d, nil
+}
+
+// BumpFirst5xxCount atomically increments deployments.first_5xx_count
+// and returns the post-increment count. The schedd-side threshold
+// check happens after this returns. Atomic via UPDATE ... RETURNING,
+// so concurrent wake.response_5xx events on the same deploy can never
+// lose an increment. Replay-safety is built-in: re-emitting the same
+// event bumps the counter again, which is the conservative direction
+// (it can trigger a no-op auto-rollback but cannot miss one).
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) BumpFirst5xxCount(ctx context.Context, deploymentID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`update deployments
+		    set first_5xx_count = first_5xx_count + 1
+		  where id = $1
+		  returning first_5xx_count`, deploymentID).Scan(&n)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return n, nil
+}
+
+// MarkAutoRollback stamps last_auto_rollback_at + last_auto_rollback_reason
+// on the current (failed) deploy. Idempotent on the (id, reason) pair;
+// re-stamping with the same reason is a no-op via the WHERE clause,
+// so a duplicated auto-rollback signal from schedd does not double-write.
+// reason MUST be 'threshold_exceeded' or 'first_window_expired' —
+// the CHECK constraint deployments_last_auto_rollback_reason_check
+// rejects anything else.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) MarkAutoRollback(ctx context.Context, deploymentID, reason string, when time.Time) (Deployment, error) {
+	if reason == "" {
+		return Deployment{}, fmt.Errorf("pkgstate: MarkAutoRollback reason required")
+	}
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	row := s.pool.QueryRow(ctx, `
+		update deployments
+		   set last_auto_rollback_at = $2,
+		       last_auto_rollback_reason = $3
+		 where id = $1
+		   and last_auto_rollback_reason is null
+		 returning `+deploymentSelectColumnsWithRootfs, deploymentID, when, reason)
+	d, err := scanDeploymentWithRootfs(row)
+	if err != nil {
+		return Deployment{}, mapErr(err)
+	}
+	return d, nil
+}
+
+// AutoRollbackDeploymentsTx performs the §6.2-1-safe rollback inside
+// a single tx: supersede the current (failed) deploy and promote the
+// latest superseded deploy back to live, stamping last_auto_rollback_at
+// + last_auto_rollback_reason on the failed row. The instances-park
+// belongs to schedd (the ONLY writer to instances per CLAUDE.md);
+// this method mutates deployments only.
+//
+// Returns the new live deployment ID, or (empty, nil) if no
+// superseded deploy exists (the rollback is a no-op — the failed
+// deploy was the only one). Returns ErrNotFound when the current
+// deployment row does not exist.
+//
+// Migration 00297 / Mega-C PR-2 / issue #961 leaf 8.
+func (s *PgStore) AutoRollbackDeploymentsTx(ctx context.Context, appID, currentDeploymentID string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// (1) Verify current row exists and is live. Prevents a stale
+	// auto-rollback signal from schedd from rolling back an already-
+	// superseded deploy (which would leave the previous live row
+	// unstamped).
+	var currentExists bool
+	if err := tx.QueryRow(ctx,
+		`select exists(select 1 from deployments where id = $1 and app_id = $2 and status = 'live')`,
+		currentDeploymentID, appID).Scan(&currentExists); err != nil {
+		return "", mapErr(err)
+	}
+	if !currentExists {
+		return "", ErrNotFound
+	}
+
+	// (2) Find the latest superseded deploy on this app (the rollback
+	// target). ORDER BY created_at DESC mirrors LatestSupersededDeployment
+	// in cmd/apid so the manual + auto-rollback paths agree on the same
+	// target.
+	var targetID string
+	err = tx.QueryRow(ctx, `
+		select id from deployments
+		 where app_id = $1 and status = 'superseded' and id <> $2
+		 order by created_at desc
+		 limit 1`, appID, currentDeploymentID).Scan(&targetID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No rollback target — succeed as a no-op so schedd does
+			// not retry forever. The failed deploy is left in place;
+			// §6.2-1 is preserved because we did not promote a new
+			// live row.
+			return "", nil
+		}
+		return "", mapErr(err)
+	}
+
+	// (3) Status swap. The order matches the manual rollback path:
+	// supersede current THEN promote target. Both are conditional on
+	// the source status to keep the path idempotent against a
+	// concurrent rollback signal.
+	if _, err := tx.Exec(ctx,
+		`update deployments set status = 'superseded' where id = $1 and status = 'live'`,
+		currentDeploymentID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx,
+		`update deployments set status = 'live' where id = $1 and status = 'superseded'`,
+		targetID); err != nil {
+		return "", err
+	}
+
+	// (4) Stamp the audit anchor on the failed deploy.
+	if _, err := tx.Exec(ctx, `
+		update deployments
+		   set last_auto_rollback_at = coalesce(last_auto_rollback_at, now()),
+		       last_auto_rollback_reason = coalesce(last_auto_rollback_reason, 'threshold_exceeded')
+		 where id = $1`, currentDeploymentID); err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return targetID, nil
 }
 
 func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error {
@@ -13408,7 +13573,10 @@ const deploymentSelectColumnsWithRootfs = `
 	scope,
 	stage_state,
 	coalesce(deployed_by_user_id::text,''), deployed_via, coalesce(host(deployed_from_ip),''), coalesce(pusher_login,''),
-	coalesce(reason,''), coalesce(tag,''), coalesce(deployed_by,''), pr_number`
+	coalesce(reason,''), coalesce(tag,''), coalesce(deployed_by,''), pr_number,
+	rollback_on_5xx,
+	first_wake_at, first_5xx_window_ends_at, first_5xx_count,
+	last_auto_rollback_at, coalesce(last_auto_rollback_reason,'')`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -13445,7 +13613,10 @@ const deploymentSelectColumnsQualified = `
 	d.scope,
 	d.stage_state,
 	coalesce(d.deployed_by_user_id::text,''), d.deployed_via, coalesce(host(d.deployed_from_ip),''), coalesce(d.pusher_login,''),
-	coalesce(d.reason,''), coalesce(d.tag,''), coalesce(d.deployed_by,''), d.pr_number`
+	coalesce(d.reason,''), coalesce(d.tag,''), coalesce(d.deployed_by,''), d.pr_number,
+	d.rollback_on_5xx,
+	d.first_wake_at, d.first_5xx_window_ends_at, d.first_5xx_count,
+	d.last_auto_rollback_at, coalesce(d.last_auto_rollback_reason,'')`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -13477,6 +13648,16 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	// closed-set vocabulary on `tag` is enforced at the schema layer
 	// via deployments_tag_set_chk, not on the scan side.
 	var prNumber *int
+	// Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: nullable
+	// timestamps + a non-nullable counter scanned directly into
+	// the struct. first_wake_at and first_5xx_window_ends_at are
+	// NULL until the gateway stamps the first customer-visible
+	// response; last_auto_rollback_at is NULL until schedd fires
+	// the rollback. last_auto_rollback_reason is coalesced to ''
+	// in the SELECT projection so it reads into a plain string
+	// field (the closed-set is enforced at the schema layer via
+	// deployments_last_auto_rollback_reason_check).
+	var firstWakeAt, first5xxWindowEndsAt, lastAutoRollbackAt *time.Time
 	// Issue #460 / ADR-053: six override columns scanned here so
 	// the SELECT projections in DeploymentByID / LatestDeployment /
 	// etc. match. The scan order matches the column order in the
@@ -13519,28 +13700,12 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.ParkedReason, &parkedAt, &d.TrafficPercent,
 		&d.Scope,
 		&d.StageState,
-		// Issue #606 — actor attribution columns (migration 00305).
-		// deployed_by_user_id is coalesced to '' in the SELECT
-		// projection above (UUID NULL → '') so the typed-string
-		// destination stays a string field on the struct; the
-		// empty string is the "anonymous / pre-FK / GitHub-push"
-		// sentinel. deployed_via is NOT NULL DEFAULT 'api' so the
-		// SELECT can hand it straight to a plain string field.
-		// deployed_from_ip is coalesced to '' for the same UUID-
-		// style reason (INET NULL → ''). pusher_login is coalesced
-		// to '' for the nullable text reason. The destinations stay
-		// in lockstep with deploymentSelectColumnsWithRootfs; pgx's
-		// "number of field descriptions must equal number of
-		// destinations" panic fires immediately on the next read
-		// path if these two lists drift apart.
 		&d.DeployedByUserID, &d.DeployedVia, &d.DeployedFromIP, &d.PusherLogin,
-		// Issue #977 / ADR-116: annotation columns. reason / tag /
-		// deployed_by are coalesced to '' in the SELECT projection
-		// (nullable text NULL → ''), so the typed-string destinations
-		// stay plain string fields. pr_number is NULLIF($N, 0) on
-		// the INSERT side and a plain int column on the SELECT side,
-		// scanned via the *int local returned as nil for NULL.
-		&d.Reason, &d.Tag, &d.DeployedBy, &prNumber); err != nil {
+		&d.Reason, &d.Tag, &d.DeployedBy, &prNumber,
+		&d.RollbackOn5xx,
+		&firstWakeAt, &first5xxWindowEndsAt, &d.First5xxCount,
+		&lastAutoRollbackAt, &d.LastAutoRollbackReason,
+	); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {
@@ -13564,6 +13729,9 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	if prNumber != nil {
 		d.PRNumber = *prNumber
 	}
+	d.FirstWakeAt = firstWakeAt
+	d.First5xxWindowEndsAt = first5xxWindowEndsAt
+	d.LastAutoRollbackAt = lastAutoRollbackAt
 	return nil
 }
 
