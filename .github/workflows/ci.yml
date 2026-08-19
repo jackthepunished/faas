@@ -1168,7 +1168,7 @@ jobs:
       - name: install jinja2 (ADR-055 cross-check)
         run: python3 -m pip install --quiet jinja2
       - name: e2e tests (shard 1 — 18 tests)
-        run: go test -race -count=1 -timeout=15m -run '^Test(C|D|Docs|E2E_[A-E])' ./cmd/e2e/...
+        run: go test -race -count=1 -timeout=15m -run '^Test(C|D|Docs|Domain|E2E_[A-E])' ./cmd/e2e/...
 
   e2e-shard2:
     name: e2e (shard 2 — 15 tests)
