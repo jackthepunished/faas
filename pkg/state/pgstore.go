@@ -13059,7 +13059,6 @@ const deploymentSelectColumnsWithRootfs = `
 	stage_state,
 	coalesce(deployed_by_user_id::text,''), deployed_via, coalesce(deployed_from_ip::text,''), coalesce(pusher_login,'')`
 
-
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
 var _ = deploymentSelectColumnsWithRootfs
@@ -13095,7 +13094,6 @@ const deploymentSelectColumnsQualified = `
 	d.scope,
 	d.stage_state,
 	coalesce(d.deployed_by_user_id::text,''), d.deployed_via, coalesce(d.deployed_from_ip::text,''), coalesce(d.pusher_login,'')`
-
 
 var _ = deploymentSelectColumnsQualified
 

@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00303 (deployments.deployed_by_user_id +
+// Migration-apply test for 00305 (deployments.deployed_by_user_id +
 // deployments.deployed_via + deployments.deployed_from_ip +
 // deployments.pusher_login + FK + closed-set CHECK).
 // Pins the contract from issue #606.
@@ -29,17 +29,17 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00303_DeploymentsActor is the per-migration pin
-// for the actor-attribution columns introduced in 00303 (issue
+// TestMigrations_00305_DeploymentsActor is the per-migration pin
+// for the actor-attribution columns introduced in 00305 (issue
 // #606 — orthogonal to PR #984's human-readable deployed_by text
 // column from issue #977 / ADR-116).
-func TestMigrations_00303_DeploymentsActor(t *testing.T) {
+func TestMigrations_00305_DeploymentsActor(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00303 should land last.
+	// (1) Run the full migration set. 00305 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot before 00303)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot before 00305)", err)
 	}
 
 	// (2) Column shape. Scoped to current_schema() per
@@ -138,6 +138,36 @@ func TestMigrations_00303_DeploymentsActor(t *testing.T) {
 	if fkAction != "n" {
 		t.Errorf("deployed_by_user_id FK ON DELETE = %q, want SET NULL (GDPR account-erasure safety)",
 			fkAction)
+	}
+
+	// (4b) MEDIUM review #3 (PR #992): the FK was added NOT VALID
+	// in 00303 (no full-table scan), and 00304 runs VALIDATE
+	// CONSTRAINT under SHARE UPDATE EXCLUSIVE (which permits
+	// concurrent apid INSERTs). The pin: after the full migration
+	// set applies, pg_constraint.convalidated must be 't' so
+	// future readers know the FK is fully enforced against
+	// existing rows, not just new ones.
+	//
+	// Pre-#606 deployments never wrote deployed_by_user_id (column
+	// was added by 00303 itself), so every existing row is NULL —
+	// VALIDATE on a NULL FK column is a catalog scan that returns
+	// "valid" immediately. The test asserts the bit flipped to
+	// 't' so a future migration that re-introduces NOT VALID
+	// without a follow-up VALIDATE trips here, not at the next
+	// GDPR erasure.
+	var convalidated string
+	err = pool.QueryRow(ctx, `
+		select c.convalidated
+		  from pg_constraint c
+		  join pg_namespace n on n.oid = c.connamespace
+		 where c.conname = 'deployments_deployed_by_user_id_fk'
+		   and n.nspname = current_schema()`).Scan(&convalidated)
+	if err != nil {
+		t.Fatalf("query deployed_by_user_id FK convalidated: %v", err)
+	}
+	if convalidated != "t" {
+		t.Errorf("deployed_by_user_id FK convalidated = %q, want 't' (00304 must have run VALIDATE CONSTRAINT — concurrent apid INSERTs block otherwise)",
+			convalidated)
 	}
 
 	// (5) Replay safety: applying the migration set a second time

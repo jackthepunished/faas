@@ -4,26 +4,50 @@
 // both the server-side column stamps (deployed_by_user_id,
 // deployed_via, deployed_from_ip) and the audit-row actor string
 // (s.audit.EmitAs(..., resolvedActor, ...)) route through the helpers
-// here so the cookie-vs-bearer-vs-API-key classifier never forks
-// across handler files.
+// here so the via-classifier never forks across handler files.
 //
-// The classification is deterministic from the request shape: a
-// session cookie present → dashboard; bearer token → CLI (the
-// CLI stores its key as a bearer per pkg/gregale/auth); API-key
-// header → api (machine-to-machine / SDK); the githubd_bridge path
-// stamps "github" at the bridge, not here (the bridge doesn't carry
-// an HTTP request — req.Pusher.Login is the resolved actor there).
+// MEDIUM review #1 (PR #992): the previous header-sniffing
+// classifier (cookie name "faas_session", case-sensitive Bearer
+// prefix check, X-API-Key branch) was structurally broken:
+//   - cookie name was wrong (the real one is "faas_sid" per
+//     handlers_auth_login.go:520 + auth_facade.go:225); the
+//     dashboard branch was silently dead code;
+//   - the X-API-Key branch was unreachable from any auth-derived
+//     request — the SDK uses Authorization: Bearer
+//     (pkg/api/client.go:202,308,389,…);
+//   - reading raw headers after the auth chain had already
+//     validated and classified the credential meant a holder of
+//     a stolen bearer key could spoof the dashboard branch by
+//     attaching a Cookie: faas_sid=garbage header; the row would
+//     stamp deployed_via='dashboard' while authenticated via
+//     the bearer key. Provenance was provably wrong.
+//
+// This file replaces the header-sniff classifier with one
+// derived from authmw.AccountFromContext — the authoritative
+// (Account, *APIKey) tuple the auth chain stashed on r.Context()
+// after credential validation. The auth chain is the source of
+// truth; this classifier is downstream of it.
+//
+// The githubd_bridge path stamps "github" at the bridge itself
+// (cmd/apid/githubd_bridge.go::EnqueueBuild) — the bridge
+// doesn't carry an HTTP request, so this helper never sees it.
 //
 // The closed-set vocabulary (api / cli / dashboard / github /
 // operator) is enforced at the schema layer by
-// migrations/00303_deployments_actor.sql's CHECK constraint — the
-// helpers here return only values in that set.
+// migrations/00305_deployments_actor.sql's CHECK constraint — the
+// helpers here return only values in that set. "operator" is
+// reserved for the (not-yet-implemented) admin path; today the
+// helper returns "api" as the fallback when the principal is
+// authenticated but the via is otherwise indistinguishable (the
+// SDK and the CLI emit byte-identical Authorization: Bearer
+// headers — the via split is intent-only, not wire-distinguishable).
 
 package main
 
 import (
 	"net/http"
 
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -35,50 +59,43 @@ import (
 // has to inspect proto headers — handlers called via the bridge
 // are not HTTP-routed.
 //
-// Classification order:
-//  1. Has session cookie → "dashboard" (the dashboard UI sets the
-//     cookie at /v1/auth/session-create — see handlers_issue_session.go).
-//  2. Has Authorization: Bearer → "cli" (the CLI writes bearer tokens
-//     per pkg/gregale/auth; the bearer header is the canonical
-//     machine-to-machine shape from the CLI's pov).
-//  3. Has X-API-Key → "api" (programmatic access via API key —
-//     the SDK uses this path).
-//  4. Else → "api" (default for unauthenticated-but-passing-the-
-//     gateway paths; a future commit can tighten the default to
-//     "operator" if observability shows the fallback is hit on
-//     any customer surface).
+// Classification (MEDIUM review #1, PR #992):
 //
-// The helper is intentionally order-sensitive: a session cookie
-// always wins over a bearer header (a CLI invocation that happens
-// to carry a session cookie is a misconfiguration we want to
-// attribute to the dashboard, not the CLI — that's what the
-// session is for).
+//	auth chain classified via API key (AuthKey != nil) → "api"
+//	  (machine-to-machine / SDK; the CLI is rare-to-never
+//	  API-key authenticated)
+//	auth chain classified via session cookie (AuthKey == nil)
+//	  → "dashboard"
+//	auth chain did NOT classify (r.Context() lacks the tuple —
+//	  a request that reached the handler without going through
+//	  the auth middleware) → "api" (safe default; the closed-set
+//	  CHECK on deployed_via rejects anything outside the set,
+//	  so the schema is the safety net for the no-principal
+//	  case)
+//
+// The classifier is downstream of authmw.AccountFromContext — the
+// auth chain is the source of truth for "who is authenticated
+// and via what credential", not the raw headers. Reading raw
+// headers post-authentication is the spoofing surface the
+// review flagged.
 func routeKindForRequest(r *http.Request) string {
-	if cookieSessionPresent(r) {
-		return "dashboard"
-	}
-	if h := r.Header.Get("Authorization"); h != "" && len(h) >= 7 && (h[:7] == "Bearer " || h[:7] == "bearer ") {
-		return "cli"
-	}
-	if r.Header.Get("X-API-Key") != "" {
+	_, key, ok := authmw.AccountFromContext(r)
+	if !ok {
+		// No principal stashed — the request reached this
+		// handler without going through the auth middleware.
+		// Default to "api" rather than failing closed: the
+		// closed-set CHECK on deployed_via rejects any
+		// out-of-set value, and the dashboard deployment
+		// table rows that miss the principal column can be
+		// re-stamped via a follow-up migration if
+		// observability shows the fallback is hit on any
+		// customer surface.
 		return "api"
 	}
-	return "api"
-}
-
-// cookieSessionPresent returns true if the request carries a
-// session cookie (the dashboard path). Extracted so the
-// classification doesn't bake cookie-name knowledge into two
-// helpers — a future cookie rename touches one place.
-//
-// The cookie name is the same one handlers_issue_session.go writes
-// ("faas_session"); a direct header lookup keeps the dependency
-// graph lean (this file is referenced from every deploy handler).
-func cookieSessionPresent(r *http.Request) bool {
-	if _, err := r.Cookie("faas_session"); err == nil {
-		return true
+	if key == nil {
+		return "dashboard"
 	}
-	return false
+	return "api"
 }
 
 // stampDeploymentActor stamps the three server-resolved actor
@@ -92,7 +109,7 @@ func cookieSessionPresent(r *http.Request) bool {
 // lives in cmd/apid/githubd_bridge.go::EnqueueBuild.
 //
 // Empty fields are kept as "" on the struct; the pgstore INSERT
-// path coalesces them to NULL/” via the migrations/00303 SQL
+// path coalesces them to NULL/” via the migrations/00305 SQL
 // shape (nullif() + coalesce() chain).
 func stampDeploymentActor(d *state.Deployment, acct state.Account, r *http.Request) {
 	d.DeployedByUserID = acct.ID

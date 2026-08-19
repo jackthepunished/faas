@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00303_deployments_actor.sql
+-- filename: 00305_deployments_actor.sql
 --
 -- issue #606 — Persist the deployer identity on `public.deployments`.
 -- PR #984 (issue #977 / ADR-116) added the human-readable `deployed_by`
@@ -85,19 +85,69 @@ ALTER TABLE deployments
 -- erased, the deployment row must keep its reason / tag /
 -- created_at, but the attribution column nulls out (matches the
 -- audit row's subject=NULL convention on account deletion,
--- audit.go:43 + issue #286). The FK is added via ALTER TABLE …
--- ADD CONSTRAINT in a separate statement so the constraint can
--- be dropped+readded in the same replay-safe shape as the CHECK.
+-- audit.go:43 + issue #286).
+--
+-- MEDIUM review #3 (PR #992): the previous version added the
+-- FK with a plain ADD CONSTRAINT — that takes a SHARE ROW
+-- EXCLUSIVE lock on `deployments` AND full-table-scans to
+-- validate every existing row holds a valid accounts(id). On a
+-- production table that has 3+ years of deployments (and the
+-- scheduled-deployments tenant account FK we added in 00300
+-- series may already be in flight), the lock-wait blocks every
+-- concurrent apid INSERT for the duration of the scan. Even
+-- on a fast disk, that's tens of seconds of apid write stalls.
+--
+-- The NOT VALID + VALIDATE precedent from migrations/00206 +
+-- 00229 lets us split the work:
+--
+--   00305 (this migration): ADD CONSTRAINT … NOT VALID — adds
+--     the FK without scanning existing rows. The lock is taken
+--     only long enough to install the trigger metadata;
+--     concurrent INSERTs continue. New rows ARE validated by
+--     the FK trigger from the moment NOT VALID is installed
+--     (only existing rows are skipped), so the SOC 2 / GDPR
+--     contract holds for every deployment going forward.
+--
+--   00306: VALIDATE CONSTRAINT deployments_deployed_by_user_id_fk
+--     — takes a SHARE UPDATE EXCLUSIVE lock (concurrent INSERTs
+--     continue, only DDL is blocked) and full-scans to confirm
+--     existing rows are within the bound. The schema layout
+--     guarantees they're NULL or a valid accounts(id) at this
+--     point: pre-#606 deployments never wrote
+--     deployed_by_user_id, so every existing row is NULL;
+--     post-#606 rows went through the apid handler that
+--     stamped acct.ID which was already validated against
+--     accounts(id) by the auth chain. The scan is a no-op
+--     validation in practice but we still run it so the FK is
+--     marked VALID in pg_constraint for future readers.
+--
+-- Replay safety: 00305's DROP CONSTRAINT IF EXISTS + ADD
+-- CONSTRAINT pair is idempotent — re-running on a DB that
+-- already has the FK (NOT VALID) drops and re-adds. 00306's
+-- VALIDATE is also idempotent: re-validating an already-valid
+-- constraint is a single catalog lookup. If a re-run races
+-- with 00306's first apply, Postgres serialises the second
+-- VALIDATE on the row-level ShareUpdateExclusive lock and
+-- both complete successfully.
 ALTER TABLE deployments
     DROP CONSTRAINT IF EXISTS deployments_deployed_by_user_id_fk;
 ALTER TABLE deployments
     ADD  CONSTRAINT deployments_deployed_by_user_id_fk
         FOREIGN KEY (deployed_by_user_id) REFERENCES accounts(id)
-        ON DELETE SET NULL;
+        ON DELETE SET NULL
+        NOT VALID;
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
+-- Note: VALIDATE in 00306 is forward-only; on full Down we DROP
+-- the FK first (in case 00306 was applied) then drop the column.
+-- The order matters: if the column is dropped first, the FK
+-- becomes an orphan reference and the DROP CONSTRAINT below
+-- would fail with a "constraint does not exist" (the FK holds
+-- the column reference; dropping the column drops the FK in
+-- many PG versions, leaving the named DROP CONSTRAINT to be a
+-- no-op).
 ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_deployed_by_user_id_fk;
 ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_deployed_via_set_chk;
 ALTER TABLE deployments DROP COLUMN IF EXISTS pusher_login;

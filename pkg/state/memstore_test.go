@@ -5285,6 +5285,7 @@ func TestMemStoreAppendDeploymentStage(t *testing.T) {
 	// returns ErrNotFound (programming-error guard).
 	if _, err := s.CloseDeploymentStage(ctx, dep2.ID, StageSourceDownload, now); !errors.Is(err, ErrNotFound) {
 		t.Errorf("CloseDeploymentStage with wrong name: expected ErrNotFound, got %v", err)
+	}
 }
 
 // TestMemStore_DeploymentActorRoundtrip (issue #606) pins the
@@ -5363,8 +5364,6 @@ func TestMemStore_DeploymentActorRoundtrip(t *testing.T) {
 	}
 	if dEmpty.PusherLogin != "" {
 		t.Errorf("empty pusher_login = %q, want \"\"", dEmpty.PusherLogin)
-	}
-}
 	}
 }
 

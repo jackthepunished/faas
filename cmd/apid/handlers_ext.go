@@ -3569,7 +3569,7 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		// — the four fields are server-stamped at handler entry
 		// (cmd/apid/handlers.go::createDeployment, deploy_inputs.go,
 		// handlers_source_ref.go, handlers_source_tarball.go, and
-		// githubd_bridge.go) and stored via the migrations/00303
+		// githubd_bridge.go) and stored via the migrations/00305
 		// column set. The DTO json tags use `omitempty` so
 		// pre-#606 rows render bit-identical JSON to the wire.
 		DeployedByUserID: d.DeployedByUserID,

@@ -9332,9 +9332,15 @@ components:
           example: "cli"
         deployed_from_ip:
           type: [string, "null"]
-          format: ipv4
-          description: "Trusted remote IP captured by `pkg/middleware.ClientIP` at handler entry (XFF + loopback trust contract). Loopback (127.0.0.1) for the githubd_bridge path."
+          description: "Trusted remote IP captured by `pkg/middleware.ClientIP` at handler entry (XFF + loopback trust contract). Loopback (127.0.0.1) for the githubd_bridge path. Both IPv4 and IPv6 are accepted at the wire and stored in Postgres' native `inet` type (which canonicalises both families); the OpenAPI schema intentionally omits `format: ipv4` so v6 deployments (which grow as the public gateway picks up AAAA records) do not fail schema validation. v6 is rendered as the bracketed colon-hex form per RFC 5952."
           example: "203.0.113.42"
+          examples:
+            ipv4:
+              summary: IPv4 (RFC 791)
+              value: "203.0.113.42"
+            ipv6:
+              summary: IPv6 (RFC 5952 canonical form)
+              value: "2001:db8::1"
         pusher_login:
           type: [string, "null"]
           description: "Raw GitHub login of the pusher when `deployed_via == \"github\"`. Empty for all other via values. Distinct from the human-readable `DeployedBy` text column (issue #977 / PR #984) — pusher_login is the unmodified GH identity, suitable for downstream GitHub-API correlation."

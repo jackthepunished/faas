@@ -3795,7 +3795,7 @@ func TestPg_DeploymentActorRoundtrip(t *testing.T) {
 	}
 
 	// 3. Closed-set deployed_via CHECK rejection. The DB-side
-	//    constraint (migrations/00303_deployments_actor.sql) is
+	//    constraint (migrations/00305_deployments_actor.sql) is
 	//    the source of truth; the apid handler is expected to
 	//    mirror the vocabulary. We drive the rejection directly
 	//    through the store to confirm the constraint is wired

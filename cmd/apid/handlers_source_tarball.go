@@ -191,8 +191,24 @@ func (s *server) auditLocalTarballDeploy(ctx context.Context, acct state.Account
 	)
 	d, dErr := s.store.DeploymentByID(ctx, res.DeploymentID)
 	if dErr != nil {
-		s.log.Warn("auditLocalTarballDeploy: read deployment for actor attribution",
+		// MEDIUM review #4: when the read-back fails we must
+		// NOT fall through with a zero Deployment — that would
+		// make resolvedActorString emit ':unknown' (via empty,
+		// '<via>:unknown' branch) and bypass EmitAs's actor==''
+		// fallback. The audit row would land with corrupt
+		// attribution exactly when forensics needs it most.
+		// Early-return without an audit row: the durable
+		// deployment row is already committed (with the
+		// structured actor columns stamped at INSERT time), so
+		// the SOC 2 / GDPR audit-trail question still has an
+		// answer via deployments.deployed_by_user_id /
+		// deployed_via / deployed_from_ip; the events-table
+		// row just doesn't get stamped this time. Operator
+		// can grep by deployment_id and recover attribution
+		// from the row directly.
+		s.log.Warn("auditLocalTarballDeploy: skip audit row, read deployment for actor attribution failed",
 			"deployment", res.DeploymentID, "err", dErr)
+		return
 	}
 	resolvedActor := resolvedActorString(d.DeployedVia, d.DeployedByUserID, d.PusherLogin)
 	s.audit.EmitAs(ctx, resolvedActor, "deploy.local_tarball", &acct.ID, mergeActorAudit(map[string]any{
