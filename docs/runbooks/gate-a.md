@@ -208,7 +208,7 @@ INSERT INTO compute_nodes (
 SQL
 
 # 2. Bootstrap vmmd on the new box (per deploy/ansible).
-ssh faas-fsn-2 'make bootstrap'
+ssh faas-fsn-2 'make bootstrap-compute'
 ssh faas-fsn-2 'systemctl enable --now faas-vmmd'
 
 # 3. Bootstrap schedd on the new box with the per-node identity.

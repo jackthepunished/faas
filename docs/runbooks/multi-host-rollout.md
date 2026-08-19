@@ -212,18 +212,18 @@ masquerade_cidr: 10.101.0.0/16
 > `egress_policy_changed`) keeps `/etc/nftables.conf` in sync with
 > the audit row, so an operator-side UPSERT on `egress_policy`
 > also hot-reloads the live ruleset without re-running
-> `make bootstrap`.
+> `make bootstrap-compute`.
 
-### 2. `make bootstrap` on the new node
+### 2. `make bootstrap-compute` on the new node
 
 ```sh
-ssh gregale-fsn-2 'cd /opt/onebox-faas && git pull && sudo make bootstrap'
+ssh gregale-fsn-2 'cd /opt/onebox-faas && git pull && sudo make bootstrap-compute'
 ```
 
 > **Note:** the `/opt/onebox-faas` filesystem path is the bootstrap
 > layout from `deploy/scripts/bootstrap.sh` (file does NOT exist;
 > canonical path is `deploy/controlplane/bootstrap.sh`, RETIRED
-> 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap` +
+> 2026-08-15 by issue #911 / PR-1; v2 path is `make bootstrap-compute` +
 > `gregalectl manifest {validate,render}` + `gregalectl release install`).
 > Filesystem layout is code-side, not part of the docs rebrand.
 > A follow-up code-identity pass renames the path to match the host
@@ -464,7 +464,7 @@ in place with `active=false`, the cert material under
 If the cut-over fails irrecoverably:
 
 - **Node-id mismatch** between schedd view (`compute_nodes.id`)
-  and vmmd's self-registration — `make bootstrap` against the
+  and vmmd's self-registration — `make bootstrap-compute` against the
   failed node with `--force` re-issues the leaves; the vmmd leaf
   CN must match the operator-POST row's `target_url` host.
 - **mTLS handshake failure** — re-run `gregalectl pki status` on

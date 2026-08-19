@@ -66,7 +66,7 @@ const (
 // absent — single-box dev boots are the daemon's own back-compat
 // default; this package is the "deploy a box as control-plane OR
 // compute-only" path, not the "deploy a box as single-box" path
-// (the legacy make bootstrap flow covers single-box).
+// (the isolated image-seed and local test paths cover single-box).
 var AllowedRoles = []Role{RoleControlPlane, RoleComputeOnly}
 
 // ValidRoles is a set-based view of AllowedRoles for O(1) lookup.

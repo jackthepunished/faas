@@ -108,7 +108,7 @@ one `sed` rewrite.
 |---|---|---|
 | `pg_backup_last_pushed_seconds > 86400` | yes (page) | `journalctl -u faas-pg-basebackup-push.service` — most likely rclone auth drift; check `/etc/faas/secrets/storage-box/rclone.conf` mode + contents |
 | `pg_backup_last_pushed_seconds > 3600` | warn | check Storage Box endpoint reachability (`rclone lsd hertznerbox:faas-pg-basebackup --config ...`) |
-| `archive_command` line shows old `cp` | warn | the operator dropped the storage-box drop-in; re-run `ansible-playbook deploy/ansible/site.yml` |
+| `archive_command` line shows old `cp` | warn | the operator dropped the storage-box drop-in; re-run the control-plane bootstrap target |
 | T-7 row-count ratio < 0.95 | page | the restore is partial — check `rclone cat hertznerbox:faas-pg-wal/` returns the right segment; check `recovery.signal` + `restore_command` are in the throwaway postgresql.conf |
 
 ## Acceptance

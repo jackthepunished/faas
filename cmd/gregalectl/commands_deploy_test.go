@@ -107,13 +107,6 @@ faas-fsn-1
 
 [compute_nodes]
 faas-fsn-2
-
-[box]
-127.0.0.1 ansible_connection=local ansible_python_interpreter=/usr/bin/python3
-
-[box:children]
-control_plane
-compute_nodes
 `
 	if err := os.WriteFile(filepath.Join(repo, "deploy/ansible/inventory/hosts.ini"), []byte(seedINI), 0o644); err != nil {
 		t.Fatalf("write hosts.ini: %v", err)

@@ -48,7 +48,7 @@ If any of these checks fail, stop. Fix the precondition and re-run.
 ### 1. Apply the ansible role (idempotent; safe to re-run)
 
 ```sh
-ansible-playbook deploy/ansible/site.yml --tags gatewayd_service
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-control-plane
 ```
 
 The role now creates `/var/lib/faas/certs` as `faas:faas 0700` (P0.2

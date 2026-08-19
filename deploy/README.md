@@ -1,9 +1,11 @@
 # deploy/ — host provisioning and runtime config
 
-Bootstraps a fresh bare-metal x86_64 control-plane node to Gregale-ready in one command:
+Bootstraps a fresh bare-metal x86_64 split-box fleet to Gregale-ready:
 
 ```
-make bootstrap          # `ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml`
+make manifest-ansible MANIFEST=deploy/manifest/splitbox.yaml
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-control-plane
+make ANSIBLE_INVENTORY=deploy/ansible/.generated/inventory/hosts.ini bootstrap-compute
 ```
 
 then verify the platform works end-to-end:
@@ -15,11 +17,9 @@ make build              # compile every daemon
 make test               # cross-platform unit tests
 ```
 
-- `ansible/` — idempotent control-plane bootstrap (`make bootstrap`): LVM layout
-  (§8), systemd slices (§13), nftables (§7), cgroups v2 verify
-  (ADR-008). 8 roles, ordered:
-  `cgroups_v2 → grub → lvm → xfs → firecracker → systemd_slices →
-  nftables → postgres`. See [`ansible/README.md`](ansible/README.md).
+- `ansible/` — role-aware split-box bootstrap: the control-plane and
+  compute-only plays install only their own daemon set and mask stale
+  opposite-role services. See [`ansible/README.md`](ansible/README.md).
 - `systemd/` — one unit + slice per daemon; memory.max fences the RAM
   ledger. Wired up in M5 (per-slice `.slice` units land in
   `ansible/roles/systemd_slices/`).
@@ -28,9 +28,6 @@ make test               # cross-platform unit tests
   via the `nftables` ansible role.
 - `scripts/` — ops helpers (`leakcheck.sh` for the shell-side check,
   restore drill planned for M8).
-- `controlplane/` — **RETIRED 2026-08-15** (issue #911 / PR-1 / ADR-110;
-  tombstone files `controlplane/bootstrap.sh` + `controlplane/RETIRED.md`
-  deleted by issue #911 / PR-1 Phase 2 on 2026-08-15). The v2 control
-  plane is bootstrapped by `make bootstrap` + `gregale manifest
-  {validate,render}` + `gregale release install` (PR-0 / PR-2 / PR-3);
-  the secrets surface lands in PR-X `gregale secrets init`.
+- `controlplane/` — retired legacy bootstrap surface. Production hosts use
+  the manifest-generated split-box inventory and role-aware Ansible targets;
+  the image builder uses its isolated image-seed inventory.
