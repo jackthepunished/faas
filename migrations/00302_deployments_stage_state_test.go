@@ -1,19 +1,21 @@
 //go:build !no_pg
 
-// Migration-apply test for 00300_deployments_stage_state.sql
+// Migration-apply test for 00302_deployments_stage_state.sql
 // (ADR-117 — deploy-stage-progress).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00300 (no goose
-//     duplicate-version panic). Slot 00300 was picked as the next
+//  1. Migration set applies cleanly through 00302 (no goose
+//     duplicate-version panic). Slot 00302 was picked as the next
 //     free slot on origin/main past the open-PR reservations
-//     (00281–00299 all merged or reserved; cross-PR precheck verified
-//     against refs/pull/<N>/head before push per
-//     scripts/ci/check_migration_slots.sh). Renumbered from 00296
-//     during review because main `b3d4cf7c` carries a
-//     `00296_reserve_slot.sql` fence for PR #986 (ADR-120 domain
-//     doctor).
+//     (00281–00301 — 00301 is taken by PR #984 (issue #977
+//     deployment annotations); cross-PR precheck verified against
+//     refs/pull/<N>/head before push per
+//     scripts/ci/check_migration_slots.sh). Renumbered twice during
+//     review: first 00288 → 00296 to dodge main's
+//     `00296_reserve_slot.sql` fence for PR #986, then
+//     00300 → 00302 after PR #984 (which had briefly claimed
+//     00300) renumbered itself to 00301.
 //  2. The new `deployments.stage_state` column carries the expected
 //     default jsonb shape and is NOT NULL.
 //  3. The CHECK `deployments_stage_state_current_check` accepts each
@@ -29,7 +31,7 @@
 //     `deployments_stage_state_current_check` — the auto-name
 //     Postgres picks for the inline jsonb expression CHECK. If a
 //     future migration renames the inline CHECK this pin must update
-//     together (silent breakage here means 00300 becomes a no-op —
+//     together (silent breakage here means 00302 becomes a no-op —
 //     exactly the bug this test exists to catch).
 //  6. Replay safety: re-running db.MigrateUp is a no-op (the
 //     migration is replay-safe via `IF NOT EXISTS` + the DO-block
@@ -63,13 +65,13 @@ var stageStateVocab = []string{
 	"readiness",
 }
 
-func TestMigrations_00300_DeploymentsStageState(t *testing.T) {
+func TestMigrations_00302_DeploymentsStageState(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00300.
+	// (1) Apply through 00302.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot — 00299 reserve_slot fence on main must not collide)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot — 00301 reserve_slot fence on main must not collide)", err)
 	}
 
 	// (2) Default shape + NOT NULL.
@@ -87,15 +89,15 @@ func TestMigrations_00300_DeploymentsStageState(t *testing.T) {
 		// schema is empty, so we always land here.
 		if _, ierr := pool.Exec(ctx, `
 			insert into deployments (id, app_id, status)
-			values ('00000000-0000-0000-0000-000000000300a',
-			        '00000000-0000-0000-0000-000000000300a',
+			values ('00000000-0000-0000-0000-000000000302a',
+			        '00000000-0000-0000-0000-000000000302a',
 			        'pending')`); ierr != nil {
 			t.Fatalf("insert sentinel deployment row: %v", ierr)
 		}
 		err = pool.QueryRow(ctx, `
 			select stage_state, stage_state IS NULL
 			  from deployments
-			 where id = '00000000-0000-0000-0000-000000000300a'`).Scan(&stageState, &isNull)
+			 where id = '00000000-0000-0000-0000-000000000302a'`).Scan(&stageState, &isNull)
 		if err != nil {
 			t.Fatalf("select stage_state default: %v", err)
 		}
@@ -134,7 +136,7 @@ func TestMigrations_00300_DeploymentsStageState(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update deployments
 		   set stage_state = jsonb_set(stage_state, '{current}', '"imagee_build"')
-		 where id = '00000000-0000-0000-0000-000000000300a'`); err != nil {
+		 where id = '00000000-0000-0000-0000-000000000302a'`); err != nil {
 		stageStateTypoErr = err
 	}
 	if stageStateTypoErr == nil {

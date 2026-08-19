@@ -5061,7 +5061,7 @@ func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
 	return s.UpdateDeploymentStatus(ctx, id, DeployLive, "")
 }
 
-// AppendDeploymentStage (ADR-117, migration 00300) atomically
+// AppendDeploymentStage (ADR-117, migration 00302) atomically
 // appends a stage transition to deployments.stage_state.
 //
 // Shape:
@@ -5086,7 +5086,7 @@ func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
 //
 // The from / to StageName vocabulary is enforced at the schema
 // layer via `deployments_stage_state_current_check`
-// (migrations/00300_deployments_stage_state.sql) so a typo from a
+// (migrations/00302_deployments_stage_state.sql) so a typo from a
 // future contributor lands as SQLSTATE 23514 at the storage layer
 // before it can leak as a wire-frame typo on `event: stage {name}`.
 // Stage-state status enum (ADR-117 §3). Local to this file so the
@@ -5116,7 +5116,7 @@ func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to
 	// than silently re-write history with a phantom entry.
 	if state.Current != from {
 		// Schema default for stage_state.current is
-		// "source_download" (migrations/00300). A pre-existing row
+		// "source_download" (migrations/00302). A pre-existing row
 		// that came through CreateDeployment without an explicit
 		// StageState has Current == "" in the decoded view — but
 		// the JSONB column on the Postgres row has the default

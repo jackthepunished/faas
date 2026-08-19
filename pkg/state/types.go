@@ -87,14 +87,14 @@ const (
 
 // StageName is the closed set of customer-visible named stages
 // surfaced in the SSE `event: stage` frame and in the CLI's
-// post-stream summary (ADR-117, migration 00300). Distinct from
+// post-stream summary (ADR-117, migration 00302). Distinct from
 // `DeploymentStatus` — the latter drives the state machine
 // (`pending → building → imaging → snapshotting → live | failed |
 // superseded`); the former is the customer-UX projection that maps
 // multiple internal status flips onto one named step.
 //
 // Schema CHECK constraint `deployments_stage_state_current_check`
-// (migrations/00300_deployments_stage_state.sql) enforces the same
+// (migrations/00302_deployments_stage_state.sql) enforces the same
 // vocabulary at the storage layer so a typo from a future
 // contributor lands as SQLSTATE 23514 check_violation at write time
 // rather than leaking as a wire-frame typo on `event: stage {name}`.
@@ -138,7 +138,7 @@ const (
 )
 
 // AllStageNames is the closed vocabulary used by both the
-// migrations/00300 jsonb CHECK constraint AND the wire-shape test
+// migrations/00302 jsonb CHECK constraint AND the wire-shape test
 // in cmd/gregale/commands2_test.go. Adding a new value here
 // without also widening the migration's IN list is a load-bearing
 // failure mode — the wire vocabulary on `event: stage {name}` would
@@ -1205,7 +1205,7 @@ type Deployment struct {
 	// live row per (app_id, scope)). A scope change requires a
 	// NEW deployment — there is no update-time scope change.
 	Scope string `json:"scope,omitempty"`
-	// StageState (ADR-117, migration 00300) — per-deployment
+	// StageState (ADR-117, migration 00302) — per-deployment
 	// customer-UX stage projection. Owned entirely by
 	// Store.AppendDeploymentStage — handlers MUST NOT write the
 	// column directly. The 2s SSE polling tick at
@@ -1224,7 +1224,7 @@ type Deployment struct {
 
 // StageState is the typed view of the
 // `deployments.stage_state` jsonb column (ADR-117,
-// migration 00300). Shape:
+// migration 00302). Shape:
 //
 //	{
 //	  "current": "<StageName>",
