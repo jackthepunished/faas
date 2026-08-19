@@ -47,6 +47,15 @@
       routing leaks operational metadata over plaintext. Override the
       variable only via ansible-vault or remove the override entirely.
 
+- name: prometheus — create system user `prometheus`
+  ansible.builtin.user:
+    name: prometheus
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ prom_data_dir }}"
+    createhome: false
+  register: prom_user
+
 - name: prometheus — mkdir /etc/prometheus and data dir
   ansible.builtin.file:
     path: "{{ item }}"
@@ -57,15 +66,6 @@
   loop:
     - /etc/prometheus
     - "{{ prom_data_dir }}"
-
-- name: prometheus — create system user `prometheus`
-  ansible.builtin.user:
-    name: prometheus
-    system: true
-    shell: /usr/sbin/nologin
-    home: "{{ prom_data_dir }}"
-    createhome: false
-  register: prom_user
 
 - name: prometheus — download release tarball
   ansible.builtin.get_url:
