@@ -146,6 +146,7 @@ export type { ListInvocationsResponse } from './models/ListInvocationsResponse.j
 export type { ListOrgAPIKeysResponse } from './models/ListOrgAPIKeysResponse.js';
 export type { ListSecretsForAccountResponse } from './models/ListSecretsForAccountResponse.js';
 export type { ListTenantSurfacesResponse } from './models/ListTenantSurfacesResponse.js';
+export type { LogExcerpt } from './models/LogExcerpt.js';
 export type { MagicLinkSignupRequest } from './models/MagicLinkSignupRequest.js';
 export type { MemberListResponse } from './models/MemberListResponse.js';
 export type { MFAConfirmRequest } from './models/MFAConfirmRequest.js';

@@ -140,6 +140,7 @@ export type { ListInvocationsResponse } from './ListInvocationsResponse.js';
 export type { ListOrgAPIKeysResponse } from './ListOrgAPIKeysResponse.js';
 export type { ListSecretsForAccountResponse } from './ListSecretsForAccountResponse.js';
 export type { ListTenantSurfacesResponse } from './ListTenantSurfacesResponse.js';
+export type { LogExcerpt } from './LogExcerpt.js';
 export type { MFAConfirmRequest } from './MFAConfirmRequest.js';
 export type { MFAConfirmResponse } from './MFAConfirmResponse.js';
 export type { MFADisableRequest } from './MFADisableRequest.js';

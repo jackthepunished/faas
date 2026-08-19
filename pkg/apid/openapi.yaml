@@ -8559,6 +8559,23 @@ components:
         status: { type: string , example: "active"}
         error: { type: [string, "null"] }
         error_code: { type: [string, "null"] }
+        # Error-explanations cluster (spec §6.4 amendment 1). The
+        # 9 cluster-owned codes (app_not_listening,
+        # app_loopback_bound, app_arch_mismatch, env_var_missing,
+        # app_healthz_unauthorized, app_runtime_oom,
+        # dep_install_failed, app_startup_timeout,
+        # stateless_only_violation) populate these 4 fields when
+        # the deployment's failure is classified. All 4 are
+        # optional + omitempty — pre-cluster failures only echo
+        # the bare `error` / `error_code` pair, and the dashboard
+        # / CLI render the 3-line legacy shape for those.
+        error_hint:        { type: [string, "null"], description: "One-line next-action lifted from pkg/whycopy catalog." }
+        error_why:         { type: [string, "null"], description: "Human-readable cause with observed value." }
+        error_fix:         { type: [string, "null"], description: "Prescriptive remediation (1-3 lines)." }
+        error_relevant_logs:
+          type: array
+          description: "Per-line log excerpts explaining the failure (error-explanations cluster). Capped at 20 entries × 512 bytes by the CLI tripwire."
+          items: { $ref: '#/components/schemas/LogExcerpt' }
         created_at: { type: string, format: date-time }
         has_overrides: { type: boolean, description: "True when this deployment carries a non-null override_* column set." }
         override_entrypoint:
@@ -12854,6 +12871,68 @@ components:
             / SDK can render the hint as a one-line footer without
             parsing prose. Optional + omitempty.
           example: "move detected secrets to `gregale secrets set` (see https://docs.gregale.dev/cli/secrets)"
+        hint:
+          type: string
+          description: |
+            Single short next-action line lifted from the
+            `pkg/whycopy` catalog (error-explanations cluster,
+            spec §6.4 amendment 1). Populated by the 9 cluster-
+            owned RFC 7807 codes (app_not_listening,
+            app_loopback_bound, app_arch_mismatch,
+            env_var_missing, app_healthz_unauthorized,
+            app_runtime_oom, dep_install_failed,
+            app_startup_timeout, stateless_only_violation). The
+            CLI renders this as the first line of the 5-line
+            error shape (`hint: <hint>`). Optional + omitempty
+            so every other problem+json site keeps its existing
+            3-line shape unchanged.
+          example: "your app isn't accepting traffic on the port we expect"
+        why:
+          type: string
+          description: |
+            Human-readable cause with the observed value templated
+            in (error-explanations cluster, spec §6.4 amendment 1).
+            Distinct from `detail`: `detail` is the platform's
+            machine-stable message; `why` is the customer-facing
+            explanation. Multi-line (≤512 bytes per `pkg/whycopy`
+            catalog row). Optional + omitempty.
+          example: "the wake readiness probe found no listener on $PORT after the wake timeout"
+        fix:
+          type: string
+          description: |
+            Prescriptive remediation (1-3 lines, error-explanations
+            cluster, spec §6.4 amendment 1). Distinct from `hint`:
+            `hint` is a single line, `fix` is the bulleted
+            remediation list. The CLI renders this as
+            `→ fix: <fix>` with literal newlines preserved so the
+            multi-line shape survives. Optional + omitempty.
+          example: "• make sure your app listens on process.env.PORT (or 8080)\n• if you bind manually, bind to 0.0.0.0 not 127.0.0.1"
+        relevant_logs:
+          type: array
+          description: |
+            Per-line log excerpts that explain the failure (error-
+            explanations cluster, spec §6.4 amendment 1). The
+            detection site attaches the last N log lines that
+            caused the failure (capped at 20 entries × 512 bytes
+            each per CLI tripwire). The CLI renders the first 5
+            inline as a fenced block. Optional + omitempty.
+          items: { $ref: '#/components/schemas/LogExcerpt' }
+
+    LogExcerpt:
+      type: object
+      description: |
+        One log entry attached to a `Problem` (error-explanations
+        cluster, spec §6.4 amendment 1) or persisted on
+        `deployments.error_relevant_logs`. The shape mirrors the
+        cluster's per-line log wire: `ts` is RFC3339 (apids
+        stamp format), `level` is one of `info|warn|error`,
+        `source` is the cluster's source discriminator
+        (build|vm-init|app|gateway), `message` is ≤512 bytes.
+      properties:
+        ts: { type: string, example: "2026-08-18T10:00:00Z" }
+        level: { type: string, enum: [info, warn, error], example: "error" }
+        source: { type: string, enum: [build, vm-init, app, gateway], example: "app" }
+        message: { type: string, example: "the kernel OOM-killer fired on the workload" }
 
     RateLimitPlain:
       type: string

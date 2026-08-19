@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { FieldError } from './FieldError.js';
+import type { LogExcerpt } from './LogExcerpt.js';
 import type { SecretFinding } from './SecretFinding.js';
 /**
  * RFC 7807 problem+json envelope. The `code` field is the stable
@@ -84,5 +85,51 @@ export type Problem = {
    *
    */
   secret_hint?: string;
+  /**
+   * Single short next-action line lifted from the
+   * `pkg/whycopy` catalog (error-explanations cluster,
+   * spec §6.4 amendment 1). Populated by the 9 cluster-
+   * owned RFC 7807 codes (app_not_listening,
+   * app_loopback_bound, app_arch_mismatch,
+   * env_var_missing, app_healthz_unauthorized,
+   * app_runtime_oom, dep_install_failed,
+   * app_startup_timeout, stateless_only_violation). The
+   * CLI renders this as the first line of the 5-line
+   * error shape (`hint: <hint>`). Optional + omitempty
+   * so every other problem+json site keeps its existing
+   * 3-line shape unchanged.
+   *
+   */
+  hint?: string;
+  /**
+   * Human-readable cause with the observed value templated
+   * in (error-explanations cluster, spec §6.4 amendment 1).
+   * Distinct from `detail`: `detail` is the platform's
+   * machine-stable message; `why` is the customer-facing
+   * explanation. Multi-line (≤512 bytes per `pkg/whycopy`
+   * catalog row). Optional + omitempty.
+   *
+   */
+  why?: string;
+  /**
+   * Prescriptive remediation (1-3 lines, error-explanations
+   * cluster, spec §6.4 amendment 1). Distinct from `hint`:
+   * `hint` is a single line, `fix` is the bulleted
+   * remediation list. The CLI renders this as
+   * `→ fix: <fix>` with literal newlines preserved so the
+   * multi-line shape survives. Optional + omitempty.
+   *
+   */
+  fix?: string;
+  /**
+   * Per-line log excerpts that explain the failure (error-
+   * explanations cluster, spec §6.4 amendment 1). The
+   * detection site attaches the last N log lines that
+   * caused the failure (capped at 20 entries × 512 bytes
+   * each per CLI tripwire). The CLI renders the first 5
+   * inline as a fenced block. Optional + omitempty.
+   *
+   */
+  relevant_logs?: Array<LogExcerpt>;
 };
 
