@@ -572,6 +572,7 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/deployments/source-tarball": "DeployFromSourceTarball",
 	"GET /v1/domains/{domain}":                        "GetDomain",
 	"POST /v1/domains/{domain}/verify":                "VerifyDomain",
+	"GET /v1/domains/{domain}/doctor":                 "DomainDoctor",
 }
 
 func main() {

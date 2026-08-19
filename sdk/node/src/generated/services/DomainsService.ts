@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { CreateCustomDomainRequest } from '../models/CreateCustomDomainRequest.js';
 import type { CustomDomainResponse } from '../models/CustomDomainResponse.js';
+import type { DomainDoctorReport } from '../models/DomainDoctorReport.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -173,6 +174,46 @@ export class DomainsService {
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
+      },
+    });
+  }
+  /**
+   * Doctor a domain (ADR-120).
+   * Returns the 5-check doctor report (DNS record found /
+   * points to Gregale / TLS certificate / CAA permits / IPv6
+   * conflict) with a human-readable remediation line per failing
+   * check. Backed by GET /v1/domains/{domain}/doctor. The
+   * handler reads the latest observation row from
+   * domain_doctor_observations; on a stale or missing row it
+   * triggers a synchronous re-probe with a 5s budget. `stale`
+   * on the response is true when the cached row was older than
+   * FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300).
+   *
+   * @returns DomainDoctorReport The 5-check report.
+   * @throws ApiError
+   */
+  public static domainDoctor({
+    domain,
+  }: {
+    /**
+     * The custom domain to doctor (e.g. `app.example.com`).
+     */
+    domain: string,
+  }): CancelablePromise<DomainDoctorReport> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/domains/{domain}/doctor',
+      path: {
+        'domain': domain,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        503: `code: doctor_unavailable`,
       },
     });
   }

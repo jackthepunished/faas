@@ -3819,6 +3819,54 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/domains/{domain}/doctor:
+    parameters:
+      - name: domain
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9.\-]+$' }
+        description: The custom domain to diagnose (e.g. `app.example.com`).
+    get:
+      tags: [domains]
+      operationId: getDomainDoctor
+      summary: Run the 5-check domain doctor (ADR-120).
+      description: |
+        Returns the per-domain doctor report. The five checks map
+        1:1 to the Render-style custom-domain check: dns_record,
+        points_to_gregale, tls_certificate, caa_permits,
+        ipv6_conflict. Each check carries a Status (ok / fail /
+        pending / na), Detail, Observed, Remediation, and a
+        per-probe CheckedAt. Used by `gregale domains doctor
+        <domain>`.
+
+        The handler reads the latest observation row from
+        `domain_doctor_observations` (the dns_poller writes a
+        row every 30s). When the row is older than
+        FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) or missing,
+        the handler triggers a synchronous re-probe with a 5s
+        budget. Stale=true is the visible degradation; the
+        response is still 200 with the per-check Status.
+
+        503 CodeDoctorDisabled is returned when the operator
+        hasn't set FAAS_DOMAIN_DOCTOR_ENABLED. The route stays
+        registered so the CLI gets a deterministic error code
+        (matches the pre-#911 pattern in `api/flags.go`).
+      responses:
+        '200':
+          description: The doctor report. `stale:true` means the cached row was older than the TTL when the handler ran a synchronous re-probe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainDoctorReport'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503':
+          description: Doctor is dark-launched (CodeDoctorDisabled) or the probe pass failed (CodeDoctorUnavailable).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Crons ────────────────────────────────────────────────────────────────
 
   /v1/crons:
@@ -10088,6 +10136,37 @@ components:
       properties:
         domain: { type: string , example: "app.example.com"}
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+
+    DomainDoctorReport:
+      description: "Per-domain doctor report (ADR-120). Carries 5 Render-style checks (dns_record, points_to_gregale, tls_certificate, caa_permits, ipv6_conflict) plus the durable row's app_id and observed_at. `stale:true` means the cached observation row was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) when the handler ran a synchronous re-probe."
+      type: object
+      required: [domain, app_id, observed_at, healthy, checks]
+      properties:
+        domain: { type: string, example: "app.example.com" }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        stale: { type: boolean, default: false }
+        observed_at: { type: string, format: date-time, example: "2026-08-18T14:23:11Z" }
+        healthy: { type: boolean, example: false }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/DomainDoctorCheck' }
+
+    DomainDoctorCheck:
+      description: "One row of the doctor report. Stable name tokens (dns_record / points_to_gregale / tls_certificate / caa_permits / ipv6_conflict) so the CLI can filter by name without parsing the human Detail field. Remediation is the exact record to change when status is fail — the load-bearing field for the activation drop-off."
+      type: object
+      required: [name, status, detail]
+      properties:
+        name:
+          type: string
+          enum: [dns_record, points_to_gregale, tls_certificate, caa_permits, ipv6_conflict]
+        status:
+          type: string
+          enum: [ok, fail, pending, na]
+          example: "fail"
+        detail: { type: string, example: "CNAME does not point at Gregale (observed: wrong.example.com.)" }
+        observed: { type: string, example: "wrong.example.com." }
+        remediation: { type: string, example: "Set CNAME app.example.com → edge.gregale.dev" }
+        checked_at: { type: string, format: date-time, example: "2026-08-18T14:23:11Z" }
 
     # ─── Tenant Surfaces (issue #879 / ADR-100 PR-C) ──────────────────────
 

@@ -88,6 +88,8 @@ export type { DailyUsageListResponse } from './DailyUsageListResponse.js';
 export type { DailyUsageResponse } from './DailyUsageResponse.js';
 export type { DataUpstreamListResponse } from './DataUpstreamListResponse.js';
 export type { DataUpstreamResponse } from './DataUpstreamResponse.js';
+export type { DomainDoctorCheck } from './DomainDoctorCheck.js';
+export type { DomainDoctorReport } from './DomainDoctorReport.js';;
 export type { DelayedTaskRequest } from './DelayedTaskRequest.js';
 export type { DelayedTaskResponse } from './DelayedTaskResponse.js';
 export type { DeploymentHealthcheck } from './DeploymentHealthcheck.js';

@@ -1085,6 +1085,24 @@ func (c *Client) GetDomain(ctx context.Context, domain string) (CustomDomainResp
 	return out, c.do(ctx, "GET", "/v1/domains/"+domain, nil, &out)
 }
 
+// DomainDoctor (ADR-120) returns the 5-check doctor report
+// for a domain. Backed by GET /v1/domains/{domain}/doctor.
+// The handler reads the latest observation row from
+// domain_doctor_observations (the dns_poller writes a row
+// every 30s); on a stale or missing row the handler
+// triggers a synchronous re-probe with a 5s budget and
+// returns the refreshed report. Stale=true on the response
+// means the cache was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS
+// when the handler ran.
+//
+// Used by `gregale domains doctor <domain>`. The 503
+// CodeDoctorDisabled error is returned when the operator
+// hasn't set FAAS_DOMAIN_DOCTOR_ENABLED.
+func (c *Client) DomainDoctor(ctx context.Context, domain string) (DomainDoctorReport, error) {
+	var out DomainDoctorReport
+	return out, c.do(ctx, "GET", "/v1/domains/"+domain+"/doctor", nil, &out)
+}
+
 // Tenant surfaces (issue #879 / ADR-100 PR-C). The CLI surface
 // (cmd/gregale/commands_tenant_surfaces.go) calls these; the
 // HTTP handlers they're backed by live in
