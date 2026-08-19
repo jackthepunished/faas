@@ -82,3 +82,41 @@ See commit #1..#21 of feat-triggers-mega. Layer boundaries (for partial cherry-p
 - Layer 3 (8, 13-16): drain+poller scaffolding; broker-independent.
 - Layer 4 (9-12): broker integrations; one commit per broker.
 - Layer 5 (17-21): spec + SDK + e2e + leakcheck.
+
+## Spec reconciliation (issue #757 closure, 2026-08-19)
+
+PR #910 shipped 12/12 plan items but only 1/9 literal
+acceptance criteria from issue #757's body — the issue was
+filed in the older "ESM" framing (`pkg/esm/`, `kafka_sources`,
+`schedd_esm_*` metrics, `esm.*` audit kinds,
+`faas-tenant.slice` egress) that was deliberately folded into
+the broader `trigger.*` / `pkg/sched/` namespace during
+planning. The closure pass (ADR-118, mega-PR commits 1-11)
+restores the operator-facing vocabulary without re-forking
+the codebase:
+
+- `esm.*` audit kinds are dual-emitted from the same call sites
+  as `trigger.*` — both land in the audit log inside one
+  transaction. See ADR-118 §1.
+- `schedd_esm_*` Prometheus collectors are the operator-facing
+  metric names, even though the Go types live under
+  `pkg/sched/`. The 3 collectors (polls, records_consumed,
+  lag_seconds) cover the metrics surface from issue #757
+  criterion 7. See ADR-118 §2.
+- `pkg/esm/` is NOT created. The ESM drain/extension lives in
+  `pkg/sched/dispatch_triggers.go` (this ADR's §Deviations).
+  Issue #757 criterion 3 maps to the spec reconciliation note
+  rather than a code change. See ADR-118 §3.
+
+The remaining 5 unmet criteria (#2 SASL/TLS, #4 FilterCriteria,
+#5 Kafka e2e, #6 plan caps, #9 broker egress) are addressed
+in commits 1-10 of the closure mega-PR. ADR-118 is the
+narrative; this section is the bridge.
+
+## Addendum (issue #757 closure complete)
+
+The 11-commit closure mega-PR has landed. The trigger primitive
+is the superset (this ADR); the ESM operator vocabulary is the
+prefix alias (ADR-118). Customers see both surfaces. SDKs and
+the OpenAPI document both. New triggers can be created via
+either surface; the wire is the same row.

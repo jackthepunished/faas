@@ -404,3 +404,44 @@ type FilterCriteria struct {
 	AND     []FilterCriteriaClause `json:"$and,omitempty"`
 	Payload []FilterCriteriaClause `json:"payload,omitempty"`
 }
+
+// KafkaSASLMechanism is the closed vocabulary of SASL mechanisms
+// a Kafka trigger config may specify (ADR-118 §5). The wire value
+// is the string representation — xdg-go/scram library derives
+// SCRAM client keypairs from Username + Password at dial time.
+type KafkaSASLMechanism string
+
+const (
+	KafkaSASLMechanismPlain       KafkaSASLMechanism = "PLAIN"
+	KafkaSASLMechanismScramSHA256 KafkaSASLMechanism = "SCRAM-SHA-256"
+	KafkaSASLMechanismScramSHA512 KafkaSASLMechanism = "SCRAM-SHA-512"
+)
+
+// KafkaSASLConfig is the kafka trigger's per-source SASL material.
+// Required Username + Password for every supported mechanism.
+type KafkaSASLConfig struct {
+	Mechanism KafkaSASLMechanism `json:"mechanism,omitempty"`
+	Username  string             `json:"username,omitempty"`
+	Password  string             `json:"password,omitempty"`
+}
+
+// KafkaTLSConfig is the kafka trigger's per-source TLS material.
+// MinVersion is forced to TLS 1.2 at decoder time regardless of
+// what the wire sends (pkg/sched/poller_kafka.go::buildKafkaTLSConfig).
+type KafkaTLSConfig struct {
+	CACert     string `json:"ca_cert,omitempty"`
+	ClientCert string `json:"client_cert,omitempty"`
+	ClientKey  string `json:"client_key,omitempty"`
+	SkipVerify bool   `json:"skip_verify,omitempty"`
+}
+
+// KafkaTriggerConfig is the decoded `config` for kind=kafka
+// triggers. The wire-level blob lives in Trigger.config; this is
+// the SDK's server-side shape.
+type KafkaTriggerConfig struct {
+	Brokers []string         `json:"brokers,omitempty"`
+	Topic   string           `json:"topic,omitempty"`
+	Group   string           `json:"group,omitempty"`
+	TLS     *KafkaTLSConfig  `json:"tls,omitempty"`
+	SASL    *KafkaSASLConfig `json:"sasl,omitempty"`
+}

@@ -10348,6 +10348,17 @@ components:
             operator retry combines a trigger re-enable with a
             dashboard "reset offset" action that re-fetches the
             dead-lettered payload. No effect on non-kafka kinds.
+        filter_criteria:
+          type: [object, "null"]
+          description: |
+            Optional record-level filter (issue #757 §criterion 4,
+            ADR-118 §6, migration 00300). Records that fail the
+            filter are marked state='skipped' on insert and
+            contribute no audit row. Jsonpath evaluator:
+            github.com/PaesslerAG/jsonpath (no eval semantics, no
+            customer-supplied code execution). See the
+            FilterCriteria schema for the full shape.
+          $ref: '#/components/schemas/FilterCriteria'
         # Cron-only fields; mutually exclusive with slug (SQL CHECK).
         schedule: { type: [string, "null"], example: "*/5 * * * *" }
         path: { type: [string, "null"] }
@@ -10390,6 +10401,13 @@ components:
             Kafka-only poison-record handling strategy. null/omitted
             falls through to the DB default 'commit'. Same semantics
             as the Trigger read shape.
+        filter_criteria:
+          type: [object, "null"]
+          description: |
+            Optional record-level filter (ADR-118 §6). nil on
+            create falls through to the DB default NULL — every
+            record passes the filter.
+          $ref: '#/components/schemas/FilterCriteria'
         schedule: { type: [string, "null"], example: "*/5 * * * *" }
         path: { type: [string, "null"] }
 
@@ -10415,8 +10433,146 @@ components:
             means "leave unchanged" (the SQL coalesce() in
             pkg/state/pgstore.go::UpdateTrigger keeps the existing
             value). Same semantics as the Trigger read shape.
+        filter_criteria:
+          type: [object, "null"]
+          description: |
+            Optional record-level filter. nil means "leave
+            unchanged" — the SQL coalesce() in
+            pkg/state/pgstore.go::UpdateTrigger keeps the existing
+            value. Pass {} to clear an existing filter.
+          $ref: '#/components/schemas/FilterCriteria'
         schedule: { type: [string, "null"], example: "*/5 * * * *" }
         path: { type: [string, "null"] }
+
+    # ─── Issue #757 / ADR-118 sub-schemas ─────────────────────────
+    # The kafka-specific config sub-schemas live here so the
+    # opaque `config` blob on Trigger can be self-describing.
+    # Each one round-trips through triggers.config JSONB and is
+    # validated at decoder time (pkg/gregalemanifest::validateKindConfig
+    # + pkg/sched/poller_kafka.go::decodeKafkaConfig for runtime).
+    # A nil pointer means "platform default" — no TLS, no SASL.
+
+    KafkaSASLMechanism:
+      description: "Kafka SASL mechanism (ADR-118 §5). Closed-vocab."
+      type: string
+      enum: [PLAIN, SCRAM-SHA-256, SCRAM-SHA-512]
+
+    KafkaSASLConfig:
+      description: |
+        Kafka SASL credentials. Required Username + Password for
+        every supported mechanism. xdg-go/scram library derives
+        SCRAM client keypairs from Username + Password at dial
+        time.
+      type: object
+      required: [mechanism, username, password]
+      properties:
+        mechanism: { $ref: '#/components/schemas/KafkaSASLMechanism' }
+        username: { type: string, minLength: 1, maxLength: 256 }
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 1024
+
+    KafkaTLSConfig:
+      description: |
+        Kafka TLS material. MinVersion is forced to TLS 1.2 at
+        decoder time regardless of what the wire sends
+        (pkg/sched/poller_kafka.go::buildKafkaTLSConfig). When
+        ClientCert + ClientKey are both set the decoder performs
+        a half-wired guard — if only one is set, decode returns
+        an error rather than the poller falling through silently
+        to PLAINTEXT over an apparent mTLS endpoint.
+      type: object
+      properties:
+        ca_cert:
+          type: string
+          description: "PEM-encoded CA bundle. Optional; if omitted the system trust store is used."
+        client_cert:
+          type: string
+          description: "PEM-encoded client cert for mTLS."
+        client_key:
+          type: string
+          format: password
+          description: "PEM-encoded client key for mTLS."
+        skip_verify:
+          type: boolean
+          default: false
+          description: |
+            Skip TLS verification. Hobby plan rejects this
+            (TLSSkipVerifyAllowed=false in pkg/api/limits.go);
+            Pro and Scale accept it for self-signed brokers.
+
+    KafkaTriggerConfig:
+      description: |
+        Decoded `config` for kind=kafka triggers. The wire-level
+        blob lives in Trigger.config; this is the SDK's
+        server-side shape.
+      type: object
+      required: [brokers, topic, group]
+      properties:
+        brokers:
+          type: array
+          items: { type: string, pattern: '^[a-zA-Z0-9.\-]+:[0-9]+$' }
+          minItems: 1
+          maxItems: 16
+          description: "Bootstrap broker list (host:port per entry)."
+        topic: { type: string, minLength: 1, maxLength: 249 }
+        group: { type: string, minLength: 1, maxLength: 255 }
+        tls:
+          type: [object, "null"]
+          $ref: '#/components/schemas/KafkaTLSConfig'
+        sasl:
+          type: [object, "null"]
+          $ref: '#/components/schemas/KafkaSASLConfig'
+
+    FilterCriteriaOp:
+      description: "Filter operation primitive (ADR-118 §6)."
+      type: string
+      enum: [eq, neq, exists, jsonpath]
+
+    FilterCriteriaClause:
+      description: |
+        One filter clause. The top-level FilterCriteria carries
+        `$or`, `$and`, and `payload` arrays; each clause here
+        is one primitive (eq / neq / exists / jsonpath) or a
+        nested `$or` / `$and` for compound logic.
+      type: object
+      required: [op]
+      properties:
+        op: { $ref: '#/components/schemas/FilterCriteriaOp' }
+        field:
+          type: string
+          description: "Header key for eq / neq / exists on the headers map."
+        value:
+          description: "Equality target for eq / neq; jsonpath expected type for jsonpath."
+        path:
+          type: string
+          description: "Jsonpath expression for op=jsonpath. Evaluated against the record payload."
+        clauses:
+          type: array
+          description: "Nested compound clauses for op=$or / $and."
+          items: { $ref: '#/components/schemas/FilterCriteriaClause' }
+
+    FilterCriteria:
+      description: |
+        FilterCriteria on a trigger (migration 00300,
+        pkg/sched/filter.go). nil / omitted matches every record.
+        Top-level arrays combine via implicit OR for `$or` and
+        AND for `$and`; nested clauses honour the same shape.
+        Jsonpath implementation: github.com/PaesslerAG/jsonpath —
+        no eval semantics, no customer-supplied code execution.
+      type: object
+      properties:
+        $or:
+          type: array
+          items: { $ref: '#/components/schemas/FilterCriteriaClause' }
+        $and:
+          type: array
+          items: { $ref: '#/components/schemas/FilterCriteriaClause' }
+        payload:
+          type: array
+          items: { $ref: '#/components/schemas/FilterCriteriaClause' }
 
     TriggerRecordState:
       description: "Lifecycle of one trigger record."
