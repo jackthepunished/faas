@@ -256,18 +256,25 @@ func TestPrintUsage_EmitsTwoLinesWithTopic(t *testing.T) {
 	}
 }
 
-// TestLiveTicker_TTY_RedrawsInPlace pins ADR-117 §3: when stdout
-// IS a TTY the ticker emits the N-row block on first Update and
-// re-emits it (cursor-up + clear + reprint) on every subsequent
-// Update. The terminal sees exactly N lines after each Update —
-// not 2N — so the customer's screen doesn't scroll.
+// TestLiveTicker_TTY_RedrawsInPlace pins ADR-117 §3 + PR-A
+// review fix (F2): when stdout IS a TTY the ticker emits the
+// N-row block on first Update (6 placeholders so the cursor
+// sits on row N+1 — not row 1 — and subsequent escapeUp(N)
+// sequences land cleanly on the top of the block), and on
+// every subsequent Update the cursor jumps to the top of the
+// block, clears all 6 lines, then writes the single updated
+// row at rowIdx. The terminal sees exactly N lines after each
+// Update — not 2N — so the customer's screen doesn't scroll.
 //
-// The test forces TTY via testOnlyTTY, drives 6 Updates (one per
-// stage), and asserts:
-//   - exactly 6 row lines printed
-//   - exactly 1 trailing newline (the Close flush)
-//   - 5 cursor-up sequences (Updates 1..5, NOT Update 0 which
-//     emits the initial block)
+// The test forces TTY via testOnlyTTY, drives 6 Updates (one
+// per stage), and asserts:
+//   - 12 row lines total (6 placeholders + 1 real row in
+//     Update 0; then 1 row line each in Updates 1..5 = 5)
+//   - 10 cursor-up sequences (2 per Update × 5 redraws;
+//     Update 0 emits 0 cursor-ups because it places the
+//     initial block)
+//   - 30 clear-line sequences (6 per Update × 5 redraws)
+//   - 1 trailing newline from Close
 func TestLiveTicker_TTY_RedrawsInPlace(t *testing.T) {
 	defer withTTYForTest(true)()
 	resetStdoutTTYCache()
@@ -279,7 +286,8 @@ func TestLiveTicker_TTY_RedrawsInPlace(t *testing.T) {
 	tk.Close()
 
 	out := buf.String()
-	// Each row is one line. Split on \n and count non-empty rows.
+	// Count row lines (anything that ends with \n and is NOT an
+	// ANSI escape sequence or empty).
 	lines := strings.Split(out, "\n")
 	rowLines := 0
 	for _, l := range lines {
@@ -288,17 +296,28 @@ func TestLiveTicker_TTY_RedrawsInPlace(t *testing.T) {
 		}
 		rowLines++
 	}
-	if rowLines != 6 {
-		t.Fatalf("got %d row lines, want 6: %q", rowLines, out)
+	want := 6 + 6 // 6 placeholders + 6 Update rows (1 per Update)
+	if rowLines != want {
+		t.Fatalf("got %d row lines, want %d: %q", rowLines, want, out)
 	}
-	// Cursor-up count = 2 per Update after the first (move up N
-	// before clearing, move up N again after printing the new
-	// N rows to position the cursor back at the top of the block).
-	// Updates 1..5 each emit 2 cursor-ups = 10. Update 0 emits 0
-	// (the initial N-row print).
+	// Cursor-up count = 2 per redraw × 5 redraws = 10. Update 0
+	// emits 0 cursor-ups because it places the initial N-row
+	// block (no redraw needed). The PR-A review fix changed
+	// the placeholder emission: previously the first Update
+	// printed only 1 row, which left the cursor 1 row below
+	// the top of the block — the next Update's escapeUp(6)
+	// then moved the cursor 5 rows into stdout lines written
+	// before the ticker started. Now Update 0 prints 6
+	// placeholders so the cursor lands on row N+1, which is
+	// the correct anchor for subsequent escapeUp(N) sequences.
 	upCount := strings.Count(out, escapeUp(6))
 	if upCount != 10 {
 		t.Errorf("got %d cursor-up escapes, want 10: %q", upCount, out)
+	}
+	// Clear-line count = 6 per Update × 5 redraws = 30.
+	clearCount := strings.Count(out, escapeClearLine)
+	if clearCount != 30 {
+		t.Errorf("got %d clear-line escapes, want 30: %q", clearCount, out)
 	}
 	// Close flushes one trailing newline so subsequent output
 	// doesn't overwrite the last row.

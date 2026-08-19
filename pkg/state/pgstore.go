@@ -5135,38 +5135,33 @@ func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to
 		state.Current = StageSourceDownload
 	}
 	// Forward transition vs. failure-stamp. The two cases dispatch
-	// on `from == to` (sentinel) — the active row stays active
-	// across a failure stamp so the next forward close can still
-	// move it to history.
+	// on `from == to` (sentinel). After the review-cluster fix the
+	// failure path is owned by `MarkDeploymentStageFailed` (below);
+	// `from == to` here is a programming error and we surface it
+	// loudly rather than silently mutating history[len-1] (the
+	// previously-closed stage) which the previous version did.
 	if from == to {
-		// Failure path: stamp the active row's history tail as
-		// failed with the caller-supplied reason. The active row
-		// stays active so the next `from != to` close can still
-		// move it to history.
-		if n := len(state.History); n > 0 {
-			state.History[n-1].Status = stageHistoryStatusFailed
-			state.History[n-1].Reason = reason
-		}
-	} else {
-		// Normal transition: close the active row, advance.
-		var durMs int64
-		if state.CurrentStartedAt != nil {
-			durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
-			if durMs < 0 {
-				durMs = 0
-			}
-		}
-		startedAt := at
-		state.History = append(state.History, StageStateItem{
-			Name:       from,
-			StartedAt:  derefTime(state.CurrentStartedAt),
-			EndedAt:    at,
-			DurationMs: durMs,
-			Status:     stageHistoryStatusCompleted,
-		})
-		state.Current = to
-		state.CurrentStartedAt = &startedAt
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: from==to is reserved for MarkDeploymentStageFailed (deployment=%s, stage=%s)", id, from)
 	}
+	// Normal transition: close the active row, advance.
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	startedAt := at
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       from,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = to
+	state.CurrentStartedAt = &startedAt
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
@@ -5186,15 +5181,153 @@ func (s *PgStore) AppendDeploymentStage(ctx context.Context, id string, from, to
 // AppendDeploymentStage to flatten the optional
 // current_started_at into the history entry's started_at — the
 // first transition writes `started_at` from the migration's seed
-// default (null → zero time, which renders as the JSON `null` via
-// the StageStateItem.StartedAt time.Time zero-value marshalling to
-// "0001-01-01T00:00:00Z"; the SSE handler tolerates that and emits
-// it verbatim as the wire-shape started_at).
+// default. Pair with ptrTime to round-trip back to *time.Time
+// when assigning into StageStateItem.StartedAt so the JSON wire
+// shape emits JSON null (not the literal "0001-01-01T00:00:00Z"
+// string time.Time{}.MarshalJSON would otherwise produce).
 func derefTime(t *time.Time) time.Time {
 	if t == nil {
 		return time.Time{}
 	}
 	return *t
+}
+
+// ptrTime returns &t when t is non-zero, nil otherwise. Used to
+// round-trip a derefTime result into the StageStateItem.StartedAt
+// *time.Time field so the JSON wire shape preserves the null-vs-set
+// distinction — time.Time{} would otherwise marshall as the literal
+// "0001-01-01T00:00:00Z" string and break any consumer that treats
+// "no start time" as null.
+func ptrTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// MarkDeploymentStageFailed stamps the in-flight `state.Current`
+// stage with status="failed" and the caller-supplied reason. The
+// active stage is recorded as a NEW history entry (with status
+// "failed") so the SSE consumer emits one final frame for the
+// failing stage rather than overwriting the previously-closed
+// stage (the previous "from == to" overload did the latter, which
+// was the wire-shape bug the review cluster surfaced).
+//
+// Returns ErrNotFound when the deployment row does not exist or
+// when state.Current is the zero value (no stage ever started).
+func (s *PgStore) MarkDeploymentStageFailed(ctx context.Context, id string, at time.Time, reason string) (Deployment, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `select stage_state from deployments where id = $1`, id).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: read stage_state for %s: %w", id, err)
+	}
+	var state StageState
+	if uerr := json.Unmarshal(raw, &state); uerr != nil {
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: decode stage_state for %s: %w", id, uerr)
+	}
+	if state.Current == "" {
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	// The active stage is moved into history as a "failed" entry so
+	// the wire shape is consistent: every stage that ever ran is in
+	// history; the customer's ticker walks history in order. The
+	// active row is cleared (Current = "") so the deployment row
+	// reflects "no stage in flight" — the status column carries the
+	// DeployFailed terminal value, set by the caller's separate
+	// transition() call.
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusFailed,
+		Reason:     reason,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: encode stage_state for %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx, `update deployments set stage_state = $2 where id = $1`, id, encoded)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return Deployment{}, ErrNotFound
+	}
+	return s.DeploymentByID(ctx, id)
+}
+
+// CloseDeploymentStage — pgstore mirror of the Store contract.
+// See pkg/state/store.go::CloseDeploymentStage for the docblock.
+// Closes the in-flight `state.Current` stage into history with
+// status="completed" so the customer-facing wire shape carries a
+// `duration_ms` for the readiness stage on a successful deploy.
+func (s *PgStore) CloseDeploymentStage(ctx context.Context, id string, name StageName, at time.Time) (Deployment, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `select stage_state from deployments where id = $1`, id).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: read stage_state for %s: %w", id, err)
+	}
+	var state StageState
+	if uerr := json.Unmarshal(raw, &state); uerr != nil {
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: decode stage_state for %s: %w", id, uerr)
+	}
+	if state.Current == "" || state.Current != name {
+		// Either nothing in flight, or the caller asked to close a
+		// stage that isn't the active one. Both are programming
+		// errors — the caller (imaged.MarkDeploymentLive) drives
+		// the close immediately after the snapshot_prepare →
+		// readiness transition, so the active row is always
+		// `readiness` at this point. Surface ErrNotFound so the
+		// caller logs a warning rather than silently dropping the
+		// stamp.
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	tag, err := s.pool.Exec(ctx, `update deployments set stage_state = $2 where id = $1`, id, encoded)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return Deployment{}, ErrNotFound
+	}
+	return s.DeploymentByID(ctx, id)
 }
 
 func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error {

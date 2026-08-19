@@ -2950,21 +2950,54 @@ type Store interface {
 	// set and migrations/00288_deployments_stage_state.sql for the
 	// schema CHECK that enforces it.
 	//
-	// When `from == to` the method stamps the active row as
-	// `status:"failed"` and carries `reason` through; this is the
-	// builderd failure path (pkg/builderd/builderd.go:653-655
-	// markFailed) and the customer-UX signal that the active stage
-	// died mid-flight.
+	// Callers MUST pass `from != to`. Failure stamps go through
+	// MarkDeploymentStageFailed (below) — they have different
+	// semantics (stamp the in-flight stage rather than close it)
+	// and a different wire shape on the SSE consumer.
 	//
-	// The stage_state jsonb is owned entirely by this method —
-	// callers MUST NOT write the column directly. The atomic
-	// JSONB merge is the load-bearing contract: the SSE handler's
-	// 2s polling tick (`statusTicker` at
+	// The stage_state jsonb is owned entirely by these two methods —
+	// callers MUST NOT write the column directly. The atomic JSONB
+	// merge is the load-bearing contract: the SSE handler's 2s
+	// polling tick (`statusTicker` at
 	// cmd/apid/handlers_ext.go:4156-4157) reads `stage_state`
 	// verbatim and emits `event: stage` frames per transition, so
 	// any drift between the in-Go state machine and the persisted
 	// jsonb would surface as a missing or duplicated frame.
 	AppendDeploymentStage(ctx context.Context, id string, from, to StageName, at time.Time, reason string) (Deployment, error)
+
+	// MarkDeploymentStageFailed (ADR-117 PR-A fix) stamps the
+	// in-flight `state.Current` stage with `status:"failed"` and the
+	// caller-supplied `reason` — distinct from a forward transition
+	// (which closes the active stage into history and advances).
+	//
+	// This method exists because the previous "from == to" failure
+	// stamp inside AppendDeploymentStage mutated `history[len-1]`
+	// (the previously-closed stage), not the in-flight stage — a
+	// wire-shape bug the review cluster surfaced. Splitting the
+	// failure path into its own method removes the silent-no-op
+	// hazard when `history` is empty (a pre-first-transition failure
+	// used to drop the stamp without error) and guarantees the
+	// SSE consumer emits the failing stage, not the one that just
+	// closed.
+	//
+	// Returns ErrNotFound if the deployment row does not exist or
+	// state.Current is the zero value (no stage ever started — the
+	// caller has not driven a single transitionWithStage, so there
+	// is nothing to fail).
+	MarkDeploymentStageFailed(ctx context.Context, id string, at time.Time, reason string) (Deployment, error)
+
+	// CloseDeploymentStage (ADR-117 PR-A fix) moves the in-flight
+	// `state.Current` stage into history with `status:"completed"`
+	// and clears Current. The customer-facing wire shape requires
+	// every stage that ever ran to appear in history so the SSE
+	// consumer's 2s tick walks `history` in order. The terminal
+	// stage of a successful deploy is the readiness stage; imaged
+	// calls CloseDeploymentStage after MarkDeploymentLive so the
+	// readiness row carries a duration_ms on the wire.
+	//
+	// Returns ErrNotFound when the deployment row does not exist or
+	// when state.Current is the zero value.
+	CloseDeploymentStage(ctx context.Context, id string, name StageName, at time.Time) (Deployment, error)
 
 	// ListAuditLog (issue #755 / PR-6) is the dashboard read path
 	// for the audit_log table. The filter struct drives every

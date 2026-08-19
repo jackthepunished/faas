@@ -4150,34 +4150,123 @@ func (m *MemStore) AppendDeploymentStage(_ context.Context, id string, from, to 
 		state.Current = StageSourceDownload
 	}
 	// Forward transition vs. failure-stamp. Same shape as
-	// pgstore.AppendDeploymentStage — see the docblock there.
+	// pgstore.AppendDeploymentStage — see the docblock there. The
+	// failure path is now owned by MarkDeploymentStageFailed
+	// (mirror below); `from == to` here is a programming error.
 	if from == to {
-		if n := len(state.History); n > 0 {
-			state.History[n-1].Status = stageHistoryStatusFailed
-			state.History[n-1].Reason = reason
-		}
-	} else {
-		var durMs int64
-		if state.CurrentStartedAt != nil {
-			durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
-			if durMs < 0 {
-				durMs = 0
-			}
-		}
-		startedAt := at
-		state.History = append(state.History, StageStateItem{
-			Name:       from,
-			StartedAt:  derefTime(state.CurrentStartedAt),
-			EndedAt:    at,
-			DurationMs: durMs,
-			Status:     stageHistoryStatusCompleted,
-		})
-		state.Current = to
-		state.CurrentStartedAt = &startedAt
+		return Deployment{}, fmt.Errorf("AppendDeploymentStage: from==to is reserved for MarkDeploymentStageFailed (deployment=%s, stage=%s)", id, from)
 	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	startedAt := at
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       from,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = to
+	state.CurrentStartedAt = &startedAt
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return Deployment{}, fmt.Errorf("AppendDeploymentStage: encode stage_state for %s: %w", id, err)
+	}
+	d.StageState = encoded
+	m.deployments[id] = d
+	return d, nil
+}
+
+// MarkDeploymentStageFailed — memstore mirror of
+// PgStore.MarkDeploymentStageFailed. See the docblock there for
+// the contract.
+func (m *MemStore) MarkDeploymentStageFailed(_ context.Context, id string, at time.Time, reason string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	var state StageState
+	if len(d.StageState) > 0 {
+		if err := json.Unmarshal(d.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: decode stage_state for %s: %w", id, err)
+		}
+	}
+	if state.Current == "" {
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusFailed,
+		Reason:     reason,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("MarkDeploymentStageFailed: encode stage_state for %s: %w", id, err)
+	}
+	d.StageState = encoded
+	m.deployments[id] = d
+	return d, nil
+}
+
+// CloseDeploymentStage — memstore mirror of PgStore. See
+// pkg/state/store.go::CloseDeploymentStage for the docblock.
+func (m *MemStore) CloseDeploymentStage(_ context.Context, id string, name StageName, at time.Time) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	var state StageState
+	if len(d.StageState) > 0 {
+		if err := json.Unmarshal(d.StageState, &state); err != nil {
+			return Deployment{}, fmt.Errorf("CloseDeploymentStage: decode stage_state for %s: %w", id, err)
+		}
+	}
+	if state.Current == "" || state.Current != name {
+		return Deployment{}, ErrNotFound
+	}
+	var durMs int64
+	if state.CurrentStartedAt != nil {
+		durMs = at.Sub(*state.CurrentStartedAt).Milliseconds()
+		if durMs < 0 {
+			durMs = 0
+		}
+	}
+	endedAt := at
+	state.History = append(state.History, StageStateItem{
+		Name:       state.Current,
+		StartedAt:  ptrTime(derefTime(state.CurrentStartedAt)),
+		EndedAt:    &endedAt,
+		DurationMs: durMs,
+		Status:     stageHistoryStatusCompleted,
+	})
+	state.Current = ""
+	state.CurrentStartedAt = nil
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("CloseDeploymentStage: encode stage_state for %s: %w", id, err)
 	}
 	d.StageState = encoded
 	m.deployments[id] = d

@@ -1352,6 +1352,18 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 	// the 5-min SLA from AC #1).
 	h.runDeployScan(ctx, app, dep)
 
+	// ADR-117 PR-A review fix (F1): close the security_scan stage
+	// and open image_build. The 3 transition sites that previously
+	// went dep_restore → image_build now go dep_restore →
+	// security_scan; this is the seam that closes security_scan
+	// after runDeployScan completes (best-effort — a scan
+	// failure logs Warn in runDeployScan itself, the stage
+	// transition still fires so the customer's ticker sees the
+	// image_build row).
+	if err := h.transitionWithStage(ctx, dep.ID, state.StageSecurityScan, state.StageImageBuild, state.DeployImaging, ""); err != nil {
+		return err
+	}
+
 	if err := h.transitionWithStage(ctx, dep.ID, state.StageImageBuild, state.StageSnapshotPrepare, state.DeploySnapshotting, ""); err != nil {
 		return err
 	}
@@ -1549,10 +1561,12 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 	h.markRegistryCredentialUsed(ctx, app, refHost, appAuth)
 
 	// ADR-117: Building→Imaging closes the dependency_restore stage
-	// and opens image_build. Caller at handleDeploySourceChanged
+	// and opens the security_scan stage. The runDeployScan call
+	// below (handler.go:1353) closes security_scan and opens
+	// image_build in turn. Caller at handleDeploySourceChanged
 	// (handler.go:1305) and handleSnapshotBoot (handler.go:2305)
 	// have already advanced to `dependency_restore`.
-	if err := h.transitionWithStage(ctx, dep.ID, state.StageDependencyRestore, state.StageImageBuild, state.DeployImaging, ""); err != nil {
+	if err := h.transitionWithStage(ctx, dep.ID, state.StageDependencyRestore, state.StageSecurityScan, state.DeployImaging, ""); err != nil {
 		return err
 	}
 
@@ -1921,8 +1935,11 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 // shipping a layer without /usr/local/bin/faas-runner (M8 readiness).
 func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep state.Deployment, acct state.Account) error {
 	// ADR-117: Building→Imaging closes dependency_restore, opens
-	// image_build. Same seam as buildImageLayer at handler.go:1551.
-	if err := h.transitionWithStage(ctx, dep.ID, state.StageDependencyRestore, state.StageImageBuild, state.DeployImaging, ""); err != nil {
+	// security_scan. The runDeployScan call at handler.go:1353
+	// (after this function returns) closes security_scan and
+	// opens image_build. Same seam as buildImageLayer at
+	// handler.go:1551.
+	if err := h.transitionWithStage(ctx, dep.ID, state.StageDependencyRestore, state.StageSecurityScan, state.DeployImaging, ""); err != nil {
 		return err
 	}
 	runtime := app.Runtime
@@ -2257,6 +2274,13 @@ func (h *Handler) handleSnapshotWritten(ctx context.Context, p snapshotWrittenPa
 		h.log.Warn("mark live: stage append failed",
 			"deployment_id", dep.ID, "from", "snapshot_prepare", "to", "readiness", "err", serr)
 	}
+	// PR-A review fix: now close the readiness stage so the
+	// customer's ticker carries a duration_ms on the wire rather
+	// than showing "Readiness passed" stuck on in_progress.
+	if _, serr := h.store.CloseDeploymentStage(ctx, dep.ID, state.StageReadiness, time.Now()); serr != nil {
+		h.log.Warn("mark live: stage close failed",
+			"deployment_id", dep.ID, "stage", "readiness", "err", serr)
+	}
 	// Fan out so audit / dashboard SSE see the terminal transition.
 	if err := h.notif.Notify(ctx, db.NotifyDeploymentChanged,
 		`{"app_id":"`+dep.AppID+`","to":"`+dep.ID+`","status":"live"}`); err != nil {
@@ -2296,6 +2320,28 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 			"deployment", p.DeploymentID, "status", dep.Status)
 		return nil
 	}
+	// PR-A review fix (F6): precondition check on stage_state.
+	// handleSnapshotBoot's caller (builderd.notifySnapshotBoot
+	// path) sets `status = DeployBuilding` upstream and assumes
+	// the active stage is dependency_restore. If a redelivered
+	// snapshot_boot notification arrives at a row that hasn't
+	// been advanced through handleDeploySourceChanged yet, the
+	// stage_state.current is still the schema default
+	// (source_download). The previous version called
+	// transitionWithStage(dep_restore, security_scan) which
+	// silently dropped the stage projection via the stale-read
+	// guard at pgstore.go. Surface the precondition violation
+	// as an error so the caller logs it loudly and the operator
+	// sees the regression rather than a customer's ticker stuck
+	// on "Source downloaded" forever.
+	if len(dep.StageState) > 0 {
+		var ss state.StageState
+		if uerr := json.Unmarshal(dep.StageState, &ss); uerr == nil && ss.Current != "" && ss.Current != state.StageDependencyRestore {
+			h.log.Warn("imaged: snapshot_boot precondition violated — stage_state.current is not dependency_restore",
+				"deployment", p.DeploymentID, "current_stage", ss.Current, "status", dep.Status)
+			return fmt.Errorf("imaged: snapshot_boot precondition violated (current=%q, want dependency_restore)", ss.Current)
+		}
+	}
 	if dep.RootfsPath == "" {
 		// builderd hasn't stamped yet. Treat as a transient no-op rather
 		// than failing the deployment — the subsequent NotifySnapshotBoot
@@ -2322,9 +2368,13 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 	// ADR-117: handleSnapshotBoot enters when the row is already in
 	// DeployBuilding (the caller at builderd's notifySnapshotBoot
 	// path set the status upstream). The active StageName is
-	// dependency_restore — the same from→to pair as sites 1551 +
-	// 1928 in the handleDeploySourceChanged entry path.
-	if err := h.transitionWithStage(ctx, dep.ID, state.StageDependencyRestore, state.StageImageBuild, state.DeployImaging, ""); err != nil {
+	// dependency_restore. PR-A review fix (F1): open
+	// security_scan here; the snapshot_boot path also calls
+	// runDeployScan below (line ~1353) so security_scan→image_build
+	// closes at the same place as the source_changed path. Same
+	// from→to pair as sites 1551 + 1928 except `to` is now
+	// security_scan instead of image_build.
+	if err := h.transitionWithStage(ctx, dep.ID, state.StageDependencyRestore, state.StageSecurityScan, state.DeployImaging, ""); err != nil {
 		return err
 	}
 	// Dispatch on the deploy kind — builderd stamps the OCI tarball
@@ -2352,6 +2402,15 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 		}
 	default:
 		return fmt.Errorf("imaged: snapshot_boot: unknown deployment kind %q", dep.Kind)
+	}
+	// ADR-117 PR-A review fix (F1): run the scan here too — the
+	// snapshot_boot path doesn't go through handleDeploySourceChanged,
+	// so without an explicit runDeployScan + security_scan→
+	// image_build transition the customer's ticker would show
+	// "Security scan" stuck on in_progress.
+	h.runDeployScan(ctx, app, dep)
+	if err := h.transitionWithStage(ctx, dep.ID, state.StageSecurityScan, state.StageImageBuild, state.DeployImaging, ""); err != nil {
+		return err
 	}
 	// ADR-117: image_build closes; snapshot_prepare opens. Same
 	// from→to pair as the handleDeploySourceChanged post-scan site
@@ -2390,10 +2449,15 @@ func (h *Handler) transition(ctx context.Context, depID string, status state.Dep
 //	DeployPending       → StageSourceDownload
 //	DeployBuilding      → StageDependencyRestore (cache hit) OR
 //	                      StageImageBuild (cold cache) — see callers
-//	DeployImaging       → StageImageBuild
+//	DeployImaging       → StageSecurityScan (entry) or
+//	                      StageImageBuild (after scan completes) —
+//	                      see PR-A review fix, F1
 //	DeploySnapshotting  → StageSnapshotPrepare
 //	DeployLive          → StageReadiness
-//	DeployFailed        → from == to sentinel (active row marked failed)
+//	DeployFailed        → no stage advance; the caller drives
+//	                      MarkDeploymentStageFailed directly so the
+//	                      in-flight stage (not the previously-closed
+//	                      one) is stamped with reason.
 //	DeploySuperseded    → no-op (not a customer-visible stage event)
 //
 // The from→to pair is computed by the caller — this helper is the
@@ -2438,25 +2502,15 @@ func (h *Handler) markDeployFailed(ctx context.Context, depID string, err error,
 	if _, err := h.store.SetDeploymentFailed(ctx, depID, code, prefix+": "+err.Error()); err != nil {
 		return fmt.Errorf("imaged: mark failed: %w", err)
 	}
-	// ADR-117: stamp the active row in stage_state as failed.
-	// Best-effort — the state-machine flip on `status` is the
-	// source of truth; the stage projection is the customer-UX
-	// surface. Reading the row is cheap (already in pgx cache
-	// for the SetDeploymentFailed caller path) and the
-	// AppendDeploymentStage `from==to` branch updates the
-	// history tail's `status="failed"` + `reason` so the SSE
-	// consumer's `event: stage {status:"failed", reason:...}`
-	// frame carries the customer-readable failure text.
-	if dep, lerr := h.store.DeploymentByID(ctx, depID); lerr == nil {
-		var state state.StageState
-		if len(dep.StageState) > 0 {
-			_ = json.Unmarshal(dep.StageState, &state)
-		}
-		if _, serr := h.store.AppendDeploymentStage(ctx, depID,
-			state.Current, state.Current, time.Now(), prefix+": "+err.Error()); serr != nil {
-			h.log.Warn("markDeployFailed: stage append failed",
-				"deployment_id", depID, "err", serr)
-		}
+	// ADR-117 §3 + PR-A review fix: stamp the active stage as
+	// failed. MarkDeploymentStageFailed moves the active row into
+	// history with status="failed" + reason rather than overwriting
+	// history[len-1] (the previously-closed stage, not the one in
+	// flight). Best-effort — the state-machine flip on `status`
+	// is the source of truth; the stage projection is the
+	// customer-UX surface.
+	if _, serr := h.store.MarkDeploymentStageFailed(ctx, depID, time.Now(), prefix+": "+err.Error()); serr != nil {
+		h.log.Warn("markDeployFailed: stamp failed stage", "deployment_id", depID, "err", serr)
 	}
 	return nil
 }

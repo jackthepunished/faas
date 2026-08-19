@@ -4380,9 +4380,10 @@ func emitStageDiff(w http.ResponseWriter, flusher http.Flusher, raw json.RawMess
 	// same tick — that ordering is intentional (the customer reads
 	// "stage X finished 1.2s ago, stage Y is now in flight").
 	if announced[ss.Current] == "" {
+		startedAt := ss.CurrentStartedAt // already *time.Time
 		emitStageFrame(w, flusher, state.StageStateItem{
 			Name:      ss.Current,
-			StartedAt: derefTimePtr(ss.CurrentStartedAt),
+			StartedAt: startedAt,
 		}, "in_progress", 0, "")
 		announced[ss.Current] = "in_progress"
 	}
@@ -4410,17 +4411,6 @@ func emitStageFrame(w http.ResponseWriter, flusher http.Flusher, item state.Stag
 	}
 }
 
-// derefTimePtr returns the dereferenced time or the zero value. Used
-// by emitStageDiff to convert the nullable `current_started_at` jsonb
-// field into a non-nullable time.Time for the SSE frame. The zero
-// value is fine — RFC3339Nano on zero time is "0001-01-01T00:00:00Z"
-// and clients ignore zero start timestamps per ADR-117 §3.
-func derefTimePtr(t *time.Time) time.Time {
-	if t == nil {
-		return time.Time{}
-	}
-	return *t
-}
 
 // writeLogEvent formats one LogEntry as a single SSE event. Used by
 // both the initial-page path and the live tail.

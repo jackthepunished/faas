@@ -109,16 +109,34 @@ type stageTicker struct {
 	index map[state.StageName]int
 }
 
-// renderStageTicker constructs the per-deploy ticker. `rows` MUST
-// be 6 (the closed stage set); any other size is a programming
-// error and the function returns nil so the caller can early-out
-// rather than render a half-built block.
+// stageOrderClosedSet is the canonical length of the deploy-stage
+// ticker. MUST equal the closed set in pkg/state.AllStageNames AND
+// the SCHEMA CHECK in migrations/00288. A divergence here is a
+// customer-visible bug (the ticker silently renders the wrong
+// number of rows); renderStageTicker panics if it sees a mismatch
+// so the bug surfaces at the first `gregale deploy` invocation
+// rather than silently shipping an off-by-one ticker.
+const stageOrderClosedSet = 6
+
+// renderStageTicker constructs the per-deploy ticker. The row
+// count is derived from `stageOrder`; the function panics if
+// `stageOrder` no longer matches the closed stage set
+// (stageOrderClosedSet). This is intentional: the contract is
+// "render the closed stage set" and a divergence is a programming
+// error the CLI binary must refuse to boot with.
 //
-// ADR-117 §3: streamDeployLogs (commands2.go) constructs ONE
-// stageTicker per deployment, NOT per SSE frame. The ticker
-// outlives the SSE decoder's frame loop so the caller can drive
-// Update across many frames without re-allocating.
+// ADR-117 §3 + PR-A review fix (F5): streamDeployLogs
+// (commands2.go) constructs ONE stageTicker per deployment, NOT
+// per SSE frame. The ticker outlives the SSE decoder's frame
+// loop so the caller can drive Update across many frames
+// without re-allocating.
 func renderStageTicker(w io.Writer) *stageTicker {
+	if len(stageOrder) != stageOrderClosedSet {
+		panic(fmt.Sprintf("renderStageTicker: stageOrder has %d entries, want %d (closed set in pkg/state.AllStageNames + migrations/00288)", len(stageOrder), stageOrderClosedSet))
+	}
+	if len(stageLabels) != stageOrderClosedSet {
+		panic(fmt.Sprintf("renderStageTicker: stageLabels has %d entries, want %d", len(stageLabels), stageOrderClosedSet))
+	}
 	rows := make([]stageRow, len(stageOrder))
 	for i, name := range stageOrder {
 		rows[i] = stageRow{name: name, status: stageStatusPending, durMs: 0}

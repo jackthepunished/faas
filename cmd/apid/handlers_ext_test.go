@@ -88,10 +88,12 @@ func TestEmitStageDiff_AllSixStages(t *testing.T) {
 		now := time.Now().UTC()
 		history := make([]state.StageStateItem, 0, i)
 		for j := 0; j < i; j++ {
+			startedAt := now.Add(-time.Duration(i-j) * time.Second)
+			endedAt := now.Add(-time.Duration(i-j-1) * time.Second)
 			history = append(history, state.StageStateItem{
 				Name:       order[j],
-				StartedAt:  now.Add(-time.Duration(i-j) * time.Second),
-				EndedAt:    now.Add(-time.Duration(i-j-1) * time.Second),
+				StartedAt:  &startedAt,
+				EndedAt:    &endedAt,
 				DurationMs: 1000,
 				Status:     "completed",
 			})
@@ -155,8 +157,8 @@ func TestEmitStageDiff_AllSixStages(t *testing.T) {
 		CurrentStartedAt: &now,
 		History: []state.StageStateItem{
 			{
-				Name: state.StageReadiness, StartedAt: now,
-				EndedAt: now, DurationMs: 0, Status: "failed",
+				Name: state.StageReadiness, StartedAt: &now,
+				EndedAt: &now, DurationMs: 0, Status: "failed",
 				Reason: "build failed: image_scan 1 error",
 			},
 		},

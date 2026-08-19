@@ -279,11 +279,24 @@ func (t *ttyLiveTicker) Update(rowIdx int, name, status, dur string) {
 		// First call — emit placeholder rows for every slot so the
 		// redraw sequence below has N rows to move up over. Each
 		// row is `   · <name padded>` so a downstream parser sees a
-		// stable shape even on the very first frame.
+		// stable shape even on the very first frame, AND the
+		// subsequent Update's escapeUp(N) lands on the top row of
+		// the block (not 5 rows into stdout that came before the
+		// ticker started). PR-A review fix (F2).
 		for i := 0; i < t.rows; i++ {
 			t.seen[i] = false
 		}
 		t.written = true
+		// Write N placeholder rows so the cursor ends up on the
+		// LAST row of the block. The real Update below writes the
+		// row at `rowIdx` — that overwrites the placeholder at
+		// that row only; the next Update's redraw sequence
+		// (escapeUp + clear + escapeUp) restores all N rows from
+		// their respective last-rendered state via the same
+		// sequence.
+		for i := 0; i < t.rows; i++ {
+			_, _ = fmt.Fprintf(t.w, "   %s  %s  %s\n", stageGlyph(stageStatusPending), padName(placeholderName(i), 24), "--")
+		}
 	}
 	// Move up N rows + clear each.
 	if t.updateCnt > 0 {
@@ -298,6 +311,19 @@ func (t *ttyLiveTicker) Update(rowIdx int, name, status, dur string) {
 	t.seen[rowIdx] = true
 	_, _ = fmt.Fprintf(t.w, "   %s  %s  %s\n", stageGlyph(status), padName(name, 24), dur)
 	t.updateCnt++
+}
+
+// placeholderName returns the label for the i-th placeholder row.
+// Uses the deploy-stage label map when the index is in range so the
+// first frame's placeholder rows carry the same human labels the
+// real frames will overwrite — better UX than a column of `· Stage N`
+// at boot. Out-of-range indices fall back to a generic slot label so
+// the helper is total.
+func placeholderName(i int) string {
+	if i < 0 || i >= len(stageOrder) {
+		return fmt.Sprintf("stage-%d", i)
+	}
+	return stageLabels[stageOrder[i]]
 }
 
 func (t *ttyLiveTicker) Close() {

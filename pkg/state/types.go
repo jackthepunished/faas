@@ -1254,10 +1254,17 @@ type StageState struct {
 // by `appendDeploymentStage` (now - current_started_at) so the SSE
 // consumer doesn't have to trust a 2s-tick-derived `time.Now()`
 // reconstruction.
+//
+// `StartedAt` is a *time.Time (NOT time.Time) so the JSON wire shape
+// is `null` when the migration seed left it unset — time.Time zero
+// value marshals to the literal string "0001-01-01T00:00:00Z" which
+// is indistinguishable from a real epoch and contradicts the
+// "uninitialized = null" contract the SSE consumer expects. The
+// pointer nil-vs-set distinction preserves that contract.
 type StageStateItem struct {
 	Name       StageName `json:"name"`
-	StartedAt  time.Time `json:"started_at"`
-	EndedAt    time.Time `json:"ended_at"`
+	StartedAt  *time.Time `json:"started_at"`
+	EndedAt    *time.Time `json:"ended_at"`
 	DurationMs int64     `json:"duration_ms"`
 	Status     string    `json:"status"` // "completed" | "failed"
 	Reason     string    `json:"reason,omitempty"`
