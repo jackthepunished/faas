@@ -78,12 +78,12 @@ type livenessResponseBody struct {
 // histogram + downstream app_healthz_unauthorized stamping all
 // flow from this single discriminator.
 const (
-	livenessOutcomeOK            = "ok"
-	livenessOutcomeNon200        = "non_200"
-	livenessOutcomeUnauthorized  = "unauthorized"
-	livenessOutcomeTimeout       = "timeout"
-	livenessOutcomeConnRefused   = "conn_refused"
-	livenessOutcomeConnErr       = "conn_err"
+	livenessOutcomeOK           = "ok"
+	livenessOutcomeNon200       = "non_200"
+	livenessOutcomeUnauthorized = "unauthorized"
+	livenessOutcomeTimeout      = "timeout"
+	livenessOutcomeConnRefused  = "conn_refused"
+	livenessOutcomeConnErr      = "conn_err"
 )
 
 // livenessProbeConfig aliases the pkg/fcvm.LivenessProbeConfig struct

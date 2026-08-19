@@ -2692,22 +2692,22 @@ func (c *explainCollector) observe(line string) {
 // stream AND the summary. Error path (when there's no failure)
 // prints "(none)" so the script-friendly shape is preserved.
 func (c *explainCollector) flush(w io.Writer) {
-	fmt.Fprintf(w, "\n── explain: %s", c.slug)
+	_, _ = fmt.Fprintf(w, "\n── explain: %s", c.slug)
 	if c.deployment != "" {
-		fmt.Fprintf(w, " (deployment %s)", c.deployment)
+		_, _ = fmt.Fprintf(w, " (deployment %s)", c.deployment)
 	}
-	fmt.Fprintln(w, " ──")
+	_, _ = fmt.Fprintln(w, " ──")
 	if c.lastError == "" {
-		fmt.Fprintln(w, "error:  (none)")
+		_, _ = fmt.Fprintln(w, "error:  (none)")
 	} else {
-		fmt.Fprintf(w, "error:  %s\n", c.lastError)
+		_, _ = fmt.Fprintf(w, "error:  %s\n", c.lastError)
 	}
-	fmt.Fprintf(w, "levels: error=%d warn=%d info=%d\n", c.errorCount, c.warnCount, c.infoCount)
+	_, _ = fmt.Fprintf(w, "levels: error=%d warn=%d info=%d\n", c.errorCount, c.warnCount, c.infoCount)
 	top := topPatterns(c.patterns, 3)
 	if len(top) == 0 {
-		fmt.Fprintln(w, "top:    (no error patterns)")
+		_, _ = fmt.Fprintln(w, "top:    (no error patterns)")
 	} else {
-		fmt.Fprintf(w, "top:    %s\n", strings.Join(top, " | "))
+		_, _ = fmt.Fprintf(w, "top:    %s\n", strings.Join(top, " | "))
 	}
 }
 
@@ -3072,7 +3072,7 @@ func mapFailureProblem(p *api.Problem) string {
 	if p == nil || p.Code == "" {
 		return ""
 	}
-	whycopy.Decorate(p, p.Code, nil)
+	_ = whycopy.Decorate(p, p.Code, nil)
 	return p.Hint
 }
 

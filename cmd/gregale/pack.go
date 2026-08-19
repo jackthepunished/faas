@@ -1013,6 +1013,14 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 // entirely — used by `gregale deploy --secret-scan=off` and by callers
 // that already vetted the inputs (cmd/e2e harness, pack_test.go).
 func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath string, fw framework, fileCount int, err error) {
+	// Error-explanations cluster (spec §6.4 amendment 1): warn-only
+	// preflight that lifts the cluster's source-side hints via the
+	// whycopy catalog. Hints are printed after the deploy summary by
+	// the caller (cmdDeploy). The preflight does NOT fail the deploy.
+	for _, hint := range runPackPreflight(srcDir) {
+		PrintWarn(osStderr, "%s", hint)
+	}
+
 	f, err := os.CreateTemp("", "gregale-cwd-*.tar.gz")
 	if err != nil {
 		return "", fwUnknown, 0, fmt.Errorf("create temp tarball: %w", err)
@@ -1039,16 +1047,16 @@ func autoPackCwd(srcDir string, envOverride map[string][]byte) (tarballPath stri
 //
 // 3 checks:
 //
-//   1. PORT unset: source references $PORT (process.env.PORT /
-//      os.Getenv("PORT") / os.environ["PORT"]) but the cwd has no
-//      explicit env-config declaring it. The runtime detector
-//      catches the missing-listener case via app_not_listening;
-//      preflight surfaces the source-side signal.
-//   2. Loopback bind: app.listen("127.0.0.1"...) or bind("127.0.0.1")
-//      patterns in source — would trip app_loopback_bound post-deploy.
-//   3. Arch mismatch: tarball contains a Mach-O / ARM aarch64 binary
-//      — would trip app_arch_mismatch post-deploy (ENOEXEC in the
-//      build VM's linux/amd64 kernel).
+//  1. PORT unset: source references $PORT (process.env.PORT /
+//     os.Getenv("PORT") / os.environ["PORT"]) but the cwd has no
+//     explicit env-config declaring it. The runtime detector
+//     catches the missing-listener case via app_not_listening;
+//     preflight surfaces the source-side signal.
+//  2. Loopback bind: app.listen("127.0.0.1"...) or bind("127.0.0.1")
+//     patterns in source — would trip app_loopback_bound post-deploy.
+//  3. Arch mismatch: tarball contains a Mach-O / ARM aarch64 binary
+//     — would trip app_arch_mismatch post-deploy (ENOEXEC in the
+//     build VM's linux/amd64 kernel).
 //
 // Errors during the scan (permission denied, etc.) are silently
 // swallowed: a hard error here would block the deploy on noise.

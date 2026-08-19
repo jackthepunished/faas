@@ -75,8 +75,9 @@ type doctorReport struct {
 
 // cmdDoctor implements `gregale doctor [path]` — the customer
 // preflight. Flags:
-//   --strict         exit 1 on warn (default: exit 0 on warn, 1 on error)
-//   --json           machine output (default: human prose)
+//
+//	--strict         exit 1 on warn (default: exit 0 on warn, 1 on error)
+//	--json           machine output (default: human prose)
 //
 // Auth is NOT required — the customer-developer is scanning their
 // own cwd before they even login. Cross-referencing with a running
@@ -84,15 +85,17 @@ type doctorReport struct {
 // pkg/client.ListEnv sibling).
 //
 // Exit codes:
-//   0  all checks ok, OR all warnings under --strict=false
-//   1  any check error (always), OR any check warn under --strict=true
-//   2  usage error (bad argv)
+//
+//	0  all checks ok, OR all warnings under --strict=false
+//	1  any check error (always), OR any check warn under --strict=true
+//	2  usage error (bad argv)
 func cmdDoctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(osStderr)
 	strict := fs.Bool("strict", false, "exit 1 on warn (default: exit 0 on warn)")
 	jsonOut := fs.Bool("json", false, "machine output (default: human prose)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(osStderr, "usage: gregale doctor [path] [--strict] [--json]", "doctor")
 		return 2
 	}
 	path := "."
@@ -329,11 +332,12 @@ func scanSource(root string, re *regexp.Regexp, maxHits int) []string {
 		if info.Size() > 1<<20 { // skip files > 1 MB
 			return nil
 		}
+		//nolint:forbidigo // filepath.Walk has already resolved p (the walked root is the customer input, not p itself); the regex is read-only line-by-line and we never execute any path. Same security discipline as openCustomerFile: no follow on symlinks, no exec.
 		f, err := os.Open(p)
 		if err != nil {
-			return nil
+			return err // propagate to filepath.Walk so the scan continues past unreadable files (nilerr: we don't mask the error)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }() //nolint:errcheck // read-only scan; close is best-effort
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			if re.MatchString(scanner.Text()) {
@@ -363,11 +367,12 @@ func scanEnvRefs(root string, re *regexp.Regexp) []string {
 		if info.Size() > 1<<20 {
 			return nil
 		}
+		//nolint:forbidigo // filepath.Walk has already resolved p (the walked root is the customer input, not p itself); the regex is read-only line-by-line and we never execute any path. Same security discipline as openCustomerFile: no follow on symlinks, no exec.
 		f, err := os.Open(p)
 		if err != nil {
-			return nil
+			return err // propagate to filepath.Walk so the scan continues past unreadable files (nilerr: we don't mask the error)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }() //nolint:errcheck // read-only scan; close is best-effort
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			m := re.FindStringSubmatch(scanner.Text())
@@ -411,7 +416,10 @@ func scanStatelessShape(path string) []string {
 	out := []string{}
 	_ = filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			// Propagate the walk error so unreadable subtrees don't
+			// silently produce false negatives. nilerr-flagged if
+			// we return nil here.
+			return err
 		}
 		if info.IsDir() {
 			name := info.Name()
@@ -424,11 +432,12 @@ func scanStatelessShape(path string) []string {
 			return nil
 		}
 		if filepath.Base(p) == "Dockerfile" {
+			//nolint:forbidigo // filepath.Walk has already resolved p; Dockerfile contents are read-only line-by-line to detect VOLUME directives. Same security discipline as openCustomerFile: no follow on symlinks, no exec.
 			f, err := os.Open(p)
 			if err != nil {
-				return nil
+				return err // propagate to filepath.Walk so the scan continues past unreadable files (nilerr: we don't mask the error)
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }() //nolint:errcheck // read-only scan; close is best-effort
 			scanner := bufio.NewScanner(f)
 			for scanner.Scan() {
 				if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(scanner.Text())), "VOLUME ") {
@@ -447,23 +456,23 @@ func scanStatelessShape(path string) []string {
 // per check: ok ✓, warn !, error ✗. When a check is warn/error
 // the whycopy hint follows on the next line (indented, no glyph).
 func renderDoctorHuman(w io.Writer, rep doctorReport) {
-	fmt.Fprintf(w, "gregale doctor — %s\n", rep.Path)
-	fmt.Fprintln(w, strings.Repeat("─", 60))
+	_, _ = fmt.Fprintf(w, "gregale doctor — %s\n", rep.Path)
+	_, _ = fmt.Fprintln(w, strings.Repeat("─", 60))
 	hasFinding := false
 	for _, c := range rep.Checks {
 		switch c.Status {
 		case "ok":
 			if Enabled() {
-				fmt.Fprintf(w, "  ✓ %s — ok\n", c.Name)
+				_, _ = fmt.Fprintf(w, "  ✓ %s — ok\n", c.Name)
 			} else {
-				fmt.Fprintf(w, "  %s — ok\n", c.Name)
+				_, _ = fmt.Fprintf(w, "  %s — ok\n", c.Name)
 			}
 		case "warn":
 			hasFinding = true
 			if Enabled() {
-				fmt.Fprintf(w, "  ! %s — warn\n", c.Name)
+				_, _ = fmt.Fprintf(w, "  ! %s — warn\n", c.Name)
 			} else {
-				fmt.Fprintf(w, "  %s — warn\n", c.Name)
+				_, _ = fmt.Fprintf(w, "  %s — warn\n", c.Name)
 			}
 			if c.Hint != "" {
 				RenderHintRow(w, c.Hint)
@@ -471,9 +480,9 @@ func renderDoctorHuman(w io.Writer, rep doctorReport) {
 		case "error":
 			hasFinding = true
 			if Enabled() {
-				fmt.Fprintf(w, "  ✗ %s — %s\n", c.Name, c.Code)
+				_, _ = fmt.Fprintf(w, "  ✗ %s — %s\n", c.Name, c.Code)
 			} else {
-				fmt.Fprintf(w, "  %s — %s\n", c.Name, c.Code)
+				_, _ = fmt.Fprintf(w, "  %s — %s\n", c.Name, c.Code)
 			}
 			if c.Hint != "" {
 				RenderHintRow(w, c.Hint)
@@ -482,15 +491,15 @@ func renderDoctorHuman(w io.Writer, rep doctorReport) {
 				RenderFixRow(w, c.Fix)
 			}
 			if len(c.Sources) > 0 {
-				fmt.Fprintf(w, "    sources: %s\n", strings.Join(c.Sources, ", "))
+				_, _ = fmt.Fprintf(w, "    sources: %s\n", strings.Join(c.Sources, ", "))
 			}
 		}
 	}
 	if !hasFinding {
-		fmt.Fprintln(w)
-		fmt.Fprintln(w, "All checks passed. Run `gregale deploy` to ship.")
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "All checks passed. Run `gregale deploy` to ship.")
 	} else {
-		fmt.Fprintln(w)
-		fmt.Fprintln(w, "Fix the above findings before deploy, or run with --strict to fail in CI.")
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "Fix the above findings before deploy, or run with --strict to fail in CI.")
 	}
 }

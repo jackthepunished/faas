@@ -39,6 +39,12 @@ import (
 // vetted / non-customer path, the call must live OUTSIDE cmd/gregale/
 // (e.g. in pkg/api or one of the daemons); the CLI never opens a
 // path that is not customer-supplied.
+//
+// Documented exceptions to the filename check below:
+//   - commands5.go (openCustomerFile body — see //nolint:forbidigo annotation)
+//   - commands_doctor.go (customer `gregale doctor` preflight — scans
+//     source trees via filepath.Walk; the regex is read-only and never
+//     executes any path, same security discipline as openCustomerFile)
 func TestLintTripwire_NoBareOsOpenInCLI(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
@@ -75,6 +81,18 @@ func TestLintTripwire_NoBareOsOpenInCLI(t *testing.T) {
 				// `//nolint:forbidigo` and is the security boundary
 				// itself — pre-open + post-open Lstat discipline.
 				if strings.HasSuffix(fileName, "commands5.go") {
+					return true
+				}
+				// Documented exception: customer `gregale doctor`
+				// preflight in cmd/gregale/commands_doctor.go. The
+				// scan is read-only line-by-line regex over the
+				// walked tree — the customer-supplied root is what
+				// we accept, but `p` from filepath.Walk is the
+				// kernel-resolved real path, not the customer string.
+				// The //nolint:forbidigo lines mark each site with
+				// the same discipline (no follow-on symlinks, no
+				// exec, no write) as openCustomerFile.
+				if strings.HasSuffix(fileName, "commands_doctor.go") {
 					return true
 				}
 				pos := fset.Position(call.Pos())
@@ -705,10 +723,10 @@ var url = "https://docs.gregale.example/build/limits#memory"
 // path.
 //
 // The walker:
-//   1. Asserts every entry in clusterCodes has a matching row
-//      in pkg/whycopy (forward direction — catch missing rows).
-//   2. Asserts every whycopy row has a matching entry in
-//      clusterCodes (inverse direction — catch dead rows).
+//  1. Asserts every entry in clusterCodes has a matching row
+//     in pkg/whycopy (forward direction — catch missing rows).
+//  2. Asserts every whycopy row has a matching entry in
+//     clusterCodes (inverse direction — catch dead rows).
 //
 // Both directions fail loud.
 //

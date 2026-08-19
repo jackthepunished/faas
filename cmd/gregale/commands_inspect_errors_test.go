@@ -9,6 +9,28 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// resetRenderCaches clears both the NO_COLOR and stdout-is-tty caches
+// so the renderer doesn't pick up a stale value from a prior test in
+// the same package run (e.g. TestEnabled_HonoursNO_COLOR primes
+// noColorCached=true and only resets via its own defer; tests that
+// run AFTER it without explicitly re-priming inherit the false cache
+// value, which suppresses glyphs in renderInspectErrorsHuman).
+// We also re-arm the TTY hook (TestMain sets testOnlyTTY=&true but a
+// withTTYForTest(false) defer in a previous test sets it back to nil,
+// and the next test that doesn't call withTTYForTest again sees the
+// nil-default which delegates to stdoutIsTTY — which on a non-TTY
+// test runner returns false).
+func resetRenderCaches(t *testing.T) {
+	t.Helper()
+	resetNOColorCache()
+	resetStdoutTTYCache()
+	on := true
+	testOnlyTTY = &on
+	t.Cleanup(func() {
+		testOnlyTTY = nil
+	})
+}
+
 // TestRenderInspectErrorsHuman_LiftedFields pins the renderer
 // shape: the 4 lifted fields (Hint/Why/Fix/RelevantLogs) appear
 // in the standard order with the same glyph-discipline as the
@@ -16,14 +38,15 @@ import (
 // might swap to a custom format that breaks script consumers
 // grepping on the literal "hint:" / "why:" / "fix:" prefixes.
 func TestRenderInspectErrorsHuman_LiftedFields(t *testing.T) {
+	resetRenderCaches(t)
 	dep := api.DeploymentResponse{
-		ID:          "dep-1",
-		Error:       "the kernel returned ENOEXEC",
-		ErrorCode:   api.CodeAppArchMismatch,
-		ErrorHint:   "your binary won't run on this control plane",
-		ErrorWhy:    "build VM exec'd Mach-O binary, kernel refused",
-		ErrorFix:    "• GOOS=linux GOARCH=amd64 go build\n• cargo build --target x86_64-unknown-linux-gnu",
-		CreatedAt:   "2026-08-18T10:00:00Z",
+		ID:        "dep-1",
+		Error:     "the kernel returned ENOEXEC",
+		ErrorCode: api.CodeAppArchMismatch,
+		ErrorHint: "your binary won't run on this control plane",
+		ErrorWhy:  "build VM exec'd Mach-O binary, kernel refused",
+		ErrorFix:  "• GOOS=linux GOARCH=amd64 go build\n• cargo build --target x86_64-unknown-linux-gnu",
+		CreatedAt: "2026-08-18T10:00:00Z",
 		ErrorRelevantLogs: []api.LogExcerpt{
 			{Timestamp: "10:00:00", Level: "error", Message: "exec format error"},
 		},
@@ -43,6 +66,7 @@ func TestRenderInspectErrorsHuman_LiftedFields(t *testing.T) {
 // (pre-feature row, no cluster prose stamped) still emits a
 // Title + Detail + DocsURL — the 3-line legacy shape.
 func TestRenderInspectErrorsHuman_NoFields(t *testing.T) {
+	resetRenderCaches(t)
 	dep := api.DeploymentResponse{
 		ID:        "dep-2",
 		Error:     "build failed",

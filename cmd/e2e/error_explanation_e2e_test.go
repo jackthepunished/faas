@@ -127,13 +127,13 @@ func TestErrorExplanation_AllClusterCodesRoundTrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// 1. Construct the wire Problem with the cluster code.
 			p := &api.Problem{
-				Code:    tc.code,
-				Status:  422,
-				Title:   "failure",
-				Detail:  "detail",
-				Hint:    "",
-				Why:     "",
-				Fix:     "",
+				Code:         tc.code,
+				Status:       422,
+				Title:        "failure",
+				Detail:       "detail",
+				Hint:         "",
+				Why:          "",
+				Fix:          "",
 				RelevantLogs: tc.logs,
 			}
 			// 2. Decorate from the catalog.
@@ -226,14 +226,14 @@ func TestErrorExplanation_AllClusterCodesRoundTrip(t *testing.T) {
 // pkg/state (creating a cycle).
 func stateDeploymentToDTO(d state.Deployment) api.DeploymentResponse {
 	return api.DeploymentResponse{
-		ID:                  d.ID,
-		AppID:               d.AppID,
-		Status:              string(d.Status),
-		Error:               d.Error,
-		ErrorCode:           d.ErrorCode,
-		ErrorHint:           d.ErrorHint,
-		ErrorWhy:            d.ErrorWhy,
-		ErrorFix:            d.ErrorFix,
-		ErrorRelevantLogs:   d.ErrorRelevantLogs,
+		ID:                d.ID,
+		AppID:             d.AppID,
+		Status:            string(d.Status),
+		Error:             d.Error,
+		ErrorCode:         d.ErrorCode,
+		ErrorHint:         d.ErrorHint,
+		ErrorWhy:          d.ErrorWhy,
+		ErrorFix:          d.ErrorFix,
+		ErrorRelevantLogs: d.ErrorRelevantLogs,
 	}
 }

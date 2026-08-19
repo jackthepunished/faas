@@ -20,7 +20,6 @@ func TestRunDoctorChecks_LoopbackBindError(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 	rep := runDoctorChecks(dir)
-	rep = rep // make the test fail loud if any other status is wrong
 	if len(rep.Checks) != 8 {
 		t.Fatalf("expected 8 checks, got %d", len(rep.Checks))
 	}

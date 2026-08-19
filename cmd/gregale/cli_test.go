@@ -974,13 +974,13 @@ func TestRenderAPIError_FiveLineShape(t *testing.T) {
 		{Timestamp: "2026-08-18T19:00:00Z", Level: "error", Source: "vm-init", Message: "dial :8080: connection refused"},
 	}
 	ae := &APIError{Problem: api.Problem{
-		Title:    "No process listening on $PORT",
-		Detail:   "your app isn't accepting traffic on the port we expect",
-		Hint:     "the readiness probe dialed :8080 and got no listener",
-		Why:      "your code binds to 127.0.0.1 not 0.0.0.0",
-		Fix:      "• bind to 0.0.0.0\n• run `gregale doctor`",
-		Code:     api.CodeAppNotListening,
-		DocsURL:  docsURLPrefix + "/errors/app-not-listening",
+		Title:        "No process listening on $PORT",
+		Detail:       "your app isn't accepting traffic on the port we expect",
+		Hint:         "the readiness probe dialed :8080 and got no listener",
+		Why:          "your code binds to 127.0.0.1 not 0.0.0.0",
+		Fix:          "• bind to 0.0.0.0\n• run `gregale doctor`",
+		Code:         api.CodeAppNotListening,
+		DocsURL:      docsURLPrefix + "/errors/app-not-listening",
 		RelevantLogs: logs,
 	}}
 	var buf bytes.Buffer

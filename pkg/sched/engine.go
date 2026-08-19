@@ -37,8 +37,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
-	"github.com/onebox-faas/faas/pkg/whycopy"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -4858,7 +4858,7 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 		p := api.NewProblem(422, api.CodeAppStartupTimeout,
 			"app did not become ready in time",
 			fmt.Sprintf("watchdog forced the instance to failed after the cold-boot budget elapsed (instance=%s, app=%s)", instanceID, appID))
-		whycopy.Decorate(p, api.CodeAppStartupTimeout, nil)
+		_ = whycopy.Decorate(p, api.CodeAppStartupTimeout, nil)
 		if _, err := e.store.SetDeploymentFailedEx(ctx, fresh.DeploymentID,
 			api.CodeAppStartupTimeout,
 			fmt.Sprintf("cold_boot_timeout: instance=%s", instanceID),

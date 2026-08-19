@@ -1101,14 +1101,14 @@ const (
 	// them up uniformly. Each code's ErrXxx constructor lives next to
 	// its constant; the StatusForCode switch arm below (line ~1267)
 	// adds them to the 422 bucket.
-	CodeAppNotListening          = "app_not_listening"
-	CodeAppLoopbackBound         = "app_loopback_bound"
-	CodeAppArchMismatch          = "app_arch_mismatch"
-	CodeEnvVarMissing            = "env_var_missing"
-	CodeAppHealthzUnauthorized   = "app_healthz_unauthorized"
-	CodeAppRuntimeOOM            = "app_runtime_oom"
-	CodeDepInstallFailed         = "dep_install_failed"
-	CodeAppStartupTimeout        = "app_startup_timeout"
+	CodeAppNotListening        = "app_not_listening"
+	CodeAppLoopbackBound       = "app_loopback_bound"
+	CodeAppArchMismatch        = "app_arch_mismatch"
+	CodeEnvVarMissing          = "env_var_missing"
+	CodeAppHealthzUnauthorized = "app_healthz_unauthorized"
+	CodeAppRuntimeOOM          = "app_runtime_oom"
+	CodeDepInstallFailed       = "dep_install_failed"
+	CodeAppStartupTimeout      = "app_startup_timeout"
 
 	// CLI auth (spec §2.2 device-code flow). Pending is the "user has
 	// not yet approved" signal the CLI's poll loop keys off; the CLI

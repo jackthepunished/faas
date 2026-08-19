@@ -17,9 +17,10 @@
 // deployment wins (ordered by created_at DESC).
 //
 // Exit codes:
-//   0  found a failed deployment, rendered the explanation
-//   1  no failed deployment for the app (nothing to show)
-//   2  server error (auth/network)
+//
+//	0  found a failed deployment, rendered the explanation
+//	1  no failed deployment for the app (nothing to show)
+//	2  server error (auth/network)
 package main
 
 import (
@@ -53,6 +54,7 @@ func cmdInspectErrors(slug string) int {
 	fs.SetOutput(osStderr)
 	asJSON := fs.Bool("json", false, "machine output (default: human prose)")
 	if err := fs.Parse([]string{}); err != nil {
+		PrintUsage(osStderr, inspectErrorsUsage, "inspect")
 		return 2
 	}
 	client, err := authedClient()
@@ -136,7 +138,7 @@ func renderInspectErrorsHuman(w io.Writer, slug string, dep api.DeploymentRespon
 	}
 	RenderTitle(w, fmt.Sprintf("%s — deployment %s", title, dep.ID))
 	if dep.Error != "" {
-		fmt.Fprintf(w, "  %s\n", dep.Error)
+		_, _ = fmt.Fprintf(w, "  %s\n", dep.Error)
 	}
 	if dep.ErrorHint != "" {
 		RenderHintRow(w, dep.ErrorHint)
@@ -157,9 +159,9 @@ func renderInspectErrorsHuman(w io.Writer, slug string, dep api.DeploymentRespon
 	}
 	// Footer: when the failure happened (the apid stamps
 	// created_at; we accept the empty case gracefully).
-	fmt.Fprintf(w, "  app: %s\n", slug)
+	_, _ = fmt.Fprintf(w, "  app: %s\n", slug)
 	if dep.CreatedAt != "" {
-		fmt.Fprintf(w, "  failed_at: %s\n", dep.CreatedAt)
+		_, _ = fmt.Fprintf(w, "  failed_at: %s\n", dep.CreatedAt)
 	}
 }
 
