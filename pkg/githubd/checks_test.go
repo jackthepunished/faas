@@ -343,3 +343,110 @@ func TestWritePreviewCheckForkRefused_RejectsMissingArgs(t *testing.T) {
 		t.Error("empty sha should error")
 	}
 }
+
+// newDestroyCommentChecksAPI is the destroy-comment twin of
+// newPreviewChecksAPI: same wiring, but the fake server records
+// the request path so a test can assert the comment endpoint
+// (POST /repos/{o}/{r}/issues/{n}/comments) was hit, not the
+// check-run endpoint.
+func newDestroyCommentChecksAPI(t *testing.T) (*ChecksAPI, *atomic.Pointer[map[string]any], *atomic.Pointer[string]) {
+	t.Helper()
+	var gotBody atomic.Pointer[map[string]any]
+	var gotPath atomic.Pointer[string]
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath.Store(&r.URL.Path)
+		body, _ := io.ReadAll(r.Body)
+		m := map[string]any{}
+		_ = json.Unmarshal(body, &m)
+		gotBody.Store(&m)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":1234}`))
+	}))
+	t.Cleanup(fake.Close)
+
+	tokens := NewTokenCache(fakeFetcher(func(_ context.Context, _ int64) (string, time.Time, error) {
+		return "ghs_destroy_token", time.Now().Add(time.Hour), nil
+	}), time.Minute)
+	c, err := NewChecksAPI(tokens, &singleHostClient{base: fake.Client(), api: fake.URL}, &fakeBindings{id: 99})
+	if err != nil {
+		t.Fatalf("NewChecksAPI: %v", err)
+	}
+	return c, &gotBody, &gotPath
+}
+
+// TestWritePreviewDestroyComment_HappyPath confirms the
+// issue-comment endpoint (NOT the check-run endpoint) is hit,
+// the body is echoed as a Markdown fragment, and the request
+// succeeds. Pins the route shape that pkg/githubd/service.go's
+// close-arm depends on.
+func TestWritePreviewDestroyComment_HappyPath(t *testing.T) {
+	c, gotBody, gotPath := newDestroyCommentChecksAPI(t)
+	body := "Preview `pr-42-hello` is open. [Tear it down](/dashboard/apps/hello/preview/pr-42-hello/destroy)."
+	if err := c.WritePreviewDestroyComment(context.Background(),
+		"octo/api", 42, body); err != nil {
+		t.Fatalf("WritePreviewDestroyComment: %v", err)
+	}
+	wantPath := "/repos/octo/api/issues/42/comments"
+	if p := gotPath.Load(); p == nil || *p != wantPath {
+		t.Errorf("path = %v, want %q (must hit the issue-comment endpoint, not check-runs)", p, wantPath)
+	}
+	captured := gotBody.Load()
+	if captured == nil {
+		t.Fatal("no body captured")
+	}
+	if (*captured)["body"] != body {
+		t.Errorf("body = %v, want %q (Markdown fragment must be echoed verbatim)", (*captured)["body"], body)
+	}
+}
+
+// TestWritePreviewDestroyComment_RejectsMissingArgs mirrors
+// the production guard: empty repo / zero pr_number both error
+// before any HTTP request goes out.
+func TestWritePreviewDestroyComment_RejectsMissingArgs(t *testing.T) {
+	c, _, _ := newDestroyCommentChecksAPI(t)
+	if err := c.WritePreviewDestroyComment(context.Background(), "", 42, "x"); err == nil {
+		t.Error("empty repo should error")
+	}
+	if err := c.WritePreviewDestroyComment(context.Background(), "owner/repo", 0, "x"); err == nil {
+		t.Error("zero pr_number should error")
+	}
+	if err := c.WritePreviewDestroyComment(context.Background(), "owner/repo", -1, "x"); err == nil {
+		t.Error("negative pr_number should error")
+	}
+}
+
+// TestWritePreviewDestroyComment_HTTPErrorReturnsErr confirms
+// GitHub's non-2xx response surfaces as an error from
+// WritePreviewDestroyComment. The body is included in the
+// error so the operator can diagnose without re-issuing the
+// call.
+func TestWritePreviewDestroyComment_HTTPErrorReturnsErr(t *testing.T) {
+	var gotPath atomic.Pointer[string]
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath.Store(&r.URL.Path)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"rate limit exceeded"}`))
+	}))
+	t.Cleanup(fake.Close)
+	tokens := NewTokenCache(fakeFetcher(func(_ context.Context, _ int64) (string, time.Time, error) {
+		return "ghs_t", time.Now().Add(time.Hour), nil
+	}), time.Minute)
+	c, err := NewChecksAPI(tokens, &singleHostClient{base: fake.Client(), api: fake.URL}, &fakeBindings{id: 99})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.WritePreviewDestroyComment(context.Background(), "octo/api", 42, "preview body")
+	if err == nil {
+		t.Fatal("expected error on 403, got nil")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("err = %v, want it to include status code 403", err)
+	}
+	if !strings.Contains(err.Error(), "rate limit") {
+		t.Errorf("err = %v, want it to include the response body", err)
+	}
+	if p := gotPath.Load(); p == nil || *p != "/repos/octo/api/issues/42/comments" {
+		t.Errorf("path = %v, want /repos/octo/api/issues/42/comments", p)
+	}
+}
