@@ -123,15 +123,26 @@ type Replayer struct {
 
 // Store is the narrow interface pkg/rekey needs from the
 // platform-wide state.Store. Two methods: ListAppSecretsForRekey
-// (paginated global walk) and UpsertAppSecretWithKid (re-seal +
-// kid stamp). Implemented by both pkg/state/pgstore.PgStore and
-// pkg/state/memstore.MemStore — see ADR-089 PR-A for the
-// rationale. Defined as an interface here so unit tests can
-// supply a tiny in-memory fakeStore without dragging in the
+// (paginated global walk) and UpsertAppSecretWithKidInScope (re-seal +
+// kid stamp at the row's actual scope). Implemented by both
+// pkg/state/pgstore.PgStore and pkg/state/memstore.MemStore — see
+// ADR-089 PR-A for the rationale. Defined as an interface here so unit
+// tests can supply a tiny in-memory fakeStore without dragging in the
 // full state.Store surface (which is ~hundreds of methods).
+//
+// ADR-092 PR-B: the rekey path must use the scope-aware sibling
+// UpsertAppSecretWithKidInScope (not the legacy UpsertAppSecretWithKid
+// which delegates to DefaultEnvScope — see pgstore.go:11236). After
+// PR-A widened the PK to (app_id, scope, key), every prod/staging row
+// has a unique address; re-sealing at the wrong scope would either
+// (a) insert a brand-new default-scope row of the same key (leaving
+// prod with stale ciphertext) or (b) silently overwrite an existing
+// default-scope row of the same key with new-identity ciphertext. The
+// row.Scope thread from ListAppSecretsForRekey is the only correct
+// write target.
 type Store interface {
 	ListAppSecretsForRekey(ctx context.Context, limit int, cursor string) ([]state.AppSecret, error)
-	UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error
+	UpsertAppSecretWithKidInScope(ctx context.Context, accountID, appID, scope, key, kid string, ciphertext []byte) error
 }
 
 // New constructs a Replayer. identities is the OpenMulti slice
@@ -301,8 +312,15 @@ func (r *Replayer) Run(
 			}
 
 			// Persist. ADR-089 D4: kid column is stamped
-			// alongside the new ciphertext.
-			if err := r.store.UpsertAppSecretWithKid(ctx, row.AccountID, row.AppID, row.Key, r.currentKid, sealed); err != nil {
+			// alongside the new ciphertext. ADR-092 PR-B: the
+			// write target is the row's actual scope
+			// (row.Scope, populated by ListAppSecretsForRekey),
+			// NOT DefaultEnvScope — pre-PR-B this call used
+			// UpsertAppSecretWithKid which delegated to
+			// DefaultEnvScope and silently dropped prod/staging
+			// rows (or corrupted a default-scope sibling of the
+			// same key).
+			if err := r.store.UpsertAppSecretWithKidInScope(ctx, row.AccountID, row.AppID, row.Scope, row.Key, r.currentKid, sealed); err != nil {
 				p.Failed++
 				if pinnedCursor == "" {
 					pinnedCursor = rowCursor

@@ -14,9 +14,13 @@ T = TypeVar("T", bound="AppSecretResponse")
 
 @_attrs_define
 class AppSecretResponse:
-    """A sealed secret envelope: key name, sealed ciphertext (server can't read it), version, and timestamps."""
+    """A sealed secret envelope: key name, sealed ciphertext (server can't read it), version, and timestamps. Scope is the
+    env-scope the row belongs to (ADR-092 PR-B). Pre-PR-B callers see scope='default' echoed on every row.
+
+    """
 
     key: str
+    scope: str
     created_at: datetime.datetime
     updated_at: datetime.datetime
     kid: str | Unset = UNSET
@@ -26,6 +30,8 @@ class AppSecretResponse:
 
     def to_dict(self) -> dict[str, Any]:
         key = self.key
+
+        scope = self.scope
 
         created_at = self.created_at.isoformat()
 
@@ -38,6 +44,7 @@ class AppSecretResponse:
         field_dict.update(
             {
                 "key": key,
+                "scope": scope,
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
@@ -52,6 +59,8 @@ class AppSecretResponse:
         d = dict(src_dict)
         key = d.pop("key")
 
+        scope = d.pop("scope")
+
         created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
 
         updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
@@ -60,6 +69,7 @@ class AppSecretResponse:
 
         app_secret_response = cls(
             key=key,
+            scope=scope,
             created_at=created_at,
             updated_at=updated_at,
             kid=kid,

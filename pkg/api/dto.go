@@ -2453,8 +2453,16 @@ type GdprAuditExportResponse struct {
 // Ciphertext is the age-sealed envelope (base64). Plaintext never
 // lands here — the customer imports the envelope into another faas
 // install (or their own age tool) to unseal.
+//
+// ADR-092 PR-B: the export lists every scope per app (not just
+// default-scope). Scope is required so a customer's import into a
+// fresh install lands each row at the same scope it was sealed at;
+// pre-PR-B this field was missing and on import the row would have
+// collapsed to default scope, silently overwriting any prod/staging
+// rows on the destination.
 type AppSecretExportResponse struct {
 	AppID      string `json:"app_id"`
+	Scope      string `json:"scope"` // ADR-092 PR-B
 	Key        string `json:"key"`
 	Ciphertext string `json:"ciphertext"` // base64
 	CreatedAt  string `json:"created_at"`

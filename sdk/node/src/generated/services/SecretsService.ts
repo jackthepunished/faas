@@ -19,17 +19,31 @@ export class SecretsService {
    */
   public static listSecrets({
     slug,
+    scope,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
      */
     slug: string,
+    /**
+     * Env-var scope (ADR-090). A domain-valid slug (3..40 chars,
+     * lowercase alnum + dash, no leading/trailing dash) — e.g.
+     * `default`, `staging`, `prod-eu`. Or the reserved sentinel
+     * `__all__` on GET only, which returns the nested
+     * `env_by_scope` response shape (every scope on the app).
+     * Omitted = `scope=default` (pre-PR-B behavior).
+     *
+     */
+    scope?: string,
   }): CancelablePromise<AppSecretListResponse> {
     return __request(OpenAPI, {
       method: 'GET',
       url: '/v1/apps/{slug}/secrets',
       path: {
         'slug': slug,
+      },
+      query: {
+        'scope': scope,
       },
       errors: {
         401: `code: unauthorized`,
@@ -53,6 +67,7 @@ export class SecretsService {
     slug,
     key,
     requestBody,
+    scope,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
@@ -66,6 +81,16 @@ export class SecretsService {
      * Secret payload — key name + plaintext. Sealed at rest; plaintext never returned.
      */
     requestBody: PutAppSecretRequest,
+    /**
+     * Env-var scope (ADR-090). A domain-valid slug (3..40 chars,
+     * lowercase alnum + dash, no leading/trailing dash) — e.g.
+     * `default`, `staging`, `prod-eu`. Or the reserved sentinel
+     * `__all__` on GET only, which returns the nested
+     * `env_by_scope` response shape (every scope on the app).
+     * Omitted = `scope=default` (pre-PR-B behavior).
+     *
+     */
+    scope?: string,
   }): CancelablePromise<AppSecretResponse> {
     return __request(OpenAPI, {
       method: 'PUT',
@@ -74,10 +99,13 @@ export class SecretsService {
         'slug': slug,
         'key': key,
       },
+      query: {
+        'scope': scope,
+      },
       body: requestBody,
       mediaType: 'application/json',
       errors: {
-        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        400: `400 on PUT /v1/apps/{slug}/secrets/{key}?scope=... — any of {secret_invalid_key, env_scope_invalid, env_scope_reserved}.`,
         401: `code: unauthorized`,
         403: `code: plan_limit_secrets`,
         413: `code: secret_value_too_large`,
@@ -96,6 +124,7 @@ export class SecretsService {
   public static deleteSecret({
     slug,
     key,
+    scope,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
@@ -105,6 +134,16 @@ export class SecretsService {
      * Secret key. Must start with a letter; A-Z, 0-9, underscore.
      */
     key: string,
+    /**
+     * Env-var scope (ADR-090). A domain-valid slug (3..40 chars,
+     * lowercase alnum + dash, no leading/trailing dash) — e.g.
+     * `default`, `staging`, `prod-eu`. Or the reserved sentinel
+     * `__all__` on GET only, which returns the nested
+     * `env_by_scope` response shape (every scope on the app).
+     * Omitted = `scope=default` (pre-PR-B behavior).
+     *
+     */
+    scope?: string,
   }): CancelablePromise<void> {
     return __request(OpenAPI, {
       method: 'DELETE',
@@ -113,8 +152,11 @@ export class SecretsService {
         'slug': slug,
         'key': key,
       },
+      query: {
+        'scope': scope,
+      },
       errors: {
-        400: `code: secret_not_found`,
+        400: `400 on DELETE /v1/apps/{slug}/secrets/{key}?scope=... — any of {secret_invalid_key, secret_not_found, env_scope_invalid, env_scope_reserved}.`,
         401: `code: unauthorized`,
         404: `code: not_found`,
         429: `429. Two response shapes:
@@ -139,6 +181,7 @@ export class SecretsService {
     slug,
     key,
     requestBody,
+    scope,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
@@ -152,6 +195,16 @@ export class SecretsService {
      * New plaintext value. Sealed at rest server-side; plaintext never returned.
      */
     requestBody: RotateAppSecretRequest,
+    /**
+     * Env-var scope (ADR-090). A domain-valid slug (3..40 chars,
+     * lowercase alnum + dash, no leading/trailing dash) — e.g.
+     * `default`, `staging`, `prod-eu`. Or the reserved sentinel
+     * `__all__` on GET only, which returns the nested
+     * `env_by_scope` response shape (every scope on the app).
+     * Omitted = `scope=default` (pre-PR-B behavior).
+     *
+     */
+    scope?: string,
   }): CancelablePromise<RotateAppSecretResponse> {
     return __request(OpenAPI, {
       method: 'POST',
@@ -160,10 +213,13 @@ export class SecretsService {
         'slug': slug,
         'key': key,
       },
+      query: {
+        'scope': scope,
+      },
       body: requestBody,
       mediaType: 'application/json',
       errors: {
-        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        400: `400 on POST /v1/apps/{slug}/secrets/{key}/rotate?scope=... — any of {secret_invalid_key, secret_not_found, env_scope_invalid, env_scope_reserved}.`,
         401: `code: unauthorized`,
         404: `code: not_found`,
         413: `code: secret_value_too_large`,

@@ -9,21 +9,29 @@ from ...client import AuthenticatedClient, Client
 from ...models.data_upstream_response import DataUpstreamResponse
 from ...models.problem import Problem
 from ...models.put_data_upstream_request import PutDataUpstreamRequest
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     slug: str,
     *,
     body: PutDataUpstreamRequest,
+    deployment_scope: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+
+    params: dict[str, Any] = {}
+
+    params["deployment_scope"] = deployment_scope
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "put",
         "url": "/v1/apps/{slug}/upstreams".format(
             slug=quote(str(slug), safe=""),
         ),
+        "params": params,
     }
 
     _kwargs["json"] = body.to_dict()
@@ -94,6 +102,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: PutDataUpstreamRequest,
+    deployment_scope: str | Unset = UNSET,
 ) -> Response[DataUpstreamResponse | Problem]:
     """Add a data upstream to an app.
 
@@ -112,12 +121,13 @@ def sync_detailed(
 
     Args:
         slug (str):
+        deployment_scope (str | Unset):
         body (PutDataUpstreamRequest): Upsert payload for a customer data upstream. The (kind,
-            host, port)
-            tuple is the deduplication key — repeating the PUT updates the
-            existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
-            inferred-source tag. Plaintext host is never persisted; the on-disk
-            column is `host_redacted_hash`.
+            host, port,
+            scope, deployment_scope) tuple is the deduplication key — repeating
+            the PUT updates the existing row's `last_seen_at` and (if
+            `FAAS_DATA_PLACEMENT=1`) the inferred-source tag. Plaintext host is
+            never persisted; the on-disk column is `host_redacted_hash`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -130,6 +140,7 @@ def sync_detailed(
     kwargs = _get_kwargs(
         slug=slug,
         body=body,
+        deployment_scope=deployment_scope,
     )
 
     response = client.get_httpx_client().request(
@@ -144,6 +155,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: PutDataUpstreamRequest,
+    deployment_scope: str | Unset = UNSET,
 ) -> DataUpstreamResponse | Problem | None:
     """Add a data upstream to an app.
 
@@ -162,12 +174,13 @@ def sync(
 
     Args:
         slug (str):
+        deployment_scope (str | Unset):
         body (PutDataUpstreamRequest): Upsert payload for a customer data upstream. The (kind,
-            host, port)
-            tuple is the deduplication key — repeating the PUT updates the
-            existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
-            inferred-source tag. Plaintext host is never persisted; the on-disk
-            column is `host_redacted_hash`.
+            host, port,
+            scope, deployment_scope) tuple is the deduplication key — repeating
+            the PUT updates the existing row's `last_seen_at` and (if
+            `FAAS_DATA_PLACEMENT=1`) the inferred-source tag. Plaintext host is
+            never persisted; the on-disk column is `host_redacted_hash`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -181,6 +194,7 @@ def sync(
         slug=slug,
         client=client,
         body=body,
+        deployment_scope=deployment_scope,
     ).parsed
 
 
@@ -189,6 +203,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: PutDataUpstreamRequest,
+    deployment_scope: str | Unset = UNSET,
 ) -> Response[DataUpstreamResponse | Problem]:
     """Add a data upstream to an app.
 
@@ -207,12 +222,13 @@ async def asyncio_detailed(
 
     Args:
         slug (str):
+        deployment_scope (str | Unset):
         body (PutDataUpstreamRequest): Upsert payload for a customer data upstream. The (kind,
-            host, port)
-            tuple is the deduplication key — repeating the PUT updates the
-            existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
-            inferred-source tag. Plaintext host is never persisted; the on-disk
-            column is `host_redacted_hash`.
+            host, port,
+            scope, deployment_scope) tuple is the deduplication key — repeating
+            the PUT updates the existing row's `last_seen_at` and (if
+            `FAAS_DATA_PLACEMENT=1`) the inferred-source tag. Plaintext host is
+            never persisted; the on-disk column is `host_redacted_hash`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -225,6 +241,7 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         slug=slug,
         body=body,
+        deployment_scope=deployment_scope,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -237,6 +254,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: PutDataUpstreamRequest,
+    deployment_scope: str | Unset = UNSET,
 ) -> DataUpstreamResponse | Problem | None:
     """Add a data upstream to an app.
 
@@ -255,12 +273,13 @@ async def asyncio(
 
     Args:
         slug (str):
+        deployment_scope (str | Unset):
         body (PutDataUpstreamRequest): Upsert payload for a customer data upstream. The (kind,
-            host, port)
-            tuple is the deduplication key — repeating the PUT updates the
-            existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
-            inferred-source tag. Plaintext host is never persisted; the on-disk
-            column is `host_redacted_hash`.
+            host, port,
+            scope, deployment_scope) tuple is the deduplication key — repeating
+            the PUT updates the existing row's `last_seen_at` and (if
+            `FAAS_DATA_PLACEMENT=1`) the inferred-source tag. Plaintext host is
+            never persisted; the on-disk column is `host_redacted_hash`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -275,5 +294,6 @@ async def asyncio(
             slug=slug,
             client=client,
             body=body,
+            deployment_scope=deployment_scope,
         )
     ).parsed

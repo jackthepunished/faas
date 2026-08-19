@@ -2908,11 +2908,19 @@ type AppSecret struct {
 // Ciphertext is the same age-sealed Envelope that AppSecret carries;
 // the handler emits it base64-encoded on the wire (paginated walk
 // orders by (app_slug ASC, key ASC), so the cursor is the pair).
+//
+// Scope is the env-scope identifier attached at write time
+// (ADR-092 PR-B). Always 'default' for legacy rows backfilled via
+// the column DEFAULT (migration 00217, PR-A). The account-wide
+// list crosses scopes — a customer with prod + staging rows
+// needs the scope echoed alongside (app_slug, key) so the
+// dashboard can group by scope without a second GET.
 type AccountAppSecret struct {
 	AccountID  string
 	AppID      string
 	AppSlug    string
 	Key        string
+	Scope      string
 	Ciphertext []byte
 	CreatedAt  time.Time
 	UpdatedAt  time.Time

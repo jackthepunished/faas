@@ -2381,6 +2381,10 @@ paths:
   /v1/apps/{slug}/secrets:
     parameters:
       - $ref: '#/components/parameters/Slug'
+      # ADR-092 PR-B: ?scope= mirrors the env route. __all__ on
+      # GET returns the nested secrets_by_scope map; any other
+      # value reads that scope's rows.
+      - $ref: '#/components/parameters/EnvScope'
     get:
       tags: [secrets]
       operationId: listSecrets
@@ -2401,6 +2405,11 @@ paths:
     parameters:
       - $ref: '#/components/parameters/Slug'
       - $ref: '#/components/parameters/SecretKey'
+      # ADR-092 PR-B: ?scope= selects which env-scope the row
+      # belongs to. PUT/DELETE/POST (single-row writes) reject
+      # the reserved sentinel __all__ as 400 EnvScopeReserved.
+      # Omitted = scope=default (pre-PR-B behavior).
+      - $ref: '#/components/parameters/EnvScope'
     put:
       tags: [secrets]
       operationId: setSecret
@@ -2424,7 +2433,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/AppSecretResponse'
                 example: {"key":"DATABASE_URL","sealed_ciphertext":"<base64 x25519+xsalsa20-poly1305 ciphertext>","version":1,"created_at":"2026-07-23T11:25:00Z"}
-        '400': { $ref: '#/components/responses/ValidationFailed' }
+        # ADR-092 PR-B: 400 carries one of {secret_invalid_key,
+        # env_scope_invalid, env_scope_reserved}. Mirrors the env
+        # PUT 400 shape at /v1/apps/{slug}/env/{key} (literal
+        # description + Problem content) — the Python SDK
+        # generator rejects `oneOf: [$ref]` at this level because
+        # the response object needs an explicit description string.
+        '400':
+          description: '400 on PUT /v1/apps/{slug}/secrets/{key}?scope=... — any of {secret_invalid_key, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/PlanLimitSecrets' }
         '413': { $ref: '#/components/responses/SecretValueTooLarge' }
@@ -2435,7 +2454,18 @@ paths:
       summary: Delete a sealed secret.
       responses:
         '204': { description: No body. The sealed-secret envelope was removed. }
-        '400': { $ref: '#/components/responses/SecretNotFound' }
+        # ADR-092 PR-B: 400 carries one of {secret_invalid_key,
+        # secret_not_found, env_scope_invalid, env_scope_reserved}.
+        # secret_not_found uses its own envelope (legacy 400 on
+        # "key isn't set"); EnvScopeInvalid is the discriminated
+        # shape (400) when the scope query itself is malformed.
+        # Mirror env's DELETE 400 shape (literal description +
+        # Problem content).
+        '400':
+          description: '400 on DELETE /v1/apps/{slug}/secrets/{key}?scope=... — any of {secret_invalid_key, secret_not_found, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -2455,6 +2485,8 @@ paths:
     parameters:
       - $ref: '#/components/parameters/Slug'
       - $ref: '#/components/parameters/SecretKey'
+      # ADR-092 PR-B: ?scope= selects which scope to rotate.
+      - $ref: '#/components/parameters/EnvScope'
     post:
       tags: [secrets]
       operationId: rotateAppSecret
@@ -2481,7 +2513,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/RotateAppSecretResponse'
                 example: {"key":"STRIPE_KEY","rotated_at":"2026-08-10T11:37:52.123Z","kid":"age1q..."}
-        '400': { $ref: '#/components/responses/ValidationFailed' }
+        # ADR-092 PR-B: 400 carries one of {secret_invalid_key,
+        # env_scope_invalid, env_scope_reserved}. Mirror env's
+        # POST 400 shape (literal description + Problem content)
+        # — the Python SDK generator rejects `oneOf: [$ref]` at
+        # this level.
+        '400':
+          description: '400 on POST /v1/apps/{slug}/secrets/{key}/rotate?scope=... — any of {secret_invalid_key, secret_not_found, env_scope_invalid, env_scope_reserved}.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '413': { $ref: '#/components/responses/SecretValueTooLarge' }
@@ -7846,10 +7887,20 @@ components:
     AppSecretExportResponse:
       description: "One sealed secret in export form: key name, sealed ciphertext (sealed at rest per §11), version, and timestamps. Plaintext is never exported."
       type: object
-      required: [app_id, key, ciphertext, created_at, updated_at]
+      required: [app_id, key, scope, ciphertext, created_at, updated_at]
       properties:
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128 , example: "DATABASE_URL"}
+        # ADR-092 PR-B: scope echoes the env-scope the row was
+        # written to. The GDPR export crosses scopes (operator
+        # compliance flow needs every row to be exportable,
+        # regardless of scope), so the field is always populated.
+        scope:
+          type: string
+          pattern: '^([a-z0-9]([a-z0-9-]{1,38})[a-z0-9]|__all__)$'
+          maxLength: 40
+          x-since: "2026-08"
+          x-issue: "adr-092"
         ciphertext: { type: string, description: 'base64-encoded age-sealed envelope' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -11296,23 +11347,73 @@ components:
         kid: { type: string, description: "age-1... recipient string of the host identity that sealed this row. Empty if kid was not stampable.", example: "age1q..." }
 
     AppSecretResponse:
-      description: "A sealed secret envelope: key name, sealed ciphertext (server can't read it), version, and timestamps."
+      description: "A sealed secret envelope: key name, sealed ciphertext (server can't read it), version, and timestamps. Scope is the env-scope the row belongs to (ADR-092 PR-B). Pre-PR-B callers see scope='default' echoed on every row."
       type: object
-      required: [key, created_at, updated_at]
+      required: [key, scope, created_at, updated_at]
       properties:
         key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128 , example: "DATABASE_URL"}
+        # ADR-092 PR-B: scope echoes the env-scope the row was
+        # written to. Always populated — flat-list reads render
+        # scope='default' so a CLI / dashboard can render
+        # "scope: prod" without a second lookup. Mirrors
+        # AppEnvResponse.Scope.
+        scope:
+          type: string
+          pattern: '^([a-z0-9]([a-z0-9-]{1,38})[a-z0-9]|__all__)$'
+          maxLength: 40
+          example: "prod"
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         kid: { type: string, description: "age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before migration 00166.", example: "age1q..." }
 
+    # ADR-092 PR-B: per-row shape for the nested secrets_by_scope
+    # response (mirror of ScopedAppEnvResponse). Reserved for the
+    # GET ?scope=__all__ path.
+    ScopedAppSecretResponse:
+      description: |
+        Per-row shape for the nested `secrets_by_scope` response
+        (ADR-092 PR-B, mirror of ADR-090 D3's env_by_scope).
+        Same posture as AppSecretResponse but with an explicit
+        `scope` field that carries the scope name on the wire
+        so a CLI / dashboard can render "scope: staging" without
+        a second lookup. Value is NEVER echoed (same posture as
+        AppSecretResponse).
+      type: object
+      required: [scope, key, created_at, updated_at]
+      properties:
+        scope:
+          type: string
+          pattern: '^([a-z0-9]([a-z0-9-]{1,38})[a-z0-9]|__all__)$'
+          maxLength: 40
+          example: "staging"
+        key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128, example: "DATABASE_URL" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        kid: { type: string, description: "age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before migration 00166. Mirrors the `kid` field on the parent `AppSecretResponse` — see that schema for the cross-reference.", example: "age1q..." }
+
     AppSecretListResponse:
-      description: "Paginated list of sealed-secret envelopes (no plaintext)."
+      description: "Paginated list of sealed-secret envelopes (no plaintext). Discriminated union: `secrets` is the flat arm; `secrets_by_scope` is the `?scope=__all__` arm (ADR-092 PR-B)."
       type: object
       required: [secrets, quota_max, count]
       properties:
         secrets:
           type: array
           items: { $ref: '#/components/schemas/AppSecretResponse' }
+        # ADR-092 PR-B: nested per-scope map shape, omitted on
+        # the default-scope GET. Same wire posture as the env
+        # route's `env_by_scope` (ADR-090 PR-B D3) — inline
+        # additionalProperties (NOT a named SecretByScope
+        # schema) because the corresponding Go DTO is a
+        # type alias `SecretByScope = map[...]...` that the
+        # AST parity test deliberately filters out, so a named
+        # schema entry would surface as "schema in spec but
+        # no DTO in code".
+        secrets_by_scope:
+          type: object
+          description: "Nested per-scope map (ADR-092 PR-B, mirror of ADR-090 PR-B D3). Populated only when `?scope=__all__` is passed; keys are scope names, values are per-scope row lists ordered by key ASC."
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/ScopedAppSecretResponse' }
         quota_max: { type: integer }
         count: { type: integer }
 
@@ -12140,9 +12241,11 @@ components:
         app (issue #393). Plaintext NEVER appears here: only the
         age-sealed envelope (base64). `app_id` and `app_slug` let the
         dashboard render "foo-app / DATABASE_URL" without a parallel
-        `/v1/apps` round-trip.
+        `/v1/apps` round-trip. `scope` (ADR-092 PR-B) carries the
+        env-scope the row belongs to; the account-wide list
+        crosses scopes.
       type: object
-      required: [app_id, app_slug, key, ciphertext, created_at, updated_at]
+      required: [app_id, app_slug, key, scope, ciphertext, created_at, updated_at]
       properties:
         app_id:
           type: string
@@ -12158,6 +12261,16 @@ components:
           type: string
           x-since: "2026-07"
           x-issue: "393"
+        # ADR-092 PR-B: scope echoes the env-scope the row was
+        # written to. The account-wide list crosses scopes — a
+        # customer with prod + staging rows needs the scope to
+        # group rows without a second GET.
+        scope:
+          type: string
+          pattern: '^([a-z0-9]([a-z0-9-]{1,38})[a-z0-9]|__all__)$'
+          maxLength: 40
+          x-since: "2026-08"
+          x-issue: "adr-092"
         ciphertext:
           type: string
           description: "base64 age-sealed envelope. Plaintext NEVER appears on this wire."
@@ -13848,7 +13961,7 @@ components:
     # env_var_invalid_key doesn't apply; __all__ is allowed on
     # read), so a single ref is fine.
     EnvScopeInvalid:
-      description: 'code: env_scope_invalid — ?scope= failed the EnvScopePattern check (empty, too long, or out-of-shape slug).'
+      description: 'code: env_scope_invalid — ?scope= failed the EnvScopePattern check (empty, too long, or out-of-shape slug). Applies to both env and secrets surfaces (ADR-090 PR-B, ADR-092 PR-B).'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

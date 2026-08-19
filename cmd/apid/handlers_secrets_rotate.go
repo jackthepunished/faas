@@ -69,6 +69,11 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 	if !ok {
 		return
 	}
+	scope, _, prob := scopeFromQuery(r, false /* allowAll */)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
 	var req api.RotateAppSecretRequest
 	if err := decodeJSON(r, &req); err != nil {
 		api.WriteProblem(w, api.ErrValidation("invalid JSON body"))
@@ -82,21 +87,21 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 
 	// Read the previous row so we can decide audit kind: secret.set
 	// (no prior value) vs secret.rotated (rotation of an existing
-	// row). GetAppSecret returns ErrNotFound when the row does not
-	// exist; that's the "first-time rotate" case which we treat as
-	// a set for audit purposes.
+	// row). GetAppSecretInScope returns ErrNotFound when the row
+	// does not exist; that's the "first-time rotate" case which we
+	// treat as a set for audit purposes.
 	//
-	// CONTRACT pinned at the handler boundary: GetAppSecret's
+	// CONTRACT pinned at the handler boundary: GetAppSecretInScope's
 	// three-state result must be either (row, nil), (nil,
 	// ErrNotFound), or (nil, err) — never (nil, nil). If a future
-	// refactor relaxes GetAppSecret to (nil, nil) on an empty
+	// refactor relaxes GetAppSecretInScope to (nil, nil) on an empty
 	// result, we want the handler to 5xx loudly rather than
 	// silently emit secret.set for a row that may already have a
 	// value (which would understate rotations in the audit log).
-	prev, err := s.store.GetAppSecret(r.Context(), acct.ID, app.ID, key)
+	prev, err := s.store.GetAppSecretInScope(r.Context(), acct.ID, app.ID, scope, key)
 	switch {
 	case err == nil && prev == nil:
-		api.WriteProblem(w, api.ErrCapacity("GetAppSecret returned (nil, nil) — store contract broken"))
+		api.WriteProblem(w, api.ErrCapacity("GetAppSecretInScope returned (nil, nil) — store contract broken"))
 		return
 	case err != nil && !errors.Is(err, state.ErrNotFound):
 		api.WriteProblem(w, api.ErrCapacity("could not read previous secret"))
@@ -120,7 +125,7 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 
-	if prob := s.sealAndPersistWithKid(r.Context(), acct, app, key, req.Value, limits, kid); prob != nil {
+	if prob := s.sealAndPersistWithKid(r.Context(), acct, app, scope, key, req.Value, limits, kid); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -129,6 +134,7 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 	s.log.Info("secret rotated",
 		"app", app.Slug,
 		"key", logsanitize.Field(key),
+		"scope", scope,
 		"account", acct.ID,
 		"value_bytes", logsanitize.RedactValue(req.Value),
 		"kid", kid,
@@ -139,7 +145,8 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 	// value-replacement events. The audit_log.actor column
 	// (migration 00163) further distinguishes user-driven rotate
 	// (this handler, actor='apid') from background re-seal
-	// (pkg/rekey.Replayer, actor='rekey' — PR-C).
+	// (pkg/rekey.Replayer, actor='rekey' — PR-C). ADR-092 PR-B
+	// adds data.scope so dashboards can group rotations by scope.
 	auditKind := "secret.rotated"
 	if !isRotation {
 		auditKind = "secret.set"
@@ -153,6 +160,7 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 	s.audit.Emit(r.Context(), auditKind, &acct.ID, map[string]any{
 		"app_id":     app.ID,
 		"name":       key,
+		"scope":      scope,
 		"kid":        kid,
 		"rotated_at": nowStr,
 	})
@@ -173,7 +181,10 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 // accessor setSecret uses). The kid fingerprint is computed in the
 // caller and passed in — the seal path doesn't need to know how to
 // fingerprint, only that the kid is correct.
-func (s *server) sealAndPersistWithKid(c stdctx, acct state.Account, app state.App, key, value string, limits api.Limits, kid string) *api.Problem {
+//
+// ADR-092 PR-B: the scope arg threads through to
+// UpsertAppSecretWithKidInScope — PK is (app_id, scope, key).
+func (s *server) sealAndPersistWithKid(c stdctx, acct state.Account, app state.App, scope, key, value string, limits api.Limits, kid string) *api.Problem {
 	recipient := setSecretRecipient()
 	if recipient == nil {
 		return api.ErrCapacity("host age recipient not loaded — refusing to seal")
@@ -185,7 +196,7 @@ func (s *server) sealAndPersistWithKid(c stdctx, acct state.Account, app state.A
 		}
 		return api.ErrCapacity("could not seal secret")
 	}
-	if err := s.store.UpsertAppSecretWithKid(c, acct.ID, app.ID, key, kid, ciphertext); err != nil {
+	if err := s.store.UpsertAppSecretWithKidInScope(c, acct.ID, app.ID, scope, key, kid, ciphertext); err != nil {
 		return api.ErrCapacity("could not persist secret")
 	}
 	return nil

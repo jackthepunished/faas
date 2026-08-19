@@ -11491,26 +11491,39 @@ func (s *PgStore) ListAllAppSecrets(ctx context.Context, accountID, appID string
 }
 
 // ListAppSecretsForAccount joins apps + app_secrets on account_id
-// (issue #393). The cursor is the (app_slug, key) pair — the
-// handler emits "<slug>|<key>" and the SQL splits it back via
-// split_part. Order is (app_slug ASC, key ASC) so the cursor walk
-// is monotonic. Each row carries the app_slug the per-app path
-// doesn't (the URL slug is the path parameter there).
+// (issue #393). The cursor is the (app_slug, scope, key) triple —
+// after PR-A's PK widening to (app_id, scope, key), the same
+// (slug, key) at multiple scopes is no longer unique, so the
+// cursor MUST include scope to fence rows that would otherwise
+// be dropped or duplicated (e.g. (foo,default,API_KEY) and
+// (foo,prod,API_KEY) on a limit=2 page).
+//
+// The handler emits "<slug>|<scope>|<key>" and the SQL splits it
+// back via split_part. Order is (app_slug ASC, scope ASC, key ASC)
+// so the cursor walk is monotonic and the row-by-row comparison
+// in the WHERE clause is the same sort key. Each row carries the
+// app_slug the per-app path doesn't (the URL slug is the path
+// parameter there).
 //
 // Cross-account isolation is the JOIN on apps.account_id = $1 — the
 // SQL is the only IDOR guard. Returns nil slice (not error) when
 // the account has no secrets.
+//
+// ADR-092 PR-B: pre-PR-B the cursor was just (slug, key) which
+// silently dropped the trailing rows when a customer had the
+// same key at multiple scopes. The fix widens the cursor model
+// in lockstep with the (slug, scope, key) sort key.
 func (s *PgStore) ListAppSecretsForAccount(ctx context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 25
 	}
 	rows, err := s.pool.Query(ctx,
-		`select s.account_id, s.app_id, a.slug, s.key, s.ciphertext, s.created_at, s.updated_at
+		`select s.account_id, s.app_id, a.slug, s.key, s.scope, s.ciphertext, s.created_at, s.updated_at
 		 from app_secrets s
 		 join apps a on a.id = s.app_id
 		 where s.account_id = $1
-		   and ($2 = '' or (a.slug, s.key) > (split_part($2, '|', 1), split_part($2, '|', 2)))
-		 order by a.slug asc, s.key asc
+		   and ($2 = '' or (a.slug, s.scope, s.key) > (split_part($2, '|', 1), split_part($2, '|', 2), split_part($2, '|', 3)))
+		 order by a.slug asc, s.scope asc, s.key asc
 		 limit $3`, accountID, before, limit)
 	if err != nil {
 		return nil, err
@@ -11519,7 +11532,7 @@ func (s *PgStore) ListAppSecretsForAccount(ctx context.Context, accountID string
 	var out []AccountAppSecret
 	for rows.Next() {
 		var r AccountAppSecret
-		if err := rows.Scan(&r.AccountID, &r.AppID, &r.AppSlug, &r.Key, &r.Ciphertext, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.AppSlug, &r.Key, &r.Scope, &r.Ciphertext, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
