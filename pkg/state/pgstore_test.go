@@ -3721,14 +3721,14 @@ func TestPg_DeploymentActorRoundtrip(t *testing.T) {
 		t.Fatalf("CreateAccount: %v", err)
 	}
 	app, err := s.CreateApp(ctx, state.App{
-		AccountID: acct.ID, Slug: "actor-app", Type: state.AppTypeApp,
+AccountID: acct.ID, Slug: "actor-app", Type: state.AppTypeApp,
 		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
 	})
 	if err != nil {
 		t.Fatalf("CreateApp: %v", err)
 	}
 
-	// 1. Full actor payload — dashboard / API path with a session
+// 1. Full actor payload — dashboard / API path with a session
 	//    user, remote IP, and a githubd-stamped pusher login.
 	depFull, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID:            app.ID,
@@ -3747,7 +3747,7 @@ func TestPg_DeploymentActorRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeploymentByID(full): %v", err)
 	}
-	if got.DeployedByUserID != acct.ID {
+if got.DeployedByUserID != acct.ID {
 		t.Errorf("deployed_by_user_id = %q, want %q", got.DeployedByUserID, acct.ID)
 	}
 	if got.DeployedVia != "github" {
@@ -3781,7 +3781,7 @@ func TestPg_DeploymentActorRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeploymentByID(empty): %v", err)
 	}
-	if gotEmpty.DeployedByUserID != "" {
+if gotEmpty.DeployedByUserID != "" {
 		t.Errorf("empty deployed_by_user_id = %q, want \"\"", gotEmpty.DeployedByUserID)
 	}
 	if gotEmpty.DeployedVia != "api" {
@@ -3827,5 +3827,114 @@ func TestPg_DeploymentActorRoundtrip(t *testing.T) {
 	})
 	if err == nil {
 		t.Errorf("expected FK violation on non-existent deployed_by_user_id, got nil")
+	}
+}
+
+// TestPg_DeploymentAnnotationRoundtrip (issue #977 / ADR-116) pins
+// the four deploy-annotation columns (reason, tag, deployed_by,
+// pr_number) through CreateDeployment + DeploymentByID. The closed-
+// set tag CHECK is exercised on both the positive (allowed value)
+// and negative (rejected value) branches. A second CreateDeployment
+// with all-zero annotation fields asserts the Go-zero → NULL collapse
+// on pr_number + the empty-string passthrough on the text columns —
+// pre-#977 rows must continue to round-trip without surprise.
+//
+// The positional scan invariant documented at
+// pkg/state/pgstore.go:12269-12270 (and called out again at lines
+// 12283-12286) is the load-bearing constraint: if any of the four
+// new SELECT projections drifts from the INSERT column order, pgx
+// fails loud at the first SELECT. This test is the regression net
+// for that drift.
+func TestPg_DeploymentAnnotationRoundtrip(t *testing.T) {
+	s, ctx := pgStore(t)
+	acct, err := s.CreateAccount(ctx, "ann@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := s.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: "ann-app", Type: state.AppTypeApp,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// 1. Full annotation payload — the githubd / Action path.
+	depFull, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID:       app.ID,
+		Kind:        state.DeploymentKindGitHub,
+		ImageDigest: "sha256:ann-full",
+		Status:      state.DeployPending,
+		Reason:      "Rollback after payments incident",
+		Tag:         "incident_recovery",
+		DeployedBy:  "octocat",
+		PRNumber:    4242,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment(full): %v", err)
+	}
+	got, err := s.DeploymentByID(ctx, depFull.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID(full): %v", err)
+	}
+	if got.Reason != "Rollback after payments incident" {
+		t.Errorf("reason = %q, want %q", got.Reason, "Rollback after payments incident")
+	}
+	if got.Tag != "incident_recovery" {
+		t.Errorf("tag = %q, want %q", got.Tag, "incident_recovery")
+	}
+	if got.DeployedBy != "octocat" {
+		t.Errorf("deployed_by = %q, want %q", got.DeployedBy, "octocat")
+	}
+	if got.PRNumber != 4242 {
+		t.Errorf("pr_number = %d, want 4242", got.PRNumber)
+	}
+
+	// 2. Zero annotations — push-to-main via CLI without --reason,
+	//    --tag, --deployed-by, --pr-number. The Go-zero on
+	//    pr_number must collapse to NULL on INSERT (the
+	//    nullif($N, 0) at pgstore.go:CreateDeployment).
+	depEmpty, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID:       app.ID,
+		Kind:        state.DeploymentKindImage,
+		ImageDigest: "sha256:ann-empty",
+		Status:      state.DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment(empty): %v", err)
+	}
+	gotEmpty, err := s.DeploymentByID(ctx, depEmpty.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID(empty): %v", err)
+	}
+	if gotEmpty.Reason != "" {
+		t.Errorf("empty reason = %q, want \"\"", gotEmpty.Reason)
+	}
+	if gotEmpty.Tag != "" {
+		t.Errorf("empty tag = %q, want \"\"", gotEmpty.Tag)
+	}
+	if gotEmpty.DeployedBy != "" {
+		t.Errorf("empty deployed_by = %q, want \"\"", gotEmpty.DeployedBy)
+	}
+	if gotEmpty.PRNumber != 0 {
+		t.Errorf("empty pr_number = %d, want 0", gotEmpty.PRNumber)
+	}
+
+	// 3. Closed-set tag CHECK rejection. The DB-side constraint
+	//    (migrations/00288_deployments_annotation.sql) is the
+	//    source of truth; the CLI / handler validators mirror
+	//    it. We drive the rejection directly through the store
+	//    to confirm the constraint is wired (the apid would
+	//    otherwise silently accept and round-trip a malformed
+	//    value).
+	_, err = s.CreateDeployment(ctx, state.Deployment{
+		AppID:       app.ID,
+		Kind:        state.DeploymentKindImage,
+		ImageDigest: "sha256:ann-bad",
+		Status:      state.DeployPending,
+		Tag:         "rogue_tag",
+	})
+	if err == nil {
+		t.Errorf("expected CHECK violation on rogue_tag, got nil")
 	}
 }
