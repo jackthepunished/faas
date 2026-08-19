@@ -2065,10 +2065,24 @@ func doctorReportFromObs(d state.CustomDomain, obs state.DomainDoctorObservation
 		tlsDetail = "port-443 cert is a CDN cert whose SANs do not include " + d.Domain
 		tlsRem = "Update the edge to use the Gregale-issued cert, or wait for Gregale cert propagation."
 	default:
-		// "none" or empty — unverified.
+		// "none" or empty. Two distinct cases:
+		// (a) d.Verified() is false — the customer never
+		//     published the _faas-verify TXT, so the cert
+		//     engine has not started. Tell them so.
+		// (b) d.Verified() is true but cert_state is still
+		//     "none" — the first poll cycle after verification
+		//     almost always hits this case (cert engine has not
+		//     yet minted). The customer has verified; we
+		//     should not contradict that reality. Tell them
+		//     the cert is pending issuance, not that the
+		//     domain is unverified.
 		tlsStatus = probePending
 		report.Healthy = false
-		tlsDetail = "domain not yet verified; cert not yet issued"
+		if !d.Verified() {
+			tlsDetail = "domain not yet verified; cert not yet issued"
+		} else {
+			tlsDetail = "cert pending issuance; wait for cert engine (next poll cycle)"
+		}
 	}
 	report.Checks = append(report.Checks, api.DomainDoctorCheck{
 		Name: "tls_certificate", Status: string(tlsStatus), Detail: tlsDetail,

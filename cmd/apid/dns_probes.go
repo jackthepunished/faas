@@ -194,15 +194,32 @@ func checkPointsToGregale(ctx context.Context, domain string) ProbeResult {
 		}
 	}
 	if cErr != nil {
-		// No CNAME. The customer may be using an apex A
-		// record instead. checkApexA_AAAA is the load-bearing
-		// check for that case; this check is na unless we
-		// also see the apex pointing at us. For now: report
-		// na so the customer isn't told to add a CNAME when
-		// they correctly have an A record.
+		// Branch on isNotFound first, mirroring the other three
+		// probes (checkApexA_AAAA, checkCAA, checkAAAAConflict).
+		// A transient resolver error (timeout, SERVFAIL, network
+		// unreachable) is "data missing, retry later" → probePending,
+		// NOT probeNA. Conflating the two cases tells the customer
+		// nothing is wrong when in reality the CNAME was simply not
+		// fetched — and the points_to_gregale check is the
+		// load-bearing one for activation drop-off, so a
+		// misclassification here masks real DNS misconfiguration
+		// during the exact window the customer is debugging it.
+		if isNotFound(cErr) {
+			// No CNAME. The customer may be using an apex A
+			// record instead. checkApexA_AAAA is the load-bearing
+			// check for that case; this check is na unless we
+			// also see the apex pointing at us. Report na so the
+			// customer isn't told to add a CNAME when they
+			// correctly have an A record.
+			return ProbeResult{
+				Status:     probeNA,
+				Detail:     "no CNAME at apex; using A/AAAA record instead",
+				ObservedAt: now,
+			}
+		}
 		return ProbeResult{
-			Status:     probeNA,
-			Detail:     "no CNAME at apex; using A/AAAA record instead",
+			Status:     probePending,
+			Detail:     "CNAME lookup failed (transient)",
 			ObservedAt: now,
 		}
 	}

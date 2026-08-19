@@ -690,6 +690,15 @@ func newServerWithDeps(
 	// required); the route is mounted via middleware.AuthLimit
 	// (no requireX chain) in cmd/apid/server.go:870 below.
 	s.oidcHandler = s.buildOIDCHandler()
+	// ADR-120: wire the package-level appsDomainFunc seam (declared at
+	// cmd/apid/dns_probes.go:125) to the server's apps base domain so
+	// checkPointsToGregale has the configured Gregale apex in
+	// production. Tests inject a constant via the same var (see
+	// cmd/apid/dns_probes_test.go:24-38); that assignment is reverted
+	// in t.Cleanup, so the production wire below wins on every real
+	// daemon start (the var is reset to the server's domain, not the
+	// empty default).
+	appsDomainFunc = func() string { return s.domain }
 	return s
 }
 

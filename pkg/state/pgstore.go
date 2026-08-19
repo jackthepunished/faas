@@ -6019,6 +6019,190 @@ func (s *PgStore) DeleteCustomDomain(ctx context.Context, domain string) error {
 	return nil
 }
 
+// --- domain_doctor_observations (ADR-120) ----------------------
+
+// UpsertDoctorObservation writes (or refreshes) the
+// per-domain observation row. The poller is the sole
+// writer. ON CONFLICT (domain) DO UPDATE means a second
+// pass overwrites every field; the handler reads the
+// latest row, so "race" between poller and handler
+// is benign (the handler may see a slightly older row
+// or a slightly newer one, both are correct).
+//
+// The COALESCE on $2 keeps the surface_id stable across
+// passes: the poller enumerates both legacy custom_domains
+// (surface_id=NULL) and tenant_hostnames (surface_id set);
+// passing NULL on a row that already has a non-null
+// surface_id would un-anchor the row from its surface.
+// The legacy case (surface_id="" passed in) is translated
+// to nil at the store boundary so the column gets NULL.
+func (s *PgStore) UpsertDoctorObservation(ctx context.Context, obs DomainDoctorObservation) error {
+	var surfaceID any
+	if obs.SurfaceID != "" {
+		surfaceID = obs.SurfaceID
+	}
+	var caaPermits any
+	if obs.CAAPermits != nil {
+		caaPermits = *obs.CAAPermits
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO domain_doctor_observations (
+			domain, surface_id, observed_at,
+			dns_record_found, points_to_gregale, caa_permits, ipv6_conflict,
+			observed_target, observed_aaaa, caa_observed,
+			cert_state, cert_not_after, last_error,
+			dns_checked_at, cert_checked_at
+		) VALUES (
+			$1, $2, $3,
+			$4, $5, $6, $7,
+			$8, $9, $10,
+			$11, $12, $13,
+			$14, $15
+		)
+		ON CONFLICT (domain) DO UPDATE SET
+			surface_id        = COALESCE(EXCLUDED.surface_id, domain_doctor_observations.surface_id),
+			observed_at       = EXCLUDED.observed_at,
+			dns_record_found  = EXCLUDED.dns_record_found,
+			points_to_gregale = EXCLUDED.points_to_gregale,
+			caa_permits       = EXCLUDED.caa_permits,
+			ipv6_conflict     = EXCLUDED.ipv6_conflict,
+			observed_target   = EXCLUDED.observed_target,
+			observed_aaaa     = EXCLUDED.observed_aaaa,
+			caa_observed      = EXCLUDED.caa_observed,
+			cert_state        = EXCLUDED.cert_state,
+			cert_not_after    = EXCLUDED.cert_not_after,
+			last_error        = EXCLUDED.last_error,
+			dns_checked_at    = EXCLUDED.dns_checked_at,
+			cert_checked_at   = EXCLUDED.cert_checked_at
+	`, obs.Domain, surfaceID, obs.ObservedAt,
+		obs.DNSRecordFound, obs.PointsToGregale, caaPermits, obs.IPv6Conflict,
+		nullableStr(obs.ObservedTarget), nullableStr(obs.ObservedAAAA), nullableStr(obs.CAAObserved),
+		obs.CertState, nullableTime(obs.CertNotAfter), nullableStr(obs.LastError),
+		nullableTime(obs.DNSCheckedAt), nullableTime(obs.CertCheckedAt))
+	return err
+}
+
+// GetDoctorObservation reads the latest row for a domain.
+// Returns ErrNotFound when the poller has not yet written
+// one — the handler treats this as stale:true and triggers
+// a synchronous re-probe. Returns the row otherwise; the
+// caller is responsible for the stale-check against
+// observed_at vs FAAS_DOMAIN_DOCTOR_TTL_SECONDS.
+func (s *PgStore) GetDoctorObservation(ctx context.Context, domain string) (DomainDoctorObservation, error) {
+	var obs DomainDoctorObservation
+	var surfaceID, observedTarget, observedAAAA, caaObserved, lastError *string
+	var certNotAfter, dnsCheckedAt, certCheckedAt *time.Time
+	var caaPermits *bool
+	row := s.pool.QueryRow(ctx, `
+		SELECT
+			domain,
+			surface_id::text,
+			observed_at,
+			dns_record_found, points_to_gregale, caa_permits, ipv6_conflict,
+			observed_target, observed_aaaa, caa_observed,
+			cert_state, cert_not_after, last_error,
+			dns_checked_at, cert_checked_at
+		FROM domain_doctor_observations
+		WHERE domain = $1
+	`, domain)
+	err := row.Scan(
+		&obs.Domain, &surfaceID, &obs.ObservedAt,
+		&obs.DNSRecordFound, &obs.PointsToGregale, &caaPermits, &obs.IPv6Conflict,
+		&observedTarget, &observedAAAA, &caaObserved,
+		&obs.CertState, &certNotAfter, &lastError,
+		&dnsCheckedAt, &certCheckedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return obs, ErrNotFound
+		}
+		return obs, err
+	}
+	if surfaceID != nil {
+		obs.SurfaceID = *surfaceID
+	}
+	if observedTarget != nil {
+		obs.ObservedTarget = *observedTarget
+	}
+	if observedAAAA != nil {
+		obs.ObservedAAAA = *observedAAAA
+	}
+	if caaObserved != nil {
+		obs.CAAObserved = *caaObserved
+	}
+	if lastError != nil {
+		obs.LastError = *lastError
+	}
+	if caaPermits != nil {
+		obs.CAAPermits = caaPermits
+	}
+	if certNotAfter != nil {
+		obs.CertNotAfter = *certNotAfter
+	}
+	if dnsCheckedAt != nil {
+		obs.DNSCheckedAt = *dnsCheckedAt
+	}
+	if certCheckedAt != nil {
+		obs.CertCheckedAt = *certCheckedAt
+	}
+	return obs, nil
+}
+
+// ListAllCustomDomainsForDoctor returns the union of
+// custom_domains.domain and tenant_hostnames.hostname
+// so the poller has a single enumeration seam. The poller
+// does NOT need the app_id or surface_id at enumeration
+// time — those are joined lazily inside the per-domain
+// probe pass to avoid carrying app/surface state on the
+// poller goroutine.
+//
+// UNION ALL (not UNION) so Postgres skips the sort+hash
+// dedup pass: the consumer is runDoctorForDomain, which
+// upserts on domain_doctor_observations keyed by citext,
+// so a duplicate row is a no-op. Dedup is the caller's
+// job (the citext PK on the upsert target), not the
+// query's.
+func (s *PgStore) ListAllCustomDomainsForDoctor(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT domain FROM custom_domains
+		UNION ALL
+		SELECT hostname FROM tenant_hostnames
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// nullableStr returns nil for "" so the doctor's empty
+// string columns translate to SQL NULL. A present-but-
+// empty value is functionally equivalent to NULL (the
+// handler treats "" and NULL identically when rendering).
+func nullableStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// nullableTime returns nil for the zero time so the
+// doctor's unset timestamps translate to SQL NULL.
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
 // --- crons -------------------------------------------------------------------
 
 func (s *PgStore) CreateCron(ctx context.Context, appID, schedule, path string, enabled bool) (Cron, error) {
