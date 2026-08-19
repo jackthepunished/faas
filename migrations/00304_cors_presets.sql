@@ -1,4 +1,4 @@
--- filename: 00303_cors_presets.sql
+-- filename: 00304_cors_presets.sql
 -- +goose Up
 -- +goose StatementBegin
 
