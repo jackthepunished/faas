@@ -31,6 +31,7 @@ func TestESMKindConstants(t *testing.T) {
 		{"ESMSourceDeleted", events.ESMSourceDeleted, "esm.source.deleted"},
 		{"ESMPollFailed", events.ESMPollFailed, "esm.poll.failed"},
 		{"ESMDrainDLQ", events.ESMDrainDLQ, "esm.drain.dlq"},
+		{"ESMFilterError", events.ESMFilterError, "esm.filter.error"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -52,6 +53,7 @@ func TestESMKindPrefix(t *testing.T) {
 		events.ESMSourceDeleted,
 		events.ESMPollFailed,
 		events.ESMDrainDLQ,
+		events.ESMFilterError,
 	} {
 		if !strings.HasPrefix(k, "esm.") {
 			t.Errorf("kind %q does not start with `esm.` prefix (ADR-118 §Audit vocabulary bridging)", k)
@@ -69,6 +71,7 @@ func TestESMEventsSatisfyWakeEvent(t *testing.T) {
 		events.ESMSourceDeletedEvent{TriggerID: "t1", AccountID: "a1", AppID: "app1", SourceKind: "kafka"},
 		events.ESMPollFailedEvent{TriggerID: "t1", AppID: "app1", SourceKind: "kafka", Error: "broker timeout"},
 		events.ESMDrainDLQEvent{TriggerID: "t1", RecordID: "r1", AppID: "app1", Reason: "max_attempts"},
+		events.ESMFilterErrorEvent{TriggerID: "t1", AppID: "app1", SourceKind: "kafka", Error: "bad path"},
 	}
 	for _, ev := range cases {
 		if ev.Kind() == "" {
@@ -106,6 +109,7 @@ func TestESMAtDefaultsToNow(t *testing.T) {
 //	trigger.fired.batch ↔ esm.source.deleted (the only gap — ESM-only)
 //	trigger.retry       ↔ esm.poll.failed  (failure-side)
 //	trigger.dlq         ↔ esm.drain.dlq    (DLQ-side)
+//	trigger.filter.error ↔ esm.filter.error (filter-error-side, commit 6)
 //
 // Drift in this map breaks the dual-emit JOIN (trigger_id,
 // record_id, At) on which the audit timeline collapse depends.
@@ -117,6 +121,7 @@ func TestESMOneToOneMapping(t *testing.T) {
 		{events.ESMSourceCreated, events.TriggerFired},
 		{events.ESMPollFailed, events.TriggerRetry},
 		{events.ESMDrainDLQ, events.TriggerDLQ},
+		{events.ESMFilterError, events.TriggerFilterError},
 	}
 	for _, c := range cases {
 		if !strings.HasPrefix(c.esm, "esm.") || !strings.HasPrefix(c.trig, "trigger.") {
@@ -127,4 +132,14 @@ func TestESMOneToOneMapping(t *testing.T) {
 	// that no trigger.* mirror exists today (a future addition
 	// would require an ADR amendment per ADR-118).
 	_ = events.ESMSourceDeleted
+}
+
+// TestTriggerFilterErrorKind pins the new trigger.filter.error
+// constant (commit 6 of the issue #757 mega-PR). It's the
+// operator-debug audit kind emitted when a per-record filter
+// parse error is encountered — NOT a customer-facing event.
+func TestTriggerFilterErrorKind(t *testing.T) {
+	if events.TriggerFilterError != "trigger.filter.error" {
+		t.Errorf("TriggerFilterError = %q, want %q", events.TriggerFilterError, "trigger.filter.error")
+	}
 }

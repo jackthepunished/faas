@@ -51,6 +51,13 @@ const (
 	// per the dlq CHECK constraint). Payload: {trigger_id,
 	// record_id, app_id, reason, attempts}.
 	TriggerDLQ = "trigger.dlq"
+
+	// TriggerFilterError — FilterCriteria evaluation rejected a
+	// record's path (ADR-118 / commit 6 of the issue #757
+	// mega-PR). Operator-debug audit only; the record is
+	// still Ack'd at the broker (a re-poll would loop on the
+	// same parse error). Payload: {trigger_id, app_id, error}.
+	TriggerFilterError = "trigger.filter.error"
 )
 
 // TriggerFiredEvent is the typed payload for TriggerFired.
@@ -160,6 +167,34 @@ func (TriggerDLQEvent) Subject() *string { return nil }
 // Payload returns the typed struct for TriggerDLQEvent.
 func (e TriggerDLQEvent) Payload() map[string]any { return eventPayload(e) }
 
+// TriggerFilterErrorEvent is the typed payload for
+// TriggerFilterError. Emitted from
+// pkg/sched/dispatch_triggers.go::dispatchOneTrigger when the
+// per-record FilterCriteria evaluation rejected a record's
+// path (the filter was authored in an unsupported form like
+// "$.items[?(...)]"; the file-header doc on filter.go:38-55
+// pins the minimal grammar). One event per tick per trigger
+// summarises the count; individual record-level errors are
+// Ack'd silently to the broker (no per-record audit row —
+// would balloon the events table for a single bad filter).
+type TriggerFilterErrorEvent struct {
+	TriggerID string `json:"trigger_id"`
+	AppID     string `json:"app_id"`
+	Error     string `json:"error"`
+}
+
+// Kind returns the audit kind for TriggerFilterErrorEvent.
+func (TriggerFilterErrorEvent) Kind() string { return TriggerFilterError }
+
+// At returns the current time for TriggerFilterErrorEvent.
+func (TriggerFilterErrorEvent) At() time.Time { return time.Now() }
+
+// Subject returns nil for TriggerFilterErrorEvent.
+func (TriggerFilterErrorEvent) Subject() *string { return nil }
+
+// Payload returns the typed struct for TriggerFilterErrorEvent.
+func (e TriggerFilterErrorEvent) Payload() map[string]any { return eventPayload(e) }
+
 // Compile-time guarantees each new event implements WakeEvent so
 // Platform.Emit accepts it.
 var (
@@ -167,6 +202,7 @@ var (
 	_ WakeEvent = TriggerFiredBatchEvent{}
 	_ WakeEvent = TriggerRetryEvent{}
 	_ WakeEvent = TriggerDLQEvent{}
+	_ WakeEvent = TriggerFilterErrorEvent{}
 )
 
 // ESM vocabulary (ADR-118 / issue #757 closure, commit 4 of 11).
@@ -226,6 +262,18 @@ const (
 	// dashboard selector `kind_prefix=esm.` filter
 	// ESM-specific DLQs without losing cross-source aggregates.
 	ESMDrainDLQ = "esm.drain.dlq"
+
+	// ESMFilterError — mirrors TriggerFilterError. Emitted from
+	// pkg/sched/dispatch_triggers.go when the per-record
+	// FilterCriteria evaluation rejects a record's path (the
+	// filter was authored in an unsupported form like
+	// "$.items[?(...)]"). The audit row is operator-debug only
+	// — the record is still Ack'd at the broker (a re-poll
+	// would loop on the same parse error). No trigger.*
+	// counterpart to "esm.source.created" or "esm.source.deleted"
+	// exists for the FILTER-error case; the dual-emit pattern
+	// applies to TriggerFilterError → ESMFilterError ONLY.
+	ESMFilterError = "esm.filter.error"
 )
 
 // ESMSourceCreatedEvent is the typed payload for ESMSourceCreated.
@@ -322,12 +370,36 @@ func (e ESMDrainDLQEvent) At() time.Time {
 func (ESMDrainDLQEvent) Subject() *string          { return nil }
 func (e ESMDrainDLQEvent) Payload() map[string]any { return eventPayload(e) }
 
+// ESMFilterErrorEvent is the typed payload for ESMFilterError
+// (dual-emit counterpart to TriggerFilterErrorEvent). The
+// field names mirror the SourceKind/EmitAt convention used by
+// the other ESM events; the JSON tags stay `kind` / `at` for
+// wire compatibility with existing consumers.
+type ESMFilterErrorEvent struct {
+	TriggerID  string    `json:"trigger_id"`
+	AppID      string    `json:"app_id"`
+	SourceKind string    `json:"kind"`
+	Error      string    `json:"error"`
+	EmitAt     time.Time `json:"at"`
+}
+
+func (ESMFilterErrorEvent) Kind() string { return ESMFilterError }
+func (e ESMFilterErrorEvent) At() time.Time {
+	if e.EmitAt.IsZero() {
+		return time.Now()
+	}
+	return e.EmitAt
+}
+func (ESMFilterErrorEvent) Subject() *string          { return nil }
+func (e ESMFilterErrorEvent) Payload() map[string]any { return eventPayload(e) }
+
 // ESM (compile-time) — every ESM event satisfies WakeEvent.
 var (
 	_ WakeEvent = ESMSourceCreatedEvent{}
 	_ WakeEvent = ESMSourceDeletedEvent{}
 	_ WakeEvent = ESMPollFailedEvent{}
 	_ WakeEvent = ESMDrainDLQEvent{}
+	_ WakeEvent = ESMFilterErrorEvent{}
 )
 
 // eventPayload marshals the typed struct into map[string]any so

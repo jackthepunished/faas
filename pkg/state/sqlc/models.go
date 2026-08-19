@@ -951,6 +951,7 @@ type Trigger struct {
 	Source               pgtype.Text
 	PayloadMaxBytes      int32
 	BrokerPoisonStrategy string
+	FilterCriteria       []byte
 	CreatedAt            pgtype.Timestamptz
 	UpdatedAt            pgtype.Timestamptz
 }

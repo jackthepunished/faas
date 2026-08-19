@@ -1249,16 +1249,27 @@ returning id, account_id, app_id, kind, slug, enabled, config,
 delete from triggers where id = $1 and app_id = $2;
 
 -- name: TriggerByID :one
+-- ADR-118 / commit 6 of the issue #757 mega-PR: filter_criteria
+-- is projected so pgstore.TriggerByID returns the same shape as
+-- ListEnabledTriggers (sqlc generates identical column sets as
+-- the same Go struct; projections that omit a column produce a
+-- distinct Row type that breaks the existing pgstore return
+-- type).
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where id = $1;
 
 -- name: ListTriggersForApp :many
+-- Same rationale as TriggerByID — full Trigger projection so
+-- sqlc's generated Row type matches the existing pgstore return
+-- type. (commit 6 of the issue #757 mega-PR.)
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where app_id = $1 order by created_at desc;
 
@@ -1267,9 +1278,14 @@ from triggers where app_id = $1 order by created_at desc;
 -- query is unfiltered by kind because the dispatch tick reads
 -- triggers.enabled = true regardless of kind and dispatches via the
 -- per-kind poller (pkg/sched/poller.go).
+--
+-- ADR-118 / issue #757: filter_criteria is included so the dispatch
+-- tick can evaluate per-record predicates without a second round-trip
+-- (the column is JSONB; empty/null means "no filter").
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where enabled = true;
 

@@ -3,10 +3,12 @@
 //
 // runTriggerTick is the sibling of runCronTick (loop.go:1808):
 // 1-second cadence, walks every enabled trigger, polls its broker
-// adapter, claims the per-record FSM rows via ClaimTriggerRecords
-// (FOR UPDATE SKIP LOCKED), batches the records (size + 6MB cap),
-// posts the batch envelope to the gateway, parses per-record
-// status, and transitions trigger_records rows through the FSM.
+// adapter, evaluates per-record FilterCriteria (ADR-118 / commit 6
+// of the issue #757 mega-PR), claims the per-record FSM rows via
+// ClaimTriggerRecords (FOR UPDATE SKIP LOCKED), batches the records
+// (size + 6MB cap), posts the batch envelope to the gateway,
+// parses per-record status, and transitions trigger_records rows
+// through the FSM.
 //
 // FSM per record:
 //
@@ -14,6 +16,35 @@
 //	                              ── retry ─▶ retry (next_fire_at=future)
 //	                                            └▶ attempts >= max ─▶ dead_letter
 //	                              ── poison_record ─▶ dead_letter
+//
+// FilterCriteria evaluation (commit 6):
+//
+//	For each polled SourceRecord, decode the trigger's
+//	triggers.filter_criteria JSONB column into a *FilterCriteria
+//	(closed-vocab per pkg/gregalemanifest + pkg/api) and call
+//	FilterCriteria.Match(payload, headers). Three outcomes:
+//
+//	  - match == true:  record flows through InsertTriggerRecord
+//	                    + ClaimTriggerRecords as today.
+//	  - match == false: record is Ack'd at the broker (so the
+//	                    offset is committed and the message is
+//	                    NOT redelivered) and DROPPED — no
+//	                    trigger_records row, no audit row. The
+//	                    skip is silent by design (ADR-118
+//	                    §"Skip audit policy"); the customer
+//	                    author of the filter chose this path.
+//	  - match error:    record is Ack'd (the parse error is in
+//	                    the filter AUTHOR not the record;
+//	                    redelivery would loop on the same error)
+//	                    and a single trigger.filter_error audit
+//	                    row is emitted (operator-debug,
+//	                    NOT customer-facing).
+//
+// Why Ack + drop (not Nack + retry): a filter that
+// always-rejects the same record is a customer-side misconfig,
+// not a transient failure. Nack would loop forever; Ack commits
+// the offset and lets the customer fix the filter without the
+// broker replaying the record.
 //
 // Concurrency: the Loop's mutex protects the cron tick. We use
 // the same mutex here so two ticks don't race on the same
@@ -24,6 +55,16 @@
 // per pkg/sched/rate_limit.go:113-150. Deny path lifts to
 // trigger.dlq audit + dead_letter row per record (NOT a transient
 // 429 like the wake path — triggers retry on next dispatch tick).
+//
+// Dual-emit (ADR-118 §"Audit vocabulary bridging"):
+//
+//	Every trigger.* event emitted from this file is paired with
+//	the corresponding esm.* operator alias. The two rows land
+//	in the events table with identical payload; consumers
+//	that want one timeline can join on (trigger_id, record_id,
+//	at). Adding a new dual-emit pair requires (a) a
+//	trigger.* event + (b) an esm.* event in pkg/events, both
+//	emitted from the same call site.
 
 package sched
 
@@ -266,6 +307,61 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		return nil
 	}
 
+	// 3.5. Filter evaluation (ADR-118 / commit 6 of the issue
+	// #757 mega-PR). For each polled record, evaluate the
+	// trigger's filter_criteria against (payload, headers). A
+	// record that doesn't match is Ack'd at the broker (so the
+	// offset is committed and the message is NOT redelivered)
+	// and dropped from the batch — no trigger_records row, no
+	// audit row. A record whose filter errors out (parse error
+	// on a malformed path) is also Ack'd but emits a single
+	// trigger.filter_error audit row so operators can see the
+	// author-side misconfig.
+	//
+	// Why before the rate-limit gate: a record that the customer
+	// explicitly excluded via filter should NOT consume a wake
+	// slot from the rate-limit bucket. The gate sees only the
+	// filtered subset.
+	if t.FilterCriteria != nil && len(t.FilterCriteria) > 0 {
+		filtered, filterErrCount, filterErr := l.filterBatch(ctx, t, batch)
+		if filterErr != nil {
+			// Catastrophic filter decode error (the JSONB on
+			// the trigger row is malformed). Don't dispatch
+			// any records for this trigger this tick — a
+			// half-wired filter would dispatch some records
+			// and skip others, which is silently confusing.
+			// Emit one audit row + return; the next tick
+			// retries the decode (the customer can fix the
+			// column in apid's updateTrigger path).
+			l.log.Warn("sched trigger tick: filter decode",
+				"trigger_id", t.ID.String(),
+				"err", filterErr)
+			l.emitAudit(ctx, events.TriggerFilterErrorEvent{
+				TriggerID: t.ID.String(),
+				AppID:     t.AppID.String(),
+				Error:     filterErr.Error(),
+			})
+			_ = poller.Ack(ctx, t, batchItemIDs(batch))
+			return nil
+		}
+		if filterErrCount > 0 {
+			// Per-record filter parse error (one of the paths
+			// in the tree is malformed — not the whole tree).
+			// One audit row summarises the count; the
+			// dispatcher already Ack'd the offending records
+			// in filterBatch.
+			l.emitAudit(ctx, events.TriggerFilterErrorEvent{
+				TriggerID: t.ID.String(),
+				AppID:     t.AppID.String(),
+				Error:     fmt.Sprintf("%d record(s) had a malformed filter clause; see dispatch logs", filterErrCount),
+			})
+		}
+		batch = filtered
+		if len(batch) == 0 {
+			return nil
+		}
+	}
+
 	// 4. Rate-limit gate. Deny → dead_letter(reason='rate_limited').
 	// review finding #4: the plan argument was hardcoded to api.PlanFree,
 	// which collapsed Hobby/Pro/Scale customers to the Free bucket's
@@ -446,13 +542,28 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				l.log.Warn("sched trigger tick: mark succeeded",
 					"id", id, "err", err)
 			}
-			// Audit: trigger.fired per succeeded record.
-			l.emitAudit(ctx, events.TriggerFiredEvent{
-				TriggerID: t.ID.String(),
-				RecordID:  id,
-				AppID:     t.AppID.String(),
-				FiredAt:   time.Now(),
-			})
+			// Audit: trigger.fired per succeeded record,
+			// dual-emitted as esm.source.created for
+			// operators on the ESM panel selector
+			// (kind_prefix=esm.*). The two events land in
+			// the events table with identical payload;
+			// consumers JOIN on (trigger_id, record_id, At).
+			l.emitAuditDual(
+				ctx,
+				events.TriggerFiredEvent{
+					TriggerID: t.ID.String(),
+					RecordID:  id,
+					AppID:     t.AppID.String(),
+					FiredAt:   time.Now(),
+				},
+				events.ESMSourceCreatedEvent{
+					TriggerID:  t.ID.String(),
+					AppID:      t.AppID.String(),
+					SourceKind: t.Kind,
+					EmitAt:     time.Now(),
+				},
+				t.ID.String(), t.AppID.String(), t.Kind,
+			)
 		}
 		if err := poller.Ack(ctx, t, succeedItems); err != nil {
 			l.log.Warn("sched trigger tick: poller ack",
@@ -470,13 +581,26 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				l.log.Warn("sched trigger tick: mark retry",
 					"id", id, "err", err)
 			}
-			l.emitAudit(ctx, events.TriggerRetryEvent{
-				TriggerID:  t.ID.String(),
-				RecordID:   id,
-				AppID:      t.AppID.String(),
-				Attempt:    int(attempts),
-				NextFireAt: nextFireAt,
-			})
+			// Audit: trigger.retry, dual-emitted as
+			// esm.poll.failed for the operator alias.
+			l.emitAuditDual(
+				ctx,
+				events.TriggerRetryEvent{
+					TriggerID:  t.ID.String(),
+					RecordID:   id,
+					AppID:      t.AppID.String(),
+					Attempt:    int(attempts),
+					NextFireAt: nextFireAt,
+				},
+				events.ESMPollFailedEvent{
+					TriggerID:  t.ID.String(),
+					AppID:      t.AppID.String(),
+					SourceKind: t.Kind,
+					Error:      fmt.Sprintf("retry: attempt=%d next_fire_at=%s", attempts, nextFireAt.Format(time.RFC3339)),
+					EmitAt:     time.Now(),
+				},
+				t.ID.String(), t.AppID.String(), t.Kind,
+			)
 		}
 		if err := poller.Nack(ctx, t, retryItems, triggerReasonBrokerError); err != nil {
 			l.log.Warn("sched trigger tick: poller nack",
@@ -492,21 +616,38 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				l.log.Warn("sched trigger tick: mark dlq",
 					"id", id, "err", err)
 			}
-			l.emitAudit(ctx, events.TriggerDLQEvent{
-				TriggerID: t.ID.String(),
-				RecordID:  id,
-				AppID:     t.AppID.String(),
-				Reason:    reason,
-				Attempts:  int(attempts),
-				LastError: lastErr,
-			})
+			// Audit: trigger.dlq, dual-emitted as
+			// esm.drain.dlq for the operator alias.
+			l.emitAuditDual(
+				ctx,
+				events.TriggerDLQEvent{
+					TriggerID: t.ID.String(),
+					RecordID:  id,
+					AppID:     t.AppID.String(),
+					Reason:    reason,
+					Attempts:  int(attempts),
+					LastError: lastErr,
+				},
+				events.ESMDrainDLQEvent{
+					TriggerID: t.ID.String(),
+					RecordID:  id,
+					AppID:     t.AppID.String(),
+					Reason:    reason,
+					EmitAt:    time.Now(),
+				},
+				t.ID.String(), t.AppID.String(), t.Kind,
+			)
 		}
 		if err := poller.Nack(ctx, t, dlqItems, triggerReasonPoisonRecord); err != nil {
 			l.log.Warn("sched trigger tick: poller nack (dlq)",
 				"trigger_id", t.ID.String(), "err", err)
 		}
 	}
-	// Audit: trigger.fired.batch — aggregated counts.
+	// Audit: trigger.fired.batch — aggregated counts. No ESM
+	// alias: the per-batch aggregate is a trigger.*-only
+	// concept (operators reading the ESM timeline filter by
+	// record_id, not by batch_id). ADR-118 §"Asymmetric kind
+	// mapping" pins this exception explicitly.
 	l.emitAudit(ctx, events.TriggerFiredBatchEvent{
 		TriggerID:      t.ID.String(),
 		BatchSize:      len(batch),
@@ -869,4 +1010,127 @@ func (l *Loop) emitAudit(ctx context.Context, ev events.WakeEvent) {
 		return
 	}
 	l.audit.Emit(ctx, ev.Kind(), nil, ev.Payload())
+}
+
+// emitAuditDual emits BOTH a trigger.* event AND its esm.*
+// operator alias (ADR-118 §"Audit vocabulary bridging"). The
+// pair is fixed at compile time; adding a new pair requires (a)
+// a trigger.* event + (b) an esm.* event in pkg/events/trigger.go
+// + (c) a new helper here that calls Emit for both. The two
+// rows are NOT wrapped in a Postgres transaction — a crash
+// between the two emits leaves one row behind. Operators can
+// detect this by joining on (trigger_id, record_id, At) and
+// looking for rows whose pair is missing; the events table
+// doesn't enforce uniqueness on the pair.
+//
+// Callers pass the trigger_id / app_id / source_kind via the
+// typed args; the trigger.* event carries the canonical payload,
+// the esm.* event carries the operator-alias payload. The
+// SourceKind field is the trigger Kind string ("kafka", "nats",
+// ...) — the dispatch tick already has it on `t.Kind`.
+func (l *Loop) emitAuditDual(
+	ctx context.Context,
+	triggerEv, esmEv events.WakeEvent,
+	triggerID, appID, sourceKind string,
+) {
+	l.emitAudit(ctx, triggerEv)
+	l.emitAudit(ctx, esmEv)
+}
+
+// filterBatch walks the batch, evaluates FilterCriteria.Match
+// for each SourceRecord, and returns:
+//
+//   - the subset of records that MATCH (so the rest of the
+//     dispatch tick sees only the filtered set),
+//   - the count of per-record filter errors encountered
+//     (the caller emits one audit row summarising this),
+//   - a non-nil error iff the WHOLE filter tree failed to
+//     decode (the caller emits one audit row + drops the
+//     entire tick for this trigger — a half-wired filter would
+//     dispatch some records and skip others, which is silently
+//     confusing).
+//
+// Records that don't match OR hit a per-record parse error are
+// Ack'd at the broker HERE so the offset is committed and the
+// message is NOT redelivered. The dispatch tick never sees
+// them again. This is the "Ack-only-after-row-exists" guarantee
+// extended to "Ack-only-after-filter-evaluated" — a record whose
+// filter rejects it should not pile up in poller.inFlight until
+// the next tick re-polls it from the broker.
+//
+// Returns (filtered, errorCount, nil) on the common path. The
+// only path that returns a non-nil error is when the WHOLE tree
+// decode fails (the column is malformed JSON); per-record parse
+// errors are counted but do NOT propagate (they're per-record
+// and don't poison the rest of the batch).
+func (l *Loop) filterBatch(
+	ctx context.Context,
+	t sqlc.Trigger,
+	batch []SourceRecord,
+) ([]SourceRecord, int, error) {
+	if len(t.FilterCriteria) == 0 {
+		return batch, 0, nil
+	}
+	// Decode the JSONB column once per tick. The filter tree is
+	// small (< 1 KB even for rich filters); the per-record
+	// evaluation dominates the cost.
+	var fc FilterCriteria
+	if err := json.Unmarshal(t.FilterCriteria, &fc); err != nil {
+		// Catastrophic — the whole tree is malformed. Return
+		// the error so the caller drops the tick. The records
+		// are still Ack'd by the caller so the broker doesn't
+		// replay them on the next poll.
+		return nil, 0, fmt.Errorf("decode filter_criteria: %w", err)
+	}
+	if l == nil {
+		return batch, 0, nil
+	}
+	out := make([]SourceRecord, 0, len(batch))
+	errCount := 0
+	for _, rec := range batch {
+		ok, err := fc.Match(rec.Payload, rec.Headers)
+		if err != nil {
+			// Per-record parse error (e.g. an unsupported
+			// JSONPath form). Ack the record so the broker
+			// doesn't replay it; count for the audit row.
+			errCount++
+			_ = ackSingle(ctx, t, rec, l)
+			continue
+		}
+		if !ok {
+			// Filter rejected the record. Ack so the
+			// broker doesn't replay it; no audit row
+			// (the skip is silent by design — ADR-118
+			// §"Skip audit policy").
+			_ = ackSingle(ctx, t, rec, l)
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out, errCount, nil
+}
+
+// ackSingle is a thin wrapper that finds the poller for `t`
+// and Ack's `rec.ItemIdentifier`. Pulled out of filterBatch so
+// the per-record error path is one line in the hot loop. The
+// poller lookup uses the same map the dispatch tick maintains;
+// we don't cache it locally because the map mutation lives on
+// the Loop and a per-tick snapshot would race the cache
+// invalidation on enable/disable transitions.
+func ackSingle(ctx context.Context, t sqlc.Trigger, rec SourceRecord, l *Loop) error {
+	if l == nil || l.triggerPollers == nil {
+		return nil
+	}
+	poller, ok := l.triggerPollers[t.ID.String()]
+	if !ok {
+		// No poller registered yet — shouldn't happen on the
+		// first filterBatch call (dispatchOneTrigger just
+		// registered one), but a defensive nil-guard is
+		// cheap.
+		return nil
+	}
+	if poller == nil {
+		return nil
+	}
+	return poller.Ack(ctx, t, []string{rec.ItemIdentifier})
 }

@@ -26,11 +26,15 @@ package sched
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
@@ -224,5 +228,180 @@ func TestDeadLetterAll_MixedPath_SkipsOnlyMissingRows(t *testing.T) {
 	}
 	if got, want := store.marks[0], rowUUID; got != want {
 		t.Errorf("MarkTriggerRecordDeadLetter id = %q, want %q", got, want)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Commit 6 (ADR-118 / issue #757 mega-PR) — filterBatch wiring
+// ----------------------------------------------------------------------
+
+// fakePollerForFilter is the minimal triggerSource the
+// filterBatch test needs: it records every Ack call so the
+// test can assert "filter rejected the record → broker
+// Ack'd it" without standing up a real broker.
+type fakePollerForFilter struct {
+	ackCalls []string
+}
+
+func (f *fakePollerForFilter) Kind() string { return "kafka" }
+func (f *fakePollerForFilter) Poll(_ context.Context, _ sqlc.Trigger) PollResult {
+	return PollResult{}
+}
+func (f *fakePollerForFilter) Ack(_ context.Context, _ sqlc.Trigger, ids []string) error {
+	f.ackCalls = append(f.ackCalls, ids...)
+	return nil
+}
+func (f *fakePollerForFilter) Nack(_ context.Context, _ sqlc.Trigger, _ []string, _ string) error {
+	return nil
+}
+func (f *fakePollerForFilter) Close() error { return nil }
+
+// makeLoopForFilter builds a Loop with the minimal wiring for
+// filterBatch — the triggerPollers map pre-populated with a
+// fake poller so ackSingle has a target.
+func makeLoopForFilter(_ *testing.T, triggerID string, poller *fakePollerForFilter) *Loop {
+	return &Loop{
+		log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		triggerPollers: map[string]triggerSource{triggerID: poller},
+	}
+}
+
+// marshalFilter is a tiny helper to keep the test fixtures
+// readable. The JSON form is the same shape as
+// triggers.filter_criteria on the wire.
+func marshalFilter(t *testing.T, fc *FilterCriteria) []byte {
+	t.Helper()
+	b, err := json.Marshal(fc)
+	if err != nil {
+		t.Fatalf("marshal filter: %v", err)
+	}
+	return b
+}
+
+// pgtypeUUIDFromString builds a pgtype.UUID from a string id so
+// the test fixture matches the production sqlc.Trigger.ID
+// shape. dispatch_triggers.go keys the triggerPollers map on
+// t.ID.String(), so a zero UUID would silently fail every
+// ackSingle lookup.
+func pgtypeUUIDFromString(t *testing.T, s string) pgtype.UUID {
+	t.Helper()
+	u, err := uuid.Parse(s)
+	if err != nil {
+		t.Fatalf("parse uuid %q: %v", s, err)
+	}
+	var b [16]byte
+	copy(b[:], u[:])
+	return pgtype.UUID{Bytes: b, Valid: true}
+}
+
+// TestFilterBatch_MatchKeepsAckDrops verifies the happy path:
+// a record whose filter matches flows through unchanged; a
+// record whose filter rejects is Ack'd (broker commits the
+// offset) and dropped from the batch.
+func TestFilterBatch_MatchKeepsAckDrops(t *testing.T) {
+	triggerID := "00000000-0000-0000-0000-000000000001"
+	poller := &fakePollerForFilter{}
+	l := makeLoopForFilter(t, triggerID, poller)
+	t1 := sqlc.Trigger{
+		Kind: "kafka",
+		FilterCriteria: marshalFilter(t, &FilterCriteria{
+			AND: []FilterClause{
+				{Op: FilterOpEq, Field: "x-tenant", Value: json.RawMessage(`"acme"`)},
+			},
+		}),
+		ID: pgtypeUUIDFromString(t, triggerID),
+	}
+	batch := []SourceRecord{
+		{ItemIdentifier: "match-1", Payload: []byte(`{}`), Headers: map[string]string{"x-tenant": "acme"}},
+		{ItemIdentifier: "drop-1", Payload: []byte(`{}`), Headers: map[string]string{"x-tenant": "globex"}},
+	}
+	filtered, errCount, err := l.filterBatch(context.Background(), t1, batch)
+	if err != nil {
+		t.Fatalf("filterBatch err = %v, want nil", err)
+	}
+	if errCount != 0 {
+		t.Errorf("errCount = %d, want 0", errCount)
+	}
+	if got, want := len(filtered), 1; got != want {
+		t.Fatalf("filtered len = %d, want %d", got, want)
+	}
+	if got, want := filtered[0].ItemIdentifier, "match-1"; got != want {
+		t.Errorf("filtered[0].ItemIdentifier = %q, want %q", got, want)
+	}
+	if got, want := len(poller.ackCalls), 1; got != want {
+		t.Fatalf("poller.Ack call count = %d, want %d (only the dropped record should be Ack'd)", got, want)
+	}
+	if got, want := poller.ackCalls[0], "drop-1"; got != want {
+		t.Errorf("Ack'd id = %q, want %q", got, want)
+	}
+}
+
+// TestFilterBatch_PerRecordParseErrorIsCountedNotFatal verifies
+// that a record with a malformed JSONPath is Ack'd silently
+// (broker commits the offset; re-poll would loop) and the
+// error count rises by 1 — the whole batch is NOT dropped
+// because one record had a bad path.
+func TestFilterBatch_PerRecordParseErrorIsCountedNotFatal(t *testing.T) {
+	triggerID := "00000000-0000-0000-0000-000000000002"
+	poller := &fakePollerForFilter{}
+	l := makeLoopForFilter(t, triggerID, poller)
+	t1 := sqlc.Trigger{
+		Kind: "kafka",
+		FilterCriteria: marshalFilter(t, &FilterCriteria{
+			Payload: []FilterClause{
+				{Op: FilterOpJsonPath, Path: "$.items[?(@.price>100)]"}, // unsupported form
+			},
+		}),
+		ID: pgtypeUUIDFromString(t, triggerID),
+	}
+	batch := []SourceRecord{
+		{ItemIdentifier: "bad-1", Payload: []byte(`{"items": [{"price": 200}]}`)},
+	}
+	filtered, errCount, err := l.filterBatch(context.Background(), t1, batch)
+	if err != nil {
+		t.Fatalf("filterBatch err = %v, want nil (per-record error must not propagate)", err)
+	}
+	if errCount != 1 {
+		t.Errorf("errCount = %d, want 1 (one record with a malformed path)", errCount)
+	}
+	if len(filtered) != 0 {
+		t.Errorf("filtered len = %d, want 0 (the bad record was Ack'd + dropped)", len(filtered))
+	}
+	if got, want := len(poller.ackCalls), 1; got != want {
+		t.Errorf("poller.Ack call count = %d, want %d", got, want)
+	}
+}
+
+// TestFilterBatch_NilFilterPassesThrough verifies the no-filter
+// case: the batch is returned unchanged with zero work.
+func TestFilterBatch_NilFilterPassesThrough(t *testing.T) {
+	l := makeLoopForFilter(t, "trig-3", &fakePollerForFilter{})
+	t1 := sqlc.Trigger{Kind: "kafka", FilterCriteria: nil}
+	batch := []SourceRecord{
+		{ItemIdentifier: "a"},
+		{ItemIdentifier: "b"},
+	}
+	filtered, errCount, err := l.filterBatch(context.Background(), t1, batch)
+	if err != nil {
+		t.Fatalf("filterBatch err = %v", err)
+	}
+	if errCount != 0 {
+		t.Errorf("errCount = %d, want 0", errCount)
+	}
+	if got, want := len(filtered), 2; got != want {
+		t.Errorf("filtered len = %d, want %d (no filter → pass-through)", got, want)
+	}
+}
+
+// TestFilterBatch_MalformedJSONTreeIsFatal verifies the
+// catastrophic path: a malformed JSONB column on the trigger
+// row returns a non-nil error so the dispatch tick drops the
+// whole batch (half-wired filters would be silently confusing).
+func TestFilterBatch_MalformedJSONTreeIsFatal(t *testing.T) {
+	l := makeLoopForFilter(t, "trig-4", &fakePollerForFilter{})
+	t1 := sqlc.Trigger{Kind: "kafka", FilterCriteria: []byte(`{"not": valid json`)}
+	_, _, err := l.filterBatch(context.Background(), t1, []SourceRecord{{ItemIdentifier: "x"}})
+	if err == nil {
+		t.Errorf("err = nil, want non-nil (malformed JSONB column → caller drops the tick)")
 	}
 }

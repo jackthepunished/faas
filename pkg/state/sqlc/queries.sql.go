@@ -1090,6 +1090,25 @@ type CreateTriggerParams struct {
 	BrokerPoisonStrategy string
 }
 
+type CreateTriggerRow struct {
+	ID                   pgtype.UUID
+	AccountID            pgtype.UUID
+	AppID                pgtype.UUID
+	Kind                 string
+	Slug                 string
+	Enabled              bool
+	Config               []byte
+	BatchSizeMax         int32
+	BatchWindowMs        int32
+	MaxAttempts          int32
+	CronID               pgtype.UUID
+	Source               pgtype.Text
+	PayloadMaxBytes      int32
+	BrokerPoisonStrategy string
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
 // Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
 // Mirrors the cron `CreateCron` / `UpdateCron` / `DeleteCron` /
 // `CronByID` / `ListCronsForApp` shape so the apid handler can stay
@@ -1104,7 +1123,7 @@ type CreateTriggerParams struct {
 // precedent set by ADR-099 PR-C's claim_job_tasks query (issue
 // tracker 'job-task pull'): concurrent schedd replicas each claim
 // disjoint row sets with no advisory-lock plumbing.
-func (q *Queries) CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerParams) (Trigger, error) {
+func (q *Queries) CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerParams) (CreateTriggerRow, error) {
 	row := db.QueryRow(ctx, createTrigger,
 		arg.AccountID,
 		arg.AppID,
@@ -1120,7 +1139,7 @@ func (q *Queries) CreateTrigger(ctx context.Context, db DBTX, arg CreateTriggerP
 		arg.PayloadMaxBytes,
 		arg.BrokerPoisonStrategy,
 	)
-	var i Trigger
+	var i CreateTriggerRow
 	err := row.Scan(
 		&i.ID,
 		&i.AccountID,
@@ -3126,6 +3145,7 @@ const listEnabledTriggers = `-- name: ListEnabledTriggers :many
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where enabled = true
 `
@@ -3134,6 +3154,10 @@ from triggers where enabled = true
 // query is unfiltered by kind because the dispatch tick reads
 // triggers.enabled = true regardless of kind and dispatches via the
 // per-kind poller (pkg/sched/poller.go).
+//
+// ADR-118 / issue #757: filter_criteria is included so the dispatch
+// tick can evaluate per-record predicates without a second round-trip
+// (the column is JSONB; empty/null means "no filter").
 func (q *Queries) ListEnabledTriggers(ctx context.Context, db DBTX) ([]Trigger, error) {
 	rows, err := db.Query(ctx, listEnabledTriggers)
 	if err != nil {
@@ -3158,6 +3182,7 @@ func (q *Queries) ListEnabledTriggers(ctx context.Context, db DBTX) ([]Trigger, 
 			&i.Source,
 			&i.PayloadMaxBytes,
 			&i.BrokerPoisonStrategy,
+			&i.FilterCriteria,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -3770,10 +3795,14 @@ const listTriggersForApp = `-- name: ListTriggersForApp :many
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where app_id = $1 order by created_at desc
 `
 
+// Same rationale as TriggerByID — full Trigger projection so
+// sqlc's generated Row type matches the existing pgstore return
+// type. (commit 6 of the issue #757 mega-PR.)
 func (q *Queries) ListTriggersForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]Trigger, error) {
 	rows, err := db.Query(ctx, listTriggersForApp, appID)
 	if err != nil {
@@ -3798,6 +3827,7 @@ func (q *Queries) ListTriggersForApp(ctx context.Context, db DBTX, appID pgtype.
 			&i.Source,
 			&i.PayloadMaxBytes,
 			&i.BrokerPoisonStrategy,
+			&i.FilterCriteria,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -4660,10 +4690,17 @@ const triggerByID = `-- name: TriggerByID :one
 select id, account_id, app_id, kind, slug, enabled, config,
        batch_size_max, batch_window_ms, max_attempts,
        cron_id, source, payload_max_bytes, broker_poison_strategy,
+       filter_criteria,
        created_at, updated_at
 from triggers where id = $1
 `
 
+// ADR-118 / commit 6 of the issue #757 mega-PR: filter_criteria
+// is projected so pgstore.TriggerByID returns the same shape as
+// ListEnabledTriggers (sqlc generates identical column sets as
+// the same Go struct; projections that omit a column produce a
+// distinct Row type that breaks the existing pgstore return
+// type).
 func (q *Queries) TriggerByID(ctx context.Context, db DBTX, id pgtype.UUID) (Trigger, error) {
 	row := db.QueryRow(ctx, triggerByID, id)
 	var i Trigger
@@ -4682,6 +4719,7 @@ func (q *Queries) TriggerByID(ctx context.Context, db DBTX, id pgtype.UUID) (Tri
 		&i.Source,
 		&i.PayloadMaxBytes,
 		&i.BrokerPoisonStrategy,
+		&i.FilterCriteria,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -4970,7 +5008,26 @@ type UpdateTriggerParams struct {
 	BrokerPoisonStrategy string
 }
 
-func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (Trigger, error) {
+type UpdateTriggerRow struct {
+	ID                   pgtype.UUID
+	AccountID            pgtype.UUID
+	AppID                pgtype.UUID
+	Kind                 string
+	Slug                 string
+	Enabled              bool
+	Config               []byte
+	BatchSizeMax         int32
+	BatchWindowMs        int32
+	MaxAttempts          int32
+	CronID               pgtype.UUID
+	Source               pgtype.Text
+	PayloadMaxBytes      int32
+	BrokerPoisonStrategy string
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerParams) (UpdateTriggerRow, error) {
 	row := db.QueryRow(ctx, updateTrigger,
 		arg.ID,
 		arg.Enabled,
@@ -4981,7 +5038,7 @@ func (q *Queries) UpdateTrigger(ctx context.Context, db DBTX, arg UpdateTriggerP
 		arg.PayloadMaxBytes,
 		arg.BrokerPoisonStrategy,
 	)
-	var i Trigger
+	var i UpdateTriggerRow
 	err := row.Scan(
 		&i.ID,
 		&i.AccountID,
