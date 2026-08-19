@@ -2,9 +2,12 @@
 
 Drops the builderd systemd unit + example TOML + FAAS_NODE_NAME/
 FAAS_BUILDERD_ROLE drop-ins. Does NOT enable or start the daemon — the
-operator runs `systemctl enable --now faas-builderd` once the per-node
-signing key (`gregalectl node-key init`) is laid out under
-`/etc/faas/secrets/builderd/`.
+operator runs `systemctl enable --now faas-builderd` once the release
+bundle and operator-provisioned database/TLS configuration are present.
+
+The per-node CapacityReport signing key is owned by vmmd at
+`/etc/faas/secrets/vmmd/node.key`; builderd does not load a separate node
+key. Build attestations are handled by imaged's signing key.
 
 ## Drop-ins
 
