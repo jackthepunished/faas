@@ -307,6 +307,26 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		return nil
 	}
 
+	// 3.1. Broker egress accounting (ADR-118 / commit 8 of the
+	// issue #757 mega-PR). Sum the bytes the dispatcher is about
+	// to push to the broker and hand off to the BrokerAccountor
+	// (nil = noop). The actual cap is enforced at the kernel qdisc
+	// on the brokerq host interface; this counter is
+	// observability-only and feeds the schedd_esm_egress_bytes
+	// metric in commit 9. Called on the post-batch path so the
+	// filter step (3.5) hasn't yet dropped the records — the byte
+	// count reflects what the dispatcher fetched from the broker,
+	// not what survived the filter.
+	if l.brokerAccountor != nil {
+		var bytes int64
+		for _, r := range batch {
+			bytes += int64(len(r.Payload))
+		}
+		if bytes > 0 {
+			l.brokerAccountor.Account(ctx, t.ID.String(), bytes)
+		}
+	}
+
 	// 3.5. Filter evaluation (ADR-118 / commit 6 of the issue
 	// #757 mega-PR). For each polled record, evaluate the
 	// trigger's filter_criteria against (payload, headers). A
