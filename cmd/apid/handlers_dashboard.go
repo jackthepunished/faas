@@ -2002,7 +2002,7 @@ func severityOrdinal(s string) int {
 // app slug, not the GitHub owner/name).
 func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 	return dashboard.DeploymentItem{
-ID:                d.ID,
+		ID:                d.ID,
 		Status:            string(d.Status),
 		Kind:              string(d.Kind),
 		CreatedAt:         d.CreatedAt.UTC().Format(time.RFC3339),
@@ -2012,7 +2012,7 @@ ID:                d.ID,
 		ErrorWhy:          d.ErrorWhy,
 		ErrorFix:          d.ErrorFix,
 		ErrorRelevantLogs: d.ErrorRelevantLogs,
-// Issue #606 / SAFE-RELEASES-E.1: structured deployer
+		// Issue #606 / SAFE-RELEASES-E.1: structured deployer
 		// attribution surfaced on the dashboard deploy detail
 		// page. Server-stamped from the HTTP request context
 		// (cmd/apid/handlers.go::createDeployment / handlers_source_*.go
@@ -2028,11 +2028,11 @@ ID:                d.ID,
 		// the dashboard deploy detail page. nil/zero values drop
 		// out at the template layer (annotation-chip conditional)
 		// so pre-feature rows stay visually identical.
-		Reason:     d.Reason,
-		Tag:        d.Tag,
-		DeployedBy: d.DeployedBy,
-		PRNumber:   d.PRNumber,
-		RepoFullName:       repoFullNameFromSourceURL(d.SourceURL),
+		Reason:       d.Reason,
+		Tag:          d.Tag,
+		DeployedBy:   d.DeployedBy,
+		PRNumber:     d.PRNumber,
+		RepoFullName: repoFullNameFromSourceURL(d.SourceURL),
 	}
 }
 
