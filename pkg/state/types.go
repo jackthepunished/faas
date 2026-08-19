@@ -1233,6 +1233,55 @@ type Deployment struct {
 	// — the typed shape is unmarshalled lazily by the SSE
 	// handler that needs it, exactly once per connection.
 	StageState json.RawMessage `json:"stage_state,omitempty"`
+
+	// Actor columns (issue #606). Orthogonal to the human-readable
+	// `DeployedBy` text column from issue #977 / ADR-116 (PR #984):
+	// that column carries the resolved name for the dashboard
+	// ("Poyraz Küçükarslan"), this group carries the
+	// machine-readable attribution needed for SOC 2 CC7.2 / GDPR
+	// ("who deployed v3 of app X at 14:32?"). Migration 00305.
+	//
+	//   DeployedByUserID  — UUID FK to accounts(id). Nullable:
+	//                       (a) anonymous / unauthenticated CLI
+	//                       deploys predate the FK (PR-D cluster,
+	//                       issue #879 PR-D); (b) GitHub-push
+	//                       deploys are not attributable to a
+	//                       local Gregale account. The dashboard
+	//                       renders the resolved name via JOIN.
+	//                       ON DELETE SET NULL on the FK so a
+	//                       GDPR-erased account keeps the row
+	//                       but nulls the attribution.
+	//   DeployedVia       — closed-set: 'api' | 'cli' |
+	//                       'dashboard' | 'github' | 'operator'.
+	//                       NOT NULL DEFAULT 'api' so pre-feature
+	//                       rows stay valid without a backfill
+	//                       (CHECK enforces the vocabulary,
+	//                       migration 00305). The CLI sends 'cli';
+	//                       the dashboard sends 'dashboard';
+	//                       githubd sends 'github'; the API
+	//                       surfaces 'api' by default; the
+	//                       `gregale operator ...` subcommands
+	//                       surface 'operator'.
+	//   DeployedFromIP    — INET, nullable. Stamped from
+	//                       r.RemoteAddr via the same loopback+XFF
+	//                       trust contract the auth-limit bucket
+	//                       uses (pkg/middleware.ClientIP). The
+	//                       column is observability data, not a
+	//                       security gate — the trust contract is
+	//                       documented at the apid handler that
+	//                       stamps it (PR-E1.2).
+	//   PusherLogin       — TEXT, nullable. Distinct from
+	//                       `DeployedBy` (issue #977): that
+	//                       carries the resolved human-readable
+	//                       name, this carries the raw GitHub
+	//                       login string (e.g. `poyrazK`) so the
+	//                       audit reader can disambiguate a
+	//                       renamed / deleted GitHub user from a
+	//                       stale `deployed_by` label.
+	DeployedByUserID string `json:"deployed_by_user_id,omitempty"`
+	DeployedVia      string `json:"deployed_via,omitempty"`
+	DeployedFromIP   string `json:"deployed_from_ip,omitempty"`
+	PusherLogin      string `json:"pusher_login,omitempty"`
 }
 
 // StageState is the typed view of the

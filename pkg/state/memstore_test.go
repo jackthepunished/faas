@@ -5285,6 +5285,86 @@ func TestMemStoreAppendDeploymentStage(t *testing.T) {
 	// returns ErrNotFound (programming-error guard).
 	if _, err := s.CloseDeploymentStage(ctx, dep2.ID, StageSourceDownload, now); !errors.Is(err, ErrNotFound) {
 		t.Errorf("CloseDeploymentStage with wrong name: expected ErrNotFound, got %v", err)
+}
+
+// TestMemStore_DeploymentActorRoundtrip (issue #606) pins the
+// four actor-attribution fields on the in-memory Deployment shape.
+// MemStore stores the Deployment struct directly
+// (m.deployments[d.ID] = d), so the "round-trip" is a write+read
+// of the struct fields themselves — the closed-set CHECK and FK
+// are DB-only and not exercised here. Mirrors the MemStore half
+// of the PR #984 annotation round-trip coverage (the PgStore
+// counterpart at TestPg_DeploymentActorRoundtrip covers the
+// DB-side CHECK + FK contract).
+func TestMemStore_DeploymentActorRoundtrip(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	app, err := m.CreateApp(ctx, App{
+		AccountID: "acct-actor", Slug: "actor-mem", Type: AppTypeApp,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// 1. Full payload — the four actor fields round-trip cleanly
+	//    through the in-memory map.
+	d, err := m.CreateDeployment(ctx, Deployment{
+		AppID:            app.ID,
+		ImageDigest:      "sha256:actor-mem",
+		Kind:             DeploymentKindGitHub,
+		Status:           DeployPending,
+		DeployedByUserID: "11111111-1111-1111-1111-111111111111",
+		DeployedVia:      "github",
+		DeployedFromIP:   "203.0.113.42",
+		PusherLogin:      "octocat",
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	if d.DeployedByUserID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("deployed_by_user_id = %q, want %q", d.DeployedByUserID, "11111111-1111-1111-1111-111111111111")
+	}
+	if d.DeployedVia != "github" {
+		t.Errorf("deployed_via = %q, want %q", d.DeployedVia, "github")
+	}
+	if d.DeployedFromIP != "203.0.113.42" {
+		t.Errorf("deployed_from_ip = %q, want %q", d.DeployedFromIP, "203.0.113.42")
+	}
+	if d.PusherLogin != "octocat" {
+		t.Errorf("pusher_login = %q, want %q", d.PusherLogin, "octocat")
+	}
+
+	// 2. Zero payload — every field collapses to its Go zero,
+	//    including DeployedVia="". The Go-zero is the
+	//    MemStore-side analogue of the pgstore nullif()/coalesce()
+	//    chain (which produces "" on the read side via
+	//    coalesce(deployed_via, 'api') + scanDeploymentInto's
+	//    plain string destination). The PgStore test asserts
+	//    the deployed_via='api' fallback; here we only assert
+	//    the in-memory shape stays consistent.
+	dEmpty, err := m.CreateDeployment(ctx, Deployment{
+		AppID:       app.ID,
+		ImageDigest: "sha256:actor-mem-empty",
+		Kind:        DeploymentKindImage,
+		Status:      DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment(empty): %v", err)
+	}
+	if dEmpty.DeployedByUserID != "" {
+		t.Errorf("empty deployed_by_user_id = %q, want \"\"", dEmpty.DeployedByUserID)
+	}
+	if dEmpty.DeployedVia != "" {
+		t.Errorf("empty deployed_via = %q, want \"\" (MemStore does not apply the coalesce('api') fallback)", dEmpty.DeployedVia)
+	}
+	if dEmpty.DeployedFromIP != "" {
+		t.Errorf("empty deployed_from_ip = %q, want \"\"", dEmpty.DeployedFromIP)
+	}
+	if dEmpty.PusherLogin != "" {
+		t.Errorf("empty pusher_login = %q, want \"\"", dEmpty.PusherLogin)
+	}
+}
 	}
 }
 
