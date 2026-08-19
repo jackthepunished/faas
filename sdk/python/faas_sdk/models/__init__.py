@@ -353,6 +353,7 @@ from .raise_overage_cap_request import RaiseOverageCapRequest
 from .rekey_progress import RekeyProgress
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
+from .rollback_request import RollbackRequest
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
 from .rotate_app_secret_request import RotateAppSecretRequest
 from .rotate_app_secret_response import RotateAppSecretResponse
@@ -808,6 +809,7 @@ __all__ = (
     "RekeyProgress",
     "RenameAppRequest",
     "RepoResponse",
+    "RollbackRequest",
     "RotateAlertRuleSecretResponse",
     "RotateAppSecretRequest",
     "RotateAppSecretResponse",

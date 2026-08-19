@@ -1383,6 +1383,13 @@ func planMaxFor(acct state.Account) int {
 // Implemented as a synchronous status swap; imaged/schedd react via
 // pg_notify and re-prime on their side. The previous "live" deployment is
 // marked superseded; the rolled-back one moves from superseded → live.
+//
+// SAFE-RELEASES-G (issue #976) adds an optional request body field
+// target_deployment_id. When set, the handler validates that the named
+// deployment (a) belongs to this app and (b) has status='superseded', then
+// promotes it. When omitted, the behaviour is unchanged — rollback to the
+// most-recent superseded deployment. The audit emit carries a `mode` field
+// so the dashboard can render "latest" vs "specific" differently.
 func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
@@ -1393,11 +1400,66 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 		s.notFound(w, "no deployments")
 		return
 	}
-	target, err := s.store.LatestSupersededDeployment(r.Context(), app.ID)
-	if err != nil {
-		api.WriteProblem(w, api.ErrNoRollbackTarget())
-		return
+
+	// SAFE-RELEASES-G: optionally target a specific deployment by id.
+	// Body is optional (legacy callers POST without a body); decodeJSON
+	// returns an error on malformed input which we treat as 400, but an
+	// empty body is fine (Decodable zero-value + no error).
+	var req api.RollbackRequest
+	if r.ContentLength != 0 {
+		if err := decodeJSON(r, &req); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid rollback request", err.Error()))
+			return
+		}
 	}
+
+	var (
+		target state.Deployment
+		mode   = "latest_superseded"
+	)
+	if req.TargetDeploymentID != nil && *req.TargetDeploymentID != "" {
+		mode = "explicit"
+		t, err := s.store.GetDeploymentByIDScopedToSuperseded(r.Context(), app.ID, *req.TargetDeploymentID)
+		if err != nil {
+			switch {
+			case errors.Is(err, state.ErrNoRollbackTarget):
+				api.WriteProblem(w, api.ErrRollbackTargetNotFound(
+					fmt.Sprintf("no superseded deployment with id %q belongs to app %q", *req.TargetDeploymentID, app.ID)))
+			case errors.Is(err, state.ErrRollbackTargetAlreadyLive):
+				api.WriteProblem(w, api.ErrRollbackTargetAlreadyLive(
+					fmt.Sprintf("deployment %q exists but is not in 'superseded' state; rollback to current live deployment is rejected", *req.TargetDeploymentID)))
+			default:
+				api.WriteProblem(w, api.ErrCapacity(fmt.Sprintf("lookup rollback target: %v", err)))
+			}
+			return
+		}
+		target = t
+	} else {
+		// Legacy path: most-recent superseded deployment.
+		t, err := s.store.LatestSupersededDeployment(r.Context(), app.ID)
+		if err != nil {
+			api.WriteProblem(w, api.ErrNoRollbackTarget())
+			return
+		}
+		target = t
+	}
+
+	// NOTE: SAFE-RELEASES-G deliberately does NOT add a "snapshot must
+	// exist" gate here. Per ADR-005 "cold boot must always work": if the
+	// rollback target's snapshot is missing (e.g. retention sweep ran,
+	// FC upgrade marked it stale, or it never had one), the wake path
+	// will cold-boot from the deployment's rootfs. Rejecting the
+	// rollback up-front would block a valid operator action and
+	// contradict the spec invariant "An app always has a live snapshot
+	// OR a cold-bootable rootfs — never neither" (CLAUDE.md §Invariants).
+	//
+	// The early-PR draft of this code did gate on HasSnapshotHistory +
+	// LatestSnapshot; /code-review medium (PR #979) flagged that the
+	// gate conflates "all snapshots stale (FC upgrade per ADR-005)" with
+	// "snapshot GC'd", wrongly blocking the rollback on stale scenarios
+	// where cold-boot is the intended fallback.
+
 	if err := s.store.MarkDeploymentSuperseded(r.Context(), current.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not supersede current"))
 		return
@@ -1430,7 +1492,7 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	_ = s.notif.Notify(r.Context(), db.NotifyDeploymentChanged,
 		fmt.Sprintf(`{"kind":"superseded","status":"superseded","app_id":"%s","deployment_id":"%s","to":"%s"}`,
 			app.ID, current.ID, current.ID))
-	s.log.Info("app rolled back", "app", app.ID, "from", current.ID, "to", target.ID, "account", acct.ID)
+	s.log.Info("app rolled back", "app", app.ID, "from", current.ID, "to", target.ID, "account", acct.ID, "mode", mode)
 	// IAM-4 (issue #291): record the rollback so an operator can
 	// answer "when did this app get rolled back, and to which
 	// deployment?" without joining the gdpr ledger. data.from
@@ -1438,10 +1500,15 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	// deployment_id promoted to live. The pg_notify emit above
 	// (lines 460+) carries the same ids for the live-system
 	// listener; the audit row is the read-only counterpart.
+	// SAFE-RELEASES-G: `mode` is the selector ("latest_superseded" vs
+	// "explicit") so a future audit filter can distinguish "operator
+	// accepted the auto-rollback to most-recent" from "operator pinned
+	// to a specific historical deployment".
 	s.audit.Emit(r.Context(), "app.rolled_back", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"from":   current.ID,
 		"to":     target.ID,
+		"mode":   mode,
 	})
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(target, app))
 }

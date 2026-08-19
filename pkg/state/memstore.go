@@ -3999,6 +3999,40 @@ func (m *MemStore) LatestSupersededDeployment(_ context.Context, appID string) (
 	return latest, nil
 }
 
+// GetDeploymentByIDScopedToSuperseded mirrors PgStore.GetDeploymentByIDScopedToSuperseded.
+// Returns the deployment only if it belongs to appID AND has status=DeploySuperseded.
+// Returns ErrNoRollbackTarget if the row is missing or belongs to a different app;
+// ErrRollbackTargetAlreadyLive if the row exists but is not superseded. SAFE-RELEASES-G.
+func (m *MemStore) GetDeploymentByIDScopedToSuperseded(_ context.Context, appID, deploymentID string) (Deployment, error) {
+	if appID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty appID")
+	}
+	if deploymentID == "" {
+		return Deployment{}, fmt.Errorf("state: get deployment by id scoped to superseded: empty deploymentID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[deploymentID]
+	if !ok || d.AppID != appID {
+		return Deployment{}, fmt.Errorf("state: rollback target %q for app %q: %w", deploymentID, appID, ErrNoRollbackTarget)
+	}
+	if d.Status != DeploySuperseded {
+		return Deployment{}, fmt.Errorf("state: rollback target %q for app %q has status %q: %w",
+			deploymentID, appID, d.Status, ErrRollbackTargetAlreadyLive)
+	}
+	return d, nil
+}
+
+// HasSnapshotHistory always returns (false, nil) for the in-process
+// MemStore — the store doesn't model snapshot retention, so the
+// snapshot-GC race check is a no-op against MemStore. This preserves
+// the legacy happy-path test semantics (no seeded snapshot = check
+// skipped) without leaking test-only affordances into the production
+// PgStore path. SAFE-RELEASES-G.
+func (m *MemStore) HasSnapshotHistory(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
 // ListDeploymentsForApp mirrors PgStore.ListDeploymentsForApp: `limit <= 0`
 // means "no row cap" (every remaining row after offset). F-10: see PgStore
 // doc for the asymmetry that this version already conformed to.

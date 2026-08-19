@@ -469,6 +469,19 @@ const (
 	// with the same code. ADR-038 §Consequences Compatibility.
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"
+	// CodeRollbackTargetNotFound is returned when the caller passes an
+	// explicit target_deployment_id that doesn't match any deployment of
+	// this app (or doesn't exist at all). Distinct from
+	// CodeNoRollbackTarget (no superseded deployment exists at all) so
+	// the CLI can render different remediation: "wrong id" vs "deploy
+	// twice first". SAFE-RELEASES-G (issue #976).
+	CodeRollbackTargetNotFound = "rollback_target_not_found"
+	// CodeRollbackTargetAlreadyLive is returned when the caller passes
+	// an explicit target_deployment_id that exists but has status !=
+	// 'superseded' (e.g. status='live' — caller is asking to rollback
+	// to the already-current deployment). Rejected explicitly rather
+	// than silently no-op'd. SAFE-RELEASES-G.
+	CodeRollbackTargetAlreadyLive = "rollback_target_already_live"
 	// CodeDeploySignatureInvalid is returned by apid when the
 	// customer's OCI image deploy is rejected at the accept-time
 	// signature-enforcement gate (issue #472 / ADR-054). Three
@@ -2303,6 +2316,32 @@ func ErrNoRollbackTarget() *Problem {
 	return NewProblem(http.StatusConflict, CodeNoRollbackTarget,
 		"No previous deployment",
 		"there's no superseded deployment to roll back to; deploy at least twice.").
+		WithDocs(docsBase + "/deploys#rollback")
+}
+
+// ErrRollbackTargetNotFound is returned by POST /v1/apps/{slug}/rollback when
+// the caller passes an explicit target_deployment_id (SAFE-RELEASES-G) that
+// does not match any deployment of this app, or does not exist. The detail
+// names the bad id so the CLI can echo it back. 404 (not 409) because the
+// resource the caller asked for genuinely doesn't exist — distinct from
+// CodeNoRollbackTarget (409: "no superseded deployment exists at all").
+func ErrRollbackTargetNotFound(detail string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeRollbackTargetNotFound,
+		"Rollback target not found",
+		detail).
+		WithDocs(docsBase + "/deploys#rollback")
+}
+
+// ErrRollbackTargetAlreadyLive is returned when the caller passes an
+// explicit target_deployment_id that exists but has status != 'superseded'
+// (most commonly status='live'). Caller asked to "rollback" to the
+// already-current deployment. Rejected explicitly rather than silently
+// no-op'd per the SAFE-RELEASES-G plan. 409 because the request is
+// well-formed but cannot proceed in current state.
+func ErrRollbackTargetAlreadyLive(detail string) *Problem {
+	return NewProblem(http.StatusConflict, CodeRollbackTargetAlreadyLive,
+		"Rollback target is already live",
+		detail).
 		WithDocs(docsBase + "/deploys#rollback")
 }
 
