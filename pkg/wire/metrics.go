@@ -14,6 +14,7 @@
 package wire
 
 import (
+	"errors"
 	"math"
 	"net/http"
 	"strconv"
@@ -5671,4 +5672,29 @@ func (m *OpsMetrics) ObserveESMLag(source, shard string, lagSeconds float64) {
 		shard = "_agg"
 	}
 	m.esmLagSeconds.WithLabelValues(source, shard).Observe(lagSeconds)
+}
+
+// ESMPollCounterForTest returns the pre-instantiated Prometheus
+// counter child for (source, outcome). Test-only accessor (lives in
+// metrics.go because the closed-set pre-instantiation is internal
+// to wire). Returns an error if the requested label pair was not
+// pre-instantiated by NewOpsMetrics (the dispatcher uses the closed
+// vocab so out-of-vocab lookups are a code-path regression).
+//
+// Added for PR #993 / issue #757 review MED-2 regression test:
+// pkg/sched/dispatch_triggers_test.go::TestObserveESM_ForwardsToOpsMetrics.
+func (m *OpsMetrics) ESMPollCounterForTest(source, outcome string) (prometheus.Counter, error) {
+	if m == nil || m.esmPollsTotal == nil {
+		return nil, errors.New("OpsMetrics.esmPollsTotal not initialised")
+	}
+	return m.esmPollsTotal.GetMetricWithLabelValues(source, outcome)
+}
+
+// ESMRecordsCounterForTest returns the pre-instantiated Prometheus
+// counter child for source. Mirrors ESMPollCounterForTest.
+func (m *OpsMetrics) ESMRecordsCounterForTest(source string) (prometheus.Counter, error) {
+	if m == nil || m.esmRecordsConsumedTotal == nil {
+		return nil, errors.New("OpsMetrics.esmRecordsConsumedTotal not initialised")
+	}
+	return m.esmRecordsConsumedTotal.GetMetricWithLabelValues(source)
 }

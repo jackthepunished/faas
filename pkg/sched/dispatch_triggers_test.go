@@ -35,8 +35,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // fakeDeadLetterStore is a minimal storeLike for the deadLetterAll
@@ -478,4 +482,116 @@ func equalSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestShardKeyFor covers MED-2 (PR #993 / issue #757 review) shard
+// extraction logic — the per-record lag metric's source/shard label
+// pair. The dashboard reader groups lag by shard; a missing-key
+// record collapses to "_agg" so the closed-set pre-instantiation in
+// wire.NewOpsMetrics doesn't blow up cardinality. The 32-byte cap
+// mirrors the wire-side guard.
+func TestShardKeyFor(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  SourceRecord
+		kind api.TriggerKind
+		want string
+	}{
+		{
+			name: "kafka_partition_int",
+			rec:  SourceRecord{Metadata: map[string]any{"partition": 3}},
+			kind: api.TriggerKindKafka,
+			want: "3",
+		},
+		{
+			name: "kafka_partition_missing_collapses",
+			rec:  SourceRecord{Metadata: map[string]any{}},
+			kind: api.TriggerKindKafka,
+			want: "_agg",
+		},
+		{
+			name: "nats_stream",
+			rec:  SourceRecord{Metadata: map[string]any{"stream": "events"}},
+			kind: api.TriggerKindNATS,
+			want: "events",
+		},
+		{
+			name: "unknown_kind_collapses",
+			rec:  SourceRecord{Metadata: map[string]any{"partition": 0}},
+			kind: api.TriggerKindQueue,
+			want: "_agg",
+		},
+		{
+			name: "overlong_key_collapses",
+			rec:  SourceRecord{Metadata: map[string]any{"partition": "this-string-is-far-longer-than-thirty-two-chars"}},
+			kind: api.TriggerKindKafka,
+			want: "_agg",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shardKeyFor(tc.rec, string(tc.kind)); got != tc.want {
+				t.Errorf("shardKeyFor = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestObserveESM_NilOpsIsNoop is the MED-2 nil-safety gate. The
+// dispatch hot path guards against a Loop with l.ops == nil
+// (production always sets it via WithOpsMetrics, but tests can
+// construct a bare Loop). Each wrapper must silently no-op.
+func TestObserveESM_NilOpsIsNoop(t *testing.T) {
+	l := &Loop{}
+	l.observeESMPoll("kafka", wire.ESMPollOutcomeSuccess)
+	l.observeESMRecords("kafka", 5)
+	l.observeESMLag("kafka", "0", 0.1)
+	// No panic, no observable side-effect. Test passes by
+	// virtue of reaching this line.
+}
+
+// esmCounterValue reads the current value of a Prometheus counter
+// with a single label pair. Mirrors pkg/wire/metrics_test.go's
+// existing counter-probe helper but lives here so MED-2's tests
+// don't depend on the wire package's test surface.
+func esmCounterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := c.Write(m); err != nil {
+		t.Fatalf("counter.Write: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// TestObserveESM_ForwardsToOpsMetrics asserts the MED-2 wrappers
+// forward to OpsMetrics correctly: a single success poll + 2 records
+// + 1 lag observation must move the wire-side counters exactly once
+// each. The Loop helper exists to keep the nil-check centralised,
+// so this test pins that the forwarding isn't shadowed by it.
+func TestObserveESM_ForwardsToOpsMetrics(t *testing.T) {
+	ops := wire.NewOpsMetrics("test")
+	l := &Loop{ops: ops}
+
+	l.observeESMPoll(string(api.TriggerKindKafka), wire.ESMPollOutcomeSuccess)
+	l.observeESMRecords(string(api.TriggerKindKafka), 2)
+	l.observeESMLag(string(api.TriggerKindKafka), "0", 0.25)
+
+	// Counter values are read by querying the pre-instantiated
+	// child for the (source, outcome) tuple — wire.NewOpsMetrics
+	// pre-creates the success/error/empty series, so a successful
+	// observeESMPoll call must increment the success child.
+	successCounter, err := ops.ESMPollCounterForTest(string(api.TriggerKindKafka), wire.ESMPollOutcomeSuccess)
+	if err != nil {
+		t.Fatalf("ESMPollCounterForTest: %v", err)
+	}
+	if got := esmCounterValue(t, successCounter); got != 1 {
+		t.Errorf("success poll counter = %v, want 1", got)
+	}
+	recordsCounter, err := ops.ESMRecordsCounterForTest(string(api.TriggerKindKafka))
+	if err != nil {
+		t.Fatalf("ESMRecordsCounterForTest: %v", err)
+	}
+	if got := esmCounterValue(t, recordsCounter); got != 2 {
+		t.Errorf("records consumed counter = %v, want 2", got)
+	}
 }

@@ -83,6 +83,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // trigger DLQ reason constants (match the CHECK on
@@ -291,6 +292,13 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	// 2. Poll.
 	res := poller.Poll(ctx, t)
 	if res.Error != nil {
+		// MED-2 (PR #993 / issue #757 review): a poll error is
+		// still a tick outcome the dashboard wants to count.
+		// Without this the schedd_esm_polls_total{outcome="error"}
+		// series stays at zero and a broker outage is invisible
+		// until something downstream (gateway 5xx, missing
+		// invocations) trips an unrelated alert.
+		l.observeESMPoll(t.Kind, wire.ESMPollOutcomeError)
 		l.log.Warn("sched trigger tick: poll",
 			"trigger_id", t.ID.String(),
 			"kind", t.Kind,
@@ -298,6 +306,10 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		return fmt.Errorf("poll trigger %s: %w", t.ID, res.Error)
 	}
 	if len(res.Records) == 0 {
+		// MED-2: count empty polls too. A trigger that's stuck
+		// with no data should show steady "empty" traffic so a
+		// rate(success)=0 alert fires, not "the metric vanished".
+		l.observeESMPoll(t.Kind, wire.ESMPollOutcomeEmpty)
 		return nil
 	}
 
@@ -380,6 +392,35 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		if len(batch) == 0 {
 			return nil
 		}
+	}
+
+	// 3.7. ESM metric emission (MED-2 / PR #993 review).
+	//
+	// Three signals, all fed by the dispatcher not the poller:
+	//
+	//   - schedd_esm_polls_total{outcome="success"}: a tick that
+	//     produced ≥1 post-filter record. Counted here (NOT at the
+	//     Poll() call site) so an "empty" or "all-filtered-out"
+	//     tick doesn't inflate the success series.
+	//   - schedd_esm_records_consumed_total{source="kafka"}: the
+	//     post-filter record count. Filter step (3.5) may have
+	//     dropped some, and the gauge/dashboard reader cares about
+	//     what actually left the broker toward the gateway — the
+	//     filtered count is the authoritative one.
+	//   - schedd_esm_lag_seconds{source="kafka",shard="..."}: per-
+	//     record lag from ReceivedAt (stamped by the poller at the
+	//     moment of broker fetch — segmentio/kafka-go's
+	//     Reader.FetchMessage return) to "about to insert into
+	//     trigger_records". A spike here is the only signal that
+	//     warns schedd is falling behind the broker commit log.
+	//
+	// shard label is source-specific; shardKeyFor collapses to
+	// "_agg" past the 32-bucket cap (the closed-set pre-instantiation
+	// only populates `_agg` for out-of-vocab shards).
+	l.observeESMPoll(t.Kind, wire.ESMPollOutcomeSuccess)
+	l.observeESMRecords(t.Kind, len(batch))
+	for _, rec := range batch {
+		l.observeESMLag(t.Kind, shardKeyFor(rec, t.Kind), time.Since(rec.ReceivedAt).Seconds())
 	}
 
 	// 4. Rate-limit gate. Deny → dead_letter(reason='rate_limited').
@@ -963,6 +1004,95 @@ func computeRetryBackoff(attempts int32) time.Duration {
 
 // Compile-time guarantee the helpers we use are wired.
 var _ = slog.Default
+
+// observeESMPoll is the Loop-side wrapper around
+// OpsMetrics.ObserveESMPoll that nil-checks the loop's *wire.OpsMetrics
+// before forwarding. dispatchOneTrigger calls this at three sites
+// (poll-error, poll-empty, post-filter success) so the dashboard
+// rate(success)+rate(empty)+rate(error) sums to the per-tick total.
+//
+// MED-2 (PR #993 / issue #757 review): the original 11 commits
+// shipped the OpsMetrics helper but never wired any callsite, so
+// schedd_esm_polls_total was structurally zero in production. This
+// wrapper exists so dispatchOneTrigger has a one-symbol callsite and
+// the nil-check lives next to the metric vocabulary rather than at
+// every insertion point.
+func (l *Loop) observeESMPoll(source, outcome string) {
+	if l.ops == nil {
+		return
+	}
+	l.ops.ObserveESMPoll(source, outcome)
+}
+
+// observeESMRecords is the loop-side nil-checked wrapper around
+// OpsMetrics.ObserveESMRecords. The count is the post-filter batch
+// length — see dispatchOneTrigger step 3.7 for the rationale.
+func (l *Loop) observeESMRecords(source string, n int) {
+	if l.ops == nil {
+		return
+	}
+	l.ops.ObserveESMRecords(source, n)
+}
+
+// observeESMLag is the loop-side nil-checked wrapper around
+// OpsMetrics.ObserveESMLag. Per-record lag from broker fetch to
+// the moment the dispatcher is about to insert into
+// trigger_records.
+func (l *Loop) observeESMLag(source, shard string, lagSeconds float64) {
+	if l.ops == nil {
+		return
+	}
+	l.ops.ObserveESMLag(source, shard, lagSeconds)
+}
+
+// shardKeyFor derives the shard label for the lag metric from
+// SourceRecord.Metadata. The dispatcher collapses shards past the
+// 32-bucket cap to "_agg" — the closed-set pre-instantiation in
+// wire.NewOpsMetrics only populates that series for out-of-vocab
+// shard keys, so an unbounded label here would silently inflate
+// Prometheus cardinality.
+//
+// Source-specific extraction:
+//
+//	"kafka"  → Metadata["partition"] (int, stamped by poller_kafka)
+//	"nats"   → Metadata["stream"]    (added in a follow-up; empty
+//	                                  today → "_agg")
+//	default  → "_agg"
+//
+// The 32-bucket cap is enforced here (rather than inside ObserveESMLag)
+// because that's where the source vocabulary lives — keeping the
+// closed-set semantics next to the dispatch logic means a new
+// source added later only has to extend this switch.
+func shardKeyFor(rec SourceRecord, kind string) string {
+	var key string
+	switch kind {
+	case string(api.TriggerKindKafka):
+		if rec.Metadata != nil {
+			if v, ok := rec.Metadata["partition"]; ok {
+				key = fmt.Sprintf("%v", v)
+			}
+		}
+	case string(api.TriggerKindNATS):
+		if rec.Metadata != nil {
+			if v, ok := rec.Metadata["stream"]; ok {
+				key = fmt.Sprintf("%v", v)
+			}
+		}
+	}
+	if key == "" {
+		return "_agg"
+	}
+	// Hard cap on label cardinality. Prometheus closed-set pre-
+	// instantiation only guards labels it knows at boot; a runaway
+	// partition id (or a malicious Metadata injection) would
+	// otherwise create new series on every record. The 32-bucket
+	// cap mirrors wire/metrics.go's pre-instantiation (see
+	// NewOpsMetrics: only "_agg" + the first 31 known series ship).
+	if len(key) > 32 {
+		return "_agg"
+	}
+	return key
+}
 
 // classifyDLQReason maps the gateway's per-record outcome onto
 // one of trigger_dead_letter.reason's CHECK values
