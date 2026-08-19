@@ -538,6 +538,50 @@ type Limits struct {
 	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
 	EdgeRulesThrottlePerApp int
 
+	// CorsPresetsPerAccount caps how many cors_presets rows one
+	// account may own in total (account-wide + app-scoped). The
+	// cap defends against a customer pinning one preset per
+	// partner / per customer-of-customer and inflating the
+	// gateway's per-account preset map. Per-plan: Free 0, Hobby
+	// 10, Pro 50, Scale 250. The Free=0 default keeps the
+	// abuse-floor tier on inline CORS — the upsell is the
+	// abstraction. apid-Validate throws
+	// CodePlanCorsPresetQuotaReached when this trips (PR-B,
+	// #979-c, slot 00295 wires the writer).
+	CorsPresetsPerAccount int
+	// CorsPresetsPerApp caps how many app-scoped cors_presets rows
+	// one app may own. Independent of CorsPresetsPerAccount so a
+	// customer with 5 apps under a Pro account can split 50
+	// presets across the apps without tripping the per-account
+	// cap. Per-plan: Free 0, Hobby 5, Pro 15, Scale 50. The
+	// per-app shape mirrors EdgeRulesPerApp's escalation curve
+	// so the upgrade ladder a customer reasons about is one
+	// number per primitive.
+	CorsPresetsPerApp int
+	// CorsPresetMaxOrigins caps how many entries
+	// cors_presets.allow_origins may hold. The cap defends
+	// against a customer stuffing a 10k-entry wildcard
+	// collection into a preset (the gateway's per-request
+	// allowlist walk is O(AllowOrigins)). Per-plan: Free 0,
+	// Hobby 25, Pro 100, Scale 500. Enforced at the apid write
+	// boundary by api.CorsPreset.Validate in PR-B.
+	CorsPresetMaxOrigins int
+	// CorsPresetMaxAllowMethods caps how many entries
+	// cors_presets.allow_methods may hold. Smaller ceiling
+	// than MaxOrigins because the set is a closed enum
+	// (CORS_ALLOWED_METHODS — GET/POST/PUT/PATCH/DELETE/HEAD/
+	// OPTIONS in current ADR-091 D12). Per-plan: Free 0,
+	// Hobby 8, Pro 8, Scale 8 (the closed-set ceiling is
+	// constant across plans; the per-plan knob here is the
+	// read-side cap a preset can ship, not the closed-set
+	// size). Enforced at the apid write boundary.
+	CorsPresetMaxAllowMethods int
+	// CorsPresetMaxNameLength pins the upper bound on
+	// cors_presets.name (the migration's CHECK pins it to
+	// 64). Surfaced here so the apid writer can reject
+	// before INSERT. Same value across plans.
+	CorsPresetMaxNameLength int
+
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
 	// defends against a SaaS customer pinning one surface per
@@ -1066,6 +1110,17 @@ var planLimits = map[Plan]Limits{
 		// upgrade curve from Free → Scale is a single double/triple
 		// progression a customer can predict.
 		EdgeRulesThrottlePerApp: 1,
+		// CORS presets (issue #975 item #4 / Mega-Foundation #979-b,
+		// slot 00294). Free=0 mirrors the tenant_surfaces / alert_rules
+		// posture: the abstraction is the upsell, the abuse-floor tier
+		// stays on inline kind=cors rules. PR-A ships the read path
+		// and the limits; PR-B (#979-c, slot 00295) wires the apid
+		// writer that trips the per-plan caps.
+		CorsPresetsPerAccount:     0,
+		CorsPresetsPerApp:         0,
+		CorsPresetMaxOrigins:      0,
+		CorsPresetMaxAllowMethods: 0,
+		CorsPresetMaxNameLength:   64,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		// Free customers can size per-key throttles on a small slice
 		// of their key space; large-cardinality per-key limits
@@ -1330,6 +1385,16 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 5,
+		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
+		// 00294). Hobby is the entry paid tier — 10 presets per
+		// account, 5 per app. MaxOrigins 25 covers the typical
+		// "partners + sub-domains" allowlist; 8 AllowMethods is the
+		// closed-set ceiling.
+		CorsPresetsPerAccount:     10,
+		CorsPresetsPerApp:         5,
+		CorsPresetMaxOrigins:      25,
+		CorsPresetMaxAllowMethods: 8,
+		CorsPresetMaxNameLength:   64,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
@@ -1583,6 +1648,14 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 25,
+		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
+		// 00294). Pro is the typical SaaS tier — 50 presets per
+		// account, 15 per app, 100 origins per preset.
+		CorsPresetsPerAccount:     50,
+		CorsPresetsPerApp:         15,
+		CorsPresetMaxOrigins:      100,
+		CorsPresetMaxAllowMethods: 8,
+		CorsPresetMaxNameLength:   64,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
@@ -1828,6 +1901,17 @@ var planLimits = map[Plan]Limits{
 		// kind='throttle' per-route rate limit cap (ADR-091 D20.5
 		// amendment, issue #881). Mirrors EdgeRulesGeoPerApp.
 		EdgeRulesThrottlePerApp: 100,
+		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
+		// 00294). Scale is the large-fleet tier — 250 presets per
+		// account, 50 per app, 500 origins per preset. Numbers
+		// mirror the AlertRuleLimitPerApp progression
+		// (1/5/25/100 * 5x) so the customer mental model is one
+		// progression across primitives.
+		CorsPresetsPerAccount:     250,
+		CorsPresetsPerApp:         50,
+		CorsPresetMaxOrigins:      500,
+		CorsPresetMaxAllowMethods: 8,
+		CorsPresetMaxNameLength:   64,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
@@ -3655,6 +3739,74 @@ func (p Plan) CronLimitPerAccount() int {
 		return 0
 	}
 	return l.CronLimitPerAccount
+}
+
+// CorsPresetsPerAccount returns the per-account CORS preset cap
+// (issue #975 item #4 / Mega-Foundation #979-b, slot 00294).
+// Free=0 (Free is the abuse-floor tier; the abstraction is the
+// upsell — Free customers stay on inline kind=cors rules). Paid
+// tiers: Hobby 10, Pro 50, Scale 250. Unknown plans fail closed
+// (return 0). PR-B (#979-c, slot 00295) reads this in
+// apid-Validate's CreateCorsPreset handler.
+func (p Plan) CorsPresetsPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetsPerAccount
+}
+
+// CorsPresetsPerApp returns the per-app CORS preset cap.
+// Independent of CorsPresetsPerAccount — a customer with N apps
+// can split the per-account budget across the apps without
+// tripping the per-account cap. Per-plan: Free 0, Hobby 5, Pro
+// 15, Scale 50. Same fail-closed contract as
+// CorsPresetsPerAccount.
+func (p Plan) CorsPresetsPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetsPerApp
+}
+
+// CorsPresetMaxOrigins returns the per-preset cap on
+// cors_presets.allow_origins entries. The gateway's per-request
+// allowlist walk is O(AllowOrigins), so the cap defends against
+// a customer shipping a 10k-entry wildcard collection. Per-plan:
+// Free 0, Hobby 25, Pro 100, Scale 500. apid-Validate reads this
+// before INSERT (PR-B).
+func (p Plan) CorsPresetMaxOrigins() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetMaxOrigins
+}
+
+// CorsPresetMaxAllowMethods returns the per-preset cap on
+// cors_presets.allow_methods entries. The closed-set ceiling is
+// constant across plans (8 in the current ADR-091 D12 enum);
+// the value here is the read-side cap a preset can ship, not
+// the closed-set size. apid-Validate reads this in PR-B.
+func (p Plan) CorsPresetMaxAllowMethods() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetMaxAllowMethods
+}
+
+// CorsPresetMaxNameLength pins the upper bound on
+// cors_presets.name. The migration's CHECK caps it at 64; this
+// accessor surfaces the same value so the apid writer can
+// reject before INSERT. Same value across plans.
+func (p Plan) CorsPresetMaxNameLength() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.CorsPresetMaxNameLength
 }
 
 // EvictionPriorityReservedAllowed (issue #475) returns true if the plan

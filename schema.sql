@@ -2526,11 +2526,10 @@ ALTER TABLE ONLY public.cors_presets
 
 
 --
--- Name: cors_presets cors_presets_unique_name; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: cors_presets_unique_name; Type: INDEX; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.cors_presets
-    ADD CONSTRAINT cors_presets_unique_name UNIQUE (account_id, COALESCE(app_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+CREATE UNIQUE INDEX cors_presets_unique_name ON public.cors_presets USING btree (account_id, COALESCE(app_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
 
 
 --

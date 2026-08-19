@@ -3940,6 +3940,45 @@ type EdgeRule struct {
 	UpdatedAt    time.Time
 }
 
+// CorsPreset is the in-memory row mirrored from cors_presets (issue
+// #975 item #4 / Mega-Foundation #979-b). One row = one reusable CORS
+// configuration a customer attaches to a kind=cors edge rule via the
+// per-rule cors.preset_id field (PR-B, slot 00295).
+//
+// Scope: account-scoped when AppID is the empty string, app-scoped
+// when AppID is set. The UNIQUE constraint
+// (account_id, COALESCE(app_id, '00..00'), name) backs both shapes
+// from a single index; the COALESCE-back pattern is documented in
+// migrations/00294_cors_presets.sql.
+//
+// AllowOrigins / AllowMethods / AllowHeaders / ExposeHeaders are
+// stored as Postgres text[] but the wire-side gate in pkg/api/dto.go
+// rejects empty arrays for AllowOrigins and AllowMethods (a CORS rule
+// without any origin allowlist is meaningless and a common footgun).
+// The DB CHECKs in 00294 cover the size + name bounds only.
+//
+// AllowCredentials, MaxAgeSeconds, and AllowHeaders / ExposeHeaders
+// use the rule-field-overrides-preset compile convention
+// (cmd/gatewayd-internal/edge_rules.go::compileCORSRules): the
+// rule's non-zero values win, the preset fills in the rest. A
+// preset that ships only the allowlist is therefore a valid
+// "convention" preset.
+type CorsPreset struct {
+	ID               string
+	AccountID        string
+	AppID            string
+	Name             string
+	Description      string
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
+	AllowCredentials bool
+	MaxAgeSeconds    int
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
 // CreateEdgeRuleParams is the input bundle for CreateEdgeRule and
 // CreateEdgeRuleIfUnderQuota. Action is marshalled to jsonb at the
 // pgstore boundary.

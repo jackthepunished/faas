@@ -2243,6 +2243,23 @@ type Store interface {
 	// the full action body.
 	UpdateEdgeRule(ctx context.Context, id string, params UpdateEdgeRuleParams) (EdgeRule, error)
 	DeleteEdgeRule(ctx context.Context, id string) error
+	// ListCorsPresetsForAccount returns every preset the account
+	// owns (both account-wide and app-scoped). The gatewayd cache
+	// refreshes its preset map on pg_notify('cors_preset_changed')
+	// and on boot reads via this path. The ordered-by-name return
+	// keeps the deterministic cache key (per cmd/gatewayd-internal
+	// /edge_rules.go::compileCORSRules).
+	ListCorsPresetsForAccount(ctx context.Context, accountID string) ([]CorsPreset, error)
+	// ListCorsPresetsForApp returns the app-scoped presets for one
+	// app. The compile path in PR-B calls this to overlay app-scoped
+	// presets on top of the account-wide set returned by
+	// ListCorsPresetsForAccount.
+	ListCorsPresetsForApp(ctx context.Context, appID string) ([]CorsPreset, error)
+	// GetCorsPresetByID returns one preset or ErrNotFound. The
+	// compile path calls this with the preset_id stamped on a
+	// kind=cors rule; ErrNotFound is mapped to a 422 at the apid
+	// boundary ("preset has been deleted; re-save the rule").
+	GetCorsPresetByID(ctx context.Context, id string) (CorsPreset, error)
 	// CountEdgeRulesForApp is the quota check (called by the apid
 	// handler before the insert; the insert itself runs the same
 	// count inside the FOR UPDATE on the apps row).

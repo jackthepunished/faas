@@ -156,6 +156,13 @@ type MemStore struct {
 	// is needed. Soft-delete semantics (apps.status='deleted') are
 	// mirrored by the per-app lookup in the quota-check branch.
 	edgeRules map[string]EdgeRule
+	// corsPresets mirrors cors_presets (issue #975 item #4 /
+	// Mega-Foundation #979-b). Keyed by presetID. PR-A exposes
+	// only the read path; the write surface lives in PR-B
+	// (#979-c, slot 00295) alongside the per-rule cors.preset_id
+	// field. Mirroring the read path here means handler tests
+	// can exercise the compile-side merge without a live PG.
+	corsPresets map[string]CorsPreset
 	// oidcTrustPolicies is keyed by (accountID, issuerURL) — the
 	// composite primary key shape from migration 00265. The
 	// per-account lookup OIDCTrustPoliciesForAccount is the only
@@ -555,6 +562,7 @@ func NewMemStore() *MemStore {
 		appWebhookDeliveries: map[string]AppWebhookDelivery{},
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
+		corsPresets:          map[string]CorsPreset{},
 		// ADR-101 / issue #270 — OIDC trust policies + exchanged
 		// bearers. Start empty; tests inject rows directly.
 		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
@@ -10750,6 +10758,64 @@ func (m *MemStore) GetEdgeRuleByID(_ context.Context, id string) (EdgeRule, erro
 		return EdgeRule{}, ErrNotFound
 	}
 	return r, nil
+}
+
+// ListCorsPresetsForAccount mirrors the pgstore query: every
+// preset the account owns (both account-wide and app-scoped). The
+// (app_id NULLS FIRST, name) order keeps the compile-side cache
+// key deterministic — see cmd/gatewayd-internal/edge_rules.go.
+func (m *MemStore) ListCorsPresetsForAccount(_ context.Context, accountID string) ([]CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []CorsPreset
+	for _, p := range m.corsPresets {
+		if p.AccountID == accountID {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		// AppID == "" means account-wide (NULL in pg). The
+		// NULLS FIRST order puts account-wide presets before
+		// app-scoped ones in the returned slice so a stable
+		// "preset defined first wins" override rule has a
+		// defined tiebreak.
+		iWide := out[i].AppID == ""
+		jWide := out[j].AppID == ""
+		if iWide != jWide {
+			return iWide
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// ListCorsPresetsForApp returns the app-scoped presets only. The
+// compile path unions this with the account-wide result from
+// ListCorsPresetsForAccount.
+func (m *MemStore) ListCorsPresetsForApp(_ context.Context, appID string) ([]CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []CorsPreset
+	for _, p := range m.corsPresets {
+		if p.AppID == appID {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// GetCorsPresetByID returns the preset or ErrNotFound.
+func (m *MemStore) GetCorsPresetByID(_ context.Context, id string) (CorsPreset, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.corsPresets[id]
+	if !ok {
+		return CorsPreset{}, ErrNotFound
+	}
+	return p, nil
 }
 
 // UpdateEdgeRule mirrors the pgstore nil-skip semantics. Action
