@@ -25,6 +25,7 @@ package main
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -41,21 +42,41 @@ type annotationForm struct {
 	PRNumber   int
 }
 
-// ValidDeploymentAnnotationTag returns true iff s is one of the
-// canonical closed-set values (mirrors the DB CHECK). Empty is
-// allowed (== no tag).
+// annotationTags is the canonical closed-set vocabulary for the
+// annotation tag field (issue #977 / ADR-116). Mirrors the DB CHECK
+// at migrations/00288_deployments_annotation.sql. Hoisted into a
+// package-level constant so the validator and the rejection-message
+// builder share the same source of truth (goconst flags the inline
+// literals otherwise).
 //
 // Source of truth: migrations/00288_deployments_annotation.sql.
 // The CLI's DeploymentAnnotationTags list (cmd/gregale/cmd_deploy_
 // annotations.go) is the same vocabulary; drift is caught by the
 // CLI's TestDeploymentAnnotationTags_MirrorsDB.
+var annotationTags = []string{
+	"incident_recovery",
+	"hotfix",
+	"scheduled_maintenance",
+	"compliance_hold",
+	"partner_request",
+}
+
+// annotationTagsCSV is the comma-joined form of annotationTags, used
+// in the ValidDeploymentAnnotationTag rejection message so the
+// detail line is generated from the same source as the validator.
+var annotationTagsCSV = strings.Join(annotationTags, ", ")
+
+// ValidDeploymentAnnotationTag returns true iff s is one of the
+// canonical closed-set values (mirrors the DB CHECK). Empty is
+// allowed (== no tag).
 func ValidDeploymentAnnotationTag(s string) bool {
 	if s == "" {
 		return true
 	}
-	switch s {
-	case "incident_recovery", "hotfix", "scheduled_maintenance", "compliance_hold", "partner_request":
-		return true
+	for _, t := range annotationTags {
+		if s == t {
+			return true
+		}
 	}
 	return false
 }
@@ -121,7 +142,7 @@ func validateAnnotationForm(ann annotationForm) *api.Problem {
 	if !ValidDeploymentAnnotationTag(ann.Tag) {
 		return api.NewProblem(http.StatusUnprocessableEntity, api.CodeValidation,
 			"Invalid tag",
-			"tag must be one of: incident_recovery, hotfix, scheduled_maintenance, compliance_hold, partner_request")
+			"tag must be one of: "+annotationTagsCSV)
 	}
 	if ann.PRNumber < 0 {
 		return api.NewProblem(http.StatusUnprocessableEntity, api.CodeValidation,
