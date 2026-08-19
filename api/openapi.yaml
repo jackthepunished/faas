@@ -52,6 +52,16 @@ tags:
     description: Custom domain bindings.
   - name: crons
     description: Scheduled synthetic POSTs.
+  - name: triggers
+    description: |
+      Event source mappings (issue #757 / ADR-100). A trigger is a
+      unified resource that pulls records from a broker (kafka, nats,
+      redis_streams, sqs_compat, queue) or a schedule (cron) and fans
+      them into the function via batched invocations. The cron kind
+      is a thin alias over /v1/crons — see the `crons` tag for the
+      canonical cron API. Records carry ReportBatchItemFailures
+      semantics stolen verbatim from AWS Lambda (the function
+      returns `{"batchItemFailures":[{"item_identifier":"..."}]}`).
   - name: webhooks
     description: |
       Outbound webhook subscriptions (issue #476 / ADR-076). One row
@@ -117,6 +127,13 @@ tags:
       PATCH /v1/apps/{slug}/security (admin + MFA) flips the
       require_signed flag; trusted_signers CRUD manages the
       per-app cosign trusted-publisher list.
+  - name: internal
+    description: |
+      Inter-daemon RPC surface (schedd ↔ gatewayd-internal). The
+      `invocations:dispatch_batch` endpoint under this tag is
+      scheduler-driven — schedd calls gatewayd-internal to dispatch
+      a batch of records against a parked instance, and the function
+      runner returns ReportBatchItemFailures. Not customer-facing.
   - name: tenant-surfaces
     description: |
       Tenant hostname groupings (issue #879 / ADR-100). One surface
@@ -3990,6 +4007,362 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Triggers (issue #757 / ADR-100) ────────────────────────────────
+  # The unified event-source-mapping primitive. 11 operations cover
+  # CRUD + pause/resume + record-level retry/drop + DLQ listing +
+  # per-trigger metrics + a bulk-create path for the dashboard.
+
+  /v1/triggers:
+    get:
+      tags: [triggers]
+      operationId: listTriggers
+      summary: List triggers on the account.
+      description: |
+        Returns every trigger owned by the calling account, optional
+        ?app_id filter to scope to one app, ?kind to scope to one
+        kind. Newest-first by created_at; result is unbounded but
+        the typical account has well under 200.
+      parameters:
+        - name: app_id
+          in: query
+          required: false
+          description: |
+            Optional app UUID to scope the listing to one app; the
+            caller's account is still the authorization boundary.
+          schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        - name: kind
+          in: query
+          required: false
+          description: |
+            Optional trigger kind filter (kafka / nats / redis_streams
+            / sqs_compat / queue). Invalid values produce an empty list,
+            not 400 — see the trigger list paginator in pkg/apid.
+          schema: { $ref: '#/components/schemas/TriggerKind' }
+      responses:
+        '200':
+          description: The trigger list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Trigger' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [triggers]
+      operationId: createTrigger
+      summary: Create a trigger.
+      description: |
+        Idempotent via Idempotency-Key header. Returns 402
+        `triggers_not_allowed` for Free plan, 403 `trigger_quota_exceeded`
+        on per-app or per-account cap; see ADR-100.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTriggerRequest' }
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: The new trigger.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Trigger' }
+        '400': { $ref: '#/components/responses/TriggerInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/TriggerNotAllowed' }
+        '403': { $ref: '#/components/responses/TriggerQuotaExceeded' }
+        '422': { $ref: '#/components/responses/TriggerImmutable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers:batch_create:
+    post:
+      tags: [triggers]
+      operationId: batchCreateTriggers
+      summary: Bulk-create triggers from a gregale.yaml fragment.
+      description: |
+        Dashboard-only shortcut — fires a `triggers:` fragment at the
+        server, validates via the same path the CLI uses, and returns
+        per-row ids and any per-row RFC 7807 codes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTriggerBatchRequest' }
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Per-row outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateTriggerBatchResponse' }
+        '400': { $ref: '#/components/responses/TriggerInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/TriggerNotAllowed' }
+        '403': { $ref: '#/components/responses/TriggerQuotaExceeded' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [triggers]
+      operationId: getTrigger
+      summary: Get one trigger.
+      responses:
+        '200':
+          description: The trigger.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Trigger' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [triggers]
+      operationId: updateTrigger
+      summary: Partial-update a trigger.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTriggerRequest' }
+      responses:
+        '200':
+          description: The updated trigger.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Trigger' }
+        '400': { $ref: '#/components/responses/TriggerInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/TriggerImmutable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [triggers]
+      operationId: deleteTrigger
+      summary: Delete a trigger.
+      responses:
+        '204': { description: No body. The trigger was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}/pause:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    post:
+      tags: [triggers]
+      operationId: pauseTrigger
+      summary: Disable a trigger without deleting it.
+      description: |
+        Sets `enabled=false` and pg_notify's `trigger_changed`. Schedd
+        stops the broker poller on the next tick; in-flight records
+        drain normally.
+      responses:
+        '204': { description: No body. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    post:
+      tags: [triggers]
+      operationId: resumeTrigger
+      summary: Re-enable a paused trigger.
+      description: |
+        Sets `enabled=true` and pg_notify's `trigger_changed`.
+        Schedd restarts the broker poller on the next tick.
+      responses:
+        '204': { description: 'Trigger resumed (no body).' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}/records:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [triggers]
+      operationId: listTriggerRecords
+      summary: List records for one trigger.
+      description: |
+        Newest-first by `received_at`. The dashboard uses this to
+        build the "Recent fires" view; the CLI uses it for `--tail`.
+      parameters:
+        - name: state
+          in: query
+          required: false
+          description: |
+            Optional state filter — pending / claimed / succeeded /
+            retry / dead_letter. Lets the dashboard narrow to
+            in-flight or DLQ rows.
+          schema: { $ref: '#/components/schemas/TriggerRecordState' }
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Page size; default 50, capped at 200.
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Records for this trigger.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListTriggerRecordsResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}/records/{rid}/retry:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+      - name: rid
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: "Record id (UUID hex, no dashes) — used by retry/drop."
+    post:
+      tags: [triggers]
+      operationId: retryTriggerRecord
+      summary: Force a record back into the dispatch queue.
+      description: |
+        Resets state to `pending`, attempts to 0. Operator-only scope
+        — the dashboard surfaces this as "Re-drive from DLQ".
+      responses:
+        '204': { description: 'Record re-driven (no body).' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/TriggerRecordRetryFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}/records/{rid}/drop:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+      - name: rid
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{32}$' }
+        description: "Record id (UUID hex, no dashes) — used by drop."
+    post:
+      tags: [triggers]
+      operationId: dropTriggerRecord
+      summary: Drop a record without re-firing.
+      description: |
+        Marks a dead-letter row `routed_to='drop'` (already the
+        default; this is the explicit acknowledgement). Operator-only
+        scope.
+      responses:
+        '204': { description: 'Record dropped (no body).' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}/dlq:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [triggers]
+      operationId: listTriggerDeadLetter
+      summary: List dead-letter rows for one trigger.
+      parameters:
+        - name: reason
+          in: query
+          required: false
+          description: |
+            Optional DLQ reason filter (poison_record / max_attempts /
+            broker_error / rate_limited / payload_too_large).
+          schema: { $ref: '#/components/schemas/TriggerDeadLetterReason' }
+        - name: limit
+          in: query
+          required: false
+          description: |
+            DLQ page size; default 50, capped at 200.
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Dead-letter rows for this trigger.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListTriggerDeadLetterResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/triggers/{id}/metrics:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [triggers]
+      operationId: getTriggerMetrics
+      summary: Per-state aggregate counts for one trigger.
+      description: |
+        Counter roll-up by state. Not a Prometheus surface — that
+        is /v1/metrics (issue #684).
+      responses:
+        '200':
+          description: Aggregated counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TriggerMetricsResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/invocations:dispatch_batch:
+    post:
+      tags: [triggers, internal]
+      operationId: dispatchInvocationBatch
+      summary: "Internal — schedd posts a batch envelope to the gateway."
+      description: |
+        Internal-only route. Schedd invokes this once per closed
+        batch (size / window / 6MB cap). The function under the
+        trigger responds with `{"batchItemFailures":[{"itemIdentifier":"..."}]}`.
+        Empty / missing response ⇒ full success. Mirrors AWS Lambda's
+        `ReportBatchItemFailures` contract verbatim.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trigger_id, records]
+              properties:
+                trigger_id: { type: string, format: uuid }
+                app_id:     { type: string, format: uuid }
+                kind:       { $ref: '#/components/schemas/TriggerKind' }
+                records:
+                  type: array
+                  items:
+                    type: object
+                    required: [item_identifier, payload_b64]
+                    properties:
+                      item_identifier: { type: string }
+                      payload_b64:     { type: string }
+                      headers:         { type: object, additionalProperties: { type: string } }
+                      metadata:        { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Batch accepted; per-record status derived from response.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  succeeded:
+                    type: array
+                    items: { type: string, description: "item_identifier." }
+                  retry:
+                    type: array
+                    items: { type: string }
+                  dead_letter:
+                    type: array
+                    items: { type: string }
+
   # ─── Projects (ADR-050 / Phase 3) ───────────────────────────────────
   # Two endpoints:
   #   POST /v1/projects/scan  — dry-run; runs reposcan.Scan over the
@@ -5168,7 +5541,7 @@ paths:
         Idempotent: a re-cancel (or a cancel of an already-fired row)
         is a 204. The drain ignores cancelled rows at dispatch.
       responses:
-        '204': { description: No body. }
+        '204': { description: 'Cron disabled (no body).' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -9827,6 +10200,280 @@ components:
         path: { type: [string, "null"] }
         enabled: { type: [boolean, "null"] }
 
+    # ─── Triggers (issue #757 / ADR-100) ────────────────────────────────
+    # Unified event-source-mapping primitive. One Trigger row covers
+    # cron, kafka, nats, redis_streams, sqs_compat, and in-platform
+    # queue — the discriminator is `kind`. Five of the six share the
+    # same batch / filter / retry / ReportBatchItemFailures machinery;
+    # cron retains its pre-existing (schedule, path) shape.
+
+    TriggerKind:
+      description: "Discriminator for the underlying event source."
+      type: string
+      enum: [cron, kafka, nats, redis_streams, sqs_compat, queue]
+
+    Trigger:
+      description: |
+        Read shape returned by GET / POST / PATCH on /v1/triggers.
+        The `config` blob is opaque at the wire level — each kind
+        decodes its own per-shape struct lazily. The SDK round-trip
+        preserves the raw JSON so unknown fields survive client
+        versions older than the server.
+      type: object
+      required:
+        [id, account_id, app_id, kind, config, batch_size_max, batch_window_ms,
+         max_attempts, payload_max_bytes, broker_poison_strategy, enabled,
+         created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        kind: { $ref: '#/components/schemas/TriggerKind' }
+        slug:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+          description: "Unique-per-app handle. Required for non-cron kinds; ignored on cron."
+        enabled: { type: boolean }
+        config:
+          type: object
+          additionalProperties: true
+          description: |
+            Per-kind opaque configuration. Decode with the per-kind
+            struct (KafkaTriggerConfig, NATSTriggerConfig, etc).
+          example:
+            {brokers: ["broker:9092"], topic: orders.v1, group: faas-orders}
+        batch_size_max:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          description: "Records per batch upper bound (per-plan cap in /v1/limits)."
+        batch_window_ms:
+          type: integer
+          minimum: 10
+          maximum: 600000
+          description: "Milliseconds a partial batch may wait before dispatch."
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 25
+        payload_max_bytes:
+          type: integer
+          minimum: 1024
+          maximum: 67108864
+          description: |
+            Per-record broker payload byte cap (migration 00274).
+            Records above this size are DLQ'd at insert time with
+            reason='payload_too_large' rather than silently truncated.
+            Plan-level ceiling in /v1/limits TriggerPayloadMaxBytes.
+            Default 6291456 (6 MiB) when omitted on create.
+        broker_poison_strategy:
+          type: string
+          enum: [commit, seek-to-offset]
+          description: |
+            Kafka-only poison-record handling strategy (migration 00275,
+            audit #10). "commit" (default) advances the broker offset
+            via CommitMessages when the dispatcher dead-letters a
+            record — the broker offset and the DB dead-letter state
+            are permanently out of sync for that offset; operator
+            retry works via the dashboard's "re-drive from DLQ"
+            action which mints a fresh trigger_records row from the
+            same item_id. "seek-to-offset" calls SetOffset(msg.Offset)
+            instead so the next Poll re-fetches the same message —
+            operator retry combines a trigger re-enable with a
+            dashboard "reset offset" action that re-fetches the
+            dead-lettered payload. No effect on non-kafka kinds.
+        # Cron-only fields; mutually exclusive with slug (SQL CHECK).
+        schedule: { type: [string, "null"], example: "*/5 * * * *" }
+        path: { type: [string, "null"] }
+        cron_id: { type: [string, "null"], pattern: '^[a-f0-9]{32}$' }
+        # kind=queue only.
+        source:
+          type: [string, "null"]
+          enum: [queue, delayed_task, null]
+          description: "Source discriminator for kind=queue rows."
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateTriggerRequest:
+      description: |
+        Trigger create payload. Kind is immutable after create. Per-kind
+        gating mirrors pkg/gregalemanifest.validateKindConfig:
+          - cron: requires schedule + path (slug ignored)
+          - non-cron: requires slug + config
+      type: object
+      required: [app_id, kind]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        kind: { $ref: '#/components/schemas/TriggerKind' }
+        slug:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+        enabled: { type: [boolean, "null"] }
+        config:
+          type: object
+          additionalProperties: true
+          description: "Per-kind opaque config blob."
+        batch_size_max: { type: [integer, "null"], minimum: 1, maximum: 5000 }
+        batch_window_ms: { type: [integer, "null"], minimum: 10, maximum: 600000 }
+        max_attempts: { type: [integer, "null"], minimum: 1, maximum: 25 }
+        payload_max_bytes: { type: [integer, "null"], minimum: 1024, maximum: 67108864 }
+        broker_poison_strategy:
+          type: [string, "null"]
+          enum: [commit, seek-to-offset, null]
+          description: |
+            Kafka-only poison-record handling strategy. null/omitted
+            falls through to the DB default 'commit'. Same semantics
+            as the Trigger read shape.
+        schedule: { type: [string, "null"], example: "*/5 * * * *" }
+        path: { type: [string, "null"] }
+
+    UpdateTriggerRequest:
+      description: |
+        Partial trigger update. nil means "leave unchanged" (same
+        semantics as UpdateCronRequest). Kind is NOT a member — it
+        is immutable. To change kind, create a new trigger and
+        delete the old one.
+      type: object
+      properties:
+        enabled: { type: [boolean, "null"] }
+        config: { type: [object, "null"], additionalProperties: true }
+        batch_size_max: { type: [integer, "null"], minimum: 1, maximum: 5000 }
+        batch_window_ms: { type: [integer, "null"], minimum: 10, maximum: 600000 }
+        max_attempts: { type: [integer, "null"], minimum: 1, maximum: 25 }
+        payload_max_bytes: { type: [integer, "null"], minimum: 1024, maximum: 67108864 }
+        broker_poison_strategy:
+          type: [string, "null"]
+          enum: [commit, seek-to-offset, null]
+          description: |
+            Kafka-only poison-record handling strategy. null/omitted
+            means "leave unchanged" (the SQL coalesce() in
+            pkg/state/pgstore.go::UpdateTrigger keeps the existing
+            value). Same semantics as the Trigger read shape.
+        schedule: { type: [string, "null"], example: "*/5 * * * *" }
+        path: { type: [string, "null"] }
+
+    TriggerRecordState:
+      description: "Lifecycle of one trigger record."
+      type: string
+      enum: [pending, claimed, succeeded, retry, dead_letter]
+
+    TriggerRecord:
+      description: |
+        Audit row for one record passing through a trigger.
+        Surfaced via GET /v1/triggers/{id}/records so customers can
+        answer "did my last N wake-ups succeed?".
+      type: object
+      required:
+        [id, trigger_id, item_identifier, payload, headers, metadata, state,
+         attempts, next_fire_at, received_at]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        trigger_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        item_identifier:
+          type: string
+          description: "Broker-side identifier (Kafka offset, NATS seq, SQS receipt handle)."
+        payload: { type: string, description: "Raw JSON body, decoded lazily by the dashboard." }
+        headers: { type: string, description: "Raw JSON of broker headers." }
+        metadata: { type: string, description: "Raw JSON of broker metadata (delivery count, etc.)." }
+        state: { $ref: '#/components/schemas/TriggerRecordState' }
+        attempts: { type: integer, minimum: 0, maximum: 25 }
+        next_fire_at: { type: string, format: date-time }
+        received_at: { type: string, format: date-time }
+        last_error: { type: [string, "null"] }
+        last_dispatched_at: { type: [string, "null"], format: date-time }
+
+    ListTriggerRecordsResponse:
+      description: "Page of trigger records, newest-first."
+      type: object
+      required: [records]
+      properties:
+        records:
+          type: array
+          items: { $ref: '#/components/schemas/TriggerRecord' }
+
+    TriggerDeadLetterReason:
+      description: |
+        Reason enum pinned by SQL CHECK on trigger_dead_letter.reason.
+      type: string
+      enum:
+        [rate_limited, poison_record, max_attempts, broker_error,
+         plan_quota, payload_too_large, customer_disabled]
+
+    TriggerRoutedTo:
+      description: "Where a dead-lettered record was routed."
+      type: string
+      enum: [drop, manual_retry, customer_dlq]
+
+    TriggerDeadLetter:
+      description: "Read-only wire shape for one trigger_dead_letter row."
+      type: object
+      required: [record_id, trigger_id, reason, routed_to, detail, created_at]
+      properties:
+        record_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        trigger_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        reason: { $ref: '#/components/schemas/TriggerDeadLetterReason' }
+        routed_to: { $ref: '#/components/schemas/TriggerRoutedTo' }
+        detail:
+          type: object
+          additionalProperties: true
+          description: "Opaque per-reason JSON (broker-error vs poison-record shapes differ)."
+        created_at: { type: string, format: date-time }
+
+    ListTriggerDeadLetterResponse:
+      description: "Dead-letter rows for a trigger, newest-first."
+      type: object
+      required: [records]
+      properties:
+        records:
+          type: array
+          items: { $ref: '#/components/schemas/TriggerDeadLetter' }
+
+    TriggerMetricsResponse:
+      description: |
+        Aggregated counters per state for one trigger. NOT a Prometheus
+        scrape — /v1/metrics is the Prometheus surface (issue #684).
+      type: object
+      required:
+        [trigger_id, pending_count, claimed_count, succeeded_count,
+         retry_count, dead_letter_count]
+      properties:
+        trigger_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        pending_count: { type: integer }
+        claimed_count: { type: integer }
+        succeeded_count: { type: integer }
+        retry_count: { type: integer }
+        dead_letter_count: { type: integer }
+
+    CreateTriggerBatchRequest:
+      description: |
+        Inline-manifest path (POST /v1/triggers:batch_create) — fire a
+        gregale.yaml blob at the server without staging a tarball.
+        The handler re-uses validateManifestBytes from the manifest
+        apply path.
+      type: object
+      required: [app_id, manifest_yaml]
+      properties:
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        manifest_yaml:
+          type: string
+          description: "Raw gregale.yaml triggers: list."
+
+    CreateTriggerBatchResponse:
+      description: "Bulk-create response — per-row trigger ids and any error codes."
+      type: object
+      required: [created]
+      properties:
+        created:
+          type: array
+          items:
+            type: object
+            required: [slug, kind]
+            properties:
+              slug: { type: string }
+              kind: { $ref: '#/components/schemas/TriggerKind' }
+              id: { type: [string, "null"], pattern: '^[a-f0-9]{32}$' }
+              error: { type: [string, "null"], description: "RFC 7807 code." }
+
     # ─── Project decomposition (ADR-050 / Phase 3) ──────────────────────
     # Wire shape mirrors cmd/apid/scan_service.go::scanPlanResponse +
     # the reposcan.Workload / Managed structs. The `workloads` and
@@ -13986,6 +14633,36 @@ components:
 
     CronInvalid:
       description: 'code: cron_invalid | plan_crons_not_allowed | plan_cron_quota'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    TriggerInvalid:
+      description: 'code: trigger_invalid_kind | trigger_invalid_config — kind does not exist, or per-kind validation failed (missing brokers, empty topic, malformed URL, etc.).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    TriggerNotAllowed:
+      description: 'code: triggers_not_allowed — Free plan cannot create triggers; upgrade required.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    TriggerQuotaExceeded:
+      description: 'code: trigger_quota_exceeded — per-app or per-account trigger cap reached (see TriggerLimitPerApp / TriggerLimitPerAccount in /v1/limits).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    TriggerImmutable:
+      description: 'code: trigger_immutable_field — kind and (for cron) trigger_id are immutable after create; changing them requires delete + recreate.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    TriggerRecordRetryFailed:
+      description: 'code: trigger_dlq_retry_failed — record could not be re-driven (state was not retry or dead_letter).'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

@@ -1204,6 +1204,200 @@ LIMIT $4;
 -- the current month that are older than cutoff).
 DELETE FROM data_upstream_probes WHERE sampled_at < $1;
 
+-- Issue #757 / ADR-0NN — Trigger primitive (event-source mappings).
+-- Mirrors the cron `CreateCron` / `UpdateCron` / `DeleteCron` /
+-- `CronByID` / `ListCronsForApp` shape so the apid handler can stay
+-- symmetric with the existing cron surface. The dispatch tick
+-- (pkg/sched/dispatch_triggers.go, commit #14) writes
+-- ClaimTriggerRecords / MarkTriggerRecordSucceeded /
+-- MarkTriggerRecordRetry / MarkTriggerRecordDeadLetter, which the
+-- schedd uses under FOR UPDATE SKIP LOCKED to drain batches
+-- concurrently.
+--
+-- The FOR UPDATE SKIP LOCKED on ClaimTriggerRecords mirrors the
+-- precedent set by ADR-099 PR-C's claim_job_tasks query (issue
+-- tracker 'job-task pull'): concurrent schedd replicas each claim
+-- disjoint row sets with no advisory-lock plumbing.
+
+-- name: CreateTrigger :one
+insert into triggers (account_id, app_id, kind, slug, enabled, config,
+                       batch_size_max, batch_window_ms, max_attempts,
+                       cron_id, source, payload_max_bytes,
+                       broker_poison_strategy)
+values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
+returning id, account_id, app_id, kind, slug, enabled, config,
+          batch_size_max, batch_window_ms, max_attempts,
+          cron_id, source, payload_max_bytes, broker_poison_strategy,
+          created_at, updated_at;
+
+-- name: UpdateTrigger :one
+update triggers set
+  enabled = coalesce($2, enabled),
+  config = coalesce($3::jsonb, config),
+  batch_size_max = coalesce($4, batch_size_max),
+  batch_window_ms = coalesce($5, batch_window_ms),
+  max_attempts = coalesce($6, max_attempts),
+  payload_max_bytes = coalesce($7, payload_max_bytes),
+  broker_poison_strategy = coalesce($8, broker_poison_strategy)
+where id = $1
+returning id, account_id, app_id, kind, slug, enabled, config,
+          batch_size_max, batch_window_ms, max_attempts,
+          cron_id, source, payload_max_bytes, broker_poison_strategy,
+          created_at, updated_at;
+
+-- name: DeleteTrigger :exec
+delete from triggers where id = $1 and app_id = $2;
+
+-- name: TriggerByID :one
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, payload_max_bytes, broker_poison_strategy,
+       created_at, updated_at
+from triggers where id = $1;
+
+-- name: ListTriggersForApp :many
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, payload_max_bytes, broker_poison_strategy,
+       created_at, updated_at
+from triggers where app_id = $1 order by created_at desc;
+
+-- name: ListEnabledTriggers :many
+-- Pulled by schedd's runTriggerTick on each 1-second cadence. The
+-- query is unfiltered by kind because the dispatch tick reads
+-- triggers.enabled = true regardless of kind and dispatches via the
+-- per-kind poller (pkg/sched/poller.go).
+select id, account_id, app_id, kind, slug, enabled, config,
+       batch_size_max, batch_window_ms, max_attempts,
+       cron_id, source, payload_max_bytes, broker_poison_strategy,
+       created_at, updated_at
+from triggers where enabled = true;
+
+-- name: CountTriggersByApp :one
+select count(*) from triggers where app_id = $1;
+
+-- name: CountTriggersByAccount :one
+select count(*) from triggers t
+join apps a on a.id = t.app_id
+where a.account_id = $1 and a.status <> 'deleted';
+
+-- name: ClaimTriggerRecords :many
+-- FOR UPDATE SKIP LOCKED is the ADR-099 PR-C claim_job_tasks
+-- precedent: concurrent schedd replicas each claim disjoint row
+-- sets. Returns at most $1 records in (pending, retry) state whose
+-- next_fire_at <= now(). The trigger_id constraint scopes the
+-- claim so the poller drains one trigger at a time.
+select id, trigger_id, item_identifier, payload, headers, metadata,
+       state, attempts, next_fire_at, received_at, last_error,
+       last_dispatched_at
+from trigger_records
+where trigger_id = $1
+  and state in ('pending','retry')
+  and next_fire_at <= now()
+order by next_fire_at
+limit $2
+for update skip locked;
+
+-- name: InsertTriggerRecord :one
+-- Review finding #1 (PR #910): the dispatcher MUST persist every
+-- broker-delivered record into trigger_records BEFORE
+-- ClaimTriggerRecords can find them. Without this insert the
+-- entire dispatch tick is dead — ClaimTriggerRecords returns 0
+-- rows, the broker messages accumulate forever in poller.inFlight,
+-- and the unified Trigger primitive never fires a function.
+--
+-- ON CONFLICT (trigger_id, item_identifier) DO NOTHING mirrors the
+-- broker-side dedupe guarantee (kafka per-partition offset,
+-- NATS stream sequence, Redis entry-id, SQS receipt handle,
+-- in-platform invocation_id — all globally unique within their
+-- own ledger). A re-poll after a partial commit + Ack timeout
+-- therefore never inserts a duplicate row.
+--
+-- Returning id gives the dispatcher the trigger_records.id that
+-- ClaimTriggerRecords surfaces under FOR UPDATE SKIP LOCKED,
+-- bridging the item_identifier → row_id namespace the
+-- ReportBatchItemFailures handler needs.
+insert into trigger_records (trigger_id, item_identifier, payload, headers, metadata)
+values ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+on conflict (trigger_id, item_identifier) do nothing
+returning id;
+
+-- name: MarkTriggerRecordSucceeded :exec
+update trigger_records
+   set state = 'succeeded',
+       last_dispatched_at = now()
+ where id = $1;
+
+-- name: MarkTriggerRecordRetry :exec
+update trigger_records
+   set state = 'retry',
+       attempts = attempts + 1,
+       last_error = $2,
+       last_dispatched_at = now(),
+       next_fire_at = $3
+ where id = $1;
+
+-- name: MarkTriggerRecordDeadLetter :exec
+update trigger_records
+   set state = 'dead_letter',
+       attempts = attempts + 1,
+       last_error = $2,
+       last_dispatched_at = now()
+ where id = $1;
+
+-- name: InsertTriggerDeadLetter :exec
+-- One row per dead-lettered record. The reason is the closed-vocab
+-- failure mode (rate_limited, poison_record, max_attempts,
+-- broker_error, plan_quota, payload_too_large, customer_disabled);
+-- the routed_to is the closed-vocab terminal action (drop,
+-- manual_retry, customer_dlq). detail carries any per-reason payload
+-- (the broker error text, the payload size that tripped the 6MB
+-- cap, etc.) for the dashboard read-back.
+insert into trigger_dead_letter (record_id, trigger_id, reason, routed_to, detail)
+values ($1, $2, $3, $4, $5::jsonb);
+
+-- name: ListTriggerDeadLetter :many
+select record_id, trigger_id, reason, routed_to, detail, created_at
+from trigger_dead_letter
+where trigger_id = $1
+order by created_at desc
+limit $2;
+
+-- name: ListTriggerRecordsForTrigger :many
+-- Used by GET /v1/triggers/{id}/records (dashboard + apid handler).
+-- Returns records in dispatch-time order with the standard projection.
+select id, trigger_id, item_identifier, payload, headers, metadata,
+       state, attempts, next_fire_at, received_at, last_error,
+       last_dispatched_at
+from trigger_records
+where trigger_id = $1
+order by received_at desc
+limit $2;
+
+-- name: TriggerRecordIDByItemIdentifier :one
+-- Audit round 2 finding #1 (PR #910): deadLetterAll() is invoked
+-- with broker-side handles (kafka offset, NATS seq, SQS receipt
+-- handle, Redis entry-id, queue invocation_id) but the
+-- trigger_dead_letter.record_id column is a UUID FK into
+-- trigger_records.id. The dispatcher needs to bridge the
+-- item_identifier namespace to the row UUID before calling
+-- InsertTriggerDeadLetter — otherwise every rate-limit denial
+-- trips SQLSTATE 23503 and the dead_letter row is silently
+-- dropped, MarkTriggerRecordDeadLetter updates 0 rows, the
+-- record stays in poller.inFlight forever, and the broker
+-- offset never advances.
+--
+-- Returns the trigger_records.id for the (trigger_id,
+-- item_identifier) pair, or an empty pgtype.UUID (and nil
+-- error) when no row exists yet — that case fires when the
+-- rate-limit gate denies a record before InsertTriggerRecord
+-- has had a chance to run. Callers MUST treat the empty UUID
+-- as "skip the dead_letter insert; leave the record in
+-- poller.inFlight for the next tick to retry".
+select id
+from trigger_records
+where trigger_id = $1
+  and item_identifier = $2;
 -- ─── OIDC / keyless deploy auth (ADR-101, issue #270) ───────────────────
 --
 -- Per-(account_id, issuer_url) trust policy CRUD + exchanged-token

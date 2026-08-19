@@ -1818,6 +1818,22 @@ const CodePlanWebhooksNotAllowed = "plan_webhooks_not_allowed"
 // can branch on upsell-vs-delete copy without parsing the body.
 const CodePlanWebhookQuota = "plan_webhook_quota"
 
+// CodePlanTriggersNotAllowed is the 402 the customer sees when
+// the plan doesn't unlock the unified Trigger primitive at all
+// (Free today, issue #757 / ADR-0NN). Mirrors CodePlanCronsNotAllowed
+// and CodePlanWebhooksNotAllowed. The handler rejects BEFORE loadApp
+// so a Free customer posting to a non-existent slug gets the upsell
+// instead of a 404 that would leak the slug's existence (PR review
+// finding F4 mirrored from createAlertRule / createAppWebhook).
+const CodePlanTriggersNotAllowed = "plan_triggers_not_allowed"
+
+// CodePlanTriggerQuota is the 403 the customer sees when the plan
+// DOES unlock triggers but the per-app or per-account cap was
+// reached. Distinct from CodePlanTriggersNotAllowed so the CLI
+// can branch on upsell-vs-delete copy without parsing the body.
+// Mirrors CodePlanCronQuota / CodePlanWebhookQuota.
+const CodePlanTriggerQuota = "plan_trigger_quota"
+
 // CodePlanLogArchiveNotAllowed is the 402 the customer sees when
 // they request ?archive=1 against an app on a plan whose
 // LogArchiveEnabled() returns false (Free today, issue #562).
@@ -2054,6 +2070,37 @@ func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem 
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
 		WithDocs(docsBase + "/plans#webhooks")
+}
+
+// ErrPlanTriggersNotAllowed is returned by apid's createTrigger /
+// listTriggers handlers when the customer's plan has
+// TriggerLimitPerApp == 0 (Free today, issue #757 / ADR-0NN).
+// Fires BEFORE loadApp so a Free customer posting to a non-existent
+// slug gets a clean 402 instead of a 404 (and the reverse — a
+// Free customer on a real slug gets 402, not a 404 masquerading as
+// plan-gating). PR review finding F4 mirrored from createAlertRule
+// and createAppWebhook.
+func ErrPlanTriggersNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanTriggersNotAllowed,
+		"Triggers unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include event-source mappings (Kafka, NATS, Redis Streams, SQS-compatible, in-platform queue); upgrade to Hobby or above to subscribe.", p)).
+		WithDocs(docsBase + "/plans#triggers")
+}
+
+// ErrPlanTriggerQuota is returned when CreateTriggerIfUnderQuota
+// surfaces a *state.TriggerQuotaError. Scope "app" or "account"
+// tells the handler which cap fired so the body can name it. 403
+// (not 402) because the plan DOES unlock triggers — the right
+// copy is "delete a trigger to add another", not "upgrade to
+// Hobby". Mirrors ErrPlanCronQuota / ErrPlanWebhookQuota.
+func ErrPlanTriggerQuota(plan Plan, scope string, limit, observed int) *Problem {
+	scopeName := PlanQuotaScopeDisplayName(scope)
+	return NewProblem(http.StatusForbidden, CodePlanTriggerQuota,
+		"Trigger limit reached",
+		fmt.Sprintf("%s plan caps triggers at %d for %s; you have %d. Delete one to add another.",
+			plan, limit, scopeName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#triggers")
 }
 
 // ErrAppWebhookInvalid is returned for malformed webhook bodies:

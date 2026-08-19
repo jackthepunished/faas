@@ -84,6 +84,12 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         "image_digest":"sha256:..."}      // image_digest when kind=image
 //	NotifyDomainChanged     {"domain":"..."}
 //	NotifyCronChanged       {"cron_id":uuid, "app_id":uuid}
+//	NotifyTriggerChanged    {"kind":"created|updated|deleted|paused|resumed",
+//	                         "trigger_id":uuid, "app_id":uuid}
+//	                         (issue #757 / ADR-0NN — listeners: schedd
+//	                         trigger-fanout, dashboard SSE; mirrors
+//	                         NotifyCronChanged's payload shape so the
+//	                         existing decoder pattern applies unchanged)
 //	NotifyKeyChanged        {"key_id":uuid}
 //	NotifyBuildQueued       {"build_id":uuid, "app_id":uuid,
 //	                         "kind":"tarball|dockerfile|function",
@@ -167,17 +173,30 @@ const (
 	NotifyDeploymentChanged = "deployment_changed"
 	NotifyDomainChanged     = "domain_changed"
 	NotifyCronChanged       = "cron_changed"
-	NotifyKeyChanged        = "key_changed"
-	NotifyBuildQueued       = "build_queued"
-	NotifyBuildLog          = "build_log"
-	NotifyDomainVerify      = "domain_verify"
-	NotifyInstanceChanged   = "instance_changed"
-	NotifySnapshotPrime     = "snapshot_prime"
-	NotifySnapshotBoot      = "snapshot_boot"
-	NotifySnapshotWritten   = "snapshot_written"
-	NotifyBillingPastDue    = "billing_past_due"
-	NotifyQuotaWarning      = "quota_warning"
-	NotifyCronFired         = "cron_fired"
+	NotifyTriggerChanged    = "trigger_changed"
+	// NotifyTriggerReady fires when a row is inserted into
+	// trigger_records (migrations/00297_triggers.sql). schedd's
+	// dispatch tick consumes via cmd/schedd/main.go's existing
+	// SubscribeWithReconnect block. Listeners:
+	//   - pkg/sched/dispatch_triggers.go (runTriggerTick fan-in
+	//     from any source — kind=queue pulls existing rows on
+	//     next tick, kind=kafka/nats/redis/sqs get the immediate
+	//     wake-up signal so an idle broker doesn't sit for a
+	//     full 1s tick before the first batch)
+	//   - dashboard SSE (commit #16 / §4.7.X — operator-facing
+	//     "your trigger just received a record" notification)
+	NotifyTriggerReady    = "trigger_ready"
+	NotifyKeyChanged      = "key_changed"
+	NotifyBuildQueued     = "build_queued"
+	NotifyBuildLog        = "build_log"
+	NotifyDomainVerify    = "domain_verify"
+	NotifyInstanceChanged = "instance_changed"
+	NotifySnapshotPrime   = "snapshot_prime"
+	NotifySnapshotBoot    = "snapshot_boot"
+	NotifySnapshotWritten = "snapshot_written"
+	NotifyBillingPastDue  = "billing_past_due"
+	NotifyQuotaWarning    = "quota_warning"
+	NotifyCronFired       = "cron_fired"
 	// NotifyRateLimitChanged fires on every INSERT / UPDATE of
 	// tokens/last_refill on pg_ratelimit_counters (migration
 	// 00126, the C4 trigger). Payload is JSON

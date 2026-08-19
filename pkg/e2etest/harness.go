@@ -592,15 +592,20 @@ const testDomain = "apps.test.example"
 // pre-check via `gh api .../contents/migrations?ref=main`
 // before opening the PR per the cross-PR slot precheck pattern.
 //
-// Triggers-mega audit #10: bumped 237 → 275 for the
-// BrokerPoisonStrategy migration (00275_triggers_poison_strategy.sql).
-// 275 is the next free integer above the live head (00274
-// payload_max, also in this branch) so a future migration merely
-// bumps this constant again. The discipline (memory:
+// Triggers-mega audit #10: bumped 237 → 275 → 287 → 290 → 296 → 297/298/299
+// across the post-rebase renumber chain. The BrokerPoisonStrategy
+// migration is 00299_triggers_poison_strategy.sql, payload_max
+// is 00298, and the unified triggers schema is 00297. The
+// head bumped 287 → 290 → 296 → 297 because main absorbed PR #963's
+// 00287_pg_ratelimit_add_rule_scope.sql, then PR #978's 00293
+// validate_mode + 00288-00295 cross-PR slot fences, then PR #986's
+// ADR-120 domain doctor claimed 00296_domain_doctor_observations
+// before PR #910's renumber cycle could land. A future migration
+// merely bumps this constant again. The discipline (memory:
 // cross-pr-slot-gate-fence-pattern) is that the only line a
 // migration land touches in this file is this constant + the
 // doc-comment history above.
-const e2eMigrationTarget = 275
+const e2eMigrationTarget = 299
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

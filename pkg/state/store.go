@@ -184,6 +184,42 @@ func (e *CronQuotaError) Is(target error) bool {
 // ErrCronQuotaExceeded is the sentinel callers compare against via errors.Is.
 var ErrCronQuotaExceeded = errors.New("state: cron quota exceeded")
 
+// TriggerQuotaScope names the cap that CreateTriggerIfUnderQuota
+// tripped on. Mirrors CronQuotaScope so the apid handler can render
+// the same "delete one to add another" copy regardless of which
+// surface (cron / webhook / trigger) the quota came from.
+type TriggerQuotaScope string
+
+const (
+	// TriggerQuotaScopeApp is set when limits.TriggerLimitPerApp was reached.
+	TriggerQuotaScopeApp TriggerQuotaScope = "app"
+	// TriggerQuotaScopeAccount is set when limits.TriggerLimitPerAccount was reached.
+	TriggerQuotaScopeAccount TriggerQuotaScope = "account"
+)
+
+// TriggerQuotaError is returned by CreateTriggerIfUnderQuota when
+// either cap (per-app or per-account) is reached (issue #757 /
+// ADR-0NN). Distinct from CronQuotaError so the apid handler can
+// branch on the typed error and emit CodePlanTriggerQuota rather
+// than CodePlanCronQuota. errors.As recovers Scope/Limit/Observed.
+type TriggerQuotaError struct {
+	Scope    TriggerQuotaScope
+	Limit    int
+	Observed int
+}
+
+func (e *TriggerQuotaError) Error() string {
+	return fmt.Sprintf("state: trigger quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
+// Is allows errors.Is(err, ErrTriggerQuotaExceeded) to match any *TriggerQuotaError.
+func (e *TriggerQuotaError) Is(target error) bool {
+	return target == ErrTriggerQuotaExceeded
+}
+
+// ErrTriggerQuotaExceeded is the sentinel callers compare against via errors.Is.
+var ErrTriggerQuotaExceeded = errors.New("state: trigger quota exceeded")
+
 // ErrReplay is returned by CheckWebhookReplay when a webhook delivery
 // has been seen inside its dedupe window. Webhook ingresses respond
 // 200 on this error (idempotent — the upstream provider interprets
@@ -1984,6 +2020,67 @@ type Store interface {
 	// dispatched through gatewayd-internal (spec §4.4, M7). MemStore keeps a
 	// lastFiredAt map; PgStore uses a column added in migration 00003.
 	MarkCronFired(ctx context.Context, cronID string, at time.Time) error
+
+	// Trigger primitive (issue #757 / ADR-0NN; commit #5 + commit #6).
+	// Per-method notes:
+	//
+	//   - TriggerByID / UpdateTrigger / DeleteTrigger take string IDs
+	//     because the customer-facing api surfaces string UUIDs on
+	//     the wire. The pgx-via-pgtype.UUID conversions live inside
+	//     PgStore so the Store interface is uniform with the cron
+	//     family (CreateCronIfUnderQuota, CronByID, etc.).
+	//
+	//   - CreateTriggerIfUnderQuota mirrors CreateCronIfUnderQuota's
+	//     FOR UPDATE apps-row lock to defeat the per-app vs
+	//     per-account TOCTOU window (see cron precedent in this
+	//     Store interface above).
+	//
+	//   - ListTriggersForApp is the dashboard read-back
+	//     (GET /v1/triggers). ListEnabledTriggers is the schedd's
+	//     1-second tick scan (commit #14).
+	//
+	//   - ClaimTriggerRecords uses FOR UPDATE SKIP LOCKED so two
+	//     concurrent dispatch workers (multi-host scale-out)
+	//     distribute claims without retry-on-collision. Each call
+	//     claims up to `limit` records for one trigger.
+	//
+	//   - Mark* writers are dispatcher-owned (commit #14): the
+	//     apid-side operator verbs (retry / drop) bypass this seam.
+	TriggerByID(ctx context.Context, id string) (sqlc.Trigger, error)
+	UpdateTrigger(ctx context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string) (sqlc.Trigger, error)
+	DeleteTrigger(ctx context.Context, id, appID string) error
+	ListTriggersForApp(ctx context.Context, appID string) ([]sqlc.Trigger, error)
+	ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, error)
+	CreateTriggerIfUnderQuota(ctx context.Context, appID, kind, slug string, enabled bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes int32, brokerPoisonStrategy string, limits api.Limits) (sqlc.Trigger, error)
+	ClaimTriggerRecords(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error)
+	// InsertTriggerRecord persists a single broker-delivered record
+	// into the trigger_records FSM queue so a subsequent
+	// ClaimTriggerRecords call can pick it up. Returns the
+	// persisted (or existing-on-conflict) trigger_records.id; the
+	// dispatcher uses this id as the durable identity for the rest
+	// of the FSM walk (succeeded / retry / dead_letter transitions).
+	//
+	// Review finding #1 (PR #910): without this insert, the
+	// dispatch tick is structurally dead — ClaimTriggerRecords
+	// returns 0 rows because nothing ever writes to trigger_records.
+	InsertTriggerRecord(ctx context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error)
+	MarkTriggerRecordSucceeded(ctx context.Context, id string) error
+	MarkTriggerRecordRetry(ctx context.Context, id, lastError string, nextFireAt time.Time) error
+	MarkTriggerRecordDeadLetter(ctx context.Context, id, lastError string) error
+	InsertTriggerDeadLetter(ctx context.Context, recordID, triggerID, reason, routedTo string, detail []byte) error
+	// TriggerRecordIDByItemIdentifier resolves a broker-side handle
+	// (kafka offset, NATS seq, SQS receipt handle, Redis entry-id,
+	// queue invocation_id) to the durable trigger_records.id UUID
+	// the dead_letter FK expects. Returns ("", nil) when no row
+	// exists yet (rate-limit fires before the record insert on the
+	// next dispatch step); callers MUST treat the empty string as
+	// "skip the dead_letter insert; the record will be retried on
+	// the next tick". See audit round 2 finding #1 (PR #910).
+	TriggerRecordIDByItemIdentifier(ctx context.Context, triggerID, itemIdentifier string) (string, error)
+	ListTriggerDeadLetter(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerDeadLetter, error)
+	ListTriggerRecordsForTrigger(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error)
+	RetryTriggerRecordByOperator(ctx context.Context, id string) error
+	DropTriggerRecordByOperator(ctx context.Context, id string) error
 
 	// Fire-now request queue (ADR-090 PR-C / migrations/00193).
 	// apid inserts on POST /v1/crons/{id}/run; schedd claims +

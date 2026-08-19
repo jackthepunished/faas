@@ -1161,6 +1161,117 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
 
+// --- Triggers (issue #757 / ADR-100) ----------------------------------------
+// Unified event-source-mapping primitive. Method names follow the
+// convention pinned by cmd/sdk-coverage/main.go::methodRouteMap.
+
+// GetTriggers lists every trigger owned by the calling account,
+// optionally filtered by app_id and/or kind. Newest-first by
+// created_at.
+func (c *Client) GetTriggers(ctx context.Context, appID string, kind TriggerKind) ([]Trigger, error) {
+	path := "/v1/triggers"
+	q := url.Values{}
+	if appID != "" {
+		q.Set("app_id", appID)
+	}
+	if kind != "" {
+		q.Set("kind", string(kind))
+	}
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	var out []Trigger
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// PostTriggers creates a new trigger. The Idempotency-Key header is
+// auto-minted (TestDo_MutatingCallsCarryIdempotencyKey).
+func (c *Client) PostTriggers(ctx context.Context, req CreateTriggerRequest) (Trigger, error) {
+	var out Trigger
+	return out, c.do(ctx, "POST", "/v1/triggers", req, &out)
+}
+
+// GetTriggersId returns one trigger.
+func (c *Client) GetTriggersId(ctx context.Context, id string) (Trigger, error) {
+	var out Trigger
+	return out, c.do(ctx, "GET", "/v1/triggers/"+id, nil, &out)
+}
+
+// PatchTriggersId is a partial update.
+func (c *Client) PatchTriggersId(ctx context.Context, id string, req UpdateTriggerRequest) (Trigger, error) {
+	var out Trigger
+	return out, c.do(ctx, "PATCH", "/v1/triggers/"+id, req, &out)
+}
+
+// DeleteTriggersId removes the trigger; ON DELETE CASCADE drops the
+// trigger_records and trigger_dead_letter rows.
+func (c *Client) DeleteTriggersId(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/triggers/"+id, nil, nil)
+}
+
+// PostTriggersIdPause sets enabled=false and emits trigger_changed pg_notify.
+func (c *Client) PostTriggersIdPause(ctx context.Context, id string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/pause", nil, nil)
+}
+
+// PostTriggersIdResume sets enabled=true and emits trigger_changed pg_notify.
+func (c *Client) PostTriggersIdResume(ctx context.Context, id string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/resume", nil, nil)
+}
+
+// GetTriggersIdRecords returns records for one trigger.
+func (c *Client) GetTriggersIdRecords(ctx context.Context, id, state string) (ListTriggerRecordsResponse, error) {
+	path := "/v1/triggers/" + id + "/records"
+	if state != "" {
+		path += "?state=" + state
+	}
+	var out ListTriggerRecordsResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// PostTriggersIdRecordsRidRetry moves a single record from retry/
+// dead_letter back to pending. Operator-only scope on the server.
+func (c *Client) PostTriggersIdRecordsRidRetry(ctx context.Context, id, recordID string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/records/"+recordID+"/retry", nil, nil)
+}
+
+// PostTriggersIdRecordsRidDrop marks a dead-letter row routed_to=drop
+// (already the default; this is the explicit acknowledgement).
+func (c *Client) PostTriggersIdRecordsRidDrop(ctx context.Context, id, recordID string) error {
+	return c.do(ctx, "POST", "/v1/triggers/"+id+"/records/"+recordID+"/drop", nil, nil)
+}
+
+// GetTriggersIdDlq returns rows from trigger_dead_letter for the trigger.
+func (c *Client) GetTriggersIdDlq(ctx context.Context, id, reason string) (ListTriggerDeadLetterResponse, error) {
+	path := "/v1/triggers/" + id + "/dlq"
+	if reason != "" {
+		path += "?reason=" + reason
+	}
+	var out ListTriggerDeadLetterResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetTriggersIdMetrics returns the per-state count roll-up. Not the
+// Prometheus surface; /v1/metrics is.
+func (c *Client) GetTriggersIdMetrics(ctx context.Context, id string) (TriggerMetricsResponse, error) {
+	var out TriggerMetricsResponse
+	return out, c.do(ctx, "GET", "/v1/triggers/"+id+"/metrics", nil, &out)
+}
+
+// PostInvocationsDispatchBatch is the internal route schedd uses to
+// post a closed batch envelope (size / window / 6MB cap). The function
+// under the trigger responds with ReportBatchItemFailures verbatim.
+func (c *Client) PostInvocationsDispatchBatch(ctx context.Context, body map[string]any) error {
+	return c.do(ctx, "POST", "/v1/invocations:dispatch_batch", body, nil)
+}
+
+// PostTriggersBatchCreate applies a gregale.yaml triggers fragment in
+// one transaction (dashboard-only shortcut).
+func (c *Client) PostTriggersBatchCreate(ctx context.Context, req CreateTriggerBatchRequest) (map[string]any, error) {
+	var out map[string]any
+	return out, c.do(ctx, "POST", "/v1/triggers:batch_create", req, &out)
+}
+
 // FireCron manually triggers a cron fire-now (issue #791 PR-C /
 // ADR-090). The endpoint is asynchronous: apid inserts a pending row
 // into cron_fire_now_requests and emits db.NotifyCronRunNow; schedd

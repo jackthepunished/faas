@@ -920,6 +920,49 @@ type TenantSurface struct {
 	UpdatedAt     pgtype.Timestamptz
 }
 
+type Trigger struct {
+	ID                   pgtype.UUID
+	AccountID            pgtype.UUID
+	AppID                pgtype.UUID
+	Kind                 string
+	Slug                 string
+	Enabled              bool
+	Config               []byte
+	BatchSizeMax         int32
+	BatchWindowMs        int32
+	MaxAttempts          int32
+	CronID               pgtype.UUID
+	Source               pgtype.Text
+	PayloadMaxBytes      int32
+	BrokerPoisonStrategy string
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+type TriggerDeadLetter struct {
+	RecordID  pgtype.UUID
+	TriggerID pgtype.UUID
+	Reason    string
+	RoutedTo  string
+	Detail    []byte
+	CreatedAt pgtype.Timestamptz
+}
+
+type TriggerRecord struct {
+	ID               pgtype.UUID
+	TriggerID        pgtype.UUID
+	ItemIdentifier   string
+	Payload          []byte
+	Headers          []byte
+	Metadata         []byte
+	State            string
+	Attempts         int32
+	NextFireAt       pgtype.Timestamptz
+	ReceivedAt       pgtype.Timestamptz
+	LastError        pgtype.Text
+	LastDispatchedAt pgtype.Timestamptz
+}
+
 // Per-(account, app, day) materialised rollup of usage_minutes. Populated by the meterd cron tick FAAS_ROLLUP_INTERVAL (default 5 min) via INSERT ... SELECT ... GROUP BY with ON CONFLICT additive merge. Read by GET /v1/usage/daily. ADR-048. Informational — not billed.
 type UsageDaily struct {
 	AccountID  pgtype.UUID

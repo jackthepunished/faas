@@ -117,6 +117,8 @@ type MemStore struct {
 	buildProvenance map[string]BuildProvenance
 	domains         map[string]CustomDomain
 	crons           map[string]Cron
+	triggers        map[string]sqlc.Trigger
+	records         map[string]sqlc.TriggerRecord
 	// fireNowRequests mirrors cron_fire_now_requests (migrations/00193)
 	// for in-process handler tests. Keyed by request id (UUID);
 	// status transitions follow the production 5-state CHECK (pending
@@ -4951,6 +4953,278 @@ func (m *MemStore) ListEnabledCrons(_ context.Context) ([]Cron, error) {
 		}
 	}
 	return out, nil
+}
+
+// --- Triggers (issue #757 / ADR-0NN; commit #6) -------------------------
+//
+// MemStore keeps an in-memory map mirroring the pgstore triggers /
+// trigger_records / trigger_dead_letter tables. The triggers map is
+// keyed by id (uuid); records are keyed by id; the dead-letter
+// queue is keyed by record id. The handlers + schedd tests use the
+// memstore rather than spinning up Postgres.
+//
+// The MemStore triggers implement only the Store-interface surface
+// (CRUD + per-app fan-out + the per-record transition verbs the
+// apid operator actions invoke). The schedd-side dispatch tick
+// (#14) reads from ListEnabledTriggers + ClaimTriggerRecords; both
+// are stubbed here so tests can run without a live Postgres.
+
+func (m *MemStore) CreateTriggerIfUnderQuota(_ context.Context, appID, kind, slug string, enabled bool, _ []byte, _, _, _, payloadMaxBytes int32, brokerPoisonStrategy string, limits api.Limits) (sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	perApp := 0
+	perAccount := 0
+	for _, t := range m.triggers {
+		if t.AppID.String() == appID {
+			perApp++
+		}
+	}
+	if limits.TriggerLimitPerApp > 0 && perApp >= limits.TriggerLimitPerApp {
+		return sqlc.Trigger{}, &TriggerQuotaError{Scope: TriggerQuotaScopeApp, Limit: limits.TriggerLimitPerApp, Observed: perApp}
+	}
+	for range m.triggers {
+		perAccount++ // memstore has no per-account join — single-app single-account default
+	}
+	if limits.TriggerLimitPerAccount > 0 && perAccount >= limits.TriggerLimitPerAccount {
+		return sqlc.Trigger{}, &TriggerQuotaError{Scope: TriggerQuotaScopeAccount, Limit: limits.TriggerLimitPerAccount, Observed: perAccount}
+	}
+	if payloadMaxBytes <= 0 {
+		payloadMaxBytes = 6291456
+	}
+	if brokerPoisonStrategy == "" {
+		brokerPoisonStrategy = "commit"
+	}
+	t := sqlc.Trigger{
+		ID:                   pgtype.UUID{Bytes: memNewUUID(), Valid: true},
+		AccountID:            pgtype.UUID{Bytes: memNewUUID(), Valid: true},
+		AppID:                pgtype.UUID{Bytes: parseMemUUIDString(appID), Valid: true},
+		Kind:                 kind,
+		Slug:                 slug,
+		Enabled:              enabled,
+		Config:               []byte("{}"),
+		BatchSizeMax:         64,
+		BatchWindowMs:        1000,
+		MaxAttempts:          5,
+		PayloadMaxBytes:      payloadMaxBytes,
+		BrokerPoisonStrategy: brokerPoisonStrategy,
+		CreatedAt:            pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		UpdatedAt:            pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}
+	if m.triggers == nil {
+		m.triggers = map[string]sqlc.Trigger{}
+	}
+	m.triggers[t.ID.String()] = t
+	return t, nil
+}
+
+func (m *MemStore) TriggerByID(_ context.Context, id string) (sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.triggers[id]
+	if !ok {
+		return sqlc.Trigger{}, ErrNotFound
+	}
+	return t, nil
+}
+
+func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, _ []byte, _, _, _, payloadMaxBytes *int32, brokerPoisonStrategy *string) (sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.triggers[id]
+	if !ok {
+		return sqlc.Trigger{}, ErrNotFound
+	}
+	if enabled != nil {
+		t.Enabled = *enabled
+	}
+	if payloadMaxBytes != nil {
+		t.PayloadMaxBytes = *payloadMaxBytes
+	}
+	if brokerPoisonStrategy != nil {
+		t.BrokerPoisonStrategy = *brokerPoisonStrategy
+	}
+	t.UpdatedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	m.triggers[id] = t
+	return t, nil
+}
+
+func (m *MemStore) DeleteTrigger(_ context.Context, id, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.triggers, id)
+	return nil
+}
+
+func (m *MemStore) ListTriggersForApp(_ context.Context, appID string) ([]sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.Trigger
+	for _, t := range m.triggers {
+		if t.AppID.String() == appID {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) ListEnabledTriggers(_ context.Context) ([]sqlc.Trigger, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.Trigger
+	for _, t := range m.triggers {
+		if t.Enabled {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) ClaimTriggerRecords(_ context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.TriggerRecord
+	for _, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.State == "pending" && len(out) < int(limit) {
+			r.State = "claimed"
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// InsertTriggerRecord mirrors PgStore.InsertTriggerRecord for the
+// in-memory store. Returns the persisted (or existing-on-duplicate)
+// record id. Mirrors the ON CONFLICT (trigger_id, item_identifier)
+// DO NOTHING semantics with a Map key probe; on a duplicate the
+// existing row's id is returned so callers don't need a second
+// lookup. Review finding #1 (PR #910).
+func (m *MemStore) InsertTriggerRecord(_ context.Context, triggerID, itemIdentifier string, payload, headers, metadata []byte) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Dedup probe — mirrors ON CONFLICT DO NOTHING on the
+	// (trigger_id, item_identifier) unique pair.
+	for id, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.ItemIdentifier == itemIdentifier {
+			return id, nil
+		}
+	}
+	id := uuid.NewString()
+	now := time.Now()
+	if payload == nil {
+		payload = []byte("{}")
+	}
+	if headers == nil {
+		headers = []byte("{}")
+	}
+	if metadata == nil {
+		metadata = []byte("{}")
+	}
+	m.records[id] = sqlc.TriggerRecord{
+		ID:             pgtype.UUID{Bytes: parseMemUUIDString(id), Valid: true},
+		TriggerID:      pgtype.UUID{Bytes: parseMemUUIDString(triggerID), Valid: true},
+		ItemIdentifier: itemIdentifier,
+		Payload:        payload,
+		Headers:        headers,
+		Metadata:       metadata,
+		State:          "pending",
+		Attempts:       0,
+		NextFireAt:     pgtypeFromTime(now),
+		ReceivedAt:     pgtypeFromTime(now),
+	}
+	return id, nil
+}
+
+func (m *MemStore) MarkTriggerRecordSucceeded(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if ok {
+		r.State = "succeeded"
+		m.records[id] = r
+	}
+	return nil
+}
+
+func (m *MemStore) MarkTriggerRecordRetry(_ context.Context, id, _ string, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if ok {
+		r.State = "retry"
+		m.records[id] = r
+	}
+	return nil
+}
+
+func (m *MemStore) MarkTriggerRecordDeadLetter(_ context.Context, id, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if ok {
+		r.State = "dead_letter"
+		m.records[id] = r
+	}
+	return nil
+}
+
+func (m *MemStore) InsertTriggerDeadLetter(_ context.Context, _, _, _, _ string, _ []byte) error {
+	return nil
+}
+
+// TriggerRecordIDByItemIdentifier (audit round 2 finding #1,
+// PR #910): the MemStore's InsertTriggerRecord builds a UUID
+// for the row at insert time; the bridge helper walks m.records
+// to find the matching UUID. Returns "" (nil err) when no row
+// matches — callers treat that as "rate-limit fired before
+// insert; skip the dead_letter; record will be retried".
+func (m *MemStore) TriggerRecordIDByItemIdentifier(_ context.Context, triggerID, itemIdentifier string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.records {
+		if r.TriggerID.String() == triggerID && r.ItemIdentifier == itemIdentifier {
+			return r.ID.String(), nil
+		}
+	}
+	return "", nil
+}
+
+func (m *MemStore) ListTriggerDeadLetter(_ context.Context, _ string, _ int32) ([]sqlc.TriggerDeadLetter, error) {
+	return nil, nil
+}
+
+func (m *MemStore) ListTriggerRecordsForTrigger(_ context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []sqlc.TriggerRecord
+	for _, r := range m.records {
+		if r.TriggerID.String() == triggerID && len(out) < int(limit) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) RetryTriggerRecordByOperator(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.records[id]
+	if !ok {
+		return ErrNotFound
+	}
+	r.State = "pending"
+	r.Attempts = 0
+	m.records[id] = r
+	return nil
+}
+
+func (m *MemStore) DropTriggerRecordByOperator(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.records[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.records, id)
+	return nil
 }
 
 // --- Invocations (Move 1 event-shaped queue: async_invoke / queue /
@@ -12101,4 +12375,27 @@ func uuidToPgtype(s string) pgtype.UUID {
 // consistent with pgstore.
 func pgtypeTimestamptzFromTime(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+}
+
+// memNewUUID returns a freshly-minted 16-byte UUID for the
+// memstore's trigger-stub helpers (commit #6). Real production
+// code never sees this — the apid's MemStore tests do.
+func memNewUUID() [16]byte {
+	var b [16]byte
+	b[0] = byte(time.Now().UnixNano() & 0xff)
+	b[6] = (b[6] & 0x0f) | 0x40 // version 7
+	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC4122
+	return b
+}
+
+// parseMemUUIDString decodes a hyphenated hex string UUID into a
+// [16]byte for memstore internals.
+func parseMemUUIDString(s string) [16]byte {
+	var b [16]byte
+	uid, err := uuid.Parse(s)
+	if err != nil {
+		return b
+	}
+	copy(b[:], uid[:])
+	return b
 }

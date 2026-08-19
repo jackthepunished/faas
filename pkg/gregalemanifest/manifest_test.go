@@ -98,11 +98,17 @@ func TestValidate_HappyPath(t *testing.T) {
 }
 
 func TestValidate_UnknownKind(t *testing.T) {
+	// "rabbitmq" is a kind we genuinely don't support — neither in
+	// the cron-PR-C vocabulary nor in the ADR-0NN six-value widening.
+	// (ADR-0NN widens to cron/kafka/nats/redis_streams/sqs_compat/queue,
+	// so "queue" is now a valid kind and would not exercise the
+	// unknown-kind branch — pinning "rabbitmq" here keeps the
+	// pre-widening test stable through the rename.)
 	m := &Manifest{Triggers: []Trigger{
-		{Kind: "queue", App: "x", Schedule: "0 3 * * *", Path: "/y"},
+		{Kind: "rabbitmq", App: "x", Schedule: "0 3 * * *", Path: "/y"},
 	}}
 	err := m.Validate()
-	if err == nil || !strings.Contains(err.Error(), "unsupported trigger kind \"queue\"") {
+	if err == nil || !strings.Contains(err.Error(), "unsupported trigger kind \"rabbitmq\"") {
 		t.Errorf("err = %v, want unsupported-kind message", err)
 	}
 }
@@ -177,4 +183,223 @@ func TestIsEnabled(t *testing.T) {
 	}
 }
 
+// ptrBool returns a pointer to b — the YAML decoder distinguishes
+// nil (absent) from explicit values via the pointer.
 func ptrBool(b bool) *bool { return &b }
+
+// Issue #757 / ADR-0NN: the manifest widens from kind=cron-only to a
+// six-value closed vocabulary (cron, kafka, nats, redis_streams,
+// sqs_compat, queue). The following table-driven fixtures pin the
+// happy + sad paths for each of the five new kinds. The cron kind
+// retains the existing TestValidate_* coverage above (no shape change).
+
+// kafkaConfigs is the canonical happy-path config for kind=kafka.
+var kafkaConfig = map[string]any{
+	"brokers": []any{"broker1:9092", "broker2:9092"},
+	"topic":   "orders.v1",
+	"group":   "faas-orders",
+}
+
+func TestValidate_Kafka_Happy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig,
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+func TestValidate_Kafka_MissingBrokers(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{"topic": "orders.v1", "group": "faas-orders"},
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "non-empty brokers") {
+		t.Errorf("err = %v, want non-empty brokers message", err)
+	}
+}
+
+func TestValidate_Kafka_MissingTopic(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{"brokers": []any{"b:9092"}, "group": "faas-orders"},
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "non-empty topic") {
+		t.Errorf("err = %v, want non-empty topic message", err)
+	}
+}
+
+func TestValidate_NATS_Happy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindNATS, App: "my-api", Slug: "telemetry",
+		Config: map[string]any{
+			"url":     "nats://nats:4222",
+			"stream":  "events",
+			"subject": "events.>",
+			"durable": "faas-telemetry",
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+func TestValidate_NATS_BadScheme(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindNATS, App: "my-api", Slug: "telemetry",
+		Config: map[string]any{
+			"url":     "http://nats:4222",
+			"stream":  "events",
+			"subject": "events.>",
+			"durable": "faas-telemetry",
+		},
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "nats:// or tls://") {
+		t.Errorf("err = %v, want bad-scheme message", err)
+	}
+}
+
+func TestValidate_RedisStreams_Happy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindRedisStreams, App: "my-api", Slug: "cache-invalids",
+		Config: map[string]any{
+			"addr":   "redis:6379",
+			"stream": "cacheinvalids",
+			"group":  "faas-cache",
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+func TestValidate_SQSCompat_Happy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindSQSCompat, App: "my-api", Slug: "ext-jobs",
+		Config: map[string]any{
+			"queue_url":      "http://faas-queue:9090/queues/ext-jobs",
+			"long_poll_secs": 20,
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+func TestValidate_SQSCompat_BadLongPoll(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindSQSCompat, App: "my-api", Slug: "ext-jobs",
+		Config: map[string]any{
+			"queue_url":      "http://faas-queue:9090/queues/ext-jobs",
+			"long_poll_secs": 25,
+		},
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "long_poll_secs") {
+		t.Errorf("err = %v, want long_poll_secs range message", err)
+	}
+}
+
+func TestValidate_Queue_Happy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindQueue, App: "my-api", Slug: "in-platform",
+		Config: map[string]any{"mode": "queue"},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+func TestValidate_Queue_BadMode(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindQueue, App: "my-api", Slug: "in-platform",
+		Config: map[string]any{"mode": "rabbit"},
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Errorf("err = %v, want mode message", err)
+	}
+}
+
+// Non-cron kinds must carry an explicit slug; cron derives its
+// identity from (schedule, path) and continues to omit slug.
+func TestValidate_NonCron_RequiresSlug(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api",
+		Config: kafkaConfig,
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "slug is required") {
+		t.Errorf("err = %v, want slug-required message", err)
+	}
+}
+
+// Slug must be DNS-safe — lowercase + digits + dashes, starts with a
+// letter. Caps / spaces / punctuation surface at `gregale deploy`
+// rather than at apid-request time.
+func TestValidate_SlugNotDNSSafe(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "Bad_Slug!",
+		Config: kafkaConfig,
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Errorf("err = %v, want DNS-safe-slug message", err)
+	}
+}
+
+// Batch/window/attempts must respect the SQL CHECK range. A Hobby
+// customer setting batch_size_max=500 should not get a "range" error
+// here (that's per-plan and enforced server-side); the manifest
+// validator only enforces the SQL CHECK envelope.
+func TestValidate_BatchSizeOutOfRange(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig, BatchSizeMax: 6000,
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "batch_size_max") {
+		t.Errorf("err = %v, want batch_size_max range message", err)
+	}
+}
+
+func TestValidate_MaxAttemptsOutOfRange(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig, MaxAttempts: 30,
+	}}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "max_attempts") {
+		t.Errorf("err = %v, want max_attempts range message", err)
+	}
+}
+
+// Happy-path mixed manifest: cron + kafka + nats + redis_streams +
+// sqs_compat + queue. The combined Validate() runs every kind's
+// validator in a single pass; the cron path keeps its (schedule,
+// path) shape, the five new kinds carry (slug, config).
+func TestValidate_AllSixKinds(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{
+		{Kind: TriggerKindCron, App: "my-api", Schedule: "*/5 * * * *", Path: "/tick"},
+		{Kind: TriggerKindKafka, App: "my-api", Slug: "orders", Config: kafkaConfig},
+		{Kind: TriggerKindNATS, App: "my-api", Slug: "telemetry", Config: map[string]any{
+			"url": "nats://nats:4222", "stream": "events", "subject": "events.>", "durable": "faas",
+		}},
+		{Kind: TriggerKindRedisStreams, App: "my-api", Slug: "cache", Config: map[string]any{
+			"addr": "redis:6379", "stream": "s", "group": "g",
+		}},
+		{Kind: TriggerKindSQSCompat, App: "my-api", Slug: "ext", Config: map[string]any{
+			"queue_url": "http://q:9090/queues/ext",
+		}},
+		{Kind: TriggerKindQueue, App: "my-api", Slug: "in", Config: map[string]any{"mode": "queue"}},
+	}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+// Cron kind does NOT require a slug (its dedupe key is (app,
+// schedule, path)) — pinning the backward-compat shape.
+func TestValidate_Cron_NoSlug(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindCron, App: "my-api", Schedule: "0 3 * * *", Path: "/cleanup",
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil (cron path stays slug-free)", err)
+	}
+}
