@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -337,4 +338,113 @@ func (stubVMM) UpdateEgressAllowlist(context.Context, string, []netip.Prefix) er
 // it.
 func (stubVMM) Logs(context.Context, string, int64, time.Time) (sched.LogStream, error) {
 	return nil, io.EOF
+}
+
+// TestBrokerEgressConfigFromEnv covers PR #993 / issue #757
+// review MED-3 — the env-var seam that wires the broker egress
+// shaper into the dispatch loop. The helper itself is a pure
+// function over os.Getenv, so no runWithDeps fixture is needed
+// (the regression gate for the wiring side is the unit test in
+// pkg/sched + the e2e suite; this table covers the parser).
+//
+// Cases:
+//
+//   - unset             → (zero, false, nil): noop accountor stays.
+//   - positive, default IFNAME → (cfg, true, nil): iface = "faas-brokerq".
+//   - positive, custom  IFNAME → (cfg, true, nil): iface from env.
+//   - zero              → error: 0 must be positive (the field is mbit).
+//   - negative          → error: -1 must be positive.
+//   - non-numeric       → error: "lemon" parses to err.
+//   - error mentions the env var name so operators can grep.
+func TestBrokerEgressConfigFromEnv(t *testing.T) {
+	cases := []struct {
+		name      string
+		mbit      string // empty → env unset
+		ifname    string // empty → env unset
+		wantOK    bool
+		wantErr   bool
+		wantMbit  int
+		wantIface string
+	}{
+		{
+			name:   "unset_returns_noop",
+			wantOK: false,
+		},
+		{
+			name:      "positive_uses_default_ifname",
+			mbit:      "500",
+			wantOK:    true,
+			wantMbit:  500,
+			wantIface: "faas-brokerq",
+		},
+		{
+			name:      "positive_custom_ifname",
+			mbit:      "1000",
+			ifname:    "eth-broker",
+			wantOK:    true,
+			wantMbit:  1000,
+			wantIface: "eth-broker",
+		},
+		{
+			name:    "zero_rejected",
+			mbit:    "0",
+			wantErr: true,
+		},
+		{
+			name:    "negative_rejected",
+			mbit:    "-1",
+			wantErr: true,
+		},
+		{
+			name:    "malformed_rejected",
+			mbit:    "lemon",
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Both env vars default to unset; tests set them
+			// only when the case exercises a value.
+			if tc.mbit != "" {
+				t.Setenv("FAAS_BROKER_EGRESS_MBIT", tc.mbit)
+			} else {
+				// Ensure no leakage from a sibling test.
+				t.Setenv("FAAS_BROKER_EGRESS_MBIT", "")
+			}
+			if tc.ifname != "" {
+				t.Setenv("FAAS_BROKER_EGRESS_IFNAME", tc.ifname)
+			} else {
+				t.Setenv("FAAS_BROKER_EGRESS_IFNAME", "")
+			}
+
+			cfg, ok, err := brokerEgressConfigFromEnv()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("err = nil, want non-nil parse error")
+				}
+				if !strings.Contains(err.Error(), "FAAS_BROKER_EGRESS_MBIT") {
+					t.Errorf("err = %v, want FAAS_BROKER_EGRESS_MBIT prefix", err)
+				}
+				if ok {
+					t.Errorf("ok = true on error path, want false")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return // noop path; cfg must be zero.
+			}
+			if cfg.EgressMbit != tc.wantMbit {
+				t.Errorf("EgressMbit = %d, want %d", cfg.EgressMbit, tc.wantMbit)
+			}
+			if cfg.InterfaceName != tc.wantIface {
+				t.Errorf("InterfaceName = %q, want %q", cfg.InterfaceName, tc.wantIface)
+			}
+		})
+	}
 }
