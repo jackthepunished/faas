@@ -388,17 +388,49 @@ func (s pgStore) UpsertComputeNode(ctx context.Context, name, gitSHA, manifestHa
 	if !validManifestHash(manifestHash) {
 		return "", fmt.Errorf("releaseinstall: manifest_hash %q is not sha256:<64hex>", manifestHash)
 	}
+	// Update first. PostgreSQL validates NOT NULL columns on the INSERT
+	// arm before it considers ON CONFLICT, so the old one-statement
+	// UPSERT failed against the production schema: target_url and the
+	// capacity columns predate the release metadata and have no defaults.
+	// Updating first also preserves the existing node's live placement
+	// contract, capacity, active bit, and role.
 	var id string
 	err := s.pool.QueryRow(ctx, `
-		insert into compute_nodes (name, release_id, manifest_hash, generation)
-		values ($1, $2, $3, 0)
-		on conflict (name) do update
-		set    release_id    = excluded.release_id,
-		       manifest_hash = excluded.manifest_hash
+		update compute_nodes
+		   set release_id = $2,
+		       manifest_hash = $3
+		 where name = $1
 		returning id
 	`, name, gitSHA, manifestHash).Scan(&id)
-	if err != nil {
-		return "", fmt.Errorf("releaseinstall: upsert compute_nodes: %w", err)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("releaseinstall: update compute_nodes: %w", err)
+	}
+
+	// A genuinely new row needs the legacy single-box defaults required by
+	// migrations/00024. Manifest rendering or node registration can refine
+	// these fields later; release installation must not invent a NULL row.
+	err = s.pool.QueryRow(ctx, `
+		insert into compute_nodes
+		    (name, target_url, vpcpus, mem_mb, max_concurrency,
+		     admission_ceiling_mb, release_id, manifest_hash, generation)
+		values ($1, 'unix:///run/faas/vmmd.sock', 160, 56000, 200,
+		        47600, $2, $3, 0)
+		on conflict (name) do nothing
+		returning id
+	`, name, gitSHA, manifestHash).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("releaseinstall: insert compute_nodes: %w", err)
+	}
+	// Another installer won the race between the update and insert. Read
+	// its row and leave its placement fields untouched.
+	if err := s.pool.QueryRow(ctx, `select id from compute_nodes where name = $1`, name).Scan(&id); err != nil {
+		return "", fmt.Errorf("releaseinstall: reread compute_nodes: %w", err)
 	}
 	return id, nil
 }
