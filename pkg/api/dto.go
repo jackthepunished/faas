@@ -1331,7 +1331,24 @@ type DeploymentResponse struct {
 	// that "" is the canonical empty value, so the dashboard /
 	// programmatic consumer can branch on ErrorCode != "".
 	ErrorCode string `json:"error_code,omitempty"`
-	CreatedAt string `json:"created_at"`
+	// ErrorHint / ErrorWhy / ErrorFix are the customer-facing
+	// explanation prose (spec §6.4 amendment 1) stamped alongside
+	// ErrorCode. Mirrors the wire-side Problem.Hint / Why / Fix
+	// fields so post-mortem retrieval via `gregale deployment <id>`
+	// or `gregale inspect <slug> --errors` surfaces the same
+	// 3-5 line shape that the deploy-time Problem emits. Empty for
+	// deployments created before migrations/00290 OR that are not
+	// in a failure state — the dashboard branches on the same
+	// ErrorCode != "" test and renders the four together.
+	ErrorHint string `json:"error_hint,omitempty"`
+	ErrorWhy  string `json:"error_why,omitempty"`
+	ErrorFix  string `json:"error_fix,omitempty"`
+	// ErrorRelevantLogs is the last N log lines that explain the
+	// failure, surfaced inline by the dashboard when the deployment
+	// row carries them. Capped at 20 entries × 512 bytes each (CLI
+	// tripwire; see pkg/whycopy.Render for the catalogue row).
+	ErrorRelevantLogs []LogExcerpt `json:"error_relevant_logs,omitempty"`
+	CreatedAt         string       `json:"created_at"`
 	// HasOverrides is true when the deployment carries an
 	// override_* column set (issue #460 / ADR-053). Lets dashboards
 	// render "this deploy pinned overrides" without re-parsing the

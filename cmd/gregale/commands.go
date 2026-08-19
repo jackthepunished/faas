@@ -520,6 +520,27 @@ func renderAPIError(w io.Writer, e *APIError) {
 	if p.Detail != "" {
 		_, _ = fmt.Fprintf(w, "  %s\n", p.Detail)
 	}
+	// Error-explanations cluster (spec §6.4 amendment 1): surface
+	// the customer-facing hint / why / fix / relevant_logs block
+	// in the same order the whycopy catalog row lists them. Each
+	// new row is gated on a non-empty value so the legacy 3-line
+	// shape (Title / Detail / DocsURL) is unchanged for codes that
+	// the cluster did not catalog yet. The renderers are the
+	// glyph-discipline-aware helpers in output.go (the central
+	// glyph table tripwire at lint_tripwires_test.go:138 pins the
+	// glyphs to a single declaration site).
+	if p.Hint != "" {
+		RenderHintRow(w, p.Hint)
+	}
+	if p.Why != "" {
+		RenderWhyRow(w, p.Why)
+	}
+	if p.Fix != "" {
+		RenderFixRow(w, p.Fix)
+	}
+	if len(p.RelevantLogs) > 0 {
+		RenderRelevantLogs(w, p.RelevantLogs)
+	}
 	if p.DocsURL != "" {
 		RenderDocsRow(w, p.DocsURL)
 	}

@@ -46,7 +46,7 @@ import (
 // (missing slug, trailing positional, missing leaf flag) so
 // drift across the three call sites is impossible — the test
 // file pins this exact wording.
-const inspectUsage = "usage: gregale inspect <slug> [--upstreams] [--scope <scope>] [--json]"
+const inspectUsage = "usage: gregale inspect <slug> [--upstreams] [--scope <scope>] [--errors] [--json]"
 
 func cmdInspect(args []string) int {
 	if len(args) == 0 {
@@ -67,6 +67,11 @@ func cmdInspect(args []string) int {
 	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
 	upstreams := fs.Bool("upstreams", false, "list data upstreams captured for this app (ADR-098 §9.A)")
 	scope := fs.String("scope", "", "filter upstreams by scope (forwarded as ?scope=<scope>)")
+	// Error-explanations cluster (spec §6.4 amendment 1): --errors
+	// lifts the persisted failure prose (Error{Hint,Why,Fix,
+	// RelevantLogs}) from the latest failed deployment for the app.
+	// Auth required; no scope filter (errors are per-deployment).
+	errorsFlag := fs.Bool("errors", false, "show the latest failed deployment's persisted error explanation (Hint/Why/Fix/RelevantLogs)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -78,9 +83,19 @@ func cmdInspect(args []string) int {
 	// any leaf would be ambiguous (future leaves will add their
 	// own gates). A bare `gregale inspect myapp` exits 1 with
 	// the same usage line, no server call.
-	if !*upstreams {
+	if !*upstreams && !*errorsFlag {
 		PrintUsage(os.Stderr, inspectUsage, "inspect")
 		return 1
+	}
+	// Mutually exclusive: --upstreams hits /v1/apps/{slug}/upstreams;
+	// --errors hits the latest deployment via the deployments list.
+	// Mixing them would force two server calls and the customer's
+	// intent is ambiguous.
+	if *upstreams && *errorsFlag {
+		return printErr("Invalid flags", fmt.Errorf("--upstreams and --errors are mutually exclusive"))
+	}
+	if *errorsFlag {
+		return cmdInspectErrors(slug)
 	}
 	return cmdInspectUpstreams(slug, *scope)
 }

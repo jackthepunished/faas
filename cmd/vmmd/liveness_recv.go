@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -65,12 +66,24 @@ type livenessResponseBody struct {
 // livenessProbeOutcomes is the closed set the vmmd
 // poll goroutine tracks in the vmmd_guest_liveness_probe_seconds
 // histogram. Each value is the Prometheus label suffix.
+//
+// Error-explanations cluster (spec §6.4 amendment 1):
+// livenessOutcomeUnauthorized discriminates 401/403 from the
+// generic non_200 bucket. A health endpoint that's gated behind
+// auth is a distinct failure ("the app is up but we can't tell
+// because /healthz returns 401") with a distinct remediation
+// (expose /healthz without auth, or move to a separate
+// healthcheck_path) — folding it into non_200 would force the
+// customer to debug it as a runtime failure. The classify +
+// histogram + downstream app_healthz_unauthorized stamping all
+// flow from this single discriminator.
 const (
-	livenessOutcomeOK          = "ok"
-	livenessOutcomeNon200      = "non_200"
-	livenessOutcomeTimeout     = "timeout"
-	livenessOutcomeConnRefused = "conn_refused"
-	livenessOutcomeConnErr     = "conn_err"
+	livenessOutcomeOK           = "ok"
+	livenessOutcomeNon200       = "non_200"
+	livenessOutcomeUnauthorized = "unauthorized"
+	livenessOutcomeTimeout      = "timeout"
+	livenessOutcomeConnRefused  = "conn_refused"
+	livenessOutcomeConnErr      = "conn_err"
 )
 
 // livenessProbeConfig aliases the pkg/fcvm.LivenessProbeConfig struct
@@ -237,6 +250,8 @@ func classifyLivenessOutcome(outcome string) string {
 		return "liveness_conn_refused"
 	case livenessOutcomeConnErr:
 		return "liveness_conn_err"
+	case livenessOutcomeUnauthorized:
+		return "liveness_unauthorized"
 	case livenessOutcomeNon200:
 		return "liveness_non_200"
 	default:
@@ -347,6 +362,15 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) str
 	}
 	if resp.Status >= 200 && resp.Status < 300 {
 		return livenessOutcomeOK
+	}
+	// Error-explanations cluster (spec §6.4 amendment 1):
+	// 401 + 403 are the canonical "health endpoint gated behind
+	// auth" signal. Discriminate them from the generic non_200
+	// bucket so the whycopy catalog can render the right hint
+	// ("expose /healthz without auth") instead of the generic
+	// "the app didn't return 200" line.
+	if resp.Status == http.StatusUnauthorized || resp.Status == http.StatusForbidden {
+		return livenessOutcomeUnauthorized
 	}
 	return livenessOutcomeNon200
 }

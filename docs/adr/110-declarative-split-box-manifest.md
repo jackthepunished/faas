@@ -181,3 +181,80 @@ bodies land in PR-3a:
   `make metal-lima-splitbox`. The harness consumes the same
   manifest the renderer consumes, so the dev loop and the
   production deploy path cannot diverge.
+
+## Amendment 1: Error-explanations cluster (spec §6.4 amendment 1)
+
+This ADR is the closest umbrella for the error-explanations
+cluster because it covers platform plumbing (Problem wire
+shape, RFC 7807 codes, customer surfaces) — the same surface
+set the cluster extends. No new ADR file is filed; the
+amendment lives here, inline, so all customer-facing wire-shape
+changes remain in a single canonical doc.
+
+**Decision:** widen the `pkg/api.Problem` envelope with 4
+optional fields (`Hint`, `Why`, `Fix`, `RelevantLogs`) plus a
+`LogExcerpt` companion type; add 9 new RFC 7807 stable codes
+covering the source-side failure modes that today produce only
+raw `fmt.Errorf` strings or the catch-all `CodeDeployFailed`
+422. Persist the same prose on the `deployments` row
+(`migrations/00290` adds `error_hint`, `error_why`, `error_fix`,
+`error_relevant_logs jsonb`) so post-mortem retrieval via
+`gregale inspect <slug> --errors` surfaces the same 5-line
+shape the live `Problem` emits.
+
+**Catalog:** the customer-facing prose lives in a single
+static catalog at `pkg/whycopy/` (table-driven, ~150 LoC).
+Each row maps one stable `Code…` to Title/Hint/Why/Fix/
+DocsURL + an optional per-code Observed renderer that templates
+the observed value into Why/Fix. Detection sites call
+`whycopy.Decorate(p, code, observed)` after the constructor
+so the wire `Problem` carries the full block on every code
+path.
+
+**CLI surfaces:**
+
+- `cmd/gregale/commands.go::renderAPIError` — extended to
+  render Hint/Why/Fix/RelevantLogs in the standard order; legacy
+  3-line shape preserved when the new fields are empty.
+- `cmd/gregale/commands_doctor.go` — `gregale doctor [path]`
+  preflight scans cwd for the source-side failure modes.
+- `cmd/gregale/pack.go::runPackPreflight` — warn-only
+  preflight during `gregale deploy`.
+- `cmd/gregale/commands2.go::runLogs --explain` — 4-line
+  summary on stream end.
+- `cmd/gregale/commands_inspect_errors.go` — post-mortem leaf.
+
+**Tripwires (every new code MUST satisfy):**
+
+- `cmd/gregale/lint_tripwires_test.go::TestEveryCodeHasWhycopyEntry`
+  — every `Code…` constant has a matching `whycopy` row.
+- `pkg/whycopy/whycopy_test.go::TestDecorate_AllCodesHaveProse`
+  — every catalog row has non-empty Title/Hint/Fix (Hint
+  ≤200 bytes, Why ≤512 bytes).
+- `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_NoGlyphLiteralOutsideOutput`
+  — every customer-facing glyph centralised in
+  `cmd/gregale/output.go`.
+- `cmd/gregale/lint_tripwires_test.go::TestLintTripwire_NoLiteralDocsDomainEverywhere`
+  — every docs URL routes through `wire.DocsHost`.
+
+**Wire-shape impact:** the 4 new fields carry `omitempty` on
+the `pkg/api.Problem` struct, so every existing problem+json
+site (~1,236 emitters) keeps its current shape unchanged.
+SDK + OpenAPI regen handle the rest mechanically.
+
+**Migration slot:** `migrations/00290` (cluster fences
+`migrations/00288_reserve_slot.sql` + `00289_reserve_slot.sql`
+mirror PR #910's slot-claim pattern per
+`cross-pr-slot-fence-reservation-fence-pattern.md`).
+
+**Out of scope (noted as followups):**
+
+- Dashboard template `pkg/dashboard/views/error_explanation.go`
+  (separate PR — `pkg/dashboard/` is a different surface area
+  than the wire-shape plumbing this ADR amends).
+- Three runtime detection points (listening_addrs →
+  app_loopback_bound; cgroup.events → app_runtime_oom;
+  reposcan env-var scan → env_var_missing) — already noted
+  in commits `ac7507e2` and `f0bda4f5` as followups.
+- Per-app custom error templates + i18n — keep the catalog
+  platform-side for v1.

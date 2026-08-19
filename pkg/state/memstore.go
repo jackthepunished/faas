@@ -4422,6 +4422,32 @@ func (m *MemStore) SetDeploymentFailed(_ context.Context, id, code, message stri
 	return d, nil
 }
 
+// SetDeploymentFailedEx is the error-explanations cluster (spec §6.4
+// amendment 1) extension of SetDeploymentFailed. Writes the four
+// customer-facing prose fields alongside the RFC 7807 code so the
+// in-process store mirrors the persistence shape introduced by
+// migration 00290. The unit-test suite that exercises MemStore stays
+// aligned with PgStore.
+func (m *MemStore) SetDeploymentFailedEx(
+	_ context.Context, id, code, message, hint, why, fix string, logs []api.LogExcerpt,
+) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	d.Status = DeployFailed
+	d.Error = message
+	d.ErrorCode = code
+	d.ErrorHint = hint
+	d.ErrorWhy = why
+	d.ErrorFix = fix
+	d.ErrorRelevantLogs = logs
+	m.deployments[id] = d
+	return d, nil
+}
+
 // SetDeploymentParked stamps the per-deployment parked_reason +
 // parked_at columns (issue #554 / ADR-079 follow-up). Idempotent:
 // a second call on an already-parked deployment is a no-op — the

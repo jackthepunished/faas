@@ -629,6 +629,8 @@ func buildDeploymentsForExport(rows []state.Deployment) ([]api.DeploymentRespons
 			ImageDigest: d.ImageDigest, Kind: string(d.Kind),
 			Status: string(d.Status), Error: sanitizeExportString(d.Error),
 			ErrorCode: d.ErrorCode,
+			ErrorHint: d.ErrorHint, ErrorWhy: d.ErrorWhy,
+			ErrorFix: d.ErrorFix, ErrorRelevantLogs: d.ErrorRelevantLogs,
 			CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 			// ADR-091 / PR-D: scope echo on export fixtures so the
 			// GDPR export carries the per-deployment env-targeting

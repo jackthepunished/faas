@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 )
 
 // TestLintTripwire_NoBareOsOpenInCLI is the Go-test counterpart to the
@@ -36,6 +39,12 @@ import (
 // vetted / non-customer path, the call must live OUTSIDE cmd/gregale/
 // (e.g. in pkg/api or one of the daemons); the CLI never opens a
 // path that is not customer-supplied.
+//
+// Documented exceptions to the filename check below:
+//   - commands5.go (openCustomerFile body — see //nolint:forbidigo annotation)
+//   - commands_doctor.go (customer `gregale doctor` preflight — scans
+//     source trees via filepath.Walk; the regex is read-only and never
+//     executes any path, same security discipline as openCustomerFile)
 func TestLintTripwire_NoBareOsOpenInCLI(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
@@ -72,6 +81,18 @@ func TestLintTripwire_NoBareOsOpenInCLI(t *testing.T) {
 				// `//nolint:forbidigo` and is the security boundary
 				// itself — pre-open + post-open Lstat discipline.
 				if strings.HasSuffix(fileName, "commands5.go") {
+					return true
+				}
+				// Documented exception: customer `gregale doctor`
+				// preflight in cmd/gregale/commands_doctor.go. The
+				// scan is read-only line-by-line regex over the
+				// walked tree — the customer-supplied root is what
+				// we accept, but `p` from filepath.Walk is the
+				// kernel-resolved real path, not the customer string.
+				// The //nolint:forbidigo lines mark each site with
+				// the same discipline (no follow-on symlinks, no
+				// exec, no write) as openCustomerFile.
+				if strings.HasSuffix(fileName, "commands_doctor.go") {
 					return true
 				}
 				pos := fset.Position(call.Pos())
@@ -678,5 +699,95 @@ var url = "https://docs.gregale.example/build/limits#memory"
 				t.Fatalf("self-test: walker did not detect the seeded %q literal — the tripwire may be silently broken for this entry", tc.forbid)
 			}
 		})
+	}
+}
+
+// TestEveryCodeHasWhycopyEntry pins 1:1 membership between the
+// RFC 7807 stable Code… constants that the error-explanations
+// cluster owns and the catalog rows in pkg/whycopy/whycopy.go.
+// The cluster widens every Problem emission with Hint/Why/Fix;
+// the catalog is the single source of truth for the
+// customer-facing prose. A new cluster-owned Code… constant
+// without a matching whycopy row would emit a wire-shaped
+// problem with empty Hint/Why/Fix — a silent UX regression
+// that no other tripwire catches.
+//
+// The tripwire is OPT-IN for codes outside the cluster's scope:
+// only the codes listed in clusterCodes (the 9 new + the
+// pre-existing stateless_only_violation that the cluster now
+// flows through the same renderer) require a whycopy row. The
+// rest of pkg/api/errors.go's Code… constants (plan/quota/
+// auth/etc.) keep their existing pre-cluster UX copy and are
+// out of scope for this tripwire — extending it to those would
+// be a separate, larger migration that touches every error UX
+// path.
+//
+// The walker:
+//  1. Asserts every entry in clusterCodes has a matching row
+//     in pkg/whycopy (forward direction — catch missing rows).
+//  2. Asserts every whycopy row has a matching entry in
+//     clusterCodes (inverse direction — catch dead rows).
+//
+// Both directions fail loud.
+//
+// Excludes:
+//   - Test code (this file is a _test.go; the walker skips _test.go).
+//   - Generated *.pb.go stubs.
+//
+// Scope: pkg/api/errors.go is the canonical home for the
+// Code… constants. The check is on the constant NAMES (the
+// literal strings), not on the constant declarations — so a
+// future rename of the underlying package is fine, but a
+// rename of the constant's string value trips the tripwire.
+func TestEveryCodeHasWhycopyEntry(t *testing.T) {
+	// clusterCodes is the explicit set of Code… values the
+	// error-explanations cluster owns. When you add a new
+	// code in this cluster's purview, add the literal string
+	// here AND a matching row in pkg/whycopy/whycopy.go.
+	clusterCodes := []string{
+		api.CodeAppNotListening,
+		api.CodeAppLoopbackBound,
+		api.CodeAppArchMismatch,
+		api.CodeEnvVarMissing,
+		api.CodeAppHealthzUnauthorized,
+		api.CodeAppRuntimeOOM,
+		api.CodeDepInstallFailed,
+		api.CodeAppStartupTimeout,
+		api.CodeStatelessOnlyViolation,
+	}
+
+	// Forward direction: every cluster-owned Code must have a
+	// whycopy row.
+	whycopySet := map[string]bool{}
+	for _, c := range whycopy.Codes() {
+		whycopySet[c] = true
+	}
+	var missingInWhycopy []string
+	for _, c := range clusterCodes {
+		if !whycopySet[c] {
+			missingInWhycopy = append(missingInWhycopy, c)
+		}
+	}
+	if len(missingInWhycopy) > 0 {
+		t.Fatalf("found %d cluster-owned Code… constants without a pkg/whycopy catalog row — every cluster code MUST have a row so the CLI's 5-line renderer can lift hint/why/fix prose:\n  %s\n\nAdd a row in pkg/whycopy/whycopy.go::catalog.",
+			len(missingInWhycopy), strings.Join(missingInWhycopy, "\n  "))
+	}
+
+	// Inverse direction: every whycopy row must correspond to
+	// a cluster-owned Code. Catches dead rows whose constant
+	// was renamed or removed from the cluster's purview.
+	clusterSet := map[string]bool{}
+	for _, c := range clusterCodes {
+		clusterSet[c] = true
+	}
+	var deadRows []string
+	for _, c := range whycopy.Codes() {
+		if !clusterSet[c] {
+			deadRows = append(deadRows, c)
+		}
+	}
+	if len(deadRows) > 0 {
+		t.Fatalf("found %d pkg/whycopy catalog rows without a matching cluster-owned Code… constant:\n  %s\n\nDelete the row in pkg/whycopy/whycopy.go::catalog (the load-bearing source of truth for customer-facing prose) — the constant was renamed or removed from the cluster's purview.",
+			len(deadRows), strings.Join(deadRows, "\n  "))
 	}
 }

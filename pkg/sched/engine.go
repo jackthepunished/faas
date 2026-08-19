@@ -38,6 +38,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/whycopy"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -4855,6 +4856,30 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 	if e.ops != nil {
 		e.ops.WatchdogKills(string(reason), string(terminal)).Inc()
 	}
+
+	// Error-explanations cluster (spec §6.4 amendment 1): a
+	// StuckColdBootTimeout marks the deployment row as failed with
+	// the app_startup_timeout code + prose so post-mortem retrieval
+	// via `gregale inspect <slug> --errors` surfaces the right
+	// hint/why/fix. The watchdog killed the instance because the
+	// cold boot exhausted the budget — that's distinct from the
+	// ECONNREFUSED (app_not_listening) case handled in pkg/fcvm.
+	// Best-effort: SetDeploymentFailedEx failure doesn't block the
+	// instance transition (the transition is the source of truth
+	// for the customer-facing timeline).
+	if reason == StuckColdBootTimeout && fresh.DeploymentID != "" {
+		p := api.NewProblem(422, api.CodeAppStartupTimeout,
+			"app did not become ready in time",
+			fmt.Sprintf("watchdog forced the instance to failed after the cold-boot budget elapsed (instance=%s, app=%s)", instanceID, appID))
+		_ = whycopy.Decorate(p, api.CodeAppStartupTimeout, nil)
+		if _, err := e.store.SetDeploymentFailedEx(ctx, fresh.DeploymentID,
+			api.CodeAppStartupTimeout,
+			fmt.Sprintf("cold_boot_timeout: instance=%s", instanceID),
+			p.Hint, p.Why, p.Fix, nil,
+		); err != nil {
+			e.log.Warn("watchdog: stamp app_startup_timeout failed", "deployment", fresh.DeploymentID, "err", err)
+		}
+	}
 	return nil
 }
 
@@ -4999,6 +5024,32 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 	// accessor.
 	if e.ops != nil {
 		e.ops.LivenessRestarts(appID, deploymentID).Inc()
+	}
+
+	// Error-explanations cluster (spec §6.4 amendment 1): stamp
+	// the deployment as failed with the matching cluster code so
+	// `gregale inspect <slug> --errors` can lift the whycopy prose
+	// post-mortem. The reason→code mapping is closed-set:
+	// liveness_unauthorized → app_healthz_unauthorized (the only
+	// cluster code the liveness path emits); the other liveness
+	// outcomes stay un-coded (legacy path). Best-effort — a
+	// SetDeploymentFailedEx failure is logged but doesn't block
+	// the destroy+transition path.
+	if deploymentID != "" && reason == "liveness_unauthorized" {
+		problem := &api.Problem{
+			Code:   api.CodeAppHealthzUnauthorized,
+			Status: 422,
+			Title:  api.CodeAppHealthzUnauthorized,
+		}
+		_ = whycopy.Decorate(problem, api.CodeAppHealthzUnauthorized, nil)
+		if _, terr := e.store.SetDeploymentFailedEx(ctx,
+			deploymentID,
+			api.CodeAppHealthzUnauthorized,
+			"healthz returned 401 after 3 consecutive probes",
+			problem.Hint, problem.Why, problem.Fix, nil); terr != nil {
+			e.log.Warn("liveness: stamp deployment failed",
+				"instance", instanceID, "deployment_id", deploymentID, "err", terr)
+		}
 	}
 
 	// Sliding-window check: N restarts in the window parks the
