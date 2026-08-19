@@ -7,12 +7,14 @@ Wants=faas-cp.slice
 Type=simple
 User=faas-schedd
 Group=faas
+ExecStartPre=/usr/bin/install -d -o faas-schedd -g faas -m 0770 /var/lib/faas/oci-tmp
 ExecStart=/opt/faas/current/bin/schedd --config /etc/faas/schedd.toml
 Restart=on-failure
 RestartSec=2s
 Slice=faas-cp.slice
 MemoryMax=256M
 EnvironmentFile=/etc/faas/sealed.env
+Environment=TMPDIR=/var/lib/faas/oci-tmp
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -21,7 +23,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
-ReadWritePaths=/run/faas /var/log/faas
+ReadWritePaths=/run/faas /var/lib/faas /var/log/faas
 
 [Install]
 WantedBy=multi-user.target

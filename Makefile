@@ -1,4 +1,4 @@
-# One-box FaaS — build & ops entrypoints (spec §Commands).
+# Gregale FaaS — build & ops entrypoints (spec §Commands).
 # Go >= 1.24. One binary per cmd/ dir.
 # (Bumped from 1.23: cmd/vmmd-stream-bridge uses the Go 1.24+
 # http.Protocols API for H2C — srv.Protocols.SetUnencryptedHTTP2(true).
@@ -20,6 +20,7 @@ CLIS := gregale gregalectl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
+ANSIBLE_INVENTORY ?= deploy/ansible/inventory/hosts.ini
 
 .DEFAULT_GOAL := help
 
@@ -421,20 +422,30 @@ scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (
 	grype dir:images/ -o json --file bin/grype-results.json
 	syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "$$(git rev-parse --short HEAD)" --source-type directory
 
-.PHONY: bootstrap
-bootstrap: ## Idempotent single-box setup (ansible) — dev/lima. Back-compat for `make bootstrap` against 127.0.0.1.
-	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $$BOX -e faas_box_role=single-box
+.PHONY: public-endpoint-check
+public-endpoint-check: ## Validate the public HTTPS/Caddy endpoint (PUBLIC_ENDPOINT_URL required)
+	@test -n "$(PUBLIC_ENDPOINT_URL)" || { echo "PUBLIC_ENDPOINT_URL is required (example: https://apps.example.com)" >&2; exit 2; }
+	@PUBLIC_ENDPOINT_URL="$(PUBLIC_ENDPOINT_URL)" PUBLIC_HTTP_URL="$(PUBLIC_HTTP_URL)" PUBLIC_ENDPOINT_PATH="$(PUBLIC_ENDPOINT_PATH)" bash scripts/ci/check_public_endpoint.sh
+
+.PHONY: systemd-hardening-check
+systemd-hardening-check: ## Static release gate for production systemd isolation directives
+	bash scripts/ci/check_systemd_hardening.sh $(CURDIR)
+
+.PHONY: manifest-ansible
+manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars tree (MANIFEST + ANSIBLE_GENERATED_DIR required)
+	@test -n "$(MANIFEST)" || (echo "MANIFEST is required (example: MANIFEST=deploy/manifest/splitbox.yaml)" >&2; exit 2)
+	test -x ./bin/gregalectl || $(GO) build -o ./bin/gregalectl ./cmd/gregalectl
+	./bin/gregalectl manifest ansible --manifest-file "$(MANIFEST)" --output-dir "$${ANSIBLE_GENERATED_DIR:-$(CURDIR)/deploy/ansible/.generated}"
 
 .PHONY: bootstrap-control-plane
 bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane} -e faas_box_role=control-plane
+	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-control_plane}
 
 .PHONY: bootstrap-compute
 bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Mega-PR-C + ADR-110 deploy-side closeout. Honors $ANSIBLE_LIMIT (default $HOST).
 	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml missing — run on the control-plane / compute node, not the dev box"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes} -e faas_box_role=compute-only
+	ansible-playbook -i $(ANSIBLE_INVENTORY) deploy/ansible/bootstrap.yml --limit $${ANSIBLE_LIMIT:-compute_nodes}
 
 .PHONY: tidy
 tidy: ## go mod tidy
@@ -443,7 +454,8 @@ tidy: ## go mod tidy
 # Egress policy (spec §11). Source of truth is pkg/netns/policy.go's
 # HostPolicy.Render(). The Go-rendered artifact under
 # deploy/ansible/roles/nftables/files/policy_nftables.conf is what
-# `make bootstrap` ships to the host at /etc/nftables.conf when
+# the role-specific bootstrap target ships to the host at
+# /etc/nftables.conf when
 # ansible_render=true (the default). With the ADR-055 Jinja2
 # template active, ansible now DOES render the per-host file
 # at bootstrap time, so the committed artifact is the canonical
@@ -825,4 +837,3 @@ sdk-smoke-python: ## Build fakeapid fixture + run Python SDK smoke + unit tests
 .PHONY: sdk-unit-python
 sdk-unit-python: ## Run Python SDK unit tests (no fixture required)
 	@cd sdk/python && .venv/bin/python -m pytest tests/test_client.py tests/test_sse.py
-

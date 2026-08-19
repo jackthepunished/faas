@@ -957,13 +957,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (log-only until gap G4 is closed). Empty secret = dev mode (the
 	// webhook accepts unsigned payloads; never deploy this way).
 	stripeSecret := deps.getenv("STRIPE_WEBHOOK_SECRET")
-	// Gap G4 closure (PR): wire the env-driven mail factory so prod
-	// boots with FAAS_MAIL_TRANSPORT=resend and emails go out for real.
-	// Tests + dev can keep mailer nil and the factory returns a log
-	// sender — behaviour matches the pre-PR newLogMailer(log) wiring.
+	// Gap G4 closure (ADR-115): wire the env-driven mail factory so
+	// prod boots with FAAS_MAIL_TRANSPORT=resend and emails go out
+	// for real. Tests + dev can keep mailer nil and the factory
+	// returns a log sender — behaviour matches the pre-PR
+	// newLogMailer(log) wiring. Operator-selected resend / postmark
+	// with the credential env var empty is fail-closed (ADR-115
+	// §D5); the wrapped ErrMailerMisconfigured propagates here so
+	// the daemon refuses to boot instead of silently dropping
+	// email into slog.
 	m := deps.mailer
 	if m == nil {
-		m = mail.SenderFromEnv(deps.getenv, log)
+		var err error
+		m, err = mail.SenderFromEnv(deps.getenv, log)
+		if err != nil {
+			return fmt.Errorf("apid: %w (set FAAS_MAIL_TRANSPORT=log or supply the missing credential in /etc/faas/sealed.env)", err)
+		}
 	}
 	mailer := newMailerAdapter(m)
 	// M7.5: githubd socket path (ADR-012). Empty = stub client (every
@@ -1133,6 +1142,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		Route:   "admin",
 		Metrics: budgetMetrics,
 		Log:     log,
+		DefaultFor: func(r *http.Request) time.Duration {
+			if reqbudget.IsSyncInvokeRequest(r) {
+				// invokeApp applies the plan-specific 5s/30s wait;
+				// give that handler the full platform ceiling so the
+				// outer apid budget does not truncate paid plans.
+				return api.RequestBudgetMax
+			}
+			return 0
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("apid: reqbudget middleware config: %w", err)

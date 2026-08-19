@@ -37,6 +37,10 @@ class DataUpstreamResponse:
     scope: str | Unset = UNSET
     """ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Echoes the value persisted on the
     row; absent when the default scope applies."""
+    deployment_scope: str | Unset = UNSET
+    """ADR-098 amendment (issue #954) widens the dedupe key to include `deployment_scope` so staging-vs-prod
+    upstreams don't collide on the same app. Echoes the value persisted on the row; absent when the default scope
+    applies."""
     declared_region: str | Unset = UNSET
     """Region hint (nullable). Empty on capture; populated by the operator or the classify-flow follow-up."""
     last_rtt_ms: int | Unset = UNSET
@@ -64,6 +68,8 @@ class DataUpstreamResponse:
 
         scope = self.scope
 
+        deployment_scope = self.deployment_scope
+
         declared_region = self.declared_region
 
         last_rtt_ms = self.last_rtt_ms
@@ -89,6 +95,8 @@ class DataUpstreamResponse:
             field_dict["host_last4"] = host_last4
         if scope is not UNSET:
             field_dict["scope"] = scope
+        if deployment_scope is not UNSET:
+            field_dict["deployment_scope"] = deployment_scope
         if declared_region is not UNSET:
             field_dict["declared_region"] = declared_region
         if last_rtt_ms is not UNSET:
@@ -119,6 +127,8 @@ class DataUpstreamResponse:
 
         scope = d.pop("scope", UNSET)
 
+        deployment_scope = d.pop("deployment_scope", UNSET)
+
         declared_region = d.pop("declared_region", UNSET)
 
         last_rtt_ms = d.pop("last_rtt_ms", UNSET)
@@ -140,6 +150,7 @@ class DataUpstreamResponse:
             last_seen_at=last_seen_at,
             host_last4=host_last4,
             scope=scope,
+            deployment_scope=deployment_scope,
             declared_region=declared_region,
             last_rtt_ms=last_rtt_ms,
             last_probed_at=last_probed_at,

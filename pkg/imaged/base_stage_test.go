@@ -162,10 +162,10 @@ func TestEnsureBaseExt4_StagesOnFirstRun(t *testing.T) {
 // OCI ref. The original implementation passed `ref` (the OCI ref, e.g.
 // "ghcr.io/onebox-faas/builder-base:latest") to grype, which Grype rejects
 // because registry refs belong to a `registry:` source. The fix routes the
-// filesystem path (outImage) to grype while still recording the OCI ref
-// in the sidecar's `image` field for dashboard traceability. This test
-// pins the contract: a captured grypeRun stub must see the outImage path,
-// not the OCI ref.
+// filesystem path published under baseKey to grype while still recording
+// the OCI ref in the sidecar's `image` field for dashboard traceability. The
+// compatibility outImage is used only when the backend has no local-path
+// capability.
 func TestEnsureBaseExt4_GrypeCalledWithFilesystemPath(t *testing.T) {
 	mp := newTwoLayerPuller(t)
 	b := &fakeBuilder{}
@@ -174,7 +174,7 @@ func TestEnsureBaseExt4_GrypeCalledWithFilesystemPath(t *testing.T) {
 	const ociRef = "ghcr.io/onebox-faas/builder-base:latest"
 	const baseKey = "base/runner-builder-amd64.ext4"
 	const digKey = "base/runner-builder-amd64.ext4.digest"
-	const outImage = "/srv/fc/base/runner-builder-amd64.ext4"
+	const outImage = "/srv/fc/base/builder-base.ext4"
 
 	var capturedDir string
 	hs.h.grypeRun = func(_ context.Context, dir string) (*ScanResult, error) {
@@ -186,9 +186,17 @@ func TestEnsureBaseExt4_GrypeCalledWithFilesystemPath(t *testing.T) {
 		ociRef, baseKey, digKey, outImage, "", ""); err != nil {
 		t.Fatalf("EnsureBaseExt4: %v", err)
 	}
-	if capturedDir != outImage {
-		t.Errorf("grypeRun called with %q; want the filesystem path %q (not the OCI ref %q)",
-			capturedDir, outImage, ociRef)
+	resolver, ok := hs.be.(storage.LocalPathResolver)
+	if !ok {
+		t.Fatal("test backend does not expose LocalPath")
+	}
+	wantPath, ok, err := resolver.LocalPath(baseKey)
+	if err != nil || !ok {
+		t.Fatalf("LocalPath(%q) = %q, %t, %v", baseKey, wantPath, ok, err)
+	}
+	if capturedDir != wantPath {
+		t.Errorf("grypeRun called with %q; want published filesystem path %q (not compatibility path %q or OCI ref %q)",
+			capturedDir, wantPath, outImage, ociRef)
 	}
 	if capturedDir == ociRef {
 		t.Errorf("grypeRun was handed the OCI ref %q — Grype's `dir:` source walks a filesystem path, not a registry ref", capturedDir)
@@ -1332,6 +1340,52 @@ func TestWriteScanSidecar_KeySetStable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestWriteScanSidecar_UsesPublishedLocalPath guards the canonical storage
+// migration: the compatibility outImage path may point at an older
+// builder-base.ext4, but the sidecar must scan the artifact published under
+// baseKey (runner-builder-<arch>.ext4).
+func TestWriteScanSidecar_UsesPublishedLocalPath(t *testing.T) {
+	be, err := storage.NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	canonical, ok, err := be.LocalPath("base/runner-builder-amd64.ext4")
+	if err != nil || !ok {
+		t.Fatalf("LocalPath = %q, %t, %v", canonical, ok, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("ext4-placeholder"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// LocalPath resolves existing symlinks; on macOS the temp root is
+	// commonly exposed as /var while the real path is /private/var.
+	canonical, ok, err = be.LocalPath("base/runner-builder-amd64.ext4")
+	if err != nil || !ok {
+		t.Fatalf("LocalPath after publish = %q, %t, %v", canonical, ok, err)
+	}
+
+	var scanned string
+	h := &Handler{
+		log:     silentLogger(),
+		storage: be,
+		grypeRun: func(_ context.Context, dir string) (*ScanResult, error) {
+			scanned = dir
+			return &ScanResult{}, nil
+		},
+	}
+	if err := h.writeScanSidecar(context.Background(),
+		"base/runner-builder-amd64.ext4",
+		"ghcr.io/poyrazk/builder-base@sha256:deadbeef",
+		"/srv/fc/base/builder-base.ext4"); err != nil {
+		t.Fatalf("writeScanSidecar: %v", err)
+	}
+	if scanned != canonical {
+		t.Errorf("grype source = %q, want canonical published path %q", scanned, canonical)
 	}
 }
 

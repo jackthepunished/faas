@@ -53,6 +53,15 @@ type fakeBackend struct {
 	onGet func(key string) error
 }
 
+type localPathFakeBackend struct {
+	*fakeBackend
+	root string
+}
+
+func (f *localPathFakeBackend) LocalPath(key string) (string, bool, error) {
+	return filepath.Join(f.root, key), true, nil
+}
+
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{blobs: map[string][]byte{}}
 }
@@ -114,6 +123,31 @@ func TestLocalCacheBackend_PutGetRoundTrip(t *testing.T) {
 	}
 	if parent.gets.Load() != 0 {
 		t.Errorf("parent.gets = %d, want 0 (cache should serve)", parent.gets.Load())
+	}
+}
+
+// TestLocalCacheBackend_LocalPathDelegates pins the local-file capability
+// used by large ext4 scans. The cache must not redirect callers to its hashed
+// cache file; the parent path is the canonical artifact path.
+func TestLocalCacheBackend_LocalPathDelegates(t *testing.T) {
+	parent := &localPathFakeBackend{
+		fakeBackend: newFakeBackend(),
+		root:        t.TempDir(),
+	}
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(t.TempDir(), "cache"), 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	got, ok, err := cache.LocalPath("base/runner-builder-amd64.ext4")
+	if err != nil {
+		t.Fatalf("LocalPath: %v", err)
+	}
+	if !ok {
+		t.Fatal("LocalPath ok=false, want true")
+	}
+	want := filepath.Join(parent.root, "base/runner-builder-amd64.ext4")
+	if got != want {
+		t.Errorf("LocalPath = %q, want %q", got, want)
 	}
 }
 

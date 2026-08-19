@@ -31,6 +31,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ProtectHostname=yes
 ProtectClock=yes
 ProtectProc=invisible
+ReadOnlyPaths=/etc/faas
 ReadWritePaths=/run/faas
 
 [Install]

@@ -1,7 +1,7 @@
 // rekey_test.go — unit tests for pkg/rekey.
 //
 // Tests use a tiny in-memory fakeStore (the methods pkg/rekey
-// uses — ListAppSecretsForRekey, UpsertAppSecretWithKid). The
+// uses — ListAppSecretsForRekey, UpsertAppSecretWithKidInScope). The
 // fakeStore matches the cursor encoding pgstore + memstore use so
 // the tests exercise the same wire shape.
 //
@@ -28,7 +28,13 @@ import (
 
 // fakeStore implements just the three methods pkg/rekey uses.
 // Cursor encoding matches pgstore/pgstore_memstore
-// ("<account_id>|<app_id>|<key>").
+// ("<account_id>|<app_id>|<scope>|<key>"). ADR-092 PR-A widened
+// the encoding from 3-segment to 4-segment; this test fake
+// mirrors that and accepts 4-segment cursors split into
+// (AccountID, AppID, Scope, Key). In-flight 3-segment cursors
+// from pre-PR A Replayer instances are tolerated for the crash
+// recovery path: splitCursor lazy-collapses them with scope =
+// "default".
 type fakeStore struct {
 	mu   sync.Mutex
 	rows map[string]state.AppSecret
@@ -41,36 +47,39 @@ func newFakeStore() *fakeStore {
 func (s *fakeStore) put(row state.AppSecret) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.rows[encodeCursor(row.AccountID, row.AppID, row.Key)] = row
+	if row.Scope == "" {
+		row.Scope = state.DefaultEnvScope
+	}
+	s.rows[encodeCursor(row.AccountID, row.AppID, row.Scope, row.Key)] = row
 }
 
 func (s *fakeStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor string) ([]state.AppSecret, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var curA, curB, curC string
+	var curA, curB, curC, curD string
 	if cursor != "" {
 		parts := splitCursor(cursor)
 		if parts == nil {
 			return nil, nil
 		}
-		curA, curB, curC = parts[0], parts[1], parts[2]
+		curA, curB, curC, curD = parts[0], parts[1], parts[2], parts[3]
 	}
 	var out []state.AppSecret
 	for _, r := range s.rows {
 		// Crash-safety: pgstore uses COMPOSITE >= so a row
 		// whose cursor matches the current row is included
 		// (matching cursor returns the row; seen-set inside
-		// Replayer dedupes). The lessOrEqTriples helper
+		// Replayer dedupes). The lessOrEqQuads helper
 		// encodes the strict-less filter; >= semantics map
 		// to "less than the cursor" being excluded.
-		if curA != "" && lessTriples(r.AccountID, r.AppID, r.Key, curA, curB, curC) {
+		if curA != "" && lessQuads(r.AccountID, r.AppID, r.Scope, r.Key, curA, curB, curC, curD) {
 			continue
 		}
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return lessTriples(out[i].AccountID, out[i].AppID, out[i].Key,
-			out[j].AccountID, out[j].AppID, out[j].Key)
+		return lessQuads(out[i].AccountID, out[i].AppID, out[i].Scope, out[i].Key,
+			out[j].AccountID, out[j].AppID, out[j].Scope, out[j].Key)
 	})
 	if len(out) > limit {
 		out = out[:limit]
@@ -78,19 +87,24 @@ func (s *fakeStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor 
 	return out, nil
 }
 
-func (s *fakeStore) UpsertAppSecretWithKid(_ context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+func (s *fakeStore) UpsertAppSecretWithKidInScope(_ context.Context, accountID, appID, scope, key, kid string, ciphertext []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	row := s.rows[encodeCursor(accountID, appID, key)]
+	row := s.rows[encodeCursor(accountID, appID, scope, key)]
 	row.AccountID = accountID
 	row.AppID = appID
+	row.Scope = scope
 	row.Key = key
 	row.Kid = kid
 	row.Ciphertext = ciphertext
-	s.rows[encodeCursor(accountID, appID, key)] = row
+	s.rows[encodeCursor(accountID, appID, state.DefaultEnvScope, key)] = row
 	return nil
 }
 
+// splitCursor splits a cursor string on '|'. Returns 4-tuple parts
+// for the canonical post-PR-A encoding; lazy 3→4 fallback treats
+// a 3-segment cursor as (acct, app, "default", key) to match the
+// pgstore/memstore fall-back semantics.
 func splitCursor(c string) []string {
 	out := []string{""}
 	for i := 0; i < len(c); i++ {
@@ -100,20 +114,30 @@ func splitCursor(c string) []string {
 		}
 		out[len(out)-1] += string(c[i])
 	}
-	if len(out) != 3 {
+	switch len(out) {
+	case 4:
+		return out
+	case 3:
+		// In-flight 3-segment cursor from a pre-PR-A Replayer
+		// resumed against a post-PR-A store. Insert the
+		// canonical scope='default' as the 3rd segment.
+		return []string{out[0], out[1], state.DefaultEnvScope, out[2]}
+	default:
 		return nil
 	}
-	return out
 }
 
-func lessTriples(a1, a2, a3, b1, b2, b3 string) bool {
+func lessQuads(a1, a2, a3, a4, b1, b2, b3, b4 string) bool {
 	if a1 != b1 {
 		return a1 < b1
 	}
 	if a2 != b2 {
 		return a2 < b2
 	}
-	return a3 < b3
+	if a3 != b3 {
+		return a3 < b3
+	}
+	return a4 < b4
 }
 
 // sealUnder is a one-shot seal helper using pkg/secretbox.Seal so
@@ -182,7 +206,7 @@ func TestRun_RekeysRowsUnderPreviousKid(t *testing.T) {
 	// recipient string.
 	wantKid := current.Recipient().String()
 	for _, key := range []string{"A", "B", "C"} {
-		row, ok := store.rows[encodeCursor("acct-1", "app-1", key)]
+		row, ok := store.rows[encodeCursor("acct-1", "app-1", state.DefaultEnvScope, key)]
 		if !ok {
 			t.Fatalf("row %q missing after rekey", key)
 		}
@@ -266,7 +290,7 @@ func TestRun_CursorResumes(t *testing.T) {
 	// later" hint, while the in-Run seen-set prevents the
 	// per-row advance + >= fence from looping forever.
 	var last RekeyProgress
-	if err := r.Run(context.Background(), encodeCursor("acct-1", "app-1", "B"), func(p RekeyProgress) { last = p }); err != nil {
+	if err := r.Run(context.Background(), encodeCursor("acct-1", "app-1", state.DefaultEnvScope, "B"), func(p RekeyProgress) { last = p }); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if last.Total != 2 || last.Rekeyed != 2 {
@@ -331,11 +355,11 @@ type failingFakeStore struct {
 	faultCursor string
 }
 
-func (s *failingFakeStore) UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
-	if s.faultCursor != "" && encodeCursor(accountID, appID, key) == s.faultCursor {
+func (s *failingFakeStore) UpsertAppSecretWithKidInScope(ctx context.Context, accountID, appID, scope, key, kid string, ciphertext []byte) error {
+	if s.faultCursor != "" && encodeCursor(accountID, appID, scope, key) == s.faultCursor {
 		return context.DeadlineExceeded // sentinel "persist failed"
 	}
-	return s.fakeStore.UpsertAppSecretWithKid(ctx, accountID, appID, key, kid, ciphertext)
+	return s.fakeStore.UpsertAppSecretWithKidInScope(ctx, accountID, appID, scope, key, kid, ciphertext)
 }
 
 // TestRun_CrashMidRow pins the cursor-pin-on-failure + >=
@@ -356,7 +380,7 @@ func TestRun_CrashMidRow(t *testing.T) {
 	current := mustIdentity(t)
 
 	inner := newFakeStore()
-	faultRow := encodeCursor("acct-1", "app-1", "B")
+	faultRow := encodeCursor("acct-1", "app-1", state.DefaultEnvScope, "B")
 	store := &failingFakeStore{fakeStore: inner, faultCursor: faultRow}
 
 	for _, key := range []string{"A", "B", "C"} {
@@ -397,14 +421,14 @@ func TestRun_CrashMidRow(t *testing.T) {
 	// LastID is PINNED to the first failed row (B), not the
 	// last success — so the next Run re-attempts B via >=
 	// fence instead of skipping past it.
-	wantLast := encodeCursor("acct-1", "app-1", "B")
+	wantLast := encodeCursor("acct-1", "app-1", state.DefaultEnvScope, "B")
 	if last.LastID != wantLast {
 		t.Errorf("LastID = %q, want %q (Pinned to first failure so resume re-attempts B)", last.LastID, wantLast)
 	}
 
 	// B's row was NOT updated by the failed persist — still
 	// under the previous identity.
-	b := inner.rows[encodeCursor("acct-1", "app-1", "B")]
+	b := inner.rows[encodeCursor("acct-1", "app-1", state.DefaultEnvScope, "B")]
 	if b.Kid != previous.Recipient().String() {
 		t.Errorf("B's kid = %q, want %q (pre-rekey; persist failed before UPDATE)",
 			b.Kid, previous.Recipient().String())

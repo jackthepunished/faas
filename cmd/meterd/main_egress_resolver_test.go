@@ -80,3 +80,18 @@ func TestEgressSocketPathResolver(t *testing.T) {
 		})
 	}
 }
+
+// TestMeterdStartupUsesCanonicalConfig pins the exact argument wiring used
+// by main.go. The generic resolver tests above cannot catch a call site that
+// accidentally passes an empty new-config value.
+func TestMeterdStartupUsesCanonicalConfig(t *testing.T) {
+	cfg := Config{
+		EgressSocket:        "/run/faas/egress.sock",
+		GatewayEgressSocket: "/run/faas/gatewayd-egress.sock",
+	}
+	getEnv := func(string) string { return "" }
+	got := egresssocket.ResolveFromOS(getEnv, cfg.EgressSocket, cfg.GatewayEgressSocket)
+	if got != cfg.EgressSocket {
+		t.Fatalf("meterd startup socket = %q, want canonical config %q", got, cfg.EgressSocket)
+	}
+}

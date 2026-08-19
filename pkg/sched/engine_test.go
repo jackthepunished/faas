@@ -1029,6 +1029,42 @@ func TestEngineWake_ColdBoot(t *testing.T) {
 	}
 }
 
+// TestEngineWake_EvictedColdIsPermanent pins the lifecycle gate used by the
+// invocation drain. A parked app must be explicitly woken before traffic can
+// create another instance; otherwise a pending invocation can create an
+// unbounded stream of FAILED rows while the app is known to be unavailable.
+func TestEngineWake_EvictedColdIsPermanent(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	parked := state.AppEvictedCold
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{Status: &parked}); err != nil {
+		t.Fatalf("park app: %v", err)
+	}
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	_, err := e.Wake(context.Background(), app.ID, "", "")
+	if err == nil {
+		t.Fatal("Wake returned nil for evicted_cold app")
+	}
+	if !errors.Is(err, ErrPermanentWake) {
+		t.Fatalf("Wake error = %v, want ErrPermanentWake", err)
+	}
+	if p := api.AsProblem(err); p == nil || p.Code != api.CodeConflict {
+		t.Fatalf("Wake problem = %v, want conflict problem", p)
+	}
+	if vmm.coldBoots != 0 || vmm.restores != 0 {
+		t.Fatalf("vmmd calls = cold=%d restore=%d, want 0/0", vmm.coldBoots, vmm.restores)
+	}
+	instances, err := store.ListInstancesForApp(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("ListInstancesForApp: %v", err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("instance rows = %d, want 0", len(instances))
+	}
+}
+
 // TestEngineWake_PhaseHistograms_Recorded (ADR-097, P1B) — pinning the
 // schedd-side wake-phase decomposition. A cold-boot wake that takes
 // 50ms inside the fakeVMM RPC must produce a non-zero observation
@@ -2937,7 +2973,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed OAUTH: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, nil)
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, nil)
 		if err != nil {
 			t.Fatalf("loadSealedEnvFor: %v", err)
 		}
@@ -2967,7 +3003,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed OAUTH: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"DB_URL": "secret:DB_URL",
 		})
 		if err != nil {
@@ -2988,7 +3024,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed DB_URL: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"NONEXISTENT": "secret:NONEXISTENT",
 		})
 		if err == nil {
@@ -3009,7 +3045,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed DB_URL: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"MISSING_A": "secret:MISSING_A",
 			"MISSING_B": "secret:MISSING_B",
 			"MISSING_C": "secret:MISSING_C",
@@ -3038,7 +3074,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 			t.Fatalf("seed DB_URL: %v", err)
 		}
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"DB_URL": "plaintext-no-prefix", // malformed ref, but row exists
 		})
 		if err != nil {
@@ -3053,7 +3089,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 		s := state.NewMemStore()
 		_, app, _ := seedApp(t, s, api.PlanHobby, 256, 1)
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, nil)
+		out, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, nil)
 		if err != nil {
 			t.Fatalf("loadSealedEnvFor: %v", err)
 		}
@@ -3066,7 +3102,7 @@ func TestLoadSealedEnvFor(t *testing.T) {
 		s := state.NewMemStore()
 		_, app, _ := seedApp(t, s, api.PlanHobby, 256, 1)
 		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, map[string]string{
+		_, err := e.loadSealedEnvFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, map[string]string{
 			"DB_URL": "secret:DB_URL",
 		})
 		if err == nil {

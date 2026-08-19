@@ -1864,6 +1864,20 @@ type WakeRequest struct {
 // SealedEnvEntry is one (key, ciphertext) pair as stored in app_secrets. The
 // key is the env-var name; the ciphertext is sealed under the host age
 // recipient by apid. vmmd merges all entries into the single envelope file.
+//
+// ADR-092 PR-A DELIBERATELY does NOT add a `Scope string` field
+// here. Each wake call goes through schedd's loadSealedEnvFor,
+// which scopes the read to dep.Scope at the seam
+// (pkg/sched/engine.go::loadSealedEnvFor at engine.go:4046 calls
+// ListAppSecretsInScope). The result is that this struct holds
+// AT MOST ONE scope's rows on every wake — there is no merge
+// demux logic at vmmd level. Adding Scope here speculatively
+// would (a) be a vestigial field reviewers rightly flag and
+// (b) push the per-scope demux into a layer that has no semantic
+// access to scope semantics. A future ADR that introduces an
+// "overlay" wire shape (analogous to the env.json overlay from
+// ADR-090 D4 deferred) would revisit this decision and widen
+// the struct + the vmmd merge loop together.
 type SealedEnvEntry struct {
 	Key        string
 	Ciphertext []byte

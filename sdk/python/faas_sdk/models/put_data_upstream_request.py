@@ -14,11 +14,11 @@ T = TypeVar("T", bound="PutDataUpstreamRequest")
 
 @_attrs_define
 class PutDataUpstreamRequest:
-    """Upsert payload for a customer data upstream. The (kind, host, port)
-    tuple is the deduplication key — repeating the PUT updates the
-    existing row's `last_seen_at` and (if `FAAS_DATA_PLACEMENT=1`) the
-    inferred-source tag. Plaintext host is never persisted; the on-disk
-    column is `host_redacted_hash`.
+    """Upsert payload for a customer data upstream. The (kind, host, port,
+    scope, deployment_scope) tuple is the deduplication key — repeating
+    the PUT updates the existing row's `last_seen_at` and (if
+    `FAAS_DATA_PLACEMENT=1`) the inferred-source tag. Plaintext host is
+    never persisted; the on-disk column is `host_redacted_hash`.
 
     """
 
@@ -29,6 +29,10 @@ class PutDataUpstreamRequest:
     port: int
     scope: str | Unset = UNSET
     """ADR-090 deployment-scope filter (3..40 chars, lowercase alnum + dash). Omitted = default scope."""
+    deployment_scope: str | Unset = UNSET
+    """ADR-098 amendment (issue #954) widens the dedupe key to include `deployment_scope` so staging-vs-prod
+    upstreams don't collide on the same app. Same shape as `scope` (3..40 chars, lowercase alnum + dash). Omitted =
+    default scope, the migration's SQL DEFAULT stamp."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -39,6 +43,8 @@ class PutDataUpstreamRequest:
         port = self.port
 
         scope = self.scope
+
+        deployment_scope = self.deployment_scope
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -51,6 +57,8 @@ class PutDataUpstreamRequest:
         )
         if scope is not UNSET:
             field_dict["scope"] = scope
+        if deployment_scope is not UNSET:
+            field_dict["deployment_scope"] = deployment_scope
 
         return field_dict
 
@@ -65,11 +73,14 @@ class PutDataUpstreamRequest:
 
         scope = d.pop("scope", UNSET)
 
+        deployment_scope = d.pop("deployment_scope", UNSET)
+
         put_data_upstream_request = cls(
             kind=kind,
             host=host,
             port=port,
             scope=scope,
+            deployment_scope=deployment_scope,
         )
 
         put_data_upstream_request.additional_properties = d

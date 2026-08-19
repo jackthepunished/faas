@@ -1,0 +1,6 @@
+[Service]
+# Multi-box routing is deployment-owned. Keep the listen/bind address
+# separate from the routable target schedd and gatewayd dial. Empty values
+# preserve the single-box unix-socket path.
+Environment=FAAS_VMMD_LISTEN_ADDR={{ faas_vmmd_listen_addr | default('') }}
+Environment=FAAS_VMMD_TARGET_URL={{ faas_vmmd_target_url | default('') }}

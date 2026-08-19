@@ -293,6 +293,24 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		log.Info("imaged: split-box artifact replicator enabled", "helper", helper)
 	}
 
+	// ADR-053: imaged asks vmmd to mount parent ext4 layers. In a split-box
+	// deployment vmmd serves TCP with mTLS rather than the legacy local Unix
+	// socket, so load the optional client cluster before constructing the
+	// lazy client. All three paths empty preserves single-box behaviour.
+	vmmTLS, err := wire.LoadClientTLSConfigWithPrefix(
+		"vmm_",
+		envOr("FAAS_VMM_TLS_CERT_PATH", ""),
+		envOr("FAAS_VMM_TLS_KEY_PATH", ""),
+		envOr("FAAS_VMM_TLS_CA_PATH", ""),
+	)
+	if err != nil {
+		return fmt.Errorf("imaged: load vmmd client TLS: %w", err)
+	}
+	vmmTarget := envOr("FAAS_VMM_SOCK", imaged.DefaultVMMSock)
+	if vmmTLS != nil {
+		log.Info("imaged: vmmd mTLS client configured", "target", vmmTarget)
+	}
+
 	h := imaged.New(store, notifier, puller, builder, guestInitPath, appsRoot, log).
 		WithStorage(storageBackend).
 		WithArtifactReplicator(artifactReplicator).
@@ -335,7 +353,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		// matches /run/faas/vmmd.sock (ADR-015); operators can
 		// override with FAAS_VMM_SOCK for dev (e.g. a bufconn
 		// test on a Mac).
-		WithVMMClient(imaged.NewVMMClient(envOr("FAAS_VMM_SOCK", imaged.DefaultVMMSock), log))
+		WithVMMClient(imaged.NewVMMClientWithTLS(vmmTarget, vmmTLS, log))
 
 	// Issue #461 / ADR-062: load the host age identity so imaged
 	// can transiently unseal per-app private-registry Basic Auth
@@ -407,16 +425,9 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// M8 loop which drives the LISTEN subscriber + nightly GC + one-shot FC
 	// sweep. The stage is still required for cold-boot of builder microVMs
 	// (see spec §4.6 two-drive scheme).
-	baseRef := envOr("FAAS_BUILDER_BASE_REF", imaged.BaseRefBuilder)
-	if v := os.Getenv("FAAS_BUILDER_BASE_REF"); v != "" {
-		// Same digest-pinned gate as the deploy base ref above. The
-		// builder base ext4 is shared across every cold-boot and
-		// snapshot-prime — flipping it without a digest would corrupt
-		// every parked app's restore path.
-		ref, err := oci.ParseReference(v)
-		if err != nil || ref.Digest == "" {
-			return fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", v)
-		}
+	baseRef, err := builderBaseRefFromEnv()
+	if err != nil {
+		return err
 	}
 	basePath := envOr("FAAS_BUILDER_BASE_PATH", "/srv/fc/base/builder-base.ext4")
 	// #96 / ADR-025 axis 2: EnsureBaseExt4 publishes via the StorageBackend
@@ -540,6 +551,26 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// builderBaseRefFromEnv resolves the builder image reference. Single-box
+// development keeps the historical latest default; a named multi-box host
+// must receive an explicit digest-pinned ref from deployment configuration.
+// This prevents a public compute node from silently changing its builder
+// rootfs when GHCR's mutable latest tag advances.
+func builderBaseRefFromEnv() (string, error) {
+	v := os.Getenv("FAAS_BUILDER_BASE_REF")
+	if v == "" {
+		if os.Getenv("FAAS_NODE_NAME") != "" {
+			return "", errors.New("imaged: FAAS_BUILDER_BASE_REF is required and must be digest-pinned on a named multi-box host")
+		}
+		return imaged.BaseRefBuilder, nil
+	}
+	ref, err := oci.ParseReference(v)
+	if err != nil || ref.Digest == "" {
+		return "", fmt.Errorf("imaged: FAAS_BUILDER_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", v)
+	}
+	return v, nil
 }
 
 // guestInitPathFromEnv resolves the boot-critical PID 1 binary. Older

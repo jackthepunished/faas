@@ -2,7 +2,7 @@
 # §4.9). Built FROM base-minimal so app images built FROM this share every lower
 # layer, keeping the two-drive diff (drive1) to just the app's deps + code.
 # Content-addressed, staged to /srv/fc/base/runner-node22.ext4.
-FROM node:22-bookworm-slim@sha256:REPLACE_ME_AT_MERGE_TIME
+FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
 # Issue #197 B3.6: mutable tag pinned via images/Dockerfile.lock.
 # `make images-lock-update` is the only way to bump the digest.
 # Guest runtime user (uid 1000, spec §4.8).

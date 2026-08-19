@@ -724,10 +724,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// Mailer: defaults to mail.SenderFromEnv so FAAS_MAIL_TRANSPORT
 	// selects the transport (resend/postmark/log/noop). The dunning
-	// timer needs this for its transition emails.
+	// timer needs this for its transition emails. Operator-selected
+	// resend / postmark with the credential env var empty is
+	// fail-closed (ADR-115 §D5); the wrapped ErrMailerMisconfigured
+	// propagates here so the daemon refuses to boot instead of
+	// silently dropping email into slog.
 	mailer := deps.mailer
 	if mailer == nil {
-		mailer = mail.SenderFromEnv(deps.getenv, log)
+		var err error
+		mailer, err = mail.SenderFromEnv(deps.getenv, log)
+		if err != nil {
+			return fmt.Errorf("meterd: %w (set FAAS_MAIL_TRANSPORT=log or supply the missing credential in /etc/faas/sealed.env)", err)
+		}
 	}
 
 	// FAAS_QUOTA_INTERVAL / FAAS_SAMPLE_INTERVAL / FAAS_STRIPE_INTERVAL /
@@ -825,9 +833,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// PR-2: kick off the gateway stream consumer. The unix-socket
 	// path is resolved by egresssocket.ResolveFromOS, which prefers
 	// FAAS_EGRESS_SOCKET (added in PR-C+D), then the legacy
-	// FAAS_GATEWAY_EGRESS_SOCKET (one release cycle), then
-	// the cfg's GatewayEgressSocket, then
-	// egresssocket.DefaultSocketPath. Both sockets (this one and
+	// FAAS_GATEWAY_EGRESS_SOCKET (one release cycle), then the
+	// config's new EgressSocket field, then the legacy
+	// GatewayEgressSocket field, then egresssocket.DefaultSocketPath.
+	// Passing both config fields is load-bearing: gatewayd-internal
+	// binds the new /run/faas/egress.sock path, so meterd must consume
+	// the same canonical config rather than silently selecting the
+	// legacy socket when no environment override is present. Both sockets (this one and
 	// FAAS_GATEWAY_SYNTH_SOCKET) share the same group-`faas` DAC auth
 	// (ADR-015). ctx here is the loop ctx — when the daemon shuts
 	// down the goroutine returns.
@@ -837,7 +849,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		return ""
 	}
-	gwSocketPath := egresssocket.ResolveFromOS(envOr, "", cfg.GatewayEgressSocket)
+	gwSocketPath := egresssocket.ResolveFromOS(envOr, cfg.EgressSocket, cfg.GatewayEgressSocket)
 	gwEgress.startStream(ctx, gwSocketPath, log)
 	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and

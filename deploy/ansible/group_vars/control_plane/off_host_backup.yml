@@ -1,0 +1,15 @@
+# group_vars/control_plane/off_host_backup.yml — off-host storage wiring
+# (issue #250).
+#
+# Read from the operator shell at ansible-run time via lookup('env',
+# 'VAR_NAME'). The vars feed the postgres_backup role's fail-closed assert,
+# the postgres archive_command template, and the backup push service.
+#
+# Set OFF_HOST_BACKUP_USER / OFF_HOST_BACKUP_HOST in the operator
+# environment. The vars intentionally remain un-defaulted; the
+# postgres_backup role refuses to deploy without a real endpoint.
+
+off_host_backup_user: "{{ lookup('env', 'OFF_HOST_BACKUP_USER') | default('', true) }}"
+off_host_backup_host: "{{ lookup('env', 'OFF_HOST_BACKUP_HOST') | default('', true) }}"
+off_host_backup_basebackup_path: "faas-pg-basebackup"
+off_host_backup_wal_path: "faas-pg-wal"

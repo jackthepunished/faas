@@ -257,6 +257,63 @@ func TestMiddleware_DownstreamHopInheritsBudget(t *testing.T) {
 	}
 }
 
+func TestMiddleware_DefaultForSelectsRouteBudget(t *testing.T) {
+	cfg, _, _ := newCfg(t, 3*time.Second, 30*time.Second)
+	cfg.DefaultFor = func(r *http.Request) time.Duration {
+		if IsSyncInvokeRequest(r) {
+			return 30 * time.Second
+		}
+		return 0
+	}
+	var got Budget
+	h := cfg.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ok bool
+		got, ok = FromContext(r.Context())
+		if !ok {
+			t.Fatal("inner handler did not receive a budget")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/apps/demo/invoke", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("sync invoke: status = %d, want 200", rr.Code)
+	}
+	if got.Total != 30*time.Second {
+		t.Fatalf("sync invoke budget = %v, want 30s", got.Total)
+	}
+
+	got = Budget{}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/apps/demo/invoke/async", nil))
+	if got.Total != 3*time.Second {
+		t.Fatalf("async invoke budget = %v, want 3s", got.Total)
+	}
+}
+
+func TestIsSyncInvokeRequest(t *testing.T) {
+	cases := []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{http.MethodPost, "/v1/apps/demo/invoke", true},
+		{http.MethodPost, "/v1/apps/demo/invoke/async", false},
+		{http.MethodGet, "/v1/apps/demo/invoke", false},
+		{http.MethodPost, "/v1/apps//invoke", false},
+		{http.MethodPost, "/v1/apps/demo/invoked", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method+"_"+tc.path, func(t *testing.T) {
+			r := httptest.NewRequest(tc.method, tc.path, nil)
+			if got := IsSyncInvokeRequest(r); got != tc.want {
+				t.Fatalf("IsSyncInvokeRequest(%s %s) = %v, want %v", tc.method, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestMiddleware_EndToEndTimeoutEnforced is the ADR-093 §14
 // metal-acceptance smoke: a 100ms budget with a 1s slow
 // downstream fake must 504 in <200ms with a stable

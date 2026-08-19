@@ -65,6 +65,52 @@ func TestInjectGuestInit_HappyPath(t *testing.T) {
 	}
 }
 
+func TestInjectGuestInit_ReplacesSymlink(t *testing.T) {
+	staging := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(staging, "sbin", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(staging, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "bin", "busybox"), []byte("busybox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(staging, "sbin", "init")
+	if err := os.Symlink("/bin/busybox", dst); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "init")
+	if err := os.WriteFile(src, []byte("guest-init"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := InjectGuestInit(staging, src); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("/sbin/init remained a symlink")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "guest-init" {
+		t.Fatalf("/sbin/init = %q, want guest-init", got)
+	}
+	busybox, err := os.ReadFile(filepath.Join(staging, "bin", "busybox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(busybox) != "busybox" {
+		t.Fatalf("busybox was modified: %q", busybox)
+	}
+}
+
 func TestInjectGuestInit_EmptyPath(t *testing.T) {
 	if err := InjectGuestInit(t.TempDir(), ""); err == nil {
 		t.Error("empty guest-init path should error")

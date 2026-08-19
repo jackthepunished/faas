@@ -856,6 +856,15 @@ func listEventsForAccountExport(ctx context.Context, st state.Store, accountID s
 // A per-app list failure is collected into the returned error so
 // gatherExport can convert any partial failure into a 500; we don't
 // want a backup trusted to be complete when a per-app SELECT failed.
+//
+// ADR-092 PR-B: the export walks every scope per app (PR-A's
+// ListAllAppSecrets), not just the default-scope ListAppSecrets.
+// Pre-PR-B the call used ListAppSecrets, which delegated to
+// ListAppSecretsInScope(DefaultEnvScope) and silently dropped
+// prod/staging rows — a customer with multi-scope secrets got a
+// silently-incomplete export. Each row's Scope is echoed on the
+// wire so the destination import can re-bind every (app, scope,
+// key) triple.
 func listSecretsForAccountExport(ctx context.Context, st state.Store, accountID string, apps []state.App, include bool) ([]api.AppSecretExportResponse, error) {
 	if !include {
 		return nil, nil
@@ -865,7 +874,7 @@ func listSecretsForAccountExport(ctx context.Context, st state.Store, accountID 
 		failure error
 	)
 	for _, a := range apps {
-		rows, err := st.ListAppSecrets(ctx, accountID, a.ID)
+		rows, err := st.ListAllAppSecrets(ctx, accountID, a.ID)
 		if err != nil {
 			failure = errors.Join(failure, fmt.Errorf("list secrets app=%s: %w", a.ID, err))
 			continue
@@ -873,6 +882,7 @@ func listSecretsForAccountExport(ctx context.Context, st state.Store, accountID 
 		for _, sec := range rows {
 			out = append(out, api.AppSecretExportResponse{
 				AppID:      sec.AppID,
+				Scope:      sec.Scope,
 				Key:        sec.Key,
 				Ciphertext: base64.RawURLEncoding.EncodeToString(sec.Ciphertext),
 				CreatedAt:  sec.CreatedAt.UTC().Format(time.RFC3339),

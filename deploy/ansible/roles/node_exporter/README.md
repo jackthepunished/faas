@@ -28,5 +28,5 @@ zero benefit.
 
 ```bash
 ansible-playbook -e node_exporter_version=1.9.0 \
-                 -e node_exporter_release_sha256=<new-sha> site.yml
+                 -e node_exporter_release_sha256=<new-sha> bootstrap.yml
 ```

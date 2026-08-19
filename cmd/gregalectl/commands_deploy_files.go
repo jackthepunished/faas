@@ -37,6 +37,13 @@ import (
 // which parses as the key `ansible_host` with value `50051` and the rest
 // as a string-typed fragment — ansible then fails to load the file.
 func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDRv6, overlayCIDRs string) string {
+	return renderHostVarsYAMLWithTargetURL(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDRv6, overlayCIDRs, "")
+}
+
+// renderHostVarsYAMLWithTargetURL is the deployment coordinator's variant.
+// A compute-only node's vmmd routing values are rendered into host_vars so
+// Ansible can install the systemd drop-in that drives self-registration.
+func renderHostVarsYAMLWithTargetURL(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDRv6, overlayCIDRs, targetURL string) string {
 	roleComment := roleControlPlane + " box"
 	roleMarker := roleControlPlane
 	hosts := []string{"postgres", "scheduler", "metering", "gateway-public", "githubd"}
@@ -79,6 +86,13 @@ func renderHostVarsYAML(fqdn, role, ansibleHost, publicIface, masqCIDR, masqCIDR
 		fmt.Fprintf(&b, "# this to the box's WAN-facing NIC (e.g. ens5 on Hetzner, eth0 on bare metal).\n")
 		fmt.Fprintf(&b, "public_iface: %s\n", yamlQuote(publicIface))
 		fmt.Fprintf(&b, "masquerade_cidr: %s\n", yamlQuote(masqCIDR))
+		if targetURL != "" {
+			fmt.Fprintf(&b, "\n")
+			fmt.Fprintf(&b, "# Multi-box vmmd routing. listen_addr is the bind target;\n")
+			fmt.Fprintf(&b, "# target_url is the routable dial target written to compute_nodes.\n")
+			fmt.Fprintf(&b, "faas_vmmd_listen_addr: %s\n", yamlQuote("tcp://0.0.0.0:50051"))
+			fmt.Fprintf(&b, "faas_vmmd_target_url: %s\n", yamlQuote(targetURL))
+		}
 		if masqCIDRv6 != "" {
 			fmt.Fprintf(&b, "masquerade_cidr_v6: %s\n", yamlQuote(masqCIDRv6))
 		} else {

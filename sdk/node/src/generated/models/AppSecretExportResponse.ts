@@ -8,6 +8,7 @@
 export type AppSecretExportResponse = {
   app_id: string;
   key: string;
+  scope: string;
   /**
    * base64-encoded age-sealed envelope
    */

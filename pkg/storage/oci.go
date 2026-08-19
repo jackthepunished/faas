@@ -218,6 +218,8 @@ const (
 	repoBase   = "base"
 	repoLayers = "layers"
 	repoKernel = "kernel"
+	repoScans  = "scans"
+	repoSigs   = "sigs"
 )
 
 // defaultRepoPrefix is the per-namespace repo prefix the driver uses
@@ -252,7 +254,7 @@ func (o *OCIRegistryStorageBackend) plan(key string) (repo, ref string, err erro
 	if err := validateKey(key); err != nil {
 		return "", "", err
 	}
-	parts := strings.SplitN(key, "/", 3)
+	parts := strings.Split(key, "/")
 	if len(parts) < 2 {
 		return "", "", fmt.Errorf("%w: %q has no namespace", ErrInvalidKey, key)
 	}
@@ -318,6 +320,33 @@ func (o *OCIRegistryStorageBackend) plan(key string) (repo, ref string, err erro
 			return "", "", fmt.Errorf("%w: %q produces invalid OCI tag %q", ErrInvalidKey, key, parts[1])
 		}
 		return repoKernel, parts[1], nil
+	case repoScans:
+		// scans/<base-name>.scan.json → repo "scans", tag
+		// "<base-name>.scan.json". Scan sidecars are opaque JSON
+		// artifacts, but their names already satisfy the OCI tag
+		// charset and must remain addressable by vmmd at boot.
+		if len(parts) != 2 || !strings.HasSuffix(parts[1], ".scan.json") {
+			return "", "", fmt.Errorf("%w: %q does not match scans/<base-name>.scan.json", ErrInvalidKey, key)
+		}
+		if !tagCharset.MatchString(parts[1]) {
+			return "", "", fmt.Errorf("%w: %q produces invalid OCI tag %q", ErrInvalidKey, key, parts[1])
+		}
+		return repoScans, parts[1], nil
+	case repoSigs:
+		// sigs/<layer-key>.sig → repo "sigs/<layer namespace>",
+		// tag "<layer name>.sig". Keeping the layer-key directory
+		// segments in the repository name preserves the exact signature
+		// key without relying on a lossy tag encoding. Cosign signatures
+		// are artifacts in their own right and must follow the same OCI
+		// path as the layer they attest.
+		if len(parts) < 3 {
+			return "", "", fmt.Errorf("%w: %q has unexpected signature path", ErrInvalidKey, key)
+		}
+		tag := parts[len(parts)-1]
+		if !tagCharset.MatchString(tag) {
+			return "", "", fmt.Errorf("%w: %q produces invalid OCI tag %q", ErrInvalidKey, key, tag)
+		}
+		return repoSigs + "/" + strings.Join(parts[1:len(parts)-1], "/"), tag, nil
 	default:
 		return "", "", fmt.Errorf("%w: %q has unknown namespace %q", ErrInvalidKey, key, parts[0])
 	}
@@ -403,6 +432,7 @@ func (o *OCIRegistryStorageBackend) Get(ctx context.Context, key string) (io.Rea
 	if err != nil {
 		return nil, err
 	}
+	o.knownRepos.Store(o.fullRepo(repo), true)
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("storage: oci get %q: %w", key, err)
 	}
@@ -549,6 +579,19 @@ func (o *OCIRegistryStorageBackend) reposForPrefix(prefix string) []string {
 		return []string{repoLayers}
 	case repoKernel:
 		return []string{repoKernel}
+	case repoScans:
+		return []string{repoScans}
+	case repoSigs:
+		var out []string
+		sigPrefix := o.prefix + "/" + repoSigs + "/"
+		o.knownRepos.Range(func(k, _ any) bool {
+			ks := k.(string)
+			if strings.HasPrefix(ks, sigPrefix) {
+				out = append(out, strings.TrimPrefix(ks, o.prefix+"/"))
+			}
+			return true
+		})
+		return out
 	default:
 		return nil
 	}
@@ -581,7 +624,15 @@ func (o *OCIRegistryStorageBackend) unplan(repo, tag string) (string, bool) {
 		return "layers/" + tag + ".ext4", true
 	case repoKernel:
 		return "kernel/" + tag, true
+	case repoScans:
+		if !strings.HasSuffix(tag, ".scan.json") || !tagCharset.MatchString(tag) {
+			return "", false
+		}
+		return "scans/" + tag, true
 	default:
+		if strings.HasPrefix(repo, repoSigs+"/") && tagCharset.MatchString(tag) {
+			return repo + "/" + tag, true
+		}
 		if strings.HasPrefix(repo, "snap-") {
 			dep := strings.TrimPrefix(repo, "snap-")
 			return "snap/" + dep + "/" + tag, true
@@ -1437,6 +1488,11 @@ type bearerReqOpts struct {
 // the status code + a 512-byte response snippet so ops have a hook
 // to diagnose.
 func (o *OCIRegistryStorageBackend) doBearerRequest(ctx context.Context, opts bearerReqOpts) (*http.Response, error) {
+	applyExtraHeaders := func(req *http.Request) {
+		for key, value := range opts.ExtraHeaders {
+			req.Header.Set(key, value)
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, opts.Method, opts.URL, opts.Body)
 	if err != nil {
 		return nil, fmt.Errorf("build %s %s: %w", opts.Method, opts.URL, err)
@@ -1452,6 +1508,7 @@ func (o *OCIRegistryStorageBackend) doBearerRequest(ctx context.Context, opts be
 	if tok, _ := o.bearer(ctx, opts.Scope); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
+	applyExtraHeaders(req)
 	resp, err := o.hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("send %s %s: %w", opts.Method, opts.URL, err)
@@ -1490,6 +1547,7 @@ func (o *OCIRegistryStorageBackend) doBearerRequest(ctx context.Context, opts be
 		if tok != "" {
 			req2.Header.Set("Authorization", "Bearer "+tok)
 		}
+		applyExtraHeaders(req2)
 		resp, err = o.hc.Do(req2)
 		if err != nil {
 			return nil, fmt.Errorf("401 retry send: %w", err)
@@ -1511,6 +1569,7 @@ func (o *OCIRegistryStorageBackend) doBearerRequest(ctx context.Context, opts be
 	if tok != "" {
 		req2.Header.Set("Authorization", "Bearer "+tok)
 	}
+	applyExtraHeaders(req2)
 	resp, err = o.hc.Do(req2)
 	if err != nil {
 		return nil, fmt.Errorf("401 retry send: %w", err)

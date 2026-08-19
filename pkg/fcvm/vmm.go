@@ -99,10 +99,11 @@ type JailerVMM struct {
 // started in startJailer; reads in DestroyWithExport block until the watchdog
 // signals done via the cond.
 type instanceRecord struct {
-	cmd      *exec.Cmd
-	exited   bool          // set by the watchdog when cmd.Wait completes
-	exitCode int           // captured from cmd.Wait's ProcessState.ExitCode()
-	done     chan struct{} // closed by the watchdog; readers <-done to wake
+	cmd         *exec.Cmd
+	consolePath string        // serial console file used to detect a guest halt
+	exited      bool          // set by the watchdog when cmd.Wait completes
+	exitCode    int           // captured from cmd.Wait's ProcessState.ExitCode()
+	done        chan struct{} // closed by the watchdog; readers <-done to wake
 }
 
 // ringWriter is a thin io.Writer that forwards every Write call to the
@@ -1246,23 +1247,48 @@ func (v *JailerVMM) DestroyWithExport(ctx context.Context, l Lease, exportDir st
 	destroyWait := v.destroyWaitFor(exportDir)
 	deadline := time.NewTimer(destroyWait)
 	defer deadline.Stop()
-	select {
-	case <-rec.done:
-	case <-deadline.C:
-		// Force-kill and re-wait with a shorter budget. A builder that ignores
-		// the spec's BuildTimeoutSeconds is misbehaving; refuse to hold vmmd
-		// forever, but don't tear down the chroot before the export either.
-		v.mu.Lock()
-		if proc := v.proc[l.Instance]; proc != nil && proc.Process != nil {
-			_ = proc.Process.Kill()
-		}
-		v.mu.Unlock()
+	// A Linux guest can reach "System halted" while the Firecracker process
+	// remains alive. Builder guest-init has already synced build-done.json and
+	// the OCI output before requesting poweroff, so this is a safe terminal
+	// state in which to stop the VMM and proceed with export. Polling the
+	// per-instance serial file keeps this recovery scoped to builder teardown;
+	// ordinary app VMs retain the existing wait/kill behavior.
+	var haltPoll <-chan time.Time
+	if exportDir != "" && rec.consolePath != "" {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		haltPoll = ticker.C
+	}
+	for {
 		select {
 		case <-rec.done:
-		case <-time.After(5 * time.Second):
-			return -1, fmt.Errorf("vmm: %s did not exit within %s", l.Instance, destroyWait)
+			goto exited
+		case <-deadline.C:
+			// Force-kill and re-wait with a shorter budget. A builder that ignores
+			// the spec's BuildTimeoutSeconds is misbehaving; refuse to hold vmmd
+			// forever, but don't tear down the chroot before the export either.
+			v.killProcess(l.Instance)
+			select {
+			case <-rec.done:
+			case <-time.After(5 * time.Second):
+				return -1, fmt.Errorf("vmm: %s did not exit within %s", l.Instance, destroyWait)
+			}
+			goto exited
+		case <-haltPoll:
+			if !consoleShowsGuestHalted(rec.consolePath) {
+				continue
+			}
+			v.killProcess(l.Instance)
+			select {
+			case <-rec.done:
+			case <-time.After(5 * time.Second):
+				return -1, fmt.Errorf("vmm: %s did not exit after guest halt", l.Instance)
+			}
+			goto exited
 		}
 	}
+
+exited:
 
 	v.mu.Lock()
 	exitCode := rec.exitCode
@@ -1294,6 +1320,40 @@ func (v *JailerVMM) DestroyWithExport(ctx context.Context, l Lease, exportDir st
 	}
 	v.sweepMaterialised(l.Instance)
 	return exitCode, nil
+}
+
+func (v *JailerVMM) killProcess(instance string) {
+	v.mu.Lock()
+	proc := v.proc[instance]
+	v.mu.Unlock()
+	if proc != nil && proc.Process != nil {
+		_ = proc.Process.Kill()
+	}
+}
+
+// consoleShowsGuestHalted reads only the tail of the serial console. The
+// kernel emits "System halted" after guest-init has synced its build marker;
+// limiting the read bounds teardown overhead even for a noisy build log.
+func consoleShowsGuestHalted(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	const tailBytes int64 = 4096
+	offset := info.Size() - tailBytes
+	if offset < 0 {
+		offset = 0
+	}
+	buf := make([]byte, info.Size()-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	return bytes.Contains(buf, []byte("System halted"))
 }
 
 // InstancePID returns the host PID of the running jailer child for
@@ -1947,8 +2007,9 @@ func (v *JailerVMM) startJailer(_ context.Context, l Lease, extraFCArgs ...strin
 	// tears it down, otherwise a successful builder boot is killed immediately.
 	cmd := exec.Command(argv[0], argv[1:]...)
 	ring := v.ringFor(l.Instance)
+	consolePath := filepath.Join("/var/log/faas", "vm-"+l.Instance+".console")
 	var consoleFile *os.File
-	if f, openErr := os.OpenFile(filepath.Join("/var/log/faas", "vm-"+l.Instance+".console"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640); openErr == nil {
+	if f, openErr := os.OpenFile(consolePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640); openErr == nil {
 		consoleFile = f
 	}
 	stdout := io.Discard
@@ -1976,7 +2037,7 @@ func (v *JailerVMM) startJailer(_ context.Context, l Lease, extraFCArgs ...strin
 	}
 	v.mu.Lock()
 	v.proc[l.Instance] = cmd
-	rec := &instanceRecord{cmd: cmd, done: make(chan struct{})}
+	rec := &instanceRecord{cmd: cmd, consolePath: consolePath, done: make(chan struct{})}
 	v.recs[l.Instance] = rec
 	v.mu.Unlock()
 	// Watchdog: cmd.Wait must be called exactly once per process (stdlib

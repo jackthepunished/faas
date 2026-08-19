@@ -183,6 +183,7 @@ func Roles() []Role {
 		{CommonName: "schedd.faas", Kind: KindServer, Directory: "schedd", Filename: "server", AltNames: ProductionSANs("schedd.faas")},
 		{CommonName: "vmmd.faas", Kind: KindServer, Directory: "vmmd", Filename: "server", AltNames: ProductionSANs("vmmd.faas")},
 		{CommonName: "builderd.faas", Kind: KindServer, Directory: "builderd", Filename: "server", AltNames: ProductionSANs("builderd.faas")},
+		{CommonName: "imaged.faas", Kind: KindServer, Directory: "imaged", Filename: "server", AltNames: ProductionSANs("imaged.faas")},
 		{CommonName: "egress.faas", Kind: KindServer, Directory: "egress", Filename: "egress", AltNames: ProductionSANs("egress.faas")},
 		{CommonName: "apid.faas", Kind: KindServer, Directory: "apid", Filename: "advisory", AltNames: ProductionSANs("apid.faas")},
 		{CommonName: "githubd.faas", Kind: KindServer, Directory: "githubd", Filename: "server", AltNames: ProductionSANs("githubd.faas")},
@@ -229,6 +230,7 @@ func Roles() []Role {
 		{CommonName: "apid.faas", Kind: KindClient, Directory: "apid", Filename: "githubd-client", AltNames: ProductionSANs("apid.faas")},
 		{CommonName: "builderd.faas", Kind: KindClient, Directory: "builderd", Filename: "vmmd-client", AltNames: ProductionSANs("builderd.faas")},
 		{CommonName: "schedd.faas", Kind: KindClient, Directory: "schedd", Filename: "vmmd-client", AltNames: ProductionSANs("schedd.faas")},
+		{CommonName: "imaged.faas", Kind: KindClient, Directory: "imaged", Filename: "vmmd-client", AltNames: ProductionSANs("imaged.faas")},
 		{CommonName: "gatewayd-internal-public.faas", Kind: KindClient, Directory: "gatewayd-internal-public", Filename: "leader-client", AltNames: MergeProductionSANs("gatewayd-internal-public.faas", "gatewayd-public.faas")},
 	}
 
@@ -324,8 +326,9 @@ func rolesForControlPlane() []Role {
 //     builderd/), gatewayd → schedd, gatewayd → vmmd (both live
 //     under gatewayd/)
 //
-// imaged's server leaf (Directory="imaged") is part of the vmmd ↔
-// imaged parent-mount hop (ADR-053 slice-3); it lives on fsn-2.
+// imaged's server and vmmd-client leaves (Directory="imaged") are part
+// of the vmmd ↔ imaged parent-mount hop (ADR-053 slice-3); they live on
+// fsn-2.
 func rolesForComputeOnly() []Role {
 	keep := map[string]bool{
 		// server + client dirs that live on fsn-2:

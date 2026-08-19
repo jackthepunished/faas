@@ -1653,6 +1653,12 @@ func (s *server) handler() http.Handler {
 	// == install.account.login) is enforced in the handlers.
 	mux.Handle("POST /v1/install/repos/list", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listInstallableRepos))))
 	mux.Handle("POST /v1/apps/{slug}/install/bind", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.bindAppToRepo))))
+	// Issue #961 / Mega-B PR-3 — GET /v1/templates is the dashboard's
+	// source of truth for the template catalog (handlers_templates.go).
+	// Mirrors cmd/gregale/templates.Names without importing the CLI's
+	// main package; the dashboard and the CLI read the same
+	// 13-entry list through independent paths.
+	mux.Handle("GET /v1/templates", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.listTemplates))))
 
 	// PR-C: /oauth/code-callback is the user-to-server OAuth callback
 	// (the "Connect GitHub" button flow). Sibling of /oauth/callback

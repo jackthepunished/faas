@@ -817,13 +817,48 @@ func (c *Client) Logout(ctx context.Context) error {
 
 // Secrets (spec §11/G2). Plaintext VALUE never leaves the caller
 // except via SetSecret's body.
+//
+// ADR-092 PR-B: every secrets helper gains an optional scope
+// argument. Pass "" to write to / read from the default scope
+// (same wire shape as pre-PR-B callers — pre-PR-B code paths are
+// preserved by the scope="" branch). Pass a scope name to read
+// or write a specific row; the SDK appends ?scope=<name> to the
+// path. SetSecretsWithScope / UnsetSecretWithScope /
+// RotateSecretWithScope are the canonical typed surfaces; the
+// pre-PR-B SetSecret/UnsetSecret/RotateSecret stay as scope=""
+// wrappers for backward-compat.
+//
+// Once SDK regen (C6) lands and the openapi.yaml gains the scope
+// query parameter, the generator will emit a single typed method
+// per verb (SetSecret(ctx, slug, key, value, scope) — *string)
+// and these hand-rolled siblings will be removed. Until then
+// the gregale CLI uses these directly to avoid an extra
+// openapi.yaml + regen round-trip mid-PR.
 func (c *Client) ListSecrets(ctx context.Context, slug string) (AppSecretListResponse, error) {
-	var out AppSecretListResponse
-	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/secrets", nil, &out)
+	return c.ListSecretsWithScope(ctx, slug, "")
 }
+
+// ListSecretsWithScope is the scope-aware sibling of ListSecrets.
+// scope="" reads from the default scope (flat `secrets` array);
+// scope="__all__" returns the nested `secrets_by_scope` map
+// (ADR-092, mirror of ADR-090 D3's env_by_scope).
+func (c *Client) ListSecretsWithScope(ctx context.Context, slug, scope string) (AppSecretListResponse, error) {
+	var out AppSecretListResponse
+	path := c.scopeQuery("/v1/apps/"+slug+"/secrets", scope)
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 func (c *Client) SetSecret(ctx context.Context, slug, key, value string) error {
-	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/secrets/"+key,
-		PutAppSecretRequest{Value: value}, nil)
+	return c.SetSecretWithScope(ctx, slug, key, value, "")
+}
+
+// SetSecretWithScope is the scope-aware sibling of SetSecret. The
+// reserved sentinel "__all__" is rejected by the server with
+// 400 env_scope_reserved; the SDK doesn't pre-validate so the
+// error envelope reaches the caller verbatim.
+func (c *Client) SetSecretWithScope(ctx context.Context, slug, key, value, scope string) error {
+	path := c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key, scope)
+	return c.do(ctx, "PUT", path, PutAppSecretRequest{Value: value}, nil)
 }
 
 // SetAppEvictionPriority (issue #475) PATCHes the per-app eviction
@@ -841,7 +876,46 @@ func (c *Client) SetAppEvictionPriority(ctx context.Context, slug, priority stri
 		UpdateAppRequest{EvictionPriority: &priority}, nil)
 }
 func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
-	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
+	return c.UnsetSecretWithScope(ctx, slug, key, "")
+}
+
+// UnsetSecretWithScope is the scope-aware sibling of UnsetSecret.
+// Same reserved-sentinel posture as SetSecretWithScope.
+func (c *Client) UnsetSecretWithScope(ctx context.Context, slug, key, scope string) error {
+	path := c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key, scope)
+	return c.do(ctx, "DELETE", path, nil, nil)
+}
+
+// RotateSecret is the pre-PR-B wrapper that calls RotateSecret
+// at the default scope. Mirrors SetSecret / UnsetSecret's pre-PR-B
+// surface so callers that haven't migrated to scope still link.
+func (c *Client) RotateSecret(ctx context.Context, slug, key, value string) (RotateAppSecretResponse, error) {
+	return c.RotateSecretWithScope(ctx, slug, key, value, "")
+}
+
+// RotateSecretWithScope is the scope-aware sibling of RotateSecret.
+// Same reserved-sentinel posture as SetSecretWithScope.
+func (c *Client) RotateSecretWithScope(ctx context.Context, slug, key, value, scope string) (RotateAppSecretResponse, error) {
+	var out RotateAppSecretResponse
+	path := c.scopeQuery("/v1/apps/"+slug+"/secrets/"+key+"/rotate", scope)
+	return out, c.do(ctx, "POST", path, RotateAppSecretRequest{Value: value}, &out)
+}
+
+// scopeQuery appends "?scope=<name>" to path when scope is
+// non-empty. Empty scope returns the path unchanged (pre-PR-B
+// callers see no behaviour change). Lives as a method on Client
+// rather than a package-level helper so the SDK's other
+// scope-aware methods can call it without an extra import.
+// url.Values.Encode handles percent-encoding of edge cases
+// (e.g. a future scope name with a reserved char — not currently
+// possible given the api.EnvScopePattern regex, but defensive).
+func (c *Client) scopeQuery(path, scope string) string {
+	if scope == "" {
+		return path
+	}
+	v := url.Values{}
+	v.Set("scope", scope)
+	return path + "?" + v.Encode()
 }
 
 // Private-registry Basic Auth (issue #461 / ADR-062). Password is

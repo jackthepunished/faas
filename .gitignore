@@ -46,6 +46,9 @@ vmlinux-*
 /gregale
 /gregale-mfa-qr.png
 
+# Manifest-derived Ansible inventory (generated; never hand-edit)
+/deploy/ansible/.generated/
+
 # CLIs (build output)
 /gregalectl
 /gregale

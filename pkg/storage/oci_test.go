@@ -393,6 +393,18 @@ func TestPlan_KernelKey(t *testing.T) {
 	}
 }
 
+func TestPlan_SignatureKey(t *testing.T) {
+	o := &OCIRegistryStorageBackend{prefix: "faas"}
+	key := "sigs/apps/my-app/550e8400-e29b-41d4-a716-446655440000.ext4.sig"
+	repo, tag, err := o.plan(key)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if repo != "sigs/apps/my-app" || tag != "550e8400-e29b-41d4-a716-446655440000.ext4.sig" {
+		t.Errorf("got (%q,%q), want (sigs/apps/my-app, 550e8400-e29b-41d4-a716-446655440000.ext4.sig)", repo, tag)
+	}
+}
+
 func TestPlan_InvalidKeys(t *testing.T) {
 	o := &OCIRegistryStorageBackend{prefix: "faas"}
 	tests := []string{
@@ -406,6 +418,8 @@ func TestPlan_InvalidKeys(t *testing.T) {
 		"snap/550e8400-e29b-41d4-a716-446655440000/bogus", // wrong segment
 		"base/runner.ext4.digest.digest",                  // double-suffix
 		"layers/abc.txt",                                  // wrong extension
+		"scans/runner-node22-amd64.ext4",                  // missing scan suffix
+		"sigs/base",                                       // missing signature namespace
 		"unknown/foo/bar",                                 // unknown namespace
 		"apps/slug!/dep.ext4",                             // bang is not in tag charset
 	}
@@ -419,6 +433,20 @@ func TestPlan_InvalidKeys(t *testing.T) {
 				t.Errorf("plan(%q): error %v does not wrap ErrInvalidKey", k, err)
 			}
 		})
+	}
+}
+
+func TestPlan_ScanKey(t *testing.T) {
+	o := &OCIRegistryStorageBackend{prefix: "faas"}
+	repo, tag, err := o.plan("scans/runner-node22-amd64.ext4.scan.json")
+	if err != nil {
+		t.Fatalf("plan scan key: %v", err)
+	}
+	if repo != "scans" || tag != "runner-node22-amd64.ext4.scan.json" {
+		t.Errorf("got (%q,%q), want (scans,runner-node22-amd64.ext4.scan.json)", repo, tag)
+	}
+	if got, ok := o.unplan(repo, tag); !ok || got != "scans/runner-node22-amd64.ext4.scan.json" {
+		t.Errorf("unplan = (%q,%t), want scan key", got, ok)
 	}
 }
 
@@ -551,6 +579,10 @@ func TestOCIGetRejectsNonSha256Digest(t *testing.T) {
 		}
 		switch {
 		case strings.Contains(r.URL.Path, "/manifests/"):
+			if !strings.Contains(r.Header.Get("Accept"), imageManifestMediaType) {
+				http.Error(w, "manifest Accept header missing", http.StatusNotAcceptable)
+				return
+			}
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 			// Craft a manifest whose layer digest is NOT sha256:.
 			// sha512 is a valid OCI digest algorithm (the spec is
@@ -1024,6 +1056,8 @@ func TestOCIUnplanInverse(t *testing.T) {
 		"base/runner-node22.ext4.digest",
 		"layers/" + depUUID + ".ext4",
 		"kernel/v1.10.0",
+		"sigs/apps/slug-1/" + depUUID + ".ext4.sig",
+		"sigs/base/amd64/runner-builder-amd64.ext4.sig",
 	}
 	for _, k := range keys {
 		t.Run(k, func(t *testing.T) {

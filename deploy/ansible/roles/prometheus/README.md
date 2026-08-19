@@ -18,7 +18,7 @@ and runs it as a hardened systemd unit on the bridge IP.
 
 ```bash
 ansible-playbook -e prom_version=2.55.0 \
-                 -e prom_release_sha256=<new-sha> site.yml
+                 -e prom_release_sha256=<new-sha> bootstrap.yml
 ```
 
 ## Hardening (spec §11)

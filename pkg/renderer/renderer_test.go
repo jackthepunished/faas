@@ -136,8 +136,10 @@ fleet:
   hosts:
     - name: fsn-1
       role: control-plane
+      address: 10.42.0.1:7100
     - name: fsn-2
       role: compute-only
+      address: 10.42.0.2:50051
 daemons:
   schedd: {bind: unix:///run/faas/schedd.sock}
   vmmd: {bind: unix:///run/faas/vmmd.sock}

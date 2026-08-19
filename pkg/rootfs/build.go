@@ -484,6 +484,13 @@ func InjectGuestInit(staging, guestInitPath string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
+	// OCI base images commonly ship /sbin/init as a symlink (for example
+	// Alpine points it at /bin/busybox). Remove the link before writing the
+	// platform PID-1 binary; os.WriteFile follows a symlink and would
+	// overwrite the link target while leaving /sbin/init pointing at it.
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("rootfs: remove existing init: %w", err)
+	}
 	if err := os.WriteFile(dst, data, 0o755); err != nil {
 		return fmt.Errorf("rootfs: write guest-init: %w", err)
 	}

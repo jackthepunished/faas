@@ -146,6 +146,30 @@ func TestRenderTOML_VmmdWithComputeNode(t *testing.T) {
 	}
 }
 
+func TestRenderTOML_VmmdDerivesIdentityAndTargetFromHost(t *testing.T) {
+	body, flat, err := renderTOML(tomlRenderCtx{
+		Daemon:      "vmmd",
+		DC:          fixtureTOML("vmmd"),
+		HostName:    "fsn-2",
+		HostAddress: "10.42.0.2:50051",
+	})
+	if err != nil {
+		t.Fatalf("renderTOML: %v", err)
+	}
+	if got := flat["compute_node.name"]; got != "fsn-2" {
+		t.Errorf("compute_node.name = %q, want fsn-2", got)
+	}
+	if got := flat["compute_node.target_url"]; got != "tcp://vmmd.faas:50051" {
+		t.Errorf("compute_node.target_url = %q, want tcp://vmmd.faas:50051", got)
+	}
+	if got := flat["compute_node.overlay_ip"]; got != "10.42.0.2" {
+		t.Errorf("compute_node.overlay_ip = %q, want 10.42.0.2", got)
+	}
+	if strings.Contains(string(body), "tcp://0.0.0.0:50051") {
+		t.Error("rendered vmmd target_url contains wildcard bind address")
+	}
+}
+
 func TestRenderTOML_NilDaemonConfig(t *testing.T) {
 	_, _, err := renderTOML(tomlRenderCtx{Daemon: "schedd", DC: nil})
 	if err == nil {

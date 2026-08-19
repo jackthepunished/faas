@@ -27,11 +27,11 @@
 - name: cgroups_v2 — assert `cgroup_no_v1=0` is on the running cmdline
   ansible.builtin.assert:
     that:
-      - "'cgroup_no_v1=0' in cmdline.stdout"
+      - "'cgroup_no_v1=0' in cmdline.stdout or cgroup2_controllers.stat.exists"
     fail_msg: >-
-      Running kernel cmdline does not contain `cgroup_no_v1=0`.
-      The `grub` role below may have just set the karg; reboot into
-      the new default entry and re-run `make bootstrap`.
+      The running kernel is not using a unified cgroup-v2 hierarchy.
+      The `grub` role can set the compatibility karg, but a reboot is
+      required before the bootstrap can continue.
     success_msg: "kernel unified-cgroup-hierarchy: enabled"
   changed_when: false
 
@@ -41,12 +41,20 @@
   changed_when: false
   check_mode: false
 
+- name: cgroups_v2 — collect v1 cgroup mounts
+  ansible.builtin.set_fact:
+    cgroup_v1_mounts: >-
+      {{ mount_out.stdout_lines
+         | select('search', ' on /sys/fs/cgroup/')
+         | select('search', 'cgroup')
+         | reject('search', 'cgroup2')
+         | list }}
+  changed_when: false
+
 - name: cgroups_v2 — reject tmpfs/v1 cgroups anywhere except /sys/fs/cgroup
   ansible.builtin.assert:
     that:
-      - "not (' on /sys/fs/cgroup/' in line and 'cgroup' in line and 'cgroup2' not in line)
-        for line in mount_out.stdout_lines
-        if 'cgroup' in line"
+      - "(cgroup_v1_mounts | length) == 0"
     fail_msg: >-
       Mounted cgroup v1 controller(s) detected on /sys/fs/cgroup/*.
       Reboot into a kernel booted with `cgroup_no_v1=0` and re-run.

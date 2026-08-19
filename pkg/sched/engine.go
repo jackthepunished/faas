@@ -1794,7 +1794,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		})
 	}
 
-	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
+	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, dep.Scope, envSecretsFromDep(dep))
 	if err != nil {
 		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
 	}
@@ -3192,7 +3192,7 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 	// ships only the requested env_keys. A missing-required
 	// key fails loud (the legacy "stage everything" path is
 	// preserved when OverrideEnvSecrets is nil).
-	sealedEnv, err := e.loadSealedEnvFor(ctx, app.AccountID, app.ID, envSecretsFromDep(dep))
+	sealedEnv, err := e.loadSealedEnvFor(ctx, app.AccountID, app.ID, dep.Scope, envSecretsFromDep(dep))
 	if err != nil {
 		return AppSpec{}, fmt.Errorf("sched: build app spec: sealed env: %w", err)
 	}
@@ -3642,7 +3642,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	// filtering — see Wake builder for the full contract. ColdBoot /
 	// Prime shares the wake path; the dep row is the same one Wake
 	// loaded (so no extra DB read).
-	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
+	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, dep.Scope, envSecretsFromDep(dep))
 	if err != nil {
 		return fmt.Errorf("sched: prime: load sealed env: %w", err)
 	}
@@ -4425,6 +4425,19 @@ func (e *Engine) resolveApp(ctx context.Context, appID string) (state.App, state
 	if err != nil {
 		return state.App{}, state.Account{}, api.Limits{}, state.Deployment{}, err
 	}
+	// A liveness-exhausted app is deliberately parked until an explicit
+	// unpark operation changes its lifecycle back to active. Treating the
+	// parked app as wakeable lets a pending async invocation retry forever:
+	// every retry creates a fresh FAILED instance row before the same
+	// underlying artifact error is observed. Join the scheduler sentinel
+	// with the public problem so the drain can terminally fail the row while
+	// the RPC surface still carries an actionable error.
+	if app.Status == state.AppEvictedCold {
+		return state.App{}, state.Account{}, api.Limits{}, state.Deployment{}, errors.Join(
+			ErrPermanentWake,
+			api.NewProblem(409, api.CodeConflict, "App is parked", "the app is evicted_cold; wake the app before invoking"),
+		)
+	}
 	scope := ScopeFrom(ctx)
 	var dep state.Deployment
 	if scope == "" {
@@ -4495,22 +4508,38 @@ func (e *Engine) resolveAppForDeploy(ctx context.Context, appID string) (state.A
 //
 // We carry AccountID explicitly so a cross-account (accountID, appID) pair
 // returns ErrNotFound (consistent with apid's 404 contract).
-func (e *Engine) loadSealedEnvFor(ctx context.Context, accountID, appID string, overrideEnvSecrets map[string]string) ([]fcvm.SealedEnvEntry, error) {
-	rows, err := e.store.ListAppSecrets(ctx, accountID, appID)
+func (e *Engine) loadSealedEnvFor(ctx context.Context, accountID, appID, scope string, overrideEnvSecrets map[string]string) ([]fcvm.SealedEnvEntry, error) {
+	// Defensive collapse: a deployment pre-PR-B may have dep.Scope
+	// empty (NULL column). The store surface uses scope='default'
+	// everywhere else, so this keeps wake-time behaviour identical
+	// to the pre-PR-A path for that deployment.
+	if scope == "" {
+		scope = api.DefaultEnvScope
+	}
+	rows, err := e.store.ListAppSecretsInScope(ctx, accountID, appID, scope)
 	if err != nil {
-		return nil, fmt.Errorf("load sealed env (account=%s app=%s): %w", accountID, appID, err)
+		return nil, fmt.Errorf("load sealed env (account=%s app=%s scope=%s): %w", accountID, appID, scope, err)
 	}
 	if len(overrideEnvSecrets) == 0 {
-		// Legacy path: stage everything for the app. Preserved for
-		// pre-PR-A deployments without override columns populated AND for
-		// tarball/dockerfile deploys that don't use the override surface.
+		// Legacy path: stage everything for the app at the deployment's
+		// scope. Preserved for pre-PR-A deployments without override
+		// columns populated AND for tarball/dockerfile deploys that
+		// don't use the override surface.
 		out := make([]fcvm.SealedEnvEntry, 0, len(rows))
 		for _, r := range rows {
 			out = append(out, fcvm.SealedEnvEntry{Key: r.Key, Ciphertext: r.Ciphertext})
 		}
 		return out, nil
 	}
-	// Filtered path: build a Key→row index, then iterate the override's
+	// Filtered path: STRICT PER-SCOPE (ADR-092 PR-A). Each
+	// override entry resolves to the (account_id, app_id, scope,
+	// env_key) sealed row. Missing rows fail loud with intent —
+	// silent 'default' overlay would defeat the entire feature
+	// (a customer who wants a different sealed DATABASE_URL in
+	// 'prod' would NOT see their override). The override map's
+	// values are still 'secret:<KEY>' refs; the KEY is the env
+	// var name in app_secrets (the env_key in app_envs is the
+	// same string but routes to the env table).
 	// requested env_keys in declaration order (so the staged
 	// /etc/faas/secrets.env is stable and easy to diff in support tickets).
 	// Each requested env_key MUST resolve; missing keys are accumulated and
@@ -4533,10 +4562,11 @@ func (e *Engine) loadSealedEnvFor(ctx context.Context, accountID, appID string, 
 	if len(missing) > 0 {
 		// Sort for determinism — Go map iteration is randomised, so without
 		// this a customer with three missing keys would see them in
-		// different orders on different wakes.
+		// different orders on different wakes. Scope is part of the
+		// error so the operator knows which deployment tripped.
 		sort.Strings(missing)
-		return nil, fmt.Errorf("env_secrets: missing app_secrets rows for %s on (%s, %s); set the secret first via faas secrets set",
-			strings.Join(missing, ", "), accountID, appID)
+		return nil, fmt.Errorf("env_secrets[scope=%s]: missing app_secrets rows for %s on (account=%s, app=%s); set the secret first via faas secrets set --scope %s",
+			scope, strings.Join(missing, ", "), accountID, appID, scope)
 	}
 	return out, nil
 }

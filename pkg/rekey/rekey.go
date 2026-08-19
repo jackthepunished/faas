@@ -84,7 +84,7 @@ type RekeyProgress struct {
 	Rekeyed int    // rows successfully re-sealed under current
 	Skipped int    // rows whose kid already matched current (no-op)
 	Failed  int    // rows that errored (bad ciphertext, timeout, etc.)
-	LastID  string // last (account_id, app_id, key) tuple visited; for crash recovery
+	LastID  string // last (account_id, app_id, scope, key) tuple visited; for crash recovery
 }
 
 // Replayer walks app_secrets and re-seals rows under the current
@@ -123,15 +123,26 @@ type Replayer struct {
 
 // Store is the narrow interface pkg/rekey needs from the
 // platform-wide state.Store. Two methods: ListAppSecretsForRekey
-// (paginated global walk) and UpsertAppSecretWithKid (re-seal +
-// kid stamp). Implemented by both pkg/state/pgstore.PgStore and
-// pkg/state/memstore.MemStore — see ADR-089 PR-A for the
-// rationale. Defined as an interface here so unit tests can
-// supply a tiny in-memory fakeStore without dragging in the
+// (paginated global walk) and UpsertAppSecretWithKidInScope (re-seal +
+// kid stamp at the row's actual scope). Implemented by both
+// pkg/state/pgstore.PgStore and pkg/state/memstore.MemStore — see
+// ADR-089 PR-A for the rationale. Defined as an interface here so unit
+// tests can supply a tiny in-memory fakeStore without dragging in the
 // full state.Store surface (which is ~hundreds of methods).
+//
+// ADR-092 PR-B: the rekey path must use the scope-aware sibling
+// UpsertAppSecretWithKidInScope (not the legacy UpsertAppSecretWithKid
+// which delegates to DefaultEnvScope — see pgstore.go:11236). After
+// PR-A widened the PK to (app_id, scope, key), every prod/staging row
+// has a unique address; re-sealing at the wrong scope would either
+// (a) insert a brand-new default-scope row of the same key (leaving
+// prod with stale ciphertext) or (b) silently overwrite an existing
+// default-scope row of the same key with new-identity ciphertext. The
+// row.Scope thread from ListAppSecretsForRekey is the only correct
+// write target.
 type Store interface {
 	ListAppSecretsForRekey(ctx context.Context, limit int, cursor string) ([]state.AppSecret, error)
-	UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error
+	UpsertAppSecretWithKidInScope(ctx context.Context, accountID, appID, scope, key, kid string, ciphertext []byte) error
 }
 
 // New constructs a Replayer. identities is the OpenMulti slice
@@ -248,7 +259,7 @@ func (r *Replayer) Run(
 		// terminates when the table has been fully visited.
 		var fresh []state.AppSecret
 		for _, row := range batch {
-			ck := encodeCursor(row.AccountID, row.AppID, row.Key)
+			ck := encodeCursor(row.AccountID, row.AppID, row.Scope, row.Key)
 			if _, ok := seen[ck]; ok {
 				continue
 			}
@@ -263,7 +274,7 @@ func (r *Replayer) Run(
 
 		for _, row := range fresh {
 			p.Total++
-			rowCursor := encodeCursor(row.AccountID, row.AppID, row.Key)
+			rowCursor := encodeCursor(row.AccountID, row.AppID, row.Scope, row.Key)
 			seen[rowCursor] = struct{}{}
 
 			if row.Kid == r.currentKid {
@@ -301,8 +312,15 @@ func (r *Replayer) Run(
 			}
 
 			// Persist. ADR-089 D4: kid column is stamped
-			// alongside the new ciphertext.
-			if err := r.store.UpsertAppSecretWithKid(ctx, row.AccountID, row.AppID, row.Key, r.currentKid, sealed); err != nil {
+			// alongside the new ciphertext. ADR-092 PR-B: the
+			// write target is the row's actual scope
+			// (row.Scope, populated by ListAppSecretsForRekey),
+			// NOT DefaultEnvScope — pre-PR-B this call used
+			// UpsertAppSecretWithKid which delegated to
+			// DefaultEnvScope and silently dropped prod/staging
+			// rows (or corrupted a default-scope sibling of the
+			// same key).
+			if err := r.store.UpsertAppSecretWithKidInScope(ctx, row.AccountID, row.AppID, row.Scope, row.Key, r.currentKid, sealed); err != nil {
 				p.Failed++
 				if pinnedCursor == "" {
 					pinnedCursor = rowCursor
@@ -340,11 +358,28 @@ func (r *Replayer) Run(
 	}
 }
 
-// encodeCursor serialises the (account_id, app_id, key) tuple
-// into a LastID string. Uses '\x00' as a separator since it
-// cannot appear in a key (key shape is ^[A-Z][A-Z0-9_]*$) or a
-// UUID (hex chars only). Returns "<account_id>|<app_id>|<key>"
-// for readability in logs; tests can split on the same shape.
-func encodeCursor(accountID, appID, key string) string {
-	return accountID + "|" + appID + "|" + key
+// encodeCursor serialises the (account_id, app_id, scope, key)
+// tuple into a LastID string. Returns
+// "<account_id>|<app_id>|<scope>|<key>".
+//
+// ADR-092 PR-A: widened from 3-tuple to 4-tuple to thread scope
+// alongside the other PK columns of app_secrets. Crash-recovery
+// cursor pins for in-flight Replayer instances whose LastID was
+// previously persisted in the pre-PR form — the pgstore
+// ListAppSecretsForRekey cursor decoder (pkg/state/pgstore.go
+// :10220-10260) lazy-falls-back: a 3-segment cursor is treated
+// as scope='default' for the first batch of the resumed walk;
+// the operator's first post-rollout Run upgrades the cursor to
+// 4-segment form via encodeCursor and the fallback is no longer
+// reached. The on-disk shape of kid, ciphertext, and the secret
+// rows themselves is unchanged — only the cursor wire format
+// gains one more component.
+//
+// Note on the original doc: "Uses '\x00' as separator" was a
+// stale note — the actual implementation has always used '|'.
+// The literal value matters for backend-side split_part parsers
+// (the pgstore decoder is shared with the lazy-3→4 fallback
+// path), so '|' is preserved here.
+func encodeCursor(accountID, appID, scope, key string) string {
+	return accountID + "|" + appID + "|" + scope + "|" + key
 }

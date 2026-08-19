@@ -3,6 +3,7 @@ package renderer
 import (
 	"bytes"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -45,10 +46,12 @@ import (
 // fine (writeTOMLKV omits empty values; the daemon's loader uses
 // its built-in default).
 type tomlRenderCtx struct {
-	Daemon     string
-	DC         *manifest.DaemonConfig
-	AppsDomain string
-	HostSANs   []string
+	Daemon      string
+	DC          *manifest.DaemonConfig
+	AppsDomain  string
+	HostSANs    []string
+	HostName    string
+	HostAddress string
 }
 
 // The flatMap is what ValidateTOMLPlacement walks. The validation
@@ -82,7 +85,7 @@ func renderTOML(ctx tomlRenderCtx) ([]byte, map[string]string, error) {
 	// [compute_node] table-block (vmmd only today). The renderer
 	// pulls the values from the manifest's DaemonConfig (Outbound
 	// for the dial target, hostSANs for the per-host SAN overlay).
-	if err := emitComputeNodeBlock(ctx.Daemon, ctx.DC, host.ComputeNodeBlock, ctx.HostSANs, flat); err != nil {
+	if err := emitComputeNodeBlock(ctx.Daemon, ctx.DC, host.ComputeNodeBlock, ctx.HostSANs, ctx.HostName, ctx.HostAddress, flat); err != nil {
 		return nil, nil, err
 	}
 
@@ -234,7 +237,7 @@ func defaultMetricsAddrForDaemon(daemon string) string {
 // keys from the manifest's DaemonConfig + hostSANs sidecar. The
 // ComputeNodeBlock catalog row is the source of truth for which keys
 // belong here (only vmmd's [compute_node] table is populated today).
-func emitComputeNodeBlock(daemon string, dc *manifest.DaemonConfig, keys []manifest.TableKey, hostSANs []string, flat map[string]string) error {
+func emitComputeNodeBlock(daemon string, dc *manifest.DaemonConfig, keys []manifest.TableKey, hostSANs []string, hostName, hostAddress string, flat map[string]string) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -242,7 +245,7 @@ func emitComputeNodeBlock(daemon string, dc *manifest.DaemonConfig, keys []manif
 		return nil
 	}
 	for _, k := range keys {
-		v, err := computeNodeValue(daemon, dc, k, hostSANs)
+		v, err := computeNodeValue(daemon, dc, k, hostSANs, hostName, hostAddress)
 		if err != nil {
 			return fmt.Errorf("renderer: %s: %s.%s: %w", daemon, k.Table, k.Key, err)
 		}
@@ -255,28 +258,37 @@ func emitComputeNodeBlock(daemon string, dc *manifest.DaemonConfig, keys []manif
 // table-block key. Today the catalog only has vmmd's [compute_node].
 // Each key's value flows from the manifest's DaemonConfig + the
 // hostSANs sidecar.
-func computeNodeValue(daemon string, dc *manifest.DaemonConfig, k manifest.TableKey, hostSANs []string) (string, error) {
+func computeNodeValue(daemon string, dc *manifest.DaemonConfig, k manifest.TableKey, hostSANs []string, hostName, hostAddress string) (string, error) {
 	switch k.Key {
 	case "name":
-		// vmmd's self-registered CN == the host's name. The renderer
-		// receives the host name via RenderOptions.Host, not the
-		// DaemonConfig. For PR-2, the value is empty here; the
-		// caller is responsible for filling it via a different
-		// pass (the renderer's host resolution step).
+		// vmmd's self-registered identity is the manifest host name.
+		// This keeps the database identity and the rendered systemd
+		// unit on the same declarative source of truth.
 		_ = daemon
-		return "", nil
+		return hostName, nil
 	case "target_url":
-		// vmmd's dial target. Pulled from the manifest's
-		// DaemonConfig.Bind (the vmmd box's listen address).
-		if dc.Bind == "" {
-			return "", nil
+		// vmmd's dial target is the host endpoint, never its bind
+		// address. A bind such as tcp://0.0.0.0:50051 is not routable
+		// and would make the control plane dial itself. Use the private
+		// PKI identity so stdlib hostname verification succeeds; Ansible
+		// maps that identity to the manifest endpoint on each box.
+		if hostAddress != "" {
+			return manifest.ServiceTCPURL("compute-only", hostAddress)
 		}
 		return dc.Bind, nil
 	case "overlay_ip":
-		// Tailscale/WireGuard/statically-assigned IP. PR-2 emits
-		// the empty string; the daemon-load path tolerates it.
-		// PR-4 will surface a missing overlay_ip as a Box health
-		// issue.
+		// Use the endpoint host when it is a literal IP. FQDN targets
+		// remain valid for target_url and are resolved through the
+		// operator's private DNS or /etc/hosts contract.
+		if hostAddress != "" {
+			host, _, err := manifest.ParseHostPort(hostAddress)
+			if err != nil {
+				return "", err
+			}
+			if _, err := netip.ParseAddr(host); err == nil {
+				return host, nil
+			}
+		}
 		return "", nil
 	case "vpcpus", "mem_mb", "max_concurrency", "admission_ceiling_mb":
 		// vmmd's compute capacity knobs. The renderer does not

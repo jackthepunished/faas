@@ -66,10 +66,10 @@ type resendError struct {
 // or From is an error — we'd rather fail closed than silently drop.
 func NewResendSender(cfg ResendConfig) (Sender, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return nil, errors.New("mail: Resend APIKey is required")
+		return nil, ErrResendMissingAPIKey
 	}
 	if strings.TrimSpace(cfg.From) == "" {
-		return nil, errors.New("mail: Resend From is required")
+		return nil, ErrResendMissingFrom
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.resend.com"

@@ -70,6 +70,7 @@ func UnitGatewaydInternal() daemonunit.Unit {
 		ProtectClock:            true,
 		ProtectProc:             "invisible",
 
+		ReadOnlyPaths:  []string{"/etc/faas"},
 		ReadWritePaths: []string{"/run/faas"},
 
 		WantedBy: "multi-user.target",
