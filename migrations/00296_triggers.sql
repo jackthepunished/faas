@@ -1,4 +1,4 @@
--- filename: 00290_triggers.sql
+-- filename: 00296_triggers.sql
 -- +goose Up
 -- +goose StatementBegin
 --

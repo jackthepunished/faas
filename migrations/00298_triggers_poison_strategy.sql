@@ -1,8 +1,8 @@
--- filename: 00292_triggers_poison_strategy.sql
+-- filename: 00298_triggers_poison_strategy.sql
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00292_triggers_poison_strategy.sql — operator-controlled Kafka
+-- 00298_triggers_poison_strategy.sql — operator-controlled Kafka
 -- poison-record handling (audit #10 from PR #910).
 --
 -- Before: when the dispatcher dead-lettered a record with
@@ -42,7 +42,7 @@
 --
 -- Replay-safety (per migrations/replay_safety_test.go + the
 -- established ADD COLUMN IF NOT EXISTS pattern from
--- 00291_triggers_payload_max.sql + 00053_deployments_source_url):
+-- 00297_triggers_payload_max.sql + 00053_deployments_source_url):
 --
 --   - ADD COLUMN IF NOT EXISTS guards the apply path so a drifted
 --     box (relation present, goose row missing) re-applies cleanly
