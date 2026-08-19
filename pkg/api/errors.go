@@ -908,6 +908,11 @@ const (
 	CodePlanStaticEgressIPNotAllowed = "plan_static_egress_ip_not_allowed"
 	CodePlanStaticEgressIPQuota      = "plan_static_egress_ip_quota"
 	CodeAppStaticEgressIPInvalid     = "app_static_egress_ip_invalid"
+	// CodeStaticEgressIPNotEnabled is the dark-launch 402 — the
+	// cluster has the schema + handlers wired but the operator
+	// has not flipped FAAS_STATIC_EGRESS_IP_ENABLED. Same posture
+	// as CodeTenantSurfacesNotAllowed.
+	CodeStaticEgressIPNotEnabled = "static_egress_ip_not_enabled"
 
 	// Issue #470 / ADR-055: per-app two-tier-snapshot flag (warm.snap
 	// on top of init.snap). Pro/Scale opt in by default; Free/Hobby
@@ -2481,6 +2486,19 @@ func ErrTenantSurfacesNotAllowed(p Plan) *Problem {
 		"Tenant surfaces unavailable on this plan",
 		fmt.Sprintf("the %s plan does not include tenant surfaces; upgrade to Hobby or above to expose one app to many customer hostnames under a single cert.", p)).
 		WithDocs(docsBase + "/plans#tenant-surfaces")
+}
+
+// ErrStaticEgressIPNotEnabled is the dark-launch 402 — the
+// cluster has the schema + handlers wired (ADR-119) but the
+// operator has not flipped FAAS_STATIC_EGRESS_IP_ENABLED. The
+// check runs before loadApp so the surface is invisible until
+// the flag is set. Mirrors the ErrTenantSurfacesNotAllowed
+// shape (same env-flag pattern in pkg/api/flags.go).
+func ErrStaticEgressIPNotEnabled() *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodeStaticEgressIPNotEnabled,
+		"Static egress IP feature is not enabled on this cluster",
+		"the FAAS_STATIC_EGRESS_IP_ENABLED env var is not set; ask the cluster operator to enable the static egress IP surface.").
+		WithDocs(docsBase + "/static-egress-ip")
 }
 
 // ErrTenantSurfaceQuota is returned when

@@ -1,7 +1,9 @@
 package state
 
 import (
+	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -109,5 +111,46 @@ func TestCoverageSlice15StaticEgressIPDefaultIsZero(t *testing.T) {
 	}
 	if got.StaticEgressIPSetAt != nil {
 		t.Errorf("fresh StaticEgressIPSetAt = %s, want nil", got.StaticEgressIPSetAt)
+	}
+}
+
+// TestCoverageSlice15StaticEgressIPCrossAppConflict drives the
+// same-account cross-app conflict branch in memstore.go::UpdateApp.
+// Mirrors the pgstore's apps_static_egress_ip_key partial unique
+// index — the apid handler branches on errors.Is(err, ErrConflict)
+// and the index-name substring to return 403 plan_static_egress_ip_quota.
+func TestCoverageSlice15StaticEgressIPCrossAppConflict(t *testing.T) {
+	m, ctx, _, app, _ := memCoverageFixture(t)
+
+	ip := netip.MustParseAddr("203.0.113.42")
+	if _, err := m.UpdateApp(ctx, app.ID, UpdateAppParams{
+		SetStaticEgressIP: true,
+		StaticEgressIP:    &ip,
+	}); err != nil {
+		t.Fatalf("first UpdateApp: %v", err)
+	}
+
+	// Second app on the same account tries to pin the same IP.
+	second, err := m.CreateApp(ctx, App{
+		AccountID: app.AccountID,
+		Slug:      "second-app-" + app.Slug,
+		RAMMB:     256,
+		Status:    AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp second: %v", err)
+	}
+	_, err = m.UpdateApp(ctx, second.ID, UpdateAppParams{
+		SetStaticEgressIP: true,
+		StaticEgressIP:    &ip,
+	})
+	if err == nil {
+		t.Fatal("expected ErrConflict on cross-app same-IP, got nil")
+	}
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("err = %v, want ErrConflict", err)
+	}
+	if !strings.Contains(err.Error(), "apps_static_egress_ip_key") {
+		t.Errorf("err %q missing index name (apId handler branch)", err.Error())
 	}
 }

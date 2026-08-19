@@ -32,6 +32,18 @@ func TenantSurfacesEnabled() bool {
 	return false
 }
 
+// StaticEgressIPEnabled reports whether the per-app static egress
+// IP surface (ADR-119) is live. Reads FAAS_STATIC_EGRESS_IP_ENABLED
+// at every call (not cached at boot) so an operator can flip the
+// env var and SIGHUP-restart-free roll out / roll back without
+// bouncing every daemon. Default off; the schema + the apid
+// routes + the host renderer are wired but the customer surface
+// is gated until the PR ships — same rollout shape as
+// TenantSurfacesEnabled above.
+func StaticEgressIPEnabled() bool {
+	return envFlagEnabled("FAAS_STATIC_EGRESS_IP_ENABLED")
+}
+
 // DomainDoctorEnabled reports whether the per-domain doctor probe
 // engine is live. Reads FAAS_DOMAIN_DOCTOR_ENABLED at every call
 // (mirrors TenantSurfacesEnabled — operator can flip the env var
@@ -40,7 +52,18 @@ func TenantSurfacesEnabled() bool {
 // but the poller branch + GET /v1/domains/{domain}/doctor are
 // gated until the operator sets the env var. ADR-120.
 func DomainDoctorEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("FAAS_DOMAIN_DOCTOR_ENABLED")))
+	return envFlagEnabled("FAAS_DOMAIN_DOCTOR_ENABLED")
+}
+
+// envFlagEnabled reads the named env var and reports whether it
+// is set to one of the truthy values ("1", "true", "yes", "on",
+// case-insensitive). Trims surrounding whitespace before the
+// comparison. Centralises the parser so StaticEgressIPEnabled,
+// DomainDoctorEnabled, and any future dark-launch flag share the
+// same shape; the TenantSurfacesEnabled switch above is the
+// historical precedent.
+func envFlagEnabled(name string) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
 	switch v {
 	case "1", "true", "yes", "on":
 		return true

@@ -3242,6 +3242,35 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if !ok {
 		return App{}, ErrNotFound
 	}
+	// ADR-119: cross-app unique-IP check. Mirrors the pgstore
+	// apps_static_egress_ip_key partial unique index. The
+	// index covers apps in the same account only (a future
+	// multi-account index would need a different shape; the
+	// current contract is "one app on this account can pin
+	// this IP"). MemStore has no SQL index, so the check is
+	// explicit: a SetStaticEgressIP with a non-nil IP that
+	// another app on the SAME ACCOUNT already pins returns
+	// ErrConflict, surfacing as 23505 on pgstore. The error
+	// message includes the index name so the apid handler
+	// can branch on the conflict (mirrors the pgstore path
+	// at cmd/apid/handlers_apps_static_egress_ip.go).
+	if p.SetStaticEgressIP && p.StaticEgressIP != nil {
+		newIP := *p.StaticEgressIP
+		for otherID, other := range m.apps {
+			if otherID == id {
+				continue
+			}
+			if other.AccountID != a.AccountID {
+				continue
+			}
+			if other.StaticEgressIP == nil {
+				continue
+			}
+			if *other.StaticEgressIP == newIP {
+				return App{}, fmt.Errorf("apps_static_egress_ip_key: %w", ErrConflict)
+			}
+		}
+	}
 	if p.RAMMB != nil {
 		a.RAMMB = *p.RAMMB
 	}
