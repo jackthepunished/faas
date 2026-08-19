@@ -47,7 +47,7 @@ RESTORE_TEST_ROOT="${RESTORE_TEST_ROOT:-/var/lib/pgsql/restore-test}"
 RESTORE_PG_PORT="${RESTORE_PG_PORT:-5433}"
 
 LIVE_PG_PORT="${LIVE_PG_PORT:-5432}"
-LIVE_PG_BIN="${LIVE_PG_BIN:-/usr/lib/postgresql/15/bin}"
+LIVE_PG_BIN="${LIVE_PG_BIN:-$(pg_config --bindir 2>/dev/null || echo /usr/lib/postgresql/15/bin)}"
 
 # Off-host storage-box wiring — driven by the same env vars the
 # postgres_backup role reads at ansible-run time. Source

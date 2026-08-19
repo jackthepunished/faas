@@ -53,8 +53,17 @@ func CurrentGitSHA(releasesRoot string) (string, error) {
 		return "", fmt.Errorf("releaseinstall: readlink %s: %w", link, err)
 	}
 	// Target is "<git-sha>" or "./<git-sha>" or the absolute path.
+	// Resolve relative targets under releasesRoot, while preserving an
+	// absolute target. filepath.Join does not safely normalize this
+	// distinction on all supported platforms and would turn
+	// /opt/faas/releases/<sha> into
+	// /opt/faas/releases/opt/faas/releases/<sha>.
+	targetPath := target
+	if !filepath.IsAbs(targetPath) {
+		targetPath = filepath.Join(releasesRoot, targetPath)
+	}
 	// We extract the basename relative to releasesRoot.
-	gitSHA, err := filepath.Rel(releasesRoot, filepath.Join(releasesRoot, target))
+	gitSHA, err := filepath.Rel(releasesRoot, filepath.Clean(targetPath))
 	if err != nil {
 		return "", fmt.Errorf("releaseinstall: rel %s: %w", target, err)
 	}

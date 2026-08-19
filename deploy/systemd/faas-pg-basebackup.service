@@ -32,7 +32,8 @@ ExecStart=/usr/bin/env bash -c '\
   ts=$$(date -u +%Y-%m-%dT%H%M%SZ); \
   out="$${PG_BB_ROOT}/basebackup-$${ts}"; \
   mkdir -p "$${out}"; \
-  /usr/lib/postgresql/15/bin/pg_basebackup \
+  pg_bindir=$$(/usr/bin/pg_config --bindir); \
+  "$${pg_bindir}/pg_basebackup" \
     -Ft -z \
     -D "$${out}" \
     -P \

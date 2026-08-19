@@ -1,13 +1,15 @@
 # `postgres` ansible role
 
-Installs PostgreSQL 15, creates the `faas` system user / role /
+Installs the distro-supported PostgreSQL major, creates the `faas` system user / role /
 database, and (spec §11) hardens the cluster to unix-socket-only
 listening: `listen_addresses=''` plus a `pg_hba.conf` that peer-auths
 local connections and `reject`s every TCP source.
 
 ## What this role does
 
-1. apt-installs `postgresql-15`, `postgresql-contrib-15`, `libpq-dev`.
+1. apt-installs the distro meta-packages `postgresql`,
+   `postgresql-contrib`, and `libpq-dev`, then discovers the installed
+   cluster major and uses its config directory.
 2. Enables + starts the cluster.
 3. Creates the `faas` system user (home `/var/lib/faas`, nologin shell).
 4. Creates the `faas` postgres role + database, with `createuser`
@@ -49,7 +51,7 @@ by the drill script.
 ## Idempotency
 
 The hardening tasks use `register: <name>` + `failed_when: false` so
-the role converges on hosts without `/etc/postgresql/15/main/` (CI /
+the role converges on hosts without a PostgreSQL config directory (CI /
 chroot bootstrap) without halting. On a real control-plane node the handlers in
 `handlers/main.yml` issue the restart + reload via systemd.
 

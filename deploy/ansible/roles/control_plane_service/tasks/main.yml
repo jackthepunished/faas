@@ -157,7 +157,7 @@
 
 - name: control_plane_service — create runtime dirs (logs, spool, statuspage)
   ansible.builtin.file:
-    path: "{{ item }}"
+    path: "{{ item.path }}"
     state: directory
     owner: "{{ item.user }}"
     group: faas
@@ -398,7 +398,7 @@
       - egress
     faas_pki_leaf_files:
       - server.crt
-      - server.crt
+      - advisory.crt
       - server.crt
       - egress.crt
   register: faas_pki_leaf_stat
@@ -432,6 +432,8 @@
       fi
       echo "Paddle billing provider selected — FAAS_PADDLE_API_KEY present (mode-tripwire deferred to verify-secrets.sh + daemon-level fail-closed)."
     fi
+  args:
+    executable: /bin/bash
   changed_when: false
   register: faas_paddle_soft_assert
 - name: control_plane_service — debug Paddle soft assert

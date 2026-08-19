@@ -52,12 +52,11 @@ table inet faas {
     ip6 daddr fc00::/7 counter name "drop_v6_fc00___7" drop
     ip6 daddr fe80::/10 counter name "drop_v6_fe80___10" drop
     ip6 daddr ff00::/8 counter name "drop_v6_ff00___8" drop
-{% if overlay_cidrs is defined and overlay_cidrs %}
-{% for cidr in overlay_cidrs %}
+{% if overlay_cidrs is defined and overlay_cidrs -%}
+{% for cidr in overlay_cidrs -%}
     ip saddr {{ cidr }} accept
-{% endfor %}
-{% endif %}
-    iifname "br-tenants" oifname "{{ public_iface }}" accept
+{% endfor -%}
+{% endif -%}{{ '    ' }}iifname "br-tenants" oifname "{{ public_iface }}" accept
   }
 
   chain output {
@@ -67,13 +66,12 @@ table inet faas {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr {{ masquerade_cidr }} oifname "{{ public_iface }}" masquerade
-{% if overlay_cidrs is defined and overlay_cidrs %}
-{% for cidr in overlay_cidrs %}
+{% if overlay_cidrs is defined and overlay_cidrs -%}
+{% for cidr in overlay_cidrs -%}
     ip saddr {{ cidr }} oifname "{{ public_iface }}" masquerade
-{% endfor %}
-{% endif %}
-{% if masquerade_cidr_v6 is defined and masquerade_cidr_v6 %}
+{% endfor -%}
+{% endif -%}
+{% if masquerade_cidr_v6 is defined and masquerade_cidr_v6 -%}
     ip6 saddr {{ masquerade_cidr_v6 }} oifname "{{ public_iface }}" masquerade
-{% endif %}
-  }
+{% endif -%}{{ '  ' }}}
 }

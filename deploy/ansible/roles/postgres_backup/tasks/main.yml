@@ -14,7 +14,7 @@
 # and enables both timers. Re-running is a no-op on a converged box.
 #
 # Off-host push wiring (issue #250):
-#   * rclone installed via apt (matches the postgres-15 install
+#   * rclone installed via apt (matches the distro PostgreSQL install
 #     pattern; we don't vendor binaries).
 #   * /etc/faas/secrets/storage-box/{rclone.conf,box-age-key} are
 #     sealed-at-rest via host.age (PR #371 cosign precedent) and

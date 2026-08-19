@@ -16,7 +16,7 @@ In order (each role is independent and verifies its own preconditions):
 | `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | `creates:` + SHA-256 pin |
 | `systemd_slices` | §13 | three `.slice` unit drops | `creates:` on each |
 | `nftables` | §7 | `/etc/nftables.conf` | `creates:` + `nft -c` syntax check |
-| `postgres` | §1 (cp slice), §4 | postgres-15, `faas` user | apt idempotent, `creates:` on home |
+| `postgres` | §1 (cp slice), §4 | distro PostgreSQL major, `faas` user | apt idempotent, `creates:` on home |
 
 ## Run it
 

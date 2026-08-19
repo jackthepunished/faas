@@ -247,13 +247,13 @@
     path: "{{ item }}"
   loop: "{{ faas_rwp_paths_flat }}"
   vars:
-    faas_rwp_unit_files:
-      - "{{ role_path }}/files/faas-imaged.service"
-      - "{{ role_path }}/../vmmd_service/files/faas-vmmd.service"
-      - "{{ role_path }}/../builderd_service/files/faas-builderd.service"
+    faas_rwp_unit_contents:
+      - "{{ lookup('file', role_path + '/files/faas-imaged.service') }}"
+      - "{{ lookup('file', role_path + '/../vmmd_service/files/faas-vmmd.service') }}"
+      - "{{ lookup('file', role_path + '/../builderd_service/files/faas-builderd.service') }}"
     faas_rwp_paths_flat: >-
-      {{ faas_rwp_unit_files
-         | map('regex_search', '^ReadWritePaths=([^\n]+)', '\\1', multiline=True)
+      {{ faas_rwp_unit_contents
+         | map('regex_findall', '(?m)^ReadWritePaths=([^\n]+)')
          | map('first')
          | map('split')
          | flatten

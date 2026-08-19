@@ -49,6 +49,27 @@ func TestCurrentGitSHA_Absent(t *testing.T) {
 	}
 }
 
+func TestCurrentGitSHA_AbsoluteTarget(t *testing.T) {
+	dir := t.TempDir()
+	releasesRoot := filepath.Join(dir, "releases")
+	if err := os.MkdirAll(releasesRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	gitSHA := "0123456789abcdef0123456789abcdef01234567"
+	setupReleaseDir(t, releasesRoot, gitSHA)
+	if err := os.Symlink(filepath.Join(releasesRoot, gitSHA), filepath.Join(dir, "current")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	got, err := CurrentGitSHA(releasesRoot)
+	if err != nil {
+		t.Fatalf("CurrentGitSHA: %v", err)
+	}
+	if got != gitSHA {
+		t.Fatalf("CurrentGitSHA = %q, want %q", got, gitSHA)
+	}
+}
+
 func TestAtomicFlip_CreatesSymlink(t *testing.T) {
 	dir := t.TempDir()
 	releasesRoot := filepath.Join(dir, "releases")
