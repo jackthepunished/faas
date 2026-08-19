@@ -37,8 +37,13 @@ package sched
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 
@@ -228,6 +233,440 @@ func TestKafka_NackBrokerErrorAlwaysRewinds(t *testing.T) {
 			if len(rdr.offsets) != 1 || rdr.offsets[0] != 123 {
 				t.Fatalf("broker_error strategy=%q: rewound offsets = %v, want [123]", stratName, rdr.offsets)
 			}
+		})
+	}
+}
+
+// ----------------------------------------------------------------------
+// Commit 7 (ADR-118 / issue #757 mega-PR) — TLS/SASL decode +
+// Dialer assembly + offset/rebalance pinning.
+// ----------------------------------------------------------------------
+
+// kafkaDecoderFixture builds a sqlc.Trigger with a JSON-encoded
+// Config blob so the decoder can be exercised without a real
+// triggers row. The fields mirror what apid writes after
+// validation in pkg/gregalemanifest has run.
+func kafkaDecoderFixture(t *testing.T, kafkaJSON string) sqlc.Trigger {
+	t.Helper()
+	return sqlc.Trigger{
+		Kind:   "kafka",
+		Config: []byte(kafkaJSON),
+	}
+}
+
+// TestDecodeKafkaConfig_NoTLSSASL pins the no-TLS / no-SASL
+// baseline: the poller still constructs a Dialer with nil TLS
+// and nil SASLMechanism (plaintext-equivalent). A future refactor
+// that drops the empty-dialer branch would regress Confluent
+// Cloud brokers with public endpoints — the canonical ~most
+// customer shape.
+func TestDecodeKafkaConfig_NoTLSSASL(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{"brokers":["broker:9092"],"topic":"t","group":"g"}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig: %v", err)
+	}
+	if cfg.TLS != nil {
+		t.Errorf("TLS = %+v, want nil", cfg.TLS)
+	}
+	if cfg.SASL != nil {
+		t.Errorf("SASL = %+v, want nil", cfg.SASL)
+	}
+	d, err := buildKafkaDialer(cfg)
+	if err != nil {
+		t.Fatalf("buildKafkaDialer: %v", err)
+	}
+	if d.TLS != nil {
+		t.Errorf("Dialer.TLS = %+v, want nil", d.TLS)
+	}
+	if d.SASLMechanism != nil {
+		t.Errorf("Dialer.SASLMechanism = %+v, want nil", d.SASLMechanism)
+	}
+	if d.Timeout != 5*time.Second {
+		t.Errorf("Dialer.Timeout = %v, want 5s", d.Timeout)
+	}
+}
+
+// TestDecodeKafkaConfig_TLSSkipVerify exercises the
+// skip_verify-only path (no CACert, no mTLS pair). The Dialer
+// is constructed with a *tls.Config whose InsecureSkipVerify is
+// true; the plan-cap gate on skip_verify lives upstream in
+// apid, not here, so the test only pins the runtime contract.
+func TestDecodeKafkaConfig_TLSSkipVerify(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{
+		"brokers":["broker:9092"],"topic":"t","group":"g",
+		"tls":{"skip_verify":true}
+	}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig: %v", err)
+	}
+	if cfg.TLS == nil || cfg.TLS.SkipVerify != true {
+		t.Fatalf("TLS = %+v, want skip_verify=true", cfg.TLS)
+	}
+	d, err := buildKafkaDialer(cfg)
+	if err != nil {
+		t.Fatalf("buildKafkaDialer: %v", err)
+	}
+	if d.TLS == nil {
+		t.Fatal("Dialer.TLS = nil, want non-nil")
+	}
+	if !d.TLS.InsecureSkipVerify {
+		t.Errorf("Dialer.TLS.InsecureSkipVerify = false, want true (skip_verify=true on the trigger row)")
+	}
+	if d.TLS.MinVersion != tls.VersionTLS12 {
+		t.Errorf("Dialer.TLS.MinVersion = %v, want TLS 1.2 (ADR-118 §TLSMinVersionGate)", d.TLS.MinVersion)
+	}
+}
+
+// TestDecodeKafkaConfig_TLSMalformedCACertFails pins the
+// error path: a non-PEM ca_cert surfaces a typed error so the
+// dispatcher sees the failure at dial time rather than getting
+// a half-built tls.Config that silently trusts nothing.
+func TestDecodeKafkaConfig_TLSMalformedCACertFails(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{
+		"brokers":["broker:9092"],"topic":"t","group":"g",
+		"tls":{"ca_cert":"this is not a PEM block"}
+	}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig (decode succeeds): %v", err)
+	}
+	if _, err := buildKafkaDialer(cfg); err == nil {
+		t.Fatal("buildKafkaDialer err = nil, want non-nil (malformed ca_cert must surface)")
+	}
+}
+
+// TestDecodeKafkaConfig_TLSHalfWiredMTLSFails pins the
+// half-configured mTLS path: client_cert set without
+// client_key (or vice versa) is rejected — tls.X509KeyPair on
+// an empty PEM is a footgun, and the customer would otherwise
+// only see the failure at the first broker dial.
+func TestDecodeKafkaConfig_TLSHalfWiredMTLSFails(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{
+		"brokers":["broker:9092"],"topic":"t","group":"g",
+		"tls":{"client_cert":"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----"}
+	}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig (decode succeeds): %v", err)
+	}
+	if _, err := buildKafkaDialer(cfg); err == nil {
+		t.Fatal("buildKafkaDialer err = nil, want non-nil (client_cert without client_key must fail)")
+	}
+}
+
+// TestDecodeKafkaConfig_SASLClosedVocab pins the closed-vocab
+// guard: anything outside {PLAIN, SCRAM-SHA-256, SCRAM-SHA-512}
+// surfaces a typed error at decode time. Without this the
+// segmentio/kafka-go scram factory would error inside
+// kafkaNewReader (which doesn't surface the error cleanly), and
+// the customer would see the dial hang rather than the typo.
+func TestDecodeKafkaConfig_SASLClosedVocab(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		mech string
+		want bool // expected to succeed at decode
+	}{
+		{"PLAIN", true},
+		{"SCRAM-SHA-256", true},
+		{"SCRAM-SHA-512", true},
+		{"plain", false}, // case-sensitive
+		{"SCRAM-SHA-1", false},
+		{"OAUTHBEARER", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run("mechanism="+c.mech, func(t *testing.T) {
+			t.Parallel()
+			body := map[string]any{
+				"brokers": []string{"broker:9092"},
+				"topic":   "t",
+				"group":   "g",
+				"sasl":    map[string]any{"mechanism": c.mech, "username": "u", "password": "p"},
+			}
+			b, _ := json.Marshal(body)
+			trig := kafkaDecoderFixture(t, string(b))
+			cfg, err := decodeKafkaConfig(trig)
+			if c.want {
+				if err != nil {
+					t.Fatalf("decodeKafkaConfig: %v (want success)", err)
+				}
+				if cfg.SASL == nil || cfg.SASL.Mechanism != c.mech {
+					t.Fatalf("SASL = %+v, want mechanism=%s", cfg.SASL, c.mech)
+				}
+			} else if err == nil {
+				t.Fatalf("decodeKafkaConfig err = nil, want non-nil (mechanism=%q must be rejected)", c.mech)
+			}
+		})
+	}
+}
+
+// TestDecodeKafkaConfig_SASLMissingCredentialsFails pins the
+// username/password required guard. Even with a valid mechanism,
+// an empty username or password must surface a typed error so
+// the customer can't accidentally deploy a no-auth trigger.
+func TestDecodeKafkaConfig_SASLMissingCredentialsFails(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, user, pass string
+	}{
+		{"empty_user", "", "p"},
+		{"empty_pass", "u", ""},
+		{"empty_both", "", ""},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := map[string]any{
+				"brokers": []string{"broker:9092"},
+				"topic":   "t",
+				"group":   "g",
+				"sasl":    map[string]any{"mechanism": "PLAIN", "username": tc.user, "password": tc.pass},
+			}
+			b, _ := json.Marshal(body)
+			_, err := decodeKafkaConfig(kafkaDecoderFixture(t, string(b)))
+			if err == nil {
+				t.Fatalf("decodeKafkaConfig err = nil, want non-nil (%s must be rejected)", tc.name)
+			}
+		})
+	}
+}
+
+// TestBuildKafkaDialer_PLAINMechanism pins the PLAIN SASL path:
+// kafkaSASLPlain.Mechanism is a value struct — buildKafkaDialer
+// returns a non-nil SASLMechanism named "PLAIN".
+func TestBuildKafkaDialer_PLAINMechanism(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{
+		"brokers":["broker:9092"],"topic":"t","group":"g",
+		"sasl":{"mechanism":"PLAIN","username":"u","password":"p"}
+	}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig: %v", err)
+	}
+	d, err := buildKafkaDialer(cfg)
+	if err != nil {
+		t.Fatalf("buildKafkaDialer: %v", err)
+	}
+	if d.SASLMechanism == nil {
+		t.Fatal("Dialer.SASLMechanism = nil, want non-nil (PLAIN)")
+	}
+	if name := d.SASLMechanism.Name(); name != "PLAIN" {
+		t.Errorf("SASLMechanism.Name() = %q, want %q", name, "PLAIN")
+	}
+}
+
+// TestBuildKafkaDialer_SCRAMSHA256Mechanism pins the
+// SCRAM-SHA-256 SASL path. segmentio/kafka-go's scram package
+// returns the mechanism via a factory (Mechanism(algo, user,
+// pass) (Mechanism, error)); buildKafkaDialer wraps the error.
+func TestBuildKafkaDialer_SCRAMSHA256Mechanism(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{
+		"brokers":["broker:9092"],"topic":"t","group":"g",
+		"sasl":{"mechanism":"SCRAM-SHA-256","username":"u","password":"p"}
+	}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig: %v", err)
+	}
+	d, err := buildKafkaDialer(cfg)
+	if err != nil {
+		t.Fatalf("buildKafkaDialer: %v", err)
+	}
+	if d.SASLMechanism == nil {
+		t.Fatal("Dialer.SASLMechanism = nil, want non-nil (SCRAM-SHA-256)")
+	}
+	if name := d.SASLMechanism.Name(); name != "SCRAM-SHA-256" {
+		t.Errorf("SASLMechanism.Name() = %q, want %q", name, "SCRAM-SHA-256")
+	}
+}
+
+// TestBuildKafkaDialer_SCRAMSHA512Mechanism mirrors the SHA-256
+// test for SHA-512. Both branches of the scram switch must land
+// in the Dialer with the correct Name().
+func TestBuildKafkaDialer_SCRAMSHA512Mechanism(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{
+		"brokers":["broker:9092"],"topic":"t","group":"g",
+		"sasl":{"mechanism":"SCRAM-SHA-512","username":"u","password":"p"}
+	}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig: %v", err)
+	}
+	d, err := buildKafkaDialer(cfg)
+	if err != nil {
+		t.Fatalf("buildKafkaDialer: %v", err)
+	}
+	if d.SASLMechanism == nil {
+		t.Fatal("Dialer.SASLMechanism = nil, want non-nil (SCRAM-SHA-512)")
+	}
+	if name := d.SASLMechanism.Name(); name != "SCRAM-SHA-512" {
+		t.Errorf("SASLMechanism.Name() = %q, want %q", name, "SCRAM-SHA-512")
+	}
+}
+
+// TestBuildKafkaDialer_TLSPlusSASLPinsBoth asserts the integrated
+// shape: one trigger with both tls.skip_verify=true AND
+// sasl.mechanism=PLAIN lands in one Dialer with both fields
+// populated. A future refactor that gates TLS-only or SASL-only
+// paths would regress the Confluent Cloud-with-mTLS shape.
+func TestBuildKafkaDialer_TLSPlusSASLPinsBoth(t *testing.T) {
+	t.Parallel()
+	trig := kafkaDecoderFixture(t, `{
+		"brokers":["broker:9092"],"topic":"t","group":"g",
+		"tls":{"skip_verify":true},
+		"sasl":{"mechanism":"PLAIN","username":"u","password":"p"}
+	}`)
+	cfg, err := decodeKafkaConfig(trig)
+	if err != nil {
+		t.Fatalf("decodeKafkaConfig: %v", err)
+	}
+	d, err := buildKafkaDialer(cfg)
+	if err != nil {
+		t.Fatalf("buildKafkaDialer: %v", err)
+	}
+	if d.TLS == nil {
+		t.Error("Dialer.TLS = nil, want non-nil")
+	}
+	if d.SASLMechanism == nil {
+		t.Error("Dialer.SASLMechanism = nil, want non-nil")
+	}
+	if d.TLS.MinVersion != tls.VersionTLS12 {
+		t.Errorf("Dialer.TLS.MinVersion = %v, want TLS 1.2", d.TLS.MinVersion)
+	}
+}
+
+// kafkaSeekFixture primes a kafkaPoller with multiple in-flight
+// messages and returns the poller + the in-flight ids in offset
+// order, so commit/rollback tests can drive Ack + Nack against a
+// non-empty payload without a real Reader.
+func kafkaSeekFixture(rdr kafkaBrokerOp, offsets ...int64) (*kafkaPoller, []string) {
+	ids := make([]string, 0, len(offsets))
+	k := &kafkaPoller{
+		reader:   rdr,
+		batchMax: 100,
+		inFlight: map[string]kafka.Message{},
+	}
+	for _, off := range offsets {
+		// Mirror the seqStr formula in (*kafkaPoller).Poll so the
+		// in-flight key matches the production hot path.
+		id := fmt.Sprintf("%d-%d-%d", 0, off, off+100)
+		k.inFlight[id] = kafka.Message{Topic: "orders.v1", Partition: 0, Offset: off}
+		ids = append(ids, id)
+	}
+	return k, ids
+}
+
+// TestKafka_AckMultipleSucceeds pins the happy path: Ack with N
+// ids commits every in-flight message via a single
+// CommitMessages call. The reader's inFlight map MUST be drained
+// so the broker offset advances server-side.
+func TestKafka_AckMultipleSucceeds(t *testing.T) {
+	t.Parallel()
+	rdr := &poisonStrategyReader{}
+	k, ids := kafkaSeekFixture(rdr, 1, 2, 3)
+	trig := sqlc.Trigger{BrokerPoisonStrategy: "commit"}
+
+	if err := k.Ack(context.Background(), trig, ids); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	rdr.mu.Lock()
+	defer rdr.mu.Unlock()
+	if rdr.poisonOp != poisonOpCommit {
+		t.Fatalf("terminal op = %v, want commit (Ack = CommitMessages)", rdr.poisonOp)
+	}
+	wantOff := []int64{1, 2, 3}
+	if len(rdr.offsets) != 3 {
+		t.Fatalf("CommitMessages offsets = %v, want %v", rdr.offsets, wantOff)
+	}
+	for i, off := range wantOff {
+		if rdr.offsets[i] != off {
+			t.Errorf("CommitMessages offsets[%d] = %d, want %d", i, rdr.offsets[i], off)
+		}
+	}
+	for _, id := range ids {
+		if _, ok := k.inFlight[id]; ok {
+			t.Errorf("inFlight[%s] still present, want drained after Ack", id)
+		}
+	}
+}
+
+// flakyCommitReader is a kafkaBrokerOp that pretends
+// CommitMessages succeeded but returns a configured error so the
+// poller's error-propagation path can be exercised. The
+// ack-drains-inFlight contract is the same as for the happy-path
+// branch.
+type flakyCommitReader struct {
+	commitErr error
+}
+
+func (r *flakyCommitReader) FetchMessage(context.Context) (kafka.Message, error) {
+	return kafka.Message{}, nil
+}
+func (r *flakyCommitReader) CommitMessages(_ context.Context, _ ...kafka.Message) error {
+	return r.commitErr
+}
+func (r *flakyCommitReader) SetOffset(_ int64) error { return nil }
+func (r *flakyCommitReader) Close() error            { return nil }
+
+// TestKafka_AckCommitBrokerError reports a non-nil error from
+// the underlying CommitMessages. The poller's contract is
+// "propagate the first error"; the in-flight rows are still
+// drained (consistent with kafka-go's at-least-once delivery —
+// the offset advance is independent of the dial).
+func TestKafka_AckCommitBrokerError(t *testing.T) {
+	t.Parallel()
+	rdr := &flakyCommitReader{commitErr: errors.New("broker conn refused")}
+	k, ids := kafkaSeekFixture(rdr, 42)
+	trig := sqlc.Trigger{BrokerPoisonStrategy: "commit"}
+
+	err := k.Ack(context.Background(), trig, ids)
+	if err == nil {
+		t.Fatal("Ack err = nil, want non-nil (CommitMessages returned an error)")
+	}
+	for _, id := range ids {
+		if _, ok := k.inFlight[id]; ok {
+			t.Errorf("inFlight[%s] still present after failing Ack", id)
+		}
+	}
+}
+
+// TestKafka_NackBrokerErrorAlwaysSeeks pins the offset-rebalance
+// path: Nack with reason="broker_error" must always SetOffset —
+// the broker_poison_strategy column is irrelevant outside the
+// poison branch. Doubles the TestKafka_NackBrokerErrorAlwaysRewinds
+// pin with a different in-flight shape to confirm the
+// rebalance-failure surface (commits don't happen on transient
+// broker errors).
+func TestKafka_NackBrokerErrorAlwaysSeeks(t *testing.T) {
+	t.Parallel()
+	for _, off := range []int64{10, 20, 30} {
+		off := off
+		t.Run(fmt.Sprintf("offset=%d", off), func(t *testing.T) {
+			t.Parallel()
+			rdr := &poisonStrategyReader{}
+			k, ids := kafkaSeekFixture(rdr, off)
+			trig := sqlc.Trigger{BrokerPoisonStrategy: "seek-to-offset"} // intentionally non-default
+			if err := k.Nack(context.Background(), trig, ids, triggerReasonBrokerError); err != nil {
+				t.Fatalf("Nack offset=%d: %v", off, err)
+			}
+			rdr.mu.Lock()
+			if rdr.poisonOp != poisonOpSetOffset {
+				t.Errorf("offset=%d: terminal op = %v, want SetOffset (broker_error must always rewind)", off, rdr.poisonOp)
+			}
+			if len(rdr.offsets) != 1 || rdr.offsets[0] != off {
+				t.Errorf("offset=%d: SetOffset offsets = %v, want [%d]", off, rdr.offsets, off)
+			}
+			rdr.mu.Unlock()
 		})
 	}
 }
