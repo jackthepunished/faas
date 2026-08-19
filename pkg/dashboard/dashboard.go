@@ -136,6 +136,23 @@ type AppListItem struct {
 	Scope string
 }
 
+// PreviewListItem is one row on /dashboard/previews (issue #961
+// Mega-C PR-1 leaf 3). The shape mirrors AppListItem for the
+// columns the customer expects (slug, parent, pr, state,
+// expires) plus a Hostname (the customer-facing preview URL)
+// and a DestroyAction (the dashboard's CSRF-wrapped POST target
+// for the new destroy endpoint).
+type PreviewListItem struct {
+	Slug          string
+	ParentSlug    string
+	PRNumber      int
+	PRState       string
+	ExpiresAt     *time.Time
+	CreatedAt     time.Time
+	Hostname      string
+	DestroyAction string
+}
+
 // ManifestView is the runner-scaffold snapshot shown on the app detail
 // page. Names are JSONish to avoid a second copy of pkg/api.AppManifest.
 type ManifestView struct {

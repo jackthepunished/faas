@@ -82,6 +82,14 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			// callback redirects here with ?install=…&branch=….
 			// ADR-116 documents the trust-root split.
 			s.renderAppNew(w, r, log, acct)
+		case path == "/dashboard/previews":
+			// Mega-C PR-1 / issue #961 leaf 3: global previews
+			// page. Every preview across the account, with a
+			// "Tear down" link that POSTs to the new
+			// /v1/preview/{slug}/destroy endpoint (via the
+			// dashboard's CSRF envelope — wired in a follow-up
+			// commit if/when the form gets JS).
+			s.renderPreviewsList(w, r, log, acct)
 		case len(path) > len("/dashboard/apps/") && path[:len("/dashboard/apps/")] == "/dashboard/apps/":
 			slug := path[len("/dashboard/apps/"):]
 			// Per-deploy drill-down (issue #464 / ADR-075):
