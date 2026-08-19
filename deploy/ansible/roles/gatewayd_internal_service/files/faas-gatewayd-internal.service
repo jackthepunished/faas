@@ -2,11 +2,13 @@
 Description=onebox-faas gatewayd-internal — routing + wake + proxy (Tier A7 split, ADR-070)
 Documentation=https://docs.gregale.dev/ops/gatewayd-internal
 # gatewayd-internal is the daemon gatewayd-public forwards to. It
-# must come up AFTER apid (route table source of truth) and schedd
-# (per-node Wake gRPC). Internal does NOT bind a public port — it
-# listens on a unix socket inside the box (ADR-015/018).
-After=faas-cp.slice network-online.target faas-apid.service faas-schedd.service faas-vmmd.service
-Wants=faas-cp.slice faas-apid.service faas-schedd.service faas-vmmd.service
+# must come up AFTER the local vmmd/runtime directory. On a split box,
+# apid and schedd are remote control-plane peers and are reached through
+# the rendered network/TLS configuration; they are intentionally masked on
+# compute-only hosts. Keeping them out of Wants= prevents a role-correct
+# compute node from inheriting a local control-plane dependency.
+After=faas-cp.slice network-online.target faas-vmmd.service
+Wants=faas-cp.slice faas-vmmd.service
 
 [Service]
 Type=simple
