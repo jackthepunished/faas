@@ -1,6 +1,7 @@
 package gregalemanifest
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -403,3 +404,292 @@ func TestValidate_Cron_NoSlug(t *testing.T) {
 		t.Errorf("err = %v, want nil (cron path stays slug-free)", err)
 	}
 }
+
+// ADR-118 / issue #757 §criterion 2 — TLS + SASL sub-objects on
+// KafkaConfig. The validator surfaces the half-wired mTLS pair,
+// the closed-vocab SASL mechanism, and the closed-vocab FilterOp
+// at `gregale deploy` time rather than at the first broker dial.
+
+// kafkaConfigWithTLS is the canonical happy-path config with TLS
+// (system CA, no client cert, no skip-verify). Mirrors the
+// managed-Kafka plaintext-on-public-TLS production shape.
+var kafkaConfigWithTLS = map[string]any{
+	"brokers": []any{"broker1:9092"},
+	"topic":   "orders.v1",
+	"group":   "faas-orders",
+	"tls": map[string]any{
+		"ca_cert": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
+	},
+}
+
+func TestValidate_Kafka_TLS_Happy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfigWithTLS,
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil (TLS with system CA is the default-on production shape)", err)
+	}
+}
+
+func TestValidate_Kafka_TLS_MTLSPair(t *testing.T) {
+	// mTLS with both cert + key round-trips. The two fields must
+	// land together; the half-wired case is the next test.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{
+			"brokers": []any{"broker1:9092"},
+			"topic":   "orders.v1",
+			"group":   "faas-orders",
+			"tls": map[string]any{
+				"client_cert": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
+				"client_key":  "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----",
+			},
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil (mTLS pair is the documented production shape for Confluent Cloud cluster-scoped cert auth)", err)
+	}
+}
+
+func TestValidate_Kafka_TLS_HalfWiredMTLS(t *testing.T) {
+	// client_cert without client_key: a 0-byte handshake that
+	// hangs at the first FetchMessage with no error. The
+	// validator surfaces the typo at load time.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{
+			"brokers": []any{"broker1:9092"},
+			"topic":   "orders.v1",
+			"group":   "faas-orders",
+			"tls": map[string]any{
+				"client_cert": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
+			},
+		},
+	}}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "client_cert and client_key") {
+		t.Errorf("err = %v, want half-wired-mtls message", err)
+	}
+}
+
+func TestValidate_Kafka_SASL_PlainHappy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{
+			"brokers": []any{"broker1:9092"},
+			"topic":   "orders.v1",
+			"group":   "faas-orders",
+			"sasl": map[string]any{
+				"mechanism": "PLAIN",
+				"username":  "faas-svc",
+				"password":  "redacted-at-rest",
+			},
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil (PLAIN is the canonical SASL mechanism for managed Kafka)", err)
+	}
+}
+
+func TestValidate_Kafka_SASL_Scram256Happy(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{
+			"brokers": []any{"broker1:9092"},
+			"topic":   "orders.v1",
+			"group":   "faas-orders",
+			"sasl": map[string]any{
+				"mechanism": "SCRAM-SHA-256",
+				"username":  "faas-svc",
+				"password":  "redacted-at-rest",
+			},
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+func TestValidate_Kafka_SASL_BadMechanism(t *testing.T) {
+	// "SCRAM-SHA256" (missing dash) is the most common typo
+	// against the closed vocab. Silently accepted by the YAML
+	// decoder; the validator surfaces the typo at load time.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{
+			"brokers": []any{"broker1:9092"},
+			"topic":   "orders.v1",
+			"group":   "faas-orders",
+			"sasl": map[string]any{
+				"mechanism": "SCRAM-SHA256",
+				"username":  "faas-svc",
+				"password":  "redacted-at-rest",
+			},
+		},
+	}}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "sasl mechanism") {
+		t.Errorf("err = %v, want sasl-mechanism message", err)
+	}
+}
+
+func TestValidate_Kafka_SASL_MissingPassword(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: map[string]any{
+			"brokers": []any{"broker1:9092"},
+			"topic":   "orders.v1",
+			"group":   "faas-orders",
+			"sasl": map[string]any{
+				"mechanism": "PLAIN",
+				"username":  "faas-svc",
+			},
+		},
+	}}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "non-empty password") {
+		t.Errorf("err = %v, want sasl-password message", err)
+	}
+}
+
+// ADR-118 / issue #757 §criterion 4 — FilterCriteria tree.
+
+func TestValidate_FilterCriteria_Canonical(t *testing.T) {
+	// The canonical happy-path: $or / $and / payload all set
+	// with the closed-vocab ops. Pins the schema that
+	// pkg/sched/filter.go (commit 5) will evaluate.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig,
+		FilterCriteria: &FilterCriteria{
+			OR: []FilterClause{
+				{Op: FilterOpExists, Field: "x-event-id"},
+			},
+			AND: []FilterClause{
+				{Op: FilterOpEq, Field: "x-tenant", Value: jsonRaw(`"acme"`)},
+			},
+			Payload: []FilterClause{
+				{Op: FilterOpJsonPath, Path: "$.event.type", Value: jsonRaw(`"order.created"`)},
+			},
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+func TestValidate_FilterCriteria_EmptyTreeRejected(t *testing.T) {
+	// A zero-Clauses tree is match-anything at runtime but a
+	// degenerate config at load time. Reject so the customer
+	// sees the typo at `gregale deploy`.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config:         kafkaConfig,
+		FilterCriteria: &FilterCriteria{},
+	}}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "at least one of $or, $and, payload") {
+		t.Errorf("err = %v, want empty-tree message", err)
+	}
+}
+
+func TestValidate_FilterCriteria_UnknownOp(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig,
+		FilterCriteria: &FilterCriteria{
+			OR: []FilterClause{
+				{Op: "regex", Field: "x-event-id"},
+			},
+		},
+	}}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "not in {eq, neq, exists, jsonpath}") {
+		t.Errorf("err = %v, want unknown-op message", err)
+	}
+}
+
+func TestValidate_FilterCriteria_JsonPathMissingPath(t *testing.T) {
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig,
+		FilterCriteria: &FilterCriteria{
+			Payload: []FilterClause{
+				{Op: FilterOpJsonPath, Value: jsonRaw(`"order.created"`)},
+			},
+		},
+	}}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "non-empty path") {
+		t.Errorf("err = %v, want missing-path message", err)
+	}
+}
+
+func TestValidate_FilterCriteria_JsonPathShapeRejected(t *testing.T) {
+	// Dot-then-bracket typo: "$.foo.[0]" is the most common
+	// customer error against the strict JSONPath grammar. The
+	// shape pre-check catches it at load time so the runtime
+	// (commit 5) never sees it.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig,
+		FilterCriteria: &FilterCriteria{
+			Payload: []FilterClause{
+				{Op: FilterOpJsonPath, Path: "$.foo.[0]"},
+			},
+		},
+	}}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "jsonpath") {
+		t.Errorf("err = %v, want jsonpath shape message", err)
+	}
+}
+
+func TestValidate_FilterCriteria_NestedOrAnd(t *testing.T) {
+	// Nested $or inside $and: the validator recurses and
+	// accepts the well-formed tree. The runtime evaluator
+	// (commit 5) preserves the nesting semantics.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindKafka, App: "my-api", Slug: "orders",
+		Config: kafkaConfig,
+		FilterCriteria: &FilterCriteria{
+			AND: []FilterClause{
+				{
+					Clauses: []FilterClause{
+						{Op: FilterOpEq, Field: "x-tenant", Value: jsonRaw(`"acme"`)},
+						{Op: FilterOpExists, Field: "x-event-id"},
+					},
+				},
+			},
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil (nested $or/$and is the documented superset shape)", err)
+	}
+}
+
+func TestValidate_FilterCriteria_CronKindSkips(t *testing.T) {
+	// FilterCriteria is meaningless for kind=cron (cron always
+	// fires; no broker record to filter). The validator does
+	// not run validateFilterCriteria for cron — a stray
+	// filter_criteria on a cron trigger is silently ignored
+	// (the runtime path doesn't read it for cron). Pin the
+	// backward-compat contract: a cron trigger with a stray
+	// filter_criteria still validates.
+	m := &Manifest{Triggers: []Trigger{{
+		Kind: TriggerKindCron, App: "my-api", Schedule: "0 3 * * *", Path: "/cleanup",
+		FilterCriteria: &FilterCriteria{
+			OR: []FilterClause{
+				{Op: FilterOpExists, Field: "x-tenant"},
+			},
+		},
+	}}}
+	if err := m.Validate(); err != nil {
+		t.Errorf("err = %v, want nil (cron ignores filter_criteria; pin the backward-compat contract)", err)
+	}
+}
+
+// jsonRaw is a tiny helper that returns a json.RawMessage from a
+// literal. Keeps the table-driven fixtures readable.
+func jsonRaw(s string) json.RawMessage { return json.RawMessage(s) }

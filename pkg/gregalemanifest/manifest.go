@@ -131,6 +131,21 @@ type Trigger struct {
 	// so a YAML typo surfaces at load time rather than at
 	// poison-record dispatch time.
 	BrokerPoisonStrategy string `yaml:"broker_poison_strategy,omitempty"`
+	// FilterCriteria (ADR-118 / issue #757 closure, migration
+	// 00300) is the per-source record filter tree. nil means
+	// "every record passes through". The shape is evaluated
+	// at runtime by pkg/sched/filter.go::FilterCriteria.Match
+	// (commit 5); the validator here only checks the closed
+	// vocabulary of operators + jsonpath syntax. The validator
+	// runs at `gregale deploy` time so a typo'd operator
+	// surfaces before any broker traffic lands.
+	//
+	// Pointer-on-pointer: *FilterCriteria distinguishes "absent"
+	// (omitempty on YAML) from "explicit null" (empty filter
+	// tree) — both decode to match-anything at runtime, but a
+	// future "force-set filter" feature may need to tell them
+	// apart, and storing the distinction now costs nothing.
+	FilterCriteria *FilterCriteria `yaml:"filter_criteria,omitempty"`
 	// Config is the per-kind JSON object. Validated strictly per
 	// kind in Validate(). Absent Config defaults to `{}` so a
 	// bare trigger entry validates against the per-kind zero-value
@@ -138,6 +153,158 @@ type Trigger struct {
 	// kind requires at least one non-empty field).
 	Config  map[string]any `yaml:"config,omitempty"`
 	Enabled *bool          `yaml:"enabled,omitempty"`
+}
+
+// FilterOp is the closed vocabulary of comparison operators a
+// FilterClause may carry. Adding a new operator requires (a) a
+// constant here, (b) widening the switch in
+// pkg/sched/filter.go::FilterCriteria.Match, and (c) a unit test
+// for the new path.
+type FilterOp string
+
+const (
+	// FilterOpEq — payload-or-header value equality. JSON-encoded
+	// comparison: numeric literals compare as numbers, string
+	// literals as strings, booleans as booleans. Type mismatch
+	// is a non-match (not a parse error).
+	FilterOpEq FilterOp = "eq"
+	// FilterOpNeq — payload-or-header value inequality. Inverts
+	// FilterOpEq (including the type-mismatch-→-match rule, so
+	// "neq against an absent header" matches).
+	FilterOpNeq FilterOp = "neq"
+	// FilterOpExists — header key presence check. The Value
+	// field is ignored. Matches iff the header key is set in
+	// rec.Headers (any non-empty value).
+	FilterOpExists FilterOp = "exists"
+	// FilterOpJsonPath — JSONPath predicate against rec.Payload.
+	// The Path field carries the expression (e.g. "$.event.type");
+	// the Value field carries the expected result. Implemented
+	// via github.com/PaesslerAG/jsonpath — no customer-supplied
+	// code execution; the library is a pure data walker.
+	FilterOpJsonPath FilterOp = "jsonpath"
+)
+
+// SASLMechanism is the closed vocabulary of SASL mechanisms the
+// kafka poller (pkg/sched/poller_kafka.go) accepts. Mirrors the
+// segmentio/kafka-go sasl.Mechanism union {Plain, SCRAMSHA256,
+// SCRAMSHA512} — anything outside this set is rejected at load
+// time so the customer sees the typo at `gregale deploy` rather
+// than at the first broker dial.
+type SASLMechanism string
+
+const (
+	SASLMechanismPlain       SASLMechanism = "PLAIN"
+	SASLMechanismScramSHA256 SASLMechanism = "SCRAM-SHA-256"
+	SASLMechanismScramSHA512 SASLMechanism = "SCRAM-SHA-512"
+)
+
+// IsValidSASLMechanism reports whether m is one of the closed-vocab
+// SASL mechanisms.
+func (m SASLMechanism) IsValid() bool {
+	switch m {
+	case SASLMechanismPlain, SASLMechanismScramSHA256, SASLMechanismScramSHA512:
+		return true
+	}
+	return false
+}
+
+// TLSConfig is the optional TLS sub-object on KafkaConfig
+// (ADR-118 / issue #757). All fields are optional — the
+// MinVersion constant is enforced at runtime regardless of what
+// the customer sets.
+//
+// Why a pointer on KafkaConfig rather than a sub-struct slot:
+// "platform default" (nil) means "use the cluster's CA bundle,
+// no client cert, no skip-verify". This is the production
+// shape for ~all managed-Kafka deployments (Confluent Cloud,
+// MSK with public endpoints, Redpanda Cloud) and lets the
+// simple case stay simple in the YAML.
+type TLSConfig struct {
+	// CACert is the PEM-encoded CA bundle. Empty means "use the
+	// system trust store". Newlines are preserved through the
+	// YAML→JSON→tls.Config.X509KeyPair path; the runtime layer
+	// (commit 7) handles the PEM decode.
+	CACert string `json:"ca_cert,omitempty" yaml:"ca_cert,omitempty"`
+	// ClientCert + ClientKey are the PEM-encoded mTLS pair.
+	// Both must be set together — Validate() rejects a
+	// half-configured mTLS pair so the customer sees the
+	// typo at load time rather than at the first dial.
+	ClientCert string `json:"client_cert,omitempty" yaml:"client_cert,omitempty"`
+	ClientKey  string `json:"client_key,omitempty"  yaml:"client_key,omitempty"`
+	// SkipVerify disables TLS certificate verification. The
+	// validator gates this on the TLSSkipVerifyAllowed plan
+	// cap (commit 3): Hobby=false, Pro=true, Scale=true. A
+	// Hobby customer setting skip_verify=true surfaces a
+	// typed error pointing them at the plan upgrade.
+	//
+	// The validator here only checks the bool-shape; the
+	// plan-cap check lives in apid handler land because the
+	// manifest loader doesn't know the customer's plan.
+	// Pinning the closed vocab here keeps the manifest
+	// self-contained: a test-grade manifest with
+	// skip_verify=true on a Hobby-shaped test plan still
+	// round-trips through the loader, and the apid is the
+	// one that ultimately rejects it.
+	SkipVerify bool `json:"skip_verify,omitempty" yaml:"skip_verify,omitempty"`
+}
+
+// SASLConfig is the optional SASL sub-object on KafkaConfig
+// (ADR-118 / issue #757). nil means "no SASL" — the kafka dial
+// is plaintext-equivalent from the customer's perspective.
+type SASLConfig struct {
+	// Mechanism is the closed-vocab SASL mechanism. Required
+	// when SASL is non-nil.
+	Mechanism SASLMechanism `json:"mechanism" yaml:"mechanism"`
+	// Username is the SASL principal. Required when SASL is
+	// non-nil.
+	Username string `json:"username" yaml:"username"`
+	// Password is the SASL secret. Required when SASL is
+	// non-nil. The validator here only checks non-emptiness;
+	// the apid handler seals secret values per pkg/webhook
+	// (ADR-113 PR-B).
+	Password string `json:"password" yaml:"password"`
+}
+
+// FilterClause is one leaf or branch in a FilterCriteria tree
+// (ADR-118 / issue #757 §criterion 4). The discriminator is Op:
+//
+//   - Eq / Neq / Exists:     Field carries the header key
+//     (eq/neq against rec.Headers[Field],
+//     exists against presence).
+//   - JsonPath:              Path carries the JSONPath expression;
+//     Value carries the expected match.
+//
+// Clauses is the branch slot for nested $or / $and: a clause with
+// Op="jsonpath" AND non-empty Clauses is malformed; the validator
+// rejects the half-wired shape at load time.
+type FilterClause struct {
+	Op      FilterOp        `json:"op"                yaml:"op"`
+	Field   string          `json:"field,omitempty"   yaml:"field,omitempty"`
+	Path    string          `json:"path,omitempty"    yaml:"path,omitempty"`
+	Value   json.RawMessage `json:"value,omitempty"   yaml:"value,omitempty"`
+	Clauses []FilterClause  `json:"clauses,omitempty" yaml:"clauses,omitempty"`
+}
+
+// FilterCriteria is the per-trigger filter tree (ADR-118 / issue
+// #757 §criterion 4). Three top-level slots, mutually combinable:
+//
+//   - OR:      a record passes if ANY clause matches.
+//   - AND:     a record passes if ALL clauses match.
+//   - Payload: a list of JSONPath predicates against rec.Payload.
+//
+// Nil-or-zero FilterCriteria is "every record passes through" —
+// the runtime short-circuits on the empty tree. The validator
+// here checks (a) at-least-one-slot rule (zero slots + zero
+// nested clauses is match-anything but a degenerate config that
+// almost certainly indicates a customer typo), (b) closed-vocab
+// op, (c) field/path presence per op, (d) JSONPath syntax.
+//
+// The runtime evaluator is pkg/sched/filter.go (commit 5 of the
+// ADR-118 mega-PR); this type is the validator's contract.
+type FilterCriteria struct {
+	OR      []FilterClause `json:"$or,omitempty"     yaml:"$or,omitempty"`
+	AND     []FilterClause `json:"$and,omitempty"    yaml:"$and,omitempty"`
+	Payload []FilterClause `json:"payload,omitempty" yaml:"payload,omitempty"`
 }
 
 // IsEnabled returns the trigger's effective enabled state. nil pointer
@@ -153,10 +320,18 @@ func (t Trigger) IsEnabled() bool {
 // KafkaConfig is the per-kind config for kind=kafka (issue #757).
 // Brokers is a list of host:port pairs; Topic is the consumer-group
 // subscription target; Group is the durable consumer-group ID.
+//
+// TLS + SASL are ADR-118 additions (issue #757 §criterion 2). Both
+// are pointers so the simple case (managed-Kafka plaintext with
+// public CAs) stays simple in the YAML: `config: {brokers: [...],
+// topic: ..., group: ...}`. nil TLS = "use the system trust store,
+// no client cert". nil SASL = "no SASL".
 type KafkaConfig struct {
-	Brokers []string `json:"brokers"`
-	Topic   string   `json:"topic"`
-	Group   string   `json:"group"`
+	Brokers []string    `json:"brokers"`
+	Topic   string      `json:"topic"`
+	Group   string      `json:"group"`
+	TLS     *TLSConfig  `json:"tls,omitempty"   yaml:"tls,omitempty"`
+	SASL    *SASLConfig `json:"sasl,omitempty"  yaml:"sasl,omitempty"`
 }
 
 // NATSConfig is the per-kind config for kind=nats (issue #757). URL
@@ -331,6 +506,16 @@ func (m *Manifest) Validate() error {
 		if err := t.validateKindConfig(i); err != nil {
 			return err
 		}
+		// FilterCriteria (ADR-118) applies to every kind except
+		// cron — cron doesn't poll, so a record filter is a
+		// no-op (cron always fires). Validate() runs on the
+		// schema-shape here (closed vocab + JSONPath syntax);
+		// the runtime evaluator is pkg/sched/filter.go (commit 5).
+		if t.Kind != TriggerKindCron && t.FilterCriteria != nil {
+			if err := validateFilterCriteria(i, t.FilterCriteria); err != nil {
+				return err
+			}
+		}
 		// Batch/window/attempts ranges mirror the SQL CHECK on the
 		// `triggers` table (migration 00267). A 0 value is "use the
 		// SQL DEFAULT" (64 / 1000 / 5) — strictly speaking the SQL
@@ -418,6 +603,12 @@ func (t Trigger) validateKindConfig(idx int) error {
 		}
 		if c.Group == "" {
 			return fmt.Errorf("trigger[%d]: kafka config requires non-empty group", idx)
+		}
+		if err := validateKafkaTLS(idx, c.TLS); err != nil {
+			return err
+		}
+		if err := validateKafkaSASL(idx, c.SASL); err != nil {
+			return err
 		}
 		return nil
 	case TriggerKindNATS:
@@ -536,6 +727,216 @@ func isDNSSafeSlug(s string) bool {
 
 func isLowerAlpha(b byte) bool { return b >= 'a' && b <= 'z' }
 func isDigit(b byte) bool      { return b >= '0' && b <= '9' }
+
+// validateKafkaTLS enforces the closed shape on KafkaConfig.TLS
+// (ADR-118 / issue #757 §criterion 2). nil is the production
+// default ("platform CA bundle, no client cert, no skip-verify")
+// and is accepted silently.
+//
+// The half-wired mTLS pair rejection is the load-bearing check:
+// a customer who sets client_cert but forgets client_key (or
+// vice-versa) silently gets a 0-byte handshake with no error
+// from segmentio/kafka-go — only a hang at the first FetchMessage.
+// Surfacing the typo at `gregale deploy` time turns that into a
+// typed error pointing at the half-wired field.
+func validateKafkaTLS(idx int, t *TLSConfig) error {
+	if t == nil {
+		return nil
+	}
+	if (t.ClientCert == "") != (t.ClientKey == "") {
+		return fmt.Errorf("trigger[%d]: kafka tls requires both client_cert and client_key when mTLS is configured (got cert=%q, key-set=%t)",
+			idx, t.ClientCert, t.ClientKey != "")
+	}
+	return nil
+}
+
+// validateKafkaSASL enforces the closed vocab on KafkaConfig.SASL
+// (ADR-118 / issue #757 §criterion 2). nil is the production
+// default ("no SASL" — plaintext-equivalent dial).
+//
+// Mechanism is the load-bearing check: a typo'd
+// `mechanism: SCRAM-SHA256` (missing dash) is silently accepted by
+// the YAML decoder but rejected at the first broker dial, leaving
+// the customer with a hung trigger. The validator surfaces the
+// typo at load time so a `gregale deploy` flags it inline.
+func validateKafkaSASL(idx int, s *SASLConfig) error {
+	if s == nil {
+		return nil
+	}
+	if !s.Mechanism.IsValid() {
+		return fmt.Errorf("trigger[%d]: kafka sasl mechanism %q not in {PLAIN, SCRAM-SHA-256, SCRAM-SHA-512}",
+			idx, s.Mechanism)
+	}
+	if s.Username == "" {
+		return fmt.Errorf("trigger[%d]: kafka sasl requires non-empty username", idx)
+	}
+	if s.Password == "" {
+		return fmt.Errorf("trigger[%d]: kafka sasl requires non-empty password", idx)
+	}
+	return nil
+}
+
+// validateFilterCriteria walks the filter tree (ADR-118 / issue
+// #757 §criterion 4) and rejects malformed shapes at load time.
+//
+// Closed vocab checks (per FilterClause.Op):
+//
+//   - eq / neq / exists:  field must be non-empty.
+//   - jsonpath:          path must be non-empty AND parseable.
+//
+// Structural checks:
+//
+//   - A clause may not simultaneously carry Clauses AND a leaf
+//     operator (a half-wired branch). The runtime short-circuits
+//     on Clauses, but a customer typo'd `clauses: [...]` on a leaf
+//     would silently disable the leaf — surfacing here turns it
+//     into a typed error.
+//   - Top-level FilterCriteria must have at least one of
+//     OR / AND / Payload — the empty-tree case is technically
+//     match-anything, but the validator rejects it as a
+//     degenerate config that almost certainly indicates a
+//     customer typo (cf. validateKindConfig rejecting empty
+//     Config on non-cron kinds).
+//
+// JSONPath syntax is checked here using the PaesslerAG/jsonpath
+// library (used at runtime by pkg/sched/filter.go). A parse
+// failure surfaces as a typed error pointing at the path — the
+// runtime would have hit the same error on the first poll, but
+// surfacing it at `gregale deploy` time lets the customer fix
+// the YAML before the trigger goes live.
+func validateFilterCriteria(idx int, f *FilterCriteria) error {
+	if f == nil {
+		return nil
+	}
+	if len(f.OR) == 0 && len(f.AND) == 0 && len(f.Payload) == 0 {
+		return fmt.Errorf("trigger[%d]: filter_criteria must declare at least one of $or, $and, payload (empty tree is a degenerate config)", idx)
+	}
+	for i, c := range f.OR {
+		if err := validateFilterClause(idx, fmt.Sprintf("$or[%d]", i), c); err != nil {
+			return err
+		}
+	}
+	for i, c := range f.AND {
+		if err := validateFilterClause(idx, fmt.Sprintf("$and[%d]", i), c); err != nil {
+			return err
+		}
+	}
+	for i, c := range f.Payload {
+		if err := validateFilterClause(idx, fmt.Sprintf("payload[%d]", i), c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateFilterClause checks a single leaf or branch (ADR-118
+// §criterion 4). See validateFilterCriteria for the rationale.
+func validateFilterClause(idx int, path string, c FilterClause) error {
+	if len(c.Clauses) > 0 && c.Op != "" {
+		// Half-wired branch: a clause with Clauses AND a leaf
+		// operator is malformed. Reject so the customer sees
+		// the typo at load time.
+		return fmt.Errorf("trigger[%d]: filter_criteria.%s carries both op=%q and clauses=%d — pick one (branch vs leaf)",
+			idx, path, c.Op, len(c.Clauses))
+	}
+	switch c.Op {
+	case FilterOpEq, FilterOpNeq, FilterOpExists:
+		if c.Field == "" {
+			return fmt.Errorf("trigger[%d]: filter_criteria.%s requires non-empty field (op=%q operates against header keys)",
+				idx, path, c.Op)
+		}
+	case FilterOpJsonPath:
+		if c.Path == "" {
+			return fmt.Errorf("trigger[%d]: filter_criteria.%s requires non-empty path (op=jsonpath)", idx, path)
+		}
+		if err := checkJSONPathShape(c.Path); err != nil {
+			return fmt.Errorf("trigger[%d]: filter_criteria.%s jsonpath %q: %w",
+				idx, path, c.Path, err)
+		}
+	case "":
+		// Empty-op branch with nested clauses — recurse to
+		// validate the children. The runtime treats this as a
+		// nested AND (the most common intent).
+		if len(c.Clauses) == 0 {
+			return fmt.Errorf("trigger[%d]: filter_criteria.%s carries neither op nor clauses (empty leaf)",
+				idx, path)
+		}
+	default:
+		return fmt.Errorf("trigger[%d]: filter_criteria.%s op=%q not in {eq, neq, exists, jsonpath}",
+			idx, path, c.Op)
+	}
+	for j, cc := range c.Clauses {
+		if err := validateFilterClause(idx, fmt.Sprintf("%s.clauses[%d]", path, j), cc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkJSONPathShape is a minimal JSONPath syntax pre-check used
+// at the manifest validator layer (commit 2 of ADR-118). It does
+// NOT use the full PaesslerAG/jsonpath library (which lands as a
+// runtime dependency in commit 5 via pkg/sched/filter.go) — the
+// validator's job is to catch the most common typos at `gregale
+// deploy` time without pulling in a new transitive dep just for
+// compile-time validation.
+//
+// Checks (best-effort):
+//
+//   - non-empty
+//   - starts with "$" (the JSONPath root marker; segmentio
+//     rejects anything else).
+//   - balanced brackets (parens + square brackets).
+//   - no trailing dots before a "[" (e.g. "$.foo.[0]" is invalid).
+//
+// Anything not rejected here is accepted; the runtime evaluator
+// in commit 5 is the source of truth for full JSONPath semantics.
+func checkJSONPathShape(p string) error {
+	if p == "" {
+		return errors.New("empty path")
+	}
+	if p[0] != '$' {
+		return fmt.Errorf("must start with $ (got %q)", string(p[0]))
+	}
+	var (
+		parenDepth   int
+		bracketDepth int
+	)
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '(':
+			parenDepth++
+		case ')':
+			parenDepth--
+			if parenDepth < 0 {
+				return fmt.Errorf("unbalanced parens at offset %d", i)
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			bracketDepth--
+			if bracketDepth < 0 {
+				return fmt.Errorf("unbalanced brackets at offset %d", i)
+			}
+		case '.':
+			// A dot followed by a bracket is the "dot-then-index"
+			// form, which PaesslerAG's strict mode rejects. Catch
+			// the most common typo: "$.foo.[0]" instead of
+			// "$.foo[0]".
+			if i+1 < len(p) && p[i+1] == '[' {
+				return fmt.Errorf("dot before bracket at offset %d (write %q without the dot)",
+					i, p[:i])
+			}
+		}
+	}
+	if parenDepth != 0 {
+		return fmt.Errorf("unbalanced parens (depth=%d at end)", parenDepth)
+	}
+	if bracketDepth != 0 {
+		return fmt.Errorf("unbalanced brackets (depth=%d at end)", bracketDepth)
+	}
+	return nil
+}
 
 // triggerKey is the dedupe primitive. Five fields because two
 // triggers of the same kind on the same app with the same slug are
