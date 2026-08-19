@@ -68,10 +68,10 @@
 - name: nftables — ensure bridge IP is present
   ansible.builtin.command: ip addr add {{ bridge_cidr }} dev {{ tenant_bridge }}
   register: bridge_addr
-  changed_when: "'RTNETLINK answers: File exists' not in bridge_addr.stderr"
+  changed_when: bridge_addr.rc == 0
   failed_when:
     - bridge_addr.rc != 0
-    - "'File exists' not in bridge_addr.stderr"
+    - "'File exists' not in bridge_addr.stderr and 'already assigned' not in bridge_addr.stderr"
 
 - name: nftables — bring the tenant bridge up
   ansible.builtin.command: ip link set {{ tenant_bridge }} up
@@ -134,11 +134,6 @@
     owner: root
     group: root
     mode: "0644"
-  vars:
-    public_iface: "{{ public_iface | default('eth0') }}"
-    masquerade_cidr: "{{ masquerade_cidr | default('10.100.0.0/16') }}"
-    overlay_cidrs: "{{ overlay_cidrs | default([]) }}"
-    masquerade_cidr_v6: "{{ masquerade_cidr_v6 | default('') }}"
   register: nft_drop
 
 - name: nftables — syntax-check the ruleset

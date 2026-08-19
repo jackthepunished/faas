@@ -21,8 +21,8 @@
 # apt signatures. The role fails closed if gv_release_sha256 is the
 # placeholder, same pattern as prom_release_sha256.
 #
-# Bind discipline: gv_listen_addr must be a loopback (127/8) or
-# management-bridge (10.0.0.0/24) address on port 3000. Off-box
+# Bind discipline: gv_listen_addr must be a loopback (127/8) address
+# on port 3000. Off-box
 # public binds would expose the admin surface (Grafana basic auth
 # + provisioning write API) over plaintext. Asserted at task time.
 
@@ -30,7 +30,7 @@ gv_version: "11.3.1"
 # SHA-256 of grafana-11.3.1.linux-amd64.tar.gz from dl.grafana.com.
 # The role asserts against this value before any templates render.
 gv_release_sha256: "cd426520532ee22582c4bcdc898ee33dd15f540b3ed0f9add0e1a09f4db2823b"
-gv_listen_addr: "10.0.0.1:3000"
+gv_listen_addr: "127.0.0.1:3000"
 gv_data_dir: /var/lib/grafana
 gv_config_path: /etc/grafana/grafana.ini
 gv_provisioning_dir: /etc/grafana/provisioning
@@ -43,10 +43,9 @@ gv_dashboards_dir: /var/lib/grafana/dashboards
 # Mode 0400, owner grafana:grafana — asserted before systemd enable.
 gv_admin_password_file: ""
 
-# Internal Prometheus address Grafana queries. Defaults to the local
-# bridge bind (same one the operator dials to reach Prometheus) so the
-# datasource target stays inside the management plane.
-gv_prom_url: "http://10.0.0.1:9090"
+# Internal Prometheus address Grafana queries. Keep the datasource local;
+# operators can use an SSH tunnel for the Grafana UI when needed.
+gv_prom_url: "http://127.0.0.1:9090"
 
 # When true, the role skips the admin-password-file permission assert
 # and the systemd service start. dev/CI hosts set this to true so

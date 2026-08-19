@@ -1,4 +1,4 @@
-# Issue #98 / ADR-028: cross-box overlay (Tailscale / Wireguard).
+# Issue #98 / ADR-028: cross-box overlay (Tailscale / Wireguard / static).
 #
 # The overlay is the dial layer gatewayd-internal uses to reach remote vmmd
 # boxes. Without it, a multi-node FaaS is impossible: gatewayd-internal
@@ -25,7 +25,10 @@ faas_overlay_provider: tailscale
 # tailscale0 by convention; wireguard uses a free name (we don't
 # pin one so multi-tenant boxes don't collide on a host-level
 # naming policy).
-faas_overlay_iface: tailscale0
+faas_overlay_iface: >-
+  {{ 'tailscale0' if faas_overlay_provider == 'tailscale'
+     else ('wg0' if faas_overlay_provider == 'wireguard'
+           else (ansible_default_ipv4.interface | default('eth0'))) }}
 # Authkey for the tailscale path. Read from /etc/faas/secrets/
 # tailscale.authkey by default; operators paste the value there
 # from their tailnet admin console. Production deploys vault

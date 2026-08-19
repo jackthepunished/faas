@@ -129,7 +129,14 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 		default:
 			return nil, fmt.Errorf("host %s has unsupported production role %q; use control-plane or compute-only", host.Name, host.Role)
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, internalHosts)
+		overlayCIDRs := ""
+		if host.Role == roleComputeOnly {
+			// The manifest's overlay CIDR is the fleet-wide network contract.
+			// Only compute boxes route tenant traffic through that overlay;
+			// the control plane keeps the canonical empty list.
+			overlayCIDRs = m.Overlay.CIDR
+		}
+		body := renderManifestHostVars(host, ansibleHost, targetURL, internalHosts, overlayCIDRs, m.Overlay.Provider)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -183,14 +190,27 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 	out.WriteByte('\n')
 }
 
-func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, internalHosts []manifestInternalHost) string {
+func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
 	fmt.Fprintf(&b, "faas_box_role: %s\n", host.Role)
 	fmt.Fprintf(&b, "faas_node_name: %s\n", host.Name)
 	fmt.Fprintf(&b, "ansible_host: %q\n", ansibleHost)
 	b.WriteString("ansible_python_interpreter: /usr/bin/python3\n")
-	b.WriteString("overlay_cidrs: []\n")
+	fmt.Fprintf(&b, "faas_overlay_provider: %q\n", overlayProvider)
+	switch overlayProvider {
+	case "tailscale":
+		b.WriteString("faas_overlay_iface: tailscale0\n")
+	case "wireguard":
+		b.WriteString("faas_overlay_iface: wg0\n")
+	case "static":
+		b.WriteString("faas_overlay_iface: \"{{ ansible_default_ipv4.interface | default('eth0') }}\"\n")
+	}
+	if host.Role == roleComputeOnly && overlayCIDRs != "" {
+		fmt.Fprintf(&b, "overlay_cidrs: [%q]\n", overlayCIDRs)
+	} else {
+		b.WriteString("overlay_cidrs: []\n")
+	}
 	if len(internalHosts) > 0 {
 		b.WriteString("faas_internal_hosts:\n")
 		for _, internalHost := range internalHosts {

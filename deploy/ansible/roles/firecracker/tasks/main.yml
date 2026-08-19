@@ -94,19 +94,21 @@
     src: "/tmp/firecracker-{{ fc_release }}.tgz"
     dest: /usr/local/bin
     remote_src: true
-    creates: "/usr/local/bin/firecracker-{{ fc_release }}"
+    extra_opts:
+      - --strip-components=1
+    creates: "/usr/local/bin/firecracker-{{ fc_release }}-{{ fc_arch }}"
   args:
-    creates: "/usr/local/bin/firecracker-{{ fc_release }}"
+    creates: "/usr/local/bin/firecracker-{{ fc_release }}-{{ fc_arch }}"
 
 - name: firecracker — symlink current fc_version binaries onto PATH
   ansible.builtin.file:
-    src: "/usr/local/bin/firecracker-{{ fc_release }}"
-    dest: "{{ item }}"
+    src: "/usr/local/bin/{{ item.src }}-{{ fc_release }}-{{ fc_arch }}"
+    dest: "{{ item.dest }}"
     state: link
     force: true
   loop:
-    - /usr/local/bin/firecracker
-    - /usr/local/bin/jailer
+    - { dest: /usr/local/bin/firecracker, src: firecracker }
+    - { dest: /usr/local/bin/jailer, src: jailer }
 
 - name: firecracker — ensure kernel build dependencies
   ansible.builtin.package:
@@ -193,13 +195,13 @@
     state: present
 
 - name: firecracker — build kernel (vmlinux) with 4 jobs
-  ansible.builtin.command: make -j4 ARCH=x86_64 CROSS_COMPILE= olddefconfig 2>&1
+  ansible.builtin.command: make -j4 ARCH=x86_64 CROSS_COMPILE= olddefconfig
   args:
     chdir: /usr/src/linux-{{ fc_kernel_version }}
     creates: "/usr/src/linux-{{ fc_kernel_version }}/vmlinux"
 
 - name: firecracker — build vmlinux
-  ansible.builtin.command: make -j4 ARCH=x86_64 CROSS_COMPILE= bzImage 2>&1
+  ansible.builtin.command: make -j4 ARCH=x86_64 CROSS_COMPILE= bzImage
   args:
     chdir: /usr/src/linux-{{ fc_kernel_version }}
     creates: "/usr/src/linux-{{ fc_kernel_version }}/arch/x86/boot/bzImage"

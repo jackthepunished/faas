@@ -28,6 +28,11 @@
   ansible.builtin.include_tasks: wireguard.yml
   when: faas_overlay_provider == "wireguard"
 
+- name: overlay — use provider-native static network (provider=static)
+  ansible.builtin.debug:
+    msg: "Using the provider-native network on {{ faas_overlay_iface }}; no overlay daemon will be installed."
+  when: faas_overlay_provider == "static"
+
 # The internal PKI is role-based (schedd.faas / vmmd.faas), while the
 # manifest carries the actual overlay address. Keep those concerns
 # separate: the generated inventory supplies this list and every box
@@ -54,6 +59,14 @@
 # in favour of a tailscale ACL only; for the one-box prod shape
 # both layers stay defensive.
 - name: overlay — open vmmd port on overlay interface (nftables)
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: overlay — write vmmd port rule on overlay interface (nftables)
   ansible.builtin.copy:
     dest: /etc/nftables.d/faas-overlay.nft
     owner: root

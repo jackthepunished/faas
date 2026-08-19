@@ -5,7 +5,7 @@
 #
 # Kernel source and config:
 # - kernel source: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.x.tar.xz
-# - FC kernel config: https://raw.githubusercontent.com/firecracker-microvm/firecracker/v{{ fc_release }}/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config
+# - FC kernel config: https://raw.githubusercontent.com/firecracker-microvm/firecracker/{{ fc_release }}/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config
 # - Required config change: CONFIG_BLK_DEV_VIRTIO=y (must be built-in, not module)
 #
 # Build deps: make, gcc, flex, bison, libssl-dev, libelf-dev, bc, kmod, cpio, xz
@@ -24,4 +24,4 @@ fc_kernel_tar_sha256: "60c70cdd70ddee384c004242e67844e3dd1fe28f75b26b3586859fff0
 # on subsequent runs. CI regenerates this and updates the role default
 # only when the FC kernel config source changes.
 fc_kernel_sha256: "REPLACE_WITH_SHA256_OF_BUILT_KERNEL"
-fc_kernel_config_url: "https://raw.githubusercontent.com/firecracker-microvm/firecracker/v{{ fc_release }}/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+fc_kernel_config_url: "https://raw.githubusercontent.com/firecracker-microvm/firecracker/{{ fc_release }}/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"

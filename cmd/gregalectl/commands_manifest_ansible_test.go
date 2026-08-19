@@ -49,6 +49,12 @@ func TestRenderManifestAnsibleFiles_DerivesRouting(t *testing.T) {
 	if !strings.Contains(computeVars, `faas_vmmd_target_url: "tcp://vmmd.faas:50051"`) {
 		t.Errorf("compute host vars missing derived target:\n%s", computeVars)
 	}
+	if !strings.Contains(computeVars, `overlay_cidrs: ["10.42.0.0/24"]`) {
+		t.Errorf("compute host vars missing manifest overlay CIDR:\n%s", computeVars)
+	}
+	if !strings.Contains(computeVars, `faas_overlay_provider: "wireguard"`) || !strings.Contains(computeVars, "faas_overlay_iface: wg0") {
+		t.Errorf("compute host vars missing manifest overlay provider/interface:\n%s", computeVars)
+	}
 	if !strings.Contains(computeVars, `10.42.0.1"`) || !strings.Contains(computeVars, `schedd.faas`) {
 		t.Errorf("compute host vars missing control-plane private alias:\n%s", computeVars)
 	}
