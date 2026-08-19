@@ -1,23 +1,25 @@
 //go:build !no_pg
 
-// Migration-apply test for 00296_triggers.sql (unified Trigger primitive,
+// Migration-apply test for 00297_triggers.sql (unified Trigger primitive,
 // closes #757).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00296 (no goose
-//     duplicate-version panic). Slot 00296 is the next free real
-//     after 00295 (held by main's PR #978 validate_mode 00293 + slot
-//     fences 00294/00295; 00288-00292 are PR #978's cross-PR slot
-//     fences bridging PR #910; 00287 belongs to PR #963
-//     pg_ratelimit_add_rule_scope on main). PR #910's trigger chain
-//     renumbered 287→290→296 across rebase cycles:
+//  1. Migration set applies cleanly through 00297 (no goose
+//     duplicate-version panic). Slot 00297 is the next free real
+//     after 00296 (held by open PR #986 ADR-120 domain doctor
+//     00296_domain_doctor_observations; 00288-00295 are PR #978's
+//     cross-PR slot fences bridging PR #910; 00287 belongs to PR
+//     #963 pg_ratelimit_add_rule_scope on main). PR #910's trigger
+//     chain renumbered 287→290→296→297 across rebase cycles:
 //
-//     287 → 290 → 296 (final)
+//     287 → 290 → 296 → 297 (final)
 //
 //     Future renumbering must re-verify `git ls-tree origin/main
-//     migrations/` after every rebase per
-//     migration-gates-collision-and-replay.md.
+//     migrations/` AND the open-PR fence landscape
+//     (`gh pr list --state open --json files`) after every rebase
+//     per migration-gates-collision-and-replay.md +
+//     cross-pr-slot-precheck-pr-867-collision-2026-08-13.
 //
 //  2. The three new tables exist with the expected columns + types:
 //     triggers          (id, account_id, app_id, kind, slug, enabled,
@@ -129,19 +131,19 @@ func pinTableExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, table
 	return exists
 }
 
-func TestMigrations_00296_Triggers(t *testing.T) {
+func TestMigrations_00297_Triggers(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00296 should land last.
+	// (1) Run the full migration set. 00297 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00295 main fence and 00296 triggers)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 00296 PR #986 domain_doctor and 00297 triggers)", err)
 	}
 
 	// (2) Tables exist.
 	for _, table := range []string{"triggers", "trigger_records", "trigger_dead_letter"} {
 		if !pinTableExists(t, ctx, pool, table) {
-			t.Errorf("table %q does not exist after migration 00296", table)
+			t.Errorf("table %q does not exist after migration 00297", table)
 		}
 	}
 

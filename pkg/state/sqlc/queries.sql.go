@@ -1336,6 +1336,19 @@ func (q *Queries) DeleteDataUpstreamByID(ctx context.Context, db DBTX, id pgtype
 	return err
 }
 
+const deleteOIDCExchangedToken = `-- name: DeleteOIDCExchangedToken :exec
+delete from oidc_exchanged_tokens where id = $1
+`
+
+// Operator-driven revoke path (PR-C). Returns 0 rows on miss;
+// the caller maps that to ErrNotFound. The 5-min TTL is the
+// natural expiry path; Delete is the "kill this CI job's
+// credential now" lever.
+func (q *Queries) DeleteOIDCExchangedToken(ctx context.Context, db DBTX, id pgtype.UUID) error {
+	_, err := db.Exec(ctx, deleteOIDCExchangedToken, id)
+	return err
+}
+
 const deleteTrigger = `-- name: DeleteTrigger :exec
 delete from triggers where id = $1 and app_id = $2
 `
@@ -1347,19 +1360,6 @@ type DeleteTriggerParams struct {
 
 func (q *Queries) DeleteTrigger(ctx context.Context, db DBTX, arg DeleteTriggerParams) error {
 	_, err := db.Exec(ctx, deleteTrigger, arg.ID, arg.AppID)
-	return err
-}
-
-const deleteOIDCExchangedToken = `-- name: DeleteOIDCExchangedToken :exec
-delete from oidc_exchanged_tokens where id = $1
-`
-
-// Operator-driven revoke path (PR-C). Returns 0 rows on miss;
-// the caller maps that to ErrNotFound. The 5-min TTL is the
-// natural expiry path; Delete is the "kill this CI job's
-// credential now" lever.
-func (q *Queries) DeleteOIDCExchangedToken(ctx context.Context, db DBTX, id pgtype.UUID) error {
-	_, err := db.Exec(ctx, deleteOIDCExchangedToken, id)
 	return err
 }
 
@@ -2007,6 +2007,65 @@ func (q *Queries) InsertDataUpstreamProbe(ctx context.Context, db DBTX, arg Inse
 	return err
 }
 
+const insertOIDCExchangedToken = `-- name: InsertOIDCExchangedToken :one
+insert into oidc_exchanged_tokens
+    (account_id, token_hash, expires_at, issuer_url, subject,
+     audience, jti)
+values ($1, $2, $3, $4, $5, $6, $7)
+returning id, account_id, token_hash, expires_at, issuer_url,
+          subject, audience, coalesce(jti, '') as jti,
+          created_at
+`
+
+type InsertOIDCExchangedTokenParams struct {
+	AccountID pgtype.UUID
+	TokenHash []byte
+	ExpiresAt pgtype.Timestamptz
+	IssuerUrl string
+	Subject   string
+	Audience  []string
+	Jti       pgtype.Text
+}
+
+type InsertOIDCExchangedTokenRow struct {
+	ID        pgtype.UUID
+	AccountID pgtype.UUID
+	TokenHash []byte
+	ExpiresAt pgtype.Timestamptz
+	IssuerUrl string
+	Subject   string
+	Audience  []string
+	Jti       string
+	CreatedAt pgtype.Timestamptz
+}
+
+// Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
+// Returns the full row (with created_at server-stamped).
+func (q *Queries) InsertOIDCExchangedToken(ctx context.Context, db DBTX, arg InsertOIDCExchangedTokenParams) (InsertOIDCExchangedTokenRow, error) {
+	row := db.QueryRow(ctx, insertOIDCExchangedToken,
+		arg.AccountID,
+		arg.TokenHash,
+		arg.ExpiresAt,
+		arg.IssuerUrl,
+		arg.Subject,
+		arg.Audience,
+		arg.Jti,
+	)
+	var i InsertOIDCExchangedTokenRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.IssuerUrl,
+		&i.Subject,
+		&i.Audience,
+		&i.Jti,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertTriggerDeadLetter = `-- name: InsertTriggerDeadLetter :exec
 insert into trigger_dead_letter (record_id, trigger_id, reason, routed_to, detail)
 values ($1, $2, $3, $4, $5::jsonb)
@@ -2082,65 +2141,6 @@ func (q *Queries) InsertTriggerRecord(ctx context.Context, db DBTX, arg InsertTr
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
-}
-
-const insertOIDCExchangedToken = `-- name: InsertOIDCExchangedToken :one
-insert into oidc_exchanged_tokens
-    (account_id, token_hash, expires_at, issuer_url, subject,
-     audience, jti)
-values ($1, $2, $3, $4, $5, $6, $7)
-returning id, account_id, token_hash, expires_at, issuer_url,
-          subject, audience, coalesce(jti, '') as jti,
-          created_at
-`
-
-type InsertOIDCExchangedTokenParams struct {
-	AccountID pgtype.UUID
-	TokenHash []byte
-	ExpiresAt pgtype.Timestamptz
-	IssuerUrl string
-	Subject   string
-	Audience  []string
-	Jti       pgtype.Text
-}
-
-type InsertOIDCExchangedTokenRow struct {
-	ID        pgtype.UUID
-	AccountID pgtype.UUID
-	TokenHash []byte
-	ExpiresAt pgtype.Timestamptz
-	IssuerUrl string
-	Subject   string
-	Audience  []string
-	Jti       string
-	CreatedAt pgtype.Timestamptz
-}
-
-// Fresh-token insert. The id is server-minted by sqlc (gen_random_uuid).
-// Returns the full row (with created_at server-stamped).
-func (q *Queries) InsertOIDCExchangedToken(ctx context.Context, db DBTX, arg InsertOIDCExchangedTokenParams) (InsertOIDCExchangedTokenRow, error) {
-	row := db.QueryRow(ctx, insertOIDCExchangedToken,
-		arg.AccountID,
-		arg.TokenHash,
-		arg.ExpiresAt,
-		arg.IssuerUrl,
-		arg.Subject,
-		arg.Audience,
-		arg.Jti,
-	)
-	var i InsertOIDCExchangedTokenRow
-	err := row.Scan(
-		&i.ID,
-		&i.AccountID,
-		&i.TokenHash,
-		&i.ExpiresAt,
-		&i.IssuerUrl,
-		&i.Subject,
-		&i.Audience,
-		&i.Jti,
-		&i.CreatedAt,
-	)
-	return i, err
 }
 
 const instanceByID = `-- name: InstanceByID :one
