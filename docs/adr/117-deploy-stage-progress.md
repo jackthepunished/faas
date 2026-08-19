@@ -81,11 +81,13 @@ readiness}`. The column is owned entirely by the new
 directly. The closed enum is enforced at the database layer so a
 rogue writer can't insert an out-of-vocabulary stage.
 
-Migration: `migrations/00296_deployments_stage_state.sql`
+Migration: `migrations/00300_deployments_stage_state.sql`
 (append-only; mirrors the `00286` / `00287` jsonb+CHECK pattern).
-The migration is paired with `migrations/00296_reserve_slot.sql`
-(fence first, per the cross-PR slot fence pattern from
-[[cross-pr-slot-fence-reservation-fence-pattern]]).
+Initial draft used slot `00296` with the cross-PR slot fence
+pattern; the slot was renumbered to `00300` post-review because
+main `b3d4cf7c` carries a `00296_reserve_slot.sql` reservation
+fence for PR #986 (ADR-120 domain doctor) — see
+[[cross-pr-slot-precheck-pr-867-collision-2026-08-13]].
 
 ### AppendDeploymentStage semantics
 
@@ -204,7 +206,7 @@ versa).
 
 - ~600 LOC across ~12 files (migration + state + imaged/builderd
   + apid SSE + CLI ticker + tests + ADR).
-- 1 new migration slot (00296) + 1 ADR.
+- 1 new migration slot (00300) + 1 ADR.
 - The Go-side read-modify-write in `AppendDeploymentStage` is a
   small race window — two concurrent transitions on the same
   deployment row could lose a stage. The existing
@@ -311,4 +313,4 @@ touched at the pure-Go transition emitters only.
 
 ~600-700 LOC across ~12 files (migration + state + imaged/builderd
 + apid SSE + CLI ticker + tests + ADR), one new migration slot
-(00296), no new deps, no SDK breakage.
+(00300), no new deps, no SDK breakage.

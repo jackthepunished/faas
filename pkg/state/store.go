@@ -2941,13 +2941,13 @@ type Store interface {
 	// the read path without spinning Postgres.
 	InsertAuditLog(ctx context.Context, entry AuditLog) error
 
-	// AppendDeploymentStage (ADR-117, migration 00296) appends a
+	// AppendDeploymentStage (ADR-117, migration 00300) appends a
 	// closed stage transition to deployments.stage_state and returns
 	// the new row. The `from` and `to` parameters are the
 	// customer-visible `StageName` vocabulary (NOT `DeploymentStatus`
 	// — they collapse the imaging+snapshotting micro-states onto one
 	// `image_build` step); see pkg/state/types.go:89 for the closed
-	// set and migrations/00296_deployments_stage_state.sql for the
+	// set and migrations/00300_deployments_stage_state.sql for the
 	// schema CHECK that enforces it.
 	//
 	// Callers MUST pass `from != to`. Failure stamps go through

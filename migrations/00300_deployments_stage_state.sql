@@ -1,8 +1,8 @@
--- filename: 00296_deployments_stage_state.sql
+-- filename: 00300_deployments_stage_state.sql
 -- +goose Up
 -- +goose StatementBegin
 
--- 00296_deployments_stage_state.sql — ADR-117 (deploy-stage-progress).
+-- 00300_deployments_stage_state.sql — ADR-117 (deploy-stage-progress).
 --
 -- Adds a `stage_state jsonb` column on `deployments` so the SSE
 -- `event: stage` frame can carry per-stage timestamps server-side.
@@ -50,7 +50,7 @@ ALTER TABLE deployments
 -- lands as SQLSTATE 23514 check_violation at write time rather than
 -- leaking as a wire-frame typo. The exact constraint name is
 -- `deployments_stage_state_current_check` — pinned in
--- 00296_deployments_stage_state_test.go so a future renaming of the
+-- 00300_deployments_stage_state_test.go so a future renaming of the
 -- inline CHECK surfaces here, not as a silent no-op.
 DO $$
 BEGIN

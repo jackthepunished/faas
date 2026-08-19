@@ -2437,7 +2437,7 @@ func (h *Handler) transition(ctx context.Context, depID string, status state.Dep
 	return nil
 }
 
-// transitionWithStage (ADR-117, migration 00296) is the single
+// transitionWithStage (ADR-117, migration 00300) is the single
 // chokepoint for status changes that ALSO advance the customer-UX
 // stage projection (deployments.stage_state). It maps the internal
 // state-machine status (pending/building/imaging/snapshotting/live)

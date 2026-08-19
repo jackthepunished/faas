@@ -5073,7 +5073,7 @@ func TestMemStore_ListAllEventsPaged_ValidSubject(t *testing.T) {
 // (ADR-117 §3 + PR-A review fixes): forward transition, failure
 // stamp on the in-flight stage, terminal close, and the stale-read
 // guard. The PGStore path is exercised by the JSONB + CHECK migration
-// test (migrations/00296_deployments_stage_state_test.go); the
+// test (migrations/00300_deployments_stage_state_test.go); the
 // in-memory store mirrors the same shape so the same test contract
 // fits both backends.
 func TestMemStoreAppendDeploymentStage(t *testing.T) {
