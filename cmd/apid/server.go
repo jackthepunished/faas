@@ -992,6 +992,13 @@ func (s *server) handler() http.Handler {
 	// 404-on-pending drilldown shape.
 	mux.HandleFunc("GET /v1/deployments/{id}/secret-scan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentSecretScan))))
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.streamDeploymentLogs))))
+	// Per-deployment closed-stage summary (issue #985 follow-up).
+	// Companion to /logs — same auth chain (authLimited + requireMFA +
+	// read scope), same IDOR posture (cross-account → 404). The body
+	// is the raw deployments.stage_state jsonb re-emitted verbatim;
+	// the closed-6-stage vocabulary is enforced by the migration's
+	// CHECK constraint, so the handler does no Go-side decoding.
+	mux.HandleFunc("GET /v1/deployments/{id}/stages", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getDeploymentStages))))
 	// Issue #557 closure / ADR-072 — PATCH the per-deployment floor
 	// (MinInstances). Reuses the deploy-write scope (the only mutable
 	// field is the floor; image / digest / overrides / sidecars stay

@@ -630,6 +630,72 @@ export class DeploymentsService {
     });
   }
   /**
+   * Get per-deploy closed-stage summary (ADR-117 follow-up).
+   * Returns the closed 6-stage summary for a deployment. Companion
+   * to `/v1/deployments/{id}/logs` (which streams `event: stage`
+   * frames during a live deploy) and `/v1/deployments/{id}` (which
+   * returns the typed deployment row). This endpoint serves the
+   * post-stream summary use case — `gregale deploys show <id>` and
+   * the future dashboard widget.
+   *
+   * The body is the same JSON shape already stored on
+   * `deployments.stage_state` (ADR-117, migration 00302). The
+   * handler does NOT add a typed DTO — the column's jsonb IS the
+   * wire. The closed vocabulary (`source_download` /
+   * `dependency_restore` / `image_build` / `security_scan` /
+   * `snapshot_prepare` / `readiness`) is enforced at the
+   * database layer by `deployments_stage_state_current_check`,
+   * so a malformed row would never reach the wire. The
+   * `current` field is the stage the deploy is in right now;
+   * `history` lists the closed rows in transition order
+   * (oldest → newest), each carrying server-measured
+   * `duration_ms` so the CLI / dashboard don't have to trust
+   * a 2s-tick reconstruction.
+   *
+   * A 404 is returned when:
+   * - the deployment row does not exist,
+   * - the deployment belongs to a different account (IDOR-safe;
+   * no account-existence leak).
+   *
+   * @returns any The raw `deployments.stage_state` jsonb. Shape: {current, current_started_at, history: [{name, started_at, ended_at, duration_ms, status, reason}]}.
+   * @throws ApiError
+   */
+  public static getDeploymentStages({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<{
+    current?: 'source_download' | 'dependency_restore' | 'image_build' | 'security_scan' | 'snapshot_prepare' | 'readiness';
+    current_started_at?: string | null;
+    history?: Array<{
+      name?: 'source_download' | 'dependency_restore' | 'image_build' | 'security_scan' | 'snapshot_prepare' | 'readiness';
+      started_at?: string | null;
+      ended_at?: string | null;
+      duration_ms?: number;
+      status?: 'completed' | 'failed';
+      reason?: string;
+    }>;
+  }> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/deployments/{id}/stages',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `Deployment row missing or cross-account probe (IDOR-safe; never 403).`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
    * List builds (operator view).
    * Returns every build the authenticated account owns, ordered
    * started_at DESC (nulls last — queued builds stay at the

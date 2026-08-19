@@ -47,6 +47,7 @@ Commands:
   delayed-task Schedule a deferred invocation (delayed-task add|get|cancel)
   deployments  List deployments (--limit N | --before C | --all)
   deployment   Get one deployment (<id> | set-min-instances <id> --min N)
+  deploys      Read-only deploy drill-downs (deploys show <id>)
   deploy       Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)
   domains      Manage custom domains
   edge-rules   Per-app edge rules (route|rewrite|redirect|headers|cors|jwt|ip; ADR-089)
@@ -221,6 +222,16 @@ func run(args []string) int {
 		// `gregale deployment <id>` — get one. Must come before appSlugFallback
 		// so the singular is never misread as an app slug.
 		return cmdDeployment(args[1:])
+	case dispatchDeploys:
+		// ADR-117 companion read surface (post-stream stage
+		// summary). Routes to cmdDeploys in deploys_show.go,
+		// which dispatches `deploys show <id>` to the new
+		// GET /v1/deployments/{id}/stages endpoint. Distinct
+		// from the singular `deployment` (flag-shaped drill-downs)
+		// and plural `deployments` (paginated list) on purpose:
+		// the noun-form `deploys` is the read-only cluster verb
+		// for future siblings (timeline, events, artifacts).
+		return cmdDeploys(args[1:])
 	case dispatchBuild:
 		// `gregale build provenance <id>` — ADR-038 / Tier 3 / issue
 		// #197 B3.10-read half. The parent dispatch is in

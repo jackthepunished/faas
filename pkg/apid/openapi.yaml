@@ -3478,6 +3478,88 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/deployments/{id}/stages:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getDeploymentStages
+      summary: Get per-deploy closed-stage summary (ADR-117 follow-up).
+      description: |
+        Returns the closed 6-stage summary for a deployment. Companion
+        to `/v1/deployments/{id}/logs` (which streams `event: stage`
+        frames during a live deploy) and `/v1/deployments/{id}` (which
+        returns the typed deployment row). This endpoint serves the
+        post-stream summary use case — `gregale deploys show <id>` and
+        the future dashboard widget.
+
+        The body is the same JSON shape already stored on
+        `deployments.stage_state` (ADR-117, migration 00302). The
+        handler does NOT add a typed DTO — the column's jsonb IS the
+        wire. The closed vocabulary (`source_download` /
+        `dependency_restore` / `image_build` / `security_scan` /
+        `snapshot_prepare` / `readiness`) is enforced at the
+        database layer by `deployments_stage_state_current_check`,
+        so a malformed row would never reach the wire. The
+        `current` field is the stage the deploy is in right now;
+        `history` lists the closed rows in transition order
+        (oldest → newest), each carrying server-measured
+        `duration_ms` so the CLI / dashboard don't have to trust
+        a 2s-tick reconstruction.
+
+        A 404 is returned when:
+          - the deployment row does not exist,
+          - the deployment belongs to a different account (IDOR-safe;
+            no account-existence leak).
+      responses:
+        '200':
+          description: "The raw `deployments.stage_state` jsonb. Shape: {current, current_started_at, history: [{name, started_at, ended_at, duration_ms, status, reason}]}."
+          content:
+            application/json:
+              schema:
+                type: object
+                description: The raw `deployments.stage_state` jsonb. Closed-vocabulary enforcement lives at the database layer (`deployments_stage_state_current_check`).
+                properties:
+                  current:
+                    type: string
+                    enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
+                  current_started_at:
+                    type: string
+                    format: date-time
+                    nullable: true
+                  history:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                          enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
+                        started_at:
+                          type: string
+                          format: date-time
+                          nullable: true
+                        ended_at:
+                          type: string
+                          format: date-time
+                          nullable: true
+                        duration_ms:
+                          type: integer
+                          format: int64
+                        status:
+                          type: string
+                          enum: [completed, failed]
+                        reason:
+                          type: string
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Deployment row missing or cross-account probe (IDOR-safe; never 403).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Builds (ADR-038, Tier 3 / issue #197 B3.10-read half) ───────────────
   # The provenance route is the only /v1/builds surface today.
   # deployments.id remains the parent resource; Build:read scope

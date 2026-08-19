@@ -141,6 +141,15 @@ const (
 	// slug validation and dispatches to the per-leaf file
 	// (commands_inspect_upstreams.go for v1).
 	dispatchInspect = "inspect"
+
+	// Read-only post-stream drill-down verb (ADR-117 companion).
+	// Distinct from dispatchDeployment (which is the singular GET
+	// with --show-scan / --show-secret-scan drill-downs and
+	// set-min-instances) and dispatchDeployments (which is the
+	// paginated list). `deploys` is the noun-form cluster — today
+	// it has one subcommand, `show <id>`, which reads the closed
+	// 6-stage state column via GET /v1/deployments/{id}/stages.
+	dispatchDeploys = "deploys"
 )
 
 // cmdApp implements `gregale app <slug>` (GET /v1/apps/{slug}), `gregale app <slug>

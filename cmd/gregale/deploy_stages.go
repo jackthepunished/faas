@@ -224,3 +224,132 @@ func formatStageDuration(durationMs int64, status, reason string) string {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
 }
+
+// renderDeploySummary writes the closed 6-stage summary block for a
+// terminal-status deployment (live or failed). It is the read-side
+// counterpart to renderStageTicker's live view: the same row order,
+// the same labels, the same duration formatter — only the cursor
+// gymnastics are gone. A future dashboard that wants the same block
+// can call this directly with the typed state.StageState it already
+// has on hand.
+//
+// The renderer assumes the caller has already gated on output.Enabled()
+// for TTY vs static — the rows below use the same column-aligned
+// format the LiveTicker's ttyLiveTicker emits, so a non-TTY caller
+// that wants the raw text path should call writeStaticLiteOnePerStage
+// instead. For the customer use case (TTY or pipe), the alignment is
+// readable in both modes — pipe output looks the same, just without
+// redraw escapes.
+//
+// Layout:
+//
+//	  ✓  Source downloaded         1.2s
+//	  ✓  Dependencies restored     4.8s
+//	  ✓  Image built               8.1s
+//	  ✓  Security scan             2.1s
+//	  ✓  Snapshot prepared        12.6s
+//	  ✓  Readiness passed          0.4s
+//
+//	  Total: 29.1s · live since 2026-08-19 18:42 UTC
+//
+// The "live since" footer is only emitted for terminal-live
+// deployments (status: "live" on deployments.status); terminal-failed
+// and superseded deployments render an analogous "failed at …" /
+// "superseded by …" footer so the customer always sees when the
+// pipeline finished and how. Pass status as the deployment row's
+// `deployments.status` string.
+func renderDeploySummary(w io.Writer, ss state.StageState, status string, terminalAt time.Time) error {
+	if w == nil {
+		return fmt.Errorf("renderDeploySummary: nil writer")
+	}
+	if len(stageOrder) != stageOrderClosedSet {
+		return fmt.Errorf("renderDeploySummary: stageOrder has %d entries, want %d (closed set drift; CLI binary must refuse to boot)", len(stageOrder), stageOrderClosedSet)
+	}
+	if len(stageLabels) != stageOrderClosedSet {
+		return fmt.Errorf("renderDeploySummary: stageLabels has %d entries, want %d", len(stageLabels), stageOrderClosedSet)
+	}
+
+	// Build a name → StageStateItem lookup so a missing history entry
+	// (which can happen mid-deploy, before the first frame arrives)
+	// renders as the canonical "pending" row rather than a panic.
+	byName := make(map[state.StageName]state.StageStateItem, len(ss.History))
+	for _, item := range ss.History {
+		byName[item.Name] = item
+	}
+
+	var totalMs int64
+	for _, name := range stageOrder {
+		item, ok := byName[name]
+		var (
+			status  string
+			durMs   int64
+			reason  string
+		)
+		switch {
+		case !ok && ss.Current == name:
+			// The active stage hasn't been pushed to history yet;
+			// render it as in_progress with the started-at delta.
+			status = stageStatusInProgress
+			if ss.CurrentStartedAt != nil {
+				durMs = time.Since(*ss.CurrentStartedAt).Milliseconds()
+				if durMs < 0 {
+					durMs = 0
+				}
+			}
+		case ok:
+			status = item.Status
+			durMs = item.DurationMs
+			reason = item.Reason
+		default:
+			status = stageStatusPending
+		}
+		glyph := stageGlyph(status)
+		label, ok := stageLabels[name]
+		if !ok {
+			label = string(name)
+		}
+		dur := formatStageDuration(durMs, status, reason)
+		if _, err := fmt.Fprintf(w, "  %s  %-22s %s\n", glyph, label, dur); err != nil {
+			return fmt.Errorf("renderDeploySummary: write row %s: %w", name, err)
+		}
+		// Total wall-clock: sum of completed stages' DurationMs PLUS
+		// the in_progress stage's running delta. Pending stages don't
+		// contribute.
+		if status == stageStatusCompleted {
+			totalMs += durMs
+		} else if status == stageStatusInProgress && durMs > 0 {
+			totalMs += durMs
+		}
+	}
+
+	if _, err := fmt.Fprintf(w, "\n  Total: %s", formatStageDuration(totalMs, stageStatusCompleted, "")); err != nil {
+		return fmt.Errorf("renderDeploySummary: write total: %w", err)
+	}
+	if !terminalAt.IsZero() {
+		switch status {
+		case "live":
+			if _, err := fmt.Fprintf(w, " · live since %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
+				return fmt.Errorf("renderDeploySummary: write live since: %w", err)
+			}
+		case "failed":
+			if _, err := fmt.Fprintf(w, " · failed at %s", terminalAt.UTC().Format(time.RFC3339)); err != nil {
+				return fmt.Errorf("renderDeploySummary: write failed at: %w", err)
+			}
+		default:
+			// superseded / cancelled — render the raw status as a
+			// hint so the customer knows why their terminal row
+			// didn't carry the ✓ Deployed line.
+			if _, err := fmt.Fprintf(w, " · %s at %s", status, terminalAt.UTC().Format(time.RFC3339)); err != nil {
+				return fmt.Errorf("renderDeploySummary: write %s at: %w", status, err)
+			}
+		}
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return fmt.Errorf("renderDeploySummary: write footer newline: %w", err)
+	}
+	return nil
+}
+
+// stageGlyph is defined in output.go (single home for the per-status
+// glyph table — both the live ticker and the static summary render
+// use the same constant set). Imported via package main.
