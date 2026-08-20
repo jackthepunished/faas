@@ -100,6 +100,8 @@ const workloadOOMEmitMaxBody = 256
 // is the deliberate detached-ctx pattern shared with
 // cmd/meterd/main.go:981, cmd/schedd/main.go:1667,
 // cmd/vmmd/main.go:1398, and cmd/gatewayd-internal/run.go:1448.
+//
+//nolint:contextcheck // WatchOOM callers may pass nil (the cgroup.events listener is detached from the guest-init main ctx so a workload OOM at shutdown still emits). The detached ctx is intentional — the host-side destroy is the customer-visible consequence, not the caller's lifecycle.
 func EmitWorkloadOOM(parentCtx context.Context, peakMB, planMB int) error {
 	if parentCtx == nil {
 		//nolint:contextcheck // WatchOOM callers may pass nil (the cgroup.events listener is detached from the guest-init main ctx so a workload OOM at shutdown still emits). The detached ctx is intentional — the host-side destroy is the customer-visible consequence, not the caller's lifecycle.
