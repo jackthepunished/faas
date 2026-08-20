@@ -99,10 +99,11 @@ type ScheddNodeResolver interface {
 // 00083). ScheddForApp / ScheddForInstance resolve that single
 // node and behave identically to the pre-PR single-dial path.
 type scheddRouter struct {
-	store  ScheddNodeResolver
-	tlsCfg *tls.Config
-	dialer ScheddDialer
-	log    *slog.Logger
+	store                 ScheddNodeResolver
+	tlsCfg                *tls.Config
+	dialer                ScheddDialer
+	log                   *slog.Logger
+	legacySingleBoxTarget string
 
 	mu     sync.Mutex
 	cache  map[string]scheddgrpc.ScheddClient
@@ -112,8 +113,11 @@ type scheddRouter struct {
 // newScheddRouter wires the production cache. store must be
 // non-nil; tlsCfg may be nil for unix-only deployments; dialer may
 // be nil and defaults to DefaultScheddDialer. log may be nil
-// (slog.Default).
-func newScheddRouter(store ScheddNodeResolver, tlsCfg *tls.Config, dialer ScheddDialer, log *slog.Logger) *scheddRouter {
+// (slog.Default). legacySingleBoxTarget is the optional legacy
+// FAAS_SCHEDD_SOCKET override used by single-box/e2e deployments;
+// configured per-node targets remain authoritative for every other
+// compute node.
+func newScheddRouter(store ScheddNodeResolver, tlsCfg *tls.Config, dialer ScheddDialer, log *slog.Logger, legacySingleBoxTarget string) *scheddRouter {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -121,11 +125,12 @@ func newScheddRouter(store ScheddNodeResolver, tlsCfg *tls.Config, dialer Schedd
 		dialer = DefaultScheddDialer(tlsCfg)
 	}
 	return &scheddRouter{
-		store:  store,
-		tlsCfg: tlsCfg,
-		dialer: dialer,
-		log:    log,
-		cache:  map[string]scheddgrpc.ScheddClient{},
+		store:                 store,
+		tlsCfg:                tlsCfg,
+		dialer:                dialer,
+		log:                   log,
+		legacySingleBoxTarget: legacySingleBoxTarget,
+		cache:                 map[string]scheddgrpc.ScheddClient{},
 	}
 }
 
@@ -212,7 +217,17 @@ func (r *scheddRouter) clientForNode(ctx context.Context, nodeID string) (schedd
 		if n.ScheddTargetURL == nil || *n.ScheddTargetURL == "" {
 			return nil, fmt.Errorf("scheddrouter: compute_node %s (%s) has no schedd_target_url configured", n.ID, n.Name)
 		}
-		c, err := r.dialer(ctx, *n.ScheddTargetURL, r.tlsCfg)
+		target := *n.ScheddTargetURL
+		// Migration 00090 seeds default-local with the canonical
+		// production socket. Honor the legacy socket override when
+		// this is the single-box row (the e2e harness uses a temporary
+		// socket); never override a target configured for another node
+		// or an explicitly customized default-local target.
+		if n.Name == state.DefaultLocalNodeName &&
+			target == defaultLocalScheddTarget && r.legacySingleBoxTarget != "" {
+			target = r.legacySingleBoxTarget
+		}
+		c, err := r.dialer(ctx, target, r.tlsCfg)
 		if err != nil {
 			return nil, fmt.Errorf("scheddrouter: dial schedd for node %s (%s): %w", n.ID, n.Name, err)
 		}

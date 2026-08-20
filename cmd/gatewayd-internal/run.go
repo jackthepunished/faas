@@ -77,6 +77,11 @@ import (
 // compute_nodes.schedd_target_url, not from this var).
 var scheddSocket = envOrGateway("FAAS_SCHEDD_SOCKET", "/run/faas/schedd.sock")
 
+// defaultLocalScheddTarget is the target written by migration 00090 for the
+// synthetic single-box node. Keep it here as the comparison value for the
+// legacy FAAS_SCHEDD_SOCKET compatibility path in scheddrouter.go.
+const defaultLocalScheddTarget = "unix:///run/faas/schedd.sock"
+
 // gatewaydInternalSocket is the unix-domain socket schedd dials to
 // fire synthetic cron requests through gatewayd (spec §4.4, M7).
 // Mode 0660 group `faas` (ADR-015); only schedd can dial. Overridable
@@ -801,7 +806,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if hp := os.Getenv("FAAS_HOST_KEY_PATH"); hp != "" {
 		deps.hostKeyDir = filepath.Dir(hp)
 	}
-	deps.scheddRouter = newScheddRouter(pgStore, scheddTLS, nil, log)
+	deps.scheddRouter = newScheddRouter(pgStore, scheddTLS, nil, log, scheddSocket)
 	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
 	// Single-stream fallback: dial the legacy schedd socket once for
 	// the consumers that don't currently fan-in (warm hints, log
