@@ -1851,8 +1851,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, route_metrics_enabled, overflow_node, preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at, maintenance_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12::cidr[], $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1874,7 +1874,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		publicAuthMode = AppPublicAuthModeOpen
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
-		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
+		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), cidrPrefixesToArray(app.PublicAuthIPAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
 		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled, app.RouteMetricsEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
 		// UUID). nullString coerces a nil pointer or empty
@@ -3058,7 +3058,14 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- matches edge_rules_cors.allow_origins
 			   -- so the gateway reuses the matchOrigin
 			   -- matcher verbatim.
-				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end
+				   cors_default_origins = case when $55 then $56::text[] else cors_default_origins end,
+			   -- ADR-118: per-app ingress IP allowlist. Same Set-bit
+			   -- pattern as EgressAllowlist above (SetPublicAuthIPAllowlist
+			   -- distinguishes "don't touch" from "explicit empty"). The
+			   -- DB trigger at migrations/00308_apps_public_auth_ip_allowlist.sql
+			   -- rejects non-v4/v6 families and masklen /0 (defence in
+			   -- depth on top of the apid parse step).
+				   public_auth_ip_allowlist = case when $57 then $58::cidr[] else public_auth_ip_allowlist end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -3156,7 +3163,13 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// explicit-empty-must-mean-something rule as
 		// EgressAllowlist).
 		p.SetCORSDefaultEnabled, boolOrFalse(p.CORSDefaultEnabled),
-		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins))
+		p.SetCORSDefaultOrigins, derefStrings(p.CORSDefaultOrigins),
+		// ADR-118: per-app ingress IP allowlist. Same nil-pointer +
+		// Set-bit convention as EgressAllowlist above. cidrPrefixesToArray
+		// renders an empty slice as '{}' (the column DEFAULT) so a
+		// PATCH with an empty IPAllowlist + SetPublicAuthIPAllowlist=true
+		// clears the column, not the Set bit.
+		p.SetPublicAuthIPAllowlist, cidrPrefixesToArray(derefPrefixes(p.PublicAuthIPAllowlist)))
 	return scanApp(row)
 }
 
@@ -3706,15 +3719,15 @@ func (s *PgStore) ApplyProjectPlan(
 		}
 		insertAppSQL := `insert into apps
 		    (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency,
-		     status, manifest, min_instances, egress_allowlist,
+		     status, manifest, min_instances, egress_allowlist, public_auth_ip_allowlist,
 		     project_id, root_dir, workload_name, workload_class, start_command,
 			     preview_of_slug, preview_pr_number, preview_pr_state, preview_expires_at)
-		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[],
-		        $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		values ($1, $2, $3, $4, $5, $6, $7, 'active', $8::jsonb, $9, $10::cidr[], $11::cidr[],
+		        $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		returning ` + appsSelectColumns
 		row := tx.QueryRow(ctx, insertAppSQL,
 			project.AccountID, a.Slug, string(appType), runtime, ramMB, idle, maxConcurrency,
-			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist),
+			manifestBytes, a.MinInstances, cidrPrefixesToArray(a.EgressAllowlist), cidrPrefixesToArray(a.PublicAuthIPAllowlist),
 			insertedProject.ID, a.RootDir, a.WorkloadName, string(a.WorkloadClass),
 			nullString(a.StartCommand),
 			// Issue #272 / ADR-094: preview columns default to
@@ -12762,6 +12775,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var typeStr, statusStr string
 	var manifestBytes []byte
 	var allowlistText string
+	var publicAuthIPAllowlistText string
 	var workloadClassStr string
 	var scalingPolicyBytes []byte
 	// Tier A10 / ADR-088: scratch sink for the overflow_node
@@ -12777,6 +12791,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var corsDefaultEnabled bool
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
+		&publicAuthIPAllowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
 		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt,
@@ -12880,6 +12895,13 @@ func scanAppInto(a *App, row pgx.Row) error {
 		_ = json.Unmarshal(manifestBytes, &a.Manifest)
 	}
 	a.EgressAllowlist = cidrTextToPrefixes(allowlistText)
+	// ADR-118: per-app ingress IP allowlist. The column projection
+	// is public_auth_ip_allowlist::text (mirroring egress_allowlist
+	// above) so the cidr array round-trips through a stable string
+	// rendering — pgx's native cidr[] decode is fine but the text
+	// projection is consistent with the egress column's treatment
+	// and keeps the scan path single-shape.
+	a.PublicAuthIPAllowlist = cidrTextToPrefixes(publicAuthIPAllowlistText)
 	// scaling_policy: an empty jsonb ('{}'::jsonb, the column
 	// default) round-trips as a non-nil zero-length slice. The
 	// non-empty path is the customer-authored shape from
@@ -12926,6 +12948,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
+	public_auth_ip_allowlist::text,
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
