@@ -282,7 +282,7 @@ func TestHandler_WithoutForwardingFallsBackToProxyFor(t *testing.T) {
 		running:  true,
 	}
 	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	h.proxyFor = func(addr string) http.Handler {
+	h.proxyFor = func(addr string, cap int64) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			called = true
 			w.WriteHeader(http.StatusOK)

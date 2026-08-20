@@ -450,6 +450,12 @@ func TestParsePositiveInt(t *testing.T) {
 		{"-1", 0, true},
 		{"12x", 0, true},
 		{"1.5", 0, true},
+		// Review fix: the prior n<0 check caught only negative
+		// wraps; positive wraps slipped through and produced a
+		// garbage int64. PR-#996 review finding #4 (medium).
+		{"10000000000000000000", 0, true}, // 1e19 — wraps positive on int64
+		{"9223372036854775808", 0, true},  // MaxInt64 + 1 — overflows
+		{"9223372036854775807", 9223372036854775807, false}, // MaxInt64 — admit
 	}
 	for _, tc := range cases {
 		got, err := parsePositiveInt(tc.in)

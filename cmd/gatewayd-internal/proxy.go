@@ -360,7 +360,17 @@ func (a *apidProxy) proxyToApid(w http.ResponseWriter, r *http.Request) {
 
 // capWriter mirrors pkg/gateway/handler.go::capWriter for the apid
 // loopback proxy. Kept local to avoid an import cycle through
-// pkg/gateway. Issue #995 Phase 2 / ADR-121.
+// pkg/gateway. The shape is intentionally identical — same field
+// names, same atomic guards, same Write / WriteHeader / Flush
+// methods — so a future hardening applied to the canonical type
+// can be ported here without surprise. The PR #996 code review
+// flagged a drift that had already materialised: this file's
+// Write was using `if 95% { ... } else if 80% { ... }` (a single
+// fire per write) while the canonical type uses two independent
+// CAS guards (both fire when the same write crosses both). The
+// fix is to copy the canonical implementation verbatim.
+//
+// Issue #995 Phase 2 / ADR-121.
 type capWriter struct {
 	http.ResponseWriter
 	cap      int64
@@ -384,6 +394,8 @@ func (c *capWriter) Write(b []byte) (int, error) {
 		return 0, http.ErrHandlerTimeout
 	}
 	if c.written+int64(len(b)) > c.cap {
+		// Fire once; idempotent under concurrent writes thanks
+		// to disabled CAS.
 		if c.disabled.CompareAndSwap(false, true) && c.onCap != nil {
 			c.onCap()
 		}
@@ -392,14 +404,22 @@ func (c *capWriter) Write(b []byte) (int, error) {
 		}
 		return 0, http.ErrHandlerTimeout
 	}
-	// Issue #995 Phase 4 / ADR-121 — pre-Write warn-on-approach
-	// hook. 95% wins over 80% if the same Write crosses both.
+	// Pre-Write warn-on-approach hook (issue #995 Phase 4 /
+	// ADR-121). The two thresholds are independent CAS guards —
+	// both fire when the same Write crosses both boundaries.
+	// Mirrors pkg/gateway/handler.go::capWriter.Write so the
+	// behaviour matches across both surfaces.
 	if c.onWarn != nil && c.cap > 0 {
 		wouldWrite := c.written + int64(len(b))
-		if wouldWrite >= c.cap*95/100 && c.near95.CompareAndSwap(false, true) {
-			c.onWarn("near_threshold")
-		} else if wouldWrite >= c.cap*80/100 && c.near80.CompareAndSwap(false, true) {
-			c.onWarn("near_threshold")
+		if wouldWrite >= c.cap*95/100 {
+			if c.near95.CompareAndSwap(false, true) {
+				c.onWarn("near_threshold")
+			}
+		}
+		if wouldWrite >= c.cap*80/100 {
+			if c.near80.CompareAndSwap(false, true) {
+				c.onWarn("near_threshold")
+			}
 		}
 	}
 	n, err := c.ResponseWriter.Write(b)
@@ -407,4 +427,33 @@ func (c *capWriter) Write(b []byte) (int, error) {
 		c.written += int64(n)
 	}
 	return n, err
+}
+
+// WriteHeader is the buffered-cap path's primary hook (ADR-121 §2).
+// If a prior Write has already crossed the cap (the disabled flag is
+// set), the wrapper refuses to acknowledge further status codes so
+// the onCap problem+json is the only thing on the wire. Mirrors
+// pkg/gateway/handler.go::capWriter.WriteHeader — the same
+// contract, kept verbatim so a future hardening can be ported.
+func (c *capWriter) WriteHeader(statusCode int) {
+	if c.disabled.Load() {
+		return
+	}
+	c.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Flush forwards to the underlying ResponseWriter if it implements
+// http.Flusher. Mirrors pkg/gateway/handler.go::capWriter.Flush.
+// The apid loopback proxy rarely flushes mid-response (apid's
+// handlers are short JSON), but the forwarder is here for parity
+// with the canonical capWriter so a streaming apid surface (SSE
+// dashboard chips, build log stream) inherits the same flush
+// contract if it ever lands.
+func (c *capWriter) Flush() {
+	if c.disabled.Load() {
+		return
+	}
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }

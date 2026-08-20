@@ -14,12 +14,14 @@
 package gateway
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -181,5 +183,100 @@ func TestSetupBufferedCapWriter_ZeroCap_NoOp(t *testing.T) {
 func TestSetupBufferedCapWriter_ProblemCodeConstant(t *testing.T) {
 	if api.CodeResponseTooLarge != "response_too_large" {
 		t.Errorf("CodeResponseTooLarge = %q, want response_too_large", api.CodeResponseTooLarge)
+	}
+}
+
+// TestDefaultProxy_UpstreamLimitReader verifies that the
+// defaultProxy's ModifyResponse hook wraps the upstream body in
+// io.LimitReader(body, cap+1) so a runaway guest EOFs at cap+1
+// bytes. The proxy returns 200 with the upstream's full body when
+// the body is under the cap; when the body is over the cap, the
+// LimitReader shortens the body to cap+1 bytes on the wire (so the
+// downstream capWriter trips at cap+1). Issue #995 Phase 2 /
+// ADR-121 — the architectural contract from #996 review-fix
+// finding #1 (medium).
+func TestDefaultProxy_UpstreamLimitReader(t *testing.T) {
+	const cap = int64(1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Emit cap+512 bytes — well past the limit.
+		chunk := make([]byte, cap+512)
+		for i := range chunk {
+			chunk[i] = 'x'
+		}
+		_, _ = w.Write(chunk)
+	}))
+	t.Cleanup(upstream.Close)
+
+	p := defaultProxy(upstream.Listener.Addr().String(), cap)
+	if p == nil {
+		t.Fatal("defaultProxy returned nil")
+	}
+
+	// Drive the proxy through an http.Server so we read the body
+	// off the wire the same way a real client would.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: p}
+	go func() { _ = srv.Serve(l) }()
+	defer func() { _ = srv.Close() }()
+
+	resp, err := http.Get("http://" + l.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read at most cap+2 bytes. The LimitReader is supposed to
+	// short-circuit at cap+1, so the read should NOT block waiting
+	// for upstream's full cap+512 to drain.
+	readCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, cap+2))
+	_ = readCtx
+	// io.ReadAll considers an EOF mid-LimitReader an "unexpected
+	// EOF" — that's the desired behaviour here (the LimitReader
+	// short-circuited the stream at cap+1), so we accept the
+	// error and assert on body length instead.
+	if err != nil && err != io.ErrUnexpectedEOF {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	// The upstream emitted cap+512, but the LimitReader caps at
+	// cap+1, so we should see exactly cap+1 bytes.
+	if int64(len(body)) != cap+1 {
+		t.Errorf("body length: got %d, want %d (LimitReader should have capped at cap+1)", len(body), cap+1)
+	}
+}
+
+// TestDefaultProxy_NoCap_NoUpstreamGuard verifies that
+// defaultProxy(addr, 0) installs no ModifyResponse hook (the
+// downstream capWriter is the only guard). Issue #995 Phase 2 /
+// ADR-121.
+func TestDefaultProxy_NoCap_NoUpstreamGuard(t *testing.T) {
+	const fullBody = 4096
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(make([]byte, fullBody))
+	}))
+	t.Cleanup(upstream.Close)
+
+	p := defaultProxy(upstream.Listener.Addr().String(), 0)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: p}
+	go func() { _ = srv.Serve(l) }()
+	defer func() { _ = srv.Close() }()
+
+	resp, err := http.Get("http://" + l.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != fullBody {
+		t.Errorf("body length with cap=0: got %d, want %d (no upstream guard expected)", len(body), fullBody)
 	}
 }

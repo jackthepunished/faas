@@ -21,6 +21,7 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -344,6 +345,15 @@ func parsePositiveInt(s string) (int64, error) {
 	for _, r := range s {
 		if r < '0' || r > '9' {
 			return 0, fmt.Errorf("parsePositiveInt: %q", s)
+		}
+		// Standard idiomatic overflow check (see Knuth TAOCP §4.3.1,
+		// or the Go strconv.ParseInt source). The pre-multiply bound
+		// uses n > MaxInt64/10 so the case where the next digit is
+		// exactly 7 still admits MaxInt64 (9223372036854775807).
+		// The post-add check catches single-digit wraps when n is
+		// exactly MaxInt64/10 and the next digit pushes it past.
+		if n > math.MaxInt64/10 {
+			return 0, fmt.Errorf("parsePositiveInt: overflow")
 		}
 		n = n*10 + int64(r-'0')
 		if n < 0 {

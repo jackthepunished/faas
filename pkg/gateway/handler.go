@@ -505,8 +505,12 @@ type Handler struct {
 	// see the proxyByNode call site in ServeHTTP.
 	egressSink *egresssink.EgressSink
 	// proxyFor builds the reverse proxy for an upstream address; overridable in
-	// tests.
-	proxyFor func(addr string) http.Handler
+	// tests. The cap parameter is the plan-derived response body cap
+	// (Plan.MaxResponseBodyBytes()); the factory installs an
+	// io.LimitReader(resp.Body, cap+1) ModifyResponse hook so the
+	// guest EOFs at cap+1 instead of streaming past the cap.
+	// Issue #995 Phase 2 / ADR-121.
+	proxyFor func(addr string, cap int64) http.Handler
 	// proxyByNode builds the reverse proxy for a compute_node.id (issue
 	// #98 / ADR-028). When non-nil, the handler dispatches every
 	// request through it instead of proxyFor — the string returned by
@@ -3959,11 +3963,12 @@ func (h *Handler) setupStreamingWriter(w http.ResponseWriter, rec *statusRecorde
 // instead of streaming_not_available so the buffered-cap surface
 // has its own stable error contract.
 //
-// The companion upstream guard (io.LimitReader wrap on the proxy's
-// upstream body) is installed at the dispatch site in ServeHTTP
-// (handler.go:~4737) because the proxy is constructed once per
-// NodeID via h.proxyFor(target.NodeID) and the plan-derived cap
-// is only known per request.
+// The companion upstream guard (io.LimitReader wrap on the
+// upstream's response body) is installed by defaultProxy's
+// ModifyResponse hook. The cap is threaded through h.proxyFor
+// (signature changed in #996 review-fix cycle to take cap int64)
+// so the upstream LimitReader fires at cap+1 bytes. Issue #995
+// Phase 2 / ADR-121.
 func (h *Handler) setupBufferedCapWriter(w http.ResponseWriter, app App, cap int64) http.ResponseWriter {
 	if cap <= 0 {
 		return w
@@ -4903,7 +4908,7 @@ haveApp:
 		// branch above for the onCap-vs-connection-reset contract.
 		planCap := app.Plan.MaxResponseBodyBytes()
 		capped := h.setupBufferedCapWriter(w, app, planCap)
-		h.proxyFor(target.NodeID).ServeHTTP(capped, r)
+		h.proxyFor(target.NodeID, planCap).ServeHTTP(capped, r)
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
 	// per-app streaming_enabled flag (ap.StreamingEnabled,
@@ -5863,19 +5868,50 @@ var sharedUpstreamTransport = newFirstByteRoundTripper(&http.Transport{
 })
 
 // defaultProxy returns a reverse proxy to addr (spec §4.1: 60 s to first
-// response byte). The spec's "25 MB either direction" outbound cap is enforced
-// at the dispatch site in ServeHTTP via setupBufferedCapWriter (issue #995
-// Phase 2 / ADR-121). The proxy here is constructed without a per-request
-// cap — the cap is set by the caller at ServeHTTP time, which has the
-// resolved App in scope. The capWriter on the downstream side emits 413
-// response_too_large on cap-exceeded; the upstream guard that prevents the
-// guest from streaming past the cap lives in ModifyResponse (below), which
-// wraps the upstream body in an io.LimitReader at cap+1 bytes so a runaway
-// guest EOFs cleanly rather than overflowing the wrapper.
-func defaultProxy(addr string) http.Handler {
+// response byte). The spec's "25 MB either direction" outbound cap is
+// enforced at two sites (issue #995 Phase 2 / ADR-121):
+//   - Downstream: setupBufferedCapWriter, installed by ServeHTTP at
+//     the dispatch site once the resolved App is in scope.
+//   - Upstream: this function's ModifyResponse hook wraps the
+//     upstream body in io.LimitReader(body, cap+1) so the guest
+//     EOFs at cap+1 bytes instead of streaming past the cap. The
+//     cap parameter threads through h.proxyFor(addr, cap); cap<=0
+//     disables the upstream guard.
+//
+// The proxy is constructed once per (addr, cap) pair; the cap is
+// set by the caller at ServeHTTP time. The downstream capWriter
+// emits 413 response_too_large on cap-exceeded; the upstream
+// LimitReader prevents the guest from wasting CPU + egress after
+// the cap fires.
+func defaultProxy(addr string, cap int64) http.Handler {
 	target := &url.URL{Scheme: "http", Host: addr}
 	p := httputil.NewSingleHostReverseProxy(target)
 	p.Transport = sharedUpstreamTransport
+	// Issue #995 Phase 2 / ADR-121 — the upstream guard. Wrap the
+	// upstream's response body in io.LimitReader(body, cap+1) so a
+	// runaway guest EOFs cleanly at cap+1 bytes instead of
+	// continuing to stream into the downstream capWriter. The
+	// downstream capWriter still emits 413 response_too_large on
+	// its side; this hook is the upstream-side defence so the
+	// guest's bytes stop flowing as soon as the cap is reached.
+	//
+	// cap <= 0 means no upstream guard (mirrors setupBufferedCapWriter's
+	// no-op behaviour for a missing plan). The downstream capWriter
+	// already guards against runaway bytes; the upstream LimitReader
+	// just prevents the guest from wasting CPU + egress after the
+	// cap has fired.
+	if cap > 0 {
+		limit := cap + 1
+		p.ModifyResponse = func(resp *http.Response) error {
+			if resp.Body != nil {
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.LimitReader(resp.Body, limit), resp.Body}
+			}
+			return nil
+		}
+	}
 	return p
 }
 
