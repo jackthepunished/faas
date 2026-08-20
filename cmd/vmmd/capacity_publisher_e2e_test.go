@@ -141,6 +141,13 @@ func (f *fakeSinkSchedAPI) DestroyForLivenessFailure(context.Context, string, st
 	return nil
 }
 
+// DestroyForWorkloadOOMFailure (Cluster C / ADR-121) — stub
+// to satisfy the SchedAPI interface; the capacity e2e tests
+// never exercise the ReportWorkloadOOM RPC path.
+func (f *fakeSinkSchedAPI) DestroyForWorkloadOOMFailure(context.Context, string, int, int) error {
+	return nil
+}
+
 // bufconnStreamer is a capacityStreamer backed by a bufconn
 // dialer. Construct one with newBufconnStreamer(t) inside a
 // test and pass it to runCapacityPublishWithStreamer.

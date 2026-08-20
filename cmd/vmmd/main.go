@@ -234,6 +234,17 @@ const metricsPath = "/metrics"
 // wedged.
 const ReportLivenessFailedCtxTimeout = 3 * time.Second
 
+// ReportWorkloadOOMCtxTimeout (Cluster C / ADR-121) caps the
+// vmmd→schedd drain for the workload-OOM RPC. The wire path
+// is best-effort (the guest-init listener exits on its end
+// after one emit; the workload is dead, the VM is about to be
+// torn down) so 3 s matches the liveness constant — a wedged
+// schedd surfaces as a Warn log, the vmmd loop exits cleanly
+// on its end, and the customer's deployment was going to
+// fail anyway (the stamp path on the guest side is the source
+// of truth).
+const ReportWorkloadOOMCtxTimeout = 3 * time.Second
+
 func main() {
 	wire.Daemon("vmmd", run)
 }
@@ -1201,6 +1212,62 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log.Info("vmmd: liveness-failed relay wired",
 			"target", deps.scheddTarget,
 			"timeout", ReportLivenessFailedCtxTimeout.String())
+	}
+
+	// Cluster C / ADR-121: vmmd → schedd drain for the
+	// workload-OOM signal. The framework_ready receiver
+	// (cmd/vmmd/framework_ready_recv.go) invokes
+	// Manager.ReportWorkloadOOM when a guest-init
+	// cgroup.events listener detects an oom_kill on the
+	// per-VM cgroup v2 leaf and emits DGRAM type=0x05.
+	// The relay dials schedd over the same gRPC channel as
+	// the liveness relay (deps.scheddTarget +
+	// deps.scheddClientTLS), calls
+	// scheddpb.ReportWorkloadOOM, and ignores the returned
+	// ack — schedd's
+	// Engine.DestroyForWorkloadOOMFailure is the source of
+	// truth for the stamp, and the guest-init listener has
+	// already exited on its end.
+	//
+	// Why a fresh dial per call: same rationale as the
+	// liveness relay above (failure is rare, fire-and-forget,
+	// connection-pool cost negligible). The dial is bounded
+	// by ReportWorkloadOOMCtxTimeout so a wedged schedd
+	// doesn't bleed back into the framework_ready dispatch
+	// loop.
+	//
+	// Skipping on the single-box default-local path
+	// (deps.scheddTarget == ""): mirrors the liveness
+	// relay gating. The framework_ready receiver still
+	// parses + dispatch type=0x05 DGRAMs (the type
+	// validation is host-local), but the sink is a no-op.
+	if deps.scheddTarget != "" {
+		mgr.WithWorkloadOOMSink(func(ctx context.Context, instanceID string, peakMB, planMB int) {
+			dialCtx, cancel := context.WithTimeout(ctx, ReportWorkloadOOMCtxTimeout)
+			defer cancel()
+			conn, err := wire.DialContext(dialCtx, deps.scheddTarget, deps.scheddClientTLS)
+			if err != nil {
+				log.Warn("vmmd: workload-OOM dial failed; engine will not be notified",
+					"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB, "err", err)
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			cli := scheddpb.NewScheddClient(conn)
+			if _, err := cli.ReportWorkloadOOM(dialCtx, &scheddpb.ReportWorkloadOOMRequest{
+				InstanceId: instanceID,
+				PeakMb:     uint32(peakMB),
+				PlanMb:     uint32(planMB),
+			}); err != nil {
+				log.Warn("vmmd: ReportWorkloadOOM RPC failed",
+					"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB, "err", err)
+				return
+			}
+			log.Info("vmmd: workload-OOM drained to schedd",
+				"instance_id", instanceID, "peak_mb", peakMB, "plan_mb", planMB)
+		})
+		log.Info("vmmd: workload-OOM relay wired",
+			"target", deps.scheddTarget,
+			"timeout", ReportWorkloadOOMCtxTimeout.String())
 	}
 
 	// ADR-055 / Tier 1 Phase 4: the per-host egress policy watcher.
