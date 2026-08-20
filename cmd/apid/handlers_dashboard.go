@@ -2082,15 +2082,29 @@ func parseDomainDoctorPath(rest string) (string, string, bool) {
 	if slug == "" || after == "" {
 		return "", "", false
 	}
-	// Strip the trailing /doctor suffix if present. We use
-	// HasPrefix rather than slicing so a future sub-tab shape
-	// like /domains/{domain}/doctor/logs can be added without
-	// breaking this parser.
+	// Match the /doctor suffix. Three cases land here:
+	//   1. /doctor (exact)                — this parser owns it
+	//   2. /doctor/{tab} (future sub-tab) — fall through to a
+	//      sibling dispatcher (this function stays untouched when
+	//      that lands)
+	//   3. anything else                   — fall through to
+	//      renderAppDetail
+	// We split on /doctor so a sub-tab can claim the part after
+	// /doctor without touching this function. Review-fix #4 caught
+	// the prior HasSuffix-only implementation rejecting sub-tabs
+	// despite the comment promising the opposite.
 	const doctorTail = "/doctor"
-	if !strings.HasSuffix(after, doctorTail) {
+	idx := strings.Index(after, doctorTail)
+	if idx < 0 {
 		return "", "", false
 	}
-	domain := strings.TrimSuffix(after, doctorTail)
+	tail := after[idx+len(doctorTail):]
+	if tail != "" {
+		// Sub-tab shape (/doctor/logs, /doctor/...) — leave for
+		// a sibling dispatcher case to claim.
+		return "", "", false
+	}
+	domain := after[:idx]
 	if domain == "" || strings.Contains(domain, "/") {
 		return "", "", false
 	}
@@ -2114,15 +2128,38 @@ func parseDomainDoctorPath(rest string) (string, string, bool) {
 // http.NotFound on either failure so a cross-tenant probe
 // returns 404, not 403 (no signal that the row exists).
 func (s *server) renderDomainDoctor(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug, domain string) {
+	// Same dark-launch guard as the JSON endpoint at
+	// handlers_ext.go:1892 — without this, the dashboard renders
+	// a stale 5-check report while the CLI returns 503
+	// doctor_disabled, and the two surfaces disagree on the same
+	// operator choice. The dark-launch was a soak-only construct
+	// per ADR-120's Tier-A3 section; the operator's escape hatch
+	// MUST be visible in BOTH surfaces, not just the CLI.
+	if !api.DomainDoctorEnabled() {
+		api.WriteProblem(w, api.ErrDoctorDisabled())
+		return
+	}
 	ctx := r.Context()
 	app, err := s.store.AppBySlug(ctx, slug)
 	if err != nil || app.AccountID != acct.ID {
-		http.NotFound(w, r)
+		s.notFound(w, "no such app")
 		return
 	}
 	d, ok := s.loadDomain(w, r, acct, domain)
-	if !ok || d.AppID != app.ID {
-		http.NotFound(w, r)
+	if !ok {
+		// loadDomain already wrote the 404 problem JSON; bail
+		// without touching the ResponseWriter again — calling
+		// http.NotFound here would clobber the RFC 7807 body
+		// with text/plain '404 page not found' and change the
+		// Content-Type under the customer's browser.
+		return
+	}
+	if d.AppID != app.ID {
+		// loadDomain passed (domain belongs to acct) but the
+		// {slug} in the URL doesn't match the owning app. Same
+		// 404 posture as cross-tenant: no signal that the row
+		// exists, single write.
+		s.notFound(w, "no such domain")
 		return
 	}
 	report, err := s.buildDoctorReport(ctx, d)
