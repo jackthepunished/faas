@@ -6985,6 +6985,32 @@ func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeR
 			}
 		}
 	}
+	// kind='cache' per-app quota (ADR-122 §Decision). Mirrors the
+	// throttle shape: tighter cap than EdgeRulesPerApp because per
+	// (host, path, vary) cache rules expand the route cardinality
+	// and a single customer could otherwise pin the in-process store
+	// (pkg/gateway/response_cache.go) to a fixed-size byte ceiling
+	// with one rule per `vary_on` value. Free customers get 0 rules
+	// under EdgeRulesCachePerApp (closed-set "Free cannot cache");
+	// Hobby 1; Pro 5; Scale 20. Same FOR UPDATE lock on apps carried
+	// by the throttle count above.
+	if in.Kind == EdgeRuleKindCache && limits.EdgeRulesCachePerApp > 0 {
+		var cachePerApp int
+		if err := tx.QueryRow(ctx,
+			`select count(*) from edge_rules where app_id = $1 and kind = 'cache'`, in.AppID,
+		).Scan(&cachePerApp); err != nil {
+			return EdgeRule{}, fmt.Errorf("state: count edge_rules by kind=cache for app %s: %w", in.AppID, err)
+		}
+		if cachePerApp >= limits.EdgeRulesCachePerApp {
+			return EdgeRule{}, &EdgeRuleQuotaError{
+				Limit:      limits.EdgeRulesCachePerApp,
+				Observed:   cachePerApp,
+				Kind:       string(EdgeRuleKindCache),
+				PerAppOnly: true,
+				PerKind:    true,
+			}
+		}
+	}
 
 	actionBytes, err := json.Marshal(in.Action)
 	if err != nil {

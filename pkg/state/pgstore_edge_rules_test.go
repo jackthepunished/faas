@@ -290,6 +290,7 @@ func TestPgStore_EdgeRule_NonGeoKindStillAccepted(t *testing.T) {
 		state.EdgeRuleKindCORSA,
 		state.EdgeRuleKindJWT,
 		state.EdgeRuleKindIP,
+		state.EdgeRuleKindCache,
 	} {
 		in := pgSampleEdgeRuleParams(acct, app, "ngeo-"+strconv.Itoa(i)+".example.com")
 		in.Kind = k

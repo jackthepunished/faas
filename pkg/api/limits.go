@@ -538,6 +538,26 @@ type Limits struct {
 	// throws CodePlanEdgeRuleKindQuotaReached when this trips.
 	EdgeRulesThrottlePerApp int
 
+	// EdgeRulesCachePerApp caps how many kind='cache' rules one
+	// app may hold (ADR-122 §Decision). Mirrors the per-app
+	// per-kind shape of EdgeRulesThrottlePerApp: per (host, path,
+	// vary) cache rules can pin the in-process
+	// pkg/gateway/response_cache.go byte ceiling, so a single
+	// customer could otherwise dominate the gateway's route
+	// cardinality. Cache is NOT in EdgeRuleKind.IsPaidOnly()
+	// (geo/throttle precedent: gated by per-app count, not a
+	// per-plan bool), so the per-plan shape lives entirely in
+	// this field. The Free=0 default keeps the abuse-floor tier
+	// on cold wake every time — the upsell is the wake-elision
+	// guarantee.
+	//
+	// Per-plan: Free 0, Hobby 1, Pro 5, Scale 20. The
+	// pgstore/memstore branch under CreateEdgeRuleIfUnderQuota
+	// returns EdgeRuleQuotaError{PerKind: true, PerAppOnly: true}
+	// when this trips; apid surfaces
+	// CodePlanEdgeRuleKindQuotaReached.
+	EdgeRulesCachePerApp int
+
 	// CorsPresetsPerAccount caps how many cors_presets rows one
 	// account may own in total (account-wide + app-scoped). The
 	// cap defends against a customer pinning one preset per

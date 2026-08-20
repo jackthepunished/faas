@@ -3723,6 +3723,22 @@ const (
 	// migrations/00254_edge_rules_kind_budget.sql for the schema
 	// CHECK widening.
 	EdgeRuleKindBudget EdgeRuleKind = "budget"
+	// EdgeRuleKindCache stamps a per-(app, host, path, vary) TTL on
+	// the matched GET/HEAD response (ADR-122 §Decision). The runtime
+	// is `pkg/gateway/response_cache.go`; the gateway matcher resolves
+	// the matched rule and serves a stored body when (a) the request
+	// is unauthenticated — authed requests are a hard bypass and are
+	// never stored or served — (b) the response is cacheable
+	// (2xx/3xx, no Set-Cookie, no Cache-Control: no-store/private,
+	// body under the per-entry byte cap), and (c) the entry is fresh
+	// (or, on origin failure only, within stale_if_error_seconds).
+	// Plan-gated via EdgeRulesCachePerApp on pkg/api/limits.go
+	// (Free 0 / Hobby 1 / Pro 5 / Scale 20) — cache is NOT in
+	// IsPaidOnly() (geo/throttle precedent: gated by per-app count,
+	// not a per-plan bool). See
+	// migrations/00321_edge_rules_kind_cache.sql for the schema
+	// CHECK widening.
+	EdgeRuleKindCache EdgeRuleKind = "cache"
 )
 
 // IsValid reports whether k is a closed-set kind. New kinds land via
@@ -3734,7 +3750,7 @@ func (k EdgeRuleKind) IsValid() bool {
 		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
 		EdgeRuleKindIP, EdgeRuleKindValidate, EdgeRuleKindLimit,
 		EdgeRuleKindMaintenance, EdgeRuleKindThrottle, EdgeRuleKindGeo,
-		EdgeRuleKindBudget:
+		EdgeRuleKindBudget, EdgeRuleKindCache:
 		return true
 	}
 	return false
@@ -3958,6 +3974,47 @@ type EdgeRuleBudgetAction struct {
 	AllowOverrideHeader string `json:"allow_override_header,omitempty"`
 }
 
+// EdgeRuleCacheAction is the per-rule TTL + vary parameter set for
+// kind=cache (ADR-122 §Decision). The runtime is
+// pkg/gateway/response_cache.go::ResponseCache; the apply step is
+// pkg/gateway/handler_apply_edge_rule_cache.go. The apid-create
+// validator (pkg/api/dto.go::EdgeRuleCacheAction.Validate) enforces
+// MaxAgeSeconds/StaleIfErrorSeconds bounds and a closed VaryOn
+// vocabulary.
+//
+// MaxAgeSeconds is the fresh window in seconds (default 60, range
+// [0, 3600]). A zero value disables fresh-cache hits but still
+// permits stale-on-error within StaleIfErrorSeconds.
+//
+// StaleIfErrorSeconds is the post-fresh window in seconds during
+// which a stored entry MAY be served ONLY on origin failure (wake
+// gate failure or upstream 5xx/timeout). Hard cap 300 — exceeding
+// the cap trips Validate. Stale-while-revalidate (serving stale
+// while a refresh runs in the background) is explicitly out of
+// scope and not supported by this field.
+//
+// VaryOn is the closed set of non-credential header names whose
+// values participate in the cache key. Closed vocabulary is
+// {Accept-Language, Accept-Encoding}; Authorization, Cookie, and
+// any other credential-bearing header are hard bypasses (never a
+// key dimension) — a principal-keyed cache would be a separate ADR.
+// Empty slice means "no vary dimension beyond the URL" and is the
+// default.
+//
+// Methods is the optional method allowlist (default {GET, HEAD}).
+// Only idempotent methods are cacheable; anything outside this set
+// trips Validate.
+//
+// Per-route byte cap (1 MiB) and per-instance byte ceiling are
+// constants in pkg/gateway/response_cache.go, not per-rule knobs,
+// so a single misconfigured rule cannot blow the in-memory budget.
+type EdgeRuleCacheAction struct {
+	MaxAgeSeconds       int      `json:"max_age_seconds"`
+	StaleIfErrorSeconds int      `json:"stale_if_error_seconds"`
+	VaryOn              []string `json:"vary_on,omitempty"`
+	Methods             []string `json:"methods,omitempty"`
+}
+
 // EdgeRuleThrottleAction is the per-rule token-bucket parameter set
 // for kind=throttle (ADR-091 D20.5 amendment, issue #881). The
 // runtime is pkg/gateway/ratelimit.go::Limiter — the gateway matcher
@@ -4063,6 +4120,19 @@ type EdgeRuleAction struct {
 	// per-customer-tunable knob (`x-faas-budget-ms` by default).
 	// See EdgeRuleBudgetAction for the full per-field contract.
 	Budget *EdgeRuleBudgetAction `json:"budget,omitempty"`
+	// Cache carries the per-route TTL knobs for kind=cache
+	// (ADR-122 §Decision). MaxAgeSeconds is the fresh window
+	// (default 60, capped per pkg/api/dto.go Validate).
+	// StaleIfErrorSeconds is the post-fresh window during which a
+	// stored entry may be served after origin failure ONLY (default
+	// 300, hard cap 300). VaryOn is the closed set of non-credential
+	// header names whose values discriminate cache entries
+	// (Accept-Language / Accept-Encoding only — Authorization and
+	// cookies are hard bypasses by construction, never a key
+	// dimension). Methods is the optional method list (default
+	// {GET, HEAD}). The runtime is pkg/gateway/response_cache.go;
+	// the apply step is pkg/gateway/handler_apply_edge_rule_cache.go.
+	Cache *EdgeRuleCacheAction `json:"cache,omitempty"`
 }
 
 // EdgeRule is the in-memory row mirrored from edge_rules.
