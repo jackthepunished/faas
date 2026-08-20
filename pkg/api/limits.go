@@ -577,10 +577,31 @@ type Limits struct {
 	// size). Enforced at the apid write boundary.
 	CorsPresetMaxAllowMethods int
 	// CorsPresetMaxNameLength pins the upper bound on
-	// cors_presets.name (the migration's CHECK pins it to
+	// consumer_keys.name (the migration's CHECK pins it to
 	// 64). Surfaced here so the apid writer can reject
 	// before INSERT. Same value across plans.
 	CorsPresetMaxNameLength int
+
+	// ConsumerKeysPerApp caps how many consumer_keys rows
+	// (ADR-120 / issue #975 item #5) one app may own. The cap
+	// defends against a customer pinning one consumer key per
+	// customer-of-customer and inflating the gateway-side
+	// (app_id, prefix) hot-path lookup. Per-plan: Free 100,
+	// Hobby 100, Pro 100, Scale 1000. Same 100-per-app floor
+	// across the lower three tiers because the cardinality
+	// budget per app is a tenant-stability concern, not a
+	// tier-upgrade lever — the per-account cap scales with
+	// the upgrade ladder. apid-Validate throws
+	// CodePlanConsumerKeyQuotaReached when this trips (PR #5-B
+	// wires the writer).
+	ConsumerKeysPerApp int
+	// ConsumerKeysPerAccount caps how many consumer_keys rows
+	// one account may own in total across all its apps.
+	// Independent of ConsumerKeysPerApp so a customer with N
+	// apps under one account can split the per-account cap.
+	// Per-plan: Free 250, Hobby 250, Pro 2500, Scale 25000.
+	// Same per-app floor + 25× scale ceiling.
+	ConsumerKeysPerAccount int
 
 	// TenantSurfacesPerAccount caps how many `tenant_surfaces` rows
 	// (ADR-099 / issue #879) a single account may own. The cap
@@ -1171,6 +1192,15 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      0,
 		CorsPresetMaxAllowMethods: 0,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Free
+		// gets the 100/app floor — every plan does. The
+		// per-account ceiling stays low (250) so an abuse-tier
+		// customer can't pin one consumer key per customer-of-
+		// customer indefinitely. PR-A ships the limits; PR-B
+		// wires the writer.
+		// Free is gated to 0 consumer keys — mirrors CronLimitPerApp/OrgMembersMax 0/0 posture.
+		ConsumerKeysPerApp:     0,
+		ConsumerKeysPerAccount: 0,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		// Free customers can size per-key throttles on a small slice
 		// of their key space; large-cardinality per-key limits
@@ -1452,6 +1482,12 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      25,
 		CorsPresetMaxAllowMethods: 8,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Hobby
+		// keeps the 100/app floor; per-account cap stays at 250
+		// (same as Free — Hobby is the entry paid tier, not a
+		// big-leap on this primitive).
+		ConsumerKeysPerApp:     100,
+		ConsumerKeysPerAccount: 250,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 1000,
 		// Tenant surfaces (ADR-099 / issue #879): Hobby is the
@@ -1727,6 +1763,12 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      100,
 		CorsPresetMaxAllowMethods: 8,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Pro
+		// keeps the 100/app floor; per-account cap steps up to
+		// 2500 — a typical SaaS customer with ~25 apps × 100
+		// keys each fits comfortably with headroom.
+		ConsumerKeysPerApp:     100,
+		ConsumerKeysPerAccount: 2500,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 5000,
 		// Tenant surfaces (ADR-099 / issue #879): Pro gets 5 surfaces
@@ -1994,6 +2036,14 @@ var planLimits = map[Plan]Limits{
 		CorsPresetMaxOrigins:      500,
 		CorsPresetMaxAllowMethods: 8,
 		CorsPresetMaxNameLength:   64,
+		// Consumer keys (ADR-120 / issue #975 item #5). Scale
+		// gets the only per-app step-up — 1000 keys per app,
+		// 25000 per account. The per-app step-up mirrors the
+		// EdgeRulesPerApp 100-ceiling for Scale — both
+		// primitives are about "per-customer-of-customer"
+		// cardinality, so the upgrade ladder is one number.
+		ConsumerKeysPerApp:     1000,
+		ConsumerKeysPerAccount: 25000,
 		// Per-consumer throttle key cap (ADR-104, issue #881 Phase 3).
 		ThrottleMaxKeysPerRule: 10000,
 		// Tenant surfaces (ADR-099 / issue #879): Scale gets 25
@@ -3962,6 +4012,38 @@ func (p Plan) CorsPresetMaxNameLength() int {
 		return 0
 	}
 	return l.CorsPresetMaxNameLength
+}
+
+// ConsumerKeysPerApp (ADR-120 / issue #975 item #5) returns the
+// per-app cap on consumer_keys rows. The cap defends against a
+// customer pinning one consumer key per customer-of-customer
+// and inflating the gateway-side (app_id, prefix) hot-path
+// lookup. Per-plan: Free 100, Hobby 100, Pro 100, Scale 1000.
+// Same 100-per-app floor across the lower three tiers — the
+// cardinality budget per app is a tenant-stability concern,
+// not a tier-upgrade lever. Unknown plans fail closed (return
+// 0) so a missing plan row never silently unlocks the
+// primitive.
+func (p Plan) ConsumerKeysPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConsumerKeysPerApp
+}
+
+// ConsumerKeysPerAccount (ADR-120 / issue #975 item #5) returns
+// the per-account cap on consumer_keys rows across all of the
+// account's apps. Independent of ConsumerKeysPerApp so a
+// customer with N apps under one account can split the
+// per-account budget. Per-plan: Free 250, Hobby 250, Pro 2500,
+// Scale 25000. Same fail-closed contract as ConsumerKeysPerApp.
+func (p Plan) ConsumerKeysPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConsumerKeysPerAccount
 }
 
 // EvictionPriorityReservedAllowed (issue #475) returns true if the plan

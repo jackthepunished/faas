@@ -88,6 +88,11 @@ type MemStore struct {
 	keys      map[string]APIKey
 	keyByHash map[string]APIKey
 	apps      map[string]App
+	// consumerKeys is the ADR-120 store. Keyed by ConsumerKey.ID
+	// (UUID, generated at create time). The (appID, prefix) hot-
+	// path index is in-memory only — we walk the map on lookup
+	// (the memstore is a test fixture, not a production path).
+	consumerKeys map[string]ConsumerKey
 	// githubBindings is keyed by appID. Holds the (install_id,
 	// repo_full_name, production_branch) tuple the /oauth/callback
 	// handler writes after verifying the install against api.github.com
@@ -571,6 +576,10 @@ func NewMemStore() *MemStore {
 		alertClaimKeys:       map[string]time.Time{},
 		edgeRules:            map[string]EdgeRule{},
 		corsPresets:          map[string]CorsPreset{},
+		// ADR-120 / issue #975 item #5 — consumer keys. The map is
+		// keyed by ConsumerKey.ID; cross-tenant IDOR guards are
+		// enforced at the read methods (same as the pg path).
+		consumerKeys: map[string]ConsumerKey{},
 		// ADR-101 / issue #270 — OIDC trust policies + exchanged
 		// bearers. Start empty; tests inject rows directly.
 		oidcTrustPolicies:   map[string]OIDCTrustPolicy{},
@@ -10173,6 +10182,15 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 	// Snapshots + builds are keyed by deployment_id; resolve the
 	// deployment set first.
 	deletedDeployments := map[string]struct{}{}
+	// consumer_keys (ADR-120 / issue #975 item #5). Mirror the
+	// pgstore ON DELETE CASCADE — when an account is hard-deleted,
+	// every consumer_keys row keyed to that account goes with it.
+	// Mirrors the api_keys cascade pattern immediately below.
+	for kid, k := range m.consumerKeys {
+		if k.AccountID == id {
+			delete(m.consumerKeys, kid)
+		}
+	}
 	for did, d := range m.deployments {
 		if app, ok := m.apps[d.AppID]; ok && app.AccountID == id {
 			deletedDeployments[did] = struct{}{}
@@ -12750,6 +12768,158 @@ func uuidToPgtype(s string) pgtype.UUID {
 // consistent with pgstore.
 func pgtypeTimestamptzFromTime(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+}
+
+// Consumer keys (ADR-120 / issue #975 item #5).
+//
+// Mirror PgStore semantics exactly: same IDOR-safe WHERE
+// predicates (accountID pinned on every read), same idempotent
+// revoke (revoke-after-revoke returns the same row), same empty-
+// id error mapping. The memstore is a test fixture — if it
+// diverges from pgstore, callers validated against memstore ship
+// bugs when moved to PG. Symmetric strictness is the rule.
+
+// consumerKeyAccountIDOf returns accountID + ok=false if the
+// caller passed an empty keyID. The pg path's pgx.ErrNoRows →
+// ErrNotFound collapse gives the same observable; we mirror it
+// here so handlers don't have to special-case.
+func consumerKeyAccountIDOf(ctx context.Context, accountID, keyID string) (string, bool) {
+	_ = ctx
+	if accountID == "" || keyID == "" {
+		return "", false
+	}
+	return accountID, true
+}
+
+func (m *MemStore) CreateConsumerKey(_ context.Context, accountID, appID, name, prefix string, hash []byte, scopes []string, expiresAt *time.Time) (ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: empty account_id or app_id")
+	}
+	if len(hash) != 32 {
+		return ConsumerKey{}, fmt.Errorf("memstore: CreateConsumerKey: hash must be 32 bytes, got %d", len(hash))
+	}
+	if len(scopes) == 0 {
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: scopes cannot be empty (closed-set CHECK in 00309)")
+	}
+	if expiresAt != nil && expiresAt.Before(time.Now()) {
+		return ConsumerKey{}, errors.New("memstore: CreateConsumerKey: expires_at must be in the future (DB CHECK 00309)")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Mirror the (account_id, app_id, name) UNIQUE from 00309.
+	for _, k := range m.consumerKeys {
+		if k.AccountID == accountID && k.AppID == appID && k.Name == name {
+			return ConsumerKey{}, ErrConflict
+		}
+	}
+	k := ConsumerKey{
+		ID:        newID(),
+		AccountID: accountID,
+		AppID:     appID,
+		Name:      name,
+		Prefix:    prefix,
+		Hash:      append([]byte(nil), hash...),
+		Scopes:    append([]string(nil), scopes...),
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: expiresAt,
+	}
+	m.consumerKeys[k.ID] = k
+	return k, nil
+}
+
+func (m *MemStore) GetConsumerKeyByID(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if _, ok := consumerKeyAccountIDOf(ctx, accountID, keyID); !ok {
+		return ConsumerKey{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.consumerKeys[keyID]
+	if !ok || k.AccountID != accountID {
+		return ConsumerKey{}, ErrNotFound
+	}
+	return k, nil
+}
+
+func (m *MemStore) ListConsumerKeysForApp(ctx context.Context, accountID, appID string) ([]ConsumerKey, error) {
+	if accountID == "" || appID == "" {
+		return nil, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []ConsumerKey
+	for _, k := range m.consumerKeys {
+		if k.AccountID == accountID && k.AppID == appID {
+			out = append(out, k)
+		}
+	}
+	// Order by created_at desc to match the pg query. Stable tie-
+	// break by ID so the test fixtures are deterministic.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// RevokeConsumerKey mirrors pgstore: idempotent (revoke-after-
+// revoke returns the same row without error), ErrNotFound only if
+// the key never existed for the account.
+func (m *MemStore) RevokeConsumerKey(ctx context.Context, accountID, keyID string) (ConsumerKey, error) {
+	if _, ok := consumerKeyAccountIDOf(ctx, accountID, keyID); !ok {
+		return ConsumerKey{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.consumerKeys[keyID]
+	if !ok || k.AccountID != accountID {
+		return ConsumerKey{}, ErrNotFound
+	}
+	if k.RevokedAt == nil {
+		now := time.Now().UTC()
+		k.RevokedAt = &now
+		m.consumerKeys[k.ID] = k
+	}
+	return k, nil
+}
+
+// TouchConsumerKeyLastUsed mirrors pgstore's WHERE filter on
+// revoked_at IS NULL — best-effort observability, no failure if
+// the key was just killed.
+func (m *MemStore) TouchConsumerKeyLastUsed(ctx context.Context, keyID string) error {
+	if keyID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.consumerKeys[keyID]
+	if !ok || k.RevokedAt != nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	k.LastUsedAt = &now
+	m.consumerKeys[k.ID] = k
+	return nil
+}
+
+// ConsumerKeyByAppAndPrefix mirrors pgstore: walks the map,
+// matches on (AccountID, AppID, Prefix), collapses misses to
+// ErrNotFound. The (app_id, prefix) composite index is in-memory
+// only — the memstore is a test fixture, not a production path.
+func (m *MemStore) ConsumerKeyByAppAndPrefix(ctx context.Context, accountID, appID, prefix string) (ConsumerKey, error) {
+	_ = ctx
+	if accountID == "" || appID == "" || prefix == "" {
+		return ConsumerKey{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, k := range m.consumerKeys {
+		if k.AccountID == accountID && k.AppID == appID && k.Prefix == prefix {
+			return k, nil
+		}
+	}
+	return ConsumerKey{}, ErrNotFound
 }
 
 // memNewUUID returns a freshly-minted 16-byte UUID for the
