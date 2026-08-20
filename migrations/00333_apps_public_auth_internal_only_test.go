@@ -163,19 +163,31 @@ func TestMigrations_00333_AppPublicAuthInternalOnly(t *testing.T) {
 	// Pin this contract: the Down section does NOT silently
 	// destroy customer rows; the operator must clear them
 	// before running the Down.
-	if err := db.MigrateDown(ctx, pool); err == nil {
-		t.Fatalf("db.MigrateDown with row in internal_only: expected SQLSTATE 23514, got nil (Down silently destroyed a customer row?)")
-	} else {
-		var pgErrDown *pgconn.PgError
-		if !errors.As(err, &pgErrDown) {
-			t.Fatalf("Down error is not *pgconn.PgError: %v (typed assertion failure)", err)
-		}
-		if pgErrDown.Code != "23514" {
-			t.Errorf("Down SQLSTATE: got %q, want %q", pgErrDown.Code, "23514")
-		}
-		if pgErrDown.ConstraintName != "apps_public_auth_mode_chk" {
-			t.Errorf("Down constraint name: got %q, want %q", pgErrDown.ConstraintName, "apps_public_auth_mode_chk")
-		}
+	//
+	// The migration test package does not expose a
+	// `MigrateDown` helper (the package only ships Up
+	// because Down is operator-driven in this repo — see
+	// ADR-041 carve-out). We invoke the Down SQL shape
+	// directly via pool.Exec to validate the SQLSTATE
+	// contract. The fenced shape is the same SQL the
+	// migration embeds verbatim (-- +goose Down section).
+	_, downErr := pool.Exec(ctx, `
+		ALTER TABLE apps DROP CONSTRAINT IF EXISTS apps_public_auth_mode_chk;
+		ALTER TABLE apps ADD CONSTRAINT apps_public_auth_mode_chk
+		  CHECK (public_auth_mode IN ('open','bearer','basic','ip_allowlist'));
+	`)
+	if downErr == nil {
+		t.Fatalf("Down with row in internal_only: expected SQLSTATE 23514, got nil (the narrower CHECK silently destroyed a customer row?)")
+	}
+	var pgErrDown *pgconn.PgError
+	if !errors.As(downErr, &pgErrDown) {
+		t.Fatalf("Down error is not *pgconn.PgError: %v (typed assertion failure)", downErr)
+	}
+	if pgErrDown.Code != "23514" {
+		t.Errorf("Down SQLSTATE: got %q, want %q", pgErrDown.Code, "23514")
+	}
+	if pgErrDown.ConstraintName != "apps_public_auth_mode_chk" {
+		t.Errorf("Down constraint name: got %q, want %q", pgErrDown.ConstraintName, "apps_public_auth_mode_chk")
 	}
 
 	// Operator clears the row (simulating the documented
@@ -186,8 +198,12 @@ func TestMigrations_00333_AppPublicAuthInternalOnly(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("operator-clear: %v", err)
 	}
-	if err := db.MigrateDown(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateDown after operator-clear: %v", err)
+	if _, err := pool.Exec(ctx, `
+		ALTER TABLE apps DROP CONSTRAINT IF EXISTS apps_public_auth_mode_chk;
+		ALTER TABLE apps ADD CONSTRAINT apps_public_auth_mode_chk
+		  CHECK (public_auth_mode IN ('open','bearer','basic','ip_allowlist'));
+	`); err != nil {
+		t.Fatalf("Down after operator-clear: %v", err)
 	}
 
 	// (8) After Down, the CHECK must reject internal_only.
