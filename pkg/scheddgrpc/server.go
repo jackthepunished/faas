@@ -219,6 +219,15 @@ type SchedAPI interface {
 	// typed error path surfaces real failures
 	// (db hitches, missing rows).
 	DestroyForLivenessFailure(ctx context.Context, instanceID, reason string) error
+
+	// DestroyForWorkloadOOMFailure (Cluster C / ADR-121) is the
+	// vmmd-triggered destroy path when the customer's per-VM cgroup
+	// v2 leaf detects an oom_kill event. The handler returns nil on
+	// a non-RUNNING instance (mirrors DestroyForLivenessFailure) so
+	// a re-report from the vmmd loop is idempotent. The peak_mb /
+	// plan_mb are passed verbatim into the whycopy Observed closure
+	// so the deployment's ErrorFix lists the recommended plan size.
+	DestroyForWorkloadOOMFailure(ctx context.Context, instanceID string, peakMB, planMB int) error
 }
 
 // StatsReader is the per-instance snapshot the schedd's
@@ -565,6 +574,59 @@ func (s *Server) ReportLivenessFailed(ctx context.Context, req *scheddpb.Livenes
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &scheddpb.LivenessFailedAck{Ok: true}, nil
+}
+
+// ReportWorkloadOOM (Cluster C / ADR-121) is the vmmd-side
+// push of a workload OOM-kill detected on the customer's per-VM
+// cgroup v2 leaf. The producer chain is:
+//
+//	guest-init cgroup.events listener → vsock DGRAM
+//	  type 0x05 on port 1027 → cmd/vmmd framework_ready_recv
+//	  dispatcher → Manager.ReportWorkloadOOM → here
+//
+// Schedd's handler delegates to Engine.DestroyForWorkloadOOMFailure,
+// which eagerly marks the deployment's snapshot stale (ADR-005
+// invariant), stamps CodeAppRuntimeOOM on the deployment row
+// with the whycopy Observed payload (peakMB + planMB), and
+// transitions the instance RUNNING → STOPPED with kind
+// "workload_oom_failed".
+//
+// Idempotent (mirrors ReportLivenessFailed): if the instance is
+// no longer RUNNING, the engine returns nil and the RPC replies
+// with Ok=true. Re-reports are benign because the vmmd loop has
+// already exited on its end.
+//
+// Wire error mapping:
+//
+//   - codes.OK + Ok=true on success or no-op
+//   - codes.NotFound when the instance_id doesn't resolve
+//   - codes.Unauthenticated / codes.PermissionDenied if the
+//     ownership guard rejects (defence-in-depth)
+//   - codes.Internal for any other engine failure
+//
+// Additive per ADR-016: new RPC + new messages append at the
+// end of the proto file.
+func (s *Server) ReportWorkloadOOM(ctx context.Context, req *scheddpb.ReportWorkloadOOMRequest) (*scheddpb.ReportWorkloadOOMAck, error) {
+	const op = "ReportWorkloadOOM"
+	if _, err := authorizeInstance(ctx, s.owner, s.resolver, req.GetInstanceId()); err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	// Note: peakMB / planMB are uint32 on the wire; the engine
+	// stamps int. The cast is safe because Go's int is at least
+	// 32 bits on every supported platform (the spec §2.1 targets
+	// include 64-bit only).
+	peakMB := int(req.GetPeakMb())
+	planMB := int(req.GetPlanMb())
+	err := s.engine.DestroyForWorkloadOOMFailure(ctx, req.GetInstanceId(), peakMB, planMB)
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &scheddpb.ReportWorkloadOOMAck{Ok: true}, nil
 }
 
 // StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B

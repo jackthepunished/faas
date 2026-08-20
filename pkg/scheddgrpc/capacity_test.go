@@ -121,6 +121,11 @@ func (c *capturingEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil 
 // exercise the ReportLivenessFailed RPC path.
 func (c *capturingEngine) DestroyForLivenessFailure(_ context.Context, _, _ string) error { return nil }
 
+// DestroyForWorkloadOOMFailure (Cluster C / ADR-121) — stub to
+// satisfy the SchedAPI interface; the capacity tests don't
+// exercise the ReportWorkloadOOM RPC path.
+func (c *capturingEngine) DestroyForWorkloadOOMFailure(_ context.Context, _ string, _, _ int) error { return nil }
+
 // TestReportCapacity_RoundTrip drives two reports through the
 // wire and asserts the handler applies them to the table via
 // the SchedAPI.CapacitySink seam. The seam is the only surface
