@@ -2098,16 +2098,16 @@ const (
 	// keep-alive pool so a half-open client can't park a goroutine.
 	// Values are int seconds to match ResponseWriteTimeoutDefault's
 	// existing precedent at line 2201 — no `time` import added.
-	APIDReadTimeoutSecondsDefault     = 60  // slowloris defence (body arrival)
-	APIDWriteTimeoutSecondsDefault    = 300 // matches gatewayd-internal
-	APIDIdleTimeoutSecondsDefault     = 120 // keep-alive cap
+	APIDReadTimeoutSecondsDefault  = 60  // slowloris defence (body arrival)
+	APIDWriteTimeoutSecondsDefault = 300 // matches gatewayd-internal
+	APIDIdleTimeoutSecondsDefault  = 120 // keep-alive cap
 
 	// Gatewayd-internal defaults (issue #995 Phase 3, ADR-121
 	// companion). The public listener carries 60 s ReadTimeout
 	// (matches the legacy default set at run.go:1989-1991), with
 	// tighter caps on the control / unix-socket listener where
 	// requests are smaller and shorter-lived.
-	GatewaydInternalReadTimeoutSecondsDefault    = 60 // public listener slowloris defence
+	GatewaydInternalReadTimeoutSecondsDefault         = 60 // public listener slowloris defence
 	GatewaydInternalControlReadTimeoutSecondsDefault  = 30 // control + unix-socket
 	GatewaydInternalControlWriteTimeoutSecondsDefault = 30 // control + unix-socket
 	GatewaydInternalControlIdleTimeoutSecondsDefault  = 60 // control + unix-socket keep-alive
