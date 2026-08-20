@@ -1,4 +1,4 @@
--- 00330_repair_app_secrets_scope.sql — repair the ADR-092 schema/ledger
+-- 00336_repair_app_secrets_scope.sql — repair the ADR-092 schema/ledger
 -- split caused by the historical 00217 slot reservation. Some databases
 -- recorded 00217 before the real app_secrets scope migration was moved into
 -- that slot, so goose considers the migration applied while the column is
