@@ -61,6 +61,14 @@ type runDeps struct {
 	lvUsedPct func(ctx context.Context) (float64, error)
 	detectFC  func(ctx context.Context) (string, error)
 	now       func() time.Time
+	// configPath is the on-disk TOML path; ADR-122 introduces a
+	// minimal cmd/imaged/config.go that LoadConfig reads. Empty
+	// defaults to /etc/faas/imaged.toml in defaultDeps.
+	configPath string
+	// loadConfig is the seam tests use to inject a pre-built
+	// *Config without writing to disk. nil in production →
+	// LoadConfig(configPath).
+	loadConfig func(path string) (*Config, error)
 	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam. nil →
 	// runtimecheck.MustCheckOnBoot(capsDecl, log, nil) which
 	// exits on violation in production. Tests inject
@@ -79,9 +87,11 @@ func defaultDeps() runDeps {
 		migrate: func(ctx context.Context, pool *pgxpool.Pool) error {
 			return db.MigrateUp(ctx, pool)
 		},
-		lvUsedPct: imaged.DefaultLvFcUsedPct(imaged.LvFcName),
-		detectFC:  imaged.DetectFirecrackerVersion,
-		now:       time.Now,
+		lvUsedPct:   imaged.DefaultLvFcUsedPct(imaged.LvFcName),
+		detectFC:    imaged.DetectFirecrackerVersion,
+		now:         time.Now,
+		configPath:  "/etc/faas/imaged.toml",
+		loadConfig:  LoadConfig,
 	}
 }
 
@@ -106,14 +116,32 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// ADR-122 / follow-on to imaged env-only config (issue #995
+	// post-merge audit): load /etc/faas/imaged.toml with defaults.
+	// Missing file is not an error — the defaults produce a working
+	// daemon. The pre-existing FAAS_IMAGED_METRICS_ADDR env overlay
+	// is honoured by GetMetricsAddr below.
+	loadCfg := d.loadConfig
+	if loadCfg == nil {
+		loadCfg = LoadConfig
+	}
+	cfgPath := d.configPath
+	if cfgPath == "" {
+		cfgPath = "/etc/faas/imaged.toml"
+	}
+	imgCfg, err := loadCfg(cfgPath)
+	if err != nil {
+		return err
+	}
+
 	// Gate-B box-role gate. imaged is a compute-only daemon — it
-	// refuses to start under RoleControlPlane. The role is set
-	// from FAAS_IMAGED_ROLE at deploy time (imaged has no
-	// config.go today; the env is the only source); default is
-	// RoleSingleBox so single-box dev boots unmoved. The gate
-	// runs before d.openDB so a misconfigured boot doesn't waste
-	// a Postgres connection.
-	if err := role.Require("imaged", role.FromConfig("", "FAAS_IMAGED_ROLE"),
+	// refuses to start under RoleControlPlane. The role is resolved
+	// from TOML role (post-ADR-122) with FAAS_IMAGED_ROLE as the
+	// env-overlay (role.FromConfig falls back to the second arg
+	// when the first is empty). Default RoleSingleBox so single-box
+	// dev boots unmoved. The gate runs before d.openDB so a
+	// misconfigured boot doesn't waste a Postgres connection.
+	if err := role.Require("imaged", role.FromConfig(string(imgCfg.Role), "FAAS_IMAGED_ROLE"),
 		role.RoleSingleBox, role.RoleComputeOnly); err != nil {
 		return err
 	}
@@ -491,14 +519,26 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// the local Prometheus scrapes from the box itself. Set
 	// FAAS_IMAGED_METRICS_ADDR= to disable the listener (unit tests that
 	// don't want a port reserved).
-	metricsAddr := envOr("FAAS_IMAGED_METRICS_ADDR", "127.0.0.1:9102")
+	// ADR-122 follow-on: bind target resolves via cfg.GetMetricsAddr
+	// (env overlay wins, TOML metrics_addr is the default). Empty
+	// disables the listener — same disable semantic as the legacy
+	// env-only path (FAAS_IMAGED_METRICS_ADDR="").
+	metricsAddr := imgCfg.GetMetricsAddr(os.Getenv)
 	if metricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", ops.Handler())
+		// ADR-122: apply the canonical metrics-listener shape —
+		// RT/WT/IT/MHB from cfg.MetricsListener (cfg → constant
+		// fallback). ReadHeaderTimeout=10s stays from before ADR-122.
+		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := imgCfg.MetricsListener()
 		msrv := &http.Server{
 			Addr:              metricsAddr,
 			Handler:           mux,
 			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    int(maxHeaderBytes),
 		}
 		mlis, err := net.Listen("tcp", metricsAddr)
 		if err != nil {
