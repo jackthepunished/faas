@@ -389,6 +389,18 @@ func LoadConfig(path string) (*Config, error) {
 		DeadNodeReconcilerIntervalSeconds:  0,
 		DeadNodeReconcilerStalenessSeconds: 0,
 	}
+	applyRoutingEnv := func() {
+		// These overlays are the deployment-safe path for split-box
+		// routing: the endpoint is host-specific, while the TOML stays
+		// portable across control-plane nodes. LookupEnv is intentional
+		// for metrics so an operator can explicitly disable the scrape.
+		if v := os.Getenv("FAAS_GATEWAY_SYNTH_TARGET"); v != "" {
+			c.GatewaySynthTarget = v
+		}
+		if v, ok := os.LookupEnv("FAAS_GATEWAY_METRICS_URL"); ok {
+			c.GatewayMetricsURL = v
+		}
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -397,6 +409,7 @@ func LoadConfig(path string) (*Config, error) {
 			// TOML default. role.FromConfig falls back to
 			// RoleSingleBox when the env is unset.
 			c.Role = role.FromConfig(string(c.Role), "FAAS_SCHEDD_ROLE")
+			applyRoutingEnv()
 			return c, nil
 		}
 		return nil, fmt.Errorf("schedd: read %q: %w", path, err)
@@ -420,5 +433,6 @@ func LoadConfig(path string) (*Config, error) {
 	if v := os.Getenv("FAAS_NODE_NAME"); v != "" {
 		c.NodeName = v
 	}
+	applyRoutingEnv()
 	return c, nil
 }

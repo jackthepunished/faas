@@ -12,9 +12,10 @@ ExecStart=/opt/faas/current/bin/imaged --config /etc/faas/imaged.toml
 Restart=on-failure
 RestartSec=2s
 Slice=faas-cp.slice
-MemoryMax=1G
+MemoryMax=4G
 CapabilityBoundingSet=cap_chown cap_dac_override cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_net_bind_service cap_sys_chroot
-EnvironmentFile=/etc/faas/sealed.env
+EnvironmentFile=-/etc/faas/sealed.env
+EnvironmentFile=-/etc/faas/compute-db.env
 Environment=TMPDIR=/srv/fc/base
 Environment=FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging
 Environment=FAAS_BASE_EXTRACT_ROOT=/srv/fc/base-staging
@@ -27,7 +28,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
-ReadWritePaths=/srv/fc/snap /srv/fc/base /srv/fc/base-staging /srv/fc/scans /srv/fc/sigs /var/log/faas /var/spool/faas /dev/shm/faas-base-staging
+ReadWritePaths=/srv/fc/snap /srv/fc/base /srv/fc/base-staging /srv/fc/scans /srv/fc/sigs /var/log/faas /var/spool/faas /var/lib/faas/cache /dev/shm/faas-base-staging
 
 [Install]
 WantedBy=multi-user.target

@@ -131,7 +131,7 @@ in `vm_metal.go` (`//go:build metal`) and calls vmmd over gRPC, with
 `vm_stub.go` returning `ErrNotMetal` for non-metal builds. OCI
 puller hardened (`pkg/oci/egress.go` — denied CIDRs cover RFC1918,
 CGN, loopback, IMDS, ULA), streamed layer blobs. `cmd/imaged`
-auto-stages `/srv/fc/base/builder-base.ext4` on startup.
+auto-stages the canonical `/srv/fc/base/runner-builder-<arch>.ext4` on startup.
 
 Source-tarball staging + Dockerfile dispatch are in via PR #56
 (closes #54): `pkg/builderd/drive.go::CreateBuildDrive1` copies

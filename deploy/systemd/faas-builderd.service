@@ -13,7 +13,8 @@ Restart=on-failure
 RestartSec=2s
 Slice=faas-cp.slice
 MemoryMax=512M
-EnvironmentFile=/etc/faas/sealed.env
+EnvironmentFile=-/etc/faas/sealed.env
+EnvironmentFile=-/etc/faas/compute-db.env
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -22,7 +23,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
-ReadWritePaths=/srv/fc/builder /srv/fc/base /var/log/faas /var/spool/faas
+ReadWritePaths=/srv/fc/builder /srv/fc/base /var/log/faas /var/spool/faas /var/lib/faas/cache
 
 [Install]
 WantedBy=multi-user.target

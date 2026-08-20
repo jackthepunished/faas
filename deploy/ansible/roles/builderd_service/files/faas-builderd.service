@@ -36,6 +36,7 @@ MemoryMax=512M
 # sealed file must not turn the role-correct builder daemon into a systemd
 # 203/resources loop during first boot.
 EnvironmentFile=-/etc/faas/sealed.env
+EnvironmentFile=-/etc/faas/compute-db.env
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -45,7 +46,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
-ReadWritePaths=/srv/fc/builder /srv/fc/base /var/log/faas /var/spool/faas
+ReadWritePaths=/srv/fc/builder /srv/fc/base /var/log/faas /var/spool/faas /var/lib/faas/cache
 
 [Install]
 WantedBy=multi-user.target

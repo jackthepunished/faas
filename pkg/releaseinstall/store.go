@@ -137,7 +137,10 @@ var canonicalComputeNodeRoles = map[string]bool{
 
 // ComputeNodeRow mirrors the columns PR-6 reads from compute_nodes
 // after UpsertComputeNode. The original four fields (id, name,
-// release_id, manifest_hash) are populated by PR-6's UPSERT. The
+// release_id, manifest_hash) are populated by PR-6's UPSERT for
+// newly managed nodes; pre-release rows may still contain NULL for
+// release_id or manifest_hash and are normalized to empty strings.
+// The
 // remaining PR-3a columns (host_certificate, cert_fingerprint,
 // role, generation) are populated by their respective writers
 // (PR-X secrets init, PR-2 renderer) and exposed as nullable
@@ -440,14 +443,17 @@ func (s pgStore) GetComputeNode(ctx context.Context, name string) (ComputeNodeRo
 	if name == "" {
 		return ComputeNodeRow{}, fmt.Errorf("releaseinstall: empty compute_nodes name")
 	}
-	var row ComputeNodeRow
+	var (
+		row                     ComputeNodeRow
+		releaseID, manifestHash *string
+	)
 	err := s.pool.QueryRow(ctx, `
 		select id, name, release_id, manifest_hash,
 		       host_certificate, cert_fingerprint, role, generation
 		  from compute_nodes
 		 where name = $1
 	`, name).Scan(
-		&row.ID, &row.Name, &row.ReleaseID, &row.ManifestHash,
+		&row.ID, &row.Name, &releaseID, &manifestHash,
 		&row.HostCertificate, &row.CertFingerprint, &row.Role, &row.Generation,
 	)
 	if err != nil {
@@ -455,6 +461,12 @@ func (s pgStore) GetComputeNode(ctx context.Context, name string) (ComputeNodeRo
 			return ComputeNodeRow{}, ErrComputeNodeNotFound
 		}
 		return ComputeNodeRow{}, fmt.Errorf("releaseinstall: get compute node: %w", err)
+	}
+	if releaseID != nil {
+		row.ReleaseID = *releaseID
+	}
+	if manifestHash != nil {
+		row.ManifestHash = *manifestHash
 	}
 	return row, nil
 }
@@ -478,12 +490,21 @@ func (s pgStore) ListComputeNodes(ctx context.Context) ([]ComputeNodeRow, error)
 	defer rows.Close()
 	var out []ComputeNodeRow
 	for rows.Next() {
-		var row ComputeNodeRow
+		var (
+			row                     ComputeNodeRow
+			releaseID, manifestHash *string
+		)
 		if err := rows.Scan(
-			&row.ID, &row.Name, &row.ReleaseID, &row.ManifestHash,
+			&row.ID, &row.Name, &releaseID, &manifestHash,
 			&row.HostCertificate, &row.CertFingerprint, &row.Role, &row.Generation,
 		); err != nil {
 			return nil, fmt.Errorf("releaseinstall: scan compute_nodes: %w", err)
+		}
+		if releaseID != nil {
+			row.ReleaseID = *releaseID
+		}
+		if manifestHash != nil {
+			row.ManifestHash = *manifestHash
 		}
 		out = append(out, row)
 	}

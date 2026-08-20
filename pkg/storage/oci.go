@@ -213,13 +213,14 @@ func (o *OCIRegistryStorageBackend) RepoPrefix() string { return o.prefix }
 // OCI driver — pkg/storage.LocalStorageBackend never sees them.
 // Lifted from inline strings so the goconst lint stays quiet.
 const (
-	repoApps   = "apps"
-	repoSnap   = "snap"
-	repoBase   = "base"
-	repoLayers = "layers"
-	repoKernel = "kernel"
-	repoScans  = "scans"
-	repoSigs   = "sigs"
+	repoApps    = "apps"
+	repoSnap    = "snap"
+	repoBase    = "base"
+	repoLayers  = "layers"
+	repoKernel  = "kernel"
+	repoScans   = "scans"
+	repoSigs    = "sigs"
+	repoSources = "sources"
 )
 
 // defaultRepoPrefix is the per-namespace repo prefix the driver uses
@@ -347,6 +348,20 @@ func (o *OCIRegistryStorageBackend) plan(key string) (repo, ref string, err erro
 			return "", "", fmt.Errorf("%w: %q produces invalid OCI tag %q", ErrInvalidKey, key, tag)
 		}
 		return repoSigs + "/" + strings.Join(parts[1:len(parts)-1], "/"), tag, nil
+	case repoSources:
+		// sources/<build>.tar.gz → repo "sources", tag "<build>.tar.gz".
+		// Source archives are the split-box handoff from apid to builderd;
+		// the build UUID keeps retries idempotent without exposing a local
+		// host path in the registry namespace.
+		if len(parts) != 2 || !strings.HasSuffix(parts[1], ".tar.gz") {
+			return "", "", fmt.Errorf("%w: %q does not match sources/<build>.tar.gz", ErrInvalidKey, key)
+		}
+		buildID := strings.TrimSuffix(parts[1], ".tar.gz")
+		if !depIDCharset.MatchString(buildID) {
+			return "", "", fmt.Errorf("%w: sources build %q fails UUID charset", ErrInvalidKey, buildID)
+		}
+		tag := parts[1]
+		return repoSources, tag, nil
 	default:
 		return "", "", fmt.Errorf("%w: %q has unknown namespace %q", ErrInvalidKey, key, parts[0])
 	}
@@ -592,6 +607,8 @@ func (o *OCIRegistryStorageBackend) reposForPrefix(prefix string) []string {
 			return true
 		})
 		return out
+	case repoSources:
+		return []string{repoSources}
 	default:
 		return nil
 	}
@@ -629,6 +646,15 @@ func (o *OCIRegistryStorageBackend) unplan(repo, tag string) (string, bool) {
 			return "", false
 		}
 		return "scans/" + tag, true
+	case repoSources:
+		if !strings.HasSuffix(tag, ".tar.gz") {
+			return "", false
+		}
+		buildID := strings.TrimSuffix(tag, ".tar.gz")
+		if !depIDCharset.MatchString(buildID) || !tagCharset.MatchString(tag) {
+			return "", false
+		}
+		return "sources/" + tag, true
 	default:
 		if strings.HasPrefix(repo, repoSigs+"/") && tagCharset.MatchString(tag) {
 			return repo + "/" + tag, true

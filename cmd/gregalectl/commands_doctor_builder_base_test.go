@@ -149,6 +149,34 @@ func TestCheckBuilderBaseExt4_FilePresent(t *testing.T) {
 	}
 }
 
+// TestCheckBuilderBaseExt4_ModernDebugfsMode verifies the e2fsprogs 1.47
+// spelling used on current Debian hosts ("Mode:" rather than
+// "File mode:").
+func TestCheckBuilderBaseExt4_ModernDebugfsMode(t *testing.T) {
+	dir := t.TempDir()
+	ext4 := filepath.Join(dir, "fake.ext4")
+	if err := os.WriteFile(ext4, []byte("not a real ext4"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withBuilderBaseHooks(t, builderBaseHooks{
+		Path: ext4,
+		Stat: os.Stat,
+		LookPath: func(string) (string, error) {
+			return "/usr/sbin/debugfs", nil
+		},
+		RunDebugfs: func(_ context.Context, _, _, _ string) ([]byte, error) {
+			return []byte("Inode: 12345   Type: regular   Mode: 0755"), nil
+		},
+	})
+	findings, err := checkBuilderBaseExt4(context.Background(), &doctorDeps{})
+	if err != nil {
+		t.Fatalf("checkBuilderBaseExt4: %v", err)
+	}
+	if len(findings) != 1 || findings[0].Severity != doctorSeverityOK {
+		t.Fatalf("findings = %+v, want one ok finding", findings)
+	}
+}
+
 // TestCheckBuilderBaseExt4_FileAbsent: debugfs runs AND returns an
 // error (file does not exist in the ext4) → SeverityError. This is
 // the load-bearing case: the alpine placeholder from

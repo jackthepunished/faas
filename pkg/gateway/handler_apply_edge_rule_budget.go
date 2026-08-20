@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,18 @@ import (
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
 )
+
+// requestBudgetCancelKey carries the timer cancellation returned by
+// reqbudget.WithRemaining until Handler.ServeHTTP has finished. The budget
+// helper runs in the middle of the handler, so cancelling here would abort
+// the downstream wake/proxy work the budget is meant to bound.
+type requestBudgetCancelKey struct{}
+
+func cancelStampedRequestBudget(ctx context.Context) {
+	if cancel, ok := ctx.Value(requestBudgetCancelKey{}).(context.CancelFunc); ok && cancel != nil {
+		cancel()
+	}
+}
 
 // applyEdgeRuleBudget (ADR-093 §Decision) consults the per-host
 // edge-rule matcher for a `kind=budget` rule and stamps the
@@ -154,7 +167,9 @@ func (h *Handler) stampRequestBudget(w http.ResponseWriter, r *http.Request, app
 	route := "forward"
 	endpoint := r.Method + ":" + r.URL.Path
 	ctx, cancel, _ := reqbudget.WithRemaining(r.Context(), total, ceiling, route, endpoint)
-	defer cancel()
+	if cancel != nil {
+		ctx = context.WithValue(ctx, requestBudgetCancelKey{}, cancel)
+	}
 	*r = *r.WithContext(ctx)
 	if h.log != nil {
 		h.log.Info("budget_stamped",

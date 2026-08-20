@@ -21,6 +21,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
 
 	"github.com/google/uuid"
@@ -872,6 +873,31 @@ func TestProcessNext_EmptyQueueReturnsErrNotFound(t *testing.T) {
 	_, err := b.ProcessNext(context.Background())
 	if !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("ProcessNext empty queue: got %v, want state.ErrNotFound", err)
+	}
+}
+
+func TestMaterializeSourceFromStorage(t *testing.T) {
+	be, err := storage.NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	buildID := "550e8400-e29b-41d4-a716-446655440000"
+	want := []byte("source-from-shared-storage")
+	if err := be.Put(context.Background(), "sources/"+buildID+".tar.gz", bytes.NewReader(want)); err != nil {
+		t.Fatalf("Put source: %v", err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "builds", buildID+".tar.gz")
+	b := New(state.NewMemStore(), &fakeNotifier{}, nil, NewCache(t.TempDir()), NewDetector(), nil, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil))).WithSourceStorage(be)
+	if err := b.materializeSource(context.Background(), buildID, dst); err != nil {
+		t.Fatalf("materializeSource: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("materialized source = %q, want %q", got, want)
 	}
 }
 

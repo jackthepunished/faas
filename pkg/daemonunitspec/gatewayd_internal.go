@@ -3,9 +3,9 @@ package daemonunitspec
 import "github.com/onebox-faas/faas/pkg/daemonunit"
 
 // UnitGatewaydInternal is the canonical unit for faas-gatewayd-internal
-// — routing + wake + proxy (Tier A7 split, ADR-070). It does NOT bind
-// a public port; it listens on a unix socket inside the box. The public
-// edge daemon (gatewayd-public) forwards every inbound request to it.
+// — routing + wake + proxy (Tier A7 split, ADR-070). It serves the local
+// unix socket and may additionally bind a private TCP listener when a
+// split-box manifest installs the FAAS_GATEWAY_LISTEN drop-in.
 //
 // Issue #675 / Tier A7 unified mux: the unix socket now serves BOTH the
 // synth routes (schedd → /v1/synthesize, /v1/invocations:dispatch, /healthz)
@@ -20,11 +20,9 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //
 // Wipe-comments-load-bearing rationale:
 //
-//   - FAAS_GATEWAY_LISTEN=off is REQUIRED to skip the public listener.
-//     Without it, both daemons bind :8080, gatewayd-internal starts
-//     first and wins (sorted order in restart loop), and gatewayd-public
-//     crash-loops with "address already in use" (run 31121004495).
-//     The sentinel is checked in cmd/gatewayd-internal/run.go.
+//   - FAAS_GATEWAY_LISTEN=off is the one-box default. Split-box manifests
+//     replace it with a private listener; nftables limits that port to the
+//     rendered control-plane CIDRs.
 //   - RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6: gRPC to schedd/vmmd
 //     is over loopback mTLS (AF_INET) and the unix socket to gatewayd-public
 //     (AF_UNIX). AF_INET6 is allowed so the internal dial doesn't fail
@@ -47,6 +45,11 @@ func UnitGatewaydInternal() daemonunit.Unit {
 
 		Slice:     "faas-cp.slice",
 		MemoryMax: "512M",
+
+		// gatewayd-internal reads the shared control-plane database
+		// through DATABASE_URL. In a split deployment the root-owned
+		// compute env is loaded by systemd; TOML must stay credential-free.
+		EnvironmentFile: "-/etc/faas/sealed.env -/etc/faas/compute-db.env",
 
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_GATEWAY_LISTEN", Value: "off"},

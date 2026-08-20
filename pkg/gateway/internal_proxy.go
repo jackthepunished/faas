@@ -84,6 +84,25 @@ func (d *unixSocketDialer) DialContext(ctx context.Context, _ string) (net.Conn,
 	return dnet.DialContext(ctx, "unix", d.path)
 }
 
+// NewTCPDialer returns an InternalDialer for a private gatewayd-internal
+// listener. The address is fixed at construction time so requests cannot
+// smuggle a customer-controlled destination through the reverse proxy.
+// Deployments use this only for the split-box control-plane → compute hop;
+// the nftables policy restricts the listener to the rendered control-plane
+// CIDRs.
+func NewTCPDialer(address string) InternalDialer {
+	return &tcpDialer{address: address}
+}
+
+type tcpDialer struct {
+	address string
+}
+
+func (d *tcpDialer) DialContext(ctx context.Context, _ string) (net.Conn, error) {
+	var dnet net.Dialer
+	return dnet.DialContext(ctx, "tcp", d.address)
+}
+
 // InternalReverseProxy is the public→internal forwarder. It wraps
 // http.Transport with a DialContext that dials the unix socket, and
 // applies the load-bearing header rewrites (XFF strip-and-rebuild,

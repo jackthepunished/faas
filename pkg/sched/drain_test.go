@@ -8,6 +8,7 @@ package sched
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -49,6 +50,7 @@ func (d *drainSynth) Invoke(_ context.Context, appID string, inv state.Invocatio
 	}
 	inv.State = state.InvocationDispatching
 	inv.InstanceID = "inst-" + inv.ID
+	inv.Result = json.RawMessage(`{"ok":true}`)
 	return inv, nil
 }
 
@@ -138,6 +140,9 @@ func TestDrain_DispatchesDueRow(t *testing.T) {
 	}
 	if got.InstanceID == "" {
 		t.Errorf("row instance_id = empty, want stamped (meter would under-count)")
+	}
+	if string(got.Result) != `{"ok":true}` {
+		t.Errorf("row result = %s, want {\"ok\":true}", got.Result)
 	}
 	// invocation_done notify fires on the success path.
 	if notif.count(db.NotifyInvocationDone) != 1 {

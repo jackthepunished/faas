@@ -66,6 +66,10 @@ import (
 const (
 	providerStripe = "stripe"
 	providerPaddle = "paddle"
+	// Keep optional remote catalog hydration from blocking the API listener
+	// indefinitely when the billing provider or internet path is unavailable.
+	// The provider remains wired and can retry on its normal request path.
+	providerBootHydrationTimeout = 10 * time.Second
 )
 
 // resolveSecret implements the env > TOML precedence for an individual
@@ -343,7 +347,10 @@ func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(s
 		// ingress is independent of the catalog — the dunning state
 		// machine reads acct.Plan, not price handles, so the boot
 		// failure mode is the upgrade 402 path only.
-		if err := bp.EnsurePlanProducts(ctx); err != nil {
+		bootCtx, cancel := context.WithTimeout(ctx, providerBootHydrationTimeout)
+		err = bp.EnsurePlanProducts(bootCtx)
+		cancel()
+		if err != nil {
 			log.Warn("billing: EnsurePlanProducts failed at boot — upgrade 402 will degrade to 500 until next run",
 				"provider", m.Name, "err", err)
 		}

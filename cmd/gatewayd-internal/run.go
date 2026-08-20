@@ -23,13 +23,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -333,8 +336,14 @@ func dnsTokenLookupFromEnv(provider string) string {
 // wake-only path left cron traffic invisible to the runner and the
 // meter (spec §4.4, M7).
 type synthAdapter struct {
-	wake   func(ctx context.Context, appID string) error
-	invoke func(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error)
+	backend gateway.Backend
+	wake    func(ctx context.Context, appID string) error
+	invoke  func(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error)
+	// forward is the same HTTP→vmmd bridge installed on the public
+	// gateway handler. Synthetic invocations must use that bridge too;
+	// waking an instance without delivering the envelope leaves the row
+	// looking completed while the guest never sees a request.
+	forward func(gateway.Target) http.Handler
 }
 
 func (a *synthAdapter) Wake(ctx context.Context, appID string) error { return a.wake(ctx, appID) }
@@ -350,6 +359,75 @@ func (a *synthAdapter) Invoke(ctx context.Context, appID string, inv state.Invoc
 		return inv, fmt.Errorf("gateway synth: invoke is not wired (legacy wake-only adapter)")
 	}
 	return a.invoke(ctx, appID, inv)
+}
+
+// forwardInvocation delivers a synthetic invocation through the same
+// per-node vmmd bridge as an ordinary HTTP request and copies the response
+// body into Invocation.Result. The scheduler persists that result when it
+// completes the invocation row, which is what makes sync invoke and async
+// polling return the function's actual response.
+func (a *synthAdapter) forwardInvocation(ctx context.Context, target gateway.Target, inv state.Invocation) (state.Invocation, error) {
+	if a.forward == nil {
+		return inv, fmt.Errorf("gateway synth: invocation forwarder is not wired")
+	}
+
+	method := inv.Method
+	if method == "" {
+		method = http.MethodPost
+	}
+	path := inv.Path
+	if path == "" {
+		path = "/"
+	}
+	if path[0] != '/' {
+		path = "/" + path
+	}
+	req, err := http.NewRequestWithContext(ctx, method, path, bytes.NewReader(inv.Payload))
+	if err != nil {
+		return inv, fmt.Errorf("gateway synth: build request: %w", err)
+	}
+	if len(inv.Headers) > 0 {
+		var headers map[string]string
+		if err := json.Unmarshal(inv.Headers, &headers); err != nil {
+			return inv, fmt.Errorf("gateway synth: decode invocation headers: %w", err)
+		}
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+	}
+	// These headers are platform-owned context. Set them after customer
+	// headers so a queued envelope cannot spoof its invocation identity.
+	req.Header.Set("x-faas-invocation-id", inv.ID)
+	req.Header.Set("x-faas-app-id", inv.AppID)
+	req.Header.Set("x-faas-invocation-source", string(inv.Source))
+	req.Header.Set("x-faas-instance", target.InstanceID)
+	req.Header.Set("x-faas-node", target.NodeID)
+	req = req.WithContext(gateway.WithSyntheticInvocation(req.Context()))
+
+	rec := httptest.NewRecorder()
+	a.forward(target).ServeHTTP(rec, req)
+	if rec.Code == 0 {
+		rec.Code = http.StatusOK
+	}
+	body := rec.Body.Bytes()
+	if len(body) > 0 {
+		// Function handlers conventionally return JSON. Preserve valid JSON
+		// as raw result bytes; wrap plain-text responses so the API remains
+		// valid JSON for CLI --json and SDK callers.
+		if json.Valid(body) {
+			inv.Result = append(json.RawMessage(nil), body...)
+		} else {
+			encoded, err := json.Marshal(string(body))
+			if err != nil {
+				return inv, fmt.Errorf("gateway synth: encode response: %w", err)
+			}
+			inv.Result = encoded
+		}
+	} else {
+		inv.Result = nil
+	}
+	inv.State = state.InvocationDispatching
+	return inv, nil
 }
 
 // runDeps is the dependency seam for run. Tests inject net.Listen / http.Server
@@ -750,6 +828,25 @@ func run(ctx context.Context, log *slog.Logger) error {
 			}
 			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode}, true, nil
 		}).
+		WithLiveTargetLoader(func(ctx context.Context, appID string) ([]gateway.Target, error) {
+			instances, err := pgStore.ListInstancesForApp(ctx, appID)
+			if err != nil {
+				return nil, err
+			}
+			targets := make([]gateway.Target, 0, len(instances))
+			for _, instance := range instances {
+				if instance.State != string(state.StateRunning) || instance.ID == "" || instance.NodeID == "" {
+					continue
+				}
+				targets = append(targets, gateway.Target{
+					InstanceID:   instance.ID,
+					NodeID:       instance.NodeID,
+					WakeID:       instance.WakeID,
+					DeploymentID: instance.DeploymentID,
+				})
+			}
+			return targets, nil
+		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)
 			if err != nil {
@@ -838,7 +935,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// path doesn't have without a Wake first). Phase 2 / Gate A: synth
 	// calls resolve the owner schedd per app via the router — they no
 	// longer dial the legacy single schedd.
-	deps.synth = gateway.NewSynthServer(gatewaydInternalSocket, &synthAdapter{
+	var synth *synthAdapter
+	synth = &synthAdapter{
+		backend: backend,
 		wake: func(ctx context.Context, appID string) error {
 			// wake_id is discarded on the synth path (gaps analysis
 			// 2026-07-23): synthesized requests don't return a
@@ -864,19 +963,23 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "", "")
+			instanceID, nodeID, deploymentID, wakeID, _, atCapacity, port, err := cli.AdmitInstance(ctx, appID, "", "")
+			if err == nil && !atCapacity {
+				backend.RecordTarget(appID, gateway.Target{
+					InstanceID:   instanceID,
+					NodeID:       nodeID,
+					DeploymentID: deploymentID,
+					WakeID:       wakeID,
+					Port:         port,
+				})
+			}
 			return err
 		},
-		// Move 1: Wake the instance, then route the synthetic
-		// envelope. The wake gate handles admit + boot; the
-		// envelope delivery to the runner is the per-app internal
-		// queue Move 2 introduces. For now the drain records the
-		// post-state as 'dispatching' — the row's result is set
-		// later (or left NULL for async sources) by the drain's
-		// CompleteInvocation call. The live instance handle from
-		// the Wake response is echoed back on the returned
-		// Invocation so schedd can StampInstanceInvocation —
-		// without it the meter's per-instance count lands on 0.
+		// Wake the instance, then deliver the synthetic envelope through
+		// the same HTTP→vmmd bridge used by public traffic. The live
+		// instance handle is echoed back on the returned Invocation so
+		// schedd can StampInstanceInvocation; without it the meter's
+		// per-instance count lands on 0.
 		invoke: func(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
 			app, err := pgStore.AppByID(ctx, appID)
 			if err != nil {
@@ -886,15 +989,23 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke resolve schedd %s: %w", appID, err)
 			}
-			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "", "")
+			instanceID, nodeID, deploymentID, wakeID, port, err := cli.Wake(ctx, appID, "", "")
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}
+			target := gateway.Target{
+				InstanceID:   instanceID,
+				NodeID:       nodeID,
+				DeploymentID: deploymentID,
+				WakeID:       wakeID,
+				Port:         port,
+			}
+			backend.RecordTarget(appID, target)
 			inv.InstanceID = instanceID
-			inv.State = state.InvocationDispatching
-			return inv, nil
+			return synth.forwardInvocation(ctx, target, inv)
 		},
-	}, log)
+	}
+	deps.synth = gateway.NewSynthServer(gatewaydInternalSocket, synth, log)
 	// Process-local Prometheus registry (spec §12). Constructed here so
 	// every downstream consumer — handler, warm-hint consumer, top-N
 	// sampler — shares the same registry. The registry is exposed via
@@ -970,6 +1081,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 	gatewayOps := wire.NewOpsMetrics("gatewayd")
 	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
+	// Synthetic invocations share the same per-node HTTP→vmmd bridge as
+	// public requests. This assignment happens after nodeCache creation so
+	// the cache has its production mTLS/overlay wiring before schedd can
+	// dispatch a cron, async, queue, or delayed-task envelope.
+	synth.forward = deps.nodeCache.Forwarding()
 	go deps.nodeCache.WatchEvictions(ctx, pool)
 	// Issue #587 / PR-A: the raw-stream forwarder needs the drain
 	// tracker so the hijacked Upgrade pump is held in the in-flight
@@ -1905,9 +2021,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	//   everything else          → customer publicHandler (NEW — issue #675)
 	//
 	// Production (FAAS_GATEWAY_LISTEN=off) routes ALL customer traffic
-	// through this mux via gatewayd-public's reverse proxy. The legacy
-	// :8080 TCP listener below (when not off) keeps publicHandler
-	// directly — but in prod the TCP path is unused.
+	// through this mux via gatewayd-public's reverse proxy. On a split
+	// compute box the TCP listener is also the schedd→compute synth
+	// transport, so it must use this same mux; otherwise the cross-box
+	// /v1/invocations:dispatch request falls through to the customer
+	// handler and returns 404 while the VM wake itself succeeds.
+	publicListenerHandler := http.Handler(publicHandler)
 	if deps.synth != nil {
 		unifiedMux := http.NewServeMux()
 		// LOAD-BEARING ORDER: register Handle("/", publicHandler) FIRST,
@@ -1946,6 +2065,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// needed — the deprecated golang.org/x/net/http2/h2c package
 		// is gone.
 		deps.synth.SetHandler(unifiedMux)
+		publicListenerHandler = unifiedMux
 	}
 	// addSrv is the closure for the public :8080 + control listeners
 	// below; declared above so the unified-mux block above can run
@@ -1963,7 +2083,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// faas-gatewayd-internal.service ships with FAAS_GATEWAY_LISTEN=off
 	// in Environment=.
 	if listenAddr != publicListenOffSentinel {
-		srv := deps.newSrv(listenAddr, publicHandler)
+		srv := deps.newSrv(listenAddr, publicListenerHandler)
 		public := srv
 		public.Addr = listenAddr
 		if public.ReadTimeout == 0 {

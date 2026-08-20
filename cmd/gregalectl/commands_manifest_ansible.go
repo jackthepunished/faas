@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -24,6 +25,8 @@ type manifestInternalHost struct {
 	Address string
 	Name    string
 }
+
+const manifestGatewayEgressPort = 9092
 
 // cmdManifestAnsible materialises the Ansible inventory shape from the same
 // manifest that drives the on-host renderer. The generated inventory is
@@ -111,14 +114,25 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 	var hostVars []manifestAnsibleFile
 	var postgresListenAddress string
 	var postgresAllowedCIDRs []string
+	var computeAllowedCIDRs []string
+	var controlPlaneAllowedCIDRs []string
+	var gatewayInternalTarget string
+	var scheddTarget string
+	var controlPlaneAPIDLoopback string
 	for _, fleetHost := range m.Fleet.Hosts {
 		if fleetHost.Role == roleControlPlane {
+			scheddTarget, err = manifest.ServiceTCPURL(fleetHost.Role, fleetHost.Address)
+			if err != nil {
+				return nil, fmt.Errorf("host %s scheduler address: %w", fleetHost.Name, err)
+			}
 			address, _, parseErr := manifest.ParseHostPort(fleetHost.Address)
 			if parseErr != nil {
 				return nil, fmt.Errorf("host %s postgres address: %w", fleetHost.Name, parseErr)
 			}
+			controlPlaneAPIDLoopback = "http://" + net.JoinHostPort(address, "8081")
 			if _, err := netip.ParseAddr(address); err == nil {
 				postgresListenAddress = address
+				controlPlaneAllowedCIDRs = append(controlPlaneAllowedCIDRs, address+"/32")
 			}
 		}
 		if fleetHost.Role == roleComputeOnly {
@@ -128,6 +142,10 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			}
 			if _, err := netip.ParseAddr(address); err == nil {
 				postgresAllowedCIDRs = append(postgresAllowedCIDRs, address+"/32")
+				computeAllowedCIDRs = append(computeAllowedCIDRs, address+"/32")
+				if gatewayInternalTarget == "" {
+					gatewayInternalTarget = "tcp://" + net.JoinHostPort(address, "8080")
+				}
 			}
 		}
 	}
@@ -158,7 +176,7 @@ func renderManifestAnsibleFiles(m *manifest.Manifest, outputDir string) ([]manif
 			// the control plane keeps the canonical empty list.
 			overlayCIDRs = m.Overlay.CIDR
 		}
-		body := renderManifestHostVars(host, ansibleHost, targetURL, internalHosts, overlayCIDRs, m.Overlay.Provider, postgresListenAddress, postgresAllowedCIDRs)
+		body := renderManifestHostVars(host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback, internalHosts, overlayCIDRs, m.Overlay.Provider, postgresListenAddress, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs)
 		hostVars = append(hostVars, manifestAnsibleFile{
 			Path: filepath.Join(outputDir, "inventory", "host_vars", host.Name+".yml"),
 			Body: []byte(body),
@@ -196,6 +214,12 @@ func renderManifestInternalHosts(m *manifest.Manifest) ([]manifestInternalHost, 
 				Address: address,
 				Name:    serviceName,
 			})
+			if host.Role == roleComputeOnly {
+				internalHosts = append(internalHosts, manifestInternalHost{
+					Address: address,
+					Name:    "egress.faas",
+				})
+			}
 		}
 	}
 	return internalHosts, nil
@@ -212,7 +236,7 @@ func writeInventoryGroup(out *bytes.Buffer, group string, hosts []string) {
 	out.WriteByte('\n')
 }
 
-func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, postgresListenAddress string, postgresAllowedCIDRs []string) string {
+func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL, gatewayInternalTarget, scheddTarget, controlPlaneAPIDLoopback string, internalHosts []manifestInternalHost, overlayCIDRs, overlayProvider, postgresListenAddress string, postgresAllowedCIDRs, computeAllowedCIDRs, controlPlaneAllowedCIDRs []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Generated from the split-box manifest for %s; do not hand-edit.\n", host.Name)
 	fmt.Fprintf(&b, "faas_box_role: %s\n", host.Role)
@@ -242,6 +266,27 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, i
 	if host.Role == roleComputeOnly {
 		b.WriteString("faas_vmmd_listen_addr: \"tcp://0.0.0.0:50051\"\n")
 		fmt.Fprintf(&b, "faas_vmmd_target_url: %q\n", targetURL)
+		fmt.Fprintf(&b, "faas_vmmd_schedd_target: %q\n", scheddTarget)
+		fmt.Fprintf(&b, "faas_gatewayd_schedd_target: %q\n", scheddTarget)
+		fmt.Fprintf(&b, "faas_gatewayd_apid_loopback: %q\n", controlPlaneAPIDLoopback)
+		fmt.Fprintf(&b, "faas_gatewayd_egress_listen: %q\n", fmt.Sprintf("tcp://0.0.0.0:%d", manifestGatewayEgressPort))
+		b.WriteString("faas_gateway_listen: \"0.0.0.0:8080\"\n")
+	}
+	if host.Role == roleControlPlane && gatewayInternalTarget != "" {
+		b.WriteString("faas_meterd_config_managed: true\n")
+		fmt.Fprintf(&b, "faas_meterd_schedd_socket: %q\n", scheddTarget)
+		fmt.Fprintf(&b, "faas_meterd_egress_socket: %q\n", fmt.Sprintf("tcp://egress.faas:%d", manifestGatewayEgressPort))
+		b.WriteString("faas_meterd_schedd_tls_cert_path: /etc/faas/tls/meterd/schedd-client.crt\n")
+		b.WriteString("faas_meterd_schedd_tls_key_path: /etc/faas/tls/meterd/schedd-client.key\n")
+		b.WriteString("faas_meterd_schedd_tls_ca_path: /etc/faas/tls/ca/ca.crt\n")
+		fmt.Fprintf(&b, "faas_gatewayd_internal_target: %q\n", gatewayInternalTarget)
+		fmt.Fprintf(&b, "faas_schedd_gateway_synth_target: %q\n", gatewayInternalTarget)
+		// gatewayd-internal deliberately binds its control/metrics
+		// listener to loopback. Do not generate an unreachable remote
+		// scrape URL; the explicit empty override disables schedd's
+		// optional scale-up signal until a dedicated metrics relay is
+		// provisioned.
+		b.WriteString("faas_schedd_gateway_metrics_url: \"\"\n")
 	}
 	if host.Role == roleControlPlane && postgresListenAddress != "" {
 		fmt.Fprintf(&b, "faas_postgres_listen_addresses: %q\n", postgresListenAddress)
@@ -249,6 +294,18 @@ func renderManifestHostVars(host manifest.Host, ansibleHost, targetURL string, i
 			b.WriteString("faas_postgres_allowed_cidrs: []\n")
 		} else {
 			fmt.Fprintf(&b, "faas_postgres_allowed_cidrs: [%s]\n", quotedYAMLList(postgresAllowedCIDRs))
+		}
+		if len(computeAllowedCIDRs) == 0 {
+			b.WriteString("faas_compute_allowed_cidrs: []\n")
+		} else {
+			fmt.Fprintf(&b, "faas_compute_allowed_cidrs: [%s]\n", quotedYAMLList(computeAllowedCIDRs))
+		}
+	}
+	if host.Role == roleComputeOnly {
+		if len(controlPlaneAllowedCIDRs) == 0 {
+			b.WriteString("faas_control_plane_allowed_cidrs: []\n")
+		} else {
+			fmt.Fprintf(&b, "faas_control_plane_allowed_cidrs: [%s]\n", quotedYAMLList(controlPlaneAllowedCIDRs))
 		}
 	}
 	return b.String()

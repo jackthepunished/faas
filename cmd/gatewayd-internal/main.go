@@ -36,6 +36,8 @@
 package main
 
 import (
+	"os"
+
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -43,5 +45,24 @@ import (
 // SIGTERM, slog, and ctx cancellation around run; run itself lives in
 // run.go and owns the PG pool, schedd router, and HTTP servers.
 func main() {
+	if path := configPathArg(os.Args[1:]); path != "" {
+		configPath = path
+	}
 	wire.Daemon("gatewayd-internal", run)
+}
+
+// configPathArg keeps the systemd ExecStart contract honest. The service
+// units pass --config explicitly; accepting it here also makes a manually
+// launched daemon behave exactly like the deployed unit. Environment remains
+// the fallback for container/e2e callers that do not pass an argument.
+func configPathArg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] != "--config" {
+			continue
+		}
+		if i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }

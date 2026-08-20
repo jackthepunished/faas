@@ -158,7 +158,7 @@ func TestRollupLoop_DefaultInterval(t *testing.T) {
 func TestRollupSQL_OverwriteSemantics(t *testing.T) {
 	checkCols := []string{
 		"mb_seconds", "requests", "cpu_usec", "tx_bytes",
-		"net_tx_bytes", "net_rx_bytes", "cold_boots",
+		"net_tx_bytes", "net_rx_bytes", "cold_boot_count",
 		"builder_seconds", "tail_seconds",
 	}
 	for _, c := range checkCols {

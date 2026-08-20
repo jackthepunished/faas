@@ -114,11 +114,16 @@ func (w *Watchdog) runOne(ctx context.Context, now time.Time, st state.State, bu
 		// A snapshot-backed wake can spend the restore budget in vmmd and then
 		// fall back to a cold boot. Its engine context is bounded by
 		// ColdBootTimeout, so the 5-second WAKING backstop must not race it.
-		// The engine still owns the terminal transition if that RPC exceeds its
-		// deadline.
+		// Do not exempt the row forever, though: if the wake caller is
+		// cancelled after vmmd has booted (or schedd is restarted), the row
+		// can otherwise remain WAKING indefinitely and consume the app's
+		// concurrency reservation. After the combined restore + cold-boot
+		// budget, the normal WAKING kill path is the safe recovery.
 		if st == state.StateWaking && ins.DeploymentID != "" {
 			if _, snapErr := w.store.LatestSnapshot(ctx, ins.DeploymentID); snapErr == nil {
-				continue
+				if !ins.StartedAt.IsZero() && now.Sub(ins.StartedAt) < WakingSweepBudget+ColdBootSweepBudget {
+					continue
+				}
 			}
 		}
 		if err := w.engine.KillStuck(ctx, ins.ID, ins.AppID, reason); err != nil {

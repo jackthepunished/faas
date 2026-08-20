@@ -9210,13 +9210,13 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 	row := s.pool.QueryRow(ctx, `
 		insert into compute_nodes
 		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
-		     region, zone,
+		     region, zone, schedd_target_url,
 		     public_ip, public_ip_set_at,
 		     release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation)
 		values ($1, $2, $3, $4, $5, $6, $7, true,
-		        $8, $9,
-		        $10, $11,
-		        $12, $13, $14, $15, $16, $17)
+		        $8, $9, $10,
+		        $11, $12,
+		        $13, $14, $15, $16, $17, $18)
 		on conflict (name) do update
 		  set vpcpus              = excluded.vpcpus,
 		      mem_mb              = excluded.mem_mb,
@@ -9243,7 +9243,7 @@ func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNod
 		          release_id, manifest_hash, host_certificate, cert_fingerprint, role, generation
 	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
 		node.AdmissionCeilingMB, node.VCPUBudget,
-		node.Region, node.Zone,
+		node.Region, node.Zone, node.ScheddTargetURL,
 		node.PublicIp, node.PublicIpSetAt,
 		node.ReleaseID, node.ManifestHash, node.HostCertificate, node.CertFingerprint,
 		node.Role, node.Generation)

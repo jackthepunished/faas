@@ -48,15 +48,17 @@ build: guest-runners ## Build every daemon + CLIs + function runners into ./bin
 # FAAS_FUNCTION_RUNNER_<RUNTIME_UPPER> — NODE22 / PYTHON312 / GO124 /
 # GO124_ALPINE / NODE24 / PYTHON313 — to the resulting paths). Build matrix
 # matches guest/init.
-GUEST_RUNNERS := node22 python312 go124 node24 python313
+GUEST_RUNNERS := node22 python312 go124 go124-alpine node24 python313
 .PHONY: guest-runners
 guest-runners: ## Build function-runner shims into ./bin/runners/<runtime>/faas-runner
 	@mkdir -p $(BINDIR)/runners
 	@for rt in $(GUEST_RUNNERS); do \
 	  mkdir -p $(BINDIR)/runners/$$rt; \
+	  source_rt=$$rt; \
+	  if [ "$$rt" = go124-alpine ]; then source_rt=go124; fi; \
 	  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
 	    $(GO) build -trimpath -o $(BINDIR)/runners/$$rt/faas-runner \
-	      ./guest/runners/$$rt || exit 1; \
+	      ./guest/runners/$$source_rt || exit 1; \
 	done
 
 # M1 gRPC codegen (ADR-013). Generated *.pb.go is COMMITTED — do not run

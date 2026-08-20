@@ -59,27 +59,35 @@ func main() {
 }
 
 func boot() error {
+	guestStage("boot")
 	if err := mountBasics(); err != nil {
 		return fmt.Errorf("mount basics: %w", err)
 	}
+	guestStage("mount-basics")
 	if err := assembleOverlay(); err != nil {
 		return fmt.Errorf("assemble overlay: %w", err)
 	}
+	guestStage("assemble-overlay")
 	if err := pivotInto(newRoot); err != nil {
 		return fmt.Errorf("pivot_root: %w", err)
 	}
+	guestStage("pivot")
 	mode, buildManifest, err := decideMode(os.DirFS("/"))
 	if err != nil {
 		return err
 	}
+	guestStage(fmt.Sprintf("mode-%d", mode))
 	// Builder VMs run BuildKit/runc as their only workload. The daemon needs a
 	// cgroup mount, but its runc workers enter a user namespace so they do not
-	// require host-level device-BPF policy support. App VMs still mount cgroup2
-	// below and retain the per-workload partition.
+	// require host-level device-BPF policy support. The guest cgroup namespace
+	// is private to this VM; the host-side vmmd cgroup fence remains the
+	// authoritative outer limit.
 	if mode == modeBuild {
+		guestStage("before-builder-cgroup")
 		if err := mountCgroup2(); err != nil {
 			return writeAndPoweroff(buildManifest, fmt.Errorf("builder cgroup2 mount: %w", err), "")
 		}
+		guestStage("after-builder-cgroup")
 		return runBuild(buildManifest)
 	}
 
@@ -248,6 +256,10 @@ func boot() error {
 	// not ready after 30s" path).
 	go runCharacterizationForSup(supRef, manifest)
 	return supRef.Run()
+}
+
+func guestStage(stage string) {
+	_, _ = fmt.Fprintf(os.Stderr, "guest-init: stage %s\n", stage)
 }
 
 // runAppWithEnv is the secrets+apiEnv-aware entrypoint — same execve
@@ -474,6 +486,16 @@ func runBuild(m api.BuildManifest) error {
 	if err := os.MkdirAll(m.OutDir, 0o755); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("mkdir outdir: %w", err), "")
 	}
+	// BuildKit is launched rootless inside a user namespace. The build
+	// workspace is disposable VM-local state, and OCI-to-ext4 materialisation
+	// can preserve an image owner that does not match the mapped worker uid.
+	// Make the exact build paths writable before starting the rootless daemon;
+	// without this, BuildKit fails before it can create its worker state.
+	for _, dir := range []string{"/build", m.Workdir, m.OutDir} {
+		if err := os.Chmod(dir, 0o777); err != nil {
+			return writeAndPoweroff(m, fmt.Errorf("chmod build workspace %s: %w", dir, err), "")
+		}
+	}
 	if err := seedBuildEntropy(); err != nil {
 		return writeAndPoweroff(m, err, "")
 	}
@@ -496,20 +518,58 @@ func runBuild(m api.BuildManifest) error {
 
 	// 2. Start BuildKit inside the builder VM. Railpack is a BuildKit
 	// frontend, as is the Dockerfile path, so both build modes need the
-	// daemon. The VM is already the isolation boundary; keep the executor in
-	// the guest's network namespace because the minimal image has no CNI setup.
+	// daemon. The VM is already the isolation boundary and the enclosing
+	// unshare below is the user/mount boundary; keep the executor in the
+	// guest's network namespace because the minimal image has no CNI setup.
 	if err := os.MkdirAll("/run/buildkit", 0o755); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("mkdir buildkit run dir: %w", err), "")
 	}
+	// The merged root is an overlayfs view whose writable upper is the same
+	// builder drive. BuildKit keeps a BoltDB, lock, and runc state tree under
+	// its root; those operations are more restrictive than a simple touch and
+	// can be rejected by overlayfs from the nested user namespace. Mount the
+	// builder drive directly and keep only this disposable state on ext4.
+	builderDriveMount := "/run/faas-builder-drive"
+	if err := os.MkdirAll(builderDriveMount, 0o755); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("mkdir builder drive mount: %w", err), "")
+	}
+	if err := syscall.Mount(layerDevice, builderDriveMount, "ext4", 0, ""); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("mount builder drive scratch: %w", err), "")
+	}
+	for _, dir := range []string{builderDriveMount, builderDriveMount + "/upper", builderDriveMount + "/upper/build"} {
+		if err := os.Chmod(dir, 0o777); err != nil {
+			return writeAndPoweroff(m, fmt.Errorf("chmod builder scratch %s: %w", dir, err), "")
+		}
+	}
+	// BuildKit is launched rootless in a separate user+mount namespace. Its
+	// persistent worker root is on the direct ext4 scratch mount above, avoiding
+	// the overlayfs lock/state failure while retaining rootless runc's guest-safe
+	// mount policy. The VM plus this outer namespace remain the isolation
+	// boundary.
+	buildkitRoot := builderDriveMount + "/upper/build/.buildkit"
+	if err := os.MkdirAll(buildkitRoot, 0o777); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("mkdir buildkit root: %w", err), "")
+	}
+	if err := os.Chmod(buildkitRoot, 0o777); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("chmod buildkit root: %w", err), "")
+	}
+	guestStage("builder-workspace")
+	if diagnostic, err := probeBuilderWorkspace(buildkitRoot); err != nil {
+		return writeAndPoweroff(m, fmt.Errorf("builder workspace preflight: %w", err), diagnostic)
+	}
+	guestStage("workspace-probe")
 	if err := ensureFuseDevice(); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("fuse device: %w", err), "")
 	}
+	guestStage("fuse")
 	if err := ensureBuilderResolver(); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("builder resolver: %w", err), "")
 	}
+	guestStage("resolver")
 	if err := ensureRailpackMise(); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("railpack mise: %w", err), "")
 	}
+	guestStage("mise")
 	// Railpack resolves language toolchains and package registries from inside
 	// the builder VM. Fail fast when the guest's DNS path is broken instead of
 	// spending the whole build budget in a registry client retry loop.
@@ -570,6 +630,7 @@ func runBuild(m api.BuildManifest) error {
 	if ghcrErr != nil {
 		return writeAndPoweroff(m, fmt.Errorf("GHCR HTTPS preflight: %w", ghcrErr), "")
 	}
+	guestStage("network-preflight")
 	runcCheck := exec.Command("/usr/local/bin/runc", "--version")
 	runcCheck.Env = builderEnv()
 	if runcOut, runcErr := runcCheck.CombinedOutput(); runcErr != nil {
@@ -583,6 +644,7 @@ func runBuild(m api.BuildManifest) error {
 	if runcOut, runcErr := runcList.CombinedOutput(); runcErr != nil {
 		return writeAndPoweroff(m, fmt.Errorf("runc list preflight: %w (%s)", runcErr, runcOut), string(runcOut))
 	}
+	guestStage("runc-preflight")
 
 	var buildkitLog bytes.Buffer
 	bk := exec.Command(
@@ -596,24 +658,34 @@ func runBuild(m api.BuildManifest) error {
 		"/usr/local/bin/buildkitd",
 		"--debug",
 		"--rootless",
-		"--root", "/build/.buildkit",
+		"--root", buildkitRoot,
 		"--addr", "unix:///run/buildkit/buildkitd.sock",
 		"--oci-worker-binary", "/usr/local/bin/runc",
-		// The builder drive is deliberately 24 GiB so rootless native snapshots
-		// can export Railpack's local rootfs without the extremely slow FUSE
-		// directory-copy path.
-		"--oci-worker-snapshotter", "native",
+		// The builder drive is deliberately 28 GiB. The image includes
+		// fuse-overlayfs and the guest kernel has FUSE built in; use the
+		// rootless COW snapshotter so committing a layer does not scan/copy the
+		// complete native snapshot tree after every RUN instruction.
+		"--oci-worker-snapshotter", "fuse-overlayfs",
 		"--oci-worker-net", "host",
 	)
 	// Keep the daemon and its rootless worker tree in a private process group so
 	// the timeout path can terminate BuildKit descendants before powering off.
 	bk.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	bk.Env = builderEnv()
-	bk.Stdout = &buildkitLog
-	bk.Stderr = &buildkitLog
+	// BuildKit uses both the user namespace probe and USER when selecting its
+	// rootless defaults. guest-init is PID 1 and can inherit a stale USER value
+	// from the host-side launch environment, so make the mapped namespace root
+	// unambiguous while keeping the worker's rootless flag explicit above.
+	bk.Env = builderEnv("USER=root", "HOME=/root")
+	// Keep the full daemon trace in the durable build marker while mirroring
+	// it to the VM console. A rootless solve can spend minutes in an image
+	// fetch/unpack step; without the console mirror the host only sees a hot
+	// Firecracker process and cannot distinguish progress from a deadlock.
+	bk.Stdout = io.MultiWriter(os.Stdout, &buildkitLog)
+	bk.Stderr = io.MultiWriter(os.Stderr, &buildkitLog)
 	if err := bk.Start(); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("start buildkitd: %w", err), tailOf(buildkitLog.Bytes(), m.LogTailBytes))
 	}
+	guestStage("buildkit-started")
 	defer func() {
 		if bk.Process == nil {
 			return
@@ -630,6 +702,7 @@ func runBuild(m api.BuildManifest) error {
 	if _, err := os.Stat("/run/buildkit/buildkitd.sock"); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("buildkitd socket never appeared: %w", err), tailOf(buildkitLog.Bytes(), m.LogTailBytes))
 	}
+	guestStage("buildkit-socket")
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	check := exec.CommandContext(checkCtx, "/usr/local/bin/buildctl", "debug", "workers")
 	check.Env = builderEnv("BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock")
@@ -661,6 +734,7 @@ func runBuild(m api.BuildManifest) error {
 		}
 		return writeAndPoweroff(m, fmt.Errorf("buildkitd readiness: %w (%s)", workerErr, workerOut), tailOf(diagnostic, m.LogTailBytes))
 	}
+	guestStage("buildkit-ready")
 
 	// 3. Pick the build command.
 	argv := buildArgv(m)
@@ -685,10 +759,19 @@ func runBuild(m api.BuildManifest) error {
 	// daemon address in their environment. Keeping this unconditional avoids
 	// the misleading success path where Railpack detects the app and only
 	// fails once it starts its install step.
-	cmd.Env = builderEnv("BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock")
+	// BuildKit v0.31.x tears down a session after a single 15-second health
+	// check timeout. A slow bare-metal guest can legitimately spend several
+	// minutes importing a remote layer, so use the upstream custom-header
+	// contract through the patched buildctl client. Five minutes is still a
+	// bounded liveness check and the build wall-clock timeout remains the outer
+	// safety limit.
+	cmd.Env = builderEnv(
+		"BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock",
+		"BUILDKIT_SESSION_HEALTH_TIMEOUT_MS=300000",
+	)
 	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
 	if err := cmd.Start(); err != nil {
 		return writeAndPoweroff(m, fmt.Errorf("start build command: %w", err), "")
 	}
@@ -707,7 +790,58 @@ func runBuild(m api.BuildManifest) error {
 		// descendant prevents exec.Cmd.Wait from returning.
 		err = context.DeadlineExceeded
 	}
+	if err != nil && buildkitLog.Len() > 0 {
+		buf.WriteString("\n[buildkitd]\n")
+		_, _ = buf.Write(buildkitLog.Bytes())
+	}
 	return writeAndPoweroff(m, err, tailOf(buf.Bytes(), m.LogTailBytes))
+}
+
+// probeBuilderWorkspace verifies the exact user/mount namespace boundary used
+// by BuildKit before starting the daemon. The builder root is deliberately on
+// the writable VM drive; a namespace-specific EACCES here otherwise gets
+// reduced to BuildKit's generic "mkdir ... permission denied" message.
+func probeBuilderWorkspace(buildkitRoot string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	probe := exec.Command(
+		"/usr/bin/unshare",
+		"--user",
+		"--map-root-user",
+		"--map-users=auto",
+		"--map-groups=auto",
+		"--mount",
+		"--fork",
+		"/bin/sh",
+		"-c",
+		`id; stat -c '%n mode=%a uid=%u gid=%g' /build "$1"; mkdir -p "$1/.probe"; touch "$1/.probe/write"; rm -rf "$1/.probe"`,
+		"faas-builder-workspace",
+		buildkitRoot,
+	)
+	probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	probe.Env = builderEnv()
+	var out bytes.Buffer
+	probe.Stdout = &out
+	probe.Stderr = &out
+	if err := probe.Start(); err != nil {
+		return out.String(), err
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- probe.Wait() }()
+	select {
+	case err := <-waitCh:
+		if err != nil {
+			return out.String(), err
+		}
+		return out.String(), nil
+	case <-ctx.Done():
+		_ = syscall.Kill(-probe.Process.Pid, syscall.SIGKILL)
+		select {
+		case <-waitCh:
+		case <-time.After(time.Second):
+		}
+		return out.String(), ctx.Err()
+	}
 }
 
 func killProcessGroup(cmd *exec.Cmd) {

@@ -1,0 +1,5 @@
+[Service]
+# The split-box schedd is the central scheduler. It must not claim the
+# control-plane host as a compute owner; an empty FAAS_NODE_NAME keeps the
+# central ownership guard in its intentional legacy-central posture.
+Environment=FAAS_NODE_NAME={{ faas_schedd_node_name | default('') }}

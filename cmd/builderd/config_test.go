@@ -4,6 +4,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -20,8 +21,15 @@ func TestLoadConfig_MissingFileReturnsDefaults(t *testing.T) {
 	if cfg.CacheDir != "/var/cache/faas/builds" {
 		t.Errorf("CacheDir = %q, want default", cfg.CacheDir)
 	}
-	if cfg.BuilderBase != "/srv/fc/base/builder-base.ext4" {
+	wantBase := "/srv/fc/base/runner-builder-" + runtime.GOARCH + ".ext4"
+	if cfg.BuilderBase != wantBase {
 		t.Errorf("BuilderBase = %q, want default", cfg.BuilderBase)
+	}
+	if cfg.BuildDriveDir != "/srv/fc/builder/drive" {
+		t.Errorf("BuildDriveDir = %q, want split-box staging default", cfg.BuildDriveDir)
+	}
+	if cfg.BuildExportDir != "/srv/fc/builder/out" {
+		t.Errorf("BuildExportDir = %q, want split-box staging default", cfg.BuildExportDir)
 	}
 	// Issue #95 fields default empty.
 	if cfg.VMMTarget != "" ||

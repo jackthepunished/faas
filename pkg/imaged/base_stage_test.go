@@ -66,7 +66,7 @@ type baseHarness struct {
 // has its own dedicated tests (TestEnsureBaseExt4_WithParentRef_*
 // in vmmclient_test.go).
 //
-// ADR-053: the four node/python runtime rows are excluded. Their
+// ADR-053: the Debian-backed node/python runtime rows are excluded. Their
 // parentRef non-empty triggers the parent-ref branch, which
 // requires the parent's DiffIDs to be a strict prefix of the
 // runtime's — the minimal test puller doesn't arrange that. The
@@ -152,8 +152,8 @@ func TestEnsureBaseExt4_StagesOnFirstRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read digest sidecar: %v", err)
 	}
-	if string(haveDigest) != res.ConfigDigest {
-		t.Errorf("sidecar %q != res.ConfigDigest %q", string(haveDigest), res.ConfigDigest)
+	if string(haveDigest) != baseDigestSidecarValue(res.ConfigDigest) {
+		t.Errorf("sidecar %q != expected %q", string(haveDigest), baseDigestSidecarValue(res.ConfigDigest))
 	}
 }
 
@@ -219,7 +219,7 @@ func TestEnsureBaseExt4_SkipsWhenDigestMatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	be.Put(context.Background(), digKey, strings.NewReader(manifest.Config.Digest))
+	be.Put(context.Background(), digKey, strings.NewReader(baseDigestSidecarValue(manifest.Config.Digest)))
 	b := &callCountingBuilder{}
 	h := &Handler{oci: mp, builder: b, log: silentLogger(), storage: be}
 	res, err := h.EnsureBaseExt4(context.Background(),
@@ -722,10 +722,11 @@ func TestEnsureBases_NilRefsIsNoOp(t *testing.T) {
 // promise of "every runtime base auto-stages on imaged startup".
 //
 // ADR-053: 7 rows now (added RuntimeDebianParent at index 0). The
-// four node/python runtime rows declare ParentRef: BaseRefDebianParent
-// and would otherwise pull the parent's tree via the parent-ref
-// branch. The parent row stays first so its stage failure aborts
-// the loop before any child is attempted.
+// Debian-backed node/python runtime rows declare ParentRef:
+// BaseRefDebianParent and would otherwise pull the parent's tree via the
+// parent-ref branch. Node22 is standalone Alpine and intentionally stays on
+// the full-chain path. The parent row stays first so its stage failure aborts
+// the loop before any Debian-backed child is attempted.
 func TestDefaultRuntimeBaseRefs_HasExpectedRuntimes(t *testing.T) {
 	want := []string{
 		RuntimeDebianParent,
@@ -745,17 +746,16 @@ func TestDefaultRuntimeBaseRefs_HasExpectedRuntimes(t *testing.T) {
 		if r.EnvOverride == "" {
 			t.Errorf("row %d (%s) EnvOverride empty", i, r.Runtime)
 		}
-		// ADR-053: the four node/python rows MUST declare
-		// ParentRef=BaseRefDebianParent. A drift here means a
-		// runtime was added without wiring parent-ref — the
-		// dedup invariant at staging time breaks silently.
+		// ADR-053: Debian-backed node/python rows MUST declare
+		// ParentRef=BaseRefDebianParent. Node22 is the intentional
+		// Alpine exception; musl cannot share the Debian parent.
 		switch r.Runtime {
-		case RuntimeNode22, RuntimeNode24, RuntimePython312, RuntimePython313:
+		case RuntimeNode24, RuntimePython312, RuntimePython313:
 			if r.ParentRef != BaseRefDebianParent {
 				t.Errorf("row %d (%s) ParentRef = %q, want %q (ADR-053)",
 					i, r.Runtime, r.ParentRef, BaseRefDebianParent)
 			}
-		case RuntimeDebianParent, RuntimeGo124, RuntimeGo124Alpine:
+		case RuntimeNode22, RuntimeDebianParent, RuntimeGo124, RuntimeGo124Alpine:
 			if r.ParentRef != "" {
 				t.Errorf("row %d (%s) ParentRef = %q, want empty (legacy path)",
 					i, r.Runtime, r.ParentRef)
@@ -1025,15 +1025,14 @@ func TestEnsureBaseExt4_OverlayDispatch(t *testing.T) {
 // path for the ADR-053 staging branch. The runtime has 2
 // DiffIDs, the parent has 1 (matching the runtime's first).
 // After staging:
-//   - BuildBaseFromStaging called once with the merged overlay
-//     path (NOT a separate staging dir — that was the pre-§4.6
-//     `cp -a` flow that produced 5 duplicated Debian images).
+//   - BuildBaseFromStaging called once with the shared materialized
+//     staging path. The parent tree is copied by vmmd while its
+//     loopback mount is visible, then imaged applies the child delta.
 //   - BuildBase NOT called (delta applied in-place on the
 //     overlay upper dir, not via BuildBase's "apply ALL layers"
 //     loop).
-//   - fvm.MountParentExt4ReadOnly invoked exactly once with
-//     the parent base key; UmountParentExt4 called once on
-//     shutdown path.
+//   - fvm.MaterializeParentExt4 invoked exactly once with the
+//     parent base key; the mount/umount pair is internal to vmmd.
 //   - the base ext4 was published under the runtime baseKey.
 func TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly(t *testing.T) {
 	hs := newParentHarness(t)
@@ -1056,27 +1055,19 @@ func TestEnsureBaseExt4_WithParentRef_PullsDeltaOnly(t *testing.T) {
 	if hs.cb.fromStagingCalls != 1 {
 		t.Errorf("BuildBaseFromStaging called %d times, want 1", hs.cb.fromStagingCalls)
 	}
-	// §4.6 contract: BuildBaseFromStaging must be called with a
-	// path that ends in "merged" (the overlay merged view). The
-	// pre-§4.6 flow passed a separate staging dir produced by
-	// `cp -a` — that contract would fail this assertion because
-	// the staging path was the parent mountpoint + "/.", not the
-	// merged overlay.
-	if got := hs.cb.fromStagingArgs[0]; filepath.Base(got) != "merged" {
-		t.Errorf("BuildBaseFromStaging staging path = %q (basename %q); want a path ending in /merged (the §4.6 overlay merged view)",
-			got, filepath.Base(got))
+	if got := hs.cb.fromStagingArgs[0]; filepath.Base(got) == "merged" {
+		t.Errorf("BuildBaseFromStaging staging path = %q; materialized parent should be the staging root, not an overlay mount", got)
 	}
 	if len(hs.fvm.mountedKeys) != 1 {
-		t.Fatalf("MountParentExt4ReadOnly called %d times, want 1", len(hs.fvm.mountedKeys))
+		t.Fatalf("MaterializeParentExt4 called %d times, want 1", len(hs.fvm.mountedKeys))
 	}
 	if hs.fvm.mountedKeys[0] != "base/runner-base-debian-parent-amd64.ext4" {
 		t.Errorf("mounted with key %q, want base/runner-base-debian-parent-amd64.ext4", hs.fvm.mountedKeys[0])
 	}
-	// UmountParentExt4 must be called on shutdown path even on
-	// the success branch — pinned because a leak here would
-	// surface as the next 30-minute orphan sweep.
-	if hs.fvm.umountCalls != 1 {
-		t.Errorf("UmountParentExt4 called %d times, want 1 (parent mount must always be released)", hs.fvm.umountCalls)
+	// The vmmd materialize RPC owns the short-lived mount and releases it
+	// before returning; imaged no longer receives a mountpoint to release.
+	if hs.fvm.umountCalls != 0 {
+		t.Errorf("UmountParentExt4 called %d times, want 0 (vmmd owns the mount lifecycle)", hs.fvm.umountCalls)
 	}
 	if rc, err := hs.be.Get(context.Background(), baseKey); err != nil {
 		t.Errorf("base ext4 not published at %s: %v", baseKey, err)
@@ -1386,6 +1377,32 @@ func TestWriteScanSidecar_UsesPublishedLocalPath(t *testing.T) {
 	}
 	if scanned != canonical {
 		t.Errorf("grype source = %q, want canonical published path %q", scanned, canonical)
+	}
+}
+
+func TestScanSidecarSourceCurrent_RetriesFailClosedPlaceholder(t *testing.T) {
+	be, err := storage.NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	baseKey := "base/runtime.ext4"
+	canonical, ok, err := be.LocalPath(baseKey)
+	if err != nil || !ok {
+		t.Fatalf("LocalPath = %q, %t, %v", canonical, ok, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("ext4-placeholder"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	sidecar := []byte(`{"source":"` + canonical + `","findings":{"CRITICAL":9999}}`)
+	if err := be.Put(context.Background(), wire.ScanKeyForBaseKey(baseKey), bytes.NewReader(sidecar)); err != nil {
+		t.Fatalf("Put sidecar: %v", err)
+	}
+	h := &Handler{}
+	if h.scanSidecarSourceCurrent(context.Background(), be, baseKey, "") {
+		t.Fatal("fail-closed scanner placeholder should be refreshed")
 	}
 }
 

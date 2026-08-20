@@ -3,6 +3,7 @@ package releaseinstall
 import (
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/onebox-faas/faas/pkg/manifest"
 )
@@ -18,9 +19,46 @@ var supportBinaryNames = []string{
 	"vmmd-stream-bridge",
 }
 
+// runtimeAssetNames is the immutable set of guest function runners that
+// imaged injects into application layers. They are release assets, not
+// daemons: keeping them inside the same release directory makes the runner
+// paths atomic with the imaged binary and prevents a rollback from pairing
+// old code with a new runner ABI.
+var runtimeAssetNames = []string{
+	"runners/go124/faas-runner",
+	"runners/go124-alpine/faas-runner",
+	"runners/node22/faas-runner",
+	"runners/node24/faas-runner",
+	"runners/python312/faas-runner",
+	"runners/python313/faas-runner",
+}
+
 // SupportBinaryNames returns the fixed support-binary catalog in stable order.
 func SupportBinaryNames() []string {
 	return append([]string(nil), supportBinaryNames...)
+}
+
+// RuntimeAssetNames returns the stable release-relative paths for all
+// function-runner assets.
+func RuntimeAssetNames() []string {
+	return append([]string(nil), runtimeAssetNames...)
+}
+
+// IsRuntimeAssetName reports whether name is one of the release's approved
+// nested runtime assets.
+func IsRuntimeAssetName(name string) bool {
+	for _, candidate := range runtimeAssetNames {
+		if name == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedRuntimeAssetNames() []string {
+	assets := RuntimeAssetNames()
+	sort.Strings(assets)
+	return assets
 }
 
 // executableName translates the manifest's logical daemon key to the

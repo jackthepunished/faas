@@ -70,6 +70,26 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       go build -trimpath -tags linux \
         -o /out/faas-guest-init ./guest/init
 
+# BuildKit's server has a deliberately strict session liveness check. The
+# stock buildctl release has no flag for its per-session timeout header, while
+# slow bare-metal builders can spend several minutes importing a remote layer.
+# Build the tiny upstream client with the repository patch that opts into a
+# bounded, longer session interval; buildkitd itself remains the pinned
+# upstream release binary below.
+FROM golang:1.25.7@sha256:5a79b94c34c299ac0361fbb7c7fca6dc552e166b42341050323fa3ab137d7be9 AS buildkit-client-build
+WORKDIR /src/buildkit
+ARG BUILDKIT_VERSION
+ARG TARGETOS
+ARG TARGETARCH
+COPY images/buildkit-session-health.patch /tmp/buildkit-session-health.patch
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && \
+      rm -rf /var/lib/apt/lists/* && \
+      curl -fsSL "https://github.com/moby/buildkit/archive/refs/tags/v${BUILDKIT_VERSION}.tar.gz" | \
+        tar -xzf - --strip-components=1 -C /src/buildkit && \
+      git apply /tmp/buildkit-session-health.patch && \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+        go build -trimpath -o /out/buildctl ./cmd/buildctl
+
 # ---- stage 2: assemble the runtime rootfs -------------------------------
 # See the stage 1 FROM above re: $TARGETPLATFORM handling.
 # Docker's build-time /etc/resolv.conf is a read-only injected mount, so keep
@@ -91,17 +111,19 @@ ARG MISE_VERSION
 ARG TARGETARCH
 
 RUN apk add --no-cache \
-      git ca-certificates curl xz shadow-subids fuse-overlayfs runc util-linux
+      git ca-certificates curl xz shadow-subids fuse-overlayfs runc util-linux util-linux-misc
 
 # guest-init and BuildKit use the stable platform path for the OCI runtime;
 # Alpine packages runc under /usr/bin.
 RUN ln -s /usr/bin/runc /usr/local/bin/runc
 
-# Rootless BuildKit runs inside the builder microVM's user namespace. Give
-# the mapped root a bounded subordinate range so runc can materialise image
-# ownership (for example root:shadow) without falling back to host access.
-RUN printf 'root:100000:65536\n' > /etc/subuid && \
-    printf 'root:100000:65536\n' > /etc/subgid
+# guest-init uses util-linux unshare's automatic subordinate-ID mapping. The
+# BusyBox applet accepts neither --map-users nor --map-groups, so assert the
+# actual runtime contract while assembling the image instead of discovering a
+# stale/incomplete builder rootfs only after a VM has booted.
+RUN test -x /usr/local/bin/runc && \
+    test -x /usr/bin/unshare && \
+    /usr/bin/unshare --help 2>&1 | grep -q -- '--map-users'
 
 # Rootless BuildKit runs inside the builder microVM's user namespace. Give
 # the mapped root a bounded subordinate range so runc can materialise image
@@ -112,13 +134,15 @@ RUN printf 'root:100000:65536\n' > /etc/subuid && \
 # BuildKit rootless. Two files: buildkitd (daemon) + buildctl (client). The
 # upstream tarball unpacks both into ./bin/.
 RUN mkdir -p /opt/buildkit && \
-    curl -fsSL -o /tmp/buildkit.tgz \
+      curl -fsSL -o /tmp/buildkit.tgz \
       "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-${TARGETARCH}.tar.gz" && \
-    tar -C /opt/buildkit -xzf /tmp/buildkit.tgz && \
-    rm /tmp/buildkit.tgz && \
-    install -m 0755 /opt/buildkit/bin/buildkitd /usr/local/bin/buildkitd && \
-    install -m 0755 /opt/buildkit/bin/buildctl   /usr/local/bin/buildctl && \
-    rm -rf /opt/buildkit
+      tar -C /opt/buildkit -xzf /tmp/buildkit.tgz && \
+      rm /tmp/buildkit.tgz && \
+      install -m 0755 /opt/buildkit/bin/buildkitd /usr/local/bin/buildkitd && \
+      rm -rf /opt/buildkit
+
+COPY --from=buildkit-client-build /out/buildctl /usr/local/bin/buildctl
+RUN chmod 0755 /usr/local/bin/buildctl
 
 # Railpack. The current naming convention is `<ver>-<arch>-unknown-linux-musl.tar.gz`
 # where <arch> is `x86_64` or `arm64`. We resolve the right arch from TARGETARCH.
@@ -164,3 +188,9 @@ COPY --from=guest-init-build /out/faas-guest-init /usr/local/bin/faas-guest-init
 RUN chmod +x /usr/local/bin/faas-guest-init
 
 WORKDIR /build
+
+# BuildKit is deliberately launched rootless inside the builder VM's user
+# namespace. The workspace is disposable VM-local state, so it must be
+# writable by the mapped worker uid rather than relying on the image's root
+# ownership surviving OCI-to-ext4 materialisation.
+RUN chmod 0777 /build

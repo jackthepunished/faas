@@ -51,6 +51,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/storage"
 )
 
 // Store is the minimal state.Store surface the deploy+build flow
@@ -129,6 +130,36 @@ type EnqueueResult struct {
 	BuildID      string
 }
 
+// sourceBackendFromEnv enables the split-box source handoff only when the
+// deployment explicitly selects the OCI backend. Single-box/local installs
+// keep the historical shared filesystem contract and do not upload a second
+// copy of the source archive.
+func sourceBackendFromEnv() (storage.StorageBackend, error) {
+	if os.Getenv("FAAS_STORAGE_BACKEND") != "oci" {
+		return nil, nil
+	}
+	be, err := storage.BackendFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("source storage: %w", err)
+	}
+	return be, nil
+}
+
+func publishSource(ctx context.Context, be storage.StorageBackend, buildID, path string) error {
+	if be == nil {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open source archive: %w", err)
+	}
+	defer f.Close()
+	if err := be.Put(ctx, "sources/"+buildID+".tar.gz", f); err != nil {
+		return fmt.Errorf("publish source archive: %w", err)
+	}
+	return nil
+}
+
 // Enqueue runs the canonical "create deployment + build + notify"
 // flow described in this file's header.
 //
@@ -166,6 +197,10 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 	}
 	if p.SourcePath == "" {
 		return EnqueueResult{}, fmt.Errorf("apidsource.Enqueue: SourcePath is required")
+	}
+	sourceStorage, err := sourceBackendFromEnv()
+	if err != nil {
+		return EnqueueResult{}, fmt.Errorf("apidsource.Enqueue: %w", err)
 	}
 
 	// Step 1: read prior deployment so the supersede notify can
@@ -220,6 +255,19 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 	build, err := store.CreateBuild(ctx, d.ID, p.Kind, p.SourceBytes, filepath.Join(logDir, "build.log"))
 	if err != nil {
 		return EnqueueResult{}, fmt.Errorf("apidsource.Enqueue: create build: %w", err)
+	}
+
+	// Split-box source handoff. The build row carries the local source path
+	// for compatibility, while compute-side builderd retrieves the same
+	// archive from the shared OCI namespace keyed by the durable build ID.
+	// Publish before the NOTIFY so a fast builderd cannot claim a row before
+	// its source is visible remotely. A failed publish deliberately leaves the
+	// row queued; the durable builder worker can retry after a transient
+	// registry or source-spool failure.
+	if err := publishSource(ctx, sourceStorage, build.ID, p.SourcePath); err != nil {
+		p.Log.Warn("apidsource.Enqueue: source handoff failed (build remains queued for retry)",
+			"build", build.ID, "deployment", d.ID, "app", p.AppID, "err", err)
+		return EnqueueResult{}, fmt.Errorf("apidsource.Enqueue: source handoff: %w", err)
 	}
 
 	// Resolve the wire "source" field. Default to Kind so the

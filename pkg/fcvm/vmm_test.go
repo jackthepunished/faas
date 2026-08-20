@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	storagedriver "github.com/onebox-faas/faas/pkg/storage"
 )
 
@@ -42,6 +43,17 @@ func TestConsoleShowsGuestHaltedReadsTail(t *testing.T) {
 	}
 	if consoleShowsGuestHalted(path) {
 		t.Fatal("did not expect halt marker")
+	}
+}
+
+func TestDestroyWaitForUsesConfiguredBuilderTimeout(t *testing.T) {
+	v := NewJailerVMM(t.TempDir(), 0)
+	v.destroyWait = time.Second
+	if got, want := v.destroyWaitFor("/export", 1800), 2400*time.Second; got != want {
+		t.Fatalf("destroy wait = %s, want %s", got, want)
+	}
+	if got, want := v.destroyWaitFor("/export", 0), time.Duration(api.BuildTimeoutSeconds+600)*time.Second; got != want {
+		t.Fatalf("default destroy wait = %s, want %s", got, want)
 	}
 }
 

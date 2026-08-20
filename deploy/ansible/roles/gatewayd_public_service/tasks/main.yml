@@ -62,3 +62,12 @@
     owner: root
     group: root
     mode: "0644"
+
+- name: gatewayd_public_service — install split-box internal target drop-in
+  ansible.builtin.template:
+    src: 99-faas-internal-target.conf.j2
+    dest: /etc/systemd/system/faas-gatewayd-public.service.d/99-faas-internal-target.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart faas-gatewayd-public

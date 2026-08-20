@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,6 +27,13 @@ import (
 // remote OCI image's config digest hasn't changed since the last stage, the
 // existing ext4 is trusted as-is. When it has, the layers are re-pulled and
 // the ext4 is rewritten atomically (write to <out>.tmp, fsync, rename).
+
+// baseLayoutVersion is part of the digest sidecar value, not the OCI image
+// digest. It invalidates bases produced before a boot-contract change (for
+// example, when OCI layers omitted the empty /proc and /sys mountpoints).
+// Keeping this in the sidecar makes upgrades self-healing even when the
+// remote image digest is unchanged and the old artifact is already cached.
+const baseLayoutVersion = "faas-base-layout-v2"
 
 // BaseStageResult reports what EnsureBaseExt4 did. Skip=true means the
 // existing artifact matched the remote digest and was left untouched.
@@ -139,7 +145,7 @@ func (h *Handler) EnsureBaseExt4(
 	if haveRC, err := be.Get(ctx, digestKey); err == nil {
 		haveBytes, rerr := io.ReadAll(haveRC)
 		_ = haveRC.Close()
-		if rerr == nil && string(haveBytes) == wantDigest {
+		if rerr == nil && baseDigestSidecarMatches(string(haveBytes), wantDigest) {
 			if rc, err := be.Get(ctx, baseKey); err == nil {
 				_ = rc.Close()
 				// A digest match proves the ext4 bytes are current, but
@@ -237,14 +243,14 @@ func (h *Handler) EnsureBaseExt4(
 	}, nil
 }
 
-// writeBaseDigestSidecar writes the per-base config-digest
+// writeBaseDigestSidecar writes the per-base config-digest and base layout
 // sidecar at digestKey. Extracted from the legacy EnsureBaseExt4
 // path so the parent-ref branch can call the same helper
 // (ADR-053). The sidecar is the source of truth for the
 // "did this base already stage?" check — re-fetching tens of
 // MB of layers on every daemon restart would be wasteful.
 func (h *Handler) writeBaseDigestSidecar(ctx context.Context, be storage.StorageBackend, digestKey, wantDigest string) error {
-	digestRC, err := openStringReader(wantDigest)
+	digestRC, err := openStringReader(baseDigestSidecarValue(wantDigest))
 	if err != nil {
 		return fmt.Errorf("imaged: open digest sidecar: %w", err)
 	}
@@ -252,6 +258,14 @@ func (h *Handler) writeBaseDigestSidecar(ctx context.Context, be storage.Storage
 		return fmt.Errorf("imaged: write digest sidecar %q: %w", digestKey, err)
 	}
 	return nil
+}
+
+func baseDigestSidecarValue(configDigest string) string {
+	return configDigest + "\n" + baseLayoutVersion
+}
+
+func baseDigestSidecarMatches(have, want string) bool {
+	return strings.TrimSpace(have) == baseDigestSidecarValue(want)
 }
 
 // ensureBaseExt4ParentRef is the ADR-053 staging path: ask vmmd
@@ -359,69 +373,23 @@ func (h *Handler) ensureBaseExt4ParentRef(
 		blobByDiff[runtimeCfg.DiffIDs[i]] = l
 	}
 
-	// Mount the parent ext4 read-only via vmmd (the only root
-	// component). Defer the umount so a partial merge or
-	// ApplyLayerGz error still releases the mount — a stuck
-	// parent mount would surface as the next 30-minute orphan
-	// sweep, but explicit defer-on-error is faster + safer.
-	mountpoint, err := h.vmmClient.MountParentExt4ReadOnly(ctx, parentBaseKey)
-	if err != nil {
-		return BaseStageResult{}, fmt.Errorf("imaged: mount parent ext4 %q: %w", parentBaseKey, err)
-	}
-	defer func() {
-		// Use a detached ctx so a cancelled staging request still
-		// releases the parent mount cleanly (Registry.Umount
-		// forgets + rm-src atomically).
-		if uerr := h.vmmClient.UmountParentExt4(context.WithoutCancel(ctx), mountpoint); uerr != nil {
-			h.log.Warn("imaged: umount parent ext4 failed", "mountpoint", mountpoint, "err", uerr)
-		}
-	}()
-
-	// Build an overlayfs three-dir layout under a fresh staging
-	// root: lowerdir = parent mountpoint (read-only, immutable),
-	// upperdir = fresh empty dir where delta layers will land,
-	// workdir = overlayfs internal scratch. Then ask vmmd to
-	// mount an overlayfs with merged = staging/merged so the
-	// merged view IS the child filesystem; ApplyLayerGz on
-	// `upper` and mkfs.ext4 -d `merged` give us the child ext4
-	// with the parent userland shared on disk.
+	// Ask vmmd to mount the parent ext4 and copy its contents into a shared
+	// ordinary-file staging tree. Mount visibility is scoped to vmmd's service
+	// namespace, so returning a mountpoint and asking imaged to read it is not
+	// sufficient. vmmd owns the short-lived mount and releases it before this
+	// call returns.
 	staging, err := rootfs.MkdirBaseStaging()
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref staging dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(staging) }()
 
-	upper := filepath.Join(staging, "upper")
-	workdir := filepath.Join(staging, "work")
-	merged := filepath.Join(staging, "merged")
-	for _, p := range []string{upper, workdir, merged} {
-		if err := os.Mkdir(p, 0o755); err != nil {
-			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref mkdir %s: %w", p, err)
-		}
+	if err := h.vmmClient.MaterializeParentExt4(ctx, parentBaseKey, staging); err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: materialize parent ext4 %q: %w", parentBaseKey, err)
 	}
 
-	// Install the umount defer UNCONDITIONALLY before issuing
-	// the mount RPC (review M5). The gRPC reply can be lost
-	// after the kernel mount succeeded; without an unconditional
-	// defer the staging tree leaks and the registry loses
-	// visibility. vmmd's UmountOverlayParent is idempotent on
-	// unknown mountpoints so this defer is safe even when no
-	// mount ever landed.
-	defer func() {
-		// Detached ctx so a cancelled staging request still
-		// releases the overlay mount cleanly.
-		if uerr := h.vmmClient.UmountOverlayParent(context.WithoutCancel(ctx), merged); uerr != nil {
-			h.log.Warn("imaged: umount parent overlay failed", "mountpoint", merged, "err", uerr)
-		}
-	}()
-	if err := h.vmmClient.MountOverlayParent(ctx, mountpoint, upper, workdir, merged); err != nil {
-		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref overlay mount: %w", err)
-	}
-
-	// Apply the delta layers onto the overlay upper dir. The
-	// modifications land in `upper`, not on the parent mount;
-	// the merged view via mkfs.ext4 -d presents the composed
-	// filesystem. Each layer is streamed via rootfs.ApplyLayerGz
+	// Apply the delta layers directly to the materialized parent tree. Each
+	// layer is streamed via rootfs.ApplyLayerGz
 	// directly — the legacy path collects readers into a slice
 	// and hands them to BuildBase, but the parent-ref path
 	// applies layers in-place (BuildBaseFromStaging doesn't read
@@ -442,12 +410,12 @@ func (h *Handler) ensureBaseExt4ParentRef(
 			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref pull blob %s: %w", desc.Digest, err)
 		}
 		closers = append(closers, rc)
-		if err := rootfs.ApplyLayerGz(upper, rc); err != nil {
+		if err := rootfs.ApplyLayerGz(staging, rc); err != nil {
 			return BaseStageResult{}, fmt.Errorf("imaged: parent-ref apply delta layer %s: %w", desc.Digest, err)
 		}
 	}
 
-	res, err := h.builder.BuildBaseFromStaging(ctx, merged, rootfs.BaseBuildInput{
+	res, err := h.builder.BuildBaseFromStaging(ctx, staging, rootfs.BaseBuildInput{
 		Storage:       be,
 		StorageKey:    baseKey,
 		GuestInitPath: h.guestInitPath,
@@ -617,6 +585,10 @@ func scanSourceForBase(be storage.StorageBackend, baseKey, outImage string) (str
 // scan path. Sidecars written before the source field was added are treated
 // as stale and refreshed once, which repairs existing installations after
 // the storage-key migration without rescanning every clean base forever.
+// Fail-closed scanner-error placeholders are also stale: once the operator
+// repairs the scanner database or binary, the next imaged restart must be
+// able to replace CRITICAL=9999 rather than preserving a transient outage as
+// a permanent boot refusal.
 func (h *Handler) scanSidecarSourceCurrent(ctx context.Context, be storage.StorageBackend, baseKey, outImage string) bool {
 	source, err := scanSourceForBase(be, baseKey, outImage)
 	if err != nil {
@@ -628,9 +600,13 @@ func (h *Handler) scanSidecarSourceCurrent(ctx context.Context, be storage.Stora
 	}
 	defer func() { _ = rc.Close() }()
 	var sidecar struct {
-		Source string `json:"source"`
+		Source   string         `json:"source"`
+		Findings map[string]int `json:"findings"`
 	}
 	if err := json.NewDecoder(rc).Decode(&sidecar); err != nil {
+		return false
+	}
+	if sidecar.Findings[SeverityCritical] >= 9999 {
 		return false
 	}
 	return sidecar.Source != "" && sidecar.Source == source
@@ -686,15 +662,21 @@ type RuntimeBaseRef struct {
 // the build/run path at function-deploy time reuses go124's runner
 // binary.
 //
-// ADR-053: the four node/python runtime rows now declare
-// ParentRef: BaseRefDebianParent. The shared parent is staged
+// ADR-053: the Debian-backed node/python runtime rows declare
+// ParentRef: BaseRefDebianParent. Node22 is intentionally standalone on
+// Alpine because musl cannot compose over the shared glibc parent; its full
+// OCI chain is staged through the legacy (parentRef="") path. The shared
+// parent is staged
 // first (index 0) so a parent re-stage failure aborts the loop
 // before any child is attempted — half-staged fleet is worse
 // than refuse. The parent row's ParentRef is "" (legacy path:
 // apply ALL its layers, no composition).
 var DefaultRuntimeBaseRefs = []RuntimeBaseRef{
 	{Runtime: RuntimeDebianParent, Ref: BaseRefDebianParent, EnvOverride: "FAAS_DEPLOY_BASE_REF_DEBIAN_PARENT"},
-	{Runtime: RuntimeNode22, Ref: BaseRefNode22, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE22", ParentRef: BaseRefDebianParent},
+	// Node22 uses the Alpine/musl image and cannot share the Debian/glibc
+	// parent. Keep it on the full-chain path until a musl-specific parent is
+	// introduced; this is a deliberate security/runtime-compatibility split.
+	{Runtime: RuntimeNode22, Ref: BaseRefNode22, EnvOverride: "FAAS_DEPLOY_BASE_REF_NODE22"},
 	{Runtime: RuntimePython312, Ref: BaseRefPython312, EnvOverride: "FAAS_DEPLOY_BASE_REF_PYTHON312", ParentRef: BaseRefDebianParent},
 	{Runtime: RuntimeGo124, Ref: BaseRefGo124, EnvOverride: "FAAS_DEPLOY_BASE_REF_GO124"},
 	{Runtime: RuntimeGo124Alpine, Ref: BaseRefGo124Alpine, EnvOverride: "FAAS_DEPLOY_BASE_REF_GO124_ALPINE"},
@@ -819,6 +801,64 @@ func (h *Handler) EnsureBases(ctx context.Context, arch string, refs []RuntimeBa
 		})
 	}
 	return out, nil
+}
+
+// EnsureRuntimeBase stages one runtime (and its shared parent, when the
+// runtime uses the parent-ref layout) for a deployment. Runtime bases are
+// deliberately lazy: staging all supported runtimes during imaged startup
+// makes a new bare-metal node spend its readiness budget and memory building
+// runtimes it may never serve. The digest sidecars keep this path idempotent.
+func (h *Handler) EnsureRuntimeBase(ctx context.Context, runtime, arch string, envLookup func(string) string) (BaseStageResult, error) {
+	if runtime == "" {
+		return BaseStageResult{}, errors.New("imaged: EnsureRuntimeBase: empty runtime")
+	}
+	if arch == "" {
+		return BaseStageResult{}, errors.New("imaged: EnsureRuntimeBase: empty arch")
+	}
+	var row RuntimeBaseRef
+	found := false
+	for _, candidate := range DefaultRuntimeBaseRefs {
+		if candidate.Runtime == runtime {
+			row = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return BaseStageResult{}, fmt.Errorf("imaged: EnsureRuntimeBase: unsupported runtime %q", runtime)
+	}
+
+	// A parent-ref runtime must be staged after its parent. Keep this call
+	// serialized with other deployment-triggered staging so two first-use
+	// requests cannot publish the same parent/child pair concurrently.
+	h.runtimeBaseMu.Lock()
+	defer h.runtimeBaseMu.Unlock()
+
+	refs := []RuntimeBaseRef{row}
+	if row.ParentRef != "" {
+		for _, candidate := range DefaultRuntimeBaseRefs {
+			if candidate.Ref == row.ParentRef {
+				refs = append([]RuntimeBaseRef{candidate}, refs...)
+				break
+			}
+		}
+		if len(refs) == 1 {
+			return BaseStageResult{}, fmt.Errorf("imaged: EnsureRuntimeBase: parent ref %q is not in runtime matrix", row.ParentRef)
+		}
+	}
+	results, err := h.EnsureBases(ctx, arch, refs, envLookup)
+	if err != nil {
+		return BaseStageResult{}, err
+	}
+	if len(results) == 0 {
+		return BaseStageResult{}, fmt.Errorf("imaged: EnsureRuntimeBase: runtime %q produced no result", runtime)
+	}
+	last := results[len(results)-1]
+	return BaseStageResult{
+		StorageKey:   sched.BaseKeyForArch(last.Runtime, arch),
+		ConfigDigest: last.ConfigDigest,
+		Skipped:      last.Skipped,
+	}, nil
 }
 
 // envLookup nil-falls-back to os.Getenv; the test seam is a map

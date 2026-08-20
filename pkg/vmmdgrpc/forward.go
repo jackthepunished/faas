@@ -90,6 +90,13 @@ const ForwardStreamResponseTimeout = 900 * time.Second
 // to context.WithDeadline on the per-request goroutine.
 const streamBridgeSessionDeadline = 24 * time.Hour
 
+// streamBridgeSocketReadyTimeout covers the host-side `ip netns exec`
+// startup cost before the v2 bridge binds its per-instance socket. The old
+// 50 ms probe was fast on a developer laptop but routinely killed a valid
+// bridge on a loaded compute node before it could bind, turning every first
+// request into a misleading 503.
+const streamBridgeSocketReadyTimeout = 2 * time.Second
+
 // ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047) is the
 // bidi bridge the gatewayd-internal hot path uses for every request. Wire
 // shape:
@@ -239,7 +246,13 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 	}
 	defer func() { _ = stdoutR.Close() }()
 
-	cmd := exec.CommandContext(ctx, "ip", "netns", "exec", netnsName, "sh", "-c",
+	// The v1 compatibility bridge uses Bash's /dev/tcp pseudo-device.
+	// Launching it with /bin/sh works on some images only until the first
+	// request, then dash reports "/dev/tcp/...: Directory nonexistent" and
+	// the documented live rollback becomes unusable. Keep the legacy script
+	// isolated to bash explicitly; v2 remains the default and does not
+	// depend on a shell.
+	cmd := exec.CommandContext(ctx, "ip", "netns", "exec", netnsName, "bash", "-c",
 		buildStreamingBridgeScript(reqInit, respTimeout))
 	cmd.Stdin = stdinR
 	cmd.Stdout = stdoutW
@@ -1429,6 +1442,9 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	// 3. Spawn the bridge. Mirrors rawBridgeSpawn (forward.go:668).
 	cmd, stderr, err := streamBridgeSpawn(ctx, bridgePath, netnsName, sockPath, netns.GuestIP, dialPort, sessionDeadline, bridgeEnv)
 	if err != nil {
+		s.log.Warn("vmmd: stream bridge spawn failed",
+			"instance", reqInit.GetInstance(), "netns", netnsName,
+			"guest_ip", netns.GuestIP, "guest_port", dialPort, "err", err.Error())
 		return status.Errorf(codes.Unavailable, "stream bridge start: %v", err)
 	}
 	defer func() { _ = cmd.Process.Signal(syscall.SIGTERM) }()
@@ -1437,8 +1453,11 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	// opens the socket synchronously before serving (cmd/vmmd-stream-bridge
 	// main.go:108-122), so a brief poll for the socket file is
 	// sufficient. 50 ms cap so a wedged bridge fails loud.
-	if err := waitForUnixSock(sockPath, 50*time.Millisecond); err != nil {
+	if err := waitForUnixSock(sockPath, streamBridgeSocketReadyTimeout); err != nil {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
+		s.log.Warn("vmmd: stream bridge socket not ready",
+			"instance", reqInit.GetInstance(), "netns", netnsName,
+			"socket", sockPath, "stderr", stderr.String(), "err", err.Error())
 		return status.Errorf(codes.Unavailable, "stream bridge socket not ready: %v (stderr: %s)", err, stderr.String())
 	}
 
@@ -1514,6 +1533,10 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	if err != nil {
 		_ = bodyPr.Close()
 		bridgeErr := bridgeWait(cmd, stderr)
+		s.log.Warn("vmmd: stream bridge H2C request failed",
+			"instance", reqInit.GetInstance(), "netns", netnsName,
+			"guest_ip", netns.GuestIP, "guest_port", dialPort,
+			"bridge_err", bridgeErr, "err", err.Error())
 		return status.Errorf(codes.Unavailable, "H2C request: %v (bridge: %v)", err, bridgeErr)
 	}
 	defer func() { _ = httpResp.Body.Close() }()
@@ -1599,6 +1622,10 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 	// Error mapping mirrors v1 priority.
 	if bridgeErr != nil {
 		s.ops.Observe(op, time.Since(start), bridgeErr)
+		s.log.Warn("vmmd: stream bridge exited with error",
+			"instance", reqInit.GetInstance(), "netns", netnsName,
+			"guest_ip", netns.GuestIP, "guest_port", dialPort,
+			"stderr", stderr.String(), "err", bridgeErr.Error())
 		return status.Errorf(codes.Unavailable, "stream bridge: %v (stderr: %s)", bridgeErr, stderr.String())
 	}
 	if bodyErr != nil && !errors.Is(bodyErr, io.EOF) {

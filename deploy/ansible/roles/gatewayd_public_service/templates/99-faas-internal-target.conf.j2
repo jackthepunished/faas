@@ -1,0 +1,4 @@
+[Service]
+# Split-box edge routing. Empty keeps the legacy same-box unix socket;
+# manifest-generated control-plane inventory sets the private compute target.
+Environment=FAAS_INTERNAL_TARGET={{ faas_gatewayd_internal_target | default('') }}

@@ -14,6 +14,7 @@ plain `python3 -m unittest` tests invoked by the Makefile via
 from __future__ import annotations
 
 import json
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,16 @@ import unittest
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
+
+
+def _load_lock_update_module():
+    path = SCRIPTS / "images_lock_update.py"
+    spec = importlib.util.spec_from_file_location("images_lock_update", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _run(script: str, *args: str, cwd: Path) -> subprocess.CompletedProcess:
@@ -143,6 +154,30 @@ class TestImagesLockCheck(unittest.TestCase):
         r = _run("images_lock_check.py", "--repo-root", str(self.tmp), cwd=self.tmp)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("does not match lock", r.stderr)
+
+
+class TestImagesLockUpdatePlatformSelection(unittest.TestCase):
+    def test_manifest_list_resolves_requested_child(self) -> None:
+        update = _load_lock_update_module()
+        manifest = {
+            "manifests": [
+                {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}},
+                {"digest": "sha256:x86", "platform": {"os": "linux", "architecture": "amd64"}},
+            ]
+        }
+        self.assertEqual(
+            update._select_platform_digest(manifest, "linux/amd64"),
+            "sha256:x86",
+        )
+
+    def test_manifest_list_without_matching_child_returns_none(self) -> None:
+        update = _load_lock_update_module()
+        manifest = {
+            "manifests": [
+                {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}},
+            ]
+        }
+        self.assertIsNone(update._select_platform_digest(manifest, "linux/amd64"))
 
 
 if __name__ == "__main__":

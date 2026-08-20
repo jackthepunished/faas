@@ -11,7 +11,7 @@
 # the box — per-app cost is just the customer's package.json-resolved
 # node_modules + handler. The 130 MB/sandbox accounting is preserved
 # (CLAUDE.md "load-bearing — DO NOT fix").
-FROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
+FROM node:24-bookworm-slim@sha256:65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848
 # Issue #197 B3.6: mutable tag pinned via images/Dockerfile.lock.
 RUN id app 2>/dev/null || useradd -u 1000 -m app
 WORKDIR /app

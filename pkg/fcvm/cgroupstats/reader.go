@@ -177,7 +177,7 @@ func (r *Reader) Instances() ([]InstanceInfo, error) {
 	if runtime.GOOS != linuxGOOS {
 		return nil, nil
 	}
-	base := filepath.Join(r.root, fcvm.ParentCgroupRoot)
+	base := filepath.Join(r.root, fcvm.CgroupMountRoot)
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		// Missing slice (cold-boot race, transient teardown) is
@@ -198,7 +198,7 @@ func (r *Reader) Instances() ([]InstanceInfo, error) {
 		// just yields zero leaves for that plan. systemd drops the
 		// sub-slices at boot, so once any VM has woken on a plan
 		// the dir is sticky for the daemon's lifetime.
-		planDir := filepath.Join(base, plan.SliceName())
+		planDir := filepath.Join(base, "faas-tenant-"+plan.SliceName()+".slice")
 		planEntries, perr := os.ReadDir(planDir)
 		if perr != nil {
 			if errors.Is(perr, fs.ErrNotExist) {

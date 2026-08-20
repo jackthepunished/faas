@@ -91,6 +91,7 @@ type Unit struct {
 	RestartSec            string
 	Slice                 string
 	MemoryMax             string
+	Delegate              bool
 	CapabilityBoundingSet []string
 	AmbientCapabilities   []string
 	EnvironmentFile       string
@@ -133,7 +134,7 @@ func BoolPtr(b bool) *bool { return &b }
 // Render emits the unit file as bytes. Section ordering: [Unit] first,
 // then [Service], then [Install] — matching every shipped faas unit.
 // Inside [Service], field ordering is fixed (Type → User → Group →
-// ExecStartPre → ExecStart → Restart → RestartSec → Slice → MemoryMax →
+// ExecStartPre → ExecStart → Restart → RestartSec → Slice → MemoryMax → Delegate →
 // CapabilityBoundingSet → AmbientCapabilities → EnvironmentFile →
 // Environment entries → LoadCredential entries → NoNewPrivileges →
 // ProtectSystem → ProtectHome → PrivateTmp → PrivateDevices →\n →
@@ -182,6 +183,9 @@ func (u Unit) Render() []byte {
 	writeStringKV(&buf, "RestartSec", u.RestartSec)
 	writeStringKV(&buf, "Slice", u.Slice)
 	writeStringKV(&buf, "MemoryMax", u.MemoryMax)
+	if u.Delegate {
+		buf.WriteString("Delegate=yes\n")
+	}
 
 	// CapabilityBoundingSet empty-but-present is intentional (locks down
 	// the cap set; see struct godoc). We write it as `CapabilityBoundingSet=`
@@ -196,7 +200,13 @@ func (u Unit) Render() []byte {
 		buf.WriteString(strings.Join(u.AmbientCapabilities, " "))
 		buf.WriteByte('\n')
 	}
-	writeStringKV(&buf, "EnvironmentFile", u.EnvironmentFile)
+	// EnvironmentFile accepts one path per directive. The compact model field
+	// is space-separated for backwards compatibility with the existing specs,
+	// but emitting the whole value as one directive makes systemd treat it as
+	// one literal filename (and silently skips the second file).
+	for _, path := range strings.Fields(u.EnvironmentFile) {
+		writeStringKV(&buf, "EnvironmentFile", path)
+	}
 	for _, env := range u.Environment {
 		buf.WriteString("Environment=")
 		buf.WriteString(env.Key)
@@ -466,12 +476,18 @@ func apply(u *Unit, section, key, val string) error {
 		u.Slice = val
 	case "[Service]/MemoryMax":
 		u.MemoryMax = val
+	case "[Service]/Delegate":
+		u.Delegate = parseYes(val)
 	case "[Service]/CapabilityBoundingSet":
 		u.CapabilityBoundingSet = splitOrEmpty(val)
 	case "[Service]/AmbientCapabilities":
 		u.AmbientCapabilities = strings.Fields(val)
 	case "[Service]/EnvironmentFile":
-		u.EnvironmentFile = val
+		if u.EnvironmentFile == "" {
+			u.EnvironmentFile = val
+		} else {
+			u.EnvironmentFile += " " + val
+		}
 	case "[Service]/Environment":
 		eq := strings.IndexByte(val, '=')
 		if eq < 0 {
@@ -633,6 +649,7 @@ func Diff(a, b Unit) []string {
 	add("[Service]", "RestartSec", a.RestartSec, b.RestartSec)
 	add("[Service]", "Slice", a.Slice, b.Slice)
 	add("[Service]", "MemoryMax", a.MemoryMax, b.MemoryMax)
+	add("[Service]", "Delegate", boolStr(a.Delegate), boolStr(b.Delegate))
 	add("[Service]", "CapabilityBoundingSet",
 		fmt.Sprintf("%v|%d", sortClone(a.CapabilityBoundingSet), len(a.CapabilityBoundingSet)),
 		fmt.Sprintf("%v|%d", sortClone(b.CapabilityBoundingSet), len(b.CapabilityBoundingSet)))

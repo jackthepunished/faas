@@ -189,11 +189,10 @@ type LocalCacheBackend struct {
 // root. The parent backend is required (nil returns an error).
 // maxBytes <= 0 falls back to DefaultCacheMaxBytes.
 //
-// root is created with mode 0o755 if missing (the cache dir is
-// world-readable on purpose — no secrets in here, and a future
-// hook may share it across containers). Operators set the dir
-// mode in the deploy ansible role; the runtime never loosens
-// or tightens it post-creation.
+// root is created with mode 0o770 if missing. The imaged and builderd
+// services share the cache through their common faas group, so both the root
+// and its fan-out buckets must be group-writable; cache blobs contain no
+// secrets and are not intended for arbitrary users.
 func NewLocalCacheBackend(parent StorageBackend, root string, maxBytes int64) (*LocalCacheBackend, error) {
 	if parent == nil {
 		return nil, errors.New("storage: cache: nil parent backend")
@@ -204,7 +203,7 @@ func NewLocalCacheBackend(parent StorageBackend, root string, maxBytes int64) (*
 	if maxBytes <= 0 {
 		maxBytes = DefaultCacheMaxBytes
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o770); err != nil {
 		return nil, fmt.Errorf("storage: cache: mkdir %q: %w", root, err)
 	}
 	return &LocalCacheBackend{
@@ -518,7 +517,7 @@ func (c *LocalCacheBackend) openCache(key string) (io.ReadCloser, bool) {
 // an OCI cache miss remains bounded by the copy buffer, not by layer size.
 func (c *LocalCacheBackend) materializeCache(ctx context.Context, key string, src io.Reader) (io.ReadCloser, error) {
 	path, metaPath := c.cacheFileFor(key)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o770); err != nil {
 		return nil, fmt.Errorf("cache mkdir %q: %w", filepath.Dir(path), err)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".faas-cache-*")
@@ -600,7 +599,7 @@ func (c *LocalCacheBackend) writeCache(key string, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	path, metaPath := c.cacheFileFor(key)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o770); err != nil {
 		return fmt.Errorf("storage: cache: mkdir %q: %w", filepath.Dir(path), err)
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {

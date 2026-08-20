@@ -10,6 +10,11 @@
 # site; the toml drop in tasks/main.yml honours the override.
 gatewayd_route_metrics_enabled: true
 
+# Shared public wildcard suffix. Operators with a different Cloudflare/public
+# zone override this variable; the split compute gateway must receive the same
+# value as apid and gatewayd-public.
+gatewayd_apps_domain: apps.gregale.dev
+
 # Path of the rendered config file on the box. The alertmanager role
 # uses the same shape (am_config_path) for the alertmanager.yml drop.
 gatewayd_config_path: /etc/faas/gatewayd-internal.toml
@@ -20,3 +25,19 @@ gatewayd_config_path: /etc/faas/gatewayd-internal.toml
 gatewayd_schedd_tls_cert_path: /etc/faas/tls/gatewayd/schedd-client.crt
 gatewayd_schedd_tls_key_path: /etc/faas/tls/gatewayd/schedd-client.key
 gatewayd_schedd_tls_ca_path: /etc/faas/tls/ca/ca.crt
+
+# VMMD client identity used by the split-box gateway to proxy requests to
+# app runners. Keep this separate from the schedd identity so deployments
+# can rotate either transport independently.
+gatewayd_vmmd_tls_cert_path: /etc/faas/tls/gatewayd/vmmd-client.crt
+gatewayd_vmmd_tls_key_path: /etc/faas/tls/gatewayd/vmmd-client.key
+gatewayd_vmmd_tls_ca_path: /etc/faas/tls/ca/ca.crt
+
+# The egress byte stream is a local Unix socket on a single box and a
+# dedicated mTLS TCP listener when gatewayd-internal runs on a compute-only
+# host. The manifest renderer overrides this on split deployments; keeping
+# the default empty preserves the single-box DAC path.
+gatewayd_egress_listen: ""
+gatewayd_egress_tls_cert_path: /etc/faas/tls/egress/egress.crt
+gatewayd_egress_tls_key_path: /etc/faas/tls/egress/egress.key
+gatewayd_egress_tls_ca_path: /etc/faas/tls/ca/ca.crt

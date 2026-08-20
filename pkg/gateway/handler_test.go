@@ -3618,3 +3618,20 @@ func TestStampRequestBudget_LogsEndpointSanitized(t *testing.T) {
 		}
 	}
 }
+
+func TestStampRequestBudget_DoesNotCancelImmediately(t *testing.T) {
+	h := &Handler{metrics: NewMetrics()}
+	app := App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}
+	req := httptest.NewRequest(http.MethodGet, "http://h.example.com/", nil)
+	rec := httptest.NewRecorder()
+
+	h.stampRequestBudget(rec, req, app, 3*time.Second, "plan_default")
+	if err := req.Context().Err(); err != nil {
+		t.Fatalf("stamped request context canceled immediately: %v", err)
+	}
+
+	cancelStampedRequestBudget(req.Context())
+	if err := req.Context().Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelStampedRequestBudget error = %v, want context.Canceled", err)
+	}
+}

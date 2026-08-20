@@ -287,15 +287,21 @@ func (s ColdBootSpec) Validate() error {
 // Jailer paths (spec §8, Appendix B).
 const (
 	JailChrootBase = "/srv/fc/jail"
-	// ParentCgroupRoot is the top-level slice vmmd lands every VM
-	// under. systemd owns this slice (deploy/ansible/roles/systemd_slices/
-	// tasks/main.yml). The per-plan sub-slices (tenant-free, tenant-hobby,
-	// tenant-pro, tenant-scale) live underneath it — see ParentCgroupFor.
+	// ParentCgroupRoot is the logical systemd slice name used by the
+	// legacy helpers and documentation. The cgroup-v2 filesystem path
+	// includes the enclosing faas.slice; CgroupMountRoot carries that
+	// fully-qualified path for production jailer/cgroup operations.
 	// Issue #301 / ADR-044: prior to this PR, every VM landed directly
 	// at faas-tenant.slice/<instance> with a single neutral cpu.weight=256;
 	// the new design nests under the per-plan sub-slice so the kernel
 	// can enforce cpu.weight + cpu.max per plan tier.
 	ParentCgroupRoot = "faas-tenant.slice"
+	CgroupMountRoot  = "faas.slice/faas-tenant.slice"
+	// BuilderCgroupParent is the systemd-owned build slice nested under
+	// faas-cp.slice. Keeping builders below vmmd's delegated service slice
+	// lets the privileged supervisor apply the per-build fence after jailer
+	// creates the instance scope.
+	BuilderCgroupParent = "faas.slice/faas-cp.slice/faas-cp-build.slice"
 	// defaultParentCgroup is the legacy 2-level hierarchy (free / hobby /
 	// pro / scale unaware) — kept as a non-empty fallback for callers
 	// that don't pass a plan through (e.g. unit tests that mock the
@@ -310,7 +316,7 @@ const (
 	// ADR-044). Direct callers that previously read the const must be
 	// updated — a code-review tripwire would be nice but we don't have
 	// one; rely on the package-wide grep for "ParentCgroup(".
-	defaultParentCgroup = "faas-tenant.slice"
+	defaultParentCgroup = CgroupMountRoot
 	FirecrackerBin      = "firecracker"
 	APISockName         = "api.sock"
 	VMConfigName        = "vmconfig.json"
@@ -343,7 +349,7 @@ func ParentCgroupFor(plan api.Plan) string {
 	if slice == "" {
 		return defaultParentCgroup
 	}
-	return ParentCgroupRoot + "/" + slice
+	return CgroupMountRoot + "/faas-tenant-" + slice + ".slice"
 }
 
 // Vsock CID allocation (ADR-022). The Linux kernel reserves CID 0 (wildcard),
@@ -378,6 +384,13 @@ type JailerSpec struct {
 	// pre-issue-301 callers don't break, but production always sets
 	// it from WakeRequest.Plan.
 	Plan api.Plan
+	// IsBuilder routes the jailer to faas-cp-build.slice and uses a neutral
+	// cgroup weight instead of a tenant plan weight.
+	IsBuilder bool
+	// MemoryMaxBytes is passed as a cgroup creation parameter. Zero preserves
+	// the legacy/test command shape; production Manager.Wake supplies the
+	// billable VM ceiling before jailer drops privileges.
+	MemoryMaxBytes int64
 }
 
 // PerInstanceScope returns the cgroup scope name the jailer will create
@@ -420,21 +433,26 @@ func PerInstanceScope(instance string) string { return instance }
 // to the legacy cpu.weight=256 neutral default so pre-issue-301
 // callers keep working. The cpu.max quota is written by the vmm
 // wrapper in writePlanCgroup because jailer v1.7 has no
-// --cgroup cpu.max= arg — only cpu.weight and memory.max are
-// exposed through --cgroup.
+// --cgroup cpu.max= arg — cpu.weight and memory.max are exposed through
+// --cgroup; the CPU quota is applied by the vmmd wrapper after boot.
 func JailerCommand(s JailerSpec) []string {
 	execFile := s.ExecFile
 	if execFile == "" {
 		execFile = FirecrackerBin
 	}
+	parentCgroup := ParentCgroupFor(s.Plan)
 	cpuWeight := s.Plan.CPUWeight()
+	if s.IsBuilder {
+		parentCgroup = BuilderCgroupParent
+		cpuWeight = 256
+	}
 	if cpuWeight <= 0 {
 		// Empty plan: keep the legacy neutral default. cpu.weight
 		// must always be in [1, 10000] per the kernel; 256 is the
 		// mid of the normalised range.
 		cpuWeight = 256
 	}
-	return []string{
+	args := []string{
 		"jailer",
 		"--id", PerInstanceScope(s.Instance),
 		"--uid", fmt.Sprintf("%d", s.UID),
@@ -443,11 +461,17 @@ func JailerCommand(s JailerSpec) []string {
 		"--chroot-base-dir", JailChrootBase,
 		"--netns", "/run/netns/" + s.Netns,
 		"--cgroup-version", "2",
-		"--parent-cgroup", ParentCgroupFor(s.Plan),
+		"--parent-cgroup", parentCgroup,
 		"--cgroup", fmt.Sprintf("cpu.weight=%d", cpuWeight),
+	}
+	if s.MemoryMaxBytes > 0 {
+		args = append(args, "--cgroup", fmt.Sprintf("memory.max=%d", s.MemoryMaxBytes))
+	}
+	args = append(args,
 		"--",
 		"--api-sock", APISockName,
-	}
+	)
+	return args
 }
 
 // WorkloadSpec (issue #463 / ADR-069 / PR-B; issue #463 / PR-C §6

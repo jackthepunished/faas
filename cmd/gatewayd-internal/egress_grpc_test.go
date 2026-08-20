@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"log/slog"
 	"net"
@@ -15,6 +16,29 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
 )
+
+// TestEgressStart_TCPPassesTLSConfig pins the split-box listener path.
+// TCP egress is mTLS-only; the listener must retain the TLS config passed to
+// newEgressGRPCListener and hand it to wire.Listen. A regression that drops
+// the config makes every TCP start fail with "mTLS required" while the Unix
+// socket path continues to look healthy.
+func TestEgressStart_TCPPassesTLSConfig(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sink := egresssink.NewEgressSink()
+	egressSrv := egressgrpc.NewServer(sink, logger)
+	tlsCfg := &tls.Config{}
+	ln := newEgressGRPCListener("tcp://127.0.0.1:0", tlsCfg, egressSrv, logger)
+	if ln.tlsCfg != tlsCfg {
+		t.Fatal("listener did not retain the supplied TLS config")
+	}
+	if err := ln.start(context.Background()); err != nil {
+		t.Fatalf("TCP start: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.stop(context.Background()) })
+	if ln.listener == nil {
+		t.Fatal("TCP start returned without a listener")
+	}
+}
 
 // egressSockPath returns a macOS-compatible unix socket path
 // (sun_path is capped at 104 bytes on darwin, and t.TempDir nests

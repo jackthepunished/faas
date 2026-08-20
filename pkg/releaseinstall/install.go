@@ -124,9 +124,12 @@ func AtomicFlip(releasesRoot, gitSHA string) error {
 	}
 	if err := os.Symlink(targetFromLink, staging); err != nil {
 		// If the staging symlink already exists from a prior
-		// failed flip, remove it and retry once.
+		// failed flip, remove it and retry once. Keep the target
+		// relative to the final link's parent: the staging link is
+		// deliberately created under releasesRoot, but it is renamed
+		// atomically to the sibling /opt/faas/current path.
 		_ = os.Remove(staging)
-		if err := os.Symlink(gitSHA, staging); err != nil {
+		if err := os.Symlink(targetFromLink, staging); err != nil {
 			return fmt.Errorf("releaseinstall: create staging symlink: %w", err)
 		}
 	}

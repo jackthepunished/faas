@@ -31,6 +31,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
 
 	builderdpkg "github.com/onebox-faas/faas/pkg/builderd"
@@ -123,6 +124,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return err
 	}
+	var sourceStorage storage.StorageBackend
+	if os.Getenv("FAAS_STORAGE_BACKEND") == "oci" {
+		sourceStorage, err = storage.BackendFromEnv()
+		if err != nil {
+			return fmt.Errorf("builderd: source storage: %w", err)
+		}
+		log.Info("source storage enabled", "backend", "oci")
+	}
 	// Gate-B box-role gate. builderd is a compute-only daemon —
 	// it refuses to start under RoleControlPlane. The role is
 	// set from TOML or FAAS_BUILDERD_ROLE at deploy time;
@@ -184,7 +193,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// "default-local" in LoadConfig; multi-node deployments
 		// override per-builder via the toml field.
 		BuilderNodeID: cfg.BuilderNodeID,
-	}, log).WithOpsMetrics(ops).WithEvents(eventsPlatform)
+	}, log).WithOpsMetrics(ops).WithEvents(eventsPlatform).WithSourceStorage(sourceStorage)
 	// builderd.New instantiates its own *Cache from cfg.CacheDir;
 	// we construct a sibling Cache at the same root for the GC loop
 	// (Cache.Sweep is pure filesystem, no shared state with Builderd).

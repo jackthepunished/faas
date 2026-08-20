@@ -58,8 +58,8 @@
     path: "{{ item }}"
     state: directory
     owner: root
-    group: root
-    mode: "0755"
+    group: faas
+    mode: "0770"
   loop:
     - /usr/local/bin
     - /srv/fc/base
@@ -124,7 +124,7 @@
       - bison
       # Issue #938 / PR-B / ADR-114: e2fsprogs ships `debugfs`, which
       # the gregalectl doctor "builder-base-ext4" check uses to verify
-      # /srv/fc/base/builder-base.ext4 contains the guest-init PID1
+      # /srv/fc/base/runner-builder-<arch>.ext4 contains the guest-init PID1
       # binary. Without this package the doctor degrades to a warn-
       # finding on every control-plane node, masking the load-bearing
       # case where the alpine placeholder ref is shipped to imaged.
@@ -201,21 +201,38 @@
     creates: "/usr/src/linux-{{ fc_kernel_version }}/vmlinux"
 
 - name: firecracker — build vmlinux
-  ansible.builtin.command: make -j4 ARCH=x86_64 CROSS_COMPILE= bzImage
+  # Firecracker 1.7 expects the uncompressed x86 ELF kernel.  `bzImage`
+  # also produces a top-level vmlinux, but publishing arch/x86/boot/bzImage
+  # under the vmlinux key makes every cold boot fail with InvalidElfMagicNumber.
+  ansible.builtin.command: make -j4 ARCH=x86_64 CROSS_COMPILE= vmlinux
   args:
     chdir: /usr/src/linux-{{ fc_kernel_version }}
-    creates: "/usr/src/linux-{{ fc_kernel_version }}/arch/x86/boot/bzImage"
+    creates: "/usr/src/linux-{{ fc_kernel_version }}/vmlinux"
   register: kernel_build
 
 - name: firecracker — copy vmlinux to /srv/fc/base
   ansible.builtin.copy:
-    src: "/usr/src/linux-{{ fc_kernel_version }}/arch/x86/boot/bzImage"
+    src: "/usr/src/linux-{{ fc_kernel_version }}/vmlinux"
     dest: "/srv/fc/base/vmlinux-{{ fc_kernel_version }}"
     remote_src: true
     owner: root
     group: root
     mode: "0644"
   register: vmlinux_copy
+
+- name: firecracker — verify published kernel is an x86 ELF
+  ansible.builtin.command: file -b /srv/fc/base/vmlinux-{{ fc_kernel_version }}
+  register: vmlinux_file
+  changed_when: false
+
+- name: firecracker — refuse non-ELF kernel artifact
+  ansible.builtin.assert:
+    that:
+      - "'ELF 64-bit' in vmlinux_file.stdout"
+      - "'x86-64' in vmlinux_file.stdout"
+    fail_msg: >-
+      Published Firecracker kernel is not an x86-64 ELF: {{ vmlinux_file.stdout }}.
+      Firecracker 1.7 cannot cold-boot the compressed bzImage artifact.
 
 - name: firecracker — publish version-keyed kernel artifact for vmmd
   ansible.builtin.copy:

@@ -1,0 +1,6 @@
+---
+- name: restart faas-vmmd
+  ansible.builtin.systemd:
+    name: faas-vmmd
+    state: restarted
+  listen: restart faas-vmmd

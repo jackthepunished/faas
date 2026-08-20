@@ -74,6 +74,43 @@ func TestRenderTOML_Schedd(t *testing.T) {
 	}
 }
 
+func TestRenderTOML_ScheddSplitBoxOutbound(t *testing.T) {
+	dc := &manifest.DaemonConfig{
+		Bind: "tcp://0.0.0.0:9091",
+		Outbound: &manifest.OutboundConfig{
+			Target: "tcp://vmmd.faas:50051",
+			TLS: &manifest.TLSMaterial{
+				CertPath: "/etc/faas/tls/schedd/vmmd-client.crt",
+				KeyPath:  "/etc/faas/tls/schedd/vmmd-client.key",
+				CAPath:   "/etc/faas/tls/ca/ca.crt",
+			},
+		},
+		GatewaySynthTarget: "tcp://10.42.0.2:8080",
+		GatewayMetricsURL:  "http://10.42.0.2:9090/metrics",
+	}
+	body, flat, err := renderTOML(tomlRenderCtx{Daemon: "schedd", DC: dc})
+	if err != nil {
+		t.Fatalf("renderTOML: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		`listen_addr = "0.0.0.0:9091"`,
+		`vmmd_target = "tcp://vmmd.faas:50051"`,
+		`vmmd_tls_cert_path = "/etc/faas/tls/schedd/vmmd-client.crt"`,
+		`vmmd_tls_key_path = "/etc/faas/tls/schedd/vmmd-client.key"`,
+		`vmmd_tls_ca_path = "/etc/faas/tls/ca/ca.crt"`,
+		`gateway_synth_target = "tcp://10.42.0.2:8080"`,
+		`gateway_metrics_url = "http://10.42.0.2:9090/metrics"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("split-box schedd body missing %q:\n%s", want, text)
+		}
+	}
+	if flat["vmmd_socket"] != "" {
+		t.Errorf("vmmd_socket = %q, want empty for TCP outbound", flat["vmmd_socket"])
+	}
+}
+
 func TestRenderTOML_Apid(t *testing.T) {
 	body, _, err := renderTOML(tomlRenderCtx{
 		Daemon: "apid",
@@ -260,6 +297,27 @@ func TestRenderTOML_DBURLFlowsThrough(t *testing.T) {
 		}
 		if !strings.Contains(string(body), `db_url = "`+dsn+`"`) {
 			t.Errorf("%s body missing db_url\nbody:\n%s", d, body)
+		}
+	}
+}
+
+func TestRenderTOML_ComputeDoesNotEmbedDatabaseCredential(t *testing.T) {
+	const dsn = "postgres://faas:secret@10.156.0.3:5432/faas?sslmode=disable"
+	for _, d := range []string{"vmmd", "imaged", "builderd"} {
+		body, flat, err := renderTOML(tomlRenderCtx{
+			Daemon:   d,
+			DC:       fixtureTOML(d),
+			DBURL:    dsn,
+			HostRole: "compute-only",
+		})
+		if err != nil {
+			t.Fatalf("%s: renderTOML: %v", d, err)
+		}
+		if got := flat["db_url"]; got != "" {
+			t.Errorf("%s flat db_url = %q, want empty", d, got)
+		}
+		if strings.Contains(string(body), "secret") || strings.Contains(string(body), "db_url") {
+			t.Errorf("%s compute TOML embeds database material:\n%s", d, body)
 		}
 	}
 }

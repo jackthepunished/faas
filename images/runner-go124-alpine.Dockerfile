@@ -25,7 +25,7 @@
 # runner-go124 / runner-node22 / runner-python312 Dockerfiles use.
 # imaged does not auto-stage runtime bases (the established pattern —
 # only the builder base is staged on startup).
-FROM golang:1.24-alpine@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191
+FROM golang:1.24-alpine@sha256:757779acac4af1b349a20f357c7296097b4a0b89da4ad0e370b339060077282a
 # Issue #197 B3.6 (extension): mutable tag pinned via images/Dockerfile.lock.
 
 # Guest runtime user (uid 1000, spec §4.8).

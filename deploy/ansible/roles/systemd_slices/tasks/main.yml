@@ -7,14 +7,14 @@
 # Hard-fence values (spec §1):
 #   faas-tenant.slice : MemoryMax=57344M  (controller for tenant VMs)
 #   faas-cp.slice     : MemoryMax=6144M   (postgres + daemons; spec §13 budget row)
-#   faas-build.slice  : MemoryMax=4096M, Parent=faas-cp.slice
+#   faas-cp-build.slice : MemoryMax=4096M (builder budget under faas-cp.slice)
 #                                                (1 guaranteed slot + 1 opportunistic)
 #
 # Per-plan sub-slices (issue #301, ADR-044):
-#   faas-tenant.slice/tenant-free.slice  : CPUWeight=2   Parent=faas-tenant.slice
-#   faas-tenant.slice/tenant-hobby.slice : CPUWeight=4   Parent=faas-tenant.slice
-#   faas-tenant.slice/tenant-pro.slice   : CPUWeight=8   Parent=faas-tenant.slice
-#   faas-tenant.slice/tenant-scale.slice: CPUWeight=16  Parent=faas-tenant.slice
+#   faas-tenant.slice/faas-tenant-free.slice  : CPUWeight=2
+#   faas-tenant.slice/faas-tenant-hobby.slice : CPUWeight=4
+#   faas-tenant.slice/faas-tenant-pro.slice   : CPUWeight=8
+#   faas-tenant.slice/faas-tenant-scale.slice: CPUWeight=16
 # The weights encode the issue's literal ratio (Free:2 / Hobby:4 / Pro:8 /
 # Scale:16) — see pkg/api/limits.go::Limits.CPUWeight and the SliceName()
 # mapping (tenant-free/hobby/pro/scale). These weights are KERNEL-ACCOUNTED
@@ -47,15 +47,14 @@
 
 # ADR-044 — per-plan CPUWeight sub-slices. The loop mirrors
 # pkg/api/limits.go::Plan.SliceName() + Limits.CPUWeight (Free=2, Hobby=4,
-# Pro=8, Scale=16). Parent=faas-tenant.slice is required because systemd
-# does NOT auto-nest; without it the unit is a sibling of faas-tenant.slice
-# and the per-VM cpu.max inherits nothing. No MemoryMax / CPUQuota on the
-# sub-slices — the parent's hard fence is the only memory ceiling, and
-# per-instance cpu.max is written by vmmd (jailer v1.7 has no --cgroup
-# cpu.max arg).
+# Pro=8, Scale=16). The `faas-tenant-<plan>.slice` names are deliberate:
+# systemd derives their parent as `faas-tenant.slice`; the old `Parent=`
+# key was invalid and silently left the slices detached. No MemoryMax /
+# CPUQuota on the sub-slices — the parent's hard fence is the only memory
+# ceiling, and per-instance cpu.max is written by vmmd.
 - name: systemd_slices — write per-plan tenant sub-slices (CPUWeight only)
   ansible.builtin.copy:
-    dest: "/etc/systemd/system/{{ item.dest }}"
+    dest: "/etc/systemd/system/faas-tenant-{{ item.plan }}.slice"
     owner: root
     group: root
     mode: "0644"
@@ -63,21 +62,26 @@
       [Unit]
       Description=onebox-faas tenant-{{ item.plan }} microVMs (CPUWeight {{ item.weight }}, ADR-044)
       # issue #301, ADR-044 — see pkg/api/limits.go::(Plan).SliceName() and
-      # Limits.CPUWeight. Parent= must be explicit (systemd does not
-      # auto-nest). No MemoryMax — memory charge pools to faas-tenant.slice;
-      # per-VM memory.max is written by vmmd (jailer).
+      # Limits.CPUWeight. No MemoryMax — memory charge pools to
+      # faas-tenant.slice; per-VM memory.max is written by vmmd (jailer).
 
       [Slice]
       CPUWeight={{ item.weight }}
-      Parent=faas-tenant.slice
   loop:
-    - { plan: free,  dest: tenant-free.slice,  weight: 2 }
-    - { plan: hobby, dest: tenant-hobby.slice, weight: 4 }
-    - { plan: pro,   dest: tenant-pro.slice,   weight: 8 }
-    - { plan: scale, dest: tenant-scale.slice, weight: 16 }
+    - { plan: free,  weight: 2 }
+    - { plan: hobby, weight: 4 }
+    - { plan: pro,   weight: 8 }
+    - { plan: scale, weight: 16 }
   loop_control:
-    label: "{{ item.dest }}"
+    label: "faas-tenant-{{ item.plan }}.slice"
   register: plan_slices
+
+- name: systemd_slices — remove invalid detached per-plan slice units
+  ansible.builtin.file:
+    path: "/etc/systemd/system/tenant-{{ item }}.slice"
+    state: absent
+  loop: [free, hobby, pro, scale]
+  register: legacy_plan_slices
 
 - name: systemd_slices — write faas-cp.slice
   ansible.builtin.copy:
@@ -95,24 +99,42 @@
       CPUQuota=400%
   register: cp_slice
 
-- name: systemd_slices — write faas-build.slice (children of faas-cp.slice)
+- name: systemd_slices — write faas-cp-build.slice
   ansible.builtin.copy:
-    dest: /etc/systemd/system/faas-build.slice
+    dest: /etc/systemd/system/faas-cp-build.slice
     owner: root
     group: root
     mode: "0644"
     content: |
       [Unit]
-      Description=onebox-faas builder microVMs (lives inside faas-cp.slice — never tenant RAM)
-      # spec §Gotchas: 1 guaranteed slot lives in faas-cp; opportunistic 2nd borrows
-      # from the 47,600 → 57,344 MB tenant headroom only when residency < 60%.
+      Description=onebox-faas builder microVMs (dedicated build budget)
+      # The dash-qualified unit name makes this a child of faas-cp.slice;
+      # vmmd's delegated service subtree can therefore fence each build.
 
       [Slice]
       MemoryMax=4096M
       CPUQuota=200%
   register: build_slice
 
+- name: systemd_slices — remove old detached builder slice unit
+  ansible.builtin.file:
+    path: /etc/systemd/system/faas-build.slice
+    state: absent
+  register: legacy_build_slice
+
 - name: systemd_slices — daemon-reload
   ansible.builtin.systemd:
     daemon_reload: true
-  when: cp_slice is changed or build_slice is changed or tenant_slice is changed or plan_slices is changed
+  when: cp_slice is changed or build_slice is changed or tenant_slice is changed or plan_slices is changed or legacy_plan_slices is changed or legacy_build_slice is changed
+
+- name: systemd_slices — start cgroup parents before jailer can attach VMs
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+  loop:
+    - faas-tenant.slice
+    - faas-cp-build.slice
+    - faas-tenant-free.slice
+    - faas-tenant-hobby.slice
+    - faas-tenant-pro.slice
+    - faas-tenant-scale.slice

@@ -201,6 +201,26 @@ func TestPGBackend_AdmitAtCapacityIsTypedResult(t *testing.T) {
 	}
 }
 
+func TestPGBackend_AdmitAtCapacityHydratesLiveTarget(t *testing.T) {
+	sched := &atCapScheduler{}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil).
+		WithLiveTargetLoader(func(context.Context, string) ([]gateway.Target, error) {
+			return []gateway.Target{{InstanceID: "running-1", NodeID: "node-fake-1"}}, nil
+		})
+
+	_, _, atCap, err := b.Admit(context.Background(), "app-1", "", "", 5)
+	if err != nil || !atCap {
+		t.Fatalf("Admit = atCapacity %v, err %v; want typed at-capacity", atCap, err)
+	}
+	if got := b.HealthyCount("app-1"); got != 1 {
+		t.Fatalf("HealthyCount after hydration = %d, want 1", got)
+	}
+	pick := b.Pick("app-1")
+	if !pick.OK || pick.Target.InstanceID != "running-1" {
+		t.Fatalf("Pick after hydration = %+v, want running-1", pick)
+	}
+}
+
 // atCapScheduler is a controllable Scheduler that always returns the
 // typed at_capacity=true outcome (issue #168).
 type atCapScheduler struct{}

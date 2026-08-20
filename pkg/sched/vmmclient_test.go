@@ -146,6 +146,12 @@ func (f *fakeVMM) MountParentExt4(_ context.Context, _ string) (string, error) {
 	return "", nil
 }
 
+// MaterializeParentExt4 is owned by imaged's staging path; sched never calls
+// it, but the server-side API must remain complete for the bufconn harness.
+func (f *fakeVMM) MaterializeParentExt4(_ context.Context, _, _ string) error {
+	return nil
+}
+
 // UmountParentExt4 (ADR-053) — sched doesn't drive the parent
 // umount path. Returns nil; imaged's defer-on-error pattern is
 // idempotent on this no-op success.

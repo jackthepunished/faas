@@ -201,13 +201,16 @@ func TestToColdBootRequest_BuildSpecExportDir(t *testing.T) {
 	}
 	t.Run("builder export dir", func(t *testing.T) {
 		req := newReq()
-		req.Build = &vmmdpb.BuildSpec{ExportDir: "/var/lib/faas/build-out/b1"}
+		req.Build = &vmmdpb.BuildSpec{ExportDir: "/var/lib/faas/build-out/b1", TimeoutSec: 1800}
 		wr, err := toColdBootRequest(context.Background(), req)
 		if err != nil {
 			t.Fatalf("toColdBootRequest: %v", err)
 		}
 		if wr.ExportDir != "/var/lib/faas/build-out/b1" {
 			t.Errorf("ExportDir = %q, want /var/lib/faas/build-out/b1", wr.ExportDir)
+		}
+		if wr.BuildTimeoutSec != 1800 {
+			t.Errorf("BuildTimeoutSec = %d, want 1800", wr.BuildTimeoutSec)
 		}
 	})
 	t.Run("nil build", func(t *testing.T) {

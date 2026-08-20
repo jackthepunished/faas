@@ -3,18 +3,18 @@
 // Package builderd — drive1 preparation for ephemeral builder VMs.
 //
 // CreateBuildDrive1 materialises the per-VM ext4 that the builder VM boots
-// with. It writes a 28 GiB image, formats it ext4, mounts it loopback rw,
-// writes /etc/faas/build.json (the BuildManifest guest-init reads to know
-// it's a build VM), copies the customer source tarball in at /build/src.tar
-// (issue #54), and unmounts. The same binary runs in app VMs with a
-// different manifest (api.AppManifest); guest-init branches on which file
-// exists at boot.
+// with. It writes a 28 GiB image, formats it ext4 from an unprivileged
+// staging directory, writes /etc/faas/build.json (the BuildManifest
+// guest-init reads to know it's a build VM), and copies the customer source
+// tarball in at /build/src.tar (issue #54). The same binary runs in app VMs
+// with a different manifest (api.AppManifest); guest-init branches on which
+// file exists at boot.
 //
-// vmmd is the only component that touches block devices (spec §11);
-// CreateBuildDrive1 runs under builderd, which uses losetup+mount as a
-// host-side file operation, not inside any VM. It runs as the host's
-// builderd user (uid ≥ 20000), and mount/umount via sudo is the only path
-// privileged enough to loopback-mount.
+// vmmd is the only component that touches block devices (spec §11). The
+// builderd service is intentionally unprivileged, so this path must not call
+// mount(8) or require CAP_SYS_ADMIN. mke2fs's -d root-directory mode writes
+// the staged tree directly into the ext4 image and preserves that privilege
+// boundary.
 
 package builderd
 
@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"golang.org/x/sys/unix"
 )
 
 // BuildDriveSizeBytes is the drive1 image size for builder VMs (M6). 28 GiB
@@ -40,6 +41,22 @@ import (
 // (in /build/out) is typically
 // < 500 MB; the rest is transient build scratch.
 const BuildDriveSizeBytes = 28 << 30
+
+// BuildDriveMinWorkingSetBytes is the conservative host working-set budget for
+// a Railpack solve. The ext4 image itself is sparse; requiring the full 28 GiB
+// image size would reject healthy hosts even though the image only materialises
+// the blocks BuildKit actually writes.
+const BuildDriveMinWorkingSetBytes = 16 << 30
+
+// BuildDriveHostReserveBytes keeps room for the host-side export directory,
+// logs, and filesystem metadata. Without this preflight, a nearly-full host
+// lets the guest run until virtio reports ENOSPC, which is misclassified as an
+// opaque infrastructure timeout.
+const BuildDriveHostReserveBytes = 4 << 30
+
+// BuildDriveMinFreeBytes is the minimum filesystem space required before a
+// builder drive is materialised.
+const BuildDriveMinFreeBytes = BuildDriveMinWorkingSetBytes + BuildDriveHostReserveBytes
 
 // mkfs utility + label used for the build drive1 image.
 const (
@@ -73,6 +90,9 @@ func CreateBuildDrive1(ctx context.Context, dest string, m api.BuildManifest, so
 	if err != nil {
 		return fmt.Errorf("builderd: stat source %s: %w", sourcePath, err)
 	}
+	if err := checkBuildDriveCapacity(dest); err != nil {
+		return err
+	}
 
 	// 1. Truncate the host file to BuildDriveSizeBytes.
 	f, err := os.Create(dest)
@@ -87,22 +107,14 @@ func CreateBuildDrive1(ctx context.Context, dest string, m api.BuildManifest, so
 		return fmt.Errorf("builderd: close drive1: %w", err)
 	}
 
-	// 2. mkfs.ext4 -L faas-build -F dest. mkfs is idempotent on -F.
-	if out, err := exec.CommandContext(ctx, buildMkfs, "-L", buildLabel, "-F", dest).CombinedOutput(); err != nil {
-		return fmt.Errorf("builderd: mkfs: %w (%s)", err, string(out))
-	}
-
-	// 3. Loopback-mount rw, write the manifest + tarball, unmount.
-	mp, err := os.MkdirTemp("", "faas-buildmnt-")
+	// 2. Stage the guest-visible tree as plain files. This avoids a loopback
+	// mount, which would require CAP_SYS_ADMIN and is unavailable to the
+	// hardened faas-builderd systemd unit.
+	mp, err := os.MkdirTemp("", "faas-buildstage-")
 	if err != nil {
-		return fmt.Errorf("builderd: mktemp mount: %w", err)
+		return fmt.Errorf("builderd: mktemp staging: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(mp) }()
-
-	if out, err := exec.CommandContext(ctx, "mount", "-o", "loop,rw", dest, mp).CombinedOutput(); err != nil {
-		return fmt.Errorf("builderd: loopback mount: %w (%s)", err, string(out))
-	}
-	defer func() { _ = exec.Command("umount", mp).Run() }()
 
 	if err := writeBuildManifest(mp, m); err != nil {
 		return fmt.Errorf("builderd: write manifest: %w", err)
@@ -128,6 +140,25 @@ func CreateBuildDrive1(ctx context.Context, dest string, m api.BuildManifest, so
 	}
 	if gotSum != srcSum {
 		return fmt.Errorf("builderd: staged tarball sha256 mismatch: got %s, want %s", gotSum, srcSum)
+	}
+
+	// 3. Build the ext4 image directly from the staged tree. mke2fs creates
+	// the filesystem and copies the tree in one operation; the image remains
+	// sparse and keeps the existing 28 GiB builder scratch budget.
+	if out, err := exec.CommandContext(ctx, buildMkfs, "-L", buildLabel, "-F", "-d", mp, dest).CombinedOutput(); err != nil {
+		return fmt.Errorf("builderd: mkfs: %w (%s)", err, string(out))
+	}
+	return nil
+}
+
+func checkBuildDriveCapacity(dest string) error {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(filepath.Dir(dest), &stat); err != nil {
+		return fmt.Errorf("builderd: stat drive filesystem: %w", err)
+	}
+	available := uint64(stat.Bavail) * uint64(stat.Bsize)
+	if available < BuildDriveMinFreeBytes {
+		return fmt.Errorf("builderd: insufficient host free space for build drive: available=%d bytes, required=%d bytes", available, BuildDriveMinFreeBytes)
 	}
 	return nil
 }

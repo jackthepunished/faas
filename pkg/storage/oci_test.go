@@ -405,6 +405,21 @@ func TestPlan_SignatureKey(t *testing.T) {
 	}
 }
 
+func TestPlan_SourceKey(t *testing.T) {
+	o := &OCIRegistryStorageBackend{prefix: "faas"}
+	buildUUID := "550e8400-e29b-41d4-a716-446655440000"
+	repo, tag, err := o.plan("sources/" + buildUUID + ".tar.gz")
+	if err != nil {
+		t.Fatalf("plan source key: %v", err)
+	}
+	if repo != "sources" || tag != buildUUID+".tar.gz" {
+		t.Errorf("got (%q,%q), want (sources,%s.tar.gz)", repo, tag, buildUUID)
+	}
+	if got, ok := o.unplan(repo, tag); !ok || got != "sources/"+buildUUID+".tar.gz" {
+		t.Errorf("unplan = (%q,%t), want source key", got, ok)
+	}
+}
+
 func TestPlan_InvalidKeys(t *testing.T) {
 	o := &OCIRegistryStorageBackend{prefix: "faas"}
 	tests := []string{
@@ -420,6 +435,7 @@ func TestPlan_InvalidKeys(t *testing.T) {
 		"layers/abc.txt",                                  // wrong extension
 		"scans/runner-node22-amd64.ext4",                  // missing scan suffix
 		"sigs/base",                                       // missing signature namespace
+		"sources/not-a-uuid.tar.gz",                       // source key needs build UUID
 		"unknown/foo/bar",                                 // unknown namespace
 		"apps/slug!/dep.ext4",                             // bang is not in tag charset
 	}
@@ -1056,6 +1072,7 @@ func TestOCIUnplanInverse(t *testing.T) {
 		"base/runner-node22.ext4.digest",
 		"layers/" + depUUID + ".ext4",
 		"kernel/v1.10.0",
+		"sources/" + depUUID + ".tar.gz",
 		"sigs/apps/slug-1/" + depUUID + ".ext4.sig",
 		"sigs/base/amd64/runner-builder-amd64.ext4.sig",
 	}

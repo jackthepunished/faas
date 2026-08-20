@@ -42,6 +42,10 @@ func (n *nopVMMClient) MountParentExt4ReadOnly(_ context.Context, _ string) (str
 	n.mountCalled++
 	return n.mountReturns, n.mountErr
 }
+func (n *nopVMMClient) MaterializeParentExt4(_ context.Context, _, _ string) error {
+	n.mountCalled++
+	return n.mountErr
+}
 func (n *nopVMMClient) UmountParentExt4(_ context.Context, _ string) error {
 	n.umountCalled++
 	return n.umountErr

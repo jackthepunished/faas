@@ -304,7 +304,7 @@ var cliCommands = []cliCommand{
 			{Name: "dir", Short: "root secrets directory (default /etc/faas/secrets)"},
 			{Name: "host", Short: "compute_nodes.name to stamp (default: hostname)"},
 			{Name: "role", Short: "compute_nodes.role to stamp (default: empty)"},
-			{Name: "pg-dsn", Short: "PostgreSQL DSN (default: $FAAS_PG_DSN)"},
+			{Name: "pg-dsn", Short: "PostgreSQL DSN (default: $FAAS_PG_DSN or $DATABASE_URL)"},
 			{Name: "no-db", Short: "skip the compute_nodes.cert_fingerprint write"},
 			{Name: "force", Short: "overwrite existing secret files (default false)"},
 		},

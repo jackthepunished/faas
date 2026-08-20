@@ -108,6 +108,17 @@
     group: faas
     mode: "0750"
 
+# OCI storage uses the shared read-through cache for source archives and
+# produced layers. builderd is a writer, so the path must exist before
+# ProtectSystem=strict creates the service namespace.
+- name: builderd_service — ensure OCI cache root exists
+  ansible.builtin.file:
+    path: /var/lib/faas/cache
+    state: directory
+    owner: faas-builderd
+    group: faas
+    mode: "0770"
+
 # Spec §11 — ProtectSystem=strict ReadWritePaths= assert. Mirrors
 # the same shape as imaged (compute_only_service/tasks/main.yml) and
 # vmmd (vmmd_service/tasks/main.yml, after Mega-PR-C Commit 10
@@ -122,6 +133,7 @@
       - /srv/fc/base
       - /var/log/faas
       - /var/spool/faas
+      - /var/lib/faas/cache
 
 - name: builderd_service — assert every ReadWritePaths= target exists
   ansible.builtin.stat:
@@ -144,6 +156,25 @@
     - vmmd-client
   register: faas_pki_builderd_leaf_stat
   failed_when: not faas_pki_builderd_leaf_stat.stat.exists
+
+# The PKI writer deliberately emits private keys as root:root 0400. The
+# builderd client leaf is different from a root daemon's key: builderd runs
+# as faas-builderd and must read it to dial vmmd. Normalize this one
+# deployment-owned client key after the bootstrap assert; never loosen the
+# generic PKI writer's policy for unrelated leaves.
+- name: builderd_service — assert vmmd client key exists for non-root daemon
+  ansible.builtin.stat:
+    path: /etc/faas/tls/builderd/vmmd-client.key
+  register: faas_pki_builderd_client_key_stat
+  failed_when: not faas_pki_builderd_client_key_stat.stat.exists
+
+- name: builderd_service — grant faas group read access to vmmd client key
+  ansible.builtin.file:
+    path: /etc/faas/tls/builderd/vmmd-client.key
+    state: file
+    owner: root
+    group: faas
+    mode: "0440"
 
 # The per-node CapacityReport signing key belongs to vmmd and is
 # asserted by vmmd_service at /etc/faas/secrets/vmmd/node.key. The

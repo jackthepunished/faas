@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/storage"
 )
@@ -30,7 +31,7 @@ type BaseBuildInput struct {
 	// gzip-compressed (same wire shape as Builders expect from
 	// oci.RegistryClient.PullBlob). Empty when BuildBaseFromStaging
 	// is invoked with a pre-populated staging dir (ADR-053 parent-ref
-	// path: the staging dir is filled by imaged's vmmd-mounted parent
+	// path: the staging dir is filled by vmmd's parent materialization RPC
 	// + delta layer apply loop, not by BuildBase itself).
 	Layers []io.Reader
 	// Storage is the artifact backend the produced ext4 is Put into.
@@ -58,8 +59,8 @@ type BaseBuildResult struct {
 
 // MkdirBaseStaging creates a fresh temp dir for a base-image staging
 // tree. Exported (ADR-053) so pkg/imaged's parent-ref path can
-// pre-create the dir, populate it via cp -a from the vmmd-mounted
-// parent ext4 + a delta layer apply loop, then hand it to
+// pre-create the dir, populate it via vmmd's parent materialization RPC
+// + a delta layer apply loop, then hand it to
 // BuildBaseFromStaging for mkfs. The dir is NOT auto-removed: callers
 // running BuildBaseFromStaging rely on this function's sibling-temp
 // pattern (mirrors publishExt4 / publishBaseExt4). Callers that want
@@ -140,8 +141,8 @@ func (b *Builder) BuildBase(ctx context.Context, in BaseBuildInput) (BaseBuildRe
 
 // BuildBaseFromStaging (ADR-053) is the seam used by the parent-ref
 // staging path: imaged pre-populates `staging` with the parent's tree
-// (cp -a from a vmmd loopback mount of the parent ext4) + the delta
-// OCI layers, then calls BuildBaseFromStaging to mkfs + publish.
+// (materialized by vmmd) + the delta OCI layers, then calls
+// BuildBaseFromStaging to mkfs + publish.
 //
 // `staging` MUST be a path returned by MkdirBaseStaging (or otherwise
 // outside the published ext4's directory, to avoid mkfs's -d flag
@@ -189,11 +190,23 @@ func injectBaseGuestInit(staging, guestInitPath string) error {
 }
 
 // ensureBaseMountpoints creates directories that must exist on the read-only
-// boot root before guest-init can mount drive1. In particular, /overlay cannot
-// be created by guest-init after Linux mounts drive0 read-only.
+// boot root before guest-init can mount drive1. OCI layers commonly omit empty
+// pseudo-filesystem mountpoints, but guest-init runs with the base root
+// read-only, so it cannot create them during boot. Keep this list in sync with
+// the mounts performed by guest-init before and after pivot_root.
 func ensureBaseMountpoints(staging string) error {
-	if err := os.MkdirAll(filepath.Join(staging, "overlay"), 0o755); err != nil {
-		return fmt.Errorf("rootfs: create base overlay mountpoint: %w", err)
+	for _, path := range []string{
+		"dev",
+		"overlay",
+		"proc",
+		"run",
+		"sys",
+		"sys/fs/cgroup",
+		"tmp",
+	} {
+		if err := os.MkdirAll(filepath.Join(staging, path), 0o755); err != nil {
+			return fmt.Errorf("rootfs: create base mountpoint %q: %w", path, err)
+		}
 	}
 	return nil
 }
@@ -235,7 +248,7 @@ func (b *Builder) buildBaseFromStaging(ctx context.Context, staging string, in B
 // path mkfs-es directly into OutImage (matches the pre-#96 behaviour).
 func (b *Builder) publishBaseExt4(ctx context.Context, in BaseBuildInput, staging string, sizeMB int) error {
 	if in.OutImage != "" {
-		if err := b.run.Run(ctx, MkfsCommand(staging, in.OutImage, sizeMB)); err != nil {
+		if err := b.runBaseMkfs(ctx, staging, in.OutImage, sizeMB); err != nil {
 			return fmt.Errorf("rootfs: base mkfs: %w", err)
 		}
 		return nil
@@ -258,7 +271,7 @@ func (b *Builder) publishBaseExt4(ctx context.Context, in BaseBuildInput, stagin
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rootfs: close base tmp ext4: %w", err)
 	}
-	if err := b.run.Run(ctx, MkfsCommand(staging, tmpPath, sizeMB)); err != nil {
+	if err := b.runBaseMkfs(ctx, staging, tmpPath, sizeMB); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rootfs: base mkfs: %w", err)
 	}
@@ -288,6 +301,49 @@ func (b *Builder) publishBaseExt4(ctx context.Context, in BaseBuildInput, stagin
 		}
 	}
 	return nil
+}
+
+const (
+	// mkfs.ext4 -d reports block exhaustion from the populate phase rather
+	// than returning a machine-readable required size. Base trees can gain
+	// many inode- and block-heavy files between runtime refreshes, so retry a
+	// bounded number of times with additional room instead of publishing a
+	// partial image or crash-looping imaged on a one-shot sizing miss.
+	baseMkfsMaxAttempts = 4
+	baseMkfsGrowthPct   = 25
+	baseMkfsGrowthFloor = 16
+)
+
+func (b *Builder) runBaseMkfs(ctx context.Context, staging, outImage string, sizeMB int) error {
+	if sizeMB < MinLayerMB {
+		sizeMB = MinLayerMB
+	}
+	lastSize := sizeMB
+	var lastErr error
+	for attempt := 0; attempt < baseMkfsMaxAttempts; attempt++ {
+		lastSize = sizeMB
+		if err := b.run.Run(ctx, MkfsCommand(staging, outImage, sizeMB)); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if !baseMkfsNeedsMoreSpace(err) || attempt == baseMkfsMaxAttempts-1 {
+				break
+			}
+		}
+		growth := sizeMB * baseMkfsGrowthPct / 100
+		if growth < baseMkfsGrowthFloor {
+			growth = baseMkfsGrowthFloor
+		}
+		sizeMB += growth
+	}
+	return fmt.Errorf("mkfs.ext4 -d exhausted base image sizing after %d attempt(s) at %d MiB: %w", baseMkfsMaxAttempts, lastSize, lastErr)
+}
+
+func baseMkfsNeedsMoreSpace(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "could not allocate block") ||
+		strings.Contains(message, "no space left") ||
+		strings.Contains(message, "populating file system")
 }
 
 // validateBaseOutputTarget enforces the same exclusive-or rule as

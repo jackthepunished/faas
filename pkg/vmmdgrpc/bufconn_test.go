@@ -212,6 +212,12 @@ func (f *fakeVMM) MountParentExt4(ctx context.Context, storageKey string) (strin
 	return "/tmp/faas-parent-mnt-fake", nil
 }
 
+// MaterializeParentExt4 (ADR-053) — the fake succeeds without touching the
+// filesystem; dedicated wire tests exercise validation and error lifting.
+func (f *fakeVMM) MaterializeParentExt4(context.Context, string, string) error {
+	return nil
+}
+
 // UmountParentExt4 (ADR-053) — wraps the optional hook so the
 // UmountParentExt4 handler test can inject errors. nil hook →
 // success.

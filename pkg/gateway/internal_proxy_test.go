@@ -35,6 +35,33 @@ type stubDialer struct {
 	dialBlock chan struct{}
 }
 
+func TestTCPDialer_DialsFixedAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			_ = conn.Close()
+			close(accepted)
+		}
+	}()
+	dialer := NewTCPDialer(ln.Addr().String())
+	conn, err := dialer.DialContext(context.Background(), "tcp://customer-controlled.invalid:1")
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	_ = conn.Close()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("fixed TCP dialer did not connect")
+	}
+}
+
 func (d *stubDialer) DialContext(ctx context.Context, target string) (net.Conn, error) {
 	d.mu.Lock()
 	d.calls = append(d.calls, target)

@@ -5,9 +5,10 @@ Resolves the current registry digest for each `pinned` entry in
 images/Dockerfile.lock and rewrites BOTH the lock and the matching
 `FROM ...@sha256:...` line in each Dockerfile.
 
-The resolver prefers `crane digest` (the sigstore crane binary) and
-falls back to a pure-Python manifest v2 fetch against the Docker
-Registry HTTP API. Registry credentials are read from
+The resolver uses a pure-Python manifest fetch against the Docker Registry
+HTTP API and selects the platform child when a tag points at a manifest list.
+It falls back to `crane digest` (the sigstore crane binary) only when the
+registry API is unavailable. Registry credentials are read from
 `~/.docker/config.json` if present (the same path `docker login`
 writes) so an operator who's already authenticated doesn't need to
 re-type.
@@ -98,11 +99,15 @@ def _docker_token(repo: str) -> str | None:
     return data.get("token")
 
 
-def resolve_via_crane(repo: str, tag: str) -> str | None:
-    """Try `crane digest <repo>:<tag>` first. Returns sha256:... or None."""
+def resolve_via_crane(repo: str, tag: str, platform: str | None = "linux/amd64") -> str | None:
+    """Try crane, optionally selecting a platform child."""
+    command = ["crane", "digest"]
+    if platform:
+        command.extend(["--platform", platform])
+    command.append(f"{repo}:{tag}")
     try:
         out = subprocess.run(
-            ["crane", "digest", f"{repo}:{tag}"],
+            command,
             check=True, capture_output=True, text=True, timeout=30,
         )
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
@@ -113,23 +118,41 @@ def resolve_via_crane(repo: str, tag: str) -> str | None:
     return None
 
 
+def _select_platform_digest(manifest: dict, platform: str) -> str | None:
+    """Return the child digest matching platform from an image index."""
+    manifests = manifest.get("manifests")
+    if not isinstance(manifests, list):
+        return None
+    parts = platform.split("/")
+    if len(parts) < 2:
+        return None
+    wanted_os, wanted_arch = parts[:2]
+    wanted_variant = parts[2] if len(parts) > 2 else None
+    for child in manifests:
+        child_platform = child.get("platform") or {}
+        if child_platform.get("os") != wanted_os:
+            continue
+        if child_platform.get("architecture") != wanted_arch:
+            continue
+        if wanted_variant is not None and child_platform.get("variant") != wanted_variant:
+            continue
+        digest = child.get("digest")
+        if isinstance(digest, str) and digest.startswith("sha256:"):
+            return digest
+    return None
+
+
 def resolve_via_registry_api(repo: str, tag: str, platform: str) -> str | None:
     """Pure-Python fallback against the Docker Registry v2 manifest API.
 
     Returns sha256:... or None.
     """
-    # Translate platform "linux/amd64" to the v2 accept header.
     accept = (
         "application/vnd.docker.distribution.manifest.v2+json,"
         "application/vnd.docker.distribution.manifest.list.v2+json,"
         "application/vnd.oci.image.manifest.v1+json,"
         "application/vnd.oci.image.index.v1+json"
     )
-    if "/" in platform:
-        plat_os, plat_arch = platform.split("/", 1)
-        accept = (
-            f"{accept};os={plat_os};architecture={plat_arch}"
-        )
     # `resolved_repo` is stored in the lock using a fully-qualified
     # Docker Hub reference (`docker.io/library/debian`), while the
     # registry v2 endpoint addresses the repository without its host
@@ -146,19 +169,34 @@ def resolve_via_registry_api(repo: str, tag: str, platform: str) -> str | None:
         token = _docker_token(repo)
         if token:
             headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers, method="HEAD")
+    # HEAD returns the manifest-list digest even when a platform is
+    # requested. GET is intentional: the child descriptor is only present in
+    # the index JSON. Returning the list digest here makes imaged reject the
+    # pin later because it correctly refuses manifest lists at boot.
+    req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            digest = r.headers.get("Docker-Content-Digest")
+            raw = r.read()
+            response_digest = r.headers.get("Docker-Content-Digest")
     except (urllib.error.URLError, OSError):
         return None
-    if digest and digest.startswith("sha256:"):
-        return digest
-    return None
+    try:
+        manifest = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return _select_platform_digest(manifest, platform) or response_digest
 
 
-def resolve_digest(repo: str, tag: str, platform: str) -> str | None:
-    return resolve_via_crane(repo, tag) or resolve_via_registry_api(repo, tag, platform)
+def resolve_digest(repo: str, tag: str, platform: str, multi_arch: bool = False) -> str | None:
+    # Multi-arch Dockerfiles (builder-base) must retain the manifest-list pin
+    # so buildx can resolve the correct child for each target architecture.
+    # Single-arch runtime Dockerfiles need the platform child because imaged
+    # rejects a manifest-list ref at staging/boot time.
+    wanted_platform = "" if multi_arch else platform
+    return (
+        resolve_via_registry_api(repo, tag, wanted_platform)
+        or resolve_via_crane(repo, tag, None if multi_arch else platform)
+    )
 
 
 def update_lock_and_dockerfiles(repo_root: Path, dry_run: bool) -> int:
@@ -172,7 +210,7 @@ def update_lock_and_dockerfiles(repo_root: Path, dry_run: bool) -> int:
         repo = entry["resolved_repo"]
         tag = entry["resolved_tag"]
         platform = entry.get("platform", "linux/amd64")
-        digest = resolve_digest(repo, tag, platform)
+        digest = resolve_digest(repo, tag, platform, bool(entry.get("multi_arch")))
         if not digest:
             failures.append(
                 f"entry[{i}] {entry.get('dockerfile', '?')}: "

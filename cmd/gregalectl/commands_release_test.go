@@ -10,6 +10,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -76,6 +77,27 @@ func TestCmdReleaseInstall_Help(t *testing.T) {
 func TestCmdReleaseInstall_MissingFlags(t *testing.T) {
 	if code := cmdReleaseInstall(nil); code != 1 {
 		t.Errorf("cmdReleaseInstall(nil) = %d, want 1", code)
+	}
+}
+
+func TestReadDatabaseEnvFile(t *testing.T) {
+	path := t.TempDir() + "/compute-db.env"
+	if err := os.WriteFile(path, []byte("# comment\nOTHER=value\nexport DATABASE_URL='postgres:///faas?host=/run/postgresql'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := readDatabaseEnvFile(path)
+	if !ok {
+		t.Fatal("readDatabaseEnvFile returned ok=false")
+	}
+	want := "postgres:///faas?host=/run/postgresql"
+	if got != want {
+		t.Fatalf("readDatabaseEnvFile = %q, want %q", got, want)
+	}
+}
+
+func TestReadDatabaseEnvFileMissing(t *testing.T) {
+	if got, ok := readDatabaseEnvFile(t.TempDir() + "/missing.env"); ok || got != "" {
+		t.Fatalf("readDatabaseEnvFile missing = (%q, %v), want (empty, false)", got, ok)
 	}
 }
 

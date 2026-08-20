@@ -146,6 +146,11 @@
       # Production clients connect via the local socket in /var/run/postgresql.
       local   all             postgres                                peer
       local   all             faas                                    peer
+      # Split-box daemons use a password-authenticated TCP DSN even when they
+      # are colocated with PostgreSQL. Keep loopback explicit so the same
+      # sealed DATABASE_URL works on the control plane and on compute nodes.
+      host    faas            faas                                    127.0.0.1/32            scram-sha-256
+      host    faas            faas                                    ::1/128                  scram-sha-256
       {% for cidr in (faas_postgres_allowed_cidrs | default([])) %}
       host    faas            faas                                    {{ cidr }}                scram-sha-256
       {% endfor %}

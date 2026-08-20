@@ -163,6 +163,24 @@ func TestBuildBaseFromStaging_MkfsFromExistingDir(t *testing.T) {
 	if _, err := os.Stat(staging); err != nil {
 		t.Errorf("staging dir was removed by BuildBaseFromStaging: %v", err)
 	}
+	for _, path := range []string{
+		"dev",
+		"overlay",
+		"proc",
+		"run",
+		"sys",
+		"sys/fs/cgroup",
+		"tmp",
+	} {
+		info, err := os.Stat(filepath.Join(staging, path))
+		if err != nil {
+			t.Errorf("required base mountpoint %q missing: %v", path, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("required base mountpoint %q is not a directory", path)
+		}
+	}
 	// The published ext4 must be at the requested key.
 	rc, err := be.Get(context.Background(), "base/runner-node24.ext4")
 	if err != nil {
@@ -190,6 +208,28 @@ func TestBuildBaseFromStaging_RejectsEmptyStaging(t *testing.T) {
 		BaseBuildInput{Storage: be, StorageKey: "base/runtime.ext4"},
 	); err == nil {
 		t.Error("missing staging dir should error")
+	}
+}
+
+func TestBuildBaseFromStaging_RetriesMkfsBlockExhaustion(t *testing.T) {
+	staging := t.TempDir()
+	if err := os.WriteFile(filepath.Join(staging, "usr"), []byte("runtime"), 0o644); err != nil {
+		t.Fatalf("seed staging: %v", err)
+	}
+	run := &retryBaseMkfsRunner{failures: 1}
+	b := NewBuilder(run)
+	if _, err := b.BuildBaseFromStaging(context.Background(), staging, BaseBuildInput{
+		OutImage: filepath.Join(t.TempDir(), "runtime.ext4"),
+	}); err != nil {
+		t.Fatalf("BuildBaseFromStaging: %v", err)
+	}
+	if len(run.argvs) != 2 {
+		t.Fatalf("mkfs calls = %d, want 2", len(run.argvs))
+	}
+	first := run.argvs[0][len(run.argvs[0])-1]
+	second := run.argvs[1][len(run.argvs[1])-1]
+	if first == second {
+		t.Fatalf("retry kept the same image size: first=%q second=%q", first, second)
 	}
 }
 
@@ -567,3 +607,17 @@ func containsString(argv []string, s string) bool {
 type fakeErrorRunner struct{ err error }
 
 func (f fakeErrorRunner) Run(_ context.Context, _ []string) error { return f.err }
+
+type retryBaseMkfsRunner struct {
+	failures int
+	argvs    [][]string
+}
+
+func (r *retryBaseMkfsRunner) Run(_ context.Context, argv []string) error {
+	r.argvs = append(r.argvs, append([]string(nil), argv...))
+	if r.failures > 0 {
+		r.failures--
+		return errors.New("mkfs.ext4: Could not allocate block while populating file system")
+	}
+	return nil
+}

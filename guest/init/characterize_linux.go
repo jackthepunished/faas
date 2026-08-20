@@ -525,12 +525,18 @@ func shipReport(r api.CharacterizationReport, log *slog.Logger) bool {
 
 	attempts := VsockCharacterizationRetries + 1
 	for i := 0; i < attempts; i++ {
-		backoff := vsockCharacterizationBackoff[i]
 		if ok := shipOnce(payload); ok {
 			return true
 		}
 		if i < attempts-1 {
-			time.Sleep(backoff)
+			// There are three configured backoff intervals for the
+			// first three attempts. The final retry has no following
+			// sleep; keep this bounds check explicit so a retry-count
+			// change cannot turn a missing host-vsock endpoint into a
+			// guest-init panic.
+			if i < len(vsockCharacterizationBackoff) {
+				time.Sleep(vsockCharacterizationBackoff[i])
+			}
 		}
 	}
 	return false

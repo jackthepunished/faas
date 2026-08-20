@@ -73,6 +73,26 @@
     mode: "0755"
   when: arch == "amd64"
 
+# Grype 0.116 ships a database seed but validates its age on every scan. Keep
+# the refreshed database outside a daemon home directory: imaged runs with
+# ProtectHome and must be able to read the same DB after bootstrap.
+- name: supply_chain_scanners — create shared Grype database cache
+  ansible.builtin.file:
+    path: "{{ grype_db_cache_dir }}"
+    state: directory
+    owner: root
+    group: faas
+    mode: "0750"
+  when: arch == "amd64"
+
+- name: supply_chain_scanners — refresh Grype vulnerability database
+  ansible.builtin.command:
+    cmd: "{{ install_root }}/bin/grype db update"
+  environment:
+    GRYPE_DB_CACHE_DIR: "{{ grype_db_cache_dir }}"
+  changed_when: false
+  when: arch == "amd64"
+
 - name: supply_chain_scanners — download syft release tarball
   ansible.builtin.get_url:
     url: "https://github.com/anchore/syft/releases/download/v{{ syft_version }}/syft_{{ syft_version }}_linux_{{ arch }}.tar.gz"

@@ -4,7 +4,7 @@
 //
 // builderd is the ONLY process that runs Railpack/buildkit. The build
 // happens inside an ephemeral Firecracker microVM booted from
-// /srv/fc/base/builder-base.ext4 (drive0, shared read-only — the image
+// /srv/fc/base/runner-builder-<arch>.ext4 (drive0, shared read-only — the image
 // built from images/builder-base.Dockerfile). cgroup: faas-cp.slice
 // (spec §13), not the tenant slice — that's what makes the M6 §14 OOM-bomb
 // acceptance gate work: an OOM in a builder kills the builder, never a
@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"google.golang.org/grpc"
@@ -43,7 +44,8 @@ type VMMDriver struct {
 	conn *grpc.ClientConn
 
 	// builderBase is drive0: the read-only shared base that holds
-	// buildkit/Railpack/etc. Default /srv/fc/base/builder-base.ext4.
+	// buildkit/Railpack/etc. Default is the canonical per-architecture
+	// runner-builder path.
 	builderBase string
 
 	// driveDir hosts the temporary per-VM drive1 images we create at
@@ -73,7 +75,7 @@ func NewVMMDriverContext(ctx context.Context, socketPath string, tlsCfg *tls.Con
 		return nil, fmt.Errorf("builderd: empty vmmd socket path")
 	}
 	if builderBase == "" {
-		builderBase = "/srv/fc/base/builder-base.ext4"
+		builderBase = "/srv/fc/base/runner-builder-" + runtime.GOARCH + ".ext4"
 	}
 	if driveDir == "" {
 		driveDir = "/var/lib/faas/build-drive"
@@ -183,7 +185,10 @@ func (d *VMMDriver) Spawn(ctx context.Context, req VMRequest) (BuildHandle, erro
 			VcpuCount:  api.BuildVMVCPU,
 			MemSizeMib: int32(api.BuildVMRAMMB),
 		},
-		Build: &vmmdpb.BuildSpec{ExportDir: buildExportDir},
+		Build: &vmmdpb.BuildSpec{
+			ExportDir:  buildExportDir,
+			TimeoutSec: int32(timeoutSec),
+		},
 		// Issue #301 / ADR-043: vmmd validates Plan on every cold
 		// boot and routes the VM into the per-plan cgroup slice.
 		// The legacy empty value is rejected.

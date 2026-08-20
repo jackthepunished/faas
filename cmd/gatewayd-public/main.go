@@ -4,7 +4,8 @@
 // it sits BEHIND Caddy + Cloudflare (api.gregale.dev) which handle
 // TLS termination; this daemon serves plain HTTP on 127.0.0.1:8080
 // and reverse-proxies to gatewayd-internal over the unix socket
-// /run/faas/gatewayd-internal.sock.
+// /run/faas/gatewayd-internal.sock (or a private TCP target on a split-box
+// deployment).
 //
 // It owns:
 //   - The plain-HTTP listener at FAAS_PUBLIC_LISTEN_ADDR
@@ -31,8 +32,8 @@
 //	                                            /run/faas/gatewayd-internal.sock
 //
 // Operators configure gatewayd-public via env overrides only (no
-// certmagic, no TOML — TLS is upstream): FAAS_INTERNAL_SOCKET,
-// FAAS_PUBLIC_LISTEN_ADDR, FAAS_PUBLIC_CONTROL_ADDR.
+// certmagic, no TOML — TLS is upstream): FAAS_INTERNAL_SOCKET or
+// FAAS_INTERNAL_TARGET, FAAS_PUBLIC_LISTEN_ADDR, FAAS_PUBLIC_CONTROL_ADDR.
 package main
 
 import (
@@ -224,18 +225,33 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	inflight := gateway.NewConnStateTracker()
 
-	// Reverse-proxy to gatewayd-internal over the unix socket.
-	internalSocket := envOr("FAAS_INTERNAL_SOCKET", defaultInternalSocket)
+	// Reverse-proxy to gatewayd-internal. Same-box installs keep the unix
+	// socket contract; split-box control planes set FAAS_INTERNAL_TARGET to a
+	// private tcp://host:port target rendered from the manifest. The TCP
+	// dialer is fixed at startup so the customer request URL cannot influence
+	// the destination.
+	internalTarget := strings.TrimSpace(os.Getenv("FAAS_INTERNAL_TARGET"))
 	internalURL := &url.URL{Scheme: "http", Host: "gatewayd-internal"}
+	var internalDialer gateway.InternalDialer
+	if internalTarget == "" {
+		internalSocket := envOr("FAAS_INTERNAL_SOCKET", defaultInternalSocket)
+		internalDialer = gateway.NewUnixSocketDialer(internalSocket)
+	} else {
+		parsedTarget, parseErr := url.Parse(internalTarget)
+		if parseErr != nil || parsedTarget.Scheme != "tcp" || parsedTarget.Host == "" || parsedTarget.Path != "" {
+			return fmt.Errorf("gatewayd-public: FAAS_INTERNAL_TARGET must be tcp://host:port, got %q", internalTarget)
+		}
+		internalURL.Host = parsedTarget.Host
+		internalDialer = gateway.NewTCPDialer(parsedTarget.Host)
+		log.Info("gatewayd-public: split-box internal target", "target", internalTarget)
+	}
 	// Issue #675: FAAS_INTERNAL_H2C toggles H2C (HTTP/2 cleartext) on
-	// the public→internal hop. Default true so the Tier A7 production
-	// path negotiates H2 end-to-end. Set to "false" / "0" / "no" to
-	// fall back to the legacy HTTP/1.1 transport (operational escape
-	// hatch if a regression shows up — no redeploy needed beyond a
-	// daemon restart).
-	h2cEnabled := envBoolOr("FAAS_INTERNAL_H2C", true)
+	// the public→internal hop. The unix SynthServer enables native H2C;
+	// the split-box TCP listener uses the ordinary HTTP/1.1 server unless
+	// an operator explicitly enables H2C after both ends are configured.
+	h2cEnabled := envBoolOr("FAAS_INTERNAL_H2C", internalTarget == "")
 	proxy := gateway.NewInternalReverseProxy(
-		gateway.NewUnixSocketDialer(internalSocket),
+		internalDialer,
 		internalURL,
 		log,
 		h2cEnabled,
