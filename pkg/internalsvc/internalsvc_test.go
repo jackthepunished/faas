@@ -23,13 +23,11 @@ package internalsvc_test
 
 import (
 	"crypto/ed25519"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/go-jose/go-jose/v4"
 	"github.com/onebox-faas/faas/pkg/internalsvc"
 )
 
@@ -86,10 +84,16 @@ func TestVerifyRejectsWrongAudience(t *testing.T) {
 		"schedd": pub,
 	}
 
-	// Build a token with aud='foo' manually.
-	tok, err := mintWithAudience(t, priv, "schedd", "foo")
+	// MintWithAudience is the test-only export added in
+	// PR #1009 round-3 — the production Mint pins Audience
+	// at gregale.internal, so the wrong-audience path needs
+	// a parameterized surface. The substring that the
+	// bridge returns verbatim is "aud claim does not match"
+	// (internalsvc.go:77) — the substring-match table in
+	// pkg/gateway/internal_svc_auth.go:300 keys off it.
+	tok, err := internalsvc.MintWithAudience("schedd", 30*time.Second, nil, priv, "kid-test-aud", "foo")
 	if err != nil {
-		t.Fatalf("mintWithAudience: %v", err)
+		t.Fatalf("MintWithAudience: %v", err)
 	}
 
 	_, err = internalsvc.Verify(tok, allowed)
@@ -238,39 +242,4 @@ func TestMintRejectsBadKeySize(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Mint with bad key size: expected error, got nil")
 	}
-}
-
-// mintWithAudience is a test helper that mints a JWT with a
-// non-default audience. Used by TestVerifyRejectsWrongAudience
-// because Mint pins Audience at the package level.
-func mintWithAudience(t *testing.T, priv ed25519.PrivateKey, svcName, aud string) (string, error) {
-	t.Helper()
-	// Inline go-jose construction, mirroring Mint but with
-	// the aud parameterizable. Keep the surface narrow so
-	// the test stays focused.
-	signer, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.EdDSA, Key: priv},
-		(&jose.SignerOptions{}).WithType("JWT"),
-	)
-	if err != nil {
-		return "", err
-	}
-	payload := map[string]any{
-		"iss": internalsvc.Issuer,
-		"sub": svcName,
-		"aud": aud,
-		"exp": time.Now().Add(30 * time.Second).Unix(),
-		"iat": time.Now().Unix(),
-		"nbf": time.Now().Unix(),
-		"jti": "test-jti",
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	jws, err := signer.Sign(body)
-	if err != nil {
-		return "", err
-	}
-	return jws.CompactSerialize()
 }

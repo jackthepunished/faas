@@ -129,7 +129,30 @@ var ErrEmptyAllowlist = errors.New("internalsvc: per-service allowlist must not 
 // in the payload for diagnostic / rotation-tracking purposes.
 func Mint(svcName string, ttl time.Duration, claims map[string]any,
 	priv ed25519.PrivateKey, kid string) (string, error) {
+	return MintWithAudience(svcName, ttl, claims, priv, kid, Audience)
+}
 
+// MintWithAudience is the test-only mint that takes an explicit
+// audience. Production callers (cmd/schedd/internal_svc_minter.go)
+// MUST use Mint (audience hardcoded to gregale.internal);
+// MintWithAudience exists so tests can mint tokens with a wrong
+// audience and exercise the gate's reason-mapping end-to-end.
+//
+// Round-2 peer-review #3 surfaced the need: a test that mints
+// with aud='foo' is the only way to pin the gate's
+// 'audience_mismatch' reason code against a live Verify call —
+// the bridge in cmd/gatewayd-internal/internal_svc_verifier.go
+// preserves the typed error from internalsvc.Verify verbatim,
+// so the substring-match table in pkg/gateway/internal_svc_auth.go
+// is what classifies it. To keep production callers from
+// accidentally varying the audience (and breaking the §3
+// ADR-119 trust contract), the function name carries the
+// "MintWith" prefix — a future reader scanning the call sites
+// will see "Mint" in cmd/schedd and "MintWithAudience" in
+// *test.go files only. There is no compile-time guard; the
+// convention is comment-enforced.
+func MintWithAudience(svcName string, ttl time.Duration, claims map[string]any,
+	priv ed25519.PrivateKey, kid, audience string) (string, error) {
 	if svcName == "" {
 		return "", errors.New("internalsvc.Mint: svcName must not be empty")
 	}
@@ -173,7 +196,7 @@ func Mint(svcName string, ttl time.Duration, claims map[string]any,
 	payload := map[string]any{
 		"iss":   Issuer,
 		"sub":   svcName,
-		"aud":   Audience,
+		"aud":   audience,
 		"exp":   jwt.NewNumericDate(now.Add(ttl)),
 		"iat":   jwt.NewNumericDate(now),
 		"nbf":   jwt.NewNumericDate(now),

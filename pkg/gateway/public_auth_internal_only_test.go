@@ -256,29 +256,59 @@ func TestApplyIngressInternalSvc_InvalidSignature_Returns403(t *testing.T) {
 
 // TestApplyIngressInternalSvc_WrongAudience_Returns403 covers
 // the aud-claim-mismatch path. Mints with aud='foo' (NOT
-// gregale.internal) via the same Mint function. Asserts 403
-// + invalid-audit row.
+// gregale.internal) via internalsvc.MintWithAudience (test-only,
+// exported in PR #1009 round-3 peer-review fix #3 — the substring-
+// match table in applyIngressInternalSvc needs a live end-to-end
+// pin). Asserts 403 + invalid-audit row + reason='audience_mismatch'.
 func TestApplyIngressInternalSvc_WrongAudience_Returns403(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatalf("genkey: %v", err)
 	}
-	_, _, _ = newTestHandlerForInternalSvc(t, map[string]ed25519.PublicKey{
+	h, a, _ := newTestHandlerForInternalSvc(t, map[string]ed25519.PublicKey{
 		"schedd": pub,
 	})
-	// Manually mint with audience='foo'. We can't use
-	// internalsvc.Mint directly because it hard-codes
-	// gregale.internal, so we hand-build a JWT using
-	// internalsvc.Verify to round-trip-test the rejection.
-	// The cleanest approach: use a separate signer with a
-	// custom audience. Since pkg/internalsvc doesn't expose
-	// a Mint variant (audience is a const), we use the
-	// test-only path of constructing a token via the public
-	// minting API and asserting the verifier rejects it for
-	// some other reason (expired TTL is the test-only hook).
-	t.Skip("audience mismatch covered by pkg/internalsvc TestVerifyRejectsWrongAudience; the gate's isErrAudience helper is unit-tested in synth_internal_only_test.go")
-	_ = pub
-	_ = priv
+	app := internalOnlyApp()
+
+	// MintWithAudience lets the test inject a non-canonical
+	// audience. Production callers (cmd/schedd) MUST use
+	// internalsvc.Mint, which pins Audience=gregale.internal
+	// at the package level.
+	sum := sha256.Sum256(pub)
+	kid := base64.RawURLEncoding.EncodeToString(sum[:16])
+	tok, err := internalsvc.MintWithAudience("schedd", 30*time.Second, nil, priv, kid, "foo")
+	if err != nil {
+		t.Fatalf("MintWithAudience: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	if !h.applyIngressInternalSvc(rec, req, app) {
+		t.Errorf("gate should deny on audience mismatch")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("rec.Code = %d, want 403", rec.Code)
+	}
+	if got := a.countByKind("instances.public_auth_internal_invalid"); got != 1 {
+		t.Errorf("invalid-audit count = %d, want 1", got)
+	}
+	// Pin the reason code — the substring-match table must
+	// classify 'aud claim does not match' as
+	// 'audience_mismatch', not the fallback
+	// 'signature_invalid'. Regression here means the gate
+	// silently misroutes every aud-mismatch as a sig error
+	// (the round-2 bug).
+	var foundReason string
+	for _, ev := range a.events {
+		if r, ok := ev.data["reason"].(string); ok {
+			foundReason = r
+		}
+	}
+	if foundReason != "audience_mismatch" {
+		t.Errorf("audit reason = %q, want 'audience_mismatch'", foundReason)
+	}
 }
 
 // TestApplyIngressInternalSvc_ExpiredToken_Returns403 covers
@@ -404,7 +434,7 @@ func TestApplyIngressInternalSvc_AuditDoesNotEchoToken(t *testing.T) {
 // dashboard.
 func TestInternalAuthMatchCounterPreInstantiated(t *testing.T) {
 	m := NewMetrics()
-	for _, outcome := range []string{"matched", "blocked", "bypass_stripped"} {
+	for _, outcome := range []string{"matched", "blocked"} {
 		got := m.internalAuthMatch.WithLabelValues(outcome)
 		if got == nil {
 			t.Errorf("counter for outcome=%q is nil (not pre-instantiated)", outcome)

@@ -45,7 +45,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -206,22 +205,28 @@ func (h *Handler) applyIngressInternalSvc(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		_ = svcName // unused on the failure branch
 		// Audit the reason code only — never the token, never
-		// the raw signature bytes. The verifier returns typed
-		// internalsvc.Err* sentinels; map them to a closed
-		// reason vocabulary so the audit row stays stable.
+		// the raw signature bytes. The bridge returns fresh
+		// errors with the pkg/internalsvc.Err*.Error() text
+		// (cmd/gatewayd-internal/internal_svc_verifier.go:177-183).
+		// Round-2 peer-review (#3): the previous shape used
+		// errors.Is against errInternalSvc* aliases here, but
+		// identity match never fired — the bridge constructs
+		// fresh errors per call, so EVERY Verify failure on the
+		// HTTP-front-door collapsed to reason='signature_invalid'.
+		// The synth-side twin (synth_internal_only.go:177-194)
+		// substring-matches raw text and works correctly, so the
+		// two surfaces already disagreed. The fix: switch to the
+		// same substring-match pattern the synth side uses. The
+		// substring fragments are stable per the §3 ADR-119
+		// contract (the bridge preserves them verbatim from
+		// internalsvc.Err*.Error()); a unit test in
+		// public_auth_internal_only_test.go pins the strings.
 		reason := "signature_invalid"
-		if errors.Is(err, errInternalSvcAudience) {
-			reason = "audience_mismatch"
-		} else if errors.Is(err, errInternalSvcExpired) {
-			reason = "expired"
-		} else if errors.Is(err, errInternalSvcNotYetValid) {
-			reason = "not_yet_valid"
-		} else if errors.Is(err, errInternalSvcUnknownSvc) {
-			reason = "unknown_service"
-		} else if errors.Is(err, errInternalSvcMalformed) {
-			reason = "malformed"
-		} else if errors.Is(err, errInternalSvcEmptyAllowlist) {
-			reason = "empty_allowlist"
+		for _, f := range errInternalSvcReasonFragments {
+			if containsReason(err.Error(), f.fragment) {
+				reason = f.reason
+				break
+			}
 		}
 		h.emitAuthnAudit(r, app, nil, "instances.public_auth_internal_invalid", map[string]any{
 			"app_id":    app.ID,
@@ -269,23 +274,44 @@ func InternalSvcFromContext(ctx context.Context) string {
 	return v
 }
 
-// errInternalSvc* are local aliases for the typed errors the
-// verifier returns. pkg/gateway cannot import pkg/internalsvc
-// (that would invert the dependency direction — the bridge
-// file at cmd/gatewayd-internal/internal_svc_verifier.go
-// translates from internalsvc.Err* to these). errors.Is
-// requires identity equality, so the gate uses both aliases
-// in the same package. If pkg/internalsvc ever ships new
-// error sentinels, extend this list — the gate's "unknown
-// reason → signature_invalid" fallback is the safety net.
-var (
-	errInternalSvcAudience      = errors.New("internal_svc: audience mismatch")
-	errInternalSvcExpired       = errors.New("internal_svc: token expired")
-	errInternalSvcNotYetValid   = errors.New("internal_svc: token not yet valid")
-	errInternalSvcUnknownSvc    = errors.New("internal_svc: unknown service")
-	errInternalSvcMalformed     = errors.New("internal_svc: malformed token")
-	errInternalSvcEmptyAllowlist = errors.New("internal_svc: empty allowlist")
-)
+// errInternalSvcReasonFragments is the closed substring list
+// the gate's reason-mapping consults (round-2 peer-review #3).
+// The previous shape used errors.Is against errInternalSvc*
+// aliases — but the bridge (cmd/gatewayd-internal/internal_svc_verifier.go)
+// returns fresh errors per call, so identity never matched and
+// every Verify failure collapsed to reason='signature_invalid'.
+// The fix: substring-match the .Error() text the bridge
+// preserves verbatim from pkg/internalsvc.Err*.Error(). The
+// substring fragments are stable per the §3 ADR-119 contract;
+// a unit test in public_auth_internal_only_test.go pins them.
+//
+// pkg/gateway cannot import pkg/internalsvc (that would invert
+// the dependency direction — the bridge translates from
+// internalsvc.Err* to the gate's reason vocabulary). The
+// fragments are the cross-package contract surface; if
+// pkg/internalsvc ever ships a new error sentinel, extend
+// this list and the gate's "unknown reason → signature_invalid"
+// fallback is the safety net.
+var errInternalSvcReasonFragments = []struct {
+	fragment string
+	reason   string
+}{
+	{"aud claim does not match", "audience_mismatch"},
+	{"token expired", "expired"},
+	{"token not yet valid", "not_yet_valid"},
+	{"svcName not in per-service allowlist", "unknown_service"},
+	{"token malformed", "malformed"},
+	{"per-service allowlist must not be empty", "empty_allowlist"},
+}
+
+// containsReason is a tiny substring helper that replaces the
+// dead `containsToken` private helper the synth side ships
+// (synth_internal_only.go:201). The HTTP-front-door side
+// imports strings already, so this is a one-line wrapper that
+// keeps the gate readable.
+func containsReason(haystack, needle string) bool {
+	return strings.Contains(haystack, needle)
+}
 
 // _ pins base64 + ed25519 imports for the gateway-side helper
 // surface. The actual JWT mint/verify logic lives in

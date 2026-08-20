@@ -371,22 +371,43 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		outReq.Header.Set("X-Forwarded-For", clientIP)
 	}
-	// ADR-119: strip inbound Authorization so external callers
-	// can never reach applyIngressInternalSvc with a header
-	// intact. The internal gate is reachable only by daemons
-	// that dial gatewayd-internal directly via the unix socket
-	// — those daemons attach their minted JWT themselves
-	// (e.g. schedd cron → gatewayd-internal at
-	// /v1/synthesize). Without this strip, a customer who
-	// sends "Authorization: Bearer foo" over the public TLS
-	// hop would reach the gate and 403 on signature, but
-	// would still leak internal-only knowledge into the
-	// public-path audit log. Stripping is cleaner: the
-	// defensive counter gateway_internal_auth_match_total{
-	// outcome="bypass_stripped"} is incremented if a header
-	// survives this strip (which would indicate a custom
-	// proxy or a misconfigured gatewayd-public).
-	outReq.Header.Del("Authorization")
+	// ADR-119 round-2 (peer-review #1): do NOT strip inbound
+	// Authorization. The strip was load-bearing for internal_only
+	// (so a customer who set Authorization: Bearer foo could
+	// not reach applyIngressInternalSvc over the public TLS hop),
+	// but the strip was unconditional — it killed every existing
+	// customer bearer/basic/require_authn gate on the Tier-A7
+	// gatewayd-public → gatewayd-internal hop. The fix is to
+	// leave the header intact: the customer-facing auth gates
+	// at handler.go (enforcePublicAuthBearer, enforcePublicAuthBasic,
+	// requireAuthnKey) consume the inbound Authorization header
+	// for their own purpose, and the internal_only gate
+	// (applyIngressInternalSvc) only fires when the app's
+	// public_auth_mode is 'internal_only'. The two cases don't
+	// collide: a customer with a bearer/basic/require_authn app
+	// never reaches applyIngressInternalSvc; a customer with an
+	// internal_only app never has a customer-facing auth gate
+	// (the mode is mutually exclusive).
+	//
+	// Why the original "strip" was wrong:
+	// The strip assumed the internal_only gate applies to every
+	// request, but it's gated on public_auth_mode='internal_only'
+	// which is mutually exclusive with bearer/basic/require_authn.
+	// Stripping on every hop broke the four pre-existing
+	// customer-facing gates. The defensive counter
+	// gateway_internal_auth_match_total{outcome="bypass_stripped"}
+	// (peer-review #6) is also dead as a result — see the
+	// metric removal commit. The strip is removed entirely.
+	//
+	// The internal_only gate is now reachable only from the
+	// unix-socket dial path (handled by the cmd-side wiring:
+	// gatewayd-public is NOT a unix-socket dialer; it uses
+	// its own TLS listener + proxies to gatewayd-internal).
+	// For the unix-socket dial path, schedd attaches its own
+	// JWT (see pkg/sched/configure_internal_svc.go) and the
+	// gate verifies it. There is no scenario where a customer
+	// header survives the public hop AND leaks into the gate.
+	_ = r // suppress unused-name if the comment is removed
 	if r.TLS != nil {
 		outReq.Header.Set("X-Forwarded-Proto", "https")
 	} else {

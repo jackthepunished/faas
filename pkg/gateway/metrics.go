@@ -228,21 +228,20 @@ type Metrics struct {
 	responseBodyWarnTotal *prometheus.CounterVec
 	// internalAuthMatch (ADR-119 / issue #477 #4): counter of
 	// apps.public_auth_mode='internal_only' ingress verifications,
-	// labelled by outcome (matched | blocked | bypass_stripped).
-	// `matched` = a valid Authorization: Bearer JWT with
-	// aud='gregale.internal' was verified against the per-service
-	// public-key allowlist (pkg/internalsvc.Verify). `blocked` =
-	// verification failed (missing/invalid/expired/unknown svc).
-	// `bypass_stripped` = the request arrived via the public→
-	// internal hop but carried an Authorization header that
-	// gatewayd-public already stripped (defensive counter — should
-	// always be zero in production; non-zero indicates a custom
-	// proxy or a misconfigured gatewayd-public that leaked the
-	// header). Distinct from edgeRuleMatch (which counts per-rule
-	// edge-rule decisions, not auth events); re-using edgeRuleMatch
-	// would conflate "an edge rule fired" with "a JWT was verified"
-	// and break the §12 dashboard "internal auth match rate" chip.
-	// Closed (outcome) set, pre-instantiated at boot below.
+	// labelled by outcome (matched | blocked). `matched` = a
+	// valid Authorization: Bearer JWT with aud='gregale.internal'
+	// was verified against the per-service public-key allowlist
+	// (pkg/internalsvc.Verify). `blocked` = verification failed
+	// (missing/invalid/expired/unknown svc). Round-2 peer-review
+	// (#6) removed the `bypass_stripped` label that no code path
+	// incremented (the Header.Del on internal_proxy.go was
+	// unconditional, so the strip was never bypassed and the
+	// counter stayed at zero forever). Distinct from edgeRuleMatch
+	// (which counts per-rule edge-rule decisions, not auth events);
+	// re-using edgeRuleMatch would conflate "an edge rule fired"
+	// with "a JWT was verified" and break the §12 dashboard
+	// "internal auth match rate" chip. Closed (outcome) set,
+	// pre-instantiated at boot below.
 	internalAuthMatch *prometheus.CounterVec
 	// appMaintenance (ADR-091 amendment / §4.1.2.0): counter of
 	// apps.maintenance_mode coarse-gate matches. Distinct from the
@@ -627,7 +626,7 @@ func NewMetrics() *Metrics {
 		// well below the 50-counter budget.
 		internalAuthMatch: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_internal_auth_match_total",
-			Help: "apps.public_auth_mode='internal_only' ingress verification outcomes (matched|blocked|bypass_stripped), labelled by outcome. ADR-119.",
+			Help: "apps.public_auth_mode='internal_only' ingress verification outcomes (matched|blocked), labelled by outcome. ADR-119.",
 		}, []string{"outcome"}),
 		// ADR-091 amendment — coarse-gate apps.maintenance_mode
 		// short-circuit counter. Distinct from edgeRule* family
@@ -1100,14 +1099,15 @@ func NewMetrics() *Metrics {
 	// ADR-119 — pre-instantiate the closed (outcome) set on the
 	// internal-auth-match counter so the §12 dashboard chip
 	// "internal auth match rate" surfaces from first scrape.
-	// `bypass_stripped` is the defensive counter for the case
-	// where an inbound Authorization header somehow survives
-	// the gatewayd-public→gatewayd-internal hop; production
-	// traffic should always increment `matched` or `blocked`,
-	// never `bypass_stripped`. The set is intentionally small
-	// (3 outcomes) — adding a new reason requires a code +
-	// dashboard change.
-	for _, outcome := range []string{"matched", "blocked", "bypass_stripped"} {
+	// Round-2 peer-review (#6): the previous shape pre-instantiated
+	// a `bypass_stripped` label that no code path incremented —
+	// the Header.Del on internal_proxy.go was unconditional →
+	// the counter stayed at zero forever, wasting 1 of the
+	// 50-counter-per-app budget (ADR-093 cap) and undermining
+	// operator trust in the metric family. The label is removed.
+	// The set is {matched, blocked}; if a future hardening pass
+	// adds a third label, it's a code + dashboard change.
+	for _, outcome := range []string{"matched", "blocked"} {
 		m.internalAuthMatch.WithLabelValues(outcome)
 	}
 	// ADR-024 H3 follow-up (Finding 2): pre-instantiate the closed
@@ -1649,10 +1649,11 @@ func (m *Metrics) ObserveRouteConsumerThrottleDecision(kind, outcome string) {
 // ObserveInternalAuthMatch (ADR-119) increments the
 // apps.public_auth_mode='internal_only' verification outcome
 // counter. Called from Handler.applyIngressInternalSvc (and the
-// parallel SynthServer.applyIngressInternalSvc at synth.go:://)
-// after the gate runs. outcome is one of {matched, blocked,
-// bypass_stripped} — the closed set pre-instantiated at boot.
-// An unknown outcome is coerced to "blocked" so a future
+// parallel SynthServer.applyIngressInternalSvc at synth.go:300,
+// :340, :617) after the gate runs. outcome is one of
+// {matched, blocked} — the closed set pre-instantiated at boot.
+// Round-2 peer-review (#6) removed the dead `bypass_stripped`
+// label. An unknown outcome is coerced to "blocked" so a future
 // regression that ships a new outcome string does not blow up
 // the §12 dashboard chip on first contact (same fallback
 // posture as ObserveEdgeRuleMatch). Nil-safe.
@@ -1661,7 +1662,7 @@ func (m *Metrics) ObserveInternalAuthMatch(outcome string) {
 		return
 	}
 	switch outcome {
-	case "matched", "blocked", "bypass_stripped":
+	case "matched", "blocked":
 		// known
 	default:
 		outcome = "blocked"
