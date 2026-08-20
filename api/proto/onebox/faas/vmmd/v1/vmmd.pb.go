@@ -210,7 +210,7 @@ type AppSpec struct {
 	// emits a sibling SNAT-to-customer rule in the postrouting
 	// chain AFTER the default MASQUERADE. v4-only in v1; the
 	// DB family=4 CHECK (apps_static_egress_ip_family_check,
-	// migration 00308) prevents IPv6 from reaching here.
+	// migration 00325) prevents IPv6 from reaching here.
 	// vmmd validates the dotted-quad + non-reserved shape
 	// before forwarding into netns.Config. Plan-gated upstream
 	// (Free/Hobby/Pro always empty) by
@@ -2167,7 +2167,7 @@ func (*UpdateEgressAllowlistAck) Descriptor() ([]byte, []int) {
 // customer-supplied IPv4 (dotted-quad); empty = clear the
 // pin (DELETE wire shape). v4-only in v1 — the DB CHECK
 // family=4 (apps_static_egress_ip_family_check, migration
-// 00308) prevents IPv6 from reaching here.
+// 00325) prevents IPv6 from reaching here.
 //
 // The wire does not include a `static_egress_ip_version`
 // field — the in-place patch is the only contract; cold boot

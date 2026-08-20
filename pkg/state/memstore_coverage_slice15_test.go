@@ -98,7 +98,7 @@ func TestCoverageSlice15StaticEgressIPNoTouch(t *testing.T) {
 
 // TestCoverageSlice15StaticEgressIPDefaultIsZero pins the fixture
 // invariant: a fresh app has StaticEgressIP=nil + SetAt=nil. The
-// migration 00308 default is NULL on both columns, and the
+// migration 00325 default is NULL on both columns, and the
 // MemStore's CreateApp mirrors that.
 func TestCoverageSlice15StaticEgressIPDefaultIsZero(t *testing.T) {
 	m, ctx, _, app, _ := memCoverageFixture(t)

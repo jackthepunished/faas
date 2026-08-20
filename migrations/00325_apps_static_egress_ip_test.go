@@ -1,15 +1,16 @@
 //go:build !no_pg
 
-// Migration-apply test for 00303_apps_static_egress_ip.sql
+// Migration-apply test for 00325_apps_static_egress_ip.sql
 // (ADR-119 static outbound IP per app).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00303 (no goose
-//     duplicate-version panic). Slot 00303 was chosen via the
-//     cross-PR fence precheck pattern — 00303–00307 are claimed
-//     by open PRs #984 / #988 / #992 / #993 per
-//     cross-pr-slot-gate-races-with-active-pr.
+//  1. Migration set applies cleanly through 00325 (no goose
+//     duplicate-version panic). Slot 00325 was chosen via the
+//     cross-PR fence precheck pattern — 00320–00324/00326 are
+//     reservation fences on this branch; 00303–00319 are claimed
+//     by open PRs #984 / #988 / #992 / #993 / #997 / #999 / #1000
+//     per cross-pr-slot-gate-races-with-active-pr.
 //  2. The two new columns exist with the expected types:
 //     apps.static_egress_ip         INET NULL
 //     apps.static_egress_ip_set_at  TIMESTAMPTZ NULL
@@ -38,13 +39,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00303_AppsStaticEgressIP(t *testing.T) {
+func TestMigrations_00325_AppsStaticEgressIP(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00303 should land last.
+	// (1) Run the full migration set. 00325 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (cross-PR fence precheck — confirm 00303–00307 are still claimed by open PRs and 00303 is the next free slot)", err)
+		t.Fatalf("db.MigrateUp: %v (cross-PR fence precheck — confirm 00320–00324/00326 are reservation fences and 00325 is the next free slot)", err)
 	}
 
 	// (2) Columns exist with expected types.

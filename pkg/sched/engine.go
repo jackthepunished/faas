@@ -1838,7 +1838,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// netns.Config.AccountStaticIP from this value so
 		// the per-netns renderer emits a sibling SNAT rule.
 		// Plan-gated upstream; the apps_static_egress_ip_key
-		// partial unique index (migration 00308) defends at
+		// partial unique index (migration 00325) defends at
 		// the DB layer. Live instances of the same app keep
 		// their old netns — the app_changed pg_notify path
 		// fires UpdateStaticEgressIP gRPC to patch them

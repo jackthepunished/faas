@@ -1,4 +1,4 @@
--- filename: 00303_apps_static_egress_ip.sql
+-- filename: 00320_reserve_slot.sql
 -- +goose Up
 -- +goose StatementBegin
 SELECT 1;

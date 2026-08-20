@@ -69,7 +69,7 @@ ADR.
 Single nullable column on `apps`, plus a stamp:
 
 ```sql
--- migrations/00308_apps_static_egress_ip.sql (additive)
+-- migrations/00325_apps_static_egress_ip.sql (additive)
 alter table apps
   add column if not exists static_egress_ip inet
     check (static_egress_ip is null or family(static_egress_ip) = 4);
@@ -224,9 +224,9 @@ call. Mirrors `cmd/gregale/commands_tenant_surfaces.go:32-56`.
 
 ## Consequences
 
-- New migration `00308_apps_static_egress_ip.sql` (additive,
+- New migration `00325_apps_static_egress_ip.sql` (additive,
   nullable, default NULL).
-- New migration `00309_reserve_slot.sql` (fence for the cross-PR
+- New migration `00326_reserve_slot.sql` (fence for the cross-PR
   follow-up).
 - New wire field on `AppSpec` (proto field 8) +
   `UpdateStaticEgressIP` gRPC method.

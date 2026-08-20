@@ -218,7 +218,7 @@ func TestStaticEgressIP_PutRejectsBadIPs(t *testing.T) {
 // to pin the same IP, the handler returns 403 with
 // plan_static_egress_ip_quota. The MemStore's static_egress_ip
 // field is set in pkg/state/memstore.go; the unique-index
-// behaviour is exercised end-to-end in migrations/00308_...
+// behaviour is exercised end-to-end in migrations/00325_...
 func TestStaticEgressIP_CrossAppSameAccountQuota(t *testing.T) {
 	withStaticEgressIPEnabled(t)
 	e, _ := newTestServerWithCapturingNotifier(t, api.PlanScale)
