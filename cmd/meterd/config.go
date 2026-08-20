@@ -8,8 +8,10 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/role"
@@ -25,6 +27,15 @@ type Config struct {
 	DBURL string `toml:"db_url"`
 	// MetricsAddr is the optional bind address for /metrics. Empty disables it.
 	MetricsAddr string `toml:"metrics_addr"`
+	// Metrics listener timeouts (ADR-122). Defaults fall back to
+	// api.Metrics*SecondsDefault when zero — keep the type as
+	// time.Duration to match the apid precedent (cmd/apid/config.go
+	// :133-136). MaxHeaderBytes is int64 seconds to mirror
+	// api.DefaultMaxHeaderBytes.
+	MetricsReadTimeout    time.Duration `toml:"metrics_read_timeout"`
+	MetricsWriteTimeout   time.Duration `toml:"metrics_write_timeout"`
+	MetricsIdleTimeout    time.Duration `toml:"metrics_idle_timeout"`
+	MetricsMaxHeaderBytes int64         `toml:"metrics_max_header_bytes"`
 	// Meter is the pkg/meter timer cadence + behavior block.
 	Meter *meter.Config `toml:"meter"`
 
@@ -95,6 +106,32 @@ type Config struct {
 // schedd. Empty cluster returns (nil, nil); partial cluster is rejected.
 func (c *Config) LoadScheddTLS() (*tls.Config, error) {
 	return wire.LoadClientTLSConfigWithPrefix("schedd_", c.ScheddTLSCertPath, c.ScheddTLSKeyPath, c.ScheddTLSCAPath)
+}
+
+// MetricsListener returns the *http.Server timeouts + MaxHeaderBytes
+// for meterd's metrics listener (ADR-122). Each knob falls back to
+// the corresponding api.Metrics*SecondsDefault when the TOML field
+// is zero. The signature is a single helper rather than four
+// getters because the listener builds a single struct at one call
+// site (cmd/meterd/main.go:metricsListenAndServe factory).
+func (c *Config) MetricsListener() (read, write, idle time.Duration, maxHeaderBytes int64) {
+	read = c.MetricsReadTimeout
+	if read == 0 {
+		read = time.Duration(api.MetricsReadTimeoutSecondsDefault) * time.Second
+	}
+	write = c.MetricsWriteTimeout
+	if write == 0 {
+		write = time.Duration(api.MetricsWriteTimeoutSecondsDefault) * time.Second
+	}
+	idle = c.MetricsIdleTimeout
+	if idle == 0 {
+		idle = time.Duration(api.MetricsIdleTimeoutSecondsDefault) * time.Second
+	}
+	maxHeaderBytes = c.MetricsMaxHeaderBytes
+	if maxHeaderBytes == 0 {
+		maxHeaderBytes = api.DefaultMaxHeaderBytes
+	}
+	return
 }
 
 // LoadEgressTLS returns the client mTLS config meterd uses to dial the

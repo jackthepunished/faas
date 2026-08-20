@@ -73,7 +73,7 @@ func writeMeterdConfig(t *testing.T, dir, metricsAddr string) string {
 //
 // env is the env-var reader (FAAS_*_INTERVAL knobs); defaults to a function
 // that returns "". Tests that want sub-second intervals pass a closure.
-func stubMeterdDeps(cfgPath, metricsAddr string, pool *pgxpool.Pool, listenFn func(string, http.Handler) (*http.Server, error), env func(string) string) runDeps {
+func stubMeterdDeps(cfgPath, metricsAddr string, pool *pgxpool.Pool, listenFn func(string, http.Handler, time.Duration, time.Duration, time.Duration, int64) (*http.Server, error), env func(string) string) runDeps {
 	return runDeps{
 		configPath: cfgPath,
 		openDB: func(context.Context, string) (*pgxpool.Pool, error) {
@@ -198,7 +198,7 @@ func TestRun_MetricsAddrEmptySkipsListener(t *testing.T) {
 	pool := testPool(t)
 
 	var invocations int
-	listenFn := func(string, http.Handler) (*http.Server, error) {
+	listenFn := func(string, http.Handler, time.Duration, time.Duration, time.Duration, int64) (*http.Server, error) {
 		invocations++
 		return nil, nil
 	}
@@ -242,7 +242,7 @@ func TestRun_MetricsAddrServesEndpoints(t *testing.T) {
 		mu       sync.Mutex
 		captured http.Handler
 	)
-	listenFn := func(_ string, h http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, h http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = h
@@ -365,7 +365,7 @@ func TestRun_MetricsAddrDrainsOnCancel(t *testing.T) {
 	cfgPath := writeMeterdConfig(t, dir, "127.0.0.1:0")
 	pool := testPool(t)
 
-	listenFn := func(_ string, _ http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, _ http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		return &http.Server{Handler: http.NewServeMux(), ReadHeaderTimeout: 10 * time.Second}, nil
 	}
 	deps := stubMeterdDeps(cfgPath, "127.0.0.1:0", pool, listenFn, func(string) string { return "" })
@@ -409,7 +409,7 @@ func TestRun_DialScheddPropagatesCancel(t *testing.T) {
 	pool := testPool(t)
 
 	wantErr := errors.New("dial cancelled (test)")
-	listenFn := func(string, http.Handler) (*http.Server, error) {
+	listenFn := func(string, http.Handler, time.Duration, time.Duration, time.Duration, int64) (*http.Server, error) {
 		return nil, nil
 	}
 	deps := stubMeterdDeps(cfgPath, "", pool, listenFn, func(string) string { return "" })
@@ -443,7 +443,7 @@ func TestRun_Healthz_StaleReturns503(t *testing.T) {
 		mu       sync.Mutex
 		captured http.Handler
 	)
-	listenFn := func(_ string, h http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, h http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = h
@@ -849,7 +849,7 @@ func TestRun_MetricsAddr_StripePushLabels(t *testing.T) {
 		mu       sync.Mutex
 		captured http.Handler
 	)
-	listenFn := func(_ string, h http.Handler) (*http.Server, error) {
+	listenFn := func(_ string, h http.Handler, _ time.Duration, _ time.Duration, _ time.Duration, _ int64) (*http.Server, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = h

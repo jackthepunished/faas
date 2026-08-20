@@ -540,8 +540,16 @@ type runDeps struct {
 	// during graceful drain — the same server owns both halves, so the
 	// pair stays in lockstep (no possibility of one server's Serve
 	// outliving another's Shutdown). Mirrors cmd/schedd/main.go:151-158.
-	// Tests inject a stub that returns a nop server (without binding).
-	metricsListenAndServe func(addr string, h http.Handler) (*http.Server, error)
+	//
+	// The four timeouts + maxHeaderBytes are passed in (resolved by
+	// cfg.MetricsListener at the call site) rather than re-resolved
+	// inside the factory so the factory stays a pure *http.Server
+	// builder with no cfg dependency — tests stubbing
+	// metricsListenAndServe never need to construct a Config.
+	// Defaults live in pkg/api/limits.go as
+	// Metrics*SecondsDefault; per-daemon override is the four
+	// cfg.Metrics* TOML fields (ADR-122).
+	metricsListenAndServe func(addr string, h http.Handler, readTimeout, writeTimeout, idleTimeout time.Duration, maxHeaderBytes int64) (*http.Server, error)
 	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
 	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
 	// log, nil) which exits on violation in production. Tests
@@ -570,12 +578,19 @@ func defaultDeps() runDeps {
 		loadBillingConfig: billingloader.LoadBillingConfigFromPath,
 		mailer:            nil, // populated lazily in runWithDeps via mail.SenderFromEnv
 		now:               time.Now,
-		metricsListenAndServe: func(addr string, h http.Handler) (*http.Server, error) {
+		metricsListenAndServe: func(addr string, h http.Handler, readTimeout, writeTimeout, idleTimeout time.Duration, maxHeaderBytes int64) (*http.Server, error) {
 			ln, err := net.Listen("tcp", addr)
 			if err != nil {
 				return nil, err
 			}
-			srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
+			srv := &http.Server{
+				Handler:           h,
+				ReadHeaderTimeout: 10 * time.Second, // pre-existing; ADR-122 doesn't override
+				ReadTimeout:       readTimeout,
+				WriteTimeout:      writeTimeout,
+				IdleTimeout:       idleTimeout,
+				MaxHeaderBytes:    int(maxHeaderBytes), // http.Server field is int; the cfg knob is int64 to mirror api.DefaultMaxHeaderBytes
+			}
 			// Serve in a goroutine; the daemon keeps `srv` and calls
 			// Shutdown on it during drain. Pairing Serve/Shutdown on the
 			// same *http.Server avoids the dual-server asymmetry the
@@ -955,7 +970,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			w.WriteHeader(code)
 			_ = json.NewEncoder(w).Encode(status)
 		})
-		srv, err := deps.metricsListenAndServe(cfg.MetricsAddr, mux)
+		readTimeout, writeTimeout, idleTimeout, maxHeaderBytes := cfg.MetricsListener()
+		srv, err := deps.metricsListenAndServe(cfg.MetricsAddr, mux, readTimeout, writeTimeout, idleTimeout, maxHeaderBytes)
 		if err != nil {
 			return fmt.Errorf("meterd: metrics listen %q: %w", cfg.MetricsAddr, err)
 		}
