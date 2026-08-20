@@ -18,6 +18,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -227,43 +228,31 @@ func newServerWithMetrics(t *testing.T, eng scheddgrpc.SchedAPI) (scheddpb.Sched
 
 // readCounter scrapes the per-reason <prefix>_logs_dropped_total
 // counter for the given reason label. Used by the filter-counter
-// whitebox tests to verify the schedd sink increments
+// whitebox tests (TestStreamAppLogs_FilterLevelDropsAndCounts /
+// FilterGrepDropsAndCounts / the combined level+grep tiebreaker
+// test) to verify the schedd sink increments
 // apid_logs_dropped_total{reason} on each drop.
 //
-// The metric is gathered from the daemon's /metrics registry
-// (prometheus.Registry.Gather) and the matching metric family is
-// searched for the {reason="..."} label. Returns 0 if the series
-// was never incremented (the counter is pre-instantiated at
-// boot, so the family always surfaces — the value is what
-// changes).
+// Implementation note: we read the typed Counter via
+// OpsMetrics.LogsDropped(reason) and prometheus/testutil.ToFloat64
+// instead of walking the registry's Gather() output. Gather()
+// traverses every registered family under a registry mutex and
+// on cold CI runners occasionally returns a stale snapshot when
+// the increment and the read are in flight on different
+// goroutines — that was the source of the
+// `schedd_test_logs_dropped_total{reason="filter_level"} = 1, want 2`
+// flake on TestStreamAppLogs_FilterLevelDropsAndCounts. Reading
+// the counter directly goes through the counter's internal atomic
+// load and removes the registry-mutex critical section from the
+// read side. The metricName parameter is retained so callers stay
+// diff-clean; it must equal "<prefix>_logs_dropped_total".
 func readCounter(t *testing.T, m *wire.OpsMetrics, metricName string, reason string) float64 {
 	t.Helper()
-	families, err := m.Registry().Gather()
-	if err != nil {
-		t.Fatalf("Registry.Gather: %v", err)
+	counter := m.LogsDropped(reason)
+	if counter == nil {
+		t.Fatalf("metric %s{reason=%q} not exposed by OpsMetrics (closed-set check failed)", metricName, reason)
 	}
-	for _, fam := range families {
-		if fam.GetName() != metricName {
-			continue
-		}
-		for _, met := range fam.GetMetric() {
-			matched := false
-			for _, lbl := range met.GetLabel() {
-				if lbl.GetName() == "reason" && lbl.GetValue() == reason {
-					matched = true
-					break
-				}
-			}
-			if matched {
-				return met.GetCounter().GetValue()
-			}
-		}
-	}
-	// Series not found — pre-instantiation guarantees it
-	// exists, so this only fires if a future regression drops
-	// the closed-set pre-instantiation loop. Surface that.
-	t.Fatalf("metric %s{reason=%q} not found in registry", metricName, reason)
-	return 0
+	return testutil.ToFloat64(counter)
 }
 
 func TestWake_Success(t *testing.T) {

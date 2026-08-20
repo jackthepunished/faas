@@ -5079,6 +5079,34 @@ func (m *OpsMetrics) IncLogDropped(reason string) {
 	}
 }
 
+// LogsDropped (issue #309 / tier-2 DX): typed counter accessor
+// for the per-reason <prefix>_logs_dropped_total series. The
+// schedd-side filter-counter whitebox tests
+// (TestStreamAppLogs_FilterLevelDropsAndCounts / FilterGrepDropsAndCounts /
+// the combined level+grep tiebreaker test) read this directly via
+// prometheus/testutil.ToFloat64 instead of walking the registry's
+// Gather() output. Direct Counter reads go through the counter's
+// internal atomic read; Gather() traverses every registered family
+// under a registry mutex and on cold CI runners occasionally
+// returns a stale snapshot when the increment and the read are
+// in flight on different goroutines — that's the flake this
+// accessor closes.
+//
+// Nil-safe (returns nil on a nil receiver). The closed `reason`
+// set is the same as IncLogDropped; unknown values return nil so
+// testutil.ToFloat64 surfaces a clean 0 rather than a panic on a
+// nil deref.
+func (m *OpsMetrics) LogsDropped(reason string) prometheus.Counter {
+	if m == nil || m.apidLogsDroppedTotal == nil {
+		return nil
+	}
+	switch reason {
+	case "slow_subscriber", "filter_grep", "filter_level":
+		return m.apidLogsDroppedTotal.WithLabelValues(reason)
+	}
+	return nil
+}
+
 // ObserveOAuthDisabled increments apid_oauth_disabled_total{provider}
 // (issue #419 / ADR-046). Called from the sign-in OAuth consent
 // handlers when the provider's SignInConfig entry is Disabled —
